@@ -962,8 +962,11 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Fx
     let mut type_refs: Vec<crate::TypeCacheRef> = vec![crate::TypeCacheRef::Module(file_id)];
     let mut nodes: Vec<LuaInferenceNodeId> = Vec::new();
     let mut signatures: Vec<LuaSignatureId> = Vec::new();
-    // Each owner, and whether the key that named it appeared or vanished.
-    let mut owners: Vec<(LuaMemberOwner, bool)> = Vec::new();
+    // Each owner, and whether any key naming it appeared or vanished. One
+    // entry per owner: a file with a thousand writes to one slot names that
+    // owner a thousand times, and the member enumeration below is per owner,
+    // so a vector here makes the whole pass quadratic in the slot's writers.
+    let mut owners: FxHashMap<LuaMemberOwner, bool> = FxHashMap::default();
     let mut net_messages: Vec<SmolStr> = Vec::new();
     let mut file_level = false;
 
@@ -982,7 +985,7 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Fx
                 nodes.push(LuaInferenceNodeId::TypeOwner(owner));
                 let member_index = db.get_member_index();
                 if let Some(owner) = member_index.get_member_owner(member_id) {
-                    owners.push((owner.clone(), structural.contains(key)));
+                    record_owner_dependency(&mut owners, owner, structural.contains(key));
                     // A reader whose lookup of this key found nothing cached
                     // no type, so no reverse index below names it.
                     if structural.contains(key)
@@ -1002,7 +1005,7 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Fx
                 if let LuaTypeOwner::Member(member_id) = owner
                     && let Some(owner) = db.get_member_index().get_member_owner(member_id)
                 {
-                    owners.push((owner.clone(), structural.contains(key)));
+                    record_owner_dependency(&mut owners, owner, structural.contains(key));
                 }
             }
             ExportKey::Signature(signature_id) => {
@@ -1048,7 +1051,7 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Fx
             ExportKey::Metatable(range) => {
                 type_refs.push(crate::TypeCacheRef::Table(range.clone()));
                 type_refs.push(crate::TypeCacheRef::Instance(range.clone()));
-                owners.push((LuaMemberOwner::Element(range.clone()), true));
+                record_owner_dependency(&mut owners, &LuaMemberOwner::Element(range.clone()), true);
             }
             ExportKey::Realm(RealmSubject::Decl(decl_id)) => {
                 nodes.push(LuaInferenceNodeId::TypeOwner(LuaTypeOwner::Decl(*decl_id)));
@@ -1147,4 +1150,18 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Fx
 
     dependents.remove(&file_id);
     dependents
+}
+
+/// Files `owner` as the home of a changed export, OR-ing whether any key
+/// naming it appeared or vanished: one enumeration in `dependents_of` covers
+/// every key of the owner either way.
+fn record_owner_dependency(
+    owners: &mut FxHashMap<LuaMemberOwner, bool>,
+    owner: &LuaMemberOwner,
+    structural: bool,
+) {
+    owners
+        .entry(owner.clone())
+        .and_modify(|known| *known |= structural)
+        .or_insert(structural);
 }

@@ -2568,7 +2568,7 @@ fn refresh_member_initializer_caches(
                 continue;
             }
             let canonical_guarded_bootstrap =
-                lua::canonical_guarded_table_bootstrap_type(db, *member_id);
+                lua::canonical_guarded_table_bootstrap_type(db, *member_id, None);
             let inferred_type = if let Some(canonical) = &canonical_guarded_bootstrap {
                 canonical.clone()
             } else {

@@ -1411,6 +1411,31 @@ mod test {
     }
 
     #[test]
+    fn test_many_same_key_guarded_bootstraps_collapse_to_first_table() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let mut body = String::from("ns = ns or {}\n");
+        for _ in 0..50 {
+            body.push_str("ns.slot = ns.slot or {}\n");
+        }
+        body.push_str("local got = ns.slot\n");
+        let file_id = ws.def_file("gamemodes/test/gamemode/shared.lua", &body);
+
+        let ty = local_name_type(&mut ws, file_id, "got");
+        let display = ws.humanize_type(ty.clone());
+
+        assert_eq!(
+            empty_table_bootstrap_branch_count(ws.analysis.compilation.get_db(), &ty),
+            1,
+            "expected many same-key guarded bootstraps to collapse to one table branch, got {display}"
+        );
+    }
+
+    #[test]
     fn test_repeated_initialized_index_prefixes_do_not_report_undefined_field() {
         let mut ws = VirtualWorkspace::new();
         let mut body = String::from("WepHolster = {}\nWepHolster.defData = {}\n");

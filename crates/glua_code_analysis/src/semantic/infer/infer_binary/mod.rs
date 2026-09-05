@@ -1,7 +1,7 @@
 mod infer_binary_and;
 mod infer_binary_or;
 
-use glua_parser::{BinaryOperator, LuaBinaryExpr};
+use glua_parser::{BinaryOperator, LuaBinaryExpr, LuaExpr, LuaIndexKey};
 use infer_binary_and::{infer_binary_expr_and, special_and_rule};
 use infer_binary_or::{infer_binary_expr_or, special_or_rule};
 use smol_str::SmolStr;
@@ -21,6 +21,42 @@ pub fn infer_binary_expr(
 ) -> InferResult {
     let op = expr.get_op_token().ok_or(InferFailReason::None)?.get_op();
     let (left, right) = expr.get_exprs().ok_or(InferFailReason::None)?;
+
+    // A field self-bootstrap `X.y = X.y or {}` always answers with the fresh
+    // table: the left read is the slot being defined, so it cannot inform its
+    // own definition (see `special_or_rule`, which discards it unconditionally
+    // for this shape). Inferring it first would merge every writer the slot
+    // holds so far — and walk the flow chain behind it — on every write, only
+    // to throw the answer away, so N same-slot bootstraps cost O(N^2). The
+    // table literal alone is the same answer `special_or_rule` returns below.
+    //
+    // Bare names are excluded: for `x = x or {}` the unresolved-global arms
+    // ahead of the bootstrap check take precedence, and a resolved local is a
+    // narrowing idiom whose left type is cheap (one declaration) anyway. An
+    // index read is never an unresolved global, so those checks are provably
+    // inert for it and skipping them changes nothing.
+    //
+    // Computed keys are excluded too: only an `Expr`-keyed member read bumps
+    // the sibling-merge counter the walk uses to queue settled re-derivation,
+    // so inferring one has an observable side effect this must preserve.
+    if op == BinaryOperator::OpOr
+        && matches!(
+            &left,
+            LuaExpr::IndexExpr(index) if matches!(
+                index.get_index_key(),
+                Some(
+                    LuaIndexKey::Name(_)
+                        | LuaIndexKey::String(_)
+                        | LuaIndexKey::Integer(_)
+                        | LuaIndexKey::Idx(_)
+                )
+            )
+        )
+        && matches!(&right, LuaExpr::TableExpr(table) if table.is_empty())
+        && infer_binary_or::is_self_referential_bootstrap(&left)
+    {
+        return infer_expr(db, cache, right);
+    }
 
     let left_type = match infer_expr(db, cache, left.clone()) {
         Ok(ty) => ty,

@@ -1190,7 +1190,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             member_assignment_or_source_type(analyzer, &type_owner, expr, expr_type);
 
         widen_existing_member_collection_type(analyzer, &var, &expr_type);
-        assign_merge_type_owner_and_expr_type(
+        let guarded_bootstrap_canonical = assign_merge_type_owner_and_expr_type(
             analyzer,
             type_owner.clone(),
             &expr_type,
@@ -1208,10 +1208,14 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             },
         );
         // The member is only homed onto its owner above, so the sibling guards
-        // this one shares a table with are not visible until here.
+        // this one shares a table with are not visible until here. The slot
+        // cannot have moved since `assign_merge_type_owner_and_expr_type`
+        // derived this same member's canonical above — binding a type,
+        // recording a candidate and marking writers touch neither the history
+        // index nor owners nor keys — so that answer is reused, not rederived.
         if let LuaTypeOwner::Member(member_id) = &type_owner
             && is_guarded_table_assignment_member(analyzer.db, *member_id)
-            && let Some(canonical) = canonical_guarded_table_bootstrap_type(analyzer.db, *member_id)
+            && let Some(canonical) = guarded_bootstrap_canonical
         {
             expr_type = canonical;
         }
@@ -1229,7 +1233,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                         let var = var_list.get(i)?;
                         let type_owner = get_var_owner(analyzer, var.clone());
                         set_index_expr_owner(analyzer, var.clone());
-                        assign_merge_type_owner_and_expr_type(
+                        let _ = assign_merge_type_owner_and_expr_type(
                             analyzer,
                             type_owner.clone(),
                             &last_expr_type,
@@ -1262,7 +1266,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                         let var = var_list.get(i)?;
                         let type_owner = get_var_owner(analyzer, var.clone());
                         set_index_expr_owner(analyzer, var.clone());
-                        assign_merge_type_owner_and_expr_type(
+                        let _ = assign_merge_type_owner_and_expr_type(
                             analyzer,
                             type_owner.clone(),
                             &LuaType::Any,
@@ -2052,7 +2056,7 @@ fn assign_merge_type_owner_and_expr_type(
     idx: usize,
     preserve_table_literals: bool,
     write: DeclWrite,
-) -> Option<()> {
+) -> Option<LuaType> {
     let mut expr_type = expr_type.clone();
     if let LuaType::Variadic(multi) = expr_type {
         expr_type = multi.get_type(idx).unwrap_or(&LuaType::Nil).clone();
@@ -2080,7 +2084,14 @@ fn assign_merge_type_owner_and_expr_type(
         LuaTypeOwner::Member(member_id)
             if is_guarded_table_assignment_member(analyzer.db, *member_id) =>
         {
-            canonical_guarded_table_bootstrap_type(analyzer.db, *member_id)
+            canonical_guarded_table_bootstrap_type(
+                analyzer.db,
+                *member_id,
+                Some(GuardedTableAssignmentCaches {
+                    member_check: &mut analyzer.guarded_table_assignment_member_check_cache,
+                    slot: &mut analyzer.guarded_table_assignment_slot_cache,
+                }),
+            )
         }
         _ => None,
     };
@@ -2095,6 +2106,9 @@ fn assign_merge_type_owner_and_expr_type(
             if is_guarded_table_assignment_member(analyzer.db, *member_id));
 
     let dynamic_expr_key_member = is_dynamic_expr_key_member_assignment(analyzer, &type_owner);
+    // Returned for the post-merge re-derivation at the assign site, which
+    // would otherwise walk the same unchanged slot a second time.
+    let canonical_used = canonical_guarded_bootstrap.clone();
     if let Some(canonical) = canonical_guarded_bootstrap {
         expr_type = canonical;
     } else if !dynamic_expr_key_member
@@ -2155,7 +2169,7 @@ fn assign_merge_type_owner_and_expr_type(
         record_member_collection_assignment_widening_cache(analyzer, &type_owner, &expr_type);
     }
 
-    Some(())
+    canonical_used
 }
 
 fn member_assignment_or_source_type(
@@ -2629,7 +2643,7 @@ pub(in crate::compilation::analyzer) fn resettle_guarded_table_bootstraps(
         let Some(first) = members.first().copied() else {
             continue;
         };
-        let Some(canonical) = canonical_guarded_table_bootstrap_type(db, first) else {
+        let Some(canonical) = canonical_guarded_table_bootstrap_type(db, first, None) else {
             continue;
         };
         // Every writer of the slot, not only the ones queued as candidates: the
@@ -2637,7 +2651,7 @@ pub(in crate::compilation::analyzer) fn resettle_guarded_table_bootstraps(
         // identity again, and whether it was queued depends on how far the walk
         // had got when it ran.
         let members =
-            guarded_table_assignment_member_ids_for_owner_key(db, first).unwrap_or(members);
+            guarded_table_assignment_member_ids_for_owner_key(db, first, None).unwrap_or(members);
         for member_id in members {
             let owner = LuaTypeOwner::Member(member_id);
             if db
@@ -2657,20 +2671,84 @@ pub(in crate::compilation::analyzer) fn resettle_guarded_table_bootstraps(
     }
 }
 
+/// Per-`(owner, key)` memo for
+/// [`canonical_guarded_table_bootstrap_type`]'s per-write path.
+///
+/// One [`LuaAnalyzer`](super::LuaAnalyzer) lives for one file pass, and within
+/// that pass a guarded slot only grows by append: removals, rekeys and
+/// definition-site remaps run at batch boundaries with no analyzer alive;
+/// rekeying only touches `Expr` keys while guarded bootstraps file under name
+/// keys; and any owner move files the member under a different canonical slot,
+/// which misses this memo instead of reading it. Guardedness is a pure
+/// function of the member's own immutable syntax, and the canonical type a
+/// pure function of the minimum member's syntax, so re-walking only the entries
+/// appended since the last visit answers exactly what a full walk would. A hit
+/// additionally verifies the member that decides the answer (the minimum while
+/// clean, the first non-guard once poisoned) is still homed; any other doubt —
+/// a shorter history than recorded, or a flown decider — rebuilds from
+/// scratch. Appends can never un-poison a slot, so a poisoned memo only
+/// advances its length and never walks again.
+///
+/// Homing caveat: the history index keeps ids a later owner move left behind,
+/// so neither the raw length nor the decider check above proves the filtered
+/// set is unchanged — a rehomed-away writer leaves the length identical, and a
+/// rehomed-back writer appends nothing when its id is already listed. The memo
+/// therefore records [`LuaMemberIndex::homing_revision`] at walk time and
+/// suffix-folds only on a revision match; any mismatch rebuilds from scratch.
+/// Pure appends (`add_member` first filings, `add_member_to_owner`,
+/// `add_member_alias_to_owner`) leave the revision alone, so the O(N) suffix
+/// path survives them.
+#[derive(Debug, Clone)]
+pub(in crate::compilation::analyzer) struct GuardedSlotMemo {
+    history_len: usize,
+    filtered_count: usize,
+    all_guarded: bool,
+    min_member: Option<LuaMemberId>,
+    poison: Option<LuaMemberId>,
+    canonical: Option<LuaType>,
+    homing_revision: u64,
+}
+
+/// The per-pass caches
+/// [`canonical_guarded_table_bootstrap_type`] threads through its per-write
+/// path. Settle-phase callers pass `None` and keep the full walk.
+pub(in crate::compilation::analyzer) struct GuardedTableAssignmentCaches<'a> {
+    pub member_check: &'a mut FxHashMap<LuaMemberId, bool>,
+    pub slot: &'a mut FxHashMap<(LuaMemberOwner, LuaMemberKey), GuardedSlotMemo>,
+}
+
 /// Every writer of this member's slot when all of them are `x.y = x.y or {}`
 /// guards.
+///
+/// Walks the history slot in insertion order with no sort: the callers only
+/// need the set (one takes its minimum, the other overwrites each member),
+/// and sorting it on every write was O(k log k) per write. Bails on the
+/// first non-guard, so the outcome never depends on the walk order.
 fn guarded_table_assignment_member_ids_for_owner_key(
     db: &DbIndex,
     member_id: LuaMemberId,
+    mut guard_cache: Option<&mut FxHashMap<LuaMemberId, bool>>,
 ) -> Option<Vec<LuaMemberId>> {
     let member_index = db.get_member_index();
     let owner = member_index.get_member_owner(&member_id)?.clone();
     let key = member_index.get_member(&member_id)?.get_key().clone();
     let mut member_ids = Vec::new();
 
-    for related_member in member_index.get_current_owner_members_for_key(&owner, &key) {
-        let related_member_id = related_member.get_id();
-        if !is_guarded_table_assignment_member(db, related_member_id) {
+    for related_member_id in
+        member_index.get_current_owner_member_ids_for_key_unsorted(&owner, &key)
+    {
+        let guarded = if let Some(cache) = guard_cache.as_mut() {
+            if let Some(&hit) = cache.get(&related_member_id) {
+                hit
+            } else {
+                let guarded = is_guarded_table_assignment_member(db, related_member_id);
+                cache.insert(related_member_id, guarded);
+                guarded
+            }
+        } else {
+            is_guarded_table_assignment_member(db, related_member_id)
+        };
+        if !guarded {
             return None;
         }
 
@@ -2690,13 +2768,160 @@ fn guarded_table_assignment_member_ids_for_owner_key(
 pub(in crate::compilation::analyzer) fn canonical_guarded_table_bootstrap_type(
     db: &crate::DbIndex,
     member_id: LuaMemberId,
+    caches: Option<GuardedTableAssignmentCaches<'_>>,
 ) -> Option<LuaType> {
-    let canonical = guarded_table_assignment_member_ids_for_owner_key(db, member_id)?
+    if let Some(caches) = caches {
+        return memoized_canonical_guarded_table_bootstrap_type(
+            db,
+            member_id,
+            caches.member_check,
+            caches.slot,
+        );
+    }
+    // No second guard filter: the walk above only returns when every writer
+    // passed, so filtering again would re-walk each member's syntax.
+    let canonical = guarded_table_assignment_member_ids_for_owner_key(db, member_id, None)?
         .into_iter()
-        .filter(|candidate| is_guarded_table_assignment_member(db, *candidate))
         .min_by_key(|candidate| member_id_sort_key(*candidate))?;
 
     guarded_table_bootstrap_member_type(db, canonical, false)
+}
+
+/// Per-write [`canonical_guarded_table_bootstrap_type`]: same answer as the
+/// full walk, visiting only the history entries appended since the last call
+/// for this slot. Each member is guard-checked once per pass and the minimum
+/// is folded incrementally, so N same-key appends cost O(N) total.
+fn memoized_canonical_guarded_table_bootstrap_type(
+    db: &crate::DbIndex,
+    member_id: LuaMemberId,
+    member_check: &mut FxHashMap<LuaMemberId, bool>,
+    slot_cache: &mut FxHashMap<(LuaMemberOwner, LuaMemberKey), GuardedSlotMemo>,
+) -> Option<LuaType> {
+    let member_index = db.get_member_index();
+    let owner = member_index.canonical_owner(member_index.get_member_owner(&member_id)?.clone());
+    let key = member_index.get_member(&member_id)?.get_key().clone();
+    let history_len = member_index.owner_key_history_len(&owner, &key);
+    let homing_revision = member_index.homing_revision();
+    let slot = (owner.clone(), key.clone());
+
+    let homed = |db: &crate::DbIndex, id: LuaMemberId| {
+        db.get_member_index()
+            .get_member_owner(&id)
+            .is_some_and(|current| *current == owner)
+            && db
+                .get_member_index()
+                .get_member(&id)
+                .is_some_and(|member| member.get_key() == &key)
+    };
+
+    let prior = slot_cache.get(&slot).cloned();
+    // Fast path: nothing appended since the last visit, nothing rehomed under
+    // it (revision match), and the member that decides the answer is still
+    // homed under this slot.
+    if let Some(memo) = &prior
+        && memo.history_len == history_len
+        && memo.homing_revision == homing_revision
+        && memo
+            .all_guarded
+            .then_some(memo.min_member)
+            .flatten()
+            .or(memo.poison)
+            .is_none_or(|decider| homed(db, decider))
+    {
+        return memo.canonical.clone();
+    }
+
+    // Poisoned slots stay poisoned while the first non-guard is still homed:
+    // appends cannot remove it, so only the length advances — no walk. Still
+    // gated on the homing revision: a move under the slot could have removed
+    // the poison and re-added history entries at the same raw length, which
+    // the homed check alone cannot see when the poison itself stayed.
+    if let Some(memo) = &prior
+        && !memo.all_guarded
+        && memo.history_len < history_len
+        && memo.homing_revision == homing_revision
+        && memo.poison.is_some_and(|poison| homed(db, poison))
+    {
+        if let Some(memo) = slot_cache.get_mut(&slot) {
+            memo.history_len = history_len;
+        }
+        return None;
+    }
+
+    // Trusted prefix (a still-clean slot that only grew by append with no
+    // rehoming under it: the suffix holds exactly the appended members) or a
+    // rebuild from scratch on any doubt.
+    let (skip, mut all_guarded, mut filtered_count, mut min_member, base_min, base_canonical) =
+        match &prior {
+            Some(memo)
+                if memo.all_guarded
+                    && memo.history_len < history_len
+                    && memo.homing_revision == homing_revision =>
+            {
+                (
+                    memo.history_len,
+                    true,
+                    memo.filtered_count,
+                    memo.min_member,
+                    memo.min_member,
+                    memo.canonical.clone(),
+                )
+            }
+            _ => (0, true, 0, None, None, None),
+        };
+    let mut poison: Option<LuaMemberId> = None;
+
+    for suffix_id in db
+        .get_member_index()
+        .get_current_owner_member_ids_for_key_unsorted_from(&owner, &key, skip)
+    {
+        filtered_count += 1;
+        let guarded = if let Some(&hit) = member_check.get(&suffix_id) {
+            hit
+        } else {
+            let guarded = is_guarded_table_assignment_member(db, suffix_id);
+            member_check.insert(suffix_id, guarded);
+            guarded
+        };
+        if guarded {
+            min_member = Some(match min_member {
+                Some(min) if member_id_sort_key(min) <= member_id_sort_key(suffix_id) => min,
+                _ => suffix_id,
+            });
+        } else {
+            all_guarded = false;
+            if poison.is_none() {
+                poison = Some(suffix_id);
+            }
+        }
+    }
+
+    let canonical = if !all_guarded || filtered_count < 2 {
+        None
+    } else {
+        match min_member {
+            // Reuse only a real answer: a `None` base means the gate above
+            // failed last time (fewer than two writers) or the bootstrap
+            // lookup did, so the same minimum needs a fresh derivation now.
+            Some(min) if Some(min) == base_min && base_canonical.is_some() => base_canonical,
+            Some(min) => guarded_table_bootstrap_member_type(db, min, false),
+            None => None,
+        }
+    };
+
+    slot_cache.insert(
+        slot,
+        GuardedSlotMemo {
+            history_len,
+            filtered_count,
+            all_guarded,
+            min_member,
+            poison,
+            canonical: canonical.clone(),
+            homing_revision,
+        },
+    );
+    canonical
 }
 
 fn merge_type_owner_and_unresolve_expr(
@@ -2955,7 +3180,7 @@ fn special_assign_pattern(
                 }
             }
 
-            assign_merge_type_owner_and_expr_type(
+            let _ = assign_merge_type_owner_and_expr_type(
                 analyzer,
                 type_owner,
                 &expr_type,
@@ -3752,5 +3977,306 @@ mod tests {
                 &LuaTypeOwner::Member(plain)
             ));
         });
+    }
+
+    fn guarded_slot_owner_key(db: &DbIndex, probe: LuaMemberId) -> (LuaMemberOwner, LuaMemberKey) {
+        let member_index = db.get_member_index();
+        let owner = member_index.canonical_owner(
+            member_index
+                .get_member_owner(&probe)
+                .expect("probe member owner")
+                .clone(),
+        );
+        let key = member_index
+            .get_member(&probe)
+            .expect("probe member")
+            .get_key()
+            .clone();
+        (owner, key)
+    }
+
+    fn guarded_slot_member_ids(
+        db: &DbIndex,
+        owner: &LuaMemberOwner,
+        key: &LuaMemberKey,
+    ) -> Vec<LuaMemberId> {
+        let mut ids = db
+            .get_member_index()
+            .get_current_owner_member_ids_for_key_unsorted(owner, key);
+        ids.sort_by_key(|id| member_id_sort_key(*id));
+        ids
+    }
+
+    fn memoized_guarded_bootstrap(
+        db: &DbIndex,
+        member_id: LuaMemberId,
+        member_check: &mut FxHashMap<LuaMemberId, bool>,
+        slot_cache: &mut FxHashMap<(LuaMemberOwner, LuaMemberKey), GuardedSlotMemo>,
+    ) -> Option<LuaType> {
+        canonical_guarded_table_bootstrap_type(
+            db,
+            member_id,
+            Some(GuardedTableAssignmentCaches {
+                member_check,
+                slot: slot_cache,
+            }),
+        )
+    }
+
+    /// A rehomed-away non-deciding writer leaves the old slot's raw history
+    /// length and its deciding minimum untouched, so a length-plus-decider
+    /// memo would answer stale. The homing revision forces a rebuild.
+    #[test]
+    fn guarded_slot_memo_rebuilds_after_non_deciding_writer_rehomed_away() {
+        let mut ws = crate::VirtualWorkspace::new();
+        ws.def_file("lua/rehome_a.lua", "T = T or {}\nT.slot = T.slot or {}\n");
+        ws.def_file("lua/rehome_b.lua", "T.slot = T.slot or {}\n");
+
+        let expected_owner = LuaMemberOwner::GlobalPath(GlobalId::new("T"));
+        let expected_key = LuaMemberKey::from("slot");
+        let (owner, key) = {
+            let db = ws.analysis.compilation.get_db();
+            let probe = guarded_slot_member_ids(db, &expected_owner, &expected_key)
+                .first()
+                .copied()
+                .expect("two guarded writers indexed");
+            guarded_slot_owner_key(db, probe)
+        };
+        assert_eq!(owner, expected_owner);
+        assert_eq!(key, expected_key);
+
+        let mut ids = {
+            let db = ws.analysis.compilation.get_db();
+            guarded_slot_member_ids(db, &owner, &key)
+        };
+        assert_eq!(ids.len(), 2, "slot starts with two guarded writers");
+        let min_guard = ids[0];
+        let other_guard = ids[1];
+        {
+            let db = ws.analysis.compilation.get_db();
+            assert!(is_guarded_table_assignment_member(db, min_guard));
+            assert!(is_guarded_table_assignment_member(db, other_guard));
+        }
+
+        let mut member_check: FxHashMap<LuaMemberId, bool> = FxHashMap::default();
+        let mut slot_cache: FxHashMap<(LuaMemberOwner, LuaMemberKey), GuardedSlotMemo> =
+            FxHashMap::default();
+        let first = {
+            let db = ws.analysis.compilation.get_db();
+            memoized_guarded_bootstrap(db, min_guard, &mut member_check, &mut slot_cache)
+        }
+        .expect("two guards answer with the minimum literal");
+        let (revision_before, len_before) = {
+            let db = ws.analysis.compilation.get_db();
+            (
+                db.get_member_index().homing_revision(),
+                db.get_member_index().owner_key_history_len(&owner, &key),
+            )
+        };
+        assert_eq!(len_before, 2);
+
+        // Append-only control: an unrelated file adds no homing change, so the
+        // revision is untouched and the memo still answers the same literal.
+        ws.def_file("lua/rehome_unrelated.lua", "local unrelated = 1\n");
+        {
+            let db = ws.analysis.compilation.get_db();
+            assert_eq!(
+                db.get_member_index().homing_revision(),
+                revision_before,
+                "append-only edit must not bump the homing revision"
+            );
+            let again =
+                memoized_guarded_bootstrap(db, min_guard, &mut member_check, &mut slot_cache);
+            assert_eq!(again, Some(first.clone()));
+        }
+
+        // Rehome the non-deciding writer away, mimicking the mid-pass owner
+        // move `add_member` performs after `set_member_owner`.
+        let other_file = {
+            let db = ws.analysis.compilation.get_db();
+            db.get_member_index()
+                .get_member(&other_guard)
+                .expect("other guard")
+                .get_file_id()
+        };
+        let away_owner = LuaMemberOwner::GlobalPath(GlobalId::new("OtherNS"));
+        {
+            let db = ws.analysis.compilation.get_db_mut();
+            db.get_member_index_mut()
+                .set_member_owner(away_owner.clone(), other_file, other_guard);
+            db.get_member_index_mut()
+                .add_member_to_owner(away_owner.clone(), other_guard);
+        }
+
+        // Pin the fast-path preconditions the stale memo would trust.
+        let revision_after = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_member_index()
+            .homing_revision();
+        assert_ne!(
+            revision_after, revision_before,
+            "a real owner move must bump the homing revision"
+        );
+        {
+            let db = ws.analysis.compilation.get_db();
+            let member_index = db.get_member_index();
+            assert_eq!(
+                member_index.owner_key_history_len(&owner, &key),
+                len_before,
+                "history retains the departed writer at the same raw length"
+            );
+            assert_eq!(
+                member_index.get_member_owner(&min_guard),
+                Some(&owner),
+                "the deciding minimum is still homed under the old slot"
+            );
+            assert_eq!(
+                member_index
+                    .get_member(&min_guard)
+                    .expect("min guard")
+                    .get_key(),
+                &key
+            );
+            ids = guarded_slot_member_ids(db, &owner, &key);
+            assert_eq!(ids, vec![min_guard], "only the minimum is still homed");
+            assert_eq!(
+                canonical_guarded_table_bootstrap_type(db, min_guard, None),
+                None,
+                "one remaining writer is below the two-writer gate"
+            );
+            let rebuilt =
+                memoized_guarded_bootstrap(db, min_guard, &mut member_check, &mut slot_cache);
+            assert_eq!(
+                rebuilt, None,
+                "memoized query must rebuild past the stale two-guard answer"
+            );
+        }
+    }
+
+    /// A historical plain writer moved back into a memoized clean slot appends
+    /// nothing when its id is already listed, so length and decider checks
+    /// still pass while the slot is poisoned. The revision forces a rebuild.
+    #[test]
+    fn guarded_slot_memo_rebuilds_after_historical_plain_writer_rehomed_in() {
+        let mut ws = crate::VirtualWorkspace::new();
+        ws.def_file("lua/poison_a.lua", "U = U or {}\nU.slot = U.slot or {}\n");
+        ws.def_file("lua/poison_b.lua", "U.slot = U.slot or {}\n");
+        ws.def_file("lua/poison_plain.lua", "U.slot = 1\n");
+
+        let expected_owner = LuaMemberOwner::GlobalPath(GlobalId::new("U"));
+        let expected_key = LuaMemberKey::from("slot");
+        let (owner, key) = {
+            let db = ws.analysis.compilation.get_db();
+            let probe = guarded_slot_member_ids(db, &expected_owner, &expected_key)
+                .first()
+                .copied()
+                .expect("guards plus plain indexed");
+            guarded_slot_owner_key(db, probe)
+        };
+        assert_eq!(owner, expected_owner);
+        assert_eq!(key, expected_key);
+
+        let (min_guard, plain_id) = {
+            let db = ws.analysis.compilation.get_db();
+            let member_index = db.get_member_index();
+            let mut all = member_index.get_current_owner_member_ids_for_key_unsorted(&owner, &key);
+            all.sort_by_key(|id| member_id_sort_key(*id));
+            assert_eq!(all.len(), 3, "two guards plus one plain writer");
+            let plain = all
+                .iter()
+                .copied()
+                .find(|id| !is_guarded_table_assignment_member(db, *id))
+                .expect("one plain writer");
+            let guards: Vec<_> = all.iter().copied().filter(|id| *id != plain).collect();
+            assert_eq!(guards.len(), 2);
+            assert!(is_guarded_table_assignment_member(db, guards[0]));
+            assert!(is_guarded_table_assignment_member(db, guards[1]));
+            let min_guard = guards
+                .iter()
+                .copied()
+                .min_by_key(|id| member_id_sort_key(*id))
+                .expect("minimum guard");
+            (min_guard, plain)
+        };
+        let plain_file = {
+            let db = ws.analysis.compilation.get_db();
+            db.get_member_index()
+                .get_member(&plain_id)
+                .expect("plain member")
+                .get_file_id()
+        };
+
+        // Move the plain writer away so the slot memoizes clean.
+        let away_owner = LuaMemberOwner::GlobalPath(GlobalId::new("OtherU"));
+        {
+            let db = ws.analysis.compilation.get_db_mut();
+            db.get_member_index_mut()
+                .set_member_owner(away_owner.clone(), plain_file, plain_id);
+            db.get_member_index_mut()
+                .add_member_to_owner(away_owner.clone(), plain_id);
+        }
+        let mut member_check: FxHashMap<LuaMemberId, bool> = FxHashMap::default();
+        let mut slot_cache: FxHashMap<(LuaMemberOwner, LuaMemberKey), GuardedSlotMemo> =
+            FxHashMap::default();
+        {
+            let db = ws.analysis.compilation.get_db();
+            let filtered = guarded_slot_member_ids(db, &owner, &key);
+            assert_eq!(filtered.len(), 2, "plain writer moved away");
+            assert!(
+                memoized_guarded_bootstrap(db, min_guard, &mut member_check, &mut slot_cache)
+                    .is_some(),
+                "two remaining guards answer clean"
+            );
+        }
+        let (revision_clean, len_clean) = {
+            let db = ws.analysis.compilation.get_db();
+            (
+                db.get_member_index().homing_revision(),
+                db.get_member_index().owner_key_history_len(&owner, &key),
+            )
+        };
+
+        // Move the historical plain writer back: its id is already listed in
+        // the old slot's history, so the raw length does not grow.
+        {
+            let db = ws.analysis.compilation.get_db_mut();
+            db.get_member_index_mut()
+                .set_member_owner(owner.clone(), plain_file, plain_id);
+            db.get_member_index_mut()
+                .add_member_to_owner(owner.clone(), plain_id);
+        }
+
+        let db = ws.analysis.compilation.get_db();
+        let member_index = db.get_member_index();
+        assert_ne!(
+            member_index.homing_revision(),
+            revision_clean,
+            "rehoming the plain writer back must bump the revision"
+        );
+        assert_eq!(
+            member_index.owner_key_history_len(&owner, &key),
+            len_clean,
+            "history already listed the returning id, raw length is equal"
+        );
+        assert_eq!(
+            member_index.get_member_owner(&min_guard),
+            Some(&owner),
+            "the deciding minimum is still homed under the slot"
+        );
+        let filtered = guarded_slot_member_ids(db, &owner, &key);
+        assert_eq!(filtered.len(), 3, "both guards plus the returned plain");
+        assert!(filtered.contains(&plain_id));
+        assert_eq!(
+            canonical_guarded_table_bootstrap_type(db, min_guard, None),
+            None,
+            "a homed plain writer poisons the slot"
+        );
+        let rebuilt = memoized_guarded_bootstrap(db, min_guard, &mut member_check, &mut slot_cache);
+        assert_eq!(
+            rebuilt, None,
+            "memoized query must rebuild to poisoned instead of the stale clean answer"
+        );
     }
 }
