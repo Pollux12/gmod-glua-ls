@@ -71,6 +71,26 @@ fn uri_sort_key(uri: &Uri) -> String {
 /// recurses costs nothing.
 pub const ANALYSIS_STACK_SIZE: usize = 256 * 1024 * 1024;
 
+/// Minimum stack bytes that must remain to keep inferring.
+///
+/// Source-controlled nesting (expressions, doc types) recurses per level and
+/// can exhaust small worker stacks on generated files. Exhaustion bails to the
+/// existing `RecursiveInfer` path (an `Unknown` fallback), the same graceful
+/// failure cyclic inputs already produce, instead of aborting the process.
+pub(crate) const ANALYSIS_STACK_RESERVE: usize = 256 * 1024;
+
+/// Fail-closed remaining-stack probe shared by expression and doc inference.
+///
+/// `None` (unsupported target / OS query failure) counts as exhausted rather
+/// than safe, mirroring how `stacker::maybe_grow` treats `None` as
+/// insufficient.
+pub(crate) fn analysis_stack_exhausted() -> bool {
+    match stacker::remaining_stack() {
+        Some(remaining) => remaining < ANALYSIS_STACK_RESERVE,
+        None => true,
+    }
+}
+
 /// True when `call_expr` calls an annotated net operation — a message start, a
 /// send terminator, or a payload write/read.
 ///
