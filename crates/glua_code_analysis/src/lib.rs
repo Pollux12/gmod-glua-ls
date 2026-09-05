@@ -203,114 +203,37 @@ fn select_cross_file_stabilization_dependents(
 ///
 /// Empirically, a removed [`LuaMemberId`]/[`LuaDeclId`] no longer resolves in
 /// the post-edit index (`get_member`/`get_decl` return `None` once
-/// `remove_index` has run), while [`LuaTypeDeclId`] and
-/// [`LuaInferredGuardOwner`] carry their names inside the [`ExportKey`] itself
-/// and survive without a snapshot. The snapshot therefore covers members
-/// (key + owner) and decls (name + locality); types are snapshotted only for
-/// the signature-fallback set below.
+/// `remove_index` has run). The snapshot therefore covers every member (owner
+/// always, key name when the key is a [`LuaMemberKey::Name`]) and every decl
+/// (name + locality): a non-name member such as an integer-indexed slot still
+/// names its owner, and [`LuaTypeDeclId`] carries its name inside the
+/// [`ExportKey`] itself and needs no snapshot.
 struct PreEditNameSnapshot {
-    members: FxHashMap<LuaMemberId, (SmolStr, Option<LuaMemberOwner>)>,
+    members: FxHashMap<LuaMemberId, (Option<SmolStr>, Option<LuaMemberOwner>)>,
     decls: FxHashMap<LuaDeclId, (SmolStr, bool)>,
-    all: FxHashSet<SmolStr>,
 }
 
 fn snapshot_pre_edit_names(db: &DbIndex, file_id: FileId) -> PreEditNameSnapshot {
     let mut members = FxHashMap::default();
     let mut decls = FxHashMap::default();
-    let mut all = FxHashSet::default();
     for member in db.get_member_index().get_file_members(file_id) {
-        if let LuaMemberKey::Name(name) = member.get_key() {
-            let owner = db
-                .get_member_index()
-                .get_member_owner(&member.get_id())
-                .cloned();
-            members.insert(member.get_id(), (name.clone(), owner.clone()));
-            all.insert(name.clone());
-            if let Some(LuaMemberOwner::GlobalPath(path)) = owner.as_ref() {
-                for part in path.get_name().split('.') {
-                    if !part.is_empty() {
-                        all.insert(SmolStr::new(part));
-                    }
-                }
-            }
-            if let Some(LuaMemberOwner::Type(type_id)) = owner.as_ref() {
-                all.insert(SmolStr::new(type_id.get_name()));
-                let simple = type_id.get_simple_name();
-                if simple != type_id.get_name() {
-                    all.insert(SmolStr::new(simple));
-                }
-            }
-        }
+        let name = match member.get_key() {
+            LuaMemberKey::Name(name) => Some(name.clone()),
+            LuaMemberKey::Integer(_) | LuaMemberKey::None | LuaMemberKey::ExprType(_) => None,
+        };
+        let owner = db
+            .get_member_index()
+            .get_member_owner(&member.get_id())
+            .cloned();
+        members.insert(member.get_id(), (name, owner));
     }
     if let Some(tree) = db.get_decl_index().get_decl_tree(&file_id) {
         for (decl_id, decl) in tree.get_decls() {
             let is_local = decl.is_local();
             decls.insert(*decl_id, (SmolStr::new(decl.get_name()), is_local));
-            if !is_local {
-                all.insert(SmolStr::new(decl.get_name()));
-            }
         }
     }
-    if let Some(type_ids) = db.get_type_index().get_file_type_decl_ids(file_id) {
-        for type_id in type_ids {
-            all.insert(SmolStr::new(type_id.get_name()));
-            let simple = type_id.get_simple_name();
-            if simple != type_id.get_name() {
-                all.insert(SmolStr::new(simple));
-            }
-        }
-    }
-    PreEditNameSnapshot {
-        members,
-        decls,
-        all,
-    }
-}
-
-/// Currently visible names in `file_id`: member keys, non-local decls and type
-/// names. Used as the signature-fallback set: a [`LuaSignatureId`] names no Lua
-/// name itself, so a signature-only diff (e.g. a `@return` change) emits every
-/// visible name in its file. Over-approximation is safe here because the set
-/// only widens diagnostics, never reindexing.
-fn visible_names_in_file(db: &DbIndex, file_id: FileId) -> FxHashSet<SmolStr> {
-    let mut names = FxHashSet::default();
-    for member in db.get_member_index().get_file_members(file_id) {
-        if let LuaMemberKey::Name(name) = member.get_key() {
-            names.insert(name.clone());
-        }
-        if let Some(owner) = db.get_member_index().get_member_owner(&member.get_id()) {
-            match owner {
-                LuaMemberOwner::GlobalPath(path) => {
-                    for part in path.get_name().split('.') {
-                        if !part.is_empty() {
-                            names.insert(SmolStr::new(part));
-                        }
-                    }
-                }
-                LuaMemberOwner::Type(type_id) => {
-                    names.insert(SmolStr::new(type_id.get_name()));
-                }
-                LuaMemberOwner::Element(_) | LuaMemberOwner::LocalUnresolve => {}
-            }
-        }
-    }
-    if let Some(tree) = db.get_decl_index().get_decl_tree(&file_id) {
-        for decl in tree.get_decls().values() {
-            if !decl.is_local() {
-                names.insert(SmolStr::new(decl.get_name()));
-            }
-        }
-    }
-    if let Some(type_ids) = db.get_type_index().get_file_type_decl_ids(file_id) {
-        for type_id in type_ids {
-            names.insert(SmolStr::new(type_id.get_name()));
-            let simple = type_id.get_simple_name();
-            if simple != type_id.get_name() {
-                names.insert(SmolStr::new(simple));
-            }
-        }
-    }
-    names
+    PreEditNameSnapshot { members, decls }
 }
 
 fn insert_global_path_parts(out: &mut FxHashSet<SmolStr>, path: &str) {
@@ -341,12 +264,14 @@ fn insert_member_id_names(
     db: &DbIndex,
     out: &mut FxHashSet<SmolStr>,
     member_id: &LuaMemberId,
-    pre: &PreEditNameSnapshot,
+    pre: Option<&PreEditNameSnapshot>,
 ) {
     // Emit both sides: a rename reuses the same position, so the post-edit
     // entry exists but names the new key while the pre-edit snapshot still
     // holds the old one. A removal only has the pre side; an addition only
-    // the post side.
+    // the post side. Either side also emits its owner's names, so a non-name
+    // member (integer slot, dynamic key) still names the global path or type
+    // another file uses to reach it.
     if let Some(member) = db.get_member_index().get_member(member_id) {
         if let LuaMemberKey::Name(name) = member.get_key() {
             out.insert(name.clone());
@@ -358,8 +283,10 @@ fn insert_member_id_names(
     // Removed — or renamed away from this key — the post-edit index no longer
     // holds the old name (`get_member` returns `None` after `remove_index`,
     // verified empirically), so the pre-edit snapshot supplies it.
-    if let Some((name, owner)) = pre.members.get(member_id) {
-        out.insert(name.clone());
+    if let Some((name, owner)) = pre.and_then(|pre| pre.members.get(member_id)) {
+        if let Some(name) = name {
+            out.insert(name.clone());
+        }
         if let Some(owner) = owner {
             insert_member_owner_names(out, owner);
         }
@@ -370,31 +297,177 @@ fn insert_decl_id_names(
     db: &DbIndex,
     out: &mut FxHashSet<SmolStr>,
     decl_id: &LuaDeclId,
-    pre: &PreEditNameSnapshot,
+    pre: Option<&PreEditNameSnapshot>,
 ) {
     if let Some(decl) = db.get_decl_index().get_decl(decl_id) {
         if !decl.is_local() {
             out.insert(SmolStr::new(decl.get_name()));
         }
     }
-    if let Some((name, is_local)) = pre.decls.get(decl_id) {
+    if let Some((name, is_local)) = pre.and_then(|pre| pre.decls.get(decl_id)) {
         if !is_local {
             out.insert(name.clone());
         }
     }
 }
 
+/// Names of the exported owner a changed signature belongs to.
+///
+/// A [`LuaSignatureId`] names no Lua name itself; its owner does. The owner
+/// lives in the signature's own file (`signature_id.get_file_id()`), which for
+/// a [`ExportKey::ContributedParam`] is the callee's file rather than the
+/// contributor's. Two legs cover the two shapes that export a function:
+/// - a function stat (`function M.Fn() end`, `function G() end`) shares its
+///   property with the signature, so the property index maps the member or
+///   decl owner back to it;
+/// - an assignment (`M.Fn = function() end`) stores the signature in the
+///   member's or global's type cache, so scanning the file's type caches for
+///   the signature finds it.
+///
+/// Only exported owners count (non-local decls, members): an anonymous or
+/// purely local closure contributes nothing, which is what keeps a local-only
+/// signature change from widening diagnostics across the workspace.
+fn insert_signature_owner_names(
+    db: &DbIndex,
+    out: &mut FxHashSet<SmolStr>,
+    signature_id: &LuaSignatureId,
+    pre: &FxHashMap<FileId, PreEditNameSnapshot>,
+) {
+    let owner_file = signature_id.get_file_id();
+    let file_pre = pre.get(&owner_file);
+    let property_index = db.get_property_index();
+    for (owner_id, _) in property_index.properties_in_file(owner_file) {
+        if property_index.get_signature_owner(owner_id) != Some(*signature_id) {
+            continue;
+        }
+        match owner_id {
+            LuaSemanticDeclId::TypeDecl(type_id) => {
+                insert_type_name(out, type_id);
+            }
+            LuaSemanticDeclId::Member(member_id) => {
+                insert_member_id_names(db, out, member_id, file_pre);
+            }
+            LuaSemanticDeclId::LuaDecl(decl_id) => {
+                insert_decl_id_names(db, out, decl_id, file_pre);
+            }
+            LuaSemanticDeclId::Signature(_) => {}
+        }
+    }
+    let Some(owners) = db.get_type_index().file_type_owners(owner_file) else {
+        return;
+    };
+    for owner in owners {
+        let exported = match owner {
+            LuaTypeOwner::Decl(decl_id) => db
+                .get_decl_index()
+                .get_decl(decl_id)
+                .is_some_and(|decl| !decl.is_local()),
+            LuaTypeOwner::Member(_) => true,
+            LuaTypeOwner::SyntaxId(_) => false,
+        };
+        if !exported {
+            continue;
+        }
+        let Some(cache) = db.get_type_index().get_type_cache(owner) else {
+            continue;
+        };
+        let mut found = false;
+        TypeVisitTrait::visit_type(cache.as_type(), &mut |inner| {
+            if let LuaType::Signature(id) = inner
+                && id == signature_id
+            {
+                found = true;
+            }
+        });
+        if !found {
+            continue;
+        }
+        match owner {
+            LuaTypeOwner::Decl(decl_id) => {
+                insert_decl_id_names(db, out, decl_id, file_pre);
+            }
+            LuaTypeOwner::Member(member_id) => {
+                insert_member_id_names(db, out, member_id, file_pre);
+            }
+            LuaTypeOwner::SyntaxId(_) => {}
+        }
+    }
+}
+
+/// Old and new names of non-local declarations the edit renamed without
+/// moving any export.
+///
+/// A same-position rename (`function Old() end` to `function New() end`) keeps
+/// every position-derived [`ExportKey`] identical, so the export diff is empty
+/// and this check runs independently of it, before the empty-diff early exit.
+/// Pre-edit positions are mapped through the edit's [`PositionMap`]: a pre
+/// decl whose image holds a post decl under a different name contributes both
+/// names; pre decls lost inside the hunk paired with otherwise-unmatched post
+/// decls are an in-hunk rename and contribute both sides as well. One-sided
+/// leftovers are a pure addition or removal, which the export diff already
+/// covers, and are skipped. Diagnostic-only: the names never enter
+/// `dirty.files`.
+fn decl_rename_refresh_names(
+    db: &DbIndex,
+    file_id: FileId,
+    map: &PositionMap,
+    pre: Option<&PreEditNameSnapshot>,
+) -> FxHashSet<SmolStr> {
+    let mut names = FxHashSet::default();
+    let Some(pre) = pre else {
+        return names;
+    };
+    let Some(tree) = db.get_decl_index().get_decl_tree(&file_id) else {
+        return names;
+    };
+    let mut unmatched_post: FxHashMap<rowan::TextSize, SmolStr> = FxHashMap::default();
+    for (decl_id, decl) in tree.get_decls() {
+        if decl_id.file_id != file_id || decl.is_local() {
+            continue;
+        }
+        unmatched_post.insert(decl_id.position, SmolStr::new(decl.get_name()));
+    }
+    let mut unmatched_pre: Vec<SmolStr> = Vec::new();
+    for (decl_id, (name, is_local)) in &pre.decls {
+        if *is_local || decl_id.file_id != file_id {
+            continue;
+        }
+        let Some(mapped) = map.map(decl_id.position) else {
+            // Inside the hunk: a rename candidate, or a deletion the diff
+            // covers when no post side is left unmatched.
+            unmatched_pre.push(name.clone());
+            continue;
+        };
+        // A mapped position with no post decl means the declaration is gone;
+        // the export diff reports that as removed keys, so nothing is added.
+        if let Some(post_name) = unmatched_post.remove(&mapped)
+            && post_name != *name
+        {
+            names.insert(name.clone());
+            names.insert(post_name);
+        }
+    }
+    if !unmatched_pre.is_empty() && !unmatched_post.is_empty() {
+        names.extend(unmatched_pre);
+        names.extend(unmatched_post.into_values());
+    }
+    names
+}
+
 /// Names from one export diff that another file could reference textually.
 ///
 /// Covers every [`ExportKey`] variant that names a Lua name:
 /// - `Member` / `TypeCache(Member)` / `Realm(Member)` / `Property(Member)`:
-///   the member key plus its owner's global-path segments or type name.
+///   the member key plus its owner's global-path segments or type name, on
+///   both the pre and the post side.
 /// - `TypeDecl` / `Operator(Type)` / `Property(TypeDecl)`: the type name.
 /// - `TypeCache(Decl)` / `Realm(Decl)` / `Property(Decl)`: the decl name.
-/// - `Signature` / `ContributedParam` / `InferredGuard(signature part)` /
-///   `Property(Signature)`: no name in the key, so every visible name in the
-///   file (pre + post). A `@return` change otherwise names nothing textual.
-/// - `InferredGuard(GlobalPath)`: its path segments directly.
+/// - `Signature` / `ContributedParam` / `Property(Signature)`: the changed
+///   signature's actual exported owner, resolved in the signature's own file
+///   (for a contributed param that is the callee's file, so the contributor's
+///   names stay out). An anonymous signature contributes nothing.
+/// - `InferredGuard(GlobalPath)`: its path segments directly; a guard that
+///   narrows differently without moving paths names nothing further.
 /// - `NetFlow` (a string-literal message name), `Metatable` (a literal range),
 ///   `Operator(Table)` and `TypeCache(SyntaxId)` name no Lua reference and are
 ///   skipped; file-level `ModuleExport`/`LoadEdges`/`Namespace`/
@@ -403,29 +476,32 @@ fn export_diff_changed_names(
     db: &DbIndex,
     file_id: FileId,
     diff: &ChangedExports,
-    pre: &PreEditNameSnapshot,
+    pre: &FxHashMap<FileId, PreEditNameSnapshot>,
 ) -> FxHashSet<SmolStr> {
     let mut names = FxHashSet::default();
-    let mut needs_file_fallback = false;
+    let file_pre = pre.get(&file_id);
     for key in diff.keys() {
         match key {
             ExportKey::Member(member_id) => {
-                insert_member_id_names(db, &mut names, member_id, pre);
+                insert_member_id_names(db, &mut names, member_id, file_pre);
             }
             ExportKey::TypeDecl(type_id) => {
                 insert_type_name(&mut names, type_id);
             }
             ExportKey::TypeCache(owner) => match owner {
                 LuaTypeOwner::Member(member_id) => {
-                    insert_member_id_names(db, &mut names, member_id, pre);
+                    insert_member_id_names(db, &mut names, member_id, file_pre);
                 }
                 LuaTypeOwner::Decl(decl_id) => {
-                    insert_decl_id_names(db, &mut names, decl_id, pre);
+                    insert_decl_id_names(db, &mut names, decl_id, file_pre);
                 }
                 LuaTypeOwner::SyntaxId(_) => {}
             },
-            ExportKey::Signature(_) | ExportKey::ContributedParam(..) => {
-                needs_file_fallback = true;
+            ExportKey::Signature(signature_id) => {
+                insert_signature_owner_names(db, &mut names, signature_id, pre);
+            }
+            ExportKey::ContributedParam(signature_id, _) => {
+                insert_signature_owner_names(db, &mut names, signature_id, pre);
             }
             ExportKey::InferredGuard(owner) => {
                 for part in owner.path() {
@@ -433,24 +509,19 @@ fn export_diff_changed_names(
                         names.insert(part.clone());
                     }
                 }
-                // The guard's path already names the function, but a guard that
-                // narrows differently without moving paths still changes what
-                // callers infer; fall back to the file's names as well so the
-                // change is not lost when paths are unchanged.
-                needs_file_fallback = true;
             }
             ExportKey::Property(semantic_id) => match semantic_id {
                 LuaSemanticDeclId::TypeDecl(type_id) => {
                     insert_type_name(&mut names, type_id);
                 }
                 LuaSemanticDeclId::Member(member_id) => {
-                    insert_member_id_names(db, &mut names, member_id, pre);
+                    insert_member_id_names(db, &mut names, member_id, file_pre);
                 }
                 LuaSemanticDeclId::LuaDecl(decl_id) => {
-                    insert_decl_id_names(db, &mut names, decl_id, pre);
+                    insert_decl_id_names(db, &mut names, decl_id, file_pre);
                 }
-                LuaSemanticDeclId::Signature(_) => {
-                    needs_file_fallback = true;
+                LuaSemanticDeclId::Signature(signature_id) => {
+                    insert_signature_owner_names(db, &mut names, signature_id, pre);
                 }
             },
             ExportKey::Operator(owner, _) => match owner {
@@ -462,10 +533,10 @@ fn export_diff_changed_names(
             ExportKey::NetFlow(_, _) | ExportKey::Metatable(_) => {}
             ExportKey::Realm(subject) => match subject {
                 RealmSubject::Decl(decl_id) => {
-                    insert_decl_id_names(db, &mut names, decl_id, pre);
+                    insert_decl_id_names(db, &mut names, decl_id, file_pre);
                 }
                 RealmSubject::Member(member_id) => {
-                    insert_member_id_names(db, &mut names, member_id, pre);
+                    insert_member_id_names(db, &mut names, member_id, file_pre);
                 }
             },
             ExportKey::FileRealmMetadata
@@ -473,10 +544,6 @@ fn export_diff_changed_names(
             | ExportKey::LoadEdges
             | ExportKey::Namespace => {}
         }
-    }
-    if needs_file_fallback {
-        names.extend(pre.all.iter().cloned());
-        names.extend(visible_names_in_file(db, file_id));
     }
     names
 }
@@ -608,9 +675,11 @@ pub struct DirtySet {
     /// each changed/added/removed [`ExportKey`] contributes the Lua name(s) another
     /// file would use to name it, resolved against the post-edit index with a
     /// pre-edit snapshot as fallback for removed keys (whose index entries are
-    /// already gone). This set never drives reindexing: it is cloned out before
-    /// [`EmmyLuaAnalysis::ripple`] and only widens the watched-file method's returned
-    /// diagnostic list. It is deliberately ignored by [`DirtySet::is_empty`] and
+    /// already gone). The ripple's own export diffs contribute a second sideband
+    /// set through `ripple_with_refresh_names`, merged with this one after the
+    /// ripple. Neither set drives reindexing: they stay out of `pending` and
+    /// `dirty.files` and only widen the watched-file method's returned
+    /// diagnostic list. They are deliberately ignored by [`DirtySet::is_empty`] and
     /// [`DirtySet::dirty_len`].
     textual_refresh_names: FxHashSet<SmolStr>,
 }
@@ -1231,6 +1300,19 @@ impl EmmyLuaAnalysis {
                 )
             };
             let diff = diff_exports(&old, &new);
+            // Diagnostic-refresh-only renames, independent of the export diff:
+            // a same-position rename moves no key, so without this its names
+            // never reach the watched-file refresh. Runs before the early exit
+            // and never touches `dirty.files`.
+            {
+                let renamed = decl_rename_refresh_names(
+                    self.compilation.get_db(),
+                    file_id,
+                    &map,
+                    pre_names.get(&file_id),
+                );
+                dirty.textual_refresh_names.extend(renamed);
+            }
             if diff.is_empty() {
                 continue;
             }
@@ -1239,9 +1321,13 @@ impl EmmyLuaAnalysis {
             // Diagnostic-refresh-only: name the Lua names this diff moved so the
             // watched-file path can refresh their textual referencers without
             // reindexing them. Never touches `dirty.files`.
-            if let Some(pre) = pre_names.get(&file_id) {
-                let changed =
-                    export_diff_changed_names(self.compilation.get_db(), file_id, &diff, pre);
+            {
+                let changed = export_diff_changed_names(
+                    self.compilation.get_db(),
+                    file_id,
+                    &diff,
+                    &pre_names,
+                );
                 dirty.textual_refresh_names.extend(changed);
             }
             dirty.guard_work |= diff.keys().any(|key| {
@@ -1320,9 +1406,26 @@ impl EmmyLuaAnalysis {
     /// named that needed no re-index of their own. A caller that publishes
     /// diagnostics needs that set and not just the files whose text changed —
     /// the point of the ripple is the files nobody edited.
-    pub fn ripple(&mut self, mut dirty: DirtySet) -> Vec<FileId> {
+    pub fn ripple(&mut self, dirty: DirtySet) -> Vec<FileId> {
+        self.ripple_with_refresh_names(dirty).0
+    }
+
+    /// [`ripple`](Self::ripple), plus the sideband textual names every ripple
+    /// export diff moved.
+    ///
+    /// Each batch is snapshotted before its re-index (a rippled file's removed
+    /// entries are gone afterwards, exactly like an edited file's), and the
+    /// names resolve after the ripple under a shared borrow. They never enter
+    /// `pending` or `dirty.files` and steer no reindex decision: which files
+    /// the ripple settled is decided by the change-driven pass alone. The
+    /// late parameter-consumer pass contributes its own sideband below, merged
+    /// the same way.
+    pub(crate) fn ripple_with_refresh_names(
+        &mut self,
+        mut dirty: DirtySet,
+    ) -> (Vec<FileId>, FxHashSet<SmolStr>) {
         if dirty.is_empty() {
-            return Vec::new();
+            return (Vec::new(), FxHashSet::default());
         }
         self.compilation
             .get_db_mut()
@@ -1342,6 +1445,10 @@ impl EmmyLuaAnalysis {
         let mut touched: FxHashSet<FileId> = dirty.sources.iter().copied().collect();
         touched.extend(pending.iter().copied());
         let mut round = 0usize;
+        // Sideband textual names from every ripple export diff, resolved after
+        // the ripple. Diagnostic-only: never enters `pending` or `touched`
+        // below, and steers no reindex decision.
+        let mut sideband: FxHashSet<SmolStr> = FxHashSet::default();
 
         while !pending.is_empty() {
             let mut batch = pending
@@ -1386,10 +1493,19 @@ impl EmmyLuaAnalysis {
                 .collect::<FxHashMap<_, _>>();
             // Their pre-batch guard facts join the snapshot for the same
             // reason the edited files' did: the re-index below overwrites them.
+            // The pre-batch name snapshots serve the sideband for the same
+            // reason: a rippled file's removed entries are gone afterwards.
             let batch_set = batch.iter().copied().collect::<FxHashSet<_>>();
             dirty
                 .guard_snapshot
                 .merge(self.inferred_guard_snapshot(&batch_set));
+            let mut batch_pres: FxHashMap<FileId, PreEditNameSnapshot> = FxHashMap::default();
+            for file_id in &batch {
+                batch_pres.insert(
+                    *file_id,
+                    snapshot_pre_edit_names(self.compilation.get_db(), *file_id),
+                );
+            }
 
             let profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
             if profile_enabled {
@@ -1407,6 +1523,24 @@ impl EmmyLuaAnalysis {
                     &FileRemap::identity(*file_id),
                 );
                 let diff = diff_exports(&before[file_id], &after);
+                // Sideband before the early exit: a rippled file whose own
+                // exports moved names its textual referencers, which hold no
+                // cached edge the change-driven pass could follow.
+                {
+                    let mut changed = export_diff_changed_names(
+                        self.compilation.get_db(),
+                        *file_id,
+                        &diff,
+                        &batch_pres,
+                    );
+                    changed.extend(decl_rename_refresh_names(
+                        self.compilation.get_db(),
+                        *file_id,
+                        &PositionMap::identity(),
+                        batch_pres.get(file_id),
+                    ));
+                    sideband.extend(changed);
+                }
                 if diff.is_empty() {
                     continue;
                 }
@@ -1451,11 +1585,19 @@ impl EmmyLuaAnalysis {
             &reanalyzed,
             &dirty.sources,
         );
-        let param_reindexed =
-            self.reindex_changed_inferred_param_consumers(&dirty.guard_snapshot, &reanalyzed);
+        // The late callee reindex can move exports of its own (a
+        // contributed-parameter change altering a differently named export),
+        // and its own ripple can move more. Both name sets bubble here;
+        // diagnostic-only, like every other sideband merge.
+        let (param_reindexed, param_names) = self
+            .reindex_changed_inferred_param_consumers_with_refresh_names(
+                &dirty.guard_snapshot,
+                &reanalyzed,
+            );
 
         reanalyzed.extend(guard_reindexed);
         reanalyzed.extend(param_reindexed);
+        sideband.extend(param_names);
         reanalyzed.extend(touched);
         reanalyzed.retain(|file_id| {
             self.compilation
@@ -1466,7 +1608,7 @@ impl EmmyLuaAnalysis {
         });
         reanalyzed.sort_unstable();
         reanalyzed.dedup();
-        reanalyzed
+        (reanalyzed, sideband)
     }
 
     /// Rebuilds only these files' own index entries.
@@ -2069,8 +2211,9 @@ impl EmmyLuaAnalysis {
     /// The returned set is what a caller has to re-diagnose. It is deliberately
     /// not just the files whose text changed: the files the ripple settled are
     /// the ones nobody edited and nobody would otherwise refresh. Past the
-    /// change-driven settle, textual referencers of the changed names are
-    /// appended as diagnostic-refresh-only candidates: they are collected via
+    /// change-driven settle, textual referencers of the changed names — from
+    /// both the batch and the ripple diffs — are appended as
+    /// diagnostic-refresh-only candidates: they are collected via
     /// `files_referencing_name` after the ripple, under a shared borrow, so
     /// they raise no `DirtySet::dirty_len` and move no index snapshot.
     ///
@@ -2167,13 +2310,17 @@ impl EmmyLuaAnalysis {
         // set itself.
         let refresh_names = dirty.textual_refresh_names.clone();
         let mut affected = changed;
-        affected.extend(self.ripple(dirty));
+        let (rippled, ripple_names) = self.ripple_with_refresh_names(dirty);
+        affected.extend(rippled);
         // Diagnostic-refresh-only, after the change-driven settle and before
-        // the detach: textual candidates via `files_referencing_name`, filtered
-        // to live `Main` files, sorted and deduped. No reindex, no `dirty_len`.
+        // the detach: batch and ripple names merged, then resolved to textual
+        // candidates via `files_referencing_name`, filtered to live `Main`
+        // files, sorted and deduped. No reindex, no `dirty_len`.
         {
+            let mut all_names = refresh_names;
+            all_names.extend(ripple_names);
             let exclude: FxHashSet<FileId> = affected.iter().copied().collect();
-            let textual = self.textual_refresh_candidates(&refresh_names, &exclude);
+            let textual = self.textual_refresh_candidates(&all_names, &exclude);
             affected.extend(textual);
         }
 

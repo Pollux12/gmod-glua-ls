@@ -6,6 +6,7 @@
 
 use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexKey, LuaNameExpr, LuaParenExpr};
 use rustc_hash::{FxHashMap, FxHashSet};
+use smol_str::SmolStr;
 
 use crate::*;
 
@@ -393,6 +394,26 @@ impl EmmyLuaAnalysis {
         old_snapshot: &InferredGuardSnapshot,
         already_reindexed: &[FileId],
     ) -> Vec<FileId> {
+        self.reindex_changed_inferred_param_consumers_with_refresh_names(
+            old_snapshot,
+            already_reindexed,
+        )
+        .0
+    }
+
+    /// [`reindex_changed_inferred_param_consumers`](Self::reindex_changed_inferred_param_consumers),
+    /// plus the sideband textual names its late reindex moved.
+    ///
+    /// The nested [`self_index_and_diff`](EmmyLuaAnalysis::self_index_and_diff)
+    /// names the callee exports the parameter change moved, and the nested
+    /// ripple names whatever those move in turn. Both are diagnostic-only:
+    /// they never enter `pending` or `dirty.files` and steer no reindex
+    /// decision; the caller merges them into its own sideband.
+    pub(crate) fn reindex_changed_inferred_param_consumers_with_refresh_names(
+        &mut self,
+        old_snapshot: &InferredGuardSnapshot,
+        already_reindexed: &[FileId],
+    ) -> (Vec<FileId>, FxHashSet<SmolStr>) {
         let new_params = self
             .compilation
             .get_db()
@@ -400,7 +421,7 @@ impl EmmyLuaAnalysis {
             .inferred_params_for_contributor_files(&old_snapshot.snapshot_file_ids);
         let old_params = &old_snapshot.inferred_params;
         if old_params.is_empty() && new_params.is_empty() {
-            return Vec::new();
+            return (Vec::new(), FxHashSet::default());
         }
 
         let already_reindexed = already_reindexed
@@ -418,7 +439,7 @@ impl EmmyLuaAnalysis {
         changed_files.sort_unstable();
         changed_files.dedup();
         if changed_files.is_empty() {
-            return Vec::new();
+            return (Vec::new(), FxHashSet::default());
         }
 
         let changed_files = changed_files
@@ -432,17 +453,24 @@ impl EmmyLuaAnalysis {
             })
             .collect::<Vec<_>>();
         if changed_files.is_empty() {
-            return Vec::new();
+            return (Vec::new(), FxHashSet::default());
         }
         // The parameter's consumers are the bodies that read it, which are the
         // files owning these signatures. Whatever those bodies then derive
         // differently is found by diffing their exports, the same way any
         // other edit ripples; expanding to every dependency re-analysed the
-        // workspace for one parameter.
+        // workspace for one parameter. The nested self-index names are kept
+        // and the nested ripple's own names are merged, so a late callee move
+        // still reaches lazy textual readers upstream.
         let mut reanalyzed = changed_files.clone();
         let dirty = self.self_index_and_diff(changed_files);
-        reanalyzed.extend(self.ripple(dirty));
-        reanalyzed
+        let mut names = dirty.textual_refresh_names.clone();
+        let (rippled, ripple_names) = self.ripple_with_refresh_names(dirty);
+        reanalyzed.extend(rippled);
+        names.extend(ripple_names);
+        reanalyzed.sort_unstable();
+        reanalyzed.dedup();
+        (reanalyzed, names)
     }
 
     pub(crate) fn reconcile_equivalent_inferred_guard_owners(

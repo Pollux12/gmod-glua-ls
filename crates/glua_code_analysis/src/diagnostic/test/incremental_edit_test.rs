@@ -32,6 +32,14 @@ mod tests {
         codes
     }
 
+    fn revision_of(ws: &VirtualWorkspace, file_id: FileId) -> u64 {
+        ws.analysis
+            .compilation
+            .get_db()
+            .get_reference_index()
+            .file_reference_revision(file_id)
+    }
+
     fn write(ws: &mut VirtualWorkspace, uri: &Uri, text: &str) -> FileId {
         ws.analysis
             .update_file_by_uri(uri, Some(text.to_string()))
@@ -2900,5 +2908,418 @@ end
             is_false()
         );
         expect_that!(dirty.files(), contains(eq(&consumer_id)));
+    }
+
+    /// A ripple-moved inference still refreshes the file that only names it.
+    #[gtest]
+    fn ripple_moved_inference_refreshes_its_lazy_reader() {
+        // The provider's edit re-analyses the middleman, whose inferred global
+        // follows the provider's value; the middleman's own export diff then
+        // names the consumer that reads it. The consumer sits in neither dirty
+        // set, keeps its reference revision, and still comes back from the
+        // watched batch.
+        let mut ws = workspace_with(vec![]);
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/chainprovider.lua");
+        let provider_id = write(&mut ws, &provider_uri, "Chain = { Value = 1 }\n");
+        let middle_uri = ws.virtual_url_generator.new_uri("lua/chainmiddle.lua");
+        let middle_id = write(&mut ws, &middle_uri, "Binferred = Chain.Value\n");
+        let consumer_uri = ws.virtual_url_generator.new_uri("lua/chainconsumer.lua");
+        let consumer_id = write(&mut ws, &consumer_uri, "local got = Binferred\n");
+
+        // Staged: the middleman is change-driven dirty, the consumer is not.
+        ws.analysis
+            .update_file_text_only(&provider_uri, "Chain = { Value = \"text\" }\n".to_string())
+            .expect("staged provider text");
+        let dirty = ws.analysis.self_index_and_diff(vec![provider_id]);
+        expect_that!(dirty.files(), contains(eq(&middle_id)));
+        expect_that!(dirty.files(), not(contains(eq(&consumer_id))));
+        ws.analysis.ripple(dirty);
+
+        // Watched from clean: the consumer comes back with its revision put.
+        write(&mut ws, &provider_uri, "Chain = { Value = 1 }\n");
+        let revision_before = revision_of(&ws, consumer_id);
+        let affected = ws.analysis.apply_file_system_changes(vec![(
+            provider_uri.clone(),
+            Some("Chain = { Value = \"text\" }\n".to_string()),
+        )]);
+        expect_that!(affected, contains(eq(&middle_id)));
+        expect_that!(affected, contains(eq(&consumer_id)));
+        expect_that!(revision_of(&ws, consumer_id), eq(revision_before));
+    }
+
+    /// A contributed-param change names the callee's owner, not the contributor's.
+    ///
+    /// The caller contributes argument types to the callee's signature, so the
+    /// `ContributedParam` key lives in the caller's export map while the
+    /// signature — and the function it belongs to — lives in the callee's
+    /// file. The owner resolves in the signature's own file (`Run` on the
+    /// mixin); the caller's own globals (`CallerMarker`) stay out of the
+    /// refresh set, which the old all-visible-names fallback got wrong.
+    #[gtest]
+    fn contributed_param_change_names_the_callee_owner() {
+        let caller_text = |argument: &str| {
+            format!(
+                r#"
+            CallerMarker = {{}}
+            local PANEL = {{}}
+            local OTHER = {{}}
+            function PANEL:ProvidedByReceiver() end
+            function OTHER:SomethingElse() end
+            function PANEL:Load()
+                self.Mixin = include("mixins/shared.lua")
+            end
+            function PANEL:Dispatch(name)
+                local callback = self.Mixin[name]
+                callback({argument})
+            end
+            "#
+            )
+        };
+        let mut ws = workspace_with(vec![]);
+        ws.def_file(
+            "lua/mixins/shared.lua",
+            r#"
+            local MIXIN = {}
+            function MIXIN.Run(self)
+                self:ProvidedByReceiver()
+            end
+            return MIXIN
+            "#,
+        );
+        let caller_uri = ws.virtual_url_generator.new_uri("lua/autorun/consumer.lua");
+        let caller_id = write(&mut ws, &caller_uri, &caller_text("self"));
+        // The call has to actually contribute, or the diff below is vacuous.
+        expect_that!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_call_site_param_index()
+                .iter_inferred_params()
+                .count(),
+            gt(0)
+        );
+
+        let before =
+            fingerprint_before_edit(&ws, caller_id, &caller_text("self"), &caller_text("OTHER"));
+        ws.analysis
+            .update_file_text_only(&caller_uri, caller_text("OTHER"))
+            .expect("staged caller text");
+        let dirty = ws.analysis.self_index_and_diff(vec![caller_id]);
+        // The change is a contributed-param move in the caller's map, dirtying
+        // nothing, and the refresh names the callee owner without the
+        // contributor's own globals.
+        expect_that!(dirty.changed_sources(), contains(eq(&caller_id)));
+        expect_that!(dirty.dirty_len(), eq(0));
+        let after = fingerprint_of(&ws, caller_id);
+        let diff = crate::diff_exports(&before, &after);
+        expect_that!(
+            diff.keys()
+                .any(|key| matches!(key, crate::ExportKey::ContributedParam(..))),
+            is_true()
+        );
+        let mut names: Vec<String> = dirty
+            .textual_refresh_names()
+            .iter()
+            .map(|name| name.as_str().to_string())
+            .collect();
+        names.sort_unstable();
+        expect_that!(names, contains(eq(&"Run".to_string())));
+        expect_that!(names, not(contains(eq(&"CallerMarker".to_string()))));
+        ws.analysis.ripple(dirty);
+    }
+
+    /// An assignment-form signature owner still names its member.
+    ///
+    /// `M.Fn = function() end` stores the signature in the member's type
+    /// cache rather than sharing a property with it, so the property leg
+    /// finds nothing and only the type-cache scan names the owner. Distinct
+    /// from the function-stat (`function M.Fn() end`) property-leg test
+    /// above; the contributor's own globals stay out either way.
+    #[gtest]
+    fn contributed_param_change_names_the_assignment_form_owner() {
+        let caller_text = |argument: &str| {
+            format!(
+                r#"
+            CallerMarker = {{}}
+            local PANEL = {{}}
+            local OTHER = {{}}
+            function PANEL:ProvidedByReceiver() end
+            function OTHER:SomethingElse() end
+            function PANEL:Load()
+                self.Mixin = include("mixins/shared_assign.lua")
+            end
+            function PANEL:Dispatch(name)
+                local callback = self.Mixin[name]
+                callback({argument})
+            end
+            "#
+            )
+        };
+        let mut ws = workspace_with(vec![]);
+        ws.def_file(
+            "lua/mixins/shared_assign.lua",
+            r#"
+            local MIXIN = {}
+            MIXIN.Run = function(self)
+                self:ProvidedByReceiver()
+            end
+            return MIXIN
+            "#,
+        );
+        let caller_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/assignconsumer.lua");
+        let caller_id = write(&mut ws, &caller_uri, &caller_text("self"));
+        expect_that!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_call_site_param_index()
+                .iter_inferred_params()
+                .count(),
+            gt(0)
+        );
+
+        let before =
+            fingerprint_before_edit(&ws, caller_id, &caller_text("self"), &caller_text("OTHER"));
+        ws.analysis
+            .update_file_text_only(&caller_uri, caller_text("OTHER"))
+            .expect("staged caller text");
+        let dirty = ws.analysis.self_index_and_diff(vec![caller_id]);
+        expect_that!(dirty.changed_sources(), contains(eq(&caller_id)));
+        expect_that!(dirty.dirty_len(), eq(0));
+        let after = fingerprint_of(&ws, caller_id);
+        let diff = crate::diff_exports(&before, &after);
+        expect_that!(
+            diff.keys()
+                .any(|key| matches!(key, crate::ExportKey::ContributedParam(..))),
+            is_true()
+        );
+        let mut names: Vec<String> = dirty
+            .textual_refresh_names()
+            .iter()
+            .map(|name| name.as_str().to_string())
+            .collect();
+        names.sort_unstable();
+        expect_that!(names, contains(eq(&"Run".to_string())));
+        expect_that!(names, not(contains(eq(&"CallerMarker".to_string()))));
+        ws.analysis.ripple(dirty);
+    }
+
+    /// A late callee move still refreshes its lazy reader.
+    ///
+    /// The contributor edit reindexes its callee late, after the outer ripple
+    /// already ran, changing a differently named export there (`Out`, not
+    /// `Run`). That reindexes the middleman (`MidLateInferred =
+    /// ParamLateHolder.Out`), whose own diff then names the lazy reader
+    /// (`local got = MidLateInferred`). Both the nested self-index names and
+    /// the nested ripple names bubble into the outer sideband; without that
+    /// the reader keeps a stale report. Diagnostic-only throughout: no extra
+    /// reindex, no revision move for the reader.
+    #[gtest]
+    fn contributed_param_late_callee_move_refreshes_lazy_reader() {
+        let caller_text = |argument: &str| {
+            format!(
+                r#"
+            local PANEL = {{}}
+            local OTHER = {{}}
+            function PANEL:ProvidedByReceiver() end
+            function OTHER:SomethingElse() end
+            function PANEL:Load()
+                self.Mixin = include("mixins/shared_late.lua")
+            end
+            function PANEL:Dispatch(name)
+                local callback = self.Mixin[name]
+                callback({argument})
+            end
+            "#
+            )
+        };
+        let mut ws = workspace_with(vec![]);
+        ws.def_file(
+            "lua/mixins/shared_late.lua",
+            r#"
+            local MIXIN = {}
+            ParamLateHolder = {}
+            function MIXIN.Run(self)
+                ParamLateHolder.Out = self
+            end
+            return MIXIN
+            "#,
+        );
+        let caller_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/lateconsumer.lua");
+        let caller_id = write(&mut ws, &caller_uri, &caller_text("self"));
+        let callee_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/mixins/shared_late.lua");
+        let callee_id = ws.analysis.get_file_id(&callee_uri).expect("callee id");
+        let middle_uri = ws.virtual_url_generator.new_uri("lua/latemiddle.lua");
+        let middle_id = write(
+            &mut ws,
+            &middle_uri,
+            "MidLateInferred = ParamLateHolder.Out\n",
+        );
+        let reader_uri = ws.virtual_url_generator.new_uri("lua/latereader.lua");
+        let reader_id = write(&mut ws, &reader_uri, "local got = MidLateInferred\n");
+        expect_that!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_call_site_param_index()
+                .iter_inferred_params()
+                .count(),
+            gt(0)
+        );
+
+        // Staged: the contributor move is a contributed-param change that
+        // dirties nothing change-driven, while the callee owner is named.
+        ws.analysis
+            .update_file_text_only(&caller_uri, caller_text("OTHER"))
+            .expect("staged contributor text");
+        let dirty = ws.analysis.self_index_and_diff(vec![caller_id]);
+        expect_that!(dirty.changed_sources(), contains(eq(&caller_id)));
+        expect_that!(dirty.dirty_len(), eq(0));
+        expect_that!(dirty.files(), not(contains(eq(&reader_id))));
+        ws.analysis.ripple(dirty);
+
+        // Watched from clean: the callee and the middleman are reindexed, the
+        // lazy reader comes back un-reindexed via the bubbled sideband.
+        write(&mut ws, &caller_uri, &caller_text("self"));
+        let revision_before = revision_of(&ws, reader_id);
+        let affected = ws
+            .analysis
+            .apply_file_system_changes(vec![(caller_uri.clone(), Some(caller_text("OTHER")))]);
+        expect_that!(affected, contains(eq(&callee_id)));
+        expect_that!(affected, contains(eq(&middle_id)));
+        expect_that!(affected, contains(eq(&reader_id)));
+        expect_that!(revision_of(&ws, reader_id), eq(revision_before));
+        let mut sorted = affected.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        expect_that!(affected, eq(&sorted));
+    }
+
+    /// A removed non-name member still names its owner.
+    ///
+    /// The dropped slot's integer key is no Lua name, but its owner — the
+    /// `Arr` global path — is, on both the pre and the post side. The owner's
+    /// referencers are refreshed without reindexing them.
+    #[gtest]
+    fn non_name_member_removal_refreshes_owner_referencers() {
+        let mut ws = workspace_with(vec![]);
+        let first = "Arr = {}\nArr[1] = \"a\"\nArr[2] = \"b\"\n";
+        let second = "Arr = {}\nArr[1] = \"a\"\n";
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/arrprovider.lua");
+        let provider_id = write(&mut ws, &provider_uri, first);
+        let consumer_uri = ws.virtual_url_generator.new_uri("lua/arrconsumer.lua");
+        let consumer_id = write(&mut ws, &consumer_uri, "local observed = Arr\n");
+
+        // The dropped slot really is a non-name member on a named owner, or
+        // the refresh below would prove nothing.
+        {
+            let db = ws.analysis.compilation.get_db();
+            let member_index = db.get_member_index();
+            let dropped = member_index
+                .get_file_members(provider_id)
+                .iter()
+                .find(|member| member.get_key() == &crate::LuaMemberKey::Integer(2))
+                .map(|member| member.get_id())
+                .expect("integer slot under test");
+            let owner = member_index
+                .get_member_owner(&dropped)
+                .map(|owner| format!("{owner:?}"));
+            expect_that!(owner, some(contains_substring("Arr")));
+        }
+
+        // Staged: the removal moves an export but dirties nothing, and the
+        // refresh carries the owner rather than the integer key.
+        ws.analysis
+            .update_file_text_only(&provider_uri, second.to_string())
+            .expect("staged provider text");
+        let dirty = ws.analysis.self_index_and_diff(vec![provider_id]);
+        expect_that!(dirty.changed_sources(), contains(eq(&provider_id)));
+        expect_that!(dirty.dirty_len(), eq(0));
+        let mut names: Vec<String> = dirty
+            .textual_refresh_names()
+            .iter()
+            .map(|name| name.as_str().to_string())
+            .collect();
+        names.sort_unstable();
+        expect_that!(names, contains(eq(&"Arr".to_string())));
+        ws.analysis.ripple(dirty);
+
+        // Watched from clean: the owner referencer comes back un-reindexed.
+        write(&mut ws, &provider_uri, first);
+        let revision_before = revision_of(&ws, consumer_id);
+        let affected = ws
+            .analysis
+            .apply_file_system_changes(vec![(provider_uri.clone(), Some(second.to_string()))]);
+        expect_that!(affected, contains(eq(&consumer_id)));
+        expect_that!(revision_of(&ws, consumer_id), eq(revision_before));
+    }
+
+    /// A same-position global rename moves no export key, yet both the old and
+    /// the new name's referencers owe a diagnostic refresh.
+    ///
+    /// The rename check runs independently of the export diff, before its
+    /// early exit: `function OldName() end` to `function NewName() end` keeps
+    /// every position-derived key identical, so the dirty set stays empty
+    /// while the refresh names carry both sides. Both halves stay
+    /// diagnostic-only: no reindex, no revision move.
+    #[gtest]
+    fn global_function_rename_refreshes_old_and_new_referencers() {
+        let mut ws = workspace_with(vec![DiagnosticCode::UndefinedGlobal]);
+        let first = "function OldName() end\n";
+        let second = "function NewName() end\n";
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/renamefunc.lua");
+        let provider_id = write(&mut ws, &provider_uri, first);
+
+        let old_consumer_uri = ws.virtual_url_generator.new_uri("lua/usesold.lua");
+        let old_consumer_id = write(&mut ws, &old_consumer_uri, "OldName()\n");
+        let new_consumer_uri = ws.virtual_url_generator.new_uri("lua/usesnew.lua");
+        let new_consumer_id = write(&mut ws, &new_consumer_uri, "NewName()\n");
+        expect_that!(codes_in(&ws, old_consumer_id), is_empty());
+        expect_that!(
+            codes_in(&ws, new_consumer_id),
+            contains(eq(DiagnosticCode::UndefinedGlobal.get_name()))
+        );
+
+        // Staged: the rename moves no export, so nothing is dirty, but both
+        // names are named for refresh.
+        ws.analysis
+            .update_file_text_only(&provider_uri, second.to_string())
+            .expect("staged provider text");
+        let dirty = ws.analysis.self_index_and_diff(vec![provider_id]);
+        expect_that!(dirty.dirty_len(), eq(0));
+        expect_true!(dirty.changed_sources().is_empty());
+        let mut names: Vec<String> = dirty
+            .textual_refresh_names()
+            .iter()
+            .map(|name| name.as_str().to_string())
+            .collect();
+        names.sort_unstable();
+        expect_that!(names, contains(eq(&"OldName".to_string())));
+        expect_that!(names, contains(eq(&"NewName".to_string())));
+        ws.analysis.ripple(dirty);
+
+        // Watched from clean: both referencers come back, un-reindexed, and
+        // their diagnostics flip sides.
+        write(&mut ws, &provider_uri, first);
+        let old_revision_before = revision_of(&ws, old_consumer_id);
+        let new_revision_before = revision_of(&ws, new_consumer_id);
+        let affected = ws
+            .analysis
+            .apply_file_system_changes(vec![(provider_uri.clone(), Some(second.to_string()))]);
+        expect_that!(affected, contains(eq(&old_consumer_id)));
+        expect_that!(affected, contains(eq(&new_consumer_id)));
+        expect_that!(revision_of(&ws, old_consumer_id), eq(old_revision_before));
+        expect_that!(revision_of(&ws, new_consumer_id), eq(new_revision_before));
+        expect_that!(
+            codes_in(&ws, old_consumer_id),
+            contains(eq(DiagnosticCode::UndefinedGlobal.get_name()))
+        );
+        expect_that!(codes_in(&ws, new_consumer_id), is_empty());
     }
 }
