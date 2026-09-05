@@ -16,8 +16,8 @@ mod test {
     // with no parse errors to blame, `Unknown` can only come from inference
     // bailing out.
     //
-    // Deep trees drop on the same small-stack threads via the grown-stack
-    // `LuaSyntaxTree::Drop`, so no test leaks to avoid teardown.
+    // Deep trees drop on the same small-stack threads via iterative rowan
+    // green-node freeing, so no test leaks to avoid teardown.
     use glua_parser::{
         LuaAstNode, LuaAstToken, LuaDocTagParam, LuaExpr, LuaLocalName, LuaParser, LuaUnaryExpr,
         ParserConfig,
@@ -136,13 +136,24 @@ mod test {
             .expect("production-sized worker must not overflow its stack");
     }
 
+    // No single depth isolates the inference guard in both profiles:
+    // release needs >= ~3500 for `infer_expr` to trip (3000 folds to a
+    // const) while debug's fatter parser frames already error at ~3050,
+    // which would blame the parser instead of inference. Depths encode
+    // profile-specific frame sizes, so each profile uses its own depth
+    // inside the clean-parse + infer-bail window.
+    #[cfg(debug_assertions)]
+    const MINUS_CHAIN_DEPTH: usize = 3000;
+    #[cfg(not(debug_assertions))]
+    const MINUS_CHAIN_DEPTH: usize = 5000;
+
     /// `infer_expr`'s own reserve guard, isolated: a `-` chain parses with
     /// one frame per level (zero parse errors even on 2 MB) while inference
     /// recurses per level, so `Unknown` here can only come from the inference
     /// guard.
     #[test]
     fn infer_expr_bails_via_stack_reserve_not_parse_errors() {
-        let body = minus_chain_source(3000);
+        let body = minus_chain_source(MINUS_CHAIN_DEPTH);
         let control_body = body.clone();
         std::thread::Builder::new()
             .stack_size(SMALL_STACK)

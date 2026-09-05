@@ -639,7 +639,7 @@ mod tests {
             body
         }
 
-        let deep = deep_blocks(3000);
+        let deep = deep_blocks(20000);
         std::thread::Builder::new()
             .stack_size(2 * 1024 * 1024)
             .spawn(move || {
@@ -745,7 +745,7 @@ mod tests {
             body
         }
 
-        let deep = deep_blocks(3000);
+        let deep = deep_blocks(20000);
         std::thread::Builder::new()
             .stack_size(2 * 1024 * 1024)
             .spawn(move || {

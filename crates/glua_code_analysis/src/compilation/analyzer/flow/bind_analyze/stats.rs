@@ -7,7 +7,7 @@ use glua_parser::{
 
 use crate::{
     AnalyzeError, AssignVarHint, AssignmentFlowInfo, AssignmentNameTarget, BranchLabelInfo,
-    DiagnosticCode, FlowId, FlowNodeKind, LuaClosureId, LuaDeclId,
+    DiagnosticCode, FlowId, FlowNodeKind, LuaClosureId, LuaDeclId, analysis_stack_exhausted,
     compilation::analyzer::flow::{
         bind_analyze::{
             bind_block, bind_each_child, bind_node,
@@ -367,6 +367,11 @@ pub fn bind_return_stat(
 }
 
 fn bind_top_level_expr(binder: &mut FlowBinder, expr: LuaExpr, current: FlowId) -> FlowId {
+    // Crash-safety guard (not a budget): skip the subtree when the stack
+    // reserve is exhausted, before creating any flow nodes for it.
+    if analysis_stack_exhausted() {
+        return current;
+    }
     bind_expr(binder, expr.clone(), current);
 
     let Some(call_expr) = unwrap_top_level_call_expr(&expr) else {

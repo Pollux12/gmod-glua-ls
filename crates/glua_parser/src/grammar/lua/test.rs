@@ -1226,10 +1226,12 @@ local y = 2
     }
 
     // Regression test: deep call nesting must degrade to a parse error,
-    // never abort the process with a stack overflow.
+    // never abort the process with a stack overflow. Depth exceeds the
+    // release-frame trip point (~4173 on 2 MB) with margin; debug frames
+    // are fatter and trip even earlier.
     #[test]
     fn deeply_nested_calls_parse_to_error_not_abort() {
-        let depth = 3000;
+        let depth = 20000;
         let mut body = String::from("local function f(x) return x end\nlocal v = ");
         for _ in 0..depth {
             body.push_str("f(");
@@ -1286,10 +1288,11 @@ local y = 2
     // innermost token is a statement start the recovery loop used to retry the
     // same token at the same depth forever. `parse_stats` now breaks on
     // no-progress instead. The watchdog turns a regression into a failure
-    // rather than a hung suite.
+    // rather than a hung suite. Depth exceeds the release-frame trip point
+    // (~3755 on 2 MB) with margin; debug frames are fatter and trip earlier.
     #[test]
     fn deeply_nested_blocks_with_statement_start_terminates() {
-        let depth = 3000;
+        let depth = 20000;
         let mut body = String::new();
         for _ in 0..depth {
             body.push_str("do ");
@@ -1327,13 +1330,14 @@ local y = 2
 
     // Regression: a guard-tripped block tree must also drop safely on a
     // production-sized (2 MB) thread. The parse bails via the reserve guard,
-    // but the resulting ~6000-level green tree previously aborted the process
+    // but the resulting deep green tree previously aborted the process
     // in recursive `GreenNode` destruction. Rowan now frees green nodes
     // iteratively, so the ordinary drop below is O(1) stack; join-based like
-    // the existing 2 MB tests.
+    // the existing 2 MB tests. Depth exceeds the release-frame trip point
+    // (~3755 on 2 MB) with margin; debug frames are fatter and trip earlier.
     #[test]
     fn deeply_nested_blocks_drop_safely_on_small_stack() {
-        let depth = 3000;
+        let depth = 20000;
         let mut body = String::new();
         for _ in 0..depth {
             body.push_str("do ");
@@ -1387,7 +1391,9 @@ local y = 2
     // join-based like the existing 2 MB tests.
     #[test]
     fn deeply_nested_blocks_red_root_outlives_tree_drops_safely_on_small_stack() {
-        let depth = 3000;
+        // Depth exceeds the release-frame trip point (~3755 on 2 MB) with
+        // margin; debug frames are fatter and trip earlier.
+        let depth = 20000;
         let mut body = String::new();
         for _ in 0..depth {
             body.push_str("do ");
