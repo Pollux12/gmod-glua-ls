@@ -1094,10 +1094,15 @@ mod test {
                 "lua/autorun/mp_1_widen.lua",
                 r#"
                 local tb = { s = "b" }
+                local keyed = {}
                 local selected = "init"
                 local function f()
                     for kb in pairs(tb) do
                         selected = kb
+                        keyed[kb] = true
+                    end
+                    for observed in pairs(keyed) do
+                        mp_key_out = observed
                     end
                 end
                 tb[true] = 1
@@ -1129,19 +1134,6 @@ mod test {
                     for key in pairs(keys) do
                         first, second = echo(key)
                     end
-                end
-                "#,
-            ),
-            (
-                "lua/autorun/mp_6_exprkey.lua",
-                r#"
-                local key = tostring(1)
-                local t = {
-                    [key] = 1,
-                }
-
-                for k in pairs(t) do
-                    mp_key_out = k
                 end
                 "#,
             ),
@@ -1181,6 +1173,10 @@ mod test {
         assert_eq!(first_ty, key_ty);
         assert_eq!(second_ty, key_ty);
 
-        assert_eq!(ws.expr_ty("mp_key_out"), LuaType::String);
+        // The computed-key target is written with the widening loop key
+        // before `tb[true]` widens it, then iterated into a global: the
+        // member key must move after `kb` settles, forcing the unfiltered
+        // round that rederives the second loop.
+        assert_eq!(ws.expr_ty("mp_key_out"), kb_ty);
     }
 }

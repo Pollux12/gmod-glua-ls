@@ -147,6 +147,23 @@ impl InferCacheManager {
         }
     }
 
+    /// Drops every narrowing answer memoized for these files, including
+    /// successful ones.
+    ///
+    /// A successful flow answer survives `clear_files_deferred_results`, but
+    /// narrowing a name reads the type of whatever it was derived from — so
+    /// once a settled pass moves a value, every flow answer that read it is
+    /// void. The settled assign replay re-reads moved declarations through
+    /// flow narrowing, so it voids them up front; otherwise the first round's
+    /// answer keeps winning over the settled declaration type.
+    pub fn clear_files_flow_results(&mut self, file_ids: &FxHashSet<FileId>) {
+        for file_id in file_ids {
+            if let Some(infer_cache) = self.infer_map.get_mut(file_id) {
+                infer_cache.clear_flow_results();
+            }
+        }
+    }
+
     pub fn drain_inferred_guard_dependencies(
         &mut self,
     ) -> Vec<(FileId, FxHashSet<LuaInferredGuardOwner>)> {
