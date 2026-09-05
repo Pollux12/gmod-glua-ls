@@ -83,6 +83,10 @@ stacker = "0.1"
 
 [patch.crates-io]
 emmylua_codestyle = { path = "vendor/emmylua_codestyle" }
+# Vendored for the iterative `GreenNode` drop and the stored-hash `NodeCache`
+# rehash key (deep-tree teardown and cache rehashing overflow small stacks
+# otherwise); see `vendor/rowan/Cargo.toml` for provenance.
+rowan = { path = "vendor/rowan" }
 
 [profile.profiling]
 inherits = "release"

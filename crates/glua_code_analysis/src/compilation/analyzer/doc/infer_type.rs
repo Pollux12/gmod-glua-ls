@@ -881,9 +881,7 @@ mod test {
     // The analyzer doc walker shares the analysis stack reserve with
     // expression inference: suffixed `[]` types parse in a loop (zero parse
     // errors on any thread) while `infer_type` recurses per level, so
-    // `Unknown` here can only come from this walker's guard. The deep
-    // complete tree is intentionally leaked on the small-stack thread: rowan
-    // drops nested trees recursively with no reserve check.
+    // `Unknown` here can only come from this walker's guard.
     use glua_parser::{LuaAstNode, LuaComment, LuaDocTagParam, LuaParser, ParserConfig};
 
     use crate::{DbIndex, FileId, LuaType, WorkspaceId};
@@ -937,7 +935,6 @@ mod test {
             WorkspaceId::MAIN,
         );
         let ty = infer_type(&mut analyzer, doc_type);
-        std::mem::forget(tree);
         ty
     }
 

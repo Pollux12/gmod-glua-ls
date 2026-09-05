@@ -618,4 +618,166 @@ mod tests {
         // Same byte length, but the blank line splits the doc block in two.
         assert!(!vfs.content_semantically_matches(file_id, "--- a\n\n--- b\nlocal c = 1"));
     }
+
+    /// VFS ownership drops a guard-tripped tree safely on a production-sized
+    /// (2 MB) thread. Drives the real replace/remove/stale/deferred entries —
+    /// not a synthetic drop call — so the LSP/VFS boundary teardown is what is
+    /// exercised. Rowan frees green nodes iteratively, so every ordinary drop
+    /// below is O(1) stack.
+    #[test]
+    fn deep_tree_vfs_replace_and_remove_drop_safely_on_small_stack() {
+        fn deep_blocks(depth: usize) -> String {
+            let mut body = String::new();
+            for _ in 0..depth {
+                body.push_str("do ");
+            }
+            body.push('x');
+            for _ in 0..depth {
+                body.push_str(" end");
+            }
+            body.push('\n');
+            body
+        }
+
+        let deep = deep_blocks(3000);
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let mut vfs = new_vfs();
+                let uri = file_uri();
+
+                let (tree, line_index) = parse_lua(&deep);
+                assert!(
+                    tree.get_errors()
+                        .iter()
+                        .any(|error| error.message.contains("too deeply nested")),
+                    "deep blocks must trip the stack reserve guard"
+                );
+                vfs.set_file_content_preparsed(&uri, Some(deep.clone()), tree, line_index, Some(1))
+                    .expect("initial deep insert must be accepted");
+
+                let (shallow_tree, shallow_index) = parse_lua("local x = 1");
+                vfs.set_file_content_preparsed(
+                    &uri,
+                    Some("local x = 1".to_string()),
+                    shallow_tree,
+                    shallow_index,
+                    Some(2),
+                )
+                .expect("replacement must be accepted");
+
+                let (tree, line_index) = parse_lua(&deep);
+                vfs.set_file_content_preparsed(&uri, Some(deep.clone()), tree, line_index, Some(3))
+                    .expect("deep re-insert must be accepted");
+                vfs.remove_file(&uri).expect("remove must succeed");
+
+                let (tree, line_index) = parse_lua("local y = 2");
+                vfs.set_file_content_preparsed(
+                    &uri,
+                    Some("local y = 2".to_string()),
+                    tree,
+                    line_index,
+                    Some(5),
+                )
+                .expect("fresh insert after remove must be accepted");
+                let (stale_tree, stale_index) = parse_lua(&deep);
+                assert!(
+                    vfs.set_file_content_preparsed(
+                        &uri,
+                        Some(deep.clone()),
+                        stale_tree,
+                        stale_index,
+                        Some(4),
+                    )
+                    .is_none(),
+                    "stale preparsed update must be rejected"
+                );
+
+                let (tree, line_index) = parse_lua(&deep);
+                let (_, deferred) = vfs
+                    .set_file_content_preparsed_deferred(
+                        &uri,
+                        Some(deep.clone()),
+                        tree,
+                        line_index,
+                        Some(6),
+                    )
+                    .expect("deferred deep insert must be accepted");
+                drop(deferred);
+
+                let (tree, line_index) = parse_lua("local z = 3");
+                let (_, deferred) = vfs
+                    .set_file_content_preparsed_deferred(
+                        &uri,
+                        Some("local z = 3".to_string()),
+                        tree,
+                        line_index,
+                        Some(7),
+                    )
+                    .expect("deferred replacement must be accepted");
+                drop(deferred);
+            })
+            .expect("worker thread should spawn")
+            .join()
+            .expect("production-sized worker must not overflow when VFS drops deep trees");
+    }
+
+    /// VFS `set_file_content` (real parse through the shared `NodeCache`)
+    /// followed by `clear` and by VFS destruction must drop safely on a
+    /// production-sized (2 MB) thread — including a red root retained past
+    /// `clear`, whose final release previously aborted in recursive `GreenNode`
+    /// destruction. Rowan now frees green nodes iteratively, so the retained
+    /// red, the cleared trees, the dropped `NodeCache`, and the destroyed VFS
+    /// below are all safe on this 2 MB stack; join-based like the existing
+    /// 2 MB test.
+    #[test]
+    fn deep_tree_vfs_clear_and_destroy_drop_safely_on_small_stack() {
+        fn deep_blocks(depth: usize) -> String {
+            let mut body = String::new();
+            for _ in 0..depth {
+                body.push_str("do ");
+            }
+            body.push('x');
+            for _ in 0..depth {
+                body.push_str(" end");
+            }
+            body.push('\n');
+            body
+        }
+
+        let deep = deep_blocks(3000);
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let mut vfs = new_vfs();
+                let uri = file_uri();
+                let file_id = vfs.set_file_content(&uri, Some(deep.clone()));
+                assert!(
+                    vfs.get_file_parse_error(&file_id)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|error| error.message.contains("too deeply nested")),
+                    "deep blocks must trip the stack reserve guard"
+                );
+                // Retain a red root past `clear`: the trees are gone but the
+                // green stays pinned until this last red dies below.
+                let red = vfs
+                    .get_syntax_tree(&file_id)
+                    .expect("deep file must have a tree")
+                    .get_red_root();
+                vfs.clear();
+                drop(red);
+
+                // And the destruction path: `Vfs` has no `Drop` impl, so every
+                // tree and the whole `NodeCache` release inline here on 2 MB.
+                let mut vfs = new_vfs();
+                vfs.set_file_content(&uri, Some(deep.clone()));
+                drop(vfs);
+            })
+            .expect("worker thread should spawn")
+            .join()
+            .expect(
+                "production-sized worker must not overflow when VFS clears or drops deep trees",
+            );
+    }
 }
