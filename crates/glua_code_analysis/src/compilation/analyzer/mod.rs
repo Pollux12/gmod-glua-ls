@@ -832,6 +832,27 @@ fn rederive_settled_iter_vars(
     (!written.is_empty(), written)
 }
 
+/// Cheap prefilter for [`refresh_settled_expr_type_member_keys`]: whether `member`
+/// may hold a stale dynamic key, decided without reading any syntax tree.
+///
+/// An `ExprType` key is always minted from a key expression. A `Name`/`Integer`
+/// key on an index or table-field node may instead be a const-folded one
+/// (`keyed[kb]` filed as `Name("s")` while `kb` narrowed to that literal); the
+/// per-member pass resolves the node and keeps only those whose key syntax
+/// really is an expression, so static writes (`t.field`, `t["lit"]`, `{ key = v }`)
+/// never pay for re-inference.
+fn is_settled_member_rekey_candidate(member: &LuaMember) -> bool {
+    let key = member.get_key();
+    if key.is_expr() {
+        return true;
+    }
+    if !(key.is_name() || key.is_integer()) {
+        return false;
+    }
+    let kind = member.get_id().get_syntax_id().get_kind();
+    LuaIndexExpr::can_cast(kind) || LuaTableField::can_cast(kind)
+}
+
 /// Re-files dynamically keyed writes under the key their key expression infers
 /// to now.
 ///
@@ -841,6 +862,12 @@ fn rederive_settled_iter_vars(
 /// its identity, so once the settled passes have moved the types the key was
 /// minted from, the member moves to the slot the settled key names instead of a
 /// second key being minted and the first left orphaned.
+///
+/// A key that narrowed to a literal at the walk is filed const-folded — a
+/// `Name`/`Integer` key minted from a key *expression* (`keyed[kb]` filed as
+/// `Name("s")` while `kb` narrowed to that literal) — so candidacy is the key
+/// syntax, not the current key variant: any member whose index key is an
+/// expression is re-minted, whatever slot the walk filed it under.
 ///
 /// Returns whether any member key moved. A rekeyed member-map reader may answer
 /// differently now, so the settled tail continues the loop — and re-derives
@@ -853,7 +880,7 @@ fn refresh_settled_expr_type_member_keys(db: &mut DbIndex, context: &mut Analyze
             db.get_member_index()
                 .get_file_members(*file_id)
                 .iter()
-                .any(|member| member.get_key().is_expr())
+                .any(|member| is_settled_member_rekey_candidate(member))
         })
         .collect::<Vec<_>>();
     if file_ids.is_empty() {
@@ -887,7 +914,7 @@ fn refresh_settled_expr_type_member_keys(db: &mut DbIndex, context: &mut Analyze
             .get_member_index()
             .get_file_members(file_id)
             .into_iter()
-            .filter(|member| member.get_key().is_expr())
+            .filter(|member| is_settled_member_rekey_candidate(member))
             .map(|member| (member.get_id(), member.get_key().clone()))
             .collect::<Vec<_>>();
         members.sort_by_key(|(member_id, _)| member_id.get_syntax_id().get_range().start());
@@ -907,6 +934,13 @@ fn refresh_settled_expr_type_member_keys(db: &mut DbIndex, context: &mut Analyze
             let Some(index_key) = index_key else {
                 continue;
             };
+            // A const-folded `Name`/`Integer` member shares its node kind with
+            // static writes (`t.field` is an index expression too), and only an
+            // expression key can have folded. Anything else keeps its slot
+            // without paying for re-inference.
+            if !current_key.is_expr() && !index_key.is_expr() {
+                continue;
+            }
             let Ok(settled_key) =
                 LuaMemberKey::from_index_key_or_unknown(db, &mut infer_cache, &index_key)
             else {
@@ -1303,6 +1337,12 @@ fn rederive_settled_assign_reads(
         .map(|(decl_id, _, _)| decl_id.file_id)
         .collect::<HashSet<_>>();
     context.infer_manager.clear_files_deferred_results(&files);
+    // The replay re-reads moved declarations through flow narrowing, and a
+    // successful flow answer survives the deferred-results clearing above.
+    // Without voiding those answers the first round's narrowing keeps serving
+    // the pre-settled declaration type, so a write whose source settles later
+    // (a loop variable widened by a rekeyed member key) replays stale forever.
+    context.infer_manager.clear_files_flow_results(&files);
 
     // The settled slot type per candidate, in candidate order. `None` is not
     // a verdict on the declaration, only on this write: another write to the
@@ -1887,13 +1927,22 @@ fn queue_settled_decl_dependents(
                             // through `bind_decl_write`, which keeps the source-order
                             // claim and write-authority semantics a direct commit
                             // would have applied.
-                            let Some(target_decl_id) = db
-                                .get_reference_index()
-                                .get_local_reference(&file_id)
-                                .and_then(|refs| refs.get_decl_id(&target.get_range()))
-                            else {
-                                continue;
-                            };
+                            //
+                            // Globals have no local reference; fall back to the same
+                            // identity `get_var_owner` binds the walk-time write to
+                            // (a decl-index entry at the use-site position, else
+                            // the use-site position itself) so the replay writes
+                            // the owner the walk claimed.
+                            let maybe_decl_id = LuaDeclId::new(file_id, target.get_position());
+                            let target_decl_id =
+                                if db.get_decl_index().get_decl(&maybe_decl_id).is_some() {
+                                    maybe_decl_id
+                                } else {
+                                    db.get_reference_index()
+                                        .get_local_reference(&file_id)
+                                        .and_then(|refs| refs.get_decl_id(&target.get_range()))
+                                        .unwrap_or(maybe_decl_id)
+                                };
                             if target_decl_id == decl_id {
                                 continue;
                             }
