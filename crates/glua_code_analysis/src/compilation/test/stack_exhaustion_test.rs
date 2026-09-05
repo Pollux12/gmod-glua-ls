@@ -16,10 +16,8 @@ mod test {
     // with no parse errors to blame, `Unknown` can only come from inference
     // bailing out.
     //
-    // Deep complete trees are intentionally leaked on the small-stack threads:
-    // rowan drops nested trees recursively with no reserve check, so dropping
-    // a guard-tripped tree there would overflow during teardown. The leak is
-    // test-only; production parses on the 256 MB analysis pool.
+    // Deep trees drop on the same small-stack threads via the grown-stack
+    // `LuaSyntaxTree::Drop`, so no test leaks to avoid teardown.
     use glua_parser::{
         LuaAstNode, LuaAstToken, LuaDocTagParam, LuaExpr, LuaLocalName, LuaParser, LuaUnaryExpr,
         ParserConfig,
@@ -166,7 +164,6 @@ mod test {
                 let db = DbIndex::new();
                 let mut cache = LuaInferCache::new(FileId::new(0), Default::default());
                 let result = infer_expr(&db, &mut cache, LuaExpr::from(outermost));
-                std::mem::forget(tree);
                 assert!(
                     matches!(result, Ok(LuaType::Unknown)),
                     "deep inference must bail to Unknown via the reserve guard, got {result:?}"
@@ -220,9 +217,17 @@ mod test {
     /// parse in a loop (zero parse errors even on 2 MB) while doc inference
     /// recurses per level, so `Unknown` here can only come from the doc
     /// inference guard.
+    ///
+    /// Depth 40000 sits above the ~28.5k first-trip point of the pre-fix tree
+    /// build (28000 parsed cleanly, 29000 aborted a 2 MB release worker
+    /// inside the vendored rowan `NodeCache` growth rehash, whose subtree
+    /// hash recursed once per level past every parser/inference reserve
+    /// guard): with the stored-hash rehash key the same shape parses in ~25
+    /// ms release / ~0.1 s debug, so the `Unknown` below still isolates the
+    /// `infer_doc_type` guard rather than the parser.
     #[test]
     fn infer_doc_type_bails_via_stack_reserve_not_parse_errors() {
-        let body = array_type_source(20000);
+        let body = array_type_source(40000);
         let control_body = body.clone();
         std::thread::Builder::new()
             .stack_size(SMALL_STACK)
@@ -246,7 +251,6 @@ mod test {
                 let db = DbIndex::new();
                 let ctx = DocTypeInferContext::new(&db, FileId::new(1));
                 let result = infer_doc_type(ctx, &doc_type);
-                std::mem::forget(tree);
                 assert!(
                     result.is_unknown(),
                     "deep doc nesting must bail to Unknown, got {result:?}"

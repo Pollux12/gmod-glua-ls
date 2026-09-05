@@ -1286,10 +1286,7 @@ local y = 2
     // innermost token is a statement start the recovery loop used to retry the
     // same token at the same depth forever. `parse_stats` now breaks on
     // no-progress instead. The watchdog turns a regression into a failure
-    // rather than a hung suite, and the tree is intentionally leaked: a
-    // guard-tripped block nest is deeper than a small stack can recursively
-    // drop, so the worker reports its assertions and forgets the tree instead
-    // of racing the next test with the drop.
+    // rather than a hung suite.
     #[test]
     fn deeply_nested_blocks_with_statement_start_terminates() {
         let depth = 3000;
@@ -1312,7 +1309,6 @@ local y = 2
                     .iter()
                     .any(|error| error.message.contains("too deeply nested")),
             );
-            std::mem::forget(tree);
             let _ = tx.send(report);
         });
         let (error_count, tripped) = rx
@@ -1329,6 +1325,44 @@ local y = 2
         );
     }
 
+    // Regression: a guard-tripped block tree must also drop safely on a
+    // production-sized (2 MB) thread. The parse bails via the reserve guard,
+    // but the resulting ~6000-level green tree previously aborted the process
+    // in recursive `GreenNode` destruction. Rowan now frees green nodes
+    // iteratively, so the ordinary drop below is O(1) stack; join-based like
+    // the existing 2 MB tests.
+    #[test]
+    fn deeply_nested_blocks_drop_safely_on_small_stack() {
+        let depth = 3000;
+        let mut body = String::new();
+        for _ in 0..depth {
+            body.push_str("do ");
+        }
+        body.push('x');
+        for _ in 0..depth {
+            body.push_str(" end");
+        }
+        body.push('\n');
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let tree = LuaParser::parse(&body, ParserConfig::default());
+                assert!(
+                    !tree.get_errors().is_empty(),
+                    "{depth}-deep blocks must degrade to parse errors, not abort"
+                );
+                assert!(
+                    tree.get_errors()
+                        .iter()
+                        .any(|error| error.message.contains("too deeply nested")),
+                    "{depth}-deep blocks must trip the stack reserve guard"
+                );
+            })
+            .expect("worker thread should spawn")
+            .join()
+            .expect("production-sized worker must not overflow when dropping its tree");
+    }
+
     // A failed statement that consumes nothing while sitting on a statement
     // start must not spin `parse_stats` forever, even far from any stack
     // limit: recovery without progress breaks out and lets `parse_chunk`
@@ -1340,5 +1374,53 @@ local y = 2
             !tree.get_errors().is_empty(),
             "unconsumed statement start must degrade to parse errors, not hang"
         );
+    }
+
+    // Regression: a red root cloned from a guard-tripped tree must also drop
+    // safely on a production-sized (2 MB) thread, even when it outlives its
+    // `LuaSyntaxTree`. `get_red_root` clones the green root, so dropping the
+    // tree releases only one reference; the final release happens wherever the
+    // last red dies (memo eviction, thread-local teardown, caches) —
+    // previously a recursive `GreenNode` free that aborted small-stack threads
+    // mid-suite. Rowan now frees green nodes iteratively, so the red drop, the
+    // tree drop, and the memo teardown below are all safe on this 2 MB stack;
+    // join-based like the existing 2 MB tests.
+    #[test]
+    fn deeply_nested_blocks_red_root_outlives_tree_drops_safely_on_small_stack() {
+        let depth = 3000;
+        let mut body = String::new();
+        for _ in 0..depth {
+            body.push_str("do ");
+        }
+        body.push('x');
+        for _ in 0..depth {
+            body.push_str(" end");
+        }
+        body.push('\n');
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let tree = LuaParser::parse(&body, ParserConfig::default());
+                assert!(
+                    tree.get_errors()
+                        .iter()
+                        .any(|error| error.message.contains("too deeply nested")),
+                    "{depth}-deep blocks must trip the stack reserve guard"
+                );
+                // Retain a red root past the tree and soil the per-thread node
+                // memo with it; the memo pins the green until thread teardown.
+                let red = tree.get_red_root();
+                let id = crate::LuaSyntaxId::from_node(&red);
+                assert!(
+                    id.to_node_from_root(&red).is_some(),
+                    "memoized resolve of the deep root must succeed"
+                );
+                drop(tree);
+                assert_eq!(red.text_range().len(), body.len().try_into().unwrap());
+                drop(red);
+            })
+            .expect("worker thread should spawn")
+            .join()
+            .expect("production-sized worker must not overflow when a retained red root drops");
     }
 }
