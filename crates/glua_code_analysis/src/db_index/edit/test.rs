@@ -344,6 +344,127 @@ fn a_cross_file_signature_cache_follows_an_offset_shift() {
     }
 }
 
+/// A collision at the old offset must not read as "unrelated": the consumer
+/// names what *used* to sit there, and the re-indexed file holds a different
+/// signature at exactly that offset, so the reference has to follow the
+/// function to its image instead of being written off as someone else's
+/// entry.
+#[gtest]
+fn a_cross_file_signature_cache_survives_a_collision_at_its_old_offset() {
+    let mut ws = workspace();
+    let provider_uri = ws.virtual_url_generator.new_uri("lua/provider.lua");
+    let first = "A = 1\nfunction fa() end\nfb = function() end\n";
+    // Replaces `fa` with a longer line whose own closure starts exactly where
+    // `fb`'s closure used to, so after the edit a different signature
+    // occupies the offset the consumer names.
+    let second = "A = 1\nlocal xxxxxxxxxxxxxx = function() end\nfb = function() end\n";
+    let provider_id = write(&mut ws, &provider_uri, first);
+
+    let consumer_uri = ws.virtual_url_generator.new_uri("lua/consumer.lua");
+    let consumer_id = write(&mut ws, &consumer_uri, "handle = fb\n");
+
+    let before = cached_signature_ids(ws.analysis.compilation.get_db(), consumer_id);
+    let old_id = *before
+        .iter()
+        .find(|id| id.get_file_id() == provider_id)
+        .expect("the consumer caches the provider's signature");
+    let old_pos = u32::from(old_id.get_position());
+    // Fixture guard: the old offset names `fb`'s closure, and the edited text
+    // puts a different closure at exactly that offset.
+    expect_that!(
+        first[old_pos as usize..].starts_with("function()"),
+        is_true()
+    );
+    expect_that!(
+        second[old_pos as usize..].starts_with("function()"),
+        is_true()
+    );
+
+    edit_and_remap(&mut ws, &provider_uri, provider_id, first, second);
+
+    let mapped_pos = PositionMap::new(first, second)
+        .map(old_id.get_position())
+        .expect("the edit maps the signature position");
+    expect_that!(u32::from(mapped_pos), not(eq(old_pos)));
+
+    let after = cached_signature_ids(ws.analysis.compilation.get_db(), consumer_id);
+    expect_that!(
+        after.contains(&LuaSignatureId::new(provider_id, mapped_pos)),
+        is_true()
+    );
+    // The collision was real: the provider holds signatures at both offsets.
+    let live = live_signature_positions(ws.analysis.compilation.get_db(), provider_id);
+    expect_that!(live.contains(&old_pos), is_true());
+    expect_that!(live.contains(&u32::from(mapped_pos)), is_true());
+}
+
+/// A same-length edit still destroys what it replaced: an identity mapping
+/// onto its own offset is not evidence it survived, so the dependent must be
+/// re-analysed rather than left pointing at the replacement bytes.
+#[gtest]
+fn a_same_length_replacement_that_destroys_its_target_dirties_the_dependent() {
+    let mut ws = workspace();
+    let provider_uri = ws.virtual_url_generator.new_uri("lua/provider.lua");
+    let first = "A = 1\nfunction fa() end\nfb = function() end\n";
+    // The comment line is exactly as long as the function it replaces.
+    let second = "A = 1\n-----------------\nfb = function() end\n";
+    let provider_id = write(&mut ws, &provider_uri, first);
+
+    let consumer_uri = ws.virtual_url_generator.new_uri("lua/consumer.lua");
+    let consumer_id = write(&mut ws, &consumer_uri, "handle = fa\n");
+    expect_that!(
+        cached_signature_ids(ws.analysis.compilation.get_db(), consumer_id)
+            .iter()
+            .any(|id| id.get_file_id() == provider_id),
+        is_true()
+    );
+
+    let dirty = edit_and_remap(&mut ws, &provider_uri, provider_id, first, &second);
+
+    let db = ws.analysis.compilation.get_db();
+    // The signature is gone ...
+    let old_pos = cached_signature_ids(db, consumer_id)
+        .iter()
+        .find(|id| id.get_file_id() == provider_id)
+        .map(|id| u32::from(id.get_position()))
+        .expect("the consumer still names the stale signature");
+    expect_that!(
+        live_signature_positions(db, provider_id).contains(&old_pos),
+        is_false()
+    );
+    // ... and the dependent is dirty rather than silently kept.
+    expect_that!(dirty, contains(eq(&consumer_id)));
+}
+
+/// The table's range maps onto itself under a same-length edit, which must
+/// not read as "before the hunk": what the range names is gone, and value
+/// equality between a range and its image proves nothing about the bytes.
+#[gtest]
+fn a_same_length_edit_mapping_a_table_onto_itself_still_loses_it() {
+    let mut ws = workspace();
+    let provider_uri = ws.virtual_url_generator.new_uri("lua/tables.lua");
+    let first = "registry = { first = 1 }\n";
+    // Padded to the same length, so the table literal's range is its own
+    // image while the literal itself is destroyed.
+    let second = "registry = nil          \n";
+    let provider_id = write(&mut ws, &provider_uri, first);
+
+    let consumer_uri = ws.virtual_url_generator.new_uri("lua/reads_tables.lua");
+    let consumer_id = write(&mut ws, &consumer_uri, "handle = registry\n");
+    expect_that!(
+        cached_identities(ws.analysis.compilation.get_db(), consumer_id)
+            .iter()
+            .any(|id| id.contains("InFiled")),
+        is_true()
+    );
+
+    let dirty = edit_and_remap(&mut ws, &provider_uri, provider_id, first, second);
+
+    let db = ws.analysis.compilation.get_db();
+    expect_that!(live_table_ranges(db, provider_id), is_empty());
+    expect_that!(dirty, contains(eq(&consumer_id)));
+}
+
 #[gtest]
 fn a_cross_file_table_cache_follows_an_offset_shift() {
     let mut ws = workspace();
@@ -377,6 +498,35 @@ fn live_table_ranges(db: &DbIndex, file_id: FileId) -> Vec<String> {
         .descendants::<LuaTableExpr>()
         .map(|table| format!("{:?}", table.get_range()))
         .collect()
+}
+
+/// The `LuaSignatureId`s a file's cached types name, as values.
+fn cached_signature_ids(db: &DbIndex, file_id: FileId) -> Vec<LuaSignatureId> {
+    let mut found = Vec::new();
+    let Some(owners) = db.get_type_index().file_type_owners(file_id) else {
+        return found;
+    };
+    for owner in owners {
+        let Some(cache) = db.get_type_index().get_type_cache(owner) else {
+            continue;
+        };
+        TypeVisitTrait::visit_type(cache.as_type(), &mut |inner| {
+            if let LuaType::Signature(id) = inner {
+                found.push(*id);
+            }
+        });
+    }
+    found
+}
+
+fn live_signature_positions(db: &DbIndex, file_id: FileId) -> Vec<u32> {
+    let mut found: Vec<u32> = db
+        .get_signature_index()
+        .get_file_signature_ids(file_id)
+        .map(|ids| ids.iter().map(|id| u32::from(id.get_position())).collect())
+        .unwrap_or_default();
+    found.sort();
+    found
 }
 
 /// An edit that destroys the literal a dependent's cache names cannot be
