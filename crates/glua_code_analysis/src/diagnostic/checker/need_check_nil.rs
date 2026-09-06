@@ -792,21 +792,42 @@ fn type_has_non_nullable_member(
         }
         LuaType::Def(def_id) | LuaType::Ref(def_id) => {
             let member_index = db.get_member_index();
-            let all_types = def_id.collect_super_types_with_self(db, typ.clone());
-            for t in all_types {
+            // Member-level visibility parity with inference
+            // (infer_custom_type_member): check realm/visibility before
+            // resolving, so the most-derived visible member decides nullability
+            // instead of a nullable child being masked by a non-nullable
+            // parent. Residual gap: collect_super_types_with_self does not
+            // verify visibility of the super-edge itself, so a
+            // realm-incompatible `super` declaration is still traversed here.
+            for t in def_id.collect_super_types_with_self(db, typ.clone()) {
                 let owner = match t {
                     LuaType::Ref(id) | LuaType::Def(id) => LuaMemberOwner::Type(id),
                     _ => continue,
                 };
-                if let Some(member_item) = member_index.get_member_item(&owner, key) {
-                    if let Ok(member_type) =
-                        member_item.resolve_type_with_realm_at_offset(db, caller_file_id, position)
-                    {
-                        if !member_type.is_nullable() {
-                            return true;
-                        }
-                    }
+                let Some(member_item) = member_index.get_member_item(&owner, key) else {
+                    continue;
+                };
+                let visible = member_item.visible_member_ids_with_realm_at_offset(
+                    db,
+                    caller_file_id,
+                    position,
+                );
+                // A missing or realm-incompatible member must not hide a
+                // compatible inherited one (mirrors infer_custom_type_member).
+                if visible.is_empty() {
+                    continue;
                 }
+                let visible_item = match visible.as_slice() {
+                    [member_id] => crate::LuaMemberIndexItem::One(*member_id),
+                    _ => crate::LuaMemberIndexItem::Many(visible),
+                };
+                // Fail closed: if the winning member's type cannot be
+                // resolved, do not fall back to a parent.
+                let Ok(member_type) = visible_item.resolve_type(db) else {
+                    return false;
+                };
+                // First visible hit wins; do not fall through to parents.
+                return !member_type.is_nullable();
             }
             false
         }
