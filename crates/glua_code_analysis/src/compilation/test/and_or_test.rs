@@ -229,4 +229,67 @@ mod test {
 
         assert_eq!(ws.humanize_type(folded), "table");
     }
+
+    #[gtest]
+    fn test_resolved_local_or_empty_table_keeps_declared_type() {
+        // `x = x or {}` over a resolved, non-optional local is a narrowing idiom,
+        // not a table bootstrap: the declared type must survive the fold.
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            local x --- @type string
+            x = x or {}
+            a = x
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        assert_eq!(ws.humanize_type(a), "string");
+    }
+
+    #[gtest]
+    fn test_resolved_local_or_empty_table_string_call_no_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local x --- @type string
+            x = x or {}
+            local y = x:upper()
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_unresolved_global_or_empty_table_still_bootstraps_table() {
+        // An undeclared global has nothing to resolve to, so `Foo = Foo or {}`
+        // remains a bootstrap: the fold yields the fresh table.
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            Foo = Foo or {}
+            a = Foo
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        assert_eq!(ws.humanize_type(a), "table");
+    }
+
+    #[gtest]
+    fn test_string_param_or_empty_table_keeps_string() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param x string
+            function f(x)
+                x = x or {}
+                a = x
+            end
+            "#,
+        );
+
+        let a = ws.expr_ty("a");
+        assert_eq!(ws.humanize_type(a), "string");
+    }
 }
