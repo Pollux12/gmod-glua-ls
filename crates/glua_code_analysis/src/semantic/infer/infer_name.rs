@@ -353,7 +353,8 @@ fn compute_in_place_ipairs_transform(
 
 /// The element type a `for k, v in ipairs(arr) do arr[k] = expr end` loop writes,
 /// or `None` when the loop is not that exact shape over `decl_id`. The body's
-/// write must be an unconditional direct child so every visited element really
+/// write must be an unconditional direct child and the body itself must have no
+/// control flow that skips or exits elements, so every visited element really
 /// takes the RHS type.
 fn ipairs_transform_element_type(
     db: &DbIndex,
@@ -366,9 +367,15 @@ fn ipairs_transform_element_type(
     let [LuaExpr::CallExpr(iter_call)] = iter_exprs.as_slice() else {
         return None;
     };
-    if !call_is_named(iter_call, "ipairs") {
+    if !is_global_ipairs_call(db, cache, file_id, iter_call) {
         return None;
     }
+
+    let body = for_range.get_block()?;
+    if loop_body_has_partial_coverage_risk(&body) {
+        return None;
+    }
+
     let iter_args = iter_call.get_args_list()?.get_args().collect::<Vec<_>>();
     let [LuaExpr::NameExpr(iter_arg)] = iter_args.as_slice() else {
         return None;
@@ -383,7 +390,6 @@ fn ipairs_transform_element_type(
         .get_name_text()
         .to_string();
 
-    let body = for_range.get_block()?;
     let mut transform_rhs = None;
     for stat in body.get_stats() {
         let LuaStat::AssignStat(assign) = stat else {
@@ -414,9 +420,71 @@ fn ipairs_transform_element_type(
     (!element_type.is_unknown()).then_some(element_type)
 }
 
-fn call_is_named(call: &LuaCallExpr, name: &str) -> bool {
-    matches!(call.get_prefix_expr(), Some(LuaExpr::NameExpr(prefix))
-        if prefix.get_name_text().as_deref() == Some(name))
+/// Matches a bare `ipairs(...)` call that really resolves to the global builtin:
+/// an `_G.ipairs(...)` index call, a local/param shadow, or a user-workspace
+/// global redefinition of `ipairs` all fail, so their loops never get the
+/// transform. Unresolved names fall back to the builtin and are accepted.
+fn is_global_ipairs_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    call: &LuaCallExpr,
+) -> bool {
+    let Some(LuaExpr::NameExpr(name_expr)) = call.get_prefix_expr() else {
+        return false;
+    };
+    if name_expr.get_name_text().as_deref() != Some("ipairs") {
+        return false;
+    }
+
+    if db
+        .get_reference_index()
+        .get_local_reference(&file_id)
+        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+        .is_some()
+    {
+        return false;
+    }
+
+    match resolve_global_decl_id(db, cache, "ipairs", Some(&name_expr)) {
+        None => true,
+        Some(decl_id) => !db
+            .get_module_index()
+            .get_workspace_id(decl_id.file_id)
+            .is_some_and(|workspace_id| db.get_module_index().is_main_workspace_id(workspace_id)),
+    }
+}
+
+/// Whether the loop body contains control flow that can skip or exit elements,
+/// which would leave parts of the array unrewritten by the transform's
+/// unconditional element write. Mirrors the rejected-control-flow scan in the
+/// numeric range population analyzer: nested closures are transparent, since
+/// their control flow never escapes the enclosing loop.
+fn loop_body_has_partial_coverage_risk(body: &LuaBlock) -> bool {
+    for stat in body.syntax().descendants().filter_map(LuaStat::cast) {
+        if is_node_in_nested_closure(stat.syntax(), body.syntax()) {
+            continue;
+        }
+        match stat {
+            LuaStat::BreakStat(_)
+            | LuaStat::ReturnStat(_)
+            | LuaStat::GotoStat(_)
+            | LuaStat::LabelStat(_)
+            | LuaStat::IfStat(_)
+            | LuaStat::WhileStat(_)
+            | LuaStat::RepeatStat(_)
+            | LuaStat::ForStat(_)
+            | LuaStat::ForRangeStat(_) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn is_node_in_nested_closure(node: &LuaSyntaxNode, boundary: &LuaSyntaxNode) -> bool {
+    node.ancestors()
+        .take_while(|ancestor| ancestor != boundary)
+        .any(|ancestor| LuaClosureExpr::can_cast(ancestor.kind().into()))
 }
 
 fn name_expr_resolves_to_decl(

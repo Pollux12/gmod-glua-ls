@@ -183,4 +183,234 @@ mod test {
         let after = local_name_type(&mut ws, file_id, "after");
         assert_eq!(after, ws.ty("string[]"));
     }
+
+    #[test]
+    fn test_breaking_loop_leaves_array_element_type_unchanged() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@return string[]
+            local function explode() end
+            ---@param v string
+            ---@return number?
+            local function tonum(v) end
+
+            local arr = explode()
+            for i, v in ipairs(arr) do
+                arr[i] = tonum(v)
+                if v == "" then break end
+            end
+            local after = arr
+        "#,
+        );
+
+        // A `break` can leave later elements unrewritten.
+        let after = local_name_type(&mut ws, file_id, "after");
+        assert_eq!(after, ws.ty("string[]"));
+    }
+
+    #[test]
+    fn test_returning_loop_leaves_array_element_type_unchanged() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@return string[]
+            local function explode() end
+            ---@param v string
+            ---@return number?
+            local function tonum(v) end
+
+            local arr = explode()
+            for i, v in ipairs(arr) do
+                arr[i] = tonum(v)
+                if v == "" then return end
+            end
+            local after = arr
+        "#,
+        );
+
+        // A `return` exits before later elements are rewritten.
+        let after = local_name_type(&mut ws, file_id, "after");
+        assert_eq!(after, ws.ty("string[]"));
+    }
+
+    #[test]
+    fn test_goto_loop_leaves_array_element_type_unchanged() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@return string[]
+            local function explode() end
+            ---@param v string
+            ---@return number?
+            local function tonum(v) end
+
+            local arr = explode()
+            for i, v in ipairs(arr) do
+                arr[i] = tonum(v)
+                goto done
+                ::done::
+            end
+            local after = arr
+        "#,
+        );
+
+        // A `goto` can jump past the write.
+        let after = local_name_type(&mut ws, file_id, "after");
+        assert_eq!(after, ws.ty("string[]"));
+    }
+
+    #[test]
+    fn test_gmod_continue_loop_leaves_array_element_type_unchanged() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@return string[]
+            local function explode() end
+            ---@param v string
+            ---@return number?
+            local function tonum(v) end
+
+            local arr = explode()
+            for i, v in ipairs(arr) do
+                if v == "" then continue end
+                arr[i] = tonum(v)
+            end
+            local after = arr
+        "#,
+        );
+
+        // GMod's `continue` parses as a break-like statement and skips elements.
+        let after = local_name_type(&mut ws, file_id, "after");
+        assert_eq!(after, ws.ty("string[]"));
+    }
+
+    #[test]
+    fn test_local_shadowed_ipairs_leaves_array_element_type_unchanged() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@return string[]
+            local function explode() end
+            ---@param v string
+            ---@return number?
+            local function tonum(v) end
+
+            local ipairs = function(t) end
+            local arr = explode()
+            for i, v in ipairs(arr) do
+                arr[i] = tonum(v)
+            end
+            local after = arr
+        "#,
+        );
+
+        // The local `ipairs` is not the builtin, so its iteration is unknown.
+        let after = local_name_type(&mut ws, file_id, "after");
+        assert_eq!(after, ws.ty("string[]"));
+    }
+
+    #[test]
+    fn test_param_shadowed_ipairs_leaves_array_element_type_unchanged() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@return string[]
+            local function explode() end
+            ---@param v string
+            ---@return number?
+            local function tonum(v) end
+
+            local arr = explode()
+            local function shadowed(ipairs)
+                for i, v in ipairs(arr) do
+                    arr[i] = tonum(v)
+                end
+            end
+            local after = arr
+        "#,
+        );
+
+        // A parameter named `ipairs` shadows the builtin for the whole call.
+        let after = local_name_type(&mut ws, file_id, "after");
+        assert_eq!(after, ws.ty("string[]"));
+    }
+
+    #[test]
+    fn test_enclosing_scope_shadowed_ipairs_leaves_array_element_type_unchanged() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@return string[]
+            local function explode() end
+            ---@param v string
+            ---@return number?
+            local function tonum(v) end
+
+            local ipairs = function(t) end
+            local arr = explode()
+            do
+                for i, v in ipairs(arr) do
+                    arr[i] = tonum(v)
+                end
+            end
+            local after = arr
+        "#,
+        );
+
+        // The shadow in the enclosing block still applies inside the `do` block.
+        let after = local_name_type(&mut ws, file_id, "after");
+        assert_eq!(after, ws.ty("string[]"));
+    }
+
+    #[test]
+    fn test_global_hijacked_ipairs_leaves_array_element_type_unchanged() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@return string[]
+            local function explode() end
+            ---@param v string
+            ---@return number?
+            local function tonum(v) end
+
+            function ipairs(t)
+                return 1, t[1]
+            end
+            local arr = explode()
+            for i, v in ipairs(arr) do
+                arr[i] = tonum(v)
+            end
+            local after = arr
+        "#,
+        );
+
+        // The user workspace redefines the global `ipairs`.
+        let after = local_name_type(&mut ws, file_id, "after");
+        assert_eq!(after, ws.ty("string[]"));
+    }
+
+    #[test]
+    fn test_g_ipairs_leaves_array_element_type_unchanged() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@return string[]
+            local function explode() end
+            ---@param v string
+            ---@return number?
+            local function tonum(v) end
+
+            local arr = explode()
+            for i, v in _G.ipairs(arr) do
+                arr[i] = tonum(v)
+            end
+            local after = arr
+        "#,
+        );
+
+        // `_G.ipairs` is an indexed access, not the bare builtin call.
+        let after = local_name_type(&mut ws, file_id, "after");
+        assert_eq!(after, ws.ty("string[]"));
+    }
 }
