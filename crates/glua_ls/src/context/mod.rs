@@ -10,7 +10,7 @@ mod workspace_manager;
 
 pub use client::ClientProxy;
 pub use client_id::{ClientId, get_client_id};
-pub use debounced_analysis::{DebouncedAnalysis, InFlightChangeGuard};
+pub use debounced_analysis::{DebouncedAnalysis, Freshness, InFlightChangeGuard};
 pub use did_change_coalescer::DidChangeCoalescer;
 pub use file_diagnostic::FileDiagnostic;
 use glua_code_analysis::EmmyLuaAnalysis;
@@ -165,6 +165,7 @@ impl ServerContext {
             200,
             debounced_shutdown.clone(),
             client.clone(),
+            file_diagnostic.clone(),
             file_diagnostic.shared_diagnostic_data_cache(),
             workspace_diagnostic_level,
             lsp_features.clone(),

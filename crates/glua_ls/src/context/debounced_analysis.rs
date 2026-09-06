@@ -1,5 +1,7 @@
 use glua_code_analysis::{DirtySet, EmmyLuaAnalysis, FileId};
 use lsp_types::Uri;
+use rustc_hash::FxHashSet;
+use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -7,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use super::{ClientProxy, file_diagnostic::SharedDiagnosticDataCache};
+use super::{ClientProxy, FileDiagnostic, file_diagnostic::SharedDiagnosticDataCache};
 
 const FRESHNESS_STUCK_WARN_AFTER: Duration = Duration::from_secs(5);
 
@@ -50,6 +52,19 @@ pub struct FreshWaitBreakdown {
     pub blocked: Duration,
 }
 
+/// Outcome of a freshness wait.
+///
+/// `Fresh` means the analysis caught up with the client's text. `Cancelled`
+/// means the request's token fired first. `LoopDead` means the debounce
+/// supervisor gave up ([`Self::note_debounce_loop_dead`]), so freshness can
+/// never arrive and the caller must not diagnose stale data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Freshness {
+    Fresh,
+    Cancelled,
+    LoopDead,
+}
+
 /// Debounced analysis: accumulates file IDs from rapid edits and runs `reindex_files` once the user pauses typing.
 pub struct DebouncedAnalysis {
     pending_files: Mutex<HashSet<FileId>>,
@@ -90,6 +105,9 @@ pub struct DebouncedAnalysis {
     reindex_notify: Notify,
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
     shared_diagnostic_data_cache: SharedDiagnosticDataCache,
+    /// Used to schedule diagnostic-only refreshes for textual refresh names:
+    /// referencers of a name an edit moved that need no re-index of their own.
+    file_diagnostic: Arc<FileDiagnostic>,
     debounce_duration: Duration,
     shutdown: CancellationToken,
     client: Arc<ClientProxy>,
@@ -107,6 +125,7 @@ impl DebouncedAnalysis {
         debounce_ms: u64,
         shutdown: CancellationToken,
         client: Arc<ClientProxy>,
+        file_diagnostic: Arc<FileDiagnostic>,
         shared_diagnostic_data_cache: SharedDiagnosticDataCache,
         workspace_diagnostic_level: Arc<AtomicU8>,
         lsp_features: Arc<crate::context::LspFeatures>,
@@ -124,6 +143,7 @@ impl DebouncedAnalysis {
             reindex_notify: Notify::new(),
             analysis,
             shared_diagnostic_data_cache,
+            file_diagnostic,
             debounce_duration: Duration::from_millis(debounce_ms),
             shutdown,
             client,
@@ -306,14 +326,15 @@ impl DebouncedAnalysis {
 
     /// Wait until all pending document changes have been reindexed.
     ///
-    /// Returns `true` when the analysis is fresh, `false` if the cancel token
-    /// fired first.  Uses `enable()` so that `notify_waiters()` wakeups are
+    /// Returns `Fresh` when the analysis is current, `Cancelled` if the cancel
+    /// token fired first, and `LoopDead` if the debounce loop is dead.
+    /// Uses `enable()` so that `notify_waiters()` wakeups are
     /// not lost between creating the `Notified` future and polling it.
     pub async fn wait_until_fresh_for(
         &self,
         cancel_token: &CancellationToken,
         request_method: &'static str,
-    ) -> bool {
+    ) -> Freshness {
         #[cfg(test)]
         self.freshness_waits.fetch_add(1, Ordering::AcqRel);
 
@@ -328,18 +349,18 @@ impl DebouncedAnalysis {
             notified.as_mut().enable();
 
             if !self.has_pending_changes.load(Ordering::Acquire) {
-                return true;
+                return Freshness::Fresh;
             }
 
             if !self.debounce_loop_alive() {
-                return false;
+                return Freshness::LoopDead;
             }
 
             let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
 
             tokio::select! {
                 _ = notified => {} // re-check
-                _ = cancel_token.cancelled() => return false,
+                _ = cancel_token.cancelled() => return Freshness::Cancelled,
                 _ = tokio::time::sleep(remaining), if !warned_stuck => {
                     self.log_freshness_stuck(request_method, started_at).await;
                     warned_stuck = true;
@@ -366,7 +387,7 @@ impl DebouncedAnalysis {
         cancel_token: &CancellationToken,
         request_method: &'static str,
         uri: &Uri,
-    ) -> bool {
+    ) -> Freshness {
         #[cfg(test)]
         self.freshness_waits.fetch_add(1, Ordering::AcqRel);
 
@@ -379,18 +400,18 @@ impl DebouncedAnalysis {
             notified.as_mut().enable();
 
             if self.file_is_answerable(uri).await {
-                return true;
+                return Freshness::Fresh;
             }
 
             if !self.debounce_loop_alive() {
-                return false;
+                return Freshness::LoopDead;
             }
 
             let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
 
             tokio::select! {
                 _ = notified => {}
-                _ = cancel_token.cancelled() => return false,
+                _ = cancel_token.cancelled() => return Freshness::Cancelled,
                 _ = tokio::time::sleep(remaining), if !warned_stuck => {
                     self.log_freshness_stuck(request_method, started_at).await;
                     warned_stuck = true;
@@ -405,7 +426,7 @@ impl DebouncedAnalysis {
         &self,
         cancel_token: &CancellationToken,
         request_method: &'static str,
-    ) -> (bool, FreshWaitBreakdown) {
+    ) -> (Freshness, FreshWaitBreakdown) {
         #[cfg(test)]
         self.freshness_waits.fetch_add(1, Ordering::AcqRel);
 
@@ -421,7 +442,7 @@ impl DebouncedAnalysis {
 
             if !self.has_pending_changes.load(Ordering::Acquire) {
                 return (
-                    true,
+                    Freshness::Fresh,
                     FreshWaitBreakdown {
                         total: started_at.elapsed(),
                         in_flight,
@@ -432,7 +453,7 @@ impl DebouncedAnalysis {
 
             if !self.debounce_loop_alive() {
                 return (
-                    false,
+                    Freshness::LoopDead,
                     FreshWaitBreakdown {
                         total: started_at.elapsed(),
                         in_flight,
@@ -462,7 +483,7 @@ impl DebouncedAnalysis {
             }
             if cancelled {
                 return (
-                    false,
+                    Freshness::Cancelled,
                     FreshWaitBreakdown {
                         total: started_at.elapsed(),
                         in_flight,
@@ -480,7 +501,7 @@ impl DebouncedAnalysis {
         cancel_token: &CancellationToken,
         request_method: &'static str,
         uri: &Uri,
-    ) -> (bool, FreshWaitBreakdown) {
+    ) -> (Freshness, FreshWaitBreakdown) {
         #[cfg(test)]
         self.freshness_waits.fetch_add(1, Ordering::AcqRel);
 
@@ -496,7 +517,7 @@ impl DebouncedAnalysis {
 
             if self.file_is_answerable(uri).await {
                 return (
-                    true,
+                    Freshness::Fresh,
                     FreshWaitBreakdown {
                         total: started_at.elapsed(),
                         in_flight,
@@ -507,7 +528,7 @@ impl DebouncedAnalysis {
 
             if !self.debounce_loop_alive() {
                 return (
-                    false,
+                    Freshness::LoopDead,
                     FreshWaitBreakdown {
                         total: started_at.elapsed(),
                         in_flight,
@@ -537,7 +558,7 @@ impl DebouncedAnalysis {
             }
             if cancelled {
                 return (
-                    false,
+                    Freshness::Cancelled,
                     FreshWaitBreakdown {
                         total: started_at.elapsed(),
                         in_flight,
@@ -587,10 +608,14 @@ impl DebouncedAnalysis {
         );
     }
 
-    /// Wait until the given file is no longer pending reindex. Returns false
-    /// without diagnosing when the debounce loop is dead (freshness can never
-    /// arrive); callers must abort rather than diagnose stale data.
-    pub async fn wait_for_reindex(&self, file_id: FileId, cancel_token: CancellationToken) -> bool {
+    /// Wait until the given file is no longer pending reindex. Returns
+    /// `LoopDead` without diagnosing when the debounce loop is dead (freshness
+    /// can never arrive); callers must abort rather than diagnose stale data.
+    pub async fn wait_for_reindex(
+        &self,
+        file_id: FileId,
+        cancel_token: CancellationToken,
+    ) -> Freshness {
         loop {
             let notified = self.reindex_notify.notified();
             tokio::pin!(notified);
@@ -602,14 +627,14 @@ impl DebouncedAnalysis {
                 pending.contains(&file_id) || reindexing.contains(&file_id)
             };
             if !is_pending {
-                return true;
+                return Freshness::Fresh;
             }
             if !self.debounce_loop_alive() {
-                return false;
+                return Freshness::LoopDead;
             }
             tokio::select! {
                 _ = notified => {}
-                _ = cancel_token.cancelled() => return false,
+                _ = cancel_token.cancelled() => return Freshness::Cancelled,
             }
         }
     }
@@ -664,7 +689,7 @@ impl DebouncedAnalysis {
         &self,
         dirty: DirtySet,
         timing: Option<&mut crate::util::ls_profile::RippleWriteTimings>,
-    ) -> bool {
+    ) -> (bool, FxHashSet<SmolStr>, Vec<FileId>) {
         let profile = timing.is_some();
         let analysis = self.analysis.clone();
         let cache = self.shared_diagnostic_data_cache.clone();
@@ -672,33 +697,75 @@ impl DebouncedAnalysis {
         // Re-index under a blocking write lock on a blocking thread: the wait
         // for the lock and the CPU work both stay off the Tokio workers.
         tokio::select! {
-            _ = self.shutdown.cancelled() => false,
+            _ = self.shutdown.cancelled() => (false, FxHashSet::default(), Vec::new()),
             result = tokio::task::spawn_blocking(move || {
                 let wait_start = profile.then(Instant::now);
                 let mut guard = analysis.blocking_write();
                 let wait = wait_start.map(|start| start.elapsed()).unwrap_or_default();
                 let hold_start = profile.then(Instant::now);
-                guard.ripple(dirty);
+                let (rippled, refresh_names) = guard.ripple_with_refresh_names(dirty);
                 // Invalidate under the write lock so no reader can observe the
                 // fresh index next to the stale shared diagnostic data.
                 cache.invalidate();
                 let hold = hold_start.map(|start| start.elapsed()).unwrap_or_default();
-                (wait, hold)
+                (rippled, refresh_names, wait, hold)
             }) => {
                 match result {
-                    Ok((wait, hold)) => {
+                    Ok((rippled, refresh_names, wait, hold)) => {
                         if let Some(timing) = timing {
                             timing.wait = wait;
                             timing.hold = hold;
                         }
-                        true
+                        (true, refresh_names, rippled)
                     }
                     Err(err) => {
                         log::error!("reindex task failed: {}", err);
-                        false
+                        (false, FxHashSet::default(), Vec::new())
                     }
                 }
             }
+        }
+    }
+
+    /// Resolve owed textual refresh names to their main-workspace referencers
+    /// and schedule diagnostic-only tasks for them.
+    ///
+    /// Never reindexes: the candidates go to
+    /// [`FileDiagnostic::add_files_diagnostic_task`], the same path a
+    /// watched-file change uses. `exclude` carries the files the edit path
+    /// already settled (the edited batch, the files owed a ripple, and the
+    /// files the ripple re-analysed), which the candidate filter drops.
+    async fn schedule_textual_refresh(
+        &self,
+        names: FxHashSet<SmolStr>,
+        exclude: &FxHashSet<FileId>,
+    ) {
+        if names.is_empty() {
+            return;
+        }
+        let analysis = self.analysis.clone();
+        let exclude = exclude.clone();
+        let resolved = tokio::task::spawn_blocking(move || {
+            let guard = analysis.blocking_read();
+            let interval = guard
+                .get_emmyrc()
+                .diagnostics
+                .diagnostic_interval
+                .unwrap_or(500);
+            let candidates = guard.textual_refresh_candidates(&names, &exclude);
+            (candidates, interval)
+        })
+        .await;
+        match resolved {
+            Ok((candidates, interval)) => {
+                if candidates.is_empty() {
+                    return;
+                }
+                self.file_diagnostic
+                    .add_files_diagnostic_task(candidates, interval, None)
+                    .await;
+            }
+            Err(err) => log::error!("textual refresh resolve task failed: {}", err),
         }
     }
 
@@ -785,6 +852,13 @@ impl DebouncedAnalysis {
         // and the union of the dirty sets each of them reported.
         let mut owed_files: HashSet<FileId> = HashSet::new();
         let mut owed_ripple: Option<DirtySet> = None;
+        // Textual refresh names owed a diagnostic-only refresh, merged from
+        // every self-index diff and ripple sideband of this burst. They steer
+        // no reindex: they are drained whenever no ripple is owed.
+        let mut owed_refresh_names: FxHashSet<SmolStr> = FxHashSet::default();
+        // Files the edit path already settled (edited batch, ripple-settled),
+        // excluded from the textual refresh resolution.
+        let mut refresh_exclude: FxHashSet<FileId> = FxHashSet::default();
         let mut burst_started_at: Option<Instant> = None;
         loop {
             // Register before testing the condition: `notify_waiters()` stores
@@ -795,7 +869,8 @@ impl DebouncedAnalysis {
 
             let needs_work = !self.pending_files.lock().await.is_empty()
                 || self.has_pending_changes.load(Ordering::Acquire)
-                || !owed_files.is_empty();
+                || !owed_files.is_empty()
+                || !owed_refresh_names.is_empty();
             if !needs_work {
                 tokio::select! {
                     _ = notified => {}
@@ -849,7 +924,7 @@ impl DebouncedAnalysis {
                 // ripple is by far the larger half — measured on a gamemode
                 // workspace, 106ms against 5.1s.
                 let self_timing = profile_cycle.then_some(&mut self_timings);
-                let Some(dirty) = self
+                let Some(mut dirty) = self
                     .self_index_without_queuing(file_ids.clone(), self_timing)
                     .await
                 else {
@@ -901,6 +976,12 @@ impl DebouncedAnalysis {
                 let handoff_opt = profile_cycle.then_some(&mut handoff_timing);
                 self.await_reader_handoff(handoff_opt).await;
 
+                // Refresh names ride along whichever path the dirty set takes:
+                // they are taken before the emptiness check, which ignores
+                // them by design.
+                owed_refresh_names.extend(dirty.take_textual_refresh_names());
+                refresh_exclude.extend(file_ids.iter().copied());
+
                 if dirty.is_empty() {
                     // Nothing else reads a fact this edit moved - the
                     // self-index already makes these files answerable. Clear
@@ -914,7 +995,9 @@ impl DebouncedAnalysis {
                     }
                     self.refresh_dirty_state().await;
                     self.reindex_notify.notify_waiters();
-                    if owed_ripple.is_none() {
+                    // Refresh names still owed: fall through so the gate below
+                    // drains them without a ripple.
+                    if owed_ripple.is_none() && owed_refresh_names.is_empty() {
                         if let Some(cycle) = cycle_id {
                             use crate::util::ls_profile::{HandoffOutcome, QuietOutcome};
                             crate::util::ls_profile::emit_ls_reindex(
@@ -943,6 +1026,16 @@ impl DebouncedAnalysis {
             }
 
             let Some(owed) = owed_ripple.take() else {
+                if owed_refresh_names.is_empty() {
+                    self.refresh_dirty_state().await;
+                    self.reindex_notify.notify_waiters();
+                    continue;
+                }
+                // No ripple is owed, but textual refresh names are: resolve
+                // them and schedule diagnostics, then settle the burst.
+                let names = std::mem::take(&mut owed_refresh_names);
+                let exclude = std::mem::take(&mut refresh_exclude);
+                self.schedule_textual_refresh(names, &exclude).await;
                 self.refresh_dirty_state().await;
                 self.reindex_notify.notify_waiters();
                 continue;
@@ -990,7 +1083,12 @@ impl DebouncedAnalysis {
                 );
 
                 let ripple_opt = profile_cycle.then_some(&mut ripple_timings);
-                let reindex_completed = self.ripple_without_queuing(owed, ripple_opt).await;
+                let (reindex_completed, ripple_names, rippled) =
+                    self.ripple_without_queuing(owed, ripple_opt).await;
+                // The ripple's own sideband joins the names already owed; they
+                // drain through the gate on the next iteration.
+                owed_refresh_names.extend(ripple_names);
+                refresh_exclude.extend(rippled.iter().copied());
 
                 {
                     let mut reindexing = self.reindexing_files.lock().await;
@@ -1168,13 +1266,13 @@ mod tests {
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::time::{Duration, Instant};
 
-    use super::{MAX_RIPPLE_DEFERRAL, READER_HANDOFF_GRACE};
+    use super::{Freshness, MAX_RIPPLE_DEFERRAL, READER_HANDOFF_GRACE};
 
     use glua_code_analysis::{DiagnosticCode, EmmyLuaAnalysis, FileId, file_path_to_uri};
     use googletest::prelude::*;
     use lsp_server::Connection;
     use lsp_types::Uri;
-    use lsp_types::{ClientCapabilities, Diagnostic, NumberOrString};
+    use lsp_types::{ClientCapabilities, Diagnostic, NumberOrString, PublishDiagnosticsParams};
     use std::str::FromStr;
     use tokio::sync::RwLock;
     use tokio_util::sync::CancellationToken;
@@ -1192,13 +1290,19 @@ mod tests {
         let (connection, _peer) = Connection::memory();
         let client = Arc::new(ClientProxy::new(connection));
         let status_bar = Arc::new(StatusBar::new(client.clone(), true));
-        let file_diagnostic = FileDiagnostic::new(analysis.clone(), status_bar, client.clone());
+        let file_diagnostic = Arc::new(FileDiagnostic::new(
+            analysis.clone(),
+            status_bar,
+            client.clone(),
+        ));
+        let shared_diagnostic_data_cache = file_diagnostic.shared_diagnostic_data_cache();
         Arc::new(DebouncedAnalysis::new(
             analysis,
             0,
             CancellationToken::new(),
             client,
-            file_diagnostic.shared_diagnostic_data_cache(),
+            file_diagnostic,
+            shared_diagnostic_data_cache,
             Arc::new(AtomicU8::new(0)),
             test_lsp_features(),
         ))
@@ -1274,7 +1378,7 @@ mod tests {
             )
             .await
             .expect("freshness wait must fail fast once the loop is dead");
-            verify_that!(fresh, eq(false))?;
+            verify_that!(fresh, eq(Freshness::LoopDead))?;
             Ok(())
         })
     }
@@ -1316,7 +1420,7 @@ mod tests {
                 .await
                 .expect("parked waiter must be released promptly")
                 .expect("waiter task must not panic");
-            verify_that!(fresh, eq(false))?;
+            verify_that!(fresh, eq(Freshness::LoopDead))?;
             assert!(
                 started.elapsed() < Duration::from_secs(5),
                 "release took {:?}, expected prompt wakeup not the stuck timer",
@@ -1354,7 +1458,7 @@ mod tests {
                 .await
                 .expect("parked reindex waiter must be released promptly")
                 .expect("waiter task must not panic");
-            verify_that!(reindexed, eq(false))?;
+            verify_that!(reindexed, eq(Freshness::LoopDead))?;
             assert!(
                 started.elapsed() < Duration::from_secs(5),
                 "release took {:?}, expected prompt wakeup not the stuck timer",
@@ -1495,7 +1599,10 @@ mod tests {
                 ),
             )
             .await;
-            verify_that!(untouched_answered.unwrap_or(false), eq(true))?;
+            verify_that!(
+                untouched_answered.unwrap_or(Freshness::Cancelled),
+                eq(Freshness::Fresh)
+            )?;
 
             let edited_answered = tokio::time::timeout(
                 Duration::from_millis(250),
@@ -1552,8 +1659,11 @@ mod tests {
             let client = Arc::new(ClientProxy::new(connection));
             let status_bar = Arc::new(StatusBar::new(client.clone(), true));
             let analysis = Arc::new(RwLock::new(analysis));
-            let file_diagnostic =
-                FileDiagnostic::new(analysis.clone(), status_bar.clone(), client.clone());
+            let file_diagnostic = Arc::new(FileDiagnostic::new(
+                analysis.clone(),
+                status_bar.clone(),
+                client.clone(),
+            ));
 
             let initial_diagnostics = file_diagnostic
                 .pull_file_diagnostics(user_uri.clone(), CancellationToken::new())
@@ -1578,12 +1688,14 @@ mod tests {
                     .expect("API file should still exist")
             };
 
+            let shared_diagnostic_data_cache = file_diagnostic.shared_diagnostic_data_cache();
             let debounced_analysis = DebouncedAnalysis::new(
                 analysis.clone(),
                 0,
                 CancellationToken::new(),
                 client,
-                file_diagnostic.shared_diagnostic_data_cache(),
+                file_diagnostic.clone(),
+                shared_diagnostic_data_cache,
                 Arc::new(AtomicU8::new(0)),
                 test_lsp_features(),
             );
@@ -1591,10 +1703,9 @@ mod tests {
                 .self_index_without_queuing(vec![api_file_id], None)
                 .await
                 .expect("self-index should complete");
-            verify_that!(
-                debounced_analysis.ripple_without_queuing(dirty, None).await,
-                eq(true)
-            )?;
+            let (completed, _refresh_names, _rippled) =
+                debounced_analysis.ripple_without_queuing(dirty, None).await;
+            verify_that!(completed, eq(true))?;
 
             let updated_diagnostics = file_diagnostic
                 .pull_file_diagnostics(user_uri, CancellationToken::new())
@@ -1605,6 +1716,228 @@ mod tests {
                 eq(true)
             )?;
 
+            Ok(())
+        })
+    }
+
+    fn publish_params(message: &lsp_server::Message) -> Option<PublishDiagnosticsParams> {
+        let lsp_server::Message::Notification(notification) = message else {
+            return None;
+        };
+        if notification.method != "textDocument/publishDiagnostics" {
+            return None;
+        }
+        serde_json::from_value(notification.params.clone()).ok()
+    }
+
+    /// A test bed wired so the debounce loop's diagnostic scheduling can be
+    /// observed on the client channel: `peer` receives everything
+    /// `FileDiagnostic` publishes.
+    fn loop_test_debounced_analysis(
+        analysis: Arc<RwLock<EmmyLuaAnalysis>>,
+    ) -> (Arc<DebouncedAnalysis>, lsp_server::Connection) {
+        let (connection, peer) = Connection::memory();
+        let client = Arc::new(ClientProxy::new(connection));
+        let status_bar = Arc::new(StatusBar::new(client.clone(), true));
+        let file_diagnostic = Arc::new(FileDiagnostic::new(
+            analysis.clone(),
+            status_bar,
+            client.clone(),
+        ));
+        let shared_diagnostic_data_cache = file_diagnostic.shared_diagnostic_data_cache();
+        let debounced_analysis = Arc::new(DebouncedAnalysis::new(
+            analysis,
+            0,
+            CancellationToken::new(),
+            client,
+            file_diagnostic,
+            shared_diagnostic_data_cache,
+            Arc::new(AtomicU8::new(0)),
+            test_lsp_features(),
+        ));
+        (debounced_analysis, peer)
+    }
+
+    async fn reference_revision(analysis: &RwLock<EmmyLuaAnalysis>, file_id: FileId) -> u64 {
+        analysis
+            .read()
+            .await
+            .compilation
+            .get_db()
+            .get_reference_index()
+            .file_reference_revision(file_id)
+    }
+
+    /// A rename that dirties nothing must still reach its readers on the
+    /// editor path: the debounced loop drains the self-index's textual refresh
+    /// names, schedules diagnostic-only tasks for their referencers, and
+    /// leaves those referencers un-reindexed (mirrors
+    /// `global_function_rename_refreshes_old_and_new_referencers`).
+    #[gtest]
+    fn a_rename_edit_refreshes_its_referencers_without_reindexing() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let mut analysis = EmmyLuaAnalysis::new();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_rename_refresh");
+            analysis.add_main_workspace(workspace.clone());
+            analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::UndefinedGlobal);
+
+            let provider_uri = file_path_to_uri(&workspace.join("lua/rename/provider.lua"))
+                .expect("provider URI should parse");
+            let consumer_uri = file_path_to_uri(&workspace.join("lua/rename/consumer.lua"))
+                .expect("consumer URI should parse");
+            analysis
+                .update_file_by_uri(&provider_uri, Some("function OldName() end\n".to_string()));
+            analysis.update_file_by_uri(&consumer_uri, Some("OldName()\n".to_string()));
+            let consumer_id = analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_file_id(&consumer_uri)
+                .expect("consumer file id");
+
+            let analysis = Arc::new(RwLock::new(analysis));
+            let (debounced_analysis, peer) = loop_test_debounced_analysis(analysis.clone());
+            let revision_before = reference_revision(&analysis, consumer_id).await;
+
+            let loop_task = tokio::spawn({
+                let debounced_analysis = debounced_analysis.clone();
+                async move { debounced_analysis.run().await }
+            });
+
+            // didChange equivalent: stage the text, then schedule the file.
+            let provider_id = {
+                let mut guard = analysis.write().await;
+                guard
+                    .update_file_text_only(&provider_uri, "function NewName() end\n".to_string())
+                    .expect("provider file should still exist")
+            };
+            debounced_analysis
+                .schedule(provider_id, provider_uri.clone())
+                .await;
+
+            // Nothing else publishes for the consumer in this test, so its
+            // first publish can only come from the names-only refresh task.
+            let published = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::task::spawn_blocking(move || {
+                    loop {
+                        let message = peer.receiver.recv().expect("peer channel should stay open");
+                        if let Some(params) = publish_params(&message)
+                            && params.uri == consumer_uri
+                        {
+                            return params;
+                        }
+                    }
+                })
+                .await
+                .expect("the publish reader task must not panic")
+            })
+            .await
+            .expect("the consumer should be re-published by the textual refresh");
+            let undefined_global = DiagnosticCode::UndefinedGlobal.get_name().to_string();
+            verify_that!(
+                published
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code
+                        == Some(NumberOrString::String(undefined_global.clone()))),
+                eq(true)
+            )?;
+
+            debounced_analysis.shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(5), loop_task)
+                .await
+                .expect("the loop should stop on shutdown")
+                .expect("the loop task must not panic");
+
+            // The rename dirties nothing: the referencer must not have been
+            // reindexed on the way to its refresh.
+            let revision_after = reference_revision(&analysis, consumer_id).await;
+            verify_that!(revision_after, eq(revision_before))?;
+            Ok(())
+        })
+    }
+
+    /// Names carried by a ripple's own export diffs must survive the ripple
+    /// path: a file that only names a rippled inference comes back
+    /// diagnostic-only, un-reindexed (mirrors
+    /// `ripple_moved_inference_refreshes_its_lazy_reader`).
+    #[gtest]
+    fn a_ripple_and_its_sideband_names_both_reach_their_readers() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let mut analysis = EmmyLuaAnalysis::new();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_ripple_sideband");
+            analysis.add_main_workspace(workspace.clone());
+
+            let provider_uri = file_path_to_uri(&workspace.join("lua/chain/provider.lua"))
+                .expect("provider URI should parse");
+            let middle_uri = file_path_to_uri(&workspace.join("lua/chain/middle.lua"))
+                .expect("middle URI should parse");
+            let consumer_uri = file_path_to_uri(&workspace.join("lua/chain/consumer.lua"))
+                .expect("consumer URI should parse");
+            analysis.update_file_by_uri(&provider_uri, Some("Chain = { Value = 1 }\n".to_string()));
+            analysis.update_file_by_uri(&middle_uri, Some("Binferred = Chain.Value\n".to_string()));
+            analysis.update_file_by_uri(&consumer_uri, Some("local got = Binferred\n".to_string()));
+            let consumer_id = analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_file_id(&consumer_uri)
+                .expect("consumer file id");
+
+            let analysis = Arc::new(RwLock::new(analysis));
+            let (debounced_analysis, peer) = loop_test_debounced_analysis(analysis.clone());
+            let revision_before = reference_revision(&analysis, consumer_id).await;
+
+            let loop_task = tokio::spawn({
+                let debounced_analysis = debounced_analysis.clone();
+                async move { debounced_analysis.run().await }
+            });
+
+            let provider_id = {
+                let mut guard = analysis.write().await;
+                guard
+                    .update_file_text_only(
+                        &provider_uri,
+                        "Chain = { Value = \"text\" }\n".to_string(),
+                    )
+                    .expect("provider file should still exist")
+            };
+            debounced_analysis
+                .schedule(provider_id, provider_uri.clone())
+                .await;
+
+            // The consumer only names `Binferred`, an export of the rippled
+            // middleman: its publish can only come from the sideband names the
+            // ripple reported, drained after the ripple ran.
+            tokio::time::timeout(Duration::from_secs(15), async {
+                tokio::task::spawn_blocking(move || {
+                    loop {
+                        let message = peer.receiver.recv().expect("peer channel should stay open");
+                        if let Some(params) = publish_params(&message)
+                            && params.uri == consumer_uri
+                        {
+                            return;
+                        }
+                    }
+                })
+                .await
+                .expect("the publish reader task must not panic")
+            })
+            .await
+            .expect("the consumer should be re-published by the ripple sideband");
+
+            debounced_analysis.shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(5), loop_task)
+                .await
+                .expect("the loop should stop on shutdown")
+                .expect("the loop task must not panic");
+
+            let revision_after = reference_revision(&analysis, consumer_id).await;
+            verify_that!(revision_after, eq(revision_before))?;
             Ok(())
         })
     }

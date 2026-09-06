@@ -8,7 +8,7 @@ pub use emmy_annotator_request::*;
 use lsp_types::Uri;
 use tokio_util::sync::CancellationToken;
 
-use crate::context::ServerContextSnapshot;
+use crate::context::{Freshness, ServerContextSnapshot};
 
 pub async fn on_emmy_annotator_handler(
     context: ServerContextSnapshot,
@@ -24,10 +24,11 @@ pub async fn on_emmy_annotator_handler(
     // Wait for any pending reindex to finish so we compute against
     // consistent tree + index data. Cancel-aware: bails out when a
     // new didChange fires cancel_all_requests().
-    if !context
+    if context
         .debounced_analysis()
         .wait_until_fresh_for(&cancel_token, "gluals/emmyAnnotator")
         .await
+        != Freshness::Fresh
     {
         return None;
     }

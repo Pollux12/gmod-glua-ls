@@ -18,7 +18,7 @@ use lsp_types::request::{
 use serde::Serialize;
 
 use crate::{
-    context::{RequestTaskMetadata, ServerContext},
+    context::{Freshness, RequestTaskMetadata, ServerContext},
     handlers::{
         diagnostic::{on_pull_document_diagnostic, on_pull_workspace_diagnostic},
         document_type_format::on_type_formatting_handler,
@@ -144,7 +144,7 @@ macro_rules! dispatch_request {
                                 // ripple waits for this request to take its read
                                 // lock rather than putting it behind the ripple it
                                 // was just released from.
-                                let (fresh, _handoff) = match target_uri.as_ref() {
+                                let (freshness, _handoff) = match target_uri.as_ref() {
                                     Some(uri) => {
                                         let debounced = snapshot.debounced_analysis_arc();
                                         let handoff = debounced.begin_reader_handoff();
@@ -168,8 +168,16 @@ macro_rules! dispatch_request {
                                         (fresh, None)
                                     }
                                 };
-                                if !fresh {
-                                    return None;
+                                match freshness {
+                                    Freshness::Fresh => {}
+                                    Freshness::Cancelled => return None,
+                                    // Freshness can never arrive: fail as
+                                    // cancelled so the client re-sends instead
+                                    // of recording an internal error.
+                                    Freshness::LoopDead => {
+                                        cancel_token.cancel();
+                                        return None;
+                                    }
                                 }
                                 let result = $fresh_handler(snapshot, params, cancel_token).await;
                                 Some(Response::new_ok(id, result))
@@ -191,7 +199,7 @@ macro_rules! dispatch_request {
                                 let accum_scope = accum.clone();
                                 crate::util::ls_profile::LS_REQUEST_ACCUM
                                     .scope(accum_scope, async move {
-                                        let (fresh, _handoff, breakdown) = match target_uri.as_ref() {
+                                        let (freshness, _handoff, breakdown) = match target_uri.as_ref() {
                                             Some(uri) => {
                                                 let debounced = snapshot.debounced_analysis_arc();
                                                 let handoff = debounced.begin_reader_handoff();
@@ -215,7 +223,7 @@ macro_rules! dispatch_request {
                                                 (fresh, None, breakdown)
                                             }
                                         };
-                                        if !fresh {
+                                        if freshness != Freshness::Fresh {
                                             let total = total_start.elapsed();
                                             let read_wait = accum.take_read_wait();
                                             let handler_ms =
@@ -231,6 +239,9 @@ macro_rules! dispatch_request {
                                                 read_wait,
                                                 handler_ms,
                                             );
+                                            if freshness == Freshness::LoopDead {
+                                                cancel_token.cancel();
+                                            }
                                             return None;
                                         }
                                         let handler_start = std::time::Instant::now();
@@ -290,7 +301,7 @@ macro_rules! dispatch_request {
                                 .lsp_features()
                                 .retries_on_content_modified(<$retry_req_type>::METHOD)
                             {
-                                let fresh = match target_uri.as_ref() {
+                                let freshness = match target_uri.as_ref() {
                                     Some(uri) => {
                                         debounced
                                             .wait_until_file_fresh_for(
@@ -309,8 +320,16 @@ macro_rules! dispatch_request {
                                             .await
                                     }
                                 };
-                                if !fresh {
-                                    return None;
+                                match freshness {
+                                    Freshness::Fresh => {}
+                                    Freshness::Cancelled => return None,
+                                    // Freshness can never arrive: fail as
+                                    // cancelled so the client re-sends instead
+                                    // of recording an internal error.
+                                    Freshness::LoopDead => {
+                                        cancel_token.cancel();
+                                        return None;
+                                    }
                                 }
                                 let result = $retry_handler(snapshot, params, cancel_token).await;
                                 return Some(Response::new_ok(id, result));

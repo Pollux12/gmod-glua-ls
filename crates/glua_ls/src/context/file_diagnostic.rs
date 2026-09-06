@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::util::{LongRunningWatchdogStatus, spawn_long_running_watchdog};
 
-use super::{ClientProxy, ProgressTask, StatusBar};
+use super::{ClientProxy, Freshness, ProgressTask, StatusBar};
 
 #[derive(Clone, Default)]
 pub(crate) struct SharedDiagnosticDataCache {
@@ -227,7 +227,9 @@ impl FileDiagnostic {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(interval)) => {
                     if let Some(da) = debounced_analysis {
-                        if !da.wait_for_reindex(file_id_clone, cancel_token.clone()).await {
+                        if da.wait_for_reindex(file_id_clone, cancel_token.clone()).await
+                            != Freshness::Fresh
+                        {
                             return;
                         }
                     }

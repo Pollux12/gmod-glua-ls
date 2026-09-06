@@ -9,32 +9,46 @@ use lsp_types::{
 use tokio_util::sync::CancellationToken;
 
 use super::diagnostic_result_id;
-use crate::context::{ServerContextSnapshot, WorkspaceDiagnosticLevel};
+use crate::context::{Freshness, ServerContextSnapshot, WorkspaceDiagnosticLevel};
 
 pub async fn on_pull_workspace_diagnostic(
     context: ServerContextSnapshot,
     params: WorkspaceDiagnosticParams,
     token: CancellationToken,
-) -> WorkspaceDiagnosticReport {
-    // Wait for any pending/in-flight document changes to finish before diagnosing.
-    if !context
+) -> Option<WorkspaceDiagnosticReport> {
+    match context
         .debounced_analysis()
         .wait_until_fresh_for(&token, "workspace/diagnostic")
         .await
     {
-        // Cancellation — return empty items rather than stale data,
-        // since workspace diagnostics replace per-URI state and
-        // returning stale could mask real issues. The client will
-        // re-pull after the next refresh signal.
-        return WorkspaceDiagnosticReport { items: vec![] };
+        Freshness::Fresh => {}
+        Freshness::Cancelled => {
+            // Cancellation — return empty items rather than stale data,
+            // since workspace diagnostics replace per-URI state and
+            // returning stale could mask real issues. The client will
+            // re-pull after the next refresh signal.
+            return Some(WorkspaceDiagnosticReport { items: vec![] });
+        }
+        Freshness::LoopDead => {
+            // Freshness can never arrive, so a sweep would diagnose the whole
+            // workspace against stale data. Fail as cancelled (the token makes
+            // the task answer with the cancel error, whose `retriggerRequest`
+            // data re-pulls when the client next refreshes) instead of
+            // reporting a success. The level is left unclaimed.
+            log::error!(
+                "LS_WORKSPACE_DIAGNOSTIC_LOOP_DEAD workspace/diagnostic abandoned: debounce loop is dead"
+            );
+            token.cancel();
+            return None;
+        }
     }
 
     let Some(workspace_manager) = context.read_workspace_manager(&token).await else {
-        return WorkspaceDiagnosticReport { items: vec![] };
+        return Some(WorkspaceDiagnosticReport { items: vec![] });
     };
     let status = workspace_manager.claim_workspace_diagnostic_level();
     if status == WorkspaceDiagnosticLevel::None {
-        return WorkspaceDiagnosticReport { items: vec![] };
+        return Some(WorkspaceDiagnosticReport { items: vec![] });
     }
     let client_id = workspace_manager.client_config.client_id;
     let open_files = workspace_manager.current_open_files.clone();
@@ -70,15 +84,14 @@ pub async fn on_pull_workspace_diagnostic(
 
     let analysis = context.analysis().read().await;
     let vfs = analysis.compilation.get_db().get_vfs();
-    build_report(
+    Some(build_report(
         file_diagnostics,
         params.previous_result_ids,
         &open_files,
         |uri| vfs.get_file_id(uri),
         |file_id| vfs.get_file_version(&file_id),
-    )
+    ))
 }
-
 /// Builds the report, matching client-supplied URIs against the server's own by
 /// `FileId` rather than by URI.
 ///
