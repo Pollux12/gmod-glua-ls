@@ -12,13 +12,13 @@ use internment::ArcIntern;
 use rowan::TextSize;
 
 use crate::{
-    DbIndex, FileId, InFiled, InferFailReason, LuaDeclId, LuaDeclOrMemberId, LuaDeclTypeKind,
-    LuaDocReturnInfo, LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId,
-    LuaInferenceProvenanceKind, LuaInferenceStep, LuaMember, LuaMemberId, LuaMemberInfo,
-    LuaMemberKey, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType,
-    LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFact, LuaTypeFlag, LuaTypeOwner,
-    OperatorFunction, RenderLevel, ReturnTypeKind, SemanticDeclLevel, SignatureReturnStatus,
-    TypeOps, VariadicType,
+    DbIndex, FileId, GlobalId, InFiled, InferFailReason, LuaDeclId, LuaDeclOrMemberId,
+    LuaDeclTypeKind, LuaDocReturnInfo, LuaInferenceConfidence, LuaInferenceEventId,
+    LuaInferenceNodeId, LuaInferenceProvenanceKind, LuaInferenceStep, LuaMember, LuaMemberId,
+    LuaMemberInfo, LuaMemberKey, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner,
+    LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFact, LuaTypeFlag,
+    LuaTypeOwner, OperatorFunction, RenderLevel, ReturnTypeKind, SemanticDeclLevel,
+    SignatureReturnStatus, TypeOps, VariadicType,
     compilation::analyzer::{
         call_site_params::{
             exact_receiver_type_is_usable, infer_supported_call_site_arg_type,
@@ -29,10 +29,10 @@ use crate::{
             holds_unbound_iter_template, write_type_cache,
         },
         lua::{
-            compute_module_semantic_id, derive_inferred_return_with_reads,
-            has_multiple_distinct_index_expr_member_owners, infer_for_range_iter_expr_func,
-            is_guarded_table_assignment_index_expr, mark_resolved_member_assignment,
-            resolve_index_expr_member_owner_for_file,
+            alias_target_global_path, compute_module_semantic_id,
+            derive_inferred_return_with_reads, has_multiple_distinct_index_expr_member_owners,
+            infer_for_range_iter_expr_func, is_guarded_table_assignment_index_expr,
+            mark_resolved_member_assignment, resolve_index_expr_member_owner_for_file,
         },
         unresolve::UnResolveSpecialCall,
     },
@@ -219,6 +219,7 @@ fn create_deferred_index_expr_member(
     prefix_type: &LuaType,
     owner: LuaMemberOwner,
     member_id: LuaMemberId,
+    alias_path: Option<GlobalId>,
 ) -> Option<()> {
     let root = db
         .get_vfs()
@@ -244,7 +245,20 @@ fn create_deferred_index_expr_member(
     let member = LuaMember::new(member_id, member_key, feature, None);
     {
         let member_index = db.get_member_index_mut();
-        member_index.add_member(owner, member);
+        member_index.add_member(owner.clone(), member);
+        // The same alias provenance the immediate path records: a write
+        // through an alias of a global path must follow the path's
+        // `---@class` flips even though its first home came from a prefix
+        // type read mid-fixpoint.
+        if let Some(alias_path) = alias_path {
+            member_index.home_alias_member_with_provenance(
+                owner,
+                member_id.file_id,
+                member_id,
+                alias_path,
+                false,
+            );
+        }
         // The owner above came from a prefix type read mid-fixpoint, so this
         // placement is provisional: the post-settle re-home is the authority on
         // where the member ends up, and it needs to know it may detach this one.
@@ -385,6 +399,17 @@ pub fn try_resolve_member(
         // `Ref` prefix names a declared class, so the member is re-homed onto it
         // but does not become one of its declared members.
         if let Some((member_owner, set_owner_only)) = member_owner {
+            // A prefix that is a local alias of a known global path is a path
+            // write for provenance purposes, so the member follows the path's
+            // `---@class` flips. Only computed when the owner resolved to a
+            // class: path and Element owners already carry their provenance
+            // through the homing note.
+            let alias_path = match &member_owner {
+                LuaMemberOwner::Type(_) => {
+                    alias_target_global_path(db, unresolve_member.file_id, prefix_expr)
+                }
+                _ => None,
+            };
             // The Lua pass creates a missing member before it looks at
             // `set_owner_only`, so this must too: `set_member_owner` cannot
             // re-home a member that does not exist, and a `Ref` prefix would
@@ -396,17 +421,44 @@ pub fn try_resolve_member(
                     &prefix_type,
                     member_owner.clone(),
                     member_id,
+                    alias_path.clone(),
                 );
             }
 
             if set_owner_only {
-                db.get_member_index_mut().set_member_owner_only(
-                    member_owner,
-                    member_id.file_id,
-                    member_id,
-                );
+                match alias_path {
+                    Some(alias_path) => {
+                        db.get_member_index_mut().home_alias_member_with_provenance(
+                            member_owner,
+                            member_id.file_id,
+                            member_id,
+                            alias_path,
+                            true,
+                        );
+                    }
+                    None => {
+                        db.get_member_index_mut().set_member_owner_only(
+                            member_owner,
+                            member_id.file_id,
+                            member_id,
+                        );
+                    }
+                }
             } else {
-                add_member(db, member_owner, member_id);
+                match alias_path {
+                    Some(alias_path) => {
+                        db.get_member_index_mut().home_alias_member_with_provenance(
+                            member_owner,
+                            member_id.file_id,
+                            member_id,
+                            alias_path,
+                            false,
+                        );
+                    }
+                    None => {
+                        add_member(db, member_owner, member_id);
+                    }
+                }
             }
         }
         unresolve_member.prefix = None;
@@ -571,6 +623,17 @@ fn merge_table_field_to_def(
             .set_member_owner(owner.clone(), member_id.file_id, member_id);
         db.get_member_index_mut()
             .add_member_to_owner(owner.clone(), member_id);
+        // A literal that initialises a global path keeps the member following
+        // the path's `---@class` flips even though it now also lives on the
+        // def. The homing note above may have dropped that evidence when the
+        // def is not the path's current canonical owner, so re-stamp here.
+        if let Some(path) = db
+            .get_member_index()
+            .definition_site_path(&InFiled::new(file_id, table_expr.get_range()))
+        {
+            db.get_member_index_mut()
+                .stamp_path_provenance_if_absent([member_id], &path);
+        }
     }
 
     Some(())

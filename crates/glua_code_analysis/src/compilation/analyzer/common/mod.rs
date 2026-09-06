@@ -583,7 +583,7 @@ fn merge_def_type_with_table(
     def_id: LuaTypeDeclId,
     table_range: InFiled<TextRange>,
 ) -> Option<()> {
-    let expr_member_owner = LuaMemberOwner::Element(table_range);
+    let expr_member_owner = LuaMemberOwner::Element(table_range.clone());
     let member_index = db.get_member_index_mut();
     let expr_member_ids = member_index
         .get_members(&expr_member_owner)?
@@ -591,8 +591,16 @@ fn merge_def_type_with_table(
         .map(|member| member.get_id())
         .collect::<Vec<_>>();
     let def_owner = LuaMemberOwner::Type(def_id);
-    for table_member_id in expr_member_ids {
+    for table_member_id in expr_member_ids.clone() {
         add_member(db, def_owner.clone(), table_member_id);
+    }
+    // A literal that initialises a global path keeps its members following the
+    // path's `---@class` flips even though they now also live on the def. The
+    // homing note may have dropped that evidence when the def is not the
+    // path's current canonical owner, so re-stamp here.
+    if let Some(path) = db.get_member_index().definition_site_path(&table_range) {
+        db.get_member_index_mut()
+            .stamp_path_provenance_if_absent(expr_member_ids, &path);
     }
 
     Some(())
