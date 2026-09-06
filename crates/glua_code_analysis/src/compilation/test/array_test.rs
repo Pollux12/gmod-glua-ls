@@ -133,7 +133,7 @@ mod test {
 
     #[test]
     fn test_in_place_ipairs_transform_rewrites_array_element_type() {
-        let mut ws = VirtualWorkspace::new();
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def(
             r#"
             ---@return string[]
@@ -159,7 +159,7 @@ mod test {
 
     #[test]
     fn test_guarded_element_write_leaves_array_element_type_unchanged() {
-        let mut ws = VirtualWorkspace::new();
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def(
             r#"
             ---@return string[]
@@ -186,7 +186,7 @@ mod test {
 
     #[test]
     fn test_breaking_loop_leaves_array_element_type_unchanged() {
-        let mut ws = VirtualWorkspace::new();
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def(
             r#"
             ---@return string[]
@@ -211,7 +211,7 @@ mod test {
 
     #[test]
     fn test_returning_loop_leaves_array_element_type_unchanged() {
-        let mut ws = VirtualWorkspace::new();
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def(
             r#"
             ---@return string[]
@@ -236,7 +236,7 @@ mod test {
 
     #[test]
     fn test_goto_loop_leaves_array_element_type_unchanged() {
-        let mut ws = VirtualWorkspace::new();
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def(
             r#"
             ---@return string[]
@@ -262,7 +262,7 @@ mod test {
 
     #[test]
     fn test_gmod_continue_loop_leaves_array_element_type_unchanged() {
-        let mut ws = VirtualWorkspace::new();
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def(
             r#"
             ---@return string[]
@@ -287,7 +287,7 @@ mod test {
 
     #[test]
     fn test_local_shadowed_ipairs_leaves_array_element_type_unchanged() {
-        let mut ws = VirtualWorkspace::new();
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def(
             r#"
             ---@return string[]
@@ -312,7 +312,7 @@ mod test {
 
     #[test]
     fn test_param_shadowed_ipairs_leaves_array_element_type_unchanged() {
-        let mut ws = VirtualWorkspace::new();
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def(
             r#"
             ---@return string[]
@@ -321,13 +321,13 @@ mod test {
             ---@return number?
             local function tonum(v) end
 
-            local arr = explode()
             local function shadowed(ipairs)
+                local arr = explode()
                 for i, v in ipairs(arr) do
                     arr[i] = tonum(v)
                 end
+                local after = arr
             end
-            local after = arr
         "#,
         );
 
@@ -338,7 +338,7 @@ mod test {
 
     #[test]
     fn test_enclosing_scope_shadowed_ipairs_leaves_array_element_type_unchanged() {
-        let mut ws = VirtualWorkspace::new();
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def(
             r#"
             ---@return string[]
@@ -348,13 +348,13 @@ mod test {
             local function tonum(v) end
 
             local ipairs = function(t) end
-            local arr = explode()
             do
+                local arr = explode()
                 for i, v in ipairs(arr) do
                     arr[i] = tonum(v)
                 end
+                local after = arr
             end
-            local after = arr
         "#,
         );
 
@@ -365,7 +365,7 @@ mod test {
 
     #[test]
     fn test_global_hijacked_ipairs_leaves_array_element_type_unchanged() {
-        let mut ws = VirtualWorkspace::new();
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def(
             r#"
             ---@return string[]
@@ -392,7 +392,7 @@ mod test {
 
     #[test]
     fn test_g_ipairs_leaves_array_element_type_unchanged() {
-        let mut ws = VirtualWorkspace::new();
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def(
             r#"
             ---@return string[]
@@ -410,6 +410,67 @@ mod test {
         );
 
         // `_G.ipairs` is an indexed access, not the bare builtin call.
+        let after = local_name_type(&mut ws, file_id, "after");
+        assert_eq!(after, ws.ty("string[]"));
+    }
+
+    #[test]
+    fn test_library_workspace_ipairs_override_still_transforms_array_element_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+
+        ws.def_file(
+            "library/ipairs_override.lua",
+            r#"
+            function ipairs(t)
+            end
+        "#,
+        );
+
+        let file_id = ws.def(
+            r#"
+            ---@return string[]
+            local function explode() end
+            ---@param v string
+            ---@return number?
+            local function tonum(v) end
+
+            local arr = explode()
+            for i, v in ipairs(arr) do
+                arr[i] = tonum(v)
+            end
+            local after = arr
+        "#,
+        );
+
+        // A library-workspace redefinition of `ipairs` is still a trusted
+        // declaration, so the transform applies.
+        let after = local_name_type(&mut ws, file_id, "after");
+        assert_eq!(after, ws.ty("(number?)[]"));
+    }
+
+    #[test]
+    fn test_unresolved_ipairs_without_std_lib_leaves_array_element_type_unchanged() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@return string[]
+            local function explode() end
+            ---@param v string
+            ---@return number?
+            local function tonum(v) end
+
+            local arr = explode()
+            for i, v in ipairs(arr) do
+                arr[i] = tonum(v)
+            end
+            local after = arr
+        "#,
+        );
+
+        // With no std or library workspaces, `ipairs` resolves to nothing; an
+        // unresolved name must not be treated as the builtin.
         let after = local_name_type(&mut ws, file_id, "after");
         assert_eq!(after, ws.ty("string[]"));
     }

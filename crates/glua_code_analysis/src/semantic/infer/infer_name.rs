@@ -423,7 +423,8 @@ fn ipairs_transform_element_type(
 /// Matches a bare `ipairs(...)` call that really resolves to the global builtin:
 /// an `_G.ipairs(...)` index call, a local/param shadow, or a user-workspace
 /// global redefinition of `ipairs` all fail, so their loops never get the
-/// transform. Unresolved names fall back to the builtin and are accepted.
+/// transform. The global must resolve to a declaration in the std or library
+/// workspace; unresolved names and main/remote definitions are rejected.
 fn is_global_ipairs_call(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -447,11 +448,15 @@ fn is_global_ipairs_call(
     }
 
     match resolve_global_decl_id(db, cache, "ipairs", Some(&name_expr)) {
-        None => true,
-        Some(decl_id) => !db
+        None => false,
+        Some(decl_id) => db
             .get_module_index()
             .get_workspace_id(decl_id.file_id)
-            .is_some_and(|workspace_id| db.get_module_index().is_main_workspace_id(workspace_id)),
+            .is_some_and(|workspace_id| {
+                let module_index = db.get_module_index();
+                module_index.is_std_workspace_id(workspace_id)
+                    || module_index.is_library_workspace_id(workspace_id)
+            }),
     }
 }
 
