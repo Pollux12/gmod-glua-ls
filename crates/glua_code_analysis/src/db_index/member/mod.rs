@@ -7,7 +7,8 @@ mod test;
 
 use rowan::{TextRange, TextSize};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::traits::LuaIndex;
 use crate::{FileId, GlobalId, db_index::member::lua_owner_members::LuaOwnerMembers};
@@ -136,7 +137,16 @@ pub struct LuaMemberIndex {
     /// `os = {}`). Such a path's members belong to the class, which is where
     /// every reader of the annotated type looks for them.
     global_path_class_owner: HashMap<GlobalId, LuaMemberOwner>,
-    global_path_classes_by_file: HashMap<FileId, Vec<GlobalId>>,
+    /// Every `---@class` proposal made for a global path's declaration, by
+    /// path. The winner is the set minimum, so two files annotating one
+    /// global settle on the same class regardless of analysis order, and a
+    /// removed file's proposal can be dropped without losing the others.
+    global_path_class_candidates: HashMap<GlobalId, BTreeSet<GlobalPathClassCandidate>>,
+    /// The global path a member's homing went through: its write named the
+    /// path directly, or a table literal that initialises one. Such members
+    /// follow the path when its winning `---@class` changes; members homed
+    /// onto a class by any other route stay where they are.
+    member_path_provenance: HashMap<LuaMemberId, GlobalId>,
     /// Member reads that found nothing, by the file that read. A file whose
     /// read failed cached no type and so left no dependency edge; when another
     /// file later defines that key, this is how the reader is found.
@@ -148,6 +158,35 @@ pub struct LuaMemberIndex {
 enum MemberOrOwner {
     Member(LuaMemberId),
     Owner(LuaMemberOwner),
+}
+
+/// One file's `---@class` proposal for a global path's declaration.
+///
+/// Ordered by class name first — the winner must be name-lexicographic-min so
+/// two files annotating one global do not depend on analysis order — then by
+/// file id and class identity, which breaks ties between same-named classes
+/// deterministically. Deriving [`Eq`] over all three fields makes re-proposing
+/// the same class from the same file a no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GlobalPathClassCandidate {
+    class_name: Box<str>,
+    file_id: FileId,
+    class: crate::LuaTypeDeclId,
+}
+
+impl Ord for GlobalPathClassCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.class_name
+            .cmp(&other.class_name)
+            .then_with(|| self.file_id.cmp(&other.file_id))
+            .then_with(|| self.class.stable_cmp(&other.class))
+    }
+}
+
+impl PartialOrd for GlobalPathClassCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl Default for LuaMemberIndex {
@@ -180,7 +219,8 @@ impl LuaMemberIndex {
             path_definition_sites: HashMap::default(),
             definition_sites_by_file: HashMap::default(),
             global_path_class_owner: HashMap::default(),
-            global_path_classes_by_file: HashMap::default(),
+            global_path_class_candidates: HashMap::default(),
+            member_path_provenance: HashMap::default(),
             missed_member_reads_by_file: HashMap::default(),
             missed_member_readers: HashMap::default(),
         }
@@ -198,8 +238,12 @@ impl LuaMemberIndex {
     }
 
     pub fn add_member(&mut self, owner: LuaMemberOwner, member: LuaMember) -> LuaMemberId {
-        let owner = self.canonical(&owner).clone();
         let id = member.get_id();
+        let owner = self
+            .effective_path_member_owner(id, &owner)
+            .unwrap_or(owner);
+        self.note_member_path_provenance(id, &owner);
+        let owner = self.canonical(&owner).clone();
         let file_id = member.get_file_id();
         let function_scope = self.assignment_file_define_scope_for_member(&member);
         // Re-filing an existing id re-homes whatever the old filing named:
@@ -287,6 +331,9 @@ impl LuaMemberIndex {
     /// Files `id` under `owner`. A slot holds every member written or declared
     /// for its key, ordered by [`member_id_sort_key`]; readers merge them.
     pub fn add_member_to_owner(&mut self, owner: LuaMemberOwner, id: LuaMemberId) -> Option<()> {
+        let owner = self
+            .effective_path_member_owner(id, &owner)
+            .unwrap_or(owner);
         let owner = self.canonical(&owner).clone();
         let key = self.get_member(&id)?.get_key().clone();
         if self.member_current_owner.get(&id) != Some(&owner) {
@@ -343,6 +390,7 @@ impl LuaMemberIndex {
             return;
         };
         self.bump_homing_revision();
+        self.drop_member_path_provenance_on_detach(owner, id);
         self.remove_member_from_all_owner_key_indexes(owner, id);
         self.remove_current_owner_member(owner, id);
 
@@ -587,6 +635,10 @@ impl LuaMemberIndex {
         file_id: FileId,
         id: LuaMemberId,
     ) -> Option<()> {
+        let owner = self
+            .effective_path_member_owner(id, &owner)
+            .unwrap_or(owner);
+        self.note_member_path_provenance(id, &owner);
         let owner = self.canonical(&owner).clone();
         // Read before the insert decides the bump: a real move, or a first
         // homing for an id the index already holds (deferred resolution filed
@@ -714,39 +766,148 @@ impl LuaMemberIndex {
         }
     }
 
+    /// Records or drops `id`'s global-path provenance for a homing decision.
+    ///
+    /// A write that named global path `path` directly, or that filed the member
+    /// under a table literal initialising one, makes the member a path member:
+    /// it must follow the path when its winning `---@class` changes. A member
+    /// re-homed onto the path's current canonical owner keeps its provenance;
+    /// one re-homed anywhere else is no longer a path member and loses it.
+    fn note_member_path_provenance(&mut self, id: LuaMemberId, raw_owner: &LuaMemberOwner) {
+        if let Some(path) = raw_owner.get_path() {
+            self.member_path_provenance.insert(id, path.clone());
+            return;
+        }
+        let canonical = self.canonical(raw_owner).clone();
+        if let Some(path) = canonical.get_path() {
+            self.member_path_provenance.insert(id, path.clone());
+            return;
+        }
+        let Some(recorded) = self.member_path_provenance.get(&id).cloned() else {
+            return;
+        };
+        let recorded_canonical = self
+            .canonical(&LuaMemberOwner::GlobalPath(recorded))
+            .clone();
+        if recorded_canonical != canonical {
+            self.member_path_provenance.remove(&id);
+        }
+    }
+
+    /// Drops `id`'s provenance when it is detached from the owner the
+    /// provenance names, so a final detachment cannot leave a member the next
+    /// class flip would resurrect onto a path it left.
+    fn drop_member_path_provenance_on_detach(
+        &mut self,
+        detached_from: &LuaMemberOwner,
+        id: LuaMemberId,
+    ) {
+        let Some(recorded) = self.member_path_provenance.get(&id).cloned() else {
+            return;
+        };
+        let provenance_canonical = self
+            .canonical(&LuaMemberOwner::GlobalPath(recorded))
+            .clone();
+        if provenance_canonical == *detached_from {
+            self.member_path_provenance.remove(&id);
+        }
+    }
+
+    /// The owner a path member's homing actually lands on.
+    ///
+    /// A path and its annotated classes are one table. A write that homes a
+    /// path-provenance member onto a class the path has already outranked
+    /// names the same table through a losing name — a re-indexed file still
+    /// binding its own (losing) class does this on every ripple — so the
+    /// winner decides and the member homes under it instead. Without this the
+    /// members surface under both classes. Homing to any other owner is a
+    /// genuine move and is left alone.
+    fn effective_path_member_owner(
+        &self,
+        id: LuaMemberId,
+        owner: &LuaMemberOwner,
+    ) -> Option<LuaMemberOwner> {
+        let class = owner.get_type_id()?;
+        let provenance = self.member_path_provenance.get(&id)?;
+        let candidates = self.global_path_class_candidates.get(provenance)?;
+        let winner = candidates.iter().next()?.class.clone();
+        if *class == winner {
+            return None;
+        }
+        candidates
+            .iter()
+            .any(|candidate| candidate.class == *class)
+            .then(|| LuaMemberOwner::Type(winner))
+    }
+
     /// Records that `path`'s declaration is annotated `---@class`, and moves
-    /// the members already filed under the path onto the class.
+    /// the path's members onto the winning class.
     ///
     /// A global with a class annotation has two names for one table, and every
-    /// reader of the annotated type looks the members up on the class. Which
-    /// class wins is decided by name so two files annotating one global do not
-    /// depend on which was analysed first.
+    /// reader of the annotated type looks the members up on the class. Every
+    /// proposal is recorded, and the winner is the name-lexicographic-min
+    /// candidate (ties broken by file id and class identity), so two files
+    /// annotating one global do not depend on which was analysed first. When
+    /// the winner changes, the members already on the losing class move to the
+    /// winner; members still parked on the path itself move too.
     pub fn set_global_path_class(
         &mut self,
         path: GlobalId,
         class: crate::LuaTypeDeclId,
         file_id: FileId,
     ) {
-        if let Some(current) = self
+        let winner = {
+            let candidates = self
+                .global_path_class_candidates
+                .entry(path.clone())
+                .or_default();
+            candidates.insert(GlobalPathClassCandidate {
+                class_name: class.get_name().into(),
+                file_id,
+                class: class.clone(),
+            });
+            candidates
+                .iter()
+                .next()
+                .map(|candidate| candidate.class.clone())
+        };
+        let Some(winner) = winner else {
+            return;
+        };
+        let old = self
             .global_path_class_owner
             .get(&path)
             .and_then(LuaMemberOwner::get_type_id)
-            && current.get_name() <= class.get_name()
-        {
+            .cloned();
+        if old.as_ref() == Some(&winner) {
             return;
         }
         self.global_path_class_owner
-            .insert(path.clone(), LuaMemberOwner::Type(class.clone()));
+            .insert(path.clone(), LuaMemberOwner::Type(winner.clone()));
         // The canonical mapping itself changed what the path slot names, on
-        // top of the per-member moves below (each bumps on its own).
+        // top of the per-member moves in `rehome_global_path_class` (each
+        // bumps on its own).
         self.bump_homing_revision();
-        self.global_path_classes_by_file
-            .entry(file_id)
-            .or_default()
-            .push(path.clone());
+        self.rehome_global_path_class(&path, old.as_ref(), &LuaMemberOwner::Type(winner));
+    }
 
-        let path_owner = LuaMemberOwner::GlobalPath(path);
-        let class_owner = LuaMemberOwner::Type(class);
+    /// Moves the members of `path` between its two homes: from the path slot
+    /// and, when one is losing it, from the losing class, onto `to`.
+    ///
+    /// Only members that reached their current home through `path` move:
+    /// members homed onto the losing class by any other route (a write through
+    /// a genuinely class-typed value) stay put, as do members whose owner was
+    /// decided by scripted-class synthesis and members recorded as owner-only
+    /// writes. The moved member's item is pruned from the owner it leaves —
+    /// `set_member_owner` rewrites the key indexes but leaves owner items
+    /// behind — so the losing class stops listing path members.
+    fn rehome_global_path_class(
+        &mut self,
+        path: &GlobalId,
+        from: Option<&crate::LuaTypeDeclId>,
+        to: &LuaMemberOwner,
+    ) {
+        let path_owner = LuaMemberOwner::GlobalPath(path.clone());
         let mut member_ids = self
             .owner_members
             .get(&path_owner)
@@ -755,14 +916,63 @@ impl LuaMemberIndex {
             .flat_map(member_ids_from_item)
             .filter(|id| {
                 !self.synthesized_owner_members.contains(id)
+                    && !self.owner_only_members.contains(id)
                     && self.member_current_owner.get(id) == Some(&path_owner)
             })
             .collect::<Vec<_>>();
+
+        if let Some(old) = from {
+            let old_owner = LuaMemberOwner::Type(old.clone());
+            member_ids.extend(
+                self.owner_members
+                    .get(&old_owner)
+                    .into_iter()
+                    .flat_map(|members| members.get_member_items())
+                    .flat_map(member_ids_from_item)
+                    .filter(|id| {
+                        !self.synthesized_owner_members.contains(id)
+                            && !self.owner_only_members.contains(id)
+                            && self.member_current_owner.get(id) == Some(&old_owner)
+                            && self.member_path_provenance.get(id) == Some(path)
+                    }),
+            );
+        }
+
         member_ids.sort_unstable_by_key(|id| member_id_sort_key(*id));
         member_ids.dedup();
         for member_id in member_ids {
-            self.set_member_owner(class_owner.clone(), member_id.file_id, member_id);
-            self.add_member_to_owner(class_owner.clone(), member_id);
+            self.remove_member_from_owner_item(&path_owner, member_id);
+            if let Some(old) = from {
+                self.remove_member_from_owner_item(&LuaMemberOwner::Type(old.clone()), member_id);
+            }
+            self.set_member_owner(to.clone(), member_id.file_id, member_id);
+            self.add_member_to_owner(to.clone(), member_id);
+        }
+    }
+
+    /// Drops `id` from the member item it occupies under `owner`, and the
+    /// owner once its map is empty, without touching the owner-key indexes or
+    /// the member itself.
+    fn remove_member_from_owner_item(&mut self, owner: &LuaMemberOwner, id: LuaMemberId) {
+        let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
+            return;
+        };
+        let Some(owner_members) = self.owner_members.get_mut(owner) else {
+            return;
+        };
+        let drop_key = match owner_members.get_member_mut(&key) {
+            Some(LuaMemberIndexItem::One(existing)) => *existing == id,
+            Some(LuaMemberIndexItem::Many(ids)) => {
+                ids.retain(|held| *held != id);
+                ids.is_empty()
+            }
+            None => false,
+        };
+        if drop_key {
+            owner_members.remove_member(&key);
+        }
+        if owner_members.is_empty() {
+            self.owner_members.remove(owner);
         }
     }
 
@@ -1477,6 +1687,7 @@ impl LuaMemberIndex {
         }
         self.members.remove(&member_id);
         self.member_current_owner.remove(&member_id);
+        self.member_path_provenance.remove(&member_id);
         self.non_overwriting_assignment_members.remove(&member_id);
         self.owner_only_members.remove(&member_id);
         self.synthesized_owner_members.remove(&member_id);
@@ -1542,12 +1753,75 @@ impl LuaMemberIndex {
         }
         self.function_scope_ranges.remove(&file_id);
         self.remove_file_definition_sites(file_id);
-        for path in self
-            .global_path_classes_by_file
-            .remove(&file_id)
-            .unwrap_or_default()
-        {
-            self.global_path_class_owner.remove(&path);
+        self.recompute_global_path_class_winners(file_id);
+    }
+
+    /// Recomputes the class winner of every global path this file proposed.
+    ///
+    /// A proposal is a vote: removing the file drops its vote and the winner
+    /// is recomputed from the survivors. A lost winner moves the path's
+    /// members onto the surviving class; a lost last proposal removes the
+    /// mapping and moves the members back onto the path itself, so nothing is
+    /// left stranded under a class no file declares. Per-file rehomes run
+    /// before the batch owner-key sweep in [`Self::remove_files`], so the
+    /// surviving members' re-written key indexes are never swept away.
+    fn recompute_global_path_class_winners(&mut self, file_id: FileId) {
+        let mut affected: Vec<GlobalId> = Vec::new();
+        for (path, candidates) in self.global_path_class_candidates.iter_mut() {
+            let before = candidates.len();
+            candidates.retain(|candidate| candidate.file_id != file_id);
+            if candidates.len() != before {
+                affected.push(path.clone());
+            }
+        }
+        if affected.is_empty() {
+            return;
+        }
+        affected.sort_unstable_by(|left, right| left.get_name().cmp(right.get_name()));
+
+        for path in affected {
+            if self
+                .global_path_class_candidates
+                .get(&path)
+                .is_some_and(BTreeSet::is_empty)
+            {
+                self.global_path_class_candidates.remove(&path);
+            }
+            let winner = self
+                .global_path_class_candidates
+                .get(&path)
+                .and_then(|candidates| candidates.iter().next())
+                .map(|candidate| candidate.class.clone());
+            let old = self
+                .global_path_class_owner
+                .get(&path)
+                .and_then(LuaMemberOwner::get_type_id)
+                .cloned();
+            match winner {
+                Some(winner) => {
+                    if old.as_ref() != Some(&winner) {
+                        self.global_path_class_owner
+                            .insert(path.clone(), LuaMemberOwner::Type(winner.clone()));
+                        self.bump_homing_revision();
+                        self.rehome_global_path_class(
+                            &path,
+                            old.as_ref(),
+                            &LuaMemberOwner::Type(winner),
+                        );
+                    }
+                }
+                None => {
+                    if let Some(old) = old {
+                        self.global_path_class_owner.remove(&path);
+                        self.bump_homing_revision();
+                        self.rehome_global_path_class(
+                            &path,
+                            Some(&old),
+                            &LuaMemberOwner::GlobalPath(path.clone()),
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1889,7 +2163,8 @@ impl LuaIndex for LuaMemberIndex {
         self.path_definition_sites.clear();
         self.definition_sites_by_file.clear();
         self.global_path_class_owner.clear();
-        self.global_path_classes_by_file.clear();
+        self.global_path_class_candidates.clear();
+        self.member_path_provenance.clear();
     }
 }
 
