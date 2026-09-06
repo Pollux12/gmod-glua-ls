@@ -8272,6 +8272,156 @@ mod test {
     }
 
     #[gtest]
+    fn test_nullable_child_override_of_non_nullable_parent_member_is_flagged() {
+        // Issue 12: the first visible member hit (Child.value: string?) must
+        // decide nullability; the non-nullable Parent.value must not mask it.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class ParentNil12
+            ---@field value string
+
+            ---@class ChildNil12 : ParentNil12
+            ---@field value string?
+            "#,
+        );
+
+        let flagged = ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param child ChildNil12
+            local function test(child)
+                child.value:upper()
+            end
+            "#,
+        );
+        assert_that!(
+            flagged,
+            eq(false),
+            "Expected NeedCheckNil for nullable Child.value override"
+        );
+    }
+
+    #[gtest]
+    fn test_nullable_child_override_of_non_nullable_parent_member_is_flagged_in_arithmetic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class ParentNum12
+            ---@field amount number
+
+            ---@class ChildNum12 : ParentNum12
+            ---@field amount number?
+            "#,
+        );
+
+        let flagged = ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param child ChildNum12
+            local function test(child)
+                local total = child.amount + 1
+            end
+            "#,
+        );
+        assert_that!(
+            flagged,
+            eq(false),
+            "Expected NeedCheckNil for nullable Child.amount override in arithmetic"
+        );
+    }
+
+    #[gtest]
+    fn test_non_nullable_child_override_of_nullable_parent_member_is_suppressed() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class ParentOpt12
+            ---@field value string?
+
+            ---@class ChildConc12 : ParentOpt12
+            ---@field value string
+            "#,
+        );
+
+        let flagged = ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param child ChildConc12
+            local function test(child)
+                child.value:upper()
+            end
+            "#,
+        );
+        assert_that!(
+            flagged,
+            eq(true),
+            "Child.value (string) override decides; no NeedCheckNil"
+        );
+    }
+
+    #[gtest]
+    fn test_parent_member_decides_when_child_has_no_override() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class ParentStr12
+            ---@field value string
+
+            ---@class ChildNoDecl12 : ParentStr12
+            "#,
+        );
+
+        let suppressed = ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param child ChildNoDecl12
+            local function test(child)
+                child.value:upper()
+            end
+            "#,
+        );
+        assert_that!(
+            suppressed,
+            eq(true),
+            "Parent.value (string) decides when child has no override"
+        );
+    }
+
+    #[gtest]
+    fn test_nullable_parent_member_still_flagged_when_child_has_no_override() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class ParentOptOnly12
+            ---@field value string?
+
+            ---@class ChildNoDeclOpt12 : ParentOptOnly12
+            "#,
+        );
+
+        let flagged = ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param child ChildNoDeclOpt12
+            local function test(child)
+                child.value:upper()
+            end
+            "#,
+        );
+        assert_that!(
+            flagged,
+            eq(false),
+            "Parent.value (string?) decides when child has no override"
+        );
+    }
+
+    #[gtest]
     fn test_field_narrow_false_branch_no_nil() {
         // In the false branch (field doesn't exist), variable should retain original type
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
