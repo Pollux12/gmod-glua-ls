@@ -68,6 +68,7 @@ pub fn load_workspace(
     config_paths: Option<Vec<PathBuf>>,
     exclude_pattern: Option<Vec<String>>,
     include_pattern: Option<Vec<String>>,
+    gmod_annotations: Option<PathBuf>,
 ) -> Result<EmmyLuaAnalysis, Box<dyn Error>> {
     let (config_files, config_root): (Vec<PathBuf>, PathBuf) =
         if let Some(config_paths) = config_paths {
@@ -88,6 +89,24 @@ pub fn load_workspace(
         config_root.display()
     );
     emmyrc.pre_process_emmyrc(&config_root);
+
+    if let Some(annotations_path) = gmod_annotations {
+        if annotations_path.is_dir() {
+            log::info!(
+                "Adding GMod annotations from: {}",
+                annotations_path.display()
+            );
+            emmyrc.prioritize_gmod_annotations_library(
+                annotations_path.to_string_lossy().into_owned(),
+            );
+        } else {
+            log::warn!(
+                "GMod annotations path is not an existing directory: {}",
+                annotations_path.display()
+            );
+        }
+    }
+
     let mut workspace_folders = cmd_workspace_folders
         .iter()
         .map(|p| WorkspaceFolder::new(p.clone(), false))
