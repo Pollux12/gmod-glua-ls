@@ -1916,6 +1916,82 @@ function meta:Custom() end
         expect_that!(dirty_len, eq(0));
     }
 
+    /// A watched-file delete/create pair in one batch settles to the create.
+    ///
+    /// The watcher can deliver `DELETED` for a file the editor immediately
+    /// re-created (branch switches, atomic saves). Sorting keeps the two
+    /// events adjacent and only the last event per URI survives, so the file
+    /// must end present with the new text, not detached.
+    #[gtest]
+    fn watched_batch_delete_then_create_keeps_new_content() {
+        let mut ws = workspace_with(vec![]);
+        let uri = ws.virtual_url_generator.new_uri("lua/toggle.lua");
+        write(&mut ws, &uri, "local old = 1");
+
+        ws.analysis.apply_file_system_changes(vec![
+            (uri.clone(), None),
+            (uri.clone(), Some("local new = 2".to_string())),
+        ]);
+
+        let file_id = ws.analysis.get_file_id(&uri).expect("file present");
+        expect_that!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_file_content(&file_id),
+            some(eq(&"local new = 2".to_string()))
+        );
+        expect_that!(
+            decl_type(&ws, file_id, "new"),
+            eq(&LuaType::IntegerConst(2))
+        );
+    }
+
+    /// The reverse order — create then delete — must not resurrect the file.
+    ///
+    /// The last event per URI is the state on disk, so the batch leaves the
+    /// URI detached and no FileId is reachable through it.
+    #[gtest]
+    fn watched_batch_create_then_delete_detaches_uri() {
+        let mut ws = workspace_with(vec![]);
+        let uri = ws.virtual_url_generator.new_uri("lua/reverted.lua");
+        write(&mut ws, &uri, "local keep = 1");
+
+        ws.analysis.apply_file_system_changes(vec![
+            (uri.clone(), Some("local resurrected = 1".to_string())),
+            (uri.clone(), None),
+        ]);
+
+        expect_that!(ws.analysis.get_file_id(&uri), none());
+    }
+
+    /// Distinct URIs in one batch settle independently.
+    #[gtest]
+    fn watched_batch_handles_distinct_uris() {
+        let mut ws = workspace_with(vec![]);
+        let kept_uri = ws.virtual_url_generator.new_uri("lua/kept.lua");
+        let dropped_uri = ws.virtual_url_generator.new_uri("lua/dropped.lua");
+        write(&mut ws, &kept_uri, "local kept_old = 1");
+        write(&mut ws, &dropped_uri, "local dropped = 1");
+
+        ws.analysis.apply_file_system_changes(vec![
+            (kept_uri.clone(), Some("local kept_new = 2".to_string())),
+            (dropped_uri.clone(), None),
+        ]);
+
+        let kept_id = ws.analysis.get_file_id(&kept_uri).expect("kept present");
+        expect_that!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_file_content(&kept_id),
+            some(eq(&"local kept_new = 2".to_string()))
+        );
+        expect_that!(ws.analysis.get_file_id(&dropped_uri), none());
+    }
+
     /// A textual collision is still diagnostic-only.
     ///
     /// Both files reference the member key `Field`, but on different owners, so
