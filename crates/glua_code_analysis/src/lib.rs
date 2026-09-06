@@ -41,6 +41,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use schema_to_glua::SchemaConverter;
 pub use semantic::*;
 use smol_str::SmolStr;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::{Component, Path};
 use std::str::FromStr;
@@ -115,8 +116,8 @@ pub fn call_expr_is_net_op(
     db_index::signature_has_net_op_metadata(db, signature_id)
 }
 
-pub async fn fetch_schema_urls(urls: Vec<Url>) -> FxHashMap<Url, String> {
-    let mut url_contents = FxHashMap::default();
+pub async fn fetch_schema_urls(urls: Vec<Url>) -> HashMap<Url, String> {
+    let mut url_contents = HashMap::default();
     for url in urls {
         if url.scheme() == "file" {
             if let Ok(path) = url.to_file_path()
@@ -725,6 +726,18 @@ impl DirtySet {
     #[cfg(test)]
     pub fn textual_refresh_names(&self) -> &FxHashSet<SmolStr> {
         &self.textual_refresh_names
+    }
+
+    /// Takes the sideband textual refresh names out of the set, so a caller
+    /// can schedule their diagnostics without holding on to the ripple's
+    /// re-index work.
+    pub fn take_textual_refresh_names(&mut self) -> FxHashSet<SmolStr> {
+        std::mem::take(&mut self.textual_refresh_names)
+    }
+
+    /// How many sideband textual refresh names the set carries.
+    pub fn textual_refresh_names_len(&self) -> usize {
+        self.textual_refresh_names.len()
     }
 }
 
@@ -1420,7 +1433,7 @@ impl EmmyLuaAnalysis {
     /// the ripple settled is decided by the change-driven pass alone. The
     /// late parameter-consumer pass contributes its own sideband below, merged
     /// the same way.
-    pub(crate) fn ripple_with_refresh_names(
+    pub fn ripple_with_refresh_names(
         &mut self,
         mut dirty: DirtySet,
     ) -> (Vec<FileId>, FxHashSet<SmolStr>) {
@@ -1851,7 +1864,7 @@ impl EmmyLuaAnalysis {
     /// No caps or prefilters: every referencer is reported, however large the
     /// fanout, and per-name fanout is logged without truncation so a hub name
     /// stays visible.
-    fn textual_refresh_candidates(
+    pub fn textual_refresh_candidates(
         &self,
         names: &FxHashSet<SmolStr>,
         exclude: &FxHashSet<FileId>,
@@ -2486,7 +2499,7 @@ impl EmmyLuaAnalysis {
             .get_need_resolve_schemas()
     }
 
-    pub fn apply_fetched_schemas(&mut self, url_contents: FxHashMap<Url, String>) {
+    pub fn apply_fetched_schemas(&mut self, url_contents: HashMap<Url, String>) {
         if url_contents.is_empty() {
             return;
         }
