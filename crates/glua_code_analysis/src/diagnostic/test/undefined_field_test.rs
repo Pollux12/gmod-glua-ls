@@ -5331,10 +5331,11 @@ owner:CompletelyMadeUpMethod()
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("annotations.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             ---@class VMatrix
             local VMatrix = {}
             function VMatrix:GetTranslation() end
@@ -5356,9 +5357,10 @@ owner:CompletelyMadeUpMethod()
             ---@return_cast value -NULL
             function IsValid(value) end
             "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         let file_id = ws.def_file(
             "gamemodes/sandbox/entities/weapons/gmod_tool/stools/finger.lua",

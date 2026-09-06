@@ -123,6 +123,7 @@ fn workspace() -> VirtualWorkspace {
 fn write(ws: &mut VirtualWorkspace, uri: &Uri, text: &str) -> FileId {
     ws.analysis
         .update_file_by_uri(uri, Some(text.to_string()))
+        .map(|(id, _)| id)
         .expect("file id")
 }
 

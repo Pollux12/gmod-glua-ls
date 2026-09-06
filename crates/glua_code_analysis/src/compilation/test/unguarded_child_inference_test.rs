@@ -483,10 +483,12 @@ mod test {
             .new_uri("lua/autorun/client/consumer.lua");
         ws.analysis
             .update_file_by_uri(&producer_uri, Some(STRUCTURAL_PRODUCER.to_string()))
+            .map(|(id, _)| id)
             .expect("initial producer");
         let mut consumer_file_id = ws
             .analysis
             .update_file_by_uri(&consumer_uri, Some(CONSUMER.to_string()))
+            .map(|(id, _)| id)
             .expect("initial consumer");
         assert_eq!(
             nested_callback_state(&mut ws, consumer_file_id),
@@ -495,6 +497,7 @@ mod test {
 
         ws.analysis
             .update_file_by_uri(&producer_uri, Some(NON_STRUCTURAL_PRODUCER.to_string()))
+            .map(|(id, _)| id)
             .expect("producer without structural callback data");
         assert_eq!(
             nested_callback_state(&mut ws, consumer_file_id),
@@ -503,6 +506,7 @@ mod test {
 
         ws.analysis
             .update_file_by_uri(&producer_uri, Some(STRUCTURAL_PRODUCER.to_string()))
+            .map(|(id, _)| id)
             .expect("restored structural producer");
         assert_eq!(
             nested_callback_state(&mut ws, consumer_file_id),
@@ -512,6 +516,7 @@ mod test {
         consumer_file_id = ws
             .analysis
             .update_file_by_uri(&consumer_uri, Some(EDITED_CONSUMER.to_string()))
+            .map(|(id, _)| id)
             .expect("edited consumer");
         assert_eq!(
             nested_callback_state(&mut ws, consumer_file_id),
@@ -520,6 +525,7 @@ mod test {
 
         ws.analysis
             .remove_file_by_uri(&producer_uri)
+            .0
             .expect("removed producer");
         assert_eq!(
             nested_callback_state(&mut ws, consumer_file_id),
@@ -528,6 +534,7 @@ mod test {
 
         ws.analysis
             .update_file_by_uri(&producer_uri, Some(STRUCTURAL_PRODUCER.to_string()))
+            .map(|(id, _)| id)
             .expect("reopened producer");
         assert_eq!(
             nested_callback_state(&mut ws, consumer_file_id),
@@ -536,10 +543,12 @@ mod test {
 
         ws.analysis
             .remove_file_by_uri(&consumer_uri)
+            .0
             .expect("removed consumer");
         consumer_file_id = ws
             .analysis
             .update_file_by_uri(&consumer_uri, Some(CONSUMER.to_string()))
+            .map(|(id, _)| id)
             .expect("reopened consumer");
         assert_eq!(
             nested_callback_state(&mut ws, consumer_file_id),
@@ -1819,6 +1828,7 @@ mod test {
         let file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(IMMUTABLE_SOURCE.to_string()))
+            .map(|(id, _)| id)
             .expect("initial immutable file");
         assert_eq!(
             diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
@@ -1828,6 +1838,7 @@ mod test {
         let updated_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(MUTABLE_SOURCE.to_string()))
+            .map(|(id, _)| id)
             .expect("mutable update");
         assert_eq!(updated_file_id, file_id);
         assert_eq!(
@@ -1842,6 +1853,7 @@ mod test {
         let restored_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(IMMUTABLE_SOURCE.to_string()))
+            .map(|(id, _)| id)
             .expect("restored immutable update");
         assert_eq!(
             diagnostic_count(
@@ -1854,10 +1866,12 @@ mod test {
 
         ws.analysis
             .remove_file_by_uri(&uri)
+            .0
             .expect("removed incremental file");
         let reopened_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(IMMUTABLE_SOURCE.to_string()))
+            .map(|(id, _)| id)
             .expect("reopened immutable file");
         assert_eq!(
             diagnostic_count(

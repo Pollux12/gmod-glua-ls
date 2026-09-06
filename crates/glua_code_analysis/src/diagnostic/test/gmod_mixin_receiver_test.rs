@@ -1854,6 +1854,7 @@ mod tests {
                     .to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("target file must be created");
         ws.def_file(
             "lua/autorun/incremental_edit_consumer.lua",
@@ -1886,19 +1887,21 @@ mod tests {
             before_receiver_slot
         ));
 
-        ws.analysis.update_file_by_uri(
-            &target_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &target_uri,
+                Some(
+                    r#"
                 local MIXIN = {}
                 function MIXIN:After()
                     self:OnlyOnReceiver()
                 end
                 return MIXIN
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         assert!(!has_inferred_param(
             &ws,
@@ -1924,6 +1927,7 @@ mod tests {
         let target_file_id = ws
             .analysis
             .update_file_by_uri(&target_uri, Some(target_content.to_string()))
+            .map(|(id, _)| id)
             .expect("target file must be created");
         ws.def_file(
             "lua/autorun/incremental_reopen_consumer.lua",
@@ -1954,12 +1958,14 @@ mod tests {
 
         ws.analysis
             .remove_file_by_uri(&target_uri)
+            .0
             .expect("target file must be removed");
         assert!(!has_inferred_param(&ws, original_signature, receiver_slot));
 
         let reopened_file_id = ws
             .analysis
             .update_file_by_uri(&target_uri, Some(target_content.to_string()))
+            .map(|(id, _)| id)
             .expect("target file must reopen");
         assert!(has_inferred_receiver(&ws, reopened_file_id, "MIXIN.Run"));
     }
@@ -1980,6 +1986,7 @@ mod tests {
         let target_file_id = ws
             .analysis
             .update_file_by_uri(&target_uri, Some(target_content.to_string()))
+            .map(|(id, _)| id)
             .expect("target file must be created");
         ws.def_file(
             "lua/autorun/compilefile_reopen_consumer.lua",
@@ -2010,12 +2017,14 @@ mod tests {
 
         ws.analysis
             .remove_file_by_uri(&target_uri)
+            .0
             .expect("target file must be removed");
         assert!(!has_inferred_param(&ws, original_signature, receiver_slot));
 
         let reopened_file_id = ws
             .analysis
             .update_file_by_uri(&target_uri, Some(target_content.to_string()))
+            .map(|(id, _)| id)
             .expect("target file must reopen");
         assert!(has_inferred_receiver(&ws, reopened_file_id, "MIXIN.Run"));
     }

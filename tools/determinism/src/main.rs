@@ -1782,8 +1782,12 @@ fn noop_edit(analysis: &mut EmmyLuaAnalysis, target: &Path, at_front: bool) -> b
 "
         )
     };
-    analysis.update_file_by_uri(&uri, Some(edited));
-    analysis.update_file_by_uri(&uri, Some(original));
+    analysis
+        .update_file_by_uri(&uri, Some(edited))
+        .map(|(id, _)| id);
+    analysis
+        .update_file_by_uri(&uri, Some(original))
+        .map(|(id, _)| id);
     eprintln!(
         "[{tag}] no-op newline edit pair on {} ({:.2}s)",
         target.display(),
@@ -2051,8 +2055,12 @@ fn edit_revert(codebase: &Path, annotations: &Path, targets: &[String]) {
         let before = collect(analysis, "before_editrevert");
 
         let t = Instant::now();
-        analysis.update_file_by_uri(&uri, Some(edited));
-        analysis.update_file_by_uri(&uri, Some(original));
+        analysis
+            .update_file_by_uri(&uri, Some(edited))
+            .map(|(id, _)| id);
+        analysis
+            .update_file_by_uri(&uri, Some(original))
+            .map(|(id, _)| id);
         eprintln!(
             "[editrevert] {target} edited and reverted ({:.2}s)",
             t.elapsed().as_secs_f64()
@@ -2115,7 +2123,9 @@ fn real_edit(
 
         let expanded = analysis.expand_reindex_file_ids(vec![file_id]);
         let t = Instant::now();
-        analysis.update_file_by_uri(&uri, Some(edited.clone()));
+        analysis
+            .update_file_by_uri(&uri, Some(edited.clone()))
+            .map(|(id, _)| id);
         eprintln!(
             "[realedit] {} ({matches} site(s)) expands to {} files ({:.2}s)",
             target,
@@ -2143,7 +2153,9 @@ fn real_edit(
         diff_index("cold_edited", &truth_index, "warm", &warm_index);
         diff("cold_edited", &truth, "warm", &warm);
 
-        analysis.update_file_by_uri(&uri, Some(original));
+        analysis
+            .update_file_by_uri(&uri, Some(original))
+            .map(|(id, _)| id);
     }
 }
 
@@ -2209,7 +2221,9 @@ fn blast_radius(analysis: &mut EmmyLuaAnalysis, codebase: &Path, targets: &[Stri
             eprintln!("[blast] PASS {target}: the edit dirtied {dirty_len} file(s) (max {max})");
         }
 
-        analysis.update_file_by_uri(&uri, Some(original));
+        analysis
+            .update_file_by_uri(&uri, Some(original))
+            .map(|(id, _)| id);
     }
     ok
 }
@@ -2337,12 +2351,16 @@ fn burst_edit(
     // The control: the same three edits through today's path, one ripple each.
     // Localises a failure to the deferral or to the path underneath it.
     for target in &resolved {
-        analysis.update_file_by_uri(&target.uri, Some(target.original.clone()));
+        analysis
+            .update_file_by_uri(&target.uri, Some(target.original.clone()))
+            .map(|(id, _)| id);
     }
     let t = Instant::now();
     for step in 0..3 {
         for target in &resolved {
-            analysis.update_file_by_uri(&target.uri, Some(step_text(target, step)));
+            analysis
+                .update_file_by_uri(&target.uri, Some(step_text(target, step)))
+                .map(|(id, _)| id);
         }
     }
     eprintln!(
@@ -2372,7 +2390,9 @@ fn burst_edit(
     diff("cold_burst", &truth, "warm", &warm);
 
     for target in &resolved {
-        analysis.update_file_by_uri(&target.uri, Some(target.original.clone()));
+        analysis
+            .update_file_by_uri(&target.uri, Some(target.original.clone()))
+            .map(|(id, _)| id);
     }
 }
 

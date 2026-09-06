@@ -814,7 +814,11 @@ impl EmmyLuaAnalysis {
         module_index.add_workspace_root_with_kind(root, id, WorkspaceKind::Library);
     }
 
-    pub fn update_file_by_uri(&mut self, uri: &Uri, text: Option<String>) -> Option<FileId> {
+    pub fn update_file_by_uri(
+        &mut self,
+        uri: &Uri,
+        text: Option<String>,
+    ) -> Option<(FileId, Vec<FileId>)> {
         let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(uri);
         if let Some(file_id) = existing_file_id {
             if let (Some(new_text), Some(old_text)) = (
@@ -837,13 +841,13 @@ impl EmmyLuaAnalysis {
                     .get_module(file_id)
                     .is_some()
                 {
-                    return Some(file_id);
+                    return Some((file_id, Vec::new()));
                 }
 
                 // Index was cleared — fall through to rebuild it.
                 self.compilation.remove_index(vec![file_id]);
                 self.compilation.update_index(vec![file_id]);
-                return Some(file_id);
+                return Some((file_id, Vec::new()));
             }
         } else if text.is_none() {
             return None;
@@ -871,7 +875,7 @@ impl EmmyLuaAnalysis {
                 .get_db_mut()
                 .get_vfs_mut()
                 .set_file_content(uri, text);
-            return Some(file_id);
+            return Some((file_id, Vec::new()));
         }
 
         // Two-phase incremental edit. Phase 1 re-indexes the edited file and
@@ -907,10 +911,14 @@ impl EmmyLuaAnalysis {
         if was_absent || is_removed {
             self.dirty_existence_dependents(&mut dirty, file_id);
         }
-        profile::phase("edit/ripple", || self.ripple(dirty));
+        // Phase 2 plus the textual widening: the caller gets every file whose
+        // diagnostics this edit may have moved, not only the edited file.
+        let widened = profile::phase("edit/ripple", || {
+            self.ripple_and_widen(dirty, vec![file_id])
+        });
         profile::phase_report("update_file_by_uri");
 
-        Some(file_id)
+        Some((file_id, widened))
     }
 
     pub fn update_file_preparsed(
@@ -921,7 +929,7 @@ impl EmmyLuaAnalysis {
         line_index: LineIndex,
         version: Option<i32>,
         trigger_reindex: bool,
-    ) -> Option<FileId> {
+    ) -> Option<(FileId, Vec<FileId>)> {
         let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(&uri);
         if let Some(file_id) = existing_file_id {
             if let (Some(incoming_version), Some(current_version)) = (
@@ -955,7 +963,7 @@ impl EmmyLuaAnalysis {
                         .get_db_mut()
                         .get_vfs_mut()
                         .update_file_version(&file_id, version);
-                    return Some(file_id);
+                    return Some((file_id, Vec::new()));
                 }
 
                 if trigger_reindex {
@@ -972,7 +980,7 @@ impl EmmyLuaAnalysis {
                     .get_db_mut()
                     .get_vfs_mut()
                     .update_file_version(&file_id, version);
-                return Some(file_id);
+                return Some((file_id, Vec::new()));
             }
         } else if text.is_none() {
             return None;
@@ -1005,10 +1013,11 @@ impl EmmyLuaAnalysis {
             if was_absent || is_removed {
                 self.dirty_existence_dependents(&mut dirty, file_id);
             }
-            self.ripple(dirty);
+            let widened = self.ripple_and_widen(dirty, vec![file_id]);
+            return Some((file_id, widened));
         }
 
-        Some(file_id)
+        Some((file_id, Vec::new()))
     }
 
     pub fn update_file_preparsed_deferred(
@@ -1095,10 +1104,12 @@ impl EmmyLuaAnalysis {
     ///
     /// Both phases of an edit: re-index the changed files and re-home the
     /// references into them, then re-analyse whatever read a fact the edit
-    /// moved.
-    pub fn reindex_files(&mut self, file_ids: Vec<FileId>) {
-        let dirty = self.self_index_and_diff(file_ids);
-        self.ripple(dirty);
+    /// moved. Returns every live file whose diagnostics this settle may have
+    /// moved — the changed files, the files the ripple settled, and the
+    /// textual referencers of the moved names.
+    pub fn reindex_files(&mut self, file_ids: Vec<FileId>) -> Vec<FileId> {
+        let dirty = self.self_index_and_diff(file_ids.clone());
+        self.ripple_and_widen(dirty, file_ids)
     }
 
     /// [`reindex_files`](Self::reindex_files) against an expansion that was
@@ -2201,15 +2212,49 @@ impl EmmyLuaAnalysis {
     /// instead of discarding them. The contribution-signature seed the expansion
     /// needed has no counterpart here because a contributed parameter is an
     /// exported fact: the diff against an emptied export map names its readers.
-    pub fn remove_file_by_uri(&mut self, uri: &Uri) -> Option<FileId> {
-        let file_id = self.compilation.get_db().get_vfs().get_file_id(uri)?;
+    /// Removes a file the way the filesystem did, and reports what to re-diagnose.
+    pub fn remove_file_by_uri(&mut self, uri: &Uri) -> (Option<FileId>, Vec<FileId>) {
+        let Some(file_id) = self.compilation.get_db().get_vfs().get_file_id(uri) else {
+            return (None, Vec::new());
+        };
         log::info!(
             "remove_file_by_uri: uri={} file_id={:?}",
             uri.as_str(),
             file_id
         );
-        self.apply_file_system_changes(vec![(uri.clone(), None)]);
-        Some(file_id)
+        let affected = self.apply_file_system_changes(vec![(uri.clone(), None)]);
+        (Some(file_id), affected)
+    }
+
+    /// Phase 2 of an edit plus the textual widening: re-analyse what `dirty`
+    /// invalidated, then resolve the sideband refresh names to
+    /// diagnostic-refresh-only candidates and append them.
+    ///
+    /// `changed` seeds the returned set (the edited batch); the files the
+    /// ripple settled and the textual referencers of the moved names join it.
+    /// Returns every live file whose diagnostics this edit may have moved,
+    /// sorted and deduped. Unlike
+    /// [`apply_file_system_changes`](Self::apply_file_system_changes), no
+    /// detached-file filtering happens here: a caller that detaches URIs
+    /// retains the live files itself afterwards.
+    fn ripple_and_widen(&mut self, dirty: DirtySet, changed: Vec<FileId>) -> Vec<FileId> {
+        let refresh_names: std::collections::HashSet<SmolStr> =
+            dirty.textual_refresh_names.iter().cloned().collect();
+        let mut affected = changed;
+        let (rippled, ripple_names) = self.ripple_with_refresh_names(dirty);
+        affected.extend(rippled);
+        // Diagnostic-refresh-only, after the change-driven settle: batch and
+        // ripple names merged, then resolved to textual candidates via
+        // `files_referencing_name`, filtered to live `Main` files. No reindex,
+        // no `dirty_len`.
+        let mut all_names = refresh_names;
+        all_names.extend(ripple_names);
+        let exclude: std::collections::HashSet<FileId> = affected.iter().copied().collect();
+        let textual = self.textual_refresh_candidates(&all_names, &exclude);
+        affected.extend(textual);
+        affected.sort_unstable();
+        affected.dedup();
+        affected
     }
 
     /// Applies a batch of filesystem changes — the creates, changes and deletes
@@ -2320,25 +2365,7 @@ impl EmmyLuaAnalysis {
         for file_id in existence_changed {
             self.dirty_existence_dependents(&mut dirty, file_id);
         }
-        // Cloned before the ripple consumes `dirty`: diagnosing under a shared
-        // borrow mutates nothing, so these names must not travel in the dirty
-        // set itself.
-        let refresh_names: std::collections::HashSet<SmolStr> =
-            dirty.textual_refresh_names.iter().cloned().collect();
-        let mut affected = changed;
-        let (rippled, ripple_names) = self.ripple_with_refresh_names(dirty);
-        affected.extend(rippled);
-        // Diagnostic-refresh-only, after the change-driven settle and before
-        // the detach: batch and ripple names merged, then resolved to textual
-        // candidates via `files_referencing_name`, filtered to live `Main`
-        // files, sorted and deduped. No reindex, no `dirty_len`.
-        {
-            let mut all_names = refresh_names;
-            all_names.extend(ripple_names);
-            let exclude: std::collections::HashSet<FileId> = affected.iter().copied().collect();
-            let textual = self.textual_refresh_candidates(&all_names, &exclude);
-            affected.extend(textual);
-        }
+        let mut affected = self.ripple_and_widen(dirty, changed);
 
         for uri in &removed_uris {
             self.compilation.get_db_mut().get_vfs_mut().remove_file(uri);
@@ -2611,12 +2638,14 @@ mod tests {
                 &producer_uri,
                 Some("State = {}\nState.value = 1".to_string()),
             )
+            .map(|(id, _)| id)
             .expect("producer should be indexed");
         let returner = analysis
             .update_file_by_uri(
                 &returner_uri,
                 Some("function GetStateValue() return State.value end".to_string()),
             )
+            .map(|(id, _)| id)
             .expect("returner should be indexed");
 
         assert!(
@@ -2639,16 +2668,19 @@ mod tests {
         analysis.add_main_workspace(workspace);
         let old_target = analysis
             .update_file_by_uri(&target_uri, Some("return {}".to_string()))
+            .map(|(id, _)| id)
             .expect("target should be created");
         let caller = analysis
             .update_file_by_uri(
                 &caller_uri,
                 Some(r#"local reopened = include("mixins/reopened.lua")"#.to_string()),
             )
+            .map(|(id, _)| id)
             .expect("caller should be created");
 
         analysis
             .remove_file_by_uri(&target_uri)
+            .0
             .expect("target should be removed");
         assert_ne!(
             analysis
@@ -2690,16 +2722,19 @@ mod tests {
         analysis.add_main_workspace(workspace);
         analysis
             .update_file_by_uri(&target_uri, Some("return {}".to_string()))
+            .map(|(id, _)| id)
             .expect("target should be created");
         let caller = analysis
             .update_file_by_uri(
                 &caller_uri,
                 Some(format!("local reopened = {dependency_expr}")),
             )
+            .map(|(id, _)| id)
             .expect("caller should be created");
 
         analysis
             .remove_file_by_uri(&target_uri)
+            .0
             .expect("target should be removed");
         let reopened_target = analysis
             .compilation
@@ -2830,6 +2865,7 @@ mod tests {
         let content = "local IsValid = IsValid";
         let file_id = analysis
             .update_file_by_uri(&uri, Some(content.to_string()))
+            .map(|(id, _)| id)
             .expect("file id should exist");
 
         analysis.compilation.clear_index();
@@ -2842,7 +2878,9 @@ mod tests {
                 .is_none()
         );
 
-        analysis.update_file_by_uri(&uri, Some(content.to_string()));
+        analysis
+            .update_file_by_uri(&uri, Some(content.to_string()))
+            .map(|(id, _)| id);
         assert!(
             analysis
                 .compilation
@@ -2862,6 +2900,7 @@ mod tests {
         let content = "local IsValid = IsValid";
         let file_id = analysis
             .update_file_by_uri(&uri, Some(content.to_string()))
+            .map(|(id, _)| id)
             .expect("file id should exist");
 
         analysis.compilation.clear_index();
@@ -2944,9 +2983,11 @@ mod tests {
         analysis.add_library_workspace(library_workspace);
         let main_file_id = analysis
             .update_file_by_uri(&main_uri, Some("return true".to_string()))
+            .map(|(id, _)| id)
             .expect("main file should be indexed");
         let helper_file_id = analysis
             .update_file_by_uri(&helper_uri, Some("return true".to_string()))
+            .map(|(id, _)| id)
             .expect("helper file should be indexed");
         let helper_syntax_id = LuaSyntaxId::from_node(
             &analysis

@@ -406,6 +406,7 @@ mod tests {
         let debug_id = ws
             .analysis
             .update_file_by_uri(&debug_uri, Some(original.to_string()))
+            .map(|(id, _)| id)
             .expect("debug file id");
 
         fn param_snapshots(ws: &VirtualWorkspace, file_id: FileId) -> BTreeSet<DiagnosticSnapshot> {
@@ -442,12 +443,14 @@ mod tests {
         let baseline_engine_type = inferred_field_type(&ws, debug_id, "engineTypeId");
 
         ws.analysis
-            .update_file_by_uri(&debug_uri, Some(format!("\n{original}")));
+            .update_file_by_uri(&debug_uri, Some(format!("\n{original}")))
+            .map(|(id, _)| id);
         let after_add = param_snapshots(&ws, debug_id);
         let after_add_engine_type = inferred_field_type(&ws, debug_id, "engineTypeId");
 
         ws.analysis
-            .update_file_by_uri(&debug_uri, Some(original.to_string()));
+            .update_file_by_uri(&debug_uri, Some(original.to_string()))
+            .map(|(id, _)| id);
         let after_remove = param_snapshots(&ws, debug_id);
         let after_remove_engine_type = inferred_field_type(&ws, debug_id, "engineTypeId");
 
@@ -505,6 +508,7 @@ mod tests {
         let file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(original.to_string()))
+            .map(|(id, _)| id)
             .expect("animation file id");
 
         fn undefined_snapshots(
@@ -542,10 +546,12 @@ mod tests {
 
         let baseline = undefined_snapshots(&ws, file_id);
         ws.analysis
-            .update_file_by_uri(&uri, Some(format!("\n{original}")));
+            .update_file_by_uri(&uri, Some(format!("\n{original}")))
+            .map(|(id, _)| id);
         let after_add = undefined_snapshots(&ws, file_id);
         ws.analysis
-            .update_file_by_uri(&uri, Some(original.to_string()));
+            .update_file_by_uri(&uri, Some(original.to_string()))
+            .map(|(id, _)| id);
         let after_remove = undefined_snapshots(&ws, file_id);
 
         assert_that!(baseline.len(), eq(1));

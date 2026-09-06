@@ -43,6 +43,7 @@ mod tests {
     fn write(ws: &mut VirtualWorkspace, uri: &Uri, text: &str) -> FileId {
         ws.analysis
             .update_file_by_uri(uri, Some(text.to_string()))
+            .map(|(id, _)| id)
             .expect("file id")
     }
 
@@ -295,7 +296,9 @@ mod tests {
         );
         expect_that!(codes_in(&ws, consumer_id), is_empty());
 
-        ws.analysis.update_file_by_uri(&provider_uri, None);
+        ws.analysis
+            .update_file_by_uri(&provider_uri, None)
+            .map(|(id, _)| id);
 
         expect_that!(
             codes_in(&ws, consumer_id),
@@ -2266,7 +2269,9 @@ function meta:Custom() end
         let baseline_unrelated = codes_in(&ws, unrelated_id);
         expect_that!(baseline_unrelated, is_empty());
 
-        ws.analysis.update_file_by_uri(&provider_uri, None);
+        ws.analysis
+            .update_file_by_uri(&provider_uri, None)
+            .map(|(id, _)| id);
         // A file that shares no literal with the deleted one must be untouched.
         expect_that!(codes_in(&ws, unrelated_id), eq(&baseline_unrelated));
 

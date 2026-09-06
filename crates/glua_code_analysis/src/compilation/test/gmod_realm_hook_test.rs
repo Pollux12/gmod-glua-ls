@@ -3643,6 +3643,7 @@ mod test {
         let old_target_id = ws
             .analysis
             .update_file_by_uri(&target_uri, Some("return true".to_string()))
+            .map(|(id, _)| id)
             .expect("target file id must be present");
         ws.def_file(
             "lua/autorun/server/sv_loader.lua",
@@ -3651,10 +3652,12 @@ mod test {
 
         ws.analysis
             .remove_file_by_uri(&target_uri)
+            .0
             .expect("target should be removed");
         let new_target_id = ws
             .analysis
             .update_file_by_uri(&target_uri, Some("return true".to_string()))
+            .map(|(id, _)| id)
             .expect("recreated target file id must be present");
         assert_ne!(old_target_id, new_target_id);
 

@@ -2415,6 +2415,7 @@ mod test {
         "#;
         ws.analysis
             .update_file_by_uri(&alias_uri, Some(alias_source.to_string()))
+            .map(|(id, _)| id)
             .expect("expected alias file");
         ws.def_file("lua/autorun/server/sf_lifecycle_init.lua", "SF = {}\n");
         ws.def_file("lua/autorun/client/sf_lifecycle_init.lua", "SF = {}\n");
@@ -2425,6 +2426,7 @@ mod test {
         let member_file = ws
             .analysis
             .update_file_by_uri(&member_uri, Some(member_source.to_string()))
+            .map(|(id, _)| id)
             .expect("expected runtime member file");
 
         let assert_runtime_owner = |ws: &VirtualWorkspace, file_id| {
@@ -2451,25 +2453,30 @@ mod test {
                     .to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("expected alias origin edit");
         assert_runtime_owner(&ws, member_file);
 
         ws.analysis
             .remove_file_by_uri(&alias_uri)
+            .0
             .expect("expected alias removal");
         assert_runtime_owner(&ws, member_file);
 
         ws.analysis
             .update_file_by_uri(&alias_uri, Some(alias_source.to_string()))
+            .map(|(id, _)| id)
             .expect("expected reopened alias file");
         assert_runtime_owner(&ws, member_file);
 
         ws.analysis
             .remove_file_by_uri(&member_uri)
+            .0
             .expect("expected runtime member removal");
         let reopened_member_file = ws
             .analysis
             .update_file_by_uri(&member_uri, Some(member_source.to_string()))
+            .map(|(id, _)| id)
             .expect("expected reopened runtime member file");
         assert_runtime_owner(&ws, reopened_member_file);
     }
@@ -2530,7 +2537,8 @@ mod test {
 
         let fuel_server_uri = ws.virtual_url_generator.new_uri(fuel_server_path);
         ws.analysis
-            .update_file_by_uri(&fuel_server_uri, Some(format!("{fuel_server_source}\n")));
+            .update_file_by_uri(&fuel_server_uri, Some(format!("{fuel_server_source}\n")))
+            .map(|(id, _)| id);
 
         assert_that!(
             file_has_diagnostic(&mut ws, consumer_file, DiagnosticCode::UndefinedField),
@@ -2589,7 +2597,8 @@ mod test {
 
         let bootstrap_uri = ws.virtual_url_generator.new_uri(bootstrap_path);
         ws.analysis
-            .update_file_by_uri(&bootstrap_uri, Some(format!("{bootstrap_source}\n")));
+            .update_file_by_uri(&bootstrap_uri, Some(format!("{bootstrap_source}\n")))
+            .map(|(id, _)| id);
 
         let after_edit_type = local_name_type(&mut ws, consumer_file, "stock");
         let after_edit = ws.humanize_type(after_edit_type);
@@ -3018,7 +3027,9 @@ mod test {
         );
 
         let winner_uri = ws.virtual_url_generator.new_uri(winner_path);
-        ws.analysis.update_file_by_uri(&winner_uri, None);
+        ws.analysis
+            .update_file_by_uri(&winner_uri, None)
+            .map(|(id, _)| id);
 
         let mid_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Mid"));
         let path_owner = LuaMemberOwner::GlobalPath(GlobalId::new("Glide.Repair"));
@@ -3070,7 +3081,9 @@ mod test {
         );
 
         let annotator_uri = ws.virtual_url_generator.new_uri(annotator_path);
-        ws.analysis.update_file_by_uri(&annotator_uri, None);
+        ws.analysis
+            .update_file_by_uri(&annotator_uri, None)
+            .map(|(id, _)| id);
 
         let path_owner = LuaMemberOwner::GlobalPath(GlobalId::new("Glide.Repair"));
         assert_eq!(
@@ -3268,7 +3281,9 @@ mod test {
             );
 
             let apple_uri = ws.virtual_url_generator.new_uri(apple_path);
-            ws.analysis.update_file_by_uri(&apple_uri, None);
+            ws.analysis
+                .update_file_by_uri(&apple_uri, None)
+                .map(|(id, _)| id);
 
             assert_eq!(
                 global_path_class_member_names(&ws, &mid_owner),
@@ -3376,7 +3391,9 @@ mod test {
         let apple_uri = ws
             .virtual_url_generator
             .new_uri("lua/glide/sh_repair_apple.lua");
-        ws.analysis.update_file_by_uri(&apple_uri, None);
+        ws.analysis
+            .update_file_by_uri(&apple_uri, None)
+            .map(|(id, _)| id);
 
         let mid_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Mid"));
         let late_owner = global_path_class_member_names(&ws, &mid_owner);
@@ -3614,16 +3631,18 @@ local util = marauth.util
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri = Uri::parse_from_file_path(&library_root.join("marauth.lua"))
             .expect("valid library uri");
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
 marauth = {}
 marauth.util = {}
 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         let file_id = ws.def(
             r#"
@@ -3692,19 +3711,21 @@ local testFunction = marauth.util.TestFunction
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             Uri::parse_from_file_path(&library_root.join("marauth.lua")).expect("valid uri");
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
 marauth = {}
 marauth.util = {}
 
 function marauth.util:TestFunction()
 end
 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         let file_id = ws.def(
             r#"
@@ -3733,16 +3754,18 @@ local testFunction = marauth.util.TestFunction
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri = Uri::parse_from_file_path(&library_root.join("shadowed.lua"))
             .expect("valid library uri");
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
 shadowed = {}
 shadowed.util = {}
 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         let file_id = ws.def(
             r#"
@@ -3772,19 +3795,21 @@ local value = shadowed
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri = Uri::parse_from_file_path(&library_root.join("marauth.lua"))
             .expect("valid library uri");
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
 marauth = {}
 marauth.util = {}
 
 function marauth.util:TestFunction()
 end
 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         let file_id = ws.def(
             r#"
@@ -3866,19 +3891,21 @@ end
         ws.analysis.add_main_workspace(base_root.clone());
         let base_uri = Uri::parse_from_file_path(&base_root.join("gamemode/sh_test1.lua"))
             .expect("valid base uri");
-        ws.analysis.update_file_by_uri(
-            &base_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &base_uri,
+                Some(
+                    r#"
 marauth = marauth or {}
 marauth.util = marauth.util or {}
 
 function marauth.util:TestFunction()
 end
 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         let child_file = ws.def_file(
             "gamemode/sh_test1.lua",
@@ -3924,19 +3951,21 @@ local testFunction = marauth.util.TestFunction
         ws.analysis.add_main_workspace(base_root.clone());
         let base_uri = Uri::parse_from_file_path(&base_root.join("gamemode/sh_test1.lua"))
             .expect("valid base uri");
-        ws.analysis.update_file_by_uri(
-            &base_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &base_uri,
+                Some(
+                    r#"
 marauth = marauth or {}
 marauth.util = marauth.util or {}
 
 function marauth.util:BaseFunction()
 end
 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         let child_file = ws.def_file(
             "gamemode/sh_test1.lua",
@@ -4070,16 +4099,18 @@ local secondChildFunction = marauth.util.SecondChildFunction
         ws.analysis.add_main_workspace(base_root.clone());
         let base_uri = Uri::parse_from_file_path(&base_root.join("gamemode/sh_test1.lua"))
             .expect("valid base uri");
-        ws.analysis.update_file_by_uri(
-            &base_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &base_uri,
+                Some(
+                    r#"
 marauth = marauth or {}
 marauth.util = marauth.util or {}
 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         let child_file = ws.def_file(
             "gamemode/sh_test1.lua",

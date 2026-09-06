@@ -151,7 +151,8 @@ mod tests {
                 .analysis()
                 .write()
                 .await
-                .update_file_by_uri(&uri, Some("local greeting = 1".to_string()));
+                .update_file_by_uri(&uri, Some("local greeting = 1".to_string()))
+                .map(|(id, _)| id);
 
             // Seen but not yet applied: exactly the window between a didChange
             // notification and the coalescer applying its preparsed tree.

@@ -57,18 +57,45 @@ pub async fn on_did_rename_files_handler(
         // 更新
         let mut analysis = context.analysis().write().await;
         let encoding = &analysis.get_emmyrc().workspace.encoding;
+        let interval = analysis
+            .get_emmyrc()
+            .diagnostics
+            .diagnostic_interval
+            .unwrap_or(500);
+        // Every live file the renames may have moved, accumulated across the
+        // whole batch: what each removal settled and what each re-open widened.
+        let mut affected: Vec<FileId> = Vec::new();
         for rename in all_renames.iter() {
-            analysis.remove_file_by_uri(&rename.old_uri);
+            let (_, removed_affected) = analysis.remove_file_by_uri(&rename.old_uri);
+            affected.extend(removed_affected);
             if let Some(new_path) = uri_to_file_path(&rename.new_uri)
                 && let Some(text) = read_file_with_encoding(&new_path, encoding)
+                && let Some((_, widened)) = analysis.update_file_by_uri(&rename.new_uri, Some(text))
             {
-                analysis.update_file_by_uri(&rename.new_uri, Some(text));
+                affected.extend(widened);
             }
         }
         context
             .file_diagnostic()
             .invalidate_shared_diagnostic_data();
         drop(analysis);
+
+        affected.sort_unstable();
+        affected.dedup();
+        if !affected.is_empty() {
+            context
+                .file_diagnostic()
+                .add_files_diagnostic_task(affected, interval, None)
+                .await;
+            context
+                .workspace_manager()
+                .read()
+                .await
+                .update_workspace_version(crate::context::WorkspaceDiagnosticLevel::Fast, false);
+            if context.lsp_features().supports_refresh_diagnostic() {
+                context.client().refresh_workspace_diagnostics();
+            }
+        }
 
         let analysis = context.analysis().read().await;
         if let Some(changes) = try_modify_require_path(&analysis.compilation, &all_renames) {

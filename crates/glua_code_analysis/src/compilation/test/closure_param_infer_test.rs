@@ -144,6 +144,7 @@ mod test {
         };
         ws.analysis
             .update_file_by_uri(&api_uri, Some(api_source("CallbackEntityA")))
+            .map(|(id, _)| id)
             .expect("initial callback API");
         let consumer_file_id = ws.def_file(
             "lua/autorun/shared/callback_consumer.lua",
@@ -161,6 +162,7 @@ mod test {
 
         ws.analysis
             .update_file_by_uri(&api_uri, Some(api_source("CallbackEntityB")))
+            .map(|(id, _)| id)
             .expect("edited callback API");
         assert_eq!(
             index_expr_type(&ws, consumer_file_id, "data.proc"),
@@ -169,9 +171,11 @@ mod test {
 
         ws.analysis
             .remove_file_by_uri(&api_uri)
+            .0
             .expect("removed callback API");
         ws.analysis
             .update_file_by_uri(&api_uri, Some(api_source("CallbackEntityA")))
+            .map(|(id, _)| id)
             .expect("reopened callback API");
         assert_eq!(
             index_expr_type(&ws, consumer_file_id, "data.proc"),
@@ -1074,6 +1078,7 @@ mod test {
                     .to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("other workspace file");
         let main_file_id = ws.def_file(
             "base.lua",
@@ -1149,16 +1154,18 @@ mod test {
             &other_workspace.join("lua/weapons/gmod_tool/stools/context_test.lua"),
         )
         .expect("other workspace uri");
-        ws.analysis.update_file_by_uri(
-            &other_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &other_uri,
+                Some(
+                    r#"
                 ---@class TOOL.context_test : WrongBase
                 TOOL = {}
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         let (base_contract, class_contract) = current_super.map_or_else(
             || (
@@ -1253,6 +1260,7 @@ mod test {
         let edge_uri = ws.virtual_url_generator.new_uri("sh_contract.lua");
         ws.analysis
             .update_file_by_uri(&edge_uri, Some(edge_source("CLIENT")))
+            .map(|(id, _)| id)
             .expect("client edge file");
         ws.def_file(
             "sh_override.lua",
@@ -1350,16 +1358,18 @@ mod test {
         let other_uri =
             lsp_types::Uri::parse_from_file_path(&other_workspace.join("lua/foreign_contract.lua"))
                 .expect("other workspace uri");
-        ws.analysis.update_file_by_uri(
-            &other_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &other_uri,
+                Some(
+                    r#"
                 ---@class WorkspaceMid : WorkspaceContract
                 local WorkspaceMid = {}
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         ws.def_file(
             "lua/current_override.lua",
             r#"
@@ -1402,10 +1412,11 @@ mod test {
             &other_workspace.join("lua/foreign_callback_edges.lua"),
         )
         .expect("other workspace uri");
-        ws.analysis.update_file_by_uri(
-            &other_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &other_uri,
+                Some(
+                    r#"
                 ---@class CallbackChild : CallbackBase
                 local CallbackChild = {}
 
@@ -1415,9 +1426,10 @@ mod test {
                 ---@class IndexCallbackChild : IndexCallbackBase
                 local IndexCallbackChild = {}
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         ws.def_file(
             "lua/current_callback_calls.lua",
             r#"

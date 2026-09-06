@@ -143,6 +143,7 @@ mod test {
         assert_eq!(initial, ws.ty("unknown"));
         ws.analysis
             .update_file_by_uri(&consumer_uri, Some(format!("{consumer}\n")))
+            .map(|(id, _)| id)
             .expect("edited consumer");
         let incremental = local_name_type(&ws, consumer_file_id, "instance");
 
@@ -201,6 +202,7 @@ mod test {
             .unwrap_or_default();
         ws.analysis
             .update_file_by_uri(&consumer_uri, Some(format!("{consumer}\n")))
+            .map(|(id, _)| id)
             .expect("edited consumer");
         let after = ws
             .analysis

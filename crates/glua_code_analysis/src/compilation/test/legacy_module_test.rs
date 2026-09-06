@@ -821,6 +821,7 @@ local _ = tc
         let module_uri = ws.virtual_url_generator.new_uri("mymod.lua");
         ws.analysis
             .update_file_by_uri(&module_uri, Some(module_source.to_string()))
+            .map(|(id, _)| id)
             .expect("initial file update must succeed");
 
         let consumer_file = ws.def_file(
@@ -840,6 +841,7 @@ local _ = tc
         // analysis layer still removes-then-re-indexes the file).
         ws.analysis
             .update_file_by_uri(&module_uri, Some(module_source.to_string()))
+            .map(|(id, _)| id)
             .expect("reparse must succeed");
 
         // After reparse the alias entry must have been cleaned up and re-created

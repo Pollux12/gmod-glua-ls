@@ -222,7 +222,9 @@ fn run_incremental_edits(
                 self_only + ripple
             } else {
                 let t = Instant::now();
-                analysis.update_file_by_uri(&uri, Some(edited_text));
+                analysis
+                    .update_file_by_uri(&uri, Some(edited_text))
+                    .map(|(id, _)| id);
                 t.elapsed()
             };
 
@@ -249,7 +251,9 @@ fn run_incremental_edits(
                 analysis.update_file_text_only(&uri, text);
                 analysis.self_index_files(vec![file_id]);
             } else {
-                analysis.update_file_by_uri(&uri, Some(text));
+                analysis
+                    .update_file_by_uri(&uri, Some(text))
+                    .map(|(id, _)| id);
             }
         }
     }

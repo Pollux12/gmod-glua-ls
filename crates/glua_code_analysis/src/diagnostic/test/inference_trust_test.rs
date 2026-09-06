@@ -292,6 +292,7 @@ mod tests {
         let file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(source("")))
+            .map(|(id, _)| id)
             .expect("raw receiver file");
         assert_eq!(
             diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnknown).len(),
@@ -302,6 +303,7 @@ mod tests {
         let annotated_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(annotated.clone()))
+            .map(|(id, _)| id)
             .expect("annotated receiver file");
         assert!(
             diagnostics_for(&mut ws, annotated_file_id, DiagnosticCode::InferUnknown).is_empty()
@@ -310,6 +312,7 @@ mod tests {
         let raw_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(source("")))
+            .map(|(id, _)| id)
             .expect("raw receiver file after edit");
         assert_eq!(
             diagnostics_for(&mut ws, raw_file_id, DiagnosticCode::InferUnknown).len(),
@@ -318,10 +321,12 @@ mod tests {
 
         ws.analysis
             .update_file_by_uri(&uri, None)
+            .map(|(id, _)| id)
             .expect("receiver file removal");
         let reopened_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(annotated))
+            .map(|(id, _)| id)
             .expect("reopened annotated receiver file");
         assert!(
             diagnostics_for(&mut ws, reopened_file_id, DiagnosticCode::InferUnknown).is_empty()
@@ -846,7 +851,8 @@ mod tests {
         );
 
         ws.analysis
-            .update_file_by_uri(&provider_uri, Some(WITH_FLOAT_NETWORK_VAR.to_string()));
+            .update_file_by_uri(&provider_uri, Some(WITH_FLOAT_NETWORK_VAR.to_string()))
+            .map(|(id, _)| id);
         assert_eq!(
             (
                 local_type(&ws, consumer_file_id, "value"),
@@ -856,17 +862,21 @@ mod tests {
         );
 
         ws.analysis
-            .update_file_by_uri(&provider_uri, Some(WITH_BOOL_NETWORK_VAR.to_string()));
+            .update_file_by_uri(&provider_uri, Some(WITH_BOOL_NETWORK_VAR.to_string()))
+            .map(|(id, _)| id);
         assert_eq!(local_type(&ws, consumer_file_id, "value"), LuaType::Boolean);
 
-        ws.analysis.update_file_by_uri(&provider_uri, None);
+        ws.analysis
+            .update_file_by_uri(&provider_uri, None)
+            .map(|(id, _)| id);
         assert_eq!(
             diagnostics_for(&mut ws, consumer_file_id, DiagnosticCode::InferUnknown).len(),
             1
         );
 
         ws.analysis
-            .update_file_by_uri(&provider_uri, Some(WITH_FLOAT_NETWORK_VAR.to_string()));
+            .update_file_by_uri(&provider_uri, Some(WITH_FLOAT_NETWORK_VAR.to_string()))
+            .map(|(id, _)| id);
         assert_eq!(
             (
                 local_type(&ws, consumer_file_id, "value"),

@@ -73,16 +73,18 @@ mod test {
             &other_workspace.join("lua/foreign_arity_edge.lua"),
         )
         .expect("other workspace uri");
-        ws.analysis.update_file_by_uri(
-            &other_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &other_uri,
+                Some(
+                    r#"
                 ---@class ArityChild : ArityBase
                 local ArityChild = {}
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         let file_id = ws.def_file(
             "lua/current_arity.lua",
             r#"
