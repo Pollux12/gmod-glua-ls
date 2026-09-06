@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap;
+use std::collections::HashMap;
 
 use glua_parser::{LuaNonStdSymbol, LuaVersionNumber, SpecialFunction};
 use schemars::JsonSchema;
@@ -25,7 +25,7 @@ pub struct EmmyrcRuntime {
     pub nonstandard_symbol: Vec<EmmyrcNonStdSymbol>,
     /// Special symbols.
     #[serde(default)]
-    pub special: FxHashMap<String, EmmyrcSpecialSymbol>,
+    pub special: HashMap<String, EmmyrcSpecialSymbol>,
 }
 
 impl Default for EmmyrcRuntime {
@@ -36,7 +36,7 @@ impl Default for EmmyrcRuntime {
             extensions: Vec::new(),
             require_pattern: Vec::new(),
             nonstandard_symbol: default_nonstandard_symbols(),
-            special: FxHashMap::default(),
+            special: HashMap::default(),
         }
     }
 }

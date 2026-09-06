@@ -3813,6 +3813,7 @@ impl AnalyzeContext {
             .collect::<Vec<_>>();
         let (scripted_scope_files, scoped_matches) =
             scopes.scan_scripted_class_scope_files(file_paths);
+        let scripted_scope_files: HashSet<_> = scripted_scope_files.into_iter().collect();
         let scripted_scope_infos = scoped_matches
             .into_iter()
             .map(|(file_id, scope_match)| {

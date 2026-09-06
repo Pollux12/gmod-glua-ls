@@ -2,7 +2,6 @@
 mod test {
     use crate::{LuaAstNode, LuaLanguageLevel, LuaNonStdSymbolSet, LuaParser, ParserConfig};
     // use std::time::Instant;
-    use rustc_hash::FxHashMap;
     use std::thread;
 
     #[test]
@@ -40,7 +39,7 @@ end
         let parse_config = ParserConfig::new(
             LuaLanguageLevel::Lua51,
             None,
-            FxHashMap::default(),
+            Default::default(),
             LuaNonStdSymbolSet::new(),
             false,
         );
@@ -97,7 +96,7 @@ local t
         let c = ParserConfig::new(
             LuaLanguageLevel::Lua54,
             None,
-            FxHashMap::default(),
+            Default::default(),
             LuaNonStdSymbolSet::new(),
             false,
         );
@@ -119,7 +118,7 @@ end"#;
         let c = ParserConfig::new(
             LuaLanguageLevel::Lua54,
             None,
-            FxHashMap::default(),
+            Default::default(),
             LuaNonStdSymbolSet::new(),
             false,
         );

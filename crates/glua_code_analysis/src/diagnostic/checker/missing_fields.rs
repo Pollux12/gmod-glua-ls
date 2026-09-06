@@ -1,4 +1,4 @@
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use glua_parser::{
@@ -47,7 +47,7 @@ fn check_table_expr(
     let mut union_has_array_type = false;
     let table_type = match semantic_model.infer_table_should_be(expr.clone())? {
         LuaType::Union(union) => {
-            let mut set = HashSet::default();
+            let mut set = HashSet::new();
             for ty in union.types() {
                 if context.is_cancelled() {
                     return Some(());

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
 use rowan::TextRange;
@@ -952,7 +953,7 @@ fn push_cached_type_refs(db: &DbIndex, owner: &LuaTypeOwner, out: &mut Vec<crate
 /// Queries are batched per reverse index rather than issued per key: the
 /// lookups are set unions, and one call per key would turn a diff of a few
 /// hundred keys into a few hundred index walks.
-pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> FxHashSet<FileId> {
+pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> HashSet<FileId> {
     // A `---@module` reader caches `LuaType::ModuleRef(file_id)`, filed in the
     // reverse index under the providing file rather than under any symbol it
     // exports. No export key names that identity, so seeding the file itself is
@@ -1069,7 +1070,7 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Fx
     }
 
     let member_index = db.get_member_index();
-    let mut dependents: FxHashSet<FileId> = missed_readers.into_iter().collect();
+    let mut dependents: HashSet<FileId> = missed_readers.into_iter().collect();
     for (owner, structural) in &owners {
         // A reader that resolved a member through this owner cached the owner
         // itself - the class it named, the literal it indexed - so the reverse
