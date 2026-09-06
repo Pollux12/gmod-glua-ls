@@ -169,10 +169,6 @@ pub struct FileFacts {
     decl_positions: FxHashSet<TextSize>,
     member_ids: FxHashSet<LuaSyntaxId>,
     syntax_ids: FxHashSet<LuaSyntaxId>,
-    /// Every node range in the new tree. Answers "is this identity already
-    /// current": a range the new tree still holds is one the re-index rebuilt
-    /// from the new text, so mapping it again would shift it twice.
-    node_ranges: FxHashSet<TextRange>,
     /// The ranges something can still own members on: a table literal in the
     /// new tree, or a range the re-indexed file registers an `Element` owner
     /// at. An owner is keyed by whatever expression the write was made on - a
@@ -208,13 +204,11 @@ impl FileFacts {
             .map(|range| range.value)
             .collect::<FxHashSet<_>>();
         let mut syntax_ids = FxHashSet::default();
-        let mut node_ranges = FxHashSet::default();
         if let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) {
             for element in tree.get_red_root().descendants_with_tokens() {
                 match element {
                     rowan::NodeOrToken::Node(node) => {
                         syntax_ids.insert(LuaSyntaxId::from_node(&node));
-                        node_ranges.insert(node.text_range());
                     }
                     rowan::NodeOrToken::Token(token) => {
                         syntax_ids.insert(LuaSyntaxId::from_token(&token));
@@ -233,7 +227,6 @@ impl FileFacts {
             decl_positions,
             member_ids,
             syntax_ids,
-            node_ranges,
             owner_ranges,
         }
     }
@@ -305,29 +298,46 @@ impl FileRemap {
         }
     }
 
-    /// Whether the identity sits entirely in the edit's unchanged prefix.
+    /// Whether the position sits entirely in the edit's unchanged prefix.
     ///
-    /// `map` and `map_range` return an offset unchanged exactly when it lies
-    /// before the hunk, and those bytes are identical in both texts, so the
-    /// code the identity names is still there whatever the index happens to
-    /// enumerate. Checking existence for it would reject live identities the
-    /// facts cannot see - a `DocTagClass` node, say, which the syntax tree's
-    /// `descendants_with_tokens` walk does not reach.
-    fn is_before_the_hunk<T: PartialEq>(&self, original: &T, mapped: &Remap<T>) -> bool {
-        matches!(mapped, Remap::Moved(value) if value == original)
+    /// `map` returns an offset unchanged exactly when it lies before the
+    /// hunk, and those bytes are identical in both texts, so the code the
+    /// identity names is still there whatever the index happens to enumerate.
+    /// Checking existence for it would reject live identities the facts
+    /// cannot see - a `DocTagClass` node, say, which the syntax tree's
+    /// `descendants_with_tokens` walk does not reach. Judged by geometry, not
+    /// by whether the map happens to return the original value: a replacement
+    /// that swaps one function for another at the same offset also maps the
+    /// offset to itself, and that identity is *not* in the unchanged prefix.
+    fn pos_is_before_the_hunk(&self, position: TextSize) -> bool {
+        u32::from(position) < self.map.hunk_start
+    }
+
+    /// The range counterpart: `map_range` keeps a range unchanged exactly
+    /// when its end lies at or before the hunk start.
+    fn range_is_before_the_hunk(&self, range: TextRange) -> bool {
+        u32::from(range.end()) <= self.map.hunk_start
     }
 
     /// Resolves a mapped identity against the re-indexed file.
     ///
-    /// An identity the file still holds was rebuilt from the new text, so it
-    /// is already in the new coordinates and mapping it again would shift it a
-    /// second time. Only what the re-index left behind - the references
-    /// another file recorded - has to move. A mapped identity that lands on
-    /// nothing is lost.
-    fn resolve<T: PartialEq>(
+    /// An identity entirely in the unchanged prefix was untouched by the edit,
+    /// so its stored form is already correct whatever the index enumerates.
+    /// Otherwise the identity moves onto its mapped position: if that position
+    /// is occupied in the new index the reference is rewritten to it (a
+    /// collision - what used to sit at the old offset now sits at its image,
+    /// even when the old offset is occupied again by something else), and if
+    /// it is not, the identity is lost.
+    ///
+    /// The one exception is an identity the file's own index still holds at
+    /// its original position while the image is empty. Such an entry has not
+    /// been rebuilt by the re-index yet, so it and the reference to it must
+    /// stay in step rather than one being rewritten and the other not.
+    fn resolve<T>(
         &self,
-        original: &T,
         mapped: Remap<T>,
+        before_the_hunk: bool,
+        original_occupied: bool,
         exists: impl Fn(&FileFacts, &T) -> bool,
     ) -> Remap<T> {
         let Some(facts) = &self.facts else {
@@ -335,39 +345,14 @@ impl FileRemap {
         };
         // `Unrelated` here means the identity is not in this file at all, so
         // the file's own facts say nothing about it.
-        if matches!(mapped, Remap::Unrelated) || self.is_before_the_hunk(original, &mapped) {
+        if matches!(mapped, Remap::Unrelated) || before_the_hunk {
             return mapped;
-        }
-        if exists(facts, original) {
-            return Remap::Unrelated;
         }
         match &mapped {
-            Remap::Moved(value) if !exists(facts, value) => Remap::Lost,
-            _ => mapped,
-        }
-    }
-
-    /// [`resolve`](Self::resolve) where "already current" and "the mapped
-    /// position is real" are not answered by the same set.
-    fn resolve_with<T: PartialEq>(
-        &self,
-        original: &T,
-        mapped: Remap<T>,
-        current: impl Fn(&FileFacts, &T) -> bool,
-        lands_on: impl Fn(&FileFacts, &T) -> bool,
-    ) -> Remap<T> {
-        let Some(facts) = &self.facts else {
-            return mapped;
-        };
-        if matches!(mapped, Remap::Unrelated) || self.is_before_the_hunk(original, &mapped) {
-            return mapped;
-        }
-        if current(facts, original) {
-            return Remap::Unrelated;
-        }
-        match &mapped {
-            Remap::Moved(value) if !lands_on(facts, value) => Remap::Lost,
-            _ => mapped,
+            Remap::Moved(value) if exists(facts, value) => mapped,
+            Remap::Moved(_) | Remap::Lost if original_occupied => Remap::Unrelated,
+            Remap::Moved(_) | Remap::Lost => Remap::Lost,
+            Remap::Unrelated => Remap::Unrelated,
         }
     }
 
@@ -377,9 +362,14 @@ impl FileRemap {
             Remap::Unrelated => Remap::Unrelated,
             Remap::Lost => Remap::Lost,
         };
-        self.resolve(&id, mapped, |facts, id| {
-            facts.signature_positions.contains(&id.get_position())
-        })
+        self.resolve(
+            mapped,
+            self.pos_is_before_the_hunk(id.get_position()),
+            self.facts
+                .as_ref()
+                .is_some_and(|facts| facts.signature_positions.contains(&id.get_position())),
+            |facts, id| facts.signature_positions.contains(&id.get_position()),
+        )
     }
 
     pub fn decl_id(&self, id: LuaDeclId) -> Remap<LuaDeclId> {
@@ -388,9 +378,14 @@ impl FileRemap {
             Remap::Unrelated => Remap::Unrelated,
             Remap::Lost => Remap::Lost,
         };
-        self.resolve(&id, mapped, |facts, id| {
-            facts.decl_positions.contains(&id.position)
-        })
+        self.resolve(
+            mapped,
+            self.pos_is_before_the_hunk(id.position),
+            self.facts
+                .as_ref()
+                .is_some_and(|facts| facts.decl_positions.contains(&id.position)),
+            |facts, id| facts.decl_positions.contains(&id.position),
+        )
     }
 
     pub fn syntax_id(&self, file_id: FileId, id: LuaSyntaxId) -> Remap<LuaSyntaxId> {
@@ -399,7 +394,14 @@ impl FileRemap {
             Remap::Unrelated => Remap::Unrelated,
             Remap::Lost => Remap::Lost,
         };
-        self.resolve(&id, mapped, |facts, id| facts.syntax_ids.contains(id))
+        self.resolve(
+            mapped,
+            self.range_is_before_the_hunk(id.get_range()),
+            self.facts
+                .as_ref()
+                .is_some_and(|facts| facts.syntax_ids.contains(&id)),
+            |facts, id| facts.syntax_ids.contains(id),
+        )
     }
 
     pub fn member_id(&self, id: LuaMemberId) -> Remap<LuaMemberId> {
@@ -411,9 +413,14 @@ impl FileRemap {
             Remap::Unrelated => Remap::Unrelated,
             Remap::Lost => Remap::Lost,
         };
-        self.resolve(&id, mapped, |facts, id| {
-            facts.member_ids.contains(id.get_syntax_id())
-        })
+        self.resolve(
+            mapped,
+            self.range_is_before_the_hunk(id.get_syntax_id().get_range()),
+            self.facts
+                .as_ref()
+                .is_some_and(|facts| facts.member_ids.contains(id.get_syntax_id())),
+            |facts, id| facts.member_ids.contains(id.get_syntax_id()),
+        )
     }
 
     /// A table literal's range, the identity behind `TableConst`, `Instance`
@@ -424,10 +431,12 @@ impl FileRemap {
             Remap::Unrelated => Remap::Unrelated,
             Remap::Lost => Remap::Lost,
         };
-        self.resolve_with(
-            range,
+        self.resolve(
             mapped,
-            |facts, range| facts.node_ranges.contains(&range.value),
+            self.range_is_before_the_hunk(range.value),
+            self.facts
+                .as_ref()
+                .is_some_and(|facts| facts.owner_ranges.contains(&range.value)),
             |facts, range| facts.owner_ranges.contains(&range.value),
         )
     }
