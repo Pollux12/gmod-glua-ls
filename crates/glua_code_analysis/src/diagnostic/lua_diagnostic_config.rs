@@ -1,4 +1,4 @@
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::{HashMap, HashSet};
 
 use glua_parser::LuaLanguageLevel;
 use lsp_types::DiagnosticSeverity;
@@ -55,5 +55,17 @@ impl LuaDiagnosticConfig {
             severity,
             level: emmyrc.get_language_level(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_collections_are_std() {
+        let cfg = LuaDiagnosticConfig::default();
+        let _: &std::collections::HashSet<DiagnosticCode> = &cfg.workspace_disabled;
+        let _: &std::collections::HashMap<DiagnosticCode, DiagnosticSeverity> = &cfg.severity;
     }
 }

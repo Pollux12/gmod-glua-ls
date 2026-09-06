@@ -1,5 +1,6 @@
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,7 +16,7 @@ use crate::{
 use super::{Checker, DiagnosticContext};
 
 /// Immutable, workspace-scoped callee realm map keyed by semantic declaration.
-pub type PrecomputedCalleeRealmMap = FxHashMap<LuaSemanticDeclId, Vec<ResolvedRealm>>;
+pub type PrecomputedCalleeRealmMap = HashMap<LuaSemanticDeclId, Vec<ResolvedRealm>>;
 
 #[derive(Debug, Default)]
 pub struct PrecomputedRealmCallCandidates {
@@ -392,7 +393,7 @@ impl ResolvedRealm {
     }
 }
 
-pub type GmMethodRealmMap = FxHashMap<String, Vec<ResolvedRealm>>;
+pub type GmMethodRealmMap = HashMap<String, Vec<ResolvedRealm>>;
 type CalleeRealmCache = FxHashMap<LuaSemanticDeclId, Vec<ResolvedRealm>>;
 type MemberCandidateCache = FxHashMap<(LuaType, LuaMemberKey, bool), Vec<LuaMemberId>>;
 type OwnerKeyMemberCandidateCache = FxHashMap<(LuaMemberOwner, LuaMemberKey), Vec<LuaMemberId>>;
@@ -452,7 +453,7 @@ fn resolve_callee_realms(
 
     let is_bare_name_call = matches!(prefix_expr, LuaExpr::NameExpr(_));
 
-    // Fast path: GM method annotations (O(1) FxHashMap lookup, no inference needed).
+    // Fast path: GM method annotations (O(1) hash lookup, no inference needed).
     // Only applies to member calls (index expressions like GM:Method or GAMEMODE.Method).
     if !is_bare_name_call {
         if let Some(index_expr) = LuaIndexExpr::cast(prefix_expr.syntax().clone()) {
@@ -503,7 +504,7 @@ fn resolve_callee_realms(
         }
     }
 
-    // Resolve realms: try precomputed first (O(1) FxHashMap lookup), then
+    // Resolve realms: try precomputed first (O(1) hash lookup), then
     // fall back to expensive member/global resolution paths.
     let mut realms = Vec::new();
 
@@ -1193,7 +1194,7 @@ fn collect_annotated_gm_method_realms(
     context: &DiagnosticContext,
     semantic_model: &SemanticModel,
 ) -> GmMethodRealmMap {
-    let mut gm_method_realms = FxHashMap::default();
+    let mut gm_method_realms = GmMethodRealmMap::default();
 
     let db = semantic_model.get_db();
     let module_index = db.get_module_index();
@@ -1507,7 +1508,7 @@ pub fn precompute_callee_realm_data_for_workspace(
     workspace_file_ids: &[FileId],
 ) -> PrecomputedCalleeRealmData {
     let module_index = db.get_module_index();
-    let mut callee_realms = FxHashMap::default();
+    let mut callee_realms = PrecomputedCalleeRealmMap::default();
     let mut realm_call_candidates = PrecomputedRealmCallCandidates::default();
 
     // Resolving one file's declaration and member realms reads only
@@ -1619,7 +1620,7 @@ pub fn precompute_gm_method_realms(
     db: &crate::db_index::DbIndex,
     workspace_id: WorkspaceId,
 ) -> GmMethodRealmMap {
-    let mut gm_method_realms = FxHashMap::default();
+    let mut gm_method_realms = GmMethodRealmMap::default();
     let module_index = db.get_module_index();
 
     for (file_id, method_realms) in db.get_gmod_infer_index().iter_gm_method_realm_annotations() {

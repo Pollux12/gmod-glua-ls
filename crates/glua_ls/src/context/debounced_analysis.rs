@@ -1,6 +1,5 @@
 use glua_code_analysis::{DirtySet, EmmyLuaAnalysis, FileId};
 use lsp_types::Uri;
-use rustc_hash::FxHashSet;
 use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -689,7 +688,7 @@ impl DebouncedAnalysis {
         &self,
         dirty: DirtySet,
         timing: Option<&mut crate::util::ls_profile::RippleWriteTimings>,
-    ) -> (bool, FxHashSet<SmolStr>, Vec<FileId>) {
+    ) -> (bool, HashSet<SmolStr>, Vec<FileId>) {
         let profile = timing.is_some();
         let analysis = self.analysis.clone();
         let cache = self.shared_diagnostic_data_cache.clone();
@@ -697,7 +696,7 @@ impl DebouncedAnalysis {
         // Re-index under a blocking write lock on a blocking thread: the wait
         // for the lock and the CPU work both stay off the Tokio workers.
         tokio::select! {
-            _ = self.shutdown.cancelled() => (false, FxHashSet::default(), Vec::new()),
+            _ = self.shutdown.cancelled() => (false, HashSet::default(), Vec::new()),
             result = tokio::task::spawn_blocking(move || {
                 let wait_start = profile.then(Instant::now);
                 let mut guard = analysis.blocking_write();
@@ -720,7 +719,7 @@ impl DebouncedAnalysis {
                     }
                     Err(err) => {
                         log::error!("reindex task failed: {}", err);
-                        (false, FxHashSet::default(), Vec::new())
+                        (false, HashSet::default(), Vec::new())
                     }
                 }
             }
@@ -735,11 +734,7 @@ impl DebouncedAnalysis {
     /// watched-file change uses. `exclude` carries the files the edit path
     /// already settled (the edited batch, the files owed a ripple, and the
     /// files the ripple re-analysed), which the candidate filter drops.
-    async fn schedule_textual_refresh(
-        &self,
-        names: FxHashSet<SmolStr>,
-        exclude: &FxHashSet<FileId>,
-    ) {
+    async fn schedule_textual_refresh(&self, names: HashSet<SmolStr>, exclude: &HashSet<FileId>) {
         if names.is_empty() {
             return;
         }
@@ -855,10 +850,10 @@ impl DebouncedAnalysis {
         // Textual refresh names owed a diagnostic-only refresh, merged from
         // every self-index diff and ripple sideband of this burst. They steer
         // no reindex: they are drained whenever no ripple is owed.
-        let mut owed_refresh_names: FxHashSet<SmolStr> = FxHashSet::default();
+        let mut owed_refresh_names: HashSet<SmolStr> = HashSet::default();
         // Files the edit path already settled (edited batch, ripple-settled),
         // excluded from the textual refresh resolution.
-        let mut refresh_exclude: FxHashSet<FileId> = FxHashSet::default();
+        let mut refresh_exclude: HashSet<FileId> = HashSet::default();
         let mut burst_started_at: Option<Instant> = None;
         loop {
             // Register before testing the condition: `notify_waiters()` stores

@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
-
 use crate::{
     DiagnosticCode, FileId, GmodRealm, NetOpEntry, NetReceiveFlow, NetSendFlow, SemanticModel,
     flows_can_match, is_opposite_strict_realm_pair, is_strict_realm,
@@ -195,7 +193,8 @@ pub struct SenderSortKey {
 
 /// Precomputed send flows sorted by SenderSortKey for each message name.
 /// Built once per diagnostic batch run instead of per file.
-pub type SortedSendFlowCache = FxHashMap<String, Vec<(FileId, NetSendFlow, SenderSortKey)>>;
+pub type SortedSendFlowCache =
+    std::collections::HashMap<String, Vec<(FileId, NetSendFlow, SenderSortKey)>>;
 
 /// Precompute and sort all send flows by message name, using VFS path
 /// ordering so that all files in a workspace sort consistently. Called
@@ -204,7 +203,7 @@ pub fn precompute_sorted_send_flows(
     network_index: &crate::GmodNetworkIndex,
     vfs: &crate::vfs::Vfs,
 ) -> SortedSendFlowCache {
-    let mut cache: SortedSendFlowCache = FxHashMap::default();
+    let mut cache: SortedSendFlowCache = SortedSendFlowCache::default();
     for (file_id, flow_idx, send_flow) in network_index.iter_send_flows() {
         let sort_key = sender_sort_key(vfs, file_id, flow_idx, send_flow);
         cache
