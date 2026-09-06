@@ -841,6 +841,155 @@ Syntax(Chunk)@0..179
     }
 
     #[test]
+    fn test_return_doc_tuple() {
+        let code = r#"
+        ---@return [string, number]
+        function f() end
+        "#;
+
+        let result = r#"
+Syntax(Chunk)@0..70
+  Syntax(Block)@0..70
+    Token(TkEndOfLine)@0..1 "\n"
+    Token(TkWhitespace)@1..9 "        "
+    Syntax(Comment)@9..36
+      Token(TkDocStart)@9..13 "---@"
+      Syntax(DocTagReturn)@13..36
+        Token(TkTagReturn)@13..19 "return"
+        Token(TkWhitespace)@19..20 " "
+        Syntax(TypeTuple)@20..36
+          Token(TkLeftBracket)@20..21 "["
+          Syntax(TypeName)@21..27
+            Token(TkName)@21..27 "string"
+          Token(TkComma)@27..28 ","
+          Token(TkWhitespace)@28..29 " "
+          Syntax(TypeName)@29..35
+            Token(TkName)@29..35 "number"
+          Token(TkRightBracket)@35..36 "]"
+    Token(TkEndOfLine)@36..37 "\n"
+    Token(TkWhitespace)@37..45 "        "
+    Syntax(FuncStat)@45..61
+      Token(TkFunction)@45..53 "function"
+      Token(TkWhitespace)@53..54 " "
+      Syntax(NameExpr)@54..55
+        Token(TkName)@54..55 "f"
+      Syntax(ClosureExpr)@55..61
+        Syntax(ParamList)@55..57
+          Token(TkLeftParen)@55..56 "("
+          Token(TkRightParen)@56..57 ")"
+        Token(TkWhitespace)@57..58 " "
+        Token(TkEnd)@58..61 "end"
+    Token(TkEndOfLine)@61..62 "\n"
+    Token(TkWhitespace)@62..70 "        "
+        "#;
+
+        assert_ast_eq!(code, result);
+    }
+
+    #[test]
+    fn test_return_doc_tuple_intersection() {
+        let code = r#"
+        ---@return [T...] & { n: integer }
+        function f() end
+        "#;
+
+        let result = r#"
+Syntax(Chunk)@0..77
+  Syntax(Block)@0..77
+    Token(TkEndOfLine)@0..1 "\n"
+    Token(TkWhitespace)@1..9 "        "
+    Syntax(Comment)@9..43
+      Token(TkDocStart)@9..13 "---@"
+      Syntax(DocTagReturn)@13..43
+        Token(TkTagReturn)@13..19 "return"
+        Token(TkWhitespace)@19..20 " "
+        Syntax(TypeBinary)@20..43
+          Syntax(TypeTuple)@20..26
+            Token(TkLeftBracket)@20..21 "["
+            Syntax(TypeVariadic)@21..25
+              Syntax(TypeName)@21..22
+                Token(TkName)@21..22 "T"
+              Token(TkDots)@22..25 "..."
+            Token(TkRightBracket)@25..26 "]"
+          Token(TkWhitespace)@26..27 " "
+          Token(TkDocAnd)@27..28 "&"
+          Token(TkWhitespace)@28..29 " "
+          Syntax(TypeObject)@29..43
+            Token(TkLeftBrace)@29..30 "{"
+            Token(TkWhitespace)@30..31 " "
+            Syntax(DocObjectField)@31..41
+              Token(TkName)@31..32 "n"
+              Token(TkColon)@32..33 ":"
+              Token(TkWhitespace)@33..34 " "
+              Syntax(TypeName)@34..41
+                Token(TkName)@34..41 "integer"
+            Token(TkWhitespace)@41..42 " "
+            Token(TkRightBrace)@42..43 "}"
+    Token(TkEndOfLine)@43..44 "\n"
+    Token(TkWhitespace)@44..52 "        "
+    Syntax(FuncStat)@52..68
+      Token(TkFunction)@52..60 "function"
+      Token(TkWhitespace)@60..61 " "
+      Syntax(NameExpr)@61..62
+        Token(TkName)@61..62 "f"
+      Syntax(ClosureExpr)@62..68
+        Syntax(ParamList)@62..64
+          Token(TkLeftParen)@62..63 "("
+          Token(TkRightParen)@63..64 ")"
+        Token(TkWhitespace)@64..65 " "
+        Token(TkEnd)@65..68 "end"
+    Token(TkEndOfLine)@68..69 "\n"
+    Token(TkWhitespace)@69..77 "        "
+        "#;
+
+        assert_ast_eq!(code, result);
+    }
+
+    #[test]
+    fn test_return_doc_tuple_nullable() {
+        let code = r#"
+        ---@return [string]?
+        function f() end
+        "#;
+
+        let result = r#"
+Syntax(Chunk)@0..63
+  Syntax(Block)@0..63
+    Token(TkEndOfLine)@0..1 "\n"
+    Token(TkWhitespace)@1..9 "        "
+    Syntax(Comment)@9..29
+      Token(TkDocStart)@9..13 "---@"
+      Syntax(DocTagReturn)@13..29
+        Token(TkTagReturn)@13..19 "return"
+        Token(TkWhitespace)@19..20 " "
+        Syntax(TypeNullable)@20..29
+          Syntax(TypeTuple)@20..28
+            Token(TkLeftBracket)@20..21 "["
+            Syntax(TypeName)@21..27
+              Token(TkName)@21..27 "string"
+            Token(TkRightBracket)@27..28 "]"
+          Token(TkDocQuestion)@28..29 "?"
+    Token(TkEndOfLine)@29..30 "\n"
+    Token(TkWhitespace)@30..38 "        "
+    Syntax(FuncStat)@38..54
+      Token(TkFunction)@38..46 "function"
+      Token(TkWhitespace)@46..47 " "
+      Syntax(NameExpr)@47..48
+        Token(TkName)@47..48 "f"
+      Syntax(ClosureExpr)@48..54
+        Syntax(ParamList)@48..50
+          Token(TkLeftParen)@48..49 "("
+          Token(TkRightParen)@49..50 ")"
+        Token(TkWhitespace)@50..51 " "
+        Token(TkEnd)@51..54 "end"
+    Token(TkEndOfLine)@54..55 "\n"
+    Token(TkWhitespace)@55..63 "        "
+        "#;
+
+        assert_ast_eq!(code, result);
+    }
+
+    #[test]
     fn test_inline_default_doc() {
         let code = r#"
         ---@field Contents=0 CONTENTS
