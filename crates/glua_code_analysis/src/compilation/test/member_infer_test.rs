@@ -2903,6 +2903,23 @@ mod test {
         names
     }
 
+    /// Names of the members currently homed under `owner`, including
+    /// owner-only writes that are not listed in the owner's item map.
+    fn current_owner_member_names(ws: &VirtualWorkspace, owner: &LuaMemberOwner) -> Vec<String> {
+        let index = ws.analysis.compilation.get_db().get_member_index();
+        let mut names = index
+            .get_member_history(owner)
+            .iter()
+            .filter(|member| index.get_member_owner(&member.get_id()) == Some(owner))
+            .filter_map(|member| match member.get_key() {
+                LuaMemberKey::Name(name) => Some(name.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
     #[gtest]
     fn test_global_class_annotation_flip_rehomes_path_members_to_the_winning_class() {
         let zebra_path = "lua/glide/sh_repair_zebra.lua";
@@ -3198,6 +3215,179 @@ mod test {
             global_path_class_member_names(&ws, &zebra_owner),
             vec!["NativeOnly".to_string()],
             "genuine Zebra members must stay under Type(Zebra) across the flip"
+        );
+    }
+
+    const GLOBAL_CLASS_FLIP_MID_SOURCE: &str = r#"
+        --- @class Mid
+        Glide.Repair = Glide.Repair or {}
+        "#;
+
+    const GLOBAL_CLASS_FLIP_ALIAS_SOURCE: &str = r#"
+        Glide = Glide or {}
+        local Repair = Glide.Repair
+        function Repair.FromAlias() end
+        "#;
+
+    #[gtest]
+    fn test_global_class_annotation_alias_member_follows_winner_removal() {
+        let apple_path = "lua/glide/sh_repair_apple.lua";
+        let mid_path = "lua/glide/sh_repair_mid.lua";
+        let alias_path = "lua/glide/sv_repair_alias.lua";
+        let consumer_source = "local from = Glide.Repair.FromAlias\n";
+
+        let mut failures = Vec::new();
+        for apple_first in [true, false] {
+            let label = if apple_first {
+                "apple_then_mid"
+            } else {
+                "mid_then_apple"
+            };
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+
+            if apple_first {
+                ws.def_file(apple_path, GLOBAL_CLASS_FLIP_APPLE_SOURCE);
+                ws.def_file(mid_path, GLOBAL_CLASS_FLIP_MID_SOURCE);
+            } else {
+                ws.def_file(mid_path, GLOBAL_CLASS_FLIP_MID_SOURCE);
+                ws.def_file(apple_path, GLOBAL_CLASS_FLIP_APPLE_SOURCE);
+            }
+            ws.def_file(alias_path, GLOBAL_CLASS_FLIP_ALIAS_SOURCE);
+            let consumer_file =
+                ws.def_file("lua/entities/glide_repair_tool/init.lua", consumer_source);
+
+            let apple_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Apple"));
+            let mid_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Mid"));
+            assert_eq!(
+                global_path_class_member_names(&ws, &apple_owner),
+                vec!["FromAlias".to_string()],
+                "{label}: precondition: the alias write homes under the winning class"
+            );
+
+            let apple_uri = ws.virtual_url_generator.new_uri(apple_path);
+            ws.analysis.update_file_by_uri(&apple_uri, None);
+
+            assert_eq!(
+                global_path_class_member_names(&ws, &mid_owner),
+                vec!["FromAlias".to_string()],
+                "{label}: removing the winning proposal must take the alias member along"
+            );
+            assert_eq!(
+                global_path_class_member_names(&ws, &apple_owner),
+                Vec::<String>::new(),
+                "{label}: the removed winner's class must not hold the alias member"
+            );
+            assert_that!(
+                file_has_diagnostic(&mut ws, consumer_file, DiagnosticCode::UndefinedField),
+                eq(false),
+                "{label}: the consumer must still resolve the alias member through the path"
+            );
+            let from_type = index_expr_type(&mut ws, consumer_file, "Glide.Repair.FromAlias");
+            if from_type.is_unknown() {
+                failures.push(format!(
+                    "{label}: Glide.Repair.FromAlias resolved as unknown"
+                ));
+            }
+        }
+
+        assert_that!(failures, is_empty(), "{failures:?}");
+    }
+
+    #[gtest]
+    fn test_global_class_annotation_flip_leaves_annotated_instance_writes_alone() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/glide/sh_repair_zebra.lua",
+            GLOBAL_CLASS_FLIP_ZEBRA_SOURCE,
+        );
+        ws.def_file(
+            "lua/glide/sv_zebra_instance.lua",
+            r#"
+            --- @type Zebra
+            local z
+            z.NativeOnly = 1
+            "#,
+        );
+        ws.def_file(
+            "lua/glide/sh_repair_apple.lua",
+            GLOBAL_CLASS_FLIP_APPLE_SOURCE,
+        );
+
+        let zebra_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Zebra"));
+        let apple_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Apple"));
+        let path_owner = LuaMemberOwner::GlobalPath(GlobalId::new("Glide.Repair"));
+
+        assert_eq!(
+            global_path_class_member_names(&ws, &path_owner),
+            vec!["x".to_string(), "y".to_string()],
+            "the path members follow the winning class"
+        );
+        assert_eq!(
+            global_path_class_member_names(&ws, &apple_owner),
+            vec!["x".to_string(), "y".to_string()],
+            "the winning class holds only the path members"
+        );
+        assert_eq!(
+            current_owner_member_names(&ws, &zebra_owner),
+            vec!["NativeOnly".to_string()],
+            "an owner-only write through a genuinely Zebra-typed value must stay under Zebra"
+        );
+    }
+
+    #[gtest]
+    fn test_global_class_annotation_definition_site_fields_follow_winner_removal() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/glide/sh_repair_apple.lua",
+            r#"
+            --- @class Apple
+            Glide.Repair = Glide.Repair or {}
+            function Glide.Repair.Direct() end
+            "#,
+        );
+        ws.def_file("lua/glide/sh_repair_mid.lua", GLOBAL_CLASS_FLIP_MID_SOURCE);
+        ws.def_file(
+            "lua/glide/sh_repair_site.lua",
+            "Glide.Repair.Late = { Wrench = function() end }\n",
+        );
+        let consumer_file = ws.def_file(
+            "lua/entities/glide_repair_tool/init.lua",
+            "local wrench = Glide.Repair.Late.Wrench\n",
+        );
+
+        let apple_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Apple"));
+        assert_eq!(
+            global_path_class_member_names(&ws, &apple_owner),
+            vec!["Direct".to_string(), "Late".to_string()],
+            "precondition: the site's members home under the winning class"
+        );
+
+        let apple_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/glide/sh_repair_apple.lua");
+        ws.analysis.update_file_by_uri(&apple_uri, None);
+
+        let mid_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Mid"));
+        let late_owner = global_path_class_member_names(&ws, &mid_owner);
+        assert!(
+            late_owner.contains(&"Late".to_string()),
+            "the nested path's slot must move to the surviving class: {late_owner:?}"
+        );
+        assert_that!(
+            file_has_diagnostic(&mut ws, consumer_file, DiagnosticCode::UndefinedField),
+            eq(false),
+            "the consumer must still resolve the nested path member after the flip"
         );
     }
 

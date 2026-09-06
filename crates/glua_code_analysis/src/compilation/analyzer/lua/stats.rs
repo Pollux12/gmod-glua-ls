@@ -31,8 +31,8 @@ use crate::{GmodStateMask, LuaArrayType};
 use super::{
     LuaAnalyzer,
     member_write_policy::{
-        MemberAssignmentWideningCacheKey, direct_local_prefix_has_declared_type,
-        direct_local_table_prefix_member_owner,
+        MemberAssignmentWideningCacheKey, alias_target_global_path,
+        direct_local_prefix_has_declared_type, direct_local_table_prefix_member_owner,
         flush_pending_dynamic_key_collection_widening_for_members,
         get_widened_member_assignment_collection_type, is_collection_append_write,
         record_member_collection_assignment_widening_cache,
@@ -877,6 +877,16 @@ fn apply_index_expr_member_owner_with_guarded(
 ) -> Option<()> {
     let index_key = index_expr.get_index_key()?;
     let member_id = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
+    // A prefix that is a local alias of a known global path is a path write
+    // for provenance purposes, so the member follows the path's `---@class`
+    // flips. Only computed when the owner resolved to a class: path and
+    // Element owners already carry their provenance through the homing note.
+    let alias_path = match &member_owner {
+        LuaMemberOwner::Type(_) => index_expr
+            .get_prefix_expr()
+            .and_then(|prefix| alias_target_global_path(&analyzer.db, analyzer.file_id, &prefix)),
+        _ => None,
+    };
 
     if analyzer
         .db
@@ -906,7 +916,16 @@ fn apply_index_expr_member_owner_with_guarded(
                 .mark_non_overwriting_assignment_member(member_id);
         }
         let member_index = analyzer.db.get_member_index_mut();
-        member_index.add_member(member_owner, member);
+        member_index.add_member(member_owner.clone(), member);
+        if let Some(alias_path) = alias_path {
+            member_index.home_alias_member_with_provenance(
+                member_owner,
+                member_id.file_id,
+                member_id,
+                alias_path,
+                false,
+            );
+        }
         // `add_member` already records the enclosing function scope for
         // `FileDefine` index-expr members (via
         // `assignment_file_define_scope_for_member`). For other features
@@ -932,7 +951,20 @@ fn apply_index_expr_member_owner_with_guarded(
             .enclosing_function_scope_range(analyzer.file_id, member_id.get_position());
         {
             let member_index = analyzer.db.get_member_index_mut();
-            member_index.set_member_owner_only(member_owner, member_id.file_id, member_id);
+            match alias_path {
+                Some(alias_path) => {
+                    member_index.home_alias_member_with_provenance(
+                        member_owner,
+                        member_id.file_id,
+                        member_id,
+                        alias_path,
+                        true,
+                    );
+                }
+                None => {
+                    member_index.set_member_owner_only(member_owner, member_id.file_id, member_id);
+                }
+            }
             member_index.set_member_function_scope_range(member_id, function_scope);
         }
         return Some(());

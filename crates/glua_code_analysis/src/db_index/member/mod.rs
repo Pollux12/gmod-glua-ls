@@ -360,6 +360,38 @@ impl LuaMemberIndex {
         Some(())
     }
 
+    /// Homes a member whose write went through an alias of the global path
+    /// `alias_path`, stamping that provenance first.
+    ///
+    /// `local Repair = Glide.Repair` names the path's table, so the member
+    /// must follow the path when its winning `---@class` changes — exactly
+    /// what a write through the path itself would do. The provenance is
+    /// recorded before the effective-owner redirect so a write that names a
+    /// losing candidate class re-homes onto the winner, and the note's drop
+    /// branch is skipped so a homing that lands elsewhere keeps the alias's
+    /// evidence. `owner_only` files the member without listing it among the
+    /// owner's members, matching [`Self::set_member_owner_only`].
+    pub fn home_alias_member_with_provenance(
+        &mut self,
+        owner: LuaMemberOwner,
+        file_id: FileId,
+        id: LuaMemberId,
+        alias_path: GlobalId,
+        owner_only: bool,
+    ) -> Option<()> {
+        self.member_path_provenance.insert(id, alias_path);
+        self.record_member_owner(owner, file_id, id)?;
+        if owner_only {
+            self.owner_only_members.insert(id);
+            return Some(());
+        }
+        let key = self.get_member(&id)?.get_key().clone();
+        self.owner_only_members.remove(&id);
+        let owner = self.member_current_owner.get(&id)?.clone();
+        self.merge_member_into_owner_item(owner, key, id);
+        Some(())
+    }
+
     /// Records that `id`'s owner was decided by scripted-class synthesis, so
     /// [`Self::set_global_path_class`] leaves it where it is instead of moving
     /// it onto the annotated class.
@@ -639,6 +671,21 @@ impl LuaMemberIndex {
             .effective_path_member_owner(id, &owner)
             .unwrap_or(owner);
         self.note_member_path_provenance(id, &owner);
+        self.record_member_owner(owner, file_id, id)
+    }
+
+    /// The filing half of [`Self::set_member_owner`], without the provenance
+    /// note. Callers that record provenance themselves route through here so
+    /// the note's drop branch cannot undo what they just recorded.
+    fn record_member_owner(
+        &mut self,
+        owner: LuaMemberOwner,
+        file_id: FileId,
+        id: LuaMemberId,
+    ) -> Option<()> {
+        let owner = self
+            .effective_path_member_owner(id, &owner)
+            .unwrap_or(owner);
         let owner = self.canonical(&owner).clone();
         // Read before the insert decides the bump: a real move, or a first
         // homing for an id the index already holds (deferred resolution filed
@@ -720,14 +767,59 @@ impl LuaMemberIndex {
         self.forget_definition_site(&site);
         self.bump_homing_revision();
         self.definition_site_owner.insert(site.clone(), owner);
-        let sites = self.path_definition_sites.entry(path).or_default();
+        let sites = self.path_definition_sites.entry(path.clone()).or_default();
         if let Err(at) = sites.binary_search_by_key(&site_sort_key(&site), site_sort_key) {
             sites.insert(at, site.clone());
         }
         self.definition_sites_by_file
             .entry(site.file_id)
             .or_default()
-            .push(site);
+            .push(site.clone());
+        // A member filed under the literal before the site was registered was
+        // homed onto the Element owner with no path provenance. Stamp it so a
+        // later `---@class` flip still takes it along. Idempotent, and rare:
+        // the decl walk registers each site before the writes it owns.
+        let member_ids: Vec<LuaMemberId> = self
+            .owner_members
+            .get(&LuaMemberOwner::Element(site))
+            .into_iter()
+            .flat_map(LuaOwnerMembers::get_member_items)
+            .flat_map(member_ids_from_item)
+            .collect();
+        self.stamp_path_provenance_if_absent(member_ids, &path);
+    }
+
+    /// The global path the table literal `site` initialises, if one is
+    /// registered for it.
+    pub fn definition_site_path(&self, site: &crate::InFiled<TextRange>) -> Option<GlobalId> {
+        self.definition_site_owner.get(site)?.get_path().cloned()
+    }
+
+    /// Whether `path` is a global path the index knows about: it has members
+    /// filed under it, a registered definition site, or a `---@class`
+    /// proposal. Read-only and cheap, so producers may consult it per write.
+    pub fn is_known_global_path(&self, path: &GlobalId) -> bool {
+        self.owner_members
+            .contains_key(&LuaMemberOwner::GlobalPath(path.clone()))
+            || self.global_path_class_candidates.contains_key(path)
+            || self.path_definition_sites.contains_key(path)
+    }
+
+    /// Records `path` as the provenance of members that do not have one yet.
+    ///
+    /// Members already carrying provenance keep it: the earliest evidence of
+    /// how a member reached its owner is the one its later homings honor, and
+    /// re-stamping the same path stays a no-op.
+    pub fn stamp_path_provenance_if_absent(
+        &mut self,
+        member_ids: impl IntoIterator<Item = LuaMemberId>,
+        path: &GlobalId,
+    ) {
+        for member_id in member_ids {
+            self.member_path_provenance
+                .entry(member_id)
+                .or_insert_with(|| path.clone());
+        }
     }
 
     /// The literals initialising `path`, sorted by `(file id, range)`.
@@ -897,8 +989,10 @@ impl LuaMemberIndex {
     /// Only members that reached their current home through `path` move:
     /// members homed onto the losing class by any other route (a write through
     /// a genuinely class-typed value) stay put, as do members whose owner was
-    /// decided by scripted-class synthesis and members recorded as owner-only
-    /// writes. The moved member's item is pruned from the owner it leaves —
+    /// decided by scripted-class synthesis. Owner-only members move only when
+    /// their provenance names `path` — a write through the path or an alias of
+    /// it — since an owner-only write through a genuinely class-typed value is
+    /// not a path member. The moved member's item is pruned from the owner it leaves —
     /// `set_member_owner` rewrites the key indexes but leaves owner items
     /// behind — so the losing class stops listing path members.
     fn rehome_global_path_class(
@@ -916,8 +1010,9 @@ impl LuaMemberIndex {
             .flat_map(member_ids_from_item)
             .filter(|id| {
                 !self.synthesized_owner_members.contains(id)
-                    && !self.owner_only_members.contains(id)
                     && self.member_current_owner.get(id) == Some(&path_owner)
+                    && (!self.owner_only_members.contains(id)
+                        || self.member_path_provenance.get(id) == Some(path))
             })
             .collect::<Vec<_>>();
 
@@ -931,7 +1026,6 @@ impl LuaMemberIndex {
                     .flat_map(member_ids_from_item)
                     .filter(|id| {
                         !self.synthesized_owner_members.contains(id)
-                            && !self.owner_only_members.contains(id)
                             && self.member_current_owner.get(id) == Some(&old_owner)
                             && self.member_path_provenance.get(id) == Some(path)
                     }),

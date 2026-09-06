@@ -1,5 +1,6 @@
 use crate::{
-    DbIndex, FileId, InFiled, LuaArrayType, LuaMemberKey, LuaTypeCache, LuaTypeOwner, TypeOps,
+    DbIndex, FileId, GlobalId, InFiled, LuaArrayType, LuaMemberKey, LuaTypeCache, LuaTypeOwner,
+    TypeOps,
     compilation::analyzer::common::{TypeCacheWriteMode, write_type_cache},
     db_index::{LuaDeclId, LuaMemberId, LuaMemberOwner, LuaType},
     semantic::member_key_matches_type,
@@ -548,6 +549,71 @@ pub(in crate::compilation::analyzer::lua) fn expr_access_path(
         LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
         _ => None,
     }
+}
+
+/// The largest number of alias hops [`alias_target_global_path`] follows.
+const ALIAS_TARGET_WALK_DEPTH: u8 = 4;
+
+/// The registered global path a member write's prefix names through local
+/// aliases, read purely syntactically.
+///
+/// `local Repair = Glide.Repair` names the same table as `Glide.Repair`, so a
+/// write through `Repair` is a path write for provenance purposes. A local
+/// declaration qualifies only when its initializer is itself a plain name or
+/// index expression — a call, a table literal, or a function may produce a
+/// table the path does not name. The terminal path must already be a
+/// registered global path, and no inference runs: this answers while the
+/// write is being filed, before any type is settled, and without gating on
+/// which class currently wins the path.
+pub(in crate::compilation::analyzer) fn alias_target_global_path(
+    db: &DbIndex,
+    file_id: FileId,
+    prefix_expr: &LuaExpr,
+) -> Option<GlobalId> {
+    alias_target_global_path_depth(db, file_id, prefix_expr, ALIAS_TARGET_WALK_DEPTH)
+}
+
+fn alias_target_global_path_depth(
+    db: &DbIndex,
+    file_id: FileId,
+    expr: &LuaExpr,
+    depth: u8,
+) -> Option<GlobalId> {
+    if depth == 0 {
+        return None;
+    }
+    match expr {
+        LuaExpr::IndexExpr(index_expr) => {
+            registered_global_path(db, &index_expr.get_access_path()?)
+        }
+        LuaExpr::NameExpr(name_expr) => {
+            let decl = db
+                .get_reference_index()
+                .get_local_reference(&file_id)
+                .and_then(|file_refs| file_refs.get_decl_id(&name_expr.get_range()))
+                .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id));
+            match decl {
+                Some(decl) if decl.is_local() => {
+                    let initializer = decl.get_initializer()?.get_expr_syntax_id();
+                    let root = db
+                        .get_vfs()
+                        .get_syntax_tree(&decl.get_file_id())?
+                        .get_red_root();
+                    let initializer = LuaExpr::cast(initializer.to_node_from_root(&root)?)?;
+                    alias_target_global_path_depth(db, decl.get_file_id(), &initializer, depth - 1)
+                }
+                _ => registered_global_path(db, &name_expr.get_access_path()?),
+            }
+        }
+        _ => None,
+    }
+}
+
+fn registered_global_path(db: &DbIndex, path: &str) -> Option<GlobalId> {
+    let path = GlobalId::new(path);
+    db.get_member_index()
+        .is_known_global_path(&path)
+        .then_some(path)
 }
 
 pub(in crate::compilation::analyzer::lua) fn is_literal_integer_one(expr: &LuaExpr) -> bool {
