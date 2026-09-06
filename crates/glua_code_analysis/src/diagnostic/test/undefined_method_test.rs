@@ -1100,6 +1100,7 @@ mod tests {
         let content_container_uri = ws.virtual_url_generator.new_uri(content_container_path);
         ws.analysis
             .update_file_by_uri(&content_container_uri, None)
+            .map(|(id, _)| id)
             .expect("forwarding helper file should exist");
         let metadata = ws
             .analysis

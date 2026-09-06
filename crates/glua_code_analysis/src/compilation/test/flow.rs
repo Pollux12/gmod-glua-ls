@@ -3280,6 +3280,7 @@ _2 = a[1]
                         .to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("predicate file id after update");
 
         let narrowed_type = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
@@ -3357,6 +3358,7 @@ _2 = a[1]
                     &guard_uri,
                     Some(definition.replace("{body}", "return IsValid(ent) and ent:IsPlayer()")),
                 )
+                .map(|(id, _)| id)
                 .unwrap_or_else(|| panic!("{case} guard addition"));
 
             let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
@@ -3385,6 +3387,7 @@ _2 = a[1]
                     "function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end".to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("new guard source file id");
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
@@ -3446,6 +3449,7 @@ _2 = a[1]
                             .to_string(),
                     ),
                 )
+                .map(|(id, _)| id)
                 .unwrap_or_else(|| panic!("{case} guard source file id"));
 
             let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
@@ -3473,6 +3477,7 @@ _2 = a[1]
                     "function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end".to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("deep alias guard source file id");
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
@@ -3498,6 +3503,7 @@ _2 = a[1]
                     "function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end".to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("cyclic alias guard source file id");
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
@@ -3523,6 +3529,7 @@ _2 = a[1]
                     "function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end".to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("mutable alias guard source file id");
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
@@ -3623,6 +3630,7 @@ _2 = a[1]
                     &guard_uri,
                     Some(definition.replace("{body}", "return IsValid(ent) and ent:IsPlayer()")),
                 )
+                .map(|(id, _)| id)
                 .unwrap_or_else(|| panic!("{case} guard file id after update"));
 
             for consumer_uri in consumer_uris {
@@ -3722,6 +3730,7 @@ _2 = a[1]
                 &uris[1],
                 Some("function GuardA(ent) return IsValid(ent) and ent:IsPlayer() end".to_string()),
             )
+            .map(|(id, _)| id)
             .expect("GuardA file id after update");
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
@@ -3808,6 +3817,7 @@ _2 = a[1]
 
         ws.analysis
             .update_file_by_uri(&uris[1], Some(guard_a("-- unrelated edit\n\n", "IsPlayer")))
+            .map(|(id, _)| id)
             .expect("fact-preserving guard source reindex");
         assert_eq!(
             ws.analysis.inferred_guard_propagation_stats.changed_facts,
@@ -3816,6 +3826,7 @@ _2 = a[1]
 
         ws.analysis
             .update_file_by_uri(&uris[1], Some(guard_a("-- unrelated edit\n\n", "IsNPC")))
+            .map(|(id, _)| id)
             .expect("guard type change");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "NPC");
@@ -3830,6 +3841,7 @@ _2 = a[1]
                 &uris[1],
                 Some("-- unrelated edit\n\nfunction GuardA(ent) return true end".to_string()),
             )
+            .map(|(id, _)| id)
             .expect("guard removal");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Entity");
@@ -3949,6 +3961,7 @@ _2 = a[1]
 
             ws.analysis
                 .update_file_by_uri(&uris[1], Some(guard_a(equivalent_prefix, "IsNPC")))
+                .map(|(id, _)| id)
                 .expect("guard type change");
 
             let wrapper_types = {
@@ -4050,6 +4063,7 @@ _2 = a[1]
                 &guard_uri,
                 Some(source("IsPlayer", "return IsValid(ent) and ent:IsPlayer()")),
             )
+            .map(|(id, _)| id)
             .expect("dot assignment guard addition");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Player");
@@ -4059,12 +4073,14 @@ _2 = a[1]
                 &guard_uri,
                 Some(source("IsPlayer", "return IsValid(ent) and ent:IsNPC()")),
             )
+            .map(|(id, _)| id)
             .expect("dot assignment guard type change");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "NPC");
 
         ws.analysis
             .update_file_by_uri(&guard_uri, Some(source("IsPlayer", "return true")))
+            .map(|(id, _)| id)
             .expect("dot assignment guard removal");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Entity");
@@ -4074,6 +4090,7 @@ _2 = a[1]
                 &guard_uri,
                 Some(source("IsPerson", "return IsValid(ent) and ent:IsPlayer()")),
             )
+            .map(|(id, _)| id)
             .expect("dot assignment guard rename");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Entity");
@@ -4108,7 +4125,7 @@ _2 = a[1]
                     "Predicates = Predicates or {}\nPredicates[\"IsPlayer\"] = function(ent) return true end"
                         .to_string(),
                 ),
-            )
+            ).map(|(id, _)| id)
             .expect("moved static-string assignment guard removal");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Entity");
@@ -4202,6 +4219,7 @@ _2 = a[1]
                     .to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("guard chain file id");
 
         let consumer_file_id = ws
@@ -4347,12 +4365,14 @@ _2 = a[1]
                 &guard_uri,
                 Some(source("IsPlayer", "return IsValid(ent) and ent:IsPlayer()")),
             )
+            .map(|(id, _)| id)
             .expect("guard addition");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Player");
 
         ws.analysis
             .update_file_by_uri(&guard_uri, Some(source("IsPlayer", "return true")))
+            .map(|(id, _)| id)
             .expect("guard removal");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Entity");
@@ -4362,6 +4382,7 @@ _2 = a[1]
                 &guard_uri,
                 Some(source("IsPerson", "return IsValid(ent) and ent:IsPlayer()")),
             )
+            .map(|(id, _)| id)
             .expect("guard rename");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Entity");
@@ -4615,6 +4636,7 @@ _2 = a[1]
                 &guards_uri,
                 Some(guard_source("return IsValid(ent) and ent:IsPlayer()")),
             )
+            .map(|(id, _)| id)
             .expect("realm guard file id after update");
 
         let server_type = nth_name_expr_type_from_end(&mut ws, server_file_id, "narrowed", 0);
@@ -4647,6 +4669,7 @@ _2 = a[1]
                 &predicate_uri,
                 Some("\n\nfunction IsPlayer(ent)\n    return true\nend".to_string()),
             )
+            .map(|(id, _)| id)
             .expect("predicate file id after offset shift");
 
         let narrowed_type = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
@@ -4671,6 +4694,7 @@ _2 = a[1]
                         .to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("predicate file id after rename");
 
         let narrowed_type = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
@@ -4689,6 +4713,7 @@ _2 = a[1]
 
         ws.analysis
             .remove_file_by_uri(&predicate_uri)
+            .0
             .expect("removed predicate file id");
 
         let narrowed_type = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
@@ -4787,6 +4812,7 @@ _2 = a[1]
         let file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(source("return IsValid(ent) and ent:IsPlayer()")))
+            .map(|(id, _)| id)
             .expect("file id");
 
         let inferred_guard_count = |ws: &VirtualWorkspace| {
@@ -4810,6 +4836,7 @@ _2 = a[1]
         let updated_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(source("return true")))
+            .map(|(id, _)| id)
             .expect("file id after update");
         assert_eq!(updated_file_id, file_id);
         assert_eq!(inferred_guard_count(&ws), 0);
@@ -6092,10 +6119,11 @@ _2 = a[1]
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("isvalid.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             ---@class Entity
             ---@field GetClass fun(self: Entity): string
 
@@ -6103,9 +6131,10 @@ _2 = a[1]
             ---@return TypeGuard<any>
             function _G.IsValid(x) end
             "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -6685,10 +6714,11 @@ _2 = a[1]
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("isvalid.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             ---@class Entity
             ---@field GetClass fun(self: Entity): string
 
@@ -6696,9 +6726,10 @@ _2 = a[1]
             ---@return TypeGuard<any>
             function _G.IsValid(x) end
             "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -6723,10 +6754,11 @@ _2 = a[1]
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("isvalid.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             ---@class Entity
             ---@field GetClass fun(self: Entity): string
 
@@ -6734,9 +6766,10 @@ _2 = a[1]
             ---@return TypeGuard<any>
             function _G.IsValid(x) end
             "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -6812,17 +6845,19 @@ _2 = a[1]
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("isvalid.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             ---@param x any
             ---@return boolean
             function _G.IsValid(x) end
             "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         assert!(!ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"

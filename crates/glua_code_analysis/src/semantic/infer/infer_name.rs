@@ -3647,6 +3647,7 @@ end
                     .to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("file id must be present");
 
         let initial_signature_id = find_first_closure_signature_id(&ws, file_id);
@@ -3658,18 +3659,20 @@ end
             .local_func_decl_for(&initial_signature_id)
             .expect("expected initial local function decl mapping");
 
-        ws.analysis.update_file_by_uri(
-            &uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &uri,
+                Some(
+                    r#"
                 -- shift signature position to verify stale map cleanup
                 local function replacement(value)
                     return value
                 end
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         let updated_signature_id = find_first_closure_signature_id(&ws, file_id);
         let db = ws.analysis.compilation.get_db();

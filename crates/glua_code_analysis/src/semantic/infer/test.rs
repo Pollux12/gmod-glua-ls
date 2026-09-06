@@ -159,10 +159,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("isvalid.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             ---@class Entity
             ---@field health integer
 
@@ -170,9 +171,10 @@ mod test {
             ---@return TypeGuard<any>
             function _G.IsValid(obj) end
             "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         // Cached aliases of the global helper should still narrow.
         assert!(ws.check_code_for(

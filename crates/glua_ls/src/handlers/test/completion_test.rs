@@ -5423,6 +5423,7 @@ mod tests {
             .or_fail()?;
         ws.analysis
             .update_file_by_uri(&uri, Some(content.to_string()))
+            .map(|(id, _)| id)
             .or_fail()
     }
 }

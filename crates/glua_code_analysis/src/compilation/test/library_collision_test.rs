@@ -247,6 +247,7 @@ mod tests {
         workspace
             .analysis
             .remove_file_by_uri(&preferred_uri)
+            .0
             .expect("preferred library file should exist");
         assert!(
             workspace
@@ -266,6 +267,7 @@ mod tests {
         workspace
             .analysis
             .update_file_by_uri(&preferred_uri, Some(DUPLICATE_ANNOTATIONS.to_string()))
+            .map(|(id, _)| id)
             .expect("preferred library file should reopen");
         assert_eq!(workspace.analysis.library_definition_collisions().len(), 1);
         assert_eq!(

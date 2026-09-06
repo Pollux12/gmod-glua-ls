@@ -186,16 +186,18 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("gm.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                 ---@class GM
                 function GM:SetupMove(ply, mv, cmd) end
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
     }
 
     #[gtest]
@@ -8075,6 +8077,7 @@ mod test {
 
         ws.analysis
             .update_file_by_uri(&init_uri, Some(format!("{init_code}\n")))
+            .map(|(id, _)| id)
             .expect("expected touched init file id");
 
         let alias_seats_after_touch = index_expr_type(&mut ws, file_id, "selfTbl.seats");
@@ -8257,6 +8260,7 @@ mod test {
 
         ws.analysis
             .update_file_by_uri(&car_uri, Some(format!("{car_code}\n")))
+            .map(|(id, _)| id)
             .expect("expected touched car cl_init file id");
 
         let touched_sounds_type = local_name_type(&mut ws, file_id, "sounds");
@@ -8930,6 +8934,7 @@ mod test {
         let consumer_uri = ws.virtual_url_generator.new_uri(consumer_path);
         ws.analysis
             .update_file_by_uri(&consumer_uri, Some(format!("{consumer_code}\n")))
+            .map(|(id, _)| id)
             .expect("expected touched consumer file id");
 
         let touched_pos_type = local_name_type(&mut ws, consumer_file, "pos");
@@ -9899,6 +9904,7 @@ mod test {
 
         ws.analysis
             .update_file_by_uri(&shared_uri, Some(format!("\n{shared_text}")))
+            .map(|(id, _)| id)
             .expect("shared file should update");
 
         let member_item_after = ws

@@ -1427,27 +1427,32 @@ mod test {
         let initial_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(unsupported_content.to_string()))
+            .map(|(id, _)| id)
             .expect("literal metatable lifecycle file must be created");
         assert!(has_undefined_method(&ws, initial_file_id));
 
         let edited_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(supported_content.to_string()))
+            .map(|(id, _)| id)
             .expect("literal metatable lifecycle file must be updated");
         assert!(!has_undefined_method(&ws, edited_file_id));
 
         ws.analysis
             .remove_file_by_uri(&uri)
+            .0
             .expect("literal metatable lifecycle file must be removed");
         let reopened_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(unsupported_content.to_string()))
+            .map(|(id, _)| id)
             .expect("literal metatable lifecycle file must reopen");
         assert!(has_undefined_method(&ws, reopened_file_id));
 
         let restored_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(supported_content.to_string()))
+            .map(|(id, _)| id)
             .expect("literal metatable lifecycle file must be restored");
         assert!(!has_undefined_method(&ws, restored_file_id));
     }
@@ -1494,27 +1499,32 @@ mod test {
         let initial_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(self_index_content.to_string()))
+            .map(|(id, _)| id)
             .expect("metatable lifecycle file must be created");
         assert!(!has_undefined_method(&ws, initial_file_id));
 
         let edited_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(other_index_content.to_string()))
+            .map(|(id, _)| id)
             .expect("metatable lifecycle file must be updated");
         assert!(has_undefined_method(&ws, edited_file_id));
 
         ws.analysis
             .remove_file_by_uri(&uri)
+            .0
             .expect("metatable lifecycle file must be removed");
         let reopened_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(other_index_content.to_string()))
+            .map(|(id, _)| id)
             .expect("metatable lifecycle file must reopen");
         assert!(has_undefined_method(&ws, reopened_file_id));
 
         let restored_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(self_index_content.to_string()))
+            .map(|(id, _)| id)
             .expect("metatable lifecycle file must be restored");
         assert!(!has_undefined_method(&ws, restored_file_id));
     }

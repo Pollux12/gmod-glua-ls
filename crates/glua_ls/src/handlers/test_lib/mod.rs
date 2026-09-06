@@ -149,6 +149,7 @@ impl ProviderVirtualWorkspace {
 
         self.analysis
             .update_file_by_uri(&uri, Some(content.to_string()))
+            .map(|(id, _)| id)
             .unwrap()
     }
 

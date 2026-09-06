@@ -1075,15 +1075,18 @@ mod tests {
 
         let server_uri = file_path_to_uri(&workspace.join("lua/autorun/server/sv_api.lua"))
             .expect("server URI should parse");
-        analysis.update_file_by_uri(
-            &server_uri,
-            Some("function ServerOnlyApi() return true end".to_string()),
-        );
+        analysis
+            .update_file_by_uri(
+                &server_uri,
+                Some("function ServerOnlyApi() return true end".to_string()),
+            )
+            .map(|(id, _)| id);
 
         let client_uri = file_path_to_uri(&workspace.join("lua/autorun/client/cl_user.lua"))
             .expect("client URI should parse");
         let client_file = analysis
             .update_file_by_uri(&client_uri, Some("ServerOnlyApi()".to_string()))
+            .map(|(id, _)| id)
             .expect("client file should be indexed");
 
         let (connection, _peer) = Connection::memory();

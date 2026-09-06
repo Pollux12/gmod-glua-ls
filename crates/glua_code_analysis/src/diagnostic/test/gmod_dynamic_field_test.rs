@@ -510,6 +510,7 @@ mod test {
 
         ws.analysis
             .remove_file_by_uri(&producer_uri)
+            .0
             .expect("producer must be removable");
         let removed_font_width = latest_member_type(&ws, consumer_file, "FontWidth");
         let removed_font_width_desc = ws.humanize_type(removed_font_width);
@@ -520,6 +521,7 @@ mod test {
 
         ws.analysis
             .update_file_by_uri(&producer_uri, Some(producer_source.to_string()))
+            .map(|(id, _)| id)
             .expect("producer must reopen");
         let reopened_font_width = latest_member_type(&ws, consumer_file, "FontWidth");
         let reopened_font_width_desc = ws.humanize_type(reopened_font_width);

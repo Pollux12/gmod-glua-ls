@@ -734,9 +734,13 @@ impl DebouncedAnalysis {
     /// watched-file change uses. `exclude` carries the files the edit path
     /// already settled (the edited batch, the files owed a ripple, and the
     /// files the ripple re-analysed), which the candidate filter drops.
-    async fn schedule_textual_refresh(&self, names: HashSet<SmolStr>, exclude: &HashSet<FileId>) {
+    async fn schedule_textual_refresh(
+        &self,
+        names: HashSet<SmolStr>,
+        exclude: &HashSet<FileId>,
+    ) -> bool {
         if names.is_empty() {
-            return;
+            return false;
         }
         let analysis = self.analysis.clone();
         let exclude = exclude.clone();
@@ -754,14 +758,54 @@ impl DebouncedAnalysis {
         match resolved {
             Ok((candidates, interval)) => {
                 if candidates.is_empty() {
-                    return;
+                    return false;
                 }
                 self.file_diagnostic
                     .add_files_diagnostic_task(candidates, interval, None)
                     .await;
+                true
             }
-            Err(err) => log::error!("textual refresh resolve task failed: {}", err),
+            Err(err) => {
+                log::error!("textual refresh resolve task failed: {}", err);
+                false
+            }
         }
+    }
+
+    /// Arm an idle workspace diagnostic refresh so closed files hit by
+    /// cross-file changes get re-diagnosed once typing pauses.
+    ///
+    /// Cancels the previously armed timer, if any. Clones the arcs it needs and
+    /// takes no lock: the caller may still hold one.
+    fn arm_idle_workspace_diagnostic(&self, token_slot: &mut Option<CancellationToken>) {
+        if let Some(token) = token_slot.take() {
+            token.cancel();
+        }
+        let cancel_token = CancellationToken::new();
+        *token_slot = Some(cancel_token.clone());
+
+        let client = self.client.clone();
+        let status = self.workspace_diagnostic_level.clone();
+        let lsp_features = self.lsp_features.clone();
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(IDLE_WORKSPACE_DIAGNOSTIC_DELAY) => {
+                    if !cancel_token.is_cancelled() && !shutdown.is_cancelled() {
+                        // Raise, never lower: don't drop a pending Slow sweep.
+                        status.fetch_max(
+                            crate::context::WorkspaceDiagnosticLevel::Fast.to_u8(),
+                            Ordering::AcqRel,
+                        );
+                        if lsp_features.supports_refresh_diagnostic() {
+                            client.refresh_workspace_diagnostics();
+                        }
+                    }
+                }
+                _ = cancel_token.cancelled() => {}
+                _ = shutdown.cancelled() => {}
+            }
+        });
     }
 
     /// Hold the owed ripple until typing has stopped for [`RIPPLE_QUIET`].
@@ -1030,9 +1074,12 @@ impl DebouncedAnalysis {
                 // them and schedule diagnostics, then settle the burst.
                 let names = std::mem::take(&mut owed_refresh_names);
                 let exclude = std::mem::take(&mut refresh_exclude);
-                self.schedule_textual_refresh(names, &exclude).await;
+                let scheduled = self.schedule_textual_refresh(names, &exclude).await;
                 self.refresh_dirty_state().await;
                 self.reindex_notify.notify_waiters();
+                if scheduled {
+                    self.arm_idle_workspace_diagnostic(&mut idle_workspace_diagnostic_token);
+                }
                 continue;
             };
 
@@ -1131,34 +1178,7 @@ impl DebouncedAnalysis {
 
                 // Arm an idle workspace diagnostic refresh so closed files hit
                 // by cross-file changes get re-diagnosed once typing pauses.
-                if let Some(token) = idle_workspace_diagnostic_token.take() {
-                    token.cancel();
-                }
-                let cancel_token = CancellationToken::new();
-                idle_workspace_diagnostic_token = Some(cancel_token.clone());
-
-                let client = self.client.clone();
-                let status = self.workspace_diagnostic_level.clone();
-                let lsp_features = self.lsp_features.clone();
-                let shutdown = self.shutdown.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        _ = tokio::time::sleep(IDLE_WORKSPACE_DIAGNOSTIC_DELAY) => {
-                            if !cancel_token.is_cancelled() && !shutdown.is_cancelled() {
-                                // Raise, never lower: don't drop a pending Slow sweep.
-                                status.fetch_max(
-                                    crate::context::WorkspaceDiagnosticLevel::Fast.to_u8(),
-                                    Ordering::AcqRel,
-                                );
-                                if lsp_features.supports_refresh_diagnostic() {
-                                    client.refresh_workspace_diagnostics();
-                                }
-                            }
-                        }
-                        _ = cancel_token.cancelled() => {}
-                        _ = shutdown.cancelled() => {}
-                    }
-                });
+                self.arm_idle_workspace_diagnostic(&mut idle_workspace_diagnostic_token);
             }
 
             self.refresh_dirty_state().await;
@@ -1641,14 +1661,18 @@ mod tests {
 
             let api_uri = file_path_to_uri(&workspace.join("lua/autorun/shared/api.lua"))
                 .expect("API URI should parse");
-            analysis.update_file_by_uri(
-                &api_uri,
-                Some("function NeedsUse() return true end".to_string()),
-            );
+            analysis
+                .update_file_by_uri(
+                    &api_uri,
+                    Some("function NeedsUse() return true end".to_string()),
+                )
+                .map(|(id, _)| id);
 
             let user_uri = file_path_to_uri(&workspace.join("lua/autorun/shared/user.lua"))
                 .expect("user URI should parse");
-            analysis.update_file_by_uri(&user_uri, Some("NeedsUse()".to_string()));
+            analysis
+                .update_file_by_uri(&user_uri, Some("NeedsUse()".to_string()))
+                .map(|(id, _)| id);
 
             let (connection, _peer) = Connection::memory();
             let client = Arc::new(ClientProxy::new(connection));
@@ -1784,8 +1808,11 @@ mod tests {
             let consumer_uri = file_path_to_uri(&workspace.join("lua/rename/consumer.lua"))
                 .expect("consumer URI should parse");
             analysis
-                .update_file_by_uri(&provider_uri, Some("function OldName() end\n".to_string()));
-            analysis.update_file_by_uri(&consumer_uri, Some("OldName()\n".to_string()));
+                .update_file_by_uri(&provider_uri, Some("function OldName() end\n".to_string()))
+                .map(|(id, _)| id);
+            analysis
+                .update_file_by_uri(&consumer_uri, Some("OldName()\n".to_string()))
+                .map(|(id, _)| id);
             let consumer_id = analysis
                 .compilation
                 .get_db()
@@ -1873,9 +1900,15 @@ mod tests {
                 .expect("middle URI should parse");
             let consumer_uri = file_path_to_uri(&workspace.join("lua/chain/consumer.lua"))
                 .expect("consumer URI should parse");
-            analysis.update_file_by_uri(&provider_uri, Some("Chain = { Value = 1 }\n".to_string()));
-            analysis.update_file_by_uri(&middle_uri, Some("Binferred = Chain.Value\n".to_string()));
-            analysis.update_file_by_uri(&consumer_uri, Some("local got = Binferred\n".to_string()));
+            analysis
+                .update_file_by_uri(&provider_uri, Some("Chain = { Value = 1 }\n".to_string()))
+                .map(|(id, _)| id);
+            analysis
+                .update_file_by_uri(&middle_uri, Some("Binferred = Chain.Value\n".to_string()))
+                .map(|(id, _)| id);
+            analysis
+                .update_file_by_uri(&consumer_uri, Some("local got = Binferred\n".to_string()))
+                .map(|(id, _)| id);
             let consumer_id = analysis
                 .compilation
                 .get_db()

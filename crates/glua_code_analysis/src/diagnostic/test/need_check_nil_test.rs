@@ -2074,10 +2074,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("dtree_node.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             ---@class DListLayout
             local DListLayout = {}
             function DListLayout:Add() end
@@ -2089,9 +2090,10 @@ mod test {
             ---@outparam self.ChildNodes DListLayout
             function DTree_Node:CreateChildNodes() end
             "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         let diagnostics = diagnostics_for_code(
             &mut ws,
@@ -6048,10 +6050,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("global.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             ---@class Color
 
             ---@return Color
@@ -6067,9 +6070,10 @@ mod test {
             ---@param l number
             function _G.HSLToColor(h, s, l) end
         "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         ws.def_file(
             "lua/autorun/shared/sh_colors.lua",
@@ -7911,10 +7915,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("isvalid.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             ---@class Entity
             ---@field GetEditingData fun(self: Entity): table
             ---@class NULL : Entity
@@ -7924,9 +7929,10 @@ mod test {
             ---@return_cast toBeValidated -NULL
             function _G.IsValid(toBeValidated) end
             "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
@@ -7955,10 +7961,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("global.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                 ---@class Entity
                 ---@field GetEditingData fun(self: Entity): table
                 ---@class NULL : Entity
@@ -7969,9 +7976,10 @@ mod test {
                 ---@return_cast value -NULL
                 function _G.IsValid(value) end
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
@@ -9056,10 +9064,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("cl_lang.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             LANG = {
                 Strings = {}
             }
@@ -9086,9 +9095,10 @@ mod test {
                 return LANG.Strings[lang_name]
             end
         "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         let diagnostics = diagnostics_for_code(
             &mut ws,
@@ -11642,16 +11652,18 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("globals.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                     ---@type SpawnMenu
                     g_SpawnMenu = nil
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         // Main workspace file with nil + create lifecycle
         ws.def_file(
@@ -11718,10 +11730,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("globals.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                     ---@meta
 
                     ---@class MyType
@@ -11730,9 +11743,10 @@ mod test {
                     ---@type MyType
                     g_AllNil = nil
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         ws.def_file(
             "main.lua",
@@ -11831,10 +11845,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("toolobj.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                     ---@meta
 
                     ---@class Weapon
@@ -11846,9 +11861,10 @@ mod test {
                     ---@class ToolObj : Tool
                     ToolObj = ToolObj or {}
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         // --- Main workspace: shipped runtime pattern (garrysmod stool.lua) ---
         // Includes the `o.SWEP = nil` initializer in Create() and the
@@ -11930,10 +11946,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("globals.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                     ---@meta
 
                     ---@class MyType
@@ -11942,9 +11959,10 @@ mod test {
                     ---@type MyType
                     g_Mixed = nil
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         ws.def_file(
             "main_nil.lua",
@@ -12098,10 +12116,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let tool_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("tool.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &tool_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &tool_uri,
+                Some(
+                    r#"
                     ---@meta
 
                     ---@class Entity
@@ -12129,9 +12148,10 @@ mod test {
                     ---@return any
                     function Tool:GetPos(id) end
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         let custom_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("custom_classes.lua")).unwrap();
         ws.analysis.update_file_by_uri(
@@ -12147,7 +12167,7 @@ mod test {
                 "#
                 .to_string(),
             ),
-        );
+        ).map(|(id, _)| id);
 
         ws.def_file(
             "gamemodes/sandbox/entities/weapons/gmod_tool/stool.lua",

@@ -552,6 +552,7 @@ impl VirtualWorkspace {
 
         self.analysis
             .update_file_by_uri(&uri, Some(content.to_string()))
+            .map(|(id, _)| id)
             .expect("File ID must be present")
     }
 
@@ -638,6 +639,7 @@ impl VirtualWorkspace {
 
         self.analysis
             .update_file_by_uri(&uri, Some(content.to_string()))
+            .map(|(id, _)| id)
             .expect("File ID must be present")
     }
 
