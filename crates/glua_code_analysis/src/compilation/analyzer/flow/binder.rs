@@ -353,24 +353,6 @@ impl<'a> FlowBinder<'a> {
         self.record_narrowable_refs(expr);
     }
 
-    pub fn record_condition_flow_paths(&mut self, flow_id: FlowId, expr: &LuaExpr) {
-        use glua_parser::{LuaAstNode, LuaIndexExpr, PathTrait};
-
-        for index_expr in expr.syntax().descendants().filter_map(LuaIndexExpr::cast) {
-            let dynamic = matches!(
-                index_expr.get_index_key(),
-                Some(glua_parser::LuaIndexKey::Expr(_))
-            );
-            if let Some(path) = index_expr.get_access_path().filter(|_| !dynamic) {
-                self.narrowing_capability
-                    .condition_flows_by_path
-                    .entry(ArcIntern::from(SmolStr::new(path)))
-                    .or_default()
-                    .insert(flow_id);
-            }
-        }
-    }
-
     fn record_narrowable_refs(&mut self, expr: &LuaExpr) {
         use glua_parser::{LuaAstNode, LuaIndexExpr, LuaNameExpr, PathTrait};
         // Record the expr itself if it is a name or index, then recurse into
