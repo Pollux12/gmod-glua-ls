@@ -66,6 +66,10 @@ pub struct CmdArgs {
     /// Verbose output
     #[arg(long)]
     pub verbose: bool,
+
+    /// Path to GMod annotations directory
+    #[arg(long)]
+    pub gmod_annotations: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, ValueEnum)]
