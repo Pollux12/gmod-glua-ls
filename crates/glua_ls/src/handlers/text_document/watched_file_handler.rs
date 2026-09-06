@@ -23,7 +23,9 @@ pub async fn on_did_change_watched_files(
     };
 
     let lsp_features = context.lsp_features();
-    let mut watched_lua_files: Vec<(Uri, Option<String>)> = Vec::new();
+    let mut lua_batch: Vec<(Uri, Option<String>)> = Vec::new();
+    // Diagnostics-only sidecar: deletion bookkeeping (clearing push
+    // diagnostics / forgetting cached reports) happens after the batch settles.
     let mut deleted_lua_uris: Vec<Uri> = Vec::new();
     let mut editorconfig_paths: Vec<PathBuf> = Vec::new();
     let mut emmyrc_dirs: Vec<PathBuf> = Vec::new();
@@ -41,6 +43,7 @@ pub async fn on_did_change_watched_files(
                         // receive spurious delete events and must not be
                         // purged from the index.
                         if workspace.is_workspace_file(&file_event.uri) {
+                            lua_batch.push((file_event.uri.clone(), None));
                             deleted_lua_uris.push(file_event.uri);
                         }
                         continue;
@@ -50,7 +53,7 @@ pub async fn on_did_change_watched_files(
                         && workspace.is_workspace_file(&file_event.uri)
                     {
                         collect_lua_files(
-                            &mut watched_lua_files,
+                            &mut lua_batch,
                             file_event.uri,
                             file_event.typ,
                             &encoding,
@@ -86,8 +89,10 @@ pub async fn on_did_change_watched_files(
     let file_ids = {
         let mut analysis = context.analysis().write().await;
 
-        let mut batch = watched_lua_files;
-        batch.extend(deleted_lua_uris.iter().cloned().map(|uri| (uri, None)));
+        // Deletions and changes arrive as one order-preserving batch; the
+        // analyser sorts, keeps only the last event per URI and settles in one
+        // pass, so a delete/create pair lands as the final state on disk.
+        let batch = lua_batch;
 
         // The files the settle touched, which is what still needs diagnosing.
         // It is not every file whose diagnostics could differ — a reader that
