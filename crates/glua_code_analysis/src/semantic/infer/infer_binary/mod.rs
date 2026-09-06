@@ -30,11 +30,12 @@ pub fn infer_binary_expr(
     // to throw the answer away, so N same-slot bootstraps cost O(N^2). The
     // table literal alone is the same answer `special_or_rule` returns below.
     //
-    // Bare names are excluded: for `x = x or {}` the unresolved-global arms
-    // ahead of the bootstrap check take precedence, and a resolved local is a
-    // narrowing idiom whose left type is cheap (one declaration) anyway. An
-    // index read is never an unresolved global, so those checks are provably
-    // inert for it and skipping them changes nothing.
+    // Bare names are excluded: `is_self_referential_bootstrap` now resolves name
+    // targets (local/param/declared-global gate), so the unresolved-global arms
+    // ahead of the bootstrap check keep precedence for them and the narrow
+    // idiom keeps its cheap left read. An index read is never an unresolved
+    // global, so those checks are provably inert for it and skipping them
+    // changes nothing.
     //
     // Computed keys are excluded too: only an `Expr`-keyed member read bumps
     // the sibling-merge counter the walk uses to queue settled re-derivation,
@@ -53,7 +54,7 @@ pub fn infer_binary_expr(
             )
         )
         && matches!(&right, LuaExpr::TableExpr(table) if table.is_empty())
-        && infer_binary_or::is_self_referential_bootstrap(&left)
+        && infer_binary_or::is_self_referential_bootstrap(db, cache, &left)
     {
         return infer_expr(db, cache, right);
     }

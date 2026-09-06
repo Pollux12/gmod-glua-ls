@@ -1,4 +1,4 @@
-use glua_parser::{LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaExpr, LuaSyntaxNode};
+use glua_parser::{LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaExpr, LuaNameExpr, LuaSyntaxNode};
 
 use crate::{
     DbIndex, LuaInferCache, LuaType, TypeOps, check_type_compact,
@@ -103,7 +103,7 @@ pub fn try_bootstrap_or(
     // wait forever. Any other `X or {}` is a read of `X`, and answering with
     // the fresh table alone commits the state of the index at the moment the
     // file was walked, so it waits for the read like any other operand.
-    if !is_self_referential_bootstrap(left) {
+    if !is_self_referential_bootstrap(db, cache, left) {
         return None;
     }
 
@@ -153,7 +153,7 @@ pub fn special_or_rule(
                 // A self-read cannot inform its own definition, so the fold must
                 // not consult it: `X = X or {}` always yields the fresh table,
                 // whatever the left read happens to resolve to right now.
-                if is_self_referential_bootstrap(&left_expr) {
+                if is_self_referential_bootstrap(db, cache, &left_expr) {
                     return Some(right_type.clone());
                 }
 
@@ -232,10 +232,15 @@ pub fn infer_binary_expr_or(db: &DbIndex, left: LuaType, right: LuaType) -> Infe
 }
 
 /// True when `left_expr` is a field read that is also the target of the assignment
-/// it feeds, e.g. `X.a[k] = X.a[k] or {}`. Name targets are excluded: for a local or
-/// parameter `x = x or {}` is a narrowing idiom over a declared type rather than a
-/// definition of the table, and unresolved globals are already handled below.
-pub(crate) fn is_self_referential_bootstrap(left_expr: &LuaExpr) -> bool {
+/// it feeds, e.g. `X.a[k] = X.a[k] or {}`. For a name target, only an unresolved
+/// name qualifies: a resolved local, parameter, or declared global makes
+/// `x = x or {}` a narrowing idiom over a declared type rather than a definition
+/// of the table (unresolved globals qualify, matching the handling below).
+pub(crate) fn is_self_referential_bootstrap(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    left_expr: &LuaExpr,
+) -> bool {
     if !matches!(left_expr, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)) {
         return false;
     }
@@ -258,7 +263,47 @@ pub(crate) fn is_self_referential_bootstrap(left_expr: &LuaExpr) -> bool {
         return false;
     };
 
-    significant_tokens(var.syntax()) == significant_tokens(left_expr.syntax())
+    if significant_tokens(var.syntax()) != significant_tokens(left_expr.syntax()) {
+        return false;
+    }
+
+    match left_expr {
+        LuaExpr::IndexExpr(_) => true,
+        LuaExpr::NameExpr(name_expr) => !is_resolved_name_expr(db, cache, name_expr),
+        _ => false,
+    }
+}
+
+/// True when the name has a local/param declaration or a declared global, i.e.
+/// anything that makes the name a resolved read rather than an unresolved
+/// bootstrap target. Mirrors `is_unresolved_global_unknown_name_expr`.
+fn is_resolved_name_expr(db: &DbIndex, cache: &mut LuaInferCache, name_expr: &LuaNameExpr) -> bool {
+    let file_id = cache.get_file_id();
+    if db
+        .get_reference_index()
+        .get_local_reference(&file_id)
+        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+        .is_some()
+    {
+        return true;
+    }
+
+    let Some(name_text) = name_expr.get_name_text() else {
+        return false;
+    };
+
+    if db
+        .get_decl_index()
+        .get_decl_tree(&file_id)
+        .is_some_and(|tree| {
+            tree.find_local_decl(name_text.as_str(), name_expr.get_position())
+                .is_some()
+        })
+    {
+        return true;
+    }
+
+    resolve_global_decl_id(db, cache, name_text.as_str(), Some(name_expr)).is_some()
 }
 
 fn significant_tokens(node: &LuaSyntaxNode) -> Vec<String> {
