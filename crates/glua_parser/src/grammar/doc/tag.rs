@@ -32,25 +32,6 @@ fn is_type_modifier_flag(p: &LuaDocParser) -> bool {
     false
 }
 
-/// Checks if the current `[` token begins an LDoc return modifier like
-/// `[opt]` or `[opt=1]` rather than a tuple return type like `[string, number]`.
-fn is_ldoc_return_modifier(p: &LuaDocParser) -> bool {
-    let text = p.origin_text();
-    let start = p.current_token_range().start_offset;
-    let rest = &text[start..];
-    let Some(close) = rest.find(']') else {
-        return false;
-    };
-    let inner = rest[1..close].trim();
-    if inner.is_empty() || inner.contains(['[', ']', '\n']) {
-        return false;
-    }
-    match inner.split_once('=') {
-        Some((name, value)) => name.trim() == "opt" && !value.trim().is_empty(),
-        None => inner == "opt",
-    }
-}
-
 pub fn parse_tag(p: &mut LuaDocParser) {
     let level = p.get_mark_level();
     match parse_tag_detail(p) {
@@ -427,22 +408,10 @@ fn parse_tag_param(p: &mut LuaDocParser) -> DocParseResult {
 // ---@return number <name> , this just compact luals
 // ---@return (instance) DPanel
 // ---@return (definition) DPanel
-// ---@return [opt]
-// ---@return [opt=1] DPanel
 fn parse_tag_return(p: &mut LuaDocParser) -> DocParseResult {
     p.set_lexer_state(LuaDocLexerState::Normal);
     let m = p.mark(LuaSyntaxKind::DocTagReturn);
     p.bump();
-
-    if p.current_token() == LuaTokenKind::TkLeftBracket && is_ldoc_return_modifier(p) {
-        p.bump();
-        while p.current_token() != LuaTokenKind::TkRightBracket
-            && p.current_token() != LuaTokenKind::TkEof
-        {
-            p.bump();
-        }
-        if_token_bump(p, LuaTokenKind::TkRightBracket);
-    }
 
     if p.current_token() == LuaTokenKind::TkLeftParen && is_type_modifier_flag(p) {
         parse_doc_type_flag(p)?;
