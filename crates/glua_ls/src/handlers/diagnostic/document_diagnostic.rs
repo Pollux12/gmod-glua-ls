@@ -6,7 +6,7 @@ use lsp_types::{
 use tokio_util::sync::CancellationToken;
 
 use super::diagnostic_result_id;
-use crate::context::ServerContextSnapshot;
+use crate::context::{Freshness, ServerContextSnapshot};
 
 fn full_report(
     result_id: Option<String>,
@@ -57,10 +57,11 @@ pub async fn on_pull_document_diagnostic(
 
     // Correctness, not latency: the index stays stale between didChange and
     // the debounced reindex, and diagnostics computed then are wrong.
-    if !context
+    if context
         .debounced_analysis()
         .wait_until_fresh_for(&token, "textDocument/diagnostic")
         .await
+        != Freshness::Fresh
     {
         return keep_client_state(&context, &uri, previous_result_id).await;
     }

@@ -2,7 +2,7 @@ mod build_function_hint;
 mod build_inlay_hint;
 
 use super::RegisterCapabilities;
-use crate::context::{ClientId, ServerContextSnapshot};
+use crate::context::{ClientId, Freshness, ServerContextSnapshot};
 use build_inlay_hint::build_inlay_hints;
 pub use build_inlay_hint::{get_override_lsp_location, get_super_member_id};
 use glua_code_analysis::{EmmyLuaAnalysis, FileId};
@@ -32,10 +32,11 @@ pub async fn on_inlay_hint_handler(
 
     // Wait for any pending reindex to finish so we serve fresh hints
     // computed against consistent tree + index data.
-    if !context
+    if context
         .debounced_analysis()
         .wait_until_fresh_for(&cancel_token, "textDocument/inlayHint")
         .await
+        != Freshness::Fresh
     {
         return None;
     }
