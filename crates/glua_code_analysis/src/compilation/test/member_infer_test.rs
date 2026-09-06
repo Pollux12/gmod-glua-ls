@@ -2867,6 +2867,340 @@ mod test {
         );
     }
 
+    const GLOBAL_CLASS_FLIP_ZEBRA_SOURCE: &str = r#"
+        Glide = Glide or {}
+
+        --- @class Zebra
+        Glide.Repair = Glide.Repair or {}
+
+        function Glide.Repair.x() end
+        function Glide.Repair.y() end
+        "#;
+
+    const GLOBAL_CLASS_FLIP_APPLE_SOURCE: &str = r#"
+        --- @class Apple
+        Glide.Repair = Glide.Repair or {}
+        "#;
+
+    fn global_path_class_member_names(
+        ws: &VirtualWorkspace,
+        owner: &LuaMemberOwner,
+    ) -> Vec<String> {
+        let mut names = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_member_index()
+            .get_members(owner)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|member| match member.get_key() {
+                LuaMemberKey::Name(name) => Some(name.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[gtest]
+    fn test_global_class_annotation_flip_rehomes_path_members_to_the_winning_class() {
+        let zebra_path = "lua/glide/sh_repair_zebra.lua";
+        let apple_path = "lua/glide/sh_repair_apple.lua";
+        let consumer_path = "lua/entities/glide_repair_tool/init.lua";
+        let consumer_source = r#"
+            local x = Glide.Repair.x
+            local y = Glide.Repair.y
+            "#;
+
+        let mut failures = Vec::new();
+        for zebra_first in [true, false] {
+            let label = if zebra_first {
+                "zebra_then_apple"
+            } else {
+                "apple_then_zebra"
+            };
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+
+            if zebra_first {
+                ws.def_file(zebra_path, GLOBAL_CLASS_FLIP_ZEBRA_SOURCE);
+                ws.def_file(apple_path, GLOBAL_CLASS_FLIP_APPLE_SOURCE);
+            } else {
+                ws.def_file(apple_path, GLOBAL_CLASS_FLIP_APPLE_SOURCE);
+                ws.def_file(zebra_path, GLOBAL_CLASS_FLIP_ZEBRA_SOURCE);
+            }
+            let consumer_file = ws.def_file(consumer_path, consumer_source);
+
+            let apple_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Apple"));
+            let zebra_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Zebra"));
+            let path_owner = LuaMemberOwner::GlobalPath(GlobalId::new("Glide.Repair"));
+
+            assert_eq!(
+                global_path_class_member_names(&ws, &path_owner),
+                vec!["x".to_string(), "y".to_string()],
+                "{label}: the path canonically resolves to the winning class members"
+            );
+            assert_eq!(
+                global_path_class_member_names(&ws, &apple_owner),
+                vec!["x".to_string(), "y".to_string()],
+                "{label}: the winning class holds the path members"
+            );
+            assert_eq!(
+                global_path_class_member_names(&ws, &zebra_owner),
+                Vec::<String>::new(),
+                "{label}: the losing class must not hold path members"
+            );
+
+            assert_that!(
+                file_has_diagnostic(&mut ws, consumer_file, DiagnosticCode::UndefinedField),
+                eq(false),
+                "{label}: consumer should read the path members"
+            );
+            let x_type = index_expr_type(&mut ws, consumer_file, "Glide.Repair.x");
+            if x_type.is_unknown() {
+                failures.push(format!("{label}: Glide.Repair.x resolved as unknown"));
+            }
+        }
+
+        assert_that!(failures, is_empty(), "{failures:?}");
+    }
+
+    #[gtest]
+    fn test_global_class_annotation_winner_removal_flips_to_the_surviving_candidate() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let winner_path = "lua/glide/sh_repair_apple.lua";
+        ws.def_file(winner_path, GLOBAL_CLASS_FLIP_APPLE_SOURCE);
+        ws.def_file(
+            "lua/glide/sh_repair_mid.lua",
+            r#"
+            --- @class Mid
+            Glide.Repair = Glide.Repair or {}
+            "#,
+        );
+        ws.def_file(
+            "lua/glide/sv_repair.lua",
+            "function Glide.Repair.Shared() end\n",
+        );
+        let consumer_file = ws.def_file(
+            "lua/entities/glide_repair_tool/init.lua",
+            "local shared = Glide.Repair.Shared\n",
+        );
+
+        let apple_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Apple"));
+        assert_eq!(
+            global_path_class_member_names(&ws, &apple_owner),
+            vec!["Shared".to_string()],
+            "precondition: the winner class holds the member before removal"
+        );
+
+        let winner_uri = ws.virtual_url_generator.new_uri(winner_path);
+        ws.analysis.update_file_by_uri(&winner_uri, None);
+
+        let mid_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Mid"));
+        let path_owner = LuaMemberOwner::GlobalPath(GlobalId::new("Glide.Repair"));
+        assert_eq!(
+            global_path_class_member_names(&ws, &path_owner),
+            vec!["Shared".to_string()],
+            "removing the winning proposal must flip the path to the surviving class"
+        );
+        assert_eq!(
+            global_path_class_member_names(&ws, &mid_owner),
+            vec!["Shared".to_string()],
+            "the member must be visible under the surviving class"
+        );
+        assert_eq!(
+            global_path_class_member_names(&ws, &apple_owner),
+            Vec::<String>::new(),
+            "the removed winner's class must not hold the member"
+        );
+        assert_that!(
+            file_has_diagnostic(&mut ws, consumer_file, DiagnosticCode::UndefinedField),
+            eq(false),
+            "the consumer must still resolve the member after the flip"
+        );
+    }
+
+    #[gtest]
+    fn test_global_class_annotation_last_proposal_removal_falls_back_to_the_path() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let annotator_path = "lua/glide/sh_repair_zebra.lua";
+        ws.def_file(annotator_path, GLOBAL_CLASS_FLIP_ZEBRA_SOURCE);
+        ws.def_file(
+            "lua/glide/sv_repair.lua",
+            "function Glide.Repair.Solo() end\n",
+        );
+        let consumer_file = ws.def_file(
+            "lua/entities/glide_repair_tool/init.lua",
+            "local solo = Glide.Repair.Solo\n",
+        );
+
+        let zebra_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Zebra"));
+        assert_eq!(
+            global_path_class_member_names(&ws, &zebra_owner),
+            vec!["Solo".to_string(), "x".to_string(), "y".to_string()],
+            "precondition: the annotated class holds the members before removal"
+        );
+
+        let annotator_uri = ws.virtual_url_generator.new_uri(annotator_path);
+        ws.analysis.update_file_by_uri(&annotator_uri, None);
+
+        let path_owner = LuaMemberOwner::GlobalPath(GlobalId::new("Glide.Repair"));
+        assert_eq!(
+            global_path_class_member_names(&ws, &path_owner),
+            vec!["Solo".to_string()],
+            "removing the last proposal must fall back to the path owner"
+        );
+        assert_eq!(
+            global_path_class_member_names(&ws, &zebra_owner),
+            Vec::<String>::new(),
+            "no member may be orphaned under the removed class"
+        );
+        assert_that!(
+            file_has_diagnostic(&mut ws, consumer_file, DiagnosticCode::UndefinedField),
+            eq(false),
+            "the consumer must still resolve the members after the fallback"
+        );
+    }
+
+    #[gtest]
+    fn test_global_class_annotation_flip_is_stable_across_load_orders() {
+        let zebra_path = "lua/glide/sh_repair_zebra.lua";
+        let apple_path = "lua/glide/sh_repair_apple.lua";
+        let consumer_path = "lua/entities/glide_repair_tool/init.lua";
+        let consumer_source = r#"
+            local x = Glide.Repair.x
+            "#;
+
+        let mut failures = Vec::new();
+        for scenario in [
+            "sequential_zebra_then_apple",
+            "sequential_apple_then_zebra",
+            "batch_startup",
+            "batch_then_full_reindex",
+        ] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+
+            let consumer_file_id = match scenario {
+                "sequential_zebra_then_apple" => {
+                    ws.def_file(zebra_path, GLOBAL_CLASS_FLIP_ZEBRA_SOURCE);
+                    ws.def_file(apple_path, GLOBAL_CLASS_FLIP_APPLE_SOURCE);
+                    ws.def_file(consumer_path, consumer_source)
+                }
+                "sequential_apple_then_zebra" => {
+                    ws.def_file(apple_path, GLOBAL_CLASS_FLIP_APPLE_SOURCE);
+                    ws.def_file(zebra_path, GLOBAL_CLASS_FLIP_ZEBRA_SOURCE);
+                    ws.def_file(consumer_path, consumer_source)
+                }
+                "batch_startup" | "batch_then_full_reindex" => {
+                    let zebra_batch_path = ws.virtual_url_generator.new_path(zebra_path);
+                    let apple_batch_path = ws.virtual_url_generator.new_path(apple_path);
+                    let consumer_batch_path = ws.virtual_url_generator.new_path(consumer_path);
+                    ws.analysis.update_files_by_path(vec![
+                        (
+                            zebra_batch_path,
+                            Some(GLOBAL_CLASS_FLIP_ZEBRA_SOURCE.into()),
+                        ),
+                        (
+                            apple_batch_path,
+                            Some(GLOBAL_CLASS_FLIP_APPLE_SOURCE.into()),
+                        ),
+                        (consumer_batch_path, Some(consumer_source.to_string())),
+                    ]);
+                    let consumer_uri = ws.virtual_url_generator.new_uri(consumer_path);
+                    ws.analysis
+                        .get_file_id(&consumer_uri)
+                        .expect("expected consumer file id")
+                }
+                _ => unreachable!(),
+            };
+
+            if scenario == "batch_then_full_reindex" {
+                ws.analysis.reindex();
+            }
+
+            let apple_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Apple"));
+            let zebra_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Zebra"));
+            let path_owner = LuaMemberOwner::GlobalPath(GlobalId::new("Glide.Repair"));
+            let expected = vec!["x".to_string(), "y".to_string()];
+            if global_path_class_member_names(&ws, &path_owner) != expected {
+                failures.push(format!("{scenario}: canonical path members diverged"));
+            }
+            if global_path_class_member_names(&ws, &apple_owner) != expected {
+                failures.push(format!("{scenario}: winning class members diverged"));
+            }
+            if !global_path_class_member_names(&ws, &zebra_owner).is_empty() {
+                failures.push(format!("{scenario}: losing class kept path members"));
+            }
+            if file_has_diagnostic(&mut ws, consumer_file_id, DiagnosticCode::UndefinedField) {
+                failures.push(format!("{scenario}: consumer has UndefinedField"));
+            }
+        }
+
+        assert_that!(
+            failures,
+            is_empty(),
+            "the class flip should be stable across load orders: {failures:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_global_class_annotation_flip_leaves_genuine_class_members_alone() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/glide/sh_zebra_class.lua",
+            r#"
+            --- @class Zebra
+            --- @field NativeOnly number
+            "#,
+        );
+        ws.def_file(
+            "lua/glide/sh_repair_zebra.lua",
+            GLOBAL_CLASS_FLIP_ZEBRA_SOURCE,
+        );
+        ws.def_file(
+            "lua/glide/sh_repair_apple.lua",
+            GLOBAL_CLASS_FLIP_APPLE_SOURCE,
+        );
+
+        let zebra_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Zebra"));
+        let apple_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Apple"));
+        let path_owner = LuaMemberOwner::GlobalPath(GlobalId::new("Glide.Repair"));
+
+        assert_eq!(
+            global_path_class_member_names(&ws, &path_owner),
+            vec!["x".to_string(), "y".to_string()],
+            "the path members follow the winning class"
+        );
+        assert_eq!(
+            global_path_class_member_names(&ws, &apple_owner),
+            vec!["x".to_string(), "y".to_string()],
+            "the winning class holds only the path members"
+        );
+        assert_eq!(
+            global_path_class_member_names(&ws, &zebra_owner),
+            vec!["NativeOnly".to_string()],
+            "genuine Zebra members must stay under Type(Zebra) across the flip"
+        );
+    }
+
     #[test]
     fn test_gmod_string_numeric_index() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
