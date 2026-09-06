@@ -138,9 +138,9 @@ impl LuaDiagnostic {
         let mut property_name_candidates = None;
         rayon::scope(|s| {
             s.spawn(|_| {
-                let mut gm_method_realms = FxHashMap::default();
-                let mut callee_realms_by_workspace = FxHashMap::default();
-                let mut realm_call_candidates_by_workspace = FxHashMap::default();
+                let mut gm_method_realms = HashMap::default();
+                let mut callee_realms_by_workspace = HashMap::default();
+                let mut realm_call_candidates_by_workspace = HashMap::default();
                 for workspace_id in module_index.get_main_workspace_ids() {
                     let realms = Arc::new(precompute_gm_method_realms(db, workspace_id));
                     let mut callee_realm_data = precompute_callee_realm_data_for_workspace(

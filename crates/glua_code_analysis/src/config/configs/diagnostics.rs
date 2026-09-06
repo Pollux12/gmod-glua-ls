@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap;
+use std::collections::HashMap;
 
 use lsp_types::DiagnosticSeverity;
 use schemars::JsonSchema;
@@ -24,7 +24,7 @@ pub struct EmmyrcDiagnostic {
     pub globals_regex: Vec<String>,
     /// A map of diagnostic codes to their severity settings.
     #[serde(default)]
-    pub severity: FxHashMap<DiagnosticCode, DiagnosticSeveritySetting>,
+    pub severity: HashMap<DiagnosticCode, DiagnosticSeveritySetting>,
     /// A list of diagnostic codes that are enabled.
     #[serde(default)]
     pub enables: Vec<DiagnosticCode>,
@@ -40,7 +40,7 @@ impl Default for EmmyrcDiagnostic {
             enable: default_true(),
             globals: Vec::new(),
             globals_regex: Vec::new(),
-            severity: FxHashMap::default(),
+            severity: HashMap::default(),
             enables: Vec::new(),
             diagnostic_interval: Some(500),
         }

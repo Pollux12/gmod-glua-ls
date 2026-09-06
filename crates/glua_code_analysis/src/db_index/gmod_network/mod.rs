@@ -1,4 +1,5 @@
 use rustc_hash::FxHashMap;
+use std::collections::HashMap;
 
 use rowan::TextRange;
 use smol_str::SmolStr;
@@ -383,8 +384,8 @@ impl GmodNetworkIndex {
     /// Every annotated wire format, paired with whether a write and a read exist
     /// for it. Used by the coverage test that guards against a typo silently
     /// breaking pairing for one op.
-    pub fn wire_format_coverage(&self) -> FxHashMap<SmolStr, (bool, bool)> {
-        let mut coverage: FxHashMap<SmolStr, (bool, bool)> = FxHashMap::default();
+    pub fn wire_format_coverage(&self) -> HashMap<SmolStr, (bool, bool)> {
+        let mut coverage: HashMap<SmolStr, (bool, bool)> = HashMap::default();
         for (wire_format, direction) in self.canonical_ops.keys() {
             let entry = coverage
                 .entry(wire_format.clone())

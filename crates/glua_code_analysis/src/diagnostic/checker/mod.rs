@@ -52,7 +52,7 @@ use glua_parser::{
 };
 use lsp_types::{Diagnostic, DiagnosticSeverity, DiagnosticTag, NumberOrString};
 use rowan::{TextRange, TextSize};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 

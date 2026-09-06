@@ -12,6 +12,7 @@ pub use module_node::{ModuleNode, ModuleNodeId};
 use regex::Regex;
 use rowan::TextSize;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::HashMap;
 pub(crate) use workspace::WorkspaceResolutionKey;
 pub use workspace::{Workspace, WorkspaceId, WorkspaceKind};
 
@@ -92,7 +93,7 @@ impl LuaModuleIndex {
         info!("update module pattern: {:?}", self.module_patterns);
     }
 
-    pub fn set_module_replace_patterns(&mut self, patterns: FxHashMap<String, String>) {
+    pub fn set_module_replace_patterns(&mut self, patterns: HashMap<String, String>) {
         self.module_replace_vec.clear();
         for (key, value) in patterns {
             let key_pattern = match Regex::new(&key) {
@@ -164,7 +165,7 @@ impl LuaModuleIndex {
             if let std::collections::hash_map::Entry::Vacant(e) = self.module_nodes.entry(child_id)
             {
                 let new_node = ModuleNode {
-                    children: FxHashMap::default(),
+                    children: HashMap::default(),
                     file_ids: Vec::new(),
                     parent: Some(parent_node_id),
                 };

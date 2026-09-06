@@ -12,7 +12,7 @@ pub use export_map::{
 };
 pub use position_map::{FileFacts, FileRemap, PositionMap, Remap};
 
-use rustc_hash::FxHashSet;
+use std::collections::HashSet;
 
 use super::{DbIndex, FileId};
 
@@ -22,8 +22,8 @@ use super::{DbIndex, FileId};
 /// by that, and what survives on an old position is what some *other* file
 /// recorded about it. Returns the files whose reference could not be
 /// rewritten - they have to be re-analysed instead.
-pub fn remap_into_file(db: &mut DbIndex, remap: &FileRemap) -> FxHashSet<FileId> {
-    let mut dirty = FxHashSet::default();
+pub fn remap_into_file(db: &mut DbIndex, remap: &FileRemap) -> HashSet<FileId> {
+    let mut dirty = HashSet::default();
     if remap.map.is_identity() {
         return dirty;
     }

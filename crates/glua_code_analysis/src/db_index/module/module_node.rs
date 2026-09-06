@@ -1,11 +1,11 @@
-use rustc_hash::FxHashMap;
+use std::collections::HashMap;
 
 use crate::FileId;
 
 #[derive(Debug, Default)]
 pub struct ModuleNode {
     pub parent: Option<ModuleNodeId>,
-    pub children: FxHashMap<String, ModuleNodeId>,
+    pub children: HashMap<String, ModuleNodeId>,
     pub file_ids: Vec<FileId>,
 }
 

@@ -1,4 +1,5 @@
 use rustc_hash::FxHashMap;
+use std::collections::HashMap;
 
 use rowan::NodeCache;
 
@@ -16,7 +17,7 @@ impl<'cache> ParserConfig<'cache> {
     pub fn new(
         level: LuaLanguageLevel,
         node_cache: Option<&'cache mut NodeCache>,
-        special_like: FxHashMap<String, SpecialFunction>,
+        special_like: HashMap<String, SpecialFunction>,
         non_std_symbols: LuaNonStdSymbolSet,
         enable_emmylua_doc: bool,
     ) -> Self {
@@ -27,7 +28,7 @@ impl<'cache> ParserConfig<'cache> {
                 non_std_symbols,
             },
             node_cache,
-            special_like,
+            special_like: special_like.into_iter().collect(),
             enable_emmylua_doc,
         }
     }

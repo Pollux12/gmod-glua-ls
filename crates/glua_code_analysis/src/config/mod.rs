@@ -6,7 +6,7 @@ mod pre_process;
 #[cfg(test)]
 mod test;
 
-use rustc_hash::FxHashMap as HashMap;
+use std::collections::HashMap;
 use std::path::Path;
 
 pub use config_loader::{ConfigLoadError, load_configs, load_configs_raw, try_load_configs};

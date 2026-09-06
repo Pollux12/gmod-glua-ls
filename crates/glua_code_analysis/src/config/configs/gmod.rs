@@ -1,4 +1,6 @@
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::{HashMap, HashSet};
+
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::hash::Hash;
 use std::path::Path;
 use std::sync::Arc;
@@ -992,7 +994,7 @@ fn merge_scripted_class_definitions(
         .iter()
         .enumerate()
         .map(|(idx, definition)| (definition.id.clone(), idx))
-        .collect::<HashMap<_, _>>();
+        .collect::<FxHashMap<_, _>>();
     let mut synthetic_legacy_id = 0usize;
 
     for entry in entries {
@@ -1067,7 +1069,7 @@ fn merge_scripted_class_definitions(
         }
     }
 
-    let mut seen = HashSet::default();
+    let mut seen = FxHashSet::default();
     resolved.retain(|definition| seen.insert(definition.id.clone()));
 
     if !legacy_include.is_empty() && !has_definition_entries {
@@ -1440,7 +1442,7 @@ impl EmmyrcGmodScriptedClassScopes {
     }
 
     pub fn hook_owner_globals(&self) -> Vec<String> {
-        let mut seen = HashSet::default();
+        let mut seen = FxHashSet::default();
         let mut globals = Vec::new();
 
         for definition in self

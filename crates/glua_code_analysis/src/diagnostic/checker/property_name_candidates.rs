@@ -1,4 +1,4 @@
-use rustc_hash::FxHashSet;
+use std::collections::HashSet;
 
 use crate::{DbIndex, LuaSemanticDeclId};
 
@@ -10,9 +10,9 @@ use super::readonly_check::property_can_report_readonly;
 /// the property index, so it is the same for every file in a run.
 #[derive(Debug, Default)]
 pub struct PrecomputedPropertyNameCandidates {
-    pub deprecated: FxHashSet<String>,
-    pub readonly: FxHashSet<String>,
-    pub access_invisible: FxHashSet<String>,
+    pub deprecated: HashSet<String>,
+    pub readonly: HashSet<String>,
+    pub access_invisible: HashSet<String>,
 }
 
 pub fn precompute_property_name_candidates(db: &DbIndex) -> PrecomputedPropertyNameCandidates {
