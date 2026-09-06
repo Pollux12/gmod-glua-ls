@@ -731,8 +731,10 @@ impl DirtySet {
     /// Takes the sideband textual refresh names out of the set, so a caller
     /// can schedule their diagnostics without holding on to the ripple's
     /// re-index work.
-    pub fn take_textual_refresh_names(&mut self) -> FxHashSet<SmolStr> {
+    pub fn take_textual_refresh_names(&mut self) -> std::collections::HashSet<SmolStr> {
         std::mem::take(&mut self.textual_refresh_names)
+            .into_iter()
+            .collect()
     }
 
     /// How many sideband textual refresh names the set carries.
@@ -1436,9 +1438,9 @@ impl EmmyLuaAnalysis {
     pub fn ripple_with_refresh_names(
         &mut self,
         mut dirty: DirtySet,
-    ) -> (Vec<FileId>, FxHashSet<SmolStr>) {
+    ) -> (Vec<FileId>, std::collections::HashSet<SmolStr>) {
         if dirty.is_empty() {
-            return (Vec::new(), FxHashSet::default());
+            return (Vec::new(), Default::default());
         }
         self.compilation
             .get_db_mut()
@@ -1621,7 +1623,7 @@ impl EmmyLuaAnalysis {
         });
         reanalyzed.sort_unstable();
         reanalyzed.dedup();
-        (reanalyzed, sideband)
+        (reanalyzed, sideband.into_iter().collect())
     }
 
     /// Rebuilds only these files' own index entries.
@@ -1866,8 +1868,8 @@ impl EmmyLuaAnalysis {
     /// stays visible.
     pub fn textual_refresh_candidates(
         &self,
-        names: &FxHashSet<SmolStr>,
-        exclude: &FxHashSet<FileId>,
+        names: &std::collections::HashSet<SmolStr>,
+        exclude: &std::collections::HashSet<FileId>,
     ) -> Vec<FileId> {
         if names.is_empty() {
             return Vec::new();
@@ -2321,7 +2323,8 @@ impl EmmyLuaAnalysis {
         // Cloned before the ripple consumes `dirty`: diagnosing under a shared
         // borrow mutates nothing, so these names must not travel in the dirty
         // set itself.
-        let refresh_names = dirty.textual_refresh_names.clone();
+        let refresh_names: std::collections::HashSet<SmolStr> =
+            dirty.textual_refresh_names.iter().cloned().collect();
         let mut affected = changed;
         let (rippled, ripple_names) = self.ripple_with_refresh_names(dirty);
         affected.extend(rippled);
@@ -2332,7 +2335,7 @@ impl EmmyLuaAnalysis {
         {
             let mut all_names = refresh_names;
             all_names.extend(ripple_names);
-            let exclude: FxHashSet<FileId> = affected.iter().copied().collect();
+            let exclude: std::collections::HashSet<FileId> = affected.iter().copied().collect();
             let textual = self.textual_refresh_candidates(&all_names, &exclude);
             affected.extend(textual);
         }
