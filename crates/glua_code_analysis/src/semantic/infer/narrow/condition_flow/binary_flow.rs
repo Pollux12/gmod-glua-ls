@@ -23,9 +23,7 @@ use crate::{
                 var_ref_id::{get_var_expr_var_ref_id, unknown_prefix_should_widen_to_any},
             },
         },
-        member::{
-            cached_local_class_table_member_ids, find_members_with_key, infer_raw_member_type,
-        },
+        member::{find_members_with_key, infer_raw_member_type, local_class_table_member_ids},
     },
 };
 
@@ -627,7 +625,7 @@ fn infer_local_class_table_member_type(
         _ => return None,
     };
 
-    let member_ids = cached_local_class_table_member_ids(db, cache, type_id, member_key);
+    let member_ids = local_class_table_member_ids(db, type_id, member_key);
     match member_ids.as_slice() {
         [] => None,
         [member_id] => crate::LuaMemberIndexItem::One(*member_id)
