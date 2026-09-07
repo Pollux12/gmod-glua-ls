@@ -312,9 +312,36 @@ impl NetHelperNameMemo {
     }
 }
 
+/// Inputs a file's network flows were collected from (B8).
+///
+/// The network pass recollects its batch every analyze; files whose own tree,
+/// expanded helpers and helper-registry fold are all unchanged keep their
+/// stored flows instead. `helper_contents` is sorted by `(file id, range)` so
+/// the comparison is deterministic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkFileInputs {
+    /// Hash of the file's own content at collect time.
+    pub content_hash: u64,
+    /// Identity of the helper-registry/call-role fold the collection
+    /// resolved helpers through (the fold's `Arc` address: a reused fold
+    /// keeps its allocation, a rebuild does not).
+    pub registry_identity: usize,
+    /// Cross-file helper bodies expanded while collecting, with their
+    /// content hashes at collect time. Same-file expansions are covered by
+    /// `content_hash`.
+    pub helper_contents: Vec<(FileId, TextRange, Option<u64>)>,
+}
+
 #[derive(Debug, Default)]
 pub struct GmodNetworkIndex {
     file_data: FxHashMap<FileId, FileNetworkData>,
+    file_inputs: FxHashMap<FileId, NetworkFileInputs>,
+    /// Data (plus inputs) parked by `remove` while its file is re-analysed.
+    /// `remove` runs before every re-index, so dropping here would force the
+    /// network pass to recollect files whose inputs never changed; the pass
+    /// restores retained entries and prunes the rest (deleted files).
+    staged_data: FxHashMap<FileId, FileNetworkData>,
+    staged_inputs: FxHashMap<FileId, NetworkFileInputs>,
     send_flows_by_message: FxHashMap<String, Vec<(FileId, usize)>>,
     receive_flows_by_message: FxHashMap<String, Vec<(FileId, usize)>>,
     materialized_definition_counts: FxHashMap<(FileId, TextRange), usize>,
@@ -334,6 +361,9 @@ impl GmodNetworkIndex {
     pub fn new() -> Self {
         Self {
             file_data: FxHashMap::default(),
+            file_inputs: FxHashMap::default(),
+            staged_data: FxHashMap::default(),
+            staged_inputs: FxHashMap::default(),
             send_flows_by_message: FxHashMap::default(),
             receive_flows_by_message: FxHashMap::default(),
             materialized_definition_counts: FxHashMap::default(),
@@ -400,12 +430,71 @@ impl GmodNetworkIndex {
 
     pub fn add_file_data(&mut self, file_id: FileId, data: FileNetworkData) {
         self.remove_file(file_id);
+        // Fresh facts supersede anything parked for this file: without this a
+        // recollect would leave its own pre-edit data staged behind it.
+        self.staged_data.remove(&file_id);
+        self.staged_inputs.remove(&file_id);
         self.index_file_data(file_id, &data);
         self.file_data.insert(file_id, data);
     }
 
     pub fn get_file_data(&self, file_id: FileId) -> Option<&FileNetworkData> {
         self.file_data.get(&file_id)
+    }
+
+    /// Records the inputs `data` was collected from. Always paired with
+    /// [`Self::add_file_data`] (including for empty data, so files without
+    /// flows are retainable too).
+    pub fn set_file_inputs(&mut self, file_id: FileId, inputs: NetworkFileInputs) {
+        self.file_inputs.insert(file_id, inputs);
+    }
+
+    pub fn get_file_inputs(&self, file_id: FileId) -> Option<&NetworkFileInputs> {
+        self.file_inputs.get(&file_id)
+    }
+
+    /// Inputs parked by [`Self::remove_file`] while the file is re-analysed.
+    pub fn staged_file_inputs(&self, file_id: FileId) -> Option<&NetworkFileInputs> {
+        self.staged_inputs.get(&file_id)
+    }
+
+    /// Restores data parked by [`Self::remove_file`]. The staged entry is
+    /// re-indexed exactly as [`Self::add_file_data`] would index it, so
+    /// `materialized_definition_counts` (a cross-file refcount) and the
+    /// per-message indexes come back whole. Returns whether anything was
+    /// restored.
+    pub fn restore_staged_file(&mut self, file_id: FileId) -> bool {
+        let Some(data) = self.staged_data.remove(&file_id) else {
+            // No parked data, but parked inputs may still describe a file
+            // whose last collection found no flows — adopt them so the file
+            // stays retainable without recollecting.
+            if let Some(inputs) = self.staged_inputs.remove(&file_id) {
+                self.file_inputs.insert(file_id, inputs);
+            }
+            return false;
+        };
+        let inputs = self.staged_inputs.remove(&file_id);
+        self.index_file_data(file_id, &data);
+        self.file_data.insert(file_id, data);
+        if let Some(inputs) = inputs {
+            self.file_inputs.insert(file_id, inputs);
+        }
+        true
+    }
+
+    /// Drops a parked entry without restoring it, after a fresh collection
+    /// (or a retain decision that found nothing to keep) superseded it.
+    pub fn drop_staged_file(&mut self, file_id: FileId) {
+        self.staged_data.remove(&file_id);
+        self.staged_inputs.remove(&file_id);
+    }
+
+    /// Drops parked entries for files that no longer exist. Called at the end
+    /// of the network pass: anything still parked then belongs to a deleted
+    /// file (live files are either recollected or restored above).
+    pub fn prune_staged_dead_files(&mut self, is_live: impl Fn(FileId) -> bool) {
+        self.staged_data.retain(|file_id, _| is_live(*file_id));
+        self.staged_inputs.retain(|file_id, _| is_live(*file_id));
     }
 
     /// File ids in canonical order. `file_data` is a `RandomState` map, so
@@ -499,13 +588,27 @@ impl GmodNetworkIndex {
     }
 
     pub fn remove_file(&mut self, file_id: FileId) {
+        // Park rather than drop: `remove` runs before every re-index, and the
+        // network pass restores the entry when the file's inputs prove it
+        // still describes the file (see `restore_staged_file`). De-indexing
+        // first keeps `materialized_definition_counts` exact while parked —
+        // restoring re-indexes — and `add_file_data` stays idempotent per
+        // file: it re-parks (a no-op, nothing is live) and then clears the
+        // parked entry it just superseded.
         if let Some(data) = self.file_data.remove(&file_id) {
             self.remove_file_data_indexes(file_id, &data);
+            self.staged_data.insert(file_id, data);
+        }
+        if let Some(inputs) = self.file_inputs.remove(&file_id) {
+            self.staged_inputs.insert(file_id, inputs);
         }
     }
 
     pub fn clear(&mut self) {
         self.file_data.clear();
+        self.file_inputs.clear();
+        self.staged_data.clear();
+        self.staged_inputs.clear();
         self.send_flows_by_message.clear();
         self.receive_flows_by_message.clear();
         self.materialized_definition_counts.clear();
@@ -767,5 +870,147 @@ mod tests {
 
         let flows = index.get_send_flows_for_message("SharedMessage");
         assert_eq!(flows.len(), 2);
+    }
+
+    fn test_inputs(content_hash: u64) -> NetworkFileInputs {
+        NetworkFileInputs {
+            content_hash,
+            registry_identity: 1,
+            helper_contents: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn remove_parks_data_and_inputs_for_restore() {
+        let file_id = FileId::new(11);
+        let mut index = GmodNetworkIndex::new();
+        index.add_file_data(
+            file_id,
+            FileNetworkData {
+                send_flows: vec![send_flow("Parked", 1)],
+                receive_flows: Vec::new(),
+            },
+        );
+        index.set_file_inputs(file_id, test_inputs(7));
+
+        index.remove_file(file_id);
+        // Parked entries stay invisible to every reader.
+        assert!(index.get_file_data(file_id).is_none());
+        assert!(index.get_file_inputs(file_id).is_none());
+        assert!(index.get_send_flows_for_message("Parked").is_empty());
+
+        assert!(index.restore_staged_file(file_id));
+        assert_eq!(
+            index
+                .get_file_data(file_id)
+                .expect("restored data")
+                .send_flows
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .get_file_inputs(file_id)
+                .map(|inputs| inputs.content_hash),
+            Some(7)
+        );
+        assert_eq!(index.get_send_flows_for_message("Parked").len(), 1);
+    }
+
+    #[test]
+    fn restore_reindexes_materialized_definition_counts() {
+        let definition_file_id = FileId::new(12);
+        let call_file_id = FileId::new(13);
+        let definition_start = range(10);
+        let mut materialized = send_flow("StagedWrapped", 30);
+        materialized.materialized_from = Some(NetFlowOrigin {
+            file_id: definition_file_id,
+            start_range: definition_start,
+        });
+
+        let mut index = GmodNetworkIndex::new();
+        index.add_file_data(
+            definition_file_id,
+            FileNetworkData {
+                send_flows: vec![send_flow("StagedWrapped", 10)],
+                receive_flows: Vec::new(),
+            },
+        );
+        index.set_file_inputs(definition_file_id, test_inputs(1));
+        index.add_file_data(
+            call_file_id,
+            FileNetworkData {
+                send_flows: vec![materialized],
+                receive_flows: Vec::new(),
+            },
+        );
+        index.set_file_inputs(call_file_id, test_inputs(2));
+
+        // Parking the call file drops its refcount, so the definition shows
+        // again; restoring brings the replacement back exactly once.
+        index.remove_file(call_file_id);
+        let flows = index.get_send_flows_for_message("StagedWrapped");
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].0, definition_file_id);
+
+        assert!(index.restore_staged_file(call_file_id));
+        let flows = index.get_send_flows_for_message("StagedWrapped");
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].0, call_file_id);
+
+        // Restoring twice must not double-count the refcount.
+        assert!(!index.restore_staged_file(call_file_id));
+        let flows = index.get_send_flows_for_message("StagedWrapped");
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].0, call_file_id);
+    }
+
+    #[test]
+    fn fresh_add_supersedes_parked_entry() {
+        let file_id = FileId::new(14);
+        let mut index = GmodNetworkIndex::new();
+        index.add_file_data(
+            file_id,
+            FileNetworkData {
+                send_flows: vec![send_flow("OldParked", 1)],
+                receive_flows: Vec::new(),
+            },
+        );
+        index.set_file_inputs(file_id, test_inputs(3));
+        index.remove_file(file_id);
+
+        index.add_file_data(
+            file_id,
+            FileNetworkData {
+                send_flows: vec![send_flow("NewLive", 5)],
+                receive_flows: Vec::new(),
+            },
+        );
+        assert!(index.get_send_flows_for_message("OldParked").is_empty());
+        assert_eq!(index.get_send_flows_for_message("NewLive").len(), 1);
+        assert!(!index.restore_staged_file(file_id));
+    }
+
+    #[test]
+    fn prune_drops_only_dead_parked_files() {
+        let live_id = FileId::new(15);
+        let dead_id = FileId::new(16);
+        let mut index = GmodNetworkIndex::new();
+        for file_id in [live_id, dead_id] {
+            index.add_file_data(
+                file_id,
+                FileNetworkData {
+                    send_flows: vec![send_flow("PruneMe", file_id.id)],
+                    receive_flows: Vec::new(),
+                },
+            );
+            index.set_file_inputs(file_id, test_inputs(u64::from(file_id.id)));
+            index.remove_file(file_id);
+        }
+
+        index.prune_staged_dead_files(|file_id| file_id == live_id);
+        assert!(index.restore_staged_file(live_id));
+        assert!(!index.restore_staged_file(dead_id));
+        assert!(index.staged_file_inputs(dead_id).is_none());
     }
 }
