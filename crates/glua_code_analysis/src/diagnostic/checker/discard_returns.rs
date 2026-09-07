@@ -53,7 +53,6 @@ impl Checker for DiscardReturnsChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::DiscardReturns];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
         let candidates = context
             .get_shared_data_arc()
             .map(|shared_data| shared_data.nodiscard_candidates.clone())
@@ -62,7 +61,10 @@ impl Checker for DiscardReturnsChecker {
             return;
         }
 
-        for call_expr_stat in root.descendants::<LuaCallExprStat>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for call_expr_stat in buckets.call_expr_stats.iter().cloned() {
             check_call_expr(context, semantic_model, call_expr_stat, &candidates);
         }
     }

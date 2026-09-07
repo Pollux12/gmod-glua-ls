@@ -16,7 +16,10 @@ impl Checker for CallNonCallableChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::CallNonCallable];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        for call_expr in semantic_model.get_root().descendants::<LuaCallExpr>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for call_expr in buckets.call_exprs.iter().cloned() {
             check_call_expr(context, semantic_model, call_expr);
         }
     }

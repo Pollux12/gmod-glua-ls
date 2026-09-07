@@ -278,17 +278,17 @@ pub fn infer_call_arg_expr_list_types(
     cache: &mut LuaInferCache,
     call_expr: LuaCallExpr,
     var_count: Option<usize>,
-) -> Vec<(LuaType, TextRange)> {
+) -> Arc<Vec<(LuaType, TextRange)>> {
     let key = (call_expr.get_syntax_id(), var_count);
     if let Some(types) = cache.call_arg_types_cache.get(&key) {
-        return types.as_ref().clone();
+        return types.clone();
     }
     if let Some(var_count) = var_count {
         let full_key = (call_expr.get_syntax_id(), None);
         if let Some(types) = cache.call_arg_types_cache.get(&full_key)
             && types.len() >= var_count
         {
-            return types[..var_count].to_vec();
+            return Arc::new(types[..var_count].to_vec());
         }
     }
 
@@ -302,10 +302,9 @@ pub fn infer_call_arg_expr_list_types(
             .ok()
         })
         .unwrap_or_default();
-    cache
-        .call_arg_types_cache
-        .insert(key, Arc::new(types.clone()));
-    types
+    let shared = Arc::new(types);
+    cache.call_arg_types_cache.insert(key, shared.clone());
+    shared
 }
 
 pub fn infer_expr_list_types<F>(

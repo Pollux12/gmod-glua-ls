@@ -1,9 +1,8 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use glua_parser::{
-    BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaBlock, LuaCallExpr,
-    LuaClosureExpr, LuaExpr, LuaIfStat, LuaLiteralToken, LuaLocalStat, LuaNameExpr, LuaStat,
-    LuaTableField, UnaryOperator,
+    BinaryOperator, LuaAstNode, LuaBinaryExpr, LuaBlock, LuaCallExpr, LuaClosureExpr, LuaExpr,
+    LuaIfStat, LuaLiteralToken, LuaLocalStat, LuaNameExpr, LuaStat, UnaryOperator,
 };
 use rowan::{TextRange, TextSize};
 
@@ -12,7 +11,7 @@ use crate::{
     SemanticModel, semantic::unwrap_paren_to_name_expr,
 };
 
-use super::{Checker, DiagnosticContext};
+use super::{Checker, DiagnosticContext, FileNodeBuckets};
 
 pub struct UndefinedGlobalChecker;
 
@@ -23,9 +22,11 @@ impl Checker for UndefinedGlobalChecker {
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
         let mut use_range_set = HashSet::default();
-        let guarded_range_set = calc_guarded_name_expr_ranges(semantic_model);
+        let guarded_range_set = calc_guarded_name_expr_ranges(semantic_model, &buckets);
         // Positions where an undefined-global read is "silent" (the read itself
         // can't crash; the resulting nil just propagates). We demote these from
         // `UndefinedGlobal` (Error) to `UndefinedGlobalAssignment` (Warning):
@@ -33,9 +34,9 @@ impl Checker for UndefinedGlobalChecker {
         //   * RHS of an assignment:        `x = UNDEF`, `local x = UNDEF`,
         //                                   `t.x = UNDEF`, `{ k = UNDEF }`
         //   * names reached through `or`/`and`/parens in those positions
-        let silent_use_ranges = calc_silent_use_name_expr_ranges(&root);
+        let silent_use_ranges = calc_silent_use_name_expr_ranges(&buckets);
         calc_name_expr_ref(semantic_model, &mut use_range_set);
-        for name_expr in root.descendants::<LuaNameExpr>() {
+        for name_expr in buckets.name_exprs.iter().cloned() {
             check_name_expr(
                 context,
                 semantic_model,
@@ -48,11 +49,13 @@ impl Checker for UndefinedGlobalChecker {
     }
 }
 
-fn calc_guarded_name_expr_ranges(semantic_model: &SemanticModel) -> HashSet<TextRange> {
+fn calc_guarded_name_expr_ranges(
+    semantic_model: &SemanticModel,
+    buckets: &FileNodeBuckets,
+) -> HashSet<TextRange> {
     let mut guarded_ranges = HashSet::default();
-    let root = semantic_model.get_root();
 
-    for if_stat in root.descendants::<LuaIfStat>() {
+    for if_stat in &buckets.if_stats {
         if let (Some(condition), Some(block)) = (if_stat.get_condition_expr(), if_stat.get_block())
         {
             collect_clause_guarded_name_ranges(
@@ -80,10 +83,10 @@ fn calc_guarded_name_expr_ranges(semantic_model: &SemanticModel) -> HashSet<Text
 
     guarded_ranges.extend(calc_continuation_guarded_name_expr_ranges(
         semantic_model,
-        root,
+        buckets,
     ));
 
-    for binary_expr in root.descendants::<LuaBinaryExpr>() {
+    for binary_expr in &buckets.binary_exprs {
         collect_short_circuit_guarded_name_expr_ranges(
             semantic_model,
             &binary_expr,
@@ -102,12 +105,12 @@ struct ContinuationGuardRule {
 
 fn calc_continuation_guarded_name_expr_ranges(
     semantic_model: &SemanticModel,
-    root: &glua_parser::LuaChunk,
+    buckets: &FileNodeBuckets,
 ) -> HashSet<TextRange> {
     let mut guarded_ranges = HashSet::default();
     let mut guard_rules_by_name = HashMap::<String, Vec<ContinuationGuardRule>>::default();
 
-    for block in root.descendants::<LuaBlock>() {
+    for block in &buckets.blocks {
         let block_range = block.get_range();
         for stat in block.get_stats() {
             let LuaStat::IfStat(if_stat) = stat else {
@@ -134,7 +137,7 @@ fn calc_continuation_guarded_name_expr_ranges(
         return guarded_ranges;
     }
 
-    for name_expr in root.descendants::<LuaNameExpr>() {
+    for name_expr in &buckets.name_exprs {
         let expr_range = name_expr.get_range();
         let Some(name_text) = name_expr.get_name_text() else {
             continue;
@@ -850,11 +853,11 @@ fn collect_silent_assignment_rhs_names(expr: &LuaExpr, ranges: &mut HashSet<Text
     }
 }
 
-fn calc_silent_use_name_expr_ranges(root: &glua_parser::LuaChunk) -> HashSet<TextRange> {
+fn calc_silent_use_name_expr_ranges(buckets: &FileNodeBuckets) -> HashSet<TextRange> {
     let mut ranges = HashSet::default();
 
     // Direct call arguments: `f(UNDEF)` and `f((UNDEF))`.
-    for call_expr in root.descendants::<LuaCallExpr>() {
+    for call_expr in &buckets.call_exprs {
         let Some(args_list) = call_expr.get_args_list() else {
             continue;
         };
@@ -867,7 +870,7 @@ fn calc_silent_use_name_expr_ranges(root: &glua_parser::LuaChunk) -> HashSet<Tex
 
     // RHS of assignments: `x = UNDEF`, `t.x, y = UNDEF, OTHER`, plus names
     // reached through `or`/`and`/parens (e.g. `local m = ModA or ModB`).
-    for assign_stat in root.descendants::<LuaAssignStat>() {
+    for assign_stat in &buckets.assign_stats {
         let (_vars, exprs) = assign_stat.get_var_and_expr_list();
         for expr in &exprs {
             collect_silent_assignment_rhs_names(expr, &mut ranges);
@@ -875,7 +878,7 @@ fn calc_silent_use_name_expr_ranges(root: &glua_parser::LuaChunk) -> HashSet<Tex
     }
 
     // RHS of `local` declarations: `local x = UNDEF`, `local x = A or B`.
-    for local_stat in root.descendants::<LuaLocalStat>() {
+    for local_stat in &buckets.local_stats {
         for expr in local_stat.get_value_exprs() {
             collect_silent_assignment_rhs_names(&expr, &mut ranges);
         }
@@ -884,7 +887,7 @@ fn calc_silent_use_name_expr_ranges(root: &glua_parser::LuaChunk) -> HashSet<Tex
     // Table constructor field values: `{ k = UNDEF }`, `{ k = A or B }`. Same
     // silent-nil-bind semantics as a regular assignment, so route through the
     // OR/AND-aware collector rather than only matching bare names.
-    for field in root.descendants::<LuaTableField>() {
+    for field in &buckets.table_fields {
         if let Some(value_expr) = field.get_value_expr() {
             collect_silent_assignment_rhs_names(&value_expr, &mut ranges);
         }

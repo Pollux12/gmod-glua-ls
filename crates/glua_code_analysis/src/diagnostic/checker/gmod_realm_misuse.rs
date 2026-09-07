@@ -151,7 +151,10 @@ impl Checker for GmodRealmMisuseChecker {
         let profile_enabled = log::log_enabled!(log::Level::Info);
         let mut profile = profile_enabled.then(GmodRealmMisuseProfile::default);
 
-        for call_expr in semantic_model.get_root().descendants::<LuaCallExpr>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for call_expr in buckets.call_exprs.iter() {
             if context.is_cancelled() {
                 return;
             }
@@ -176,7 +179,7 @@ impl Checker for GmodRealmMisuseChecker {
             }
             if let Some(candidates) = realm_call_candidates
                 && let Some(should_check) =
-                    should_check_static_realm_call(&call_expr, call_realm, candidates, decl_tree)
+                    should_check_static_realm_call(call_expr, call_realm, candidates, decl_tree)
                 && !should_check
             {
                 if let Some(profile) = profile.as_mut() {
@@ -188,7 +191,7 @@ impl Checker for GmodRealmMisuseChecker {
             let mut callee_realms = resolve_callee_realms(
                 context,
                 semantic_model,
-                &call_expr,
+                call_expr,
                 call_realm,
                 &gm_method_realms,
                 &mut decl_realm_cache,

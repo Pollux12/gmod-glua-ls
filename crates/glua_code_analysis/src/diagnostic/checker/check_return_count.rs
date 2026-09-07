@@ -17,10 +17,12 @@ impl Checker for CheckReturnCount {
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
 
-        for closure_expr in root.descendants::<LuaClosureExpr>() {
-            check_missing_return(context, semantic_model, &closure_expr);
+        for closure_expr in buckets.closure_exprs.iter() {
+            check_missing_return(context, semantic_model, closure_expr);
         }
     }
 }

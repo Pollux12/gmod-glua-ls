@@ -19,10 +19,12 @@ impl Checker for CheckExportChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::InjectField, DiagnosticCode::UndefinedField];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
         let mut checked_index_expr = HashSet::default();
         let mut exported_key_cache: ExportedKeyCache = HashMap::default();
-        for node in root.descendants::<LuaAst>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for node in buckets.all_nodes.iter().cloned() {
             if context.is_cancelled() {
                 return;
             }

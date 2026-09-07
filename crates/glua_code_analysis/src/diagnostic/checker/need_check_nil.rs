@@ -36,7 +36,10 @@ impl Checker for NeedCheckNilChecker {
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
         let assignment_prefixes = context.get_assignment_prefix_events(&root);
-        for expr in root.descendants::<LuaExpr>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for expr in buckets.exprs.iter().cloned() {
             match expr {
                 LuaExpr::CallExpr(call_expr) => {
                     check_call_expr(context, semantic_model, call_expr);
@@ -51,7 +54,7 @@ impl Checker for NeedCheckNilChecker {
             }
         }
 
-        for node in root.descendants::<LuaAst>() {
+        for node in buckets.all_nodes.iter().cloned() {
             match node {
                 LuaAst::LuaIfStat(if_stat) => {
                     if let Some(condition) = if_stat.get_condition_expr() {

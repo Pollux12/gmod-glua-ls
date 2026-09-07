@@ -20,12 +20,14 @@ impl Checker for ReturnTypeMismatch {
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-        for closure_expr in root.descendants::<LuaClosureExpr>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for closure_expr in buckets.closure_exprs.iter() {
             if context.is_cancelled() {
                 return;
             }
-            check_closure_expr(context, semantic_model, &closure_expr);
+            check_closure_expr(context, semantic_model, closure_expr);
         }
     }
 }

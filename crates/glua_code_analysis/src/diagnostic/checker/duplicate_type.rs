@@ -1,6 +1,4 @@
-use glua_parser::{
-    LuaAstNode, LuaAstToken, LuaDocTag, LuaDocTagAlias, LuaDocTagClass, LuaDocTagEnum,
-};
+use glua_parser::{LuaAstToken, LuaDocTag, LuaDocTagAlias, LuaDocTagClass, LuaDocTagEnum};
 
 use crate::{DiagnosticCode, LuaTypeFlag, SemanticModel};
 
@@ -11,9 +9,11 @@ pub struct DuplicateTypeChecker;
 impl Checker for DuplicateTypeChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::DuplicateType];
 
-    fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-        for tag in root.descendants::<LuaDocTag>() {
+    fn check(context: &mut DiagnosticContext, _semantic_model: &SemanticModel) {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for tag in buckets.doc_tags.iter().cloned() {
             match tag {
                 LuaDocTag::Class(class_tag) => {
                     check_duplicate_class(context, class_tag);

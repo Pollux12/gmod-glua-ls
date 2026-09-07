@@ -13,8 +13,10 @@ impl Checker for EnumValueMismatchChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::EnumValueMismatch];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-        for node in root.descendants::<LuaAst>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for node in buckets.all_nodes.iter().cloned() {
             let condition_expr = match node {
                 LuaAst::LuaIfStat(if_stat) => if_stat.get_condition_expr(),
                 LuaAst::LuaElseIfClauseStat(elseif_stat) => elseif_stat.get_condition_expr(),

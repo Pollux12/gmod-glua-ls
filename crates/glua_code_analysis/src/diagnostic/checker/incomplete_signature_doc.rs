@@ -15,9 +15,11 @@ impl Checker for IncompleteSignatureDocChecker {
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root();
-        for closure_expr in root.descendants::<LuaClosureExpr>() {
-            check_doc(context, semantic_model, &closure_expr);
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for closure_expr in buckets.closure_exprs.iter() {
+            check_doc(context, semantic_model, closure_expr);
         }
     }
 }

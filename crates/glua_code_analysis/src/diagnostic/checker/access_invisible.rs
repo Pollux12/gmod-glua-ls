@@ -20,13 +20,15 @@ impl Checker for AccessInvisibleChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::AccessInvisible];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
         let candidates = AccessInvisibleCandidates::new(context, semantic_model.get_db());
         if candidates.is_empty() {
             return;
         }
 
-        for node in root.descendants::<LuaAst>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for node in buckets.all_nodes.iter().cloned() {
             match node {
                 LuaAst::LuaNameExpr(name_expr) => {
                     check_name_expr(context, semantic_model, name_expr, &candidates);

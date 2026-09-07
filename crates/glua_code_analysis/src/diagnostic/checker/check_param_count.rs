@@ -21,7 +21,10 @@ impl Checker for CheckParamCountChecker {
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        for node in semantic_model.get_root().descendants::<LuaAst>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for node in buckets.all_nodes.iter().cloned() {
             match node {
                 LuaAst::LuaCallExpr(call_expr) => {
                     check_call_expr(context, semantic_model, call_expr);

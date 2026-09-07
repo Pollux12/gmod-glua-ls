@@ -1,4 +1,4 @@
-use glua_parser::{LuaAstNode, LuaExpr, LuaIfStat};
+use glua_parser::{LuaAstNode, LuaExpr};
 
 use crate::{DiagnosticCode, SemanticModel};
 
@@ -10,8 +10,10 @@ impl Checker for UnnecessaryIfChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::UnnecessaryIf];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-        for if_statement in root.descendants::<LuaIfStat>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for if_statement in buckets.if_stats.iter() {
             if let Some(condition) = if_statement.get_condition_expr() {
                 check_condition(context, semantic_model, condition);
             }

@@ -27,7 +27,6 @@ impl Checker for ParamTypeCheckChecker {
 
     /// a simple implementation of param type check, later we will do better
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
         let candidates = context
             .get_shared_data_arc()
             .map(|shared_data| shared_data.param_type_candidates.clone())
@@ -35,7 +34,10 @@ impl Checker for ParamTypeCheckChecker {
         let profile_enabled = log::log_enabled!(log::Level::Info);
         let mut profile = profile_enabled.then(ParamTypeCheckProfile::default);
 
-        for call_expr in root.descendants::<LuaCallExpr>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for call_expr in buckets.call_exprs.iter().cloned() {
             if context.is_cancelled() {
                 return;
             }
@@ -49,6 +51,7 @@ impl Checker for ParamTypeCheckChecker {
                 call_expr,
                 &candidates,
                 profile.as_mut(),
+                &buckets.assign_stats,
             );
             if let (Some(profile), Some(call_start)) = (profile.as_mut(), call_start) {
                 profile.total_call_time += call_start.elapsed();
@@ -385,6 +388,7 @@ fn check_call_expr(
     call_expr: LuaCallExpr,
     candidates: &PrecomputedParamTypeCandidates,
     mut profile: Option<&mut ParamTypeCheckProfile>,
+    assign_stats: &[LuaAssignStat],
 ) -> Option<()> {
     if context.is_cancelled() {
         return Some(());
@@ -441,7 +445,7 @@ fn check_call_expr(
         profile.infer_arg_time += infer_arg_start.elapsed();
     }
     let (mut arg_types, mut arg_ranges): (Vec<LuaType>, Vec<TextRange>) =
-        arg_infos.into_iter().unzip();
+        arg_infos.iter().cloned().unzip();
 
     match (colon_call, colon_define) {
         (true, true) | (false, false) => {}
@@ -577,6 +581,7 @@ fn check_call_expr(
                         semantic_model,
                         index_expr,
                         &check_type,
+                        assign_stats,
                     )
                 {
                     continue;
@@ -802,6 +807,7 @@ fn rewritten_collection_element_matches_param(
     semantic_model: &SemanticModel,
     arg_index_expr: &LuaIndexExpr,
     param_type: &LuaType,
+    assign_stats: &[LuaAssignStat],
 ) -> bool {
     let Some(arg_prefix_expr) = arg_index_expr.get_prefix_expr() else {
         return false;
@@ -822,7 +828,7 @@ fn rewritten_collection_element_matches_param(
     let arg_start = arg_index_expr.get_range().start();
     let mut last_matching_assignment_is_compatible = None;
 
-    for assign_stat in semantic_model.get_root().descendants::<LuaAssignStat>() {
+    for assign_stat in assign_stats {
         if assign_stat.get_range().end() >= arg_start {
             continue;
         }

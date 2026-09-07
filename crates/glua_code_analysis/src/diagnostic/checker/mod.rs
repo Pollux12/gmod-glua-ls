@@ -46,12 +46,15 @@ mod unnecessary_if;
 mod unused;
 
 use glua_parser::{
-    BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaChunk, LuaClosureExpr, LuaComment,
-    LuaExpr, LuaIfStat, LuaIndexExpr, LuaReturnStat, LuaStat, LuaSyntaxKind, LuaSyntaxNode,
+    BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaBinaryExpr, LuaBlock, LuaCallExpr,
+    LuaCallExprStat, LuaChunk, LuaClosureExpr, LuaComment, LuaDocTag, LuaDocTagAttributeUse,
+    LuaDocTagClass, LuaDocTagOther, LuaExpr, LuaIfStat, LuaIndexExpr, LuaLocalStat, LuaNameExpr,
+    LuaReturnStat, LuaStat, LuaSyntaxKind, LuaSyntaxNode, LuaTableExpr, LuaTableField,
     UnaryOperator,
 };
 use lsp_types::{Diagnostic, DiagnosticSeverity, DiagnosticTag, NumberOrString};
 use rowan::{TextRange, TextSize};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -90,6 +93,229 @@ pub type AssignmentPrefixEvents = HashMap<AssignmentPrefixKey, Vec<AssignmentPre
 pub struct AssignmentPrefixEvent {
     pub offset: TextSize,
     pub is_table_literal: bool,
+}
+
+/// Per-file syntax nodes bucketed by kind in a single preorder walk.
+///
+/// Every `descendants::<T>()` filter over the file root visits the whole
+/// tree; with ~45 such walks per file that dominates diagnostics CPU.
+/// `build_file_node_buckets` performs exactly one `descendants::<LuaAst>()`
+/// walk and fans each node out to its typed buckets, all in source order, so
+/// checkers iterate slices instead of re-walking.
+///
+/// Fidelity: each bucket holds exactly what the corresponding
+/// `descendants::<T>()` walk would yield, because both go through the same
+/// `T::cast` on the same nodes in the same preorder. Two node classes are
+/// invisible to `LuaAst::cast` and therefore absent here: `EmptyStat` nodes
+/// (no `LuaAst` variant) and `DocTagVisibility` nodes (no `LuaAst` variant).
+/// Both fall into `_ => {}` arms in the only checkers walking those kinds
+/// (`UnbalancedAssignments`, `DuplicateType`), so no diagnostic changes.
+#[derive(Debug, Default)]
+pub struct FileNodeBuckets {
+    pub all_nodes: Vec<LuaAst>,
+    pub call_exprs: Vec<LuaCallExpr>,
+    pub assign_stats: Vec<LuaAssignStat>,
+    pub local_stats: Vec<LuaLocalStat>,
+    pub closure_exprs: Vec<LuaClosureExpr>,
+    pub name_exprs: Vec<LuaNameExpr>,
+    pub if_stats: Vec<LuaIfStat>,
+    pub table_exprs: Vec<LuaTableExpr>,
+    pub table_fields: Vec<LuaTableField>,
+    pub binary_exprs: Vec<LuaBinaryExpr>,
+    pub blocks: Vec<LuaBlock>,
+    pub call_expr_stats: Vec<LuaCallExprStat>,
+    pub doc_tag_classes: Vec<LuaDocTagClass>,
+    pub statements: Vec<LuaStat>,
+    pub exprs: Vec<LuaExpr>,
+    pub doc_tags: Vec<LuaDocTag>,
+    pub doc_tag_others: Vec<LuaDocTagOther>,
+    pub doc_tag_attribute_uses: Vec<LuaDocTagAttributeUse>,
+}
+
+pub fn build_file_node_buckets(root: &LuaChunk) -> FileNodeBuckets {
+    let mut buckets = FileNodeBuckets::default();
+    for node in root.descendants::<LuaAst>() {
+        push_file_node(&mut buckets, &node);
+        buckets.all_nodes.push(node);
+    }
+    buckets
+}
+
+fn push_file_node(buckets: &mut FileNodeBuckets, node: &LuaAst) {
+    match node {
+        LuaAst::LuaCallExpr(call_expr) => {
+            buckets.call_exprs.push(call_expr.clone());
+            buckets.exprs.push(LuaExpr::CallExpr(call_expr.clone()));
+        }
+        LuaAst::LuaTableExpr(table_expr) => {
+            buckets.table_exprs.push(table_expr.clone());
+            buckets.exprs.push(LuaExpr::TableExpr(table_expr.clone()));
+        }
+        LuaAst::LuaLiteralExpr(literal_expr) => {
+            buckets
+                .exprs
+                .push(LuaExpr::LiteralExpr(literal_expr.clone()));
+        }
+        LuaAst::LuaBinaryExpr(binary_expr) => {
+            buckets.binary_exprs.push(binary_expr.clone());
+            buckets.exprs.push(LuaExpr::BinaryExpr(binary_expr.clone()));
+        }
+        LuaAst::LuaUnaryExpr(unary_expr) => {
+            buckets.exprs.push(LuaExpr::UnaryExpr(unary_expr.clone()));
+        }
+        LuaAst::LuaClosureExpr(closure_expr) => {
+            buckets.closure_exprs.push(closure_expr.clone());
+            buckets
+                .exprs
+                .push(LuaExpr::ClosureExpr(closure_expr.clone()));
+        }
+        LuaAst::LuaParenExpr(paren_expr) => {
+            buckets.exprs.push(LuaExpr::ParenExpr(paren_expr.clone()));
+        }
+        LuaAst::LuaNameExpr(name_expr) => {
+            buckets.name_exprs.push(name_expr.clone());
+            buckets.exprs.push(LuaExpr::NameExpr(name_expr.clone()));
+        }
+        LuaAst::LuaIndexExpr(index_expr) => {
+            buckets.exprs.push(LuaExpr::IndexExpr(index_expr.clone()));
+        }
+        LuaAst::LuaLocalStat(local_stat) => {
+            buckets.local_stats.push(local_stat.clone());
+            buckets
+                .statements
+                .push(LuaStat::LocalStat(local_stat.clone()));
+        }
+        LuaAst::LuaAssignStat(assign_stat) => {
+            buckets.assign_stats.push(assign_stat.clone());
+            buckets
+                .statements
+                .push(LuaStat::AssignStat(assign_stat.clone()));
+        }
+        LuaAst::LuaCallExprStat(call_stat) => {
+            buckets.call_expr_stats.push(call_stat.clone());
+            buckets
+                .statements
+                .push(LuaStat::CallExprStat(call_stat.clone()));
+        }
+        LuaAst::LuaFuncStat(func_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::FuncStat(func_stat.clone()));
+        }
+        LuaAst::LuaLocalFuncStat(local_func_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::LocalFuncStat(local_func_stat.clone()));
+        }
+        LuaAst::LuaIfStat(if_stat) => {
+            buckets.if_stats.push(if_stat.clone());
+            buckets.statements.push(LuaStat::IfStat(if_stat.clone()));
+        }
+        LuaAst::LuaWhileStat(while_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::WhileStat(while_stat.clone()));
+        }
+        LuaAst::LuaDoStat(do_stat) => {
+            buckets.statements.push(LuaStat::DoStat(do_stat.clone()));
+        }
+        LuaAst::LuaForStat(for_stat) => {
+            buckets.statements.push(LuaStat::ForStat(for_stat.clone()));
+        }
+        LuaAst::LuaForRangeStat(for_range_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::ForRangeStat(for_range_stat.clone()));
+        }
+        LuaAst::LuaRepeatStat(repeat_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::RepeatStat(repeat_stat.clone()));
+        }
+        LuaAst::LuaBreakStat(break_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::BreakStat(break_stat.clone()));
+        }
+        LuaAst::LuaReturnStat(return_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::ReturnStat(return_stat.clone()));
+        }
+        LuaAst::LuaGotoStat(goto_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::GotoStat(goto_stat.clone()));
+        }
+        LuaAst::LuaLabelStat(label_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::LabelStat(label_stat.clone()));
+        }
+        LuaAst::LuaGlobalStat(global_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::GlobalStat(global_stat.clone()));
+        }
+        LuaAst::LuaBlock(block) => {
+            buckets.blocks.push(block.clone());
+        }
+        LuaAst::LuaTableField(field) => {
+            buckets.table_fields.push(field.clone());
+        }
+        LuaAst::LuaDocTagClass(class_tag) => {
+            buckets.doc_tag_classes.push(class_tag.clone());
+            buckets.doc_tags.push(LuaDocTag::Class(class_tag.clone()));
+        }
+        LuaAst::LuaDocTagOther(other_tag) => {
+            buckets.doc_tag_others.push(other_tag.clone());
+            buckets.doc_tags.push(LuaDocTag::Other(other_tag.clone()));
+        }
+        LuaAst::LuaDocTagAttributeUse(attribute_use) => {
+            buckets.doc_tag_attribute_uses.push(attribute_use.clone());
+            buckets
+                .doc_tags
+                .push(LuaDocTag::AttributeUse(attribute_use.clone()));
+        }
+        LuaAst::LuaDocTagEnum(_)
+        | LuaAst::LuaDocTagAlias(_)
+        | LuaAst::LuaDocTagAttribute(_)
+        | LuaAst::LuaDocTagType(_)
+        | LuaAst::LuaDocTagParam(_)
+        | LuaAst::LuaDocTagReturn(_)
+        | LuaAst::LuaDocTagOverload(_)
+        | LuaAst::LuaDocTagField(_)
+        | LuaAst::LuaDocTagModule(_)
+        | LuaAst::LuaDocTagSee(_)
+        | LuaAst::LuaDocTagDiagnostic(_)
+        | LuaAst::LuaDocTagDeprecated(_)
+        | LuaAst::LuaDocTagVersion(_)
+        | LuaAst::LuaDocTagCast(_)
+        | LuaAst::LuaDocTagSource(_)
+        | LuaAst::LuaDocTagSchema(_)
+        | LuaAst::LuaDocTagNamespace(_)
+        | LuaAst::LuaDocTagUsing(_)
+        | LuaAst::LuaDocTagMeta(_)
+        | LuaAst::LuaDocTagRealm(_)
+        | LuaAst::LuaDocTagNodiscard(_)
+        | LuaAst::LuaDocTagReadonly(_)
+        | LuaAst::LuaDocTagOperator(_)
+        | LuaAst::LuaDocTagGeneric(_)
+        | LuaAst::LuaDocTagAsync(_)
+        | LuaAst::LuaDocTagAs(_)
+        | LuaAst::LuaDocTagReturnCast(_)
+        | LuaAst::LuaDocTagExport(_)
+        | LuaAst::LuaDocTagLanguage(_)
+        | LuaAst::LuaDocTagFileparam(_)
+        | LuaAst::LuaDocTagOutparam(_) => {
+            // Delegate to `LuaDocTag::cast` so this bucket mirrors
+            // `descendants::<LuaDocTag>()` exactly.
+            if let Some(tag) = LuaDocTag::cast(node.syntax().clone()) {
+                buckets.doc_tags.push(tag);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub trait Checker {
@@ -306,6 +532,8 @@ pub struct DiagnosticContext<'a> {
     cancel_token: CancellationToken,
     shared_data: Option<Arc<SharedDiagnosticData>>,
     assignment_prefix_events: Option<Arc<AssignmentPrefixEvents>>,
+    file_buckets: Option<Arc<FileNodeBuckets>>,
+    enable_cache: RefCell<HashMap<DiagnosticCode, bool>>,
 }
 
 impl<'a> DiagnosticContext<'a> {
@@ -323,6 +551,8 @@ impl<'a> DiagnosticContext<'a> {
             cancel_token,
             shared_data: None,
             assignment_prefix_events: None,
+            file_buckets: None,
+            enable_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -341,6 +571,8 @@ impl<'a> DiagnosticContext<'a> {
             cancel_token,
             shared_data: Some(shared_data),
             assignment_prefix_events: None,
+            file_buckets: None,
+            enable_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -361,9 +593,32 @@ impl<'a> DiagnosticContext<'a> {
             return events.clone();
         }
 
-        let events = Arc::new(collect_assignment_prefix_events(root));
+        let events = if let Some(buckets) = self.file_buckets() {
+            collect_assignment_prefix_events_from_assigns(&buckets.assign_stats)
+        } else {
+            collect_assignment_prefix_events(root)
+        };
+        let events = Arc::new(events);
         self.assignment_prefix_events = Some(events.clone());
         events
+    }
+
+    /// Per-file syntax nodes bucketed by kind, built with a single preorder
+    /// walk on first use and shared by all checkers. Returns `None` only when
+    /// the file has no syntax tree, in which case diagnostics cannot run.
+    // Rowan syntax nodes are `!Send`/`!Sync`, but this `Arc` never crosses
+    // threads: buckets are built and iterated synchronously within one file's
+    // check pass, bridging only the `&mut` borrow between checkers.
+    #[expect(clippy::arc_with_non_send_sync)]
+    pub fn file_buckets(&mut self) -> Option<Arc<FileNodeBuckets>> {
+        if let Some(buckets) = &self.file_buckets {
+            return Some(buckets.clone());
+        }
+
+        let tree = self.db.get_vfs().get_syntax_tree(&self.file_id)?;
+        let buckets = Arc::new(build_file_node_buckets(&tree.get_chunk_node()));
+        self.file_buckets = Some(buckets.clone());
+        Some(buckets)
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -469,6 +724,20 @@ impl<'a> DiagnosticContext<'a> {
     }
 
     pub fn is_checker_enable_by_code(&self, code: &DiagnosticCode) -> bool {
+        // Evaluated once per emitted diagnostic plus once per checker dispatch,
+        // so hundreds of repeated workspace-set/index lookups per file. The
+        // inputs (config, per-file diagnostic index, module index) are fixed
+        // for the lifetime of this context, so memoize per code.
+        if let Some(cached) = self.enable_cache.borrow().get(code) {
+            return *cached;
+        }
+
+        let enabled = self.is_checker_enable_by_code_uncached(code);
+        self.enable_cache.borrow_mut().insert(*code, enabled);
+        enabled
+    }
+
+    fn is_checker_enable_by_code_uncached(&self, code: &DiagnosticCode) -> bool {
         let file_id = self.get_file_id();
         let db = self.get_db();
         let diagnostic_index = db.get_diagnostic_index();
@@ -504,12 +773,15 @@ impl<'a> DiagnosticContext<'a> {
 }
 
 fn collect_assignment_prefix_events(root: &LuaChunk) -> AssignmentPrefixEvents {
-    let mut events: AssignmentPrefixEvents = HashMap::default();
-    for node in root.descendants::<LuaAst>() {
-        let LuaAst::LuaAssignStat(assign_stat) = node else {
-            continue;
-        };
+    let assigns: Vec<LuaAssignStat> = root.descendants().collect();
+    collect_assignment_prefix_events_from_assigns(&assigns)
+}
 
+fn collect_assignment_prefix_events_from_assigns(
+    assigns: &[LuaAssignStat],
+) -> AssignmentPrefixEvents {
+    let mut events: AssignmentPrefixEvents = HashMap::default();
+    for assign_stat in assigns {
         let Some((block_start, block_end)) = assignment_block_range(assign_stat.syntax()) else {
             continue;
         };
@@ -592,17 +864,17 @@ fn condition_tests_absence(condition: &LuaExpr, prefix_text: &str) -> bool {
             unary.get_op_token().map(|op| op.get_op()) == Some(UnaryOperator::OpNot)
                 && unary
                     .get_expr()
-                    .is_some_and(|inner| normalized_syntax_text(inner.syntax()) == prefix_text)
+                    .is_some_and(|inner| syntax_text_eq_normalized(inner.syntax(), prefix_text))
         }
         LuaExpr::BinaryExpr(binary) => {
             binary.get_op_token().map(|op| op.get_op()) == Some(BinaryOperator::OpEq)
                 && binary.get_exprs().is_some_and(|(left, right)| {
                     (matches!(right, LuaExpr::LiteralExpr(_))
-                        && normalized_syntax_text(right.syntax()) == "nil"
-                        && normalized_syntax_text(left.syntax()) == prefix_text)
+                        && syntax_text_eq_normalized(right.syntax(), "nil")
+                        && syntax_text_eq_normalized(left.syntax(), prefix_text))
                         || (matches!(left, LuaExpr::LiteralExpr(_))
-                            && normalized_syntax_text(left.syntax()) == "nil"
-                            && normalized_syntax_text(right.syntax()) == prefix_text)
+                            && syntax_text_eq_normalized(left.syntax(), "nil")
+                            && syntax_text_eq_normalized(right.syntax(), prefix_text))
                 })
         }
         _ => false,
@@ -625,7 +897,7 @@ fn assignment_guarantees_table(var: &LuaSyntaxNode, expr: &LuaExpr) -> bool {
     };
 
     matches!(right, LuaExpr::TableExpr(_))
-        && normalized_syntax_text(left.syntax()) == normalized_syntax_text(var)
+        && syntax_text_eq_normalized(left.syntax(), &normalized_syntax_text(var))
 }
 
 pub fn is_initialized_assignment_prefix(
@@ -647,8 +919,13 @@ pub fn is_initialized_assignment_prefix(
     // `if` initialises `t.k` for the writes inside it just as much as for the
     // ones after it. Only a closure breaks the chain, since its body runs
     // somewhere else entirely.
+    //
+    // The key reuses one `String` across blocks instead of cloning the prefix
+    // per enclosing block.
+    let mut key: AssignmentPrefixKey = (TextSize::from(0), TextSize::from(0), prefix_text);
     for (block_start, block_end) in enclosing_assignment_block_ranges(assign_stat.syntax()) {
-        let key = (block_start, block_end, prefix_text.clone());
+        key.0 = block_start;
+        key.1 = block_end;
         let Some(events) = assignment_prefixes.get(&key) else {
             continue;
         };
@@ -725,6 +1002,28 @@ fn normalized_syntax_text(syntax: &LuaSyntaxNode) -> String {
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect()
+}
+
+/// Whitespace-insensitive comparison without materialising the syntax text.
+/// Hot query paths (`condition_tests_absence`, `assignment_guarantees_table`)
+/// compare single nodes against short literals or an already-normalized
+/// prefix; building an intermediate `String` per query showed up per file.
+fn syntax_text_eq_normalized(syntax: &LuaSyntaxNode, expected: &str) -> bool {
+    let mut expected_chars = expected.chars().filter(|c| !c.is_whitespace());
+    for element in syntax.descendants_with_tokens() {
+        let Some(token) = element.into_token() else {
+            continue;
+        };
+        for c in token.text().chars() {
+            if c.is_whitespace() {
+                continue;
+            }
+            if expected_chars.next() != Some(c) {
+                return false;
+            }
+        }
+    }
+    expected_chars.next().is_none()
 }
 
 fn get_closure_expr_comment(closure_expr: &LuaClosureExpr) -> Option<LuaComment> {

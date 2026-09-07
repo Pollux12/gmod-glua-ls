@@ -33,8 +33,10 @@ impl Checker for RedefinedLocalChecker {
         let mut visible_locals = HashMap::default();
         let mut changes = Vec::new();
         let gmod_enabled = semantic_model.get_emmyrc().gmod.enabled;
-        let syntax_registrations =
-            collect_syntax_vgui_registration_calls(semantic_model.get_db(), file_id);
+        let syntax_registrations = context
+            .file_buckets()
+            .map(|buckets| collect_syntax_vgui_registration_calls(&buckets.call_exprs))
+            .unwrap_or_default();
 
         check_scope_for_redefined_locals(
             semantic_model.get_db(),
@@ -268,15 +270,10 @@ fn gmod_registered_local_reuse(
 }
 
 fn collect_syntax_vgui_registration_calls(
-    db: &DbIndex,
-    file_id: crate::FileId,
+    call_exprs: &[LuaCallExpr],
 ) -> Vec<SyntaxVguiRegistrationCall> {
-    let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
-        return Vec::new();
-    };
-
-    tree.get_chunk_node()
-        .descendants::<LuaCallExpr>()
+    call_exprs
+        .iter()
         .filter_map(|call_expr| {
             let table_arg_idx = match call_expr.get_access_path().as_deref() {
                 Some("vgui.Register") => 1,
