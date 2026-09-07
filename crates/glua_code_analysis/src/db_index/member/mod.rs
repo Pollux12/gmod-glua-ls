@@ -233,6 +233,41 @@ impl LuaMemberIndex {
         self.homing_revision
     }
 
+    /// Reserves capacity for one file's worth of member writes.
+    ///
+    /// `members` is a cheap upper-bound hint (see
+    /// `crate::compilation::analyzer::common::estimate_file_index_entries`),
+    /// not a count the index trusts: every map keeps its exact length and
+    /// contents, so over- or under-estimating only changes how often the
+    /// tables rehash, never what they hold. Distinct owners and keys are a
+    /// fraction of member writes, hence the scaled outer-map reservations.
+    /// Per-file entries are created when absent; an empty file keeps empty
+    /// per-file entries, which all readers treat exactly like absent ones.
+    pub fn reserve_for_file(&mut self, file_id: FileId, members: usize) {
+        self.members.reserve(members);
+        self.member_current_owner.reserve(members);
+        self.member_path_provenance.reserve(members / 4 + 1);
+        self.member_function_scope_ranges.reserve(members / 4 + 1);
+        self.owner_members.reserve(members / 4 + 1);
+        self.member_owner_key_index.reserve(members / 4 + 1);
+        self.member_owner_key_history_index.reserve(members / 4 + 1);
+        self.current_owner_member_history.reserve(members / 4 + 1);
+        self.current_members_by_key.reserve(members / 4 + 1);
+        self.in_filed
+            .entry(file_id)
+            .or_default()
+            .reserve(members + members / 2 + 2);
+        self.owner_key_index_owners_by_file
+            .entry(file_id)
+            .or_default()
+            .reserve(members / 4 + 2);
+        let scopes = (members / 32).clamp(2, 64);
+        self.function_scope_ranges
+            .entry(file_id)
+            .or_default()
+            .reserve(scopes);
+    }
+
     fn bump_homing_revision(&mut self) {
         self.homing_revision = self.homing_revision.wrapping_add(1);
     }

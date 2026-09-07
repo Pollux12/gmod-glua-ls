@@ -13,6 +13,20 @@ use crate::{
     },
 };
 
+/// Cheap upper-bound estimate of one file's member/reference index writes from
+/// its syntax text length, without walking the tree.
+///
+/// Dense field writes can exceed one entry per 16 bytes and
+/// sparse files use far fewer, so callers treat the result as a reservation
+/// hint only: under-estimating merely leaves some rehashing in place, and
+/// over-estimating leaves bounded slack. Never changes indexed facts.
+pub fn estimate_file_index_entries(text_len: usize) -> usize {
+    const BYTES_PER_ENTRY: usize = 16;
+    const MIN_ENTRIES: usize = 8;
+    const MAX_ENTRIES: usize = 4096;
+    (text_len / BYTES_PER_ENTRY + MIN_ENTRIES).min(MAX_ENTRIES)
+}
+
 /// Whether `typ` is a raw template placeholder inherited from a generic-for
 /// variable that nothing has bound yet.
 pub fn holds_unbound_iter_template(

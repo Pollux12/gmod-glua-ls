@@ -23,6 +23,13 @@ impl FileReference {
         }
     }
 
+    /// Reserves capacity for one file's worth of decl-reference writes.
+    /// Capacity only; lengths and contents are unchanged.
+    pub fn reserve(&mut self, additional: usize) {
+        self.decl_references.reserve(additional);
+        self.references_to_decl.reserve(additional);
+    }
+
     pub fn add_decl_reference(&mut self, decl_id: LuaDeclId, range: TextRange, is_write: bool) {
         if self.references_to_decl.contains_key(&range) {
             return;
