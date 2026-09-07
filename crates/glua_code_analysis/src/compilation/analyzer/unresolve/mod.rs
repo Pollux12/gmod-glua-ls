@@ -521,7 +521,21 @@ fn requeue_flushed_call_site_returns(
     let consumers = consumers
         .into_iter()
         .filter_map(|consumer| materialize_call_result_consumer(db, consumer))
-        .collect();
+        .collect::<Vec<_>>();
+    // The flush rewrote `inferred_params`, which feeds param types and the
+    // returns derived from them. Only the files that can observe it need a
+    // clear: the changed signatures' own files, the materialized return
+    // consumers' files, and every file with an item this wave attempts, so
+    // each attempt recomputes exactly as under a full clear.
+    let mut cleared_files = changed_signatures
+        .iter()
+        .map(|signature_id| signature_id.get_file_id())
+        .collect::<FxHashSet<_>>();
+    cleared_files.extend(
+        consumers
+            .iter()
+            .filter_map(|(_, consumer, _)| consumer.get_file_id()),
+    );
     context.requeue_call_site_inferred_returns(db, changed_signatures, consumers);
 
     let mut requeued: FxHashMap<InferFailReason, Vec<UnResolve>> = FxHashMap::default();
@@ -531,6 +545,12 @@ fn requeue_flushed_call_site_returns(
     if requeued.is_empty() {
         return;
     }
+    cleared_files.extend(
+        requeued
+            .values()
+            .flatten()
+            .filter_map(UnResolve::get_file_id),
+    );
 
     // Pending template decls are index writes rather than cache entries, and
     // `clear` drops them unmaterialized, so they are drained either side of it
@@ -541,7 +561,7 @@ fn requeue_flushed_call_site_returns(
     // inference here would commit a pre-flush answer. Everything `clear` drops
     // is derived from the indexes and recomputed on demand; the phase and
     // dynamic-field visibility live on the manager and survive it.
-    infer_manager.clear();
+    infer_manager.clear_files(&cleared_files);
 
     let _ = try_resolve(
         db,
