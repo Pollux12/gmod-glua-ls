@@ -571,12 +571,32 @@ fn collect_file_network_flows(
         return crate::db_index::FileNetworkData::default();
     };
 
+    // N3: one descendants pass per file builds the helper-lookup map and the
+    // block list shared by the direct and wrapped send scans, instead of one
+    // walk per consumer (plus the lazy cached build those scans used to
+    // trigger on first helper resolution).
+    let (prebuilt_map, file_blocks) =
+        crate::profile::phase("gmodnet/file_scan", || FileFunctionMap::scan(&root));
     let mut local_fns = LocalFnCache::default();
+    local_fns.insert_prebuilt(file_id, &root, prebuilt_map);
     let mut net = NetCallResolver::new(file_id, Some(resolve_shared.clone()));
     // One memo for both walks: the receive walk and the three send walks start
     // from the same call expressions and reach the same helpers, so a shared
     // memo resolves each of them once.
     let mut resolve_memo = ResolveMemo::default();
+    // N3: the candidate call expressions (reference-index lookup + per-file
+    // local/alias decl scan) are computed once here and shared by the receive
+    // walk and the unannotated-send walk, instead of running that decl scan
+    // and alias fixpoint twice per file.
+    let mut registry_roots = HashMap::default();
+    registry_roots.insert(file_id, root.clone());
+    let recv_site = NetWalkSite {
+        root: root.clone(),
+        file_id,
+    };
+    let net_candidates = crate::profile::phase("gmodnet/net_candidates", || {
+        net_candidate_call_exprs(db, &recv_site, helper_call_sites)
+    });
 
     let (_, _, _, receive_flows) = crate::profile::phase("gmodnet/receive_walk", || {
         collect_hook_and_receive_metadata(
@@ -591,7 +611,8 @@ fn collect_file_network_flows(
             &mut net,
             &mut resolve_memo,
             reach,
-            helper_call_sites,
+            Some(&net_candidates),
+            &mut registry_roots,
         )
     });
 
@@ -600,12 +621,14 @@ fn collect_file_network_flows(
         file_id,
         root,
         receive_flows,
+        net_candidates,
+        &file_blocks,
         helper_registry,
         &mut local_fns,
         &mut net,
         &mut resolve_memo,
         reach,
-        helper_call_sites,
+        &mut registry_roots,
     )
 }
 
@@ -1505,101 +1528,145 @@ struct FileFunctionMap {
 
 impl FileFunctionMap {
     fn build(root: &LuaChunk) -> Self {
-        let mut bare: HashMap<String, LuaBlock> = HashMap::default();
-        let mut duplicate_bare = HashSet::default();
-        let mut all_blocks: Vec<LuaBlock> = Vec::new();
+        let mut scan = FileTreeScan::default();
         for node in root.syntax().descendants() {
-            if let Some(local_func_stat) = LuaLocalFuncStat::cast(node.clone()) {
-                if let Some(block) = local_func_stat.get_closure().and_then(|c| c.get_block()) {
-                    if let Some(local_name) = local_func_stat
-                        .get_local_name()
-                        .and_then(|n| n.get_name_token())
-                    {
-                        let name = local_name.get_name_text().to_string();
-                        if bare.insert(name.clone(), block.clone()).is_some() {
-                            duplicate_bare.insert(name);
-                        }
+            scan.visit(&node);
+        }
+        scan.finish_map()
+    }
+
+    /// N3: one `descendants` pass per file yields both the helper-lookup map
+    /// and every block in the file. The direct and wrapped send scans iterate
+    /// the shared block list instead of each running their own walk (and the
+    /// map is pre-seeded into [`LocalFnCache`] so those scans never trigger
+    /// the lazy build walk either).
+    fn scan(root: &LuaChunk) -> (Self, Vec<LuaBlock>) {
+        let mut scan = FileTreeScan::default();
+        for node in root.syntax().descendants() {
+            scan.visit(&node);
+        }
+        scan.finish()
+    }
+}
+
+/// One-pass per-file tree scan backing [`FileFunctionMap::build`] (lazy,
+/// cross-file path) and [`FileFunctionMap::scan`] (eager, owning-file path).
+/// The per-node logic is identical in both; only whether the block list is
+/// kept differs.
+#[derive(Default)]
+struct FileTreeScan {
+    bare: HashMap<String, LuaBlock>,
+    duplicate_bare: HashSet<String>,
+    all_blocks: Vec<LuaBlock>,
+    blocks: Vec<LuaBlock>,
+}
+
+impl FileTreeScan {
+    fn visit(&mut self, node: &LuaSyntaxNode) {
+        if let Some(block) = LuaBlock::cast(node.clone()) {
+            self.blocks.push(block);
+        }
+        if let Some(local_func_stat) = LuaLocalFuncStat::cast(node.clone()) {
+            if let Some(block) = local_func_stat.get_closure().and_then(|c| c.get_block()) {
+                if let Some(local_name) = local_func_stat
+                    .get_local_name()
+                    .and_then(|n| n.get_name_token())
+                {
+                    let name = local_name.get_name_text().to_string();
+                    if self.bare.insert(name.clone(), block.clone()).is_some() {
+                        self.duplicate_bare.insert(name);
                     }
-                    all_blocks.push(block);
                 }
-                continue;
+                self.all_blocks.push(block);
             }
-            if let Some(local_stat) = LuaLocalStat::cast(node.clone()) {
-                let names: Vec<_> = local_stat.get_local_name_list().collect();
-                let values: Vec<_> = local_stat.get_value_exprs().collect();
-                for (idx, value) in values.iter().enumerate() {
-                    let LuaExpr::ClosureExpr(closure) = value else {
-                        continue;
-                    };
-                    let Some(block) = closure.get_block() else {
-                        continue;
-                    };
-                    if let Some(name_token) = names.get(idx).and_then(|n| n.get_name_token()) {
-                        let name = name_token.get_name_text().to_string();
-                        if bare.insert(name.clone(), block.clone()).is_some() {
-                            duplicate_bare.insert(name);
-                        }
-                    }
-                    all_blocks.push(block);
-                }
-                continue;
-            }
-            if let Some(func_stat) = LuaFuncStat::cast(node.clone()) {
-                let Some(block) = func_stat.get_closure().and_then(|c| c.get_block()) else {
-                    continue;
-                };
-                match func_stat.get_func_name() {
-                    Some(LuaVarExpr::NameExpr(name_expr)) => {
-                        if let Some(name) = name_expr.get_name_text().map(String::from) {
-                            if bare.insert(name.clone(), block.clone()).is_some() {
-                                duplicate_bare.insert(name);
-                            }
-                        }
-                    }
-                    Some(LuaVarExpr::IndexExpr(_)) => {}
-                    None => {}
-                }
-                all_blocks.push(block);
-                continue;
-            }
-            if let Some(assign_stat) = LuaAssignStat::cast(node.clone()) {
-                let (vars, values) = assign_stat.get_var_and_expr_list();
-                for (idx, value) in values.iter().enumerate() {
-                    let LuaExpr::ClosureExpr(closure) = value else {
-                        continue;
-                    };
-                    let Some(block) = closure.get_block() else {
-                        continue;
-                    };
-                    if let Some(var) = vars.get(idx) {
-                        match var {
-                            LuaVarExpr::NameExpr(name_expr) => {
-                                if let Some(name) = name_expr.get_name_text().map(String::from) {
-                                    if bare.insert(name.clone(), block.clone()).is_some() {
-                                        duplicate_bare.insert(name);
-                                    }
-                                }
-                            }
-                            LuaVarExpr::IndexExpr(_) => {}
-                        }
-                    }
-                    all_blocks.push(block);
-                }
-            }
-            if let Some(table_field) = LuaTableField::cast(node.clone()) {
-                let Some(LuaExpr::ClosureExpr(closure)) = table_field.get_value_expr() else {
+            return;
+        }
+        if let Some(local_stat) = LuaLocalStat::cast(node.clone()) {
+            let names: Vec<_> = local_stat.get_local_name_list().collect();
+            let values: Vec<_> = local_stat.get_value_exprs().collect();
+            for (idx, value) in values.iter().enumerate() {
+                let LuaExpr::ClosureExpr(closure) = value else {
                     continue;
                 };
                 let Some(block) = closure.get_block() else {
                     continue;
                 };
-                all_blocks.push(block);
+                if let Some(name_token) = names.get(idx).and_then(|n| n.get_name_token()) {
+                    let name = name_token.get_name_text().to_string();
+                    if self.bare.insert(name.clone(), block.clone()).is_some() {
+                        self.duplicate_bare.insert(name);
+                    }
+                }
+                self.all_blocks.push(block);
+            }
+            return;
+        }
+        if let Some(func_stat) = LuaFuncStat::cast(node.clone()) {
+            let Some(block) = func_stat.get_closure().and_then(|c| c.get_block()) else {
+                return;
+            };
+            match func_stat.get_func_name() {
+                Some(LuaVarExpr::NameExpr(name_expr)) => {
+                    if let Some(name) = name_expr.get_name_text().map(String::from) {
+                        if self.bare.insert(name.clone(), block.clone()).is_some() {
+                            self.duplicate_bare.insert(name);
+                        }
+                    }
+                }
+                Some(LuaVarExpr::IndexExpr(_)) => {}
+                None => {}
+            }
+            self.all_blocks.push(block);
+            return;
+        }
+        if let Some(assign_stat) = LuaAssignStat::cast(node.clone()) {
+            let (vars, values) = assign_stat.get_var_and_expr_list();
+            for (idx, value) in values.iter().enumerate() {
+                let LuaExpr::ClosureExpr(closure) = value else {
+                    continue;
+                };
+                let Some(block) = closure.get_block() else {
+                    continue;
+                };
+                if let Some(var) = vars.get(idx) {
+                    match var {
+                        LuaVarExpr::NameExpr(name_expr) => {
+                            if let Some(name) = name_expr.get_name_text().map(String::from) {
+                                if self.bare.insert(name.clone(), block.clone()).is_some() {
+                                    self.duplicate_bare.insert(name);
+                                }
+                            }
+                        }
+                        LuaVarExpr::IndexExpr(_) => {}
+                    }
+                }
+                self.all_blocks.push(block);
             }
         }
-        for name in duplicate_bare {
-            bare.remove(&name);
+        if let Some(table_field) = LuaTableField::cast(node.clone()) {
+            let Some(LuaExpr::ClosureExpr(closure)) = table_field.get_value_expr() else {
+                return;
+            };
+            let Some(block) = closure.get_block() else {
+                return;
+            };
+            self.all_blocks.push(block);
         }
-        FileFunctionMap { bare, all_blocks }
+    }
+
+    fn finish_map(mut self) -> FileFunctionMap {
+        for name in self.duplicate_bare {
+            self.bare.remove(&name);
+        }
+        FileFunctionMap {
+            bare: self.bare,
+            all_blocks: self.all_blocks,
+        }
+    }
+
+    fn finish(mut self) -> (FileFunctionMap, Vec<LuaBlock>) {
+        let blocks = std::mem::take(&mut self.blocks);
+        (self.finish_map(), blocks)
     }
 }
 
@@ -1617,6 +1684,14 @@ impl LocalFnCache {
         self.cache
             .entry(key)
             .or_insert_with(|| FileFunctionMap::build(root))
+    }
+
+    /// N3: seed the owning file's map from the fused [`FileFunctionMap::scan`]
+    /// so the send scans never trigger the lazy build walk for their own file.
+    /// Same key as [`LocalFnCache::get`]; cross-file entries keep the lazy path.
+    fn insert_prebuilt(&mut self, file_id: FileId, root: &LuaChunk, map: FileFunctionMap) {
+        let key = (file_id, root.syntax().text_range());
+        self.cache.insert(key, map);
     }
 }
 
@@ -1711,9 +1786,8 @@ fn collect_file_gmod_metadata(
                 &mut net,
                 &mut ResolveMemo::default(),
                 &reach,
-                // This walk collects hook metadata only; it never expands
-                // wrapper chains for send flows, so it needs no call sites.
-                &NetHelperCallSites::default(),
+                None,
+                &mut HashMap::default(),
             );
         (hook_sites, system_metadata, gm_method_realms)
     });
@@ -1763,7 +1837,8 @@ fn collect_hook_and_receive_metadata(
     net: &mut NetCallResolver,
     resolve_memo: &mut ResolveMemo,
     reach: &HelperStartReachCache,
-    helper_call_sites: &NetHelperCallSites,
+    net_candidates: Option<&[LuaCallExpr]>,
+    registry_roots: &mut HashMap<FileId, LuaChunk>,
 ) -> (
     Vec<GmodHookSiteMetadata>,
     GmodSystemFileMetadata,
@@ -1791,15 +1866,28 @@ fn collect_hook_and_receive_metadata(
         net,
         resolve_memo,
         reach,
-        helper_call_sites,
+        registry_roots,
     };
 
     // Collecting receive flows alone needs no walk: the `net.Receive` sites are
     // already recorded by annotation, and the calls that can expand into a
     // wrapper that reaches one come from the reference index.
+    //
+    // N4 gate (candidate-driven walks only): when the precomputed candidate
+    // list is empty, neither loop below can produce a flow — both iterate
+    // exactly that list — so they are skipped outright. This must NOT be
+    // extended to the direct scan (`collect_net_send_flows`) or the wrapped
+    // scan: those walk every statement-level call and resolve through
+    // signatures, so a file with no `by_file` entry can still produce a flow
+    // (aliased op `local s = net.Start`, cross-file helper reached by
+    // signature, same-file local wrapper whose name never entered the global
+    // reference table, or a helper passed as a parameter). A content gate on
+    // the direct path would need the same name-substring caveats and is
+    // deliberately not attempted here.
     if !collect_non_net_metadata {
         if collect_receive_flows {
-            for call_expr in net_candidate_call_exprs(db, &net_site, helper_call_sites) {
+            let empty: &[LuaCallExpr] = &[];
+            for call_expr in net_candidates.unwrap_or(empty) {
                 if let Some(receive_flow) =
                     collect_net_receive_flow(&mut net_ctx, &net_site, &call_expr)
                 {
@@ -1879,12 +1967,14 @@ fn collect_network_flow_metadata(
     file_id: FileId,
     root: LuaChunk,
     receive_flows: Vec<NetReceiveFlow>,
+    net_candidates: Vec<LuaCallExpr>,
+    blocks: &[LuaBlock],
     helper_registry: &HelperRegistry,
     local_fns: &mut LocalFnCache,
     net: &mut NetCallResolver,
     resolve_memo: &mut ResolveMemo,
     reach: &HelperStartReachCache,
-    helper_call_sites: &NetHelperCallSites,
+    registry_roots: &mut HashMap<FileId, LuaChunk>,
 ) -> crate::db_index::FileNetworkData {
     let site = NetWalkSite { root, file_id };
     let mut ctx = NetCollectCtx {
@@ -1894,17 +1984,22 @@ fn collect_network_flow_metadata(
         net,
         resolve_memo,
         reach,
-        helper_call_sites,
+        registry_roots,
     };
     let mut send_flows = crate::profile::phase("gmodnet/send_direct", || {
-        collect_net_send_flows(&mut ctx, &site)
+        collect_net_send_flows(&mut ctx, &site, blocks)
     });
     send_flows.extend(crate::profile::phase("gmodnet/send_wrapped", || {
-        collect_wrapped_net_send_flows(&mut ctx, &site)
+        collect_wrapped_net_send_flows(&mut ctx, &site, blocks)
     }));
-    send_flows.extend(crate::profile::phase("gmodnet/send_unannotated", || {
-        collect_unannotated_net_wrapper_send_flows(&mut ctx, &site)
-    }));
+    // N4 gate: with no candidates the unannotated walk iterates an empty list
+    // and cannot produce a flow; skipping the call keeps the (empty) result
+    // identical while avoiding per-candidate helper resolution entirely.
+    if !net_candidates.is_empty() {
+        send_flows.extend(crate::profile::phase("gmodnet/send_unannotated", || {
+            collect_unannotated_net_wrapper_send_flows(&mut ctx, &site, &net_candidates)
+        }));
+    }
     send_flows.sort_by_key(|flow| flow.start_range.start());
     let mut unique_send_flows = Vec::with_capacity(send_flows.len());
     for flow in send_flows {
@@ -1939,10 +2034,17 @@ fn collect_gm_method_realm_annotation(func_stat: &LuaFuncStat) -> Option<(String
     Some((method_name, realm))
 }
 
-fn collect_net_send_flows(ctx: &mut NetCollectCtx<'_>, site: &NetWalkSite) -> Vec<NetSendFlow> {
+fn collect_net_send_flows(
+    ctx: &mut NetCollectCtx<'_>,
+    site: &NetWalkSite,
+    blocks: &[LuaBlock],
+) -> Vec<NetSendFlow> {
     let mut flows = Vec::new();
 
-    for block in site.root.descendants::<LuaBlock>() {
+    // N3: `blocks` comes from the single fused per-file scan in
+    // `collect_file_network_flows` — same document order as the old
+    // `descendants::<LuaBlock>()` walk, without re-walking the tree.
+    for block in blocks {
         let stats: Vec<LuaStat> = block.get_stats().collect();
         for (index, stat) in stats.iter().enumerate() {
             let Some(call_expr) = call_expr_from_stat(stat) else {
@@ -2001,7 +2103,7 @@ fn collect_net_send_flows(ctx: &mut NetCollectCtx<'_>, site: &NetWalkSite) -> Ve
                     }
                 }
 
-                collect_net_write_ops_from_stat(ctx, site, &block, next_stat, &mut writes);
+                collect_net_write_ops_from_stat(ctx, site, block, next_stat, &mut writes);
             }
 
             let Some((send_range, send_kind, send_target, send_display_name)) = send else {
@@ -2045,11 +2147,11 @@ fn resolve_helper_start_message_recursive(
     caller_site: &NetWalkSite,
     helper_call: &LuaCallExpr,
     caller_bindings: &HashMap<String, String>,
-    visited: &mut HashSet<(FileId, String)>,
+    visited: &mut HashSet<HelperId>,
 ) -> Option<String> {
     let (helper_key, helper_block, helper_root, helper_file_id) =
         resolve_call_to_function_block_cached(ctx, caller_site, helper_call)?;
-    if !visited.insert((helper_file_id, helper_key.clone())) {
+    if !visited.insert((helper_file_id, helper_key)) {
         return None;
     }
 
@@ -2112,11 +2214,11 @@ fn resolve_helper_send_recursive(
     ctx: &mut NetCollectCtx<'_>,
     caller_site: &NetWalkSite,
     helper_call: &LuaCallExpr,
-    visited: &mut HashSet<(FileId, String)>,
+    visited: &mut HashSet<HelperId>,
 ) -> Option<(NetSendKind, Option<String>)> {
     let (helper_key, helper_block, helper_root, helper_file_id) =
         resolve_call_to_function_block_cached(ctx, caller_site, helper_call)?;
-    if !visited.insert((helper_file_id, helper_key.clone())) {
+    if !visited.insert((helper_file_id, helper_key)) {
         return None;
     }
 
@@ -2157,119 +2259,131 @@ fn resolve_helper_send_recursive(
 fn collect_wrapped_net_send_flows(
     ctx: &mut NetCollectCtx<'_>,
     site: &NetWalkSite,
+    blocks: &[LuaBlock],
 ) -> Vec<NetSendFlow> {
     let mut flows = Vec::new();
 
-    // Snapshot the per-file function blocks so we can borrow `local_fns`
-    // mutably during the recursive collect call below.
-    let blocks: Vec<LuaBlock> = ctx
+    // N3: `blocks` is shared with the direct scan from the single fused
+    // per-file scan — no second descendants walk here. Attribution below is
+    // unchanged: each block is visited under its innermost enclosing named
+    // function body exactly once (see the quadratic note this replaced).
+    let owned_ranges: HashSet<TextRange> = ctx
         .local_fns
         .get(site.file_id, &site.root)
         .all_blocks
-        .clone();
-    for block in &blocks {
-        collect_wrapped_net_send_flows_in_function_block(ctx, site, block, &mut flows);
+        .iter()
+        .map(|block| block.syntax().text_range())
+        .collect();
+    for block in blocks {
+        // The block's own closure (if any) owns it; a block with no enclosing
+        // closure is top-level chunk code, which the direct scan covers.
+        // Blocks inside an anonymous callback (e.g. a `net.Receive` receiver)
+        // have no named owner and were skipped by the old walk under every
+        // enclosing function, so they are skipped here too. A block nested
+        // inside another named function is visited under that inner owner
+        // rather than any outer one, which is exactly what the old
+        // per-function nested-closure skip produced.
+        let Some(owner_range) = block
+            .syntax()
+            .ancestors()
+            .find_map(LuaClosureExpr::cast)
+            .and_then(|closure| closure.get_block())
+            .map(|owner| owner.syntax().text_range())
+        else {
+            continue;
+        };
+        if !owned_ranges.contains(&owner_range) {
+            continue;
+        }
+        collect_wrapped_net_send_flows_in_block(ctx, site, block, &mut flows);
     }
 
     flows.sort_by_key(|flow| flow.start_range.start());
     flows
 }
 
-fn collect_wrapped_net_send_flows_in_function_block(
+fn collect_wrapped_net_send_flows_in_block(
     ctx: &mut NetCollectCtx<'_>,
     site: &NetWalkSite,
-    function_block: &LuaBlock,
+    block: &LuaBlock,
     flows: &mut Vec<NetSendFlow>,
 ) {
-    for block in function_block
-        .syntax()
-        .descendants()
-        .filter_map(LuaBlock::cast)
-    {
-        if block.syntax() != function_block.syntax()
-            && is_block_in_nested_closure(function_block, &block)
-        {
+    let stats: Vec<LuaStat> = block.get_stats().collect();
+    for (index, stat) in stats.iter().enumerate() {
+        let Some(call_expr) = call_expr_from_stat(stat) else {
+            continue;
+        };
+
+        if !call_has_literal_string_arg(&call_expr) {
             continue;
         }
 
-        let stats: Vec<LuaStat> = block.get_stats().collect();
-        for (index, stat) in stats.iter().enumerate() {
-            let Some(call_expr) = call_expr_from_stat(stat) else {
-                continue;
-            };
+        let Some(NetCallRole::Start { message_idx }) =
+            ctx.net.role(ctx.db, site.file_id, &call_expr)
+        else {
+            continue;
+        };
+        let Some(message_name) = extract_static_string_arg_value(&call_expr, message_idx) else {
+            continue;
+        };
 
-            if !call_has_literal_string_arg(&call_expr) {
-                continue;
-            }
+        let mut writes = Vec::new();
+        let mut send = None;
 
-            let Some(NetCallRole::Start { message_idx }) =
-                ctx.net.role(ctx.db, site.file_id, &call_expr)
-            else {
-                continue;
-            };
-            let Some(message_name) = extract_static_string_arg_value(&call_expr, message_idx)
-            else {
-                continue;
-            };
-
-            let mut writes = Vec::new();
-            let mut send = None;
-
-            for next_stat in stats.iter().skip(index + 1) {
-                if let Some(next_call_expr) = call_expr_from_stat(next_stat) {
-                    match ctx.net.role(ctx.db, site.file_id, &next_call_expr) {
-                        Some(NetCallRole::Start { .. }) => break,
-                        Some(NetCallRole::Send(send_kind)) => {
-                            let target = extract_send_target_text(&next_call_expr, send_kind);
-                            send = Some((
-                                next_call_expr.get_range(),
-                                send_kind,
-                                target,
-                                call_display_name(&next_call_expr),
-                            ));
-                            break;
-                        }
-                        _ => {}
+        for next_stat in stats.iter().skip(index + 1) {
+            if let Some(next_call_expr) = call_expr_from_stat(next_stat) {
+                match ctx.net.role(ctx.db, site.file_id, &next_call_expr) {
+                    Some(NetCallRole::Start { .. }) => break,
+                    Some(NetCallRole::Send(send_kind)) => {
+                        let target = extract_send_target_text(&next_call_expr, send_kind);
+                        send = Some((
+                            next_call_expr.get_range(),
+                            send_kind,
+                            target,
+                            call_display_name(&next_call_expr),
+                        ));
+                        break;
                     }
+                    _ => {}
                 }
-
-                collect_net_write_ops_from_stat(ctx, site, &block, next_stat, &mut writes);
             }
 
-            if let Some((send_range, send_kind, send_target, send_display_name)) = send {
-                flows.push(NetSendFlow {
-                    message_name,
-                    start_range: call_expr.get_range(),
-                    writes,
-                    send_range,
-                    send_kind,
-                    send_display_name,
-                    send_target,
-                    is_wrapped: true,
-                    materialized_from: None,
-                });
-                continue;
-            }
+            collect_net_write_ops_from_stat(ctx, site, block, next_stat, &mut writes);
+        }
 
-            // Wrapped helper flows can start a net message in one function and send at call-site.
-            // Keep a conservative stub so counterpart diagnostics can still resolve by message name.
-            // The realm is a placeholder: `is_wrapped` flows are used for counterpart
-            // presence only and are skipped by every realm-sensitive check.
+        if let Some((send_range, send_kind, send_target, send_display_name)) = send {
             flows.push(NetSendFlow {
                 message_name,
                 start_range: call_expr.get_range(),
-                writes: Vec::new(),
-                send_range: call_expr.get_range(),
-                send_kind: NetSendKind {
-                    receiver_realm: GmodRealm::Client,
-                    target_arg_idx: None,
-                },
-                send_display_name: call_display_name(&call_expr),
-                send_target: None,
+                writes,
+                send_range,
+                send_kind,
+                send_display_name,
+                send_target,
                 is_wrapped: true,
                 materialized_from: None,
             });
+            continue;
         }
+
+        // Wrapped helper flows can start a net message in one function and send at call-site.
+        // Keep a conservative stub so counterpart diagnostics can still resolve by message name.
+        // The realm is a placeholder: `is_wrapped` flows are used for counterpart
+        // presence only and are skipped by every realm-sensitive check.
+        flows.push(NetSendFlow {
+            message_name,
+            start_range: call_expr.get_range(),
+            writes: Vec::new(),
+            send_range: call_expr.get_range(),
+            send_kind: NetSendKind {
+                receiver_realm: GmodRealm::Client,
+                target_arg_idx: None,
+            },
+            send_display_name: call_display_name(&call_expr),
+            send_target: None,
+            is_wrapped: true,
+            materialized_from: None,
+        });
     }
 }
 
@@ -2282,16 +2396,21 @@ fn collect_wrapped_net_send_flows_in_function_block(
 /// `net.Start(messageName)` can become concrete at
 /// `MyLib.SendString("Message", value)`. Static message names take this same
 /// path, which lets a no-argument helper produce a complete call-site flow.
+///
+/// `candidates` is computed once per file by the caller (see
+/// [`collect_file_network_flows`]) rather than derived here, so the decl-tree
+/// scan and alias fixpoint inside [`net_candidate_call_exprs`] run once instead
+/// of once per walk.
 fn collect_unannotated_net_wrapper_send_flows(
     ctx: &mut NetCollectCtx<'_>,
     site: &NetWalkSite,
+    candidates: &[LuaCallExpr],
 ) -> Vec<NetSendFlow> {
     let mut flows = Vec::new();
     let mut visited = HashSet::default();
     let empty_bindings = HashMap::default();
 
-    let calls = net_candidate_call_exprs(ctx.db, site, ctx.helper_call_sites);
-    for call_expr in calls {
+    for call_expr in candidates {
         if ctx.net.role(ctx.db, site.file_id, &call_expr).is_some() {
             continue;
         }
@@ -2417,7 +2536,7 @@ fn collect_send_flows_from_helper_call(
     helper_call: &LuaCallExpr,
     origin_call: &LuaCallExpr,
     caller_bindings: &HashMap<String, String>,
-    visited: &mut HashSet<(FileId, String)>,
+    visited: &mut HashSet<HelperId>,
     flows: &mut Vec<NetSendFlow>,
 ) {
     let Some((helper_key, helper_block, helper_root, helper_file_id)) =
@@ -2425,7 +2544,7 @@ fn collect_send_flows_from_helper_call(
     else {
         return;
     };
-    if !visited.insert((helper_file_id, helper_key.clone())) {
+    if !visited.insert((helper_file_id, helper_key)) {
         return;
     }
 
@@ -2438,7 +2557,7 @@ fn collect_send_flows_from_helper_call(
     // a helper that cannot reach one contributes nothing however it is called.
     // The answer depends only on the helper, so it is cached per helper rather
     // than recomputed for each calling file.
-    let helper_id = (helper_file_id, helper_key.clone());
+    let helper_id = (helper_file_id, helper_key);
     let (reaches_start, _) = helper_reaches_net_role(
         ctx,
         &helper_site,
@@ -2692,7 +2811,7 @@ fn collect_receive_flows_from_helper_call(
     helper_call: &LuaCallExpr,
     origin_call: &LuaCallExpr,
     caller_bindings: &HashMap<String, String>,
-    visited: &mut HashSet<(FileId, String)>,
+    visited: &mut HashSet<HelperId>,
     flows: &mut Vec<NetReceiveFlow>,
 ) {
     let Some((helper_key, helper_block, helper_root, helper_file_id)) =
@@ -2700,7 +2819,7 @@ fn collect_receive_flows_from_helper_call(
     else {
         return;
     };
-    if !visited.insert((helper_file_id, helper_key.clone())) {
+    if !visited.insert((helper_file_id, helper_key)) {
         return;
     }
 
@@ -2714,7 +2833,7 @@ fn collect_receive_flows_from_helper_call(
     // one contributes nothing however it is called. Without this, every call
     // with a literal string argument re-walked the full body of whatever it
     // resolved to, once per calling site.
-    let helper_id = (helper_file_id, helper_key.clone());
+    let helper_id = (helper_file_id, helper_key);
     let (reaches_receive, _) = helper_reaches_net_role(
         ctx,
         &helper_site,
@@ -2804,24 +2923,32 @@ fn resolve_callback_block(
         .cloned()
 }
 
-/// Resolve a call expression to a function definition, returning a
-/// stable string key (used for cycle detection), the function body block,
-/// and the chunk that owns the body (which becomes the new `root` for
-/// further nested helper resolution within that body).
+/// Resolve a call expression to a function definition, returning the helper
+/// body's identity (owning file + body range, used for cycle detection), the
+/// function body block, and the chunk that owns the body (which becomes the
+/// new `root` for further nested helper resolution within that body).
 ///
 /// Resolve a `(FileId, LuaSyntaxId)` helper-registry entry back to its
-/// `(LuaBlock, LuaChunk)` by rebuilding the owning file's red tree on demand.
-/// Returns an owned `LuaChunk` (cheap clone of a red node) which becomes the new
-/// `root` for further nested helper resolution within that body.
+/// `(LuaBlock, LuaChunk)` via the per-file red-root cache in `roots`, falling
+/// back to rebuilding the owning file's red tree on demand. Returns an owned
+/// `LuaChunk` (cheap clone of a red node) which becomes the new `root` for
+/// further nested helper resolution within that body.
 fn resolve_registry_entry(
+    roots: &mut HashMap<FileId, LuaChunk>,
     db: &DbIndex,
     file_id: &FileId,
     syntax_id: &LuaSyntaxId,
 ) -> Option<(LuaBlock, LuaChunk)> {
+    if let Some(chunk) = roots.get(file_id) {
+        let node = syntax_id.to_node_from_root(chunk.syntax())?;
+        let block = LuaBlock::cast(node)?;
+        return Some((block, chunk.clone()));
+    }
     let tree = db.get_vfs().get_syntax_tree(file_id)?;
     let chunk = tree.get_chunk_node();
     let node = syntax_id.to_node_from_root(chunk.syntax())?;
     let block = LuaBlock::cast(node)?;
+    roots.insert(*file_id, chunk.clone());
     Some((block, chunk))
 }
 
@@ -2833,7 +2960,8 @@ fn resolve_call_to_function_block(
     local_fns: &mut LocalFnCache,
     net: &mut NetCallResolver,
     db: &DbIndex,
-) -> Option<(String, LuaBlock, LuaChunk, FileId)> {
+    roots: &mut HashMap<FileId, LuaChunk>,
+) -> Option<(HelperKey, LuaBlock, LuaChunk, FileId)> {
     // Direct global member calls have a stable symbol identity even when
     // duplicate declarations make the inferred signature winner dependent on
     // index order. Resolve that identity through the deterministic registry.
@@ -2844,27 +2972,17 @@ fn resolve_call_to_function_block(
         let call_path = call_path.strip_prefix("_G.").unwrap_or(&call_path);
         let global_id = GlobalId::new(call_path);
         if let Some((file_id, syntax_id)) = helper_registry.globals.get(&global_id)
-            && let Some((block, chunk)) = resolve_registry_entry(db, file_id, syntax_id)
+            && let Some((block, chunk)) = resolve_registry_entry(roots, db, file_id, syntax_id)
         {
-            return Some((
-                format!("global:{}", global_id.get_name()),
-                block,
-                chunk,
-                *file_id,
-            ));
+            return Some((block.syntax().text_range(), block, chunk, *file_id));
         }
     }
 
     if let Some(signature_id) = net.signature_id(db, root_file_id, call_expr)
         && let Some((file_id, syntax_id)) = helper_registry.signatures.get(&signature_id)
-        && let Some((block, chunk)) = resolve_registry_entry(db, file_id, syntax_id)
+        && let Some((block, chunk)) = resolve_registry_entry(roots, db, file_id, syntax_id)
     {
-        return Some((
-            format!("signature:{signature_id:?}"),
-            block,
-            chunk,
-            *file_id,
-        ));
+        return Some((block.syntax().text_range(), block, chunk, *file_id));
     }
 
     // Pre-analysis can run before every local/global callable type cache is
@@ -2878,12 +2996,8 @@ fn resolve_call_to_function_block(
             .get(name.as_str())
             .cloned()
     {
-        return Some((
-            format!("unique-local:{name}"),
-            block,
-            root.clone(),
-            root_file_id,
-        ));
+        let key = block.syntax().text_range();
+        return Some((key, block, root.clone(), root_file_id));
     }
 
     // Dynamic receivers sometimes have no inferable class in Lua source. Keep
@@ -2895,14 +3009,9 @@ fn resolve_call_to_function_block(
     {
         let method_name = SmolStr::new(method_token.get_name_text());
         if let Some((file_id, syntax_id)) = helper_registry.methods.get(&method_name)
-            && let Some((block, chunk)) = resolve_registry_entry(db, file_id, syntax_id)
+            && let Some((block, chunk)) = resolve_registry_entry(roots, db, file_id, syntax_id)
         {
-            return Some((
-                format!("unique-method:{method_name}"),
-                block,
-                chunk,
-                *file_id,
-            ));
+            return Some((block.syntax().text_range(), block, chunk, *file_id));
         }
     }
 
@@ -2928,18 +3037,30 @@ struct NetCollectCtx<'a> {
     resolve_memo: &'a mut ResolveMemo,
     /// Shared across files; see [`HelperStartReachCache`].
     reach: &'a HelperStartReachCache,
-    /// See [`NetHelperCallSites`].
-    helper_call_sites: &'a NetHelperCallSites,
+    /// Red roots of helper-owning files, cached per collected file so
+    /// [`resolve_registry_entry`] does not rebuild the same red tree for every
+    /// call site that expands into it. The green trees stay cached in the VFS;
+    /// only the red root (whose parser node memo holds ~4 MRU entries and
+    /// thrashes when callers alternate between helper files) is retained here.
+    registry_roots: &'a mut HashMap<FileId, LuaChunk>,
 }
 
-type ResolvedHelperFn = (String, LuaBlock, LuaChunk, FileId);
+/// Identity of a resolved helper body: the owning file plus the body block's
+/// range. This replaces the former `format!("global:{...}")` /
+/// `format!("signature:{...:?}")` / `format!("unique-local:{...}")` string keys:
+/// it is `Copy` (no allocation, no clone on every visited insert/remove), it
+/// distinguishes two bodies that happen to share a written name, and two call
+/// paths that resolve to the same body share one cycle-detection entry.
+type HelperKey = TextRange;
+
+type ResolvedHelperFn = (HelperKey, LuaBlock, LuaChunk, FileId);
 
 /// See [`NetCollectCtx::resolve_memo`]. Owned per file by the collector that
 /// drives both the receive walk and the send walks, so one file's helper
 /// resolutions are computed once instead of once per walk.
 type ResolveMemo = FxHashMap<(FileId, TextRange), Option<ResolvedHelperFn>>;
 
-type HelperId = (FileId, String);
+type HelperId = (FileId, HelperKey);
 
 const HELPER_REACH_SHARDS: usize = 32;
 
@@ -3068,16 +3189,26 @@ fn resolve_call_to_function_block_cached(
         return cached.clone();
     }
 
+    let NetCollectCtx {
+        helper_registry,
+        local_fns,
+        net,
+        db,
+        registry_roots,
+        resolve_memo,
+        ..
+    } = &mut *ctx;
     let resolved = resolve_call_to_function_block(
         &site.root,
         site.file_id,
         call_expr,
-        ctx.helper_registry,
-        ctx.local_fns,
-        ctx.net,
-        ctx.db,
+        helper_registry,
+        local_fns,
+        net,
+        db,
+        registry_roots,
     );
-    ctx.resolve_memo.insert(key, resolved.clone());
+    resolve_memo.insert(key, resolved.clone());
     resolved
 }
 
@@ -3143,7 +3274,7 @@ fn collect_net_ops_recursive(
     enclosing_block: &LuaBlock,
     subtree: &LuaSyntaxNode,
     out: &mut Vec<NetOpEntry>,
-    visited: &mut HashSet<String>,
+    visited: &mut HashSet<HelperId>,
     force_dynamic: bool,
     direction: NetOpDirection,
     flow_prefix: &[NetFlowFrame],
@@ -3171,7 +3302,7 @@ fn collect_net_ops_eval_order(
     enclosing_block: &LuaBlock,
     subtree: &LuaSyntaxNode,
     out: &mut Vec<NetOpEntry>,
-    visited: &mut HashSet<String>,
+    visited: &mut HashSet<HelperId>,
     force_dynamic: bool,
     direction: NetOpDirection,
     flow_prefix: &[NetFlowFrame],
@@ -3213,7 +3344,7 @@ fn collect_net_ops_from_call_expr(
     enclosing_block: &LuaBlock,
     call_expr: &LuaCallExpr,
     out: &mut Vec<NetOpEntry>,
-    visited: &mut HashSet<String>,
+    visited: &mut HashSet<HelperId>,
     force_dynamic: bool,
     direction: NetOpDirection,
     flow_prefix: &[NetFlowFrame],
@@ -3269,7 +3400,7 @@ fn collect_net_ops_from_call_expr(
         return;
     };
 
-    if !visited.insert(helper_key.clone()) {
+    if !visited.insert((helper_file_id, helper_key)) {
         return;
     }
 
@@ -3297,7 +3428,7 @@ fn collect_net_ops_from_call_expr(
         direction,
         &nested_prefix,
     );
-    visited.remove(&helper_key);
+    visited.remove(&(helper_file_id, helper_key));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3307,7 +3438,7 @@ fn collect_net_ops_from_call_args(
     enclosing_block: &LuaBlock,
     call_expr: &LuaCallExpr,
     out: &mut Vec<NetOpEntry>,
-    visited: &mut HashSet<String>,
+    visited: &mut HashSet<HelperId>,
     force_dynamic: bool,
     direction: NetOpDirection,
     flow_prefix: &[NetFlowFrame],
@@ -3843,18 +3974,22 @@ fn unique_signature_id_from_type(typ: &LuaType) -> Option<LuaSignatureId> {
 /// Source text of the called function, used for display in diagnostics, hover
 /// and code lens. Prefers what the developer actually wrote so an aliased or
 /// wrapped call reports its own name.
+///
+/// Computed at flow-construction time only (never speculatively per candidate),
+/// in a single pass that drops whitespace without the intermediate `String` +
+/// `Vec<&str>` + join of the old implementation.
 fn call_display_name(call_expr: &LuaCallExpr) -> SmolStr {
     call_expr
         .get_prefix_expr()
         .map(|prefix| {
+            let text = prefix.syntax().text().to_string();
+            if !text.bytes().any(|b| b.is_ascii_whitespace()) {
+                return SmolStr::new(text);
+            }
             SmolStr::new(
-                prefix
-                    .syntax()
-                    .text()
-                    .to_string()
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(""),
+                text.chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>(),
             )
         })
         .unwrap_or_else(|| SmolStr::new_static("<net call>"))
@@ -4665,6 +4800,64 @@ mod forwarding_parent_candidate_tests {
             Some(ForwardingParentCandidate::Conflicted)
         ));
         assert!(finalize_vgui_forwarding_parent_candidates(candidates).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod net_candidate_gate_tests {
+    use crate::{Emmyrc, VirtualWorkspace};
+
+    fn set_gmod_enabled(ws: &mut VirtualWorkspace) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        // Net ops resolve through signature metadata, so the annotated
+        // builtins must be present or no flows are collected at all.
+        ws.def_gmod_call_arg_builtins();
+    }
+
+    /// N4 gate: a file with no candidate call expressions skips the
+    /// candidate-driven walks (receive + unannotated-send) with a result
+    /// identical to running them, while a network file still produces flows.
+    /// The direct and wrapped scans intentionally keep running for every file:
+    /// they resolve through signatures, so an empty candidate list alone can
+    /// never prove they would find nothing (see the N4 note in
+    /// `collect_hook_and_receive_metadata`).
+    #[test]
+    fn empty_candidates_skip_preserves_flows() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        let net_id = ws.def_file(
+            "addons/mytest/lua/autorun/server/gate_net.lua",
+            r#"
+            net.Start("GateMsg")
+            net.WriteString("hello")
+            net.Broadcast()
+            "#,
+        );
+        let plain_id = ws.def_file(
+            "addons/mytest/lua/autorun/server/gate_plain.lua",
+            "local x = 1\nreturn x\n",
+        );
+
+        let data = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(net_id)
+            .expect("expected network data");
+        assert_eq!(data.send_flows.len(), 1);
+        assert_eq!(data.send_flows[0].message_name.as_str(), "GateMsg");
+
+        // The plain file takes every N4 early-out (no `by_file` entry, empty
+        // candidate list): nothing is stored for it, exactly what an ungated
+        // walk that found no flows would produce.
+        assert!(
+            ws.get_db_mut()
+                .get_gmod_network_index()
+                .get_file_data(plain_id)
+                .is_none()
+        );
     }
 }
 
