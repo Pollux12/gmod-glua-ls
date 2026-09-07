@@ -2033,6 +2033,7 @@ fn collect_string_const_names(typ: &LuaType, names: &mut Vec<SmolStr>) {
 pub(crate) fn rederive_settled_dynamic_fields(
     db: &mut DbIndex,
     context: &mut AnalyzeContext,
+    moved_owners: Option<&FxHashSet<LuaTypeOwner>>,
 ) -> bool {
     // Kept, not taken: the settled tail runs to a fixpoint and each round
     // re-derives the same candidates against what the previous one landed.
@@ -2042,6 +2043,15 @@ pub(crate) fn rederive_settled_dynamic_fields(
     }
     candidates.sort_by_key(|(file_id, syntax_id)| (*file_id, syntax_id.get_range().start()));
     candidates.dedup();
+    // Later tail rounds only revisit files whose recorded settled reads
+    // intersect what the previous round moved, as the iter-var pass does. The
+    // first round (`None`) runs every candidate and records what each file read.
+    if let Some(moved) = moved_owners {
+        candidates.retain(|(file_id, _)| context.settled_file_reads_moved(*file_id, Some(moved)));
+        if candidates.is_empty() {
+            return false;
+        }
+    }
 
     let mut collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
         Vec::new();
@@ -2054,6 +2064,10 @@ pub(crate) fn rederive_settled_dynamic_fields(
         crate::LuaInferCache,
         Option<FxHashMap<LuaDeclId, Vec<TextSize>>>,
     )> = None;
+    // What each file's re-derivation actually read, recorded for the next
+    // round's filter the way the iter-var pass records.
+    let mut file_reads: FxHashMap<crate::FileId, crate::db_index::read_set::InferenceReadSet> =
+        FxHashMap::default();
     for (file_id, syntax_id) in candidates {
         if current_file
             .as_ref()
@@ -2091,7 +2105,12 @@ pub(crate) fn rederive_settled_dynamic_fields(
         let Some(definition_range) = index_expr.get_index_key().and_then(|k| k.get_range()) else {
             continue;
         };
+        crate::db_index::read_set::arm();
         let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) else {
+            file_reads
+                .entry(file_id)
+                .or_default()
+                .extend(crate::db_index::read_set::disarm());
             continue;
         };
         let effective_type =
@@ -2100,6 +2119,10 @@ pub(crate) fn rederive_settled_dynamic_fields(
 
         let field_names =
             get_field_names(db, cache, root, local_reassignment_positions, &index_expr);
+        file_reads
+            .entry(file_id)
+            .or_default()
+            .extend(crate::db_index::read_set::disarm());
         if is_dynamic_index_key(&index_expr) && field_names.may_have_other_string_names {
             collect_wildcard_for_type(
                 &effective_type,
@@ -2121,6 +2144,10 @@ pub(crate) fn rederive_settled_dynamic_fields(
                 attributed_unattributed.push((field_name, file_id));
             }
         }
+    }
+
+    for (file_id, reads) in file_reads {
+        context.record_settled_tail_filter_reads(file_id, reads);
     }
 
     for (owner, _, _, _) in &mut collected {
