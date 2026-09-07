@@ -1,7 +1,10 @@
 use rustc_hash::FxHashSet as HashSet;
 use std::{ops::Deref, sync::Arc};
 
-use glua_parser::{LuaAstNode, LuaCallExpr, LuaChunk, LuaDocTypeList, LuaExpr, LuaNameExpr};
+use glua_parser::{
+    LuaAstNode, LuaCallExpr, LuaChunk, LuaDocTypeList, LuaExpr, LuaLiteralToken, LuaNameExpr,
+    LuaSyntaxId,
+};
 use internment::ArcIntern;
 use smol_str::SmolStr;
 
@@ -491,6 +494,88 @@ fn apply_call_generic_type_list(
     }
 }
 
+/// Reuse an argument type already inferred for the same call.
+///
+/// `infer_call_arg_expr_list_types` memoises the whole argument list per call
+/// under `(call_syntax_id, None)`. When that entry exists and aligns 1:1 with
+/// `arg_exprs`, a concrete entry is exactly what `infer_expr` returned for the
+/// same expression, so it is reused without re-inference.
+///
+/// `Unknown`/`Nil` entries are never reused: the shared entry stores `Unknown`
+/// when the underlying inference failed, while this path maps `FieldNotFound`
+/// to `Nil` and propagates other errors. Falling back to `infer_expr` for
+/// those keeps the error paths identical.
+fn shared_call_arg_type(
+    cache: &LuaInferCache,
+    call_syntax_id: LuaSyntaxId,
+    arg_exprs: &[LuaExpr],
+    arg_idx: usize,
+) -> Option<LuaType> {
+    let shared = cache.call_arg_types_cache.get(&(call_syntax_id, None))?;
+    if shared.len() != arg_exprs.len() {
+        return None;
+    }
+    let arg_expr = &arg_exprs[arg_idx];
+    let (cached_type, cached_range) = &shared[arg_idx];
+    if *cached_range != arg_expr.get_range() {
+        return None;
+    }
+    match cached_type {
+        LuaType::Unknown | LuaType::Nil => None,
+        _ => {
+            if arg_may_unwrap_variadic(arg_expr, arg_idx, arg_exprs.len()) {
+                return None;
+            }
+            Some(cached_type.clone())
+        }
+    }
+}
+
+/// Whether `infer_expr` on this argument may yield a `Variadic` that the
+/// shared call-arg list stores unwrapped (a `Base` variadic behind a trailing
+/// call or a `...` literal collapses to one entry, so reusing it would lose
+/// the `Variadic` wrapper the `(_, Variadic)` arm dispatches on).
+fn arg_may_unwrap_variadic(arg_expr: &LuaExpr, arg_idx: usize, arg_count: usize) -> bool {
+    match arg_expr {
+        LuaExpr::LiteralExpr(literal_expr) => {
+            matches!(literal_expr.get_literal(), Some(LuaLiteralToken::Dots(_)))
+        }
+        LuaExpr::CallExpr(_) => arg_idx + 1 == arg_count,
+        _ => false,
+    }
+}
+
+fn infer_generic_arg_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_syntax_id: LuaSyntaxId,
+    arg_exprs: &[LuaExpr],
+    arg_idx: usize,
+) -> Result<LuaType, InferFailReason> {
+    if let Some(shared) = shared_call_arg_type(cache, call_syntax_id, arg_exprs, arg_idx) {
+        return Ok(shared);
+    }
+    match infer_expr(db, cache, arg_exprs[arg_idx].clone()) {
+        Ok(t) => Ok(t),
+        // Unresolved fields infer as nil so follow-up deduction can proceed.
+        Err(InferFailReason::FieldNotFound) => Ok(LuaType::Nil),
+        Err(e) => Err(e),
+    }
+}
+
+fn infer_variadic_tail_arg_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_syntax_id: LuaSyntaxId,
+    arg_exprs: &[LuaExpr],
+    arg_idx: usize,
+) -> Result<LuaType, InferFailReason> {
+    if let Some(shared) = shared_call_arg_type(cache, call_syntax_id, arg_exprs, arg_idx) {
+        return Ok(shared);
+    }
+    infer_expr(db, cache, arg_exprs[arg_idx].clone())
+}
+
 fn infer_generic_types_from_call(
     db: &DbIndex,
     context: &mut TplContext,
@@ -523,6 +608,7 @@ fn infer_generic_types_from_call(
         _ => {}
     }
 
+    let call_syntax_id = call_expr.get_syntax_id();
     let mut unresolve_tpls = vec![];
     for i in 0..func_params.len() {
         if i >= arg_exprs.len() {
@@ -548,21 +634,29 @@ fn infer_generic_types_from_call(
             continue;
         }
 
-        let arg_type = match infer_expr(db, context.cache, call_arg_expr.clone()) {
-            Ok(t) => t,
-            Err(InferFailReason::FieldNotFound) => LuaType::Nil, // 对于未找到的字段, 我们认为是 nil 以执行后续推断
-            Err(e) => return Err(e),
-        };
-        match (func_param_type, &arg_type) {
-            (LuaType::Variadic(variadic), _) => {
-                let mut arg_types = vec![];
-                for arg_expr in &arg_exprs[i..] {
-                    let arg_type = infer_expr(db, context.cache, arg_expr.clone())?;
-                    arg_types.push(arg_type);
-                }
-                variadic_tpl_pattern_match(context, variadic, &arg_types)?;
-                break;
+        // A variadic parameter discards the single pre-inferred argument type
+        // below (the tail re-infers with `?` error semantics), so inferring it
+        // first would infer `arg_exprs[i]` twice for the same call. Go straight
+        // to the tail loop instead; the first tail inference returns the same
+        // `Err` the skipped pre-inference would have returned.
+        if let LuaType::Variadic(variadic) = &func_params[i].1 {
+            let mut arg_types = Vec::with_capacity(arg_exprs.len() - i);
+            for tail_idx in i..arg_exprs.len() {
+                let arg_type = infer_variadic_tail_arg_type(
+                    db,
+                    context.cache,
+                    call_syntax_id,
+                    arg_exprs,
+                    tail_idx,
+                )?;
+                arg_types.push(arg_type);
             }
+            variadic_tpl_pattern_match(context, variadic, &arg_types)?;
+            break;
+        }
+
+        let arg_type = infer_generic_arg_type(db, context.cache, call_syntax_id, arg_exprs, i)?;
+        match (func_param_type, &arg_type) {
             (_, LuaType::Variadic(variadic)) => {
                 let func_param_types = func_params[i..]
                     .iter()
