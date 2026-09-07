@@ -9,8 +9,7 @@ use std::cmp::Ordering;
 use std::time::Duration;
 
 use crate::{
-    FileId, InferFailReason, LuaDeclTypeKind, LuaMemberFeature, LuaSemanticDeclId, LuaTypeDecl,
-    LuaTypeFlag,
+    FileId, InferFailReason, LuaDeclTypeKind, LuaMemberFeature, LuaTypeDecl, LuaTypeFlag,
     compilation::analyzer::{
         AnalysisPipeline, call_site_params::materialize_call_result_consumer,
         unresolve::resolve::try_resolve_special_call,
@@ -18,14 +17,14 @@ use crate::{
     db_index::{DbIndex, LuaDeclId, LuaMemberId, LuaSignatureId},
     profile::Profile,
 };
-use check_reason::{check_reach_reason, resolve_all_reason};
+use check_reason::{ExprReachMemo, check_reach_reason, resolve_all_reason};
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaExpr, LuaFuncStat,
     LuaNameToken, LuaTableExpr, LuaTableField,
 };
 use resolve::{
     try_resolve_call_site_contribution, try_resolve_decl, try_resolve_iter_var, try_resolve_module,
-    try_resolve_module_ref, try_resolve_table_field,
+    try_resolve_table_field,
 };
 use resolve_closure::{
     try_resolve_call_closure_params, try_resolve_closure_parent_params, try_resolve_closure_return,
@@ -146,6 +145,12 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
         let mut reason_resolve: FxHashMap<InferFailReason, Vec<UnResolve>> = FxHashMap::default();
         for (unresolve, reason) in context.unresolves.drain(..) {
             reason_resolve.entry(reason).or_default().push(unresolve);
+        }
+        // Groups are drained empty every wave, so a group is sorted exactly when
+        // its membership changes: once here for the initial build, and below for
+        // groups appended to during a wave.
+        for unresolves in reason_resolve.values_mut() {
+            unresolves.sort_unstable_by(unresolve_stable_cmp);
         }
 
         if log_enabled {
@@ -518,7 +523,6 @@ fn attempt_resolve(
         UnResolve::IterDecl(un_resolve_iter_var) => {
             try_resolve_iter_var(db, cache, un_resolve_iter_var)
         }
-        UnResolve::ModuleRef(module_ref) => try_resolve_module_ref(db, cache, module_ref),
         UnResolve::ClosureParentParams(un_resolve_closure_params) => {
             try_resolve_closure_parent_params(db, cache, un_resolve_closure_params)
         }
@@ -577,6 +581,12 @@ fn try_resolve(
     // resolves an item or retires an `(item, reason)` pair, both of which are
     // finite, so the loop terminates.
     let mut requeued: FxHashSet<(UnResolveIdentity, InferFailReason)> = FxHashSet::default();
+    // Memoised `UnResolveExpr` reach results, validated against the write epochs.
+    let mut expr_reach_memo = ExprReachMemo::default();
+    // Counts resolutions that move index state outside the type/return write
+    // epochs (signature params, un-noted doc returns, module exports) so the
+    // reach memo above invalidates on them.
+    let mut other_epoch: u64 = 0;
     // Waves have no file count to report, so they report what is still deferred.
     let initial_outstanding: usize = reason_resolve.values().map(Vec::len).sum();
     loop {
@@ -593,6 +603,11 @@ fn try_resolve(
         let mut retain_unresolve = Vec::new();
         let mut parked = Vec::new();
         let mut retry_file_ids = FxHashSet::default();
+        // Files whose deferred inference results are stale after a move this
+        // wave, cleared lazily before their next read below.
+        let mut pending_clears = FxHashSet::default();
+        // Reason groups appended to this wave; the only ones that can be unsorted.
+        let mut touched: FxHashSet<InferFailReason> = FxHashSet::default();
 
         // Only re-sort keys when the set of reason groups has changed.
         // This avoids cloning and sorting on every inner loop iteration.
@@ -612,7 +627,17 @@ fn try_resolve(
             };
 
             let reach_start = profile_enabled.then(std::time::Instant::now);
-            let reached = check_reach_reason(db, infer_manager, &check_reason).unwrap_or(false);
+            if let InferFailReason::UnResolveExpr(expr) = &check_reason
+                && pending_clears.remove(&expr.file_id)
+            {
+                infer_manager.clear_file_deferred_results(expr.file_id);
+            }
+            let reached = match check_reason {
+                InferFailReason::UnResolveExpr(_) => {
+                    expr_reach_memo.check(db, infer_manager, check_reason, other_epoch)
+                }
+                _ => check_reach_reason(db, infer_manager, &check_reason).unwrap_or(false),
+            };
             if let (Some(profile), Some(reach_start)) = (profile.as_mut(), reach_start) {
                 profile.record_reach_check(&check_reason, reached, reach_start.elapsed());
             }
@@ -620,9 +645,11 @@ fn try_resolve(
                 continue;
             }
 
-            unresolves.sort_unstable_by(unresolve_stable_cmp);
             for mut unresolve in unresolves.drain(..) {
                 let file_id = unresolve.get_file_id().unwrap_or(FileId { id: 0 });
+                if pending_clears.remove(&file_id) {
+                    infer_manager.clear_file_deferred_results(file_id);
+                }
                 let attempt_start = profile_enabled.then(std::time::Instant::now);
                 let writes_before = db.get_type_index().type_writes();
                 let narrowing_root = unresolve.narrowing_root();
@@ -637,7 +664,13 @@ fn try_resolve(
                 // with its writer is a property of the batch rather than of the
                 // source.
                 if db.get_type_index().type_writes() != writes_before {
-                    infer_manager.clear_file_deferred_results(file_id);
+                    // Deferred to the next read of this file's cache: only that
+                    // file's attempts populate it, so clearing then leaves every
+                    // read the same cache state an eager clear would have, while
+                    // back-to-back moves in one file share a single clear. Files
+                    // with no further read this wave are covered by the
+                    // end-of-wave purge below.
+                    pending_clears.insert(file_id);
                     retry_file_ids.insert(file_id);
                     // Narrowing answers are the expensive half of that cache and
                     // are keyed by the variable they narrow, not by what the
@@ -666,6 +699,19 @@ fn try_resolve(
                 match resolve_result {
                     Ok(_) => {
                         changed = true;
+                        // These resolutions move index state the expression reach
+                        // memo cannot see in the type/return write epochs, so
+                        // they invalidate it explicitly.
+                        if matches!(
+                            unresolve,
+                            UnResolve::ClosureParams(_)
+                                | UnResolve::ClosureParentParams(_)
+                                | UnResolve::ClosureReturn(_)
+                                | UnResolve::Module(_)
+                                | UnResolve::SpecialCall(_)
+                        ) {
+                            other_epoch += 1;
+                        }
                         // A local this wave settles had a placeholder during
                         // the walk, and the writes that read it then hold that
                         // placeholder's answer. See
@@ -751,6 +797,7 @@ fn try_resolve(
 
         let mut keys_changed = !retain_unresolve.is_empty();
         for (unresolve, reason) in retain_unresolve {
+            touched.insert(reason.clone());
             reason_resolve.entry(reason).or_default().push(unresolve);
         }
 
@@ -775,7 +822,17 @@ fn try_resolve(
 
         keys_changed |= !parked.is_empty();
         for (unresolve, reason) in parked {
+            touched.insert(reason.clone());
             reason_resolve.entry(reason).or_default().push(unresolve);
+        }
+
+        // Drained groups leave sorted, so only groups appended to above can be
+        // unsorted. Sorting those here attempts each wave's arrivals once
+        // instead of re-sorting every group on every wave.
+        for reason in touched {
+            if let Some(unresolves) = reason_resolve.get_mut(&reason) {
+                unresolves.sort_unstable_by(unresolve_stable_cmp);
+            }
         }
 
         // Re-use cached sorted keys if no new reason groups were added.
@@ -1009,10 +1066,9 @@ fn unresolve_kind_rank(unresolve: &UnResolve) -> u8 {
         UnResolve::ClosureParams(_) => 5,
         UnResolve::ClosureReturn(_) => 6,
         UnResolve::ClosureParentParams(_) => 7,
-        UnResolve::ModuleRef(_) => 8,
-        UnResolve::TableField(_) => 9,
-        UnResolve::SpecialCall(_) => 10,
-        UnResolve::CallSiteContribution(_) => 11,
+        UnResolve::TableField(_) => 8,
+        UnResolve::SpecialCall(_) => 9,
+        UnResolve::CallSiteContribution(_) => 10,
     }
 }
 
@@ -1024,7 +1080,6 @@ fn unresolve_kind_rank(unresolve: &UnResolve) -> u8 {
 enum UnResolveDiscriminator {
     None,
     ParamIdx(usize),
-    Owner(LuaSemanticDeclId),
     /// The write a deferred local binding came from: a local with several
     /// deferred writes carries one item per write.
     Write(u32),
@@ -1044,7 +1099,6 @@ fn unresolve_identity(unresolve: &UnResolve) -> UnResolveIdentity {
         UnResolve::ClosureParams(d) => UnResolveDiscriminator::ParamIdx(d.param_idx),
         UnResolve::ClosureReturn(d) => UnResolveDiscriminator::ParamIdx(d.param_idx),
         UnResolve::CallSiteContribution(d) => UnResolveDiscriminator::ParamIdx(d.param_idx),
-        UnResolve::ModuleRef(d) => UnResolveDiscriminator::Owner(d.owner_id.clone()),
         _ => UnResolveDiscriminator::None,
     };
     (
@@ -1108,7 +1162,6 @@ pub enum UnResolve {
     ClosureParams(Box<UnResolveCallClosureParams>),
     ClosureReturn(Box<UnResolveClosureReturn>),
     ClosureParentParams(Box<UnResolveParentClosureParams>),
-    ModuleRef(Box<UnResolveModuleRef>),
     TableField(Box<UnResolveTableField>),
     SpecialCall(Box<UnResolveSpecialCall>),
     CallSiteContribution(Box<UnResolveCallSiteContribution>),
@@ -1133,7 +1186,6 @@ impl UnResolve {
                 Some(un_resolve_closure_params.file_id)
             }
             UnResolve::TableField(un_resolve_table_field) => Some(un_resolve_table_field.file_id),
-            UnResolve::ModuleRef(_) => None,
             UnResolve::SpecialCall(un_resolve_special_call) => {
                 Some(un_resolve_special_call.file_id)
             }
@@ -1198,7 +1250,6 @@ impl UnResolve {
             UnResolve::ClosureParentParams(d) => {
                 (d.file_id.id, u32::from(d.signature_id.get_position()))
             }
-            UnResolve::ModuleRef(d) => (0, d.module_file_id.id),
             UnResolve::TableField(d) => (
                 d.file_id.id,
                 u32::from(d.field.syntax().text_range().start()),
@@ -1310,18 +1361,6 @@ pub struct UnResolveClosureReturn {
 impl From<UnResolveClosureReturn> for UnResolve {
     fn from(un_resolve_closure_return: UnResolveClosureReturn) -> Self {
         UnResolve::ClosureReturn(Box::new(un_resolve_closure_return))
-    }
-}
-
-#[derive(Debug)]
-pub struct UnResolveModuleRef {
-    pub owner_id: LuaSemanticDeclId,
-    pub module_file_id: FileId,
-}
-
-impl From<UnResolveModuleRef> for UnResolve {
-    fn from(un_resolve_module_ref: UnResolveModuleRef) -> Self {
-        UnResolve::ModuleRef(Box::new(un_resolve_module_ref))
     }
 }
 

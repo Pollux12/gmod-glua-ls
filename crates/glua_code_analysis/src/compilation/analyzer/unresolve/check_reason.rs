@@ -68,6 +68,44 @@ pub fn check_reach_reason(
     }
 }
 
+/// Memoised `UnResolveExpr` reach results for one `try_resolve` call.
+///
+/// The check runs a full `infer_expr`, which on a cold cache is the expensive
+/// half of the reach gate. Re-running it once per wave for every surviving
+/// expression group is pure re-derivation while nothing the expression could
+/// read has moved, so entries are validated against the type/return write
+/// epochs plus a caller-bumped epoch covering index writes outside those
+/// counters (signature params, un-noted doc returns, module exports).
+#[derive(Default)]
+pub struct ExprReachMemo {
+    entries: FxHashMap<InferFailReason, (bool, u64, u64, u64)>,
+}
+
+impl ExprReachMemo {
+    pub fn check(
+        &mut self,
+        db: &DbIndex,
+        infer_manager: &mut InferCacheManager,
+        reason: &InferFailReason,
+        other_epoch: u64,
+    ) -> bool {
+        let epochs = (
+            db.get_type_index().type_writes(),
+            db.get_signature_index().return_writes(),
+            other_epoch,
+        );
+        if let Some((reached, type_epoch, return_epoch, seen_other)) = self.entries.get(reason)
+            && (*type_epoch, *return_epoch, *seen_other) == epochs
+        {
+            return *reached;
+        }
+        let reached = check_reach_reason(db, infer_manager, reason).unwrap_or(false);
+        self.entries
+            .insert(reason.clone(), (reached, epochs.0, epochs.1, epochs.2));
+        reached
+    }
+}
+
 pub fn resolve_all_reason(
     db: &mut DbIndex,
     reason_unresolves: &mut FxHashMap<InferFailReason, Vec<UnResolve>>,

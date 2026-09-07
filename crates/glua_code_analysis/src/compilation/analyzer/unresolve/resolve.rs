@@ -51,8 +51,8 @@ use smol_str::SmolStr;
 
 use super::{
     CallSiteContributionKind, ResolveResult, UnResolveCallSiteContribution, UnResolveDecl,
-    UnResolveIterVar, UnResolveMember, UnResolveModule, UnResolveModuleRef, UnResolveReturn,
-    UnResolveTableField, resolve_closure::inferred_return_tail_matching_documented_first,
+    UnResolveIterVar, UnResolveMember, UnResolveModule, UnResolveReturn, UnResolveTableField,
+    resolve_closure::inferred_return_tail_matching_documented_first,
 };
 
 /// Re-derive one call-site parameter contribution whose type was not
@@ -976,39 +976,6 @@ fn iter_var_holds_tpl_placeholder(
     db.get_type_index()
         .get_type_cache(&decl_id.into())
         .is_some_and(|cache| cache.as_type().contain_tpl())
-}
-
-pub fn try_resolve_module_ref(
-    db: &mut DbIndex,
-    _: &mut LuaInferCache,
-    module_ref: &UnResolveModuleRef,
-) -> ResolveResult {
-    let module_index = db.get_module_index();
-    let module = module_index
-        .get_module(module_ref.module_file_id)
-        .ok_or(InferFailReason::None)?;
-    let export_type = module.export_type.clone().ok_or(InferFailReason::None)?;
-    match &module_ref.owner_id {
-        LuaSemanticDeclId::LuaDecl(decl_id) => {
-            write_type_cache(
-                db,
-                (*decl_id).into(),
-                LuaTypeCache::InferType(export_type),
-                TypeCacheWriteMode::InsertOnly,
-            );
-        }
-        LuaSemanticDeclId::Member(member_id) => {
-            write_type_cache(
-                db,
-                (*member_id).into(),
-                LuaTypeCache::InferType(export_type),
-                TypeCacheWriteMode::InsertOnly,
-            );
-        }
-        _ => {}
-    };
-
-    Ok(())
 }
 
 pub fn try_resolve_special_call(
