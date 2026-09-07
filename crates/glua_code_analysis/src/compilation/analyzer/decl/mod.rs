@@ -13,7 +13,7 @@ use crate::{
 
 use super::{
     AnalyzeContext,
-    common::{TypeCacheWriteMode, write_type_cache},
+    common::{TypeCacheWriteMode, estimate_file_index_entries, write_type_cache},
     gmod::ensure_scoped_class_type_decl_for_file,
 };
 use glua_parser::{
@@ -60,6 +60,18 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
 
             db.get_reference_index_mut()
                 .create_local_reference(in_filed_tree.file_id);
+
+            // Pre-size the member and reference tables for this file's writes
+            // from its text length, without walking the tree: the walk below
+            // inserts one entry per member/reference, which otherwise rehashes
+            // the workspace-wide maps once per growth step for every file.
+            let estimate = estimate_file_index_entries(usize::from(
+                in_filed_tree.value.syntax().text_range().len(),
+            ));
+            db.get_member_index_mut()
+                .reserve_for_file(in_filed_tree.file_id, estimate);
+            db.get_reference_index_mut()
+                .reserve_for_file(in_filed_tree.file_id, estimate);
 
             let mut analyzer = DeclAnalyzer::new(
                 db,

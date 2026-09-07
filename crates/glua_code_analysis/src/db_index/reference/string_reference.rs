@@ -21,6 +21,12 @@ impl StringReference {
             .push(range);
     }
 
+    /// Reserves capacity for one file's worth of distinct strings.
+    /// Capacity only; lengths and contents are unchanged.
+    pub fn reserve(&mut self, additional: usize) {
+        self.string_references.reserve(additional);
+    }
+
     pub fn get_string_references(&self, string: &str) -> Vec<TextRange> {
         self.string_references
             .get(string)

@@ -55,6 +55,32 @@ impl LuaReferenceIndex {
         self.file_revision.get(&file_id).copied().unwrap_or(0)
     }
 
+    /// Reserves capacity for one file's worth of reference writes.
+    ///
+    /// `entries` is a cheap upper-bound hint (see
+    /// `crate::compilation::analyzer::common::estimate_file_index_entries`),
+    /// not a count the index trusts: maps keep their exact contents, so the
+    /// hint only changes rehashing, never facts. Distinct member keys are a
+    /// fraction of reference writes, hence the scaled outer-map reservations.
+    /// `file_revision` is intentionally untouched: a revision is minted on the
+    /// first real write, and reserving must not consume one.
+    pub fn reserve_for_file(&mut self, file_id: FileId, entries: usize) {
+        self.file_references
+            .entry(file_id)
+            .or_default()
+            .reserve(entries);
+        self.index_reference.reserve(entries / 4 + 1);
+        self.global_references.reserve(entries / 4 + 1);
+        self.string_references
+            .entry(file_id)
+            .or_insert_with(StringReference::new)
+            .reserve(entries / 8 + 1);
+        self.type_references
+            .entry(file_id)
+            .or_default()
+            .reserve(entries / 8 + 1);
+    }
+
     fn bump_file_revision(&mut self, file_id: FileId) {
         let revision = self.next_revision;
         self.next_revision += 1;
@@ -454,5 +480,28 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn reserve_for_file_leaves_reference_contents_and_revisions_unchanged() {
+        let first = FileId::new(1);
+        let range = TextRange::new(TextSize::new(0), TextSize::new(1));
+        let mut index = LuaReferenceIndex::new();
+        index.reserve_for_file(first, 64);
+
+        assert_eq!(index.file_reference_revision(first), 0);
+        assert!(
+            index
+                .get_local_reference(&first)
+                .is_none_or(|references| references.get_decl_references_map().is_empty())
+        );
+
+        let syntax_id = LuaSyntaxId::new(LuaSyntaxKind::NameExpr.into(), range);
+        let member_key = LuaMemberKey::Name("field".into());
+        index.add_index_reference(member_key.clone(), first, syntax_id);
+        index.add_global_reference("GLOBAL", first, syntax_id);
+
+        assert_eq!(index.get_index_references(&member_key).unwrap().len(), 1);
+        assert_eq!(index.get_global_references("GLOBAL").unwrap().len(), 1);
     }
 }

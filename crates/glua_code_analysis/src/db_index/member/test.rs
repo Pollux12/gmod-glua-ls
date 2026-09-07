@@ -1157,4 +1157,19 @@ mod tests {
         assert!(!index.member_owner_key_history_index.contains_key(&owner));
         assert!(!index.member_current_owner.contains_key(&member_id));
     }
+
+    #[test]
+    fn reserve_for_file_leaves_index_contents_unchanged() {
+        let mut index = LuaMemberIndex::new();
+        let file_id = FileId::new(1);
+        index.reserve_for_file(file_id, 64);
+        assert!(index.get_file_members(file_id).is_empty());
+
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("ReservedType"));
+        let member_id = make_index_member_id(file_id, 10);
+        index.add_member(owner.clone(), make_member(member_id, "field"));
+
+        assert_eq!(owner_member_ids(&index, &owner), vec![member_id]);
+        assert_eq!(index.get_file_members(file_id).len(), 1);
+    }
 }
