@@ -331,13 +331,17 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                 // read-set filter all see only owners whose cached type
                 // actually differs across the round boundary.
                 let boundary_before = snapshot_settled_tail_boundary(db, &context);
-                let global_owners = rederive_settled_global_reads(db, &mut context);
+                let global_owners =
+                    rederive_settled_global_reads(db, &mut context, moved_owners.as_ref());
                 // Runs inside the loop: the records it adds are read by the
                 // iterated-table answers below, and its own prefixes read the
                 // loop variables those answers settle — each direction needs
                 // the other's previous round.
-                let dynamic_fields_moved =
-                    dynamic_field::rederive_settled_dynamic_fields(db, &mut context);
+                let dynamic_fields_moved = dynamic_field::rederive_settled_dynamic_fields(
+                    db,
+                    &mut context,
+                    moved_owners.as_ref(),
+                );
                 let (_iter_moved, _iter_var_owners) =
                     rederive_settled_iter_vars(db, &mut context, moved_owners.as_ref());
                 let returns_moved = rederive_settled_inferred_returns(db, &mut context);
@@ -372,7 +376,8 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                 // differs across this round. Mid-round ping-pong cancels here.
                 let net_moved = diff_settled_tail_boundary(db, &boundary_before);
                 queue_settled_decl_dependents(db, &mut context, &net_moved);
-                let member_keys_moved = refresh_settled_expr_type_member_keys(db, &mut context);
+                let member_keys_moved =
+                    refresh_settled_expr_type_member_keys(db, &mut context, moved_owners.as_ref());
                 // Dynamic-field records, inferred signature returns, and member
                 // keys are not type-owner state, so the boundary fingerprint
                 // below cannot see them move. A recurring fingerprint amid that
@@ -872,7 +877,11 @@ fn is_settled_member_rekey_candidate(member: &LuaMember) -> bool {
 /// Returns whether any member key moved. A rekeyed member-map reader may answer
 /// differently now, so the settled tail continues the loop — and re-derives
 /// every candidate unfiltered next round — when it does.
-fn refresh_settled_expr_type_member_keys(db: &mut DbIndex, context: &mut AnalyzeContext) -> bool {
+fn refresh_settled_expr_type_member_keys(
+    db: &mut DbIndex,
+    context: &mut AnalyzeContext,
+    moved_owners: Option<&HashSet<LuaTypeOwner>>,
+) -> bool {
     let mut file_ids = context
         .analyzed_file_ids()
         .into_iter()
@@ -887,6 +896,13 @@ fn refresh_settled_expr_type_member_keys(db: &mut DbIndex, context: &mut Analyze
         return false;
     }
     file_ids.sort_unstable();
+    // Later tail rounds only revisit files whose recorded settled reads
+    // intersect what the previous round moved. The first round (`None`) runs
+    // every candidate file and records what each one read.
+    file_ids.retain(|file_id| context.settled_file_reads_moved(*file_id, moved_owners));
+    if file_ids.is_empty() {
+        return false;
+    }
 
     let analysis_phase = context.infer_manager.current_phase();
     let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
@@ -907,7 +923,11 @@ fn refresh_settled_expr_type_member_keys(db: &mut DbIndex, context: &mut Analyze
             .get_syntax_tree(&file_id)
             .map(|tree| tree.get_red_root())
         else {
-            return Vec::new();
+            return (
+                file_id,
+                Vec::new(),
+                crate::db_index::read_set::InferenceReadSet::default(),
+            );
         };
 
         let mut members = db
@@ -920,6 +940,7 @@ fn refresh_settled_expr_type_member_keys(db: &mut DbIndex, context: &mut Analyze
         members.sort_by_key(|(member_id, _)| member_id.get_syntax_id().get_range().start());
 
         let mut updates = Vec::new();
+        crate::db_index::read_set::arm();
         for (member_id, current_key) in members {
             let Some(node) = member_id.get_syntax_id().to_node_from_root(&root) else {
                 continue;
@@ -959,11 +980,12 @@ fn refresh_settled_expr_type_member_keys(db: &mut DbIndex, context: &mut Analyze
             }
             updates.push((member_id, settled_key));
         }
-        updates
+        (file_id, updates, crate::db_index::read_set::disarm())
     });
 
     let mut moved = false;
-    for updates in results {
+    for (file_id, updates, reads) in results {
+        context.record_settled_tail_filter_reads(file_id, reads);
         for (member_id, settled_key) in updates {
             if db
                 .get_member_index_mut()
@@ -988,11 +1010,24 @@ fn refresh_settled_expr_type_member_keys(db: &mut DbIndex, context: &mut Analyze
 fn rederive_settled_global_reads(
     db: &mut DbIndex,
     context: &mut AnalyzeContext,
+    moved_owners: Option<&HashSet<LuaTypeOwner>>,
 ) -> HashSet<LuaTypeOwner> {
-    let standard = context.settled_global_read_candidates.clone();
-    let multi_decl = context.settled_multi_decl_global_read_candidates.clone();
+    let mut standard = context.settled_global_read_candidates.clone();
+    let mut multi_decl = context.settled_multi_decl_global_read_candidates.clone();
     if standard.is_empty() && multi_decl.is_empty() {
         return HashSet::default();
+    }
+    // Later tail rounds only re-read files whose recorded settled reads
+    // intersect what the previous round moved; anything else re-derives the
+    // same answer. The first round (`None`) runs every candidate and records.
+    if moved_owners.is_some() {
+        standard
+            .retain(|(decl_id, _)| context.settled_file_reads_moved(decl_id.file_id, moved_owners));
+        multi_decl
+            .retain(|(decl_id, _)| context.settled_file_reads_moved(decl_id.file_id, moved_owners));
+        if standard.is_empty() && multi_decl.is_empty() {
+            return HashSet::default();
+        }
     }
 
     let files = standard
@@ -1017,6 +1052,9 @@ fn rederive_settled_global_reads(
     let generic_initializer_candidates = context.settled_decl_initializer_candidates.clone();
     context.infer_manager.clear_files_deferred_results(&files);
 
+    // What each file's re-derivation actually read, recorded for the next
+    // round's filter the way the iter-var and initializer passes record.
+    let mut file_reads = HashMap::<FileId, crate::db_index::read_set::InferenceReadSet>::default();
     // `allow_unsubsumed_swap` is set for reads through a multi-declaration
     // global: those are one runtime table, so the read against the complete set
     // of backing tables replaces the walk's read against a subset even when the
@@ -1054,7 +1092,13 @@ fn rederive_settled_global_reads(
                 fills_own_default: lua::expr_fills_own_default(db, decl_id.file_id, decl_id, &expr),
             };
             let cache = context.infer_manager.get_infer_cache(decl_id.file_id);
-            let Ok(settled) = crate::semantic::infer_expr(db, cache, expr) else {
+            crate::db_index::read_set::arm();
+            let inferred = crate::semantic::infer_expr(db, cache, expr);
+            file_reads
+                .entry(decl_id.file_id)
+                .or_default()
+                .extend(crate::db_index::read_set::disarm());
+            let Ok(settled) = inferred else {
                 continue;
             };
             // Re-deriving may only add to what the walk found, never swap it. The
@@ -1091,6 +1135,9 @@ fn rederive_settled_global_reads(
                 common::bind_decl_write(db, decl_id, LuaTypeCache::InferType(settled), write);
             }
         }
+    }
+    for (file_id, reads) in file_reads {
+        context.record_settled_tail_filter_reads(file_id, reads);
     }
     let moved = before
         .into_iter()
@@ -3202,6 +3249,11 @@ pub struct AnalyzeContext {
     /// three dependency kinds.
     /// See [`crate::db_index::read_set`].
     settled_read_sets: HashMap<FileId, crate::db_index::read_set::InferenceReadSet>,
+    /// Per file, what the settled-tail passes that filter by moved owners read.
+    /// Consulted by the tail filter alongside [`Self::settled_read_sets`], but
+    /// never persisted: persisting it would widen the incremental dirty sets
+    /// the edit path derives from the persisted reads.
+    settled_tail_filter_reads: HashMap<FileId, crate::db_index::read_set::InferenceReadSet>,
     /// See [`AnalyzeContext::record_settled_global_read_candidate`].
     settled_global_read_candidates: Vec<(LuaDeclId, LuaExpr)>,
     /// Decls reading through a multi-declaration global. Unlike
@@ -3261,6 +3313,7 @@ impl AnalyzeContext {
             settled_guarded_bootstrap_candidates: Vec::new(),
             settled_iter_var_candidates: Vec::new(),
             settled_read_sets: HashMap::default(),
+            settled_tail_filter_reads: HashMap::default(),
             settled_global_read_candidates: Vec::new(),
             settled_multi_decl_global_read_candidates: Vec::new(),
             settled_dynamic_field_candidates: Vec::new(),
@@ -3364,12 +3417,20 @@ impl AnalyzeContext {
         let Some(moved_owners) = moved_owners else {
             return true;
         };
-        match self.settled_read_sets.get(&file_id) {
-            Some(reads) => reads
-                .type_owners
-                .iter()
-                .any(|owner| moved_owners.contains(owner)),
-            None => true,
+        let reads_moved = |reads: Option<&crate::db_index::read_set::InferenceReadSet>| {
+            reads.is_some_and(|reads| {
+                reads
+                    .type_owners
+                    .iter()
+                    .any(|owner| moved_owners.contains(owner))
+            })
+        };
+        match (
+            self.settled_read_sets.get(&file_id),
+            self.settled_tail_filter_reads.get(&file_id),
+        ) {
+            (None, None) => true,
+            (persisted, filter) => reads_moved(persisted) || reads_moved(filter),
         }
     }
 
@@ -3379,6 +3440,20 @@ impl AnalyzeContext {
         reads: crate::db_index::read_set::InferenceReadSet,
     ) {
         self.settled_read_sets
+            .entry(file_id)
+            .or_default()
+            .extend(reads);
+    }
+
+    /// Records reads for the settled-tail filter without touching the persisted
+    /// per-file settled reads that drive incremental dirtying. For the tail
+    /// passes whose reads must not widen the edit path's dirty sets.
+    fn record_settled_tail_filter_reads(
+        &mut self,
+        file_id: FileId,
+        reads: crate::db_index::read_set::InferenceReadSet,
+    ) {
+        self.settled_tail_filter_reads
             .entry(file_id)
             .or_default()
             .extend(reads);
