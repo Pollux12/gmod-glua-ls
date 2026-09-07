@@ -47,6 +47,7 @@ use crate::{
     profile::Profile,
 };
 use rowan::{TextRange, TextSize};
+use rustc_hash::FxHasher;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
@@ -388,12 +389,15 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         }
 
         let t_load = do_profile.then(std::time::Instant::now);
+        let load_roles_ptr = Arc::as_ptr(&annotated_global_call_roles) as usize;
         crate::profile::phase("gmodpre/rebuild_load_index", || {
             rebuild_gmod_load_index(
                 db,
                 &branch_realm_ranges,
+                &annotation_realms,
                 &file_ids,
                 &annotated_global_call_roles,
+                load_roles_ptr,
             )
         });
         if let Some(t_load) = t_load {
@@ -531,8 +535,35 @@ impl AnalysisPipeline for GmodNetworkAnalysisPipeline {
         };
         db.get_gmod_network_index_mut()
             .restore_helper_name_memo(helper_name_memo);
+        // B8: the fold identity pins the helpers collection resolves
+        // through. A reused fold keeps its `Arc` allocation, so pointer
+        // identity is a content identity for everything the expansion below
+        // can read from it.
+        let registry_identity = Arc::as_ptr(&helper_registry) as usize;
+        // Files parked by `remove` whose staged inputs still describe them
+        // keep their stored flows: their own tree, every expanded helper's
+        // tree and the fold are all unchanged, so recollecting would derive
+        // the same flows. The check is O(batch) cheap reads; only the rest
+        // pays the walks below.
+        let recollect: Vec<FileId> = file_ids
+            .iter()
+            .copied()
+            .filter(|file_id| !network_staged_inputs_are_fresh(db, *file_id, registry_identity))
+            .collect();
+        // Restoring first keeps `iter_send_flows` (sorted by file id, with
+        // replaced definitions hidden through the refcount) deterministic
+        // regardless of which files recollected: retained entries never leave
+        // the index in a different order.
+        let recollect_set: HashSet<FileId> = recollect.iter().copied().collect();
+        for file_id in file_ids
+            .iter()
+            .copied()
+            .filter(|file_id| !recollect_set.contains(file_id))
+        {
+            db.get_gmod_network_index_mut().restore_staged_file(file_id);
+        }
         let collected = crate::profile::phase("gmodnet/collect_flows", || {
-            super::parallel::map_files_collect(db, &file_ids, |db, file_id| {
+            super::parallel::map_files_collect(db, &recollect, |db, file_id| {
                 collect_file_network_flows(
                     db,
                     file_id,
@@ -544,13 +575,98 @@ impl AnalysisPipeline for GmodNetworkAnalysisPipeline {
                 )
             })
         });
-        for (file_id, network_data) in file_ids.iter().zip(collected) {
+        for (file_id, (network_data, expanded_helpers)) in recollect.iter().zip(collected) {
+            let inputs = network_file_inputs_for_collection(
+                db,
+                *file_id,
+                registry_identity,
+                &expanded_helpers,
+            );
             if network_data.send_flows.is_empty() && network_data.receive_flows.is_empty() {
+                // No flows to store, but the inputs still describe the file:
+                // recording them keeps empty files retainable without
+                // recollecting. Any previously parked entry was superseded.
+                db.get_gmod_network_index_mut().drop_staged_file(*file_id);
+                db.get_gmod_network_index_mut()
+                    .set_file_inputs(*file_id, inputs);
                 continue;
             }
             db.get_gmod_network_index_mut()
                 .add_file_data(*file_id, network_data);
+            db.get_gmod_network_index_mut()
+                .set_file_inputs(*file_id, inputs);
         }
+        // Anything still parked belongs to a deleted file: live files were
+        // either recollected or restored above.
+        let live_check: Vec<FileId> = db.get_vfs().get_all_file_ids().into_iter().collect();
+        let live_set: HashSet<FileId> = live_check.into_iter().collect();
+        db.get_gmod_network_index_mut()
+            .prune_staged_dead_files(|file_id| live_set.contains(&file_id));
+    }
+}
+
+/// Hash of a file's content for the B8 retain check. `None` when the file has
+/// no content (deleted or never loaded) — a missing tree can never be fresh.
+fn hash_network_file_content(db: &DbIndex, file_id: &FileId) -> Option<u64> {
+    db.get_vfs()
+        .get_file_content(file_id)
+        .map(|content| hash_u64_with(|h| content.hash(h)))
+}
+
+/// Whether the flows parked for `file_id` still describe it: the staged
+/// inputs exist, the fold is the same allocation, the file's own content
+/// hashes equal, and every expanded helper file's content hashes equal.
+/// Conservative throughout: anything unreadable or changed recollects.
+fn network_staged_inputs_are_fresh(
+    db: &DbIndex,
+    file_id: FileId,
+    registry_identity: usize,
+) -> bool {
+    let Some(staged) = db.get_gmod_network_index().staged_file_inputs(file_id) else {
+        return false;
+    };
+    if staged.registry_identity != registry_identity {
+        return false;
+    }
+    if hash_network_file_content(db, &file_id) != Some(staged.content_hash) {
+        return false;
+    }
+    staged
+        .helper_contents
+        .iter()
+        .all(|(helper_file_id, _, hash)| hash_network_file_content(db, helper_file_id) == *hash)
+}
+
+/// Inputs describing a fresh collection, for [`NetworkFileInputs`].
+/// `expanded_helpers` holds every cross-file body the walks resolved, so the
+/// retain check pins exactly the files the flows were derived from.
+fn network_file_inputs_for_collection(
+    db: &DbIndex,
+    file_id: FileId,
+    registry_identity: usize,
+    expanded_helpers: &HashSet<HelperId>,
+) -> crate::db_index::NetworkFileInputs {
+    let mut helper_contents: Vec<(FileId, TextRange, Option<u64>)> = expanded_helpers
+        .iter()
+        .map(|(helper_file_id, range)| {
+            (
+                *helper_file_id,
+                *range,
+                hash_network_file_content(db, helper_file_id),
+            )
+        })
+        .collect();
+    helper_contents.sort_by_key(|(helper_file_id, range, _)| {
+        (
+            *helper_file_id,
+            u32::from(range.start()),
+            u32::from(range.end()),
+        )
+    });
+    crate::db_index::NetworkFileInputs {
+        content_hash: hash_network_file_content(db, &file_id).unwrap_or(0),
+        registry_identity,
+        helper_contents,
     }
 }
 
@@ -562,13 +678,17 @@ fn collect_file_network_flows(
     reach: &HelperStartReachCache,
     helper_call_sites: &NetHelperCallSites,
     resolve_shared: &Arc<NetResolveShared>,
-) -> crate::db_index::FileNetworkData {
+) -> (crate::db_index::FileNetworkData, HashSet<HelperId>) {
+    let mut expanded_helpers = HashSet::default();
     let Some(root) = db
         .get_vfs()
         .get_syntax_tree(&file_id)
         .map(|tree| tree.get_chunk_node())
     else {
-        return crate::db_index::FileNetworkData::default();
+        return (
+            crate::db_index::FileNetworkData::default(),
+            expanded_helpers,
+        );
     };
 
     // N3: one descendants pass per file builds the helper-lookup map and the
@@ -613,10 +733,11 @@ fn collect_file_network_flows(
             reach,
             Some(&net_candidates),
             &mut registry_roots,
+            &mut expanded_helpers,
         )
     });
 
-    collect_network_flow_metadata(
+    let data = collect_network_flow_metadata(
         db,
         file_id,
         root,
@@ -629,7 +750,9 @@ fn collect_file_network_flows(
         &mut resolve_memo,
         reach,
         &mut registry_roots,
-    )
+        &mut expanded_helpers,
+    );
+    (data, expanded_helpers)
 }
 
 /// Post-analysis phase: runs AFTER lua_analyze.
@@ -968,11 +1091,14 @@ pub(crate) struct HelperRegistry {
 
 type IndexedHelperDefinition = (LuaSignatureId, FileId, LuaSyntaxId, Option<GlobalId>);
 
-/// Cache key for the net-helper registry.
+/// Cache key for the within-analyze fast path.
 ///
-/// The registry is a pure function of the syntax trees reachable through the
-/// signature index, so both the VFS content revision and the size of that index
-/// have to take part in the key. Both reads are `O(1)`.
+/// The revision-keyed `helper_registry_cache` slot is only a shortcut for
+/// reusing the fold between the pipelines of a single analyze batch (VFS
+/// content cannot change mid-batch, so the key is stable there). It misses on
+/// every edit by construction (`content_revision` moves on any VFS write, and
+/// `remove_index` clears the slot), so the cross-edit fold cache is the
+/// scan-set-keyed [`CachedHelperFold`] below instead. Both reads are `O(1)`.
 fn helper_registry_revision(db: &DbIndex) -> u64 {
     let content_revision = db.get_vfs().content_revision();
     let signature_count = db.get_signature_index().indexed_signature_count() as u64;
@@ -982,10 +1108,47 @@ fn helper_registry_revision(db: &DbIndex) -> u64 {
         ^ signature_count
 }
 
+/// Sentinel `FileId`s for workspace-wide fold caches kept in
+/// `file_helper_scan_cache`.
+///
+/// `FileId::VIRTUAL` already takes `u32::MAX`, and real ids are handed out
+/// sequentially from zero, so these are unreachable by real files. They are
+/// never passed to `remove_index` (which only ever names real batch files),
+/// which is what lets the caches below survive the per-edit invalidation that
+/// clears the revision-keyed `helper_registry_cache` slot on every edit.
+fn helper_fold_cache_sentinel() -> FileId {
+    FileId::new(u32::MAX - 1)
+}
+
+fn load_snapshot_cache_sentinel() -> FileId {
+    FileId::new(u32::MAX - 2)
+}
+
 /// A single file's cached contribution to the gmod net-helper scan.
 struct FileHelperScan {
     role_map: AnnotatedGmodGlobalCallRoleMap,
     definitions: Vec<IndexedHelperDefinition>,
+}
+
+/// The folded call-role map plus helper registry, keyed on the scan set they
+/// were derived from.
+///
+/// A file's scan is a pure function of that file's own signatures and syntax
+/// tree, so the fold is a pure function of the scan set. Identity is by `Arc`
+/// pointer per path-sorted entry: an unchanged file keeps its cached `Arc`,
+/// while any recomputed, added or removed scan changes the entry. Pointer
+/// equality of the whole vector therefore implies identical fold inputs and
+/// the fold can be reused as-is (the stored registry's `(FileId, LuaSyntaxId)`
+/// targets stay valid because no contributing file changed).
+///
+/// This is deliberately conservative: a recomputed scan whose content happens
+/// to be identical still rebuilds the fold. That only costs an extra fold on
+/// edits that touch helper-carrying files; edits to files without scans
+/// (the common data/config case) keep every `Arc` and skip the fold whole.
+struct CachedHelperFold {
+    scans: Vec<(String, Arc<FileHelperScan>)>,
+    registry: Arc<HelperRegistry>,
+    roles: Arc<AnnotatedGmodGlobalCallRoleMap>,
 }
 
 /// Builds the annotated call-role map and the net-helper registry from
@@ -1070,6 +1233,36 @@ fn build_call_roles_and_registry(
         db.set_cached_file_helper_scan(*file_id, scan);
     }
 
+    // B5: the fold is keyed on the scan set itself, not on `content_revision`.
+    // `scan_files` is already in fixed path order, so zipping the cached
+    // `Arc`s in that order is a deterministic identity of the fold inputs.
+    // Every entry is an `Arc` hit unless its file was (re)scanned above,
+    // added, or removed — pointer equality of the whole vector therefore
+    // means no scan changed and the stored fold is still the answer.
+    let current_scans: Vec<(String, Arc<FileHelperScan>)> = scan_files
+        .iter()
+        .filter_map(|file_id| {
+            let scan = db.get_cached_file_helper_scan::<FileHelperScan>(*file_id)?;
+            let raw_path = db
+                .get_vfs()
+                .get_file_path(file_id)
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default();
+            Some((raw_path, scan))
+        })
+        .collect();
+    if let Some(cached) =
+        db.get_cached_file_helper_scan::<CachedHelperFold>(helper_fold_cache_sentinel())
+        && cached.scans.len() == current_scans.len()
+        && cached.scans.iter().zip(current_scans.iter()).all(
+            |((cached_path, cached_scan), (current_path, current_scan))| {
+                cached_path == current_path && Arc::ptr_eq(cached_scan, current_scan)
+            },
+        )
+    {
+        return (cached.registry.clone(), cached.roles.clone());
+    }
+
     let (mut role_map, definitions) = crate::profile::phase("ccs/merge_scans", || {
         let mut role_map = AnnotatedGmodGlobalCallRoleMap::default();
         let mut definitions: Vec<IndexedHelperDefinition> = Vec::new();
@@ -1101,7 +1294,16 @@ fn build_call_roles_and_registry(
         }),
     };
 
-    (registry, Arc::new(role_map))
+    let roles = Arc::new(role_map);
+    db.set_cached_file_helper_scan(
+        helper_fold_cache_sentinel(),
+        Arc::new(CachedHelperFold {
+            scans: current_scans,
+            registry: registry.clone(),
+            roles: roles.clone(),
+        }),
+    );
+    (registry, roles)
 }
 
 #[derive(Default)]
@@ -1788,6 +1990,9 @@ fn collect_file_gmod_metadata(
                 &reach,
                 None,
                 &mut HashMap::default(),
+                // The hook walk never expands helper bodies; the set exists
+                // only so the network pass can share the context shape.
+                &mut HashSet::default(),
             );
         (hook_sites, system_metadata, gm_method_realms)
     });
@@ -1839,6 +2044,7 @@ fn collect_hook_and_receive_metadata(
     reach: &HelperStartReachCache,
     net_candidates: Option<&[LuaCallExpr]>,
     registry_roots: &mut HashMap<FileId, LuaChunk>,
+    expanded_helpers: &mut HashSet<HelperId>,
 ) -> (
     Vec<GmodHookSiteMetadata>,
     GmodSystemFileMetadata,
@@ -1867,6 +2073,7 @@ fn collect_hook_and_receive_metadata(
         resolve_memo,
         reach,
         registry_roots,
+        expanded_helpers,
     };
 
     // Collecting receive flows alone needs no walk: the `net.Receive` sites are
@@ -1975,6 +2182,7 @@ fn collect_network_flow_metadata(
     resolve_memo: &mut ResolveMemo,
     reach: &HelperStartReachCache,
     registry_roots: &mut HashMap<FileId, LuaChunk>,
+    expanded_helpers: &mut HashSet<HelperId>,
 ) -> crate::db_index::FileNetworkData {
     let site = NetWalkSite { root, file_id };
     let mut ctx = NetCollectCtx {
@@ -1985,6 +2193,7 @@ fn collect_network_flow_metadata(
         resolve_memo,
         reach,
         registry_roots,
+        expanded_helpers,
     };
     let mut send_flows = crate::profile::phase("gmodnet/send_direct", || {
         collect_net_send_flows(&mut ctx, &site, blocks)
@@ -3220,6 +3429,13 @@ struct NetCollectCtx<'a> {
     /// only the red root (whose parser node memo holds ~4 MRU entries and
     /// thrashes when callers alternate between helper files) is retained here.
     registry_roots: &'a mut HashMap<FileId, LuaChunk>,
+    /// Cross-file helper bodies expanded during this file's walks, as
+    /// `(owning file, body range)`. Recorded by
+    /// [`resolve_call_to_function_block_cached`] (the single choke point for
+    /// helper expansion) so the B8 retain check can pin exactly the files
+    /// this file's flows were derived from. Same-file bodies are covered by
+    /// the file's own content hash and are not recorded.
+    expanded_helpers: &'a mut HashSet<HelperId>,
 }
 
 /// Identity of a resolved helper body: the owning file plus the body block's
@@ -3533,6 +3749,7 @@ fn resolve_call_to_function_block_cached(
         db,
         registry_roots,
         resolve_memo,
+        expanded_helpers,
         ..
     } = &mut *ctx;
     let resolved = resolve_call_to_function_block(
@@ -3546,6 +3763,14 @@ fn resolve_call_to_function_block_cached(
         registry_roots,
     );
     resolve_memo.insert(key, resolved.clone());
+    // B8: pin the cross-file bodies this file's flows were derived from. A
+    // failed resolution pins nothing (there is no body to go stale), and a
+    // same-file body is covered by the file's own content hash.
+    if let Some((helper_key, _, _, helper_file_id)) = &resolved
+        && *helper_file_id != site.file_id
+    {
+        expanded_helpers.insert((*helper_file_id, *helper_key));
+    }
     resolved
 }
 
@@ -5189,6 +5414,177 @@ mod forwarding_parent_candidate_tests {
             Some(ForwardingParentCandidate::Conflicted)
         ));
         assert!(finalize_vgui_forwarding_parent_candidates(candidates).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod perf_cache_tests {
+    use std::sync::Arc;
+
+    use crate::{Emmyrc, VirtualWorkspace};
+
+    use super::{CachedHelperFold, helper_fold_cache_sentinel, load_snapshot_cache_sentinel};
+
+    fn set_gmod_enabled(ws: &mut VirtualWorkspace) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        // Net ops and load calls resolve through signature metadata, so the
+        // annotated builtins must be present or no flows or sites exist.
+        ws.def_gmod_call_arg_builtins();
+    }
+
+    fn helper_fold_registry(ws: &mut VirtualWorkspace) -> Arc<super::HelperRegistry> {
+        ws.get_db_mut()
+            .get_cached_file_helper_scan::<CachedHelperFold>(helper_fold_cache_sentinel())
+            .expect("helper fold cache should exist after analysis")
+            .registry
+            .clone()
+    }
+
+    /// B5: editing a file without helper scans reuses the folded roles and
+    /// registry, while editing a scan-carrying file rebuilds them.
+    #[test]
+    fn helper_fold_reused_for_scanless_edits_and_rebuilt_for_scan_edits() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file("lua/b5_plain.lua", "local x = 1\n");
+        ws.def_file(
+            "lua/b5_helper.lua",
+            "local M = {}\nfunction M.helper() end\nreturn M\n",
+        );
+
+        let before = helper_fold_registry(&mut ws);
+        // No functions, so no signatures and no scan: the fold must survive.
+        ws.def_file("lua/b5_plain.lua", "local x = 2\n");
+        assert!(
+            Arc::ptr_eq(&before, &helper_fold_registry(&mut ws)),
+            "scanless edit should reuse the helper fold"
+        );
+
+        // A new function changes the file's scan: the fold must rebuild.
+        ws.def_file(
+            "lua/b5_helper.lua",
+            "local M = {}\nfunction M.helper() end\nfunction M.other() end\nreturn M\n",
+        );
+        assert!(
+            !Arc::ptr_eq(&before, &helper_fold_registry(&mut ws)),
+            "scan-changing edit should rebuild the helper fold"
+        );
+    }
+
+    /// B6: adding and removing an `include(...)` moves the load index.
+    #[test]
+    fn adding_and_removing_include_moves_load_index() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let helper_id = ws.def_file("lua/b6_helper.lua", "return {}\n");
+        let main_id = ws.def_file("lua/b6_main.lua", "return {}\n");
+
+        let has_edge_from_main = |ws: &mut VirtualWorkspace| {
+            ws.get_db_mut()
+                .get_gmod_load_index()
+                .get_file_info(&helper_id)
+                .is_some_and(|info| {
+                    info.incoming_edges
+                        .iter()
+                        .any(|edge| edge.source_file_id == main_id)
+                })
+        };
+        assert!(
+            !has_edge_from_main(&mut ws),
+            "no include yet, so no load edge is expected"
+        );
+
+        ws.def_file("lua/b6_main.lua", "include(\"b6_helper.lua\")\n");
+        assert!(
+            has_edge_from_main(&mut ws),
+            "adding include should move the load index"
+        );
+        // The rebuild records its inputs for the next analyze.
+        assert!(
+            ws.get_db_mut()
+                .get_cached_file_helper_scan::<super::CachedLoadSnapshot>(
+                    load_snapshot_cache_sentinel()
+                )
+                .is_some(),
+            "load snapshot should exist after a rebuild"
+        );
+
+        ws.def_file("lua/b6_main.lua", "return {}\n");
+        assert!(
+            !has_edge_from_main(&mut ws),
+            "removing include should move the load index back"
+        );
+    }
+
+    /// B8: network flows survive an unrelated edit and follow a helper edit.
+    #[test]
+    fn network_flows_retained_across_unrelated_edit_and_updated_on_helper_edit() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let helper_id = ws.def_file(
+            "lua/b8_helper.lua",
+            "function SendGreeting()\nnet.Start(\"B8Msg\")\nnet.Broadcast()\nend\n",
+        );
+        let caller_id = ws.def_file("lua/b8_caller.lua", "SendGreeting()\n");
+        ws.def_file("lua/b8_plain.lua", "local y = 1\n");
+
+        let caller_messages = |ws: &mut VirtualWorkspace| {
+            ws.get_db_mut()
+                .get_gmod_network_index()
+                .get_file_data(caller_id)
+                .map(|data| {
+                    data.send_flows
+                        .iter()
+                        .map(|flow| flow.message_name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(caller_messages(&mut ws), vec!["B8Msg".to_string()]);
+        // Inputs are recorded for the caller, the helper and the (empty)
+        // plain file alike.
+        for file_id in [helper_id, caller_id] {
+            assert!(
+                ws.get_db_mut()
+                    .get_gmod_network_index()
+                    .get_file_inputs(file_id)
+                    .is_some(),
+                "network inputs should be recorded"
+            );
+        }
+        let caller_inputs_before = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_inputs(caller_id)
+            .cloned();
+
+        // A scanless, flowless edit cannot move any network input.
+        ws.def_file("lua/b8_plain.lua", "local y = 2\n");
+        assert_eq!(
+            caller_messages(&mut ws),
+            vec!["B8Msg".to_string()],
+            "unrelated edit should keep network flows"
+        );
+        assert_eq!(
+            ws.get_db_mut()
+                .get_gmod_network_index()
+                .get_file_inputs(caller_id),
+            caller_inputs_before.as_ref(),
+            "unrelated edit should keep the caller's network inputs"
+        );
+
+        // Editing the expanded helper must invalidate the caller.
+        ws.def_file(
+            "lua/b8_helper.lua",
+            "function SendGreeting()\nnet.Start(\"B8Msg2\")\nnet.Broadcast()\nend\n",
+        );
+        assert_eq!(
+            caller_messages(&mut ws),
+            vec!["B8Msg2".to_string()],
+            "helper edit should update the caller's network flows"
+        );
     }
 }
 
@@ -13174,15 +13570,412 @@ fn collect_reassigned_local_decls(
         .collect()
 }
 
+/// Per-file load-relevant fingerprint (B6).
+///
+/// Covers exactly the inputs `rebuild_gmod_load_index` reads for one file:
+/// its dependency sites (with ranges — an edit shifting a call site moves the
+/// recorded edge), its branch realm ranges and file-level annotation realm
+/// (freshly collected for batch files, stored metadata otherwise), and the
+/// dynamic-loader gate. Files whose content can feed `collect_dynamic_loaders`
+/// (`file.Find` patterns or annotated load wrappers) additionally carry their
+/// content hash, so any edit to a dynamic file rebuilds; other files skip it
+/// and keep the index on comment-only edits.
+#[derive(Clone, PartialEq, Eq)]
+struct LoadFilePrint {
+    deps_hash: u64,
+    branch_hash: u64,
+    annotation_hash: u64,
+    has_dynamic_gate: bool,
+    content_hash: Option<u64>,
+}
+
+/// Workspace-wide snapshot of the load index inputs (B6).
+///
+/// `per_file` is path-sorted. Non-batch entries carry their dynamic gate and
+/// content hash over from the previous snapshot: an untouched file's content
+/// cannot change without the file joining the batch, so the carried values
+/// stay valid. `roles_ptr` pins the annotated call-role fold the dynamic
+/// patterns were derived from — a rebuilt fold can match new wrapper paths
+/// against untouched files' contents, so it rebuilds even when every print
+/// matches.
+///
+/// `file_infos`/`unresolved_edges` are the index this snapshot was taken
+/// from. The batch's entries are already gone when the gate runs
+/// (`remove_index` drops them before re-analysis), so a hit restores them
+/// instead of rebuilding: the inputs prove a rebuild would derive exactly
+/// this index.
+struct CachedLoadSnapshot {
+    files_hash: u64,
+    config_hash: u64,
+    roles_ptr: usize,
+    per_file: Vec<(String, LoadFilePrint)>,
+    file_infos: HashMap<FileId, GmodFileLoadInfo>,
+    unresolved_edges: Vec<GmodLoadEdge>,
+}
+
+fn hash_u64_with(build: impl FnOnce(&mut FxHasher)) -> u64 {
+    let mut hasher = FxHasher::default();
+    build(&mut hasher);
+    hasher.finish()
+}
+
+/// Sort key identifying the workspace file set plus the per-file
+/// path-derived load inputs (engine roots, load-path hints and workspace
+/// shadowing all derive from these, so an add/remove/rename or workspace
+/// reassignment rebuilds even when no batch print moved). `FileId` is part
+/// of the key: a remove/re-add cycle hands out a new id for the same path,
+/// and a snapshot taken under the old id must not be restored for the new
+/// one.
+fn load_files_hash(db: &DbIndex, file_ids: &[FileId]) -> u64 {
+    let mut entries: Vec<(String, u32, String, String)> = file_ids
+        .iter()
+        .map(|file_id| {
+            let raw_path = db
+                .get_vfs()
+                .get_file_path(file_id)
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let module_index = db.get_module_index();
+            let workspace = module_index
+                .get_workspace_id(*file_id)
+                .map(|id| format!("{id:?}"))
+                .unwrap_or_default();
+            let kind = module_index
+                .get_workspace_id(*file_id)
+                .map(|id| format!("{:?}", module_index.get_workspace_kind(id)))
+                .unwrap_or_default();
+            (raw_path, file_id.id, workspace, kind)
+        })
+        .collect();
+    entries.sort();
+    hash_u64_with(|h| entries.hash(h))
+}
+
+fn load_config_hash(db: &DbIndex) -> u64 {
+    let emmyrc = db.get_emmyrc();
+    hash_u64_with(|h| {
+        format!("{:?}", emmyrc.gmod.default_realm).hash(h);
+        emmyrc.gmod.detect_realm_from_filename.hash(h);
+        emmyrc.gmod.detect_realm_from_calls.hash(h);
+    })
+}
+
+fn hash_dependency_sites(sites: &[LuaDependencySite], required: &[u32]) -> u64 {
+    // Sorted by a property of the source: the dependency index stores sites in
+    // walk order, which must not leak into the fingerprint.
+    let mut texts: Vec<String> = sites
+        .iter()
+        .map(|site| {
+            format!(
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}",
+                site.kind,
+                site.target_file_id,
+                site.path,
+                site.path_keys,
+                site.call_range,
+                site.range,
+                site.original_expr,
+            )
+        })
+        .collect();
+    texts.sort();
+    let mut required = required.to_vec();
+    required.sort_unstable();
+    hash_u64_with(|h| {
+        texts.hash(h);
+        required.hash(h);
+    })
+}
+
+/// Whether `content` can feed `collect_dynamic_loaders`, using the same gate
+/// that collector uses before walking a file.
+fn load_dynamic_gate(
+    content: &str,
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
+) -> bool {
+    content.contains("gmod.file_find")
+        || content.contains("gmod.load")
+        || annotated_global_call_roles
+            .candidate_call_paths_in_content(content)
+            .has_file_find
+        || annotated_global_call_roles
+            .candidate_call_paths_in_content(content)
+            .has_load
+}
+
+fn load_file_print_for_batch(
+    db: &DbIndex,
+    file_id: FileId,
+    branch_ranges: &[GmodRealmRange],
+    annotation_realm: Option<GmodRealm>,
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
+) -> LoadFilePrint {
+    let (deps_hash, branch_hash, annotation_hash) =
+        load_index_print(db, file_id, branch_ranges, annotation_realm);
+    // The gate is read for every batch file (one substring scan plus the
+    // candidate matcher the dynamic collector runs anyway); the content hash
+    // is only paid for files that can actually feed the collector.
+    let (has_dynamic_gate, content_hash) = db
+        .get_vfs()
+        .get_file_content(&file_id)
+        .map(|content| {
+            let gate = load_dynamic_gate(content, annotated_global_call_roles);
+            let hash = gate.then(|| hash_u64_with(|h| content.hash(h)));
+            (gate, hash)
+        })
+        .unwrap_or((false, None));
+    LoadFilePrint {
+        deps_hash,
+        branch_hash,
+        annotation_hash,
+        has_dynamic_gate,
+        content_hash,
+    }
+}
+
+/// Index-derived half of a [`LoadFilePrint`]: dependency sites plus the
+/// branch/annotation inputs. No syntax tree or file content is touched.
+fn load_index_print(
+    db: &DbIndex,
+    file_id: FileId,
+    branch_ranges: &[GmodRealmRange],
+    annotation_realm: Option<GmodRealm>,
+) -> (u64, u64, u64) {
+    let dependency_index = db.get_file_dependencies_index();
+    let sites: &[LuaDependencySite] = dependency_index
+        .get_dependency_sites(&file_id)
+        .unwrap_or_default();
+    let required: Vec<u32> = dependency_index
+        .get_required_files(&file_id)
+        .map(|files| files.iter().map(|file| file.id).collect())
+        .unwrap_or_default();
+    (
+        hash_dependency_sites(sites, &required),
+        hash_u64_with(|h| format!("{branch_ranges:?}").hash(h)),
+        hash_u64_with(|h| format!("{annotation_realm:?}").hash(h)),
+    )
+}
+
+/// Fresh print for a non-batch file with no previous snapshot entry (first
+/// build after `clear`, or a file the previous snapshot never saw). Reads the
+/// file's content once; afterwards the dynamic values are carried over until
+/// the file joins a batch.
+fn load_file_print_from_index(
+    db: &DbIndex,
+    file_id: FileId,
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
+) -> LoadFilePrint {
+    let stored = db.get_gmod_infer_index().get_realm_file_metadata(&file_id);
+    let branch_ranges = stored
+        .map(|metadata| metadata.branch_realm_ranges.as_slice())
+        .unwrap_or_default();
+    let annotation_realm = stored.and_then(|metadata| metadata.annotation_realm);
+    load_file_print_for_batch(
+        db,
+        file_id,
+        branch_ranges,
+        annotation_realm,
+        annotated_global_call_roles,
+    )
+}
+
+fn load_snapshot_lookup<'a>(
+    snapshot: &'a CachedLoadSnapshot,
+    path: &str,
+) -> Option<&'a LoadFilePrint> {
+    snapshot
+        .per_file
+        .binary_search_by(|(candidate, _)| candidate.as_str().cmp(path))
+        .ok()
+        .map(|idx| &snapshot.per_file[idx].1)
+}
+
+/// The snapshot to restore when the stored load index was derived from the
+/// current load inputs (see [`CachedLoadSnapshot`]).
+///
+/// Compares the workspace file set, the gmod realm config, the call-role fold
+/// identity, and every batch file's [`LoadFilePrint`] against the snapshot
+/// taken by the last rebuild. Non-batch files are untouched by definition
+/// (their content cannot change outside the batch) and their carried prints
+/// stay valid while the file set and fold are pinned. Conservative by
+/// construction: anything not proven identical rebuilds.
+fn load_snapshot_for_restore(
+    db: &DbIndex,
+    branch_realm_ranges: &HashMap<FileId, Vec<GmodRealmRange>>,
+    annotation_realms: &HashMap<FileId, GmodRealm>,
+    analyzed_file_ids: &HashSet<FileId>,
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
+    roles_ptr: usize,
+    files_hash: u64,
+) -> Option<Arc<CachedLoadSnapshot>> {
+    let snapshot =
+        db.get_cached_file_helper_scan::<CachedLoadSnapshot>(load_snapshot_cache_sentinel())?;
+    if snapshot.files_hash != files_hash
+        || snapshot.config_hash != load_config_hash(db)
+        || snapshot.roles_ptr != roles_ptr
+    {
+        return None;
+    }
+    analyzed_file_ids
+        .iter()
+        .all(|file_id| {
+            let raw_path = db
+                .get_vfs()
+                .get_file_path(file_id)
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let Some(previous) = load_snapshot_lookup(&snapshot, &raw_path) else {
+                return false;
+            };
+            // Same fresh-or-empty rule `rebuild_gmod_load_index` itself applies:
+            // a batch file without newly collected ranges contributes none.
+            let branch_ranges = branch_realm_ranges
+                .get(file_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let annotation_realm = annotation_realms.get(file_id).copied();
+            let current = load_file_print_for_batch(
+                db,
+                *file_id,
+                branch_ranges,
+                annotation_realm,
+                annotated_global_call_roles,
+            );
+            current == *previous
+        })
+        .then_some(snapshot)
+}
+
+/// Records the inputs the just-finished rebuild derived the load index from.
+/// Batch files are fingerprinted fresh (including their dynamic content
+/// hashes); every other file keeps its cheap index-derived print while its
+/// dynamic gate values are carried over from the previous snapshot by path.
+fn store_load_snapshot(
+    db: &mut DbIndex,
+    branch_realm_ranges: &HashMap<FileId, Vec<GmodRealmRange>>,
+    annotation_realms: &HashMap<FileId, GmodRealm>,
+    analyzed_file_ids: &HashSet<FileId>,
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
+    roles_ptr: usize,
+    file_ids: &[FileId],
+    files_hash: u64,
+) {
+    let previous =
+        db.get_cached_file_helper_scan::<CachedLoadSnapshot>(load_snapshot_cache_sentinel());
+    let mut per_file: Vec<(String, LoadFilePrint)> = file_ids
+        .iter()
+        .map(|file_id| {
+            let raw_path = db
+                .get_vfs()
+                .get_file_path(file_id)
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let print = if analyzed_file_ids.contains(file_id) {
+                let branch_ranges = branch_realm_ranges
+                    .get(file_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let annotation_realm = annotation_realms.get(file_id).copied();
+                load_file_print_for_batch(
+                    db,
+                    *file_id,
+                    branch_ranges,
+                    annotation_realm,
+                    annotated_global_call_roles,
+                )
+            } else if let Some(carried) = previous
+                .as_ref()
+                .and_then(|snapshot| load_snapshot_lookup(&snapshot, &raw_path))
+            {
+                // Untouched file: the index-derived inputs are re-read cheaply
+                // while the dynamic gate values are carried over, so no file
+                // content is touched outside the batch.
+                let stored = db.get_gmod_infer_index().get_realm_file_metadata(file_id);
+                let branch_ranges = stored
+                    .map(|metadata| metadata.branch_realm_ranges.as_slice())
+                    .unwrap_or_default();
+                let annotation_realm = stored.and_then(|metadata| metadata.annotation_realm);
+                let (deps_hash, branch_hash, annotation_hash) =
+                    load_index_print(db, *file_id, branch_ranges, annotation_realm);
+                LoadFilePrint {
+                    deps_hash,
+                    branch_hash,
+                    annotation_hash,
+                    has_dynamic_gate: carried.has_dynamic_gate,
+                    content_hash: carried.content_hash,
+                }
+            } else {
+                load_file_print_from_index(db, *file_id, annotated_global_call_roles)
+            };
+            (raw_path, print)
+        })
+        .collect();
+    per_file.sort_by(|left, right| left.0.cmp(&right.0));
+    // The index this snapshot describes, so a hit can restore the batch
+    // entries `remove_index` dropped instead of rebuilding.
+    let (file_infos, unresolved_edges) = {
+        let load_index = db.get_gmod_load_index();
+        (
+            load_index
+                .iter_file_infos()
+                .map(|(file_id, info)| (*file_id, info.clone()))
+                .collect(),
+            load_index.unresolved_edges().to_vec(),
+        )
+    };
+    db.set_cached_file_helper_scan(
+        load_snapshot_cache_sentinel(),
+        Arc::new(CachedLoadSnapshot {
+            files_hash,
+            config_hash: load_config_hash(db),
+            roles_ptr,
+            per_file,
+            file_infos,
+            unresolved_edges,
+        }),
+    );
+}
+
 fn rebuild_gmod_load_index(
     db: &mut DbIndex,
     branch_realm_ranges: &HashMap<FileId, Vec<GmodRealmRange>>,
+    annotation_realms: &HashMap<FileId, GmodRealm>,
     analyzed_file_ids: &[FileId],
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
+    roles_ptr: usize,
 ) {
     let _p_prep = crate::profile::PhaseGuard::new("gmodload/prep");
     let file_ids = db.get_vfs().get_all_local_file_ids();
     let analyzed_file_ids: HashSet<FileId> = analyzed_file_ids.iter().copied().collect();
+    // B6: the load index is workspace-global but its inputs only move with
+    // the batch. When the file set, the realm config, the call-role fold and
+    // every batch file's load-relevant print match the last rebuild, the
+    // stored index is still the answer and the fixpoint below is skipped.
+    // Realm and load order stay first-class by keeping the index (not the
+    // fingerprint) as the source of truth: anything not proven identical
+    // rebuilds.
+    let files_hash = load_files_hash(db, &file_ids);
+    // B6: the batch's entries are already gone (`remove_index` drops them
+    // before re-analysis), so a hit restores the index the snapshot was
+    // taken from: its inputs prove a rebuild would derive exactly this.
+    // Realm and load order stay first-class by keeping the index (not the
+    // fingerprint) as the source of truth: anything not proven identical
+    // rebuilds.
+    if let Some(snapshot) = load_snapshot_for_restore(
+        db,
+        branch_realm_ranges,
+        annotation_realms,
+        &analyzed_file_ids,
+        annotated_global_call_roles,
+        roles_ptr,
+        files_hash,
+    ) {
+        db.get_gmod_load_index_mut().set_all_file_infos(
+            snapshot.file_infos.clone(),
+            snapshot.unresolved_edges.clone(),
+        );
+        return;
+    }
     let resolved_branch_ranges = file_ids
         .iter()
         .map(|file_id| {
@@ -13275,6 +14068,19 @@ fn rebuild_gmod_load_index(
 
     db.get_gmod_load_index_mut()
         .set_all_file_infos(file_infos, unresolved_edges);
+
+    // B6: record the inputs this rebuild derived the index from, so the next
+    // analyze can keep the index when the batch moved nothing load-relevant.
+    store_load_snapshot(
+        db,
+        branch_realm_ranges,
+        annotation_realms,
+        &analyzed_file_ids,
+        annotated_global_call_roles,
+        roles_ptr,
+        &file_ids,
+        files_hash,
+    );
 }
 
 fn mark_main_workspace_load_shadows(
