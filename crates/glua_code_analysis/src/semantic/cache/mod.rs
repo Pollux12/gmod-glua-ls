@@ -10,7 +10,8 @@ use std::{collections::HashSet, sync::Arc};
 
 use crate::{
     DbIndex, FileId, FlowId, GmodRealm, InFiled, LuaDeclId, LuaFunctionType, LuaInferredGuardOwner,
-    LuaMemberId, LuaMemberKey, LuaSemanticDeclId, LuaSignatureId, VarRefId, VarRefRootId,
+    LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, VarRefId,
+    VarRefRootId,
     db_index::{LuaType, LuaTypeDeclId},
     semantic::{
         generic::FuncGenericBinding,
@@ -115,13 +116,23 @@ pub struct LuaInferCache {
     file_id: FileId,
     config: CacheOptions,
     pub expr_cache: FxHashMap<LuaSyntaxId, CacheEntry<LuaType>>,
+    /// Call-site function resolution, keyed by the cheap syntax identity.
+    ///
+    /// The previous key hashed the whole prefix `LuaType` on every call, even
+    /// on a miss. The same call site can legitimately be queried with
+    /// different prefix types (e.g. `infer_tpl_ref_call` re-enters with the
+    /// extended type while the outer query holds `Ready`), so the prefix type
+    /// cannot be dropped from the key — it now selects among a short
+    /// per-site bucket by equality instead. Buckets stay tiny (one entry for
+    /// almost every call site), lookup order never affects the answer, and the
+    /// `Ready` recursion guard keeps its per-type granularity.
     pub call_cache:
-        FxHashMap<(LuaSyntaxId, Option<usize>, LuaType), CacheEntry<Arc<LuaFunctionType>>>,
+        FxHashMap<(LuaSyntaxId, Option<usize>), Vec<(LuaType, CacheEntry<Arc<LuaFunctionType>>)>>,
     pub call_arg_types_cache:
         FxHashMap<(LuaSyntaxId, Option<usize>), Arc<Vec<(LuaType, TextRange)>>>,
     pub generic_call_bindings: FxHashMap<LuaSyntaxId, GenericCallBindings>,
     pub flow_node_cache:
-        FxHashMap<VarRefCacheKey, FxHashMap<FlowCacheInnerKey, CacheEntry<LuaType>>>,
+        FxHashMap<VarRefCacheKey, FxHashMap<FlowCacheInnerKey, CacheEntry<Arc<LuaType>>>>,
     pub flow_query_realm: Option<GmodRealm>,
     /// Scratch memo for one top-level closure-baseline query. Without it that
     /// walk re-derives each merge point once per path into it.
@@ -132,6 +143,38 @@ pub struct LuaInferCache {
     pub baseline_flow_memo: FxHashMap<(VarRefCacheKey, FlowCacheInnerKey), LuaType>,
     pub baseline_flow_depth: u32,
     pub flow_node_realm_cache: FxHashMap<FlowId, GmodRealm>,
+    /// Whether the numeric-index fast path applies to a var ref, keyed by the
+    /// var ref plus the realm the query runs under (the index-key probe goes
+    /// through `infer_expr`, which is realm sensitive).
+    ///
+    /// Derives from the immutable decl initializer plus inference results, so
+    /// it is dropped wherever `expr_cache` is dropped.
+    pub numeric_table_index_query_cache:
+        FxHashMap<(VarRefCacheKey, Option<GmodRealm>), Option<(VarRefRootId, i64)>>,
+    /// Result of the unambiguous-integer-const scan, keyed by name and the
+    /// read position. The scan walks the whole decl tree, so each distinct
+    /// (name, position) pays it at most once per inference wave. Dropped
+    /// wherever `expr_cache` is dropped: the scanned types settle over waves.
+    pub unambiguous_int_const_cache: FxHashMap<(SmolStr, TextSize), Option<i64>>,
+    /// Lazily built per-file `name -> decls` lookup feeding the scan above.
+    /// One decl-tree walk per wave instead of one per distinct (name,
+    /// position) query. Derives only from the immutable decl tree, so it is
+    /// dropped alongside the scan results.
+    pub(crate) decl_name_index: Option<FxHashMap<SmolStr, Vec<LuaDeclId>>>,
+    /// Whether the branch region between a flow node and a stop point
+    /// contains a special call effect matching a var ref, keyed by
+    /// (node, stop, var ref).
+    ///
+    /// Pure syntax plus the immutable flow index, so it survives deferred and
+    /// unresolve clearing like the other structural caches.
+    pub branch_special_call_effect_cache: FxHashMap<(FlowId, FlowId, VarRefCacheKey), bool>,
+    /// Scratch `visited_flow_ids` buffer for the flow walk. Taken at the top
+    /// of a walk and returned afterwards so repeated walks reuse one
+    /// allocation. Walks nest (a merge point re-enters through
+    /// `get_type_at_flow_with_origin`), so while `flow_walk_scratch_in_use`
+    /// is set a nested walk uses a throwaway buffer instead.
+    pub flow_walk_scratch: Vec<FlowId>,
+    pub(crate) flow_walk_scratch_in_use: bool,
     pub index_ref_origin_type_cache: FxHashMap<VarRefCacheKey, CacheEntry<LuaType>>,
     pub param_type_cache: FxHashMap<LuaDeclId, CacheEntry<LuaType>>,
     pub(crate) param_type_source_cache: FxHashMap<LuaDeclId, CacheEntry<ParamInferenceSource>>,
@@ -168,6 +211,23 @@ pub struct LuaInferCache {
     pub dynamic_field_resolution_cache: FxHashMap<
         (LuaType, LuaMemberKey, Option<TextSize>),
         Option<(LuaType, Option<LuaSemanticDeclId>)>,
+    >,
+    /// Memo for `infer_owner_raw_member_type_with_realm`, keyed by owner, key,
+    /// caller file, caller position and table-generation cutoff. The union fold
+    /// over writers is identical for every read of the same member from the
+    /// same place, so repeated reads share one answer. Position sensitivity
+    /// comes only from offset visibility, which the position and cutoff in the
+    /// key capture. Derived from member/type/realm index state, so it is
+    /// dropped wherever expression inference results are dropped.
+    pub owner_raw_member_type_cache: FxHashMap<
+        (
+            LuaMemberOwner,
+            LuaMemberKey,
+            FileId,
+            Option<TextSize>,
+            Option<InFiled<TextSize>>,
+        ),
+        Result<LuaType, InferFailReason>,
     >,
     pub dynamic_field_type_cache: FxHashMap<LuaMemberId, Option<LuaType>>,
     pub dynamic_field_definition_syntax_cache:
@@ -221,6 +281,12 @@ impl LuaInferCache {
             baseline_flow_memo: FxHashMap::default(),
             baseline_flow_depth: 0,
             flow_node_realm_cache: FxHashMap::default(),
+            numeric_table_index_query_cache: FxHashMap::default(),
+            unambiguous_int_const_cache: FxHashMap::default(),
+            decl_name_index: None,
+            branch_special_call_effect_cache: FxHashMap::default(),
+            flow_walk_scratch: Vec::new(),
+            flow_walk_scratch_in_use: false,
             index_ref_origin_type_cache: FxHashMap::default(),
             param_type_cache: FxHashMap::default(),
             param_type_source_cache: FxHashMap::default(),
@@ -235,6 +301,7 @@ impl LuaInferCache {
             in_place_ipairs_transform_cache: FxHashMap::default(),
             dynamic_field_scope_metatable_cache: FxHashMap::default(),
             dynamic_field_resolution_cache: FxHashMap::default(),
+            owner_raw_member_type_cache: FxHashMap::default(),
             dynamic_field_type_cache: FxHashMap::default(),
             dynamic_field_definition_syntax_cache: FxHashMap::default(),
             dynamic_field_resolving: HashSet::default(),
@@ -356,6 +423,12 @@ impl LuaInferCache {
         self.flow_node_cache.clear();
         self.flow_query_realm = None;
         self.flow_node_realm_cache.clear();
+        self.numeric_table_index_query_cache.clear();
+        self.unambiguous_int_const_cache.clear();
+        self.decl_name_index = None;
+        self.branch_special_call_effect_cache.clear();
+        self.flow_walk_scratch.clear();
+        self.flow_walk_scratch_in_use = false;
         self.index_ref_origin_type_cache.clear();
         self.param_type_cache.clear();
         self.param_type_source_cache.clear();
@@ -370,6 +443,7 @@ impl LuaInferCache {
         self.in_place_ipairs_transform_cache.clear();
         self.dynamic_field_scope_metatable_cache.clear();
         self.dynamic_field_resolution_cache.clear();
+        self.owner_raw_member_type_cache.clear();
         self.dynamic_field_type_cache.clear();
         self.dynamic_field_definition_syntax_cache.clear();
         self.dynamic_field_resolving.clear();
@@ -392,6 +466,9 @@ impl LuaInferCache {
     pub fn clear_flow_results(&mut self) {
         self.flow_node_cache.clear();
         self.flow_query_realm = None;
+        self.numeric_table_index_query_cache.clear();
+        self.unambiguous_int_const_cache.clear();
+        self.decl_name_index = None;
         self.index_ref_origin_type_cache.clear();
     }
 
@@ -410,9 +487,15 @@ impl LuaInferCache {
             }
         }
         self.flow_node_cache.retain(|_, inner| {
-            inner.retain(|_, entry| settled(entry));
+            inner.retain(|_, entry| match entry {
+                CacheEntry::Cache(typ) => !crate::db_index::is_undetermined_type(typ.as_ref()),
+                _ => false,
+            });
             !inner.is_empty()
         });
+        self.numeric_table_index_query_cache.clear();
+        self.unambiguous_int_const_cache.clear();
+        self.decl_name_index = None;
         self.index_ref_origin_type_cache
             .retain(|_, entry| settled(entry));
     }
@@ -430,11 +513,15 @@ impl LuaInferCache {
         self.expr_cache.clear();
         self.call_cache.clear();
         self.call_arg_types_cache.clear();
+        self.numeric_table_index_query_cache.clear();
+        self.unambiguous_int_const_cache.clear();
+        self.decl_name_index = None;
         // A resolved signature return is exactly what turns this answer from
         // `false` to `true`, so it cannot survive a wave.
         self.call_returns_never_cache.clear();
         self.signature_is_generic_cache.clear();
         self.generic_call_bindings.clear();
+        self.owner_raw_member_type_cache.clear();
         self.flow_node_cache.retain(|_, inner| {
             inner.retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
             !inner.is_empty()
@@ -458,6 +545,9 @@ impl LuaInferCache {
         self.expr_cache.clear();
         self.call_cache.clear();
         self.call_arg_types_cache.clear();
+        self.numeric_table_index_query_cache.clear();
+        self.unambiguous_int_const_cache.clear();
+        self.decl_name_index = None;
         self.flow_node_cache.clear();
         self.flow_query_realm = None;
         self.index_ref_origin_type_cache.clear();
@@ -466,6 +556,7 @@ impl LuaInferCache {
         self.call_returns_never_cache.clear();
         self.signature_is_generic_cache.clear();
         self.generic_call_bindings.clear();
+        self.owner_raw_member_type_cache.clear();
         // Local reference identities come directly from immutable reference
         // indexes and are safe to retain. Global/member/self roots can be
         // selected through types and overloads that unresolve is about to
@@ -493,7 +584,7 @@ impl LuaInferCache {
         var_ref_id: &VarRefId,
         flow_id: FlowId,
         query_realm: GmodRealm,
-    ) -> Option<&CacheEntry<LuaType>> {
+    ) -> Option<&CacheEntry<Arc<LuaType>>> {
         self.get_flow_cache_with_origin(var_ref_id, flow_id, query_realm, FlowOrigin::Real)
     }
 
@@ -503,7 +594,7 @@ impl LuaInferCache {
         flow_id: FlowId,
         query_realm: GmodRealm,
         origin: FlowOrigin,
-    ) -> Option<&CacheEntry<LuaType>> {
+    ) -> Option<&CacheEntry<Arc<LuaType>>> {
         let cache_key = VarRefCacheKey::from(var_ref_id);
         self.flow_node_cache
             .get(&cache_key)
@@ -515,7 +606,7 @@ impl LuaInferCache {
         var_ref_id: &VarRefId,
         flow_id: FlowId,
         query_realm: GmodRealm,
-        entry: CacheEntry<LuaType>,
+        entry: CacheEntry<Arc<LuaType>>,
     ) {
         self.set_flow_cache_with_origin(var_ref_id, flow_id, query_realm, FlowOrigin::Real, entry);
     }
@@ -526,19 +617,105 @@ impl LuaInferCache {
         flow_id: FlowId,
         query_realm: GmodRealm,
         origin: FlowOrigin,
-        entry: CacheEntry<LuaType>,
+        entry: CacheEntry<Arc<LuaType>>,
     ) {
         let cache_key = VarRefCacheKey::from(var_ref_id);
+        self.set_flow_cache_with_origin_by_key(&cache_key, flow_id, query_realm, origin, entry);
+    }
+
+    pub fn get_flow_cache_with_origin_by_key(
+        &self,
+        cache_key: &VarRefCacheKey,
+        flow_id: FlowId,
+        query_realm: GmodRealm,
+        origin: FlowOrigin,
+    ) -> Option<&CacheEntry<Arc<LuaType>>> {
         self.flow_node_cache
-            .entry(cache_key)
+            .get(cache_key)
+            .and_then(|by_flow| by_flow.get(&(flow_id, query_realm, origin)))
+    }
+
+    pub fn set_flow_cache_with_origin_by_key(
+        &mut self,
+        cache_key: &VarRefCacheKey,
+        flow_id: FlowId,
+        query_realm: GmodRealm,
+        origin: FlowOrigin,
+        entry: CacheEntry<Arc<LuaType>>,
+    ) {
+        self.flow_node_cache
+            .entry(cache_key.clone())
             .or_default()
             .insert((flow_id, query_realm, origin), entry);
+    }
+
+    /// Takes the reusable flow-walk scratch buffer. Walks nest through merge
+    /// points, so when a walk is already in progress the nested walk gets a
+    /// throwaway buffer (`owned == false`) that is simply dropped on return.
+    pub(crate) fn take_flow_walk_scratch(&mut self) -> (Vec<FlowId>, bool) {
+        if self.flow_walk_scratch_in_use {
+            (Vec::new(), false)
+        } else {
+            self.flow_walk_scratch_in_use = true;
+            (std::mem::take(&mut self.flow_walk_scratch), true)
+        }
+    }
+
+    pub(crate) fn return_flow_walk_scratch(&mut self, mut scratch: Vec<FlowId>, owned: bool) {
+        if owned {
+            scratch.clear();
+            self.flow_walk_scratch = scratch;
+            self.flow_walk_scratch_in_use = false;
+        }
+    }
+
+    pub fn get_call_func_cache(
+        &self,
+        syntax_id: LuaSyntaxId,
+        args_count: Option<usize>,
+        call_expr_type: &LuaType,
+    ) -> Option<&CacheEntry<Arc<LuaFunctionType>>> {
+        self.call_cache
+            .get(&(syntax_id, args_count))?
+            .iter()
+            .find(|(ty, _)| ty == call_expr_type)
+            .map(|(_, entry)| entry)
+    }
+
+    pub fn insert_call_func_cache(
+        &mut self,
+        syntax_id: LuaSyntaxId,
+        args_count: Option<usize>,
+        call_expr_type: LuaType,
+        entry: CacheEntry<Arc<LuaFunctionType>>,
+    ) {
+        let bucket = self.call_cache.entry((syntax_id, args_count)).or_default();
+        if let Some(slot) = bucket.iter_mut().find(|(ty, _)| *ty == call_expr_type) {
+            *slot = (call_expr_type, entry);
+        } else {
+            bucket.push((call_expr_type, entry));
+        }
+    }
+
+    pub fn remove_call_func_cache(
+        &mut self,
+        syntax_id: LuaSyntaxId,
+        args_count: Option<usize>,
+        call_expr_type: &LuaType,
+    ) {
+        let key = (syntax_id, args_count);
+        if let Some(bucket) = self.call_cache.get_mut(&key) {
+            bucket.retain(|(ty, _)| ty != call_expr_type);
+            if bucket.is_empty() {
+                self.call_cache.remove(&key);
+            }
+        }
     }
 
     pub fn take_flow_cache_for_var_ref(
         &mut self,
         var_ref_id: &VarRefId,
-    ) -> Option<FxHashMap<FlowCacheInnerKey, CacheEntry<LuaType>>> {
+    ) -> Option<FxHashMap<FlowCacheInnerKey, CacheEntry<Arc<LuaType>>>> {
         let cache_key = VarRefCacheKey::from(var_ref_id);
         self.flow_node_cache.remove(&cache_key)
     }
@@ -546,7 +723,7 @@ impl LuaInferCache {
     pub fn restore_flow_cache_for_var_ref(
         &mut self,
         var_ref_id: &VarRefId,
-        previous: Option<FxHashMap<FlowCacheInnerKey, CacheEntry<LuaType>>>,
+        previous: Option<FxHashMap<FlowCacheInnerKey, CacheEntry<Arc<LuaType>>>>,
     ) {
         let cache_key = VarRefCacheKey::from(var_ref_id);
         if let Some(previous) = previous {

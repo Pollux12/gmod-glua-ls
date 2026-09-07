@@ -27,8 +27,8 @@ use glua_parser::{
 };
 use glua_parser::{LuaAstNode, LuaIndexExpr};
 pub(crate) use infer_raw_member::{
-    infer_owner_raw_member_type_with_realm, resolve_member_item_with_realm,
-    source_survives_table_generation_cutoff,
+    infer_owner_raw_member_type_with_realm, infer_owner_raw_member_type_with_realm_cached,
+    resolve_member_item_with_realm, source_survives_table_generation_cutoff,
 };
 pub use infer_raw_member::{infer_raw_member_type, infer_raw_member_type_with_cache};
 use rowan::{TextRange, TextSize};

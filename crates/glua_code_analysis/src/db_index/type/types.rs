@@ -215,6 +215,43 @@ impl Hash for LuaType {
     }
 }
 
+/// Linear dedup window for `LuaType::from_vec_structural`.
+///
+/// Not a cap: larger results migrate to a hash set mid-scan. Only the
+/// dispatch is heuristic, never the outcome.
+const LINEAR_DEDUP_LIMIT: usize = 8;
+
+/// Pushes `typ` unless an equal member is already present, migrating from a
+/// linear scan to a hash set once the result outgrows the linear window.
+/// Keeps first-occurrence order either way.
+fn push_dedup(
+    result_types: &mut Vec<LuaType>,
+    hash_set: &mut Option<rustc_hash::FxHashSet<LuaType>>,
+    typ: LuaType,
+) {
+    if let Some(set) = hash_set {
+        if set.insert(typ.clone()) {
+            result_types.push(typ);
+        }
+        return;
+    }
+    if result_types.contains(&typ) {
+        return;
+    }
+    if result_types.len() == LINEAR_DEDUP_LIMIT {
+        let mut set = rustc_hash::FxHashSet::default();
+        for existing in result_types.iter() {
+            set.insert(existing.clone());
+        }
+        if set.insert(typ.clone()) {
+            result_types.push(typ);
+        }
+        *hash_set = Some(set);
+    } else {
+        result_types.push(typ);
+    }
+}
+
 #[allow(unused)]
 impl LuaType {
     pub fn is_unknown(&self) -> bool {
@@ -500,23 +537,27 @@ impl LuaType {
             0 => LuaType::Nil,
             1 => types[0].clone(),
             _ => {
-                let mut result_types = Vec::new();
+                let mut result_types: Vec<LuaType> = Vec::new();
                 // Membership only: the union's order comes from `result_types`,
-                // so the hasher cannot affect the result.
-                let mut hash_set = rustc_hash::FxHashSet::default();
+                // so the hasher cannot reach a result.
+                //
+                // Small inputs dedup faster with a linear scan: hashing a
+                // `LuaType` walks its contents, which costs more than a few
+                // equality probes. Once the result outgrows the linear
+                // window, the scan migrates to a hash set seeded from what is
+                // already there. Both paths keep first-occurrence order and
+                // drop the same duplicates, so the outcome is identical
+                // whichever path an input takes.
+                let mut hash_set: Option<rustc_hash::FxHashSet<LuaType>> = None;
                 for typ in types {
                     match typ {
                         LuaType::Union(u) => {
                             for t in u.into_vec() {
-                                if hash_set.insert(t.clone()) {
-                                    result_types.push(t);
-                                }
+                                push_dedup(&mut result_types, &mut hash_set, t);
                             }
                         }
                         _ => {
-                            if hash_set.insert(typ.clone()) {
-                                result_types.push(typ);
-                            }
+                            push_dedup(&mut result_types, &mut hash_set, typ);
                         }
                     }
                 }

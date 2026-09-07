@@ -51,15 +51,19 @@ pub fn infer_call_expr_func(
     args_count: Option<usize>,
 ) -> InferCallFuncResult {
     let syntax_id = call_expr.get_syntax_id();
-    let key = (syntax_id, args_count, call_expr_type.clone());
-    if let Some(cache_entry) = cache.call_cache.get(&key) {
+    if let Some(cache_entry) = cache.get_call_func_cache(syntax_id, args_count, &call_expr_type) {
         match cache_entry {
             CacheEntry::Cache(ty) => return Ok(ty.clone()),
             _ => return Err(InferFailReason::RecursiveInfer),
         }
     }
 
-    cache.call_cache.insert(key.clone(), CacheEntry::Ready);
+    cache.insert_call_func_cache(
+        syntax_id,
+        args_count,
+        call_expr_type.clone(),
+        CacheEntry::Ready,
+    );
     let prefix_signature_id = matches!(call_expr_type, LuaType::DocFunction(_))
         .then(|| get_prefix_expr_signature_id(db, cache, &call_expr))
         .flatten();
@@ -68,8 +72,10 @@ pub fn infer_call_expr_func(
     {
         let result =
             infer_signature_doc_function(db, cache, signature_id, call_expr.clone(), args_count);
-        cache.call_cache.insert(
-            key,
+        cache.insert_call_func_cache(
+            syntax_id,
+            args_count,
+            call_expr_type,
             result
                 .as_ref()
                 .map(|it| CacheEntry::Cache(it.clone()))
@@ -213,15 +219,18 @@ pub fn infer_call_expr_func(
 
     match &result {
         Ok(func_ty) => {
-            cache
-                .call_cache
-                .insert(key, CacheEntry::Cache(func_ty.clone()));
+            cache.insert_call_func_cache(
+                syntax_id,
+                args_count,
+                call_expr_type,
+                CacheEntry::Cache(func_ty.clone()),
+            );
         }
         Err(r) if r.is_need_resolve() => {
-            cache.call_cache.remove(&key);
+            cache.remove_call_func_cache(syntax_id, args_count, &call_expr_type);
         }
         Err(InferFailReason::None) => {
-            cache.call_cache.remove(&key);
+            cache.remove_call_func_cache(syntax_id, args_count, &call_expr_type);
         }
         _ => {}
     }

@@ -8,7 +8,7 @@ use crate::{
     db_index::{WorkspaceKind, WorkspaceResolutionKey, gmod_infer::GmodRealm},
     is_table_assignment_merge_type, widen_literal_type_for_assignment,
 };
-use glua_parser::{BinaryOperator, LuaAssignStat, LuaAstNode, LuaExpr, PathTrait};
+use glua_parser::{BinaryOperator, LuaAssignStat, LuaAstNode, LuaExpr, LuaSyntaxNode, PathTrait};
 use rowan::TextSize;
 
 use super::{LuaMemberId, LuaMemberOwner};
@@ -102,35 +102,35 @@ impl LuaMemberIndexItem {
             }
         }
 
-        let member_ids = self.get_member_ids();
-        let mut visible_member_ids =
-            visible_member_ids_at_offset(db, &member_ids, caller_file_id, caller_position);
-        if visible_member_ids.is_empty()
-            || should_expand_function_assignment_history(
-                db,
-                &visible_member_ids,
-                caller_file_id,
-                caller_position,
-            )
-        {
-            let historical_member_ids =
-                expand_member_ids_with_owner_key_history(db, member_ids.clone());
-            if historical_member_ids != member_ids {
-                visible_member_ids = visible_member_ids_at_offset(
-                    db,
-                    &historical_member_ids,
-                    caller_file_id,
-                    caller_position,
-                );
+        // One borrowed candidate set for the whole query: every stage below
+        // selects indices into it, so the ids are materialised once, in the
+        // output, instead of once per stage.
+        let member_ids = self.member_ids_slice();
+        let caller_realm = db
+            .get_gmod_infer_index()
+            .get_realm_at_offset(caller_file_id, caller_position);
+        let mut query = OffsetVisibilityQuery::new(db, *caller_file_id, caller_position);
+        let mut visible = query.visible_indices(member_ids);
+        // `expanded` owns the history-expanded set only when the branch below
+        // takes it; `base` borrows whichever candidate set is current.
+        let expanded: Vec<LuaMemberId>;
+        let mut base = member_ids;
+        if visible.is_empty() || query.should_expand_history(base, &visible) {
+            let historical = expand_member_ids_with_owner_key_history(db, base);
+            if historical.as_slice() != base {
+                visible = query.visible_indices(&historical);
+                expanded = historical;
+                base = &expanded;
             }
         }
-        let priority_tiers = get_member_id_priority_tiers(db, caller_file_id, &visible_member_ids);
-        select_member_ids_by_workspace_and_realm(
+        let priority_tiers =
+            get_member_id_priority_tier_indices(db, caller_file_id, base, &visible);
+        select_member_ids_by_workspace_and_realm_from_indices(
             db,
             caller_file_id,
             priority_tiers,
-            db.get_gmod_infer_index()
-                .get_realm_at_offset(caller_file_id, caller_position),
+            base,
+            caller_realm,
         )
     }
 
@@ -157,6 +157,15 @@ impl LuaMemberIndexItem {
         match self {
             LuaMemberIndexItem::One(member_id) => vec![*member_id],
             LuaMemberIndexItem::Many(member_ids) => member_ids.clone(),
+        }
+    }
+
+    /// The same ids borrowed: query paths that only filter and select should
+    /// work on indices into this slice instead of cloning the vector.
+    pub fn member_ids_slice(&self) -> &[LuaMemberId] {
+        match self {
+            LuaMemberIndexItem::One(member_id) => std::slice::from_ref(member_id),
+            LuaMemberIndexItem::Many(member_ids) => member_ids,
         }
     }
 }
@@ -306,13 +315,13 @@ fn is_top_level_overwriting_assignment(db: &DbIndex, member_id: LuaMemberId) -> 
 
 fn expand_member_ids_with_owner_key_history(
     db: &DbIndex,
-    member_ids: Vec<LuaMemberId>,
+    member_ids: &[LuaMemberId],
 ) -> Vec<LuaMemberId> {
     let mut expanded = Vec::new();
     let mut seen = HashSet::new();
     let member_index = db.get_member_index();
 
-    for member_id in member_ids {
+    for member_id in member_ids.iter().copied() {
         push_unique_member_id(&mut expanded, &mut seen, member_id);
 
         let Some(member) = member_index.get_member(&member_id) else {
@@ -342,11 +351,132 @@ fn push_unique_member_id(
     }
 }
 
+/// Per-query state for the offset visibility filter: the caller position plus
+/// the caller file's red root, fetched at most once and shared by every
+/// member the filter probes instead of rebuilt per member.
+struct OffsetVisibilityQuery<'a> {
+    db: &'a DbIndex,
+    caller_file_id: FileId,
+    caller_position: TextSize,
+    caller_root: Option<LuaSyntaxNode>,
+    caller_root_fetched: bool,
+}
+
+impl<'a> OffsetVisibilityQuery<'a> {
+    fn new(db: &'a DbIndex, caller_file_id: FileId, caller_position: TextSize) -> Self {
+        Self {
+            db,
+            caller_file_id,
+            caller_position,
+            caller_root: None,
+            caller_root_fetched: false,
+        }
+    }
+
+    /// Indices into `member_ids` that are visible at the caller position: the
+    /// offset filter plus the overwritten-writer drop, in a single pass that
+    /// never materialises an id vector of its own.
+    fn visible_indices(&mut self, member_ids: &[LuaMemberId]) -> Vec<usize> {
+        let db = self.db;
+        let caller_file_id = self.caller_file_id;
+        let caller_position = self.caller_position;
+        let mut visible = Vec::new();
+        for (index, member_id) in member_ids.iter().enumerate() {
+            let caller_root = self.caller_root();
+            if member_visible_at_offset_with_root(
+                db,
+                *member_id,
+                &caller_file_id,
+                caller_position,
+                caller_root,
+            ) {
+                visible.push(index);
+            }
+        }
+        drop_overwritten_writer_indices(db, member_ids, &mut visible);
+        visible
+    }
+
+    /// Whether any visible member is a function-scoped assignment the caller
+    /// does not share its enclosing function with, in which case the owner-key
+    /// history must be consulted too. Same predicate as
+    /// `should_expand_function_assignment_history`, over selected indices.
+    fn should_expand_history(&self, member_ids: &[LuaMemberId], visible: &[usize]) -> bool {
+        let db = self.db;
+        visible
+            .iter()
+            .map(|&index| member_ids[index])
+            .any(|member_id| {
+                is_function_scoped_assignment_file_define(db, member_id)
+                    && !member_assignment_shares_enclosing_function(
+                        db,
+                        member_id,
+                        &self.caller_file_id,
+                        self.caller_position,
+                    )
+            })
+    }
+
+    /// The caller file's red root, fetched at most once per query. Only
+    /// same-file members reach the enclosing-assignment probe that needs it.
+    fn caller_root(&mut self) -> Option<&LuaSyntaxNode> {
+        if !self.caller_root_fetched {
+            self.caller_root_fetched = true;
+            self.caller_root = self
+                .db
+                .get_vfs()
+                .get_syntax_tree(&self.caller_file_id)
+                .map(|tree| tree.get_red_root());
+        }
+        self.caller_root.as_ref()
+    }
+}
+
+/// Index analogue of `drop_overwritten_writers`: drops the visible entries a
+/// plain top-level write in the same file overwrote, without materialising an
+/// id vector.
+fn drop_overwritten_writer_indices(
+    db: &DbIndex,
+    member_ids: &[LuaMemberId],
+    visible: &mut Vec<usize>,
+) {
+    let mut overwriters = Vec::new();
+    for &index in visible.iter() {
+        let member_id = member_ids[index];
+        if is_top_level_overwriting_assignment(db, member_id) {
+            overwriters.push((member_id.file_id, member_id.get_position()));
+        }
+    }
+    if overwriters.is_empty() {
+        return;
+    }
+    let member_index = db.get_member_index();
+    visible.retain(|index| {
+        let member_id = &member_ids[*index];
+        !member_index
+            .get_member(member_id)
+            .is_some_and(|member| member.get_feature().is_file_define())
+            || !overwriters.iter().any(|(file_id, position)| {
+                *file_id == member_id.file_id && member_id.get_position() < *position
+            })
+    });
+}
+
 fn member_visible_at_offset(
     db: &DbIndex,
     member_id: LuaMemberId,
     caller_file_id: &FileId,
     caller_position: TextSize,
+) -> bool {
+    member_visible_at_offset_with_root(db, member_id, caller_file_id, caller_position, None)
+}
+
+fn member_visible_at_offset_with_root(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+    caller_file_id: &FileId,
+    caller_position: TextSize,
+    caller_root: Option<&LuaSyntaxNode>,
 ) -> bool {
     let Some(member) = db.get_member_index().get_member(&member_id) else {
         return false;
@@ -371,7 +501,7 @@ fn member_visible_at_offset(
         );
     }
 
-    !member_hidden_by_enclosing_assignment(db, member_id, caller_position)
+    !member_hidden_by_enclosing_assignment_with_root(db, member_id, caller_position, caller_root)
 }
 
 fn same_file_define_shares_execution_region(
@@ -396,22 +526,34 @@ fn same_file_define_shares_execution_region(
     member_function == caller_function
 }
 
-fn member_hidden_by_enclosing_assignment(
+fn member_hidden_by_enclosing_assignment_with_root(
     db: &DbIndex,
     member_id: LuaMemberId,
     caller_position: TextSize,
+    caller_root: Option<&LuaSyntaxNode>,
 ) -> bool {
-    let Some(root) = db.get_vfs().get_syntax_tree(&member_id.file_id) else {
+    // The caller file's root, shared across every member one query probes.
+    // `None` fetches it fresh, preserving the old call shape for the paths
+    // that probe a single member. The probe below only runs for same-file
+    // members (see `member_visible_at_offset_with_root`), so a caller-file
+    // root passed by the query always covers the member it is asked about.
+    let fetched_root = if caller_root.is_none() {
+        db.get_vfs()
+            .get_syntax_tree(&member_id.file_id)
+            .map(|tree| tree.get_red_root())
+    } else {
+        None
+    };
+    let Some(root) = caller_root.or(fetched_root.as_ref()) else {
         return false;
     };
-    let root = root.get_red_root();
     let Some(member) = db.get_member_index().get_member(&member_id) else {
         return false;
     };
     let member_range = member.get_range();
     // By syntax id, not by offset: `token_at_offset` rescans the siblings at
     // every level it descends, and this lookup is memoised.
-    let Some(member_node) = member_id.get_syntax_id().to_node_from_root(&root) else {
+    let Some(member_node) = member_id.get_syntax_id().to_node_from_root(root) else {
         return false;
     };
 
@@ -958,6 +1100,144 @@ fn infer_caller_file_realm(db: &DbIndex, caller_file_id: &FileId) -> GmodRealm {
         .get_realm_file_metadata(caller_file_id)
         .map(|metadata| metadata.inferred_realm)
         .unwrap_or(GmodRealm::Unknown)
+}
+
+/// Index analogue of `get_member_id_priority_tiers`: groups the selected
+/// indices by workspace resolution tier without cloning any id.
+fn get_member_id_priority_tier_indices(
+    db: &DbIndex,
+    caller_file_id: &FileId,
+    member_ids: &[LuaMemberId],
+    visible: &[usize],
+) -> Vec<(WorkspaceResolutionKey, Vec<usize>)> {
+    let module_index = db.get_module_index();
+    let Some(caller_workspace_id) = module_index.get_workspace_id(*caller_file_id) else {
+        return vec![(
+            WorkspaceResolutionKey::new(0, 0, crate::WorkspaceId { id: 0 }),
+            visible.to_vec(),
+        )];
+    };
+
+    let mut priority_tiers = BTreeMap::new();
+    for &index in visible {
+        let member_id = &member_ids[index];
+        let candidate_workspace_id = module_index
+            .get_workspace_id(member_id.file_id)
+            .unwrap_or(crate::WorkspaceId::MAIN);
+        let Some(priority) =
+            module_index.workspace_resolution_key(caller_workspace_id, candidate_workspace_id)
+        else {
+            continue;
+        };
+
+        priority_tiers
+            .entry(priority)
+            .or_insert_with(Vec::new)
+            .push(index);
+    }
+
+    priority_tiers.into_iter().collect()
+}
+
+/// Index analogue of `select_member_ids_by_workspace_and_realm`: the same
+/// tier walk over indices into `member_ids`, materialising ids only into the
+/// returned vector.
+fn select_member_ids_by_workspace_and_realm_from_indices(
+    db: &DbIndex,
+    caller_file_id: &FileId,
+    priority_tiers: Vec<(WorkspaceResolutionKey, Vec<usize>)>,
+    member_ids: &[LuaMemberId],
+    caller_realm: GmodRealm,
+) -> Vec<LuaMemberId> {
+    if !db.get_emmyrc().gmod.enabled {
+        return priority_tiers
+            .first()
+            .map(|(_, indices)| {
+                let mut selected: Vec<LuaMemberId> =
+                    indices.iter().map(|&index| member_ids[index]).collect();
+                sort_member_ids_for_caller(db, caller_realm, &mut selected);
+                selected
+            })
+            .unwrap_or_default();
+    }
+
+    let mut fallback_member_ids: Vec<LuaMemberId> = priority_tiers
+        .first()
+        .map(|(_, indices)| indices.iter().map(|&index| member_ids[index]).collect())
+        .unwrap_or_default();
+    sort_member_ids_for_caller(db, caller_realm, &mut fallback_member_ids);
+
+    let member_index = db.get_member_index();
+    let infer_index = db.get_gmod_infer_index();
+    let caller_is_main = db
+        .get_module_index()
+        .get_workspace_id(*caller_file_id)
+        .is_some_and(|workspace_id| {
+            db.get_module_index().get_workspace_kind(workspace_id) == WorkspaceKind::Main
+        });
+
+    let mut result = Vec::new();
+    let mut found_first_compatible = false;
+    let mut all_seen_are_non_meta = true;
+    let mut can_supplement_from_library = false;
+
+    for (priority, tier_indices) in &priority_tiers {
+        let compatible_indices = tier_indices
+            .iter()
+            .copied()
+            .filter(|&index| {
+                let member_realm = member_effective_realm(infer_index, &member_ids[index]);
+                is_realm_compatible(caller_realm, member_realm)
+            })
+            .collect::<Vec<_>>();
+
+        if compatible_indices.is_empty() {
+            continue;
+        }
+
+        if !found_first_compatible {
+            // First compatible tier: include all its realm-compatible members.
+            let has_meta = compatible_indices.iter().any(|&index| {
+                member_index
+                    .get_member(&member_ids[index])
+                    .is_some_and(|m| m.get_feature().is_meta_decl())
+            });
+            result.extend(compatible_indices.iter().map(|&index| member_ids[index]));
+            found_first_compatible = true;
+            all_seen_are_non_meta = !has_meta;
+            can_supplement_from_library =
+                caller_is_main && priority.broad_tier() == 0 && all_seen_are_non_meta;
+        } else if can_supplement_from_library && all_seen_are_non_meta {
+            // We have only non-meta members so far. Supplement with any
+            // meta (annotated) members from this lower-priority tier so that
+            // resolve_member_type can prefer them via meta_override_file_define.
+            let meta_members: Vec<_> = compatible_indices
+                .iter()
+                .map(|&index| member_ids[index])
+                .filter(|member_id| {
+                    member_index
+                        .get_member(member_id)
+                        .is_some_and(|m| m.get_feature().is_meta_decl())
+                })
+                .collect();
+            if !meta_members.is_empty() {
+                result.extend(meta_members);
+            }
+            // Each library root has its own tier. Once the first compatible
+            // lower tier is examined, later libraries must not supply
+            // metadata for the same member.
+            break;
+        }
+    }
+
+    if result.is_empty() && caller_realm.state_mask().is_empty() {
+        return fallback_member_ids;
+    }
+
+    supplement_function_assignment_shape_members(db, &fallback_member_ids, &mut result);
+
+    sort_member_ids_for_caller(db, caller_realm, &mut result);
+    result
 }
 
 fn get_member_id_priority_tiers(

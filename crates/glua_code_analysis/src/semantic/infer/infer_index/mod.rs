@@ -10,6 +10,7 @@ use rowan::{TextRange, TextSize};
 use rustc_hash::FxHashSet;
 use smol_str::SmolStr;
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::{
     CacheEntry, FileId, GenericTpl, GlobalId, InFiled, InferGuardRef, LuaAliasCallKind, LuaDeclId,
@@ -43,7 +44,7 @@ use crate::{
         is_doc_tag_table_const,
         member::find_members_with_key,
         member::get_buildin_type_map_type_id,
-        member::infer_owner_raw_member_type_with_realm,
+        member::infer_owner_raw_member_type_with_realm_cached,
         member::intersect_member_types,
         member::local_class_table_member_ids,
         member::member_key_as_type,
@@ -269,9 +270,9 @@ fn run_legacy_fallback_narrow_raw(
     result
 }
 
-fn cache_entry_to_infer_result(entry: &CacheEntry<LuaType>) -> InferResult {
+fn cache_entry_to_infer_result(entry: &CacheEntry<Arc<LuaType>>) -> InferResult {
     match entry {
-        CacheEntry::Cache(ty) => Ok(ty.clone()),
+        CacheEntry::Cache(ty) => Ok(ty.as_ref().clone()),
         CacheEntry::Error(reason) => Err(reason.clone()),
         CacheEntry::Ready => Err(InferFailReason::None),
     }
@@ -280,9 +281,9 @@ fn cache_entry_to_infer_result(entry: &CacheEntry<LuaType>) -> InferResult {
 fn infer_result_to_cache_entry(
     cache: &LuaInferCache,
     result: &InferResult,
-) -> Option<CacheEntry<LuaType>> {
+) -> Option<CacheEntry<Arc<LuaType>>> {
     match result {
-        Ok(ty) => Some(CacheEntry::Cache(ty.clone())),
+        Ok(ty) => Some(CacheEntry::Cache(Arc::new(ty.clone()))),
         Err(InferFailReason::RecursiveInfer) => None,
         Err(reason) => {
             let should_cache = match reason {
@@ -325,12 +326,14 @@ pub fn get_index_expr_var_ref_id(
         return Some(var_ref_id.clone());
     }
 
-    let path = index_expr.get_access_path()?;
-    let access_path = ArcIntern::new(SmolStr::new(&path));
-
+    // Resolve the prefix first: it is usually cached, while the access path
+    // below allocates a string and hits the global interner. Building the
+    // path first would pay both on every miss that bails out here — and
+    // misses that bail out here never populate the cache above, so they pay
+    // it on every repeated query.
     let mut prefix_expr = index_expr.get_prefix_expr()?;
-    while let LuaExpr::IndexExpr(index_expr) = prefix_expr {
-        prefix_expr = index_expr.get_prefix_expr()?;
+    while let LuaExpr::IndexExpr(nested) = prefix_expr {
+        prefix_expr = nested.get_prefix_expr()?;
     }
 
     if let LuaExpr::NameExpr(name_expr) = prefix_expr {
@@ -340,6 +343,8 @@ pub fn get_index_expr_var_ref_id(
             _ => return None,
         };
 
+        let path = index_expr.get_access_path()?;
+        let access_path = ArcIntern::new(SmolStr::new(&path));
         let var_ref_id = VarRefId::IndexRef(root, access_path);
         cache
             .expr_var_ref_id_cache
@@ -742,8 +747,9 @@ fn infer_table_member_owner(
         }
     }
 
-    let raw_member_type = infer_owner_raw_member_type_with_realm(
+    let raw_member_type = infer_owner_raw_member_type_with_realm_cached(
         db,
+        cache,
         owner.clone(),
         &key,
         cache.get_file_id(),
@@ -917,8 +923,9 @@ fn infer_table_metatable_member(
     // Every `__index` writer is visible; a slot whose writers disagree (a
     // table in one place, a function or another table elsewhere) names no
     // single lookup table, so nothing is resolved through it.
-    if let Ok(index_type) = infer_owner_raw_member_type_with_realm(
+    if let Ok(index_type) = infer_owner_raw_member_type_with_realm_cached(
         db,
+        cache,
         meta_owner.clone(),
         &index_member_key,
         cache.get_file_id(),
