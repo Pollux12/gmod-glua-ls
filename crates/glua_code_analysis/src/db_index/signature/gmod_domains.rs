@@ -569,14 +569,74 @@ fn signature_has_valid_guard_attribute(db: &DbIndex, signature_id: LuaSignatureI
 /// same global/member identity. Resolve that identity once after declarations
 /// and docs are indexed, before flow/lua analysis, so call narrowing remains an
 /// O(1) signature lookup instead of re-inferring semantic declarations per call.
+///
+/// Incremental: the global-declaration part is recomputed only until it has
+/// been derived once and no removal dirtied it, and the per-file member part
+/// only for files removed since the last rebuild or never derived at all
+/// (added files). Everything else is reused from the stored per-file
+/// contributions, and the effective set is re-derived as their union.
 pub fn rebuild_effective_valid_guard_signatures(db: &mut DbIndex) {
-    db.get_signature_index_mut()
-        .clear_effective_valid_guard_signatures();
-
     if !db.get_emmyrc().gmod.enabled {
+        let signature_index = db.get_signature_index_mut();
+        signature_index.clear_effective_valid_guard_signatures();
+        signature_index.clear_valid_guard_contributions();
         return;
     }
 
+    let dirty_files = db.get_signature_index_mut().take_valid_guard_dirty_files();
+    let global_stale = {
+        let signature_index = db.get_signature_index();
+        signature_index.valid_guard_global_contributions().is_none()
+            || signature_index.valid_guard_global_dirty()
+    };
+
+    // Files drained from the dirty set but gone from the workspace need no
+    // entry: the removal hook already dropped their contributions. Files the
+    // map has never covered are added files, derived here once.
+    let all_file_ids = db.get_vfs().get_all_file_ids();
+    let mut work_files: Vec<FileId> = {
+        let signature_index = db.get_signature_index();
+        let contributions = signature_index.valid_guard_file_contributions();
+        let mut work: Vec<FileId> = dirty_files
+            .into_iter()
+            .filter(|file_id| all_file_ids.contains(file_id))
+            .collect();
+        for file_id in &all_file_ids {
+            if !contributions.contains_key(file_id) && !work.contains(file_id) {
+                work.push(*file_id);
+            }
+        }
+        work
+    };
+    work_files.sort_unstable();
+
+    let global_contributions = global_stale.then(|| valid_guard_global_contributions(db));
+    // The per-file member scan is read-only against `&DbIndex`, so the dirty
+    // and added files derive across files in parallel. Each file's result is
+    // stored under its own id, so scheduling order cannot change the merged
+    // set.
+    let per_file = if work_files.is_empty() {
+        Vec::new()
+    } else {
+        crate::compilation::analyzer::parallel::map_files_collect(db, &work_files, |db, file_id| {
+            (file_id, valid_guard_contributions_for_file(db, file_id))
+        })
+    };
+
+    let signature_index = db.get_signature_index_mut();
+    if let Some(global) = global_contributions {
+        signature_index.store_valid_guard_global_contributions(global);
+    }
+    for (file_id, contributions) in per_file {
+        signature_index.store_valid_guard_file_contributions(file_id, contributions);
+    }
+    signature_index.rederive_effective_valid_guard_signatures();
+}
+
+/// The global-declaration part of the effective valid-guard derivation: every
+/// global's identity, resolved against the shadowing-aware semantic
+/// declaration.
+fn valid_guard_global_contributions(db: &DbIndex) -> Vec<(LuaSignatureId, GmodStateMask)> {
     let mut effective_signatures = Vec::new();
 
     for decl_id in db.get_global_index().get_all_global_decl_ids() {
@@ -601,42 +661,34 @@ pub fn rebuild_effective_valid_guard_signatures(db: &mut DbIndex) {
         }
     }
 
-    // The per-file member scan is read-only against `&DbIndex` and runs over
-    // every file in the workspace on every edit, so it is derived across files
-    // in parallel. Results are flattened in file order, so the marked set is
-    // identical to the previous sequential scan.
-    let all_file_ids = db.get_vfs().get_all_file_ids();
-    let per_file = crate::compilation::analyzer::parallel::map_files_collect(
-        db,
-        &all_file_ids,
-        |db, file_id| {
-            let mut found = Vec::new();
-            let member_ids = db
-                .get_member_index()
-                .get_file_members(file_id)
-                .into_iter()
-                .map(|member| member.get_id())
-                .collect::<Vec<_>>();
-            for member_id in member_ids {
-                let semantic_decl = LuaSemanticDeclId::from(member_id);
-                let Some(signature_id) = signature_id_for_semantic_decl(db, &semantic_decl) else {
-                    continue;
-                };
-                if let Some(state_mask) = member_identity_direct_valid_guard_mask(db, member_id)
-                    && state_mask.is_compatible_with(signature_realm_mask(db, signature_id))
-                {
-                    found.push((signature_id, state_mask));
-                }
-            }
-            found
-        },
-    );
-    effective_signatures.extend(per_file.into_iter().flatten());
+    effective_signatures
+}
 
-    let signature_index = db.get_signature_index_mut();
-    for (signature_id, state_mask) in effective_signatures {
-        signature_index.mark_effective_valid_guard_signature(signature_id, state_mask);
+/// The member-identity part for one file: every member's identity, resolved
+/// against the shadowing-aware semantic declaration.
+fn valid_guard_contributions_for_file(
+    db: &DbIndex,
+    file_id: FileId,
+) -> Vec<(LuaSignatureId, GmodStateMask)> {
+    let mut found = Vec::new();
+    let member_ids = db
+        .get_member_index()
+        .get_file_members(file_id)
+        .into_iter()
+        .map(|member| member.get_id())
+        .collect::<Vec<_>>();
+    for member_id in member_ids {
+        let semantic_decl = LuaSemanticDeclId::from(member_id);
+        let Some(signature_id) = signature_id_for_semantic_decl(db, &semantic_decl) else {
+            continue;
+        };
+        if let Some(state_mask) = member_identity_direct_valid_guard_mask(db, member_id)
+            && state_mask.is_compatible_with(signature_realm_mask(db, signature_id))
+        {
+            found.push((signature_id, state_mask));
+        }
     }
+    found
 }
 
 pub fn signature_is_valid_guard_or_base_runtime_isvalid_in_realm(
@@ -804,7 +856,7 @@ pub fn signature_owner_for(
 mod tests {
     use super::*;
     use crate::{
-        LuaAttributeUse, LuaType, LuaTypeDeclId, VirtualWorkspace,
+        LuaAttributeUse, LuaSignatureId, LuaType, LuaTypeDeclId, VirtualWorkspace,
         db_index::signature::{CALL_ARG_ATTRIBUTE, LuaDocParamInfo, LuaSignature},
     };
     use smol_str::SmolStr;
@@ -1131,6 +1183,94 @@ mod tests {
             copied.len(),
             GMOD_CALL_ARG_DOMAINS.len(),
             "GMOD_CALL_ARG_DOMAINS has no duplicates"
+        );
+    }
+
+    /// Removing the file that shadows a valid-guard annotation drops its
+    /// contribution explicitly: the incremental rebuild must agree exactly
+    /// with a fresh workspace that never contained the shadow.
+    #[test]
+    fn incremental_valid_guard_rebuild_matches_fresh_after_shadow_removal() {
+        use crate::Emmyrc;
+
+        const ANNOTATION: &str = r#"
+            ---@meta
+            ---@attribute valid_guard()
+
+            ---@class Entity
+
+            ---@param value any
+            ---@return TypeGuard<Entity>
+            ---@[valid_guard]
+            function IsValid(value) end
+
+            ---@class Widget
+
+            ---@param value any
+            ---@return TypeGuard<Widget>
+            ---@[valid_guard]
+            function Widget:IsValid() end
+        "#;
+        const SHADOW: &str = r#"
+            function IsValid(value)
+                return value ~= nil
+            end
+        "#;
+
+        fn effective_snapshot(db: &crate::DbIndex) -> Vec<(LuaSignatureId, Option<GmodStateMask>)> {
+            let index = db.get_signature_index();
+            let mut entries: Vec<_> = index
+                .iter()
+                .map(|(id, _)| (*id, index.effective_valid_guard_signature_mask(id)))
+                .collect();
+            entries.sort_by_key(|(id, _)| (id.get_file_id(), id.get_position()));
+            entries
+        }
+
+        fn workspace_with_annotation() -> VirtualWorkspace {
+            let mut ws = VirtualWorkspace::new();
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+            let uri = ws
+                .virtual_url_generator
+                .new_uri("lua/includes/valid_guard_anno.lua");
+            ws.analysis
+                .update_file_by_uri(&uri, Some(ANNOTATION.to_string()))
+                .map(|(id, _)| id)
+                .expect("annotation file indexed");
+            ws
+        }
+
+        let mut ws = workspace_with_annotation();
+        let shadow_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/shared/shadow.lua");
+        let shadow_file = ws
+            .analysis
+            .update_file_by_uri(&shadow_uri, Some(SHADOW.to_string()))
+            .map(|(id, _)| id)
+            .expect("shadow file indexed");
+        let before = effective_snapshot(ws.analysis.compilation.get_db());
+        assert!(
+            before
+                .iter()
+                .any(|(id, mask)| id.get_file_id() == shadow_file && mask.is_some()),
+            "the shadowing source contributes to the effective set while present",
+        );
+
+        ws.analysis.update_file_by_uri(&shadow_uri, None);
+        let after = effective_snapshot(ws.analysis.compilation.get_db());
+        assert!(
+            after.iter().all(|(id, _)| id.get_file_id() != shadow_file),
+            "the removed shadow leaves no signature behind at all",
+        );
+
+        let fresh = workspace_with_annotation();
+        assert_eq!(
+            after,
+            effective_snapshot(fresh.analysis.compilation.get_db()),
+            "incremental rebuild after removal agrees with a fresh workspace",
         );
     }
 }

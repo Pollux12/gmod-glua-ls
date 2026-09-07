@@ -23,9 +23,7 @@ use crate::{
                 var_ref_id::{get_var_expr_var_ref_id, unknown_prefix_should_widen_to_any},
             },
         },
-        member::{
-            cached_local_class_table_member_ids, find_members_with_key, infer_raw_member_type,
-        },
+        member::{find_members_with_key, infer_raw_member_type, local_class_table_member_ids},
     },
 };
 
@@ -502,11 +500,9 @@ fn maybe_type_guard_binary(
                         target_type_id,
                     )
                 {
-                    return Ok(
-                        infer_static_member_path(db, cache, antecedent_type, member_keys)
-                            .map(ResultTypeOrContinue::Result)
-                            .unwrap_or(ResultTypeOrContinue::Continue),
-                    );
+                    return Ok(infer_static_member_path(db, antecedent_type, member_keys)
+                        .map(ResultTypeOrContinue::Result)
+                        .unwrap_or(ResultTypeOrContinue::Continue));
                 }
                 return Ok(ResultTypeOrContinue::Continue);
             }
@@ -523,11 +519,9 @@ fn maybe_type_guard_binary(
     };
 
     if let Some(member_keys) = related_member_query {
-        return Ok(
-            infer_static_member_path(db, cache, result_type, &member_keys)
-                .map(ResultTypeOrContinue::Result)
-                .unwrap_or(ResultTypeOrContinue::Continue),
-        );
+        return Ok(infer_static_member_path(db, result_type, &member_keys)
+            .map(ResultTypeOrContinue::Result)
+            .unwrap_or(ResultTypeOrContinue::Continue));
     }
 
     Ok(ResultTypeOrContinue::Result(result_type))
@@ -595,7 +589,6 @@ fn static_member_path_keys(path: &str) -> Option<Vec<LuaMemberKey>> {
 
 fn infer_static_member_path(
     db: &DbIndex,
-    cache: &mut LuaInferCache,
     root_type: LuaType,
     member_keys: &[LuaMemberKey],
 ) -> Option<LuaType> {
@@ -603,7 +596,7 @@ fn infer_static_member_path(
     for member_key in member_keys {
         current_type = find_members_with_key(db, &current_type, member_key.clone(), false)
             .and_then(|members| members.first().map(|member| member.typ.clone()))
-            .or_else(|| infer_local_class_table_member_type(db, cache, &current_type, member_key))
+            .or_else(|| infer_local_class_table_member_type(db, &current_type, member_key))
             .or_else(|| infer_raw_member_type(db, &current_type, member_key).ok())?;
     }
 
@@ -612,22 +605,21 @@ fn infer_static_member_path(
 
 fn infer_local_class_table_member_type(
     db: &DbIndex,
-    cache: &mut LuaInferCache,
     class_type: &LuaType,
     member_key: &LuaMemberKey,
 ) -> Option<LuaType> {
     let type_id = match class_type {
         LuaType::Ref(type_id) | LuaType::Def(type_id) => type_id,
         LuaType::TypeGuard(inner) => {
-            return infer_local_class_table_member_type(db, cache, inner, member_key);
+            return infer_local_class_table_member_type(db, inner, member_key);
         }
         LuaType::TableOf(inner) => {
-            return infer_local_class_table_member_type(db, cache, inner, member_key);
+            return infer_local_class_table_member_type(db, inner, member_key);
         }
         _ => return None,
     };
 
-    let member_ids = cached_local_class_table_member_ids(db, cache, type_id, member_key);
+    let member_ids = local_class_table_member_ids(db, type_id, member_key);
     match member_ids.as_slice() {
         [] => None,
         [member_id] => crate::LuaMemberIndexItem::One(*member_id)

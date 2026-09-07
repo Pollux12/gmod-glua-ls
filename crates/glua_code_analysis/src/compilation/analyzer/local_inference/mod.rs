@@ -18,6 +18,7 @@ use crate::{
     LuaMemberKey, LuaMemberOwner, LuaSignatureId, LuaType, LuaTypeDeclId, LuaTypeFact,
     SignatureReturnStatus, TypeOps,
     compilation::analyzer::AnalyzeContext,
+    db_index::{DirectSubtypeMembers, DirectSubtypeMembersKey},
     semantic::{
         infer_bind_value_type, infer_expr, infer_true_condition_narrowing,
         resolve_dynamic_field_member,
@@ -438,7 +439,8 @@ pub(super) fn stabilize_unguarded_children(
     let mut initializer_refinements = HashMap::<crate::LuaDeclId, LuaType>::default();
     let mut declared_path_bases = DeclaredPathBases::default();
     let subtype_index_start = profile.as_ref().map(|_| std::time::Instant::now());
-    let direct_subtype_members = precompute_direct_subtype_members(db);
+    let subtype_members_cache = direct_subtype_members_cached(db);
+    let direct_subtype_members: &DirectSubtypeMembers = &subtype_members_cache;
     let nested_candidate_members = direct_subtype_members
         .values()
         .flat_map(|members| members.keys().cloned())
@@ -529,7 +531,7 @@ pub(super) fn stabilize_unguarded_children(
                 file_id,
                 root_decl_id: decl_id,
                 declared_root_type: base_type.as_ref(),
-                direct_subtype_members: &direct_subtype_members,
+                direct_subtype_members,
                 candidate_members: &nested_candidate_members,
                 declared_path_bases: &mut declared_path_bases,
                 scores: &mut nested_scores,
@@ -1541,7 +1543,55 @@ fn type_has_visible_static_member_at_use(
     })
 }
 
-type DirectSubtypeMembers = FxHashMap<LuaTypeDeclId, FxHashMap<LuaMemberKey, Vec<LuaTypeDeclId>>>;
+/// The cached [`precompute_direct_subtype_members`] map, rebuilt lazily only
+/// when a super-type, member or dynamic-field write moved the revision key
+/// underneath it. The [`Arc`] clone is what `stabilize_unguarded_children`
+/// holds: the map borrows nothing, so the pass keeps using `db` freely.
+pub(crate) fn direct_subtype_members_cached(db: &mut crate::DbIndex) -> Arc<DirectSubtypeMembers> {
+    let key = direct_subtype_members_key(db);
+    if let Some((cached_key, cached_map)) = db.get_type_index().direct_subtype_members_cache()
+        && cached_key == &key
+    {
+        return cached_map.clone();
+    }
+
+    let map = Arc::new(precompute_direct_subtype_members(db));
+    db.get_type_index_mut()
+        .store_direct_subtype_members(key, map.clone());
+    map
+}
+
+/// Snapshots everything [`precompute_direct_subtype_members`] reads: the
+/// super-type write revision, the member re-homing revision plus per-file
+/// member counts (pure first filings re-home nothing), and an
+/// order-independent fold of the dynamic field names.
+fn direct_subtype_members_key(db: &crate::DbIndex) -> DirectSubtypeMembersKey {
+    let member_index = db.get_member_index();
+    let mut file_ids = db.get_vfs().get_all_file_ids();
+    file_ids.sort_unstable();
+    let member_file_counts = file_ids
+        .iter()
+        .map(|file_id| (*file_id, member_index.get_file_members(*file_id).len()))
+        .collect();
+
+    let mut dynamic_fields_fingerprint = 0u64;
+    for (owner, fields) in db.get_dynamic_field_index().iter_all_owner_fields() {
+        for name in fields.keys() {
+            let mut hasher = rustc_hash::FxHasher::default();
+            std::hash::Hash::hash(owner, &mut hasher);
+            std::hash::Hash::hash(name, &mut hasher);
+            dynamic_fields_fingerprint =
+                dynamic_fields_fingerprint.wrapping_add(std::hash::Hasher::finish(&hasher));
+        }
+    }
+
+    DirectSubtypeMembersKey {
+        super_revision: db.get_type_index().super_write_revision(),
+        member_revision: member_index.homing_revision(),
+        member_file_counts,
+        dynamic_fields_fingerprint,
+    }
+}
 
 fn precompute_direct_subtype_members(db: &crate::DbIndex) -> DirectSubtypeMembers {
     let type_index = db.get_type_index();

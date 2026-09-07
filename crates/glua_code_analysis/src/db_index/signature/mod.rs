@@ -45,6 +45,20 @@ pub struct LuaSignatureIndex {
     in_file_signatures: HashMap<FileId, HashSet<LuaSignatureId>>,
     local_func_decls: HashMap<LuaSignatureId, LuaDeclId>,
     effective_valid_guard_signatures: HashMap<LuaSignatureId, GmodStateMask>,
+    /// Per-file valid-guard contributions feeding the effective set: file →
+    /// the `(signature, mask)` pairs derived from that file's members. A file
+    /// can contribute to another file's signature (a source function shadowing
+    /// a metadata-bearing annotation), so removal drops these entries
+    /// explicitly instead of filtering the effective map by signature file.
+    valid_guard_file_contributions: HashMap<FileId, Vec<(LuaSignatureId, GmodStateMask)>>,
+    /// The global-declaration part of the same derivation. `None` until the
+    /// first rebuild; always recomputed together with any dirty file part.
+    valid_guard_global_contributions: Option<Vec<(LuaSignatureId, GmodStateMask)>>,
+    /// Files whose contributions must be re-derived on the next rebuild:
+    /// every removal lands here, as does every global-decl change via
+    /// [`Self::valid_guard_global_dirty`].
+    valid_guard_contribution_dirty_files: HashSet<FileId>,
+    valid_guard_global_dirty: bool,
     inferred_positive_guards: HashMap<LuaSignatureId, LuaInferredPositiveGuard>,
     inferred_guard_owners: HashMap<LuaSignatureId, LuaInferredGuardOwner>,
     inferred_guard_facts: HashMap<LuaInferredGuardOwner, LuaInferredPositiveGuard>,
@@ -152,6 +166,10 @@ impl LuaSignatureIndex {
             in_file_signatures: HashMap::default(),
             local_func_decls: HashMap::default(),
             effective_valid_guard_signatures: HashMap::default(),
+            valid_guard_file_contributions: HashMap::default(),
+            valid_guard_global_contributions: None,
+            valid_guard_contribution_dirty_files: HashSet::default(),
+            valid_guard_global_dirty: false,
             inferred_positive_guards: HashMap::default(),
             inferred_guard_owners: HashMap::default(),
             inferred_guard_facts: HashMap::default(),
@@ -233,6 +251,84 @@ impl LuaSignatureIndex {
         self.effective_valid_guard_signatures
             .get(signature_id)
             .copied()
+    }
+
+    pub(crate) fn valid_guard_global_contributions(
+        &self,
+    ) -> Option<&[(LuaSignatureId, GmodStateMask)]> {
+        self.valid_guard_global_contributions.as_deref()
+    }
+
+    pub(crate) fn valid_guard_global_dirty(&self) -> bool {
+        self.valid_guard_global_dirty
+    }
+
+    pub(crate) fn valid_guard_file_contributions(
+        &self,
+    ) -> &HashMap<FileId, Vec<(LuaSignatureId, GmodStateMask)>> {
+        &self.valid_guard_file_contributions
+    }
+
+    pub(crate) fn take_valid_guard_dirty_files(&mut self) -> HashSet<FileId> {
+        std::mem::take(&mut self.valid_guard_contribution_dirty_files)
+    }
+
+    pub(crate) fn store_valid_guard_global_contributions(
+        &mut self,
+        contributions: Vec<(LuaSignatureId, GmodStateMask)>,
+    ) {
+        self.valid_guard_global_contributions = Some(contributions);
+        self.valid_guard_global_dirty = false;
+    }
+
+    pub(crate) fn store_valid_guard_file_contributions(
+        &mut self,
+        file_id: FileId,
+        contributions: Vec<(LuaSignatureId, GmodStateMask)>,
+    ) {
+        self.valid_guard_file_contributions
+            .insert(file_id, contributions);
+        self.valid_guard_contribution_dirty_files.remove(&file_id);
+    }
+
+    /// Drops one file's contributions explicitly and marks the global part
+    /// dirty: member removal can change the global member-identity masks, and
+    /// decl removal can drop a global identity altogether.
+    pub(crate) fn remove_valid_guard_file_contributions(&mut self, file_id: FileId) {
+        self.valid_guard_file_contributions.remove(&file_id);
+        self.valid_guard_contribution_dirty_files.remove(&file_id);
+        self.valid_guard_global_dirty = true;
+    }
+
+    /// Re-derives the effective set as the union of the stored contributions.
+    /// Union is commutative, so the result is independent of hash iteration
+    /// order.
+    pub(crate) fn rederive_effective_valid_guard_signatures(&mut self) {
+        let mut effective: HashMap<LuaSignatureId, GmodStateMask> = HashMap::default();
+        let union = |effective: &mut HashMap<LuaSignatureId, GmodStateMask>,
+                     signature_id: LuaSignatureId,
+                     state_mask: GmodStateMask| {
+            effective
+                .entry(signature_id)
+                .and_modify(|existing| existing.insert(state_mask))
+                .or_insert(state_mask);
+        };
+        if let Some(global) = self.valid_guard_global_contributions.clone() {
+            for (signature_id, state_mask) in global {
+                union(&mut effective, signature_id, state_mask);
+            }
+        }
+        for (signature_id, state_mask) in self.valid_guard_file_contributions.values().flatten() {
+            union(&mut effective, *signature_id, *state_mask);
+        }
+        self.effective_valid_guard_signatures = effective;
+    }
+
+    pub(crate) fn clear_valid_guard_contributions(&mut self) {
+        self.valid_guard_file_contributions.clear();
+        self.valid_guard_global_contributions = None;
+        self.valid_guard_contribution_dirty_files.clear();
+        self.valid_guard_global_dirty = false;
     }
 
     pub fn set_inferred_positive_guard(
@@ -794,8 +890,13 @@ impl LuaIndex for LuaSignatureIndex {
                 self.local_func_decls.remove(&signature_id);
             }
         }
-        self.effective_valid_guard_signatures
-            .retain(|signature_id, _| signature_id.get_file_id() != file_id);
+        // Drop this file's valid-guard contributions explicitly and re-derive
+        // the effective set from what remains: a removed file can contribute
+        // to another file's signature (a source function shadowing a
+        // metadata-bearing annotation), which a signature-file filter on the
+        // effective map would leave stale.
+        self.remove_valid_guard_file_contributions(file_id);
+        self.rederive_effective_valid_guard_signatures();
         self.clear_inferred_positive_guards_for_file(file_id);
 
         if let Some(member_names) = self
@@ -825,6 +926,7 @@ impl LuaIndex for LuaSignatureIndex {
         self.local_func_decls.clear();
         self.return_write_versions.clear();
         self.effective_valid_guard_signatures.clear();
+        self.clear_valid_guard_contributions();
         self.inferred_positive_guards.clear();
         self.inferred_guard_owners.clear();
         self.inferred_guard_facts.clear();
