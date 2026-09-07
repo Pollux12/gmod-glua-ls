@@ -1025,6 +1025,221 @@ impl CallSiteParamIndex {
         }
         self.rebuild_source_dependents();
     }
+
+    /// Drops `signature_ids` from the source-signature derived maps, the
+    /// incremental counterpart of [`Self::rebuild_source_signatures`].
+    ///
+    /// The full rebuild pushes surviving entries in sorted-file order, so
+    /// retaining (which preserves order) over the stored vecs reaches the
+    /// same state while visiting only the removed signatures' paths.
+    fn prune_source_signatures(&mut self, signature_ids: &HashSet<LuaSignatureId>) {
+        if signature_ids.is_empty() {
+            return;
+        }
+        for signature_id in signature_ids {
+            self.mutated_params.remove(signature_id);
+        }
+        let mut emptied_paths = Vec::new();
+        for (path, signatures) in self.source_signatures_by_path.iter_mut() {
+            signatures.retain(|signature_id| !signature_ids.contains(signature_id));
+            if signatures.is_empty() {
+                emptied_paths.push(path.clone());
+            }
+        }
+        for path in emptied_paths {
+            self.source_signatures_by_path.remove(&path);
+        }
+    }
+
+    /// Drops `consumers` from the return-consumer derived maps, the
+    /// incremental counterpart of [`Self::rebuild_return_consumers`].
+    ///
+    /// The dependency maps are left alone: both rebuilds that feed them only
+    /// ever insert, so removing consumers never shrinks them, and rebuilding
+    /// the dependents from the unchanged forward map would be an identity.
+    fn prune_return_consumers(&mut self, consumers: &[CallSiteReturnConsumer]) {
+        for consumer in consumers {
+            if let Some(stored) = self.return_consumers.get_mut(&consumer.signature_id) {
+                stored.retain(|existing| existing != consumer);
+                if stored.is_empty() {
+                    self.return_consumers.remove(&consumer.signature_id);
+                }
+            }
+            let signature_file_id = consumer.signature_id.get_file_id();
+            if let Some(stored) = self
+                .return_consumers_by_signature_file
+                .get_mut(&signature_file_id)
+            {
+                stored.retain(|existing| existing != consumer);
+                if stored.is_empty() {
+                    self.return_consumers_by_signature_file
+                        .remove(&signature_file_id);
+                }
+            }
+        }
+    }
+
+    /// Re-folds exactly the pairs `affected` names from the surviving
+    /// contributions, the incremental counterpart of [`Self::rebuild_derived_state`].
+    ///
+    /// Candidates come from `contributor_files_by_signature`, which accumulates
+    /// every file that ever contributed to the signature and so is a superset
+    /// of the current contributors; files are visited in sorted order with
+    /// their stored contribution order, exactly as the full fold does. The
+    /// contributor and dependency maps accumulate rather than rebuild, so they
+    /// are left alone, matching what the full rebuild re-inserts.
+    fn refold_removed_params(
+        &mut self,
+        affected: &[(LuaSignatureId, usize)],
+        previous_facts: &HashMap<(LuaSignatureId, usize), Option<LuaTypeFact>>,
+    ) {
+        if affected.is_empty() {
+            return;
+        }
+        let mut affected_signatures = HashSet::default();
+        let mut touched_event_files = HashSet::default();
+        for (signature_id, param_idx) in affected {
+            affected_signatures.insert(*signature_id);
+            let mut contributor_files = self
+                .contributor_files_by_signature
+                .get(signature_id)
+                .map(|files| files.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default();
+            contributor_files.sort_unstable();
+
+            let mut accumulator: Option<CallSiteParamAccumulator> = None;
+            for file_id in contributor_files {
+                let Some(contributions) = self.file_contributions.get(&file_id) else {
+                    continue;
+                };
+                for contribution in contributions {
+                    if contribution.signature_id != *signature_id
+                        || contribution.param_idx != *param_idx
+                    {
+                        continue;
+                    }
+                    match &mut accumulator {
+                        None => {
+                            accumulator =
+                                Some(CallSiteParamAccumulator::new(&contribution.param_fact));
+                        }
+                        Some(current) => current.push(&contribution.param_fact),
+                    }
+                }
+            }
+            match accumulator {
+                None => {
+                    if let Some(params) = self.inferred_params.get_mut(signature_id) {
+                        params.remove(param_idx);
+                        if params.is_empty() {
+                            self.inferred_params.remove(signature_id);
+                        }
+                    }
+                }
+                Some(accumulator) => {
+                    self.inferred_params
+                        .entry(*signature_id)
+                        .or_default()
+                        .insert(*param_idx, accumulator.finish());
+                }
+            }
+
+            let old_fact = previous_facts
+                .get(&(*signature_id, *param_idx))
+                .and_then(Clone::clone);
+            let new_fact = self
+                .get_inferred_param_fact(signature_id, *param_idx)
+                .cloned();
+            self.refresh_param_events(
+                old_fact.as_ref(),
+                new_fact.as_ref(),
+                &mut touched_event_files,
+            );
+        }
+        let mut touched_files = touched_event_files.into_iter().collect::<Vec<_>>();
+        touched_files.sort_unstable();
+        let events_by_file = &mut self.inference_events_by_file;
+        for file_id in touched_files {
+            if let Some(events) = events_by_file.get_mut(&file_id) {
+                events.sort_by(|left, right| left.event.stable_cmp(&right.event));
+                events.dedup_by(|left, right| left.event == right.event);
+            }
+        }
+        self.inference_events_by_file
+            .retain(|_, events| !events.is_empty());
+        self.refresh_callback_files(&affected_signatures);
+    }
+
+    /// Swaps one pair's old event entries for its new ones. Events are keyed
+    /// per source file exactly as [`Self::rebuild_derived_state`] files them;
+    /// the caller re-sorts and dedups the touched files afterwards.
+    fn refresh_param_events(
+        &mut self,
+        old_fact: Option<&LuaTypeFact>,
+        new_fact: Option<&LuaTypeFact>,
+        touched: &mut HashSet<FileId>,
+    ) {
+        if let Some(old_fact) = old_fact {
+            for step in old_fact.provenance() {
+                touched.insert(step.event.source.file_id);
+                if let Some(events) = self
+                    .inference_events_by_file
+                    .get_mut(&step.event.source.file_id)
+                {
+                    events.retain(|existing| {
+                        !(existing.event == step.event && existing.fact == *old_fact)
+                    });
+                }
+            }
+        }
+        if let Some(new_fact) = new_fact {
+            for step in new_fact.provenance() {
+                touched.insert(step.event.source.file_id);
+                self.inference_events_by_file
+                    .entry(step.event.source.file_id)
+                    .or_default()
+                    .push(LuaInferenceDiagnosticEvent {
+                        event: step.event.clone(),
+                        fact: new_fact.clone(),
+                    });
+            }
+        }
+    }
+
+    /// Re-derives [`Self::concrete_structural_callback_files`] membership for
+    /// the files owning `signatures`, matching the full rebuild's pure
+    /// function of the current inferred params.
+    fn refresh_callback_files(&mut self, signatures: &HashSet<LuaSignatureId>) {
+        let mut files = signatures
+            .iter()
+            .map(|signature_id| signature_id.get_file_id())
+            .collect::<Vec<_>>();
+        files.sort_unstable();
+        files.dedup();
+        for file_id in files {
+            let has_callback = self.inferred_params.iter().any(|(signature_id, params)| {
+                signature_id.get_file_id() == file_id
+                    && params.values().any(is_concrete_structural_callback_fact)
+            });
+            if has_callback {
+                self.concrete_structural_callback_files.insert(file_id);
+            } else {
+                self.concrete_structural_callback_files.remove(&file_id);
+            }
+        }
+    }
+}
+
+/// Deterministic order for param updates: the folds they rebuild are
+/// sensitive to application order through the parked previous facts.
+fn param_sort_key(
+    (signature_id, param_idx): &(LuaSignatureId, usize),
+) -> (FileId, TextSize, usize) {
+    (
+        signature_id.get_file_id(),
+        signature_id.get_position(),
+        *param_idx,
+    )
 }
 
 impl LuaIndex for CallSiteParamIndex {
@@ -1039,18 +1254,36 @@ impl LuaIndex for CallSiteParamIndex {
             .flatten()
             .map(|contribution| (contribution.signature_id, contribution.param_idx))
             .collect::<HashSet<_>>();
-        for (signature_id, param_idx) in affected_params {
+        // The current facts of the affected pairs, for the event surgery once
+        // the contributions are gone. The parked map below may already hold an
+        // older fact from a previous removal, so this snapshot is taken
+        // separately.
+        let mut affected_sorted = affected_params.iter().copied().collect::<Vec<_>>();
+        affected_sorted.sort_by_key(param_sort_key);
+        let previous_facts = affected_sorted
+            .iter()
+            .map(|(signature_id, param_idx)| {
+                (
+                    (*signature_id, *param_idx),
+                    self.get_inferred_param_fact(signature_id, *param_idx)
+                        .cloned(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for (signature_id, param_idx) in &affected_sorted {
             if let Some(fact) = self
-                .get_inferred_param_fact(&signature_id, param_idx)
+                .get_inferred_param_fact(signature_id, *param_idx)
                 .cloned()
             {
                 self.pending_previous_params
-                    .entry((signature_id, param_idx))
+                    .entry((*signature_id, *param_idx))
                     .or_insert(fact);
             }
         }
         self.deferred_contributions
             .retain(|(file_id, _)| !file_ids.contains(file_id));
+        let mut removed_source_signatures = HashSet::default();
+        let mut removed_consumers = Vec::new();
         for &file_id in file_ids {
             if let Some(signatures) = self.file_source_signatures.remove(&file_id) {
                 // The oldest surviving entry is the one the stored ids belong
@@ -1060,18 +1293,25 @@ impl LuaIndex for CallSiteParamIndex {
                     .entry(file_id)
                     .or_insert_with(|| {
                         signatures
-                            .into_iter()
-                            .map(|(path, signature_id, _)| (path, signature_id))
+                            .iter()
+                            .map(|(path, signature_id, _)| (path.clone(), *signature_id))
                             .collect()
                     });
+                removed_source_signatures.extend(
+                    signatures
+                        .into_iter()
+                        .map(|(_, signature_id, _)| signature_id),
+                );
             }
-            self.file_return_consumers.remove(&file_id);
+            if let Some(consumers) = self.file_return_consumers.remove(&file_id) {
+                removed_consumers.extend(consumers);
+            }
             self.file_contributions.remove(&file_id);
         }
 
-        self.rebuild_derived_state();
-        self.rebuild_source_signatures();
-        self.rebuild_return_consumers();
+        self.prune_source_signatures(&removed_source_signatures);
+        self.prune_return_consumers(&removed_consumers);
+        self.refold_removed_params(&affected_sorted, &previous_facts);
     }
 
     fn clear(&mut self) {

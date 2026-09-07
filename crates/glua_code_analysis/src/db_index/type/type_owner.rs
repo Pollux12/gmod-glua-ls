@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use glua_parser::LuaSyntaxId;
 use rowan::TextSize;
 
@@ -46,6 +48,43 @@ impl LuaTypeOwner {
             LuaTypeOwner::SyntaxId(id) => id.value.get_range().start(),
         }
     }
+
+    /// Total order over owners, so index writes ordered by it do not depend on
+    /// hash-map iteration order. Mirrors the field order `Debug` prints, but
+    /// through real keys rather than a formatted string.
+    pub fn stable_cmp(&self, other: &Self) -> Ordering {
+        let tag = |owner: &Self| match owner {
+            LuaTypeOwner::Decl(_) => 0,
+            LuaTypeOwner::Member(_) => 1,
+            LuaTypeOwner::SyntaxId(_) => 2,
+        };
+
+        tag(self)
+            .cmp(&tag(other))
+            .then_with(|| match (self, other) {
+                (LuaTypeOwner::Decl(left), LuaTypeOwner::Decl(right)) => left
+                    .file_id
+                    .cmp(&right.file_id)
+                    .then_with(|| left.position.cmp(&right.position)),
+                (LuaTypeOwner::Member(left), LuaTypeOwner::Member(right)) => left
+                    .file_id
+                    .cmp(&right.file_id)
+                    .then_with(|| syntax_id_cmp(left.get_syntax_id(), right.get_syntax_id())),
+                (LuaTypeOwner::SyntaxId(left), LuaTypeOwner::SyntaxId(right)) => left
+                    .file_id
+                    .cmp(&right.file_id)
+                    .then_with(|| syntax_id_cmp(&left.value, &right.value)),
+                _ => Ordering::Equal,
+            })
+    }
+}
+
+fn syntax_id_cmp(left: &LuaSyntaxId, right: &LuaSyntaxId) -> Ordering {
+    left.get_range()
+        .start()
+        .cmp(&right.get_range().start())
+        .then_with(|| left.get_range().end().cmp(&right.get_range().end()))
+        .then_with(|| (left.get_kind() as u16).cmp(&(right.get_kind() as u16)))
 }
 
 #[derive(Debug, Clone)]

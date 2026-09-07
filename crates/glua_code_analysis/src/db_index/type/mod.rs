@@ -1264,9 +1264,14 @@ pub struct LuaTypeIndex {
     full_name_type_map: HashMap<LuaTypeDeclId, LuaTypeDecl>,
     generic_params: HashMap<LuaTypeDeclId, Vec<GenericParam>>,
     supers: HashMap<LuaTypeDeclId, Vec<InFiled<LuaSuperType>>>,
+    /// Super-type edges by the file that declared them, so removing a file
+    /// visits only its own edges instead of retaining over every edge in the
+    /// workspace. One record per [`LuaTypeIndex::add_super_type`] write, kept
+    /// in step with [`Self::supers`].
+    supers_by_file: HashMap<FileId, Vec<(LuaTypeDeclId, InFiled<LuaSuperType>)>>,
     /// Reverse super-type edges: base class id → direct subclass ids. Updated
-    /// on every [`LuaTypeIndex::add_super_type`] write and rebuilt when
-    /// [`LuaTypeIndex::remove_files`] prunes super-type entries, so
+    /// on every [`LuaTypeIndex::add_super_type`] write and pruned by declaring
+    /// file when [`LuaIndex::remove_files`] drops super-type entries, so
     /// [`LuaTypeIndex::get_sub_types`] is a lookup instead of a scan over
     /// every inheritance edge in the workspace.
     sub_types: HashMap<LuaTypeDeclId, Vec<LuaTypeDeclId>>,
@@ -1287,7 +1292,25 @@ pub struct LuaTypeIndex {
     in_filed_type_owner: HashMap<FileId, HashSet<LuaTypeOwner>>,
     settled_reads_by_file: HashMap<FileId, HashSet<LuaTypeOwner>>,
     settled_read_dependents: HashMap<LuaTypeOwner, HashSet<FileId>>,
+    /// The keys of [`Self::settled_read_dependents`] by the file the key
+    /// lives in, so remapping one file visits only its own keys instead of
+    /// scanning every settled owner in the workspace.
+    settled_owners_by_file: HashMap<FileId, HashSet<LuaTypeOwner>>,
     fact_metadata: HashMap<LuaTypeOwner, LuaTypeFactMetadata>,
+    /// The files one fact's provenance and step types name, per fact owner,
+    /// with the reverse map beside it. [`Self::remap_inference_facts`] visits
+    /// only the facts that name the edited file instead of every fact in the
+    /// workspace; the file set is exactly what `remap` consults (node, source
+    /// and support files plus `TableConst`/`Instance`/`Signature` files in the
+    /// step types), so a fact outside the edited file's bucket remaps to
+    /// itself.
+    fact_ref_files: HashMap<LuaTypeOwner, HashSet<FileId>>,
+    fact_refs_by_file: HashMap<FileId, HashSet<LuaTypeOwner>>,
+    /// The [`Self::fact_ref_files`] counterpart for definition facts, whose
+    /// payload type can name another file's literal or signature on top of
+    /// the provenance every fact carries.
+    definition_fact_ref_files: HashMap<LuaDefinitionId, HashSet<FileId>>,
+    definition_fact_refs_by_file: HashMap<FileId, HashSet<LuaDefinitionId>>,
     /// For each decl whose type a write has seeded: that write's source
     /// position, and whether its right-hand side was a call or index read. See
     /// `bind_decl_write`.
@@ -1318,6 +1341,7 @@ impl LuaTypeIndex {
             full_name_type_map: HashMap::default(),
             generic_params: HashMap::default(),
             supers: HashMap::default(),
+            supers_by_file: HashMap::default(),
             sub_types: HashMap::default(),
             decl_type_binds: HashMap::default(),
             type_bound_decls: HashMap::default(),
@@ -1328,6 +1352,11 @@ impl LuaTypeIndex {
             in_filed_type_owner: HashMap::default(),
             settled_reads_by_file: HashMap::default(),
             settled_read_dependents: HashMap::default(),
+            settled_owners_by_file: HashMap::default(),
+            fact_ref_files: HashMap::default(),
+            fact_refs_by_file: HashMap::default(),
+            definition_fact_ref_files: HashMap::default(),
+            definition_fact_refs_by_file: HashMap::default(),
             fact_metadata: HashMap::default(),
             decl_write_claims: HashMap::default(),
             type_writes: 0,
@@ -1513,7 +1542,11 @@ impl LuaTypeIndex {
         let at = supers.partition_point(|existing| {
             super_entry_sort_key(existing) <= super_entry_sort_key(&entry)
         });
-        supers.insert(at, entry);
+        supers.insert(at, entry.clone());
+        self.supers_by_file
+            .entry(file_id)
+            .or_default()
+            .push((decl_id.clone(), entry));
         if let Some(base_id) = base_id {
             let children = self.sub_types.entry(base_id).or_default();
             if !children.contains(&decl_id) {
@@ -1609,33 +1642,6 @@ impl LuaTypeIndex {
                 self.type_bound_decls.remove(&type_id);
             }
         }
-    }
-
-    /// Rebuilds [`Self::sub_types`] from the live [`Self::supers`] edges.
-    ///
-    /// Pruning in [`LuaIndex::remove_files`] drops super-type entries by file,
-    /// which can remove edges, whole children, and (for edge-only files) leave
-    /// the child declaration itself behind. Re-deriving keeps the reverse map
-    /// exactly consistent with the forward one. Each child list is sorted by
-    /// declaration id so the stored order is deterministic regardless of hash
-    /// iteration order; [`LuaTypeIndex::get_sub_types`] still applies the
-    /// name-first display order on read.
-    fn rebuild_sub_type_index(&mut self) {
-        let mut sub_types: HashMap<LuaTypeDeclId, Vec<LuaTypeDeclId>> = HashMap::default();
-        for (child_id, supers) in &self.supers {
-            for super_entry in supers {
-                if let LuaType::Ref(base_id) = &super_entry.value.typ {
-                    let children = sub_types.entry(base_id.clone()).or_default();
-                    if !children.contains(child_id) {
-                        children.push(child_id.clone());
-                    }
-                }
-            }
-        }
-        for children in sub_types.values_mut() {
-            children.sort_by(LuaTypeDeclId::stable_cmp);
-        }
-        self.sub_types = sub_types;
     }
 
     /// Counts the super-type writes so far. Compare it across an operation to
@@ -1785,6 +1791,7 @@ impl LuaTypeIndex {
             .or_default()
             .insert(owner.clone());
         if replaced && self.fact_metadata.remove(&owner).is_some() {
+            self.drop_fact_refs(&owner);
             self.mark_inference_derived_state_dirty();
         }
     }
@@ -1814,6 +1821,7 @@ impl LuaTypeIndex {
                 .entry(owner.clone())
                 .or_default()
                 .insert(file_id);
+            self.link_settled_owner(owner);
         }
         self.settled_reads_by_file.insert(file_id, reads);
     }
@@ -1827,18 +1835,20 @@ impl LuaTypeIndex {
                 dependents.remove(&file_id);
                 if dependents.is_empty() {
                     self.settled_read_dependents.remove(&owner);
+                    self.unlink_settled_owner(&owner);
                 }
             }
         }
     }
 
     fn remap_settled_reads(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
+        // Only the keys living in the edited file can move; the per-file side
+        // map locates them without scanning every settled owner.
         let old_owners = self
-            .settled_read_dependents
-            .keys()
-            .filter(|owner| owner.get_file_id() == remap.file_id)
-            .cloned()
-            .collect::<Vec<_>>();
+            .settled_owners_by_file
+            .get(&remap.file_id)
+            .map(|owners| owners.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
         let mut dirty = HashSet::default();
         let mut updates = Vec::new();
         for old_owner in old_owners {
@@ -1858,8 +1868,12 @@ impl LuaTypeIndex {
             updates.push((old_owner, new_owner, dependents));
         }
 
+        // Ordered by a real key rather than hash-map iteration order, so the
+        // re-keyed entries land deterministically.
+        updates.sort_by(|left, right| left.0.stable_cmp(&right.0));
         for (old_owner, _, _) in &updates {
             self.settled_read_dependents.remove(old_owner);
+            self.unlink_settled_owner(old_owner);
         }
         for (old_owner, new_owner, dependents) in updates {
             for dependent in &dependents {
@@ -1872,9 +1886,10 @@ impl LuaTypeIndex {
             }
             if let Some(new_owner) = new_owner {
                 self.settled_read_dependents
-                    .entry(new_owner)
+                    .entry(new_owner.clone())
                     .or_default()
                     .extend(dependents);
+                self.link_settled_owner(&new_owner);
             }
         }
         dirty
@@ -1892,6 +1907,7 @@ impl LuaTypeIndex {
             .or_default()
             .insert(owner.clone());
         if self.fact_metadata.remove(&owner).is_some() {
+            self.drop_fact_refs(&owner);
             self.mark_inference_derived_state_dirty();
         }
     }
@@ -1917,7 +1933,8 @@ impl LuaTypeIndex {
             .entry(file_id)
             .or_default()
             .insert(owner.clone());
-        self.fact_metadata.insert(owner, metadata);
+        self.fact_metadata.insert(owner.clone(), metadata);
+        self.refresh_fact_refs(&owner);
         self.mark_inference_derived_state_dirty();
     }
 
@@ -2029,7 +2046,8 @@ impl LuaTypeIndex {
             .entry(file_id)
             .or_default()
             .insert(owner.clone());
-        self.fact_metadata.insert(owner, metadata);
+        self.fact_metadata.insert(owner.clone(), metadata);
+        self.refresh_fact_refs(&owner);
         file_id
     }
 
@@ -2088,7 +2106,90 @@ impl LuaTypeIndex {
     ) -> FileId {
         let file_id = definition.file_id();
         self.definition_facts.insert(definition, fact);
+        self.refresh_definition_fact_refs(&definition);
         file_id
+    }
+
+    /// The files `metadata` names: every step's event node, source and
+    /// support files, plus the files the step types point at. Exactly the
+    /// files [`remap_provenance`] consults through `remap`, so a fact whose
+    /// set skips a file remaps to itself there.
+    fn metadata_referenced_files(metadata: &LuaTypeFactMetadata) -> HashSet<FileId> {
+        let mut files = HashSet::default();
+        collect_provenance_files(metadata.provenance.iter(), &mut files);
+        files
+    }
+
+    /// The files `fact` names: its payload type on top of its provenance.
+    fn definition_fact_referenced_files(fact: &LuaTypeFact) -> HashSet<FileId> {
+        let mut files = HashSet::default();
+        collect_type_files(fact.typ(), &mut files);
+        collect_provenance_files(fact.provenance().iter(), &mut files);
+        files
+    }
+
+    /// Re-points the reverse edges of `owner`'s fact at what the stored
+    /// metadata now names. Call on every metadata write; the remap only moves
+    /// identities within one file, so it never changes the file set and skips
+    /// this.
+    fn refresh_fact_refs(&mut self, owner: &LuaTypeOwner) {
+        let files = self
+            .fact_metadata
+            .get(owner)
+            .map(Self::metadata_referenced_files)
+            .unwrap_or_default();
+        replace_reverse_edges(
+            &mut self.fact_refs_by_file,
+            &mut self.fact_ref_files,
+            owner.clone(),
+            files,
+        );
+    }
+
+    fn drop_fact_refs(&mut self, owner: &LuaTypeOwner) {
+        remove_reverse_edges(&mut self.fact_refs_by_file, &mut self.fact_ref_files, owner);
+    }
+
+    fn refresh_definition_fact_refs(&mut self, definition: &LuaDefinitionId) {
+        let files = self
+            .definition_facts
+            .get(definition)
+            .map(Self::definition_fact_referenced_files)
+            .unwrap_or_default();
+        replace_reverse_edges(
+            &mut self.definition_fact_refs_by_file,
+            &mut self.definition_fact_ref_files,
+            *definition,
+            files,
+        );
+    }
+
+    fn drop_definition_fact_refs(&mut self, definition: &LuaDefinitionId) {
+        remove_reverse_edges(
+            &mut self.definition_fact_refs_by_file,
+            &mut self.definition_fact_ref_files,
+            definition,
+        );
+    }
+
+    /// Records `owner` as a settled-read key living in its own file. The key
+    /// is created exactly where [`Self::settled_read_dependents`] gains one.
+    fn link_settled_owner(&mut self, owner: &LuaTypeOwner) {
+        self.settled_owners_by_file
+            .entry(owner.get_file_id())
+            .or_default()
+            .insert(owner.clone());
+    }
+
+    /// Forgets `owner` once [`Self::settled_read_dependents`] loses its key.
+    fn unlink_settled_owner(&mut self, owner: &LuaTypeOwner) {
+        let file_id = owner.get_file_id();
+        if let Some(owners) = self.settled_owners_by_file.get_mut(&file_id) {
+            owners.remove(owner);
+            if owners.is_empty() {
+                self.settled_owners_by_file.remove(&file_id);
+            }
+        }
     }
 
     /// Marks the inference-derived state stale.
@@ -2246,6 +2347,7 @@ impl LuaTypeIndex {
                 self.note_type_write(&owner);
             }
             self.fact_metadata.remove(&owner);
+            self.drop_fact_refs(&owner);
         }
     }
 
@@ -2288,8 +2390,8 @@ impl LuaTypeIndex {
             }
         }
         // `candidate_owners` comes out of a hash set, so the writes are ordered
-        // before they are applied.
-        updates.sort_unstable_by_key(|(owner, _)| format!("{:?}", owner));
+        // by a real key before they are applied.
+        updates.sort_by(|left, right| left.0.stable_cmp(&right.0));
         let mut changed_files = HashSet::default();
         for (owner, new_cache) in updates {
             changed_files.insert(owner.get_file_id());
@@ -2307,17 +2409,25 @@ impl LuaTypeIndex {
     /// Rewrites the provenance of every stored fact, and the payload of every
     /// definition fact, through `remap`.
     ///
-    /// A definition fact's payload comes from inference and can name another
-    /// file's table literal or signature; its provenance names the inference
-    /// nodes the fact was derived from, which is what
-    /// `files_depending_on_inference_nodes` indexes. Neither is reachable from
-    /// `cache_refs`, so both are visited here rather than located by a reverse
-    /// index - the same walk `flush_inference_derived_state` already makes on
-    /// every analyse.
+    /// Only the facts that name the edited file are visited, located through
+    /// the reverse reference maps rather than by scanning every fact: any
+    /// other fact remaps each of its nodes, sources and nested identities to
+    /// itself. A definition fact's payload comes from inference and can name
+    /// another file's table literal or signature; its provenance names the
+    /// inference nodes the fact was derived from, which is what
+    /// `files_depending_on_inference_nodes` indexes.
     fn remap_inference_facts(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
         let mut dirty = HashSet::default();
         let mut metadata_updates = Vec::new();
-        for (owner, metadata) in &self.fact_metadata {
+        let candidates = self
+            .fact_refs_by_file
+            .get(&remap.file_id)
+            .map(|owners| owners.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for owner in candidates {
+            let Some(metadata) = self.fact_metadata.get(&owner) else {
+                continue;
+            };
             let mut lost = false;
             if let Some(provenance) = remap_provenance(&metadata.provenance, remap, &mut lost) {
                 metadata_updates.push((
@@ -2333,12 +2443,22 @@ impl LuaTypeIndex {
                 dirty.insert(owner.get_file_id());
             }
         }
+        // Ordered by a real key rather than hash-map iteration order.
+        metadata_updates.sort_by(|left, right| left.0.stable_cmp(&right.0));
         for (owner, metadata) in metadata_updates {
             self.fact_metadata.insert(owner, metadata);
         }
 
         let mut fact_updates = Vec::new();
-        for (definition, fact) in &self.definition_facts {
+        let candidates = self
+            .definition_fact_refs_by_file
+            .get(&remap.file_id)
+            .map(|definitions| definitions.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for definition in candidates {
+            let Some(fact) = self.definition_facts.get(&definition) else {
+                continue;
+            };
             let mut lost = false;
             let remapped = remap_identities_in_type(fact.typ(), remap);
             if remapped.lost {
@@ -2347,7 +2467,7 @@ impl LuaTypeIndex {
             let provenance = remap_provenance(fact.provenance(), remap, &mut lost);
             if remapped.typ.is_some() || provenance.is_some() {
                 fact_updates.push((
-                    *definition,
+                    definition,
                     LuaTypeFact::from_normalized_parts(
                         remapped.typ.unwrap_or_else(|| fact.typ().clone()),
                         fact.confidence(),
@@ -2360,6 +2480,7 @@ impl LuaTypeIndex {
                 dirty.insert(definition.file_id());
             }
         }
+        fact_updates.sort_by(|left, right| left.0.stable_cmp(&right.0));
         for (definition, fact) in fact_updates {
             self.definition_facts.insert(definition, fact);
         }
@@ -2576,25 +2697,75 @@ impl LuaIndex for LuaTypeIndex {
 
     fn remove_files(&mut self, file_ids: &[FileId]) {
         let mut changed_files = HashSet::default();
+        let mut ordered_removed = Vec::new();
         for &file_id in file_ids {
             if changed_files.insert(file_id) {
+                ordered_removed.push(file_id);
                 self.remove_file_raw(file_id);
             }
         }
-        let super_edges_before: usize = self.supers.values().map(Vec::len).sum();
-        self.supers.retain(|_, supers| {
-            supers.retain(|super_type| !changed_files.contains(&super_type.file_id));
-            !supers.is_empty()
-        });
-        self.rebuild_sub_type_index();
-        if self.supers.values().map(Vec::len).sum::<usize>() != super_edges_before {
+        // Only the edges the removed files declared are visited, through the
+        // declaring-file index, instead of retaining over every edge.
+        let mut pruned_edges = 0;
+        let mut affected_bases: HashSet<LuaTypeDeclId> = HashSet::default();
+        for file_id in ordered_removed {
+            let Some(records) = self.supers_by_file.remove(&file_id) else {
+                continue;
+            };
+            for (child_id, entry) in records {
+                if let LuaType::Ref(base_id) = &entry.value.typ {
+                    affected_bases.insert(base_id.clone());
+                }
+                let Some(supers) = self.supers.get_mut(&child_id) else {
+                    continue;
+                };
+                if let Some(at) = supers.iter().position(|existing| existing == &entry) {
+                    supers.remove(at);
+                    pruned_edges += 1;
+                }
+                if supers.is_empty() {
+                    self.supers.remove(&child_id);
+                }
+            }
+        }
+        if pruned_edges > 0 {
+            // The child lists stay consistent with the forward edges: a child
+            // leaves a base's list only when no surviving edge names it, and
+            // each touched list is re-sorted, matching the rebuilt index.
+            let mut bases = affected_bases.into_iter().collect::<Vec<_>>();
+            bases.sort_by(LuaTypeDeclId::stable_cmp);
+            for base_id in bases {
+                if let Some(children) = self.sub_types.get_mut(&base_id) {
+                    children.retain(|child_id| {
+                        self.supers.get(child_id).is_some_and(|supers| {
+                            supers.iter().any(|entry| {
+                                matches!(&entry.value.typ, LuaType::Ref(base) if base == &base_id)
+                            })
+                        })
+                    });
+                    children.sort_by(LuaTypeDeclId::stable_cmp);
+                    if children.is_empty() {
+                        self.sub_types.remove(&base_id);
+                    }
+                }
+            }
             // Pruning dropped an edge the cached map may have been derived
             // from; the next read rebuilds it lazily.
             self.bump_super_write_revision();
         }
 
-        self.definition_facts
-            .retain(|definition, _| !changed_files.contains(&definition.file_id()));
+        let mut dropped_definitions = Vec::new();
+        self.definition_facts.retain(|definition, _| {
+            if changed_files.contains(&definition.file_id()) {
+                dropped_definitions.push(*definition);
+                false
+            } else {
+                true
+            }
+        });
+        for definition in dropped_definitions {
+            self.drop_definition_fact_refs(&definition);
+        }
 
         if !changed_files.is_empty() {
             self.mark_inference_derived_state_dirty();
@@ -2609,6 +2780,7 @@ impl LuaIndex for LuaTypeIndex {
         self.full_name_type_map.clear();
         self.generic_params.clear();
         self.supers.clear();
+        self.supers_by_file.clear();
         self.sub_types.clear();
         self.super_write_revision = 0;
         self.cached_direct_subtype_members = None;
@@ -2617,12 +2789,17 @@ impl LuaIndex for LuaTypeIndex {
         self.in_filed_type_owner.clear();
         self.settled_reads_by_file.clear();
         self.settled_read_dependents.clear();
+        self.settled_owners_by_file.clear();
         self.fact_metadata.clear();
+        self.fact_ref_files.clear();
+        self.fact_refs_by_file.clear();
         self.decl_write_claims.clear();
         self.decl_type_binds.clear();
         self.type_bound_decls.clear();
         self.type_write_versions.clear();
         self.definition_facts.clear();
+        self.definition_fact_ref_files.clear();
+        self.definition_fact_refs_by_file.clear();
         self.inference_events_by_file.clear();
         self.support_dependents.clear();
         self.support_file_dependents.clear();
@@ -2668,10 +2845,100 @@ impl LuaTypeIndex {
                     self.note_type_write(&type_owner);
                 }
                 self.fact_metadata.remove(&type_owner);
+                self.drop_fact_refs(&type_owner);
             }
         }
 
         self.cache_refs.remove_file(file_id);
+    }
+}
+
+/// The files one provenance names: event node, source and support files,
+/// plus the files the step types point at. Mirrors what `remap_provenance`
+/// consults, so the reverse index built from it visits exactly the facts an
+/// edit to `file_id` can move.
+fn collect_provenance_files<'a>(
+    provenance: impl Iterator<Item = &'a LuaInferenceStep>,
+    files: &mut HashSet<FileId>,
+) {
+    for step in provenance {
+        files.insert(step.event.node.file_id());
+        files.insert(step.event.source.file_id);
+        for support in step.support.iter() {
+            files.insert(support.file_id());
+        }
+        if let Some(typ) = step.inferred_type.as_deref() {
+            collect_type_files(typ, files);
+        }
+        if let Some(typ) = step.found_type.as_deref() {
+            collect_type_files(typ, files);
+        }
+    }
+}
+
+/// The files one stored type points at through a positioned identity: the
+/// arms `remap_identities_in_type` rewrites. Named references (`Ref`, `Def`)
+/// and module links carry no position and never move under a remap.
+fn collect_type_files(typ: &LuaType, files: &mut HashSet<FileId>) {
+    typ.visit_type(&mut |inner| match inner {
+        LuaType::TableConst(range) => {
+            files.insert(range.file_id);
+        }
+        LuaType::Instance(instance) => {
+            files.insert(instance.get_range().file_id);
+        }
+        LuaType::Signature(signature_id) => {
+            files.insert(signature_id.get_file_id());
+        }
+        _ => {}
+    });
+}
+
+/// Re-points `key`'s reverse edges at `files`, dropping the stale ones.
+fn replace_reverse_edges<K>(
+    by_file: &mut HashMap<FileId, HashSet<K>>,
+    forward: &mut HashMap<K, HashSet<FileId>>,
+    key: K,
+    files: HashSet<FileId>,
+) where
+    K: Eq + std::hash::Hash + Clone,
+{
+    if let Some(previous) = forward.insert(key.clone(), files.clone()) {
+        for file_id in previous.difference(&files) {
+            if let Some(keys) = by_file.get_mut(file_id) {
+                keys.remove(&key);
+                if keys.is_empty() {
+                    by_file.remove(file_id);
+                }
+            }
+        }
+    }
+    for file_id in &files {
+        by_file.entry(*file_id).or_default().insert(key.clone());
+    }
+    if files.is_empty() {
+        forward.remove(&key);
+    }
+}
+
+/// Drops `key`'s reverse edges entirely.
+fn remove_reverse_edges<K>(
+    by_file: &mut HashMap<FileId, HashSet<K>>,
+    forward: &mut HashMap<K, HashSet<FileId>>,
+    key: &K,
+) where
+    K: Eq + std::hash::Hash + Clone,
+{
+    let Some(files) = forward.remove(key) else {
+        return;
+    };
+    for file_id in files {
+        if let Some(keys) = by_file.get_mut(&file_id) {
+            keys.remove(key);
+            if keys.is_empty() {
+                by_file.remove(&file_id);
+            }
+        }
     }
 }
 
@@ -3098,6 +3365,7 @@ mod batch_removal_tests {
         assert_eq!(left.full_name_type_map, right.full_name_type_map);
         assert_eq!(left.generic_params, right.generic_params);
         assert_eq!(left.supers, right.supers);
+        assert_eq!(left.supers_by_file, right.supers_by_file);
         assert_eq!(left.sub_types, right.sub_types);
         assert_eq!(left.decl_type_binds, right.decl_type_binds);
         assert_eq!(left.type_bound_decls, right.type_bound_decls);
@@ -3117,6 +3385,19 @@ mod batch_removal_tests {
         assert_eq!(left.support_dependents, right.support_dependents);
         assert_eq!(left.support_file_dependents, right.support_file_dependents);
         assert_eq!(left.cache_refs, right.cache_refs);
+        assert_eq!(left.settled_reads_by_file, right.settled_reads_by_file);
+        assert_eq!(left.settled_read_dependents, right.settled_read_dependents);
+        assert_eq!(left.settled_owners_by_file, right.settled_owners_by_file);
+        assert_eq!(left.fact_ref_files, right.fact_ref_files);
+        assert_eq!(left.fact_refs_by_file, right.fact_refs_by_file);
+        assert_eq!(
+            left.definition_fact_ref_files,
+            right.definition_fact_ref_files
+        );
+        assert_eq!(
+            left.definition_fact_refs_by_file,
+            right.definition_fact_refs_by_file
+        );
     }
 
     #[test]
@@ -3150,6 +3431,246 @@ mod batch_removal_tests {
                 .files_depending_on_inference_support(&[first].into_iter().collect::<HashSet<_>>()),
             [survivor].into_iter().collect::<HashSet<_>>()
         );
+    }
+
+    /// The reverse lookup maps stay consistent with the primary maps: every
+    /// forward entry recomputes to the same file set, every reverse bucket is
+    /// exactly the forward entries naming it, and the settled-owner buckets
+    /// are exactly the dependent keys living in each file.
+    fn assert_reverse_maps_consistent(index: &LuaTypeIndex) {
+        for (owner, metadata) in &index.fact_metadata {
+            let expected = LuaTypeIndex::metadata_referenced_files(metadata);
+            assert_eq!(
+                index.fact_ref_files.get(owner).cloned().unwrap_or_default(),
+                expected,
+                "fact refs for {owner:?}"
+            );
+        }
+        let mut expected_by_file: HashMap<FileId, HashSet<LuaTypeOwner>> = HashMap::default();
+        for (owner, files) in &index.fact_ref_files {
+            for file_id in files {
+                expected_by_file
+                    .entry(*file_id)
+                    .or_default()
+                    .insert(owner.clone());
+            }
+        }
+        assert_eq!(index.fact_refs_by_file, expected_by_file);
+
+        for (definition, fact) in &index.definition_facts {
+            let expected = LuaTypeIndex::definition_fact_referenced_files(fact);
+            assert_eq!(
+                index
+                    .definition_fact_ref_files
+                    .get(definition)
+                    .cloned()
+                    .unwrap_or_default(),
+                expected,
+                "definition fact refs for {definition:?}"
+            );
+        }
+        let mut expected_definitions: HashMap<FileId, HashSet<LuaDefinitionId>> =
+            HashMap::default();
+        for (definition, files) in &index.definition_fact_ref_files {
+            for file_id in files {
+                expected_definitions
+                    .entry(*file_id)
+                    .or_default()
+                    .insert(*definition);
+            }
+        }
+        assert_eq!(index.definition_fact_refs_by_file, expected_definitions);
+
+        let mut expected_owners: HashMap<FileId, HashSet<LuaTypeOwner>> = HashMap::default();
+        for owner in index.settled_read_dependents.keys() {
+            expected_owners
+                .entry(owner.get_file_id())
+                .or_default()
+                .insert(owner.clone());
+        }
+        assert_eq!(index.settled_owners_by_file, expected_owners);
+
+        let mut expected_edges: HashMap<FileId, Vec<(LuaTypeDeclId, InFiled<LuaSuperType>)>> =
+            HashMap::default();
+        for (child_id, supers) in &index.supers {
+            for entry in supers {
+                expected_edges
+                    .entry(entry.file_id)
+                    .or_default()
+                    .push((child_id.clone(), entry.clone()));
+            }
+        }
+        for edges in expected_edges.values_mut() {
+            edges.sort_by(|left, right| {
+                left.0.stable_cmp(&right.0).then_with(|| {
+                    super_entry_sort_key(&left.1).cmp(&super_entry_sort_key(&right.1))
+                })
+            });
+        }
+        let mut actual_edges = index.supers_by_file.clone();
+        for edges in actual_edges.values_mut() {
+            edges.sort_by(|left, right| {
+                left.0.stable_cmp(&right.0).then_with(|| {
+                    super_entry_sort_key(&left.1).cmp(&super_entry_sort_key(&right.1))
+                })
+            });
+        }
+        assert_eq!(actual_edges, expected_edges);
+    }
+
+    /// Removing a file leaves exactly the state a fresh index built from the
+    /// surviving files' inputs holds. The surviving facts keep provenance
+    /// naming the removed file (only re-analysis rewrites that), so the fresh
+    /// index is built with the same dangling references.
+    #[test]
+    fn removal_matches_fresh_index_for_surviving_derived_state() {
+        let first = file_id(1);
+        let second = file_id(2);
+
+        fn build(files: &[FileId]) -> LuaTypeIndex {
+            let source_file = file_id(4);
+            let mut index = LuaTypeIndex::new();
+            for target in files {
+                let name = format!("Class{}", target.id);
+                index.add_type_decl(
+                    *target,
+                    LuaTypeDecl::new(
+                        *target,
+                        TextRange::new(0.into(), 1.into()),
+                        name.clone(),
+                        LuaDeclTypeKind::Class,
+                        LuaTypeFlag::None.into(),
+                        LuaTypeDeclId::global(name.as_str()),
+                    ),
+                );
+                let fact_owner = owner(*target, 10);
+                index.force_bind_type_fact(
+                    fact_owner.clone(),
+                    LuaTypeCache::InferType(LuaType::String),
+                    metadata(fact_owner, source_file, file_id(1)),
+                );
+                index.bind_definition_fact(
+                    LuaDefinitionId::Declaration(LuaDeclId::new(*target, 40.into())),
+                    LuaTypeFact::certain(LuaType::Number),
+                );
+            }
+            // Cross-file settled reads, recorded on both sides so the removed
+            // index and the fresh one observe the same reader entries.
+            if files.contains(&file_id(1)) {
+                index.set_settled_reads(file_id(1), [owner(file_id(3), 10)]);
+            }
+            if files.contains(&file_id(3)) {
+                index.set_settled_reads(file_id(3), [owner(file_id(1), 10)]);
+            }
+            index.flush_inference_derived_state();
+            index
+        }
+
+        let mut removed = build(&[first, second, file_id(3)]);
+        assert_reverse_maps_consistent(&removed);
+        removed.remove_files(&[second, first]);
+        assert_reverse_maps_consistent(&removed);
+
+        let fresh = build(&[file_id(3)]);
+
+        // The revision counts operations rather than state, and the write
+        // counters depend on how many owners were ever bound: both differ by
+        // construction and are excluded.
+        assert_eq!(removed.file_namespace, fresh.file_namespace);
+        assert_eq!(removed.file_using_namespace, fresh.file_using_namespace);
+        assert_eq!(removed.file_types, fresh.file_types);
+        assert_eq!(removed.full_name_type_map, fresh.full_name_type_map);
+        assert_eq!(removed.generic_params, fresh.generic_params);
+        assert_eq!(removed.supers, fresh.supers);
+        assert_eq!(removed.supers_by_file, fresh.supers_by_file);
+        assert_eq!(removed.sub_types, fresh.sub_types);
+        assert_eq!(type_cache_types(&removed), type_cache_types(&fresh));
+        assert_eq!(removed.in_filed_type_owner, fresh.in_filed_type_owner);
+        assert_eq!(removed.fact_metadata, fresh.fact_metadata);
+        assert_eq!(removed.fact_ref_files, fresh.fact_ref_files);
+        assert_eq!(removed.fact_refs_by_file, fresh.fact_refs_by_file);
+        assert_eq!(removed.definition_facts, fresh.definition_facts);
+        assert_eq!(
+            removed.definition_fact_ref_files,
+            fresh.definition_fact_ref_files
+        );
+        assert_eq!(
+            removed.definition_fact_refs_by_file,
+            fresh.definition_fact_refs_by_file
+        );
+        assert_eq!(
+            removed.inference_events_by_file,
+            fresh.inference_events_by_file
+        );
+        assert_eq!(removed.support_dependents, fresh.support_dependents);
+        assert_eq!(
+            removed.support_file_dependents,
+            fresh.support_file_dependents
+        );
+        assert_eq!(removed.cache_refs, fresh.cache_refs);
+        assert_eq!(removed.settled_reads_by_file, fresh.settled_reads_by_file);
+        assert_eq!(
+            removed.settled_read_dependents,
+            fresh.settled_read_dependents
+        );
+        assert_eq!(removed.settled_owners_by_file, fresh.settled_owners_by_file);
+    }
+
+    /// Remapping one file visits only the facts that name it: an unrelated
+    /// file's facts, payloads and settled reads come out byte-identical.
+    #[test]
+    fn remap_visits_only_facts_naming_the_edited_file() {
+        use crate::db_index::edit::{FileRemap, PositionMap};
+
+        let edited = file_id(1);
+        let unrelated = file_id(2);
+        let mut index = LuaTypeIndex::new();
+        let edited_owner = owner(edited, 10);
+        let unrelated_owner = owner(unrelated, 10);
+        index.force_bind_type_fact(
+            edited_owner.clone(),
+            LuaTypeCache::InferType(LuaType::String),
+            metadata(edited_owner.clone(), edited, edited),
+        );
+        // No reference to the edited file anywhere: empty provenance and a
+        // payload-free cached type.
+        index.force_bind_type_fact(
+            unrelated_owner.clone(),
+            LuaTypeCache::InferType(LuaType::String),
+            LuaTypeFactMetadata {
+                confidence: LuaInferenceConfidence::Certain,
+                base_provenance_kind: None,
+                provenance: Arc::from([]),
+            },
+        );
+        index.bind_definition_fact(
+            LuaDefinitionId::Declaration(LuaDeclId::new(unrelated, 40.into())),
+            LuaTypeFact::certain(LuaType::Number),
+        );
+        index.set_settled_reads(unrelated, [owner(unrelated, 20)]);
+        assert_reverse_maps_consistent(&index);
+        assert!(
+            index
+                .fact_refs_by_file
+                .get(&edited)
+                .is_none_or(|owners| !owners.contains(&unrelated_owner))
+        );
+
+        let before_metadata = index.fact_metadata.clone();
+        let before_definitions = index.definition_facts.clone();
+        let before_settled = index.settled_read_dependents.clone();
+
+        // An insertion at offset 3 shifts everything after it by two.
+        let remap = FileRemap::unvalidated(edited, PositionMap::new("abcdef", "abcXXdef"));
+        index.remap_file_identities(&remap);
+        assert_reverse_maps_consistent(&index);
+
+        assert_eq!(
+            index.fact_metadata.get(&unrelated_owner),
+            before_metadata.get(&unrelated_owner)
+        );
+        assert_eq!(index.definition_facts, before_definitions);
+        assert_eq!(index.settled_read_dependents, before_settled);
     }
 }
 
