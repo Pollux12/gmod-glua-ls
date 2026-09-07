@@ -1,8 +1,11 @@
 use std::ops::Deref;
+use std::sync::Arc;
 
 // Every set below is a cycle guard for a graph walk: membership only, never
 // iterated, so the hasher cannot reach a result.
+use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet as HashSet;
+use smol_str::SmolStr;
 
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaBlock, LuaCallExpr, LuaChunk, LuaClosureExpr,
@@ -95,26 +98,29 @@ pub fn get_type_at_flow_with_origin(
         db.get_gmod_infer_index()
             .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())
     });
-    // Check cache for both success and error results.
-    match cache
-        .get_flow_cache_with_origin(var_ref_id, flow_id, query_realm, policy.origin)
-        .cloned()
-    {
+    // Build once per query: the walk below touches the cache at every node.
+    let cache_key = VarRefCacheKey::from(var_ref_id);
+    // Check cache for both success and error results. The shared entries
+    // only bump a refcount here; the owned type is cloned once on return.
+    match cache.get_flow_cache_with_origin_by_key(&cache_key, flow_id, query_realm, policy.origin) {
         Some(CacheEntry::Cache(narrow_type)) => {
-            return Ok(narrow_type);
+            return Ok(narrow_type.as_ref().clone());
         }
         Some(CacheEntry::Error(reason)) => {
-            return Err(reason);
+            return Err(reason.clone());
         }
         _ => {}
     }
-    let mut visited_flow_ids = Vec::new();
+    // Reuse one allocation across queries; nested walks (through merge
+    // points) get a throwaway buffer while this one is checked out.
+    let (mut visited_flow_ids, scratch_owned) = cache.take_flow_walk_scratch();
     let result = get_type_at_flow_walk(
         db,
         tree,
         cache,
         root,
         var_ref_id,
+        &cache_key,
         query_realm,
         flow_id,
         &mut visited_flow_ids,
@@ -125,23 +131,25 @@ pub fn get_type_at_flow_with_origin(
     // cached — they'd poison future non-recursive queries.
     match &result {
         Ok(ty) => {
-            let entry = CacheEntry::Cache(ty.clone());
-            cache.set_flow_cache_with_origin(
-                var_ref_id,
-                flow_id,
-                query_realm,
-                policy.origin,
-                entry.clone(),
-            );
-            for visited_flow_id in visited_flow_ids {
-                cache.set_flow_cache_with_origin(
-                    var_ref_id,
-                    visited_flow_id,
+            // One deep clone into a shared entry; the fan-out below only
+            // bumps the refcount instead of cloning the type per node.
+            let entry = CacheEntry::Cache(Arc::new(ty.clone()));
+            for visited_flow_id in &visited_flow_ids {
+                cache.set_flow_cache_with_origin_by_key(
+                    &cache_key,
+                    *visited_flow_id,
                     query_realm,
                     policy.origin,
                     entry.clone(),
                 );
             }
+            cache.set_flow_cache_with_origin_by_key(
+                &cache_key,
+                flow_id,
+                query_realm,
+                policy.origin,
+                entry,
+            );
         }
         Err(InferFailReason::RecursiveInfer) => {
             // Don't cache — this is a transient cycle-detection signal.
@@ -156,26 +164,27 @@ pub fn get_type_at_flow_with_origin(
 
             if should_cache {
                 let entry = CacheEntry::Error(reason.clone());
-                cache.set_flow_cache_with_origin(
-                    var_ref_id,
-                    flow_id,
-                    query_realm,
-                    policy.origin,
-                    entry.clone(),
-                );
-                for visited_flow_id in visited_flow_ids {
-                    cache.set_flow_cache_with_origin(
-                        var_ref_id,
-                        visited_flow_id,
+                for visited_flow_id in &visited_flow_ids {
+                    cache.set_flow_cache_with_origin_by_key(
+                        &cache_key,
+                        *visited_flow_id,
                         query_realm,
                         policy.origin,
                         entry.clone(),
                     );
                 }
+                cache.set_flow_cache_with_origin_by_key(
+                    &cache_key,
+                    flow_id,
+                    query_realm,
+                    policy.origin,
+                    entry,
+                );
             }
         }
     }
 
+    cache.return_flow_walk_scratch(visited_flow_ids, scratch_owned);
     result
 }
 
@@ -228,6 +237,7 @@ pub(super) fn get_type_at_flow_in_mode(
                 cache,
                 root,
                 var_ref_id,
+                &memo_key.0,
                 query_realm,
                 flow_id,
                 &mut visited_flow_ids,
@@ -396,31 +406,26 @@ fn get_type_at_flow_walk(
     cache: &mut LuaInferCache,
     root: &LuaChunk,
     var_ref_id: &VarRefId,
+    cache_key: &VarRefCacheKey,
     query_realm: GmodRealm,
     initial_flow_id: FlowId,
     visited_flow_ids: &mut Vec<FlowId>,
     policy: FlowWalkPolicy,
 ) -> InferResult {
     let mut antecedent_flow_id = initial_flow_id;
-    let pending_branch_types = [];
     loop {
         // Check cache for intermediate flow nodes (both success and error).
         // This is critical for performance in large files where many walks
         // share overlapping flow chains.
         if policy.is_normal() {
-            match cache.get_flow_cache_with_origin(
-                var_ref_id,
+            match cache.get_flow_cache_with_origin_by_key(
+                cache_key,
                 antecedent_flow_id,
                 query_realm,
                 policy.origin,
             ) {
                 Some(CacheEntry::Cache(cached_type)) => {
-                    return finish_flow_walk_result(
-                        db,
-                        var_ref_id,
-                        &pending_branch_types,
-                        Ok(cached_type.clone()),
-                    );
+                    return Ok(cached_type.as_ref().clone());
                 }
                 Some(CacheEntry::Error(reason)) => return Err(reason.clone()),
                 _ => {}
@@ -433,42 +438,28 @@ fn get_type_at_flow_walk(
             .ok_or(InferFailReason::None)?;
         match &flow_node.kind {
             FlowNodeKind::Start | FlowNodeKind::Unreachable => {
-                return finish_flow_walk_result(
-                    db,
-                    var_ref_id,
-                    &pending_branch_types,
-                    get_var_ref_type(db, cache, var_ref_id),
-                );
+                return get_var_ref_type(db, cache, var_ref_id);
             }
             FlowNodeKind::ClosureEntry(_) => {
                 let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-                return finish_flow_walk_result(
+                return get_type_at_flow_walk(
                     db,
+                    tree,
+                    cache,
+                    root,
                     var_ref_id,
-                    &pending_branch_types,
-                    get_type_at_flow_walk(
-                        db,
-                        tree,
-                        cache,
-                        root,
-                        var_ref_id,
-                        query_realm,
-                        antecedent_flow_id,
-                        visited_flow_ids,
-                        policy.with_mode(FlowWalkMode::ClosureBaseline),
-                    ),
+                    cache_key,
+                    query_realm,
+                    antecedent_flow_id,
+                    visited_flow_ids,
+                    policy.with_mode(FlowWalkMode::ClosureBaseline),
                 );
             }
             FlowNodeKind::LoopLabel | FlowNodeKind::Break | FlowNodeKind::Return => {
                 if let Some(merged_type) = try_get_multi_antecedent_type(
                     db, tree, cache, root, var_ref_id, flow_node, policy,
                 )? {
-                    return finish_flow_walk_result(
-                        db,
-                        var_ref_id,
-                        &pending_branch_types,
-                        Ok(merged_type),
-                    );
+                    return Ok(merged_type);
                 }
                 antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
             }
@@ -495,11 +486,8 @@ fn get_type_at_flow_walk(
                     }
                 }
 
-                return finish_flow_walk_result(
-                    db,
-                    var_ref_id,
-                    &pending_branch_types,
-                    merge_antecedent_types(db, tree, cache, root, var_ref_id, flow_node, policy),
+                return merge_antecedent_types(
+                    db, tree, cache, root, var_ref_id, flow_node, policy,
                 );
             }
             FlowNodeKind::DeclPosition(position) => {
@@ -510,12 +498,7 @@ fn get_type_at_flow_walk(
                         if policy.is_closure_baseline() {
                             let baseline_type = get_var_ref_type(db, cache, var_ref_id)
                                 .map(|typ| TypeOps::Union.apply(db, &typ, &LuaType::Nil));
-                            return finish_flow_walk_result(
-                                db,
-                                var_ref_id,
-                                &pending_branch_types,
-                                baseline_type,
-                            );
+                            return baseline_type;
                         }
                         return Err(InferFailReason::UnResolveDeclType(decl_id));
                     }
@@ -528,12 +511,7 @@ fn get_type_at_flow_walk(
                                 .and_then(|owner| db.get_type_index().get_type_cache(&owner))
                                 .is_some_and(|type_cache| type_cache.is_doc())
                             {
-                                return finish_flow_walk_result(
-                                    db,
-                                    var_ref_id,
-                                    &pending_branch_types,
-                                    Ok(var_type),
-                                );
+                                return Ok(var_type);
                             }
 
                             if should_retry_decl_initializer_type(&var_type)
@@ -541,31 +519,16 @@ fn get_type_at_flow_walk(
                                     try_infer_decl_initializer_type(db, cache, root, var_ref_id)
                                 && !should_retry_decl_initializer_type(&init_type)
                             {
-                                return finish_flow_walk_result(
-                                    db,
-                                    var_ref_id,
-                                    &pending_branch_types,
-                                    Ok(init_type),
-                                );
+                                return Ok(init_type);
                             }
 
-                            return finish_flow_walk_result(
-                                db,
-                                var_ref_id,
-                                &pending_branch_types,
-                                Ok(var_type),
-                            );
+                            return Ok(var_type);
                         }
                         Err(err) => {
                             if let Some(init_type) =
                                 try_infer_decl_initializer_type(db, cache, root, var_ref_id)?
                             {
-                                return finish_flow_walk_result(
-                                    db,
-                                    var_ref_id,
-                                    &pending_branch_types,
-                                    Ok(init_type),
-                                );
+                                return Ok(init_type);
                             }
 
                             return Err(err);
@@ -575,12 +538,7 @@ fn get_type_at_flow_walk(
                     if let Some(merged_type) = try_get_multi_antecedent_type(
                         db, tree, cache, root, var_ref_id, flow_node, policy,
                     )? {
-                        return finish_flow_walk_result(
-                            db,
-                            var_ref_id,
-                            &pending_branch_types,
-                            Ok(merged_type),
-                        );
+                        return Ok(merged_type);
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                 }
@@ -602,12 +560,7 @@ fn get_type_at_flow_walk(
                         },
                     )
                 {
-                    return finish_flow_walk_result(
-                        db,
-                        var_ref_id,
-                        &pending_branch_types,
-                        Ok(fact.typ().clone()),
-                    );
+                    return Ok(fact.typ().clone());
                 }
 
                 let can_match_assignment = matches!(
@@ -625,12 +578,7 @@ fn get_type_at_flow_walk(
                     if let Some(merged_type) = try_get_multi_antecedent_type(
                         db, tree, cache, root, var_ref_id, flow_node, policy,
                     )? {
-                        return finish_flow_walk_result(
-                            db,
-                            var_ref_id,
-                            &pending_branch_types,
-                            Ok(merged_type),
-                        );
+                        return Ok(merged_type);
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                     continue;
@@ -642,12 +590,7 @@ fn get_type_at_flow_walk(
                     if let Some(merged_type) = try_get_multi_antecedent_type(
                         db, tree, cache, root, var_ref_id, flow_node, policy,
                     )? {
-                        return finish_flow_walk_result(
-                            db,
-                            var_ref_id,
-                            &pending_branch_types,
-                            Ok(merged_type),
-                        );
+                        return Ok(merged_type);
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                     continue;
@@ -666,22 +609,12 @@ fn get_type_at_flow_walk(
                 )?;
 
                 if let ResultTypeOrContinue::Result(assign_type) = result_or_continue {
-                    return finish_flow_walk_result(
-                        db,
-                        var_ref_id,
-                        &pending_branch_types,
-                        Ok(assign_type),
-                    );
+                    return Ok(assign_type);
                 } else {
                     if let Some(merged_type) = try_get_multi_antecedent_type(
                         db, tree, cache, root, var_ref_id, flow_node, policy,
                     )? {
-                        return finish_flow_walk_result(
-                            db,
-                            var_ref_id,
-                            &pending_branch_types,
-                            Ok(merged_type),
-                        );
+                        return Ok(merged_type);
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                 }
@@ -689,12 +622,7 @@ fn get_type_at_flow_walk(
             FlowNodeKind::Call(call_ptr) => {
                 let call_expr = call_ptr.to_node(root).ok_or(InferFailReason::None)?;
                 if call_expr_returns_never(db, cache, call_expr.clone()) {
-                    return finish_flow_walk_result(
-                        db,
-                        var_ref_id,
-                        &pending_branch_types,
-                        Ok(LuaType::Never),
-                    );
+                    return Ok(LuaType::Never);
                 }
 
                 if let Some(effects) = db
@@ -713,12 +641,7 @@ fn get_type_at_flow_walk(
                         }
                     }
                     if let Some(effect_type) = effect_type {
-                        return finish_flow_walk_result(
-                            db,
-                            var_ref_id,
-                            &pending_branch_types,
-                            Ok(effect_type),
-                        );
+                        return Ok(effect_type);
                     }
                 }
 
@@ -729,32 +652,17 @@ fn get_type_at_flow_walk(
                     var_ref_id,
                     call_expr.clone(),
                 )? {
-                    return finish_flow_walk_result(
-                        db,
-                        var_ref_id,
-                        &pending_branch_types,
-                        Ok(populated_type),
-                    );
+                    return Ok(populated_type);
                 }
 
                 if numeric_table_index_query(db, cache, root, var_ref_id).is_some() {
-                    return finish_flow_walk_result(
-                        db,
-                        var_ref_id,
-                        &pending_branch_types,
-                        get_var_ref_type(db, cache, var_ref_id),
-                    );
+                    return get_var_ref_type(db, cache, var_ref_id);
                 }
 
                 if let Some(merged_type) = try_get_multi_antecedent_type(
                     db, tree, cache, root, var_ref_id, flow_node, policy,
                 )? {
-                    return finish_flow_walk_result(
-                        db,
-                        var_ref_id,
-                        &pending_branch_types,
-                        Ok(merged_type),
-                    );
+                    return Ok(merged_type);
                 }
                 antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
             }
@@ -764,12 +672,7 @@ fn get_type_at_flow_walk(
                     if let Some(merged_type) = try_get_multi_antecedent_type(
                         db, tree, cache, root, var_ref_id, flow_node, policy,
                     )? {
-                        return finish_flow_walk_result(
-                            db,
-                            var_ref_id,
-                            &pending_branch_types,
-                            Ok(merged_type),
-                        );
+                        return Ok(merged_type);
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                     continue;
@@ -779,12 +682,7 @@ fn get_type_at_flow_walk(
                     if let Some(merged_type) = try_get_multi_antecedent_type(
                         db, tree, cache, root, var_ref_id, flow_node, policy,
                     )? {
-                        return finish_flow_walk_result(
-                            db,
-                            var_ref_id,
-                            &pending_branch_types,
-                            Ok(merged_type),
-                        );
+                        return Ok(merged_type);
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                     continue;
@@ -796,15 +694,10 @@ fn get_type_at_flow_walk(
                             return Err(InferFailReason::None);
                         };
 
-                        return finish_flow_walk_result(
-                            db,
-                            var_ref_id,
-                            &pending_branch_types,
-                            Ok(LuaType::Signature(LuaSignatureId::from_closure(
-                                cache.get_file_id(),
-                                &closure,
-                            ))),
-                        );
+                        return Ok(LuaType::Signature(LuaSignatureId::from_closure(
+                            cache.get_file_id(),
+                            &closure,
+                        )));
                     }
 
                     // Only use the func-stat's signature when the member isn't
@@ -821,15 +714,10 @@ fn get_type_at_flow_walk(
                             return Err(InferFailReason::None);
                         };
 
-                        return finish_flow_walk_result(
-                            db,
-                            var_ref_id,
-                            &pending_branch_types,
-                            Ok(LuaType::Signature(LuaSignatureId::from_closure(
-                                cache.get_file_id(),
-                                &closure,
-                            ))),
-                        );
+                        return Ok(LuaType::Signature(LuaSignatureId::from_closure(
+                            cache.get_file_id(),
+                            &closure,
+                        )));
                     }
 
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
@@ -837,12 +725,7 @@ fn get_type_at_flow_walk(
                     if let Some(merged_type) = try_get_multi_antecedent_type(
                         db, tree, cache, root, var_ref_id, flow_node, policy,
                     )? {
-                        return finish_flow_walk_result(
-                            db,
-                            var_ref_id,
-                            &pending_branch_types,
-                            Ok(merged_type),
-                        );
+                        return Ok(merged_type);
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                 }
@@ -862,22 +745,12 @@ fn get_type_at_flow_walk(
                             policy,
                         )
                     {
-                        return finish_flow_walk_result(
-                            db,
-                            var_ref_id,
-                            &pending_branch_types,
-                            Ok(condition_type),
-                        );
+                        return Ok(condition_type);
                     }
                     if let Some(merged_type) = try_get_multi_antecedent_type(
                         db, tree, cache, root, var_ref_id, flow_node, policy,
                     )? {
-                        return finish_flow_walk_result(
-                            db,
-                            var_ref_id,
-                            &pending_branch_types,
-                            Ok(merged_type),
-                        );
+                        return Ok(merged_type);
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                     continue;
@@ -903,22 +776,12 @@ fn get_type_at_flow_walk(
                 };
 
                 if let ResultTypeOrContinue::Result(condition_type) = result_or_continue {
-                    return finish_flow_walk_result(
-                        db,
-                        var_ref_id,
-                        &pending_branch_types,
-                        Ok(condition_type),
-                    );
+                    return Ok(condition_type);
                 } else {
                     if let Some(merged_type) = try_get_multi_antecedent_type(
                         db, tree, cache, root, var_ref_id, flow_node, policy,
                     )? {
-                        return finish_flow_walk_result(
-                            db,
-                            var_ref_id,
-                            &pending_branch_types,
-                            Ok(merged_type),
-                        );
+                        return Ok(merged_type);
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                 }
@@ -938,22 +801,12 @@ fn get_type_at_flow_walk(
                             policy,
                         )
                     {
-                        return finish_flow_walk_result(
-                            db,
-                            var_ref_id,
-                            &pending_branch_types,
-                            Ok(condition_type),
-                        );
+                        return Ok(condition_type);
                     }
                     if let Some(merged_type) = try_get_multi_antecedent_type(
                         db, tree, cache, root, var_ref_id, flow_node, policy,
                     )? {
-                        return finish_flow_walk_result(
-                            db,
-                            var_ref_id,
-                            &pending_branch_types,
-                            Ok(merged_type),
-                        );
+                        return Ok(merged_type);
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                     continue;
@@ -977,22 +830,12 @@ fn get_type_at_flow_walk(
                 };
 
                 if let ResultTypeOrContinue::Result(condition_type) = result_or_continue {
-                    return finish_flow_walk_result(
-                        db,
-                        var_ref_id,
-                        &pending_branch_types,
-                        Ok(condition_type),
-                    );
+                    return Ok(condition_type);
                 } else {
                     if let Some(merged_type) = try_get_multi_antecedent_type(
                         db, tree, cache, root, var_ref_id, flow_node, policy,
                     )? {
-                        return finish_flow_walk_result(
-                            db,
-                            var_ref_id,
-                            &pending_branch_types,
-                            Ok(merged_type),
-                        );
+                        return Ok(merged_type);
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                 }
@@ -1002,12 +845,7 @@ fn get_type_at_flow_walk(
                 if let Some(merged_type) = try_get_multi_antecedent_type(
                     db, tree, cache, root, var_ref_id, flow_node, policy,
                 )? {
-                    return finish_flow_walk_result(
-                        db,
-                        var_ref_id,
-                        &pending_branch_types,
-                        Ok(merged_type),
-                    );
+                    return Ok(merged_type);
                 }
                 antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
             }
@@ -1018,46 +856,18 @@ fn get_type_at_flow_walk(
                 )?;
 
                 if let ResultTypeOrContinue::Result(cast_type) = cast_or_continue {
-                    return finish_flow_walk_result(
-                        db,
-                        var_ref_id,
-                        &pending_branch_types,
-                        Ok(cast_type),
-                    );
+                    return Ok(cast_type);
                 } else {
                     if let Some(merged_type) = try_get_multi_antecedent_type(
                         db, tree, cache, root, var_ref_id, flow_node, policy,
                     )? {
-                        return finish_flow_walk_result(
-                            db,
-                            var_ref_id,
-                            &pending_branch_types,
-                            Ok(merged_type),
-                        );
+                        return Ok(merged_type);
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                 }
             }
         }
     }
-}
-
-fn finish_flow_walk_result(
-    db: &DbIndex,
-    var_ref_id: &VarRefId,
-    pending_branch_types: &[LuaType],
-    result: InferResult,
-) -> InferResult {
-    result.map(|typ| {
-        if pending_branch_types.is_empty() {
-            typ
-        } else {
-            let mut branch_types = Vec::with_capacity(pending_branch_types.len() + 1);
-            branch_types.extend_from_slice(pending_branch_types);
-            branch_types.push(typ);
-            merge_flow_branch_types(db, var_ref_id, branch_types)
-        }
-    })
 }
 
 fn get_decl_position_var_ref_type(
@@ -1274,7 +1084,9 @@ fn merge_antecedent_types(
         return Ok(merge_flow_branch_types(db, var_ref_id, branch_types));
     }
 
-    let mut branch_types = Vec::with_capacity(antecedents.len());
+    // `accepted_any` is false, so nothing was pushed above: `branch_types` is
+    // still an empty buffer with capacity, reused for the realm-unfiltered
+    // fallback instead of allocating a second vector.
     for &flow_id in antecedents {
         let Some(antecedent_node) = tree.get_flow_node(flow_id) else {
             continue;
@@ -1643,7 +1455,7 @@ fn all_branch_antecedents_alive(tree: &FlowTree, flow_node: &FlowNode) -> bool {
 fn branch_has_relevant_special_call_effects(
     db: &DbIndex,
     tree: &FlowTree,
-    cache: &LuaInferCache,
+    cache: &mut LuaInferCache,
     root: &LuaChunk,
     flow_node: &FlowNode,
     stop_at: FlowId,
@@ -1656,6 +1468,9 @@ fn branch_has_relevant_special_call_effects(
         return false;
     };
 
+    // One key per query: the walk below re-enters this for every branch label
+    // on the path, and each re-entry used to re-walk the whole region.
+    let var_key = VarRefCacheKey::from(var_ref_id);
     let mut visited = HashSet::default();
     antecedents.iter().copied().any(|flow_id| {
         antecedent_has_relevant_special_call_effect(
@@ -1666,6 +1481,7 @@ fn branch_has_relevant_special_call_effects(
             flow_id,
             stop_at,
             var_ref_id,
+            &var_key,
             &mut visited,
         )
     })
@@ -1711,18 +1527,37 @@ fn branch_name_can_be_narrowed(info: &crate::BranchLabelInfo, name: &str) -> boo
 fn antecedent_has_relevant_special_call_effect(
     db: &DbIndex,
     tree: &FlowTree,
-    cache: &LuaInferCache,
+    cache: &mut LuaInferCache,
     root: &LuaChunk,
     flow_id: FlowId,
     stop_at: FlowId,
     var_ref_id: &VarRefId,
+    var_key: &VarRefCacheKey,
     visited: &mut HashSet<FlowId>,
 ) -> bool {
-    if flow_id == stop_at || !visited.insert(flow_id) {
+    if flow_id == stop_at {
+        return false;
+    }
+
+    // Sound to share across queries: the answer is a pure function of the
+    // immutable flow graph plus the immutable special-effect index. Only
+    // fully explored nodes are memoised — a node cut off by the cycle guard
+    // below has no entry yet, so it still terminates the same way. (A
+    // completed node revisited through another path always holds `false`
+    // here: `true` short-circuits every `.any` above it, so no sibling is
+    // ever explored afterwards.)
+    let memo_key = (flow_id, stop_at, var_key.clone());
+    if let Some(cached) = cache.branch_special_call_effect_cache.get(&memo_key) {
+        return *cached;
+    }
+    if !visited.insert(flow_id) {
         return false;
     }
 
     let Some(flow_node) = tree.get_flow_node(flow_id) else {
+        cache
+            .branch_special_call_effect_cache
+            .insert(memo_key, false);
         return false;
     };
 
@@ -1735,24 +1570,31 @@ fn antecedent_has_relevant_special_call_effect(
             .iter()
             .any(|effect| special_call_effect_matches_var_ref(&effect.target, var_ref_id))
     {
+        cache
+            .branch_special_call_effect_cache
+            .insert(memo_key, true);
         return true;
     }
 
-    match &flow_node.antecedent {
+    let result = match &flow_node.antecedent {
         Some(FlowAntecedent::Single(prev)) => antecedent_has_relevant_special_call_effect(
-            db, tree, cache, root, *prev, stop_at, var_ref_id, visited,
+            db, tree, cache, root, *prev, stop_at, var_ref_id, var_key, visited,
         ),
         Some(FlowAntecedent::Multiple(idx)) => {
             tree.get_multi_antecedents(*idx).is_some_and(|prevs| {
                 prevs.iter().copied().any(|prev| {
                     antecedent_has_relevant_special_call_effect(
-                        db, tree, cache, root, prev, stop_at, var_ref_id, visited,
+                        db, tree, cache, root, prev, stop_at, var_ref_id, var_key, visited,
                     )
                 })
             })
         }
         None => false,
-    }
+    };
+    cache
+        .branch_special_call_effect_cache
+        .insert(memo_key, result);
+    result
 }
 
 fn special_call_effect_matches_var_ref(effect_target: &VarRefId, var_ref_id: &VarRefId) -> bool {
@@ -2706,6 +2548,33 @@ fn numeric_table_index_query(
     crate::semantic::infer::narrow::var_ref_id::VarRefRootId,
     i64,
 )> {
+    // Asked up to three times per assignment node on a walk, with the same
+    // answer every time within a realm: memoise it. The realm joins the key
+    // because the index-key probe goes through realm-sensitive inference.
+    let memo_key = (VarRefCacheKey::from(var_ref_id), cache.flow_query_realm);
+    if let Some(cached) = cache
+        .numeric_table_index_query_cache
+        .get(&memo_key)
+        .cloned()
+    {
+        return cached;
+    }
+    let result = numeric_table_index_query_uncached(db, cache, root, var_ref_id);
+    cache
+        .numeric_table_index_query_cache
+        .insert(memo_key, result.clone());
+    result
+}
+
+fn numeric_table_index_query_uncached(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+) -> Option<(
+    crate::semantic::infer::narrow::var_ref_id::VarRefRootId,
+    i64,
+)> {
     if let VarRefId::IndexRef(query_root, query_path) = var_ref_id
         && let Some(index_name) = dynamic_bracket_index_name(query_path.deref())
         && let Some(index) =
@@ -2937,19 +2806,59 @@ fn dynamic_bracket_index_name(path: &str) -> Option<&str> {
 
 fn unambiguous_integer_const_name_value(
     db: &DbIndex,
-    cache: &LuaInferCache,
+    cache: &mut LuaInferCache,
     name: &str,
     before: TextSize,
 ) -> Option<i64> {
-    let file_id = cache.get_file_id();
-    let decl_tree = db.get_decl_index().get_decl_tree(&file_id)?;
+    // The scan below walks the whole decl tree; each distinct (name,
+    // position) pays it at most once per inference wave.
+    let memo_key = (smol_str::SmolStr::new(name), before);
+    if let Some(cached) = cache.unambiguous_int_const_cache.get(&memo_key) {
+        return *cached;
+    }
+    let result = unambiguous_integer_const_name_value_uncached(db, cache, name, before);
+    cache.unambiguous_int_const_cache.insert(memo_key, result);
+    result
+}
+
+/// Per-file `name -> decls` lookup, built once from the decl tree on first
+/// use. The integer-const scan below used to walk every decl in the file per
+/// distinct (name, position) query; the index pays that walk once per wave
+/// and each query then only visits its same-named decls. `LuaDeclId.position`
+/// is the decl's range start, so filtering on it matches the old scan exactly.
+fn file_decl_name_index<'a>(
+    db: &DbIndex,
+    cache: &'a mut LuaInferCache,
+) -> Option<&'a FxHashMap<SmolStr, Vec<LuaDeclId>>> {
+    if cache.decl_name_index.is_none() {
+        let file_id = cache.get_file_id();
+        let mut index: FxHashMap<SmolStr, Vec<LuaDeclId>> = FxHashMap::default();
+        if let Some(tree) = db.get_decl_index().get_decl_tree(&file_id) {
+            for decl in tree.get_decls().values() {
+                index
+                    .entry(SmolStr::new(decl.get_name()))
+                    .or_default()
+                    .push(decl.get_id());
+            }
+        }
+        cache.decl_name_index = Some(index);
+    }
+    cache.decl_name_index.as_ref()
+}
+
+fn unambiguous_integer_const_name_value_uncached(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name: &str,
+    before: TextSize,
+) -> Option<i64> {
+    let decl_ids = file_decl_name_index(db, cache)?.get(&SmolStr::new(name))?;
     let mut value = None;
-    for decl in decl_tree
-        .get_decls()
-        .values()
-        .filter(|decl| decl.get_name() == name && decl.get_position() <= before)
-    {
-        let type_cache = db.get_type_index().get_type_cache(&decl.get_id().into())?;
+    for decl_id in decl_ids {
+        if decl_id.position > before {
+            continue;
+        }
+        let type_cache = db.get_type_index().get_type_cache(&(*decl_id).into())?;
         let decl_value = match type_cache.as_type() {
             LuaType::IntegerConst(value) | LuaType::DocIntegerConst(value) => *value,
             _ => return None,
@@ -3144,11 +3053,12 @@ fn resolve_assigned_type_member(
 fn antecedent_has_relevant_special_call_effect_before_node(
     db: &DbIndex,
     tree: &FlowTree,
-    cache: &LuaInferCache,
+    cache: &mut LuaInferCache,
     root: &LuaChunk,
     flow_node: &FlowNode,
     var_ref_id: &VarRefId,
 ) -> bool {
+    let var_key = VarRefCacheKey::from(var_ref_id);
     let mut visited = HashSet::default();
     match flow_node.antecedent {
         Some(FlowAntecedent::Single(prev)) => antecedent_has_relevant_special_call_effect(
@@ -3159,6 +3069,7 @@ fn antecedent_has_relevant_special_call_effect_before_node(
             prev,
             flow_node.id,
             var_ref_id,
+            &var_key,
             &mut visited,
         ),
         Some(FlowAntecedent::Multiple(idx)) => {
@@ -3172,6 +3083,7 @@ fn antecedent_has_relevant_special_call_effect_before_node(
                         prev,
                         flow_node.id,
                         var_ref_id,
+                        &var_key,
                         &mut visited,
                     )
                 })
@@ -4109,14 +4021,14 @@ mod tests {
                 antecedent,
                 query_realm,
                 FlowOrigin::Real,
-                CacheEntry::Cache(LuaType::String),
+                CacheEntry::Cache(Arc::new(LuaType::String)),
             );
             cache.set_flow_cache_with_origin(
                 &var_ref_id,
                 antecedent,
                 query_realm,
                 FlowOrigin::NilCounterfactual,
-                CacheEntry::Cache(LuaType::Number),
+                CacheEntry::Cache(Arc::new(LuaType::Number)),
             );
         }
 
@@ -4152,12 +4064,12 @@ mod tests {
                 query_realm,
                 FlowOrigin::NilCounterfactual,
             ),
-            Some(CacheEntry::Cache(LuaType::Number))
+            Some(CacheEntry::Cache(narrow_type)) if **narrow_type == LuaType::Number
         ));
         assert!(matches!(
             cache
                 .get_flow_cache_with_origin(&var_ref_id, FlowId(2), query_realm, FlowOrigin::Real,),
-            Some(CacheEntry::Cache(LuaType::String))
+            Some(CacheEntry::Cache(narrow_type)) if **narrow_type == LuaType::String
         ));
     }
 
@@ -4203,14 +4115,14 @@ mod tests {
             FlowId(0),
             query_realm,
             FlowOrigin::Real,
-            CacheEntry::Cache(LuaType::String),
+            CacheEntry::Cache(Arc::new(LuaType::String)),
         );
         cache.set_flow_cache_with_origin(
             &var_ref_id,
             FlowId(0),
             query_realm,
             FlowOrigin::NilCounterfactual,
-            CacheEntry::Cache(LuaType::Number),
+            CacheEntry::Cache(Arc::new(LuaType::Number)),
         );
 
         let counterfactual_result = get_type_at_flow_with_origin(
@@ -4245,12 +4157,12 @@ mod tests {
                 query_realm,
                 FlowOrigin::NilCounterfactual,
             ),
-            Some(CacheEntry::Cache(LuaType::Number))
+            Some(CacheEntry::Cache(narrow_type)) if **narrow_type == LuaType::Number
         ));
         assert!(matches!(
             cache
                 .get_flow_cache_with_origin(&var_ref_id, FlowId(1), query_realm, FlowOrigin::Real,),
-            Some(CacheEntry::Cache(LuaType::String))
+            Some(CacheEntry::Cache(narrow_type)) if **narrow_type == LuaType::String
         ));
     }
 }

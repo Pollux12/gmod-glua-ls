@@ -215,14 +215,68 @@ pub(crate) fn infer_owner_raw_member_type_with_realm(
     caller_position: Option<TextSize>,
     source_min_position: Option<InFiled<TextSize>>,
 ) -> RawGetMemberTypeResult {
+    infer_owner_raw_member_type_with_realm_uncached(
+        db,
+        &member_owner,
+        member_key,
+        caller_file_id,
+        caller_position,
+        source_min_position.as_ref(),
+    )
+}
+
+/// Memoised entry point for hot read paths. The union fold over writers is
+/// identical for every read of the same member from the same place, so
+/// repeated reads share one answer instead of re-resolving every writer.
+pub(crate) fn infer_owner_raw_member_type_with_realm_cached(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    member_owner: LuaMemberOwner,
+    member_key: &LuaMemberKey,
+    caller_file_id: FileId,
+    caller_position: Option<TextSize>,
+    source_min_position: Option<InFiled<TextSize>>,
+) -> RawGetMemberTypeResult {
+    let cache_key = (
+        member_owner.clone(),
+        member_key.clone(),
+        caller_file_id,
+        caller_position,
+        source_min_position.clone(),
+    );
+    if let Some(cached) = cache.owner_raw_member_type_cache.get(&cache_key) {
+        return cached.clone();
+    }
+    let result = infer_owner_raw_member_type_with_realm_uncached(
+        db,
+        &member_owner,
+        member_key,
+        caller_file_id,
+        caller_position,
+        source_min_position.as_ref(),
+    );
+    cache
+        .owner_raw_member_type_cache
+        .insert(cache_key, result.clone());
+    result
+}
+
+fn infer_owner_raw_member_type_with_realm_uncached(
+    db: &DbIndex,
+    member_owner: &LuaMemberOwner,
+    member_key: &LuaMemberKey,
+    caller_file_id: FileId,
+    caller_position: Option<TextSize>,
+    source_min_position: Option<&InFiled<TextSize>>,
+) -> RawGetMemberTypeResult {
     let member_index = db.get_member_index();
-    if let Some(member_item) = member_index.get_member_item(&member_owner, member_key) {
+    if let Some(member_item) = member_index.get_member_item(member_owner, member_key) {
         let exact_type = resolve_member_item_with_realm(
             db,
             member_item,
             caller_file_id,
             caller_position,
-            source_min_position.as_ref(),
+            source_min_position,
         )?;
         // A dynamic write answers a dynamic read, but it is not evidence that
         // the integer entries beside it are absent: `t[n]` on a table filled
@@ -234,7 +288,7 @@ pub(crate) fn infer_owner_raw_member_type_with_realm(
             return Ok(exact_type);
         };
         let mut integer_keys = member_index
-            .get_member_keys(&member_owner)
+            .get_member_keys(member_owner)
             .filter(|key| {
                 matches!(key, LuaMemberKey::Integer(_))
                     && member_key_matches_type(db, access_key_type, key)
@@ -243,14 +297,14 @@ pub(crate) fn infer_owner_raw_member_type_with_realm(
         integer_keys.sort();
         let result_type = integer_keys
             .into_iter()
-            .filter_map(|key| member_index.get_member_item(&member_owner, key))
+            .filter_map(|key| member_index.get_member_item(member_owner, key))
             .filter_map(|item| {
                 resolve_member_item_with_realm(
                     db,
                     item,
                     caller_file_id,
                     caller_position,
-                    source_min_position.as_ref(),
+                    source_min_position,
                 )
                 .ok()
             })
@@ -268,9 +322,9 @@ pub(crate) fn infer_owner_raw_member_type_with_realm(
     // lookup above already covered, so a literal access that reaches here can
     // only be answered by an expression-keyed member.
     let owner_members = if matches!(member_key, LuaMemberKey::Name(_) | LuaMemberKey::Integer(_)) {
-        member_index.get_expr_key_members(&member_owner)
+        member_index.get_expr_key_members(member_owner)
     } else {
-        member_index.get_members(&member_owner)
+        member_index.get_members(member_owner)
     };
     let Some(owner_members) = owner_members else {
         return Err(InferFailReason::FieldNotFound);
@@ -291,7 +345,7 @@ pub(crate) fn infer_owner_raw_member_type_with_realm(
             &member_item,
             caller_file_id,
             caller_position,
-            source_min_position.as_ref(),
+            source_min_position,
         ) {
             saw_match = true;
             result_type = TypeOps::Union.apply(db, &result_type, &member_type);

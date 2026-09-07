@@ -61,8 +61,9 @@ impl LuaGlobalIndex {
     }
 
     pub fn get_global_decl_ids(&self, name: &str) -> Option<&Vec<LuaDeclId>> {
-        let id = GlobalId::new(name);
-        self.global_decl.get(&id)
+        // Borrowed lookup: `GlobalId` hashes by name and borrows as `str`,
+        // so this finds the same bucket without interning a new id per call.
+        self.global_decl.get(name)
     }
 
     pub fn get_global_decl_ids_in_workspace(
