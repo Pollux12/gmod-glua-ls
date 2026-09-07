@@ -1618,6 +1618,22 @@ fn analyze_lambda_params(
     signature_id: &LuaSignatureId,
     closure: &LuaClosureExpr,
 ) -> Option<()> {
+    // A3-remnant decision (language-server-performance §3): the general
+    // attempt-once-at-enqueue for ClosureParams/ClosureReturn/ClosureParentParams
+    // is deliberately NOT landed. An enqueue-time `try_resolve` would run against
+    // a partially walked batch (later files' lua passes, gmod post, and the
+    // dynamic-field seal have not run yet), while the first wave sees all of
+    // them. `try_resolve_call_closure_params` inserts param docs first-writer-wins
+    // (`contains_key` skip), so an early write from a still-Unknown prefix would
+    // pin `any` over the concrete contract the wave would have installed; an
+    // early no-op `Ok` (callback not found yet) would retire an item the wave
+    // would have filled once a later file's facts landed. Either changes
+    // diagnostics without moving the `moved` counters (params are not type
+    // writes), so the stop rule cannot catch it. A failed enqueue-time attempt
+    // also doubles cost for the majority that do not resolve immediately: the
+    // infer caches are cleared before the waves (`clear_for_unresolve`), so the
+    // pre-warm is wiped. The only provably identical skips are the syntactic
+    // no-ops below, which read no index state and write nothing.
     let ast_node = closure.get_parent::<LuaAst>()?;
     match ast_node {
         LuaAst::LuaCallArgList(call_arg_list) => {
@@ -1639,6 +1655,14 @@ fn analyze_lambda_params(
                 .add_unresolve(unresolved.into(), InferFailReason::None);
         }
         LuaAst::LuaFuncStat(func_stat) => {
+            // `try_resolve_closure_parent_params` returns `Ok` without reading
+            // or writing anything unless the defined name is an index expression.
+            // A plain `function foo() end` therefore retires on its first wave
+            // attempt with no state change; skipping the enqueue leaves the
+            // `moved == 0` termination and every floor identical.
+            if !func_stat_defines_index_target(&func_stat) {
+                return Some(());
+            }
             let unresolved = UnResolveParentClosureParams {
                 file_id: analyzer.file_id,
                 signature_id: *signature_id,
@@ -1661,6 +1685,13 @@ fn analyze_lambda_params(
                 .add_unresolve(unresolved.into(), InferFailReason::None);
         }
         LuaAst::LuaAssignStat(assign_stat) => {
+            // Same no-op rule as the `FuncStat` arm: an assignment whose slot for
+            // this closure is a plain name returns `Ok` with no reads or writes.
+            // Only the slot at this closure's position matters; when it cannot
+            // be identified the item is enqueued as before.
+            if assign_slot_is_plain_name(&assign_stat, closure.get_position()) {
+                return Some(());
+            }
             let unresolved = UnResolveParentClosureParams {
                 file_id: analyzer.file_id,
                 signature_id: *signature_id,
@@ -1675,6 +1706,27 @@ fn analyze_lambda_params(
     }
 
     Some(())
+}
+
+/// Whether a `FuncStat` parent can contribute a parameter contract: only an
+/// `a.b.c` / `a:b()` definition reads the prefix type. A missing name fails
+/// the retry with `None` rather than retiring, so it still enqueues.
+fn func_stat_defines_index_target(func_stat: &LuaFuncStat) -> bool {
+    matches!(func_stat.get_func_name(), Some(LuaVarExpr::IndexExpr(_)))
+}
+
+/// Whether the assignment slot holding the closure at `closure_pos` is a plain
+/// name. Mirrors the `UnResolveParentClosureParams::LuaAssignStat` retry, which
+/// returns `Ok` without reads or writes for any non-index target. `None` (slot
+/// not found) preserves the enqueue: the retry fails with `None` and stays
+/// queued rather than retiring.
+fn assign_slot_is_plain_name(assign_stat: &LuaAssignStat, closure_pos: rowan::TextSize) -> bool {
+    let (vars, exprs) = assign_stat.get_var_and_expr_list();
+    exprs
+        .iter()
+        .position(|expr| expr.get_position() == closure_pos)
+        .and_then(|idx| vars.get(idx))
+        .is_some_and(|var| !matches!(var, LuaVarExpr::IndexExpr(_)))
 }
 
 fn analyze_require_guard_param(
@@ -2462,4 +2514,111 @@ fn should_union_any_as_unknown(typ: &LuaType) -> bool {
             | LuaType::BooleanConst(_)
             | LuaType::DocBooleanConst(_)
     ) && !typ.is_nullable()
+}
+
+#[cfg(test)]
+mod closure_parent_enqueue_tests {
+    use glua_parser::{
+        LuaAssignStat, LuaAstNode, LuaClosureExpr, LuaFuncStat, LuaParser, ParserConfig,
+    };
+
+    use super::{assign_slot_is_plain_name, func_stat_defines_index_target};
+
+    fn single_func_stat(code: &str) -> LuaFuncStat {
+        let tree = LuaParser::parse(code, ParserConfig::default());
+        tree.get_chunk_node()
+            .descendants::<LuaFuncStat>()
+            .next()
+            .expect("expected func stat")
+    }
+
+    fn single_assign_and_closures(code: &str) -> (LuaAssignStat, Vec<LuaClosureExpr>) {
+        let tree = LuaParser::parse(code, ParserConfig::default());
+        let root = tree.get_chunk_node();
+        let assign = root
+            .descendants::<LuaAssignStat>()
+            .next()
+            .expect("expected assign stat");
+        let closures = root.descendants::<LuaClosureExpr>().collect::<Vec<_>>();
+        (assign, closures)
+    }
+
+    #[test]
+    fn plain_function_name_needs_no_parent_param_item() {
+        assert!(!func_stat_defines_index_target(&single_func_stat(
+            "function foo() end"
+        )));
+    }
+
+    #[test]
+    fn dotted_and_colon_definitions_keep_parent_param_item() {
+        assert!(func_stat_defines_index_target(&single_func_stat(
+            "function foo.bar() end"
+        )));
+        assert!(func_stat_defines_index_target(&single_func_stat(
+            "function foo:bar() end"
+        )));
+    }
+
+    #[test]
+    fn plain_assign_slot_needs_no_parent_param_item() {
+        let (assign, closures) = single_assign_and_closures("foo = function() end");
+        assert_eq!(closures.len(), 1);
+        assert!(assign_slot_is_plain_name(
+            &assign,
+            closures[0].get_position()
+        ));
+    }
+
+    #[test]
+    fn index_assign_slot_keeps_parent_param_item() {
+        let (assign, closures) = single_assign_and_closures("foo.bar = function() end");
+        assert_eq!(closures.len(), 1);
+        assert!(!assign_slot_is_plain_name(
+            &assign,
+            closures[0].get_position()
+        ));
+    }
+
+    #[test]
+    fn mixed_assign_slots_are_decided_per_closure() {
+        let (assign, closures) =
+            single_assign_and_closures("foo, bar.baz = function() end, function() end");
+        assert_eq!(closures.len(), 2);
+        assert!(assign_slot_is_plain_name(
+            &assign,
+            closures[0].get_position()
+        ));
+        assert!(!assign_slot_is_plain_name(
+            &assign,
+            closures[1].get_position()
+        ));
+    }
+
+    #[test]
+    fn unknown_assign_slot_keeps_parent_param_item() {
+        let (assign, _) = single_assign_and_closures("foo = function() end");
+        assert!(!assign_slot_is_plain_name(
+            &assign,
+            rowan::TextSize::new(10_000)
+        ));
+    }
+
+    #[test]
+    fn plain_and_index_definitions_still_index() {
+        let mut ws = crate::VirtualWorkspace::new();
+        let file_id =
+            ws.def("function foo(a) return a end\nfoo.bar = function(self, x) return x end\n");
+        assert!(
+            ws.analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("semantic model")
+                .get_db()
+                .get_decl_index()
+                .get_decl_tree(&file_id)
+                .is_some(),
+            "file failed to index"
+        );
+    }
 }

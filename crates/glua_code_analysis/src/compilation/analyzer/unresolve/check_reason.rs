@@ -123,6 +123,21 @@ pub fn resolve_as_unknown(
     reason: &InferFailReason,
     loop_count: usize,
 ) -> Option<()> {
+    // A3-remnant design check (language-server-performance §3, declined): the
+    // `None` group is deliberately NOT pre-classified at enqueue into "undefined
+    // global" vs "genuinely deferred". A `None` floor is a no-op by construction
+    // (there is no owner to write), while every specific reason floors to
+    // `Unknown` (decl/member/return) or publishes a placeholder. Re-labelling a
+    // genuinely deferred item as an undefined global would therefore swap "leave
+    // no cache and let later passes derive it" for "commit `Unknown`/`nil` as
+    // the final answer", which the `moved == 0` totals cannot catch and which
+    // downstream reads observe (undefined-global RHS is `nil` only on the
+    // assignment path that opts in; elsewhere the same read must stay unresolved
+    // so narrowing keeps the other branches). Proving the same final floor would
+    // require showing the classification never fires on an item whose inputs
+    // settle later in the same batch, which the enqueue-time DB cannot show. The
+    // wave keeps carrying `None` items until they resolve or the force phase
+    // drops them.
     match reason {
         InferFailReason::None
         | InferFailReason::FieldNotFound
