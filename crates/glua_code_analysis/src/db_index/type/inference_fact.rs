@@ -350,29 +350,7 @@ fn normalize_provenance(provenance: Arc<[LuaInferenceStep]>) -> Arc<[LuaInferenc
 }
 
 fn type_owner_cmp(left: &LuaTypeOwner, right: &LuaTypeOwner) -> Ordering {
-    let tag = |owner: &LuaTypeOwner| match owner {
-        LuaTypeOwner::Decl(_) => 0,
-        LuaTypeOwner::Member(_) => 1,
-        LuaTypeOwner::SyntaxId(_) => 2,
-    };
-
-    tag(left)
-        .cmp(&tag(right))
-        .then_with(|| match (left, right) {
-            (LuaTypeOwner::Decl(left), LuaTypeOwner::Decl(right)) => left
-                .file_id
-                .cmp(&right.file_id)
-                .then_with(|| left.position.cmp(&right.position)),
-            (LuaTypeOwner::Member(left), LuaTypeOwner::Member(right)) => left
-                .file_id
-                .cmp(&right.file_id)
-                .then_with(|| syntax_id_cmp(left.get_syntax_id(), right.get_syntax_id())),
-            (LuaTypeOwner::SyntaxId(left), LuaTypeOwner::SyntaxId(right)) => left
-                .file_id
-                .cmp(&right.file_id)
-                .then_with(|| syntax_id_cmp(&left.value, &right.value)),
-            _ => Ordering::Equal,
-        })
+    left.stable_cmp(right)
 }
 
 fn syntax_id_cmp(left: &LuaSyntaxId, right: &LuaSyntaxId) -> Ordering {

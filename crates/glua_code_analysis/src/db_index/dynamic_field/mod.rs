@@ -99,6 +99,11 @@ pub struct DynamicFieldIndex {
     finite_named_members: HashMap<DynamicFieldOwner, HashSet<LuaMemberId>>,
     /// file → list of (owner, field_name) pairs contributed by this file
     file_contributions: HashMap<FileId, Vec<(DynamicFieldOwner, SmolStr, TextRange)>>,
+    /// file → finite-named members contributed by this file, so removal visits
+    /// only the owners the removed files touched instead of retaining over
+    /// every member in the workspace. Keyed by the member's own file, which is
+    /// the file whose analysis recorded it.
+    finite_named_file_contributions: HashMap<FileId, Vec<(DynamicFieldOwner, LuaMemberId)>>,
     /// owner → assignment locations for writes through non-literal keys.
     wildcard_definitions: HashMap<DynamicFieldOwner, Vec<InFiled<TextRange>>>,
     /// file → wildcard assignments contributed by this file.
@@ -346,6 +351,11 @@ impl DynamicFieldIndex {
                     dirty.insert(*file_id);
                 }
             }
+            for entries in self.finite_named_file_contributions.values_mut() {
+                entries.retain(|(owner, _)| !lost.contains(owner));
+            }
+            self.finite_named_file_contributions
+                .retain(|_, entries| !entries.is_empty());
         }
         dirty.remove(&remap.file_id);
         dirty
@@ -417,6 +427,13 @@ impl DynamicFieldIndex {
 
         for entries in self.file_contributions.values_mut() {
             for (owner, _, _) in entries.iter_mut() {
+                if let Some(new) = remap_owner(owner, map) {
+                    *owner = new;
+                }
+            }
+        }
+        for entries in self.finite_named_file_contributions.values_mut() {
+            for (owner, _) in entries.iter_mut() {
                 if let Some(new) = remap_owner(owner, map) {
                     *owner = new;
                 }
@@ -510,10 +527,17 @@ impl DynamicFieldIndex {
     }
 
     pub fn add_finite_named_member(&mut self, owner: DynamicFieldOwner, member_id: LuaMemberId) {
-        self.finite_named_members
-            .entry(owner)
+        if self
+            .finite_named_members
+            .entry(owner.clone())
             .or_default()
-            .insert(member_id);
+            .insert(member_id)
+        {
+            self.finite_named_file_contributions
+                .entry(member_id.file_id)
+                .or_default()
+                .push((owner, member_id));
+        }
     }
 
     pub fn remove_finite_named_member(
@@ -527,6 +551,16 @@ impl DynamicFieldIndex {
         members.remove(&member_id);
         if members.is_empty() {
             self.finite_named_members.remove(owner);
+        }
+        if let Some(contributions) = self
+            .finite_named_file_contributions
+            .get_mut(&member_id.file_id)
+        {
+            contributions.retain(|(o, m)| o != owner || m != &member_id);
+            if contributions.is_empty() {
+                self.finite_named_file_contributions
+                    .remove(&member_id.file_id);
+            }
         }
     }
 
@@ -626,73 +660,28 @@ impl DynamicFieldIndex {
         definitions.dedup();
         definitions
     }
+}
 
-    fn rebuild_derived_state(&mut self) {
-        self.owner_fields.clear();
-        self.file_contributions.clear();
-        self.wildcard_file_contributions.clear();
-
-        for (owner, fields) in &self.field_definitions {
-            for (field_name, definitions) in fields {
-                for definition in definitions {
-                    self.owner_fields
-                        .entry(owner.clone())
-                        .or_default()
-                        .entry(field_name.clone())
-                        .or_default()
-                        .insert(definition.file_id);
-                    self.file_contributions
-                        .entry(definition.file_id)
-                        .or_default()
-                        .push((owner.clone(), field_name.clone(), definition.value));
-                }
-            }
-        }
-
-        for (owner, definitions) in &self.wildcard_definitions {
-            for definition in definitions {
-                self.wildcard_file_contributions
-                    .entry(definition.file_id)
-                    .or_default()
-                    .push((owner.clone(), definition.value));
-            }
-        }
+/// Drops one definition entry filed under `(owner, field_name)`, pruning the
+/// emptied levels so no owner or field outlives its last definition.
+fn remove_field_definition(
+    definitions: &mut HashMap<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
+    owner: &DynamicFieldOwner,
+    field_name: &str,
+    definition: &InFiled<TextRange>,
+) {
+    let Some(fields) = definitions.get_mut(owner) else {
+        return;
+    };
+    let Some(entries) = fields.get_mut(field_name) else {
+        return;
+    };
+    entries.retain(|existing| existing != definition);
+    if entries.is_empty() {
+        fields.remove(field_name);
     }
-
-    fn erase_file_from_derived(&mut self, file_id: FileId) -> (bool, bool) {
-        let had_field_contributions =
-            if let Some(contributions) = self.file_contributions.remove(&file_id) {
-                for (owner, field_name, _) in contributions {
-                    let mut remove_owner = false;
-
-                    if let Some(fields) = self.owner_fields.get_mut(&owner) {
-                        let mut remove_field = false;
-
-                        if let Some(files) = fields.get_mut(&field_name) {
-                            files.remove(&file_id);
-                            remove_field = files.is_empty();
-                        }
-
-                        if remove_field {
-                            fields.remove(&field_name);
-                        }
-
-                        remove_owner = fields.is_empty();
-                    }
-
-                    if remove_owner {
-                        self.owner_fields.remove(&owner);
-                    }
-                }
-                true
-            } else {
-                false
-            };
-
-        let had_wildcard_contributions =
-            self.wildcard_file_contributions.remove(&file_id).is_some();
-
-        (had_field_contributions, had_wildcard_contributions)
+    if fields.is_empty() {
+        definitions.remove(owner);
     }
 }
 
@@ -765,53 +754,65 @@ impl LuaIndex for DynamicFieldIndex {
     }
 
     fn remove_files(&mut self, file_ids: &[FileId]) {
-        let removed: HashSet<FileId> = file_ids.iter().copied().collect();
-        // The definition maps are swept once for the whole batch: retaining
-        // per file made removal cost O(files × index) on high fan-in edits.
-        let mut files_with_removed_fields: HashSet<FileId> = HashSet::default();
-        self.field_definitions.retain(|_, fields| {
-            fields.retain(|_, definitions| {
-                definitions.retain(|definition| {
-                    if removed.contains(&definition.file_id) {
-                        files_with_removed_fields.insert(definition.file_id);
-                        false
-                    } else {
-                        true
-                    }
-                });
-                !definitions.is_empty()
-            });
-            !fields.is_empty()
-        });
-        self.direct_field_definitions.retain(|_, fields| {
-            fields.retain(|_, definitions| {
-                definitions.retain(|definition| !removed.contains(&definition.file_id));
-                !definitions.is_empty()
-            });
-            !fields.is_empty()
-        });
-        self.finite_named_members.retain(|_, members| {
-            members.retain(|member_id| !removed.contains(&member_id.file_id));
-            !members.is_empty()
-        });
-
-        let mut files_with_removed_wildcards: HashSet<FileId> = HashSet::default();
-        self.wildcard_definitions.retain(|_, definitions| {
-            definitions.retain(|definition| {
-                if removed.contains(&definition.file_id) {
-                    files_with_removed_wildcards.insert(definition.file_id);
-                    false
-                } else {
-                    true
-                }
-            });
-            !definitions.is_empty()
-        });
-
-        // `file_contributions` is an internal removal index only; no downstream consumer
-        // observes its Vec order, and `rebuild_derived_state` may repopulate it through
-        // HashMap iteration.
+        // Every primary map is pruned through the per-file contribution
+        // indexes: only the owners the removed files contributed to are
+        // visited, never the whole index. Each contribution corresponds to
+        // exactly one definition entry, so draining a file's contributions
+        // removes precisely its definitions; pruning is idempotent, and the
+        // surviving entries keep their canonical order.
         for &file_id in file_ids {
+            if let Some(contributions) = self.file_contributions.remove(&file_id) {
+                for (owner, field_name, range) in contributions {
+                    let definition = InFiled::new(file_id, range);
+                    remove_field_definition(
+                        &mut self.field_definitions,
+                        &owner,
+                        &field_name,
+                        &definition,
+                    );
+                    remove_field_definition(
+                        &mut self.direct_field_definitions,
+                        &owner,
+                        &field_name,
+                        &definition,
+                    );
+                    if let Some(fields) = self.owner_fields.get_mut(&owner) {
+                        if let Some(files) = fields.get_mut(field_name.as_str()) {
+                            files.remove(&file_id);
+                            if files.is_empty() {
+                                fields.remove(field_name.as_str());
+                            }
+                        }
+                        if fields.is_empty() {
+                            self.owner_fields.remove(&owner);
+                        }
+                    }
+                }
+            }
+
+            if let Some(contributions) = self.wildcard_file_contributions.remove(&file_id) {
+                for (owner, range) in contributions {
+                    let definition = InFiled::new(file_id, range);
+                    if let Some(definitions) = self.wildcard_definitions.get_mut(&owner) {
+                        definitions.retain(|existing| existing != &definition);
+                        if definitions.is_empty() {
+                            self.wildcard_definitions.remove(&owner);
+                        }
+                    }
+                }
+            }
+
+            if let Some(contributions) = self.finite_named_file_contributions.remove(&file_id) {
+                for (owner, member_id) in contributions {
+                    if let Some(members) = self.finite_named_members.get_mut(&owner) {
+                        members.remove(&member_id);
+                        if members.is_empty() {
+                            self.finite_named_members.remove(&owner);
+                        }
+                    }
+                }
+            }
+
             if let Some(field_names) = self.unattributed_file_contributions.remove(&file_id) {
                 for field_name in field_names {
                     if let Some(files) = self.unattributed_fields.get_mut(&field_name) {
@@ -823,20 +824,6 @@ impl LuaIndex for DynamicFieldIndex {
                 }
             }
         }
-
-        let mut need_rebuild = false;
-        for &file_id in file_ids {
-            let (had_field_contributions, had_wildcard_contributions) =
-                self.erase_file_from_derived(file_id);
-            need_rebuild |= (files_with_removed_fields.contains(&file_id)
-                && !had_field_contributions)
-                || (files_with_removed_wildcards.contains(&file_id) && !had_wildcard_contributions);
-        }
-        // Rebuilding is a pure function of the primary maps, so one rebuild at
-        // batch end is equivalent to the per-file rebuilds it replaces.
-        if need_rebuild {
-            self.rebuild_derived_state();
-        }
     }
 
     fn clear(&mut self) {
@@ -845,6 +832,7 @@ impl LuaIndex for DynamicFieldIndex {
         self.direct_field_definitions.clear();
         self.finite_named_members.clear();
         self.file_contributions.clear();
+        self.finite_named_file_contributions.clear();
         self.wildcard_definitions.clear();
         self.wildcard_file_contributions.clear();
         self.unattributed_fields.clear();
@@ -929,32 +917,20 @@ mod tests {
         );
     }
 
+    /// Removal is driven by the per-file contribution indexes, so state is
+    /// built through the same `add_*` entry points production uses.
     #[test]
-    fn remove_prunes_orphaned_field_definitions_without_contribution_entries() {
+    fn remove_prunes_definitions_leaving_no_orphaned_entries() {
         let file_to_remove = FileId::new(1);
         let remaining_file = FileId::new(2);
         let owner = DynamicFieldOwner::Type(LuaTypeDeclId::global("DynFieldTest"));
         let field = SmolStr::new("value");
 
         let mut index = DynamicFieldIndex::new();
-        index
-            .field_definitions
-            .entry(owner.clone())
-            .or_default()
-            .entry(field.clone())
-            .or_default()
-            .extend([
-                InFiled::new(file_to_remove, range(1, 2)),
-                InFiled::new(remaining_file, range(3, 4)),
-            ]);
-        index
-            .wildcard_definitions
-            .entry(owner.clone())
-            .or_default()
-            .extend([
-                InFiled::new(file_to_remove, range(5, 6)),
-                InFiled::new(remaining_file, range(7, 8)),
-            ]);
+        index.add_field(owner.clone(), field.clone(), file_to_remove, range(1, 2));
+        index.add_field(owner.clone(), field.clone(), remaining_file, range(3, 4));
+        index.add_wildcard_definition(owner.clone(), file_to_remove, range(5, 6));
+        index.add_wildcard_definition(owner.clone(), remaining_file, range(7, 8));
 
         index.remove(file_to_remove);
 
@@ -1228,6 +1204,98 @@ mod tests {
         assert_eq!(
             normalize_wildcard_file_contributions(&index.wildcard_file_contributions),
             normalize_wildcard_file_contributions(&fresh.wildcard_file_contributions)
+        );
+    }
+
+    /// Contributions-driven removal leaves exactly the state a fresh index
+    /// built from the surviving files' inputs holds, finite-named members
+    /// included.
+    #[test]
+    fn remove_matches_fresh_state_including_finite_members() {
+        use glua_parser::LuaSyntaxKind;
+
+        fn member(file_id: FileId, start: u32, end: u32) -> LuaMemberId {
+            LuaMemberId::new(
+                LuaSyntaxId::new(LuaSyntaxKind::IndexExpr.into(), range(start, end)),
+                file_id,
+            )
+        }
+
+        let removed_file = FileId::new(1);
+        let remaining_file = FileId::new(2);
+        let owner = DynamicFieldOwner::Type(LuaTypeDeclId::global("DynFieldTest"));
+        let field = SmolStr::new("value");
+        let removed_member = member(removed_file, 1, 2);
+        let remaining_member = member(remaining_file, 3, 4);
+
+        fn build(
+            removed_file: FileId,
+            remaining_file: FileId,
+            removed_member: LuaMemberId,
+            remaining_member: LuaMemberId,
+            owner: &DynamicFieldOwner,
+            field: &SmolStr,
+            files: &[FileId],
+        ) -> DynamicFieldIndex {
+            let mut index = DynamicFieldIndex::new();
+            if files.contains(&removed_file) {
+                index.add_field(owner.clone(), field.clone(), removed_file, range(1, 2));
+                index.add_wildcard_definition(owner.clone(), removed_file, range(5, 6));
+                index.add_finite_named_member(owner.clone(), removed_member);
+                index.add_unattributed_field(SmolStr::new("loose"), removed_file);
+            }
+            if files.contains(&remaining_file) {
+                index.add_field(owner.clone(), field.clone(), remaining_file, range(3, 4));
+                index.add_wildcard_definition(owner.clone(), remaining_file, range(7, 8));
+                index.add_finite_named_member(owner.clone(), remaining_member);
+                index.add_unattributed_field(SmolStr::new("loose"), remaining_file);
+            }
+            index
+        }
+
+        let mut index = build(
+            removed_file,
+            remaining_file,
+            removed_member,
+            remaining_member,
+            &owner,
+            &field,
+            &[removed_file, remaining_file],
+        );
+        index.remove(removed_file);
+        let fresh = build(
+            removed_file,
+            remaining_file,
+            removed_member,
+            remaining_member,
+            &owner,
+            &field,
+            &[remaining_file],
+        );
+
+        assert_eq!(index.owner_fields, fresh.owner_fields);
+        assert_eq!(
+            normalize_field_definitions(&index.field_definitions),
+            normalize_field_definitions(&fresh.field_definitions)
+        );
+        assert_eq!(
+            normalize_file_contributions(&index.file_contributions),
+            normalize_file_contributions(&fresh.file_contributions)
+        );
+        assert_eq!(index.wildcard_definitions, fresh.wildcard_definitions);
+        assert_eq!(
+            normalize_wildcard_file_contributions(&index.wildcard_file_contributions),
+            normalize_wildcard_file_contributions(&fresh.wildcard_file_contributions)
+        );
+        assert_eq!(index.finite_named_members, fresh.finite_named_members);
+        assert_eq!(
+            index.finite_named_file_contributions,
+            fresh.finite_named_file_contributions
+        );
+        assert_eq!(index.unattributed_fields, fresh.unattributed_fields);
+        assert_eq!(
+            index.unattributed_file_contributions,
+            fresh.unattributed_file_contributions
         );
     }
 }

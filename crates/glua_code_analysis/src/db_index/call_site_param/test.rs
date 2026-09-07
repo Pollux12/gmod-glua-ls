@@ -370,4 +370,188 @@ mod tests {
                 .is_empty()
         );
     }
+
+    fn provenanced_fact(
+        typ: LuaType,
+        signature_id: LuaSignatureId,
+        source_file: FileId,
+        start: u32,
+    ) -> LuaTypeFact {
+        use crate::{
+            InFiled, LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId,
+            LuaInferenceProvenanceKind, LuaInferenceStep,
+        };
+        use glua_parser::{LuaKind, LuaSyntaxId, LuaSyntaxKind};
+        use rowan::{TextRange, TextSize};
+
+        let range = TextRange::new(TextSize::from(start), TextSize::from(start + 1));
+        let kind: LuaKind = LuaSyntaxKind::LocalName.into();
+        let step = LuaInferenceStep {
+            event: LuaInferenceEventId {
+                node: LuaInferenceNodeId::SignatureParam {
+                    signature_id,
+                    param_idx: 0,
+                },
+                kind: LuaInferenceProvenanceKind::ConcreteValue,
+                source: InFiled::new(source_file, LuaSyntaxId::new(kind, range)),
+            },
+            support: std::sync::Arc::from([]),
+            inferred_type: None,
+            found_type: None,
+        };
+        LuaTypeFact::new(
+            typ,
+            LuaInferenceConfidence::Certain,
+            std::sync::Arc::from([step]),
+        )
+    }
+
+    /// Incremental removal re-folds the surviving contributions, so the
+    /// inferred params and their diagnostic events match a fresh index built
+    /// from the surviving files' inputs.
+    #[test]
+    fn removal_refolds_provenanced_params_and_events_like_a_fresh_build() {
+        let caller_a = FileId::new(1);
+        let caller_b = FileId::new(2);
+        let callee = FileId::new(3);
+        let signature_id = signature_id(callee, 100);
+
+        let mut index = CallSiteParamIndex::new();
+        index.set_files_fact_contributions(vec![
+            (
+                caller_a,
+                vec![(
+                    signature_id,
+                    0,
+                    provenanced_fact(LuaType::String, signature_id, caller_a, 10),
+                )],
+            ),
+            (
+                caller_b,
+                vec![(
+                    signature_id,
+                    0,
+                    provenanced_fact(LuaType::Boolean, signature_id, caller_b, 20),
+                )],
+            ),
+        ]);
+
+        index.remove_files(&[caller_a]);
+
+        let mut expected = CallSiteParamIndex::new();
+        expected.set_files_fact_contributions(vec![(
+            caller_b,
+            vec![(
+                signature_id,
+                0,
+                provenanced_fact(LuaType::Boolean, signature_id, caller_b, 20),
+            )],
+        )]);
+
+        assert_eq!(index.inferred_params, expected.inferred_params);
+        assert_eq!(
+            index.inference_events_by_file,
+            expected.inference_events_by_file
+        );
+        assert_eq!(
+            index.get_inferred_param(&signature_id, 0),
+            Some(&LuaType::Boolean)
+        );
+        assert!(index.get_inference_events_for_file(caller_a).is_empty());
+        assert_eq!(index.get_inference_events_for_file(caller_b).len(), 1);
+    }
+
+    fn return_consumer(
+        signature_id: LuaSignatureId,
+        file_id: FileId,
+        start: u32,
+    ) -> CallSiteReturnConsumer {
+        use crate::LuaDeclId;
+        use glua_parser::{LuaKind, LuaSyntaxId, LuaSyntaxKind};
+        use rowan::{TextRange, TextSize};
+
+        let range = TextRange::new(TextSize::from(start), TextSize::from(start + 1));
+        let kind: LuaKind = LuaSyntaxKind::CallExpr.into();
+        CallSiteReturnConsumer {
+            signature_id,
+            file_id,
+            call_syntax_id: LuaSyntaxId::new(kind, range),
+            ret_idx: 0,
+            target: CallSiteReturnConsumerTarget::Decl(LuaDeclId::new(
+                file_id,
+                TextSize::from(start),
+            )),
+            definition: None,
+            needs_result_refresh: false,
+        }
+    }
+
+    /// Removing a consumer file prunes exactly its entries from the derived
+    /// return-consumer maps, matching a fresh index built from the surviving
+    /// files' consumers. Dependency edges intentionally outlive the removal
+    /// (they are append-only until `forget_removed_files`), so they are
+    /// excluded from the comparison.
+    #[test]
+    fn removal_prunes_return_consumers_like_a_fresh_build() {
+        let callee = FileId::new(1);
+        let consumer_a = FileId::new(2);
+        let consumer_b = FileId::new(3);
+        let signature_id = signature_id(callee, 100);
+        let consumer_a_entry = return_consumer(signature_id, consumer_a, 10);
+        let consumer_b_entry = return_consumer(signature_id, consumer_b, 20);
+
+        let mut index = CallSiteParamIndex::new();
+        index.set_files_return_consumers(vec![
+            (consumer_a, vec![consumer_a_entry.clone()]),
+            (consumer_b, vec![consumer_b_entry.clone()]),
+        ]);
+
+        index.remove_files(&[consumer_a]);
+
+        let mut expected = CallSiteParamIndex::new();
+        expected.set_files_return_consumers(vec![(consumer_b, vec![consumer_b_entry])]);
+
+        assert_eq!(index.file_return_consumers, expected.file_return_consumers);
+        assert_eq!(index.return_consumers, expected.return_consumers);
+        assert_eq!(
+            index.return_consumers_by_signature_file,
+            expected.return_consumers_by_signature_file
+        );
+    }
+
+    /// A remove followed by re-adding the same inputs restores the derived
+    /// maps exactly, pinning the incremental removal against the installing
+    /// paths rather than against a fresh build.
+    #[test]
+    fn remove_then_readd_restores_source_signatures_and_consumers() {
+        let callee = FileId::new(1);
+        let consumer = FileId::new(2);
+        let signature_id = signature_id(callee, 100);
+        let consumer_entry = return_consumer(signature_id, consumer, 10);
+        let source_entry = ("m.f".to_string(), signature_id, Vec::new());
+
+        let mut index = CallSiteParamIndex::new();
+        index.set_files_source_signatures(vec![(callee, vec![source_entry.clone()])]);
+        index.set_files_return_consumers(vec![(consumer, vec![consumer_entry.clone()])]);
+        index.set_files_contributions(vec![(consumer, vec![(signature_id, 0, LuaType::String)])]);
+
+        let snapshot = (
+            index.source_signatures_by_path.clone(),
+            index.mutated_params.clone(),
+            index.return_consumers.clone(),
+            index.return_consumers_by_signature_file.clone(),
+            index.inferred_params.clone(),
+        );
+
+        index.remove_files(&[callee, consumer]);
+        index.set_files_source_signatures(vec![(callee, vec![source_entry])]);
+        index.set_files_return_consumers(vec![(consumer, vec![consumer_entry])]);
+        index.set_files_contributions(vec![(consumer, vec![(signature_id, 0, LuaType::String)])]);
+
+        assert_eq!(index.source_signatures_by_path, snapshot.0);
+        assert_eq!(index.mutated_params, snapshot.1);
+        assert_eq!(index.return_consumers, snapshot.2);
+        assert_eq!(index.return_consumers_by_signature_file, snapshot.3);
+        assert_eq!(index.inferred_params, snapshot.4);
+    }
 }
