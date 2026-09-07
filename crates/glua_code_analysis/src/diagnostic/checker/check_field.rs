@@ -2330,3 +2330,117 @@ fn owner_wildcard_covers_any_field(db: &DbIndex, owner: &crate::DynamicFieldOwne
             .is_some_and(|fields| !fields.is_empty())
         || crate::is_pure_wildcard_registry(db, owner)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{DiagnosticCode, LuaType, valid_member_cache_key};
+    use crate::VirtualWorkspace;
+    use glua_parser::{LuaAstNode, LuaIndexExpr};
+    use lsp_types::NumberOrString;
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn valid_member_cache_key_should_reject_uncacheable_prefixes() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def("local _probe = t.wanted");
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let index_key = semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .next()
+            .expect("expected index expression")
+            .get_index_key()
+            .expect("expected index key");
+
+        for prefix in [
+            LuaType::Unknown,
+            LuaType::Any,
+            LuaType::Table,
+            LuaType::Never,
+        ] {
+            assert!(
+                valid_member_cache_key(
+                    &semantic_model,
+                    &prefix,
+                    &index_key,
+                    DiagnosticCode::UndefinedField,
+                )
+                .is_none(),
+                "uncacheable prefix {prefix:?} must not produce a member cache key",
+            );
+        }
+
+        let read_key = valid_member_cache_key(
+            &semantic_model,
+            &LuaType::String,
+            &index_key,
+            DiagnosticCode::UndefinedField,
+        )
+        .expect("string prefix must be cacheable");
+        let inject_key = valid_member_cache_key(
+            &semantic_model,
+            &LuaType::String,
+            &index_key,
+            DiagnosticCode::InjectField,
+        )
+        .expect("string prefix must be cacheable");
+        assert_ne!(
+            read_key, inject_key,
+            "read and inject checks must not share a member cache entry",
+        );
+    }
+
+    #[test]
+    fn poisoned_unknown_entry_should_not_validate_missing_member() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class D2Has
+            ---@field wanted string
+
+            ---@class D2Lacks
+            ---@field other string
+
+            ---@type any
+            local u
+            ---@type D2Has
+            local has
+            ---@type D2Lacks
+            local lacks
+
+            local _poison = u.wanted
+            local _ok = has.wanted
+            local _bad = lacks.wanted
+            "#,
+        );
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        let field_diagnostics = diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == code)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            field_diagnostics.len(),
+            1,
+            "expected only lacks.wanted, got {field_diagnostics:?}",
+        );
+        assert!(
+            field_diagnostics[0].message.contains("`wanted`"),
+            "expected missing-field diagnostic for lacks.wanted, got {:?}",
+            field_diagnostics[0].message,
+        );
+    }
+}
