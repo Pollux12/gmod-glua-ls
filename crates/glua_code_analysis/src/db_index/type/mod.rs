@@ -1246,6 +1246,13 @@ pub struct LuaTypeIndex {
     /// [`LuaTypeIndex::get_sub_types`] is a lookup instead of a scan over
     /// every inheritance edge in the workspace.
     sub_types: HashMap<LuaTypeDeclId, Vec<LuaTypeDeclId>>,
+    /// Which class each declaration's stored type names. Backs
+    /// `local_class_table_member_ids`: finding the table literals that back
+    /// a class is a lookup of the declarations bound to it instead of a scan
+    /// over every declaration in the class's files. Maintained on every
+    /// type-cache write and file removal alongside the caches themselves.
+    decl_type_binds: HashMap<LuaDeclId, LuaTypeDeclId>,
+    type_bound_decls: HashMap<LuaTypeDeclId, HashSet<LuaDeclId>>,
     types: HashMap<LuaTypeOwner, LuaTypeCache>,
     cache_refs: TypeCacheRefIndex,
     in_filed_type_owner: HashMap<FileId, HashSet<LuaTypeOwner>>,
@@ -1283,6 +1290,8 @@ impl LuaTypeIndex {
             generic_params: HashMap::default(),
             supers: HashMap::default(),
             sub_types: HashMap::default(),
+            decl_type_binds: HashMap::default(),
+            type_bound_decls: HashMap::default(),
             types: HashMap::default(),
             cache_refs: TypeCacheRefIndex::default(),
             in_filed_type_owner: HashMap::default(),
@@ -1539,6 +1548,38 @@ impl LuaTypeIndex {
         decl_id: &LuaTypeDeclId,
     ) -> Option<&[InFiled<LuaSuperType>]> {
         self.supers.get(decl_id).map(Vec::as_slice)
+    }
+
+    /// The declarations whose stored type is a direct reference to `type_id`.
+    pub fn decls_bound_to_type(
+        &self,
+        type_id: &LuaTypeDeclId,
+    ) -> Option<&HashSet<LuaDeclId>> {
+        self.type_bound_decls.get(type_id)
+    }
+
+    fn bind_decl_to_type(&mut self, decl_id: LuaDeclId, type_id: LuaTypeDeclId) {
+        if self.decl_type_binds.get(&decl_id) == Some(&type_id) {
+            return;
+        }
+        self.unbind_decl(&decl_id);
+        self.decl_type_binds.insert(decl_id, type_id.clone());
+        self.type_bound_decls
+            .entry(type_id)
+            .or_default()
+            .insert(decl_id);
+    }
+
+    fn unbind_decl(&mut self, decl_id: &LuaDeclId) {
+        let Some(type_id) = self.decl_type_binds.remove(decl_id) else {
+            return;
+        };
+        if let Some(decls) = self.type_bound_decls.get_mut(&type_id) {
+            decls.remove(decl_id);
+            if decls.is_empty() {
+                self.type_bound_decls.remove(&type_id);
+            }
+        }
     }
 
     /// Rebuilds [`Self::sub_types`] from the live [`Self::supers`] edges.
@@ -1959,6 +2000,15 @@ impl LuaTypeIndex {
             .is_none_or(|existing| existing.as_type() != cache.as_type())
         {
             self.note_type_write(&owner);
+        }
+        match (&owner, cache.as_type()) {
+            (LuaTypeOwner::Decl(decl_id), LuaType::Ref(type_id) | LuaType::Def(type_id)) => {
+                self.bind_decl_to_type(*decl_id, type_id.clone());
+            }
+            (LuaTypeOwner::Decl(decl_id), _) => {
+                self.unbind_decl(decl_id);
+            }
+            _ => {}
         }
         let file_id = owner.get_file_id();
         self.cache_refs.add(file_id, cache.as_type());
@@ -2505,6 +2555,8 @@ impl LuaIndex for LuaTypeIndex {
         self.settled_read_dependents.clear();
         self.fact_metadata.clear();
         self.decl_write_claims.clear();
+        self.decl_type_binds.clear();
+        self.type_bound_decls.clear();
         self.type_write_versions.clear();
         self.definition_facts.clear();
         self.inference_events_by_file.clear();
@@ -2546,6 +2598,7 @@ impl LuaTypeIndex {
             for type_owner in type_owners {
                 if let LuaTypeOwner::Decl(decl_id) = &type_owner {
                     self.decl_write_claims.remove(decl_id);
+                    self.unbind_decl(decl_id);
                 }
                 if self.types.remove(&type_owner).is_some() {
                     self.note_type_write(&type_owner);
@@ -2939,6 +2992,8 @@ mod batch_removal_tests {
         assert_eq!(left.generic_params, right.generic_params);
         assert_eq!(left.supers, right.supers);
         assert_eq!(left.sub_types, right.sub_types);
+        assert_eq!(left.decl_type_binds, right.decl_type_binds);
+        assert_eq!(left.type_bound_decls, right.type_bound_decls);
         assert_eq!(type_cache_types(left), type_cache_types(right));
         assert_eq!(left.in_filed_type_owner, right.in_filed_type_owner);
         assert_eq!(left.fact_metadata, right.fact_metadata);
