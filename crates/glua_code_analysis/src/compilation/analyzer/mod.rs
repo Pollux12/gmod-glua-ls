@@ -592,7 +592,19 @@ fn requeue_force_finalized(db: &mut DbIndex, context: &mut AnalyzeContext) {
         }
         context.add_unresolve(unresolve, InferFailReason::None);
     }
-    context.infer_manager.clear();
+    // `clear` also drops unmaterialized pending template decls, and the
+    // pipeline below materializes those at entry, so the other files' pending
+    // decls must go here to match the blanket clear exactly.
+    let _ = context.infer_manager.drain_pending_str_tpl_type_decls();
+    // Only the files owning requeued items are attempted below, and each
+    // attempt reads its own file's cache, so only their caches can be stale.
+    // Moves within the run clear their file lazily via `pending_clears`.
+    let files = context
+        .unresolves
+        .iter()
+        .filter_map(|(unresolve, _)| unresolve.get_file_id())
+        .collect::<HashSet<_>>();
+    context.infer_manager.clear_files(&files);
     run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, context);
 }
 
