@@ -441,17 +441,19 @@ fn get_type_at_flow_walk(
                 return get_var_ref_type(db, cache, var_ref_id);
             }
             FlowNodeKind::ClosureEntry(_) => {
+                // Route through the modal entry so the top-level baseline walk
+                // holds `baseline_flow_depth` and its memo survives the nested
+                // merges below. Calling the walk directly leaves depth at zero,
+                // so each nested merge clears the memo on exit and every merge
+                // point is re-derived once per path into it.
                 let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-                return get_type_at_flow_walk(
+                return get_type_at_flow_in_mode(
                     db,
                     tree,
                     cache,
                     root,
                     var_ref_id,
-                    cache_key,
-                    query_realm,
                     antecedent_flow_id,
-                    visited_flow_ids,
                     policy.with_mode(FlowWalkMode::ClosureBaseline),
                 );
             }
@@ -4164,5 +4166,67 @@ mod tests {
                 .get_flow_cache_with_origin(&var_ref_id, FlowId(1), query_realm, FlowOrigin::Real,),
             Some(CacheEntry::Cache(narrow_type)) if **narrow_type == LuaType::String
         ));
+    }
+
+    /// C3-remnant guard: the `ClosureEntry` arm must route through
+    /// `get_type_at_flow_in_mode` so the top-level baseline walk holds
+    /// `baseline_flow_depth` and its memo survives the nested merges below.
+    /// Counted, not timed: per-path re-derivation is exponential in the branch
+    /// count while memoised is linear.
+    #[test]
+    fn closure_entry_baseline_memo_survives_nested_merges() {
+        fn walks_and_result_for_merges(count: usize) -> (u64, String) {
+            let mut body = String::from("local value = 1\n");
+            for i in 0..count {
+                body.push_str(&format!(
+                    "if cond{i} then value = {i} else value = {} end\n",
+                    i + 100
+                ));
+            }
+            body.push_str("local read = function() return value end\nresult = value\n");
+
+            crate::semantic::BASELINE_FLOW_WALKS.with(|walks| walks.set(0));
+            let mut ws = crate::VirtualWorkspace::new();
+            ws.def(&body);
+            let walks = crate::semantic::BASELINE_FLOW_WALKS.with(|walks| walks.get());
+            let result_type = ws.expr_ty("result");
+            (walks, ws.humanize_type(result_type))
+        }
+
+        let (small_walks, small_ty) = walks_and_result_for_merges(6);
+        let (large_walks, large_ty) = walks_and_result_for_merges(12);
+
+        assert!(
+            small_walks > 0,
+            "no closure-baseline walk ran; the guard is vacuous"
+        );
+        assert_eq!(
+            small_ty, large_ty,
+            "baseline memo changed narrowing: 6 merges gave `{small_ty}`, 12 gave `{large_ty}`"
+        );
+        assert!(
+            !small_ty.contains("unknown"),
+            "closure-baseline narrowing erased to `{small_ty}`"
+        );
+        // Routing through the modal entry holds the memo across the nested
+        // merges of one baseline walk (6 merges: 31 walks, 12 merges: 61).
+        // Bypassing it clears the memo after each nested merge (55/115).
+        // Counts are deterministic, so the bound sits between the two with
+        // headroom for unrelated drift rather than at the exponential edge.
+        assert!(
+            small_walks <= 45,
+            "closure-baseline walks for 6 merges grew to {small_walks} (expected <= 45); \
+             the memo is cleared by nested merges"
+        );
+        assert!(
+            large_walks <= 90,
+            "closure-baseline walks for 12 merges grew to {large_walks} (expected <= 90); \
+             the memo is cleared by nested merges"
+        );
+        assert!(
+            large_walks <= small_walks * 4,
+            "closure-baseline walks grew from {small_walks} to {large_walks} when the branch \
+             count doubled; merge points are being re-derived once per path"
+        );
     }
 }
