@@ -13,7 +13,7 @@ mod types;
 
 use super::traits::LuaIndex;
 use crate::{
-    DbIndex, FileId, InFiled, LuaDeclId, LuaMemberOwner, LuaSignatureId,
+    DbIndex, FileId, InFiled, LuaDeclId, LuaMemberKey, LuaMemberOwner, LuaSignatureId,
     db_index::r#type::type_decl::LuaTypeIdentifier,
 };
 pub use generic_param::GenericParam;
@@ -1206,6 +1206,29 @@ fn sort_type_decls_for_sub_types(sub_types: &mut Vec<&LuaTypeDecl>) {
     });
 }
 
+/// Direct subtype members by base class, as derived by the unguarded-child
+/// pass: base class id → member key → ids of the direct subclasses carrying
+/// that member. Cached on [`LuaTypeIndex`] instead of rebuilt per pass.
+pub(crate) type DirectSubtypeMembers =
+    HashMap<LuaTypeDeclId, HashMap<LuaMemberKey, Vec<LuaTypeDeclId>>>;
+
+/// What [`LuaTypeIndex::cached_direct_subtype_members`] was derived from.
+///
+/// `super_revision` is exact: every super-type write bumps it. `member_revision`
+/// tracks member re-homing, rekeys and removals, while `member_file_counts`
+/// catches the pure first filings those leave alone. Dynamic fields feed the
+/// map too and carry no revision of their own, so their per-owner field names
+/// fold into an order-independent 64-bit fingerprint instead. A fingerprint
+/// collision could reuse a stale map, so this stays a miss-biased heuristic
+/// key rather than proof; a future dynamic-field revision can replace it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirectSubtypeMembersKey {
+    pub(crate) super_revision: u64,
+    pub(crate) member_revision: u64,
+    pub(crate) member_file_counts: Vec<(FileId, usize)>,
+    pub(crate) dynamic_fields_fingerprint: u64,
+}
+
 fn collect_type_cache_refs(typ: &LuaType) -> HashSet<TypeCacheRef> {
     let mut refs = HashSet::default();
     typ.visit_type_identities(&mut |inner| {
@@ -1253,6 +1276,12 @@ pub struct LuaTypeIndex {
     /// type-cache write and file removal alongside the caches themselves.
     decl_type_binds: HashMap<LuaDeclId, LuaTypeDeclId>,
     type_bound_decls: HashMap<LuaTypeDeclId, HashSet<LuaDeclId>>,
+    /// Counts super-type writes. Together with the member and dynamic-field
+    /// state captured in [`DirectSubtypeMembersKey`] it decides whether the
+    /// cached [`DirectSubtypeMembers`] is still fresh.
+    super_write_revision: u64,
+    cached_direct_subtype_members:
+        Option<(DirectSubtypeMembersKey, Arc<DirectSubtypeMembers>)>,
     types: HashMap<LuaTypeOwner, LuaTypeCache>,
     cache_refs: TypeCacheRefIndex,
     in_filed_type_owner: HashMap<FileId, HashSet<LuaTypeOwner>>,
@@ -1292,6 +1321,8 @@ impl LuaTypeIndex {
             sub_types: HashMap::default(),
             decl_type_binds: HashMap::default(),
             type_bound_decls: HashMap::default(),
+            super_write_revision: 0,
+            cached_direct_subtype_members: None,
             types: HashMap::default(),
             cache_refs: TypeCacheRefIndex::default(),
             in_filed_type_owner: HashMap::default(),
@@ -1489,6 +1520,7 @@ impl LuaTypeIndex {
                 children.push(decl_id);
             }
         }
+        self.bump_super_write_revision();
     }
 
     fn has_super_type_at_source(
@@ -1607,6 +1639,33 @@ impl LuaTypeIndex {
             children.sort_by(LuaTypeDeclId::stable_cmp);
         }
         self.sub_types = sub_types;
+    }
+
+    /// Counts the super-type writes so far. Compare it across an operation to
+    /// learn whether the inheritance edges moved.
+    pub(crate) fn super_write_revision(&self) -> u64 {
+        self.super_write_revision
+    }
+
+    fn bump_super_write_revision(&mut self) {
+        self.super_write_revision = self.super_write_revision.wrapping_add(1);
+        self.cached_direct_subtype_members = None;
+    }
+
+    pub(crate) fn direct_subtype_members_cache(
+        &self,
+    ) -> Option<(&DirectSubtypeMembersKey, &Arc<DirectSubtypeMembers>)> {
+        self.cached_direct_subtype_members
+            .as_ref()
+            .map(|(key, map)| (key, map))
+    }
+
+    pub(crate) fn store_direct_subtype_members(
+        &mut self,
+        key: DirectSubtypeMembersKey,
+        map: Arc<DirectSubtypeMembers>,
+    ) {
+        self.cached_direct_subtype_members = Some((key, map));
     }
 
     /// Get all direct subclasses of a given type
@@ -2525,11 +2584,17 @@ impl LuaIndex for LuaTypeIndex {
                 self.remove_file_raw(file_id);
             }
         }
+        let super_edges_before: usize = self.supers.values().map(Vec::len).sum();
         self.supers.retain(|_, supers| {
             supers.retain(|super_type| !changed_files.contains(&super_type.file_id));
             !supers.is_empty()
         });
         self.rebuild_sub_type_index();
+        if self.supers.values().map(Vec::len).sum::<usize>() != super_edges_before {
+            // Pruning dropped an edge the cached map may have been derived
+            // from; the next read rebuilds it lazily.
+            self.bump_super_write_revision();
+        }
 
         self.definition_facts
             .retain(|definition, _| !changed_files.contains(&definition.file_id()));
@@ -2548,6 +2613,8 @@ impl LuaIndex for LuaTypeIndex {
         self.generic_params.clear();
         self.supers.clear();
         self.sub_types.clear();
+        self.super_write_revision = 0;
+        self.cached_direct_subtype_members = None;
         self.types.clear();
         self.cache_refs = TypeCacheRefIndex::default();
         self.in_filed_type_owner.clear();
@@ -2839,6 +2906,49 @@ mod super_type_tests {
         assert_eq!(names, vec!["Apple"]);
         assert_eq!(index.get_all_sub_types(&parent_id).len(), 1);
     }
+
+    /// Super-type writes bump the revision the subtype-member cache keys on,
+    /// and pruning edges drops a cached map so the next read rebuilds it.
+    #[test]
+    fn super_type_writes_bump_the_subtype_cache_revision() {
+        let mut index = LuaTypeIndex::new();
+        assert_eq!(index.super_write_revision(), 0);
+
+        let child_id = LuaTypeDeclId::global("Child");
+        let parent_type = LuaType::Ref(LuaTypeDeclId::global("Parent"));
+        let edge_file = FileId::new(1);
+        let range = TextRange::new(10.into(), 20.into());
+        index.add_super_type(child_id, edge_file, range, parent_type.clone());
+        assert_eq!(index.super_write_revision(), 1);
+
+        // Re-adding the identical edge is a no-op write: no bump.
+        index.add_super_type_if_missing(
+            LuaTypeDeclId::global("Child"),
+            edge_file,
+            range,
+            parent_type,
+        );
+        assert_eq!(index.super_write_revision(), 1);
+
+        let key = DirectSubtypeMembersKey {
+            super_revision: index.super_write_revision(),
+            member_revision: 0,
+            member_file_counts: Vec::new(),
+            dynamic_fields_fingerprint: 0,
+        };
+        index.store_direct_subtype_members(key, Arc::new(DirectSubtypeMembers::default()));
+        assert!(index.direct_subtype_members_cache().is_some());
+
+        // Removing an unrelated file prunes no edge: revision and cache stay.
+        index.remove_files(&[FileId::new(9)]);
+        assert_eq!(index.super_write_revision(), 1);
+        assert!(index.direct_subtype_members_cache().is_some());
+
+        // Removing the edge file prunes the edge: revision bumps, cache drops.
+        index.remove_files(&[edge_file]);
+        assert_eq!(index.super_write_revision(), 2);
+        assert!(index.direct_subtype_members_cache().is_none());
+    }
 }
 
 #[cfg(test)]
@@ -2994,6 +3104,11 @@ mod batch_removal_tests {
         assert_eq!(left.sub_types, right.sub_types);
         assert_eq!(left.decl_type_binds, right.decl_type_binds);
         assert_eq!(left.type_bound_decls, right.type_bound_decls);
+        assert_eq!(left.super_write_revision, right.super_write_revision);
+        assert_eq!(
+            left.cached_direct_subtype_members,
+            right.cached_direct_subtype_members
+        );
         assert_eq!(type_cache_types(left), type_cache_types(right));
         assert_eq!(left.in_filed_type_owner, right.in_filed_type_owner);
         assert_eq!(left.fact_metadata, right.fact_metadata);
