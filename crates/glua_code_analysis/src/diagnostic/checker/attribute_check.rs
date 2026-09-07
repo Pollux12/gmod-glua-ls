@@ -4,9 +4,7 @@ use crate::{
     DiagnosticCode, DocTypeInferContext, LuaType, SemanticModel, TypeCheckFailReason,
     TypeCheckResult, diagnostic::checker::humanize_lint_type, infer_doc_type,
 };
-use glua_parser::{
-    LuaAstNode, LuaDocAttributeUse, LuaDocTagAttributeUse, LuaDocType, LuaExpr, LuaLiteralExpr,
-};
+use glua_parser::{LuaAstNode, LuaDocAttributeUse, LuaDocType, LuaExpr, LuaLiteralExpr};
 use rowan::TextRange;
 
 use super::{Checker, DiagnosticContext};
@@ -21,8 +19,10 @@ impl Checker for AttributeCheckChecker {
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-        for tag_use in root.descendants::<LuaDocTagAttributeUse>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for tag_use in buckets.doc_tag_attribute_uses.iter() {
             for attribute_use in tag_use.get_attribute_uses() {
                 check_attribute_use(context, semantic_model, &attribute_use);
             }

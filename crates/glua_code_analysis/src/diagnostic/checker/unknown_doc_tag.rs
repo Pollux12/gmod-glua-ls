@@ -28,9 +28,11 @@ impl Checker for UnknownDocTag {
             known_tags.insert("realm");
         }
 
-        let root = semantic_model.get_root().clone();
-        for tag_other in root.descendants::<LuaDocTagOther>() {
-            check_tag(context, &tag_other, &known_tags);
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for tag_other in buckets.doc_tag_others.iter() {
+            check_tag(context, tag_other, &known_tags);
         }
     }
 }

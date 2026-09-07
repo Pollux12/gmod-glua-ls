@@ -28,7 +28,10 @@ impl Checker for AssignTypeMismatchChecker {
         let root = semantic_model.get_root().clone();
         let assignment_prefixes = context.get_assignment_prefix_events(&root);
 
-        for node in root.descendants::<LuaAst>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for node in buckets.all_nodes.iter().cloned() {
             match node {
                 LuaAst::LuaAssignStat(assign) => {
                     check_assign_stat(context, semantic_model, &assign, &assignment_prefixes);

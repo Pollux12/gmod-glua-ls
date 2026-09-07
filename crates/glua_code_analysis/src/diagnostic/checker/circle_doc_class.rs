@@ -14,13 +14,15 @@ impl Checker for CircleDocClassChecker {
 
     /// 检查循环继承的类
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
 
-        for expr in root.descendants::<LuaDocTagClass>() {
+        for expr in buckets.doc_tag_classes.iter() {
             if context.is_cancelled() {
                 return;
             }
-            check_doc_tag_class(context, semantic_model, &expr);
+            check_doc_tag_class(context, semantic_model, expr);
         }
     }
 }

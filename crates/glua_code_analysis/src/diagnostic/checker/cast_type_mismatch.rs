@@ -16,7 +16,10 @@ impl Checker for CastTypeMismatchChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::CastTypeMismatch];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        for node in semantic_model.get_root().descendants::<LuaAst>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for node in buckets.all_nodes.iter().cloned() {
             if let LuaAst::LuaDocTagCast(cast_tag) = node {
                 check_cast_tag(context, semantic_model, &cast_tag);
             }

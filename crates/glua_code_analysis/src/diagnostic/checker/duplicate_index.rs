@@ -1,6 +1,6 @@
 use rustc_hash::FxHashMap;
 
-use glua_parser::{LuaAstNode, LuaIndexKey, LuaTableExpr};
+use glua_parser::{LuaIndexKey, LuaTableExpr};
 
 use crate::{DiagnosticCode, SemanticModel};
 
@@ -12,8 +12,10 @@ impl Checker for DuplicateIndexChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::DuplicateIndex];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-        for table in root.descendants::<LuaTableExpr>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for table in buckets.table_exprs.iter().cloned() {
             if context.is_cancelled() {
                 return;
             }

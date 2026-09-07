@@ -37,10 +37,7 @@ pub(crate) fn resolve_signature_with_index(
     if call_expr.get_args_list().is_none() {
         return Err(InferFailReason::None);
     }
-    let expr_types = infer_call_arg_expr_list_types(db, cache, call_expr.clone(), arg_count)
-        .into_iter()
-        .map(|(typ, _)| typ)
-        .collect::<Vec<_>>();
+    let expr_types = infer_call_arg_expr_list_types(db, cache, call_expr.clone(), arg_count);
     let candidates = if is_generic {
         instantiate_signatures(db, cache, overloads, call_expr.clone())?
     } else {

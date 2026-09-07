@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use rowan::TextRange;
+
 use crate::{
     InferFailReason, check_type_compact,
     db_index::{DbIndex, LuaFunctionType, LuaType},
@@ -9,7 +11,7 @@ use crate::{
 pub fn resolve_signature_by_args(
     db: &DbIndex,
     overloads: &[Arc<LuaFunctionType>],
-    expr_types: &[LuaType],
+    expr_types: &[(LuaType, TextRange)],
     is_colon_call: bool,
     arg_count: Option<usize>,
 ) -> InferCallFuncResult {
@@ -36,7 +38,7 @@ pub fn resolve_signature_by_args(
     let mut best_match_result = need_resolve_funcs[0]
         .clone()
         .expect("Match result should exist");
-    for (arg_index, expr_type) in expr_types.iter().enumerate() {
+    for (arg_index, (expr_type, _)) in expr_types.iter().enumerate() {
         let mut current_match_result = ParamMatchResult::Not;
         let mut skipped_implicit_self = false;
         for opt_func in &mut need_resolve_funcs {

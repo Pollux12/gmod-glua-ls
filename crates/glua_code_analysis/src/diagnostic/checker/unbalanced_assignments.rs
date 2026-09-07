@@ -10,8 +10,10 @@ impl Checker for UnbalancedAssignmentsChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::UnbalancedAssignments];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-        for stat in root.descendants::<LuaStat>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for stat in buckets.statements.iter().cloned() {
             match stat {
                 LuaStat::LocalStat(local) => {
                     check_local_stat(context, semantic_model, &local);

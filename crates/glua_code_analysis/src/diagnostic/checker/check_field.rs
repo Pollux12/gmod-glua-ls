@@ -38,16 +38,19 @@ impl Checker for CheckFieldChecker {
         let root = semantic_model.get_root().clone();
         let mut checked_index_expr = HashSet::default();
         let assignment_prefixes = context.get_assignment_prefix_events(&root);
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
         let initialized_assignment_accesses =
             if has_reusable_table_literal_assignment(&assignment_prefixes) {
-                collect_initialized_assignment_accesses(&root, &assignment_prefixes)
+                collect_initialized_assignment_accesses(&buckets.assign_stats, &assignment_prefixes)
             } else {
                 HashSet::default()
             };
         let mut state = CheckFieldState::default();
         let profile_enabled = log::log_enabled!(log::Level::Info);
         let mut profile = profile_enabled.then(CheckFieldProfile::default);
-        for node in root.descendants::<LuaAst>() {
+        for node in buckets.all_nodes.iter().cloned() {
             if context.is_cancelled() {
                 return;
             }
@@ -185,11 +188,11 @@ fn has_reusable_table_literal_assignment(assignment_prefixes: &AssignmentPrefixE
 }
 
 fn collect_initialized_assignment_accesses(
-    root: &glua_parser::LuaChunk,
+    assign_stats: &[LuaAssignStat],
     assignment_prefixes: &AssignmentPrefixEvents,
 ) -> HashSet<LuaSyntaxNode> {
     let mut initialized_accesses = HashSet::default();
-    for assign in root.descendants::<LuaAssignStat>() {
+    for assign in assign_stats {
         let (vars, _) = assign.get_var_and_expr_list();
         for var in vars {
             let LuaVarExpr::IndexExpr(index_expr) = var else {

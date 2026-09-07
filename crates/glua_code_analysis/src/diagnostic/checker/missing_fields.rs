@@ -20,14 +20,15 @@ impl Checker for MissingFieldsChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::MissingFields];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-
         let mut type_cache: HashMap<LuaType, Arc<HashSet<String>>> = HashMap::default();
-        for expr in root.descendants::<LuaTableExpr>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for expr in buckets.table_exprs.iter() {
             if context.is_cancelled() {
                 return;
             }
-            check_table_expr(context, semantic_model, &expr, &mut type_cache);
+            check_table_expr(context, semantic_model, expr, &mut type_cache);
         }
     }
 }

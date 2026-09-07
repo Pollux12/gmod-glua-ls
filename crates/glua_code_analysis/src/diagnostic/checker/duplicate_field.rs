@@ -1,7 +1,7 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use glua_parser::{
-    LuaAstNode, LuaDocTagClass, LuaDocTagField, LuaIndexExpr, LuaStat, LuaSyntaxKind, LuaSyntaxNode,
+    LuaAstNode, LuaDocTagField, LuaIndexExpr, LuaStat, LuaSyntaxKind, LuaSyntaxNode,
 };
 
 use crate::{
@@ -39,7 +39,7 @@ struct DeclInfo {
 }
 
 fn get_decl_set(
-    context: &DiagnosticContext,
+    context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
 ) -> Option<HashSet<DeclInfo>> {
     let file_id = semantic_model.get_file_id();
@@ -77,8 +77,10 @@ fn get_decl_set(
         }
     }
 
-    let root = semantic_model.get_root();
-    for tag_class in root.descendants::<LuaDocTagClass>() {
+    let Some(buckets) = context.file_buckets() else {
+        return Some(type_decl_id_set);
+    };
+    for tag_class in buckets.doc_tag_classes.iter() {
         if context.is_cancelled() {
             return Some(type_decl_id_set);
         }

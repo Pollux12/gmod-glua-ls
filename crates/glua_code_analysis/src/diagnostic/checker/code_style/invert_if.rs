@@ -12,10 +12,12 @@ pub struct InvertIfChecker;
 impl Checker for InvertIfChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::InvertIf];
 
-    fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-        for if_statement in root.descendants::<LuaIfStat>() {
-            check_early_return_pattern(context, &if_statement);
+    fn check(context: &mut DiagnosticContext, _semantic_model: &SemanticModel) {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for if_statement in buckets.if_stats.iter() {
+            check_early_return_pattern(context, if_statement);
         }
     }
 }
