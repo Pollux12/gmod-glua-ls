@@ -180,6 +180,7 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
                     &mut force_finalized,
                     &mut provisional,
                     &mut late_resolved_decls,
+                    None,
                 )
             });
             if let Some(resolve_start) = resolve_start {
@@ -327,6 +328,67 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
     }
 }
 
+/// What a fixpoint attempt actually consulted, with the write epochs taken
+/// just after it ran. Recording the epochs after the attempt keeps the item's
+/// own writes from marking it stale: only a *later* write to something it read
+/// requeues it.
+#[derive(Debug, Clone)]
+struct FixpointReadRecord {
+    reads: crate::db_index::read_set::InferenceReadSet,
+    type_epoch: u64,
+    return_epoch: u64,
+}
+
+/// Whether the item's last derivation could answer differently now: something
+/// it read has since been written, or a member slot it missed has since been
+/// filled. Mirrors `AnalyzeContext::inferred_return_reads_are_stale`, which is
+/// the same staleness rule the settled return re-derivation already trusts.
+fn fixpoint_reads_are_stale(db: &DbIndex, record: &FixpointReadRecord) -> bool {
+    record
+        .reads
+        .type_owners
+        .iter()
+        .any(|owner| db.get_type_index().type_write_version(owner) > record.type_epoch)
+        || record.reads.signatures.iter().any(|dependency| {
+            db.get_signature_index().return_write_version(dependency) > record.return_epoch
+        })
+        || record
+            .reads
+            .missing_member_slots
+            .iter()
+            .any(|(owner, key)| {
+                !db.get_member_index()
+                    .get_members_for_owner_key(owner, key)
+                    .is_empty()
+                    || matches!(key, crate::LuaMemberKey::Name(name)
+                    if crate::dynamic_field_owner_of(db, owner).is_some_and(
+                        |dynamic_owner| {
+                            !db
+                                .get_dynamic_field_index()
+                                .field_definitions(&dynamic_owner, name.as_str())
+                                .is_empty()
+                        },
+                    ))
+            })
+}
+
+/// Whether settling this item can move index state outside the type/return
+/// write epochs (signature params, un-noted doc returns, module exports,
+/// call-site contributions), which the read-set filter cannot see. A round
+/// that settled any of these requeues everything next round; the `other_epoch`
+/// counter in `try_resolve` names the same family for the reach memo.
+fn fixpoint_settled_moves_unversioned_state(unresolve: &UnResolve) -> bool {
+    matches!(
+        unresolve,
+        UnResolve::ClosureParams(_)
+            | UnResolve::ClosureParentParams(_)
+            | UnResolve::ClosureReturn(_)
+            | UnResolve::Module(_)
+            | UnResolve::SpecialCall(_)
+            | UnResolve::CallSiteContribution(_)
+    )
+}
+
 /// Re-derives what settled against a floor until nothing moves.
 ///
 /// An item that resolved once the wave had begun flooring read placeholders
@@ -346,19 +408,40 @@ pub(super) fn settle_floored_fixpoint(
     let profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
     let mut round = 0usize;
     let mut fuse = super::common::FixpointFuse::new("settle_floored_fixpoint");
-    while !force_finalized.is_empty() {
+    let mut read_records: FxHashMap<UnResolveIdentity, FixpointReadRecord> = FxHashMap::default();
+    // Settled items whose reads proved unaffected by the last round's writes.
+    // They rejoin the candidate pool every round: a later round can still move
+    // something they read, and per-item epochs keep that check exact no matter
+    // how long an item has been parked.
+    let mut parked: Vec<UnResolve> = Vec::new();
+    while !force_finalized.is_empty() || !parked.is_empty() {
         if fuse.trip() {
             force_finalized.clear();
+            parked.clear();
             break;
         }
         let writes_before =
             db.get_type_index().type_writes() + db.get_signature_index().return_writes();
+        // A round that settled unversioned state cannot filter the next one.
+        let full_requeue = force_finalized
+            .iter()
+            .any(fixpoint_settled_moves_unversioned_state);
+        let mut pool = std::mem::take(&mut parked);
+        pool.append(force_finalized);
         // A return is re-derived from an unresolved status so the apply rule
         // lets a settled answer move; what it held is kept, because a
         // re-derivation that fails (a self-recursive body reads its own
         // return) must leave the answer in place rather than nothing.
         let mut held_returns = Vec::new();
-        for unresolve in force_finalized.drain(..) {
+        for unresolve in pool {
+            let stale = full_requeue
+                || read_records
+                    .get(&unresolve_identity(&unresolve))
+                    .is_none_or(|record| fixpoint_reads_are_stale(db, record));
+            if !stale {
+                parked.push(unresolve);
+                continue;
+            }
             if let UnResolve::Return(return_) = &unresolve
                 && let Some(signature) = db.get_signature_index_mut().get_mut(&return_.signature_id)
                 && signature.resolve_return == crate::SignatureReturnStatus::InferResolve
@@ -371,6 +454,14 @@ pub(super) fn settle_floored_fixpoint(
                 .or_default()
                 .push(unresolve);
         }
+        if reason_resolve.values().all(Vec::is_empty) {
+            // Nothing the last round moved is read by anything waiting: the
+            // fixpoint is reached without another attempt. Parked items are
+            // settled values, so dropping them here answers nothing differently
+            // than attempting and moving nothing would have.
+            parked.clear();
+            break;
+        }
         infer_manager.clear();
         let attempted: usize = reason_resolve.values().map(Vec::len).sum();
         try_resolve(
@@ -382,6 +473,7 @@ pub(super) fn settle_floored_fixpoint(
             force_finalized,
             provisional,
             late_resolved_decls,
+            Some(&mut read_records),
         );
         for (signature_id, return_docs) in held_returns {
             if let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id)
@@ -402,6 +494,7 @@ pub(super) fn settle_floored_fixpoint(
         }
         if moved == 0 {
             force_finalized.clear();
+            parked.clear();
         }
     }
 }
@@ -459,6 +552,7 @@ fn requeue_flushed_call_site_returns(
         &mut context.force_finalized,
         &mut Vec::new(),
         &mut context.late_resolved_decls,
+        None,
     );
     materialize_pending_str_tpl_type_decls(db, infer_manager);
 
@@ -563,6 +657,7 @@ fn try_resolve(
     force_finalized: &mut Vec<UnResolve>,
     provisional: &mut Vec<UnResolve>,
     late_resolved_decls: &mut rustc_hash::FxHashSet<crate::LuaTypeOwner>,
+    mut fixpoint_reads: Option<&mut FxHashMap<UnResolveIdentity, FixpointReadRecord>>,
 ) -> Option<TryResolveProfile> {
     let mut profile = profile_enabled.then(TryResolveProfile::default);
     let mut cached_sorted_keys: Option<Vec<InferFailReason>> = None;
@@ -656,7 +751,26 @@ fn try_resolve(
                 let was_undetermined = narrowing_root
                     .as_ref()
                     .is_none_or(|root| root_type_is_undetermined(db, root));
-                let resolve_result = attempt_resolve(db, infer_manager, file_id, &mut unresolve);
+                // In the fixpoint the attempt runs under the read-set recorder
+                // so the next round can skip items nothing written since has
+                // touched. The recorder nests with the return derivation's own
+                // arming rather than clobbering it.
+                let resolve_result = if let Some(records) = fixpoint_reads.as_mut() {
+                    crate::db_index::read_set::arm();
+                    let result = attempt_resolve(db, infer_manager, file_id, &mut unresolve);
+                    let reads = crate::db_index::read_set::disarm();
+                    records.insert(
+                        unresolve_identity(&unresolve),
+                        FixpointReadRecord {
+                            reads,
+                            type_epoch: db.get_type_index().type_writes(),
+                            return_epoch: db.get_signature_index().return_writes(),
+                        },
+                    );
+                    result
+                } else {
+                    attempt_resolve(db, infer_manager, file_id, &mut unresolve)
+                };
                 // A resolution that moved a type invalidates every inference
                 // memoised against the old one. The end-of-wave purge is too
                 // late for the items still to be drained here: they would read
