@@ -2133,13 +2133,14 @@ fn resolve_helper_start_message(
     site: &NetWalkSite,
     call_expr: &LuaCallExpr,
 ) -> Option<String> {
-    resolve_helper_start_message_recursive(
+    let (answer, _) = resolve_helper_start_message_recursive(
         ctx,
         site,
         call_expr,
         &HashMap::default(),
-        &mut HashSet::default(),
-    )
+        &mut Vec::new(),
+    );
+    answer
 }
 
 fn resolve_helper_start_message_recursive(
@@ -2147,20 +2148,31 @@ fn resolve_helper_start_message_recursive(
     caller_site: &NetWalkSite,
     helper_call: &LuaCallExpr,
     caller_bindings: &HashMap<String, String>,
-    visited: &mut HashSet<HelperId>,
-) -> Option<String> {
-    let (helper_key, helper_block, helper_root, helper_file_id) =
-        resolve_call_to_function_block_cached(ctx, caller_site, helper_call)?;
-    if !visited.insert((helper_file_id, helper_key)) {
-        return None;
-    }
-
+    stack: &mut Vec<HelperId>,
+) -> (Option<String>, usize) {
+    let Some((helper_key, helper_block, helper_root, helper_file_id)) =
+        resolve_call_to_function_block_cached(ctx, caller_site, helper_call)
+    else {
+        return (None, NO_CYCLE);
+    };
+    let helper_id = (helper_file_id, helper_key);
     let bindings = helper_call_string_bindings(helper_call, &helper_block, caller_bindings);
+    let cache_key = (helper_id, sorted_helper_bindings(&bindings));
+    if let Some(cached) = ctx.reach.get_start_message(&cache_key) {
+        return (cached, NO_CYCLE);
+    }
+    if let Some(open_depth) = stack.iter().position(|open| *open == cache_key.0) {
+        return (None, open_depth);
+    }
+    let depth = stack.len();
+    stack.push(cache_key.0);
+
     let helper_site = NetWalkSite {
         root: helper_root,
         file_id: helper_file_id,
     };
     let mut messages = Vec::new();
+    let mut low = NO_CYCLE;
     for nested_call in helper_block
         .syntax()
         .descendants()
@@ -2181,25 +2193,38 @@ fn resolve_helper_start_message_recursive(
             }
             Some(_) => {}
             None => {
-                if let Some(message) = resolve_helper_start_message_recursive(
+                let (nested_message, nested_low) = resolve_helper_start_message_recursive(
                     ctx,
                     &helper_site,
                     &nested_call,
                     &bindings,
-                    visited,
-                ) {
+                    stack,
+                );
+                low = low.min(nested_low);
+                if let Some(message) = nested_message {
                     messages.push(message);
                 }
             }
         }
     }
 
-    visited.remove(&(helper_file_id, helper_key));
+    stack.pop();
     let mut messages = messages.into_iter();
-    let message = messages.next()?;
-    messages
-        .all(|candidate| candidate == message)
-        .then_some(message)
+    let answer = match messages.next() {
+        Some(message) => messages
+            .all(|candidate| candidate == message)
+            .then_some(message),
+        None => None,
+    };
+    // Consensus over a pruned branch set is unsound: a cycle-hidden call may
+    // disagree with the visible ones, turning this `Some` into `None` once
+    // the open helper resolves. Cache only answers that assumed nothing
+    // about a still-open helper.
+    if low >= depth {
+        ctx.reach.insert_start_message(cache_key, answer.clone());
+        return (answer, NO_CYCLE);
+    }
+    (answer, low)
 }
 
 fn resolve_helper_send(
@@ -2207,26 +2232,37 @@ fn resolve_helper_send(
     site: &NetWalkSite,
     call_expr: &LuaCallExpr,
 ) -> Option<(NetSendKind, Option<String>)> {
-    resolve_helper_send_recursive(ctx, site, call_expr, &mut HashSet::default())
+    let (answer, _) = resolve_helper_send_recursive(ctx, site, call_expr, &mut Vec::new());
+    answer
 }
 
 fn resolve_helper_send_recursive(
     ctx: &mut NetCollectCtx<'_>,
     caller_site: &NetWalkSite,
     helper_call: &LuaCallExpr,
-    visited: &mut HashSet<HelperId>,
-) -> Option<(NetSendKind, Option<String>)> {
-    let (helper_key, helper_block, helper_root, helper_file_id) =
-        resolve_call_to_function_block_cached(ctx, caller_site, helper_call)?;
-    if !visited.insert((helper_file_id, helper_key)) {
-        return None;
+    stack: &mut Vec<HelperId>,
+) -> (Option<HelperSendAnswer>, usize) {
+    let Some((helper_key, helper_block, helper_root, helper_file_id)) =
+        resolve_call_to_function_block_cached(ctx, caller_site, helper_call)
+    else {
+        return (None, NO_CYCLE);
+    };
+    let helper_id = (helper_file_id, helper_key);
+    if let Some(cached) = ctx.reach.get_send(&helper_id) {
+        return (cached, NO_CYCLE);
     }
+    if let Some(open_depth) = stack.iter().position(|open| *open == helper_id) {
+        return (None, open_depth);
+    }
+    let depth = stack.len();
+    stack.push(helper_id);
 
     let helper_site = NetWalkSite {
         root: helper_root,
         file_id: helper_file_id,
     };
     let mut sends = Vec::new();
+    let mut low = NO_CYCLE;
     for nested_call in helper_block
         .syntax()
         .descendants()
@@ -2241,19 +2277,29 @@ fn resolve_helper_send_recursive(
             }
             Some(_) => {}
             None => {
-                if let Some(send) =
-                    resolve_helper_send_recursive(ctx, &helper_site, &nested_call, visited)
-                {
+                let (nested_send, nested_low) =
+                    resolve_helper_send_recursive(ctx, &helper_site, &nested_call, stack);
+                low = low.min(nested_low);
+                if let Some(send) = nested_send {
                     sends.push(send);
                 }
             }
         }
     }
 
-    visited.remove(&(helper_file_id, helper_key));
+    let helper_id = stack.pop().expect("helper stack underflow");
     let mut sends = sends.into_iter();
-    let send = sends.next()?;
-    sends.all(|candidate| candidate.0 == send.0).then_some(send)
+    let answer = match sends.next() {
+        Some(send) => sends.all(|candidate| candidate.0 == send.0).then_some(send),
+        None => None,
+    };
+    // Same cycle rule as the start-message memo: a pruned branch may hide a
+    // conflicting send kind, so only cycle-free answers are cached.
+    if low >= depth {
+        ctx.reach.insert_send(helper_id, answer.clone());
+        return (answer, NO_CYCLE);
+    }
+    (answer, low)
 }
 
 fn collect_wrapped_net_send_flows(
@@ -3081,7 +3127,25 @@ enum NetReachKind {
 struct HelperStartReachCache {
     start: [Mutex<FxHashMap<HelperId, bool>>; HELPER_REACH_SHARDS],
     receive: [Mutex<FxHashMap<HelperId, bool>>; HELPER_REACH_SHARDS],
+    /// N1: consensus `net.Start` message per helper. The answer depends on
+    /// the caller's literal bindings (`net.Start(msg)` becomes concrete only
+    /// through them), so the key carries the effective bindings sorted by
+    /// parameter name. Helpers reached with different literals give different
+    /// answers and must not share an entry.
+    start_message: [Mutex<FxHashMap<HelperStartMessageKey, Option<String>>>; HELPER_REACH_SHARDS],
+    /// N1: consensus send terminator per helper. Send targets are read from
+    /// the helper body's own source text, so the answer is independent of
+    /// caller bindings and keyed by helper alone.
+    send: [Mutex<FxHashMap<HelperId, Option<HelperSendAnswer>>>; HELPER_REACH_SHARDS],
 }
+
+/// Memo key for [`HelperStartReachCache::start_message`]: the helper plus its
+/// effective string bindings sorted by parameter name, so equal bindings hash
+/// equally regardless of `HashMap` iteration order.
+type HelperStartMessageKey = (HelperId, Vec<(String, String)>);
+
+/// Cached answer of [`resolve_helper_send_recursive`].
+type HelperSendAnswer = (NetSendKind, Option<String>);
 
 impl HelperStartReachCache {
     fn shard(&self, kind: NetReachKind, helper: &HelperId) -> &Mutex<FxHashMap<HelperId, bool>> {
@@ -3103,6 +3167,54 @@ impl HelperStartReachCache {
             shard.insert(helper, reaches);
         }
     }
+
+    fn start_message_shard(
+        &self,
+        key: &HelperStartMessageKey,
+    ) -> &Mutex<FxHashMap<HelperStartMessageKey, Option<String>>> {
+        let mut hasher = rustc_hash::FxHasher::default();
+        key.hash(&mut hasher);
+        &self.start_message[hasher.finish() as usize % HELPER_REACH_SHARDS]
+    }
+
+    fn get_start_message(&self, key: &HelperStartMessageKey) -> Option<Option<String>> {
+        self.start_message_shard(key).lock().ok()?.get(key).cloned()
+    }
+
+    fn insert_start_message(&self, key: HelperStartMessageKey, answer: Option<String>) {
+        if let Ok(mut shard) = self.start_message_shard(&key).lock() {
+            shard.insert(key, answer);
+        }
+    }
+
+    fn send_shard(
+        &self,
+        helper: &HelperId,
+    ) -> &Mutex<FxHashMap<HelperId, Option<HelperSendAnswer>>> {
+        let mut hasher = rustc_hash::FxHasher::default();
+        helper.hash(&mut hasher);
+        &self.send[hasher.finish() as usize % HELPER_REACH_SHARDS]
+    }
+
+    fn get_send(&self, helper: &HelperId) -> Option<Option<HelperSendAnswer>> {
+        self.send_shard(helper).lock().ok()?.get(helper).cloned()
+    }
+
+    fn insert_send(&self, helper: HelperId, answer: Option<HelperSendAnswer>) {
+        if let Ok(mut shard) = self.send_shard(&helper).lock() {
+            shard.insert(helper, answer);
+        }
+    }
+}
+
+/// Sorted bindings fingerprint for [`HelperStartMessageKey`].
+fn sorted_helper_bindings(bindings: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut key: Vec<(String, String)> = bindings
+        .iter()
+        .map(|(param, value)| (param.clone(), value.clone()))
+        .collect();
+    key.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    key
 }
 
 /// Whether expanding `helper_block` can reach a `NetCallRole::Start`.
@@ -4857,6 +4969,87 @@ mod net_candidate_gate_tests {
                 .get_gmod_network_index()
                 .get_file_data(plain_id)
                 .is_none()
+        );
+    }
+
+    /// N1 gate: a diamond helper (`top` -> `left`/`right` -> `leaf`) must give
+    /// the same flows as an unmemoised walk, while the shared `leaf` body is
+    /// walked once per distinct bindings (second visit hits the shared memo).
+    /// Calling the same param-forwarding helper with two literals also guards
+    /// the bindings key: a helper-only key would return the first message for
+    /// both call sites.
+    #[test]
+    fn diamond_helper_memo_preserves_flows() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        let start_id = ws.def_file(
+            "addons/mytest/lua/autorun/server/diamond_start.lua",
+            r#"
+            local function leaf(msg)
+                net.Start(msg)
+            end
+            local function left(msg)
+                leaf(msg)
+            end
+            local function right(msg)
+                leaf(msg)
+            end
+            local function top(msg)
+                left(msg)
+                right(msg)
+            end
+            top("DiamondA")
+            net.WriteString("a")
+            net.Broadcast()
+            top("DiamondB")
+            net.WriteString("b")
+            net.Broadcast()
+            "#,
+        );
+        let send_id = ws.def_file(
+            "addons/mytest/lua/autorun/server/diamond_send.lua",
+            r#"
+            local function leafSend()
+                net.Broadcast()
+            end
+            local function leftSend()
+                leafSend()
+            end
+            local function rightSend()
+                leafSend()
+            end
+            local function topSend()
+                leftSend()
+                rightSend()
+            end
+            net.Start("DiamondSend")
+            net.WriteString("x")
+            topSend()
+            "#,
+        );
+
+        let start_data = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(start_id)
+            .expect("expected network data");
+        assert_eq!(start_data.send_flows.len(), 2);
+        assert_eq!(start_data.send_flows[0].message_name.as_str(), "DiamondA");
+        assert_eq!(start_data.send_flows[1].message_name.as_str(), "DiamondB");
+
+        let send_data = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(send_id)
+            .expect("expected network data");
+        assert_eq!(send_data.send_flows.len(), 1);
+        assert_eq!(send_data.send_flows[0].message_name.as_str(), "DiamondSend");
+        // Sends through a helper materialize at the call site, so the display
+        // name is the wrapper call rather than the inner `net.Broadcast`.
+        assert_eq!(
+            send_data.send_flows[0].send_display_name.as_str(),
+            "topSend"
         );
     }
 }
