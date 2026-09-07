@@ -1575,16 +1575,13 @@ fn direct_subtype_members_key(db: &crate::DbIndex) -> DirectSubtypeMembersKey {
         .collect();
 
     let mut dynamic_fields_fingerprint = 0u64;
-    for (owner, fields) in db
-        .get_dynamic_field_index()
-        .iter_all_owner_fields()
-    {
+    for (owner, fields) in db.get_dynamic_field_index().iter_all_owner_fields() {
         for name in fields.keys() {
             let mut hasher = rustc_hash::FxHasher::default();
             std::hash::Hash::hash(owner, &mut hasher);
             std::hash::Hash::hash(name, &mut hasher);
-            dynamic_fields_fingerprint = dynamic_fields_fingerprint
-                .wrapping_add(std::hash::Hasher::finish(&hasher));
+            dynamic_fields_fingerprint =
+                dynamic_fields_fingerprint.wrapping_add(std::hash::Hasher::finish(&hasher));
         }
     }
 
