@@ -2453,7 +2453,7 @@ fn collect_unannotated_net_wrapper_send_flows(
     candidates: &[LuaCallExpr],
 ) -> Vec<NetSendFlow> {
     let mut flows = Vec::new();
-    let mut visited = HashSet::default();
+    let mut stack: Vec<HelperId> = Vec::new();
     let empty_bindings = HashMap::default();
 
     for call_expr in candidates {
@@ -2466,7 +2466,7 @@ fn collect_unannotated_net_wrapper_send_flows(
             &call_expr,
             &call_expr,
             &empty_bindings,
-            &mut visited,
+            &mut stack,
             &mut flows,
         );
     }
@@ -2582,42 +2582,89 @@ fn collect_send_flows_from_helper_call(
     helper_call: &LuaCallExpr,
     origin_call: &LuaCallExpr,
     caller_bindings: &HashMap<String, String>,
-    visited: &mut HashSet<HelperId>,
+    stack: &mut Vec<HelperId>,
     flows: &mut Vec<NetSendFlow>,
-) {
+) -> usize {
     let Some((helper_key, helper_block, helper_root, helper_file_id)) =
         resolve_call_to_function_block_cached(ctx, caller_site, helper_call)
     else {
-        return;
+        return NO_CYCLE;
     };
-    if !visited.insert((helper_file_id, helper_key)) {
-        return;
-    }
-
     let helper_site = NetWalkSite {
         root: helper_root,
         file_id: helper_file_id,
     };
+    let helper_id = (helper_file_id, helper_key);
+    let bindings = helper_call_string_bindings(helper_call, &helper_block, caller_bindings);
+    let (bodies, low) = send_body_for_helper(
+        ctx,
+        &helper_site,
+        &helper_block,
+        &helper_id,
+        &bindings,
+        stack,
+    );
+    // N2: the memo holds the body-derived transaction; only the origin is
+    // stamped per call site so diamonds share one body scan.
+    let origin_range = origin_call.get_range();
+    let display_name = call_display_name(origin_call);
+    for body in bodies {
+        flows.push(NetSendFlow {
+            message_name: body.message_name,
+            start_range: origin_range,
+            writes: body.writes,
+            send_range: origin_range,
+            send_kind: body.send_kind,
+            send_display_name: display_name.clone(),
+            send_target: body.send_target,
+            is_wrapped: false,
+            materialized_from: body.materialized_from,
+        });
+    }
+    low
+}
+
+/// Body-derived send transactions for one `(helper, bindings)` pair, without
+/// any call-site origin. Shared across callers through
+/// [`HelperStartReachCache::send_body`]; the caller stamps the origin.
+fn send_body_for_helper(
+    ctx: &mut NetCollectCtx<'_>,
+    helper_site: &NetWalkSite,
+    helper_block: &LuaBlock,
+    helper_id: &HelperId,
+    bindings: &HashMap<String, String>,
+    stack: &mut Vec<HelperId>,
+) -> (Vec<CachedSendBody>, usize) {
+    let cache_key = (helper_id.clone(), sorted_helper_bindings(bindings));
+    if let Some(cached) = ctx.reach.get_send_body(&cache_key) {
+        return (cached, NO_CYCLE);
+    }
+    if let Some(open_depth) = stack.iter().position(|open| open == helper_id) {
+        return (Vec::new(), open_depth);
+    }
 
     // A send flow always starts at a `net.Start` somewhere in the expansion, so
     // a helper that cannot reach one contributes nothing however it is called.
     // The answer depends only on the helper, so it is cached per helper rather
     // than recomputed for each calling file.
-    let helper_id = (helper_file_id, helper_key);
     let (reaches_start, _) = helper_reaches_net_role(
         ctx,
-        &helper_site,
-        &helper_block,
-        &helper_id,
+        helper_site,
+        helper_block,
+        helper_id,
         NetReachKind::Start,
         &mut Vec::new(),
     );
     if !reaches_start {
-        visited.remove(&helper_id);
-        return;
+        return (Vec::new(), NO_CYCLE);
     }
 
-    let bindings = helper_call_string_bindings(helper_call, &helper_block, caller_bindings);
+    let depth = stack.len();
+    stack.push(helper_id.clone());
+
+    let mut bodies = Vec::new();
+    let mut low = NO_CYCLE;
+    let helper_file_id = helper_site.file_id;
 
     for block in helper_block
         .syntax()
@@ -2625,7 +2672,7 @@ fn collect_send_flows_from_helper_call(
         .filter_map(LuaBlock::cast)
     {
         if block.syntax() != helper_block.syntax()
-            && is_block_in_nested_closure(&helper_block, &block)
+            && is_block_in_nested_closure(helper_block, &block)
         {
             continue;
         }
@@ -2641,7 +2688,7 @@ fn collect_send_flows_from_helper_call(
                 continue;
             };
             let Some(message_name) =
-                extract_static_string_arg_value_with_bindings(&start_call, message_idx, &bindings)
+                extract_static_string_arg_value_with_bindings(&start_call, message_idx, bindings)
             else {
                 continue;
             };
@@ -2660,23 +2707,17 @@ fn collect_send_flows_from_helper_call(
                         _ => {}
                     }
                 }
-                collect_net_write_ops_from_stat(ctx, &helper_site, &block, next_stat, &mut writes);
+                collect_net_write_ops_from_stat(ctx, helper_site, &block, next_stat, &mut writes);
             }
 
             let Some((send_kind, send_target)) = send else {
                 continue;
             };
-            flows.push(NetSendFlow {
+            bodies.push(CachedSendBody {
                 message_name,
-                start_range: origin_call.get_range(),
                 writes,
-                send_range: origin_call.get_range(),
                 send_kind,
-                send_display_name: call_display_name(origin_call),
                 send_target,
-                // Unlike the conservative definition-site stubs, this is a
-                // complete transaction materialized at a concrete call site.
-                is_wrapped: false,
                 materialized_from: Some(crate::db_index::NetFlowOrigin {
                     file_id: helper_file_id,
                     start_range: start_call.get_range(),
@@ -2692,23 +2733,42 @@ fn collect_send_flows_from_helper_call(
         .descendants()
         .filter_map(LuaCallExpr::cast)
     {
-        if is_call_expr_in_nested_closure(&helper_block, &nested_call)
+        if is_call_expr_in_nested_closure(helper_block, &nested_call)
             || ctx.net.role(ctx.db, helper_file_id, &nested_call).is_some()
         {
             continue;
         }
-        collect_send_flows_from_helper_call(
+        let Some((nested_key, nested_block, nested_root, nested_file_id)) =
+            resolve_call_to_function_block_cached(ctx, helper_site, &nested_call)
+        else {
+            continue;
+        };
+        let nested_site = NetWalkSite {
+            root: nested_root,
+            file_id: nested_file_id,
+        };
+        let nested_bindings = helper_call_string_bindings(&nested_call, &nested_block, bindings);
+        let nested_id = (nested_file_id, nested_key);
+        let (nested_bodies, nested_low) = send_body_for_helper(
             ctx,
-            &helper_site,
-            &nested_call,
-            origin_call,
-            &bindings,
-            visited,
-            flows,
+            &nested_site,
+            &nested_block,
+            &nested_id,
+            &nested_bindings,
+            stack,
         );
+        low = low.min(nested_low);
+        bodies.extend(nested_bodies);
     }
 
-    visited.remove(&(helper_file_id, helper_key));
+    stack.pop();
+    // Same cycle rule as the N1 memos: a pruned branch may hide a conflicting
+    // transaction, so only cycle-free expansions are shared.
+    if low >= depth {
+        ctx.reach.insert_send_body(cache_key, bodies.clone());
+        return (bodies, NO_CYCLE);
+    }
+    (bodies, low)
 }
 
 fn helper_call_string_bindings(
@@ -2844,7 +2904,7 @@ fn collect_unannotated_net_wrapper_receive_flows(
         call_expr,
         call_expr,
         &HashMap::default(),
-        &mut HashSet::default(),
+        &mut Vec::new(),
         &mut flows,
     );
     flows
@@ -2857,49 +2917,91 @@ fn collect_receive_flows_from_helper_call(
     helper_call: &LuaCallExpr,
     origin_call: &LuaCallExpr,
     caller_bindings: &HashMap<String, String>,
-    visited: &mut HashSet<HelperId>,
+    stack: &mut Vec<HelperId>,
     flows: &mut Vec<NetReceiveFlow>,
-) {
+) -> usize {
     let Some((helper_key, helper_block, helper_root, helper_file_id)) =
         resolve_call_to_function_block_cached(ctx, caller_site, helper_call)
     else {
-        return;
+        return NO_CYCLE;
     };
-    if !visited.insert((helper_file_id, helper_key)) {
-        return;
-    }
-
     let helper_site = NetWalkSite {
         root: helper_root,
         file_id: helper_file_id,
     };
+    let helper_id = (helper_file_id, helper_key);
+    let bindings = helper_call_string_bindings(helper_call, &helper_block, caller_bindings);
+    let (bodies, low) = receive_body_for_helper(
+        ctx,
+        &helper_site,
+        &helper_block,
+        &helper_id,
+        &bindings,
+        stack,
+    );
+    // N2: body-derived receive transactions are shared per `(helper,
+    // bindings)`; only the call-site range is stamped here.
+    let origin_range = origin_call.get_range();
+    for body in bodies {
+        flows.push(NetReceiveFlow {
+            message_name: body.message_name,
+            receive_range: origin_range,
+            reads: body.reads,
+            reads_opaque: body.reads_opaque,
+        });
+    }
+    low
+}
+
+/// Body-derived receive transactions for one `(helper, bindings)` pair. The
+/// literal-message fast path stays unmemoised: registrations with a static
+/// message are already indexed in the helper's defining file and never
+/// materialize a call-site flow.
+fn receive_body_for_helper(
+    ctx: &mut NetCollectCtx<'_>,
+    helper_site: &NetWalkSite,
+    helper_block: &LuaBlock,
+    helper_id: &HelperId,
+    bindings: &HashMap<String, String>,
+    stack: &mut Vec<HelperId>,
+) -> (Vec<CachedReceiveBody>, usize) {
+    let cache_key = (helper_id.clone(), sorted_helper_bindings(bindings));
+    if let Some(cached) = ctx.reach.get_receive_body(&cache_key) {
+        return (cached, NO_CYCLE);
+    }
+    if let Some(open_depth) = stack.iter().position(|open| open == helper_id) {
+        return (Vec::new(), open_depth);
+    }
 
     // Mirror of the send walk's prune: a receive flow always originates at a
     // `net.Receive` somewhere in the expansion, so a helper that cannot reach
     // one contributes nothing however it is called. Without this, every call
     // with a literal string argument re-walked the full body of whatever it
     // resolved to, once per calling site.
-    let helper_id = (helper_file_id, helper_key);
     let (reaches_receive, _) = helper_reaches_net_role(
         ctx,
-        &helper_site,
-        &helper_block,
-        &helper_id,
+        helper_site,
+        helper_block,
+        helper_id,
         NetReachKind::Receive,
         &mut Vec::new(),
     );
     if !reaches_receive {
-        visited.remove(&helper_id);
-        return;
+        return (Vec::new(), NO_CYCLE);
     }
 
-    let bindings = helper_call_string_bindings(helper_call, &helper_block, caller_bindings);
+    let depth = stack.len();
+    stack.push(helper_id.clone());
+
+    let mut bodies = Vec::new();
+    let mut low = NO_CYCLE;
+    let helper_file_id = helper_site.file_id;
     for nested_call in helper_block
         .syntax()
         .descendants()
         .filter_map(LuaCallExpr::cast)
     {
-        if is_call_expr_in_nested_closure(&helper_block, &nested_call) {
+        if is_call_expr_in_nested_closure(helper_block, &nested_call) {
             continue;
         }
         match ctx.net.role(ctx.db, helper_file_id, &nested_call) {
@@ -2913,32 +3015,61 @@ fn collect_receive_flows_from_helper_call(
                 if extract_static_string_arg_value(&nested_call, message_idx).is_some() {
                     continue;
                 }
-                if let Some(flow) = build_net_receive_flow(
+                // Reads are helper-body facts (callback blocks plus nested
+                // helper payloads); only the message name needs `bindings`.
+                // The range is stamped by the caller, so build with a
+                // placeholder and strip it back into the body cache.
+                let Some(flow) = build_net_receive_flow(
                     ctx,
-                    &helper_site,
+                    helper_site,
                     &nested_call,
                     message_idx,
                     callback_idx,
-                    &bindings,
-                    origin_call.get_range(),
-                ) {
-                    flows.push(flow);
-                }
+                    bindings,
+                    nested_call.get_range(),
+                ) else {
+                    continue;
+                };
+                bodies.push(CachedReceiveBody {
+                    message_name: flow.message_name,
+                    reads: flow.reads,
+                    reads_opaque: flow.reads_opaque,
+                });
             }
             Some(_) => {}
-            None => collect_receive_flows_from_helper_call(
-                ctx,
-                &helper_site,
-                &nested_call,
-                origin_call,
-                &bindings,
-                visited,
-                flows,
-            ),
+            None => {
+                let Some((nested_key, nested_block, nested_root, nested_file_id)) =
+                    resolve_call_to_function_block_cached(ctx, helper_site, &nested_call)
+                else {
+                    continue;
+                };
+                let nested_site = NetWalkSite {
+                    root: nested_root,
+                    file_id: nested_file_id,
+                };
+                let nested_bindings =
+                    helper_call_string_bindings(&nested_call, &nested_block, bindings);
+                let nested_id = (nested_file_id, nested_key);
+                let (nested_bodies, nested_low) = receive_body_for_helper(
+                    ctx,
+                    &nested_site,
+                    &nested_block,
+                    &nested_id,
+                    &nested_bindings,
+                    stack,
+                );
+                low = low.min(nested_low);
+                bodies.extend(nested_bodies);
+            }
         }
     }
 
-    visited.remove(&(helper_file_id, helper_key));
+    stack.pop();
+    if low >= depth {
+        ctx.reach.insert_receive_body(cache_key, bodies.clone());
+        return (bodies, NO_CYCLE);
+    }
+    (bodies, low)
 }
 
 /// Resolve the callback block for a `net.Receive` second argument. Handles
@@ -3137,6 +3268,18 @@ struct HelperStartReachCache {
     /// the helper body's own source text, so the answer is independent of
     /// caller bindings and keyed by helper alone.
     send: [Mutex<FxHashMap<HelperId, Option<HelperSendAnswer>>>; HELPER_REACH_SHARDS],
+    /// N2: body-derived send transactions per `(helper, bindings)`, without
+    /// the call-site origin. The caller stamps `start_range`/`send_range` and
+    /// the display name from its own `origin_call` on every hit.
+    send_body: [Mutex<FxHashMap<HelperStartMessageKey, Vec<CachedSendBody>>>; HELPER_REACH_SHARDS],
+    /// N2: body-derived receive transactions per `(helper, bindings)`,
+    /// without the call-site `receive_range`.
+    receive_body:
+        [Mutex<FxHashMap<HelperStartMessageKey, Vec<CachedReceiveBody>>>; HELPER_REACH_SHARDS],
+    /// N2: canonical payload ops per `(helper, direction)`, collected with
+    /// `force_dynamic = false` and an empty flow prefix. Callers stamp
+    /// `dynamic` (`force_dynamic || baseline`) and prepend their own prefix.
+    ops_body: [Mutex<FxHashMap<HelperOpsKey, Vec<NetOpEntry>>>; HELPER_REACH_SHARDS],
 }
 
 /// Memo key for [`HelperStartReachCache::start_message`]: the helper plus its
@@ -3146,6 +3289,31 @@ type HelperStartMessageKey = (HelperId, Vec<(String, String)>);
 
 /// Cached answer of [`resolve_helper_send_recursive`].
 type HelperSendAnswer = (NetSendKind, Option<String>);
+
+/// N2: body-derived send transaction without the call-site origin. The memo
+/// stores everything the helper body determines; the caller stamps
+/// `start_range`/`send_range` and `send_display_name` from `origin_call`.
+#[derive(Clone)]
+struct CachedSendBody {
+    message_name: String,
+    writes: Vec<NetOpEntry>,
+    send_kind: NetSendKind,
+    send_target: Option<String>,
+    materialized_from: Option<crate::db_index::NetFlowOrigin>,
+}
+
+/// N2: body-derived receive transaction without the call-site range.
+#[derive(Clone)]
+struct CachedReceiveBody {
+    message_name: String,
+    reads: Vec<NetOpEntry>,
+    reads_opaque: bool,
+}
+
+/// N2: canonical payload-op memo key. Payload expansion takes no string
+/// bindings, so the helper plus the walk direction fully determine the
+/// baseline body.
+type HelperOpsKey = (HelperId, NetOpDirection);
 
 impl HelperStartReachCache {
     fn shard(&self, kind: NetReachKind, helper: &HelperId) -> &Mutex<FxHashMap<HelperId, bool>> {
@@ -3203,6 +3371,63 @@ impl HelperStartReachCache {
     fn insert_send(&self, helper: HelperId, answer: Option<HelperSendAnswer>) {
         if let Ok(mut shard) = self.send_shard(&helper).lock() {
             shard.insert(helper, answer);
+        }
+    }
+
+    fn send_body_shard(
+        &self,
+        key: &HelperStartMessageKey,
+    ) -> &Mutex<FxHashMap<HelperStartMessageKey, Vec<CachedSendBody>>> {
+        let mut hasher = rustc_hash::FxHasher::default();
+        key.hash(&mut hasher);
+        &self.send_body[hasher.finish() as usize % HELPER_REACH_SHARDS]
+    }
+
+    fn get_send_body(&self, key: &HelperStartMessageKey) -> Option<Vec<CachedSendBody>> {
+        self.send_body_shard(key).lock().ok()?.get(key).cloned()
+    }
+
+    fn insert_send_body(&self, key: HelperStartMessageKey, bodies: Vec<CachedSendBody>) {
+        if let Ok(mut shard) = self.send_body_shard(&key).lock() {
+            shard.insert(key, bodies);
+        }
+    }
+
+    fn receive_body_shard(
+        &self,
+        key: &HelperStartMessageKey,
+    ) -> &Mutex<FxHashMap<HelperStartMessageKey, Vec<CachedReceiveBody>>> {
+        let mut hasher = rustc_hash::FxHasher::default();
+        key.hash(&mut hasher);
+        &self.receive_body[hasher.finish() as usize % HELPER_REACH_SHARDS]
+    }
+
+    fn get_receive_body(&self, key: &HelperStartMessageKey) -> Option<Vec<CachedReceiveBody>> {
+        self.receive_body_shard(key).lock().ok()?.get(key).cloned()
+    }
+
+    fn insert_receive_body(&self, key: HelperStartMessageKey, bodies: Vec<CachedReceiveBody>) {
+        if let Ok(mut shard) = self.receive_body_shard(&key).lock() {
+            shard.insert(key, bodies);
+        }
+    }
+
+    fn ops_body_shard(
+        &self,
+        key: &HelperOpsKey,
+    ) -> &Mutex<FxHashMap<HelperOpsKey, Vec<NetOpEntry>>> {
+        let mut hasher = rustc_hash::FxHasher::default();
+        key.hash(&mut hasher);
+        &self.ops_body[hasher.finish() as usize % HELPER_REACH_SHARDS]
+    }
+
+    fn get_ops_body(&self, key: &HelperOpsKey) -> Option<Vec<NetOpEntry>> {
+        self.ops_body_shard(key).lock().ok()?.get(key).cloned()
+    }
+
+    fn insert_ops_body(&self, key: HelperOpsKey, ops: Vec<NetOpEntry>) {
+        if let Ok(mut shard) = self.ops_body_shard(&key).lock() {
+            shard.insert(key, ops);
         }
     }
 }
@@ -3339,14 +3564,14 @@ fn collect_net_read_ops_from_block(
     block: LuaBlock,
     reads: &mut Vec<NetOpEntry>,
 ) {
-    let mut visited = HashSet::default();
+    let mut stack: Vec<HelperId> = Vec::new();
     collect_net_ops_recursive(
         ctx,
         site,
         &block,
         block.syntax(),
         reads,
-        &mut visited,
+        &mut stack,
         false,
         NetOpDirection::Read,
         &[],
@@ -3360,14 +3585,14 @@ fn collect_net_write_ops_from_stat(
     stat: &LuaStat,
     writes: &mut Vec<NetOpEntry>,
 ) {
-    let mut visited = HashSet::default();
+    let mut stack: Vec<HelperId> = Vec::new();
     collect_net_ops_recursive(
         ctx,
         site,
         block,
         stat.syntax(),
         writes,
-        &mut visited,
+        &mut stack,
         false,
         NetOpDirection::Write,
         &[],
@@ -3377,7 +3602,7 @@ fn collect_net_write_ops_from_stat(
 /// Walk `subtree` for net payload call expressions, treating non-net
 /// calls that resolve to a same-file function as helper expansions: we recurse
 /// into the helper body so writes/reads it performs participate in the
-/// outer flow. Cycles are guarded via `visited`, and dynamic-context propagates
+/// outer flow. Cycles are guarded via `stack`, and dynamic-context propagates
 /// from the call site into the helper body.
 #[allow(clippy::too_many_arguments)]
 fn collect_net_ops_recursive(
@@ -3386,11 +3611,11 @@ fn collect_net_ops_recursive(
     enclosing_block: &LuaBlock,
     subtree: &LuaSyntaxNode,
     out: &mut Vec<NetOpEntry>,
-    visited: &mut HashSet<HelperId>,
+    stack: &mut Vec<HelperId>,
     force_dynamic: bool,
     direction: NetOpDirection,
     flow_prefix: &[NetFlowFrame],
-) {
+) -> usize {
     // Keep the public helper name used by read/write collection call sites,
     // while the implementation below documents the call-argument evaluation
     // ordering needed for nested reads such as `net.ReadData(net.ReadUInt(16))`.
@@ -3400,11 +3625,11 @@ fn collect_net_ops_recursive(
         enclosing_block,
         subtree,
         out,
-        visited,
+        stack,
         force_dynamic,
         direction,
         flow_prefix,
-    );
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3414,39 +3639,41 @@ fn collect_net_ops_eval_order(
     enclosing_block: &LuaBlock,
     subtree: &LuaSyntaxNode,
     out: &mut Vec<NetOpEntry>,
-    visited: &mut HashSet<HelperId>,
+    stack: &mut Vec<HelperId>,
     force_dynamic: bool,
     direction: NetOpDirection,
     flow_prefix: &[NetFlowFrame],
-) {
+) -> usize {
     if let Some(call_expr) = LuaCallExpr::cast(subtree.clone()) {
-        collect_net_ops_from_call_expr(
+        return collect_net_ops_from_call_expr(
             ctx,
             site,
             enclosing_block,
             &call_expr,
             out,
-            visited,
+            stack,
             force_dynamic,
             direction,
             flow_prefix,
         );
-        return;
     }
 
+    let mut low = NO_CYCLE;
     for child in subtree.children() {
-        collect_net_ops_eval_order(
+        let child_low = collect_net_ops_eval_order(
             ctx,
             site,
             enclosing_block,
             &child,
             out,
-            visited,
+            stack,
             force_dynamic,
             direction,
             flow_prefix,
         );
+        low = low.min(child_low);
     }
+    low
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3456,22 +3683,22 @@ fn collect_net_ops_from_call_expr(
     enclosing_block: &LuaBlock,
     call_expr: &LuaCallExpr,
     out: &mut Vec<NetOpEntry>,
-    visited: &mut HashSet<HelperId>,
+    stack: &mut Vec<HelperId>,
     force_dynamic: bool,
     direction: NetOpDirection,
     flow_prefix: &[NetFlowFrame],
-) {
+) -> usize {
     if is_call_expr_in_nested_closure(enclosing_block, call_expr) {
-        return;
+        return NO_CYCLE;
     }
 
-    collect_net_ops_from_call_args(
+    let mut low = collect_net_ops_from_call_args(
         ctx,
         site,
         enclosing_block,
         call_expr,
         out,
-        visited,
+        stack,
         force_dynamic,
         direction,
         flow_prefix,
@@ -3503,19 +3730,16 @@ fn collect_net_ops_from_call_expr(
                 flow_path,
             });
         }
-        return;
+        return low;
     }
 
     let Some((helper_key, helper_block, helper_root, helper_file_id)) =
         resolve_call_to_function_block_cached(ctx, site, call_expr)
     else {
-        return;
+        return low;
     };
 
-    if !visited.insert((helper_file_id, helper_key)) {
-        return;
-    }
-
+    let helper_id = (helper_file_id, helper_key);
     let helper_force_dynamic =
         force_dynamic || is_call_expr_in_dynamic_control_flow(enclosing_block, call_expr);
     // Carry the call-site's flow context into the helper so reads/writes
@@ -3525,22 +3749,72 @@ fn collect_net_ops_from_call_expr(
     let mut nested_prefix = Vec::with_capacity(flow_prefix.len() + local_path.len());
     nested_prefix.extend_from_slice(flow_prefix);
     nested_prefix.extend(local_path);
+
+    // N2: the helper body's payload ops depend only on the helper and the
+    // walk direction. The shared memo holds the canonical baseline
+    // (`force_dynamic = false`, empty prefix); each caller stamps its own
+    // dynamic flag and prefix so diamonds share one body scan.
+    let ops_key = (helper_id.clone(), direction);
+    if let Some(cached) = ctx.reach.get_ops_body(&ops_key) {
+        stamp_ops_body(&cached, helper_force_dynamic, &nested_prefix, out);
+        return low;
+    }
+    if let Some(open_depth) = stack.iter().position(|open| *open == helper_id) {
+        return low.min(open_depth);
+    }
+
+    let depth = stack.len();
+    stack.push(helper_id.clone());
     let helper_site = NetWalkSite {
         root: helper_root,
         file_id: helper_file_id,
     };
-    collect_net_ops_recursive(
+    let mut canonical = Vec::new();
+    let body_low = collect_net_ops_recursive(
         ctx,
         &helper_site,
         &helper_block,
         helper_block.syntax(),
-        out,
-        visited,
-        helper_force_dynamic,
+        &mut canonical,
+        stack,
+        false,
         direction,
-        &nested_prefix,
+        &[],
     );
-    visited.remove(&(helper_file_id, helper_key));
+    stack.pop();
+    low = low.min(body_low);
+    // Same cycle rule as the N1 memos: only cycle-free baselines are shared.
+    // The current expansion still emits its (pruned) ops to preserve the
+    // unmemoised walk's output exactly.
+    if body_low >= depth {
+        ctx.reach.insert_ops_body(ops_key, canonical.clone());
+        stamp_ops_body(&canonical, helper_force_dynamic, &nested_prefix, out);
+        return if low >= depth { NO_CYCLE } else { low };
+    }
+    stamp_ops_body(&canonical, helper_force_dynamic, &nested_prefix, out);
+    low
+}
+
+/// Stamp a canonical [`HelperStartReachCache::ops_body`] baseline with the
+/// caller's dynamic context: `dynamic` is the OR of the outer flag and the
+/// body's own flag, and the outer prefix is prepended to the body's path.
+fn stamp_ops_body(
+    canonical: &[NetOpEntry],
+    force_dynamic: bool,
+    prefix: &[NetFlowFrame],
+    out: &mut Vec<NetOpEntry>,
+) {
+    for entry in canonical {
+        let mut stamped = entry.clone();
+        stamped.dynamic = force_dynamic || entry.dynamic;
+        if !prefix.is_empty() {
+            let mut flow_path = Vec::with_capacity(prefix.len() + entry.flow_path.len());
+            flow_path.extend_from_slice(prefix);
+            flow_path.extend_from_slice(&entry.flow_path);
+            stamped.flow_path = flow_path;
+        }
+        out.push(stamped);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3550,28 +3824,31 @@ fn collect_net_ops_from_call_args(
     enclosing_block: &LuaBlock,
     call_expr: &LuaCallExpr,
     out: &mut Vec<NetOpEntry>,
-    visited: &mut HashSet<HelperId>,
+    stack: &mut Vec<HelperId>,
     force_dynamic: bool,
     direction: NetOpDirection,
     flow_prefix: &[NetFlowFrame],
-) {
+) -> usize {
     let Some(args) = call_expr.get_args_list() else {
-        return;
+        return NO_CYCLE;
     };
 
+    let mut low = NO_CYCLE;
     for arg in args.get_args() {
-        collect_net_ops_eval_order(
+        let arg_low = collect_net_ops_eval_order(
             ctx,
             site,
             enclosing_block,
             arg.syntax(),
             out,
-            visited,
+            stack,
             force_dynamic,
             direction,
             flow_prefix,
         );
+        low = low.min(arg_low);
     }
+    low
 }
 
 fn is_call_expr_in_dynamic_control_flow(block: &LuaBlock, call_expr: &LuaCallExpr) -> bool {
@@ -4978,6 +5255,15 @@ mod net_candidate_gate_tests {
     /// Calling the same param-forwarding helper with two literals also guards
     /// the bindings key: a helper-only key would return the first message for
     /// both call sites.
+    ///
+    /// N2 extends the same diamond to body-scan sharing: full-transaction
+    /// helpers (`send_body`), receive wrappers (`receive_body`) and payload
+    /// helpers (`ops_body`) memoise the body-derived output per
+    /// `(helper, bindings)` (or `(helper, direction)` for ops) and stamp the
+    /// call-site origin per hit. The assertions below guard both halves: the
+    /// bindings key (different literals give different messages) and the
+    /// origin stamp (same literal at two sites gives two flows with distinct
+    /// ranges but identical bodies).
     #[test]
     fn diamond_helper_memo_preserves_flows() {
         let mut ws = VirtualWorkspace::new();
@@ -5051,6 +5337,164 @@ mod net_candidate_gate_tests {
             send_data.send_flows[0].send_display_name.as_str(),
             "topSend"
         );
+
+        // N2: full-transaction bodies share one scan per `(helper, bindings)`
+        // while stamping the origin per call site. The diamond (`topBody` ->
+        // `leftBody`/`rightBody` -> `fullBody`) exercises the shared scan;
+        // the two literals guard the bindings key; the repeated `SameMsg`
+        // calls guard the origin stamp.
+        let body_id = ws.def_file(
+            "addons/mytest/lua/autorun/server/diamond_body.lua",
+            r#"
+            local function fullBody(msg)
+                net.Start(msg)
+                net.WriteString("payload")
+                net.Broadcast()
+            end
+            local function leftBody(msg)
+                fullBody(msg)
+            end
+            local function rightBody(msg)
+                fullBody(msg)
+            end
+            local function topBody(msg)
+                leftBody(msg)
+                rightBody(msg)
+            end
+            topBody("BodyShareA")
+            topBody("BodyShareB")
+            fullBody("SameMsg")
+            fullBody("SameMsg")
+            "#,
+        );
+        let body_data = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(body_id)
+            .expect("expected network data");
+        assert_eq!(body_data.send_flows.len(), 4);
+        assert_eq!(body_data.send_flows[0].message_name.as_str(), "BodyShareA");
+        assert_eq!(body_data.send_flows[1].message_name.as_str(), "BodyShareB");
+        assert_eq!(body_data.send_flows[2].message_name.as_str(), "SameMsg");
+        assert_eq!(body_data.send_flows[3].message_name.as_str(), "SameMsg");
+        // Same literal at two sites: distinct origins, identical bodies.
+        assert_ne!(
+            body_data.send_flows[2].start_range,
+            body_data.send_flows[3].start_range
+        );
+        assert_eq!(
+            body_data.send_flows[2].materialized_from,
+            body_data.send_flows[3].materialized_from
+        );
+        assert_eq!(
+            body_data.send_flows[2].writes,
+            body_data.send_flows[3].writes
+        );
+        assert_eq!(body_data.send_flows[2].writes.len(), 1);
+        // Diamond duplicates collapse: each `topBody` call expands to two
+        // identical bodies (left + right) with the same origin, deduped to one.
+        assert_ne!(
+            body_data.send_flows[0].start_range,
+            body_data.send_flows[1].start_range
+        );
+
+        // N2: receive bodies share per `(helper, bindings)` the same way.
+        // Each `recvTop` call reaches the leaf twice (left + right), so one
+        // call yields two identical flows; two literals guard the bindings key.
+        let recv_id = ws.def_file(
+            "addons/mytest/lua/autorun/server/diamond_recv.lua",
+            r#"
+            local function recvLeaf(msg)
+                net.Receive(msg, function()
+                    net.ReadString()
+                end)
+            end
+            local function recvLeft(msg)
+                recvLeaf(msg)
+            end
+            local function recvRight(msg)
+                recvLeaf(msg)
+            end
+            local function recvTop(msg)
+                recvLeft(msg)
+                recvRight(msg)
+            end
+            recvTop("RecvShareA")
+            recvTop("RecvShareB")
+            "#,
+        );
+        let recv_data = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(recv_id)
+            .expect("expected network data");
+        assert_eq!(recv_data.receive_flows.len(), 4);
+        assert_eq!(
+            recv_data.receive_flows[0].message_name.as_str(),
+            "RecvShareA"
+        );
+        assert_eq!(
+            recv_data.receive_flows[1].message_name.as_str(),
+            "RecvShareA"
+        );
+        assert_eq!(
+            recv_data.receive_flows[2].message_name.as_str(),
+            "RecvShareB"
+        );
+        assert_eq!(
+            recv_data.receive_flows[3].message_name.as_str(),
+            "RecvShareB"
+        );
+        assert_eq!(
+            recv_data.receive_flows[0].receive_range,
+            recv_data.receive_flows[1].receive_range
+        );
+        assert!(!recv_data.receive_flows[0].reads.is_empty());
+
+        // N2: payload-op bodies share per `(helper, direction)` with per-caller
+        // stamping of `dynamic` and the flow prefix. `writePayload` is reached
+        // from two top-level transactions (shared baseline, both static);
+        // `writeCond` is reached from inside an `if` (same baseline shape,
+        // stamped dynamic with the outer frame).
+        let ops_id = ws.def_file(
+            "addons/mytest/lua/autorun/server/diamond_ops.lua",
+            r#"
+            local function writePayload()
+                net.WriteString("shared")
+            end
+            local function writeCond()
+                net.WriteString("cond")
+            end
+            net.Start("OpsShareA")
+            writePayload()
+            net.Broadcast()
+            net.Start("OpsShareB")
+            writePayload()
+            net.Broadcast()
+            net.Start("OpsCond")
+            if foo then
+                writeCond()
+            end
+            net.Broadcast()
+            "#,
+        );
+        let ops_data = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(ops_id)
+            .expect("expected network data");
+        assert_eq!(ops_data.send_flows.len(), 3);
+        assert_eq!(ops_data.send_flows[0].message_name.as_str(), "OpsShareA");
+        assert_eq!(ops_data.send_flows[1].message_name.as_str(), "OpsShareB");
+        assert_eq!(ops_data.send_flows[2].message_name.as_str(), "OpsCond");
+        assert_eq!(ops_data.send_flows[0].writes.len(), 1);
+        assert_eq!(ops_data.send_flows[1].writes.len(), 1);
+        assert_eq!(ops_data.send_flows[0].writes, ops_data.send_flows[1].writes);
+        assert!(!ops_data.send_flows[0].writes[0].dynamic);
+        assert!(ops_data.send_flows[0].writes[0].flow_path.is_empty());
+        assert_eq!(ops_data.send_flows[2].writes.len(), 1);
+        assert!(ops_data.send_flows[2].writes[0].dynamic);
+        assert!(!ops_data.send_flows[2].writes[0].flow_path.is_empty());
     }
 }
 
