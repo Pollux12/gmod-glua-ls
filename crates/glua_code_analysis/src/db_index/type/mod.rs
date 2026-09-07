@@ -1196,6 +1196,16 @@ fn super_entry_sort_key(entry: &InFiled<LuaSuperType>) -> (FileId, TextSize, Tex
     )
 }
 
+/// Orders subclass declarations by name, breaking ties by declaration id so
+/// same-named locals in different files still compare in a total order rather
+/// than falling back to hash-map iteration order.
+fn sort_type_decls_for_sub_types(sub_types: &mut Vec<&LuaTypeDecl>) {
+    sub_types.sort_by(|left, right| {
+        left.get_name().cmp(right.get_name())
+            .then_with(|| left.get_id().stable_cmp(&right.get_id()))
+    });
+}
+
 fn collect_type_cache_refs(typ: &LuaType) -> HashSet<TypeCacheRef> {
     let mut refs = HashSet::default();
     typ.visit_type_identities(&mut |inner| {
@@ -1230,6 +1240,12 @@ pub struct LuaTypeIndex {
     full_name_type_map: HashMap<LuaTypeDeclId, LuaTypeDecl>,
     generic_params: HashMap<LuaTypeDeclId, Vec<GenericParam>>,
     supers: HashMap<LuaTypeDeclId, Vec<InFiled<LuaSuperType>>>,
+    /// Reverse super-type edges: base class id → direct subclass ids. Updated
+    /// on every [`LuaTypeIndex::add_super_type`] write and rebuilt when
+    /// [`LuaTypeIndex::remove_files`] prunes super-type entries, so
+    /// [`LuaTypeIndex::get_sub_types`] is a lookup instead of a scan over
+    /// every inheritance edge in the workspace.
+    sub_types: HashMap<LuaTypeDeclId, Vec<LuaTypeDeclId>>,
     types: HashMap<LuaTypeOwner, LuaTypeCache>,
     cache_refs: TypeCacheRefIndex,
     in_filed_type_owner: HashMap<FileId, HashSet<LuaTypeOwner>>,
@@ -1266,6 +1282,7 @@ impl LuaTypeIndex {
             full_name_type_map: HashMap::default(),
             generic_params: HashMap::default(),
             supers: HashMap::default(),
+            sub_types: HashMap::default(),
             types: HashMap::default(),
             cache_refs: TypeCacheRefIndex::default(),
             in_filed_type_owner: HashMap::default(),
@@ -1441,6 +1458,10 @@ impl LuaTypeIndex {
         // analysed in: an incremental re-analysis visits the declaring files in
         // a different order than a cold build, and the first entry decides
         // which declaration a consumer resolves against.
+        let base_id = match &super_type {
+            LuaType::Ref(base_id) => Some(base_id.clone()),
+            _ => None,
+        };
         let entry = InFiled::new(
             file_id,
             LuaSuperType {
@@ -1448,11 +1469,17 @@ impl LuaTypeIndex {
                 typ: super_type,
             },
         );
-        let supers = self.supers.entry(decl_id).or_default();
+        let supers = self.supers.entry(decl_id.clone()).or_default();
         let at = supers.partition_point(|existing| {
             super_entry_sort_key(existing) <= super_entry_sort_key(&entry)
         });
         supers.insert(at, entry);
+        if let Some(base_id) = base_id {
+            let children = self.sub_types.entry(base_id).or_default();
+            if !children.contains(&decl_id) {
+                children.push(decl_id);
+            }
+        }
     }
 
     fn has_super_type_at_source(
@@ -1514,29 +1541,47 @@ impl LuaTypeIndex {
         self.supers.get(decl_id).map(Vec::as_slice)
     }
 
-    /// Get all direct subclasses of a given type
-    /// Returns a vector of type declarations that directly inherit from the given type
-    pub fn get_sub_types(&self, decl_id: &LuaTypeDeclId) -> Vec<&LuaTypeDecl> {
-        let mut sub_types = Vec::new();
-
-        // Iterate through all types and check their super types
-        for (type_id, supers) in &self.supers {
-            for super_filed in supers {
-                // Check if this super type references our target type
-                if let LuaType::Ref(super_id) = &super_filed.value.typ {
-                    if super_id == decl_id {
-                        // Found a subclass
-                        if let Some(sub_decl) = self.full_name_type_map.get(type_id) {
-                            sub_types.push(sub_decl);
-                        }
-                        break; // No need to check other supers of this type
+    /// Rebuilds [`Self::sub_types`] from the live [`Self::supers`] edges.
+    ///
+    /// Pruning in [`LuaIndex::remove_files`] drops super-type entries by file,
+    /// which can remove edges, whole children, and (for edge-only files) leave
+    /// the child declaration itself behind. Re-deriving keeps the reverse map
+    /// exactly consistent with the forward one. Each child list is sorted by
+    /// declaration id so the stored order is deterministic regardless of hash
+    /// iteration order; [`LuaTypeIndex::get_sub_types`] still applies the
+    /// name-first display order on read.
+    fn rebuild_sub_type_index(&mut self) {
+        let mut sub_types: HashMap<LuaTypeDeclId, Vec<LuaTypeDeclId>> = HashMap::default();
+        for (child_id, supers) in &self.supers {
+            for super_entry in supers {
+                if let LuaType::Ref(base_id) = &super_entry.value.typ {
+                    let children = sub_types.entry(base_id.clone()).or_default();
+                    if !children.contains(child_id) {
+                        children.push(child_id.clone());
                     }
                 }
             }
         }
+        for children in sub_types.values_mut() {
+            children.sort_by(LuaTypeDeclId::stable_cmp);
+        }
+        self.sub_types = sub_types;
+    }
+
+    /// Get all direct subclasses of a given type
+    /// Returns a vector of type declarations that directly inherit from the given type
+    pub fn get_sub_types(&self, decl_id: &LuaTypeDeclId) -> Vec<&LuaTypeDecl> {
+        let Some(children) = self.sub_types.get(decl_id) else {
+            return Vec::new();
+        };
+
+        let mut sub_types = children
+            .iter()
+            .filter_map(|type_id| self.full_name_type_map.get(type_id))
+            .collect::<Vec<_>>();
 
         // Sort to ensure deterministic ordering regardless of HashMap iteration order
-        sub_types.sort_by(|a, b| a.get_name().cmp(b.get_name()));
+        sort_type_decls_for_sub_types(&mut sub_types);
         sub_types
     }
 
@@ -2434,6 +2479,7 @@ impl LuaIndex for LuaTypeIndex {
             supers.retain(|super_type| !changed_files.contains(&super_type.file_id));
             !supers.is_empty()
         });
+        self.rebuild_sub_type_index();
 
         self.definition_facts
             .retain(|definition, _| !changed_files.contains(&definition.file_id()));
@@ -2451,6 +2497,7 @@ impl LuaIndex for LuaTypeIndex {
         self.full_name_type_map.clear();
         self.generic_params.clear();
         self.supers.clear();
+        self.sub_types.clear();
         self.types.clear();
         self.cache_refs = TypeCacheRefIndex::default();
         self.in_filed_type_owner.clear();
@@ -2677,6 +2724,68 @@ mod super_type_tests {
         assert_eq!(super_types, vec![parent_type.clone()]);
         assert_eq!(iter_super_types, vec![parent_type]);
     }
+
+    /// The reverse sub-type index answers from the writes, not from a scan,
+    /// and file removal prunes its edges along with the forward ones.
+    #[test]
+    fn sub_type_index_answers_writes_and_prunes_removed_edges() {
+        let mut index = LuaTypeIndex::new();
+        let parent_id = LuaTypeDeclId::global("Parent");
+        let parent_type = LuaType::Ref(parent_id.clone());
+        let(top_file, mid_file) = (FileId::new(1), FileId::new(2));
+
+        for name in ["Zebra", "Apple", "Mango"] {
+            index.add_type_decl(
+                top_file,
+                LuaTypeDecl::new(
+                    top_file,
+                    TextRange::new(0.into(), 1.into()),
+                    name.to_owned(),
+                    LuaDeclTypeKind::Class,
+                    LuaTypeFlag::None.into(),
+                    LuaTypeDeclId::global(name),
+                ),
+            );
+        }
+        // Insert out of name order: the answer still comes back sorted.
+        for (file_id, name, start) in [
+            (mid_file, "Zebra", 10),
+            (top_file, "Apple", 20),
+            (mid_file, "Mango", 30),
+        ] {
+            index.add_super_type(
+                LuaTypeDeclId::global(name),
+                file_id,
+                TextRange::new(start.into(), (start + 5).into()),
+                parent_type.clone(),
+            );
+        }
+        // A non-`Ref` super edge is not an inheritance edge and stays out.
+        index.add_super_type(
+            LuaTypeDeclId::global("Apple"),
+            top_file,
+            TextRange::new(40.into(), 45.into()),
+            LuaType::String,
+        );
+
+        let names = index
+            .get_sub_types(&parent_id)
+            .iter()
+            .map(|decl| decl.get_name().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Apple", "Mango", "Zebra"]);
+        assert_eq!(index.get_all_sub_types(&parent_id).len(), 3);
+
+        // Removing the edge-only file prunes exactly its edges.
+        index.remove_files(&[mid_file]);
+        let names = index
+            .get_sub_types(&parent_id)
+            .iter()
+            .map(|decl| decl.get_name().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Apple"]);
+        assert_eq!(index.get_all_sub_types(&parent_id).len(), 1);
+    }
 }
 
 #[cfg(test)]
@@ -2829,6 +2938,7 @@ mod batch_removal_tests {
         assert_eq!(left.full_name_type_map, right.full_name_type_map);
         assert_eq!(left.generic_params, right.generic_params);
         assert_eq!(left.supers, right.supers);
+        assert_eq!(left.sub_types, right.sub_types);
         assert_eq!(type_cache_types(left), type_cache_types(right));
         assert_eq!(left.in_filed_type_owner, right.in_filed_type_owner);
         assert_eq!(left.fact_metadata, right.fact_metadata);
