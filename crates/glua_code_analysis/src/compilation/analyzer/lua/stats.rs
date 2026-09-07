@@ -916,8 +916,8 @@ fn apply_index_expr_member_owner_with_guarded(
                 .mark_non_overwriting_assignment_member(member_id);
         }
         let member_index = analyzer.db.get_member_index_mut();
-        member_index.add_member(member_owner.clone(), member);
         if let Some(alias_path) = alias_path {
+            member_index.add_member(member_owner.clone(), member);
             member_index.home_alias_member_with_provenance(
                 member_owner,
                 member_id.file_id,
@@ -925,6 +925,8 @@ fn apply_index_expr_member_owner_with_guarded(
                 alias_path,
                 false,
             );
+        } else {
+            member_index.add_member(member_owner, member);
         }
         // `add_member` already records the enclosing function scope for
         // `FileDefine` index-expr members (via
@@ -2175,8 +2177,9 @@ fn assign_merge_type_owner_and_expr_type(
     if let LuaTypeOwner::Member(member_id) = &type_owner
         && is_assignment_file_define_member(analyzer.db, *member_id)
     {
-        let guarded_table_assignment =
-            preserve_table_literals || is_guarded_table_assignment_member(analyzer.db, *member_id);
+        // `preserve_table_literals` already folds this member's guarded check
+        // in, and that answer reads only the immutable syntax tree.
+        let guarded_table_assignment = preserve_table_literals;
         if guarded_table_assignment {
             // Whichever canonical writer this found — including none at all — it
             // read the sibling set off a half-built owner index, and which
