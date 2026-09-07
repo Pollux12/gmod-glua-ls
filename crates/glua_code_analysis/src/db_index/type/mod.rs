@@ -1201,7 +1201,8 @@ fn super_entry_sort_key(entry: &InFiled<LuaSuperType>) -> (FileId, TextSize, Tex
 /// than falling back to hash-map iteration order.
 fn sort_type_decls_for_sub_types(sub_types: &mut Vec<&LuaTypeDecl>) {
     sub_types.sort_by(|left, right| {
-        left.get_name().cmp(right.get_name())
+        left.get_name()
+            .cmp(right.get_name())
             .then_with(|| left.get_id().stable_cmp(&right.get_id()))
     });
 }
@@ -1280,8 +1281,7 @@ pub struct LuaTypeIndex {
     /// state captured in [`DirectSubtypeMembersKey`] it decides whether the
     /// cached [`DirectSubtypeMembers`] is still fresh.
     super_write_revision: u64,
-    cached_direct_subtype_members:
-        Option<(DirectSubtypeMembersKey, Arc<DirectSubtypeMembers>)>,
+    cached_direct_subtype_members: Option<(DirectSubtypeMembersKey, Arc<DirectSubtypeMembers>)>,
     types: HashMap<LuaTypeOwner, LuaTypeCache>,
     cache_refs: TypeCacheRefIndex,
     in_filed_type_owner: HashMap<FileId, HashSet<LuaTypeOwner>>,
@@ -1583,10 +1583,7 @@ impl LuaTypeIndex {
     }
 
     /// The declarations whose stored type is a direct reference to `type_id`.
-    pub fn decls_bound_to_type(
-        &self,
-        type_id: &LuaTypeDeclId,
-    ) -> Option<&HashSet<LuaDeclId>> {
+    pub fn decls_bound_to_type(&self, type_id: &LuaTypeDeclId) -> Option<&HashSet<LuaDeclId>> {
         self.type_bound_decls.get(type_id)
     }
 
@@ -2852,7 +2849,7 @@ mod super_type_tests {
         let mut index = LuaTypeIndex::new();
         let parent_id = LuaTypeDeclId::global("Parent");
         let parent_type = LuaType::Ref(parent_id.clone());
-        let(top_file, mid_file) = (FileId::new(1), FileId::new(2));
+        let (top_file, mid_file) = (FileId::new(1), FileId::new(2));
 
         for name in ["Zebra", "Apple", "Mango"] {
             index.add_type_decl(

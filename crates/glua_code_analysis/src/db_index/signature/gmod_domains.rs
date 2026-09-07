@@ -583,9 +583,7 @@ pub fn rebuild_effective_valid_guard_signatures(db: &mut DbIndex) {
         return;
     }
 
-    let dirty_files = db
-        .get_signature_index_mut()
-        .take_valid_guard_dirty_files();
+    let dirty_files = db.get_signature_index_mut().take_valid_guard_dirty_files();
     let global_stale = {
         let signature_index = db.get_signature_index();
         signature_index.valid_guard_global_contributions().is_none()
@@ -620,11 +618,9 @@ pub fn rebuild_effective_valid_guard_signatures(db: &mut DbIndex) {
     let per_file = if work_files.is_empty() {
         Vec::new()
     } else {
-        crate::compilation::analyzer::parallel::map_files_collect(
-            db,
-            &work_files,
-            |db, file_id| (file_id, valid_guard_contributions_for_file(db, file_id)),
-        )
+        crate::compilation::analyzer::parallel::map_files_collect(db, &work_files, |db, file_id| {
+            (file_id, valid_guard_contributions_for_file(db, file_id))
+        })
     };
 
     let signature_index = db.get_signature_index_mut();
@@ -1255,8 +1251,7 @@ mod tests {
             .update_file_by_uri(&shadow_uri, Some(SHADOW.to_string()))
             .map(|(id, _)| id)
             .expect("shadow file indexed");
-        let before =
-            effective_snapshot(ws.analysis.compilation.get_db());
+        let before = effective_snapshot(ws.analysis.compilation.get_db());
         assert!(
             before
                 .iter()
@@ -1267,9 +1262,7 @@ mod tests {
         ws.analysis.update_file_by_uri(&shadow_uri, None);
         let after = effective_snapshot(ws.analysis.compilation.get_db());
         assert!(
-            after
-                .iter()
-                .all(|(id, _)| id.get_file_id() != shadow_file),
+            after.iter().all(|(id, _)| id.get_file_id() != shadow_file),
             "the removed shadow leaves no signature behind at all",
         );
 
