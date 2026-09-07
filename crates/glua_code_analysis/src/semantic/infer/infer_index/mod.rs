@@ -41,11 +41,11 @@ use crate::{
             },
         },
         is_doc_tag_table_const,
-        member::cached_local_class_table_member_ids,
         member::find_members_with_key,
         member::get_buildin_type_map_type_id,
         member::infer_owner_raw_member_type_with_realm,
         member::intersect_member_types,
+        member::local_class_table_member_ids,
         member::member_key_as_type,
         member::member_key_matches_type,
         member::merge_open_table_types,
@@ -1931,8 +1931,7 @@ fn infer_custom_type_member(
 
         return resolved;
     }
-    let local_class_member_ids =
-        cached_local_class_table_member_ids(db, cache, &prefix_type_id, &key);
+    let local_class_member_ids = local_class_table_member_ids(db, &prefix_type_id, &key);
     if !local_class_member_ids.is_empty() {
         let member_item = match local_class_member_ids.as_slice() {
             [member_id] => LuaMemberIndexItem::One(*member_id),

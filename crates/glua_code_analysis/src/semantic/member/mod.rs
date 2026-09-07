@@ -135,10 +135,21 @@ pub(crate) fn local_class_table_member_ids(
         return Vec::new();
     }
 
+    // Only declarations bound to this class can back it with a table
+    // literal. The type index tracks those bindings on every type-cache
+    // write, so resolving them is a lookup of the class's own declarations
+    // instead of a scan over every declaration in the class's files.
+    let Some(bound_decls) = db.get_type_index().decls_bound_to_type(type_id) else {
+        return Vec::new();
+    };
+    if bound_decls.is_empty() {
+        return Vec::new();
+    }
+
     let member_index = db.get_member_index();
     let mut member_ids = Vec::new();
     // A class declared several times in one file names that file once per
-    // declaration, and each of them would otherwise scan the same declarations.
+    // declaration, and each of them would otherwise resolve the same bindings.
     let mut scanned_files = FxHashSet::default();
     for location in type_decl.get_locations() {
         if !scanned_files.insert(location.file_id) {
@@ -154,7 +165,13 @@ pub(crate) fn local_class_table_member_ids(
         else {
             continue;
         };
-        for decl in decl_tree.get_decls().values() {
+        for decl_id in bound_decls {
+            if decl_id.file_id != location.file_id {
+                continue;
+            }
+            let Some(decl) = decl_tree.get_decl(decl_id) else {
+                continue;
+            };
             // `local_table_decl_member_owner` opens with these two conditions
             // and they are field reads, so they run before the index lookups.
             // Keep them in step with it.
@@ -162,9 +179,6 @@ pub(crate) fn local_class_table_member_ids(
                 .get_initializer()
                 .is_none_or(|initializer| initializer.get_ret_idx() != 0)
             {
-                continue;
-            }
-            if !decl_binds_type(db, decl, type_id) {
                 continue;
             }
             let Some(owner) = local_table_decl_member_owner(decl, &root) else {
@@ -197,33 +211,6 @@ pub(crate) fn local_class_table_member_ids(
     });
     member_ids.dedup();
     member_ids
-}
-
-pub(crate) fn cached_local_class_table_member_ids(
-    db: &DbIndex,
-    cache: &mut LuaInferCache,
-    type_id: &LuaTypeDeclId,
-    member_key: &LuaMemberKey,
-) -> Vec<LuaMemberId> {
-    let cache_key = (type_id.clone(), member_key.clone());
-    if let Some(member_ids) = cache.local_class_table_member_ids_cache.get(&cache_key) {
-        return member_ids.as_ref().clone();
-    }
-
-    let member_ids = local_class_table_member_ids(db, type_id, member_key);
-    cache
-        .local_class_table_member_ids_cache
-        .insert(cache_key, std::sync::Arc::new(member_ids.clone()));
-    member_ids
-}
-
-fn decl_binds_type(db: &DbIndex, decl: &LuaDecl, type_id: &LuaTypeDeclId) -> bool {
-    db.get_type_index()
-        .get_type_cache(&decl.get_id().into())
-        .is_some_and(|type_cache| match type_cache.as_type() {
-            LuaType::Ref(bound_id) | LuaType::Def(bound_id) => bound_id == type_id,
-            _ => false,
-        })
 }
 
 fn local_table_decl_member_owner(decl: &LuaDecl, root: &LuaSyntaxNode) -> Option<LuaMemberOwner> {
@@ -307,6 +294,74 @@ mod tests {
         let mixed = LuaType::from_vec_structural(vec![left, right, LuaType::BooleanConst(false)]);
 
         assert_eq!(merge_open_table_types(&db, vec![mixed.clone()]), mixed);
+    }
+
+    /// The class→table-owner lookup answers the live decl bindings: editing
+    /// the annotation that binds a local table to a class moves the table's
+    /// members to the newly bound class without any cache to invalidate.
+    #[test]
+    fn local_class_table_lookup_follows_decl_rebinds_across_edits() {
+        use crate::VirtualWorkspace;
+
+        use super::local_class_table_member_ids;
+
+        const INITIAL: &str = r#"
+            ---@class BoundClass
+            ---@class OtherClass
+
+            ---@type BoundClass
+            local instance = { speed = 10 }
+
+            ---@type OtherClass
+            local other = { power = 5 }
+        "#;
+        const REBOUND: &str = r#"
+            ---@class BoundClass
+            ---@class OtherClass
+
+            ---@type OtherClass
+            local instance = { speed = 10 }
+
+            ---@type OtherClass
+            local other = { power = 5 }
+        "#;
+
+        let mut ws = VirtualWorkspace::new();
+        let uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/shared/bound.lua");
+        ws.analysis
+            .update_file_by_uri(&uri, Some(INITIAL.to_string()))
+            .map(|(id, _)| id)
+            .expect("initial file indexed");
+        let bound = LuaTypeDeclId::global("BoundClass");
+        let other = LuaTypeDeclId::global("OtherClass");
+        let speed = LuaMemberKey::Name("speed".into());
+        let db = ws.analysis.compilation.get_db();
+        assert_eq!(
+            local_class_table_member_ids(db, &bound, &speed).len(),
+            1,
+            "the table bound to BoundClass backs it",
+        );
+        assert!(
+            local_class_table_member_ids(db, &other, &speed).is_empty(),
+            "no table bound to OtherClass carries speed yet",
+        );
+
+        ws.analysis
+            .update_file_by_uri(&uri, Some(REBOUND.to_string()))
+            .map(|(id, _)| id)
+            .expect("rebound file indexed");
+        let db = ws.analysis.compilation.get_db();
+        assert!(
+            local_class_table_member_ids(db, &bound, &speed).is_empty(),
+            "rebinding the only table away leaves BoundClass with no backer",
+        );
+        assert_eq!(
+            local_class_table_member_ids(db, &other, &speed).len(),
+            1,
+            "the rebound table now backs OtherClass",
+        );
     }
 }
 

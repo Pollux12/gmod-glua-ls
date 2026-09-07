@@ -169,8 +169,6 @@ pub struct LuaInferCache {
         (LuaType, LuaMemberKey, Option<TextSize>),
         Option<(LuaType, Option<LuaSemanticDeclId>)>,
     >,
-    pub local_class_table_member_ids_cache:
-        FxHashMap<(LuaTypeDeclId, LuaMemberKey), Arc<Vec<LuaMemberId>>>,
     pub dynamic_field_type_cache: FxHashMap<LuaMemberId, Option<LuaType>>,
     pub dynamic_field_definition_syntax_cache:
         FxHashMap<InFiled<TextRange>, DynamicFieldDefinitionSyntax>,
@@ -237,7 +235,6 @@ impl LuaInferCache {
             in_place_ipairs_transform_cache: FxHashMap::default(),
             dynamic_field_scope_metatable_cache: FxHashMap::default(),
             dynamic_field_resolution_cache: FxHashMap::default(),
-            local_class_table_member_ids_cache: FxHashMap::default(),
             dynamic_field_type_cache: FxHashMap::default(),
             dynamic_field_definition_syntax_cache: FxHashMap::default(),
             dynamic_field_resolving: HashSet::default(),
@@ -373,7 +370,6 @@ impl LuaInferCache {
         self.in_place_ipairs_transform_cache.clear();
         self.dynamic_field_scope_metatable_cache.clear();
         self.dynamic_field_resolution_cache.clear();
-        self.local_class_table_member_ids_cache.clear();
         self.dynamic_field_type_cache.clear();
         self.dynamic_field_definition_syntax_cache.clear();
         self.dynamic_field_resolving.clear();
@@ -485,7 +481,6 @@ impl LuaInferCache {
         self.in_place_ipairs_transform_cache.clear();
         self.dynamic_field_scope_metatable_cache.clear();
         self.dynamic_field_resolution_cache.clear();
-        self.local_class_table_member_ids_cache.clear();
         self.dynamic_field_type_cache.clear();
         self.dynamic_field_definition_syntax_cache.clear();
         self.dynamic_field_resolving.clear();

@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use glua_code_analysis::SharedDiagnosticComponentCache;
 use glua_code_analysis::{EmmyLuaAnalysis, FileId, SharedDiagnosticData};
 use log::{debug, info, warn};
 use lsp_types::{Diagnostic, PublishDiagnosticsParams, Uri};
@@ -20,25 +21,27 @@ use super::{ClientProxy, Freshness, ProgressTask, StatusBar};
 #[derive(Clone, Default)]
 pub(crate) struct SharedDiagnosticDataCache {
     cached: Arc<StdMutex<Option<Arc<SharedDiagnosticData>>>>,
+    components: SharedDiagnosticComponentCache,
 }
 
 impl SharedDiagnosticDataCache {
     fn get_or_precompute(&self, analysis: &EmmyLuaAnalysis) -> Arc<SharedDiagnosticData> {
-        if let Ok(mut cache) = self.cached.lock() {
-            if let Some(cached) = cache.as_ref() {
-                return cached.clone();
-            }
-
-            let shared_data = analysis.precompute_diagnostic_shared_data();
-            *cache = Some(shared_data.clone());
-            return shared_data;
+        // Fast path: the assembled bundle is reused whole while every
+        // component is still fresh for the current index revisions.
+        let cached = self.cached.lock().ok().and_then(|cache| cache.clone());
+        if let Some(cached) = cached
+            && self.components.is_fresh(analysis.compilation.get_db())
+        {
+            return cached;
         }
 
-        analysis.precompute_diagnostic_shared_data()
+        self.force_precompute(analysis)
     }
 
     fn force_precompute(&self, analysis: &EmmyLuaAnalysis) -> Arc<SharedDiagnosticData> {
-        let shared_data = analysis.precompute_diagnostic_shared_data();
+        let shared_data = analysis
+            .diagnostic
+            .precompute_shared_data_with_cache(&analysis.compilation, &self.components);
         if let Ok(mut cache) = self.cached.lock() {
             *cache = Some(shared_data.clone());
         }
@@ -49,6 +52,7 @@ impl SharedDiagnosticDataCache {
         if let Ok(mut cache) = self.cached.lock() {
             *cache = None;
         }
+        self.components.invalidate();
     }
 
     #[cfg(test)]
