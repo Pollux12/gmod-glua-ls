@@ -14,8 +14,9 @@ use crate::{
 };
 
 use super::{
-    RawGetMemberTypeResult, get_buildin_type_map_type_id, local_class_table_member_ids,
-    member_key_as_type, member_key_matches_type, merge_open_table_types,
+    RawGetMemberTypeResult, cached_local_class_table_member_ids, get_buildin_type_map_type_id,
+    local_class_table_member_ids, member_key_as_type, member_key_matches_type,
+    merge_open_table_types,
 };
 
 pub fn infer_raw_member_type(
@@ -454,11 +455,14 @@ fn infer_custom_type_raw_member_type(
     {
         return member_item.resolve_type(db);
     }
-    let local_class_member_ids = local_class_table_member_ids(db, type_id, member_key);
+    let local_class_member_ids = match cache.as_deref_mut() {
+        Some(cache) => cached_local_class_table_member_ids(db, cache, type_id, member_key),
+        None => Arc::new(local_class_table_member_ids(db, type_id, member_key)),
+    };
     if !local_class_member_ids.is_empty() {
         let member_item = match local_class_member_ids.as_slice() {
             [member_id] => LuaMemberIndexItem::One(*member_id),
-            _ => LuaMemberIndexItem::Many(local_class_member_ids),
+            _ => LuaMemberIndexItem::Many(local_class_member_ids.as_ref().clone()),
         };
         return member_item.resolve_type(db);
     }

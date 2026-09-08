@@ -229,6 +229,17 @@ pub struct LuaInferCache {
         ),
         Result<LuaType, InferFailReason>,
     >,
+    /// Memo for `local_class_table_member_ids`, keyed by class and member key.
+    /// Each entry carries the `DbIndex::type_structure_revision` it was built
+    /// against; a hit is valid only when the revision still matches. The
+    /// revision bumps on every mutable type/member/signature/module access
+    /// and on remove/clear, which covers the type-bound-decl and member-slot
+    /// writes this query reads, so mutable analysis never sees a stale hit.
+    /// Decl initializers and VFS syntax are fixed within a batch, and a
+    /// synthetic decl only becomes relevant after a type-index bind that
+    /// bumps the revision.
+    pub local_class_table_member_ids_cache:
+        FxHashMap<(LuaTypeDeclId, LuaMemberKey), (u64, Arc<Vec<LuaMemberId>>)>,
     pub dynamic_field_type_cache: FxHashMap<LuaMemberId, Option<LuaType>>,
     pub dynamic_field_definition_syntax_cache:
         FxHashMap<InFiled<TextRange>, DynamicFieldDefinitionSyntax>,
@@ -302,6 +313,7 @@ impl LuaInferCache {
             dynamic_field_scope_metatable_cache: FxHashMap::default(),
             dynamic_field_resolution_cache: FxHashMap::default(),
             owner_raw_member_type_cache: FxHashMap::default(),
+            local_class_table_member_ids_cache: FxHashMap::default(),
             dynamic_field_type_cache: FxHashMap::default(),
             dynamic_field_definition_syntax_cache: FxHashMap::default(),
             dynamic_field_resolving: HashSet::default(),
@@ -444,6 +456,7 @@ impl LuaInferCache {
         self.dynamic_field_scope_metatable_cache.clear();
         self.dynamic_field_resolution_cache.clear();
         self.owner_raw_member_type_cache.clear();
+        self.local_class_table_member_ids_cache.clear();
         self.dynamic_field_type_cache.clear();
         self.dynamic_field_definition_syntax_cache.clear();
         self.dynamic_field_resolving.clear();
