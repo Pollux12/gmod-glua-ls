@@ -38,7 +38,7 @@ use crate::{
     },
     db_index::{
         LuaFunctionType, LuaMemberFeature, LuaMemberOwner, LuaOutParamRoot, LuaSignature,
-        LuaSignatureId,
+        LuaSignatureId, SpecialCallFact,
     },
     find_members_with_key, get_member_value_expr, humanize_type,
     semantic::{
@@ -658,8 +658,15 @@ pub fn try_resolve_module(
         .get_module_index_mut()
         .get_module_mut(module.file_id)
         .ok_or(InferFailReason::None)?;
-    module_info.export_type = Some(expr_type);
-    module_info.semantic_id = semantic_id;
+    // Re-settling an identical export moves nothing observable: only a novel
+    // fact may bump the module epoch.
+    let changed = module_info.export_type.as_ref() != Some(&expr_type)
+        || module_info.semantic_id != semantic_id;
+    if changed {
+        module_info.export_type = Some(expr_type);
+        module_info.semantic_id = semantic_id;
+        db.get_module_index_mut().note_module_write(module.file_id);
+    }
     Ok(())
 }
 
@@ -1951,6 +1958,7 @@ fn collect_signature_special_call_params(
     signature: &LuaSignature,
     signature_id: LuaSignatureId,
 ) -> Vec<SpecialCallParamInfo> {
+    crate::db_index::read_set::record_param(&signature_id);
     let mut param_infos = Vec::new();
     for (idx, param_info) in &signature.param_docs {
         let is_constructor = param_info.get_attribute_by_name("constructor").is_some();
@@ -2458,6 +2466,12 @@ fn materialize_str_tpl_class_from_call(
         Some(existing_decl) => existing_decl.is_auto_generated(),
         None => true,
     };
+    // A re-settled call replays the same materialization: only a novel decl
+    // or super edge may bump the special-call epoch. The facts carry their
+    // full identity (call-site, class, constraint, source), so replaying them
+    // in any order hits the same dedup keys.
+    let call_position = call_expr.get_position();
+    let mut novel_facts = Vec::new();
     if db.get_type_index().get_type_decl(&class_decl_id).is_none() {
         db.get_type_index_mut().add_type_decl(
             file_id,
@@ -2470,19 +2484,46 @@ fn materialize_str_tpl_class_from_call(
                 class_decl_id.clone(),
             ),
         );
+        novel_facts.push(SpecialCallFact::str_tpl_decl(
+            file_id,
+            call_position,
+            class_decl_id.clone(),
+            LuaType::Ref(constraint.clone()),
+            param_idx,
+            is_colon_define,
+            is_colon_call,
+        ));
     }
 
     if !should_attach_super {
+        if !novel_facts.is_empty() {
+            db.get_flow_index_mut()
+                .install_special_call_facts(file_id, call_position, novel_facts);
+        }
         return Ok(());
     }
 
     let super_type = LuaType::Ref(constraint);
-    db.get_type_index_mut().add_super_type_if_missing(
-        class_decl_id,
+    let source_range = arg_expr.get_range();
+    if db.get_type_index_mut().add_super_type_if_missing(
+        class_decl_id.clone(),
         file_id,
-        arg_expr.get_range(),
-        super_type,
-    );
+        source_range,
+        super_type.clone(),
+    ) {
+        novel_facts.push(SpecialCallFact::super_edge(
+            file_id,
+            call_position,
+            class_decl_id,
+            super_type,
+            file_id,
+            source_range,
+        ));
+    }
+    if !novel_facts.is_empty() {
+        db.get_flow_index_mut()
+            .install_special_call_facts(file_id, call_position, novel_facts);
+    }
 
     Ok(())
 }
@@ -2500,6 +2541,7 @@ fn try_resolve_constructor_param(
             .get_signature_index()
             .get(&signature_id)
             .ok_or(InferFailReason::None)?;
+        crate::db_index::read_set::record_param(&signature_id);
         let param_doc = signature
             .get_param_info_by_id(param_info.param_idx)
             .ok_or(InferFailReason::None)?;
@@ -2570,12 +2612,25 @@ fn try_resolve_constructor_param(
             .map(|arg| arg.get_range())
             .unwrap_or_else(|| call_expr.get_range());
             let root_type = LuaType::Ref(root_type_id.clone());
-            db.get_type_index_mut().add_super_type_if_missing(
+            if db.get_type_index_mut().add_super_type_if_missing(
                 target_id.clone(),
                 file_id,
                 source_range,
-                root_type,
-            );
+                root_type.clone(),
+            ) {
+                db.get_flow_index_mut().install_special_call_facts(
+                    file_id,
+                    call_expr.get_position(),
+                    [SpecialCallFact::super_edge(
+                        file_id,
+                        call_expr.get_position(),
+                        target_id.clone(),
+                        root_type,
+                        file_id,
+                        source_range,
+                    )],
+                );
+            }
         }
     }
 
@@ -2604,8 +2659,16 @@ fn try_resolve_constructor_param(
         .ok_or(InferFailReason::FieldNotFound)?;
     let ctor_signature_member = members.first().ok_or(InferFailReason::FieldNotFound)?;
 
-    set_signature_to_default_call(db, cache, ctor_signature_member, strip_self, return_self)
-        .ok_or(InferFailReason::FieldNotFound)?;
+    set_signature_to_default_call(
+        db,
+        cache,
+        ctor_signature_member,
+        strip_self,
+        return_self,
+        file_id,
+        call_expr.get_position(),
+    )
+    .ok_or(InferFailReason::FieldNotFound)?;
 
     Ok(())
 }
@@ -2616,7 +2679,9 @@ fn set_signature_to_default_call(
     member_info: &LuaMemberInfo,
     strip_self: bool,
     return_self: bool,
-) -> Option<()> {
+    site_file: FileId,
+    site_position: TextSize,
+) -> Option<bool> {
     let LuaType::Signature(signature_id) = member_info.typ else {
         return None;
     };
@@ -2644,7 +2709,7 @@ fn set_signature_to_default_call(
     }
 
     let operator = LuaOperator::new(
-        decl_id.into(),
+        decl_id.clone().into(),
         LuaOperatorMetaMethod::Call,
         member_id.file_id,
         // 必须指向名称, 使用 index_expr 的完整范围不会跳转到函数上
@@ -2655,8 +2720,24 @@ fn set_signature_to_default_call(
             return_self,
         },
     );
-    db.get_operator_index_mut().add_operator(operator);
-    Some(())
+    let operator_id = operator.get_id();
+    let installed = db.get_operator_index_mut().add_operator(operator);
+    if installed {
+        db.get_flow_index_mut().install_special_call_facts(
+            site_file,
+            site_position,
+            [SpecialCallFact::call_operator(
+                site_file,
+                site_position,
+                operator_id,
+                LuaOperatorOwner::Type(decl_id),
+                signature_id,
+                strip_self,
+                return_self,
+            )],
+        );
+    }
+    Some(installed)
 }
 
 fn get_constructor_target_type(
@@ -3142,6 +3223,281 @@ mod tests {
         assert_eq!(
             before, after,
             "identical docs and correlations must not advance return_write_version"
+        );
+    }
+
+    /// Installing a module export bumps its epoch once; re-settling the
+    /// identical export must not bump, or the fixpoint filter degrades to a
+    /// full requeue.
+    #[test]
+    fn resettling_module_export_without_changes_bumps_no_module_epoch() {
+        use glua_parser::{LuaAstNode, LuaExpr, LuaParser, LuaTableExpr, ParserConfig};
+
+        use super::{UnResolveModule, try_resolve_module};
+
+        let mut db = make_db();
+        let file_id = FileId::new(1);
+        db.get_module_index_mut()
+            .add_workspace_root(Path::new("C:/proj").into(), WorkspaceId::MAIN);
+        db.get_module_index_mut()
+            .add_module_by_path(file_id, "C:/proj/mylib.lua");
+
+        let tree = LuaParser::parse("return { value = 1 }", ParserConfig::default());
+        let table_expr = tree
+            .get_chunk_node()
+            .descendants::<LuaTableExpr>()
+            .next()
+            .expect("expected table expression");
+        let mut item = UnResolveModule {
+            file_id,
+            expr: LuaExpr::TableExpr(table_expr),
+        };
+        let mut cache = crate::LuaInferCache::new(file_id, Default::default());
+
+        try_resolve_module(&mut db, &mut cache, &mut item)
+            .expect("expected the novel export install to succeed");
+        assert_eq!(
+            db.get_module_index().module_writes(),
+            1,
+            "the novel export install must bump the module epoch"
+        );
+
+        try_resolve_module(&mut db, &mut cache, &mut item)
+            .expect("expected the identical re-settle to succeed");
+        assert_eq!(
+            db.get_module_index().module_writes(),
+            1,
+            "re-settling an identical export must not bump the module epoch"
+        );
+    }
+
+    const SPECIAL_DEFS: &str = r#"
+        ---@class Entity
+
+        ents = {}
+
+        ---@generic T: Entity
+        ---@param class `T`
+        ---@return T[]
+        function ents.FindByClass(class) end
+
+        ---@class TraceResult
+        ---@field Hit boolean
+        local TraceResult = {}
+
+        util = {}
+
+        ---@outparam traceConfig.output TraceResult
+        ---@param traceConfig table
+        function util.TraceLine(traceConfig) end
+    "#;
+
+    const SPECIAL_CALLER_A: &str = r#"local found_a = ents.FindByClass("prop_vehicle_jeep")"#;
+    const SPECIAL_CALLER_B: &str = r#"local found_b = ents.FindByClass("prop_vehicle_jeep")"#;
+    const SPECIAL_CALLER_C: &str = r#"
+        local ray = {}
+        local traceData = {
+            output = ray,
+        }
+
+        util.TraceLine(traceData)
+    "#;
+
+    fn special_call_workspace() -> (
+        crate::VirtualWorkspace,
+        Vec<(FileId, Vec<glua_parser::LuaCallExpr>)>,
+    ) {
+        use glua_parser::LuaAstNode;
+
+        let mut ws = crate::VirtualWorkspace::new();
+        ws.def_file("defs.lua", SPECIAL_DEFS);
+        let caller_ids = [
+            ws.def_file("caller_a.lua", SPECIAL_CALLER_A),
+            ws.def_file("caller_b.lua", SPECIAL_CALLER_B),
+            ws.def_file("caller_c.lua", SPECIAL_CALLER_C),
+        ];
+        let db = ws.get_db_mut();
+        assert!(
+            db.get_flow_index().special_call_writes() > 0,
+            "the fixture must settle special-call facts"
+        );
+        let generated = LuaTypeDeclId::global("prop_vehicle_jeep");
+        assert!(
+            db.get_type_index().get_type_decl(&generated).is_some(),
+            "the fixture must synthesize the str-tpl class"
+        );
+
+        let mut sites = Vec::new();
+        for file_id in caller_ids {
+            let calls = db
+                .get_vfs()
+                .get_syntax_tree(&file_id)
+                .expect("expected syntax tree")
+                .get_chunk_node()
+                .descendants::<glua_parser::LuaCallExpr>()
+                .collect::<Vec<_>>();
+            assert!(
+                !calls.is_empty(),
+                "expected call expressions in {file_id:?}"
+            );
+            sites.push((file_id, calls));
+        }
+        (ws, sites)
+    }
+
+    /// Re-drives every special-call site in `order`, returning how much the
+    /// replay moved the special-call epoch.
+    fn resettle_special_calls(
+        db: &mut DbIndex,
+        sites: &[(FileId, Vec<glua_parser::LuaCallExpr>)],
+        order: &[usize],
+    ) -> u64 {
+        use super::{UnResolveSpecialCall, try_resolve_special_call};
+
+        let before = db.get_flow_index().special_call_writes();
+        for &idx in order {
+            let (file_id, calls) = &sites[idx];
+            for call_expr in calls {
+                let mut item = UnResolveSpecialCall {
+                    file_id: *file_id,
+                    call_expr: call_expr.clone(),
+                };
+                let mut cache = crate::LuaInferCache::new(*file_id, Default::default());
+                try_resolve_special_call(db, &mut cache, &mut item)
+                    .expect("expected the settled call to re-derive");
+            }
+        }
+        db.get_flow_index().special_call_writes() - before
+    }
+
+    /// Replaying the same special-call fact set in two orders bumps nothing on
+    /// the second pass: identical facts build identical dedup keys however the
+    /// pass interleaves the sites, so the fixpoint's novelty trigger stays
+    /// quiet on re-settle.
+    #[test]
+    fn resettling_special_calls_in_any_order_bumps_no_special_epoch() {
+        use glua_parser::LuaAstNode;
+
+        let (mut ws, mut sites) = special_call_workspace();
+
+        let db = ws.get_db_mut();
+        assert_eq!(
+            resettle_special_calls(db, &sites, &[0, 1, 2]),
+            0,
+            "replaying settled special calls must not bump"
+        );
+        assert_eq!(
+            resettle_special_calls(db, &sites, &[2, 1, 0]),
+            0,
+            "replaying settled special calls in reverse order must not bump"
+        );
+
+        // The epoch is live, not stuck: a genuinely new class still counts.
+        let live_before = db.get_flow_index().special_call_writes();
+        let caller_d = ws.def_file(
+            "caller_d.lua",
+            r#"local found_d = ents.FindByClass("prop_vehicle_apc")"#,
+        );
+        assert!(
+            ws.get_db_mut().get_flow_index().special_call_writes() > live_before,
+            "a novel class install must still bump the epoch"
+        );
+        let db = ws.get_db_mut();
+        let new_calls = db
+            .get_vfs()
+            .get_syntax_tree(&caller_d)
+            .expect("expected syntax tree")
+            .get_chunk_node()
+            .descendants::<glua_parser::LuaCallExpr>()
+            .collect::<Vec<_>>();
+        sites.push((caller_d, new_calls));
+        assert_eq!(
+            resettle_special_calls(db, &sites, &[3, 2, 1, 0]),
+            0,
+            "replaying after a novel install must not bump again"
+        );
+    }
+
+    /// Defining the same callers in the opposite order settles the same epoch:
+    /// which site materializes a shared fact first must not change the count.
+    #[test]
+    fn mirrored_workspaces_settle_special_calls_to_same_special_epoch() {
+        let mut forward = crate::VirtualWorkspace::new();
+        forward.def_file("defs.lua", SPECIAL_DEFS);
+        forward.def_file("caller_a.lua", SPECIAL_CALLER_A);
+        forward.def_file("caller_b.lua", SPECIAL_CALLER_B);
+        forward.def_file("caller_c.lua", SPECIAL_CALLER_C);
+
+        let mut reverse = crate::VirtualWorkspace::new();
+        reverse.def_file("defs.lua", SPECIAL_DEFS);
+        reverse.def_file("caller_c.lua", SPECIAL_CALLER_C);
+        reverse.def_file("caller_b.lua", SPECIAL_CALLER_B);
+        reverse.def_file("caller_a.lua", SPECIAL_CALLER_A);
+
+        assert_eq!(
+            forward.get_db_mut().get_flow_index().special_call_writes(),
+            reverse.get_db_mut().get_flow_index().special_call_writes(),
+            "definition order must not change the settled special-call epoch"
+        );
+    }
+
+    /// A constructor call's `__call` install reports itself the same way on
+    /// replay without moving the epoch: an existing install is not novel.
+    #[test]
+    fn resettling_constructor_special_call_bumps_no_special_epoch() {
+        use glua_parser::LuaAstNode;
+
+        use super::{UnResolveSpecialCall, try_resolve_special_call};
+
+        let mut ws = crate::VirtualWorkspace::new();
+        ws.def_file(
+            "defs.lua",
+            r#"
+                ---@attribute constructor(name: string, root_class: string?, strip_self: boolean?, return_self: boolean?)
+
+                ---@class Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@[constructor("__init", "Entity")]
+                ---@param class `T`
+                ---@return T[]
+                function ents.FindByClass(class)
+                end
+            "#,
+        );
+        let caller_id = ws.def_file(
+            "caller.lua",
+            r#"local found = ents.FindByClass("prop_vehicle_jeep")"#,
+        );
+
+        let db = ws.get_db_mut();
+        let baseline = db.get_flow_index().special_call_writes();
+        assert!(baseline > 0, "the fixture must settle special-call facts");
+        let calls = db
+            .get_vfs()
+            .get_syntax_tree(&caller_id)
+            .expect("expected syntax tree")
+            .get_chunk_node()
+            .descendants::<glua_parser::LuaCallExpr>()
+            .collect::<Vec<_>>();
+        assert!(!calls.is_empty(), "expected the constructor call");
+
+        for call_expr in &calls {
+            let mut item = UnResolveSpecialCall {
+                file_id: caller_id,
+                call_expr: call_expr.clone(),
+            };
+            let mut cache = crate::LuaInferCache::new(caller_id, Default::default());
+            // An already-installed `__call` reports itself instead of
+            // reinstalling; either way the epoch must not move.
+            let _ = try_resolve_special_call(db, &mut cache, &mut item);
+        }
+        assert_eq!(
+            db.get_flow_index().special_call_writes(),
+            baseline,
+            "replaying a settled constructor call must not bump"
         );
     }
 }

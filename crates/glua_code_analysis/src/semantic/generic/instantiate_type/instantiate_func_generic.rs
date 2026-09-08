@@ -152,6 +152,7 @@ fn resolve_str_default_from_arg_inner(
             ..
         } = &decl.extra
         {
+            crate::db_index::read_set::record_param(signature_id);
             if let Some(default_val) = db
                 .get_signature_index()
                 .get(signature_id)

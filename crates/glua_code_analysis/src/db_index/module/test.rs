@@ -558,4 +558,33 @@ mod tests {
             assert_eq!(resolved.workspace_id, WorkspaceId::MAIN);
         }
     }
+
+    #[test]
+    fn module_write_versions_start_at_zero_and_bump_per_file() {
+        let mut m = create_module();
+        let file_id = FileId { id: 1 };
+        let other_id = FileId { id: 2 };
+
+        assert_eq!(m.module_writes(), 0);
+        assert_eq!(m.module_write_version(&file_id), 0);
+
+        m.note_module_write(file_id);
+        assert_eq!(m.module_writes(), 1);
+        assert_eq!(m.module_write_version(&file_id), 1);
+        assert_eq!(m.module_write_version(&other_id), 0);
+    }
+
+    #[test]
+    fn removing_module_bumps_its_export_version() {
+        let mut m = create_module();
+        m.add_workspace_root(
+            Path::new("C:/Users/username/Documents").into(),
+            WorkspaceId::MAIN,
+        );
+        let file_id = FileId { id: 1 };
+        m.add_module_by_path(file_id, "C:/Users/username/Documents/test.lua");
+
+        m.remove(file_id);
+        assert_eq!(m.module_write_version(&file_id), 1);
+    }
 }

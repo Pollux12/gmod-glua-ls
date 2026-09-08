@@ -1572,18 +1572,23 @@ impl LuaTypeIndex {
         })
     }
 
+    /// Inserts `super_type` unless the same edge from the same source already
+    /// exists, reporting whether it was new. Re-settling an identical edge
+    /// moves nothing observable: only a novel insert may bump a write epoch,
+    /// or the fixpoint's staleness filter degrades to a full requeue.
     pub fn add_super_type_if_missing(
         &mut self,
         decl_id: LuaTypeDeclId,
         file_id: FileId,
         source_range: TextRange,
         super_type: LuaType,
-    ) {
+    ) -> bool {
         if self.has_super_type_at_source(&decl_id, file_id, source_range, &super_type) {
-            return;
+            return false;
         }
 
         self.add_super_type(decl_id, file_id, source_range, super_type);
+        true
     }
 
     pub fn get_super_types(&self, decl_id: &LuaTypeDeclId) -> Option<Vec<LuaType>> {

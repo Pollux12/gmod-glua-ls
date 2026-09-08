@@ -32,8 +32,15 @@ impl LuaOperatorIndex {
         }
     }
 
-    pub fn add_operator(&mut self, operator: LuaOperator) {
+    /// Installs `operator`, reporting whether it was new. Re-settling an
+    /// identical operator moves nothing observable: only a novel install may
+    /// bump a write epoch, or the fixpoint's staleness filter degrades to a
+    /// full requeue.
+    pub fn add_operator(&mut self, operator: LuaOperator) -> bool {
         let id = operator.get_id();
+        if self.operators.contains_key(&id) {
+            return false;
+        }
         let owner = operator.get_owner().clone();
         let op = operator.get_op();
         self.operators.insert(id, operator);
@@ -47,6 +54,7 @@ impl LuaOperatorIndex {
             .entry(id.file_id)
             .or_default()
             .push(id);
+        true
     }
 
     pub fn get_operators(

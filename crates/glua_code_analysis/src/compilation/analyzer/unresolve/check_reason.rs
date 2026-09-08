@@ -73,12 +73,11 @@ pub fn check_reach_reason(
 /// The check runs a full `infer_expr`, which on a cold cache is the expensive
 /// half of the reach gate. Re-running it once per wave for every surviving
 /// expression group is pure re-derivation while nothing the expression could
-/// read has moved, so entries are validated against the type/return write
-/// epochs plus a caller-bumped epoch covering index writes outside those
-/// counters (signature params, un-noted doc returns, module exports).
+/// read has moved, so entries are validated against the type/return/param/
+/// module/special-call/contribution/dynamic-field write epochs.
 #[derive(Default)]
 pub struct ExprReachMemo {
-    entries: FxHashMap<InferFailReason, (bool, u64, u64, u64)>,
+    entries: FxHashMap<InferFailReason, (bool, u64, u64, u64, u64, u64, u64, u64)>,
 }
 
 impl ExprReachMemo {
@@ -87,21 +86,45 @@ impl ExprReachMemo {
         db: &DbIndex,
         infer_manager: &mut InferCacheManager,
         reason: &InferFailReason,
-        other_epoch: u64,
     ) -> bool {
         let epochs = (
             db.get_type_index().type_writes(),
             db.get_signature_index().return_writes(),
-            other_epoch,
+            db.get_signature_index().param_writes(),
+            db.get_module_index().module_writes(),
+            db.get_flow_index().special_call_writes(),
+            db.get_call_site_param_index().contrib_writes(),
+            db.get_dynamic_field_index().dynamic_writes(),
         );
-        if let Some((reached, type_epoch, return_epoch, seen_other)) = self.entries.get(reason)
-            && (*type_epoch, *return_epoch, *seen_other) == epochs
+        if let Some((
+            reached,
+            type_epoch,
+            return_epoch,
+            param_epoch,
+            module_epoch,
+            special_epoch,
+            contrib_epoch,
+            dynamic_epoch,
+        )) = self.entries.get(reason)
+            && (
+                *type_epoch,
+                *return_epoch,
+                *param_epoch,
+                *module_epoch,
+                *special_epoch,
+                *contrib_epoch,
+                *dynamic_epoch,
+            ) == epochs
         {
             return *reached;
         }
         let reached = check_reach_reason(db, infer_manager, reason).unwrap_or(false);
-        self.entries
-            .insert(reason.clone(), (reached, epochs.0, epochs.1, epochs.2));
+        self.entries.insert(
+            reason.clone(),
+            (
+                reached, epochs.0, epochs.1, epochs.2, epochs.3, epochs.4, epochs.5, epochs.6,
+            ),
+        );
         reached
     }
 }
@@ -215,6 +238,7 @@ pub fn resolve_as_unknown(
             let module = db.get_module_index_mut().get_module_mut(*file_id)?;
             if module.export_type.is_none() {
                 module.export_type = Some(LuaType::Unknown);
+                db.get_module_index_mut().note_module_write(*file_id);
             }
         }
     }

@@ -789,7 +789,7 @@ fn overload_has_special_call_params(func: &LuaFunctionType) -> bool {
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LuaDocParamInfo {
     pub name: String,
     pub type_ref: LuaType,
@@ -952,7 +952,7 @@ pub enum LuaDocDefaultValue {
     Expression(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LuaDocReturnInfo {
     pub name: Option<String>,
     pub type_ref: LuaType,
