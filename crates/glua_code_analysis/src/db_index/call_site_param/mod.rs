@@ -128,6 +128,13 @@ pub struct CallSiteParamIndex {
     /// every apply rebuilds the whole derived state; see
     /// `flush_deferred_contributions`.
     deferred_contributions: Vec<(FileId, CallSiteParamContribution)>,
+    /// Count of call-site-inferred parameter changes, keyed by the callee
+    /// slot that holds them. Contributions are queued by the unresolve items
+    /// but applied wholesale by the flush/rebuild paths, so without this
+    /// counter every queued settle looks like unversioned state and forces a
+    /// full fixpoint requeue.
+    contrib_writes: u64,
+    contrib_write_versions: HashMap<(LuaSignatureId, usize), u64>,
     /// signature → param index → union of all observed types from current file contributions.
     inferred_params: HashMap<LuaSignatureId, HashMap<usize, LuaTypeFact>>,
     /// file declaring a signature → files whose calls have supplied evidence for
@@ -228,6 +235,10 @@ impl CallSiteParamIndex {
     pub fn remap_file_signatures(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
         let file_id = remap.file_id;
         let candidates = self.stored_signature_ids_for_file(file_id);
+        // The re-keying below rebuilds the folded facts wholesale, so the
+        // versions tick from a whole-index snapshot rather than a per-slot
+        // delta. Cold builds never reach here; this is the incremental path.
+        let facts_before = self.snapshot_all_param_facts();
 
         let mut moved = HashMap::default();
         let mut lost: HashSet<LuaSignatureId> = HashSet::default();
@@ -284,12 +295,13 @@ impl CallSiteParamIndex {
         }
 
         if !moved.is_empty() {
-            self.remap_signatures(&moved);
+            self.remap_signatures_inner(&moved);
         }
         if !moved.is_empty() || !lost.is_empty() {
             self.rebuild_derived_state();
             self.rebuild_return_consumers();
             self.rebuild_source_dependents();
+            self.tick_changed_contrib_writes(&facts_before);
         }
         dirty.remove(&file_id);
         dirty
@@ -351,6 +363,15 @@ impl CallSiteParamIndex {
     /// contributor outside the expansion keeps the id it recorded, so without
     /// this its evidence is stranded on a position the callee no longer has.
     fn remap_signatures(&mut self, moved: &HashMap<LuaSignatureId, LuaSignatureId>) {
+        let facts_before = self.snapshot_all_param_facts();
+        self.remap_signatures_inner(moved);
+        self.tick_changed_contrib_writes(&facts_before);
+    }
+
+    /// The re-keying half of [`Self::remap_signatures`], without the version
+    /// ticks, so the file-remap path (which rekeys more than signatures) can
+    /// tick once for the whole edit instead of once per re-keying.
+    fn remap_signatures_inner(&mut self, moved: &HashMap<LuaSignatureId, LuaSignatureId>) {
         for contributions in self.file_contributions.values_mut() {
             for contribution in contributions {
                 if let Some(new_id) = moved.get(&contribution.signature_id) {
@@ -505,6 +526,7 @@ impl CallSiteParamIndex {
         }
         self.rebuild_derived_state();
 
+        self.tick_changed_contrib_writes(&previous);
         self.changed_signatures(previous)
     }
 
@@ -539,13 +561,30 @@ impl CallSiteParamIndex {
     }
 
     /// Queue one call-site contribution recovered by deferred resolution.
+    ///
+    /// Reports whether the fact was queued. An identical fact filed by the
+    /// same file is a re-settled duplicate: skipping it keeps the flush from
+    /// folding the same evidence twice, which would only grow provenance.
     pub(crate) fn queue_deferred_contribution(
         &mut self,
         file_id: FileId,
         signature_id: LuaSignatureId,
         param_idx: usize,
         param_fact: LuaTypeFact,
-    ) {
+    ) -> bool {
+        let duplicate = self
+            .deferred_contributions
+            .iter()
+            .map(|(_, contribution)| contribution)
+            .chain(self.file_contributions.get(&file_id).into_iter().flatten())
+            .any(|contribution| {
+                contribution.signature_id == signature_id
+                    && contribution.param_idx == param_idx
+                    && contribution.param_fact == param_fact
+            });
+        if duplicate {
+            return false;
+        }
         self.deferred_contributions.push((
             file_id,
             CallSiteParamContribution {
@@ -554,6 +593,73 @@ impl CallSiteParamIndex {
                 param_fact,
             },
         ));
+        true
+    }
+
+    /// Compare it across an operation to tell whether the operation changed
+    /// any call-site-inferred parameter fact.
+    pub fn contrib_writes(&self) -> u64 {
+        self.contrib_writes
+    }
+
+    /// Records a call-site-inferred parameter change. Callers bump only for
+    /// slots whose folded fact actually changed; re-folding an identical fact
+    /// must not bump, or the fixpoint's staleness filter degrades to a full
+    /// requeue.
+    pub(crate) fn note_contrib_write(&mut self, signature_id: LuaSignatureId, param_idx: usize) {
+        self.contrib_writes += 1;
+        self.contrib_write_versions
+            .insert((signature_id, param_idx), self.contrib_writes);
+    }
+
+    pub(crate) fn contrib_write_version(
+        &self,
+        signature_id: &LuaSignatureId,
+        param_idx: usize,
+    ) -> u64 {
+        self.contrib_write_versions
+            .get(&(*signature_id, param_idx))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Bumps the version of every slot whose current fact differs from
+    /// `previous`, in a stable slot order so the counter values do not depend
+    /// on hash iteration. Comparison-only: the values never feed inference.
+    fn tick_changed_contrib_writes(
+        &mut self,
+        previous: &HashMap<(LuaSignatureId, usize), Option<LuaTypeFact>>,
+    ) {
+        let mut changed = previous
+            .iter()
+            .filter_map(|(key, previous_fact)| {
+                let current = self.get_inferred_param_fact(&key.0, key.1);
+                (previous_fact.as_ref() != current).then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        changed.sort_by_key(|(signature_id, param_idx)| {
+            (
+                signature_id.get_file_id(),
+                signature_id.get_position(),
+                *param_idx,
+            )
+        });
+        for (signature_id, param_idx) in changed {
+            self.note_contrib_write(signature_id, param_idx);
+        }
+    }
+
+    /// Every currently folded fact, for snapshotting across the rebuild paths
+    /// that hold no per-slot delta of their own.
+    fn snapshot_all_param_facts(&self) -> HashMap<(LuaSignatureId, usize), Option<LuaTypeFact>> {
+        self.inferred_params
+            .iter()
+            .flat_map(|(signature_id, params)| {
+                params
+                    .iter()
+                    .map(|(param_idx, fact)| ((*signature_id, *param_idx), Some(fact.clone())))
+            })
+            .collect()
     }
 
     /// Apply every queued deferred contribution and rebuild derived state once.
@@ -577,6 +683,7 @@ impl CallSiteParamIndex {
                 .push(contribution);
         }
         self.rebuild_derived_state();
+        self.tick_changed_contrib_writes(&previous);
         self.changed_signatures(previous)
     }
 
@@ -632,6 +739,7 @@ impl CallSiteParamIndex {
         signature_id: &LuaSignatureId,
         param_idx: usize,
     ) -> Option<&LuaTypeFact> {
+        crate::db_index::read_set::record_contrib(signature_id, param_idx);
         self.inferred_params
             .get(signature_id)
             .and_then(|params| params.get(&param_idx))
@@ -1150,6 +1258,11 @@ impl CallSiteParamIndex {
             let new_fact = self
                 .get_inferred_param_fact(signature_id, *param_idx)
                 .cloned();
+            // The refold above rewrote this pair's fact: readers of the slot
+            // go stale exactly when the fact differs.
+            if old_fact != new_fact {
+                self.note_contrib_write(*signature_id, *param_idx);
+            }
             self.refresh_param_events(
                 old_fact.as_ref(),
                 new_fact.as_ref(),
@@ -1323,6 +1436,7 @@ impl LuaIndex for CallSiteParamIndex {
         self.file_contributions.clear();
         self.deferred_contributions.clear();
         self.inferred_params.clear();
+        self.contrib_write_versions.clear();
         self.pending_previous_params.clear();
         self.file_return_consumers.clear();
         self.return_consumers.clear();

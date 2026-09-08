@@ -3364,19 +3364,59 @@ impl AnalyzeContext {
         self.drain_inferred_return_reads();
         for (signature_id, record) in std::mem::take(&mut self.inferred_return_reads) {
             let source_file_id = signature_id.get_file_id();
-            let mut dependencies = record
-                .reads
-                .type_owners
-                .into_iter()
-                .map(|owner| owner.get_file_id())
-                .chain(
-                    record
-                        .reads
-                        .signatures
-                        .into_iter()
-                        .map(|signature| signature.get_file_id()),
-                )
-                .collect::<HashSet<_>>();
+            let mut dependencies =
+                record
+                    .reads
+                    .type_owners
+                    .into_iter()
+                    .map(|owner| owner.get_file_id())
+                    .chain(
+                        record
+                            .reads
+                            .signatures
+                            .into_iter()
+                            .map(|signature| signature.get_file_id()),
+                    )
+                    .chain(
+                        record
+                            .reads
+                            .params
+                            .into_iter()
+                            .map(|signature| signature.get_file_id()),
+                    )
+                    .chain(record.reads.modules)
+                    .chain(
+                        record
+                            .reads
+                            .special_calls
+                            .into_iter()
+                            .map(|(file_id, _)| file_id),
+                    )
+                    .chain(
+                        record
+                            .reads
+                            .contribs
+                            .into_iter()
+                            .map(|(signature_id, _)| signature_id.get_file_id()),
+                    )
+                    .chain(record.reads.dynamic_fields.into_iter().flat_map(
+                        |(owner, field_name)| {
+                            let index = db.get_dynamic_field_index();
+                            match field_name {
+                                Some(field_name) => index
+                                    .field_definitions(&owner, field_name.as_str())
+                                    .iter()
+                                    .map(|definition| definition.file_id)
+                                    .collect::<Vec<_>>(),
+                                None => index
+                                    .get_wildcard_definitions(&owner)
+                                    .iter()
+                                    .map(|definition| definition.file_id)
+                                    .collect::<Vec<_>>(),
+                            }
+                        },
+                    ))
+                    .collect::<HashSet<_>>();
             dependencies.remove(&source_file_id);
             db.get_signature_index_mut()
                 .set_inferred_return_dependencies(signature_id, dependencies);
@@ -3394,6 +3434,33 @@ impl AnalyzeContext {
             .any(|owner| db.get_type_index().type_write_version(owner) > record.type_epoch)
             || record.reads.signatures.iter().any(|dependency| {
                 db.get_signature_index().return_write_version(dependency) > record.return_epoch
+            })
+            || record.reads.params.iter().any(|dependency| {
+                db.get_signature_index().param_write_version(dependency) > record.param_epoch
+            })
+            || record.reads.modules.iter().any(|dependency| {
+                db.get_module_index().module_write_version(dependency) > record.module_epoch
+            })
+            || record
+                .reads
+                .special_calls
+                .iter()
+                .any(|(file_id, position)| {
+                    db.get_flow_index()
+                        .special_call_write_version(file_id, position)
+                        > record.special_epoch
+                })
+            || record
+                .reads
+                .contribs
+                .iter()
+                .any(|(signature_id, param_idx)| {
+                    db.get_call_site_param_index()
+                        .contrib_write_version(signature_id, *param_idx)
+                        > record.contrib_epoch
+                })
+            || record.reads.dynamic_fields.iter().any(|key| {
+                db.get_dynamic_field_index().dynamic_write_version(key) > record.dynamic_epoch
             })
             || record
                 .reads

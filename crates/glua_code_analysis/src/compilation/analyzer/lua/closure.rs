@@ -2167,6 +2167,11 @@ pub fn derive_inferred_return_with_reads(
             reads,
             type_epoch: db.get_type_index().type_writes(),
             return_epoch: db.get_signature_index().return_writes(),
+            param_epoch: db.get_signature_index().param_writes(),
+            module_epoch: db.get_module_index().module_writes(),
+            special_epoch: db.get_flow_index().special_call_writes(),
+            contrib_epoch: db.get_call_site_param_index().contrib_writes(),
+            dynamic_epoch: db.get_dynamic_field_index().dynamic_writes(),
         },
     );
     (correlations, returns)

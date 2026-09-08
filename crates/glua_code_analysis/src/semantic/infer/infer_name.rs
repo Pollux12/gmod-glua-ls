@@ -971,6 +971,8 @@ fn infer_param_inner(
     let mut colon_define = false;
     // find local annotation
     if let Some(signature) = db.get_signature_index().get(&signature_id) {
+        // A missing contract is a read too: a later fill changes this answer.
+        crate::db_index::read_set::record_param(&signature_id);
         colon_define = signature.is_colon_define;
         if let Some(param_info) = signature.get_param_info_by_id(param_idx) {
             let mut typ = param_info.type_ref.clone();
@@ -1888,6 +1890,12 @@ pub fn infer_param_with_cache(
     cache: &mut LuaInferCache,
     decl: &LuaDecl,
 ) -> InferResult {
+    // The memoised answer below derives from this signature's parameter
+    // contract, so a cache hit must still record the read: the contract can
+    // move after the answer was memoised.
+    if let LuaDeclExtra::Param { signature_id, .. } = &decl.extra {
+        crate::db_index::read_set::record_param(signature_id);
+    }
     let decl_id = decl.get_id();
     if let Some(cache_entry) = cache.param_type_cache.get(&decl_id) {
         return match cache_entry {
@@ -2175,6 +2183,7 @@ fn find_param_type_from_type(
     match source_type {
         LuaType::Signature(signature_id) => {
             let signature = db.get_signature_index().get(&signature_id)?;
+            crate::db_index::read_set::record_param(&signature_id);
             let adjusted_idx =
                 adjust_param_idx(param_idx, current_colon_define, signature.is_colon_define);
 
@@ -2267,6 +2276,7 @@ fn find_param_type_from_union(
     match source_type {
         LuaType::Signature(signature_id) => {
             let signature = db.get_signature_index().get(&signature_id)?;
+            crate::db_index::read_set::record_param(&signature_id);
             if !signature.param_docs.is_empty() {
                 let adjusted_idx =
                     adjust_param_idx(param_idx, origin_colon_define, signature.is_colon_define);

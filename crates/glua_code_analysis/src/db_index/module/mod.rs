@@ -38,6 +38,12 @@ pub struct LuaModuleIndex {
     fuzzy_search: bool,
     module_replace_vec: Vec<(Regex, String)>,
     workspace_isolation_enabled: bool,
+    /// Count of module-export changes, keyed by exporting file. Module
+    /// exports are written by the unresolve items, so without this counter
+    /// every such write looks like unversioned state and forces a full
+    /// fixpoint requeue.
+    module_writes: u64,
+    module_write_versions: FxHashMap<FileId, u64>,
 }
 
 impl Default for LuaModuleIndex {
@@ -62,6 +68,8 @@ impl LuaModuleIndex {
             fuzzy_search: false,
             module_replace_vec: Vec::new(),
             workspace_isolation_enabled: true,
+            module_writes: 0,
+            module_write_versions: FxHashMap::default(),
         };
 
         let root_node = ModuleNode::default();
@@ -206,7 +214,31 @@ impl LuaModuleIndex {
     }
 
     pub fn get_module(&self, file_id: FileId) -> Option<&ModuleInfo> {
-        self.file_module_map.get(&file_id)
+        let module = self.file_module_map.get(&file_id)?;
+        crate::db_index::read_set::record_module(&module.file_id);
+        Some(module)
+    }
+
+    /// Compare it across an operation to tell whether the operation changed
+    /// any module's exported type.
+    pub fn module_writes(&self) -> u64 {
+        self.module_writes
+    }
+
+    /// Records a module-export change. Callers bump only when the write added
+    /// a novel fact; re-settling an identical export must not bump, or the
+    /// fixpoint's staleness filter degrades to a full requeue.
+    pub(crate) fn note_module_write(&mut self, file_id: FileId) {
+        self.module_writes += 1;
+        self.module_write_versions
+            .insert(file_id, self.module_writes);
+    }
+
+    pub(crate) fn module_write_version(&self, file_id: &FileId) -> u64 {
+        self.module_write_versions
+            .get(file_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn get_module_mut(&mut self, file_id: FileId) -> Option<&mut ModuleInfo> {
@@ -336,11 +368,17 @@ impl LuaModuleIndex {
     }
 
     pub fn find_module_for_file(&self, module_path: &str, file_id: FileId) -> Option<&ModuleInfo> {
-        if let Some(workspace_id) = self.get_workspace_id(file_id) {
-            return self.find_module_in_workspace(module_path, workspace_id);
+        let module = if let Some(workspace_id) = self.get_workspace_id(file_id) {
+            self.find_module_in_workspace(module_path, workspace_id)
+        } else {
+            self.find_module(module_path)
+        };
+        // `find_module` bypasses `get_module`, so the export read is recorded
+        // here: the version is keyed by the exporting file, not the caller.
+        if let Some(module) = module {
+            crate::db_index::read_set::record_module(&module.file_id);
         }
-
-        self.find_module(module_path)
+        module
     }
 
     pub fn find_module_by_path_in_workspace(
@@ -1041,6 +1079,11 @@ impl LuaModuleIndex {
 
 impl LuaIndex for LuaModuleIndex {
     fn remove(&mut self, file_id: FileId) {
+        // Dropping the export is a novel fact for export readers, mirroring
+        // the signature index's removal tombstones.
+        if self.file_module_map.contains_key(&file_id) {
+            self.note_module_write(file_id);
+        }
         let (mut parent_id, mut child_id) =
             if let Some(module_info) = self.file_module_map.remove(&file_id) {
                 let module_id = module_info.module_id;
@@ -1119,6 +1162,7 @@ impl LuaIndex for LuaModuleIndex {
         self.file_module_paths.clear();
         self.module_name_to_file_ids.clear();
         self.legacy_module_envs.clear();
+        self.module_write_versions.clear();
 
         let root_node = ModuleNode::default();
         self.module_nodes.insert(self.module_root_id, root_node);

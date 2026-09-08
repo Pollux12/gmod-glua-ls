@@ -68,11 +68,15 @@ pub fn try_resolve_call_closure_params(
     let async_state = callback_func.get_async_state();
     let params_to_insert = callback_func.get_params().to_vec();
 
+    let signature_id = closure_params.signature_id;
     let signature = db
         .get_signature_index_mut()
-        .get_mut(&closure_params.signature_id)
+        .get_mut(&signature_id)
         .ok_or(InferFailReason::None)?;
 
+    let params_before = signature.params.len();
+    let param_docs_before = signature.param_docs.len();
+    let async_before = signature.async_state;
     let signature_params = &mut signature.param_docs;
     for (idx, (name, type_ref)) in params_to_insert.iter().enumerate() {
         if signature_params.contains_key(&idx) {
@@ -99,6 +103,15 @@ pub fn try_resolve_call_closure_params(
     }
 
     signature.async_state = async_state;
+    // Re-settling an identical contract moves nothing observable: only a
+    // novel fact may bump the param epoch, or the fixpoint filter degrades
+    // to a full requeue.
+    if signature.param_docs.len() != param_docs_before
+        || signature.params.len() != params_before
+        || signature.async_state != async_before
+    {
+        db.get_signature_index_mut().note_param_write(signature_id);
+    }
 
     Ok(())
 }
@@ -148,9 +161,10 @@ pub fn try_resolve_closure_return(
     };
     let ret_type = callback_func.get_ret().clone();
 
+    let signature_id = closure_return.signature_id;
     let signature = db
         .get_signature_index_mut()
-        .get_mut(&closure_return.signature_id)
+        .get_mut(&signature_id)
         .ok_or(InferFailReason::None)?;
 
     // An `unknown`/`any` contextual return carries no information, but taking it
@@ -179,6 +193,11 @@ pub fn try_resolve_closure_return(
     });
 
     signature.resolve_return = SignatureReturnStatus::DocResolve;
+    // A DocResolve install is a novel return fact for the signature's
+    // return readers. It never called `note_return_write`, which left it
+    // invisible to the staleness epochs and readable only through the
+    // full-requeue fallback.
+    db.get_signature_index_mut().note_return_write(signature_id);
     Ok(())
 }
 
@@ -394,6 +413,8 @@ pub fn try_resolve_closure_parent_params(
         .get_signature_index()
         .get(&closure_params.signature_id)
         .ok_or(InferFailReason::None)?;
+    // The empty-contract fast path consults this signature's params.
+    crate::db_index::read_set::record_param(&closure_params.signature_id);
     if !signature.param_docs.is_empty() {
         return Ok(());
     }
@@ -490,6 +511,8 @@ fn resolve_closure_member_type(
             let signature = db.get_signature_index().get(id);
 
             if let Some(signature) = signature {
+                // The base contract below is read as this closure's params.
+                crate::db_index::read_set::record_param(id);
                 // An empty `return_docs` renders as `-> nil`, so a base whose
                 // return has not settled yet hands out a contract claiming it
                 // returns nothing. `resolve_doc_function` stamps that as
@@ -515,6 +538,7 @@ fn resolve_closure_member_type(
                 .get_signature_index()
                 .get(&closure_params.signature_id)
                 .ok_or(InferFailReason::None)?;
+            crate::db_index::read_set::record_param(&closure_params.signature_id);
             let mut final_params = signature.get_type_params().to_vec();
             let mut final_ret = LuaType::Never;
 
@@ -647,11 +671,13 @@ fn resolve_doc_function(
     doc_func: &LuaFunctionType,
     self_type: Option<LuaType>,
 ) -> ResolveResult {
+    let signature_id = closure_params.signature_id;
     let signature = db
         .get_signature_index_mut()
-        .get_mut(&closure_params.signature_id)
+        .get_mut(&signature_id)
         .ok_or(InferFailReason::None)?;
 
+    let async_before = signature.async_state;
     signature.async_state = doc_func.get_async_state();
 
     let mut doc_params = doc_func.get_params().to_vec();
@@ -676,6 +702,8 @@ fn resolve_doc_function(
         doc_params[0].1 = Some(self_type);
     }
 
+    let params_before = signature.param_docs.clone();
+    let filled_from_slot_before = signature.params_filled_from_slot;
     signature.params_filled_from_slot |= !doc_params.is_empty();
     for (index, param) in doc_params.iter().enumerate() {
         let name = signature.params.get(index).unwrap_or(&param.0);
@@ -691,6 +719,14 @@ fn resolve_doc_function(
             },
         );
     }
+    // Overwriting an identical contract moves nothing observable: only a
+    // novel fact may bump the param epoch. The tick fires below, after the
+    // signature borrow ends.
+    let params_changed = signature.param_docs != params_before
+        || signature.params_filled_from_slot != filled_from_slot_before
+        || signature.async_state != async_before;
+
+    let return_before = (signature.resolve_return, signature.return_docs.clone());
 
     let doc_return = doc_func.get_ret();
     let inferred_tail = (signature.resolve_return == SignatureReturnStatus::InferResolve)
@@ -742,6 +778,16 @@ fn resolve_doc_function(
             attributes: None,
             return_kind: ReturnTypeKind::default(),
         });
+    }
+    // A DocResolve install is a novel return fact for the signature's return
+    // readers, routed through the return epoch like every other return write.
+    let return_changed =
+        signature.resolve_return != return_before.0 || signature.return_docs != return_before.1;
+    if params_changed {
+        db.get_signature_index_mut().note_param_write(signature_id);
+    }
+    if return_changed {
+        db.get_signature_index_mut().note_return_write(signature_id);
     }
 
     Ok(())
@@ -892,6 +938,8 @@ fn filter_signature_type(
                 // Skip the current closure's own signature to avoid self-reference
                 if origin_signature_id != Some(&sig_id) {
                     if let Some(sig) = db.get_signature_index().get(&sig_id) {
+                        // The annotated params below are read as this closure's params.
+                        crate::db_index::read_set::record_param(&sig_id);
                         // Convert annotated signature to DocFunction for param propagation.
                         // When preserve_returns is false (monkey-patch path), emit a DocFunction
                         // for annotated params or an implicit colon receiver. We want parameter
@@ -1043,9 +1091,11 @@ mod tests {
 
     use glua_parser::{LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaParser, ParserConfig};
 
-    use super::resolve_call_param_doc_function;
+    use super::{resolve_call_param_doc_function, try_resolve_call_closure_params};
     use crate::{
-        AsyncState, DbIndex, FileId, LuaFunctionType, LuaSignatureId, LuaType, LuaUnionType,
+        AsyncState, DbIndex, FileId, LuaFunctionType, LuaInferCache, LuaSignatureId, LuaType,
+        LuaUnionType, VirtualWorkspace,
+        compilation::analyzer::unresolve::UnResolveCallClosureParams,
     };
 
     fn parse_call_and_closure(code: &str) -> (LuaCallExpr, LuaClosureExpr) {
@@ -1131,6 +1181,68 @@ mod tests {
             selected_alpha_first.as_ref(),
             selected_beta_first.as_ref(),
             "doc function selection should be independent of union member order"
+        );
+    }
+
+    /// Re-settling a closure's params against unchanged inputs installs an
+    /// identical contract and must not bump the param epoch: only the novel
+    /// install during analysis may bump.
+    #[test]
+    fn resettling_closure_params_without_changes_bumps_no_param_epoch() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@param cb fun(x: string)
+            function register(cb) end
+            register(function(a)
+                observed = a
+            end)
+            "#,
+        );
+
+        let db = ws.analysis.compilation.get_db();
+        // The analysis above filled the closure's contract: the novel tick fired.
+        assert!(
+            db.get_signature_index().param_writes() > 0,
+            "expected the analysis to install a novel closure param contract"
+        );
+
+        let tree = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("expected syntax tree");
+        let root = tree.get_chunk_node();
+        let call_expr = root
+            .descendants::<LuaCallExpr>()
+            .next()
+            .expect("expected call expression");
+        let closure_expr = root
+            .descendants::<LuaClosureExpr>()
+            .next()
+            .expect("expected closure expression");
+        let signature_id = LuaSignatureId::from_closure(file_id, &closure_expr);
+        assert!(
+            db.get_signature_index()
+                .get(&signature_id)
+                .is_some_and(|signature| !signature.param_docs.is_empty()),
+            "expected the closure contract to be settled before the re-settle"
+        );
+
+        let mut item = UnResolveCallClosureParams {
+            file_id,
+            signature_id,
+            call_expr,
+            param_idx: 0,
+        };
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+        let db = ws.analysis.compilation.get_db_mut();
+        let writes_before = db.get_signature_index().param_writes();
+        try_resolve_call_closure_params(db, &mut cache, &mut item)
+            .expect("expected the identical re-settle to succeed");
+        assert_eq!(
+            db.get_signature_index().param_writes(),
+            writes_before,
+            "re-settling an identical closure contract must not bump the param epoch"
         );
     }
 }

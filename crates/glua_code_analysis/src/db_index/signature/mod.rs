@@ -76,6 +76,13 @@ pub struct LuaSignatureIndex {
     /// return from one that did not.
     return_writes: u64,
     return_write_versions: HashMap<LuaSignatureId, u64>,
+    /// Count of closure-parameter changes, for telling a pass that moved a
+    /// signature's parameter contract from one that did not. Closure params
+    /// are written by the unresolve items, not by the type cache, so without
+    /// this counter every such write looks like unversioned state and forces
+    /// a full fixpoint requeue.
+    param_writes: u64,
+    param_write_versions: HashMap<LuaSignatureId, u64>,
     receiver_out_param_member_names: HashMap<String, usize>,
     in_file_receiver_out_param_member_names: HashMap<FileId, HashSet<String>>,
 }
@@ -160,6 +167,28 @@ impl LuaSignatureIndex {
             .unwrap_or(0)
     }
 
+    /// Compare it across an operation to tell whether the operation changed
+    /// any signature's parameter contract.
+    pub fn param_writes(&self) -> u64 {
+        self.param_writes
+    }
+
+    /// Records a parameter-contract change. Callers bump only when the write
+    /// added a novel fact; re-settling an identical contract must not bump,
+    /// or the fixpoint's staleness filter degrades to a full requeue.
+    pub(crate) fn note_param_write(&mut self, signature_id: LuaSignatureId) {
+        self.param_writes += 1;
+        self.param_write_versions
+            .insert(signature_id, self.param_writes);
+    }
+
+    pub(crate) fn param_write_version(&self, signature_id: &LuaSignatureId) -> u64 {
+        self.param_write_versions
+            .get(signature_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub fn new() -> Self {
         Self {
             signatures: HashMap::default(),
@@ -185,6 +214,8 @@ impl LuaSignatureIndex {
             inferred_positive_guards_changed: false,
             return_writes: 0,
             return_write_versions: HashMap::default(),
+            param_writes: 0,
+            param_write_versions: HashMap::default(),
             receiver_out_param_member_names: HashMap::default(),
             in_file_receiver_out_param_member_names: HashMap::default(),
         }
@@ -886,6 +917,7 @@ impl LuaIndex for LuaSignatureIndex {
                 self.clear_inferred_return_dependencies(signature_id);
                 if self.signatures.remove(&signature_id).is_some() {
                     self.note_return_write(signature_id);
+                    self.note_param_write(signature_id);
                 }
                 self.local_func_decls.remove(&signature_id);
             }
@@ -925,6 +957,7 @@ impl LuaIndex for LuaSignatureIndex {
         self.in_file_signatures.clear();
         self.local_func_decls.clear();
         self.return_write_versions.clear();
+        self.param_write_versions.clear();
         self.effective_valid_guard_signatures.clear();
         self.clear_valid_guard_contributions();
         self.inferred_positive_guards.clear();
@@ -1234,5 +1267,32 @@ mod tests {
         index.clear();
         assert!(index.payload_sources_by_holder.is_empty());
         assert!(index.payload_holders_by_source.is_empty());
+    }
+
+    #[test]
+    fn param_write_versions_start_at_zero_and_bump_per_signature() {
+        let source_file_id = FileId::new(1);
+        let signature_id = LuaSignatureId::new(source_file_id, 0.into());
+        let other_id = LuaSignatureId::new(source_file_id, 40.into());
+        let mut index = LuaSignatureIndex::new();
+
+        assert_eq!(index.param_writes(), 0);
+        assert_eq!(index.param_write_version(&signature_id), 0);
+
+        index.note_param_write(signature_id);
+        assert_eq!(index.param_writes(), 1);
+        assert_eq!(index.param_write_version(&signature_id), 1);
+        assert_eq!(index.param_write_version(&other_id), 0);
+    }
+
+    #[test]
+    fn removing_signature_bumps_its_param_version() {
+        let source_file_id = FileId::new(1);
+        let signature_id = LuaSignatureId::new(source_file_id, 0.into());
+        let mut index = LuaSignatureIndex::new();
+        index.get_or_create(signature_id);
+
+        index.remove(source_file_id);
+        assert_eq!(index.param_write_version(&signature_id), 1);
     }
 }

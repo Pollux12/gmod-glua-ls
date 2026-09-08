@@ -167,6 +167,74 @@ mod tests {
         assert!(index.flush_deferred_contributions().is_empty());
     }
 
+    /// Queuing an identical fact is a re-settled duplicate: it reports that
+    /// nothing was queued, so the flush never folds the same evidence twice.
+    #[test]
+    fn queueing_an_identical_contribution_reports_not_queued() {
+        let source_file = FileId::new(1);
+        let signature_id = signature_id(FileId::new(2), 10);
+        let mut index = CallSiteParamIndex::new();
+        index.set_files_contributions(vec![(
+            source_file,
+            vec![(signature_id, 0, LuaType::String)],
+        )]);
+        let fact = LuaTypeFact::certain(LuaType::Boolean);
+
+        assert!(index.queue_deferred_contribution(source_file, signature_id, 0, fact.clone()));
+        assert!(!index.queue_deferred_contribution(source_file, signature_id, 0, fact));
+        assert_ne!(
+            index.queue_deferred_contribution(
+                source_file,
+                signature_id,
+                1,
+                LuaTypeFact::certain(LuaType::Boolean),
+            ),
+            false,
+            "a different slot is a different fact and must queue"
+        );
+    }
+
+    /// Only the slot whose folded fact changed may bump the contribution
+    /// epoch; re-folding identical facts must not bump, or the fixpoint
+    /// filter degrades to a full requeue.
+    #[test]
+    fn flush_ticks_only_the_changed_slot() {
+        let source_file = FileId::new(1);
+        let changed_id = signature_id(FileId::new(2), 10);
+        let unchanged_id = signature_id(FileId::new(2), 20);
+        let mut index = CallSiteParamIndex::new();
+        index.set_files_fact_contributions(vec![(
+            source_file,
+            vec![
+                (changed_id, 0, LuaTypeFact::certain(LuaType::String)),
+                (unchanged_id, 0, LuaTypeFact::certain(LuaType::Integer)),
+            ],
+        )]);
+        // `set_files_fact_contributions` ticks the novel installs; the flush
+        // below must tick only the slot it actually changes.
+        let writes_before_flush = index.contrib_writes();
+        assert!(writes_before_flush > 0);
+        let unchanged_before = index.contrib_write_version(&unchanged_id, 0);
+
+        index.queue_deferred_contribution(
+            source_file,
+            changed_id,
+            0,
+            LuaTypeFact::certain(LuaType::Boolean),
+        );
+        index.flush_deferred_contributions();
+
+        assert!(
+            index.contrib_write_version(&changed_id, 0) > writes_before_flush,
+            "the changed slot must tick"
+        );
+        assert_eq!(
+            index.contrib_write_version(&unchanged_id, 0),
+            unchanged_before,
+            "re-folding an identical fact must not bump the slot"
+        );
+    }
+
     #[test]
     fn unchanged_reindexed_contribution_does_not_report_a_change() {
         let source_file = FileId::new(1);

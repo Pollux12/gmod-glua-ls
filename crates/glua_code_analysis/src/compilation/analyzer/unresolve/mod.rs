@@ -337,6 +337,11 @@ struct FixpointReadRecord {
     reads: crate::db_index::read_set::InferenceReadSet,
     type_epoch: u64,
     return_epoch: u64,
+    param_epoch: u64,
+    module_epoch: u64,
+    special_epoch: u64,
+    contrib_epoch: u64,
+    dynamic_epoch: u64,
 }
 
 /// Whether the item's last derivation could answer differently now: something
@@ -351,6 +356,33 @@ fn fixpoint_reads_are_stale(db: &DbIndex, record: &FixpointReadRecord) -> bool {
         .any(|owner| db.get_type_index().type_write_version(owner) > record.type_epoch)
         || record.reads.signatures.iter().any(|dependency| {
             db.get_signature_index().return_write_version(dependency) > record.return_epoch
+        })
+        || record.reads.params.iter().any(|dependency| {
+            db.get_signature_index().param_write_version(dependency) > record.param_epoch
+        })
+        || record.reads.modules.iter().any(|dependency| {
+            db.get_module_index().module_write_version(dependency) > record.module_epoch
+        })
+        || record
+            .reads
+            .special_calls
+            .iter()
+            .any(|(file_id, position)| {
+                db.get_flow_index()
+                    .special_call_write_version(file_id, position)
+                    > record.special_epoch
+            })
+        || record
+            .reads
+            .contribs
+            .iter()
+            .any(|(signature_id, param_idx)| {
+                db.get_call_site_param_index()
+                    .contrib_write_version(signature_id, *param_idx)
+                    > record.contrib_epoch
+            })
+        || record.reads.dynamic_fields.iter().any(|key| {
+            db.get_dynamic_field_index().dynamic_write_version(key) > record.dynamic_epoch
         })
         || record
             .reads
@@ -372,21 +404,14 @@ fn fixpoint_reads_are_stale(db: &DbIndex, record: &FixpointReadRecord) -> bool {
             })
 }
 
-/// Whether settling this item can move index state outside the type/return
-/// write epochs (signature params, un-noted doc returns, module exports,
-/// call-site contributions), which the read-set filter cannot see. A round
-/// that settled any of these requeues everything next round; the `other_epoch`
-/// counter in `try_resolve` names the same family for the reach memo.
-fn fixpoint_settled_moves_unversioned_state(unresolve: &UnResolve) -> bool {
-    matches!(
-        unresolve,
-        UnResolve::ClosureParams(_)
-            | UnResolve::ClosureParentParams(_)
-            | UnResolve::ClosureReturn(_)
-            | UnResolve::Module(_)
-            | UnResolve::SpecialCall(_)
-            | UnResolve::CallSiteContribution(_)
-    )
+/// Whether the settled special calls moved a novel fact since `baseline`.
+///
+/// Duplicate re-settles bump nothing, so a round whose specials all replayed
+/// what the index already holds filters the next round normally; only a round
+/// that actually materialized something new requeues everything, covering the
+/// read paths without a per-key record (operator installs, super edges).
+fn fixpoint_special_calls_moved_novel_fact(db: &DbIndex, baseline: u64) -> bool {
+    db.get_flow_index().special_call_writes() != baseline
 }
 
 /// Re-derives what settled against a floor until nothing moves.
@@ -414,18 +439,119 @@ pub(super) fn settle_floored_fixpoint(
     // something they read, and per-item epochs keep that check exact no matter
     // how long an item has been parked.
     let mut parked: Vec<UnResolve> = Vec::new();
+    // Special-call epoch at the end of the previous round. A round whose
+    // specials all replayed already-materialized facts moved nothing the
+    // per-key filter cannot see, so it filters the next round normally.
+    let mut special_writes_at_last_round_end = db.get_flow_index().special_call_writes();
+    // Call-site-contribution epoch at the end of the previous round. Queued
+    // facts only land on flush, outside the fixpoint, so this never moves
+    // mid-fixpoint; the conditional keeps the trigger honest if that ever
+    // changes rather than re-adding an unconditional requeue.
+    let mut contrib_writes_at_last_round_end = db.get_call_site_param_index().contrib_writes();
     while !force_finalized.is_empty() || !parked.is_empty() {
         if fuse.trip() {
             force_finalized.clear();
             parked.clear();
             break;
         }
-        let writes_before =
-            db.get_type_index().type_writes() + db.get_signature_index().return_writes();
-        // A round that settled unversioned state cannot filter the next one.
-        let full_requeue = force_finalized
+        let writes_before = db.get_type_index().type_writes()
+            + db.get_signature_index().return_writes()
+            + db.get_signature_index().param_writes()
+            + db.get_module_index().module_writes()
+            + db.get_flow_index().special_call_writes()
+            + db.get_call_site_param_index().contrib_writes()
+            + db.get_dynamic_field_index().dynamic_writes();
+        // A round whose settles all replayed already-materialized facts
+        // moved nothing the keyed filter cannot see, so it filters the next
+        // round normally. Only a round that materialized a novel special-call
+        // or contribution fact requeues everything, covering read paths
+        // without a per-key record.
+        let full_requeue = (force_finalized
             .iter()
-            .any(fixpoint_settled_moves_unversioned_state);
+            .any(|unresolve| matches!(unresolve, UnResolve::SpecialCall(_)))
+            && fixpoint_special_calls_moved_novel_fact(db, special_writes_at_last_round_end))
+            || (force_finalized
+                .iter()
+                .any(|unresolve| matches!(unresolve, UnResolve::CallSiteContribution(_)))
+                && db.get_call_site_param_index().contrib_writes()
+                    != contrib_writes_at_last_round_end);
+        if profile_enabled && full_requeue {
+            let special_has = force_finalized
+                .iter()
+                .any(|unresolve| matches!(unresolve, UnResolve::SpecialCall(_)));
+            let contrib_has = force_finalized
+                .iter()
+                .any(|unresolve| matches!(unresolve, UnResolve::CallSiteContribution(_)));
+            let special_moved =
+                fixpoint_special_calls_moved_novel_fact(db, special_writes_at_last_round_end);
+            let contrib_moved =
+                db.get_call_site_param_index().contrib_writes() != contrib_writes_at_last_round_end;
+            let trigger = match (special_has && special_moved, contrib_has && contrib_moved) {
+                (true, true) => "both",
+                (true, false) => "special_call_novel",
+                (false, true) => "contrib_moved",
+                (false, false) => "unreachable",
+            };
+            let mut preview_stale = 0usize;
+            let mut preview_unstale = 0usize;
+            let mut no_record = 0usize;
+            let mut nc_iter_decl = 0usize;
+            let mut nc_decl = 0usize;
+            let mut nc_member = 0usize;
+            let mut nc_module = 0usize;
+            let mut nc_return = 0usize;
+            let mut nc_closure_params = 0usize;
+            let mut nc_closure_return = 0usize;
+            let mut nc_closure_parent_params = 0usize;
+            let mut nc_table_field = 0usize;
+            let mut nc_special_call = 0usize;
+            let mut nc_call_site = 0usize;
+            for unresolve in parked.iter().chain(force_finalized.iter()) {
+                match read_records.get(&unresolve_identity(unresolve)) {
+                    None => {
+                        no_record += 1;
+                        preview_stale += 1;
+                    }
+                    Some(record) => {
+                        if fixpoint_reads_are_stale(db, record) {
+                            preview_stale += 1;
+                        } else {
+                            preview_unstale += 1;
+                        }
+                        let reads = &record.reads;
+                        let lacks_version_coverage = reads.type_owners.is_empty()
+                            && reads.signatures.is_empty()
+                            && reads.params.is_empty()
+                            && reads.modules.is_empty()
+                            && reads.special_calls.is_empty()
+                            && reads.contribs.is_empty()
+                            && reads.dynamic_fields.is_empty();
+                        if lacks_version_coverage {
+                            match unresolve {
+                                UnResolve::IterDecl(_) => nc_iter_decl += 1,
+                                UnResolve::Decl(_) => nc_decl += 1,
+                                UnResolve::Member(_) => nc_member += 1,
+                                UnResolve::Module(_) => nc_module += 1,
+                                UnResolve::Return(_) => nc_return += 1,
+                                UnResolve::ClosureParams(_) => nc_closure_params += 1,
+                                UnResolve::ClosureReturn(_) => nc_closure_return += 1,
+                                UnResolve::ClosureParentParams(_) => nc_closure_parent_params += 1,
+                                UnResolve::TableField(_) => nc_table_field += 1,
+                                UnResolve::SpecialCall(_) => nc_special_call += 1,
+                                UnResolve::CallSiteContribution(_) => nc_call_site += 1,
+                            }
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "[profile] finalize escape round {}: trigger={trigger} force_finalized_len={} parked_len={} pool={} preview_stale={preview_stale} preview_unstale={preview_unstale} no_record={no_record} no_coverage=[iter_decl={nc_iter_decl} decl={nc_decl} member={nc_member} module={nc_module} return={nc_return} closure_params={nc_closure_params} closure_return={nc_closure_return} closure_parent_params={nc_closure_parent_params} table_field={nc_table_field} special_call={nc_special_call} call_site={nc_call_site}]",
+                round + 1,
+                force_finalized.len(),
+                parked.len(),
+                parked.len() + force_finalized.len(),
+            );
+        }
         let mut pool = std::mem::take(&mut parked);
         pool.append(force_finalized);
         // A return is re-derived from an unresolved status so the apply rule
@@ -483,12 +609,46 @@ pub(super) fn settle_floored_fixpoint(
                 signature.return_docs = return_docs;
             }
         }
-        let moved = db.get_type_index().type_writes() + db.get_signature_index().return_writes()
+        let moved = db.get_type_index().type_writes()
+            + db.get_signature_index().return_writes()
+            + db.get_signature_index().param_writes()
+            + db.get_module_index().module_writes()
+            + db.get_flow_index().special_call_writes()
+            + db.get_call_site_param_index().contrib_writes()
+            + db.get_dynamic_field_index().dynamic_writes()
             - writes_before;
+        special_writes_at_last_round_end = db.get_flow_index().special_call_writes();
+        contrib_writes_at_last_round_end = db.get_call_site_param_index().contrib_writes();
         round += 1;
         if profile_enabled {
+            let mut iter_decl = 0usize;
+            let mut decl = 0usize;
+            let mut member = 0usize;
+            let mut module = 0usize;
+            let mut return_ = 0usize;
+            let mut closure_params = 0usize;
+            let mut closure_return = 0usize;
+            let mut closure_parent_params = 0usize;
+            let mut table_field = 0usize;
+            let mut special_call = 0usize;
+            let mut call_site = 0usize;
+            for unresolve in force_finalized.iter() {
+                match unresolve {
+                    UnResolve::IterDecl(_) => iter_decl += 1,
+                    UnResolve::Decl(_) => decl += 1,
+                    UnResolve::Member(_) => member += 1,
+                    UnResolve::Module(_) => module += 1,
+                    UnResolve::Return(_) => return_ += 1,
+                    UnResolve::ClosureParams(_) => closure_params += 1,
+                    UnResolve::ClosureReturn(_) => closure_return += 1,
+                    UnResolve::ClosureParentParams(_) => closure_parent_params += 1,
+                    UnResolve::TableField(_) => table_field += 1,
+                    UnResolve::SpecialCall(_) => special_call += 1,
+                    UnResolve::CallSiteContribution(_) => call_site += 1,
+                }
+            }
             eprintln!(
-                "[profile] finalize round {round}: attempted={attempted} moved={moved} requeued={}",
+                "[profile] finalize round {round}: attempted={attempted} moved={moved} requeued={} settled=[iter_decl={iter_decl} decl={decl} member={member} module={module} return={return_} closure_params={closure_params} closure_return={closure_return} closure_parent_params={closure_parent_params} table_field={table_field} special_call={special_call} call_site={call_site}]",
                 force_finalized.len()
             );
         }
@@ -587,11 +747,16 @@ fn materialize_pending_str_tpl_type_decls(db: &mut DbIndex, infer_manager: &mut 
     let pending_type_decls = infer_manager.drain_pending_str_tpl_type_decls();
 
     for pending in pending_type_decls {
+        // A re-drained identical decl replays the same materialization: only a
+        // novel decl or super edge may bump the special-call epoch, keyed by
+        // the materialization source like the direct call-site path.
+        let mut novel = false;
         if db
             .get_type_index()
             .get_type_decl(&pending.type_decl_id)
             .is_none()
         {
+            novel = true;
             db.get_type_index_mut().add_type_decl(
                 pending.file_id,
                 LuaTypeDecl::new(
@@ -605,12 +770,16 @@ fn materialize_pending_str_tpl_type_decls(db: &mut DbIndex, infer_manager: &mut 
             );
         }
 
-        db.get_type_index_mut().add_super_type_if_missing(
+        novel |= db.get_type_index_mut().add_super_type_if_missing(
             pending.type_decl_id.clone(),
             pending.file_id,
             pending.source_range,
             pending.super_type,
         );
+        if novel {
+            db.get_flow_index_mut()
+                .note_special_call_write(pending.file_id, pending.source_range.start());
+        }
     }
 }
 
@@ -698,10 +867,6 @@ fn try_resolve(
     let mut requeued: FxHashSet<(UnResolveIdentity, InferFailReason)> = FxHashSet::default();
     // Memoised `UnResolveExpr` reach results, validated against the write epochs.
     let mut expr_reach_memo = ExprReachMemo::default();
-    // Counts resolutions that move index state outside the type/return write
-    // epochs (signature params, un-noted doc returns, module exports) so the
-    // reach memo above invalidates on them.
-    let mut other_epoch: u64 = 0;
     // Waves have no file count to report, so they report what is still deferred.
     let initial_outstanding: usize = reason_resolve.values().map(Vec::len).sum();
     loop {
@@ -749,7 +914,7 @@ fn try_resolve(
             }
             let reached = match check_reason {
                 InferFailReason::UnResolveExpr(_) => {
-                    expr_reach_memo.check(db, infer_manager, check_reason, other_epoch)
+                    expr_reach_memo.check(db, infer_manager, check_reason)
                 }
                 _ => check_reach_reason(db, infer_manager, &check_reason).unwrap_or(false),
             };
@@ -767,6 +932,8 @@ fn try_resolve(
                 }
                 let attempt_start = profile_enabled.then(std::time::Instant::now);
                 let writes_before = db.get_type_index().type_writes();
+                let param_writes_before = db.get_signature_index().param_writes();
+                let module_writes_before = db.get_module_index().module_writes();
                 let narrowing_root = unresolve.narrowing_root();
                 let was_undetermined = narrowing_root
                     .as_ref()
@@ -785,6 +952,11 @@ fn try_resolve(
                             reads,
                             type_epoch: db.get_type_index().type_writes(),
                             return_epoch: db.get_signature_index().return_writes(),
+                            param_epoch: db.get_signature_index().param_writes(),
+                            module_epoch: db.get_module_index().module_writes(),
+                            special_epoch: db.get_flow_index().special_call_writes(),
+                            contrib_epoch: db.get_call_site_param_index().contrib_writes(),
+                            dynamic_epoch: db.get_dynamic_field_index().dynamic_writes(),
                         },
                     );
                     result
@@ -797,6 +969,16 @@ fn try_resolve(
                 // the pre-resolve value, and whether a reader shares a wave
                 // with its writer is a property of the batch rather than of the
                 // source.
+                // A param or module write invalidates the same memoised
+                // inference a type write does, but it carries no narrowing
+                // transition, so it shares the deferred clear without the
+                // undetermined-flow purge below.
+                if db.get_signature_index().param_writes() != param_writes_before
+                    || db.get_module_index().module_writes() != module_writes_before
+                {
+                    pending_clears.insert(file_id);
+                    retry_file_ids.insert(file_id);
+                }
                 if db.get_type_index().type_writes() != writes_before {
                     // Deferred to the next read of this file's cache: only that
                     // file's attempts populate it, so clearing then leaves every
@@ -833,19 +1015,6 @@ fn try_resolve(
                 match resolve_result {
                     Ok(_) => {
                         changed = true;
-                        // These resolutions move index state the expression reach
-                        // memo cannot see in the type/return write epochs, so
-                        // they invalidate it explicitly.
-                        if matches!(
-                            unresolve,
-                            UnResolve::ClosureParams(_)
-                                | UnResolve::ClosureParentParams(_)
-                                | UnResolve::ClosureReturn(_)
-                                | UnResolve::Module(_)
-                                | UnResolve::SpecialCall(_)
-                        ) {
-                            other_epoch += 1;
-                        }
                         // A local this wave settles had a placeholder during
                         // the walk, and the writes that read it then hold that
                         // placeholder's answer. See
@@ -1589,14 +1758,16 @@ mod tests {
     use rowan::TextSize;
 
     use crate::{
-        DbIndex, FileId, InferFailReason, LuaDeclId, LuaMemberId, LuaType, LuaTypeCache,
-        LuaTypeDeclId,
+        DbIndex, FileId, InferFailReason, LuaDeclId, LuaMemberId, LuaSignatureId, LuaType,
+        LuaTypeCache, LuaTypeDeclId,
     };
 
     use super::{
-        UnResolve, UnResolveIterVar, UnResolveMember, partition_pre_dynamic_unresolves,
+        FixpointReadRecord, UnResolve, UnResolveIterVar, UnResolveMember, fixpoint_reads_are_stale,
+        fixpoint_special_calls_moved_novel_fact, partition_pre_dynamic_unresolves,
         resolved_value_is_uninformative, sorted_reason_keys,
     };
+    use crate::db_index::read_set::InferenceReadSet;
 
     #[test]
     fn resolved_any_member_value_remains_provisional() {
@@ -1721,5 +1892,240 @@ mod tests {
         };
         assert!(deferred_member.prefix.is_none());
         assert!(matches!(deferred_member.expr, Some(LuaExpr::IndexExpr(_))));
+    }
+
+    fn param_reader_record(signature_id: LuaSignatureId) -> FixpointReadRecord {
+        let mut reads = InferenceReadSet::default();
+        reads.params.insert(signature_id);
+        FixpointReadRecord {
+            reads,
+            type_epoch: 0,
+            return_epoch: 0,
+            param_epoch: 0,
+            module_epoch: 0,
+            special_epoch: 0,
+            contrib_epoch: 0,
+            dynamic_epoch: 0,
+        }
+    }
+
+    fn module_reader_record(file_id: FileId) -> FixpointReadRecord {
+        let mut reads = InferenceReadSet::default();
+        reads.modules.insert(file_id);
+        FixpointReadRecord {
+            reads,
+            type_epoch: 0,
+            return_epoch: 0,
+            param_epoch: 0,
+            module_epoch: 0,
+            special_epoch: 0,
+            contrib_epoch: 0,
+            dynamic_epoch: 0,
+        }
+    }
+
+    fn special_reader_record(file_id: FileId, position: TextSize) -> FixpointReadRecord {
+        let mut reads = InferenceReadSet::default();
+        reads.special_calls.insert((file_id, position));
+        FixpointReadRecord {
+            reads,
+            type_epoch: 0,
+            return_epoch: 0,
+            param_epoch: 0,
+            module_epoch: 0,
+            special_epoch: 0,
+            contrib_epoch: 0,
+            dynamic_epoch: 0,
+        }
+    }
+
+    fn contrib_reader_record(signature_id: LuaSignatureId, param_idx: usize) -> FixpointReadRecord {
+        let mut reads = InferenceReadSet::default();
+        reads.contribs.insert((signature_id, param_idx));
+        FixpointReadRecord {
+            reads,
+            type_epoch: 0,
+            return_epoch: 0,
+            param_epoch: 0,
+            module_epoch: 0,
+            special_epoch: 0,
+            contrib_epoch: 0,
+            dynamic_epoch: 0,
+        }
+    }
+
+    /// A param write after the attempt requeues exactly the items that read
+    /// that signature's contract: a parked item stays parked while nothing it
+    /// read moved, and goes stale on the write.
+    #[test]
+    fn closure_param_write_marks_param_readers_stale() {
+        let mut db = DbIndex::new();
+        let signature_id = LuaSignatureId::new(FileId::new(1), TextSize::new(0));
+        db.get_signature_index_mut().get_or_create(signature_id);
+        let record = param_reader_record(signature_id);
+
+        assert!(!fixpoint_reads_are_stale(&db, &record));
+        db.get_signature_index_mut().note_param_write(signature_id);
+        assert!(fixpoint_reads_are_stale(&db, &record));
+    }
+
+    /// Per-key exactness: a write to another signature's contract must not
+    /// requeue this item, or the filter degrades to a full requeue.
+    #[test]
+    fn unrelated_closure_param_write_keeps_item_parked() {
+        let mut db = DbIndex::new();
+        let signature_id = LuaSignatureId::new(FileId::new(1), TextSize::new(0));
+        let other_id = LuaSignatureId::new(FileId::new(1), TextSize::new(40));
+        db.get_signature_index_mut().get_or_create(signature_id);
+        db.get_signature_index_mut().get_or_create(other_id);
+        let record = param_reader_record(signature_id);
+
+        db.get_signature_index_mut().note_param_write(other_id);
+        assert!(!fixpoint_reads_are_stale(&db, &record));
+    }
+
+    /// A module export write after the attempt requeues exactly the items
+    /// that read that file's export.
+    #[test]
+    fn module_export_write_marks_module_readers_stale() {
+        let mut db = DbIndex::new();
+        let file_id = FileId::new(3);
+        let record = module_reader_record(file_id);
+
+        assert!(!fixpoint_reads_are_stale(&db, &record));
+        db.get_module_index_mut().note_module_write(file_id);
+        assert!(fixpoint_reads_are_stale(&db, &record));
+    }
+
+    #[test]
+    fn unrelated_module_export_write_keeps_item_parked() {
+        let mut db = DbIndex::new();
+        let record = module_reader_record(FileId::new(3));
+
+        db.get_module_index_mut().note_module_write(FileId::new(4));
+        assert!(!fixpoint_reads_are_stale(&db, &record));
+    }
+
+    /// The novelty trigger only fires on movement since its baseline: a round
+    /// whose specials all replayed recorded facts leaves the epoch alone, so
+    /// an idempotent re-settle never trips the full requeue.
+    #[test]
+    fn special_call_novelty_trigger_quiet_without_new_writes() {
+        let mut db = DbIndex::new();
+        let baseline = db.get_flow_index().special_call_writes();
+        assert!(!fixpoint_special_calls_moved_novel_fact(&db, baseline));
+
+        db.get_flow_index_mut()
+            .note_special_call_write(FileId::new(3), TextSize::new(16));
+        assert!(fixpoint_special_calls_moved_novel_fact(&db, baseline));
+        assert!(!fixpoint_special_calls_moved_novel_fact(
+            &db,
+            db.get_flow_index().special_call_writes()
+        ));
+    }
+
+    /// A special-call materialization after the attempt requeues exactly the
+    /// items that read that call-site's effects.
+    #[test]
+    fn special_call_write_marks_special_readers_stale() {
+        let mut db = DbIndex::new();
+        let file_id = FileId::new(3);
+        let position = TextSize::new(16);
+        let record = special_reader_record(file_id, position);
+
+        assert!(!fixpoint_reads_are_stale(&db, &record));
+        db.get_flow_index_mut()
+            .note_special_call_write(file_id, position);
+        assert!(fixpoint_reads_are_stale(&db, &record));
+    }
+
+    /// Per-key exactness: a materialization at another call-site must not
+    /// requeue this item, or the filter degrades to a full requeue.
+    #[test]
+    fn unrelated_special_call_write_keeps_item_parked() {
+        let mut db = DbIndex::new();
+        let record = special_reader_record(FileId::new(3), TextSize::new(16));
+
+        db.get_flow_index_mut()
+            .note_special_call_write(FileId::new(3), TextSize::new(64));
+        assert!(!fixpoint_reads_are_stale(&db, &record));
+    }
+
+    /// A contribution flush after the attempt requeues exactly the items that
+    /// read that callee slot.
+    #[test]
+    fn contrib_write_marks_contrib_readers_stale() {
+        let mut db = DbIndex::new();
+        let signature_id = LuaSignatureId::new(FileId::new(1), TextSize::new(0));
+        let record = contrib_reader_record(signature_id, 0);
+
+        assert!(!fixpoint_reads_are_stale(&db, &record));
+        db.get_call_site_param_index_mut()
+            .note_contrib_write(signature_id, 0);
+        assert!(fixpoint_reads_are_stale(&db, &record));
+    }
+
+    /// Per-key exactness: a flush for another slot must not requeue this
+    /// item, or the filter degrades to a full requeue.
+    #[test]
+    fn unrelated_contrib_write_keeps_item_parked() {
+        let mut db = DbIndex::new();
+        let signature_id = LuaSignatureId::new(FileId::new(1), TextSize::new(0));
+        let other_id = LuaSignatureId::new(FileId::new(1), TextSize::new(40));
+        let record = contrib_reader_record(signature_id, 0);
+
+        db.get_call_site_param_index_mut()
+            .note_contrib_write(other_id, 0);
+        db.get_call_site_param_index_mut()
+            .note_contrib_write(signature_id, 1);
+        assert!(!fixpoint_reads_are_stale(&db, &record));
+    }
+
+    fn dynamic_reader_record(
+        owner: crate::DynamicFieldOwner,
+        field_name: Option<&str>,
+    ) -> FixpointReadRecord {
+        let mut reads = InferenceReadSet::default();
+        reads
+            .dynamic_fields
+            .insert((owner, field_name.map(smol_str::SmolStr::new)));
+        FixpointReadRecord {
+            reads,
+            type_epoch: 0,
+            return_epoch: 0,
+            param_epoch: 0,
+            module_epoch: 0,
+            special_epoch: 0,
+            contrib_epoch: 0,
+            dynamic_epoch: 0,
+        }
+    }
+
+    /// A dynamic-field definition after the attempt requeues exactly the
+    /// items that read that owner slot.
+    #[test]
+    fn dynamic_write_marks_dynamic_readers_stale() {
+        let mut db = DbIndex::new();
+        let owner = crate::DynamicFieldOwner::Type(crate::LuaTypeDeclId::global("DynStaleTest"));
+        let record = dynamic_reader_record(owner.clone(), Some("value"));
+
+        assert!(!fixpoint_reads_are_stale(&db, &record));
+        db.get_dynamic_field_index_mut()
+            .note_dynamic_write(owner, Some("value".into()));
+        assert!(fixpoint_reads_are_stale(&db, &record));
+    }
+
+    /// The wildcard bucket versions apart from the named slots.
+    #[test]
+    fn unrelated_dynamic_write_keeps_item_parked() {
+        let mut db = DbIndex::new();
+        let owner = crate::DynamicFieldOwner::Type(crate::LuaTypeDeclId::global("DynStaleTest"));
+        let record = dynamic_reader_record(owner.clone(), Some("value"));
+
+        db.get_dynamic_field_index_mut()
+            .note_dynamic_write(owner.clone(), Some("other".into()));
+        db.get_dynamic_field_index_mut()
+            .note_dynamic_write(owner, None);
+        assert!(!fixpoint_reads_are_stale(&db, &record));
     }
 }

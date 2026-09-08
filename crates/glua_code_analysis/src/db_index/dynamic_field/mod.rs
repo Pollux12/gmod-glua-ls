@@ -115,6 +115,13 @@ pub struct DynamicFieldIndex {
     unattributed_fields: HashMap<SmolStr, HashSet<FileId>>,
     /// file → unattributed field names contributed by this file.
     unattributed_file_contributions: HashMap<FileId, Vec<SmolStr>>,
+    /// Count of dynamic-field definition changes, keyed by owner and field
+    /// name (`None` is the wildcard bucket). Field assignments land from the
+    /// dynamic-field passes and from member resolution during inference, so
+    /// without this counter every such write looks like unversioned state to
+    /// the fixpoint filter.
+    dynamic_writes: u64,
+    dynamic_write_versions: HashMap<(DynamicFieldOwner, Option<SmolStr>), u64>,
     sealed: bool,
 }
 
@@ -224,6 +231,7 @@ impl DynamicFieldIndex {
         }
 
         if is_new_definition {
+            self.note_dynamic_write(owner.clone(), Some(field_name.clone()));
             self.file_contributions
                 .entry(file_id)
                 .or_default()
@@ -244,12 +252,37 @@ impl DynamicFieldIndex {
         let is_new_definition = !definitions.contains(&definition);
         if is_new_definition {
             definitions.push(definition);
+            self.note_dynamic_write(owner.clone(), None);
             self.wildcard_file_contributions
                 .entry(file_id)
                 .or_default()
                 .push((owner, range));
         }
         is_new_definition
+    }
+
+    /// Compare it across an operation to tell whether the operation changed
+    /// any dynamic-field definition.
+    pub fn dynamic_writes(&self) -> u64 {
+        self.dynamic_writes
+    }
+
+    /// Records a dynamic-field definition change. Callers bump only when the
+    /// write added a novel fact (`is_new` at the add sites, a drained
+    /// definition at removal); re-adding an identical definition must not
+    /// bump, or the fixpoint's staleness filter degrades to a full requeue.
+    pub(crate) fn note_dynamic_write(
+        &mut self,
+        owner: DynamicFieldOwner,
+        field_name: Option<SmolStr>,
+    ) {
+        self.dynamic_writes += 1;
+        self.dynamic_write_versions
+            .insert((owner, field_name), self.dynamic_writes);
+    }
+
+    pub(crate) fn dynamic_write_version(&self, key: &(DynamicFieldOwner, Option<SmolStr>)) -> u64 {
+        self.dynamic_write_versions.get(key).copied().unwrap_or(0)
     }
 
     pub fn add_unattributed_field(&mut self, field_name: SmolStr, file_id: FileId) {
@@ -330,7 +363,25 @@ impl DynamicFieldIndex {
 
         let mut dirty = HashSet::default();
         if !lost.is_empty() {
+            // Ticked in a stable owner order: the counter values must not
+            // depend on hash iteration. Comparison-only, but deterministic
+            // anyway.
+            let mut lost = lost.into_iter().collect::<Vec<_>>();
+            lost.sort_by_cached_key(|owner| format!("{owner:?}"));
             for owner in &lost {
+                // Dropping the group is a novel fact for its readers.
+                let field_names = self
+                    .owner_fields
+                    .get(owner)
+                    .map(|fields| fields.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let has_wildcards = self.wildcard_definitions.contains_key(owner);
+                for field_name in field_names {
+                    self.note_dynamic_write(owner.clone(), Some(field_name));
+                }
+                if has_wildcards {
+                    self.note_dynamic_write(owner.clone(), None);
+                }
                 self.owner_fields.remove(owner);
                 self.field_definitions.remove(owner);
                 self.direct_field_definitions.remove(owner);
@@ -598,6 +649,7 @@ impl DynamicFieldIndex {
         owner: &DynamicFieldOwner,
         field_name: &str,
     ) -> &[InFiled<TextRange>] {
+        crate::db_index::read_set::record_dynamic_field(owner, Some(field_name));
         self.field_definitions
             .get(owner)
             .and_then(|fields| fields.get(field_name))
@@ -605,6 +657,7 @@ impl DynamicFieldIndex {
     }
 
     pub fn get_wildcard_definitions(&self, owner: &DynamicFieldOwner) -> Vec<InFiled<TextRange>> {
+        crate::db_index::read_set::record_dynamic_field(owner, None);
         self.wildcard_definitions
             .get(owner)
             .cloned()
@@ -612,6 +665,7 @@ impl DynamicFieldIndex {
     }
 
     pub fn has_wildcard_definitions(&self, owner: &DynamicFieldOwner) -> bool {
+        crate::db_index::read_set::record_dynamic_field(owner, None);
         self.wildcard_definitions
             .get(owner)
             .is_some_and(|definitions| !definitions.is_empty())
@@ -776,6 +830,10 @@ impl LuaIndex for DynamicFieldIndex {
                         &field_name,
                         &definition,
                     );
+                    // Draining a definition is a novel fact for the slot's
+                    // readers, mirroring the signature index's removal
+                    // tombstones.
+                    self.note_dynamic_write(owner.clone(), Some(field_name.clone()));
                     if let Some(fields) = self.owner_fields.get_mut(&owner) {
                         if let Some(files) = fields.get_mut(field_name.as_str()) {
                             files.remove(&file_id);
@@ -799,6 +857,7 @@ impl LuaIndex for DynamicFieldIndex {
                             self.wildcard_definitions.remove(&owner);
                         }
                     }
+                    self.note_dynamic_write(owner, None);
                 }
             }
 
@@ -837,6 +896,7 @@ impl LuaIndex for DynamicFieldIndex {
         self.wildcard_file_contributions.clear();
         self.unattributed_fields.clear();
         self.unattributed_file_contributions.clear();
+        self.dynamic_write_versions.clear();
         self.sealed = false;
     }
 }
@@ -1204,6 +1264,85 @@ mod tests {
         assert_eq!(
             normalize_wildcard_file_contributions(&index.wildcard_file_contributions),
             normalize_wildcard_file_contributions(&fresh.wildcard_file_contributions)
+        );
+    }
+
+    /// Only a novel definition may bump the dynamic epoch: re-adding an
+    /// identical definition reports not-new and leaves the version alone, or
+    /// the fixpoint filter degrades to a full requeue.
+    #[test]
+    fn readding_an_identical_definition_bumps_no_dynamic_epoch() {
+        let owner = DynamicFieldOwner::Type(LuaTypeDeclId::global("DynVersionTest"));
+        let field = SmolStr::new("value");
+        let file_id = FileId::new(1);
+
+        let mut index = DynamicFieldIndex::new();
+        assert!(index.add_field(owner.clone(), field.clone(), file_id, range(1, 2)));
+        let writes_after_insert = index.dynamic_writes();
+        assert!(writes_after_insert > 0);
+
+        assert!(!index.add_field(owner.clone(), field.clone(), file_id, range(1, 2)));
+        assert_eq!(index.dynamic_writes(), writes_after_insert);
+
+        let key = (owner.clone(), Some(field.clone()));
+        assert_eq!(index.dynamic_write_version(&key), writes_after_insert);
+    }
+
+    /// The wildcard bucket versions apart from the named slots: a wildcard
+    /// write must not requeue a reader of an unrelated named field.
+    #[test]
+    fn wildcard_and_named_slots_version_independently() {
+        let owner = DynamicFieldOwner::Type(LuaTypeDeclId::global("DynVersionTest"));
+        let file_id = FileId::new(1);
+
+        let mut index = DynamicFieldIndex::new();
+        index.add_field(owner.clone(), SmolStr::new("named"), file_id, range(1, 2));
+        let named_version =
+            index.dynamic_write_version(&(owner.clone(), Some(SmolStr::new("named"))));
+        assert_eq!(
+            index.dynamic_write_version(&(owner.clone(), None)),
+            0,
+            "a named write must not tick the wildcard bucket"
+        );
+
+        index.add_wildcard_definition(owner.clone(), file_id, range(3, 4));
+        assert_eq!(
+            index.dynamic_write_version(&(owner.clone(), Some(SmolStr::new("named")))),
+            named_version,
+            "a wildcard write must not tick an unrelated named slot"
+        );
+        assert!(
+            index.dynamic_write_version(&(owner.clone(), None)) > 0,
+            "the wildcard write must tick its own bucket"
+        );
+    }
+
+    /// Draining a definition is a novel fact for the slot's readers.
+    #[test]
+    fn removing_a_definition_bumps_its_slot_version() {
+        let owner = DynamicFieldOwner::Type(LuaTypeDeclId::global("DynVersionTest"));
+        let field = SmolStr::new("value");
+        let removed_file = FileId::new(1);
+        let remaining_file = FileId::new(2);
+
+        let mut index = DynamicFieldIndex::new();
+        index.add_field(owner.clone(), field.clone(), removed_file, range(1, 2));
+        index.add_field(owner.clone(), field.clone(), remaining_file, range(3, 4));
+        index.add_wildcard_definition(owner.clone(), removed_file, range(5, 6));
+        let key = (owner.clone(), Some(field.clone()));
+        let wildcard_key: (DynamicFieldOwner, Option<SmolStr>) = (owner.clone(), None);
+        let version_before = index.dynamic_write_version(&key);
+        let wildcard_before = index.dynamic_write_version(&wildcard_key);
+
+        index.remove(removed_file);
+
+        assert!(
+            index.dynamic_write_version(&key) > version_before,
+            "draining a definition must invalidate the slot's readers"
+        );
+        assert!(
+            index.dynamic_write_version(&wildcard_key) > wildcard_before,
+            "draining a wildcard must invalidate the bucket's readers"
         );
     }
 

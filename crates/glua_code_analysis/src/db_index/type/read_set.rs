@@ -28,12 +28,25 @@ use rustc_hash::FxHashSet;
 use std::cell::{Cell, RefCell};
 
 use super::type_owner::LuaTypeOwner;
-use crate::{LuaMemberKey, LuaMemberOwner, LuaSignatureId};
+use crate::{DynamicFieldOwner, FileId, LuaMemberKey, LuaMemberOwner, LuaSignatureId};
+use rowan::TextSize;
+use smol_str::SmolStr;
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct InferenceReadSet {
     pub type_owners: FxHashSet<LuaTypeOwner>,
     pub signatures: FxHashSet<LuaSignatureId>,
+    pub params: FxHashSet<LuaSignatureId>,
+    pub modules: FxHashSet<FileId>,
+    /// Special-call materializations read through the flow effects of one
+    /// call-site, keyed by that site. See `LuaFlowIndex::special_writes`.
+    pub special_calls: FxHashSet<(FileId, TextSize)>,
+    /// Call-site-inferred parameter facts, keyed by the callee slot that
+    /// holds them. See `CallSiteParamIndex::contrib_writes`.
+    pub contribs: FxHashSet<(LuaSignatureId, usize)>,
+    /// Dynamic-field definitions consulted, keyed by owner and field name
+    /// (`None` is the wildcard bucket). See `DynamicFieldIndex::dynamic_writes`.
+    pub dynamic_fields: FxHashSet<(DynamicFieldOwner, Option<SmolStr>)>,
     pub missing_member_slots: FxHashSet<(LuaMemberOwner, LuaMemberKey)>,
 }
 
@@ -41,6 +54,11 @@ impl InferenceReadSet {
     pub(crate) fn extend(&mut self, other: Self) {
         self.type_owners.extend(other.type_owners);
         self.signatures.extend(other.signatures);
+        self.params.extend(other.params);
+        self.modules.extend(other.modules);
+        self.special_calls.extend(other.special_calls);
+        self.contribs.extend(other.contribs);
+        self.dynamic_fields.extend(other.dynamic_fields);
         self.missing_member_slots.extend(other.missing_member_slots);
     }
 }
@@ -50,12 +68,22 @@ pub(crate) struct InferredReturnReadRecord {
     pub reads: InferenceReadSet,
     pub type_epoch: u64,
     pub return_epoch: u64,
+    pub param_epoch: u64,
+    pub module_epoch: u64,
+    pub special_epoch: u64,
+    pub contrib_epoch: u64,
+    pub dynamic_epoch: u64,
 }
 
 thread_local! {
     static DEPTH: Cell<u32> = const { Cell::new(0) };
     static READS: RefCell<FxHashSet<LuaTypeOwner>> = RefCell::new(FxHashSet::default());
     static SIGNATURES: RefCell<FxHashSet<LuaSignatureId>> = RefCell::new(FxHashSet::default());
+    static PARAMS: RefCell<FxHashSet<LuaSignatureId>> = RefCell::new(FxHashSet::default());
+    static MODULES: RefCell<FxHashSet<FileId>> = RefCell::new(FxHashSet::default());
+    static SPECIAL_CALLS: RefCell<FxHashSet<(FileId, TextSize)>> = RefCell::new(FxHashSet::default());
+    static CONTRIBS: RefCell<FxHashSet<(LuaSignatureId, usize)>> = RefCell::new(FxHashSet::default());
+    static DYNAMIC_FIELDS: RefCell<FxHashSet<(DynamicFieldOwner, Option<SmolStr>)>> = RefCell::new(FxHashSet::default());
     static MISSING_MEMBER_SLOTS: RefCell<FxHashSet<(LuaMemberOwner, LuaMemberKey)>> = RefCell::new(FxHashSet::default());
 }
 
@@ -68,6 +96,11 @@ pub(crate) fn arm() {
     if DEPTH.with(Cell::get) == 0 {
         READS.with(|reads| reads.borrow_mut().clear());
         SIGNATURES.with(|signatures| signatures.borrow_mut().clear());
+        PARAMS.with(|params| params.borrow_mut().clear());
+        MODULES.with(|modules| modules.borrow_mut().clear());
+        SPECIAL_CALLS.with(|sites| sites.borrow_mut().clear());
+        CONTRIBS.with(|slots| slots.borrow_mut().clear());
+        DYNAMIC_FIELDS.with(|fields| fields.borrow_mut().clear());
         MISSING_MEMBER_SLOTS.with(|slots| slots.borrow_mut().clear());
     }
     DEPTH.with(|depth| depth.set(depth.get() + 1));
@@ -86,12 +119,22 @@ pub(crate) fn disarm() -> InferenceReadSet {
         InferenceReadSet {
             type_owners: READS.with(|reads| reads.borrow().clone()),
             signatures: SIGNATURES.with(|signatures| signatures.borrow().clone()),
+            params: PARAMS.with(|params| params.borrow().clone()),
+            modules: MODULES.with(|modules| modules.borrow().clone()),
+            special_calls: SPECIAL_CALLS.with(|sites| sites.borrow().clone()),
+            contribs: CONTRIBS.with(|slots| slots.borrow().clone()),
+            dynamic_fields: DYNAMIC_FIELDS.with(|fields| fields.borrow().clone()),
             missing_member_slots: MISSING_MEMBER_SLOTS.with(|slots| slots.borrow().clone()),
         }
     } else {
         InferenceReadSet {
             type_owners: READS.with(|reads| std::mem::take(&mut *reads.borrow_mut())),
             signatures: SIGNATURES.with(|signatures| std::mem::take(&mut *signatures.borrow_mut())),
+            params: PARAMS.with(|params| std::mem::take(&mut *params.borrow_mut())),
+            modules: MODULES.with(|modules| std::mem::take(&mut *modules.borrow_mut())),
+            special_calls: SPECIAL_CALLS.with(|sites| std::mem::take(&mut *sites.borrow_mut())),
+            contribs: CONTRIBS.with(|slots| std::mem::take(&mut *slots.borrow_mut())),
+            dynamic_fields: DYNAMIC_FIELDS.with(|fields| std::mem::take(&mut *fields.borrow_mut())),
             missing_member_slots: MISSING_MEMBER_SLOTS
                 .with(|slots| std::mem::take(&mut *slots.borrow_mut())),
         }
@@ -113,6 +156,66 @@ pub(crate) fn record_signature(signature_id: &LuaSignatureId) {
     if DEPTH.with(Cell::get) > 0 {
         SIGNATURES.with(|signatures| {
             signatures.borrow_mut().insert(*signature_id);
+        });
+    }
+}
+
+/// Records a read of a signature's parameter contract (`param_docs`).
+///
+/// `LuaSignature::get_param_info_by_id/by_name` cannot record: the signature
+/// does not know its own id. Callers that hold the id record at the shared
+/// inference boundaries instead (`infer_param`, closure/special-call
+/// resolution), which covers every read an armed scope can make.
+#[inline]
+pub(crate) fn record_param(signature_id: &LuaSignatureId) {
+    if DEPTH.with(Cell::get) > 0 {
+        PARAMS.with(|params| {
+            params.borrow_mut().insert(*signature_id);
+        });
+    }
+}
+
+/// Records a read of a module's exported type, keyed by the exporting file.
+#[inline]
+pub(crate) fn record_module(file_id: &FileId) {
+    if DEPTH.with(Cell::get) > 0 {
+        MODULES.with(|modules| {
+            modules.borrow_mut().insert(*file_id);
+        });
+    }
+}
+
+/// Records a read of one call-site's special-call materializations, keyed by
+/// the calling file and the call's start offset.
+#[inline]
+pub(crate) fn record_special_call(file_id: &FileId, position: TextSize) {
+    if DEPTH.with(Cell::get) > 0 {
+        SPECIAL_CALLS.with(|sites| {
+            sites.borrow_mut().insert((*file_id, position));
+        });
+    }
+}
+
+/// Records a read of one call-site-inferred parameter fact, keyed by the
+/// callee slot that holds it.
+#[inline]
+pub(crate) fn record_contrib(signature_id: &LuaSignatureId, param_idx: usize) {
+    if DEPTH.with(Cell::get) > 0 {
+        CONTRIBS.with(|slots| {
+            slots.borrow_mut().insert((*signature_id, param_idx));
+        });
+    }
+}
+
+/// Records a read of one dynamic field's definitions, keyed by owner and
+/// field name (`None` is the wildcard bucket).
+#[inline]
+pub(crate) fn record_dynamic_field(owner: &DynamicFieldOwner, field_name: Option<&str>) {
+    if DEPTH.with(Cell::get) > 0 {
+        DYNAMIC_FIELDS.with(|fields| {
+            fields
+                .borrow_mut()
+                .insert((owner.clone(), field_name.map(SmolStr::new)));
         });
     }
 }
