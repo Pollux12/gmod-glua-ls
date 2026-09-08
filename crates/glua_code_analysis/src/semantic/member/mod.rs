@@ -3,7 +3,9 @@ mod find_members;
 mod get_member_map;
 mod infer_raw_member;
 
-use rustc_hash::FxHashSet;
+use std::sync::Arc;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     DbIndex, FileId, GmodStateMask, InFiled, LuaDecl, LuaMemberFeature, LuaMemberId, LuaMemberKey,
@@ -146,29 +148,45 @@ pub(crate) fn local_class_table_member_ids(
         return Vec::new();
     }
 
+    // The class's files bound where the tables may live. The bound decls are
+    // visited once and filtered against this set, so each file's syntax root
+    // and decl tree are acquired once no matter how many bound decls it holds.
+    let mut class_files = FxHashSet::default();
+    for location in type_decl.get_locations() {
+        class_files.insert(location.file_id);
+    }
+    let mut decls_by_file: FxHashMap<FileId, Vec<crate::LuaDeclId>> = FxHashMap::default();
+    for decl_id in bound_decls {
+        if class_files.contains(&decl_id.file_id) {
+            decls_by_file
+                .entry(decl_id.file_id)
+                .or_default()
+                .push(*decl_id);
+        }
+    }
+    if decls_by_file.is_empty() {
+        return Vec::new();
+    }
+    let mut files: Vec<FileId> = decls_by_file.keys().copied().collect();
+    files.sort_by_key(|file_id| file_id.id);
+
     let member_index = db.get_member_index();
     let mut member_ids = Vec::new();
-    // A class declared several times in one file names that file once per
-    // declaration, and each of them would otherwise resolve the same bindings.
-    let mut scanned_files = FxHashSet::default();
-    for location in type_decl.get_locations() {
-        if !scanned_files.insert(location.file_id) {
+    for file_id in files {
+        let Some(decl_ids) = decls_by_file.get(&file_id) else {
             continue;
-        }
-        let Some(decl_tree) = db.get_decl_index().get_decl_tree(&location.file_id) else {
+        };
+        let Some(decl_tree) = db.get_decl_index().get_decl_tree(&file_id) else {
             continue;
         };
         let Some(root) = db
             .get_vfs()
-            .get_syntax_tree(&location.file_id)
+            .get_syntax_tree(&file_id)
             .map(|tree| tree.get_red_root())
         else {
             continue;
         };
-        for decl_id in bound_decls {
-            if decl_id.file_id != location.file_id {
-                continue;
-            }
+        for decl_id in decl_ids {
             let Some(decl) = decl_tree.get_decl(decl_id) else {
                 continue;
             };
@@ -210,6 +228,37 @@ pub(crate) fn local_class_table_member_ids(
         )
     });
     member_ids.dedup();
+    member_ids
+}
+
+/// Revision-gated memo for [`local_class_table_member_ids`].
+///
+/// The answer derives from the type-bound-decl map plus the live member
+/// slots, both covered by `DbIndex::type_structure_revision`. A hit is
+/// returned only when the entry's revision still matches; any mutable
+/// type/member/signature/module write, remove or clear bumps the revision
+/// and forces a recompute, so mutable analysis never observes a stale hit.
+/// Within the immutable diagnostics phase the revision is fixed and repeated
+/// reads of one class member share a single scan.
+pub(crate) fn cached_local_class_table_member_ids(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    type_id: &LuaTypeDeclId,
+    member_key: &LuaMemberKey,
+) -> Arc<Vec<LuaMemberId>> {
+    let revision = db.type_structure_revision();
+    let cache_key = (type_id.clone(), member_key.clone());
+    if let Some((cached_revision, member_ids)) =
+        cache.local_class_table_member_ids_cache.get(&cache_key)
+        && *cached_revision == revision
+    {
+        return Arc::clone(member_ids);
+    }
+
+    let member_ids = Arc::new(local_class_table_member_ids(db, type_id, member_key));
+    cache
+        .local_class_table_member_ids_cache
+        .insert(cache_key, (revision, Arc::clone(&member_ids)));
     member_ids
 }
 
@@ -259,10 +308,16 @@ fn is_open_table_merge_component(typ: &LuaType) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
-    use crate::{DbIndex, LuaMemberKey, LuaObjectType, LuaType, LuaTypeDeclId};
+    use crate::{
+        DbIndex, LuaInferCache, LuaMemberKey, LuaObjectType, LuaType, LuaTypeDeclId,
+        VirtualWorkspace,
+    };
 
-    use super::merge_open_table_types;
+    use super::{
+        cached_local_class_table_member_ids, local_class_table_member_ids, merge_open_table_types,
+    };
 
     #[test]
     fn merge_open_table_types_keeps_tableof_as_table_component() {
@@ -362,6 +417,294 @@ mod tests {
             1,
             "the rebound table now backs OtherClass",
         );
+    }
+
+    fn assert_cached_matches_uncached(
+        ws: &VirtualWorkspace,
+        cache: &mut LuaInferCache,
+        type_id: &LuaTypeDeclId,
+        key: &LuaMemberKey,
+    ) -> Vec<crate::LuaMemberId> {
+        let db = ws.analysis.compilation.get_db();
+        let uncached = local_class_table_member_ids(db, type_id, key);
+        let cached = cached_local_class_table_member_ids(db, cache, type_id, key);
+        assert_eq!(
+            cached.as_ref(),
+            &uncached,
+            "cached and uncached agree for {}::{:?}",
+            type_id.get_name(),
+            key,
+        );
+        uncached
+    }
+
+    #[test]
+    fn cached_local_class_table_ids_reuse_hit_and_stay_sorted() {
+        const CONTENT: &str = r#"
+            ---@class SortedClass
+            ---@type SortedClass
+            local first = { speed = 1 }
+            ---@type SortedClass
+            local second = { speed = 2 }
+        "#;
+
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file("lua/autorun/shared/sorted.lua", CONTENT);
+        let type_id = LuaTypeDeclId::global("SortedClass");
+        let key = LuaMemberKey::Name("speed".into());
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+
+        let db = ws.analysis.compilation.get_db();
+        let uncached = local_class_table_member_ids(db, &type_id, &key);
+        assert_eq!(uncached.len(), 2, "both bound tables back the class");
+        let first_hit = cached_local_class_table_member_ids(db, &mut cache, &type_id, &key);
+        assert_eq!(first_hit.as_ref(), &uncached);
+        let second_hit = cached_local_class_table_member_ids(db, &mut cache, &type_id, &key);
+        assert!(
+            Arc::ptr_eq(&first_hit, &second_hit),
+            "unchanged query reuses the cached allocation",
+        );
+        assert_eq!(second_hit.as_ref(), &uncached);
+        let positions: Vec<_> = second_hit.iter().map(|id| id.get_position()).collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] <= w[1]),
+            "repeated query returns the same sorted ids: {:?}",
+            positions,
+        );
+    }
+
+    #[test]
+    fn cached_local_class_table_ids_see_first_member_insertion() {
+        const EMPTY: &str = r#"
+            ---@class GrowingClass
+            ---@type GrowingClass
+            local box = {}
+        "#;
+        const FILLED: &str = r#"
+            ---@class GrowingClass
+            ---@type GrowingClass
+            local box = { speed = 1 }
+        "#;
+
+        let mut ws = VirtualWorkspace::new();
+        let path = "lua/autorun/shared/growing.lua";
+        let file_id = ws.def_file(path, EMPTY);
+        let type_id = LuaTypeDeclId::global("GrowingClass");
+        let key = LuaMemberKey::Name("speed".into());
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+
+        let found = assert_cached_matches_uncached(&ws, &mut cache, &type_id, &key);
+        assert!(found.is_empty(), "no table field backs the key yet");
+
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.analysis
+            .update_file_by_uri(&uri, Some(FILLED.to_string()))
+            .expect("filled file indexed");
+        let found = assert_cached_matches_uncached(&ws, &mut cache, &type_id, &key);
+        assert_eq!(
+            found.len(),
+            1,
+            "the cached empty hit is invalidated by the member insertion",
+        );
+    }
+
+    #[test]
+    fn cached_local_class_table_ids_follow_rekey_rehome_and_removal() {
+        const SPEED: &str = r#"
+            ---@class RekeyClass
+            ---@type RekeyClass
+            local item = { speed = 1 }
+        "#;
+        const REKEYED: &str = r#"
+            ---@class RekeyClass
+            ---@type RekeyClass
+            local item = { velocity = 1 }
+        "#;
+        const SHIFTED: &str = r#"
+            ---@class RekeyClass
+            -- shifting the table down rehomes its members to a new owner range
+            ---@type RekeyClass
+            local item = { velocity = 1 }
+        "#;
+        const REMOVED: &str = r#"
+            ---@class RekeyClass
+            ---@type RekeyClass
+            local item = {}
+        "#;
+
+        let mut ws = VirtualWorkspace::new();
+        let path = "lua/autorun/shared/rekey.lua";
+        let file_id = ws.def_file(path, SPEED);
+        let type_id = LuaTypeDeclId::global("RekeyClass");
+        let speed = LuaMemberKey::Name("speed".into());
+        let velocity = LuaMemberKey::Name("velocity".into());
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+
+        let found = assert_cached_matches_uncached(&ws, &mut cache, &type_id, &speed);
+        assert_eq!(found.len(), 1, "initial hit populates the cache");
+
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.analysis
+            .update_file_by_uri(&uri, Some(REKEYED.to_string()))
+            .expect("rekeyed file indexed");
+        let found = assert_cached_matches_uncached(&ws, &mut cache, &type_id, &speed);
+        assert!(
+            found.is_empty(),
+            "the rekeyed-away member is gone after the hit",
+        );
+        let found = assert_cached_matches_uncached(&ws, &mut cache, &type_id, &velocity);
+        assert_eq!(found.len(), 1, "the rekeyed-to member appears");
+
+        ws.analysis
+            .update_file_by_uri(&uri, Some(SHIFTED.to_string()))
+            .expect("shifted file indexed");
+        let found = assert_cached_matches_uncached(&ws, &mut cache, &type_id, &velocity);
+        assert_eq!(
+            found.len(),
+            1,
+            "rehoming the table keeps the member visible through the cache",
+        );
+
+        ws.analysis
+            .update_file_by_uri(&uri, Some(REMOVED.to_string()))
+            .expect("emptied file indexed");
+        let found = assert_cached_matches_uncached(&ws, &mut cache, &type_id, &velocity);
+        assert!(
+            found.is_empty(),
+            "removing the field after a hit reads empty again",
+        );
+    }
+
+    #[test]
+    fn cached_local_class_table_ids_handle_multiple_decls_across_files() {
+        const FILE_A: &str = r#"
+            ---@class MultiClass
+            ---@type MultiClass
+            local a = { speed = 1 }
+            ---@type MultiClass
+            local b = { speed = 2 }
+        "#;
+        const FILE_B: &str = r#"
+            ---@class MultiClass
+            ---@type MultiClass
+            local c = { speed = 3 }
+        "#;
+        const FILE_B_UNBOUND: &str = r#"
+            ---@class MultiClass
+            ---@class OtherMulti
+            ---@type OtherMulti
+            local c = { speed = 3 }
+        "#;
+
+        let mut ws = VirtualWorkspace::new();
+        let path_a = "lua/autorun/shared/multi_a.lua";
+        let path_b = "lua/autorun/shared/multi_b.lua";
+        let file_a = ws.def_file(path_a, FILE_A);
+        ws.def_file(path_b, FILE_B);
+        let type_id = LuaTypeDeclId::global("MultiClass");
+        let key = LuaMemberKey::Name("speed".into());
+        let mut cache = LuaInferCache::new(file_a, Default::default());
+
+        let found = assert_cached_matches_uncached(&ws, &mut cache, &type_id, &key);
+        assert_eq!(
+            found.len(),
+            3,
+            "two bound decls in one file plus one across files",
+        );
+        let order: Vec<_> = found
+            .iter()
+            .map(|id| (id.file_id, id.get_position()))
+            .collect();
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(order, sorted, "ids stay in deterministic sorted order");
+
+        let uri_b = ws.virtual_url_generator.new_uri(path_b);
+        ws.analysis
+            .update_file_by_uri(&uri_b, Some(FILE_B_UNBOUND.to_string()))
+            .expect("unbound file indexed");
+        let found = assert_cached_matches_uncached(&ws, &mut cache, &type_id, &key);
+        assert_eq!(
+            found.len(),
+            2,
+            "unbinding the cross-file table leaves the single-file pair",
+        );
+    }
+
+    #[test]
+    fn cached_local_class_table_ids_ignore_non_table_and_multivalue_initializers() {
+        const CONTENT: &str = r#"
+            ---@class FilteredClass
+            ---@type FilteredClass
+            local nontable = 42
+            ---@type FilteredClass
+            local good = { wanted = 1 }
+            local function make() return 1 end
+            ---@type FilteredClass
+            local x, y = make()
+        "#;
+
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file("lua/autorun/shared/filtered.lua", CONTENT);
+        let type_id = LuaTypeDeclId::global("FilteredClass");
+        let wanted = LuaMemberKey::Name("wanted".into());
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+
+        let found = assert_cached_matches_uncached(&ws, &mut cache, &type_id, &wanted);
+        assert_eq!(
+            found.len(),
+            1,
+            "only the table literal backs the class; the number and the call decls do not",
+        );
+    }
+
+    #[test]
+    fn cached_local_class_table_ids_follow_decl_bind_and_clear_drops() {
+        const BOUND: &str = r#"
+            ---@class CachedBound
+            ---@class CachedOther
+            ---@type CachedBound
+            local instance = { speed = 10 }
+        "#;
+        const REBOUND: &str = r#"
+            ---@class CachedBound
+            ---@class CachedOther
+            ---@type CachedOther
+            local instance = { speed = 10 }
+        "#;
+
+        let mut ws = VirtualWorkspace::new();
+        let path = "lua/autorun/shared/cached_bound.lua";
+        let file_id = ws.def_file(path, BOUND);
+        let bound = LuaTypeDeclId::global("CachedBound");
+        let other = LuaTypeDeclId::global("CachedOther");
+        let speed = LuaMemberKey::Name("speed".into());
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+
+        let found = assert_cached_matches_uncached(&ws, &mut cache, &bound, &speed);
+        assert_eq!(found.len(), 1, "bound table backs its class");
+        let found = assert_cached_matches_uncached(&ws, &mut cache, &other, &speed);
+        assert!(found.is_empty(), "no table backs the other class yet");
+
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.analysis
+            .update_file_by_uri(&uri, Some(REBOUND.to_string()))
+            .expect("rebound file indexed");
+        let found = assert_cached_matches_uncached(&ws, &mut cache, &bound, &speed);
+        assert!(
+            found.is_empty(),
+            "rebinding away invalidates the earlier hit",
+        );
+        let found = assert_cached_matches_uncached(&ws, &mut cache, &other, &speed);
+        assert_eq!(found.len(), 1, "the rebound table backs the other class");
+
+        cache.clear();
+        assert!(
+            cache.local_class_table_member_ids_cache.is_empty(),
+            "full clear drops the entries",
+        );
+        let found = assert_cached_matches_uncached(&ws, &mut cache, &other, &speed);
+        assert_eq!(found.len(), 1, "lookup still agrees after a clear");
     }
 }
 
