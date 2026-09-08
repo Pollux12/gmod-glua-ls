@@ -52,6 +52,87 @@ pub(crate) fn union_type_all(types: Vec<LuaType>) -> LuaType {
     union_all_absorbed(types)
 }
 
+/// Batch equivalent of folding [`union_type`] from [`LuaType::Never`].
+///
+/// The result is exactly the ordered pairwise fold for every input. A
+/// structural fast path runs only when proven equivalent; otherwise this
+/// literally performs that fold.
+pub fn union_all(db: &DbIndex, types: Vec<LuaType>) -> LuaType {
+    match types.len() {
+        0 => return LuaType::Never,
+        // `Never | t` is `t` via the `Never` collapse arm, with no
+        // dereference in play (`Never` is not a `Ref`).
+        1 => return types.into_iter().next().unwrap_or(LuaType::Never),
+        _ => {}
+    }
+
+    if can_use_db_aware_structural_union(db, &types) {
+        return LuaType::from_vec_structural(types);
+    }
+
+    types
+        .into_iter()
+        .fold(LuaType::Never, |acc, ty| union_type(db, acc, ty))
+}
+
+/// Whether [`LuaType::from_vec_structural`] matches the DB-aware ordered fold.
+///
+/// Proof of equivalence when this returns true:
+/// - No top-level `Any`: `Any` absorbs siblings (`Any | T` is `Any`,
+///   `Any | nil` is `Any?`) while the structural constructor keeps both.
+/// - No top-level `Never`: `Never` is the fold identity (`Never | T` is `T`)
+///   while the structural constructor keeps it as an arm.
+/// - No top-level `Union`/`MultiLineUnion`: joining a plain accumulator to a
+///   union splices that union's members first, where sequential absorption
+///   keeps the accumulator first; a multi-line union matches an incoming
+///   literal by value, so which side it lands on decides the result.
+/// - No top-level alias `Ref`: the fold dereferences the accumulator
+///   (`get_real_type`) for matching only, so an alias to a primitive, to
+///   `Any`, or to a union collapses or splices differently than the
+///   structural path, which matches a `Ref` by identity. Non-alias `Ref`s
+///   dereference to themselves and are safe.
+/// - No absorption pair per [`can_use_structural_union`]: primitive absorbs
+///   literal (`Integer` absorbs `IntegerConst`, `Number` absorbs numerics,
+///   `String` absorbs string consts, `Boolean` absorbs `BooleanConst`, two
+///   distinct `BooleanConst`s become `Boolean`, `Table` absorbs `TableConst`,
+///   `Function` absorbs callables), while the structural constructor keeps
+///   both arms.
+/// - No observable visiting order per [`visiting_order_is_observable`]:
+///   with the union cases above already rejected this only restates that no
+///   nested multi-line union and no order-sensitive callable members mixed
+///   with a spliced union can reorder survivors.
+///
+/// Anything not proven safe above falls back to the literal fold.
+fn can_use_db_aware_structural_union(db: &DbIndex, types: &[LuaType]) -> bool {
+    for typ in types {
+        match typ {
+            LuaType::Any | LuaType::Never | LuaType::Union(_) | LuaType::MultiLineUnion(_) => {
+                return false;
+            }
+            LuaType::Ref(id) => {
+                if db
+                    .get_type_index()
+                    .get_type_decl(id)
+                    .is_some_and(|decl| decl.is_alias())
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !can_use_structural_union(types) {
+        return false;
+    }
+
+    if visiting_order_is_observable(types) {
+        return false;
+    }
+
+    true
+}
+
 /// `union_type_all`'s fold without the per-step canonicalisation.
 ///
 /// The pairwise fold rebuilds, de-duplicates and re-sorts the whole accumulated

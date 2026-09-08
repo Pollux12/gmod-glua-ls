@@ -1021,7 +1021,7 @@ fn infer_table_dynamic_key_member_type(
 
     let access_key_type = member_key_as_type(key)?;
     let members = db.get_member_index().get_expr_key_members(owner)?;
-    let mut result_type = LuaType::Never;
+    let mut member_types = Vec::with_capacity(members.len());
 
     for member in members {
         let dynamic_key = member.get_key();
@@ -1048,10 +1048,11 @@ fn infer_table_dynamic_key_member_type(
             caller_position,
             source_min_position,
         ) {
-            result_type = TypeOps::Union.apply(db, &result_type, &member_type);
+            member_types.push(member_type);
         }
     }
 
+    let result_type = TypeOps::union_all(db, member_types);
     (!result_type.is_never()).then_some(result_type)
 }
 
@@ -1110,7 +1111,7 @@ fn infer_gmod_same_file_expr_key_member_type(
 
     let access_key_type = crate::semantic::member::member_key_as_type(key)?;
     let members = db.get_member_index().get_members(owner)?;
-    let mut result = LuaType::Never;
+    let mut member_types = Vec::with_capacity(members.len());
     // Track matches independently of the accumulated type: a matched member
     // whose type is (still) Unknown must not read as "no member matched".
     let mut saw_match = false;
@@ -1151,9 +1152,10 @@ fn infer_gmod_same_file_expr_key_member_type(
         };
 
         saw_match = true;
-        result = TypeOps::Union.apply(db, &result, &member_type);
+        member_types.push(member_type);
     }
 
+    let result = TypeOps::union_all(db, member_types);
     if !saw_match {
         None
     } else if matched_covered_numeric_for_write {
@@ -1340,7 +1342,7 @@ fn infer_cross_file_matching_expr_key_member_type(
     let allow_wildcard_expr_literal_match =
         is_literal_member_key(key) && owner_wildcard_covers_literal_key(db, owner);
     let members = db.get_member_index().get_expr_key_members(owner)?;
-    let mut result = LuaType::Never;
+    let mut member_types = Vec::with_capacity(members.len());
     // See `infer_gmod_same_file_expr_key_member_type`: matching is tracked
     // separately so an Unknown member type does not read as "no match".
     let mut saw_match = false;
@@ -1385,10 +1387,14 @@ fn infer_cross_file_matching_expr_key_member_type(
         }
 
         saw_match = true;
-        result = TypeOps::Union.apply(db, &result, &member_type);
+        member_types.push(member_type);
     }
 
-    if saw_match { Some(result) } else { None }
+    if saw_match {
+        Some(TypeOps::union_all(db, member_types))
+    } else {
+        None
+    }
 }
 
 fn table_has_cross_file_matching_expr_key_member(
@@ -2097,7 +2103,7 @@ pub(crate) fn resolve_decl_backed_global_path_member_type(
         }
         None => member_item.visible_member_ids_with_realm(db, caller_file_id),
     };
-    let mut result = LuaType::Never;
+    let mut member_types = Vec::with_capacity(visible_member_ids.len());
 
     for member_id in visible_member_ids {
         let decl_id = crate::LuaDeclId::new(member_id.file_id, member_id.get_position());
@@ -2119,9 +2125,10 @@ pub(crate) fn resolve_decl_backed_global_path_member_type(
                 .ok_or(InferFailReason::None)
         })
         .unwrap_or(LuaType::Unknown);
-        result = TypeOps::Union.apply(db, &result, &decl_type);
+        member_types.push(decl_type);
     }
 
+    let result = TypeOps::union_all(db, member_types);
     (!result.is_never()).then_some(result)
 }
 
@@ -2254,10 +2261,7 @@ fn infer_tuple_member(
                 };
             }
             LuaType::Integer | LuaType::Number => {
-                let mut result = LuaType::Never;
-                for typ in tuple_type.get_types() {
-                    result = TypeOps::Union.apply(db, &result, typ);
-                }
+                let mut result = TypeOps::union_all(db, tuple_type.get_types().to_vec());
                 if tuple_type.get_types().is_empty() {
                     // Nothing contributed: pin the escape value, not the seed.
                     // `result` still flows through the `Nil` union below.
@@ -2948,7 +2952,7 @@ fn infer_member_by_index_table(
             };
             if let Some(mut members) = members {
                 members.sort_by(|a, b| a.get_key().cmp(b.get_key()));
-                let mut result_type = LuaType::Never;
+                let mut member_types = Vec::with_capacity(members.len());
                 let mut matched_inferred_index_key = false;
                 // Track matches independently of the union being non-Unknown:
                 // a matched member whose type is (temporarily) Unknown must not
@@ -2978,10 +2982,11 @@ fn infer_member_by_index_table(
                     };
                     saw_match = true;
                     matched_inferred_index_key |= is_inferred_index_member_key(member.get_key());
-                    result_type = TypeOps::Union.apply(db, &result_type, &member_type);
+                    member_types.push(member_type);
                 }
 
                 if saw_match {
+                    let mut result_type = TypeOps::union_all(db, member_types);
                     if table_index_result_may_be_nil(db, &key_type, matched_inferred_index_key) {
                         result_type = TypeOps::Union.apply(db, &result_type, &LuaType::Nil);
                     }
@@ -3216,7 +3221,7 @@ fn infer_member_by_index_union(
     index_expr: LuaIndexMemberExpr,
     infer_guard: &InferGuardRef,
 ) -> InferResult {
-    let mut member_type = LuaType::Never;
+    let mut member_types = Vec::with_capacity(union.len());
     // An arm that resolves to Unknown is still a resolved arm, so track that
     // separately from the accumulated type.
     let mut saw_match = false;
@@ -3226,7 +3231,7 @@ fn infer_member_by_index_union(
         match result {
             Ok(typ) => {
                 saw_match = true;
-                member_type = TypeOps::Union.apply(db, &member_type, &typ);
+                member_types.push(typ);
             }
             Err(InferFailReason::FieldNotFound) => {}
             Err(err) => {
@@ -3239,7 +3244,10 @@ fn infer_member_by_index_union(
         return Err(InferFailReason::FieldNotFound);
     }
 
-    Ok(normalize_uninformative_member_union(member_type))
+    Ok(normalize_uninformative_member_union(TypeOps::union_all(
+        db,
+        member_types,
+    )))
 }
 
 fn normalize_uninformative_member_union(typ: LuaType) -> LuaType {
