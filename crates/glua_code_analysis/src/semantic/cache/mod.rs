@@ -662,6 +662,22 @@ impl LuaInferCache {
             .insert((flow_id, query_realm, origin), entry);
     }
 
+    pub(crate) fn set_flow_cache_batch_with_origin_by_key(
+        &mut self,
+        cache_key: &VarRefCacheKey,
+        visited_flow_ids: &[FlowId],
+        flow_id: FlowId,
+        query_realm: GmodRealm,
+        origin: FlowOrigin,
+        entry: CacheEntry<Arc<LuaType>>,
+    ) {
+        let by_flow = self.flow_node_cache.entry(cache_key.clone()).or_default();
+        for visited_flow_id in visited_flow_ids {
+            by_flow.insert((*visited_flow_id, query_realm, origin), entry.clone());
+        }
+        by_flow.insert((flow_id, query_realm, origin), entry);
+    }
+
     /// Takes the reusable flow-walk scratch buffer. Walks nest through merge
     /// points, so when a walk is already in progress the nested walk gets a
     /// throwaway buffer (`owned == false`) that is simply dropped on return.
@@ -817,15 +833,17 @@ fn var_ref_is_phase_stable(db: &DbIndex, syntax_id: &LuaSyntaxId, var_ref_id: &V
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
     use internment::ArcIntern;
     use rowan::{TextRange, TextSize};
     use smol_str::SmolStr;
 
-    use super::{CacheEntry, LuaInferCache};
+    use super::{CacheEntry, FlowOrigin, LuaInferCache, VarRefCacheKey};
     use crate::{
-        DbIndex, FileId, FlowId, GmodRealm, LuaDecl, LuaDeclExtra, LuaDeclId, LuaDeclarationTree,
-        LuaType, VarRefId, VarRefRootId,
+        DbIndex, FileId, FlowId, GmodRealm, InferFailReason, LuaDecl, LuaDeclExtra, LuaDeclId,
+        LuaDeclarationTree, LuaType, VarRefId, VarRefRootId,
     };
 
     #[test]
@@ -926,5 +944,117 @@ mod tests {
             cache.expr_var_ref_id_cache.get(&index_expr_id),
             Some(&index_ref)
         );
+    }
+
+    #[test]
+    fn flow_cache_batch_backfills_success_entries() {
+        let file_id = FileId { id: 7 };
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+        let cache_key = VarRefCacheKey::GlobalName(ArcIntern::new(SmolStr::new("value")));
+        let query_realm = GmodRealm::Shared;
+
+        cache.set_flow_cache_batch_with_origin_by_key(
+            &cache_key,
+            &[],
+            FlowId(1),
+            query_realm,
+            FlowOrigin::Real,
+            CacheEntry::Cache(Arc::new(LuaType::String)),
+        );
+        assert!(matches!(
+            cache.get_flow_cache_with_origin_by_key(
+                &cache_key,
+                FlowId(1),
+                query_realm,
+                FlowOrigin::Real
+            ),
+            Some(CacheEntry::Cache(narrow_type)) if **narrow_type == LuaType::String
+        ));
+
+        cache.set_flow_cache_batch_with_origin_by_key(
+            &cache_key,
+            &[FlowId(2), FlowId(3)],
+            FlowId(4),
+            query_realm,
+            FlowOrigin::Real,
+            CacheEntry::Cache(Arc::new(LuaType::Number)),
+        );
+        for flow_id in [FlowId(2), FlowId(3), FlowId(4)] {
+            assert!(matches!(
+                cache.get_flow_cache_with_origin_by_key(
+                    &cache_key,
+                    flow_id,
+                    query_realm,
+                    FlowOrigin::Real
+                ),
+                Some(CacheEntry::Cache(narrow_type)) if **narrow_type == LuaType::Number
+            ));
+        }
+
+        cache.set_flow_cache_batch_with_origin_by_key(
+            &cache_key,
+            &[FlowId(5), FlowId(6)],
+            FlowId(5),
+            query_realm,
+            FlowOrigin::Real,
+            CacheEntry::Cache(Arc::new(LuaType::Integer)),
+        );
+        for flow_id in [FlowId(5), FlowId(6)] {
+            assert!(matches!(
+                cache.get_flow_cache_with_origin_by_key(
+                    &cache_key,
+                    flow_id,
+                    query_realm,
+                    FlowOrigin::Real
+                ),
+                Some(CacheEntry::Cache(narrow_type)) if **narrow_type == LuaType::Integer
+            ));
+        }
+    }
+
+    #[test]
+    fn flow_cache_batch_preserves_error_entries() {
+        let file_id = FileId { id: 7 };
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+        let cache_key = VarRefCacheKey::GlobalName(ArcIntern::new(SmolStr::new("value")));
+        let query_realm = GmodRealm::Shared;
+
+        cache.set_flow_cache_batch_with_origin_by_key(
+            &cache_key,
+            &[],
+            FlowId(1),
+            query_realm,
+            FlowOrigin::Real,
+            CacheEntry::Error(InferFailReason::None),
+        );
+        assert!(matches!(
+            cache.get_flow_cache_with_origin_by_key(
+                &cache_key,
+                FlowId(1),
+                query_realm,
+                FlowOrigin::Real
+            ),
+            Some(CacheEntry::Error(InferFailReason::None))
+        ));
+
+        cache.set_flow_cache_batch_with_origin_by_key(
+            &cache_key,
+            &[FlowId(2), FlowId(3)],
+            FlowId(2),
+            query_realm,
+            FlowOrigin::Real,
+            CacheEntry::Error(InferFailReason::FieldNotFound),
+        );
+        for flow_id in [FlowId(2), FlowId(3)] {
+            assert!(matches!(
+                cache.get_flow_cache_with_origin_by_key(
+                    &cache_key,
+                    flow_id,
+                    query_realm,
+                    FlowOrigin::Real
+                ),
+                Some(CacheEntry::Error(InferFailReason::FieldNotFound))
+            ));
+        }
     }
 }

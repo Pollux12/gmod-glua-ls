@@ -134,17 +134,9 @@ pub fn get_type_at_flow_with_origin(
             // One deep clone into a shared entry; the fan-out below only
             // bumps the refcount instead of cloning the type per node.
             let entry = CacheEntry::Cache(Arc::new(ty.clone()));
-            for visited_flow_id in &visited_flow_ids {
-                cache.set_flow_cache_with_origin_by_key(
-                    &cache_key,
-                    *visited_flow_id,
-                    query_realm,
-                    policy.origin,
-                    entry.clone(),
-                );
-            }
-            cache.set_flow_cache_with_origin_by_key(
+            cache.set_flow_cache_batch_with_origin_by_key(
                 &cache_key,
+                &visited_flow_ids,
                 flow_id,
                 query_realm,
                 policy.origin,
@@ -164,17 +156,9 @@ pub fn get_type_at_flow_with_origin(
 
             if should_cache {
                 let entry = CacheEntry::Error(reason.clone());
-                for visited_flow_id in &visited_flow_ids {
-                    cache.set_flow_cache_with_origin_by_key(
-                        &cache_key,
-                        *visited_flow_id,
-                        query_realm,
-                        policy.origin,
-                        entry.clone(),
-                    );
-                }
-                cache.set_flow_cache_with_origin_by_key(
+                cache.set_flow_cache_batch_with_origin_by_key(
                     &cache_key,
+                    &visited_flow_ids,
                     flow_id,
                     query_realm,
                     policy.origin,
