@@ -296,22 +296,24 @@ fn infer_owner_raw_member_type_with_realm_uncached(
             })
             .collect::<Vec<_>>();
         integer_keys.sort();
-        let result_type = integer_keys
-            .into_iter()
-            .filter_map(|key| member_index.get_member_item(member_owner, key))
-            .filter_map(|item| {
-                resolve_member_item_with_realm(
-                    db,
-                    item,
-                    caller_file_id,
-                    caller_position,
-                    source_min_position,
-                )
-                .ok()
-            })
-            .fold(exact_type, |acc, member_type| {
-                TypeOps::Union.apply(db, &acc, &member_type)
-            });
+        let mut member_types = Vec::with_capacity(1 + integer_keys.len());
+        member_types.push(exact_type);
+        member_types.extend(
+            integer_keys
+                .into_iter()
+                .filter_map(|key| member_index.get_member_item(member_owner, key))
+                .filter_map(|item| {
+                    resolve_member_item_with_realm(
+                        db,
+                        item,
+                        caller_file_id,
+                        caller_position,
+                        source_min_position,
+                    )
+                    .ok()
+                }),
+        );
+        let result_type = TypeOps::union_all(db, member_types);
         return Ok(result_type);
     }
 
@@ -331,7 +333,7 @@ fn infer_owner_raw_member_type_with_realm_uncached(
         return Err(InferFailReason::FieldNotFound);
     };
 
-    let mut result_type = LuaType::Never;
+    let mut member_types = Vec::new();
     // A member that resolves to Unknown is still a resolved member, so "did
     // anything match" is tracked separately from the accumulated type.
     let mut saw_match = false;
@@ -349,13 +351,15 @@ fn infer_owner_raw_member_type_with_realm_uncached(
             source_min_position,
         ) {
             saw_match = true;
-            result_type = TypeOps::Union.apply(db, &result_type, &member_type);
+            member_types.push(member_type);
         }
     }
 
     if !saw_match {
         return Err(InferFailReason::FieldNotFound);
     }
+
+    let mut result_type = TypeOps::union_all(db, member_types);
 
     if matches!(
         access_key_type,
