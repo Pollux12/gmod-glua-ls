@@ -2887,7 +2887,7 @@ fn collect_provenance_files<'a>(
 /// arms `remap_identities_in_type` rewrites. Named references (`Ref`, `Def`)
 /// and module links carry no position and never move under a remap.
 fn collect_type_files(typ: &LuaType, files: &mut HashSet<FileId>) {
-    typ.visit_type(&mut |inner| match inner {
+    typ.visit_type_identities(&mut |inner| match inner {
         LuaType::TableConst(range) => {
             files.insert(range.file_id);
         }
@@ -3701,6 +3701,33 @@ mod remap_walker_tests {
 
     fn signature(file: u32, position: u32) -> LuaType {
         LuaType::Signature(LuaSignatureId::new(file_id(file), TextSize::new(position)))
+    }
+
+    #[test]
+    fn definition_fact_remaps_instance_base_after_edit_and_reports_deletion() {
+        let source = file_id(1);
+        let consumer = file_id(2);
+        let definition = LuaDefinitionId::Declaration(LuaDeclId::new(consumer, 0.into()));
+        let instance = |start, end| {
+            LuaType::Instance(Arc::new(LuaInstanceType::new(
+                table(1, start, end),
+                InFiled::new(consumer, TextRange::new(0.into(), 2.into())),
+            )))
+        };
+        let mut index = LuaTypeIndex::new();
+        index.bind_definition_fact(definition, LuaTypeFact::certain(instance(3, 5)));
+        let insertion = FileRemap::unvalidated(source, PositionMap::new("abcde", "XXabcde"));
+        assert!(index.remap_file_identities(&insertion).is_empty());
+        assert_eq!(
+            index.get_definition_fact(&definition).unwrap().typ(),
+            &instance(5, 7),
+        );
+
+        let deletion = FileRemap::unvalidated(source, PositionMap::new("XXabcde", "XXa"));
+        assert_eq!(
+            index.remap_file_identities(&deletion),
+            [consumer].into_iter().collect(),
+        );
     }
 
     #[test]
