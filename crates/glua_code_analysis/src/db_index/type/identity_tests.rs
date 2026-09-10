@@ -151,3 +151,33 @@ fn nested_identities_move_revert_and_report_loss() {
         }
     }
 }
+
+#[test]
+fn table_merges_preserve_precise_components() {
+    let named = LuaType::Object(Arc::new(LuaObjectType::new_with_fields(
+        BTreeMap::from([(LuaMemberKey::Name("foo".into()), LuaType::String)]),
+        vec![],
+    )));
+    let components = vec![
+        LuaType::Object(Arc::new(LuaObjectType::new_with_fields(
+            BTreeMap::new(),
+            vec![(LuaType::String, LuaType::Number)],
+        ))),
+        LuaType::TableGeneric(Arc::new(vec![LuaType::String, LuaType::Number])),
+        LuaType::TableOf(Box::new(LuaType::Ref(LuaTypeDeclId::global("Entity")))),
+        LuaType::TableConst(InFiled::new(
+            FileId::new(1),
+            TextRange::new(0.into(), 2.into()),
+        )),
+    ];
+    for component in components {
+        let merged =
+            merge_table_assignment_types(vec![LuaType::Table, component.clone(), named.clone()]);
+        let LuaType::MergedTable(merged) = merged else {
+            panic!("lost {component:?}")
+        };
+        assert!(merged.get_types().contains(&component));
+        assert!(merged.get_types().contains(&named));
+        assert!(!merged.get_types().contains(&LuaType::Table));
+    }
+}
