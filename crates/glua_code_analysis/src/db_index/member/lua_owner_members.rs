@@ -10,7 +10,9 @@ pub struct LuaOwnerMembers {
     // `members` is private and these four mutators are the complete id-set
     // invalidation surface: `add_member`, `get_member_mut`, `iter_mut`, and
     // `remove_member`.
+    revision: u64,
     sorted_ids_cache: OnceLock<Vec<LuaMemberId>>,
+    sorted_expr_ids_cache: OnceLock<Vec<LuaMemberId>>,
     /// The subset of `members` keyed by an expression rather than a name.
     ///
     /// Only `add_member` and `remove_member` change the key set; the mutators
@@ -24,7 +26,9 @@ impl LuaOwnerMembers {
     pub fn new() -> Self {
         Self {
             members: HashMap::new(),
+            revision: 0,
             sorted_ids_cache: OnceLock::new(),
+            sorted_expr_ids_cache: OnceLock::new(),
             expr_keys: Vec::new(),
             resolve_state: OwnerMemberStatus::UnResolved,
         }
@@ -81,6 +85,21 @@ impl LuaOwnerMembers {
         })
     }
 
+    pub fn sorted_expr_key_member_ids(&self) -> &[LuaMemberId] {
+        self.sorted_expr_ids_cache.get_or_init(|| {
+            let mut member_ids = Vec::with_capacity(self.expr_keys.len());
+            for key in &self.expr_keys {
+                match self.members.get(key) {
+                    Some(LuaMemberIndexItem::One(id)) => member_ids.push(*id),
+                    Some(LuaMemberIndexItem::Many(ids)) => member_ids.extend(ids.iter().copied()),
+                    None => {}
+                }
+            }
+            member_ids.sort_by_key(|member_id| member_id_sort_key(*member_id));
+            member_ids
+        })
+    }
+
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&LuaMemberKey, &mut LuaMemberIndexItem)> {
         self.invalidate_sorted_member_ids();
         self.members.iter_mut()
@@ -110,8 +129,14 @@ impl LuaOwnerMembers {
         matches!(self.resolve_state, OwnerMemberStatus::Resolved)
     }
 
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
     fn invalidate_sorted_member_ids(&mut self) {
+        self.revision += 1;
         self.sorted_ids_cache = OnceLock::new();
+        self.sorted_expr_ids_cache = OnceLock::new();
     }
 }
 
@@ -119,4 +144,60 @@ impl LuaOwnerMembers {
 pub enum OwnerMemberStatus {
     UnResolved,
     Resolved,
+}
+
+#[cfg(test)]
+mod tests {
+    use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
+    use rowan::{TextRange, TextSize};
+
+    use super::*;
+    use crate::FileId;
+
+    fn member_id(file_id: u32, start: u32) -> LuaMemberId {
+        LuaMemberId::new(
+            LuaSyntaxId::new(
+                LuaSyntaxKind::NameExpr.into(),
+                TextRange::new(TextSize::new(start), TextSize::new(start + 1)),
+            ),
+            FileId::new(file_id),
+        )
+    }
+
+    #[test]
+    fn sorted_expression_member_ids_follow_every_mutation_path() {
+        let expr_key = LuaMemberKey::ExprType(crate::LuaType::String);
+        let second_expr_key = LuaMemberKey::ExprType(crate::LuaType::Integer);
+        let first = member_id(2, 20);
+        let second = member_id(1, 10);
+        let third = member_id(3, 30);
+        let mut members = LuaOwnerMembers::new();
+
+        members.add_member(expr_key.clone(), LuaMemberIndexItem::One(first));
+        assert_eq!(members.sorted_expr_key_member_ids(), &[first]);
+
+        members.add_member(
+            expr_key.clone(),
+            LuaMemberIndexItem::Many(vec![first, second]),
+        );
+        assert_eq!(members.sorted_expr_key_member_ids(), &[second, first]);
+
+        if let Some(item) = members.get_member_mut(&expr_key) {
+            *item = LuaMemberIndexItem::One(first);
+        }
+        assert_eq!(members.sorted_expr_key_member_ids(), &[first]);
+
+        members.add_member(second_expr_key.clone(), LuaMemberIndexItem::One(third));
+        assert_eq!(members.sorted_expr_key_member_ids(), &[first, third]);
+
+        for (key, item) in members.iter_mut() {
+            if key == &expr_key {
+                *item = LuaMemberIndexItem::One(second);
+            }
+        }
+        assert_eq!(members.sorted_expr_key_member_ids(), &[second, third]);
+
+        members.remove_member(&second_expr_key);
+        assert_eq!(members.sorted_expr_key_member_ids(), &[second]);
+    }
 }

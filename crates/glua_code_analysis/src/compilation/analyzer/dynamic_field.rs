@@ -2016,6 +2016,14 @@ fn collect_string_const_names(typ: &LuaType, names: &mut Vec<SmolStr>) {
     }
 }
 
+struct DynamicFieldRefreshResult {
+    file_id: crate::FileId,
+    collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
+    attributed_unattributed: Vec<(SmolStr, crate::FileId)>,
+    reads: Option<crate::db_index::read_set::InferenceReadSet>,
+}
+
 /// Re-derives the dynamic-field sites whose prefix held no nameable table
 /// when the dynamic-field pass ran: wildcards that were silently dropped, and
 /// named writes that landed unattributed.
@@ -2035,119 +2043,146 @@ pub(crate) fn rederive_settled_dynamic_fields(
     context: &mut AnalyzeContext,
     moved_owners: Option<&FxHashSet<LuaTypeOwner>>,
 ) -> bool {
+    let read_pass = super::SettledReadPass::Dynamic;
+    let candidate_count = context.settled_dynamic_field_candidates.len();
+    let read_version = crate::db_index::read_set::InferenceReadVersion::capture(db);
     // Kept, not taken: the settled tail runs to a fixpoint and each round
     // re-derives the same candidates against what the previous one landed.
-    let mut candidates = context.settled_dynamic_field_candidates.clone();
+    let mut stale_files = FxHashMap::<crate::FileId, bool>::default();
+    let mut candidates = context
+        .settled_dynamic_field_candidates
+        .iter()
+        .filter(|(file_id, _)| {
+            *stale_files.entry(*file_id).or_insert_with(|| {
+                context.settled_pass_reads_stale(
+                    db,
+                    read_pass,
+                    candidate_count,
+                    *file_id,
+                    moved_owners,
+                )
+            })
+        })
+        .copied()
+        .collect::<Vec<_>>();
     if candidates.is_empty() {
         return false;
     }
     candidates.sort_by_key(|(file_id, syntax_id)| (*file_id, syntax_id.get_range().start()));
     candidates.dedup();
-    // Later tail rounds only revisit files whose recorded settled reads
-    // intersect what the previous round moved, as the iter-var pass does. The
-    // first round (`None`) runs every candidate and records what each file read.
-    if let Some(moved) = moved_owners {
-        candidates.retain(|(file_id, _)| context.settled_file_reads_moved(*file_id, Some(moved)));
-        if candidates.is_empty() {
-            return false;
-        }
-    }
 
-    let mut collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
-        Vec::new();
-    let mut collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)> =
-        Vec::new();
-    let mut attributed_unattributed: Vec<(SmolStr, crate::FileId)> = Vec::new();
-    let mut current_file: Option<(
-        crate::FileId,
-        glua_parser::LuaChunk,
-        crate::LuaInferCache,
-        Option<FxHashMap<LuaDeclId, Vec<TextSize>>>,
-    )> = None;
-    // What each file's re-derivation actually read, recorded for the next
-    // round's filter the way the iter-var pass records.
-    let mut file_reads: FxHashMap<crate::FileId, crate::db_index::read_set::InferenceReadSet> =
+    let mut candidates_by_file: FxHashMap<crate::FileId, Vec<glua_parser::LuaSyntaxId>> =
         FxHashMap::default();
     for (file_id, syntax_id) in candidates {
-        if current_file
-            .as_ref()
-            .is_none_or(|(id, _, _, _)| *id != file_id)
-        {
-            let Some(chunk) = db
-                .get_vfs()
-                .get_syntax_tree(&file_id)
-                .map(|tree| tree.get_chunk_node())
+        candidates_by_file
+            .entry(file_id)
+            .or_default()
+            .push(syntax_id);
+    }
+    let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
+    file_ids.sort_unstable();
+    let results = super::parallel::map_files_collect(db, &file_ids, |db, file_id| {
+        let mut result = DynamicFieldRefreshResult {
+            file_id,
+            collected: Vec::new(),
+            collected_wildcards: Vec::new(),
+            attributed_unattributed: Vec::new(),
+            reads: None,
+        };
+        let Some(root) = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .map(|tree| tree.get_chunk_node())
+        else {
+            return result;
+        };
+        let mut cache = crate::LuaInferCache::new(
+            file_id,
+            crate::CacheOptions {
+                analysis_phase: crate::LuaAnalysisPhase::Force,
+                dynamic_fields_visible: true,
+                building_dynamic_field_index: true,
+            },
+        );
+        let mut local_reassignment_positions = None;
+        for syntax_id in &candidates_by_file[&file_id] {
+            let Some(index_expr) = syntax_id
+                .to_node_from_root(root.syntax())
+                .and_then(glua_parser::LuaIndexExpr::cast)
             else {
                 continue;
             };
-            let cache = crate::LuaInferCache::new(
-                file_id,
-                crate::CacheOptions {
-                    analysis_phase: crate::LuaAnalysisPhase::Force,
-                    dynamic_fields_visible: true,
-                    building_dynamic_field_index: true,
-                },
-            );
-            current_file = Some((file_id, chunk, cache, None));
-        }
-        let Some((_, root, cache, local_reassignment_positions)) = current_file.as_mut() else {
-            continue;
-        };
-        let Some(index_expr) = syntax_id
-            .to_node_from_root(root.syntax())
-            .and_then(glua_parser::LuaIndexExpr::cast)
-        else {
-            continue;
-        };
-        let Some(prefix_expr) = index_expr.get_prefix_expr() else {
-            continue;
-        };
-        let Some(definition_range) = index_expr.get_index_key().and_then(|k| k.get_range()) else {
-            continue;
-        };
-        crate::db_index::read_set::arm();
-        let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) else {
-            file_reads
-                .entry(file_id)
-                .or_default()
-                .extend(crate::db_index::read_set::disarm());
-            continue;
-        };
-        let effective_type =
-            infer_setmetatable_target_type(db, cache, &prefix_expr, index_expr.get_range())
-                .unwrap_or(prefix_type);
+            let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+                continue;
+            };
+            let Some(definition_range) = index_expr.get_index_key().and_then(|k| k.get_range())
+            else {
+                continue;
+            };
+            crate::db_index::read_set::arm_with_member_maps();
+            let Ok(prefix_type) = infer_expr(db, &mut cache, prefix_expr.clone()) else {
+                let reads = crate::db_index::read_set::disarm();
+                result.reads.get_or_insert_default().extend(reads);
+                continue;
+            };
+            let effective_type = infer_setmetatable_target_type(
+                db,
+                &mut cache,
+                &prefix_expr,
+                index_expr.get_range(),
+            )
+            .unwrap_or(prefix_type);
 
-        let field_names =
-            get_field_names(db, cache, root, local_reassignment_positions, &index_expr);
-        file_reads
-            .entry(file_id)
-            .or_default()
-            .extend(crate::db_index::read_set::disarm());
-        if is_dynamic_index_key(&index_expr) && field_names.may_have_other_string_names {
-            collect_wildcard_for_type(
-                &effective_type,
-                file_id,
-                definition_range,
-                &mut collected_wildcards,
+            let field_names = get_field_names(
+                db,
+                &mut cache,
+                &root,
+                &mut local_reassignment_positions,
+                &index_expr,
             );
-        }
-        for field_name in field_names.names {
-            let before = collected.len();
-            collect_for_type(
-                &effective_type,
-                &field_name,
-                file_id,
-                definition_range,
-                &mut collected,
-            );
-            if collected.len() > before {
-                attributed_unattributed.push((field_name, file_id));
+            let reads = crate::db_index::read_set::disarm();
+            result.reads.get_or_insert_default().extend(reads);
+            if is_dynamic_index_key(&index_expr) && field_names.may_have_other_string_names {
+                collect_wildcard_for_type(
+                    &effective_type,
+                    file_id,
+                    definition_range,
+                    &mut result.collected_wildcards,
+                );
+            }
+            for field_name in field_names.names {
+                let before = result.collected.len();
+                collect_for_type(
+                    &effective_type,
+                    &field_name,
+                    file_id,
+                    definition_range,
+                    &mut result.collected,
+                );
+                if result.collected.len() > before {
+                    result.attributed_unattributed.push((field_name, file_id));
+                }
             }
         }
-    }
+        result
+    });
 
-    for (file_id, reads) in file_reads {
-        context.record_settled_tail_filter_reads(file_id, reads);
+    let mut collected = Vec::new();
+    let mut collected_wildcards = Vec::new();
+    let mut attributed_unattributed = Vec::new();
+    for result in results {
+        if let Some(reads) = result.reads {
+            context.record_settled_pass_reads(
+                read_pass,
+                result.file_id,
+                candidate_count,
+                read_version,
+                reads,
+            );
+        }
+        collected.extend(result.collected);
+        collected_wildcards.extend(result.collected_wildcards);
+        attributed_unattributed.extend(result.attributed_unattributed);
     }
 
     for (owner, _, _, _) in &mut collected {

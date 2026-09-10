@@ -229,6 +229,23 @@ impl LuaMemberIndex {
     /// The current homing generation. Per-`(owner, key)` memos record this
     /// alongside what they walked; a mismatch proves an owner, key, or
     /// canonical mapping moved under them, so only a full rebuild answers.
+    pub(crate) fn get_members_count(&self) -> usize {
+        self.members.len()
+    }
+
+    pub(crate) fn read_version(&self, owner: &LuaMemberOwner) -> (u64, u64, usize) {
+        let owner = self.canonical(owner);
+        (
+            self.homing_revision,
+            self.owner_members
+                .get(owner)
+                .map_or(0, LuaOwnerMembers::revision),
+            self.current_owner_member_history
+                .get(owner)
+                .map_or(0, |members| members.len()),
+        )
+    }
+
     pub fn homing_revision(&self) -> u64 {
         self.homing_revision
     }
@@ -1201,6 +1218,7 @@ impl LuaMemberIndex {
     }
 
     pub fn get_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
+        crate::db_index::read_set::record_member_map(self, owner);
         let owner = self.canonical(owner);
         let owner_members = self.owner_members.get(owner)?;
         if owner_members.get_member_len() == 0 {
@@ -1228,19 +1246,12 @@ impl LuaMemberIndex {
     /// The owner's members whose key is an expression rather than a name, in
     /// the same order [`Self::get_members`] would yield them.
     pub fn get_expr_key_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
+        crate::db_index::read_set::record_member_map(self, owner);
         let owner = self.canonical(owner);
         let owner_members = self.owner_members.get(owner)?;
-        let mut member_ids = Vec::new();
-        for key in owner_members.expr_keys() {
-            match owner_members.get_member(key) {
-                Some(LuaMemberIndexItem::One(id)) => member_ids.push(*id),
-                Some(LuaMemberIndexItem::Many(ids)) => member_ids.extend(ids.iter().copied()),
-                None => {}
-            }
-        }
-        member_ids.sort_by_key(|member_id| member_id_sort_key(*member_id));
         Some(
-            member_ids
+            owner_members
+                .sorted_expr_key_member_ids()
                 .iter()
                 .filter_map(|member_id| self.get_member(member_id))
                 .collect(),
@@ -1257,6 +1268,7 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         key: &LuaMemberKey,
     ) -> Option<Vec<&LuaMember>> {
+        crate::db_index::read_set::record_member_map(self, owner);
         let owner = self.canonical(owner);
         let owner_members = self.owner_members.get(owner)?;
         let mut member_ids = match owner_members.get_member(key) {
@@ -1277,6 +1289,7 @@ impl LuaMemberIndex {
         &'a self,
         owner: &LuaMemberOwner,
     ) -> impl Iterator<Item = &'a LuaMemberKey> + 'a {
+        crate::db_index::read_set::record_member_map(self, owner);
         self.owner_members
             .get(self.canonical(owner))
             .into_iter()
@@ -1295,6 +1308,7 @@ impl LuaMemberIndex {
     }
 
     pub fn get_sorted_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
+        crate::db_index::read_set::record_member_map(self, owner);
         self.get_members(owner)
     }
 
@@ -1303,6 +1317,7 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         key: &LuaMemberKey,
     ) -> Option<&LuaMemberIndexItem> {
+        crate::db_index::read_set::record_member_map(self, owner);
         let owner = self.canonical(owner);
         self.owner_members
             .get(owner)
@@ -1310,6 +1325,7 @@ impl LuaMemberIndex {
     }
 
     pub fn get_member_len(&self, owner: &LuaMemberOwner) -> usize {
+        crate::db_index::read_set::record_member_map(self, owner);
         let owner = self.canonical(owner);
         self.owner_members
             .get(owner)
@@ -1323,6 +1339,7 @@ impl LuaMemberIndex {
     /// key can outlive the member it points at. Stops at the first live id
     /// rather than materialising the owner's whole member list.
     pub fn has_live_member(&self, owner: &LuaMemberOwner) -> bool {
+        crate::db_index::read_set::record_member_map(self, owner);
         let owner = self.canonical(owner);
         let Some(owner_members) = self.owner_members.get(owner) else {
             return false;
@@ -1346,6 +1363,7 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         key: &LuaMemberKey,
     ) -> usize {
+        crate::db_index::read_set::record_member_map(self, owner);
         let owner = self.canonical(owner);
         self.member_owner_key_index
             .get(owner)
@@ -1360,6 +1378,7 @@ impl LuaMemberIndex {
         key: &LuaMemberKey,
         excluded_member_id: LuaMemberId,
     ) -> bool {
+        crate::db_index::read_set::record_member_map(self, owner);
         let owner = self.canonical(owner);
         let Some(member_ids) = self
             .member_owner_key_index
@@ -1381,6 +1400,7 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         key: &LuaMemberKey,
     ) -> Vec<&LuaMember> {
+        crate::db_index::read_set::record_member_map(self, owner);
         let owner = self.canonical(owner);
         let Some(owner_items) = self.member_owner_key_index.get(owner) else {
             return Vec::new();
@@ -1404,6 +1424,7 @@ impl LuaMemberIndex {
     /// Every member ever keyed under `owner`, including ones hidden by the
     /// latest-assignment view and ones since re-homed to a concrete owner.
     pub fn get_member_history(&self, owner: &LuaMemberOwner) -> Vec<&LuaMember> {
+        crate::db_index::read_set::record_member_map(self, owner);
         let owner = self.canonical(owner);
         let Some(owner_items) = self.member_owner_key_history_index.get(owner) else {
             return Vec::new();
@@ -1425,6 +1446,7 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         global_id: &GlobalId,
     ) -> Vec<LuaMemberId> {
+        crate::db_index::read_set::record_member_map(self, owner);
         let owner = self.canonical(owner);
         // The member key is the part of the path below the owner, so the members
         // declaring it are one bucket of the owner's history rather than all of
@@ -1644,6 +1666,7 @@ impl LuaMemberIndex {
         key: &LuaMemberKey,
         skip: usize,
     ) -> Vec<LuaMemberId> {
+        crate::db_index::read_set::record_member_map(self, owner);
         let owner = self.canonical(owner);
         let Some(member_ids) = self
             .member_owner_key_history_index
@@ -1691,6 +1714,7 @@ impl LuaMemberIndex {
     /// owner region wholesale. Ordinary semantic lookup should continue using
     /// `get_members`, which applies runtime overwrite visibility.
     pub fn get_current_owner_member_history(&self, owner: &LuaMemberOwner) -> Vec<&LuaMember> {
+        crate::db_index::read_set::record_member_map(self, owner);
         let owner = self.canonical(owner);
         let Some(member_ids) = self.current_owner_member_history.get(owner) else {
             return Vec::new();
@@ -1756,13 +1780,12 @@ impl LuaMemberIndex {
             return Vec::new();
         };
 
-        member_or_owners
-            .iter()
-            .filter_map(|entry| match entry {
-                MemberOrOwner::Member(member_id) => self.get_member(member_id),
-                MemberOrOwner::Owner(_) => None,
-            })
-            .collect()
+        let mut members = Vec::with_capacity(member_or_owners.len());
+        members.extend(member_or_owners.iter().filter_map(|entry| match entry {
+            MemberOrOwner::Member(member_id) => self.get_member(member_id),
+            MemberOrOwner::Owner(_) => None,
+        }));
+        members
     }
 }
 
