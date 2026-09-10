@@ -2116,8 +2116,7 @@ fn memoized_debug_detail(ty: &LuaType) -> u64 {
     })
 }
 
-/// The address of the allocation a complex type points at, or `None` for the
-/// variants that hold their payload inline.
+/// The payload address retained by cloning the type, or `None` otherwise.
 fn payload_address(ty: &LuaType) -> Option<usize> {
     fn addr<T>(ptr: *const T) -> usize {
         ptr as usize
@@ -2143,7 +2142,7 @@ fn payload_address(ty: &LuaType) -> Option<usize> {
         LuaType::DocAttribute(a) => addr(Arc::as_ptr(a)),
         LuaType::Conditional(a) => addr(Arc::as_ptr(a)),
         LuaType::Mapped(a) => addr(Arc::as_ptr(a)),
-        LuaType::TableOf(a) => addr(a.as_ref() as *const LuaType),
+        LuaType::TableOf(_) => return None,
         _ => return None,
     })
 }
@@ -2314,5 +2313,23 @@ mod tests {
             lua_type_sort_key(&LuaType::TplRef(shared.clone())).1,
             lua_type_sort_key(&LuaType::ConstTplRef(shared)).1
         );
+    }
+
+    #[test]
+    fn tableof_sort_keys_do_not_memoise_box_addresses() {
+        let original = LuaType::TableOf(Box::new(LuaType::Number));
+        let cloned = original.clone();
+        let (LuaType::TableOf(left), LuaType::TableOf(right)) = (&original, &cloned) else {
+            unreachable!();
+        };
+        assert!(!std::ptr::eq(left.as_ref(), right.as_ref()));
+        assert_eq!(payload_address(&original), None);
+        for inner in [LuaType::Number, LuaType::String, LuaType::Boolean] {
+            let typ = LuaType::TableOf(Box::new(inner));
+            assert_eq!(
+                lua_type_sort_key(&typ).1,
+                hash_str_content(&format!("{typ:?}"))
+            );
+        }
     }
 }
