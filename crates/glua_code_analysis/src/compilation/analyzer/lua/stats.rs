@@ -217,7 +217,7 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         unresolve.into(),
                         InferFailReason::UnResolveExpr(InFiled::new(
                             analyzer.file_id,
-                            expr.clone(),
+                            expr.get_syntax_id(),
                         )),
                     );
                     continue;
@@ -2976,7 +2976,10 @@ fn merge_type_owner_and_unresolve_expr(
 
             analyzer.context.add_unresolve(
                 unresolve_decl.into(),
-                InferFailReason::UnResolveExpr(InFiled::new(analyzer.file_id, expr.clone())),
+                InferFailReason::UnResolveExpr(InFiled::new(
+                    analyzer.file_id,
+                    expr.get_syntax_id(),
+                )),
             );
         }
         LuaTypeOwner::Member(member_id) => {
@@ -2989,7 +2992,10 @@ fn merge_type_owner_and_unresolve_expr(
             };
             analyzer.context.add_unresolve(
                 unresolve_member.into(),
-                InferFailReason::UnResolveExpr(InFiled::new(analyzer.file_id, expr.clone())),
+                InferFailReason::UnResolveExpr(InFiled::new(
+                    analyzer.file_id,
+                    expr.get_syntax_id(),
+                )),
             );
         }
         _ => {}

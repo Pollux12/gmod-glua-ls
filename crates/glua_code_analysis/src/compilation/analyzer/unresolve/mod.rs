@@ -1333,8 +1333,8 @@ fn infer_fail_reason_stable_cmp(a: &InferFailReason, b: &InferFailReason) -> Ord
         }),
         (InferFailReason::UnResolveExpr(a_expr), InferFailReason::UnResolveExpr(b_expr)) => {
             a_expr.file_id.id.cmp(&b_expr.file_id.id).then_with(|| {
-                u32::from(a_expr.value.syntax().text_range().start())
-                    .cmp(&u32::from(b_expr.value.syntax().text_range().start()))
+                u32::from(a_expr.value.get_range().start())
+                    .cmp(&u32::from(b_expr.value.get_range().start()))
             })
         }
         (

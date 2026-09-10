@@ -36,7 +36,7 @@ const MIN_PARALLEL_FILES: usize = 8;
 ///
 /// The pool's size is [`init_pool`]'s business; this only decides whether to
 /// reach for it at all.
-fn runs_inline(file_count: usize) -> bool {
+pub(crate) fn runs_inline(file_count: usize) -> bool {
     if file_count < MIN_PARALLEL_FILES {
         return true;
     }
@@ -121,7 +121,7 @@ where
 /// Indices into `file_ids`, ordered largest source first so the long poles are
 /// started before the short ones. Ties break on the index, keeping the order a
 /// pure function of the input.
-fn dispatch_order(db: &DbIndex, file_ids: &[FileId]) -> Vec<usize> {
+pub(crate) fn dispatch_order(db: &DbIndex, file_ids: &[FileId]) -> Vec<usize> {
     let vfs = db.get_vfs();
     let mut order: Vec<usize> = (0..file_ids.len()).collect();
     order.sort_unstable_by_key(|&idx| {
