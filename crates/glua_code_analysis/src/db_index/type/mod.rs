@@ -1,5 +1,7 @@
 mod generic_param;
 mod humanize_type;
+#[cfg(test)]
+mod identity_tests;
 mod inference_fact;
 pub(crate) mod read_set;
 mod test;
@@ -286,6 +288,29 @@ fn remap_child_types<'a>(
     }
 }
 
+fn remap_generic_params(
+    params: &[GenericParam],
+    remap: &crate::FileRemap,
+) -> crate::Remap<Vec<GenericParam>> {
+    let mut rebuilt = None;
+    for (index, param) in params.iter().enumerate() {
+        let Some(constraint) = &param.type_constraint else {
+            continue;
+        };
+        let result = remap_identities_in_type(constraint, remap);
+        if result.lost {
+            return crate::Remap::Lost;
+        }
+        if let Some(typ) = result.typ {
+            rebuilt.get_or_insert_with(|| params.to_vec())[index].type_constraint = Some(typ);
+        }
+    }
+    match rebuilt {
+        Some(params) => crate::Remap::Moved(params),
+        None => crate::Remap::Unrelated,
+    }
+}
+
 /// Rewrites every position-carrying identity inside a stored type.
 ///
 /// Identities are resolved directly through `remap` (`signature_id`,
@@ -380,15 +405,27 @@ pub fn remap_identities_in_type(typ: &LuaType, remap: &crate::FileRemap) -> Type
             let mut lost = false;
             let mut new_fields = std::collections::BTreeMap::new();
             for (k, v) in obj.get_fields() {
+                let new_key = if let crate::LuaMemberKey::ExprType(typ) = k {
+                    let result = remap_identities_in_type(typ, remap);
+                    lost |= result.lost;
+                    if let Some(typ) = result.typ {
+                        changed = true;
+                        crate::LuaMemberKey::ExprType(typ)
+                    } else {
+                        k.clone()
+                    }
+                } else {
+                    k.clone()
+                };
                 let remapped = remap_identities_in_type(v, remap);
                 if remapped.lost {
                     lost = true;
                 }
                 if let Some(nv) = remapped.typ {
                     changed = true;
-                    new_fields.insert(k.clone(), nv);
+                    new_fields.insert(new_key, nv);
                 } else {
-                    new_fields.insert(k.clone(), v.clone());
+                    new_fields.insert(new_key, v.clone());
                 }
             }
             let mut new_index_access = Vec::with_capacity(obj.get_index_access().len());
@@ -505,6 +542,10 @@ pub fn remap_identities_in_type(typ: &LuaType, remap: &crate::FileRemap) -> Type
             })
         }
         LuaType::Conditional(cond) => {
+            let remapped_params = remap_generic_params(cond.get_infer_params(), remap);
+            if matches!(remapped_params, crate::Remap::Lost) {
+                return TypeRemapResult::lost();
+            }
             let mut lost = false;
             let remapped_cond = remap_identities_in_type(cond.get_condition(), remap);
             let remapped_true = remap_identities_in_type(cond.get_true_type(), remap);
@@ -523,7 +564,8 @@ pub fn remap_identities_in_type(typ: &LuaType, remap: &crate::FileRemap) -> Type
                 .unwrap_or_else(|| cond.get_false_type().clone());
             let changed = &new_cond != cond.get_condition()
                 || &new_true != cond.get_true_type()
-                || &new_false != cond.get_false_type();
+                || &new_false != cond.get_false_type()
+                || matches!(remapped_params, crate::Remap::Moved(_));
             if lost {
                 TypeRemapResult::lost()
             } else if changed {
@@ -532,7 +574,10 @@ pub fn remap_identities_in_type(typ: &LuaType, remap: &crate::FileRemap) -> Type
                         new_cond,
                         new_true,
                         new_false,
-                        cond.get_infer_params().to_vec(),
+                        match remapped_params {
+                            crate::Remap::Moved(params) => params,
+                            _ => cond.get_infer_params().to_vec(),
+                        },
                         cond.has_new,
                     ),
                 )))
@@ -540,17 +585,80 @@ pub fn remap_identities_in_type(typ: &LuaType, remap: &crate::FileRemap) -> Type
                 TypeRemapResult::unchanged()
             }
         }
-        LuaType::Mapped(mapped) => TypeRemapResult::from_single(
-            remap_identities_in_type(&mapped.value, remap),
-            |new_value| {
-                LuaType::Mapped(Arc::new(crate::LuaMappedType::new(
-                    mapped.param.clone(),
-                    new_value,
+        LuaType::Mapped(mapped) => {
+            let params = remap_generic_params(std::slice::from_ref(&mapped.param.1), remap);
+            let value = remap_identities_in_type(&mapped.value, remap);
+            if matches!(params, crate::Remap::Lost) || value.lost {
+                TypeRemapResult::lost()
+            } else if matches!(params, crate::Remap::Moved(_)) || value.typ.is_some() {
+                let param = match params {
+                    crate::Remap::Moved(mut params) => (mapped.param.0, params.remove(0)),
+                    _ => mapped.param.clone(),
+                };
+                TypeRemapResult::moved(LuaType::Mapped(Arc::new(crate::LuaMappedType::new(
+                    param,
+                    value.typ.unwrap_or_else(|| mapped.value.clone()),
                     mapped.is_readonly,
                     mapped.is_optional,
+                ))))
+            } else {
+                TypeRemapResult::unchanged()
+            }
+        }
+        LuaType::TplRef(tpl) | LuaType::ConstTplRef(tpl) => {
+            let Some(constraint) = tpl.get_constraint() else {
+                return TypeRemapResult::unchanged();
+            };
+            TypeRemapResult::from_single(
+                remap_identities_in_type(constraint, remap),
+                |constraint| {
+                    let tpl = Arc::new(GenericTpl::new(
+                        tpl.get_tpl_id(),
+                        smol_str::SmolStr::new(tpl.get_name()).into(),
+                        Some(constraint),
+                    ));
+                    if matches!(typ, LuaType::ConstTplRef(_)) {
+                        LuaType::ConstTplRef(tpl)
+                    } else {
+                        LuaType::TplRef(tpl)
+                    }
+                },
+            )
+        }
+        LuaType::StrTplRef(tpl) => {
+            let Some(constraint) = tpl.get_constraint() else {
+                return TypeRemapResult::unchanged();
+            };
+            TypeRemapResult::from_single(remap_identities_in_type(constraint, remap), |typ| {
+                LuaType::StrTplRef(Arc::new(LuaStringTplType::new(
+                    tpl.get_prefix(),
+                    tpl.get_name(),
+                    tpl.get_tpl_id(),
+                    tpl.get_suffix(),
+                    Some(typ),
                 )))
-            },
-        ),
+            })
+        }
+        LuaType::DocAttribute(attribute) => {
+            let mut params = None;
+            for (index, (_, typ)) in attribute.get_params().iter().enumerate() {
+                let Some(typ) = typ else { continue };
+                let result = remap_identities_in_type(typ, remap);
+                if result.lost {
+                    return TypeRemapResult::lost();
+                }
+                if let Some(typ) = result.typ {
+                    params.get_or_insert_with(|| attribute.get_params().to_vec())[index].1 =
+                        Some(typ);
+                }
+            }
+            match params {
+                Some(params) => TypeRemapResult::moved(LuaType::DocAttribute(Arc::new(
+                    LuaAttributeType::new(params),
+                ))),
+                None => TypeRemapResult::unchanged(),
+            }
+        }
         LuaType::TableOf(inner) => {
             TypeRemapResult::from_single(remap_identities_in_type(inner, remap), |new_inner| {
                 LuaType::TableOf(Box::new(new_inner))
@@ -594,13 +702,9 @@ pub fn remap_identities_in_type(typ: &LuaType, remap: &crate::FileRemap) -> Type
         | LuaType::DocBooleanConst(_)
         | LuaType::Ref(_)
         | LuaType::Def(_)
-        | LuaType::TplRef(_)
-        | LuaType::ConstTplRef(_)
-        | LuaType::StrTplRef(_)
         | LuaType::Namespace(_)
         | LuaType::Language(_)
         | LuaType::ModuleRef(_)
-        | LuaType::DocAttribute(_)
         | LuaType::ConditionalInfer(_) => TypeRemapResult::unchanged(),
     }
 }
@@ -1098,7 +1202,7 @@ fn super_entry_sort_key(entry: &InFiled<LuaSuperType>) -> (FileId, TextSize, Tex
 
 fn collect_type_cache_refs(typ: &LuaType) -> HashSet<TypeCacheRef> {
     let mut refs = HashSet::default();
-    typ.visit_type(&mut |inner| {
+    typ.visit_type_identities(&mut |inner| {
         match inner {
             LuaType::TableConst(range) => {
                 refs.insert(TypeCacheRef::Table(range.clone()));
@@ -2243,7 +2347,7 @@ impl LuaTypeIndex {
         owner_file_id: FileId,
     ) -> bool {
         let mut references_file = false;
-        typ.visit_type(&mut |inner| {
+        typ.visit_type_identities(&mut |inner| {
             if references_file {
                 return;
             }

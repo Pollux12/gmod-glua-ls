@@ -127,6 +127,64 @@ fn write(ws: &mut VirtualWorkspace, uri: &Uri, text: &str) -> FileId {
         .expect("file id")
 }
 
+#[test]
+fn a_setmetatable_instance_keeps_inherited_members_after_edit_and_reopen() {
+    fn inherited_member(
+        ws: &VirtualWorkspace,
+        consumer: FileId,
+    ) -> std::result::Result<LuaType, crate::InferFailReason> {
+        let expr = ws.get_node::<glua_parser::LuaIndexExpr>(consumer);
+        ws.analysis
+            .compilation
+            .get_semantic_model(consumer)
+            .unwrap()
+            .infer_expr(glua_parser::LuaExpr::IndexExpr(expr))
+    }
+
+    let first = "Provider = { inherited = 42 }\nProviderMeta = { __index = Provider }\n";
+    let second = format!("local padding = true\n{first}");
+    let consumer =
+        "local instance = setmetatable({ own = true }, ProviderMeta)\nreturn instance.inherited\n";
+    let mut ws = workspace();
+    let provider_uri = ws
+        .virtual_url_generator
+        .new_uri("lua/autorun/sh_provider.lua");
+    let provider_id = write(&mut ws, &provider_uri, first);
+    let consumer_uri = ws
+        .virtual_url_generator
+        .new_uri("lua/autorun/sh_consumer.lua");
+    let consumer_id = write(&mut ws, &consumer_uri, consumer);
+    let before = inherited_member(&ws, consumer_id).unwrap();
+    let db = ws.analysis.compilation.get_db();
+    assert!(db.get_type_index().file_type_owners(consumer_id).unwrap().iter().any(|owner| {
+        matches!(db.get_type_index().get_type_cache(owner).map(|cache| cache.as_type()),
+            Some(LuaType::Instance(instance)) if matches!(instance.get_base(), LuaType::TableConst(range) if range.file_id == provider_id))
+    }));
+
+    assert!(
+        !edit_and_remap(&mut ws, &provider_uri, provider_id, first, &second).contains(&consumer_id)
+    );
+    let after = inherited_member(&ws, consumer_id).unwrap();
+    let mut cold = workspace();
+    let cold_provider = cold
+        .virtual_url_generator
+        .new_uri("lua/autorun/sh_provider.lua");
+    write(&mut cold, &cold_provider, &second);
+    let cold_consumer = cold
+        .virtual_url_generator
+        .new_uri("lua/autorun/sh_consumer.lua");
+    let cold_consumer_id = write(&mut cold, &cold_consumer, consumer);
+    assert_eq!(after, inherited_member(&cold, cold_consumer_id).unwrap());
+    assert_eq!(after, before);
+
+    edit_and_remap(&mut ws, &provider_uri, provider_id, &second, first);
+    assert_eq!(inherited_member(&ws, consumer_id).unwrap(), before);
+    write(&mut ws, &provider_uri, first);
+    assert_eq!(inherited_member(&ws, consumer_id).unwrap(), before);
+    ws.analysis.update_file_by_uri(&provider_uri, None);
+    assert!(inherited_member(&ws, consumer_id).is_err());
+}
+
 /// The diff an edit to one file produces, with the old map expressed in the
 /// new text's coordinates - which is what makes the two comparable.
 fn diff_after_edit(first: &str, second: &str) -> super::ChangedExports {
