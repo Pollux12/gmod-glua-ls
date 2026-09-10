@@ -52,14 +52,20 @@ pub const FIXPOINT_ROUND_FUSE: usize = 10_000;
 pub const FIXPOINT_CYCLE_CONFIRMATIONS: usize = 3;
 
 /// Counts rounds of one fixpoint loop; see module docs.
-pub struct FixpointFuse {
+pub struct FixpointFuse<T = String> {
     name: &'static str,
     rounds: usize,
-    boundary_sightings: HashMap<u64, Vec<(String, usize)>>,
+    boundary_sightings: HashMap<u64, Vec<(T, usize)>>,
 }
 
 impl FixpointFuse {
     pub fn new(name: &'static str) -> Self {
+        Self::with_state(name)
+    }
+}
+
+impl<T> FixpointFuse<T> {
+    pub fn with_state(name: &'static str) -> Self {
         FixpointFuse {
             name,
             rounds: 0,
@@ -112,12 +118,16 @@ impl FixpointFuse {
     /// sightings and never used to order, index, or otherwise decide answers,
     /// so a collision can only delay cycle confirmation (the round-count hang
     /// guard still bounds the loop), never change an analysis result.
-    pub fn observe_boundary(
+    pub fn observe_boundary<Q>(
         &mut self,
         fingerprint: u64,
         empty: bool,
-        canonical_state: &str,
-    ) -> bool {
+        canonical_state: &Q,
+    ) -> bool
+    where
+        Q: Eq + ToOwned<Owned = T> + ?Sized,
+        T: std::borrow::Borrow<Q>,
+    {
         if empty {
             return false;
         }
@@ -143,13 +153,17 @@ impl FixpointFuse {
     /// Pure counting with no side effects, so tests can drive the real cycle
     /// logic: confirming through [`FixpointFuse::observe_boundary`] trips its
     /// `debug_assert` in test builds by design.
-    fn record_sighting(&mut self, fingerprint: u64, canonical_state: &str) -> bool {
+    fn record_sighting<Q>(&mut self, fingerprint: u64, canonical_state: &Q) -> bool
+    where
+        Q: Eq + ToOwned<Owned = T> + ?Sized,
+        T: std::borrow::Borrow<Q>,
+    {
         let bucket = self.boundary_sightings.entry(fingerprint).or_default();
         // An index, not a live `&mut`: the `None` arm pushes into the same
         // bucket the search just borrowed.
         if let Some(idx) = bucket
             .iter()
-            .position(|(state, _)| state == canonical_state)
+            .position(|(state, _)| state.borrow() == canonical_state)
         {
             bucket[idx].1 += 1;
             bucket[idx].1 >= FIXPOINT_CYCLE_CONFIRMATIONS
@@ -174,6 +188,18 @@ impl FixpointFuse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_states_require_exact_equality_despite_hash_collisions() {
+        let mut fuse = FixpointFuse::<Vec<(u32, Option<u32>)>>::with_state("test");
+        let first = vec![(1, Some(2)), (3, None)];
+        let second = vec![(1, Some(2)), (3, Some(4))];
+        assert!(!fuse.record_sighting(7, &first));
+        assert!(!fuse.record_sighting(7, &second));
+        assert!(!fuse.record_sighting(7, &first));
+        assert!(!fuse.record_sighting(7, &second));
+        assert!(fuse.record_sighting(7, &first));
+    }
 
     #[test]
     fn repeated_exact_state_confirms_a_cycle() {

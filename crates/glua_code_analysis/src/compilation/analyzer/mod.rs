@@ -316,7 +316,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             // performance budgets): `observe_boundary` confirms oscillation
             // from the exact post-round state, and `trip` bounds total rounds
             // as a pure hang guard.
-            let mut fuse = common::FixpointFuse::new("settled_tail_fixpoint");
+            let mut fuse = common::FixpointFuse::with_state("settled_tail_fixpoint");
             loop {
                 let _round = Profile::new("settled_tail_round");
                 if fuse.trip() {
@@ -395,13 +395,13 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                     // delta that recurs while another part of the boundary
                     // advances presents a different complete state every
                     // round and must not break the loop. The fingerprint is
-                    // only a lookup accelerator; the fuse confirms byte-exact
+                    // only a lookup accelerator; the fuse confirms exact
                     // canonical-state equality on a repeat sighting.
                     let canonical = canonical_settled_tail_state(db, &context);
                     if fuse.observe_boundary(
                         fingerprint_settled_tail_state(&canonical),
                         false,
-                        &format!("{:?}", canonical),
+                        canonical.as_slice(),
                     ) {
                         break;
                     }
@@ -1280,35 +1280,25 @@ fn diff_settled_tail_boundary(
 fn canonical_settled_tail_state(
     db: &DbIndex,
     context: &AnalyzeContext,
-) -> Vec<(u8, u32, u32, Option<String>)> {
+) -> Vec<(LuaTypeOwner, Option<LuaType>)> {
     let mut entries = settled_tail_movable_owners(context)
         .into_iter()
         .map(|owner| {
-            let kind = match owner {
-                LuaTypeOwner::Decl(_) => 0u8,
-                LuaTypeOwner::Member(_) => 1u8,
-                LuaTypeOwner::SyntaxId(_) => 2u8,
-            };
             let cached = db
                 .get_type_index()
                 .get_type_cache(&owner)
-                .map(|cache| format!("{:?}", cache.as_type()));
-            (
-                kind,
-                owner.get_file_id().id,
-                u32::from(owner.get_position()),
-                cached,
-            )
+                .map(|cache| cache.as_type().clone());
+            (owner, cached)
         })
         .collect::<Vec<_>>();
-    entries.sort();
+    entries.sort_unstable_by(|(left, _), (right, _)| left.stable_cmp(right));
     entries
 }
 
 /// Equality-only fingerprint of [`canonical_settled_tail_state`] for
 /// [`FixpointFuse::observe_boundary`]: compared for equality only, never used
 /// to order, index, or otherwise decide answers (see the fuse docs).
-fn fingerprint_settled_tail_state(canonical: &[(u8, u32, u32, Option<String>)]) -> u64 {
+fn fingerprint_settled_tail_state(canonical: &[(LuaTypeOwner, Option<LuaType>)]) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
