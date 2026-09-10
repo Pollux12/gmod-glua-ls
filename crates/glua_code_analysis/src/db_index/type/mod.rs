@@ -886,7 +886,6 @@ pub(crate) fn prune_redundant_guarded_table_bootstrap_type(db: &DbIndex, typ: Lu
     }
 
     merge_table_assignment_types(
-        db,
         types
             .into_iter()
             .filter(|typ| !is_guarded_table_bootstrap_branch(db, typ))
@@ -921,7 +920,7 @@ fn collapse_guarded_table_bootstrap_branches(db: &DbIndex, types: Vec<LuaType>) 
         retained.push(LuaType::Table);
     }
 
-    merge_table_assignment_types(db, retained)
+    merge_table_assignment_types(retained)
 }
 
 /// Folds several writers' table types into one answer.
@@ -930,7 +929,7 @@ fn collapse_guarded_table_bootstrap_branches(db: &DbIndex, types: Vec<LuaType>) 
 /// table literal holds one table at runtime, and every field any writer spells
 /// is a field it can have. Bare `table` drops out whenever a more precise
 /// component is present, since it names no field and would only dilute them.
-pub(crate) fn merge_table_assignment_types(db: &DbIndex, types: Vec<LuaType>) -> LuaType {
+pub(crate) fn merge_table_assignment_types(types: Vec<LuaType>) -> LuaType {
     let mut table_components = Vec::new();
     let mut other_components = Vec::new();
 
@@ -947,11 +946,6 @@ pub(crate) fn merge_table_assignment_types(db: &DbIndex, types: Vec<LuaType>) ->
     });
 
     if table_components
-        .iter()
-        .any(|component| is_informative_guarded_table_branch(db, component))
-    {
-        table_components.retain(|component| is_informative_guarded_table_branch(db, component));
-    } else if table_components
         .iter()
         .any(|component| !matches!(component, LuaType::Table))
     {
@@ -1038,7 +1032,9 @@ fn is_informative_guarded_table_branch(db: &DbIndex, typ: &LuaType) -> bool {
                 false
             }
         }
-        LuaType::Object(object) => !object.get_fields().is_empty(),
+        LuaType::Object(object) => {
+            !object.get_fields().is_empty() || !object.get_index_access().is_empty()
+        }
         LuaType::MergedTable(merged) => merged
             .get_types()
             .iter()

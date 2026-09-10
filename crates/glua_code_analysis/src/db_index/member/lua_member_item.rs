@@ -606,7 +606,7 @@ fn resolve_member_type(
                     // this slot before and after it lands would then answer
                     // differently for the same source.
                     let mut typ = if all_are_table_merges && !collected_types.is_empty() {
-                        crate::merge_table_assignment_types(db, collected_types)
+                        crate::merge_table_assignment_types(collected_types)
                     } else {
                         let mut t = LuaType::Never;
                         for member_type in collected_types {
