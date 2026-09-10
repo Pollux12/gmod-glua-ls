@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -126,7 +127,6 @@ pub fn get_type_at_flow_with_origin(
         &mut visited_flow_ids,
         policy,
     );
-
     // RecursiveInfer errors are transient (cycle detection) and must NOT be
     // cached — they'd poison future non-recursive queries.
     match &result {
@@ -397,6 +397,7 @@ fn get_type_at_flow_walk(
     policy: FlowWalkPolicy,
 ) -> InferResult {
     let mut antecedent_flow_id = initial_flow_id;
+    let numeric_index_query = OnceCell::new();
     loop {
         // Check cache for intermediate flow nodes (both success and error).
         // This is critical for performance in large files where many walks
@@ -425,11 +426,8 @@ fn get_type_at_flow_walk(
                 return get_var_ref_type(db, cache, var_ref_id);
             }
             FlowNodeKind::ClosureEntry(_) => {
-                // Route through the modal entry so the top-level baseline walk
-                // holds `baseline_flow_depth` and its memo survives the nested
-                // merges below. Calling the walk directly leaves depth at zero,
-                // so each nested merge clears the memo on exit and every merge
-                // point is re-derived once per path into it.
+                // Route through the modal entry so the closure-baseline memo
+                // survives nested merge walks.
                 let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                 return get_type_at_flow_in_mode(
                     db,
@@ -558,7 +556,11 @@ fn get_type_at_flow_walk(
                         | (AssignVarHint::NameOnly, VarRefId::IndexRef(_, _))
                         | (AssignVarHint::IndexOnly, VarRefId::IndexRef(_, _))
                 ) || (matches!(assign_hint, AssignVarHint::IndexOnly)
-                    && numeric_table_index_query(db, cache, root, var_ref_id).is_some());
+                    && numeric_index_query
+                        .get_or_init(|| {
+                            numeric_table_index_query(db, cache, root, var_ref_id, cache_key)
+                        })
+                        .is_some());
 
                 if !can_match_assignment {
                     if let Some(merged_type) = try_get_multi_antecedent_type(
@@ -571,7 +573,11 @@ fn get_type_at_flow_walk(
                 }
 
                 if assignment_flow_info_cannot_match(tree, antecedent_flow_id, var_ref_id)
-                    && numeric_table_index_query(db, cache, root, var_ref_id).is_none()
+                    && numeric_index_query
+                        .get_or_init(|| {
+                            numeric_table_index_query(db, cache, root, var_ref_id, cache_key)
+                        })
+                        .is_none()
                 {
                     if let Some(merged_type) = try_get_multi_antecedent_type(
                         db, tree, cache, root, var_ref_id, flow_node, policy,
@@ -591,6 +597,8 @@ fn get_type_at_flow_walk(
                     var_ref_id,
                     flow_node,
                     assign_stat,
+                    &numeric_index_query,
+                    cache_key,
                     policy,
                 )?;
 
@@ -631,17 +639,21 @@ fn get_type_at_flow_walk(
                     }
                 }
 
+                let numeric_query = numeric_index_query.get_or_init(|| {
+                    numeric_table_index_query(db, cache, root, var_ref_id, cache_key)
+                });
                 if let Some(populated_type) = try_get_numeric_range_table_arg_population_type(
                     db,
                     cache,
                     root,
                     var_ref_id,
                     call_expr.clone(),
+                    numeric_query.as_ref(),
                 )? {
                     return Ok(populated_type);
                 }
 
-                if numeric_table_index_query(db, cache, root, var_ref_id).is_some() {
+                if numeric_query.is_some() {
                     return get_var_ref_type(db, cache, var_ref_id);
                 }
 
@@ -1650,6 +1662,8 @@ fn get_type_at_assign_stat(
     var_ref_id: &VarRefId,
     flow_node: &FlowNode,
     assign_stat: LuaAssignStat,
+    numeric_index_query: &OnceCell<Option<NumericTableIndexQuery>>,
+    cache_key: &VarRefCacheKey,
     policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let (vars, exprs) = assign_stat.get_var_and_expr_list();
@@ -1672,23 +1686,25 @@ fn get_type_at_assign_stat(
             return Ok(ResultTypeOrContinue::Result(LuaType::Nil));
         }
 
-        if let Some((query_root, _query_index)) =
-            numeric_table_index_query(db, cache, root, var_ref_id)
-            && var_ref_matches_root(&maybe_ref_id, &query_root)
+        if let Some((query_root, _query_index)) = numeric_index_query
+            .get_or_init(|| numeric_table_index_query(db, cache, root, var_ref_id, cache_key))
+            .as_ref()
+            && var_ref_matches_root(&maybe_ref_id, query_root)
         {
             return Ok(ResultTypeOrContinue::Result(get_var_ref_type(
                 db, cache, var_ref_id,
             )?));
         }
 
-        if let Some((query_root, query_index)) =
-            numeric_table_index_query(db, cache, root, var_ref_id)
+        if let Some((query_root, query_index)) = numeric_index_query
+            .get_or_init(|| numeric_table_index_query(db, cache, root, var_ref_id, cache_key))
+            .as_ref()
             && let LuaVarExpr::IndexExpr(index_expr) = &var
             && let VarRefId::IndexRef(assign_root, _) = &maybe_ref_id
-            && *assign_root == query_root
-            && index_expr_numeric_key_value(db, cache, index_expr) == Some(query_index)
+            && assign_root == query_root
+            && index_expr_numeric_key_value(db, cache, index_expr) == Some(*query_index)
         {
-            if assignment_vars_write_root(db, cache, &vars, &query_root) {
+            if assignment_vars_write_root(db, cache, &vars, query_root) {
                 return Ok(ResultTypeOrContinue::Result(get_var_ref_type(
                     db, cache, var_ref_id,
                 )?));
@@ -1871,9 +1887,9 @@ fn try_get_numeric_range_table_arg_population_type(
     root: &LuaChunk,
     var_ref_id: &VarRefId,
     call_expr: LuaCallExpr,
+    numeric_index_query: Option<&NumericTableIndexQuery>,
 ) -> Result<Option<LuaType>, InferFailReason> {
-    let Some((query_root, access_index)) = numeric_table_index_query(db, cache, root, var_ref_id)
-    else {
+    let Some((query_root, access_index)) = numeric_index_query else {
         return Ok(None);
     };
     let key_name = numeric_table_index_query_key_name(var_ref_id)
@@ -1913,7 +1929,7 @@ fn try_get_numeric_range_table_arg_population_type(
     let [LuaStat::ForStat(for_stat)] = stats.as_slice() else {
         return Ok(None);
     };
-    if !numeric_for_bounds_cover_index(db, cache, for_stat, access_index) {
+    if !numeric_for_bounds_cover_index(db, cache, for_stat, *access_index) {
         return Ok(None);
     }
 
@@ -1943,7 +1959,7 @@ fn try_get_numeric_range_table_arg_population_type(
         cache,
         root,
         rhs_expr,
-        &query_root,
+        query_root,
         key_name.as_deref(),
         &mut HashSet::default(),
     ) {
@@ -2525,19 +2541,20 @@ fn index_expr_global_root_name(index_expr: &LuaIndexExpr) -> Option<smol_str::Sm
     name_expr.get_name_text()
 }
 
+type NumericTableIndexQuery = (
+    crate::semantic::infer::narrow::var_ref_id::VarRefRootId,
+    i64,
+);
+
 fn numeric_table_index_query(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     root: &LuaChunk,
     var_ref_id: &VarRefId,
-) -> Option<(
-    crate::semantic::infer::narrow::var_ref_id::VarRefRootId,
-    i64,
-)> {
-    // Asked up to three times per assignment node on a walk, with the same
-    // answer every time within a realm: memoise it. The realm joins the key
-    // because the index-key probe goes through realm-sensitive inference.
-    let memo_key = (VarRefCacheKey::from(var_ref_id), cache.flow_query_realm);
+    cache_key: &VarRefCacheKey,
+) -> Option<NumericTableIndexQuery> {
+    // Reuse the query shape across walks in the same realm.
+    let memo_key = (cache_key.clone(), cache.flow_query_realm);
     if let Some(cached) = cache
         .numeric_table_index_query_cache
         .get(&memo_key)
