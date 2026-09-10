@@ -3310,14 +3310,6 @@ mod test {
         );
     }
 
-    /// Verifies that `find_registered_table_expr` does NOT fall back to the
-    /// original local initializer when the latest write is an unrelated
-    /// reassignment (not the registration call). This is a regression guard
-    /// for the narrowed fallback in `find_registered_table_expr`: only when
-    /// the registration call IS the reassignment RHS (e.g.
-    /// `PANEL = vgui.RegisterTable(PANEL, ...)`) should the original local
-    /// initializer be used. An unrelated `PANEL = MakePanel()` should NOT
-    /// trigger the fallback.
     #[gtest]
     fn test_vgui_register_table_unrelated_reassignment_does_not_bind_stale_initializer() {
         let mut ws = VirtualWorkspace::new();
@@ -3379,11 +3371,11 @@ mod test {
             "self-assignment RegisterTable should bind the table literal; got nil diagnostics: {valid_diagnostics:?}"
         );
 
-        // Case 2: Unrelated reassignment — PANEL = MakePanel(), then separate vgui.RegisterTable(PANEL, ...)
-        // The stale initializer should NOT be used, so the `Init` function's
-        // `self.Btn` access should produce diagnostics (since self resolves to
-        // Unknown instead of the synthesized panel class).
-        let _unrelated_file_id = ws.def_file(
+        assert!(matches!(
+            index_expr_prefix_type(&mut ws, valid_file_id, "self:Add"),
+            LuaType::Def(_)
+        ));
+        let unrelated_file_id = ws.def_file(
             "lua/vgui/register_table_unrelated_reassign.lua",
             r#"
             local function MakePanel() return {} end
@@ -3401,19 +3393,21 @@ mod test {
             "#,
         );
 
-        let unrelated_diagnostics = ws
-            .analysis
-            .diagnose_file(_unrelated_file_id, CancellationToken::new())
-            .unwrap_or_default();
-        // With the narrowed fallback, the stale initializer is NOT bound, so
-        // `self.Btn2` should produce `unchecked-nil-access` because `self`
-        // resolves to Unknown (no table expr found).
-        let has_nil_diag = unrelated_diagnostics
-            .iter()
-            .any(|d| nil_codes.contains(&d.code));
+        assert_eq!(
+            index_expr_prefix_type(&mut ws, unrelated_file_id, "self:Add"),
+            LuaType::Unknown,
+        );
+        assert!(matches!(
+            local_assignment_value_type(&mut ws, unrelated_file_id, "PANEL2"),
+            LuaType::TableConst(_)
+        ));
         assert!(
-            has_nil_diag,
-            "unrelated reassignment should NOT bind the stale initializer; expected nil diagnostics on self.Btn2, got: {unrelated_diagnostics:?}"
+            ws.analysis
+                .diagnose_file(unrelated_file_id, CancellationToken::new())
+                .unwrap_or_default()
+                .iter()
+                .all(|diagnostic| !nil_codes.contains(&diagnostic.code)),
+            "an unknown receiver does not prove nil"
         );
     }
 
@@ -4390,26 +4384,28 @@ mod test {
         );
     }
 
-    /// Regression for Oracle Blocker 2: `write_position_contains_register`
-    /// must check the specific RHS expression for the matching LHS variable,
-    /// not the entire assignment statement range. In a multi-assignment like
-    /// `PANEL, OTHER = MakePanel(), vgui.RegisterTable(PANEL, "DPanel")`,
-    /// the registration call is inside the statement range but PANEL's RHS is
-    /// `MakePanel()`, so the stale initializer fallback must NOT fire.
+    /// Lua evaluates all right-hand expressions before assigning any left-hand
+    /// variable. Registration therefore receives the original table while the
+    /// replacement value is assigned to `PANEL`.
     #[gtest]
-    fn test_vgui_register_table_multi_assign_does_not_bind_stale_initializer() {
-        let mut ws = VirtualWorkspace::new();
-        let mut emmyrc = Emmyrc::default();
-        emmyrc.gmod.enabled = true;
-        emmyrc.gmod.infer_dynamic_fields = false;
-        ws.update_emmyrc(emmyrc);
-        ws.def_gmod_call_arg_builtins();
-        ws.enable_check(DiagnosticCode::UncheckedNilAccess);
-        ws.enable_check(DiagnosticCode::NeedCheckNil);
+    fn test_vgui_register_table_multi_assign_registers_original_table() {
+        for assignment in [
+            "PANEL, OTHER = MakePanel(), vgui.RegisterTable(PANEL, \"DPanel\")",
+            "PANEL, OTHER = {}, vgui.RegisterTable(PANEL, \"DPanel\")",
+            "OTHER, PANEL = vgui.RegisterTable(PANEL, \"DPanel\"), MakePanel()",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            emmyrc.gmod.infer_dynamic_fields = false;
+            ws.update_emmyrc(emmyrc);
+            ws.def_gmod_call_arg_builtins();
+            ws.enable_check(DiagnosticCode::UncheckedNilAccess);
+            ws.enable_check(DiagnosticCode::NeedCheckNil);
 
-        let file_id = ws.def_file(
-            "lua/vgui/register_table_multi_assign.lua",
-            r#"
+            let file_id = ws.def_file(
+                "lua/vgui/register_table_multi_assign.lua",
+                r#"
             ---@class Panel
             ---@field Add fun(self: Panel, className: string): Panel
             ---@field Dock fun(self: Panel, dock: integer)
@@ -4435,33 +4431,58 @@ mod test {
             }
 
             local OTHER
-            -- Multi-assignment: PANEL's RHS is MakePanel(), not RegisterTable.
-            -- The RegisterTable call is on OTHER's RHS, not PANEL's.
-            -- The stale initializer fallback must NOT fire for PANEL.
-            PANEL, OTHER = MakePanel(), vgui.RegisterTable(PANEL, "DPanel")
-            "#,
-        );
+            ASSIGNMENT
+            local replacement = PANEL
+            local registered = OTHER
+            "#
+                .replace("ASSIGNMENT", assignment)
+                .as_str(),
+            );
 
-        let diagnostics = ws
-            .analysis
-            .diagnose_file(file_id, CancellationToken::new())
-            .unwrap_or_default();
-        let nil_codes = [
-            Some(NumberOrString::String(
-                DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
-            )),
-            Some(NumberOrString::String(
-                DiagnosticCode::NeedCheckNil.get_name().to_string(),
-            )),
-        ];
-        // Since PANEL's RHS is MakePanel() (not the registration call),
-        // the stale initializer fallback should NOT bind. `self.Btn` inside
-        // Init should produce nil diagnostics because self resolves to Unknown.
-        let has_nil_diag = diagnostics.iter().any(|d| nil_codes.contains(&d.code));
-        assert!(
-            has_nil_diag,
-            "multi-assignment with RegisterTable on a different LHS should NOT bind the stale initializer; expected nil diagnostics, got: {diagnostics:?}"
-        );
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default();
+            let nil_codes = [
+                Some(NumberOrString::String(
+                    DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+                )),
+                Some(NumberOrString::String(
+                    DiagnosticCode::NeedCheckNil.get_name().to_string(),
+                )),
+            ];
+            let LuaType::Def(original_class) =
+                local_assignment_value_type(&mut ws, file_id, "PANEL")
+            else {
+                panic!("original table must be registered: {assignment}");
+            };
+            for typ in [
+                index_expr_prefix_type(&mut ws, file_id, "self:Add"),
+                local_name_type(&mut ws, file_id, "registered"),
+            ] {
+                let (LuaType::Def(class) | LuaType::Ref(class)) = typ else {
+                    panic!("expected registered panel type, got {typ:?}: {assignment}");
+                };
+                assert_eq!(class, original_class, "{assignment}");
+            }
+            let replacement_type = local_name_type(&mut ws, file_id, "replacement");
+            assert!(
+                matches!(
+                    replacement_type,
+                    LuaType::TableConst(_) | LuaType::Instance(_)
+                ),
+                "replacement {replacement_type:?}: {assignment}"
+            );
+            assert_eq!(
+                replacement_type,
+                assign_value_type(&mut ws, file_id, "PANEL"),
+                "{assignment}"
+            );
+            assert!(
+                diagnostics.iter().all(|d| !nil_codes.contains(&d.code)),
+                "registered original table should retain panel methods: {diagnostics:?}"
+            );
+        }
     }
 
     /// Regression: PANEL reassignment (`PANEL = {}`) should create distinct classes

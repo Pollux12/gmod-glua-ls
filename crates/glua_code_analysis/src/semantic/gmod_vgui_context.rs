@@ -1,5 +1,7 @@
 use crate::{DbIndex, FileId, LuaDeclId, LuaSignatureId, db_index::GmodScriptedClassCallMetadata};
-use glua_parser::{LuaAstNode, LuaExpr, LuaFuncStat, LuaNameExpr, LuaVarExpr};
+use glua_parser::{
+    LuaAssignStat, LuaAstNode, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaNameExpr, LuaVarExpr,
+};
 use rowan::TextSize;
 
 use super::LuaInferCache;
@@ -123,12 +125,27 @@ fn resolve_call_table_registration_region(
     Some((decl_id, region_start, register_position))
 }
 
-fn find_latest_decl_write_before_position(
+pub(crate) fn find_latest_decl_write_before_position(
     db: &DbIndex,
     file_id: FileId,
     decl_id: LuaDeclId,
     position: TextSize,
 ) -> Option<TextSize> {
+    // All RHS expressions read the values from before the enclosing assignment.
+    let position = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .and_then(|tree| {
+            tree.get_chunk_node()
+                .syntax()
+                .token_at_offset(position)
+                .right_biased()?
+                .parent_ancestors()
+                .take_while(|node| !LuaClosureExpr::can_cast(node.kind().into()))
+                .find_map(LuaAssignStat::cast)
+                .map(|assignment| assignment.get_range().start())
+        })
+        .unwrap_or(position);
     db.get_reference_index()
         .get_decl_references(&file_id, &decl_id)
         .and_then(|references| {

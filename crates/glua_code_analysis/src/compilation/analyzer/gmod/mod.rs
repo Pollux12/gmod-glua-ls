@@ -45,6 +45,7 @@ use crate::{
     },
     infer_expr,
     profile::Profile,
+    semantic::find_latest_decl_write_before_position,
 };
 use rowan::{TextRange, TextSize};
 use rustc_hash::FxHasher;
@@ -7285,7 +7286,7 @@ fn synthesize_scripted_ent_registration(
                 return;
             };
             (
-                find_registered_table_expr(db, file_id, decl_id, register_position),
+                find_registered_table_expr_at_write_position(db, file_id, region_start),
                 region_start,
                 Some(decl_id),
             )
@@ -7509,8 +7510,6 @@ fn cached_registered_table_expr(
     cache: &mut VguiSynthesisCache,
     db: &DbIndex,
     file_id: FileId,
-    decl_id: LuaDeclId,
-    register_position: TextSize,
     write_position: TextSize,
 ) -> Option<LuaTableExpr> {
     let key = (file_id, text_size_key(write_position));
@@ -7518,8 +7517,7 @@ fn cached_registered_table_expr(
         return table_expr.clone();
     }
 
-    let table_expr = find_registered_table_expr_at_write_position(db, file_id, write_position)
-        .or_else(|| find_registered_table_expr(db, file_id, decl_id, register_position));
+    let table_expr = find_registered_table_expr_at_write_position(db, file_id, write_position);
     cache.registered_table_exprs.insert(key, table_expr.clone());
     table_expr
 }
@@ -8996,110 +8994,6 @@ fn register_global_panel(
     );
 }
 
-// REMOVED: find_table_type_for_register — it fell back to the shared decl-level
-// type cache, which is exactly the position-insensitive slot that caused
-// reassigned-PANEL collapse. Resolution now goes through the concrete table
-// expression (find_registered_table_expr) instead.
-
-/// Locate the concrete table-constructor (`{}`) expression that backs the
-/// variable being registered, by scanning to the variable's latest write
-/// before the register call and taking the matching RHS expression.
-///
-/// VGUI files commonly reuse a single `local PANEL` decl with repeated plain
-/// reassignments (`PANEL = {}`), one per registered class. The class identity
-/// belongs to each individual table value, not to the shared decl slot — so we
-/// resolve the exact `{}` literal at the latest write position and return its
-/// table range plus syntax id. Callers bind the synthesized class to that
-/// `SyntaxId`, which the public `infer_expr` override consults, giving correct
-/// per-region resolution for hover/diagnostics/CodeLens alike.
-///
-/// Returns `None` (caller skips SyntaxId binding) when the RHS is not a table
-/// literal (e.g. `PANEL = make()`, `PANEL = SomeOther`), keeping behavior
-/// conservative for non-literal table values.
-fn find_registered_table_expr(
-    db: &DbIndex,
-    file_id: FileId,
-    decl_id: LuaDeclId,
-    register_position: TextSize,
-) -> Option<LuaTableExpr> {
-    // The latest write position is the start of the assigned name range for the
-    // most recent plain reassignment (`PANEL = {}`) before the register call.
-    //
-    // The original `local PANEL = {}` declaration is NOT recorded as a write
-    // reference cell (only later assignments are), so for the FIRST region
-    // there is no prior write — fall back to the decl's own position, where the
-    // enclosing `LuaLocalStat` yields the initializer table RHS.
-    let write_position =
-        find_latest_decl_write_before_position(db, file_id, decl_id, register_position)
-            .unwrap_or(decl_id.position);
-
-    find_registered_table_expr_at_write_position(db, file_id, write_position).or_else(|| {
-        // When the latest write is a reassignment whose RHS is not a table
-        // literal (e.g. `PANEL = vgui.RegisterTable(PANEL, "DPanel")`),
-        // the table constructor still lives at the original `local PANEL =
-        // {...}` declaration.
-        //
-        // Only fall back when the registration call is the reassignment RHS
-        // itself — i.e. `register_position` is within the write statement's
-        // range. This avoids mis-modeling unrelated reassignments such as
-        // `PANEL = MakePanel()` followed by a separate `vgui.RegisterTable`
-        // call, where the stale initializer should NOT be used.
-        if write_position == decl_id.position {
-            return None;
-        }
-        if !write_position_contains_register(db, file_id, write_position, register_position) {
-            return None;
-        }
-        let table_write_position =
-            find_latest_decl_write_before_position(db, file_id, decl_id, write_position)
-                .unwrap_or(decl_id.position);
-        find_registered_table_expr_at_write_position(db, file_id, table_write_position)
-    })
-}
-
-/// Checks whether `register_position` falls within the RHS expression
-/// corresponding to the LHS at `write_position`. This identifies the
-/// self-assignment registration pattern `PANEL = vgui.RegisterTable(PANEL, ...)`
-/// while rejecting multi-assignments where the registration call is on a
-/// different LHS (e.g. `PANEL, OTHER = MakePanel(), vgui.RegisterTable(...)`).
-fn write_position_contains_register(
-    db: &DbIndex,
-    file_id: FileId,
-    write_position: TextSize,
-    register_position: TextSize,
-) -> bool {
-    let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
-        return false;
-    };
-    let chunk = tree.get_chunk_node();
-    let Some(name_token) = chunk
-        .syntax()
-        .token_at_offset(write_position)
-        .right_biased()
-    else {
-        return false;
-    };
-    let Some(assign_stat) = name_token.parent_ancestors().find_map(LuaAssignStat::cast) else {
-        return false;
-    };
-    // Find the specific RHS expression for the LHS at write_position.
-    // In a simple assignment `PANEL = expr`, there is one RHS at index 0.
-    // In a multi-assignment `A, B = expr1, expr2`, each LHS maps to its
-    // corresponding RHS by position index.
-    let (lhs_list, rhs_list) = assign_stat.get_var_and_expr_list();
-    let Some(lhs_idx) = lhs_list
-        .iter()
-        .position(|lhs| lhs.syntax().text_range().contains(write_position))
-    else {
-        return false;
-    };
-    let Some(rhs_expr) = rhs_list.get(lhs_idx) else {
-        return false;
-    };
-    let rhs_range = rhs_expr.syntax().text_range();
-    rhs_range.start() <= register_position && register_position < rhs_range.end()
-}
-
 /// Checks whether the call at the given metadata is `vgui.RegisterTable`
 /// (not `vgui.CreateFromTable`). Both use the `register_table` call_arg
 /// kind and land in `vgui_register_table_calls`, but only `RegisterTable`
@@ -9217,24 +9111,6 @@ fn value_expr_as_table(expr: &LuaExpr) -> Option<LuaTableExpr> {
     }
 }
 
-fn find_latest_decl_write_before_position(
-    db: &DbIndex,
-    file_id: FileId,
-    decl_id: LuaDeclId,
-    position: TextSize,
-) -> Option<TextSize> {
-    db.get_reference_index()
-        .get_decl_references(&file_id, &decl_id)
-        .and_then(|decl_references| {
-            decl_references
-                .cells
-                .iter()
-                .filter(|cell| cell.is_write && cell.range.start() < position)
-                .max_by_key(|cell| cell.range.start())
-                .map(|cell| cell.range.start())
-        })
-}
-
 fn synthesize_panel_class(
     db: &mut DbIndex,
     cache: &mut VguiSynthesisCache,
@@ -9335,14 +9211,7 @@ fn synthesize_panel_class_with_id(
         let latest_write_position = Some(region_start);
 
         // Resolve the concrete `{}` table literal backing this registration.
-        let registered_table = cached_registered_table_expr(
-            cache,
-            db,
-            file_id,
-            decl_id,
-            register_position,
-            region_start,
-        );
+        let registered_table = cached_registered_table_expr(cache, db, file_id, region_start);
 
         if let Some(table_expr) = &registered_table {
             // Bind the class to this exact table-constructor expression.
