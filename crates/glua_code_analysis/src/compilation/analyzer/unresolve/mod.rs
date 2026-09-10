@@ -336,76 +336,10 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
 /// just after it ran. Recording the epochs after the attempt keeps the item's
 /// own writes from marking it stale: only a *later* write to something it read
 /// requeues it.
-#[derive(Debug, Clone)]
-struct FixpointReadRecord {
-    reads: crate::db_index::read_set::InferenceReadSet,
-    type_epoch: u64,
-    return_epoch: u64,
-    param_epoch: u64,
-    module_epoch: u64,
-    special_epoch: u64,
-    contrib_epoch: u64,
-    dynamic_epoch: u64,
-}
+type FixpointReadRecord = crate::db_index::read_set::InferredReturnReadRecord;
 
-/// Whether the item's last derivation could answer differently now: something
-/// it read has since been written, or a member slot it missed has since been
-/// filled. Mirrors `AnalyzeContext::inferred_return_reads_are_stale`, which is
-/// the same staleness rule the settled return re-derivation already trusts.
 fn fixpoint_reads_are_stale(db: &DbIndex, record: &FixpointReadRecord) -> bool {
-    record
-        .reads
-        .type_owners
-        .iter()
-        .any(|owner| db.get_type_index().type_write_version(owner) > record.type_epoch)
-        || record.reads.signatures.iter().any(|dependency| {
-            db.get_signature_index().return_write_version(dependency) > record.return_epoch
-        })
-        || record.reads.params.iter().any(|dependency| {
-            db.get_signature_index().param_write_version(dependency) > record.param_epoch
-        })
-        || record.reads.modules.iter().any(|dependency| {
-            db.get_module_index().module_write_version(dependency) > record.module_epoch
-        })
-        || record
-            .reads
-            .special_calls
-            .iter()
-            .any(|(file_id, position)| {
-                db.get_flow_index()
-                    .special_call_write_version(file_id, position)
-                    > record.special_epoch
-            })
-        || record
-            .reads
-            .contribs
-            .iter()
-            .any(|(signature_id, param_idx)| {
-                db.get_call_site_param_index()
-                    .contrib_write_version(signature_id, *param_idx)
-                    > record.contrib_epoch
-            })
-        || record.reads.dynamic_fields.iter().any(|key| {
-            db.get_dynamic_field_index().dynamic_write_version(key) > record.dynamic_epoch
-        })
-        || record
-            .reads
-            .missing_member_slots
-            .iter()
-            .any(|(owner, key)| {
-                !db.get_member_index()
-                    .get_members_for_owner_key(owner, key)
-                    .is_empty()
-                    || matches!(key, crate::LuaMemberKey::Name(name)
-                    if crate::dynamic_field_owner_of(db, owner).is_some_and(
-                        |dynamic_owner| {
-                            !db
-                                .get_dynamic_field_index()
-                                .field_definitions(&dynamic_owner, name.as_str())
-                                .is_empty()
-                        },
-                    ))
-            })
+    record.is_stale(db)
 }
 
 /// Whether the settled special calls moved a novel fact since `baseline`.
