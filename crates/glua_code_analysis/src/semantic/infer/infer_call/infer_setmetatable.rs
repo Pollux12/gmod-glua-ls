@@ -39,7 +39,7 @@ pub fn infer_setmetatable_call(
         MetatableIndex::Unresolved => {
             return Err(InferFailReason::UnResolveExpr(InFiled::new(
                 cache.get_file_id(),
-                metatable,
+                metatable.get_syntax_id(),
             )));
         }
         MetatableIndex::Index(index_type) => (index_type, true),

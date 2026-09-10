@@ -1,5 +1,7 @@
 use rustc_hash::FxHashMap;
 
+use glua_parser::{LuaAstNode, LuaExpr};
+
 use crate::{
     DbIndex, InferFailReason, LuaDocReturnInfo, LuaType, LuaTypeCache, ReturnTypeKind,
     SignatureReturnStatus,
@@ -52,6 +54,7 @@ pub fn check_reach_reason(
             )
         }
         InferFailReason::UnResolveExpr(expr) => {
+            let expr = resolve_unresolve_expr(db, expr)?;
             let cache = infer_manager.get_infer_cache(expr.file_id);
             let result = infer_expr(db, cache, expr.value.clone());
             Some(result.is_ok())
@@ -66,6 +69,20 @@ pub fn check_reach_reason(
         }
         InferFailReason::UnSealedDynamicFields => Some(db.get_dynamic_field_index().is_sealed()),
     }
+}
+
+fn resolve_unresolve_expr(
+    db: &DbIndex,
+    expr: &crate::InFiled<glua_parser::LuaSyntaxId>,
+) -> Option<crate::InFiled<LuaExpr>> {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&expr.file_id)
+        .map(|tree| tree.get_red_root())?;
+    Some(crate::InFiled::new(
+        expr.file_id,
+        LuaExpr::cast(expr.value.to_node_from_root(&root)?)?,
+    ))
 }
 
 /// Memoised `UnResolveExpr` reach results for one `try_resolve` call.

@@ -1,4 +1,4 @@
-use glua_parser::LuaExpr;
+use glua_parser::LuaSyntaxId;
 
 use crate::{FileId, InFiled, LuaDeclId, LuaMemberId, LuaSignatureId, LuaTypeDeclId};
 
@@ -6,7 +6,7 @@ use crate::{FileId, InFiled, LuaDeclId, LuaMemberId, LuaSignatureId, LuaTypeDecl
 pub enum InferFailReason {
     None,
     RecursiveInfer,
-    UnResolveExpr(InFiled<LuaExpr>),
+    UnResolveExpr(InFiled<LuaSyntaxId>),
     UnResolveSignatureReturn(LuaSignatureId),
     FieldNotFound,
     UnResolveDeclType(LuaDeclId),

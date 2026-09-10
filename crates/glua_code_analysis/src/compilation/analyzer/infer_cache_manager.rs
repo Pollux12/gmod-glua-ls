@@ -147,21 +147,22 @@ impl InferCacheManager {
         }
     }
 
-    /// Drops every narrowing answer memoized for these files, including
-    /// successful ones.
-    ///
-    /// A successful flow answer survives `clear_files_deferred_results`, but
-    /// narrowing a name reads the type of whatever it was derived from — so
-    /// once a settled pass moves a value, every flow answer that read it is
-    /// void. The settled assign replay re-reads moved declarations through
-    /// flow narrowing, so it voids them up front; otherwise the first round's
-    /// answer keeps winning over the settled declaration type.
     pub fn clear_files_flow_results(&mut self, file_ids: &FxHashSet<FileId>) {
         for file_id in file_ids {
             if let Some(infer_cache) = self.infer_map.get_mut(file_id) {
                 infer_cache.clear_flow_results();
             }
         }
+    }
+
+    pub fn take_file(&mut self, file_id: FileId) -> Option<LuaInferCache> {
+        self.infer_map.remove(&file_id)
+    }
+
+    pub fn restore_file(&mut self, file_id: FileId, infer_cache: LuaInferCache) {
+        debug_assert_eq!(infer_cache.get_file_id(), file_id);
+        let previous = self.infer_map.insert(file_id, infer_cache);
+        debug_assert!(previous.is_none());
     }
 
     pub fn drain_inferred_guard_dependencies(
@@ -211,5 +212,44 @@ mod tests {
     fn dynamic_field_visibility_defaults_are_opposite() {
         assert!(crate::CacheOptions::default().dynamic_fields_visible);
         assert!(!InferCacheManager::new().dynamic_fields_visible());
+    }
+
+    #[test]
+    fn taking_and_restoring_a_file_preserves_cache_and_config() {
+        let file_id = FileId::new(7);
+        let decl_id = crate::LuaDeclId::new(file_id, 4.into());
+        let mut manager = InferCacheManager::new();
+        let mut cache = LuaInferCache::new(
+            file_id,
+            crate::CacheOptions {
+                analysis_phase: crate::LuaAnalysisPhase::Force,
+                dynamic_fields_visible: false,
+                building_dynamic_field_index: true,
+            },
+        );
+        cache
+            .for_range_iter_var_type_cache
+            .insert(decl_id, crate::CacheEntry::Cache(crate::LuaType::String));
+
+        manager.restore_file(file_id, cache);
+        let cache = manager.take_file(file_id).expect("cache was restored");
+        assert_eq!(cache.get_file_id(), file_id);
+        assert!(cache.get_config().analysis_phase.is_force());
+        assert!(!cache.get_config().dynamic_fields_visible);
+        assert!(cache.get_config().building_dynamic_field_index);
+        assert!(matches!(
+            cache.for_range_iter_var_type_cache.get(&decl_id),
+            Some(crate::CacheEntry::Cache(crate::LuaType::String))
+        ));
+
+        manager.restore_file(file_id, cache);
+        let restored = manager
+            .take_file(file_id)
+            .expect("cache was restored again");
+        assert!(matches!(
+            restored.for_range_iter_var_type_cache.get(&decl_id),
+            Some(crate::CacheEntry::Cache(crate::LuaType::String))
+        ));
+        assert!(restored.get_config().analysis_phase.is_force());
     }
 }

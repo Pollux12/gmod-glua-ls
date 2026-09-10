@@ -319,7 +319,7 @@ pub fn analyze_table_expr(analyzer: &mut DeclAnalyzer, table_expr: LuaTableExpr)
                             unresolve_member.into(),
                             InferFailReason::UnResolveExpr(InFiled::new(
                                 analyzer.get_file_id(),
-                                field_expr.clone(),
+                                field_expr.get_syntax_id(),
                             )),
                         );
                         continue;
