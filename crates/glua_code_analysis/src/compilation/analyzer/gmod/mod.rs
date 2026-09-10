@@ -535,16 +535,9 @@ impl AnalysisPipeline for GmodNetworkAnalysisPipeline {
         };
         db.get_gmod_network_index_mut()
             .restore_helper_name_memo(helper_name_memo);
-        // B8: the fold identity pins the helpers collection resolves
-        // through. A reused fold keeps its `Arc` allocation, so pointer
-        // identity is a content identity for everything the expansion below
-        // can read from it.
+        // The registry and semantic revision together identify call-resolution inputs.
         let registry_identity = Arc::as_ptr(&helper_registry) as usize;
-        // Files parked by `remove` whose staged inputs still describe them
-        // keep their stored flows: their own tree, every expanded helper's
-        // tree and the fold are all unchanged, so recollecting would derive
-        // the same flows. The check is O(batch) cheap reads; only the rest
-        // pays the walks below.
+        // Retain parked flows only while their syntax and semantic inputs match.
         let recollect: Vec<FileId> = file_ids
             .iter()
             .copied()
@@ -614,7 +607,7 @@ fn hash_network_file_content(db: &DbIndex, file_id: &FileId) -> Option<u64> {
 }
 
 /// Whether the flows parked for `file_id` still describe it: the staged
-/// inputs exist, the fold is the same allocation, the file's own content
+/// inputs exist, the semantic revision and fold match, the file's own content
 /// hashes equal, and every expanded helper file's content hashes equal.
 /// Conservative throughout: anything unreadable or changed recollects.
 fn network_staged_inputs_are_fresh(
@@ -625,7 +618,9 @@ fn network_staged_inputs_are_fresh(
     let Some(staged) = db.get_gmod_network_index().staged_file_inputs(file_id) else {
         return false;
     };
-    if staged.registry_identity != registry_identity {
+    if staged.registry_identity != registry_identity
+        || staged.semantic_revision != db.type_structure_revision()
+    {
         return false;
     }
     if hash_network_file_content(db, &file_id) != Some(staged.content_hash) {
@@ -664,6 +659,7 @@ fn network_file_inputs_for_collection(
         )
     });
     crate::db_index::NetworkFileInputs {
+        semantic_revision: db.type_structure_revision(),
         content_hash: hash_network_file_content(db, &file_id).unwrap_or(0),
         registry_identity,
         helper_contents,

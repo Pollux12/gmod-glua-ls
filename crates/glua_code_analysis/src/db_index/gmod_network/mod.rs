@@ -315,11 +315,13 @@ impl NetHelperNameMemo {
 /// Inputs a file's network flows were collected from (B8).
 ///
 /// The network pass recollects its batch every analyze; files whose own tree,
-/// expanded helpers and helper-registry fold are all unchanged keep their
+/// expanded helpers, helper-registry fold and semantic revision are unchanged keep their
 /// stored flows instead. `helper_contents` is sorted by `(file id, range)` so
 /// the comparison is deterministic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkFileInputs {
+    /// Revision of the type, member, signature and module inputs to call resolution.
+    pub semantic_revision: u64,
     /// Hash of the file's own content at collect time.
     pub content_hash: u64,
     /// Identity of the helper-registry/call-role fold the collection
@@ -874,6 +876,7 @@ mod tests {
 
     fn test_inputs(content_hash: u64) -> NetworkFileInputs {
         NetworkFileInputs {
+            semantic_revision: 0,
             content_hash,
             registry_identity: 1,
             helper_contents: Vec::new(),
