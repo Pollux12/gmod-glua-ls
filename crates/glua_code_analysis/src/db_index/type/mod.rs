@@ -1181,10 +1181,12 @@ impl TypeCacheRefIndex {
     }
 
     fn owners_referencing_file(&self, file_id: FileId) -> impl Iterator<Item = FileId> {
+        let mut seen = HashSet::default();
         self.refs_into_file(file_id)
             .filter_map(|type_ref| self.ref_owners.get(type_ref))
             .flatten()
             .copied()
+            .filter(move |owner_file_id| seen.insert(*owner_file_id))
     }
 }
 
