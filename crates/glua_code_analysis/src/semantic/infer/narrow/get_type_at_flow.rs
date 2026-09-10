@@ -1807,18 +1807,11 @@ fn get_type_at_assign_stat(
             return Ok(ResultTypeOrContinue::Continue);
         }
 
-        // Assignment is value REPLACEMENT, not condition refinement. When the RHS is a
-        // fresh table-literal constructor, its table identity must replace the
-        // antecedent's identity rather than being narrowed against it. Narrowing
-        // (`narrow_down_type`) intentionally preserves the antecedent `TableConst`
-        // identity for `TableConst -> TableConst`, which is correct for guards like
-        // `if type(x) == "table"` but wrong for `x = {}`: it would keep the previous
-        // table, collapsing every reassigned region of a reused local onto the first
-        // table literal. Bypass narrowing for literal-table assignments (no explicit
-        // doc `@type` override) so each region keeps its own table identity.
-        let rhs_is_fresh_table_literal = explicit_var_type.is_none()
-            && matches!(expr_type, LuaType::TableConst(_))
-            && exprs.get(i).is_some_and(expr_is_table_constructor);
+        // Table literals and instance values replace the previous identity on assignment.
+        let rhs_replaces_table_identity = explicit_var_type.is_none()
+            && (matches!(expr_type, LuaType::Instance(_))
+                || (matches!(expr_type, LuaType::TableConst(_))
+                    && exprs.get(i).is_some_and(expr_is_table_constructor)));
         let rhs_is_string_literal = explicit_var_type.is_none()
             && matches!(
                 expr_type,
@@ -1831,7 +1824,7 @@ fn get_type_at_assign_stat(
                 db, tree, cache, root, flow_node, var_ref_id,
             );
 
-        let narrowed = if rhs_is_fresh_table_literal
+        let narrowed = if rhs_replaces_table_identity
             || rhs_is_string_literal
             || rhs_is_class_instance
             || rhs_replaces_special_call_effect
