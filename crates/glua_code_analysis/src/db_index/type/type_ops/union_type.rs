@@ -1,6 +1,6 @@
 use crate::db_index::r#type::types::{lua_type_sort_key, lua_type_sort_ordinal};
 use crate::{DbIndex, LuaMultiLineUnion, LuaType, LuaUnionType, get_real_type};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 // Union member *order* is preserved here, but the member *set* is
 // canonical.
@@ -17,6 +17,20 @@ pub(crate) fn union_type_shallow(source: &LuaType, target: &LuaType) -> LuaType 
 
 /// Normalise a whole member set the same way repeated `union_type` would.
 pub(crate) fn union_type_all(types: Vec<LuaType>) -> LuaType {
+    union_type_all_mode(types, false)
+}
+
+/// Normalise inferred alternatives while deferring canonical ordering until
+/// the final union is built.
+pub(crate) fn union_type_all_inferred(types: Vec<LuaType>) -> LuaType {
+    union_type_all_mode(types, true)
+}
+
+fn union_type_all_mode(types: Vec<LuaType>, inferred: bool) -> LuaType {
+    if types.len() < 2 {
+        return LuaType::from_vec_structural(types);
+    }
+
     // `any` is the one member that deliberately does NOT absorb its siblings
     // here, unlike the pairwise rule and upstream. A declared
     // `---@type any|string` has to keep its `string` arm — the arms are the
@@ -45,11 +59,22 @@ pub(crate) fn union_type_all(types: Vec<LuaType>) -> LuaType {
     }
 
     if visiting_order_is_observable(&types) {
+        if inferred
+            && !types.iter().any(contains_multi_line_union)
+            && !types.iter().any(contains_preserved_union_member)
+            && !contains_distinct_sort_key_collision(&types)
+        {
+            return union_all_absorbed_inferred(types);
+        }
         return types.into_iter().fold(LuaType::Never, |result, typ| {
             union_type_shallow(&result, &typ)
         });
     }
-    union_all_absorbed(types)
+    if inferred {
+        union_all_absorbed_inferred(types)
+    } else {
+        union_all_absorbed(types)
+    }
 }
 
 /// Batch equivalent of folding [`union_type`] from [`LuaType::Never`].
@@ -147,6 +172,25 @@ fn can_use_db_aware_structural_union(db: &DbIndex, types: &[LuaType]) -> bool {
 /// Only valid where that visiting order is not observable, which
 /// [`visiting_order_is_observable`] decides for the caller.
 fn union_all_absorbed(types: Vec<LuaType>) -> LuaType {
+    let members = absorbed_members(types);
+    if members.is_empty() {
+        return LuaType::Never;
+    }
+    LuaType::from_vec_structural(members)
+}
+
+/// The same absorbed member set, left unsorted for the inferred constructor's
+/// one final canonicalisation pass.
+fn union_all_absorbed_inferred(types: Vec<LuaType>) -> LuaType {
+    let mut members = absorbed_members(types);
+    match members.len() {
+        0 => LuaType::Never,
+        1 => members.pop().unwrap_or(LuaType::Never),
+        _ => LuaType::Union(LuaUnionType::from_multi_unchecked(members).into()),
+    }
+}
+
+fn absorbed_members(types: Vec<LuaType>) -> Vec<LuaType> {
     let mut members: Vec<LuaType> = Vec::with_capacity(types.len());
     let mut present = 0u64;
     let mut hashed: FxHashSet<LuaType> =
@@ -168,10 +212,43 @@ fn union_all_absorbed(types: Vec<LuaType>) -> LuaType {
         }
     }
 
-    if members.is_empty() {
-        return LuaType::Never;
+    members
+}
+
+fn contains_multi_line_union(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::MultiLineUnion(_) => true,
+        LuaType::Union(union) => union.types().any(contains_multi_line_union),
+        _ => false,
     }
-    LuaType::from_vec_structural(members)
+}
+
+fn contains_preserved_union_member(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Any
+        | LuaType::Never
+        | LuaType::DocStringConst(_)
+        | LuaType::DocIntegerConst(_) => true,
+        LuaType::FloatConst(value) if *value == 0.0 => true,
+        LuaType::Union(union) => union.types().any(contains_preserved_union_member),
+        _ => false,
+    }
+}
+
+fn contains_distinct_sort_key_collision(types: &[LuaType]) -> bool {
+    fn visit<'a>(typ: &'a LuaType, keys: &mut FxHashMap<(u8, u64), &'a LuaType>) -> bool {
+        if let LuaType::Union(union) = typ {
+            return union.types().any(|member| visit(member, keys));
+        }
+        let key = lua_type_sort_key(typ);
+        if let Some(existing) = keys.get(&key) {
+            return *existing != typ;
+        }
+        keys.insert(key, typ);
+        false
+    }
+    let mut keys = FxHashMap::default();
+    types.iter().any(|typ| visit(typ, &mut keys))
 }
 
 /// [`absorb`], with the common case answered by a hash set instead of a scan.
@@ -638,9 +715,11 @@ fn contains_ordinal(members: &[LuaType], ordinal: u8) -> bool {
 #[cfg(test)]
 mod union_shortcut_tests {
     use super::*;
-    use crate::LuaTypeDeclId;
+    use crate::{FileId, LuaIndexAccessKey, LuaObjectType, LuaSignatureId, LuaTypeDeclId};
     use internment::ArcIntern;
+    use rowan::TextSize;
     use smol_str::SmolStr;
+    use std::sync::Arc;
 
     /// The pairwise fold both shortcuts replace.
     fn fold(types: Vec<LuaType>) -> LuaType {
@@ -796,5 +875,137 @@ mod union_shortcut_tests {
             LuaType::Ref(LuaTypeDeclId::global("Alpha")),
         ];
         assert_eq!(union_all_absorbed(types.clone()), fold(types));
+    }
+
+    fn inferred_before_optimisation(types: Vec<LuaType>) -> LuaType {
+        match LuaType::from_vec(types) {
+            LuaType::Union(union) => match Arc::try_unwrap(union) {
+                Ok(LuaUnionType::Multi(members)) => {
+                    LuaType::Union(LuaUnionType::from_inferred_vec(members).into())
+                }
+                Ok(union) => LuaType::Union(union.into()),
+                Err(union) => match union.as_ref() {
+                    LuaUnionType::Multi(members) => {
+                        LuaType::Union(LuaUnionType::from_inferred_vec(members.clone()).into())
+                    }
+                    LuaUnionType::Nullable(_) => LuaType::Union(union),
+                },
+            },
+            other => other,
+        }
+    }
+
+    fn signature(file_id: u32, position: u32) -> LuaType {
+        LuaType::Signature(LuaSignatureId::new(
+            FileId::new(file_id),
+            TextSize::new(position),
+        ))
+    }
+
+    fn nested_callable_union() -> LuaType {
+        LuaType::Union(
+            LuaUnionType::from_multi_unchecked(vec![signature(1, 0), LuaType::String]).into(),
+        )
+    }
+
+    fn nested_preserved_literal_union() -> LuaType {
+        LuaType::Union(
+            LuaUnionType::from_multi_unchecked(vec![
+                LuaType::Any,
+                LuaType::String,
+                signature(1, 1),
+            ])
+            .into(),
+        )
+    }
+
+    fn nested_never_union() -> LuaType {
+        LuaType::Union(
+            LuaUnionType::from_multi_unchecked(vec![signature(1, 3), LuaType::Never]).into(),
+        )
+    }
+
+    fn nested_multiline_union() -> LuaType {
+        LuaType::Union(
+            LuaUnionType::from_multi_unchecked(vec![
+                LuaType::MultiLineUnion(Arc::new(LuaMultiLineUnion::new(vec![(
+                    LuaType::StringConst(ArcIntern::new(SmolStr::new("literal"))),
+                    None,
+                )]))),
+                signature(1, 2),
+            ])
+            .into(),
+        )
+    }
+
+    #[test]
+    fn inferred_normalisation_matches_the_previous_fold_across_permutations() {
+        let object = LuaType::Object(Arc::new(LuaObjectType::new(vec![(
+            LuaIndexAccessKey::String(SmolStr::new("field")),
+            LuaType::String,
+        )])));
+        let cases = vec![
+            vec![
+                nested_callable_union(),
+                signature(2, 0),
+                LuaType::Integer,
+                object.clone(),
+            ],
+            vec![
+                nested_preserved_literal_union(),
+                object.clone(),
+                LuaType::String,
+            ],
+            vec![nested_multiline_union(), signature(3, 0), LuaType::Integer],
+            vec![nested_never_union(), signature(3, 1), LuaType::Integer],
+            vec![LuaType::Any, signature(4, 0), LuaType::String],
+            vec![
+                LuaType::FloatConst(0.0),
+                LuaType::Union(
+                    LuaUnionType::from_multi_unchecked(vec![
+                        LuaType::FloatConst(-0.0),
+                        signature(5, 0),
+                    ])
+                    .into(),
+                ),
+                LuaType::Integer,
+            ],
+        ];
+        let orders = [
+            vec![0, 1, 2, 3],
+            vec![3, 2, 1, 0],
+            vec![1, 3, 0, 2],
+            vec![2, 0, 3, 1],
+        ];
+
+        for case in cases {
+            for order in &orders {
+                let permutation = order
+                    .iter()
+                    .filter_map(|&idx| case.get(idx).cloned())
+                    .collect::<Vec<_>>();
+                let old = inferred_before_optimisation(permutation.clone());
+                let actual = LuaType::from_inferred_vec(permutation);
+                assert_eq!(actual, old, "inferred normalisation changed its member set");
+                assert_eq!(format!("{actual:?}"), format!("{old:?}"));
+            }
+        }
+    }
+    #[test]
+    fn inferred_sort_key_collision_checks_all_input_members() {
+        let types = vec![
+            LuaType::FloatConst(f64::NAN),
+            LuaType::Union(
+                LuaUnionType::from_multi_unchecked(vec![
+                    LuaType::FloatConst(f64::NAN),
+                    signature(1, 0),
+                ])
+                .into(),
+            ),
+        ];
+        assert!(contains_distinct_sort_key_collision(&types));
+        let old = inferred_before_optimisation(types.clone());
+        let actual = LuaType::from_inferred_vec(types);
+        assert_eq!(format!("{actual:?}"), format!("{old:?}"));
     }
 }

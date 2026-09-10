@@ -535,7 +535,7 @@ impl LuaType {
     pub(crate) fn from_vec_structural(types: Vec<LuaType>) -> Self {
         match types.len() {
             0 => LuaType::Nil,
-            1 => types[0].clone(),
+            1 => types.into_iter().next().unwrap_or(LuaType::Nil),
             _ => {
                 let mut result_types: Vec<LuaType> = Vec::new();
                 // Membership only: the union's order comes from `result_types`,
@@ -552,7 +552,11 @@ impl LuaType {
                 for typ in types {
                     match typ {
                         LuaType::Union(u) => {
-                            for t in u.into_vec() {
+                            let members = match Arc::try_unwrap(u) {
+                                Ok(union) => union.into_vec_owned(),
+                                Err(union) => union.into_vec(),
+                            };
+                            for t in members {
                                 push_dedup(&mut result_types, &mut hash_set, t);
                             }
                         }
@@ -564,7 +568,7 @@ impl LuaType {
 
                 match result_types.len() {
                     0 => LuaType::Nil,
-                    1 => result_types[0].clone(),
+                    1 => result_types.into_iter().next().unwrap_or(LuaType::Nil),
                     _ => LuaType::Union(LuaUnionType::from_vec(result_types).into()),
                 }
             }
@@ -577,12 +581,18 @@ impl LuaType {
     /// canonical order. See [`LuaUnionType::from_inferred_vec`] for why declared
     /// unions must keep the author's order while inferred ones must not.
     pub fn from_inferred_vec(types: Vec<LuaType>) -> Self {
-        match Self::from_vec(types) {
-            LuaType::Union(union) => match union.as_ref() {
-                LuaUnionType::Multi(members) => {
-                    LuaType::Union(LuaUnionType::from_inferred_vec(members.clone()).into())
+        match crate::db_index::r#type::type_ops::union_type::union_type_all_inferred(types) {
+            LuaType::Union(union) => match Arc::try_unwrap(union) {
+                Ok(LuaUnionType::Multi(members)) => {
+                    LuaType::Union(LuaUnionType::from_inferred_vec(members).into())
                 }
-                LuaUnionType::Nullable(_) => LuaType::Union(union),
+                Ok(union) => LuaType::Union(union.into()),
+                Err(union) => match union.as_ref() {
+                    LuaUnionType::Multi(members) => {
+                        LuaType::Union(LuaUnionType::from_inferred_vec(members.clone()).into())
+                    }
+                    LuaUnionType::Nullable(_) => LuaType::Union(union),
+                },
             },
             other => other,
         }
@@ -1138,13 +1148,7 @@ impl LuaUnionType {
             types.dedup();
         }
 
-        if types.len() == 2
-            && types.contains(&LuaType::Nil)
-            && let Some(ty) = types.iter().find(|t| !matches!(t, LuaType::Nil))
-        {
-            return Self::Nullable(ty.clone());
-        }
-        Self::Multi(types)
+        Self::from_normalized_vec(types)
     }
 
     /// Builds a union out of *inferred* alternatives, in a canonical order.
@@ -1157,7 +1161,17 @@ impl LuaUnionType {
             types.sort_by_cached_key(lua_type_sort_key);
             types.dedup();
         }
-        Self::from_vec(types)
+        Self::from_normalized_vec(types)
+    }
+
+    fn from_normalized_vec(types: Vec<LuaType>) -> Self {
+        if types.len() == 2
+            && types.contains(&LuaType::Nil)
+            && let Some(ty) = types.iter().find(|t| !matches!(t, LuaType::Nil))
+        {
+            return Self::Nullable(ty.clone());
+        }
+        Self::Multi(types)
     }
 
     /// Builds a `Multi` union out of members that are already in their final
@@ -1190,6 +1204,13 @@ impl LuaUnionType {
         match self {
             LuaUnionType::Nullable(ty) => vec![ty.clone(), LuaType::Nil],
             LuaUnionType::Multi(types) => types.clone(),
+        }
+    }
+
+    fn into_vec_owned(self) -> Vec<LuaType> {
+        match self {
+            LuaUnionType::Nullable(ty) => vec![ty, LuaType::Nil],
+            LuaUnionType::Multi(types) => types,
         }
     }
 
@@ -2209,6 +2230,71 @@ mod tests {
         let mut hasher = DefaultHasher::new();
         ty.hash(&mut hasher);
         hasher.finish()
+    }
+
+    #[test]
+    fn structural_union_flattens_nested_owned_members_in_order() {
+        let template = LuaType::TplRef(Arc::new(GenericTpl::new(
+            GenericTplId::Type(3),
+            ArcIntern::new(SmolStr::new("T")),
+            None,
+        )));
+        let nested = LuaType::Union(
+            LuaUnionType::from_multi_unchecked(vec![template.clone(), LuaType::String]).into(),
+        );
+
+        let LuaType::Union(union) = LuaType::from_vec_structural(vec![nested, LuaType::Nil]) else {
+            panic!("expected a flattened union");
+        };
+
+        assert_eq!(
+            union.types().cloned().collect::<Vec<_>>(),
+            vec![template, LuaType::String, LuaType::Nil]
+        );
+    }
+
+    #[test]
+    fn declared_union_preserves_order_sensitive_member_order() {
+        let template = LuaType::TplRef(Arc::new(GenericTpl::new(
+            GenericTplId::Type(3),
+            ArcIntern::new(SmolStr::new("T")),
+            None,
+        )));
+        let declared = LuaType::from_vec(vec![template.clone(), LuaType::String]);
+
+        let LuaType::Union(union) = declared else {
+            panic!("expected a declared union");
+        };
+
+        assert_eq!(
+            union.types().cloned().collect::<Vec<_>>(),
+            vec![template, LuaType::String]
+        );
+    }
+
+    #[test]
+    fn inferred_union_order_is_independent_of_input_order() {
+        let template = LuaType::TplRef(Arc::new(GenericTpl::new(
+            GenericTplId::Type(3),
+            ArcIntern::new(SmolStr::new("T")),
+            None,
+        )));
+        let forward = LuaType::from_inferred_vec(vec![template.clone(), LuaType::String]);
+        let reverse = LuaType::from_inferred_vec(vec![LuaType::String, template]);
+
+        assert_eq!(forward, reverse);
+    }
+
+    #[test]
+    fn inferred_union_preserves_absorption_and_nullable_nil() {
+        assert_eq!(
+            LuaType::from_inferred_vec(vec![
+                LuaType::IntegerConst(1),
+                LuaType::Integer,
+                LuaType::Nil
+            ]),
+            LuaType::Union(LuaUnionType::Nullable(LuaType::Integer).into())
+        );
     }
 
     /// `k1 == k2` must imply `hash(k1) == hash(k2)`, for separately

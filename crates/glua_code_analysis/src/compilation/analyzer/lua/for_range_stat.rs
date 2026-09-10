@@ -495,23 +495,42 @@ fn compact_pairs_key_type(keys: &[LuaType]) -> LuaType {
 }
 
 fn compact_pairs_value_type(db: &DbIndex, values: Vec<LuaType>) -> LuaType {
-    let mut values = values
-        .into_iter()
-        .map(|value| remove_pairs_yield_nil(db, &value))
-        .filter(|value| !value.is_unknown() && !value.is_never())
-        .collect::<Vec<_>>();
-    if values.iter().any(|v| !v.is_any()) {
-        values.retain(|v| !v.is_any());
+    let mut saw_concrete = false;
+    let mut values = values;
+    values.retain_mut(|value| {
+        *value = remove_pairs_yield_nil(db, value);
+        if value.is_unknown() || value.is_never() {
+            return false;
+        }
+        saw_concrete |= !value.is_any();
+        true
+    });
+    if saw_concrete {
+        values.retain(|value| !value.is_any());
     }
     if values.is_empty() {
         // All observed values were nil-only or otherwise uninformative; avoid collapsing to Nil.
         return LuaType::Unknown;
     }
 
+    if values.len() == 1 && !matches!(values[0], LuaType::Union(_)) {
+        return values.pop().unwrap_or(LuaType::Unknown);
+    }
+
     try_compact_record_values(db, &values).unwrap_or_else(|| LuaType::from_inferred_vec(values))
 }
 
 fn remove_pairs_yield_nil(db: &DbIndex, value_type: &LuaType) -> LuaType {
+    if matches!(value_type, LuaType::Unknown | LuaType::Never | LuaType::Nil) {
+        return LuaType::Unknown;
+    }
+    if !matches!(
+        value_type,
+        LuaType::Union(_) | LuaType::Ref(_) | LuaType::Instance(_)
+    ) {
+        return value_type.clone();
+    }
+
     let non_nil = TypeOps::Remove.apply(db, value_type, &LuaType::Nil);
     if non_nil.is_never() {
         LuaType::Unknown
@@ -612,4 +631,37 @@ fn is_global_pairs_call(
         .get_local_reference(&file_id)
         .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
         .is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compact_pairs_value_type;
+    use crate::{DbIndex, LuaType};
+
+    #[test]
+    fn compact_pairs_value_type_keeps_nil_and_any_cleanup_semantics() {
+        let db = DbIndex::new();
+
+        assert_eq!(
+            compact_pairs_value_type(&db, vec![LuaType::Nil, LuaType::Unknown]),
+            LuaType::Unknown
+        );
+        assert_eq!(
+            compact_pairs_value_type(&db, vec![LuaType::Any, LuaType::String]),
+            LuaType::String
+        );
+        assert_eq!(
+            compact_pairs_value_type(&db, vec![LuaType::Integer, LuaType::Nil]),
+            LuaType::Integer
+        );
+    }
+
+    #[test]
+    fn compact_pairs_value_type_matches_inferred_union_for_multiple_values() {
+        let db = DbIndex::new();
+        let values = vec![LuaType::Integer, LuaType::String];
+        let expected = LuaType::from_inferred_vec(values.clone());
+
+        assert_eq!(compact_pairs_value_type(&db, values), expected);
+    }
 }
