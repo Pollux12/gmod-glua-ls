@@ -77,9 +77,10 @@ where
     T: Send,
     F: Fn(&DbIndex, FileId) -> T + Sync,
 {
+    let run = |db: &DbIndex, file_id: FileId| glua_parser::with_syntax_resolvers(|| f(db, file_id));
     let n = file_ids.len();
     if runs_inline(n) {
-        return file_ids.iter().map(|&id| f(db, id)).collect();
+        return file_ids.iter().map(|&id| run(db, id)).collect();
     }
 
     let _p = Profile::cond_new("parallel map_files", n > 1);
@@ -107,7 +108,7 @@ where
                     crate::progress::advance_current_phase(seq, n, "files");
                 }
             }
-            (idx, f(db, file_ids[idx]))
+            (idx, run(db, file_ids[idx]))
         })
         .collect();
 

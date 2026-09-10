@@ -49,11 +49,13 @@ type ResolveResult = Result<(), InferFailReason>;
 pub struct PreDynamicUnResolveAnalysisPipeline;
 impl AnalysisPipeline for PreDynamicUnResolveAnalysisPipeline {
     fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
-        let (ready, deferred) =
-            partition_pre_dynamic_unresolves(std::mem::take(&mut context.unresolves));
-        context.unresolves = ready;
-        UnResolveAnalysisPipeline::analyze(db, context);
-        context.unresolves.extend(deferred);
+        glua_parser::with_syntax_resolvers(|| {
+            let (ready, deferred) =
+                partition_pre_dynamic_unresolves(std::mem::take(&mut context.unresolves));
+            context.unresolves = ready;
+            UnResolveAnalysisPipeline::analyze(db, context);
+            context.unresolves.extend(deferred);
+        });
     }
 }
 
