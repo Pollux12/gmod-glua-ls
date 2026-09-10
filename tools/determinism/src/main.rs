@@ -1712,6 +1712,7 @@ fn run_index_repeat(codebase: &Path, annotations: &Path, targets: &[String]) {
             .and_then(|raw| raw.parse::<usize>().ok())
             .unwrap_or(1);
         let mut before = collect_index(analysis, "before_indexrepeat");
+        let mut before_diagnostics = collect(analysis, "before_indexrepeat");
         for round in 1..=rounds {
             analysis.reindex_files(vec![file_id]);
             let label = format!("after_indexrepeat[{target}]#{round}");
@@ -1722,6 +1723,14 @@ fn run_index_repeat(codebase: &Path, annotations: &Path, targets: &[String]) {
                 &label,
                 &after,
             );
+            let after_diagnostics = collect(analysis, &label);
+            diff(
+                &format!("before_indexrepeat#{round}"),
+                &before_diagnostics,
+                &label,
+                &after_diagnostics,
+            );
+            before_diagnostics = after_diagnostics;
             before = after;
         }
     }
@@ -2473,9 +2482,19 @@ fn run() {
         collect_index(&analysis, "cold");
     }
 
+    let cold_index = (std::env::var_os("DET_INDEX_DIFF").is_some()
+        && stages
+            .iter()
+            .any(|stage| matches!(stage.as_str(), "repeat" | "fresh" | "order" | "reindex")))
+    .then(|| collect_index(&analysis, "cold"));
+
     if stages.iter().any(|s| s == "repeat") {
         let again = collect(&analysis, "repeat");
         diff("cold", &cold, "repeat", &again);
+        if let Some(cold_index) = &cold_index {
+            let after_index = collect_index(&analysis, "repeat");
+            diff_index("cold", cold_index, "repeat", &after_index);
+        }
     }
 
     if stages.iter().any(|s| s == "noopedit") {
@@ -2657,6 +2676,10 @@ fn run() {
         eprintln!("[reindex] full reindex {:.2}s", t.elapsed().as_secs_f64());
         let after = collect(&analysis, "after_full_reindex");
         diff("cold", &cold, "after_full_reindex", &after);
+        if let Some(cold_index) = &cold_index {
+            let after_index = collect_index(&analysis, "after_full_reindex");
+            diff_index("cold", cold_index, "after_full_reindex", &after_index);
+        }
     }
 
     if stages.iter().any(|s| s == "expandwhy") {
@@ -2720,6 +2743,10 @@ fn run() {
         let fresh_analysis = build_analysis(&codebase, &annotations);
         let fresh = collect(&fresh_analysis, "fresh_process");
         diff("cold", &cold, "fresh_process", &fresh);
+        if let Some(cold_index) = &cold_index {
+            let after_index = collect_index(&fresh_analysis, "fresh_process");
+            diff_index("cold", cold_index, "fresh_process", &after_index);
+        }
     }
 
     if stages.iter().any(|s| s == "order") {
@@ -2727,6 +2754,10 @@ fn run() {
             build_analysis_with(&codebase, &annotations, Order::Reverse, 1, &[]);
         let reversed = collect(&reversed_analysis, "reverse_order");
         diff("cold", &cold, "reverse_order", &reversed);
+        if let Some(cold_index) = &cold_index {
+            let after_index = collect_index(&reversed_analysis, "reverse_order");
+            diff_index("cold", cold_index, "reverse_order", &after_index);
+        }
     }
 
     if let Some(batches) = stages.iter().find_map(|s| s.strip_prefix("split:")) {
