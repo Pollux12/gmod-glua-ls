@@ -560,7 +560,6 @@ impl LuaInferCache {
         self.call_arg_types_cache.clear();
         self.numeric_table_index_query_cache.clear();
         self.unambiguous_int_const_cache.clear();
-        self.decl_name_index = None;
         self.flow_node_cache.clear();
         self.flow_query_realm = None;
         self.index_ref_origin_type_cache.clear();
