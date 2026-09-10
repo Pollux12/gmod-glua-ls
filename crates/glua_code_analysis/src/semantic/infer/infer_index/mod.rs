@@ -155,6 +155,15 @@ pub fn infer_index_expr(
         Err(err) => return Err(err),
     }
 
+    // Keep analysis retries unresolved; diagnostics narrow unknown fields from unknown, not nil.
+    if pass_flow
+        && prefix_type.is_unknown()
+        && cache.get_config().analysis_phase.is_diagnostics()
+        && let Some(var_ref_id) = get_index_expr_var_ref_id(db, cache, &index_expr)
+    {
+        return run_fallback_narrow_raw(db, cache, index_expr, &var_ref_id, LuaType::Unknown);
+    }
+
     if pass_flow {
         match infer_member_type_fallback_pass_flow(db, cache, index_expr) {
             Ok(member_type) => return Ok(member_type),
@@ -235,7 +244,7 @@ fn infer_member_type_fallback_pass_flow(
         return finalize_fallback_result(cache_entry_to_infer_result(&counterfactual_entry));
     }
 
-    let result = run_legacy_fallback_narrow_raw(db, cache, index_expr, &var_ref_id);
+    let result = run_fallback_narrow_raw(db, cache, index_expr, &var_ref_id, LuaType::Nil);
     if let Some(entry) = infer_result_to_cache_entry(cache, &result) {
         cache.set_flow_cache_with_origin(
             &var_ref_id,
@@ -249,14 +258,15 @@ fn infer_member_type_fallback_pass_flow(
     finalize_fallback_result(result)
 }
 
-fn run_legacy_fallback_narrow_raw(
+fn run_fallback_narrow_raw(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     index_expr: LuaIndexExpr,
     var_ref_id: &VarRefId,
+    origin_type: LuaType,
 ) -> InferResult {
     let previous_origin =
-        cache.replace_index_ref_origin_type_cache(var_ref_id, CacheEntry::Cache(LuaType::Nil));
+        cache.replace_index_ref_origin_type_cache(var_ref_id, CacheEntry::Cache(origin_type));
     let previous_flow_cache = cache.take_flow_cache_for_var_ref(var_ref_id);
     let result = infer_expr_narrow_type_with_flow_origin(
         db,

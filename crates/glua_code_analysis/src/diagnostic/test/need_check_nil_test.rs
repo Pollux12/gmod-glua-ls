@@ -1179,19 +1179,7 @@ mod test {
         );
     }
 
-    /// Known edge, no measured occurrences: an unresolved prefix reaches
-    /// `report_unsafe_receiver` as `FieldNotFound`, which that path reads as a
-    /// runtime `nil`, so the chain warns as if nil were proven.
-    ///
-    /// Both obvious fixes are worse than the edge. Skipping the
-    /// `FieldNotFound`→`nil` conversion when the prefix is unresolved breaks
-    /// four tests that rely on it to report genuinely absent fields (e.g.
-    /// `test_gmod_vehicle_sound_unguarded_turbo_parameter_field_reports_unchecked_nil`),
-    /// and returning `Ok(Unknown)` for an `Unknown` prefix in
-    /// `infer_member_by_index` breaks seven — `FieldNotFound` is what drives
-    /// unresolve deferral. Zero hits on CityRP (2035 files) and StarfallEx.
     #[test]
-    #[ignore = "known edge: unresolved prefix reads as proven nil; see doc comment"]
     fn test_unresolved_prefix_chain_is_not_warned() {
         let mut ws = VirtualWorkspace::new();
         assert_that!(
@@ -1205,6 +1193,25 @@ mod test {
             ),
             eq(true)
         );
+    }
+
+    #[test]
+    fn test_receiver_chain_distinguishes_unknown_from_missing_fields() {
+        for (declaration, clean) in [
+            ("local m = require(SomeUndefinedGlobal)", true),
+            ("---@type unknown\nlocal m", true),
+            ("---@class ReceiverChain\nlocal m = {}", false),
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert_that!(
+                ws.check_code_for(
+                    DiagnosticCode::UncheckedNilAccess,
+                    &format!("{declaration}\nm.foo.child:bar()"),
+                ),
+                eq(clean),
+                "{declaration}"
+            );
+        }
     }
 
     #[gtest]
