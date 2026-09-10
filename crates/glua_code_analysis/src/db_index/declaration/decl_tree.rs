@@ -6,6 +6,7 @@ use crate::{FileId, db_index::LuaMemberId};
 use decl::LuaDecl;
 use rowan::{TextRange, TextSize};
 use scope::{LuaScope, LuaScopeId, LuaScopeKind, ScopeOrDeclId};
+use smol_str::SmolStr;
 
 #[derive(Debug)]
 pub struct LuaDeclarationTree {
@@ -22,6 +23,11 @@ pub struct LuaDeclarationTree {
     /// binary-searching the `position < start` boundary instead of scanning
     /// every statement scope. Only scopes with any hold an entry.
     interesting_children: FxHashMap<LuaScopeId, Vec<((TextSize, u32), InterestingChild)>>,
+    /// The same ordered visit set keyed by declaration name. `find_local_decl`
+    /// only needs one name, so it can skip unrelated declarations while keeping
+    /// the source-order walk and scope boundaries intact.
+    interesting_children_by_name:
+        FxHashMap<LuaScopeId, FxHashMap<SmolStr, Vec<((TextSize, u32), InterestingChild)>>>,
 }
 
 impl LuaDeclarationTree {
@@ -33,6 +39,7 @@ impl LuaDeclarationTree {
             scopes: Vec::new(),
             scope_child_index: Vec::new(),
             interesting_children: FxHashMap::default(),
+            interesting_children_by_name: FxHashMap::default(),
         }
     }
 
@@ -43,7 +50,7 @@ impl LuaDeclarationTree {
     pub fn find_local_decl(&self, name: &str, position: TextSize) -> Option<&LuaDecl> {
         let scope = self.find_scope(position)?;
         let mut result: Option<&LuaDecl> = None;
-        self.walk_up(scope, position, 0, &mut |decl_id| {
+        self.walk_up(scope, position, 0, Some(name), &mut |decl_id| {
             match decl_id {
                 ScopeOrDeclId::Decl(decl_id) => {
                     let decl = match self.get_decl(&decl_id) {
@@ -82,7 +89,7 @@ impl LuaDeclarationTree {
     pub fn get_env_decls(&self, position: TextSize) -> Option<Vec<LuaDeclId>> {
         let scope = self.find_scope(position)?;
         let mut result = Vec::new();
-        self.walk_up(scope, position, 0, &mut |decl_id| {
+        self.walk_up(scope, position, 0, None, &mut |decl_id| {
             match decl_id {
                 ScopeOrDeclId::Decl(decl_id) => {
                     if let Some(decl) = self.get_decl(&decl_id)
@@ -204,11 +211,24 @@ impl LuaDeclarationTree {
     /// would be `f(Scope)`, which carries no declaration. Both current callers
     /// ignore `Scope` visits, so the elision is unobservable to them; a future
     /// closure that depends on visiting every scope must not use this walk.
-    fn base_walk_up<F>(&self, scope: &LuaScope, start_pos: TextSize, level: usize, f: &mut F)
-    where
+    fn base_walk_up<F>(
+        &self,
+        scope: &LuaScope,
+        start_pos: TextSize,
+        level: usize,
+        name: Option<&str>,
+        f: &mut F,
+    ) where
         F: FnMut(ScopeOrDeclId) -> bool,
     {
-        if let Some(interesting) = self.interesting_children.get(&scope.get_id()) {
+        let interesting = match name {
+            Some(name) => self
+                .interesting_children_by_name
+                .get(&scope.get_id())
+                .and_then(|children| children.get(name)),
+            None => self.interesting_children.get(&scope.get_id()),
+        };
+        if let Some(interesting) = interesting {
             // Sorted by `(position, child index)`, the order entries hold in
             // `children`, so this visits exactly what the old reverse scan
             // over `children` would, minus the elided scopes.
@@ -237,13 +257,19 @@ impl LuaDeclarationTree {
                 Some(scope) => scope,
                 None => return,
             };
-            self.walk_up(parent_scope, start_pos, level + 1, f);
+            self.walk_up(parent_scope, start_pos, level + 1, name, f);
         }
     }
 
     /// Walks up the scope tree and calls `f` for each declaration.
-    fn walk_up<F>(&self, scope: &LuaScope, start_pos: TextSize, level: usize, f: &mut F)
-    where
+    fn walk_up<F>(
+        &self,
+        scope: &LuaScope,
+        start_pos: TextSize,
+        level: usize,
+        name: Option<&str>,
+        f: &mut F,
+    ) where
         F: FnMut(ScopeOrDeclId) -> bool,
     {
         match scope.get_kind() {
@@ -254,7 +280,7 @@ impl LuaDeclarationTree {
                         Some(scope) => scope,
                         None => return,
                     };
-                    self.walk_up(parent_scope, scope.get_position(), level, f);
+                    self.walk_up(parent_scope, scope.get_position(), level, name, f);
                 }
             }
             LuaScopeKind::Repeat => {
@@ -265,11 +291,11 @@ impl LuaDeclarationTree {
                         Some(scope) => scope,
                         None => return,
                     };
-                    self.walk_up(scope, start_pos, level, f);
+                    self.walk_up(scope, start_pos, level, name, f);
                     return;
                 }
 
-                self.base_walk_up(scope, start_pos, level, f);
+                self.base_walk_up(scope, start_pos, level, name, f);
             }
             LuaScopeKind::ForRange => {
                 if level == 0 {
@@ -279,14 +305,14 @@ impl LuaDeclarationTree {
                             Some(scope) => scope,
                             None => return,
                         };
-                        self.walk_up(parent_scope, start_pos, level, f);
+                        self.walk_up(parent_scope, start_pos, level, name, f);
                     }
                 } else {
-                    self.base_walk_up(scope, start_pos, level, f);
+                    self.base_walk_up(scope, start_pos, level, name, f);
                 }
             }
             _ => {
-                self.base_walk_up(scope, start_pos, level, f);
+                self.base_walk_up(scope, start_pos, level, name, f);
             }
         }
     }
@@ -346,6 +372,9 @@ impl LuaDeclarationTree {
     }
 
     pub fn add_decl_to_scope(&mut self, scope_id: LuaScopeId, decl_id: LuaDeclId) {
+        let decl_name = self
+            .get_decl(&decl_id)
+            .map(|decl| SmolStr::new(decl.get_name()));
         let Some(scope) = self.scopes.get_mut(scope_id.id as usize) else {
             return;
         };
@@ -358,6 +387,15 @@ impl LuaDeclarationTree {
             (decl_id.position, vec_index),
             InterestingChild::Decl(decl_id),
         );
+        if let Some(name) = decl_name.as_deref() {
+            insert_named_interesting_child(
+                &mut self.interesting_children_by_name,
+                scope_id,
+                name,
+                (decl_id.position, vec_index),
+                InterestingChild::Decl(decl_id),
+            );
+        }
         // A child scope with direct declarations is visited for them when the
         // walk passes its parent; record it there. The key makes repeat
         // inserts idempotent, so every declaration can file unconditionally.
@@ -379,6 +417,15 @@ impl LuaDeclarationTree {
                 scope_key,
                 InterestingChild::Scope(scope_id),
             );
+            if let Some(name) = decl_name.as_deref() {
+                insert_named_interesting_child(
+                    &mut self.interesting_children_by_name,
+                    parent_id,
+                    name,
+                    scope_key,
+                    InterestingChild::Scope(scope_id),
+                );
+            }
         }
     }
 
@@ -403,21 +450,32 @@ impl LuaDeclarationTree {
     /// already holds direct declarations (see `add_decl_to_scope` for the
     /// usual link-then-declare order this covers for).
     fn file_child_scope_with_decls(&mut self, parent_id: LuaScopeId, child_id: LuaScopeId) {
-        let (kind, position, vec_index, has_decls) = match self.scopes.get(child_id.id as usize) {
-            Some(child) => (
-                child.get_kind(),
-                child.get_position(),
-                self.scope_child_index
-                    .get(child_id.id as usize)
-                    .copied()
-                    .unwrap_or(u32::MAX),
-                child
-                    .get_children()
-                    .iter()
-                    .any(|entry| matches!(entry, ScopeOrDeclId::Decl(_))),
-            ),
-            None => return,
-        };
+        let (kind, position, vec_index, has_decls, names) =
+            match self.scopes.get(child_id.id as usize) {
+                Some(child) => (
+                    child.get_kind(),
+                    child.get_position(),
+                    self.scope_child_index
+                        .get(child_id.id as usize)
+                        .copied()
+                        .unwrap_or(u32::MAX),
+                    child
+                        .get_children()
+                        .iter()
+                        .any(|entry| matches!(entry, ScopeOrDeclId::Decl(_))),
+                    child
+                        .get_children()
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            ScopeOrDeclId::Decl(decl_id) => self
+                                .get_decl(decl_id)
+                                .map(|decl| SmolStr::new(decl.get_name())),
+                            ScopeOrDeclId::Scope(_) => None,
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                None => return,
+            };
         if !has_decls
             || !matches!(
                 kind,
@@ -432,6 +490,15 @@ impl LuaDeclarationTree {
             (position, vec_index),
             InterestingChild::Scope(child_id),
         );
+        for name in names {
+            insert_named_interesting_child(
+                &mut self.interesting_children_by_name,
+                parent_id,
+                &name,
+                (position, vec_index),
+                InterestingChild::Scope(child_id),
+            );
+        }
     }
 
     pub fn get_root_scope(&self) -> Option<&LuaScope> {
@@ -473,6 +540,29 @@ fn insert_interesting_child(
     }
 }
 
+fn insert_named_interesting_child(
+    interesting: &mut FxHashMap<
+        LuaScopeId,
+        FxHashMap<SmolStr, Vec<((TextSize, u32), InterestingChild)>>,
+    >,
+    scope_id: LuaScopeId,
+    name: &str,
+    key: (TextSize, u32),
+    child: InterestingChild,
+) {
+    let entries = interesting
+        .entry(scope_id)
+        .or_default()
+        .entry(SmolStr::new(name))
+        .or_default();
+    match entries.binary_search_by_key(&key, |(key, _)| *key) {
+        // Child scopes may be filed once per direct declaration; preserve one
+        // scope entry for each `(position, child index)` key.
+        Ok(_) if matches!(child, InterestingChild::Scope(_)) => {}
+        Ok(at) | Err(at) => entries.insert(at, (key, child)),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LuaDeclOrMemberId {
     Decl(LuaDeclId),
@@ -499,5 +589,118 @@ impl LuaDeclOrMemberId {
             LuaDeclOrMemberId::Decl(decl_id) => decl_id.position,
             LuaDeclOrMemberId::Member(member_id) => member_id.get_position(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FileId, LuaDeclExtra};
+    use glua_parser::LuaSyntaxKind;
+
+    fn range(start: u32, end: u32) -> TextRange {
+        TextRange::new(TextSize::new(start), TextSize::new(end))
+    }
+
+    fn add_local(tree: &mut LuaDeclarationTree, name: &str, start: u32) -> LuaDeclId {
+        tree.add_decl(LuaDecl::new(
+            name,
+            FileId::new(1),
+            range(start, start + 1),
+            LuaDeclExtra::Local {
+                kind: LuaSyntaxKind::LocalName.into(),
+                attrib: None,
+            },
+            None,
+        ))
+    }
+
+    fn found_position(tree: &LuaDeclarationTree, name: &str, position: u32) -> Option<u32> {
+        tree.find_local_decl(name, TextSize::new(position))
+            .map(|decl| decl.get_position().into())
+    }
+
+    #[test]
+    fn finds_latest_same_name_declaration_before_use() {
+        let file_id = FileId::new(1);
+        let mut tree = LuaDeclarationTree::new(file_id);
+        let root = tree.create_scope(range(0, 100), LuaScopeKind::Normal);
+        let first = add_local(&mut tree, "value", 10);
+        tree.add_decl_to_scope(root, first);
+        let other = add_local(&mut tree, "other", 20);
+        tree.add_decl_to_scope(root, other);
+        let second = add_local(&mut tree, "value", 30);
+        tree.add_decl_to_scope(root, second);
+
+        assert_eq!(found_position(&tree, "value", 10), None);
+        assert_eq!(found_position(&tree, "value", 20), Some(10));
+        assert_eq!(found_position(&tree, "value", 40), Some(30));
+    }
+
+    #[test]
+    fn files_child_declarations_regardless_of_link_order() {
+        let file_id = FileId::new(1);
+        let mut tree = LuaDeclarationTree::new(file_id);
+        let root = tree.create_scope(range(0, 200), LuaScopeKind::Normal);
+
+        let linked_first = tree.create_scope(range(10, 40), LuaScopeKind::FuncStat);
+        tree.add_child_scope(root, linked_first);
+        let first_decl = add_local(&mut tree, "value", 20);
+        tree.add_decl_to_scope(linked_first, first_decl);
+
+        let declared_first = tree.create_scope(range(50, 80), LuaScopeKind::FuncStat);
+        let second_decl = add_local(&mut tree, "value", 60);
+        tree.add_decl_to_scope(declared_first, second_decl);
+        tree.add_child_scope(root, declared_first);
+
+        assert_eq!(found_position(&tree, "value", 100), Some(60));
+    }
+
+    #[test]
+    fn preserves_direct_child_declaration_insertion_order() {
+        let file_id = FileId::new(1);
+        let mut tree = LuaDeclarationTree::new(file_id);
+        let root = tree.create_scope(range(0, 200), LuaScopeKind::Normal);
+        let child = tree.create_scope(range(20, 80), LuaScopeKind::FuncStat);
+        tree.add_child_scope(root, child);
+
+        // The declaration walker files children in traversal order. Keep that
+        // order even when their source positions arrive out of order.
+        let later = add_local(&mut tree, "value", 60);
+        tree.add_decl_to_scope(child, later);
+        let earlier = add_local(&mut tree, "value", 30);
+        tree.add_decl_to_scope(child, earlier);
+
+        assert_eq!(found_position(&tree, "value", 100), Some(60));
+    }
+
+    #[test]
+    fn local_assignment_scope_hides_its_declaration_from_its_rhs() {
+        let file_id = FileId::new(1);
+        let mut tree = LuaDeclarationTree::new(file_id);
+        let root = tree.create_scope(range(0, 100), LuaScopeKind::Normal);
+        let local_scope = tree.create_scope(range(20, 40), LuaScopeKind::LocalOrAssignStat);
+        tree.add_child_scope(root, local_scope);
+        let decl = add_local(&mut tree, "value", 30);
+        tree.add_decl_to_scope(local_scope, decl);
+
+        assert_eq!(found_position(&tree, "value", 25), None);
+        assert_eq!(found_position(&tree, "value", 50), Some(30));
+    }
+
+    #[test]
+    fn for_range_declaration_is_visible_in_body_after_header() {
+        let file_id = FileId::new(1);
+        let mut tree = LuaDeclarationTree::new(file_id);
+        let root = tree.create_scope(range(0, 200), LuaScopeKind::Normal);
+        let for_scope = tree.create_scope(range(20, 150), LuaScopeKind::ForRange);
+        tree.add_child_scope(root, for_scope);
+        let body = tree.create_scope(range(50, 140), LuaScopeKind::Normal);
+        tree.add_child_scope(for_scope, body);
+        let decl = add_local(&mut tree, "value", 25);
+        tree.add_decl_to_scope(for_scope, decl);
+
+        assert_eq!(found_position(&tree, "value", 30), None);
+        assert_eq!(found_position(&tree, "value", 60), Some(25));
     }
 }
