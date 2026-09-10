@@ -15,7 +15,7 @@ pub use closure::{analyze_return_point, derive_inferred_return_with_reads};
 use for_range_stat::analyze_for_range_stat;
 pub use for_range_stat::{infer_for_range_iter_expr_func, iterates_table_member_map};
 pub use func_body::LuaReturnPoint;
-use glua_parser::{LuaAst, LuaAstNode, LuaExpr};
+use glua_parser::{LuaAst, LuaAstNode, LuaExpr, with_syntax_resolver};
 pub(in crate::compilation::analyzer) use member_write_policy::alias_target_global_path;
 pub(in crate::compilation::analyzer) use member_write_policy::resolve_index_expr_member_owner_for_file;
 use member_write_policy::{
@@ -119,23 +119,25 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                         &special_call_direct_matcher,
                     );
                     let mut profile = node_profile_enabled.then(LuaAnalyzeProfile::default);
-                    for node in root.descendants::<LuaAst>() {
-                        if let Some(profile) = profile.as_mut() {
-                            let kind = lua_ast_profile_kind(&node);
-                            let node_start = Instant::now();
-                            analyze_node(&mut analyzer, node);
-                            profile.record(kind, node_start.elapsed());
-                        } else {
-                            analyze_node(&mut analyzer, node);
+                    with_syntax_resolver(root.syntax(), || {
+                        for node in root.descendants::<LuaAst>() {
+                            if let Some(profile) = profile.as_mut() {
+                                let kind = lua_ast_profile_kind(&node);
+                                let node_start = Instant::now();
+                                analyze_node(&mut analyzer, node);
+                                profile.record(kind, node_start.elapsed());
+                            } else {
+                                analyze_node(&mut analyzer, node);
+                            }
                         }
-                    }
-                    if let (Some(workspace_profile), Some(profile)) =
-                        (workspace_profile.as_mut(), profile.as_ref())
-                    {
-                        workspace_profile.merge(profile);
-                    }
-                    analyze_chunk_return(&mut analyzer, root.clone());
-                    flush_pending_dynamic_key_collection_widenings(&mut analyzer);
+                        if let (Some(workspace_profile), Some(profile)) =
+                            (workspace_profile.as_mut(), profile.as_ref())
+                        {
+                            workspace_profile.merge(profile);
+                        }
+                        analyze_chunk_return(&mut analyzer, root.clone());
+                        flush_pending_dynamic_key_collection_widenings(&mut analyzer);
+                    });
                     file_count += 1;
                     if let Some(file_start) = file_start {
                         let file_elapsed = file_start.elapsed();

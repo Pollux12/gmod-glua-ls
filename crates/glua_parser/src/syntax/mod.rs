@@ -62,23 +62,63 @@ impl From<rowan::SyntaxKind> for LuaTokenKind {
     }
 }
 
+/// Maximum number of resolved nodes retained by the compatibility memo for one
+/// root. Scoped resolvers keep their entries only until their scope ends.
+const MAX_ENTRIES_PER_ROOT: usize = 8192;
+
+/// A resolver for one red syntax root. Keeping the root alongside its
+/// nodes makes identity comparison sound for the resolver's lifetime.
+#[derive(Debug)]
+pub struct LuaSyntaxResolver {
+    root: LuaSyntaxNode,
+    entries: rustc_hash::FxHashMap<LuaSyntaxId, Option<LuaSyntaxNode>>,
+    bounded: bool,
+}
+
+impl LuaSyntaxResolver {
+    /// Creates a resolver whose cache is released when the resolver is dropped.
+    pub fn new(root: LuaSyntaxNode) -> Self {
+        Self {
+            root,
+            entries: rustc_hash::FxHashMap::default(),
+            bounded: false,
+        }
+    }
+
+    fn bounded(root: LuaSyntaxNode) -> Self {
+        Self {
+            root,
+            entries: rustc_hash::FxHashMap::default(),
+            bounded: true,
+        }
+    }
+
+    /// Resolves an id against this resolver's root, retaining the result.
+    pub fn resolve(&mut self, id: LuaSyntaxId) -> Option<LuaSyntaxNode> {
+        if let Some(hit) = self.entries.get(&id) {
+            return hit.clone();
+        }
+
+        let resolved = id.walk_from_root(&self.root);
+        if self.bounded && self.entries.len() >= MAX_ENTRIES_PER_ROOT {
+            self.entries.clear();
+        }
+        self.entries.insert(id, resolved.clone());
+        resolved
+    }
+}
+
 /// Per-thread memo for [`LuaSyntaxId::to_node_from_root`], keyed by root
 /// (MRU, a few roots kept). Holding each root alive keeps its green tree
 /// alive, which is what makes identity comparison sound.
 mod node_memo {
-    use super::{LuaSyntaxId, LuaSyntaxNode};
-    use rustc_hash::FxHashMap;
+    use super::{LuaSyntaxId, LuaSyntaxNode, LuaSyntaxResolver};
 
     const MAX_ROOTS: usize = 4;
-    /// Each entry pins a red node, which holds an rc on its whole ancestor
-    /// chain, so a long-lived thread would otherwise retain most of a large
-    /// tree. Clearing beats evicting: the memo only pays off within one
-    /// traversal, so a fresh map costs a re-walk, not a lasting miss.
-    const MAX_ENTRIES_PER_ROOT: usize = 8192;
 
     #[derive(Default)]
     pub(super) struct NodeMemo {
-        roots: Vec<(LuaSyntaxNode, FxHashMap<LuaSyntaxId, Option<LuaSyntaxNode>>)>,
+        roots: Vec<LuaSyntaxResolver>,
     }
 
     impl NodeMemo {
@@ -87,7 +127,7 @@ mod node_memo {
             id: LuaSyntaxId,
             root: &LuaSyntaxNode,
         ) -> Option<LuaSyntaxNode> {
-            let found = self.roots.iter().position(|(cached, _)| cached == root);
+            let found = self.roots.iter().position(|cached| cached.root == *root);
             let index = match found {
                 Some(0) => 0,
                 Some(index) => {
@@ -98,21 +138,13 @@ mod node_memo {
                     if self.roots.len() == MAX_ROOTS {
                         self.roots.pop();
                     }
-                    self.roots.insert(0, (root.clone(), FxHashMap::default()));
+                    self.roots
+                        .insert(0, LuaSyntaxResolver::bounded(root.clone()));
                     0
                 }
             };
 
-            if let Some(hit) = self.roots[index].1.get(&id) {
-                return hit.clone();
-            }
-            let resolved = id.walk_from_root(root);
-            let entries = &mut self.roots[index].1;
-            if entries.len() >= MAX_ENTRIES_PER_ROOT {
-                entries.clear();
-            }
-            entries.insert(id, resolved.clone());
-            resolved
+            self.roots[index].resolve(id)
         }
     }
 }
@@ -120,6 +152,188 @@ mod node_memo {
 thread_local! {
     static NODE_MEMO: std::cell::RefCell<node_memo::NodeMemo> =
         std::cell::RefCell::new(node_memo::NodeMemo::default());
+    static SCOPED_RESOLVERS: std::cell::RefCell<Vec<ScopedResolvers>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static SCOPED_RESOLVERS_ACTIVE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[derive(Default)]
+struct ScopedResolvers {
+    resolvers: rustc_hash::FxHashMap<LuaSyntaxNode, LuaSyntaxResolver>,
+}
+
+impl ScopedResolvers {
+    fn new(root: Option<&LuaSyntaxNode>) -> Self {
+        Self {
+            resolvers: root
+                .map(|root| (root.clone(), LuaSyntaxResolver::new(root.clone())))
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn resolve_existing(
+        &mut self,
+        id: LuaSyntaxId,
+        root: &LuaSyntaxNode,
+    ) -> Option<Option<LuaSyntaxNode>> {
+        self.resolvers
+            .get_mut(root)
+            .map(|resolver| resolver.resolve(id))
+    }
+
+    fn resolve_new(
+        &mut self,
+        id: LuaSyntaxId,
+        root: &LuaSyntaxNode,
+    ) -> Option<Option<LuaSyntaxNode>> {
+        Some(
+            self.resolvers
+                .entry(root.clone())
+                .or_insert_with(|| LuaSyntaxResolver::new(root.clone()))
+                .resolve(id),
+        )
+    }
+}
+
+fn with_scoped_resolvers<R>(root: Option<&LuaSyntaxNode>, f: impl FnOnce() -> R) -> R {
+    SCOPED_RESOLVERS.with(|resolvers| {
+        resolvers.borrow_mut().push(ScopedResolvers::new(root));
+    });
+    let was_active = SCOPED_RESOLVERS_ACTIVE.with(|active| active.replace(true));
+
+    struct Scope {
+        was_active: bool,
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            SCOPED_RESOLVERS.with(|resolvers| {
+                resolvers.borrow_mut().pop();
+            });
+            SCOPED_RESOLVERS_ACTIVE.with(|active| active.set(self.was_active));
+        }
+    }
+
+    let _scope = Scope { was_active };
+    f()
+}
+
+/// Runs `f` with lazily created root resolvers scoped to the current thread.
+///
+/// Use this when the callback creates its own red roots. Each root is retained
+/// only until the scope ends.
+pub fn with_syntax_resolvers<R>(f: impl FnOnce() -> R) -> R {
+    with_scoped_resolvers(None, f)
+}
+
+/// Runs `f` with a resolver scoped to `root` on the current thread.
+///
+/// Nested scopes select the innermost matching root and are removed on normal
+/// or unwinding exit.
+pub fn with_syntax_resolver<R>(root: &LuaSyntaxNode, f: impl FnOnce() -> R) -> R {
+    with_scoped_resolvers(Some(root), f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{LuaParser, ParserConfig};
+
+    fn parsed_root(source: &str) -> LuaSyntaxNode {
+        LuaParser::parse(source, ParserConfig::default()).get_red_root()
+    }
+
+    #[test]
+    fn scoped_resolver_routes_matching_root_and_drops_after_scope() {
+        let root = parsed_root("local value = 1\n");
+        let id = LuaSyntaxId::from_node(&root.descendants().next().unwrap());
+
+        with_syntax_resolver(&root, || {
+            assert!(id.to_node_from_root(&root).is_some());
+            SCOPED_RESOLVERS.with(|scopes| {
+                assert_eq!(scopes.borrow()[0].resolvers[&root].entries.len(), 1);
+            });
+        });
+
+        SCOPED_RESOLVERS.with(|resolvers| assert!(resolvers.borrow().is_empty()));
+    }
+
+    #[test]
+    fn scoped_resolver_supports_nested_roots_and_exact_matching() {
+        let outer_root = parsed_root("local outer = 1\n");
+        let inner_root = parsed_root("-- shift\nlocal inner = 2\n");
+        let equivalent_root = parsed_root("local outer = 1\n");
+        let outer_id = LuaSyntaxId::from_node(&outer_root.descendants().next().unwrap());
+        let inner_id = LuaSyntaxId::from_node(&inner_root.descendants().next().unwrap());
+
+        with_syntax_resolver(&outer_root, || {
+            assert!(outer_id.to_node_from_root(&outer_root).is_some());
+            with_syntax_resolver(&inner_root, || {
+                assert!(inner_id.to_node_from_root(&inner_root).is_some());
+                assert!(outer_id.to_node_from_root(&outer_root).is_some());
+                SCOPED_RESOLVERS.with(|scopes| {
+                    let scopes = scopes.borrow();
+                    assert_eq!(scopes.len(), 2);
+                    assert_eq!(scopes[0].resolvers.len(), 1);
+                    assert_eq!(scopes[1].resolvers.len(), 1);
+                    assert!(!scopes[0].resolvers.contains_key(&equivalent_root));
+                });
+            });
+            SCOPED_RESOLVERS.with(|resolvers| assert_eq!(resolvers.borrow().len(), 1));
+        });
+    }
+
+    #[test]
+    fn scoped_resolver_drops_after_panic() {
+        let root = parsed_root("local value = 1\n");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_syntax_resolver(&root, || panic!("test resolver scope"));
+        }));
+
+        assert!(result.is_err());
+        SCOPED_RESOLVERS.with(|resolvers| assert!(resolvers.borrow().is_empty()));
+    }
+
+    #[test]
+    fn lazy_scoped_resolver_handles_roots_rebuilt_from_one_tree() {
+        let tree = LuaParser::parse("local value = 1\n", ParserConfig::default());
+        let first_root = tree.get_red_root();
+        let second_root = tree.get_red_root();
+        let id = LuaSyntaxId::from_node(&first_root.descendants().next().unwrap());
+
+        with_syntax_resolvers(|| {
+            assert!(id.to_node_from_root(&first_root).is_some());
+            assert!(id.to_node_from_root(&second_root).is_some());
+        });
+
+        SCOPED_RESOLVERS.with(|resolvers| assert!(resolvers.borrow().is_empty()));
+    }
+
+    #[test]
+    fn lazy_scope_retains_each_tree_until_the_phase_ends() {
+        let roots = (0..8)
+            .map(|index| parsed_root(&format!("local value{index} = {index}\n")))
+            .collect::<Vec<_>>();
+        with_syntax_resolvers(|| {
+            for root in roots.iter().chain(roots.iter().rev()) {
+                let id = LuaSyntaxId::from_node(&root.descendants().next().unwrap());
+                assert!(id.to_node_from_root(root).is_some());
+            }
+            SCOPED_RESOLVERS.with(|scopes| {
+                let scopes = scopes.borrow();
+                assert_eq!(scopes[0].resolvers.len(), roots.len());
+                assert!(
+                    scopes[0]
+                        .resolvers
+                        .values()
+                        .all(|resolver| resolver.entries.len() == 1)
+                );
+            });
+        });
+        SCOPED_RESOLVERS.with(|scopes| assert!(scopes.borrow().is_empty()));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -185,6 +399,20 @@ impl LuaSyntaxId {
     /// Resolve this id to its node, memoized per thread: an uncached walk
     /// allocates a red node per nesting level.
     pub fn to_node_from_root(&self, root: &LuaSyntaxNode) -> Option<LuaSyntaxNode> {
+        if SCOPED_RESOLVERS_ACTIVE.with(std::cell::Cell::get) {
+            let scoped_result = SCOPED_RESOLVERS.with(|scopes| {
+                let mut scopes = scopes.borrow_mut();
+                for scope in scopes.iter_mut().rev() {
+                    if let Some(result) = scope.resolve_existing(*self, root) {
+                        return Some(result);
+                    }
+                }
+                scopes.last_mut()?.resolve_new(*self, root)
+            });
+            if let Some(result) = scoped_result {
+                return result;
+            }
+        }
         NODE_MEMO.with(|memo| memo.borrow_mut().resolve(*self, root))
     }
 
