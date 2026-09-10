@@ -1102,22 +1102,26 @@ mod tests {
             .update_file_by_uri(&content_container_uri, None)
             .map(|(id, _)| id)
             .expect("forwarding helper file should exist");
-        let metadata = ws
-            .analysis
-            .compilation
-            .get_db()
-            .get_gmod_class_metadata_index();
-        assert!(
-            metadata
-                .get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("ContentHeader"))
-                .is_none(),
-            "forwarded parent metadata must be invalidated when the helper is deleted"
-        );
-        assert!(
-            metadata
-                .get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("ContentIcon"))
-                .is_none()
-        );
+        let parent_chains = |ws: &VirtualWorkspace| {
+            ["ContentHeader", "ContentIcon"].map(|name| {
+                ws.analysis
+                    .compilation
+                    .get_db()
+                    .get_gmod_class_metadata_index()
+                    .get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global(name))
+                    .map(|chain| chain.to_vec())
+            })
+        };
+        let after_deletion = parent_chains(&ws);
+        for chain in &after_deletion {
+            assert_eq!(
+                chain.as_deref(),
+                Some([crate::LuaTypeDeclId::global("ContentContainer")].as_slice()),
+                "the inherited Panel:Add replaces the deleted forwarding override"
+            );
+        }
+        ws.analysis.reindex();
+        assert_eq!(parent_chains(&ws), after_deletion);
     }
 
     #[test]

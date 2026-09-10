@@ -35,7 +35,7 @@ pub use signature::{
     visit_call_arg_roles_from_type,
 };
 
-use crate::{FileId, GmodStateMask, LuaType, TypeVisitTrait, db_index::LuaDeclId};
+use crate::{FileId, GmodStateMask, LuaType, db_index::LuaDeclId};
 
 use super::traits::LuaIndex;
 
@@ -566,7 +566,7 @@ impl LuaSignatureIndex {
     pub(crate) fn snapshot_payload_refs(&mut self, holder: FileId) {
         let mut sources = HashSet::default();
         let mut collect = |ty: &LuaType| {
-            ty.visit_type(&mut |inner| match inner {
+            ty.visit_type_identities(&mut |inner| match inner {
                 LuaType::TableConst(range) => {
                     if range.file_id != holder {
                         sources.insert(range.file_id);
