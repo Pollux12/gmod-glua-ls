@@ -320,7 +320,9 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
         // Resolving deferred items mutates type/member indexes, so any inference
         // cached while resolution was still in progress can be stale.
         if had_unresolves {
-            crate::profile::phase("unresolve/infer_manager_clear", || infer_manager.clear());
+            crate::profile::phase("unresolve/infer_manager_clear", || {
+                infer_manager.clear_for_settle(db)
+            });
         }
 
         // Return the infer_manager so later phases (e.g. dynamic field) can
@@ -590,7 +592,7 @@ pub(super) fn settle_floored_fixpoint(
             parked.clear();
             break;
         }
-        infer_manager.clear();
+        infer_manager.clear_for_settle(db);
         let attempted: usize = reason_resolve.values().map(Vec::len).sum();
         try_resolve(
             db,

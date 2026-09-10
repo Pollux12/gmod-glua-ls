@@ -101,6 +101,17 @@ impl InferCacheManager {
         }
     }
 
+    /// Clears inference results between floored settle rounds while retaining
+    /// the structural lookups that remain valid for this analysis context.
+    /// Branch special-call answers are derived from a mutable effect index, so
+    /// they must not cross the boundary with the structural caches.
+    pub fn clear_for_settle(&mut self, db: &DbIndex) {
+        for infer_cache in self.infer_map.values_mut() {
+            infer_cache.clear_for_unresolve(db);
+            infer_cache.branch_special_call_effect_cache.clear();
+        }
+    }
+
     pub fn drain_pending_str_tpl_type_decls(&mut self) -> Vec<PendingStrTplTypeDecl> {
         let mut pending = Vec::new();
 
@@ -251,5 +262,43 @@ mod tests {
             Some(crate::CacheEntry::Cache(crate::LuaType::String))
         ));
         assert!(restored.get_config().analysis_phase.is_force());
+    }
+
+    #[test]
+    fn clear_for_settle_retains_structural_lookup_but_clears_results() {
+        let file_id = FileId::new(7);
+        let syntax_id = glua_parser::LuaSyntaxId::new(
+            glua_parser::LuaSyntaxKind::NameExpr.into(),
+            rowan::TextRange::new(3.into(), 4.into()),
+        );
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+        cache.decl_name_index = Some(rustc_hash::FxHashMap::default());
+        cache
+            .flow_node_realm_cache
+            .insert(crate::FlowId(1), crate::GmodRealm::Server);
+        cache
+            .expr_cache
+            .insert(syntax_id, crate::CacheEntry::Cache(crate::LuaType::Integer));
+        cache.branch_special_call_effect_cache.insert(
+            (
+                crate::FlowId(1),
+                crate::FlowId(2),
+                (&crate::VarRefId::VarRef(crate::LuaDeclId::new(file_id, 3.into()))).into(),
+            ),
+            true,
+        );
+
+        let mut manager = InferCacheManager::new();
+        manager.restore_file(file_id, cache);
+        manager.clear_for_settle(&DbIndex::new());
+
+        let cache = manager.take_file(file_id).expect("cache was retained");
+        assert!(cache.decl_name_index.is_some());
+        assert_eq!(
+            cache.flow_node_realm_cache.get(&crate::FlowId(1)),
+            Some(&crate::GmodRealm::Server)
+        );
+        assert!(cache.expr_cache.is_empty());
+        assert!(cache.branch_special_call_effect_cache.is_empty());
     }
 }
