@@ -376,6 +376,50 @@ mod test {
         assert_that!(wrapped_flow.send_range, eq(wrapped_flow.start_range));
     }
 
+    #[test]
+    fn network_flows_follow_cross_file_alias_edit_delete_and_reopen() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let alias_path = "addons/mytest/lua/autorun/server/a_alias.lua";
+        let alias_id = ws.def_file(alias_path, "WritePayload = net.WriteString");
+        let sender_id = ws.def_file(
+            "addons/mytest/lua/autorun/server/b_sender.lua",
+            "net.Start(\"AliasMessage\")\nWritePayload(1)\nnet.Broadcast()",
+        );
+        let writes = |ws: &VirtualWorkspace| {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_gmod_network_index()
+                .get_file_data(sender_id)
+                .into_iter()
+                .flat_map(|data| &data.send_flows)
+                .flat_map(send_op_kinds)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(writes(&ws), vec!["string"]);
+
+        let alias_uri = ws.virtual_url_generator.new_uri(alias_path);
+        ws.analysis
+            .update_file_text_only(&alias_uri, "WritePayload = net.WriteBool".into());
+        ws.analysis
+            .reindex_expanded_files(vec![alias_id], vec![alias_id, sender_id]);
+        assert_eq!(writes(&ws), vec!["bool"]);
+        let incremental = writes(&ws);
+        ws.analysis.reindex();
+        assert_eq!(writes(&ws), incremental);
+
+        ws.analysis.update_file_by_uri(&alias_uri, None);
+        ws.analysis
+            .reindex_expanded_files(vec![alias_id], vec![alias_id, sender_id]);
+        assert!(writes(&ws).is_empty());
+
+        let reopened_id = ws.def_file(alias_path, "WritePayload = net.WriteString");
+        ws.analysis
+            .reindex_expanded_files(vec![reopened_id], vec![reopened_id, sender_id]);
+        assert_eq!(writes(&ws), vec!["string"]);
+    }
+
     #[gtest]
     fn test_send_flow_through_two_local_wrapper_levels() {
         let mut ws = VirtualWorkspace::new();
