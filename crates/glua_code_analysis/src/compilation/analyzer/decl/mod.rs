@@ -81,6 +81,7 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
                 scoped_class_info,
             );
             analyzer.analyze();
+            let assignment_sites = analyzer.take_assignment_sites();
             let decl_tree = analyzer.get_decl_tree();
             // Register the scoped class type (must happen during decl, before doc/flow phases)
             if let Some(scripted_scope_infos) = scripted_scope_infos.as_ref()
@@ -96,25 +97,25 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
             db.get_decl_index_mut().add_decl_tree(decl_tree);
 
             let reassignments =
-                collect_local_reassignments(db, in_filed_tree.file_id, &in_filed_tree.value);
+                collect_local_reassignments(db, in_filed_tree.file_id, &assignment_sites);
             db.get_reference_index_mut()
                 .set_local_reassignments(in_filed_tree.file_id, reassignments);
         }
     }
 }
 
-/// Where each local declared in `file_id` is first reassigned. Derived from the
-/// file's own syntax tree, local references and declaration tree, all of which
-/// are complete for the file at this point in the decl walk.
+/// Where each local declared in `file_id` is first reassigned. The assignment
+/// sites are collected during the declaration walk and resolved after the
+/// file's references and declaration tree are complete.
 fn collect_local_reassignments(
     db: &DbIndex,
     file_id: FileId,
-    chunk: &LuaChunk,
+    assignment_sites: &[LuaAssignStat],
 ) -> rustc_hash::FxHashMap<LuaDeclId, TextSize> {
     let mut positions = rustc_hash::FxHashMap::default();
     let references = db.get_reference_index().get_local_reference(&file_id);
     let decl_tree = db.get_decl_index().get_decl_tree(&file_id);
-    for assign_stat in chunk.syntax().descendants().filter_map(LuaAssignStat::cast) {
+    for assign_stat in assignment_sites {
         let position = assign_stat.get_position();
 
         let (vars, _) = assign_stat.get_var_and_expr_list();
@@ -173,6 +174,7 @@ fn walk_node_enter(analyzer: &mut DeclAnalyzer, node: LuaAst) {
         }
         LuaAst::LuaAssignStat(stat) => {
             analyzer.create_scope(stat.get_range(), LuaScopeKind::LocalOrAssignStat);
+            analyzer.assignment_sites.push(stat.clone());
             stats::analyze_assign_stat(analyzer, stat);
         }
         LuaAst::LuaForStat(stat) => {
@@ -288,6 +290,7 @@ pub struct DeclAnalyzer<'a> {
     scoped_class_global_names: Option<FxHashSet<String>>,
     seeded_scoped_class_decl: bool,
     legacy_module_envs: Vec<LegacyModuleEnv>,
+    assignment_sites: Vec<LuaAssignStat>,
     scopes: Vec<LuaScopeId>,
     is_meta: bool,
     context: &'a mut AnalyzeContext,
@@ -316,6 +319,7 @@ impl<'a> DeclAnalyzer<'a> {
             scoped_class_global_names,
             seeded_scoped_class_decl: false,
             legacy_module_envs: Vec::new(),
+            assignment_sites: Vec::new(),
             scopes: Vec::new(),
             is_meta: false,
             context,
@@ -342,6 +346,10 @@ impl<'a> DeclAnalyzer<'a> {
 
     pub fn get_decl_tree(self) -> LuaDeclarationTree {
         self.decl
+    }
+
+    fn take_assignment_sites(&mut self) -> Vec<LuaAssignStat> {
+        std::mem::take(&mut self.assignment_sites)
     }
 
     pub fn create_scope(&mut self, range: TextRange, kind: LuaScopeKind) {
