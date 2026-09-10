@@ -596,6 +596,9 @@ async function main() {
 // comparison and never fail; these two are defects whatever the latency was.
 function failedChecks(report) {
     const failures = [];
+    if (report.checks.completionItemCount === 0) {
+        failures.push('completion probe returned no items; select a real member access with --completion-find');
+    }
     if (report.checks.thinReportsOnCancel > 0) {
         failures.push(`${report.checks.thinReportsOnCancel} cancelled diagnostic pull(s) came `
             + 'back thinner than the settled report, which drops diagnostics in the editor');
