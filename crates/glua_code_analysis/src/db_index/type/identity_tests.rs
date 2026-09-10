@@ -2,6 +2,39 @@ use super::*;
 use crate::{FileRemap, LuaMemberKey, PositionMap};
 use std::collections::BTreeMap;
 
+#[test]
+fn owners_referencing_file_are_unique_across_identities() {
+    let provider = FileId::new(1);
+    let consumer = FileId::new(2);
+    let other_consumer = FileId::new(3);
+    let table = LuaType::TableConst(InFiled::new(provider, TextRange::new(2.into(), 4.into())));
+    let signature = LuaType::Signature(LuaSignatureId::new(provider, 8.into()));
+    let mut index = TypeCacheRefIndex::default();
+    index.add(consumer, &table);
+    index.add(consumer, &signature);
+    index.add(other_consumer, &table);
+
+    let mut owners: Vec<_> = index.owners_referencing_file(provider).collect();
+    owners.sort_unstable();
+    assert_eq!(owners, vec![consumer, other_consumer]);
+
+    index.remove(consumer, &table);
+    assert_eq!(index.owners_referencing_file(provider).count(), 2);
+    index.remove_file(consumer);
+    assert_eq!(
+        index.owners_referencing_file(provider).collect::<Vec<_>>(),
+        vec![other_consumer]
+    );
+    index.remove_file(other_consumer);
+    assert_eq!(index.owners_referencing_file(provider).count(), 0);
+
+    index.add(consumer, &signature);
+    assert_eq!(
+        index.owners_referencing_file(provider).collect::<Vec<_>>(),
+        vec![consumer]
+    );
+}
+
 fn nested_types(inner: LuaType) -> Vec<LuaType> {
     let param = GenericParam::new("T".into(), Some(inner.clone()), None);
     let tpl = Arc::new(GenericTpl::new(
