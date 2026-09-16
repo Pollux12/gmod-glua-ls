@@ -1725,6 +1725,26 @@ impl LuaTypeIndex {
         self.full_name_type_map.get(decl_id)
     }
 
+    /// Whether some non-auto declaration already owns this name.
+    ///
+    /// Synthesizers that attach edges to a class they are materializing (the
+    /// call-site str-tpl paths, `scripted_ents.Register`/panel classes) must
+    /// ask this before writing, because their own decision would otherwise
+    /// depend on whether a *different* pass created the declaration first:
+    /// the same call would attach an edge in one pass order and skip it in
+    /// another, and the edge's `(file, range, type)` dedup key makes the
+    /// replay novel. Attaching only to a name nothing else has declared makes
+    /// the result a function of the settled declaration set instead of the
+    /// order in which it was built.
+    ///
+    /// This is deliberately kind-agnostic: an `---@alias`/`---@enum` that
+    /// shadowed the name is as much an owner as a `---@class`, and the caller
+    /// has no class to attach a super to in that case anyway.
+    pub fn has_non_auto_declaration(&self, decl_id: &LuaTypeDeclId) -> bool {
+        self.get_type_decl(decl_id)
+            .is_some_and(|decl| !decl.is_auto_generated())
+    }
+
     pub fn get_all_types(&self) -> Vec<&LuaTypeDecl> {
         self.full_name_type_map.values().collect()
     }

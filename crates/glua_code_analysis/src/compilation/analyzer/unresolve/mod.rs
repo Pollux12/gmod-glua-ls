@@ -694,7 +694,6 @@ fn requeue_flushed_call_site_returns(
 
 fn materialize_pending_str_tpl_type_decls(db: &mut DbIndex, infer_manager: &mut InferCacheManager) {
     let pending_type_decls = infer_manager.drain_pending_str_tpl_type_decls();
-
     for pending in pending_type_decls {
         // A re-drained identical decl replays the same materialization: only a
         // novel decl or super edge may bump the special-call epoch, keyed by
@@ -718,13 +717,24 @@ fn materialize_pending_str_tpl_type_decls(db: &mut DbIndex, infer_manager: &mut 
                 ),
             );
         }
-
-        novel |= db.get_type_index_mut().add_super_type_if_missing(
-            pending.type_decl_id.clone(),
-            pending.file_id,
-            pending.source_range,
-            pending.super_type,
-        );
+        // The Register synthesis owns a decl once it exists as a real
+        // declaration: the pending edge was queued against a view in which the
+        // class was still missing, and its (file, range) dedup key is novel
+        // even when the (class, super) pair is one the settled build never
+        // stores. Attaching it would make the super set a function of whether
+        // the drain ran before or after synthesis. This mirrors the direct
+        // call-site gate in `materialize_str_tpl_class_from_call`.
+        let register_owned = db
+            .get_type_index()
+            .has_non_auto_declaration(&pending.type_decl_id);
+        if !register_owned {
+            novel |= db.get_type_index_mut().add_super_type_if_missing(
+                pending.type_decl_id.clone(),
+                pending.file_id,
+                pending.source_range,
+                pending.super_type,
+            );
+        }
         if novel {
             db.get_flow_index_mut()
                 .note_special_call_write(pending.file_id, pending.source_range.start());
@@ -1707,8 +1717,8 @@ mod tests {
     use rowan::TextSize;
 
     use crate::{
-        DbIndex, FileId, InferFailReason, LuaDeclId, LuaMemberId, LuaSignatureId, LuaType,
-        LuaTypeCache, LuaTypeDeclId,
+        DbIndex, FileId, InferFailReason, LuaDeclId, LuaDeclTypeKind, LuaMemberId, LuaSignatureId,
+        LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag,
     };
 
     use super::{
@@ -2076,5 +2086,43 @@ mod tests {
         db.get_dynamic_field_index_mut()
             .note_dynamic_write(owner, None);
         assert!(!fixpoint_reads_are_stale(&db, &record));
+    }
+    /// A pending str-tpl edge queued before its Register synthesis runs must
+    /// not materialize: the Register pass owns the decl once it exists, and
+    /// the pending edge's (file, range) dedup key is novel even when the
+    /// (class, super) pair is one the cold build never stores. Draining the
+    /// same two pendings after the synthesis must leave the super set empty.
+    #[test]
+    fn pending_str_tpl_edge_queued_before_register_synthesis_stays_absent() {
+        use rowan::TextRange;
+        let mut db = DbIndex::new();
+        let mut infer_manager = super::super::infer_cache_manager::InferCacheManager::new();
+        let file_id = FileId::new(3);
+        let class_id = LuaTypeDeclId::global("sizehandler");
+        let cache = infer_manager.get_infer_cache(file_id);
+        cache.add_pending_str_tpl_type_decl(
+            TextRange::new(10.into(), 20.into()),
+            class_id.clone(),
+            LuaType::Ref(LuaTypeDeclId::global("Entity")),
+        );
+        // Register synthesis ran first: the decl exists and is NOT
+        // auto-generated, exactly as `synthesize_scripted_ent_registration`
+        // leaves it.
+        db.get_type_index_mut().add_type_decl(
+            file_id,
+            LuaTypeDecl::new(
+                file_id,
+                TextRange::new(30.into(), 40.into()),
+                "sizehandler".to_string(),
+                LuaDeclTypeKind::Class,
+                LuaTypeFlag::None.into(),
+                class_id.clone(),
+            ),
+        );
+        super::materialize_pending_str_tpl_type_decls(&mut db, &mut infer_manager);
+        assert!(
+            db.get_type_index().get_super_types(&class_id).is_none(),
+            "pending edge must not attach once Register owns the decl"
+        );
     }
 }
