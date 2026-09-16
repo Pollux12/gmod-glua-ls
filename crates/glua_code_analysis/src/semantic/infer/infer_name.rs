@@ -541,6 +541,15 @@ fn try_infer_enclosing_for_range_iter_type(
         .get_type(var_idx)
         .cloned()
         .unwrap_or(LuaType::Unknown);
+    let ret_type = if ret_type.contain_tpl() {
+        if let Some(Some(proven)) = iter_var_types.settled_overrides.get(var_idx) {
+            proven.clone()
+        } else {
+            ret_type
+        }
+    } else {
+        ret_type
+    };
     let ret_type = TypeOps::Remove.apply(db, &ret_type, &LuaType::Nil);
     cache
         .for_range_iter_var_type_cache
@@ -807,9 +816,7 @@ fn infer_implicit_method_self_type_inner(
     // A colon method selected as a raw table member can be invoked with an
     // explicit receiver (`callback(self, ...)`). Call-site analysis stores that
     // receiver in the synthetic slot immediately after the explicit params.
-    if let Some(call_site_type) =
-        infer_implicit_self_type_from_call_site(db, cache.get_file_id(), name_expr)
-    {
+    if let Some(call_site_type) = infer_implicit_self_type_from_call_site(db, cache, name_expr) {
         return Some(call_site_type);
     }
 
@@ -822,9 +829,13 @@ fn infer_implicit_method_self_type_inner(
 
 fn infer_implicit_self_type_from_call_site(
     db: &DbIndex,
-    file_id: FileId,
+    cache: &LuaInferCache,
     name_expr: &LuaNameExpr,
 ) -> Option<LuaType> {
+    if !cache.get_config().call_site_params_visible {
+        return None;
+    }
+    let file_id = cache.get_file_id();
     let closure = name_expr.ancestors::<LuaClosureExpr>().next()?;
     let signature_id = LuaSignatureId::from_closure(file_id, &closure);
     let signature = db.get_signature_index().get(&signature_id)?;

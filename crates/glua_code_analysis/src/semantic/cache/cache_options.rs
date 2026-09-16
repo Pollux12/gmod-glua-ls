@@ -6,6 +6,8 @@ pub struct CacheOptions {
     /// Whether this cache belongs to the dynamic-field collection pass
     /// itself.
     pub building_dynamic_field_index: bool,
+    /// Whether inference may consult call-site parameter and receiver facts.
+    pub call_site_params_visible: bool,
 }
 
 impl Default for CacheOptions {
@@ -14,6 +16,7 @@ impl Default for CacheOptions {
             analysis_phase: LuaAnalysisPhase::default(),
             dynamic_fields_visible: true,
             building_dynamic_field_index: false,
+            call_site_params_visible: true,
         }
     }
 }

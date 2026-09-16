@@ -963,6 +963,7 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Ha
     let mut type_refs: Vec<crate::TypeCacheRef> = vec![crate::TypeCacheRef::Module(file_id)];
     let mut nodes: Vec<LuaInferenceNodeId> = Vec::new();
     let mut signatures: Vec<LuaSignatureId> = Vec::new();
+    let mut return_consumer_signatures: Vec<LuaSignatureId> = Vec::new();
     // Each owner, and whether any key naming it appeared or vanished. One
     // entry per owner: a file with a thousand writes to one slot names that
     // owner a thousand times, and the member enumeration below is per owner,
@@ -1012,12 +1013,14 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Ha
             ExportKey::Signature(signature_id) => {
                 type_refs.push(crate::TypeCacheRef::Signature(*signature_id));
                 signatures.push(*signature_id);
+                return_consumer_signatures.push(*signature_id);
             }
             ExportKey::ContributedParam(signature_id, param_idx) => {
                 nodes.push(LuaInferenceNodeId::SignatureParam {
                     signature_id: *signature_id,
                     param_idx: *param_idx,
                 });
+                return_consumer_signatures.push(*signature_id);
             }
             ExportKey::InferredGuard(owner) => {
                 signatures.push(owner.signature_id());
@@ -1037,6 +1040,7 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Ha
                 LuaSemanticDeclId::Signature(signature_id) => {
                     type_refs.push(crate::TypeCacheRef::Signature(*signature_id));
                     signatures.push(*signature_id);
+                    return_consumer_signatures.push(*signature_id);
                 }
             },
             ExportKey::Operator(owner, _) => match owner {
@@ -1117,6 +1121,13 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Ha
         db.get_signature_index()
             .settled_read_dependents_for_signatures(&signatures),
     );
+    let sig_set = return_consumer_signatures
+        .iter()
+        .copied()
+        .collect::<rustc_hash::FxHashSet<_>>();
+    for consumer in call_site_index.get_return_consumers(&sig_set) {
+        dependents.insert(consumer.file_id);
+    }
     let sources: Vec<crate::CallSiteSourceId> = signatures
         .iter()
         .map(|id| crate::CallSiteSourceId::Signature(*id))

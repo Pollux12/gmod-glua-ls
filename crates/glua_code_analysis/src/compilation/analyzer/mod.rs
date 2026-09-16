@@ -186,6 +186,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);
 
         run_analysis::<call_site_params::CallSiteParamAnalysisPipeline>(db, &mut context);
+        context.infer_manager.set_call_site_params_visible();
 
         let call_site_return_invalidation_changed = context.call_site_return_invalidation_changed;
         let late_guard_retries = context.inferred_guard_candidates.len();
@@ -407,7 +408,11 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                 if net_moved.is_empty() && !non_type_progressed {
                     break;
                 }
-                moved_owners = Some(net_moved);
+                moved_owners = if non_type_progressed {
+                    None
+                } else {
+                    Some(net_moved)
+                };
             }
             context.settled_iter_var_candidates.clear();
             context.settled_global_read_candidates.clear();
@@ -801,6 +806,7 @@ fn rederive_settled_iter_vars(
 
     let analysis_phase = context.infer_manager.current_phase();
     let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
+    let call_site_params_visible = context.infer_manager.call_site_params_visible();
 
     // Inference reads the settled indexes and records candidate type writes
     // without mutating the database. The results come back in `file_ids` order,
@@ -814,6 +820,7 @@ fn rederive_settled_iter_vars(
                 analysis_phase,
                 dynamic_fields_visible,
                 building_dynamic_field_index: false,
+                call_site_params_visible,
             },
         );
         let mut result = IterVarRefreshResult::new(file_id);
@@ -978,6 +985,7 @@ fn refresh_settled_expr_type_member_keys(
 
     let analysis_phase = context.infer_manager.current_phase();
     let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
+    let call_site_params_visible = context.infer_manager.call_site_params_visible();
 
     // Read-only per file, applied on the caller thread in file and source
     // order, like every other settled pass.
@@ -988,6 +996,7 @@ fn refresh_settled_expr_type_member_keys(
                 analysis_phase,
                 dynamic_fields_visible,
                 building_dynamic_field_index: false,
+                call_site_params_visible,
             },
         );
         let Some(root) = db
@@ -1522,6 +1531,7 @@ fn rederive_settled_assign_reads(
         .collect::<HashSet<_>>();
     let analysis_phase = context.infer_manager.current_phase();
     let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
+    let call_site_params_visible = context.infer_manager.call_site_params_visible();
     context.infer_manager.clear_files_deferred_results(&files);
     context.infer_manager.clear_files_flow_results(&files);
 
@@ -1538,6 +1548,7 @@ fn rederive_settled_assign_reads(
                         analysis_phase,
                         dynamic_fields_visible,
                         building_dynamic_field_index: false,
+                        call_site_params_visible,
                     },
                 )
             });
@@ -2299,6 +2310,7 @@ fn refresh_decl_initializer_caches(
     }
     let analysis_phase = context.infer_manager.current_phase();
     let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
+    let call_site_params_visible = context.infer_manager.call_site_params_visible();
     let pass_is_settled = pass.is_settled();
 
     // Initializer inference reads the stabilized indexes and records candidate
@@ -2312,6 +2324,7 @@ fn refresh_decl_initializer_caches(
                 analysis_phase,
                 dynamic_fields_visible,
                 building_dynamic_field_index: false,
+                call_site_params_visible,
             },
         );
         let Some(root) = db
@@ -2392,6 +2405,10 @@ fn refresh_decl_initializer_caches(
                 && !can_upgrade_authority
                 && !cached_a_provisional_slot_union
                 && !cached_an_unsettled_union
+                && !matches!(
+                    current_cache.as_ref().map(LuaTypeCache::as_type),
+                    Some(LuaType::Tuple(_))
+                )
             {
                 continue;
             }
@@ -2441,6 +2458,7 @@ fn refresh_decl_initializer_caches(
                             analysis_phase,
                             dynamic_fields_visible: false,
                             building_dynamic_field_index: false,
+                            call_site_params_visible,
                         },
                     );
                     let blind_type = select_result_fact(
@@ -2454,12 +2472,16 @@ fn refresh_decl_initializer_caches(
                         .is_some_and(|current| current.as_type() == &blind_type)
                         && blind_type != inferred_type
                 };
+            let is_numeric_tuple_refinement = current_cache.as_ref().is_some_and(|current| {
+                is_settled_numeric_tuple_refinement(&inferred_type, current.as_type())
+            });
             if !copies_settled_iter_var
                 && !current_is_uninformative
                 && !can_refine_nominal_type
                 && !can_upgrade_authority
                 && !cached_a_blind_dynamic_field_read
                 && !cached_an_unsettled_union
+                && !is_numeric_tuple_refinement
             {
                 continue;
             }
@@ -2598,6 +2620,7 @@ fn refresh_decl_initializer_caches(
                 || cached_a_blind_dynamic_field_read
                 || cached_a_provisional_slot_union
                 || cached_an_unsettled_union
+                || is_numeric_tuple_refinement
             {
                 result.updates.push(InitializerCacheUpdate::Overwrite {
                     owner: type_owner,
@@ -2833,6 +2856,7 @@ fn refresh_member_initializer_caches(
     }
     let analysis_phase = context.infer_manager.current_phase();
     let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
+    let call_site_params_visible = context.infer_manager.call_site_params_visible();
 
     let results = parallel::map_files_collect(db, &file_ids, |db, file_id| {
         let mut infer_cache = crate::LuaInferCache::new(
@@ -2841,6 +2865,7 @@ fn refresh_member_initializer_caches(
                 analysis_phase,
                 dynamic_fields_visible,
                 building_dynamic_field_index: false,
+                call_site_params_visible,
             },
         );
         let Some(root) = db
@@ -3137,6 +3162,32 @@ fn is_strict_nominal_refinement(db: &DbIndex, candidate: &LuaType, current: &Lua
         return false;
     };
     candidate_id != current_id && crate::semantic::is_sub_type_of(db, &candidate_id, &current_id)
+}
+
+fn is_settled_numeric_tuple_refinement(inferred: &LuaType, current: &LuaType) -> bool {
+    let (LuaType::Tuple(inferred_tuple), LuaType::Tuple(current_tuple)) = (inferred, current)
+    else {
+        return false;
+    };
+    if inferred_tuple.len() != current_tuple.len() {
+        return false;
+    }
+    let mut refined = false;
+    for (inf, cur) in inferred_tuple
+        .get_types()
+        .iter()
+        .zip(current_tuple.get_types().iter())
+    {
+        if inf == cur {
+            continue;
+        }
+        if inf.is_integer() && cur.is_number() {
+            refined = true;
+            continue;
+        }
+        return false;
+    }
+    refined
 }
 
 fn single_nominal_type_id(typ: &LuaType) -> Option<LuaTypeDeclId> {

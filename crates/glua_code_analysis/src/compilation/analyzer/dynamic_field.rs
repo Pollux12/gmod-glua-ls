@@ -264,6 +264,7 @@ fn collect_dynamic_fields_for_file(
             analysis_phase: crate::LuaAnalysisPhase::Force,
             dynamic_fields_visible: false,
             building_dynamic_field_index: true,
+            call_site_params_visible: false,
         },
     );
     let cache = &mut cache;
@@ -2102,6 +2103,7 @@ pub(crate) fn rederive_settled_dynamic_fields(
                 analysis_phase: crate::LuaAnalysisPhase::Force,
                 dynamic_fields_visible: true,
                 building_dynamic_field_index: true,
+                call_site_params_visible: true,
             },
         );
         let mut local_reassignment_positions = None;

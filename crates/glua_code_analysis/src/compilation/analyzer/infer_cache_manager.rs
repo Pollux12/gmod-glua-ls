@@ -12,6 +12,7 @@ pub struct InferCacheManager {
     infer_map: FxHashMap<FileId, LuaInferCache>,
     current_phase: LuaAnalysisPhase,
     dynamic_fields_visible: bool,
+    call_site_params_visible: bool,
 }
 
 impl InferCacheManager {
@@ -20,12 +21,14 @@ impl InferCacheManager {
             infer_map: FxHashMap::default(),
             current_phase: LuaAnalysisPhase::Ordered,
             dynamic_fields_visible: false,
+            call_site_params_visible: false,
         }
     }
 
     pub fn get_infer_cache(&mut self, file_id: FileId) -> &mut LuaInferCache {
         let phase = self.current_phase;
         let dynamic_fields_visible = self.dynamic_fields_visible;
+        let call_site_params_visible = self.call_site_params_visible;
         self.infer_map.entry(file_id).or_insert_with(|| {
             LuaInferCache::new(
                 file_id,
@@ -33,6 +36,7 @@ impl InferCacheManager {
                     analysis_phase: phase,
                     dynamic_fields_visible,
                     building_dynamic_field_index: false,
+                    call_site_params_visible,
                 },
             )
         })
@@ -54,6 +58,19 @@ impl InferCacheManager {
 
     pub fn dynamic_fields_visible(&self) -> bool {
         self.dynamic_fields_visible
+    }
+
+    /// Called once the call-site parameter index has been populated for this batch.
+    /// Until then early syntactic and body passes must not read it.
+    pub fn set_call_site_params_visible(&mut self) {
+        self.call_site_params_visible = true;
+        for infer_cache in self.infer_map.values_mut() {
+            infer_cache.config_mut().call_site_params_visible = true;
+        }
+    }
+
+    pub fn call_site_params_visible(&self) -> bool {
+        self.call_site_params_visible
     }
 
     pub fn merge_inference_side_effects(
@@ -223,6 +240,8 @@ mod tests {
     fn dynamic_field_visibility_defaults_are_opposite() {
         assert!(crate::CacheOptions::default().dynamic_fields_visible);
         assert!(!InferCacheManager::new().dynamic_fields_visible());
+        assert!(crate::CacheOptions::default().call_site_params_visible);
+        assert!(!InferCacheManager::new().call_site_params_visible());
     }
 
     #[test]
@@ -236,6 +255,7 @@ mod tests {
                 analysis_phase: crate::LuaAnalysisPhase::Force,
                 dynamic_fields_visible: false,
                 building_dynamic_field_index: true,
+                call_site_params_visible: false,
             },
         );
         cache

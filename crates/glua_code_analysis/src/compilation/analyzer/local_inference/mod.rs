@@ -495,6 +495,7 @@ pub(super) fn stabilize_unguarded_children(
         analysis_phase: context.infer_manager.current_phase(),
         dynamic_fields_visible: context.infer_manager.dynamic_fields_visible(),
         building_dynamic_field_index: false,
+        call_site_params_visible: context.infer_manager.call_site_params_visible(),
     };
     let mut jobs = Vec::new();
     for file_id in file_ids {

@@ -634,6 +634,17 @@ fn requeue_flushed_call_site_returns(
             .iter()
             .filter_map(|(_, consumer, _)| consumer.get_file_id()),
     );
+    let changed_sigs_vec = changed_signatures.iter().copied().collect::<Vec<_>>();
+    cleared_files.extend(
+        db.get_signature_index()
+            .settled_read_dependents_for_signatures(&changed_sigs_vec),
+    );
+    for consumer in db
+        .get_call_site_param_index()
+        .get_return_consumers(changed_signatures)
+    {
+        cleared_files.insert(consumer.file_id);
+    }
     context.requeue_call_site_inferred_returns(db, changed_signatures, consumers);
 
     let mut requeued: FxHashMap<InferFailReason, Vec<UnResolve>> = FxHashMap::default();

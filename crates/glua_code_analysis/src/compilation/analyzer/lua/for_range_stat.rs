@@ -228,6 +228,7 @@ pub fn infer_for_range_iter_expr_func(
     let Some(status_param) = status_param else {
         let types = doc_function.get_variadic_ret();
         let settled_overrides = compute_proven_settled_overrides(pairs_bindings.as_deref(), &types);
+        let types = substitute_unbound_iter_var_templates(types, &settled_overrides);
         return Ok(IterVarInference {
             types,
             settled_overrides,
@@ -259,10 +260,42 @@ pub fn infer_for_range_iter_expr_func(
 
     let types = instantiate_func.get_variadic_ret();
     let settled_overrides = compute_proven_settled_overrides(pairs_bindings.as_deref(), &types);
+    let types = substitute_unbound_iter_var_templates(types, &settled_overrides);
     Ok(IterVarInference {
         types,
         settled_overrides,
     })
+}
+
+fn substitute_unbound_iter_var_templates(
+    types: VariadicType,
+    settled_overrides: &[Option<LuaType>],
+) -> VariadicType {
+    match types {
+        VariadicType::Multi(list) => {
+            let substituted = list
+                .into_iter()
+                .enumerate()
+                .map(|(idx, typ)| {
+                    if typ.contain_tpl() {
+                        if let Some(Some(fallback)) = settled_overrides.get(idx) {
+                            return fallback.clone();
+                        }
+                    }
+                    typ
+                })
+                .collect();
+            VariadicType::Multi(substituted)
+        }
+        VariadicType::Base(typ) => {
+            if typ.contain_tpl() {
+                if let Some(Some(fallback)) = settled_overrides.first() {
+                    return VariadicType::Base(fallback.clone());
+                }
+            }
+            VariadicType::Base(typ)
+        }
+    }
 }
 
 fn compute_proven_settled_overrides(

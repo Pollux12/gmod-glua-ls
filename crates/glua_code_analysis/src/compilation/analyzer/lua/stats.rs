@@ -903,6 +903,13 @@ fn apply_index_expr_member_owner_with_guarded(
         else {
             return Some(());
         };
+        let member_key = if let LuaIndexKey::Expr(expr) = &index_key
+            && reads_settling_iter_var(analyzer.db, analyzer.file_id, expr)
+        {
+            LuaMemberKey::ExprType(LuaType::Unknown)
+        } else {
+            member_key
+        };
         let decl_feature = if analyzer.context.metas.contains(&analyzer.file_id) {
             LuaMemberFeature::MetaDefine
         } else {

@@ -163,7 +163,13 @@ impl LuaMemberKey {
             LuaType::DocStringConst(s) => LuaMemberKey::Name(s.deref().clone()),
             LuaType::IntegerConst(i) => LuaMemberKey::Integer(i),
             LuaType::DocIntegerConst(i) => LuaMemberKey::Integer(i),
-            _ => LuaMemberKey::ExprType(expr_type),
+            _ => {
+                if expr_type.contain_tpl() {
+                    LuaMemberKey::ExprType(LuaType::Unknown)
+                } else {
+                    LuaMemberKey::ExprType(expr_type)
+                }
+            }
         }
     }
 
