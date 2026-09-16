@@ -794,12 +794,22 @@ fn infer_implicit_method_self_type(
 
     // Cache the unified result (including a negative result) for subsequent
     // `self` references in the same method body.
-    if let Some(cached) = cache.self_type_cache.get(&func_syntax_id) {
+    //
+    // Only once the call-site parameter index is readable: a result computed
+    // before it is populated cannot distinguish "no call site says so" from
+    // "the index is not built yet", and memoising that `None` would freeze the
+    // pre-pipeline answer into every later read of this method.
+    let cacheable = cache.get_config().call_site_params_visible;
+    if cacheable
+        && let Some(cached) = cache.self_type_cache.get(&func_syntax_id)
+    {
         return cached.clone();
     }
 
     let result = infer_implicit_method_self_type_inner(db, cache, name_expr);
-    cache.self_type_cache.insert(func_syntax_id, result.clone());
+    if cacheable {
+        cache.self_type_cache.insert(func_syntax_id, result.clone());
+    }
     result
 }
 
