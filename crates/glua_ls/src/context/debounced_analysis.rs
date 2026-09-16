@@ -1309,6 +1309,7 @@ mod tests {
             analysis.clone(),
             status_bar,
             client.clone(),
+            false,
         ));
         let shared_diagnostic_data_cache = file_diagnostic.shared_diagnostic_data_cache();
         Arc::new(DebouncedAnalysis::new(
@@ -1682,6 +1683,7 @@ mod tests {
                 analysis.clone(),
                 status_bar.clone(),
                 client.clone(),
+                false,
             ));
 
             let initial_diagnostics = file_diagnostic
@@ -1762,6 +1764,7 @@ mod tests {
             analysis.clone(),
             status_bar,
             client.clone(),
+            false,
         ));
         let shared_diagnostic_data_cache = file_diagnostic.shared_diagnostic_data_cache();
         let debounced_analysis = Arc::new(DebouncedAnalysis::new(

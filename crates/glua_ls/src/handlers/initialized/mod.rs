@@ -634,6 +634,7 @@ mod tests {
             analysis.clone(),
             status_bar.clone(),
             client.clone(),
+            lsp_features.fetches_diagnostics(),
         ));
 
         runtime.block_on(init_analysis(

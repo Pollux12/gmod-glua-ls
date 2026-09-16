@@ -77,6 +77,17 @@ impl LspFeatures {
         self.supports_pull_diagnostic()
     }
 
+    /// Whether the client can be told to fetch diagnostics again.
+    ///
+    /// Fetching alone is not enough: without `workspace/diagnostic/refresh`
+    /// there is no way to tell the client that a file it is not showing has
+    /// changed, so the server must keep publishing per-file reports for it.
+    /// With both, publishing duplicates what the fetch returns — the client
+    /// keeps the published collection beside the fetched one.
+    pub fn fetches_diagnostics(&self) -> bool {
+        self.supports_pull_diagnostic() && self.supports_refresh_diagnostic()
+    }
+
     pub fn supports_refresh_diagnostic(&self) -> bool {
         if let Some(workspace) = &self.client_capabilities.workspace {
             if let Some(diagnostic) = &workspace.diagnostics {

@@ -84,6 +84,15 @@ pub struct FileDiagnostic {
     workspace_diagnostic_token: Arc<Mutex<Option<CancellationToken>>>,
     cached_file_diagnostics: Arc<Mutex<HashMap<Uri, Vec<Diagnostic>>>>,
     shared_diagnostic_data_cache: SharedDiagnosticDataCache,
+    /// Whether diagnostics reach this client by being fetched *and* the client
+    /// accepts `workspace/diagnostic/refresh`.
+    ///
+    /// Both capabilities are needed to drop the pushed report: a client that
+    /// fetches but cannot be asked to re-fetch has no other way to learn about
+    /// a change to a file it is not showing. For a client with both, publishing
+    /// duplicates the fetched report — VS Code keeps the pushed collection
+    /// beside the pulled one and the Problems panel shows their union.
+    fetches_diagnostics: bool,
 }
 
 impl FileDiagnostic {
@@ -91,6 +100,7 @@ impl FileDiagnostic {
         analysis: Arc<RwLock<EmmyLuaAnalysis>>,
         status_bar: Arc<StatusBar>,
         client: Arc<ClientProxy>,
+        fetches_diagnostics: bool,
     ) -> Self {
         Self {
             analysis,
@@ -102,6 +112,7 @@ impl FileDiagnostic {
             cached_file_diagnostics: Arc::new(Mutex::new(HashMap::new())),
             shared_diagnostic_data_cache: SharedDiagnosticDataCache::default(),
             status_bar,
+            fetches_diagnostics,
         }
     }
 
@@ -189,13 +200,25 @@ impl FileDiagnostic {
         cache.get(uri).cloned()
     }
 
-    pub async fn publish_fresh_file_diagnostics(
+    /// Record the server's report for one file and forward it to the client
+    /// only if the client needs it pushed.
+    ///
+    /// Every per-file diagnostic producer funnels through here — the edited
+    /// file, the widen set an edit returns, textual-refresh candidates,
+    /// watched-file and rename fanout — so this is the one place that decides
+    /// the channel. A client that fetches is asked to re-poll
+    /// (`workspace/diagnostic` refresh) by the callers instead; publishing as
+    /// well would show the same report twice.
+    pub async fn set_file_diagnostics(
         &self,
         uri: Uri,
         diagnostics: Vec<Diagnostic>,
         version: Option<i32>,
     ) {
         self.cache_fresh_file_diagnostics(&uri, &diagnostics).await;
+        if self.fetches_diagnostics {
+            return;
+        }
         self.client.publish_diagnostics(PublishDiagnosticsParams {
             uri,
             diagnostics,
@@ -262,7 +285,7 @@ impl FileDiagnostic {
                     {
                         Ok(Some((uri, diagnostics))) => {
                             file_diagnostic
-                                .publish_fresh_file_diagnostics(uri, diagnostics, None)
+                                .set_file_diagnostics(uri, diagnostics, None)
                                 .await;
                         }
                         Ok(None) => {
@@ -1034,7 +1057,7 @@ mod tests {
         let client = Arc::new(ClientProxy::new(connection));
         let status_bar = Arc::new(StatusBar::new(client.clone(), true));
         let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
-        let file_diagnostic = FileDiagnostic::new(analysis, status_bar, client);
+        let file_diagnostic = FileDiagnostic::new(analysis, status_bar, client, false);
 
         file_diagnostic.notify_workspace_loaded();
         file_diagnostic.notify_workspace_loaded();
@@ -1097,7 +1120,7 @@ mod tests {
         let client = Arc::new(ClientProxy::new(connection));
         let status_bar = Arc::new(StatusBar::new(client.clone(), true));
         let analysis = Arc::new(RwLock::new(analysis));
-        let file_diagnostic = FileDiagnostic::new(analysis.clone(), status_bar, client);
+        let file_diagnostic = FileDiagnostic::new(analysis.clone(), status_bar, client, false);
 
         let diagnostics = {
             let guard = analysis.blocking_read();

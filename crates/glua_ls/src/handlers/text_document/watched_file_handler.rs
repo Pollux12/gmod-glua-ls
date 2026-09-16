@@ -134,6 +134,19 @@ pub async fn on_did_change_watched_files(
         .add_files_diagnostic_task(file_ids, interval, Some(context.debounced_analysis_arc()))
         .await;
 
+    // Those tasks update the server's report for each file; a client that
+    // fetches diagnostics needs to be told to fetch again, since nothing is
+    // pushed to it any more. Raise the workspace level first: a pull answered
+    // while the level is `None` reports no items at all.
+    if context.lsp_features().supports_refresh_diagnostic() {
+        context
+            .workspace_manager()
+            .read()
+            .await
+            .update_workspace_version(crate::context::WorkspaceDiagnosticLevel::Fast, false);
+        context.client().refresh_workspace_diagnostics();
+    }
+
     // Handle editorconfig / emmyrc updates
     {
         let workspace = context.workspace_manager().read().await;

@@ -149,6 +149,7 @@ impl ServerContext {
             analysis.clone(),
             status_bar.clone(),
             client.clone(),
+            lsp_features.fetches_diagnostics(),
         ));
         let workspace_manager_inner = WorkspaceManager::new(
             analysis.clone(),
