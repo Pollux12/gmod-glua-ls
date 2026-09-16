@@ -1,4 +1,5 @@
 /target
+.omp/
 .idea/
 .cursor/
 dhat-heap.json
