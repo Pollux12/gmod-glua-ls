@@ -24,7 +24,9 @@
 //!
 //! **No stage is expected to diverge**: a non-zero result is a defect in the
 //! analyzer, never an accepted outcome. The bisect stages exist to localise one
-//! when it happens. `mainreindex`, `exact`, `editmid` and `split:N` must reach
+//! when it happens. A non-identical comparison anywhere in a run makes the
+//! process exit non-zero, so the verdict does not depend on someone reading the
+//! log. `mainreindex`, `exact`, `editmid` and `split:N` must reach
 //! `+0` like the gates — a divergence there is a bug, and where it lands says
 //! which mechanism feeds it: `mainreindex` and `exact` run
 //! `reindex_files_without_expansion`, which skips three convergence passes
@@ -47,10 +49,18 @@
 //!     cargo run --release -p determinism
 //!
 //! Env vars:
-//!   DET_CODEBASE    (required) workspace root
-//!   DET_ANNOTATIONS (required) GMod annotations root (library workspace)
 //!   DET_TARGETS     comma separated workspace-relative paths to no-op edit
 //!   DET_STAGES      comma separated subset of:
+//!                     shiftsettle single shift-only edit (blank line at the
+//!                               front) on each DET_TARGETS entry through the
+//!                               production path (`update_file_text_only` +
+//!                               `self_index_and_diff` + `ripple`), with the
+//!                               dirty set broken down by source (seed /
+//!                               remap-loss / diff-driven), plus the export
+//!                               diff verdict and the textual-refresh names.
+//!                               Bisects the RC-2 attribution: a shift-only
+//!                               edit must produce an empty diff and no dirty
+//!                               files.
 //!                     repeat    re-collect diagnostics with no change at all
 //!                     noopedit  EOF-newline edit pair on each DET_TARGETS
 //!                               entry, through the same `update_file_by_uri`
@@ -488,6 +498,7 @@ static GLOBAL: CountingMiMalloc = CountingMiMalloc;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use glua_code_analysis::{
@@ -794,6 +805,41 @@ impl HashDump {
     }
 }
 
+/// Number of comparisons that were supposed to come back identical and did not.
+///
+/// A stage that prints a divergence and exits zero is a report, not a gate:
+/// whoever reads the log has to notice, and nobody does. Every comparison the
+/// stages make is an assertion unless it is explicitly wrapped in
+/// `ObservedDifference`, so the run fails at the end if this is non-zero.
+static DIVERGENCES: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether the comparison in flight is an assertion.
+static ASSERTING: AtomicBool = AtomicBool::new(true);
+
+/// Marks a comparison whose difference is the *point*: `realedit` and `burst`
+/// measure what an edit genuinely moves, so "cold differs from cold+edit" is
+/// the work a mechanism must reproduce, not a regression.
+struct ObservedDifference;
+
+impl ObservedDifference {
+    fn new() -> Self {
+        ASSERTING.store(false, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ObservedDifference {
+    fn drop(&mut self) {
+        ASSERTING.store(true, Ordering::Relaxed);
+    }
+}
+
+fn record_divergence() {
+    if ASSERTING.load(Ordering::Relaxed) {
+        DIVERGENCES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Sorted-merge diff of two hash vectors: counts only, since a hash carries
 /// no text to print a dropped/gained line from.
 fn diff_sorted_hashes(base: &[u64], other: &[u64]) -> (usize, usize) {
@@ -850,6 +896,9 @@ fn diff_hash_dump(
         return;
     }
     let (dropped, gained) = diff_sorted_hashes(&base.hashes, &other.hashes);
+    if dropped > 0 || gained > 0 {
+        record_divergence();
+    }
     println!("INDEX {base_label} -> {label}: {name} dropped={dropped} gained={gained}");
 }
 
@@ -1380,6 +1429,9 @@ fn diff_map(
         .intersection(&other_keys)
         .filter(|key| base.get(**key) != other.get(**key))
         .collect::<Vec<_>>();
+    if !dropped.is_empty() || !gained.is_empty() || !changed.is_empty() {
+        record_divergence();
+    }
     println!(
         "INDEX {base_label} -> {label}: {name} dropped={} gained={} changed={}",
         dropped.len(),
@@ -1577,6 +1629,9 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
 
     let member_dropped = base.members.difference(&other.members).collect::<Vec<_>>();
     let member_gained = other.members.difference(&base.members).collect::<Vec<_>>();
+    if !member_dropped.is_empty() || !member_gained.is_empty() {
+        record_divergence();
+    }
     println!(
         "INDEX {base_label} -> {label}: members dropped={} gained={}",
         member_dropped.len(),
@@ -1594,6 +1649,9 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
     let net_dropped = base_net.difference(&other_net).collect::<Vec<_>>();
     let net_gained = other_net.difference(&base_net).collect::<Vec<_>>();
     let net_reordered = base.net_flows != other.net_flows;
+    if !net_dropped.is_empty() || !net_gained.is_empty() || net_reordered {
+        record_divergence();
+    }
     println!(
         "INDEX {base_label} -> {label}: net_flows dropped={} gained={} reordered={net_reordered}",
         net_dropped.len(),
@@ -1644,6 +1702,7 @@ fn diff(base_label: &str, base: &BTreeSet<Snapshot>, label: &str, other: &BTreeS
         removed.len(),
         added.len()
     );
+    record_divergence();
 
     let limit = diff_limit();
 
@@ -1809,6 +1868,177 @@ fn noop_edit(analysis: &mut EmmyLuaAnalysis, target: &Path, at_front: bool) -> b
     true
 }
 
+/// Single shift-only settle through the production two-phase path, asserting
+/// the remap-path invariant and printing the dirty breakdown as diagnostics.
+///
+/// Applies ONE edit (a blank line at the front, shifting every offset with no
+/// token change) via `update_file_text_only` + `self_index_and_diff` +
+/// `ripple`, on its own analysis like `editrevert`.
+///
+/// Asserted (records a divergence, no `ObservedDifference` wrapper):
+/// 1. `remap-loss == 0`. Defensible for this stage specifically because its
+///    edit is a pure insertion of a blank line at the front: no fact's
+///    referent can disappear and no text a fact anchors on is deleted, so any
+///    loss means the validator failed to *see* a fact the shift never touched.
+///    This is not a universal claim about remapping: a genuinely deleted
+///    `---@class` must still lose its facts (lossy by design, covered by the
+///    remap negative case, not this stage).
+/// 2. Accounting completeness: every file in `dirty` is attributable to a
+///    named source — the edited file itself, a remap loss, or a diff
+///    dependent — so a file dirtied by nothing is a bug.
+///
+/// Deliberately NOT asserted: `export diff empty`. False on drift targets
+/// whose owner/accumulator families still move under a shift (`cl_umsgs`' 2
+/// member keys, `sh_configuration`'s 1 dynamic-element key); `indexrepeat` is
+/// the gate that owns that. The key count and keys print as diagnostics.
+///
+/// The before/after *index* comparison stays characterization
+/// (`ObservedDifference`): a shifted file's own facts legitimately move by a
+/// line, and the tail's first-settle convergence is the work being measured,
+/// not a regression. The second identical settle (which must be fully quiet)
+/// is the determinism check: quiet there proves no lingering corruption, so a
+/// first-settle fanout is a convergence phenomenon the tail owns.
+fn shift_settle(codebase: &Path, annotations: &Path, targets: &[String]) {
+    let analysis = &mut build_analysis(codebase, annotations);
+
+    for target in targets {
+        let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let Some(uri) = glua_code_analysis::file_path_to_uri(&path) else {
+            continue;
+        };
+        let Some(file_id) = analysis.get_file_id(&uri) else {
+            eprintln!("[shiftsettle] file not indexed: {}", path.display());
+            continue;
+        };
+        let Some(original) = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_content(&file_id)
+            .cloned()
+        else {
+            continue;
+        };
+        let shifted = format!("\n{original}");
+
+        let before_index = collect_index(analysis, "before_shiftsettle");
+        let before = collect(analysis, "before_shiftsettle");
+
+        // Phase 0: the dependency expansion, captured pre-edit like the LSP
+        // does. `self_index_and_diff` itself takes no expansion; what it
+        // reports is remap-loss plus diff-driven only.
+        let expansion = analysis.expand_reindex_file_ids(vec![file_id]);
+        eprintln!(
+            "[shiftsettle] {target}: dependency expansion is {} file(s)",
+            expansion.len()
+        );
+
+        let t = Instant::now();
+        analysis.update_file_text_only(&uri, shifted.clone());
+        let mut dirty: DirtySet = analysis.self_index_and_diff(vec![file_id]);
+        let dirty_len = dirty.dirty_len();
+        let refresh_len = dirty.textual_refresh_names_len();
+        eprintln!(
+            "[shiftsettle] {target}: self-index dirty_len={dirty_len} refresh_names={refresh_len} ({:.2}s)",
+            t.elapsed().as_secs_f64()
+        );
+        // Asserted invariant 1: a pure insertion loses no remap identity.
+        // Printed as diagnostics either way (sorted ids), asserted by count.
+        {
+            let mut losses: Vec<_> = dirty.remap_losses().iter().collect();
+            losses.sort_unstable();
+            eprintln!(
+                "[shiftsettle] {target}: remap-loss {} file(s): {losses:?}",
+                losses.len()
+            );
+            if !losses.is_empty() {
+                record_divergence();
+            }
+        }
+        // Asserted invariant 2: every dirty file has a named source. The
+        // edited file itself is settled by phase 1 and never dirtied, so the
+        // union of remap losses and diff dependents must cover `dirty`.
+        {
+            let mut unattributed: Vec<_> = Vec::new();
+            for file in dirty.dirty_files() {
+                if *file == file_id
+                    || dirty.remap_losses().contains(file)
+                    || dirty.diff_dependents().contains(file)
+                {
+                    continue;
+                }
+                unattributed.push(file);
+            }
+            unattributed.sort_unstable();
+            let mut dependents: Vec<_> = dirty.diff_dependents().iter().collect();
+            dependents.sort_unstable();
+            eprintln!(
+                "[shiftsettle] {target}: diff-dependents {} file(s): {dependents:?}; unattributed {} file(s): {unattributed:?}",
+                dependents.len(),
+                unattributed.len()
+            );
+            if !unattributed.is_empty() {
+                record_divergence();
+            }
+        }
+        let phase1_names: Vec<String> = dirty
+            .take_textual_refresh_names()
+            .into_iter()
+            .map(|name| name.as_str().to_string())
+            .collect();
+        let (rippled, ripple_names) = analysis.ripple_with_refresh_names(dirty);
+        let mut phase1_sorted = phase1_names;
+        phase1_sorted.sort_unstable();
+        let mut ripple_sorted: Vec<String> = ripple_names
+            .into_iter()
+            .map(|name| name.as_str().to_string())
+            .collect();
+        ripple_sorted.sort_unstable();
+        eprintln!(
+            "[shiftsettle] {target}: ripple reanalysed {} file(s), phase1_names={} ripple_names={}",
+            rippled.len(),
+            phase1_sorted.len(),
+            ripple_sorted.len(),
+        );
+        for name in phase1_sorted.iter().take(60) {
+            eprintln!("[shiftsettle] {target}:   phase1 name `{name}`");
+        }
+        for name in ripple_sorted.iter().take(60) {
+            eprintln!("[shiftsettle] {target}:   ripple name `{name}`");
+        }
+        let label = format!("after_shiftsettle[{target}]");
+        let after_index = collect_index(analysis, &label);
+        let after = collect(analysis, &label);
+        {
+            let _guard = ObservedDifference::new();
+            diff_index("before_shiftsettle", &before_index, &label, &after_index);
+            diff("before_shiftsettle", &before, &label, &after);
+        }
+
+        // Determinism check the parent asked for: settle the SAME shifted text
+        // a second time through the identical path and compare the loss sets.
+        // A repeat loss means the remap path itself drifts rather than the
+        // first settle being a one-shot artefact.
+        let t = Instant::now();
+        analysis.update_file_text_only(&uri, shifted.clone());
+        let dirty2: DirtySet = analysis.self_index_and_diff(vec![file_id]);
+        let dirty2_len = dirty2.dirty_len();
+        eprintln!(
+            "[shiftsettle] {target}: second identical settle dirty_len={dirty2_len} ({:.2}s)",
+            t.elapsed().as_secs_f64()
+        );
+        analysis.ripple(dirty2);
+        let label2 = format!("after_shiftsettle2[{target}]");
+        let after2_index = collect_index(analysis, &label2);
+        let after2 = collect(analysis, &label2);
+        {
+            let _guard = ObservedDifference::new();
+            diff_index(&label, &after_index, &label2, &after2_index);
+            diff(&label, &after, &label2, &after2);
+        }
+    }
+}
+
 /// Edit a file through the single-file update path, then put it back.
 ///
 /// The source ends as it started, so the index has to as well. Any difference is
@@ -1951,8 +2181,11 @@ fn real_edit(
         let truth = collect(&ground_truth, "cold_edited");
 
         // What the edit genuinely moves: the work any mechanism must reproduce.
-        diff_index("cold", &cold_index, "cold_edited", &truth_index);
-        diff("cold", cold, "cold_edited", &truth);
+        {
+            let _observed = ObservedDifference::new();
+            diff_index("cold", &cold_index, "cold_edited", &truth_index);
+            diff("cold", cold, "cold_edited", &truth);
+        }
         // What today's incremental path gets wrong about it.
         diff_index("cold_edited", &truth_index, "warm", &warm_index);
         diff("cold_edited", &truth, "warm", &warm);
@@ -1973,8 +2206,7 @@ fn real_edit(
 /// The dirty set names the files the edit invalidated, so its size is the blast
 /// radius directly. `DET_BLAST_MAX` is the ceiling per target, defaulting to a
 /// value far below any dependency expansion but far above a real edit's fanout.
-/// Exceeding it is a hard failure: this stage is the one that makes the process
-/// exit non-zero.
+/// Exceeding it is a hard failure, like any non-identical comparison.
 fn blast_radius(analysis: &mut EmmyLuaAnalysis, codebase: &Path, targets: &[String]) -> bool {
     let Ok(find) = std::env::var("DET_EDIT_FIND") else {
         eprintln!("[blast] SKIPPED: DET_EDIT_FIND is not set, so no blast gate ran");
@@ -2184,8 +2416,11 @@ fn burst_edit(
     let truth = collect(&ground_truth, "cold_burst");
 
     // Context: what the edits themselves move.
-    diff_index("cold", &cold_index, "cold_burst", &truth_index);
-    diff("cold", cold, "cold_burst", &truth);
+    {
+        let _observed = ObservedDifference::new();
+        diff_index("cold", &cold_index, "cold_burst", &truth_index);
+        diff("cold", cold, "cold_burst", &truth);
+    }
     // Context: the same comparison for the undeferred path.
     diff_index("cold_burst", &truth_index, "control", &control_index);
     diff("cold_burst", &truth, "control", &control);
@@ -2477,10 +2712,12 @@ fn run() {
         }
     }
 
+    if stages.iter().any(|s| s == "shiftsettle") {
+        shift_settle(&codebase, &annotations, &targets);
+    }
     if stages.iter().any(|s| s == "editrevert") {
         edit_revert(&codebase, &annotations, &targets);
     }
-
     if stages.iter().any(|s| s == "realedit") {
         real_edit(&mut analysis, &codebase, &annotations, &targets, &cold);
     }
@@ -2567,10 +2804,17 @@ fn run() {
             .unwrap_or(30),
     );
 
-    // Every other stage reports and leaves the verdict to whoever reads the log.
-    // The blast gate has a machine-checkable answer, so it is worth failing on.
+    // Stages that print a divergence and exit zero are reports, not gates.
+    let divergences = DIVERGENCES.load(Ordering::Relaxed);
+    if divergences > 0 {
+        eprintln!(
+            "[determinism] {divergences} comparison(s) were not identical; see the DIFF/INDEX lines above"
+        );
+    }
     if !blast_ok {
         eprintln!("[blast] gate failed");
+    }
+    if divergences > 0 || !blast_ok {
         std::process::exit(1);
     }
 }
