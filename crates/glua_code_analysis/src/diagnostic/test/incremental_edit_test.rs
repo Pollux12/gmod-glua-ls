@@ -3403,4 +3403,101 @@ end
         );
         expect_that!(codes_in(&ws, new_consumer_id), is_empty());
     }
+    /// A paced type-then-erase burst emits no refresh names.
+    ///
+    /// Typing `p` .. `print` inside a function body parses each prefix as a
+    /// global decl at a fixed position, so every intermediate settle reports
+    /// an old+new pair through the rename channel (and once the prefix becomes
+    /// a callee, a one-sided Realm name-only key rerouted to the same
+    /// channel). Erasing back to the starting text leaves no decl behind, so
+    /// burst-boundary validation (presence XOR between burst start and settled
+    /// final) drops every transient name. A genuine rename keeps old
+    /// (start-only) + new (final-only); this burst keeps neither.
+    #[gtest]
+    fn paced_type_then_erase_burst_emits_no_refresh_names() {
+        let mut ws = workspace_with(vec![]);
+        let original = "cityrp = cityrp or {}\ncityrp.data = cityrp.data or {}\nfunction cityrp.data.Get(key, default)\n\tif (default ~= nil) then\n\t\treturn default\n\tend\n\t\n\tlocal path = \"cityrp/\" .. key\n\treturn path\nend\n";
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/sh_data.lua");
+        let provider_id = write(&mut ws, &provider_uri, original);
+        let anchor = "\t\treturn default\n\tend\n";
+        let insert_at = original.find(anchor).expect("anchor") + anchor.len();
+        let (head, tail) = original.split_at(insert_at);
+        let seg = "print(\"test\")";
+        let mut states = vec![original.to_string()];
+        for k in 1..=seg.len() {
+            states.push(format!("{}{}{}", head, &seg[..k], tail));
+        }
+        for k in (0..seg.len()).rev() {
+            states.push(format!("{}{}{}", head, &seg[..k], tail));
+        }
+
+        // Burst-start baselines, captured before the first settle exactly as
+        // the production loop anchors them: decl names for the rename channel,
+        // export maps for the export channel.
+        let start_names: std::collections::HashSet<smol_str::SmolStr> = {
+            let db = ws.analysis.compilation.get_db();
+            let tree = db
+                .get_decl_index()
+                .get_decl_tree(&provider_id)
+                .expect("decl tree");
+            tree.get_decls()
+                .values()
+                .filter(|decl| decl.get_file_id() == provider_id && !decl.is_local())
+                .map(|decl| smol_str::SmolStr::new(decl.get_name()))
+                .collect()
+        };
+        let mut start_exports = rustc_hash::FxHashMap::default();
+        start_exports.insert(provider_id, fingerprint_of(&ws, provider_id));
+
+        // Drive the gesture settle by settle through the debounced path's two
+        // halves, accumulating rename-channel names across the burst exactly
+        // as `owed_rename_names` does.
+        let mut owed_rename: std::collections::HashSet<smol_str::SmolStr> =
+            std::collections::HashSet::new();
+        let mut owed_export: std::collections::HashSet<smol_str::SmolStr> =
+            std::collections::HashSet::new();
+        for text in states.iter().skip(1) {
+            ws.analysis
+                .update_file_text_only(&provider_uri, text.clone())
+                .expect("staged text");
+            let mut dirty = ws.analysis.self_index_and_diff(vec![provider_id]);
+            owed_export.extend(dirty.take_export_refresh_names());
+            owed_rename.extend(dirty.take_decl_rename_refresh_names());
+            // The gesture's intermediate settles dirty nothing change-driven:
+            // the mapped rename branch fires, and the transient decl's
+            // appearance/disappearance moves a one-sided Realm name-only key.
+            expect_that!(dirty.dirty_len(), eq(0));
+            let (_, ripple_export, ripple_rename) =
+                ws.analysis.ripple_with_refresh_names_split(dirty);
+            owed_export.extend(ripple_export);
+            owed_rename.extend(ripple_rename);
+        }
+        // The burst ends where it started.
+        expect_true!(states.last().unwrap() == original);
+        // The burst really did pollute the per-settle rename union: without
+        // burst-boundary semantics this non-empty set is what would fan out.
+        // (One-sided Realm name-only keys from the transient decl's
+        // appearance/disappearance are rerouted to the rename channel, so the
+        // export union stays empty for this gesture.)
+        expect_that!(owed_rename, not(is_empty()));
+        expect_that!(owed_export, is_empty());
+
+        // Production drain semantics at burst end: the export channel
+        // recomputes start-vs-final (empty: the burst ends where it started)
+        // and the rename channel keeps presence-XOR names only (none: every
+        // transient is on neither side). Zero names reach the refresh.
+        let boundary_export = ws.analysis.burst_boundary_export_names(&start_exports);
+        let mut burst_start = rustc_hash::FxHashMap::default();
+        burst_start.insert(
+            provider_id,
+            start_names
+                .into_iter()
+                .collect::<rustc_hash::FxHashSet<_>>(),
+        );
+        expect_that!(boundary_export, is_empty());
+        let kept = ws
+            .analysis
+            .validate_rename_refresh_names(owed_rename, &burst_start);
+        expect_that!(kept, is_empty());
+    }
 }

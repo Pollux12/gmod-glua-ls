@@ -638,6 +638,85 @@ impl DebouncedAnalysis {
         }
     }
 
+    /// Snapshot the burst-start declaration names for `file_ids`: the baseline
+    /// the rename-channel validation diffs the settled-final state against.
+    ///
+    /// Runs under a read lock before the burst's first self-index settles, so
+    /// the names describe the index the burst started from. Files already in
+    /// the baseline keep their first snapshot: the comparison is burst-start
+    /// to burst-end, not keystroke to keystroke.
+    async fn snapshot_burst_start(
+        &self,
+        file_ids: &[FileId],
+        burst_start_names: &mut HashMap<FileId, HashSet<SmolStr>>,
+        burst_start_exports: &mut HashMap<FileId, glua_code_analysis::ExportMap>,
+    ) {
+        let fresh: Vec<FileId> = file_ids
+            .iter()
+            .copied()
+            .filter(|id| !burst_start_names.contains_key(id))
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        let analysis = self.analysis.clone();
+        let snapshot = tokio::task::spawn_blocking(move || {
+            let guard = analysis.blocking_read();
+            let names = guard.snapshot_burst_start_names(&fresh);
+            let exports = guard.snapshot_burst_start_exports(&fresh);
+            (names, exports)
+        })
+        .await
+        .unwrap_or_default();
+        for (file_id, names) in snapshot.0 {
+            burst_start_names.insert(file_id, names.into_iter().collect());
+        }
+        for (file_id, map) in snapshot.1 {
+            burst_start_exports.insert(file_id, map);
+        }
+    }
+
+    /// Merge the two refresh-name channels after validating the rename
+    /// channel: a rename-channel name survives iff it names a declaration in
+    /// the burst-start baseline or in the settled-final index. Export-channel
+    /// names pass through untouched.
+    async fn validate_and_merge_refresh_names(
+        &self,
+        fallback_export_names: HashSet<SmolStr>,
+        rename_names: HashSet<SmolStr>,
+        burst_start: &HashMap<FileId, HashSet<SmolStr>>,
+        burst_exports: HashMap<FileId, glua_code_analysis::ExportMap>,
+    ) -> HashSet<SmolStr> {
+        let analysis = self.analysis.clone();
+        let burst_start = burst_start
+            .iter()
+            .map(|(file_id, names)| (*file_id, names.iter().cloned().collect()))
+            .collect::<rustc_hash::FxHashMap<_, _>>();
+        let burst_exports = burst_exports
+            .into_iter()
+            .collect::<rustc_hash::FxHashMap<_, _>>();
+        tokio::task::spawn_blocking(move || {
+            let guard = analysis.blocking_read();
+            // Export channel: recompute start-vs-final; a burst that ends
+            // where it started yields nothing. Fall back to the per-settle
+            // union only when no baseline was captured (should not happen:
+            // the baseline anchors before the first self-index).
+            let mut names: HashSet<SmolStr> = if burst_exports.is_empty() {
+                fallback_export_names
+            } else {
+                guard
+                    .burst_boundary_export_names(&burst_exports)
+                    .into_iter()
+                    .collect()
+            };
+            let kept = guard.validate_rename_refresh_names(rename_names, &burst_start);
+            names.extend(kept);
+            names
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     /// Re-index the edited files' own entries, and report which other files
     /// the edit invalidated.
     ///
@@ -688,7 +767,7 @@ impl DebouncedAnalysis {
         &self,
         dirty: DirtySet,
         timing: Option<&mut crate::util::ls_profile::RippleWriteTimings>,
-    ) -> (bool, HashSet<SmolStr>, Vec<FileId>) {
+    ) -> (bool, HashSet<SmolStr>, HashSet<SmolStr>, Vec<FileId>) {
         let profile = timing.is_some();
         let analysis = self.analysis.clone();
         let cache = self.shared_diagnostic_data_cache.clone();
@@ -696,30 +775,31 @@ impl DebouncedAnalysis {
         // Re-index under a blocking write lock on a blocking thread: the wait
         // for the lock and the CPU work both stay off the Tokio workers.
         tokio::select! {
-            _ = self.shutdown.cancelled() => (false, HashSet::default(), Vec::new()),
+            _ = self.shutdown.cancelled() => (false, HashSet::default(), HashSet::default(), Vec::new()),
             result = tokio::task::spawn_blocking(move || {
                 let wait_start = profile.then(Instant::now);
                 let mut guard = analysis.blocking_write();
                 let wait = wait_start.map(|start| start.elapsed()).unwrap_or_default();
                 let hold_start = profile.then(Instant::now);
-                let (rippled, refresh_names) = guard.ripple_with_refresh_names(dirty);
+                let (rippled, export_names, rename_names) =
+                    guard.ripple_with_refresh_names_split(dirty);
                 // Invalidate under the write lock so no reader can observe the
                 // fresh index next to the stale shared diagnostic data.
                 cache.invalidate();
                 let hold = hold_start.map(|start| start.elapsed()).unwrap_or_default();
-                (rippled, refresh_names, wait, hold)
+                (rippled, export_names, rename_names, wait, hold)
             }) => {
                 match result {
-                    Ok((rippled, refresh_names, wait, hold)) => {
+                    Ok((rippled, export_names, rename_names, wait, hold)) => {
                         if let Some(timing) = timing {
                             timing.wait = wait;
                             timing.hold = hold;
                         }
-                        (true, refresh_names, rippled)
+                        (true, export_names, rename_names, rippled)
                     }
                     Err(err) => {
                         log::error!("reindex task failed: {}", err);
-                        (false, HashSet::default(), Vec::new())
+                        (false, HashSet::default(), HashSet::default(), Vec::new())
                     }
                 }
             }
@@ -891,13 +971,35 @@ impl DebouncedAnalysis {
         // and the union of the dirty sets each of them reported.
         let mut owed_files: HashSet<FileId> = HashSet::new();
         let mut owed_ripple: Option<DirtySet> = None;
-        // Textual refresh names owed a diagnostic-only refresh, merged from
-        // every self-index diff and ripple sideband of this burst. They steer
-        // no reindex: they are drained whenever no ripple is owed.
-        let mut owed_refresh_names: HashSet<SmolStr> = HashSet::default();
+        // Textual refresh names owed a diagnostic-only refresh, split by
+        // channel. Export-diff names are callee-anchored and pass through
+        // untouched; rename-channel names are anchored in the edited files'
+        // own decls and are validated against the burst baseline before they
+        // fan out, so transient keystroke decls (`p` -> `pr` -> ...) that no
+        // longer exist at burst end emit nothing. Both steer no reindex: they
+        // are drained whenever no ripple is owed.
+        let mut owed_export_names: HashSet<SmolStr> = HashSet::default();
+        let mut owed_rename_names: HashSet<SmolStr> = HashSet::default();
+        // Export names the settled ripple itself reported (a rippled file's
+        // moved inference, e.g. a middleman's `Binferred`). The ripple runs
+        // once at quiet against the settled-final state, so these are already
+        // boundary-clean and pass through untouched — unlike the edited
+        // files' per-settle union above, which the burst boundary recomputes.
+        let mut owed_ripple_export_names: HashSet<SmolStr> = HashSet::default();
         // Files the edit path already settled (edited batch, ripple-settled),
         // excluded from the textual refresh resolution.
         let mut refresh_exclude: HashSet<FileId> = HashSet::default();
+        // Burst-start non-local declaration names per edited file, snapshotted
+        // under the read lock before the burst's first self-index settles.
+        // The rename-channel validation diffs this against the settled-final
+        // index: a name survives iff its presence differs between the two.
+        let mut burst_start_names: HashMap<FileId, HashSet<SmolStr>> = HashMap::new();
+        // Burst-start export maps per edited file: the export channel
+        // recomputes its diff against the settled-final state at burst end,
+        // so a burst that ends where it started emits nothing while a durable
+        // change still emits the keys it moved.
+        let mut burst_start_exports: HashMap<FileId, glua_code_analysis::ExportMap> =
+            HashMap::new();
         let mut burst_started_at: Option<Instant> = None;
         loop {
             // Register before testing the condition: `notify_waiters()` stores
@@ -909,7 +1011,9 @@ impl DebouncedAnalysis {
             let needs_work = !self.pending_files.lock().await.is_empty()
                 || self.has_pending_changes.load(Ordering::Acquire)
                 || !owed_files.is_empty()
-                || !owed_refresh_names.is_empty();
+                || !owed_export_names.is_empty()
+                || !owed_rename_names.is_empty()
+                || !owed_ripple_export_names.is_empty();
             if !needs_work {
                 tokio::select! {
                     _ = notified => {}
@@ -956,6 +1060,15 @@ impl DebouncedAnalysis {
                     self.debounce_duration.as_millis()
                 );
 
+                // Anchor the burst baseline before the first self-index
+                // settles: later keystrokes join the same baseline, so the
+                // validation compares burst-start to burst-end.
+                self.snapshot_burst_start(
+                    &file_ids,
+                    &mut burst_start_names,
+                    &mut burst_start_exports,
+                )
+                .await;
                 // Re-index the edited files themselves first and release the
                 // write lock, so a completion or hover positioned inside one of
                 // them can be answered against entries that match its text
@@ -1014,12 +1127,17 @@ impl DebouncedAnalysis {
                 // would put them behind the whole ripple.
                 let handoff_opt = profile_cycle.then_some(&mut handoff_timing);
                 self.await_reader_handoff(handoff_opt).await;
-
                 // Refresh names ride along whichever path the dirty set takes:
                 // they are taken before the emptiness check, which ignores
-                // them by design.
-                owed_refresh_names.extend(dirty.take_textual_refresh_names());
+                // them by design. Export-channel names pass through; the
+                // rename channel accumulates for burst-boundary validation and
+                // drains only when no ripple is owed.
+                owed_export_names.extend(dirty.take_export_refresh_names());
+                owed_rename_names.extend(dirty.take_decl_rename_refresh_names());
                 refresh_exclude.extend(file_ids.iter().copied());
+                if !owed_export_names.is_empty() || !owed_rename_names.is_empty() {
+                    burst_started_at.get_or_insert_with(Instant::now);
+                }
 
                 if dirty.is_empty() {
                     // Nothing else reads a fact this edit moved - the
@@ -1033,10 +1151,13 @@ impl DebouncedAnalysis {
                         }
                     }
                     self.refresh_dirty_state().await;
-                    self.reindex_notify.notify_waiters();
                     // Refresh names still owed: fall through so the gate below
                     // drains them without a ripple.
-                    if owed_ripple.is_none() && owed_refresh_names.is_empty() {
+                    if owed_ripple.is_none()
+                        && owed_export_names.is_empty()
+                        && owed_rename_names.is_empty()
+                        && owed_ripple_export_names.is_empty()
+                    {
                         if let Some(cycle) = cycle_id {
                             use crate::util::ls_profile::{HandoffOutcome, QuietOutcome};
                             crate::util::ls_profile::emit_ls_reindex(
@@ -1065,15 +1186,76 @@ impl DebouncedAnalysis {
             }
 
             let Some(owed) = owed_ripple.take() else {
-                if owed_refresh_names.is_empty() {
+                // The settled ripple's own exports are already boundary-clean
+                // (the ripple ran once at quiet), so they drain on the next
+                // debounce tick without waiting for another full quiet window.
+                // Edited-file names still wait below for the burst boundary.
+                if !owed_ripple_export_names.is_empty()
+                    && owed_export_names.is_empty()
+                    && owed_rename_names.is_empty()
+                {
+                    let passthrough = std::mem::take(&mut owed_ripple_export_names);
+                    let exclude = std::mem::take(&mut refresh_exclude);
+                    let scheduled = self.schedule_textual_refresh(passthrough, &exclude).await;
+                    self.refresh_dirty_state().await;
+                    self.reindex_notify.notify_waiters();
+                    if scheduled {
+                        self.arm_idle_workspace_diagnostic(&mut idle_workspace_diagnostic_token);
+                    }
+                    continue;
+                }
+                if owed_export_names.is_empty()
+                    && owed_rename_names.is_empty()
+                    && owed_ripple_export_names.is_empty()
+                {
                     self.refresh_dirty_state().await;
                     self.reindex_notify.notify_waiters();
                     continue;
                 }
-                // No ripple is owed, but textual refresh names are: resolve
-                // them and schedule diagnostics, then settle the burst.
-                let names = std::mem::take(&mut owed_refresh_names);
+                // No ripple is owed, but textual refresh names are: hold them
+                // until typing has genuinely stopped, then validate the rename
+                // channel against the burst baseline (export names pass
+                // through), resolve them, schedule diagnostics, and settle the
+                // burst. Draining per settle would validate each keystroke
+                // against its own micro-baseline, where the transient decl
+                // still exists, and keep every transient name.
+                let burst_started_at_instant = burst_started_at.unwrap_or_else(Instant::now);
+                let names_quiet_opt = profile_cycle.then_some(&mut quiet_timing);
+                if !self
+                    .ripple_quiet_elapsed(burst_started_at_instant, names_quiet_opt)
+                    .await
+                {
+                    if let Some(cycle) = cycle_id {
+                        use crate::util::ls_profile::{HandoffOutcome, QuietOutcome};
+                        crate::util::ls_profile::emit_ls_reindex(
+                            cycle,
+                            debounce_elapsed,
+                            self_timings.wait,
+                            self_timings.hold,
+                            handoff_timing.wait,
+                            handoff_timing.outcome.unwrap_or(HandoffOutcome::Idle),
+                            quiet_timing.wait,
+                            quiet_timing.outcome.unwrap_or(QuietOutcome::Edit),
+                            std::time::Duration::ZERO,
+                            std::time::Duration::ZERO,
+                        );
+                    }
+                    continue;
+                }
+                burst_started_at = None;
+                let fallback_export_names = std::mem::take(&mut owed_export_names);
+                let rename_names = std::mem::take(&mut owed_rename_names);
                 let exclude = std::mem::take(&mut refresh_exclude);
+                let burst_start = std::mem::take(&mut burst_start_names);
+                let burst_exports = std::mem::take(&mut burst_start_exports);
+                let names = self
+                    .validate_and_merge_refresh_names(
+                        fallback_export_names,
+                        rename_names,
+                        &burst_start,
+                        burst_exports,
+                    )
+                    .await;
                 let scheduled = self.schedule_textual_refresh(names, &exclude).await;
                 self.refresh_dirty_state().await;
                 self.reindex_notify.notify_waiters();
@@ -1125,11 +1307,15 @@ impl DebouncedAnalysis {
                 );
 
                 let ripple_opt = profile_cycle.then_some(&mut ripple_timings);
-                let (reindex_completed, ripple_names, rippled) =
+                let (reindex_completed, ripple_export_names, ripple_rename_names, rippled) =
                     self.ripple_without_queuing(owed, ripple_opt).await;
-                // The ripple's own sideband joins the names already owed; they
-                // drain through the gate on the next iteration.
-                owed_refresh_names.extend(ripple_names);
+                // The ripple's own sideband is already boundary-clean: the
+                // ripple settled once against the quiet state, so its export
+                // names join the passthrough set (validated bursts rejoin it
+                // at their drain). They drain after this block without waiting
+                // for another full quiet window.
+                owed_ripple_export_names.extend(ripple_export_names);
+                owed_rename_names.extend(ripple_rename_names);
                 refresh_exclude.extend(rippled.iter().copied());
 
                 {
@@ -1724,7 +1910,7 @@ mod tests {
                 .self_index_without_queuing(vec![api_file_id], None)
                 .await
                 .expect("self-index should complete");
-            let (completed, _refresh_names, _rippled) =
+            let (completed, _export_names, _rename_names, _rippled) =
                 debounced_analysis.ripple_without_queuing(dirty, None).await;
             verify_that!(completed, eq(true))?;
 

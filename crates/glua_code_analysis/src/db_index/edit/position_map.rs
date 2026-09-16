@@ -1,11 +1,11 @@
-use glua_parser::{LuaAstNode, LuaKind, LuaSyntaxId, LuaTableExpr};
+use glua_parser::{LuaAstNode, LuaKind, LuaSyntaxId, LuaSyntaxKind, LuaTableExpr};
 use rowan::{TextRange, TextSize};
 use rustc_hash::FxHashSet;
 
 use crate::{
-    DbIndex, FileId, InFiled, LuaDeclId, LuaDefinitionId, LuaInferenceNodeId,
+    DbIndex, FileId, InFiled, LuaDeclId, LuaDeclTypeKind, LuaDefinitionId, LuaInferenceNodeId,
     LuaInferredGuardOwner, LuaMemberId, LuaOperatorOwner, LuaSemanticDeclId, LuaSignatureId,
-    LuaTypeOwner,
+    LuaTypeDeclId, LuaTypeOwner,
 };
 
 /// The single hunk an edit changed, as byte offsets.
@@ -176,6 +176,10 @@ pub struct FileFacts {
     /// owner here" is not a question the tree alone answers. Answers "did the
     /// mapped range land on something that still holds members".
     owner_ranges: FxHashSet<TextRange>,
+    /// Same-file type-decl locations with their kinds, backing the
+    /// unique-covering-decl admission for synthesized `DocTagClass` ids in
+    /// [`FileRemap::syntax_id`]: one entry per declaration site in this file.
+    type_decl_spans: Vec<(LuaTypeDeclId, TextRange, LuaDeclTypeKind)>,
 }
 
 impl FileFacts {
@@ -196,7 +200,6 @@ impl FileFacts {
             .into_iter()
             .map(|member| *member.get_id().get_syntax_id())
             .collect();
-
         let mut owner_ranges = db
             .get_member_index()
             .element_owner_ranges_in_file(file_id)
@@ -221,6 +224,64 @@ impl FileFacts {
                     .map(|table| table.get_range()),
             );
         }
+        // `contextual_type_support` synthesizes `DocTagClass` ids from a type
+        // decl's name-token ranges (`local_inference/mod.rs`), and those nodes
+        // ride inside `Comment` trivia the red walk above never yields. The
+        // range alone still names the decl site, so they are admitted by
+        // geometry: any type decl declared in this file at that range counts.
+        // Scoped-class synthesis (`ensure_scoped_class_type_decl`) registers
+        // whole-file (chunk) spans instead, which no shift image ever equals;
+        // those are admitted in `syntax_id` by unique covering decl (see
+        // `FileFacts::unique_covering_decl`). Both arms share this span table.
+        let mut type_decl_spans: Vec<(LuaTypeDeclId, TextRange, LuaDeclTypeKind)> = Vec::new();
+        if let Some(decl_ids) = db.get_type_index().get_file_type_decl_ids(file_id) {
+            for decl_id in decl_ids {
+                if let Some(type_decl) = db.get_type_index().get_type_decl(decl_id) {
+                    let kind = type_decl.kind_and_flags().0;
+                    for location in type_decl.get_locations() {
+                        if location.file_id == file_id {
+                            syntax_ids.insert(LuaSyntaxId::new(
+                                LuaKind::Syntax(LuaSyntaxKind::DocTagClass),
+                                location.range,
+                            ));
+                            type_decl_spans.push((decl_id.clone(), location.range, kind));
+                        }
+                    }
+                }
+            }
+        }
+        // TEMP DUMP (GLUALS_SETTLE_DETAIL): new decls after re-index. Env-gated,
+        // behavior-neutral; on the trace-deletion list.
+        if std::env::var_os("GLUALS_SETTLE_DETAIL").is_some() {
+            let mut decls: Vec<String> = db
+                .get_type_index()
+                .get_file_type_decl_ids(file_id)
+                .map(|ids| {
+                    ids.iter()
+                        .map(|id| {
+                            let locs = db
+                                .get_type_index()
+                                .get_type_decl(id)
+                                .map(|d| {
+                                    d.get_locations()
+                                        .iter()
+                                        .map(|l| format!("{:?}:{:?}", l.file_id, l.range))
+                                        .collect::<Vec<_>>()
+                                        .join(",")
+                                })
+                                .unwrap_or_default();
+                            format!("{id:?}@[{locs}]")
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            decls.sort();
+            eprintln!(
+                "[settle-dump] collect {file_id:?} path {:?} decls {}: {decls:?}",
+                db.get_vfs().get_file_path(&file_id),
+                decls.len(),
+            );
+        }
 
         Self {
             signature_positions,
@@ -228,7 +289,33 @@ impl FileFacts {
             member_ids,
             syntax_ids,
             owner_ranges,
+            type_decl_spans,
         }
+    }
+
+    /// The unique same-file declaration site covering `range`, if exactly one
+    /// exists. Backs the synthesized-`DocTagClass` admission in
+    /// [`FileRemap::syntax_id`]: identity comes from uniqueness (same file,
+    /// a single covering site — a same-span rename keeps one site, a deletion
+    /// leaves none, a same-span collision leaves several), never from a name
+    /// or geometric guess. Only `Class` sites count: whole-file (chunk) spans
+    /// are produced solely by scoped-class synthesis
+    /// (`ensure_scoped_class_type_decl`), so a candidate of any other kind
+    /// cannot be the synthesis the id names.
+    fn unique_covering_decl(&self, range: TextRange) -> Option<TextRange> {
+        let mut covering: Option<TextRange> = None;
+        for (_, span, kind) in &self.type_decl_spans {
+            if *kind != LuaDeclTypeKind::Class {
+                continue;
+            }
+            if span.start() <= range.start() && range.end() <= span.end() {
+                if covering.is_some() {
+                    return None;
+                }
+                covering = Some(*span);
+            }
+        }
+        covering
     }
 }
 
@@ -394,13 +481,55 @@ impl FileRemap {
             Remap::Unrelated => Remap::Unrelated,
             Remap::Lost => Remap::Lost,
         };
+        // TEMP DUMP (GLUALS_SETTLE_DETAIL): DocTagClass misses only. Env-gated,
+        // behavior-neutral; on the trace-deletion list.
+        if std::env::var_os("GLUALS_SETTLE_DETAIL").is_some()
+            && !id.is_token()
+            && id.get_kind() == LuaSyntaxKind::DocTagClass
+            && self.owns(file_id)
+            && self.facts.is_some()
+        {
+            let mapped_range = match &mapped {
+                Remap::Moved(v) => format!("{:?}", v.get_range()),
+                Remap::Lost => "Lost".to_string(),
+                Remap::Unrelated => "Unrelated".to_string(),
+            };
+            eprintln!(
+                "[settle-dump] syntax_id {file_id:?} old {:?} mapped {mapped_range} hunk {:?}",
+                id.get_range(),
+                self.map.hunk(),
+            );
+        }
+        // Synthesized `DocTagClass` ids from whole-file (chunk) decl spans
+        // (`ensure_scoped_class_type_decl`) never equal their shift image, so
+        // the exact admission in `FileFacts::collect` cannot see them. When
+        // the mapped range has exactly one covering declaration site in this
+        // file, the fact is re-homed onto that site's location: uniqueness is
+        // the identity (a same-span rename keeps one site, a deletion leaves
+        // none, a same-span collision leaves several — both stay `Lost`).
+        if !id.is_token() && id.get_kind() == LuaSyntaxKind::DocTagClass && self.owns(file_id) {
+            if let Remap::Moved(moved) = &mapped {
+                let mapped_range = moved.get_range();
+                if !self
+                    .facts
+                    .as_ref()
+                    .is_some_and(|facts| facts.syntax_ids.contains(moved))
+                    && let Some(cover) = self
+                        .facts
+                        .as_ref()
+                        .and_then(|facts| facts.unique_covering_decl(mapped_range))
+                {
+                    return Remap::Moved(with_range(id, cover));
+                }
+            }
+        }
         self.resolve(
             mapped,
             self.range_is_before_the_hunk(id.get_range()),
             self.facts
                 .as_ref()
                 .is_some_and(|facts| facts.syntax_ids.contains(&id)),
-            |facts, id| facts.syntax_ids.contains(id),
+            |facts, value| facts.syntax_ids.contains(value),
         )
     }
 
@@ -413,6 +542,46 @@ impl FileRemap {
             Remap::Unrelated => Remap::Unrelated,
             Remap::Lost => Remap::Lost,
         };
+        // TEMP DUMP (GLUALS_SETTLE_DETAIL): member-id misses only. Env-gated,
+        // behavior-neutral; on the trace-deletion list.
+        if std::env::var_os("GLUALS_SETTLE_DETAIL").is_some()
+            && self.owns(id.file_id)
+            && self.facts.is_some()
+        {
+            if let Remap::Moved(moved) = &mapped {
+                let known = self
+                    .facts
+                    .as_ref()
+                    .is_some_and(|facts| facts.member_ids.contains(moved.get_syntax_id()));
+                if !known {
+                    let mut known_ranges: Vec<String> = self
+                        .facts
+                        .as_ref()
+                        .map(|facts| {
+                            let mut v: Vec<String> = facts
+                                .member_ids
+                                .iter()
+                                .map(|m| format!("{:?}@{:?}", m.get_kind(), m.get_range()))
+                                .collect();
+                            v.sort();
+                            v
+                        })
+                        .unwrap_or_default();
+                    known_ranges.truncate(60);
+                    eprintln!(
+                        "[settle-dump] member_id {:?} old {:?} mapped {:?} hunk {:?} known {}: {known_ranges:?}",
+                        id.file_id,
+                        id.get_syntax_id().get_range(),
+                        moved.get_syntax_id().get_range(),
+                        self.map.hunk(),
+                        self.facts
+                            .as_ref()
+                            .map(|facts| facts.member_ids.len())
+                            .unwrap_or(0),
+                    );
+                }
+            }
+        }
         self.resolve(
             mapped,
             self.range_is_before_the_hunk(id.get_syntax_id().get_range()),

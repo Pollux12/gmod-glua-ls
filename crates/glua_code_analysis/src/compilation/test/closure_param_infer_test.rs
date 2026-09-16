@@ -1725,4 +1725,50 @@ mod test {
         let player_type = ws.ty("Player");
         assert_eq!(ws.humanize_type(client_type), ws.humanize_type(player_type));
     }
+    #[test]
+    fn test_gmod_hook_callback_prefers_annotated_contract_over_peer_closure() {
+        // A peer `hook.Add` closure filling the same slot carries params only
+        // because this pass copied them off its own receiver. Ranking must
+        // prefer the annotated `GM` contract regardless of batch order, so a
+        // warm re-analysis cannot degrade the callback to `any`.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+            ---@class Player
+            local Player = {}
+
+            ---@class Entity
+            local Entity = {}
+
+            ---@class GM
+            GM = {}
+
+            ---@param player Player
+            ---@param entity Entity
+            ---@return boolean
+            function GM:PhysgunPickup(player, entity) end
+
+            hook.Add("PhysgunPickup", "peer", function(player, entity)
+                peer_hook_player = player
+            end)
+
+            hook.Add("PhysgunPickup", "target", function(ply, ent)
+                target_hook_ply = ply
+                target_hook_ent = ent
+            end)
+            "#,
+        );
+
+        let ply = ws.expr_ty("target_hook_ply");
+        let ent = ws.expr_ty("target_hook_ent");
+        let player_type = ws.ty("Player");
+        let entity_type = ws.ty("Entity");
+        assert_eq!(ws.humanize_type(ply), ws.humanize_type(player_type));
+        assert_eq!(ws.humanize_type(ent), ws.humanize_type(entity_type));
+    }
 }

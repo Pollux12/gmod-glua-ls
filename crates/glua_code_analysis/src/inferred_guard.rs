@@ -464,7 +464,7 @@ impl EmmyLuaAnalysis {
         // still reaches lazy textual readers upstream.
         let mut reanalyzed = changed_files.clone();
         let dirty = self.self_index_and_diff(changed_files);
-        let mut names = dirty.textual_refresh_names.clone();
+        let mut names = dirty.textual_refresh_names();
         let (rippled, ripple_names) = self.ripple_with_refresh_names(dirty);
         reanalyzed.extend(rippled);
         names.extend(ripple_names);

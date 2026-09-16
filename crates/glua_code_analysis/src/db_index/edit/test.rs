@@ -316,6 +316,351 @@ fn adding_a_field_to_a_table_literal_adds_a_member_key() {
         is_true()
     );
 }
+/// Shift-only probe: insert a blank line at the top and dump every export key
+/// whose hash moves. Must stay empty: a pure offset shift is not a change.
+/// The fixture covers every export family in one file: members, type decls
+/// (+supers, generics), signatures (+doc attrs, overloads, param/return
+/// docs), type caches, properties with attribute uses, operators,
+/// metatables, module exports, load edges and namespaces.
+#[gtest]
+fn shift_only_edit_produces_an_empty_export_diff_dumping_movers() {
+    let first = r#"---@meta
+---@class ShiftProbe
+---@field name string
+---@generic T
+---@param value T
+---@return T
+---@nodiscard
+---@version >5.1
+---@export namespace
+local ShiftProbe = {}
+function ShiftProbe.identify(value) return value end
+---@param count integer
+---@return string
+function ShiftProbe.describe(count) return tostring(count) end
+registry = { first = 1 }
+result = ShiftProbe.describe(1)
+return ShiftProbe
+"#;
+    let second = format!("\n{first}");
+    let mut ws = workspace();
+    let uri = ws.virtual_url_generator.new_uri("lua/shift_probe.lua");
+    let file_id = write(&mut ws, &uri, first);
+    let map = PositionMap::new(first, &second);
+    let old = export_map(
+        ws.analysis.compilation.get_db(),
+        file_id,
+        &FileRemap::unvalidated(file_id, map),
+    );
+    write(&mut ws, &uri, &second);
+    let new = export_map(
+        ws.analysis.compilation.get_db(),
+        file_id,
+        &FileRemap::identity(file_id),
+    );
+    let diff = diff_exports(&old, &new);
+    expect_that!(diff.is_empty(), is_true(), "shift-only movers: {diff:?}");
+}
+
+/// Narrower shift probes, one per hashed-payload family, so a failure names
+/// the leaking value shape rather than just "something moved".
+#[gtest]
+fn shift_only_member_key_and_owner_hash_stable() {
+    let diff = diff_after_edit(
+        "registry = { first = 1 }\nregistry.second = 2\n",
+        "\nregistry = { first = 1 }\nregistry.second = 2\n",
+    );
+    expect_that!(diff.is_empty(), is_true(), "shift-only movers: {diff:?}");
+}
+
+#[gtest]
+fn shift_only_signature_doc_payload_hash_stable() {
+    let diff = diff_after_edit(
+        "---@param name string\n---@return string\nfunction describe(name) return name end\n",
+        "\n---@param name string\n---@return string\nfunction describe(name) return name end\n",
+    );
+    expect_that!(diff.is_empty(), is_true(), "shift-only movers: {diff:?}");
+}
+
+#[gtest]
+fn shift_only_type_decl_payload_hash_stable() {
+    let diff = diff_after_edit(
+        "---@class ShiftProbe\n---@field name string\nlocal ShiftProbe = {}\nreturn ShiftProbe\n",
+        "\n---@class ShiftProbe\n---@field name string\nlocal ShiftProbe = {}\nreturn ShiftProbe\n",
+    );
+    expect_that!(diff.is_empty(), is_true(), "shift-only movers: {diff:?}");
+}
+
+#[gtest]
+fn shift_only_property_attribute_payload_hash_stable() {
+    let diff = diff_after_edit(
+        "---@nodiscard\n---@version >5.1\nfunction compute(value) return value end\n",
+        "\n---@nodiscard\n---@version >5.1\nfunction compute(value) return value end\n",
+    );
+    expect_that!(diff.is_empty(), is_true(), "shift-only movers: {diff:?}");
+}
+#[gtest]
+fn shift_only_doc_instance_and_table_const_payload_hash_stable() {
+    let diff = diff_after_edit(
+        "---@class Widget\nlocal Widget = {}\n---@type Widget\ninstance = {}\n---@return Widget\nfunction make() return instance end\n",
+        "\n---@class Widget\nlocal Widget = {}\n---@type Widget\ninstance = {}\n---@return Widget\nfunction make() return instance end\n",
+    );
+    expect_that!(diff.is_empty(), is_true(), "shift-only movers: {diff:?}");
+}
+#[gtest]
+fn shift_only_branch_realm_block_hash_stable() {
+    let diff = diff_after_edit(
+        "shared = 1\nif CLIENT then\nclient_only = 2\nend\nshared_tail = 3\n",
+        "\nshared = 1\nif CLIENT then\nclient_only = 2\nend\nshared_tail = 3\n",
+    );
+    expect_that!(diff.is_empty(), is_true(), "shift-only movers: {diff:?}");
+}
+#[gtest]
+fn shift_only_metatable_binding_hash_stable() {
+    let diff = diff_after_edit(
+        "MT = { __index = {} }\ninstance = setmetatable({}, MT)\n",
+        "\nMT = { __index = {} }\ninstance = setmetatable({}, MT)\n",
+    );
+    expect_that!(diff.is_empty(), is_true(), "shift-only movers: {diff:?}");
+}
+
+#[gtest]
+fn shift_only_operator_payload_hash_stable() {
+    let diff = diff_after_edit(
+        "---@class Counter\n---@operator add(Counter): Counter\nlocal Counter = {}\nreturn Counter\n",
+        "\n---@class Counter\n---@operator add(Counter): Counter\nlocal Counter = {}\nreturn Counter\n",
+    );
+    expect_that!(diff.is_empty(), is_true(), "shift-only movers: {diff:?}");
+}
+#[gtest]
+fn shift_only_net_flow_payload_hash_stable() {
+    let first = "util.AddNetworkString(\"ProbeMessage\")\nnet.Start(\"ProbeMessage\")\nnet.WriteString(\"hello\")\nnet.Broadcast()\nnet.Receive(\"ProbeMessage\", function() local text = net.ReadString() end)\n";
+    let diff = diff_after_edit(first, &format!("\n{first}"));
+    expect_that!(diff.is_empty(), is_true(), "shift-only movers: {diff:?}");
+}
+
+#[gtest]
+fn shift_only_module_and_load_edge_hash_stable() {
+    let first = "local helper = include(\"sh_helper.lua\")\nhelper.ping()\nreturn {}\n";
+    let diff = diff_after_edit(first, &format!("\n{first}"));
+    expect_that!(diff.is_empty(), is_true(), "shift-only movers: {diff:?}");
+}
+#[gtest]
+fn shift_only_instance_return_flag_payload_hash_stable() {
+    let first = "---@class Widget\nlocal Widget = {}\n---@return (instance) Widget\nfunction make() return {} end\n";
+    let diff = diff_after_edit(first, &format!("\n{first}"));
+    expect_that!(diff.is_empty(), is_true(), "shift-only movers: {diff:?}");
+}
+#[gtest]
+fn shift_only_overload_and_generic_payload_hash_stable() {
+    let first = "---@generic T\n---@param value T\n---@return T\n---@overload fun(other: string): string\nfunction identify(value) return value end\n";
+    let diff = diff_after_edit(first, &format!("\n{first}"));
+    expect_that!(diff.is_empty(), is_true(), "shift-only movers: {diff:?}");
+}
+#[gtest]
+fn shift_only_blank_line_inside_body_hash_stable() {
+    let first = "config = config or {}\nfunction config.describe(name)\nreturn name\nend\n";
+    let second = "config = config or {}\nfunction config.describe(name)\n\nreturn name\nend\n";
+    let diff = diff_after_edit(first, second);
+    expect_that!(diff.is_empty(), is_true(), "shift-only movers: {diff:?}");
+}
+
+/// The `diff_after_edit` probes above re-index through the fast test-only
+/// `update_file_by_uri` path; the production edit path (`update_file_text_only`
+/// + `self_index_and_diff` with a validated remap over the re-indexed file)
+/// runs `remap_into_file` first, so a key that survives here must also
+/// survive there. A shift-only edit through that path must produce an empty
+/// diff and no remap-loss dirty set.
+#[gtest]
+fn shift_only_edit_through_self_index_and_diff_is_empty() {
+    let first = "config = config or {}\nfunction config.describe(name)\nreturn name\nend\n";
+    let second = format!("\n{first}");
+    let mut ws = workspace();
+    let uri = ws.virtual_url_generator.new_uri("lua/shift_settle.lua");
+    let file_id = write(&mut ws, &uri, first);
+    ws.analysis
+        .update_file_text_only(&uri, second.clone())
+        .expect("staged text");
+    let dirty = ws.analysis.self_index_and_diff(vec![file_id]);
+    expect_that!(dirty.dirty_len(), eq(0));
+    expect_that!(
+        dirty.textual_refresh_names_len(),
+        eq(0),
+        "shift-only edit must name no refresh names"
+    );
+    ws.analysis.ripple(dirty);
+}
+/// `ContextualUnknown` support names a synthesized `DocTagClass` id per
+/// `---@class` site of the inferred type (`local_inference/mod.rs`
+/// `contextual_type_support`): the `DocTagClass` *kind* paired with the
+/// *name-token* range. That pair exists nowhere in the syntax tree — the real
+/// `DocTagClass` node spans the whole tag, and the name range itself holds a
+/// `TkName` token — so `FileFacts` validation reported the mapped id lost.
+/// Live CityRP observation: a one-line shift of `sh_util.lua` lost 20 files'
+/// `Vector` / `Entity` facts this way. `FileFacts::collect` now admits those
+/// ids by geometry (any type decl declared in the file at that range counts),
+/// so the remap must carry them to their shifted image instead of `Lost`.
+#[gtest]
+fn shift_only_edit_moves_synthesized_doc_class_support_ids() {
+    use glua_parser::{LuaKind, LuaSyntaxKind};
+    let provider = "---@class Vector\nlocal Vector = {}\nreturn Vector\n";
+    let shifted = format!("\n{provider}");
+    let mut ws = workspace();
+    let provider_uri = ws.virtual_url_generator.new_uri("lua/vector_provider.lua");
+    let provider_id = write(&mut ws, &provider_uri, provider);
+    // The name-token range the decl analyzer recorded for `Vector`.
+    let decl_range = ws
+        .analysis
+        .compilation
+        .get_db()
+        .get_type_index()
+        .get_file_type_decl_ids(provider_id)
+        .expect("provider declares a type")
+        .iter()
+        .find_map(|decl_id| {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_type_index()
+                .get_type_decl(decl_id)
+                .and_then(|decl| {
+                    decl.get_locations()
+                        .iter()
+                        .find(|location| location.file_id == provider_id)
+                        .map(|location| location.range)
+                })
+        })
+        .expect("decl location in provider");
+    // Re-index under the shifted text, then remap exactly the id shape
+    // `contextual_type_support` synthesizes for that site.
+    ws.analysis
+        .update_file_text_only(&provider_uri, shifted.clone());
+    ws.analysis.compilation.remove_index(vec![provider_id]);
+    ws.analysis.compilation.update_index(vec![provider_id]);
+    let map = PositionMap::new(provider, &shifted);
+    let remap = FileRemap::validated(ws.analysis.compilation.get_db(), provider_id, map);
+    let id = glua_parser::LuaSyntaxId::new(LuaKind::Syntax(LuaSyntaxKind::DocTagClass), decl_range);
+    let expected = map.map_range(decl_range).expect("a shift maps every range");
+    assert_eq!(
+        remap.syntax_id(provider_id, id),
+        super::Remap::Moved(glua_parser::LuaSyntaxId::new(
+            LuaKind::Syntax(LuaSyntaxKind::DocTagClass),
+            expected,
+        ))
+    );
+}
+/// Whole-file (chunk) decl spans — the shape scoped-class synthesis
+/// (`ensure_scoped_class_type_decl`) registers — never equal their shift
+/// image, so the exact admission cannot see them. `FileRemap::syntax_id`
+/// admits a synthesized `DocTagClass` id whose mapped range has exactly one
+/// covering declaration site in the file, re-homed onto that site. Live
+/// CityRP observation: a one-line shift of `cl_umsgs.lua` lost 3 files'
+/// `cw_*` facts this way (`(DocTagClass, 0..3033)` → `1..3034` vs the new
+/// `0..3034` site). Identity is uniqueness, never a name: a same-span
+/// rename keeps one site (still moves), a deletion leaves none (still
+/// `Lost`).
+#[gtest]
+fn shift_only_edit_rehomes_a_whole_file_doc_class_id_onto_its_unique_cover() {
+    use glua_parser::{LuaKind, LuaSyntaxKind};
+    use rowan::TextRange;
+    // One class decl spanning the whole file, the synthesis shape.
+    let provider = "local ENT = {}\nreturn ENT\n";
+    let shifted = format!("\n{provider}");
+    let mut ws = workspace();
+    let provider_uri = ws.virtual_url_generator.new_uri("lua/synth_provider.lua");
+    let provider_id = write(&mut ws, &provider_uri, provider);
+    // Register a whole-file class site directly: the unit analogue of what
+    // `ensure_scoped_class_type_decl` records for a scoped file.
+    let whole = TextRange::new(TextSize::new(0), TextSize::new(provider.len() as u32));
+    ws.analysis
+        .compilation
+        .get_db_mut()
+        .get_type_index_mut()
+        .add_type_decl(
+            provider_id,
+            crate::LuaTypeDecl::new(
+                provider_id,
+                whole,
+                "SynthClass".to_string(),
+                crate::LuaDeclTypeKind::Class,
+                crate::LuaTypeFlag::None.into(),
+                crate::LuaTypeDeclId::global("SynthClass"),
+            ),
+        );
+    ws.analysis
+        .update_file_text_only(&provider_uri, shifted.clone());
+    ws.analysis.compilation.remove_index(vec![provider_id]);
+    ws.analysis.compilation.update_index(vec![provider_id]);
+    // Re-register the shifted whole-file site the way synthesis would.
+    let shifted_whole = TextRange::new(TextSize::new(0), TextSize::new(shifted.len() as u32));
+    ws.analysis
+        .compilation
+        .get_db_mut()
+        .get_type_index_mut()
+        .add_type_decl(
+            provider_id,
+            crate::LuaTypeDecl::new(
+                provider_id,
+                shifted_whole,
+                "SynthClass".to_string(),
+                crate::LuaDeclTypeKind::Class,
+                crate::LuaTypeFlag::None.into(),
+                crate::LuaTypeDeclId::global("SynthClass"),
+            ),
+        );
+    let map = PositionMap::new(provider, &shifted);
+    let remap = FileRemap::validated(ws.analysis.compilation.get_db(), provider_id, map);
+    let id = glua_parser::LuaSyntaxId::new(LuaKind::Syntax(LuaSyntaxKind::DocTagClass), whole);
+    assert_eq!(
+        remap.syntax_id(provider_id, id),
+        super::Remap::Moved(glua_parser::LuaSyntaxId::new(
+            LuaKind::Syntax(LuaSyntaxKind::DocTagClass),
+            shifted_whole,
+        ))
+    );
+}
+
+/// Deleting the covering declaration must still lose the fact: with no
+/// covering site the unique-cover rule has no candidate, so the dependent is
+/// re-analysed instead of being re-homed onto a guess.
+#[gtest]
+fn deleted_covering_decl_still_loses_the_synthesized_id() {
+    use glua_parser::{LuaKind, LuaSyntaxKind};
+    use rowan::TextRange;
+    let provider = "local ENT = {}\nreturn ENT\n";
+    // Destroys the class site while keeping a mapped image: removing the
+    // table literal's braces shrinks the file, so the whole-file range maps
+    // onto the shorter text, which the re-index holds no class site at.
+    let second = "local ENT = nil\nreturn EN";
+    assert!(second.len() < provider.len());
+    let mut ws = workspace();
+    let provider_uri = ws.virtual_url_generator.new_uri("lua/synth_gone.lua");
+    let provider_id = write(&mut ws, &provider_uri, provider);
+    let whole = TextRange::new(TextSize::new(0), TextSize::new(provider.len() as u32));
+    ws.analysis
+        .compilation
+        .get_db_mut()
+        .get_type_index_mut()
+        .add_type_decl(
+            provider_id,
+            crate::LuaTypeDecl::new(
+                provider_id,
+                whole,
+                "GoneClass".to_string(),
+                crate::LuaDeclTypeKind::Class,
+                crate::LuaTypeFlag::None.into(),
+                crate::LuaTypeDeclId::global("GoneClass"),
+            ),
+        );
+    ws.analysis
+        .update_file_text_only(&provider_uri, second.to_string());
+    ws.analysis.compilation.remove_index(vec![provider_id]);
+    ws.analysis.compilation.update_index(vec![provider_id]);
+    let map = PositionMap::new(provider, second);
+    let remap = FileRemap::validated(ws.analysis.compilation.get_db(), provider_id, map);
+    let id = glua_parser::LuaSyntaxId::new(LuaKind::Syntax(LuaSyntaxKind::DocTagClass), whole);
+    assert!(remap.syntax_id(provider_id, id).is_lost());
+}
 
 // --- Remap ---
 

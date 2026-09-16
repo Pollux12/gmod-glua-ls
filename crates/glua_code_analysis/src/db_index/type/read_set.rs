@@ -36,6 +36,11 @@ use smol_str::SmolStr;
 pub(crate) struct InferenceReadSet {
     pub type_owners: FxHashSet<LuaTypeOwner>,
     pub member_maps: FxHashMap<LuaMemberOwner, (u64, u64, usize)>,
+    /// Key-indexed member reads (`get_current_members_for_key`): the reverse
+    /// owner lookup draws narrowing candidates from the live member map, so a
+    /// pass that read a key must re-derive once a member joins or leaves it.
+    /// Versioned as `(homing_revision, slot_len)` for O(members found) cost.
+    pub member_keys: FxHashMap<LuaMemberKey, (u64, usize)>,
     pub signatures: FxHashSet<LuaSignatureId>,
     pub params: FxHashSet<LuaSignatureId>,
     pub modules: FxHashSet<FileId>,
@@ -56,6 +61,9 @@ impl InferenceReadSet {
         self.type_owners.extend(other.type_owners);
         for (owner, version) in other.member_maps {
             self.member_maps.entry(owner).or_insert(version);
+        }
+        for (key, version) in other.member_keys {
+            self.member_keys.entry(key).or_insert(version);
         }
         self.signatures.extend(other.signatures);
         self.params.extend(other.params);
@@ -82,7 +90,10 @@ pub(crate) struct InferredReturnReadRecord {
 thread_local! {
     static DEPTH: Cell<u32> = const { Cell::new(0) };
     static TRACK_MEMBER_MAPS: Cell<bool> = const { Cell::new(false) };
-    static MEMBER_MAPS: RefCell<FxHashMap<LuaMemberOwner, (u64, u64, usize)>> = RefCell::new(FxHashMap::default());
+    static MEMBER_MAPS: RefCell<FxHashMap<LuaMemberOwner, (u64, u64, usize)>> =
+        RefCell::new(FxHashMap::default());
+    static MEMBER_KEYS: RefCell<FxHashMap<LuaMemberKey, (u64, usize)>> =
+        RefCell::new(FxHashMap::default());
     static READS: RefCell<FxHashSet<LuaTypeOwner>> = RefCell::new(FxHashSet::default());
     static SIGNATURES: RefCell<FxHashSet<LuaSignatureId>> = RefCell::new(FxHashSet::default());
     static PARAMS: RefCell<FxHashSet<LuaSignatureId>> = RefCell::new(FxHashSet::default());
@@ -99,6 +110,7 @@ pub(crate) fn arm() {
         TRACK_MEMBER_MAPS.with(|track| track.set(false));
         READS.with(|reads| reads.borrow_mut().clear());
         MEMBER_MAPS.with(|maps| maps.borrow_mut().clear());
+        MEMBER_KEYS.with(|keys| keys.borrow_mut().clear());
         SIGNATURES.with(|signatures| signatures.borrow_mut().clear());
         PARAMS.with(|params| params.borrow_mut().clear());
         MODULES.with(|modules| modules.borrow_mut().clear());
@@ -129,6 +141,7 @@ pub(crate) fn disarm() -> InferenceReadSet {
         InferenceReadSet {
             type_owners: READS.with(|reads| reads.borrow().clone()),
             member_maps: MEMBER_MAPS.with(|maps| maps.borrow().clone()),
+            member_keys: MEMBER_KEYS.with(|keys| keys.borrow().clone()),
             signatures: SIGNATURES.with(|signatures| signatures.borrow().clone()),
             params: PARAMS.with(|params| params.borrow().clone()),
             modules: MODULES.with(|modules| modules.borrow().clone()),
@@ -141,6 +154,7 @@ pub(crate) fn disarm() -> InferenceReadSet {
         InferenceReadSet {
             type_owners: READS.with(|reads| std::mem::take(&mut *reads.borrow_mut())),
             member_maps: MEMBER_MAPS.with(|maps| std::mem::take(&mut *maps.borrow_mut())),
+            member_keys: MEMBER_KEYS.with(|keys| std::mem::take(&mut *keys.borrow_mut())),
             signatures: SIGNATURES.with(|signatures| std::mem::take(&mut *signatures.borrow_mut())),
             params: PARAMS.with(|params| std::mem::take(&mut *params.borrow_mut())),
             modules: MODULES.with(|modules| std::mem::take(&mut *modules.borrow_mut())),
@@ -252,6 +266,23 @@ pub(crate) fn record_member_map(index: &crate::LuaMemberIndex, owner: &LuaMember
     }
 }
 
+/// Records a key-indexed member read (`get_current_members_for_key`).
+///
+/// The reverse owner lookup answers from the members filed under one key, so
+/// the version is that key's slot: `(homing_revision, slot_len)`. A new owner
+/// gaining the key grows the slot; a re-home between owners bumps the
+/// revision. First read wins per collection, matching `record_member_map`.
+#[inline]
+pub(crate) fn record_member_key_read(index: &crate::LuaMemberIndex, key: &LuaMemberKey) {
+    if DEPTH.with(Cell::get) > 0 && TRACK_MEMBER_MAPS.with(Cell::get) {
+        MEMBER_KEYS.with(|keys| {
+            keys.borrow_mut()
+                .entry(key.clone())
+                .or_insert_with(|| index.key_read_version(key));
+        });
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct InferenceReadVersion {
     type_epoch: u64,
@@ -282,8 +313,11 @@ impl InferenceReadVersion {
                 .member_maps
                 .iter()
                 .any(|(owner, version)| db.get_member_index().read_version(owner) != *version)
+            || reads
+                .member_keys
+                .iter()
+                .any(|(key, version)| db.get_member_index().key_read_version(key) != *version)
     }
-
     fn value_reads_changed(&self, db: &crate::DbIndex, reads: &InferenceReadSet) -> bool {
         reads.type_owners.iter().any(|key| db.get_type_index().type_write_version(key) > self.type_epoch)
             || reads.signatures.iter().any(|key| db.get_signature_index().return_write_version(key) > self.return_epoch)

@@ -800,9 +800,7 @@ fn infer_implicit_method_self_type(
     // "the index is not built yet", and memoising that `None` would freeze the
     // pre-pipeline answer into every later read of this method.
     let cacheable = cache.get_config().call_site_params_visible;
-    if cacheable
-        && let Some(cached) = cache.self_type_cache.get(&func_syntax_id)
-    {
+    if cacheable && let Some(cached) = cache.self_type_cache.get(&func_syntax_id) {
         return cached.clone();
     }
 

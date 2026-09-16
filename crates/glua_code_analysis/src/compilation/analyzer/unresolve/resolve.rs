@@ -2461,9 +2461,7 @@ fn materialize_str_tpl_class_from_call(
     // A real declaration already owns this name (a `---@class` the author
     // wrote, or a Register-synthesized one): the materialization must not add
     // edges behind its back, or the result depends on which pass ran first.
-    let should_attach_super = !db
-        .get_type_index()
-        .has_non_auto_declaration(&class_decl_id);
+    let should_attach_super = !db.get_type_index().has_non_auto_declaration(&class_decl_id);
     // A re-settled call replays the same materialization: only a novel decl
     // or super edge may bump the special-call epoch. The facts carry their
     // full identity (call-site, class, constraint, source), so replaying them

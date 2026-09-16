@@ -839,12 +839,10 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
             crate::compilation::analyzer::rederive_vgui_parent_fallbacks(db, context)
         });
         if let Some(t_parent) = t_parent {
-            let elapsed = t_parent.elapsed();
-            if log::log_enabled!(log::Level::Info) {
-                log::info!("gmod post: vgui_parent_relations cost {elapsed:?}");
-            } else {
-                eprintln!("gmod post: vgui_parent_relations cost {elapsed:?}");
-            }
+            log::info!(
+                "gmod post: vgui_parent_relations cost {:?}",
+                t_parent.elapsed()
+            );
         }
 
         let t_local_register = do_profile.then(std::time::Instant::now);

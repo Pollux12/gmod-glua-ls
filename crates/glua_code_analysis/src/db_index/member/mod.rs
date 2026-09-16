@@ -250,6 +250,21 @@ impl LuaMemberIndex {
         self.homing_revision
     }
 
+    /// Version for a key-indexed member read (`get_current_members_for_key`).
+    ///
+    /// Cost is O(members found): the slot length is the map lookup every
+    /// caller already pays, paired with the homing revision every owner or
+    /// key move bumps. A new owner gaining the key grows the slot; a re-home
+    /// between owners bumps the revision, so both directions mark stale.
+    pub(crate) fn key_read_version(&self, key: &LuaMemberKey) -> (u64, usize) {
+        (
+            self.homing_revision,
+            self.current_members_by_key
+                .get(key)
+                .map_or(0, |ids| ids.len()),
+        )
+    }
+
     /// Reserves capacity for one file's worth of member writes.
     ///
     /// `members` is a cheap upper-bound hint (see
@@ -453,6 +468,15 @@ impl LuaMemberIndex {
 
     pub fn has_synthesized_owner(&self, id: &LuaMemberId) -> bool {
         self.synthesized_owner_members.contains(id)
+    }
+
+    /// The global path this member reached its owner through, if it named one:
+    /// a write through the path itself, an alias of it, or a table literal
+    /// initialising it. Members carrying provenance are owned by the
+    /// class-flip machinery (`set_global_path_class`), not by the prefix-type
+    /// read a settled pass re-derives.
+    pub fn member_path_provenance(&self, id: &LuaMemberId) -> Option<&GlobalId> {
+        self.member_path_provenance.get(id)
     }
 
     /// Records that `id` was created by deferred resolution, so its first home
@@ -1736,6 +1760,7 @@ impl LuaMemberIndex {
     }
 
     pub fn get_current_members_for_key(&self, key: &LuaMemberKey) -> Vec<&LuaMember> {
+        crate::db_index::read_set::record_member_key_read(self, key);
         let Some(member_ids) = self.current_members_by_key.get(key) else {
             return Vec::new();
         };

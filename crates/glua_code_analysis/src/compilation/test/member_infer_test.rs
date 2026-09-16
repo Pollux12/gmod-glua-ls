@@ -4571,7 +4571,7 @@ mod runtime_member_write_ownership {
             ---@field exterior door_exterior
             "#,
         );
-        ws.def_file(
+        let writer = ws.def_file(
             "lua/portals.lua",
             &BRANCH_WRITES.replace("RUNTIME_CLASS", "Entity"),
         );
@@ -4584,6 +4584,54 @@ mod runtime_member_write_ownership {
             class_member_item_exists(&ws, "door_exterior", "interior"),
             "the subclasses' own declarations are untouched"
         );
+
+        // The settled owner pass must converge with the walk, not mint a
+        // shadowing placement on re-analysis.
+        ws.analysis.reindex_files(vec![writer]);
+        assert!(
+            !class_member_item_exists(&ws, "Entity", "interior"),
+            "re-analysis must not hand a base class a field its subclasses declare"
+        );
+        assert!(
+            class_member_item_exists(&ws, "door_exterior", "interior"),
+            "re-analysis must keep the subclasses' own declarations"
+        );
+    }
+
+    /// The completion regression the owner settle must not reintroduce: an
+    /// index-expression write onto a bare class-name local keeps the walk's
+    /// placement across re-analysis, so the member survives on the class the
+    /// write named instead of detaching to the parent.
+    #[test]
+    fn bare_class_write_keeps_member_on_named_class_across_reanalysis() {
+        let mut ws = gmod_workspace();
+        ws.def_file(
+            "lua/proxy.lua",
+            r#"
+            ---@alias ProxyHandler.Setter fun(raw: any)
+
+            ---@class ProxyHandler
+            ---@field set? ProxyHandler.Setter
+            "#,
+        );
+        let consumer = ws.def_file(
+            "lua/handler.lua",
+            r#"
+            ---@class MHandler: ProxyHandler
+            local MHandler
+
+            MHandler.set = function(raw) end
+            "#,
+        );
+        assert!(
+            class_member_item_exists(&ws, "MHandler", "set"),
+            "the walk homes the write onto the named class"
+        );
+        ws.analysis.reindex_files(vec![consumer]);
+        assert!(
+            class_member_item_exists(&ws, "MHandler", "set"),
+            "re-analysis must keep the write homed onto the named class"
+        );
     }
 }
 
@@ -4594,7 +4642,9 @@ mod multi_site_member_and_alias_inference {
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
-    use crate::{DiagnosticCode, VirtualWorkspace};
+    use crate::{
+        DiagnosticCode, LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, VirtualWorkspace,
+    };
 
     fn file_diagnostic_messages(
         ws: &mut VirtualWorkspace,
@@ -4756,5 +4806,92 @@ PLUGIN.other_field = 123
             file_diagnostic_messages(&mut ws, plugin_a, DiagnosticCode::UndefinedMethod),
             is_empty()
         );
+    }
+
+    #[gtest]
+    fn settled_owner_rederive_keeps_ownerless_class_write_from_shadowing_inherited_field() {
+        // The completion regression `test_field_is_alias_function`: the walk
+        // homes `MHandler.set` onto `MHandler`, and the settled owner pass
+        // must keep that placement across re-analysis (the bug detached it,
+        // leaving `set` resolvable only through the parent).
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@alias ProxyHandler.Setter fun(raw: any)
+
+            ---@class ProxyHandler
+            ---@field set? ProxyHandler.Setter
+            "#,
+        );
+        let consumer = ws.def(
+            r#"
+            ---@class MHandler: ProxyHandler
+            local MHandler
+
+            MHandler.set = function(raw) end
+            "#,
+        );
+        // The walk homes the write onto `MHandler`; cold and re-analysis
+        // must agree on that placement.
+        let mhandler_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("MHandler"));
+        let owner_names = |ws: &VirtualWorkspace| -> Vec<String> {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_member_index()
+                .get_members(&mhandler_owner)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|member| member.get_key().get_name().map(str::to_string))
+                .collect()
+        };
+        assert_that!(owner_names(&ws), contains(eq(&"set".to_string())));
+
+        ws.analysis.reindex_files(vec![consumer]);
+        assert_that!(owner_names(&ws), contains(eq(&"set".to_string())));
+    }
+
+    #[gtest]
+    fn settled_owner_rederive_replaces_unknown_key_once_iter_var_settles() {
+        // The `ExprType(Unknown)` collapse: a dynamic write through a
+        // `pairs` loop variable is filed under the unknown key while the
+        // variable settles; once it does, the key must be replaced (not
+        // accreted beside the collapsed one).
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            local registry = { alpha = 1 }
+            local target = {}
+            for key, _ in pairs(registry) do
+                target[key] = 1
+            end
+            "#,
+        );
+        let unknown_key = LuaMemberKey::ExprType(LuaType::Unknown);
+        let collapsed_before: Vec<String> = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_member_index()
+            .get_current_members_for_key(&unknown_key)
+            .into_iter()
+            .filter(|member| member.get_file_id() == file_id)
+            .filter_map(|member| member.get_key().get_name().map(str::to_string))
+            .collect();
+        ws.analysis.reindex_files(vec![file_id]);
+        let collapsed_after: Vec<String> = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_member_index()
+            .get_current_members_for_key(&unknown_key)
+            .into_iter()
+            .filter(|member| member.get_file_id() == file_id)
+            .filter_map(|member| member.get_key().get_name().map(str::to_string))
+            .collect();
+        // The collapsed key set must not grow across re-analysis: whatever
+        // the walk filed, the settled re-take converges instead of minting
+        // a second key beside the first.
+        assert_that!(collapsed_after.len(), le(collapsed_before.len()));
     }
 }

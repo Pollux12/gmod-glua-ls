@@ -27,33 +27,69 @@ pub fn remap_into_file(db: &mut DbIndex, remap: &FileRemap) -> HashSet<FileId> {
     if remap.map.is_identity() {
         return dirty;
     }
-
+    let trace = std::env::var_os("GLUALS_SETTLE_TRACE").is_some();
     // The member index drives the assignment-contribution store, so its
     // signature half is threaded through it.
     let (forgotten, member_dirty) = db.get_member_index_mut().remap_file_element_owners(remap);
+    if trace && !member_dirty.is_empty() {
+        eprintln!("[settle-trace]   remap pass member_element_owners: {member_dirty:?}");
+    }
     dirty.extend(member_dirty);
     if !forgotten.is_empty() {
         db.get_type_index_mut()
             .remove_member_type_caches(&forgotten);
     }
 
-    dirty.extend(
-        db.get_call_site_param_index_mut()
-            .remap_file_signatures(remap),
-    );
-    dirty.extend(db.get_signature_index_mut().remap_settled_reads(remap));
-    dirty.extend(db.get_signature_index_mut().remap_payload_types(remap));
-    dirty.extend(db.get_type_index_mut().remap_file_identities(remap));
-    dirty.extend(
-        db.get_dynamic_field_index_mut()
-            .remap_file_table_owners(remap),
-    );
-    dirty.extend(db.get_metatable_index_mut().remap_file_ranges(remap));
-    dirty.extend(
-        db.get_flow_index_mut()
-            .remap_special_call_effect_types(remap),
-    );
+    let pass = db
+        .get_call_site_param_index_mut()
+        .remap_file_signatures(remap);
+    if trace && !pass.is_empty() {
+        eprintln!("[settle-trace]   remap pass call_site_signatures: {pass:?}");
+    }
+    dirty.extend(pass);
+    let pass = db.get_signature_index_mut().remap_settled_reads(remap);
+    if trace && !pass.is_empty() {
+        eprintln!("[settle-trace]   remap pass signature_settled_reads: {pass:?}");
+    }
+    dirty.extend(pass);
+    let pass = db.get_signature_index_mut().remap_payload_types(remap);
+    if trace && !pass.is_empty() {
+        eprintln!("[settle-trace]   remap pass signature_payload_types: {pass:?}");
+    }
+    dirty.extend(pass);
+    let pass = db.get_type_index_mut().remap_file_identities(remap);
+    if trace && !pass.is_empty() {
+        eprintln!("[settle-trace]   remap pass type_identities: {pass:?}");
+    }
+    dirty.extend(pass);
+    let pass = db
+        .get_dynamic_field_index_mut()
+        .remap_file_table_owners(remap);
+    if trace && !pass.is_empty() {
+        eprintln!("[settle-trace]   remap pass dynamic_field_owners: {pass:?}");
+    }
+    dirty.extend(pass);
+    let pass = db.get_metatable_index_mut().remap_file_ranges(remap);
+    if trace && !pass.is_empty() {
+        eprintln!("[settle-trace]   remap pass metatable_ranges: {pass:?}");
+    }
+    dirty.extend(pass);
+    let pass = db
+        .get_flow_index_mut()
+        .remap_special_call_effect_types(remap);
+    if trace && !pass.is_empty() {
+        eprintln!("[settle-trace]   remap pass flow_effect_types: {pass:?}");
+    }
+    dirty.extend(pass);
 
+    if trace {
+        let mut all: Vec<_> = dirty.iter().collect();
+        all.sort_unstable();
+        eprintln!(
+            "[settle-trace]   remap total: {} file(s): {all:?}",
+            all.len()
+        );
+    }
     dirty.remove(&remap.file_id);
     dirty
 }

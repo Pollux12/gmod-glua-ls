@@ -672,17 +672,41 @@ pub struct DirtySet {
     changed_sources: FxHashSet<FileId>,
     /// Names whose textual referencers owe a diagnostic refresh.
     ///
-    /// Derived from the batch's export diff in [`EmmyLuaAnalysis::self_index_and_diff`]:
-    /// each changed/added/removed [`ExportKey`] contributes the Lua name(s) another
-    /// file would use to name it, resolved against the post-edit index with a
-    /// pre-edit snapshot as fallback for removed keys (whose index entries are
-    /// already gone). The ripple's own export diffs contribute a second sideband
-    /// set through `ripple_with_refresh_names`, merged with this one after the
-    /// ripple. Neither set drives reindexing: they stay out of `pending` and
-    /// `dirty.files` and only widen the watched-file method's returned
-    /// diagnostic list. They are deliberately ignored by [`DirtySet::is_empty`] and
-    /// [`DirtySet::dirty_len`].
-    textual_refresh_names: FxHashSet<SmolStr>,
+    /// Two independent channels share this path downstream but are emitted and
+    /// filtered separately:
+    /// - `export_refresh_names`: from the batch's export diff in
+    ///   [`EmmyLuaAnalysis::self_index_and_diff`]. Each changed/added/removed
+    ///   [`ExportKey`] contributes the Lua name(s) another file would use to
+    ///   name it, resolved against the post-edit index with a pre-edit snapshot
+    ///   as fallback for removed keys (whose index entries are already gone).
+    ///   Some of these are deliberately callee-anchored: a
+    ///   [`ExportKey::ContributedParam`] resolves its owner in the *callee's*
+    ///   file, which is not in the settled set when the name is emitted.
+    ///   These names are always legitimate and pass through untouched.
+    /// - `decl_rename_refresh_names`: from `decl_rename_refresh_names` in
+    ///   [`EmmyLuaAnalysis::self_index_and_diff`] and from the ripple's
+    ///   renamed-without-export moves. Anchored in the edited file's own
+    ///   declarations, these are the channel transient keystrokes pollute (a
+    ///   bare `p` parsed as a global decl at a fixed position, renamed to
+    ///   `pr`, `pri`, ... on each keystroke), so only this channel is
+    ///   validated before it fans out. The ripple's own export diffs contribute
+    ///   to both channels through `ripple_with_refresh_names`, merged with
+    ///   these after the ripple. Neither channel drives reindexing: they stay
+    ///   out of `pending` and `dirty.files` and only widen the watched-file
+    ///   method's returned diagnostic list. They are deliberately ignored by
+    ///   [`DirtySet::is_empty`] and [`DirtySet::dirty_len`].
+    export_refresh_names: FxHashSet<SmolStr>,
+    decl_rename_refresh_names: FxHashSet<SmolStr>,
+    /// Diagnostic provenance for the dirty set, populated in
+    /// [`EmmyLuaAnalysis::self_index_and_diff`]: the files `remap_into_file`
+    /// reported as unrewritable (`remap_losses`) vs the files the export diff
+    /// named (`diff_dependents`, including evidence and unresolved-path
+    /// dependents). Never read by the ripple and excluded from
+    /// [`DirtySet::dirty_len`] and [`DirtySet::is_empty`] like the refresh
+    /// sidebands; exists so the determinism harness can assert the remap path
+    /// lost nothing and attribute every dirty file to a named source.
+    remap_losses: FxHashSet<FileId>,
+    diff_dependents: FxHashSet<FileId>,
 }
 
 impl DirtySet {
@@ -699,8 +723,11 @@ impl DirtySet {
         self.sources.extend(other.sources);
         self.removed.extend(other.removed);
         self.guard_work |= other.guard_work;
-        self.textual_refresh_names
-            .extend(other.textual_refresh_names);
+        self.export_refresh_names.extend(other.export_refresh_names);
+        self.decl_rename_refresh_names
+            .extend(other.decl_rename_refresh_names);
+        self.remap_losses.extend(other.remap_losses);
+        self.diff_dependents.extend(other.diff_dependents);
         #[cfg(test)]
         self.changed_sources.extend(other.changed_sources);
         self.guard_snapshot.merge(other.guard_snapshot);
@@ -709,6 +736,8 @@ impl DirtySet {
     /// How many files the ripple still owes.
     ///
     /// Textual refresh names never count: they owe diagnostics, not reanalysis.
+    /// Diagnostic provenance (`remap_losses`, `diff_dependents`) never counts
+    /// either: the ripple never reads it.
     pub fn dirty_len(&self) -> usize {
         self.files.len()
     }
@@ -718,28 +747,68 @@ impl DirtySet {
         &self.files
     }
 
+    /// The files the ripple still owes. Read-only diagnostic access for the
+    /// determinism harness's accounting-completeness check; the ripple consumes
+    /// `dirty.files` by taking the set, never through this.
+    pub fn dirty_files(&self) -> &FxHashSet<FileId> {
+        &self.files
+    }
+
+    /// The files `remap_into_file` reported as unrewritable for this batch.
+    /// Read-only diagnostic provenance for the determinism harness: the ripple
+    /// never reads it, and it counts toward nothing.
+    pub fn remap_losses(&self) -> &FxHashSet<FileId> {
+        &self.remap_losses
+    }
+
+    /// The files the export diff named for this batch (diff dependents plus
+    /// evidence and unresolved-path dependents). Same read-only status as
+    /// [`DirtySet::remap_losses`].
+    pub fn diff_dependents(&self) -> &FxHashSet<FileId> {
+        &self.diff_dependents
+    }
+
     #[cfg(test)]
     pub fn changed_sources(&self) -> &FxHashSet<FileId> {
         &self.changed_sources
     }
 
-    #[cfg(test)]
-    pub fn textual_refresh_names(&self) -> &FxHashSet<SmolStr> {
-        &self.textual_refresh_names
+    /// The union of both sideband channels, for callers that resolve without
+    /// validating (watched-file widening, nested late-param merge).
+    pub fn textual_refresh_names(&self) -> FxHashSet<SmolStr> {
+        let mut names = self.export_refresh_names.clone();
+        names.extend(self.decl_rename_refresh_names.iter().cloned());
+        names
     }
 
     /// Takes the sideband textual refresh names out of the set, so a caller
     /// can schedule their diagnostics without holding on to the ripple's
     /// re-index work.
     pub fn take_textual_refresh_names(&mut self) -> std::collections::HashSet<SmolStr> {
-        std::mem::take(&mut self.textual_refresh_names)
+        let mut names = std::mem::take(&mut self.export_refresh_names);
+        names.extend(std::mem::take(&mut self.decl_rename_refresh_names));
+        names.into_iter().collect()
+    }
+
+    /// Takes only the export-diff channel, leaving rename-channel names in
+    /// place for burst-boundary validation.
+    pub fn take_export_refresh_names(&mut self) -> std::collections::HashSet<SmolStr> {
+        std::mem::take(&mut self.export_refresh_names)
+            .into_iter()
+            .collect()
+    }
+
+    /// Takes only the rename-channel names, leaving export-diff names in
+    /// place.
+    pub fn take_decl_rename_refresh_names(&mut self) -> std::collections::HashSet<SmolStr> {
+        std::mem::take(&mut self.decl_rename_refresh_names)
             .into_iter()
             .collect()
     }
 
     /// How many sideband textual refresh names the set carries.
     pub fn textual_refresh_names_len(&self) -> usize {
-        self.textual_refresh_names.len()
+        self.export_refresh_names.len() + self.decl_rename_refresh_names.len()
     }
 }
 
@@ -1282,6 +1351,61 @@ impl EmmyLuaAnalysis {
                 snapshot_pre_edit_names(self.compilation.get_db(), file_id),
             );
             let map = self.take_position_map(file_id);
+            // TEMP DUMP (GLUALS_SETTLE_DETAIL): old type decls before re-index,
+            // so the cl_umsgs loss can be attributed to a decl-shape change vs
+            // a pure geometry miss. Env-gated, behavior-neutral; on the
+            // trace-deletion list.
+            if std::env::var_os("GLUALS_SETTLE_DETAIL").is_some() {
+                let db = self.compilation.get_db();
+                let path = db.get_vfs().get_file_path(&file_id);
+                let new_len = db.get_vfs().get_file_content(&file_id).map(|t| t.len());
+                let mut decls: Vec<String> = db
+                    .get_type_index()
+                    .get_file_type_decl_ids(file_id)
+                    .map(|ids| {
+                        ids.iter()
+                            .map(|id| {
+                                let locs = db
+                                    .get_type_index()
+                                    .get_type_decl(id)
+                                    .map(|d| {
+                                        d.get_locations()
+                                            .iter()
+                                            .map(|l| format!("{:?}:{:?}", l.file_id, l.range))
+                                            .collect::<Vec<_>>()
+                                            .join(",")
+                                    })
+                                    .unwrap_or_default();
+                                format!("{id:?}@[{locs}]")
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                decls.sort();
+                // TEMP DUMP: old member ids + 1489's settled reads naming this
+                // file. Env-gated, behavior-neutral; on the trace-deletion list.
+                let mut members: Vec<String> = db
+                    .get_member_index()
+                    .get_file_members(file_id)
+                    .iter()
+                    .map(|m| {
+                        format!(
+                            "{:?}@{:?} key={:?} owner={:?}",
+                            m.get_id().get_syntax_id().get_kind(),
+                            m.get_id().get_syntax_id().get_range(),
+                            m.get_key(),
+                            db.get_member_index().get_current_owner(&m.get_id())
+                        )
+                    })
+                    .collect();
+                members.sort();
+                eprintln!(
+                    "[settle-dump] pre-edit {path:?} hunk {:?} new_len {new_len:?} decls {}: {decls:?} members {}: {members:?}",
+                    map.hunk(),
+                    decls.len(),
+                    members.len(),
+                );
+            }
             let removed = dirty.removed.contains(&file_id);
             // Expressed in the new text's coordinates already, so it compares
             // key for key against the map taken after the re-index.
@@ -1310,11 +1434,23 @@ impl EmmyLuaAnalysis {
             self.compilation.update_index(live);
         }
 
+        let settle_trace = std::env::var_os("GLUALS_SETTLE_TRACE").is_some();
         for (file_id, map, old) in pre_edit {
             let removed = dirty.removed.contains(&file_id);
             let remap = FileRemap::validated(self.compilation.get_db(), file_id, map);
             let lost = remap_into_file(self.compilation.get_db_mut(), &remap);
-            dirty.files.extend(lost);
+            if settle_trace {
+                let mut lost_sorted: Vec<_> = lost.iter().collect();
+                lost_sorted.sort_unstable();
+                eprintln!(
+                    "[settle-trace] remap-loss for {:?}: {} file(s): {:?} (hunk {:?})",
+                    self.compilation.get_db().get_vfs().get_file_path(&file_id),
+                    lost.len(),
+                    lost_sorted,
+                    map.hunk(),
+                );
+            }
+            dirty.remap_losses.extend(lost.iter().copied());
 
             let new = if removed {
                 ExportMap::default()
@@ -1326,10 +1462,27 @@ impl EmmyLuaAnalysis {
                 )
             };
             let diff = diff_exports(&old, &new);
+            if settle_trace {
+                let mut keys: Vec<String> = diff.keys().map(|key| format!("{key:?}")).collect();
+                keys.sort_unstable();
+                eprintln!(
+                    "[settle-trace] export diff for {:?}: {} key(s)",
+                    self.compilation.get_db().get_vfs().get_file_path(&file_id),
+                    keys.len(),
+                );
+                for key in keys.iter().take(40) {
+                    eprintln!("[settle-trace]   key {key}");
+                }
+                if keys.len() > 40 {
+                    eprintln!("[settle-trace]   ... and {} more", keys.len() - 40);
+                }
+            }
             // Diagnostic-refresh-only renames, independent of the export diff:
             // a same-position rename moves no key, so without this its names
-            // never reach the watched-file refresh. Runs before the early exit
-            // and never touches `dirty.files`.
+            // never reach the watched-file refresh. Rename-channel: anchored in
+            // this file's own decls, validated at the burst boundary before it
+            // fans out. Runs before the early exit and never touches
+            // `dirty.files`.
             {
                 let renamed = decl_rename_refresh_names(
                     self.compilation.get_db(),
@@ -1337,7 +1490,7 @@ impl EmmyLuaAnalysis {
                     &map,
                     pre_names.get(&file_id),
                 );
-                dirty.textual_refresh_names.extend(renamed);
+                dirty.decl_rename_refresh_names.extend(renamed);
             }
             if diff.is_empty() {
                 continue;
@@ -1346,15 +1499,57 @@ impl EmmyLuaAnalysis {
             dirty.changed_sources.insert(file_id);
             // Diagnostic-refresh-only: name the Lua names this diff moved so the
             // watched-file path can refresh their textual referencers without
-            // reindexing them. Never touches `dirty.files`.
+            // reindexing them. Export-channel: callee-anchored (a contributed
+            // param resolves its owner in the callee's file), so these pass
+            // through untouched. Never touches `dirty.files`.
             {
-                let changed = export_diff_changed_names(
+                let mut changed = export_diff_changed_names(
                     self.compilation.get_db(),
                     file_id,
                     &diff,
                     &pre_names,
                 );
-                dirty.textual_refresh_names.extend(changed);
+                // Realm name-only keys for decls that no longer exist carry
+                // the same transient-decl pollution as the rename channel (a
+                // bare `p` parsed as a global decl vanishes once it becomes a
+                // callee). Route those through the rename channel where
+                // burst-boundary validation checks them; every other export
+                // name passes through untouched.
+                let mut transient = FxHashSet::default();
+                for key in diff.keys() {
+                    if let ExportKey::Realm(RealmSubject::Decl(decl_id)) = key {
+                        let post_name = self
+                            .compilation
+                            .get_db()
+                            .get_decl_index()
+                            .get_decl(decl_id)
+                            .filter(|decl| !decl.is_local())
+                            .map(|decl| SmolStr::new(decl.get_name()));
+                        let pre_name = pre_names
+                            .get(&file_id)
+                            .and_then(|pre| pre.decls.get(decl_id))
+                            .filter(|(_, is_local)| !is_local)
+                            .map(|(name, _)| name.clone());
+                        // Exactly one side names the decl: an addition or a
+                        // removal of a name-only decl (a bare transient like
+                        // `p` vanishing into a callee, or reappearing while
+                        // backspacing). Route it through the rename channel
+                        // where burst-boundary validation checks it; a genuine
+                        // addition/removal survives via the final/burst-start
+                        // state. Both sides present is a realm-value move of a
+                        // durable decl and stays on the export channel.
+                        match (post_name, pre_name) {
+                            (Some(name), None) | (None, Some(name)) => {
+                                if changed.remove(&name) {
+                                    transient.insert(name);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                dirty.export_refresh_names.extend(changed);
+                dirty.decl_rename_refresh_names.extend(transient);
             }
             dirty.guard_work |= diff.keys().any(|key| {
                 matches!(
@@ -1362,12 +1557,30 @@ impl EmmyLuaAnalysis {
                     ExportKey::InferredGuard(_) | ExportKey::ContributedParam(..)
                 )
             });
-            dirty
-                .files
-                .extend(dependents_of(self.compilation.get_db(), file_id, &diff));
+            let dependents = dependents_of(self.compilation.get_db(), file_id, &diff);
             let evidence = self.evidence_dependents(file_id);
+            if settle_trace {
+                let mut dependents_sorted: Vec<_> = dependents.iter().collect();
+                dependents_sorted.sort_unstable();
+                let mut evidence_sorted: Vec<_> = evidence.iter().collect();
+                evidence_sorted.sort_unstable();
+                eprintln!(
+                    "[settle-trace] diff-driven for {:?}: {} dependent(s) + {} evidence file(s)",
+                    self.compilation.get_db().get_vfs().get_file_path(&file_id),
+                    dependents_sorted.len(),
+                    evidence_sorted.len(),
+                );
+                for dep in dependents_sorted.iter().take(40) {
+                    eprintln!("[settle-trace]   dependent {dep:?}");
+                }
+                for dep in evidence_sorted.iter().take(40) {
+                    eprintln!("[settle-trace]   evidence {dep:?}");
+                }
+            }
+            dirty.diff_dependents.extend(dependents.iter().copied());
+            dirty.diff_dependents.extend(evidence.iter().copied());
+            dirty.files.extend(dependents);
             dirty.files.extend(evidence);
-            // A file whose `include` path this edit changed is reached through
             // the dependency index; one whose path did not resolve before is
             // not in it at all.
             if diff.keys().any(|key| {
@@ -1381,6 +1594,7 @@ impl EmmyLuaAnalysis {
             }) {
                 let unresolved =
                     self.unresolved_path_dependency_dependents(&FxHashSet::from_iter([file_id]));
+                dirty.diff_dependents.extend(unresolved.iter().copied());
                 dirty.files.extend(unresolved);
             }
         }
@@ -1437,7 +1651,7 @@ impl EmmyLuaAnalysis {
     }
 
     /// [`ripple`](Self::ripple), plus the sideband textual names every ripple
-    /// export diff moved.
+    /// export diff moved, split by channel.
     ///
     /// Each batch is snapshotted before its re-index (a rippled file's removed
     /// entries are gone afterwards, exactly like an edited file's), and the
@@ -1448,10 +1662,27 @@ impl EmmyLuaAnalysis {
     /// the same way.
     pub fn ripple_with_refresh_names(
         &mut self,
-        mut dirty: DirtySet,
+        dirty: DirtySet,
     ) -> (Vec<FileId>, std::collections::HashSet<SmolStr>) {
+        let (rippled, export_names, rename_names) = self.ripple_with_refresh_names_split(dirty);
+        let mut names = export_names;
+        names.extend(rename_names);
+        (rippled, names)
+    }
+
+    /// [`ripple_with_refresh_names`](Self::ripple_with_refresh_names), with the
+    /// two sideband channels kept separate so callers can validate only the
+    /// rename channel.
+    pub fn ripple_with_refresh_names_split(
+        &mut self,
+        mut dirty: DirtySet,
+    ) -> (
+        Vec<FileId>,
+        std::collections::HashSet<SmolStr>,
+        std::collections::HashSet<SmolStr>,
+    ) {
         if dirty.is_empty() {
-            return (Vec::new(), Default::default());
+            return (Vec::new(), Default::default(), Default::default());
         }
         self.compilation
             .get_db_mut()
@@ -1473,8 +1704,14 @@ impl EmmyLuaAnalysis {
         let mut round = 0usize;
         // Sideband textual names from every ripple export diff, resolved after
         // the ripple. Diagnostic-only: never enters `pending` or `touched`
-        // below, and steers no reindex decision.
-        let mut sideband: FxHashSet<SmolStr> = FxHashSet::default();
+        // below, and steers no reindex decision. Split by channel: export-diff
+        // names pass through untouched, rename-channel names are validated at
+        // the burst boundary. `dirty`'s own incoming sideband joins the
+        // channel it was emitted on.
+        let mut export_sideband: FxHashSet<SmolStr> =
+            std::mem::take(&mut dirty.export_refresh_names);
+        let mut rename_sideband: FxHashSet<SmolStr> =
+            std::mem::take(&mut dirty.decl_rename_refresh_names);
 
         while !pending.is_empty() {
             let mut batch = pending
@@ -1559,13 +1796,38 @@ impl EmmyLuaAnalysis {
                         &diff,
                         &batch_pres,
                     );
-                    changed.extend(decl_rename_refresh_names(
+                    for key in diff.keys() {
+                        if let ExportKey::Realm(RealmSubject::Decl(decl_id)) = key {
+                            let post_name = self
+                                .compilation
+                                .get_db()
+                                .get_decl_index()
+                                .get_decl(decl_id)
+                                .filter(|decl| !decl.is_local())
+                                .map(|decl| SmolStr::new(decl.get_name()));
+                            let pre_name = batch_pres
+                                .get(file_id)
+                                .and_then(|pre| pre.decls.get(decl_id))
+                                .filter(|(_, is_local)| !is_local)
+                                .map(|(name, _)| name.clone());
+                            match (post_name, pre_name) {
+                                (Some(name), None) | (None, Some(name)) => {
+                                    if changed.remove(&name) {
+                                        rename_sideband.insert(name);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    export_sideband.extend(changed);
+                    let renamed = decl_rename_refresh_names(
                         self.compilation.get_db(),
                         *file_id,
                         &PositionMap::identity(),
                         batch_pres.get(file_id),
-                    ));
-                    sideband.extend(changed);
+                    );
+                    rename_sideband.extend(renamed);
                 }
                 if diff.is_empty() {
                     continue;
@@ -1623,7 +1885,12 @@ impl EmmyLuaAnalysis {
 
         reanalyzed.extend(guard_reindexed);
         reanalyzed.extend(param_reindexed);
-        sideband.extend(param_names);
+        // The nested pass returns a merged union; its export-channel names are
+        // already in the sideband via the nested self-index, and the union can
+        // only add rename-channel names here. Keep the split conservative:
+        // export names pass through, the union joins the rename channel where
+        // burst-boundary validation will check it.
+        rename_sideband.extend(param_names);
         reanalyzed.extend(touched);
         reanalyzed.retain(|file_id| {
             self.compilation
@@ -1634,7 +1901,11 @@ impl EmmyLuaAnalysis {
         });
         reanalyzed.sort_unstable();
         reanalyzed.dedup();
-        (reanalyzed, sideband.into_iter().collect())
+        (
+            reanalyzed,
+            export_sideband.into_iter().collect(),
+            rename_sideband.into_iter().collect(),
+        )
     }
 
     /// Rebuilds only these files' own index entries.
@@ -1650,6 +1921,157 @@ impl EmmyLuaAnalysis {
     pub fn self_index_files(&mut self, file_ids: Vec<FileId>) {
         self.compilation.remove_index(file_ids.clone());
         self.compilation.update_index(file_ids);
+    }
+
+    /// Keep only the rename-channel names a burst actually moved.
+    ///
+    /// `burst_start` snapshots each edited file's non-local declaration names at
+    /// the burst's start; the current index is the settled-final state. A name is
+    /// legitimate iff its presence differs between the two boundary states (an
+    /// add, a removal, or a rename pairing two such names):
+    /// - a burst that ends where it started keeps every name on both sides, so a
+    ///   type-then-erase gesture emits nothing;
+    /// - a genuine rename keeps old (start-only) + new (final-only);
+    /// - a genuine new declaration keeps its (final-only) name;
+    /// - a genuine removal keeps its (start-only) name, which the export diff
+    ///   already covers on its own channel.
+    ///
+    /// The export-diff channel is never passed here: it is callee-anchored and
+    /// passes through untouched.
+    pub fn validate_rename_refresh_names(
+        &self,
+        names: std::collections::HashSet<SmolStr>,
+        burst_start: &FxHashMap<FileId, FxHashSet<SmolStr>>,
+    ) -> std::collections::HashSet<SmolStr> {
+        if names.is_empty() {
+            return names;
+        }
+        let db = self.compilation.get_db();
+        let mut final_names = FxHashSet::default();
+        for file_id in burst_start.keys() {
+            if let Some(tree) = db.get_decl_index().get_decl_tree(file_id) {
+                for decl in tree.get_decls().values() {
+                    if decl.get_file_id() == *file_id && !decl.is_local() {
+                        final_names.insert(SmolStr::new(decl.get_name()));
+                    }
+                }
+            }
+        }
+        let start_names: FxHashSet<&SmolStr> = burst_start.values().flatten().collect();
+        names
+            .into_iter()
+            .filter(|name| {
+                // XOR: present on exactly one side of the burst boundary.
+                start_names.contains(name) != final_names.contains(name)
+            })
+            .collect()
+    }
+
+    /// The export-diff names of `file_ids` recomputed between the burst-start
+    /// index state and the current (settled-final) state.
+    ///
+    /// Burst-boundary semantics for the export channel: the refresh set a burst
+    /// produces is the difference between the burst's start and its settled
+    /// final, not the union of per-settle diffs. A burst that ends where it
+    /// started recomputes an empty diff and emits nothing, while a durable
+    /// change (a member type flip whose name exists at both ends) still
+    /// recomputes the same moved keys and emits its names. One-sided
+    /// Realm(Decl) name-only keys (a transient decl that existed on exactly
+    /// one side) are excluded here; the rename channel's boundary check
+    /// already drops them.
+    pub fn burst_boundary_export_names(
+        &self,
+        burst_start: &FxHashMap<FileId, ExportMap>,
+    ) -> FxHashSet<SmolStr> {
+        let mut names = FxHashSet::default();
+        let mut pre_names: FxHashMap<FileId, PreEditNameSnapshot> = FxHashMap::default();
+        for file_id in burst_start.keys() {
+            pre_names.insert(
+                *file_id,
+                snapshot_pre_edit_names(self.compilation.get_db(), *file_id),
+            );
+        }
+        for (file_id, old) in burst_start {
+            let new = export_map(
+                self.compilation.get_db(),
+                *file_id,
+                &FileRemap::identity(*file_id),
+            );
+            let diff = diff_exports(old, &new);
+            if diff.is_empty() {
+                continue;
+            }
+            let mut changed =
+                export_diff_changed_names(self.compilation.get_db(), *file_id, &diff, &pre_names);
+            // Drop one-sided Realm(Decl) name-only keys: transient decls the
+            // rename channel already rejects. Durable realm-value moves (both
+            // sides name the decl) stay.
+            for key in diff.keys() {
+                if let ExportKey::Realm(RealmSubject::Decl(decl_id)) = key {
+                    let post_name = self
+                        .compilation
+                        .get_db()
+                        .get_decl_index()
+                        .get_decl(decl_id)
+                        .filter(|decl| !decl.is_local())
+                        .map(|decl| SmolStr::new(decl.get_name()));
+                    let pre_name = pre_names
+                        .get(file_id)
+                        .and_then(|pre| pre.decls.get(decl_id))
+                        .filter(|(_, is_local)| !is_local)
+                        .map(|(name, _)| name.clone());
+                    match (post_name, pre_name) {
+                        (Some(name), None) | (None, Some(name)) => {
+                            changed.remove(&name);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            names.extend(changed);
+        }
+        names
+    }
+
+    /// Snapshot the export maps of `file_ids` in the current index: the
+    /// burst-start baseline the export-channel validation diffs the
+    /// settled-final state against.
+    pub fn snapshot_burst_start_exports(
+        &self,
+        file_ids: &[FileId],
+    ) -> FxHashMap<FileId, ExportMap> {
+        let db = self.compilation.get_db();
+        let mut start = FxHashMap::default();
+        for file_id in file_ids {
+            start.insert(
+                *file_id,
+                export_map(db, *file_id, &FileRemap::identity(*file_id)),
+            );
+        }
+        start
+    }
+
+    /// Snapshot the non-local declaration names of `file_ids` in the current
+    /// index: the burst-start baseline the rename-channel validation diffs the
+    /// settled-final state against.
+    pub fn snapshot_burst_start_names(
+        &self,
+        file_ids: &[FileId],
+    ) -> FxHashMap<FileId, FxHashSet<SmolStr>> {
+        let db = self.compilation.get_db();
+        let mut start = FxHashMap::default();
+        for file_id in file_ids {
+            let mut names = FxHashSet::default();
+            if let Some(tree) = db.get_decl_index().get_decl_tree(file_id) {
+                for decl in tree.get_decls().values() {
+                    if decl.get_file_id() == *file_id && !decl.is_local() {
+                        names.insert(SmolStr::new(decl.get_name()));
+                    }
+                }
+            }
+            start.insert(*file_id, names);
+        }
+        start
     }
 
     fn stabilize_cross_file_type_caches(&mut self, file_ids: &[FileId]) {
@@ -2239,7 +2661,7 @@ impl EmmyLuaAnalysis {
     /// retains the live files itself afterwards.
     fn ripple_and_widen(&mut self, dirty: DirtySet, changed: Vec<FileId>) -> Vec<FileId> {
         let refresh_names: std::collections::HashSet<SmolStr> =
-            dirty.textual_refresh_names.iter().cloned().collect();
+            dirty.textual_refresh_names().into_iter().collect();
         let mut affected = changed;
         let (rippled, ripple_names) = self.ripple_with_refresh_names(dirty);
         affected.extend(rippled);
@@ -2260,13 +2682,6 @@ impl EmmyLuaAnalysis {
     /// Applies a batch of filesystem changes — the creates, changes and deletes
     /// a watched-file notification delivers together — and returns every live
     /// file whose diagnostics the batch may have moved.
-    ///
-    /// One [`self_index_and_diff`](Self::self_index_and_diff) over the whole
-    /// batch and one [`ripple`](Self::ripple), so a branch switch costs the
-    /// files the change reached rather than the union of their dependency
-    /// expansions. The batch is one call rather than one per file because the
-    /// analyser derives its facts over a whole batch; settling the files one at
-    /// a time does not land where a cold build of the same set does.
     ///
     /// The returned set is what a caller has to re-diagnose. It is deliberately
     /// not just the files whose text changed: the files the ripple settled are

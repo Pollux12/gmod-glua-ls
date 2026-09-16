@@ -253,6 +253,19 @@ fn resolve_call_param_doc_function(
 fn stable_type_selection_key(db: &DbIndex, typ: &LuaType) -> String {
     humanize_type(db, typ, RenderLevel::Detailed)
 }
+/// Counts hook-candidate params carrying an informative (non-placeholder)
+/// type. Used to rank same-hook candidates by provenance quality instead of
+/// batch order: an annotated contract outranks a peer closure whose params
+/// this pass copied, and a return-only candidate never outranks either.
+fn informative_hook_param_count(func: &LuaFunctionType) -> usize {
+    func.get_params()
+        .iter()
+        .filter(|(_, ty)| match ty {
+            Some(t) => !(t.is_any() || t.is_unknown()),
+            None => false,
+        })
+        .count()
+}
 
 pub fn resolve_gmod_hook_add_callback_doc_function(
     db: &DbIndex,
@@ -336,7 +349,24 @@ pub fn resolve_gmod_hook_callback_doc_function(
         }
     }
 
-    candidates.sort_by_key(|function| std::cmp::Reverse(function.get_params().len()));
+    // Several hook owners can declare the same hook (the annotated `GM`
+    // method plus a peer closure filling the slot): prefer the candidate
+    // with the most informative params so the pick is a function of settled
+    // inputs, not of which sibling the batch resolved first. A return-only
+    // candidate (no annotated params) still serves hover when it is the only
+    // one, but never outranks an annotated contract. Ties break on the
+    // candidate content so identically-informative candidates stay stable
+    // across orders.
+    candidates.sort_by(|a, b| {
+        informative_hook_param_count(a)
+            .cmp(&informative_hook_param_count(b))
+            .reverse()
+            .then_with(|| {
+                stable_type_selection_key(db, &LuaType::DocFunction(Arc::clone(a))).cmp(
+                    &stable_type_selection_key(db, &LuaType::DocFunction(Arc::clone(b))),
+                )
+            })
+    });
     let function = candidates.into_iter().next()?;
     Some(GmodHookCallbackDocFunction {
         hook_name,
@@ -524,7 +554,9 @@ fn resolve_closure_member_type(
                 }
                 // See `filter_signature_type`: params this pass copied off a
                 // sibling's receiver are that sibling's answer, not the slot's.
-                if signature.params_filled_from_slot {
+                // A slot-filled flag with no docs at all carries no params to
+                // inherit, so it must not suppress a typed union member.
+                if signature.params_filled_from_slot && !signature.param_docs.is_empty() {
                     return Ok(());
                 }
                 let fake_doc_function = signature.to_doc_func_type();

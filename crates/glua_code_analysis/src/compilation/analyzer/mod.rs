@@ -8,6 +8,7 @@ pub(crate) mod gmod;
 mod infer_cache_manager;
 mod local_inference;
 mod lua;
+mod owner_settle;
 pub(crate) mod parallel;
 mod setmetatable_factory;
 pub(crate) mod unresolve;
@@ -375,16 +376,26 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                 // differs across this round. Mid-round ping-pong cancels here.
                 let net_moved = diff_settled_tail_boundary(db, &boundary_before);
                 queue_settled_decl_dependents(db, &mut context, &net_moved);
+                // Owner placements read the same settled types as the passes
+                // above (prefix types through loop variables, globals, and
+                // narrowed members), so they re-derive after them and before
+                // the key re-take below: a moved owner re-homes the member
+                // whose key is then re-minted.
+                let owner_moved = owner_settle::rederive_settled_index_expr_owners(
+                    db,
+                    &mut context,
+                    moved_owners.as_ref(),
+                );
                 let member_keys_moved =
                     refresh_settled_expr_type_member_keys(db, &mut context, moved_owners.as_ref());
-                // Dynamic-field records, inferred signature returns, and member
-                // keys are not type-owner state, so the boundary fingerprint
-                // below cannot see them move. A recurring fingerprint amid that
-                // progress is continued convergence, not a cycle: forget the
-                // sightings instead of confirming an oscillation that never
-                // happened.
+                // Dynamic-field records, inferred signature returns, member
+                // owners, and member keys are not type-owner state, so the
+                // boundary fingerprint below cannot see them move. A recurring
+                // fingerprint amid that progress is continued convergence, not
+                // a cycle: forget the sightings instead of confirming an
+                // oscillation that never happened.
                 let non_type_progressed =
-                    dynamic_fields_moved || returns_moved || member_keys_moved;
+                    dynamic_fields_moved || returns_moved || member_keys_moved || owner_moved;
                 if non_type_progressed {
                     fuse.reset_boundary_sightings();
                 }
@@ -425,6 +436,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             context.settled_assign_claims.clear();
             context.settled_return_attempts.clear();
             context.settled_member_key_candidates = None;
+            context.settled_owner_candidates = None;
         }
 
         {
@@ -1044,13 +1056,23 @@ fn refresh_settled_expr_type_member_keys(
                 continue;
             };
             // Only ever a better-resolved key. A key expression that still
-            // answers `nil`, `unknown`, `any` or an unbound template ref has
-            // not settled -- it is a read that has not resolved, and filing a
-            // write under it would move the write off the wildcard key that
-            // dynamic reads do match and onto one nothing selects.
+            // answers `nil`, `never`, an unbound template ref, or `unknown`
+            // *beside a current unknown* has not settled -- it is a read that
+            // has not resolved, and filing a write under it would move the
+            // write off the wildcard key that dynamic reads do match and onto
+            // one nothing selects. But `unknown` -> an informative key is the
+            // core convergence: members the walk collapsed under
+            // `ExprType(Unknown)` while their key expression read a settling
+            // loop variable are re-minted once that variable settles --
+            // replacing the collapsed key, never accreting beside it.
+            let settled_is_unknown =
+                matches!(&settled_key, LuaMemberKey::ExprType(typ) if typ.is_unknown());
             if &settled_key == current_key
-                || matches!(&settled_key, LuaMemberKey::ExprType(typ)
-                    if !crate::db_index::is_informative_type(typ) || typ.contain_tpl())
+                || (!settled_is_unknown
+                    && matches!(&settled_key, LuaMemberKey::ExprType(typ)
+                        if !crate::db_index::is_informative_type(typ) || typ.contain_tpl()))
+                || (settled_is_unknown
+                    && !matches!(current_key, LuaMemberKey::ExprType(typ) if typ.is_unknown()))
             {
                 continue;
             }
@@ -3512,6 +3534,7 @@ pub struct AnalyzeContext {
     /// `(second, rhs, 1)`); a lone right-hand side always queues index `0`.
     settled_assign_candidates: Vec<(LuaDeclId, LuaExpr, usize)>,
     settled_member_key_candidates: Option<(usize, HashMap<FileId, Vec<LuaMemberId>>)>,
+    settled_owner_candidates: Option<(usize, HashMap<FileId, Vec<LuaMemberId>>)>,
     settled_return_attempts: HashMap<LuaSignatureId, (u64, u64, u64, u64)>,
     settled_assign_claims: HashMap<LuaDeclId, Option<rowan::TextSize>>,
     settled_pass_reads: HashMap<
@@ -3581,6 +3604,7 @@ pub struct AnalyzeContext {
 enum SettledReadPass {
     Iter,
     MemberKey,
+    Owner,
     Global,
     Decl,
     Member,
@@ -3611,6 +3635,7 @@ impl AnalyzeContext {
             settled_decl_copy_candidates: HashSet::default(),
             settled_assign_candidates: Vec::new(),
             settled_member_key_candidates: None,
+            settled_owner_candidates: None,
             settled_pass_reads: HashMap::default(),
             settled_assign_claims: HashMap::default(),
             settled_return_attempts: HashMap::default(),

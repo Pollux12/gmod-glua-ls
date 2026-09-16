@@ -1877,7 +1877,7 @@ impl LuaTypeIndex {
             .map(|owners| owners.iter().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
         let mut dirty = HashSet::default();
-        let mut updates = Vec::new();
+        let mut updates: Vec<(LuaTypeOwner, Option<LuaTypeOwner>, HashSet<FileId>)> = Vec::new();
         for old_owner in old_owners {
             let new_owner = match remap.type_owner(&old_owner) {
                 crate::Remap::Moved(new_owner) if new_owner != old_owner => Some(new_owner),
@@ -1889,6 +1889,13 @@ impl LuaTypeIndex {
                 .get(&old_owner)
                 .cloned()
                 .unwrap_or_default();
+            // TEMP DUMP (GLUALS_SETTLE_DETAIL): which settled owner lost.
+            // Env-gated, behavior-neutral; on the trace-deletion list.
+            if new_owner.is_none() && std::env::var_os("GLUALS_SETTLE_DETAIL").is_some() {
+                eprintln!(
+                    "[settle-dump] settled-read lost: owner {old_owner:?} dependents {dependents:?}",
+                );
+            }
             if new_owner.is_none() {
                 dirty.extend(dependents.iter().copied());
             }
@@ -2407,6 +2414,14 @@ impl LuaTypeIndex {
             if result.lost {
                 // A lost nested identity is left in place; the owner is
                 // re-analysed instead of being rewritten to a guessed value.
+                // TEMP DUMP (GLUALS_SETTLE_DETAIL): which cache + type lost.
+                // Env-gated, behavior-neutral; on the trace-deletion list.
+                if std::env::var_os("GLUALS_SETTLE_DETAIL").is_some() {
+                    eprintln!(
+                        "[settle-dump] cache lost: owner {owner:?} type {:?}",
+                        cache.as_type(),
+                    );
+                }
                 dirty.insert(owner.get_file_id());
             } else if let Some(new_type) = result.typ {
                 let new_cache = match cache {
@@ -2428,7 +2443,16 @@ impl LuaTypeIndex {
             self.mark_inference_derived_state_dirty();
         }
         dirty.extend(self.remap_inference_facts(remap));
+        // TEMP DUMP (GLUALS_SETTLE_DETAIL): attribute the loss to facts vs
+        // settled reads. Env-gated, behavior-neutral; on trace-deletion list.
+        let before_reads = dirty.len();
         dirty.extend(self.remap_settled_reads(remap));
+        if std::env::var_os("GLUALS_SETTLE_DETAIL").is_some() && dirty.len() != before_reads {
+            eprintln!(
+                "[settle-dump] settled-reads added {} file(s)",
+                dirty.len() - before_reads,
+            );
+        }
         dirty.remove(&remap.file_id);
         dirty
     }
@@ -2467,6 +2491,12 @@ impl LuaTypeIndex {
                 ));
             }
             if lost {
+                if std::env::var_os("GLUALS_SETTLE_DETAIL").is_some() {
+                    eprintln!(
+                        "[settle-trace]     fact lost: owner {owner:?} provenance {:?}",
+                        metadata.provenance
+                    );
+                }
                 dirty.insert(owner.get_file_id());
             }
         }
@@ -2488,6 +2518,15 @@ impl LuaTypeIndex {
             };
             let mut lost = false;
             let remapped = remap_identities_in_type(fact.typ(), remap);
+            // TEMP DUMP (GLUALS_SETTLE_DETAIL): which definition fact + payload
+            // lost. Env-gated, behavior-neutral; on the trace-deletion list.
+            if std::env::var_os("GLUALS_SETTLE_DETAIL").is_some() && remapped.lost {
+                eprintln!(
+                    "[settle-dump] definition-fact lost: definition {definition:?} type {:?} provenance {:?}",
+                    fact.typ(),
+                    fact.provenance(),
+                );
+            }
             if remapped.lost {
                 lost = true;
             }
