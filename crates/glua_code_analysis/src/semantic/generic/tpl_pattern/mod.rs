@@ -702,6 +702,21 @@ fn func_tpl_pattern_match(
                 .get_signature_index()
                 .get(signature_id)
                 .ok_or(InferFailReason::None)?;
+            let fake_doc_func = signature.to_doc_func_type();
+            let mut tpl_func_params = tpl_func.get_params().to_vec();
+            if tpl_func.is_colon_define() {
+                tpl_func_params.insert(0, ("self".to_string(), Some(LuaType::Any)));
+            }
+            let mut target_func_params = fake_doc_func.get_params().to_vec();
+            if fake_doc_func.is_colon_define() {
+                target_func_params.insert(0, ("self".to_string(), Some(LuaType::Any)));
+            }
+            param_type_list_pattern_match_type_list(
+                context,
+                &tpl_func_params,
+                &target_func_params,
+            )?;
+
             if !signature.is_resolve_return() {
                 return lambda_tpl_pattern::check_lambda_tpl_pattern(
                     context,
@@ -709,8 +724,9 @@ fn func_tpl_pattern_match(
                     *signature_id,
                 );
             }
-            let fake_doc_func = signature.to_doc_func_type();
-            func_tpl_pattern_match_doc_func(context, tpl_func, &fake_doc_func)?;
+            let tpl_return = tpl_func.get_ret();
+            let target_return = fake_doc_func.get_ret();
+            return_type_pattern_match_target_type(context, tpl_return, target_return)?;
         }
         _ => {}
     }

@@ -53,8 +53,14 @@ fn owner_settle_candidates_for_file(db: &DbIndex, file_id: FileId) -> Vec<LuaMem
             // A member that already carries path provenance is owned by the
             // class-flip machinery, not by the prefix read the settle
             // re-derives: `set_global_path_class` placed it, and re-homing
-            // it here would detach it from the path it must follow.
-            if index.member_path_provenance(&id).is_some() {
+            // it here would detach it from the path it must follow. The
+            // exemption only holds while the path can actually flip — a
+            // plain global variable's provenance is inert, so its members
+            // stay settle-able.
+            if index
+                .member_path_provenance(&id)
+                .is_some_and(|path| index.global_path_has_class_candidates(path))
+            {
                 return false;
             }
             // A field on a factory local consumed by `setmetatable(local,
@@ -249,16 +255,7 @@ fn scoped_class_prefix_owner(
     file_id: FileId,
     prefix_expr: &LuaExpr,
 ) -> Option<LuaMemberOwner> {
-    let LuaExpr::NameExpr(name_expr) = prefix_expr else {
-        return None;
-    };
-    let name = name_expr.get_name_text()?;
-    if name == "self" {
-        return None;
-    }
-    let class_decl_id =
-        super::gmod::name_expr_resolves_to_scoped_authoring_table(db, file_id, name_expr)?;
-    Some(LuaMemberOwner::Type(class_decl_id))
+    super::lua::scoped_class_prefix_member_owner(db, file_id, prefix_expr).map(|(owner, _)| owner)
 }
 
 /// The factory local whose table a member sits on, when `setmetatable(local,

@@ -202,7 +202,9 @@ fn uninformative_key(typ: &LuaType) -> Option<(u8, u8)> {
     Some((uninformative_rank(typ)?, typ.is_nullable() as u8))
 }
 
-/// Whether `wider` is the widened primitive of the literal `narrower`.
+/// Whether `wider` is the widened primitive of `narrower` — a literal folding
+/// into its primitive, or a narrower primitive folding into its supertype
+/// (`integer` into `number`).
 pub(crate) fn widens_primitive(wider: &LuaType, narrower: &LuaType) -> bool {
     matches!(
         (wider, narrower),
@@ -214,7 +216,10 @@ pub(crate) fn widens_primitive(wider: &LuaType, narrower: &LuaType) -> bool {
             LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_)
         ) | (
             LuaType::Number,
-            LuaType::FloatConst(_) | LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_)
+            LuaType::Integer
+                | LuaType::FloatConst(_)
+                | LuaType::IntegerConst(_)
+                | LuaType::DocIntegerConst(_)
         ) | (
             LuaType::Boolean,
             LuaType::BooleanConst(_) | LuaType::DocBooleanConst(_)

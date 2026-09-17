@@ -310,11 +310,27 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
         }
 
         for (reason, unresolves) in reason_resolve {
-            context.unresolves.extend(
-                unresolves
-                    .into_iter()
-                    .map(|unresolve| (unresolve, reason.clone())),
-            );
+            for unresolve in unresolves {
+                // A member write a finalizing run cannot answer is dropped
+                // with the context, and the write would keep no owner at all
+                // while a warm re-index that reads a settled prefix attaches
+                // one. The settled attach re-runs the same prefix decision
+                // against the finished index, so keep the write queued for it
+                // rather than dropping it here.
+                if finalize
+                    && let UnResolve::Member(member) = &unresolve
+                    && member.prefix.is_some()
+                    && glua_parser::LuaIndexExpr::can_cast(
+                        member.member_id.get_syntax_id().get_kind(),
+                    )
+                {
+                    context.add_settled_member_attach_candidate(crate::InFiled::new(
+                        member.file_id,
+                        *member.member_id.get_syntax_id(),
+                    ));
+                }
+                context.unresolves.push((unresolve, reason.clone()));
+            }
         }
 
         // Resolving deferred items mutates type/member indexes, so any inference

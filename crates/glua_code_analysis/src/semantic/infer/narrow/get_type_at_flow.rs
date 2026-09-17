@@ -826,7 +826,6 @@ fn get_type_at_flow_walk(
                     Ok(r) => r,
                     Err(_) => ResultTypeOrContinue::Continue,
                 };
-
                 if let ResultTypeOrContinue::Result(condition_type) = result_or_continue {
                     return Ok(condition_type);
                 } else {

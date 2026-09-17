@@ -53,7 +53,13 @@ pub(crate) struct InferenceReadSet {
     /// Dynamic-field definitions consulted, keyed by owner and field name
     /// (`None` is the wildcard bucket). See `DynamicFieldIndex::dynamic_writes`.
     pub dynamic_fields: FxHashSet<(DynamicFieldOwner, Option<SmolStr>)>,
-    pub missing_member_slots: FxHashSet<(LuaMemberOwner, LuaMemberKey)>,
+    /// Member slots a lookup missed on, versioned by what the slot held when
+    /// read: the member count, and for a `Name` key the dynamic-field
+    /// definition count. A slot that was already non-empty (a realm-incompatible
+    /// member, or a key a dynamic field already defines) is a definitive answer
+    /// the settled pass reproduces, so it must not report stale every round —
+    /// only the slot changing what it holds re-derives the read.
+    pub missing_member_slots: FxHashMap<(LuaMemberOwner, LuaMemberKey), (usize, usize)>,
 }
 
 impl InferenceReadSet {
@@ -101,7 +107,7 @@ thread_local! {
     static SPECIAL_CALLS: RefCell<FxHashSet<(FileId, TextSize)>> = RefCell::new(FxHashSet::default());
     static CONTRIBS: RefCell<FxHashSet<(LuaSignatureId, usize)>> = RefCell::new(FxHashSet::default());
     static DYNAMIC_FIELDS: RefCell<FxHashSet<(DynamicFieldOwner, Option<SmolStr>)>> = RefCell::new(FxHashSet::default());
-    static MISSING_MEMBER_SLOTS: RefCell<FxHashSet<(LuaMemberOwner, LuaMemberKey)>> = RefCell::new(FxHashSet::default());
+    static MISSING_MEMBER_SLOTS: RefCell<FxHashMap<(LuaMemberOwner, LuaMemberKey), (usize, usize)>> = RefCell::new(FxHashMap::default());
 }
 
 /// Starts collecting reads, sharing the collection with any enclosing scope.
@@ -247,10 +253,18 @@ pub(crate) fn record_dynamic_field(owner: &DynamicFieldOwner, field_name: Option
 }
 
 #[inline]
-pub(crate) fn record_missing_member_slot(owner: &LuaMemberOwner, key: &LuaMemberKey) {
+pub(crate) fn record_missing_member_slot(
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+    member_count: usize,
+    dynamic_field_count: usize,
+) {
     if DEPTH.with(Cell::get) > 0 {
         MISSING_MEMBER_SLOTS.with(|slots| {
-            slots.borrow_mut().insert((owner.clone(), key.clone()));
+            slots.borrow_mut().insert(
+                (owner.clone(), key.clone()),
+                (member_count, dynamic_field_count),
+            );
         });
     }
 }
@@ -326,10 +340,13 @@ impl InferenceReadVersion {
             || reads.special_calls.iter().any(|(file, pos)| db.get_flow_index().special_call_write_version(file, pos) > self.special_epoch)
             || reads.contribs.iter().any(|(sig, param)| db.get_call_site_param_index().contrib_write_version(sig, *param) > self.contrib_epoch)
             || reads.dynamic_fields.iter().any(|key| db.get_dynamic_field_index().dynamic_write_version(key) > self.dynamic_epoch)
-            || reads.missing_member_slots.iter().any(|(owner, key)| {
-                !db.get_member_index().get_members_for_owner_key(owner, key).is_empty()
+            || reads.missing_member_slots.iter().any(|((owner, key), (member_count, dynamic_count))| {
+                db.get_member_index()
+                    .get_members_for_owner_key(owner, key)
+                    .len()
+                    != *member_count
                     || matches!(key, LuaMemberKey::Name(name) if crate::dynamic_field_owner_of(db, owner).is_some_and(|dynamic_owner| {
-                        !db.get_dynamic_field_index().field_definitions(&dynamic_owner, name.as_str()).is_empty()
+                        db.get_dynamic_field_index().field_definitions(&dynamic_owner, name.as_str()).len() != *dynamic_count
                     }))
             })
     }

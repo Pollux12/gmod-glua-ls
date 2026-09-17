@@ -209,8 +209,14 @@ fn incoming_is_the_declared_class_table(
 /// precedence between two files writing the same key (annotations over the std
 /// stub) never gets to apply.
 fn bind_global_path_class(db: &mut DbIndex, type_owner: &LuaTypeOwner) -> Option<()> {
+    // Only a `Def` names the class's own table: `Glide.Fuel = Fuel` assigns
+    // the `---@class Fuel` table itself, so the path and the class are two
+    // names for one table and the members must follow the class. A `Ref`
+    // (`wep = ply:GetActiveWeapon()` holding `Weapon`) names an *instance*
+    // the variable happens to hold — treating it as a class path would pin
+    // every `wep.k` write to whichever class the inference order picked.
     let class = match db.get_type_index().get_type_cache(type_owner)?.as_type() {
-        LuaType::Def(id) | LuaType::Ref(id) => id.clone(),
+        LuaType::Def(id) => id.clone(),
         _ => return None,
     };
     let (path, file_id) = match type_owner {

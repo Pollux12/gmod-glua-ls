@@ -1,8 +1,8 @@
 use rustc_hash::FxHashSet;
 
 use crate::{
-    CacheEntry, DbIndex, GlobalId, InFiled, InferFailReason, LuaMemberKey, LuaSemanticDeclId,
-    LuaSignatureId, LuaTypeCache, LuaTypeOwner, TypeOps,
+    CacheEntry, DbIndex, FileId, GlobalId, InFiled, InferFailReason, LuaMemberKey,
+    LuaSemanticDeclId, LuaSignatureId, LuaTypeCache, LuaTypeOwner, TypeOps,
     compilation::analyzer::{
         common::{
             DeclWrite, TypeCacheWriteMode, add_member, bind_decl_write, bind_type,
@@ -564,7 +564,6 @@ fn prefix_path_has_computed_segment(prefix_expr: &LuaExpr) -> bool {
 fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Option<()> {
     let index_expr = LuaIndexExpr::cast(var_expr.syntax().clone())?;
     let prefix_expr = index_expr.get_prefix_expr()?;
-
     if prefix_path_has_computed_segment(&prefix_expr) {
         let member_id = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
         if matches!(
@@ -574,7 +573,6 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
             return Some(());
         }
     }
-
     if let Some((member_owner, set_owner_only)) =
         try_resolve_scoped_class_prefix_member_owner(analyzer, &prefix_expr)
     {
@@ -808,18 +806,29 @@ fn try_resolve_scoped_class_prefix_member_owner(
     analyzer: &LuaAnalyzer,
     prefix_expr: &LuaExpr,
 ) -> Option<(LuaMemberOwner, bool)> {
+    scoped_class_prefix_member_owner(analyzer.db, analyzer.file_id, prefix_expr)
+}
+
+/// The walk's scoped-class fast path, shared with the owner-settle pass: a
+/// `SWEP`/`ENT`/`GM`-style prefix (or `self` inside one of its colon methods)
+/// names the file's authoring class without any inference, so the answer does
+/// not move between a cold build and a warm re-index.
+pub(crate) fn scoped_class_prefix_member_owner(
+    db: &DbIndex,
+    file_id: FileId,
+    prefix_expr: &LuaExpr,
+) -> Option<(LuaMemberOwner, bool)> {
     let LuaExpr::NameExpr(name_expr) = prefix_expr else {
         return None;
     };
 
     let name = name_expr.get_name_text()?;
     if name != "self" {
-        let class_decl_id =
-            name_expr_resolves_to_scoped_authoring_table(analyzer.db, analyzer.file_id, name_expr)?;
+        let class_decl_id = name_expr_resolves_to_scoped_authoring_table(db, file_id, name_expr)?;
         return Some((LuaMemberOwner::Type(class_decl_id), false));
     }
 
-    if !name_expr_resolves_to_implicit_self(analyzer, name_expr) {
+    if !name_expr_resolves_to_implicit_self(db, file_id, name_expr) {
         return None;
     }
 
@@ -834,21 +843,20 @@ fn try_resolve_scoped_class_prefix_member_owner(
     let LuaExpr::NameExpr(class_name_expr) = func_name.get_prefix_expr()? else {
         return None;
     };
-    let class_decl_id = name_expr_resolves_to_scoped_authoring_table(
-        analyzer.db,
-        analyzer.file_id,
-        &class_name_expr,
-    )?;
+    let class_decl_id =
+        name_expr_resolves_to_scoped_authoring_table(db, file_id, &class_name_expr)?;
     Some((LuaMemberOwner::Type(class_decl_id), false))
 }
 
-fn name_expr_resolves_to_implicit_self(analyzer: &LuaAnalyzer, name_expr: &LuaNameExpr) -> bool {
-    analyzer
-        .db
-        .get_reference_index()
-        .get_local_reference(&analyzer.file_id)
+fn name_expr_resolves_to_implicit_self(
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+) -> bool {
+    db.get_reference_index()
+        .get_local_reference(&file_id)
         .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
-        .and_then(|decl_id| analyzer.db.get_decl_index().get_decl(&decl_id))
+        .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
         .is_some_and(|decl| decl.is_implicit_self())
 }
 
@@ -877,7 +885,6 @@ fn apply_index_expr_member_owner_with_guarded(
 ) -> Option<()> {
     let index_key = index_expr.get_index_key()?;
     let member_id = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
-    // A prefix that is a local alias of a known global path is a path write
     // for provenance purposes, so the member follows the path's `---@class`
     // flips. Only computed when the owner resolved to a class: path and
     // Element owners already carry their provenance through the homing note.
@@ -924,16 +931,16 @@ fn apply_index_expr_member_owner_with_guarded(
         }
         let member_index = analyzer.db.get_member_index_mut();
         if let Some(alias_path) = alias_path {
-            member_index.add_member(member_owner.clone(), member);
+            member_index.add_member_with_owner_only(member_owner.clone(), member, set_owner_only);
             member_index.home_alias_member_with_provenance(
                 member_owner,
                 member_id.file_id,
                 member_id,
                 alias_path,
-                false,
+                set_owner_only,
             );
         } else {
-            member_index.add_member(member_owner, member);
+            member_index.add_member_with_owner_only(member_owner, member, set_owner_only);
         }
         // `add_member` already records the enclosing function scope for
         // `FileDefine` index-expr members (via
@@ -1020,7 +1027,6 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         }
 
         let type_owner = get_var_owner(analyzer, var.clone());
-
         // A local reassigned from a multi-declaration global field read has the
         // same batch-order exposure as a local *initialized* from one: the walk
         // answers it from whichever backing tables it had reached. Record it so
@@ -1226,7 +1232,6 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                 .context
                 .request_sibling_merge_read_reinfer(*member_id);
         }
-
         let mut expr_type =
             member_assignment_or_source_type(analyzer, &type_owner, expr, expr_type);
 
@@ -1738,7 +1743,25 @@ fn reads_field_exist_guarded_member(expr: &LuaExpr) -> bool {
                 condition
                     .descendants::<LuaIndexExpr>()
                     .filter_map(|index_expr| index_expr.get_access_path())
-                    .any(|guarded| read_paths.contains(&guarded))
+                    .any(|guarded| {
+                        read_paths.iter().any(|read| {
+                            // The guard tests a path on the same receiver the
+                            // read walks through: `wep.DeployAngle` guards
+                            // `wep.DeployAngle.y`, and `wep.DeployAngle.y`
+                            // proves `wep.DeployAngle` non-nil. Either prefix
+                            // direction reads off the member set the guard
+                            // narrowed by, which grows as the batch walks.
+                            read == &guarded
+                                || read
+                                    .as_str()
+                                    .strip_prefix(guarded.as_str())
+                                    .is_some_and(|rest| rest.starts_with('.'))
+                                || guarded
+                                    .as_str()
+                                    .strip_prefix(read.as_str())
+                                    .is_some_and(|rest| rest.starts_with('.'))
+                        })
+                    })
             })
     })
 }
@@ -2065,13 +2088,6 @@ fn add_unresolve_for_assignment(
             } else {
                 None
             };
-            let unresolve_member = UnResolveMember {
-                file_id: analyzer.file_id,
-                member_id,
-                expr: Some(expr),
-                prefix,
-                ret_idx: 0,
-            };
             // The deferred write resolves against whatever the index held
             // when its retry ran, and an attempt that reaches `unknown`
             // succeeds: the item retires and the placeholder becomes the
@@ -2082,6 +2098,22 @@ fn add_unresolve_for_assignment(
             analyzer
                 .context
                 .request_member_initializer_reinfer(member_id);
+            // A member write whose initializer errored before the guarded-read
+            // check in the assign walk still reads off the member set the
+            // enclosing `if` narrowed by. Queue it the same way so the settled
+            // re-infer re-reads it once every owner of the key has landed.
+            if reads_field_exist_guarded_member(&expr) {
+                analyzer
+                    .context
+                    .request_guarded_member_read_reinfer(member_id);
+            }
+            let unresolve_member = UnResolveMember {
+                file_id: analyzer.file_id,
+                member_id,
+                expr: Some(expr),
+                prefix,
+                ret_idx: 0,
+            };
             analyzer
                 .context
                 .add_unresolve(unresolve_member.into(), reason);
@@ -2990,6 +3022,19 @@ fn merge_type_owner_and_unresolve_expr(
             );
         }
         LuaTypeOwner::Member(member_id) => {
+            // Same deferred-write exposure as `add_unresolve_for_assignment`:
+            // the retry binds whatever the index held when it ran, so the
+            // member is re-derived once the batch settles. The guarded check
+            // covers a tail var whose value reads through a member the
+            // enclosing `if` narrowed by.
+            analyzer
+                .context
+                .request_member_initializer_reinfer(member_id);
+            if reads_field_exist_guarded_member(&expr) {
+                analyzer
+                    .context
+                    .request_guarded_member_read_reinfer(member_id);
+            }
             let unresolve_member = UnResolveMember {
                 file_id: analyzer.file_id,
                 member_id,
@@ -3116,6 +3161,11 @@ pub fn analyze_table_field(analyzer: &mut LuaAnalyzer, field: LuaTableField) -> 
                 .context
                 .request_sibling_merge_read_reinfer(member_id);
         }
+        if reads_field_exist_guarded_member(&value_expr) {
+            analyzer
+                .context
+                .request_guarded_member_read_reinfer(member_id);
+        }
         let value_type = match inferred {
             Ok(value_type) => match value_type {
                 LuaType::Def(ref_id) => LuaType::Ref(ref_id),
@@ -3131,6 +3181,17 @@ pub fn analyze_table_field(analyzer: &mut LuaAnalyzer, field: LuaTableField) -> 
             // RHS evaluates to `nil` at runtime.
             Err(InferFailReason::None) => LuaType::Nil,
             Err(reason) => {
+                // Same deferred-write exposure as the assign walk: the retry
+                // binds whatever the index held when it ran, so the member is
+                // re-derived once the batch settles.
+                analyzer
+                    .context
+                    .request_member_initializer_reinfer(member_id);
+                if reads_field_exist_guarded_member(&value_expr) {
+                    analyzer
+                        .context
+                        .request_guarded_member_read_reinfer(member_id);
+                }
                 let unresolve = UnResolveMember {
                     file_id: analyzer.file_id,
                     member_id,
@@ -3257,12 +3318,13 @@ fn set_guarded_table_assignment_index_owner(
 ) -> Option<()> {
     match var {
         LuaVarExpr::IndexExpr(index_expr) => {
-            if let Some(cache_key) = guarded_table_assignment_cache_key(analyzer, left) {
+            if let Some((cache_key, set_owner_only)) = guarded_table_assignment_info(analyzer, left)
+            {
                 apply_index_expr_member_owner_with_guarded(
                     analyzer,
                     index_expr,
                     cache_key.owner,
-                    false,
+                    set_owner_only,
                     true,
                 )
             } else {
@@ -3342,27 +3404,38 @@ fn merge_guarded_table_assignment_type(
     Ok(TypeOps::Union.apply(analyzer.db, &left_type, &right_type))
 }
 
-fn guarded_table_assignment_cache_key(
+fn guarded_table_assignment_info(
     analyzer: &mut LuaAnalyzer,
     left: &LuaExpr,
-) -> Option<MemberAssignmentWideningCacheKey> {
+) -> Option<(MemberAssignmentWideningCacheKey, bool)> {
     let left_var = LuaVarExpr::cast(left.syntax().clone())?;
     let LuaVarExpr::IndexExpr(index_expr) = left_var else {
         return None;
     };
     let prefix_expr = index_expr.get_prefix_expr()?;
-    let owner = direct_local_table_prefix_member_owner(analyzer, &prefix_expr).or_else(|| {
-        let prefix_type = analyzer.infer_expr(&prefix_expr).ok()?;
-        resolve_index_expr_member_owner_for_file(&prefix_type, Some(analyzer.file_id))
-            .map(|(owner, _)| owner)
-    })?;
+    let (owner, set_owner_only) = direct_local_table_prefix_member_owner(analyzer, &prefix_expr)
+        .map(|owner| (owner, false))
+        .or_else(|| {
+            let prefix_type = analyzer.infer_expr(&prefix_expr).ok()?;
+            resolve_index_expr_member_owner_for_file(&prefix_type, Some(analyzer.file_id))
+        })?;
     let index_key = index_expr.get_index_key()?;
     let cache = analyzer
         .context
         .infer_manager
         .get_infer_cache(analyzer.file_id);
     let key = LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key).ok()?;
-    (!key.is_expr()).then_some(MemberAssignmentWideningCacheKey { owner, key })
+    (!key.is_expr()).then_some((
+        MemberAssignmentWideningCacheKey { owner, key },
+        set_owner_only,
+    ))
+}
+
+fn guarded_table_assignment_cache_key(
+    analyzer: &mut LuaAnalyzer,
+    left: &LuaExpr,
+) -> Option<MemberAssignmentWideningCacheKey> {
+    guarded_table_assignment_info(analyzer, left).map(|(cache_key, _)| cache_key)
 }
 
 fn should_prefer_guarded_dynamic_index_rhs(

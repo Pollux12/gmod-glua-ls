@@ -13,7 +13,7 @@ mod types;
 
 use super::traits::LuaIndex;
 use crate::{
-    DbIndex, FileId, InFiled, LuaDeclId, LuaMemberKey, LuaMemberOwner, LuaSignatureId,
+    DbIndex, FileId, InFiled, LuaDeclId, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSignatureId,
     db_index::r#type::type_decl::LuaTypeIdentifier,
 };
 pub use generic_param::GenericParam;
@@ -1868,7 +1868,21 @@ impl LuaTypeIndex {
         }
     }
 
-    fn remap_settled_reads(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
+    /// Rewrites the settled-read keys that live in the edited file.
+    ///
+    /// A key naming a member the file had filed is an identity like any other:
+    /// the validated remap confirms it against the re-indexed member index, so
+    /// a member the edit removed drops its key and dirties its readers. A key
+    /// naming no filed member is speculative - a settled pass keyed the read on
+    /// the range of the expression it read (a call like `ply:GetActiveWeapon()`)
+    /// and no `LuaMember` was ever filed for it - so `pre_edit_member_ids` is
+    /// what tells the two apart. See [`Self::settled_read_image`] for the key
+    /// itself.
+    fn remap_settled_reads(
+        &mut self,
+        remap: &crate::FileRemap,
+        pre_edit_member_ids: &rustc_hash::FxHashSet<LuaMemberId>,
+    ) -> HashSet<FileId> {
         // Only the keys living in the edited file can move; the per-file side
         // map locates them without scanning every settled owner.
         let old_owners = self
@@ -1879,7 +1893,8 @@ impl LuaTypeIndex {
         let mut dirty = HashSet::default();
         let mut updates: Vec<(LuaTypeOwner, Option<LuaTypeOwner>, HashSet<FileId>)> = Vec::new();
         for old_owner in old_owners {
-            let new_owner = match remap.type_owner(&old_owner) {
+            let image = Self::settled_read_image(remap, pre_edit_member_ids, &old_owner);
+            let new_owner = match image {
                 crate::Remap::Moved(new_owner) if new_owner != old_owner => Some(new_owner),
                 crate::Remap::Moved(_) | crate::Remap::Unrelated => continue,
                 crate::Remap::Lost => None,
@@ -1889,13 +1904,6 @@ impl LuaTypeIndex {
                 .get(&old_owner)
                 .cloned()
                 .unwrap_or_default();
-            // TEMP DUMP (GLUALS_SETTLE_DETAIL): which settled owner lost.
-            // Env-gated, behavior-neutral; on the trace-deletion list.
-            if new_owner.is_none() && std::env::var_os("GLUALS_SETTLE_DETAIL").is_some() {
-                eprintln!(
-                    "[settle-dump] settled-read lost: owner {old_owner:?} dependents {dependents:?}",
-                );
-            }
             if new_owner.is_none() {
                 dirty.extend(dependents.iter().copied());
             }
@@ -1929,6 +1937,43 @@ impl LuaTypeIndex {
         dirty
     }
 
+    /// The image of one settled-read key.
+    ///
+    /// A key naming a member the file had filed is confirmed against the
+    /// re-indexed member index like every other identity, so a member the edit
+    /// removed reads as `Lost` and its readers are dirtied.
+    ///
+    /// A key naming no filed member is speculative: the analyzer keyed a
+    /// settled read on the range of an expression (a call like
+    /// `ply:GetActiveWeapon()`), and no `LuaMember` was ever filed for it.
+    /// Nothing in the member index can confirm or deny such a key, so the
+    /// position map alone decides - the same geometric answer `member_id`
+    /// gives, taken without the file's facts. The reader still reads the same
+    /// text, so it is not dirtied; only a range the edit destroyed is a loss.
+    fn settled_read_image(
+        remap: &crate::FileRemap,
+        pre_edit_member_ids: &rustc_hash::FxHashSet<LuaMemberId>,
+        old_owner: &LuaTypeOwner,
+    ) -> crate::Remap<LuaTypeOwner> {
+        if let LuaTypeOwner::Member(member_id) = old_owner
+            && !pre_edit_member_ids.contains(member_id)
+        {
+            return match crate::FileRemap::unvalidated(remap.file_id, remap.map)
+                .member_id(*member_id)
+            {
+                crate::Remap::Moved(member_id) => {
+                    crate::Remap::Moved(LuaTypeOwner::Member(member_id))
+                }
+                crate::Remap::Lost => crate::Remap::Lost,
+                // Both remaps are bound to the edited file, and every key the
+                // settled-owner side map hands out lives in it, so a key can
+                // never read as unrelated.
+                crate::Remap::Unrelated => crate::Remap::Unrelated,
+            };
+        }
+        remap.type_owner(old_owner)
+    }
+
     pub fn get_file_type_decl_ids(&self, file_id: FileId) -> Option<&Vec<LuaTypeDeclId>> {
         self.file_types.get(&file_id)
     }
@@ -1944,6 +1989,25 @@ impl LuaTypeIndex {
             self.drop_fact_refs(&owner);
             self.mark_inference_derived_state_dirty();
         }
+    }
+
+    /// Replaces an inferred cache's type with `widened`, keeping the entry's
+    /// fact metadata. Used by the settled-tail widening operator, which rewrites
+    /// a literal that grew across a fixpoint boundary into its primitive; the
+    /// provenance that produced the literal still describes the widened fact.
+    ///
+    /// No-op on a documented cache: an annotation is authoritative and is never
+    /// widened over.
+    pub(crate) fn widen_infer_type_cache(&mut self, owner: &LuaTypeOwner, widened: LuaType) {
+        let Some(existing) = self.types.get(owner) else {
+            return;
+        };
+        if !existing.is_infer() || existing.as_type() == &widened {
+            return;
+        }
+        self.insert_type_cache(owner.clone(), LuaTypeCache::InferType(widened));
+        self.refresh_fact_refs(owner);
+        self.mark_inference_derived_state_dirty();
     }
 
     /// Fact-carrying counterpart of [`bind_type`](Self::bind_type); the same
@@ -2088,20 +2152,6 @@ impl LuaTypeIndex {
     /// Stores `cache`, keeping [`Self::cache_refs`] in step, and reports
     /// whether a cache was replaced.
     fn insert_type_cache(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) -> bool {
-        if let Ok(want) = std::env::var("GLUALS_TRACE_WRITE") {
-            let key = format!("{:?}", owner);
-            if key.contains(&want) {
-                eprintln!(
-                    "WRITE {} <- {:?} (was {:?})",
-                    key,
-                    cache.as_type(),
-                    self.types.get(&owner).map(|c| c.as_type().clone())
-                );
-                if std::env::var("GLUALS_TRACE_BT").is_ok() {
-                    eprintln!("{}", std::backtrace::Backtrace::force_capture());
-                }
-            }
-        }
         if self
             .types
             .get(&owner)
@@ -2390,7 +2440,15 @@ impl LuaTypeIndex {
     ///
     /// Returns the files whose entry named something the edit destroyed: those
     /// cannot be rewritten and have to be re-analysed instead.
-    pub fn remap_file_identities(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
+    ///
+    /// `pre_edit_member_ids` names the members the edited file had filed
+    /// before the edit, which is what [`Self::remap_settled_reads`] needs to
+    /// tell a settled read on a member from one on a speculative key.
+    pub fn remap_file_identities(
+        &mut self,
+        remap: &crate::FileRemap,
+        pre_edit_member_ids: &rustc_hash::FxHashSet<LuaMemberId>,
+    ) -> HashSet<FileId> {
         let mut dirty = HashSet::default();
 
         // Only caches that actually name an identity in the edited file can
@@ -2414,14 +2472,6 @@ impl LuaTypeIndex {
             if result.lost {
                 // A lost nested identity is left in place; the owner is
                 // re-analysed instead of being rewritten to a guessed value.
-                // TEMP DUMP (GLUALS_SETTLE_DETAIL): which cache + type lost.
-                // Env-gated, behavior-neutral; on the trace-deletion list.
-                if std::env::var_os("GLUALS_SETTLE_DETAIL").is_some() {
-                    eprintln!(
-                        "[settle-dump] cache lost: owner {owner:?} type {:?}",
-                        cache.as_type(),
-                    );
-                }
                 dirty.insert(owner.get_file_id());
             } else if let Some(new_type) = result.typ {
                 let new_cache = match cache {
@@ -2443,16 +2493,7 @@ impl LuaTypeIndex {
             self.mark_inference_derived_state_dirty();
         }
         dirty.extend(self.remap_inference_facts(remap));
-        // TEMP DUMP (GLUALS_SETTLE_DETAIL): attribute the loss to facts vs
-        // settled reads. Env-gated, behavior-neutral; on trace-deletion list.
-        let before_reads = dirty.len();
-        dirty.extend(self.remap_settled_reads(remap));
-        if std::env::var_os("GLUALS_SETTLE_DETAIL").is_some() && dirty.len() != before_reads {
-            eprintln!(
-                "[settle-dump] settled-reads added {} file(s)",
-                dirty.len() - before_reads,
-            );
-        }
+        dirty.extend(self.remap_settled_reads(remap, pre_edit_member_ids));
         dirty.remove(&remap.file_id);
         dirty
     }
@@ -2491,12 +2532,6 @@ impl LuaTypeIndex {
                 ));
             }
             if lost {
-                if std::env::var_os("GLUALS_SETTLE_DETAIL").is_some() {
-                    eprintln!(
-                        "[settle-trace]     fact lost: owner {owner:?} provenance {:?}",
-                        metadata.provenance
-                    );
-                }
                 dirty.insert(owner.get_file_id());
             }
         }
@@ -2518,15 +2553,6 @@ impl LuaTypeIndex {
             };
             let mut lost = false;
             let remapped = remap_identities_in_type(fact.typ(), remap);
-            // TEMP DUMP (GLUALS_SETTLE_DETAIL): which definition fact + payload
-            // lost. Env-gated, behavior-neutral; on the trace-deletion list.
-            if std::env::var_os("GLUALS_SETTLE_DETAIL").is_some() && remapped.lost {
-                eprintln!(
-                    "[settle-dump] definition-fact lost: definition {definition:?} type {:?} provenance {:?}",
-                    fact.typ(),
-                    fact.provenance(),
-                );
-            }
             if remapped.lost {
                 lost = true;
             }
@@ -3728,7 +3754,7 @@ mod batch_removal_tests {
 
         // An insertion at offset 3 shifts everything after it by two.
         let remap = FileRemap::unvalidated(edited, PositionMap::new("abcdef", "abcXXdef"));
-        index.remap_file_identities(&remap);
+        index.remap_file_identities(&remap, &HashSet::default());
         assert_reverse_maps_consistent(&index);
 
         assert_eq!(
@@ -3776,7 +3802,11 @@ mod remap_walker_tests {
         let mut index = LuaTypeIndex::new();
         index.bind_definition_fact(definition, LuaTypeFact::certain(instance(3, 5)));
         let insertion = FileRemap::unvalidated(source, PositionMap::new("abcde", "XXabcde"));
-        assert!(index.remap_file_identities(&insertion).is_empty());
+        assert!(
+            index
+                .remap_file_identities(&insertion, &HashSet::default())
+                .is_empty()
+        );
         assert_eq!(
             index.get_definition_fact(&definition).unwrap().typ(),
             &instance(5, 7),
@@ -3784,7 +3814,7 @@ mod remap_walker_tests {
 
         let deletion = FileRemap::unvalidated(source, PositionMap::new("XXabcde", "XXa"));
         assert_eq!(
-            index.remap_file_identities(&deletion),
+            index.remap_file_identities(&deletion, &HashSet::default()),
             [consumer].into_iter().collect(),
         );
     }

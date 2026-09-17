@@ -746,10 +746,7 @@ fn infer_self(db: &DbIndex, cache: &mut LuaInferCache, name_expr: LuaNameExpr) -
     // so generic `SelfInfer`/declared-parameter `self` still falls through to
     // the canonical `get_var_ref_type` resolution.
     let base_seed = infer_implicit_method_self_type(db, cache, &name_expr);
-
     let Some(self_ref_id) = self_ref_id else {
-        // No receiver id, but the seed may still know the receiver's type.
-        // Narrowing needs the id, so the seed is the final answer here.
         return base_seed.ok_or(InferFailReason::None);
     };
 
@@ -2633,7 +2630,16 @@ fn infer_global_type_from_decl_ids(db: &DbIndex, decl_ids: Vec<LuaDeclId>) -> In
     sorted_decl_ids.sort_by(|a, b| {
         let a_is_std = db.get_module_index().is_std(&a.file_id);
         let b_is_std = db.get_module_index().is_std(&b.file_id);
-        b_is_std.cmp(&a_is_std)
+        b_is_std.cmp(&a_is_std).then_with(|| {
+            // Within a tier the order *is* the answer: `def_or_ref_type` keeps
+            // the first declaration that names one and the table merge folds in
+            // the rest in order. The declaration list is built in analysis
+            // order, so a cold build and a re-index line the same tier up
+            // differently and the same name infers to a different one of its
+            // declarations. Source order decides instead -- the first
+            // declaration in the first file -- so both runs pick the same.
+            (a.file_id, a.position).cmp(&(b.file_id, b.position))
+        })
     });
 
     let mut callable_type: Option<LuaType> = None;

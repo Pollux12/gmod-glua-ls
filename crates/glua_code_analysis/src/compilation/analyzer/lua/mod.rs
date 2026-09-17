@@ -25,6 +25,7 @@ use metatable::analyze_setmetatable;
 use module::analyze_chunk_return;
 pub use module::compute_module_semantic_id;
 pub use stats::is_member_assignment_in_conditional_branch;
+pub(crate) use stats::scoped_class_prefix_member_owner;
 use stats::{
     GuardedSlotMemo, analyze_assign_stat, analyze_func_stat, analyze_local_func_stat,
     analyze_local_stat, analyze_table_field, flush_pending_dynamic_key_collection_widenings,

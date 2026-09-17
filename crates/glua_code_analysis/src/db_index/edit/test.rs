@@ -1,11 +1,12 @@
 use googletest::prelude::*;
 use lsp_types::Uri;
 use rowan::{TextRange, TextSize};
+use rustc_hash::FxHashSet;
 
 use super::{ExportKey, FileRemap, PositionMap, export_map, remap_into_file};
 use crate::{
-    DbIndex, Emmyrc, FileId, InFiled, LuaSignatureId, LuaType, LuaTypeOwner, SignatureReturnStatus,
-    TypeVisitTrait, VirtualWorkspace, diff_exports,
+    DbIndex, Emmyrc, FileId, InFiled, LuaInferenceNodeId, LuaMemberId, LuaSignatureId, LuaType,
+    LuaTypeOwner, SignatureReturnStatus, TypeVisitTrait, VirtualWorkspace, diff_exports,
 };
 
 fn range(start: u32, end: u32) -> TextRange {
@@ -673,14 +674,29 @@ fn edit_and_remap(
     old_text: &str,
     new_text: &str,
 ) -> Vec<FileId> {
+    // The members as they were before the edit: `remap_into_file` needs them
+    // to tell a settled read on a filed member from one on a speculative key.
+    let pre_edit_member_ids = ws
+        .analysis
+        .compilation
+        .get_db()
+        .get_member_index()
+        .get_file_members(file_id)
+        .iter()
+        .map(|member| member.get_id())
+        .collect::<FxHashSet<_>>();
     ws.analysis.update_file_text_only(uri, new_text.to_string());
     ws.analysis.compilation.remove_index(vec![file_id]);
     ws.analysis.compilation.update_index(vec![file_id]);
     let map = PositionMap::new(old_text, new_text);
     let remap = FileRemap::validated(ws.analysis.compilation.get_db(), file_id, map);
-    let mut dirty: Vec<FileId> = remap_into_file(ws.analysis.compilation.get_db_mut(), &remap)
-        .into_iter()
-        .collect();
+    let mut dirty: Vec<FileId> = remap_into_file(
+        ws.analysis.compilation.get_db_mut(),
+        &remap,
+        &pre_edit_member_ids,
+    )
+    .into_iter()
+    .collect();
     dirty.sort_by_key(|file_id| file_id.id);
     dirty
 }
@@ -1309,7 +1325,154 @@ fn an_identity_remap_leaves_every_owner_alone() {
         );
     }
     expect_that!(
-        remap_into_file(ws.analysis.compilation.get_db_mut(), &remap),
+        remap_into_file(
+            ws.analysis.compilation.get_db_mut(),
+            &remap,
+            &FxHashSet::default()
+        ),
+        is_empty()
+    );
+}
+
+/// Records the settled read a pass makes on a range the member index never
+/// filed: a `CallExpr` member id, the shape a pass records for the expression
+/// it read (`ply:GetActiveWeapon()` carries no member of its own). The key is
+/// stored under `consumer_id` with the provider file as the key's own file,
+/// exactly as `set_settled_reads` keeps it. Returns the key and its range.
+fn record_speculative_settled_read(
+    ws: &mut VirtualWorkspace,
+    provider_id: FileId,
+    consumer_id: FileId,
+) -> (LuaMemberId, TextRange) {
+    use glua_parser::{LuaAstNode, LuaCallExpr, LuaSyntaxId, LuaSyntaxKind};
+
+    let call_range = ws
+        .analysis
+        .compilation
+        .get_db()
+        .get_vfs()
+        .get_syntax_tree(&provider_id)
+        .expect("provider syntax tree")
+        .get_red_root()
+        .descendants()
+        .filter_map(LuaCallExpr::cast)
+        .map(|call| call.get_range())
+        .next()
+        .expect("the provider holds a call expression");
+    let member_id = LuaMemberId::new(
+        LuaSyntaxId::new(LuaSyntaxKind::CallExpr.into(), call_range),
+        provider_id,
+    );
+    expect_that!(
+        ws.analysis
+            .compilation
+            .get_db()
+            .get_member_index()
+            .get_file_members(provider_id)
+            .iter()
+            .any(|member| member.get_id() == member_id),
+        is_false(),
+        "the scenario needs a key the member index never filed"
+    );
+    ws.analysis
+        .compilation
+        .get_db_mut()
+        .get_type_index_mut()
+        .set_settled_reads(consumer_id, [LuaTypeOwner::Member(member_id)]);
+    (member_id, call_range)
+}
+
+/// A settled read can be keyed on a member id the index never filed: a pass
+/// keys such a read on the range of the expression it read, and a call files
+/// no member. The member layer is right to call such a key `Lost` - there is
+/// no member to confirm - but the key names a range in the edited file, not an
+/// identity, so a shift moves it with the text and its reader stays settled.
+/// Live CityRP observation: `cl_umsgs.lua`'s shift reported `settled-read
+/// lost: owner Member(1476 @107..126)` and dirtied the reader over a key that
+/// had only moved.
+#[gtest]
+fn a_shift_moves_a_speculative_settled_read_key_without_dirtying_its_reader() {
+    use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
+
+    let mut ws = workspace();
+    let provider_uri = ws.virtual_url_generator.new_uri("lua/provider.lua");
+    let first =
+        "provider = provider or {}\nfunction provider.Describe() end\nprovider:Describe()\n";
+    let shifted = format!("\n{first}");
+    let provider_id = write(&mut ws, &provider_uri, first);
+    let consumer_uri = ws.virtual_url_generator.new_uri("lua/consumer.lua");
+    let consumer_id = write(&mut ws, &consumer_uri, "local cached = 1\n");
+
+    let (speculative_id, call_range) =
+        record_speculative_settled_read(&mut ws, provider_id, consumer_id);
+
+    expect_that!(
+        edit_and_remap(&mut ws, &provider_uri, provider_id, first, &shifted),
+        is_empty(),
+        "a shift only moves the key: no reader is dirty"
+    );
+
+    let db = ws.analysis.compilation.get_db();
+    let shifted_range = PositionMap::new(first, &shifted)
+        .map_range(call_range)
+        .expect("a shift maps the call range");
+    let shifted_key = LuaTypeOwner::Member(LuaMemberId::new(
+        LuaSyntaxId::new(LuaSyntaxKind::CallExpr.into(), shifted_range),
+        provider_id,
+    ));
+    // The reader is still settled on the key, now at its shifted range ...
+    expect_that!(
+        db.get_type_index()
+            .files_depending_on_inference_nodes(&[LuaInferenceNodeId::TypeOwner(shifted_key)])
+            .contains(&consumer_id),
+        is_true()
+    );
+    // ... and nothing is left on the range the key came from.
+    expect_that!(
+        db.get_type_index()
+            .files_depending_on_inference_nodes(&[LuaInferenceNodeId::TypeOwner(
+                LuaTypeOwner::Member(speculative_id)
+            )])
+            .is_empty(),
+        is_true()
+    );
+}
+
+/// The same key on a range the edit destroyed is a real loss: no text is left
+/// for the read to name, so the key is dropped and its reader is dirty.
+#[gtest]
+fn a_deleted_speculative_settled_read_key_loses_its_reader() {
+    let mut ws = workspace();
+    let provider_uri = ws.virtual_url_generator.new_uri("lua/provider.lua");
+    let first =
+        "provider = provider or {}\nfunction provider.Describe() end\nprovider:Describe()\n";
+    // The call line is gone, so the key's range has no image.
+    let second = "provider = provider or {}\nfunction provider.Describe() end\n";
+    let provider_id = write(&mut ws, &provider_uri, first);
+    let consumer_uri = ws.virtual_url_generator.new_uri("lua/consumer.lua");
+    let consumer_id = write(&mut ws, &consumer_uri, "local cached = 1\n");
+
+    let (speculative_id, call_range) =
+        record_speculative_settled_read(&mut ws, provider_id, consumer_id);
+    expect_that!(
+        PositionMap::new(first, second).map_range(call_range),
+        none(),
+        "the deleted line leaves the key's range no image"
+    );
+
+    expect_that!(
+        edit_and_remap(&mut ws, &provider_uri, provider_id, first, second),
+        contains(eq(&consumer_id)),
+        "the reader has to be re-analysed"
+    );
+    expect_that!(
+        ws.analysis
+            .compilation
+            .get_db()
+            .get_type_index()
+            .files_depending_on_inference_nodes(&[LuaInferenceNodeId::TypeOwner(
+                LuaTypeOwner::Member(speculative_id)
+            )]),
         is_empty()
     );
 }

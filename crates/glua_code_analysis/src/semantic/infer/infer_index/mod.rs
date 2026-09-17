@@ -907,7 +907,7 @@ fn infer_table_member_owner(
             if is_table_const_from_doc_tag(db, &inst) {
                 Ok(nullable_any_type())
             } else {
-                cache.record_missed_member_read(owner, key);
+                cache.record_missed_member_read(db, owner, key);
                 Err(InferFailReason::FieldNotFound)
             }
         }
@@ -1160,7 +1160,6 @@ fn infer_gmod_same_file_expr_key_member_type(
         ) else {
             continue;
         };
-
         saw_match = true;
         member_types.push(member_type);
     }
@@ -2096,7 +2095,7 @@ fn infer_custom_type_member(
         }
     }
 
-    cache.record_missed_member_read(owner, key);
+    cache.record_missed_member_read(db, owner, key);
     Err(InferFailReason::FieldNotFound)
 }
 

@@ -475,7 +475,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             missed_member_reads
                 .entry(*reader_file_id)
                 .or_default()
-                .extend(reads.missing_member_slots);
+                .extend(reads.missing_member_slots.into_keys());
             db.get_member_index_mut().set_missed_member_reads(
                 *reader_file_id,
                 missed_member_reads
@@ -1365,20 +1365,80 @@ fn snapshot_settled_tail_boundary(
 /// Owners the round never wrote compare equal and drop out, and so does an
 /// owner one pass moved and a later pass moved back: only the net boundary
 /// state remains.
+///
+/// This is also the fixpoint's widening point. A self-referential counter
+/// (`t[k] = (t[k] or 0) + 1`) re-derives `integer N` as `integer N+1` every
+/// round, so the boundary never repeats and never empties — the loop would
+/// climb `IntegerConst` forever. When the only change across the boundary is
+/// numeric literals moving, the owner is rewritten to the widened primitive
+/// (`integer`/`number`), which is the join the counter converges to.
 fn diff_settled_tail_boundary(
-    db: &DbIndex,
+    db: &mut DbIndex,
     before: &HashMap<LuaTypeOwner, Option<LuaType>>,
 ) -> HashSet<LuaTypeOwner> {
     before
         .iter()
         .filter(|(owner, cached)| {
-            db.get_type_index()
+            let now = db
+                .get_type_index()
                 .get_type_cache(owner)
-                .map(|cache| cache.as_type())
-                != cached.as_ref()
+                .map(|cache| cache.as_type().clone());
+            if now.as_ref() == cached.as_ref() {
+                return false;
+            }
+            if let (Some(new), Some(old)) = (now.as_ref(), cached.as_ref())
+                && let Some(widened) = widen_numeric_literal_delta(new, old)
+            {
+                db.get_type_index_mut()
+                    .widen_infer_type_cache(owner, widened);
+            }
+            true
         })
         .map(|(owner, _)| owner.clone())
         .collect()
+}
+
+/// The widened form of `new` when it differs from `old` only by numeric
+/// literals having moved — the fixpoint widening operator for self-referential
+/// counters. Returns `None` when the change is anything else, so a real type
+/// change is never collapsed.
+///
+/// Only `IntegerConst`/`DocIntegerConst` (→ `integer`) and `FloatConst`
+/// (→ `number`) widen: those are the literals arithmetic produces fresh each
+/// round. String/boolean literals don't grow under a fixpoint, so a changed
+/// one is a real change. Union arms widen pairwise when the arity matches.
+fn widen_numeric_literal_delta(new: &LuaType, old: &LuaType) -> Option<LuaType> {
+    match (new, old) {
+        (LuaType::IntegerConst(_), LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_))
+        | (LuaType::DocIntegerConst(_), LuaType::IntegerConst(_)) => Some(LuaType::Integer),
+        (LuaType::FloatConst(_), LuaType::FloatConst(_)) => Some(LuaType::Number),
+        (LuaType::Union(new_union), LuaType::Union(old_union)) => {
+            let (LuaUnionType::Multi(new_arms), LuaUnionType::Multi(old_arms)) =
+                (new_union.as_ref(), old_union.as_ref())
+            else {
+                return None;
+            };
+            if new_arms.len() != old_arms.len() {
+                return None;
+            }
+            let mut widened_any = false;
+            let arms = new_arms
+                .iter()
+                .zip(old_arms.iter())
+                .map(|(new_arm, old_arm)| {
+                    if new_arm == old_arm {
+                        Some(new_arm.clone())
+                    } else {
+                        widen_numeric_literal_delta(new_arm, old_arm).inspect(|_| {
+                            widened_any = true;
+                        })
+                    }
+                })
+                .collect::<Option<Vec<_>>>()?;
+            widened_any.then(|| LuaType::Union(Arc::new(LuaUnionType::from_vec(arms))))
+        }
+        _ => None,
+    }
 }
 
 /// Canonical post-round state of every owner the settled tail can move:
@@ -2444,7 +2504,6 @@ fn refresh_decl_initializer_caches(
             // Whether the field's writer had been walked yet is a property of
             // the batch, not of the source: cold cached `false` for
             // `local on = LocalPlayer()._flag or false` where re-analysing the
-            // same unchanged file cached `true`.
             let inferred_full_fact = infer_expr_fact_with_cache(db, &mut infer_cache, expr.clone());
             let resolved_variadic_tail =
                 ret_idx > 0 && selects_resolved_result(inferred_full_fact.typ(), ret_idx);
@@ -2461,6 +2520,10 @@ fn refresh_decl_initializer_caches(
             if union_has_unsettled_arm(&inferred_type)
                 && !current_is_uninformative
                 && !cached_an_unsettled_union
+                && !current_cache.as_ref().is_some_and(|current| {
+                    union_widens_cached_type(&inferred_type, current.as_type())
+                        || settled_widens_cached_literals(&inferred_type, current.as_type())
+                })
             {
                 continue;
             }
@@ -2497,13 +2560,24 @@ fn refresh_decl_initializer_caches(
             let is_numeric_tuple_refinement = current_cache.as_ref().is_some_and(|current| {
                 is_settled_numeric_tuple_refinement(&inferred_type, current.as_type())
             });
+            let is_settled_widening = current_cache.as_ref().is_some_and(|current| {
+                union_widens_cached_type(&inferred_type, current.as_type())
+                    || settled_widens_cached_literals(&inferred_type, current.as_type())
+            });
+            let cached_a_tpl_leak = current_cache
+                .as_ref()
+                .is_some_and(|current| crate::db_index::leaks_unsubstituted_tpl(current.as_type()));
             if !copies_settled_iter_var
+                && !copies_settled_decl
                 && !current_is_uninformative
                 && !can_refine_nominal_type
                 && !can_upgrade_authority
                 && !cached_a_blind_dynamic_field_read
                 && !cached_an_unsettled_union
                 && !is_numeric_tuple_refinement
+                && !cached_a_provisional_slot_union
+                && !cached_a_tpl_leak
+                && !is_settled_widening
             {
                 continue;
             }
@@ -2616,18 +2690,7 @@ fn refresh_decl_initializer_caches(
                 && current_cache.as_ref().is_some_and(|current| {
                     is_strict_nominal_refinement(db, &inferred_type, current.as_type())
                 });
-            let is_settled_widening = current_cache.as_ref().is_some_and(|current| {
-                union_widens_cached_type(&inferred_type, current.as_type())
-                    || settled_widens_cached_literals(&inferred_type, current.as_type())
-            });
-            // A cache carrying an unsubstituted template parameter records that
-            // the generic call it came from never got instantiated, and the
-            // settled read has now instantiated it. `Bind` weighs the two as
-            // types, and the leak reads as a real one, so this goes through the
-            // force path.
-            let cached_a_tpl_leak = current_cache
-                .as_ref()
-                .is_some_and(|current| crate::db_index::leaks_unsubstituted_tpl(current.as_type()));
+
             if current_is_uninformative && !cached_a_tpl_leak {
                 result.updates.push(InitializerCacheUpdate::Bind {
                     owner: type_owner,
@@ -2732,13 +2795,23 @@ pub(crate) fn union_widens_cached_type(inferred: &LuaType, current: &LuaType) ->
         return false;
     };
     let inferred_arms = known_arms(inferred_union);
+    // A cached arm is covered when the settled union holds it verbatim or holds
+    // the primitive it widens to — `number` covers a cached `integer` the same
+    // way it covers a cached `5`.
+    let covered = |cached: &LuaType| {
+        inferred_arms
+            .iter()
+            .any(|arm| arm == cached || crate::db_index::widens_primitive(arm, cached))
+    };
     match current {
         LuaType::Union(current_union) => {
             let current_arms = known_arms(current_union);
-            current_arms.len() < inferred_arms.len()
-                && current_arms.iter().all(|arm| inferred_arms.contains(arm))
+            (current_arms.len() < inferred_arms.len()
+                || (current_arms.len() == inferred_arms.len()
+                    && current_union.types().count() < inferred_union.types().count()))
+                && current_arms.iter().all(covered)
         }
-        current => inferred_arms.contains(current),
+        current => covered(current),
     }
 }
 
@@ -2909,7 +2982,7 @@ fn refresh_member_initializer_caches(
             if current_cache.is_doc() {
                 continue;
             }
-            let Some(expr) = member_initializer_expr(&root, *member_id) else {
+            let Some((expr, ret_idx)) = member_initializer_expr(&root, *member_id) else {
                 continue;
             };
             // A member that copies a loop variable holds whatever that variable
@@ -2953,19 +3026,21 @@ fn refresh_member_initializer_caches(
                 else {
                     continue;
                 };
+                // A tail var holds one return of the last expression, not the
+                // whole multi-return value. Select it the way the deferred
+                // write's own resolution does.
+                let inferred_type = match &inferred_type {
+                    LuaType::Variadic(multi) => {
+                        multi.get_type(ret_idx).cloned().unwrap_or(LuaType::Unknown)
+                    }
+                    _ => inferred_type,
+                };
                 if copies_settled_iter_var {
                     widen_direct_literal_copy(&inferred_type)
                 } else {
                     common::widen_mutable_local_name_copy(db, file_id, &expr, inferred_type)
                 }
             };
-            if inferred_type == *current_cache.as_type()
-                || (union_has_unsettled_arm(&inferred_type)
-                    && !current_is_uninformative
-                    && !cached_an_unsettled_union)
-            {
-                continue;
-            }
             let takes_inferred_type = if canonical_guarded_bootstrap.is_some()
                 || copies_settled_iter_var
                 || copies_settled_decl
@@ -2974,11 +3049,14 @@ fn refresh_member_initializer_caches(
             {
                 true
             } else if reads_field_exist_guard
-                && union_widens_cached_type(&inferred_type, current_cache.as_type())
+                && (union_widens_cached_type(&inferred_type, current_cache.as_type())
+                    || (pass.is_settled() && inferred_type.is_any()))
             {
                 // The guard's narrowing has since seen every type that owns the
                 // key, so the settled answer is the cached one with the owners
-                // the walk had not reached folded in.
+                // the walk had not reached folded in. A settled `any` is that
+                // answer too: the member set now holds a writer whose own type
+                // never resolved, and `any` is what the read honestly reports.
                 true
             } else if reads_sibling_merge
                 && settled_covers_cached_type(&inferred_type, current_cache.as_type())
@@ -3162,10 +3240,13 @@ fn select_result_fact(fact: LuaTypeFact, result_idx: usize) -> LuaTypeFact {
     fact.with_runtime_type(typ)
 }
 
-fn member_initializer_expr(root: &LuaSyntaxNode, member_id: LuaMemberId) -> Option<LuaExpr> {
+fn member_initializer_expr(
+    root: &LuaSyntaxNode,
+    member_id: LuaMemberId,
+) -> Option<(LuaExpr, usize)> {
     let node = member_id.get_syntax_id().to_node_from_root(root)?;
     if let Some(field) = LuaTableField::cast(node.clone()) {
-        return field.get_value_expr();
+        return field.get_value_expr().map(|expr| (expr, 0));
     }
     let index_expr = glua_parser::LuaIndexExpr::cast(node)?;
     let assign_stat = index_expr.get_parent::<glua_parser::LuaAssignStat>()?;
@@ -3173,7 +3254,15 @@ fn member_initializer_expr(root: &LuaSyntaxNode, member_id: LuaMemberId) -> Opti
     let value_idx = vars
         .iter()
         .position(|var| var.syntax().text_range() == index_expr.get_range())?;
-    exprs.get(value_idx).cloned()
+    // A var past the last right-hand side takes the next return of the last
+    // expression (`a.b, t.c = f()` puts `t.c` on `f()`'s second return), so the
+    // re-infer reads that expression and selects the element the var holds.
+    match exprs.get(value_idx) {
+        Some(expr) => Some((expr.clone(), 0)),
+        None => exprs
+            .last()
+            .map(|expr| (expr.clone(), value_idx + 1 - exprs.len())),
+    }
 }
 
 fn is_strict_nominal_refinement(db: &DbIndex, candidate: &LuaType, current: &LuaType) -> bool {
@@ -3268,7 +3357,9 @@ pub(crate) fn initializer_reads_through_call_or_index(expr: &LuaExpr) -> bool {
 /// terms. Without this it stays `unknown` forever and usage-context inference
 /// guesses at it instead.
 pub(crate) fn initializer_may_improve_after_resolve(expr: &LuaExpr) -> bool {
-    initializer_reads_through_call_or_index(expr) || initializer_is_operator_expr(expr)
+    initializer_reads_through_call_or_index(expr)
+        || initializer_is_operator_expr(expr)
+        || matches!(expr, LuaExpr::NameExpr(_))
 }
 
 pub(crate) fn initializer_is_operator_expr(expr: &LuaExpr) -> bool {

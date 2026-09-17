@@ -305,6 +305,15 @@ impl LuaMemberIndex {
     }
 
     pub fn add_member(&mut self, owner: LuaMemberOwner, member: LuaMember) -> LuaMemberId {
+        self.add_member_with_owner_only(owner, member, false)
+    }
+
+    pub fn add_member_with_owner_only(
+        &mut self,
+        owner: LuaMemberOwner,
+        member: LuaMember,
+        is_owner_only: bool,
+    ) -> LuaMemberId {
         let id = member.get_id();
         let owner = self
             .effective_path_member_owner(id, &owner)
@@ -317,8 +326,28 @@ impl LuaMemberIndex {
         // the member keeps its identity while its owner and key maps move, so
         // any memo holding the old slot must rebuild. Pure first filings are
         // append-only and leave the revision alone.
+        let mut already_filed_here = false;
         if self.members.contains_key(&id) {
             self.bump_homing_revision();
+            // The insert below overwrites the member record, but nothing else
+            // removes the id from the key slot its previous filing named. When
+            // the owner is unchanged and only the key moved, that leaves the id
+            // listed under two keys of one owner, so `get_members` yields it
+            // twice. Drop the stale key slot; a changed owner is a genuine
+            // second home (membership accumulates across owners) and is kept.
+            let old_owner = self.member_current_owner.get(&id).cloned();
+            let same_owner = old_owner.as_ref() == Some(&owner);
+            let key_changed = self.get_member(&id).map(|m| m.get_key()) != Some(member.get_key());
+            if same_owner
+                && key_changed
+                && let Some(old_owner) = old_owner
+            {
+                self.remove_member_from_owner_slot(&old_owner, id);
+            }
+            // A re-file under the same owner and key is a rewrite, not a new
+            // membership: the owner-key indexes already hold the id, and
+            // pushing it again would list the member twice in the slot.
+            already_filed_here = same_owner && !key_changed;
         }
         self.members.insert(id, member);
         self.set_member_function_scope_range(id, function_scope);
@@ -331,10 +360,41 @@ impl LuaMemberIndex {
                 .or_default()
                 .insert(member_id_sort_key(id), id);
             self.add_in_file_object(file_id, MemberOrOwner::Owner(owner.clone()));
-            self.add_new_member_to_owner_key_indexes(owner.clone(), id);
-            self.add_member_to_owner(owner.clone(), id);
+            if is_owner_only {
+                self.owner_only_members.insert(id);
+            } else {
+                if !already_filed_here {
+                    self.add_new_member_to_owner_key_indexes(owner.clone(), id);
+                }
+                self.add_member_to_owner(owner.clone(), id);
+            }
         }
         id
+    }
+
+    /// Removes `id` from `owner`'s item slot and the owner-key indexes, reading
+    /// the key off the member's current record. Shared by `rekey_member` and
+    /// the re-file path in `add_member_with_owner_only`: both move a member
+    /// whose stored key still names the slot being vacated.
+    fn remove_member_from_owner_slot(&mut self, owner: &LuaMemberOwner, id: LuaMemberId) {
+        let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
+            return;
+        };
+        self.remove_member_from_all_owner_key_indexes(owner, id);
+        self.remove_current_member_key(id);
+        if let Some(owner_members) = self.owner_members.get_mut(owner) {
+            let drop_key = match owner_members.get_member_mut(&key) {
+                Some(LuaMemberIndexItem::One(existing)) => *existing == id,
+                Some(LuaMemberIndexItem::Many(ids)) => {
+                    ids.retain(|member_id| *member_id != id);
+                    ids.is_empty()
+                }
+                None => false,
+            };
+            if drop_key {
+                owner_members.remove_member(&key);
+            }
+        }
     }
 
     /// Files an existing member under a different key.
@@ -361,21 +421,7 @@ impl LuaMemberIndex {
         self.bump_homing_revision();
         let owner = self.member_current_owner.get(&member_id).cloned();
         if let Some(owner) = &owner {
-            self.remove_member_from_all_owner_key_indexes(owner, member_id);
-            self.remove_current_member_key(member_id);
-            if let Some(owner_members) = self.owner_members.get_mut(owner) {
-                let slot_empty = match owner_members.get_member_mut(&old_key) {
-                    Some(LuaMemberIndexItem::One(id)) => *id == member_id,
-                    Some(LuaMemberIndexItem::Many(ids)) => {
-                        ids.retain(|id| *id != member_id);
-                        ids.is_empty()
-                    }
-                    None => false,
-                };
-                if slot_empty {
-                    owner_members.remove_member(&old_key);
-                }
-            }
+            self.remove_member_from_owner_slot(owner, member_id);
         }
 
         self.members.get_mut(&member_id)?.set_key(new_key.clone());
@@ -869,6 +915,14 @@ impl LuaMemberIndex {
     /// registered for it.
     pub fn definition_site_path(&self, site: &crate::InFiled<TextRange>) -> Option<GlobalId> {
         self.definition_site_owner.get(site)?.get_path().cloned()
+    }
+
+    /// Whether `path` has at least one `---@class` proposal, so the class-flip
+    /// machinery ([`Self::set_global_path_class`]) owns its members' homing.
+    /// A path with no candidates can never flip, so provenance on it is inert
+    /// and must not exempt a member from settled owner re-derivation.
+    pub fn global_path_has_class_candidates(&self, path: &GlobalId) -> bool {
+        self.global_path_class_candidates.contains_key(path)
     }
 
     /// Whether `path` is a global path the index knows about: it has members

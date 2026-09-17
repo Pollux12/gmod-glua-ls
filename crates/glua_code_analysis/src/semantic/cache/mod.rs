@@ -419,9 +419,38 @@ impl LuaInferCache {
         std::mem::take(&mut self.inferred_return_reads)
     }
 
-    pub fn record_missed_member_read(&mut self, owner: crate::LuaMemberOwner, key: LuaMemberKey) {
-        crate::db_index::read_set::record_missing_member_slot(&owner, &key);
-        self.missed_member_reads.insert((owner, key));
+    pub fn record_missed_member_read(
+        &mut self,
+        db: &crate::DbIndex,
+        owner: crate::LuaMemberOwner,
+        key: LuaMemberKey,
+    ) {
+        // Version the miss by what the slot held when read: the member count,
+        // and for a `Name` key the dynamic-field definition count. A slot that
+        // was already non-empty — a realm-incompatible member the reader could
+        // not see, or a key a dynamic field already defines — is a definitive
+        // answer the settled pass reproduces, so it must not report stale every
+        // round; only the slot changing what it holds re-derives the read.
+        let member_count = db
+            .get_member_index()
+            .get_members_for_owner_key(&owner, &key)
+            .len();
+        let dynamic_field_count = match &key {
+            LuaMemberKey::Name(name) => crate::dynamic_field_owner_of(db, &owner)
+                .map(|dynamic_owner| {
+                    db.get_dynamic_field_index()
+                        .field_definitions(&dynamic_owner, name.as_str())
+                        .len()
+                })
+                .unwrap_or(0),
+            _ => 0,
+        };
+        crate::db_index::read_set::record_missing_member_slot(
+            &owner,
+            &key,
+            member_count,
+            dynamic_field_count,
+        );
     }
 
     pub fn take_missed_member_reads(&mut self) -> FxHashSet<(crate::LuaMemberOwner, LuaMemberKey)> {

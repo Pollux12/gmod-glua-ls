@@ -1351,61 +1351,20 @@ impl EmmyLuaAnalysis {
                 snapshot_pre_edit_names(self.compilation.get_db(), file_id),
             );
             let map = self.take_position_map(file_id);
-            // TEMP DUMP (GLUALS_SETTLE_DETAIL): old type decls before re-index,
-            // so the cl_umsgs loss can be attributed to a decl-shape change vs
-            // a pure geometry miss. Env-gated, behavior-neutral; on the
-            // trace-deletion list.
-            if std::env::var_os("GLUALS_SETTLE_DETAIL").is_some() {
-                let db = self.compilation.get_db();
-                let path = db.get_vfs().get_file_path(&file_id);
-                let new_len = db.get_vfs().get_file_content(&file_id).map(|t| t.len());
-                let mut decls: Vec<String> = db
-                    .get_type_index()
-                    .get_file_type_decl_ids(file_id)
-                    .map(|ids| {
-                        ids.iter()
-                            .map(|id| {
-                                let locs = db
-                                    .get_type_index()
-                                    .get_type_decl(id)
-                                    .map(|d| {
-                                        d.get_locations()
-                                            .iter()
-                                            .map(|l| format!("{:?}:{:?}", l.file_id, l.range))
-                                            .collect::<Vec<_>>()
-                                            .join(",")
-                                    })
-                                    .unwrap_or_default();
-                                format!("{id:?}@[{locs}]")
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                decls.sort();
-                // TEMP DUMP: old member ids + 1489's settled reads naming this
-                // file. Env-gated, behavior-neutral; on the trace-deletion list.
-                let mut members: Vec<String> = db
-                    .get_member_index()
-                    .get_file_members(file_id)
-                    .iter()
-                    .map(|m| {
-                        format!(
-                            "{:?}@{:?} key={:?} owner={:?}",
-                            m.get_id().get_syntax_id().get_kind(),
-                            m.get_id().get_syntax_id().get_range(),
-                            m.get_key(),
-                            db.get_member_index().get_current_owner(&m.get_id())
-                        )
-                    })
-                    .collect();
-                members.sort();
-                eprintln!(
-                    "[settle-dump] pre-edit {path:?} hunk {:?} new_len {new_len:?} decls {}: {decls:?} members {}: {members:?}",
-                    map.hunk(),
-                    decls.len(),
-                    members.len(),
-                );
-            }
+            // The members this file had filed before the edit. A settled read
+            // can be keyed on a member id the index never filed - a pass keys
+            // such a read on the range of the expression it read - and such a
+            // key has no filed identity for the validated remap to confirm, so
+            // `remap_into_file` moves it by geometry instead of dirtying every
+            // reader of it.
+            let pre_edit_member_ids = self
+                .compilation
+                .get_db()
+                .get_member_index()
+                .get_file_members(file_id)
+                .iter()
+                .map(|member| member.get_id())
+                .collect::<FxHashSet<LuaMemberId>>();
             let removed = dirty.removed.contains(&file_id);
             // Expressed in the new text's coordinates already, so it compares
             // key for key against the map taken after the re-index.
@@ -1421,7 +1380,7 @@ impl EmmyLuaAnalysis {
                     FileRemap::unvalidated(file_id, map)
                 },
             );
-            pre_edit.push((file_id, map, old));
+            pre_edit.push((file_id, map, old, pre_edit_member_ids));
         }
 
         self.compilation.remove_index(file_ids.clone());
@@ -1434,22 +1393,10 @@ impl EmmyLuaAnalysis {
             self.compilation.update_index(live);
         }
 
-        let settle_trace = std::env::var_os("GLUALS_SETTLE_TRACE").is_some();
-        for (file_id, map, old) in pre_edit {
+        for (file_id, map, old, pre_edit_member_ids) in pre_edit {
             let removed = dirty.removed.contains(&file_id);
             let remap = FileRemap::validated(self.compilation.get_db(), file_id, map);
-            let lost = remap_into_file(self.compilation.get_db_mut(), &remap);
-            if settle_trace {
-                let mut lost_sorted: Vec<_> = lost.iter().collect();
-                lost_sorted.sort_unstable();
-                eprintln!(
-                    "[settle-trace] remap-loss for {:?}: {} file(s): {:?} (hunk {:?})",
-                    self.compilation.get_db().get_vfs().get_file_path(&file_id),
-                    lost.len(),
-                    lost_sorted,
-                    map.hunk(),
-                );
-            }
+            let lost = remap_into_file(self.compilation.get_db_mut(), &remap, &pre_edit_member_ids);
             dirty.remap_losses.extend(lost.iter().copied());
 
             let new = if removed {
@@ -1462,21 +1409,6 @@ impl EmmyLuaAnalysis {
                 )
             };
             let diff = diff_exports(&old, &new);
-            if settle_trace {
-                let mut keys: Vec<String> = diff.keys().map(|key| format!("{key:?}")).collect();
-                keys.sort_unstable();
-                eprintln!(
-                    "[settle-trace] export diff for {:?}: {} key(s)",
-                    self.compilation.get_db().get_vfs().get_file_path(&file_id),
-                    keys.len(),
-                );
-                for key in keys.iter().take(40) {
-                    eprintln!("[settle-trace]   key {key}");
-                }
-                if keys.len() > 40 {
-                    eprintln!("[settle-trace]   ... and {} more", keys.len() - 40);
-                }
-            }
             // Diagnostic-refresh-only renames, independent of the export diff:
             // a same-position rename moves no key, so without this its names
             // never reach the watched-file refresh. Rename-channel: anchored in
@@ -1559,24 +1491,6 @@ impl EmmyLuaAnalysis {
             });
             let dependents = dependents_of(self.compilation.get_db(), file_id, &diff);
             let evidence = self.evidence_dependents(file_id);
-            if settle_trace {
-                let mut dependents_sorted: Vec<_> = dependents.iter().collect();
-                dependents_sorted.sort_unstable();
-                let mut evidence_sorted: Vec<_> = evidence.iter().collect();
-                evidence_sorted.sort_unstable();
-                eprintln!(
-                    "[settle-trace] diff-driven for {:?}: {} dependent(s) + {} evidence file(s)",
-                    self.compilation.get_db().get_vfs().get_file_path(&file_id),
-                    dependents_sorted.len(),
-                    evidence_sorted.len(),
-                );
-                for dep in dependents_sorted.iter().take(40) {
-                    eprintln!("[settle-trace]   dependent {dep:?}");
-                }
-                for dep in evidence_sorted.iter().take(40) {
-                    eprintln!("[settle-trace]   evidence {dep:?}");
-                }
-            }
             dirty.diff_dependents.extend(dependents.iter().copied());
             dirty.diff_dependents.extend(evidence.iter().copied());
             dirty.files.extend(dependents);

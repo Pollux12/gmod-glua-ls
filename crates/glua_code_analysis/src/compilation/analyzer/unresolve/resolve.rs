@@ -220,6 +220,7 @@ fn create_deferred_index_expr_member(
     owner: LuaMemberOwner,
     member_id: LuaMemberId,
     alias_path: Option<GlobalId>,
+    set_owner_only: bool,
 ) -> Option<()> {
     let root = db
         .get_vfs()
@@ -245,7 +246,7 @@ fn create_deferred_index_expr_member(
     let member = LuaMember::new(member_id, member_key, feature, None);
     {
         let member_index = db.get_member_index_mut();
-        member_index.add_member(owner.clone(), member);
+        member_index.add_member_with_owner_only(owner.clone(), member, set_owner_only);
         // The same alias provenance the immediate path records: a write
         // through an alias of a global path must follow the path's
         // `---@class` flips even though its first home came from a prefix
@@ -256,7 +257,7 @@ fn create_deferred_index_expr_member(
                 member_id.file_id,
                 member_id,
                 alias_path,
-                false,
+                set_owner_only,
             );
         }
         // The owner above came from a prefix type read mid-fixpoint, so this
@@ -375,22 +376,33 @@ pub fn try_resolve_member(
                     // Some annotation bundles define methods as `function TypeName:Method()`
                     // without binding a typed declaration for `TypeName` in scope. Expose those
                     // runtime members through a matching class without replacing their real owner.
+                    //
+                    // This is the last branch that can end without an owner, and a
+                    // prefix that names no class reads exactly like one that has
+                    // not settled: the lookup misses for the lowercase locals the
+                    // real scripts use (`player._Sleeping`), and on a cold build
+                    // the walk reaches the write before the prefix carries a type
+                    // at all. Answering `Ok` there retires the member from every
+                    // retry with nothing attached, which is what made its owner a
+                    // function of how far the batch had run. Report it unresolved
+                    // instead, so the caller keeps it queued until a pass that can
+                    // still settle the prefix has run.
                     let LuaExpr::NameExpr(name_expr) = prefix_expr else {
                         return Err(InferFailReason::FieldNotFound);
                     };
                     let Some(name_token) = name_expr.get_name_token() else {
-                        return Ok(());
+                        return Err(InferFailReason::FieldNotFound);
                     };
                     let type_decl_id = LuaTypeDeclId::global(name_token.get_name_text());
                     let Some(type_decl) = db.get_type_index().get_type_decl(&type_decl_id) else {
-                        return Ok(());
+                        return Err(InferFailReason::FieldNotFound);
                     };
-                    if type_decl.is_class() {
-                        let _ = db.get_member_index_mut().add_member_alias_to_owner(
-                            LuaMemberOwner::Type(type_decl_id),
-                            member_id,
-                        );
+                    if !type_decl.is_class() {
+                        return Err(InferFailReason::FieldNotFound);
                     }
+                    let _ = db
+                        .get_member_index_mut()
+                        .add_member_alias_to_owner(LuaMemberOwner::Type(type_decl_id), member_id);
                     None
                 }
             }
@@ -422,6 +434,7 @@ pub fn try_resolve_member(
                     member_owner.clone(),
                     member_id,
                     alias_path.clone(),
+                    set_owner_only,
                 );
             }
 

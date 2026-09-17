@@ -1336,6 +1336,7 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         let mut out = String::new();
         for (tag, map) in [
             ("TC", &snapshot.type_caches),
+            ("TF", &snapshot.type_facts),
             ("PARAM", &snapshot.inferred_params),
             ("SUPER", &snapshot.super_types),
             ("CLSMEM", &snapshot.class_members),

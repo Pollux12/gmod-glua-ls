@@ -250,39 +250,6 @@ impl FileFacts {
                 }
             }
         }
-        // TEMP DUMP (GLUALS_SETTLE_DETAIL): new decls after re-index. Env-gated,
-        // behavior-neutral; on the trace-deletion list.
-        if std::env::var_os("GLUALS_SETTLE_DETAIL").is_some() {
-            let mut decls: Vec<String> = db
-                .get_type_index()
-                .get_file_type_decl_ids(file_id)
-                .map(|ids| {
-                    ids.iter()
-                        .map(|id| {
-                            let locs = db
-                                .get_type_index()
-                                .get_type_decl(id)
-                                .map(|d| {
-                                    d.get_locations()
-                                        .iter()
-                                        .map(|l| format!("{:?}:{:?}", l.file_id, l.range))
-                                        .collect::<Vec<_>>()
-                                        .join(",")
-                                })
-                                .unwrap_or_default();
-                            format!("{id:?}@[{locs}]")
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            decls.sort();
-            eprintln!(
-                "[settle-dump] collect {file_id:?} path {:?} decls {}: {decls:?}",
-                db.get_vfs().get_file_path(&file_id),
-                decls.len(),
-            );
-        }
-
         Self {
             signature_positions,
             decl_positions,
@@ -481,25 +448,6 @@ impl FileRemap {
             Remap::Unrelated => Remap::Unrelated,
             Remap::Lost => Remap::Lost,
         };
-        // TEMP DUMP (GLUALS_SETTLE_DETAIL): DocTagClass misses only. Env-gated,
-        // behavior-neutral; on the trace-deletion list.
-        if std::env::var_os("GLUALS_SETTLE_DETAIL").is_some()
-            && !id.is_token()
-            && id.get_kind() == LuaSyntaxKind::DocTagClass
-            && self.owns(file_id)
-            && self.facts.is_some()
-        {
-            let mapped_range = match &mapped {
-                Remap::Moved(v) => format!("{:?}", v.get_range()),
-                Remap::Lost => "Lost".to_string(),
-                Remap::Unrelated => "Unrelated".to_string(),
-            };
-            eprintln!(
-                "[settle-dump] syntax_id {file_id:?} old {:?} mapped {mapped_range} hunk {:?}",
-                id.get_range(),
-                self.map.hunk(),
-            );
-        }
         // Synthesized `DocTagClass` ids from whole-file (chunk) decl spans
         // (`ensure_scoped_class_type_decl`) never equal their shift image, so
         // the exact admission in `FileFacts::collect` cannot see them. When
@@ -542,46 +490,6 @@ impl FileRemap {
             Remap::Unrelated => Remap::Unrelated,
             Remap::Lost => Remap::Lost,
         };
-        // TEMP DUMP (GLUALS_SETTLE_DETAIL): member-id misses only. Env-gated,
-        // behavior-neutral; on the trace-deletion list.
-        if std::env::var_os("GLUALS_SETTLE_DETAIL").is_some()
-            && self.owns(id.file_id)
-            && self.facts.is_some()
-        {
-            if let Remap::Moved(moved) = &mapped {
-                let known = self
-                    .facts
-                    .as_ref()
-                    .is_some_and(|facts| facts.member_ids.contains(moved.get_syntax_id()));
-                if !known {
-                    let mut known_ranges: Vec<String> = self
-                        .facts
-                        .as_ref()
-                        .map(|facts| {
-                            let mut v: Vec<String> = facts
-                                .member_ids
-                                .iter()
-                                .map(|m| format!("{:?}@{:?}", m.get_kind(), m.get_range()))
-                                .collect();
-                            v.sort();
-                            v
-                        })
-                        .unwrap_or_default();
-                    known_ranges.truncate(60);
-                    eprintln!(
-                        "[settle-dump] member_id {:?} old {:?} mapped {:?} hunk {:?} known {}: {known_ranges:?}",
-                        id.file_id,
-                        id.get_syntax_id().get_range(),
-                        moved.get_syntax_id().get_range(),
-                        self.map.hunk(),
-                        self.facts
-                            .as_ref()
-                            .map(|facts| facts.member_ids.len())
-                            .unwrap_or(0),
-                    );
-                }
-            }
-        }
         self.resolve(
             mapped,
             self.range_is_before_the_hunk(id.get_syntax_id().get_range()),
