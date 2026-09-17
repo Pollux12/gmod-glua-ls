@@ -837,14 +837,18 @@ fn infer_implicit_self_type_from_call_site(
     cache: &LuaInferCache,
     name_expr: &LuaNameExpr,
 ) -> Option<LuaType> {
-    if !cache.get_config().call_site_params_visible {
-        return None;
-    }
     let file_id = cache.get_file_id();
     let closure = name_expr.ancestors::<LuaClosureExpr>().next()?;
     let signature_id = LuaSignatureId::from_closure(file_id, &closure);
     let signature = db.get_signature_index().get(&signature_id)?;
     if !signature.is_colon_define {
+        return None;
+    }
+    // Record the read even while call-site params are still being collected:
+    // the slot is empty now, but the contrib edge is what flags this read
+    // stale once the pipeline lands the receiver a caller contributed.
+    if !cache.get_config().call_site_params_visible {
+        crate::db_index::read_set::record_contrib(&signature_id, signature.params.len());
         return None;
     }
     db.get_call_site_param_index()

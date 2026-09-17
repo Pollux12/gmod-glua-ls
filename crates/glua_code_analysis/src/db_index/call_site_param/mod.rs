@@ -1361,12 +1361,34 @@ impl LuaIndex for CallSiteParamIndex {
     }
 
     fn remove_files(&mut self, file_ids: &[FileId]) {
-        let affected_params = file_ids
+        let mut affected_params: HashSet<(LuaSignatureId, usize)> = file_ids
             .iter()
             .filter_map(|file_id| self.file_contributions.get(file_id))
             .flatten()
             .map(|contribution| (contribution.signature_id, contribution.param_idx))
-            .collect::<HashSet<_>>();
+            .collect();
+        // Incoming facts: signatures *declared* in a removed file that
+        // surviving callers supplied evidence for. Their folded facts must go
+        // too, or an isolated re-index of the callee reads a stale caller's
+        // receiver and flips member ownership. The raw contributions stay, so
+        // re-analysing the callers re-folds exactly what a fresh build sees.
+        // Scanning the folded keys rather than going through
+        // `contributor_signatures_by_file` keeps the purge true to that
+        // promise even where the accumulated contributor views have already
+        // forgotten a signature.
+        let mut removed_declared_signatures = HashSet::default();
+        for signature_id in self.inferred_params.keys() {
+            if file_ids.contains(&signature_id.get_file_id()) {
+                removed_declared_signatures.insert(*signature_id);
+            }
+        }
+        for signature_id in &removed_declared_signatures {
+            affected_params.extend(
+                self.inferred_params[signature_id]
+                    .keys()
+                    .map(|param_idx| (*signature_id, *param_idx)),
+            );
+        }
         // The current facts of the affected pairs, for the event surgery once
         // the contributions are gone. The parked map below may already hold an
         // older fact from a previous removal, so this snapshot is taken
@@ -1395,6 +1417,29 @@ impl LuaIndex for CallSiteParamIndex {
         }
         self.deferred_contributions
             .retain(|(file_id, _)| !file_ids.contains(file_id));
+        // Drop the incoming facts now that the snapshot and the park above
+        // have captured them. The contributor maps go first so the refold at
+        // the end sees no surviving contributor for these signatures and
+        // leaves the slots empty; the parked previous facts go too, so a
+        // caller re-contributing the identical fact still reports a change and
+        // requeues the callee instead of silently matching the stale state.
+        for signature_id in &removed_declared_signatures {
+            self.inferred_params.remove(signature_id);
+            self.contributor_files_by_signature.remove(signature_id);
+        }
+        for file_id in file_ids {
+            if let Some(signatures) = self.contributor_signatures_by_file.get_mut(file_id) {
+                signatures
+                    .retain(|signature_id| !removed_declared_signatures.contains(signature_id));
+                if signatures.is_empty() {
+                    self.contributor_signatures_by_file.remove(file_id);
+                }
+            }
+        }
+        self.pending_previous_params
+            .retain(|(signature_id, _), _| !removed_declared_signatures.contains(signature_id));
+        self.contrib_write_versions
+            .retain(|(signature_id, _), _| !removed_declared_signatures.contains(signature_id));
         let mut removed_source_signatures = HashSet::default();
         let mut removed_consumers = Vec::new();
         for &file_id in file_ids {

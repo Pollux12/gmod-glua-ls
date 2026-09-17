@@ -15,7 +15,7 @@ pub(crate) mod unresolve;
 
 pub(crate) use common::FixpointFuse;
 pub(crate) use dynamic_field::for_range_pairs_source_for_var;
-pub(crate) use dynamic_field::is_provably_builtin_pairs_call;
+pub(crate) use dynamic_field::is_provably_builtin_iterator_call;
 pub use lua::is_member_assignment_in_conditional_branch;
 pub(crate) use lua::{
     dominating_guarded_table_bootstrap_range, infer_for_range_iter_expr_func,
@@ -280,6 +280,18 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             );
         }
 
+        {
+            // A guess from a local's uses is a fallback for a local inference
+            // cannot type, so it is taken only once inference has finished:
+            // taken earlier it stands in for an answer a later pass lands. It
+            // runs before the settled tail, not after it: the tail's candidates
+            // read these locals, and a guess committed only after the fixpoint
+            // would leave every dependent frozen at the pre-stabilization read
+            // while a warm re-derivation sees the settled one.
+            let _p = Profile::new("local inference stabilize");
+            local_inference::stabilize_unknown_locals(db, &mut context);
+        }
+
         // A loop over a global has to enumerate the table every realm's file
         // contributed to, so the copies of that global settle first; and only
         // now is every member attached, so a loop that enumerates a table can
@@ -438,14 +450,6 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             context.settled_return_attempts.clear();
             context.settled_member_key_candidates = None;
             context.settled_owner_candidates = None;
-        }
-
-        {
-            // A guess from a local's uses is a fallback for a local inference
-            // cannot type, so it is taken only once inference has finished:
-            // taken earlier it stands in for an answer a later pass lands.
-            let _p = Profile::new("local inference stabilize");
-            local_inference::stabilize_unknown_locals(db, &mut context);
         }
 
         // Net flows are collected last: the collector resolves wrappers through
@@ -2566,6 +2570,28 @@ fn refresh_decl_initializer_caches(
                 union_widens_cached_type(&inferred_type, current.as_type())
                     || settled_widens_cached_literals(&inferred_type, current.as_type())
             });
+            // The mirror of `is_settled_widening`: the cache holds the union a
+            // partial member set produced (`string` for a map whose keys had
+            // not folded yet, `number` for a slot one literal had reached), and
+            // the settled read narrows it to the arms the full set yields.
+            // `settled_covers_cached_type` asks the settled answer to cover the
+            // cache; here the cache must cover the settled answer — every
+            // informative arm it holds is one the cache's arms already covered
+            // or widened to. `nil`/`unknown` arms are absence markers the read
+            // adds, not refinements, so they are excluded from the check.
+            let is_settled_refinement = current_cache.as_ref().is_some_and(|current| {
+                let settled_arms: Vec<LuaType> = match &inferred_type {
+                    LuaType::Union(union) => known_arms(union)
+                        .into_iter()
+                        .filter(|arm| !matches!(arm, LuaType::Nil))
+                        .collect(),
+                    other => vec![other.clone()],
+                };
+                !settled_arms.is_empty()
+                    && settled_arms
+                        .iter()
+                        .all(|settled| settled_covers_cached_type(current.as_type(), settled))
+            });
             let cached_a_tpl_leak = current_cache
                 .as_ref()
                 .is_some_and(|current| crate::db_index::leaks_unsubstituted_tpl(current.as_type()));
@@ -2579,7 +2605,7 @@ fn refresh_decl_initializer_caches(
                 && !is_numeric_tuple_refinement
                 && !cached_a_provisional_slot_union
                 && !cached_a_tpl_leak
-                && !is_settled_widening
+                && !is_settled_refinement
             {
                 continue;
             }
@@ -2708,6 +2734,7 @@ fn refresh_decl_initializer_caches(
                 || cached_a_provisional_slot_union
                 || cached_an_unsettled_union
                 || is_numeric_tuple_refinement
+                || is_settled_refinement
             {
                 result.updates.push(InitializerCacheUpdate::Overwrite {
                     owner: type_owner,

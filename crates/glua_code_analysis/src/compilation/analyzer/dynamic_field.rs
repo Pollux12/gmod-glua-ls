@@ -519,51 +519,11 @@ fn analyze_dynamic_fields(
     }
 
     let propagate_start = profile_enabled.then(std::time::Instant::now);
-    // Propagate dynamic fields to parent types so that e.g. a field assigned
-    // on `base_glide` (which extends `Entity`) is also visible when the variable
-    // is typed as `Entity`.  This avoids false-positive `undefined-field` when
-    // user code accesses entity fields through a base-class reference.
-    let mut propagated: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
-        Vec::new();
-    if mode.propagate_to_super_types() {
-        // The authoring globals of scripted-class scopes (`ENT`, `SWEP`,
-        // `TOOL`, `GM`, and their aliases) are supers of *every* per-file
-        // scoped class, so propagating there pools each file's fields onto
-        // one table the whole workspace writes. Those scopes are per-file
-        // by design: a `---@type SWEP` read is a read of the generic
-        // authoring table, not of any one weapon, so it should see the
-        // annotated `SWEP` fields and not every weapon's private ones.
-        let scoped_globals: FxHashSet<&str> = db
-            .get_emmyrc()
-            .gmod
-            .scripted_class_scopes
-            .resolved_definitions_slice()
-            .iter()
-            .flat_map(|definition| {
-                std::iter::once(definition.class_global.as_str())
-                    .chain(definition.aliases.iter().map(String::as_str))
-            })
-            .collect();
-        for (owner, field_name, file_id, range) in &collected {
-            let DynamicFieldOwner::Type(type_id) = owner else {
-                continue;
-            };
-            let mut super_types = Vec::new();
-            type_id.collect_super_types(&*db, &mut super_types);
-            for super_type in super_types {
-                if let LuaType::Ref(super_id) = &super_type
-                    && !scoped_globals.contains(super_id.get_name())
-                {
-                    propagated.push((
-                        DynamicFieldOwner::Type(super_id.clone()),
-                        field_name.clone(),
-                        *file_id,
-                        *range,
-                    ));
-                }
-            }
-        }
-    }
+    let propagated = if mode.propagate_to_super_types() {
+        propagate_dynamic_fields_to_super_types(db, &collected)
+    } else {
+        Vec::new()
+    };
     if let (Some(profile), Some(propagate_start)) = (profile.as_mut(), propagate_start) {
         profile.propagation_time += propagate_start.elapsed();
     }
@@ -1898,16 +1858,37 @@ pub(crate) fn is_provably_builtin_pairs_call(
     file_id: crate::FileId,
     call_expr: &LuaCallExpr,
 ) -> bool {
-    if call_expr.get_access_path().as_deref() != Some("pairs") {
+    is_provably_builtin_global_call(db, file_id, call_expr, "pairs")
+}
+
+/// [`is_provably_builtin_pairs_call`] proved for the other builtin iterator
+/// whose generic bindings the for-range path retrieves (`ipairs`).
+pub(crate) fn is_provably_builtin_iterator_call(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    ["pairs", "ipairs"]
+        .into_iter()
+        .any(|builtin_name| is_provably_builtin_global_call(db, file_id, call_expr, builtin_name))
+}
+
+fn is_provably_builtin_global_call(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    call_expr: &LuaCallExpr,
+    builtin_name: &str,
+) -> bool {
+    if call_expr.get_access_path().as_deref() != Some(builtin_name) {
         return false;
     }
-    let Some(LuaExpr::NameExpr(pairs_name)) = call_expr.get_prefix_expr() else {
+    let Some(LuaExpr::NameExpr(call_name)) = call_expr.get_prefix_expr() else {
         return false;
     };
     if db
         .get_reference_index()
         .get_local_reference(&file_id)
-        .and_then(|references| references.get_decl_id(&pairs_name.get_range()))
+        .and_then(|references| references.get_decl_id(&call_name.get_range()))
         .is_some()
     {
         return false;
@@ -1918,7 +1899,7 @@ pub(crate) fn is_provably_builtin_pairs_call(
         return false;
     };
     let Some(priority_tiers) = db.get_global_index().get_global_decl_id_priority_tiers(
-        "pairs",
+        builtin_name,
         module_index,
         current_workspace_id,
     ) else {
@@ -1937,7 +1918,7 @@ pub(crate) fn is_provably_builtin_pairs_call(
             .is_some_and(|workspace_id| {
                 module_index.get_workspace_kind(workspace_id) == WorkspaceKind::Std
             })
-            || decl_preserves_builtin_semantics(db, *decl_id, "pairs")
+            || decl_preserves_builtin_semantics(db, *decl_id, builtin_name)
     })
 }
 
@@ -2023,6 +2004,57 @@ struct DynamicFieldRefreshResult {
     collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
     attributed_unattributed: Vec<(SmolStr, crate::FileId)>,
     reads: Option<crate::db_index::read_set::InferenceReadSet>,
+}
+
+/// Propagates collected dynamic fields to the super types of their owners so
+/// that e.g. a field assigned on `base_glide` (which extends `Entity`) is also
+/// visible when the variable is typed as `Entity`.  This avoids false-positive
+/// `undefined-field` when user code accesses entity fields through a
+/// base-class reference.  Shared by the initial pass and the settled
+/// re-derivation so both file the same propagated field set.
+fn propagate_dynamic_fields_to_super_types(
+    db: &DbIndex,
+    collected: &[(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)],
+) -> Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> {
+    // The authoring globals of scripted-class scopes (`ENT`, `SWEP`,
+    // `TOOL`, `GM`, and their aliases) are supers of *every* per-file
+    // scoped class, so propagating there pools each file's fields onto
+    // one table the whole workspace writes. Those scopes are per-file
+    // by design: a `---@type SWEP` read is a read of the generic
+    // authoring table, not of any one weapon, so it should see the
+    // annotated `SWEP` fields and not every weapon's private ones.
+    let scoped_globals: FxHashSet<&str> = db
+        .get_emmyrc()
+        .gmod
+        .scripted_class_scopes
+        .resolved_definitions_slice()
+        .iter()
+        .flat_map(|definition| {
+            std::iter::once(definition.class_global.as_str())
+                .chain(definition.aliases.iter().map(String::as_str))
+        })
+        .collect();
+    let mut propagated = Vec::new();
+    for (owner, field_name, file_id, range) in collected {
+        let DynamicFieldOwner::Type(type_id) = owner else {
+            continue;
+        };
+        let mut super_types = Vec::new();
+        type_id.collect_super_types(db, &mut super_types);
+        for super_type in super_types {
+            if let LuaType::Ref(super_id) = &super_type
+                && !scoped_globals.contains(super_id.get_name())
+            {
+                propagated.push((
+                    DynamicFieldOwner::Type(super_id.clone()),
+                    field_name.clone(),
+                    *file_id,
+                    *range,
+                ));
+            }
+        }
+    }
+    propagated
 }
 
 /// Re-derives the dynamic-field sites whose prefix held no nameable table
@@ -2193,10 +2225,17 @@ pub(crate) fn rederive_settled_dynamic_fields(
     for (owner, _, _) in &mut collected_wildcards {
         *owner = crate::canonical_dynamic_field_owner(db, owner.clone());
     }
+    // Same super-type propagation the initial pass applies, so a field the
+    // settled path resolves lands on the super types a cold first pass would
+    // have given it: the two paths must reach the identical index.
+    let propagated = propagate_dynamic_fields_to_super_types(db, &collected);
     let index = db.get_dynamic_field_index_mut();
     let mut changed = false;
     for (owner, field_name, file_id, range) in collected {
         changed |= index.add_field(owner, field_name, file_id, range);
+    }
+    for (owner, field_name, file_id, range) in propagated {
+        index.add_propagated_field(owner, field_name, file_id, range);
     }
     for (owner, file_id, range) in collected_wildcards {
         changed |= index.add_wildcard_definition(owner, file_id, range);

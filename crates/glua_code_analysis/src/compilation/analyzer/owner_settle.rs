@@ -27,7 +27,11 @@ use crate::{
 
 use super::{AnalyzeContext, SettledReadPass, parallel};
 
-fn owner_settle_candidates_for_file(db: &DbIndex, file_id: FileId) -> Vec<LuaMemberId> {
+fn owner_settle_candidates_for_file(
+    db: &DbIndex,
+    file_id: FileId,
+    unresolve_deferred: &HashSet<LuaMemberId>,
+) -> Vec<LuaMemberId> {
     db.get_member_index()
         .get_file_members(file_id)
         .into_iter()
@@ -40,10 +44,8 @@ fn owner_settle_candidates_for_file(db: &DbIndex, file_id: FileId) -> Vec<LuaMem
             }
             let id = member.get_id();
             let index = db.get_member_index();
-            // Ownerless members are the walk's deliberate answer for a prefix
-            // with no table value (e.g. `MHandler.set` on a bare class-name
-            // local) and stay put. Deferred members are the exception: their
-            // first home was explicitly provisional, so they always retry.
+            // Deferred members are always retried: their first home was
+            // explicitly provisional, so they always retry.
             if index.is_deferred_index_expr_member(&id) {
                 return true;
             }
@@ -77,10 +79,27 @@ fn owner_settle_candidates_for_file(db: &DbIndex, file_id: FileId) -> Vec<LuaMem
             if walk_skipped_value_flow_write(db, file_id, id) {
                 return false;
             }
-            let Some(current) = index.get_current_owner(&id) else {
-                return false;
-            };
-            !current.is_unknown()
+            // A member that already carries an owner keeps the old rule: only
+            // a real (non-`LocalUnresolve`) placement can be contradicted.
+            match index.get_current_owner(&id) {
+                Some(current) => !current.is_unknown(),
+                // An ownerless member is a candidate only when its write was
+                // a *failed prefix resolution*. Those are exactly the writes
+                // the walk queued for the settled attach retry — the
+                // no-owner-information fallthrough and the finalized member
+                // unresolves in `set_index_expr_owner` both land in
+                // `settled_member_attach_candidates`, and the attach passes
+                // keep the ones they could not place queued. A deliberately
+                // unowned write — a `t.x = nil` delete the walk's value-flow
+                // gates refused, a prefix that names no table at all —
+                // records no retry, so re-homing it here would mint the
+                // placement the walk deliberately refused to make. For the
+                // queued ones the re-derivation below keeps the member put
+                // while the prefix still says nothing and homes it once the
+                // prefix names a table, which is exactly the decision warm
+                // makes.
+                None => unresolve_deferred.contains(&id),
+            }
         })
         .map(|member| member.get_id())
         .collect()
@@ -342,9 +361,19 @@ pub(crate) fn rederive_settled_index_expr_owners(
         .as_ref()
         .is_none_or(|(count, _)| *count != candidate_count)
     {
+        // Provenance for ownerless members: the walk queues a write whose
+        // prefix read failed for the settled attach retry, and the attach
+        // passes keep every write they could not place queued. At this point
+        // that queue is exactly the set of failed resolutions — a write the
+        // walk deliberately left unowned never enters it.
+        let unresolve_deferred: HashSet<LuaMemberId> = context
+            .settled_member_attach_candidates
+            .iter()
+            .map(|candidate| LuaMemberId::new(candidate.value, candidate.file_id))
+            .collect();
         let mut candidates = HashMap::default();
         for file_id in context.analyzed_file_ids() {
-            let mut members = owner_settle_candidates_for_file(db, file_id);
+            let mut members = owner_settle_candidates_for_file(db, file_id, &unresolve_deferred);
             members.sort_unstable_by_key(|id| id.get_syntax_id().get_range().start());
             if !members.is_empty() {
                 candidates.insert(file_id, members);

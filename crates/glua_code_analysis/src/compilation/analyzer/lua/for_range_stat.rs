@@ -8,7 +8,7 @@ use crate::{
     TypeSubstitutor, VariadicType,
     compilation::analyzer::{
         common::{TypeCacheWriteMode, write_type_cache},
-        is_provably_builtin_pairs_call,
+        is_provably_builtin_iterator_call,
         unresolve::UnResolveIterVar,
     },
     get_member_map, infer_expr, instantiate_doc_function, tpl_pattern_match_args,
@@ -48,12 +48,12 @@ pub fn analyze_for_range_stat(
                 );
             }
 
-            if iter_var_types.contain_tpl() || enumerates_member_map {
-                // Either nothing bound the generic, so the vars hold raw
-                // template refs, or the types came from enumerating a
-                // table's member map. Either way the answer only covers the
-                // members indexed when this ran, and which those are
-                // depends on the order files were analysed in.
+            if iter_var_types.degraded_unbound_tpl || enumerates_member_map {
+                // Either a generic iterator left templates nothing bound, so
+                // the vars hold degraded placeholders, or the types came from
+                // enumerating a table's member map. Either way the answer only
+                // covers the members indexed when this ran, and which those
+                // are depends on the order files were analysed in.
                 let unresolved = UnResolveIterVar {
                     file_id: analyzer.file_id,
                     iter_exprs: iter_exprs.clone(),
@@ -116,15 +116,16 @@ pub fn iterates_table_member_map(
 pub struct IterVarInference {
     pub types: VariadicType,
     pub settled_overrides: Vec<Option<LuaType>>,
+    /// Whether some slot carried an unbound template, degraded to its
+    /// constraint or [`LuaType::Unknown`]. Such an answer was taken against
+    /// the index as it stood when the iterator was inferred, so the loop vars
+    /// stay queued for settled re-derivation.
+    pub degraded_unbound_tpl: bool,
 }
 
 impl IterVarInference {
     pub fn get_type(&self, idx: usize) -> Option<&LuaType> {
         self.types.get_type(idx)
-    }
-
-    pub fn contain_tpl(&self) -> bool {
-        self.types.contain_tpl()
     }
 }
 
@@ -151,11 +152,12 @@ pub fn infer_for_range_iter_expr_func(
         return Ok(IterVarInference {
             types: iter_types,
             settled_overrides: Vec::new(),
+            degraded_unbound_tpl: false,
         });
     }
 
-    let pairs_bindings = if let Some(LuaExpr::CallExpr(call_expr)) = iter_exprs.first()
-        && is_provably_builtin_pairs_call(db, cache.get_file_id(), call_expr)
+    let builtin_iter_bindings = if let Some(LuaExpr::CallExpr(call_expr)) = iter_exprs.first()
+        && is_provably_builtin_iterator_call(db, cache.get_file_id(), call_expr)
     {
         cache
             .get_generic_call_bindings(&call_expr.get_syntax_id())
@@ -227,11 +229,14 @@ pub fn infer_for_range_iter_expr_func(
 
     let Some(status_param) = status_param else {
         let types = doc_function.get_variadic_ret();
-        let settled_overrides = compute_proven_settled_overrides(pairs_bindings.as_deref(), &types);
-        let types = substitute_unbound_iter_var_templates(types, &settled_overrides);
+        let settled_overrides =
+            compute_proven_settled_overrides(builtin_iter_bindings.as_deref(), &types);
+        let (types, degraded_unbound_tpl) =
+            substitute_unbound_iter_var_templates(types, &settled_overrides);
         return Ok(IterVarInference {
             types,
             settled_overrides,
+            degraded_unbound_tpl,
         });
     };
     let mut substitutor = TypeSubstitutor::new();
@@ -259,42 +264,81 @@ pub fn infer_for_range_iter_expr_func(
     };
 
     let types = instantiate_func.get_variadic_ret();
-    let settled_overrides = compute_proven_settled_overrides(pairs_bindings.as_deref(), &types);
-    let types = substitute_unbound_iter_var_templates(types, &settled_overrides);
+    let settled_overrides =
+        compute_proven_settled_overrides(builtin_iter_bindings.as_deref(), &types);
+    let (types, degraded_unbound_tpl) =
+        substitute_unbound_iter_var_templates(types, &settled_overrides);
     Ok(IterVarInference {
         types,
         settled_overrides,
+        degraded_unbound_tpl,
     })
 }
 
+/// Substitutes the settled overrides into the iterator's return slots and
+/// degrades every remaining unbound template. A raw `TplRef` is a placeholder
+/// an unbound generic left behind, never a type the variable holds, so it must
+/// never reach the decl cache: it degrades to its declared constraint, or to
+/// `Unknown` when none exists. Returns whether any slot carried an unbound
+/// template — such an answer was taken against the index as it stood when the
+/// iterator was inferred, so it must be re-derived once the rest has landed.
 fn substitute_unbound_iter_var_templates(
     types: VariadicType,
     settled_overrides: &[Option<LuaType>],
-) -> VariadicType {
+) -> (VariadicType, bool) {
     match types {
         VariadicType::Multi(list) => {
+            let mut degraded_unbound_tpl = false;
             let substituted = list
                 .into_iter()
                 .enumerate()
                 .map(|(idx, typ)| {
-                    if typ.contain_tpl() {
-                        if let Some(Some(fallback)) = settled_overrides.get(idx) {
-                            return fallback.clone();
-                        }
+                    if !typ.contain_tpl() {
+                        return typ;
                     }
-                    typ
+                    degraded_unbound_tpl = true;
+                    match settled_overrides.get(idx) {
+                        Some(Some(fallback)) => fallback.clone(),
+                        _ => degrade_unbound_iter_var_type(typ),
+                    }
                 })
                 .collect();
-            VariadicType::Multi(substituted)
+            (VariadicType::Multi(substituted), degraded_unbound_tpl)
         }
         VariadicType::Base(typ) => {
-            if typ.contain_tpl() {
-                if let Some(Some(fallback)) = settled_overrides.first() {
-                    return VariadicType::Base(fallback.clone());
-                }
+            if !typ.contain_tpl() {
+                return (VariadicType::Base(typ), false);
             }
-            VariadicType::Base(typ)
+            if let Some(Some(fallback)) = settled_overrides.first() {
+                return (VariadicType::Base(fallback.clone()), true);
+            }
+            (VariadicType::Base(degrade_unbound_iter_var_type(typ)), true)
         }
+    }
+}
+
+/// Degrade an unbound template placeholder to a real type: its declared
+/// constraint when one exists, else `Unknown`. Union arms that did bind
+/// survive; only the placeholder arms are dropped.
+fn degrade_unbound_iter_var_type(typ: LuaType) -> LuaType {
+    match typ {
+        LuaType::TplRef(tpl) | LuaType::ConstTplRef(tpl) => {
+            tpl.get_constraint().cloned().unwrap_or(LuaType::Unknown)
+        }
+        LuaType::StrTplRef(tpl) => tpl.get_constraint().cloned().unwrap_or(LuaType::Unknown),
+        LuaType::Union(union) => {
+            let bound = union
+                .types()
+                .filter(|arm| !arm.contain_tpl())
+                .cloned()
+                .collect::<Vec<_>>();
+            match bound.as_slice() {
+                [] => LuaType::Unknown,
+                [only] => only.clone(),
+                _ => LuaType::from_vec(bound),
+            }
+        }
+        typ => typ,
     }
 }
 

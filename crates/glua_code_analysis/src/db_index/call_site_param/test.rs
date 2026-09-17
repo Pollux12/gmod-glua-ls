@@ -296,7 +296,8 @@ mod tests {
 
         // Two definitions now share the path, so which one the old id meant is
         // a guess, and guessing wrong merges one function's call sites into
-        // another's.
+        // another's. The removal purges the folded fact with the callee, and
+        // the retained contribution must not be re-homed onto a guess either.
         index.remove(callee);
         index.set_files_source_signatures(vec![(
             callee,
@@ -306,11 +307,72 @@ mod tests {
             ],
         )]);
 
-        assert_eq!(index.get_inferred_param(&before, 0), Some(&LuaType::String));
+        assert_eq!(index.get_inferred_param(&before, 0), None);
         assert_eq!(
             index.get_inferred_param(&signature_id(callee, 101), 0),
             None
         );
+        assert_eq!(
+            index.get_inferred_param(&signature_id(callee, 220), 0),
+            None
+        );
+        // The caller's evidence survives filed under the caller, so
+        // re-analysing the caller rebuilds it against a real signature.
+        assert!(index.file_contributions.contains_key(&caller));
+    }
+
+    /// Removing a callee purges the facts its signatures held from surviving
+    /// callers, so an isolated re-index of the callee cannot resolve `self`
+    /// from a stale caller's receiver. The caller's raw contribution survives
+    /// so re-analysing the caller rebuilds it.
+    #[test]
+    fn removing_a_callee_purges_the_facts_its_signatures_held_from_callers() {
+        let callee = FileId::new(1);
+        let caller = FileId::new(2);
+        let signature_id = signature_id(callee, 100);
+
+        let mut index = CallSiteParamIndex::new();
+        index.set_files_contributions(vec![(caller, vec![(signature_id, 0, LuaType::String)])]);
+
+        index.remove_files(&[callee]);
+
+        assert_eq!(index.get_inferred_param(&signature_id, 0), None);
+        assert!(!index.inferred_params.contains_key(&signature_id));
+        assert!(
+            !index
+                .contributor_files_by_signature
+                .contains_key(&signature_id)
+        );
+        assert!(!index.contributor_signatures_by_file.contains_key(&callee));
+        assert!(
+            !index
+                .pending_previous_params
+                .contains_key(&(signature_id, 0))
+        );
+        assert!(index.file_contributions.contains_key(&caller));
+    }
+
+    /// A caller re-contributing the exact fact it held before the callee's
+    /// removal must still report the signature as changed: the purge dropped
+    /// the parked previous fact, so the requeue machinery sees the callee's
+    /// slots move from empty back to inferred instead of matching the stale
+    /// state an isolated re-index just read.
+    #[test]
+    fn recontributing_a_removed_callees_fact_reports_a_change() {
+        let callee = FileId::new(1);
+        let caller = FileId::new(2);
+        let signature_id = signature_id(callee, 100);
+
+        let mut index = CallSiteParamIndex::new();
+        index.set_files_contributions(vec![(caller, vec![(signature_id, 0, LuaType::String)])]);
+
+        index.remove(callee);
+        let changed = index.set_files_fact_contributions(vec![(
+            caller,
+            vec![(signature_id, 0, LuaTypeFact::certain(LuaType::String))],
+        )]);
+
+        assert_eq!(changed, HashSet::from_iter([signature_id]));
     }
 
     #[test]
