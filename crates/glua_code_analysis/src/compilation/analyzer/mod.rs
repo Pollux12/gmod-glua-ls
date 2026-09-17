@@ -432,6 +432,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             context.settled_sibling_merge_read_candidates.clear();
             context.settled_decl_copy_candidates.clear();
             context.settled_assign_candidates.clear();
+            context.settled_assign_candidate_keys.clear();
             context.settled_pass_reads.clear();
             context.settled_assign_claims.clear();
             context.settled_return_attempts.clear();
@@ -1766,6 +1767,15 @@ fn rederive_settled_assign_reads(
             if cached.as_ref().is_some_and(|cached| cached == settled_type) {
                 continue;
             }
+            // An `unknown` arm is the read saying part of it had not landed
+            // yet; committing it would cache a provisional answer as final.
+            // Only a cache already carrying one may be replaced by the same
+            // shape.
+            if union_has_unsettled_arm(settled_type)
+                && !cached.as_ref().is_some_and(union_has_unsettled_arm)
+            {
+                continue;
+            }
             let (_, rhs, _) = &candidates[idx];
             let holder = claim
                 .as_ref()
@@ -2311,19 +2321,11 @@ fn queue_settled_decl_dependents(
                             if lua::expr_reads_out_of_decl(db, file_id, target_decl_id, &rhs) {
                                 continue;
                             }
-                            if !context.settled_assign_candidates.iter().any(
-                                |(queued_decl, queued_expr, queued_ret_idx)| {
-                                    *queued_decl == target_decl_id
-                                        && queued_expr.get_range() == rhs.get_range()
-                                        && *queued_ret_idx == ret_idx
-                                },
-                            ) {
-                                context.settled_assign_candidates.push((
-                                    target_decl_id,
-                                    rhs.clone(),
-                                    ret_idx,
-                                ));
-                            }
+                            context.request_settled_assign_candidate(
+                                target_decl_id,
+                                rhs.clone(),
+                                ret_idx,
+                            );
                         }
                         _ => {}
                     }
@@ -3624,6 +3626,10 @@ pub struct AnalyzeContext {
     /// (`first, second = echo(key)` queues `(first, rhs, 0)` and
     /// `(second, rhs, 1)`); a lone right-hand side always queues index `0`.
     settled_assign_candidates: Vec<(LuaDeclId, LuaExpr, usize)>,
+    /// Dedup keys for [`Self::settled_assign_candidates`]: the walk queues
+    /// every call/index right-hand side onto a local, so membership cannot
+    /// stay a linear scan.
+    settled_assign_candidate_keys: HashSet<(LuaDeclId, rowan::TextRange, usize)>,
     settled_member_key_candidates: Option<(usize, HashMap<FileId, Vec<LuaMemberId>>)>,
     settled_owner_candidates: Option<(usize, HashMap<FileId, Vec<LuaMemberId>>)>,
     settled_return_attempts: HashMap<LuaSignatureId, (u64, u64, u64, u64)>,
@@ -3725,6 +3731,7 @@ impl AnalyzeContext {
             settled_sibling_merge_read_candidates: HashSet::default(),
             settled_decl_copy_candidates: HashSet::default(),
             settled_assign_candidates: Vec::new(),
+            settled_assign_candidate_keys: HashSet::default(),
             settled_member_key_candidates: None,
             settled_owner_candidates: None,
             settled_pass_reads: HashMap::default(),
@@ -4230,6 +4237,26 @@ impl AnalyzeContext {
 
     pub fn has_pending_decl_unresolve(&self, decl_id: LuaDeclId) -> bool {
         self.pending_unresolve_decl_ids.contains(&decl_id)
+    }
+    /// Queues an assignment onto a local for the settled replay.
+    ///
+    /// The write bound during the walk to whatever its right-hand side read
+    /// then; a call or index answer that moves afterwards leaves the local's
+    /// cache stale with nothing to report it. Re-derived through
+    /// `bind_decl_write` once the batch settles.
+    pub fn request_settled_assign_candidate(
+        &mut self,
+        decl_id: LuaDeclId,
+        expr: LuaExpr,
+        ret_idx: usize,
+    ) {
+        if self
+            .settled_assign_candidate_keys
+            .insert((decl_id, expr.get_range(), ret_idx))
+        {
+            self.settled_assign_candidates
+                .push((decl_id, expr, ret_idx));
+        }
     }
 
     pub fn request_settled_decl_initializer_reinfer(&mut self, decl_id: LuaDeclId) {

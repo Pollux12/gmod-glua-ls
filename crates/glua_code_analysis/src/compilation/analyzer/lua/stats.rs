@@ -1053,21 +1053,49 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             continue;
         }
 
-        if let LuaTypeOwner::Decl(decl_id) = &type_owner
-            && is_call_or_index_expr(expr)
-            && analyzer
-                .db
-                .get_decl_index()
-                .get_decl(decl_id)
-                .and_then(|decl| decl.get_initializer())
-                .is_some_and(|initializer| {
-                    initializer.get_ret_idx() == 0
-                        && initializer.get_expr_syntax_id() == expr.get_syntax_id()
-                })
-        {
-            analyzer
-                .context
-                .request_settled_decl_initializer_reinfer(*decl_id);
+        if let LuaTypeOwner::Decl(decl_id) = &type_owner {
+            // A plain global read answers from the merge of every file that
+            // writes the name; same batch-order exposure as the initializer
+            // form, re-derived through the global-read pass. The multi-decl
+            let reads_global = !initializer_reads_through_multi_decl_global(analyzer, expr)
+                && !is_undefined_global_name_expr(analyzer, expr)
+                && reads_global_name(analyzer, expr);
+            if reads_global {
+                analyzer
+                    .context
+                    .record_settled_global_read_candidate(*decl_id, expr.clone());
+            }
+            // An assignment onto a local reads no initializer cache of its own,
+            // so the read-set filter cannot see its right-hand side move. Queue
+            // the write itself the way `queue_settled_decl_dependents` does for
+            // reads through a local that moved: the settled tail replays it
+            // through `bind_decl_write` once every read it makes has landed.
+            // Global reads take their own pass, so they stay out of this one.
+            if !reads_global
+                && !is_undefined_global_name_expr(analyzer, expr)
+                && may_improve_after_resolve(expr)
+                && !expr_reads_out_of_decl(analyzer.db, analyzer.file_id, *decl_id, expr)
+                && !expr_is_bare_param_read(analyzer.db, analyzer.file_id, expr)
+            {
+                analyzer
+                    .context
+                    .request_settled_assign_candidate(*decl_id, expr.clone(), 0);
+            }
+            if is_call_or_index_expr(expr)
+                && analyzer
+                    .db
+                    .get_decl_index()
+                    .get_decl(decl_id)
+                    .and_then(|decl| decl.get_initializer())
+                    .is_some_and(|initializer| {
+                        initializer.get_ret_idx() == 0
+                            && initializer.get_expr_syntax_id() == expr.get_syntax_id()
+                    })
+            {
+                analyzer
+                    .context
+                    .request_settled_decl_initializer_reinfer(*decl_id);
+            }
         }
 
         let declared_empty_table_type = declared_empty_table_assignment_type(analyzer, &var, expr);
@@ -1214,10 +1242,6 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                 .context
                 .request_member_initializer_reinfer(*member_id);
         }
-
-        // A read whose receiver an `if x.k then` guard narrowed answers from the
-        // set of types that own `k`, and that set grows as the batch walks the
-        // files declaring them. See `reads_field_exist_guarded_member`.
         if let LuaTypeOwner::Member(member_id) = &type_owner
             && reads_field_exist_guarded_member(expr)
         {
@@ -1266,6 +1290,30 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             expr_type = canonical;
         }
         update_literal_index_member_owner_cache(analyzer, &var, &expr_type);
+    }
+
+    // The trailing vars take the extra returns of the last expression, so a
+    // call or index answer that moves after the walk leaves those slots stale
+    // the same way the paired writes above go stale. Queue each local target
+    // with the return index it binds.
+    if var_count > expr_count
+        && let Some(last_expr) = expr_list.last()
+        && is_call_or_index_expr(last_expr)
+    {
+        for i in expr_count..var_count {
+            let Some(var) = var_list.get(i) else {
+                break;
+            };
+            if let LuaTypeOwner::Decl(decl_id) = get_var_owner(analyzer, var.clone())
+                && !expr_reads_out_of_decl(analyzer.db, analyzer.file_id, decl_id, last_expr)
+            {
+                analyzer.context.request_settled_assign_candidate(
+                    decl_id,
+                    last_expr.clone(),
+                    i - expr_count + 1,
+                );
+            }
+        }
     }
 
     // The complexity brought by multiple return values is too high
@@ -2002,6 +2050,23 @@ pub(crate) fn expr_reads_out_of_decl(
         .any(|index_expr| {
             index_chain_roots_at_decl(db, file_id, decl_id, &LuaExpr::IndexExpr(index_expr))
         })
+}
+/// Whether the expression is exactly one parameter name (`x = value`).
+///
+/// A parameter's contract is fixed before the settled tail runs — call-site
+/// inference is a walk-phase fact — so a bare param read cannot move there.
+/// Replaying it only re-asks a question whose answer is already final, and a
+/// realm-filtered contract can answer differently than the walk's narrowed
+/// read did.
+fn expr_is_bare_param_read(db: &DbIndex, file_id: crate::FileId, expr: &LuaExpr) -> bool {
+    let LuaExpr::NameExpr(name_expr) = expr else {
+        return false;
+    };
+    db.get_reference_index()
+        .get_local_reference(&file_id)
+        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+        .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
+        .is_some_and(|decl| decl.is_param())
 }
 
 fn index_chain_roots_at_decl(
