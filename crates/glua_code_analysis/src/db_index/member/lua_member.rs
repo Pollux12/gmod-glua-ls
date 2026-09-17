@@ -164,7 +164,14 @@ impl LuaMemberKey {
             LuaType::IntegerConst(i) => LuaMemberKey::Integer(i),
             LuaType::DocIntegerConst(i) => LuaMemberKey::Integer(i),
             _ => {
-                if expr_type.contain_tpl() {
+                // An uninformative key type carries nothing to discriminate
+                // writers by -- `t[x] = v` where `x` reads `nil`, `any` or
+                // `unknown` is the same dynamic slot whichever of those the
+                // read happened to land on. Folding them all to `unknown`
+                // keeps the member under one key instead of letting the
+                // answer depend on how resolved the key expression was when
+                // the write was indexed.
+                if expr_type.contain_tpl() || !crate::db_index::is_informative_type(&expr_type) {
                     LuaMemberKey::ExprType(LuaType::Unknown)
                 } else {
                     LuaMemberKey::ExprType(expr_type)
