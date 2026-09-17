@@ -384,6 +384,15 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                 });
                 let _initializer_owners =
                     refresh_settled_initializer_caches(db, &mut context, refresh_owners.as_ref());
+                // The queued member attaches read the same settled types the
+                // passes above refine: a prefix local typed by a call's
+                // inferred return stays unresolved until that return lands,
+                // and it can land inside this loop. A failed attach attempt
+                // keeps its candidate queued, so re-drain the queue here --
+                // this is the dependency edge from an inferred return to the
+                // member write waiting on it. Placed candidates drop out;
+                // failures stay for the next round.
+                let attach_moved = attach_settled_index_expr_members(db, &mut context);
                 // The net boundary diff: owners whose cached type actually
                 // differs across this round. Mid-round ping-pong cancels here.
                 let net_moved = diff_settled_tail_boundary(db, &boundary_before);
@@ -406,8 +415,11 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                 // fingerprint amid that progress is continued convergence, not
                 // a cycle: forget the sightings instead of confirming an
                 // oscillation that never happened.
-                let non_type_progressed =
-                    dynamic_fields_moved || returns_moved || member_keys_moved || owner_moved;
+                let non_type_progressed = dynamic_fields_moved
+                    || returns_moved
+                    || member_keys_moved
+                    || owner_moved
+                    || attach_moved;
                 if non_type_progressed {
                     fuse.reset_boundary_sightings();
                 }
@@ -519,7 +531,10 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
 }
 
 /// Retries the index-expression member attaches `set_index_expr_owner`
-/// dropped.
+/// dropped. Runs twice before the settled tail and once per settled-tail
+/// round: the types its prefixes read keep refining into the fixpoint, so a
+/// candidate that fails here can place once the pass that lands its prefix
+/// (typically an inferred call return) has run.
 /// Whether any candidate was placed.
 fn attach_settled_index_expr_members(db: &mut DbIndex, context: &mut AnalyzeContext) -> bool {
     let mut candidates = std::mem::take(&mut context.settled_member_attach_candidates);
