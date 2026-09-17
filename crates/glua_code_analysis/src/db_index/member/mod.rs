@@ -1498,6 +1498,33 @@ impl LuaMemberIndex {
             })
             .collect()
     }
+    /// The number of live members keyed under `(owner, key)` — the writer
+    /// count [`get_members_for_owner_key`](Self::get_members_for_owner_key)
+    /// would return, without materialising the list. Read-versioning calls
+    /// this every read, so it must not allocate or record a member map.
+    pub fn get_member_count_for_owner_key(
+        &self,
+        owner: &LuaMemberOwner,
+        key: &LuaMemberKey,
+    ) -> usize {
+        let owner = self.canonical(owner);
+        let Some(member_ids) = self
+            .member_owner_key_index
+            .get(owner)
+            .and_then(|owner_items| owner_items.get(key))
+        else {
+            return 0;
+        };
+        member_ids
+            .iter()
+            .filter(|member_id| {
+                self.member_current_owner
+                    .get(member_id)
+                    .is_some_and(|current_owner| current_owner == owner)
+                    && self.get_member(member_id).is_some()
+            })
+            .count()
+    }
 
     /// Every member ever keyed under `owner`, including ones hidden by the
     /// latest-assignment view and ones since re-homed to a concrete owner.

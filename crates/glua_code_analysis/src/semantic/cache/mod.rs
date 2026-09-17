@@ -433,8 +433,7 @@ impl LuaInferCache {
         // round; only the slot changing what it holds re-derives the read.
         let member_count = db
             .get_member_index()
-            .get_members_for_owner_key(&owner, &key)
-            .len();
+            .get_member_count_for_owner_key(&owner, &key);
         let dynamic_field_count = match &key {
             LuaMemberKey::Name(name) => crate::dynamic_field_owner_of(db, &owner)
                 .map(|dynamic_owner| {

@@ -272,6 +272,28 @@ fn infer_owner_raw_member_type_with_realm_uncached(
 ) -> RawGetMemberTypeResult {
     let member_index = db.get_member_index();
     if let Some(member_item) = member_index.get_member_item(member_owner, member_key) {
+        // Version the slot by its writer count, not just the writers seen: a
+        // multi-writer member (`x.y = x.y or {}` in several files) resolves to
+        // the union of the writers indexed so far, and a later same-key writer
+        // must re-derive the read or the cached union stays frozen at the
+        // partial set. Mirrors `record_missed_member_read` for the hit path.
+        let member_count = member_index.get_member_count_for_owner_key(member_owner, member_key);
+        let dynamic_field_count = match member_key {
+            LuaMemberKey::Name(name) => crate::dynamic_field_owner_of(db, member_owner)
+                .map(|dynamic_owner| {
+                    db.get_dynamic_field_index()
+                        .field_definitions(&dynamic_owner, name.as_str())
+                        .len()
+                })
+                .unwrap_or(0),
+            _ => 0,
+        };
+        crate::db_index::read_set::record_missing_member_slot(
+            member_owner,
+            member_key,
+            member_count,
+            dynamic_field_count,
+        );
         let exact_type = resolve_member_item_with_realm(
             db,
             member_item,

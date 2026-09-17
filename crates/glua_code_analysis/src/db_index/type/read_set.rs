@@ -342,8 +342,7 @@ impl InferenceReadVersion {
             || reads.dynamic_fields.iter().any(|key| db.get_dynamic_field_index().dynamic_write_version(key) > self.dynamic_epoch)
             || reads.missing_member_slots.iter().any(|((owner, key), (member_count, dynamic_count))| {
                 db.get_member_index()
-                    .get_members_for_owner_key(owner, key)
-                    .len()
+                    .get_member_count_for_owner_key(owner, key)
                     != *member_count
                     || matches!(key, LuaMemberKey::Name(name) if crate::dynamic_field_owner_of(db, owner).is_some_and(|dynamic_owner| {
                         db.get_dynamic_field_index().field_definitions(&dynamic_owner, name.as_str()).len() != *dynamic_count
