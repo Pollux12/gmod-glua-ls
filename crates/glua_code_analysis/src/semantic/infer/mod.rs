@@ -451,7 +451,16 @@ pub fn infer_bind_value_type(
                             if let LuaType::Def(_) = prefix_type {
                                 return None;
                             }
-                        };
+                            // An inferred container's element type is the merge
+                            // of every store into the slot -- this one included
+                            // -- plus the slot's own bootstrap placeholder, so
+                            // it reads back as `Union({}, local, ...)`. That is
+                            // the local deriving itself, not evidence of its
+                            // type, so it cannot pin the stored local.
+                            if matches!(prefix_type, LuaType::TableConst(_)) {
+                                return None;
+                            }
+                        }
                         typ = Some(infer_expr(db, cache, var.clone().into()).ok()?);
                         break;
                     }
