@@ -610,15 +610,6 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
                 &prefix_type,
                 Some(analyzer.file_id),
             ) else {
-                if std::env::var("GLUALS_TRACE_OWNER").is_ok() {
-                    eprintln!(
-                        "OWNER_NONE file={:?} pos={:?} prefix_type={:?} no_info={}",
-                        analyzer.file_id,
-                        var_expr.get_range(),
-                        prefix_type,
-                        prefix_carries_no_owner_information(&prefix_type)
-                    );
-                }
                 // The prefix inferred, but to nothing that names an owner. That
                 // is not a property of the source: the prefix may simply not
                 // have settled yet, and nothing revisits this attach. Record it
