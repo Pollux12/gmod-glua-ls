@@ -257,7 +257,7 @@ fn prefix_path_has_computed_segment(prefix_expr: &LuaExpr) -> bool {
 /// unsettled read worth retrying later.
 fn prefix_carries_no_owner_information(prefix_type: &LuaType) -> bool {
     match prefix_type {
-        LuaType::Unknown | LuaType::Any | LuaType::Table => true,
+        LuaType::Nil | LuaType::Unknown | LuaType::Any | LuaType::Table => true,
         LuaType::Union(union) => union.types().all(|arm| {
             matches!(
                 arm,

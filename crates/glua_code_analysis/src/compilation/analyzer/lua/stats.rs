@@ -667,7 +667,7 @@ fn prefix_carries_no_owner_information(prefix_type: &LuaType) -> bool {
         // element, so nothing can attach through it. It is also what a slot
         // collapses to while a writer's literal is still being widened against
         // siblings the walk has not reached, which is a property of the batch.
-        LuaType::Unknown | LuaType::Any | LuaType::Table => true,
+        LuaType::Nil | LuaType::Unknown | LuaType::Any | LuaType::Table => true,
         LuaType::Union(union) => union.types().all(|arm| {
             matches!(
                 arm,
