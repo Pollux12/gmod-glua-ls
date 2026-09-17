@@ -3231,6 +3231,13 @@ pub fn analyze_table_field(analyzer: &mut LuaAnalyzer, field: LuaTableField) -> 
                 .context
                 .request_guarded_member_read_reinfer(member_id);
         }
+        // Same exposure as the assign walk's member writes: an initializer
+        // whose answer can still move is re-derived once the batch settles.
+        if may_improve_after_resolve(&value_expr) {
+            analyzer
+                .context
+                .request_member_initializer_reinfer(member_id);
+        }
         let value_type = match inferred {
             Ok(value_type) => match value_type {
                 LuaType::Def(ref_id) => LuaType::Ref(ref_id),
