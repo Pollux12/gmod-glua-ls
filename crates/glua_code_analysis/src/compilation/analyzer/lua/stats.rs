@@ -605,9 +605,11 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
             if should_skip_ambiguous_unknown_key_table_owner(analyzer, &prefix_type, &index_expr) {
                 return Some(());
             }
-            let Some((member_owner, set_owner_only)) =
-                resolve_index_expr_member_owner_for_file(&prefix_type, Some(analyzer.file_id))
-            else {
+            let Some((member_owner, set_owner_only)) = resolve_index_expr_member_owner_for_file(
+                analyzer.db,
+                &prefix_type,
+                Some(analyzer.file_id),
+            ) else {
                 // The prefix inferred, but to nothing that names an owner. That
                 // is not a property of the source: the prefix may simply not
                 // have settled yet, and nothing revisits this attach. Record it
@@ -1618,7 +1620,7 @@ fn should_skip_nil_table_shape_assignment(
     }
 
     let Some((owner, _)) =
-        resolve_index_expr_member_owner_for_file(&prefix_type, Some(analyzer.file_id))
+        resolve_index_expr_member_owner_for_file(analyzer.db, &prefix_type, Some(analyzer.file_id))
     else {
         return false;
     };
@@ -3489,7 +3491,11 @@ fn guarded_table_assignment_info(
         .map(|owner| (owner, false))
         .or_else(|| {
             let prefix_type = analyzer.infer_expr(&prefix_expr).ok()?;
-            resolve_index_expr_member_owner_for_file(&prefix_type, Some(analyzer.file_id))
+            resolve_index_expr_member_owner_for_file(
+                analyzer.db,
+                &prefix_type,
+                Some(analyzer.file_id),
+            )
         })?;
     let index_key = index_expr.get_index_key()?;
     let cache = analyzer

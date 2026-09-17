@@ -914,7 +914,17 @@ fn collapse_guarded_table_bootstrap_branches(db: &DbIndex, types: Vec<LuaType>) 
             // which literal that is. A slot with a single such writer keeps it
             // (the `One` arm returns the cache verbatim), so a slot with several
             // has to as well, or a member's owner would depend on how many
-            // writers happened to be indexed when the read was taken.
+            // writers happened to be indexed when the read was taken. They are
+            // sorted by `(file id, range)` so the arm order — not just the arm
+            // set — is independent of the order the writers were indexed in.
+            bootstraps.sort_by_key(|typ| match typ {
+                LuaType::TableConst(site) => Some((
+                    site.file_id.id,
+                    u32::from(site.value.start()),
+                    u32::from(site.value.end()),
+                )),
+                _ => None,
+            });
             return LuaType::from_vec(bootstraps);
         }
         retained.push(LuaType::Table);

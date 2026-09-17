@@ -347,8 +347,11 @@ pub fn try_resolve_member(
         // = SF or {}` written once per realm — the GLua norm), a `Union` or
         // a `Ref` fell through to the annotation-class fallback and the
         // member was left parked on its global path.
-        let resolved_owner =
-            resolve_index_expr_member_owner_for_file(&prefix_type, Some(unresolve_member.file_id));
+        let resolved_owner = resolve_index_expr_member_owner_for_file(
+            db,
+            &prefix_type,
+            Some(unresolve_member.file_id),
+        );
         let member_owner = match resolved_owner {
             Some((LuaMemberOwner::Type(def_id), set_owner_only)) => {
                 let type_decl = db
@@ -366,6 +369,7 @@ pub fn try_resolve_member(
                 if matches!(prefix_expr, LuaExpr::IndexExpr(_)) {
                     let dynamic_type = infer_dynamic_index_expr_shape(db, cache, prefix_expr)?;
                     let Some(owner) = resolve_index_expr_member_owner_for_file(
+                        db,
                         &dynamic_type,
                         Some(unresolve_member.file_id),
                     ) else {

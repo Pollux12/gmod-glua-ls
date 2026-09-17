@@ -222,7 +222,7 @@ fn settled_owner_for_member(
     {
         return None;
     }
-    super::lua::resolve_index_expr_member_owner_for_file(&prefix_type, Some(file_id))
+    super::lua::resolve_index_expr_member_owner_for_file(db, &prefix_type, Some(file_id))
 }
 /// Whether the write goes through a computed index (`t[k].field = v`).
 ///

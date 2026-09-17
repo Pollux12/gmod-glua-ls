@@ -267,7 +267,7 @@ pub(in crate::compilation::analyzer::lua) fn dynamic_key_owner_and_member_key(
     let prefix_expr = index_expr.get_prefix_expr()?;
     let owner = direct_local_table_prefix_member_owner(analyzer, &prefix_expr).or_else(|| {
         let prefix_type = analyzer.infer_expr(&prefix_expr).ok()?;
-        get_member_owner_for_prefix_type(prefix_type)
+        get_member_owner_for_prefix_type(analyzer.db, prefix_type)
     })?;
     let index_key = index_expr.get_index_key()?;
     let cache = analyzer
@@ -382,7 +382,7 @@ pub(in crate::compilation::analyzer::lua) fn find_related_member_ids(
 ) -> Option<Vec<LuaMemberId>> {
     let prefix_expr = index_expr.get_prefix_expr()?;
     let prefix_type = analyzer.infer_expr(&prefix_expr).ok()?;
-    let owner = get_member_owner_for_prefix_type(prefix_type)?;
+    let owner = get_member_owner_for_prefix_type(analyzer.db, prefix_type)?;
     let index_key = index_expr.get_index_key()?;
     let cache = analyzer
         .context
@@ -426,12 +426,14 @@ pub(in crate::compilation::analyzer::lua) fn member_key_as_expr_type(
 }
 
 pub(in crate::compilation::analyzer::lua) fn get_member_owner_for_prefix_type(
+    db: &DbIndex,
     prefix_type: LuaType,
 ) -> Option<LuaMemberOwner> {
-    resolve_index_expr_member_owner_for_file(&prefix_type, None).map(|(owner, _)| owner)
+    resolve_index_expr_member_owner_for_file(db, &prefix_type, None).map(|(owner, _)| owner)
 }
 
 pub(in crate::compilation::analyzer) fn resolve_index_expr_member_owner_for_file(
+    db: &DbIndex,
     prefix_type: &LuaType,
     preferred_file_id: Option<FileId>,
 ) -> Option<(LuaMemberOwner, bool)> {
@@ -445,23 +447,26 @@ pub(in crate::compilation::analyzer) fn resolve_index_expr_member_owner_for_file
             Some((LuaMemberOwner::Element(instance.get_range().clone()), false))
         }
         LuaType::TableOf(inner) => {
-            resolve_index_expr_member_owner_for_file(inner, preferred_file_id)
+            resolve_index_expr_member_owner_for_file(db, inner, preferred_file_id)
         }
         LuaType::TypeGuard(inner) => {
-            resolve_index_expr_member_owner_for_file(inner, preferred_file_id)
+            resolve_index_expr_member_owner_for_file(db, inner, preferred_file_id)
         }
         LuaType::Union(union) => {
-            pick_preferred_index_expr_member_owner(union.types(), preferred_file_id)
+            pick_preferred_index_expr_member_owner(db, union.types(), preferred_file_id)
         }
         LuaType::Intersection(intersection) => pick_preferred_index_expr_member_owner(
+            db,
             intersection.get_types().iter(),
             preferred_file_id,
         ),
         LuaType::MergedTable(merged_table) => pick_preferred_index_expr_member_owner(
+            db,
             merged_table.get_types().iter(),
             preferred_file_id,
         ),
         LuaType::MultiLineUnion(union) => pick_preferred_index_expr_member_owner(
+            db,
             union.get_unions().iter().map(|(typ, _)| typ),
             preferred_file_id,
         ),
@@ -470,17 +475,58 @@ pub(in crate::compilation::analyzer) fn resolve_index_expr_member_owner_for_file
 }
 
 fn pick_preferred_index_expr_member_owner<'a>(
+    db: &DbIndex,
     types: impl Iterator<Item = &'a LuaType>,
     preferred_file_id: Option<FileId>,
 ) -> Option<(LuaMemberOwner, bool)> {
+    // Guarded bootstraps of one property (`x.y = x.y or {}` spelled in several
+    // files) all initialise the same table: the `or {}` branch only fires when
+    // the property is still nil, so whichever file runs first creates it and
+    // the rest reuse it. Homing a member on whichever literal the writing file
+    // prefers makes the owner — and, through `is_guarded_table_bootstrap_branch`
+    // pruning the memberless literals, the slot's surviving `TableConst` arm —
+    // a function of file order. When every owner-bearing arm of the union is
+    // such a bootstrap, elect the lowest-sorting literal instead — the same
+    // writer `canonical_guarded_table_bootstrap_type` settles the slot's type
+    // on — so the attachment and the surviving arm agree and neither moves
+    // with the batch. Every other shape keeps the legacy preference below.
+    let candidates: Vec<_> = types
+        .into_iter()
+        .filter_map(|typ| {
+            let owner_info = resolve_index_expr_member_owner_for_file(db, typ, preferred_file_id)?;
+            Some((typ, owner_info))
+        })
+        .collect();
+
+    if candidates.len() >= 2 {
+        let all_guarded_bootstraps = candidates.iter().all(|(typ, _)| match typ {
+            LuaType::TableConst(range) => {
+                crate::compilation::analyzer::is_guarded_table_definition_site(db, range)
+            }
+            _ => false,
+        });
+        if all_guarded_bootstraps {
+            let canonical = candidates
+                .iter()
+                .filter_map(|(typ, _)| match typ {
+                    LuaType::TableConst(range) => Some(range),
+                    _ => None,
+                })
+                .min_by_key(|range| {
+                    (
+                        range.file_id.id,
+                        u32::from(range.value.start()),
+                        u32::from(range.value.end()),
+                    )
+                })
+                .map(|range| (*range).clone());
+            return canonical.map(|range| (LuaMemberOwner::Element(range), false));
+        }
+    }
+
     let mut exact_type_owner = None;
     let mut fallback_owner = None;
-    for typ in types {
-        let Some(owner_info) = resolve_index_expr_member_owner_for_file(typ, preferred_file_id)
-        else {
-            continue;
-        };
-
+    for (_, owner_info) in candidates {
         if owner_matches_preferred_file(&owner_info.0, preferred_file_id) {
             return Some(owner_info);
         }
