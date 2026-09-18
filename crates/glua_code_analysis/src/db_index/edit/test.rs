@@ -317,6 +317,28 @@ fn adding_a_field_to_a_table_literal_adds_a_member_key() {
         is_true()
     );
 }
+
+#[gtest]
+fn adding_a_class_member_changes_type_member_list_key() {
+    let diff = diff_after_edit(
+        r#"
+        ---@class TargetClass
+        TargetClass = {}
+        function TargetClass:First() end
+        "#,
+        r#"
+        ---@class TargetClass
+        TargetClass = {}
+        function TargetClass:First() end
+        function TargetClass:Second() end
+        "#,
+    );
+    expect_that!(
+        diff.keys()
+            .any(|key| matches!(key, ExportKey::TypeMemberList(_))),
+        is_true()
+    );
+}
 /// Shift-only probe: insert a blank line at the top and dump every export key
 /// whose hash moves. Must stay empty: a pure offset shift is not a change.
 /// The fixture covers every export family in one file: members, type decls

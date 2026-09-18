@@ -486,6 +486,9 @@ fn export_diff_changed_names(
             ExportKey::Member(member_id) => {
                 insert_member_id_names(db, &mut names, member_id, file_pre);
             }
+            ExportKey::TypeMemberList(type_id) => {
+                insert_type_name(&mut names, type_id);
+            }
             ExportKey::TypeDecl(type_id) => {
                 insert_type_name(&mut names, type_id);
             }
@@ -502,6 +505,9 @@ fn export_diff_changed_names(
                 insert_signature_owner_names(db, &mut names, signature_id, pre);
             }
             ExportKey::ContributedParam(signature_id, _) => {
+                insert_signature_owner_names(db, &mut names, signature_id, pre);
+            }
+            ExportKey::CallSiteLink(signature_id) => {
                 insert_signature_owner_names(db, &mut names, signature_id, pre);
             }
             ExportKey::InferredGuard(owner) => {
@@ -1486,7 +1492,9 @@ impl EmmyLuaAnalysis {
             dirty.guard_work |= diff.keys().any(|key| {
                 matches!(
                     key,
-                    ExportKey::InferredGuard(_) | ExportKey::ContributedParam(..)
+                    ExportKey::InferredGuard(_)
+                        | ExportKey::ContributedParam(..)
+                        | ExportKey::CallSiteLink(..)
                 )
             });
             let dependents = dependents_of(self.compilation.get_db(), file_id, &diff);
@@ -1542,8 +1550,18 @@ impl EmmyLuaAnalysis {
             call_site_index.collect_source_path_dependents(db.get_vfs().get_file_path(&file_id)),
         );
         dependents.extend(
+            call_site_index
+                .get_return_consumers_for_signature_files(&files)
+                .into_iter()
+                .map(|consumer| consumer.file_id),
+        );
+        dependents.extend(
             db.get_signature_index()
                 .inferred_return_dependents_for_files(&files),
+        );
+        dependents.extend(
+            db.get_signature_index()
+                .inferred_guard_consumers_for_files(&files),
         );
         dependents
     }
@@ -2071,6 +2089,13 @@ impl EmmyLuaAnalysis {
                 .get_db()
                 .get_call_site_param_index()
                 .collect_source_path_dependents(callback_source_paths);
+            let return_consumers = self
+                .compilation
+                .get_db()
+                .get_call_site_param_index()
+                .get_return_consumers_for_signature_files(&expanded)
+                .into_iter()
+                .map(|consumer| consumer.file_id);
             let inferred_return_dependents = self
                 .compilation
                 .get_db()
@@ -2090,6 +2115,7 @@ impl EmmyLuaAnalysis {
                 .chain(callback_dependents)
                 .chain(contributor_dependents)
                 .chain(callback_path_dependents)
+                .chain(return_consumers)
                 .chain(inferred_return_dependents)
                 .chain(settled_signature_dependents)
             {

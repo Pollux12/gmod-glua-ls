@@ -255,78 +255,42 @@ mod tests {
     }
 
     #[test]
-    fn a_contribution_follows_the_signature_an_edit_moved() {
+    fn removing_a_callee_purges_incoming_contributions_from_surviving_callers() {
         let callee = FileId::new(1);
         let caller = FileId::new(2);
-        let before = signature_id(callee, 100);
-        let after = signature_id(callee, 101);
+        let callee_sig = signature_id(callee, 100);
+        let caller_sig = signature_id(caller, 200);
 
         let mut index = CallSiteParamIndex::new();
-        index.set_files_source_signatures(vec![(
-            callee,
-            vec![("m.f".to_string(), before, Vec::new())],
-        )]);
-        index.set_files_contributions(vec![(caller, vec![(before, 0, LuaType::String)])]);
-
-        // The callee is re-indexed on its own, as an edit outside the caller's
-        // expansion re-indexes it: the caller keeps the contribution it made
-        // against the pre-edit text.
-        index.remove(callee);
-        index.set_files_source_signatures(vec![(
-            callee,
-            vec![("m.f".to_string(), after, Vec::new())],
-        )]);
-
-        assert_eq!(index.get_inferred_param(&after, 0), Some(&LuaType::String));
-        assert_eq!(index.get_inferred_param(&before, 0), None);
-    }
-
-    #[test]
-    fn a_path_that_gained_a_definition_is_left_alone() {
-        let callee = FileId::new(1);
-        let caller = FileId::new(2);
-        let before = signature_id(callee, 100);
-
-        let mut index = CallSiteParamIndex::new();
-        index.set_files_source_signatures(vec![(
-            callee,
-            vec![("m.f".to_string(), before, Vec::new())],
-        )]);
-        index.set_files_contributions(vec![(caller, vec![(before, 0, LuaType::String)])]);
-
-        // Two definitions now share the path, so which one the old id meant is
-        // a guess, and guessing wrong merges one function's call sites into
-        // another's. The removal purges the folded fact with the callee, and
-        // the retained contribution must not be re-homed onto a guess either.
-        index.remove(callee);
-        index.set_files_source_signatures(vec![(
-            callee,
+        index.set_files_contributions(vec![(
+            caller,
             vec![
-                ("m.f".to_string(), signature_id(callee, 101), Vec::new()),
-                ("m.f".to_string(), signature_id(callee, 220), Vec::new()),
+                (callee_sig, 0, LuaType::String),
+                (caller_sig, 0, LuaType::Boolean),
             ],
         )]);
 
-        assert_eq!(index.get_inferred_param(&before, 0), None);
-        assert_eq!(
-            index.get_inferred_param(&signature_id(callee, 101), 0),
-            None
+        index.forget_removed_files(&HashSet::from_iter([callee]));
+
+        assert_eq!(index.get_inferred_param(&callee_sig, 0), None);
+        assert!(!index.inferred_params.contains_key(&callee_sig));
+        assert!(
+            !index
+                .contributor_files_by_signature
+                .contains_key(&callee_sig)
         );
-        assert_eq!(
-            index.get_inferred_param(&signature_id(callee, 220), 0),
-            None
-        );
-        // The caller's evidence survives filed under the caller, so
-        // re-analysing the caller rebuilds it against a real signature.
-        assert!(index.file_contributions.contains_key(&caller));
+        assert!(!index.contributor_signatures_by_file.contains_key(&callee));
+        assert!(!index.pending_previous_params.contains_key(&(callee_sig, 0)));
+
+        // The contribution to callee_sig must be purged from caller's contributions,
+        // while caller_sig survives.
+        let caller_contributions = index.file_contributions.get(&caller).unwrap();
+        assert_eq!(caller_contributions.len(), 1);
+        assert_eq!(caller_contributions[0].signature_id, caller_sig);
     }
 
-    /// Removing a callee purges the facts its signatures held from surviving
-    /// callers, so an isolated re-index of the callee cannot resolve `self`
-    /// from a stale caller's receiver. The caller's raw contribution survives
-    /// so re-analysing the caller rebuilds it.
     #[test]
-    fn removing_a_callee_purges_the_facts_its_signatures_held_from_callers() {
+    fn removing_a_callee_purges_all_caller_contributions_when_solely_targeting_callee() {
         let callee = FileId::new(1);
         let caller = FileId::new(2);
         let signature_id = signature_id(callee, 100);
@@ -334,7 +298,7 @@ mod tests {
         let mut index = CallSiteParamIndex::new();
         index.set_files_contributions(vec![(caller, vec![(signature_id, 0, LuaType::String)])]);
 
-        index.remove_files(&[callee]);
+        index.forget_removed_files(&HashSet::from_iter([callee]));
 
         assert_eq!(index.get_inferred_param(&signature_id, 0), None);
         assert!(!index.inferred_params.contains_key(&signature_id));
@@ -349,7 +313,12 @@ mod tests {
                 .pending_previous_params
                 .contains_key(&(signature_id, 0))
         );
-        assert!(index.file_contributions.contains_key(&caller));
+        assert!(
+            index
+                .file_contributions
+                .get(&caller)
+                .is_none_or(|c| c.is_empty())
+        );
     }
 
     /// A caller re-contributing the exact fact it held before the callee's
@@ -366,7 +335,7 @@ mod tests {
         let mut index = CallSiteParamIndex::new();
         index.set_files_contributions(vec![(caller, vec![(signature_id, 0, LuaType::String)])]);
 
-        index.remove(callee);
+        index.forget_removed_files(&HashSet::from_iter([callee]));
         let changed = index.set_files_fact_contributions(vec![(
             caller,
             vec![(signature_id, 0, LuaTypeFact::certain(LuaType::String))],
@@ -376,38 +345,28 @@ mod tests {
     }
 
     #[test]
-    fn a_park_survives_the_group_analysed_before_it() {
-        let library = FileId::new(1);
-        let main = FileId::new(2);
-        let caller = FileId::new(3);
-        let before = signature_id(main, 100);
-        let after = signature_id(main, 101);
+    fn removing_a_callee_leaves_it_clean_until_callers_recontribute() {
+        let callee = FileId::new(1);
+        let caller = FileId::new(2);
+        let before = signature_id(callee, 100);
+        let after = signature_id(callee, 101);
 
         let mut index = CallSiteParamIndex::new();
-        index.set_files_source_signatures(vec![
-            (
-                library,
-                vec![("lib.f".to_string(), signature_id(library, 10), Vec::new())],
-            ),
-            (main, vec![("m.f".to_string(), before, Vec::new())]),
-        ]);
+        index.set_files_source_signatures(vec![(
+            callee,
+            vec![("m.f".to_string(), before, Vec::new())],
+        )]);
         index.set_files_contributions(vec![(caller, vec![(before, 0, LuaType::String)])]);
 
-        // `analyze` runs this pass once per workspace group, so one batch
-        // spanning both files installs the library's signatures before the main
-        // workspace's. The main file's park has to still be there when its own
-        // group arrives.
-        index.remove_files(&[library, main]);
+        // When callee is removed, caller's contribution to `before` is purged so an
+        // isolated re-index of callee has clean slots.
+        index.forget_removed_files(&HashSet::from_iter([callee]));
         index.set_files_source_signatures(vec![(
-            library,
-            vec![("lib.f".to_string(), signature_id(library, 10), Vec::new())],
-        )]);
-        index.set_files_source_signatures(vec![(
-            main,
+            callee,
             vec![("m.f".to_string(), after, Vec::new())],
         )]);
 
-        assert_eq!(index.get_inferred_param(&after, 0), Some(&LuaType::String));
+        assert_eq!(index.get_inferred_param(&after, 0), None);
         assert_eq!(index.get_inferred_param(&before, 0), None);
     }
 

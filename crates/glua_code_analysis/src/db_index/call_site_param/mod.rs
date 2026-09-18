@@ -51,10 +51,10 @@ pub(crate) enum CallSiteReturnConsumerTarget {
 }
 
 #[derive(Debug, Clone)]
-struct CallSiteParamContribution {
-    signature_id: LuaSignatureId,
-    param_idx: usize,
-    param_fact: LuaTypeFact,
+pub(crate) struct CallSiteParamContribution {
+    pub(crate) signature_id: LuaSignatureId,
+    pub(crate) param_idx: usize,
+    pub(crate) param_fact: LuaTypeFact,
 }
 
 struct CallSiteParamAccumulator {
@@ -745,6 +745,20 @@ impl CallSiteParamIndex {
             .and_then(|params| params.get(&param_idx))
     }
 
+    pub(crate) fn file_contributions(
+        &self,
+        file_id: FileId,
+    ) -> Option<&[CallSiteParamContribution]> {
+        self.file_contributions.get(&file_id).map(Vec::as_slice)
+    }
+
+    pub(crate) fn file_return_consumers(
+        &self,
+        file_id: FileId,
+    ) -> Option<&[CallSiteReturnConsumer]> {
+        self.file_return_consumers.get(&file_id).map(Vec::as_slice)
+    }
+
     pub(crate) fn set_files_return_consumers(
         &mut self,
         updates: Vec<(FileId, Vec<CallSiteReturnConsumer>)>,
@@ -942,6 +956,9 @@ impl CallSiteParamIndex {
         let contributor_signatures_by_file = &mut self.contributor_signatures_by_file;
         self.contributor_files_by_signature
             .retain(|signature_id, contributors| {
+                if file_ids.contains(&signature_id.get_file_id()) {
+                    return false;
+                }
                 contributors.retain(|file_id| !file_ids.contains(file_id));
                 if contributors.is_empty() {
                     if let Some(signatures) =
@@ -953,7 +970,52 @@ impl CallSiteParamIndex {
                 }
                 true
             });
-        contributor_signatures_by_file.retain(|_, signatures| !signatures.is_empty());
+        contributor_signatures_by_file.retain(|file_id, signatures| {
+            if file_ids.contains(file_id) {
+                return false;
+            }
+            signatures.retain(|sig| self.contributor_files_by_signature.contains_key(sig));
+            !signatures.is_empty()
+        });
+
+        self.deferred_contributions
+            .retain(|(file_id, contribution)| {
+                !file_ids.contains(file_id)
+                    && !file_ids.contains(&contribution.signature_id.get_file_id())
+            });
+
+        for (contributor, contributions) in &mut self.file_contributions {
+            if !file_ids.contains(contributor) {
+                contributions.retain(|c| !file_ids.contains(&c.signature_id.get_file_id()));
+            }
+        }
+        for file_id in file_ids {
+            self.file_contributions.remove(file_id);
+        }
+        self.file_contributions
+            .retain(|_, contributions| !contributions.is_empty());
+
+        self.inferred_params
+            .retain(|signature_id, _| !file_ids.contains(&signature_id.get_file_id()));
+
+        self.pending_previous_params
+            .retain(|(signature_id, _), _| !file_ids.contains(&signature_id.get_file_id()));
+        self.contrib_write_versions
+            .retain(|(signature_id, _), _| !file_ids.contains(&signature_id.get_file_id()));
+
+        for (consumer_file, consumers) in &mut self.file_return_consumers {
+            if !file_ids.contains(consumer_file) {
+                consumers.retain(|c| !file_ids.contains(&c.signature_id.get_file_id()));
+            }
+        }
+        for file_id in file_ids {
+            self.file_return_consumers.remove(file_id);
+        }
+        self.file_return_consumers
+            .retain(|_, consumers| !consumers.is_empty());
+
+        self.rebuild_derived_state();
+        self.rebuild_return_consumers();
     }
 
     pub fn refresh_file_source_dependencies(&mut self, file_id: FileId) {
@@ -1361,34 +1423,13 @@ impl LuaIndex for CallSiteParamIndex {
     }
 
     fn remove_files(&mut self, file_ids: &[FileId]) {
-        let mut affected_params: HashSet<(LuaSignatureId, usize)> = file_ids
+        let affected_params: HashSet<(LuaSignatureId, usize)> = file_ids
             .iter()
             .filter_map(|file_id| self.file_contributions.get(file_id))
             .flatten()
             .map(|contribution| (contribution.signature_id, contribution.param_idx))
             .collect();
-        // Incoming facts: signatures *declared* in a removed file that
-        // surviving callers supplied evidence for. Their folded facts must go
-        // too, or an isolated re-index of the callee reads a stale caller's
-        // receiver and flips member ownership. The raw contributions stay, so
-        // re-analysing the callers re-folds exactly what a fresh build sees.
-        // Scanning the folded keys rather than going through
-        // `contributor_signatures_by_file` keeps the purge true to that
-        // promise even where the accumulated contributor views have already
-        // forgotten a signature.
-        let mut removed_declared_signatures = HashSet::default();
-        for signature_id in self.inferred_params.keys() {
-            if file_ids.contains(&signature_id.get_file_id()) {
-                removed_declared_signatures.insert(*signature_id);
-            }
-        }
-        for signature_id in &removed_declared_signatures {
-            affected_params.extend(
-                self.inferred_params[signature_id]
-                    .keys()
-                    .map(|param_idx| (*signature_id, *param_idx)),
-            );
-        }
+
         // The current facts of the affected pairs, for the event surgery once
         // the contributions are gone. The parked map below may already hold an
         // older fact from a previous removal, so this snapshot is taken
@@ -1415,31 +1456,14 @@ impl LuaIndex for CallSiteParamIndex {
                     .or_insert(fact);
             }
         }
+
         self.deferred_contributions
             .retain(|(file_id, _)| !file_ids.contains(file_id));
-        // Drop the incoming facts now that the snapshot and the park above
-        // have captured them. The contributor maps go first so the refold at
-        // the end sees no surviving contributor for these signatures and
-        // leaves the slots empty; the parked previous facts go too, so a
-        // caller re-contributing the identical fact still reports a change and
-        // requeues the callee instead of silently matching the stale state.
-        for signature_id in &removed_declared_signatures {
-            self.inferred_params.remove(signature_id);
-            self.contributor_files_by_signature.remove(signature_id);
+
+        for &file_id in file_ids {
+            self.file_contributions.remove(&file_id);
         }
-        for file_id in file_ids {
-            if let Some(signatures) = self.contributor_signatures_by_file.get_mut(file_id) {
-                signatures
-                    .retain(|signature_id| !removed_declared_signatures.contains(signature_id));
-                if signatures.is_empty() {
-                    self.contributor_signatures_by_file.remove(file_id);
-                }
-            }
-        }
-        self.pending_previous_params
-            .retain(|(signature_id, _), _| !removed_declared_signatures.contains(signature_id));
-        self.contrib_write_versions
-            .retain(|(signature_id, _), _| !removed_declared_signatures.contains(signature_id));
+
         let mut removed_source_signatures = HashSet::default();
         let mut removed_consumers = Vec::new();
         for &file_id in file_ids {
@@ -1464,7 +1488,6 @@ impl LuaIndex for CallSiteParamIndex {
             if let Some(consumers) = self.file_return_consumers.remove(&file_id) {
                 removed_consumers.extend(consumers);
             }
-            self.file_contributions.remove(&file_id);
         }
 
         self.prune_source_signatures(&removed_source_signatures);

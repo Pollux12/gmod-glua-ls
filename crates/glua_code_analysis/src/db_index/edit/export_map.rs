@@ -35,10 +35,12 @@ pub enum RealmSubject {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExportKey {
     Member(LuaMemberId),
+    TypeMemberList(LuaTypeDeclId),
     TypeDecl(LuaTypeDeclId),
     TypeCache(LuaTypeOwner),
     Signature(LuaSignatureId),
     ContributedParam(LuaSignatureId, u16),
+    CallSiteLink(LuaSignatureId),
     InferredGuard(LuaInferredGuardOwner),
     Property(LuaSemanticDeclId),
     Operator(LuaOperatorOwner, SmolStr),
@@ -104,10 +106,12 @@ pub fn export_map(db: &DbIndex, file_id: FileId, remap: &FileRemap) -> ExportMap
     let files = FxHashSet::from_iter([file_id]);
 
     members(db, file_id, remap, &mut map);
+    type_member_lists(db, file_id, remap, &mut map);
     type_decls(db, file_id, remap, &mut map);
     type_caches(db, file_id, remap, &mut map);
     signatures(db, file_id, remap, &mut map);
     contributed_params(db, &files, remap, &mut map);
+    call_site_links(db, file_id, remap, &mut map);
     inferred_guards(db, &files, remap, &mut map);
     properties(db, file_id, remap, &mut map);
     operators(db, file_id, remap, &mut map);
@@ -117,7 +121,6 @@ pub fn export_map(db: &DbIndex, file_id: FileId, remap: &FileRemap) -> ExportMap
     module_export(db, file_id, remap, &mut map);
     load_edges(db, file_id, &mut map);
     namespaces(db, file_id, &mut map);
-
     map
 }
 
@@ -145,6 +148,45 @@ fn members(db: &DbIndex, file_id: FileId, remap: &FileRemap, map: &mut ExportMap
                 member_index
                     .is_non_overwriting_assignment_member(member.get_id())
                     .hash(h);
+            }),
+        );
+    }
+}
+
+// --- 2. Member lists of types this file contributes to ---
+fn type_member_lists(db: &DbIndex, file_id: FileId, remap: &FileRemap, map: &mut ExportMap) {
+    let member_index = db.get_member_index();
+    let type_index = db.get_type_index();
+    let mut type_decl_ids = FxHashSet::default();
+
+    if let Some(decl_ids) = type_index.get_file_type_decl_ids(file_id) {
+        type_decl_ids.extend(decl_ids.iter().cloned());
+    }
+
+    for member in member_index.get_file_members(file_id) {
+        if let Some(LuaMemberOwner::Type(type_decl_id)) =
+            member_index.get_member_owner(&member.get_id())
+        {
+            type_decl_ids.insert(type_decl_id.clone());
+        }
+    }
+
+    for type_decl_id in type_decl_ids {
+        let mut member_keys = Vec::new();
+        for member in member_index.get_file_members(file_id) {
+            if member_index.get_member_owner(&member.get_id())
+                == Some(&LuaMemberOwner::Type(type_decl_id.clone()))
+            {
+                member_keys.push(member.get_key().clone());
+            }
+        }
+        member_keys.sort();
+        map.insert(
+            ExportKey::TypeMemberList(type_decl_id),
+            hash_with(|h| {
+                for key in member_keys {
+                    hash_member_key(remap, &key, h);
+                }
             }),
         );
     }
@@ -315,6 +357,46 @@ fn contributed_params(
     }
 }
 
+// --- 6b. Call-site links this file contributes to signatures ---
+fn call_site_links(db: &DbIndex, file_id: FileId, remap: &FileRemap, map: &mut ExportMap) {
+    let call_site_index = db.get_call_site_param_index();
+    let mut sig_contributions =
+        FxHashMap::<LuaSignatureId, Vec<(usize, &crate::LuaTypeFact)>>::default();
+    if let Some(contributions) = call_site_index.file_contributions(file_id) {
+        for contribution in contributions {
+            sig_contributions
+                .entry(contribution.signature_id)
+                .or_default()
+                .push((contribution.param_idx, &contribution.param_fact));
+        }
+    }
+    let mut return_signatures = FxHashSet::default();
+    if let Some(consumers) = call_site_index.file_return_consumers(file_id) {
+        for consumer in consumers {
+            return_signatures.insert(consumer.signature_id);
+        }
+    }
+
+    let mut all_signatures: FxHashSet<LuaSignatureId> = sig_contributions.keys().copied().collect();
+    all_signatures.extend(return_signatures);
+
+    for signature_id in all_signatures {
+        let key_id = remapped(remap.signature_id(signature_id), signature_id);
+        let mut params = sig_contributions.remove(&signature_id).unwrap_or_default();
+        params.sort_by_key(|(idx, _)| *idx);
+        map.insert(
+            ExportKey::CallSiteLink(key_id),
+            hash_with(|h| {
+                for (idx, fact) in params {
+                    idx.hash(h);
+                    hash_type(remap, fact.typ(), h);
+                }
+            }),
+        );
+    }
+}
+
+#[allow(dead_code)]
 // --- 7. Inferred guard facts produced by this file ---
 fn inferred_guards(
     db: &DbIndex,
@@ -998,6 +1080,14 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Ha
                     }
                 }
             }
+            ExportKey::TypeMemberList(type_decl_id) => {
+                type_refs.push(crate::TypeCacheRef::Decl(type_decl_id.clone()));
+                record_owner_dependency(
+                    &mut owners,
+                    &LuaMemberOwner::Type(type_decl_id.clone()),
+                    true,
+                );
+            }
             ExportKey::TypeDecl(type_decl_id) => {
                 type_refs.push(crate::TypeCacheRef::Decl(type_decl_id.clone()));
             }
@@ -1020,6 +1110,9 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Ha
                     signature_id: *signature_id,
                     param_idx: *param_idx,
                 });
+                return_consumer_signatures.push(*signature_id);
+            }
+            ExportKey::CallSiteLink(signature_id) => {
                 return_consumer_signatures.push(*signature_id);
             }
             ExportKey::InferredGuard(owner) => {
