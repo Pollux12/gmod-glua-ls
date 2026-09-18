@@ -2428,6 +2428,27 @@ pub fn infer_global_type(
     infer_global_type_impl(db, current_file_id, call_offset, name, false)
 }
 
+fn record_missing_global_read(db: &DbIndex, name: &str) {
+    let owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new(name));
+    let key = LuaMemberKey::Name(name.into());
+    let member_count = db
+        .get_member_index()
+        .get_member_count_for_owner_key(&owner, &key);
+    let dynamic_field_count = crate::dynamic_field_owner_of(db, &owner)
+        .map(|dynamic_owner| {
+            db.get_dynamic_field_index()
+                .field_definitions(&dynamic_owner, name)
+                .len()
+        })
+        .unwrap_or(0);
+    crate::db_index::read_set::record_missing_member_slot(
+        &owner,
+        &key,
+        member_count,
+        dynamic_field_count,
+    );
+}
+
 fn infer_global_type_impl(
     db: &DbIndex,
     current_file_id: Option<FileId>,
@@ -2468,6 +2489,7 @@ fn infer_global_type_impl(
         ) {
             Some(tiers) => tiers,
             None => {
+                record_missing_global_read(db, name);
                 return Err(InferFailReason::None);
             }
         }
@@ -2475,12 +2497,14 @@ fn infer_global_type_impl(
         vec![match global_index.get_global_decl_ids(name).cloned() {
             Some(decls) => (0, decls),
             None => {
+                record_missing_global_read(db, name);
                 return Err(InferFailReason::None);
             }
         }]
     };
 
     if priority_tiers.is_empty() {
+        record_missing_global_read(db, name);
         return Err(InferFailReason::None);
     }
 

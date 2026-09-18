@@ -460,8 +460,11 @@ impl LuaInferCache {
         self.expr_cache.clear();
         self.call_cache.clear();
         self.call_arg_types_cache.clear();
+        self.generic_call_bindings.clear();
         self.flow_node_cache.clear();
         self.flow_query_realm = None;
+        self.baseline_flow_memo.clear();
+        self.baseline_flow_depth = 0;
         self.flow_node_realm_cache.clear();
         self.numeric_table_index_query_cache.clear();
         self.unambiguous_int_const_cache.clear();
@@ -490,9 +493,9 @@ impl LuaInferCache {
         self.dynamic_field_resolving.clear();
         self.vgui_parent_fallback_calls.clear();
         self.vgui_parent_chain_calls.clear();
+        self.local_function_call_sites_cache.clear();
         self.call_returns_never_cache.clear();
         self.signature_is_generic_cache.clear();
-        self.generic_call_bindings.clear();
     }
 
     /// Drops every narrowing answer this file has memoised.
@@ -576,6 +579,8 @@ impl LuaInferCache {
         // The transform's element type comes from inferring the loop body's
         // right-hand side, which a resolved signature return can change.
         self.in_place_ipairs_transform_cache.clear();
+        self.dynamic_field_resolution_cache.clear();
+        self.dynamic_field_type_cache.clear();
     }
 
     /// Clears inference results that can become stale as deferred declarations,
@@ -590,6 +595,8 @@ impl LuaInferCache {
         self.unambiguous_int_const_cache.clear();
         self.flow_node_cache.clear();
         self.flow_query_realm = None;
+        self.baseline_flow_memo.clear();
+        self.baseline_flow_depth = 0;
         self.index_ref_origin_type_cache.clear();
         self.param_type_cache.clear();
         self.param_type_source_cache.clear();

@@ -736,6 +736,14 @@ pub(crate) fn resolve_dynamic_field_member(
         || !db.get_emmyrc().gmod.infer_dynamic_fields
         || !cache.get_config().dynamic_fields_visible
     {
+        if db.get_emmyrc().gmod.enabled
+            && db.get_emmyrc().gmod.infer_dynamic_fields
+            && !cache.get_config().dynamic_fields_visible
+        {
+            if let Some(field_name) = member_key.get_name() {
+                record_dynamic_field_read_for_prefix(db, prefix_type, field_name);
+            }
+        }
         return Ok(None);
     }
 
@@ -930,6 +938,25 @@ fn dynamic_field_definitions(
             access_position,
         ),
         _ => Vec::new(),
+    }
+}
+fn record_dynamic_field_read_for_prefix(db: &DbIndex, prefix_type: &LuaType, field_name: &str) {
+    match prefix_type {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            crate::db_index::read_set::record_dynamic_field(
+                &crate::DynamicFieldOwner::Type(type_id.clone()),
+                Some(field_name),
+            );
+        }
+        LuaType::TableConst(table_range) => {
+            let table_owner = crate::DynamicFieldOwner::Table(table_range.clone());
+            let owner = crate::canonical_dynamic_field_owner(db, table_owner);
+            crate::db_index::read_set::record_dynamic_field(&owner, Some(field_name));
+        }
+        LuaType::Instance(instance) => {
+            record_dynamic_field_read_for_prefix(db, instance.get_base(), field_name);
+        }
+        _ => {}
     }
 }
 

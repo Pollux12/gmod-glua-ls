@@ -933,7 +933,7 @@ fn infer_table_metatable_member(
     // Every `__index` writer is visible; a slot whose writers disagree (a
     // table in one place, a function or another table elsewhere) names no
     // single lookup table, so nothing is resolved through it.
-    if let Ok(index_type) = infer_owner_raw_member_type_with_realm_cached(
+    match infer_owner_raw_member_type_with_realm_cached(
         db,
         cache,
         meta_owner.clone(),
@@ -941,19 +941,27 @@ fn infer_table_metatable_member(
         cache.get_file_id(),
         Some(index_expr.get_position()),
         None,
-    ) && let super::infer_call::MetatableIndexCandidate::Supported(index_type) =
-        super::infer_call::classify_metatable_index_candidate(&index_type)
-        && !metatable_index_type_points_to_table(&index_type, table_range)
-        && let Ok(typ) = infer_member_by_member_key_with_table_guard(
-            db,
-            cache,
-            &index_type,
-            index_expr.clone(),
-            &InferGuard::new(),
-            table_member_lookup_guard,
-        )
-    {
-        return Ok(typ);
+    ) {
+        Ok(index_type) => {
+            if let super::infer_call::MetatableIndexCandidate::Supported(index_type) =
+                super::infer_call::classify_metatable_index_candidate(&index_type)
+                && !metatable_index_type_points_to_table(&index_type, table_range)
+                && let Ok(typ) = infer_member_by_member_key_with_table_guard(
+                    db,
+                    cache,
+                    &index_type,
+                    index_expr.clone(),
+                    &InferGuard::new(),
+                    table_member_lookup_guard,
+                )
+            {
+                return Ok(typ);
+            }
+        }
+        Err(InferFailReason::FieldNotFound) => {
+            cache.record_missed_member_read(db, meta_owner, index_member_key);
+        }
+        _ => {}
     }
 
     let operator_ids = db
