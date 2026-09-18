@@ -77,10 +77,9 @@ where
     T: Send,
     F: Fn(&DbIndex, FileId) -> T + Sync,
 {
-    let run = |db: &DbIndex, file_id: FileId| glua_parser::with_syntax_resolvers(|| f(db, file_id));
     let n = file_ids.len();
     if runs_inline(n) {
-        return file_ids.iter().map(|&id| run(db, id)).collect();
+        return file_ids.iter().map(|&id| f(db, id)).collect();
     }
 
     let _p = Profile::cond_new("parallel map_files", n > 1);
@@ -99,18 +98,24 @@ where
     };
     let done = AtomicUsize::new(0);
 
-    let mut computed: Vec<(usize, T)> = dispatch
-        .par_iter()
-        .map(|&idx| {
-            if report_step != 0 {
-                let seq = done.fetch_add(1, Ordering::Relaxed);
-                if seq.is_multiple_of(report_step) {
-                    crate::progress::advance_current_phase(seq, n, "files");
+    // `in_place_scope` turns the calling thread into a worker for the
+    // duration: a bare `par_iter` would park it on the job latch while the
+    // pool alone drained the work.
+    let mut computed: Vec<(usize, T)> = Vec::new();
+    rayon::in_place_scope(|_| {
+        computed = dispatch
+            .par_iter()
+            .map(|&idx| {
+                if report_step != 0 {
+                    let seq = done.fetch_add(1, Ordering::Relaxed);
+                    if seq.is_multiple_of(report_step) {
+                        crate::progress::advance_current_phase(seq, n, "files");
+                    }
                 }
-            }
-            (idx, run(db, file_ids[idx]))
-        })
-        .collect();
+                (idx, f(db, file_ids[idx]))
+            })
+            .collect();
+    });
 
     // Each result carries the index it was computed for, so putting them back in
     // input order is a sort rather than a scatter into pre-filled slots.
