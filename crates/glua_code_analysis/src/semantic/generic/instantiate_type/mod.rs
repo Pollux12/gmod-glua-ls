@@ -1,10 +1,9 @@
 mod instantiate_func_generic;
 mod instantiate_special_generic;
 
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    ops::Deref,
-};
+use std::{collections::BTreeMap, ops::Deref};
+
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
     DbIndex, GenericTpl, GenericTplId, LuaAliasCallKind, LuaArrayType, LuaConditionalType,
@@ -526,7 +525,7 @@ fn instantiate_conditional(
     substitutor: &TypeSubstitutor,
 ) -> LuaType {
     // 记录右侧出现的每个 infer 名称对应的具体类型
-    let mut infer_assignments: HashMap<String, LuaType> = HashMap::new();
+    let mut infer_assignments: HashMap<String, LuaType> = HashMap::default();
     let mut condition_result: Option<bool> = None;
 
     // 仅当条件形如 T extends ... 时才尝试提前求值, 否则返回原始结构
@@ -918,7 +917,7 @@ fn strict_type_match(db: &DbIndex, source: &LuaType, pattern: &LuaType) -> bool 
 
 fn is_optional_param_type(db: &DbIndex, ty: &LuaType) -> bool {
     let mut stack = vec![ty.clone()];
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
 
     while let Some(current) = stack.pop() {
         if !visited.insert(current.clone()) {
@@ -973,7 +972,7 @@ fn resolve_infer_tpl_ids(
     substitutor: &TypeSubstitutor,
     infer_names: &HashSet<String>,
 ) -> HashMap<String, GenericTplId> {
-    let mut map = HashMap::new();
+    let mut map = HashMap::default();
     let mut visit = |ty: &LuaType| {
         if let LuaType::TplRef(tpl) = ty {
             if substitutor.get(tpl.get_tpl_id()).is_none() {
@@ -1008,7 +1007,7 @@ fn instantiate_mapped_type(
         let mut key_types = Vec::new();
         collect_mapped_key_atoms(&constraint, &mut key_types);
 
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
         let mut fields: Vec<(LuaMemberKey, LuaType)> = Vec::new();
         let mut index_access: Vec<(LuaType, LuaType)> = Vec::new();
 
