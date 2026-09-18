@@ -2,6 +2,8 @@ mod check_reason;
 mod find_decl_function;
 mod resolve;
 mod resolve_closure;
+mod spec;
+mod writes;
 
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
@@ -9,7 +11,8 @@ use std::cmp::Ordering;
 use std::time::Duration;
 
 use crate::{
-    FileId, InferFailReason, LuaDeclTypeKind, LuaMemberFeature, LuaType, LuaTypeDecl, LuaTypeFlag,
+    FileId, InferFailReason, LuaDeclTypeKind, LuaInferCache, LuaMemberFeature, LuaType,
+    LuaTypeDecl, LuaTypeFlag,
     compilation::analyzer::{
         AnalysisPipeline, call_site_params::materialize_call_result_consumer,
         unresolve::resolve::try_resolve_special_call,
@@ -770,39 +773,103 @@ fn materialize_pending_str_tpl_type_decls(db: &mut DbIndex, infer_manager: &mut 
     }
 }
 
+/// Runs a buffered attempt serially: the resolver computes against the live
+/// index and its deferred writes land immediately after, which is exactly the
+/// inline mutation the unconverted kinds still do.
+fn buffered_attempt(
+    db: &mut DbIndex,
+    infer_manager: &mut InferCacheManager,
+    file_id: FileId,
+    attempt: impl FnOnce(&DbIndex, &mut writes::ResolveWrites, &mut LuaInferCache) -> ResolveResult,
+) -> ResolveResult {
+    let cache = infer_manager.get_infer_cache(file_id);
+    let mut writes = writes::ResolveWrites::new();
+    let result = attempt(db, &mut writes, cache);
+    writes.apply(db, infer_manager);
+    result
+}
+
+/// [`try_resolve_member`] for callers outside the wave: same compute +
+/// deferred-apply shape the serial drain uses.
+pub(crate) fn attempt_member(
+    db: &mut DbIndex,
+    infer_manager: &mut InferCacheManager,
+    member: &mut UnResolveMember,
+) -> ResolveResult {
+    let file_id = member.file_id;
+    buffered_attempt(db, infer_manager, file_id, |db, writes, cache| {
+        try_resolve_member(db, writes, cache, member)
+    })
+}
+
+/// [`try_resolve_closure_parent_params`] for the settled-tail retry queue.
+pub(crate) fn attempt_closure_parent_params(
+    db: &mut DbIndex,
+    infer_manager: &mut InferCacheManager,
+    candidate: &mut UnResolveParentClosureParams,
+) -> ResolveResult {
+    let file_id = candidate.file_id;
+    buffered_attempt(db, infer_manager, file_id, |db, writes, cache| {
+        try_resolve_closure_parent_params(db, writes, cache, candidate)
+    })
+}
+
 fn attempt_resolve(
     db: &mut DbIndex,
     infer_manager: &mut InferCacheManager,
     file_id: FileId,
     unresolve: &mut UnResolve,
 ) -> ResolveResult {
-    let cache = infer_manager.get_infer_cache(file_id);
     match unresolve {
-        UnResolve::Decl(un_resolve_decl) => try_resolve_decl(db, cache, un_resolve_decl),
-        UnResolve::Member(un_resolve_member) => try_resolve_member(db, cache, un_resolve_member),
-        UnResolve::Module(un_resolve_module) => try_resolve_module(db, cache, un_resolve_module),
+        UnResolve::Decl(un_resolve_decl) => {
+            buffered_attempt(db, infer_manager, file_id, |db, writes, cache| {
+                try_resolve_decl(db, writes, cache, un_resolve_decl)
+            })
+        }
+        UnResolve::Member(un_resolve_member) => {
+            buffered_attempt(db, infer_manager, file_id, |db, writes, cache| {
+                try_resolve_member(db, writes, cache, un_resolve_member)
+            })
+        }
+        UnResolve::Module(un_resolve_module) => {
+            let cache = infer_manager.get_infer_cache(file_id);
+            try_resolve_module(db, cache, un_resolve_module)
+        }
         UnResolve::Return(un_resolve_return) => {
-            try_resolve_return_point(db, cache, un_resolve_return)
+            buffered_attempt(db, infer_manager, file_id, |db, writes, cache| {
+                try_resolve_return_point(db, writes, cache, un_resolve_return)
+            })
         }
         UnResolve::ClosureParams(un_resolve_closure_params) => {
-            try_resolve_call_closure_params(db, cache, un_resolve_closure_params)
+            buffered_attempt(db, infer_manager, file_id, |db, writes, cache| {
+                try_resolve_call_closure_params(db, writes, cache, un_resolve_closure_params)
+            })
         }
         UnResolve::ClosureReturn(un_resolve_closure_return) => {
-            try_resolve_closure_return(db, cache, un_resolve_closure_return)
+            buffered_attempt(db, infer_manager, file_id, |db, writes, cache| {
+                try_resolve_closure_return(db, writes, cache, un_resolve_closure_return)
+            })
         }
         UnResolve::IterDecl(un_resolve_iter_var) => {
-            try_resolve_iter_var(db, cache, un_resolve_iter_var)
+            buffered_attempt(db, infer_manager, file_id, |db, writes, cache| {
+                try_resolve_iter_var(db, writes, cache, un_resolve_iter_var)
+            })
         }
         UnResolve::ClosureParentParams(un_resolve_closure_params) => {
-            try_resolve_closure_parent_params(db, cache, un_resolve_closure_params)
+            buffered_attempt(db, infer_manager, file_id, |db, writes, cache| {
+                try_resolve_closure_parent_params(db, writes, cache, un_resolve_closure_params)
+            })
         }
         UnResolve::TableField(un_resolve_table_field) => {
+            let cache = infer_manager.get_infer_cache(file_id);
             try_resolve_table_field(db, cache, un_resolve_table_field)
         }
         UnResolve::SpecialCall(un_resolve_special_call) => {
+            let cache = infer_manager.get_infer_cache(file_id);
             try_resolve_special_call(db, cache, un_resolve_special_call)
         }
         UnResolve::CallSiteContribution(contribution) => {
+            let cache = infer_manager.get_infer_cache(file_id);
             try_resolve_call_site_contribution(db, cache, contribution)
         }
     }
@@ -913,7 +980,24 @@ fn try_resolve(
                 continue;
             }
 
-            for mut unresolve in unresolves.drain(..) {
+            // Speculative compute: supported item kinds were attempted on
+            // workers against the index state at this point, with their writes
+            // deferred. The drain below replays each outcome in order; an item
+            // whose recorded reads were moved by an earlier write — or that
+            // read one of its own buffered writes — falls back to the live
+            // attempt the serial drain would have run.
+            let spec_start = profile_enabled.then(std::time::Instant::now);
+            let mut spec = spec::speculate(db, infer_manager, unresolves);
+            let spec_version = crate::db_index::read_set::InferenceReadVersion::capture(db);
+            if let (Some(profile), Some(spec_start)) = (profile.as_mut(), spec_start) {
+                profile.spec_time += spec_start.elapsed();
+                profile.spec_items += spec.len();
+            }
+
+            for (spec_idx, mut unresolve) in unresolves.drain(..).enumerate() {
+                if let Some(profile) = profile.as_mut() {
+                    profile.kind_counts[unresolve_kind_rank(&unresolve) as usize] += 1;
+                }
                 let file_id = unresolve.get_file_id().unwrap_or(FileId { id: 0 });
                 if pending_clears.remove(&file_id) {
                     infer_manager.clear_file_deferred_results(file_id);
@@ -930,7 +1014,51 @@ fn try_resolve(
                 // so the next round can skip items nothing written since has
                 // touched. The recorder nests with the return derivation's own
                 // arming rather than clobbering it.
-                let resolve_result = if let Some(records) = fixpoint_reads.as_mut() {
+                let spec_outcome = spec.remove(&spec_idx).filter(|outcome| {
+                    let usable = !outcome.writes.self_conflicted(&outcome.reads)
+                        && !spec_version.is_stale(db, &outcome.reads);
+                    if let Some(profile) = profile.as_mut() {
+                        if usable {
+                            profile.spec_applied += 1;
+                        } else if outcome.writes.self_conflicted(&outcome.reads) {
+                            profile.spec_conflict += 1;
+                        } else {
+                            profile.spec_stale += 1;
+                        }
+                    }
+                    usable
+                });
+                let resolve_result = if let Some(outcome) = spec_outcome {
+                    let spec::SpecOutcome {
+                        result,
+                        writes,
+                        reads,
+                        post_item,
+                    } = outcome;
+                    writes.apply(db, infer_manager);
+                    // Item-field mutations are part of the verdict too: the
+                    // worker's item was a throwaway, so the cleared prefix or
+                    // the queued settled-retry flag lands here.
+                    if let Some(post_item) = post_item {
+                        post_item(&mut unresolve);
+                    }
+                    if let Some(records) = fixpoint_reads.as_mut() {
+                        records.insert(
+                            unresolve_identity(&unresolve),
+                            FixpointReadRecord {
+                                reads,
+                                type_epoch: db.get_type_index().type_writes(),
+                                return_epoch: db.get_signature_index().return_writes(),
+                                param_epoch: db.get_signature_index().param_writes(),
+                                module_epoch: db.get_module_index().module_writes(),
+                                special_epoch: db.get_flow_index().special_call_writes(),
+                                contrib_epoch: db.get_call_site_param_index().contrib_writes(),
+                                dynamic_epoch: db.get_dynamic_field_index().dynamic_writes(),
+                            },
+                        );
+                    }
+                    result
+                } else if let Some(records) = fixpoint_reads.as_mut() {
                     crate::db_index::read_set::arm();
                     let result = attempt_resolve(db, infer_manager, file_id, &mut unresolve);
                     let reads = crate::db_index::read_set::disarm();
@@ -1152,6 +1280,12 @@ fn try_resolve(
 #[derive(Default)]
 struct TryResolveProfile {
     reason_stats: FxHashMap<&'static str, TryResolveReasonStats>,
+    spec_items: usize,
+    spec_applied: usize,
+    spec_stale: usize,
+    spec_conflict: usize,
+    spec_time: Duration,
+    kind_counts: [usize; 11],
 }
 
 #[derive(Default)]
@@ -1215,6 +1349,27 @@ impl TryResolveProfile {
     }
 
     fn log(&self, loop_count: usize) {
+        if unresolve_profile_enabled() && self.spec_items != 0 {
+            eprintln!(
+                "  [unres] loop {loop_count} spec: items={} applied={} stale={} conflict={} t={:>7.3}s kinds=[iter={} decl={} member={} module={} ret={} cparam={} cret={} cpparam={} tfield={} scall={} csite={}]",
+                self.spec_items,
+                self.spec_applied,
+                self.spec_stale,
+                self.spec_conflict,
+                self.spec_time.as_secs_f64(),
+                self.kind_counts[0],
+                self.kind_counts[1],
+                self.kind_counts[2],
+                self.kind_counts[3],
+                self.kind_counts[4],
+                self.kind_counts[5],
+                self.kind_counts[6],
+                self.kind_counts[7],
+                self.kind_counts[8],
+                self.kind_counts[9],
+                self.kind_counts[10],
+            );
+        }
         let mut stats = self
             .reason_stats
             .iter()

@@ -51,6 +51,7 @@ use super::{
     CallSiteContributionKind, ResolveResult, UnResolveCallSiteContribution, UnResolveDecl,
     UnResolveIterVar, UnResolveMember, UnResolveModule, UnResolveReturn, UnResolveTableField,
     resolve_closure::inferred_return_tail_matching_documented_first,
+    writes::{ResolveWrites, WriteKey},
 };
 
 /// Re-derive one call-site parameter contribution whose type was not
@@ -138,7 +139,8 @@ pub fn try_resolve_call_site_contribution(
 }
 
 pub fn try_resolve_decl(
-    db: &mut DbIndex,
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
     cache: &mut LuaInferCache,
     decl: &mut UnResolveDecl,
 ) -> ResolveResult {
@@ -175,31 +177,32 @@ pub fn try_resolve_decl(
     // resolved late can still take the slot back from one that ran ahead of it.
     let may_improve = crate::compilation::analyzer::initializer_may_improve_after_resolve(&expr);
     let is_initializer = decl_expr_is_initializer(db, decl_id, &expr);
-    bind_decl_write(
-        db,
-        decl_id,
-        LuaTypeCache::InferType(expr_type),
-        DeclWrite {
-            position: expr.get_position(),
-            may_improve_after_resolve: may_improve,
-            reads_out_of_decl: crate::compilation::analyzer::lua::expr_reads_out_of_decl(
-                db,
-                decl.file_id,
-                decl_id,
-                &expr,
-            ),
-            may_narrow_uninformative: if is_initializer {
-                may_improve
-            } else {
-                crate::compilation::analyzer::initializer_reads_through_call_or_index(&expr)
-            },
-            resolved_initializer: is_initializer && may_improve,
-            fills_own_default: crate::compilation::analyzer::lua::expr_fills_own_default(
-                db,
-                decl.file_id,
-                decl_id,
-                &expr,
-            ),
+    let write = DeclWrite {
+        position: expr.get_position(),
+        may_improve_after_resolve: may_improve,
+        reads_out_of_decl: crate::compilation::analyzer::lua::expr_reads_out_of_decl(
+            db,
+            decl.file_id,
+            decl_id,
+            &expr,
+        ),
+        may_narrow_uninformative: if is_initializer {
+            may_improve
+        } else {
+            crate::compilation::analyzer::initializer_reads_through_call_or_index(&expr)
+        },
+        resolved_initializer: is_initializer && may_improve,
+        fills_own_default: crate::compilation::analyzer::lua::expr_fills_own_default(
+            db,
+            decl.file_id,
+            decl_id,
+            &expr,
+        ),
+    };
+    writes.push(
+        WriteKey::TypeOwner(LuaTypeOwner::Decl(decl_id)),
+        move |db, _| {
+            bind_decl_write(db, decl_id, LuaTypeCache::InferType(expr_type), write);
         },
     );
     Ok(())
@@ -330,10 +333,21 @@ fn guarded_index_or_empty_table_left(expr: &LuaExpr) -> Option<LuaExpr> {
 }
 
 pub fn try_resolve_member(
-    db: &mut DbIndex,
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
     cache: &mut LuaInferCache,
     unresolve_member: &mut UnResolveMember,
 ) -> ResolveResult {
+    // The member's pre-write home, read once for the deferred writes that
+    // need it below: re-homing stamps the old owner's move epoch, and the
+    // assignment mark lands on whichever owner the member lives on. The read
+    // must precede the create+home push — after it, this same slot read
+    // would count as reading the attempt's own write.
+    let existing_owner = db
+        .get_member_index()
+        .get_member_owner(&unresolve_member.member_id)
+        .cloned();
+    let mut mark_owners: Vec<LuaMemberOwner> = Vec::new();
     if let Some(prefix_expr) = &unresolve_member.prefix {
         let prefix_type = infer_expr(db, cache, prefix_expr.clone())?;
         let member_id = unresolve_member.member_id;
@@ -402,9 +416,12 @@ pub fn try_resolve_member(
                     if !type_decl.is_class() {
                         return Err(InferFailReason::FieldNotFound);
                     }
-                    let _ = db
-                        .get_member_index_mut()
-                        .add_member_alias_to_owner(LuaMemberOwner::Type(type_decl_id), member_id);
+                    let alias_owner = LuaMemberOwner::Type(type_decl_id);
+                    writes.push(WriteKey::MemberOwner(alias_owner.clone()), move |db, _| {
+                        let _ = db
+                            .get_member_index_mut()
+                            .add_member_alias_to_owner(alias_owner, member_id);
+                    });
                     None
                 }
             }
@@ -424,57 +441,78 @@ pub fn try_resolve_member(
                 }
                 _ => None,
             };
-            // The Lua pass creates a missing member before it looks at
-            // `set_owner_only`, so this must too: `set_member_owner` cannot
-            // re-home a member that does not exist, and a `Ref` prefix would
-            // otherwise leave the cold build with no member at all.
-            if db.get_member_index().get_member(&member_id).is_none() {
-                create_deferred_index_expr_member(
-                    db,
-                    cache,
-                    &prefix_type,
-                    member_owner.clone(),
-                    member_id,
-                    alias_path.clone(),
-                    set_owner_only,
-                );
+            // The member's pre-write home is recorded for the intra-item
+            // ordering check: re-homing it stamps the old owner's move epoch,
+            // which is a member-map write to that owner.
+            let mut owner_keys = vec![member_owner.clone()];
+            if let Some(existing) = &existing_owner {
+                owner_keys.push(existing.clone());
             }
+            mark_owners = owner_keys.clone();
+            // The whole gate + create + home block replays verbatim when the
+            // write lands: `get_member` is re-asked against the live index,
+            // so a member another write created in between is skipped exactly
+            // as the serial attempt would skip it, and the member-key
+            // inference inside `create_deferred_index_expr_member` reads the
+            // state it would have read inline.
+            writes.push_multi(owner_keys.into_iter().map(WriteKey::MemberOwner), {
+                let prefix_type = prefix_type.clone();
+                move |db, infer_manager| {
+                    // The Lua pass creates a missing member before it looks at
+                    // `set_owner_only`, so this must too: `set_member_owner`
+                    // cannot re-home a member that does not exist, and a `Ref`
+                    // prefix would otherwise leave the cold build with no
+                    // member at all.
+                    if db.get_member_index().get_member(&member_id).is_none() {
+                        let cache = infer_manager.get_infer_cache(member_id.file_id);
+                        create_deferred_index_expr_member(
+                            db,
+                            cache,
+                            &prefix_type,
+                            member_owner.clone(),
+                            member_id,
+                            alias_path.clone(),
+                            set_owner_only,
+                        );
+                    }
 
-            if set_owner_only {
-                match alias_path {
-                    Some(alias_path) => {
-                        db.get_member_index_mut().home_alias_member_with_provenance(
-                            member_owner,
-                            member_id.file_id,
-                            member_id,
-                            alias_path,
-                            true,
-                        );
-                    }
-                    None => {
-                        db.get_member_index_mut().set_member_owner_only(
-                            member_owner,
-                            member_id.file_id,
-                            member_id,
-                        );
+                    if set_owner_only {
+                        match alias_path {
+                            Some(alias_path) => {
+                                db.get_member_index_mut().home_alias_member_with_provenance(
+                                    member_owner,
+                                    member_id.file_id,
+                                    member_id,
+                                    alias_path,
+                                    true,
+                                );
+                            }
+                            None => {
+                                db.get_member_index_mut().set_member_owner_only(
+                                    member_owner,
+                                    member_id.file_id,
+                                    member_id,
+                                );
+                            }
+                        }
+                    } else {
+                        match alias_path {
+                            Some(alias_path) => {
+                                db.get_member_index_mut().home_alias_member_with_provenance(
+                                    member_owner,
+                                    member_id.file_id,
+                                    member_id,
+                                    alias_path,
+                                    false,
+                                );
+                            }
+                            None => {
+                                add_member(db, member_owner, member_id);
+                            }
+                        }
                     }
                 }
-            } else {
-                match alias_path {
-                    Some(alias_path) => {
-                        db.get_member_index_mut().home_alias_member_with_provenance(
-                            member_owner,
-                            member_id.file_id,
-                            member_id,
-                            alias_path,
-                            false,
-                        );
-                    }
-                    None => {
-                        add_member(db, member_owner, member_id);
-                    }
-                }
-            }
+            });
         }
         unresolve_member.prefix = None;
     }
@@ -506,12 +544,30 @@ pub fn try_resolve_member(
         }
 
         let member_id = unresolve_member.member_id;
-        bind_resolved_type(
-            db,
-            member_id.into(),
-            LuaTypeCache::InferType(expr_type.clone()),
+        let type_owner: crate::LuaTypeOwner = member_id.into();
+        writes.push(WriteKey::TypeOwner(type_owner.clone()), move |db, _| {
+            bind_resolved_type(
+                db,
+                type_owner.clone(),
+                LuaTypeCache::InferType(expr_type.clone()),
+            );
+        });
+        // The mark lands on whatever owner the member lives on when it
+        // applies: the pre-write home if the create+home write did not move
+        // it, the new owner if it did. Both were read before that push, so
+        // this covers the landing site without reading a slot the attempt
+        // already queued a write to.
+        if mark_owners.is_empty()
+            && let Some(existing_owner) = &existing_owner
+        {
+            mark_owners.push(existing_owner.clone());
+        }
+        writes.push_multi(
+            mark_owners.into_iter().map(WriteKey::MemberOwner),
+            move |db, _| {
+                crate::compilation::analyzer::lua::mark_resolved_member_assignment(db, member_id);
+            },
         );
-        crate::compilation::analyzer::lua::mark_resolved_member_assignment(db, member_id);
     }
 
     Ok(())
@@ -686,7 +742,8 @@ pub fn try_resolve_module(
 }
 
 pub fn try_resolve_return_point(
-    db: &mut DbIndex,
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
     cache: &mut LuaInferCache,
     return_: &mut UnResolveReturn,
 ) -> ResolveResult {
@@ -730,43 +787,51 @@ pub fn try_resolve_return_point(
             )
         });
 
-    let signature = db
-        .get_signature_index_mut()
-        .get_mut(&return_.signature_id)
-        .ok_or(InferFailReason::None)?;
-
-    if let Some(inherited_tail) = inherited_tail {
-        signature
-            .return_docs
-            .extend(inherited_tail.into_iter().map(|type_ref| LuaDocReturnInfo {
-                name: None,
-                type_ref,
-                default_value: None,
-                description: None,
-                attributes: None,
-                return_kind: ReturnTypeKind::default(),
-            }));
-        signature.set_return_correlations(return_correlations);
-        db.get_signature_index_mut()
-            .note_return_write(return_.signature_id);
-        return Ok(());
+    let signature_id = return_.signature_id;
+    if db.get_signature_index().get(&signature_id).is_none() {
+        return Err(InferFailReason::None);
     }
 
-    if should_apply_resolved_return_docs(signature, &return_docs) {
-        let moved = signature
-            .return_docs
-            .iter()
-            .map(|doc| &doc.type_ref)
-            .ne(return_docs.iter().map(|doc| &doc.type_ref));
-        let correlations_moved = signature.return_correlations() != return_correlations.as_slice();
-        signature.resolve_return = SignatureReturnStatus::InferResolve;
-        signature.return_docs = return_docs;
-        signature.set_return_correlations(return_correlations);
-        if moved || correlations_moved {
-            db.get_signature_index_mut()
-                .note_return_write(return_.signature_id);
+    // The mutation reads the slot's live `resolve_return`/`return_docs` when
+    // it lands, so the deferred closure replays the whole decision verbatim —
+    // the same state the serial attempt would have mutated in place.
+    writes.push_multi([WriteKey::Signature(signature_id)], move |db, _| {
+        let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id) else {
+            return;
+        };
+
+        if let Some(inherited_tail) = inherited_tail {
+            signature
+                .return_docs
+                .extend(inherited_tail.into_iter().map(|type_ref| LuaDocReturnInfo {
+                    name: None,
+                    type_ref,
+                    default_value: None,
+                    description: None,
+                    attributes: None,
+                    return_kind: ReturnTypeKind::default(),
+                }));
+            signature.set_return_correlations(return_correlations);
+            db.get_signature_index_mut().note_return_write(signature_id);
+            return;
         }
-    }
+
+        if should_apply_resolved_return_docs(signature, &return_docs) {
+            let moved = signature
+                .return_docs
+                .iter()
+                .map(|doc| &doc.type_ref)
+                .ne(return_docs.iter().map(|doc| &doc.type_ref));
+            let correlations_moved =
+                signature.return_correlations() != return_correlations.as_slice();
+            signature.resolve_return = SignatureReturnStatus::InferResolve;
+            signature.return_docs = return_docs;
+            signature.set_return_correlations(return_correlations);
+            if moved || correlations_moved {
+                db.get_signature_index_mut().note_return_write(signature_id);
+            }
+        }
+    });
 
     Ok(())
 }
@@ -877,7 +942,8 @@ pub fn resolve_settled_iter_var_readonly(
 }
 
 pub fn try_resolve_iter_var(
-    db: &mut DbIndex,
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
     cache: &mut LuaInferCache,
     unresolve_iter_var: &mut UnResolveIterVar,
 ) -> ResolveResult {
@@ -886,30 +952,48 @@ pub fn try_resolve_iter_var(
         .iter()
         .map(LuaAstToken::get_position)
         .collect::<Vec<_>>();
-    let updates = match compute_iter_var_updates(
+    try_resolve_iter_var_updates(
         db,
+        writes,
         cache,
         unresolve_iter_var.file_id,
         &unresolve_iter_var.iter_exprs,
         &var_positions,
-        false,
-    ) {
-        Ok(updates) => updates,
-        // Placeholder items have nothing to add on a failed retry: the template
-        // ref is already cached. Keep the failure in this reason's own group
-        // rather than injecting the item into another group's fixpoint.
-        Err(reason) => {
-            return Err(
-                if iter_var_holds_tpl_placeholder(db, unresolve_iter_var, 0) {
-                    InferFailReason::UnResolveIterTemplate
-                } else {
-                    reason
-                },
-            );
-        }
-    };
+    )
+}
+
+/// The worker-facing half of [`try_resolve_iter_var`]: iterator variables are
+/// identified by position, so a caller without the syntax tokens — a
+/// speculative worker rebuilding the item from ids — can run the same
+/// attempt.
+pub(super) fn try_resolve_iter_var_updates(
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    iter_exprs: &[LuaExpr],
+    var_positions: &[rowan::TextSize],
+) -> ResolveResult {
+    let updates =
+        match compute_iter_var_updates(db, cache, file_id, iter_exprs, var_positions, false) {
+            Ok(updates) => updates,
+            // Placeholder items have nothing to add on a failed retry: the template
+            // ref is already cached. Keep the failure in this reason's own group
+            // rather than injecting the item into another group's fixpoint.
+            Err(reason) => {
+                return Err(
+                    if iter_var_holds_tpl_placeholder_at(db, file_id, var_positions, 0) {
+                        InferFailReason::UnResolveIterTemplate
+                    } else {
+                        reason
+                    },
+                );
+            }
+        };
     for update in updates {
-        write_type_cache(db, update.owner, update.cache, update.mode);
+        writes.push(WriteKey::TypeOwner(update.owner.clone()), move |db, _| {
+            write_type_cache(db, update.owner, update.cache, update.mode);
+        });
     }
     Ok(())
 }
@@ -1025,15 +1109,16 @@ fn iter_var_write_mode(cached: Option<&LuaTypeCache>, settled: &LuaType) -> Type
 
 /// Whether the iterator var at `idx` still caches a raw template ref, the
 /// placeholder an unbound generic leaves behind.
-fn iter_var_holds_tpl_placeholder(
+fn iter_var_holds_tpl_placeholder_at(
     db: &DbIndex,
-    unresolve_iter_var: &UnResolveIterVar,
+    file_id: FileId,
+    var_positions: &[rowan::TextSize],
     idx: usize,
 ) -> bool {
-    let Some(var_name) = unresolve_iter_var.iter_vars.get(idx) else {
+    let Some(&position) = var_positions.get(idx) else {
         return false;
     };
-    let decl_id = LuaDeclId::new(unresolve_iter_var.file_id, var_name.get_position());
+    let decl_id = LuaDeclId::new(file_id, position);
     db.get_type_index()
         .get_type_cache(&decl_id.into())
         .is_some_and(|cache| cache.as_type().contain_tpl())
@@ -3229,8 +3314,13 @@ mod tests {
             body: None,
             return_points: Vec::new(),
         };
-        super::try_resolve_return_point(&mut db, &mut cache, &mut unresolve)
-            .expect("empty return points resolve to never");
+        let mut writes = crate::compilation::analyzer::unresolve::writes::ResolveWrites::new();
+        let result = super::try_resolve_return_point(&db, &mut writes, &mut cache, &mut unresolve);
+        writes.apply(
+            &mut db,
+            &mut crate::compilation::analyzer::infer_cache_manager::InferCacheManager::new(),
+        );
+        result.expect("empty return points resolve to never");
 
         let after = db.get_signature_index().return_write_version(&signature_id);
         assert!(
@@ -3270,8 +3360,13 @@ mod tests {
             body: None,
             return_points: Vec::new(),
         };
-        super::try_resolve_return_point(&mut db, &mut cache, &mut unresolve)
-            .expect("empty return points resolve to never");
+        let mut writes = crate::compilation::analyzer::unresolve::writes::ResolveWrites::new();
+        let result = super::try_resolve_return_point(&db, &mut writes, &mut cache, &mut unresolve);
+        writes.apply(
+            &mut db,
+            &mut crate::compilation::analyzer::infer_cache_manager::InferCacheManager::new(),
+        );
+        result.expect("empty return points resolve to never");
 
         let after = db.get_signature_index().return_write_version(&signature_id);
         assert_eq!(

@@ -32,6 +32,24 @@ use crate::{DynamicFieldOwner, FileId, LuaMemberKey, LuaMemberOwner, LuaSignatur
 use rowan::TextSize;
 use smol_str::SmolStr;
 
+/// The slot one index mutation lands in, keyed the same way the read
+/// recorder keys reads so a read/write overlap compares directly. The wave's
+/// deferred writes record these, and every recorded read stamps its slot
+/// here, so a read can be ordered against the push that writes it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum WriteKey {
+    TypeOwner(LuaTypeOwner),
+    MemberOwner(LuaMemberOwner),
+    MemberKey(LuaMemberKey),
+    MemberSlot(LuaMemberOwner, LuaMemberKey),
+    Signature(LuaSignatureId),
+    Param(LuaSignatureId),
+    Module(FileId),
+    SpecialCall(FileId, TextSize),
+    Contrib(LuaSignatureId, usize),
+    DynamicField(DynamicFieldOwner, Option<SmolStr>),
+}
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct InferenceReadSet {
     pub type_owners: FxHashSet<LuaTypeOwner>,
@@ -61,6 +79,13 @@ pub(crate) struct InferenceReadSet {
     /// the settled pass reproduces, so it must not report stale every round —
     /// only the slot changing what it holds re-derives the read.
     pub missing_member_slots: FxHashMap<(LuaMemberOwner, LuaMemberKey), (usize, usize)>,
+    /// The sequence number of the most recent read of each slot, keyed the
+    /// same way the wave's deferred writes key theirs. A slot read *after*
+    /// its own write was queued saw pre-write state where the serial drain
+    /// would have seen the write, which is what `self_conflicted` answers.
+    /// Fixpoint staleness ignores this — presence in the sets above already
+    /// covers it.
+    pub read_seqs: FxHashMap<WriteKey, u64>,
 }
 
 impl InferenceReadSet {
@@ -79,6 +104,10 @@ impl InferenceReadSet {
         self.contribs.extend(other.contribs);
         self.dynamic_fields.extend(other.dynamic_fields);
         self.missing_member_slots.extend(other.missing_member_slots);
+        for (key, seq) in other.read_seqs {
+            let entry = self.read_seqs.entry(key).or_insert(seq);
+            *entry = (*entry).max(seq);
+        }
     }
 }
 
@@ -109,6 +138,14 @@ thread_local! {
     static CONTRIBS: RefCell<FxHashSet<(LuaSignatureId, usize)>> = RefCell::new(FxHashSet::default());
     static DYNAMIC_FIELDS: RefCell<FxHashSet<(DynamicFieldOwner, Option<SmolStr>)>> = RefCell::new(FxHashSet::default());
     static MISSING_MEMBER_SLOTS: RefCell<FxHashMap<(LuaMemberOwner, LuaMemberKey), (usize, usize)>> = RefCell::new(FxHashMap::default());
+    /// A monotonic event ordinal shared by read recording and the wave's
+    /// deferred-write pushes. Stamping both on one clock lets the drain tell
+    /// whether a slot read happened *after* the attempt queued its own write
+    /// to that slot — a read that precedes the push sees the same pre-write
+    /// state the serial attempt sees, while a later one diverged.
+    static SEQ: Cell<u64> = const { Cell::new(0) };
+    static READ_SEQS: RefCell<FxHashMap<WriteKey, u64>> =
+        RefCell::new(FxHashMap::default());
 }
 
 /// Starts collecting reads, sharing the collection with any enclosing scope.
@@ -125,6 +162,7 @@ pub(crate) fn arm() {
         CONTRIBS.with(|slots| slots.borrow_mut().clear());
         DYNAMIC_FIELDS.with(|fields| fields.borrow_mut().clear());
         MISSING_MEMBER_SLOTS.with(|slots| slots.borrow_mut().clear());
+        READ_SEQS.with(|seqs| seqs.borrow_mut().clear());
     }
     DEPTH.with(|depth| depth.set(depth.get() + 1));
 }
@@ -156,6 +194,7 @@ pub(crate) fn disarm() -> InferenceReadSet {
             contribs: CONTRIBS.with(|slots| slots.borrow().clone()),
             dynamic_fields: DYNAMIC_FIELDS.with(|fields| fields.borrow().clone()),
             missing_member_slots: MISSING_MEMBER_SLOTS.with(|slots| slots.borrow().clone()),
+            read_seqs: READ_SEQS.with(|seqs| seqs.borrow().clone()),
         }
     } else {
         InferenceReadSet {
@@ -170,8 +209,32 @@ pub(crate) fn disarm() -> InferenceReadSet {
             dynamic_fields: DYNAMIC_FIELDS.with(|fields| std::mem::take(&mut *fields.borrow_mut())),
             missing_member_slots: MISSING_MEMBER_SLOTS
                 .with(|slots| std::mem::take(&mut *slots.borrow_mut())),
+            read_seqs: READ_SEQS.with(|seqs| std::mem::take(&mut *seqs.borrow_mut())),
         }
     }
+}
+
+/// Hands out the next event ordinal. Deferred-write pushes stamp their keys
+/// with it, so a read's ordinal can be compared against the push that wrote
+/// the same slot. Reads stamp theirs inside their `record_*` call.
+#[inline]
+pub(crate) fn next_seq() -> u64 {
+    SEQ.with(|seq| {
+        let next = seq.get().wrapping_add(1);
+        seq.set(next);
+        next
+    })
+}
+
+/// Stamps `key` with the ordinal of this read. Repeated reads keep the
+/// latest, which is the comparison `self_conflicted` wants: any read that
+/// ran after the slot's first queued write may have diverged.
+#[inline]
+fn note_read_seq(key: WriteKey) {
+    let seq = next_seq();
+    READ_SEQS.with(|seqs| {
+        seqs.borrow_mut().insert(key, seq);
+    });
 }
 
 #[inline]
@@ -182,6 +245,7 @@ pub(crate) fn record(owner: &LuaTypeOwner) {
     READS.with(|reads| {
         reads.borrow_mut().insert(owner.clone());
     });
+    note_read_seq(WriteKey::TypeOwner(owner.clone()));
 }
 
 #[inline]
@@ -190,6 +254,7 @@ pub(crate) fn record_signature(signature_id: &LuaSignatureId) {
         SIGNATURES.with(|signatures| {
             signatures.borrow_mut().insert(*signature_id);
         });
+        note_read_seq(WriteKey::Signature(*signature_id));
     }
 }
 
@@ -205,6 +270,7 @@ pub(crate) fn record_param(signature_id: &LuaSignatureId) {
         PARAMS.with(|params| {
             params.borrow_mut().insert(*signature_id);
         });
+        note_read_seq(WriteKey::Param(*signature_id));
     }
 }
 
@@ -215,6 +281,7 @@ pub(crate) fn record_module(file_id: &FileId) {
         MODULES.with(|modules| {
             modules.borrow_mut().insert(*file_id);
         });
+        note_read_seq(WriteKey::Module(*file_id));
     }
 }
 
@@ -226,6 +293,7 @@ pub(crate) fn record_special_call(file_id: &FileId, position: TextSize) {
         SPECIAL_CALLS.with(|sites| {
             sites.borrow_mut().insert((*file_id, position));
         });
+        note_read_seq(WriteKey::SpecialCall(*file_id, position));
     }
 }
 
@@ -237,6 +305,7 @@ pub(crate) fn record_contrib(signature_id: &LuaSignatureId, param_idx: usize) {
         CONTRIBS.with(|slots| {
             slots.borrow_mut().insert((*signature_id, param_idx));
         });
+        note_read_seq(WriteKey::Contrib(*signature_id, param_idx));
     }
 }
 
@@ -250,6 +319,10 @@ pub(crate) fn record_dynamic_field(owner: &DynamicFieldOwner, field_name: Option
                 .borrow_mut()
                 .insert((owner.clone(), field_name.map(SmolStr::new)));
         });
+        note_read_seq(WriteKey::DynamicField(
+            owner.clone(),
+            field_name.map(SmolStr::new),
+        ));
     }
 }
 
@@ -267,6 +340,7 @@ pub(crate) fn record_missing_member_slot(
                 (member_count, dynamic_field_count),
             );
         });
+        note_read_seq(WriteKey::MemberSlot(owner.clone(), key.clone()));
     }
 }
 
@@ -278,6 +352,7 @@ pub(crate) fn record_member_map(index: &crate::LuaMemberIndex, owner: &LuaMember
                 .entry(owner.clone())
                 .or_insert_with(|| index.read_version(owner));
         });
+        note_read_seq(WriteKey::MemberOwner(owner.clone()));
     }
 }
 
@@ -296,6 +371,7 @@ pub(crate) fn record_member_key_read(index: &crate::LuaMemberIndex, key: &LuaMem
                 .entry(key.clone())
                 .or_insert_with(|| index.key_read_version(key));
         });
+        note_read_seq(WriteKey::MemberKey(key.clone()));
     }
 }
 

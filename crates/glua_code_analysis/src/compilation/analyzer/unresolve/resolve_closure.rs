@@ -15,12 +15,16 @@ use crate::{
 
 use super::{
     ResolveResult, UnResolveCallClosureParams, UnResolveClosureReturn, UnResolveParentAst,
-    UnResolveParentClosureParams, UnResolveReturn, find_decl_function::find_decl_function_type,
-    is_unsettled_inferred_return, resolve::try_resolve_return_point,
+    UnResolveParentClosureParams, UnResolveReturn,
+    find_decl_function::find_decl_function_type,
+    is_unsettled_inferred_return,
+    resolve::try_resolve_return_point,
+    writes::{ResolveWrites, WriteKey},
 };
 
 pub fn try_resolve_call_closure_params(
-    db: &mut DbIndex,
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
     cache: &mut LuaInferCache,
     closure_params: &mut UnResolveCallClosureParams,
 ) -> ResolveResult {
@@ -69,55 +73,64 @@ pub fn try_resolve_call_closure_params(
     let params_to_insert = callback_func.get_params().to_vec();
 
     let signature_id = closure_params.signature_id;
-    let signature = db
-        .get_signature_index_mut()
-        .get_mut(&signature_id)
-        .ok_or(InferFailReason::None)?;
+    if db.get_signature_index().get(&signature_id).is_none() {
+        return Err(InferFailReason::None);
+    }
 
-    let params_before = signature.params.len();
-    let param_docs_before = signature.param_docs.len();
-    let async_before = signature.async_state;
-    let signature_params = &mut signature.param_docs;
-    for (idx, (name, type_ref)) in params_to_insert.iter().enumerate() {
-        if signature_params.contains_key(&idx) {
-            continue;
+    // The mutation reads the signature's live state when it lands, so the
+    // deferred closure replays it verbatim against whatever the slot holds
+    // then — the same state the serial attempt would have seen.
+    writes.push_multi([WriteKey::Param(signature_id)], move |db, _| {
+        let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id) else {
+            return;
+        };
+
+        let params_before = signature.params.len();
+        let param_docs_before = signature.param_docs.len();
+        let async_before = signature.async_state;
+        let signature_params = &mut signature.param_docs;
+        for (idx, (name, type_ref)) in params_to_insert.iter().enumerate() {
+            if signature_params.contains_key(&idx) {
+                continue;
+            }
+
+            signature_params.insert(
+                idx,
+                LuaDocParamInfo {
+                    name: name.clone(),
+                    type_ref: type_ref.clone().unwrap_or(LuaType::Any),
+                    default_value: None,
+                    description: None,
+                    nullable: false,
+                    attributes: None,
+                },
+            );
+        }
+        if signature.params.len() < params_to_insert.len() {
+            let missing_start = signature.params.len();
+            for (name, _) in params_to_insert.iter().skip(missing_start) {
+                signature.params.push(name.clone());
+            }
         }
 
-        signature_params.insert(
-            idx,
-            LuaDocParamInfo {
-                name: name.clone(),
-                type_ref: type_ref.clone().unwrap_or(LuaType::Any),
-                default_value: None,
-                description: None,
-                nullable: false,
-                attributes: None,
-            },
-        );
-    }
-    if signature.params.len() < params_to_insert.len() {
-        let missing_start = signature.params.len();
-        for (name, _) in params_to_insert.iter().skip(missing_start) {
-            signature.params.push(name.clone());
+        signature.async_state = async_state;
+        // Re-settling an identical contract moves nothing observable: only a
+        // novel fact may bump the param epoch, or the fixpoint filter degrades
+        // to a full requeue.
+        if signature.param_docs.len() != param_docs_before
+            || signature.params.len() != params_before
+            || signature.async_state != async_before
+        {
+            db.get_signature_index_mut().note_param_write(signature_id);
         }
-    }
-
-    signature.async_state = async_state;
-    // Re-settling an identical contract moves nothing observable: only a
-    // novel fact may bump the param epoch, or the fixpoint filter degrades
-    // to a full requeue.
-    if signature.param_docs.len() != param_docs_before
-        || signature.params.len() != params_before
-        || signature.async_state != async_before
-    {
-        db.get_signature_index_mut().note_param_write(signature_id);
-    }
+    });
 
     Ok(())
 }
 
 pub fn try_resolve_closure_return(
-    db: &mut DbIndex,
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
     cache: &mut LuaInferCache,
     closure_return: &mut UnResolveClosureReturn,
 ) -> ResolveResult {
@@ -162,42 +175,49 @@ pub fn try_resolve_closure_return(
     let ret_type = callback_func.get_ret().clone();
 
     let signature_id = closure_return.signature_id;
-    let signature = db
-        .get_signature_index_mut()
-        .get_mut(&signature_id)
-        .ok_or(InferFailReason::None)?;
+    if db.get_signature_index().get(&signature_id).is_none() {
+        return Err(InferFailReason::None);
+    }
 
     // An `unknown`/`any` contextual return carries no information, but taking it
     // would clear the body-derived return below and stamp `DocResolve` over the
     // result, which every later repair pass then refuses to touch. Fall back to
     // the body exactly as an unbound template return does.
     if is_uninformative_callback_return(&ret_type) {
-        return try_convert_to_func_body_infer(db, cache, closure_return);
+        return try_convert_to_func_body_infer(db, writes, cache, closure_return);
     }
 
-    match signature.resolve_return {
-        SignatureReturnStatus::UnResolve => {}
-        SignatureReturnStatus::InferResolve => {
-            signature.return_docs.clear();
+    // The slot's `resolve_return` is read when the write lands, matching the
+    // state the serial attempt would have mutated in place.
+    writes.push_multi([WriteKey::Signature(signature_id)], move |db, _| {
+        let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id) else {
+            return;
+        };
+
+        match signature.resolve_return {
+            SignatureReturnStatus::UnResolve => {}
+            SignatureReturnStatus::InferResolve => {
+                signature.return_docs.clear();
+            }
+            _ => return,
         }
-        _ => return Ok(()),
-    }
 
-    signature.return_docs.push(LuaDocReturnInfo {
-        name: None,
-        type_ref: ret_type.clone(),
-        default_value: None,
-        description: None,
-        attributes: None,
-        return_kind: ReturnTypeKind::default(),
+        signature.return_docs.push(LuaDocReturnInfo {
+            name: None,
+            type_ref: ret_type.clone(),
+            default_value: None,
+            description: None,
+            attributes: None,
+            return_kind: ReturnTypeKind::default(),
+        });
+
+        signature.resolve_return = SignatureReturnStatus::DocResolve;
+        // A DocResolve install is a novel return fact for the signature's
+        // return readers. It never called `note_return_write`, which left it
+        // invisible to the staleness epochs and readable only through the
+        // full-requeue fallback.
+        db.get_signature_index_mut().note_return_write(signature_id);
     });
-
-    signature.resolve_return = SignatureReturnStatus::DocResolve;
-    // A DocResolve install is a novel return fact for the signature's
-    // return readers. It never called `note_return_write`, which left it
-    // invisible to the staleness epochs and readable only through the
-    // full-requeue fallback.
-    db.get_signature_index_mut().note_return_write(signature_id);
     Ok(())
 }
 fn is_uninformative_callback_return(typ: &LuaType) -> bool {
@@ -214,7 +234,8 @@ fn is_uninformative_callback_return(typ: &LuaType) -> bool {
 }
 
 fn try_convert_to_func_body_infer(
-    db: &mut DbIndex,
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
     cache: &mut LuaInferCache,
     closure_return: &mut UnResolveClosureReturn,
 ) -> ResolveResult {
@@ -225,7 +246,7 @@ fn try_convert_to_func_body_infer(
         return_points: closure_return.return_points.clone(),
     };
 
-    try_resolve_return_point(db, cache, &mut unresolve)
+    try_resolve_return_point(db, writes, cache, &mut unresolve)
 }
 
 fn resolve_call_param_doc_function(
@@ -446,7 +467,8 @@ pub fn extract_hook_name(call_expr: &LuaCallExpr) -> Option<String> {
 }
 
 pub fn try_resolve_closure_parent_params(
-    db: &mut DbIndex,
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
     cache: &mut LuaInferCache,
     closure_params: &mut UnResolveParentClosureParams,
 ) -> ResolveResult {
@@ -528,6 +550,7 @@ pub fn try_resolve_closure_parent_params(
 
     resolve_closure_member_type(
         db,
+        writes,
         closure_params,
         &member_type,
         self_type,
@@ -535,8 +558,36 @@ pub fn try_resolve_closure_parent_params(
     )
 }
 
+/// Defers one `resolve_doc_function` write. The signature's existence is the
+/// only thing the attempt can fail on, so it is checked up front; every other
+/// read the mutation makes is replayed inside the closure against the live
+/// slot, which is exactly the state the serial attempt would have seen.
+fn defer_resolve_doc_function(
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
+    signature_id: LuaSignatureId,
+    doc_func: &LuaFunctionType,
+    self_type: Option<LuaType>,
+) -> ResolveResult {
+    if db.get_signature_index().get(&signature_id).is_none() {
+        return Err(InferFailReason::None);
+    }
+    let doc_func = doc_func.clone();
+    writes.push_multi(
+        [
+            WriteKey::Param(signature_id),
+            WriteKey::Signature(signature_id),
+        ],
+        move |db, _| {
+            let _ = resolve_doc_function(db, signature_id, &doc_func, self_type);
+        },
+    );
+    Ok(())
+}
+
 fn resolve_closure_member_type(
-    db: &mut DbIndex,
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
     closure_params: &mut UnResolveParentClosureParams,
     member_type: &LuaType,
     self_type: Option<LuaType>,
@@ -544,7 +595,7 @@ fn resolve_closure_member_type(
 ) -> ResolveResult {
     match &member_type {
         LuaType::DocFunction(doc_func) => {
-            resolve_doc_function(db, closure_params, doc_func, self_type)
+            defer_resolve_doc_function(db, writes, closure_params.signature_id, doc_func, self_type)
         }
         LuaType::Signature(id) => {
             if id == &closure_params.signature_id {
@@ -580,8 +631,13 @@ fn resolve_closure_member_type(
                 let source_return_unsettled = is_unsettled_inferred_return(&source_return);
                 let source_id = *id;
                 let fake_doc_function = signature.to_doc_func_type();
-                let result =
-                    resolve_doc_function(db, closure_params, &fake_doc_function, self_type);
+                let result = defer_resolve_doc_function(
+                    db,
+                    writes,
+                    closure_params.signature_id,
+                    &fake_doc_function,
+                    self_type,
+                );
                 if result.is_ok() && source_return_unsettled {
                     closure_params.needs_settled_retry = true;
                     closure_params.source_signature_id = Some(source_id);
@@ -687,9 +743,10 @@ fn resolve_closure_member_type(
                 param.1 = Some(variadic_type);
             }
 
-            resolve_doc_function(
+            defer_resolve_doc_function(
                 db,
-                closure_params,
+                writes,
+                closure_params.signature_id,
                 &LuaFunctionType::new(
                     signature.async_state,
                     signature.is_colon_define,
@@ -712,6 +769,7 @@ fn resolve_closure_member_type(
             {
                 return resolve_closure_member_type(
                     db,
+                    writes,
                     closure_params,
                     &origin,
                     self_type,
@@ -726,11 +784,10 @@ fn resolve_closure_member_type(
 
 fn resolve_doc_function(
     db: &mut DbIndex,
-    closure_params: &UnResolveParentClosureParams,
+    signature_id: LuaSignatureId,
     doc_func: &LuaFunctionType,
     self_type: Option<LuaType>,
 ) -> ResolveResult {
-    let signature_id = closure_params.signature_id;
     let signature = db
         .get_signature_index_mut()
         .get_mut(&signature_id)
@@ -1319,8 +1376,13 @@ mod tests {
         let mut cache = LuaInferCache::new(file_id, Default::default());
         let db = ws.analysis.compilation.get_db_mut();
         let writes_before = db.get_signature_index().param_writes();
-        try_resolve_call_closure_params(db, &mut cache, &mut item)
+        let mut writes = crate::compilation::analyzer::unresolve::writes::ResolveWrites::new();
+        try_resolve_call_closure_params(db, &mut writes, &mut cache, &mut item)
             .expect("expected the identical re-settle to succeed");
+        writes.apply(
+            db,
+            &mut crate::compilation::analyzer::infer_cache_manager::InferCacheManager::new(),
+        );
         assert_eq!(
             db.get_signature_index().param_writes(),
             writes_before,

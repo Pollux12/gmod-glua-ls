@@ -614,8 +614,8 @@ fn attach_settled_index_expr_members(db: &mut DbIndex, context: &mut AnalyzeCont
             prefix: Some(prefix_expr),
             ret_idx: 0,
         };
-        let cache = context.infer_manager.get_infer_cache(file_id);
-        if unresolve::try_resolve_member(db, cache, &mut unresolve_member).is_err() {
+        if unresolve::attempt_member(db, &mut context.infer_manager, &mut unresolve_member).is_err()
+        {
             // The prefix still has not settled. Dropping it here is what made a
             // member's existence depend on analysis order: the passes that run
             // after this one go on refining the very types this retry needs, so
@@ -771,10 +771,11 @@ fn rederive_settled_parent_closures(db: &mut DbIndex, context: &mut AnalyzeConte
     let mut kept = Vec::new();
     for mut candidate in candidates {
         let previously_seen = candidate.last_source_return.clone();
-        {
-            let cache = context.infer_manager.get_infer_cache(candidate.file_id);
-            let _ = unresolve::try_resolve_closure_parent_params(db, cache, &mut candidate);
-        }
+        let _ = unresolve::attempt_closure_parent_params(
+            db,
+            &mut context.infer_manager,
+            &mut candidate,
+        );
         // A candidate leaves the queue only once the source return is settled,
         // unchanged since the last look, and mirrored by the copy. The source
         // can move through slot values that read as settled (a transient

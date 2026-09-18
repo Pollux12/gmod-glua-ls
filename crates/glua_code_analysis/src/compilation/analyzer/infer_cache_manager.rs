@@ -42,6 +42,22 @@ impl InferCacheManager {
         })
     }
 
+    /// A cache built the way [`get_infer_cache`](Self::get_infer_cache) would
+    /// build this file's, for worker threads that cannot borrow the map.
+    /// Deterministic inference results match because the config matches; the
+    /// memo entries it accumulates can be merged back or discarded.
+    pub fn fresh_cache(&self, file_id: FileId) -> crate::LuaInferCache {
+        crate::LuaInferCache::new(
+            file_id,
+            crate::CacheOptions {
+                analysis_phase: self.current_phase,
+                dynamic_fields_visible: self.dynamic_fields_visible,
+                building_dynamic_field_index: false,
+                call_site_params_visible: self.call_site_params_visible,
+            },
+        )
+    }
+
     /// Called once the dynamic-field index has been populated for this batch.
     /// Until then inference must not read it — see [`crate::CacheOptions`].
     pub fn set_dynamic_fields_visible(&mut self) {
