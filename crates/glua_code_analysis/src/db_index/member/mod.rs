@@ -469,8 +469,14 @@ impl LuaMemberIndex {
         id: LuaMemberId,
     ) -> Option<()> {
         self.set_member_owner(owner, file_id, id)?;
+        let owner = self.member_current_owner.get(&id)?.clone();
+        self.remove_member_from_owner_item(&owner, id);
         self.owner_only_members.insert(id);
         Some(())
+    }
+
+    pub(crate) fn is_owner_only_member(&self, id: &LuaMemberId) -> bool {
+        self.owner_only_members.contains(id)
     }
 
     /// Homes a member whose write went through an alias of the global path

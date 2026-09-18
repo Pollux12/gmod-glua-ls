@@ -1172,4 +1172,33 @@ mod tests {
         assert_eq!(owner_member_ids(&index, &owner), vec![member_id]);
         assert_eq!(index.get_file_members(file_id).len(), 1);
     }
+
+    #[test]
+    fn owner_only_transition_hides_and_readmission_restores_same_owner_member() {
+        let file_id = FileId::new(1);
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Holder"));
+        let member_id = make_member_id(file_id, 1);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(owner.clone(), make_member(member_id, "field"));
+        assert_eq!(owner_member_ids(&index, &owner), vec![member_id]);
+
+        index
+            .set_member_owner_only(owner.clone(), file_id, member_id)
+            .expect("owner-only filing should succeed");
+        assert_eq!(index.get_current_owner(&member_id), Some(&owner));
+        assert!(index.is_owner_only_member(&member_id));
+        assert!(
+            index.get_members(&owner).is_none_or(|members| {
+                !members.iter().any(|member| member.get_id() == member_id)
+            })
+        );
+
+        index
+            .set_member_owner(owner.clone(), file_id, member_id)
+            .expect("owner reassignment should succeed");
+        index.add_member_to_owner(owner.clone(), member_id);
+        assert!(!index.is_owner_only_member(&member_id));
+        assert_eq!(owner_member_ids(&index, &owner), vec![member_id]);
+    }
 }

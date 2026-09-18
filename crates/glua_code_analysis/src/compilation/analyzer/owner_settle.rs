@@ -425,8 +425,11 @@ pub(crate) fn rederive_settled_index_expr_owners(
             if db.get_member_index().has_synthesized_owner(&member_id) {
                 continue;
             }
-            let canonical_settled = db.get_member_index().canonical_owner(settled_owner.clone());
-            if current.as_ref() == Some(&canonical_settled) {
+            let member_index = db.get_member_index();
+            let canonical_settled = member_index.canonical_owner(settled_owner.clone());
+            let current_owner_only = member_index.is_owner_only_member(&member_id);
+            if current.as_ref() == Some(&canonical_settled) && current_owner_only == set_owner_only
+            {
                 continue;
             }
             // `set_owner_only` keeps the walk's meaning: a `Ref` prefix
