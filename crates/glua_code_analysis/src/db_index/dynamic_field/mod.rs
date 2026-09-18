@@ -194,8 +194,8 @@ impl DynamicFieldIndex {
         field_name: SmolStr,
         file_id: FileId,
         range: TextRange,
-    ) {
-        self.add_field_inner(owner, field_name, file_id, range);
+    ) -> bool {
+        self.add_field_inner(owner, field_name, file_id, range)
     }
 
     fn add_field_inner(

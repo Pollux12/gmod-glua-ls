@@ -499,6 +499,20 @@ fn has_unresolved_metatable_index(
     prefix_typ: &LuaType,
     position: Option<rowan::TextSize>,
 ) -> bool {
+    let mut visited = rustc_hash::FxHashSet::default();
+    has_unresolved_metatable_index_inner(db, semantic_model, prefix_typ, position, &mut visited)
+}
+
+fn has_unresolved_metatable_index_inner(
+    db: &DbIndex,
+    semantic_model: &SemanticModel,
+    prefix_typ: &LuaType,
+    position: Option<rowan::TextSize>,
+    visited: &mut rustc_hash::FxHashSet<LuaType>,
+) -> bool {
+    if !visited.insert(prefix_typ.clone()) {
+        return false;
+    }
     match prefix_typ {
         LuaType::TableConst(table_range) => {
             let Some(metatable) = db.get_metatable_index().get(table_range) else {
@@ -520,13 +534,26 @@ fn has_unresolved_metatable_index(
             // absence cannot be proven. Known `__index` types still flow through normal checks.
             index_type.is_ok_and(|typ| typ.is_unknown())
         }
-        LuaType::Instance(instance) => {
-            has_unresolved_metatable_index(db, semantic_model, instance.get_base(), position)
-        }
+        LuaType::Instance(instance) => has_unresolved_metatable_index_inner(
+            db,
+            semantic_model,
+            instance.get_base(),
+            position,
+            visited,
+        ),
         LuaType::Union(union) => match union.nullable_inner() {
-            Some(typ) => has_unresolved_metatable_index(db, semantic_model, typ, position),
+            Some(typ) => {
+                has_unresolved_metatable_index_inner(db, semantic_model, typ, position, visited)
+            }
             None => union.types().any(|typ| {
-                !typ.is_nil() && has_unresolved_metatable_index(db, semantic_model, typ, position)
+                !typ.is_nil()
+                    && has_unresolved_metatable_index_inner(
+                        db,
+                        semantic_model,
+                        typ,
+                        position,
+                        visited,
+                    )
             }),
         },
         _ => false,
@@ -2279,6 +2306,20 @@ fn has_dynamic_field_for_type(
     typ: &LuaType,
     field_name: &SmolStr,
 ) -> bool {
+    let mut visited = rustc_hash::FxHashSet::default();
+    has_dynamic_field_for_type_inner(db, index, typ, field_name, &mut visited)
+}
+
+fn has_dynamic_field_for_type_inner(
+    db: &DbIndex,
+    index: &crate::DynamicFieldIndex,
+    typ: &LuaType,
+    field_name: &SmolStr,
+    visited: &mut rustc_hash::FxHashSet<LuaType>,
+) -> bool {
+    if !visited.insert(typ.clone()) {
+        return false;
+    }
     match typ {
         LuaType::Ref(id) | LuaType::Def(id) => {
             let owner = crate::DynamicFieldOwner::Type(id.clone());
@@ -2308,12 +2349,14 @@ fn has_dynamic_field_for_type(
             index.has_field(&owner, field_name) || owner_wildcard_covers_any_field(db, &owner)
         }
         LuaType::Instance(instance) => {
-            has_dynamic_field_for_type(db, index, instance.get_base(), field_name)
+            has_dynamic_field_for_type_inner(db, index, instance.get_base(), field_name, visited)
         }
-        LuaType::TableOf(inner) => has_dynamic_field_for_type(db, index, inner, field_name),
+        LuaType::TableOf(inner) => {
+            has_dynamic_field_for_type_inner(db, index, inner, field_name, visited)
+        }
         LuaType::Union(union_type) => union_type
             .types()
-            .any(|t| has_dynamic_field_for_type(db, index, t, field_name)),
+            .any(|t| has_dynamic_field_for_type_inner(db, index, t, field_name, visited)),
         _ => false,
     }
 }

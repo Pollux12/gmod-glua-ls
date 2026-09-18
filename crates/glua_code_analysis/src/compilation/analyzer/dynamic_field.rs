@@ -518,16 +518,6 @@ fn analyze_dynamic_fields(
         profile.collection_merge_time += merge_start.elapsed();
     }
 
-    let propagate_start = profile_enabled.then(std::time::Instant::now);
-    let propagated = if mode.propagate_to_super_types() {
-        propagate_dynamic_fields_to_super_types(db, &collected)
-    } else {
-        Vec::new()
-    };
-    if let (Some(profile), Some(propagate_start)) = (profile.as_mut(), propagate_start) {
-        profile.propagation_time += propagate_start.elapsed();
-    }
-
     // A field written on one of a global path's bootstrap literals belongs to
     // the path, not to that literal: every file's `X.k = X.k or {}` names a
     // different `{}` and every reader of `X.k` has to see all of them.
@@ -541,6 +531,15 @@ fn analyze_dynamic_fields(
         *owner = crate::canonical_dynamic_field_owner(db, owner.clone());
     }
 
+    let propagate_start = profile_enabled.then(std::time::Instant::now);
+    let propagated = if mode.propagate_to_super_types() {
+        propagate_dynamic_fields_to_super_types(db, &collected)
+    } else {
+        Vec::new()
+    };
+    if let (Some(profile), Some(propagate_start)) = (profile.as_mut(), propagate_start) {
+        profile.propagation_time += propagate_start.elapsed();
+    }
     let insert_start = profile_enabled.then(std::time::Instant::now);
     let index = db.get_dynamic_field_index_mut();
     for (field_name, file_id) in collected_unattributed {
@@ -2235,7 +2234,7 @@ pub(crate) fn rederive_settled_dynamic_fields(
         changed |= index.add_field(owner, field_name, file_id, range);
     }
     for (owner, field_name, file_id, range) in propagated {
-        index.add_propagated_field(owner, field_name, file_id, range);
+        changed |= index.add_propagated_field(owner, field_name, file_id, range);
     }
     for (owner, file_id, range) in collected_wildcards {
         changed |= index.add_wildcard_definition(owner, file_id, range);
@@ -2252,6 +2251,20 @@ fn collect_wildcard_for_type(
     range: rowan::TextRange,
     result: &mut Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
 ) {
+    let mut visited = rustc_hash::FxHashSet::default();
+    collect_wildcard_for_type_inner(typ, file_id, range, result, &mut visited);
+}
+
+fn collect_wildcard_for_type_inner(
+    typ: &LuaType,
+    file_id: crate::FileId,
+    range: rowan::TextRange,
+    result: &mut Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
+    visited: &mut rustc_hash::FxHashSet<LuaType>,
+) {
+    if !visited.insert(typ.clone()) {
+        return;
+    }
     match typ {
         LuaType::Ref(id) | LuaType::Def(id) => {
             result.push((DynamicFieldOwner::Type(id.clone()), file_id, range));
@@ -2264,21 +2277,21 @@ fn collect_wildcard_for_type(
             ));
         }
         LuaType::Instance(instance) => {
-            collect_wildcard_for_type(instance.get_base(), file_id, range, result);
+            collect_wildcard_for_type_inner(instance.get_base(), file_id, range, result, visited);
         }
         LuaType::TableOf(inner) => {
-            collect_wildcard_for_type(inner, file_id, range, result);
+            collect_wildcard_for_type_inner(inner, file_id, range, result, visited);
         }
         LuaType::Union(union_type) => {
             for t in union_type.types() {
-                collect_wildcard_for_type(t, file_id, range, result);
+                collect_wildcard_for_type_inner(t, file_id, range, result, visited);
             }
         }
         // See `collect_for_type`: a merged table stands for its backing
         // literals.
         LuaType::MergedTable(merged) => {
             for t in merged.get_types() {
-                collect_wildcard_for_type(t, file_id, range, result);
+                collect_wildcard_for_type_inner(t, file_id, range, result, visited);
             }
         }
         _ => {}
@@ -2292,6 +2305,21 @@ fn collect_for_type(
     range: rowan::TextRange,
     result: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
 ) {
+    let mut visited = rustc_hash::FxHashSet::default();
+    collect_for_type_inner(typ, field_name, file_id, range, result, &mut visited);
+}
+
+fn collect_for_type_inner(
+    typ: &LuaType,
+    field_name: &SmolStr,
+    file_id: crate::FileId,
+    range: rowan::TextRange,
+    result: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    visited: &mut rustc_hash::FxHashSet<LuaType>,
+) {
+    if !visited.insert(typ.clone()) {
+        return;
+    }
     match typ {
         LuaType::Ref(id) | LuaType::Def(id) => {
             result.push((
@@ -2310,14 +2338,21 @@ fn collect_for_type(
             ));
         }
         LuaType::Instance(instance) => {
-            collect_for_type(instance.get_base(), field_name, file_id, range, result);
+            collect_for_type_inner(
+                instance.get_base(),
+                field_name,
+                file_id,
+                range,
+                result,
+                visited,
+            );
         }
         LuaType::TableOf(inner) => {
-            collect_for_type(inner, field_name, file_id, range, result);
+            collect_for_type_inner(inner, field_name, file_id, range, result, visited);
         }
         LuaType::Union(union_type) => {
             for t in union_type.types() {
-                collect_for_type(t, field_name, file_id, range, result);
+                collect_for_type_inner(t, field_name, file_id, range, result, visited);
             }
         }
         // A merged table is the same runtime table seen through several
@@ -2325,7 +2360,7 @@ fn collect_for_type(
         // does when inference answers with the literals unmerged.
         LuaType::MergedTable(merged) => {
             for t in merged.get_types() {
-                collect_for_type(t, field_name, file_id, range, result);
+                collect_for_type_inner(t, field_name, file_id, range, result, visited);
             }
         }
         _ => {}
@@ -2340,6 +2375,30 @@ fn collect_finite_member_for_type(
     has_finite_domain: bool,
     result: &mut Vec<FiniteNamedMemberEvidence>,
 ) {
+    let mut visited = rustc_hash::FxHashSet::default();
+    collect_finite_member_for_type_inner(
+        typ,
+        member_id,
+        file_id,
+        range,
+        has_finite_domain,
+        result,
+        &mut visited,
+    );
+}
+
+fn collect_finite_member_for_type_inner(
+    typ: &LuaType,
+    member_id: LuaMemberId,
+    file_id: crate::FileId,
+    range: rowan::TextRange,
+    has_finite_domain: bool,
+    result: &mut Vec<FiniteNamedMemberEvidence>,
+    visited: &mut rustc_hash::FxHashSet<LuaType>,
+) {
+    if !visited.insert(typ.clone()) {
+        return;
+    }
     match typ {
         LuaType::Ref(id) | LuaType::Def(id) => {
             result.push((
@@ -2360,34 +2419,37 @@ fn collect_finite_member_for_type(
             ));
         }
         LuaType::Instance(instance) => {
-            collect_finite_member_for_type(
+            collect_finite_member_for_type_inner(
                 instance.get_base(),
                 member_id,
                 file_id,
                 range,
                 has_finite_domain,
                 result,
+                visited,
             );
         }
         LuaType::TableOf(inner) => {
-            collect_finite_member_for_type(
+            collect_finite_member_for_type_inner(
                 inner,
                 member_id,
                 file_id,
                 range,
                 has_finite_domain,
                 result,
+                visited,
             );
         }
         LuaType::Union(union_type) => {
             for typ in union_type.types() {
-                collect_finite_member_for_type(
+                collect_finite_member_for_type_inner(
                     typ,
                     member_id,
                     file_id,
                     range,
                     has_finite_domain,
                     result,
+                    visited,
                 );
             }
         }
@@ -2395,13 +2457,14 @@ fn collect_finite_member_for_type(
         // literals.
         LuaType::MergedTable(merged) => {
             for typ in merged.get_types() {
-                collect_finite_member_for_type(
+                collect_finite_member_for_type_inner(
                     typ,
                     member_id,
                     file_id,
                     range,
                     has_finite_domain,
                     result,
+                    visited,
                 );
             }
         }
