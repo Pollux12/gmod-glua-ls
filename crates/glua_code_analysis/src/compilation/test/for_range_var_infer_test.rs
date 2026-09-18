@@ -1006,6 +1006,11 @@ mod test {
             &LuaType::Nil,
             Some(&LuaType::String),
         ));
+        assert!(!settled_assign_write_committable(
+            true,
+            &LuaType::IntegerConst(32),
+            Some(&LuaType::Number),
+        ));
     }
 
     /// A leaked template parameter is not an answer, so any write — holder or

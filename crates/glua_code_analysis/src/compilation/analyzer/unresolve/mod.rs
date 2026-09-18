@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use std::time::Duration;
 
 use crate::{
-    FileId, InferFailReason, LuaDeclTypeKind, LuaMemberFeature, LuaTypeDecl, LuaTypeFlag,
+    FileId, InferFailReason, LuaDeclTypeKind, LuaMemberFeature, LuaType, LuaTypeDecl, LuaTypeFlag,
     compilation::analyzer::{
         AnalysisPipeline, call_site_params::materialize_call_result_consumer,
         unresolve::resolve::try_resolve_special_call,
@@ -26,9 +26,7 @@ use resolve::{
     try_resolve_call_site_contribution, try_resolve_decl, try_resolve_iter_var, try_resolve_module,
     try_resolve_table_field,
 };
-use resolve_closure::{
-    try_resolve_call_closure_params, try_resolve_closure_parent_params, try_resolve_closure_return,
-};
+use resolve_closure::{try_resolve_call_closure_params, try_resolve_closure_return};
 
 pub(crate) use resolve::get_wrapped_callable_target_expr;
 pub(crate) use resolve::is_unsettled_inferred_return;
@@ -37,6 +35,7 @@ pub(crate) use resolve::{
     try_resolve_return_point,
 };
 pub use resolve_closure::extract_hook_name;
+pub(crate) use resolve_closure::try_resolve_closure_parent_params;
 pub use resolve_closure::{
     resolve_gmod_hook_add_callback_doc_function, resolve_gmod_hook_callback_doc_function,
 };
@@ -168,6 +167,7 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
         let mut force_finalized = Vec::new();
         let mut provisional = Vec::new();
         let mut late_resolved_decls = rustc_hash::FxHashSet::default();
+        let mut settled_parent_closures = Vec::new();
         while !reason_resolve.is_empty() {
             let iter_start = log_enabled.then(std::time::Instant::now);
 
@@ -182,6 +182,7 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
                     &mut force_finalized,
                     &mut provisional,
                     &mut late_resolved_decls,
+                    &mut settled_parent_closures,
                     None,
                 )
             });
@@ -273,6 +274,7 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
                 &mut force_finalized,
                 &mut provisional,
                 &mut late_resolved_decls,
+                &mut settled_parent_closures,
                 log_enabled,
             );
         }
@@ -281,6 +283,9 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
         // rebuilds the index's whole derived contribution state.
         context.force_finalized.extend(force_finalized);
         context.late_resolved_decls.extend(late_resolved_decls);
+        for candidate in settled_parent_closures {
+            context.add_settled_parent_closure_candidate(candidate);
+        }
         context.unresolves.extend(
             provisional
                 .into_iter()
@@ -382,6 +387,7 @@ pub(super) fn settle_floored_fixpoint(
     force_finalized: &mut Vec<UnResolve>,
     provisional: &mut Vec<UnResolve>,
     late_resolved_decls: &mut rustc_hash::FxHashSet<crate::LuaTypeOwner>,
+    settled_parent_closures: &mut Vec<UnResolveParentClosureParams>,
     log_enabled: bool,
 ) {
     let profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
@@ -553,6 +559,7 @@ pub(super) fn settle_floored_fixpoint(
             force_finalized,
             provisional,
             late_resolved_decls,
+            settled_parent_closures,
             Some(&mut read_records),
         );
         for (signature_id, return_docs) in held_returns {
@@ -688,6 +695,7 @@ fn requeue_flushed_call_site_returns(
     // dynamic-field visibility live on the manager and survive it.
     infer_manager.clear_files(&cleared_files);
 
+    let mut settled_parent_closures = Vec::new();
     let _ = try_resolve(
         db,
         infer_manager,
@@ -697,8 +705,12 @@ fn requeue_flushed_call_site_returns(
         &mut context.force_finalized,
         &mut Vec::new(),
         &mut context.late_resolved_decls,
+        &mut settled_parent_closures,
         None,
     );
+    for candidate in settled_parent_closures {
+        context.add_settled_parent_closure_candidate(candidate);
+    }
     materialize_pending_str_tpl_type_decls(db, infer_manager);
 
     // Whatever is still unresolved rejoins the retained set, so it leaves this
@@ -821,6 +833,7 @@ fn try_resolve(
     force_finalized: &mut Vec<UnResolve>,
     provisional: &mut Vec<UnResolve>,
     late_resolved_decls: &mut rustc_hash::FxHashSet<crate::LuaTypeOwner>,
+    settled_parent_closures: &mut Vec<UnResolveParentClosureParams>,
     mut fixpoint_reads: Option<&mut FxHashMap<UnResolveIdentity, FixpointReadRecord>>,
 ) -> Option<TryResolveProfile> {
     let mut profile = profile_enabled.then(TryResolveProfile::default);
@@ -990,6 +1003,11 @@ fn try_resolve(
                 match resolve_result {
                     Ok(_) => {
                         changed = true;
+                        if let UnResolve::ClosureParentParams(closure_params) = &unresolve
+                            && closure_params.needs_settled_retry
+                        {
+                            settled_parent_closures.push((**closure_params).clone());
+                        }
                         // A local this wave settles had a placeholder during
                         // the walk, and the writes that read it then hold that
                         // placeholder's answer. See
@@ -1030,7 +1048,15 @@ fn try_resolve(
                         }
                     }
                     Err(InferFailReason::FieldNotFound) => {
-                        if !cache.get_config().analysis_phase.is_force() {
+                        let settled_member_attach = matches!(
+                            &unresolve,
+                            UnResolve::Member(member)
+                                if member.prefix.is_some()
+                                    && glua_parser::LuaIndexExpr::can_cast(
+                                        member.member_id.get_syntax_id().get_kind()
+                                    )
+                        );
+                        if !cache.get_config().analysis_phase.is_force() || settled_member_attach {
                             retain_unresolve.push((unresolve, InferFailReason::FieldNotFound));
                         }
                     }
@@ -1643,18 +1669,29 @@ impl From<UnResolveClosureReturn> for UnResolve {
 }
 
 #[allow(clippy::enum_variant_names)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum UnResolveParentAst {
     LuaFuncStat(LuaFuncStat),
     LuaTableField(LuaTableField),
     LuaAssignStat(LuaAssignStat),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UnResolveParentClosureParams {
     pub file_id: FileId,
     pub signature_id: LuaSignatureId,
     pub parent_ast: UnResolveParentAst,
+    /// Set when the inherited contract was installed while the source
+    /// signature's return still held unsettled slots; the item retired with a
+    /// partial answer and joins the settled-tail retry queue.
+    pub needs_settled_retry: bool,
+    /// The signature the contract was copied from, and the source return as
+    /// seen when the candidate was queued or last retried. The source's own
+    /// inferred return can keep moving through slot values that read as
+    /// settled (a transient `nil`), so the retry stays queued until the
+    /// source is stable and the copy mirrors it.
+    pub source_signature_id: Option<LuaSignatureId>,
+    pub last_source_return: Option<LuaType>,
 }
 
 impl From<UnResolveParentClosureParams> for UnResolve {

@@ -16,7 +16,7 @@ use crate::{
 use super::{
     ResolveResult, UnResolveCallClosureParams, UnResolveClosureReturn, UnResolveParentAst,
     UnResolveParentClosureParams, UnResolveReturn, find_decl_function::find_decl_function_type,
-    resolve::try_resolve_return_point,
+    is_unsettled_inferred_return, resolve::try_resolve_return_point,
 };
 
 pub fn try_resolve_call_closure_params(
@@ -457,7 +457,7 @@ pub fn try_resolve_closure_parent_params(
         .ok_or(InferFailReason::None)?;
     // The empty-contract fast path consults this signature's params.
     crate::db_index::read_set::record_param(&closure_params.signature_id);
-    if !signature.param_docs.is_empty() {
+    if !signature.param_docs.is_empty() && !signature.return_filled_from_slot {
         return Ok(());
     }
     let self_type;
@@ -537,7 +537,7 @@ pub fn try_resolve_closure_parent_params(
 
 fn resolve_closure_member_type(
     db: &mut DbIndex,
-    closure_params: &UnResolveParentClosureParams,
+    closure_params: &mut UnResolveParentClosureParams,
     member_type: &LuaType,
     self_type: Option<LuaType>,
     infer_guard: &InferGuardRef,
@@ -571,8 +571,23 @@ fn resolve_closure_member_type(
                 if signature.params_filled_from_slot && !signature.param_docs.is_empty() {
                     return Ok(());
                 }
+                // The base contract is readable, but its return can still hold
+                // unsettled slots. Copying it stamps `DocResolve` on this
+                // signature, which no later pass reopens, so queue a settled
+                // retry that can refresh the slot-filled return once the base
+                // settles.
+                let source_return = signature.get_return_type();
+                let source_return_unsettled = is_unsettled_inferred_return(&source_return);
+                let source_id = *id;
                 let fake_doc_function = signature.to_doc_func_type();
-                resolve_doc_function(db, closure_params, &fake_doc_function, self_type)
+                let result =
+                    resolve_doc_function(db, closure_params, &fake_doc_function, self_type);
+                if result.is_ok() && source_return_unsettled {
+                    closure_params.needs_settled_retry = true;
+                    closure_params.source_signature_id = Some(source_id);
+                    closure_params.last_source_return = Some(source_return);
+                }
+                result
             } else {
                 Ok(())
             }
@@ -770,7 +785,11 @@ fn resolve_doc_function(
         || signature.params_filled_from_slot != filled_from_slot_before
         || signature.async_state != async_before;
 
-    let return_before = (signature.resolve_return, signature.return_docs.clone());
+    let return_before = (
+        signature.resolve_return,
+        signature.return_docs.clone(),
+        signature.return_filled_from_slot,
+    );
 
     let doc_return = doc_func.get_ret();
     let inferred_tail = (signature.resolve_return == SignatureReturnStatus::InferResolve)
@@ -787,11 +806,12 @@ fn resolve_doc_function(
         SignatureReturnStatus::InferResolve => {
             should_doc_return_override_inferred(doc_return, &signature.get_return_type())
         }
-        SignatureReturnStatus::DocResolve => false,
+        SignatureReturnStatus::DocResolve => signature.return_filled_from_slot,
     };
 
     if let Some(inferred_tail) = inferred_tail {
         signature.resolve_return = SignatureReturnStatus::DocResolve;
+        signature.return_filled_from_slot = true;
         signature.return_docs.clear();
         signature.return_docs.push(LuaDocReturnInfo {
             name: None,
@@ -812,21 +832,39 @@ fn resolve_doc_function(
                 return_kind: ReturnTypeKind::default(),
             }));
     } else if should_apply_return {
+        let slot_refresh = signature.resolve_return == SignatureReturnStatus::DocResolve;
         signature.resolve_return = SignatureReturnStatus::DocResolve;
-        signature.return_docs.clear();
-        signature.return_docs.push(LuaDocReturnInfo {
-            name: None,
-            type_ref: doc_return.clone(),
-            default_value: None,
-            description: None,
-            attributes: None,
-            return_kind: ReturnTypeKind::default(),
-        });
+        signature.return_filled_from_slot = true;
+        if slot_refresh {
+            if let Some(first) = signature.return_docs.first_mut() {
+                first.type_ref = doc_return.clone();
+            } else {
+                signature.return_docs.push(LuaDocReturnInfo {
+                    name: None,
+                    type_ref: doc_return.clone(),
+                    default_value: None,
+                    description: None,
+                    attributes: None,
+                    return_kind: ReturnTypeKind::default(),
+                });
+            }
+        } else {
+            signature.return_docs.clear();
+            signature.return_docs.push(LuaDocReturnInfo {
+                name: None,
+                type_ref: doc_return.clone(),
+                default_value: None,
+                description: None,
+                attributes: None,
+                return_kind: ReturnTypeKind::default(),
+            });
+        }
     }
     // A DocResolve install is a novel return fact for the signature's return
     // readers, routed through the return epoch like every other return write.
-    let return_changed =
-        signature.resolve_return != return_before.0 || signature.return_docs != return_before.1;
+    let return_changed = signature.resolve_return != return_before.0
+        || signature.return_docs != return_before.1
+        || signature.return_filled_from_slot != return_before.2;
     if params_changed {
         db.get_signature_index_mut().note_param_write(signature_id);
     }

@@ -1,7 +1,7 @@
 use rustc_hash::FxHashSet;
 
 use crate::{
-    CacheEntry, DbIndex, FileId, GlobalId, InFiled, InferFailReason, LuaMemberKey,
+    CacheEntry, DbIndex, FileId, GlobalId, InFiled, InferFailReason, LuaInferCache, LuaMemberKey,
     LuaSemanticDeclId, LuaSignatureId, LuaTypeCache, LuaTypeOwner, TypeOps,
     compilation::analyzer::{
         common::{
@@ -1232,13 +1232,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         }
 
         if let LuaTypeOwner::Member(member_id) = &type_owner
-            && ((analyzer.gmod_enabled
-                && matches!(
-                    expr,
-                    LuaExpr::CallExpr(_) | LuaExpr::IndexExpr(_) | LuaExpr::NameExpr(_)
-                )
-                && type_contains_nominal_reference(&expr_type))
-                || crate::compilation::analyzer::union_has_unsettled_arm(&expr_type))
+            && may_improve_after_resolve(expr)
         {
             analyzer
                 .context
@@ -1494,15 +1488,6 @@ fn declared_table_assignment_type(db: &crate::DbIndex, declared_type: &LuaType) 
                 })
             }),
         _ => None,
-    }
-}
-
-fn type_contains_nominal_reference(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Def(_) | LuaType::Ref(_) => true,
-        LuaType::Instance(instance) => type_contains_nominal_reference(instance.get_base()),
-        LuaType::Union(union) => union.types().any(type_contains_nominal_reference),
-        _ => false,
     }
 }
 
@@ -2319,11 +2304,35 @@ fn member_assignment_or_source_type(
     expr: &LuaExpr,
     fallback_type: LuaType,
 ) -> LuaType {
+    let cache = analyzer
+        .context
+        .infer_manager
+        .get_infer_cache(analyzer.file_id);
+    let merges_before = cache.sibling_merge_reads;
+    let result = member_assignment_or_source_type_with_cache(
+        analyzer.db,
+        cache,
+        analyzer.file_id,
+        type_owner,
+        expr,
+        fallback_type,
+    );
+    analyzer.sibling_merge_read = cache.sibling_merge_reads > merges_before;
+    result
+}
+
+pub(in crate::compilation::analyzer) fn member_assignment_or_source_type_with_cache(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    type_owner: &LuaTypeOwner,
+    expr: &LuaExpr,
+    fallback_type: LuaType,
+) -> LuaType {
     if !matches!(type_owner, LuaTypeOwner::Member(_)) {
         return fallback_type;
     }
-    let fallback_type =
-        widen_mutable_local_name_copy(analyzer.db, analyzer.file_id, expr, fallback_type);
+    let fallback_type = widen_mutable_local_name_copy(db, file_id, expr, fallback_type);
 
     let Some(arms) = top_level_or_expr_arms(expr) else {
         return fallback_type;
@@ -2335,7 +2344,7 @@ fn member_assignment_or_source_type(
 
     let mut source_type = None;
     for arm in non_final_arms {
-        let Ok(arm_type) = analyzer.infer_expr(arm) else {
+        let Ok(arm_type) = crate::infer_expr(db, cache, arm.clone()) else {
             return fallback_type;
         };
         if arm_type.is_unknown() || arm_type.is_any() {
@@ -2343,12 +2352,12 @@ fn member_assignment_or_source_type(
         }
         let arm_type = remove_false_or_nil(arm_type);
         source_type = Some(match source_type {
-            Some(current) => TypeOps::Union.apply(analyzer.db, &current, &arm_type),
+            Some(current) => TypeOps::Union.apply(db, &current, &arm_type),
             None => arm_type,
         });
     }
 
-    let Ok(last_type) = analyzer.infer_expr(last_arm) else {
+    let Ok(last_type) = crate::infer_expr(db, cache, last_arm.clone()) else {
         return fallback_type;
     };
     if last_type.is_unknown() || last_type.is_any() {
@@ -2356,9 +2365,13 @@ fn member_assignment_or_source_type(
     }
 
     match source_type {
-        Some(current) => TypeOps::Union.apply(analyzer.db, &current, &last_type),
+        Some(current) => TypeOps::Union.apply(db, &current, &last_type),
         None => fallback_type,
     }
+}
+
+pub(in crate::compilation::analyzer) fn is_top_level_or_expr(expr: &LuaExpr) -> bool {
+    top_level_or_expr_arms(expr).is_some()
 }
 
 fn top_level_or_expr_arms(expr: &LuaExpr) -> Option<Vec<LuaExpr>> {
@@ -2750,13 +2763,14 @@ fn guarded_table_bootstrap_range(
 /// those happened is a property of the batch, not of the source.
 pub(in crate::compilation::analyzer) fn resettle_guarded_table_bootstraps(
     db: &mut DbIndex,
-    candidates: Vec<LuaMemberId>,
-) {
+    candidates: &[LuaMemberId],
+) -> bool {
+    let mut moved = false;
     // Every writer of one slot resolves to the same canonical literal, so the
     // pick is made once per slot rather than once per writer.
     let mut by_slot: FxHashMap<(LuaMemberOwner, LuaMemberKey), Vec<LuaMemberId>> =
         FxHashMap::default();
-    for member_id in candidates {
+    for &member_id in candidates {
         let member_index = db.get_member_index();
         let Some(owner) = member_index.get_member_owner(&member_id).cloned() else {
             continue;
@@ -2778,38 +2792,75 @@ pub(in crate::compilation::analyzer) fn resettle_guarded_table_bootstraps(
             .min()
     });
 
-    for (_, mut members) in slots {
-        members.sort_by_key(|member_id| member_id_sort_key(*member_id));
-        members.dedup();
-        let Some(first) = members.first().copied() else {
-            continue;
-        };
-        let Some(canonical) = canonical_guarded_table_bootstrap_type(db, first, None) else {
-            continue;
-        };
-        // Every writer of the slot, not only the ones queued as candidates: the
-        // slot holds one table, so a writer left on its own literal forks the
-        // identity again, and whether it was queued depends on how far the walk
-        // had got when it ran.
-        let members =
-            guarded_table_assignment_member_ids_for_owner_key(db, first, None).unwrap_or(members);
-        for member_id in members {
-            let owner = LuaTypeOwner::Member(member_id);
-            if db
-                .get_type_index()
-                .get_type_cache(&owner)
-                .is_some_and(|cached| cached.is_doc() || cached.as_type() == &canonical)
-            {
-                continue;
+    for ((owner, key), _) in slots {
+        let current_writers = db
+            .get_member_index()
+            .get_current_owner_member_ids_for_key_unsorted(&owner, &key);
+        let mut guarded_writers = Vec::new();
+        let mut non_guarded_writers = Vec::new();
+        for writer_id in current_writers {
+            if is_guarded_table_assignment_member(db, writer_id) {
+                guarded_writers.push(writer_id);
+            } else {
+                non_guarded_writers.push(writer_id);
             }
-            write_type_cache(
-                db,
-                owner,
-                LuaTypeCache::InferType(canonical.clone()),
-                TypeCacheWriteMode::ForceOverwrite,
-            );
+        }
+
+        if guarded_writers.len() >= 2 && non_guarded_writers.is_empty() {
+            let min_guard = guarded_writers
+                .iter()
+                .copied()
+                .min_by_key(|id| member_id_sort_key(*id));
+            if let Some(min_guard) = min_guard {
+                if let Some(canonical) = guarded_table_bootstrap_member_type(db, min_guard, false) {
+                    for member_id in guarded_writers {
+                        let type_owner = LuaTypeOwner::Member(member_id);
+                        if db
+                            .get_type_index()
+                            .get_type_cache(&type_owner)
+                            .is_some_and(|cached| cached.is_doc() || cached.as_type() == &canonical)
+                        {
+                            continue;
+                        }
+                        write_type_cache(
+                            db,
+                            type_owner,
+                            LuaTypeCache::InferType(canonical.clone()),
+                            TypeCacheWriteMode::ForceOverwrite,
+                        );
+                        moved = true;
+                    }
+                }
+            }
+        } else {
+            for member_id in guarded_writers {
+                let Some(own_literal) = guarded_table_bootstrap_member_type(db, member_id, false)
+                else {
+                    continue;
+                };
+                let type_owner = LuaTypeOwner::Member(member_id);
+                let current = db.get_type_index().get_type_cache(&type_owner);
+                if let Some(cached) = current {
+                    if cached.is_doc() {
+                        continue;
+                    }
+                    if let LuaType::TableConst(_) = cached.as_type() {
+                        if cached.as_type() != &own_literal {
+                            write_type_cache(
+                                db,
+                                type_owner,
+                                LuaTypeCache::InferType(own_literal),
+                                TypeCacheWriteMode::ForceOverwrite,
+                            );
+                            moved = true;
+                        }
+                    }
+                }
+            }
         }
     }
+
+    moved
 }
 
 /// Per-`(owner, key)` memo for

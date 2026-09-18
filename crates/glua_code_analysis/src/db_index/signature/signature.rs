@@ -38,6 +38,11 @@ pub struct LuaSignature {
     /// filling the same slot must not inherit them, or its receiver would be
     /// whichever sibling the batch happened to resolve first.
     pub params_filled_from_slot: bool,
+    /// Whether `return_docs` was filled in from the slot this closure was
+    /// assigned into rather than from its own `@return` tags. Slot-filled
+    /// returns may be refreshed when the inherited contract settles; explicit
+    /// doc-tag returns may not.
+    pub return_filled_from_slot: bool,
     require_guard_param: Option<usize>,
     nil_return_guard_params: Vec<usize>,
     return_correlations: Vec<LuaReturnCorrelation>,
@@ -110,6 +115,7 @@ impl LuaSignature {
             nodiscard: None,
             is_vararg: false,
             params_filled_from_slot: false,
+            return_filled_from_slot: false,
             require_guard_param: None,
             nil_return_guard_params: Vec::new(),
             return_correlations: Vec::new(),

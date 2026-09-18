@@ -788,18 +788,61 @@ fn should_apply_resolved_return_docs(
         return false;
     }
 
-    if current_return.is_unknown() && new_return.is_any() {
-        return true; // Allow upgrading Unknown to Any
-    }
-
-    is_unsettled_inferred_return(&current_return) && !is_unsettled_inferred_return(&new_return)
+    inferred_return_improves(&current_return, &new_return)
 }
 
 /// An inferred return that says nothing yet. `never` belongs here: a function
 /// whose body returns an expression cannot return no value, so a `never`
 /// return is an operand that had not resolved when the body was read.
 pub(crate) fn is_unsettled_inferred_return(return_type: &LuaType) -> bool {
-    return_type.is_unknown() || return_type.is_any() || return_type.is_never()
+    match return_type {
+        LuaType::Unknown | LuaType::Any | LuaType::Never => true,
+        LuaType::Variadic(variadic) => match variadic.as_ref() {
+            VariadicType::Multi(types) => types.iter().any(is_unsettled_inferred_return),
+            VariadicType::Base(typ) => is_unsettled_inferred_return(typ),
+        },
+        // `T|nil` says as much as `T` does: a nullable wrapper around an
+        // unsettled slot is still an unsettled answer.
+        LuaType::Union(union) => union
+            .nullable_inner()
+            .is_some_and(is_unsettled_inferred_return),
+        _ => false,
+    }
+}
+
+fn inferred_return_improves(current: &LuaType, new: &LuaType) -> bool {
+    if current == new {
+        return false;
+    }
+    if current.is_unknown() && new.is_any() {
+        return true;
+    }
+    match (current, new) {
+        (LuaType::Unknown | LuaType::Any | LuaType::Never, LuaType::Union(union))
+            if union.nullable_inner() == Some(current) =>
+        {
+            true
+        }
+        (LuaType::Unknown | LuaType::Any | LuaType::Never, _) => !is_unsettled_inferred_return(new),
+        (LuaType::Variadic(current_variadic), LuaType::Variadic(new_variadic)) => {
+            match (current_variadic.as_ref(), new_variadic.as_ref()) {
+                (VariadicType::Multi(current_types), VariadicType::Multi(new_types)) => {
+                    current_types.len() == new_types.len()
+                        && current_types.iter().zip(new_types.iter()).all(
+                            |(current_slot, new_slot)| {
+                                current_slot == new_slot
+                                    || inferred_return_improves(current_slot, new_slot)
+                            },
+                        )
+                }
+                (VariadicType::Base(current_type), VariadicType::Base(new_type)) => {
+                    inferred_return_improves(current_type, new_type)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 fn return_docs_to_type(return_docs: &[LuaDocReturnInfo]) -> LuaType {
@@ -3512,5 +3555,64 @@ mod tests {
             baseline,
             "replaying a settled constructor call must not bump"
         );
+    }
+
+    fn variadic_multi(types: Vec<LuaType>) -> LuaType {
+        LuaType::Variadic(crate::VariadicType::Multi(types).into())
+    }
+
+    #[test]
+    fn unsettled_inferred_return_reaches_into_multi_slots() {
+        assert!(super::is_unsettled_inferred_return(&variadic_multi(vec![
+            LuaType::Unknown,
+            LuaType::Integer
+        ])));
+        assert!(!super::is_unsettled_inferred_return(&variadic_multi(vec![
+            LuaType::String,
+            LuaType::Integer
+        ])));
+    }
+
+    #[test]
+    fn inferred_return_improves_partial_multi_slots() {
+        assert!(super::inferred_return_improves(
+            &variadic_multi(vec![LuaType::Unknown, LuaType::Unknown]),
+            &variadic_multi(vec![LuaType::Unknown, LuaType::Integer])
+        ));
+    }
+
+    #[test]
+    fn inferred_return_rejects_regressing_slot() {
+        assert!(!super::inferred_return_improves(
+            &variadic_multi(vec![LuaType::String, LuaType::Unknown]),
+            &variadic_multi(vec![LuaType::Unknown, LuaType::Integer])
+        ));
+    }
+
+    #[test]
+    fn inferred_return_rejects_equal_multi() {
+        assert!(!super::inferred_return_improves(
+            &variadic_multi(vec![LuaType::Unknown, LuaType::Integer]),
+            &variadic_multi(vec![LuaType::Unknown, LuaType::Integer])
+        ));
+    }
+
+    #[test]
+    fn inferred_return_preserves_unknown_any_direction() {
+        assert!(super::inferred_return_improves(
+            &LuaType::Unknown,
+            &LuaType::Any
+        ));
+        assert!(!super::inferred_return_improves(
+            &LuaType::Any,
+            &LuaType::Unknown
+        ));
+        assert!(super::inferred_return_improves(
+            &LuaType::Unknown,
+            &LuaType::Union(Arc::new(LuaUnionType::from_vec(vec![
+                LuaType::Unknown,
+                LuaType::Nil,
+            ])))
+        ));
     }
 }

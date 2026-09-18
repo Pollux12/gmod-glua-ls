@@ -33,7 +33,7 @@ use crate::{
     LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDeclId, LuaTypeFact,
     LuaTypeOwner, LuaUnionType, WorkspaceId,
     compilation::analyzer::common::{TypeCacheWriteMode, write_type_cache},
-    db_index::{DbIndex, LuaMemberOwner},
+    db_index::{DbIndex, LuaMemberOwner, member_id_sort_key},
     profile::Profile,
     semantic::infer_expr_fact_with_cache,
 };
@@ -273,14 +273,6 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         context.force_finalized.clear();
 
         {
-            let _p = Profile::new("resettle_guarded_table_bootstraps");
-            lua::resettle_guarded_table_bootstraps(
-                db,
-                std::mem::take(&mut context.settled_guarded_bootstrap_candidates),
-            );
-        }
-
-        {
             // A guess from a local's uses is a fallback for a local inference
             // cannot type, so it is taken only once inference has finished:
             // taken earlier it stands in for an answer a later pass lands. It
@@ -333,6 +325,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             // from the exact post-round state, and `trip` bounds total rounds
             // as a pure hang guard.
             let mut fuse = common::FixpointFuse::with_state("settled_tail_fixpoint");
+            let mut guarded_bootstrap_candidates: Vec<LuaMemberId> = Vec::new();
             loop {
                 let _round = Profile::new("settled_tail_round");
                 if fuse.trip() {
@@ -361,7 +354,8 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                 let (_iter_moved, _iter_var_owners) =
                     rederive_settled_iter_vars(db, &mut context, moved_owners.as_ref());
                 let returns_moved = rederive_settled_inferred_returns(db, &mut context);
-                if returns_moved {
+                let parent_closures_moved = rederive_settled_parent_closures(db, &mut context);
+                if returns_moved || parent_closures_moved {
                     // Side effects only: this resolves the return targets the
                     // boundary snapshot covers, so the net diff below already
                     // sees the owners it moves.
@@ -409,17 +403,26 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                 );
                 let member_keys_moved =
                     refresh_settled_expr_type_member_keys(db, &mut context, moved_owners.as_ref());
+                guarded_bootstrap_candidates.extend(std::mem::take(
+                    &mut context.settled_guarded_bootstrap_candidates,
+                ));
+                guarded_bootstrap_candidates.sort_by_key(|id| member_id_sort_key(*id));
+                guarded_bootstrap_candidates.dedup();
+                let guarded_bootstraps_moved =
+                    lua::resettle_guarded_table_bootstraps(db, &guarded_bootstrap_candidates);
                 // Dynamic-field records, inferred signature returns, member
-                // owners, and member keys are not type-owner state, so the
-                // boundary fingerprint below cannot see them move. A recurring
-                // fingerprint amid that progress is continued convergence, not
-                // a cycle: forget the sightings instead of confirming an
-                // oscillation that never happened.
+                // owners, member keys, and guarded bootstraps are not
+                // type-owner state, so the boundary fingerprint below cannot
+                // see them move. A recurring fingerprint amid that progress is
+                // continued convergence, not a cycle: forget the sightings
+                // instead of confirming an oscillation that never happened.
                 let non_type_progressed = dynamic_fields_moved
                     || returns_moved
+                    || parent_closures_moved
                     || member_keys_moved
                     || owner_moved
-                    || attach_moved;
+                    || attach_moved
+                    || guarded_bootstraps_moved;
                 if non_type_progressed {
                     fuse.reset_boundary_sightings();
                 }
@@ -443,11 +446,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                 if net_moved.is_empty() && !non_type_progressed {
                     break;
                 }
-                moved_owners = if non_type_progressed {
-                    None
-                } else {
-                    Some(net_moved)
-                };
+                moved_owners = Some(net_moved);
             }
             context.settled_iter_var_candidates.clear();
             context.settled_global_read_candidates.clear();
@@ -459,6 +458,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             context.settled_assign_candidate_keys.clear();
             context.settled_pass_reads.clear();
             context.settled_assign_claims.clear();
+            context.settled_parent_closure_candidates.clear();
             context.settled_return_attempts.clear();
             context.settled_member_key_candidates = None;
             context.settled_owner_candidates = None;
@@ -683,6 +683,11 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
         }
         candidates.sort_by_key(|return_| (return_.file_id, return_.signature_id.get_position()));
         candidates.dedup_by(|left, right| left.signature_id == right.signature_id);
+        for candidate in &candidates {
+            context
+                .infer_manager
+                .clear_file_deferred_results(candidate.file_id);
+        }
 
         let attempted = candidates
             .iter()
@@ -694,6 +699,7 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
             .into_iter()
             .map(UnResolve::from)
             .collect::<Vec<_>>();
+        let mut settled_parent_closures = Vec::new();
         unresolve::settle_floored_fixpoint(
             db,
             &mut context.infer_manager,
@@ -701,8 +707,12 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
             &mut forced,
             &mut Vec::new(),
             &mut context.late_resolved_decls,
+            &mut settled_parent_closures,
             false,
         );
+        for candidate in settled_parent_closures {
+            context.add_settled_parent_closure_candidate(candidate);
+        }
         context.drain_inferred_return_reads();
         let version = settled_return_version(db);
         context
@@ -714,6 +724,66 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
         changed = true;
     }
     changed
+}
+
+/// Re-resolves parent-closure contracts installed while their source
+/// signature's return was still partially unsettled. The copy stamps
+/// `DocResolve`, which the ordinary return passes leave alone, so only the
+/// explicitly queued candidates are retried here; a candidate stays queued
+/// while the return it inherited is still partially unsettled.
+fn rederive_settled_parent_closures(db: &mut DbIndex, context: &mut AnalyzeContext) -> bool {
+    if context.settled_parent_closure_candidates.is_empty() {
+        return false;
+    }
+    let mut candidates = context.settled_parent_closure_candidates.clone();
+    candidates.sort_by_key(|candidate| (candidate.file_id, candidate.signature_id.get_position()));
+    candidates.dedup_by(|left, right| left.signature_id == right.signature_id);
+    let file_ids = candidates
+        .iter()
+        .map(|candidate| candidate.file_id)
+        .collect::<HashSet<_>>();
+    for file_id in file_ids {
+        context.infer_manager.clear_file_deferred_results(file_id);
+    }
+    let writes_before =
+        db.get_signature_index().return_writes() + db.get_signature_index().param_writes();
+    let mut kept = Vec::new();
+    for mut candidate in candidates {
+        let previously_seen = candidate.last_source_return.clone();
+        {
+            let cache = context.infer_manager.get_infer_cache(candidate.file_id);
+            let _ = unresolve::try_resolve_closure_parent_params(db, cache, &mut candidate);
+        }
+        // A candidate leaves the queue only once the source return is settled,
+        // unchanged since the last look, and mirrored by the copy. The source
+        // can move through slot values that read as settled (a transient
+        // `nil` slot), so a matching copy alone is not proof of convergence.
+        let source_return = candidate
+            .source_signature_id
+            .and_then(|id| db.get_signature_index().get(&id))
+            .map(|signature| signature.get_return_type());
+        let child_return = db
+            .get_signature_index()
+            .get(&candidate.signature_id)
+            .map(|signature| signature.get_return_type());
+        let still_pending = match &source_return {
+            Some(source_return) => {
+                unresolve::is_unsettled_inferred_return(source_return)
+                    || previously_seen.as_ref() != Some(source_return)
+                    || child_return.as_ref() != Some(source_return)
+            }
+            None => child_return
+                .as_ref()
+                .is_some_and(unresolve::is_unsettled_inferred_return),
+        };
+        if still_pending {
+            candidate.last_source_return = source_return;
+            kept.push(candidate);
+        }
+    }
+    context.settled_parent_closure_candidates = kept;
+    (db.get_signature_index().return_writes() + db.get_signature_index().param_writes())
+        != writes_before
 }
 
 /// The parallel re-derivation's per-file output: candidate type writes for the
@@ -1934,7 +2004,7 @@ fn settled_assign_sideways_committable(holder: bool, settled: &LuaType, cached: 
     {
         return false;
     }
-    if holder {
+    if holder && !settled_covers_cached_type(cached, settled) {
         return true;
     }
     if crate::db_index::is_undetermined_type(cached)
@@ -2621,6 +2691,7 @@ fn refresh_decl_initializer_caches(
                 && !cached_a_provisional_slot_union
                 && !cached_a_tpl_leak
                 && !is_settled_refinement
+                && !is_settled_widening
             {
                 continue;
             }
@@ -2632,7 +2703,14 @@ fn refresh_decl_initializer_caches(
                 // decided by arrival order. Canonicalize to `unknown`,
                 // which is the honest answer and is opaque to the checkers,
                 // so it neither silences a real report nor invents one.
-                if copies_settled_decl {
+                if copies_settled_decl
+                    || (pass.is_settled()
+                        && ret_idx == 0
+                        && inferred_type.is_nil()
+                        && current_cache
+                            .as_ref()
+                            .is_some_and(|current| current.as_type().is_unknown()))
+                {
                     result.updates.push(InitializerCacheUpdate::Overwrite {
                         owner: type_owner,
                         fact: inferred_fact,
@@ -3050,7 +3128,17 @@ fn refresh_member_initializer_caches(
             // read had not landed yet. See [`union_has_unsettled_arm`].
             let cached_an_unsettled_union =
                 pass.is_settled() && union_has_unsettled_arm(current_cache.as_type());
-            if !copies_settled_iter_var
+            let widens_top_level_or_literal = pass.is_settled()
+                && matches!(
+                    current_cache.as_type(),
+                    LuaType::IntegerConst(_)
+                        | LuaType::StringConst(_)
+                        | LuaType::BooleanConst(_)
+                        | LuaType::FloatConst(_)
+                )
+                && lua::is_top_level_or_expr(&expr);
+            if !widens_top_level_or_literal
+                && !copies_settled_iter_var
                 && !copies_settled_decl
                 && !widens_mutable_local_literal
                 && !reads_field_exist_guard
@@ -3085,6 +3173,25 @@ fn refresh_member_initializer_caches(
                     common::widen_mutable_local_name_copy(db, file_id, &expr, inferred_type)
                 }
             };
+            let inferred_type = lua::member_assignment_or_source_type_with_cache(
+                db,
+                &mut infer_cache,
+                file_id,
+                &type_owner,
+                &expr,
+                inferred_type,
+            );
+            if pass.is_settled() {
+                let takes_inferred_type = !widens_top_level_or_literal
+                    || settled_covers_cached_type(&inferred_type, current_cache.as_type());
+                if takes_inferred_type && current_cache.as_type() != &inferred_type {
+                    result.updates.push(InitializerCacheUpdate::Overwrite {
+                        owner: type_owner,
+                        fact: LuaTypeFact::certain(inferred_type),
+                    });
+                }
+                continue;
+            }
             let takes_inferred_type = if canonical_guarded_bootstrap.is_some()
                 || copies_settled_iter_var
                 || copies_settled_decl
@@ -3736,6 +3843,10 @@ pub struct AnalyzeContext {
     /// per file. See [`gmod::resolve_deferred_vgui_parent_calls`].
     deferred_vgui_parent_call_sites: HashMap<FileId, HashSet<LuaSyntaxId>>,
     call_site_return_invalidation_changed: bool,
+    /// Parent-closure items whose inherited contract was installed while the
+    /// source signature's return was still partially unsettled. Retried by
+    /// [`rederive_settled_parent_closures`].
+    settled_parent_closure_candidates: Vec<unresolve::UnResolveParentClosureParams>,
     pub workspace_id: Option<WorkspaceId>,
 }
 
@@ -3797,6 +3908,7 @@ impl AnalyzeContext {
             vgui_parent_fallback_files: HashSet::default(),
             deferred_vgui_parent_call_sites: HashMap::default(),
             call_site_return_invalidation_changed: false,
+            settled_parent_closure_candidates: Vec::new(),
             workspace_id: None,
         }
     }
@@ -4022,6 +4134,20 @@ impl AnalyzeContext {
 
     pub(crate) fn add_settled_member_attach_candidate(&mut self, candidate: InFiled<LuaSyntaxId>) {
         self.settled_member_attach_candidates.push(candidate);
+    }
+
+    fn add_settled_parent_closure_candidate(
+        &mut self,
+        candidate: unresolve::UnResolveParentClosureParams,
+    ) {
+        if self
+            .settled_parent_closure_candidates
+            .iter()
+            .any(|existing| existing.signature_id == candidate.signature_id)
+        {
+            return;
+        }
+        self.settled_parent_closure_candidates.push(candidate);
     }
 
     pub(crate) fn requeue_call_site_inferred_returns(

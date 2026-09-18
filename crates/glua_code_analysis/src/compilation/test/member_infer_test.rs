@@ -4637,6 +4637,7 @@ mod runtime_member_write_ownership {
 
 #[cfg(test)]
 mod multi_site_member_and_alias_inference {
+    use glua_parser::{LuaAstNode, LuaIndexKey, LuaVarExpr};
     use googletest::assert_that;
     use googletest::prelude::*;
     use lsp_types::NumberOrString;
@@ -4893,5 +4894,179 @@ PLUGIN.other_field = 123
         // the walk filed, the settled re-take converges instead of minting
         // a second key beside the first.
         assert_that!(collapsed_after.len(), le(collapsed_before.len()));
+    }
+
+    #[gtest]
+    fn settled_owner_attach_retries_member_write_on_ambiguous_owner_prefix() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![
+            (
+                "lua/weapons/cw_base/shared.lua",
+                r#"
+function SWEP:DrawHUD()
+    for _, value in pairs(self.Attachments) do
+        value.keyText = "x"
+    end
+end
+"#,
+            ),
+            (
+                "lua/weapons/cw_ak74/shared.lua",
+                r#"
+SWEP.Base = "cw_base"
+SWEP.Attachments = {[1] = {header = "Sight", atts = {"md_kobra", "md_eotech"}}}
+"#,
+            ),
+            (
+                "lua/weapons/cw_ar15/shared.lua",
+                r#"
+SWEP.Base = "cw_base"
+SWEP.Attachments = {[1] = {header = "Sight", offset = {800, -500}}}
+"#,
+            ),
+        ]);
+        let base_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/weapons/cw_base/shared.lua");
+        let base_file = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&base_uri)
+            .expect("base file must be indexed");
+
+        let key = LuaMemberKey::Name("keyText".into());
+        let member_owner = |ws: &VirtualWorkspace| -> Option<LuaMemberOwner> {
+            let member_index = ws.analysis.compilation.get_db().get_member_index();
+            let member_id = member_index
+                .get_file_members(base_file)
+                .into_iter()
+                .find(|member| member.get_key() == &key)
+                .map(|member| member.get_id())
+                .expect("keyText write must be indexed");
+            member_index.get_current_owner(&member_id).cloned()
+        };
+        let cold_owner = member_owner(&ws);
+        assert_that!(
+            cold_owner
+                .as_ref()
+                .is_some_and(|owner| !matches!(owner, LuaMemberOwner::LocalUnresolve)),
+            eq(true),
+            "keyText must have a real owner after the cold batch, got {cold_owner:?}"
+        );
+
+        ws.analysis.reindex_files_without_expansion(vec![base_file]);
+        assert_that!(member_owner(&ws), eq(&cold_owner));
+    }
+
+    #[test]
+    fn settled_parent_closure_refreshes_partially_unsettled_inherited_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![
+            (
+                "lua/weapons/cw_base/shared.lua",
+                r#"
+function SWEP:DrawHUD()
+    for _, value in pairs(self.Attachments) do
+        value.keyText = 5
+    end
+end
+
+function SWEP:GetSlotText()
+    for _, value in pairs(self.Attachments) do
+        return true, value.keyText
+    end
+end
+"#,
+            ),
+            (
+                "lua/weapons/cw_child/shared.lua",
+                r#"
+SWEP.Base = "cw_base"
+SWEP.Attachments = {[1] = {header = "Sight", atts = {"md_kobra"}}}
+function SWEP:GetSlotText()
+    return self:GetSlotText()
+end
+"#,
+            ),
+        ]);
+        let child_file = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(
+                &ws.virtual_url_generator
+                    .new_uri("lua/weapons/cw_child/shared.lua"),
+            )
+            .expect("child file must be indexed");
+        let base_file = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(
+                &ws.virtual_url_generator
+                    .new_uri("lua/weapons/cw_base/shared.lua"),
+            )
+            .expect("base file must be indexed");
+
+        let child_signature = |ws: &VirtualWorkspace| -> (bool, LuaType) {
+            let semantic_model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(child_file)
+                .expect("expected semantic model");
+            let closure = semantic_model
+                .get_root()
+                .descendants::<glua_parser::LuaFuncStat>()
+                .find(|stat| {
+                    matches!(
+                        stat.get_func_name(),
+                        Some(LuaVarExpr::IndexExpr(index_expr))
+                            if matches!(index_expr.get_index_key(), Some(LuaIndexKey::Name(name)) if name.get_name_text() == "GetSlotText")
+                    )
+                })
+                .and_then(|stat| stat.get_closure())
+                .expect("expected GetSlotText declaration");
+            let signature_id = crate::LuaSignatureId::from_closure(child_file, &closure);
+            let signature = ws
+                .analysis
+                .compilation
+                .get_db()
+                .get_signature_index()
+                .get(&signature_id)
+                .expect("expected GetSlotText signature");
+            (
+                signature.return_filled_from_slot,
+                signature.get_return_type(),
+            )
+        };
+
+        let (filled_from_slot, cold_return) = child_signature(&ws);
+        assert_that!(
+            filled_from_slot,
+            eq(true),
+            "inherited return must be marked slot-filled, got return {cold_return:?}"
+        );
+        let rendered = format!("{cold_return:?}");
+        assert!(
+            rendered.contains("IntegerConst(5)"),
+            "inherited return must contain the settled slot, got {rendered}"
+        );
+
+        ws.analysis.reindex_files_without_expansion(vec![base_file]);
+        let (filled_after, warm_return) = child_signature(&ws);
+        assert_that!(warm_return, eq(&cold_return));
+        assert_that!(filled_after, eq(filled_from_slot));
     }
 }

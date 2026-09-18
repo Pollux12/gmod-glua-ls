@@ -1667,6 +1667,9 @@ fn analyze_lambda_params(
                 file_id: analyzer.file_id,
                 signature_id: *signature_id,
                 parent_ast: UnResolveParentAst::LuaFuncStat(func_stat.clone()),
+                needs_settled_retry: false,
+                source_signature_id: None,
+                last_source_return: None,
             };
 
             analyzer
@@ -1678,6 +1681,9 @@ fn analyze_lambda_params(
                 file_id: analyzer.file_id,
                 signature_id: *signature_id,
                 parent_ast: UnResolveParentAst::LuaTableField(table_field.clone()),
+                needs_settled_retry: false,
+                source_signature_id: None,
+                last_source_return: None,
             };
 
             analyzer
@@ -1696,6 +1702,9 @@ fn analyze_lambda_params(
                 file_id: analyzer.file_id,
                 signature_id: *signature_id,
                 parent_ast: UnResolveParentAst::LuaAssignStat(assign_stat.clone()),
+                needs_settled_retry: false,
+                source_signature_id: None,
+                last_source_return: None,
             };
 
             analyzer

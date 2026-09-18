@@ -31,7 +31,8 @@ use stats::{
     analyze_local_stat, analyze_table_field, flush_pending_dynamic_key_collection_widenings,
 };
 pub(in crate::compilation::analyzer) use stats::{
-    canonical_guarded_table_bootstrap_type, resettle_guarded_table_bootstraps,
+    canonical_guarded_table_bootstrap_type, is_top_level_or_expr,
+    member_assignment_or_source_type_with_cache, resettle_guarded_table_bootstraps,
 };
 pub(crate) use stats::{
     dominating_guarded_table_bootstrap_range, is_guarded_table_definition_site,
