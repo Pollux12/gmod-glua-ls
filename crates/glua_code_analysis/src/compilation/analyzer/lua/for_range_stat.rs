@@ -297,9 +297,14 @@ fn substitute_unbound_iter_var_templates(
                         return typ;
                     }
                     degraded_unbound_tpl = true;
-                    match settled_overrides.get(idx) {
-                        Some(Some(fallback)) => fallback.clone(),
+                    let result = match settled_overrides.get(idx) {
+                        Some(Some(fallback)) if !fallback.contain_tpl() => fallback.clone(),
                         _ => degrade_unbound_iter_var_type(typ),
+                    };
+                    if result.contain_tpl() {
+                        LuaType::Unknown
+                    } else {
+                        result
                     }
                 })
                 .collect();
@@ -310,22 +315,34 @@ fn substitute_unbound_iter_var_templates(
                 return (VariadicType::Base(typ), false);
             }
             if let Some(Some(fallback)) = settled_overrides.first() {
-                return (VariadicType::Base(fallback.clone()), true);
+                if !fallback.contain_tpl() {
+                    return (VariadicType::Base(fallback.clone()), true);
+                }
             }
-            (VariadicType::Base(degrade_unbound_iter_var_type(typ)), true)
+            let degraded = degrade_unbound_iter_var_type(typ);
+            let final_type = if degraded.contain_tpl() {
+                LuaType::Unknown
+            } else {
+                degraded
+            };
+            (VariadicType::Base(final_type), true)
         }
     }
 }
 
 /// Degrade an unbound template placeholder to a real type: its declared
-/// constraint when one exists, else `Unknown`. Union arms that did bind
-/// survive; only the placeholder arms are dropped.
+/// constraint when one exists and is concrete, else `Unknown`. Union arms that
+/// did bind survive; only the placeholder arms are dropped.
 fn degrade_unbound_iter_var_type(typ: LuaType) -> LuaType {
-    match typ {
-        LuaType::TplRef(tpl) | LuaType::ConstTplRef(tpl) => {
-            tpl.get_constraint().cloned().unwrap_or(LuaType::Unknown)
-        }
-        LuaType::StrTplRef(tpl) => tpl.get_constraint().cloned().unwrap_or(LuaType::Unknown),
+    let degraded = match typ {
+        LuaType::TplRef(tpl) | LuaType::ConstTplRef(tpl) => match tpl.get_constraint() {
+            Some(constraint) if !constraint.contain_tpl() => constraint.clone(),
+            _ => LuaType::Unknown,
+        },
+        LuaType::StrTplRef(tpl) => match tpl.get_constraint() {
+            Some(constraint) if !constraint.contain_tpl() => constraint.clone(),
+            _ => LuaType::Unknown,
+        },
         LuaType::Union(union) => {
             let bound = union
                 .types()
@@ -338,7 +355,18 @@ fn degrade_unbound_iter_var_type(typ: LuaType) -> LuaType {
                 _ => LuaType::from_vec(bound),
             }
         }
-        typ => typ,
+        typ => {
+            if typ.contain_tpl() {
+                LuaType::Unknown
+            } else {
+                typ
+            }
+        }
+    };
+    if degraded.contain_tpl() {
+        LuaType::Unknown
+    } else {
+        degraded
     }
 }
 
@@ -361,7 +389,12 @@ fn compute_proven_settled_overrides(
     };
     (0..slot_count)
         .map(|idx| {
-            let want = GenericTplId::Func(idx as u32);
+            let slot_type = match types {
+                VariadicType::Multi(list) => list.get(idx),
+                VariadicType::Base(base) => Some(base),
+            };
+            let want = slot_type.and_then(find_tpl_id_in_type);
+            let want = want.unwrap_or(GenericTplId::Func(idx as u32));
             bindings.iter().find_map(|b| {
                 if b.id != want {
                     return None;
@@ -373,6 +406,21 @@ fn compute_proven_settled_overrides(
             })
         })
         .collect()
+}
+
+fn find_tpl_id_in_type(typ: &LuaType) -> Option<GenericTplId> {
+    match typ {
+        LuaType::TplRef(tpl) | LuaType::ConstTplRef(tpl) => Some(tpl.get_tpl_id()),
+        LuaType::StrTplRef(tpl) => Some(tpl.get_tpl_id()),
+        LuaType::Union(union) => union.types().find_map(find_tpl_id_in_type),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .find_map(|(typ, _)| find_tpl_id_in_type(typ)),
+        LuaType::Array(base) => find_tpl_id_in_type(base.get_base()),
+        LuaType::TableOf(inner) => find_tpl_id_in_type(inner),
+        _ => None,
+    }
 }
 
 fn try_infer_pairs_iter_types_from_table_members(
