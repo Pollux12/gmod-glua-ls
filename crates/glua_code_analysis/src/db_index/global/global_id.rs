@@ -23,9 +23,42 @@ impl Borrow<str> for GlobalId {
     }
 }
 
+/// Per-thread memo in front of `ArcIntern`'s shared pool, matching the
+/// `LuaTypeDeclId` constructors: global-name lookups intern per call, and the
+/// pool's SipHash + shard write-lock repeats for every repeat name. Capped;
+/// past the cap the pool is consulted directly — the cap bounds per-thread
+/// memory, not behavior.
+mod global_id_intern {
+    use super::GlobalId;
+    use rustc_hash::FxHashMap;
+    use smol_str::SmolStr;
+    use std::cell::RefCell;
+
+    const CAP: usize = 8192;
+
+    thread_local! {
+        static CACHE: RefCell<FxHashMap<SmolStr, GlobalId>> =
+            RefCell::new(FxHashMap::default());
+    }
+
+    pub fn intern(name: &str) -> GlobalId {
+        CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(id) = cache.get(name) {
+                return id.clone();
+            }
+            let id = GlobalId(internment::ArcIntern::new(SmolStr::new(name)));
+            if cache.len() < CAP {
+                cache.insert(SmolStr::new(name), id.clone());
+            }
+            id
+        })
+    }
+}
+
 impl GlobalId {
     pub fn new(name: &str) -> Self {
-        Self(ArcIntern::new(SmolStr::new(name)))
+        global_id_intern::intern(name)
     }
 
     pub fn get_name(&self) -> &str {

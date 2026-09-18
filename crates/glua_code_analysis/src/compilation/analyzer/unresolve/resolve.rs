@@ -8,7 +8,6 @@ use glua_parser::{
     BinaryOperator, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaLocalStat,
     LuaTableExpr, LuaTableField, PathTrait,
 };
-use internment::ArcIntern;
 use rowan::TextSize;
 
 use crate::{
@@ -47,7 +46,6 @@ use crate::{
         try_infer_expr_semantic_decl,
     },
 };
-use smol_str::SmolStr;
 
 use super::{
     CallSiteContributionKind, ResolveResult, UnResolveCallSiteContribution, UnResolveDecl,
@@ -2462,7 +2460,7 @@ fn extend_var_ref_id_with_path(
         Some(access_path) => format!("{}.{}", access_path, field_path.join(".")),
         None => field_path.join("."),
     };
-    let arc_path = ArcIntern::from(SmolStr::new(&full_path));
+    let arc_path = crate::db_index::intern_smol_str(&full_path);
     match var_ref_id {
         VarRefId::VarRef(decl_id) => {
             Some(VarRefId::IndexRef(VarRefRootId::Decl(decl_id), arc_path))

@@ -352,7 +352,7 @@ fn get_call_expr_var_ref_id(
 
             Some(VarRefId::IndexRef(
                 root,
-                ArcIntern::new(SmolStr::new(access_path)),
+                crate::db_index::intern_smol_str(&access_path),
             ))
         }
         _ => None,

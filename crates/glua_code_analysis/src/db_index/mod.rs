@@ -11,6 +11,7 @@ mod gmod_class;
 mod gmod_infer;
 mod gmod_load;
 mod gmod_network;
+mod intern;
 mod member;
 mod metatable;
 mod module;
@@ -23,6 +24,7 @@ mod semantic_decl;
 mod signature;
 mod traits;
 mod r#type;
+pub(crate) use intern::intern_smol_str;
 pub(crate) use r#type::read_set;
 
 use rustc_hash::{FxHashMap, FxHashSet};

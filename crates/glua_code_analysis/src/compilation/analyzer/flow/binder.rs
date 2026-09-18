@@ -142,9 +142,9 @@ impl<'a> FlowBinder<'a> {
     }
 
     pub fn create_name_label(&mut self, name: &str, closure_id: LuaClosureId) -> FlowId {
-        let label_id = self.create_node(FlowNodeKind::NamedLabel(ArcIntern::from(SmolStr::new(
-            name,
-        ))));
+        let label_id = self.create_node(FlowNodeKind::NamedLabel(
+            crate::db_index::intern_smol_str(name),
+        ));
         self.labels
             .entry(closure_id)
             .or_default()
@@ -316,7 +316,7 @@ impl<'a> FlowBinder<'a> {
     /// Record a bare name that can be narrowed at some site (assignment target,
     /// cast, or condition expression).
     pub fn record_narrowable_name(&mut self, name: &str) {
-        let name = ArcIntern::from(SmolStr::new(name));
+        let name = crate::db_index::intern_smol_str(name);
         self.narrowing_capability
             .referenced_names
             .insert(name.clone());
@@ -325,7 +325,7 @@ impl<'a> FlowBinder<'a> {
 
     /// Record an index access path that can be narrowed.
     pub fn record_narrowable_index_path(&mut self, path: &str) {
-        let path = ArcIntern::from(SmolStr::new(path));
+        let path = crate::db_index::intern_smol_str(path);
         self.narrowing_capability
             .referenced_index_paths
             .insert(path.clone());

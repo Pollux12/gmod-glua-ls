@@ -362,17 +362,75 @@ pub struct LuaTypeDeclId {
     id: ArcIntern<LuaTypeIdentifier>,
 }
 
+/// Per-thread memo in front of `ArcIntern`'s shared pool. Every type-name
+/// lookup constructs an id, and `ArcIntern::new` pays a SipHash string hash
+/// plus a shard write-lock on each call; the same handful of names dominate
+/// any corpus, so a bounded per-thread map takes the hit once per name per
+/// worker instead. Capped: past the cap the pool is consulted directly, which
+/// is correct but uncached — the cap bounds per-thread memory, not behavior.
+mod decl_id_intern {
+    use super::{FileId, LuaTypeDeclId};
+    use rustc_hash::FxHashMap;
+    use smol_str::SmolStr;
+    use std::cell::RefCell;
+
+    const CAP: usize = 8192;
+
+    thread_local! {
+        static GLOBAL: RefCell<FxHashMap<SmolStr, LuaTypeDeclId>> =
+            RefCell::new(FxHashMap::default());
+        static LOCAL: RefCell<FxHashMap<(FileId, SmolStr), LuaTypeDeclId>> =
+            RefCell::new(FxHashMap::default());
+    }
+
+    pub fn global(name: &str) -> LuaTypeDeclId {
+        GLOBAL.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(id) = cache.get(name) {
+                return id.clone();
+            }
+            let id = LuaTypeDeclId::interned_global(name);
+            if cache.len() < CAP {
+                cache.insert(SmolStr::new(name), id.clone());
+            }
+            id
+        })
+    }
+
+    pub fn local(file_id: FileId, name: &str) -> LuaTypeDeclId {
+        LOCAL.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(id) = cache.get(&(file_id, SmolStr::new(name))) {
+                return id.clone();
+            }
+            let id = LuaTypeDeclId::interned_local(file_id, name);
+            if cache.len() < CAP {
+                cache.insert((file_id, SmolStr::new(name)), id.clone());
+            }
+            id
+        })
+    }
+}
+
 impl LuaTypeDeclId {
-    pub fn global(str: &str) -> Self {
+    fn interned_global(str: &str) -> Self {
         Self {
             id: ArcIntern::new(LuaTypeIdentifier::Global(SmolStr::new(str))),
         }
     }
 
-    pub fn local(file_id: FileId, str: &str) -> Self {
+    fn interned_local(file_id: FileId, str: &str) -> Self {
         Self {
             id: ArcIntern::new(LuaTypeIdentifier::Local(file_id, SmolStr::new(str))),
         }
+    }
+
+    pub fn global(str: &str) -> Self {
+        decl_id_intern::global(str)
+    }
+
+    pub fn local(file_id: FileId, str: &str) -> Self {
+        decl_id_intern::local(file_id, str)
     }
 
     pub fn get_id(&self) -> &LuaTypeIdentifier {

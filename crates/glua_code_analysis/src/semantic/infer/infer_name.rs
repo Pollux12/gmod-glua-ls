@@ -943,7 +943,7 @@ pub fn get_name_expr_var_ref_id(
                 VarRefId::VarRef(global_decl_id)
             } else {
                 VarRefId::GlobalName(
-                    internment::ArcIntern::new(smol_str::SmolStr::new(name)),
+                    crate::db_index::intern_smol_str(name),
                     name_expr.get_position(),
                 )
             }

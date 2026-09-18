@@ -8,7 +8,6 @@ use glua_parser::{
     LuaDocUnaryType, LuaDocVariadicType, LuaLiteralToken, LuaSyntaxKind, LuaTypeBinaryOperator,
     LuaTypeUnaryOperator, LuaVarExpr, NumberResult,
 };
-use internment::ArcIntern;
 use rowan::TextRange;
 use smol_str::SmolStr;
 
@@ -125,7 +124,7 @@ pub fn infer_type(analyzer: &mut DocAnalyzer, node: LuaDocType) -> LuaType {
         }
         LuaDocType::Infer(infer_type) => {
             if let Some(name) = infer_type.get_generic_decl_name_text() {
-                return LuaType::ConditionalInfer(ArcIntern::new(SmolStr::new(&name)));
+                return LuaType::ConditionalInfer(crate::db_index::intern_smol_str(&name));
             }
         }
         LuaDocType::Mapped(mapped_type) => {

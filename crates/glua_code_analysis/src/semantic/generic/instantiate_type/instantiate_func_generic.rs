@@ -5,7 +5,6 @@ use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaChunk, LuaDocTypeList, LuaExpr, LuaLiteralToken, LuaNameExpr,
     LuaSyntaxId,
 };
-use internment::ArcIntern;
 use smol_str::SmolStr;
 
 use crate::db_index::find_best_direct_call_arg_role_from_type;
@@ -732,7 +731,7 @@ pub fn build_self_type(db: &DbIndex, self_type: &LuaType) -> LuaType {
                     } else {
                         params.push(LuaType::TplRef(Arc::new(GenericTpl::new(
                             GenericTplId::Type(i as u32),
-                            ArcIntern::new(generic_param.name.clone()),
+                            crate::db_index::intern_smol_str(&generic_param.name),
                             None,
                         ))));
                     }

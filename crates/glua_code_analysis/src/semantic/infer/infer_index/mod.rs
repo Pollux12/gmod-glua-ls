@@ -5,7 +5,6 @@ use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaExpr, LuaForStat, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr,
     LuaLocalStat, LuaNameExpr, NumberResult, PathTrait,
 };
-use internment::ArcIntern;
 use rowan::{TextRange, TextSize};
 use rustc_hash::FxHashSet;
 use smol_str::SmolStr;
@@ -354,7 +353,7 @@ pub fn get_index_expr_var_ref_id(
         };
 
         let path = index_expr.get_access_path()?;
-        let access_path = ArcIntern::new(SmolStr::new(&path));
+        let access_path = crate::db_index::intern_smol_str(&path);
         let var_ref_id = VarRefId::IndexRef(root, access_path);
         cache
             .expr_var_ref_id_cache

@@ -178,7 +178,7 @@ fn collect_assignment_flow_info(binder: &FlowBinder, vars: &[LuaVarExpr]) -> Ass
 }
 
 fn push_assignment_index_path(info: &mut AssignmentFlowInfo, path: smol_str::SmolStr) {
-    let path = internment::ArcIntern::from(path);
+    let path = crate::db_index::intern_smol_str(&path);
     if !info.index_paths.contains(&path) {
         info.index_paths.push(path);
     }
