@@ -1,8 +1,8 @@
 mod export;
 
 use glua_parser::{
-    LuaAstNode, LuaAstToken, LuaBlock, LuaClosureExpr, LuaFuncStat, LuaGeneralToken, LuaIndexExpr,
-    LuaSyntaxToken, LuaVarExpr, VisibilityKind,
+    LuaAstNode, LuaAstToken, LuaBlock, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaGeneralToken,
+    LuaIndexExpr, LuaSyntaxToken, LuaVarExpr, VisibilityKind,
 };
 
 use crate::{
@@ -164,14 +164,14 @@ fn check_block_visibility(
 fn check_def_visibility(
     db: &DbIndex,
     infer_config: &mut LuaInferCache,
-    _file_id: FileId,
+    file_id: FileId,
     member_owner: &LuaMemberOwner,
     token: LuaGeneralToken,
     visibility: VisibilityKind,
 ) -> Option<bool> {
     let index_expr = token.get_parent::<LuaIndexExpr>()?;
     let prefix_expr = index_expr.get_prefix_expr()?;
-    let typ = infer_expr(db, infer_config, prefix_expr).ok()?;
+    let typ = infer_expr(db, infer_config, prefix_expr.clone()).ok()?;
 
     // 这是为解决 require 后仍然是`Def`类型的问题, 但现在不需要了, 不过还是留着以防万一
     // if !in_def_file(db, &typ, file_id) {
@@ -186,7 +186,18 @@ fn check_def_visibility(
             _ => Some(false),
         },
         VisibilityKind::Private => match (typ, member_owner) {
-            (LuaType::Def(left), LuaMemberOwner::Type(right)) => Some(left == *right),
+            (LuaType::Def(left), LuaMemberOwner::Type(right)) => Some(
+                left == *right
+                    && (!expr_root_is_local(db, file_id, &prefix_expr)
+                        || db
+                            .get_type_index()
+                            .get_type_decl(&left)
+                            .is_some_and(|decl| {
+                                decl.get_locations()
+                                    .iter()
+                                    .any(|location| location.file_id == file_id)
+                            })),
+            ),
             (LuaType::TableConst(left), _) => Some(
                 db.get_member_index()
                     .canonical_owner(LuaMemberOwner::Element(left))
@@ -196,6 +207,21 @@ fn check_def_visibility(
         },
         _ => None,
     }
+}
+
+fn expr_root_is_local(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> bool {
+    let name = match expr {
+        LuaExpr::NameExpr(name) => name.clone(),
+        LuaExpr::IndexExpr(index) => match index.get_prefix_expr() {
+            Some(prefix) => return expr_root_is_local(db, file_id, &prefix),
+            None => return false,
+        },
+        _ => return false,
+    };
+    db.get_reference_index()
+        .get_var_reference_decl(&file_id, name.get_range())
+        .and_then(|id| db.get_decl_index().get_decl(&id))
+        .is_some_and(|decl| decl.is_local())
 }
 
 // fn in_def_file(db: &DbIndex, typ: &LuaType, file_id: FileId) -> bool {
