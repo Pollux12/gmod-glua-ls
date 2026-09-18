@@ -339,33 +339,48 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                 // continuation, dependent queueing, and the next round's
                 // read-set filter all see only owners whose cached type
                 // actually differs across the round boundary.
-                let boundary_before = snapshot_settled_tail_boundary(db, &context);
-                let global_owners =
-                    rederive_settled_global_reads(db, &mut context, moved_owners.as_ref());
+                let boundary_before = crate::profile::phase("tail:snapshot_boundary", || {
+                    snapshot_settled_tail_boundary(db, &context)
+                });
+                let global_owners = crate::profile::phase("tail:global_reads", || {
+                    rederive_settled_global_reads(db, &mut context, moved_owners.as_ref())
+                });
                 // Runs inside the loop: the records it adds are read by the
                 // iterated-table answers below, and its own prefixes read the
                 // loop variables those answers settle — each direction needs
                 // the other's previous round.
-                let dynamic_fields_moved = dynamic_field::rederive_settled_dynamic_fields(
-                    db,
-                    &mut context,
-                    moved_owners.as_ref(),
-                );
+                let dynamic_fields_moved = crate::profile::phase("tail:dynamic_fields", || {
+                    dynamic_field::rederive_settled_dynamic_fields(
+                        db,
+                        &mut context,
+                        moved_owners.as_ref(),
+                    )
+                });
                 let (_iter_moved, _iter_var_owners) =
-                    rederive_settled_iter_vars(db, &mut context, moved_owners.as_ref());
-                let returns_moved = rederive_settled_inferred_returns(db, &mut context);
-                let parent_closures_moved = rederive_settled_parent_closures(db, &mut context);
+                    crate::profile::phase("tail:iter_vars", || {
+                        rederive_settled_iter_vars(db, &mut context, moved_owners.as_ref())
+                    });
+                let returns_moved = crate::profile::phase("tail:inferred_returns", || {
+                    rederive_settled_inferred_returns(db, &mut context)
+                });
+                let parent_closures_moved = crate::profile::phase("tail:parent_closures", || {
+                    rederive_settled_parent_closures(db, &mut context)
+                });
                 if returns_moved || parent_closures_moved {
                     // Side effects only: this resolves the return targets the
                     // boundary snapshot covers, so the net diff below already
                     // sees the owners it moves.
-                    context.resolve_call_site_return_consumers(db);
+                    crate::profile::phase("tail:call_site_consumers", || {
+                        context.resolve_call_site_return_consumers(db)
+                    });
                 }
                 // Assignments onto locals that read a decl the passes above
                 // just moved (`selected = key` after the loop variable
                 // settled): re-derived through the same source-order claim a
                 // direct commit would have applied.
-                let _assign_owners = rederive_settled_assign_reads(db, &mut context);
+                let _assign_owners = crate::profile::phase("tail:assign_reads", || {
+                    rederive_settled_assign_reads(db, &mut context)
+                });
                 // Everything that read a loop variable resolved while it still
                 // held the answer the partial map gave, so moving one means
                 // re-reading the initializers that could still take a better
@@ -376,8 +391,9 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                     owners.extend(global_owners.iter().cloned());
                     owners
                 });
-                let _initializer_owners =
-                    refresh_settled_initializer_caches(db, &mut context, refresh_owners.as_ref());
+                let _initializer_owners = crate::profile::phase("tail:initializer_caches", || {
+                    refresh_settled_initializer_caches(db, &mut context, refresh_owners.as_ref())
+                });
                 // The queued member attaches read the same settled types the
                 // passes above refine: a prefix local typed by a call's
                 // inferred return stays unresolved until that return lands,
@@ -386,30 +402,40 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                 // this is the dependency edge from an inferred return to the
                 // member write waiting on it. Placed candidates drop out;
                 // failures stay for the next round.
-                let attach_moved = attach_settled_index_expr_members(db, &mut context);
+                let attach_moved = crate::profile::phase("tail:attach_members", || {
+                    attach_settled_index_expr_members(db, &mut context)
+                });
                 // The net boundary diff: owners whose cached type actually
                 // differs across this round. Mid-round ping-pong cancels here.
-                let net_moved = diff_settled_tail_boundary(db, &boundary_before);
-                queue_settled_decl_dependents(db, &mut context, &net_moved);
+                let net_moved = crate::profile::phase("tail:diff_boundary", || {
+                    diff_settled_tail_boundary(db, &boundary_before)
+                });
+                crate::profile::phase("tail:queue_dependents", || {
+                    queue_settled_decl_dependents(db, &mut context, &net_moved)
+                });
                 // Owner placements read the same settled types as the passes
                 // above (prefix types through loop variables, globals, and
                 // narrowed members), so they re-derive after them and before
                 // the key re-take below: a moved owner re-homes the member
                 // whose key is then re-minted.
-                let owner_moved = owner_settle::rederive_settled_index_expr_owners(
-                    db,
-                    &mut context,
-                    moved_owners.as_ref(),
-                );
-                let member_keys_moved =
-                    refresh_settled_expr_type_member_keys(db, &mut context, moved_owners.as_ref());
+                let owner_moved = crate::profile::phase("tail:index_expr_owners", || {
+                    owner_settle::rederive_settled_index_expr_owners(
+                        db,
+                        &mut context,
+                        moved_owners.as_ref(),
+                    )
+                });
+                let member_keys_moved = crate::profile::phase("tail:member_keys", || {
+                    refresh_settled_expr_type_member_keys(db, &mut context, moved_owners.as_ref())
+                });
                 guarded_bootstrap_candidates.extend(std::mem::take(
                     &mut context.settled_guarded_bootstrap_candidates,
                 ));
                 guarded_bootstrap_candidates.sort_by_key(|id| member_id_sort_key(*id));
                 guarded_bootstrap_candidates.dedup();
-                let guarded_bootstraps_moved =
-                    lua::resettle_guarded_table_bootstraps(db, &guarded_bootstrap_candidates);
+                let guarded_bootstraps_moved = crate::profile::phase("tail:bootstraps", || {
+                    lua::resettle_guarded_table_bootstraps(db, &guarded_bootstrap_candidates)
+                });
                 // Dynamic-field records, inferred signature returns, member
                 // owners, member keys, and guarded bootstraps are not
                 // type-owner state, so the boundary fingerprint below cannot
@@ -434,7 +460,9 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                     // round and must not break the loop. The fingerprint is
                     // only a lookup accelerator; the fuse confirms exact
                     // canonical-state equality on a repeat sighting.
-                    let canonical = canonical_settled_tail_state(db, &context);
+                    let canonical = crate::profile::phase("tail:canonical_state", || {
+                        canonical_settled_tail_state(db, &context)
+                    });
                     if fuse.observe_boundary(
                         fingerprint_settled_tail_state(&canonical),
                         false,
@@ -448,6 +476,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                 }
                 moved_owners = Some(net_moved);
             }
+            crate::profile::phase_report("settled_tail");
             context.settled_iter_var_candidates.clear();
             context.settled_global_read_candidates.clear();
             context.settled_multi_decl_global_read_candidates.clear();
@@ -639,17 +668,12 @@ fn requeue_force_finalized(db: &mut DbIndex, context: &mut AnalyzeContext) {
     run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, context);
 }
 
-// Unsettled results can depend on facts absent from their partial read records.
-fn settled_return_version(db: &DbIndex) -> (u64, u64, u64, u64) {
-    (
-        db.type_structure_revision(),
-        db.get_flow_index().special_call_writes(),
-        db.get_dynamic_field_index().dynamic_writes(),
-        db.get_call_site_param_index().contrib_writes(),
-    )
-}
-
 /// Re-resolves body-inferred returns after every type and member input settles.
+///
+/// A candidate re-derives when its recorded read set went stale, plus one
+/// guaranteed attempt while its return is still unsettled: the walk-time
+/// record can predate the dynamic-field index becoming visible, so reads it
+/// could not make then only enter the record on the next derivation.
 fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeContext) -> bool {
     let mut changed = false;
     let mut fuse = common::FixpointFuse::new("rederive_settled_inferred_returns");
@@ -658,7 +682,6 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
             break;
         }
         context.drain_inferred_return_reads();
-        let version = settled_return_version(db);
         let mut candidates = context
             .inferred_return_candidates
             .iter()
@@ -667,8 +690,9 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
                     .get(&return_.signature_id)
                     .is_some_and(|signature| {
                         signature.resolve_return == crate::SignatureReturnStatus::InferResolve
-                            && ((context.settled_return_attempts.get(&return_.signature_id)
-                                != Some(&version)
+                            && ((!context
+                                .settled_return_attempts
+                                .contains(&return_.signature_id)
                                 && unresolve::is_unsettled_inferred_return(
                                     &signature.get_return_type(),
                                 ))
@@ -714,10 +738,7 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
             context.add_settled_parent_closure_candidate(candidate);
         }
         context.drain_inferred_return_reads();
-        let version = settled_return_version(db);
-        context
-            .settled_return_attempts
-            .extend(attempted.into_iter().map(|id| (id, version)));
+        context.settled_return_attempts.extend(attempted);
         if db.get_signature_index().return_writes() == writes_before {
             break;
         }
@@ -853,7 +874,12 @@ fn rederive_settled_iter_vars(
     moved_owners: Option<&HashSet<LuaTypeOwner>>,
 ) -> (bool, HashSet<LuaTypeOwner>) {
     let read_pass = SettledReadPass::Iter;
-    let candidate_count = context.settled_iter_var_candidates.len();
+    // Per-file candidate counts: a new candidate arriving for one file must
+    // not re-derive every other file's recorded reads.
+    let mut file_candidate_counts = HashMap::<FileId, usize>::default();
+    for candidate in &context.settled_iter_var_candidates {
+        *file_candidate_counts.entry(candidate.file_id).or_default() += 1;
+    }
     let read_version = crate::db_index::read_set::InferenceReadVersion::capture(db);
     // Kept, not taken: the settled tail runs to a fixpoint and each round
     // re-derives the same candidates against what the previous one landed.
@@ -866,7 +892,7 @@ fn rederive_settled_iter_vars(
                 context.settled_pass_reads_stale(
                     db,
                     read_pass,
-                    candidate_count,
+                    file_candidate_counts[&candidate.file_id],
                     candidate.file_id,
                     moved_owners,
                 )
@@ -961,7 +987,7 @@ fn rederive_settled_iter_vars(
         context.record_settled_pass_reads(
             read_pass,
             result.file_id,
-            candidate_count,
+            file_candidate_counts[&result.file_id],
             read_version,
             result.reads,
         );
@@ -1072,14 +1098,27 @@ fn refresh_settled_expr_type_member_keys(
     let Some((_, candidates)) = context.settled_member_key_candidates.as_ref() else {
         return false;
     };
+    // Per-file candidate counts: a candidate arriving for one file must not
+    // re-derive every other file's recorded reads.
+    let file_candidate_counts: HashMap<FileId, usize> = candidates
+        .iter()
+        .map(|(file_id, members)| (*file_id, members.len()))
+        .collect();
     let mut file_ids = candidates.keys().copied().collect::<Vec<_>>();
     if file_ids.is_empty() {
         return false;
     }
     file_ids.sort_unstable();
-    // Revisit files when a recorded fact or the candidate set changes.
+    // Revisit files when a recorded fact or the file's own candidate count
+    // changes; unrelated files' candidates no longer force a re-derivation.
     file_ids.retain(|file_id| {
-        context.settled_pass_reads_stale(db, read_pass, candidate_count, *file_id, moved_owners)
+        context.settled_pass_reads_stale(
+            db,
+            read_pass,
+            file_candidate_counts[file_id],
+            *file_id,
+            moved_owners,
+        )
     });
     if file_ids.is_empty() {
         return false;
@@ -1173,7 +1212,13 @@ fn refresh_settled_expr_type_member_keys(
 
     let mut moved = false;
     for (file_id, updates, reads) in results {
-        context.record_settled_pass_reads(read_pass, file_id, candidate_count, read_version, reads);
+        context.record_settled_pass_reads(
+            read_pass,
+            file_id,
+            file_candidate_counts[&file_id],
+            read_version,
+            reads,
+        );
         for (member_id, settled_key) in updates {
             if db
                 .get_member_index_mut()
@@ -1201,8 +1246,16 @@ fn rederive_settled_global_reads(
     moved_owners: Option<&HashSet<LuaTypeOwner>>,
 ) -> HashSet<LuaTypeOwner> {
     let read_pass = SettledReadPass::Global;
-    let candidate_count = context.settled_global_read_candidates.len()
-        + context.settled_multi_decl_global_read_candidates.len();
+    // Per-file candidate counts across both read sets: a new candidate
+    // arriving for one file must not re-derive every other file's reads.
+    let mut file_candidate_counts = HashMap::<FileId, usize>::default();
+    for (decl_id, _) in context
+        .settled_global_read_candidates
+        .iter()
+        .chain(context.settled_multi_decl_global_read_candidates.iter())
+    {
+        *file_candidate_counts.entry(decl_id.file_id).or_default() += 1;
+    }
     let read_version = crate::db_index::read_set::InferenceReadVersion::capture(db);
     let mut stale_files = HashMap::<FileId, bool>::default();
     let standard = context
@@ -1213,7 +1266,7 @@ fn rederive_settled_global_reads(
                 context.settled_pass_reads_stale(
                     db,
                     read_pass,
-                    candidate_count,
+                    file_candidate_counts[&decl_id.file_id],
                     decl_id.file_id,
                     moved_owners,
                 )
@@ -1229,7 +1282,7 @@ fn rederive_settled_global_reads(
                 context.settled_pass_reads_stale(
                     db,
                     read_pass,
-                    candidate_count,
+                    file_candidate_counts[&decl_id.file_id],
                     decl_id.file_id,
                     moved_owners,
                 )
@@ -1354,7 +1407,13 @@ fn rederive_settled_global_reads(
                 .filter(|owner| owner.get_file_id() == file_id)
                 .cloned(),
         );
-        context.record_settled_pass_reads(read_pass, file_id, candidate_count, read_version, reads);
+        context.record_settled_pass_reads(
+            read_pass,
+            file_id,
+            file_candidate_counts[&file_id],
+            read_version,
+            reads,
+        );
     }
     let moved = before
         .into_iter()
@@ -1637,7 +1696,12 @@ fn rederive_settled_assign_reads(
     context: &mut AnalyzeContext,
 ) -> HashSet<LuaTypeOwner> {
     let read_pass = SettledReadPass::Assign;
-    let candidate_count = context.settled_assign_candidates.len();
+    // Per-file candidate counts: a new candidate arriving for one file must
+    // not re-derive every other file's recorded reads.
+    let mut file_candidate_counts = HashMap::<FileId, usize>::default();
+    for (decl_id, _, _) in &context.settled_assign_candidates {
+        *file_candidate_counts.entry(decl_id.file_id).or_default() += 1;
+    }
     let read_version = crate::db_index::read_set::InferenceReadVersion::capture(db);
     let unchanged = HashSet::default();
     let mut stale_files = HashMap::<FileId, bool>::default();
@@ -1651,7 +1715,7 @@ fn rederive_settled_assign_reads(
             context.settled_pass_reads_stale(
                 db,
                 read_pass,
-                candidate_count,
+                file_candidate_counts[&decl_id.file_id],
                 decl_id.file_id,
                 Some(&unchanged),
             )
@@ -1819,7 +1883,7 @@ fn rederive_settled_assign_reads(
         context.record_settled_pass_reads(
             read_pass,
             result.file_id,
-            candidate_count,
+            file_candidate_counts[&result.file_id],
             read_version,
             result.reads,
         );
@@ -2454,7 +2518,6 @@ fn refresh_decl_initializer_caches(
     decl_copies: &HashSet<LuaTypeOwner>,
 ) -> HashSet<LuaTypeOwner> {
     let read_pass = SettledReadPass::Decl;
-    let candidate_count = context.settled_decl_initializer_candidates.len();
     let read_version = crate::db_index::read_set::InferenceReadVersion::capture(db);
     if context.settled_decl_initializer_candidates.is_empty() {
         return HashSet::default();
@@ -2472,10 +2535,17 @@ fn refresh_decl_initializer_caches(
     }
     let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
     file_ids.retain(|file_id| {
-        context.settled_pass_reads_stale(db, read_pass, candidate_count, *file_id, pass.moved())
-            || candidates_by_file[file_id]
-                .iter()
-                .any(|decl_id| decl_copies.contains(&LuaTypeOwner::Decl(*decl_id)))
+        // The file's own candidate count, not the workspace total: a new
+        // candidate elsewhere must not re-derive this file's recorded reads.
+        context.settled_pass_reads_stale(
+            db,
+            read_pass,
+            candidates_by_file[file_id].len(),
+            *file_id,
+            pass.moved(),
+        ) || candidates_by_file[file_id]
+            .iter()
+            .any(|decl_id| decl_copies.contains(&LuaTypeOwner::Decl(*decl_id)))
     });
     file_ids.sort();
     if file_ids.is_empty() {
@@ -2847,7 +2917,7 @@ fn refresh_decl_initializer_caches(
         context.record_settled_pass_reads(
             read_pass,
             result.file_id,
-            candidate_count,
+            candidates_by_file[&result.file_id].len(),
             read_version,
             result.reads,
         );
@@ -3022,9 +3092,6 @@ fn refresh_member_initializer_caches(
     decl_copies: &HashSet<LuaTypeOwner>,
 ) -> HashSet<LuaTypeOwner> {
     let read_pass = SettledReadPass::Member;
-    let candidate_count = context.member_initializer_reinfer_candidates.len()
-        + context.guarded_member_read_candidates.len()
-        + context.settled_sibling_merge_read_candidates.len();
     let read_version = crate::db_index::read_set::InferenceReadVersion::capture(db);
     // A sibling merge is only worth re-reading once the writers it merged have
     // settled, which the full pass runs ahead of.
@@ -3062,10 +3129,17 @@ fn refresh_member_initializer_caches(
     }
     let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
     file_ids.retain(|file_id| {
-        context.settled_pass_reads_stale(db, read_pass, candidate_count, *file_id, pass.moved())
-            || candidates_by_file[file_id]
-                .iter()
-                .any(|member_id| decl_copies.contains(&LuaTypeOwner::Member(*member_id)))
+        // The file's own candidate count, not the workspace total: a new
+        // candidate elsewhere must not re-derive this file's recorded reads.
+        context.settled_pass_reads_stale(
+            db,
+            read_pass,
+            candidates_by_file[file_id].len(),
+            *file_id,
+            pass.moved(),
+        ) || candidates_by_file[file_id]
+            .iter()
+            .any(|member_id| decl_copies.contains(&LuaTypeOwner::Member(*member_id)))
     });
     file_ids.sort();
     if file_ids.is_empty() {
@@ -3254,7 +3328,7 @@ fn refresh_member_initializer_caches(
         context.record_settled_pass_reads(
             read_pass,
             result.file_id,
-            candidate_count,
+            candidates_by_file[&result.file_id].len(),
             read_version,
             result.reads,
         );
@@ -3781,7 +3855,7 @@ pub struct AnalyzeContext {
     settled_assign_candidate_keys: HashSet<(LuaDeclId, rowan::TextRange, usize)>,
     settled_member_key_candidates: Option<(usize, HashMap<FileId, Vec<LuaMemberId>>)>,
     settled_owner_candidates: Option<(usize, HashMap<FileId, Vec<LuaMemberId>>)>,
-    settled_return_attempts: HashMap<LuaSignatureId, (u64, u64, u64, u64)>,
+    settled_return_attempts: HashSet<LuaSignatureId>,
     settled_assign_claims: HashMap<LuaDeclId, Option<rowan::TextSize>>,
     settled_pass_reads: HashMap<
         (SettledReadPass, FileId),
@@ -3889,7 +3963,7 @@ impl AnalyzeContext {
             settled_owner_candidates: None,
             settled_pass_reads: HashMap::default(),
             settled_assign_claims: HashMap::default(),
-            settled_return_attempts: HashMap::default(),
+            settled_return_attempts: HashSet::default(),
             late_resolved_decls: HashSet::default(),
             infer_manager: InferCacheManager::new(),
             inferred_guard_dependencies: HashMap::default(),

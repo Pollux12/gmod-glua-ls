@@ -2165,7 +2165,10 @@ pub fn derive_inferred_return_with_reads(
     Vec<LuaReturnCorrelation>,
     Result<Vec<LuaDocReturnInfo>, InferFailReason>,
 ) {
-    crate::db_index::read_set::arm();
+    // Member maps are armed too: a return inferred off a member lookup must
+    // re-derive when that owner's membership moves, and the settled tail's
+    // per-record staleness check needs the read on record to see it.
+    crate::db_index::read_set::arm_with_member_maps();
     let correlations = analyze_return_correlations(db, cache, return_points);
     let returns = analyze_return_point(db, cache, return_points);
     let mut reads = crate::db_index::read_set::disarm();

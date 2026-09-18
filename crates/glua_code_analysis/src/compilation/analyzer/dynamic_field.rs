@@ -2076,7 +2076,12 @@ pub(crate) fn rederive_settled_dynamic_fields(
     moved_owners: Option<&FxHashSet<LuaTypeOwner>>,
 ) -> bool {
     let read_pass = super::SettledReadPass::Dynamic;
-    let candidate_count = context.settled_dynamic_field_candidates.len();
+    // Per-file candidate counts: a new candidate arriving for one file must
+    // not re-derive every other file's recorded reads.
+    let mut file_candidate_counts = FxHashMap::<crate::FileId, usize>::default();
+    for (file_id, _) in &context.settled_dynamic_field_candidates {
+        *file_candidate_counts.entry(*file_id).or_default() += 1;
+    }
     let read_version = crate::db_index::read_set::InferenceReadVersion::capture(db);
     // Kept, not taken: the settled tail runs to a fixpoint and each round
     // re-derives the same candidates against what the previous one landed.
@@ -2089,7 +2094,7 @@ pub(crate) fn rederive_settled_dynamic_fields(
                 context.settled_pass_reads_stale(
                     db,
                     read_pass,
-                    candidate_count,
+                    file_candidate_counts[file_id],
                     *file_id,
                     moved_owners,
                 )
@@ -2208,7 +2213,7 @@ pub(crate) fn rederive_settled_dynamic_fields(
             context.record_settled_pass_reads(
                 read_pass,
                 result.file_id,
-                candidate_count,
+                file_candidate_counts[&result.file_id],
                 read_version,
                 reads,
             );

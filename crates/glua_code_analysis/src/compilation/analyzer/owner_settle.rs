@@ -390,7 +390,15 @@ pub(crate) fn rederive_settled_index_expr_owners(
     }
     file_ids.sort_unstable();
     file_ids.retain(|file_id| {
-        context.settled_pass_reads_stale(db, read_pass, candidate_count, *file_id, moved_owners)
+        // The file's own candidate count, not the workspace member total: a
+        // new member elsewhere must not re-derive this file's recorded reads.
+        context.settled_pass_reads_stale(
+            db,
+            read_pass,
+            candidates[file_id].len(),
+            *file_id,
+            moved_owners,
+        )
     });
     if file_ids.is_empty() {
         return false;
@@ -439,9 +447,19 @@ pub(crate) fn rederive_settled_index_expr_owners(
         (file_id, updates, crate::db_index::read_set::disarm())
     });
 
+    let file_candidate_counts: HashMap<crate::FileId, usize> = file_ids
+        .iter()
+        .map(|file_id| (*file_id, candidates[file_id].len()))
+        .collect();
     let mut moved = false;
     for (file_id, updates, reads) in results {
-        context.record_settled_pass_reads(read_pass, file_id, candidate_count, read_version, reads);
+        context.record_settled_pass_reads(
+            read_pass,
+            file_id,
+            file_candidate_counts[&file_id],
+            read_version,
+            reads,
+        );
         for (member_id, settled_owner, set_owner_only, previous) in updates {
             let index = db.get_member_index_mut();
             if index.has_synthesized_owner(&member_id) {

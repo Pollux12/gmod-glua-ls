@@ -31,11 +31,13 @@ fn push_owner_key_id_unique(
     owner: LuaMemberOwner,
     key: LuaMemberKey,
     id: LuaMemberId,
-) {
+) -> bool {
     let member_ids = target.entry(owner).or_default().entry(key).or_default();
-    if !member_ids.contains(&id) {
-        member_ids.push(id);
+    if member_ids.contains(&id) {
+        return false;
     }
+    member_ids.push(id);
+    true
 }
 
 /// Appends `id` to its slot, which the caller knows does not hold it yet.
@@ -59,12 +61,15 @@ fn remove_owner_key_id(
     owner: &LuaMemberOwner,
     key: &LuaMemberKey,
     id: LuaMemberId,
-) {
+) -> bool {
     let Some(owner_items) = target.get_mut(owner) else {
-        return;
+        return false;
     };
+    let mut removed = false;
     if let Some(member_ids) = owner_items.get_mut(key) {
+        let before = member_ids.len();
         member_ids.retain(|member_id| *member_id != id);
+        removed = member_ids.len() != before;
         if member_ids.is_empty() {
             owner_items.remove(key);
         }
@@ -72,6 +77,7 @@ fn remove_owner_key_id(
     if owner_items.is_empty() {
         target.remove(owner);
     }
+    removed
 }
 
 #[derive(Debug)]
@@ -112,6 +118,26 @@ pub struct LuaMemberIndex {
     /// holders record the revision they walked and suffix-fold only on a
     /// match, rebuilding from scratch otherwise.
     homing_revision: u64,
+    /// Epoch bumped by every retarget of the canonical-owner mappings
+    /// ([`Self::definition_site_owner`], [`Self::global_path_class_owner`]). A
+    /// recorded member read validates against it because a retarget silently
+    /// re-points which slot its owner names; retargets are rare next to member
+    /// moves, so one scalar covers them all.
+    canonical_revision: u64,
+    /// Stamp clock for the move epochs below. Unlike `homing_revision` this
+    /// advances on every targeted membership change — appends included —
+    /// because per-entity read versions want each entity's last-moved epoch,
+    /// while `homing_revision` stays the coarse any-move signal the
+    /// suffix-fold memos rely on.
+    move_clock: u64,
+    /// The `move_clock` epoch each owner/key's membership view last moved at.
+    /// Targeted mutations stamp the entities they touched so a read validates
+    /// against its own last-moved epoch instead of the index-global
+    /// `homing_revision`: a move under an owner the read never saw leaves it
+    /// fresh, which is what keeps unrelated files out of settled-tail
+    /// re-derivation.
+    owner_move_epochs: HashMap<LuaMemberOwner, u64>,
+    key_move_epochs: HashMap<LuaMemberKey, u64>,
     /// Members whose owner was recorded without adding them to the owner's
     /// member list: a write through an instance of a class, not the class.
     /// See [`Self::set_member_owner_only`].
@@ -210,6 +236,10 @@ impl LuaMemberIndex {
             non_overwriting_assignment_members: HashSet::default(),
             preserved_co_writer_reconciled: HashSet::default(),
             homing_revision: 0,
+            canonical_revision: 0,
+            move_clock: 0,
+            owner_move_epochs: HashMap::default(),
+            key_move_epochs: HashMap::default(),
             owner_only_members: HashSet::default(),
             synthesized_owner_members: HashSet::default(),
             deferred_index_expr_members: HashSet::default(),
@@ -233,10 +263,17 @@ impl LuaMemberIndex {
         self.members.len()
     }
 
-    pub(crate) fn read_version(&self, owner: &LuaMemberOwner) -> (u64, u64, usize) {
+    /// Version for an owner-indexed member read (everything
+    /// [`crate::db_index::read_set::record_member_map`] callers walk).
+    ///
+    /// `(canonical epoch, owner move epoch, owner-members revision, history
+    /// len)`: a canonical retarget or any mutation naming this owner marks the
+    /// read stale, while moves under owners it never saw do not.
+    pub(crate) fn read_version(&self, owner: &LuaMemberOwner) -> (u64, u64, u64, usize) {
         let owner = self.canonical(owner);
         (
-            self.homing_revision,
+            self.canonical_revision,
+            self.owner_move_epochs.get(owner).copied().unwrap_or(0),
             self.owner_members
                 .get(owner)
                 .map_or(0, LuaOwnerMembers::revision),
@@ -252,13 +289,14 @@ impl LuaMemberIndex {
 
     /// Version for a key-indexed member read (`get_current_members_for_key`).
     ///
-    /// Cost is O(members found): the slot length is the map lookup every
-    /// caller already pays, paired with the homing revision every owner or
-    /// key move bumps. A new owner gaining the key grows the slot; a re-home
-    /// between owners bumps the revision, so both directions mark stale.
-    pub(crate) fn key_read_version(&self, key: &LuaMemberKey) -> (u64, usize) {
+    /// `(canonical epoch, key move epoch, slot len)`: a canonical retarget or
+    /// any mutation naming this key marks the read stale — a re-home between
+    /// owners leaves the slot length unchanged but stamps the key — while
+    /// moves under keys it never saw do not.
+    pub(crate) fn key_read_version(&self, key: &LuaMemberKey) -> (u64, u64, usize) {
         (
-            self.homing_revision,
+            self.canonical_revision,
+            self.key_move_epochs.get(key).copied().unwrap_or(0),
             self.current_members_by_key
                 .get(key)
                 .map_or(0, |ids| ids.len()),
@@ -304,6 +342,45 @@ impl LuaMemberIndex {
         self.homing_revision = self.homing_revision.wrapping_add(1);
     }
 
+    /// Stamps `owner`'s membership view as moved at a fresh `move_clock` epoch.
+    /// Called by every mutation that edits the maps an owner-indexed read
+    /// walks — the owner-key indexes, current-owner history, the member's
+    /// current owner — so reads recorded against `owner` go stale while
+    /// unrelated owners stay fresh.
+    fn note_owner_move(&mut self, owner: &LuaMemberOwner) {
+        self.move_clock = self.move_clock.wrapping_add(1);
+        let epoch = self.move_clock;
+        let owner = self.canonical(owner).clone();
+        self.owner_move_epochs.insert(owner, epoch);
+    }
+
+    /// [`Self::note_owner_move`] for a key-indexed slot
+    /// (`current_members_by_key`): membership and per-member owner changes
+    /// under `key` mark its reads stale.
+    fn note_key_move(&mut self, key: &LuaMemberKey) {
+        self.move_clock = self.move_clock.wrapping_add(1);
+        let epoch = self.move_clock;
+        self.key_move_epochs.insert(key.clone(), epoch);
+    }
+
+    /// Stamps the owner and key `member_id`'s current record names: a rewrite,
+    /// flag change, or drop behind the member's back alters the membership
+    /// view both slots answer for.
+    fn note_member_move(&mut self, member_id: LuaMemberId) {
+        self.move_clock = self.move_clock.wrapping_add(1);
+        let epoch = self.move_clock;
+        if let Some(owner) = self.member_current_owner.get(&member_id) {
+            let owner = self.canonical(owner).clone();
+            self.owner_move_epochs.insert(owner, epoch);
+        }
+        if let Some(key) = self
+            .get_member(&member_id)
+            .map(|member| member.get_key().clone())
+        {
+            self.key_move_epochs.insert(key, epoch);
+        }
+    }
+
     pub fn add_member(&mut self, owner: LuaMemberOwner, member: LuaMember) -> LuaMemberId {
         self.add_member_with_owner_only(owner, member, false)
     }
@@ -329,6 +406,7 @@ impl LuaMemberIndex {
         let mut already_filed_here = false;
         if self.members.contains_key(&id) {
             self.bump_homing_revision();
+            self.note_member_move(id);
             // The insert below overwrites the member record, but nothing else
             // removes the id from the key slot its previous filing named. When
             // the owner is unchanged and only the key moved, that leaves the id
@@ -353,7 +431,17 @@ impl LuaMemberIndex {
         self.set_member_function_scope_range(id, function_scope);
         self.add_in_file_object(file_id, MemberOrOwner::Member(id));
         if !owner.is_unknown() {
-            self.member_current_owner.insert(id, owner.clone());
+            // A re-file that lands the id under a different current owner
+            // drops it from the old owner's filtered views without touching
+            // that owner's slots, so the old owner needs its own stamp.
+            if let Some(previous) = self
+                .member_current_owner
+                .insert(id, owner.clone())
+                .filter(|previous| previous != &owner)
+            {
+                self.note_owner_move(&previous);
+                self.note_owner_move(&owner);
+            }
             self.add_current_member_key(id);
             self.current_owner_member_history
                 .entry(owner.clone())
@@ -383,16 +471,22 @@ impl LuaMemberIndex {
         self.remove_member_from_all_owner_key_indexes(owner, id);
         self.remove_current_member_key(id);
         if let Some(owner_members) = self.owner_members.get_mut(owner) {
-            let drop_key = match owner_members.get_member_mut(&key) {
+            let listed = match owner_members.get_member(&key) {
                 Some(LuaMemberIndexItem::One(existing)) => *existing == id,
-                Some(LuaMemberIndexItem::Many(ids)) => {
-                    ids.retain(|member_id| *member_id != id);
-                    ids.is_empty()
-                }
+                Some(LuaMemberIndexItem::Many(ids)) => ids.contains(&id),
                 None => false,
             };
-            if drop_key {
-                owner_members.remove_member(&key);
+            if listed {
+                let drop_key = match owner_members.get_member_mut(&key) {
+                    Some(LuaMemberIndexItem::Many(ids)) => {
+                        ids.retain(|member_id| *member_id != id);
+                        ids.is_empty()
+                    }
+                    _ => true,
+                };
+                if drop_key {
+                    owner_members.remove_member(&key);
+                }
             }
         }
     }
@@ -419,6 +513,7 @@ impl LuaMemberIndex {
         // left-behind entry at the same raw length while the filtered set
         // changed: memos must rebuild rather than suffix-fold.
         self.bump_homing_revision();
+        self.note_member_move(member_id);
         let owner = self.member_current_owner.get(&member_id).cloned();
         if let Some(owner) = &owner {
             self.remove_member_from_owner_slot(owner, member_id);
@@ -471,7 +566,9 @@ impl LuaMemberIndex {
         self.set_member_owner(owner, file_id, id)?;
         let owner = self.member_current_owner.get(&id)?.clone();
         self.remove_member_from_owner_item(&owner, id);
-        self.owner_only_members.insert(id);
+        if self.owner_only_members.insert(id) {
+            self.note_member_move(id);
+        }
         Some(())
     }
 
@@ -501,7 +598,9 @@ impl LuaMemberIndex {
         self.member_path_provenance.insert(id, alias_path);
         self.record_member_owner(owner, file_id, id)?;
         if owner_only {
-            self.owner_only_members.insert(id);
+            if self.owner_only_members.insert(id) {
+                self.note_member_move(id);
+            }
             return Some(());
         }
         let key = self.get_member(&id)?.get_key().clone();
@@ -515,7 +614,9 @@ impl LuaMemberIndex {
     /// [`Self::set_global_path_class`] leaves it where it is instead of moving
     /// it onto the annotated class.
     pub fn pin_synthesized_owner(&mut self, id: LuaMemberId) {
-        self.synthesized_owner_members.insert(id);
+        if self.synthesized_owner_members.insert(id) {
+            self.note_member_move(id);
+        }
     }
 
     pub fn has_synthesized_owner(&self, id: &LuaMemberId) -> bool {
@@ -535,7 +636,9 @@ impl LuaMemberIndex {
     /// was decided from a mid-fixpoint prefix type. See
     /// [`Self::deferred_index_expr_members`].
     pub fn mark_deferred_index_expr_member(&mut self, id: LuaMemberId) {
-        self.deferred_index_expr_members.insert(id);
+        if self.deferred_index_expr_members.insert(id) {
+            self.note_member_move(id);
+        }
     }
 
     pub fn is_deferred_index_expr_member(&self, id: &LuaMemberId) -> bool {
@@ -550,6 +653,8 @@ impl LuaMemberIndex {
             return;
         };
         self.bump_homing_revision();
+        self.note_owner_move(owner);
+        self.note_key_move(&key);
         self.drop_member_path_provenance_on_detach(owner, id);
         self.remove_member_from_all_owner_key_indexes(owner, id);
         self.remove_current_owner_member(owner, id);
@@ -557,16 +662,22 @@ impl LuaMemberIndex {
         let Some(owner_members) = self.owner_members.get_mut(owner) else {
             return;
         };
-        let drop_key = match owner_members.get_member_mut(&key) {
+        let listed = match owner_members.get_member(&key) {
             Some(LuaMemberIndexItem::One(existing)) => *existing == id,
-            Some(LuaMemberIndexItem::Many(ids)) => {
-                ids.retain(|member_id| *member_id != id);
-                ids.is_empty()
-            }
+            Some(LuaMemberIndexItem::Many(ids)) => ids.contains(&id),
             None => false,
         };
-        if drop_key {
-            owner_members.remove_member(&key);
+        if listed {
+            let drop_key = match owner_members.get_member_mut(&key) {
+                Some(LuaMemberIndexItem::Many(ids)) => {
+                    ids.retain(|member_id| *member_id != id);
+                    ids.is_empty()
+                }
+                _ => true,
+            };
+            if drop_key {
+                owner_members.remove_member(&key);
+            }
         }
         if owner_members.is_empty() {
             self.owner_members.remove(owner);
@@ -607,6 +718,22 @@ impl LuaMemberIndex {
             .owner_members
             .entry(owner)
             .or_insert_with(LuaOwnerMembers::new);
+        // A slot that already holds `id` must not touch the item:
+        // `get_member_mut` invalidates the owner's revision on entry, so a
+        // no-op merge would still mark every read recorded against this
+        // owner stale.
+        let already_present = match owner_members.get_member(&key) {
+            Some(LuaMemberIndexItem::One(existing)) => *existing == id,
+            Some(LuaMemberIndexItem::Many(ids)) => ids
+                .binary_search_by_key(&member_id_sort_key(id), |existing_id| {
+                    member_id_sort_key(*existing_id)
+                })
+                .is_ok(),
+            None => false,
+        };
+        if already_present {
+            return;
+        }
         let Some(item) = owner_members.get_member_mut(&key) else {
             owner_members.add_member(key, LuaMemberIndexItem::One(id));
             return;
@@ -650,13 +777,20 @@ impl LuaMemberIndex {
         };
 
         self.record_owner_key_index_owner(id.file_id, &owner);
-        push_owner_key_id_unique(
+        let changed = push_owner_key_id_unique(
             &mut self.member_owner_key_index,
             owner.clone(),
             key.clone(),
             id,
+        ) | push_owner_key_id_unique(
+            &mut self.member_owner_key_history_index,
+            owner.clone(),
+            key,
+            id,
         );
-        push_owner_key_id_unique(&mut self.member_owner_key_history_index, owner, key, id);
+        if changed {
+            self.note_owner_move(&owner);
+        }
     }
 
     /// [`add_member_to_owner_key_indexes`](Self::add_member_to_owner_key_indexes)
@@ -666,6 +800,7 @@ impl LuaMemberIndex {
             return;
         };
 
+        self.note_owner_move(&owner);
         self.record_owner_key_index_owner(id.file_id, &owner);
         push_owner_key_id(
             &mut self.member_owner_key_index,
@@ -696,7 +831,9 @@ impl LuaMemberIndex {
         let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
             return;
         };
-        remove_owner_key_id(&mut self.member_owner_key_index, owner, &key, id);
+        if remove_owner_key_id(&mut self.member_owner_key_index, owner, &key, id) {
+            self.note_owner_move(owner);
+        }
     }
 
     fn remove_member_from_all_owner_key_indexes(
@@ -707,8 +844,11 @@ impl LuaMemberIndex {
         let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
             return;
         };
-        remove_owner_key_id(&mut self.member_owner_key_index, owner, &key, id);
-        remove_owner_key_id(&mut self.member_owner_key_history_index, owner, &key, id);
+        let changed = remove_owner_key_id(&mut self.member_owner_key_index, owner, &key, id)
+            | remove_owner_key_id(&mut self.member_owner_key_history_index, owner, &key, id);
+        if changed {
+            self.note_owner_move(owner);
+        }
     }
 
     fn remove_files_members_from_owner_key_indexes(&mut self, removed: &HashSet<FileId>) {
@@ -717,21 +857,27 @@ impl LuaMemberIndex {
             .filter_map(|file_id| self.owner_key_index_owners_by_file.remove(file_id))
             .flatten()
             .collect::<HashSet<_>>();
+        let mut affected = HashSet::default();
         let visible_removed = Self::remove_files_members_from_owner_key_map(
             &mut self.member_owner_key_index,
             removed,
             &owners,
+            &mut affected,
         );
         let history_removed = Self::remove_files_members_from_owner_key_map(
             &mut self.member_owner_key_history_index,
             removed,
             &owners,
+            &mut affected,
         );
         // The sweep edits history membership behind every memo's back: a slot
         // that lost an entry shrinks, but one that lost nothing keeps its raw
         // length, so only bump when an entry actually left.
         if visible_removed || history_removed {
             self.bump_homing_revision();
+            for owner in &affected {
+                self.note_owner_move(owner);
+            }
         }
     }
 
@@ -739,22 +885,28 @@ impl LuaMemberIndex {
         owner_key_index: &mut HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>,
         removed: &HashSet<FileId>,
         owners: &HashSet<LuaMemberOwner>,
+        affected: &mut HashSet<LuaMemberOwner>,
     ) -> bool {
         let mut removed_any = false;
         for owner in owners {
             let Some(key_members) = owner_key_index.get_mut(owner) else {
                 continue;
             };
+            let mut owner_removed = false;
             key_members.retain(|_, member_ids| {
                 let before = member_ids.len();
                 member_ids.retain(|member_id| !removed.contains(&member_id.file_id));
                 if member_ids.len() != before {
                     removed_any = true;
+                    owner_removed = true;
                 }
                 !member_ids.is_empty()
             });
             if key_members.is_empty() {
                 owner_key_index.remove(owner);
+            }
+            if owner_removed {
+                affected.insert(owner.clone());
             }
         }
         removed_any
@@ -823,8 +975,15 @@ impl LuaMemberIndex {
         let already_indexed = self.members.contains_key(&id);
         let previous_owner = self.member_current_owner.insert(id, owner.clone());
         match &previous_owner {
-            None if already_indexed => self.bump_homing_revision(),
-            Some(previous) if previous != &owner => self.bump_homing_revision(),
+            None if already_indexed => {
+                self.bump_homing_revision();
+                self.note_member_move(id);
+            }
+            Some(previous) if previous != &owner => {
+                self.bump_homing_revision();
+                self.note_owner_move(previous);
+                self.note_member_move(id);
+            }
             _ => {}
         }
         if previous_owner.is_none() {
@@ -866,6 +1025,7 @@ impl LuaMemberIndex {
         // `set_key` would otherwise read stale suffix-folded answers.
         if self.members.contains_key(id) {
             self.bump_homing_revision();
+            self.note_member_move(*id);
         }
         self.members.get_mut(id)
     }
@@ -895,6 +1055,10 @@ impl LuaMemberIndex {
         self.forget_definition_site(&site);
         self.bump_homing_revision();
         self.definition_site_owner.insert(site.clone(), owner);
+        // `site` now resolves to the path's owner: stamping the canonical
+        // target marks every read recorded through `site` stale.
+        self.canonical_revision = self.canonical_revision.wrapping_add(1);
+        self.note_owner_move(&LuaMemberOwner::Element(site.clone()));
         let sites = self.path_definition_sites.entry(path.clone()).or_default();
         if let Err(at) = sites.binary_search_by_key(&site_sort_key(&site), site_sort_key) {
             sites.insert(at, site.clone());
@@ -1116,6 +1280,8 @@ impl LuaMemberIndex {
         // top of the per-member moves in `rehome_global_path_class` (each
         // bumps on its own).
         self.bump_homing_revision();
+        self.canonical_revision = self.canonical_revision.wrapping_add(1);
+        self.note_owner_move(&LuaMemberOwner::Type(winner.clone()));
         self.rehome_global_path_class(&path, old.as_ref(), &LuaMemberOwner::Type(winner));
     }
 
@@ -1190,16 +1356,22 @@ impl LuaMemberIndex {
         let Some(owner_members) = self.owner_members.get_mut(owner) else {
             return;
         };
-        let drop_key = match owner_members.get_member_mut(&key) {
+        let listed = match owner_members.get_member(&key) {
             Some(LuaMemberIndexItem::One(existing)) => *existing == id,
-            Some(LuaMemberIndexItem::Many(ids)) => {
-                ids.retain(|held| *held != id);
-                ids.is_empty()
-            }
+            Some(LuaMemberIndexItem::Many(ids)) => ids.contains(&id),
             None => false,
         };
-        if drop_key {
-            owner_members.remove_member(&key);
+        if listed {
+            let drop_key = match owner_members.get_member_mut(&key) {
+                Some(LuaMemberIndexItem::Many(ids)) => {
+                    ids.retain(|held| *held != id);
+                    ids.is_empty()
+                }
+                _ => true,
+            };
+            if drop_key {
+                owner_members.remove_member(&key);
+            }
         }
         if owner_members.is_empty() {
             self.owner_members.remove(owner);
@@ -1226,6 +1398,10 @@ impl LuaMemberIndex {
         // Unmapping what a canonical slot names re-homes the literal's
         // members back onto the literal itself.
         self.bump_homing_revision();
+        // `site` now resolves to itself: stamping it marks every read that
+        // previously resolved through the path stale.
+        self.canonical_revision = self.canonical_revision.wrapping_add(1);
+        self.note_owner_move(&LuaMemberOwner::Element(site.clone()));
         if let Some(sites) = self.path_definition_sites.get_mut(&path) {
             sites.retain(|held| held != site);
             if sites.is_empty() {
@@ -1637,10 +1813,15 @@ impl LuaMemberIndex {
         member_id: LuaMemberId,
         range: Option<TextRange>,
     ) {
-        if let Some(range) = range {
-            self.member_function_scope_ranges.insert(member_id, range);
+        let changed = if let Some(range) = range {
+            self.member_function_scope_ranges.insert(member_id, range) != Some(range)
         } else {
-            self.member_function_scope_ranges.remove(&member_id);
+            self.member_function_scope_ranges
+                .remove(&member_id)
+                .is_some()
+        };
+        if changed {
+            self.note_member_move(member_id);
         }
     }
 
@@ -1649,7 +1830,9 @@ impl LuaMemberIndex {
     }
 
     pub fn mark_non_overwriting_assignment_member(&mut self, member_id: LuaMemberId) {
-        self.non_overwriting_assignment_members.insert(member_id);
+        if self.non_overwriting_assignment_members.insert(member_id) {
+            self.note_member_move(member_id);
+        }
         self.readmit_preserved_assignment_co_writers(member_id);
     }
 
@@ -1837,12 +2020,18 @@ impl LuaMemberIndex {
     }
 
     fn remove_current_owner_member(&mut self, owner: &LuaMemberOwner, member_id: LuaMemberId) {
-        let Some(members) = self.current_owner_member_history.get_mut(owner) else {
-            return;
+        let removed = {
+            let Some(members) = self.current_owner_member_history.get_mut(owner) else {
+                return;
+            };
+            let removed = members.remove(&member_id_sort_key(member_id)).is_some();
+            if members.is_empty() {
+                self.current_owner_member_history.remove(owner);
+            }
+            removed
         };
-        members.remove(&member_id_sort_key(member_id));
-        if members.is_empty() {
-            self.current_owner_member_history.remove(owner);
+        if removed {
+            self.note_owner_move(owner);
         }
     }
 
@@ -1865,10 +2054,15 @@ impl LuaMemberIndex {
         else {
             return;
         };
-        self.current_members_by_key
-            .entry(key)
+        if self
+            .current_members_by_key
+            .entry(key.clone())
             .or_default()
-            .insert(member_id_sort_key(member_id), member_id);
+            .insert(member_id_sort_key(member_id), member_id)
+            .is_none()
+        {
+            self.note_key_move(&key);
+        }
     }
 
     fn remove_current_member_key(&mut self, member_id: LuaMemberId) {
@@ -1878,12 +2072,18 @@ impl LuaMemberIndex {
         else {
             return;
         };
-        let Some(members) = self.current_members_by_key.get_mut(&key) else {
-            return;
+        let removed = {
+            let Some(members) = self.current_members_by_key.get_mut(&key) else {
+                return;
+            };
+            let removed = members.remove(&member_id_sort_key(member_id)).is_some();
+            if members.is_empty() {
+                self.current_members_by_key.remove(&key);
+            }
+            removed
         };
-        members.remove(&member_id_sort_key(member_id));
-        if members.is_empty() {
-            self.current_members_by_key.remove(&key);
+        if removed {
+            self.note_key_move(&key);
         }
     }
 
@@ -1943,6 +2143,7 @@ impl LuaMemberIndex {
         // entry in the middle.
         if self.members.contains_key(&member_id) {
             self.bump_homing_revision();
+            self.note_member_move(member_id);
         }
         if let Some(owner) = self.member_current_owner.get(&member_id).cloned() {
             self.remove_member_from_all_owner_key_indexes(&owner, member_id);
@@ -1983,6 +2184,18 @@ impl LuaMemberIndex {
 
             let mut need_removed_owner = Vec::new();
             for owner in owners {
+                // `iter_mut` invalidates the owner's revision on entry, so an
+                // owner holding none of this file's members must not be
+                // touched: an immutable peek keeps its reads fresh.
+                let affected = self.owner_members.get(&owner).is_some_and(|member_items| {
+                    member_items.get_member_items().any(|item| match item {
+                        LuaMemberIndexItem::One(id) => id.file_id == file_id,
+                        LuaMemberIndexItem::Many(ids) => ids.iter().any(|id| id.file_id == file_id),
+                    })
+                });
+                if !affected {
+                    continue;
+                }
                 if let Some(member_items) = self.owner_members.get_mut(&owner) {
                     let mut need_removed_key = Vec::new();
                     for (key, item) in member_items.iter_mut() {
@@ -2067,6 +2280,8 @@ impl LuaMemberIndex {
                         self.global_path_class_owner
                             .insert(path.clone(), LuaMemberOwner::Type(winner.clone()));
                         self.bump_homing_revision();
+                        self.canonical_revision = self.canonical_revision.wrapping_add(1);
+                        self.note_owner_move(&LuaMemberOwner::Type(winner.clone()));
                         self.rehome_global_path_class(
                             &path,
                             old.as_ref(),
@@ -2078,6 +2293,8 @@ impl LuaMemberIndex {
                     if let Some(old) = old {
                         self.global_path_class_owner.remove(&path);
                         self.bump_homing_revision();
+                        self.canonical_revision = self.canonical_revision.wrapping_add(1);
+                        self.note_owner_move(&LuaMemberOwner::GlobalPath(path.clone()));
                         self.rehome_global_path_class(
                             &path,
                             Some(&old),
@@ -2327,6 +2544,7 @@ impl LuaMemberIndex {
             self.member_owner_key_index.remove(&owner);
             self.member_owner_key_history_index.remove(&owner);
             self.current_owner_member_history.remove(&owner);
+            self.note_owner_move(&owner);
             self.remove_owner_from_all_files(&owner);
         }
         forgotten
@@ -2418,6 +2636,10 @@ impl LuaIndex for LuaMemberIndex {
         self.non_overwriting_assignment_members.clear();
         self.preserved_co_writer_reconciled.clear();
         self.homing_revision = 0;
+        self.canonical_revision = 0;
+        self.move_clock = 0;
+        self.owner_move_epochs.clear();
+        self.key_move_epochs.clear();
         self.owner_only_members.clear();
         self.synthesized_owner_members.clear();
         self.deferred_index_expr_members.clear();

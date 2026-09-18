@@ -35,12 +35,13 @@ use smol_str::SmolStr;
 #[derive(Debug, Default, Clone)]
 pub(crate) struct InferenceReadSet {
     pub type_owners: FxHashSet<LuaTypeOwner>,
-    pub member_maps: FxHashMap<LuaMemberOwner, (u64, u64, usize)>,
+    pub member_maps: FxHashMap<LuaMemberOwner, (u64, u64, u64, usize)>,
     /// Key-indexed member reads (`get_current_members_for_key`): the reverse
     /// owner lookup draws narrowing candidates from the live member map, so a
     /// pass that read a key must re-derive once a member joins or leaves it.
-    /// Versioned as `(homing_revision, slot_len)` for O(members found) cost.
-    pub member_keys: FxHashMap<LuaMemberKey, (u64, usize)>,
+    /// Versioned as `(canonical_revision, key_move_epoch, slot_len)` —
+    /// see [`crate::LuaMemberIndex::key_read_version`].
+    pub member_keys: FxHashMap<LuaMemberKey, (u64, u64, usize)>,
     pub signatures: FxHashSet<LuaSignatureId>,
     pub params: FxHashSet<LuaSignatureId>,
     pub modules: FxHashSet<FileId>,
@@ -96,9 +97,9 @@ pub(crate) struct InferredReturnReadRecord {
 thread_local! {
     static DEPTH: Cell<u32> = const { Cell::new(0) };
     static TRACK_MEMBER_MAPS: Cell<bool> = const { Cell::new(false) };
-    static MEMBER_MAPS: RefCell<FxHashMap<LuaMemberOwner, (u64, u64, usize)>> =
+    static MEMBER_MAPS: RefCell<FxHashMap<LuaMemberOwner, (u64, u64, u64, usize)>> =
         RefCell::new(FxHashMap::default());
-    static MEMBER_KEYS: RefCell<FxHashMap<LuaMemberKey, (u64, usize)>> =
+    static MEMBER_KEYS: RefCell<FxHashMap<LuaMemberKey, (u64, u64, usize)>> =
         RefCell::new(FxHashMap::default());
     static READS: RefCell<FxHashSet<LuaTypeOwner>> = RefCell::new(FxHashSet::default());
     static SIGNATURES: RefCell<FxHashSet<LuaSignatureId>> = RefCell::new(FxHashSet::default());
@@ -283,9 +284,10 @@ pub(crate) fn record_member_map(index: &crate::LuaMemberIndex, owner: &LuaMember
 /// Records a key-indexed member read (`get_current_members_for_key`).
 ///
 /// The reverse owner lookup answers from the members filed under one key, so
-/// the version is that key's slot: `(homing_revision, slot_len)`. A new owner
-/// gaining the key grows the slot; a re-home between owners bumps the
-/// revision. First read wins per collection, matching `record_member_map`.
+/// the version is that key's slot: `(canonical_revision, key_move_epoch,
+/// slot_len)`. A new owner gaining the key grows the slot; a re-home between
+/// owners stamps the key's move epoch. First read wins per collection,
+/// matching `record_member_map`.
 #[inline]
 pub(crate) fn record_member_key_read(index: &crate::LuaMemberIndex, key: &LuaMemberKey) {
     if DEPTH.with(Cell::get) > 0 && TRACK_MEMBER_MAPS.with(Cell::get) {
@@ -322,16 +324,24 @@ impl InferenceReadVersion {
     }
 
     pub(crate) fn is_stale(&self, db: &crate::DbIndex, reads: &InferenceReadSet) -> bool {
-        self.value_reads_changed(db, reads)
-            || reads
-                .member_maps
-                .iter()
-                .any(|(owner, version)| db.get_member_index().read_version(owner) != *version)
+        self.value_reads_changed(db, reads) || self.member_reads_changed(db, reads)
+    }
+
+    pub(crate) fn member_reads_changed(
+        &self,
+        db: &crate::DbIndex,
+        reads: &InferenceReadSet,
+    ) -> bool {
+        reads
+            .member_maps
+            .iter()
+            .any(|(owner, version)| db.get_member_index().read_version(owner) != *version)
             || reads
                 .member_keys
                 .iter()
                 .any(|(key, version)| db.get_member_index().key_read_version(key) != *version)
     }
+
     fn value_reads_changed(&self, db: &crate::DbIndex, reads: &InferenceReadSet) -> bool {
         reads.type_owners.iter().any(|key| db.get_type_index().type_write_version(key) > self.type_epoch)
             || reads.signatures.iter().any(|key| db.get_signature_index().return_write_version(key) > self.return_epoch)
@@ -352,6 +362,10 @@ impl InferenceReadVersion {
 }
 
 impl InferredReturnReadRecord {
+    /// Whether anything the recorded attempt read has since moved — value
+    /// reads and the member maps/keys it consulted. Member reads only exist
+    /// for scopes armed with [`arm_with_member_maps`]; an empty set can never
+    /// be stale, so unarmed records keep their old behavior.
     pub(crate) fn is_stale(&self, db: &crate::DbIndex) -> bool {
         InferenceReadVersion {
             type_epoch: self.type_epoch,
@@ -362,7 +376,7 @@ impl InferredReturnReadRecord {
             contrib_epoch: self.contrib_epoch,
             dynamic_epoch: self.dynamic_epoch,
         }
-        .value_reads_changed(db, &self.reads)
+        .is_stale(db, &self.reads)
     }
 }
 
