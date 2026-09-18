@@ -483,10 +483,10 @@ fn try_infer_pairs_iter_types_from_table_members(
     }
     let mut keys = Vec::new();
     let mut values = Vec::new();
-    let mut member_entries = members
-        .iter()
-        .map(|(key, member_infos)| (key.clone(), member_infos.clone()))
-        .collect::<Vec<_>>();
+    // Sort borrowed entries: the walk below only needs each member's `typ`
+    // clone, so cloning the whole map's keys and info vectors up front would
+    // pay a second deep clone of every member type for nothing.
+    let mut member_entries = members.iter().collect::<Vec<_>>();
     member_entries.sort_by_key(|(key, _)| member_key_stable_key(key));
 
     // A dynamic key aliases every access whose key infers to the same type
@@ -500,15 +500,15 @@ fn try_infer_pairs_iter_types_from_table_members(
 
     for (key, member_infos) in member_entries {
         let key_type = if keys_are_sampled {
-            match table_projection_member_key_type(&key) {
+            match table_projection_member_key_type(key) {
                 Some(typ) => typ,
                 None => continue,
             }
         } else {
             match key {
-                LuaMemberKey::Integer(i) => LuaType::IntegerConst(i),
-                LuaMemberKey::Name(name) => LuaType::StringConst(name.into()),
-                LuaMemberKey::ExprType(typ) => typ,
+                LuaMemberKey::Integer(i) => LuaType::IntegerConst(*i),
+                LuaMemberKey::Name(name) => LuaType::StringConst(name.clone().into()),
+                LuaMemberKey::ExprType(typ) => typ.clone(),
                 LuaMemberKey::None => continue,
             }
         };
@@ -518,7 +518,10 @@ fn try_infer_pairs_iter_types_from_table_members(
             [] => LuaType::Any,
             [member] => member.typ.clone(),
             _ => LuaType::from_inferred_vec(
-                member_infos.into_iter().map(|member| member.typ).collect(),
+                member_infos
+                    .iter()
+                    .map(|member| member.typ.clone())
+                    .collect(),
             ),
         };
         values.push(value_type);

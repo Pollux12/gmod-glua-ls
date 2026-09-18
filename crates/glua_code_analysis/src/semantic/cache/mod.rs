@@ -342,6 +342,28 @@ impl LuaInferCache {
         self.file_id
     }
 
+    /// Presize the maps the file walk and the deferred waves fill, from the
+    /// same text-length hint the member/reference indexes reserve with
+    /// (`crate::compilation::analyzer::common::estimate_file_index_entries`).
+    ///
+    /// `expr_cache` alone takes roughly one entry per expression — for a large
+    /// file that is thousands of inserts, each one a rehash step on an
+    /// unsized map, repeated on every worker walk. `HashMap::clear` keeps
+    /// capacity, so sizing once here also covers every deferred-results wave
+    /// that reuses this cache. Fractions keep the small maps near their
+    /// measured occupancy; under- or over-reserving only changes how much
+    /// rehashing remains, never what is cached.
+    pub fn reserve_inference_maps(&mut self, entries: usize) {
+        self.expr_cache.reserve(entries);
+        self.expr_var_ref_id_cache.reserve(entries / 2);
+        self.decl_cache.reserve(entries / 4);
+        self.call_cache.reserve(entries / 8);
+        self.self_type_cache.reserve(entries / 8);
+        self.flow_node_cache.reserve(entries / 8);
+        self.param_type_cache.reserve(entries / 8);
+        self.for_range_iter_var_type_cache.reserve(entries / 16);
+    }
+
     pub fn set_phase(&mut self, phase: LuaAnalysisPhase) {
         self.config.analysis_phase = phase;
     }

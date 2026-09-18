@@ -112,6 +112,19 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                 if let Some(root) = tree_map.get(&file_id) {
                     let file_start = slow_log_enabled.then(Instant::now);
                     let is_scripted = scripted_scope_files.contains(&file_id);
+                    // Presize the per-file inference maps before the walk
+                    // fills them; `HashMap::clear` keeps the capacity, so this
+                    // also covers every deferred-results wave that reuses the
+                    // cache. Estimate-only: it changes rehash count, never
+                    // cached facts.
+                    let estimate =
+                        crate::compilation::analyzer::common::estimate_file_index_entries(
+                            usize::from(root.syntax().text_range().len()),
+                        );
+                    context
+                        .infer_manager
+                        .get_infer_cache(file_id)
+                        .reserve_inference_maps(estimate);
                     let mut analyzer = LuaAnalyzer::new(
                         db,
                         file_id,

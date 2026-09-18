@@ -1,4 +1,6 @@
-use std::{collections::HashMap, sync::OnceLock};
+use std::sync::OnceLock;
+
+use rustc_hash::FxHashMap as HashMap;
 
 use super::member_id_sort_key;
 use crate::{LuaMemberId, LuaMemberIndexItem, LuaMemberKey};
@@ -25,7 +27,7 @@ pub struct LuaOwnerMembers {
 impl LuaOwnerMembers {
     pub fn new() -> Self {
         Self {
-            members: HashMap::new(),
+            members: HashMap::default(),
             revision: 0,
             sorted_ids_cache: OnceLock::new(),
             sorted_expr_ids_cache: OnceLock::new(),
