@@ -2111,6 +2111,24 @@ pub(crate) fn rederive_settled_dynamic_fields(
             attributed_unattributed: Vec::new(),
             candidate_reads: Vec::new(),
         };
+        let file_candidates = &candidates_by_file[&file_id];
+        // The tree and cache only serve a file that re-derives a site this
+        // round — an all-fresh file early-outs on the same per-site staleness
+        // check, paying only the scan.
+        if !rederive_all
+            && !file_candidates.iter().any(|syntax_id| {
+                candidate_reads
+                    .get(&(
+                        read_pass,
+                        super::SettledCandidate::Dynamic(file_id, *syntax_id),
+                    ))
+                    .is_none_or(|(version, reads)| {
+                        version.is_stale_against(&read_version, db, reads)
+                    })
+            })
+        {
+            return result;
+        }
         let Some(root) = db
             .get_vfs()
             .get_syntax_tree(&file_id)
@@ -2128,14 +2146,16 @@ pub(crate) fn rederive_settled_dynamic_fields(
             },
         );
         let mut local_reassignment_positions = None;
-        for syntax_id in &candidates_by_file[&file_id] {
+        for syntax_id in file_candidates {
             let key = super::SettledCandidate::Dynamic(file_id, *syntax_id);
             // A site whose recorded reads did not move answers the same as
             // last round; one with no record has never run.
             let stale = rederive_all
                 || candidate_reads
                     .get(&(read_pass, key))
-                    .is_none_or(|(version, reads)| version.is_stale(db, reads));
+                    .is_none_or(|(version, reads)| {
+                        version.is_stale_against(&read_version, db, reads)
+                    });
             if !stale {
                 continue;
             }

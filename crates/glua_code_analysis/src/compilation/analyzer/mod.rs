@@ -630,7 +630,7 @@ fn attach_settled_index_expr_members(db: &mut DbIndex, context: &mut AnalyzeCont
                 SettledReadPass::Attach,
                 SettledCandidate::Attach(file_id, candidate.value),
             ))
-            .is_some_and(|(version, reads)| !version.is_stale(db, reads))
+            .is_some_and(|(version, reads)| !version.is_stale_against(&read_version, db, reads))
         {
             retry.push(candidate);
             continue;
@@ -749,6 +749,9 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
             break;
         }
         context.drain_inferred_return_reads();
+        // The filter writes nothing, so one capture stands for every
+        // record's staleness check this round.
+        let now = crate::db_index::read_set::InferenceReadVersion::capture(db);
         let mut candidates = context
             .inferred_return_candidates
             .iter()
@@ -763,8 +766,11 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
                                 && unresolve::is_unsettled_inferred_return(
                                     &signature.get_return_type(),
                                 ))
-                                || context
-                                    .inferred_return_reads_are_stale(db, return_.signature_id))
+                                || context.inferred_return_reads_are_stale(
+                                    &now,
+                                    db,
+                                    return_.signature_id,
+                                ))
                     })
             })
             .cloned()
@@ -991,6 +997,25 @@ fn rederive_settled_iter_vars(
     // thread in file and source order, never in the order the workers finished
     // or a hash map happened to yield.
     let results = parallel::map_files_collect(db, &file_ids, |db, file_id| {
+        let file_candidates = &candidates_by_file[&file_id];
+        // The cache and syntax tree only serve a file that re-derives a
+        // candidate this round — an all-fresh file early-outs on the same
+        // per-candidate staleness check, paying only the scan.
+        if !rederive_all
+            && !file_candidates.iter().any(|candidate| {
+                let key = SettledCandidate::IterVar(
+                    file_id,
+                    candidate.var_positions.first().copied().unwrap_or_default(),
+                );
+                candidate_reads
+                    .get(&(read_pass, key))
+                    .is_none_or(|(version, reads)| {
+                        version.is_stale_against(&read_version, db, reads)
+                    })
+            })
+        {
+            return IterVarRefreshResult::new(file_id);
+        }
         let mut infer_cache = crate::LuaInferCache::new(
             file_id,
             crate::CacheOptions {
@@ -1008,7 +1033,7 @@ fn rederive_settled_iter_vars(
         else {
             return result;
         };
-        for candidate in &candidates_by_file[&file_id] {
+        for candidate in file_candidates {
             let key = SettledCandidate::IterVar(
                 file_id,
                 candidate.var_positions.first().copied().unwrap_or_default(),
@@ -1018,7 +1043,9 @@ fn rederive_settled_iter_vars(
             let stale = rederive_all
                 || candidate_reads
                     .get(&(read_pass, key))
-                    .is_none_or(|(version, reads)| version.is_stale(db, reads));
+                    .is_none_or(|(version, reads)| {
+                        version.is_stale_against(&read_version, db, reads)
+                    });
             if !stale {
                 continue;
             }
@@ -1189,6 +1216,21 @@ fn refresh_settled_expr_type_member_keys(
     // Read-only per file, applied on the caller thread in file and source
     // order, like every other settled pass.
     let results = parallel::map_files_collect(db, &file_ids, |db, file_id| {
+        let file_candidates = &candidates[&file_id];
+        // The cache and syntax tree only serve a file that re-derives a
+        // member this round — an all-fresh file early-outs on the same
+        // per-candidate staleness check, paying only the scan.
+        if !rederive_all
+            && !file_candidates.iter().any(|member_id| {
+                candidate_reads
+                    .get(&(read_pass, SettledCandidate::Member(*member_id)))
+                    .is_none_or(|(version, reads)| {
+                        version.is_stale_against(&read_version, db, reads)
+                    })
+            })
+        {
+            return (file_id, Vec::new(), Vec::new());
+        }
         let mut infer_cache = crate::LuaInferCache::new(
             file_id,
             crate::CacheOptions {
@@ -1211,12 +1253,14 @@ fn refresh_settled_expr_type_member_keys(
         // alone rather than every candidate in the file. The guard disarms on
         // whichever path the body takes.
         let mut drained_reads = Vec::new();
-        for &member_id in &candidates[&file_id] {
+        for &member_id in file_candidates {
             let key = SettledCandidate::Member(member_id);
             let stale = rederive_all
                 || candidate_reads
                     .get(&(read_pass, key))
-                    .is_none_or(|(version, reads)| version.is_stale(db, reads));
+                    .is_none_or(|(version, reads)| {
+                        version.is_stale_against(&read_version, db, reads)
+                    });
             if !stale {
                 continue;
             }
@@ -1316,17 +1360,19 @@ fn rederive_settled_global_reads(
     // The first round has no records yet, so every candidate runs; later
     // rounds re-derive only the candidates whose own recorded reads moved.
     let rederive_all = moved_owners.is_none();
-    let candidate_stale =
-        |context: &AnalyzeContext, db: &DbIndex, decl_id: LuaDeclId, expr: &LuaExpr| {
-            rederive_all
-                || context
-                    .settled_candidate_reads
-                    .get(&(
-                        read_pass,
-                        SettledCandidate::Global(decl_id, expr.get_syntax_id()),
-                    ))
-                    .is_none_or(|(version, reads)| version.is_stale(db, reads))
-        };
+    let candidate_stale = |context: &AnalyzeContext,
+                           db: &DbIndex,
+                           decl_id: LuaDeclId,
+                           expr: &LuaExpr| {
+        rederive_all
+            || context
+                .settled_candidate_reads
+                .get(&(
+                    read_pass,
+                    SettledCandidate::Global(decl_id, expr.get_syntax_id()),
+                ))
+                .is_none_or(|(version, reads)| version.is_stale_against(&read_version, db, reads))
+    };
     let standard = context
         .settled_global_read_candidates
         .iter()
@@ -1881,7 +1927,9 @@ fn rederive_settled_assign_reads(
                     || assign_counts.get(decl_id).copied() != Some(decl_candidate_counts[decl_id])
                     || candidate_reads
                         .get(&(read_pass, key))
-                        .is_none_or(|(version, reads)| version.is_stale(db_ref, reads));
+                        .is_none_or(|(version, reads)| {
+                            version.is_stale_against(&read_version, db_ref, reads)
+                        });
                 if !stale {
                     continue;
                 }
@@ -2611,6 +2659,26 @@ fn refresh_decl_initializer_caches(
     let pass_is_settled = pass.is_settled();
     let candidate_reads = &context.settled_candidate_reads;
 
+    // A file whose candidates are all fresh needs no task: the scan below
+    // would early-out on the same check, so an all-fresh file here costs a
+    // lookup, not a dispatch. The first settled round records nothing yet,
+    // so it always runs every candidate and skips the scan.
+    if !rederive_all {
+        file_ids.retain(|file_id| {
+            candidates_by_file[file_id].iter().any(|decl_id| {
+                decl_copies.contains(&LuaTypeOwner::Decl(*decl_id))
+                    || candidate_reads
+                        .get(&(read_pass, SettledCandidate::Decl(*decl_id)))
+                        .is_none_or(|(version, reads)| {
+                            version.is_stale_against(&read_version, db, reads)
+                        })
+            })
+        });
+        if file_ids.is_empty() {
+            return HashSet::default();
+        }
+    }
+
     // Initializer inference reads the stabilized indexes and records candidate
     // cache writes without mutating the database. Process that read-only work
     // per file, then merge inference side effects and type writes in stable file
@@ -2628,7 +2696,9 @@ fn refresh_decl_initializer_caches(
                     || decl_copies.contains(&LuaTypeOwner::Decl(*decl_id))
                     || candidate_reads
                         .get(&(read_pass, SettledCandidate::Decl(*decl_id)))
-                        .is_none_or(|(version, reads)| version.is_stale(db, reads))
+                        .is_none_or(|(version, reads)| {
+                            version.is_stale_against(&read_version, db, reads)
+                        })
             })
             .collect();
         if stale_decls.is_empty() {
@@ -3219,6 +3289,27 @@ fn refresh_member_initializer_caches(
     let call_site_params_visible = context.infer_manager.call_site_params_visible();
     let candidate_reads = &context.settled_candidate_reads;
 
+    // A file whose candidates are all fresh needs no task: the scan below
+    // would early-out on the same check, so an all-fresh file here costs a
+    // lookup, not a dispatch.
+    if !rederive_all {
+        file_ids.retain(|file_id| {
+            candidates_by_file[file_id].iter().any(|member_id| {
+                decl_copies.contains(&LuaTypeOwner::Member(*member_id))
+                    || guarded.contains(member_id)
+                    || sibling_merges.contains(member_id)
+                    || candidate_reads
+                        .get(&(read_pass, SettledCandidate::Member(*member_id)))
+                        .is_none_or(|(version, reads)| {
+                            version.is_stale_against(&read_version, db, reads)
+                        })
+            })
+        });
+        if file_ids.is_empty() {
+            return HashSet::default();
+        }
+    }
+
     let results = parallel::map_files_collect(db, &file_ids, |db, file_id| {
         // A candidate whose recorded reads did not move answers what it
         // answered last round, so only candidates that have never run or whose
@@ -3238,7 +3329,9 @@ fn refresh_member_initializer_caches(
                     || sibling_merges.contains(member_id)
                     || candidate_reads
                         .get(&(read_pass, SettledCandidate::Member(*member_id)))
-                        .is_none_or(|(version, reads)| version.is_stale(db, reads))
+                        .is_none_or(|(version, reads)| {
+                            version.is_stale_against(&read_version, db, reads)
+                        })
             })
             .collect();
         if stale_members.is_empty() {
@@ -4272,10 +4365,15 @@ impl AnalyzeContext {
         }
     }
 
-    fn inferred_return_reads_are_stale(&self, db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    fn inferred_return_reads_are_stale(
+        &self,
+        now: &crate::db_index::read_set::InferenceReadVersion,
+        db: &DbIndex,
+        signature_id: LuaSignatureId,
+    ) -> bool {
         self.inferred_return_reads
             .get(&signature_id)
-            .is_some_and(|record| record.is_stale(db))
+            .is_some_and(|record| record.is_stale_against(now, db))
     }
 
     fn record_settled_candidate_reads(

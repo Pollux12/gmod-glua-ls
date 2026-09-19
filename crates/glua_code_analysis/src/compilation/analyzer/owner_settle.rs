@@ -404,6 +404,20 @@ pub(crate) fn rederive_settled_index_expr_owners(
 
     // Read-only per file, applied on the caller thread in file order like
     let results = parallel::map_files_collect(db, &file_ids, |db, file_id| {
+        let file_candidates = &candidates[&file_id];
+        // The cache only serves a file that re-derives a member this round —
+        // an all-fresh file early-outs on the same staleness check.
+        if !rederive_all
+            && !file_candidates.iter().any(|member_id| {
+                candidate_reads
+                    .get(&(read_pass, super::SettledCandidate::Member(*member_id)))
+                    .is_none_or(|(version, reads)| {
+                        version.is_stale_against(&read_version, db, reads)
+                    })
+            })
+        {
+            return (file_id, Vec::new(), Vec::new());
+        }
         let mut infer_cache = LuaInferCache::new(
             file_id,
             crate::CacheOptions {
@@ -418,12 +432,14 @@ pub(crate) fn rederive_settled_index_expr_owners(
         // alone rather than every candidate in the file. The guard disarms on
         // whichever path the body takes.
         let mut drained_reads = Vec::new();
-        for &member_id in &candidates[&file_id] {
+        for &member_id in file_candidates {
             let key = super::SettledCandidate::Member(member_id);
             let stale = rederive_all
                 || candidate_reads
                     .get(&(read_pass, key))
-                    .is_none_or(|(version, reads)| version.is_stale(db, reads));
+                    .is_none_or(|(version, reads)| {
+                        version.is_stale_against(&read_version, db, reads)
+                    });
             if !stale {
                 continue;
             }

@@ -392,38 +392,24 @@ fn fixpoint_reads_are_stale(db: &DbIndex, record: &FixpointReadRecord) -> bool {
 /// same speculation-validity rule the drain applies to worker outcomes — but
 /// only if the record actually covers what the item is waiting on.
 ///
-/// Always-reached reasons name no dependency, so freshness plus a non-empty
-/// record decides. Dep-named reasons never park: their group's reach check
-/// already reads the live slot the item waits on, and a transition that
-/// lands without a content bump is invisible to the record's epochs.
-fn record_covers_reason(reason: &InferFailReason, record: &FixpointReadRecord) -> bool {
-    let reads = &record.reads;
-    match reason {
-        // Reasons naming no dependency park only while everything the
-        // attempt ever read is unmoved — but that verdict is only worth
-        // trusting when the record consulted mutable state at all. An
-        // empty set can never report stale, so parking on it either wastes
-        // nothing (the failure was deterministic) or buries a miss that
-        // recorded nothing, and only the second is visible.
+/// Whether a reason group can hold parked items at all — a per-group
+/// property, so it decides once per drain rather than per item.
+///
+/// Dep-named reasons never park: the group's reach check already reads the
+/// live slot the item waits on, so a drained item always attempts — a
+/// parked item would sit past the landing it was waiting for. The readable
+/// transition can also land without a content bump (a held return
+/// re-derived to the same docs), which the record's epoch check cannot
+/// see, while `check_reach_reason` reads the live flag.
+fn reason_can_park(reason: &InferFailReason) -> bool {
+    matches!(
+        reason,
         InferFailReason::None
-        | InferFailReason::FieldNotFound
-        | InferFailReason::UnResolveOperatorCall
-        | InferFailReason::UnResolveIterTemplate
-        | InferFailReason::RecursiveInfer => !reads.is_empty(),
-        // The group itself is the dependency: it only drains once the named
-        // slot is readable, so every item inside must attempt — a parked
-        // item would sit past the landing it was waiting for. The readable
-        // transition can also land without a content bump (a held return
-        // re-derived to the same docs), which the record's epoch check
-        // cannot see, while `check_reach_reason` reads the live flag.
-        InferFailReason::UnResolveDeclType(_)
-        | InferFailReason::UnResolveMemberType(_)
-        | InferFailReason::UnResolveSignatureReturn(_)
-        | InferFailReason::UnResolveModuleExport(_)
-        | InferFailReason::UnResolveTypeDecl(_)
-        | InferFailReason::UnResolveExpr(_)
-        | InferFailReason::UnSealedDynamicFields => false,
-    }
+            | InferFailReason::FieldNotFound
+            | InferFailReason::UnResolveOperatorCall
+            | InferFailReason::UnResolveIterTemplate
+            | InferFailReason::RecursiveInfer
+    )
 }
 
 /// Whether an item that fails with `reason` again under the force phase is
@@ -614,12 +600,15 @@ pub(super) fn settle_floored_fixpoint(
         // re-derivation that fails (a self-recursive body reads its own
         // return) must leave the answer in place rather than nothing.
         let _gate = Profile::cond_new("settle/gate", profile_enabled);
+        // The scan writes no epochs — the held-return flip below is a status
+        // field, not a `note_return_write` — so one capture covers it.
+        let now = crate::db_index::read_set::InferenceReadVersion::capture(db);
         let mut held_returns = Vec::new();
         for unresolve in pool {
             let stale = full_requeue
                 || read_records
                     .get(&unresolve_identity(&unresolve))
-                    .is_none_or(|record| fixpoint_reads_are_stale(db, record));
+                    .is_none_or(|record| record.is_stale_against(&now, db));
             if !stale {
                 parked.push(unresolve);
                 continue;
@@ -1095,20 +1084,36 @@ fn try_resolve(
             // would survive an attempt the serial code was meant to retire.
             // Dep-named reasons never park: their reach check already reads
             // the live slot the group waits on, so a drained item always
-            // attempts (see `record_covers_reason`).
+            // attempts — they skip the identity lookup and staleness walk
+            // entirely (see `reason_can_park`).
             let force = infer_manager.current_phase().is_force();
             let mut candidates: Vec<UnResolve> = Vec::new();
-            if let Some(records) = fixpoint_reads.as_deref() {
+            let parkable = reason_can_park(check_reason)
+                && (!force
+                    || unresolves
+                        .iter()
+                        .any(|unresolve| force_retains_failure(check_reason, unresolve)));
+            if let (true, Some(records)) = (parkable, fixpoint_reads.as_deref()) {
+                // The index cannot move during the partition — the group's
+                // drain has not run yet — so one capture stands for every
+                // item's staleness check.
+                let now = crate::db_index::read_set::InferenceReadVersion::capture(db);
                 for unresolve in unresolves.drain(..) {
                     let park = records
                         .get(&unresolve_identity(&unresolve))
                         .is_some_and(|record| {
-                            !fixpoint_reads_are_stale(db, record)
-                                && record_covers_reason(check_reason, record)
+                            // An empty record can never report stale, so
+                            // parking on it either wastes nothing (the failure
+                            // was deterministic) or buries a miss that recorded
+                            // nothing — and only the second is visible.
+                            !record.reads.is_empty()
+                                && !record.is_stale_against(&now, db)
                                 && (!force || force_retains_failure(check_reason, &unresolve))
                         });
                     if park {
-                        retain_unresolve.push((unresolve, check_reason.clone()));
+                        // Rejoins its own group in drain order — still
+                        // sorted, so it does not mark the group touched.
+                        retain_unresolve.push((unresolve, check_reason.clone(), true));
                     } else {
                         candidates.push(unresolve);
                     }
@@ -1295,19 +1300,26 @@ fn try_resolve(
                         // settling run has no floor to give it either; it is
                         // kept for the run after the next fact source.
                         if !cache.get_config().analysis_phase.is_force() {
-                            retain_unresolve.push((unresolve, reason));
+                            retain_unresolve.push((unresolve, reason, false));
                         }
                     }
                     Err(InferFailReason::FieldNotFound) => {
                         let settled_member_attach = is_settled_member_attach(&unresolve);
                         if !cache.get_config().analysis_phase.is_force() || settled_member_attach {
-                            retain_unresolve.push((unresolve, InferFailReason::FieldNotFound));
+                            retain_unresolve.push((
+                                unresolve,
+                                InferFailReason::FieldNotFound,
+                                false,
+                            ));
                         }
                     }
                     Err(InferFailReason::UnResolveOperatorCall) => {
                         if !cache.get_config().analysis_phase.is_force() {
-                            retain_unresolve
-                                .push((unresolve, InferFailReason::UnResolveOperatorCall));
+                            retain_unresolve.push((
+                                unresolve,
+                                InferFailReason::UnResolveOperatorCall,
+                                false,
+                            ));
                         }
                     }
                     Err(reason) => {
@@ -1316,7 +1328,7 @@ fn try_resolve(
                         {
                             changed = true;
                             retry_file_ids.insert(file_id);
-                            retain_unresolve.push((unresolve, reason));
+                            retain_unresolve.push((unresolve, reason, false));
                         } else {
                             // Re-failing on the dependency the group was
                             // reached on usually means the attempt replayed
@@ -1344,8 +1356,12 @@ fn try_resolve(
         }
 
         let mut keys_changed = !retain_unresolve.is_empty();
-        for (unresolve, reason) in retain_unresolve {
-            touched.insert(reason.clone());
+        for (unresolve, reason, ordered) in retain_unresolve {
+            // Partition retains rejoin in drain order (already sorted);
+            // every other push can break a group's order and marks it.
+            if !ordered {
+                touched.insert(reason.clone());
+            }
             reason_resolve.entry(reason).or_default().push(unresolve);
         }
 
@@ -2183,7 +2199,7 @@ mod tests {
         let mut reads = InferenceReadSet::default();
         reads.params.insert(signature_id);
         FixpointReadRecord {
-            reads,
+            reads: Box::new(reads),
             type_epoch: 0,
             return_epoch: 0,
             param_epoch: 0,
@@ -2212,7 +2228,7 @@ mod tests {
         let mut reads = InferenceReadSet::default();
         reads.modules.insert(file_id);
         FixpointReadRecord {
-            reads,
+            reads: Box::new(reads),
             type_epoch: 0,
             return_epoch: 0,
             param_epoch: 0,
@@ -2241,7 +2257,7 @@ mod tests {
         let mut reads = InferenceReadSet::default();
         reads.special_calls.insert((file_id, position));
         FixpointReadRecord {
-            reads,
+            reads: Box::new(reads),
             type_epoch: 0,
             return_epoch: 0,
             param_epoch: 0,
@@ -2270,7 +2286,7 @@ mod tests {
         let mut reads = InferenceReadSet::default();
         reads.contribs.insert((signature_id, param_idx));
         FixpointReadRecord {
-            reads,
+            reads: Box::new(reads),
             type_epoch: 0,
             return_epoch: 0,
             param_epoch: 0,
@@ -2431,7 +2447,7 @@ mod tests {
             .dynamic_fields
             .insert((owner, field_name.map(smol_str::SmolStr::new)));
         FixpointReadRecord {
-            reads,
+            reads: Box::new(reads),
             type_epoch: 0,
             return_epoch: 0,
             param_epoch: 0,

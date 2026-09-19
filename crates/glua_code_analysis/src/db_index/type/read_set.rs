@@ -320,7 +320,9 @@ impl InferenceReadSet {
 
 #[derive(Debug, Clone)]
 pub(crate) struct InferredReturnReadRecord {
-    pub reads: InferenceReadSet,
+    /// Boxed so the record stays small: the maps it lives in rehash without
+    /// moving ~1.4KB of read sets per entry.
+    pub reads: Box<InferenceReadSet>,
     pub type_epoch: u64,
     pub return_epoch: u64,
     pub param_epoch: u64,
@@ -344,104 +346,213 @@ pub(crate) struct InferredReturnReadRecord {
     pub metatable_clock: u64,
 }
 
-thread_local! {
-    static DEPTH: Cell<u32> = const { Cell::new(0) };
-    static TRACK_MEMBER_MAPS: Cell<bool> = const { Cell::new(false) };
-    static MEMBER_MAPS: RefCell<FxHashMap<LuaMemberOwner, (u64, u64, u64, usize)>> =
-        RefCell::new(FxHashMap::default());
-    static MEMBER_KEYS: RefCell<FxHashMap<LuaMemberKey, (u64, u64, usize)>> =
-        RefCell::new(FxHashMap::default());
-    static READS: RefCell<FxHashSet<LuaTypeOwner>> = RefCell::new(FxHashSet::default());
-    static SIGNATURES: RefCell<FxHashSet<LuaSignatureId>> = RefCell::new(FxHashSet::default());
-    static PARAMS: RefCell<FxHashSet<LuaSignatureId>> = RefCell::new(FxHashSet::default());
-    static MODULES: RefCell<FxHashSet<FileId>> = RefCell::new(FxHashSet::default());
-    static SPECIAL_CALLS: RefCell<FxHashSet<(FileId, TextSize)>> = RefCell::new(FxHashSet::default());
-    static CONTRIBS: RefCell<FxHashSet<(LuaSignatureId, usize)>> = RefCell::new(FxHashSet::default());
-    static DYNAMIC_FIELDS: RefCell<FxHashSet<(DynamicFieldOwner, Option<SmolStr>)>> = RefCell::new(FxHashSet::default());
-    static MISSING_MEMBER_SLOTS: RefCell<FxHashMap<(LuaMemberOwner, LuaMemberKey), (usize, usize)>> = RefCell::new(FxHashMap::default());
-    static MEMBER_IDS: RefCell<FxHashMap<LuaMemberId, u64>> =
-        RefCell::new(FxHashMap::default());
-    static TYPE_DECLS: RefCell<FxHashMap<(LuaTypeDeclId, TypeDeclKind), u64>> =
-        RefCell::new(FxHashMap::default());
-    static BOUND_DECLS: RefCell<FxHashMap<(LuaTypeDeclId, FileId), u64>> =
-        RefCell::new(FxHashMap::default());
-    static VGUI_TYPE_DECLS: RefCell<FxHashMap<LuaTypeDeclId, u64>> =
-        RefCell::new(FxHashMap::default());
-    static DECL_MISCS: RefCell<FxHashMap<LuaDeclId, u64>> =
-        RefCell::new(FxHashMap::default());
-    static DECL_CLAIMS: RefCell<FxHashMap<LuaDeclId, u64>> =
-        RefCell::new(FxHashMap::default());
-    static DECL_DEFAULTS: RefCell<FxHashMap<LuaDeclId, u64>> =
-        RefCell::new(FxHashMap::default());
-    static DEFINITION_FACTS: RefCell<FxHashMap<LuaDefinitionId, u64>> =
-        RefCell::new(FxHashMap::default());
-    static GLOBAL_PATHS: RefCell<FxHashMap<GlobalId, u64>> =
-        RefCell::new(FxHashMap::default());
-    static OPERATOR_OWNERS: RefCell<FxHashMap<LuaOperatorOwner, u64>> =
-        RefCell::new(FxHashMap::default());
-    static METATABLE_SITES: RefCell<FxHashMap<InFiled<TextRange>, u64>> =
-        RefCell::new(FxHashMap::default());
-    static DEFINITION_SITES: RefCell<FxHashMap<InFiled<TextRange>, u64>> =
-        RefCell::new(FxHashMap::default());
-    static GMOD_METAS: RefCell<FxHashSet<SmolStr>> = RefCell::new(FxHashSet::default());
-    static FILE_SCOPEDS: RefCell<FxHashMap<(FileId, FileScopedKind), u64>> =
-        RefCell::new(FxHashMap::default());
-    static TYPE_DECL_SCAN: Cell<bool> = const { Cell::new(false) };
+/// Everything one armed scope accumulates, bundled under a single
+/// thread-local: a `record_*` call used to pay one `LocalKey::with`
+/// dispatch for the depth gate plus one per collection it touched (and the
+/// seq stamps on top); one dispatch now reaches the whole set, and
+/// `arm`/`disarm` drop from ~50 dispatches to one each.
+///
+/// Each collection stays its own `RefCell` rather than one borrow covering
+/// the set: version getters like `LuaMemberIndex::read_version` record
+/// their own reads through `canonical`, so a nested `record_*` lands while
+/// the caller's borrow is still held — only a different field may nest.
+#[derive(Default)]
+struct ActiveReads {
+    /// Armed-scope nesting depth; recording only happens above zero.
+    depth: Cell<u32>,
+    /// Member-map shape reads are only collected for scopes that asked —
+    /// [`arm_with_member_maps`] — settled passes validate them.
+    track_member_maps: Cell<bool>,
+    type_owners: RefCell<FxHashSet<LuaTypeOwner>>,
+    member_maps: RefCell<FxHashMap<LuaMemberOwner, (u64, u64, u64, usize)>>,
+    member_keys: RefCell<FxHashMap<LuaMemberKey, (u64, u64, usize)>>,
+    signatures: RefCell<FxHashSet<LuaSignatureId>>,
+    params: RefCell<FxHashSet<LuaSignatureId>>,
+    modules: RefCell<FxHashSet<FileId>>,
+    special_calls: RefCell<FxHashSet<(FileId, TextSize)>>,
+    contribs: RefCell<FxHashSet<(LuaSignatureId, usize)>>,
+    dynamic_fields: RefCell<FxHashSet<(DynamicFieldOwner, Option<SmolStr>)>>,
+    missing_member_slots: RefCell<FxHashMap<(LuaMemberOwner, LuaMemberKey), (usize, usize)>>,
+    member_ids: RefCell<FxHashMap<LuaMemberId, u64>>,
+    type_decls: RefCell<FxHashMap<(LuaTypeDeclId, TypeDeclKind), u64>>,
+    bound_decls: RefCell<FxHashMap<(LuaTypeDeclId, FileId), u64>>,
+    vgui_type_decls: RefCell<FxHashMap<LuaTypeDeclId, u64>>,
+    decl_miscs: RefCell<FxHashMap<LuaDeclId, u64>>,
+    decl_claims: RefCell<FxHashMap<LuaDeclId, u64>>,
+    decl_defaults: RefCell<FxHashMap<LuaDeclId, u64>>,
+    definition_facts: RefCell<FxHashMap<LuaDefinitionId, u64>>,
+    global_paths: RefCell<FxHashMap<GlobalId, u64>>,
+    operator_owners: RefCell<FxHashMap<LuaOperatorOwner, u64>>,
+    metatable_sites: RefCell<FxHashMap<InFiled<TextRange>, u64>>,
+    definition_sites: RefCell<FxHashMap<InFiled<TextRange>, u64>>,
+    gmod_metas: RefCell<FxHashSet<SmolStr>>,
+    file_scopeds: RefCell<FxHashMap<(FileId, FileScopedKind), u64>>,
+    type_decl_scan: Cell<bool>,
     /// A monotonic event ordinal shared by read recording and the wave's
     /// deferred-write pushes. Stamping both on one clock lets the drain tell
     /// whether a slot read happened *after* the attempt queued its own write
     /// to that slot — a read that precedes the push sees the same pre-write
     /// state the serial attempt sees, while a later one diverged.
-    static SEQ: Cell<u64> = const { Cell::new(0) };
-    static READ_SEQS: RefCell<FxHashMap<WriteKey, u64>> =
-        RefCell::new(FxHashMap::default());
+    seq: Cell<u64>,
+    read_seqs: RefCell<FxHashMap<WriteKey, u64>>,
     /// True once the armed scope queued its first deferred write. A read
     /// taken before that point precedes every push, so it can never have
     /// diverged from the serial order and its stamp is dead bookkeeping —
     /// most attempts push nothing or write only at the end, which leaves
     /// nearly every recorded read unstamped.
-    static WRITES_QUEUED: Cell<bool> = const { Cell::new(false) };
+    writes_queued: Cell<bool>,
+}
+
+thread_local! {
+    static ACTIVE: ActiveReads = ActiveReads::default();
+}
+
+/// Reaches the armed-scope state — the single `LocalKey` dispatch every
+/// `record_*`, the arm/disarm pair, and the seq helpers all funnel through.
+#[inline]
+fn with_active<R>(f: impl FnOnce(&ActiveReads) -> R) -> R {
+    ACTIVE.with(f)
+}
+
+impl ActiveReads {
+    /// Empties every collection for a fresh outermost scope. `seq` keeps
+    /// counting: ordinals only compare within a scope, and a scope's own
+    /// pushes always start after its reads anyway.
+    fn clear(&self) {
+        self.track_member_maps.set(false);
+        self.type_owners.borrow_mut().clear();
+        self.member_maps.borrow_mut().clear();
+        self.member_keys.borrow_mut().clear();
+        self.signatures.borrow_mut().clear();
+        self.params.borrow_mut().clear();
+        self.modules.borrow_mut().clear();
+        self.special_calls.borrow_mut().clear();
+        self.contribs.borrow_mut().clear();
+        self.dynamic_fields.borrow_mut().clear();
+        self.missing_member_slots.borrow_mut().clear();
+        self.member_ids.borrow_mut().clear();
+        self.type_decls.borrow_mut().clear();
+        self.bound_decls.borrow_mut().clear();
+        self.vgui_type_decls.borrow_mut().clear();
+        self.decl_miscs.borrow_mut().clear();
+        self.decl_claims.borrow_mut().clear();
+        self.decl_defaults.borrow_mut().clear();
+        self.definition_facts.borrow_mut().clear();
+        self.global_paths.borrow_mut().clear();
+        self.operator_owners.borrow_mut().clear();
+        self.metatable_sites.borrow_mut().clear();
+        self.definition_sites.borrow_mut().clear();
+        self.gmod_metas.borrow_mut().clear();
+        self.file_scopeds.borrow_mut().clear();
+        self.type_decl_scan.set(false);
+        self.read_seqs.borrow_mut().clear();
+        self.writes_queued.set(false);
+    }
+
+    /// A full copy of what has been read so far — the nested `disarm`, which
+    /// leaves the outer collection in place.
+    fn snapshot(&self) -> InferenceReadSet {
+        InferenceReadSet {
+            type_owners: self.type_owners.borrow().clone(),
+            member_maps: self.member_maps.borrow().clone(),
+            member_keys: self.member_keys.borrow().clone(),
+            signatures: self.signatures.borrow().clone(),
+            params: self.params.borrow().clone(),
+            modules: self.modules.borrow().clone(),
+            special_calls: self.special_calls.borrow().clone(),
+            contribs: self.contribs.borrow().clone(),
+            dynamic_fields: self.dynamic_fields.borrow().clone(),
+            missing_member_slots: self.missing_member_slots.borrow().clone(),
+            member_ids: self.member_ids.borrow().clone(),
+            type_decls: self.type_decls.borrow().clone(),
+            bound_decls: self.bound_decls.borrow().clone(),
+            vgui_type_decls: self.vgui_type_decls.borrow().clone(),
+            decl_miscs: self.decl_miscs.borrow().clone(),
+            decl_claims: self.decl_claims.borrow().clone(),
+            decl_defaults: self.decl_defaults.borrow().clone(),
+            definition_facts: self.definition_facts.borrow().clone(),
+            global_paths: self.global_paths.borrow().clone(),
+            operator_owners: self.operator_owners.borrow().clone(),
+            metatable_sites: self.metatable_sites.borrow().clone(),
+            definition_sites: self.definition_sites.borrow().clone(),
+            gmod_metas: self.gmod_metas.borrow().clone(),
+            file_scopeds: self.file_scopeds.borrow().clone(),
+            type_decl_scan: self.type_decl_scan.get(),
+            read_seqs: self.read_seqs.borrow().clone(),
+        }
+    }
+
+    /// Moves the accumulated reads out — the outermost `disarm`, leaving
+    /// emptied collections behind for the next scope.
+    fn take_set(&self) -> InferenceReadSet {
+        InferenceReadSet {
+            type_owners: self.type_owners.take(),
+            member_maps: self.member_maps.take(),
+            member_keys: self.member_keys.take(),
+            signatures: self.signatures.take(),
+            params: self.params.take(),
+            modules: self.modules.take(),
+            special_calls: self.special_calls.take(),
+            contribs: self.contribs.take(),
+            dynamic_fields: self.dynamic_fields.take(),
+            missing_member_slots: self.missing_member_slots.take(),
+            member_ids: self.member_ids.take(),
+            type_decls: self.type_decls.take(),
+            bound_decls: self.bound_decls.take(),
+            vgui_type_decls: self.vgui_type_decls.take(),
+            decl_miscs: self.decl_miscs.take(),
+            decl_claims: self.decl_claims.take(),
+            decl_defaults: self.decl_defaults.take(),
+            definition_facts: self.definition_facts.take(),
+            global_paths: self.global_paths.take(),
+            operator_owners: self.operator_owners.take(),
+            metatable_sites: self.metatable_sites.take(),
+            definition_sites: self.definition_sites.take(),
+            gmod_metas: self.gmod_metas.take(),
+            file_scopeds: self.file_scopeds.take(),
+            type_decl_scan: self.type_decl_scan.replace(false),
+            read_seqs: self.read_seqs.take(),
+        }
+    }
+
+    /// Hands out the next event ordinal. Deferred-write pushes stamp their
+    /// keys with it, so a read's ordinal can be compared against the push
+    /// that wrote the same slot.
+    #[inline]
+    fn bump_seq(&self) -> u64 {
+        let next = self.seq.get().wrapping_add(1);
+        self.seq.set(next);
+        next
+    }
+
+    /// Stamps `key` with the ordinal of this read, once the scope has queued
+    /// a write worth ordering against. Repeated reads keep the latest, which
+    /// is the comparison `self_conflicted` wants: any read that ran after
+    /// the slot's first queued write may have diverged.
+    #[inline]
+    fn note_read_seq(&self, key: WriteKey) {
+        if !self.writes_queued.get() {
+            return;
+        }
+        let seq = self.bump_seq();
+        self.read_seqs.borrow_mut().insert(key, seq);
+    }
 }
 
 /// Starts collecting reads, sharing the collection with any enclosing scope.
 pub(crate) fn arm() {
-    if DEPTH.with(Cell::get) == 0 {
-        TRACK_MEMBER_MAPS.with(|track| track.set(false));
-        READS.with(|reads| reads.borrow_mut().clear());
-        MEMBER_MAPS.with(|maps| maps.borrow_mut().clear());
-        MEMBER_KEYS.with(|keys| keys.borrow_mut().clear());
-        SIGNATURES.with(|signatures| signatures.borrow_mut().clear());
-        PARAMS.with(|params| params.borrow_mut().clear());
-        MODULES.with(|modules| modules.borrow_mut().clear());
-        SPECIAL_CALLS.with(|sites| sites.borrow_mut().clear());
-        CONTRIBS.with(|slots| slots.borrow_mut().clear());
-        DYNAMIC_FIELDS.with(|fields| fields.borrow_mut().clear());
-        MISSING_MEMBER_SLOTS.with(|slots| slots.borrow_mut().clear());
-        MEMBER_IDS.with(|ids| ids.borrow_mut().clear());
-        TYPE_DECLS.with(|decls| decls.borrow_mut().clear());
-        BOUND_DECLS.with(|decls| decls.borrow_mut().clear());
-        VGUI_TYPE_DECLS.with(|decls| decls.borrow_mut().clear());
-        DECL_MISCS.with(|decls| decls.borrow_mut().clear());
-        DEFINITION_FACTS.with(|facts| facts.borrow_mut().clear());
-        GLOBAL_PATHS.with(|paths| paths.borrow_mut().clear());
-        OPERATOR_OWNERS.with(|owners| owners.borrow_mut().clear());
-        METATABLE_SITES.with(|sites| sites.borrow_mut().clear());
-        DEFINITION_SITES.with(|sites| sites.borrow_mut().clear());
-        GMOD_METAS.with(|metas| metas.borrow_mut().clear());
-        FILE_SCOPEDS.with(|files| files.borrow_mut().clear());
-        DECL_CLAIMS.with(|claims| claims.borrow_mut().clear());
-        DECL_DEFAULTS.with(|defaults| defaults.borrow_mut().clear());
-        TYPE_DECL_SCAN.with(|scan| scan.set(false));
-        READ_SEQS.with(|seqs| seqs.borrow_mut().clear());
-        WRITES_QUEUED.with(|queued| queued.set(false));
-    }
-    DEPTH.with(|depth| depth.set(depth.get() + 1));
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            active.clear();
+        }
+        active.depth.set(active.depth.get() + 1);
+    });
 }
 
 /// Includes member-map shape reads for settled passes that validate them.
 pub(crate) fn arm_with_member_maps() {
     arm();
-    TRACK_MEMBER_MAPS.with(|track| track.set(true));
+    with_active(|active| active.track_member_maps.set(true));
 }
 
 /// Stops collecting and hands back what was read since [`arm`].
@@ -451,83 +562,14 @@ pub(crate) fn arm_with_member_maps() {
 /// than underflow; every `arm` in the codebase is paired, so the saturated
 /// path only takes whatever is left over.
 pub(crate) fn disarm() -> InferenceReadSet {
-    let depth = DEPTH.with(Cell::get);
-    DEPTH.with(|armed| armed.set(depth.saturating_sub(1)));
-    if depth > 1 {
-        InferenceReadSet {
-            type_owners: READS.with(|reads| reads.borrow().clone()),
-            member_maps: MEMBER_MAPS.with(|maps| maps.borrow().clone()),
-            member_keys: MEMBER_KEYS.with(|keys| keys.borrow().clone()),
-            signatures: SIGNATURES.with(|signatures| signatures.borrow().clone()),
-            params: PARAMS.with(|params| params.borrow().clone()),
-            modules: MODULES.with(|modules| modules.borrow().clone()),
-            special_calls: SPECIAL_CALLS.with(|sites| sites.borrow().clone()),
-            contribs: CONTRIBS.with(|slots| slots.borrow().clone()),
-            dynamic_fields: DYNAMIC_FIELDS.with(|fields| fields.borrow().clone()),
-            missing_member_slots: MISSING_MEMBER_SLOTS.with(|slots| slots.borrow().clone()),
-            member_ids: MEMBER_IDS.with(|ids| ids.borrow().clone()),
-            type_decls: TYPE_DECLS.with(|decls| decls.borrow().clone()),
-            bound_decls: BOUND_DECLS.with(|decls| decls.borrow().clone()),
-            vgui_type_decls: VGUI_TYPE_DECLS.with(|decls| decls.borrow().clone()),
-            decl_miscs: DECL_MISCS.with(|decls| decls.borrow().clone()),
-            decl_claims: DECL_CLAIMS.with(|claims| claims.borrow().clone()),
-            decl_defaults: DECL_DEFAULTS.with(|defaults| defaults.borrow().clone()),
-            definition_facts: DEFINITION_FACTS.with(|facts| facts.borrow().clone()),
-            global_paths: GLOBAL_PATHS.with(|paths| paths.borrow().clone()),
-            operator_owners: OPERATOR_OWNERS.with(|owners| owners.borrow().clone()),
-            metatable_sites: METATABLE_SITES.with(|sites| sites.borrow().clone()),
-            definition_sites: DEFINITION_SITES.with(|sites| sites.borrow().clone()),
-            gmod_metas: GMOD_METAS.with(|metas| metas.borrow().clone()),
-            file_scopeds: FILE_SCOPEDS.with(|files| files.borrow().clone()),
-            type_decl_scan: TYPE_DECL_SCAN.with(Cell::get),
-            read_seqs: READ_SEQS.with(|seqs| seqs.borrow().clone()),
+    with_active(|active| {
+        let depth = active.depth.get();
+        active.depth.set(depth.saturating_sub(1));
+        if depth > 1 {
+            active.snapshot()
+        } else {
+            active.take_set()
         }
-    } else {
-        InferenceReadSet {
-            type_owners: READS.with(|reads| std::mem::take(&mut *reads.borrow_mut())),
-            member_maps: MEMBER_MAPS.with(|maps| std::mem::take(&mut *maps.borrow_mut())),
-            member_keys: MEMBER_KEYS.with(|keys| std::mem::take(&mut *keys.borrow_mut())),
-            signatures: SIGNATURES.with(|signatures| std::mem::take(&mut *signatures.borrow_mut())),
-            params: PARAMS.with(|params| std::mem::take(&mut *params.borrow_mut())),
-            modules: MODULES.with(|modules| std::mem::take(&mut *modules.borrow_mut())),
-            special_calls: SPECIAL_CALLS.with(|sites| std::mem::take(&mut *sites.borrow_mut())),
-            contribs: CONTRIBS.with(|slots| std::mem::take(&mut *slots.borrow_mut())),
-            dynamic_fields: DYNAMIC_FIELDS.with(|fields| std::mem::take(&mut *fields.borrow_mut())),
-            missing_member_slots: MISSING_MEMBER_SLOTS
-                .with(|slots| std::mem::take(&mut *slots.borrow_mut())),
-            member_ids: MEMBER_IDS.with(|ids| std::mem::take(&mut *ids.borrow_mut())),
-            type_decls: TYPE_DECLS.with(|decls| std::mem::take(&mut *decls.borrow_mut())),
-            bound_decls: BOUND_DECLS.with(|decls| std::mem::take(&mut *decls.borrow_mut())),
-            vgui_type_decls: VGUI_TYPE_DECLS.with(|decls| std::mem::take(&mut *decls.borrow_mut())),
-            decl_miscs: DECL_MISCS.with(|decls| std::mem::take(&mut *decls.borrow_mut())),
-            decl_claims: DECL_CLAIMS.with(|claims| std::mem::take(&mut *claims.borrow_mut())),
-            decl_defaults: DECL_DEFAULTS
-                .with(|defaults| std::mem::take(&mut *defaults.borrow_mut())),
-            definition_facts: DEFINITION_FACTS
-                .with(|facts| std::mem::take(&mut *facts.borrow_mut())),
-            global_paths: GLOBAL_PATHS.with(|paths| std::mem::take(&mut *paths.borrow_mut())),
-            operator_owners: OPERATOR_OWNERS
-                .with(|owners| std::mem::take(&mut *owners.borrow_mut())),
-            metatable_sites: METATABLE_SITES.with(|sites| std::mem::take(&mut *sites.borrow_mut())),
-            definition_sites: DEFINITION_SITES
-                .with(|sites| std::mem::take(&mut *sites.borrow_mut())),
-            gmod_metas: GMOD_METAS.with(|metas| std::mem::take(&mut *metas.borrow_mut())),
-            file_scopeds: FILE_SCOPEDS.with(|files| std::mem::take(&mut *files.borrow_mut())),
-            type_decl_scan: TYPE_DECL_SCAN.with(|scan| scan.replace(false)),
-            read_seqs: READ_SEQS.with(|seqs| std::mem::take(&mut *seqs.borrow_mut())),
-        }
-    }
-}
-
-/// Hands out the next event ordinal. Deferred-write pushes stamp their keys
-/// with it, so a read's ordinal can be compared against the push that wrote
-/// the same slot. Reads stamp theirs inside their `record_*` call.
-#[inline]
-pub(crate) fn next_seq() -> u64 {
-    SEQ.with(|seq| {
-        let next = seq.get().wrapping_add(1);
-        seq.set(next);
-        next
     })
 }
 
@@ -536,44 +578,34 @@ pub(crate) fn next_seq() -> u64 {
 /// stay unstamped — they observed the pre-write state either way.
 #[inline]
 pub(crate) fn next_write_seq() -> u64 {
-    WRITES_QUEUED.with(|queued| queued.set(true));
-    next_seq()
+    with_active(|active| {
+        active.writes_queued.set(true);
+        active.bump_seq()
+    })
 }
 
-/// Stamps `key` with the ordinal of this read, once the scope has queued a
-/// write worth ordering against. Repeated reads keep the latest, which is
-/// the comparison `self_conflicted` wants: any read that ran after the
-/// slot's first queued write may have diverged.
-#[inline]
-fn note_read_seq(key: WriteKey) {
-    if !WRITES_QUEUED.with(Cell::get) {
-        return;
-    }
-    let seq = next_seq();
-    READ_SEQS.with(|seqs| {
-        seqs.borrow_mut().insert(key, seq);
-    });
-}
-
+/// Records a read of a type owner's cache slot.
 #[inline]
 pub(crate) fn record(owner: &LuaTypeOwner) {
-    if DEPTH.with(Cell::get) == 0 {
-        return;
-    }
-    READS.with(|reads| {
-        reads.borrow_mut().insert(owner.clone());
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active.type_owners.borrow_mut().insert(owner.clone());
+        active.note_read_seq(WriteKey::TypeOwner(owner.clone()));
     });
-    note_read_seq(WriteKey::TypeOwner(owner.clone()));
 }
 
+/// Records a read of a signature's return slot (`return_docs`).
 #[inline]
 pub(crate) fn record_signature(signature_id: &LuaSignatureId) {
-    if DEPTH.with(Cell::get) > 0 {
-        SIGNATURES.with(|signatures| {
-            signatures.borrow_mut().insert(*signature_id);
-        });
-        note_read_seq(WriteKey::Signature(*signature_id));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active.signatures.borrow_mut().insert(*signature_id);
+        active.note_read_seq(WriteKey::Signature(*signature_id));
+    });
 }
 
 /// Records a read of a signature's parameter contract (`param_docs`).
@@ -584,64 +616,76 @@ pub(crate) fn record_signature(signature_id: &LuaSignatureId) {
 /// resolution), which covers every read an armed scope can make.
 #[inline]
 pub(crate) fn record_param(signature_id: &LuaSignatureId) {
-    if DEPTH.with(Cell::get) > 0 {
-        PARAMS.with(|params| {
-            params.borrow_mut().insert(*signature_id);
-        });
-        note_read_seq(WriteKey::Param(*signature_id));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active.params.borrow_mut().insert(*signature_id);
+        active.note_read_seq(WriteKey::Param(*signature_id));
+    });
 }
 
 /// Records a read of a module's exported type, keyed by the exporting file.
 #[inline]
 pub(crate) fn record_module(file_id: &FileId) {
-    if DEPTH.with(Cell::get) > 0 {
-        MODULES.with(|modules| {
-            modules.borrow_mut().insert(*file_id);
-        });
-        note_read_seq(WriteKey::Module(*file_id));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active.modules.borrow_mut().insert(*file_id);
+        active.note_read_seq(WriteKey::Module(*file_id));
+    });
 }
 
 /// Records a read of one call-site's special-call materializations, keyed by
 /// the calling file and the call's start offset.
 #[inline]
 pub(crate) fn record_special_call(file_id: &FileId, position: TextSize) {
-    if DEPTH.with(Cell::get) > 0 {
-        SPECIAL_CALLS.with(|sites| {
-            sites.borrow_mut().insert((*file_id, position));
-        });
-        note_read_seq(WriteKey::SpecialCall(*file_id, position));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active
+            .special_calls
+            .borrow_mut()
+            .insert((*file_id, position));
+        active.note_read_seq(WriteKey::SpecialCall(*file_id, position));
+    });
 }
 
 /// Records a read of one call-site-inferred parameter fact, keyed by the
 /// callee slot that holds it.
 #[inline]
 pub(crate) fn record_contrib(signature_id: &LuaSignatureId, param_idx: usize) {
-    if DEPTH.with(Cell::get) > 0 {
-        CONTRIBS.with(|slots| {
-            slots.borrow_mut().insert((*signature_id, param_idx));
-        });
-        note_read_seq(WriteKey::Contrib(*signature_id, param_idx));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active
+            .contribs
+            .borrow_mut()
+            .insert((*signature_id, param_idx));
+        active.note_read_seq(WriteKey::Contrib(*signature_id, param_idx));
+    });
 }
 
 /// Records a read of one dynamic field's definitions, keyed by owner and
 /// field name (`None` is the wildcard bucket).
 #[inline]
 pub(crate) fn record_dynamic_field(owner: &DynamicFieldOwner, field_name: Option<&str>) {
-    if DEPTH.with(Cell::get) > 0 {
-        DYNAMIC_FIELDS.with(|fields| {
-            fields
-                .borrow_mut()
-                .insert((owner.clone(), field_name.map(SmolStr::new)));
-        });
-        note_read_seq(WriteKey::DynamicField(
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active
+            .dynamic_fields
+            .borrow_mut()
+            .insert((owner.clone(), field_name.map(SmolStr::new)));
+        active.note_read_seq(WriteKey::DynamicField(
             owner.clone(),
             field_name.map(SmolStr::new),
         ));
-    }
+    });
 }
 
 #[inline]
@@ -651,27 +695,33 @@ pub(crate) fn record_missing_member_slot(
     member_count: usize,
     dynamic_field_count: usize,
 ) {
-    if DEPTH.with(Cell::get) > 0 {
-        MISSING_MEMBER_SLOTS.with(|slots| {
-            slots.borrow_mut().insert(
-                (owner.clone(), key.clone()),
-                (member_count, dynamic_field_count),
-            );
-        });
-        note_read_seq(WriteKey::MemberSlot(owner.clone(), key.clone()));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active.missing_member_slots.borrow_mut().insert(
+            (owner.clone(), key.clone()),
+            (member_count, dynamic_field_count),
+        );
+        active.note_read_seq(WriteKey::MemberSlot(owner.clone(), key.clone()));
+    });
 }
 
 #[inline]
 pub(crate) fn record_member_map(index: &crate::LuaMemberIndex, owner: &LuaMemberOwner) {
-    if DEPTH.with(Cell::get) > 0 && TRACK_MEMBER_MAPS.with(Cell::get) {
-        MEMBER_MAPS.with(|maps| {
-            maps.borrow_mut()
-                .entry(owner.clone())
-                .or_insert_with(|| index.read_version(owner));
-        });
-        note_read_seq(WriteKey::MemberOwner(owner.clone()));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 || !active.track_member_maps.get() {
+            return;
+        }
+        // `read_version` descends through `canonical`, which records its own
+        // reads — legal here only because it lands on other fields' cells.
+        active
+            .member_maps
+            .borrow_mut()
+            .entry(owner.clone())
+            .or_insert_with(|| index.read_version(owner));
+        active.note_read_seq(WriteKey::MemberOwner(owner.clone()));
+    });
 }
 
 /// Records a key-indexed member read (`get_current_members_for_key`).
@@ -683,14 +733,17 @@ pub(crate) fn record_member_map(index: &crate::LuaMemberIndex, owner: &LuaMember
 /// matching `record_member_map`.
 #[inline]
 pub(crate) fn record_member_key_read(index: &crate::LuaMemberIndex, key: &LuaMemberKey) {
-    if DEPTH.with(Cell::get) > 0 && TRACK_MEMBER_MAPS.with(Cell::get) {
-        MEMBER_KEYS.with(|keys| {
-            keys.borrow_mut()
-                .entry(key.clone())
-                .or_insert_with(|| index.key_read_version(key));
-        });
-        note_read_seq(WriteKey::MemberKey(key.clone()));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 || !active.track_member_maps.get() {
+            return;
+        }
+        active
+            .member_keys
+            .borrow_mut()
+            .entry(key.clone())
+            .or_insert_with(|| index.key_read_version(key));
+        active.note_read_seq(WriteKey::MemberKey(key.clone()));
+    });
 }
 
 /// Records a member-object read by id (`get_member`, `get_member_owner`,
@@ -698,14 +751,17 @@ pub(crate) fn record_member_key_read(index: &crate::LuaMemberIndex, key: &LuaMem
 /// move epoch — first read wins, matching `record_member_map`.
 #[inline]
 pub(crate) fn record_member_id(index: &crate::LuaMemberIndex, member_id: &LuaMemberId) {
-    if DEPTH.with(Cell::get) > 0 {
-        MEMBER_IDS.with(|ids| {
-            ids.borrow_mut()
-                .entry(*member_id)
-                .or_insert_with(|| index.member_object_version(member_id));
-        });
-        note_read_seq(WriteKey::MemberId(*member_id));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active
+            .member_ids
+            .borrow_mut()
+            .entry(*member_id)
+            .or_insert_with(|| index.member_object_version(member_id));
+        active.note_read_seq(WriteKey::MemberId(*member_id));
+    });
 }
 
 /// Records a `---` type-declaration read (`find_type_decl`, super-type and
@@ -717,16 +773,18 @@ pub(crate) fn record_type_decl(
     decl_id: &LuaTypeDeclId,
     kind: TypeDeclKind,
 ) {
-    if DEPTH.with(Cell::get) > 0 {
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
         let key = (decl_id.clone(), kind);
-        TYPE_DECLS.with(|decls| {
-            decls
-                .borrow_mut()
-                .entry(key.clone())
-                .or_insert_with(|| epochs.epoch(&key));
-        });
-        note_read_seq(WriteKey::TypeDecl(decl_id.clone()));
-    }
+        active
+            .type_decls
+            .borrow_mut()
+            .entry(key.clone())
+            .or_insert_with(|| epochs.epoch(&key));
+        active.note_read_seq(WriteKey::TypeDecl(decl_id.clone()));
+    });
 }
 
 /// Records a `decls_bound_to_type` read, stamped with the (bound-to type,
@@ -737,16 +795,18 @@ pub(crate) fn record_bound_decl(
     type_id: &LuaTypeDeclId,
     file_id: FileId,
 ) {
-    if DEPTH.with(Cell::get) > 0 {
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
         let key = (type_id.clone(), file_id);
-        BOUND_DECLS.with(|decls| {
-            decls
-                .borrow_mut()
-                .entry(key.clone())
-                .or_insert_with(|| epochs.epoch(&key));
-        });
-        note_read_seq(WriteKey::TypeDecl(type_id.clone()));
-    }
+        active
+            .bound_decls
+            .borrow_mut()
+            .entry(key.clone())
+            .or_insert_with(|| epochs.epoch(&key));
+        active.note_read_seq(WriteKey::TypeDecl(type_id.clone()));
+    });
 }
 
 /// Records a vgui parent-chain read (`get_vgui_panel_parent_chain`,
@@ -754,15 +814,17 @@ pub(crate) fn record_bound_decl(
 /// current write epoch on the gmod metadata index which owns those maps.
 #[inline]
 pub(crate) fn record_vgui_type_decl(epochs: &KeyedEpochs<LuaTypeDeclId>, decl_id: &LuaTypeDeclId) {
-    if DEPTH.with(Cell::get) > 0 {
-        VGUI_TYPE_DECLS.with(|decls| {
-            decls
-                .borrow_mut()
-                .entry(decl_id.clone())
-                .or_insert_with(|| epochs.epoch(decl_id));
-        });
-        note_read_seq(WriteKey::TypeDecl(decl_id.clone()));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active
+            .vgui_type_decls
+            .borrow_mut()
+            .entry(decl_id.clone())
+            .or_insert_with(|| epochs.epoch(decl_id));
+        active.note_read_seq(WriteKey::TypeDecl(decl_id.clone()));
+    });
 }
 
 /// Records a decl-object or decl-anchored side-entry read (`get_decl`,
@@ -770,15 +832,17 @@ pub(crate) fn record_vgui_type_decl(epochs: &KeyedEpochs<LuaTypeDeclId>, decl_id
 /// decl index — the earliest read wins.
 #[inline]
 pub(crate) fn record_decl_misc(epochs: &KeyedEpochs<LuaDeclId>, decl_id: &LuaDeclId) {
-    if DEPTH.with(Cell::get) > 0 {
-        DECL_MISCS.with(|decls| {
-            decls
-                .borrow_mut()
-                .entry(*decl_id)
-                .or_insert_with(|| epochs.epoch(decl_id));
-        });
-        note_read_seq(WriteKey::DeclMisc(*decl_id));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active
+            .decl_miscs
+            .borrow_mut()
+            .entry(*decl_id)
+            .or_insert_with(|| epochs.epoch(decl_id));
+        active.note_read_seq(WriteKey::DeclMisc(*decl_id));
+    });
 }
 
 /// Records a `decl_write_claim` read, stamped with the claim's current epoch
@@ -786,28 +850,31 @@ pub(crate) fn record_decl_misc(epochs: &KeyedEpochs<LuaDeclId>, decl_id: &LuaDec
 /// reader alone.
 #[inline]
 pub(crate) fn record_decl_claim(epochs: &KeyedEpochs<LuaDeclId>, decl_id: &LuaDeclId) {
-    if DEPTH.with(Cell::get) > 0 {
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
         let epoch = epochs.epoch(decl_id);
-        DECL_CLAIMS.with(|claims| {
-            claims.borrow_mut().insert(*decl_id, epoch);
-        });
-        note_read_seq(WriteKey::DeclMisc(*decl_id));
-    }
+        active.decl_claims.borrow_mut().insert(*decl_id, epoch);
+        active.note_read_seq(WriteKey::DeclMisc(*decl_id));
+    });
 }
 
 /// Records an `inferred_string_defaults` read, stamped with the decl's
 /// current write epoch on the property index which owns that map.
 #[inline]
 pub(crate) fn record_decl_default(epochs: &KeyedEpochs<LuaDeclId>, decl_id: &LuaDeclId) {
-    if DEPTH.with(Cell::get) > 0 {
-        DECL_DEFAULTS.with(|defaults| {
-            defaults
-                .borrow_mut()
-                .entry(*decl_id)
-                .or_insert_with(|| epochs.epoch(decl_id));
-        });
-        note_read_seq(WriteKey::DeclMisc(*decl_id));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active
+            .decl_defaults
+            .borrow_mut()
+            .entry(*decl_id)
+            .or_insert_with(|| epochs.epoch(decl_id));
+        active.note_read_seq(WriteKey::DeclMisc(*decl_id));
+    });
 }
 
 /// Records a definition-anchored inferred-fact read, stamped with the
@@ -817,30 +884,34 @@ pub(crate) fn record_definition_fact(
     epochs: &KeyedEpochs<LuaDefinitionId>,
     definition_id: &LuaDefinitionId,
 ) {
-    if DEPTH.with(Cell::get) > 0 {
-        DEFINITION_FACTS.with(|facts| {
-            facts
-                .borrow_mut()
-                .entry(*definition_id)
-                .or_insert_with(|| epochs.epoch(definition_id));
-        });
-        note_read_seq(WriteKey::DefinitionFact(*definition_id));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active
+            .definition_facts
+            .borrow_mut()
+            .entry(*definition_id)
+            .or_insert_with(|| epochs.epoch(definition_id));
+        active.note_read_seq(WriteKey::DefinitionFact(*definition_id));
+    });
 }
 
 /// Records a global-path metadata read (definition sites, provenance),
 /// stamped with the path's current write epoch on the member index.
 #[inline]
 pub(crate) fn record_global_path(epochs: &KeyedEpochs<GlobalId>, global_id: &GlobalId) {
-    if DEPTH.with(Cell::get) > 0 {
-        GLOBAL_PATHS.with(|paths| {
-            paths
-                .borrow_mut()
-                .entry(global_id.clone())
-                .or_insert_with(|| epochs.epoch(global_id));
-        });
-        note_read_seq(WriteKey::GlobalPath(global_id.clone()));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active
+            .global_paths
+            .borrow_mut()
+            .entry(global_id.clone())
+            .or_insert_with(|| epochs.epoch(global_id));
+        active.note_read_seq(WriteKey::GlobalPath(global_id.clone()));
+    });
 }
 
 /// Records an operator-table read, stamped with the operand owner's current
@@ -850,15 +921,17 @@ pub(crate) fn record_operator_owner(
     epochs: &KeyedEpochs<LuaOperatorOwner>,
     owner: &LuaOperatorOwner,
 ) {
-    if DEPTH.with(Cell::get) > 0 {
-        OPERATOR_OWNERS.with(|owners| {
-            owners
-                .borrow_mut()
-                .entry(owner.clone())
-                .or_insert_with(|| epochs.epoch(owner));
-        });
-        note_read_seq(WriteKey::OperatorOwner(owner.clone()));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active
+            .operator_owners
+            .borrow_mut()
+            .entry(owner.clone())
+            .or_insert_with(|| epochs.epoch(owner));
+        active.note_read_seq(WriteKey::OperatorOwner(owner.clone()));
+    });
 }
 
 /// Records a setmetatable binding read, stamped with the table site's
@@ -868,15 +941,17 @@ pub(crate) fn record_metatable(
     epochs: &KeyedEpochs<InFiled<TextRange>>,
     site: &InFiled<TextRange>,
 ) {
-    if DEPTH.with(Cell::get) > 0 {
-        METATABLE_SITES.with(|sites| {
-            sites
-                .borrow_mut()
-                .entry(site.clone())
-                .or_insert_with(|| epochs.epoch(site));
-        });
-        note_read_seq(WriteKey::Metatable(site.clone()));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active
+            .metatable_sites
+            .borrow_mut()
+            .entry(site.clone())
+            .or_insert_with(|| epochs.epoch(site));
+        active.note_read_seq(WriteKey::Metatable(site.clone()));
+    });
 }
 
 /// Records a table-literal → owning-path read (`definition_site_owner` /
@@ -887,36 +962,41 @@ pub(crate) fn record_definition_site(
     epochs: &KeyedEpochs<InFiled<TextRange>>,
     site: &InFiled<TextRange>,
 ) {
-    if DEPTH.with(Cell::get) > 0 {
-        DEFINITION_SITES.with(|sites| {
-            sites
-                .borrow_mut()
-                .entry(site.clone())
-                .or_insert_with(|| epochs.epoch(site));
-        });
-        note_read_seq(WriteKey::DefinitionSite(site.clone()));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active
+            .definition_sites
+            .borrow_mut()
+            .entry(site.clone())
+            .or_insert_with(|| epochs.epoch(site));
+        active.note_read_seq(WriteKey::DefinitionSite(site.clone()));
+    });
 }
 
 /// Records a name-keyed gmod-metadata read (vgui panels, derma skins,
 /// net/system registrations).
 #[inline]
 pub(crate) fn record_gmod_meta(name: &SmolStr) {
-    if DEPTH.with(Cell::get) > 0 {
-        GMOD_METAS.with(|metas| {
-            metas.borrow_mut().insert(name.clone());
-        });
-        note_read_seq(WriteKey::GmodMeta(name.clone()));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active.gmod_metas.borrow_mut().insert(name.clone());
+        active.note_read_seq(WriteKey::GmodMeta(name.clone()));
+    });
 }
 
 /// Records a whole-map enumeration of the type declarations — any
 /// `TypeDecl` write stales it, so the merge checks writes by tag.
 #[inline]
 pub(crate) fn record_type_decl_scan() {
-    if DEPTH.with(Cell::get) > 0 {
-        TYPE_DECL_SCAN.with(|scan| scan.set(true));
-    }
+    with_active(|active| {
+        if active.depth.get() > 0 {
+            active.type_decl_scan.set(true);
+        }
+    });
 }
 
 /// Records a `FileId`-keyed side-map read (namespaces, decl trees, per-file
@@ -929,17 +1009,18 @@ pub(crate) fn record_file_scoped(
     file_id: &FileId,
     kind: FileScopedKind,
 ) {
-    if DEPTH.with(Cell::get) > 0 {
-        FILE_SCOPEDS.with(|files| {
-            files
-                .borrow_mut()
-                .entry((*file_id, kind))
-                .or_insert_with(|| epochs.epoch(file_id));
-        });
-        note_read_seq(WriteKey::FileScoped(*file_id));
-    }
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active
+            .file_scopeds
+            .borrow_mut()
+            .entry((*file_id, kind))
+            .or_insert_with(|| epochs.epoch(file_id));
+        active.note_read_seq(WriteKey::FileScoped(*file_id));
+    });
 }
-
 /// Index domains a read set records but per-key versions cannot cover:
 /// their reads enumerate whole maps or names rather than a recordable key,
 /// so a domain-wide counter answers "did anything here move since the
@@ -1116,11 +1197,24 @@ impl InferenceReadVersion {
     }
 
     pub(crate) fn is_stale(&self, db: &crate::DbIndex, reads: &InferenceReadSet) -> bool {
+        self.is_stale_against(&Self::capture(db), db, reads)
+    }
+
+    /// `is_stale` against a caller-taken capture: a scan that checks many
+    /// records while the index cannot move (a partition pass, a parallel
+    /// per-file collect) pays one `capture` for the whole scan instead of
+    /// re-reading every store clock per record.
+    pub(crate) fn is_stale_against(
+        &self,
+        now: &Self,
+        db: &crate::DbIndex,
+        reads: &InferenceReadSet,
+    ) -> bool {
         // An unchanged capture covers every epoch-keyed read: the store
         // clocks prove each per-key epoch inside `reads` is what it was, and
         // `member_clock` covers the member-side versions. Only the slot
         // content probes still need their walk.
-        if Self::capture(db) == *self {
+        if *now == *self {
             return self.missing_slots_changed(db, reads);
         }
         self.value_reads_changed(db, reads) || self.member_reads_changed(db, reads)
@@ -1285,7 +1379,7 @@ impl InferredReturnReadRecord {
     /// taken — one call site for every attempt path.
     pub(crate) fn captured(db: &crate::DbIndex, reads: InferenceReadSet) -> Self {
         Self {
-            reads,
+            reads: Box::new(reads),
             type_epoch: db.get_type_index().type_writes(),
             return_epoch: db.get_signature_index().return_writes(),
             param_epoch: db.get_signature_index().param_writes(),
@@ -1315,6 +1409,12 @@ impl InferredReturnReadRecord {
     /// for scopes armed with [`arm_with_member_maps`]; an empty set can never
     /// be stale, so unarmed records keep their old behavior.
     pub(crate) fn is_stale(&self, db: &crate::DbIndex) -> bool {
+        self.is_stale_against(&InferenceReadVersion::capture(db), db)
+    }
+
+    /// `is_stale` against a caller-taken capture, for scans that check many
+    /// records while the index cannot move.
+    pub(crate) fn is_stale_against(&self, now: &InferenceReadVersion, db: &crate::DbIndex) -> bool {
         InferenceReadVersion {
             type_epoch: self.type_epoch,
             return_epoch: self.return_epoch,
@@ -1338,7 +1438,7 @@ impl InferredReturnReadRecord {
             operator_clock: self.operator_clock,
             metatable_clock: self.metatable_clock,
         }
-        .is_stale(db, &self.reads)
+        .is_stale_against(now, db, &self.reads)
     }
 }
 
