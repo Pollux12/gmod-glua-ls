@@ -613,6 +613,7 @@ impl FileDiagnostic {
         cancel_token: CancellationToken,
     ) -> Vec<(Uri, Vec<Diagnostic>)> {
         info!("workspace diagnostic pull fast started");
+        let sweep_started = crate::util::ls_profile::profile_instant();
         let watchdog_status =
             LongRunningWatchdogStatus::new("Preparing workspace diagnostics (fast pull)");
         let _watchdog =
@@ -642,6 +643,7 @@ impl FileDiagnostic {
         // empty and sweep everything. Scoped ids are a subset of the main
         // workspace list, so retaining keeps its size-ordered dispatch.
         let scoped = self.take_scoped_sweep_files().await;
+        let was_scoped = scoped.is_some();
         let (main_workspace_file_ids, shared_data) = {
             let analysis = self.analysis.read().await;
             let mut file_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
@@ -754,6 +756,9 @@ impl FileDiagnostic {
                 valid_file_count,
                 cancel_token.is_cancelled()
             );
+        }
+        if let Some(started) = sweep_started {
+            crate::util::ls_profile::emit_ls_diag_sweep(count, started.elapsed(), was_scoped);
         }
 
         result

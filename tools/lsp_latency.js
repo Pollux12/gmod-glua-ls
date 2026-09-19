@@ -129,6 +129,7 @@ class LspClient {
         this.pending = new Map();
         this.onNotification = null;
         this.serverRequests = new Set();
+        this.requestWaiters = new Map();
         proc.stdout.on('data', (chunk) => this._receive(chunk));
         // The server's phase profiler writes to stderr, so LSP_SERVER_STDERR
         // makes those numbers reachable instead of dropping them on the floor.
@@ -164,6 +165,8 @@ class LspClient {
             // and would have the server fall back to something a real client
             // never makes it use.
             this.serverRequests.add(message.method);
+            const waiter = this.requestWaiters.get(message.method);
+            if (waiter) { this.requestWaiters.delete(message.method); waiter(message); }
             const result = message.method === 'workspace/configuration'
                 ? ((message.params && message.params.items) || []).map(() => ({}))
                 : null;
@@ -186,6 +189,17 @@ class LspClient {
 
     notify(method, params) {
         this._write({ jsonrpc: '2.0', method, params });
+    }
+
+    /** Resolves when the server next initiates `method` (or rejects on timeout). */
+    waitForServerRequest(method, timeoutMs) {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(
+                () => { this.requestWaiters.delete(method); reject(new Error(`timeout waiting for ${method}`)); },
+                timeoutMs,
+            );
+            this.requestWaiters.set(method, (message) => { clearTimeout(timer); resolve(message); });
+        });
     }
 
     /** Returns a promise carrying the response, the elapsed ms, and its id. */
@@ -534,6 +548,57 @@ async function main() {
         });
     }
 
+    // Edit -> all related work done. One last isolated edit, then wait out the
+    // server's own pipeline: debounce, self-index, ripple quiet, ripple, the
+    // idle arm that raises the workspace-diagnostic level, the refresh request,
+    // and the workspace pull itself. Nothing here is optional — until the pull
+    // resolves, diagnostics and every freshness-gated feature lag the edit.
+    //
+    // An edit that moves nothing any other file reads owes no downstream work:
+    // the server then sends no refresh, and all related work ends when the
+    // edited file itself goes fresh. Both shapes are real; measure whichever
+    // this edit produces.
+    const waitRefresh = (ms) =>
+        client.waitForServerRequest('workspace/diagnostic/refresh', ms).catch(() => null);
+    await waitUntilQuiet();
+    // Consume the sweep the workspace load armed: the pending level is what the
+    // next pull claims, and a Slow claim sweeps every file regardless of the
+    // scoped set. Until it drains, a post-edit pull measures the initial sweep,
+    // not the edit's own.
+    await client.request('workspace/diagnostic', { previousResultIds: [] });
+    // The run loop's last edits may have armed a refresh that fires ~3s later;
+    // drain it so the refresh awaited below is unambiguously caused by this edit.
+    await waitRefresh(15000);
+    const allWorkEditAt = Date.now();
+    editDocument();
+    const refreshWait = waitRefresh(15000);
+    // The file going fresh is the last owed work when the edit moves nothing
+    // another file reads; the sweep, when owed, supersedes it.
+    const fresh = client.request('textDocument/diagnostic', {
+        textDocument: { uri }, previousResultId,
+    });
+    await fresh;
+    const freshDoneAt = Date.now();
+    const refresh = await refreshWait;
+    if (refresh) {
+        const workspacePull = await client.request('workspace/diagnostic', {
+            previousResultIds: [],
+        });
+        if (workspacePull.message.error) {
+            throw new Error(`workspace/diagnostic pull failed: ${JSON.stringify(workspacePull.message.error)}`);
+        }
+        report.measurements.editToAllWorkDone = summarise([Date.now() - allWorkEditAt]);
+        report.measurements.workspaceSweep = summarise([workspacePull.ms]);
+        const workspaceItems = (workspacePull.message.result && workspacePull.message.result.items) || [];
+        report.checks.workspaceSweepItems = workspaceItems.length;
+        report.checks.workspaceSweepUnchanged =
+            workspaceItems.filter((item) => item.kind === 'unchanged').length;
+    } else {
+        // No refresh ever came: the edit owed no downstream work, so all
+        // related work ended when the edited file answered fresh.
+        report.measurements.editToAllWorkDone = summarise([freshDoneAt - allWorkEditAt]);
+    }
+
     report.measurements.completionSettled = summarise(settledCompletion);
     report.measurements.completionWhileTyping = summarise(typingCompletion);
     report.measurements.diagnosticSettled = summarise(settledDiagnostic);
@@ -550,6 +615,9 @@ async function main() {
         worstMissing: Math.max(0, ...completionDrift.map((d) => d.missing)),
         worstExtra: Math.max(0, ...completionDrift.map((d) => d.extra)),
         sampleMissing: (completionDrift.find((d) => d.missing > 0) || {}).sampleMissing || [],
+        // A --edit-find rename *should* change completions mid-edit; drift is
+        // only a defect when the edit was meant to be inert at this position.
+        expectedToDrift: opts.editFind !== null,
     };
     report.checks.serverInitiatedRequests = [...client.serverRequests].sort();
 
@@ -569,6 +637,8 @@ async function main() {
         ['completion (concurrent)', report.measurements.completionWhileTypingConcurrent],
         ['highlight after edit', report.measurements.highlightAfterEdit],
         ['edit -> fresh answer', report.measurements.editToFreshAnswer],
+        ['edit -> all work done', report.measurements.editToAllWorkDone],
+        ['workspace sweep', report.measurements.workspaceSweep],
     ];
     console.log(`workspace : ${report.workspace}`);
     console.log(`file      : ${report.file}`);
@@ -582,6 +652,12 @@ async function main() {
     }
     console.log(`\ncompletion items          : ${report.checks.completionItemCount}`);
     console.log(`diagnostics               : ${report.checks.diagnosticCount}`);
+    if (report.checks.workspaceSweepItems !== undefined) {
+        console.log(`workspace sweep items     : ${report.checks.workspaceSweepItems}`
+            + ` (${report.checks.workspaceSweepUnchanged} unchanged)`);
+    } else {
+        console.log('workspace sweep items     : (edit owed no downstream work)');
+    }
     console.log(`thin reports on cancel    : ${report.checks.thinReportsOnCancel}`
         + (report.checks.thinReportsOnCancel === 0 ? '  (good)' : '  (BAD: drops diagnostics)'));
     const drift = report.checks.completionDriftWhileTyping;
@@ -604,7 +680,7 @@ function failedChecks(report) {
             + 'back thinner than the settled report, which drops diagnostics in the editor');
     }
     const drift = report.checks.completionDriftWhileTyping;
-    if (drift.worstMissing > 0 || drift.worstExtra > 0) {
+    if ((drift.worstMissing > 0 || drift.worstExtra > 0) && !drift.expectedToDrift) {
         failures.push(`completion mid-edit differed from settled by -${drift.worstMissing}`
             + ` / +${drift.worstExtra} items`);
     }

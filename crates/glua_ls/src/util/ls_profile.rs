@@ -395,3 +395,18 @@ pub fn emit_ls_reindex(
         ms(ripple_hold),
     );
 }
+
+/// One workspace diagnostic pull's sweep size and wall time, plus whether it
+/// ran edit-scoped: the last piece of work an edit owes, so its completion
+/// marks the burst's "all related work done" point.
+pub fn emit_ls_diag_sweep(files: usize, hold: Duration, scoped: bool) {
+    if !ls_profile_enabled() {
+        return;
+    }
+    eprintln!(
+        "[profile] ls_diag_sweep files={} hold_ms={} scoped={}",
+        files,
+        ms(hold),
+        scoped
+    );
+}
