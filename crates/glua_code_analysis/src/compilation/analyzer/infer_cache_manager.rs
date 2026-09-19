@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
 use rustc_hash::FxHashMap;
@@ -156,10 +157,22 @@ impl InferCacheManager {
     /// the structural lookups that remain valid for this analysis context.
     /// Branch special-call answers are derived from a mutable effect index, so
     /// they must not cross the boundary with the structural caches.
+    ///
+    /// Each cache clears independently, so the sweep runs on workers when the
+    /// map is large enough to pay the dispatch.
     pub fn clear_for_settle(&mut self, db: &DbIndex) {
-        for infer_cache in self.infer_map.values_mut() {
+        let clear = |infer_cache: &mut LuaInferCache| {
             infer_cache.clear_for_unresolve(db);
             infer_cache.branch_special_call_effect_cache.clear();
+        };
+        if super::parallel::runs_inline(self.infer_map.len()) {
+            self.infer_map.values_mut().for_each(clear);
+        } else {
+            super::parallel::init_pool();
+            let mut caches: Vec<&mut LuaInferCache> = self.infer_map.values_mut().collect();
+            rayon::in_place_scope(|_| {
+                caches.par_iter_mut().for_each(|cache| clear(cache));
+            });
         }
     }
 

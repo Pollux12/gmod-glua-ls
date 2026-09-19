@@ -528,14 +528,16 @@ impl ActiveReads {
     /// Stamps `key` with the ordinal of this read, once the scope has queued
     /// a write worth ordering against. Repeated reads keep the latest, which
     /// is the comparison `self_conflicted` wants: any read that ran after
-    /// the slot's first queued write may have diverged.
+    /// the slot's first queued write may have diverged. The key is built
+    /// lazily — most scopes never queue a write, so the clone behind it
+    /// would die in the early-out.
     #[inline]
-    fn note_read_seq(&self, key: WriteKey) {
+    fn note_read_seq(&self, key: impl FnOnce() -> WriteKey) {
         if !self.writes_queued.get() {
             return;
         }
         let seq = self.bump_seq();
-        self.read_seqs.borrow_mut().insert(key, seq);
+        self.read_seqs.borrow_mut().insert(key(), seq);
     }
 }
 
@@ -592,7 +594,7 @@ pub(crate) fn record(owner: &LuaTypeOwner) {
             return;
         }
         active.type_owners.borrow_mut().insert(owner.clone());
-        active.note_read_seq(WriteKey::TypeOwner(owner.clone()));
+        active.note_read_seq(|| WriteKey::TypeOwner(owner.clone()));
     });
 }
 
@@ -604,7 +606,7 @@ pub(crate) fn record_signature(signature_id: &LuaSignatureId) {
             return;
         }
         active.signatures.borrow_mut().insert(*signature_id);
-        active.note_read_seq(WriteKey::Signature(*signature_id));
+        active.note_read_seq(|| WriteKey::Signature(*signature_id));
     });
 }
 
@@ -621,7 +623,7 @@ pub(crate) fn record_param(signature_id: &LuaSignatureId) {
             return;
         }
         active.params.borrow_mut().insert(*signature_id);
-        active.note_read_seq(WriteKey::Param(*signature_id));
+        active.note_read_seq(|| WriteKey::Param(*signature_id));
     });
 }
 
@@ -633,7 +635,7 @@ pub(crate) fn record_module(file_id: &FileId) {
             return;
         }
         active.modules.borrow_mut().insert(*file_id);
-        active.note_read_seq(WriteKey::Module(*file_id));
+        active.note_read_seq(|| WriteKey::Module(*file_id));
     });
 }
 
@@ -649,7 +651,7 @@ pub(crate) fn record_special_call(file_id: &FileId, position: TextSize) {
             .special_calls
             .borrow_mut()
             .insert((*file_id, position));
-        active.note_read_seq(WriteKey::SpecialCall(*file_id, position));
+        active.note_read_seq(|| WriteKey::SpecialCall(*file_id, position));
     });
 }
 
@@ -665,7 +667,7 @@ pub(crate) fn record_contrib(signature_id: &LuaSignatureId, param_idx: usize) {
             .contribs
             .borrow_mut()
             .insert((*signature_id, param_idx));
-        active.note_read_seq(WriteKey::Contrib(*signature_id, param_idx));
+        active.note_read_seq(|| WriteKey::Contrib(*signature_id, param_idx));
     });
 }
 
@@ -681,10 +683,8 @@ pub(crate) fn record_dynamic_field(owner: &DynamicFieldOwner, field_name: Option
             .dynamic_fields
             .borrow_mut()
             .insert((owner.clone(), field_name.map(SmolStr::new)));
-        active.note_read_seq(WriteKey::DynamicField(
-            owner.clone(),
-            field_name.map(SmolStr::new),
-        ));
+        active
+            .note_read_seq(|| WriteKey::DynamicField(owner.clone(), field_name.map(SmolStr::new)));
     });
 }
 
@@ -703,7 +703,7 @@ pub(crate) fn record_missing_member_slot(
             (owner.clone(), key.clone()),
             (member_count, dynamic_field_count),
         );
-        active.note_read_seq(WriteKey::MemberSlot(owner.clone(), key.clone()));
+        active.note_read_seq(|| WriteKey::MemberSlot(owner.clone(), key.clone()));
     });
 }
 
@@ -715,12 +715,14 @@ pub(crate) fn record_member_map(index: &crate::LuaMemberIndex, owner: &LuaMember
         }
         // `read_version` descends through `canonical`, which records its own
         // reads — legal here only because it lands on other fields' cells.
-        active
-            .member_maps
-            .borrow_mut()
-            .entry(owner.clone())
-            .or_insert_with(|| index.read_version(owner));
-        active.note_read_seq(WriteKey::MemberOwner(owner.clone()));
+        // First read wins, so the key clone only happens on the miss that
+        // actually inserts.
+        let mut maps = active.member_maps.borrow_mut();
+        if !maps.contains_key(owner) {
+            maps.insert(owner.clone(), index.read_version(owner));
+        }
+        drop(maps);
+        active.note_read_seq(|| WriteKey::MemberOwner(owner.clone()));
     });
 }
 
@@ -737,12 +739,14 @@ pub(crate) fn record_member_key_read(index: &crate::LuaMemberIndex, key: &LuaMem
         if active.depth.get() == 0 || !active.track_member_maps.get() {
             return;
         }
-        active
-            .member_keys
-            .borrow_mut()
-            .entry(key.clone())
-            .or_insert_with(|| index.key_read_version(key));
-        active.note_read_seq(WriteKey::MemberKey(key.clone()));
+        // `LuaMemberKey::ExprType` clones a `LuaType`, so the clone only
+        // happens on the miss that inserts — first read wins.
+        let mut keys = active.member_keys.borrow_mut();
+        if !keys.contains_key(key) {
+            keys.insert(key.clone(), index.key_read_version(key));
+        }
+        drop(keys);
+        active.note_read_seq(|| WriteKey::MemberKey(key.clone()));
     });
 }
 
@@ -760,7 +764,7 @@ pub(crate) fn record_member_id(index: &crate::LuaMemberIndex, member_id: &LuaMem
             .borrow_mut()
             .entry(*member_id)
             .or_insert_with(|| index.member_object_version(member_id));
-        active.note_read_seq(WriteKey::MemberId(*member_id));
+        active.note_read_seq(|| WriteKey::MemberId(*member_id));
     });
 }
 
@@ -783,7 +787,7 @@ pub(crate) fn record_type_decl(
             .borrow_mut()
             .entry(key.clone())
             .or_insert_with(|| epochs.epoch(&key));
-        active.note_read_seq(WriteKey::TypeDecl(decl_id.clone()));
+        active.note_read_seq(|| WriteKey::TypeDecl(decl_id.clone()));
     });
 }
 
@@ -805,7 +809,7 @@ pub(crate) fn record_bound_decl(
             .borrow_mut()
             .entry(key.clone())
             .or_insert_with(|| epochs.epoch(&key));
-        active.note_read_seq(WriteKey::TypeDecl(type_id.clone()));
+        active.note_read_seq(|| WriteKey::TypeDecl(type_id.clone()));
     });
 }
 
@@ -823,7 +827,7 @@ pub(crate) fn record_vgui_type_decl(epochs: &KeyedEpochs<LuaTypeDeclId>, decl_id
             .borrow_mut()
             .entry(decl_id.clone())
             .or_insert_with(|| epochs.epoch(decl_id));
-        active.note_read_seq(WriteKey::TypeDecl(decl_id.clone()));
+        active.note_read_seq(|| WriteKey::TypeDecl(decl_id.clone()));
     });
 }
 
@@ -841,7 +845,7 @@ pub(crate) fn record_decl_misc(epochs: &KeyedEpochs<LuaDeclId>, decl_id: &LuaDec
             .borrow_mut()
             .entry(*decl_id)
             .or_insert_with(|| epochs.epoch(decl_id));
-        active.note_read_seq(WriteKey::DeclMisc(*decl_id));
+        active.note_read_seq(|| WriteKey::DeclMisc(*decl_id));
     });
 }
 
@@ -856,7 +860,7 @@ pub(crate) fn record_decl_claim(epochs: &KeyedEpochs<LuaDeclId>, decl_id: &LuaDe
         }
         let epoch = epochs.epoch(decl_id);
         active.decl_claims.borrow_mut().insert(*decl_id, epoch);
-        active.note_read_seq(WriteKey::DeclMisc(*decl_id));
+        active.note_read_seq(|| WriteKey::DeclMisc(*decl_id));
     });
 }
 
@@ -873,7 +877,7 @@ pub(crate) fn record_decl_default(epochs: &KeyedEpochs<LuaDeclId>, decl_id: &Lua
             .borrow_mut()
             .entry(*decl_id)
             .or_insert_with(|| epochs.epoch(decl_id));
-        active.note_read_seq(WriteKey::DeclMisc(*decl_id));
+        active.note_read_seq(|| WriteKey::DeclMisc(*decl_id));
     });
 }
 
@@ -893,7 +897,7 @@ pub(crate) fn record_definition_fact(
             .borrow_mut()
             .entry(*definition_id)
             .or_insert_with(|| epochs.epoch(definition_id));
-        active.note_read_seq(WriteKey::DefinitionFact(*definition_id));
+        active.note_read_seq(|| WriteKey::DefinitionFact(*definition_id));
     });
 }
 
@@ -905,12 +909,12 @@ pub(crate) fn record_global_path(epochs: &KeyedEpochs<GlobalId>, global_id: &Glo
         if active.depth.get() == 0 {
             return;
         }
-        active
-            .global_paths
-            .borrow_mut()
-            .entry(global_id.clone())
-            .or_insert_with(|| epochs.epoch(global_id));
-        active.note_read_seq(WriteKey::GlobalPath(global_id.clone()));
+        let mut paths = active.global_paths.borrow_mut();
+        if !paths.contains_key(global_id) {
+            paths.insert(global_id.clone(), epochs.epoch(global_id));
+        }
+        drop(paths);
+        active.note_read_seq(|| WriteKey::GlobalPath(global_id.clone()));
     });
 }
 
@@ -925,12 +929,12 @@ pub(crate) fn record_operator_owner(
         if active.depth.get() == 0 {
             return;
         }
-        active
-            .operator_owners
-            .borrow_mut()
-            .entry(owner.clone())
-            .or_insert_with(|| epochs.epoch(owner));
-        active.note_read_seq(WriteKey::OperatorOwner(owner.clone()));
+        let mut owners = active.operator_owners.borrow_mut();
+        if !owners.contains_key(owner) {
+            owners.insert(owner.clone(), epochs.epoch(owner));
+        }
+        drop(owners);
+        active.note_read_seq(|| WriteKey::OperatorOwner(owner.clone()));
     });
 }
 
@@ -950,7 +954,7 @@ pub(crate) fn record_metatable(
             .borrow_mut()
             .entry(site.clone())
             .or_insert_with(|| epochs.epoch(site));
-        active.note_read_seq(WriteKey::Metatable(site.clone()));
+        active.note_read_seq(|| WriteKey::Metatable(site.clone()));
     });
 }
 
@@ -971,7 +975,7 @@ pub(crate) fn record_definition_site(
             .borrow_mut()
             .entry(site.clone())
             .or_insert_with(|| epochs.epoch(site));
-        active.note_read_seq(WriteKey::DefinitionSite(site.clone()));
+        active.note_read_seq(|| WriteKey::DefinitionSite(site.clone()));
     });
 }
 
@@ -983,8 +987,12 @@ pub(crate) fn record_gmod_meta(name: &SmolStr) {
         if active.depth.get() == 0 {
             return;
         }
-        active.gmod_metas.borrow_mut().insert(name.clone());
-        active.note_read_seq(WriteKey::GmodMeta(name.clone()));
+        let mut metas = active.gmod_metas.borrow_mut();
+        if !metas.contains(name) {
+            metas.insert(name.clone());
+        }
+        drop(metas);
+        active.note_read_seq(|| WriteKey::GmodMeta(name.clone()));
     });
 }
 
@@ -1018,7 +1026,7 @@ pub(crate) fn record_file_scoped(
             .borrow_mut()
             .entry((*file_id, kind))
             .or_insert_with(|| epochs.epoch(file_id));
-        active.note_read_seq(WriteKey::FileScoped(*file_id));
+        active.note_read_seq(|| WriteKey::FileScoped(*file_id));
     });
 }
 /// Index domains a read set records but per-key versions cannot cover:

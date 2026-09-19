@@ -5,6 +5,7 @@ mod resolve_closure;
 pub(in crate::compilation::analyzer) mod spec;
 mod writes;
 
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 use std::cmp::Ordering;
@@ -44,7 +45,9 @@ pub use resolve_closure::{
 };
 use rowan::TextRange;
 
-use super::{AnalyzeContext, infer_cache_manager::InferCacheManager, lua::LuaReturnPoint};
+use super::{
+    AnalyzeContext, infer_cache_manager::InferCacheManager, lua::LuaReturnPoint, parallel,
+};
 
 type ResolveResult = Result<(), InferFailReason>;
 
@@ -604,11 +607,31 @@ pub(super) fn settle_floored_fixpoint(
         // field, not a `note_return_write` — so one capture covers it.
         let now = crate::db_index::read_set::InferenceReadVersion::capture(db);
         let mut held_returns = Vec::new();
-        for unresolve in pool {
-            let stale = full_requeue
-                || read_records
-                    .get(&unresolve_identity(&unresolve))
-                    .is_none_or(|record| record.is_stale_against(&now, db));
+        // The staleness check is read-only, but `UnResolve` holds red syntax
+        // nodes (`!Send`), so the boundary is the identity: computed serially,
+        // staleness-checked on workers against the shared index, and the
+        // flips and group pushes applied serially afterward in pool order —
+        // the same order the single-pass scan visited.
+        let identities: Vec<UnResolveIdentity> = pool.iter().map(unresolve_identity).collect();
+        let db_ref: &DbIndex = db;
+        let read_records_ref: &FxHashMap<UnResolveIdentity, FixpointReadRecord> = read_records;
+        let check = |identity: &UnResolveIdentity| {
+            full_requeue
+                || read_records_ref
+                    .get(identity)
+                    .is_none_or(|record| record.is_stale_against(&now, db_ref))
+        };
+        let stale_flags: Vec<bool> = if parallel::runs_inline(identities.len()) {
+            identities.iter().map(check).collect()
+        } else {
+            parallel::init_pool();
+            let mut flags = Vec::new();
+            rayon::in_place_scope(|_| {
+                flags = identities.par_iter().map(check).collect();
+            });
+            flags
+        };
+        for (unresolve, stale) in pool.into_iter().zip(stale_flags) {
             if !stale {
                 parked.push(unresolve);
                 continue;
