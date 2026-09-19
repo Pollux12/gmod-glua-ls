@@ -485,7 +485,6 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             context.settled_decl_copy_candidates.clear();
             context.settled_assign_candidates.clear();
             context.settled_assign_candidate_keys.clear();
-            context.settled_candidate_reads.clear();
             context.settled_assign_claims.clear();
             context.settled_assign_candidate_counts.clear();
             context.settled_parent_closure_candidates.clear();
@@ -515,11 +514,26 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             .into_iter()
             .collect::<HashMap<_, _>>();
         // The per-candidate records carry the same reads the old file-level
-        // union accumulated; only three of its fields are consumed below, so
-        // the union is rebuilt here instead of cloned per candidate per round.
+        // union accumulated — but only for the three passes whose armed scopes
+        // fed it (iter vars and the two initializer rewrites). The other
+        // passes' records track staleness only: letting e.g. a global read's
+        // `type_owners` into the union would draw the file's lazy readers into
+        // the reindex expansion, re-analysing consumers whose answers do not
+        // move. Only three fields of the union are consumed below, so it is
+        // rebuilt here instead of cloned per candidate per round.
         let mut settled_read_sets =
             HashMap::<FileId, crate::db_index::read_set::InferenceReadSet>::default();
-        for ((_, candidate), (_, reads)) in &context.settled_candidate_reads {
+        for ((pass, candidate), (_, reads)) in &context.settled_candidate_reads {
+            if !matches!(
+                pass,
+                SettledReadPass::Iter
+                    | SettledReadPass::Decl
+                    | SettledReadPass::DeclFull
+                    | SettledReadPass::Member
+                    | SettledReadPass::MemberFull
+            ) {
+                continue;
+            }
             let file_reads = settled_read_sets.entry(candidate.file_id()).or_default();
             file_reads
                 .type_owners
