@@ -1243,19 +1243,18 @@ pub(crate) type DirectSubtypeMembers =
 
 /// What [`LuaTypeIndex::cached_direct_subtype_members`] was derived from.
 ///
-/// `super_revision` is exact: every super-type write bumps it. `member_revision`
-/// tracks member re-homing, rekeys and removals, while `member_file_counts`
-/// catches the pure first filings those leave alone. Dynamic fields feed the
-/// map too and carry no revision of their own, so their per-owner field names
-/// fold into an order-independent 64-bit fingerprint instead. A fingerprint
-/// collision could reuse a stale map, so this stays a miss-biased heuristic
-/// key rather than proof; a future dynamic-field revision can replace it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// All four counters are exact write revisions, so the key is O(1) to build:
+/// `super_revision` counts super-type writes, `member_revision` member
+/// re-homings, `member_writes` the member index's `move_clock` (every member,
+/// owner or key mutation — a superset of the member-count snapshot this used
+/// to need), and `dynamic_writes` the dynamic-field index's definition
+/// counter (a superset of the per-owner name fingerprint it replaces).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DirectSubtypeMembersKey {
     pub(crate) super_revision: u64,
     pub(crate) member_revision: u64,
-    pub(crate) member_file_counts: Vec<(FileId, usize)>,
-    pub(crate) dynamic_fields_fingerprint: u64,
+    pub(crate) member_writes: u64,
+    pub(crate) dynamic_writes: u64,
 }
 
 fn collect_type_cache_refs(typ: &LuaType) -> HashSet<TypeCacheRef> {
@@ -3685,8 +3684,8 @@ mod super_type_tests {
         let key = DirectSubtypeMembersKey {
             super_revision: index.super_write_revision(),
             member_revision: 0,
-            member_file_counts: Vec::new(),
-            dynamic_fields_fingerprint: 0,
+            member_writes: 0,
+            dynamic_writes: 0,
         };
         index.store_direct_subtype_members(key, Arc::new(DirectSubtypeMembers::default()));
         assert!(index.direct_subtype_members_cache().is_some());

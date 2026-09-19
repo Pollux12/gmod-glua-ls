@@ -975,6 +975,10 @@ impl LuaIndex for DynamicFieldIndex {
         self.unattributed_fields.clear();
         self.unattributed_file_contributions.clear();
         self.dynamic_write_versions.clear();
+        // The counter survives a clear (it is monotonic, never an index
+        // position) but must still move: a consumer comparing it across the
+        // clear sees empty maps where definitions used to be.
+        self.dynamic_writes += 1;
         self.sealed = false;
     }
 }

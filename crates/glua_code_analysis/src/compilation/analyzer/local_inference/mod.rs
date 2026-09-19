@@ -1789,35 +1789,15 @@ pub(crate) fn direct_subtype_members_cached(db: &mut crate::DbIndex) -> Arc<Dire
     map
 }
 
-/// Snapshots everything [`precompute_direct_subtype_members`] reads: the
-/// super-type write revision, the member re-homing revision plus per-file
-/// member counts (pure first filings re-home nothing), and an
-/// order-independent fold of the dynamic field names.
+/// The four write revisions covering everything
+/// [`precompute_direct_subtype_members`] reads — O(1) instead of the old
+/// per-file member-count snapshot plus dynamic-field name fold.
 fn direct_subtype_members_key(db: &crate::DbIndex) -> DirectSubtypeMembersKey {
-    let member_index = db.get_member_index();
-    let mut file_ids = db.get_vfs().get_all_file_ids();
-    file_ids.sort_unstable();
-    let member_file_counts = file_ids
-        .iter()
-        .map(|file_id| (*file_id, member_index.get_file_members(*file_id).len()))
-        .collect();
-
-    let mut dynamic_fields_fingerprint = 0u64;
-    for (owner, fields) in db.get_dynamic_field_index().iter_all_owner_fields() {
-        for name in fields.keys() {
-            let mut hasher = rustc_hash::FxHasher::default();
-            std::hash::Hash::hash(owner, &mut hasher);
-            std::hash::Hash::hash(name, &mut hasher);
-            dynamic_fields_fingerprint =
-                dynamic_fields_fingerprint.wrapping_add(std::hash::Hasher::finish(&hasher));
-        }
-    }
-
     DirectSubtypeMembersKey {
         super_revision: db.get_type_index().super_write_revision(),
-        member_revision: member_index.homing_revision(),
-        member_file_counts,
-        dynamic_fields_fingerprint,
+        member_revision: db.get_member_index().homing_revision(),
+        member_writes: db.get_member_index().move_clock(),
+        dynamic_writes: db.get_dynamic_field_index().dynamic_writes(),
     }
 }
 
