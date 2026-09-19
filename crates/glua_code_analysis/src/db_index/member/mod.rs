@@ -438,11 +438,12 @@ impl LuaMemberIndex {
         // Re-filing an existing id re-homes whatever the old filing named:
         // the member keeps its identity while its owner and key maps move, so
         // any memo holding the old slot must rebuild. Pure first filings are
-        // append-only and leave the revision alone.
+        // append-only and leave the revision alone. An identical re-file —
+        // same owner, key and member record — changes nothing a membership
+        // view or memo can observe, so stamping it would only churn readers
+        // (settled passes re-file members every round while converging).
         let mut already_filed_here = false;
         if self.members.contains_key(&id) {
-            self.bump_homing_revision();
-            self.note_member_move(id);
             // The insert below overwrites the member record, but nothing else
             // removes the id from the key slot its previous filing named. When
             // the owner is unchanged and only the key moved, that leaves the id
@@ -452,6 +453,17 @@ impl LuaMemberIndex {
             let old_owner = self.member_current_owner.get(&id).cloned();
             let same_owner = old_owner.as_ref() == Some(&owner);
             let key_changed = self.get_member(&id).map(|m| m.get_key()) != Some(member.get_key());
+            let identical = same_owner
+                && !key_changed
+                && self.owner_only_members.contains(&id) == is_owner_only
+                && self.members.get(&id).is_some_and(|existing| {
+                    existing.get_feature() == member.get_feature()
+                        && existing.get_global_id() == member.get_global_id()
+                });
+            if !identical {
+                self.bump_homing_revision();
+                self.note_member_move(id);
+            }
             if same_owner
                 && key_changed
                 && let Some(old_owner) = old_owner
