@@ -1121,24 +1121,57 @@ fn try_resolve(
                 // drain has not run yet — so one capture stands for every
                 // item's staleness check.
                 let now = crate::db_index::read_set::InferenceReadVersion::capture(db);
-                for unresolve in unresolves.drain(..) {
-                    let park = records
-                        .get(&unresolve_identity(&unresolve))
-                        .is_some_and(|record| {
+                if !force {
+                    // The record check is read-only; `UnResolve` holds red
+                    // nodes (`!Send`), so it runs on workers over the identity
+                    // list and the split lands serially in drain order — the
+                    // same partition the per-item scan produced.
+                    let identities: Vec<UnResolveIdentity> =
+                        unresolves.iter().map(unresolve_identity).collect();
+                    let db_ref: &DbIndex = db;
+                    let check = |identity: &UnResolveIdentity| {
+                        records.get(identity).is_some_and(|record| {
                             // An empty record can never report stale, so
                             // parking on it either wastes nothing (the failure
                             // was deterministic) or buries a miss that recorded
                             // nothing — and only the second is visible.
-                            !record.reads.is_empty()
-                                && !record.is_stale_against(&now, db)
-                                && (!force || force_retains_failure(check_reason, &unresolve))
-                        });
-                    if park {
-                        // Rejoins its own group in drain order — still
-                        // sorted, so it does not mark the group touched.
-                        retain_unresolve.push((unresolve, check_reason.clone(), true));
+                            !record.reads.is_empty() && !record.is_stale_against(&now, db_ref)
+                        })
+                    };
+                    let park_flags: Vec<bool> = if parallel::runs_inline(identities.len()) {
+                        identities.iter().map(check).collect()
                     } else {
-                        candidates.push(unresolve);
+                        parallel::init_pool();
+                        let mut flags = Vec::new();
+                        rayon::in_place_scope(|_| {
+                            flags = identities.par_iter().map(check).collect();
+                        });
+                        flags
+                    };
+                    for (unresolve, park) in unresolves.drain(..).zip(park_flags) {
+                        if park {
+                            // Rejoins its own group in drain order — still
+                            // sorted, so it does not mark the group touched.
+                            retain_unresolve.push((unresolve, check_reason.clone(), true));
+                        } else {
+                            candidates.push(unresolve);
+                        }
+                    }
+                } else {
+                    for unresolve in unresolves.drain(..) {
+                        let park =
+                            records
+                                .get(&unresolve_identity(&unresolve))
+                                .is_some_and(|record| {
+                                    !record.reads.is_empty()
+                                        && !record.is_stale_against(&now, db)
+                                        && force_retains_failure(check_reason, &unresolve)
+                                });
+                        if park {
+                            retain_unresolve.push((unresolve, check_reason.clone(), true));
+                        } else {
+                            candidates.push(unresolve);
+                        }
                     }
                 }
             } else {
