@@ -9,7 +9,7 @@ use crate::FileId;
 
 use super::{LuaDeclId, LuaIndex, LuaModuleIndex, WorkspaceId};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LuaGlobalIndex {
     global_decl: FxHashMap<GlobalId, Vec<LuaDeclId>>,
 }

@@ -128,7 +128,7 @@ pub struct GmodSystemFileMetadata {
     pub timer_calls: Vec<GmodTimerSiteMetadata>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct GmodSystemAggregate {
     known_net_messages: HashSet<String>,
     net_registration_count: HashMap<String, usize>,
@@ -280,7 +280,7 @@ pub struct GmodScopedClassInfo {
 ///
 /// Locals are intentionally excluded — they can only be referenced from
 /// within their defining file, so the same-file lookup already covers them.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct GmodInferIndex {
     hook_file_metadata: HashMap<FileId, GmodHookFileMetadata>,
     system_file_metadata: HashMap<FileId, GmodSystemFileMetadata>,

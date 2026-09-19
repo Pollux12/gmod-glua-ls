@@ -12,6 +12,8 @@ mod type_visit_trait;
 mod types;
 
 use super::traits::LuaIndex;
+use crate::db_index::op_log;
+use crate::db_index::r#type::read_set::WriteKey;
 use crate::{
     DbIndex, FileId, InFiled, LuaDeclId, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSignatureId,
     db_index::r#type::type_decl::LuaTypeIdentifier,
@@ -45,6 +47,20 @@ pub struct LuaResolvedAliasType {
 pub(crate) struct LuaSuperType {
     pub(crate) source_range: TextRange,
     pub(crate) typ: LuaType,
+}
+
+/// The slots a type-cache write lands in for merge keying: the owner's cache
+/// slot, plus the decl↔type bind maps when the owner is a decl bound to a
+/// `---` reference — `insert_type_cache` maintains both from the one call.
+fn type_bind_keys(owner: &LuaTypeOwner, cache: &LuaTypeCache) -> Box<[WriteKey]> {
+    let mut keys = vec![WriteKey::TypeOwner(owner.clone())];
+    if let (LuaTypeOwner::Decl(decl_id), LuaType::Ref(type_id) | LuaType::Def(type_id)) =
+        (owner, cache.as_type())
+    {
+        keys.push(WriteKey::DeclMisc(*decl_id));
+        keys.push(WriteKey::TypeDecl(type_id.clone()));
+    }
+    keys.into()
 }
 
 pub fn resolve_alias_type(db: &DbIndex, typ: &LuaType) -> LuaResolvedAliasType {
@@ -1098,7 +1114,7 @@ impl TypeCacheRef {
 
 /// Reverse map of `referenced thing -> files whose cached types reference it`,
 /// so incremental expansion is a lookup instead of a scan over every cache.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct TypeCacheRefIndex {
     owner_refs: HashMap<FileId, HashMap<TypeCacheRef, u32>>,
     ref_owners: HashMap<TypeCacheRef, HashSet<FileId>>,
@@ -1268,7 +1284,7 @@ fn collect_type_cache_refs(typ: &LuaType) -> HashSet<TypeCacheRef> {
     refs
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LuaTypeIndex {
     file_namespace: HashMap<FileId, String>,
     file_using_namespace: HashMap<FileId, Vec<String>>,
@@ -1382,14 +1398,37 @@ impl LuaTypeIndex {
     }
 
     pub fn add_file_namespace(&mut self, file_id: FileId, namespace: String) {
+        if op_log::recording() {
+            let namespace2 = namespace.clone();
+            op_log::push_one(
+                op_log::Domain::Type,
+                WriteKey::FileScoped(file_id),
+                move |db| {
+                    db.get_type_index_mut()
+                        .add_file_namespace(file_id, namespace2)
+                },
+            );
+        }
         self.file_namespace.insert(file_id, namespace);
     }
 
     pub fn get_file_namespace(&self, file_id: &FileId) -> Option<&String> {
+        read_set::record_file_scoped(file_id);
         self.file_namespace.get(file_id)
     }
 
     pub fn add_file_using_namespace(&mut self, file_id: FileId, namespace: String) {
+        if op_log::recording() {
+            let namespace2 = namespace.clone();
+            op_log::push_one(
+                op_log::Domain::Type,
+                WriteKey::FileScoped(file_id),
+                move |db| {
+                    db.get_type_index_mut()
+                        .add_file_using_namespace(file_id, namespace2)
+                },
+            );
+        }
         self.file_using_namespace
             .entry(file_id)
             .or_default()
@@ -1397,11 +1436,24 @@ impl LuaTypeIndex {
     }
 
     pub fn get_file_using_namespace(&self, file_id: &FileId) -> Option<&Vec<String>> {
+        read_set::record_file_scoped(file_id);
         self.file_using_namespace.get(file_id)
     }
 
     /// return previous FileId if exist
     pub fn add_type_decl(&mut self, file_id: FileId, type_decl: LuaTypeDecl) {
+        if op_log::recording() {
+            let type_decl2 = type_decl.clone();
+            op_log::push(
+                op_log::Domain::Type,
+                Box::new([
+                    WriteKey::TypeDecl(type_decl.get_id()),
+                    WriteKey::TypeDeclScan,
+                    WriteKey::FileScoped(file_id),
+                ]),
+                move |db| db.get_type_index_mut().add_type_decl(file_id, type_decl2),
+            );
+        }
         let id = type_decl.get_id();
         self.file_types.entry(file_id).or_default().push(id.clone());
 
@@ -1420,6 +1472,21 @@ impl LuaTypeIndex {
         decl_id: &LuaTypeDeclId,
         location: LuaDeclLocation,
     ) {
+        if op_log::recording() {
+            let decl_id2 = decl_id.clone();
+            let location2 = location.clone();
+            op_log::push(
+                op_log::Domain::Type,
+                Box::new([
+                    WriteKey::TypeDecl(decl_id.clone()),
+                    WriteKey::FileScoped(file_id),
+                ]),
+                move |db| {
+                    db.get_type_index_mut()
+                        .add_type_decl_location(file_id, &decl_id2, location2)
+                },
+            );
+        }
         if let Some(decl) = self.full_name_type_map.get_mut(decl_id) {
             decl.add_location(location);
             self.file_types
@@ -1432,6 +1499,7 @@ impl LuaTypeIndex {
     pub fn find_type_decl(&self, file_id: FileId, name: &str) -> Option<&LuaTypeDecl> {
         if let Some(ns) = self.get_file_namespace(&file_id) {
             let full_name = LuaTypeDeclId::global(&format!("{}.{}", ns, name));
+            read_set::record_type_decl(&full_name);
             if let Some(decl) = self.full_name_type_map.get(&full_name) {
                 return Some(decl);
             }
@@ -1439,6 +1507,7 @@ impl LuaTypeIndex {
         if let Some(usings) = self.get_file_using_namespace(&file_id) {
             for ns in usings {
                 let full_name = LuaTypeDeclId::global(&format!("{}.{}", ns, name));
+                read_set::record_type_decl(&full_name);
                 if let Some(decl) = self.full_name_type_map.get(&full_name) {
                     return Some(decl);
                 }
@@ -1446,11 +1515,13 @@ impl LuaTypeIndex {
         }
 
         let local_id = LuaTypeDeclId::local(file_id, name);
+        read_set::record_type_decl(&local_id);
         if let Some(decl) = self.full_name_type_map.get(&local_id) {
             return Some(decl);
         }
 
         let global_id = LuaTypeDeclId::global(name);
+        read_set::record_type_decl(&global_id);
         self.full_name_type_map.get(&global_id)
     }
 
@@ -1459,6 +1530,7 @@ impl LuaTypeIndex {
         file_id: FileId,
         prefix: &str,
     ) -> HashMap<String, Option<LuaTypeDeclId>> {
+        read_set::record_type_decl_scan();
         let mut result = HashMap::default();
         let all_type_ids = self.full_name_type_map.keys().collect::<Vec<_>>();
         if let Some(ns) = self.get_file_namespace(&file_id) {
@@ -1521,10 +1593,23 @@ impl LuaTypeIndex {
     }
 
     pub fn add_generic_params(&mut self, decl_id: LuaTypeDeclId, params: Vec<GenericParam>) {
+        if op_log::recording() {
+            let decl_id2 = decl_id.clone();
+            let params2 = params.clone();
+            op_log::push_one(
+                op_log::Domain::Type,
+                WriteKey::TypeDecl(decl_id.clone()),
+                move |db| {
+                    db.get_type_index_mut()
+                        .add_generic_params(decl_id2, params2)
+                },
+            );
+        }
         self.generic_params.insert(decl_id, params);
     }
 
     pub fn get_generic_params(&self, decl_id: &LuaTypeDeclId) -> Option<&Vec<GenericParam>> {
+        read_set::record_type_decl(decl_id);
         self.generic_params.get(decl_id)
     }
 
@@ -1535,6 +1620,21 @@ impl LuaTypeIndex {
         source_range: TextRange,
         super_type: LuaType,
     ) {
+        if op_log::recording() {
+            let mut keys = vec![
+                WriteKey::TypeDecl(decl_id.clone()),
+                WriteKey::FileScoped(file_id),
+            ];
+            if let LuaType::Ref(base_id) = &super_type {
+                keys.push(WriteKey::TypeDecl(base_id.clone()));
+            }
+            let decl_id2 = decl_id.clone();
+            let super_type2 = super_type.clone();
+            op_log::push(op_log::Domain::Type, keys.into(), move |db| {
+                db.get_type_index_mut()
+                    .add_super_type(decl_id2, file_id, source_range, super_type2)
+            });
+        }
         // Kept in source order rather than the order the files happened to be
         // analysed in: an incremental re-analysis visits the declaring files in
         // a different order than a cold build, and the first entry decides
@@ -1575,6 +1675,7 @@ impl LuaTypeIndex {
         source_range: TextRange,
         super_type: &LuaType,
     ) -> bool {
+        read_set::record_type_decl(decl_id);
         self.supers.get(decl_id).is_some_and(|supers| {
             supers.iter().any(|entry| {
                 entry.file_id == file_id
@@ -1612,6 +1713,7 @@ impl LuaTypeIndex {
         &self,
         decl_id: &LuaTypeDeclId,
     ) -> Option<impl Iterator<Item = &LuaType> + '_> {
+        read_set::record_type_decl(decl_id);
         self.supers.get(decl_id).map(|supers| {
             supers
                 .iter()
@@ -1629,11 +1731,13 @@ impl LuaTypeIndex {
         &self,
         decl_id: &LuaTypeDeclId,
     ) -> Option<&[InFiled<LuaSuperType>]> {
+        read_set::record_type_decl(decl_id);
         self.supers.get(decl_id).map(Vec::as_slice)
     }
 
     /// The declarations whose stored type is a direct reference to `type_id`.
     pub fn decls_bound_to_type(&self, type_id: &LuaTypeDeclId) -> Option<&HashSet<LuaDeclId>> {
+        read_set::record_type_decl(type_id);
         self.type_bound_decls.get(type_id)
     }
 
@@ -1691,6 +1795,7 @@ impl LuaTypeIndex {
     /// Get all direct subclasses of a given type
     /// Returns a vector of type declarations that directly inherit from the given type
     pub fn get_sub_types(&self, decl_id: &LuaTypeDeclId) -> Vec<&LuaTypeDecl> {
+        read_set::record_type_decl(decl_id);
         let Some(children) = self.sub_types.get(decl_id) else {
             return Vec::new();
         };
@@ -1732,6 +1837,7 @@ impl LuaTypeIndex {
     }
 
     pub fn get_type_decl(&self, decl_id: &LuaTypeDeclId) -> Option<&LuaTypeDecl> {
+        read_set::record_type_decl(decl_id);
         self.full_name_type_map.get(decl_id)
     }
 
@@ -1776,7 +1882,17 @@ impl LuaTypeIndex {
     }
 
     pub fn get_type_decl_mut(&mut self, decl_id: &LuaTypeDeclId) -> Option<&mut LuaTypeDecl> {
+        op_log::note_mut_ref(op_log::MutRef::TypeDecl(decl_id.clone()));
+        read_set::record_type_decl(decl_id);
         self.full_name_type_map.get_mut(decl_id)
+    }
+
+    /// Boundary replace for the parallel lua walk: installs the fork's final
+    /// `LuaTypeDecl` under the same id. Side maps (supertypes, generic
+    /// params, file_types) are owned by the replayed ops. Runs only on the
+    /// merge thread.
+    pub(crate) fn replace_type_decl_object(&mut self, decl_id: &LuaTypeDeclId, decl: LuaTypeDecl) {
+        self.full_name_type_map.insert(decl_id.clone(), decl);
     }
 
     /// Stores `cache` for `owner`, keeping any type already bound there unless
@@ -1786,6 +1902,15 @@ impl LuaTypeIndex {
     /// it has to go with it; otherwise [`get_type_fact`](Self::get_type_fact)
     /// pairs the new type with the old confidence and provenance.
     pub fn bind_type(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
+        if op_log::recording() {
+            let owner2 = owner.clone();
+            let cache2 = cache.clone();
+            op_log::push(
+                op_log::Domain::Type,
+                type_bind_keys(&owner, &cache),
+                move |db| db.get_type_index_mut().bind_type(owner2, cache2),
+            );
+        }
         if let Some(existing) = self.types.get(&owner)
             && !cache.supersedes(existing)
         {
@@ -1807,6 +1932,7 @@ impl LuaTypeIndex {
     /// The write that seeded `decl_id`'s type: its source position, and whether
     /// its right-hand side read through a call or index.
     pub fn decl_write_claim(&self, decl_id: &LuaDeclId) -> Option<(TextSize, bool)> {
+        read_set::record_decl_misc(decl_id);
         self.decl_write_claims.get(decl_id).copied()
     }
 
@@ -1816,6 +1942,19 @@ impl LuaTypeIndex {
         position: TextSize,
         reads_through_call_or_index: bool,
     ) {
+        if op_log::recording() {
+            op_log::push_one(
+                op_log::Domain::Type,
+                WriteKey::DeclMisc(decl_id),
+                move |db| {
+                    db.get_type_index_mut().record_decl_write_claim(
+                        decl_id,
+                        position,
+                        reads_through_call_or_index,
+                    )
+                },
+            );
+        }
         self.decl_write_claims
             .insert(decl_id, (position, reads_through_call_or_index));
     }
@@ -1989,6 +2128,15 @@ impl LuaTypeIndex {
     }
 
     pub fn force_bind_type(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
+        if op_log::recording() {
+            let owner2 = owner.clone();
+            let cache2 = cache.clone();
+            op_log::push(
+                op_log::Domain::Type,
+                type_bind_keys(&owner, &cache),
+                move |db| db.get_type_index_mut().force_bind_type(owner2, cache2),
+            );
+        }
         let file_id = owner.get_file_id();
         self.insert_type_cache(owner.clone(), cache);
         self.in_filed_type_owner
@@ -2009,6 +2157,18 @@ impl LuaTypeIndex {
     /// No-op on a documented cache: an annotation is authoritative and is never
     /// widened over.
     pub(crate) fn widen_infer_type_cache(&mut self, owner: &LuaTypeOwner, widened: LuaType) {
+        if op_log::recording() {
+            let owner2 = owner.clone();
+            let widened2 = widened.clone();
+            op_log::push_one(
+                op_log::Domain::Type,
+                WriteKey::TypeOwner(owner.clone()),
+                move |db| {
+                    db.get_type_index_mut()
+                        .widen_infer_type_cache(&owner2, widened2)
+                },
+            );
+        }
         let Some(existing) = self.types.get(owner) else {
             return;
         };
@@ -2028,6 +2188,19 @@ impl LuaTypeIndex {
         cache: LuaTypeCache,
         metadata: LuaTypeFactMetadata,
     ) {
+        if op_log::recording() {
+            let owner2 = owner.clone();
+            let cache2 = cache.clone();
+            let metadata2 = metadata.clone();
+            op_log::push(
+                op_log::Domain::Type,
+                type_bind_keys(&owner, &cache),
+                move |db| {
+                    db.get_type_index_mut()
+                        .bind_type_fact(owner2, cache2, metadata2)
+                },
+            );
+        }
         if let Some(existing) = self.types.get(&owner)
             && !cache.supersedes(existing)
         {
@@ -2052,6 +2225,19 @@ impl LuaTypeIndex {
         cache: LuaTypeCache,
         metadata: LuaTypeFactMetadata,
     ) {
+        if op_log::recording() {
+            let owner2 = owner.clone();
+            let cache2 = cache.clone();
+            let metadata2 = metadata.clone();
+            op_log::push(
+                op_log::Domain::Type,
+                type_bind_keys(&owner, &cache),
+                move |db| {
+                    db.get_type_index_mut()
+                        .force_bind_type_fact(owner2, cache2, metadata2)
+                },
+            );
+        }
         self.force_bind_type_fact_unchecked(owner, cache, metadata);
         self.mark_inference_derived_state_dirty();
     }
@@ -2071,11 +2257,23 @@ impl LuaTypeIndex {
     }
 
     pub fn bind_definition_fact(&mut self, definition: LuaDefinitionId, fact: LuaTypeFact) {
+        if op_log::recording() {
+            let fact2 = fact.clone();
+            op_log::push_one(
+                op_log::Domain::Type,
+                WriteKey::DefinitionFact(definition),
+                move |db| {
+                    db.get_type_index_mut()
+                        .bind_definition_fact(definition, fact2)
+                },
+            );
+        }
         self.bind_definition_fact_unchecked(definition, fact);
         self.mark_inference_derived_state_dirty();
     }
 
     pub fn get_definition_fact(&self, definition: &LuaDefinitionId) -> Option<&LuaTypeFact> {
+        read_set::record_definition_fact(definition);
         self.definition_facts.get(definition)
     }
 
@@ -2428,6 +2626,17 @@ impl LuaTypeIndex {
     /// re-index will reach, because the file it belongs to is not being
     /// re-analysed.
     pub fn remove_member_type_caches(&mut self, member_ids: &[crate::LuaMemberId]) {
+        if op_log::recording() {
+            let member_ids2 = member_ids.to_vec();
+            let keys: Box<[WriteKey]> = member_ids
+                .iter()
+                .map(|id| WriteKey::TypeOwner(LuaTypeOwner::Member(*id)))
+                .collect();
+            op_log::push(op_log::Domain::Type, keys, move |db| {
+                db.get_type_index_mut()
+                    .remove_member_type_caches(&member_ids2)
+            });
+        }
         for member_id in member_ids {
             let owner = LuaTypeOwner::Member(*member_id);
             if let Some(set) = self.in_filed_type_owner.get_mut(&member_id.file_id) {

@@ -15,7 +15,9 @@ use rowan::TextRange;
 use smol_str::SmolStr;
 
 use crate::LuaDocDefaultValue;
+use crate::db_index::op_log;
 pub use crate::db_index::property::property::LuaAttributeUse;
+use crate::db_index::read_set::WriteKey;
 use crate::{DbIndex, FileId, LuaDeclId, LuaMember, LuaSignatureId};
 
 use super::{LuaSemanticDeclId, traits::LuaIndex};
@@ -39,7 +41,7 @@ struct PropertyContributorKey {
     file_id: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LuaPropertyIndex {
     /// Merged view, read by `get_property`. For the common single-contributor property this is
     /// the contribution itself and nothing else is stored.
@@ -402,6 +404,21 @@ impl LuaPropertyIndex {
             value,
             source_range,
         };
+        if op_log::recording() {
+            let entry2 = entry.clone();
+            op_log::push(
+                op_log::Domain::Property,
+                Box::new([WriteKey::DeclMisc(decl_id), WriteKey::FileScoped(file_id)]),
+                move |db| {
+                    db.get_property_index_mut().add_inferred_string_default(
+                        file_id,
+                        decl_id,
+                        entry2.value,
+                        entry2.source_range,
+                    )
+                },
+            );
+        }
         self.inferred_string_defaults
             .entry(decl_id)
             .or_default()
@@ -417,6 +434,7 @@ impl LuaPropertyIndex {
         &self,
         decl_id: &LuaDeclId,
     ) -> Option<&[LuaInferredStringDefault]> {
+        crate::db_index::read_set::record_decl_misc(decl_id);
         self.inferred_string_defaults
             .get(decl_id)
             .map(|v| v.as_slice())

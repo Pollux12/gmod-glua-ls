@@ -384,22 +384,12 @@ pub(crate) fn rederive_settled_index_expr_owners(
     let Some((_, candidates)) = context.settled_owner_candidates.as_ref() else {
         return false;
     };
+    // The first round has no records yet, so every candidate runs; later
+    // rounds re-derive only the members whose own recorded reads moved.
+    let rederive_all = moved_owners.is_none();
+    let candidate_reads = &context.settled_candidate_reads;
     let mut file_ids = candidates.keys().copied().collect::<Vec<_>>();
-    if file_ids.is_empty() {
-        return false;
-    }
     file_ids.sort_unstable();
-    file_ids.retain(|file_id| {
-        // The file's own candidate count, not the workspace member total: a
-        // new member elsewhere must not re-derive this file's recorded reads.
-        context.settled_pass_reads_stale(
-            db,
-            read_pass,
-            candidates[file_id].len(),
-            *file_id,
-            moved_owners,
-        )
-    });
     if file_ids.is_empty() {
         return false;
     }
@@ -420,8 +410,24 @@ pub(crate) fn rederive_settled_index_expr_owners(
             },
         );
         let mut updates = Vec::new();
-        crate::db_index::read_set::arm_with_member_maps();
+        // Reads are armed per member so the next round re-derives this member
+        // alone rather than every candidate in the file. The guard disarms on
+        // whichever path the body takes.
+        let mut drained_reads = Vec::new();
         for &member_id in &candidates[&file_id] {
+            let key = super::SettledCandidate::Member(member_id);
+            let stale = rederive_all
+                || candidate_reads
+                    .get(&(read_pass, key))
+                    .is_none_or(|(version, reads)| version.is_stale(db, reads));
+            if !stale {
+                continue;
+            }
+            crate::db_index::read_set::arm_with_member_maps();
+            let _drain = super::ReadDrain {
+                slot: &mut drained_reads,
+                key,
+            };
             let current = db.get_member_index().get_current_owner(&member_id).cloned();
             let Some((settled_owner, set_owner_only)) =
                 settled_owner_for_member(db, &mut infer_cache, file_id, member_id)
@@ -444,22 +450,14 @@ pub(crate) fn rederive_settled_index_expr_owners(
             // names a declared class without becoming one of its members.
             updates.push((member_id, settled_owner, set_owner_only, current));
         }
-        (file_id, updates, crate::db_index::read_set::disarm())
+        (file_id, updates, drained_reads)
     });
 
-    let file_candidate_counts: HashMap<crate::FileId, usize> = file_ids
-        .iter()
-        .map(|file_id| (*file_id, candidates[file_id].len()))
-        .collect();
     let mut moved = false;
-    for (file_id, updates, reads) in results {
-        context.record_settled_pass_reads(
-            read_pass,
-            file_id,
-            file_candidate_counts[&file_id],
-            read_version,
-            reads,
-        );
+    for (file_id, updates, candidate_reads) in results {
+        for (candidate, reads) in candidate_reads {
+            context.record_settled_candidate_reads(read_pass, candidate, read_version, reads);
+        }
         for (member_id, settled_owner, set_owner_only, previous) in updates {
             let index = db.get_member_index_mut();
             if index.has_synthesized_owner(&member_id) {

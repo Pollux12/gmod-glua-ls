@@ -5,6 +5,7 @@ pub(in crate::compilation::analyzer) mod func_body;
 mod member_write_policy;
 mod metatable;
 mod module;
+mod par_walk;
 mod stats;
 
 use rustc_hash::FxHashMap;
@@ -101,9 +102,85 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
         } else {
             0
         };
+        // Speculative intra-level parallelism: workers walk files on copy-on-
+        // write forks and the merge replays each outcome in level order,
+        // re-running serially any file whose recorded reads were moved by a
+        // write it never saw. Measured on CityRP: the dominant level's files
+        // read each other's type/member slots densely enough that ~70% of
+        // outcomes re-ran, and replay + rerun + fork clones cost ~2× the
+        // serial walk — speculation cannot pay when the unseen-write window
+        // is the whole level. Disabled by default pending a cheaper
+        // staleness model; `GLUALS_PARWALK=1` re-enables for measurement.
+        let parallel_walk = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            > 1
+            && std::env::var_os("GLUALS_PARWALK").is_some();
         for level in levels {
             if let Some(shape) = level_shape.as_mut() {
                 shape.begin_level(level.len());
+            }
+            if level.len() >= par_walk::PARALLEL_MIN_LEVEL && parallel_walk {
+                let (reports, _rerun_count) = par_walk::analyze_level(
+                    db,
+                    context,
+                    &level,
+                    &scripted_scope_files,
+                    &special_call_direct_matcher,
+                    gmod_enabled,
+                    node_profile_enabled,
+                );
+                for report in reports {
+                    file_count += 1;
+                    if progress_step != 0 && file_count.is_multiple_of(progress_step) {
+                        crate::progress::advance_current_phase(file_count, progress_total, "files");
+                    }
+                    let file_id = report.file_id;
+                    let file_elapsed = report.elapsed;
+                    if let Some(summary) = slow_file_summary.as_mut() {
+                        summary.record(file_id, file_elapsed);
+                    }
+                    if let Some(shape) = level_shape.as_mut() {
+                        shape.record_file(file_elapsed);
+                    }
+                    if let (Some(workspace_profile), Some(profile)) =
+                        (workspace_profile.as_mut(), report.profile.as_ref())
+                    {
+                        workspace_profile.merge(profile);
+                    }
+                    if slow_log_enabled {
+                        let should_log_file = if stderr_profile_enabled {
+                            file_elapsed.as_millis() > 1
+                        } else {
+                            file_elapsed >= Duration::from_millis(50)
+                        };
+                        if should_log_file {
+                            let path = db
+                                .get_vfs()
+                                .get_uri(&file_id)
+                                .map(|u| u.to_string())
+                                .unwrap_or_else(|| format!("{:?}", file_id));
+                            info!("lua analyze slow file: {} cost {:?}", path, file_elapsed);
+                            if let Some(profile) = report.profile.as_ref() {
+                                profile.log_slow_file(&path);
+                            }
+                            if stderr_profile_enabled {
+                                eprintln!(
+                                    "lua analyze slow file: {} cost {:?}",
+                                    path, file_elapsed
+                                );
+                                if let Some(profile) = report.profile.as_ref() {
+                                    eprintln!(
+                                        "lua analyze slow file node profile: {} [{}]",
+                                        path,
+                                        profile.summary(8)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
             }
             for file_id in level {
                 if progress_step != 0 && file_count.is_multiple_of(progress_step) {

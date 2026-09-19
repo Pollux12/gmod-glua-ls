@@ -2,7 +2,7 @@ mod check_reason;
 mod find_decl_function;
 mod resolve;
 mod resolve_closure;
-mod spec;
+pub(in crate::compilation::analyzer) mod spec;
 mod writes;
 
 use rustc_hash::FxHashMap;

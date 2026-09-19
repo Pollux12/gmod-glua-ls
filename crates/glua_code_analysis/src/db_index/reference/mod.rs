@@ -12,7 +12,7 @@ use string_reference::StringReference;
 use super::{LuaDeclId, LuaMemberKey, LuaTypeDeclId, traits::LuaIndex};
 use crate::{FileId, InFiled};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LuaReferenceIndex {
     file_references: HashMap<FileId, FileReference>,
     index_reference: HashMap<LuaMemberKey, HashMap<FileId, HashSet<LuaSyntaxId>>>,

@@ -40,7 +40,7 @@ struct DependencySiteLocation {
     site_index: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LuaDependencyIndex {
     dependencies: HashMap<FileId, HashSet<FileId>>,
     dependency_kinds: HashMap<FileId, HashMap<FileId, HashSet<LuaDependencyKind>>>,

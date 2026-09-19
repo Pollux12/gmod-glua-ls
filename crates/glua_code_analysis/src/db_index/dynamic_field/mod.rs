@@ -6,6 +6,7 @@ use smol_str::SmolStr;
 use super::traits::LuaIndex;
 use crate::{
     DbIndex, FileId, GlobalId, InFiled, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaTypeDeclId,
+    db_index::op_log, db_index::read_set::WriteKey,
 };
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -87,7 +88,7 @@ pub fn is_pure_wildcard_registry(db: &DbIndex, owner: &DynamicFieldOwner) -> boo
 /// When `gmod.inferDynamicFields` is enabled, field assignments like
 /// `player.customField = value` are recorded here so that both
 /// `InjectField` and `UndefinedField` diagnostics can be suppressed.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DynamicFieldIndex {
     /// owner → (field_name → set of files that assign this field)
     owner_fields: HashMap<DynamicFieldOwner, HashMap<SmolStr, HashSet<FileId>>>,
@@ -175,6 +176,21 @@ impl DynamicFieldIndex {
         file_id: FileId,
         range: TextRange,
     ) -> bool {
+        if op_log::recording() {
+            let owner2 = owner.clone();
+            let field_name2 = field_name.clone();
+            op_log::push(
+                op_log::Domain::DynamicField,
+                Box::new([
+                    WriteKey::DynamicField(owner.clone(), Some(field_name.clone())),
+                    WriteKey::FileScoped(file_id),
+                ]),
+                move |db| {
+                    db.get_dynamic_field_index_mut()
+                        .add_field(owner2, field_name2, file_id, range);
+                },
+            );
+        }
         let definition = InFiled::new(file_id, range);
         let direct_definitions = self
             .direct_field_definitions
@@ -195,6 +211,25 @@ impl DynamicFieldIndex {
         file_id: FileId,
         range: TextRange,
     ) -> bool {
+        if op_log::recording() {
+            let owner2 = owner.clone();
+            let field_name2 = field_name.clone();
+            op_log::push(
+                op_log::Domain::DynamicField,
+                Box::new([
+                    WriteKey::DynamicField(owner.clone(), Some(field_name.clone())),
+                    WriteKey::FileScoped(file_id),
+                ]),
+                move |db| {
+                    db.get_dynamic_field_index_mut().add_propagated_field(
+                        owner2,
+                        field_name2,
+                        file_id,
+                        range,
+                    );
+                },
+            );
+        }
         self.add_field_inner(owner, field_name, file_id, range)
     }
 
@@ -247,6 +282,20 @@ impl DynamicFieldIndex {
         file_id: FileId,
         range: TextRange,
     ) -> bool {
+        if op_log::recording() {
+            let owner2 = owner.clone();
+            op_log::push(
+                op_log::Domain::DynamicField,
+                Box::new([
+                    WriteKey::DynamicField(owner.clone(), None),
+                    WriteKey::FileScoped(file_id),
+                ]),
+                move |db| {
+                    db.get_dynamic_field_index_mut()
+                        .add_wildcard_definition(owner2, file_id, range);
+                },
+            );
+        }
         let definitions = self.wildcard_definitions.entry(owner.clone()).or_default();
         let definition = InFiled::new(file_id, range);
         let is_new_definition = !definitions.contains(&definition);
@@ -286,6 +335,20 @@ impl DynamicFieldIndex {
     }
 
     pub fn add_unattributed_field(&mut self, field_name: SmolStr, file_id: FileId) {
+        if op_log::recording() {
+            let field_name2 = field_name.clone();
+            op_log::push(
+                op_log::Domain::DynamicField,
+                Box::new([
+                    WriteKey::UnattributedField(field_name.clone()),
+                    WriteKey::FileScoped(file_id),
+                ]),
+                move |db| {
+                    db.get_dynamic_field_index_mut()
+                        .add_unattributed_field(field_name2, file_id)
+                },
+            );
+        }
         if self
             .unattributed_fields
             .entry(field_name.clone())
@@ -578,6 +641,21 @@ impl DynamicFieldIndex {
     }
 
     pub fn add_finite_named_member(&mut self, owner: DynamicFieldOwner, member_id: LuaMemberId) {
+        if op_log::recording() {
+            let owner2 = owner.clone();
+            op_log::push(
+                op_log::Domain::DynamicField,
+                Box::new([
+                    WriteKey::DynamicField(owner.clone(), None),
+                    WriteKey::MemberId(member_id),
+                    WriteKey::FileScoped(member_id.file_id),
+                ]),
+                move |db| {
+                    db.get_dynamic_field_index_mut()
+                        .add_finite_named_member(owner2, member_id)
+                },
+            );
+        }
         if self
             .finite_named_members
             .entry(owner.clone())

@@ -16,7 +16,7 @@ pub struct TableNumericRangePopulation {
     pub call_range: TextRange,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct NumericRangePopulationIndex {
     by_file: FxHashMap<FileId, Vec<TableNumericRangePopulation>>,
     by_global: FxHashMap<String, Vec<TableNumericRangePopulation>>,

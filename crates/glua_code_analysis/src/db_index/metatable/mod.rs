@@ -4,6 +4,8 @@ use std::sync::Arc;
 use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 
+use crate::db_index::op_log;
+use crate::db_index::read_set::WriteKey;
 use crate::{FileId, InFiled};
 
 use super::LuaIndex;
@@ -17,7 +19,7 @@ fn map_range(remap: &crate::FileRemap, range: &InFiled<TextRange>) -> Option<InF
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LuaMetatableIndex {
     /// Table literal -> the bindings written for it, ordered by writer. Both the key and the
     /// metatable range can live in a file other than the one that wrote `setmetatable`, so a
@@ -74,6 +76,22 @@ impl LuaMetatableIndex {
         writer_file_id: FileId,
         writer_sort_key: Arc<str>,
     ) {
+        if op_log::recording() {
+            let table2 = table.clone();
+            let metatable2 = metatable.clone();
+            let sort_key2 = writer_sort_key.clone();
+            op_log::push(
+                op_log::Domain::Metatable,
+                Box::new([
+                    WriteKey::Metatable(table.clone()),
+                    WriteKey::FileScoped(writer_file_id),
+                ]),
+                move |db| {
+                    db.get_metatable_index_mut()
+                        .add(table2, metatable2, writer_file_id, sort_key2)
+                },
+            );
+        }
         let bindings = self.metatables.entry(table.clone()).or_default();
         if let Some(existing) = bindings
             .iter_mut()
@@ -104,6 +122,7 @@ impl LuaMetatableIndex {
     }
 
     pub fn get(&self, table: &InFiled<TextRange>) -> Option<&InFiled<TextRange>> {
+        crate::db_index::read_set::record_metatable(table);
         self.metatables
             .get(table)
             .and_then(|bindings| bindings.first())
@@ -114,12 +133,21 @@ impl LuaMetatableIndex {
     pub fn iter_bindings(
         &self,
     ) -> impl Iterator<Item = (&InFiled<TextRange>, &MetatableBinding)> + '_ {
+        op_log::note_untracked_read(op_log::UntrackedDomain::Metatable);
         self.metatables
             .iter()
             .flat_map(|(table, bindings)| bindings.iter().map(move |binding| (table, binding)))
     }
 
     pub fn add_factory_binding(&mut self, binding: SetmetatableFactoryBinding) {
+        if op_log::recording() {
+            let binding2 = binding.clone();
+            op_log::push_one(
+                op_log::Domain::Metatable,
+                WriteKey::FileScoped(binding.file_id),
+                move |db| db.get_metatable_index_mut().add_factory_binding(binding2),
+            );
+        }
         self.factory_bindings
             .entry(binding.file_id)
             .or_default()
@@ -196,6 +224,7 @@ impl LuaMetatableIndex {
         &self,
         file_id: FileId,
     ) -> Option<&[SetmetatableFactoryBinding]> {
+        crate::db_index::read_set::record_file_scoped(&file_id);
         self.factory_bindings.get(&file_id).map(Vec::as_slice)
     }
 

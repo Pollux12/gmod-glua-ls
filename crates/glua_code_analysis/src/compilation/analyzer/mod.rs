@@ -485,8 +485,9 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             context.settled_decl_copy_candidates.clear();
             context.settled_assign_candidates.clear();
             context.settled_assign_candidate_keys.clear();
-            context.settled_pass_reads.clear();
+            context.settled_candidate_reads.clear();
             context.settled_assign_claims.clear();
+            context.settled_assign_candidate_counts.clear();
             context.settled_parent_closure_candidates.clear();
             context.settled_return_attempts.clear();
             context.settled_member_key_candidates = None;
@@ -513,11 +514,28 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             .drain_missed_member_reads()
             .into_iter()
             .collect::<HashMap<_, _>>();
+        // The per-candidate records carry the same reads the old file-level
+        // union accumulated; only three of its fields are consumed below, so
+        // the union is rebuilt here instead of cloned per candidate per round.
+        let mut settled_read_sets =
+            HashMap::<FileId, crate::db_index::read_set::InferenceReadSet>::default();
+        for ((_, candidate), (_, reads)) in &context.settled_candidate_reads {
+            let file_reads = settled_read_sets.entry(candidate.file_id()).or_default();
+            file_reads
+                .type_owners
+                .extend(reads.type_owners.iter().cloned());
+            file_reads
+                .signatures
+                .extend(reads.signatures.iter().cloned());
+            file_reads.missing_member_slots.extend(
+                reads
+                    .missing_member_slots
+                    .iter()
+                    .map(|(key, counts)| (key.clone(), *counts)),
+            );
+        }
         for reader_file_id in &workspace_file_ids {
-            let reads = context
-                .settled_read_sets
-                .remove(reader_file_id)
-                .unwrap_or_default();
+            let reads = settled_read_sets.remove(reader_file_id).unwrap_or_default();
             missed_member_reads
                 .entry(*reader_file_id)
                 .or_default()
@@ -812,7 +830,12 @@ fn rederive_settled_parent_closures(db: &mut DbIndex, context: &mut AnalyzeConte
 /// settled iterator variables, plus the cache side effects inference produced.
 struct IterVarRefreshResult {
     file_id: FileId,
-    reads: crate::db_index::read_set::InferenceReadSet,
+    /// Each re-derived candidate's recorded reads, saved so the next round can
+    /// skip candidates whose own reads did not move.
+    candidate_reads: Vec<(
+        SettledCandidate,
+        crate::db_index::read_set::InferenceReadSet,
+    )>,
     pending_type_decls: Vec<crate::PendingStrTplTypeDecl>,
     guard_dependencies: HashSet<crate::LuaInferredGuardOwner>,
     updates: Vec<unresolve::IterVarTypeUpdate>,
@@ -822,7 +845,7 @@ impl IterVarRefreshResult {
     fn new(file_id: FileId) -> Self {
         Self {
             file_id,
-            reads: Default::default(),
+            candidate_reads: Vec::new(),
             pending_type_decls: Vec::new(),
             guard_dependencies: HashSet::default(),
             updates: Vec::new(),
@@ -875,32 +898,13 @@ fn rederive_settled_iter_vars(
     moved_owners: Option<&HashSet<LuaTypeOwner>>,
 ) -> (bool, HashSet<LuaTypeOwner>) {
     let read_pass = SettledReadPass::Iter;
-    // Per-file candidate counts: a new candidate arriving for one file must
-    // not re-derive every other file's recorded reads.
-    let mut file_candidate_counts = HashMap::<FileId, usize>::default();
-    for candidate in &context.settled_iter_var_candidates {
-        *file_candidate_counts.entry(candidate.file_id).or_default() += 1;
-    }
     let read_version = crate::db_index::read_set::InferenceReadVersion::capture(db);
+    // The first round has no records yet, so every candidate runs; later
+    // rounds re-derive only the candidates whose own recorded reads moved.
+    let rederive_all = moved_owners.is_none();
     // Kept, not taken: the settled tail runs to a fixpoint and each round
     // re-derives the same candidates against what the previous one landed.
-    let mut stale_files = HashMap::<FileId, bool>::default();
-    let mut candidates = context
-        .settled_iter_var_candidates
-        .iter()
-        .filter(|candidate| {
-            *stale_files.entry(candidate.file_id).or_insert_with(|| {
-                context.settled_pass_reads_stale(
-                    db,
-                    read_pass,
-                    file_candidate_counts[&candidate.file_id],
-                    candidate.file_id,
-                    moved_owners,
-                )
-            })
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut candidates = context.settled_iter_var_candidates.clone();
     if candidates.is_empty() {
         return (false, HashSet::default());
     }
@@ -915,8 +919,8 @@ fn rederive_settled_iter_vars(
     });
 
     let mut candidates_by_file = HashMap::<FileId, Vec<SettledIterVarCandidate>>::default();
-    for iter_var in candidates {
-        let candidate = SettledIterVarCandidate::new(&iter_var);
+    for iter_var in &candidates {
+        let candidate = SettledIterVarCandidate::new(iter_var);
         candidates_by_file
             .entry(iter_var.file_id)
             .or_default()
@@ -924,14 +928,8 @@ fn rederive_settled_iter_vars(
     }
 
     let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
-    file_ids.retain(|file_id| stale_files.get(file_id).copied().unwrap_or(false));
     file_ids.sort_unstable();
-    if file_ids.is_empty() {
-        return (false, HashSet::default());
-    }
-    context
-        .infer_manager
-        .clear_files_iter_var_results(&file_ids.iter().copied().collect());
+    let candidate_reads = &context.settled_candidate_reads;
 
     let analysis_phase = context.infer_manager.current_phase();
     let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
@@ -953,28 +951,48 @@ fn rederive_settled_iter_vars(
             },
         );
         let mut result = IterVarRefreshResult::new(file_id);
-        crate::db_index::read_set::arm_with_member_maps();
-        let root = db
+        let Some(root) = db
             .get_vfs()
             .get_syntax_tree(&file_id)
-            .map(|tree| tree.get_red_root());
-        if let Some(root) = &root {
-            for candidate in &candidates_by_file[&file_id] {
-                let Some(iter_exprs) = candidate.iter_exprs(root) else {
-                    continue;
-                };
-                if let Ok(updates) = unresolve::resolve_settled_iter_var_readonly(
-                    db,
-                    &mut infer_cache,
-                    file_id,
-                    &iter_exprs,
-                    &candidate.var_positions,
-                ) {
-                    result.updates.extend(updates);
-                }
+            .map(|tree| tree.get_red_root())
+        else {
+            return result;
+        };
+        for candidate in &candidates_by_file[&file_id] {
+            let key = SettledCandidate::IterVar(
+                file_id,
+                candidate.var_positions.first().copied().unwrap_or_default(),
+            );
+            // A candidate whose recorded reads did not move answers the same
+            // as last round; one with no record has never run.
+            let stale = rederive_all
+                || candidate_reads
+                    .get(&(read_pass, key))
+                    .is_none_or(|(version, reads)| version.is_stale(db, reads));
+            if !stale {
+                continue;
+            }
+            // Reads are armed per candidate so the next round re-derives this
+            // loop alone rather than every candidate in the file. The guard
+            // disarms on whichever path the body takes.
+            crate::db_index::read_set::arm_with_member_maps();
+            let _drain = ReadDrain {
+                slot: &mut result.candidate_reads,
+                key,
+            };
+            let Some(iter_exprs) = candidate.iter_exprs(&root) else {
+                continue;
+            };
+            if let Ok(updates) = unresolve::resolve_settled_iter_var_readonly(
+                db,
+                &mut infer_cache,
+                file_id,
+                &iter_exprs,
+                &candidate.var_positions,
+            ) {
+                result.updates.extend(updates);
             }
         }
-        result.reads = crate::db_index::read_set::disarm();
         result.pending_type_decls = infer_cache.take_pending_str_tpl_type_decls();
         result.guard_dependencies = infer_cache.take_inferred_guard_dependencies();
         result
@@ -984,14 +1002,16 @@ fn rederive_settled_iter_vars(
     // answer already cached would otherwise re-derive its readers every round.
     let mut written = HashSet::default();
     for result in results {
-        context.record_settled_reads(result.file_id, result.reads.clone());
-        context.record_settled_pass_reads(
-            read_pass,
-            result.file_id,
-            file_candidate_counts[&result.file_id],
-            read_version,
-            result.reads,
-        );
+        // A file whose candidates all skipped kept its iter-var mirrors;
+        // one that ran any clears them before the fresh answers land.
+        if !result.candidate_reads.is_empty() {
+            context
+                .infer_manager
+                .clear_files_iter_var_results(&[result.file_id].into_iter().collect());
+        }
+        for (candidate, reads) in result.candidate_reads {
+            context.record_settled_candidate_reads(read_pass, candidate, read_version, reads);
+        }
         context.infer_manager.merge_inference_side_effects(
             result.file_id,
             result.pending_type_decls,
@@ -1099,28 +1119,12 @@ fn refresh_settled_expr_type_member_keys(
     let Some((_, candidates)) = context.settled_member_key_candidates.as_ref() else {
         return false;
     };
-    // Per-file candidate counts: a candidate arriving for one file must not
-    // re-derive every other file's recorded reads.
-    let file_candidate_counts: HashMap<FileId, usize> = candidates
-        .iter()
-        .map(|(file_id, members)| (*file_id, members.len()))
-        .collect();
+    // The first round has no records yet, so every candidate runs; later
+    // rounds re-derive only the members whose own recorded reads moved.
+    let rederive_all = moved_owners.is_none();
+    let candidate_reads = &context.settled_candidate_reads;
     let mut file_ids = candidates.keys().copied().collect::<Vec<_>>();
-    if file_ids.is_empty() {
-        return false;
-    }
     file_ids.sort_unstable();
-    // Revisit files when a recorded fact or the file's own candidate count
-    // changes; unrelated files' candidates no longer force a re-derivation.
-    file_ids.retain(|file_id| {
-        context.settled_pass_reads_stale(
-            db,
-            read_pass,
-            file_candidate_counts[file_id],
-            *file_id,
-            moved_owners,
-        )
-    });
     if file_ids.is_empty() {
         return false;
     }
@@ -1146,16 +1150,28 @@ fn refresh_settled_expr_type_member_keys(
             .get_syntax_tree(&file_id)
             .map(|tree| tree.get_red_root())
         else {
-            return (
-                file_id,
-                Vec::new(),
-                crate::db_index::read_set::InferenceReadSet::default(),
-            );
+            return (file_id, Vec::new(), Vec::new());
         };
 
         let mut updates = Vec::new();
-        crate::db_index::read_set::arm_with_member_maps();
+        // Reads are armed per member so the next round re-derives this member
+        // alone rather than every candidate in the file. The guard disarms on
+        // whichever path the body takes.
+        let mut drained_reads = Vec::new();
         for &member_id in &candidates[&file_id] {
+            let key = SettledCandidate::Member(member_id);
+            let stale = rederive_all
+                || candidate_reads
+                    .get(&(read_pass, key))
+                    .is_none_or(|(version, reads)| version.is_stale(db, reads));
+            if !stale {
+                continue;
+            }
+            crate::db_index::read_set::arm_with_member_maps();
+            let _drain = ReadDrain {
+                slot: &mut drained_reads,
+                key,
+            };
             let Some(member) = db.get_member_index().get_member(&member_id) else {
                 continue;
             };
@@ -1208,18 +1224,14 @@ fn refresh_settled_expr_type_member_keys(
             }
             updates.push((member_id, settled_key));
         }
-        (file_id, updates, crate::db_index::read_set::disarm())
+        (file_id, updates, drained_reads)
     });
 
     let mut moved = false;
-    for (file_id, updates, reads) in results {
-        context.record_settled_pass_reads(
-            read_pass,
-            file_id,
-            file_candidate_counts[&file_id],
-            read_version,
-            reads,
-        );
+    for (_file_id, updates, candidate_reads) in results {
+        for (candidate, reads) in candidate_reads {
+            context.record_settled_candidate_reads(read_pass, candidate, read_version, reads);
+        }
         for (member_id, settled_key) in updates {
             if db
                 .get_member_index_mut()
@@ -1247,48 +1259,31 @@ fn rederive_settled_global_reads(
     moved_owners: Option<&HashSet<LuaTypeOwner>>,
 ) -> HashSet<LuaTypeOwner> {
     let read_pass = SettledReadPass::Global;
-    // Per-file candidate counts across both read sets: a new candidate
-    // arriving for one file must not re-derive every other file's reads.
-    let mut file_candidate_counts = HashMap::<FileId, usize>::default();
-    for (decl_id, _) in context
-        .settled_global_read_candidates
-        .iter()
-        .chain(context.settled_multi_decl_global_read_candidates.iter())
-    {
-        *file_candidate_counts.entry(decl_id.file_id).or_default() += 1;
-    }
     let read_version = crate::db_index::read_set::InferenceReadVersion::capture(db);
-    let mut stale_files = HashMap::<FileId, bool>::default();
+    // The first round has no records yet, so every candidate runs; later
+    // rounds re-derive only the candidates whose own recorded reads moved.
+    let rederive_all = moved_owners.is_none();
+    let candidate_stale =
+        |context: &AnalyzeContext, db: &DbIndex, decl_id: LuaDeclId, expr: &LuaExpr| {
+            rederive_all
+                || context
+                    .settled_candidate_reads
+                    .get(&(
+                        read_pass,
+                        SettledCandidate::Global(decl_id, expr.get_syntax_id()),
+                    ))
+                    .is_none_or(|(version, reads)| version.is_stale(db, reads))
+        };
     let standard = context
         .settled_global_read_candidates
         .iter()
-        .filter(|(decl_id, _)| {
-            *stale_files.entry(decl_id.file_id).or_insert_with(|| {
-                context.settled_pass_reads_stale(
-                    db,
-                    read_pass,
-                    file_candidate_counts[&decl_id.file_id],
-                    decl_id.file_id,
-                    moved_owners,
-                )
-            })
-        })
+        .filter(|(decl_id, expr)| candidate_stale(context, db, *decl_id, expr))
         .cloned()
         .collect::<Vec<_>>();
     let multi_decl = context
         .settled_multi_decl_global_read_candidates
         .iter()
-        .filter(|(decl_id, _)| {
-            *stale_files.entry(decl_id.file_id).or_insert_with(|| {
-                context.settled_pass_reads_stale(
-                    db,
-                    read_pass,
-                    file_candidate_counts[&decl_id.file_id],
-                    decl_id.file_id,
-                    moved_owners,
-                )
-            })
-        })
+        .filter(|(decl_id, expr)| candidate_stale(context, db, *decl_id, expr))
         .cloned()
         .collect::<Vec<_>>();
     if standard.is_empty() && multi_decl.is_empty() {
@@ -1317,9 +1312,12 @@ fn rederive_settled_global_reads(
     let generic_initializer_candidates = context.settled_decl_initializer_candidates.clone();
     context.infer_manager.clear_files_deferred_results(&files);
 
-    // What each file's re-derivation actually read, recorded for the next
-    // round's filter the way the iter-var and initializer passes record.
-    let mut file_reads = HashMap::<FileId, crate::db_index::read_set::InferenceReadSet>::default();
+    // What each candidate's re-derivation actually read, recorded so the next
+    // round re-derives only the candidates whose own reads moved.
+    let mut candidate_reads = Vec::<(
+        SettledCandidate,
+        crate::db_index::read_set::InferenceReadSet,
+    )>::new();
     // `allow_unsubsumed_swap` is set for reads through a multi-declaration
     // global: those are one runtime table, so the read against the complete set
     // of backing tables replaces the walk's read against a subset even when the
@@ -1330,6 +1328,13 @@ fn rederive_settled_global_reads(
             if generic_initializer_candidates.contains(&decl_id) {
                 continue;
             }
+            // Armed before the doc-cache check so that read stales the
+            // candidate too; the guard disarms on whichever path follows.
+            crate::db_index::read_set::arm_with_member_maps();
+            let _drain = ReadDrain {
+                slot: &mut candidate_reads,
+                key: SettledCandidate::Global(decl_id, expr.get_syntax_id()),
+            };
             let type_owner = LuaTypeOwner::Decl(decl_id);
             let existing = db.get_type_index().get_type_cache(&type_owner);
             if existing.is_some_and(|cached| cached.is_doc()) {
@@ -1357,12 +1362,8 @@ fn rederive_settled_global_reads(
                 fills_own_default: lua::expr_fills_own_default(db, decl_id.file_id, decl_id, &expr),
             };
             let cache = context.infer_manager.get_infer_cache(decl_id.file_id);
-            crate::db_index::read_set::arm_with_member_maps();
+            crate::db_index::read_set::record(&type_owner);
             let inferred = crate::semantic::infer_expr(db, cache, expr);
-            file_reads
-                .entry(decl_id.file_id)
-                .or_default()
-                .extend(crate::db_index::read_set::disarm());
             let Ok(settled) = inferred else {
                 continue;
             };
@@ -1401,20 +1402,18 @@ fn rederive_settled_global_reads(
             }
         }
     }
-    for (file_id, mut reads) in file_reads {
-        reads.type_owners.extend(
-            before
-                .keys()
-                .filter(|owner| owner.get_file_id() == file_id)
-                .cloned(),
-        );
-        context.record_settled_pass_reads(
-            read_pass,
-            file_id,
-            file_candidate_counts[&file_id],
-            read_version,
-            reads,
-        );
+    // A decl+expr pair queued on both candidate lists drains twice under one
+    // key; union so the record covers every read the pass actually made.
+    let mut candidate_records =
+        HashMap::<SettledCandidate, crate::db_index::read_set::InferenceReadSet>::default();
+    for (candidate, reads) in candidate_reads {
+        candidate_records
+            .entry(candidate)
+            .or_default()
+            .extend(reads);
+    }
+    for (candidate, reads) in candidate_records {
+        context.record_settled_candidate_reads(read_pass, candidate, read_version, reads);
     }
     let moved = before
         .into_iter()
@@ -1638,7 +1637,12 @@ const _: fn() = assert_send::<crate::LuaInferCache>;
 struct SettledAssignRefreshResult {
     file_id: FileId,
     settled: Vec<(usize, Option<LuaType>)>,
-    reads: crate::db_index::read_set::InferenceReadSet,
+    /// Each re-derived candidate's recorded reads, saved so the next round can
+    /// skip candidates whose own reads did not move.
+    candidate_reads: Vec<(
+        SettledCandidate,
+        crate::db_index::read_set::InferenceReadSet,
+    )>,
     infer_cache: crate::LuaInferCache,
 }
 
@@ -1647,7 +1651,7 @@ impl SettledAssignRefreshResult {
         Self {
             file_id,
             settled: Vec::new(),
-            reads: Default::default(),
+            candidate_reads: Vec::new(),
             infer_cache,
         }
     }
@@ -1697,40 +1701,16 @@ fn rederive_settled_assign_reads(
     context: &mut AnalyzeContext,
 ) -> HashSet<LuaTypeOwner> {
     let read_pass = SettledReadPass::Assign;
-    // Per-file candidate counts: a new candidate arriving for one file must
-    // not re-derive every other file's recorded reads.
-    let mut file_candidate_counts = HashMap::<FileId, usize>::default();
+    // Per-decl candidate counts: a candidate arriving or leaving changes the
+    // arbitration group, so every candidate of that declaration re-derives.
+    let mut decl_candidate_counts = HashMap::<LuaDeclId, usize>::default();
     for (decl_id, _, _) in &context.settled_assign_candidates {
-        *file_candidate_counts.entry(decl_id.file_id).or_default() += 1;
+        *decl_candidate_counts.entry(*decl_id).or_default() += 1;
     }
     let read_version = crate::db_index::read_set::InferenceReadVersion::capture(db);
-    let unchanged = HashSet::default();
-    let mut stale_files = HashMap::<FileId, bool>::default();
-    let mut dirty_files = HashSet::default();
-    for (decl_id, _, _) in &context.settled_assign_candidates {
-        let claim = db
-            .get_type_index()
-            .decl_write_claim(decl_id)
-            .map(|(position, _)| position);
-        let stale = *stale_files.entry(decl_id.file_id).or_insert_with(|| {
-            context.settled_pass_reads_stale(
-                db,
-                read_pass,
-                file_candidate_counts[&decl_id.file_id],
-                decl_id.file_id,
-                Some(&unchanged),
-            )
-        });
-        if stale || context.settled_assign_claims.get(decl_id) != Some(&claim) {
-            dirty_files.insert(decl_id.file_id);
-        }
-    }
-    let mut candidates = context
-        .settled_assign_candidates
-        .iter()
-        .filter(|(decl_id, _, _)| dirty_files.contains(&decl_id.file_id))
-        .cloned()
-        .collect::<Vec<_>>();
+    // The write-claim holder, the arbitration group, and the recorded reads
+    // are the staleness inputs; the workers check all three in parallel.
+    let mut candidates = context.settled_assign_candidates.clone();
     if candidates.is_empty() {
         return HashSet::default();
     }
@@ -1769,8 +1749,6 @@ fn rederive_settled_assign_reads(
     let analysis_phase = context.infer_manager.current_phase();
     let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
     let call_site_params_visible = context.infer_manager.call_site_params_visible();
-    context.infer_manager.clear_files_deferred_results(&files);
-    context.infer_manager.clear_files_flow_results(&files);
 
     let mut file_ids = files.iter().copied().collect::<Vec<_>>();
     file_ids.sort_unstable();
@@ -1816,19 +1794,57 @@ fn rederive_settled_assign_reads(
         context
             .settled_assign_claims
             .insert(*decl_id, snapshots[decl_id].1);
+        context
+            .settled_assign_candidate_counts
+            .insert(*decl_id, decl_candidate_counts[decl_id]);
     }
 
     // Red syntax handles are not `Send`; workers reconstruct each expression
     // from its syntax id and return the complete file cache with the answer.
+    let candidate_reads = &context.settled_candidate_reads;
+    let assign_claims = &context.settled_assign_claims;
+    let assign_counts = &context.settled_assign_candidate_counts;
     let run = |(file_id, infer_cache): (FileId, crate::LuaInferCache)| {
         glua_parser::with_syntax_resolvers(|| {
             let mut result = SettledAssignRefreshResult::new(file_id, infer_cache);
-            crate::db_index::read_set::arm_with_member_maps();
             let root = db_ref
                 .get_vfs()
                 .get_syntax_tree(&file_id)
                 .map(|tree| tree.get_red_root());
+            // Deferred and flow results only need flushing when this file
+            // actually re-derives a candidate — the pass's writes are what
+            // invalidates them.
+            let mut cleared = false;
             for (slot, decl_id, expr_id, ret_idx) in &candidates_by_file[&file_id] {
+                let key = SettledCandidate::Assign(*decl_id, *expr_id, *ret_idx);
+                let claim = db_ref
+                    .get_type_index()
+                    .decl_write_claim(decl_id)
+                    .map(|(position, _)| position);
+                // A candidate with no record has never run; one whose
+                // recorded reads, write claim, or arbitration group did not
+                // move answers the same as last round.
+                let stale = assign_claims.get(decl_id) != Some(&claim)
+                    || assign_counts.get(decl_id).copied() != Some(decl_candidate_counts[decl_id])
+                    || candidate_reads
+                        .get(&(read_pass, key))
+                        .is_none_or(|(version, reads)| version.is_stale(db_ref, reads));
+                if !stale {
+                    continue;
+                }
+                if !cleared {
+                    result.infer_cache.clear_deferred_inference_results();
+                    result.infer_cache.clear_flow_results();
+                    cleared = true;
+                }
+                // Reads are armed per candidate so the next round re-derives
+                // this assignment alone rather than every candidate in the
+                // file. The guard disarms on whichever path the body takes.
+                crate::db_index::read_set::arm_with_member_maps();
+                let _drain = ReadDrain {
+                    slot: &mut result.candidate_reads,
+                    key,
+                };
                 let type_owner = LuaTypeOwner::Decl(*decl_id);
                 crate::db_index::read_set::record(&type_owner);
                 let Some(expr) = root
@@ -1862,7 +1878,6 @@ fn rederive_settled_assign_reads(
                 };
                 result.settled.push((*slot, settled));
             }
-            result.reads = crate::db_index::read_set::disarm();
             result
         })
     };
@@ -1881,13 +1896,9 @@ fn rederive_settled_assign_reads(
         for (slot, value) in result.settled {
             settled[slot] = value;
         }
-        context.record_settled_pass_reads(
-            read_pass,
-            result.file_id,
-            file_candidate_counts[&result.file_id],
-            read_version,
-            result.reads,
-        );
+        for (candidate, reads) in result.candidate_reads {
+            context.record_settled_candidate_reads(read_pass, candidate, read_version, reads);
+        }
         context
             .infer_manager
             .restore_file(result.file_id, result.infer_cache);
@@ -2303,14 +2314,6 @@ impl<'a> InitializerPass<'a> {
     fn is_settled(self) -> bool {
         matches!(self, InitializerPass::Settled { .. })
     }
-
-    /// The owners the previous round moved, or `None` to re-read everything.
-    fn moved(self) -> Option<&'a HashSet<LuaTypeOwner>> {
-        match self {
-            InitializerPass::Full => None,
-            InitializerPass::Settled { moved } => moved,
-        }
-    }
 }
 
 fn refresh_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
@@ -2518,7 +2521,6 @@ fn refresh_decl_initializer_caches(
     pass: InitializerPass<'_>,
     decl_copies: &HashSet<LuaTypeOwner>,
 ) -> HashSet<LuaTypeOwner> {
-    let read_pass = SettledReadPass::Decl;
     let read_version = crate::db_index::read_set::InferenceReadVersion::capture(db);
     if context.settled_decl_initializer_candidates.is_empty() {
         return HashSet::default();
@@ -2535,33 +2537,50 @@ fn refresh_decl_initializer_caches(
         candidates.sort_by_key(|decl_id| decl_id.position);
     }
     let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
-    file_ids.retain(|file_id| {
-        // The file's own candidate count, not the workspace total: a new
-        // candidate elsewhere must not re-derive this file's recorded reads.
-        context.settled_pass_reads_stale(
-            db,
-            read_pass,
-            candidates_by_file[file_id].len(),
-            *file_id,
-            pass.moved(),
-        ) || candidates_by_file[file_id]
-            .iter()
-            .any(|decl_id| decl_copies.contains(&LuaTypeOwner::Decl(*decl_id)))
-    });
     file_ids.sort();
     if file_ids.is_empty() {
         return HashSet::default();
     }
+    // The settled tail's first round re-derives every candidate once: its
+    // Full-pass records answer a different question (the settled filters take
+    // different branches), so they cannot stand in for a settled run. A Full
+    // pass instead checks its own records every call, skipping candidates
+    // whose reads have not moved since the call that recorded them.
+    let rederive_all = matches!(pass, InitializerPass::Settled { moved: None });
+    let read_pass = if pass.is_settled() {
+        SettledReadPass::Decl
+    } else {
+        SettledReadPass::DeclFull
+    };
     let analysis_phase = context.infer_manager.current_phase();
     let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
     let call_site_params_visible = context.infer_manager.call_site_params_visible();
     let pass_is_settled = pass.is_settled();
+    let candidate_reads = &context.settled_candidate_reads;
 
     // Initializer inference reads the stabilized indexes and records candidate
     // cache writes without mutating the database. Process that read-only work
     // per file, then merge inference side effects and type writes in stable file
     // and source order on the caller thread.
     let results = parallel::map_files_collect(db, &file_ids, |db, file_id| {
+        // A candidate whose recorded reads did not move answers what it
+        // answered last round, so only candidates that have never run or whose
+        // own reads moved are re-derived. The check runs before the tree is
+        // rebuilt so an all-fresh file costs only the candidate scan.
+        let stale_decls: Vec<LuaDeclId> = candidates_by_file[&file_id]
+            .iter()
+            .copied()
+            .filter(|decl_id| {
+                rederive_all
+                    || decl_copies.contains(&LuaTypeOwner::Decl(*decl_id))
+                    || candidate_reads
+                        .get(&(read_pass, SettledCandidate::Decl(*decl_id)))
+                        .is_none_or(|(version, reads)| version.is_stale(db, reads))
+            })
+            .collect();
+        if stale_decls.is_empty() {
+            return InitializerRefreshResult::new(file_id);
+        }
         let mut infer_cache = crate::LuaInferCache::new(
             file_id,
             crate::CacheOptions {
@@ -2579,8 +2598,15 @@ fn refresh_decl_initializer_caches(
             return InitializerRefreshResult::new(file_id);
         };
         let mut result = InitializerRefreshResult::new(file_id);
-        crate::db_index::read_set::arm_with_member_maps();
-        for decl_id in &candidates_by_file[&file_id] {
+        for decl_id in &stale_decls {
+            // Reads are armed per candidate so next round can re-derive this
+            // decl alone rather than every decl in the file. The guard disarms
+            // on whichever path the body takes, including its early `continue`s.
+            crate::db_index::read_set::arm_with_member_maps();
+            let _drain = ReadDrain {
+                slot: &mut result.candidate_reads,
+                key: SettledCandidate::Decl(*decl_id),
+            };
             let type_owner = (*decl_id).into();
             let current_cache = db.get_type_index().get_type_cache(&type_owner).cloned();
             if current_cache.as_ref().is_some_and(LuaTypeCache::is_doc) {
@@ -2906,7 +2932,6 @@ fn refresh_decl_initializer_caches(
                 });
             }
         }
-        result.reads = crate::db_index::read_set::disarm();
         result.pending_type_decls = infer_cache.take_pending_str_tpl_type_decls();
         result.guard_dependencies = infer_cache.take_inferred_guard_dependencies();
         result
@@ -2914,14 +2939,9 @@ fn refresh_decl_initializer_caches(
 
     let mut updates = Vec::new();
     for result in results {
-        context.record_settled_reads(result.file_id, result.reads.clone());
-        context.record_settled_pass_reads(
-            read_pass,
-            result.file_id,
-            candidates_by_file[&result.file_id].len(),
-            read_version,
-            result.reads,
-        );
+        for (candidate, reads) in result.candidate_reads {
+            context.record_settled_candidate_reads(read_pass, candidate, read_version, reads);
+        }
         context.infer_manager.merge_inference_side_effects(
             result.file_id,
             result.pending_type_decls,
@@ -3092,7 +3112,6 @@ fn refresh_member_initializer_caches(
     pass: InitializerPass<'_>,
     decl_copies: &HashSet<LuaTypeOwner>,
 ) -> HashSet<LuaTypeOwner> {
-    let read_pass = SettledReadPass::Member;
     let read_version = crate::db_index::read_set::InferenceReadVersion::capture(db);
     // A sibling merge is only worth re-reading once the writers it merged have
     // settled, which the full pass runs ahead of.
@@ -3129,28 +3148,49 @@ fn refresh_member_initializer_caches(
         candidates.dedup();
     }
     let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
-    file_ids.retain(|file_id| {
-        // The file's own candidate count, not the workspace total: a new
-        // candidate elsewhere must not re-derive this file's recorded reads.
-        context.settled_pass_reads_stale(
-            db,
-            read_pass,
-            candidates_by_file[file_id].len(),
-            *file_id,
-            pass.moved(),
-        ) || candidates_by_file[file_id]
-            .iter()
-            .any(|member_id| decl_copies.contains(&LuaTypeOwner::Member(*member_id)))
-    });
     file_ids.sort();
     if file_ids.is_empty() {
         return HashSet::default();
     }
+    // See `refresh_decl_initializer_caches` for the pass-key split: the
+    // settled tail's first round re-derives every candidate once, while a
+    // Full pass re-derives only what its own recorded reads saw move.
+    let rederive_all = matches!(pass, InitializerPass::Settled { moved: None });
+    let read_pass = if pass.is_settled() {
+        SettledReadPass::Member
+    } else {
+        SettledReadPass::MemberFull
+    };
     let analysis_phase = context.infer_manager.current_phase();
     let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
     let call_site_params_visible = context.infer_manager.call_site_params_visible();
+    let candidate_reads = &context.settled_candidate_reads;
 
     let results = parallel::map_files_collect(db, &file_ids, |db, file_id| {
+        // A candidate whose recorded reads did not move answers what it
+        // answered last round, so only candidates that have never run or whose
+        // own reads moved are re-derived. The check runs before the tree is
+        // rebuilt so an all-fresh file costs only the candidate scan.
+        let stale_members: Vec<LuaMemberId> = candidates_by_file[&file_id]
+            .iter()
+            .copied()
+            .filter(|member_id| {
+                // Candidate-set membership is filter input, not an index read:
+                // a member that joined the guarded or sibling-merge sets since
+                // it last ran (or that copies a settled decl) takes different
+                // filter branches, so it re-derives even with fresh reads.
+                rederive_all
+                    || decl_copies.contains(&LuaTypeOwner::Member(*member_id))
+                    || guarded.contains(member_id)
+                    || sibling_merges.contains(member_id)
+                    || candidate_reads
+                        .get(&(read_pass, SettledCandidate::Member(*member_id)))
+                        .is_none_or(|(version, reads)| version.is_stale(db, reads))
+            })
+            .collect();
+        if stale_members.is_empty() {
+            return InitializerRefreshResult::new(file_id);
+        }
         let mut infer_cache = crate::LuaInferCache::new(
             file_id,
             crate::CacheOptions {
@@ -3168,8 +3208,15 @@ fn refresh_member_initializer_caches(
             return InitializerRefreshResult::new(file_id);
         };
         let mut result = InitializerRefreshResult::new(file_id);
-        crate::db_index::read_set::arm_with_member_maps();
-        for member_id in &candidates_by_file[&file_id] {
+        for member_id in &stale_members {
+            // Reads are armed per candidate so next round can re-derive this
+            // member alone rather than every member in the file. The guard
+            // disarms on whichever path the body takes, including `continue`.
+            crate::db_index::read_set::arm_with_member_maps();
+            let _drain = ReadDrain {
+                slot: &mut result.candidate_reads,
+                key: SettledCandidate::Member(*member_id),
+            };
             let type_owner = LuaTypeOwner::Member(*member_id);
             let Some(current_cache) = db.get_type_index().get_type_cache(&type_owner).cloned()
             else {
@@ -3317,7 +3364,6 @@ fn refresh_member_initializer_caches(
                 fact: LuaTypeFact::certain(inferred_type),
             });
         }
-        result.reads = crate::db_index::read_set::disarm();
         result.pending_type_decls = infer_cache.take_pending_str_tpl_type_decls();
         result.guard_dependencies = infer_cache.take_inferred_guard_dependencies();
         result
@@ -3325,14 +3371,9 @@ fn refresh_member_initializer_caches(
 
     let mut updates = Vec::new();
     for result in results {
-        context.record_settled_reads(result.file_id, result.reads.clone());
-        context.record_settled_pass_reads(
-            read_pass,
-            result.file_id,
-            candidates_by_file[&result.file_id].len(),
-            read_version,
-            result.reads,
-        );
+        for (candidate, reads) in result.candidate_reads {
+            context.record_settled_candidate_reads(read_pass, candidate, read_version, reads);
+        }
         context.infer_manager.merge_inference_side_effects(
             result.file_id,
             result.pending_type_decls,
@@ -3345,7 +3386,13 @@ fn refresh_member_initializer_caches(
 
 struct InitializerRefreshResult {
     file_id: FileId,
-    reads: crate::db_index::read_set::InferenceReadSet,
+    /// What each processed candidate actually read, in candidate order. The
+    /// merge stores one record per candidate so the next round can skip the
+    /// ones whose reads did not move instead of re-deriving the file.
+    candidate_reads: Vec<(
+        SettledCandidate,
+        crate::db_index::read_set::InferenceReadSet,
+    )>,
     pending_type_decls: Vec<crate::PendingStrTplTypeDecl>,
     guard_dependencies: HashSet<LuaInferredGuardOwner>,
     updates: Vec<InitializerCacheUpdate>,
@@ -3355,7 +3402,7 @@ impl InitializerRefreshResult {
     fn new(file_id: FileId) -> Self {
         Self {
             file_id,
-            reads: Default::default(),
+            candidate_reads: Vec::new(),
             pending_type_decls: Vec::new(),
             guard_dependencies: HashSet::default(),
             updates: Vec::new(),
@@ -3858,10 +3905,17 @@ pub struct AnalyzeContext {
     settled_owner_candidates: Option<(usize, HashMap<FileId, Vec<LuaMemberId>>)>,
     settled_return_attempts: HashSet<LuaSignatureId>,
     settled_assign_claims: HashMap<LuaDeclId, Option<rowan::TextSize>>,
-    settled_pass_reads: HashMap<
-        (SettledReadPass, FileId),
+    /// How many assignment candidates each declaration carried when the
+    /// settled pass last ran it: a candidate arriving or leaving changes the
+    /// arbitration group, so every candidate of that declaration re-derives.
+    settled_assign_candidate_counts: HashMap<LuaDeclId, usize>,
+    /// Per-candidate recorded reads for settled passes fine-grained enough to
+    /// skip one candidate without re-deriving the rest of its file. Keyed by
+    /// the pass and the candidate's own identity; a candidate absent here has
+    /// never run and always reads as stale.
+    settled_candidate_reads: HashMap<
+        (SettledReadPass, SettledCandidate),
         (
-            usize,
             crate::db_index::read_set::InferenceReadVersion,
             crate::db_index::read_set::InferenceReadSet,
         ),
@@ -3891,11 +3945,6 @@ pub struct AnalyzeContext {
     settled_guarded_bootstrap_candidates: Vec<LuaMemberId>,
     /// See [`AnalyzeContext::record_settled_iter_var_candidate`].
     settled_iter_var_candidates: Vec<UnResolveIterVar>,
-    /// Per file, the cached facts its settled re-derivations actually read.
-    /// Later rounds use the type-owner subset; incremental edits persist all
-    /// three dependency kinds.
-    /// See [`crate::db_index::read_set`].
-    settled_read_sets: HashMap<FileId, crate::db_index::read_set::InferenceReadSet>,
     /// See [`AnalyzeContext::record_settled_global_read_candidate`].
     settled_global_read_candidates: Vec<(LuaDeclId, LuaExpr)>,
     /// Decls reading through a multi-declaration global. Unlike
@@ -3935,6 +3984,86 @@ enum SettledReadPass {
     Member,
     Dynamic,
     Assign,
+    /// The non-settled initializer passes (`InitializerPass::Full`). Their
+    /// filter semantics differ from the settled rounds, so their read records
+    /// live under separate keys: a decl that ran under Full has not run under
+    /// Settled and vice versa.
+    DeclFull,
+    MemberFull,
+}
+
+/// One re-derivation candidate's identity inside a settled pass, for passes
+/// that record what each candidate — rather than each file — actually read.
+/// A candidate whose recorded reads did not move answers the same as last
+/// round, so the pass can skip it instead of re-deriving a whole file when
+/// any one of its candidates' reads moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SettledCandidate {
+    Decl(LuaDeclId),
+    Member(LuaMemberId),
+    /// One `for ... in` loop's iterator-variable candidate, keyed by its file
+    /// and first loop variable position.
+    IterVar(FileId, rowan::TextSize),
+    /// One settled assignment re-derivation, keyed by the written decl, the
+    /// value expression's site, and which return index it reads.
+    Assign(LuaDeclId, glua_parser::LuaSyntaxId, usize),
+    /// One settled global read re-derivation, keyed by the written decl and
+    /// the read expression's site.
+    Global(LuaDeclId, glua_parser::LuaSyntaxId),
+    /// One settled dynamic-field site, keyed by file and index-expression
+    /// site.
+    Dynamic(FileId, glua_parser::LuaSyntaxId),
+}
+
+impl SettledCandidate {
+    fn file_id(&self) -> FileId {
+        match *self {
+            SettledCandidate::Decl(decl_id)
+            | SettledCandidate::Assign(decl_id, ..)
+            | SettledCandidate::Global(decl_id, _) => decl_id.file_id,
+            SettledCandidate::Member(member_id) => member_id.file_id,
+            SettledCandidate::IterVar(file_id, _) | SettledCandidate::Dynamic(file_id, _) => {
+                file_id
+            }
+        }
+    }
+}
+
+/// Collects the armed read set into `slot` when the enclosing iteration
+/// scope ends, on every path including `continue`. Lets a worker arm reads
+/// per candidate without restructuring the loop body's early exits.
+struct ReadDrain<'a, K: Clone> {
+    slot: &'a mut Vec<(K, crate::db_index::read_set::InferenceReadSet)>,
+    key: K,
+}
+
+impl<K: Clone> Drop for ReadDrain<'_, K> {
+    fn drop(&mut self) {
+        self.slot
+            .push((self.key.clone(), crate::db_index::read_set::disarm()));
+    }
+}
+
+/// One file's context deltas from the parallel lua walk, as `Send`
+/// descriptors. Every field mirrors a collection the walk can write;
+/// drained on the worker by [`AnalyzeContext::take_walk_deltas`] and
+/// replayed in file order by [`AnalyzeContext::apply_walk_deltas`], so the
+/// merge reproduces the serial concatenation exactly.
+#[derive(Default)]
+pub(crate) struct WalkCtxDelta {
+    unresolves: Vec<(unresolve::spec::ItemDesc, InferFailReason)>,
+    inferred_returns: Vec<unresolve::spec::ItemDesc>,
+    assign_candidates: Vec<(LuaDeclId, LuaSyntaxId, usize)>,
+    member_attach_candidates: Vec<InFiled<LuaSyntaxId>>,
+    decl_init_candidates: Vec<LuaDeclId>,
+    member_init_candidates: Vec<LuaMemberId>,
+    guarded_member_reads: Vec<LuaMemberId>,
+    sibling_merge_reads: Vec<LuaMemberId>,
+    vgui_fallback_files: Vec<FileId>,
+    iter_var_candidates: Vec<unresolve::spec::ItemDesc>,
+    global_read_candidates: Vec<(LuaDeclId, LuaSyntaxId)>,
+    multi_decl_global_read_candidates: Vec<(LuaDeclId, LuaSyntaxId)>,
+    guarded_bootstrap_candidates: Vec<LuaMemberId>,
 }
 
 impl AnalyzeContext {
@@ -3962,8 +4091,9 @@ impl AnalyzeContext {
             settled_assign_candidate_keys: HashSet::default(),
             settled_member_key_candidates: None,
             settled_owner_candidates: None,
-            settled_pass_reads: HashMap::default(),
+            settled_candidate_reads: HashMap::default(),
             settled_assign_claims: HashMap::default(),
+            settled_assign_candidate_counts: HashMap::default(),
             settled_return_attempts: HashSet::default(),
             late_resolved_decls: HashSet::default(),
             infer_manager: InferCacheManager::new(),
@@ -3976,7 +4106,6 @@ impl AnalyzeContext {
             finalize_unresolves: true,
             settled_guarded_bootstrap_candidates: Vec::new(),
             settled_iter_var_candidates: Vec::new(),
-            settled_read_sets: HashMap::default(),
             settled_global_read_candidates: Vec::new(),
             settled_multi_decl_global_read_candidates: Vec::new(),
             settled_dynamic_field_candidates: Vec::new(),
@@ -4081,46 +4210,15 @@ impl AnalyzeContext {
             .is_some_and(|record| record.is_stale(db))
     }
 
-    /// Whether `file_id`'s settled re-derivation could answer differently now.
-    ///
-    /// `None` is the first round, where nothing has been recorded yet and every
-    /// candidate runs. Later rounds validate the pass's recorded facts and
-    /// candidate count against their versions when that file last ran.
-    fn settled_pass_reads_stale(
-        &self,
-        db: &DbIndex,
-        pass: SettledReadPass,
-        candidate_count: usize,
-        file_id: FileId,
-        moved_owners: Option<&HashSet<LuaTypeOwner>>,
-    ) -> bool {
-        moved_owners.is_none()
-            || self.settled_pass_reads.get(&(pass, file_id)).is_none_or(
-                |(count, version, reads)| *count != candidate_count || version.is_stale(db, reads),
-            )
-    }
-
-    fn record_settled_pass_reads(
+    fn record_settled_candidate_reads(
         &mut self,
         pass: SettledReadPass,
-        file_id: FileId,
-        candidate_count: usize,
+        candidate: SettledCandidate,
         version: crate::db_index::read_set::InferenceReadVersion,
         reads: crate::db_index::read_set::InferenceReadSet,
     ) {
-        self.settled_pass_reads
-            .insert((pass, file_id), (candidate_count, version, reads));
-    }
-
-    fn record_settled_reads(
-        &mut self,
-        file_id: FileId,
-        reads: crate::db_index::read_set::InferenceReadSet,
-    ) {
-        self.settled_read_sets
-            .entry(file_id)
-            .or_default()
-            .extend(reads);
+        self.settled_candidate_reads
+            .insert((pass, candidate), (version, reads));
     }
 
     pub(crate) fn analyzed_file_ids(&self) -> HashSet<FileId> {
@@ -4524,6 +4622,313 @@ impl AnalyzeContext {
     /// under a computed key. See `settled_sibling_merge_read_candidates`.
     pub fn request_sibling_merge_read_reinfer(&mut self, member_id: LuaMemberId) {
         self.settled_sibling_merge_read_candidates.insert(member_id);
+    }
+
+    /// A context for a parallel lua-walk worker: the walk reads `metas`,
+    /// `workspace_id` and `infer_manager` (shadowed) plus the delta
+    /// collections [`take_walk_deltas`](Self::take_walk_deltas) drains.
+    /// `tree_list` stays empty — red chunks cannot cross threads and the
+    /// walk never reads it.
+    pub(crate) fn worker_shadow_context(&self) -> Self {
+        let mut context = Self::new();
+        context.metas = self.metas.clone();
+        context.workspace_id = self.workspace_id;
+        context.infer_manager = self.infer_manager.worker_shadow();
+        // Read-only Arc'd precomputes the walk may consult; copying them is
+        // free and keeps a shadow from recomputing against its empty
+        // `tree_list`.
+        context.scripted_scope_files = self.scripted_scope_files.clone();
+        context.scripted_scope_infos = self.scripted_scope_infos.clone();
+        context.gmod_global_call_roles = self.gmod_global_call_roles.clone();
+        context.finalize_unresolves = self.finalize_unresolves;
+        context
+    }
+
+    /// Drains every context collection the lua walk can write, as `Send`
+    /// descriptors. Called on the worker after each file's walk; replaying
+    /// the delta on the canonical context through [`apply_walk_deltas`]
+    /// reproduces the serial accumulation in order.
+    pub(crate) fn take_walk_deltas(&mut self) -> WalkCtxDelta {
+        // Re-derived by the replays below (`add_unresolve` re-inserts decl
+        // ids, `request_settled_assign_candidate` re-keys dedup).
+        self.pending_unresolve_decl_ids.clear();
+        self.settled_assign_candidate_keys.clear();
+        WalkCtxDelta {
+            unresolves: self
+                .unresolves
+                .drain(..)
+                .map(|(item, reason)| (unresolve::spec::describe_walk(&item), reason))
+                .collect(),
+            inferred_returns: self
+                .inferred_return_candidates
+                .drain(..)
+                .map(|ret| unresolve::spec::describe_walk(&UnResolve::Return(Box::new(ret))))
+                .collect(),
+            assign_candidates: self
+                .settled_assign_candidates
+                .drain(..)
+                .map(|(decl_id, expr, ret_idx)| {
+                    (decl_id, LuaSyntaxId::from_node(expr.syntax()), ret_idx)
+                })
+                .collect(),
+            member_attach_candidates: self.settled_member_attach_candidates.drain(..).collect(),
+            decl_init_candidates: self.settled_decl_initializer_candidates.drain().collect(),
+            member_init_candidates: self.member_initializer_reinfer_candidates.drain().collect(),
+            guarded_member_reads: self.guarded_member_read_candidates.drain().collect(),
+            sibling_merge_reads: self.settled_sibling_merge_read_candidates.drain().collect(),
+            vgui_fallback_files: self.vgui_parent_fallback_files.drain().collect(),
+            iter_var_candidates: self
+                .settled_iter_var_candidates
+                .drain(..)
+                .map(|var| unresolve::spec::describe_walk(&UnResolve::IterDecl(Box::new(var))))
+                .collect(),
+            global_read_candidates: self
+                .settled_global_read_candidates
+                .drain(..)
+                .map(|(decl_id, expr)| (decl_id, LuaSyntaxId::from_node(expr.syntax())))
+                .collect(),
+            multi_decl_global_read_candidates: self
+                .settled_multi_decl_global_read_candidates
+                .drain(..)
+                .map(|(decl_id, expr)| (decl_id, LuaSyntaxId::from_node(expr.syntax())))
+                .collect(),
+            guarded_bootstrap_candidates: self
+                .settled_guarded_bootstrap_candidates
+                .drain(..)
+                .collect(),
+        }
+    }
+
+    /// Names of residual collections still holding entries after
+    /// [`take_walk_deltas`](Self::take_walk_deltas) — diagnostics for the
+    /// parallel walk's coverage audit.
+    pub(crate) fn walk_delta_residual_fields(&self) -> Vec<&'static str> {
+        let mut fields = Vec::new();
+        if !self.inferred_return_reads.is_empty() {
+            fields.push("inferred_return_reads");
+        }
+        if !self.pending_call_site_return_consumers.is_empty() {
+            fields.push("pending_call_site_return_consumers");
+        }
+        if !self.pending_call_site_definition_refreshes.is_empty() {
+            fields.push("pending_call_site_definition_refreshes");
+        }
+        if !self.call_site_return_targets.is_empty() {
+            fields.push("call_site_return_targets");
+        }
+        if !self.call_site_return_definition_refreshes.is_empty() {
+            fields.push("call_site_return_definition_refreshes");
+        }
+        if !self.pending_unresolve_decl_ids.is_empty() {
+            fields.push("pending_unresolve_decl_ids");
+        }
+        if !self.settled_assign_candidate_keys.is_empty() {
+            fields.push("settled_assign_candidate_keys");
+        }
+        if self
+            .settled_member_key_candidates
+            .as_ref()
+            .is_some_and(|(count, map)| *count != 0 || !map.is_empty())
+        {
+            fields.push("settled_member_key_candidates");
+        }
+        if self
+            .settled_owner_candidates
+            .as_ref()
+            .is_some_and(|(count, map)| *count != 0 || !map.is_empty())
+        {
+            fields.push("settled_owner_candidates");
+        }
+        if !self.settled_return_attempts.is_empty() {
+            fields.push("settled_return_attempts");
+        }
+        if !self.settled_assign_claims.is_empty() {
+            fields.push("settled_assign_claims");
+        }
+        if !self.settled_assign_candidate_counts.is_empty() {
+            fields.push("settled_assign_candidate_counts");
+        }
+        if !self.late_resolved_decls.is_empty() {
+            fields.push("late_resolved_decls");
+        }
+        if !self.inferred_guard_dependencies.is_empty() {
+            fields.push("inferred_guard_dependencies");
+        }
+        if !self.inferred_guard_candidates.is_empty() {
+            fields.push("inferred_guard_candidates");
+        }
+        if !self.early_callable_signatures.is_empty() {
+            fields.push("early_callable_signatures");
+        }
+        if !self.early_member_owner_candidates.is_empty() {
+            fields.push("early_member_owner_candidates");
+        }
+        if !self.force_finalized.is_empty() {
+            fields.push("force_finalized");
+        }
+        if !self.settled_guarded_bootstrap_candidates.is_empty() {
+            fields.push("settled_guarded_bootstrap_candidates");
+        }
+        if !self.settled_iter_var_candidates.is_empty() {
+            fields.push("settled_iter_var_candidates");
+        }
+
+        if !self.settled_global_read_candidates.is_empty() {
+            fields.push("settled_global_read_candidates");
+        }
+        if !self.settled_multi_decl_global_read_candidates.is_empty() {
+            fields.push("settled_multi_decl_global_read_candidates");
+        }
+        if !self.settled_dynamic_field_candidates.is_empty() {
+            fields.push("settled_dynamic_field_candidates");
+        }
+        if !self.deferred_vgui_parent_call_sites.is_empty() {
+            fields.push("deferred_vgui_parent_call_sites");
+        }
+        if !self.settled_parent_closure_candidates.is_empty() {
+            fields.push("settled_parent_closure_candidates");
+        }
+        if !self.settled_decl_copy_candidates.is_empty() {
+            fields.push("settled_decl_copy_candidates");
+        }
+        if self.call_site_return_invalidation_changed {
+            fields.push("call_site_return_invalidation_changed");
+        }
+        fields
+    }
+
+    /// Whether a context collection the parallel walk does not model still
+    /// holds entries after [`take_walk_deltas`](Self::take_walk_deltas).
+    /// Non-empty means the file's walk wrote context state the merge cannot
+    /// move — the file is re-run serially.
+    pub(crate) fn walk_delta_residual_nonempty(&self) -> bool {
+        !self.inferred_return_reads.is_empty()
+            || !self.pending_call_site_return_consumers.is_empty()
+            || !self.pending_call_site_definition_refreshes.is_empty()
+            || !self.call_site_return_targets.is_empty()
+            || !self.call_site_return_definition_refreshes.is_empty()
+            || !self.pending_unresolve_decl_ids.is_empty()
+            || !self.settled_assign_candidate_keys.is_empty()
+            || self
+                .settled_member_key_candidates
+                .as_ref()
+                .is_some_and(|(count, map)| *count != 0 || !map.is_empty())
+            || self
+                .settled_owner_candidates
+                .as_ref()
+                .is_some_and(|(count, map)| *count != 0 || !map.is_empty())
+            || !self.settled_return_attempts.is_empty()
+            || !self.settled_assign_claims.is_empty()
+            || !self.settled_assign_candidate_counts.is_empty()
+            || !self.late_resolved_decls.is_empty()
+            || !self.inferred_guard_dependencies.is_empty()
+            || !self.inferred_guard_candidates.is_empty()
+            || !self.early_callable_signatures.is_empty()
+            || !self.early_member_owner_candidates.is_empty()
+            || !self.force_finalized.is_empty()
+            || !self.settled_guarded_bootstrap_candidates.is_empty()
+            || !self.settled_iter_var_candidates.is_empty()
+            || !self.settled_global_read_candidates.is_empty()
+            || !self.settled_multi_decl_global_read_candidates.is_empty()
+            || !self.settled_dynamic_field_candidates.is_empty()
+            || !self.deferred_vgui_parent_call_sites.is_empty()
+            || !self.settled_parent_closure_candidates.is_empty()
+            || !self.settled_decl_copy_candidates.is_empty()
+            || self.call_site_return_invalidation_changed
+    }
+
+    /// Replays a worker's drained context deltas, in order, through the real
+    /// context methods — dedup and bookkeeping (`pending_unresolve_decl_ids`,
+    /// `settled_assign_candidate_keys`) re-derive exactly as the serial walk
+    /// produced them. `false` when a descriptor cannot hydrate against
+    /// `root`; the caller then re-runs the file serially.
+    pub(crate) fn apply_walk_deltas(&mut self, delta: WalkCtxDelta, root: &LuaSyntaxNode) -> bool {
+        // Hydrate every descriptor before applying anything: a failure must
+        // leave the context untouched so the caller's serial re-run cannot
+        // double-apply the leading entries.
+        let mut unresolves = Vec::with_capacity(delta.unresolves.len());
+        for (desc, reason) in delta.unresolves {
+            let Some(item) = desc.hydrate(root) else {
+                return false;
+            };
+            unresolves.push((item, reason));
+        }
+        let mut returns = Vec::with_capacity(delta.inferred_returns.len());
+        for desc in delta.inferred_returns {
+            let Some(UnResolve::Return(ret)) = desc.hydrate(root) else {
+                return false;
+            };
+            returns.push(*ret);
+        }
+        let mut assigns = Vec::with_capacity(delta.assign_candidates.len());
+        for (decl_id, syntax_id, ret_idx) in delta.assign_candidates {
+            let Some(expr) = syntax_id.to_node_from_root(root).and_then(LuaExpr::cast) else {
+                return false;
+            };
+            assigns.push((decl_id, expr, ret_idx));
+        }
+        let mut iter_vars = Vec::with_capacity(delta.iter_var_candidates.len());
+        for desc in delta.iter_var_candidates {
+            let Some(UnResolve::IterDecl(var)) = desc.hydrate(root) else {
+                return false;
+            };
+            iter_vars.push(*var);
+        }
+        let mut global_reads = Vec::with_capacity(delta.global_read_candidates.len());
+        for (decl_id, syntax_id) in delta.global_read_candidates {
+            let Some(expr) = syntax_id.to_node_from_root(root).and_then(LuaExpr::cast) else {
+                return false;
+            };
+            global_reads.push((decl_id, expr));
+        }
+        let mut multi_decl_global_reads =
+            Vec::with_capacity(delta.multi_decl_global_read_candidates.len());
+        for (decl_id, syntax_id) in delta.multi_decl_global_read_candidates {
+            let Some(expr) = syntax_id.to_node_from_root(root).and_then(LuaExpr::cast) else {
+                return false;
+            };
+            multi_decl_global_reads.push((decl_id, expr));
+        }
+        for (item, reason) in unresolves {
+            self.add_unresolve(item, reason);
+        }
+        for ret in returns {
+            self.add_inferred_return_candidate(ret);
+        }
+        for (decl_id, expr, ret_idx) in assigns {
+            self.request_settled_assign_candidate(decl_id, expr, ret_idx);
+        }
+        for candidate in delta.member_attach_candidates {
+            self.add_settled_member_attach_candidate(candidate);
+        }
+        for decl_id in delta.decl_init_candidates {
+            self.request_settled_decl_initializer_reinfer(decl_id);
+        }
+        for member_id in delta.member_init_candidates {
+            self.request_member_initializer_reinfer(member_id);
+        }
+        for member_id in delta.guarded_member_reads {
+            self.request_guarded_member_read_reinfer(member_id);
+        }
+        for member_id in delta.sibling_merge_reads {
+            self.request_sibling_merge_read_reinfer(member_id);
+        }
+        for file_id in delta.vgui_fallback_files {
+            self.record_vgui_parent_fallback_file(file_id);
+        }
+        for var in iter_vars {
+            self.record_settled_iter_var_candidate(var);
+        }
+        for (decl_id, expr) in global_reads {
+            self.record_settled_global_read_candidate(decl_id, expr);
+        }
+        for (decl_id, expr) in multi_decl_global_reads {
+            self.record_settled_multi_decl_global_read_candidate(decl_id, expr);
+        }
+        for member_id in delta.guarded_bootstrap_candidates {
+            self.record_settled_guarded_bootstrap_candidate(member_id);
+        }
+        true
     }
 
     fn add_inferred_guard_dependencies(

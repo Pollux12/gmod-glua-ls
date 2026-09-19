@@ -3,7 +3,7 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::db_index::LuaDeclId;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileReference {
     decl_references: HashMap<LuaDeclId, DeclReference>,
     references_to_decl: HashMap<TextRange, LuaDeclId>,

@@ -1998,11 +1998,15 @@ fn collect_string_const_names(typ: &LuaType, names: &mut Vec<SmolStr>) {
 }
 
 struct DynamicFieldRefreshResult {
-    file_id: crate::FileId,
     collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
     collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
     attributed_unattributed: Vec<(SmolStr, crate::FileId)>,
-    reads: Option<crate::db_index::read_set::InferenceReadSet>,
+    /// Each re-derived site's recorded reads, saved so the next round can skip
+    /// candidates whose own reads did not move.
+    candidate_reads: Vec<(
+        super::SettledCandidate,
+        crate::db_index::read_set::InferenceReadSet,
+    )>,
 }
 
 /// Propagates collected dynamic fields to the super types of their owners so
@@ -2076,32 +2080,14 @@ pub(crate) fn rederive_settled_dynamic_fields(
     moved_owners: Option<&FxHashSet<LuaTypeOwner>>,
 ) -> bool {
     let read_pass = super::SettledReadPass::Dynamic;
-    // Per-file candidate counts: a new candidate arriving for one file must
-    // not re-derive every other file's recorded reads.
-    let mut file_candidate_counts = FxHashMap::<crate::FileId, usize>::default();
-    for (file_id, _) in &context.settled_dynamic_field_candidates {
-        *file_candidate_counts.entry(*file_id).or_default() += 1;
-    }
     let read_version = crate::db_index::read_set::InferenceReadVersion::capture(db);
     // Kept, not taken: the settled tail runs to a fixpoint and each round
     // re-derives the same candidates against what the previous one landed.
-    let mut stale_files = FxHashMap::<crate::FileId, bool>::default();
-    let mut candidates = context
-        .settled_dynamic_field_candidates
-        .iter()
-        .filter(|(file_id, _)| {
-            *stale_files.entry(*file_id).or_insert_with(|| {
-                context.settled_pass_reads_stale(
-                    db,
-                    read_pass,
-                    file_candidate_counts[file_id],
-                    *file_id,
-                    moved_owners,
-                )
-            })
-        })
-        .copied()
-        .collect::<Vec<_>>();
+    // The first round has no records yet, so every candidate runs; later
+    // rounds re-derive only the candidates whose own recorded reads moved.
+    let rederive_all = moved_owners.is_none();
+    let candidate_reads = &context.settled_candidate_reads;
+    let mut candidates = context.settled_dynamic_field_candidates.clone();
     if candidates.is_empty() {
         return false;
     }
@@ -2120,11 +2106,10 @@ pub(crate) fn rederive_settled_dynamic_fields(
     file_ids.sort_unstable();
     let results = super::parallel::map_files_collect(db, &file_ids, |db, file_id| {
         let mut result = DynamicFieldRefreshResult {
-            file_id,
             collected: Vec::new(),
             collected_wildcards: Vec::new(),
             attributed_unattributed: Vec::new(),
-            reads: None,
+            candidate_reads: Vec::new(),
         };
         let Some(root) = db
             .get_vfs()
@@ -2144,6 +2129,25 @@ pub(crate) fn rederive_settled_dynamic_fields(
         );
         let mut local_reassignment_positions = None;
         for syntax_id in &candidates_by_file[&file_id] {
+            let key = super::SettledCandidate::Dynamic(file_id, *syntax_id);
+            // A site whose recorded reads did not move answers the same as
+            // last round; one with no record has never run.
+            let stale = rederive_all
+                || candidate_reads
+                    .get(&(read_pass, key))
+                    .is_none_or(|(version, reads)| version.is_stale(db, reads));
+            if !stale {
+                continue;
+            }
+            // Reads are armed per site so the next round re-derives this site
+            // alone rather than every candidate in the file; sites that fail
+            // the AST lookups record an empty set and stop retrying. The
+            // guard disarms on whichever path the body takes.
+            crate::db_index::read_set::arm_with_member_maps();
+            let _drain = super::ReadDrain {
+                slot: &mut result.candidate_reads,
+                key,
+            };
             let Some(index_expr) = syntax_id
                 .to_node_from_root(root.syntax())
                 .and_then(glua_parser::LuaIndexExpr::cast)
@@ -2157,10 +2161,7 @@ pub(crate) fn rederive_settled_dynamic_fields(
             else {
                 continue;
             };
-            crate::db_index::read_set::arm_with_member_maps();
             let Ok(prefix_type) = infer_expr(db, &mut cache, prefix_expr.clone()) else {
-                let reads = crate::db_index::read_set::disarm();
-                result.reads.get_or_insert_default().extend(reads);
                 continue;
             };
             let effective_type = infer_setmetatable_target_type(
@@ -2178,8 +2179,6 @@ pub(crate) fn rederive_settled_dynamic_fields(
                 &mut local_reassignment_positions,
                 &index_expr,
             );
-            let reads = crate::db_index::read_set::disarm();
-            result.reads.get_or_insert_default().extend(reads);
             if is_dynamic_index_key(&index_expr) && field_names.may_have_other_string_names {
                 collect_wildcard_for_type(
                     &effective_type,
@@ -2209,14 +2208,8 @@ pub(crate) fn rederive_settled_dynamic_fields(
     let mut collected_wildcards = Vec::new();
     let mut attributed_unattributed = Vec::new();
     for result in results {
-        if let Some(reads) = result.reads {
-            context.record_settled_pass_reads(
-                read_pass,
-                result.file_id,
-                file_candidate_counts[&result.file_id],
-                read_version,
-                reads,
-            );
+        for (candidate, reads) in result.candidate_reads {
+            context.record_settled_candidate_reads(read_pass, candidate, read_version, reads);
         }
         collected.extend(result.collected);
         collected_wildcards.extend(result.collected_wildcards);

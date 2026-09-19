@@ -7,7 +7,7 @@ use url::Url;
 use crate::{FileId, LuaIndex};
 pub use schema_file::*;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct JsonSchemaIndex {
     schema_files: FxHashMap<Url, JsonSchemaFile>,
 }

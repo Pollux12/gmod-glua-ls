@@ -18,7 +18,7 @@ pub const CALL_ARG_FIELD_ATTRIBUTE: &str = "call_arg_field";
 pub const OVERLOAD_CALL_ARG_ATTRIBUTE: &str = "overload_call_arg";
 pub const OVERLOAD_CALL_ARG_FIELD_ATTRIBUTE: &str = "overload_call_arg_field";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LuaSignature {
     pub generic_params: Vec<Arc<LuaGenericParamInfo>>,
     pub overloads: Vec<Arc<LuaFunctionType>>,

@@ -23,8 +23,8 @@
 //! records is exactly the one the live attempt would have produced.
 
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaBlock, LuaCallExpr, LuaExpr, LuaFuncStat, LuaSyntaxId,
-    LuaTableField,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaExpr, LuaFuncStat,
+    LuaSyntaxId, LuaTableField,
 };
 use rayon::prelude::*;
 use rowan::TextSize;
@@ -42,8 +42,10 @@ use crate::{
 };
 
 use super::{
-    ResolveResult, UnResolve, UnResolveCallClosureParams, UnResolveClosureReturn, UnResolveDecl,
-    UnResolveMember, UnResolveParentAst, UnResolveParentClosureParams, UnResolveReturn,
+    CallSiteContributionKind, ResolveResult, UnResolve, UnResolveCallClosureParams,
+    UnResolveCallSiteContribution, UnResolveClosureReturn, UnResolveDecl, UnResolveIterVar,
+    UnResolveMember, UnResolveModule, UnResolveParentAst, UnResolveParentClosureParams,
+    UnResolveReturn, UnResolveSpecialCall, UnResolveTableField,
     resolve::{
         try_resolve_decl, try_resolve_iter_var_updates, try_resolve_member,
         try_resolve_return_point,
@@ -58,7 +60,8 @@ use super::{
 /// A `Send` description of one speculatable `UnResolve` item. The item
 /// itself holds red syntax nodes and cannot cross a thread boundary, so the
 /// worker rebuilds it against the file's own red root.
-enum ItemDesc {
+#[derive(Clone)]
+pub(crate) enum ItemDesc {
     Decl {
         file_id: FileId,
         decl_id: LuaDeclId,
@@ -101,11 +104,40 @@ enum ItemDesc {
         file_id: FileId,
         signature_id: LuaSignatureId,
         parent_ast: ParentAstDesc,
+        /// Carried for the parallel walk's delta move: a queued retry keeps
+        /// the flags it was queued with. The wave's own speculative items
+        /// always rebuild these as `false`/`None`.
+        needs_settled_retry: bool,
+        source_signature_id: Option<LuaSignatureId>,
+        last_source_return: Option<crate::LuaType>,
+    },
+    Module {
+        file_id: FileId,
+        expr: LuaSyntaxId,
+    },
+    TableField {
+        file_id: FileId,
+        table_expr: LuaSyntaxId,
+        field: LuaSyntaxId,
+        decl_feature: crate::LuaMemberFeature,
+    },
+    SpecialCall {
+        file_id: FileId,
+        call_expr: LuaSyntaxId,
+    },
+    CallSiteContribution {
+        file_id: FileId,
+        expr_file_id: FileId,
+        expr_syntax_id: LuaSyntaxId,
+        signature_id: LuaSignatureId,
+        param_idx: usize,
+        kind: CallSiteContributionKind,
     },
 }
 
 /// `LuaReturnPoint` minus its red nodes.
-enum ReturnPointDesc {
+#[derive(Clone)]
+pub(crate) enum ReturnPointDesc {
     Expr(LuaSyntaxId),
     MuliExpr(Vec<LuaSyntaxId>),
     Nil,
@@ -113,7 +145,8 @@ enum ReturnPointDesc {
 }
 
 /// `UnResolveParentAst` minus its red nodes.
-enum ParentAstDesc {
+#[derive(Clone)]
+pub(crate) enum ParentAstDesc {
     FuncStat(LuaSyntaxId),
     TableField(LuaSyntaxId),
     AssignStat(LuaSyntaxId),
@@ -188,7 +221,7 @@ pub(super) fn speculate(
 }
 
 impl ItemDesc {
-    fn file_id(&self) -> FileId {
+    pub(crate) fn file_id(&self) -> FileId {
         match self {
             ItemDesc::Decl { file_id, .. }
             | ItemDesc::Member { file_id, .. }
@@ -196,7 +229,11 @@ impl ItemDesc {
             | ItemDesc::Return { file_id, .. }
             | ItemDesc::ClosureParams { file_id, .. }
             | ItemDesc::ClosureReturn { file_id, .. }
-            | ItemDesc::ClosureParentParams { file_id, .. } => *file_id,
+            | ItemDesc::ClosureParentParams { file_id, .. }
+            | ItemDesc::Module { file_id, .. }
+            | ItemDesc::TableField { file_id, .. }
+            | ItemDesc::SpecialCall { file_id, .. }
+            | ItemDesc::CallSiteContribution { file_id, .. } => *file_id,
         }
     }
 }
@@ -258,18 +295,21 @@ fn describe(item: &UnResolve) -> Option<ItemDesc> {
         UnResolve::ClosureParentParams(params) => ItemDesc::ClosureParentParams {
             file_id: params.file_id,
             signature_id: params.signature_id,
-            parent_ast: match &params.parent_ast {
-                UnResolveParentAst::LuaFuncStat(stat) => ParentAstDesc::FuncStat(syntax_id(stat)),
-                UnResolveParentAst::LuaTableField(field) => {
-                    ParentAstDesc::TableField(syntax_id(field))
-                }
-                UnResolveParentAst::LuaAssignStat(assign) => {
-                    ParentAstDesc::AssignStat(syntax_id(assign))
-                }
-            },
+            parent_ast: parent_ast_desc(&params.parent_ast),
+            needs_settled_retry: false,
+            source_signature_id: None,
+            last_source_return: None,
         },
         _ => return None,
     })
+}
+
+fn parent_ast_desc(parent_ast: &UnResolveParentAst) -> ParentAstDesc {
+    match parent_ast {
+        UnResolveParentAst::LuaFuncStat(stat) => ParentAstDesc::FuncStat(syntax_id(stat)),
+        UnResolveParentAst::LuaTableField(field) => ParentAstDesc::TableField(syntax_id(field)),
+        UnResolveParentAst::LuaAssignStat(assign) => ParentAstDesc::AssignStat(syntax_id(assign)),
+    }
 }
 
 /// Runs one file's speculative items against a worker-local infer cache.
@@ -487,6 +527,13 @@ fn compute_item(
             }) as Box<dyn FnOnce(&mut UnResolve) + Send>;
             (result, Some(post_item))
         }
+        // The walk's delta move carries every variant, but the wave only
+        // speculates the kinds `describe` produces — these stay on the live
+        // drain.
+        ItemDesc::Module { .. }
+        | ItemDesc::TableField { .. }
+        | ItemDesc::SpecialCall { .. }
+        | ItemDesc::CallSiteContribution { .. } => return None,
     };
     Some(outcome)
 }
@@ -529,4 +576,209 @@ fn hydrate_return_points(
             })
         })
         .collect()
+}
+
+/// Like [`describe`] but covering every `UnResolve` variant: the parallel
+/// file walk moves its produced unresolves across threads as descriptors,
+/// and an undescribable variant would force the file's serial re-run.
+pub(crate) fn describe_walk(item: &UnResolve) -> ItemDesc {
+    match item {
+        UnResolve::Module(module) => ItemDesc::Module {
+            file_id: module.file_id,
+            expr: syntax_id(&module.expr),
+        },
+        UnResolve::TableField(field) => ItemDesc::TableField {
+            file_id: field.file_id,
+            table_expr: syntax_id(&field.table_expr),
+            field: syntax_id(&field.field),
+            decl_feature: field.decl_feature,
+        },
+        UnResolve::SpecialCall(call) => ItemDesc::SpecialCall {
+            file_id: call.file_id,
+            call_expr: syntax_id(&call.call_expr),
+        },
+        UnResolve::CallSiteContribution(contribution) => ItemDesc::CallSiteContribution {
+            file_id: contribution.file_id,
+            expr_file_id: contribution.expr_file_id,
+            expr_syntax_id: contribution.expr_syntax_id,
+            signature_id: contribution.signature_id,
+            param_idx: contribution.param_idx,
+            kind: contribution.kind,
+        },
+        UnResolve::ClosureParentParams(params) => ItemDesc::ClosureParentParams {
+            file_id: params.file_id,
+            signature_id: params.signature_id,
+            parent_ast: parent_ast_desc(&params.parent_ast),
+            needs_settled_retry: params.needs_settled_retry,
+            source_signature_id: params.source_signature_id,
+            last_source_return: params.last_source_return.clone(),
+        },
+        _ => describe(item).expect("describe covers the variants describe_walk delegates"),
+    }
+}
+
+impl ItemDesc {
+    /// Rebuilds the `UnResolve` this descriptor names against `root`.
+    /// `None` only when a syntax id cannot be rebuilt — impossible for a
+    /// descriptor produced against the same tree, so the caller treats it
+    /// as a bug guard rather than a fallback.
+    pub(crate) fn hydrate(&self, root: &glua_parser::LuaSyntaxNode) -> Option<UnResolve> {
+        let item = match self {
+            ItemDesc::Decl {
+                file_id,
+                decl_id,
+                expr,
+                ret_idx,
+            } => UnResolve::Decl(Box::new(UnResolveDecl {
+                file_id: *file_id,
+                decl_id: *decl_id,
+                expr: expr.to_node_from_root(root).and_then(LuaExpr::cast)?,
+                ret_idx: *ret_idx,
+            })),
+            ItemDesc::Member {
+                file_id,
+                member_id,
+                expr,
+                prefix,
+                ret_idx,
+            } => UnResolve::Member(Box::new(UnResolveMember {
+                file_id: *file_id,
+                member_id: *member_id,
+                expr: hydrate_opt(root, *expr)?,
+                prefix: hydrate_opt(root, *prefix)?,
+                ret_idx: *ret_idx,
+            })),
+            ItemDesc::IterDecl {
+                file_id,
+                iter_exprs,
+                var_positions,
+            } => UnResolve::IterDecl(Box::new(UnResolveIterVar {
+                file_id: *file_id,
+                iter_exprs: iter_exprs
+                    .iter()
+                    .map(|id| id.to_node_from_root(root).and_then(LuaExpr::cast))
+                    .collect::<Option<Vec<_>>>()?,
+                iter_vars: var_positions
+                    .iter()
+                    .map(|position| {
+                        let token = match root.token_at_offset(*position) {
+                            rowan::TokenAtOffset::Single(token) => token,
+                            rowan::TokenAtOffset::Between(_, right) => right,
+                            rowan::TokenAtOffset::None => return None,
+                        };
+                        glua_parser::LuaNameToken::cast(token)
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            })),
+            ItemDesc::Return {
+                file_id,
+                signature_id,
+                body,
+                return_points,
+            } => UnResolve::Return(Box::new(UnResolveReturn {
+                file_id: *file_id,
+                signature_id: *signature_id,
+                body: hydrate_block(root, *body)?,
+                return_points: hydrate_return_points(root, return_points.clone())?,
+            })),
+            ItemDesc::ClosureParams {
+                file_id,
+                signature_id,
+                call_expr,
+                param_idx,
+            } => UnResolve::ClosureParams(Box::new(UnResolveCallClosureParams {
+                file_id: *file_id,
+                signature_id: *signature_id,
+                call_expr: call_expr
+                    .to_node_from_root(root)
+                    .and_then(LuaCallExpr::cast)?,
+                param_idx: *param_idx,
+            })),
+            ItemDesc::ClosureReturn {
+                file_id,
+                signature_id,
+                call_expr,
+                param_idx,
+                body,
+                return_points,
+            } => UnResolve::ClosureReturn(Box::new(UnResolveClosureReturn {
+                file_id: *file_id,
+                signature_id: *signature_id,
+                call_expr: call_expr
+                    .to_node_from_root(root)
+                    .and_then(LuaCallExpr::cast)?,
+                param_idx: *param_idx,
+                body: hydrate_block(root, *body)?,
+                return_points: hydrate_return_points(root, return_points.clone())?,
+            })),
+            ItemDesc::ClosureParentParams {
+                file_id,
+                signature_id,
+                parent_ast,
+                needs_settled_retry,
+                source_signature_id,
+                last_source_return,
+            } => UnResolve::ClosureParentParams(Box::new(UnResolveParentClosureParams {
+                file_id: *file_id,
+                signature_id: *signature_id,
+                parent_ast: match parent_ast {
+                    ParentAstDesc::FuncStat(id) => UnResolveParentAst::LuaFuncStat(
+                        id.to_node_from_root(root).and_then(LuaFuncStat::cast)?,
+                    ),
+                    ParentAstDesc::TableField(id) => UnResolveParentAst::LuaTableField(
+                        id.to_node_from_root(root).and_then(LuaTableField::cast)?,
+                    ),
+                    ParentAstDesc::AssignStat(id) => UnResolveParentAst::LuaAssignStat(
+                        id.to_node_from_root(root).and_then(LuaAssignStat::cast)?,
+                    ),
+                },
+                needs_settled_retry: *needs_settled_retry,
+                source_signature_id: *source_signature_id,
+                last_source_return: last_source_return.clone(),
+            })),
+            ItemDesc::Module { file_id, expr } => UnResolve::Module(Box::new(UnResolveModule {
+                file_id: *file_id,
+                expr: expr.to_node_from_root(root).and_then(LuaExpr::cast)?,
+            })),
+            ItemDesc::TableField {
+                file_id,
+                table_expr,
+                field,
+                decl_feature,
+            } => UnResolve::TableField(Box::new(UnResolveTableField {
+                file_id: *file_id,
+                table_expr: table_expr
+                    .to_node_from_root(root)
+                    .and_then(glua_parser::LuaTableExpr::cast)?,
+                field: field
+                    .to_node_from_root(root)
+                    .and_then(LuaTableField::cast)?,
+                decl_feature: *decl_feature,
+            })),
+            ItemDesc::SpecialCall { file_id, call_expr } => {
+                UnResolve::SpecialCall(Box::new(UnResolveSpecialCall {
+                    file_id: *file_id,
+                    call_expr: call_expr
+                        .to_node_from_root(root)
+                        .and_then(LuaCallExpr::cast)?,
+                }))
+            }
+            ItemDesc::CallSiteContribution {
+                file_id,
+                expr_file_id,
+                expr_syntax_id,
+                signature_id,
+                param_idx,
+                kind,
+            } => UnResolve::CallSiteContribution(Box::new(UnResolveCallSiteContribution {
+                file_id: *file_id,
+                expr_file_id: *expr_file_id,
+                expr_syntax_id: *expr_syntax_id,
+                signature_id: *signature_id,
+                param_idx: *param_idx,
+                kind: *kind,
+            })),
+        };
+        Some(item)
+    }
 }

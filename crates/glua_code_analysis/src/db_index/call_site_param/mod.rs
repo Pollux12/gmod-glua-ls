@@ -107,7 +107,7 @@ fn sorted_file_ids<V>(map: &HashMap<FileId, V>) -> Vec<FileId> {
     file_ids
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct CallSiteParamIndex {
     /// file → source function access paths and their mutated parameter indexes declared by that file.
     file_source_signatures: HashMap<FileId, Vec<(String, LuaSignatureId, Vec<usize>)>>,

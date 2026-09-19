@@ -11,7 +11,7 @@ use crate::{DiagnosticCode, FileId};
 
 use super::traits::LuaIndex;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DiagnosticIndex {
     diagnostic_actions: HashMap<FileId, Vec<DiagnosticAction>>,
     diagnostics: HashMap<FileId, Vec<AnalyzeError>>,

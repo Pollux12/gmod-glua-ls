@@ -28,8 +28,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::{Cell, RefCell};
 
 use super::type_owner::LuaTypeOwner;
-use crate::{DynamicFieldOwner, FileId, LuaMemberKey, LuaMemberOwner, LuaSignatureId};
-use rowan::TextSize;
+use crate::{
+    DynamicFieldOwner, FileId, GlobalId, InFiled, LuaDeclId, LuaDefinitionId, LuaMemberId,
+    LuaMemberKey, LuaMemberOwner, LuaOperatorOwner, LuaSignatureId, LuaTypeDeclId,
+};
+use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 
 /// The slot one index mutation lands in, keyed the same way the read
@@ -48,6 +51,43 @@ pub enum WriteKey {
     SpecialCall(FileId, TextSize),
     Contrib(LuaSignatureId, usize),
     DynamicField(DynamicFieldOwner, Option<SmolStr>),
+    /// A `---` type declaration object (`---@class`/`---@alias` and its
+    /// supertypes/generic params), keyed by its decl id.
+    TypeDecl(LuaTypeDeclId),
+    /// A decl-anchored side entry: feature caches, decl write claims.
+    DeclMisc(LuaDeclId),
+    /// A definition-anchored inferred fact (see `bind_definition_fact`).
+    DefinitionFact(LuaDefinitionId),
+    /// A global-path member-metadata slot (definition sites, path provenance,
+    /// class-candidate flags).
+    GlobalPath(GlobalId),
+    /// The operator table for one operand owner (`a + b`/`t.x` metamethods).
+    OperatorOwner(LuaOperatorOwner),
+    /// One setmetatable binding slot, keyed by the table's own site.
+    Metatable(InFiled<TextRange>),
+    /// A name-keyed gmod metadata entry (vgui panels, derma skins, net/system
+    /// registrations).
+    GmodMeta(SmolStr),
+    /// A member object slot (`get_member`/`get_member_mut`), keyed by member
+    /// id — covers rekeys, re-homes, and direct object pokes alike.
+    MemberId(LuaMemberId),
+    /// A whole-map scan of the `---` type declarations (`find_type_decls`)
+    /// — stales on *any* `TypeDecl` write, which the merge checks by tag.
+    TypeDeclScan,
+    /// A table-literal → owning-path slot in `definition_site_owner`, keyed
+    /// by the literal's own range.
+    DefinitionSite(InFiled<TextRange>),
+    /// An unattributed dynamic field slot, keyed by field name — these have
+    /// no owner until a settled retry attributes them.
+    UnattributedField(SmolStr),
+    /// A slot inside a map keyed by `FileId` — inherently file-scoped, so it
+    /// can never collide with another file's write; the key only feeds the
+    /// boundary coverage report.
+    FileScoped(FileId),
+    /// One file's helper-scan cache slot on `DbIndex` (gmod net helpers).
+    HelperCache(FileId),
+    /// The workspace-wide gmod net-helper registry slot on `DbIndex`.
+    HelperRegistry,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -79,6 +119,36 @@ pub(crate) struct InferenceReadSet {
     /// the settled pass reproduces, so it must not report stale every round —
     /// only the slot changing what it holds re-derives the read.
     pub missing_member_slots: FxHashMap<(LuaMemberOwner, LuaMemberKey), (usize, usize)>,
+    /// Member objects read by id (`get_member`), for the parallel walk's
+    /// key-intersection staleness — a member mutated by an earlier chunk's
+    /// file must re-run the reader. Not consulted by fixpoint `is_stale`.
+    pub member_ids: FxHashSet<LuaMemberId>,
+    /// `---` type declarations consulted (`find_type_decl`, super-type and
+    /// generic-param lookups), keyed by decl id.
+    pub type_decls: FxHashSet<LuaTypeDeclId>,
+    /// Decl-anchored side entries consulted (feature caches, write claims).
+    pub decl_miscs: FxHashSet<LuaDeclId>,
+    /// Definition-anchored inferred facts consulted.
+    pub definition_facts: FxHashSet<LuaDefinitionId>,
+    /// Global-path member metadata consulted (definition sites, provenance).
+    pub global_paths: FxHashSet<GlobalId>,
+    /// Operator tables consulted, keyed by operand owner.
+    pub operator_owners: FxHashSet<LuaOperatorOwner>,
+    /// Setmetatable binding slots consulted, keyed by the table's own site.
+    pub metatable_sites: FxHashSet<InFiled<TextRange>>,
+    /// Table-literal → owning-path slots consulted, keyed by the literal's
+    /// own range (`definition_site_owner` / `canonical` lookups).
+    pub definition_sites: FxHashSet<InFiled<TextRange>>,
+    /// Name-keyed gmod metadata consulted (vgui panels, derma skins,
+    /// net/system registrations).
+    pub gmod_metas: FxHashSet<SmolStr>,
+    /// Reads of `FileId`-keyed side maps (namespaces, per-file member lists,
+    /// accessor calls). A same-file key can only have been written by that
+    /// file itself, so recording it can never produce a false stale.
+    pub file_scopeds: FxHashSet<FileId>,
+    /// The file enumerated the whole type-declaration map
+    /// (`find_type_decls`), so any `TypeDecl` write stales it.
+    pub type_decl_scan: bool,
     /// The sequence number of the most recent read of each slot, keyed the
     /// same way the wave's deferred writes key theirs. A slot read *after*
     /// its own write was queued saw pre-write state where the serial drain
@@ -104,6 +174,17 @@ impl InferenceReadSet {
         self.contribs.extend(other.contribs);
         self.dynamic_fields.extend(other.dynamic_fields);
         self.missing_member_slots.extend(other.missing_member_slots);
+        self.member_ids.extend(other.member_ids);
+        self.type_decls.extend(other.type_decls);
+        self.decl_miscs.extend(other.decl_miscs);
+        self.definition_facts.extend(other.definition_facts);
+        self.global_paths.extend(other.global_paths);
+        self.operator_owners.extend(other.operator_owners);
+        self.metatable_sites.extend(other.metatable_sites);
+        self.definition_sites.extend(other.definition_sites);
+        self.gmod_metas.extend(other.gmod_metas);
+        self.file_scopeds.extend(other.file_scopeds);
+        self.type_decl_scan |= other.type_decl_scan;
         for (key, seq) in other.read_seqs {
             let entry = self.read_seqs.entry(key).or_insert(seq);
             *entry = (*entry).max(seq);
@@ -138,6 +219,20 @@ thread_local! {
     static CONTRIBS: RefCell<FxHashSet<(LuaSignatureId, usize)>> = RefCell::new(FxHashSet::default());
     static DYNAMIC_FIELDS: RefCell<FxHashSet<(DynamicFieldOwner, Option<SmolStr>)>> = RefCell::new(FxHashSet::default());
     static MISSING_MEMBER_SLOTS: RefCell<FxHashMap<(LuaMemberOwner, LuaMemberKey), (usize, usize)>> = RefCell::new(FxHashMap::default());
+    static MEMBER_IDS: RefCell<FxHashSet<LuaMemberId>> = RefCell::new(FxHashSet::default());
+    static TYPE_DECLS: RefCell<FxHashSet<LuaTypeDeclId>> = RefCell::new(FxHashSet::default());
+    static DECL_MISCS: RefCell<FxHashSet<LuaDeclId>> = RefCell::new(FxHashSet::default());
+    static DEFINITION_FACTS: RefCell<FxHashSet<LuaDefinitionId>> = RefCell::new(FxHashSet::default());
+    static GLOBAL_PATHS: RefCell<FxHashSet<GlobalId>> = RefCell::new(FxHashSet::default());
+    static OPERATOR_OWNERS: RefCell<FxHashSet<LuaOperatorOwner>> =
+        RefCell::new(FxHashSet::default());
+    static METATABLE_SITES: RefCell<FxHashSet<InFiled<TextRange>>> =
+        RefCell::new(FxHashSet::default());
+    static DEFINITION_SITES: RefCell<FxHashSet<InFiled<TextRange>>> =
+        RefCell::new(FxHashSet::default());
+    static GMOD_METAS: RefCell<FxHashSet<SmolStr>> = RefCell::new(FxHashSet::default());
+    static FILE_SCOPEDS: RefCell<FxHashSet<FileId>> = RefCell::new(FxHashSet::default());
+    static TYPE_DECL_SCAN: Cell<bool> = const { Cell::new(false) };
     /// A monotonic event ordinal shared by read recording and the wave's
     /// deferred-write pushes. Stamping both on one clock lets the drain tell
     /// whether a slot read happened *after* the attempt queued its own write
@@ -162,6 +257,17 @@ pub(crate) fn arm() {
         CONTRIBS.with(|slots| slots.borrow_mut().clear());
         DYNAMIC_FIELDS.with(|fields| fields.borrow_mut().clear());
         MISSING_MEMBER_SLOTS.with(|slots| slots.borrow_mut().clear());
+        MEMBER_IDS.with(|ids| ids.borrow_mut().clear());
+        TYPE_DECLS.with(|decls| decls.borrow_mut().clear());
+        DECL_MISCS.with(|decls| decls.borrow_mut().clear());
+        DEFINITION_FACTS.with(|facts| facts.borrow_mut().clear());
+        GLOBAL_PATHS.with(|paths| paths.borrow_mut().clear());
+        OPERATOR_OWNERS.with(|owners| owners.borrow_mut().clear());
+        METATABLE_SITES.with(|sites| sites.borrow_mut().clear());
+        DEFINITION_SITES.with(|sites| sites.borrow_mut().clear());
+        GMOD_METAS.with(|metas| metas.borrow_mut().clear());
+        FILE_SCOPEDS.with(|files| files.borrow_mut().clear());
+        TYPE_DECL_SCAN.with(|scan| scan.set(false));
         READ_SEQS.with(|seqs| seqs.borrow_mut().clear());
     }
     DEPTH.with(|depth| depth.set(depth.get() + 1));
@@ -194,6 +300,17 @@ pub(crate) fn disarm() -> InferenceReadSet {
             contribs: CONTRIBS.with(|slots| slots.borrow().clone()),
             dynamic_fields: DYNAMIC_FIELDS.with(|fields| fields.borrow().clone()),
             missing_member_slots: MISSING_MEMBER_SLOTS.with(|slots| slots.borrow().clone()),
+            member_ids: MEMBER_IDS.with(|ids| ids.borrow().clone()),
+            type_decls: TYPE_DECLS.with(|decls| decls.borrow().clone()),
+            decl_miscs: DECL_MISCS.with(|decls| decls.borrow().clone()),
+            definition_facts: DEFINITION_FACTS.with(|facts| facts.borrow().clone()),
+            global_paths: GLOBAL_PATHS.with(|paths| paths.borrow().clone()),
+            operator_owners: OPERATOR_OWNERS.with(|owners| owners.borrow().clone()),
+            metatable_sites: METATABLE_SITES.with(|sites| sites.borrow().clone()),
+            definition_sites: DEFINITION_SITES.with(|sites| sites.borrow().clone()),
+            gmod_metas: GMOD_METAS.with(|metas| metas.borrow().clone()),
+            file_scopeds: FILE_SCOPEDS.with(|files| files.borrow().clone()),
+            type_decl_scan: TYPE_DECL_SCAN.with(Cell::get),
             read_seqs: READ_SEQS.with(|seqs| seqs.borrow().clone()),
         }
     } else {
@@ -209,6 +326,20 @@ pub(crate) fn disarm() -> InferenceReadSet {
             dynamic_fields: DYNAMIC_FIELDS.with(|fields| std::mem::take(&mut *fields.borrow_mut())),
             missing_member_slots: MISSING_MEMBER_SLOTS
                 .with(|slots| std::mem::take(&mut *slots.borrow_mut())),
+            member_ids: MEMBER_IDS.with(|ids| std::mem::take(&mut *ids.borrow_mut())),
+            type_decls: TYPE_DECLS.with(|decls| std::mem::take(&mut *decls.borrow_mut())),
+            decl_miscs: DECL_MISCS.with(|decls| std::mem::take(&mut *decls.borrow_mut())),
+            definition_facts: DEFINITION_FACTS
+                .with(|facts| std::mem::take(&mut *facts.borrow_mut())),
+            global_paths: GLOBAL_PATHS.with(|paths| std::mem::take(&mut *paths.borrow_mut())),
+            operator_owners: OPERATOR_OWNERS
+                .with(|owners| std::mem::take(&mut *owners.borrow_mut())),
+            metatable_sites: METATABLE_SITES.with(|sites| std::mem::take(&mut *sites.borrow_mut())),
+            definition_sites: DEFINITION_SITES
+                .with(|sites| std::mem::take(&mut *sites.borrow_mut())),
+            gmod_metas: GMOD_METAS.with(|metas| std::mem::take(&mut *metas.borrow_mut())),
+            file_scopeds: FILE_SCOPEDS.with(|files| std::mem::take(&mut *files.borrow_mut())),
+            type_decl_scan: TYPE_DECL_SCAN.with(|scan| scan.replace(false)),
             read_seqs: READ_SEQS.with(|seqs| std::mem::take(&mut *seqs.borrow_mut())),
         }
     }
@@ -375,7 +506,132 @@ pub(crate) fn record_member_key_read(index: &crate::LuaMemberIndex, key: &LuaMem
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Records a member-object read by id (`get_member`), for the parallel
+/// walk's staleness keys.
+#[inline]
+pub(crate) fn record_member_id(member_id: &LuaMemberId) {
+    if DEPTH.with(Cell::get) > 0 {
+        MEMBER_IDS.with(|ids| {
+            ids.borrow_mut().insert(*member_id);
+        });
+        note_read_seq(WriteKey::MemberId(*member_id));
+    }
+}
+
+/// Records a `---` type-declaration read (`find_type_decl`, super-type and
+/// generic-parameter lookups).
+#[inline]
+pub(crate) fn record_type_decl(decl_id: &LuaTypeDeclId) {
+    if DEPTH.with(Cell::get) > 0 {
+        TYPE_DECLS.with(|decls| {
+            decls.borrow_mut().insert(decl_id.clone());
+        });
+        note_read_seq(WriteKey::TypeDecl(decl_id.clone()));
+    }
+}
+
+/// Records a decl-anchored side-entry read (feature caches, write claims).
+#[inline]
+pub(crate) fn record_decl_misc(decl_id: &LuaDeclId) {
+    if DEPTH.with(Cell::get) > 0 {
+        DECL_MISCS.with(|decls| {
+            decls.borrow_mut().insert(*decl_id);
+        });
+        note_read_seq(WriteKey::DeclMisc(*decl_id));
+    }
+}
+
+/// Records a definition-anchored inferred-fact read.
+#[inline]
+pub(crate) fn record_definition_fact(definition_id: &LuaDefinitionId) {
+    if DEPTH.with(Cell::get) > 0 {
+        DEFINITION_FACTS.with(|facts| {
+            facts.borrow_mut().insert(*definition_id);
+        });
+        note_read_seq(WriteKey::DefinitionFact(*definition_id));
+    }
+}
+
+/// Records a global-path metadata read (definition sites, provenance).
+#[inline]
+pub(crate) fn record_global_path(global_id: &GlobalId) {
+    if DEPTH.with(Cell::get) > 0 {
+        GLOBAL_PATHS.with(|paths| {
+            paths.borrow_mut().insert(global_id.clone());
+        });
+        note_read_seq(WriteKey::GlobalPath(global_id.clone()));
+    }
+}
+
+/// Records an operator-table read, keyed by the operand owner.
+#[inline]
+pub(crate) fn record_operator_owner(owner: &LuaOperatorOwner) {
+    if DEPTH.with(Cell::get) > 0 {
+        OPERATOR_OWNERS.with(|owners| {
+            owners.borrow_mut().insert(owner.clone());
+        });
+        note_read_seq(WriteKey::OperatorOwner(owner.clone()));
+    }
+}
+
+/// Records a setmetatable binding read, keyed by the table's own site.
+#[inline]
+pub(crate) fn record_metatable(site: &InFiled<TextRange>) {
+    if DEPTH.with(Cell::get) > 0 {
+        METATABLE_SITES.with(|sites| {
+            sites.borrow_mut().insert(site.clone());
+        });
+        note_read_seq(WriteKey::Metatable(site.clone()));
+    }
+}
+
+/// Records a table-literal → owning-path read (`definition_site_owner` /
+/// `canonical`), keyed by the literal's own range.
+#[inline]
+pub(crate) fn record_definition_site(site: &InFiled<TextRange>) {
+    if DEPTH.with(Cell::get) > 0 {
+        DEFINITION_SITES.with(|sites| {
+            sites.borrow_mut().insert(site.clone());
+        });
+        note_read_seq(WriteKey::DefinitionSite(site.clone()));
+    }
+}
+
+/// Records a name-keyed gmod-metadata read (vgui panels, derma skins,
+/// net/system registrations).
+#[inline]
+pub(crate) fn record_gmod_meta(name: &SmolStr) {
+    if DEPTH.with(Cell::get) > 0 {
+        GMOD_METAS.with(|metas| {
+            metas.borrow_mut().insert(name.clone());
+        });
+        note_read_seq(WriteKey::GmodMeta(name.clone()));
+    }
+}
+
+/// Records a whole-map enumeration of the type declarations — any
+/// `TypeDecl` write stales it, so the merge checks writes by tag.
+#[inline]
+pub(crate) fn record_type_decl_scan() {
+    if DEPTH.with(Cell::get) > 0 {
+        TYPE_DECL_SCAN.with(|scan| scan.set(true));
+    }
+}
+
+/// Records a `FileId`-keyed side-map read (namespaces, per-file member
+/// lists, accessor calls). Same-file keys can never collide with another
+/// file's writes, so this only ever marks the file's own coverage.
+#[inline]
+pub(crate) fn record_file_scoped(file_id: &FileId) {
+    if DEPTH.with(Cell::get) > 0 {
+        FILE_SCOPEDS.with(|files| {
+            files.borrow_mut().insert(*file_id);
+        });
+        note_read_seq(WriteKey::FileScoped(*file_id));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InferenceReadVersion {
     type_epoch: u64,
     return_epoch: u64,
@@ -400,6 +656,13 @@ impl InferenceReadVersion {
     }
 
     pub(crate) fn is_stale(&self, db: &crate::DbIndex, reads: &InferenceReadSet) -> bool {
+        // The seven epochs cover every `value_reads_changed` probe except the
+        // member-key count reads, which observe the member index directly. An
+        // unchanged capture with no such probe means only member-side versions
+        // can have moved, so the per-key value walk is skipped.
+        if reads.missing_member_slots.is_empty() && Self::capture(db) == *self {
+            return self.member_reads_changed(db, reads);
+        }
         self.value_reads_changed(db, reads) || self.member_reads_changed(db, reads)
     }
 

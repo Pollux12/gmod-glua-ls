@@ -17,13 +17,15 @@ pub(crate) use workspace::WorkspaceResolutionKey;
 pub use workspace::{Workspace, WorkspaceId, WorkspaceKind};
 
 use super::traits::LuaIndex;
+use crate::db_index::op_log;
+use crate::db_index::read_set::WriteKey;
 use crate::{Emmyrc, FileId};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LuaModuleIndex {
     module_patterns: Vec<Regex>,
     module_root_id: ModuleNodeId,
@@ -229,6 +231,13 @@ impl LuaModuleIndex {
     /// a novel fact; re-settling an identical export must not bump, or the
     /// fixpoint's staleness filter degrades to a full requeue.
     pub(crate) fn note_module_write(&mut self, file_id: FileId) {
+        if op_log::recording() {
+            op_log::push_one(
+                op_log::Domain::Module,
+                WriteKey::Module(file_id),
+                move |db| db.get_module_index_mut().note_module_write(file_id),
+            );
+        }
         self.module_writes += 1;
         self.module_write_versions
             .insert(file_id, self.module_writes);
@@ -242,10 +251,30 @@ impl LuaModuleIndex {
     }
 
     pub fn get_module_mut(&mut self, file_id: FileId) -> Option<&mut ModuleInfo> {
+        op_log::note_mut_ref(op_log::MutRef::Module(file_id));
+        crate::db_index::read_set::record_module(&file_id);
         self.file_module_map.get_mut(&file_id)
     }
 
+    /// Boundary replace for the parallel lua walk: installs the fork's final
+    /// `ModuleInfo` for the file. `module_writes` accounting stays with the
+    /// replayed `note_module_write` ops. Runs only on the merge thread.
+    pub(crate) fn replace_module_object(&mut self, file_id: FileId, info: ModuleInfo) {
+        self.file_module_map.insert(file_id, info);
+    }
+
     pub fn set_legacy_module_env(&mut self, file_id: FileId, env: LegacyModuleEnv) {
+        if op_log::recording() {
+            let env2 = env.clone();
+            op_log::push_one(
+                op_log::Domain::Module,
+                WriteKey::Module(file_id),
+                move |db| {
+                    db.get_module_index_mut()
+                        .set_legacy_module_env(file_id, env2)
+                },
+            );
+        }
         let envs = self.legacy_module_envs.entry(file_id).or_default();
         envs.push(env);
         envs.sort_by_key(|env| env.activation_position);
@@ -301,6 +330,16 @@ impl LuaModuleIndex {
     }
 
     pub fn set_module_visibility(&mut self, file_id: FileId, visible: bool) {
+        if op_log::recording() {
+            op_log::push_one(
+                op_log::Domain::Module,
+                WriteKey::Module(file_id),
+                move |db| {
+                    db.get_module_index_mut()
+                        .set_module_visibility(file_id, visible)
+                },
+            );
+        }
         if let Some(module_info) = self.file_module_map.get_mut(&file_id) {
             module_info.visible = visible;
         }
@@ -311,6 +350,17 @@ impl LuaModuleIndex {
         file_id: FileId,
         version_conds: Vec<LuaVersionCondition>,
     ) {
+        if op_log::recording() {
+            let conds2 = version_conds.clone();
+            op_log::push_one(
+                op_log::Domain::Module,
+                WriteKey::Module(file_id),
+                move |db| {
+                    db.get_module_index_mut()
+                        .set_module_version_conds(file_id, conds2)
+                },
+            );
+        }
         if let Some(module_info) = self.file_module_map.get_mut(&file_id) {
             module_info.version_conds = Some(Box::new(version_conds));
         }
@@ -1040,12 +1090,20 @@ impl LuaModuleIndex {
     }
 
     pub fn set_meta(&mut self, file_id: FileId) {
+        if op_log::recording() {
+            op_log::push_one(
+                op_log::Domain::Module,
+                WriteKey::Module(file_id),
+                move |db| db.get_module_index_mut().set_meta(file_id),
+            );
+        }
         if let Some(module_info) = self.file_module_map.get_mut(&file_id) {
             module_info.is_meta = true;
         }
     }
 
     pub fn is_meta_file(&self, file_id: &FileId) -> bool {
+        crate::db_index::read_set::record_module(file_id);
         if let Some(module_info) = self.file_module_map.get(file_id) {
             return module_info.is_meta;
         }

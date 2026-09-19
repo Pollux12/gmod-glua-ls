@@ -18,7 +18,7 @@ pub use signature_cast::LuaSignatureCast;
 
 use super::traits::LuaIndex;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LuaFlowIndex {
     file_flow_tree: HashMap<FileId, FlowTree>,
     signature_cast_cache: HashMap<FileId, HashMap<LuaSignatureId, LuaSignatureCast>>,

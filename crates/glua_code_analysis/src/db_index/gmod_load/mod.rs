@@ -286,7 +286,7 @@ pub(crate) enum GmodExecutionEnvironmentSource {
     Path(String),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct GmodLoadIndex {
     file_infos: HashMap<FileId, GmodFileLoadInfo>,
     unresolved_edges: Vec<GmodLoadEdge>,

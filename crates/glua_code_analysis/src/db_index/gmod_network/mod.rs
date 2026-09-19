@@ -241,12 +241,12 @@ pub struct NetNameExpansion {
 /// references, so an entry stays valid until that file's reference revision
 /// moves — which covers a re-index, a removal, and a late cross-file reference
 /// written by a retained unresolve alike.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct NetHelperNameMemo {
     files: FxHashMap<FileId, NetHelperFileMemo>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct NetHelperFileMemo {
     revision: u64,
     names: FxHashMap<SmolStr, NetNameExpansion>,
@@ -334,7 +334,7 @@ pub struct NetworkFileInputs {
     pub helper_contents: Vec<(FileId, TextRange, Option<u64>)>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct GmodNetworkIndex {
     file_data: FxHashMap<FileId, FileNetworkData>,
     file_inputs: FxHashMap<FileId, NetworkFileInputs>,

@@ -355,7 +355,7 @@ impl AssignmentFlowInfo {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FlowTree {
     decl_bind_expr_ref: HashMap<LuaDeclId, LuaAstPtr<LuaExpr>>,
     flow_nodes: Vec<FlowNode>,

@@ -35,11 +35,13 @@ pub use signature::{
     visit_call_arg_roles_from_type,
 };
 
+use crate::db_index::op_log;
+use crate::db_index::read_set::WriteKey;
 use crate::{FileId, GmodStateMask, LuaType, db_index::LuaDeclId};
 
 use super::traits::LuaIndex;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LuaSignatureIndex {
     signatures: HashMap<LuaSignatureId, LuaSignature>,
     in_file_signatures: HashMap<FileId, HashSet<LuaSignatureId>>,
@@ -155,6 +157,13 @@ impl LuaSignatureIndex {
     }
 
     pub(crate) fn note_return_write(&mut self, signature_id: LuaSignatureId) {
+        if op_log::recording() {
+            op_log::push_one(
+                op_log::Domain::Signature,
+                WriteKey::Signature(signature_id),
+                move |db| db.get_signature_index_mut().note_return_write(signature_id),
+            );
+        }
         self.return_writes += 1;
         self.return_write_versions
             .insert(signature_id, self.return_writes);
@@ -177,6 +186,13 @@ impl LuaSignatureIndex {
     /// added a novel fact; re-settling an identical contract must not bump,
     /// or the fixpoint's staleness filter degrades to a full requeue.
     pub(crate) fn note_param_write(&mut self, signature_id: LuaSignatureId) {
+        if op_log::recording() {
+            op_log::push_one(
+                op_log::Domain::Signature,
+                WriteKey::Param(signature_id),
+                move |db| db.get_signature_index_mut().note_param_write(signature_id),
+            );
+        }
         self.param_writes += 1;
         self.param_write_versions
             .insert(signature_id, self.param_writes);
@@ -222,6 +238,8 @@ impl LuaSignatureIndex {
     }
 
     pub fn get_or_create(&mut self, signature_id: LuaSignatureId) -> &mut LuaSignature {
+        op_log::note_mut_ref(op_log::MutRef::Signature(signature_id));
+        crate::db_index::read_set::record_signature(&signature_id);
         self.in_file_signatures
             .entry(signature_id.get_file_id())
             .or_default()
@@ -235,7 +253,24 @@ impl LuaSignatureIndex {
     }
 
     pub fn get_mut(&mut self, signature_id: &LuaSignatureId) -> Option<&mut LuaSignature> {
+        op_log::note_mut_ref(op_log::MutRef::Signature(*signature_id));
+        crate::db_index::read_set::record_signature(signature_id);
         self.signatures.get_mut(signature_id)
+    }
+
+    /// Boundary replace for the parallel lua walk: installs the fork's final
+    /// object under the same id, keeping `in_file_signatures` registered the
+    /// way `get_or_create` does. Runs only on the merge thread.
+    pub(crate) fn replace_signature_object(
+        &mut self,
+        signature_id: LuaSignatureId,
+        signature: LuaSignature,
+    ) {
+        self.in_file_signatures
+            .entry(signature_id.get_file_id())
+            .or_default()
+            .insert(signature_id);
+        self.signatures.insert(signature_id, signature);
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&LuaSignatureId, &LuaSignature)> {
@@ -248,10 +283,24 @@ impl LuaSignatureIndex {
     }
 
     pub fn local_func_decl_for(&self, signature_id: &LuaSignatureId) -> Option<LuaDeclId> {
+        crate::db_index::read_set::record_signature(signature_id);
         self.local_func_decls.get(signature_id).copied()
     }
 
     pub fn bind_local_func_decl(&mut self, signature_id: LuaSignatureId, decl_id: LuaDeclId) {
+        if op_log::recording() {
+            op_log::push(
+                op_log::Domain::Signature,
+                Box::new([
+                    WriteKey::Signature(signature_id),
+                    WriteKey::DeclMisc(decl_id),
+                ]),
+                move |db| {
+                    db.get_signature_index_mut()
+                        .bind_local_func_decl(signature_id, decl_id)
+                },
+            );
+        }
         self.local_func_decls.insert(signature_id, decl_id);
     }
 
@@ -264,6 +313,16 @@ impl LuaSignatureIndex {
         signature_id: LuaSignatureId,
         state_mask: GmodStateMask,
     ) {
+        if op_log::recording() {
+            op_log::push_one(
+                op_log::Domain::Signature,
+                WriteKey::Signature(signature_id),
+                move |db| {
+                    db.get_signature_index_mut()
+                        .mark_effective_valid_guard_signature(signature_id, state_mask)
+                },
+            );
+        }
         self.effective_valid_guard_signatures
             .entry(signature_id)
             .and_modify(|existing| existing.insert(state_mask))
@@ -271,6 +330,7 @@ impl LuaSignatureIndex {
     }
 
     pub fn is_effective_valid_guard_signature(&self, signature_id: &LuaSignatureId) -> bool {
+        crate::db_index::read_set::record_signature(signature_id);
         self.effective_valid_guard_signatures
             .contains_key(signature_id)
     }
@@ -279,6 +339,7 @@ impl LuaSignatureIndex {
         &self,
         signature_id: &LuaSignatureId,
     ) -> Option<GmodStateMask> {
+        crate::db_index::read_set::record_signature(signature_id);
         self.effective_valid_guard_signatures
             .get(signature_id)
             .copied()
@@ -397,6 +458,7 @@ impl LuaSignatureIndex {
         &self,
         signature_id: &LuaSignatureId,
     ) -> Option<&LuaInferredPositiveGuard> {
+        crate::db_index::read_set::record_signature(signature_id);
         self.inferred_positive_guards.get(signature_id)
     }
 
@@ -404,6 +466,7 @@ impl LuaSignatureIndex {
         &self,
         signature_id: &LuaSignatureId,
     ) -> Option<&LuaInferredGuardOwner> {
+        crate::db_index::read_set::record_signature(signature_id);
         self.inferred_guard_owners.get(signature_id)
     }
 
@@ -874,6 +937,20 @@ impl LuaSignatureIndex {
     }
 
     pub fn add_receiver_out_param_member_name(&mut self, file_id: FileId, member_name: String) {
+        if op_log::recording() {
+            let member_name2 = member_name.clone();
+            op_log::push(
+                op_log::Domain::Signature,
+                Box::new([
+                    WriteKey::FileScoped(file_id),
+                    WriteKey::GmodMeta(member_name.clone().into()),
+                ]),
+                move |db| {
+                    db.get_signature_index_mut()
+                        .add_receiver_out_param_member_name(file_id, member_name2)
+                },
+            );
+        }
         if !self
             .in_file_receiver_out_param_member_names
             .entry(file_id)
@@ -890,17 +967,20 @@ impl LuaSignatureIndex {
     }
 
     pub fn has_receiver_out_param_member_name(&self, member_name: &str) -> bool {
+        crate::db_index::read_set::record_gmod_meta(&member_name.into());
         self.receiver_out_param_member_names
             .contains_key(member_name)
     }
 
     pub fn receiver_out_param_member_names(&self) -> impl Iterator<Item = &str> {
+        op_log::note_untracked_read(op_log::UntrackedDomain::SignatureAux);
         self.receiver_out_param_member_names
             .keys()
             .map(String::as_str)
     }
 
     pub fn get_file_signature_ids(&self, file_id: FileId) -> Option<&HashSet<LuaSignatureId>> {
+        crate::db_index::read_set::record_file_scoped(&file_id);
         self.in_file_signatures.get(&file_id)
     }
 }

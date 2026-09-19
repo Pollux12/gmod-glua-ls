@@ -2,7 +2,7 @@ use rowan::TextRange;
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StringReference {
     string_references: FxHashMap<SmolStr, Vec<TextRange>>,
 }

@@ -4,7 +4,7 @@ use glua_parser::LuaSyntaxId;
 use smol_str::SmolStr;
 
 use super::traits::LuaIndex;
-use crate::{FileId, LuaTypeDeclId};
+use crate::{FileId, LuaTypeDeclId, db_index::op_log, db_index::read_set::WriteKey};
 
 #[derive(Debug, Clone)]
 pub struct AccessorFuncAnnotation {
@@ -12,7 +12,7 @@ pub struct AccessorFuncAnnotation {
     pub file_id: FileId,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct AccessorFuncAnnotationIndex {
     by_name: FxHashMap<SmolStr, Vec<AccessorFuncAnnotation>>,
     by_file: FxHashMap<FileId, Vec<SmolStr>>,
@@ -93,7 +93,7 @@ pub struct AccessorFuncCallMetadata {
     pub name_arg_syntax_id: Option<LuaSyntaxId>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct AccessorFuncCallIndex {
     calls: FxHashMap<FileId, Vec<AccessorFuncCallMetadata>>,
 }
@@ -104,6 +104,17 @@ impl AccessorFuncCallIndex {
     }
 
     pub fn add_call(&mut self, file_id: FileId, metadata: AccessorFuncCallMetadata) {
+        if op_log::recording() {
+            let replay = metadata.clone();
+            op_log::push(
+                op_log::Domain::AccessorFuncCall,
+                Box::new([WriteKey::FileScoped(file_id)]),
+                move |db| {
+                    db.get_accessor_func_call_index_mut()
+                        .add_call(file_id, replay)
+                },
+            );
+        }
         self.calls.entry(file_id).or_default().push(metadata);
     }
 

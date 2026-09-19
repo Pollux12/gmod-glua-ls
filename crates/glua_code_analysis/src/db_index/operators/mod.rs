@@ -4,12 +4,14 @@ mod lua_operator_meta_method;
 use rustc_hash::FxHashMap;
 
 use crate::FileId;
+use crate::db_index::op_log;
+use crate::db_index::read_set::WriteKey;
 
 use super::traits::LuaIndex;
 pub use lua_operator::{LuaOperator, LuaOperatorId, LuaOperatorOwner, OperatorFunction};
 pub use lua_operator_meta_method::LuaOperatorMetaMethod;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LuaOperatorIndex {
     operators: FxHashMap<LuaOperatorId, LuaOperator>,
     type_operators_map:
@@ -37,6 +39,19 @@ impl LuaOperatorIndex {
     /// bump a write epoch, or the fixpoint's staleness filter degrades to a
     /// full requeue.
     pub fn add_operator(&mut self, operator: LuaOperator) -> bool {
+        if op_log::recording() {
+            let operator2 = operator.clone();
+            op_log::push(
+                op_log::Domain::Operator,
+                Box::new([
+                    WriteKey::OperatorOwner(operator.get_owner().clone()),
+                    WriteKey::FileScoped(operator.get_id().file_id),
+                ]),
+                move |db| {
+                    db.get_operator_index_mut().add_operator(operator2);
+                },
+            );
+        }
         let id = operator.get_id();
         if self.operators.contains_key(&id) {
             return false;
@@ -62,6 +77,7 @@ impl LuaOperatorIndex {
         owner: &LuaOperatorOwner,
         meta_method: LuaOperatorMetaMethod,
     ) -> Option<&Vec<LuaOperatorId>> {
+        crate::db_index::read_set::record_operator_owner(owner);
         self.type_operators_map
             .get(owner)
             .and_then(|map| map.get(&meta_method))
@@ -70,12 +86,14 @@ impl LuaOperatorIndex {
     /// Every metamethod this file declares. Another file's inference reads
     /// them whenever it applies an operator to the owning type.
     pub fn operators_in_file(&self, file_id: FileId) -> Vec<&LuaOperator> {
+        crate::db_index::read_set::record_file_scoped(&file_id);
         self.in_filed_operator_map
             .get(&file_id)
             .map(|ids| ids.iter().filter_map(|id| self.get_operator(id)).collect())
             .unwrap_or_default()
     }
     pub fn get_operator(&self, id: &LuaOperatorId) -> Option<&LuaOperator> {
+        crate::db_index::read_set::record_file_scoped(&id.file_id);
         self.operators.get(id)
     }
 }

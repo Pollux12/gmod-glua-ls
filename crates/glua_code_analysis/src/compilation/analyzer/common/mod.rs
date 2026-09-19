@@ -604,7 +604,7 @@ fn merge_def_type_with_table(
     table_range: InFiled<TextRange>,
 ) -> Option<()> {
     let expr_member_owner = LuaMemberOwner::Element(table_range.clone());
-    let member_index = db.get_member_index_mut();
+    let member_index = db.get_member_index();
     let expr_member_ids = member_index
         .get_members(&expr_member_owner)?
         .iter()

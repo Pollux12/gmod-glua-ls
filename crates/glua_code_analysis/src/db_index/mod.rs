@@ -16,6 +16,7 @@ mod member;
 mod metatable;
 mod module;
 mod numeric_range_population;
+pub(crate) mod op_log;
 mod operators;
 mod property;
 mod reference;
@@ -30,6 +31,7 @@ pub(crate) use r#type::read_set;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{path::PathBuf, sync::Arc};
 
+use self::read_set::WriteKey;
 use crate::{Emmyrc, FileId, Vfs, profile::Profile};
 pub use accessor_func::*;
 pub use call_site_param::{CallSiteParamIndex, CallSiteSourceId};
@@ -61,32 +63,38 @@ pub use signature::*;
 pub use traits::LuaIndex;
 pub use r#type::*;
 
+/// Domain indexes live behind `Arc` so [`DbIndex::fork`] can hand a worker a
+/// cheap handle for the parallel lua-analyze walk: cloning a fork bumps ref
+/// counts, and the first mutable access to a domain clones just that domain
+/// (`Arc::make_mut`), so an unwritten domain is shared with the base index for
+/// free. Forks are scoped to the walk and dropped before merge; mutation entry
+/// points outside the walk rely on there being no live fork.
 #[derive(Debug)]
 pub struct DbIndex {
-    decl_index: LuaDeclIndex,
-    references_index: LuaReferenceIndex,
-    types_index: LuaTypeIndex,
-    modules_index: LuaModuleIndex,
-    members_index: LuaMemberIndex,
-    property_index: LuaPropertyIndex,
-    signature_index: LuaSignatureIndex,
-    diagnostic_index: DiagnosticIndex,
-    operator_index: LuaOperatorIndex,
-    flow_index: LuaFlowIndex,
-    accessor_func_index: AccessorFuncAnnotationIndex,
-    accessor_func_call_index: AccessorFuncCallIndex,
-    call_site_param_index: CallSiteParamIndex,
-    gmod_class_index: GmodClassMetadataIndex,
-    gmod_infer_index: GmodInferIndex,
-    gmod_load_index: GmodLoadIndex,
-    gmod_network_index: GmodNetworkIndex,
-    dynamic_field_index: DynamicFieldIndex,
-    vfs: Vfs,
-    file_dependencies_index: LuaDependencyIndex,
-    numeric_range_population_index: NumericRangePopulationIndex,
-    metatable_index: LuaMetatableIndex,
-    global_index: LuaGlobalIndex,
-    json_schema_index: JsonSchemaIndex,
+    decl_index: Arc<LuaDeclIndex>,
+    references_index: Arc<LuaReferenceIndex>,
+    types_index: Arc<LuaTypeIndex>,
+    modules_index: Arc<LuaModuleIndex>,
+    members_index: Arc<LuaMemberIndex>,
+    property_index: Arc<LuaPropertyIndex>,
+    signature_index: Arc<LuaSignatureIndex>,
+    diagnostic_index: Arc<DiagnosticIndex>,
+    operator_index: Arc<LuaOperatorIndex>,
+    flow_index: Arc<LuaFlowIndex>,
+    accessor_func_index: Arc<AccessorFuncAnnotationIndex>,
+    accessor_func_call_index: Arc<AccessorFuncCallIndex>,
+    call_site_param_index: Arc<CallSiteParamIndex>,
+    gmod_class_index: Arc<GmodClassMetadataIndex>,
+    gmod_infer_index: Arc<GmodInferIndex>,
+    gmod_load_index: Arc<GmodLoadIndex>,
+    gmod_network_index: Arc<GmodNetworkIndex>,
+    dynamic_field_index: Arc<DynamicFieldIndex>,
+    vfs: Arc<Vfs>,
+    file_dependencies_index: Arc<LuaDependencyIndex>,
+    numeric_range_population_index: Arc<NumericRangePopulationIndex>,
+    metatable_index: Arc<LuaMetatableIndex>,
+    global_index: Arc<LuaGlobalIndex>,
+    json_schema_index: Arc<JsonSchemaIndex>,
     emmyrc: Arc<Emmyrc>,
     /// Revision-keyed cache for workspace-wide derived structures that are pure
     /// functions of VFS content (currently the gmod net-helper registry). Stored
@@ -136,30 +144,30 @@ impl DbIndex {
     pub fn new() -> Self {
         Self {
             type_structure_revision: next_type_structure_revision(),
-            decl_index: LuaDeclIndex::new(),
-            references_index: LuaReferenceIndex::new(),
-            types_index: LuaTypeIndex::new(),
-            modules_index: LuaModuleIndex::new(),
-            members_index: LuaMemberIndex::new(),
-            property_index: LuaPropertyIndex::new(),
-            signature_index: LuaSignatureIndex::new(),
-            diagnostic_index: DiagnosticIndex::new(),
-            operator_index: LuaOperatorIndex::new(),
-            flow_index: LuaFlowIndex::new(),
-            accessor_func_index: AccessorFuncAnnotationIndex::new(),
-            accessor_func_call_index: AccessorFuncCallIndex::new(),
-            call_site_param_index: CallSiteParamIndex::new(),
-            gmod_class_index: GmodClassMetadataIndex::new(),
-            gmod_infer_index: GmodInferIndex::new(),
-            gmod_load_index: GmodLoadIndex::new(),
-            gmod_network_index: GmodNetworkIndex::new(),
-            dynamic_field_index: DynamicFieldIndex::new(),
-            vfs: Vfs::new(),
-            file_dependencies_index: LuaDependencyIndex::new(),
-            numeric_range_population_index: NumericRangePopulationIndex::new(),
-            metatable_index: LuaMetatableIndex::new(),
-            global_index: LuaGlobalIndex::new(),
-            json_schema_index: JsonSchemaIndex::new(),
+            decl_index: Arc::new(LuaDeclIndex::new()),
+            references_index: Arc::new(LuaReferenceIndex::new()),
+            types_index: Arc::new(LuaTypeIndex::new()),
+            modules_index: Arc::new(LuaModuleIndex::new()),
+            members_index: Arc::new(LuaMemberIndex::new()),
+            property_index: Arc::new(LuaPropertyIndex::new()),
+            signature_index: Arc::new(LuaSignatureIndex::new()),
+            diagnostic_index: Arc::new(DiagnosticIndex::new()),
+            operator_index: Arc::new(LuaOperatorIndex::new()),
+            flow_index: Arc::new(LuaFlowIndex::new()),
+            accessor_func_index: Arc::new(AccessorFuncAnnotationIndex::new()),
+            accessor_func_call_index: Arc::new(AccessorFuncCallIndex::new()),
+            call_site_param_index: Arc::new(CallSiteParamIndex::new()),
+            gmod_class_index: Arc::new(GmodClassMetadataIndex::new()),
+            gmod_infer_index: Arc::new(GmodInferIndex::new()),
+            gmod_load_index: Arc::new(GmodLoadIndex::new()),
+            gmod_network_index: Arc::new(GmodNetworkIndex::new()),
+            dynamic_field_index: Arc::new(DynamicFieldIndex::new()),
+            vfs: Arc::new(Vfs::new()),
+            file_dependencies_index: Arc::new(LuaDependencyIndex::new()),
+            numeric_range_population_index: Arc::new(NumericRangePopulationIndex::new()),
+            metatable_index: Arc::new(LuaMetatableIndex::new()),
+            global_index: Arc::new(LuaGlobalIndex::new()),
+            json_schema_index: Arc::new(JsonSchemaIndex::new()),
             emmyrc: Arc::new(Emmyrc::default()),
             helper_registry_cache: RevisionedCache::default(),
             file_helper_scan_cache: FxHashMap::default(),
@@ -171,6 +179,7 @@ impl DbIndex {
         &self,
         file_id: FileId,
     ) -> Option<Arc<T>> {
+        op_log::note_untracked_read(op_log::UntrackedDomain::HelperCache);
         self.file_helper_scan_cache
             .get(&file_id)
             .and_then(|value| value.clone().downcast::<T>().ok())
@@ -181,6 +190,14 @@ impl DbIndex {
         file_id: FileId,
         value: Arc<T>,
     ) {
+        if op_log::recording() {
+            let value2 = value.clone();
+            op_log::push_one(
+                op_log::Domain::HelperCache,
+                WriteKey::HelperCache(file_id),
+                move |db| db.set_cached_file_helper_scan(file_id, value2),
+            );
+        }
         self.file_helper_scan_cache.insert(file_id, value);
     }
 
@@ -191,6 +208,7 @@ impl DbIndex {
         &self,
         revision: u64,
     ) -> Option<Arc<T>> {
+        op_log::note_untracked_read(op_log::UntrackedDomain::HelperCache);
         match &self.helper_registry_cache.0 {
             Some((cached_rev, value)) if *cached_rev == revision => {
                 value.clone().downcast::<T>().ok()
@@ -206,6 +224,14 @@ impl DbIndex {
         revision: u64,
         value: Arc<T>,
     ) {
+        if op_log::recording() {
+            let value2 = value.clone();
+            op_log::push_one(
+                op_log::Domain::HelperCache,
+                WriteKey::HelperRegistry,
+                move |db| db.set_cached_helper_registry(revision, value2),
+            );
+        }
         self.helper_registry_cache.0 = Some((revision, value));
     }
 
@@ -239,30 +265,37 @@ impl DbIndex {
     }
 
     pub fn get_metatable_index_mut(&mut self) -> &mut LuaMetatableIndex {
-        &mut self.metatable_index
+        op_log::note_domain_touch(op_log::Domain::Metatable);
+        Arc::make_mut(&mut self.metatable_index)
     }
 
+    /// Reads record their own keys on `LuaMetatableIndex`'s methods — see
+    /// `get_operator_index`.
     pub fn get_metatable_index(&self) -> &LuaMetatableIndex {
-        &self.metatable_index
+        self.metatable_index.as_ref()
     }
 
     pub fn get_decl_index_mut(&mut self) -> &mut LuaDeclIndex {
-        &mut self.decl_index
+        op_log::note_domain_touch(op_log::Domain::Decl);
+        Arc::make_mut(&mut self.decl_index)
     }
 
     pub fn get_reference_index_mut(&mut self) -> &mut LuaReferenceIndex {
-        &mut self.references_index
+        op_log::note_domain_touch(op_log::Domain::Reference);
+        Arc::make_mut(&mut self.references_index)
     }
 
     /// Rebuilds the inference-derived state left stale by a batch of fact
     /// bindings. See [`LuaTypeIndex::flush_inference_derived_state`].
     pub fn flush_inference_derived_state(&mut self) {
-        self.types_index.flush_inference_derived_state();
+        op_log::note_domain_touch(op_log::Domain::Type);
+        Arc::make_mut(&mut self.types_index).flush_inference_derived_state();
     }
 
     pub fn get_type_index_mut(&mut self) -> &mut LuaTypeIndex {
+        op_log::note_domain_touch(op_log::Domain::Type);
         self.type_structure_revision = next_type_structure_revision();
-        &mut self.types_index
+        Arc::make_mut(&mut self.types_index)
     }
 
     /// See [`Self::type_structure_revision`]. Memos over type/member-derived
@@ -295,7 +328,9 @@ impl DbIndex {
         mut updates: Vec<(LuaInferenceNodeId, LuaTypeFact)>,
     ) -> FxHashSet<FileId> {
         // Writes into `types_index` below go direct rather than through
-        // `get_type_index_mut`, so bump the revision here too.
+        // `get_type_index_mut`, so bump the revision and note the touch here
+        // too.
+        op_log::note_domain_touch(op_log::Domain::Type);
         self.type_structure_revision = next_type_structure_revision();
         updates.sort_by(|(left_node, _), (right_node, _)| left_node.stable_cmp(right_node));
 
@@ -322,24 +357,25 @@ impl DbIndex {
 
             match node {
                 LuaInferenceNodeId::TypeOwner(owner) => {
-                    let file_id = self.types_index.force_bind_type_fact_unchecked(
-                        owner,
-                        LuaTypeCache::InferType(fact.typ().clone()),
-                        LuaTypeFactMetadata::from_fact(&fact),
-                    );
+                    let file_id = Arc::make_mut(&mut self.types_index)
+                        .force_bind_type_fact_unchecked(
+                            owner,
+                            LuaTypeCache::InferType(fact.typ().clone()),
+                            LuaTypeFactMetadata::from_fact(&fact),
+                        );
                     changed_files.insert(file_id);
                 }
                 LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(decl_id)) => {
-                    let file_id = self.types_index.force_bind_type_fact_unchecked(
-                        LuaTypeOwner::Decl(decl_id),
-                        LuaTypeCache::InferType(fact.typ().clone()),
-                        LuaTypeFactMetadata::from_fact(&fact),
-                    );
+                    let file_id = Arc::make_mut(&mut self.types_index)
+                        .force_bind_type_fact_unchecked(
+                            LuaTypeOwner::Decl(decl_id),
+                            LuaTypeCache::InferType(fact.typ().clone()),
+                            LuaTypeFactMetadata::from_fact(&fact),
+                        );
                     changed_files.insert(file_id);
                 }
                 LuaInferenceNodeId::Definition(definition) => {
-                    let file_id = self
-                        .types_index
+                    let file_id = Arc::make_mut(&mut self.types_index)
                         .bind_definition_fact_unchecked(definition, fact);
                     changed_files.insert(file_id);
                 }
@@ -348,190 +384,223 @@ impl DbIndex {
         }
 
         if !changed_files.is_empty() {
-            self.types_index.mark_inference_derived_state_dirty();
+            Arc::make_mut(&mut self.types_index).mark_inference_derived_state_dirty();
         }
-        self.types_index.flush_inference_derived_state();
+        Arc::make_mut(&mut self.types_index).flush_inference_derived_state();
         changed_files
     }
 
     pub fn get_module_index_mut(&mut self) -> &mut LuaModuleIndex {
+        op_log::note_domain_touch(op_log::Domain::Module);
         self.type_structure_revision = next_type_structure_revision();
-        &mut self.modules_index
+        Arc::make_mut(&mut self.modules_index)
     }
 
+    #[track_caller]
     pub fn get_member_index_mut(&mut self) -> &mut LuaMemberIndex {
+        op_log::note_domain_touch(op_log::Domain::Member);
         self.type_structure_revision = next_type_structure_revision();
-        &mut self.members_index
+        Arc::make_mut(&mut self.members_index)
     }
 
+    #[track_caller]
     pub fn get_property_index_mut(&mut self) -> &mut LuaPropertyIndex {
-        &mut self.property_index
+        op_log::note_domain_touch(op_log::Domain::Property);
+        Arc::make_mut(&mut self.property_index)
     }
 
     pub fn get_signature_index_mut(&mut self) -> &mut LuaSignatureIndex {
+        op_log::note_domain_touch(op_log::Domain::Signature);
         self.type_structure_revision = next_type_structure_revision();
-        &mut self.signature_index
+        Arc::make_mut(&mut self.signature_index)
     }
 
     pub fn get_diagnostic_index_mut(&mut self) -> &mut DiagnosticIndex {
-        &mut self.diagnostic_index
+        op_log::note_domain_touch(op_log::Domain::Diagnostic);
+        Arc::make_mut(&mut self.diagnostic_index)
     }
 
     pub fn get_operator_index_mut(&mut self) -> &mut LuaOperatorIndex {
-        &mut self.operator_index
+        op_log::note_domain_touch(op_log::Domain::Operator);
+        Arc::make_mut(&mut self.operator_index)
     }
 
     pub fn get_flow_index_mut(&mut self) -> &mut LuaFlowIndex {
-        &mut self.flow_index
+        op_log::note_domain_touch(op_log::Domain::Flow);
+        Arc::make_mut(&mut self.flow_index)
     }
 
     pub fn get_decl_index(&self) -> &LuaDeclIndex {
-        &self.decl_index
+        self.decl_index.as_ref()
     }
 
     pub fn get_reference_index(&self) -> &LuaReferenceIndex {
-        &self.references_index
+        self.references_index.as_ref()
     }
 
     pub fn get_type_index(&self) -> &LuaTypeIndex {
-        &self.types_index
+        self.types_index.as_ref()
     }
 
     pub fn get_module_index(&self) -> &LuaModuleIndex {
-        &self.modules_index
+        self.modules_index.as_ref()
     }
 
     pub fn get_member_index(&self) -> &LuaMemberIndex {
-        &self.members_index
+        self.members_index.as_ref()
     }
 
     pub fn get_property_index(&self) -> &LuaPropertyIndex {
-        &self.property_index
+        op_log::note_untracked_read(op_log::UntrackedDomain::Property);
+        self.property_index.as_ref()
     }
 
     pub fn get_signature_index(&self) -> &LuaSignatureIndex {
-        &self.signature_index
+        self.signature_index.as_ref()
     }
 
     pub fn get_diagnostic_index(&self) -> &DiagnosticIndex {
-        &self.diagnostic_index
+        self.diagnostic_index.as_ref()
     }
 
+    /// Reads record their own keys on `LuaOperatorIndex`'s methods — no
+    /// catch-all note here, or every file touching the index poisons the
+    /// domain bit for its successors.
     pub fn get_operator_index(&self) -> &LuaOperatorIndex {
-        &self.operator_index
+        self.operator_index.as_ref()
     }
 
     pub fn get_flow_index(&self) -> &LuaFlowIndex {
-        &self.flow_index
+        self.flow_index.as_ref()
     }
 
     pub fn get_accessor_func_index(&self) -> &AccessorFuncAnnotationIndex {
-        &self.accessor_func_index
+        self.accessor_func_index.as_ref()
     }
 
     pub fn get_accessor_func_index_mut(&mut self) -> &mut AccessorFuncAnnotationIndex {
-        &mut self.accessor_func_index
+        op_log::note_domain_touch(op_log::Domain::AccessorFunc);
+        Arc::make_mut(&mut self.accessor_func_index)
     }
 
     pub fn get_accessor_func_call_index(&self) -> &AccessorFuncCallIndex {
-        &self.accessor_func_call_index
+        self.accessor_func_call_index.as_ref()
     }
 
     pub fn get_accessor_func_call_index_mut(&mut self) -> &mut AccessorFuncCallIndex {
-        &mut self.accessor_func_call_index
+        op_log::note_domain_touch(op_log::Domain::AccessorFuncCall);
+        Arc::make_mut(&mut self.accessor_func_call_index)
     }
 
     pub fn get_call_site_param_index(&self) -> &CallSiteParamIndex {
-        &self.call_site_param_index
+        self.call_site_param_index.as_ref()
     }
 
     pub fn get_call_site_param_index_mut(&mut self) -> &mut CallSiteParamIndex {
-        &mut self.call_site_param_index
+        op_log::note_domain_touch(op_log::Domain::CallSiteParam);
+        Arc::make_mut(&mut self.call_site_param_index)
     }
 
+    /// Reads record their own keys on `GmodClassMetadataIndex`'s methods —
+    /// see `get_operator_index`.
     pub fn get_gmod_class_metadata_index(&self) -> &GmodClassMetadataIndex {
-        &self.gmod_class_index
+        self.gmod_class_index.as_ref()
     }
 
     pub fn get_gmod_class_metadata_index_mut(&mut self) -> &mut GmodClassMetadataIndex {
-        &mut self.gmod_class_index
+        op_log::note_domain_touch(op_log::Domain::GmodClass);
+        Arc::make_mut(&mut self.gmod_class_index)
     }
 
     pub fn get_gmod_infer_index(&self) -> &GmodInferIndex {
-        &self.gmod_infer_index
+        op_log::note_untracked_read(op_log::UntrackedDomain::GmodInfer);
+        self.gmod_infer_index.as_ref()
     }
 
     pub fn get_gmod_infer_index_mut(&mut self) -> &mut GmodInferIndex {
-        &mut self.gmod_infer_index
+        op_log::note_domain_touch(op_log::Domain::GmodInfer);
+        Arc::make_mut(&mut self.gmod_infer_index)
     }
 
     pub fn get_gmod_load_index(&self) -> &GmodLoadIndex {
-        &self.gmod_load_index
+        self.gmod_load_index.as_ref()
     }
 
     pub fn get_gmod_load_index_mut(&mut self) -> &mut GmodLoadIndex {
-        &mut self.gmod_load_index
+        op_log::note_domain_touch(op_log::Domain::GmodLoad);
+        Arc::make_mut(&mut self.gmod_load_index)
     }
 
     pub fn get_gmod_network_index(&self) -> &GmodNetworkIndex {
-        &self.gmod_network_index
+        self.gmod_network_index.as_ref()
     }
 
     pub fn get_gmod_network_index_mut(&mut self) -> &mut GmodNetworkIndex {
-        &mut self.gmod_network_index
+        op_log::note_domain_touch(op_log::Domain::GmodNetwork);
+        Arc::make_mut(&mut self.gmod_network_index)
     }
 
     pub fn get_dynamic_field_index(&self) -> &DynamicFieldIndex {
-        &self.dynamic_field_index
+        self.dynamic_field_index.as_ref()
     }
 
     pub fn get_dynamic_field_index_mut(&mut self) -> &mut DynamicFieldIndex {
-        &mut self.dynamic_field_index
+        op_log::note_domain_touch(op_log::Domain::DynamicField);
+        Arc::make_mut(&mut self.dynamic_field_index)
     }
 
     pub fn get_vfs(&self) -> &Vfs {
-        &self.vfs
+        self.vfs.as_ref()
     }
 
     pub fn get_vfs_mut(&mut self) -> &mut Vfs {
-        &mut self.vfs
+        // Vfs is not `Clone`, so `make_mut` is unavailable; forks only exist
+        // inside the parallel lua-analyze walk where the vfs is read-only, so
+        // a strong count above one here would mean a fork outlived the walk.
+        Arc::get_mut(&mut self.vfs).expect("vfs mutation while a DbIndex fork is live")
     }
 
     pub fn get_file_dependencies_index(&self) -> &LuaDependencyIndex {
-        &self.file_dependencies_index
+        self.file_dependencies_index.as_ref()
     }
 
     pub fn get_file_dependencies_index_mut(&mut self) -> &mut LuaDependencyIndex {
-        &mut self.file_dependencies_index
+        op_log::note_domain_touch(op_log::Domain::Dependency);
+        Arc::make_mut(&mut self.file_dependencies_index)
     }
 
     pub fn get_numeric_range_population_index(&self) -> &NumericRangePopulationIndex {
-        &self.numeric_range_population_index
+        self.numeric_range_population_index.as_ref()
     }
 
     pub fn get_numeric_range_population_index_mut(&mut self) -> &mut NumericRangePopulationIndex {
-        &mut self.numeric_range_population_index
+        op_log::note_domain_touch(op_log::Domain::NumericRange);
+        Arc::make_mut(&mut self.numeric_range_population_index)
     }
 
     pub fn get_global_index(&self) -> &LuaGlobalIndex {
-        &self.global_index
+        self.global_index.as_ref()
     }
 
     pub fn get_global_index_mut(&mut self) -> &mut LuaGlobalIndex {
-        &mut self.global_index
+        op_log::note_domain_touch(op_log::Domain::Global);
+        Arc::make_mut(&mut self.global_index)
     }
 
     pub fn get_json_schema_index(&self) -> &JsonSchemaIndex {
-        &self.json_schema_index
+        self.json_schema_index.as_ref()
     }
 
     pub fn get_json_schema_index_mut(&mut self) -> &mut JsonSchemaIndex {
-        &mut self.json_schema_index
+        op_log::note_domain_touch(op_log::Domain::JsonSchema);
+        Arc::make_mut(&mut self.json_schema_index)
     }
 
     pub fn update_config(&mut self, config: Arc<Emmyrc>) {
-        self.vfs.update_config(config.clone());
-        self.modules_index.update_config(config.clone());
+        Arc::get_mut(&mut self.vfs)
+            .expect("vfs mutation while a DbIndex fork is live")
+            .update_config(config.clone());
+        Arc::make_mut(&mut self.modules_index).update_config(config.clone());
         self.emmyrc = config;
     }
 
@@ -550,34 +619,80 @@ impl DbIndex {
 
         paths
     }
+
+    /// A worker-side view of this index for the parallel lua-analyze walk.
+    /// Every domain shares its `Arc` with the base until the first mutable
+    /// accessor clones it (`Arc::make_mut`), so a fork costs refcount bumps
+    /// plus one clone per domain actually written. The vfs is shared
+    /// read-only: `get_vfs_mut` panics while any fork is live.
+    ///
+    /// A fork must not outlive the walk that created it — mutation entry
+    /// points outside the walk assume exclusive ownership.
+    pub(crate) fn fork(&self) -> Self {
+        Self {
+            type_structure_revision: self.type_structure_revision,
+            decl_index: Arc::clone(&self.decl_index),
+            references_index: Arc::clone(&self.references_index),
+            types_index: Arc::clone(&self.types_index),
+            modules_index: Arc::clone(&self.modules_index),
+            members_index: Arc::clone(&self.members_index),
+            property_index: Arc::clone(&self.property_index),
+            signature_index: Arc::clone(&self.signature_index),
+            diagnostic_index: Arc::clone(&self.diagnostic_index),
+            operator_index: Arc::clone(&self.operator_index),
+            flow_index: Arc::clone(&self.flow_index),
+            accessor_func_index: Arc::clone(&self.accessor_func_index),
+            accessor_func_call_index: Arc::clone(&self.accessor_func_call_index),
+            call_site_param_index: Arc::clone(&self.call_site_param_index),
+            gmod_class_index: Arc::clone(&self.gmod_class_index),
+            gmod_infer_index: Arc::clone(&self.gmod_infer_index),
+            gmod_load_index: Arc::clone(&self.gmod_load_index),
+            gmod_network_index: Arc::clone(&self.gmod_network_index),
+            dynamic_field_index: Arc::clone(&self.dynamic_field_index),
+            vfs: Arc::clone(&self.vfs),
+            file_dependencies_index: Arc::clone(&self.file_dependencies_index),
+            numeric_range_population_index: Arc::clone(&self.numeric_range_population_index),
+            metatable_index: Arc::clone(&self.metatable_index),
+            global_index: Arc::clone(&self.global_index),
+            json_schema_index: Arc::clone(&self.json_schema_index),
+            emmyrc: Arc::clone(&self.emmyrc),
+            helper_registry_cache: RevisionedCache(
+                self.helper_registry_cache
+                    .0
+                    .as_ref()
+                    .map(|(rev, value)| (*rev, Arc::clone(value))),
+            ),
+            file_helper_scan_cache: self.file_helper_scan_cache.clone(),
+        }
+    }
 }
 
 impl LuaIndex for DbIndex {
     fn remove(&mut self, file_id: FileId) {
         self.type_structure_revision = next_type_structure_revision();
-        self.decl_index.remove(file_id);
-        self.references_index.remove(file_id);
-        self.types_index.remove(file_id);
-        self.modules_index.remove(file_id);
-        self.members_index.remove(file_id);
-        self.property_index.remove(file_id);
-        self.signature_index.remove(file_id);
-        self.diagnostic_index.remove(file_id);
-        self.operator_index.remove(file_id);
-        self.flow_index.remove(file_id);
-        self.accessor_func_index.remove(file_id);
-        self.accessor_func_call_index.remove(file_id);
-        self.call_site_param_index.remove(file_id);
-        self.gmod_class_index.remove(file_id);
-        self.gmod_infer_index.remove(file_id);
-        self.gmod_load_index.remove(file_id);
-        self.gmod_network_index.remove(file_id);
-        self.dynamic_field_index.remove(file_id);
-        self.file_dependencies_index.remove(file_id);
-        self.numeric_range_population_index.remove(file_id);
-        self.metatable_index.remove(file_id);
-        self.global_index.remove(file_id);
-        self.json_schema_index.remove(file_id);
+        Arc::make_mut(&mut self.decl_index).remove(file_id);
+        Arc::make_mut(&mut self.references_index).remove(file_id);
+        Arc::make_mut(&mut self.types_index).remove(file_id);
+        Arc::make_mut(&mut self.modules_index).remove(file_id);
+        Arc::make_mut(&mut self.members_index).remove(file_id);
+        Arc::make_mut(&mut self.property_index).remove(file_id);
+        Arc::make_mut(&mut self.signature_index).remove(file_id);
+        Arc::make_mut(&mut self.diagnostic_index).remove(file_id);
+        Arc::make_mut(&mut self.operator_index).remove(file_id);
+        Arc::make_mut(&mut self.flow_index).remove(file_id);
+        Arc::make_mut(&mut self.accessor_func_index).remove(file_id);
+        Arc::make_mut(&mut self.accessor_func_call_index).remove(file_id);
+        Arc::make_mut(&mut self.call_site_param_index).remove(file_id);
+        Arc::make_mut(&mut self.gmod_class_index).remove(file_id);
+        Arc::make_mut(&mut self.gmod_infer_index).remove(file_id);
+        Arc::make_mut(&mut self.gmod_load_index).remove(file_id);
+        Arc::make_mut(&mut self.gmod_network_index).remove(file_id);
+        Arc::make_mut(&mut self.dynamic_field_index).remove(file_id);
+        Arc::make_mut(&mut self.file_dependencies_index).remove(file_id);
+        Arc::make_mut(&mut self.numeric_range_population_index).remove(file_id);
+        Arc::make_mut(&mut self.metatable_index).remove(file_id);
+        Arc::make_mut(&mut self.global_index).remove(file_id);
+        Arc::make_mut(&mut self.json_schema_index).remove(file_id);
     }
 
     fn remove_files(&mut self, file_ids: &[FileId]) {
@@ -588,96 +703,104 @@ impl LuaIndex for DbIndex {
         }
 
         use crate::profile::phase;
-        phase("remove/decl", || self.decl_index.remove_files(file_ids));
-        phase("remove/references", || {
-            self.references_index.remove_files(file_ids)
+        phase("remove/decl", || {
+            Arc::make_mut(&mut self.decl_index).remove_files(file_ids)
         });
-        phase("remove/types", || self.types_index.remove_files(file_ids));
+        phase("remove/references", || {
+            Arc::make_mut(&mut self.references_index).remove_files(file_ids)
+        });
+        phase("remove/types", || {
+            Arc::make_mut(&mut self.types_index).remove_files(file_ids)
+        });
         phase("remove/modules", || {
-            self.modules_index.remove_files(file_ids)
+            Arc::make_mut(&mut self.modules_index).remove_files(file_ids)
         });
         phase("remove/members", || {
-            self.members_index.remove_files(file_ids)
+            Arc::make_mut(&mut self.members_index).remove_files(file_ids)
         });
         phase("remove/property", || {
-            self.property_index.remove_files(file_ids)
+            Arc::make_mut(&mut self.property_index).remove_files(file_ids)
         });
         phase("remove/signature", || {
-            self.signature_index.remove_files(file_ids)
+            Arc::make_mut(&mut self.signature_index).remove_files(file_ids)
         });
         phase("remove/diagnostic", || {
-            self.diagnostic_index.remove_files(file_ids)
+            Arc::make_mut(&mut self.diagnostic_index).remove_files(file_ids)
         });
         phase("remove/operator", || {
-            self.operator_index.remove_files(file_ids)
+            Arc::make_mut(&mut self.operator_index).remove_files(file_ids)
         });
-        phase("remove/flow", || self.flow_index.remove_files(file_ids));
+        phase("remove/flow", || {
+            Arc::make_mut(&mut self.flow_index).remove_files(file_ids)
+        });
         phase("remove/accessor_func", || {
-            self.accessor_func_index.remove_files(file_ids)
+            Arc::make_mut(&mut self.accessor_func_index).remove_files(file_ids)
         });
         phase("remove/accessor_func_call", || {
-            self.accessor_func_call_index.remove_files(file_ids)
+            Arc::make_mut(&mut self.accessor_func_call_index).remove_files(file_ids)
         });
         phase("remove/call_site_param", || {
-            self.call_site_param_index.remove_files(file_ids)
+            Arc::make_mut(&mut self.call_site_param_index).remove_files(file_ids)
         });
         phase("remove/gmod_class", || {
-            self.gmod_class_index.remove_files(file_ids)
+            Arc::make_mut(&mut self.gmod_class_index).remove_files(file_ids)
         });
         phase("remove/gmod_infer", || {
-            self.gmod_infer_index.remove_files(file_ids)
+            Arc::make_mut(&mut self.gmod_infer_index).remove_files(file_ids)
         });
         phase("remove/gmod_load", || {
-            self.gmod_load_index.remove_files(file_ids)
+            Arc::make_mut(&mut self.gmod_load_index).remove_files(file_ids)
         });
         phase("remove/gmod_network", || {
-            self.gmod_network_index.remove_files(file_ids)
+            Arc::make_mut(&mut self.gmod_network_index).remove_files(file_ids)
         });
         phase("remove/dynamic_field", || {
-            self.dynamic_field_index.remove_files(file_ids)
+            Arc::make_mut(&mut self.dynamic_field_index).remove_files(file_ids)
         });
         phase("remove/file_dependencies", || {
-            self.file_dependencies_index.remove_files(file_ids)
+            Arc::make_mut(&mut self.file_dependencies_index).remove_files(file_ids)
         });
         phase("remove/numeric_range", || {
             for &file_id in file_ids {
-                self.numeric_range_population_index.remove(file_id);
+                Arc::make_mut(&mut self.numeric_range_population_index).remove(file_id);
             }
         });
         phase("remove/metatable", || {
-            self.metatable_index.remove_files(file_ids)
+            Arc::make_mut(&mut self.metatable_index).remove_files(file_ids)
         });
-        phase("remove/global", || self.global_index.remove_files(file_ids));
+        phase("remove/global", || {
+            Arc::make_mut(&mut self.global_index).remove_files(file_ids)
+        });
         phase("remove/json_schema", || {
-            self.json_schema_index.remove_files(file_ids)
+            Arc::make_mut(&mut self.json_schema_index).remove_files(file_ids)
         });
     }
 
     fn clear(&mut self) {
         self.type_structure_revision = next_type_structure_revision();
-        self.decl_index.clear();
-        self.references_index.clear();
-        self.types_index.clear();
-        self.modules_index.clear();
-        self.members_index.clear();
-        self.property_index.clear();
-        self.signature_index.clear();
-        self.diagnostic_index.clear();
-        self.operator_index.clear();
-        self.flow_index.clear();
-        self.accessor_func_index.clear();
-        self.accessor_func_call_index.clear();
-        self.call_site_param_index.clear();
-        self.gmod_class_index.clear();
-        self.gmod_infer_index.clear();
-        self.gmod_load_index.clear();
-        self.gmod_network_index.clear();
-        self.dynamic_field_index.clear();
-        self.file_dependencies_index.clear();
-        self.numeric_range_population_index.clear();
-        self.metatable_index.clear();
-        self.global_index.clear();
-        self.json_schema_index.clear();
+        Arc::make_mut(&mut self.decl_index).clear();
+        Arc::make_mut(&mut self.references_index).clear();
+        Arc::make_mut(&mut self.types_index).clear();
+        Arc::make_mut(&mut self.modules_index).clear();
+        Arc::make_mut(&mut self.members_index).clear();
+        Arc::make_mut(&mut self.property_index).clear();
+        Arc::make_mut(&mut self.signature_index).clear();
+        Arc::make_mut(&mut self.diagnostic_index).clear();
+        Arc::make_mut(&mut self.operator_index).clear();
+        Arc::make_mut(&mut self.flow_index).clear();
+        Arc::make_mut(&mut self.accessor_func_index).clear();
+        Arc::make_mut(&mut self.accessor_func_call_index).clear();
+        Arc::make_mut(&mut self.call_site_param_index).clear();
+        Arc::make_mut(&mut self.gmod_class_index).clear();
+        Arc::make_mut(&mut self.gmod_infer_index).clear();
+        Arc::make_mut(&mut self.gmod_load_index).clear();
+        Arc::make_mut(&mut self.gmod_network_index).clear();
+        Arc::make_mut(&mut self.dynamic_field_index).clear();
+        Arc::make_mut(&mut self.file_dependencies_index).clear();
+        Arc::make_mut(&mut self.numeric_range_population_index).clear();
+        Arc::make_mut(&mut self.metatable_index).clear();
+        Arc::make_mut(&mut self.global_index).clear();
+        Arc::make_mut(&mut self.json_schema_index).clear();
         // Derived caches have to go with the facts they were derived from.
         // `clear` does not touch the VFS, so `content_revision` and the
         // signature count both return to their old values once the same file

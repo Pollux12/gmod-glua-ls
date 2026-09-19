@@ -10,7 +10,7 @@ use crate::{
 
 use super::lua_operator_meta_method::LuaOperatorMetaMethod;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LuaOperator {
     owner: LuaOperatorOwner,
     op: LuaOperatorMetaMethod,

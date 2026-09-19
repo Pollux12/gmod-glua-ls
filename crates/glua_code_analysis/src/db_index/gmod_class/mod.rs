@@ -4,7 +4,7 @@ use glua_parser::LuaSyntaxId;
 use rowan::TextSize;
 
 use super::LuaIndex;
-use crate::{FileId, LuaTypeDeclId};
+use crate::{FileId, LuaTypeDeclId, db_index::op_log, db_index::read_set::WriteKey};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GmodScriptedClassCallKind {
@@ -299,6 +299,25 @@ impl GmodScriptedClassFileMetadata {
         })
     }
 
+    fn calls_by_kind(
+        &self,
+        kind: GmodScriptedClassCallKind,
+    ) -> &Vec<GmodScriptedClassCallMetadata> {
+        match kind {
+            GmodScriptedClassCallKind::DefineBaseClass => &self.define_baseclass_calls,
+            GmodScriptedClassCallKind::DeriveGamemode => &self.derive_gamemode_calls,
+            GmodScriptedClassCallKind::AccessorFunc => &self.accessor_func_calls,
+            GmodScriptedClassCallKind::NetworkVar => &self.network_var_calls,
+            GmodScriptedClassCallKind::NetworkVarElement => &self.network_var_element_calls,
+            GmodScriptedClassCallKind::ScriptedEntRegister => &self.scripted_ent_register_calls,
+            GmodScriptedClassCallKind::VguiRegister => &self.vgui_register_calls,
+            GmodScriptedClassCallKind::VguiRegisterFile => &self.vgui_register_file_calls,
+            GmodScriptedClassCallKind::VguiRegisterTable => &self.vgui_register_table_calls,
+            GmodScriptedClassCallKind::DermaDefineControl => &self.derma_define_control_calls,
+            GmodScriptedClassCallKind::DermaDefineSkin => &self.derma_define_skin_calls,
+        }
+    }
+
     fn calls_by_kind_mut(
         &mut self,
         kind: GmodScriptedClassCallKind,
@@ -319,7 +338,7 @@ impl GmodScriptedClassFileMetadata {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct GmodClassMetadataIndex {
     file_metadata: HashMap<FileId, GmodScriptedClassFileMetadata>,
     vgui_panels: HashMap<String, Vec<VguiPanelDefinition>>,
@@ -574,12 +593,65 @@ impl GmodClassMetadataIndex {
         self.recompute_vgui_panel_parent_chains();
     }
 
+    /// The name-keyed cache slots (`vgui_panels`/`derma_skins`) a call write
+    /// touches, as write keys — name-keyed readers stale only on a same-name
+    /// write, not on every `add_call`.
+    fn call_cache_keys(
+        kind: GmodScriptedClassCallKind,
+        call_metadata: &GmodScriptedClassCallMetadata,
+    ) -> Vec<WriteKey> {
+        let mut keys = Vec::new();
+        if matches!(
+            kind,
+            GmodScriptedClassCallKind::VguiRegister | GmodScriptedClassCallKind::DermaDefineControl
+        ) && let Some((panel_name, _)) = Self::maybe_extract_vgui_panel(kind, call_metadata)
+        {
+            keys.push(WriteKey::GmodMeta(panel_name.into()));
+        }
+        if kind == GmodScriptedClassCallKind::DermaDefineSkin
+            && let Some(skin_name) = Self::extract_non_empty_string_arg(
+                call_metadata,
+                call_metadata.derma_skin_define_arg_idx(),
+            )
+        {
+            keys.push(WriteKey::GmodMeta(skin_name.into()));
+        }
+        keys
+    }
+
     pub fn add_call(
         &mut self,
         file_id: FileId,
         kind: GmodScriptedClassCallKind,
         call_metadata: GmodScriptedClassCallMetadata,
     ) {
+        if op_log::recording() {
+            let metadata = call_metadata.clone();
+            let mut keys = vec![WriteKey::FileScoped(file_id)];
+            keys.extend(Self::call_cache_keys(kind, &call_metadata));
+            // Re-adding a call site replaces the previous one's cache entries
+            // — its names are written slots too.
+            if let Some(existing) = self
+                .file_metadata
+                .get(&file_id)
+                .map(|m| m.calls_by_kind(kind))
+                .and_then(|calls| {
+                    calls
+                        .iter()
+                        .find(|call| call.syntax_id == call_metadata.syntax_id)
+                })
+            {
+                keys.extend(Self::call_cache_keys(kind, existing));
+            }
+            op_log::push(
+                op_log::Domain::GmodClass,
+                keys.into_boxed_slice(),
+                move |db| {
+                    db.get_gmod_class_metadata_index_mut()
+                        .add_call(file_id, kind, metadata)
+                },
+            );
+        }
         {
             let calls = self
                 .file_metadata
@@ -611,6 +683,17 @@ impl GmodClassMetadataIndex {
     }
 
     pub fn add_vgui_parent_call(&mut self, file_id: FileId, call: GmodVguiParentCallMetadata) {
+        if op_log::recording() {
+            let replay = call.clone();
+            op_log::push(
+                op_log::Domain::GmodClass,
+                Box::new([WriteKey::FileScoped(file_id)]),
+                move |db| {
+                    db.get_gmod_class_metadata_index_mut()
+                        .add_vgui_parent_call(file_id, replay)
+                },
+            );
+        }
         let calls = &mut self
             .file_metadata
             .entry(file_id)
@@ -658,6 +741,7 @@ impl GmodClassMetadataIndex {
     }
 
     pub fn has_annotated_vgui_parent_calls(&self, file_id: FileId) -> bool {
+        crate::db_index::read_set::record_file_scoped(&file_id);
         self.file_metadata.get(&file_id).is_some_and(|metadata| {
             metadata
                 .vgui_parent_calls
@@ -678,6 +762,7 @@ impl GmodClassMetadataIndex {
     }
 
     pub fn get_vgui_parent_calls(&self, file_id: &FileId) -> &[GmodVguiParentCallMetadata] {
+        crate::db_index::read_set::record_file_scoped(file_id);
         self.file_metadata
             .get(file_id)
             .map(|metadata| metadata.vgui_parent_calls.as_slice())
@@ -726,12 +811,14 @@ impl GmodClassMetadataIndex {
         &self,
         child_type_id: &LuaTypeDeclId,
     ) -> Option<&[LuaTypeDeclId]> {
+        crate::db_index::read_set::record_type_decl(child_type_id);
         self.vgui_panel_parent_chains
             .get(child_type_id)
             .map(Vec::as_slice)
     }
 
     pub fn vgui_panel_parent_chain_is_complete(&self, child_type_id: &LuaTypeDeclId) -> bool {
+        crate::db_index::read_set::record_type_decl(child_type_id);
         !self
             .incomplete_vgui_panel_parent_chains
             .contains(child_type_id)
@@ -792,6 +879,7 @@ impl GmodClassMetadataIndex {
     /// The files whose removal is still holding their children's chains
     /// incomplete.
     pub fn pending_vgui_parent_relation_file_ids(&self) -> Vec<FileId> {
+        op_log::note_untracked_read(op_log::UntrackedDomain::GmodClass);
         let mut file_ids = self
             .pending_vgui_parent_relation_files
             .keys()
@@ -802,6 +890,7 @@ impl GmodClassMetadataIndex {
     }
 
     pub fn get_file_metadata(&self, file_id: &FileId) -> Option<&GmodScriptedClassFileMetadata> {
+        crate::db_index::read_set::record_file_scoped(file_id);
         self.file_metadata.get(file_id)
     }
 
@@ -812,6 +901,7 @@ impl GmodClassMetadataIndex {
     pub fn iter_file_metadata(
         &self,
     ) -> impl Iterator<Item = (&FileId, &GmodScriptedClassFileMetadata)> {
+        op_log::note_untracked_read(op_log::UntrackedDomain::GmodClass);
         self.file_metadata.iter()
     }
 
@@ -819,6 +909,7 @@ impl GmodClassMetadataIndex {
         &self,
         name: &str,
     ) -> Vec<(FileId, &GmodScriptedClassCallMetadata)> {
+        crate::db_index::read_set::record_gmod_meta(&name.into());
         if name.trim().is_empty() {
             return Vec::new();
         }
@@ -851,6 +942,7 @@ impl GmodClassMetadataIndex {
         &self,
         name: &str,
     ) -> Vec<(FileId, &GmodScriptedClassCallMetadata)> {
+        crate::db_index::read_set::record_gmod_meta(&name.into());
         if name.trim().is_empty() {
             return Vec::new();
         }
@@ -876,6 +968,7 @@ impl GmodClassMetadataIndex {
     }
 
     pub fn get_vgui_panel_base(&self, name: &str) -> Option<Option<String>> {
+        crate::db_index::read_set::record_gmod_meta(&name.into());
         self.vgui_panels.get(name).map(|definitions| {
             definitions
                 .iter()

@@ -58,6 +58,24 @@ impl InferCacheManager {
         )
     }
 
+    /// The file's cache without creating it — worker seeding clones only
+    /// what the serial walk would have found already present.
+    pub fn peek_infer_cache(&self, file_id: FileId) -> Option<&crate::LuaInferCache> {
+        self.infer_map.get(&file_id)
+    }
+
+    /// An empty manager whose visibility flags match this one's, for worker
+    /// threads that walk a file against a forked index. `get_infer_cache` on
+    /// it builds the same `LuaInferCache::new` the shared manager would.
+    pub fn worker_shadow(&self) -> Self {
+        InferCacheManager {
+            infer_map: FxHashMap::default(),
+            current_phase: self.current_phase,
+            dynamic_fields_visible: self.dynamic_fields_visible,
+            call_site_params_visible: self.call_site_params_visible,
+        }
+    }
+
     /// Called once the dynamic-field index has been populated for this batch.
     /// Until then inference must not read it — see [`crate::CacheOptions`].
     pub fn set_dynamic_fields_visible(&mut self) {
@@ -187,14 +205,6 @@ impl InferCacheManager {
         for file_id in file_ids {
             if let Some(infer_cache) = self.infer_map.get_mut(file_id) {
                 infer_cache.clear_deferred_inference_results();
-            }
-        }
-    }
-
-    pub fn clear_files_flow_results(&mut self, file_ids: &FxHashSet<FileId>) {
-        for file_id in file_ids {
-            if let Some(infer_cache) = self.infer_map.get_mut(file_id) {
-                infer_cache.clear_flow_results();
             }
         }
     }

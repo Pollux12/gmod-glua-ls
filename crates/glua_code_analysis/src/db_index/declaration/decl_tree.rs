@@ -8,7 +8,7 @@ use rowan::{TextRange, TextSize};
 use scope::{LuaScope, LuaScopeId, LuaScopeKind, ScopeOrDeclId};
 use smol_str::SmolStr;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LuaDeclarationTree {
     file_id: FileId,
     decls: FxHashMap<LuaDeclId, LuaDecl>,
