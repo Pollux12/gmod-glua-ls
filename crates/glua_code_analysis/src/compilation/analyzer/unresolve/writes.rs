@@ -24,8 +24,6 @@
 
 use std::collections::VecDeque;
 
-use rustc_hash::FxHashMap;
-
 use crate::{
     DbIndex,
     compilation::analyzer::infer_cache_manager::InferCacheManager,
@@ -48,8 +46,9 @@ pub struct ResolveWrites {
     writes: VecDeque<DeferredWrite>,
     /// The ordinal of the first queued write to each slot. Only the first
     /// matters for the intra-item check — any read stamped later may have
-    /// needed that write's value.
-    first_push: FxHashMap<WriteKey, u64>,
+    /// needed that write's value. Most attempts touch a handful of slots, so
+    /// a linear scan stays cheaper than a hash map's build and teardown.
+    first_push: Vec<(WriteKey, u64)>,
 }
 
 impl ResolveWrites {
@@ -59,9 +58,10 @@ impl ResolveWrites {
 
     #[inline]
     fn note_key(&mut self, key: WriteKey) {
-        self.first_push
-            .entry(key)
-            .or_insert_with(read_set::next_seq);
+        if self.first_push.iter().any(|(existing, _)| *existing == key) {
+            return;
+        }
+        self.first_push.push((key, read_set::next_write_seq()));
     }
 
     /// Defers one index mutation against `key`'s slot. The closure runs at

@@ -1352,6 +1352,27 @@ pub struct LuaTypeIndex {
     support_dependents: HashMap<LuaInferenceNodeId, HashSet<FileId>>,
     support_file_dependents: HashMap<FileId, HashSet<FileId>>,
     derived_state_dirty: bool,
+    /// Write epochs for the file-keyed side maps (`file_namespace`,
+    /// `file_using_namespace`, `file_types`) — `FileScopedKind::TypeFile`.
+    pub(crate) file_write_epochs: read_set::KeyedEpochs<FileId>,
+    /// Write epochs for `decl_write_claims`, stamped per claimed decl so a
+    /// mid-fixpoint claim write stales only readers of that claim.
+    pub(crate) claim_write_epochs: read_set::KeyedEpochs<LuaDeclId>,
+    /// Write epochs for the `---` type declarations (`full_name_type_map`,
+    /// supers, generic params, decl binds), stamped per decl so a decl write
+    /// stales only readers of that decl — `type_decl_scan` still uses the
+    /// domain counter since a scan observes the whole map.
+    pub(crate) decl_key_epochs: read_set::KeyedEpochs<(LuaTypeDeclId, read_set::TypeDeclKind)>,
+    /// Write epochs for `type_bound_decls`, stamped per (bound-to type,
+    /// bound decl's file) — the only caller filters the set by the class's
+    /// own files, so a bind elsewhere cannot move its result.
+    pub(crate) bound_decl_epochs: read_set::KeyedEpochs<(LuaTypeDeclId, FileId)>,
+    /// Write epochs for `definition_facts`, stamped per definition.
+    pub(crate) fact_epochs: read_set::KeyedEpochs<LuaDefinitionId>,
+    /// Domain counter for type-declaration writes (`full_name_type_map`,
+    /// supers, generic params) — the `type_decl_scan` whole-map read still
+    /// answers through this since a scan observes every decl.
+    pub(crate) type_decl_writes: u64,
 }
 
 impl Default for LuaTypeIndex {
@@ -1394,6 +1415,12 @@ impl LuaTypeIndex {
             support_dependents: HashMap::default(),
             support_file_dependents: HashMap::default(),
             derived_state_dirty: false,
+            file_write_epochs: read_set::KeyedEpochs::default(),
+            claim_write_epochs: read_set::KeyedEpochs::default(),
+            decl_key_epochs: read_set::KeyedEpochs::default(),
+            bound_decl_epochs: read_set::KeyedEpochs::default(),
+            fact_epochs: read_set::KeyedEpochs::default(),
+            type_decl_writes: 0,
         }
     }
 
@@ -1410,10 +1437,15 @@ impl LuaTypeIndex {
             );
         }
         self.file_namespace.insert(file_id, namespace);
+        self.file_write_epochs.note(file_id);
     }
 
     pub fn get_file_namespace(&self, file_id: &FileId) -> Option<&String> {
-        read_set::record_file_scoped(file_id);
+        read_set::record_file_scoped(
+            &self.file_write_epochs,
+            file_id,
+            read_set::FileScopedKind::TypeFile,
+        );
         self.file_namespace.get(file_id)
     }
 
@@ -1433,10 +1465,15 @@ impl LuaTypeIndex {
             .entry(file_id)
             .or_default()
             .push(namespace);
+        self.file_write_epochs.note(file_id);
     }
 
     pub fn get_file_using_namespace(&self, file_id: &FileId) -> Option<&Vec<String>> {
-        read_set::record_file_scoped(file_id);
+        read_set::record_file_scoped(
+            &self.file_write_epochs,
+            file_id,
+            read_set::FileScopedKind::TypeFile,
+        );
         self.file_using_namespace.get(file_id)
     }
 
@@ -1456,6 +1493,8 @@ impl LuaTypeIndex {
         }
         let id = type_decl.get_id();
         self.file_types.entry(file_id).or_default().push(id.clone());
+        self.decl_key_epochs
+            .note((id.clone(), read_set::TypeDeclKind::Object));
 
         if let Some(old_decl) = self.full_name_type_map.get_mut(&id) {
             for location in type_decl.get_locations() {
@@ -1464,6 +1503,8 @@ impl LuaTypeIndex {
         } else {
             self.full_name_type_map.insert(id, type_decl);
         }
+        self.note_type_decl_write();
+        self.file_write_epochs.note(file_id);
     }
 
     pub fn add_type_decl_location(
@@ -1493,13 +1534,21 @@ impl LuaTypeIndex {
                 .entry(file_id)
                 .or_default()
                 .push(decl_id.clone());
+            self.note_type_decl_write();
+            self.decl_key_epochs
+                .note((decl_id.clone(), read_set::TypeDeclKind::Object));
+            self.file_write_epochs.note(file_id);
         }
     }
 
     pub fn find_type_decl(&self, file_id: FileId, name: &str) -> Option<&LuaTypeDecl> {
         if let Some(ns) = self.get_file_namespace(&file_id) {
             let full_name = LuaTypeDeclId::global(&format!("{}.{}", ns, name));
-            read_set::record_type_decl(&full_name);
+            read_set::record_type_decl(
+                &self.decl_key_epochs,
+                &full_name,
+                read_set::TypeDeclKind::Object,
+            );
             if let Some(decl) = self.full_name_type_map.get(&full_name) {
                 return Some(decl);
             }
@@ -1507,7 +1556,11 @@ impl LuaTypeIndex {
         if let Some(usings) = self.get_file_using_namespace(&file_id) {
             for ns in usings {
                 let full_name = LuaTypeDeclId::global(&format!("{}.{}", ns, name));
-                read_set::record_type_decl(&full_name);
+                read_set::record_type_decl(
+                    &self.decl_key_epochs,
+                    &full_name,
+                    read_set::TypeDeclKind::Object,
+                );
                 if let Some(decl) = self.full_name_type_map.get(&full_name) {
                     return Some(decl);
                 }
@@ -1515,13 +1568,21 @@ impl LuaTypeIndex {
         }
 
         let local_id = LuaTypeDeclId::local(file_id, name);
-        read_set::record_type_decl(&local_id);
+        read_set::record_type_decl(
+            &self.decl_key_epochs,
+            &local_id,
+            read_set::TypeDeclKind::Object,
+        );
         if let Some(decl) = self.full_name_type_map.get(&local_id) {
             return Some(decl);
         }
 
         let global_id = LuaTypeDeclId::global(name);
-        read_set::record_type_decl(&global_id);
+        read_set::record_type_decl(
+            &self.decl_key_epochs,
+            &global_id,
+            read_set::TypeDeclKind::Object,
+        );
         self.full_name_type_map.get(&global_id)
     }
 
@@ -1605,11 +1666,18 @@ impl LuaTypeIndex {
                 },
             );
         }
-        self.generic_params.insert(decl_id, params);
+        self.generic_params.insert(decl_id.clone(), params);
+        self.note_type_decl_write();
+        self.decl_key_epochs
+            .note((decl_id.clone(), read_set::TypeDeclKind::GenericParams));
     }
 
     pub fn get_generic_params(&self, decl_id: &LuaTypeDeclId) -> Option<&Vec<GenericParam>> {
-        read_set::record_type_decl(decl_id);
+        read_set::record_type_decl(
+            &self.decl_key_epochs,
+            decl_id,
+            read_set::TypeDeclKind::GenericParams,
+        );
         self.generic_params.get(decl_id)
     }
 
@@ -1660,12 +1728,18 @@ impl LuaTypeIndex {
             .or_default()
             .push((decl_id.clone(), entry));
         if let Some(base_id) = base_id {
-            let children = self.sub_types.entry(base_id).or_default();
+            let children = self.sub_types.entry(base_id.clone()).or_default();
             if !children.contains(&decl_id) {
-                children.push(decl_id);
+                children.push(decl_id.clone());
             }
+            self.decl_key_epochs
+                .note((base_id.clone(), read_set::TypeDeclKind::SubTypes));
         }
+        self.decl_key_epochs
+            .note((decl_id.clone(), read_set::TypeDeclKind::Supers));
         self.bump_super_write_revision();
+        self.note_type_decl_write();
+        self.file_write_epochs.note(file_id);
     }
 
     fn has_super_type_at_source(
@@ -1675,7 +1749,11 @@ impl LuaTypeIndex {
         source_range: TextRange,
         super_type: &LuaType,
     ) -> bool {
-        read_set::record_type_decl(decl_id);
+        read_set::record_type_decl(
+            &self.decl_key_epochs,
+            decl_id,
+            read_set::TypeDeclKind::Supers,
+        );
         self.supers.get(decl_id).is_some_and(|supers| {
             supers.iter().any(|entry| {
                 entry.file_id == file_id
@@ -1713,7 +1791,11 @@ impl LuaTypeIndex {
         &self,
         decl_id: &LuaTypeDeclId,
     ) -> Option<impl Iterator<Item = &LuaType> + '_> {
-        read_set::record_type_decl(decl_id);
+        read_set::record_type_decl(
+            &self.decl_key_epochs,
+            decl_id,
+            read_set::TypeDeclKind::Supers,
+        );
         self.supers.get(decl_id).map(|supers| {
             supers
                 .iter()
@@ -1731,14 +1813,31 @@ impl LuaTypeIndex {
         &self,
         decl_id: &LuaTypeDeclId,
     ) -> Option<&[InFiled<LuaSuperType>]> {
-        read_set::record_type_decl(decl_id);
+        read_set::record_type_decl(
+            &self.decl_key_epochs,
+            decl_id,
+            read_set::TypeDeclKind::Supers,
+        );
         self.supers.get(decl_id).map(Vec::as_slice)
     }
 
-    /// The declarations whose stored type is a direct reference to `type_id`.
-    pub fn decls_bound_to_type(&self, type_id: &LuaTypeDeclId) -> Option<&HashSet<LuaDeclId>> {
-        read_set::record_type_decl(type_id);
-        self.type_bound_decls.get(type_id)
+    /// The declarations in `files` whose stored type is a direct reference to
+    /// `type_id`. Only the files the caller can observe get read stamps — a
+    /// bind in any other file cannot move the filtered result.
+    pub fn decls_bound_to_type<'a>(
+        &'a self,
+        type_id: &'a LuaTypeDeclId,
+        files: &'a HashSet<FileId>,
+    ) -> impl Iterator<Item = LuaDeclId> + 'a {
+        for file_id in files {
+            read_set::record_bound_decl(&self.bound_decl_epochs, type_id, *file_id);
+        }
+        self.type_bound_decls
+            .get(type_id)
+            .into_iter()
+            .flatten()
+            .filter(move |decl_id| files.contains(&decl_id.file_id))
+            .copied()
     }
 
     fn bind_decl_to_type(&mut self, decl_id: LuaDeclId, type_id: LuaTypeDeclId) {
@@ -1748,9 +1847,12 @@ impl LuaTypeIndex {
         self.unbind_decl(&decl_id);
         self.decl_type_binds.insert(decl_id, type_id.clone());
         self.type_bound_decls
-            .entry(type_id)
+            .entry(type_id.clone())
             .or_default()
             .insert(decl_id);
+        self.bound_decl_epochs
+            .note((type_id.clone(), decl_id.file_id));
+        self.note_type_decl_write();
     }
 
     fn unbind_decl(&mut self, decl_id: &LuaDeclId) {
@@ -1763,6 +1865,8 @@ impl LuaTypeIndex {
                 self.type_bound_decls.remove(&type_id);
             }
         }
+        self.bound_decl_epochs.note((type_id, decl_id.file_id));
+        self.note_type_decl_write();
     }
 
     /// Counts the super-type writes so far. Compare it across an operation to
@@ -1774,6 +1878,13 @@ impl LuaTypeIndex {
     fn bump_super_write_revision(&mut self) {
         self.super_write_revision = self.super_write_revision.wrapping_add(1);
         self.cached_direct_subtype_members = None;
+    }
+
+    /// Domain-counter bump for `---` type-declaration writes — readers
+    /// record `type_decls`/`type_decl_scan` without per-key clocks, so any
+    /// write in the domain stales them (see `untracked_reads_changed`).
+    fn note_type_decl_write(&mut self) {
+        self.type_decl_writes = self.type_decl_writes.wrapping_add(1);
     }
 
     pub(crate) fn direct_subtype_members_cache(
@@ -1795,7 +1906,11 @@ impl LuaTypeIndex {
     /// Get all direct subclasses of a given type
     /// Returns a vector of type declarations that directly inherit from the given type
     pub fn get_sub_types(&self, decl_id: &LuaTypeDeclId) -> Vec<&LuaTypeDecl> {
-        read_set::record_type_decl(decl_id);
+        read_set::record_type_decl(
+            &self.decl_key_epochs,
+            decl_id,
+            read_set::TypeDeclKind::SubTypes,
+        );
         let Some(children) = self.sub_types.get(decl_id) else {
             return Vec::new();
         };
@@ -1837,7 +1952,11 @@ impl LuaTypeIndex {
     }
 
     pub fn get_type_decl(&self, decl_id: &LuaTypeDeclId) -> Option<&LuaTypeDecl> {
-        read_set::record_type_decl(decl_id);
+        read_set::record_type_decl(
+            &self.decl_key_epochs,
+            decl_id,
+            read_set::TypeDeclKind::Object,
+        );
         self.full_name_type_map.get(decl_id)
     }
 
@@ -1883,7 +2002,16 @@ impl LuaTypeIndex {
 
     pub fn get_type_decl_mut(&mut self, decl_id: &LuaTypeDeclId) -> Option<&mut LuaTypeDecl> {
         op_log::note_mut_ref(op_log::MutRef::TypeDecl(decl_id.clone()));
-        read_set::record_type_decl(decl_id);
+        read_set::record_type_decl(
+            &self.decl_key_epochs,
+            decl_id,
+            read_set::TypeDeclKind::Object,
+        );
+        if self.full_name_type_map.contains_key(decl_id) {
+            self.note_type_decl_write();
+            self.decl_key_epochs
+                .note((decl_id.clone(), read_set::TypeDeclKind::Object));
+        }
         self.full_name_type_map.get_mut(decl_id)
     }
 
@@ -1893,6 +2021,9 @@ impl LuaTypeIndex {
     /// merge thread.
     pub(crate) fn replace_type_decl_object(&mut self, decl_id: &LuaTypeDeclId, decl: LuaTypeDecl) {
         self.full_name_type_map.insert(decl_id.clone(), decl);
+        self.note_type_decl_write();
+        self.decl_key_epochs
+            .note((decl_id.clone(), read_set::TypeDeclKind::Object));
     }
 
     /// Stores `cache` for `owner`, keeping any type already bound there unless
@@ -1932,7 +2063,7 @@ impl LuaTypeIndex {
     /// The write that seeded `decl_id`'s type: its source position, and whether
     /// its right-hand side read through a call or index.
     pub fn decl_write_claim(&self, decl_id: &LuaDeclId) -> Option<(TextSize, bool)> {
-        read_set::record_decl_misc(decl_id);
+        read_set::record_decl_claim(&self.claim_write_epochs, decl_id);
         self.decl_write_claims.get(decl_id).copied()
     }
 
@@ -1955,8 +2086,13 @@ impl LuaTypeIndex {
                 },
             );
         }
-        self.decl_write_claims
-            .insert(decl_id, (position, reads_through_call_or_index));
+        if self
+            .decl_write_claims
+            .insert(decl_id, (position, reads_through_call_or_index))
+            != Some((position, reads_through_call_or_index))
+        {
+            self.claim_write_epochs.note(decl_id.clone());
+        }
     }
 
     fn commit_type_cache(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
@@ -2273,7 +2409,7 @@ impl LuaTypeIndex {
     }
 
     pub fn get_definition_fact(&self, definition: &LuaDefinitionId) -> Option<&LuaTypeFact> {
-        read_set::record_definition_fact(definition);
+        read_set::record_definition_fact(&self.fact_epochs, definition);
         self.definition_facts.get(definition)
     }
 
@@ -2397,8 +2533,11 @@ impl LuaTypeIndex {
         fact: LuaTypeFact,
     ) -> FileId {
         let file_id = definition.file_id();
-        self.definition_facts.insert(definition, fact);
-        self.refresh_definition_fact_refs(&definition);
+        if self.definition_facts.get(&definition) != Some(&fact) {
+            self.definition_facts.insert(definition, fact);
+            self.refresh_definition_fact_refs(&definition);
+            self.fact_epochs.note(definition.clone());
+        }
         file_id
     }
 
@@ -2794,6 +2933,7 @@ impl LuaTypeIndex {
         fact_updates.sort_by(|left, right| left.0.stable_cmp(&right.0));
         for (definition, fact) in fact_updates {
             self.definition_facts.insert(definition, fact);
+            self.fact_epochs.note(definition.clone());
         }
         dirty
     }
@@ -3033,6 +3173,8 @@ impl LuaIndex for LuaTypeIndex {
                 if let Some(at) = supers.iter().position(|existing| existing == &entry) {
                     supers.remove(at);
                     pruned_edges += 1;
+                    self.decl_key_epochs
+                        .note((child_id.clone(), read_set::TypeDeclKind::Supers));
                 }
                 if supers.is_empty() {
                     self.supers.remove(&child_id);
@@ -3059,10 +3201,13 @@ impl LuaIndex for LuaTypeIndex {
                         self.sub_types.remove(&base_id);
                     }
                 }
+                self.decl_key_epochs
+                    .note((base_id.clone(), read_set::TypeDeclKind::SubTypes));
             }
             // Pruning dropped an edge the cached map may have been derived
             // from; the next read rebuilds it lazily.
             self.bump_super_write_revision();
+            self.note_type_decl_write();
         }
 
         let mut dropped_definitions = Vec::new();
@@ -3076,6 +3221,7 @@ impl LuaIndex for LuaTypeIndex {
         });
         for definition in dropped_definitions {
             self.drop_definition_fact_refs(&definition);
+            self.fact_epochs.note(definition.clone());
         }
 
         if !changed_files.is_empty() {
@@ -3085,6 +3231,22 @@ impl LuaIndex for LuaTypeIndex {
     }
 
     fn clear(&mut self) {
+        for file_id in self
+            .file_types
+            .keys()
+            .chain(self.file_namespace.keys())
+            .chain(self.file_using_namespace.keys())
+        {
+            self.file_write_epochs.note(*file_id);
+        }
+        self.note_type_decl_write();
+        // Resetting the keyed stores stales every recorded read of a removed
+        // slot (a recorded epoch is nonzero; `epoch` then reads `0`) — a
+        // rebuilt identical map lands on the same ticks, which is the same
+        // answer.
+        self.decl_key_epochs.clear();
+        self.bound_decl_epochs.clear();
+        self.fact_epochs.clear();
         self.file_namespace.clear();
         self.file_using_namespace.clear();
         self.file_types.clear();
@@ -3104,6 +3266,9 @@ impl LuaIndex for LuaTypeIndex {
         self.fact_metadata.clear();
         self.fact_ref_files.clear();
         self.fact_refs_by_file.clear();
+        for decl_id in self.decl_write_claims.keys() {
+            self.claim_write_epochs.note(*decl_id);
+        }
         self.decl_write_claims.clear();
         self.decl_type_binds.clear();
         self.type_bound_decls.clear();
@@ -3123,6 +3288,7 @@ impl LuaTypeIndex {
         self.clear_settled_reads(file_id);
         self.file_namespace.remove(&file_id);
         self.file_using_namespace.remove(&file_id);
+        self.file_write_epochs.note(file_id);
         if let Some(type_id_list) = self.file_types.remove(&file_id) {
             for id in type_id_list {
                 let mut remove_type = false;
@@ -3143,13 +3309,24 @@ impl LuaTypeIndex {
                 if remove_type {
                     self.generic_params.remove(&id);
                 }
+                self.note_type_decl_write();
+                for kind in [
+                    read_set::TypeDeclKind::Object,
+                    read_set::TypeDeclKind::Supers,
+                    read_set::TypeDeclKind::SubTypes,
+                    read_set::TypeDeclKind::GenericParams,
+                ] {
+                    self.decl_key_epochs.note((id.clone(), kind));
+                }
             }
         }
 
         if let Some(type_owners) = self.in_filed_type_owner.remove(&file_id) {
             for type_owner in type_owners {
                 if let LuaTypeOwner::Decl(decl_id) = &type_owner {
-                    self.decl_write_claims.remove(decl_id);
+                    if self.decl_write_claims.remove(decl_id).is_some() {
+                        self.claim_write_epochs.note(*decl_id);
+                    }
                     self.unbind_decl(decl_id);
                 }
                 if self.types.remove(&type_owner).is_some() {

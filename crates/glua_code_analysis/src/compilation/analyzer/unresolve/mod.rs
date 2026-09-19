@@ -171,6 +171,14 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
         let mut provisional = Vec::new();
         let mut late_resolved_decls = rustc_hash::FxHashSet::default();
         let mut settled_parent_closures = Vec::new();
+        // What each surviving item's last attempt read. Items parked by
+        // `try_resolve` keep their records across loops, so an item whose
+        // inputs never moved is not re-derived against identical state. The map
+        // lives on the context: an item retained into a later pipeline keeps
+        // the record of its last attempt, and `settle_floored_fixpoint` (which
+        // settles through the same `try_resolve`) reads and updates the same
+        // entries across the settled tail's rounds.
+        let mut wave_read_records = std::mem::take(&mut context.unresolve_read_records);
         while !reason_resolve.is_empty() {
             let iter_start = log_enabled.then(std::time::Instant::now);
 
@@ -186,7 +194,7 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
                     &mut provisional,
                     &mut late_resolved_decls,
                     &mut settled_parent_closures,
-                    None,
+                    Some(&mut wave_read_records),
                 )
             });
             if let Some(resolve_start) = resolve_start {
@@ -240,7 +248,17 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             }
 
             if loop_count == 0 {
+                // Force answers failures with floors: a record captured under
+                // the non-force attempt does not describe what a force
+                // attempt reads, so parking must only consult post-force
+                // records. A later pipeline re-enters here already forcing,
+                // and the records its loop just wrote are post-transition —
+                // the clear runs only on the transition itself.
+                let was_forcing = infer_manager.current_phase().is_force();
                 infer_manager.set_force();
+                if !was_forcing {
+                    wave_read_records.clear();
+                }
             }
 
             let reason_start = log_enabled.then(std::time::Instant::now);
@@ -278,6 +296,7 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
                 &mut provisional,
                 &mut late_resolved_decls,
                 &mut settled_parent_closures,
+                &mut wave_read_records,
                 log_enabled,
             );
         }
@@ -304,6 +323,7 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
                 &mut infer_manager,
                 &mut reason_resolve,
                 &changed_signatures,
+                &mut wave_read_records,
                 log_enabled,
             );
             // The requeued wave can defer contributions of its own. Applying
@@ -353,6 +373,7 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
         // reuse cached inference results rather than recomputing from scratch
         // when no deferred resolution changed the indexes.
         context.infer_manager = infer_manager;
+        context.unresolve_read_records = wave_read_records;
     }
 }
 
@@ -360,10 +381,78 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
 /// just after it ran. Recording the epochs after the attempt keeps the item's
 /// own writes from marking it stale: only a *later* write to something it read
 /// requeues it.
-type FixpointReadRecord = crate::db_index::read_set::InferredReturnReadRecord;
+pub(crate) type FixpointReadRecord = crate::db_index::read_set::InferredReturnReadRecord;
 
 fn fixpoint_reads_are_stale(db: &DbIndex, record: &FixpointReadRecord) -> bool {
     record.is_stale(db)
+}
+
+/// Whether `record` watched everything that could change this item's next
+/// attempt. A fresh record replays the attempt it was captured from — the
+/// same speculation-validity rule the drain applies to worker outcomes — but
+/// only if the record actually covers what the item is waiting on.
+///
+/// Always-reached reasons name no dependency, so freshness plus a non-empty
+/// record decides. Dep-named reasons never park: their group's reach check
+/// already reads the live slot the item waits on, and a transition that
+/// lands without a content bump is invisible to the record's epochs.
+fn record_covers_reason(reason: &InferFailReason, record: &FixpointReadRecord) -> bool {
+    let reads = &record.reads;
+    match reason {
+        // Reasons naming no dependency park only while everything the
+        // attempt ever read is unmoved — but that verdict is only worth
+        // trusting when the record consulted mutable state at all. An
+        // empty set can never report stale, so parking on it either wastes
+        // nothing (the failure was deterministic) or buries a miss that
+        // recorded nothing, and only the second is visible.
+        InferFailReason::None
+        | InferFailReason::FieldNotFound
+        | InferFailReason::UnResolveOperatorCall
+        | InferFailReason::UnResolveIterTemplate
+        | InferFailReason::RecursiveInfer => !reads.is_empty(),
+        // The group itself is the dependency: it only drains once the named
+        // slot is readable, so every item inside must attempt — a parked
+        // item would sit past the landing it was waiting for. The readable
+        // transition can also land without a content bump (a held return
+        // re-derived to the same docs), which the record's epoch check
+        // cannot see, while `check_reach_reason` reads the live flag.
+        InferFailReason::UnResolveDeclType(_)
+        | InferFailReason::UnResolveMemberType(_)
+        | InferFailReason::UnResolveSignatureReturn(_)
+        | InferFailReason::UnResolveModuleExport(_)
+        | InferFailReason::UnResolveTypeDecl(_)
+        | InferFailReason::UnResolveExpr(_)
+        | InferFailReason::UnSealedDynamicFields => false,
+    }
+}
+
+/// Whether an item that fails with `reason` again under the force phase is
+/// retained for another look rather than retired. Parking an item whose
+/// repeated failure the drain would drop keeps it queued past the point the
+/// serial code retires it — `retain_unresolve` cannot tell the difference.
+fn force_retains_failure(reason: &InferFailReason, unresolve: &UnResolve) -> bool {
+    match reason {
+        InferFailReason::None
+        | InferFailReason::RecursiveInfer
+        | InferFailReason::UnResolveOperatorCall => false,
+        InferFailReason::FieldNotFound => is_settled_member_attach(unresolve),
+        _ => true,
+    }
+}
+
+/// The `FieldNotFound` retain rule's member-attach half: a member that still
+/// names its index target carries a pending attach the settle tail services,
+/// so the force phase keeps it. Everything else that fails `FieldNotFound`
+/// under force is retired.
+fn is_settled_member_attach(unresolve: &UnResolve) -> bool {
+    matches!(
+    unresolve,
+    UnResolve::Member(member)
+        if member.prefix.is_some()
+            && glua_parser::LuaIndexExpr::can_cast(
+                member.member_id.get_syntax_id().get_kind()
+            )
+    )
 }
 
 /// Whether the settled special calls moved a novel fact since `baseline`.
@@ -391,12 +480,15 @@ pub(super) fn settle_floored_fixpoint(
     provisional: &mut Vec<UnResolve>,
     late_resolved_decls: &mut rustc_hash::FxHashSet<crate::LuaTypeOwner>,
     settled_parent_closures: &mut Vec<UnResolveParentClosureParams>,
+    // What each surviving item's last `try_resolve` attempt read, kept across
+    // calls: the settled tail runs this once per round, and a fresh map would
+    // read every parked item as unrecorded — and therefore stale — each time.
+    read_records: &mut FxHashMap<UnResolveIdentity, FixpointReadRecord>,
     log_enabled: bool,
 ) {
     let profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
     let mut round = 0usize;
     let mut fuse = super::common::FixpointFuse::new("settle_floored_fixpoint");
-    let mut read_records: FxHashMap<UnResolveIdentity, FixpointReadRecord> = FxHashMap::default();
     // Settled items whose reads proved unaffected by the last round's writes.
     // They rejoin the candidate pool every round: a later round can still move
     // something they read, and per-item epochs keep that check exact no matter
@@ -521,6 +613,7 @@ pub(super) fn settle_floored_fixpoint(
         // lets a settled answer move; what it held is kept, because a
         // re-derivation that fails (a self-recursive body reads its own
         // return) must leave the answer in place rather than nothing.
+        let _gate = Profile::cond_new("settle/gate", profile_enabled);
         let mut held_returns = Vec::new();
         for unresolve in pool {
             let stale = full_requeue
@@ -551,8 +644,12 @@ pub(super) fn settle_floored_fixpoint(
             parked.clear();
             break;
         }
+        drop(_gate);
+        let _clear = Profile::cond_new("settle/clear", profile_enabled);
         infer_manager.clear_for_settle(db);
+        drop(_clear);
         let attempted: usize = reason_resolve.values().map(Vec::len).sum();
+        let _resolve = Profile::cond_new("settle/resolve", profile_enabled);
         try_resolve(
             db,
             infer_manager,
@@ -563,12 +660,19 @@ pub(super) fn settle_floored_fixpoint(
             provisional,
             late_resolved_decls,
             settled_parent_closures,
-            Some(&mut read_records),
+            Some(&mut *read_records),
         );
+        drop(_resolve);
         for (signature_id, return_docs) in held_returns {
             if let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id)
                 && signature.resolve_return == crate::SignatureReturnStatus::UnResolve
             {
+                // The hold was a transient: the item never resolved, so the
+                // signature goes back to readable with its original docs.
+                // No write is signalled — bumping the epoch here would feed
+                // `moved` every round for sigs that never change, and the
+                // readers that observed `UnResolve` re-check the live flag
+                // through their dep-named reach gate, not through epochs.
                 signature.resolve_return = crate::SignatureReturnStatus::InferResolve;
                 signature.return_docs = return_docs;
             }
@@ -637,6 +741,7 @@ fn requeue_flushed_call_site_returns(
     infer_manager: &mut InferCacheManager,
     reason_resolve: &mut FxHashMap<InferFailReason, Vec<UnResolve>>,
     changed_signatures: &FxHashSet<LuaSignatureId>,
+    read_records: &mut FxHashMap<UnResolveIdentity, FixpointReadRecord>,
     log_enabled: bool,
 ) {
     let consumers = db
@@ -709,7 +814,7 @@ fn requeue_flushed_call_site_returns(
         &mut Vec::new(),
         &mut context.late_resolved_decls,
         &mut settled_parent_closures,
-        None,
+        Some(read_records),
     );
     for candidate in settled_parent_closures {
         context.add_settled_parent_closure_candidate(candidate);
@@ -980,6 +1085,38 @@ fn try_resolve(
                 continue;
             }
 
+            // An item whose recorded reads are still fresh repeats the attempt
+            // it was captured from — the same speculation-validity rule the
+            // drain applies to worker outcomes — so it rejoins its reason group
+            // without spending a speculate+drain pass on an identical failure.
+            // A record is only trusted for the phase it was captured under:
+            // the force phase answers failures with floors and retires the
+            // reasons `force_retains_failure` names, so a parked item there
+            // would survive an attempt the serial code was meant to retire.
+            // Dep-named reasons never park: their reach check already reads
+            // the live slot the group waits on, so a drained item always
+            // attempts (see `record_covers_reason`).
+            let force = infer_manager.current_phase().is_force();
+            let mut candidates: Vec<UnResolve> = Vec::new();
+            if let Some(records) = fixpoint_reads.as_deref() {
+                for unresolve in unresolves.drain(..) {
+                    let park = records
+                        .get(&unresolve_identity(&unresolve))
+                        .is_some_and(|record| {
+                            !fixpoint_reads_are_stale(db, record)
+                                && record_covers_reason(check_reason, record)
+                                && (!force || force_retains_failure(check_reason, &unresolve))
+                        });
+                    if park {
+                        retain_unresolve.push((unresolve, check_reason.clone()));
+                    } else {
+                        candidates.push(unresolve);
+                    }
+                }
+            } else {
+                candidates.append(unresolves);
+            }
+
             // Speculative compute: supported item kinds were attempted on
             // workers against the index state at this point, with their writes
             // deferred. The drain below replays each outcome in order; an item
@@ -987,14 +1124,14 @@ fn try_resolve(
             // read one of its own buffered writes — falls back to the live
             // attempt the serial drain would have run.
             let spec_start = profile_enabled.then(std::time::Instant::now);
-            let mut spec = spec::speculate(db, infer_manager, unresolves);
+            let mut spec = spec::speculate(db, infer_manager, &candidates);
             let spec_version = crate::db_index::read_set::InferenceReadVersion::capture(db);
             if let (Some(profile), Some(spec_start)) = (profile.as_mut(), spec_start) {
                 profile.spec_time += spec_start.elapsed();
-                profile.spec_items += spec.len();
+                profile.spec_items += spec.iter().flatten().count();
             }
 
-            for (spec_idx, mut unresolve) in unresolves.drain(..).enumerate() {
+            for (spec_idx, mut unresolve) in candidates.into_iter().enumerate() {
                 if let Some(profile) = profile.as_mut() {
                     profile.kind_counts[unresolve_kind_rank(&unresolve) as usize] += 1;
                 }
@@ -1014,7 +1151,7 @@ fn try_resolve(
                 // so the next round can skip items nothing written since has
                 // touched. The recorder nests with the return derivation's own
                 // arming rather than clobbering it.
-                let spec_outcome = spec.remove(&spec_idx).filter(|outcome| {
+                let spec_outcome = spec[spec_idx].take().filter(|outcome| {
                     let usable = !outcome.writes.self_conflicted(&outcome.reads)
                         && !spec_version.is_stale(db, &outcome.reads);
                     if let Some(profile) = profile.as_mut() {
@@ -1035,7 +1172,11 @@ fn try_resolve(
                         reads,
                         post_item,
                     } = outcome;
+                    let apply_start = profile_enabled.then(std::time::Instant::now);
                     writes.apply(db, infer_manager);
+                    if let (Some(profile), Some(start)) = (profile.as_mut(), apply_start) {
+                        profile.apply_time += start.elapsed();
+                    }
                     // Item-field mutations are part of the verdict too: the
                     // worker's item was a throwaway, so the cleared prefix or
                     // the queued settled-retry flag lands here.
@@ -1045,16 +1186,7 @@ fn try_resolve(
                     if let Some(records) = fixpoint_reads.as_mut() {
                         records.insert(
                             unresolve_identity(&unresolve),
-                            FixpointReadRecord {
-                                reads,
-                                type_epoch: db.get_type_index().type_writes(),
-                                return_epoch: db.get_signature_index().return_writes(),
-                                param_epoch: db.get_signature_index().param_writes(),
-                                module_epoch: db.get_module_index().module_writes(),
-                                special_epoch: db.get_flow_index().special_call_writes(),
-                                contrib_epoch: db.get_call_site_param_index().contrib_writes(),
-                                dynamic_epoch: db.get_dynamic_field_index().dynamic_writes(),
-                            },
+                            FixpointReadRecord::captured(db, reads),
                         );
                     }
                     result
@@ -1064,16 +1196,7 @@ fn try_resolve(
                     let reads = crate::db_index::read_set::disarm();
                     records.insert(
                         unresolve_identity(&unresolve),
-                        FixpointReadRecord {
-                            reads,
-                            type_epoch: db.get_type_index().type_writes(),
-                            return_epoch: db.get_signature_index().return_writes(),
-                            param_epoch: db.get_signature_index().param_writes(),
-                            module_epoch: db.get_module_index().module_writes(),
-                            special_epoch: db.get_flow_index().special_call_writes(),
-                            contrib_epoch: db.get_call_site_param_index().contrib_writes(),
-                            dynamic_epoch: db.get_dynamic_field_index().dynamic_writes(),
-                        },
+                        FixpointReadRecord::captured(db, reads),
                     );
                     result
                 } else {
@@ -1176,14 +1299,7 @@ fn try_resolve(
                         }
                     }
                     Err(InferFailReason::FieldNotFound) => {
-                        let settled_member_attach = matches!(
-                            &unresolve,
-                            UnResolve::Member(member)
-                                if member.prefix.is_some()
-                                    && glua_parser::LuaIndexExpr::can_cast(
-                                        member.member_id.get_syntax_id().get_kind()
-                                    )
-                        );
+                        let settled_member_attach = is_settled_member_attach(&unresolve);
                         if !cache.get_config().analysis_phase.is_force() || settled_member_attach {
                             retain_unresolve.push((unresolve, InferFailReason::FieldNotFound));
                         }
@@ -1285,6 +1401,7 @@ struct TryResolveProfile {
     spec_stale: usize,
     spec_conflict: usize,
     spec_time: Duration,
+    apply_time: Duration,
     kind_counts: [usize; 11],
 }
 
@@ -1351,12 +1468,13 @@ impl TryResolveProfile {
     fn log(&self, loop_count: usize) {
         if unresolve_profile_enabled() && self.spec_items != 0 {
             eprintln!(
-                "  [unres] loop {loop_count} spec: items={} applied={} stale={} conflict={} t={:>7.3}s kinds=[iter={} decl={} member={} module={} ret={} cparam={} cret={} cpparam={} tfield={} scall={} csite={}]",
+                "  [unres] loop {loop_count} spec: items={} applied={} stale={} conflict={} t={:>7.3}s apply_t={:>7.3}s kinds=[iter={} decl={} member={} module={} ret={} cparam={} cret={} cpparam={} tfield={} scall={} csite={}]",
                 self.spec_items,
                 self.spec_applied,
                 self.spec_stale,
                 self.spec_conflict,
                 self.spec_time.as_secs_f64(),
+                self.apply_time.as_secs_f64(),
                 self.kind_counts[0],
                 self.kind_counts[1],
                 self.kind_counts[2],
@@ -1535,8 +1653,8 @@ fn unresolve_kind_rank(unresolve: &UnResolve) -> u8 {
 /// Closure-argument and call-site-contribution items are all keyed on their
 /// call's start position, and a module ref is keyed on the module rather than on
 /// the owner receiving it.
-#[derive(PartialEq, Eq, Hash)]
-enum UnResolveDiscriminator {
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) enum UnResolveDiscriminator {
     None,
     ParamIdx(usize),
     /// The write a deferred local binding came from: a local with several
@@ -1547,7 +1665,7 @@ enum UnResolveDiscriminator {
 /// Identifies an unresolve item across waves: the same syntax position in the
 /// same file for the same item kind, plus the discriminator that separates
 /// siblings sharing that position, is the same item.
-type UnResolveIdentity = (u8, u32, u32, UnResolveDiscriminator);
+pub(crate) type UnResolveIdentity = (u8, u32, u32, UnResolveDiscriminator);
 
 fn unresolve_identity(unresolve: &UnResolve) -> UnResolveIdentity {
     let (file_id, position) = unresolve.sort_key_site();
@@ -2073,6 +2191,20 @@ mod tests {
             special_epoch: 0,
             contrib_epoch: 0,
             dynamic_epoch: 0,
+            untracked_epochs: [0; crate::db_index::read_set::UNTRACKED_DOMAIN_COUNT],
+            decl_clock: 0,
+            claim_clock: 0,
+            default_clock: 0,
+            file_clocks: [0; crate::db_index::read_set::FILE_SCOPED_KIND_COUNT],
+            member_clock: 0,
+            decl_key_clock: 0,
+            bound_decl_clock: 0,
+            vgui_decl_clock: 0,
+            fact_clock: 0,
+            global_path_clock: 0,
+            site_clock: 0,
+            operator_clock: 0,
+            metatable_clock: 0,
         }
     }
 
@@ -2088,6 +2220,20 @@ mod tests {
             special_epoch: 0,
             contrib_epoch: 0,
             dynamic_epoch: 0,
+            untracked_epochs: [0; crate::db_index::read_set::UNTRACKED_DOMAIN_COUNT],
+            decl_clock: 0,
+            claim_clock: 0,
+            default_clock: 0,
+            file_clocks: [0; crate::db_index::read_set::FILE_SCOPED_KIND_COUNT],
+            member_clock: 0,
+            decl_key_clock: 0,
+            bound_decl_clock: 0,
+            vgui_decl_clock: 0,
+            fact_clock: 0,
+            global_path_clock: 0,
+            site_clock: 0,
+            operator_clock: 0,
+            metatable_clock: 0,
         }
     }
 
@@ -2103,6 +2249,20 @@ mod tests {
             special_epoch: 0,
             contrib_epoch: 0,
             dynamic_epoch: 0,
+            untracked_epochs: [0; crate::db_index::read_set::UNTRACKED_DOMAIN_COUNT],
+            decl_clock: 0,
+            claim_clock: 0,
+            default_clock: 0,
+            file_clocks: [0; crate::db_index::read_set::FILE_SCOPED_KIND_COUNT],
+            member_clock: 0,
+            decl_key_clock: 0,
+            bound_decl_clock: 0,
+            vgui_decl_clock: 0,
+            fact_clock: 0,
+            global_path_clock: 0,
+            site_clock: 0,
+            operator_clock: 0,
+            metatable_clock: 0,
         }
     }
 
@@ -2118,6 +2278,20 @@ mod tests {
             special_epoch: 0,
             contrib_epoch: 0,
             dynamic_epoch: 0,
+            untracked_epochs: [0; crate::db_index::read_set::UNTRACKED_DOMAIN_COUNT],
+            decl_clock: 0,
+            claim_clock: 0,
+            default_clock: 0,
+            file_clocks: [0; crate::db_index::read_set::FILE_SCOPED_KIND_COUNT],
+            member_clock: 0,
+            decl_key_clock: 0,
+            bound_decl_clock: 0,
+            vgui_decl_clock: 0,
+            fact_clock: 0,
+            global_path_clock: 0,
+            site_clock: 0,
+            operator_clock: 0,
+            metatable_clock: 0,
         }
     }
 
@@ -2265,6 +2439,20 @@ mod tests {
             special_epoch: 0,
             contrib_epoch: 0,
             dynamic_epoch: 0,
+            untracked_epochs: [0; crate::db_index::read_set::UNTRACKED_DOMAIN_COUNT],
+            decl_clock: 0,
+            claim_clock: 0,
+            default_clock: 0,
+            file_clocks: [0; crate::db_index::read_set::FILE_SCOPED_KIND_COUNT],
+            member_clock: 0,
+            decl_key_clock: 0,
+            bound_decl_clock: 0,
+            vgui_decl_clock: 0,
+            fact_clock: 0,
+            global_path_clock: 0,
+            site_clock: 0,
+            operator_clock: 0,
+            metatable_clock: 0,
         }
     }
 

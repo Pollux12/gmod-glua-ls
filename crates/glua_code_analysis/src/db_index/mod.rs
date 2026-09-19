@@ -442,6 +442,20 @@ impl DbIndex {
         self.types_index.as_ref()
     }
 
+    /// The current write counters for the read-set domains without per-key
+    /// clocks, in [`read_set::UntrackedDomain`] order. The counters live on
+    /// the owning indexes — `TypeDecl` and `GmodMeta` each span two of them
+    /// (the gmod index's `vgui_forwarding_parents` and the signature index's
+    /// `receiver_out_param_member_names` feed the same readers), so those
+    /// slots sum. Instance-scoped: a write on another `DbIndex` cannot
+    /// stale this instance's readers.
+    pub(crate) fn untracked_write_epochs(&self) -> [u64; read_set::UNTRACKED_DOMAIN_COUNT] {
+        [
+            self.types_index.type_decl_writes + self.gmod_class_index.type_decl_writes,
+            self.signature_index.gmod_meta_writes + self.gmod_class_index.gmod_meta_writes,
+        ]
+    }
+
     pub fn get_module_index(&self) -> &LuaModuleIndex {
         self.modules_index.as_ref()
     }

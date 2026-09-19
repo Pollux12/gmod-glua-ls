@@ -64,6 +64,9 @@ pub struct LuaPropertyIndex {
     /// function).  File ownership is tracked for cleanup on reindex.
     inferred_string_defaults: HashMap<LuaDeclId, Vec<LuaInferredStringDefault>>,
     inferred_string_defaults_file_owners: HashMap<FileId, HashSet<LuaDeclId>>,
+    /// Write epochs for `inferred_string_defaults`, stamped per decl so a
+    /// default landing mid-fixpoint stales only that decl's readers.
+    pub(crate) default_write_epochs: crate::db_index::read_set::KeyedEpochs<LuaDeclId>,
 }
 
 impl Default for LuaPropertyIndex {
@@ -85,6 +88,7 @@ impl LuaPropertyIndex {
             file_merge_order: HashMap::default(),
             inferred_string_defaults: HashMap::default(),
             inferred_string_defaults_file_owners: HashMap::default(),
+            default_write_epochs: crate::db_index::read_set::KeyedEpochs::default(),
         }
     }
 
@@ -427,6 +431,7 @@ impl LuaPropertyIndex {
             .entry(file_id)
             .or_default()
             .insert(decl_id);
+        self.default_write_epochs.note(decl_id);
     }
 
     /// Get all inferred string default candidates for a declaration.
@@ -434,7 +439,7 @@ impl LuaPropertyIndex {
         &self,
         decl_id: &LuaDeclId,
     ) -> Option<&[LuaInferredStringDefault]> {
-        crate::db_index::read_set::record_decl_misc(decl_id);
+        crate::db_index::read_set::record_decl_default(&self.default_write_epochs, decl_id);
         self.inferred_string_defaults
             .get(decl_id)
             .map(|v| v.as_slice())
@@ -499,11 +504,15 @@ impl LuaIndex for LuaPropertyIndex {
         if let Some(decl_ids) = self.inferred_string_defaults_file_owners.remove(&file_id) {
             for decl_id in decl_ids {
                 self.inferred_string_defaults.remove(&decl_id);
+                self.default_write_epochs.note(decl_id);
             }
         }
     }
 
     fn clear(&mut self) {
+        for decl_id in self.inferred_string_defaults.keys() {
+            self.default_write_epochs.note(*decl_id);
+        }
         self.properties.clear();
         self.property_owners_map.clear();
         self.signature_owner_by_property.clear();

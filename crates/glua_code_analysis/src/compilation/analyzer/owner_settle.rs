@@ -16,7 +16,7 @@
 //! settled passes: first round re-derives every candidate file, later rounds
 //! only files whose recorded reads went stale.
 
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashSet as HashSet;
 
 use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr};
 
@@ -371,14 +371,18 @@ pub(crate) fn rederive_settled_index_expr_owners(
             .iter()
             .map(|candidate| LuaMemberId::new(candidate.value, candidate.file_id))
             .collect();
-        let mut candidates = HashMap::default();
-        for file_id in context.analyzed_file_ids() {
-            let mut members = owner_settle_candidates_for_file(db, file_id, &unresolve_deferred);
+        let unresolve_deferred = &unresolve_deferred;
+        let mut file_ids: Vec<FileId> = context.analyzed_file_ids().into_iter().collect();
+        file_ids.sort_unstable();
+        let scanned = parallel::map_files_collect(db, &file_ids, |db, file_id| {
+            let mut members = owner_settle_candidates_for_file(db, file_id, unresolve_deferred);
             members.sort_unstable_by_key(|id| id.get_syntax_id().get_range().start());
-            if !members.is_empty() {
-                candidates.insert(file_id, members);
-            }
-        }
+            (file_id, members)
+        });
+        let candidates = scanned
+            .into_iter()
+            .filter(|(_, members)| !members.is_empty())
+            .collect();
         context.settled_owner_candidates = Some((candidate_count, candidates));
     }
     let Some((_, candidates)) = context.settled_owner_candidates.as_ref() else {

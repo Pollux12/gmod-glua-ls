@@ -1033,8 +1033,13 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         // same batch-order exposure as a local *initialized* from one: the walk
         // answers it from whichever backing tables it had reached. Record it so
         // the settled pass re-derives it against the complete set.
+        // The answer is also reused below: a name with more than one global
+        // declaration cannot be an undefined-global read, and nothing between
+        // here and there mutates what the helper reads.
+        let reads_multi_decl_global = matches!(&type_owner, LuaTypeOwner::Decl(_))
+            && initializer_reads_through_multi_decl_global(analyzer, expr);
         if let LuaTypeOwner::Decl(decl_id) = &type_owner
-            && initializer_reads_through_multi_decl_global(analyzer, expr)
+            && reads_multi_decl_global
         {
             analyzer
                 .context
@@ -1059,8 +1064,12 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             // A plain global read answers from the merge of every file that
             // writes the name; same batch-order exposure as the initializer
             // form, re-derived through the global-read pass. The multi-decl
-            let reads_global = !initializer_reads_through_multi_decl_global(analyzer, expr)
-                && !is_undefined_global_name_expr(analyzer, expr)
+            // exposure queued its own pass above, and an undefined-global
+            // name belongs to that pass, so both stay out of this one.
+            let expr_is_undefined_global =
+                !reads_multi_decl_global && is_undefined_global_name_expr(analyzer, expr);
+            let reads_global = !reads_multi_decl_global
+                && !expr_is_undefined_global
                 && reads_global_name(analyzer, expr);
             if reads_global {
                 analyzer
@@ -1074,7 +1083,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             // through `bind_decl_write` once every read it makes has landed.
             // Global reads take their own pass, so they stay out of this one.
             if !reads_global
-                && !is_undefined_global_name_expr(analyzer, expr)
+                && !expr_is_undefined_global
                 && may_improve_after_resolve(expr)
                 && !expr_reads_out_of_decl(analyzer.db, analyzer.file_id, *decl_id, expr)
                 && !expr_is_bare_param_read(analyzer.db, analyzer.file_id, expr)

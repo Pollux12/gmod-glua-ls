@@ -141,28 +141,27 @@ pub(crate) fn local_class_table_member_ids(
     // literal. The type index tracks those bindings on every type-cache
     // write, so resolving them is a lookup of the class's own declarations
     // instead of a scan over every declaration in the class's files.
-    let Some(bound_decls) = db.get_type_index().decls_bound_to_type(type_id) else {
-        return Vec::new();
-    };
-    if bound_decls.is_empty() {
-        return Vec::new();
-    }
-
-    // The class's files bound where the tables may live. The bound decls are
-    // visited once and filtered against this set, so each file's syntax root
-    // and decl tree are acquired once no matter how many bound decls it holds.
+    //
+    // The class's files bound where the tables may live; binds outside them
+    // cannot contribute, so the lookup only reads those (type, file) slots.
     let mut class_files = FxHashSet::default();
     for location in type_decl.get_locations() {
         class_files.insert(location.file_id);
     }
+    let bound_decls: Vec<crate::LuaDeclId> = db
+        .get_type_index()
+        .decls_bound_to_type(type_id, &class_files)
+        .collect();
+    if bound_decls.is_empty() {
+        return Vec::new();
+    }
+
     let mut decls_by_file: FxHashMap<FileId, Vec<crate::LuaDeclId>> = FxHashMap::default();
     for decl_id in bound_decls {
-        if class_files.contains(&decl_id.file_id) {
-            decls_by_file
-                .entry(decl_id.file_id)
-                .or_default()
-                .push(*decl_id);
-        }
+        decls_by_file
+            .entry(decl_id.file_id)
+            .or_default()
+            .push(decl_id);
     }
     if decls_by_file.is_empty() {
         return Vec::new();

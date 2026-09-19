@@ -263,6 +263,24 @@ fn reads_stale(
             )
         };
     }
+    macro_rules! unseen_map {
+        ($field:ident) => {
+            keys_unseen(
+                reads.$field.keys(),
+                &canon.$field,
+                &clean.$field,
+                &rerun.$field,
+            )
+        };
+        ($read_field:ident, $write_field:ident) => {
+            keys_unseen(
+                reads.$read_field.keys(),
+                &canon.$write_field,
+                &clean.$write_field,
+                &rerun.$write_field,
+            )
+        };
+    }
     unseen!(type_owners)
         || keys_unseen(
             reads.member_maps.keys(),
@@ -288,16 +306,40 @@ fn reads_stale(
         || unseen!(special_calls)
         || unseen!(contribs)
         || unseen!(dynamic_fields)
-        || unseen!(type_decls)
-        || unseen!(decl_miscs)
-        || unseen!(definition_facts)
-        || unseen!(global_paths)
-        || unseen!(operator_owners)
-        || unseen!(metatable_sites)
-        || unseen!(definition_sites)
+        || keys_unseen(
+            reads.type_decls.keys().map(|(decl_id, _)| decl_id),
+            &canon.type_decls,
+            &clean.type_decls,
+            &rerun.type_decls,
+        )
+        || keys_unseen(
+            reads.bound_decls.keys().map(|(type_id, _)| type_id),
+            &canon.type_decls,
+            &clean.type_decls,
+            &rerun.type_decls,
+        )
+        || unseen_map!(vgui_type_decls, type_decls)
+        || unseen_map!(decl_miscs)
+        || unseen_map!(decl_claims, decl_miscs)
+        || unseen_map!(decl_defaults, decl_miscs)
+        || unseen_map!(definition_facts)
+        || unseen_map!(global_paths)
+        || unseen_map!(operator_owners)
+        || unseen_map!(metatable_sites)
+        || unseen_map!(definition_sites)
         || unseen!(gmod_metas)
-        || unseen!(member_ids)
-        || unseen!(file_scopeds)
+        || keys_unseen(
+            reads.member_ids.keys(),
+            &canon.member_ids,
+            &clean.member_ids,
+            &rerun.member_ids,
+        )
+        || keys_unseen(
+            reads.file_scopeds.keys().map(|(file_id, _)| file_id),
+            &canon.file_scopeds,
+            &clean.file_scopeds,
+            &rerun.file_scopeds,
+        )
         // A whole-map decl scan is stale when the canonical index holds a decl
         // the scan never saw, or the scan saw a rerun mate's speculative decl
         // that its serial replay did not produce.
@@ -348,28 +390,44 @@ fn count_stale_reads(
     count!("SpecialCall", reads.special_calls.iter(), special_calls);
     count!("Contrib", reads.contribs.iter(), contribs);
     count!("DynamicField", reads.dynamic_fields.iter(), dynamic_fields);
-    count!("TypeDecl", reads.type_decls.iter(), type_decls);
-    count!("DeclMisc", reads.decl_miscs.iter(), decl_miscs);
+    count!(
+        "TypeDecl",
+        reads.type_decls.keys().map(|(decl_id, _)| decl_id),
+        type_decls
+    );
+    count!(
+        "BoundDecl",
+        reads.bound_decls.keys().map(|(type_id, _)| type_id),
+        type_decls
+    );
+    count!("VguiTypeDecl", reads.vgui_type_decls.keys(), type_decls);
+    count!("DeclMisc", reads.decl_miscs.keys(), decl_miscs);
+    count!("DeclClaim", reads.decl_claims.keys(), decl_miscs);
+    count!("DeclDefault", reads.decl_defaults.keys(), decl_miscs);
     count!(
         "DefinitionFact",
-        reads.definition_facts.iter(),
+        reads.definition_facts.keys(),
         definition_facts
     );
-    count!("GlobalPath", reads.global_paths.iter(), global_paths);
+    count!("GlobalPath", reads.global_paths.keys(), global_paths);
     count!(
         "OperatorOwner",
-        reads.operator_owners.iter(),
+        reads.operator_owners.keys(),
         operator_owners
     );
-    count!("Metatable", reads.metatable_sites.iter(), metatable_sites);
+    count!("Metatable", reads.metatable_sites.keys(), metatable_sites);
     count!(
         "DefinitionSite",
-        reads.definition_sites.iter(),
+        reads.definition_sites.keys(),
         definition_sites
     );
     count!("GmodMeta", reads.gmod_metas.iter(), gmod_metas);
-    count!("MemberId", reads.member_ids.iter(), member_ids);
-    count!("FileScoped", reads.file_scopeds.iter(), file_scopeds);
+    count!("MemberId", reads.member_ids.keys(), member_ids);
+    count!(
+        "FileScoped",
+        reads.file_scopeds.keys().map(|(file_id, _)| file_id),
+        file_scopeds
+    );
     if reads.type_decl_scan
         && (canon
             .type_decls
@@ -907,7 +965,13 @@ pub(in crate::compilation::analyzer) fn analyze_level(
                                 if ordinal != index {
                                     break;
                                 }
-                                apply_replacement(db, replacements.next().unwrap().1);
+                                apply_replacement(
+                                    db,
+                                    replacements
+                                        .next()
+                                        .expect("peeked replacement at this ordinal")
+                                        .1,
+                                );
                             }
                             (op.apply)(db);
                         }

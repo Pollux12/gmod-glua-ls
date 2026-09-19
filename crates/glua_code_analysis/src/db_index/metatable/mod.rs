@@ -5,7 +5,7 @@ use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 
 use crate::db_index::op_log;
-use crate::db_index::read_set::WriteKey;
+use crate::db_index::read_set::{KeyedEpochs, WriteKey};
 use crate::{FileId, InFiled};
 
 use super::LuaIndex;
@@ -27,6 +27,12 @@ pub struct LuaMetatableIndex {
     metatables: HashMap<InFiled<TextRange>, Vec<MetatableBinding>>,
     by_writer: HashMap<FileId, Vec<InFiled<TextRange>>>,
     factory_bindings: HashMap<FileId, Vec<SetmetatableFactoryBinding>>,
+    /// Write epochs for `factory_bindings`/`by_writer` —
+    /// `FileScopedKind::MetatableFactory`.
+    pub(crate) file_write_epochs: KeyedEpochs<FileId>,
+    /// Write epochs for `metatables`, stamped per table site so a binding
+    /// change under one literal stales only readers of that site.
+    pub(crate) site_epochs: KeyedEpochs<InFiled<TextRange>>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +72,8 @@ impl LuaMetatableIndex {
             metatables: HashMap::default(),
             by_writer: HashMap::default(),
             factory_bindings: HashMap::default(),
+            file_write_epochs: KeyedEpochs::default(),
+            site_epochs: KeyedEpochs::default(),
         }
     }
 
@@ -97,7 +105,10 @@ impl LuaMetatableIndex {
             .iter_mut()
             .find(|binding| binding.writer_file_id == writer_file_id)
         {
-            existing.metatable = metatable;
+            if existing.metatable != metatable {
+                existing.metatable = metatable;
+                self.site_epochs.note(table);
+            }
             return;
         }
 
@@ -111,7 +122,9 @@ impl LuaMetatableIndex {
         self.by_writer
             .entry(writer_file_id)
             .or_default()
-            .push(table);
+            .push(table.clone());
+        self.site_epochs.note(table);
+        self.file_write_epochs.note(writer_file_id);
     }
 
     /// Number of recorded `setmetatable` bindings, so a test can show its
@@ -122,7 +135,7 @@ impl LuaMetatableIndex {
     }
 
     pub fn get(&self, table: &InFiled<TextRange>) -> Option<&InFiled<TextRange>> {
-        crate::db_index::read_set::record_metatable(table);
+        crate::db_index::read_set::record_metatable(&self.site_epochs, table);
         self.metatables
             .get(table)
             .and_then(|bindings| bindings.first())
@@ -148,10 +161,12 @@ impl LuaMetatableIndex {
                 move |db| db.get_metatable_index_mut().add_factory_binding(binding2),
             );
         }
+        let file_id = binding.file_id;
         self.factory_bindings
-            .entry(binding.file_id)
+            .entry(file_id)
             .or_default()
             .push(binding);
+        self.file_write_epochs.note(file_id);
     }
 
     /// Rewrites every `setmetatable` binding that names a table literal in the
@@ -165,6 +180,7 @@ impl LuaMetatableIndex {
         let mut rebuilt: HashMap<InFiled<TextRange>, Vec<MetatableBinding>> =
             HashMap::with_capacity_and_hasher(self.metatables.len(), Default::default());
         for (table, bindings) in std::mem::take(&mut self.metatables) {
+            self.site_epochs.note(table.clone());
             let new_table = map_range(remap, &table);
             for binding in bindings {
                 match (new_table.clone(), map_range(remap, &binding.metatable)) {
@@ -217,6 +233,14 @@ impl LuaMetatableIndex {
         self.factory_bindings
             .retain(|_, bindings| !bindings.is_empty());
         dirty.remove(&remap.file_id);
+        // Every surviving site re-keyed or lost a binding: stamp old and new
+        // keys so readers of either observe the move.
+        for site in self.metatables.keys() {
+            self.site_epochs.note(site.clone());
+        }
+        for file_id in &dirty {
+            self.file_write_epochs.note(*file_id);
+        }
         dirty
     }
 
@@ -224,7 +248,11 @@ impl LuaMetatableIndex {
         &self,
         file_id: FileId,
     ) -> Option<&[SetmetatableFactoryBinding]> {
-        crate::db_index::read_set::record_file_scoped(&file_id);
+        crate::db_index::read_set::record_file_scoped(
+            &self.file_write_epochs,
+            &file_id,
+            crate::db_index::read_set::FileScopedKind::MetatableFactory,
+        );
         self.factory_bindings.get(&file_id).map(Vec::as_slice)
     }
 
@@ -237,8 +265,11 @@ impl LuaMetatableIndex {
             if bindings.is_empty() {
                 self.metatables.remove(&table);
             }
+            self.site_epochs.note(table);
         }
-        self.factory_bindings.remove(&file_id);
+        if self.factory_bindings.remove(&file_id).is_some() {
+            self.file_write_epochs.note(file_id);
+        }
     }
 }
 
@@ -254,6 +285,12 @@ impl LuaIndex for LuaMetatableIndex {
     }
 
     fn clear(&mut self) {
+        for file_id in self.by_writer.keys().chain(self.factory_bindings.keys()) {
+            self.file_write_epochs.note(*file_id);
+        }
+        for site in self.metatables.keys() {
+            self.site_epochs.note(site.clone());
+        }
         self.metatables.clear();
         self.by_writer.clear();
         self.factory_bindings.clear();

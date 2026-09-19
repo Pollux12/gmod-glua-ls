@@ -356,6 +356,20 @@ pub struct GmodClassMetadataIndex {
     /// a conflicting creation site vanish transiently, and inference that ran
     /// in the gap kept the answer the full relation set contradicts.
     pending_vgui_parent_relation_files: HashMap<FileId, Vec<LuaTypeDeclId>>,
+    /// Write epochs for `file_metadata` — `FileScopedKind::GmodMetaFile`.
+    pub(crate) file_write_epochs: crate::db_index::read_set::KeyedEpochs<FileId>,
+    /// Domain counter for name-keyed metadata writes (`vgui_panels`,
+    /// `derma_skins`) — `record_gmod_meta` readers have no per-key clocks,
+    /// so any write stales them.
+    pub(crate) gmod_meta_writes: u64,
+    /// Domain counter for `vgui_forwarding_parents` writes — readers reach
+    /// the forwarding parents through type-decl paths, so a change here
+    /// stales `type_decls` readers (summed with the type index's counter).
+    pub(crate) type_decl_writes: u64,
+    /// Write epochs for `vgui_panel_parent_chains` /
+    /// `incomplete_vgui_panel_parent_chains`, keyed by child decl — a chain
+    /// rewrite under one child stales only readers of that child.
+    pub(crate) decl_key_epochs: crate::db_index::read_set::KeyedEpochs<LuaTypeDeclId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,7 +395,24 @@ impl GmodClassMetadataIndex {
             vgui_panel_parent_chains: HashMap::default(),
             incomplete_vgui_panel_parent_chains: HashSet::default(),
             pending_vgui_parent_relation_files: HashMap::default(),
+            file_write_epochs: crate::db_index::read_set::KeyedEpochs::default(),
+            gmod_meta_writes: 0,
+            type_decl_writes: 0,
+            decl_key_epochs: crate::db_index::read_set::KeyedEpochs::default(),
         }
+    }
+
+    /// Domain-counter bump for name-keyed metadata writes — see
+    /// `record_gmod_meta`/`untracked_reads_changed`.
+    fn note_gmod_meta_write(&mut self) {
+        self.gmod_meta_writes = self.gmod_meta_writes.wrapping_add(1);
+    }
+
+    /// Domain-counter bump for `vgui_forwarding_parents` writes — readers
+    /// reach them through type-decl paths, so a change here stales
+    /// `type_decls` readers (summed with the type index's counter).
+    fn note_type_decl_write(&mut self) {
+        self.type_decl_writes = self.type_decl_writes.wrapping_add(1);
     }
 
     fn extract_non_empty_string_literal(literal: &GmodClassCallLiteral) -> Option<String> {
@@ -588,6 +619,9 @@ impl GmodClassMetadataIndex {
             }
         }
 
+        if self.vgui_panels != vgui_panels || self.derma_skins != derma_skins {
+            self.note_gmod_meta_write();
+        }
         self.vgui_panels = vgui_panels;
         self.derma_skins = derma_skins;
         self.recompute_vgui_panel_parent_chains();
@@ -669,17 +703,28 @@ impl GmodClassMetadataIndex {
                 // make a full analysis O(calls * total_calls).
                 let old_metadata = std::mem::replace(existing, call_metadata.clone());
                 self.replace_cached_call(file_id, kind, &old_metadata, &call_metadata);
+                self.file_write_epochs.note(file_id);
+                if !Self::call_cache_keys(kind, &call_metadata).is_empty()
+                    || !Self::call_cache_keys(kind, &old_metadata).is_empty()
+                {
+                    self.note_gmod_meta_write();
+                }
                 return;
             }
         }
 
         self.update_vgui_panels_from_call(file_id, kind, &call_metadata);
         self.update_derma_skins_from_call(file_id, kind, &call_metadata);
+        let cache_touched = !Self::call_cache_keys(kind, &call_metadata).is_empty();
         self.file_metadata
             .entry(file_id)
             .or_default()
             .calls_by_kind_mut(kind)
             .push(call_metadata);
+        self.file_write_epochs.note(file_id);
+        if cache_touched {
+            self.note_gmod_meta_write();
+        }
     }
 
     pub fn add_vgui_parent_call(&mut self, file_id: FileId, call: GmodVguiParentCallMetadata) {
@@ -719,13 +764,18 @@ impl GmodClassMetadataIndex {
             });
             calls.insert(insert_at, call);
         }
+        self.file_write_epochs.note(file_id);
     }
 
     pub fn clear_forwarded_vgui_parent_calls(&mut self) {
-        for metadata in self.file_metadata.values_mut() {
+        for (file_id, metadata) in self.file_metadata.iter_mut() {
+            let before = metadata.vgui_parent_calls.len();
             metadata
                 .vgui_parent_calls
                 .retain(|call| call.origin != GmodVguiParentCallOrigin::Forwarded);
+            if metadata.vgui_parent_calls.len() != before {
+                self.file_write_epochs.note(*file_id);
+            }
         }
     }
 
@@ -734,14 +784,22 @@ impl GmodClassMetadataIndex {
             let Some(metadata) = self.file_metadata.get_mut(file_id) else {
                 continue;
             };
+            let before = metadata.vgui_parent_calls.len();
             metadata
                 .vgui_parent_calls
                 .retain(|call| call.origin != GmodVguiParentCallOrigin::Forwarded);
+            if metadata.vgui_parent_calls.len() != before {
+                self.file_write_epochs.note(*file_id);
+            }
         }
     }
 
     pub fn has_annotated_vgui_parent_calls(&self, file_id: FileId) -> bool {
-        crate::db_index::read_set::record_file_scoped(&file_id);
+        crate::db_index::read_set::record_file_scoped(
+            &self.file_write_epochs,
+            &file_id,
+            crate::db_index::read_set::FileScopedKind::GmodMetaFile,
+        );
         self.file_metadata.get(&file_id).is_some_and(|metadata| {
             metadata
                 .vgui_parent_calls
@@ -758,11 +816,16 @@ impl GmodClassMetadataIndex {
             return false;
         }
         self.vgui_forwarding_parents.clone_from(forwarding_parents);
+        self.note_type_decl_write();
         true
     }
 
     pub fn get_vgui_parent_calls(&self, file_id: &FileId) -> &[GmodVguiParentCallMetadata] {
-        crate::db_index::read_set::record_file_scoped(file_id);
+        crate::db_index::read_set::record_file_scoped(
+            &self.file_write_epochs,
+            file_id,
+            crate::db_index::read_set::FileScopedKind::GmodMetaFile,
+        );
         self.file_metadata
             .get(file_id)
             .map(|metadata| metadata.vgui_parent_calls.as_slice())
@@ -785,6 +848,7 @@ impl GmodClassMetadataIndex {
                     .find(|(syntax_id, _)| *syntax_id == call.syntax_id)
                     .map(|(_, source)| source.clone());
             }
+            self.file_write_epochs.note(*file_id);
         }
     }
 
@@ -803,6 +867,7 @@ impl GmodClassMetadataIndex {
                     .map(|(_, relations)| relations.clone())
                     .unwrap_or_default();
             }
+            self.file_write_epochs.note(file_id);
         }
         self.recompute_vgui_panel_parent_chains();
     }
@@ -811,14 +876,14 @@ impl GmodClassMetadataIndex {
         &self,
         child_type_id: &LuaTypeDeclId,
     ) -> Option<&[LuaTypeDeclId]> {
-        crate::db_index::read_set::record_type_decl(child_type_id);
+        crate::db_index::read_set::record_vgui_type_decl(&self.decl_key_epochs, child_type_id);
         self.vgui_panel_parent_chains
             .get(child_type_id)
             .map(Vec::as_slice)
     }
 
     pub fn vgui_panel_parent_chain_is_complete(&self, child_type_id: &LuaTypeDeclId) -> bool {
-        crate::db_index::read_set::record_type_decl(child_type_id);
+        crate::db_index::read_set::record_vgui_type_decl(&self.decl_key_epochs, child_type_id);
         !self
             .incomplete_vgui_panel_parent_chains
             .contains(child_type_id)
@@ -862,6 +927,23 @@ impl GmodClassMetadataIndex {
         for type_id in &incomplete {
             parent_chains.remove(type_id);
         }
+        if self.vgui_panel_parent_chains != parent_chains
+            || self.incomplete_vgui_panel_parent_chains != incomplete
+        {
+            self.note_type_decl_write();
+            // Stamp every child whose chain or completeness could have moved —
+            // old and new keys both, so removed and gained chains stale their
+            // readers alike.
+            for type_id in self
+                .vgui_panel_parent_chains
+                .keys()
+                .chain(parent_chains.keys())
+                .chain(self.incomplete_vgui_panel_parent_chains.iter())
+                .chain(incomplete.iter())
+            {
+                self.decl_key_epochs.note(type_id.clone());
+            }
+        }
         self.vgui_panel_parent_chains = parent_chains;
         self.incomplete_vgui_panel_parent_chains = incomplete;
     }
@@ -873,6 +955,7 @@ impl GmodClassMetadataIndex {
     pub fn clear_pending_vgui_parent_relation_files(&mut self, file_ids: &[FileId]) {
         for file_id in file_ids {
             self.pending_vgui_parent_relation_files.remove(file_id);
+            self.file_write_epochs.note(*file_id);
         }
     }
 
@@ -890,7 +973,11 @@ impl GmodClassMetadataIndex {
     }
 
     pub fn get_file_metadata(&self, file_id: &FileId) -> Option<&GmodScriptedClassFileMetadata> {
-        crate::db_index::read_set::record_file_scoped(file_id);
+        crate::db_index::read_set::record_file_scoped(
+            &self.file_write_epochs,
+            file_id,
+            crate::db_index::read_set::FileScopedKind::GmodMetaFile,
+        );
         self.file_metadata.get(file_id)
     }
 
@@ -988,6 +1075,7 @@ impl LuaIndex for GmodClassMetadataIndex {
             let Some(metadata) = self.file_metadata.remove(&file_id) else {
                 continue;
             };
+            self.file_write_epochs.note(file_id);
             let mut children = metadata
                 .vgui_parent_calls
                 .iter()
@@ -1005,6 +1093,18 @@ impl LuaIndex for GmodClassMetadataIndex {
     }
 
     fn clear(&mut self) {
+        for file_id in self.file_metadata.keys() {
+            self.file_write_epochs.note(*file_id);
+        }
+        for type_id in self
+            .vgui_panel_parent_chains
+            .keys()
+            .chain(self.incomplete_vgui_panel_parent_chains.iter())
+        {
+            self.decl_key_epochs.note(type_id.clone());
+        }
+        self.note_gmod_meta_write();
+        self.note_type_decl_write();
         self.file_metadata.clear();
         self.vgui_panels.clear();
         self.derma_skins.clear();

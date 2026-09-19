@@ -5,7 +5,7 @@ use rustc_hash::FxHashMap;
 
 use crate::FileId;
 use crate::db_index::op_log;
-use crate::db_index::read_set::WriteKey;
+use crate::db_index::read_set::{KeyedEpochs, WriteKey};
 
 use super::traits::LuaIndex;
 pub use lua_operator::{LuaOperator, LuaOperatorId, LuaOperatorOwner, OperatorFunction};
@@ -17,6 +17,12 @@ pub struct LuaOperatorIndex {
     type_operators_map:
         FxHashMap<LuaOperatorOwner, FxHashMap<LuaOperatorMetaMethod, Vec<LuaOperatorId>>>,
     in_filed_operator_map: FxHashMap<FileId, Vec<LuaOperatorId>>,
+    /// Write epochs for `in_filed_operator_map`/`operators` —
+    /// `FileScopedKind::OperatorFile`.
+    pub(crate) file_write_epochs: KeyedEpochs<FileId>,
+    /// Write epochs for the operator tables, stamped per operand owner so a
+    /// write under one owner stales only readers of that owner.
+    pub(crate) operator_epochs: KeyedEpochs<LuaOperatorOwner>,
 }
 
 impl Default for LuaOperatorIndex {
@@ -31,6 +37,8 @@ impl LuaOperatorIndex {
             operators: FxHashMap::default(),
             type_operators_map: FxHashMap::default(),
             in_filed_operator_map: FxHashMap::default(),
+            file_write_epochs: KeyedEpochs::default(),
+            operator_epochs: KeyedEpochs::default(),
         }
     }
 
@@ -60,7 +68,7 @@ impl LuaOperatorIndex {
         let op = operator.get_op();
         self.operators.insert(id, operator);
         self.type_operators_map
-            .entry(owner)
+            .entry(owner.clone())
             .or_default()
             .entry(op)
             .or_default()
@@ -69,6 +77,8 @@ impl LuaOperatorIndex {
             .entry(id.file_id)
             .or_default()
             .push(id);
+        self.operator_epochs.note(owner);
+        self.file_write_epochs.note(id.file_id);
         true
     }
 
@@ -77,7 +87,7 @@ impl LuaOperatorIndex {
         owner: &LuaOperatorOwner,
         meta_method: LuaOperatorMetaMethod,
     ) -> Option<&Vec<LuaOperatorId>> {
-        crate::db_index::read_set::record_operator_owner(owner);
+        crate::db_index::read_set::record_operator_owner(&self.operator_epochs, owner);
         self.type_operators_map
             .get(owner)
             .and_then(|map| map.get(&meta_method))
@@ -86,14 +96,22 @@ impl LuaOperatorIndex {
     /// Every metamethod this file declares. Another file's inference reads
     /// them whenever it applies an operator to the owning type.
     pub fn operators_in_file(&self, file_id: FileId) -> Vec<&LuaOperator> {
-        crate::db_index::read_set::record_file_scoped(&file_id);
+        crate::db_index::read_set::record_file_scoped(
+            &self.file_write_epochs,
+            &file_id,
+            crate::db_index::read_set::FileScopedKind::OperatorFile,
+        );
         self.in_filed_operator_map
             .get(&file_id)
             .map(|ids| ids.iter().filter_map(|id| self.get_operator(id)).collect())
             .unwrap_or_default()
     }
     pub fn get_operator(&self, id: &LuaOperatorId) -> Option<&LuaOperator> {
-        crate::db_index::read_set::record_file_scoped(&id.file_id);
+        crate::db_index::read_set::record_file_scoped(
+            &self.file_write_epochs,
+            &id.file_id,
+            crate::db_index::read_set::FileScopedKind::OperatorFile,
+        );
         self.operators.get(id)
     }
 }
@@ -101,6 +119,7 @@ impl LuaOperatorIndex {
 impl LuaIndex for LuaOperatorIndex {
     fn remove(&mut self, file_id: FileId) {
         if let Some(operator_ids) = self.in_filed_operator_map.remove(&file_id) {
+            self.file_write_epochs.note(file_id);
             for id in operator_ids {
                 if let Some(operator) = self.operators.remove(&id) {
                     let owner = operator.get_owner();
@@ -121,12 +140,17 @@ impl LuaIndex for LuaOperatorIndex {
                     if operators_map.is_empty() {
                         self.type_operators_map.remove(owner);
                     }
+                    self.operator_epochs.note(owner.clone());
                 }
             }
         }
     }
 
     fn clear(&mut self) {
+        for file_id in self.in_filed_operator_map.keys() {
+            self.file_write_epochs.note(*file_id);
+        }
+        self.operator_epochs.clear();
         self.operators.clear();
         self.type_operators_map.clear();
         self.in_filed_operator_map.clear();

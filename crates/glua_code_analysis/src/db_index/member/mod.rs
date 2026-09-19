@@ -140,6 +140,11 @@ pub struct LuaMemberIndex {
     /// re-derivation.
     owner_move_epochs: HashMap<LuaMemberOwner, u64>,
     key_move_epochs: HashMap<LuaMemberKey, u64>,
+    /// The `move_clock` epoch each member's own record last changed at:
+    /// object content, current owner, provenance and bookkeeping flags —
+    /// everything `member_ids` reads observe that the owner/key membership
+    /// epochs do not name.
+    member_move_epochs: HashMap<LuaMemberId, u64>,
     /// Members whose owner was recorded without adding them to the owner's
     /// member list: a write through an instance of a class, not the class.
     /// See [`Self::set_member_owner_only`].
@@ -180,6 +185,15 @@ pub struct LuaMemberIndex {
     /// file later defines that key, this is how the reader is found.
     missed_member_reads_by_file: HashMap<FileId, Vec<(LuaMemberOwner, LuaMemberKey)>>,
     missed_member_readers: HashMap<(LuaMemberOwner, LuaMemberKey), HashSet<FileId>>,
+    /// Write epochs for `function_scope_ranges` — `FileScopedKind::MemberScope`.
+    pub(crate) file_write_epochs: crate::db_index::read_set::KeyedEpochs<FileId>,
+    /// Write epochs for global-path metadata, stamped per path so a write
+    /// under one path stales only readers of that path.
+    pub(crate) global_path_epochs: crate::db_index::read_set::KeyedEpochs<GlobalId>,
+    /// Write epochs for `definition_site_owner` slots, stamped per literal
+    /// site so a re-map of one literal stales only readers of that site.
+    pub(crate) site_epochs:
+        crate::db_index::read_set::KeyedEpochs<crate::InFiled<rowan::TextRange>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -242,6 +256,7 @@ impl LuaMemberIndex {
             move_clock: 0,
             owner_move_epochs: HashMap::default(),
             key_move_epochs: HashMap::default(),
+            member_move_epochs: HashMap::default(),
             owner_only_members: HashSet::default(),
             synthesized_owner_members: HashSet::default(),
             deferred_index_expr_members: HashSet::default(),
@@ -255,6 +270,9 @@ impl LuaMemberIndex {
             member_path_provenance: HashMap::default(),
             missed_member_reads_by_file: HashMap::default(),
             missed_member_readers: HashMap::default(),
+            file_write_epochs: crate::db_index::read_set::KeyedEpochs::default(),
+            global_path_epochs: crate::db_index::read_set::KeyedEpochs::default(),
+            site_epochs: crate::db_index::read_set::KeyedEpochs::default(),
         }
     }
 
@@ -374,10 +392,12 @@ impl LuaMemberIndex {
 
     /// Stamps the owner and key `member_id`'s current record names: a rewrite,
     /// flag change, or drop behind the member's back alters the membership
-    /// view both slots answer for.
+    /// view both slots answer for. The member's own epoch moves too, since
+    /// every caller reaching this point changed something an id-read sees.
     fn note_member_move(&mut self, member_id: LuaMemberId) {
         self.move_clock = self.move_clock.wrapping_add(1);
         let epoch = self.move_clock;
+        self.member_move_epochs.insert(member_id, epoch);
         if let Some(owner) = self.member_current_owner.get(&member_id) {
             let owner = self.canonical(owner).clone();
             self.owner_move_epochs.insert(owner, epoch);
@@ -388,6 +408,28 @@ impl LuaMemberIndex {
         {
             self.key_move_epochs.insert(key, epoch);
         }
+    }
+
+    /// [`Self::note_member_move`] for writes that leave the owner/key slots
+    /// alone — provenance, bookkeeping flags, first filings, owner-slot
+    /// bookkeeping — but still change what an id-keyed member read sees.
+    fn note_member_object_write(&mut self, member_id: LuaMemberId) {
+        self.move_clock = self.move_clock.wrapping_add(1);
+        let epoch = self.move_clock;
+        self.member_move_epochs.insert(member_id, epoch);
+    }
+
+    /// The `move_clock` epoch `member_id`'s own record last changed at, for
+    /// the `member_ids` read set.
+    pub(crate) fn member_object_version(&self, member_id: &LuaMemberId) -> u64 {
+        self.member_move_epochs.get(member_id).copied().unwrap_or(0)
+    }
+
+    /// The membership/move tick every owner, key, and member-id epoch is
+    /// stamped from — a capture can compare it whole to skip all three
+    /// families' per-key walks when nothing moved.
+    pub(crate) fn move_clock(&self) -> u64 {
+        self.move_clock
     }
 
     pub fn add_member(&mut self, owner: LuaMemberOwner, member: LuaMember) -> LuaMemberId {
@@ -443,6 +485,7 @@ impl LuaMemberIndex {
         // view or memo can observe, so stamping it would only churn readers
         // (settled passes re-file members every round while converging).
         let mut already_filed_here = false;
+        let mut member_object_changed = true;
         if self.members.contains_key(&id) {
             // The insert below overwrites the member record, but nothing else
             // removes the id from the key slot its previous filing named. When
@@ -460,6 +503,7 @@ impl LuaMemberIndex {
                     existing.get_feature() == member.get_feature()
                         && existing.get_global_id() == member.get_global_id()
                 });
+            member_object_changed = !identical;
             if !identical {
                 self.bump_homing_revision();
                 self.note_member_move(id);
@@ -476,6 +520,9 @@ impl LuaMemberIndex {
             already_filed_here = same_owner && !key_changed;
         }
         self.members.insert(id, member);
+        if member_object_changed {
+            self.note_member_object_write(id);
+        }
         self.set_member_function_scope_range(id, function_scope);
         self.add_in_file_object(file_id, MemberOrOwner::Member(id));
         if !owner.is_unknown() {
@@ -689,7 +736,7 @@ impl LuaMemberIndex {
                 );
             });
         }
-        self.member_path_provenance.insert(id, alias_path);
+        self.stamp_member_path_provenance(id, &alias_path);
         self.record_member_owner(owner, file_id, id)?;
         if owner_only {
             if self.owner_only_members.insert(id) {
@@ -698,7 +745,9 @@ impl LuaMemberIndex {
             return Some(());
         }
         let key = self.get_member(&id)?.get_key().clone();
-        self.owner_only_members.remove(&id);
+        if self.owner_only_members.remove(&id) {
+            self.note_member_object_write(id);
+        }
         let owner = self.member_current_owner.get(&id)?.clone();
         self.merge_member_into_owner_item(owner, key, id);
         Some(())
@@ -728,7 +777,7 @@ impl LuaMemberIndex {
     /// class-flip machinery (`set_global_path_class`), not by the prefix-type
     /// read a settled pass re-derives.
     pub fn member_path_provenance(&self, id: &LuaMemberId) -> Option<&GlobalId> {
-        crate::db_index::read_set::record_member_id(id);
+        crate::db_index::read_set::record_member_id(self, id);
         self.member_path_provenance.get(id)
     }
 
@@ -1126,6 +1175,9 @@ impl LuaMemberIndex {
         // append-only and must not invalidate memos.
         let already_indexed = self.members.contains_key(&id);
         let previous_owner = self.member_current_owner.insert(id, owner.clone());
+        if previous_owner.as_ref() != Some(&owner) {
+            self.note_member_object_write(id);
+        }
         match &previous_owner {
             None if already_indexed => {
                 self.bump_homing_revision();
@@ -1167,13 +1219,13 @@ impl LuaMemberIndex {
     }
 
     pub fn get_member(&self, id: &LuaMemberId) -> Option<&LuaMember> {
-        read_set::record_member_id(id);
+        read_set::record_member_id(self, id);
         self.members.get(id)
     }
 
     pub fn get_member_mut(&mut self, id: &LuaMemberId) -> Option<&mut LuaMember> {
         op_log::note_mut_ref(op_log::MutRef::Member(*id));
-        read_set::record_member_id(id);
+        read_set::record_member_id(self, id);
         // Defensive: the key lives on the member, so any mutable access could
         // re-home it behind every memo's back. No caller does so today except
         // through `rekey_member` (which bumps itself), but a future direct
@@ -1235,6 +1287,8 @@ impl LuaMemberIndex {
         self.forget_definition_site(&site);
         self.bump_homing_revision();
         self.definition_site_owner.insert(site.clone(), owner);
+        self.site_epochs.note(site.clone());
+        self.global_path_epochs.note(path.clone());
         // `site` now resolves to the path's owner: stamping the canonical
         // target marks every read recorded through `site` stale.
         self.canonical_revision = self.canonical_revision.wrapping_add(1);
@@ -1264,7 +1318,7 @@ impl LuaMemberIndex {
     /// The global path the table literal `site` initialises, if one is
     /// registered for it.
     pub fn definition_site_path(&self, site: &crate::InFiled<TextRange>) -> Option<GlobalId> {
-        crate::db_index::read_set::record_definition_site(site);
+        crate::db_index::read_set::record_definition_site(&self.site_epochs, site);
         self.definition_site_owner.get(site)?.get_path().cloned()
     }
 
@@ -1273,15 +1327,24 @@ impl LuaMemberIndex {
     /// A path with no candidates can never flip, so provenance on it is inert
     /// and must not exempt a member from settled owner re-derivation.
     pub fn global_path_has_class_candidates(&self, path: &GlobalId) -> bool {
-        crate::db_index::read_set::record_global_path(path);
+        crate::db_index::read_set::record_global_path(&self.global_path_epochs, path);
         self.global_path_class_candidates.contains_key(path)
     }
 
     /// Whether `path` is a global path the index knows about: it has members
     /// filed under it, a registered definition site, or a `---@class`
     /// proposal. Read-only and cheap, so producers may consult it per write.
+    ///
+    /// The membership arm is not covered by the `GlobalPath` domain epoch —
+    /// filing a member under the path only bumps membership clocks — so it
+    /// records the owner map read as well, which member-map-armed scopes
+    /// compare through `read_version`.
     pub fn is_known_global_path(&self, path: &GlobalId) -> bool {
-        crate::db_index::read_set::record_global_path(path);
+        crate::db_index::read_set::record_global_path(&self.global_path_epochs, path);
+        crate::db_index::read_set::record_member_map(
+            self,
+            &LuaMemberOwner::GlobalPath(path.clone()),
+        );
         self.owner_members
             .contains_key(&LuaMemberOwner::GlobalPath(path.clone()))
             || self.global_path_class_candidates.contains_key(path)
@@ -1312,15 +1375,18 @@ impl LuaMemberIndex {
             });
         }
         for member_id in member_ids {
-            self.member_path_provenance
-                .entry(member_id)
-                .or_insert_with(|| path.clone());
+            if let std::collections::hash_map::Entry::Vacant(slot) =
+                self.member_path_provenance.entry(member_id)
+            {
+                slot.insert(path.clone());
+                self.note_member_object_write(member_id);
+            }
         }
     }
 
     /// The literals initialising `path`, sorted by `(file id, range)`.
     pub fn definition_sites(&self, path: &GlobalId) -> &[crate::InFiled<TextRange>] {
-        crate::db_index::read_set::record_global_path(path);
+        crate::db_index::read_set::record_global_path(&self.global_path_epochs, path);
         self.path_definition_sites
             .get(path)
             .map_or(&[], |sites| sites.as_slice())
@@ -1343,14 +1409,14 @@ impl LuaMemberIndex {
     fn canonical<'a>(&'a self, owner: &'a LuaMemberOwner) -> &'a LuaMemberOwner {
         let owner = match owner {
             LuaMemberOwner::Element(range) => {
-                crate::db_index::read_set::record_definition_site(range);
+                crate::db_index::read_set::record_definition_site(&self.site_epochs, range);
                 self.definition_site_owner.get(range).unwrap_or(owner)
             }
             _ => owner,
         };
         match owner {
             LuaMemberOwner::GlobalPath(path) => {
-                crate::db_index::read_set::record_global_path(path);
+                crate::db_index::read_set::record_global_path(&self.global_path_epochs, path);
                 self.global_path_class_owner.get(path).unwrap_or(owner)
             }
             _ => owner,
@@ -1366,12 +1432,12 @@ impl LuaMemberIndex {
     /// one re-homed anywhere else is no longer a path member and loses it.
     fn note_member_path_provenance(&mut self, id: LuaMemberId, raw_owner: &LuaMemberOwner) {
         if let Some(path) = raw_owner.get_path() {
-            self.member_path_provenance.insert(id, path.clone());
+            self.stamp_member_path_provenance(id, path);
             return;
         }
         let canonical = self.canonical(raw_owner).clone();
         if let Some(path) = canonical.get_path() {
-            self.member_path_provenance.insert(id, path.clone());
+            self.stamp_member_path_provenance(id, path);
             return;
         }
         let Some(recorded) = self.member_path_provenance.get(&id).cloned() else {
@@ -1382,7 +1448,18 @@ impl LuaMemberIndex {
             .clone();
         if recorded_canonical != canonical {
             self.member_path_provenance.remove(&id);
+            self.note_member_object_write(id);
         }
+    }
+
+    /// Writes `id`'s provenance when it differs, so a re-file that re-derives
+    /// the same path does not stamp the member-object domain.
+    fn stamp_member_path_provenance(&mut self, id: LuaMemberId, path: &GlobalId) {
+        if self.member_path_provenance.get(&id) == Some(path) {
+            return;
+        }
+        self.member_path_provenance.insert(id, path.clone());
+        self.note_member_object_write(id);
     }
 
     /// Drops `id`'s provenance when it is detached from the owner the
@@ -1401,6 +1478,7 @@ impl LuaMemberIndex {
             .clone();
         if provenance_canonical == *detached_from {
             self.member_path_provenance.remove(&id);
+            self.note_member_object_write(id);
         }
     }
 
@@ -1479,21 +1557,25 @@ impl LuaMemberIndex {
                     .set_global_path_class(path2, class2, file_id);
             });
         }
-        let winner = {
+        let (inserted, winner) = {
             let candidates = self
                 .global_path_class_candidates
                 .entry(path.clone())
                 .or_default();
-            candidates.insert(GlobalPathClassCandidate {
+            let inserted = candidates.insert(GlobalPathClassCandidate {
                 class_name: class.get_name().into(),
                 file_id,
                 class: class.clone(),
             });
-            candidates
+            let winner = candidates
                 .iter()
                 .next()
-                .map(|candidate| candidate.class.clone())
+                .map(|candidate| candidate.class.clone());
+            (inserted, winner)
         };
+        if inserted {
+            self.global_path_epochs.note(path.clone());
+        }
         let Some(winner) = winner else {
             return;
         };
@@ -1507,6 +1589,7 @@ impl LuaMemberIndex {
         }
         self.global_path_class_owner
             .insert(path.clone(), LuaMemberOwner::Type(winner.clone()));
+        self.global_path_epochs.note(path.clone());
         // The canonical mapping itself changed what the path slot names, on
         // top of the per-member moves in `rehome_global_path_class` (each
         // bumps on its own).
@@ -1645,6 +1728,8 @@ impl LuaMemberIndex {
                 self.definition_sites_by_file.remove(&site.file_id);
             }
         }
+        self.site_epochs.note(site.clone());
+        self.global_path_epochs.note(path);
     }
 
     /// Every path with at least one definition site, and its sites, in a stable
@@ -1791,8 +1876,10 @@ impl LuaMemberIndex {
         &self,
         member_id: LuaMemberId,
     ) -> Option<&LuaMemberIndexItem> {
+        crate::db_index::read_set::record_member_id(self, &member_id);
         let owner = self.member_current_owner.get(&member_id)?;
         let member_key = self.members.get(&member_id)?.get_key();
+        crate::db_index::read_set::record_member_map(self, owner);
         let member_items = self.owner_members.get(owner)?;
         let item = member_items.get_member(member_key)?;
         Some(item)
@@ -1846,7 +1933,7 @@ impl LuaMemberIndex {
     }
 
     pub fn get_member_owner(&self, id: &LuaMemberId) -> Option<&LuaMemberOwner> {
-        read_set::record_member_id(id);
+        read_set::record_member_id(self, id);
         self.member_current_owner.get(id)
     }
 
@@ -2031,6 +2118,7 @@ impl LuaMemberIndex {
         match ranges.binary_search_by_key(&range.start(), |range| range.start()) {
             Ok(index) | Err(index) => ranges.insert(index, range),
         }
+        self.file_write_epochs.note(file_id);
     }
 
     pub fn enclosing_function_scope_range(
@@ -2038,6 +2126,11 @@ impl LuaMemberIndex {
         file_id: FileId,
         position: TextSize,
     ) -> Option<TextRange> {
+        crate::db_index::read_set::record_file_scoped(
+            &self.file_write_epochs,
+            &file_id,
+            crate::db_index::read_set::FileScopedKind::MemberScope,
+        );
         let ranges = self.function_scope_ranges.get(&file_id)?;
         let mut index = ranges.partition_point(|range| range.start() <= position);
         while index > 0 {
@@ -2078,6 +2171,7 @@ impl LuaMemberIndex {
     }
 
     pub fn member_function_scope_range(&self, member_id: LuaMemberId) -> Option<TextRange> {
+        crate::db_index::read_set::record_member_id(self, &member_id);
         self.member_function_scope_ranges.get(&member_id).copied()
     }
 
@@ -2423,6 +2517,7 @@ impl LuaMemberIndex {
         self.non_overwriting_assignment_members.remove(&member_id);
         self.owner_only_members.remove(&member_id);
         self.synthesized_owner_members.remove(&member_id);
+        self.note_member_object_write(member_id);
         self.deferred_index_expr_members.remove(&member_id);
         self.member_function_scope_ranges.remove(&member_id);
         if let Some(set) = self.in_filed.get_mut(&member_id.file_id) {
@@ -2496,6 +2591,7 @@ impl LuaMemberIndex {
             }
         }
         self.function_scope_ranges.remove(&file_id);
+        self.file_write_epochs.note(file_id);
         self.remove_file_definition_sites(file_id);
         self.recompute_global_path_class_winners(file_id);
     }
@@ -2524,6 +2620,7 @@ impl LuaMemberIndex {
         affected.sort_unstable_by(|left, right| left.get_name().cmp(right.get_name()));
 
         for path in affected {
+            self.global_path_epochs.note(path.clone());
             if self
                 .global_path_class_candidates
                 .get(&path)
@@ -2889,6 +2986,15 @@ impl LuaIndex for LuaMemberIndex {
     }
 
     fn clear(&mut self) {
+        for file_id in self
+            .in_filed
+            .keys()
+            .chain(self.function_scope_ranges.keys())
+        {
+            self.file_write_epochs.note(*file_id);
+        }
+        self.global_path_epochs.clear();
+        self.site_epochs.clear();
         self.members.clear();
         self.in_filed.clear();
         self.owner_members.clear();
@@ -2907,6 +3013,7 @@ impl LuaIndex for LuaMemberIndex {
         self.move_clock = 0;
         self.owner_move_epochs.clear();
         self.key_move_epochs.clear();
+        self.member_move_epochs.clear();
         self.owner_only_members.clear();
         self.synthesized_owner_members.clear();
         self.deferred_index_expr_members.clear();

@@ -181,13 +181,15 @@ fn return_point_desc(point: &LuaReturnPoint) -> ReturnPointDesc {
 }
 
 /// Runs every speculatable item in `items` on workers and returns its
-/// outcome keyed by the item's position in `items`. Unsupported kinds are
-/// absent from the map; the caller attempts them live in drain order.
+/// outcome at the item's position in `items`. Unsupported kinds stay `None`;
+/// the caller attempts them live in drain order.
 pub(super) fn speculate(
     db: &DbIndex,
     infer_manager: &InferCacheManager,
     items: &[UnResolve],
-) -> FxHashMap<usize, SpecOutcome> {
+) -> Vec<Option<SpecOutcome>> {
+    let mut outcomes: Vec<Option<SpecOutcome>> = Vec::new();
+    outcomes.resize_with(items.len(), || None);
     // Descriptors are extracted here because `items` holds red syntax nodes:
     // neither the items nor a shared slice of them may cross a thread
     // boundary.
@@ -199,7 +201,7 @@ pub(super) fn speculate(
         by_file.entry(desc.file_id()).or_default().push((idx, desc));
     }
     if by_file.is_empty() {
-        return FxHashMap::default();
+        return outcomes;
     }
 
     let groups: Vec<(FileId, Vec<(usize, ItemDesc)>)> = by_file.into_iter().collect();
@@ -208,16 +210,20 @@ pub(super) fn speculate(
             compute_file(db, infer_manager, file_id, descs)
         };
 
-    if parallel::runs_inline(groups.len()) {
-        return groups.into_iter().flat_map(compute).collect();
+    let computed: Vec<(usize, SpecOutcome)> = if parallel::runs_inline(groups.len()) {
+        groups.into_iter().flat_map(compute).collect()
+    } else {
+        parallel::init_pool();
+        let mut computed = Vec::new();
+        rayon::in_place_scope(|_| {
+            computed = groups.into_par_iter().flat_map_iter(compute).collect();
+        });
+        computed
+    };
+    for (idx, outcome) in computed {
+        outcomes[idx] = Some(outcome);
     }
-
-    parallel::init_pool();
-    let mut computed = Vec::new();
-    rayon::in_place_scope(|_| {
-        computed = groups.into_par_iter().flat_map_iter(compute).collect();
-    });
-    computed.into_iter().collect()
+    outcomes
 }
 
 impl ItemDesc {

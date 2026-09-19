@@ -87,6 +87,13 @@ pub struct LuaSignatureIndex {
     param_write_versions: HashMap<LuaSignatureId, u64>,
     receiver_out_param_member_names: HashMap<String, usize>,
     in_file_receiver_out_param_member_names: HashMap<FileId, HashSet<String>>,
+    /// Write epochs for the file-keyed signature maps (`in_file_signatures`,
+    /// `in_file_receiver_out_param_member_names`) — `FileScopedKind::SignatureFile`.
+    pub(crate) file_write_epochs: crate::db_index::read_set::KeyedEpochs<FileId>,
+    /// Domain counter for name-keyed gmod metadata writes
+    /// (`receiver_out_param_member_names`) — `record_gmod_meta` readers have
+    /// no per-key clocks, so any write stales them.
+    pub(crate) gmod_meta_writes: u64,
 }
 
 /// A conservative true-branch parameter narrowing derived from a function body.
@@ -234,16 +241,28 @@ impl LuaSignatureIndex {
             param_write_versions: HashMap::default(),
             receiver_out_param_member_names: HashMap::default(),
             in_file_receiver_out_param_member_names: HashMap::default(),
+            file_write_epochs: crate::db_index::read_set::KeyedEpochs::default(),
+            gmod_meta_writes: 0,
         }
+    }
+
+    /// Domain-counter bump for name-keyed gmod metadata writes — see
+    /// `record_gmod_meta`/`untracked_reads_changed`.
+    fn note_gmod_meta_write(&mut self) {
+        self.gmod_meta_writes = self.gmod_meta_writes.wrapping_add(1);
     }
 
     pub fn get_or_create(&mut self, signature_id: LuaSignatureId) -> &mut LuaSignature {
         op_log::note_mut_ref(op_log::MutRef::Signature(signature_id));
         crate::db_index::read_set::record_signature(&signature_id);
-        self.in_file_signatures
+        if self
+            .in_file_signatures
             .entry(signature_id.get_file_id())
             .or_default()
-            .insert(signature_id);
+            .insert(signature_id)
+        {
+            self.file_write_epochs.note(signature_id.get_file_id());
+        }
         self.signatures.entry(signature_id).or_default()
     }
 
@@ -266,10 +285,14 @@ impl LuaSignatureIndex {
         signature_id: LuaSignatureId,
         signature: LuaSignature,
     ) {
-        self.in_file_signatures
+        if self
+            .in_file_signatures
             .entry(signature_id.get_file_id())
             .or_default()
-            .insert(signature_id);
+            .insert(signature_id)
+        {
+            self.file_write_epochs.note(signature_id.get_file_id());
+        }
         self.signatures.insert(signature_id, signature);
     }
 
@@ -301,7 +324,12 @@ impl LuaSignatureIndex {
                 },
             );
         }
-        self.local_func_decls.insert(signature_id, decl_id);
+        if self.local_func_decls.get(&signature_id) != Some(&decl_id) {
+            self.local_func_decls.insert(signature_id, decl_id);
+            // `local_func_decl_for` records a signature read: the write
+            // lands on that signature's contract clock.
+            self.note_return_write(signature_id);
+        }
     }
 
     pub fn clear_effective_valid_guard_signatures(&mut self) {
@@ -964,6 +992,8 @@ impl LuaSignatureIndex {
             .receiver_out_param_member_names
             .entry(member_name)
             .or_default() += 1;
+        self.note_gmod_meta_write();
+        self.file_write_epochs.note(file_id);
     }
 
     pub fn has_receiver_out_param_member_name(&self, member_name: &str) -> bool {
@@ -980,7 +1010,11 @@ impl LuaSignatureIndex {
     }
 
     pub fn get_file_signature_ids(&self, file_id: FileId) -> Option<&HashSet<LuaSignatureId>> {
-        crate::db_index::read_set::record_file_scoped(&file_id);
+        crate::db_index::read_set::record_file_scoped(
+            &self.file_write_epochs,
+            &file_id,
+            crate::db_index::read_set::FileScopedKind::SignatureFile,
+        );
         self.in_file_signatures.get(&file_id)
     }
 }
@@ -993,13 +1027,16 @@ impl LuaIndex for LuaSignatureIndex {
         self.clear_settled_reads(file_id);
         self.clear_inferred_guard_dependencies(file_id);
         if let Some(signature_ids) = self.in_file_signatures.remove(&file_id) {
+            self.file_write_epochs.note(file_id);
             for signature_id in signature_ids {
                 self.clear_inferred_return_dependencies(signature_id);
                 if self.signatures.remove(&signature_id).is_some() {
                     self.note_return_write(signature_id);
                     self.note_param_write(signature_id);
                 }
-                self.local_func_decls.remove(&signature_id);
+                if self.local_func_decls.remove(&signature_id).is_some() {
+                    self.note_return_write(signature_id);
+                }
             }
         }
         // Drop this file's valid-guard contributions explicitly and re-derive
@@ -1015,11 +1052,13 @@ impl LuaIndex for LuaSignatureIndex {
             .in_file_receiver_out_param_member_names
             .remove(&file_id)
         {
+            self.file_write_epochs.note(file_id);
             for member_name in member_names {
                 match self.receiver_out_param_member_names.get_mut(&member_name) {
                     Some(count) if *count > 1 => *count -= 1,
                     Some(_) => {
                         self.receiver_out_param_member_names.remove(&member_name);
+                        self.note_gmod_meta_write();
                     }
                     None => {}
                 }
@@ -1028,11 +1067,28 @@ impl LuaIndex for LuaSignatureIndex {
 
         // Also drop entries whose target decl lived in the removed file, even if
         // the signature key was not tracked in that file's signature set.
-        self.local_func_decls
-            .retain(|_, decl_id| decl_id.file_id != file_id);
+        let mut dropped_binds = Vec::new();
+        self.local_func_decls.retain(|signature_id, decl_id| {
+            let keep = decl_id.file_id != file_id;
+            if !keep {
+                dropped_binds.push(*signature_id);
+            }
+            keep
+        });
+        for signature_id in dropped_binds {
+            self.note_return_write(signature_id);
+        }
     }
 
     fn clear(&mut self) {
+        for file_id in self
+            .in_file_signatures
+            .keys()
+            .chain(self.in_file_receiver_out_param_member_names.keys())
+        {
+            self.file_write_epochs.note(*file_id);
+        }
+        self.note_gmod_meta_write();
         self.signatures.clear();
         self.in_file_signatures.clear();
         self.local_func_decls.clear();

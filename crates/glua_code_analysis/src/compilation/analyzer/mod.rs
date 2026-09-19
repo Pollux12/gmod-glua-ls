@@ -488,7 +488,6 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             context.settled_assign_claims.clear();
             context.settled_assign_candidate_counts.clear();
             context.settled_parent_closure_candidates.clear();
-            context.settled_return_attempts.clear();
             context.settled_member_key_candidates = None;
             context.settled_owner_candidates = None;
         }
@@ -606,16 +605,12 @@ fn attach_settled_index_expr_members(db: &mut DbIndex, context: &mut AnalyzeCont
     candidates.sort_by_key(|candidate| (candidate.file_id, candidate.value.get_range().start()));
     candidates.dedup();
     let mut retry = Vec::new();
+    let read_version = crate::db_index::read_set::InferenceReadVersion::capture(db);
 
-    // Only the candidate files are re-inferred, so only their caches are stale.
-    // Clearing the whole manager would also discard caches the passes that ran
-    // before this one built for files this pass never touches.
-    let candidate_files = candidates
-        .iter()
-        .map(|candidate| candidate.file_id)
-        .collect::<HashSet<_>>();
-    context.infer_manager.clear_files(&candidate_files);
-
+    // A candidate whose recorded reads did not move fails the same way it did
+    // on the attempt that recorded them, so it stays queued without paying
+    // another attach attempt. No record means the candidate has never run.
+    let mut pending = Vec::new();
     for candidate in candidates {
         let file_id = candidate.file_id;
         let member_id = LuaMemberId::new(candidate.value, file_id);
@@ -629,6 +624,38 @@ fn attach_settled_index_expr_members(db: &mut DbIndex, context: &mut AnalyzeCont
         {
             continue;
         }
+        if context
+            .settled_candidate_reads
+            .get(&(
+                SettledReadPass::Attach,
+                SettledCandidate::Attach(file_id, candidate.value),
+            ))
+            .is_some_and(|(version, reads)| !version.is_stale(db, reads))
+        {
+            retry.push(candidate);
+            continue;
+        }
+        pending.push(candidate);
+    }
+
+    // Only the candidate files are re-inferred, so only their caches are stale.
+    // Clearing the whole manager would also discard caches the passes that ran
+    // before this one built for files this pass never touches.
+    let candidate_files = pending
+        .iter()
+        .map(|candidate| candidate.file_id)
+        .collect::<HashSet<_>>();
+    context.infer_manager.clear_files(&candidate_files);
+
+    let mut drained_reads = Vec::new();
+    for candidate in pending {
+        let file_id = candidate.file_id;
+        let member_id = LuaMemberId::new(candidate.value, file_id);
+        crate::db_index::read_set::arm_with_member_maps();
+        let _drain = ReadDrain {
+            slot: &mut drained_reads,
+            key: SettledCandidate::Attach(file_id, candidate.value),
+        };
         let Some(prefix_expr) = db
             .get_vfs()
             .get_syntax_tree(&file_id)
@@ -657,6 +684,14 @@ fn attach_settled_index_expr_members(db: &mut DbIndex, context: &mut AnalyzeCont
         } else {
             attached = true;
         }
+    }
+    for (candidate, reads) in drained_reads {
+        context.record_settled_candidate_reads(
+            SettledReadPass::Attach,
+            candidate,
+            read_version,
+            reads,
+        );
     }
 
     context.settled_member_attach_candidates = retry;
@@ -764,6 +799,7 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
             &mut Vec::new(),
             &mut context.late_resolved_decls,
             &mut settled_parent_closures,
+            &mut context.unresolve_read_records,
             false,
         );
         for candidate in settled_parent_closures {
@@ -1114,8 +1150,9 @@ fn refresh_settled_expr_type_member_keys(
         .as_ref()
         .is_none_or(|(count, _)| *count != candidate_count)
     {
-        let mut candidates = HashMap::default();
-        for file_id in context.analyzed_file_ids() {
+        let mut file_ids: Vec<FileId> = context.analyzed_file_ids().into_iter().collect();
+        file_ids.sort_unstable();
+        let scanned = parallel::map_files_collect(db, &file_ids, |db, file_id| {
             let mut members = db
                 .get_member_index()
                 .get_file_members(file_id)
@@ -1124,10 +1161,12 @@ fn refresh_settled_expr_type_member_keys(
                 .map(|member| member.get_id())
                 .collect::<Vec<_>>();
             members.sort_unstable_by_key(|id| id.get_syntax_id().get_range().start());
-            if !members.is_empty() {
-                candidates.insert(file_id, members);
-            }
-        }
+            (file_id, members)
+        });
+        let candidates = scanned
+            .into_iter()
+            .filter(|(_, members)| !members.is_empty())
+            .collect();
         context.settled_member_key_candidates = Some((candidate_count, candidates));
     }
     let Some((_, candidates)) = context.settled_member_key_candidates.as_ref() else {
@@ -3934,6 +3973,13 @@ pub struct AnalyzeContext {
             crate::db_index::read_set::InferenceReadSet,
         ),
     >,
+    /// What each surviving unresolve item's last `try_resolve` attempt read,
+    /// kept across the wave pipelines and the settled tail's fixpoint calls so
+    /// a retained item whose inputs never moved is not re-derived against
+    /// identical state. Cleared when `set_force` flips attempt semantics:
+    /// a pre-force record does not describe what a force attempt reads.
+    pub(crate) unresolve_read_records:
+        HashMap<unresolve::UnResolveIdentity, unresolve::FixpointReadRecord>,
     /// Locals the unresolve waves settled after the walk bound their readers.
     /// See [`queue_settled_decl_dependents`].
     pub(crate) late_resolved_decls: HashSet<LuaTypeOwner>,
@@ -4004,6 +4050,10 @@ enum SettledReadPass {
     /// Settled and vice versa.
     DeclFull,
     MemberFull,
+    /// The settled member-attach retry. A candidate whose prefix reads have
+    /// not moved fails the same way it did last round, so it stays queued
+    /// without spending another attempt.
+    Attach,
 }
 
 /// One re-derivation candidate's identity inside a settled pass, for passes
@@ -4027,6 +4077,9 @@ enum SettledCandidate {
     /// One settled dynamic-field site, keyed by file and index-expression
     /// site.
     Dynamic(FileId, glua_parser::LuaSyntaxId),
+    /// One settled member-attach retry, keyed by file and the write's
+    /// index-expression site.
+    Attach(FileId, glua_parser::LuaSyntaxId),
 }
 
 impl SettledCandidate {
@@ -4036,9 +4089,9 @@ impl SettledCandidate {
             | SettledCandidate::Assign(decl_id, ..)
             | SettledCandidate::Global(decl_id, _) => decl_id.file_id,
             SettledCandidate::Member(member_id) => member_id.file_id,
-            SettledCandidate::IterVar(file_id, _) | SettledCandidate::Dynamic(file_id, _) => {
-                file_id
-            }
+            SettledCandidate::IterVar(file_id, _)
+            | SettledCandidate::Dynamic(file_id, _)
+            | SettledCandidate::Attach(file_id, _) => file_id,
         }
     }
 }
@@ -4109,6 +4162,7 @@ impl AnalyzeContext {
             settled_assign_claims: HashMap::default(),
             settled_assign_candidate_counts: HashMap::default(),
             settled_return_attempts: HashSet::default(),
+            unresolve_read_records: HashMap::default(),
             late_resolved_decls: HashSet::default(),
             infer_manager: InferCacheManager::new(),
             inferred_guard_dependencies: HashMap::default(),

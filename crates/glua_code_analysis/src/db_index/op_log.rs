@@ -189,11 +189,11 @@ thread_local! {
     /// only while armed, so the serial walk and other phases pay a single
     /// thread-local read per write.
     static DEPTH: Cell<u32> = const { Cell::new(0) };
-    static OPS: RefCell<Vec<LoggedOp>> = RefCell::new(Vec::new());
+    static OPS: RefCell<Vec<LoggedOp>> = const { RefCell::new(Vec::new()) };
     /// Mutable borrows handed out while armed; drained with the ops at the
     /// file boundary. Each note carries its position in the op stream so the
     /// merge can order the boundary replace against the logged writes.
-    static MUT_REFS: RefCell<Vec<MutRefNote>> = RefCell::new(Vec::new());
+    static MUT_REFS: RefCell<Vec<MutRefNote>> = const { RefCell::new(Vec::new()) };
     /// Coarse per-domain read flags for domains without per-key read
     /// recording; see [`UntrackedDomain`].
     static UNTRACKED_READS: Cell<u32> = const { Cell::new(0) };
