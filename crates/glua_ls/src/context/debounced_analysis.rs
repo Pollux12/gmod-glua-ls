@@ -1200,6 +1200,9 @@ impl DebouncedAnalysis {
                     self.refresh_dirty_state().await;
                     self.reindex_notify.notify_waiters();
                     if scheduled {
+                        self.file_diagnostic
+                            .note_scoped_sweep_files(exclude.iter().copied())
+                            .await;
                         self.arm_idle_workspace_diagnostic(&mut idle_workspace_diagnostic_token);
                     }
                     continue;
@@ -1260,6 +1263,9 @@ impl DebouncedAnalysis {
                 self.refresh_dirty_state().await;
                 self.reindex_notify.notify_waiters();
                 if scheduled {
+                    self.file_diagnostic
+                        .note_scoped_sweep_files(exclude.iter().copied())
+                        .await;
                     self.arm_idle_workspace_diagnostic(&mut idle_workspace_diagnostic_token);
                 }
                 continue;
@@ -1364,6 +1370,11 @@ impl DebouncedAnalysis {
 
                 // Arm an idle workspace diagnostic refresh so closed files hit
                 // by cross-file changes get re-diagnosed once typing pauses.
+                // The sweep is scoped to the files this burst touched —
+                // refresh_exclude has accumulated every edited and rippled id.
+                self.file_diagnostic
+                    .note_scoped_sweep_files(refresh_exclude.iter().copied())
+                    .await;
                 self.arm_idle_workspace_diagnostic(&mut idle_workspace_diagnostic_token);
             }
 

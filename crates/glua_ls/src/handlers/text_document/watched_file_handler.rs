@@ -129,6 +129,12 @@ pub async fn on_did_change_watched_files(
         }
     }
 
+    // The same touched set scopes the armed pull's sweep below: it covers the
+    // files the settle moved, not the whole workspace.
+    context
+        .file_diagnostic()
+        .note_scoped_sweep_files(file_ids.iter().copied())
+        .await;
     context
         .file_diagnostic()
         .add_files_diagnostic_task(file_ids, interval, Some(context.debounced_analysis_arc()))

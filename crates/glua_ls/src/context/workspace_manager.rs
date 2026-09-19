@@ -220,6 +220,9 @@ impl WorkspaceManager {
 
             // Cancel diagnostics and update status without holding analysis lock
             file_diagnostic.cancel_workspace_diagnostic().await;
+            // A config reload can move any file's diagnostics — the sweep must
+            // cover everything, which covers the pending scoped set too.
+            file_diagnostic.clear_scoped_sweep_files().await;
             // Raise, never lower — a pending `Slow` request must survive.
             workspace_diagnostic_status
                 .fetch_max(WorkspaceDiagnosticLevel::Fast.to_u8(), Ordering::AcqRel);
@@ -278,6 +281,9 @@ impl WorkspaceManager {
 
             // Cancel diagnostics and update status without holding analysis lock
             file_diagnostic.cancel_workspace_diagnostic().await;
+            // A reindex can move any file's diagnostics — full sweep, which
+            // also covers whatever the scoped set had noted.
+            file_diagnostic.clear_scoped_sweep_files().await;
             workspace_diagnostic_status
                 .fetch_max(WorkspaceDiagnosticLevel::Fast.to_u8(), Ordering::AcqRel);
 

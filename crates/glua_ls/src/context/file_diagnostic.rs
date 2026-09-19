@@ -83,6 +83,14 @@ pub struct FileDiagnostic {
     diagnostic_tokens: Arc<Mutex<HashMap<FileId, CancellationToken>>>,
     workspace_diagnostic_token: Arc<Mutex<Option<CancellationToken>>>,
     cached_file_diagnostics: Arc<Mutex<HashMap<Uri, Vec<Diagnostic>>>>,
+    /// Files an edit reported as diagnostically touched (re-analysed files,
+    /// readers the export diff named, textual-refresh candidates). The next
+    /// `Fast` workspace sweep diagnoses exactly this set instead of the whole
+    /// workspace: nothing outside it can have a stale report, since a
+    /// diagnostic only moves when a fact the file reads moved, and the dirty
+    /// machinery names every such file. `None`-equivalent (empty) means the
+    /// arm was not edit-scoped — open/reindex/config paths still sweep all.
+    scoped_sweep_files: Arc<Mutex<rustc_hash::FxHashSet<FileId>>>,
     shared_diagnostic_data_cache: SharedDiagnosticDataCache,
     /// Whether diagnostics reach this client by being fetched *and* the client
     /// accepts `workspace/diagnostic/refresh`.
@@ -110,6 +118,7 @@ impl FileDiagnostic {
             diagnostic_tokens: Arc::new(Mutex::new(HashMap::new())),
             workspace_diagnostic_token: Arc::new(Mutex::new(None)),
             cached_file_diagnostics: Arc::new(Mutex::new(HashMap::new())),
+            scoped_sweep_files: Arc::new(Mutex::new(rustc_hash::FxHashSet::default())),
             shared_diagnostic_data_cache: SharedDiagnosticDataCache::default(),
             status_bar,
             fetches_diagnostics,
@@ -325,6 +334,40 @@ impl FileDiagnostic {
             self.add_diagnostic_task(file_id, interval, debounced_analysis.clone())
                 .await;
         }
+    }
+
+    /// Accumulate files whose diagnostics an edit may have moved. The debounced
+    /// loop extends this across the whole burst (each ripple's widened set,
+    /// each textual-refresh batch), so the armed idle sweep covers every file
+    /// the burst touched rather than only the last settle's.
+    pub async fn note_scoped_sweep_files(&self, file_ids: impl IntoIterator<Item = FileId>) {
+        self.scoped_sweep_files.lock().await.extend(file_ids);
+    }
+
+    /// The files an edit-scoped sweep owes, sorted for deterministic worker
+    /// dispatch. `None` means no scoped set accumulated — sweep the whole
+    /// workspace (the open/reindex/config arms leave it empty).
+    async fn take_scoped_sweep_files(&self) -> Option<Vec<FileId>> {
+        let mut slot = self.scoped_sweep_files.lock().await;
+        if slot.is_empty() {
+            return None;
+        }
+        let mut files: Vec<FileId> = slot.drain().collect();
+        files.sort_unstable();
+        Some(files)
+    }
+
+    /// Put back the undiagnosed remainder when a scoped sweep is cut short, so
+    /// the re-armed pull re-sweeps it instead of losing it to the cancel.
+    async fn restore_scoped_sweep_files(&self, file_ids: impl IntoIterator<Item = FileId>) {
+        self.scoped_sweep_files.lock().await.extend(file_ids);
+    }
+
+    /// Forget the pending scoped set because a sweep about to run covers the
+    /// whole workspace anyway (config reloads, explicit reindexes): the noted
+    /// files are swept as part of it, so nothing is lost.
+    pub async fn clear_scoped_sweep_files(&self) {
+        self.scoped_sweep_files.lock().await.clear();
     }
 
     /// Drop the remembered report for a URI without telling the client.
@@ -594,9 +637,23 @@ impl FileDiagnostic {
         );
         watchdog_status.set_phase("Preparing workspace diagnostics (fast pull)");
 
+        // An armed idle sweep after an edit is scoped to the files the burst
+        // touched; the other Fast arms (open, reindex, config) leave the slot
+        // empty and sweep everything. Scoped ids are a subset of the main
+        // workspace list, so retaining keeps its size-ordered dispatch.
+        let scoped = self.take_scoped_sweep_files().await;
         let (main_workspace_file_ids, shared_data) = {
             let analysis = self.analysis.read().await;
-            let file_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
+            let mut file_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
+            if let Some(scoped_ids) = &scoped {
+                let scoped_set: std::collections::HashSet<FileId> =
+                    scoped_ids.iter().copied().collect();
+                file_ids.retain(|file_id| scoped_set.contains(file_id));
+                info!(
+                    "edit-scoped workspace diagnostic sweep: {} file(s)",
+                    file_ids.len()
+                );
+            }
             info!(
                 "precomputing shared diagnostic data for {} workspace files",
                 file_ids.len()
@@ -670,6 +727,12 @@ impl FileDiagnostic {
                     }
                 }
             }
+        }
+        if cancel_token.is_cancelled() {
+            // Re-diagnosing the few files already completed is cheap and keeps
+            // the next armed sweep's coverage exact.
+            self.restore_scoped_sweep_files(scoped.unwrap_or_default())
+                .await;
         }
         if count < valid_file_count && !cancel_token.is_cancelled() {
             warn!(
@@ -913,6 +976,9 @@ async fn push_workspace_diagnostic(
     }
     watchdog_status.set_phase("Preparing workspace diagnostics (push)");
 
+    // The push sweep runs only as the initial workspace pass (push clients get
+    // post-edit coverage from per-file diagnostic tasks), so it deliberately
+    // leaves the scoped-sweep slot alone and diagnoses everything.
     let (main_workspace_file_ids, shared_data) = {
         let read_analysis = analysis.read().await;
         let file_ids = read_analysis.get_main_workspace_file_ids_for_diagnostics();
@@ -1160,5 +1226,88 @@ mod tests {
         )?;
 
         Ok(())
+    }
+
+    /// The scoped-sweep slot accumulates the touched set across a burst, hands
+    /// it out sorted exactly once, then reports nothing until the next note.
+    #[gtest]
+    fn scoped_sweep_files_round_trip() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let (connection, _peer) = Connection::memory();
+            let client = Arc::new(ClientProxy::new(connection));
+            let status_bar = Arc::new(StatusBar::new(client.clone(), true));
+            let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
+            let file_diagnostic = FileDiagnostic::new(analysis, status_bar, client, false);
+
+            verify_that!(file_diagnostic.take_scoped_sweep_files().await, none())?;
+
+            file_diagnostic
+                .note_scoped_sweep_files([FileId::new(7), FileId::new(3), FileId::new(7)])
+                .await;
+            file_diagnostic
+                .note_scoped_sweep_files([FileId::new(9)])
+                .await;
+            verify_that!(
+                file_diagnostic.take_scoped_sweep_files().await.as_deref(),
+                some(eq(&[FileId::new(3), FileId::new(7), FileId::new(9)]))
+            )?;
+            verify_that!(file_diagnostic.take_scoped_sweep_files().await, none())?;
+
+            file_diagnostic
+                .restore_scoped_sweep_files([FileId::new(5)])
+                .await;
+            verify_that!(
+                file_diagnostic.take_scoped_sweep_files().await.as_deref(),
+                some(eq(&[FileId::new(5)]))
+            )?;
+            Ok(())
+        })
+    }
+
+    /// A noted touched set scopes the fast pull's sweep to the files the burst
+    /// moved; without one the pull still sweeps every workspace file.
+    #[gtest]
+    fn fast_pull_scopes_to_noted_files() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let mut analysis = EmmyLuaAnalysis::new();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_scoped_fast_pull_workspace");
+            analysis.add_main_workspace(workspace.clone());
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            analysis.update_config(Arc::new(emmyrc));
+
+            let uri_a = file_path_to_uri(&workspace.join("lua/autorun/sh_a.lua"))
+                .expect("uri A should parse");
+            let file_a = analysis
+                .update_file_by_uri(&uri_a, Some("local a = 1".to_string()))
+                .map(|(id, _)| id)
+                .expect("file A should be indexed");
+            let uri_b = file_path_to_uri(&workspace.join("lua/autorun/sh_b.lua"))
+                .expect("uri B should parse");
+            analysis.update_file_by_uri(&uri_b, Some("local b = 1".to_string()));
+
+            let (connection, _peer) = Connection::memory();
+            let client = Arc::new(ClientProxy::new(connection));
+            let status_bar = Arc::new(StatusBar::new(client.clone(), true));
+            let analysis = Arc::new(RwLock::new(analysis));
+            let file_diagnostic = FileDiagnostic::new(analysis.clone(), status_bar, client, false);
+
+            // Scoped: only the noted file is swept.
+            file_diagnostic.note_scoped_sweep_files([file_a]).await;
+            let report = file_diagnostic
+                .pull_workspace_diagnostics_fast(CancellationToken::new())
+                .await;
+            verify_that!(report.len(), eq(1))?;
+            verify_that!(&report[0].0, eq(&uri_a))?;
+
+            // Slot drained: the next pull sweeps the whole workspace again.
+            let report = file_diagnostic
+                .pull_workspace_diagnostics_fast(CancellationToken::new())
+                .await;
+            verify_that!(report.len(), eq(2))?;
+            Ok(())
+        })
     }
 }

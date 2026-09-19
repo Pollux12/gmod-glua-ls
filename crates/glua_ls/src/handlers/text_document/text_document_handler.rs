@@ -246,7 +246,9 @@ fn parse_error_range_to_lsp_range(
 /// applied to. Files beyond the edited one get a diagnostic-only task (no
 /// debounce slot), and when anything beyond the edited file moved the
 /// workspace level is raised to `Fast` — never lowered — with a refresh
-/// request so pull clients re-poll.
+/// request so pull clients re-poll. The widen list (plus the edited file)
+/// also scopes that pull's sweep, so it re-diagnoses the touched set rather
+/// than the whole workspace.
 async fn handle_widened_refresh(
     context: &ServerContextSnapshot,
     file_id: Option<FileId>,
@@ -260,6 +262,10 @@ async fn handle_widened_refresh(
     if widened.is_empty() {
         return;
     }
+    context
+        .file_diagnostic()
+        .note_scoped_sweep_files(widened.iter().copied().chain(file_id))
+        .await;
     context
         .file_diagnostic()
         .add_files_diagnostic_task(widened, interval, None)

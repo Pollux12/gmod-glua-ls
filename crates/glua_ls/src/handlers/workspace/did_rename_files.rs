@@ -85,6 +85,10 @@ pub async fn on_did_rename_files_handler(
         if !affected.is_empty() {
             context
                 .file_diagnostic()
+                .note_scoped_sweep_files(affected.iter().copied())
+                .await;
+            context
+                .file_diagnostic()
                 .add_files_diagnostic_task(affected, interval, None)
                 .await;
             context
