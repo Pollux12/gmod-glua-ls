@@ -319,6 +319,7 @@ fn report_unsafe_receiver(
                 )
                 || is_expr_guarded_by_current_type_guard_condition(semantic_model, receiver)
                 || is_expr_guarded_by_current_truthiness_condition(semantic_model, receiver)
+                || is_expr_guarded_by_short_circuit(semantic_model, receiver)
         };
         if guarded {
             return false;
@@ -733,6 +734,7 @@ fn check_index_expr(
                 // `report_unsafe_receiver`. Without it the guard held for the
                 // call form and not the index form of the same access.
                 || is_expr_guarded_by_current_truthiness_condition(semantic_model, &prefix)
+                || is_expr_guarded_by_short_circuit(semantic_model, &prefix)
         };
         if guarded {
             return Some(());
@@ -1431,10 +1433,25 @@ fn is_expr_guarded_by_current_truthiness_condition(
 /// match goes through [`stable_expr_text_matches`]: `if f() then f():m() end`
 /// spells the same text either side of the guard but calls the function again.
 fn condition_proves_expr_truthy(condition: &LuaExpr, expr: &LuaExpr) -> bool {
+    // A truthy result still means the condition was evaluated; if evaluating it
+    // necessarily dereferences `expr`, `expr` is non-nil regardless.
+    if eval_requires_non_nil(condition, expr) {
+        return true;
+    }
     match condition {
         LuaExpr::ParenExpr(paren) => paren
             .get_expr()
             .is_some_and(|inner| condition_proves_expr_truthy(&inner, expr)),
+        // `not x` truthy means `x` was falsy, so the falsy predicate answers.
+        LuaExpr::UnaryExpr(unary)
+            if unary
+                .get_op_token()
+                .is_some_and(|token| token.get_op() == UnaryOperator::OpNot) =>
+        {
+            unary
+                .get_expr()
+                .is_some_and(|inner| condition_falsy_proves_expr_non_nil(&inner, expr))
+        }
         LuaExpr::BinaryExpr(binary) => {
             let Some(op) = binary.get_op_token().map(|op| op.get_op()) else {
                 return false;
@@ -1443,6 +1460,12 @@ fn condition_proves_expr_truthy(condition: &LuaExpr, expr: &LuaExpr) -> bool {
                 BinaryOperator::OpAnd => binary.get_exprs().is_some_and(|(left, right)| {
                     condition_proves_expr_truthy(&left, expr)
                         || condition_proves_expr_truthy(&right, expr)
+                }),
+                // `A or B` truthy means either arm held; the proof must survive
+                // under both.
+                BinaryOperator::OpOr => binary.get_exprs().is_some_and(|(left, right)| {
+                    condition_proves_expr_truthy(&left, expr)
+                        && condition_proves_expr_truthy(&right, expr)
                 }),
                 BinaryOperator::OpNe => binary.get_exprs().is_some_and(|(left, right)| {
                     (is_nil_literal_expr(&right) && stable_expr_text_matches(&left, expr))
@@ -1453,6 +1476,181 @@ fn condition_proves_expr_truthy(condition: &LuaExpr, expr: &LuaExpr) -> bool {
         }
         _ => stable_expr_text_matches(condition, expr),
     }
+}
+
+/// Whether `condition` evaluating falsy proves `expr` non-nil — the dual of
+/// [`condition_proves_expr_truthy`], used for `or` right operands and `else`
+/// branches. `not x` falsy means `x` truthy, and `x == nil` falsy means `x`
+/// is not nil; nested `or` chains falsy mean every arm was falsy.
+fn condition_falsy_proves_expr_non_nil(condition: &LuaExpr, expr: &LuaExpr) -> bool {
+    if eval_requires_non_nil(condition, expr) {
+        return true;
+    }
+    match condition {
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .is_some_and(|inner| condition_falsy_proves_expr_non_nil(&inner, expr)),
+        LuaExpr::UnaryExpr(unary)
+            if unary
+                .get_op_token()
+                .is_some_and(|token| token.get_op() == UnaryOperator::OpNot) =>
+        {
+            unary
+                .get_expr()
+                .is_some_and(|inner| condition_proves_expr_truthy(&inner, expr))
+        }
+        LuaExpr::BinaryExpr(binary) => {
+            let Some(op) = binary.get_op_token().map(|op| op.get_op()) else {
+                return false;
+            };
+            match op {
+                // `x == nil` falsy means x is not nil. `x ~= nil` falsy means
+                // x IS nil — the opposite of a proof.
+                BinaryOperator::OpEq => binary.get_exprs().is_some_and(|(left, right)| {
+                    (is_nil_literal_expr(&right) && stable_expr_text_matches(&left, expr))
+                        || (is_nil_literal_expr(&left) && stable_expr_text_matches(&right, expr))
+                }),
+                // `A or B` falsy means both arms were falsy; either proof holds.
+                BinaryOperator::OpOr => binary.get_exprs().is_some_and(|(left, right)| {
+                    condition_falsy_proves_expr_non_nil(&left, expr)
+                        || condition_falsy_proves_expr_non_nil(&right, expr)
+                }),
+                // `A and B` falsy means A falsy, or A truthy and B falsy — both
+                // paths need to prove non-nil.
+                BinaryOperator::OpAnd => binary.get_exprs().is_some_and(|(left, right)| {
+                    condition_falsy_proves_expr_non_nil(&left, expr)
+                        && condition_falsy_proves_expr_non_nil(&right, expr)
+                }),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Whether evaluating `condition` necessarily dereferences `expr` — indexing,
+/// calling, arithmetically operating on, or taking its length — in a position
+/// that always runs. Reaching any later operand means the evaluation did not
+/// error, so `expr` is non-nil. `x.f and x:M()`, `x:M1() or x:M2()`, and
+/// `not x.f or x:M()` all qualify; bare reads and `f(x)` do not, since reading
+/// or passing nil is legal.
+fn eval_requires_non_nil(condition: &LuaExpr, expr: &LuaExpr) -> bool {
+    match condition {
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .is_some_and(|inner| eval_requires_non_nil(&inner, expr)),
+        LuaExpr::UnaryExpr(unary) => {
+            let Some(inner) = unary.get_expr() else {
+                return false;
+            };
+            match unary.get_op_token().map(|token| token.get_op()) {
+                // `#x`, `-x`, `~x` error on nil; `not x` is legal for nil.
+                Some(UnaryOperator::OpLen | UnaryOperator::OpUnm | UnaryOperator::OpBNot) => {
+                    stable_expr_text_matches(&inner, expr) || eval_requires_non_nil(&inner, expr)
+                }
+                _ => eval_requires_non_nil(&inner, expr),
+            }
+        }
+        LuaExpr::BinaryExpr(binary) => {
+            let Some(op) = binary.get_op_token().map(|token| token.get_op()) else {
+                return false;
+            };
+            let Some((left, right)) = binary.get_exprs() else {
+                return false;
+            };
+            match op {
+                // Only the left operand of a short-circuit always evaluates.
+                BinaryOperator::OpAnd | BinaryOperator::OpOr => eval_requires_non_nil(&left, expr),
+                // Equality accepts nil operands; only nested dereferences count.
+                BinaryOperator::OpEq | BinaryOperator::OpNe => {
+                    eval_requires_non_nil(&left, expr) || eval_requires_non_nil(&right, expr)
+                }
+                // Ordering comparisons error on nil operands, like arithmetic.
+                BinaryOperator::OpLt
+                | BinaryOperator::OpLe
+                | BinaryOperator::OpGt
+                | BinaryOperator::OpGe => {
+                    stable_expr_text_matches(&left, expr)
+                        || stable_expr_text_matches(&right, expr)
+                        || eval_requires_non_nil(&left, expr)
+                        || eval_requires_non_nil(&right, expr)
+                }
+                // Arithmetic, bitwise and concat all error on nil operands.
+                _ => {
+                    stable_expr_text_matches(&left, expr)
+                        || stable_expr_text_matches(&right, expr)
+                        || eval_requires_non_nil(&left, expr)
+                        || eval_requires_non_nil(&right, expr)
+                }
+            }
+        }
+        LuaExpr::IndexExpr(index_expr) => {
+            // `t[k]` errors when `t` is nil. A nil key read is legal — only a
+            // nil-key *write* errors — so the key contributes nested
+            // dereferences but not a proof of its own value.
+            index_expr.get_prefix_expr().is_some_and(|prefix| {
+                stable_expr_text_matches(&prefix, expr) || eval_requires_non_nil(&prefix, expr)
+            }) || match index_expr.get_index_key() {
+                Some(glua_parser::LuaIndexKey::Expr(key_expr)) => {
+                    eval_requires_non_nil(&key_expr, expr)
+                }
+                _ => false,
+            }
+        }
+        LuaExpr::CallExpr(call_expr) => {
+            // `x(...)`, `x.f(...)` and `x:m()` all dereference the call's
+            // prefix; argument evaluation is unconditional but bare `f(x)`
+            // only reads the value.
+            call_expr.get_prefix_expr().is_some_and(|prefix| {
+                stable_expr_text_matches(&prefix, expr) || eval_requires_non_nil(&prefix, expr)
+            }) || call_expr
+                .get_args_list()
+                .is_some_and(|args| args.get_args().any(|arg| eval_requires_non_nil(&arg, expr)))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `expr` sits in the right operand of an `and`/`or` whose left operand
+/// already proves it non-nil. `x and x:M()` runs the call only when `x` was
+/// truthy; `not x or x:M()` runs it only when `x` was truthy too. Uses whose
+/// evaluation the left side already performed — `x.f and x:M()` — are covered
+/// through [`eval_requires_non_nil`].
+fn is_expr_guarded_by_short_circuit(_semantic_model: &SemanticModel, expr: &LuaExpr) -> bool {
+    if !is_stable_guard_expr(expr) {
+        return false;
+    }
+    let expr_range = expr.syntax().text_range();
+    for ancestor in expr.syntax().ancestors() {
+        // The LHS ran when the closure was built, not when it runs.
+        if LuaClosureExpr::cast(ancestor.clone()).is_some() {
+            break;
+        }
+        let Some(binary) = LuaBinaryExpr::cast(ancestor) else {
+            continue;
+        };
+        let Some(op) = binary.get_op_token().map(|token| token.get_op()) else {
+            continue;
+        };
+        if !matches!(op, BinaryOperator::OpAnd | BinaryOperator::OpOr) {
+            continue;
+        }
+        let Some((left, right)) = binary.get_exprs() else {
+            continue;
+        };
+        // A use inside the left operand is not conditioned by this operator.
+        if !range_contains(right.syntax().text_range(), expr_range) {
+            continue;
+        }
+        let guarded = match op {
+            BinaryOperator::OpAnd => condition_proves_expr_truthy(&left, expr),
+            _ => condition_falsy_proves_expr_non_nil(&left, expr),
+        };
+        if guarded {
+            return true;
+        }
+    }
+    false
 }
 
 /// [`expr_text_matches`], restricted to expressions that name the same value

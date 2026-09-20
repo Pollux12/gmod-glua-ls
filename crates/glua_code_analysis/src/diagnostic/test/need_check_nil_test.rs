@@ -14882,4 +14882,68 @@ mod test {
             );
         }
     }
+
+    /// `self` fields persist across calls, so a read placed before the
+    /// in-function write is not definite nil. `not self.x or not self.x:M()`
+    /// guards the call in the `or` RHS either way.
+    #[gtest]
+    fn or_rhs_self_field_read_before_in_function_write_is_not_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            ---@class PartSnd
+            function PartSnd:IsPlaying() return true end
+            function PartSnd:Stop() end
+
+            ---@class PartCls
+            ---@field snd2 PartSnd?
+
+            ---@param self PartCls
+            ---@param moving boolean
+            local function animate(self, moving)
+                if moving and self.snd and self.snd:IsPlaying() then
+                    self.snd:Stop()
+                    self.snd = nil
+                elseif moving and (not self.snd or not self.snd:IsPlaying()) then
+                    self.snd = PartSnd
+                end
+                if moving and self.snd2 and self.snd2:IsPlaying() then
+                end
+                if moving and (not self.snd2 or not self.snd2:IsPlaying()) then
+                end
+            end
+        "#;
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(true)
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
+    }
+
+    /// The `or` short-circuit only protects the RHS when the LHS *falsy* case
+    /// proves the receiver non-nil. A bare `x or x:M()` reaches the call with
+    /// `x` falsy — possibly nil — so it must still report, as must an
+    /// unguarded use of a different field.
+    #[gtest]
+    fn or_rhs_with_falsy_receiver_still_reports_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            ---@class PartSnd
+            function PartSnd:IsPlaying() return true end
+
+            ---@class PartCls
+
+            ---@param self PartCls
+            local function animate(self)
+                local a = self.snd or self.snd:IsPlaying()
+                self.other:Stop()
+            end
+        "#;
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(false)
+        );
+    }
 }
