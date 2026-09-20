@@ -6,6 +6,7 @@ use crate::{
     semantic::{
         member::find_members,
         type_check::{
+            complex_type::structural_object_from_members,
             intersection_utils::intersection_to_object, type_check_context::TypeCheckContext,
         },
     },
@@ -263,6 +264,20 @@ fn check_ref_class(
             } else {
                 Err(TypeCheckFailReason::TypeNotMatch)
             }
+        }
+        LuaType::MergedTable(_) => {
+            // A merged table's runtime value carries every component's members,
+            // so structurally check the merged member view like a table literal.
+            let object_type = match structural_object_from_members(context, compact_type) {
+                Some(LuaType::Object(object_type)) => object_type,
+                _ => LuaObjectType::new_with_fields(Default::default(), Vec::new()).into(),
+            };
+            check_ref_type_compact_object(
+                context,
+                &object_type,
+                source_id,
+                check_guard.next_level()?,
+            )
         }
         LuaType::Table => Ok(()),
         LuaType::TableOf(inner) => check_general_type_compact(

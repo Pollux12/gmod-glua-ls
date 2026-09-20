@@ -3467,3 +3467,92 @@ fn member_write_of_missing_doc_field_reports_member_reason() {
     assert_eq!(mismatches.len(), 1, "{mismatches:#?}");
     assert!(mismatches[0].message.contains("Damage"), "{mismatches:#?}");
 }
+/// A global table built by member writes across files infers as `MergedTable`;
+/// passing it to a class parameter must member-check the merged structure
+/// rather than failing with a bare `TypeNotMatch`.
+#[test]
+fn merged_table_across_files_satisfies_partial_class() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    let mismatches = merged_table_param_diagnostics(
+        &mut ws,
+        r#"
+            ---@class (partial) BulletT4
+            ---@field Num? number
+            ---@field Damage? number
+        "#,
+        r#"
+            bullet.Damage = 20
+        "#,
+    );
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+/// The merged-table check must still report a genuinely incompatible member.
+#[test]
+fn merged_table_across_files_reports_required_member_mismatch() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    let mismatches = merged_table_param_diagnostics(
+        &mut ws,
+        r#"
+            ---@class (partial) BulletT4
+            ---@field Num? number
+            ---@field Damage number
+        "#,
+        r#"
+            bullet.Damage = "not a number"
+        "#,
+    );
+    assert_eq!(mismatches.len(), 1, "{mismatches:#?}");
+}
+
+#[cfg(test)]
+fn merged_table_param_diagnostics(
+    ws: &mut crate::VirtualWorkspace,
+    class_def: &str,
+    other_file: &str,
+) -> Vec<lsp_types::Diagnostic> {
+    ws.analysis
+        .diagnostic
+        .enable_only(crate::DiagnosticCode::ParamTypeMismatch);
+    let file_ids = ws.def_files(vec![
+        (
+            "a.lua",
+            &format!(
+                r#"
+                {class_def}
+
+                ---@param b BulletT4
+                function fire(b) end
+
+                bullet = {{}}
+                bullet.Num = 1
+                bullet.Damage = 10
+                fire(bullet)
+            "#
+            ),
+        ),
+        (
+            "b.lua",
+            &format!(
+                r#"
+                bullet = {{}}
+                bullet.Num = 2
+                {other_file}
+            "#
+            ),
+        ),
+    ]);
+    ws.analysis
+        .diagnose_file(file_ids[0], tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    crate::DiagnosticCode::ParamTypeMismatch
+                        .get_name()
+                        .to_string(),
+                ))
+        })
+        .collect()
+}

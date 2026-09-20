@@ -203,7 +203,10 @@ fn check_merged_table_type_compact(
     check_general_type_compact(context, &object, compact_type, check_guard.next_level()?)
 }
 
-fn structural_object_from_members(context: &TypeCheckContext, typ: &LuaType) -> Option<LuaType> {
+pub(super) fn structural_object_from_members(
+    context: &TypeCheckContext,
+    typ: &LuaType,
+) -> Option<LuaType> {
     let members = find_members(context.db, typ).unwrap_or_default();
     // A key several members write to is worth all of them. Collecting straight
     // into the map would keep whichever one `find_members` happened to yield
