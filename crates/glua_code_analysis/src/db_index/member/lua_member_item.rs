@@ -1231,7 +1231,8 @@ fn select_member_ids_by_workspace_and_realm_from_indices(
                 .filter(|member_id| {
                     member_index.get_member(member_id).is_some_and(|m| {
                         m.get_feature().is_meta_decl()
-                            || db.get_type_index()
+                            || db
+                                .get_type_index()
                                 .get_type_cache(&m.get_id().into())
                                 .is_some_and(|cache| cache.is_doc())
                     })
@@ -1365,7 +1366,8 @@ fn select_member_ids_by_workspace_and_realm(
                 .filter(|mid| {
                     member_index.get_member(mid).is_some_and(|m| {
                         m.get_feature().is_meta_decl()
-                            || db.get_type_index()
+                            || db
+                                .get_type_index()
                                 .get_type_cache(&m.get_id().into())
                                 .is_some_and(|cache| cache.is_doc())
                     })
