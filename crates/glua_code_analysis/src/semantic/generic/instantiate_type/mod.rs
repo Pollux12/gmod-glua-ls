@@ -116,7 +116,12 @@ fn instantiate_tuple(db: &DbIndex, tuple: &LuaTupleType, substitutor: &TypeSubst
                                     }
                                 }
                                 SubstitutorValue::Type(ty) => new_types.push(ty.default().clone()),
-                                SubstitutorValue::MultiBase(base) => new_types.push(base.clone()),
+                                // `T...` bound to an open pack keeps the pack in
+                                // the tuple tail, matching the `{ ... }`
+                                // `Tuple([Variadic(t)])` encoding.
+                                SubstitutorValue::MultiBase(base) => new_types.push(
+                                    LuaType::Variadic(VariadicType::Base(base.clone()).into()),
+                                ),
                             }
                         }
                     }

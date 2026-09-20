@@ -554,17 +554,33 @@ mod tests {
             .analysis
             .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
             .unwrap_or_default();
-        // The point is that this terminates at all, and the type it settles on
-        // is what proves it: an unbounded arm taken literally cannot produce a
-        // finite union, so pinning the union pins the bound.
-        let messages = diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.message.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(messages.len(), 1, "{messages:?}");
+        // The point is that this terminates at all, and the type it settles
+        // on is what proves it: an unbounded arm taken literally cannot
+        // produce a finite union. `outer` forwards its `...` into `forward`,
+        // so `forward`'s vararg stays `integer` and `integer ...` satisfies
+        // `@return integer`.
         assert!(
-            messages[0].contains("`(1 ...|unknown ...)`"),
-            "spread should yield one slot per unbounded arm: {messages:?}"
+            diagnostics.is_empty(),
+            "forwarded varargs contribute their element types, not the pack: {diagnostics:#?}"
+        );
+        use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr};
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let outer_call = semantic_model
+            .get_root()
+            .descendants::<LuaCallExpr>()
+            .find(|call| call.syntax().text() == "outer(1)")
+            .expect("outer(1) call");
+        let outer_result = semantic_model
+            .infer_expr(LuaExpr::CallExpr(outer_call))
+            .unwrap_or(crate::LuaType::Unknown);
+        assert_eq!(
+            ws.humanize_type(outer_result),
+            "integer",
+            "an unbounded spread arm must not explode into a per-slot union"
         );
     }
 }

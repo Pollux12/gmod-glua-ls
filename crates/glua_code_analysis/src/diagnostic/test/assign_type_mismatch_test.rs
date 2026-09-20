@@ -3696,3 +3696,131 @@ fn infer_first_index_ty(
         crate::RenderLevel::Simple,
     )
 }
+
+/// Regression (CityRP `cl_vgui3d2d.lua`): `{ ... }` stores the pack as a
+/// `Tuple([Variadic(T)])`; indexing `key[1]` read the stored element verbatim
+/// and surfaced `Variadic(T)` — a multi-value container — where a single value
+/// sits. The element at that position is the spread's first value, `T`.
+#[test]
+fn vararg_pack_table_index_unwraps_variadic_element() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    ws.def(
+        r#"
+            ---@class Panel
+            Panel = {}
+            ---@param keyCode number
+            function Panel:OnMouseReleased(keyCode) end
+        "#,
+    );
+    let file_id = ws.def(
+        r#"
+            local usedpanel = {}
+
+            ---@param pnl Panel
+            local function postPanelEvent(pnl, event, ...)
+                if pnl[event] then
+                    pnl[event](pnl, ...)
+                    usedpanel[pnl] = { ... }
+                    return true
+                end
+                return false
+            end
+
+            local function release()
+                for pnl, key in pairs(usedpanel) do
+                    if pnl["OnMouseReleased"] then
+                        pnl["OnMouseReleased"](pnl, key[1])
+                    end
+                end
+            end
+        "#,
+    );
+
+    let mismatches: Vec<_> = ws
+        .analysis
+        .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    crate::DiagnosticCode::ParamTypeMismatch
+                        .get_name()
+                        .to_string(),
+                ))
+        })
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "uninformative vararg element must not flag a number param: {mismatches:#?}"
+    );
+
+    use glua_parser::{LuaAstNode, LuaExpr};
+    let (key_ty, elem_ty) = {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let mut key_ty = crate::LuaType::Unknown;
+        let mut elem_ty = crate::LuaType::Unknown;
+        for expr in semantic_model.get_root().descendants::<LuaExpr>() {
+            let text = expr.syntax().text().to_string();
+            if text == "key[1]" {
+                elem_ty = semantic_model
+                    .infer_expr(expr)
+                    .unwrap_or(crate::LuaType::Unknown);
+            } else if text == "key" && key_ty.is_unknown() {
+                // the `for pnl, key` loop variable
+                key_ty = semantic_model
+                    .infer_expr(expr)
+                    .unwrap_or(crate::LuaType::Unknown);
+            }
+        }
+        (key_ty, elem_ty)
+    };
+    assert_eq!(
+        ws.humanize_type(elem_ty),
+        "unknown",
+        "indexing a vararg-packed table yields the element type, not the pack; key={}",
+        ws.humanize_type(key_ty)
+    );
+}
+
+/// Forwarding `...` through a chain of locals must keep the pack open for the
+/// callee's vararg: `pack`'s `T...` binds the forwarded pack as `T ...`, not a
+/// closed one-element tuple, so `arg[2]` stays a valid read.
+#[test]
+fn forwarded_dots_binds_open_variadic_param() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    let file_id = ws.def(
+        r#"
+            local pack = table.pack or function(...) return { n = 1, ... } end
+            local function date_from(...)
+                local arg = pack(...)
+                local y, m, d = arg[1], arg[2], arg[3]
+                return y, m, d
+            end
+            local function date(...)
+                return date_from(...)
+            end
+            date("x")
+        "#,
+    );
+    let diags: Vec<_> = ws
+        .analysis
+        .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    crate::DiagnosticCode::UndefinedField.get_name().to_string(),
+                ))
+        })
+        .collect();
+    assert!(
+        diags.is_empty(),
+        "a forwarded vararg pack must keep its open arity: {diags:#?}"
+    );
+}

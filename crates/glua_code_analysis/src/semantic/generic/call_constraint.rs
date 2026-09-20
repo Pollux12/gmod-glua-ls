@@ -362,14 +362,19 @@ fn infer_expr_list_types(
     exprs: &[LuaExpr],
 ) -> Vec<(LuaType, LuaExpr)> {
     let mut value_types = Vec::new();
-    for expr in exprs.iter() {
+    for (idx, expr) in exprs.iter().enumerate() {
         let expr_type = semantic_model
             .infer_expr(expr.clone())
             .unwrap_or(LuaType::Unknown);
         match expr_type {
             LuaType::Variadic(variadic) => match variadic.deref() {
-                VariadicType::Base(base) => {
+                // The last expression forwards its whole pack; earlier
+                // positions keep only the first value.
+                VariadicType::Base(base) if idx + 1 != exprs.len() => {
                     value_types.push((base.clone(), expr.clone()));
+                }
+                VariadicType::Base(_) => {
+                    value_types.push((LuaType::Variadic(variadic.clone()), expr.clone()));
                 }
                 VariadicType::Multi(vecs) => {
                     for typ in vecs {

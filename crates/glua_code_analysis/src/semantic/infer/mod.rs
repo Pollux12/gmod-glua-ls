@@ -340,8 +340,16 @@ where
                     }
                 } else {
                     match variadic.deref() {
-                        VariadicType::Base(base) => {
+                        // The last expression in the list forwards every value
+                        // it produces: `f(g())`, `f(...)` and `return f()` all
+                        // pass the whole pack on. In earlier positions Lua
+                        // truncates the expression to its first value.
+                        VariadicType::Base(base) if idx + 1 != exprs.len() => {
                             value_types.push((base.clone(), expr.get_range()));
+                        }
+                        VariadicType::Base(_) => {
+                            value_types
+                                .push((LuaType::Variadic(variadic.clone()), expr.get_range()));
                         }
                         VariadicType::Multi(vecs) => {
                             for typ in vecs {

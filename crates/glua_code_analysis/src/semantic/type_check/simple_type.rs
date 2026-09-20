@@ -315,6 +315,14 @@ pub fn check_simple_type_compact(
 
             return Ok(());
         }
+        // A multi-value argument (`f(g())`, `f(...)`) occupies a slot with its
+        // first value; the pack marker itself is not a value to compare.
+        LuaType::Variadic(compact_variadic) => {
+            let Some(first) = compact_variadic.get_type(0) else {
+                return Ok(());
+            };
+            return check_general_type_compact(context, source, first, check_guard.next_level()?);
+        }
         LuaType::Generic(generic) => {
             if !generic.contain_tpl() {
                 let base_id = generic.get_base_type_id();

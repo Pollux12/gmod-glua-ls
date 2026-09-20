@@ -668,7 +668,12 @@ impl LuaTupleType {
 
     pub fn get_type(&self, idx: usize) -> Option<&LuaType> {
         if let Some(ty) = self.types.get(idx) {
-            return Some(ty);
+            // A spread stored at this position contributes its first value;
+            // the pack marker itself is not a value.
+            return match ty {
+                LuaType::Variadic(variadic) => variadic.get_type(0),
+                _ => Some(ty),
+            };
         };
 
         if self.types.is_empty() {
@@ -712,6 +717,13 @@ impl LuaTupleType {
                 }
                 LuaType::StringConst(s) => {
                     ty = TypeOps::Union.apply(db, &ty, &LuaType::DocStringConst(s.clone()));
+                }
+                // A spread element contributes the value type of each
+                // position it covers; the pack marker is not a value.
+                LuaType::Variadic(variadic) => {
+                    for element in variadic.element_types() {
+                        ty = TypeOps::Union.apply(db, &ty, element);
+                    }
                 }
                 _ => {
                     ty = TypeOps::Union.apply(db, &ty, t);
@@ -1578,6 +1590,32 @@ impl TypeVisitTrait for VariadicType {
 }
 
 impl VariadicType {
+    /// The value stored in a slot that `ty` fills. A spread marker collapses
+    /// to the first value it contributes, since a slot holds a value, not a
+    /// pack.
+    fn slot_type(ty: &LuaType) -> Option<&LuaType> {
+        match ty {
+            LuaType::Variadic(variadic) => variadic.get_type(0),
+            _ => Some(ty),
+        }
+    }
+
+    /// The value types each position of this spread holds: `Base(t)` is `t`
+    /// at every position, `Multi` lists each element with nested spreads
+    /// collapsed to the values they contribute.
+    pub fn element_types(&self) -> Vec<&LuaType> {
+        match self {
+            VariadicType::Base(t) => Self::slot_type(t).into_iter().collect(),
+            VariadicType::Multi(types) => types
+                .iter()
+                .flat_map(|t| match t {
+                    LuaType::Variadic(variadic) => variadic.element_types(),
+                    _ => vec![t],
+                })
+                .collect(),
+        }
+    }
+
     pub fn get_type(&self, idx: usize) -> Option<&LuaType> {
         match self {
             VariadicType::Multi(types) => {
@@ -1588,7 +1626,7 @@ impl VariadicType {
 
                 // If the index exceeds the range, return the last element
                 if idx + 1 < types.len() {
-                    Some(&types[idx])
+                    Self::slot_type(&types[idx])
                 } else {
                     let last_idx = types_len - 1;
                     let last_ty = &types[last_idx];
@@ -1602,7 +1640,7 @@ impl VariadicType {
                     }
                 }
             }
-            VariadicType::Base(t) => Some(t),
+            VariadicType::Base(t) => Self::slot_type(t),
         }
     }
 

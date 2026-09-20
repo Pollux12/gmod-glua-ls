@@ -593,10 +593,16 @@ fn infer_array_raw_member_type(
     array_type: &LuaType,
     member_key: &LuaMemberKey,
 ) -> RawGetMemberTypeResult {
+    // An element read yields a single value: a spread base collapses to the
+    // value it puts in each slot.
+    let element_type = match array_type {
+        LuaType::Variadic(variadic) => variadic.get_type(0).cloned().unwrap_or(LuaType::Unknown),
+        _ => array_type.clone(),
+    };
     let typ = if db.get_emmyrc().strict.array_index {
-        TypeOps::Union.apply(db, array_type, &LuaType::Nil)
+        TypeOps::Union.apply(db, &element_type, &LuaType::Nil)
     } else {
-        array_type.clone()
+        element_type
     };
     match member_key {
         LuaMemberKey::Integer(_) => Ok(typ),

@@ -1169,7 +1169,14 @@ fn infer_param_type_from_call_sites(
         .local_func_decl_for(&signature_id)?;
     let call_sites =
         local_function_call_sites(db, cache, signature_id.get_file_id(), &root, target_decl_id);
-    infer_param_type_from_local_call_sites_inner(db, cache, call_sites, param_idx, true)
+    infer_param_type_from_local_call_sites_inner(
+        db,
+        cache,
+        call_sites,
+        param_idx,
+        true,
+        decl.get_name() == "...",
+    )
 }
 
 fn infer_param_type_from_local_call_sites_inner(
@@ -1178,6 +1185,7 @@ fn infer_param_type_from_local_call_sites_inner(
     call_sites: Vec<(FileId, LuaCallExpr)>,
     param_idx: usize,
     allow_param_args: bool,
+    is_dots: bool,
 ) -> Option<LuaType> {
     let mut inferred_type: Option<LuaType> = None;
     for (file_id, call_expr) in call_sites {
@@ -1212,6 +1220,24 @@ fn infer_param_type_from_local_call_sites_inner(
                 continue;
             };
             arg_type
+        };
+        let arg_type = match &arg_type {
+            // `f(...)` forwards the whole pack into the callee's `...`;
+            // the param collects the value types the pack can hold, not
+            // the pack marker itself.
+            LuaType::Variadic(variadic) if is_dots => {
+                let elements = variadic.element_types();
+                if elements.is_empty() {
+                    continue;
+                }
+                TypeOps::union_all(db, elements.into_iter().cloned().collect())
+            }
+            // An argument position holds a single value: the pack's first.
+            LuaType::Variadic(variadic) => match variadic.get_type(0) {
+                Some(first) => first.clone(),
+                None => continue,
+            },
+            _ => arg_type,
         };
         if arg_type.is_unknown() || arg_type.is_never() {
             continue;
@@ -1365,7 +1391,14 @@ fn infer_forwarded_param_arg_type(
 
     let call_sites =
         local_function_call_sites(db, cache, signature_id.get_file_id(), &root, target_decl_id);
-    infer_param_type_from_local_call_sites_inner(db, cache, call_sites, idx, false)
+    infer_param_type_from_local_call_sites_inner(
+        db,
+        cache,
+        call_sites,
+        idx,
+        false,
+        decl.get_name() == "...",
+    )
 }
 
 fn local_function_call_sites(
