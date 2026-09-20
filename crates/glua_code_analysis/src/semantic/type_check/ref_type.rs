@@ -62,18 +62,30 @@ pub fn check_ref_type_compact(
     compact_type: &LuaType,
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
-    let type_decl = context
-        .db
-        .get_type_index()
-        .get_type_decl(source_id)
-        // unreachable!
-        .ok_or(if context.detail {
-            TypeCheckFailReason::TypeNotMatchWithReason(
-                format!("type `{name}` not found.", name = source_id.get_name()).to_string(),
-            )
-        } else {
-            TypeCheckFailReason::TypeNotMatch
-        })?;
+    // A `Def`/`Ref` carrying the same decl id is trivially the same type even
+    // when the declaration itself cannot be resolved — a scripted-class global
+    // alias (`Schema` -> `SCHEMA`) produces a `Def` for the class global while
+    // annotated params hold a `Ref`, and a workspace without a schema file
+    // never registers the decl, so the lookup below would fail before
+    // `check_ref_class` could see the identity.
+    let type_decl = if let LuaType::Def(id) | LuaType::Ref(id) = compact_type
+        && id == source_id
+    {
+        return Ok(());
+    } else {
+        context
+            .db
+            .get_type_index()
+            .get_type_decl(source_id)
+            // unreachable!
+            .ok_or(if context.detail {
+                TypeCheckFailReason::TypeNotMatchWithReason(
+                    format!("type `{name}` not found.", name = source_id.get_name()).to_string(),
+                )
+            } else {
+                TypeCheckFailReason::TypeNotMatch
+            })?
+    };
 
     if type_decl.is_alias() {
         if let Some(origin_type) = type_decl.get_alias_origin(context.db, None) {

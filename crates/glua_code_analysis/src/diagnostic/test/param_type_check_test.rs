@@ -4620,3 +4620,50 @@ mod test {
         ));
     }
 }
+
+/// A scripted-class global alias (`Schema` -> `SCHEMA`) yields `Def(SCHEMA)`
+/// while annotated params reference `Ref(SCHEMA)`. When no schema file exists
+/// the class decl is dangling; `check_ref_type_compact` must still recognize
+/// `Def(id)`/`Ref(id)` identity instead of erroring with "type SCHEMA not
+/// found" on every call site. Regression: CityRP `sh_plugin.lua`'s
+/// `pcall(Schema[name], Schema, ...)` flagged `expected SCHEMA but found
+/// SCHEMA`.
+#[test]
+fn dangling_scoped_class_ref_matches_its_own_def() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    ws.def_file(
+        "gamemode/init.lua",
+        r#"
+            hook.Add("PlayerSpawn", "x", function(client) end)
+        "#,
+    );
+    let file_id = ws.def_file(
+        "gamemode/core/libraries/sh_plugin.lua",
+        r#"
+            local function SafeRun(name, gm, ...)
+                if (Schema and Schema[name]) then
+                    local bSuccess, a, b = pcall(Schema[name], Schema, ...)
+                end
+            end
+            SafeRun("PlayerSpawn", nil, 1)
+        "#,
+    );
+    let diags: Vec<_> = ws
+        .analysis
+        .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    crate::DiagnosticCode::ParamTypeMismatch
+                        .get_name()
+                        .to_string(),
+                ))
+        })
+        .collect();
+    assert!(
+        diags.is_empty(),
+        "a value of a dangling scripted-class ref must satisfy its own type: {diags:#?}"
+    );
+}
