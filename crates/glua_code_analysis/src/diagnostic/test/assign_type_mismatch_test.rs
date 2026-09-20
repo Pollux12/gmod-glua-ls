@@ -3556,3 +3556,143 @@ fn merged_table_param_diagnostics(
         })
         .collect()
 }
+
+/// Regression (CityRP `cl_tooltip.lua`): an AccessorFunc backing field with no
+/// force type is synthesized as an uninformative inferred member — a
+/// placeholder — while a real assignment writes a concrete type. The
+/// placeholder must not absorb the writer's evidence: `entity` resolves `E4`,
+/// so `min`/`max` narrow back to number through the `ToScreen().x`
+/// reassignment and `math.max` stays clean.
+#[test]
+fn accessor_func_any_field_does_not_mask_inferred_writes() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    ws.analysis
+        .diagnostic
+        .enable_only(crate::DiagnosticCode::ParamTypeMismatch);
+    ws.def_gmod_call_arg_builtins();
+    let file_id = ws.def(
+        r#"
+            ---@class TSD4
+            ---@field x number
+            ---@field y number
+
+            ---@class V4
+            local V4 = {}
+            ---@return TSD4
+            function V4:ToScreen() end
+
+            ---@class E4
+            local E4 = {}
+            ---@return V4
+            function E4:OBBMins() end
+            ---@return V4
+            function E4:OBBMaxs() end
+            ---@return V4, V4
+            function E4:GetRotatedAABB(mins, maxs) end
+            ---@param lpos V4
+            ---@return V4
+            function E4:LocalToWorld(lpos) end
+
+            ---@class P4
+
+            DEFINE_BASECLASS("P4")
+            PANEL = {} ---@class TT4 : P4
+
+            AccessorFunc(PANEL, "entity", "Entity")
+
+            ---@param entity E4
+            function PANEL:SetEntity(entity)
+                self.entity = entity
+            end
+
+            function PANEL:Think()
+                if IsValid(self.entity) then
+                    local entity = self.entity
+                    local min, max = entity:GetRotatedAABB(entity:OBBMins() * 0.5, entity:OBBMaxs() * 0.5)
+                    min = entity:LocalToWorld(min):ToScreen().x
+                    max = entity:LocalToWorld(max):ToScreen().x
+                    local m = math.max(min, max)
+                end
+            end
+
+            vgui.Register("TT4", PANEL, "P4")
+        "#,
+    );
+    let diagnostics = ws
+        .analysis
+        .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default();
+    let mismatches: Vec<_> = diagnostics
+        .into_iter()
+        .filter(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    crate::DiagnosticCode::ParamTypeMismatch
+                        .get_name()
+                        .to_string(),
+                ))
+        })
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "uninformative AccessorFunc field must not mask the inferred writer: {mismatches:#?}"
+    );
+
+    // Root cause: the synthesized backing field declares existence, not a
+    // type, so the `self.entity` read must resolve the concrete `SetEntity`
+    // write rather than the placeholder.
+    assert_eq!(infer_first_index_ty(&ws, file_id, "self.entity"), "E4");
+}
+
+/// An unforced `AccessorFunc` backing field with no writes still resolves
+/// `any` — existence without a type.
+#[test]
+fn accessor_func_any_field_without_writes_resolves_any() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    ws.def_gmod_call_arg_builtins();
+    let file_id = ws.def(
+        r#"
+            ---@class P5
+
+            DEFINE_BASECLASS("P5")
+            PANEL = {} ---@class TT5 : P5
+
+            AccessorFunc(PANEL, "entity", "Entity")
+
+            function PANEL:Think()
+                local entity = self.entity
+            end
+
+            vgui.Register("TT5", PANEL, "P5")
+        "#,
+    );
+    assert_eq!(infer_first_index_ty(&ws, file_id, "self.entity"), "any");
+}
+
+#[cfg(test)]
+fn infer_first_index_ty(
+    ws: &crate::VirtualWorkspace,
+    file_id: crate::FileId,
+    field_access: &str,
+) -> String {
+    use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr};
+
+    let semantic_model = ws
+        .analysis
+        .compilation
+        .get_semantic_model(file_id)
+        .expect("semantic model");
+    let target = semantic_model
+        .get_root()
+        .descendants::<LuaIndexExpr>()
+        .find(|expr| expr.syntax().text() == field_access)
+        .expect("field access should exist");
+    let ty = semantic_model
+        .infer_expr(LuaExpr::IndexExpr(target))
+        .unwrap_or(crate::LuaType::Unknown);
+    crate::humanize_type(
+        ws.analysis.compilation.get_db(),
+        &ty,
+        crate::RenderLevel::Simple,
+    )
+}

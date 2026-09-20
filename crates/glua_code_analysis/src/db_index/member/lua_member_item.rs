@@ -6,7 +6,7 @@ use std::{
 use crate::{
     DbIndex, FileId, InferFailReason, LuaFunctionType, LuaSemanticDeclId, LuaType, TypeOps,
     db_index::{WorkspaceKind, WorkspaceResolutionKey, gmod_infer::GmodRealm},
-    is_table_assignment_merge_type, widen_literal_type_for_assignment,
+    is_informative_type, is_table_assignment_merge_type, widen_literal_type_for_assignment,
 };
 use glua_parser::{BinaryOperator, LuaAssignStat, LuaAstNode, LuaExpr, LuaSyntaxNode, PathTrait};
 use rowan::TextSize;
@@ -673,6 +673,21 @@ fn writer_spells_table(db: &DbIndex, member_id: LuaMemberId, typ: &LuaType) -> b
     }
 }
 
+/// Whether `member` is a declaration in feature only: synthesized existence
+/// markers such as an unforced `AccessorFunc` backing field record that the
+/// field exists, but their uninformative inferred cache declares no type.
+/// They must neither exercise declaration authority over writers nor
+/// contribute `any` to a member union. Doc caches and informative inferred
+/// ones (module path segments) are real decls; inferred writes on a
+/// `FileDefine` are evidence too, so only file-level decls qualify.
+fn member_is_placeholder_decl(db: &DbIndex, member: &crate::LuaMember) -> bool {
+    member.get_feature().is_file_decl()
+        && db
+            .get_type_index()
+            .get_type_cache(&member.get_id().into())
+            .is_some_and(|cache| cache.is_infer() && !is_informative_type(cache.as_type()))
+}
+
 fn resolve_member_type(
     db: &DbIndex,
     member_item: &LuaMemberIndexItem,
@@ -722,7 +737,7 @@ fn resolve_member_type(
                     if feature.is_meta_decl() {
                         resolve_state = MemberTypeResolveState::Meta;
                         break;
-                    } else if feature.is_file_decl() {
+                    } else if feature.is_file_decl() && !member_is_placeholder_decl(db, member) {
                         resolve_state = MemberTypeResolveState::FileDecl;
                     }
                 }
@@ -731,6 +746,13 @@ fn resolve_member_type(
             match resolve_state {
                 MemberTypeResolveState::All => {
                     let mut collected_types = Vec::new();
+                    // Decl members whose cache is an uninformative inference
+                    // are existence markers, not type evidence: an unforced
+                    // `AccessorFunc` backing field declares that the field
+                    // exists, not that it is `any`. Deferred so they neither
+                    // absorb concrete writes in the union nor veto a table
+                    // merge; they only answer when nothing else does.
+                    let mut deferred_placeholder_types = Vec::new();
                     let mut all_are_table_merges = true;
                     for member in &members {
                         let member_type_cache = db
@@ -742,6 +764,10 @@ fn resolve_member_type(
                         }
 
                         let member_type = class_table_as_class(db, member_type_cache.as_type());
+                        if member_is_placeholder_decl(db, member) {
+                            deferred_placeholder_types.push(member_type);
+                            continue;
+                        }
                         if !is_table_assignment_merge_type(&member_type)
                             || !writer_spells_table(db, member.get_id(), &member_type)
                         {
@@ -753,6 +779,10 @@ fn resolve_member_type(
                             member_type
                         };
                         collected_types.push(member_type);
+                    }
+                    if collected_types.is_empty() {
+                        collected_types = deferred_placeholder_types;
+                        all_are_table_merges = false;
                     }
 
                     // Whether a writer is worth keeping is not decided here: a
@@ -811,7 +841,7 @@ fn resolve_member_type(
                     let mut typ = LuaType::Never;
                     for member in &members {
                         let feature = member.get_feature();
-                        if feature.is_file_decl() {
+                        if feature.is_file_decl() && !member_is_placeholder_decl(db, member) {
                             typ = TypeOps::Union.apply(
                                 db,
                                 &typ,

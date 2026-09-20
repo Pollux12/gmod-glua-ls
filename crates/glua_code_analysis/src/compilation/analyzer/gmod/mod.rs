@@ -8456,10 +8456,18 @@ fn synthesize_accessor_func(
                 None,
             );
             db.get_member_index_mut().add_member(owner.clone(), member);
+            // Without a force type the accessor declares the field's existence,
+            // not its type: `DocType` would carry annotation authority and let
+            // the placeholder `any` displace types inferred from real writes.
+            let field_cache = if value_type.is_any() {
+                LuaTypeCache::InferType(LuaType::Any)
+            } else {
+                LuaTypeCache::DocType(value_type.clone())
+            };
             write_type_cache(
                 db,
                 member_id.into(),
-                LuaTypeCache::DocType(value_type.clone()),
+                field_cache,
                 TypeCacheWriteMode::InsertOnly,
             );
         }
