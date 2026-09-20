@@ -5156,9 +5156,9 @@ impl AnalyzeContext {
             })
             .collect::<Vec<_>>();
         let (scripted_scope_files, scoped_matches) =
-            scopes.scan_scripted_class_scope_files(file_paths);
-        let scripted_scope_files: HashSet<_> = scripted_scope_files.into_iter().collect();
-        let scripted_scope_infos = scoped_matches
+            scopes.scan_scripted_class_scope_files(file_paths.iter().copied());
+        let mut scripted_scope_files: HashSet<_> = scripted_scope_files.into_iter().collect();
+        let mut scripted_scope_infos = scoped_matches
             .into_iter()
             .map(|(file_id, scope_match)| {
                 (
@@ -5174,6 +5174,33 @@ impl AnalyzeContext {
                 )
             })
             .collect::<HashMap<_, _>>();
+
+        // A workspace rooted at a gamemode checkout has `gamemode/` directly
+        // under the root — no `gamemodes/<name>` segment for the scope path
+        // rules to anchor on — but its `gamemode/**` files author `GM` just
+        // like `gamemodes/*/gamemode/**`. Scope them the same way.
+        let root_gamemode = file_paths
+            .first()
+            .and_then(|(file_id, _)| gmod::detect_root_gamemode_scope(db, *file_id));
+        if let Some((gamemode_dir, scope_match)) = root_gamemode {
+            for (file_id, path) in &file_paths {
+                if scripted_scope_infos.contains_key(file_id) || !path.starts_with(&gamemode_dir) {
+                    continue;
+                }
+                scripted_scope_files.insert(*file_id);
+                scripted_scope_infos.insert(
+                    *file_id,
+                    GmodScopedClassInfo {
+                        class_name: scope_match.class_name.clone(),
+                        global_name: scope_match.global_name.clone(),
+                        is_global_singleton: scope_match.is_global_singleton,
+                        aliases: scope_match.aliases.clone(),
+                        super_types: scope_match.super_types.clone(),
+                        class_name_prefix: scope_match.class_name_prefix.clone(),
+                    },
+                );
+            }
+        }
 
         self.scripted_scope_files = Some(Arc::new(scripted_scope_files));
         self.scripted_scope_infos = Some(Arc::new(scripted_scope_infos));

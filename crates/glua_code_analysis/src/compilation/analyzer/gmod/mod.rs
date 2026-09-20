@@ -2,7 +2,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{
     collections::VecDeque,
     hash::{Hash, Hasher},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -6826,10 +6826,11 @@ fn synthesize_scripted_class_members(
             }
             if let Some(effective_call) =
                 metadata.define_baseclass_calls.iter().rev().find(|call| {
-                    matches!(
-                        call.literal_args.first(),
-                        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty()
-                    )
+                    valid_inheritance_literal(call)
+                        && define_baseclass_targets_scope_class(
+                            call,
+                            scope_match.class_name_prefix.as_deref(),
+                        )
                 })
             {
                 synthesize_define_baseclass_parent_alias(
@@ -6842,33 +6843,146 @@ fn synthesize_scripted_class_members(
             }
         }
 
-        // AccessorFunc: synthesize Get/Set/field members
+        // AccessorFunc/NetworkVar/NetworkVarElement: synthesize Get/Set/field
+        // members — but only for calls that actually target the scope's
+        // authoring table. A scoped file can author other scripted tables
+        // (`AccessorFunc(PANEL, ...)` in a gamemode derma file belongs to the
+        // panel, not to `gamemode_*`).
         if let Some(ref scope_match) = scope_match {
             let class_decl_id =
                 get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name);
             for call in &metadata.accessor_func_calls {
-                synthesize_accessor_func(db, file_id, &class_decl_id, call);
+                if scripted_call_targets_scope_class(db, file_id, scope_match, call, "AccessorFunc")
+                {
+                    synthesize_accessor_func(db, file_id, &class_decl_id, call);
+                }
             }
-        }
-
-        // NetworkVar: synthesize Get/Set members
-        if let Some(ref scope_match) = scope_match {
-            let class_decl_id =
-                get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name);
             for call in &metadata.network_var_calls {
-                synthesize_network_var(db, file_id, &class_decl_id, call);
+                if scripted_call_targets_scope_class(db, file_id, scope_match, call, "NetworkVar") {
+                    synthesize_network_var(db, file_id, &class_decl_id, call);
+                }
             }
-        }
-
-        // NetworkVarElement: synthesize Get/Set members (always number type)
-        if let Some(ref scope_match) = scope_match {
-            let class_decl_id =
-                get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name);
             for call in &metadata.network_var_element_calls {
-                synthesize_network_var_element(db, file_id, &class_decl_id, call);
+                if scripted_call_targets_scope_class(
+                    db,
+                    file_id,
+                    scope_match,
+                    call,
+                    "NetworkVarElement",
+                ) {
+                    synthesize_network_var_element(db, file_id, &class_decl_id, call);
+                }
             }
         }
     }
+}
+
+/// Whether a scripted-class helper call (`AccessorFunc`, `NetworkVar`,
+/// `NetworkVarElement`) targets the file's scope class. These helpers can
+/// define members on any table — `AccessorFunc(PANEL, ...)` inside a
+/// gamemode file authors the panel the file registers, not `GM` — so a call
+/// only applies to the scope class when its target resolves to the scope's
+/// authoring table (`GM`, `GAMEMODE`, aliases, or `self` inside a `GM:`
+/// method).
+///
+/// The target is the receiver of a `:` call (`self:NetworkVar(...)` targets
+/// `self`, whatever table it is — annotated wrappers invoked with `:` behave
+/// the same way). For a plain call the target is arg0, but only when the
+/// callee is the builtin helper itself: annotated wrappers
+/// (`addNetworkVar("Enabled", "Bool")`) and other callee names implicitly
+/// author the file's scripted class and carry no target argument.
+///
+/// When the target cannot be resolved — including calls copied in from
+/// another file's metadata by `copy_network_var_calls_from`, whose
+/// `syntax_id` does not exist in this file's tree — the call is kept
+/// (preserving prior behavior).
+fn scripted_call_targets_scope_class(
+    db: &DbIndex,
+    file_id: FileId,
+    scope_match: &GmodScopedClassInfo,
+    call: &GmodScriptedClassCallMetadata,
+    builtin_name: &str,
+) -> bool {
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .map(|tree| tree.get_red_root())
+    else {
+        return true;
+    };
+    let Some(call_expr) = call
+        .syntax_id
+        .to_node_from_root(&root)
+        .and_then(LuaCallExpr::cast)
+        .filter(|expr| expr.get_range() == call.syntax_id.get_range())
+    else {
+        return true;
+    };
+
+    let target_expr = if call_expr.is_colon_call() {
+        // `x:Helper(...)`: the receiver is the target table.
+        match call_expr.get_prefix_expr() {
+            Some(LuaExpr::IndexExpr(index_expr)) => index_expr.get_prefix_expr(),
+            _ => None,
+        }
+    } else {
+        match call_expr.get_prefix_expr() {
+            // `Helper(target, ...)`: arg0 names the target table — but only
+            // for the builtin helper; an annotated wrapper or a shadowing
+            // local has no explicit target.
+            Some(LuaExpr::NameExpr(name_expr))
+                if name_expr.get_name_text().as_deref() == Some(builtin_name)
+                    && !name_expr_resolves_to_local(db, file_id, &name_expr) =>
+            {
+                call.args
+                    .first()
+                    .and_then(|arg| arg.syntax_id.to_node_from_root(&root))
+                    .and_then(LuaExpr::cast)
+            }
+            _ => return true,
+        }
+    };
+
+    match target_expr {
+        Some(LuaExpr::NameExpr(name_expr)) => {
+            let Some(name) = name_expr.get_name_text() else {
+                return true;
+            };
+            if &*name == "self" {
+                // `self` targets the enclosing method's table — the scope
+                // class only when that method is defined on its authoring
+                // global.
+                scope_authoring_names(scope_match).iter().any(|var_name| {
+                    member_defined_via_variable(
+                        db,
+                        file_id,
+                        call.syntax_id.get_range().start(),
+                        var_name,
+                    )
+                })
+            } else {
+                name_expr_resolves_to_scoped_authoring_table(db, file_id, &name_expr).is_some()
+            }
+        }
+        // A resolvable non-name target (e.g. `lib.GetTable():NetworkVar`) is
+        // never the scope's authoring table.
+        Some(_) => false,
+        // No target expression at all — keep the member.
+        None => true,
+    }
+}
+
+/// The globals a scoped file's `self`/name references author members on:
+/// the scope's class global plus its aliases (and `GAMEMODE` for gamemodes,
+/// mirroring `resolve_scoped_authoring_type`).
+fn scope_authoring_names(scope_match: &GmodScopedClassInfo) -> Vec<&str> {
+    let mut names = Vec::with_capacity(scope_match.aliases.len() + 2);
+    names.push(scope_match.global_name.as_str());
+    names.extend(scope_match.aliases.iter().map(String::as_str));
+    if scope_match.global_name == "GM" && !names.contains(&"GAMEMODE") {
+        names.push("GAMEMODE");
+    }
+    names
 }
 
 /// Synthesize vgui.Register / derma.DefineControl class types.
@@ -8131,20 +8245,20 @@ fn materialize_scoped_gamemode_base(
     ensure_scoped_class_type_decl(db, file_id, base_name, "GM", &[], range);
 }
 
-fn resolve_effective_inheritance_call(
-    metadata: &GmodScriptedClassFileMetadata,
-) -> Option<&GmodScriptedClassCallMetadata> {
+fn resolve_effective_inheritance_call<'a>(
+    metadata: &'a GmodScriptedClassFileMetadata,
+    class_name_prefix: Option<&str>,
+) -> Option<&'a GmodScriptedClassCallMetadata> {
     metadata
         .derive_gamemode_calls
         .iter()
         .rev()
         .find(|call| valid_inheritance_literal(call))
         .or_else(|| {
-            metadata
-                .define_baseclass_calls
-                .iter()
-                .rev()
-                .find(|call| valid_inheritance_literal(call))
+            metadata.define_baseclass_calls.iter().rev().find(|call| {
+                valid_inheritance_literal(call)
+                    && define_baseclass_targets_scope_class(call, class_name_prefix)
+            })
         })
 }
 
@@ -8155,11 +8269,28 @@ fn valid_inheritance_literal(call: &GmodScriptedClassCallMetadata) -> bool {
     )
 }
 
+/// `DEFINE_BASECLASS` names the base of whatever scripted table the file
+/// registers. When the scope names its classes `<prefix><name>` (gamemodes
+/// use `gamemode_`), a base outside that family — `DEFINE_BASECLASS("Panel")`
+/// in a derma file — is the registered panel's base, not the scope class's.
+fn define_baseclass_targets_scope_class(
+    call: &GmodScriptedClassCallMetadata,
+    class_name_prefix: Option<&str>,
+) -> bool {
+    let Some(prefix) = class_name_prefix else {
+        return true;
+    };
+    match call.literal_args.get(call.inheritance_name_arg_idx()) {
+        Some(Some(GmodClassCallLiteral::String(name))) => name.starts_with(prefix),
+        _ => false,
+    }
+}
+
 fn resolve_effective_inheritance_base(
     metadata: &GmodScriptedClassFileMetadata,
     class_name_prefix: Option<&str>,
 ) -> Option<(String, bool, LuaSyntaxId)> {
-    let call = resolve_effective_inheritance_call(metadata)?;
+    let call = resolve_effective_inheritance_call(metadata, class_name_prefix)?;
     let base_name = match call.literal_args.get(call.inheritance_name_arg_idx()) {
         Some(Some(GmodClassCallLiteral::String(name))) => name.as_str(),
         _ => return None,
@@ -9758,18 +9889,91 @@ fn resolve_networkvar_type(type_name: &str) -> LuaType {
 
 fn detect_scoped_class_from_path(db: &DbIndex, file_id: FileId) -> Option<GmodScopedClassMatch> {
     let file_path = db.get_vfs().get_file_path(&file_id)?;
-    db.get_emmyrc()
+    if let Some(scope_match) = db
+        .get_emmyrc()
         .gmod
         .scripted_class_scopes
         .detect_class_for_path(file_path)
-        .map(|scope_match| GmodScopedClassMatch {
+    {
+        return Some(GmodScopedClassMatch {
             global_name: scope_match.definition.class_global,
             class_name: scope_match.class_name,
             is_global_singleton: scope_match.definition.is_global_singleton,
             aliases: scope_match.definition.aliases,
             super_types: scope_match.definition.super_types,
             class_name_prefix: scope_match.definition.class_name_prefix,
-        })
+        });
+    }
+
+    let (gamemode_dir, scope_match) = detect_root_gamemode_scope(db, file_id)?;
+    file_path.starts_with(&gamemode_dir).then_some(scope_match)
+}
+
+/// Detect the "workspace root *is* a gamemode folder" layout: `gamemode/`
+/// sits directly under the workspace root (e.g. opening a `gamemodes/<name>`
+/// checkout itself in the editor), so no `gamemodes/<name>` segment exists
+/// for the `gamemodes` scope path rule to anchor on.
+///
+/// Returns the gamemode directory and a scope match named
+/// `gamemode_<root dir name>` (the same identifier `gamemode.Register`
+/// derives from the folder at runtime). The entry files are always loaded
+/// for a real gamemode workspace, so probing the VFS for them keeps the
+/// answer independent of how analysis was batched. Callers decide whether a
+/// given file lives under the returned directory; files already claimed by
+/// another scope (e.g. `gamemode/schema.lua` → `SCHEMA`) keep their match.
+pub(crate) fn detect_root_gamemode_scope(
+    db: &DbIndex,
+    file_id: FileId,
+) -> Option<(PathBuf, GmodScopedClassMatch)> {
+    let workspace_id = db.get_module_index().get_workspace_id(file_id)?;
+    if !db.get_module_index().is_main_workspace_id(workspace_id) {
+        return None;
+    }
+    let root = db.get_module_index().get_workspace_root(workspace_id)?;
+    let gamemode_dir = root.join("gamemode");
+    let has_entry = ["init.lua", "shared.lua", "cl_init.lua"]
+        .iter()
+        .any(|name| {
+            crate::vfs::file_path_to_uri(&gamemode_dir.join(name))
+                .and_then(|uri| db.get_vfs().get_file_id(&uri))
+                .is_some()
+        });
+    if !has_entry {
+        return None;
+    }
+
+    let name = root.file_name()?.to_str()?;
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+
+    let definition = db
+        .get_emmyrc()
+        .gmod
+        .scripted_class_scopes
+        .resolved_definitions_slice()
+        .iter()
+        .find(|definition| definition.id == "gamemodes")?
+        .clone();
+    let class_name = match definition.class_name_prefix.as_deref() {
+        Some(prefix) => format!("{prefix}{name}"),
+        None => name.to_string(),
+    };
+
+    Some((
+        gamemode_dir,
+        GmodScopedClassMatch {
+            global_name: definition.class_global,
+            class_name,
+            is_global_singleton: definition.is_global_singleton,
+            aliases: definition.aliases,
+            super_types: definition.super_types,
+            class_name_prefix: definition.class_name_prefix,
+        },
+    ))
 }
 
 /// Returns the scripted class info `(class_name, global_name)` for a file, if it belongs to a

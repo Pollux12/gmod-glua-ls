@@ -16,7 +16,10 @@ use crate::{
     LuaInferCache, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType,
     LuaTypeDeclId, SemanticDeclLevel, TypeOps,
     compilation::analyzer::{
-        gmod::{get_scripted_class_type_decl_id, name_expr_resolves_to_scoped_authoring_table},
+        gmod::{
+            detect_root_gamemode_scope, get_scripted_class_type_decl_id,
+            name_expr_resolves_to_scoped_authoring_table,
+        },
         infer_for_range_iter_expr_func,
     },
     db_index::{DbIndex, LuaDeclOrMemberId, LuaSignature, LuaSignatureId},
@@ -193,6 +196,24 @@ fn resolve_global_singleton_scripted_type_decl_id(
                 lookup.insert(definition.class_global.clone(), type_decl_id.clone());
                 for alias in &definition.aliases {
                     lookup.insert(alias.clone(), type_decl_id.clone());
+                }
+            }
+
+            // A workspace rooted at a gamemode folder scopes `GM`/`GAMEMODE`
+            // to that gamemode's class workspace-wide: the runtime global
+            // `GAMEMODE` is the gamemode table, so plugin and entity files
+            // see the same members `gamemode/**` files author.
+            if let Some((_, scope_match)) = detect_root_gamemode_scope(db, cache.get_file_id()) {
+                let type_decl_id = get_scripted_class_type_decl_id(
+                    &scope_match.global_name,
+                    &scope_match.class_name,
+                );
+                lookup.insert(scope_match.global_name.clone(), type_decl_id.clone());
+                for alias in &scope_match.aliases {
+                    lookup.insert(alias.clone(), type_decl_id.clone());
+                }
+                if scope_match.global_name == "GM" {
+                    lookup.insert("GAMEMODE".to_string(), type_decl_id);
                 }
             }
         }

@@ -2354,6 +2354,221 @@ mod test {
         }
     }
 
+    /// A workspace that *is* a gamemode checkout (`gamemode/` directly under
+    /// the workspace root, e.g. opening `gamemodes/<name>` itself in the
+    /// editor) has no `gamemodes/` path segment for the scope rules to anchor
+    /// on, but its `gamemode/**` files author the `GM` table all the same.
+    /// `DeriveGamemode` must still synthesize `BaseClass` on the scoped class.
+    #[gtest]
+    fn test_gamemode_self_baseclass_members_resolve_in_root_gamemode_layout() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+
+        let file_ids = ws.def_files(vec![
+            // The base gamemode the root workspace derives from.
+            (
+                "gamemodes/sandbox/gamemode/init.lua",
+                r#"
+                function GM:Initialize() end
+                function GM:HUDShouldDraw(name) return true end
+                "#,
+            ),
+            (
+                "gamemode/shared.lua",
+                r#"
+                DeriveGamemode("sandbox")
+
+                function GM:DrawInformation() end
+                "#,
+            ),
+            (
+                "gamemode/init.lua",
+                r#"
+                function GM:Initialize()
+                    self.BaseClass:Initialize()
+                end
+                "#,
+            ),
+            (
+                "gamemode/cl_hud.lua",
+                r#"
+                function GM:HUDShouldDraw(name)
+                    return self.BaseClass.HUDShouldDraw(self, name)
+                end
+                "#,
+            ),
+            // `GAMEMODE` is the runtime global for the current gamemode
+            // table, so plugin files must see the gamemode class members too.
+            (
+                "plugins/foo/sh_main.lua",
+                r#"
+                GAMEMODE = GM
+                function PLUGIN:Init()
+                    GAMEMODE:DrawInformation()
+                    GAMEMODE.BaseClass:Initialize()
+                end
+                "#,
+            ),
+        ]);
+
+        let checked_codes = [
+            NumberOrString::String(DiagnosticCode::UndefinedField.get_name().to_string()),
+            NumberOrString::String(DiagnosticCode::UndefinedMethod.get_name().to_string()),
+        ];
+
+        for (index, file_id) in file_ids.into_iter().enumerate() {
+            let db = ws.get_db_mut();
+            if index < 4 {
+                let scope_info = db
+                    .get_gmod_infer_index()
+                    .get_scoped_class_info(&file_id)
+                    .expect("expected gamemode scope info");
+                assert_eq!(scope_info.global_name, "GM");
+                assert!(
+                    scope_info.class_name.starts_with("gamemode_"),
+                    "expected gamemode_* class name, got {:?}",
+                    scope_info.class_name
+                );
+            }
+
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default();
+            let flagged: Vec<_> = diagnostics
+                .into_iter()
+                .filter(|diag| {
+                    diag.code
+                        .as_ref()
+                        .is_some_and(|code| checked_codes.contains(code))
+                })
+                .collect();
+            assert!(
+                flagged.is_empty(),
+                "unexpected gamemode diagnostics in file {index}: {flagged:?}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_scoped_class_helpers_target_only_scope_table() {
+        // A gamemode-scope file can author other scripted tables (panels,
+        // skins). AccessorFunc/NetworkVar/DEFINE_BASECLASS inside it must
+        // target the table the file registers, not leak onto the scope's
+        // class (gamemode_*): otherwise the gamemode type gains panel
+        // members and panel supertypes it does not have at runtime.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_ids = ws.def_files(vec![
+            (
+                "gamemode/init.lua",
+                r#"
+                DeriveGamemode("sandbox")
+                AccessorFunc(GM, "m_GamemodeKey", "GamemodeKey", FORCE_BOOL)
+                "#,
+            ),
+            (
+                "gamemode/core/derma/cl_row.lua",
+                r#"
+                DEFINE_BASECLASS("EditablePanel")
+                local PANEL = {}
+                AccessorFunc(PANEL, "backgroundIndex", "BackgroundIndex", FORCE_NUMBER)
+                vgui.Register("cityrpRow", PANEL, "EditablePanel")
+                "#,
+            ),
+            // Same shapes in a `gamemodes/*` layout: the leaks must not
+            // depend on where the workspace root sits.
+            (
+                "gamemodes/ttt/gamemode/cl_row.lua",
+                r#"
+                DEFINE_BASECLASS("DPanel")
+                local PANEL = {}
+                AccessorFunc(PANEL, "otherKey", "OtherKey", FORCE_NUMBER)
+                vgui.Register("tttRow", PANEL, "DPanel")
+                "#,
+            ),
+        ]);
+
+        let db = ws.get_db_mut();
+        let root_class_name = db
+            .get_gmod_infer_index()
+            .get_scoped_class_info(&file_ids[0])
+            .expect("expected gamemode scope info")
+            .class_name
+            .clone();
+        let members_of = |name: &str| -> Vec<String> {
+            db.get_member_index()
+                .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global(name)))
+                .map(|members| {
+                    members
+                        .iter()
+                        .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let supers_of = |name: &str| -> Vec<String> {
+            db.get_type_index()
+                .get_super_types(&LuaTypeDeclId::global(name))
+                .unwrap_or_default()
+                .iter()
+                .map(|typ| format!("{typ:?}"))
+                .collect()
+        };
+
+        for gamemode_class in [root_class_name.as_str(), "gamemode_ttt"] {
+            let members = members_of(gamemode_class);
+            for leaked in [
+                "GetBackgroundIndex",
+                "SetBackgroundIndex",
+                "backgroundIndex",
+                "GetOtherKey",
+                "SetOtherKey",
+                "otherKey",
+            ] {
+                assert!(
+                    !members.iter().any(|m| m == leaked),
+                    "{gamemode_class} must not gain panel member {leaked}: {members:?}"
+                );
+            }
+            let supers = supers_of(gamemode_class);
+            for leaked_super in ["EditablePanel", "DPanel"] {
+                assert!(
+                    !supers.iter().any(|s| s.contains(leaked_super)),
+                    "{gamemode_class} must not gain panel supertype {leaked_super}: {supers:?}"
+                );
+            }
+        }
+
+        // GM-targeted AccessorFunc still attaches to the scope class.
+        let members = members_of(&root_class_name);
+        for wanted in ["GetGamemodeKey", "SetGamemodeKey", "m_GamemodeKey"] {
+            assert!(
+                members.iter().any(|m| m == wanted),
+                "gamemode class lost its own accessor member {wanted}: {members:?}"
+            );
+        }
+
+        // Panel tables still receive their accessor members via the
+        // arg0-typed accessor index.
+        for panel in ["cityrpRow", "tttRow"] {
+            let members = members_of(panel);
+            assert!(
+                !members.is_empty(),
+                "{panel} kept its accessor members: {members:?}"
+            );
+        }
+    }
+
     #[gtest]
     fn test_doc_param_resolves_scoped_entity_type_without_type_not_found() {
         let mut ws = VirtualWorkspace::new();
