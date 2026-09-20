@@ -153,6 +153,19 @@ impl LuaMemberIndexItem {
         )
     }
 
+    /// Position-only visibility: the read offset and overwrite rules apply,
+    /// but realm and workspace tiers do not. `resolve_member_item_with_realm`
+    /// uses this to tell "every surviving writer sits after the read" apart
+    /// from "the writers are absent to this caller's realm or workspace".
+    pub(crate) fn visible_member_ids_at_position(
+        &self,
+        db: &DbIndex,
+        caller_file_id: &FileId,
+        caller_position: TextSize,
+    ) -> Vec<LuaMemberId> {
+        visible_member_ids_at_offset(db, self.member_ids_slice(), caller_file_id, caller_position)
+    }
+
     pub fn get_member_ids(&self) -> Vec<LuaMemberId> {
         match self {
             LuaMemberIndexItem::One(member_id) => vec![*member_id],

@@ -309,7 +309,15 @@ fn should_defer_guarded_index_alias_resolution(
     };
 
     match infer_expr(db, cache, left) {
-        Ok(ty) => ty.is_nil() || ty.is_unknown(),
+        // A `nil`/`unknown` left defers only while the index may still produce
+        // the member. Under the force phase a failed read floors to `nil`,
+        // which is the settled answer rather than a placeholder — `nil or {}`
+        // yields the fresh table, so the `or` must run instead of waiting on a
+        // member that cannot become visible at this position (the common case
+        // is `local x = T.f or {}` where `T.f` is only written later in the
+        // same file). Deferring here retires the declaration with no type and
+        // lets usage-context inference fabricate one.
+        Ok(ty) => (ty.is_nil() || ty.is_unknown()) && !cache.get_config().analysis_phase.is_force(),
         Err(reason) => reason.is_need_resolve(),
     }
 }

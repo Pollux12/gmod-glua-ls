@@ -5836,4 +5836,295 @@ owner:CompletelyMadeUpMethod()
 
         assert!(found.is_empty(), "{found:#?}");
     }
+
+    #[test]
+    fn test_setmetatable_named_metatable_across_realms_reports_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedMethod);
+
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/autorun/sh_glide.lua",
+                r#"
+                Glide = Glide or {}
+                "#,
+            ),
+            (
+                "lua/glide/client/ranged_feature.lua",
+                r#"
+                local RangedFeature = Glide.RangedFeature or {}
+                RangedFeature.__index = RangedFeature
+                Glide.RangedFeature = RangedFeature
+
+                function Glide.CreateRangedFeature(ent, distance)
+                    return setmetatable({ ent = ent, isActive = false }, RangedFeature)
+                end
+
+                function RangedFeature:SetActivateCallback(callback) end
+                function RangedFeature:SetDeactivateCallback(callback) end
+                function RangedFeature:SetUpdateCallback(callback) end
+                function RangedFeature:SetTestCallback(callback) end
+                function RangedFeature:Destroy() end
+                function RangedFeature:Think() end
+                "#,
+            ),
+            (
+                "lua/entities/base_glide/shared.lua",
+                r#"
+                ENT.Type = "anim"
+                ENT.Base = "base_anim"
+                "#,
+            ),
+            (
+                "lua/entities/base_glide/cl_init.lua",
+                r#"
+                include("shared.lua")
+
+                function ENT:Initialize()
+                    self.rfMisc = Glide.CreateRangedFeature(self, 1000)
+                    self.rfMisc:SetActivateCallback("InternalActivateFeatures")
+                end
+
+                function ENT:Think()
+                    self.rfMisc:Think()
+                end
+                "#,
+            ),
+            (
+                "lua/entities/glide_engine_stream_chip.lua",
+                r#"
+                AddCSLuaFile()
+                ENT.Type = "anim"
+                ENT.Base = "base_anim"
+
+                function ENT:Initialize()
+                    self.rangedFeature = Glide.CreateRangedFeature(self, 5000)
+                    self.rangedFeature:SetTestCallback("ShouldActivateSounds")
+                end
+
+                function ENT:OnRemove()
+                    if self.rangedFeature then
+                        self.rangedFeature:Destroy()
+                        self.rangedFeature = nil
+                    end
+                end
+                "#,
+            ),
+            (
+                "lua/entities/glide_missile/cl_init.lua",
+                r#"
+                function ENT:Initialize()
+                    self.missileSounds = Glide.CreateRangedFeature(self, 5000)
+                    self.missileSounds:SetActivateCallback("ActivateSound")
+                end
+                "#,
+            ),
+            (
+                "lua/entities/glide_missile/shared.lua",
+                r#"
+                ENT.Type = "anim"
+                ENT.Base = "base_anim"
+                "#,
+            ),
+        ]);
+
+        let mut found = Vec::new();
+        for file_id in &file_ids {
+            found.extend(diagnostics_for_code(
+                &mut ws,
+                *file_id,
+                DiagnosticCode::UndefinedMethod,
+            ));
+        }
+
+        assert!(found.is_empty(), "{found:#?}");
+    }
+
+    /// `local x = T.f or {}` where `T.f` is only written later in the same
+    /// file: the read is permanently nil at that position, so the local must
+    /// settle to the fresh-table literal. A deferred read that never resolves
+    /// used to retire with no type, letting usage-context inference publish
+    /// the `setmetatable` parameter's `std.metatable|table` constraint as the
+    /// local's own type — which then detached every method the metatable
+    /// carried.
+    #[test]
+    fn test_or_empty_table_local_settles_to_literal_when_member_written_later() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file("lua/autorun/sh_glide.lua", "Glide = Glide or {}");
+        let rf_file = ws.def_file(
+            "lua/glide/client/ranged_feature.lua",
+            r#"
+                local RangedFeature = Glide.RangedFeature or {}
+                RangedFeature.__index = RangedFeature
+                Glide.RangedFeature = RangedFeature
+
+                function Glide.CreateRangedFeature(ent, distance)
+                    return setmetatable({ ent = ent, isActive = false }, RangedFeature)
+                end
+
+                function RangedFeature:Think() end
+            "#,
+        );
+        let cl_init = ws.def_file(
+            "lua/entities/base_glide/cl_init.lua",
+            r#"
+                function ENT:Initialize()
+                    self.rfMisc = Glide.CreateRangedFeature(self, 1000)
+                end
+            "#,
+        );
+
+        let decl_type = local_name_type(&mut ws, rf_file, "RangedFeature");
+        assert!(
+            matches!(decl_type, LuaType::TableConst(_)),
+            "RangedFeature local: {}",
+            ws.humanize_type(decl_type)
+        );
+
+        let rf_misc_type = assign_value_type(&mut ws, cl_init, "self.rfMisc");
+        assert!(
+            matches!(rf_misc_type, LuaType::Instance(_)),
+            "self.rfMisc: {}",
+            ws.humanize_type(rf_misc_type)
+        );
+    }
+
+    #[test]
+    fn test_global_path_member_written_later_same_function_is_not_undefined_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        enable_gmod(&mut ws);
+        ws.def_file("lua/a.lua", "T = T or {}\nT.foo = 1\n");
+        let b = ws.def_file(
+            "lua/b.lua",
+            r#"
+            T = T or {}
+            function T.F()
+                local y = 1 + T.baz
+                T.baz = 1
+            end
+            "#,
+        );
+
+        let fields = diagnostics_for_code(&mut ws, b, DiagnosticCode::UndefinedField);
+        assert!(fields.is_empty(), "{fields:#?}");
+    }
+
+    #[test]
+    fn test_global_path_member_never_written_still_reports_undefined_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        enable_gmod(&mut ws);
+        ws.def_file("lua/a.lua", "T = T or {}\nT.foo = 1\n");
+        let b = ws.def_file(
+            "lua/b.lua",
+            r#"
+            T = T or {}
+            function T.F()
+                local y = 1 + T.never
+            end
+            "#,
+        );
+
+        let fields = diagnostics_for_code(&mut ws, b, DiagnosticCode::UndefinedField);
+        assert_eq!(fields.len(), 1, "{fields:#?}");
+        assert!(fields[0].message.contains("`never`"), "{fields:#?}");
+    }
+
+    /// When flow analysis keeps the competing writers of a local as a union
+    /// of literals, an empty `TableConst` arm keeps the same open
+    /// numeric-index semantics a lone empty literal has: the table is being
+    /// used as an array (populated through `table.insert`/`table.remove`, not
+    /// spelled fields), so `t[1]` is not an undefined-field access. This is
+    /// the shape `ply.lastbullet = ply.lastbullet or {}` repeated across
+    /// writers merges into.
+    #[test]
+    fn test_empty_table_literal_union_numeric_index_is_not_undefined_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        enable_gmod(&mut ws);
+        let file_id = ws.def_file(
+            "lua/sv.lua",
+            r#"
+            local c = ...
+            local t
+            if c then
+                t = {}
+            else
+                t = {}
+            end
+            local x = t[1]
+            "#,
+        );
+
+        let fields = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        assert!(fields.is_empty(), "{fields:#?}");
+    }
+
+    /// The per-literal rules apply to each union arm individually: a named
+    /// field no arm ever spells is still reported, and a numeric index is
+    /// still reported when no arm is an empty literal.
+    #[test]
+    fn test_table_literal_union_missing_members_still_report_undefined_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        enable_gmod(&mut ws);
+        let file_id = ws.def_file(
+            "lua/sv.lua",
+            r#"
+            local c = ...
+            local t
+            if c then
+                t = { a = 1 }
+            else
+                t = { b = 2 }
+            end
+            local x = t[1]
+            local y = t.missing
+            "#,
+        );
+
+        let fields = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        assert_eq!(fields.len(), 2, "{fields:#?}");
+        assert!(
+            fields.iter().any(|field| field.message.contains("`[1]`")),
+            "{fields:#?}"
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.message.contains("`missing`")),
+            "{fields:#?}"
+        );
+    }
+
+    /// A field spelled by one union arm is a field the value can have, so it
+    /// is not reported even though the other arms do not declare it.
+    #[test]
+    fn test_table_literal_union_field_spelled_by_one_arm_is_not_undefined_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        enable_gmod(&mut ws);
+        let file_id = ws.def_file(
+            "lua/sv.lua",
+            r#"
+            local c = ...
+            local t
+            if c then
+                t = { a = 1 }
+            else
+                t = {}
+            end
+            local x = t.a
+            "#,
+        );
+
+        let fields = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        assert!(fields.is_empty(), "{fields:#?}");
+    }
 }

@@ -401,27 +401,55 @@ pub(crate) fn resolve_member_item_with_realm(
     source_min_position: Option<&InFiled<TextSize>>,
 ) -> RawGetMemberTypeResult {
     if let Some(source_min_position) = source_min_position {
-        let mut member_ids = if let Some(pos) = caller_position {
-            member_item.visible_member_ids_with_realm_at_offset(db, &caller_file_id, pos)
-        } else {
-            member_item.visible_member_ids_with_realm(db, &caller_file_id)
-        };
-        member_ids.retain(|member_id| {
-            source_survives_table_generation_cutoff(
-                db,
-                member_id.file_id,
-                member_id.get_position(),
-                source_min_position,
-            )
-        });
-        if member_ids.is_empty() {
+        // The generation cutoff decides which writers belong to this table
+        // generation at all; position and realm decide which of those this
+        // read sees. Applying the cutoff first keeps the two apart: a member
+        // whose writers all survive the cutoff but are hidden from the read
+        // position exists on this table -- it resolves to `unknown`, the same
+        // answer the no-cutoff path gives -- while a member with no writer on
+        // this generation is genuinely absent, as is one whose writers are
+        // only absent to this caller's realm or workspace.
+        let surviving_ids: Vec<_> = member_item
+            .member_ids_slice()
+            .iter()
+            .copied()
+            .filter(|member_id| {
+                source_survives_table_generation_cutoff(
+                    db,
+                    member_id.file_id,
+                    member_id.get_position(),
+                    source_min_position,
+                )
+            })
+            .collect();
+        if surviving_ids.is_empty() {
             return Err(InferFailReason::FieldNotFound);
         }
-        let item = match member_ids.as_slice() {
+        let item = match surviving_ids.as_slice() {
             [member_id] => LuaMemberIndexItem::One(*member_id),
-            _ => LuaMemberIndexItem::Many(member_ids),
+            _ => LuaMemberIndexItem::Many(surviving_ids),
         };
-        return item.resolve_type(db);
+        return if let Some(pos) = caller_position {
+            let visible_ids =
+                item.visible_member_ids_with_realm_at_offset(db, &caller_file_id, pos);
+            if visible_ids.is_empty() {
+                return if item
+                    .visible_member_ids_at_position(db, &caller_file_id, pos)
+                    .is_empty()
+                {
+                    Ok(LuaType::Unknown)
+                } else {
+                    Err(InferFailReason::FieldNotFound)
+                };
+            }
+            let visible_item = match visible_ids.as_slice() {
+                [member_id] => LuaMemberIndexItem::One(*member_id),
+                _ => LuaMemberIndexItem::Many(visible_ids),
+            };
+            visible_item.resolve_type(db)
+        } else {
+            item.resolve_type_with_realm(db, &caller_file_id)
+        };
     }
 
     if let Some(pos) = caller_position {

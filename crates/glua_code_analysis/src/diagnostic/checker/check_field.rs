@@ -556,6 +556,12 @@ fn has_unresolved_metatable_index_inner(
                     )
             }),
         },
+        LuaType::MergedTable(merged) => merged.get_types().iter().any(|typ| {
+            has_unresolved_metatable_index_inner(db, semantic_model, typ, position, visited)
+        }),
+        LuaType::MultiLineUnion(union) => union.get_unions().iter().any(|(typ, _)| {
+            has_unresolved_metatable_index_inner(db, semantic_model, typ, position, visited)
+        }),
         _ => false,
     }
 }
@@ -692,54 +698,35 @@ fn is_valid_member_inner(
             }
         }
         LuaType::TableConst(id) => {
-            if code == DiagnosticCode::UndefinedField
-                && !is_table_const_from_doc_tag(semantic_model, id)
-                && table_const_is_empty(semantic_model.get_db(), id)
-                && index_key_is_numeric(semantic_model, index_key)
-            {
-                return Some(());
+            match check_table_const_member(semantic_model, index_expr, index_key, code, id) {
+                TableConstMemberCheck::Valid => return Some(()),
+                TableConstMemberCheck::Unresolvable => return None,
+                TableConstMemberCheck::NotFound => {}
             }
-
-            if code == DiagnosticCode::UndefinedField
-                && matches!(index_key, LuaIndexKey::Expr(_))
-                && !is_table_const_from_doc_tag(semantic_model, id)
-            {
-                return Some(());
-            }
-
-            let key = LuaMemberKey::from_index_key(
-                semantic_model.get_db(),
-                &mut semantic_model.get_cache().borrow_mut(),
+        }
+        // A composite of table literals is the set of shapes the value can
+        // take; each `TableConst` component keeps its own member rules — a
+        // field spelled by any literal writer is valid, and an empty literal
+        // arm keeps the open numeric-index semantics.
+        LuaType::MergedTable(merged_table) => {
+            if any_table_const_component_valid(
+                semantic_model,
+                index_expr,
                 index_key,
-            )
-            .ok()?;
-            let owner = LuaMemberOwner::Element(id.clone());
-            match infer_owner_raw_member_type_with_realm(
-                semantic_model.get_db(),
-                owner,
-                &key,
-                semantic_model.get_file_id(),
-                Some(index_expr.get_position()),
-                None,
+                code,
+                merged_table.get_types().iter(),
             ) {
-                Ok(_) => return Some(()),
-                Err(InferFailReason::FieldNotFound)
-                    if code == DiagnosticCode::UndefinedField
-                        && is_table_const_from_doc_tag(semantic_model, id) =>
-                {
-                    return Some(());
-                }
-                Err(_) => {}
-            }
-
-            if code == DiagnosticCode::UndefinedField
-                && table_const_has_only_dynamic_key_members(semantic_model.get_db(), id)
-                && index_key_is_literal_member(index_key)
-            {
                 return Some(());
             }
-
-            if is_valid_global_path_table_member(semantic_model, index_expr, &key) {
+        }
+        LuaType::MultiLineUnion(union) => {
+            if any_table_const_component_valid(
+                semantic_model,
+                index_expr,
+                index_key,
+                code,
+                union.get_unions().iter().map(|(component, _)| component),
+            ) {
                 return Some(());
             }
         }
@@ -811,6 +798,18 @@ fn is_valid_member_inner(
                         }
                     }
                 }
+            }
+            // Literal arms keep their own member rules: a field spelled by any
+            // literal writer is valid, and an empty literal arm keeps the open
+            // numeric-index semantics of a lone `TableConst`.
+            if any_table_const_component_valid(
+                semantic_model,
+                index_expr,
+                index_key,
+                code,
+                union.types(),
+            ) {
+                return Some(());
             }
         }
         _ => {}
@@ -1033,6 +1032,98 @@ fn all_runtime_components_are_non_indexable_primitives(db: &DbIndex, typ: &LuaTy
             .all(|(typ, _)| all_runtime_components_are_non_indexable_primitives(db, typ)),
         _ => false,
     }
+}
+
+fn any_table_const_component_valid<'a>(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+    index_key: &LuaIndexKey,
+    code: DiagnosticCode,
+    mut components: impl Iterator<Item = &'a LuaType>,
+) -> bool {
+    components.any(|component| {
+        matches!(component, LuaType::TableConst(id) if matches!(
+            check_table_const_member(semantic_model, index_expr, index_key, code, id),
+            TableConstMemberCheck::Valid
+        ))
+    })
+}
+
+/// Outcome of checking an index key against one `TableConst` literal.
+enum TableConstMemberCheck {
+    /// The key is valid on this literal: the member was found, or one of the
+    /// open-shape bail-outs applies (empty literal with a numeric key,
+    /// expression-key access on a non-doc literal, a literal whose members are
+    /// all dynamic-keyed, or a global-path member).
+    Valid,
+    /// The key cannot name a member at all. A lone literal reports this as an
+    /// invalid access; composite callers keep checking their other components.
+    Unresolvable,
+    /// The literal neither proves nor disproves the member, so the caller may
+    /// continue with the shared member-resolution fallbacks.
+    NotFound,
+}
+
+fn check_table_const_member(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+    index_key: &LuaIndexKey,
+    code: DiagnosticCode,
+    id: &crate::InFiled<rowan::TextRange>,
+) -> TableConstMemberCheck {
+    if code == DiagnosticCode::UndefinedField
+        && !is_table_const_from_doc_tag(semantic_model, id)
+        && table_const_is_empty(semantic_model.get_db(), id)
+        && index_key_is_numeric(semantic_model, index_key)
+    {
+        return TableConstMemberCheck::Valid;
+    }
+
+    if code == DiagnosticCode::UndefinedField
+        && matches!(index_key, LuaIndexKey::Expr(_))
+        && !is_table_const_from_doc_tag(semantic_model, id)
+    {
+        return TableConstMemberCheck::Valid;
+    }
+
+    let Ok(key) = LuaMemberKey::from_index_key(
+        semantic_model.get_db(),
+        &mut semantic_model.get_cache().borrow_mut(),
+        index_key,
+    ) else {
+        return TableConstMemberCheck::Unresolvable;
+    };
+    let owner = LuaMemberOwner::Element(id.clone());
+    match infer_owner_raw_member_type_with_realm(
+        semantic_model.get_db(),
+        owner,
+        &key,
+        semantic_model.get_file_id(),
+        Some(index_expr.get_position()),
+        None,
+    ) {
+        Ok(_) => return TableConstMemberCheck::Valid,
+        Err(InferFailReason::FieldNotFound)
+            if code == DiagnosticCode::UndefinedField
+                && is_table_const_from_doc_tag(semantic_model, id) =>
+        {
+            return TableConstMemberCheck::Valid;
+        }
+        Err(_) => {}
+    }
+
+    if code == DiagnosticCode::UndefinedField
+        && table_const_has_only_dynamic_key_members(semantic_model.get_db(), id)
+        && index_key_is_literal_member(index_key)
+    {
+        return TableConstMemberCheck::Valid;
+    }
+
+    if is_valid_global_path_table_member(semantic_model, index_expr, &key) {
+        return TableConstMemberCheck::Valid;
+    }
+
+    TableConstMemberCheck::NotFound
 }
 
 fn table_const_is_empty(db: &DbIndex, id: &crate::InFiled<rowan::TextRange>) -> bool {
@@ -2261,6 +2352,29 @@ fn if_body_has_return(if_stat: &LuaIfStat) -> bool {
 /// A table literal with no members and no dynamic fields at all: nothing
 /// whatsoever is known about its shape.
 fn is_shapeless_table_const(db: &DbIndex, typ: &LuaType) -> bool {
+    // A composite of literals is shapeless only when every component is — a
+    // single shaped arm means the value can carry the field concretely.
+    match typ {
+        LuaType::Union(union) => {
+            return union
+                .types()
+                .all(|t| t.is_nil() || is_shapeless_table_const(db, t));
+        }
+        LuaType::MergedTable(merged) => {
+            return merged
+                .get_types()
+                .iter()
+                .all(|t| is_shapeless_table_const(db, t));
+        }
+        LuaType::MultiLineUnion(union) => {
+            return union
+                .get_unions()
+                .iter()
+                .all(|(t, _)| is_shapeless_table_const(db, t));
+        }
+        _ => {}
+    }
+
     let LuaType::TableConst(table_range) = typ else {
         return false;
     };
@@ -2357,6 +2471,14 @@ fn has_dynamic_field_for_type_inner(
         LuaType::Union(union_type) => union_type
             .types()
             .any(|t| has_dynamic_field_for_type_inner(db, index, t, field_name, visited)),
+        LuaType::MergedTable(merged) => merged
+            .get_types()
+            .iter()
+            .any(|t| has_dynamic_field_for_type_inner(db, index, t, field_name, visited)),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .any(|(t, _)| has_dynamic_field_for_type_inner(db, index, t, field_name, visited)),
         _ => false,
     }
 }
