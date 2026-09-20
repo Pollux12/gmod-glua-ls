@@ -1222,19 +1222,23 @@ fn select_member_ids_by_workspace_and_realm_from_indices(
                 caller_is_main && priority.broad_tier() == 0 && all_seen_are_non_meta;
         } else if can_supplement_from_library && all_seen_are_non_meta {
             // We have only non-meta members so far. Supplement with any
-            // meta (annotated) members from this lower-priority tier so that
-            // resolve_member_type can prefer them via meta_override_file_define.
-            let meta_members: Vec<_> = compatible_indices
+            // annotated member from this lower-priority tier — meta decls
+            // and doc-sourced file decls both state a contract that
+            // resolve_member_type prefers via meta_override_file_define.
+            let decl_members: Vec<_> = compatible_indices
                 .iter()
                 .map(|&index| member_ids[index])
                 .filter(|member_id| {
-                    member_index
-                        .get_member(member_id)
-                        .is_some_and(|m| m.get_feature().is_meta_decl())
+                    member_index.get_member(member_id).is_some_and(|m| {
+                        m.get_feature().is_meta_decl()
+                            || db.get_type_index()
+                                .get_type_cache(&m.get_id().into())
+                                .is_some_and(|cache| cache.is_doc())
+                    })
                 })
                 .collect();
-            if !meta_members.is_empty() {
-                result.extend(meta_members);
+            if !decl_members.is_empty() {
+                result.extend(decl_members);
             }
             // Each library root has its own tier. Once the first compatible
             // lower tier is examined, later libraries must not supply
@@ -1353,18 +1357,22 @@ fn select_member_ids_by_workspace_and_realm(
                 caller_is_main && priority.broad_tier() == 0 && all_seen_are_non_meta;
         } else if can_supplement_from_library && all_seen_are_non_meta {
             // We have only non-meta members so far. Supplement with any
-            // meta (annotated) members from this lower-priority tier so that
-            // resolve_member_type can prefer them via meta_override_file_define.
-            let meta_members: Vec<_> = compatible_member_ids
+            // annotated member from this lower-priority tier — meta decls
+            // and doc-sourced file decls both state a contract that
+            // resolve_member_type prefers via meta_override_file_define.
+            let decl_members: Vec<_> = compatible_member_ids
                 .into_iter()
                 .filter(|mid| {
-                    member_index
-                        .get_member(mid)
-                        .is_some_and(|m| m.get_feature().is_meta_decl())
+                    member_index.get_member(mid).is_some_and(|m| {
+                        m.get_feature().is_meta_decl()
+                            || db.get_type_index()
+                                .get_type_cache(&m.get_id().into())
+                                .is_some_and(|cache| cache.is_doc())
+                    })
                 })
                 .collect();
-            if !meta_members.is_empty() {
-                result.extend(meta_members);
+            if !decl_members.is_empty() {
+                result.extend(decl_members);
             }
             // Each library root has its own tier. Once the first compatible
             // lower tier is examined, later libraries must not supply

@@ -3238,3 +3238,84 @@ fn declared_boolean_field_still_reports() {
         "#
     ));
 }
+
+#[test]
+fn library_doc_field_not_tightened_by_cross_file_inferred_writers() {
+    let mut ws = crate::VirtualWorkspace::new();
+
+    // The doc class lives in a library workspace (like Doors' sh_api.lua
+    // being a workspace.library for TARDIS), while the field's writers live
+    // in the main workspace.
+    let library_root = ws.virtual_url_generator.new_path("__test_sound_opts_lib");
+    ws.analysis.add_library_workspace(library_root.clone());
+    let library_uri =
+        lsp_types::Uri::parse_from_file_path(&library_root.join("opts.lua")).unwrap();
+    ws.analysis
+        .update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class LibSoundOpts
+                ---@field owner LibBase?
+                "#
+                .to_string(),
+            ),
+        )
+        .expect("library file");
+
+    ws.def_file(
+        "lua/types.lua",
+        r#"
+        ---@class LibBase
+        ---@class LibSubA: LibBase
+        ---@class LibSubB: LibBase
+    "#,
+    );
+
+    let a_id = ws.def_file(
+        "lua/a.lua",
+        r#"
+        ---@param opts LibSoundOpts
+        ---@param a LibSubA
+        local function fa(opts, a)
+            opts.owner = opts.owner or a
+        end
+    "#,
+    );
+
+    let b_id = ws.def_file(
+        "lua/b.lua",
+        r#"
+        ---@param opts LibSoundOpts
+        ---@param b LibSubB
+        local function fb(opts, b)
+            opts.owner = opts.owner or b
+        end
+    "#,
+    );
+
+    // `owner` is documented `LibBase?`; an inferred writer union must not
+    // tighten it, so neither write may be flagged.
+    for file_id in [a_id, b_id] {
+        ws.analysis
+            .diagnostic
+            .enable_only(crate::DiagnosticCode::AssignTypeMismatch);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default();
+        let mismatches: Vec<_> = diagnostics
+            .into_iter()
+            .filter(|d| {
+                d.code
+                    == Some(lsp_types::NumberOrString::String(
+                        crate::DiagnosticCode::AssignTypeMismatch
+                            .get_name()
+                            .to_string(),
+                    ))
+            })
+            .collect();
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+}
+
