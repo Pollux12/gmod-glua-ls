@@ -3317,3 +3317,153 @@ fn library_doc_field_not_tightened_by_cross_file_inferred_writers() {
         assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
 }
+
+/// `self.Primary` is unresolvable on the receiver class, so the write's
+/// right-hand side cannot produce a value. The member it feeds must record
+/// `unknown`, not `never`: a `never` member is reserved for declared shapes
+/// that contradict themselves and fails any structural check.
+#[test]
+fn member_write_of_unresolvable_read_is_not_never() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    ws.analysis
+        .diagnostic
+        .enable_only(crate::DiagnosticCode::ParamTypeMismatch);
+    let file_id = ws.def(
+        r#"
+            ---@class (partial) BulletT
+            ---@field Num? number
+            ---@field Damage? number
+
+            ---@class BulletWeapCls
+
+            ---@param b BulletT
+            local function fire(b) end
+
+            ---@param self BulletWeapCls
+            local function shoot(self)
+                local bullet = {}
+                bullet.Num = 1
+                bullet.Damage = self.Primary.Damage
+                fire(bullet)
+            end
+        "#,
+    );
+    let diagnostics = ws
+        .analysis
+        .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default();
+    let mismatches: Vec<_> = diagnostics
+        .into_iter()
+        .filter(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    crate::DiagnosticCode::ParamTypeMismatch
+                        .get_name()
+                        .to_string(),
+                ))
+        })
+        .collect();
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+/// Same shape but `self.Primary` resolves to a table type that lacks `Damage`:
+/// the missing-field read floors to `nil`, which must not produce a member
+/// mismatch against an optional field either.
+#[test]
+fn member_write_of_missing_doc_field_is_nil_not_mismatch() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    ws.analysis
+        .diagnostic
+        .enable_only(crate::DiagnosticCode::ParamTypeMismatch);
+    let file_id = ws.def(
+        r#"
+            ---@class (partial) BulletT2
+            ---@field Num? number
+            ---@field Damage? number
+
+            ---@class AmmoT2
+            ---@field ClipSize number
+
+            ---@class WeapCls2
+            ---@field Primary AmmoT2
+
+            ---@param b BulletT2
+            local function fire(b) end
+
+            ---@param self WeapCls2
+            local function shoot(self)
+                local bullet = {}
+                bullet.Num = 1
+                bullet.Damage = self.Primary.Damage
+                fire(bullet)
+            end
+        "#,
+    );
+    let diagnostics = ws
+        .analysis
+        .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default();
+    let mismatches: Vec<_> = diagnostics
+        .into_iter()
+        .filter(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    crate::DiagnosticCode::ParamTypeMismatch
+                        .get_name()
+                        .to_string(),
+                ))
+        })
+        .collect();
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+/// Same shape with `Damage` *required* on the target class: the floored `nil`
+/// must report with a real member reason rather than silently mismatching.
+#[test]
+fn member_write_of_missing_doc_field_reports_member_reason() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    ws.analysis
+        .diagnostic
+        .enable_only(crate::DiagnosticCode::ParamTypeMismatch);
+    let file_id = ws.def(
+        r#"
+            ---@class BulletT3
+            ---@field Num number
+            ---@field Damage number
+
+            ---@class AmmoT3
+            ---@field ClipSize number
+
+            ---@class WeapCls3
+            ---@field Primary AmmoT3
+
+            ---@param b BulletT3
+            local function fire(b) end
+
+            ---@param self WeapCls3
+            local function shoot(self)
+                local bullet = {}
+                bullet.Num = 1
+                bullet.Damage = self.Primary.Damage
+                fire(bullet)
+            end
+        "#,
+    );
+    let diagnostics = ws
+        .analysis
+        .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default();
+    let mismatches: Vec<_> = diagnostics
+        .into_iter()
+        .filter(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    crate::DiagnosticCode::ParamTypeMismatch
+                        .get_name()
+                        .to_string(),
+                ))
+        })
+        .collect();
+    assert_eq!(mismatches.len(), 1, "{mismatches:#?}");
+    assert!(mismatches[0].message.contains("Damage"), "{mismatches:#?}");
+}

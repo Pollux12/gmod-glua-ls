@@ -2495,6 +2495,21 @@ impl LuaTypeIndex {
     /// Stores `cache`, keeping [`Self::cache_refs`] in step, and reports
     /// whether a cache was replaced.
     fn insert_type_cache(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) -> bool {
+        // `never` describes an expression that cannot produce a value — indexing
+        // a `nil` a failed read floored to, a branch the analyzer proved
+        // unreachable. A member's cache instead states what the field may hold,
+        // and a write whose right-hand side cannot produce a value contributes
+        // no evidence: `unknown` is the honest record. An inferred `never`
+        // member would render the field uninhabited, which member-level checks
+        // read as a declared contradiction (`integer & string`) — a category
+        // error when the `never` came out of inference rather than a `---@field
+        // x never` doc (those arrive as `DocType` caches and stay).
+        let cache = match (&owner, &cache) {
+            (LuaTypeOwner::Member(_), LuaTypeCache::InferType(LuaType::Never)) => {
+                LuaTypeCache::InferType(LuaType::Unknown)
+            }
+            _ => cache,
+        };
         if self
             .types
             .get(&owner)
