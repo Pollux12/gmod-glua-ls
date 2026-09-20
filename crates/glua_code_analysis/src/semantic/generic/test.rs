@@ -180,6 +180,38 @@ mod test {
         );
     }
 
+    /// An optional table (`T[]?`, `table<K, V>?`) is a union with `nil`. The
+    /// iterator still binds through the non-nil arm: `pairs` on `Vector[]?`
+    /// yields `integer, Vector`, not `any, any`.
+    #[test]
+    fn pairs_over_optional_table_binds_through_the_nil_arm() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@class OptVec
+
+            ---@type OptVec[]?
+            local optArr
+
+            ---@type table<string, OptVec>?
+            local optMap
+
+            for arrKey, arrValue in pairs(optArr) do end
+            for mapKey, mapValue in pairs(optMap) do end
+            "#,
+        );
+
+        let arr_key = local_type(&ws, file_id, "arrKey");
+        let arr_value = local_type(&ws, file_id, "arrValue");
+        assert_eq!(arr_key, LuaType::Integer, "arrKey was {arr_key:?}");
+        assert_eq!(arr_value, ws.ty("OptVec"), "arrValue was {arr_value:?}");
+
+        let map_key = local_type(&ws, file_id, "mapKey");
+        let map_value = local_type(&ws, file_id, "mapValue");
+        assert_eq!(map_key, LuaType::String, "mapKey was {map_key:?}");
+        assert_eq!(map_value, ws.ty("OptVec"), "mapValue was {map_value:?}");
+    }
+
     #[test]
     fn test_variadic_func() {
         let mut ws = crate::VirtualWorkspace::new();

@@ -230,6 +230,43 @@ pub fn tpl_pattern_match(
         return Ok(());
     }
 
+    // A union target contributes whatever each arm can bind: `V[]` against
+    // `A[] | nil` still binds `V = A` from the array arm while the nil arm
+    // supplies nothing, and the same holds for map/object/class arms. Bare
+    // template refs are excluded — `T` against `A | B` binds the union whole.
+    let union_arms: Option<Vec<LuaType>> = match &target {
+        LuaType::Union(union) => Some(union.types().cloned().collect()),
+        LuaType::MultiLineUnion(union) => Some(
+            union
+                .get_unions()
+                .iter()
+                .map(|(typ, _)| typ.clone())
+                .collect(),
+        ),
+        _ => None,
+    };
+    if let Some(arms) = union_arms
+        && !matches!(
+            pattern,
+            LuaType::TplRef(_) | LuaType::ConstTplRef(_) | LuaType::StrTplRef(_)
+        )
+    {
+        let arm_count = arms.len();
+        let mut error_count = 0;
+        let mut last_error = InferFailReason::None;
+        for arm in &arms {
+            if let Err(reason) = tpl_pattern_match(context, pattern, arm) {
+                error_count += 1;
+                last_error = reason;
+            }
+        }
+        return if error_count == arm_count && arm_count > 0 {
+            Err(last_error)
+        } else {
+            Ok(())
+        };
+    }
+
     match pattern {
         LuaType::TplRef(tpl) => {
             if tpl.get_tpl_id().is_func() {
