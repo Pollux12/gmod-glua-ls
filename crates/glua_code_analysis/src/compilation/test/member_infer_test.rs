@@ -4549,6 +4549,85 @@ marauth.character = marauth.character or {}
         );
     }
 
+    /// Guarded `ns = ns or { cfg = ... }` literals and an `ns.cfg = ns.cfg or
+    /// {}` write all bootstrap the `ns.cfg` member slot. While those writer
+    /// caches still name their own literal, a reader's `local cfg = ns.cfg`
+    /// merges them into a `MergedTable`; the settled tail then canonicalises
+    /// every writer onto the lowest-sorting literal, so the cached read is a
+    /// pre-canonicalisation snapshot and has to fold to the canonical literal
+    /// the way a re-index answers.
+    #[test]
+    fn test_guarded_bootstrap_member_read_converges_to_canonical_literal() {
+        let mut ws = VirtualWorkspace::new();
+        let file_a = ws.def_file("lua/ns_guard/a.lua", "ns = ns or { cfg = { a = 1 } }\n");
+        ws.def_file("lua/ns_guard/b.lua", "ns = ns or { cfg = { b = 2 } }\n");
+        ws.def_file(
+            "lua/ns_guard/c.lua",
+            "ns = ns or {}\nns.cfg = ns.cfg or {}\n",
+        );
+        let consumer = ws.def_file("lua/ns_guard/consumer.lua", "local cfg = ns.cfg\n");
+
+        let typ = local_name_type(&mut ws, consumer, "cfg");
+        assert!(
+            matches!(&typ, LuaType::TableConst(in_filed) if in_filed.file_id == file_a),
+            "expected the canonical bootstrap literal from a.lua, got {typ:?}"
+        );
+    }
+
+    /// `ns.item.stored[id]` reads a registry whose only member is a computed
+    /// `stored[item.uniqueID] = item` write in a file the batch walks after the
+    /// consumer. The early read sees an owner with no members and must defer to
+    /// the same `unknown|nil` the sealed index answers, not commit the
+    /// `any|nil` "no data yet" hedge.
+    #[test]
+    fn test_dynamic_key_read_on_guarded_bootstrap_is_stable() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.dynamic_fields_global = true;
+        ws.update_emmyrc(emmyrc);
+        // All three files land in one batch so their lua passes share a wave:
+        // the writer's `ns.item.stored[item.uniqueID]` write cannot resolve
+        // `ns` yet and defers to unresolve, the bootstrap installs
+        // `ns.item.stored`, and the consumer reads it last — its walk sees the
+        // literal owner with no member yet, the ordering a plugin entity gets
+        // against `gamemode/core`.
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/dynread/a_writer.lua",
+                "function ns.item.register(item)\n    ns.item.stored[item.uniqueID] = item\nend\nlocal ITEM = {}\nITEM.cost = 0\nITEM.uniqueID = \"x\"\nns.item.register(ITEM)\n",
+            ),
+            (
+                "lua/dynread/b_boot.lua",
+                "ns = ns or {}\nns.item = ns.item or {}\nns.item.stored = ns.item.stored or {}\n",
+            ),
+            (
+                "lua/dynread/c_read.lua",
+                // The key must resolve during the walk — as `net.ReadString()`
+                // does in the corpus — so `stored[itemID]` evaluates there and
+                // `.cost` commits whatever the still-empty member index says,
+                // rather than deferring the whole initializer.
+                "---@return string\nlocal function nextid() end\nlocal itemID = nextid()\nlocal cost = ns.item.stored[itemID].cost\nlocal doubled = cost + cost\n",
+            ),
+        ]);
+        let consumer = file_ids[2];
+
+        let cold = local_name_type(&mut ws, consumer, "cost");
+        ws.analysis.reindex_files(vec![consumer]);
+        let warm = local_name_type(&mut ws, consumer, "cost");
+        // The member the read waits on holds an `unknown` value, so the sealed
+        // index answers `unknown|nil` for `stored[itemID]` and `.cost` floors
+        // to `nil` — the answer the read must also reach when it first runs
+        // before the deferred write lands.
+        assert_that!(warm, eq(&LuaType::Nil));
+        assert_eq!(cold, warm, "re-index moved the dynamic-key read's answer");
+    }
+
+    /// Loop-carried `grid[x] = row` / `row[y] = cell` writes feed back into the
+    /// `or {}` reads they follow in the same body. Re-indexing the file must
+    /// reach the same answer the cold pass did — the writes and reads are all
+    /// present in both runs, only scheduling differs.
+    #[test]
     fn test_loop_carried_dynamic_member_feedback_is_stable() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();

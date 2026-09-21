@@ -2802,7 +2802,6 @@ pub(in crate::compilation::analyzer) fn resettle_guarded_table_bootstraps(
                 non_guarded_writers.push(writer_id);
             }
         }
-
         if guarded_writers.len() >= 2 && non_guarded_writers.is_empty() {
             let min_guard = guarded_writers
                 .iter()
@@ -3325,6 +3324,29 @@ pub fn analyze_table_field(analyzer: &mut LuaAnalyzer, field: LuaTableField) -> 
                 analyzer.context.add_unresolve(unresolve.into(), reason);
                 return None;
             }
+        };
+        // A table-valued field of a guarded `x = x or { ... }` literal
+        // bootstraps the same member `x.y = x.y or {}` does: when every writer
+        // of the slot is a guard they all name one table — the earliest
+        // writer's literal — so the field binds that literal, not its own.
+        // Binding the field literal instead leaves whichever file re-walked
+        // last in the cache, and reads taken between the writes disagree with
+        // the settled answer.
+        let value_type = if is_guarded_table_assignment_member(analyzer.db, member_id) {
+            analyzer
+                .context
+                .record_settled_guarded_bootstrap_candidate(member_id);
+            canonical_guarded_table_bootstrap_type(
+                analyzer.db,
+                member_id,
+                Some(GuardedTableAssignmentCaches {
+                    member_check: &mut analyzer.guarded_table_assignment_member_check_cache,
+                    slot: &mut analyzer.guarded_table_assignment_slot_cache,
+                }),
+            )
+            .unwrap_or(value_type)
+        } else {
+            value_type
         };
         bind_type(
             analyzer.db,

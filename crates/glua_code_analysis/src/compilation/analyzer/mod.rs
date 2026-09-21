@@ -2779,11 +2779,13 @@ fn refresh_decl_initializer_caches(
             }
             // A slot whose writers had not all landed answers with a flat
             // union instead of the merge, and that answer was cached as if it
-            // were final. See [`cached_provisional_slot_union`].
-            let cached_a_provisional_slot_union = !current_is_uninformative
+            // were final — as is the merge itself when the writers were
+            // guarded bootstraps that resettle folds to one literal. See
+            // [`cached_provisional_slot_merge`].
+            let cached_a_provisional_slot_merge = !current_is_uninformative
                 && current_cache
                     .as_ref()
-                    .is_some_and(|current| cached_provisional_slot_union(current.as_type()));
+                    .is_some_and(|current| cached_provisional_slot_merge(current.as_type()));
             // An `unknown` arm is the read saying it could not settle that part
             // of the union yet. See [`union_has_unsettled_arm`].
             let cached_an_unsettled_union = !current_is_uninformative
@@ -2796,7 +2798,7 @@ fn refresh_decl_initializer_caches(
                 && !current_is_uninformative
                 && !can_refine_nominal_type
                 && !can_upgrade_authority
-                && !cached_a_provisional_slot_union
+                && !cached_a_provisional_slot_merge
                 && !cached_an_unsettled_union
                 && !matches!(
                     current_cache.as_ref().map(LuaTypeCache::as_type),
@@ -2908,7 +2910,7 @@ fn refresh_decl_initializer_caches(
                 && !cached_a_blind_dynamic_field_read
                 && !cached_an_unsettled_union
                 && !is_numeric_tuple_refinement
-                && !cached_a_provisional_slot_union
+                && !cached_a_provisional_slot_merge
                 && !cached_a_tpl_leak
                 && !is_settled_refinement
                 && !is_settled_widening
@@ -3044,7 +3046,7 @@ fn refresh_decl_initializer_caches(
                 || is_nominal_refinement
                 || is_settled_widening
                 || cached_a_blind_dynamic_field_read
-                || cached_a_provisional_slot_union
+                || cached_a_provisional_slot_merge
                 || cached_an_unsettled_union
                 || is_numeric_tuple_refinement
                 || is_settled_refinement
@@ -3076,7 +3078,8 @@ fn refresh_decl_initializer_caches(
 }
 
 /// Whether the cached answer is the flat union a member slot falls back to when
-/// one of its writers had no type yet.
+/// one of its writers had no type yet, or the `MergedTable` several spelled
+/// literals merged into while each still named its own.
 ///
 /// `resolve_member_type`'s `All` arm merges a slot's writers into one table only
 /// when every one of them already reads as a table assignment; a sibling the
@@ -3084,20 +3087,24 @@ fn refresh_decl_initializer_caches(
 /// instead. What decided that is how far the batch had got, not the source, so
 /// the read is provisional and worth taking again once every writer has landed.
 ///
-/// A settled merge answers `MergedTable`, never this shape, so re-reading is
-/// idempotent: the repaired cache no longer matches.
+/// The merged shape is provisional the same way when the writers are guarded
+/// bootstraps: `resettle_guarded_table_bootstraps` canonicalises every writer
+/// onto one literal after the walk, so a merge taken earlier folds back to a
+/// subset — down to one arm — on the settled re-read.
 ///
-/// An arm carrying no type of its own is not one of the slot's writers: the
-/// read adds `nil` for a branch it found no member on and `any` for a sibling
-/// it could not resolve. Letting one veto the shape left the repair unable to
-/// see the very unions it exists for — a double dynamic index over a table
-/// several files write reads as `nil|any|<2052 literals>`.
-fn cached_provisional_slot_union(typ: &LuaType) -> bool {
-    let LuaType::Union(union) = typ else {
-        return false;
+/// A component carrying no type of its own is not one of the slot's writers:
+/// the read adds `nil` for a branch it found no member on and `any` for a
+/// sibling it could not resolve. Letting one veto the shape left the repair
+/// unable to see the very unions it exists for — a double dynamic index over a
+/// table several files write reads as `nil|any|<2052 literals>`.
+fn cached_provisional_slot_merge(typ: &LuaType) -> bool {
+    let components: Vec<&LuaType> = match typ {
+        LuaType::Union(union) => union.types().collect(),
+        LuaType::MergedTable(merged) => merged.get_types().iter().collect(),
+        _ => return false,
     };
     let mut count = 0;
-    for component in union.types() {
+    for component in components {
         if !crate::db_index::is_informative_type(component) {
             continue;
         }
@@ -5282,7 +5289,7 @@ fn return_point_contains_range(point: &LuaReturnPoint, range: rowan::TextRange) 
 #[cfg(test)]
 mod union_widening_tests {
     use super::{
-        cached_provisional_slot_union, settled_widens_cached_literals, union_has_unsettled_arm,
+        cached_provisional_slot_merge, settled_widens_cached_literals, union_has_unsettled_arm,
         union_widens_cached_type,
     };
     use crate::LuaType;
@@ -5342,19 +5349,19 @@ mod union_widening_tests {
         };
         // The read's own `nil`/`any` arms do not stop the rest being the
         // provisional flat-literal shape.
-        assert!(cached_provisional_slot_union(&literals(vec![])));
-        assert!(cached_provisional_slot_union(&literals(vec![LuaType::Nil])));
-        assert!(cached_provisional_slot_union(&literals(vec![
+        assert!(cached_provisional_slot_merge(&literals(vec![])));
+        assert!(cached_provisional_slot_merge(&literals(vec![LuaType::Nil])));
+        assert!(cached_provisional_slot_merge(&literals(vec![
             LuaType::Nil,
             LuaType::Any
         ])));
         // A real non-table arm still does.
-        assert!(!cached_provisional_slot_union(&literals(vec![
+        assert!(!cached_provisional_slot_merge(&literals(vec![
             LuaType::String
         ])));
         // And one literal is not the shape, however many placeholders sit
         // beside it.
-        assert!(!cached_provisional_slot_union(&union(vec![
+        assert!(!cached_provisional_slot_merge(&union(vec![
             LuaType::TableConst(crate::InFiled::new(
                 crate::FileId::new(1),
                 rowan::TextRange::new(0.into(), 1.into()),
@@ -5362,6 +5369,35 @@ mod union_widening_tests {
             LuaType::Nil,
             LuaType::Any,
         ])));
+    }
+
+    #[test]
+    fn spots_a_provisional_slot_merge_of_guarded_bootstrap_literals() {
+        let literal = |file: u32, start: u32| {
+            LuaType::TableConst(crate::InFiled::new(
+                crate::FileId::new(file),
+                rowan::TextRange::new(start.into(), (start + 1).into()),
+            ))
+        };
+        // Several spelled literals merged while each still named its own — the
+        // guarded-bootstrap resettle folds the merge back to the canonical
+        // literal, so the snapshot is provisional too.
+        assert!(cached_provisional_slot_merge(&LuaType::MergedTable(
+            std::sync::Arc::new(crate::LuaMergedTableType::new(vec![
+                literal(1, 0),
+                literal(2, 0)
+            ]))
+        )));
+        // A constituent that is not a spelled literal vetoes the shape — a
+        // genuine multi-writer merge stays final.
+        assert!(!cached_provisional_slot_merge(&LuaType::MergedTable(
+            std::sync::Arc::new(crate::LuaMergedTableType::new(vec![
+                literal(1, 0),
+                LuaType::Table
+            ]))
+        )));
+        // One literal is never the shape.
+        assert!(!cached_provisional_slot_merge(&literal(1, 0)));
     }
 
     #[test]
