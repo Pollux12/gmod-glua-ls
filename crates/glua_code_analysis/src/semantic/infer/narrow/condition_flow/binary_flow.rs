@@ -601,10 +601,15 @@ fn infer_static_member_path(
 ) -> Option<LuaType> {
     let mut current_type = root_type;
     for member_key in member_keys {
-        current_type = find_members_with_key(db, &current_type, member_key.clone(), false)
+        let member_type = find_members_with_key(db, &current_type, member_key.clone(), false)
             .and_then(|members| members.first().map(|member| member.typ.clone()))
             .or_else(|| infer_local_class_table_member_type(db, cache, &current_type, member_key))
             .or_else(|| infer_raw_member_type(db, &current_type, member_key).ok())?;
+        current_type = crate::semantic::infer::infer_index::substitute_member_self_type(
+            db,
+            member_type,
+            &current_type,
+        );
     }
 
     Some(current_type)

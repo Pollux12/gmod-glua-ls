@@ -58,11 +58,27 @@ use crate::{
 };
 
 use super::{
-    InferFailReason, InferResult, infer_expr, infer_name::infer_global_type,
+    InferFailReason, InferResult, infer_expr,
+    infer_name::{contains_self_infer, infer_global_type},
     type_decl_is_vgui_panel,
 };
 
 type TableMemberLookupGuard = FxHashSet<InFiled<TextRange>>;
+
+/// A member declared `---@field x self` yields the receiver's own type, so
+/// `ent.Entity` resolves to whatever `ent` is (including a narrowed class).
+pub(crate) fn substitute_member_self_type(
+    db: &DbIndex,
+    member_type: LuaType,
+    prefix_type: &LuaType,
+) -> LuaType {
+    if !contains_self_infer(&member_type) {
+        return member_type;
+    }
+    let mut substitutor = TypeSubstitutor::new();
+    substitutor.add_self_type(crate::semantic::generic::build_self_type(db, prefix_type));
+    instantiate_type_generic(db, &member_type, &substitutor)
+}
 
 fn visible_super_types_for_index(
     db: &DbIndex,
@@ -372,14 +388,15 @@ pub fn infer_member_by_member_key(
     infer_guard: &InferGuardRef,
 ) -> InferResult {
     let mut table_member_lookup_guard = TableMemberLookupGuard::default();
-    infer_member_by_member_key_with_table_guard(
+    let member_type = infer_member_by_member_key_with_table_guard(
         db,
         cache,
         prefix_type,
         index_expr,
         infer_guard,
         &mut table_member_lookup_guard,
-    )
+    )?;
+    Ok(substitute_member_self_type(db, member_type, prefix_type))
 }
 
 fn infer_member_by_member_key_with_table_guard(
@@ -2785,7 +2802,7 @@ pub fn infer_member_by_operator(
     index_expr: LuaIndexMemberExpr,
     infer_guard: &InferGuardRef,
 ) -> InferResult {
-    match &prefix_type {
+    let member_type = match &prefix_type {
         LuaType::Table => Ok(LuaType::Unknown),
         LuaType::TableConst(in_filed) => {
             infer_member_by_index_table(db, cache, in_filed, index_expr)
@@ -2839,7 +2856,8 @@ pub fn infer_member_by_operator(
             Err(InferFailReason::FieldNotFound)
         }
         _ => Err(InferFailReason::FieldNotFound),
-    }
+    };
+    member_type.map(|member_type| substitute_member_self_type(db, member_type, prefix_type))
 }
 
 fn infer_member_by_index_merged_table(

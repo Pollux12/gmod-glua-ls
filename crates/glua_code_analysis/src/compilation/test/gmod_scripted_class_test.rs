@@ -12605,4 +12605,154 @@ GM.TestValue = 1"#,
     /// holding the backing engine entity. Declared `self`, the read resolves to
     /// the scoped class through the `ENT` super type.
     #[gtest]
+    fn test_entity_scope_self_entity_back_reference() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/autorun/ent_lib.lua",
+            r#"
+            ---@class Entity
+            function Entity:DrawModel() end
+
+            ---@class ENTITY : Entity
+            ENTITY = {}
+
+            ---@class ENT : ENTITY
+            ---@field Entity self
+            ENT = {}
+        "#,
+        );
+
+        let file_id = ws.def_file(
+            "entities/entities/ent_fballoon/cl_init.lua",
+            r#"
+            function ENT:Draw()
+                self.Entity:DrawModel()
+            end
+        "#,
+        );
+
+        let ty = index_expr_type(&mut ws, file_id, "self.Entity");
+        assert_eq!(
+            ty,
+            LuaType::Def(LuaTypeDeclId::global("ent_fballoon")),
+            "self.Entity should resolve to the scoped entity class, got {ty:?}"
+        );
+
+        let diags = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .expect("diagnostics");
+        let field_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.code,
+                    Some(NumberOrString::String(ref c))
+                        if c == "undefined-field" || c == "unchecked-nil-access"
+                )
+            })
+            .collect();
+        assert!(
+            field_diags.is_empty(),
+            "self.Entity should not be flagged, got {field_diags:?}"
+        );
+    }
+
+    /// `ent.Entity` is a self-reference: the field returns the entity itself via
+    /// script-table delegation. Declared `self` on both `ENT` and `Entity`, the
+    /// member read must resolve to the receiver's type so `GetClass` guards
+    /// narrow `ent.Entity` too. `ENT.Entity` is declared `self` because the
+    /// scoped class's `ENT` super type shadows `Entity`'s member.
+    #[gtest]
+    fn test_entity_self_back_reference_resolves_receiver_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/autorun/ent_lib.lua",
+            r#"
+            ---@class Entity
+            ---@field Entity self
+            ---@return string
+            function Entity:GetClass() end
+
+            ---@class ENTITY : Entity
+            ENTITY = {}
+
+            ---@class ENT : ENTITY
+            ---@field Entity self
+            ENT = {}
+
+            ---@class TraceResult
+            ---@field Entity Entity
+
+            ---@param p Entity
+            ---@return TraceResult
+            function GetEyeTrace(p) end
+        "#,
+        );
+
+        ws.def_file(
+            "entities/entities/cityrp_farmplot/init.lua",
+            r#"
+            function ENT:GetIsSoiled() end
+        "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/test/plant.lua",
+            r#"
+            local function f(player)
+                local trace = GetEyeTrace(player).Entity
+                if trace:GetClass() == "cityrp_farmplot" then
+                    trace.Entity:GetIsSoiled()
+                end
+            end
+        "#,
+        );
+
+        let ty = index_expr_type(&mut ws, file_id, "trace.Entity");
+        assert_eq!(
+            ty,
+            LuaType::Ref(LuaTypeDeclId::global("cityrp_farmplot")),
+            "trace.Entity should resolve to the narrowed receiver type, got {ty:?}"
+        );
+
+        let diags = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .expect("diagnostics");
+        let field_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.code,
+                    Some(NumberOrString::String(ref c))
+                        if c == "undefined-field"
+                            || c == "unchecked-nil-access"
+                            || c == "infer-unguarded-child"
+                )
+            })
+            .collect();
+        assert!(
+            field_diags.is_empty(),
+            "guarded trace.Entity access should not be flagged, got {field_diags:?}"
+        );
+    }
 }

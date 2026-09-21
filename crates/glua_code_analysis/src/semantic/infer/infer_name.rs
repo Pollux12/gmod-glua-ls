@@ -3039,7 +3039,7 @@ fn find_self_receiver_id(
 }
 
 /// Returns true if the type contains an unresolved `SelfInfer`.
-fn contains_self_infer(typ: &LuaType) -> bool {
+pub(crate) fn contains_self_infer(typ: &LuaType) -> bool {
     match typ {
         LuaType::SelfInfer => true,
         LuaType::TableOf(inner) => contains_self_infer(inner),
