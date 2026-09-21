@@ -161,6 +161,14 @@ pub(crate) struct InferenceReadSet {
     /// Dynamic-field definitions consulted, keyed by owner and field name
     /// (`None` is the wildcard bucket). See `DynamicFieldIndex::dynamic_writes`.
     pub dynamic_fields: FxHashSet<(DynamicFieldOwner, Option<SmolStr>)>,
+    /// A member lookup reached the dynamic-field fallback while the index was
+    /// hidden (`dynamic_fields_visible: false`) and the field it asked about
+    /// already had definitions. The read answered "no field" only because the
+    /// index was masked — no write epoch can express that, since the defs
+    /// predate the capture — so the read stays provisional until the index is
+    /// visible. Unlike the epoch-keyed `dynamic_fields` entries, this flags
+    /// the whole set as stale once a visible pass re-checks it.
+    pub dynamic_fields_masked: bool,
     /// Member slots a lookup missed on, versioned by what the slot held when
     /// read: the member count, and for a `Name` key the dynamic-field
     /// definition count. A slot that was already non-empty (a realm-incompatible
@@ -263,6 +271,7 @@ impl InferenceReadSet {
             && self.special_calls.is_empty()
             && self.contribs.is_empty()
             && self.dynamic_fields.is_empty()
+            && !self.dynamic_fields_masked
             && self.missing_member_slots.is_empty()
             && self.member_ids.is_empty()
             && self.type_decls.is_empty()
@@ -295,6 +304,7 @@ impl InferenceReadSet {
         self.special_calls.extend(other.special_calls);
         self.contribs.extend(other.contribs);
         self.dynamic_fields.extend(other.dynamic_fields);
+        self.dynamic_fields_masked |= other.dynamic_fields_masked;
         self.missing_member_slots.extend(other.missing_member_slots);
         merge_min_epochs(&mut self.member_ids, other.member_ids);
         merge_min_epochs(&mut self.type_decls, other.type_decls);
@@ -372,6 +382,9 @@ struct ActiveReads {
     special_calls: RefCell<FxHashSet<(FileId, TextSize)>>,
     contribs: RefCell<FxHashSet<(LuaSignatureId, usize)>>,
     dynamic_fields: RefCell<FxHashSet<(DynamicFieldOwner, Option<SmolStr>)>>,
+    /// A hidden dynamic-field read masked a field the index already holds —
+    /// see [`InferenceReadSet::dynamic_fields_masked`].
+    dynamic_fields_masked: Cell<bool>,
     missing_member_slots: RefCell<FxHashMap<(LuaMemberOwner, LuaMemberKey), (usize, usize)>>,
     member_ids: RefCell<FxHashMap<LuaMemberId, u64>>,
     type_decls: RefCell<FxHashMap<(LuaTypeDeclId, TypeDeclKind), u64>>,
@@ -429,6 +442,7 @@ impl ActiveReads {
         self.special_calls.borrow_mut().clear();
         self.contribs.borrow_mut().clear();
         self.dynamic_fields.borrow_mut().clear();
+        self.dynamic_fields_masked.set(false);
         self.missing_member_slots.borrow_mut().clear();
         self.member_ids.borrow_mut().clear();
         self.type_decls.borrow_mut().clear();
@@ -462,6 +476,7 @@ impl ActiveReads {
             special_calls: self.special_calls.borrow().clone(),
             contribs: self.contribs.borrow().clone(),
             dynamic_fields: self.dynamic_fields.borrow().clone(),
+            dynamic_fields_masked: self.dynamic_fields_masked.get(),
             missing_member_slots: self.missing_member_slots.borrow().clone(),
             member_ids: self.member_ids.borrow().clone(),
             type_decls: self.type_decls.borrow().clone(),
@@ -495,6 +510,7 @@ impl ActiveReads {
             special_calls: self.special_calls.take(),
             contribs: self.contribs.take(),
             dynamic_fields: self.dynamic_fields.take(),
+            dynamic_fields_masked: self.dynamic_fields_masked.replace(false),
             missing_member_slots: self.missing_member_slots.take(),
             member_ids: self.member_ids.take(),
             type_decls: self.type_decls.take(),
@@ -685,6 +701,20 @@ pub(crate) fn record_dynamic_field(owner: &DynamicFieldOwner, field_name: Option
             .insert((owner.clone(), field_name.map(SmolStr::new)));
         active
             .note_read_seq(|| WriteKey::DynamicField(owner.clone(), field_name.map(SmolStr::new)));
+    });
+}
+
+/// Flags that a member lookup reached the dynamic-field fallback while the
+/// index was hidden and the asked-for field already had definitions — the
+/// "no field" answer was a masking artifact, so no write epoch can stale it.
+/// The visible pass re-derives the reader unconditionally.
+#[inline]
+pub(crate) fn record_dynamic_field_masked() {
+    with_active(|active| {
+        if active.depth.get() == 0 {
+            return;
+        }
+        active.dynamic_fields_masked.set(true);
     });
 }
 
@@ -1218,6 +1248,12 @@ impl InferenceReadVersion {
         db: &crate::DbIndex,
         reads: &InferenceReadSet,
     ) -> bool {
+        // A hidden dynamic-field read that masked a present field is stale the
+        // moment the index is visible again — its "no field" answer was never a
+        // fact about the index, so no write epoch in `self`/`now` can clear it.
+        if reads.dynamic_fields_masked {
+            return true;
+        }
         // An unchanged capture covers every epoch-keyed read: the store
         // clocks prove each per-key epoch inside `reads` is what it was, and
         // `member_clock` covers the member-side versions. Only the slot

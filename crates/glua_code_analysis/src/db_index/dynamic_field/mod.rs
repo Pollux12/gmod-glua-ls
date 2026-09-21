@@ -334,7 +334,8 @@ impl DynamicFieldIndex {
         self.dynamic_write_versions.get(key).copied().unwrap_or(0)
     }
 
-    pub fn add_unattributed_field(&mut self, field_name: SmolStr, file_id: FileId) {
+    /// Returns whether the unattributed record was new to the index.
+    pub fn add_unattributed_field(&mut self, field_name: SmolStr, file_id: FileId) -> bool {
         if op_log::recording() {
             let field_name2 = field_name.clone();
             op_log::push(
@@ -345,21 +346,22 @@ impl DynamicFieldIndex {
                 ]),
                 move |db| {
                     db.get_dynamic_field_index_mut()
-                        .add_unattributed_field(field_name2, file_id)
+                        .add_unattributed_field(field_name2, file_id);
                 },
             );
         }
-        if self
+        let is_new = self
             .unattributed_fields
             .entry(field_name.clone())
             .or_default()
-            .insert(file_id)
-        {
+            .insert(file_id);
+        if is_new {
             self.unattributed_file_contributions
                 .entry(file_id)
                 .or_default()
                 .push(field_name);
         }
+        is_new
     }
 
     /// Takes back an unattributed record once a settled retry has attributed
@@ -380,6 +382,169 @@ impl DynamicFieldIndex {
             }
         }
         removed
+    }
+
+    /// Replaces one write site's contribution set with a re-derived one.
+    ///
+    /// The settled tail answers from a more settled index than the pass that
+    /// first collected the site, so the new owner set can differ in either
+    /// direction: definitions the retry no longer produces are withdrawn,
+    /// ones it now produces are added, and unchanged ones keep their version
+    /// — re-filing an identical definition must not stale the readers that
+    /// already saw it.
+    ///
+    /// `range` is the site's index-key range; with `file_id` it names exactly
+    /// the definitions this site produced, so sibling sites writing the same
+    /// field onto the same owner from different positions are untouched.
+    pub fn replace_site_contributions(
+        &mut self,
+        file_id: FileId,
+        range: TextRange,
+        direct: &[(DynamicFieldOwner, SmolStr)],
+        propagated: &[(DynamicFieldOwner, SmolStr)],
+        wildcards: &[DynamicFieldOwner],
+    ) -> bool {
+        let definition = InFiled::new(file_id, range);
+        let mut changed = false;
+
+        let new_named: HashSet<(DynamicFieldOwner, SmolStr)> =
+            direct.iter().chain(propagated.iter()).cloned().collect();
+        let stale_named: Vec<(DynamicFieldOwner, SmolStr)> = self
+            .file_contributions
+            .get(&file_id)
+            .map(|contributions| {
+                contributions
+                    .iter()
+                    .filter(|(_, _, contribution_range)| *contribution_range == range)
+                    .filter(|(owner, field_name, _)| {
+                        !new_named.contains(&(owner.clone(), field_name.clone()))
+                    })
+                    .map(|(owner, field_name, _)| (owner.clone(), field_name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (owner, field_name) in stale_named {
+            remove_field_definition(
+                &mut self.field_definitions,
+                &owner,
+                &field_name,
+                &definition,
+            );
+            remove_field_definition(
+                &mut self.direct_field_definitions,
+                &owner,
+                &field_name,
+                &definition,
+            );
+            self.note_dynamic_write(owner.clone(), Some(field_name.clone()));
+            // The file keeps its slot while another of its definitions on the
+            // same owner/field survives; only the file's last definition for
+            // the slot frees it.
+            let has_remaining = self
+                .field_definitions
+                .get(&owner)
+                .and_then(|fields| fields.get(field_name.as_str()))
+                .is_some_and(|defs| defs.iter().any(|def| def.file_id == file_id));
+            if !has_remaining && let Some(fields) = self.owner_fields.get_mut(&owner) {
+                if let Some(files) = fields.get_mut(field_name.as_str()) {
+                    files.remove(&file_id);
+                    if files.is_empty() {
+                        fields.remove(field_name.as_str());
+                    }
+                }
+                if fields.is_empty() {
+                    self.owner_fields.remove(&owner);
+                }
+            }
+            if let Some(contributions) = self.file_contributions.get_mut(&file_id) {
+                contributions.retain(|(o, n, contribution_range)| {
+                    !(o == &owner && n == &field_name && *contribution_range == range)
+                });
+                if contributions.is_empty() {
+                    self.file_contributions.remove(&file_id);
+                }
+            }
+            changed = true;
+        }
+        for (owner, field_name) in direct {
+            changed |= self.add_field(owner.clone(), field_name.clone(), file_id, range);
+        }
+        for (owner, field_name) in propagated {
+            changed |= self.add_propagated_field(owner.clone(), field_name.clone(), file_id, range);
+        }
+
+        let new_wildcards: HashSet<DynamicFieldOwner> = wildcards.iter().cloned().collect();
+        let stale_wildcards: Vec<DynamicFieldOwner> = self
+            .wildcard_file_contributions
+            .get(&file_id)
+            .map(|contributions| {
+                contributions
+                    .iter()
+                    .filter(|(_, contribution_range)| *contribution_range == range)
+                    .map(|(owner, _)| owner.clone())
+                    .filter(|owner| !new_wildcards.contains(owner))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for owner in stale_wildcards {
+            if let Some(definitions) = self.wildcard_definitions.get_mut(&owner) {
+                definitions.retain(|existing| existing != &definition);
+                if definitions.is_empty() {
+                    self.wildcard_definitions.remove(&owner);
+                }
+            }
+            self.note_dynamic_write(owner.clone(), None);
+            if let Some(contributions) = self.wildcard_file_contributions.get_mut(&file_id) {
+                contributions.retain(|(o, contribution_range)| {
+                    !(o == &owner && *contribution_range == range)
+                });
+                if contributions.is_empty() {
+                    self.wildcard_file_contributions.remove(&file_id);
+                }
+            }
+            changed = true;
+        }
+        for owner in wildcards {
+            changed |= self.add_wildcard_definition(owner.clone(), file_id, range);
+        }
+        changed
+    }
+
+    /// Replaces the finite-named-member marks one write site produced.
+    ///
+    /// A dynamic-key write marks `(owner, member_id)` when its key domain
+    /// resolved finitely against the owner's type — the same settle-time
+    /// partiality the named/wildcard reconcile covers applies here: owners
+    /// the site's prefix no longer resolves to lose the mark, ones it now
+    /// resolves to gain it. `member_id` is the site's own syntax identity,
+    /// so every existing mark under it came from this site.
+    pub fn replace_site_finite_members(
+        &mut self,
+        member_id: LuaMemberId,
+        marked: &HashSet<DynamicFieldOwner>,
+    ) -> bool {
+        let file_id = member_id.file_id;
+        let stale: Vec<DynamicFieldOwner> = self
+            .finite_named_file_contributions
+            .get(&file_id)
+            .map(|contributions| {
+                contributions
+                    .iter()
+                    .filter(|(_, contribution_member)| *contribution_member == member_id)
+                    .map(|(owner, _)| owner.clone())
+                    .filter(|owner| !marked.contains(owner))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut changed = false;
+        for owner in stale {
+            self.remove_finite_named_member(&owner, member_id);
+            changed = true;
+        }
+        for owner in marked {
+            changed |= self.add_finite_named_member(owner.clone(), member_id);
+        }
+        changed
     }
 
     /// Re-keys the table-literal owners in the edited file and drops the
@@ -640,7 +805,12 @@ impl DynamicFieldIndex {
         self.direct_field_definitions.get(owner)
     }
 
-    pub fn add_finite_named_member(&mut self, owner: DynamicFieldOwner, member_id: LuaMemberId) {
+    /// Returns whether the mark was new to the index.
+    pub fn add_finite_named_member(
+        &mut self,
+        owner: DynamicFieldOwner,
+        member_id: LuaMemberId,
+    ) -> bool {
         if op_log::recording() {
             let owner2 = owner.clone();
             op_log::push(
@@ -652,21 +822,22 @@ impl DynamicFieldIndex {
                 ]),
                 move |db| {
                     db.get_dynamic_field_index_mut()
-                        .add_finite_named_member(owner2, member_id)
+                        .add_finite_named_member(owner2, member_id);
                 },
             );
         }
-        if self
+        let is_new = self
             .finite_named_members
             .entry(owner.clone())
             .or_default()
-            .insert(member_id)
-        {
+            .insert(member_id);
+        if is_new {
             self.finite_named_file_contributions
                 .entry(member_id.file_id)
                 .or_default()
                 .push((owner, member_id));
         }
+        is_new
     }
 
     pub fn remove_finite_named_member(
@@ -1518,5 +1689,172 @@ mod tests {
             index.unattributed_file_contributions,
             fresh.unattributed_file_contributions
         );
+    }
+
+    /// The settled tail replaces a site's contribution set rather than adding
+    /// beside it: definitions the re-derivation no longer produces are
+    /// withdrawn, and a sibling site writing the same field from another
+    /// position is untouched.
+    #[test]
+    fn replace_site_contributions_withdraws_only_the_sites_own_definitions() {
+        let site_file = FileId::new(1);
+        let owner_a = DynamicFieldOwner::Type(LuaTypeDeclId::global("OwnerA"));
+        let owner_b = DynamicFieldOwner::Type(LuaTypeDeclId::global("OwnerB"));
+        let site_range = range(1, 2);
+        let sibling_range = range(5, 6);
+
+        let mut index = DynamicFieldIndex::new();
+        index.add_field(owner_a.clone(), SmolStr::new("f"), site_file, site_range);
+        index.add_field(owner_a.clone(), SmolStr::new("f"), site_file, sibling_range);
+        index.add_field(owner_a.clone(), SmolStr::new("g"), site_file, site_range);
+
+        let changed = index.replace_site_contributions(
+            site_file,
+            site_range,
+            &[(owner_b.clone(), SmolStr::new("f"))],
+            &[],
+            &[],
+        );
+
+        assert!(changed);
+        // The site moved `f` to `owner_b` and no longer produces `g`; the
+        // sibling site's `f` definition on `owner_a` survives.
+        assert_eq!(
+            index.field_definitions(&owner_a, "f"),
+            [InFiled::new(site_file, sibling_range)]
+        );
+        assert_eq!(index.field_definitions(&owner_b, "f").len(), 1);
+        assert!(!index.has_field(&owner_a, "g"));
+        // `owner_a.f` still counts this file through the sibling site's
+        // surviving definition; only `g` released the file's slot.
+        assert_eq!(
+            index.get_fields_in_file(&owner_a, site_file),
+            vec![&SmolStr::new("f")]
+        );
+        assert_eq!(
+            index.file_contributions[&site_file]
+                .iter()
+                .filter(|(_, _, r)| *r == site_range)
+                .count(),
+            1
+        );
+        // A second identical replacement is a no-op: re-filing what the site
+        // already produced must not churn.
+        assert!(!index.replace_site_contributions(
+            site_file,
+            site_range,
+            &[(owner_b.clone(), SmolStr::new("f"))],
+            &[],
+            &[],
+        ));
+    }
+
+    /// Propagated contributions filed beside a site's direct ones reconcile
+    /// the same way: a stale propagated owner is withdrawn while a kept
+    /// direct definition stands.
+    #[test]
+    fn replace_site_contributions_withdraws_stale_propagated_definitions() {
+        let site_file = FileId::new(1);
+        let owner_direct = DynamicFieldOwner::Type(LuaTypeDeclId::global("Direct"));
+        let owner_super = DynamicFieldOwner::Type(LuaTypeDeclId::global("Super"));
+        let site_range = range(1, 2);
+
+        let mut index = DynamicFieldIndex::new();
+        index.add_field(
+            owner_direct.clone(),
+            SmolStr::new("f"),
+            site_file,
+            site_range,
+        );
+        index.add_propagated_field(
+            owner_super.clone(),
+            SmolStr::new("f"),
+            site_file,
+            site_range,
+        );
+
+        // The re-derived site keeps the direct definition but produces no
+        // propagated one this round.
+        let changed = index.replace_site_contributions(
+            site_file,
+            site_range,
+            &[(owner_direct.clone(), SmolStr::new("f"))],
+            &[],
+            &[],
+        );
+
+        assert!(changed);
+        assert_eq!(index.field_definitions(&owner_direct, "f").len(), 1);
+        assert!(!index.has_field(&owner_super, "f"));
+        // The stale propagated entry is out of the file's contributions.
+        assert!(
+            index.file_contributions[&site_file]
+                .iter()
+                .all(|(owner, _, _)| *owner != owner_super)
+        );
+    }
+
+    /// Wildcard definitions reconcile under the same site identity: owners
+    /// the re-derivation no longer covers lose the site's wildcard.
+    #[test]
+    fn replace_site_contributions_withdraws_stale_wildcards() {
+        let site_file = FileId::new(1);
+        let owner_a = DynamicFieldOwner::Type(LuaTypeDeclId::global("OwnerA"));
+        let owner_b = DynamicFieldOwner::Type(LuaTypeDeclId::global("OwnerB"));
+        let site_range = range(1, 2);
+
+        let mut index = DynamicFieldIndex::new();
+        index.add_wildcard_definition(owner_a.clone(), site_file, site_range);
+
+        let changed = index.replace_site_contributions(
+            site_file,
+            site_range,
+            &[],
+            &[],
+            std::slice::from_ref(&owner_b),
+        );
+
+        assert!(changed);
+        assert!(index.get_wildcard_definitions(&owner_a).is_empty());
+        assert_eq!(index.get_wildcard_definitions(&owner_b).len(), 1);
+        assert!(
+            index.wildcard_file_contributions[&site_file]
+                .iter()
+                .all(|(owner, _)| *owner != owner_a)
+        );
+    }
+
+    /// Finite-named marks reconcile against the marks the site files this
+    /// round: every mark under the member id is that site's own, so stale
+    /// ones withdraw and new ones land.
+    #[test]
+    fn replace_site_finite_members_reconciles_the_sites_marks() {
+        use glua_parser::LuaSyntaxKind;
+
+        let site_file = FileId::new(1);
+        let member_id = LuaMemberId::new(
+            LuaSyntaxId::new(LuaSyntaxKind::IndexExpr.into(), range(1, 2)),
+            site_file,
+        );
+        let other_member = LuaMemberId::new(
+            LuaSyntaxId::new(LuaSyntaxKind::IndexExpr.into(), range(9, 10)),
+            site_file,
+        );
+        let owner_a = DynamicFieldOwner::Type(LuaTypeDeclId::global("OwnerA"));
+        let owner_b = DynamicFieldOwner::Type(LuaTypeDeclId::global("OwnerB"));
+
+        let mut index = DynamicFieldIndex::new();
+        index.add_finite_named_member(owner_a.clone(), member_id);
+        index.add_finite_named_member(owner_a.clone(), other_member);
+
+        let marked: HashSet<DynamicFieldOwner> = [owner_b.clone()].into_iter().collect();
+        let changed = index.replace_site_finite_members(member_id, &marked);
+
+        assert!(changed);
+        assert!(!index.member_has_finite_named_definition(&owner_a, member_id));
+        assert!(index.member_has_finite_named_definition(&owner_b, member_id));
+        // The other member's mark on the same owner is untouched.
+        assert!(index.member_has_finite_named_definition(&owner_a, other_member));
+        assert!(!index.replace_site_finite_members(member_id, &marked));
     }
 }

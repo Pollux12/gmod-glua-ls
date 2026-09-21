@@ -4549,6 +4549,101 @@ marauth.character = marauth.character or {}
         );
     }
 
+    fn test_loop_carried_dynamic_member_feedback_is_stable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc.gmod.dynamic_fields_global = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/looped/a_boot.lua",
+            "cityrp = cityrp or {}\ncityrp.configuration = {}\n",
+        );
+        let file_id = ws.def_file(
+            "lua/looped/b_grid.lua",
+            r#"
+local voiceDistance = cityrp.configuration["Voice Chat Distance Squared"]
+local DrpCanHear = {}
+local gridSize = math.sqrt(voiceDistance)
+local floor = math.floor
+local grid
+local plyToGrid = {
+    { },
+    { },
+}
+
+timer.Create("CityRPCanHearPlayersVoice", 0.5, 0, function()
+    plyToGrid[1], plyToGrid[2] = {}, {}
+    grid = {}
+    local plyPos = {}
+    local plyTables = {}
+
+    for _, ply in player.Iterator() do
+        local plyTbl = ply:GetTable()
+        plyTables[ply] = plyTbl
+        local pos = ply:GetPos()
+        plyPos[ply] = pos
+        local x = floor(pos.x / gridSize)
+        local y = floor(pos.y / gridSize)
+        local row = grid[x] or {}
+        local cell = row[y] or {}
+        table.insert(cell, ply)
+        row[y] = cell
+        grid[x] = row
+        plyToGrid[1][ply] = x
+        plyToGrid[2][ply] = y
+        DrpCanHear[ply] = {}
+    end
+
+    for _, ply1 in player.Iterator() do
+        local ply1Tbl = plyTables[ply1]
+        local gridX = plyToGrid[1][ply1]
+        local gridY = plyToGrid[2][ply1]
+        local ply1Pos = plyPos[ply1]
+        for i = 0, 3 do
+            local vOffset = 1 - ((i >= 3) and 1 or 0)
+            local hOffset = -(i % 3 - 1)
+            local x = gridX + hOffset
+            local y = gridY + vOffset
+            local row = grid[x]
+            if not row then continue end
+            local cell = row[y]
+            if not cell then continue end
+            for _, ply2 in ipairs(cell) do
+                local ply2Tbl = plyTables[ply2]
+                local canTalk = ply1Pos:DistToSqr(plyPos[ply2]) < voiceDistance
+                DrpCanHear[ply1][ply2] = canTalk
+                DrpCanHear[ply2][ply1] = canTalk
+            end
+        end
+    end
+
+    for _, row in pairs(grid) do
+        for _, cell in pairs(row) do
+            local count = #cell
+            for i = 1, count do
+                local ply1 = cell[i]
+                local ply1Tbl = plyTables[ply1]
+                for j = i + 1, count do
+                    local ply2 = cell[j]
+                    local ply2Tbl = plyTables[ply2]
+                    local canTalk = plyPos[ply1]:DistToSqr(plyPos[ply2]) < voiceDistance
+                    DrpCanHear[ply1][ply2] = canTalk
+                    DrpCanHear[ply2][ply1] = canTalk
+                end
+            end
+        end
+    end
+end)
+"#,
+        );
+
+        let cold = local_name_type(&mut ws, file_id, "cell");
+        ws.analysis.reindex_files(vec![file_id]);
+        let warm = local_name_type(&mut ws, file_id, "cell");
+        assert_eq!(cold, warm, "re-index moved the loop-carried read's answer");
+    }
+
     /// `X.k = X.k or {}` installs an empty table, but a sibling assignment
     /// inside a function can replace it at any time. A read outside that
     /// function must not narrow to the empty bootstrap table.
@@ -5225,6 +5320,258 @@ SWEP.Attachments = {[1] = {header = "Sight", offset = {800, -500}}}
 
         ws.analysis.reindex_files_without_expansion(vec![base_file]);
         assert_that!(member_owner(&ws), eq(&cold_owner));
+    }
+
+    #[gtest]
+    fn settled_dynamic_field_write_fans_out_over_late_element_write() {
+        // `v.keyText = ...` fans the write out over every element table of
+        // `self.Attachments`. One element arm (`self.Attachments[2] = ...`)
+        // cannot attach until `self`'s weapon binding settles, so at dynamic
+        // -field collection time the iterated union only covers the first
+        // arm. The write still lands on a real owner, so nothing flags the
+        // site for the settled retry — the second element table's field
+        // definition must arrive through the tail rather than be lost.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![
+            (
+                "lua/weapons/cw_base/shared.lua",
+                r#"
+function SWEP:DrawHUD()
+    for _, value in pairs(self.Attachments) do
+        value.keyText = "x"
+    end
+end
+"#,
+            ),
+            (
+                "lua/weapons/cw_ak74/shared.lua",
+                r#"
+SWEP.Base = "cw_base"
+SWEP.Attachments = {[1] = {header = "Sight", atts = {"md_kobra"}}}
+"#,
+            ),
+            (
+                "lua/weapons/cw_ar15/shared.lua",
+                r#"
+SWEP.Base = "cw_base"
+SWEP.Attachments = {[1] = {header = "Irons"}}
+function SWEP:adjust()
+    self.Attachments[2] = {header = "Late"}
+end
+"#,
+            ),
+            (
+                // Defined before the reader so `pending`'s global read of
+                // `ATT_LIST` is a settled-tail re-derivation, not an in-phase
+                // bind: `pending[2]`'s element write then lands after the
+                // dynamic-field pass collected the reader's loop.
+                "lua/att_writer.lua",
+                r#"
+local pending = ATT_LIST
+pending[2] = {header = "Second"}
+"#,
+            ),
+            (
+                "lua/att_reader.lua",
+                r#"
+ATT_LIST = ATT_LIST or {}
+ATT_LIST[1] = {header = "First"}
+ATT_LIST[3] = "marker"
+for _, value in pairs(ATT_LIST) do
+    value.keyText = "x"
+end
+"#,
+            ),
+        ]);
+
+        // Every element table iterated by the two `pairs` loops carries a
+        // `keyText` field definition once the workspace settles: the three
+        // `Attachments` literals plus both `ATT_LIST` elements — including
+        // `{header="Second"}`, whose write attaches only after the
+        // `getAtts()` return resolves in the settled tail.
+        let key_text_owners = |ws: &VirtualWorkspace| -> Vec<String> {
+            let mut owners = ws
+                .analysis
+                .compilation
+                .get_db()
+                .get_dynamic_field_index()
+                .iter_all_field_definitions()
+                .flat_map(|(owner, fields)| {
+                    fields
+                        .keys()
+                        .filter(|name| name.as_str() == "keyText")
+                        .map(move |_| format!("{owner:?}"))
+                })
+                .collect::<Vec<_>>();
+            owners.sort();
+            owners.dedup();
+            owners
+        };
+        let cold_owners = key_text_owners(&ws);
+        assert_that!(
+            cold_owners.len(),
+            eq(5),
+            "keyText must be defined on every iterated element table, got {cold_owners:?}"
+        );
+        // `ATT_LIST[1]`'s literal canonicalizes to the global path it
+        // initialized; the other four land on their table literals —
+        // including `{header="Second"}`, which only exists once the deferred
+        // `pending[2]` write attaches in the settled tail.
+        assert_that!(
+            cold_owners
+                .iter()
+                .filter(|owner| owner.starts_with("Table("))
+                .count(),
+            eq(4),
+            "element-table owners expected, got {cold_owners:?}"
+        );
+        assert_that!(
+            cold_owners
+                .iter()
+                .any(|owner| owner == "GlobalPath(GlobalId(\"ATT_LIST.1\"))"),
+            eq(true),
+            "ATT_LIST[1]'s literal must carry keyText, got {cold_owners:?}"
+        );
+    }
+
+    #[gtest]
+    fn settled_dynamic_field_write_moves_when_setmetatable_binding_lands_late() {
+        // `t.movedField = ...` reads the setmetatable binding for `t`: the
+        // metatable's `__index` member only attaches in the settled tail
+        // (`lateMeta`'s read of `WEP_META` is a deferred global read), so the
+        // dynamic-field pass files the field on `t`'s own literal. Once the
+        // binding resolves the write's owner is the `__index` target — the
+        // re-derivation must replace the stale contribution, not add beside
+        // it: the literal and the target cannot both keep the definition.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![
+            (
+                // Defined before the user so `lateMeta`'s read of `WEP_META`
+                // is a settled-tail re-derivation, not an in-phase bind: the
+                // `__index` member write then lands after the dynamic-field
+                // pass collected the user's write site.
+                "lua/meta_late.lua",
+                r#"
+local lateMeta = WEP_META
+lateMeta["__index"] = INDEX_TARGET
+"#,
+            ),
+            (
+                "lua/meta_user.lua",
+                r#"
+WEP_META = {}
+INDEX_TARGET = {}
+local t = {}
+setmetatable(t, WEP_META)
+t.movedField = 1
+"#,
+            ),
+        ]);
+
+        let moved_owners = |ws: &VirtualWorkspace| -> Vec<String> {
+            let mut owners = ws
+                .analysis
+                .compilation
+                .get_db()
+                .get_dynamic_field_index()
+                .iter_all_field_definitions()
+                .flat_map(|(owner, fields)| {
+                    fields
+                        .keys()
+                        .filter(|name| name.as_str() == "movedField")
+                        .map(move |_| format!("{owner:?}"))
+                })
+                .collect::<Vec<_>>();
+            owners.sort();
+            owners.dedup();
+            owners
+        };
+        let owners = moved_owners(&ws);
+        assert_that!(
+            owners.as_slice(),
+            eq(&["GlobalPath(GlobalId(\"INDEX_TARGET\"))".to_string()]),
+            "movedField must live only on the metatable's __index target once the binding settles, got {owners:?}"
+        );
+    }
+
+    #[gtest]
+    fn dynamic_field_write_after_dynamic_index_read_attributes() {
+        // `attTable = self.Attachments[cur]` reads the element tables through a
+        // dynamic key; `attTable.last = ...` then writes a named field on each.
+        // Reproduces the cw_base `attTable.last` site: the element union is only
+        // reachable once `self.Attachments` (the subclass member accumulation)
+        // resolves, so a collection that infers the index read before the
+        // member settles must not commit the transient `Never`.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![
+            (
+                "lua/weapons/cw_base/shared.lua",
+                r#"
+function SWEP:_attach(cur, curPos, inherit)
+    local attTable = self.Attachments[cur]
+    local att = inherit or self:findAttachment(attTable.atts[curPos])
+    if not att then
+        return false
+    end
+    if attTable.last then
+        local last = attTable.atts[attTable.last]
+    end
+    attTable.last = curPos
+end
+"#,
+            ),
+            (
+                "lua/weapons/cw_ak74/shared.lua",
+                r#"
+SWEP.Base = "cw_base"
+SWEP.Attachments = {[1] = {header = "Sight", atts = {"md_kobra"}}}
+"#,
+            ),
+            (
+                "lua/weapons/cw_ar15/shared.lua",
+                r#"
+SWEP.Base = "cw_base"
+SWEP.Attachments = {[1] = {header = "Irons", atts = {"md_t1"}}}
+"#,
+            ),
+        ]);
+
+        let last_owners = |ws: &VirtualWorkspace| -> Vec<String> {
+            let mut owners = ws
+                .analysis
+                .compilation
+                .get_db()
+                .get_dynamic_field_index()
+                .iter_all_field_definitions()
+                .flat_map(|(owner, fields)| {
+                    fields
+                        .keys()
+                        .filter(|name| name.as_str() == "last")
+                        .map(move |_| format!("{owner:?}"))
+                })
+                .collect::<Vec<_>>();
+            owners.sort();
+            owners.dedup();
+            owners
+        };
+        let owners = last_owners(&ws);
+        assert_that!(
+            owners.len(),
+            eq(2),
+            "last must be defined on each Attachments element table, got {owners:?}"
+        );
     }
 
     #[test]

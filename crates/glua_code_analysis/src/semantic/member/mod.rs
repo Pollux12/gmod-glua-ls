@@ -940,17 +940,36 @@ fn dynamic_field_definitions(
     }
 }
 fn record_dynamic_field_read_for_prefix(db: &DbIndex, prefix_type: &LuaType, field_name: &str) {
+    // The lookup answered "no field" because the dynamic-field index is hidden
+    // right now, not because the field is absent. When the index already holds
+    // definitions for it the answer is a masking artifact — flag the read so
+    // the visible pass re-derives it, since no write epoch can express a
+    // change that was never a write.
+    // `field_definitions` records the `(owner, field)` read itself.
+    fn flag_masked_if_present(db: &DbIndex, owner: &crate::DynamicFieldOwner, field_name: &str) {
+        if !db
+            .get_dynamic_field_index()
+            .field_definitions(owner, field_name)
+            .is_empty()
+        {
+            crate::db_index::read_set::record_dynamic_field_masked();
+        }
+    }
+
     match prefix_type {
         LuaType::Ref(type_id) | LuaType::Def(type_id) => {
-            crate::db_index::read_set::record_dynamic_field(
+            flag_masked_if_present(
+                db,
                 &crate::DynamicFieldOwner::Type(type_id.clone()),
-                Some(field_name),
+                field_name,
             );
         }
         LuaType::TableConst(table_range) => {
-            let table_owner = crate::DynamicFieldOwner::Table(table_range.clone());
-            let owner = crate::canonical_dynamic_field_owner(db, table_owner);
-            crate::db_index::read_set::record_dynamic_field(&owner, Some(field_name));
+            let owner = crate::canonical_dynamic_field_owner(
+                db,
+                crate::DynamicFieldOwner::Table(table_range.clone()),
+            );
+            flag_masked_if_present(db, &owner, field_name);
         }
         LuaType::Instance(instance) => {
             record_dynamic_field_read_for_prefix(db, instance.get_base(), field_name);

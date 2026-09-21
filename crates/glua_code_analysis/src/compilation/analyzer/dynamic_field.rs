@@ -231,6 +231,12 @@ fn field_definition_sites(
 /// cache yields identical inference results) and a local clone of the workspace
 /// field-setter-helper registry (a deterministic memoization cache). This makes
 /// the collection safe to run concurrently across files.
+///
+/// The last tuple element pairs each write site with the read set its
+/// collection consulted: the answers this pass computes are read off a
+/// mid-batch index, so the settled tail re-derives any site whose recorded
+/// reads moved — a partially resolved prefix must not stand as the final
+/// answer just because it already named one owner.
 fn collect_dynamic_fields_for_file(
     db: &DbIndex,
     file_id: crate::FileId,
@@ -244,6 +250,10 @@ fn collect_dynamic_fields_for_file(
     rustc_hash::FxHashSet<LuaInferredGuardOwner>,
     Vec<SmolStr>,
     Vec<glua_parser::LuaSyntaxId>,
+    Vec<(
+        glua_parser::LuaSyntaxId,
+        crate::db_index::read_set::InferenceReadSet,
+    )>,
 ) {
     let mut collected_unattributed: Vec<SmolStr> = Vec::new();
     let mut dynamic_field_retry: Vec<glua_parser::LuaSyntaxId> = Vec::new();
@@ -253,6 +263,15 @@ fn collect_dynamic_fields_for_file(
         Vec::new();
     let mut collected_finite_members = Vec::new();
     let mut field_setter_helpers = field_setter_helpers.clone();
+    let mut site_reads: Vec<(
+        (glua_parser::LuaSyntaxId, Option<PrefixCacheKey>),
+        crate::db_index::read_set::InferenceReadSet,
+    )> = Vec::new();
+    // The reads that produced each `prefix_type_cache` entry. A cache-hit
+    // site performs none of the instrumented reads that produced the cached
+    // type, so they are replayed into its record from here.
+    let mut prefix_reads: FxHashMap<PrefixCacheKey, crate::db_index::read_set::InferenceReadSet> =
+        FxHashMap::default();
     // The records are what this pass is building. A cold build has none yet,
     // and a re-index of some files has the rest of the workspace's, with the
     // re-indexed files' contributions removed: a partial record that names a
@@ -282,6 +301,17 @@ fn collect_dynamic_fields_for_file(
                 continue;
             };
 
+            // Everything that decides where this write lands — the candidate
+            // names, the prefix's type, and the collect walk below — reads a
+            // still-mutable index. The armed scope records those reads so the
+            // settled tail can re-derive the site the moment any of them
+            // move; the drain pushes the record on every exit path.
+            crate::db_index::read_set::arm_with_member_maps();
+            let mut read_drain = super::ReadDrain {
+                slot: &mut site_reads,
+                key: (index_expr.get_syntax_id(), None),
+            };
+
             let field_names = get_field_names(
                 db,
                 cache,
@@ -306,23 +336,29 @@ fn collect_dynamic_fields_for_file(
             }
 
             let cache_key = PrefixCacheKey::from_expr(db, cache, &prefix_expr);
+            read_drain.key.1 = Some(cache_key.clone());
             let prefix_type = if let Some(cached_type) = prefix_type_cache.get(&cache_key) {
                 match cached_type {
                     Some(prefix_type) => prefix_type.clone(),
                     None => {
-                        if should_collect_wildcard {
-                            dynamic_field_retry.push(index_expr.get_syntax_id());
-                        }
+                        // A failed prefix infer is as settle-dependent as a
+                        // partial one — the site is a candidate either way.
+                        dynamic_field_retry.push(index_expr.get_syntax_id());
                         continue;
                     }
                 }
             } else {
+                // Nested scope: `disarm` above depth one snapshots without
+                // draining, so the infer's reads stay in this site's own
+                // record and are also stored beside the cached type for
+                // cache-hit sites to replay.
+                crate::db_index::read_set::arm();
                 let inferred = infer_expr(db, cache, prefix_expr.clone()).ok();
+                let infer_reads = crate::db_index::read_set::disarm();
+                prefix_reads.insert(cache_key.clone(), infer_reads);
                 prefix_type_cache.insert(cache_key, inferred.clone());
                 let Some(prefix_type) = inferred else {
-                    if should_collect_wildcard {
-                        dynamic_field_retry.push(index_expr.get_syntax_id());
-                    }
+                    dynamic_field_retry.push(index_expr.get_syntax_id());
                     continue;
                 };
                 prefix_type
@@ -426,6 +462,22 @@ fn collect_dynamic_fields_for_file(
             );
         }
     }
+    // Every site that consulted mutable index state is a settled candidate:
+    // its answer was read off a mid-batch index and may be partial. Sites
+    // that hit `prefix_type_cache` replay the reads the miss recorded; a site
+    // that consulted nothing mutable answers identically in every round and
+    // is not worth a candidate slot.
+    let site_read_records = site_reads
+        .into_iter()
+        .filter_map(|((syntax_id, prefix_key), mut reads)| {
+            if let Some(prefix_key) = prefix_key
+                && let Some(prefix_reads) = prefix_reads.get(&prefix_key)
+            {
+                reads.extend(prefix_reads.clone());
+            }
+            (!reads.is_empty()).then_some((syntax_id, reads))
+        })
+        .collect();
     (
         collected,
         collected_wildcards,
@@ -433,6 +485,7 @@ fn collect_dynamic_fields_for_file(
         cache.take_inferred_guard_dependencies(),
         collected_unattributed,
         dynamic_field_retry,
+        site_read_records,
     )
 }
 
@@ -466,6 +519,13 @@ fn analyze_dynamic_fields(
     // per-file local buffers, so it runs concurrently across files. Results are
     // concatenated in deterministic file order and merged into the db below.
     let file_ids: Vec<crate::FileId> = tree_list.iter().map(|t| t.file_id).collect();
+    // The version the collection reads observed: the parallel walk runs
+    // against an immutable index, so this capture is exactly the state every
+    // site consulted. Writes the merge and the later passes then file stale
+    // only the sites that read the slots they touched — including a site's
+    // own fresh definitions, whose identical re-derivation files nothing and
+    // is where the round ends.
+    let collection_read_version = crate::db_index::read_set::InferenceReadVersion::capture(&*db);
     let collection_start = profile_enabled.then(std::time::Instant::now);
     let per_file = super::parallel::map_files_collect(&*db, &file_ids, |db, file_id| {
         let Some(root) = db
@@ -478,6 +538,7 @@ fn analyze_dynamic_fields(
                 Vec::new(),
                 Vec::new(),
                 Default::default(),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
             );
@@ -497,6 +558,7 @@ fn analyze_dynamic_fields(
             dependencies,
             file_unattributed,
             file_dynamic_field_retry,
+            file_site_reads,
         ),
         file_id,
     ) in per_file.into_iter().zip(file_ids)
@@ -511,6 +573,18 @@ fn analyze_dynamic_fields(
         );
         for syntax_id in file_dynamic_field_retry {
             context.record_settled_dynamic_field_candidate(file_id, syntax_id);
+        }
+        // Every site that read mutable state is a candidate whose own reads
+        // gate its re-derivation; a site that produced only a partial fan-out
+        // at collection time is exactly the case this covers.
+        for (syntax_id, reads) in file_site_reads {
+            context.record_settled_dynamic_field_candidate(file_id, syntax_id);
+            context.record_settled_candidate_reads(
+                super::SettledReadPass::Dynamic,
+                super::SettledCandidate::Dynamic(file_id, syntax_id),
+                collection_read_version,
+                reads,
+            );
         }
         context.add_inferred_guard_dependencies(file_id, dependencies);
     }
@@ -1997,10 +2071,32 @@ fn collect_string_const_names(typ: &LuaType, names: &mut Vec<SmolStr>) {
     }
 }
 
+/// One re-derived write site's replacement contribution set: what the site
+/// produces against the settled index, reconciled at merge against whatever
+/// it filed when it was collected — late-arriving owners add their
+/// definitions, owners the site no longer resolves to lose them.
+struct DynamicFieldSiteRefresh {
+    /// The site's index-key range — its contribution identity.
+    definition_range: rowan::TextRange,
+    /// The site's member identity — its finite-named-member marks live under
+    /// this key.
+    member_id: crate::LuaMemberId,
+    named: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
+    /// Names that resolved to owners this round: their unattributed records
+    /// are withdrawn, as an in-phase attribution would never have filed one.
+    attributed: Vec<SmolStr>,
+    /// Names that resolved to nothing: their unattributed records are
+    /// (re-)filed, matching what collection writes for a zero-owner name.
+    unattributed: Vec<SmolStr>,
+    /// Owners the re-derived site claims finite-named member marks for —
+    /// collection's `has_finite_domain && !wildcard-covered` rule applied to
+    /// this round's evidence.
+    finite_marked: rustc_hash::FxHashSet<DynamicFieldOwner>,
+}
+
 struct DynamicFieldRefreshResult {
-    collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
-    collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
-    attributed_unattributed: Vec<(SmolStr, crate::FileId)>,
+    sites: Vec<DynamicFieldSiteRefresh>,
     /// Each re-derived site's recorded reads, saved so the next round can skip
     /// candidates whose own reads did not move.
     candidate_reads: Vec<(
@@ -2060,17 +2156,22 @@ fn propagate_dynamic_fields_to_super_types(
     propagated
 }
 
-/// Re-derives the dynamic-field sites whose prefix held no nameable table
-/// when the dynamic-field pass ran: wildcards that were silently dropped, and
-/// named writes that landed unattributed.
+/// Re-derives the dynamic-field sites whose collection read mutable index
+/// state: wildcards that were silently dropped, named writes that landed
+/// unattributed, and fan-outs that committed to a partial answer.
 ///
-/// That pass runs before the unresolve waves and the settled tail, so a prefix
-/// fed by a late-settling fact (a member still widening, an iterator variable
-/// over one) answers with nothing — and whether it does depends on how far
-/// the batch had settled, not on the source. Taking the answer again after
-/// settling makes the field and wildcard sets a property of the code. A named
-/// write the retry attributes takes its unattributed record with it, which is
-/// what an in-phase attribution would have produced.
+/// The collection pass runs before the unresolve waves and the settled tail,
+/// so a prefix fed by a late-settling fact (a member still widening, an
+/// iterator variable over one) answers against an incomplete index — a union
+/// that has only some of its arms lands the write on only some owners, and
+/// whether it does is a property of how far the batch had settled, not of
+/// the source. Every site that consulted mutable state is re-derived once
+/// its recorded reads move, and the re-derived answer *replaces* the site's
+/// contribution set — owners it no longer resolves to lose their
+/// definitions, matching what a collection that saw the settled state would
+/// have filed. A named write the retry attributes takes its unattributed
+/// record with it; one that stops attributing gains one, as an in-phase
+/// collection would have produced.
 /// Returns whether it changed the dynamic-field index at all, so the settled
 /// tail knows to run another round: the records it adds feed the same reads
 /// (member maps, iterated tables) the other settled passes re-derive from.
@@ -2083,8 +2184,9 @@ pub(crate) fn rederive_settled_dynamic_fields(
     let read_version = crate::db_index::read_set::InferenceReadVersion::capture(db);
     // Kept, not taken: the settled tail runs to a fixpoint and each round
     // re-derives the same candidates against what the previous one landed.
-    // The first round has no records yet, so every candidate runs; later
-    // rounds re-derive only the candidates whose own recorded reads moved.
+    // Sites carry the reads their collection performed, so even the first
+    // round re-derives only those whose inputs moved since they answered;
+    // a candidate with no record (queued before records existed) runs.
     let rederive_all = moved_owners.is_none();
     let candidate_reads = &context.settled_candidate_reads;
     let mut candidates = context.settled_dynamic_field_candidates.clone();
@@ -2106,9 +2208,7 @@ pub(crate) fn rederive_settled_dynamic_fields(
     file_ids.sort_unstable();
     let results = super::parallel::map_files_collect(db, &file_ids, |db, file_id| {
         let mut result = DynamicFieldRefreshResult {
-            collected: Vec::new(),
-            collected_wildcards: Vec::new(),
-            attributed_unattributed: Vec::new(),
+            sites: Vec::new(),
             candidate_reads: Vec::new(),
         };
         let file_candidates = &candidates_by_file[&file_id];
@@ -2149,13 +2249,12 @@ pub(crate) fn rederive_settled_dynamic_fields(
         for syntax_id in file_candidates {
             let key = super::SettledCandidate::Dynamic(file_id, *syntax_id);
             // A site whose recorded reads did not move answers the same as
-            // last round; one with no record has never run.
-            let stale = rederive_all
-                || candidate_reads
-                    .get(&(read_pass, key))
-                    .is_none_or(|(version, reads)| {
-                        version.is_stale_against(&read_version, db, reads)
-                    });
+            // when it collected them; one with no record has never run.
+            let stale = candidate_reads
+                .get(&(read_pass, key))
+                .map_or(rederive_all, |(version, reads)| {
+                    version.is_stale_against(&read_version, db, reads)
+                });
             if !stale {
                 continue;
             }
@@ -2181,7 +2280,29 @@ pub(crate) fn rederive_settled_dynamic_fields(
             else {
                 continue;
             };
+            let field_names = get_field_names(
+                db,
+                &mut cache,
+                &root,
+                &mut local_reassignment_positions,
+                &index_expr,
+            );
+            let mut site = DynamicFieldSiteRefresh {
+                definition_range,
+                member_id: LuaMemberId::new(*syntax_id, file_id),
+                named: Vec::new(),
+                wildcards: Vec::new(),
+                attributed: Vec::new(),
+                unattributed: Vec::new(),
+                finite_marked: Default::default(),
+            };
             let Ok(prefix_type) = infer_expr(db, &mut cache, prefix_expr.clone()) else {
+                // The site yields nothing this round, so whatever it filed
+                // when collected is stale: reconcile withdraws it, and no
+                // name claims an unattributed record — as a collection that
+                // saw this state would have filed neither.
+                site.attributed = field_names.names;
+                result.sites.push(site);
                 continue;
             };
             let effective_type = infer_setmetatable_target_type(
@@ -2192,73 +2313,105 @@ pub(crate) fn rederive_settled_dynamic_fields(
             )
             .unwrap_or(prefix_type);
 
-            let field_names = get_field_names(
-                db,
-                &mut cache,
-                &root,
-                &mut local_reassignment_positions,
-                &index_expr,
-            );
-            if is_dynamic_index_key(&index_expr) && field_names.may_have_other_string_names {
+            let is_dynamic_key = is_dynamic_index_key(&index_expr);
+            if is_dynamic_key && field_names.may_have_other_string_names {
                 collect_wildcard_for_type(
                     &effective_type,
                     file_id,
                     definition_range,
-                    &mut result.collected_wildcards,
+                    &mut site.wildcards,
                 );
             }
+            if is_dynamic_key && !field_names.names.is_empty() {
+                let mut finite_evidence = Vec::new();
+                collect_finite_member_for_type(
+                    &effective_type,
+                    LuaMemberId::new(*syntax_id, file_id),
+                    file_id,
+                    definition_range,
+                    !field_names.may_have_other_string_names,
+                    &mut finite_evidence,
+                );
+                // Same mark rule the collection merge applies: a finite claim
+                // loses to a wildcard the site filed on the same owner.
+                site.finite_marked = finite_evidence
+                    .into_iter()
+                    .filter(|(owner, _, file_id, range, has_finite_domain)| {
+                        *has_finite_domain
+                            && !site.wildcards.contains(&(owner.clone(), *file_id, *range))
+                    })
+                    .map(|(owner, ..)| owner)
+                    .collect();
+            }
             for field_name in field_names.names {
-                let before = result.collected.len();
+                let before = site.named.len();
                 collect_for_type(
                     &effective_type,
                     &field_name,
                     file_id,
                     definition_range,
-                    &mut result.collected,
+                    &mut site.named,
                 );
-                if result.collected.len() > before {
-                    result.attributed_unattributed.push((field_name, file_id));
+                if site.named.len() > before {
+                    site.attributed.push(field_name);
+                } else {
+                    site.unattributed.push(field_name);
                 }
             }
+            result.sites.push(site);
         }
         result
     });
 
-    let mut collected = Vec::new();
-    let mut collected_wildcards = Vec::new();
-    let mut attributed_unattributed = Vec::new();
-    for result in results {
+    let mut changed = false;
+    for (result, file_id) in results.into_iter().zip(file_ids.iter().copied()) {
         for (candidate, reads) in result.candidate_reads {
             context.record_settled_candidate_reads(read_pass, candidate, read_version, reads);
         }
-        collected.extend(result.collected);
-        collected_wildcards.extend(result.collected_wildcards);
-        attributed_unattributed.extend(result.attributed_unattributed);
-    }
-
-    for (owner, _, _, _) in &mut collected {
-        *owner = crate::canonical_dynamic_field_owner(db, owner.clone());
-    }
-    for (owner, _, _) in &mut collected_wildcards {
-        *owner = crate::canonical_dynamic_field_owner(db, owner.clone());
-    }
-    // Same super-type propagation the initial pass applies, so a field the
-    // settled path resolves lands on the super types a cold first pass would
-    // have given it: the two paths must reach the identical index.
-    let propagated = propagate_dynamic_fields_to_super_types(db, &collected);
-    let index = db.get_dynamic_field_index_mut();
-    let mut changed = false;
-    for (owner, field_name, file_id, range) in collected {
-        changed |= index.add_field(owner, field_name, file_id, range);
-    }
-    for (owner, field_name, file_id, range) in propagated {
-        changed |= index.add_propagated_field(owner, field_name, file_id, range);
-    }
-    for (owner, file_id, range) in collected_wildcards {
-        changed |= index.add_wildcard_definition(owner, file_id, range);
-    }
-    for (field_name, file_id) in attributed_unattributed {
-        changed |= index.remove_unattributed_field(&field_name, file_id);
+        for mut site in result.sites {
+            for (owner, ..) in &mut site.named {
+                *owner = crate::canonical_dynamic_field_owner(db, owner.clone());
+            }
+            for (owner, ..) in &mut site.wildcards {
+                *owner = crate::canonical_dynamic_field_owner(db, owner.clone());
+            }
+            // Same super-type propagation the initial pass applies, so a
+            // field the settled path resolves lands on the super types a cold
+            // first pass would have given it: the two paths must reach the
+            // identical index.
+            let propagated = propagate_dynamic_fields_to_super_types(db, &site.named);
+            let direct = site
+                .named
+                .iter()
+                .map(|(owner, field_name, _, _)| (owner.clone(), field_name.clone()))
+                .collect::<Vec<_>>();
+            let propagated = propagated
+                .iter()
+                .map(|(owner, field_name, _, _)| (owner.clone(), field_name.clone()))
+                .collect::<Vec<_>>();
+            let wildcards = site
+                .wildcards
+                .iter()
+                .map(|(owner, ..)| owner.clone())
+                .collect::<Vec<_>>();
+            let index = db.get_dynamic_field_index_mut();
+            changed |= index.replace_site_contributions(
+                file_id,
+                site.definition_range,
+                &direct,
+                &propagated,
+                &wildcards,
+            );
+            // The member id names the site itself, so every mark under it is
+            // this site's to keep or withdraw.
+            changed |= index.replace_site_finite_members(site.member_id, &site.finite_marked);
+            for field_name in site.unattributed {
+                changed |= index.add_unattributed_field(field_name, file_id);
+            }
+            for field_name in site.attributed {
+                changed |= index.remove_unattributed_field(&field_name, file_id);
+            }
+        }
     }
     changed
 }
