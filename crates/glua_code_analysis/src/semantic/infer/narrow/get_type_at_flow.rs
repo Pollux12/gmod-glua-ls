@@ -19,7 +19,7 @@ use crate::{
     AssignVarHint, CacheEntry, DbIndex, FileId, FlowAntecedent, FlowId, FlowNode, FlowNodeKind,
     FlowTree, GlobalId, GmodRealm, InferFailReason, LuaArrayType, LuaDeclId, LuaInferCache,
     LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType,
-    LuaTypeDeclId, LuaTypeOwner, LuaUnionType, TypeOps, infer_expr,
+    LuaTypeCache, LuaTypeDeclId, LuaTypeOwner, LuaUnionType, TypeOps, infer_expr,
     semantic::cache::{FlowOrigin, VarRefCacheKey},
     semantic::gmod_call_effect::{GmodCallWriteEffect, gmod_call_write_effect},
     semantic::infer::{
@@ -415,6 +415,8 @@ fn get_type_at_flow_walk(
                 Some(CacheEntry::Error(reason)) => return Err(reason.clone()),
                 _ => {}
             }
+        }
+        if policy.is_normal() {
             visited_flow_ids.push(antecedent_flow_id);
         }
 
@@ -3483,6 +3485,26 @@ fn try_infer_decl_initializer_type(
         ty if ret_idx == 0 => ty,
         LuaType::Unknown if initializer_is_call => LuaType::Unknown,
         _ => LuaType::Nil,
+    };
+
+    // A global's initializer is a stand-in for the declaration's own cache,
+    // which widens a mutable declaration's primitive literals when its writes
+    // bind. Skip the widen here and a walk that reaches this node before the
+    // declaration bound answers `integerconst(0)` where the settled cache will
+    // hold `integer` — which of the two a consumer sees then depends on
+    // scheduling, not on the source. Locals keep literal precision instead:
+    // their settled read is the flow merge of every write, so the substitute
+    // stays raw.
+    let init_type = if decl.is_global() {
+        crate::compilation::analyzer::widen_mutable_decl_literal(
+            db,
+            &decl_id.into(),
+            LuaTypeCache::InferType(init_type),
+        )
+        .as_type()
+        .clone()
+    } else {
+        init_type
     };
 
     Ok(Some(init_type))

@@ -13,7 +13,7 @@ pub(crate) mod parallel;
 mod setmetatable_factory;
 pub(crate) mod unresolve;
 
-pub(crate) use common::FixpointFuse;
+pub(crate) use common::{FixpointFuse, widen_mutable_decl_literal};
 pub(crate) use dynamic_field::for_range_pairs_source_for_var;
 pub(crate) use dynamic_field::is_provably_builtin_iterator_call;
 pub use lua::is_member_assignment_in_conditional_branch;
