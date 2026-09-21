@@ -1857,19 +1857,31 @@ impl UnResolve {
         }
     }
 
-    /// Returns a deterministic sort key (file_id, text_position, write_position)
-    /// for stable ordering. This ensures unresolves are processed in a consistent
-    /// order regardless of FxHashMap iteration order or other non-deterministic
-    /// sources during collection. A local with several deferred writes carries
-    /// one item per write, and which of them binds last decides the cache, so
-    /// the write's own position breaks the tie in source order.
-    fn sort_key(&self) -> (u32, u32, u32) {
+    /// Returns a deterministic sort key (file_id, text_position, order,
+    /// write_position) for stable ordering. This ensures unresolves are
+    /// processed in a consistent order regardless of FxHashMap iteration order
+    /// or other non-deterministic sources during collection. A local with
+    /// several deferred writes carries one item per write, and which of them
+    /// binds last decides the cache, so the write's own position breaks the
+    /// tie in source order.
+    ///
+    /// A member can likewise carry two items for the same site: the
+    /// owner-attach item `set_index_expr_owner` queues while the prefix cannot
+    /// be inferred, and the value item the assignment queues while the
+    /// right-hand side cannot. Both sort on the member's position, so without
+    /// a further key their relative order is whatever `sort_unstable` makes of
+    /// the push order — which retained index state perturbs. The attach must
+    /// drain first, matching the serial walk: once the member exists, a value
+    /// read back through the same index path sees a pending member rather than
+    /// an absent one, and does not commit an absence-derived answer.
+    fn sort_key(&self) -> (u32, u32, u32, u32) {
         let (file_id, position) = self.sort_key_site();
-        let write_position = match self {
-            UnResolve::Decl(d) => u32::from(d.expr.syntax().text_range().start()),
-            _ => 0,
+        let (order, write_position) = match self {
+            UnResolve::Decl(d) => (0, u32::from(d.expr.syntax().text_range().start())),
+            UnResolve::Member(m) => (u32::from(m.prefix.is_none()), m.ret_idx as u32),
+            _ => (0, 0),
         };
-        (file_id, position, write_position)
+        (file_id, position, order, write_position)
     }
 
     fn sort_key_site(&self) -> (u32, u32) {
@@ -2122,7 +2134,7 @@ mod tests {
     use super::{
         FixpointReadRecord, UnResolve, UnResolveIterVar, UnResolveMember, fixpoint_reads_are_stale,
         fixpoint_special_calls_moved_novel_fact, partition_pre_dynamic_unresolves,
-        resolved_value_is_uninformative, sorted_reason_keys,
+        resolved_value_is_uninformative, sorted_reason_keys, unresolve_stable_cmp,
     };
     use crate::db_index::read_set::InferenceReadSet;
 
@@ -2249,6 +2261,58 @@ mod tests {
         };
         assert!(deferred_member.prefix.is_none());
         assert!(matches!(deferred_member.expr, Some(LuaExpr::IndexExpr(_))));
+    }
+
+    /// A member whose owner attach and value write both deferred carries two
+    /// items at the same sort position: `prefix`-only (attach) and
+    /// `expr`-only (value). The attach must drain first — it is the order the
+    /// serial walk uses, and a value read back through the member's own index
+    /// path (`row[y] = (row[y] or {})`-shaped loops) must see the member as
+    /// pending rather than absent. With equal keys `sort_unstable` leaves the
+    /// order to the push order, which retained index state perturbs; the sort
+    /// key itself has to distinguish them.
+    #[test]
+    fn member_attach_item_sorts_before_value_item() {
+        let tree = LuaParser::parse("t[k] = v", ParserConfig::default());
+        let index_expr = tree
+            .get_chunk_node()
+            .descendants::<LuaIndexExpr>()
+            .next()
+            .expect("index expr");
+        let file_id = FileId::new(1);
+        let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
+        let attach = || {
+            UnResolveMember {
+                file_id,
+                member_id,
+                expr: None,
+                prefix: index_expr.get_prefix_expr(),
+                ret_idx: 0,
+            }
+            .into()
+        };
+        let value = || {
+            UnResolveMember {
+                file_id,
+                member_id,
+                expr: Some(LuaExpr::IndexExpr(index_expr.clone())),
+                prefix: None,
+                ret_idx: 0,
+            }
+            .into()
+        };
+
+        for items in [vec![attach(), value()], vec![value(), attach()]] {
+            let mut sorted = items;
+            sorted.sort_unstable_by(unresolve_stable_cmp);
+            let UnResolve::Member(first) = &sorted[0] else {
+                panic!("expected member item");
+            };
+            assert!(
+                first.prefix.is_some() && first.expr.is_none(),
+                "owner attach must drain before the value write"
+            );
+        }
     }
 
     fn param_reader_record(signature_id: LuaSignatureId) -> FixpointReadRecord {
