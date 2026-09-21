@@ -6,8 +6,8 @@ use crate::{
     compilation::analyzer::{
         common::{
             DeclWrite, TypeCacheWriteMode, add_member, bind_decl_write, bind_type,
-            holds_unbound_iter_template, reads_settling_iter_var, widen_mutable_local_name_copy,
-            write_type_cache,
+            holds_unbound_iter_template, is_nil_literal_expr, reads_settling_iter_var,
+            widen_mutable_local_name_copy, write_type_cache,
         },
         gmod::name_expr_resolves_to_scoped_authoring_table,
         unresolve::{UnResolveDecl, UnResolveMember},
@@ -1651,18 +1651,6 @@ fn should_skip_nullable_collection_append_shape_assignment(
     analyzer
         .infer_expr(expr)
         .is_ok_and(|expr_type| expr_type.is_nullable())
-}
-
-fn is_nil_literal_expr(expr: &LuaExpr) -> bool {
-    match expr {
-        LuaExpr::LiteralExpr(literal_expr) => {
-            matches!(literal_expr.get_literal(), Some(LuaLiteralToken::Nil(_)))
-        }
-        LuaExpr::ParenExpr(paren_expr) => paren_expr
-            .get_expr()
-            .is_some_and(|expr| is_nil_literal_expr(&expr)),
-        _ => false,
-    }
 }
 
 fn is_table_shape_cleanup_type(typ: &LuaType) -> bool {

@@ -1,13 +1,13 @@
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaForStat, LuaFuncStat,
-    LuaIndexExpr, LuaIndexKey, LuaLocalFuncStat, LuaLocalStat, LuaSyntaxId, LuaSyntaxKind,
-    LuaTableExpr, LuaVarExpr, NumberResult,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCommentOwner, LuaDocTag, LuaExpr, LuaForRangeStat,
+    LuaForStat, LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLocalFuncStat, LuaLocalStat,
+    LuaSyntaxId, LuaSyntaxKind, LuaTableExpr, LuaVarExpr, NumberResult,
 };
 
 use crate::{
     GlobalId, InFiled, LuaDeclExtra, LuaMemberFeature, LuaMemberId, LuaSemanticDeclId,
     LuaSignatureId, LuaType, LuaTypeCache,
-    compilation::analyzer::common::bind_type,
+    compilation::analyzer::common::{bind_type, expr_expands_to_fill_slots, is_nil_literal_expr},
     db_index::{
         LocalAttribute, LuaDecl, LuaDeclInitializer, LuaMember, LuaMemberKey, LuaMemberOwner,
     },
@@ -237,7 +237,21 @@ pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> 
                 }
                 let member = LuaMember::new(member_id, key.clone(), decl_feature, global_id);
 
-                analyzer.add_member(owner, member);
+                // `t[k] = nil` is a delete, not a member write: the value walk
+                // deliberately skips it, so a record minted here would sit in
+                // the owner set forever unresolvable. A var the value list
+                // does not reach gets `nil` the same way unless the tail
+                // expression can expand to fill it. A doc tag that binds a
+                // type to the var keeps the member: the write is still a
+                // runtime delete, but the annotation supplies the member's
+                // type cache, so the record resolves.
+                let is_nil_delete = match value_exprs.get(idx) {
+                    Some(expr) => is_nil_literal_expr(expr),
+                    None => !value_exprs.last().is_some_and(expr_expands_to_fill_slots),
+                };
+                if !is_nil_delete || assign_stat_var_carries_doc_type(&stat, idx) {
+                    analyzer.add_member(owner, member);
+                }
                 if let LuaMemberKey::Name(name) = &key {
                     analyze_maybe_global_index_expr(analyzer, index_expr, name, value_expr_id);
                 }
@@ -246,6 +260,26 @@ pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> 
     }
 
     Some(())
+}
+
+/// True when a doc tag attached to the assign statement will write the type
+/// cache of the member bound at var position `var_idx`. Mirrors the doc
+/// analyzer's binding rules: `---@type` binds vars positionally, while
+/// `---@class`, `---@enum`, `---@module`, and `---@schema` bind the first var
+/// only. Other tags (`---@deprecated`, `---@field`, ...) write properties or
+/// unrelated owners and never make the member resolvable.
+fn assign_stat_var_carries_doc_type(stat: &LuaAssignStat, var_idx: usize) -> bool {
+    stat.get_comments()
+        .iter()
+        .flat_map(|comment| comment.get_doc_tags())
+        .any(|tag| match tag {
+            LuaDocTag::Type(type_tag) => var_idx < type_tag.get_type_list().count(),
+            LuaDocTag::Class(_)
+            | LuaDocTag::Enum(_)
+            | LuaDocTag::Module(_)
+            | LuaDocTag::Schema(_) => var_idx == 0,
+            _ => false,
+        })
 }
 
 fn analyze_maybe_global_index_expr(

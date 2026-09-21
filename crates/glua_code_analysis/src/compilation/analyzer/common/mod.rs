@@ -1,4 +1,4 @@
-use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat};
+use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaLiteralToken};
 use rowan::{TextRange, TextSize};
 
 mod fixpoint_fuse;
@@ -25,6 +25,32 @@ pub fn estimate_file_index_entries(text_len: usize) -> usize {
     const MIN_ENTRIES: usize = 8;
     const MAX_ENTRIES: usize = 4096;
     (text_len / BYTES_PER_ENTRY + MIN_ENTRIES).min(MAX_ENTRIES)
+}
+
+/// Whether `expr` is a `nil` literal, possibly parenthesized. A `nil` write is
+/// a delete: it removes an entry, it never adds a member typed `nil`.
+pub fn is_nil_literal_expr(expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::LiteralExpr(literal_expr) => {
+            matches!(literal_expr.get_literal(), Some(LuaLiteralToken::Nil(_)))
+        }
+        LuaExpr::ParenExpr(paren_expr) => paren_expr
+            .get_expr()
+            .is_some_and(|expr| is_nil_literal_expr(&expr)),
+        _ => false,
+    }
+}
+
+/// Whether `expr` in tail position can expand to fill extra assignment slots:
+/// a call returns all its values, and `...` spreads.
+pub fn expr_expands_to_fill_slots(expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::CallExpr(_) => true,
+        LuaExpr::LiteralExpr(literal_expr) => {
+            matches!(literal_expr.get_literal(), Some(LuaLiteralToken::Dots(_)))
+        }
+        _ => false,
+    }
 }
 
 /// Whether `typ` is a raw template placeholder inherited from a generic-for

@@ -1254,6 +1254,179 @@ mod test {
     }
 
     #[gtest]
+    fn static_key_nil_delete_is_not_a_member_before_or_after_reindex() {
+        let mut ws = VirtualWorkspace::new();
+        let clear_path = "lua/a_clear.lua";
+        let clear_source = r#"
+        Store = {}
+        Store.values = {}
+        function Clear()
+            Store.values[4] = nil
+        end
+        "#;
+        ws.def_files(vec![(clear_path, clear_source)]);
+
+        let clear_uri = ws.virtual_url_generator.new_uri(clear_path);
+        let clear_file = ws
+            .analysis
+            .get_file_id(&clear_uri)
+            .expect("expected clear file");
+        let delete_is_indexed = |ws: &VirtualWorkspace| {
+            let model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(clear_file)
+                .expect("expected semantic model");
+            let index_expr = model
+                .get_root()
+                .descendants::<LuaAst>()
+                .find_map(|node| match node {
+                    LuaAst::LuaIndexExpr(index_expr)
+                        if index_expr.syntax().text() == "Store.values[4]" =>
+                    {
+                        Some(index_expr)
+                    }
+                    _ => None,
+                })
+                .expect("expected static-key delete");
+            let member_id = LuaMemberId::new(index_expr.get_syntax_id(), clear_file);
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_member_index()
+                .get_member(&member_id)
+                .is_some()
+        };
+
+        assert_that!(delete_is_indexed(&ws), eq(false));
+
+        ws.analysis
+            .update_file_text_only(&clear_uri, format!("{clear_source}\n"));
+        ws.analysis.reindex_files(vec![clear_file]);
+
+        assert_that!(delete_is_indexed(&ws), eq(false));
+    }
+
+    #[gtest]
+    fn doc_typed_nil_member_write_is_indexed_before_and_after_reindex() {
+        let mut ws = VirtualWorkspace::new();
+        let tool_path = "lua/a_tool.lua";
+        let tool_source = r#"
+        ---@class ControlPanel
+        TOOL = {}
+
+        ---@type fun(panel: ControlPanel)
+        TOOL.BuildCPanel = nil
+        "#;
+        ws.def_files(vec![(tool_path, tool_source)]);
+
+        let tool_uri = ws.virtual_url_generator.new_uri(tool_path);
+        let tool_file = ws
+            .analysis
+            .get_file_id(&tool_uri)
+            .expect("expected tool file");
+        // `x.y = nil` carrying `---@type` is a declaration carrier, not a plain
+        // delete: the doc pass writes the member's type cache, so the member
+        // record must exist for the contract to resolve.
+        let doc_typed_member = |ws: &VirtualWorkspace| {
+            let model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(tool_file)
+                .expect("expected semantic model");
+            let index_expr = model
+                .get_root()
+                .descendants::<LuaAst>()
+                .find_map(|node| match node {
+                    LuaAst::LuaIndexExpr(index_expr)
+                        if index_expr.syntax().text() == "TOOL.BuildCPanel" =>
+                    {
+                        Some(index_expr)
+                    }
+                    _ => None,
+                })
+                .expect("expected doc-typed nil write");
+            let member_id = LuaMemberId::new(index_expr.get_syntax_id(), tool_file);
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_member_index()
+                .get_member(&member_id)
+                .is_some()
+                .then(|| {
+                    ws.analysis
+                        .compilation
+                        .get_db()
+                        .get_type_index()
+                        .get_type_cache(&member_id.into())
+                        .is_some_and(|cache| cache.is_doc())
+                })
+        };
+
+        assert_that!(doc_typed_member(&ws), eq(Some(true)));
+
+        ws.analysis
+            .update_file_text_only(&tool_uri, format!("{tool_source}\n"));
+        ws.analysis.reindex_files(vec![tool_file]);
+
+        assert_that!(doc_typed_member(&ws), eq(Some(true)));
+    }
+
+    #[gtest]
+    fn static_key_nil_delete_keeps_dynamic_reads_deterministic() {
+        let mut ws = VirtualWorkspace::new();
+        let clear_path = "lua/a_clear.lua";
+        let clear_source = r#"
+        Store = Store or {}
+        Store.values = Store.values or {}
+        function Wipe()
+            Store.values[4] = nil
+            Store.values[5] = nil
+        end
+        "#;
+        ws.def_files(vec![
+            ("lua/a_init.lua", "Store = {}\nStore.values = {}"),
+            (
+                "lua/b_write.lua",
+                "function Put(k, v)\n    Store.values[k] = v\nend",
+            ),
+            (clear_path, clear_source),
+            (
+                "lua/d_read.lua",
+                "function Get(k)\n    local v = Store.values[k]\n    return v\nend",
+            ),
+        ]);
+
+        let read_type = |ws: &mut VirtualWorkspace| {
+            let read_uri = ws.virtual_url_generator.new_uri("lua/d_read.lua");
+            let read_file = ws
+                .analysis
+                .get_file_id(&read_uri)
+                .expect("expected read file");
+            local_name_type(ws, read_file, "v")
+        };
+        let before = read_type(&mut ws);
+
+        let clear_uri = ws.virtual_url_generator.new_uri(clear_path);
+        let clear_file = ws
+            .analysis
+            .get_file_id(&clear_uri)
+            .expect("expected clear file");
+        ws.analysis
+            .update_file_text_only(&clear_uri, format!("{clear_source}\n"));
+        ws.analysis.reindex_files(vec![clear_file]);
+
+        let after = read_type(&mut ws);
+        assert_that!(
+            ws.check_type(&after, &before),
+            eq(true),
+            "dynamic read drifted across reindex: {} -> {}",
+            ws.humanize_type(before),
+            ws.humanize_type(after)
+        );
+    }
+
+    #[gtest]
     fn constant_folded_nil_delete_keeps_the_named_member() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def(
