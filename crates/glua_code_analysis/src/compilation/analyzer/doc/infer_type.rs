@@ -240,6 +240,7 @@ fn infer_generic_type(analyzer: &mut DocAnalyzer, generic_type: &LuaDocGenericTy
         {
             name_type_decl.get_id()
         } else {
+            let type_id = LuaTypeDeclId::global(&name);
             analyzer.db.get_diagnostic_index_mut().add_diagnostic(
                 analyzer.file_id,
                 AnalyzeError::new(
@@ -247,6 +248,11 @@ fn infer_generic_type(analyzer: &mut DocAnalyzer, generic_type: &LuaDocGenericTy
                     &format!("Type '{name}' not found", name = name),
                     generic_type.get_range(),
                 ),
+            );
+            analyzer.db.get_reference_index_mut().add_type_reference(
+                analyzer.file_id,
+                type_id,
+                name_type.get_range(),
             );
             return LuaType::Unknown;
         };

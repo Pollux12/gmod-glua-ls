@@ -315,6 +315,24 @@ impl LuaReferenceIndex {
 
         Some(results)
     }
+
+    /// The declaration ids recorded for doc type names spanning `range` in
+    /// `file_id`, including names that resolved to nothing when the file was
+    /// analysed (those are stored under the would-be global id).
+    pub fn get_type_references_at(&self, file_id: FileId, range: TextRange) -> Vec<LuaTypeDeclId> {
+        let Some(type_references) = self.type_references.get(&file_id) else {
+            return Vec::new();
+        };
+        type_references
+            .iter()
+            .filter(|(_, ranges)| {
+                ranges
+                    .iter()
+                    .any(|stored| stored.intersect(range).is_some())
+            })
+            .map(|(decl_id, _)| decl_id.clone())
+            .collect()
+    }
 }
 
 impl LuaIndex for LuaReferenceIndex {
