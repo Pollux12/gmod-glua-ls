@@ -274,7 +274,7 @@ fn adding_an_exported_function_adds_a_member_key() {
     expect_that!(
         diff.added
             .iter()
-            .any(|key| matches!(key, ExportKey::Member(_))),
+            .any(|key| matches!(key, ExportKey::Member(..))),
         is_true()
     );
 }
@@ -295,7 +295,7 @@ fn removing_an_exported_function_removes_its_keys() {
     expect_that!(
         diff.removed
             .iter()
-            .any(|key| matches!(key, ExportKey::Member(_) | ExportKey::Signature(_))),
+            .any(|key| matches!(key, ExportKey::Member(..) | ExportKey::Signature(_))),
         is_true()
     );
 }
@@ -313,7 +313,7 @@ fn adding_a_field_to_a_table_literal_adds_a_member_key() {
     expect_that!(
         diff.added
             .iter()
-            .any(|key| matches!(key, ExportKey::Member(_))),
+            .any(|key| matches!(key, ExportKey::Member(..))),
         is_true()
     );
 }

@@ -34,7 +34,12 @@ pub enum RealmSubject {
 /// touches only those produces no key and dirties nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExportKey {
-    Member(LuaMemberId),
+    /// A member declaration. The second element is the member key's hash: a
+    /// rename keeps the member id (its syntax site survives the edit remap),
+    /// so without the key in the identity a rename diffs as a value change and
+    /// the slot's readers - including ones whose lookup missed - never see it
+    /// leave or return.
+    Member(LuaMemberId, u64),
     TypeMemberList(LuaTypeDeclId),
     TypeDecl(LuaTypeDeclId),
     TypeCache(LuaTypeOwner),
@@ -137,7 +142,10 @@ fn members(db: &DbIndex, file_id: FileId, remap: &FileRemap, map: &mut ExportMap
         let member_id = remapped(remap.member_id(member.get_id()), member.get_id());
         let owner = member_index.get_member_owner(&member.get_id());
         map.insert(
-            ExportKey::Member(member_id),
+            ExportKey::Member(
+                member_id,
+                hash_with(|h| hash_member_key(remap, member.get_key(), h)),
+            ),
             hash_with(|h| {
                 hash_member_key(remap, member.get_key(), h);
                 match owner {
@@ -1063,7 +1071,7 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Ha
 
     for key in diff.keys() {
         match key {
-            ExportKey::Member(member_id) => {
+            ExportKey::Member(member_id, _) => {
                 let owner = LuaTypeOwner::Member(*member_id);
                 push_cached_type_refs(db, &owner, &mut type_refs);
                 nodes.push(LuaInferenceNodeId::TypeOwner(owner));

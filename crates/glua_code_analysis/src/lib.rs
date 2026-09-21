@@ -483,7 +483,7 @@ fn export_diff_changed_names(
     let file_pre = pre.get(&file_id);
     for key in diff.keys() {
         match key {
-            ExportKey::Member(member_id) => {
+            ExportKey::Member(member_id, _) => {
                 insert_member_id_names(db, &mut names, member_id, file_pre);
             }
             ExportKey::TypeMemberList(type_id) => {

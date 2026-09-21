@@ -3500,4 +3500,76 @@ end
             .validate_rename_refresh_names(owed_rename, &burst_start);
         expect_that!(kept, is_empty());
     }
+    fn renamed_member_reaches_readers_that_missed_it() {
+        let mut ws = workspace_with(vec![DiagnosticCode::UndefinedField]);
+        let with_get = r#"
+            ns = ns or {}
+            ns.data = ns.data or {}
+            function ns.data.Get(key, default)
+                if key then
+                    return default or {}
+                end
+            end
+        "#;
+        let renamed = r#"
+            ns = ns or {}
+            ns.data = ns.data or {}
+            function ns.data.GetDisabled(key, default)
+                if key then
+                    return default or {}
+                end
+            end
+        "#;
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/missprovider.lua");
+        let provider_id = write(&mut ws, &provider_uri, with_get);
+        let consumer_uri = ws.virtual_url_generator.new_uri("lua/missconsumer.lua");
+        let consumer_source = r#"
+            local options = ns.data.Get("options", nil)
+            return options
+        "#;
+        let consumer_id = write(&mut ws, &consumer_uri, consumer_source);
+
+        expect_that!(
+            codes_in(&ws, consumer_id),
+            not(contains(eq(DiagnosticCode::UndefinedField.get_name())))
+        );
+
+        // Rename the member away, then re-analyse the consumer against the
+        // missing slot so its `ns.data.Get` miss is filed on the owner.
+        ws.analysis
+            .update_file_text_only(&provider_uri, renamed.to_string())
+            .expect("staged provider text");
+        let dirty = ws.analysis.self_index_and_diff(vec![provider_id]);
+        ws.analysis.ripple(dirty);
+        ws.analysis
+            .update_file_text_only(&consumer_uri, consumer_source.to_string())
+            .expect("staged consumer text");
+        let consumer_dirty = ws.analysis.self_index_and_diff(vec![consumer_id]);
+        ws.analysis.ripple(consumer_dirty);
+        expect_that!(
+            codes_in(&ws, consumer_id),
+            contains(eq(DiagnosticCode::UndefinedField.get_name()))
+        );
+        {
+            let db = ws.analysis.compilation.get_db();
+            let owner = crate::LuaMemberOwner::from(smol_str::SmolStr::new("ns.data"));
+            let readers: Vec<FileId> = db
+                .get_member_index()
+                .missed_member_readers(&owner, &LuaMemberKey::Name("Get".into()))
+                .collect();
+            expect_that!(readers, contains(eq(&consumer_id)));
+        }
+
+        // Rename it back: the missed-read edge must re-dirty the consumer.
+        ws.analysis
+            .update_file_text_only(&provider_uri, with_get.to_string())
+            .expect("staged provider text");
+        let dirty = ws.analysis.self_index_and_diff(vec![provider_id]);
+        expect_that!(dirty.files(), contains(eq(&consumer_id)));
+        ws.analysis.ripple(dirty);
+        expect_that!(
+            codes_in(&ws, consumer_id),
+            not(contains(eq(DiagnosticCode::UndefinedField.get_name())))
+        );
+    }
 }
