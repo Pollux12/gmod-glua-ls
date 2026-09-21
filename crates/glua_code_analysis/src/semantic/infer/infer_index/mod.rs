@@ -793,7 +793,7 @@ fn infer_table_member_owner(
                     &key,
                     cache.get_file_id(),
                     index_expr.get_position(),
-                )
+                )?
             {
                 return Ok(nullable_if_needed(db, member_type));
             }
@@ -866,7 +866,7 @@ fn infer_table_member_owner(
                 &key,
                 cache.get_file_id(),
                 index_expr.get_position(),
-            ) {
+            )? {
                 return Ok(nullable_if_needed(db, member_type));
             }
 
@@ -895,6 +895,19 @@ fn infer_table_member_owner(
                 if is_dynamic_index_proven_in_range(db, cache, &index_expr, &index_key) {
                     // Presence is proven, the element type is not.
                     return Ok(LuaType::Unknown);
+                }
+                // The empty-table hedge is only honest against a sealed
+                // member index. Answering `any|nil` while members can still
+                // land commits a top-of-band uninformative answer that the
+                // member a later file files -- exactly the data this branch
+                // calls absent -- can never displace. During the ordered
+                // phase this behaves like any other missing member instead:
+                // the miss is recorded and the read defers. Unresolve retries
+                // it once later members land; the force and diagnostics
+                // phases keep the hedge as the final answer.
+                if cache.get_config().analysis_phase.is_ordered() {
+                    cache.record_missed_member_read(db, owner, key);
+                    return Err(InferFailReason::FieldNotFound);
                 }
                 return Ok(empty_table_dynamic_access_type(
                     db,
@@ -1306,6 +1319,69 @@ fn integer_const_expr_value(
     }
 }
 
+/// Gathers the expression-keyed members on `owner` compatible with `key`.
+///
+/// `ExprType` member slots reflect how far a write's key expression had
+/// resolved when it was filed — the same `t[k] = v` write sits under
+/// `ExprType(Unknown)` while `k` is unresolved and under `ExprType(String)`
+/// once it settles — so a computed-key read has to match on key-type
+/// compatibility across every `ExprType` slot rather than looking up the one
+/// slot its own key currently maps to.
+fn infer_owner_expr_key_member_type(
+    db: &DbIndex,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+    access_file_id: FileId,
+    access_position: TextSize,
+) -> Result<Option<LuaType>, InferFailReason> {
+    let Some(access_key_type) = member_key_as_type(key) else {
+        return Ok(None);
+    };
+    let Some(members) = db.get_member_index().get_expr_key_members(owner) else {
+        return Ok(None);
+    };
+    let mut member_types = Vec::with_capacity(members.len());
+    // A matched member that still resolves to nothing must not read as "no
+    // member matched" — the write is there even if its type is not yet.
+    let mut saw_match = false;
+    let mut pending_reason = None;
+
+    for member in members {
+        let member_key = member.get_key();
+        let key_match = if member_key_is_unknown_expr(member_key) {
+            expr_dynamic_access_matches_unknown_member(&access_key_type)
+        } else {
+            member_key_matches_type(db, &access_key_type, member_key)
+        };
+        if !key_match {
+            continue;
+        }
+
+        let member_item = crate::db_index::LuaMemberIndexItem::One(member.get_id());
+        match member_item.resolve_type_with_realm_at_offset(db, &access_file_id, access_position) {
+            Ok(member_type) => {
+                saw_match = true;
+                member_types.push(member_type);
+            }
+            // Same pending-read rule as the raw member scan: a key-matched
+            // member whose type is still resolving is a dependency, not an
+            // absence.
+            Err(reason) if reason.is_need_resolve() => {
+                pending_reason.get_or_insert(reason);
+            }
+            Err(_) => {}
+        }
+    }
+
+    if !saw_match {
+        return match pending_reason {
+            Some(reason) => Err(reason),
+            None => Ok(None),
+        };
+    }
+    Ok(Some(TypeOps::union_all(db, member_types)))
+}
+
 fn expr_dynamic_access_matches_unknown_member(access_key_type: &LuaType) -> bool {
     match access_key_type {
         LuaType::Any
@@ -1340,15 +1416,17 @@ fn infer_cross_file_matching_expr_key_member_type(
     key: &LuaMemberKey,
     access_file_id: FileId,
     access_position: TextSize,
-) -> Option<LuaType> {
+) -> Result<Option<LuaType>, InferFailReason> {
     if !db.get_emmyrc().gmod.enabled
         || !db.get_emmyrc().gmod.infer_dynamic_fields
         || !db.get_emmyrc().gmod.dynamic_fields_global
     {
-        return None;
+        return Ok(None);
     }
 
-    let access_key_type = crate::semantic::member::member_key_as_type(key)?;
+    let Some(access_key_type) = crate::semantic::member::member_key_as_type(key) else {
+        return Ok(None);
+    };
     let access_realm = db
         .get_gmod_infer_index()
         .get_realm_file_metadata(&access_file_id)
@@ -1357,11 +1435,14 @@ fn infer_cross_file_matching_expr_key_member_type(
 
     let allow_wildcard_expr_literal_match =
         is_literal_member_key(key) && owner_wildcard_covers_literal_key(db, owner);
-    let members = db.get_member_index().get_expr_key_members(owner)?;
+    let Some(members) = db.get_member_index().get_expr_key_members(owner) else {
+        return Ok(None);
+    };
     let mut member_types = Vec::with_capacity(members.len());
     // See `infer_gmod_same_file_expr_key_member_type`: matching is tracked
     // separately so an Unknown member type does not read as "no match".
     let mut saw_match = false;
+    let mut pending_reason = None;
 
     for member in members {
         if member.get_file_id() == access_file_id
@@ -1381,10 +1462,20 @@ fn infer_cross_file_matching_expr_key_member_type(
         }
 
         let member_item = crate::db_index::LuaMemberIndexItem::One(member.get_id());
-        let Ok(member_type) =
-            member_item.resolve_type_with_realm_at_offset(db, &access_file_id, access_position)
-        else {
-            continue;
+        let member_type = match member_item.resolve_type_with_realm_at_offset(
+            db,
+            &access_file_id,
+            access_position,
+        ) {
+            Ok(member_type) => member_type,
+            // A member this reader can see whose type is still resolving
+            // is a pending read, not an absent member: the read must retry
+            // rather than fall through to the no-data fallback.
+            Err(reason) if reason.is_need_resolve() => {
+                pending_reason.get_or_insert(reason);
+                continue;
+            }
+            Err(_) => continue,
         };
 
         let key_match = if is_literal_member_key(key)
@@ -1407,9 +1498,12 @@ fn infer_cross_file_matching_expr_key_member_type(
     }
 
     if saw_match {
-        Some(TypeOps::union_all(db, member_types))
+        Ok(Some(TypeOps::union_all(db, member_types)))
     } else {
-        None
+        match pending_reason {
+            Some(reason) => Err(reason),
+            None => Ok(None),
+        }
     }
 }
 
@@ -1913,6 +2007,22 @@ fn infer_custom_type_member(
     let owner = LuaMemberOwner::Type(prefix_type_id.clone());
     let access_position = index_expr.get_position();
 
+    // A read through a computed key can land on any dynamically-filed member
+    // whose key type is compatible. `ExprType` slots only reflect how far a
+    // write's key expression had resolved when it was filed, so the match has
+    // to gather across all of them rather than look up the one slot this key
+    // maps to right now.
+    if matches!(key, LuaMemberKey::ExprType(_))
+        && let Some(member_type) = infer_owner_expr_key_member_type(
+            db,
+            &owner,
+            &key,
+            cache.get_file_id(),
+            access_position,
+        )?
+    {
+        return Ok(member_type);
+    }
     if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) {
         let visible_member_ids = member_item.visible_member_ids_with_realm_at_offset(
             db,
@@ -1930,6 +2040,17 @@ fn infer_custom_type_member(
         // member. Continue through the normal owner hierarchy.
     }
     let global_owner = LuaMemberOwner::GlobalPath(GlobalId::new(prefix_type_id.get_name()));
+    if matches!(key, LuaMemberKey::ExprType(_))
+        && let Some(member_type) = infer_owner_expr_key_member_type(
+            db,
+            &global_owner,
+            &key,
+            cache.get_file_id(),
+            access_position,
+        )?
+    {
+        return Ok(member_type);
+    }
     if let Some(member_item) = db.get_member_index().get_member_item(&global_owner, &key) {
         let resolved = member_item.resolve_type_with_realm_at_offset(
             db,

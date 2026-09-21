@@ -359,26 +359,40 @@ fn infer_owner_raw_member_type_with_realm_uncached(
     // A member that resolves to Unknown is still a resolved member, so "did
     // anything match" is tracked separately from the accumulated type.
     let mut saw_match = false;
+    let mut pending_reason = None;
     for member in owner_members {
         if !member_key_matches_type(db, &access_key_type, member.get_key()) {
             continue;
         }
 
         let member_item = LuaMemberIndexItem::One(member.get_id());
-        if let Ok(member_type) = resolve_member_item_with_realm(
+        match resolve_member_item_with_realm(
             db,
             &member_item,
             caller_file_id,
             caller_position,
             source_min_position,
         ) {
-            saw_match = true;
-            member_types.push(member_type);
+            Ok(member_type) => {
+                saw_match = true;
+                member_types.push(member_type);
+            }
+            // A member whose key matched but whose value type is still being
+            // resolved is a pending read, not an absent one: reporting
+            // FieldNotFound lets the caller's no-data fallback answer
+            // `any|nil`, a top-of-band commit the member's settled type can
+            // never displace. Defer on the member's own dependency instead so
+            // the read retries when its type lands — or when the reason floor
+            // fills the member's cache with `unknown`.
+            Err(reason) if reason.is_need_resolve() => {
+                pending_reason.get_or_insert(reason);
+            }
+            Err(_) => {}
         }
     }
 
     if !saw_match {
-        return Err(InferFailReason::FieldNotFound);
+        return Err(pending_reason.unwrap_or(InferFailReason::FieldNotFound));
     }
 
     let mut result_type = TypeOps::union_all(db, member_types);

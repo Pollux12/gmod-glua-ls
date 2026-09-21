@@ -264,6 +264,20 @@ impl InferCacheManager {
             .map(|(file_id, cache)| (*file_id, cache.take_missed_member_reads()))
             .collect()
     }
+
+    /// Merges reads a pass recorded into caches it owned — the net-call
+    /// resolver's per-file map, drained worker scopes — into `file_id`'s
+    /// canonical cache so [`Self::drain_missed_member_reads`] files them.
+    /// The caller attributes them to the file whose analysis consumed the
+    /// reads, not the file each detached cache was keyed under.
+    pub fn extend_missed_member_reads(
+        &mut self,
+        file_id: FileId,
+        reads: impl IntoIterator<Item = (crate::LuaMemberOwner, crate::LuaMemberKey)>,
+    ) {
+        self.get_infer_cache(file_id)
+            .extend_missed_member_reads(reads);
+    }
 }
 
 #[cfg(test)]

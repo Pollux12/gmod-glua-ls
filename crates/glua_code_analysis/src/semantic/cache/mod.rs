@@ -472,10 +472,26 @@ impl LuaInferCache {
             member_count,
             dynamic_field_count,
         );
+        // The cross-edit edge is separate from the slot version: the slot
+        // record only reaches the index through the settled-candidate passes,
+        // while a miss anywhere else still has to name this file when the key
+        // later appears.
+        self.missed_member_reads
+            .insert((owner.clone(), key.clone()));
     }
 
     pub fn take_missed_member_reads(&mut self) -> FxHashSet<(crate::LuaMemberOwner, LuaMemberKey)> {
         std::mem::take(&mut self.missed_member_reads)
+    }
+
+    /// Folds reads recorded into a detached cache — one a parallel or
+    /// speculative pass built away from this manager — into the file's
+    /// canonical set so the analysis drain files them like a native read.
+    pub fn extend_missed_member_reads(
+        &mut self,
+        reads: impl IntoIterator<Item = (crate::LuaMemberOwner, LuaMemberKey)>,
+    ) {
+        self.missed_member_reads.extend(reads);
     }
 
     pub fn clear(&mut self) {

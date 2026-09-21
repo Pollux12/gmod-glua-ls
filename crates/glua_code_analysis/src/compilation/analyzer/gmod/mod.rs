@@ -252,7 +252,11 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                 branch_ranges,
                 annotation_realm,
                 file_params,
+                missed_member_reads,
             } = result;
+            context
+                .infer_manager
+                .extend_missed_member_reads(file_id, missed_member_reads);
 
             if let Some(profile) = profile.as_mut() {
                 profile.files_scanned += 1;
@@ -569,7 +573,12 @@ impl AnalysisPipeline for GmodNetworkAnalysisPipeline {
                 )
             })
         });
-        for (file_id, (network_data, expanded_helpers)) in recollect.iter().zip(collected) {
+        for (file_id, (network_data, expanded_helpers, missed_member_reads)) in
+            recollect.iter().zip(collected)
+        {
+            context
+                .infer_manager
+                .extend_missed_member_reads(*file_id, missed_member_reads);
             let inputs = network_file_inputs_for_collection(
                 db,
                 *file_id,
@@ -675,7 +684,11 @@ fn collect_file_network_flows(
     reach: &HelperStartReachCache,
     helper_call_sites: &NetHelperCallSites,
     resolve_shared: &Arc<NetResolveShared>,
-) -> (crate::db_index::FileNetworkData, HashSet<HelperId>) {
+) -> (
+    crate::db_index::FileNetworkData,
+    HashSet<HelperId>,
+    FxHashSet<(LuaMemberOwner, LuaMemberKey)>,
+) {
     let mut expanded_helpers = HashSet::default();
     let Some(root) = db
         .get_vfs()
@@ -685,6 +698,7 @@ fn collect_file_network_flows(
         return (
             crate::db_index::FileNetworkData::default(),
             expanded_helpers,
+            FxHashSet::default(),
         );
     };
 
@@ -749,7 +763,7 @@ fn collect_file_network_flows(
         &mut registry_roots,
         &mut expanded_helpers,
     );
-    (data, expanded_helpers)
+    (data, expanded_helpers, net.drain_missed_member_reads())
 }
 
 /// Post-analysis phase: runs AFTER lua_analyze.
@@ -1913,6 +1927,10 @@ struct GmodFileMetadataResult {
     annotation_realm: Option<GmodRealm>,
     /// `@fileparam` annotations, when the file content mentions `@fileparam`.
     file_params: Option<Vec<(String, String)>>,
+    /// Member lookups the hook-metadata walk's detached resolver caches
+    /// observed failing. Filed as this file's missed-reader edges so a member
+    /// that appears later re-analyses the file.
+    missed_member_reads: FxHashSet<(LuaMemberOwner, LuaMemberKey)>,
 }
 
 /// Collect all per-file gmod pre-analysis metadata for `file_id`. Read-only
@@ -1952,6 +1970,7 @@ fn collect_file_gmod_metadata(
             branch_ranges: Vec::new(),
             annotation_realm: None,
             file_params: None,
+            missed_member_reads: FxHashSet::default(),
         };
     };
 
@@ -2021,6 +2040,7 @@ fn collect_file_gmod_metadata(
         branch_ranges,
         annotation_realm,
         file_params,
+        missed_member_reads: net.drain_missed_member_reads(),
     }
 }
 
@@ -4555,6 +4575,19 @@ impl NetCallResolver {
         let prefix = call_expr.get_prefix_expr()?;
         let typ = crate::semantic::infer_expr(db, cache, prefix).ok()?;
         unique_signature_id_from_type(&typ)
+    }
+
+    /// Every member lookup this resolver's caches observed failing, gathered
+    /// across the files they were keyed under. The caches are worker-local
+    /// and dropped with the pass, so the records would otherwise never reach
+    /// the index's missed-reader edges. The caller files them under the file
+    /// whose walk consumed the reads — `self.owner` — not the file each
+    /// cache happened to be keyed under.
+    fn drain_missed_member_reads(&mut self) -> FxHashSet<(LuaMemberOwner, LuaMemberKey)> {
+        self.caches
+            .values_mut()
+            .flat_map(|cache| cache.take_missed_member_reads())
+            .collect()
     }
 }
 

@@ -847,6 +847,96 @@ mod test {
         assert_eq!(ws.humanize_type(unobserved_lookup_ty), "nil");
     }
 
+    /// A computed-key write whose key already settled to `string` files under
+    /// `ExprType(String)`, while an unknowable read key (`M[key]` on a
+    /// `__index` delegation) asks for `ExprType(Unknown)`. The read must still
+    /// find the write: which `ExprType` slot a member currently sits in is a
+    /// property of how far the key expression had resolved when it was filed,
+    /// not of the source.
+    #[gtest]
+    fn test_class_unknown_dynamic_key_read_matches_settled_expr_key_write() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+        ---@class DynMeta
+
+        ---@generic T : table
+        ---@param metaName `T`
+        ---@return (definition) T
+        function FindMetaTable(metaName) end
+        "#,
+        );
+
+        let file_id = ws.def(
+            r#"
+        local M = FindMetaTable("DynMeta")
+
+        ---@param prefix string
+        local function install(prefix)
+            local fn = prefix .. "Thing"
+            M[fn] = function(self) return 1 end
+        end
+
+        function M:__index(key)
+            local val = M[key]
+            return val
+        end
+        "#,
+        );
+
+        let val_ty = local_name_type(&mut ws, file_id, "val");
+        assert!(
+            val_ty.is_function(),
+            "`M[key]` should resolve to the dynamically-written member, got {:?}",
+            ws.humanize_type_detailed(val_ty)
+        );
+    }
+
+    /// The dual direction: a write still filed under `ExprType(Unknown)` must
+    /// match a read whose key already settled to `string`.
+    #[gtest]
+    fn test_class_settled_dynamic_key_read_matches_unknown_expr_key_write() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+        ---@class DynMeta
+
+        ---@generic T : table
+        ---@param metaName `T`
+        ---@return (definition) T
+        function FindMetaTable(metaName) end
+        "#,
+        );
+
+        let file_id = ws.def(
+            r#"
+        local M = FindMetaTable("DynMeta")
+
+        local function install(fn)
+            M[fn] = function(self) return "x" end
+        end
+
+        local k = tostring(1)
+        local val = M[k]
+        "#,
+        );
+
+        let val_ty = local_name_type(&mut ws, file_id, "val");
+        assert!(
+            val_ty.is_function(),
+            "`M[k]` with a settled string key should still match a write filed under an unresolved key, got {:?}",
+            ws.humanize_type_detailed(val_ty)
+        );
+    }
+
     #[gtest]
     fn test_vehicle_weapon_registry_same_file_key_should_not_infer_unknown() {
         let (mut ws, _) = setup_vehicle_weapon_registry_same_file_fixture();

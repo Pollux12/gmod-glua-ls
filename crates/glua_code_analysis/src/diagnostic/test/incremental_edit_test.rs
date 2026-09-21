@@ -3500,6 +3500,170 @@ end
             .validate_rename_refresh_names(owed_rename, &burst_start);
         expect_that!(kept, is_empty());
     }
+
+    /// Re-adding a member must re-dirty the files whose read missed while it
+    /// was gone.
+    ///
+    /// A reader that saw `ns.data.Get` disappear caches a missed-read edge on
+    /// (`owner`, `"Get"`); restoring the member is a structural add whose
+    /// `dependents_of` queries exactly that edge through
+    /// `missed_member_readers`. A call statement's callee is only resolved by
+    /// the net-flow pass, whose `NetCallResolver` infers through caches it
+    /// owns and drops — so without the drain merging them into the file's
+    /// canonical infer cache, the edge never reaches the index, the revert's
+    /// dirty set is empty, and the stale `undefined-field` diagnostics stay.
+    #[gtest]
+    fn re_added_member_reaches_readers_that_missed_it() {
+        let mut ws = workspace_with(vec![DiagnosticCode::UndefinedField]);
+        let with_get = r#"
+            ns = ns or {}
+            ns.data = ns.data or {}
+            function ns.data.Get(key)
+                if key then
+                    return {}
+                end
+            end
+        "#;
+        let without_get = r#"
+            ns = ns or {}
+            ns.data = ns.data or {}
+        "#;
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/missprovider.lua");
+        let provider_id = write(&mut ws, &provider_uri, with_get);
+        let consumer_uri = ws.virtual_url_generator.new_uri("lua/missconsumer.lua");
+        // A call statement, not an initializer: the callee read happens in the
+        // net-flow pass's detached resolver caches, outside any
+        // settled-candidate record.
+        let consumer_source = r#"
+            ns.data.Get("options")
+        "#;
+        let consumer_id = write(&mut ws, &consumer_uri, consumer_source);
+
+        expect_that!(
+            codes_in(&ws, consumer_id),
+            not(contains(eq(DiagnosticCode::UndefinedField.get_name())))
+        );
+
+        // Remove the member, then re-analyse the consumer against the missing
+        // slot: its `ns.data.Get` read misses and must be filed as a
+        // missed-member read on the owner.
+        ws.analysis
+            .update_file_text_only(&provider_uri, without_get.to_string())
+            .expect("staged provider text");
+        let dirty = ws.analysis.self_index_and_diff(vec![provider_id]);
+        ws.analysis.ripple(dirty);
+        ws.analysis
+            .update_file_text_only(&consumer_uri, consumer_source.to_string())
+            .expect("staged consumer text");
+        let consumer_dirty = ws.analysis.self_index_and_diff(vec![consumer_id]);
+        ws.analysis.ripple(consumer_dirty);
+        expect_that!(
+            codes_in(&ws, consumer_id),
+            contains(eq(DiagnosticCode::UndefinedField.get_name()))
+        );
+        {
+            let db = ws.analysis.compilation.get_db();
+            let owner = crate::LuaMemberOwner::from(smol_str::SmolStr::new("ns.data"));
+            let readers: Vec<FileId> = db
+                .get_member_index()
+                .missed_member_readers(&owner, &LuaMemberKey::Name("Get".into()))
+                .collect();
+            expect_that!(readers, contains(eq(&consumer_id)));
+        }
+
+        // Restore it: the missed-read edge must re-dirty the consumer.
+        ws.analysis
+            .update_file_text_only(&provider_uri, with_get.to_string())
+            .expect("staged provider text");
+        let dirty = ws.analysis.self_index_and_diff(vec![provider_id]);
+        expect_that!(dirty.files(), contains(eq(&consumer_id)));
+        ws.analysis.ripple(dirty);
+        expect_that!(
+            codes_in(&ws, consumer_id),
+            not(contains(eq(DiagnosticCode::UndefinedField.get_name())))
+        );
+    }
+
+    /// The same missed-read edge through a declaration initializer — the
+    /// shape the CityRP consumers use (`local options = ns.data.Get(...)`).
+    /// The initializer runs inside a settled-candidate armed scope, so the
+    /// slot record carries the edge; the assertion is the same: restoring
+    /// the member must re-dirty the reader.
+    #[gtest]
+    fn re_added_member_reaches_initializer_readers_that_missed_it() {
+        let mut ws = workspace_with(vec![DiagnosticCode::UndefinedField]);
+        let with_get = r#"
+            ns = ns or {}
+            ns.data = ns.data or {}
+            function ns.data.Get(key, default)
+                return default
+            end
+        "#;
+        let without_get = r#"
+            ns = ns or {}
+            ns.data = ns.data or {}
+        "#;
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/missprovider.lua");
+        let provider_id = write(&mut ws, &provider_uri, with_get);
+        let consumer_uri = ws.virtual_url_generator.new_uri("lua/missconsumer.lua");
+        let consumer_source = r#"
+            local options = ns.data.Get("options", nil)
+            return options
+        "#;
+        let consumer_id = write(&mut ws, &consumer_uri, consumer_source);
+
+        expect_that!(
+            codes_in(&ws, consumer_id),
+            not(contains(eq(DiagnosticCode::UndefinedField.get_name())))
+        );
+
+        ws.analysis
+            .update_file_text_only(&provider_uri, without_get.to_string())
+            .expect("staged provider text");
+        let dirty = ws.analysis.self_index_and_diff(vec![provider_id]);
+        ws.analysis.ripple(dirty);
+        ws.analysis
+            .update_file_text_only(&consumer_uri, consumer_source.to_string())
+            .expect("staged consumer text");
+        let consumer_dirty = ws.analysis.self_index_and_diff(vec![consumer_id]);
+        ws.analysis.ripple(consumer_dirty);
+        expect_that!(
+            codes_in(&ws, consumer_id),
+            contains(eq(DiagnosticCode::UndefinedField.get_name()))
+        );
+        {
+            let db = ws.analysis.compilation.get_db();
+            let owner = crate::LuaMemberOwner::from(smol_str::SmolStr::new("ns.data"));
+            let readers: Vec<FileId> = db
+                .get_member_index()
+                .missed_member_readers(&owner, &LuaMemberKey::Name("Get".into()))
+                .collect();
+            expect_that!(readers, contains(eq(&consumer_id)));
+        }
+
+        ws.analysis
+            .update_file_text_only(&provider_uri, with_get.to_string())
+            .expect("staged provider text");
+        let dirty = ws.analysis.self_index_and_diff(vec![provider_id]);
+        expect_that!(dirty.files(), contains(eq(&consumer_id)));
+        ws.analysis.ripple(dirty);
+        expect_that!(
+            codes_in(&ws, consumer_id),
+            not(contains(eq(DiagnosticCode::UndefinedField.get_name())))
+        );
+    }
+
+    /// Renaming a member in place must re-dirty the files whose read missed
+    /// the old name while it was gone.
+    ///
+    /// `ns.data.Get` -> `ns.data.GetDisabled` keeps the index-expression site,
+    /// so the member id survives the edit remap and the export diff reports
+    /// the member as `changed` rather than `removed` + `added`. A `changed`
+    /// key is not structural, so `dependents_of` never queries
+    /// `missed_member_readers` and the rename back leaves the readers that
+    /// missed `Get` stale. The member key must be part of the export identity
+    /// so a rename diffs as the slot vanishing and reappearing.
+    #[gtest]
     fn renamed_member_reaches_readers_that_missed_it() {
         let mut ws = workspace_with(vec![DiagnosticCode::UndefinedField]);
         let with_get = r#"
