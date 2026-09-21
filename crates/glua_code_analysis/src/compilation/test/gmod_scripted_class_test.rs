@@ -2455,6 +2455,108 @@ mod test {
         }
     }
 
+    /// `DeriveGamemode` runs once per realm entry file (`init.lua`
+    /// server-side, `cl_init.lua` client-side). The synthesized `BaseClass`
+    /// member must exist per realm: a bare existence dedup lets whichever
+    /// file analyzes first own the only record, and that record's realm then
+    /// hides the base edge from the other realm's readers — so the answer
+    /// depends on analysis order.
+    #[gtest]
+    fn test_derive_gamemode_baseclass_member_is_filed_per_realm() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        // Sorted order: cl_hud, cl_init, init, sv_main, sandbox init. The
+        // client entry analyzes ahead of the server entry, so a first-writer
+        // dedup would leave only the client member.
+        let file_ids = ws.def_files(vec![
+            (
+                "gamemodes/sandbox/gamemode/init.lua",
+                r#"
+                function GM:Initialize() end
+                "#,
+            ),
+            (
+                "gamemode/cl_init.lua",
+                r#"
+                DeriveGamemode("sandbox")
+                "#,
+            ),
+            (
+                "gamemode/init.lua",
+                r#"
+                DeriveGamemode("sandbox")
+                "#,
+            ),
+            (
+                "gamemode/cl_hud.lua",
+                r#"
+                function GM:Draw()
+                    local clientBase = self.BaseClass
+                end
+                "#,
+            ),
+            (
+                "gamemode/sv_main.lua",
+                r#"
+                function GM:Init()
+                    local serverBase = self.BaseClass
+                end
+                "#,
+            ),
+        ]);
+
+        let (cl_hud_id, cl_init_id, init_id, sv_main_id) =
+            (file_ids[0], file_ids[1], file_ids[2], file_ids[3]);
+
+        let class_name = {
+            let db = ws.get_db_mut();
+            db.get_gmod_infer_index()
+                .get_scoped_class_info(&init_id)
+                .expect("expected gamemode scope info")
+                .class_name
+                .clone()
+        };
+
+        // Both derives file a member under the scoped class — one per realm —
+        // and each realm's reader resolves it to the same base class.
+        {
+            let db = ws.get_db_mut();
+            let owner = LuaMemberOwner::Type(LuaTypeDeclId::global(&class_name));
+            let member_files: Vec<crate::FileId> = db
+                .get_member_index()
+                .get_member_item(&owner, &LuaMemberKey::Name("BaseClass".into()))
+                .map(|item| {
+                    item.get_member_ids()
+                        .iter()
+                        .map(|member_id| member_id.file_id)
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                {
+                    let mut sorted = member_files.clone();
+                    sorted.sort();
+                    sorted
+                },
+                vec![cl_init_id, init_id],
+                "expected one BaseClass member per realm entry file"
+            );
+        }
+
+        for (reader_id, local) in [(cl_hud_id, "clientBase"), (sv_main_id, "serverBase")] {
+            let typ = local_name_type(&mut ws, reader_id, local);
+            assert_eq!(
+                ws.humanize_type(typ),
+                "gamemode_sandbox",
+                "BaseClass must resolve in the reader's own realm"
+            );
+        }
+    }
+
     #[gtest]
     fn test_scoped_class_helpers_target_only_scope_table() {
         // A gamemode-scope file can author other scripted tables (panels,
@@ -12294,4 +12396,118 @@ GM.TestValue = 1"#,
         );
         assert_eq!(forward, reversed);
     }
+
+    /// A `PANEL` block with no `vgui.Register` before the next `PANEL = {}`
+    /// keeps the `PANEL` fallback owner; another file's *global* `PANEL`
+    /// registration must not rebind it later.
+    ///
+    /// CityRP's `cl_categorylist.lua` has four `PANEL` regions and the third
+    /// is a bare `PANEL = {}` + `AccessorFunc` block that is never registered.
+    /// `cl_credits.lua` binds a *global* `PANEL` to `cityrp_credits`. When the
+    /// local file is re-analysed while that global binding exists, the
+    /// unregistered region's members must still resolve `PANEL` locally —
+    /// they must not move to `Type(cityrp_credits)`.
+    #[gtest]
+    fn test_unregistered_local_panel_region_is_not_rebound_by_global_panel() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/vgui/0_accessor_builtin.lua",
+            r#"
+            ---@class PANEL
+            PANEL = {}
+
+            ---@accessorfunc 3
+            ---@param tbl any
+            ---@param varname string
+            ---@param name string
+            function AccessorFunc(tbl, varname, name) end
+        "#,
+        );
+        // Analysed first (path sorts earlier): a *local* PANEL whose middle
+        // region is never registered.
+        let local_source = r#"
+            local PANEL = {}
+            vgui.Register("PanelA", PANEL, "Panel")
+            PANEL = {}
+            AccessorFunc(PANEL, "text", "Text")
+            PANEL = {}
+            vgui.Register("PanelB", PANEL, "Panel")
+        "#;
+        let local_file = ws.def_file("lua/vgui/a_local_panel.lua", local_source);
+        // Analysed second: binds the *global* PANEL to its own class. The
+        // register call sits past the local file's member offsets so the
+        // registration-region position window would admit the foreign
+        // members if the gather reached them.
+        let global_source = r#"
+            PANEL = {}
+            -- filler
+            -- filler
+            -- filler
+            -- filler
+            -- filler
+            -- filler
+            -- filler
+            -- filler
+            -- filler
+            -- filler
+            -- filler
+            -- filler
+            vgui.Register("cityrp_credits", PANEL, "Panel")
+            local PANEL = {}
+            vgui.Register("OtherGlobalPanelClass", PANEL, "Panel")
+        "#;
+        let global_file = ws.def_file("lua/vgui/b_global_panel.lua", global_source);
+
+        let owner_of = |db: &crate::DbIndex, key: &str| {
+            db.get_member_index()
+                .get_file_members(local_file)
+                .iter()
+                .filter(|m| m.get_key().get_name().is_some_and(|n| n == key))
+                .filter_map(|m| db.get_member_index().get_member_owner(&m.get_id()).cloned())
+                .collect::<Vec<_>>()
+        };
+        let assert_local_owner = |db: &crate::DbIndex, when: &str| {
+            for key in ["SetText", "GetText"] {
+                let owners = owner_of(db, key);
+                assert!(
+                    !owners.is_empty(),
+                    "expected {key} member in local panel file ({when})"
+                );
+                for owner in owners {
+                    assert_ne!(
+                        owner,
+                        LuaMemberOwner::Type(LuaTypeDeclId::global("cityrp_credits")),
+                        "{key} must not be rebound to the other file's global PANEL class ({when})"
+                    );
+                }
+            }
+        };
+        assert_local_owner(ws.get_db_mut(), "cold");
+
+        // Re-analyse the *registering* file: its synthesis gathers the member
+        // history of its global `PANEL = {}` literal, which canonicalizes to
+        // `Type(PANEL)` — the shared owner the local file's unregistered
+        // AccessorFunc members also sit under. Without a file filter the
+        // transfer sweeps the foreign members into `cityrp_credits`.
+        let uri = ws
+            .virtual_url_generator
+            .new_uri("lua/vgui/b_global_panel.lua");
+        ws.analysis
+            .update_file_text_only(&uri, global_source.to_string())
+            .expect("restage global file");
+        let dirty = ws.analysis.self_index_and_diff(vec![global_file]);
+        ws.analysis.ripple(dirty);
+        assert_local_owner(ws.get_db_mut(), "warm");
+    }
+
+    /// `self.Entity` inside an entity-scope method is the canonical scripted
+    /// entity back-reference: every ENT script table carries an `Entity` member
+    /// holding the backing engine entity. Declared `self`, the read resolves to
+    /// the scoped class through the `ENT` super type.
+    #[gtest]
 }

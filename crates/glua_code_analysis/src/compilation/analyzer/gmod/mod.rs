@@ -8401,11 +8401,13 @@ fn synthesize_define_baseclass_parent_alias(
     let member_key = LuaMemberKey::Name(alias_name.as_str().into());
 
     // If the user already defined this field (e.g. `GM.Sandbox = BaseClass`),
-    // let their definition win — don't shadow it with a synthetic decl.
-    if db
-        .get_member_index()
-        .get_member_item(&owner, &member_key)
-        .is_some()
+    // let their definition win — don't shadow it with a synthetic decl. The
+    // check must be realm-scoped, not bare existence: a write in the other
+    // realm (e.g. a second DEFINE_BASECLASS entry file) is not a definition
+    // this realm's readers can see. It must NOT be position-scoped though: a
+    // write later in this same file is still the user's definition.
+    if let Some(item) = db.get_member_index().get_member_item(&owner, &member_key)
+        && !item.visible_member_ids_with_realm(db, &file_id).is_empty()
     {
         return;
     }
@@ -9450,7 +9452,17 @@ fn synthesize_panel_class_with_id(
                     .get_current_owner_member_history(&source_owner);
                 if !members.is_empty() {
                     for member in members {
-                        let member_position = member.get_id().get_position();
+                        let member_id = member.get_id();
+                        // The `Element` owner canonicalizes through the global
+                        // path's class binding (e.g. a global `PANEL = {}`
+                        // literal resolves to `Type(PANEL)`), so the history
+                        // can contain members from *other* files. Region
+                        // boundaries are text positions and only comparable
+                        // within this file.
+                        if member_id.file_id != file_id {
+                            continue;
+                        }
+                        let member_position = member_id.get_position();
                         if member_position < register_position
                             && latest_write_position
                                 .map(|write_position| member_position >= write_position)
@@ -9471,7 +9483,7 @@ fn synthesize_panel_class_with_id(
                             {
                                 continue;
                             }
-                            table_member_ids.insert(member.get_id());
+                            table_member_ids.insert(member_id);
                         }
                     }
                 }
@@ -9800,10 +9812,14 @@ fn synthesize_panel_baseclass_member(
 ) {
     let owner = LuaMemberOwner::Type(class_decl_id.clone());
     let member_key = LuaMemberKey::Name("BaseClass".into());
-    if db
-        .get_member_index()
-        .get_member_item(&owner, &member_key)
-        .is_some()
+    if let Some(item) = db.get_member_index().get_member_item(&owner, &member_key)
+        && !item
+            .visible_member_ids_with_realm_at_offset(
+                db,
+                &file_id,
+                call.syntax_id.get_range().start(),
+            )
+            .is_empty()
     {
         return;
     }
@@ -9844,10 +9860,16 @@ fn synthesize_baseclass_member(
 
     let owner = LuaMemberOwner::Type(class_decl_id.clone());
     let member_key = LuaMemberKey::Name("BaseClass".into());
-    if db
-        .get_member_index()
-        .get_member_item(&owner, &member_key)
-        .is_some()
+    // The same derive runs once per realm entry file (`init.lua` server-side,
+    // `cl_init.lua` client-side). A bare existence check lets whichever file
+    // analyzes first own the only `BaseClass` record, and that record's realm
+    // then hides the base edge from the other realm's readers — which reader
+    // loses depends on analysis order. Skip only when a member already
+    // visible at this write's position covers the same audience.
+    if let Some(item) = db.get_member_index().get_member_item(&owner, &member_key)
+        && !item
+            .visible_member_ids_with_realm_at_offset(db, &file_id, syntax_id.get_range().start())
+            .is_empty()
     {
         return;
     }

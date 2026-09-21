@@ -4863,6 +4863,42 @@ end
             "the read must resolve to its own file's bootstrap, got {held_type:?}"
         );
     }
+
+    #[gtest]
+    fn reindex_shared_reader_keeps_both_realm_table_field_arms() {
+        // CityRP residual drift: `local cfg = cityrp.configuration` cold-read
+        // merged the server (`init.lua`) and client (`cl_init.lua`)
+        // `configuration = {}` literal arms into a MergedTable, but a later
+        // re-index of the shared reader dropped the client arm. Re-deriving a
+        // file against the settled index must reproduce the cold answer.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/gamemode/init.lua",
+            "ns = ns or { configuration = { sv_field = 1 } }",
+        );
+        ws.def_file(
+            "lua/gamemode/cl_init.lua",
+            "ns = ns or { configuration = { cl_field = 2 } }",
+        );
+        let reader = ws.def_file(
+            "lua/gamemode/sh_reader.lua",
+            "local cfg = ns.configuration\n",
+        );
+
+        let cold_ty = local_name_type(&mut ws, reader, "cfg");
+        ws.analysis.reindex_files_without_expansion(vec![reader]);
+        let warm_ty = local_name_type(&mut ws, reader, "cfg");
+        assert_that!(
+            warm_ty,
+            eq(&cold_ty),
+            "cold {} vs warm {}",
+            ws.humanize_type_detailed(cold_ty),
+            ws.humanize_type_detailed(warm_ty)
+        );
+    }
 }
 
 #[cfg(test)]
