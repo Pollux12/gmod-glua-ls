@@ -1,14 +1,17 @@
 #[cfg(test)]
 mod test {
-    use glua_parser::{LuaAst, LuaAstNode, LuaAstToken, LuaExpr, LuaLocalName, LuaNameExpr};
+    use glua_parser::{
+        LuaAst, LuaAstNode, LuaAstToken, LuaExpr, LuaFuncStat, LuaIndexKey, LuaLocalName,
+        LuaNameExpr, LuaVarExpr,
+    };
     use googletest::prelude::*;
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
     use crate::{
         DiagnosticCode, Emmyrc, EmmyrcGmodScriptedClassScopeEntry, GlobalId, GmodClassCallLiteral,
-        LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
-        VirtualWorkspace,
+        LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType,
+        LuaTypeDeclId, VirtualWorkspace,
     };
 
     fn legacy_scope(pattern: &str) -> EmmyrcGmodScriptedClassScopeEntry {
@@ -11970,6 +11973,98 @@ GM.TestValue = 1"#,
                 ))),
             "removing the reassignment should remove the wildcard on incremental reindex: {diagnostics:?}"
         );
+    }
+
+    fn gm_signature_return_type(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        method: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let root = semantic_model.get_root();
+        let closure = root
+            .descendants::<LuaFuncStat>()
+            .find(|stat| match stat.get_func_name() {
+                Some(LuaVarExpr::IndexExpr(index_expr)) => {
+                    matches!(
+                        index_expr.get_index_key(),
+                        Some(LuaIndexKey::Name(name)) if name.get_name_text() == method
+                    )
+                }
+                _ => false,
+            })
+            .and_then(|stat| stat.get_closure())
+            .expect("expected GM method closure");
+        let signature_id = LuaSignatureId::from_closure(file_id, &closure);
+        semantic_model
+            .get_db()
+            .get_signature_index()
+            .get(&signature_id)
+            .expect("expected signature")
+            .get_return_type()
+    }
+
+    /// Re-indexing a file whose hook returns `self.BaseClass:Hook()` must not
+    /// change the inferred return. Cold analysis settles the call to the
+    /// derived gamemode's synthesized `BaseClass` member; a no-op reindex used
+    /// to keep a leftover `Unknown` arm instead.
+    #[gtest]
+    fn test_derived_gamemode_baseclass_return_converges_on_reindex() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_ids = ws.def_files(vec![
+            // Stand-in for the shipped annotations library: `GM` carries a
+            // generic `BaseClass` table field, and the base hook returns a
+            // concrete type. `gamemode_sandbox` itself has no real files — it
+            // is materialized empty by `DeriveGamemode` with `GM` as super.
+            (
+                "annotations/gm.lua",
+                r#"
+                ---@class GM
+                ---@field BaseClass table
+                ---@return boolean
+                function GM:PhysgunPickup(player, entity) end
+                "#,
+            ),
+            (
+                "gamemode/init.lua",
+                r#"
+                DeriveGamemode("sandbox")
+                "#,
+            ),
+            (
+                "gamemode/cl_init.lua",
+                r#"
+                DeriveGamemode("sandbox")
+                "#,
+            ),
+            (
+                "gamemode/sv_hooks.lua",
+                r#"
+                function GM:PhysgunPickup(player, entity)
+                    if entity then
+                        return false
+                    end
+                    return self.BaseClass:PhysgunPickup(player, entity)
+                end
+                "#,
+            ),
+        ]);
+        let hooks_file = file_ids[3];
+
+        let cold = gm_signature_return_type(&mut ws, hooks_file, "PhysgunPickup");
+        ws.analysis
+            .reindex_files_without_expansion(vec![hooks_file]);
+        let warm = gm_signature_return_type(&mut ws, hooks_file, "PhysgunPickup");
+        assert_eq!(warm, cold, "cold={cold:?} warm={warm:?}");
     }
 
     #[gtest]

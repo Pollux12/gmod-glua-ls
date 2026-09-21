@@ -1761,13 +1761,25 @@ fn type_has_visible_static_member_at_use(
             }),
     );
     owners.into_iter().any(|owner_id| {
-        db.get_member_index()
-            .get_member_item(&LuaMemberOwner::Type(owner_id), member_key)
-            .is_some_and(|item| {
-                !item
-                    .visible_member_ids_with_realm_at_offset(db, &file_id, position)
-                    .is_empty()
-            })
+        // Member lookup resolves `Type` and `GlobalPath` owners for the same
+        // name (see `find_custom_type_members`): scoped-class and annotation
+        // members are filed under the global path, not the type decl. Checking
+        // only `Type` misses them, and the receiver then gets narrowed to a
+        // subtype that "has" the member the base already resolves.
+        [
+            &LuaMemberOwner::Type(owner_id.clone()),
+            &LuaMemberOwner::GlobalPath(crate::GlobalId::new(owner_id.get_name())),
+        ]
+        .into_iter()
+        .any(|owner| {
+            db.get_member_index()
+                .get_member_item(owner, member_key)
+                .is_some_and(|item| {
+                    !item
+                        .visible_member_ids_with_realm_at_offset(db, &file_id, position)
+                        .is_empty()
+                })
+        })
     })
 }
 
