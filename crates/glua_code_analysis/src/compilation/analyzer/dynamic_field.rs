@@ -245,20 +245,27 @@ fn collect_dynamic_fields_for_file(
     field_setter_helpers: &FieldSetterHelperCache,
 ) -> (
     Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
     Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
     Vec<FiniteNamedMemberEvidence>,
     rustc_hash::FxHashSet<LuaInferredGuardOwner>,
-    Vec<SmolStr>,
+    Vec<(SmolStr, rowan::TextRange)>,
     Vec<glua_parser::LuaSyntaxId>,
     Vec<(
         glua_parser::LuaSyntaxId,
         crate::db_index::read_set::InferenceReadSet,
     )>,
 ) {
-    let mut collected_unattributed: Vec<SmolStr> = Vec::new();
+    let mut collected_unattributed: Vec<(SmolStr, rowan::TextRange)> = Vec::new();
     let mut dynamic_field_retry: Vec<glua_parser::LuaSyntaxId> = Vec::new();
     let mut collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
         Vec::new();
+    let mut collected_propagated: Vec<(
+        DynamicFieldOwner,
+        SmolStr,
+        crate::FileId,
+        rowan::TextRange,
+    )> = Vec::new();
     let mut collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)> =
         Vec::new();
     let mut collected_finite_members = Vec::new();
@@ -374,6 +381,7 @@ fn collect_dynamic_fields_for_file(
             if should_collect_wildcard {
                 let before = collected_wildcards.len();
                 collect_wildcard_for_type(
+                    db,
                     &effective_type,
                     file_id,
                     definition_range,
@@ -390,6 +398,7 @@ fn collect_dynamic_fields_for_file(
 
             if is_dynamic_index_key(&index_expr) && !field_names.names.is_empty() {
                 collect_finite_member_for_type(
+                    db,
                     &effective_type,
                     LuaMemberId::new(index_expr.get_syntax_id(), file_id),
                     file_id,
@@ -403,6 +412,13 @@ fn collect_dynamic_fields_for_file(
                 continue;
             };
 
+            // Site-local buffers: super-type propagation runs inside this
+            // site's armed scope so the `collect_super_types` reads join the
+            // reads that re-derive it. A super edge landing after collection
+            // otherwise leaves the propagated fields frozen at the partial
+            // set.
+            let mut site_named: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
+                Vec::new();
             for field_name in field_names.names {
                 if mode.collect_declared_member_table_fields()
                     && let Some(value_expr) = value_expr
@@ -416,33 +432,43 @@ fn collect_dynamic_fields_for_file(
                         member_id,
                         value_expr,
                         file_id,
-                        &mut collected,
+                        &mut site_named,
                         &mut collected_finite_members,
                     );
                 }
                 if mode.collect_direct_assignments() || collect_finite_direct_assignment {
-                    let before = collected.len();
+                    let before = site_named.len();
                     collect_for_type(
+                        db,
                         &effective_type,
                         &field_name,
                         file_id,
                         definition_range,
-                        &mut collected,
+                        &mut site_named,
                     );
                     // The write is real but landed on no owner the index can
                     // name, so record that the field exists somewhere even
                     // though no table claims it — and queue the site for the
                     // settled retry, which attributes it properly once the
                     // prefix's type has finished settling.
-                    if collected.len() == before {
-                        collected_unattributed.push(field_name.clone());
+                    if site_named.len() == before {
+                        collected_unattributed.push((field_name.clone(), definition_range));
                         dynamic_field_retry.push(index_expr.get_syntax_id());
                     }
                 }
             }
+            if mode.propagate_to_super_types() {
+                collected_propagated
+                    .extend(propagate_dynamic_fields_to_super_types(db, &site_named));
+            }
+            collected.extend(site_named);
         }
     }
     if mode.collect_setmetatable_tables() {
+        // The helper/setmetatable producers are not per-site armed scopes, so
+        // their propagation runs here rather than inside one. Their reads are
+        // not settle-tracked either way.
+        let non_site_start = collected.len();
         for call_expr in root.descendants::<LuaCallExpr>() {
             collect_field_setter_helper_call_fields(
                 db,
@@ -460,6 +486,12 @@ fn collect_dynamic_fields_for_file(
                 &mut collected,
                 &mut collected_finite_members,
             );
+        }
+        if mode.propagate_to_super_types() {
+            collected_propagated.extend(propagate_dynamic_fields_to_super_types(
+                db,
+                &collected[non_site_start..],
+            ));
         }
     }
     // Every site that consulted mutable index state is a settled candidate:
@@ -480,6 +512,7 @@ fn collect_dynamic_fields_for_file(
         .collect();
     (
         collected,
+        collected_propagated,
         collected_wildcards,
         collected_finite_members,
         cache.take_inferred_guard_dependencies(),
@@ -498,6 +531,12 @@ fn analyze_dynamic_fields(
     let tree_list = context.tree_list.clone();
     let mut collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
         Vec::new();
+    let mut collected_propagated: Vec<(
+        DynamicFieldOwner,
+        SmolStr,
+        crate::FileId,
+        rowan::TextRange,
+    )> = Vec::new();
     let mut collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)> =
         Vec::new();
     let mut collected_finite_members = Vec::new();
@@ -537,6 +576,7 @@ fn analyze_dynamic_fields(
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
                 Default::default(),
                 Vec::new(),
                 Vec::new(),
@@ -549,10 +589,11 @@ fn analyze_dynamic_fields(
         profile.collection_time += collection_start.elapsed();
     }
     let merge_start = profile_enabled.then(std::time::Instant::now);
-    let mut collected_unattributed: Vec<(SmolStr, crate::FileId)> = Vec::new();
+    let mut collected_unattributed: Vec<(SmolStr, crate::FileId, rowan::TextRange)> = Vec::new();
     for (
         (
             file_collected,
+            file_propagated,
             file_wildcards,
             file_finite_members,
             dependencies,
@@ -564,12 +605,13 @@ fn analyze_dynamic_fields(
     ) in per_file.into_iter().zip(file_ids)
     {
         collected.extend(file_collected);
+        collected_propagated.extend(file_propagated);
         collected_wildcards.extend(file_wildcards);
         collected_finite_members.extend(file_finite_members);
         collected_unattributed.extend(
             file_unattributed
                 .into_iter()
-                .map(|field_name| (field_name, file_id)),
+                .map(|(field_name, range)| (field_name, file_id, range)),
         );
         for syntax_id in file_dynamic_field_retry {
             context.record_settled_dynamic_field_candidate(file_id, syntax_id);
@@ -592,37 +634,18 @@ fn analyze_dynamic_fields(
         profile.collection_merge_time += merge_start.elapsed();
     }
 
-    // A field written on one of a global path's bootstrap literals belongs to
-    // the path, not to that literal: every file's `X.k = X.k or {}` names a
-    // different `{}` and every reader of `X.k` has to see all of them.
-    for (owner, _, _, _) in &mut collected {
-        *owner = crate::canonical_dynamic_field_owner(db, owner.clone());
-    }
-    for (owner, _, _) in &mut collected_wildcards {
-        *owner = crate::canonical_dynamic_field_owner(db, owner.clone());
-    }
-    for (owner, _, _, _, _) in &mut collected_finite_members {
-        *owner = crate::canonical_dynamic_field_owner(db, owner.clone());
-    }
-
-    let propagate_start = profile_enabled.then(std::time::Instant::now);
-    let propagated = if mode.propagate_to_super_types() {
-        propagate_dynamic_fields_to_super_types(db, &collected)
-    } else {
-        Vec::new()
-    };
-    if let (Some(profile), Some(propagate_start)) = (profile.as_mut(), propagate_start) {
-        profile.propagation_time += propagate_start.elapsed();
-    }
+    // Owners were canonicalized at push inside each site's armed read scope,
+    // and super-type propagation ran there too, so the reads that decide both
+    // are the reads that re-derive the site.
     let insert_start = profile_enabled.then(std::time::Instant::now);
     let index = db.get_dynamic_field_index_mut();
-    for (field_name, file_id) in collected_unattributed {
-        index.add_unattributed_field(field_name, file_id);
+    for (field_name, file_id, range) in collected_unattributed {
+        index.add_unattributed_field(field_name, file_id, range);
     }
     for (owner, field_name, file_id, range) in &collected {
         index.add_field(owner.clone(), field_name.clone(), *file_id, *range);
     }
-    for (owner, field_name, file_id, range) in &propagated {
+    for (owner, field_name, file_id, range) in &collected_propagated {
         index.add_propagated_field(owner.clone(), field_name.clone(), *file_id, *range);
     }
     for (owner, file_id, range) in &collected_wildcards {
@@ -640,9 +663,9 @@ fn analyze_dynamic_fields(
         profile.insertion_time += insert_start.elapsed();
     }
     if let Some(profile) = profile {
-        profile.log(tree_list.len(), collected.len(), propagated.len());
+        profile.log(tree_list.len(), collected.len(), collected_propagated.len());
         if stderr_profile_enabled {
-            profile.print(tree_list.len(), collected.len(), propagated.len());
+            profile.print(tree_list.len(), collected.len(), collected_propagated.len());
         }
     }
 }
@@ -854,6 +877,7 @@ fn collect_field_setter_helper_call_fields(
 
         for field_name in field_names {
             collect_for_type(
+                db,
                 &table_type,
                 &field_name,
                 file_id,
@@ -1122,6 +1146,7 @@ fn collect_nested_table_field(
 
     if is_expression_key {
         collect_finite_member_for_type(
+            db,
             owner_type,
             LuaMemberId::new(field.get_syntax_id(), file_id),
             file_id,
@@ -1133,6 +1158,7 @@ fn collect_nested_table_field(
 
     for field_name in field_names {
         collect_for_type(
+            db,
             owner_type,
             &field_name,
             file_id,
@@ -2082,12 +2108,15 @@ struct DynamicFieldSiteRefresh {
     /// this key.
     member_id: crate::LuaMemberId,
     named: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    /// Super-type propagation of `named`, computed inside the site's armed
+    /// read scope so the `collect_super_types` reads join the reads that
+    /// re-derive it.
+    propagated: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
     wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
-    /// Names that resolved to owners this round: their unattributed records
-    /// are withdrawn, as an in-phase attribution would never have filed one.
-    attributed: Vec<SmolStr>,
-    /// Names that resolved to nothing: their unattributed records are
-    /// (re-)filed, matching what collection writes for a zero-owner name.
+    /// The site's exact current unattributed name set: names that resolved
+    /// to nothing this round. `replace_site_contributions` reconciles the
+    /// site's prior records against it — a name absent here loses its
+    /// record whether it attributed this round or vanished entirely.
     unattributed: Vec<SmolStr>,
     /// Owners the re-derived site claims finite-named member marks for —
     /// collection's `has_finite_domain && !wildcard-covered` rule applied to
@@ -2291,17 +2320,17 @@ pub(crate) fn rederive_settled_dynamic_fields(
                 definition_range,
                 member_id: LuaMemberId::new(*syntax_id, file_id),
                 named: Vec::new(),
+                propagated: Vec::new(),
                 wildcards: Vec::new(),
-                attributed: Vec::new(),
                 unattributed: Vec::new(),
                 finite_marked: Default::default(),
             };
             let Ok(prefix_type) = infer_expr(db, &mut cache, prefix_expr.clone()) else {
                 // The site yields nothing this round, so whatever it filed
-                // when collected is stale: reconcile withdraws it, and no
-                // name claims an unattributed record — as a collection that
-                // saw this state would have filed neither.
-                site.attributed = field_names.names;
+                // when collected is stale: reconcile withdraws it, and the
+                // empty unattributed set retracts any record the site held —
+                // as a collection that saw this state would have filed
+                // neither.
                 result.sites.push(site);
                 continue;
             };
@@ -2316,6 +2345,7 @@ pub(crate) fn rederive_settled_dynamic_fields(
             let is_dynamic_key = is_dynamic_index_key(&index_expr);
             if is_dynamic_key && field_names.may_have_other_string_names {
                 collect_wildcard_for_type(
+                    db,
                     &effective_type,
                     file_id,
                     definition_range,
@@ -2325,6 +2355,7 @@ pub(crate) fn rederive_settled_dynamic_fields(
             if is_dynamic_key && !field_names.names.is_empty() {
                 let mut finite_evidence = Vec::new();
                 collect_finite_member_for_type(
+                    db,
                     &effective_type,
                     LuaMemberId::new(*syntax_id, file_id),
                     file_id,
@@ -2346,18 +2377,20 @@ pub(crate) fn rederive_settled_dynamic_fields(
             for field_name in field_names.names {
                 let before = site.named.len();
                 collect_for_type(
+                    db,
                     &effective_type,
                     &field_name,
                     file_id,
                     definition_range,
                     &mut site.named,
                 );
-                if site.named.len() > before {
-                    site.attributed.push(field_name);
-                } else {
+                if site.named.len() == before {
                     site.unattributed.push(field_name);
                 }
             }
+            // Inside the armed scope: the super-type reads that decide the
+            // propagated set are reads this site re-derives on.
+            site.propagated = propagate_dynamic_fields_to_super_types(db, &site.named);
             result.sites.push(site);
         }
         result
@@ -2368,24 +2401,14 @@ pub(crate) fn rederive_settled_dynamic_fields(
         for (candidate, reads) in result.candidate_reads {
             context.record_settled_candidate_reads(read_pass, candidate, read_version, reads);
         }
-        for mut site in result.sites {
-            for (owner, ..) in &mut site.named {
-                *owner = crate::canonical_dynamic_field_owner(db, owner.clone());
-            }
-            for (owner, ..) in &mut site.wildcards {
-                *owner = crate::canonical_dynamic_field_owner(db, owner.clone());
-            }
-            // Same super-type propagation the initial pass applies, so a
-            // field the settled path resolves lands on the super types a cold
-            // first pass would have given it: the two paths must reach the
-            // identical index.
-            let propagated = propagate_dynamic_fields_to_super_types(db, &site.named);
+        for site in result.sites {
             let direct = site
                 .named
                 .iter()
                 .map(|(owner, field_name, _, _)| (owner.clone(), field_name.clone()))
                 .collect::<Vec<_>>();
-            let propagated = propagated
+            let propagated = site
+                .propagated
                 .iter()
                 .map(|(owner, field_name, _, _)| (owner.clone(), field_name.clone()))
                 .collect::<Vec<_>>();
@@ -2401,32 +2424,29 @@ pub(crate) fn rederive_settled_dynamic_fields(
                 &direct,
                 &propagated,
                 &wildcards,
+                &site.unattributed,
             );
             // The member id names the site itself, so every mark under it is
             // this site's to keep or withdraw.
             changed |= index.replace_site_finite_members(site.member_id, &site.finite_marked);
-            for field_name in site.unattributed {
-                changed |= index.add_unattributed_field(field_name, file_id);
-            }
-            for field_name in site.attributed {
-                changed |= index.remove_unattributed_field(&field_name, file_id);
-            }
         }
     }
     changed
 }
 
 fn collect_wildcard_for_type(
+    db: &DbIndex,
     typ: &LuaType,
     file_id: crate::FileId,
     range: rowan::TextRange,
     result: &mut Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
 ) {
     let mut visited = rustc_hash::FxHashSet::default();
-    collect_wildcard_for_type_inner(typ, file_id, range, result, &mut visited);
+    collect_wildcard_for_type_inner(db, typ, file_id, range, result, &mut visited);
 }
 
 fn collect_wildcard_for_type_inner(
+    db: &DbIndex,
     typ: &LuaType,
     file_id: crate::FileId,
     range: rowan::TextRange,
@@ -2440,29 +2460,42 @@ fn collect_wildcard_for_type_inner(
         LuaType::Ref(id) | LuaType::Def(id) => {
             result.push((DynamicFieldOwner::Type(id.clone()), file_id, range));
         }
+        // Canonicalized at push, like `collect_for_type`: the
+        // `definition_site_owner` read belongs to the site's armed scope so a
+        // late literal→path binding re-derives it.
         LuaType::TableConst(table_range) => {
             result.push((
-                DynamicFieldOwner::Table(table_range.clone()),
+                crate::canonical_dynamic_field_owner(
+                    db,
+                    DynamicFieldOwner::Table(table_range.clone()),
+                ),
                 file_id,
                 range,
             ));
         }
         LuaType::Instance(instance) => {
-            collect_wildcard_for_type_inner(instance.get_base(), file_id, range, result, visited);
+            collect_wildcard_for_type_inner(
+                db,
+                instance.get_base(),
+                file_id,
+                range,
+                result,
+                visited,
+            );
         }
         LuaType::TableOf(inner) => {
-            collect_wildcard_for_type_inner(inner, file_id, range, result, visited);
+            collect_wildcard_for_type_inner(db, inner, file_id, range, result, visited);
         }
         LuaType::Union(union_type) => {
             for t in union_type.types() {
-                collect_wildcard_for_type_inner(t, file_id, range, result, visited);
+                collect_wildcard_for_type_inner(db, t, file_id, range, result, visited);
             }
         }
         // See `collect_for_type`: a merged table stands for its backing
         // literals.
         LuaType::MergedTable(merged) => {
             for t in merged.get_types() {
-                collect_wildcard_for_type_inner(t, file_id, range, result, visited);
+                collect_wildcard_for_type_inner(db, t, file_id, range, result, visited);
             }
         }
         _ => {}
@@ -2470,6 +2503,7 @@ fn collect_wildcard_for_type_inner(
 }
 
 fn collect_for_type(
+    db: &DbIndex,
     typ: &LuaType,
     field_name: &SmolStr,
     file_id: crate::FileId,
@@ -2477,10 +2511,11 @@ fn collect_for_type(
     result: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
 ) {
     let mut visited = rustc_hash::FxHashSet::default();
-    collect_for_type_inner(typ, field_name, file_id, range, result, &mut visited);
+    collect_for_type_inner(db, typ, field_name, file_id, range, result, &mut visited);
 }
 
 fn collect_for_type_inner(
+    db: &DbIndex,
     typ: &LuaType,
     field_name: &SmolStr,
     file_id: crate::FileId,
@@ -2500,9 +2535,18 @@ fn collect_for_type_inner(
                 range,
             ));
         }
+        // The owner is canonicalized here, inside the site's armed read
+        // scope: a literal that initializes a global path belongs to the
+        // path, and the `definition_site_owner` read that decides it is what
+        // re-derives this site when the binding lands after collection.
+        // Canonicalizing at merge instead would file the same owner but
+        // record the read nowhere, leaving the site frozen at the literal.
         LuaType::TableConst(table_range) => {
             result.push((
-                DynamicFieldOwner::Table(table_range.clone()),
+                crate::canonical_dynamic_field_owner(
+                    db,
+                    DynamicFieldOwner::Table(table_range.clone()),
+                ),
                 field_name.clone(),
                 file_id,
                 range,
@@ -2510,6 +2554,7 @@ fn collect_for_type_inner(
         }
         LuaType::Instance(instance) => {
             collect_for_type_inner(
+                db,
                 instance.get_base(),
                 field_name,
                 file_id,
@@ -2519,11 +2564,11 @@ fn collect_for_type_inner(
             );
         }
         LuaType::TableOf(inner) => {
-            collect_for_type_inner(inner, field_name, file_id, range, result, visited);
+            collect_for_type_inner(db, inner, field_name, file_id, range, result, visited);
         }
         LuaType::Union(union_type) => {
             for t in union_type.types() {
-                collect_for_type_inner(t, field_name, file_id, range, result, visited);
+                collect_for_type_inner(db, t, field_name, file_id, range, result, visited);
             }
         }
         // A merged table is the same runtime table seen through several
@@ -2531,7 +2576,7 @@ fn collect_for_type_inner(
         // does when inference answers with the literals unmerged.
         LuaType::MergedTable(merged) => {
             for t in merged.get_types() {
-                collect_for_type_inner(t, field_name, file_id, range, result, visited);
+                collect_for_type_inner(db, t, field_name, file_id, range, result, visited);
             }
         }
         _ => {}
@@ -2539,6 +2584,7 @@ fn collect_for_type_inner(
 }
 
 fn collect_finite_member_for_type(
+    db: &DbIndex,
     typ: &LuaType,
     member_id: LuaMemberId,
     file_id: crate::FileId,
@@ -2548,6 +2594,7 @@ fn collect_finite_member_for_type(
 ) {
     let mut visited = rustc_hash::FxHashSet::default();
     collect_finite_member_for_type_inner(
+        db,
         typ,
         member_id,
         file_id,
@@ -2559,6 +2606,7 @@ fn collect_finite_member_for_type(
 }
 
 fn collect_finite_member_for_type_inner(
+    db: &DbIndex,
     typ: &LuaType,
     member_id: LuaMemberId,
     file_id: crate::FileId,
@@ -2580,9 +2628,16 @@ fn collect_finite_member_for_type_inner(
                 has_finite_domain,
             ));
         }
+        // Canonicalized at push, like `collect_for_type`: the mark must land
+        // on the owner readers consult, and the `definition_site_owner` read
+        // belongs to the site's armed scope so a late literal→path binding
+        // re-derives it.
         LuaType::TableConst(table_range) => {
             result.push((
-                DynamicFieldOwner::Table(table_range.clone()),
+                crate::canonical_dynamic_field_owner(
+                    db,
+                    DynamicFieldOwner::Table(table_range.clone()),
+                ),
                 member_id,
                 file_id,
                 range,
@@ -2591,6 +2646,7 @@ fn collect_finite_member_for_type_inner(
         }
         LuaType::Instance(instance) => {
             collect_finite_member_for_type_inner(
+                db,
                 instance.get_base(),
                 member_id,
                 file_id,
@@ -2602,6 +2658,7 @@ fn collect_finite_member_for_type_inner(
         }
         LuaType::TableOf(inner) => {
             collect_finite_member_for_type_inner(
+                db,
                 inner,
                 member_id,
                 file_id,
@@ -2614,6 +2671,7 @@ fn collect_finite_member_for_type_inner(
         LuaType::Union(union_type) => {
             for typ in union_type.types() {
                 collect_finite_member_for_type_inner(
+                    db,
                     typ,
                     member_id,
                     file_id,
@@ -2629,6 +2687,7 @@ fn collect_finite_member_for_type_inner(
         LuaType::MergedTable(merged) => {
             for typ in merged.get_types() {
                 collect_finite_member_for_type_inner(
+                    db,
                     typ,
                     member_id,
                     file_id,

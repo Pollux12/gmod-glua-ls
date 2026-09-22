@@ -1253,10 +1253,34 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
             );
         }
     }
-    for (field_name, files) in dynamic_field_index.iter_all_unattributed_fields() {
-        let mut files = files.iter().map(|f| f.id).collect::<Vec<_>>();
-        files.sort_unstable();
-        dynamic_fields.insert(format!("UNATTRIBUTED {field_name}"), format!("{files:?}"));
+    for (owner, fields) in dynamic_field_index.iter_all_direct_field_definitions() {
+        for (field_name, definitions) in fields {
+            let mut definitions = definitions
+                .iter()
+                .map(|d| format!("{d:?}"))
+                .collect::<Vec<_>>();
+            definitions.sort_unstable();
+            dynamic_fields.insert(
+                format!("DIRECTFIELDDEF {owner:?}|{field_name}"),
+                format!("{definitions:?}"),
+            );
+        }
+    }
+    for (field_name, sites) in dynamic_field_index.iter_all_unattributed_fields() {
+        // Every site keeps its full identity — file id plus the index-key
+        // range's numeric bounds — so same-file sites stay distinct records.
+        let mut sites = sites
+            .iter()
+            .map(|site| {
+                (
+                    site.file_id.id,
+                    u32::from(site.value.start()),
+                    u32::from(site.value.end()),
+                )
+            })
+            .collect::<Vec<_>>();
+        sites.sort_unstable();
+        dynamic_fields.insert(format!("UNATTRIBUTED {field_name}"), format!("{sites:?}"));
     }
     for (owner, member_ids) in dynamic_field_index.iter_all_finite_named_members() {
         let mut member_ids = member_ids

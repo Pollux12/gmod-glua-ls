@@ -5689,6 +5689,122 @@ SWEP.Attachments = {[1] = {header = "Irons", atts = {"md_t1"}}}
         );
     }
 
+    #[gtest]
+    fn settled_dynamic_field_attribution_keeps_sibling_unattributed_record() {
+        // Two `X.shared` writes in one file. `s.shared` can never attribute —
+        // a string has no owner — so collection files an unattributed record
+        // for it. `value.shared` inside the `pairs` loop attributes, and its
+        // site is re-derived in the settled tail once the late
+        // `self.Attachments[2]` element write lands (the same deferral
+        // `settled_dynamic_field_write_fans_out_over_late_element_write`
+        // relies on). The retry's unattributed bookkeeping is keyed by
+        // (name, file), not by site, so re-deriving the attributed site must
+        // not take `s.shared`'s record with it.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![
+            (
+                "lua/weapons/cw_base/shared.lua",
+                r#"
+local s = "x"
+s.shared = 1
+function SWEP:DrawHUD()
+    for _, value in pairs(self.Attachments) do
+        value.shared = "x"
+    end
+end
+"#,
+            ),
+            (
+                "lua/weapons/cw_ak74/shared.lua",
+                r#"
+SWEP.Base = "cw_base"
+SWEP.Attachments = {[1] = {header = "Sight", atts = {"md_kobra"}}}
+"#,
+            ),
+            (
+                "lua/weapons/cw_ar15/shared.lua",
+                r#"
+SWEP.Base = "cw_base"
+SWEP.Attachments = {[1] = {header = "Irons"}}
+function SWEP:adjust()
+    self.Attachments[2] = {header = "Late"}
+end
+"#,
+            ),
+        ]);
+
+        let shared_owners = |ws: &VirtualWorkspace| -> Vec<String> {
+            let mut owners = ws
+                .analysis
+                .compilation
+                .get_db()
+                .get_dynamic_field_index()
+                .iter_all_field_definitions()
+                .flat_map(|(owner, fields)| {
+                    fields
+                        .keys()
+                        .filter(|name| name.as_str() == "shared")
+                        .map(move |_| format!("{owner:?}"))
+                })
+                .collect::<Vec<_>>();
+            owners.sort();
+            owners.dedup();
+            owners
+        };
+        assert_that!(
+            shared_owners(&ws)
+                .iter()
+                .any(|owner| owner.starts_with("Table(")),
+            eq(true),
+            "value.shared must attribute to the iterated element tables, got {:?}",
+            shared_owners(&ws)
+        );
+        assert_that!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_dynamic_field_index()
+                .has_unattributed_field("shared"),
+            eq(true),
+            "s.shared is still written and still ownerless: its unattributed record must survive value.shared's settled attribution"
+        );
+
+        // Removing the unattributed site must drop its record while the
+        // attributed definitions on the element tables survive.
+        ws.def_file(
+            "lua/weapons/cw_base/shared.lua",
+            r#"
+function SWEP:DrawHUD()
+    for _, value in pairs(self.Attachments) do
+        value.shared = "x"
+    end
+end
+"#,
+        );
+        assert_that!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_dynamic_field_index()
+                .has_unattributed_field("shared"),
+            eq(false),
+            "removing s.shared must clean up its unattributed record"
+        );
+        assert_that!(
+            shared_owners(&ws)
+                .iter()
+                .any(|owner| owner.starts_with("Table(")),
+            eq(true),
+            "the attributed shared definitions must survive the edit, got {:?}",
+            shared_owners(&ws)
+        );
+    }
+
     #[test]
     fn settled_parent_closure_refreshes_partially_unsettled_inherited_return() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();

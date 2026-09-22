@@ -109,13 +109,17 @@ pub struct DynamicFieldIndex {
     wildcard_definitions: HashMap<DynamicFieldOwner, Vec<InFiled<TextRange>>>,
     /// file → wildcard assignments contributed by this file.
     wildcard_file_contributions: HashMap<FileId, Vec<(DynamicFieldOwner, TextRange)>>,
-    /// field_name → files containing an `X.field_name = ...` write whose
-    /// receiver could not be resolved to any owner, so the write landed
-    /// nowhere. Names here are known to be assigned *somewhere* at runtime even
-    /// though no table in the index can claim them.
-    unattributed_fields: HashMap<SmolStr, HashSet<FileId>>,
-    /// file → unattributed field names contributed by this file.
-    unattributed_file_contributions: HashMap<FileId, Vec<SmolStr>>,
+    /// field_name → write sites (`file`, index-key `range`) whose
+    /// `X.field_name = ...` receiver could not be resolved to any owner, so
+    /// the write landed nowhere. Names here are known to be assigned
+    /// *somewhere* at runtime even though no table in the index can claim
+    /// them. Keyed by site, not by file: the settled tail attributes each
+    /// site independently, so two same-name sites in one file each own their
+    /// record.
+    unattributed_fields: HashMap<SmolStr, HashSet<InFiled<TextRange>>>,
+    /// file → unattributed (field_name, site range) pairs contributed by this
+    /// file.
+    unattributed_file_contributions: HashMap<FileId, Vec<(SmolStr, TextRange)>>,
     /// Count of dynamic-field definition changes, keyed by owner and field
     /// name (`None` is the wildcard bucket). Field assignments land from the
     /// dynamic-field passes and from member resolution during inference, so
@@ -168,7 +172,8 @@ impl DynamicFieldIndex {
         Self::default()
     }
 
-    /// Returns whether the definition site was new to the index.
+    /// Returns whether the definition site was new to the index — to the
+    /// union of definitions or to this owner's direct set.
     pub fn add_field(
         &mut self,
         owner: DynamicFieldOwner,
@@ -198,10 +203,19 @@ impl DynamicFieldIndex {
             .or_default()
             .entry(field_name.clone())
             .or_default();
-        if !direct_definitions.contains(&definition) {
+        let is_new_direct = !direct_definitions.contains(&definition);
+        if is_new_direct {
             direct_definitions.push(definition);
         }
-        self.add_field_inner(owner, field_name, file_id, range)
+        let is_new_definition =
+            self.add_field_inner(owner.clone(), field_name.clone(), file_id, range);
+        if is_new_direct && !is_new_definition {
+            // The union already held the definition through propagation, so
+            // `add_field_inner` filed nothing — but direct membership is a
+            // novel fact for the slot's readers all the same.
+            self.note_dynamic_write(owner, Some(field_name));
+        }
+        is_new_direct || is_new_definition
     }
 
     pub fn add_propagated_field(
@@ -335,7 +349,16 @@ impl DynamicFieldIndex {
     }
 
     /// Returns whether the unattributed record was new to the index.
-    pub fn add_unattributed_field(&mut self, field_name: SmolStr, file_id: FileId) -> bool {
+    ///
+    /// `range` is the site's index-key range; with `file_id` it names the
+    /// write site, so two same-name sites in one file hold independent
+    /// records.
+    pub fn add_unattributed_field(
+        &mut self,
+        field_name: SmolStr,
+        file_id: FileId,
+        range: TextRange,
+    ) -> bool {
         if op_log::recording() {
             let field_name2 = field_name.clone();
             op_log::push(
@@ -345,8 +368,11 @@ impl DynamicFieldIndex {
                     WriteKey::FileScoped(file_id),
                 ]),
                 move |db| {
-                    db.get_dynamic_field_index_mut()
-                        .add_unattributed_field(field_name2, file_id);
+                    db.get_dynamic_field_index_mut().add_unattributed_field(
+                        field_name2,
+                        file_id,
+                        range,
+                    );
                 },
             );
         }
@@ -354,34 +380,14 @@ impl DynamicFieldIndex {
             .unattributed_fields
             .entry(field_name.clone())
             .or_default()
-            .insert(file_id);
+            .insert(InFiled::new(file_id, range));
         if is_new {
             self.unattributed_file_contributions
                 .entry(file_id)
                 .or_default()
-                .push(field_name);
+                .push((field_name, range));
         }
         is_new
-    }
-
-    /// Takes back an unattributed record once a settled retry has attributed
-    /// the write to a real owner.
-    /// Returns whether a record was actually removed.
-    pub fn remove_unattributed_field(&mut self, field_name: &str, file_id: FileId) -> bool {
-        let mut removed = false;
-        if let Some(files) = self.unattributed_fields.get_mut(field_name) {
-            removed = files.remove(&file_id);
-            if removed && files.is_empty() {
-                self.unattributed_fields.remove(field_name);
-            }
-        }
-        if let Some(names) = self.unattributed_file_contributions.get_mut(&file_id) {
-            names.retain(|name| name != field_name);
-            if names.is_empty() {
-                self.unattributed_file_contributions.remove(&file_id);
-            }
-        }
-        removed
     }
 
     /// Replaces one write site's contribution set with a re-derived one.
@@ -391,7 +397,16 @@ impl DynamicFieldIndex {
     /// direction: definitions the retry no longer produces are withdrawn,
     /// ones it now produces are added, and unchanged ones keep their version
     /// — re-filing an identical definition must not stale the readers that
-    /// already saw it.
+    /// already saw it. Direct membership is reconciled against `direct`
+    /// alone, independently of the direct∪propagated union, so a definition
+    /// that stays filed but changes tier (a prefix that resolved to a
+    /// subtype at collection and to its super at settle, or back) is moved
+    /// between the direct and propagated sets rather than left stale.
+    ///
+    /// `unattributed` is the site's exact current unattributed name set:
+    /// names the site filed a record for that are absent from it are
+    /// retracted (whether the name attributed this round or vanished from
+    /// the site's names entirely), and names present are (re-)filed.
     ///
     /// `range` is the site's index-key range; with `file_id` it names exactly
     /// the definitions this site produced, so sibling sites writing the same
@@ -403,6 +418,7 @@ impl DynamicFieldIndex {
         direct: &[(DynamicFieldOwner, SmolStr)],
         propagated: &[(DynamicFieldOwner, SmolStr)],
         wildcards: &[DynamicFieldOwner],
+        unattributed: &[SmolStr],
     ) -> bool {
         let definition = InFiled::new(file_id, range);
         let mut changed = false;
@@ -466,6 +482,43 @@ impl DynamicFieldIndex {
             }
             changed = true;
         }
+        // Direct membership reconciles against `direct` alone, not the
+        // union: a definition that stays filed but is now propagated (or
+        // vice versa) keeps its union slot while its tier changed. The
+        // stale-union pass above already drained the site's contributions
+        // absent from the new union, so the site's remaining
+        // `file_contributions` entries are exactly the union members that
+        // could still hold a direct record.
+        let new_direct: HashSet<(DynamicFieldOwner, SmolStr)> = direct.iter().cloned().collect();
+        let stale_direct: Vec<(DynamicFieldOwner, SmolStr)> = self
+            .file_contributions
+            .get(&file_id)
+            .map(|contributions| {
+                contributions
+                    .iter()
+                    .filter(|(_, _, contribution_range)| *contribution_range == range)
+                    .filter(|(owner, field_name, _)| {
+                        !new_direct.contains(&(owner.clone(), field_name.clone()))
+                            && self
+                                .direct_field_definitions
+                                .get(owner)
+                                .and_then(|fields| fields.get(field_name.as_str()))
+                                .is_some_and(|defs| defs.contains(&definition))
+                    })
+                    .map(|(owner, field_name, _)| (owner.clone(), field_name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (owner, field_name) in stale_direct {
+            remove_field_definition(
+                &mut self.direct_field_definitions,
+                &owner,
+                &field_name,
+                &definition,
+            );
+            self.note_dynamic_write(owner, Some(field_name));
+            changed = true;
+        }
         for (owner, field_name) in direct {
             changed |= self.add_field(owner.clone(), field_name.clone(), file_id, range);
         }
@@ -506,6 +559,43 @@ impl DynamicFieldIndex {
         }
         for owner in wildcards {
             changed |= self.add_wildcard_definition(owner.clone(), file_id, range);
+        }
+        // The site's unattributed records reconcile the same way: names it
+        // filed a record for that are absent from the new set are retracted
+        // (attributed this round, or no longer among the site's names at
+        // all), and names present are (re-)filed. Sibling sites' records
+        // under the same name are untouched — the record is keyed by site.
+        let new_unattributed: HashSet<&SmolStr> = unattributed.iter().collect();
+        let stale_unattributed: Vec<SmolStr> = self
+            .unattributed_file_contributions
+            .get(&file_id)
+            .map(|contributions| {
+                contributions
+                    .iter()
+                    .filter(|(_, site_range)| *site_range == range)
+                    .filter(|(name, _)| !new_unattributed.contains(name))
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for field_name in stale_unattributed {
+            let site = InFiled::new(file_id, range);
+            if let Some(sites) = self.unattributed_fields.get_mut(field_name.as_str()) {
+                sites.remove(&site);
+                if sites.is_empty() {
+                    self.unattributed_fields.remove(field_name.as_str());
+                }
+            }
+            if let Some(names) = self.unattributed_file_contributions.get_mut(&file_id) {
+                names.retain(|(name, site_range)| name != &field_name || *site_range != range);
+                if names.is_empty() {
+                    self.unattributed_file_contributions.remove(&file_id);
+                }
+            }
+            changed = true;
+        }
+        for field_name in unattributed {
+            changed |= self.add_unattributed_field(field_name.clone(), file_id, range);
         }
         changed
     }
@@ -939,10 +1029,25 @@ impl DynamicFieldIndex {
         self.field_definitions.iter()
     }
 
+    /// Every owner's direct field-definition sites, for whole-index
+    /// snapshots. Direct membership is a distinct fact from the union
+    /// `iter_all_field_definitions` reports — a site whose write moved
+    /// between the direct and propagated tiers leaves the union unchanged.
+    pub fn iter_all_direct_field_definitions(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &DynamicFieldOwner,
+            &HashMap<SmolStr, Vec<InFiled<TextRange>>>,
+        ),
+    > {
+        self.direct_field_definitions.iter()
+    }
+
     /// Every unattributed-field record, for whole-index snapshots.
     pub fn iter_all_unattributed_fields(
         &self,
-    ) -> impl Iterator<Item = (&SmolStr, &HashSet<FileId>)> {
+    ) -> impl Iterator<Item = (&SmolStr, &HashSet<InFiled<TextRange>>)> {
         self.unattributed_fields.iter()
     }
 
@@ -1121,11 +1226,12 @@ impl LuaIndex for DynamicFieldIndex {
                 }
             }
 
-            if let Some(field_names) = self.unattributed_file_contributions.remove(&file_id) {
-                for field_name in field_names {
-                    if let Some(files) = self.unattributed_fields.get_mut(&field_name) {
-                        files.remove(&file_id);
-                        if files.is_empty() {
+            if let Some(contributions) = self.unattributed_file_contributions.remove(&file_id) {
+                for (field_name, range) in contributions {
+                    let site = InFiled::new(file_id, range);
+                    if let Some(sites) = self.unattributed_fields.get_mut(&field_name) {
+                        sites.remove(&site);
+                        if sites.is_empty() {
                             self.unattributed_fields.remove(&field_name);
                         }
                     }
@@ -1634,13 +1740,13 @@ mod tests {
                 index.add_field(owner.clone(), field.clone(), removed_file, range(1, 2));
                 index.add_wildcard_definition(owner.clone(), removed_file, range(5, 6));
                 index.add_finite_named_member(owner.clone(), removed_member);
-                index.add_unattributed_field(SmolStr::new("loose"), removed_file);
+                index.add_unattributed_field(SmolStr::new("loose"), removed_file, range(9, 10));
             }
             if files.contains(&remaining_file) {
                 index.add_field(owner.clone(), field.clone(), remaining_file, range(3, 4));
                 index.add_wildcard_definition(owner.clone(), remaining_file, range(7, 8));
                 index.add_finite_named_member(owner.clone(), remaining_member);
-                index.add_unattributed_field(SmolStr::new("loose"), remaining_file);
+                index.add_unattributed_field(SmolStr::new("loose"), remaining_file, range(11, 12));
             }
             index
         }
@@ -1714,6 +1820,7 @@ mod tests {
             &[(owner_b.clone(), SmolStr::new("f"))],
             &[],
             &[],
+            &[],
         );
 
         assert!(changed);
@@ -1744,6 +1851,7 @@ mod tests {
             site_file,
             site_range,
             &[(owner_b.clone(), SmolStr::new("f"))],
+            &[],
             &[],
             &[],
         ));
@@ -1781,6 +1889,7 @@ mod tests {
             &[(owner_direct.clone(), SmolStr::new("f"))],
             &[],
             &[],
+            &[],
         );
 
         assert!(changed);
@@ -1812,6 +1921,7 @@ mod tests {
             &[],
             &[],
             std::slice::from_ref(&owner_b),
+            &[],
         );
 
         assert!(changed);
@@ -1856,5 +1966,174 @@ mod tests {
         // The other member's mark on the same owner is untouched.
         assert!(index.member_has_finite_named_definition(&owner_a, other_member));
         assert!(!index.replace_site_finite_members(member_id, &marked));
+    }
+
+    /// Unattributed records are owned by the write site, not by
+    /// `(field_name, file)`: two same-name sites in one file hold independent
+    /// records, so a settled retry attributing one site withdraws only that
+    /// site's record while the sibling's survives — and removing the file
+    /// drains both.
+    #[test]
+    fn unattributed_records_are_site_owned() {
+        let file_id = FileId::new(1);
+        let site_range = range(1, 2);
+        let sibling_range = range(5, 6);
+
+        let mut index = DynamicFieldIndex::new();
+        index.add_unattributed_field(SmolStr::new("shared"), file_id, site_range);
+        index.add_unattributed_field(SmolStr::new("shared"), file_id, sibling_range);
+        assert!(index.has_unattributed_field("shared"));
+
+        // Attributing one site must not take the sibling's record with it.
+        assert!(index.replace_site_contributions(file_id, site_range, &[], &[], &[], &[],));
+        assert!(index.has_unattributed_field("shared"));
+        assert_eq!(
+            index
+                .unattributed_file_contributions
+                .get(&file_id)
+                .expect("expected the sibling's contribution to survive"),
+            &vec![(SmolStr::new("shared"), sibling_range)]
+        );
+
+        // Removing the file drains the surviving site's record.
+        index.remove(file_id);
+        assert!(!index.has_unattributed_field("shared"));
+        assert!(!index.unattributed_file_contributions.contains_key(&file_id));
+    }
+
+    /// Direct membership is a separate fact from the union of definitions:
+    /// a site whose write moves between the direct and propagated tiers
+    /// keeps its union slot, so reconciling only the union would leave the
+    /// direct set stale in both directions. Each move must also tick the
+    /// slot's version — a `get_direct_fields` reader that saw the old tier
+    /// is stale even though no definition was added or removed.
+    #[test]
+    fn replace_site_contributions_reconciles_direct_membership_independently() {
+        let site_file = FileId::new(1);
+        let owner = DynamicFieldOwner::Type(LuaTypeDeclId::global("OwnerA"));
+        let field = SmolStr::new("f");
+        let site_range = range(1, 2);
+        let sibling_range = range(5, 6);
+        let site_def = InFiled::new(site_file, site_range);
+        let sibling_def = InFiled::new(site_file, sibling_range);
+        let key = (owner.clone(), Some(field.clone()));
+
+        let mut index = DynamicFieldIndex::new();
+        index.add_field(owner.clone(), field.clone(), site_file, site_range);
+        index.add_field(owner.clone(), field.clone(), site_file, sibling_range);
+
+        // direct → propagated: the union is unchanged, but the site's
+        // definition leaves the direct set. The sibling's direct record
+        // survives — it is not this site's to withdraw.
+        let version_before = index.dynamic_write_version(&key);
+        assert!(index.replace_site_contributions(
+            site_file,
+            site_range,
+            &[],
+            &[(owner.clone(), field.clone())],
+            &[],
+            &[],
+        ));
+        assert_eq!(
+            index.field_definitions(&owner, &field),
+            [site_def.clone(), sibling_def.clone()],
+            "the union keeps both definitions"
+        );
+        assert_eq!(
+            index
+                .get_direct_fields(&owner)
+                .and_then(|fields| fields.get(field.as_str()))
+                .map(Vec::as_slice),
+            Some(&[sibling_def.clone()][..]),
+            "the site's definition left the direct set; the sibling's stands"
+        );
+        assert!(
+            index.dynamic_write_version(&key) > version_before,
+            "a tier change is a novel fact for the slot's readers"
+        );
+
+        // propagated → direct: the union is still unchanged, so only the
+        // direct-set fix reports the move.
+        let version_before = index.dynamic_write_version(&key);
+        assert!(index.replace_site_contributions(
+            site_file,
+            site_range,
+            &[(owner.clone(), field.clone())],
+            &[],
+            &[],
+            &[],
+        ));
+        let mut direct = index
+            .get_direct_fields(&owner)
+            .and_then(|fields| fields.get(field.as_str()))
+            .cloned()
+            .unwrap_or_default();
+        direct.sort_by_key(definition_sort_key);
+        assert_eq!(direct, [site_def.clone(), sibling_def.clone()]);
+        assert!(index.dynamic_write_version(&key) > version_before);
+
+        // An identical replacement is a no-op: nothing moved, nothing ticks.
+        let version_before = index.dynamic_write_version(&key);
+        assert!(!index.replace_site_contributions(
+            site_file,
+            site_range,
+            &[(owner.clone(), field.clone())],
+            &[],
+            &[],
+            &[],
+        ));
+        assert_eq!(index.dynamic_write_version(&key), version_before);
+    }
+
+    /// The site's unattributed set is exact: a name the site filed a record
+    /// for that is absent from the re-derived set is retracted — whether it
+    /// attributed this round or vanished from the site's names entirely —
+    /// while a sibling site's record under the same name survives.
+    #[test]
+    fn replace_site_contributions_retracts_absent_unattributed_names() {
+        let site_file = FileId::new(1);
+        let site_range = range(1, 2);
+        let sibling_range = range(5, 6);
+
+        let mut index = DynamicFieldIndex::new();
+        index.add_unattributed_field(SmolStr::new("kept"), site_file, site_range);
+        index.add_unattributed_field(SmolStr::new("gone"), site_file, site_range);
+        index.add_unattributed_field(SmolStr::new("gone"), site_file, sibling_range);
+
+        // The re-derived site still fails to attribute `kept`; `gone` is no
+        // longer among its names at all.
+        assert!(index.replace_site_contributions(
+            site_file,
+            site_range,
+            &[],
+            &[],
+            &[],
+            &[SmolStr::new("kept")],
+        ));
+        assert!(index.has_unattributed_field("kept"));
+        assert!(
+            index.has_unattributed_field("gone"),
+            "the sibling site's record survives the site's own retraction"
+        );
+        assert_eq!(
+            index
+                .unattributed_file_contributions
+                .get(&site_file)
+                .expect("expected the site's surviving contribution"),
+            &vec![
+                (SmolStr::new("kept"), site_range),
+                (SmolStr::new("gone"), sibling_range),
+            ]
+        );
+
+        // An identical replacement is a no-op.
+        assert!(!index.replace_site_contributions(
+            site_file,
+            site_range,
+            &[],
+            &[],
+            &[],
+            &[SmolStr::new("kept")],
+        ));
     }
 }
