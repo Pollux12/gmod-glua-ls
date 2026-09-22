@@ -1201,4 +1201,71 @@ mod tests {
         assert!(!index.is_owner_only_member(&member_id));
         assert_eq!(owner_member_ids(&index, &owner), vec![member_id]);
     }
+
+    #[test]
+    fn refiling_under_a_former_owner_does_not_duplicate_history() {
+        let file_id = FileId::new(1);
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("ReturnOwner"));
+        let away = LuaMemberOwner::Type(LuaTypeDeclId::global("AwayOwner"));
+        let key = LuaMemberKey::Name("field".into());
+        let member_id = make_member_id(file_id, 1);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(owner.clone(), make_member(member_id, "field"));
+        // The canonical move path: settle re-homes the member, leaving a
+        // left-behind history entry under the owner it departed.
+        index
+            .set_member_owner(away.clone(), file_id, member_id)
+            .expect("owner reassignment should succeed");
+        index.add_member_to_owner(away.clone(), member_id);
+        // A later pass re-derives the original owner and re-files the member
+        // under the (owner, key) slot its history already lists.
+        index.add_member(owner.clone(), make_member(member_id, "field"));
+
+        assert_eq!(
+            index.get_current_owner_member_ids_for_key_unsorted(&owner, &key),
+            vec![member_id],
+            "a returning member must occupy its owner/key slot once"
+        );
+        assert_eq!(index.owner_key_history_len(&owner, &key), 1);
+        assert_eq!(
+            index
+                .get_current_owner_members_for_key(&owner, &key)
+                .into_iter()
+                .map(|member| member.get_id())
+                .collect::<Vec<_>>(),
+            vec![member_id]
+        );
+        assert_eq!(owner_member_ids(&index, &owner), vec![member_id]);
+    }
+
+    #[test]
+    fn refiling_under_a_former_key_does_not_duplicate_history() {
+        let file_id = FileId::new(1);
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("KeyOwner"));
+        let first_key = LuaMemberKey::ExprType(crate::LuaType::Integer);
+        let second_key = LuaMemberKey::ExprType(crate::LuaType::String);
+        let member_id = make_index_member_id(file_id, 1);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(
+            owner.clone(),
+            make_expr_member(member_id, first_key.clone()),
+        );
+        index.rekey_member(member_id, second_key.clone());
+        // Re-filing under the key the member already occupied must not append
+        // a second history entry to that slot.
+        index.add_member(
+            owner.clone(),
+            make_expr_member(member_id, first_key.clone()),
+        );
+
+        assert_eq!(
+            index.get_current_owner_member_ids_for_key_unsorted(&owner, &first_key),
+            vec![member_id],
+            "a member returning to a former key must occupy the slot once"
+        );
+        assert_eq!(index.owner_key_history_len(&owner, &first_key), 1);
+        assert_eq!(owner_member_ids(&index, &owner), vec![member_id]);
+    }
 }

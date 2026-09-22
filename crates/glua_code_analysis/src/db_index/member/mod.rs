@@ -42,21 +42,6 @@ fn push_owner_key_id_unique(
     true
 }
 
-/// Appends `id` to its slot, which the caller knows does not hold it yet.
-fn push_owner_key_id(
-    target: &mut OwnerKeyMap,
-    owner: LuaMemberOwner,
-    key: LuaMemberKey,
-    id: LuaMemberId,
-) {
-    target
-        .entry(owner)
-        .or_default()
-        .entry(key)
-        .or_default()
-        .push(id);
-}
-
 /// Drops `id` from its slot, and the slot and owner once they are empty.
 fn remove_owner_key_id(
     target: &mut OwnerKeyMap,
@@ -987,7 +972,11 @@ impl LuaMemberIndex {
     }
 
     /// [`add_member_to_owner_key_indexes`](Self::add_member_to_owner_key_indexes)
-    /// for a member the caller knows neither index holds yet.
+    /// for a member whose *current* filing is new. The history index keeps
+    /// entries a later owner move left behind, and an alias filing
+    /// ([`Self::add_member_alias_to_owner`]) lists the id under an owner its
+    /// current owner never names, so either slot can already hold the id when
+    /// the member returns to a former `(owner, key)`: both pushes dedupe.
     fn add_new_member_to_owner_key_indexes(&mut self, owner: LuaMemberOwner, id: LuaMemberId) {
         let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
             return;
@@ -995,13 +984,13 @@ impl LuaMemberIndex {
 
         self.note_owner_move(&owner);
         self.record_owner_key_index_owner(id.file_id, &owner);
-        push_owner_key_id(
+        push_owner_key_id_unique(
             &mut self.member_owner_key_index,
             owner.clone(),
             key.clone(),
             id,
         );
-        push_owner_key_id(&mut self.member_owner_key_history_index, owner, key, id);
+        push_owner_key_id_unique(&mut self.member_owner_key_history_index, owner, key, id);
     }
 
     fn record_owner_key_index_owner(&mut self, file_id: FileId, owner: &LuaMemberOwner) {
