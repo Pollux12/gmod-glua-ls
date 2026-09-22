@@ -109,14 +109,16 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                 }
             }
         }
-        // A read through a multi-declaration global answers from whichever backing
-        // tables the walk had reached; a decl deferred to the unresolve wave never
-        // reaches the settled-global-read recording below, so record it here
-        // before it can branch off. Re-derived once every backing table has landed.
+        // Register global reads before inference can defer them: the first
+        // attempt may fail while a provider is still being settled.
         if reads_multi_decl_global {
             analyzer
                 .context
                 .record_settled_multi_decl_global_read_candidate(decl_id, expr.clone());
+        } else if reads_global_name(analyzer, &expr) {
+            analyzer
+                .context
+                .record_settled_global_read_candidate(decl_id, expr.clone());
         }
         note_vgui_parent_fallback_file(analyzer);
 
@@ -221,16 +223,6 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         )),
                     );
                     continue;
-                }
-
-                // A global's type is the merge of every file that writes it, and
-                // a batch that retains some of those writers while its own are
-                // still empty answers this read from a smaller set than a cold
-                // build sees. Re-derived once they have all landed.
-                if !reads_multi_decl_global && reads_global_name(analyzer, &expr) {
-                    analyzer
-                        .context
-                        .record_settled_global_read_candidate(decl_id, expr.clone());
                 }
 
                 let retry_uninformative = should_retry_uninformative_initializer(&expr, &expr_type);

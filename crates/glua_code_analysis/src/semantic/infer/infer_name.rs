@@ -920,7 +920,7 @@ pub(crate) fn is_authoritative_self_receiver_type(typ: &LuaType) -> bool {
 /// directly as an implicit `self` type. Rejects unconstrained/unknown types so
 /// the caller falls back to the generic `SelfRef` resolution path (preserving
 /// generic `SelfInfer` and declared-parameter behavior).
-fn is_concrete_self_receiver_type(typ: &LuaType) -> bool {
+pub(crate) fn is_concrete_self_receiver_type(typ: &LuaType) -> bool {
     match typ {
         LuaType::Def(_)
         | LuaType::Ref(_)

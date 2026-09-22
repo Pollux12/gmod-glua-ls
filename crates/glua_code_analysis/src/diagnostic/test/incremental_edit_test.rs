@@ -2994,11 +2994,8 @@ end
     /// A ripple-moved inference still refreshes the file that only names it.
     #[gtest]
     fn ripple_moved_inference_refreshes_its_lazy_reader() {
-        // The provider's edit re-analyses the middleman, whose inferred global
-        // follows the provider's value; the middleman's own export diff then
-        // names the consumer that reads it. The consumer sits in neither dirty
-        // set, keeps its reference revision, and still comes back from the
-        // watched batch.
+        // The provider changes the middleman's inferred global. Its actual
+        // readers must then refresh their materialized type caches.
         let mut ws = workspace_with(vec![]);
         let provider_uri = ws.virtual_url_generator.new_uri("lua/chainprovider.lua");
         let provider_id = write(&mut ws, &provider_uri, "Chain = { Value = 1 }\n");
@@ -3016,16 +3013,19 @@ end
         expect_that!(dirty.files(), not(contains(eq(&consumer_id))));
         ws.analysis.ripple(dirty);
 
-        // Watched from clean: the consumer comes back with its revision put.
+        // Exercise the same chain through a watched-file update.
         write(&mut ws, &provider_uri, "Chain = { Value = 1 }\n");
-        let revision_before = revision_of(&ws, consumer_id);
         let affected = ws.analysis.apply_file_system_changes(vec![(
             provider_uri.clone(),
             Some("Chain = { Value = \"text\" }\n".to_string()),
         )]);
         expect_that!(affected, contains(eq(&middle_id)));
         expect_that!(affected, contains(eq(&consumer_id)));
-        expect_that!(revision_of(&ws, consumer_id), eq(revision_before));
+        let got = decl_type(&ws, consumer_id, "got");
+        expect_true!(
+            matches!(&got, LuaType::StringConst(value) if value.as_str() == "text"),
+            "lazy reader kept {got:?} instead of the provider's new string"
+        );
     }
 
     /// A contributed-param change names the callee's owner, not the contributor's.
@@ -3187,16 +3187,8 @@ end
         ws.analysis.ripple(dirty);
     }
 
-    /// A late callee move still refreshes its lazy reader.
-    ///
-    /// The contributor edit reindexes its callee late, after the outer ripple
-    /// already ran, changing a differently named export there (`Out`, not
-    /// `Run`). That reindexes the middleman (`MidLateInferred =
-    /// ParamLateHolder.Out`), whose own diff then names the lazy reader
-    /// (`local got = MidLateInferred`). Both the nested self-index names and
-    /// the nested ripple names bubble into the outer sideband; without that
-    /// the reader keeps a stale report. Diagnostic-only throughout: no extra
-    /// reindex, no revision move for the reader.
+    /// A late callee move propagates through a middleman to its cached reader.
+    /// The affected-file report includes the whole chain and remains unique.
     #[gtest]
     fn contributed_param_late_callee_move_refreshes_lazy_reader() {
         let caller_text = |argument: &str| {
@@ -3265,17 +3257,24 @@ end
         expect_that!(dirty.files(), not(contains(eq(&reader_id))));
         ws.analysis.ripple(dirty);
 
-        // Watched from clean: the callee and the middleman are reindexed, the
-        // lazy reader comes back un-reindexed via the bubbled sideband.
+        // The late callee repair must reach the reader through the middleman.
         write(&mut ws, &caller_uri, &caller_text("self"));
-        let revision_before = revision_of(&ws, reader_id);
         let affected = ws
             .analysis
             .apply_file_system_changes(vec![(caller_uri.clone(), Some(caller_text("OTHER")))]);
         expect_that!(affected, contains(eq(&callee_id)));
         expect_that!(affected, contains(eq(&middle_id)));
         expect_that!(affected, contains(eq(&reader_id)));
-        expect_that!(revision_of(&ws, reader_id), eq(revision_before));
+        // A reader must not retain its earlier receiver type after the
+        // middleman's inference changes.
+        assert_eq!(
+            decl_type(&ws, reader_id, "got"),
+            decl_type(&ws, middle_id, "MidLateInferred")
+        );
+        let observed = decl_type(&ws, reader_id, "got");
+        assert_eq!(observed, decl_type(&ws, caller_id, "OTHER"));
+        ws.analysis.reindex();
+        assert_eq!(observed, decl_type(&ws, reader_id, "got"));
         let mut sorted = affected.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -3735,5 +3734,560 @@ end
             codes_in(&ws, consumer_id),
             not(contains(eq(DiagnosticCode::UndefinedField.get_name())))
         );
+    }
+
+    /// A dependency cycle must revisit the file the edit started from.
+    ///
+    /// `cycle_a` reads `cycle_b`'s inferred return while `cycle_b` reads
+    /// `cycle_a`'s field. Editing `cycle_a` re-analyses it against
+    /// `cycle_b`'s still-current signature, then `cycle_b` re-analyses and
+    /// its signature moves — naming `cycle_a` as a dependent again. A ripple
+    /// that settles each file at most once drops that second visit, so `res`
+    /// keeps the type the pre-edit `cycle_b` reported. A cold workspace over
+    /// the same sources resolves the post-edit type.
+    #[test]
+    fn edit_in_a_cycle_revisits_the_edited_file() {
+        const A_BEFORE: &str = "CycleA = { input = 1 }\nlocal res = CycleB.Compute()";
+        const A_AFTER: &str = "CycleA = { input = \"text\" }\nlocal res = CycleB.Compute()";
+        const B: &str = "CycleB = {}\nfunction CycleB.Compute() return CycleA.input end";
+
+        let mut warm = VirtualWorkspace::new_with_init_std_lib();
+        let a_uri = warm.virtual_url_generator.new_uri("lua/cycle_a.lua");
+        let b_uri = warm.virtual_url_generator.new_uri("lua/cycle_b.lua");
+        warm.analysis.update_files_by_uri_sorted(vec![
+            (a_uri.clone(), Some(A_BEFORE.to_string())),
+            (b_uri.clone(), Some(B.to_string())),
+        ]);
+
+        let a_id = write_deferred(&mut warm, &a_uri, A_AFTER);
+
+        let mut cold = VirtualWorkspace::new_with_init_std_lib();
+        let cold_a_uri = cold.virtual_url_generator.new_uri("lua/cycle_a.lua");
+        let cold_b_uri = cold.virtual_url_generator.new_uri("lua/cycle_b.lua");
+        cold.analysis.update_files_by_uri_sorted(vec![
+            (cold_a_uri.clone(), Some(A_AFTER.to_string())),
+            (cold_b_uri, Some(B.to_string())),
+        ]);
+        let cold_a_id = cold
+            .analysis
+            .get_file_id(&cold_a_uri)
+            .expect("cold a file id");
+
+        let warm_res = decl_type(&warm, a_id, "res");
+        assert!(
+            matches!(
+                &warm_res,
+                LuaType::String | LuaType::StringConst(_) | LuaType::DocStringConst(_)
+            ),
+            "the edited file's own read should follow its reader's new return, got {warm_res:?}"
+        );
+        assert_eq!(warm_res, decl_type(&cold, cold_a_id, "res"));
+    }
+
+    /// A file the batch path has never seen has no dependency edges pointing
+    /// at it, so `expand_reindex_file_ids` cannot name the readers whose
+    /// lookups missed before it existed. The batch has to reach them through
+    /// the new file's exports instead: a reader indexed before its provider
+    /// must be re-analysed when the provider arrives.
+    #[gtest]
+    fn batch_ingested_global_reaches_readers_indexed_before_it() {
+        let mut ws = workspace_with(vec![DiagnosticCode::UndefinedGlobalAssignment]);
+        let reader_uri = ws.virtual_url_generator.new_uri("lua/batch_reader.lua");
+        let reader_id = write(&mut ws, &reader_uri, "local observed = BatchGlobal\n");
+        let before = decl_type(&ws, reader_id, "observed");
+        assert!(
+            before.is_unknown(),
+            "reader should miss the not-yet-ingested global, got {before:?}"
+        );
+        expect_that!(
+            codes_in(&ws, reader_id),
+            contains(eq(DiagnosticCode::UndefinedGlobalAssignment.get_name()))
+        );
+
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/batch_provider.lua");
+        let reindexed = ws.analysis.update_files_by_uri(vec![(
+            provider_uri,
+            Some("BatchGlobal = \"provided\"\n".to_string()),
+        )]);
+        assert!(
+            reindexed.contains(&reader_id),
+            "the missed reader must be reindexed, got {reindexed:?}"
+        );
+
+        let mut cold = workspace_with(vec![DiagnosticCode::UndefinedGlobalAssignment]);
+        let cold_reader_uri = cold.virtual_url_generator.new_uri("lua/batch_reader.lua");
+        let cold_provider_uri = cold.virtual_url_generator.new_uri("lua/batch_provider.lua");
+        cold.analysis.update_files_by_uri(vec![
+            (
+                cold_reader_uri.clone(),
+                Some("local observed = BatchGlobal\n".to_string()),
+            ),
+            (
+                cold_provider_uri,
+                Some("BatchGlobal = \"provided\"\n".to_string()),
+            ),
+        ]);
+        let cold_reader_id = cold
+            .analysis
+            .get_file_id(&cold_reader_uri)
+            .expect("cold reader file id");
+
+        let after = decl_type(&ws, reader_id, "observed");
+        assert!(
+            matches!(&after, LuaType::StringConst(value) if value.as_str() == "provided"),
+            "the new global should reach the earlier reader, got {after:?}"
+        );
+        assert_eq!(after, decl_type(&cold, cold_reader_id, "observed"));
+        expect_that!(
+            codes_in(&ws, reader_id),
+            not(contains(eq(
+                DiagnosticCode::UndefinedGlobalAssignment.get_name()
+            )))
+        );
+    }
+
+    /// A `---@type` name that resolved to nothing is filed under the would-be
+    /// global type id, so the new declaration's readers are found through the
+    /// type-reference index, not the name index.
+    #[gtest]
+    fn batch_ingested_class_reaches_unresolved_doc_type_readers() {
+        let mut ws = workspace_with(vec![DiagnosticCode::TypeNotFound]);
+        let reader_uri = ws.virtual_url_generator.new_uri("lua/batch_doc_reader.lua");
+        let reader_id = write(
+            &mut ws,
+            &reader_uri,
+            "---@type BatchDocType\nlocal observed\nlocal field = observed.value\n",
+        );
+        expect_that!(
+            codes_in(&ws, reader_id),
+            contains(eq(DiagnosticCode::TypeNotFound.get_name()))
+        );
+
+        let provider_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/batch_doc_provider.lua");
+        let reindexed = ws.analysis.update_files_by_uri(vec![(
+            provider_uri,
+            Some("---@class BatchDocType\n---@field value string\n".to_string()),
+        )]);
+        assert!(
+            reindexed.contains(&reader_id),
+            "the unresolved doc-type reader must be reindexed, got {reindexed:?}"
+        );
+
+        let mut cold = workspace_with(vec![DiagnosticCode::TypeNotFound]);
+        let cold_reader_uri = cold
+            .virtual_url_generator
+            .new_uri("lua/batch_doc_reader.lua");
+        let cold_provider_uri = cold
+            .virtual_url_generator
+            .new_uri("lua/batch_doc_provider.lua");
+        cold.analysis.update_files_by_uri(vec![
+            (
+                cold_reader_uri.clone(),
+                Some(
+                    "---@type BatchDocType\nlocal observed\nlocal field = observed.value\n"
+                        .to_string(),
+                ),
+            ),
+            (
+                cold_provider_uri,
+                Some("---@class BatchDocType\n---@field value string\n".to_string()),
+            ),
+        ]);
+        let cold_reader_id = cold
+            .analysis
+            .get_file_id(&cold_reader_uri)
+            .expect("cold reader file id");
+
+        let field = decl_type(&ws, reader_id, "field");
+        assert_eq!(field, decl_type(&cold, cold_reader_id, "field"));
+        assert!(
+            matches!(&field, LuaType::String),
+            "the new class should reach the earlier doc-type reader, got {field:?}"
+        );
+        expect_that!(
+            codes_in(&ws, reader_id),
+            not(contains(eq(DiagnosticCode::TypeNotFound.get_name())))
+        );
+    }
+
+    /// A member that joins an owner another file already failed to read is
+    /// found through the missed-member-reader edges, the same index the
+    /// single-file edit path consults for structural adds.
+    #[gtest]
+    fn batch_ingested_member_reaches_missed_member_readers() {
+        let mut ws = workspace_with(vec![DiagnosticCode::UndefinedField]);
+        ws.def("ns = ns or {}\nns.data = ns.data or {}\n");
+        let reader_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/batch_member_reader.lua");
+        let reader_id = write(
+            &mut ws,
+            &reader_uri,
+            "local options = ns.data.Get(\"options\")\n",
+        );
+        expect_that!(
+            codes_in(&ws, reader_id),
+            contains(eq(DiagnosticCode::UndefinedField.get_name()))
+        );
+
+        let provider_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/batch_member_provider.lua");
+        let reindexed = ws.analysis.update_files_by_uri(vec![(
+            provider_uri,
+            Some("function ns.data.Get(key) return key end\n".to_string()),
+        )]);
+        assert!(
+            reindexed.contains(&reader_id),
+            "the missed member reader must be reindexed, got {reindexed:?}"
+        );
+
+        let options = decl_type(&ws, reader_id, "options");
+        assert!(
+            matches!(&options, LuaType::StringConst(value) if value.as_str() == "options"),
+            "the new member should reach the earlier reader, got {options:?}"
+        );
+        expect_that!(
+            codes_in(&ws, reader_id),
+            not(contains(eq(DiagnosticCode::UndefinedField.get_name())))
+        );
+    }
+
+    /// A `require` that resolved to nothing files an unresolved-path edge
+    /// keyed by the module path, which the batch expansion already consults:
+    /// the reader must be reindexed exactly once, through that edge, not
+    /// through a second scheduling pass.
+    #[gtest]
+    fn batch_ingested_file_resolves_unresolved_require_readers() {
+        let mut ws = workspace_with(vec![]);
+        let reader_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/batch_req_reader.lua");
+        let reader_id = write(&mut ws, &reader_uri, "local inc = require(\"batchmod\")\n");
+
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/batchmod.lua");
+        let reindexed = ws.analysis.update_files_by_uri(vec![(
+            provider_uri,
+            Some("return \"loaded\"\n".to_string()),
+        )]);
+        assert!(
+            reindexed.contains(&reader_id),
+            "the unresolved require reader must be reindexed, got {reindexed:?}"
+        );
+
+        let mut cold = workspace_with(vec![]);
+        let cold_reader_uri = cold
+            .virtual_url_generator
+            .new_uri("lua/autorun/batch_req_reader.lua");
+        let cold_provider_uri = cold.virtual_url_generator.new_uri("lua/batchmod.lua");
+        cold.analysis.update_files_by_uri(vec![
+            (
+                cold_reader_uri.clone(),
+                Some("local inc = require(\"batchmod\")\n".to_string()),
+            ),
+            (cold_provider_uri, Some("return \"loaded\"\n".to_string())),
+        ]);
+        let cold_reader_id = cold
+            .analysis
+            .get_file_id(&cold_reader_uri)
+            .expect("cold reader file id");
+
+        let inc = decl_type(&ws, reader_id, "inc");
+        assert_eq!(inc, decl_type(&cold, cold_reader_id, "inc"));
+        assert!(
+            matches!(&inc, LuaType::StringConst(value) if value.as_str() == "loaded"),
+            "the resolved require should reach the earlier reader, got {inc:?}"
+        );
+    }
+
+    /// The unrelated-file control: a file that never read anything the new
+    /// file provides keeps its index — its reference revision does not move —
+    /// while the missed reader in the same batch does get reindexed.
+    #[gtest]
+    fn batch_ingested_file_leaves_unrelated_files_untouched() {
+        let mut ws = workspace_with(vec![DiagnosticCode::UndefinedGlobalAssignment]);
+        let unrelated_uri = ws.virtual_url_generator.new_uri("lua/batch_unrelated.lua");
+        let unrelated_id = write(
+            &mut ws,
+            &unrelated_uri,
+            "local untouched = 1\nlocal doubled = untouched + untouched\n",
+        );
+        let reader_uri = ws.virtual_url_generator.new_uri("lua/batch_reader.lua");
+        let reader_id = write(&mut ws, &reader_uri, "local observed = BatchGlobal\n");
+        let unrelated_revision = revision_of(&ws, unrelated_id);
+        let unrelated_observed = decl_type(&ws, unrelated_id, "doubled");
+
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/batch_provider.lua");
+        let reindexed = ws.analysis.update_files_by_uri(vec![(
+            provider_uri,
+            Some("BatchGlobal = \"provided\"\n".to_string()),
+        )]);
+
+        assert!(
+            reindexed.contains(&reader_id),
+            "the missed reader must be reindexed, got {reindexed:?}"
+        );
+        assert!(
+            !reindexed.contains(&unrelated_id),
+            "an unrelated file must not be reindexed, got {reindexed:?}"
+        );
+        assert_eq!(
+            revision_of(&ws, unrelated_id),
+            unrelated_revision,
+            "an unrelated file's references must not be rewritten"
+        );
+        assert_eq!(decl_type(&ws, unrelated_id, "doubled"), unrelated_observed);
+    }
+
+    /// A batch deletion leaves a tombstone, so re-adding the same URI is an
+    /// appearance, not an edit: the readers that missed while it was gone
+    /// must be reached again.
+    #[gtest]
+    fn batch_deleted_then_readded_file_restores_its_readers() {
+        let mut ws = workspace_with(vec![DiagnosticCode::UndefinedGlobalAssignment]);
+        let provider_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/batch_reopen_provider.lua");
+        write(&mut ws, &provider_uri, "ReopenGlobal = \"first\"\n");
+        let reader_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/batch_reopen_reader.lua");
+        let reader_id = write(&mut ws, &reader_uri, "local observed = ReopenGlobal\n");
+        expect_that!(
+            codes_in(&ws, reader_id),
+            not(contains(eq(
+                DiagnosticCode::UndefinedGlobalAssignment.get_name()
+            )))
+        );
+
+        ws.analysis
+            .update_files_by_uri(vec![(provider_uri.clone(), None)]);
+        expect_that!(
+            codes_in(&ws, reader_id),
+            contains(eq(DiagnosticCode::UndefinedGlobalAssignment.get_name()))
+        );
+
+        let reindexed = ws.analysis.update_files_by_uri(vec![(
+            provider_uri,
+            Some("ReopenGlobal = \"second\"\n".to_string()),
+        )]);
+        assert!(
+            reindexed.contains(&reader_id),
+            "the reader of a re-added file must be reindexed, got {reindexed:?}"
+        );
+        let observed = decl_type(&ws, reader_id, "observed");
+        assert!(
+            matches!(&observed, LuaType::StringConst(value) if value.as_str() == "second"),
+            "the re-added file should reach its reader, got {observed:?}"
+        );
+        expect_that!(
+            codes_in(&ws, reader_id),
+            not(contains(eq(
+                DiagnosticCode::UndefinedGlobalAssignment.get_name()
+            )))
+        );
+    }
+
+    /// A declaration introduced into a file that was already indexed is a
+    /// structural addition too: the readers that missed the name while the
+    /// provider lacked it recorded no edge the expansion can follow.
+    #[gtest]
+    fn batch_edit_introducing_a_declaration_reaches_missed_readers() {
+        let mut ws = workspace_with(vec![DiagnosticCode::UndefinedGlobalAssignment]);
+        let provider_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/batch_edit_provider.lua");
+        write(&mut ws, &provider_uri, "local keep = 1\n");
+        let reader_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/batch_edit_reader.lua");
+        let reader_id = write(&mut ws, &reader_uri, "local observed = LateGlobal\n");
+        expect_that!(
+            codes_in(&ws, reader_id),
+            contains(eq(DiagnosticCode::UndefinedGlobalAssignment.get_name()))
+        );
+
+        let reindexed = ws.analysis.update_files_by_uri(vec![(
+            provider_uri,
+            Some("local keep = 1\nLateGlobal = \"late\"\n".to_string()),
+        )]);
+        assert!(
+            reindexed.contains(&reader_id),
+            "the missed reader must be reindexed, got {reindexed:?}"
+        );
+        let observed = decl_type(&ws, reader_id, "observed");
+        assert!(
+            matches!(&observed, LuaType::StringConst(value) if value.as_str() == "late"),
+            "the introduced declaration should reach its reader, got {observed:?}"
+        );
+        expect_that!(
+            codes_in(&ws, reader_id),
+            not(contains(eq(
+                DiagnosticCode::UndefinedGlobalAssignment.get_name()
+            )))
+        );
+    }
+
+    /// file → the call-site records it currently owns, rendered for an exact
+    /// set comparison. Presence is part of the contract: the index stores an
+    /// entry only while the file holds records, so a file that recollects
+    /// nothing must come back with no entry, not an empty vec.
+    fn call_site_records(
+        ws: &VirtualWorkspace,
+    ) -> (Vec<(FileId, Vec<String>)>, Vec<(FileId, Vec<String>)>) {
+        let index = ws.analysis.compilation.get_db().get_call_site_param_index();
+        let contributions = index
+            .iter_file_contributions()
+            .map(|(file_id, contributions)| {
+                (
+                    *file_id,
+                    contributions
+                        .iter()
+                        .map(|contribution| format!("{contribution:?}"))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let consumers = index
+            .iter_file_return_consumers()
+            .map(|(file_id, consumers)| {
+                (
+                    *file_id,
+                    consumers
+                        .iter()
+                        .map(|consumer| format!("{consumer:?}"))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        (contributions, consumers)
+    }
+
+    /// An edit that is then reverted must restore the call-site index exactly:
+    /// every file's contribution and return-consumer records, including which
+    /// files hold an entry at all. The bystander below owns no records, so its
+    /// presence in the maps is the canary for the removal/recollection
+    /// lifecycle leaving empty entries behind.
+    #[gtest]
+    fn edit_revert_restores_call_site_record_sets() {
+        let mut ws = workspace_with(vec![DiagnosticCode::AssignTypeMismatch]);
+        let provider_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/call_site_provider.lua");
+        let provider_v1 = r#"
+            provider = provider or {}
+            ---@return string
+            ---@return number
+            function provider.Describe() end
+            function provider.Apply(value) end
+        "#;
+        let provider_v2 = r#"
+            provider = provider or {}
+            ---@return number
+            ---@return number
+            function provider.Describe() end
+            function provider.Apply(value) end
+        "#;
+        write(&mut ws, &provider_uri, provider_v1);
+
+        // A reader of the edited export: the provider's return-type change
+        // dirties it, which is what makes the ripple run at all.
+        let consumer_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/call_site_consumer.lua");
+        write(
+            &mut ws,
+            &consumer_uri,
+            r#"
+            local name, count = provider.Describe()
+            provider.Apply("literal")
+            "#,
+        );
+
+        // Owns no call-site records and reads nothing the edit moves, so the
+        // ripple never re-analyses it.
+        let bystander_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/call_site_bystander.lua");
+        write(&mut ws, &bystander_uri, "local untouched = 1\n");
+
+        let before = call_site_records(&ws);
+
+        write(&mut ws, &provider_uri, provider_v2);
+        write(&mut ws, &provider_uri, provider_v1);
+
+        let after = call_site_records(&ws);
+        assert_eq!(
+            after.0, before.0,
+            "call-site contributions differ after an edit-revert"
+        );
+        assert_eq!(
+            after.1, before.1,
+            "call-site return consumers differ after an edit-revert"
+        );
+    }
+
+    /// A same-batch reader of a pre-existing file whose export the batch
+    /// repairs is a downstream dependent of that repair, not a missed reader:
+    /// the consumer indexed `Bridge` while it still resolved to nothing, so
+    /// once the provider lands and the bridge is re-analysed, the consumer's
+    /// cached read is stale even though it arrived in the same batch.
+    #[gtest]
+    fn batch_ingested_provider_repairs_same_batch_consumers_of_a_bridge() {
+        let mut ws = workspace_with(vec![]);
+        let bridge_uri = ws.virtual_url_generator.new_uri("lua/batch_bridge.lua");
+        write(&mut ws, &bridge_uri, "Bridge = LateGlobal\n");
+
+        let provider_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/batch_bridge_provider.lua");
+        let consumer_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/batch_bridge_consumer.lua");
+        ws.analysis.update_files_by_uri(vec![
+            (provider_uri, Some("LateGlobal = \"ready\"\n".to_string())),
+            (
+                consumer_uri.clone(),
+                Some("local observed = Bridge\n".to_string()),
+            ),
+        ]);
+
+        let consumer_id = ws
+            .analysis
+            .get_file_id(&consumer_uri)
+            .expect("consumer file id");
+
+        let mut cold = workspace_with(vec![]);
+        let cold_bridge_uri = cold.virtual_url_generator.new_uri("lua/batch_bridge.lua");
+        let cold_provider_uri = cold
+            .virtual_url_generator
+            .new_uri("lua/batch_bridge_provider.lua");
+        let cold_consumer_uri = cold
+            .virtual_url_generator
+            .new_uri("lua/batch_bridge_consumer.lua");
+        cold.analysis.update_files_by_uri(vec![
+            (cold_bridge_uri, Some("Bridge = LateGlobal\n".to_string())),
+            (
+                cold_provider_uri,
+                Some("LateGlobal = \"ready\"\n".to_string()),
+            ),
+            (
+                cold_consumer_uri.clone(),
+                Some("local observed = Bridge\n".to_string()),
+            ),
+        ]);
+        let cold_consumer_id = cold
+            .analysis
+            .get_file_id(&cold_consumer_uri)
+            .expect("cold consumer file id");
+
+        let observed = decl_type(&ws, consumer_id, "observed");
+        assert!(
+            matches!(&observed, LuaType::StringConst(value) if value.as_str() == "ready"),
+            "the consumer should see the repaired bridge's type, got {observed:?}"
+        );
+        assert_eq!(observed, decl_type(&cold, cold_consumer_id, "observed"));
     }
 }

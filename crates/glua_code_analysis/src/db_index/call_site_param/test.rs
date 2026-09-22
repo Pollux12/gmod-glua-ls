@@ -571,7 +571,6 @@ mod tests {
                 TextSize::from(start),
             )),
             definition: None,
-            needs_result_refresh: false,
         }
     }
 

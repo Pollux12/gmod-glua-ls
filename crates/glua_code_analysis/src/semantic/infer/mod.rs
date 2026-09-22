@@ -33,6 +33,7 @@ pub(crate) use infer_name::infer_authoritative_method_self_type;
 pub(crate) use infer_name::infer_enclosing_self_type;
 use infer_name::infer_name_expr;
 pub(crate) use infer_name::is_authoritative_self_receiver_type;
+pub(crate) use infer_name::is_concrete_self_receiver_type;
 pub(crate) use infer_name::try_local_decl_initializer_fallback_type;
 pub(crate) use infer_name::type_decl_is_vgui_panel;
 pub(crate) use infer_name::{ParamInferenceSource, infer_param_is_weak};

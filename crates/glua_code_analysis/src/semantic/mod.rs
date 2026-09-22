@@ -102,6 +102,7 @@ pub(crate) use infer::infer_enclosing_self_type;
 pub(crate) use infer::infer_expr;
 pub(crate) use infer::infer_param_is_weak;
 pub(crate) use infer::is_authoritative_self_receiver_type;
+pub(crate) use infer::is_concrete_self_receiver_type;
 pub(crate) use infer::remove_false_or_nil;
 pub(crate) use infer::type_decl_is_vgui_panel;
 pub use infer::{SelfRefId, VarRefId, VarRefRootId};

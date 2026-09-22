@@ -641,6 +641,150 @@ fn lexically_normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+/// The name-level facts a batch re-index can add, snapshotted before
+/// `remove_index` so additions are detectable afterwards.
+///
+/// Position-keyed export keys cannot be diffed here — the batch entry points
+/// never take a [`PositionMap`], so an old [`ExportMap`] has no coordinates to
+/// be expressed in. An addition does not need them: it is identifiable by
+/// name alone, and it is the only change whose readers recorded no dependency
+/// edge — a read that missed a slot, a name, or a type cached nothing to
+/// follow. Changed and removed exports already reach their readers through
+/// the edges the earlier index recorded.
+#[derive(Default)]
+struct BatchPreAdditions {
+    /// Member slots this file contributed to, with how many members each
+    /// slot held in total: a slot whose membership moved is an addition or
+    /// removal its missed readers must see.
+    member_slots: FxHashMap<(LuaMemberOwner, LuaMemberKey), usize>,
+    /// Names of the file's non-local declarations.
+    decl_names: FxHashSet<SmolStr>,
+    /// Type declarations this file defined.
+    type_decl_ids: FxHashSet<LuaTypeDeclId>,
+}
+
+fn snapshot_batch_pre_additions(db: &DbIndex, file_id: FileId) -> BatchPreAdditions {
+    let member_index = db.get_member_index();
+    let mut member_slots: FxHashMap<(LuaMemberOwner, LuaMemberKey), usize> = FxHashMap::default();
+    for member in member_index.get_file_members(file_id) {
+        if let Some(owner) = member_index.get_member_owner(&member.get_id()) {
+            member_slots
+                .entry((owner.clone(), member.get_key().clone()))
+                .or_insert_with(|| {
+                    member_index.visible_member_count_for_owner_key(owner, member.get_key())
+                });
+        }
+    }
+    let mut decl_names = FxHashSet::default();
+    if let Some(tree) = db.get_decl_index().get_decl_tree(&file_id) {
+        for decl in tree.get_decls().values() {
+            if !decl.is_local() {
+                decl_names.insert(SmolStr::new(decl.get_name()));
+            }
+        }
+    }
+    let type_decl_ids = db
+        .get_type_index()
+        .get_file_type_decl_ids(file_id)
+        .map(|ids| ids.iter().cloned().collect())
+        .unwrap_or_default();
+    BatchPreAdditions {
+        member_slots,
+        decl_names,
+        type_decl_ids,
+    }
+}
+
+/// The files whose reads of `file_id`'s additions missed before this batch
+/// re-indexed it.
+///
+/// `pre` is `None` for a file that appeared — never seen, or reopened past a
+/// tombstone — where every export is an addition and the full export diff
+/// applies; `Some` for a re-indexed file, where only the name-level delta is
+/// trustworthy without a position map. Three reader classes leave no edge a
+/// dependency expansion could follow:
+/// - missed member slots, through `missed_member_readers`;
+/// - textual name references (a bare global read that found nothing files a
+///   `global_references` entry and nothing else), through
+///   `files_referencing_name`;
+/// - unresolved doc-type names, filed under the would-be global type id,
+///   through `get_type_references`.
+/// Unresolved include/require readers are deliberately absent: the batch
+/// expansion already reaches them through `unresolved_path_dependents`.
+fn batch_addition_readers(
+    db: &DbIndex,
+    file_id: FileId,
+    pre: Option<&BatchPreAdditions>,
+) -> FxHashSet<FileId> {
+    let member_index = db.get_member_index();
+    let reference_index = db.get_reference_index();
+    let mut readers = FxHashSet::default();
+    let mut names = FxHashSet::default();
+
+    for member in member_index.get_file_members(file_id) {
+        let Some(owner) = member_index.get_member_owner(&member.get_id()) else {
+            continue;
+        };
+        let slot = (owner.clone(), member.get_key().clone());
+        let before = pre
+            .and_then(|pre| pre.member_slots.get(&slot))
+            .copied()
+            .unwrap_or(0);
+        let now = member_index.visible_member_count_for_owner_key(owner, member.get_key());
+        if now == before {
+            continue;
+        }
+        readers.extend(member_index.missed_member_readers(owner, member.get_key()));
+        if let LuaMemberKey::Name(name) = member.get_key() {
+            names.insert(name.clone());
+        }
+    }
+
+    if let Some(tree) = db.get_decl_index().get_decl_tree(&file_id) {
+        for decl in tree.get_decls().values() {
+            if decl.is_local() {
+                continue;
+            }
+            let name = SmolStr::new(decl.get_name());
+            if pre.is_none_or(|pre| !pre.decl_names.contains(&name)) {
+                names.insert(name);
+            }
+        }
+    }
+
+    if let Some(type_ids) = db.get_type_index().get_file_type_decl_ids(file_id) {
+        for type_id in type_ids {
+            if pre.is_some_and(|pre| pre.type_decl_ids.contains(type_id)) {
+                continue;
+            }
+            for referenced in reference_index
+                .get_type_references(type_id)
+                .unwrap_or_default()
+            {
+                readers.insert(referenced.file_id);
+            }
+            // A doc name that resolved to nothing was filed under the
+            // would-be global id, which a namespaced declaration does not
+            // carry.
+            let global_id = LuaTypeDeclId::global(type_id.get_simple_name());
+            if global_id != *type_id {
+                for referenced in reference_index
+                    .get_type_references(&global_id)
+                    .unwrap_or_default()
+                {
+                    readers.insert(referenced.file_id);
+                }
+            }
+        }
+    }
+
+    for name in names {
+        readers.extend(reference_index.files_referencing_name(&name));
+    }
+    readers.remove(&file_id);
+    readers
+}
+
 #[derive(Debug)]
 pub struct EmmyLuaAnalysis {
     pub compilation: LuaCompilation,
@@ -687,7 +831,8 @@ pub struct DirtySet {
     ///   as fallback for removed keys (whose index entries are already gone).
     ///   Some of these are deliberately callee-anchored: a
     ///   [`ExportKey::ContributedParam`] resolves its owner in the *callee's*
-    ///   file, which is not in the settled set when the name is emitted.
+    ///   file, which the ripple may not have re-analysed when the name is
+    ///   emitted.
     ///   These names are always legitimate and pass through untouched.
     /// - `decl_rename_refresh_names`: from `decl_rename_refresh_names` in
     ///   [`EmmyLuaAnalysis::self_index_and_diff`] and from the ripple's
@@ -1435,11 +1580,10 @@ impl EmmyLuaAnalysis {
             }
             #[cfg(test)]
             dirty.changed_sources.insert(file_id);
-            // Diagnostic-refresh-only: name the Lua names this diff moved so the
-            // watched-file path can refresh their textual referencers without
-            // reindexing them. Export-channel: callee-anchored (a contributed
-            // param resolves its owner in the callee's file), so these pass
-            // through untouched. Never touches `dirty.files`.
+            // The Lua names this diff moved, for the diagnostic-refresh
+            // sideband. Export-channel: callee-anchored (a contributed param
+            // resolves its owner in the callee's file), so these pass through
+            // untouched.
             {
                 let mut changed = export_diff_changed_names(
                     self.compilation.get_db(),
@@ -1571,7 +1715,9 @@ impl EmmyLuaAnalysis {
     ///
     /// Each round re-analyses a batch and diffs each file's exports against
     /// the map taken just before it, so a file that re-derives the same facts
-    /// adds nothing. A file is re-analysed at most once per ripple.
+    /// adds nothing. Scheduling is the fixed point of that diff: a file is
+    /// re-analysed again whenever a later batch's export diff names it, and
+    /// the ripple ends when no diff names further work.
     ///
     /// Returns every live file whose diagnostics this edit may have moved:
     /// the files re-analysed, propagation included, plus the readers the diff
@@ -1621,8 +1767,6 @@ impl EmmyLuaAnalysis {
             .get_call_site_param_index_mut()
             .forget_removed_files(&dirty.removed);
 
-        let mut settled = dirty.sources.clone();
-        settled.extend(dirty.removed.iter().copied());
         let mut reanalyzed = dirty.sources.iter().copied().collect::<Vec<_>>();
         reanalyzed.sort_unstable();
         let mut pending = std::mem::take(&mut dirty.files);
@@ -1648,7 +1792,6 @@ impl EmmyLuaAnalysis {
         while !pending.is_empty() {
             let mut batch = pending
                 .drain()
-                .filter(|file_id| !settled.contains(file_id))
                 // A file with a stashed text owes its own self-index, which is
                 // the only pass that can re-home the references into it.
                 // Re-indexing it here would drop that stash and strand them.
@@ -1709,7 +1852,6 @@ impl EmmyLuaAnalysis {
             self.compilation.remove_index(batch.clone());
             self.compilation.update_index(batch.clone());
             reanalyzed.extend(batch.iter().copied());
-            settled.extend(batch.iter().copied());
 
             for file_id in &batch {
                 let after = export_map(
@@ -1718,9 +1860,9 @@ impl EmmyLuaAnalysis {
                     &FileRemap::identity(*file_id),
                 );
                 let diff = diff_exports(&before[file_id], &after);
-                // Sideband before the early exit: a rippled file whose own
-                // exports moved names its textual referencers, which hold no
-                // cached edge the change-driven pass could follow.
+                // A rippled file whose own exports moved names them for the
+                // diagnostic-refresh sideband — the same accounting
+                // `self_index_and_diff` applies to an edit's diff.
                 {
                     let mut changed = export_diff_changed_names(
                         self.compilation.get_db(),
@@ -1728,6 +1870,7 @@ impl EmmyLuaAnalysis {
                         &diff,
                         &batch_pres,
                     );
+                    let mut transient = FxHashSet::default();
                     for key in diff.keys() {
                         if let ExportKey::Realm(RealmSubject::Decl(decl_id)) = key {
                             let post_name = self
@@ -1745,20 +1888,21 @@ impl EmmyLuaAnalysis {
                             match (post_name, pre_name) {
                                 (Some(name), None) | (None, Some(name)) => {
                                     if changed.remove(&name) {
-                                        rename_sideband.insert(name);
+                                        transient.insert(name);
                                     }
                                 }
                                 _ => {}
                             }
                         }
                     }
-                    export_sideband.extend(changed);
                     let renamed = decl_rename_refresh_names(
                         self.compilation.get_db(),
                         *file_id,
                         &PositionMap::identity(),
                         batch_pres.get(file_id),
                     );
+                    export_sideband.extend(changed);
+                    rename_sideband.extend(transient);
                     rename_sideband.extend(renamed);
                 }
                 if diff.is_empty() {
@@ -1785,9 +1929,7 @@ impl EmmyLuaAnalysis {
                     .chain(evidence)
                 {
                     touched.insert(dependent);
-                    if !settled.contains(&dependent) {
-                        pending.insert(dependent);
-                    }
+                    pending.insert(dependent);
                 }
             }
         }
@@ -2332,8 +2474,11 @@ impl EmmyLuaAnalysis {
             .collect::<FxHashSet<_>>();
         let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
 
-        // Separate files into: unchanged (skip), to-remove, and to-parse
+        // Separate files into: unchanged (skip), to-remove, and to-parse.
+        // `appeared_uris` tracks the files this batch introduces — never seen,
+        // or reopened past a tombstone — whose exports no recorded edge names.
         let mut to_parse: Vec<(Uri, String)> = Vec::new();
+        let mut appeared_uris = FxHashSet::default();
         {
             let _p = Profile::new("update files: classify");
             for (uri, text) in files {
@@ -2352,8 +2497,19 @@ impl EmmyLuaAnalysis {
                         updated_files.insert(file_id);
                         continue;
                     }
+                    if self
+                        .compilation
+                        .get_db()
+                        .get_vfs()
+                        .get_syntax_tree(&file_id)
+                        .is_none()
+                    {
+                        appeared_uris.insert(uri.clone());
+                    }
                 } else if text.is_none() {
                     continue;
+                } else {
+                    appeared_uris.insert(uri.clone());
                 }
 
                 if let Some(text) = text {
@@ -2427,6 +2583,25 @@ impl EmmyLuaAnalysis {
         let mut removed_files = self.expand_reindex_file_ids(removed_files.into_iter().collect());
         self.add_vgui_forwarding_removal_seed(&removed_source_file_ids, &mut removed_files);
         let guard_fact_file_ids = removed_files.iter().copied().collect::<FxHashSet<_>>();
+        // Name-level additions are the only change whose readers recorded no
+        // edge the expansion could follow; snapshot what each re-indexed file
+        // held before `remove_index` so the settle below can name them.
+        let pre_additions: FxHashMap<FileId, BatchPreAdditions> = removed_files
+            .iter()
+            .filter(|file_id| {
+                self.compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_syntax_tree(file_id)
+                    .is_some()
+            })
+            .map(|file_id| {
+                (
+                    *file_id,
+                    snapshot_batch_pre_additions(self.compilation.get_db(), *file_id),
+                )
+            })
+            .collect();
         self.compilation.remove_index(removed_files.clone());
         updated_files.extend(removed_files.into_iter().filter(|file_id| {
             self.compilation
@@ -2464,7 +2639,80 @@ impl EmmyLuaAnalysis {
             let _p = Profile::new("post: reindex_changed_inferred_param_consumers");
             self.reindex_changed_inferred_param_consumers(&old_guard_facts, &updated_files);
         }
+        {
+            let _p = Profile::new("post: settle_batch_addition_readers");
+            self.settle_batch_addition_readers(&appeared_uris, &pre_additions, &mut updated_files);
+        }
         updated_files
+    }
+
+    /// Re-analyses the readers a batch's additions reached.
+    ///
+    /// The batch expansion follows edges the earlier index recorded; an
+    /// addition has none — a read that missed the slot, name, or type cached
+    /// nothing to point back at it. `appeared_uris` names the files this batch
+    /// introduced (never seen, or reopened past a tombstone): every export of
+    /// theirs is an addition, so the full export diff runs through
+    /// `dependents_of` like `self_index_and_diff` would drive it. For a file
+    /// that was already indexed the name-level delta in `pre_additions` is
+    /// what identifies its additions.
+    ///
+    /// Only files that existed before this batch can hold a stale read: a
+    /// file indexed inside the batch was analysed against the batch's hoisted
+    /// decls, so a reader that is itself in `updated_files` needs nothing.
+    /// The surviving readers are settled through `reindex_files` — the same
+    /// self-index + ripple an edit uses — so their own moved exports
+    /// propagate instead of stopping at one hop. Batch files enter that
+    /// ripple only as actual dependents of a moved seed export or a moved
+    /// name — the dependency chain the repair owes — never by virtue of
+    /// being in the batch.
+    fn settle_batch_addition_readers(
+        &mut self,
+        appeared_uris: &FxHashSet<Uri>,
+        pre_additions: &FxHashMap<FileId, BatchPreAdditions>,
+        updated_files: &mut Vec<FileId>,
+    ) {
+        let db = self.compilation.get_db();
+        let vfs = db.get_vfs();
+        let mut readers = FxHashSet::default();
+        for file_id in updated_files.iter().copied() {
+            let appeared = vfs
+                .get_file_path(&file_id)
+                .and_then(|path| file_path_to_uri(path))
+                .is_some_and(|uri| appeared_uris.contains(&uri));
+            if appeared {
+                // Every export is an addition: the same diff
+                // `self_index_and_diff` produces for a file that was not
+                // there, driven through the shared dependents query.
+                let new = export_map(db, file_id, &FileRemap::identity(file_id));
+                let diff = diff_exports(&ExportMap::default(), &new);
+                readers.extend(dependents_of(db, file_id, &diff));
+                readers.extend(self.evidence_dependents(file_id));
+            }
+            readers.extend(batch_addition_readers(
+                db,
+                file_id,
+                pre_additions.get(&file_id),
+            ));
+        }
+        let batch_set: FxHashSet<FileId> = updated_files.iter().copied().collect();
+        let seeds: Vec<FileId> = readers
+            .into_iter()
+            .filter(|file_id| !batch_set.contains(file_id))
+            .filter(|file_id| vfs.get_syntax_tree(file_id).is_some())
+            .collect();
+        if seeds.is_empty() {
+            return;
+        }
+        if std::env::var_os("GLUALS_PROFILE").is_some() {
+            eprintln!(
+                "[profile] settle_batch_addition_readers: seeds={}",
+                seeds.len()
+            );
+        }
+        updated_files.extend(self.reindex_files(seeds));
+        updated_files.sort_unstable();
+        updated_files.dedup();
     }
 
     #[allow(unused)]
@@ -2495,6 +2743,7 @@ impl EmmyLuaAnalysis {
         let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
         let mut removed_files = FxHashSet::default();
         let mut updated_files = FxHashSet::default();
+        let mut appeared_uris = FxHashSet::default();
         {
             let _p = Profile::new("update files");
             for (uri, text) in files {
@@ -2513,8 +2762,19 @@ impl EmmyLuaAnalysis {
                         updated_files.insert(file_id);
                         continue;
                     }
+                    if self
+                        .compilation
+                        .get_db()
+                        .get_vfs()
+                        .get_syntax_tree(&file_id)
+                        .is_none()
+                    {
+                        appeared_uris.insert(uri.clone());
+                    }
                 } else if text.is_none() {
                     continue;
+                } else {
+                    appeared_uris.insert(uri.clone());
                 }
 
                 let is_new_text = text.is_some();
@@ -2536,6 +2796,22 @@ impl EmmyLuaAnalysis {
         let mut removed_files = self.expand_reindex_file_ids(removed_files.into_iter().collect());
         self.add_vgui_forwarding_removal_seed(&removed_source_file_ids, &mut removed_files);
         let guard_fact_file_ids = removed_files.iter().copied().collect::<FxHashSet<_>>();
+        let pre_additions: FxHashMap<FileId, BatchPreAdditions> = removed_files
+            .iter()
+            .filter(|file_id| {
+                self.compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_syntax_tree(file_id)
+                    .is_some()
+            })
+            .map(|file_id| {
+                (
+                    *file_id,
+                    snapshot_batch_pre_additions(self.compilation.get_db(), *file_id),
+                )
+            })
+            .collect();
         self.compilation.remove_index(removed_files.clone());
         updated_files.extend(removed_files.into_iter().filter(|file_id| {
             self.compilation
@@ -2561,6 +2837,7 @@ impl EmmyLuaAnalysis {
             &old_source_file_ids,
         );
         self.reindex_changed_inferred_param_consumers(&old_guard_facts, &updated_files);
+        self.settle_batch_addition_readers(&appeared_uris, &pre_additions, &mut updated_files);
         updated_files
     }
 

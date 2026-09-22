@@ -20,6 +20,7 @@ use crate::{
     SignatureReturnStatus, TypeOps, VariadicType,
     compilation::analyzer::{
         call_site_params::{
+            argument_type_is_usable, collect_deferred_result_consumers,
             exact_receiver_type_is_usable, infer_supported_call_site_arg_type,
             snapshot_callback_table_type,
         },
@@ -48,8 +49,9 @@ use crate::{
 };
 
 use super::{
-    CallSiteContributionKind, ResolveResult, UnResolveCallSiteContribution, UnResolveDecl,
-    UnResolveIterVar, UnResolveMember, UnResolveModule, UnResolveReturn, UnResolveTableField,
+    CallSiteContributionKind, ResolveResult, UnResolveCallSiteContribution,
+    UnResolveCallSiteReturnConsumers, UnResolveDecl, UnResolveIterVar, UnResolveMember,
+    UnResolveModule, UnResolveReturn, UnResolveTableField,
     resolve_closure::inferred_return_tail_matching_documented_first,
     writes::{ResolveWrites, WriteKey},
 };
@@ -91,7 +93,13 @@ pub fn try_resolve_call_site_contribution(
         CallSiteContributionKind::Argument => {
             let typ =
                 infer_supported_call_site_arg_type(db, cache, contribution.expr_file_id, expr)?;
-            if typ.is_unknown() || typ.is_never() {
+            if !db
+                .get_signature_index()
+                .get(&contribution.signature_id)
+                .is_some_and(|signature| {
+                    argument_type_is_usable(signature, contribution.param_idx, &typ)
+                })
+            {
                 return Err(InferFailReason::None);
             }
             (
@@ -135,6 +143,37 @@ pub fn try_resolve_call_site_contribution(
             contribution.param_idx,
             LuaTypeFact::new(typ, confidence, Arc::from([step])),
         );
+    Ok(())
+}
+
+/// Re-runs the result-consumer collection for a call whose callee signature
+/// was not resolvable when its file was walked, and buffers the consumers on
+/// the index for the next flush.
+///
+/// A still-unresolvable callee stays queued: the record set a warm re-index
+/// would produce is exactly what this retry collects once the signature
+/// resolves, so the item only retires with the collection applied.
+pub fn try_resolve_call_site_return_consumers(
+    db: &mut DbIndex,
+    cache: &mut LuaInferCache,
+    consumers: &mut UnResolveCallSiteReturnConsumers,
+) -> ResolveResult {
+    let Some(call_expr) = db
+        .get_vfs()
+        .get_syntax_tree(&consumers.file_id)
+        .map(|tree| tree.get_red_root())
+        .and_then(|root| consumers.call_syntax_id.to_node_from_root(&root))
+        .and_then(LuaCallExpr::cast)
+    else {
+        return Err(InferFailReason::None);
+    };
+    let Some(collected) =
+        collect_deferred_result_consumers(db, cache, consumers.file_id, &call_expr)
+    else {
+        return Err(InferFailReason::None);
+    };
+    db.get_call_site_param_index_mut()
+        .queue_deferred_return_consumers(consumers.file_id, collected);
     Ok(())
 }
 

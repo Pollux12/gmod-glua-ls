@@ -644,7 +644,7 @@ impl VirtualWorkspace {
     }
 
     pub fn def_files(&mut self, files: Vec<(&str, &str)>) -> Vec<FileId> {
-        let file_infos = files
+        let file_infos: Vec<_> = files
             .iter()
             .map(|(file_name, content)| {
                 let uri = self.virtual_url_generator.new_uri(file_name);
@@ -652,7 +652,15 @@ impl VirtualWorkspace {
             })
             .collect();
 
-        let mut file_ids = self.analysis.update_files_by_uri_sorted(file_infos);
+        let uris = file_infos
+            .iter()
+            .map(|(uri, _)| uri.clone())
+            .collect::<Vec<_>>();
+        self.analysis.update_files_by_uri_sorted(file_infos);
+        let mut file_ids = uris
+            .iter()
+            .map(|uri| self.analysis.get_file_id(uri).expect("defined file id"))
+            .collect::<Vec<_>>();
         file_ids.sort();
 
         file_ids

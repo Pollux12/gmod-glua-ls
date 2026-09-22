@@ -34,8 +34,10 @@ use std::{path::PathBuf, sync::Arc};
 use self::read_set::WriteKey;
 use crate::{Emmyrc, FileId, Vfs, profile::Profile};
 pub use accessor_func::*;
-pub use call_site_param::{CallSiteParamIndex, CallSiteSourceId};
-pub(crate) use call_site_param::{CallSiteReturnConsumer, CallSiteReturnConsumerTarget};
+pub use call_site_param::{
+    CallSiteParamContribution, CallSiteParamIndex, CallSiteReturnConsumer,
+    CallSiteReturnConsumerTarget, CallSiteSourceId,
+};
 pub use declaration::*;
 pub use dependency::{LuaDependencyIndex, LuaDependencyKind, LuaDependencySite};
 pub use diagnostic::{AnalyzeError, DiagnosticAction, DiagnosticActionKind, DiagnosticIndex};

@@ -22,8 +22,8 @@ use super::{
     AnalysisPipeline, AnalyzeContext,
     gmod::{is_vgui_register_table_call, vgui_register_table_type_decl_id},
     unresolve::{
-        CallSiteContributionKind, UnResolve, UnResolveCallSiteContribution, UnResolveDecl,
-        UnResolveMember,
+        CallSiteContributionKind, UnResolve, UnResolveCallSiteContribution,
+        UnResolveCallSiteReturnConsumers, UnResolveDecl, UnResolveMember,
     },
 };
 
@@ -111,7 +111,9 @@ fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext)
             let mut contributions = Vec::new();
             let mut receiver_signatures = Vec::new();
             let mut receiver_consumers = Vec::new();
+            let mut stale_consumers = Vec::new();
             let mut deferred = Vec::new();
+            let mut deferred_consumers = Vec::new();
             let mut exact_receiver_eligibility = HashMap::default();
             let mut authoritative_receiver_signatures = HashMap::default();
             let Some(root) = db
@@ -124,7 +126,9 @@ fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext)
                     contributions,
                     receiver_signatures,
                     receiver_consumers,
+                    stale_consumers,
                     deferred,
+                    deferred_consumers,
                     Default::default(),
                 );
             };
@@ -150,7 +154,9 @@ fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext)
                     &mut contributions,
                     &mut receiver_signatures,
                     &mut receiver_consumers,
+                    &mut stale_consumers,
                     &mut deferred,
+                    &mut deferred_consumers,
                 );
             }
             collect_vgui_named_callback_receiver_types(
@@ -165,20 +171,25 @@ fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext)
                 contributions,
                 receiver_signatures,
                 receiver_consumers,
+                stale_consumers,
                 deferred,
+                deferred_consumers,
                 cache.take_inferred_guard_dependencies(),
             )
         });
     let mut fact_updates = Vec::with_capacity(contribution_updates.len());
     let mut receiver_signatures = Vec::new();
     let mut return_consumer_updates = Vec::new();
+    let mut stale_return_consumers = Vec::new();
     let mut deferred_count = 0;
     for (
         file_id,
         contributions,
         file_receiver_signatures,
         file_consumers,
+        file_stale_consumers,
         file_deferred,
+        file_deferred_consumers,
         dependencies,
     ) in contribution_updates
     {
@@ -186,12 +197,16 @@ fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext)
         fact_updates.push((file_id, contributions));
         receiver_signatures.extend(file_receiver_signatures);
         return_consumer_updates.push((file_id, file_consumers));
+        stale_return_consumers.extend(file_stale_consumers);
         // Queued under `None` like the other call-site requeues: the first
         // attempt re-runs the inference, and a still-unbuildable one is retained
         // under whatever dependency it actually names.
-        deferred_count += file_deferred.len();
+        deferred_count += file_deferred.len() + file_deferred_consumers.len();
         for contribution in file_deferred {
             context.add_unresolve(contribution.into(), InferFailReason::None);
+        }
+        for consumers in file_deferred_consumers {
+            context.add_unresolve(consumers.into(), InferFailReason::None);
         }
     }
     // Guarantees a later unresolve wave exists to retry them even when the
@@ -230,12 +245,6 @@ fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext)
     });
     receiver_signatures.dedup();
     let receiver_signatures = receiver_signatures.into_iter().collect::<HashSet<_>>();
-    let stale_return_consumers = return_consumer_updates
-        .iter()
-        .flat_map(|(_, consumers)| consumers)
-        .filter(|consumer| consumer.needs_result_refresh)
-        .cloned()
-        .collect::<Vec<_>>();
     // Existing consumers are the indexed dependents of producer files in this
     // reindex batch. File ownership stays stable when edits shift a signature's
     // syntax position; a clean workspace build has no previous entries.
@@ -293,7 +302,8 @@ fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext)
 
 fn call_result_consumer_needs_refresh(
     db: &DbIndex,
-    consumer: &CallSiteReturnConsumer,
+    ret_idx: usize,
+    target: &CallSiteReturnConsumerTarget,
     return_type: &LuaType,
 ) -> bool {
     // The first result is read the same way as any later one: a single-valued
@@ -302,19 +312,19 @@ fn call_result_consumer_needs_refresh(
     // result the walk had already answered from a narrower type, while a warm
     // re-index reached it through the consumers its index had retained.
     let expected = match return_type {
-        LuaType::Variadic(variadic) => match variadic.get_type(consumer.ret_idx) {
+        LuaType::Variadic(variadic) => match variadic.get_type(ret_idx) {
             Some(expected) => expected,
             None => return false,
         },
-        return_type if consumer.ret_idx == 0 => return_type,
+        return_type if ret_idx == 0 => return_type,
         _ => return false,
     };
     if expected.is_any() || expected.is_unknown() || expected.is_nil() || expected.is_never() {
         return false;
     }
-    let owner = match consumer.target {
-        CallSiteReturnConsumerTarget::Decl(decl_id) => LuaTypeOwner::Decl(decl_id),
-        CallSiteReturnConsumerTarget::Member(member_id) => LuaTypeOwner::Member(member_id),
+    let owner = match target {
+        CallSiteReturnConsumerTarget::Decl(decl_id) => LuaTypeOwner::Decl(*decl_id),
+        CallSiteReturnConsumerTarget::Member(member_id) => LuaTypeOwner::Member(*member_id),
     };
     let Some(current) = db.get_type_index().get_type_cache(&owner) else {
         return false;
@@ -327,6 +337,42 @@ fn call_result_consumer_needs_refresh(
     // non-documented disagreement is a stale result cache, including after an
     // incremental producer edit; independent writes have separate definitions.
     current != expected
+}
+
+/// Re-runs the result-consumer collection for a call whose callee signature
+/// was not resolvable when its file was walked.
+///
+/// The signature resolution mirrors the collection-time chain minus the exact
+/// colon receiver (a deferred item only exists when that receiver produced no
+/// signature): the direct/inferred prefix lookup first, then the semantic
+/// declaration of the prefix expression. Collected consumers are buffered on
+/// the index rather than applied, so one flush rebuilds the derived maps.
+pub(crate) fn collect_deferred_result_consumers(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+) -> Option<Vec<CallSiteReturnConsumer>> {
+    let prefix_expr = call_expr.get_prefix_expr()?;
+    let returned_table_cache = ReturnedTableCache::default();
+    let (signature_ids, _) = signature_ids_from_call_prefix(
+        db,
+        cache,
+        file_id,
+        &prefix_expr,
+        call_expr.get_position(),
+        &returned_table_cache,
+    );
+    let consumer_signature = signature_ids
+        .first()
+        .copied()
+        .or_else(|| get_prefix_expr_signature_id(db, cache, call_expr))?;
+    Some(direct_call_result_consumers(
+        db,
+        file_id,
+        call_expr,
+        consumer_signature,
+    ))
 }
 
 fn call_result_consumer_target_is_inferred(
@@ -782,7 +828,9 @@ fn collect_call_site_param_types(
     contributions: &mut Vec<(LuaSignatureId, usize, LuaTypeFact)>,
     receiver_signatures: &mut Vec<LuaSignatureId>,
     receiver_consumers: &mut Vec<CallSiteReturnConsumer>,
+    stale_consumers: &mut Vec<CallSiteReturnConsumer>,
     deferred: &mut Vec<UnResolveCallSiteContribution>,
+    deferred_consumers: &mut Vec<UnResolveCallSiteReturnConsumers>,
 ) -> Option<()> {
     let args = call_expr.get_args_list()?;
     let prefix_expr = call_expr.get_prefix_expr()?;
@@ -808,18 +856,13 @@ fn collect_call_site_param_types(
         .enumerate()
         .filter(|(_, arg)| is_supported_call_site_arg_shape(db, file_id, arg))
         .collect::<Vec<_>>();
-
     let colon_call_arg_shift = usize::from(call_expr.is_colon_call());
-    let first_arg_is_self = useful_args
-        .iter()
-        .any(|(arg_idx, arg)| *arg_idx == 0 && is_self_name_expr(arg));
     let (mut signature_ids, lookup_kind) = signature_ids_from_call_prefix(
         db,
         cache,
         file_id,
         &prefix_expr,
         call_expr.get_position(),
-        first_arg_is_self,
         returned_table_cache,
     );
     if signature_ids.is_empty()
@@ -847,13 +890,38 @@ fn collect_call_site_param_types(
         None
     };
     if let Some(consumer_signature) = consumer_signature {
-        receiver_consumers.extend(direct_call_result_consumers(
-            db,
-            cache,
+        let consumers = direct_call_result_consumers(db, file_id, &call_expr, consumer_signature);
+        // Freshness is judged against the pre-publish index: a target whose
+        // cache disagrees with the call's inferred return queues a refresh
+        // alongside the persistent records, without storing the flag on them.
+        if !consumers.is_empty()
+            && let Ok(return_type) = infer_expr(db, cache, LuaExpr::CallExpr(call_expr.clone()))
+        {
+            stale_consumers.extend(
+                consumers
+                    .iter()
+                    .filter(|consumer| {
+                        call_result_consumer_needs_refresh(
+                            db,
+                            consumer.ret_idx,
+                            &consumer.target,
+                            &return_type,
+                        )
+                    })
+                    .cloned(),
+            );
+        }
+        receiver_consumers.extend(consumers);
+    } else if should_collect_result_consumers {
+        // The call's result targets exist but no callee signature resolves
+        // yet: the prefix is still unsettled. Defer the collection so the
+        // consumer records land once a later wave settles the callee, exactly
+        // as a re-index of this file against the settled index would collect
+        // them.
+        deferred_consumers.push(UnResolveCallSiteReturnConsumers {
             file_id,
-            &call_expr,
-            consumer_signature,
-        ));
+            call_syntax_id: call_expr.get_syntax_id(),
+        });
     }
     for signature_id in signature_ids.iter().copied() {
         if is_call_site_realm_compatible(db, file_id, call_expr.get_position(), signature_id) {
@@ -883,23 +951,24 @@ fn collect_call_site_param_types(
                 .entry(signature_id)
                 .or_insert_with(|| signature_has_authoritative_receiver(db, signature_id));
         for (arg_idx, arg) in &useful_args {
-            let is_implicit_receiver = signature.is_colon_define
-                && !call_expr.is_colon_call()
+            let is_implicit_receiver =
+                signature.is_colon_define && !call_expr.is_colon_call() && *arg_idx == 0;
+            let is_explicit_receiver = !call_expr.is_colon_call()
                 && *arg_idx == 0
-                && is_self_name_expr(arg);
-            let is_exact_include_receiver = lookup_kind
-                == SignatureLookupKind::IncludeReturnedMember
-                && !call_expr.is_colon_call()
-                && *arg_idx == 0
-                && is_self_name_expr(arg)
                 && (signature.is_colon_define
                     || signature
                         .params
                         .first()
                         .is_some_and(|param| param == "self"));
+            let is_exact_include_receiver =
+                lookup_kind == SignatureLookupKind::IncludeReturnedMember && is_explicit_receiver;
             match lookup_kind {
                 SignatureLookupKind::Direct => {}
-                SignatureLookupKind::InferredCallable if !is_self_name_expr(arg) => continue,
+                SignatureLookupKind::InferredCallable
+                    if !is_self_name_expr(arg) && !is_explicit_receiver =>
+                {
+                    continue;
+                }
                 SignatureLookupKind::IncludeReturnedMember if !is_exact_include_receiver => {
                     continue;
                 }
@@ -956,7 +1025,7 @@ fn collect_call_site_param_types(
                 }
                 Err(_) => continue,
             };
-            if arg_type.is_unknown() || arg_type.is_never() {
+            if !argument_type_is_usable(signature, param_idx, &arg_type) {
                 continue;
             }
 
@@ -1194,13 +1263,12 @@ fn call_has_later_result_target(call_expr: &LuaCallExpr) -> bool {
 
 fn direct_call_result_consumers(
     db: &DbIndex,
-    cache: &mut LuaInferCache,
     file_id: FileId,
     call_expr: &LuaCallExpr,
     signature_id: LuaSignatureId,
 ) -> Vec<CallSiteReturnConsumer> {
     let call_range = call_expr.get_range();
-    let mut consumers: Vec<CallSiteReturnConsumer> = if let Some(assign) =
+    let consumers: Vec<CallSiteReturnConsumer> = if let Some(assign) =
         call_expr.ancestors::<LuaAssignStat>().next()
     {
         let (vars, exprs) = assign.get_var_and_expr_list();
@@ -1228,7 +1296,6 @@ fn direct_call_result_consumers(
                         assignment: assign.get_syntax_id(),
                         target_idx: u16::try_from(target_idx).ok()?,
                     }),
-                    needs_result_refresh: false,
                 })
             })
             .collect()
@@ -1262,18 +1329,9 @@ fn direct_call_result_consumers(
                     local_name.get_position(),
                 )),
                 definition: None,
-                needs_result_refresh: false,
             })
             .collect()
     };
-    if consumers.len() > 1
-        && let Ok(return_type) = infer_expr(db, cache, LuaExpr::CallExpr(call_expr.clone()))
-    {
-        for consumer in &mut consumers {
-            consumer.needs_result_refresh =
-                call_result_consumer_needs_refresh(db, consumer, &return_type);
-        }
-    }
     consumers
 }
 
@@ -1674,7 +1732,6 @@ fn signature_ids_from_call_prefix(
     file_id: FileId,
     prefix_expr: &LuaExpr,
     call_position: TextSize,
-    first_arg_is_self: bool,
     returned_table_cache: &ReturnedTableCache,
 ) -> (Vec<LuaSignatureId>, SignatureLookupKind) {
     let direct = match prefix_expr {
@@ -1689,9 +1746,6 @@ fn signature_ids_from_call_prefix(
     };
     if let Some(signature_id) = direct {
         return (vec![signature_id], SignatureLookupKind::Direct);
-    }
-    if !first_arg_is_self {
-        return (Vec::new(), SignatureLookupKind::InferredCallable);
     }
 
     let mut signature_ids = Vec::new();
@@ -2460,6 +2514,22 @@ fn is_call_site_realm_compatible(
     caller_mask.is_compatible_with(candidate_mask)
 }
 
+pub(super) fn argument_type_is_usable(
+    signature: &crate::LuaSignature,
+    param_idx: usize,
+    typ: &LuaType,
+) -> bool {
+    if typ.is_unknown() || typ.is_never() {
+        return false;
+    }
+    let is_receiver = if signature.is_colon_define {
+        param_idx == signature.params.len()
+    } else {
+        param_idx == 0 && signature.params.first().is_some_and(|name| name == "self")
+    };
+    !is_receiver || crate::semantic::is_concrete_self_receiver_type(typ)
+}
+
 /// `Err(InferFailReason::None)` means the argument genuinely contributes
 /// nothing; any other `Err` is a type that is not built yet and can be retried.
 pub(super) fn infer_supported_call_site_arg_type(
@@ -2469,7 +2539,7 @@ pub(super) fn infer_supported_call_site_arg_type(
     arg: LuaExpr,
 ) -> Result<LuaType, InferFailReason> {
     match &arg {
-        LuaExpr::LiteralExpr(_) => infer_expr(db, cache, arg),
+        LuaExpr::LiteralExpr(_) | LuaExpr::TableExpr(_) => infer_expr(db, cache, arg),
         LuaExpr::CallExpr(call_expr) if is_zero_arg_call(call_expr) => infer_expr(db, cache, arg),
         LuaExpr::NameExpr(name_expr) => {
             if name_expr.get_name_text().as_deref() == Some("self") {
@@ -2497,7 +2567,7 @@ pub(super) fn infer_supported_call_site_arg_type(
                 })
                 .and_then(LuaExpr::cast)
                 .filter(|value_expr| match value_expr {
-                    LuaExpr::LiteralExpr(_) => true,
+                    LuaExpr::LiteralExpr(_) | LuaExpr::TableExpr(_) => true,
                     LuaExpr::CallExpr(call_expr) => is_zero_arg_call(call_expr),
                     _ => false,
                 });
@@ -2521,7 +2591,7 @@ pub(super) fn exact_receiver_type_is_usable(typ: &LuaType) -> bool {
 
 fn is_supported_call_site_arg_shape(db: &DbIndex, file_id: FileId, arg: &LuaExpr) -> bool {
     match arg {
-        LuaExpr::LiteralExpr(_) => true,
+        LuaExpr::LiteralExpr(_) | LuaExpr::TableExpr(_) => true,
         LuaExpr::CallExpr(call_expr) => is_zero_arg_call(call_expr),
         LuaExpr::NameExpr(name_expr) => {
             if name_expr.get_name_text().as_deref() == Some("self") {
@@ -2557,7 +2627,7 @@ fn is_supported_call_site_arg_shape(db: &DbIndex, file_id: FileId, arg: &LuaExpr
             else {
                 return false;
             };
-            matches!(value_expr, LuaExpr::LiteralExpr(_))
+            matches!(value_expr, LuaExpr::LiteralExpr(_) | LuaExpr::TableExpr(_))
                 || matches!(&value_expr, LuaExpr::CallExpr(call_expr) if is_zero_arg_call(call_expr))
         }
         _ => false,

@@ -27,8 +27,8 @@ use glua_parser::{
     LuaNameToken, LuaTableExpr, LuaTableField,
 };
 use resolve::{
-    try_resolve_call_site_contribution, try_resolve_decl, try_resolve_iter_var, try_resolve_module,
-    try_resolve_table_field,
+    try_resolve_call_site_contribution, try_resolve_call_site_return_consumers, try_resolve_decl,
+    try_resolve_iter_var, try_resolve_module, try_resolve_table_field,
 };
 use resolve_closure::{try_resolve_call_closure_params, try_resolve_closure_return};
 
@@ -329,15 +329,20 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
                 &mut wave_read_records,
                 log_enabled,
             );
-            // The requeued wave can defer contributions of its own. Applying
-            // them here keeps the queue empty when this pipeline returns, as it
-            // was before the wave existed. Their changed set is deliberately
-            // dropped: acting on it would make the flush re-entrant, and the
-            // returns it would requeue are exactly as stale as they were before
-            // this fix rather than newly wrong.
-            let _ = db
-                .get_call_site_param_index_mut()
-                .flush_deferred_contributions();
+        }
+
+        // Consumers a deferred collection recovered this wave join the index
+        // and queue for the result refresh that runs after this pipeline.
+        let deferred_consumers = db
+            .get_call_site_param_index_mut()
+            .take_deferred_return_consumers();
+        if !deferred_consumers.is_empty() {
+            let materialized = deferred_consumers
+                .into_iter()
+                .filter_map(|consumer| materialize_call_result_consumer(db, consumer))
+                .map(|(_, consumer, definition)| (consumer, definition))
+                .collect();
+            context.queue_call_site_return_consumers(materialized);
         }
 
         for (reason, unresolves) in reason_resolve {
@@ -583,6 +588,7 @@ pub(super) fn settle_floored_fixpoint(
                                 UnResolve::TableField(_) => nc_table_field += 1,
                                 UnResolve::SpecialCall(_) => nc_special_call += 1,
                                 UnResolve::CallSiteContribution(_) => nc_call_site += 1,
+                                UnResolve::CallSiteReturnConsumers(_) => nc_call_site += 1,
                             }
                         }
                     }
@@ -725,6 +731,7 @@ pub(super) fn settle_floored_fixpoint(
                     UnResolve::TableField(_) => table_field += 1,
                     UnResolve::SpecialCall(_) => special_call += 1,
                     UnResolve::CallSiteContribution(_) => call_site += 1,
+                    UnResolve::CallSiteReturnConsumers(_) => call_site += 1,
                 }
             }
             eprintln!(
@@ -816,6 +823,7 @@ fn requeue_flushed_call_site_returns(
     infer_manager.clear_files(&cleared_files);
 
     let mut settled_parent_closures = Vec::new();
+
     let _ = try_resolve(
         db,
         infer_manager,
@@ -832,6 +840,20 @@ fn requeue_flushed_call_site_returns(
         context.add_settled_parent_closure_candidate(candidate);
     }
     materialize_pending_str_tpl_type_decls(db, infer_manager);
+
+    // A deferred consumer collection resolved inside that wave joins the same
+    // queue rather than waiting for a later pipeline that may never run.
+    let deferred_consumers = db
+        .get_call_site_param_index_mut()
+        .take_deferred_return_consumers();
+    if !deferred_consumers.is_empty() {
+        let materialized = deferred_consumers
+            .into_iter()
+            .filter_map(|consumer| materialize_call_result_consumer(db, consumer))
+            .map(|(_, consumer, definition)| (consumer, definition))
+            .collect();
+        context.queue_call_site_return_consumers(materialized);
+    }
 
     // Whatever is still unresolved rejoins the retained set, so it leaves this
     // pipeline through the same path as the main loop's leftovers.
@@ -988,6 +1010,10 @@ fn attempt_resolve(
         UnResolve::CallSiteContribution(contribution) => {
             let cache = infer_manager.get_infer_cache(file_id);
             try_resolve_call_site_contribution(db, cache, contribution)
+        }
+        UnResolve::CallSiteReturnConsumers(consumers) => {
+            let cache = infer_manager.get_infer_cache(file_id);
+            try_resolve_call_site_return_consumers(db, cache, consumers)
         }
     }
 }
@@ -1718,6 +1744,7 @@ fn unresolve_kind_rank(unresolve: &UnResolve) -> u8 {
         UnResolve::TableField(_) => 8,
         UnResolve::SpecialCall(_) => 9,
         UnResolve::CallSiteContribution(_) => 10,
+        UnResolve::CallSiteReturnConsumers(_) => 11,
     }
 }
 
@@ -1739,7 +1766,7 @@ pub(crate) enum UnResolveDiscriminator {
 /// siblings sharing that position, is the same item.
 pub(crate) type UnResolveIdentity = (u8, u32, u32, UnResolveDiscriminator);
 
-fn unresolve_identity(unresolve: &UnResolve) -> UnResolveIdentity {
+pub(crate) fn unresolve_identity(unresolve: &UnResolve) -> UnResolveIdentity {
     let (file_id, position) = unresolve.sort_key_site();
     let discriminator = match unresolve {
         UnResolve::Decl(d) => {
@@ -1748,6 +1775,9 @@ fn unresolve_identity(unresolve: &UnResolve) -> UnResolveIdentity {
         UnResolve::ClosureParams(d) => UnResolveDiscriminator::ParamIdx(d.param_idx),
         UnResolve::ClosureReturn(d) => UnResolveDiscriminator::ParamIdx(d.param_idx),
         UnResolve::CallSiteContribution(d) => UnResolveDiscriminator::ParamIdx(d.param_idx),
+        // Sits at the call's own position, which an argument contribution for
+        // the same call does not share; the kind rank already separates them.
+        UnResolve::CallSiteReturnConsumers(_) => UnResolveDiscriminator::None,
         _ => UnResolveDiscriminator::None,
     };
     (
@@ -1814,6 +1844,10 @@ pub enum UnResolve {
     TableField(Box<UnResolveTableField>),
     SpecialCall(Box<UnResolveSpecialCall>),
     CallSiteContribution(Box<UnResolveCallSiteContribution>),
+    /// A call whose result targets were visible but whose callee signature
+    /// was not resolvable when its file was walked. The retry re-runs the
+    /// result-consumer collection once the callee settles.
+    CallSiteReturnConsumers(Box<UnResolveCallSiteReturnConsumers>),
 }
 
 #[allow(dead_code)]
@@ -1841,6 +1875,7 @@ impl UnResolve {
             // The retry infers in the file the expression lives in, which is the
             // callee's file for callback snapshots.
             UnResolve::CallSiteContribution(contribution) => Some(contribution.expr_file_id),
+            UnResolve::CallSiteReturnConsumers(consumers) => Some(consumers.file_id),
         }
     }
 
@@ -1922,6 +1957,10 @@ impl UnResolve {
             UnResolve::CallSiteContribution(d) => (
                 d.expr_file_id.id,
                 u32::from(d.expr_syntax_id.get_range().start()),
+            ),
+            UnResolve::CallSiteReturnConsumers(d) => (
+                d.file_id.id,
+                u32::from(d.call_syntax_id.get_range().start()),
             ),
         }
     }
@@ -2116,6 +2155,25 @@ pub struct UnResolveCallSiteContribution {
 impl From<UnResolveCallSiteContribution> for UnResolve {
     fn from(contribution: UnResolveCallSiteContribution) -> Self {
         UnResolve::CallSiteContribution(Box::new(contribution))
+    }
+}
+
+/// A call whose result targets were visible but whose callee signature was
+/// not resolvable when its file was walked.
+///
+/// Carries only ids so it can cross the per-file parallel collection boundary
+/// (rowan red nodes are `!Send`); the retry re-materializes the call from
+/// `file_id`'s red root and re-runs exactly the consumer collection the batch
+/// pass skipped.
+#[derive(Debug, Clone)]
+pub struct UnResolveCallSiteReturnConsumers {
+    pub file_id: FileId,
+    pub call_syntax_id: glua_parser::LuaSyntaxId,
+}
+
+impl From<UnResolveCallSiteReturnConsumers> for UnResolve {
+    fn from(consumers: UnResolveCallSiteReturnConsumers) -> Self {
+        UnResolve::CallSiteReturnConsumers(Box::new(consumers))
     }
 }
 

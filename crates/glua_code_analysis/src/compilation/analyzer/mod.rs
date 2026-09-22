@@ -513,13 +513,13 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             .into_iter()
             .collect::<HashMap<_, _>>();
         // The per-candidate records carry the same reads the old file-level
-        // union accumulated — but only for the three passes whose armed scopes
-        // fed it (iter vars and the two initializer rewrites). The other
-        // passes' records track staleness only: letting e.g. a global read's
-        // `type_owners` into the union would draw the file's lazy readers into
-        // the reindex expansion, re-analysing consumers whose answers do not
-        // move. Only three fields of the union are consumed below, so it is
-        // rebuilt here instead of cloned per candidate per round.
+        // union accumulated — but only for the passes whose armed scopes fed
+        // it (iter vars, the two initializer rewrites, and the materialized
+        // global read candidates, whose records retain actual
+        // type-owner/signature dependencies rather than textual aliases). The
+        // other passes' records track staleness only. Only three fields of
+        // the union are consumed below, so it is rebuilt here instead of
+        // cloned per candidate per round.
         let mut settled_read_sets =
             HashMap::<FileId, crate::db_index::read_set::InferenceReadSet>::default();
         for ((pass, candidate), (_, reads)) in &context.settled_candidate_reads {
@@ -530,6 +530,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                     | SettledReadPass::DeclFull
                     | SettledReadPass::Member
                     | SettledReadPass::MemberFull
+                    | SettledReadPass::Global
             ) {
                 continue;
             }
@@ -1409,7 +1410,12 @@ fn rederive_settled_global_reads(
         })
         .collect::<HashMap<_, _>>();
     let generic_initializer_candidates = context.settled_decl_initializer_candidates.clone();
-    context.infer_manager.clear_files_deferred_results(&files);
+    for file_id in &files {
+        context
+            .infer_manager
+            .get_infer_cache(*file_id)
+            .clear_for_unresolve(db);
+    }
 
     // What each candidate's re-derivation actually read, recorded so the next
     // round re-derives only the candidates whose own reads moved.
@@ -1440,6 +1446,15 @@ fn rederive_settled_global_reads(
                 continue;
             }
             let cached = existing.map(|cached| cached.as_type().clone());
+            if let Some(LuaType::Def(type_id)) = &cached
+                && db.get_decl_index().get_decl(&decl_id).is_some_and(|decl| {
+                    gmod::resolve_scoped_authoring_type(db, decl_id.file_id, decl.get_name())
+                        .as_ref()
+                        == Some(type_id)
+                })
+            {
+                continue;
+            }
             let may_improve = initializer_may_improve_after_resolve(&expr);
             let is_initializer = db
                 .get_decl_index()

@@ -43,9 +43,9 @@ use crate::{
 
 use super::{
     CallSiteContributionKind, ResolveResult, UnResolve, UnResolveCallClosureParams,
-    UnResolveCallSiteContribution, UnResolveClosureReturn, UnResolveDecl, UnResolveIterVar,
-    UnResolveMember, UnResolveModule, UnResolveParentAst, UnResolveParentClosureParams,
-    UnResolveReturn, UnResolveSpecialCall, UnResolveTableField,
+    UnResolveCallSiteContribution, UnResolveCallSiteReturnConsumers, UnResolveClosureReturn,
+    UnResolveDecl, UnResolveIterVar, UnResolveMember, UnResolveModule, UnResolveParentAst,
+    UnResolveParentClosureParams, UnResolveReturn, UnResolveSpecialCall, UnResolveTableField,
     resolve::{
         try_resolve_decl, try_resolve_iter_var_updates, try_resolve_member,
         try_resolve_return_point,
@@ -132,6 +132,10 @@ pub(crate) enum ItemDesc {
         signature_id: LuaSignatureId,
         param_idx: usize,
         kind: CallSiteContributionKind,
+    },
+    CallSiteReturnConsumers {
+        file_id: FileId,
+        call_syntax_id: LuaSyntaxId,
     },
 }
 
@@ -239,7 +243,8 @@ impl ItemDesc {
             | ItemDesc::Module { file_id, .. }
             | ItemDesc::TableField { file_id, .. }
             | ItemDesc::SpecialCall { file_id, .. }
-            | ItemDesc::CallSiteContribution { file_id, .. } => *file_id,
+            | ItemDesc::CallSiteContribution { file_id, .. }
+            | ItemDesc::CallSiteReturnConsumers { file_id, .. } => *file_id,
         }
     }
 }
@@ -539,7 +544,8 @@ fn compute_item(
         ItemDesc::Module { .. }
         | ItemDesc::TableField { .. }
         | ItemDesc::SpecialCall { .. }
-        | ItemDesc::CallSiteContribution { .. } => return None,
+        | ItemDesc::CallSiteContribution { .. }
+        | ItemDesc::CallSiteReturnConsumers { .. } => return None,
     };
     Some(outcome)
 }
@@ -610,6 +616,10 @@ pub(crate) fn describe_walk(item: &UnResolve) -> ItemDesc {
             signature_id: contribution.signature_id,
             param_idx: contribution.param_idx,
             kind: contribution.kind,
+        },
+        UnResolve::CallSiteReturnConsumers(consumers) => ItemDesc::CallSiteReturnConsumers {
+            file_id: consumers.file_id,
+            call_syntax_id: consumers.call_syntax_id,
         },
         UnResolve::ClosureParentParams(params) => ItemDesc::ClosureParentParams {
             file_id: params.file_id,
@@ -783,6 +793,13 @@ impl ItemDesc {
                 signature_id: *signature_id,
                 param_idx: *param_idx,
                 kind: *kind,
+            })),
+            ItemDesc::CallSiteReturnConsumers {
+                file_id,
+                call_syntax_id,
+            } => UnResolve::CallSiteReturnConsumers(Box::new(UnResolveCallSiteReturnConsumers {
+                file_id: *file_id,
+                call_syntax_id: *call_syntax_id,
             })),
         };
         Some(item)

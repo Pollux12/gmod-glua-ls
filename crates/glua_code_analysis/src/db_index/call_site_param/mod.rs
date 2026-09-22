@@ -32,29 +32,26 @@ impl CallSiteSourceId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CallSiteReturnConsumer {
+pub struct CallSiteReturnConsumer {
     pub signature_id: LuaSignatureId,
     pub file_id: FileId,
     pub call_syntax_id: glua_parser::LuaSyntaxId,
     pub ret_idx: usize,
     pub target: CallSiteReturnConsumerTarget,
     pub definition: Option<LuaDefinitionId>,
-    /// The actual call result has a proven informative later slot, while this
-    /// target still holds the earlier single-result cache.
-    pub needs_result_refresh: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CallSiteReturnConsumerTarget {
+pub enum CallSiteReturnConsumerTarget {
     Decl(LuaDeclId),
     Member(LuaMemberId),
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CallSiteParamContribution {
-    pub(crate) signature_id: LuaSignatureId,
-    pub(crate) param_idx: usize,
-    pub(crate) param_fact: LuaTypeFact,
+pub struct CallSiteParamContribution {
+    pub signature_id: LuaSignatureId,
+    pub param_idx: usize,
+    pub param_fact: LuaTypeFact,
 }
 
 struct CallSiteParamAccumulator {
@@ -122,12 +119,23 @@ pub struct CallSiteParamIndex {
     /// Flat map for fast check: signature_id -> list of mutated parameter indices.
     mutated_params: HashMap<LuaSignatureId, Vec<usize>>,
     /// file → observed call-site param evidence contributed by calls in that file.
+    ///
+    /// An entry exists only while it holds records: a file whose recollection
+    /// comes back empty retracts the entry instead of parking an empty vec, so
+    /// presence is a function of the file's records rather than of which pass
+    /// touched it last. `forget_removed_files` relies on the same invariant
+    /// when it drops entries its own pruning emptied.
     file_contributions: HashMap<FileId, Vec<CallSiteParamContribution>>,
     /// Contributions recovered by deferred resolution after this file's batch
     /// collection already ran. Buffered rather than applied directly because
     /// every apply rebuilds the whole derived state; see
     /// `flush_deferred_contributions`.
     deferred_contributions: Vec<(FileId, CallSiteParamContribution)>,
+    /// Return consumers recovered by deferred resolution after this file's
+    /// batch collection already ran. Buffered like `deferred_contributions`:
+    /// applying them rebuilds the derived consumer maps, so they merge at the
+    /// flush points rather than per item.
+    deferred_return_consumers: Vec<CallSiteReturnConsumer>,
     /// Count of call-site-inferred parameter changes, keyed by the callee
     /// slot that holds them. Contributions are queued by the unresolve items
     /// but applied wholesale by the flush/rebuild paths, so without this
@@ -149,6 +157,8 @@ pub struct CallSiteParamIndex {
     /// contributors, so the file-level view is a lookup rather than a scan.
     contributor_signatures_by_file: HashMap<FileId, HashSet<LuaSignatureId>>,
     pending_previous_params: HashMap<(LuaSignatureId, usize), LuaTypeFact>,
+    /// file → return consumers its calls recorded. Same presence invariant as
+    /// `file_contributions`: no empty entries.
     file_return_consumers: HashMap<FileId, Vec<CallSiteReturnConsumer>>,
     return_consumers: HashMap<LuaSignatureId, Vec<CallSiteReturnConsumer>>,
     return_consumers_by_signature_file: HashMap<FileId, Vec<CallSiteReturnConsumer>>,
@@ -207,6 +217,11 @@ impl CallSiteParamIndex {
             .flatten()
         {
             ids.insert(consumer.signature_id);
+        }
+        for consumer in &self.deferred_return_consumers {
+            if consumer.signature_id.get_file_id() == file_id {
+                ids.insert(consumer.signature_id);
+            }
         }
         for (_, contribution) in &self.deferred_contributions {
             if contribution.signature_id.get_file_id() == file_id {
@@ -276,10 +291,21 @@ impl CallSiteParamIndex {
                     dirty.insert(*contributor);
                 }
             }
+            // A contributor left with nothing keeps no entry: the maps carry
+            // records or no key at all, never an empty vec.
+            self.file_contributions
+                .retain(|_, contributions| !contributions.is_empty());
             self.deferred_contributions.retain(|(contributor, c)| {
                 let keep = !lost.contains(&c.signature_id);
                 if !keep {
                     dirty.insert(*contributor);
+                }
+                keep
+            });
+            self.deferred_return_consumers.retain(|consumer| {
+                let keep = !lost.contains(&consumer.signature_id);
+                if !keep {
+                    dirty.insert(consumer.file_id);
                 }
                 keep
             });
@@ -290,6 +316,8 @@ impl CallSiteParamIndex {
                     dirty.insert(*consumer_file);
                 }
             }
+            self.file_return_consumers
+                .retain(|_, consumers| !consumers.is_empty());
             self.pending_previous_params
                 .retain(|(signature_id, _), _| !lost.contains(signature_id));
         }
@@ -389,6 +417,11 @@ impl CallSiteParamIndex {
                 if let Some(new_id) = moved.get(&consumer.signature_id) {
                     consumer.signature_id = *new_id;
                 }
+            }
+        }
+        for consumer in &mut self.deferred_return_consumers {
+            if let Some(new_id) = moved.get(&consumer.signature_id) {
+                consumer.signature_id = *new_id;
             }
         }
         let contributors = std::mem::take(&mut self.contributor_files_by_signature);
@@ -510,6 +543,13 @@ impl CallSiteParamIndex {
         let previous = self.snapshot_param_facts(affected_params, parked);
 
         for (file_id, contributions) in updates {
+            // An emptied recollection retracts the entry outright; storing an
+            // empty vec would leave presence dependent on whether the file was
+            // re-analysed after the last `forget_removed_files` sweep.
+            if contributions.is_empty() {
+                self.file_contributions.remove(&file_id);
+                continue;
+            }
             self.file_contributions.insert(
                 file_id,
                 contributions
@@ -687,6 +727,65 @@ impl CallSiteParamIndex {
         self.changed_signatures(previous)
     }
 
+    /// Queue return consumers recovered by deferred resolution for `file_id`.
+    ///
+    /// A consumer identical to one the file already recorded is a re-settled
+    /// duplicate and is skipped, matching `queue_deferred_contribution`.
+    pub(crate) fn queue_deferred_return_consumers(
+        &mut self,
+        file_id: FileId,
+        consumers: Vec<CallSiteReturnConsumer>,
+    ) {
+        for consumer in consumers {
+            let duplicate = self
+                .deferred_return_consumers
+                .iter()
+                .chain(
+                    self.file_return_consumers
+                        .get(&file_id)
+                        .into_iter()
+                        .flatten(),
+                )
+                .any(|existing| *existing == consumer);
+            if !duplicate {
+                self.deferred_return_consumers.push(consumer);
+            }
+        }
+    }
+
+    /// Apply every queued deferred consumer and rebuild the derived maps once.
+    ///
+    /// Returns the drained consumers so the caller can queue their result
+    /// refreshes. The merge keeps each file's list sorted by call position so
+    /// a record collected late serializes identically to one the batch pass
+    /// collected in document order.
+    pub(crate) fn take_deferred_return_consumers(&mut self) -> Vec<CallSiteReturnConsumer> {
+        if self.deferred_return_consumers.is_empty() {
+            return Vec::new();
+        }
+        let queued = std::mem::take(&mut self.deferred_return_consumers);
+        let mut touched: HashSet<FileId> = HashSet::default();
+        for consumer in &queued {
+            touched.insert(consumer.file_id);
+            self.file_return_consumers
+                .entry(consumer.file_id)
+                .or_default()
+                .push(consumer.clone());
+        }
+        for file_id in touched {
+            if let Some(consumers) = self.file_return_consumers.get_mut(&file_id) {
+                consumers.sort_unstable_by_key(|consumer| {
+                    (
+                        consumer.call_syntax_id.get_range().start(),
+                        consumer.ret_idx,
+                    )
+                });
+            }
+        }
+        self.rebuild_return_consumers();
+        queued
+    }
+
     /// The inferred parameter facts of every signature that `file_ids`
     /// supply call-site evidence for.
     pub(crate) fn inferred_params_for_contributor_files(
@@ -723,6 +822,127 @@ impl CallSiteParamIndex {
                     .iter()
                     .map(move |(param_idx, fact)| (signature_id, *param_idx, fact))
             })
+    }
+
+    /// Source function access paths each file declares, with the signature
+    /// they resolve to and the parameter indexes that file mutates.
+    pub fn iter_file_source_signatures(
+        &self,
+    ) -> impl Iterator<Item = (&FileId, &Vec<(String, LuaSignatureId, Vec<usize>)>)> {
+        self.file_source_signatures.iter()
+    }
+
+    /// The source signatures a re-indexed file had before its removal.
+    pub fn iter_previous_source_signatures(
+        &self,
+    ) -> impl Iterator<Item = (&FileId, &Vec<(String, LuaSignatureId)>)> {
+        self.previous_source_signatures.iter()
+    }
+
+    /// Access path → current source function signature candidates.
+    pub fn iter_source_signatures_by_path(
+        &self,
+    ) -> impl Iterator<Item = (&String, &Vec<LuaSignatureId>)> {
+        self.source_signatures_by_path.iter()
+    }
+
+    /// Signature → parameter indexes mutated by its source function.
+    pub fn iter_mutated_params(&self) -> impl Iterator<Item = (&LuaSignatureId, &Vec<usize>)> {
+        self.mutated_params.iter()
+    }
+
+    /// Observed call-site param evidence contributed by calls in each file.
+    pub fn iter_file_contributions(
+        &self,
+    ) -> impl Iterator<Item = (&FileId, &Vec<CallSiteParamContribution>)> {
+        self.file_contributions.iter()
+    }
+
+    /// Files that have supplied call-site evidence for each signature.
+    pub fn iter_contributor_files_by_signature(
+        &self,
+    ) -> impl Iterator<Item = (&LuaSignatureId, &HashSet<FileId>)> {
+        self.contributor_files_by_signature.iter()
+    }
+
+    /// Signatures of each file that have call-site contributors.
+    pub fn iter_contributor_signatures_by_file(
+        &self,
+    ) -> impl Iterator<Item = (&FileId, &HashSet<LuaSignatureId>)> {
+        self.contributor_signatures_by_file.iter()
+    }
+
+    /// Facts parked across a remove/re-add so a re-index can tell which of
+    /// its signatures merely moved.
+    pub fn iter_pending_previous_params(
+        &self,
+    ) -> impl Iterator<Item = (&(LuaSignatureId, usize), &LuaTypeFact)> {
+        self.pending_previous_params.iter()
+    }
+
+    /// Return consumers recorded by each file's calls.
+    pub fn iter_file_return_consumers(
+        &self,
+    ) -> impl Iterator<Item = (&FileId, &Vec<CallSiteReturnConsumer>)> {
+        self.file_return_consumers.iter()
+    }
+
+    /// Return consumers keyed by the signature whose return they read.
+    pub fn iter_return_consumers(
+        &self,
+    ) -> impl Iterator<Item = (&LuaSignatureId, &Vec<CallSiteReturnConsumer>)> {
+        self.return_consumers.iter()
+    }
+
+    /// Return consumers keyed by the file declaring the consumed signature.
+    pub fn iter_return_consumers_by_signature_file(
+        &self,
+    ) -> impl Iterator<Item = (&FileId, &Vec<CallSiteReturnConsumer>)> {
+        self.return_consumers_by_signature_file.iter()
+    }
+
+    /// Files owning callback parameters inferred from concrete structural
+    /// table values.
+    pub fn iter_concrete_structural_callback_files(&self) -> impl Iterator<Item = &FileId> {
+        self.concrete_structural_callback_files.iter()
+    }
+
+    /// Inference diagnostic events filed under each source file.
+    pub fn iter_inference_events_by_file(
+        &self,
+    ) -> impl Iterator<Item = (&FileId, &Vec<LuaInferenceDiagnosticEvent>)> {
+        self.inference_events_by_file.iter()
+    }
+
+    /// Consumer file → producer sources its call-site inference read.
+    pub fn iter_file_source_dependencies(
+        &self,
+    ) -> impl Iterator<Item = (&FileId, &HashSet<CallSiteSourceId>)> {
+        self.file_source_dependencies.iter()
+    }
+
+    /// Producer source → consumer files that read it.
+    pub fn iter_source_dependents(
+        &self,
+    ) -> impl Iterator<Item = (&CallSiteSourceId, &HashSet<FileId>)> {
+        self.source_dependents.iter()
+    }
+
+    /// Producer file → consumer files that read one of its sources.
+    pub fn iter_source_file_dependents(&self) -> impl Iterator<Item = (&FileId, &HashSet<FileId>)> {
+        self.source_file_dependents.iter()
+    }
+
+    /// File → workspace path, for source-path dependency lookups.
+    pub fn iter_source_paths(&self) -> impl Iterator<Item = (&FileId, &PathBuf)> {
+        self.source_paths.iter()
+    }
+
+    /// Workspace path → consumer files depending on the file at that path.
+    pub fn iter_source_path_dependents(
+        &self,
+    ) -> impl Iterator<Item = (&PathBuf, &HashSet<FileId>)> {
+        self.source_path_dependents.iter()
     }
 
     pub fn get_inferred_param(
@@ -764,7 +984,13 @@ impl CallSiteParamIndex {
         updates: Vec<(FileId, Vec<CallSiteReturnConsumer>)>,
     ) {
         for (file_id, consumers) in updates {
-            self.file_return_consumers.insert(file_id, consumers);
+            // Same presence invariant as `file_contributions`: an emptied
+            // recollection retracts the entry rather than storing `[]`.
+            if consumers.is_empty() {
+                self.file_return_consumers.remove(&file_id);
+            } else {
+                self.file_return_consumers.insert(file_id, consumers);
+            }
         }
         self.rebuild_return_consumers();
     }
@@ -983,6 +1209,11 @@ impl CallSiteParamIndex {
                 !file_ids.contains(file_id)
                     && !file_ids.contains(&contribution.signature_id.get_file_id())
             });
+
+        self.deferred_return_consumers.retain(|consumer| {
+            !file_ids.contains(&consumer.file_id)
+                && !file_ids.contains(&consumer.signature_id.get_file_id())
+        });
 
         for (contributor, contributions) in &mut self.file_contributions {
             if !file_ids.contains(contributor) {
