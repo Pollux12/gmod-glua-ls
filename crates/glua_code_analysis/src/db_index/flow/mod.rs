@@ -65,10 +65,22 @@ impl LuaFlowIndex {
         self.file_flow_tree.get(file_id)
     }
 
+    pub fn flow_trees(&self) -> impl Iterator<Item = (&FileId, &FlowTree)> {
+        self.file_flow_tree.iter()
+    }
+
     pub fn get_signature_cast(&self, signature_id: &LuaSignatureId) -> Option<&LuaSignatureCast> {
         self.signature_cast_cache
             .get(&signature_id.get_file_id())?
             .get(signature_id)
+    }
+
+    pub fn signature_casts(
+        &self,
+    ) -> impl Iterator<Item = (&FileId, &LuaSignatureId, &LuaSignatureCast)> {
+        self.signature_cast_cache
+            .iter()
+            .flat_map(|(file_id, casts)| casts.iter().map(move |(id, cast)| (file_id, id, cast)))
     }
 
     pub fn add_signature_cast(
@@ -176,6 +188,13 @@ impl LuaFlowIndex {
             .unwrap_or(0)
     }
 
+    /// Iterates the special-call write sites recorded so far, exposing only
+    /// the `(FileId, TextSize)` keys — never the epoch values — so callers can
+    /// compare write-site sets without observing internal versioning.
+    pub fn special_call_write_sites(&self) -> impl Iterator<Item = &(FileId, TextSize)> {
+        self.special_call_write_versions.keys()
+    }
+
     /// Rewrites the types stored on special-call effects.
     ///
     /// `type_ref` is the callee's declared out-param type, so it can name a
@@ -215,6 +234,22 @@ impl LuaFlowIndex {
             .get(file_id)?
             .get(&position)
             .map(|effects| effects.as_slice())
+    }
+
+    pub fn special_call_effects(
+        &self,
+    ) -> impl Iterator<Item = (&FileId, &TextSize, &LuaSpecialCallEffect)> {
+        self.special_call_effects
+            .iter()
+            .flat_map(|(file_id, effects)| {
+                effects.iter().flat_map(move |(position, entries)| {
+                    entries.iter().map(move |entry| (file_id, position, entry))
+                })
+            })
+    }
+
+    pub fn settled_special_call_facts(&self) -> impl Iterator<Item = &SpecialCallFact> {
+        self.settled_special_call_facts.iter()
     }
 
     /// Whether the file has ANY special-call effect. Used by the flow-walk skip
@@ -259,7 +294,6 @@ impl LuaIndex for LuaFlowIndex {
             }
         }
     }
-
     fn clear(&mut self) {
         self.file_flow_tree.clear();
         self.signature_cast_cache.clear();
@@ -283,7 +317,7 @@ pub struct LuaSpecialCallEffect {
 /// install the same fact build the same key however far apart the pass visits
 /// them, so the second is always recognised as a replay.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum SpecialCallFact {
+pub enum SpecialCallFact {
     /// A `---@param x \`T\`` class synthesized for a call-site argument.
     StrTplDecl {
         site_file: FileId,

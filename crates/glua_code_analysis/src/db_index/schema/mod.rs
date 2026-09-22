@@ -23,6 +23,11 @@ impl JsonSchemaIndex {
         self.schema_files.get(url)
     }
 
+    /// Every schema URL entry and its resolution state.
+    pub fn iter_schema_files(&self) -> impl Iterator<Item = (&Url, &JsonSchemaFile)> {
+        self.schema_files.iter()
+    }
+
     pub fn get_schema_file_mut(&mut self, url: &Url) -> Option<&mut JsonSchemaFile> {
         self.schema_files.get_mut(url)
     }

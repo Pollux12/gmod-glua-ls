@@ -33,4 +33,11 @@ impl StringReference {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// Every indexed string literal and its reference ranges, borrowed.
+    pub fn iter_string_references(&self) -> impl Iterator<Item = (&str, &[TextRange])> {
+        self.string_references
+            .iter()
+            .map(|(string, ranges)| (string.as_str(), ranges.as_slice()))
+    }
 }

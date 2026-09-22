@@ -55,6 +55,18 @@ impl NumericRangePopulationIndex {
         self.by_global.contains_key(table_global)
     }
 
+    pub fn populations_by_file(
+        &self,
+    ) -> impl Iterator<Item = (&FileId, &Vec<TableNumericRangePopulation>)> {
+        self.by_file.iter()
+    }
+
+    pub fn populations_by_global(
+        &self,
+    ) -> impl Iterator<Item = (&String, &Vec<TableNumericRangePopulation>)> {
+        self.by_global.iter()
+    }
+
     pub fn remove(&mut self, file_id: FileId) {
         if let Some(populations) = self.by_file.remove(&file_id) {
             for population in populations {

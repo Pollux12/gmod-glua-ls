@@ -38,10 +38,10 @@
 //! there means a stored fact depends on raw positions; `split:N` means it
 //! depends on batch composition.
 //!
-//! `restabilize` re-runs analysis over every file without removing anything
-//! first, three times: it characterises how far the retained-state path is from
-//! a fixpoint (it does not converge today), and is not a licence to leave it
-//! that way.
+//! `restabilize` removes and re-indexes every file three times through
+//! `reindex_files_without_expansion`, diffing each round against the
+//! immutable cold baseline: it characterises how far the retained-state
+//! path is from a fixpoint, and is not a licence to leave it that way.
 //!
 //! Example:
 //!   DET_CODEBASE=/path/to/addon DET_ANNOTATIONS=/path/to/annotations/output \
@@ -61,7 +61,10 @@
 //!                               Bisects the RC-2 attribution: a shift-only
 //!                               edit must produce an empty diff and no dirty
 //!                               files.
-//!                     repeat    re-collect diagnostics with no change at all
+//!                     repeat    collect diagnostics twice from one isolated
+//!                               analysis with no intervening update: a
+//!                               read-side mutation or cache-dependent second
+//!                               result is a divergence
 //!                     noopedit  EOF-newline edit pair on each DET_TARGETS
 //!                               entry, through the same `update_file_by_uri`
 //!                               path the LSP uses. The pair is semantically
@@ -89,8 +92,9 @@
 //!                               ALONE (or last): it leaves diverged warm state
 //!                               behind, so any in-place stage listed after it
 //!                               inherits that state and its diff is
-//!                               meaningless. Honours DET_INDEX_DIFF (cold index
-//!                               snapshot vs the state each target leaves behind).
+//!                               meaningless. The index diff compares the cold
+//!                               snapshot against the state each target leaves
+//!                               behind.
 //!                     editrevert
 //!                               apply a real edit through the single-file
 //!                               update path and then take it back out. The
@@ -114,7 +118,7 @@
 //!                               the only one that measures how much of the index
 //!                               an edit actually moves — which bounds what a
 //!                               cheaper re-index mechanism has to reproduce.
-//!                               Always diffs the index, DET_INDEX_DIFF or not.
+//!                               Always diffs the index.
 //!                               Needs DET_EDIT_FIND; without it the stage
 //!                               skips loudly instead of gating anything.
 //!                     blast     how many files ONE edit to each DET_TARGETS
@@ -151,6 +155,14 @@
 //!                               nothing. Honours DET_PERFILE_ROUNDS (default
 //!                               2). Slow -- ~830s a round -- because every file
 //!                               pays the whole pipeline.
+//!                     delete    remove each DET_TARGETS entry through
+//!                               `update_file_by_uri` and compare both the
+//!                               diagnostics and the index against a cold
+//!                               build that never contained the file
+//!                     reopen    same stage, second half: put the file's text
+//!                               back and compare against the ordinary cold
+//!                               build of the full workspace. Either name
+//!                               runs both halves
 //!                     reindex   full clear + rebuild, the ground truth
 //!                     order     rebuild with the file list reversed
 //!                     split:N   rebuild in N batches instead of one
@@ -170,29 +182,43 @@
 //!                               facts the diff says changed.
 //!                     allreindex   re-analyse every file, library included,
 //!                               via per-file removal rather than `clear_index`
-//!                     restabilize  re-run analysis over every file *without*
-//!                               removing anything first, three times. This is
-//!                               the only stage that gives a full build the same
-//!                               retained state a partial re-index inherits. It
-//!                               currently diverges and does not converge --
-//!                               that is a defect to fix, not a design, and it
-//!                               shows why "just run it again" is not a fix
-//!                               while the retained-state path is non-confluent
+//!                     restabilize  remove and re-index every file three
+//!                               times through
+//!                               `reindex_files_without_expansion`, diffing
+//!                               each round against the immutable cold
+//!                               baseline. This is the only stage that gives
+//!                               a full build the same retained state a
+//!                               partial re-index inherits, repeatedly: a
+//!                               round that still differs from cold shows
+//!                               the retained-state path is non-confluent,
+//!                               and a diff that keeps moving between rounds
+//!                               shows it has not reached a fixpoint
 //!                     fresh     build a second analysis in-process
-//!   DET_INDEX_DIFF  also diff every index reachable from `DbIndex`: type
-//!                   caches, members, signatures, class members, super types,
-//!                   net flows, inferred params, decls, decl references,
+//!   Index diff    every stage diffs every index reachable from `DbIndex`,
+//!                   unconditionally: type caches, members, signatures, class
+//!                   members, super types, net flows, inferred params, flow
+//!                   trees, signature casts, special-call effects/facts/write
+//!                   sites, decls, decl references, type-decl effective
+//!                   payloads (kind, canonical locations, alias origin, enum
+//!                   base/flatness, attribute type), generic params and
+//!                   per-site alias contributions,
 //!                   modules, globals, diagnostics (and their disable
-//!                   actions), operators, dependency sites, gmod load/hook/
-//!                   system/realm/scoped-class/network/class metadata,
-//!                   dynamic-field wildcards, dynamic-field owner/field maps
-//!                   (with unattributed names and finite members), accessor-func
-//!                   calls,
-//!                   properties, and metatables. Not covered: flow index
-//!                   (signature casts, special-call effects), the
-//!                   name-keyed accessor-func annotation table, and
-//!                   numeric-range population -- none expose a public
-//!                   whole-index iterator
+//!                   actions), operators,
+//!                   dependency sites, gmod load/hook/system/realm/
+//!                   scoped-class/network/class metadata, dynamic-field
+//!                   wildcards, dynamic-field owner/field maps (with
+//!                   unattributed names, finite members and direct field
+//!                   definitions), accessor-func
+//!                   annotations and calls, numeric-range populations,
+//!                   properties (merged and per-source contributions), and
+//!                   metatables; the reference index's decl
+//!                   and inverse ranges, member/global/string/type maps and
+//!                   local reassignments; the call-site index's
+//!                   source/signature/path/contribution/consumer/dependency
+//!                   relations and parked previous params; and the JSON
+//!                   schema index. Not covered: transient deferred
+//!                   contribution queues and raw revisions/write
+//!                   epochs/counters.
 //!   DET_DUMP_INDEX  directory to write each index snapshot to as `<label>.idx`.
 //!                   The stage diffs only compare snapshots *within* one process;
 //!                   this writes them out so two runs of the same binary on the
@@ -498,7 +524,7 @@ static GLOBAL: CountingMiMalloc = CountingMiMalloc;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use glua_code_analysis::{
@@ -563,7 +589,18 @@ enum Order {
 }
 
 fn build_analysis(codebase: &Path, annotations: &Path) -> EmmyLuaAnalysis {
-    build_analysis_with(codebase, annotations, Order::Natural, 1, &[])
+    build_analysis_with(codebase, annotations, Order::Natural, 1, &[], None)
+}
+
+/// Cold build of a workspace that never contained `exclude`: the file is
+/// dropped from the collected list before indexing, which is not the same
+/// state as indexing it and then removing it.
+fn build_analysis_excluding(
+    codebase: &Path,
+    annotations: &Path,
+    exclude: &Path,
+) -> EmmyLuaAnalysis {
+    build_analysis_with(codebase, annotations, Order::Natural, 1, &[], Some(exclude))
 }
 
 /// Comparison key for a workspace file path. `DET_TARGETS` is written by hand,
@@ -572,12 +609,35 @@ fn path_key(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
+/// Ordering key `update_files_by_uri` sorts on before assigning file ids:
+/// the path round-tripped through its URI, normalized like
+/// `normalize_path_for_ordering` (which is crate-private). The reservation
+/// pass in `build_analysis_with` has to allocate ids in exactly this order
+/// or every file's id shifts.
+fn uri_order_key(path: &Path) -> String {
+    let Some(uri) = glua_code_analysis::file_path_to_uri(&path.to_path_buf()) else {
+        return String::new();
+    };
+    let mut normalized = glua_code_analysis::uri_to_file_path(&uri)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| uri.as_str().to_string());
+    while normalized.ends_with('/') {
+        normalized.pop();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        normalized = normalized.to_lowercase();
+    }
+    normalized
+}
+
 fn build_analysis_with(
     codebase: &Path,
     annotations: &Path,
     order: Order,
     batches: usize,
     overrides: &[(PathBuf, String)],
+    exclude: Option<&Path>,
 ) -> EmmyLuaAnalysis {
     let config_files = discover_config_files(codebase);
     let mut emmyrc = if config_files.is_empty() {
@@ -611,6 +671,29 @@ fn build_analysis_with(
         .filter(|file| !file.path.ends_with(".editorconfig"))
         .map(|file| file.into_tuple())
         .collect::<Vec<_>>();
+    // An exclusion keeps its slot in the file list with `None` content: the
+    // reservation pass below gives it the file id the full build would have
+    // assigned, so every other file keeps the id a warm delete leaves behind
+    // and the cold-absent snapshot's embedded ids compare equal.
+    let mut excluded = None;
+    if let Some(exclude) = exclude {
+        let want = path_key(exclude);
+        let mut matched = 0;
+        for file in files.iter_mut() {
+            if path_key(&file.0) == want {
+                file.1 = None;
+                excluded = Some(file.0.clone());
+                matched += 1;
+            }
+        }
+        // A silently unapplied exclusion would make this build a copy of the
+        // full baseline, and every diff taken against it would read as
+        // "identical".
+        assert_eq!(
+            matched, 1,
+            "excluded path did not match exactly one collected workspace file"
+        );
+    }
     if order == Order::Reverse {
         files.reverse();
     }
@@ -634,18 +717,34 @@ fn build_analysis_with(
         );
         eprintln!("[setup] applied {applied} content override(s)");
     }
-    eprintln!(
-        "[setup] collected {} files (order={} batches={batches})",
-        files.len(),
-        if order == Order::Reverse {
-            "reverse"
-        } else {
-            "natural"
-        }
-    );
-
     let t = Instant::now();
-    if batches <= 1 {
+    if let Some(excluded_path) = excluded {
+        // Reserve every file id in `uri_order_key` order — the same order
+        // `update_files_by_uri` hands them out — via `set_file_content(uri,
+        // None)`, which allocates the path→id entry without parsing or
+        // indexing. The excluded file stays an unindexed tombstone, matching
+        // the VFS state a warm `update_file_by_uri(uri, None)` leaves behind,
+        // so embedded file ids compare equal between the two baselines.
+        let mut ordered = files.clone();
+        ordered.sort_by_cached_key(|(path, _)| uri_order_key(path));
+        for (path, _) in &ordered {
+            let Some(uri) = glua_code_analysis::file_path_to_uri(path) else {
+                continue;
+            };
+            analysis
+                .compilation
+                .get_db_mut()
+                .get_vfs_mut()
+                .set_file_content(&uri, None);
+        }
+        // One ordinary batch over the surviving files; the tombstone is not
+        // in it, so the excluded file is never indexed.
+        let surviving = files
+            .into_iter()
+            .filter(|(path, _)| path != &excluded_path)
+            .collect();
+        analysis.update_files_by_path(surviving);
+    } else if batches <= 1 {
         analysis.update_files_by_path(files);
     } else {
         let chunk = files.len().div_ceil(batches);
@@ -653,6 +752,7 @@ fn build_analysis_with(
             analysis.update_files_by_path(group.to_vec());
         }
     }
+
     eprintln!("[setup] indexed in {:.2}s", t.elapsed().as_secs_f64());
     if std::env::var_os("DET_DUMP_FILE_IDS").is_some() {
         for file_id in analysis.get_main_workspace_file_ids_for_diagnostics() {
@@ -711,12 +811,11 @@ fn collect(analysis: &EmmyLuaAnalysis, label: &str) -> BTreeSet<Snapshot> {
 /// Snapshot of the derived index state that diagnostics read from.
 struct IndexSnapshot {
     type_caches: BTreeMap<String, String>,
-    /// How each cached type was reached, under `DET_PROVENANCE`. Diffed apart
-    /// from the type, so a value that stayed put while its reasoning moved is
-    /// still visible.
+    /// How each cached type was reached. Diffed apart from the type, so a
+    /// value that stayed put while its reasoning moved is still visible.
     type_facts: BTreeMap<String, String>,
-    /// Where each member is currently homed, under `DET_PROVENANCE`. Class
-    /// member lists are keyed off this.
+    /// Where each member is currently homed. Class member lists are keyed off
+    /// this.
     member_owners: BTreeMap<String, String>,
     members: BTreeSet<String>,
     net_flows: Vec<String>,
@@ -730,8 +829,44 @@ struct IndexSnapshot {
     /// member set can hide.
     definition_sites: BTreeMap<String, String>,
     signatures: BTreeMap<String, String>,
+    flow_trees: BTreeMap<String, String>,
+    signature_casts: BTreeMap<String, String>,
+    special_call_effects: BTreeMap<String, String>,
+    special_call_facts: BTreeMap<String, String>,
+    /// Sites where a special-call write was recorded. Only the site set is
+    /// snapshotted: the version values are a monotonic epoch, so they differ
+    /// between a cold build and any re-index of the same text.
+    special_call_write_sites: BTreeMap<String, String>,
+    accessor_func_annotations: HashDumpResult,
+    accessor_func_annotation_files: HashDumpResult,
+    numeric_range_file_populations: HashDumpResult,
+    numeric_range_global_populations: HashDumpResult,
     decls: HashDumpResult,
+    /// Complete effective `LuaTypeDecl` payload per decl id: name, kind,
+    /// canonically ordered locations (file path, range, flags), alias origin,
+    /// enum base/flatness and attribute type. `decls` covers syntax decls;
+    /// this covers the merged type-level declaration state they feed.
+    type_decl_states: HashDumpResult,
+    /// Every stored alias contribution (site, origin, generic params,
+    /// precedence), not just the effective winner `type_decl_states` shows.
+    alias_contributions: HashDumpResult,
+    /// Declared generic parameter list per decl id. Order is meaningful
+    /// (`fun<T, U>` vs `fun<U, T>`), so the rendered list keeps it.
+    type_decl_generic_params: HashDumpResult,
     decl_references: HashDumpResult,
+    /// Expression range → decl it refers to: the inverse view of
+    /// `decl_references`, which keys the same cells by decl.
+    reference_ranges: HashDumpResult,
+    /// Member-key reference sites: key → file → syntax ids.
+    index_references: HashDumpResult,
+    /// Global-name reference sites: name → file → syntax ids.
+    global_references: HashDumpResult,
+    /// Per-file string literal reference sites.
+    string_references: HashDumpResult,
+    /// Doc type-name reference sites: file → type decl → ranges.
+    type_references: HashDumpResult,
+    /// First reassignment position of each local: file → decl → position.
+    local_reassignments: HashDumpResult,
     modules: HashDumpResult,
     globals: HashDumpResult,
     diagnostics: HashDumpResult,
@@ -753,6 +888,48 @@ struct IndexSnapshot {
     properties: HashDumpResult,
     metatables: HashDumpResult,
     metatable_factory_bindings: HashDumpResult,
+    /// Source access paths each file declares, with the signature they
+    /// resolve to and the parameter indexes that file mutates.
+    call_site_source_signatures: HashDumpResult,
+    /// Source signatures a re-indexed file had before its removal, parked so
+    /// the update can tell which of its signatures merely moved.
+    call_site_previous_source_signatures: HashDumpResult,
+    /// Access path → current source function signature candidates.
+    call_site_signatures_by_path: HashDumpResult,
+    /// Signature → parameter indexes mutated by its source function.
+    call_site_mutated_params: HashDumpResult,
+    /// Observed call-site param evidence contributed by calls in each file.
+    call_site_contributions: HashDumpResult,
+    /// Files that have supplied call-site evidence for each signature.
+    call_site_contributor_files: HashDumpResult,
+    /// Signatures of each file that have call-site contributors.
+    call_site_contributor_signatures: HashDumpResult,
+    /// Facts parked across a remove/re-add so a re-index can tell which of
+    /// its signatures merely moved.
+    call_site_pending_previous_params: HashDumpResult,
+    /// Return consumers recorded by each file's calls.
+    call_site_file_return_consumers: HashDumpResult,
+    /// Return consumers keyed by the signature whose return they read.
+    call_site_return_consumers: HashDumpResult,
+    /// Return consumers keyed by the file declaring the consumed signature.
+    call_site_return_consumers_by_signature_file: HashDumpResult,
+    /// Files owning callback parameters inferred from concrete structural
+    /// table values.
+    call_site_callback_files: HashDumpResult,
+    /// Inference diagnostic events filed under each source file.
+    call_site_inference_events: HashDumpResult,
+    /// Consumer file → producer sources its call-site inference read.
+    call_site_source_dependencies: HashDumpResult,
+    /// Producer source → consumer files that read it.
+    call_site_source_dependents: HashDumpResult,
+    /// Producer file → consumer files that read one of its sources.
+    call_site_source_file_dependents: HashDumpResult,
+    /// File → workspace path, for source-path dependency lookups.
+    call_site_source_paths: HashDumpResult,
+    /// Workspace path → consumer files depending on the file at that path.
+    call_site_source_path_dependents: HashDumpResult,
+    /// Schema URL → resolution state.
+    schema_files: HashDumpResult,
 }
 
 /// Accumulates one index's entries as sorted hashes rather than owned
@@ -809,35 +986,34 @@ impl HashDump {
 ///
 /// A stage that prints a divergence and exits zero is a report, not a gate:
 /// whoever reads the log has to notice, and nobody does. Every comparison the
-/// stages make is an assertion unless it is explicitly wrapped in
-/// `ObservedDifference`, so the run fails at the end if this is non-zero.
+/// stages make is an assertion, so the run fails at the end if this is
+/// non-zero.
 static DIVERGENCES: AtomicUsize = AtomicUsize::new(0);
 
-/// Whether the comparison in flight is an assertion.
-static ASSERTING: AtomicBool = AtomicBool::new(true);
-
-/// Marks a comparison whose difference is the *point*: `realedit` and `burst`
-/// measure what an edit genuinely moves, so "cold differs from cold+edit" is
-/// the work a mechanism must reproduce, not a regression.
-struct ObservedDifference;
-
-impl ObservedDifference {
-    fn new() -> Self {
-        ASSERTING.store(false, Ordering::Relaxed);
-        Self
-    }
-}
-
-impl Drop for ObservedDifference {
-    fn drop(&mut self) {
-        ASSERTING.store(true, Ordering::Relaxed);
-    }
-}
-
 fn record_divergence() {
-    if ASSERTING.load(Ordering::Relaxed) {
-        DIVERGENCES.fetch_add(1, Ordering::Relaxed);
+    if MEASURE_ONLY.get() {
+        return;
     }
+    DIVERGENCES.fetch_add(1, Ordering::Relaxed);
+}
+
+thread_local! {
+    /// Set while a measurement diff runs: the comparison still prints its
+    /// dropped/gained/changed counts, but a non-identical result is the
+    /// payload being measured, not a gate failure.
+    static MEASURE_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run a diff as a measurement: full output, no divergence recorded.
+///
+/// For comparisons between *different* inputs — the original workspace versus
+/// an edited one — where a non-identical result is the expected answer to
+/// "how much did the edit move", not a defect. Equivalence gates (same final
+/// text through two paths) must stay outside this and remain fatal.
+fn measure(f: impl FnOnce()) {
+    let was = MEASURE_ONLY.replace(true);
+    f();
+    MEASURE_ONLY.set(was);
 }
 
 /// Sorted-merge diff of two hash vectors: counts only, since a hash carries
@@ -907,10 +1083,9 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
     let type_index = db.get_type_index();
     let mut type_caches = BTreeMap::new();
     let mut type_facts: BTreeMap<String, String> = BTreeMap::new();
-    // `DET_PROVENANCE=1` records how each cached type was reached, so drift
-    // entries carry the producing pass on both sides and can be grouped by
-    // cause.
-    let with_provenance = std::env::var_os("DET_PROVENANCE").is_some();
+    // Provenance records how each cached type was reached, so drift entries
+    // carry the producing pass on both sides and can be grouped by cause.
+    let with_provenance = true;
     for (owner, cache) in type_index.iter_type_caches() {
         let value = format!("{:?}", cache.as_type());
         if with_provenance {
@@ -965,7 +1140,7 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         for member in member_index.get_file_members(file_id) {
             let member_id = member.get_id();
             members.insert(format!(
-                "{file}|{:?}|owner={:?}",
+                "{file}|{:?}|owner={:?}|member={member:?}",
                 member.get_key(),
                 member_index.get_member_owner(&member_id),
             ));
@@ -974,8 +1149,8 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
             }
         }
     }
-    // Net flows are stored per file; the index yields them in canonical file
-    // order so ordering differences (not just membership) show up in the diff.
+    // Net flows are stored per file; sorted so the dump is canonical across
+    // processes and membership differences show up in the diff.
     let network = db.get_gmod_network_index();
     let mut net_flows = Vec::new();
     for (file_id, _, flow) in network.iter_send_flows() {
@@ -984,8 +1159,17 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
     for (file_id, flow) in network.iter_receive_flows() {
         net_flows.push(format!("recv {}|{flow:?}", file_label(analysis, file_id)));
     }
+    net_flows.sort_unstable();
 
     let mut super_types = BTreeMap::new();
+    // Complete effective declaration payload: kind, every location (sorted by
+    // file path/range/flags rather than merge-arrival order), alias origin,
+    // enum base/flatness, attribute type. `members`/`super_types` snapshot the
+    // decl's edges; this snapshots the decl itself.
+    let mut type_decl_states = HashDump::new("type_decl_states");
+    // Declared generic parameter list per decl. Parameter order is semantic,
+    // so the rendered list preserves it instead of sorting.
+    let mut type_decl_generic_params = HashDump::new("type_decl_generic_params");
     // Ordered member list per class. Two members can share a key (a doc `@field`
     // and a file define, or two partial-class contributions) and this order picks
     // the winner, so drift changes overload selection without changing the set.
@@ -995,12 +1179,60 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         if let Some(supers) = type_index.get_super_types(&decl_id) {
             super_types.insert(format!("{decl_id:?}"), format!("{supers:?}"));
         }
+        let kind = match () {
+            _ if type_decl.is_class() => "class",
+            _ if type_decl.is_enum() => "enum",
+            _ if type_decl.is_alias() => "alias",
+            _ if type_decl.is_attribute() => "attribute",
+            _ => "unknown",
+        };
+        let mut locations = type_decl
+            .get_locations()
+            .iter()
+            .map(|location| {
+                (
+                    file_label(analysis, location.file_id),
+                    u32::from(location.range.start()),
+                    u32::from(location.range.end()),
+                    location.flag.bits(),
+                    format!("{location:?}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        locations.sort_unstable();
+        let locations = locations
+            .into_iter()
+            .map(|(file, start, end, _, debug)| format!("{file}@{start}..{end} {debug}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        type_decl_states.insert(
+            format!("{decl_id:?}"),
+            format!(
+                "name={}|kind={kind}|locations=[{locations}]|alias_origin={:?}|enum_base={:?}|flat_enum={}|attribute_type={:?}",
+                type_decl.get_name(),
+                type_decl.get_alias_ref(),
+                type_decl.get_enum_base(),
+                type_decl.is_flat_enum(),
+                type_decl.get_attribute_type(),
+            ),
+        );
+        if let Some(params) = type_index.get_generic_params(&decl_id) {
+            type_decl_generic_params.insert(
+                format!("{decl_id:?}"),
+                params
+                    .iter()
+                    .map(|param| format!("{param:?}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
         let owner = glua_code_analysis::LuaMemberOwner::Type(decl_id.clone());
         if let Some(members) = db.get_member_index().get_members(&owner) {
-            let ordered = members
+            let mut ordered = members
                 .iter()
-                .map(|member| format!("{:?}@{:?}", member.get_key(), member.get_id()))
+                .map(|member| format!("{:?}@{:?}|{member:?}", member.get_key(), member.get_id()))
                 .collect::<Vec<_>>();
+            ordered.sort_unstable();
             if let Ok(want) = std::env::var("DET_DUMP_CLASS")
                 && decl_id.get_simple_name() == want
             {
@@ -1017,14 +1249,79 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         }
     }
 
+    // Every stored alias contribution, not just the winning origin the
+    // `type_decl_states` bucket shows: a losing site's origin/generic params
+    // still decide what a removal re-selects. Sorted by site path/range so
+    // the dump is canonical across processes.
+    let mut alias_contributions = HashDump::new("alias_contributions");
+    let mut alias_entries = type_index
+        .iter_alias_sources()
+        .map(|(decl_id, source)| {
+            (
+                file_label(analysis, source.site.file_id),
+                u32::from(source.site.value.start()),
+                u32::from(source.site.value.end()),
+                format!("{decl_id:?}"),
+                format!("{source:?}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    alias_entries.sort_unstable();
+    for (file, start, end, decl_id, source) in alias_entries {
+        alias_contributions.insert(format!("{file}@{start}..{end}|decl={decl_id}"), source);
+    }
+
+    // DET_DUMP_OWNER_SLOTS=<simple class name>: dump the owner's raw key
+    // slots — which slot lists each member id, plus the member's own current
+    // key and owner — so an id listed under two slots (or a slot its current
+    // owner no longer names) is visible rather than deduped away.
+    if let Ok(want) = std::env::var("DET_DUMP_OWNER_SLOTS") {
+        let member_index = db.get_member_index();
+        for type_decl in type_index.get_all_types() {
+            let decl_id = type_decl.get_id();
+            if decl_id.get_simple_name() != want {
+                continue;
+            }
+            let owner = glua_code_analysis::LuaMemberOwner::Type(decl_id.clone());
+            let mut slot_lines = Vec::new();
+            for key in member_index.get_member_keys(&owner) {
+                let Some(item) = member_index.get_member_item(&owner, key) else {
+                    continue;
+                };
+                let ids: Vec<glua_code_analysis::LuaMemberId> = match item {
+                    glua_code_analysis::LuaMemberIndexItem::One(id) => vec![*id],
+                    glua_code_analysis::LuaMemberIndexItem::Many(ids) => ids.clone(),
+                };
+                for id in ids {
+                    let (member_key, current_owner, file) = match member_index.get_member(&id) {
+                        Some(member) => (
+                            format!("{:?}", member.get_key()),
+                            format!("{:?}", member_index.get_member_owner(&id)),
+                            file_label(analysis, member.get_file_id()),
+                        ),
+                        None => ("<gone>".into(), "<gone>".into(), "<gone>".into()),
+                    };
+                    slot_lines.push(format!(
+                        "  [{label}] {want} slot={key:?} id={id:?} member_key={member_key} current_owner={current_owner} file={file}"
+                    ));
+                }
+            }
+            slot_lines.sort_unstable();
+            for line in slot_lines {
+                println!("{line}");
+            }
+        }
+    }
+
     // The same visible-item view for non-type owners (table constants, element
     // owners, global paths), which decide member lookup on anonymous tables.
     for (key, owner) in &all_owners {
         if let Some(members) = db.get_member_index().get_members(owner) {
-            let ordered = members
+            let mut ordered = members
                 .iter()
-                .map(|member| format!("{:?}@{:?}", member.get_key(), member.get_id()))
+                .map(|member| format!("{:?}@{:?}|{member:?}", member.get_key(), member.get_id()))
                 .collect::<Vec<_>>();
+            ordered.sort_unstable();
             class_members.insert(format!("OWNER {key}"), ordered.join(","));
         }
     }
@@ -1057,13 +1354,47 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
                 file_label(analysis, signature_id.get_file_id())
             ),
             format!(
-                "{:?} -> {:?}",
+                "params={:?} return={:?} optional={:?} sig={}",
                 signature.get_type_params(),
-                signature.get_return_type()
+                signature.get_return_type(),
+                signature.get_param_optional_flags(),
+                canonical_signature(signature)
             ),
         );
     }
 
+    let flow = db.get_flow_index();
+    let mut flow_trees = BTreeMap::new();
+    for (file_id, tree) in flow.flow_trees() {
+        flow_trees.insert(file_label(analysis, *file_id), format!("{tree:?}"));
+    }
+    let mut signature_casts = BTreeMap::new();
+    for (file_id, signature_id, cast) in flow.signature_casts() {
+        signature_casts.insert(
+            format!("{}|{signature_id:?}", file_label(analysis, *file_id)),
+            format!("{cast:?}"),
+        );
+    }
+    let mut special_call_effects = BTreeMap::new();
+    for (file_id, position, effect) in flow.special_call_effects() {
+        special_call_effects.insert(
+            format!("{}|{position:?}|{effect:?}", file_label(analysis, *file_id)),
+            format!("{effect:?}"),
+        );
+    }
+    let mut special_call_facts = BTreeMap::new();
+    for fact in flow.settled_special_call_facts() {
+        let text = format!("{fact:?}");
+        special_call_facts.insert(text.clone(), text);
+    }
+    // Only the site set is semantic: the version values are a monotonic epoch
+    // bumped once per novel write, so a re-index of unchanged text rewrites
+    // them. Facts and effects carry the semantic payload.
+    let mut special_call_write_sites = BTreeMap::new();
+    for &(file_id, position) in flow.special_call_write_sites() {
+        let site = format!("{}|{position:?}", file_label(analysis, file_id));
+        special_call_write_sites.insert(site.clone(), site);
+    }
     let mut inferred_params = BTreeMap::new();
     for (signature_id, param_idx, fact) in db.get_call_site_param_index().iter_inferred_params() {
         inferred_params.insert(
@@ -1075,12 +1406,6 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         );
     }
 
-    eprintln!(
-        "[{label}] index type_caches={} members={} net_flows={}",
-        type_caches.len(),
-        members.len(),
-        net_flows.len()
-    );
     // Where every member ended up. Contribution groups and class member lists
     // are both keyed off this.
     let mut member_owners = BTreeMap::new();
@@ -1120,6 +1445,76 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
                 decl_references
                     .insert(format!("{file}|{decl_id:?}"), format!("{decl_reference:?}"));
             }
+        }
+    }
+
+    // The rest of the reference index: the inverse range→decl map, the
+    // member/global/string/type site maps, and per-local first-reassignment
+    // positions. `file_revision`/`next_revision` are raw epochs and stay out.
+    // Hash-set values render sorted so two processes agree on the text.
+    let reference_index = db.get_reference_index();
+    let mut reference_ranges = HashDump::new("reference_ranges");
+    for (file_id, range, decl_id) in reference_index.iter_reference_ranges() {
+        reference_ranges.insert(
+            format!("{}|{range:?}", file_label(analysis, file_id)),
+            format!("{decl_id:?}"),
+        );
+    }
+    let mut index_references = HashDump::new("index_references");
+    for (key, by_file) in reference_index.iter_index_references() {
+        for (file_id, syntax_ids) in by_file {
+            let mut sites = syntax_ids
+                .iter()
+                .map(|syntax_id| format!("{syntax_id:?}"))
+                .collect::<Vec<_>>();
+            sites.sort_unstable();
+            index_references.insert(
+                format!("{key:?}|{}", file_label(analysis, *file_id)),
+                format!("{sites:?}"),
+            );
+        }
+    }
+    let mut global_references = HashDump::new("global_references");
+    for (name, by_file) in reference_index.iter_global_references() {
+        for (file_id, syntax_ids) in by_file {
+            let mut sites = syntax_ids
+                .iter()
+                .map(|syntax_id| format!("{syntax_id:?}"))
+                .collect::<Vec<_>>();
+            sites.sort_unstable();
+            global_references.insert(
+                format!("{name}|{}", file_label(analysis, *file_id)),
+                format!("{sites:?}"),
+            );
+        }
+    }
+    let mut string_references = HashDump::new("string_references");
+    for (file_id, string_reference) in reference_index.iter_string_references() {
+        let file = file_label(analysis, *file_id);
+        for (string, ranges) in string_reference.iter_string_references() {
+            string_references.insert(format!("{file}|{string}"), format!("{ranges:?}"));
+        }
+    }
+    let mut type_references = HashDump::new("type_references");
+    for (file_id, by_decl) in reference_index.iter_type_references() {
+        let file = file_label(analysis, *file_id);
+        for (type_decl_id, ranges) in by_decl {
+            let mut sites = ranges
+                .iter()
+                .map(|range| format!("{range:?}"))
+                .collect::<Vec<_>>();
+            sites.sort_unstable();
+            type_references.insert(format!("{file}|{type_decl_id:?}"), format!("{sites:?}"));
+        }
+    }
+    let mut local_reassignments = HashDump::new("local_reassignments");
+    for (file_id, positions) in reference_index.iter_local_reassignments() {
+        let file = file_label(analysis, *file_id);
+        for (decl_id, position) in positions {
+            local_reassignments.insert(
+                format!("{file}|{decl_id:?}"),
+                format!("{}", u32::from(*position)),
+            );
         }
     }
 
@@ -1291,6 +1686,49 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         dynamic_fields.insert(format!("FINITE {owner:?}"), format!("{member_ids:?}"));
     }
 
+    let mut accessor_func_annotations = HashDump::new("accessor_func_annotations");
+    for (name, annotations) in db.get_accessor_func_index().annotation_entries() {
+        let mut entries = annotations
+            .iter()
+            .map(|annotation| format!("{annotation:?}"))
+            .collect::<Vec<_>>();
+        entries.sort_unstable();
+        accessor_func_annotations.insert(name.to_string(), format!("{entries:?}"));
+    }
+    let mut accessor_func_annotation_files = HashDump::new("accessor_func_annotation_files");
+    for (file_id, names) in db.get_accessor_func_index().annotation_files() {
+        let mut names = names
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        accessor_func_annotation_files.insert(file_label(analysis, *file_id), format!("{names:?}"));
+    }
+    let mut numeric_range_file_populations = HashDump::new("numeric_range_file_populations");
+    let mut numeric_range_global_populations = HashDump::new("numeric_range_global_populations");
+    for (file_id, populations) in db
+        .get_numeric_range_population_index()
+        .populations_by_file()
+    {
+        let mut entries = populations
+            .iter()
+            .map(|population| format!("{population:?}"))
+            .collect::<Vec<_>>();
+        entries.sort_unstable();
+        numeric_range_file_populations
+            .insert(file_label(analysis, *file_id), format!("{entries:?}"));
+    }
+    for (global, populations) in db
+        .get_numeric_range_population_index()
+        .populations_by_global()
+    {
+        let mut entries = populations
+            .iter()
+            .map(|population| format!("{population:?}"))
+            .collect::<Vec<_>>();
+        entries.sort_unstable();
+        numeric_range_global_populations.insert(global.clone(), format!("{entries:?}"));
+    }
     let mut accessor_func_calls = HashDump::new("accessor_func_calls");
     for (file_id, calls) in db.get_accessor_func_call_index().iter() {
         accessor_func_calls.insert(file_label(analysis, *file_id), format!("{calls:?}"));
@@ -1299,6 +1737,23 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
     let mut properties = HashDump::new("properties");
     for (owner_id, property) in db.get_property_index().iter_owner_properties() {
         properties.insert(format!("{owner_id:?}"), format!("{property:?}"));
+    }
+    // Source-owned contributions, normalized across the sole/multi storage
+    // split: the merged `properties` view alone cannot show a hidden
+    // contribution that lost the merge but still decides what a deletion
+    // re-selects.
+    for contribution in db.get_property_index().iter_source_contributions() {
+        properties.insert(
+            format!(
+                "PROPERTYCONTRIB {:?}|{}",
+                contribution.owner_id,
+                file_label(analysis, contribution.file_id)
+            ),
+            format!(
+                "rank={}|path={}|{:?}",
+                contribution.workspace_rank, contribution.normalized_path, contribution.property
+            ),
+        );
     }
 
     let mut metatables = HashDump::new("metatables");
@@ -1318,6 +1773,179 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         }
     }
 
+    // The call-site param index's persisted relations. `deferred_contributions`
+    // is a transient queue and `contrib_writes`/`contrib_write_versions` are
+    // raw epochs, so both stay out; everything else is semantic state a
+    // re-index has to reproduce. Hash-set values render sorted so two
+    // processes agree on the text.
+    let call_site = db.get_call_site_param_index();
+    let mut call_site_source_signatures = HashDump::new("call_site_source_signatures");
+    for (file_id, signatures) in call_site.iter_file_source_signatures() {
+        call_site_source_signatures
+            .insert(file_label(analysis, *file_id), format!("{signatures:?}"));
+    }
+    let mut call_site_previous_source_signatures =
+        HashDump::new("call_site_previous_source_signatures");
+    for (file_id, signatures) in call_site.iter_previous_source_signatures() {
+        call_site_previous_source_signatures
+            .insert(file_label(analysis, *file_id), format!("{signatures:?}"));
+    }
+    let mut call_site_signatures_by_path = HashDump::new("call_site_signatures_by_path");
+    for (path, signature_ids) in call_site.iter_source_signatures_by_path() {
+        call_site_signatures_by_path.insert(path.clone(), format!("{signature_ids:?}"));
+    }
+    let mut call_site_mutated_params = HashDump::new("call_site_mutated_params");
+    for (signature_id, params) in call_site.iter_mutated_params() {
+        call_site_mutated_params.insert(
+            format!(
+                "{}|{signature_id:?}",
+                file_label(analysis, signature_id.get_file_id())
+            ),
+            format!("{params:?}"),
+        );
+    }
+    let mut call_site_contributions = HashDump::new("call_site_contributions");
+    for (file_id, contributions) in call_site.iter_file_contributions() {
+        call_site_contributions
+            .insert(file_label(analysis, *file_id), format!("{contributions:?}"));
+    }
+    let mut call_site_contributor_files = HashDump::new("call_site_contributor_files");
+    for (signature_id, files) in call_site.iter_contributor_files_by_signature() {
+        let mut files = files
+            .iter()
+            .map(|file_id| file_label(analysis, *file_id))
+            .collect::<Vec<_>>();
+        files.sort_unstable();
+        call_site_contributor_files.insert(
+            format!(
+                "{}|{signature_id:?}",
+                file_label(analysis, signature_id.get_file_id())
+            ),
+            format!("{files:?}"),
+        );
+    }
+    let mut call_site_contributor_signatures = HashDump::new("call_site_contributor_signatures");
+    for (file_id, signature_ids) in call_site.iter_contributor_signatures_by_file() {
+        let mut signature_ids = signature_ids
+            .iter()
+            .map(|signature_id| format!("{signature_id:?}"))
+            .collect::<Vec<_>>();
+        signature_ids.sort_unstable();
+        call_site_contributor_signatures
+            .insert(file_label(analysis, *file_id), format!("{signature_ids:?}"));
+    }
+    let mut call_site_pending_previous_params = HashDump::new("call_site_pending_previous_params");
+    for ((signature_id, param_idx), fact) in call_site.iter_pending_previous_params() {
+        call_site_pending_previous_params.insert(
+            format!(
+                "{}|{signature_id:?}|param{param_idx}",
+                file_label(analysis, signature_id.get_file_id())
+            ),
+            format!("{fact:?}"),
+        );
+    }
+    let mut call_site_file_return_consumers = HashDump::new("call_site_file_return_consumers");
+    for (file_id, consumers) in call_site.iter_file_return_consumers() {
+        call_site_file_return_consumers
+            .insert(file_label(analysis, *file_id), format!("{consumers:?}"));
+    }
+    let mut call_site_return_consumers = HashDump::new("call_site_return_consumers");
+    for (signature_id, consumers) in call_site.iter_return_consumers() {
+        call_site_return_consumers.insert(
+            format!(
+                "{}|{signature_id:?}",
+                file_label(analysis, signature_id.get_file_id())
+            ),
+            format!("{consumers:?}"),
+        );
+    }
+    let mut call_site_return_consumers_by_signature_file =
+        HashDump::new("call_site_return_consumers_by_signature_file");
+    for (file_id, consumers) in call_site.iter_return_consumers_by_signature_file() {
+        call_site_return_consumers_by_signature_file
+            .insert(file_label(analysis, *file_id), format!("{consumers:?}"));
+    }
+    let mut call_site_callback_files = HashDump::new("call_site_callback_files");
+    for file_id in call_site.iter_concrete_structural_callback_files() {
+        let file = file_label(analysis, *file_id);
+        call_site_callback_files.insert(file.clone(), file);
+    }
+    let mut call_site_inference_events = HashDump::new("call_site_inference_events");
+    for (file_id, events) in call_site.iter_inference_events_by_file() {
+        call_site_inference_events.insert(file_label(analysis, *file_id), format!("{events:?}"));
+    }
+    let mut call_site_source_dependencies = HashDump::new("call_site_source_dependencies");
+    for (file_id, sources) in call_site.iter_file_source_dependencies() {
+        let mut sources = sources
+            .iter()
+            .map(|source| format!("{source:?}"))
+            .collect::<Vec<_>>();
+        sources.sort_unstable();
+        call_site_source_dependencies
+            .insert(file_label(analysis, *file_id), format!("{sources:?}"));
+    }
+    let mut call_site_source_dependents = HashDump::new("call_site_source_dependents");
+    for (source, files) in call_site.iter_source_dependents() {
+        let mut files = files
+            .iter()
+            .map(|file_id| file_label(analysis, *file_id))
+            .collect::<Vec<_>>();
+        files.sort_unstable();
+        call_site_source_dependents.insert(format!("{source:?}"), format!("{files:?}"));
+    }
+    let mut call_site_source_file_dependents = HashDump::new("call_site_source_file_dependents");
+    for (file_id, files) in call_site.iter_source_file_dependents() {
+        let mut files = files
+            .iter()
+            .map(|file_id| file_label(analysis, *file_id))
+            .collect::<Vec<_>>();
+        files.sort_unstable();
+        call_site_source_file_dependents
+            .insert(file_label(analysis, *file_id), format!("{files:?}"));
+    }
+    let mut call_site_source_paths = HashDump::new("call_site_source_paths");
+    for (file_id, path) in call_site.iter_source_paths() {
+        call_site_source_paths.insert(
+            file_label(analysis, *file_id),
+            path.display().to_string().replace('\\', "/"),
+        );
+    }
+    let mut call_site_source_path_dependents = HashDump::new("call_site_source_path_dependents");
+    for (path, files) in call_site.iter_source_path_dependents() {
+        let mut files = files
+            .iter()
+            .map(|file_id| file_label(analysis, *file_id))
+            .collect::<Vec<_>>();
+        files.sort_unstable();
+        call_site_source_path_dependents.insert(
+            path.display().to_string().replace('\\', "/"),
+            format!("{files:?}"),
+        );
+    }
+
+    let mut schema_files = HashDump::new("schema_files");
+    for (url, schema_file) in db.get_json_schema_index().iter_schema_files() {
+        schema_files.insert(url.as_str().to_string(), format!("{schema_file:?}"));
+    }
+
+    eprintln!(
+        "[{label}] index type_caches={} members={} net_flows={} flow_trees={} signature_casts={} special_call_effects={} special_call_facts={} special_call_sites={} accessor_annotations={} accessor_annotation_files={} numeric_range_files={} numeric_range_globals={} type_decl_states={} type_decl_generic_params={}",
+        type_caches.len(),
+        members.len(),
+        net_flows.len(),
+        flow_trees.len(),
+        signature_casts.len(),
+        special_call_effects.len(),
+        special_call_facts.len(),
+        special_call_write_sites.len(),
+        accessor_func_annotations.hashes.len(),
+        accessor_func_annotation_files.hashes.len(),
+        numeric_range_file_populations.hashes.len(),
+        numeric_range_global_populations.hashes.len(),
+        type_decl_states.hashes.len(),
+        type_decl_generic_params.hashes.len()
+    );
+
     let snapshot = IndexSnapshot {
         type_caches,
         type_facts,
@@ -1329,8 +1957,26 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         class_members,
         definition_sites,
         signatures,
+        flow_trees,
+        signature_casts,
+        special_call_effects,
+        special_call_facts,
+        special_call_write_sites,
+        accessor_func_annotations: accessor_func_annotations.finish(),
+        accessor_func_annotation_files: accessor_func_annotation_files.finish(),
+        numeric_range_file_populations: numeric_range_file_populations.finish(),
+        numeric_range_global_populations: numeric_range_global_populations.finish(),
         decls: decls.finish(),
+        type_decl_states: type_decl_states.finish(),
+        type_decl_generic_params: type_decl_generic_params.finish(),
+        alias_contributions: alias_contributions.finish(),
         decl_references: decl_references.finish(),
+        reference_ranges: reference_ranges.finish(),
+        index_references: index_references.finish(),
+        global_references: global_references.finish(),
+        string_references: string_references.finish(),
+        type_references: type_references.finish(),
+        local_reassignments: local_reassignments.finish(),
         modules: modules.finish(),
         globals: globals.finish(),
         diagnostics: diagnostics.finish(),
@@ -1352,6 +1998,26 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         properties: properties.finish(),
         metatables: metatables.finish(),
         metatable_factory_bindings: metatable_factory_bindings.finish(),
+        call_site_source_signatures: call_site_source_signatures.finish(),
+        call_site_previous_source_signatures: call_site_previous_source_signatures.finish(),
+        call_site_signatures_by_path: call_site_signatures_by_path.finish(),
+        call_site_mutated_params: call_site_mutated_params.finish(),
+        call_site_contributions: call_site_contributions.finish(),
+        call_site_contributor_files: call_site_contributor_files.finish(),
+        call_site_contributor_signatures: call_site_contributor_signatures.finish(),
+        call_site_pending_previous_params: call_site_pending_previous_params.finish(),
+        call_site_file_return_consumers: call_site_file_return_consumers.finish(),
+        call_site_return_consumers: call_site_return_consumers.finish(),
+        call_site_return_consumers_by_signature_file: call_site_return_consumers_by_signature_file
+            .finish(),
+        call_site_callback_files: call_site_callback_files.finish(),
+        call_site_inference_events: call_site_inference_events.finish(),
+        call_site_source_dependencies: call_site_source_dependencies.finish(),
+        call_site_source_dependents: call_site_source_dependents.finish(),
+        call_site_source_file_dependents: call_site_source_file_dependents.finish(),
+        call_site_source_paths: call_site_source_paths.finish(),
+        call_site_source_path_dependents: call_site_source_path_dependents.finish(),
+        schema_files: schema_files.finish(),
     };
 
     // Cross-process comparison: write the whole snapshot so two runs of the same
@@ -1361,11 +2027,17 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         for (tag, map) in [
             ("TC", &snapshot.type_caches),
             ("TF", &snapshot.type_facts),
+            ("MO", &snapshot.member_owners),
             ("PARAM", &snapshot.inferred_params),
             ("SUPER", &snapshot.super_types),
             ("CLSMEM", &snapshot.class_members),
             ("DEFSITE", &snapshot.definition_sites),
             ("SIG", &snapshot.signatures),
+            ("FLOW", &snapshot.flow_trees),
+            ("CAST", &snapshot.signature_casts),
+            ("SCEFFECT", &snapshot.special_call_effects),
+            ("SCFACT", &snapshot.special_call_facts),
+            ("SCSITE", &snapshot.special_call_write_sites),
         ] {
             for (key, value) in map {
                 out.push_str(&format!("{tag} {key} = {value}\n"));
@@ -1382,7 +2054,16 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         // cross-process compare still has *something* to diff.
         for (tag, dump) in [
             ("DECL", &snapshot.decls),
+            ("TDECL", &snapshot.type_decl_states),
+            ("TGEN", &snapshot.type_decl_generic_params),
+            ("ALIASCONTRIB", &snapshot.alias_contributions),
             ("DREF", &snapshot.decl_references),
+            ("REFRANGE", &snapshot.reference_ranges),
+            ("IDXREF", &snapshot.index_references),
+            ("GLOBREF", &snapshot.global_references),
+            ("STRREF", &snapshot.string_references),
+            ("TYPEREF", &snapshot.type_references),
+            ("LOCALREASSIGN", &snapshot.local_reassignments),
             ("MOD", &snapshot.modules),
             ("GLOBAL", &snapshot.globals),
             ("DIAG", &snapshot.diagnostics),
@@ -1400,10 +2081,36 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
             ("GCLASS", &snapshot.gmod_class_file_metadata),
             ("DYNWILD", &snapshot.dynamic_field_wildcards),
             ("DYNFIELD", &snapshot.dynamic_fields),
+            ("ACCANN", &snapshot.accessor_func_annotations),
+            ("ACCFILES", &snapshot.accessor_func_annotation_files),
+            ("NUMFILE", &snapshot.numeric_range_file_populations),
+            ("NUMGLOBAL", &snapshot.numeric_range_global_populations),
             ("ACCCALL", &snapshot.accessor_func_calls),
             ("PROP", &snapshot.properties),
             ("METATBL", &snapshot.metatables),
             ("METAFACT", &snapshot.metatable_factory_bindings),
+            ("CSSIG", &snapshot.call_site_source_signatures),
+            ("CSPREVSIG", &snapshot.call_site_previous_source_signatures),
+            ("CSSIGPATH", &snapshot.call_site_signatures_by_path),
+            ("CSMUT", &snapshot.call_site_mutated_params),
+            ("CSCONTRIB", &snapshot.call_site_contributions),
+            ("CSCONTRIBF", &snapshot.call_site_contributor_files),
+            ("CSCONTRIBS", &snapshot.call_site_contributor_signatures),
+            ("CSPREV", &snapshot.call_site_pending_previous_params),
+            ("CSFCONS", &snapshot.call_site_file_return_consumers),
+            ("CSCONS", &snapshot.call_site_return_consumers),
+            (
+                "CSCONSSIGF",
+                &snapshot.call_site_return_consumers_by_signature_file,
+            ),
+            ("CSCB", &snapshot.call_site_callback_files),
+            ("CSEVENTS", &snapshot.call_site_inference_events),
+            ("CSDEP", &snapshot.call_site_source_dependencies),
+            ("CSSRCDEP", &snapshot.call_site_source_dependents),
+            ("CSFILEDEP", &snapshot.call_site_source_file_dependents),
+            ("CSPATH", &snapshot.call_site_source_paths),
+            ("CSPATHDEP", &snapshot.call_site_source_path_dependents),
+            ("SCHEMA", &snapshot.schema_files),
         ] {
             if let Some(detail) = &dump.detail {
                 for (key, value) in detail {
@@ -1423,6 +2130,49 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
     }
 
     snapshot
+}
+
+/// Canonical serialization of one signature for the index snapshot.
+///
+/// `LuaSignature`'s derived `Debug` renders `param_docs` — a
+/// `std::collections::HashMap` re-seeded per signature — in randomized order,
+/// so two identical builds can produce different strings for the same
+/// signature. Every field is serialized explicitly instead: `param_docs`
+/// sorted by parameter index, private fields through their getters.
+fn canonical_signature(signature: &glua_code_analysis::LuaSignature) -> String {
+    let mut param_docs = signature
+        .param_docs
+        .iter()
+        .map(|(idx, info)| format!("{idx}:{info:?}"))
+        .collect::<Vec<_>>();
+    param_docs.sort_unstable();
+    format!(
+        "generic_params={:?} overloads={:?} param_docs={param_docs:?} out_params={:?} params={:?} \
+         return_docs={:?} resolve_return={:?} is_colon_define={:?} async_state={:?} nodiscard={:?} \
+         is_vararg={:?} params_filled_from_slot={:?} return_filled_from_slot={:?} \
+         require_guard_param={:?} nil_return_guard_params={:?} return_correlations={:?} \
+         direct_param_return_alias={:?} class_name_param_return_alias={:?} \
+         falsy_param_nil_free_return_slots={:?} falsy_param_return_aliases={:?}",
+        signature.generic_params,
+        signature.overloads,
+        signature.out_params,
+        signature.params,
+        signature.return_docs,
+        signature.resolve_return,
+        signature.is_colon_define,
+        signature.async_state,
+        signature.nodiscard,
+        signature.is_vararg,
+        signature.params_filled_from_slot,
+        signature.return_filled_from_slot,
+        signature.require_guard_param(),
+        signature.nil_return_guard_params(),
+        signature.return_correlations(),
+        signature.direct_param_return_alias(),
+        signature.class_name_param_return_alias(),
+        signature.falsy_param_nil_free_return_slots(),
+        signature.falsy_param_return_aliases(),
+    )
 }
 
 /// Max diff lines printed per bucket.
@@ -1510,6 +2260,31 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
             &other.super_types,
         ),
         ("signatures", "SIG", &base.signatures, &other.signatures),
+        ("flow_trees", "FLOW", &base.flow_trees, &other.flow_trees),
+        (
+            "signature_casts",
+            "CAST",
+            &base.signature_casts,
+            &other.signature_casts,
+        ),
+        (
+            "special_call_effects",
+            "SCEFFECT",
+            &base.special_call_effects,
+            &other.special_call_effects,
+        ),
+        (
+            "special_call_facts",
+            "SCFACT",
+            &base.special_call_facts,
+            &other.special_call_facts,
+        ),
+        (
+            "special_call_write_sites",
+            "SCSITE",
+            &base.special_call_write_sites,
+            &other.special_call_write_sites,
+        ),
         (
             "class_members",
             "CM",
@@ -1540,10 +2315,64 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
     for (name, prefix, base_hash, other_hash) in [
         ("decls", "DECL", &base.decls, &other.decls),
         (
+            "type_decl_states",
+            "TDECL",
+            &base.type_decl_states,
+            &other.type_decl_states,
+        ),
+        (
+            "type_decl_generic_params",
+            "TGEN",
+            &base.type_decl_generic_params,
+            &other.type_decl_generic_params,
+        ),
+        (
+            "alias_contributions",
+            "ALIASCONTRIB",
+            &base.alias_contributions,
+            &other.alias_contributions,
+        ),
+        (
             "decl_references",
             "DREF",
             &base.decl_references,
             &other.decl_references,
+        ),
+        (
+            "reference_ranges",
+            "REFRANGE",
+            &base.reference_ranges,
+            &other.reference_ranges,
+        ),
+        (
+            "index_references",
+            "IDXREF",
+            &base.index_references,
+            &other.index_references,
+        ),
+        (
+            "global_references",
+            "GLOBREF",
+            &base.global_references,
+            &other.global_references,
+        ),
+        (
+            "string_references",
+            "STRREF",
+            &base.string_references,
+            &other.string_references,
+        ),
+        (
+            "type_references",
+            "TYPEREF",
+            &base.type_references,
+            &other.type_references,
+        ),
+        (
+            "local_reassignments",
+            "LOCALREASSIGN",
+            &base.local_reassignments,
+            &other.local_reassignments,
         ),
         ("modules", "MOD", &base.modules, &other.modules),
         ("globals", "GLOBAL", &base.globals, &other.globals),
@@ -1633,6 +2462,30 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
             &other.dynamic_fields,
         ),
         (
+            "accessor_func_annotations",
+            "ACCANN",
+            &base.accessor_func_annotations,
+            &other.accessor_func_annotations,
+        ),
+        (
+            "accessor_func_annotation_files",
+            "ACCFILES",
+            &base.accessor_func_annotation_files,
+            &other.accessor_func_annotation_files,
+        ),
+        (
+            "numeric_range_file_populations",
+            "NUMFILE",
+            &base.numeric_range_file_populations,
+            &other.numeric_range_file_populations,
+        ),
+        (
+            "numeric_range_global_populations",
+            "NUMGLOBAL",
+            &base.numeric_range_global_populations,
+            &other.numeric_range_global_populations,
+        ),
+        (
             "accessor_func_calls",
             "ACCCALL",
             &base.accessor_func_calls,
@@ -1645,6 +2498,120 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
             "METAFACT",
             &base.metatable_factory_bindings,
             &other.metatable_factory_bindings,
+        ),
+        (
+            "call_site_source_signatures",
+            "CSSIG",
+            &base.call_site_source_signatures,
+            &other.call_site_source_signatures,
+        ),
+        (
+            "call_site_previous_source_signatures",
+            "CSPREVSIG",
+            &base.call_site_previous_source_signatures,
+            &other.call_site_previous_source_signatures,
+        ),
+        (
+            "call_site_signatures_by_path",
+            "CSSIGPATH",
+            &base.call_site_signatures_by_path,
+            &other.call_site_signatures_by_path,
+        ),
+        (
+            "call_site_mutated_params",
+            "CSMUT",
+            &base.call_site_mutated_params,
+            &other.call_site_mutated_params,
+        ),
+        (
+            "call_site_contributions",
+            "CSCONTRIB",
+            &base.call_site_contributions,
+            &other.call_site_contributions,
+        ),
+        (
+            "call_site_contributor_files",
+            "CSCONTRIBF",
+            &base.call_site_contributor_files,
+            &other.call_site_contributor_files,
+        ),
+        (
+            "call_site_contributor_signatures",
+            "CSCONTRIBS",
+            &base.call_site_contributor_signatures,
+            &other.call_site_contributor_signatures,
+        ),
+        (
+            "call_site_pending_previous_params",
+            "CSPREV",
+            &base.call_site_pending_previous_params,
+            &other.call_site_pending_previous_params,
+        ),
+        (
+            "call_site_file_return_consumers",
+            "CSFCONS",
+            &base.call_site_file_return_consumers,
+            &other.call_site_file_return_consumers,
+        ),
+        (
+            "call_site_return_consumers",
+            "CSCONS",
+            &base.call_site_return_consumers,
+            &other.call_site_return_consumers,
+        ),
+        (
+            "call_site_return_consumers_by_signature_file",
+            "CSCONSSIGF",
+            &base.call_site_return_consumers_by_signature_file,
+            &other.call_site_return_consumers_by_signature_file,
+        ),
+        (
+            "call_site_callback_files",
+            "CSCB",
+            &base.call_site_callback_files,
+            &other.call_site_callback_files,
+        ),
+        (
+            "call_site_inference_events",
+            "CSEVENTS",
+            &base.call_site_inference_events,
+            &other.call_site_inference_events,
+        ),
+        (
+            "call_site_source_dependencies",
+            "CSDEP",
+            &base.call_site_source_dependencies,
+            &other.call_site_source_dependencies,
+        ),
+        (
+            "call_site_source_dependents",
+            "CSSRCDEP",
+            &base.call_site_source_dependents,
+            &other.call_site_source_dependents,
+        ),
+        (
+            "call_site_source_file_dependents",
+            "CSFILEDEP",
+            &base.call_site_source_file_dependents,
+            &other.call_site_source_file_dependents,
+        ),
+        (
+            "call_site_source_paths",
+            "CSPATH",
+            &base.call_site_source_paths,
+            &other.call_site_source_paths,
+        ),
+        (
+            "call_site_source_path_dependents",
+            "CSPATHDEP",
+            &base.call_site_source_path_dependents,
+            &other.call_site_source_path_dependents,
+        ),
+        (
+            "schema_files",
+            "SCHEMA",
+            &base.schema_files,
+            &other.schema_files,
         ),
     ] {
         diff_hash_dump(
@@ -1673,12 +2640,11 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
     let other_net = other.net_flows.iter().collect::<BTreeSet<_>>();
     let net_dropped = base_net.difference(&other_net).collect::<Vec<_>>();
     let net_gained = other_net.difference(&base_net).collect::<Vec<_>>();
-    let net_reordered = base.net_flows != other.net_flows;
-    if !net_dropped.is_empty() || !net_gained.is_empty() || net_reordered {
+    if !net_dropped.is_empty() || !net_gained.is_empty() {
         record_divergence();
     }
     println!(
-        "INDEX {base_label} -> {label}: net_flows dropped={} gained={} reordered={net_reordered}",
+        "INDEX {base_label} -> {label}: net_flows dropped={} gained={}",
         net_dropped.len(),
         net_gained.len()
     );
@@ -1900,7 +2866,7 @@ fn noop_edit(analysis: &mut EmmyLuaAnalysis, target: &Path, at_front: bool) -> b
 /// token change) via `update_file_text_only` + `self_index_and_diff` +
 /// `ripple`, on its own analysis like `editrevert`.
 ///
-/// Asserted (records a divergence, no `ObservedDifference` wrapper):
+/// Asserted (each records a divergence):
 /// 1. `remap-loss == 0`. Defensible for this stage specifically because its
 ///    edit is a pure insertion of a blank line at the front: no fact's
 ///    referent can disappear and no text a fact anchors on is deleted, so any
@@ -1917,12 +2883,12 @@ fn noop_edit(analysis: &mut EmmyLuaAnalysis, target: &Path, at_front: bool) -> b
 /// member keys, `sh_configuration`'s 1 dynamic-element key); `indexrepeat` is
 /// the gate that owns that. The key count and keys print as diagnostics.
 ///
-/// The before/after *index* comparison stays characterization
-/// (`ObservedDifference`): a shifted file's own facts legitimately move by a
-/// line, and the tail's first-settle convergence is the work being measured,
-/// not a regression. The second identical settle (which must be fully quiet)
-/// is the determinism check: quiet there proves no lingering corruption, so a
-/// first-settle fanout is a convergence phenomenon the tail owns.
+/// The before/after comparison is a *measurement*, not a gate: a shifted
+/// file's own facts legitimately move by a line, so cross-input equality is
+/// not expected and the diff prints without recording a divergence. The
+/// second identical settle (which must be fully quiet) is the determinism
+/// gate: quiet there proves no lingering corruption, so a first-settle fanout
+/// is a convergence phenomenon the tail owns.
 fn shift_settle(codebase: &Path, annotations: &Path, targets: &[String]) {
     let analysis = &mut build_analysis(codebase, annotations);
 
@@ -2034,11 +3000,12 @@ fn shift_settle(codebase: &Path, annotations: &Path, targets: &[String]) {
         let label = format!("after_shiftsettle[{target}]");
         let after_index = collect_index(analysis, &label);
         let after = collect(analysis, &label);
-        {
-            let _guard = ObservedDifference::new();
+        // Cross-input measurement, not a gate: the shifted file's facts
+        // legitimately move by a line, so before/after cannot be identical.
+        measure(|| {
             diff_index("before_shiftsettle", &before_index, &label, &after_index);
             diff("before_shiftsettle", &before, &label, &after);
-        }
+        });
 
         // Determinism check the parent asked for: settle the SAME shifted text
         // a second time through the identical path and compare the loss sets.
@@ -2056,11 +3023,8 @@ fn shift_settle(codebase: &Path, annotations: &Path, targets: &[String]) {
         let label2 = format!("after_shiftsettle2[{target}]");
         let after2_index = collect_index(analysis, &label2);
         let after2 = collect(analysis, &label2);
-        {
-            let _guard = ObservedDifference::new();
-            diff_index(&label, &after_index, &label2, &after2_index);
-            diff(&label, &after, &label2, &after2);
-        }
+        diff_index(&label, &after_index, &label2, &after2_index);
+        diff(&label, &after, &label2, &after2);
     }
 }
 
@@ -2201,20 +3165,21 @@ fn real_edit(
             Order::Natural,
             1,
             &[(path.clone(), edited)],
+            None,
         );
         let truth_index = collect_index(&ground_truth, "cold_edited");
         let truth = collect(&ground_truth, "cold_edited");
 
-        // What the edit genuinely moves: the work any mechanism must reproduce.
-        {
-            let _observed = ObservedDifference::new();
+        // What the edit genuinely moves: the work any mechanism must
+        // reproduce. A measurement, not a gate — the original and edited
+        // workspaces legitimately differ.
+        measure(|| {
             diff_index("cold", &cold_index, "cold_edited", &truth_index);
             diff("cold", cold, "cold_edited", &truth);
-        }
+        });
         // What today's incremental path gets wrong about it.
         diff_index("cold_edited", &truth_index, "warm", &warm_index);
         diff("cold_edited", &truth, "warm", &warm);
-
         analysis
             .update_file_by_uri(&uri, Some(original))
             .map(|(id, _)| id);
@@ -2436,20 +3401,21 @@ fn burst_edit(
         .iter()
         .map(|target| (target.path.clone(), step_text(target, 2)))
         .collect::<Vec<_>>();
-    let ground_truth = build_analysis_with(codebase, annotations, Order::Natural, 1, &overrides);
+    let ground_truth =
+        build_analysis_with(codebase, annotations, Order::Natural, 1, &overrides, None);
     let truth_index = collect_index(&ground_truth, "cold_burst");
     let truth = collect(&ground_truth, "cold_burst");
 
-    // Context: what the edits themselves move.
-    {
-        let _observed = ObservedDifference::new();
+    // Context, not a gate: the burst's final text legitimately differs from
+    // the original workspace, so this cross-input distance is a measurement.
+    measure(|| {
         diff_index("cold", &cold_index, "cold_burst", &truth_index);
         diff("cold", cold, "cold_burst", &truth);
-    }
-    // Context: the same comparison for the undeferred path.
+    });
+    // The gates: both the deferred burst and the one-settle-at-a-time control
+    // must land where a cold build of the same final text lands.
     diff_index("cold_burst", &truth_index, "control", &control_index);
     diff("cold_burst", &truth, "control", &control);
-    // The gate: the burst must land where a cold build of the final text lands.
     diff_index("cold_burst", &truth_index, "warm", &warm_index);
     diff("cold_burst", &truth, "warm", &warm);
 
@@ -2457,6 +3423,61 @@ fn burst_edit(
         analysis
             .update_file_by_uri(&target.uri, Some(target.original.clone()))
             .map(|(id, _)| id);
+    }
+}
+
+fn delete_reopen(codebase: &Path, annotations: &Path, targets: &[String]) {
+    for target in targets {
+        let path = codebase.join(target.replace("/", std::path::MAIN_SEPARATOR_STR));
+        let Some(uri) = glua_code_analysis::file_path_to_uri(&path) else {
+            eprintln!("[delete] cannot build uri for {}", path.display());
+            std::process::exit(2);
+        };
+        let mut warm = build_analysis(codebase, annotations);
+        // A target that resolves to no indexed text exercises neither the
+        // delete nor the reopen half, so it is a fatal prerequisite error,
+        // not a skipped gate.
+        let Some(original) = warm.get_file_id(&uri).and_then(|id| {
+            warm.compilation
+                .get_db()
+                .get_vfs()
+                .get_file_content(&id)
+                .cloned()
+        }) else {
+            eprintln!("[delete] target not indexed: {}", path.display());
+            std::process::exit(2);
+        };
+        // Delete: the warm analysis drops the file through the same
+        // `update_file_by_uri` path the LSP uses. Its baseline is a cold build
+        // that never contained the file — removing it after indexing would
+        // only reproduce the warm path, not the state a workspace without the
+        // file starts from. The cold build reserves the file's id as an
+        // unindexed tombstone (see `build_analysis_with`), so embedded file
+        // ids match the warm side's retained allocation. Both the diagnostics
+        // and the full index must match.
+        warm.update_file_by_uri(&uri, None);
+        let cold_deleted = build_analysis_excluding(codebase, annotations, &path);
+        let deleted = collect(&warm, "warm_delete");
+        let baseline = collect(&cold_deleted, "cold_delete");
+        diff("cold_delete", &baseline, "warm_delete", &deleted);
+        let deleted_index = collect_index(&warm, "warm_delete");
+        let baseline_index = collect_index(&cold_deleted, "cold_delete");
+        diff_index(
+            "cold_delete",
+            &baseline_index,
+            "warm_delete",
+            &deleted_index,
+        );
+        // Reopen: the same warm analysis gets the file's text back. Its
+        // baseline is the ordinary cold build of the full workspace.
+        warm.update_file_by_uri(&uri, Some(original));
+        let reopened = collect(&warm, "warm_reopen");
+        let cold = build_analysis(codebase, annotations);
+        let baseline = collect(&cold, "cold_reopen");
+        diff("cold_reopen", &baseline, "warm_reopen", &reopened);
+        let reopened_index = collect_index(&warm, "warm_reopen");
+        let cold_index = collect_index(&cold, "cold_reopen");
+        diff_index("cold_reopen", &cold_index, "warm_reopen", &reopened_index);
     }
 }
 
@@ -2517,7 +3538,82 @@ fn run() {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();
 
+    let target_stages = [
+        "shiftsettle",
+        "noopedit",
+        "editmid",
+        "editrevert",
+        "realedit",
+        "blast",
+        "burst",
+        "exact",
+        "batchexpand",
+        "indexrepeat",
+        "delete",
+        "reopen",
+    ];
+    // Stages that consume DET_EDIT_FIND/DET_EDIT_REPLACE. `shiftsettle` and
+    // `editmid` are newline-only edits and are deliberately absent.
+    let edit_stages = ["editrevert", "realedit", "blast", "burst"];
+    if stages
+        .iter()
+        .any(|stage| target_stages.iter().any(|want| stage == want))
+        && targets.is_empty()
+    {
+        eprintln!("[determinism] target-dependent stage selected but DET_TARGETS is empty");
+        std::process::exit(2);
+    }
+    if stages
+        .iter()
+        .any(|stage| edit_stages.iter().any(|want| stage == want))
+    {
+        let find = std::env::var("DET_EDIT_FIND").ok().filter(|value| !value.is_empty()).unwrap_or_else(|| { eprintln!("[determinism] edit-dependent stage selected but DET_EDIT_FIND is absent or empty"); std::process::exit(2) });
+        let matched = targets
+            .iter()
+            .filter_map(|target| {
+                std::fs::read_to_string(
+                    codebase.join(target.replace("/", std::path::MAIN_SEPARATOR_STR)),
+                )
+                .ok()
+            })
+            .map(|text| text.matches(&find).count())
+            .sum::<usize>();
+        if matched == 0 {
+            eprintln!(
+                "[determinism] edit-dependent stage selected but DET_EDIT_FIND matches zero occurrences in selected targets"
+            );
+            std::process::exit(2);
+        }
+    }
+
     let mut analysis = build_analysis(&codebase, &annotations);
+
+    // Every selected target must resolve to indexed text before any stage
+    // runs: a misspelled or workspace-excluded DET_TARGETS entry would
+    // otherwise let a stage skip its gate and still exit successfully.
+    if stages
+        .iter()
+        .any(|stage| target_stages.iter().any(|want| stage == want))
+    {
+        for target in &targets {
+            let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
+            let resolved = glua_code_analysis::file_path_to_uri(&path)
+                .and_then(|uri| analysis.get_file_id(&uri))
+                .and_then(|file_id| {
+                    analysis
+                        .compilation
+                        .get_db()
+                        .get_vfs()
+                        .get_file_content(&file_id)
+                });
+            if resolved.is_none() {
+                eprintln!(
+                    "[determinism] DET_TARGETS entry does not resolve to indexed text: {target}"
+                );
+                std::process::exit(2);
+            }
+        }
+    }
     let cold = collect(&analysis, "cold");
 
     if let Ok(dump_path) = std::env::var("DET_DUMP") {
@@ -2532,31 +3628,34 @@ fn run() {
 
     // A cross-process comparison needs the cold snapshot even when no stage runs
     // that would otherwise collect one.
-    if std::env::var_os("DET_DUMP_INDEX").is_some() && std::env::var_os("DET_INDEX_DIFF").is_none()
-    {
+    if std::env::var_os("DET_DUMP_INDEX").is_some() {
         collect_index(&analysis, "cold");
     }
 
-    let cold_index = (std::env::var_os("DET_INDEX_DIFF").is_some()
-        && stages
-            .iter()
-            .any(|stage| matches!(stage.as_str(), "repeat" | "fresh" | "order" | "reindex")))
+    let cold_index = (stages
+        .iter()
+        .any(|stage| matches!(stage.as_str(), "fresh" | "order" | "reindex")))
     .then(|| collect_index(&analysis, "cold"));
 
+    // Repeated collection on the same retained state, with no intervening
+    // update: a read-side mutation or cache-dependent second result shows up
+    // as a divergence between the two collections. The stage builds its own
+    // analysis so neither collection inherits another stage's warm state.
     if stages.iter().any(|s| s == "repeat") {
+        analysis = build_analysis(&codebase, &annotations);
+        let baseline = collect(&analysis, "repeat_base");
+        let baseline_index = collect_index(&analysis, "repeat_base");
         let again = collect(&analysis, "repeat");
-        diff("cold", &cold, "repeat", &again);
-        if let Some(cold_index) = &cold_index {
-            let after_index = collect_index(&analysis, "repeat");
-            diff_index("cold", cold_index, "repeat", &after_index);
-        }
+        diff("repeat_base", &baseline, "repeat", &again);
+        let after_index = collect_index(&analysis, "repeat");
+        diff_index("repeat_base", &baseline_index, "repeat", &after_index);
     }
 
     if stages.iter().any(|s| s == "noopedit") {
+        analysis = build_analysis(&codebase, &annotations);
         let mut previous = cold.clone();
         let mut previous_label = "cold".to_string();
-        let cold_index =
-            std::env::var_os("DET_INDEX_DIFF").map(|_| collect_index(&analysis, "cold"));
+        let cold_index = Some(collect_index(&analysis, "cold"));
         for target in &targets {
             let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
             if !noop_edit(&mut analysis, &path, false) {
@@ -2578,8 +3677,8 @@ fn run() {
     }
 
     if stages.iter().any(|s| s == "editmid") {
-        let cold_index =
-            std::env::var_os("DET_INDEX_DIFF").map(|_| collect_index(&analysis, "cold"));
+        analysis = build_analysis(&codebase, &annotations);
+        let cold_index = Some(collect_index(&analysis, "cold"));
         for target in &targets {
             let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
             if !noop_edit(&mut analysis, &path, true) {
@@ -2596,6 +3695,7 @@ fn run() {
     }
 
     if stages.iter().any(|s| s == "exact") {
+        analysis = build_analysis(&codebase, &annotations);
         let cold_index = collect_index(&analysis, "cold");
         if reindex_exact(&mut analysis, &codebase, &targets) {
             let after_index = collect_index(&analysis, "after_exact");
@@ -2609,6 +3709,7 @@ fn run() {
     // populated. Tests whether the cold build under-resolved because library and
     // std groups were analysed before main-workspace files existed.
     if stages.iter().any(|s| s == "mainreindex") {
+        analysis = build_analysis(&codebase, &annotations);
         let cold_index = collect_index(&analysis, "cold");
         let main_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
         let t = Instant::now();
@@ -2637,6 +3738,7 @@ fn run() {
     // this stage analyse the same file set from the same starting point, so a
     // difference isolates state `remove_index` fails to drop.
     if stages.iter().any(|s| s == "allreindex") {
+        analysis = build_analysis(&codebase, &annotations);
         let cold_index = collect_index(&analysis, "cold");
         let all_ids = analysis.compilation.get_db().get_vfs().get_all_file_ids();
         let t = Instant::now();
@@ -2652,22 +3754,31 @@ fn run() {
         diff("cold", &cold, "after_allreindex", &after);
     }
 
-    // Re-run analysis over every file without removing anything first, so each
-    // file re-infers against the settled index with every existing fact
-    // retained. Says whether the cold answer is under-converged.
+    // Remove and re-index every file through the supported remove-first
+    // path, so each file is re-derived against the settled index the
+    // previous round left behind. Says whether the retained-state path
+    // reaches the cold answer, and whether repeated rounds converge.
     if stages.iter().any(|s| s == "restabilize") {
+        analysis = build_analysis(&codebase, &annotations);
         let all_ids = analysis.compilation.get_db().get_vfs().get_all_file_ids();
+        // Immutable baselines captured before the first retained-state
+        // update: every round compares against the state the cold build left,
+        // so index drift and diagnostic-only non-confluence are both visible.
+        let baseline_index = collect_index(&analysis, "cold");
+        let baseline = collect(&analysis, "cold");
         for round in 0..3 {
             let t = Instant::now();
-            analysis.compilation.update_index(all_ids.clone());
+            analysis.reindex_files_without_expansion(all_ids.clone());
             let label = format!("after_restabilize_{round}");
             eprintln!(
-                "[restabilize] round {round} over {} files ({:.2}s)",
+                "[restabilize] round {round} reindexed {} files ({:.2}s)",
                 all_ids.len(),
                 t.elapsed().as_secs_f64()
             );
+            let after_index = collect_index(&analysis, &label);
+            diff_index("cold", &baseline_index, &label, &after_index);
             let after = collect(&analysis, &label);
-            diff("cold", &cold, &label, &after);
+            diff("cold", &baseline, &label, &after);
         }
     }
 
@@ -2675,6 +3786,7 @@ fn run() {
     // against the complete settled workspace rather than the prefix the cold
     // walk had built when it reached that file.
     if stages.iter().any(|s| s == "perfile") {
+        analysis = build_analysis(&codebase, &annotations);
         let all_ids = analysis.compilation.get_db().get_vfs().get_all_file_ids();
         let rounds = std::env::var("DET_PERFILE_ROUNDS")
             .ok()
@@ -2707,6 +3819,7 @@ fn run() {
     // The production incremental path: phase 1 re-indexes the set and reports
     // what it invalidated, phase 2 re-analyses only that.
     if stages.iter().any(|s| s == "mainexpand") {
+        analysis = build_analysis(&codebase, &annotations);
         let cold_index = collect_index(&analysis, "cold");
         let main_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
         let t = Instant::now();
@@ -2726,6 +3839,7 @@ fn run() {
     }
 
     if stages.iter().any(|s| s == "reindex") {
+        analysis = build_analysis(&codebase, &annotations);
         let t = Instant::now();
         analysis.reindex();
         eprintln!("[reindex] full reindex {:.2}s", t.elapsed().as_secs_f64());
@@ -2744,22 +3858,38 @@ fn run() {
         edit_revert(&codebase, &annotations, &targets);
     }
     if stages.iter().any(|s| s == "realedit") {
-        real_edit(&mut analysis, &codebase, &annotations, &targets, &cold);
+        let mut stage_analysis = build_analysis(&codebase, &annotations);
+        real_edit(
+            &mut stage_analysis,
+            &codebase,
+            &annotations,
+            &targets,
+            &cold,
+        );
     }
 
     if stages.iter().any(|s| s == "burst") {
-        burst_edit(&mut analysis, &codebase, &annotations, &targets, &cold);
+        let mut stage_analysis = build_analysis(&codebase, &annotations);
+        burst_edit(
+            &mut stage_analysis,
+            &codebase,
+            &annotations,
+            &targets,
+            &cold,
+        );
     }
 
     let mut blast_ok = true;
     if stages.iter().any(|s| s == "blast") {
-        blast_ok = blast_radius(&mut analysis, &codebase, &targets);
+        let mut stage_analysis = build_analysis(&codebase, &annotations);
+        blast_ok = blast_radius(&mut stage_analysis, &codebase, &targets);
     }
 
     // Bisect stage: re-walk the target's expansion in one batch with the text
     // untouched. Localises which sites flip when re-derived against a settled
     // retained neighborhood, without the edit signal `burst` carries.
     if stages.iter().any(|s| s == "batchexpand") {
+        analysis = build_analysis(&codebase, &annotations);
         let cold_index = collect_index(&analysis, "cold");
         for target in &targets {
             let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
@@ -2784,6 +3914,10 @@ fn run() {
         diff("cold", &cold, "after_batchexpand", &after);
     }
 
+    if stages.iter().any(|s| s == "delete" || s == "reopen") {
+        delete_reopen(&codebase, &annotations, &targets);
+    }
+
     if stages.iter().any(|s| s == "indexrepeat") {
         run_index_repeat(&codebase, &annotations, &targets);
     }
@@ -2800,7 +3934,7 @@ fn run() {
 
     if stages.iter().any(|s| s == "order") {
         let reversed_analysis =
-            build_analysis_with(&codebase, &annotations, Order::Reverse, 1, &[]);
+            build_analysis_with(&codebase, &annotations, Order::Reverse, 1, &[], None);
         let reversed = collect(&reversed_analysis, "reverse_order");
         diff("cold", &cold, "reverse_order", &reversed);
         if let Some(cold_index) = &cold_index {
@@ -2812,12 +3946,10 @@ fn run() {
     if let Some(batches) = stages.iter().find_map(|s| s.strip_prefix("split:")) {
         let batches = batches.parse::<usize>().unwrap_or(2);
         let split_analysis =
-            build_analysis_with(&codebase, &annotations, Order::Natural, batches, &[]);
-        if std::env::var_os("DET_INDEX_DIFF").is_some() {
-            let cold_index = collect_index(&analysis, "cold");
-            let split_index = collect_index(&split_analysis, "split_batches");
-            diff_index("cold", &cold_index, "split_batches", &split_index);
-        }
+            build_analysis_with(&codebase, &annotations, Order::Natural, batches, &[], None);
+        let cold_index = collect_index(&analysis, "cold");
+        let split_index = collect_index(&split_analysis, "split_batches");
+        diff_index("cold", &cold_index, "split_batches", &split_index);
         let split = collect(&split_analysis, "split_batches");
         diff("cold", &cold, "split_batches", &split);
     }

@@ -63,6 +63,15 @@ impl AccessorFuncAnnotationIndex {
     pub fn get_annotations(&self, name: &str) -> Option<&Vec<AccessorFuncAnnotation>> {
         self.by_name.get(name)
     }
+    pub fn annotation_entries(
+        &self,
+    ) -> impl Iterator<Item = (&SmolStr, &Vec<AccessorFuncAnnotation>)> {
+        self.by_name.iter()
+    }
+
+    pub fn annotation_files(&self) -> impl Iterator<Item = (&FileId, &Vec<SmolStr>)> {
+        self.by_file.iter()
+    }
 }
 
 impl LuaIndex for AccessorFuncAnnotationIndex {

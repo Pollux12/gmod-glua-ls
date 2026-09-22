@@ -55,6 +55,11 @@ impl FileReference {
     pub fn get_decl_id(&self, range: &TextRange) -> Option<LuaDeclId> {
         self.references_to_decl.get(range).copied()
     }
+
+    /// Borrowed entries of the range → decl inverse map, in storage order.
+    pub fn iter_references_to_decl(&self) -> impl Iterator<Item = (&TextRange, &LuaDeclId)> + '_ {
+        self.references_to_decl.iter()
+    }
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]

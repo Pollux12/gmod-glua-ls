@@ -7,7 +7,7 @@ pub use file_reference::{DeclReference, DeclReferenceCell, FileReference};
 use glua_parser::LuaSyntaxId;
 use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
-use string_reference::StringReference;
+pub use string_reference::StringReference;
 
 use super::{LuaDeclId, LuaMemberKey, LuaTypeDeclId, traits::LuaIndex};
 use crate::{FileId, InFiled};
@@ -332,6 +332,59 @@ impl LuaReferenceIndex {
             })
             .map(|(decl_id, _)| decl_id.clone())
             .collect()
+    }
+
+    /// Every file's declaration references: the decl → sites map and the
+    /// range → decl inverse map inside each [`FileReference`].
+    pub fn iter_file_references(&self) -> impl Iterator<Item = (&FileId, &FileReference)> {
+        self.file_references.iter()
+    }
+
+    /// Every expression range mapped to the declaration it refers to — the
+    /// stored range → decl inverse map inside each [`FileReference`].
+    pub fn iter_reference_ranges(
+        &self,
+    ) -> impl Iterator<Item = (FileId, TextRange, LuaDeclId)> + '_ {
+        self.file_references
+            .iter()
+            .flat_map(|(file_id, reference)| {
+                reference
+                    .iter_references_to_decl()
+                    .map(move |(range, decl_id)| (*file_id, *range, *decl_id))
+            })
+    }
+
+    /// Member-key reference sites: key → file → syntax ids.
+    pub fn iter_index_references(
+        &self,
+    ) -> impl Iterator<Item = (&LuaMemberKey, &HashMap<FileId, HashSet<LuaSyntaxId>>)> {
+        self.index_reference.iter()
+    }
+
+    /// Global-name reference sites: name → file → syntax ids.
+    pub fn iter_global_references(
+        &self,
+    ) -> impl Iterator<Item = (&SmolStr, &HashMap<FileId, HashSet<LuaSyntaxId>>)> {
+        self.global_references.iter()
+    }
+
+    /// Per-file string literal reference sites.
+    pub fn iter_string_references(&self) -> impl Iterator<Item = (&FileId, &StringReference)> {
+        self.string_references.iter()
+    }
+
+    /// Doc type-name reference sites: file → type decl → ranges.
+    pub fn iter_type_references(
+        &self,
+    ) -> impl Iterator<Item = (&FileId, &HashMap<LuaTypeDeclId, HashSet<TextRange>>)> {
+        self.type_references.iter()
+    }
+
+    /// First reassignment position of each local: file → decl → position.
+    pub fn iter_local_reassignments(
+        &self,
+    ) -> impl Iterator<Item = (&FileId, &HashMap<LuaDeclId, TextSize>)> {
+        self.local_reassignments.iter()
     }
 }
 

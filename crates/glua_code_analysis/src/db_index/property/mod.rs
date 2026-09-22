@@ -41,6 +41,24 @@ struct PropertyContributorKey {
     file_id: u32,
 }
 
+/// One file's contribution to a property, normalized so the sole-contributor
+/// fast path and the multi-contributor map read as the same record shape.
+/// Borrowed throughout: the payload is the stored contribution (for a sole
+/// contributor the merged value *is* the contribution).
+#[derive(Debug)]
+pub struct LuaPropertyContribution<'a> {
+    /// The documented symbol the contribution is filed under. Owner aliases
+    /// sharing one property each get their own record.
+    pub owner_id: &'a LuaSemanticDeclId,
+    /// The file that wrote the contribution.
+    pub file_id: FileId,
+    /// Merge precedence inputs: workspace rank, then normalized path.
+    pub workspace_rank: u8,
+    pub normalized_path: &'a str,
+    /// The contribution payload.
+    pub property: &'a LuaCommonProperty,
+}
+
 #[derive(Debug, Clone)]
 pub struct LuaPropertyIndex {
     /// Merged view, read by `get_property`. For the common single-contributor property this is
@@ -393,6 +411,55 @@ impl LuaPropertyIndex {
                 self.properties
                     .get(property_id)
                     .map(|property| (owner_id, property))
+            })
+    }
+
+    /// Every source-owned contribution, normalized across the sole-contributor
+    /// fast path and the multi-contributor map into the same record shape.
+    /// Internal property ids and which storage slot a contribution landed in
+    /// are deliberately not exposed — only owner, contributing file, merge
+    /// precedence and payload are semantic.
+    pub fn iter_source_contributions(&self) -> impl Iterator<Item = LuaPropertyContribution<'_>> {
+        self.property_owners_map
+            .iter()
+            .flat_map(move |(owner_id, property_id)| {
+                let sole = self
+                    .sole_contributor
+                    .get(property_id)
+                    .into_iter()
+                    .map(move |file_id| {
+                        let (workspace_rank, normalized_path) = self
+                            .file_merge_order
+                            .get(file_id)
+                            .map(|(rank, path)| (*rank, path.as_ref()))
+                            .unwrap_or((u8::MAX, ""));
+                        LuaPropertyContribution {
+                            owner_id,
+                            file_id: *file_id,
+                            workspace_rank,
+                            normalized_path,
+                            property: self
+                                .properties
+                                .get(property_id)
+                                .expect("sole contributor without merged value"),
+                        }
+                    });
+                let multi =
+                    self.contributions
+                        .get(property_id)
+                        .into_iter()
+                        .flat_map(move |by_key| {
+                            by_key
+                                .iter()
+                                .map(move |(key, property)| LuaPropertyContribution {
+                                    owner_id,
+                                    file_id: FileId { id: key.file_id },
+                                    workspace_rank: key.workspace_rank,
+                                    normalized_path: key.normalized_path.as_ref(),
+                                    property,
+                                })
+                        });
+                sole.chain(multi)
             })
     }
 
