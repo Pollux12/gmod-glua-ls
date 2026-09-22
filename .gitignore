@@ -1,4 +1,5 @@
 /target
+/target-det/
 .omp/
 .idea/
 .cursor/
