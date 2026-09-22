@@ -10,7 +10,7 @@ use log::{error, info};
 pub use module_info::ModuleInfo;
 pub use module_node::{ModuleNode, ModuleNodeId};
 use regex::Regex;
-use rowan::TextSize;
+use rowan::{TextRange, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 pub(crate) use workspace::WorkspaceResolutionKey;
@@ -46,6 +46,32 @@ pub struct LuaModuleIndex {
     /// fixpoint requeue.
     module_writes: u64,
     module_write_versions: FxHashMap<FileId, u64>,
+}
+
+/// Deterministic precedence of one declaration site for a shared `---`
+/// payload (alias origin, generic params, ...).
+///
+/// The ordering reuses the global module-resolution semantics: workspace kind
+/// (Main before Library before Std before Remote), then the workspace's
+/// registration order so earlier configured libraries win, then the
+/// normalized VFS path, then the declaration range inside the file. File id
+/// is only a totality tiebreak for two files sharing a path; arrival order
+/// never participates, so the winner is a function of the settled
+/// declaration set rather than ingestion order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LuaDeclSourceKey {
+    /// `workspace_kind_priority`: Main=0, Library=1, Std=2, Remote=3.
+    pub workspace_kind: u8,
+    /// Position of the file's workspace in registration order.
+    pub workspace_order: usize,
+    /// Tiebreak inside `workspace_order_priority` (`WorkspaceId::id`).
+    pub workspace_id: u32,
+    /// `Vfs::file_order_key` — normalized path, empty when unknown.
+    pub file_order_key: Arc<str>,
+    /// Totality tiebreak for files sharing an order key (`FileId::id`).
+    pub file_id: u32,
+    /// The declaration site's range inside its file.
+    pub range: (TextSize, TextSize),
 }
 
 impl Default for LuaModuleIndex {
@@ -683,6 +709,31 @@ impl LuaModuleIndex {
                 .unwrap_or(usize::MAX),
             workspace_id,
         )
+    }
+
+    /// The precedence key one declaration site carries for a shared `---`
+    /// payload. See [`LuaDeclSourceKey`]; a file with no module info is
+    /// treated as a main-workspace file, matching the loose-file default.
+    pub(crate) fn decl_source_key(
+        &self,
+        file_id: FileId,
+        file_order_key: Arc<str>,
+        range: TextRange,
+    ) -> LuaDeclSourceKey {
+        let workspace_id = self
+            .file_module_map
+            .get(&file_id)
+            .map(|module_info| module_info.workspace_id)
+            .unwrap_or(WorkspaceId::MAIN);
+        let (workspace_order, _) = self.workspace_order_priority(workspace_id);
+        LuaDeclSourceKey {
+            workspace_kind: self.workspace_kind_priority(workspace_id),
+            workspace_order,
+            workspace_id: workspace_id.id,
+            file_order_key,
+            file_id: file_id.id,
+            range: (range.start(), range.end()),
+        }
     }
 
     fn workspace_kind_priority(&self, workspace_id: WorkspaceId) -> u8 {

@@ -212,6 +212,16 @@ impl LuaTypeDecl {
         }
     }
 
+    /// Installs the effective alias origin selected from the per-site
+    /// contributions, or clears it when no contribution survives.
+    /// `add_alias_origin` stays for low-level tests that bypass the
+    /// contribution store.
+    pub fn set_alias_origin(&mut self, origin: Option<LuaType>) {
+        if let LuaTypeExtra::Alias { origin: slot, .. } = &mut self.extra {
+            *slot = origin;
+        }
+    }
+
     pub fn add_enum_base(&mut self, base_type: LuaType) {
         if let LuaTypeExtra::Enum { base, .. } = &mut self.extra {
             *base = Some(base_type);

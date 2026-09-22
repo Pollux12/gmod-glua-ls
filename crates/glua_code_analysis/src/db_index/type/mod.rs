@@ -15,8 +15,8 @@ use super::traits::LuaIndex;
 use crate::db_index::op_log;
 use crate::db_index::r#type::read_set::WriteKey;
 use crate::{
-    DbIndex, FileId, InFiled, LuaDeclId, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSignatureId,
-    db_index::r#type::type_decl::LuaTypeIdentifier,
+    DbIndex, FileId, InFiled, LuaDeclId, LuaDeclSourceKey, LuaMemberId, LuaMemberKey,
+    LuaMemberOwner, LuaSignatureId, db_index::r#type::type_decl::LuaTypeIdentifier,
 };
 pub use generic_param::GenericParam;
 pub use humanize_type::{
@@ -41,6 +41,27 @@ pub use types::*;
 pub struct LuaResolvedAliasType {
     pub alias_id: Option<LuaTypeDeclId>,
     pub typ: LuaType,
+}
+
+/// One declaration site's contribution to a shared `---@alias` payload.
+///
+/// Several files can declare the same alias name; each publishes its own
+/// origin and generic params keyed by its name-token site, and the index
+/// selects the effective pair atomically by [`LuaDeclSourceKey`] precedence
+/// instead of letting the last writer win. The losing contributions stay
+/// stored so removing the winner re-selects a survivor rather than dropping
+/// the alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaAliasSource {
+    /// The `---@alias` name-token site that published this contribution.
+    pub site: InFiled<TextRange>,
+    /// The origin type inferred at that site.
+    pub origin: LuaType,
+    /// The site's own generic params — `None` when the tag declared no
+    /// `---@generic` list at all.
+    pub generic_params: Option<Vec<GenericParam>>,
+    /// Deterministic precedence; the smallest key wins.
+    pub order_key: LuaDeclSourceKey,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -1288,8 +1309,16 @@ pub struct LuaTypeIndex {
     file_namespace: HashMap<FileId, String>,
     file_using_namespace: HashMap<FileId, Vec<String>>,
     file_types: HashMap<FileId, Vec<LuaTypeDeclId>>,
+    declaration_sites: HashMap<FileId, HashMap<TextRange, LuaTypeDeclId>>,
     full_name_type_map: HashMap<LuaTypeDeclId, LuaTypeDecl>,
     generic_params: HashMap<LuaTypeDeclId, Vec<GenericParam>>,
+    /// Per-site alias contributions: decl id → declaration site → payload.
+    /// The effective `LuaTypeExtra::Alias::origin` and `generic_params` entry
+    /// are the winning site's pair, re-selected on every publish/retract.
+    /// Removal walks the removed file's `file_types` decls and drops the
+    /// sites it owned — a contribution always lands on the decl the file's
+    /// own declaration produced.
+    alias_sources: HashMap<LuaTypeDeclId, HashMap<InFiled<TextRange>, LuaAliasSource>>,
     supers: HashMap<LuaTypeDeclId, Vec<InFiled<LuaSuperType>>>,
     /// Super-type edges by the file that declared them, so removing a file
     /// visits only its own edges instead of retaining over every edge in the
@@ -1386,7 +1415,9 @@ impl LuaTypeIndex {
             file_namespace: HashMap::default(),
             file_using_namespace: HashMap::default(),
             file_types: HashMap::default(),
+            declaration_sites: HashMap::default(),
             full_name_type_map: HashMap::default(),
+            alias_sources: HashMap::default(),
             generic_params: HashMap::default(),
             supers: HashMap::default(),
             supers_by_file: HashMap::default(),
@@ -1491,6 +1522,10 @@ impl LuaTypeIndex {
             );
         }
         let id = type_decl.get_id();
+        let sites = self.declaration_sites.entry(file_id).or_default();
+        for location in type_decl.get_locations() {
+            sites.insert(location.range, id.clone());
+        }
         self.file_types.entry(file_id).or_default().push(id.clone());
         self.decl_key_epochs
             .note((id.clone(), read_set::TypeDeclKind::Object));
@@ -1528,6 +1563,10 @@ impl LuaTypeIndex {
             );
         }
         if let Some(decl) = self.full_name_type_map.get_mut(decl_id) {
+            self.declaration_sites
+                .entry(file_id)
+                .or_default()
+                .insert(location.range, decl_id.clone());
             decl.add_location(location);
             self.file_types
                 .entry(file_id)
@@ -1583,6 +1622,23 @@ impl LuaTypeIndex {
             read_set::TypeDeclKind::Object,
         );
         self.full_name_type_map.get(&global_id)
+    }
+
+    /// Finds the declaration registered by this file at the given name-token range.
+    /// Registration fixes namespace and visibility at the declaration site;
+    /// later namespace tags and using directives must not retarget it.
+    pub fn find_type_decl_by_site(
+        &self,
+        file_id: FileId,
+        range: TextRange,
+    ) -> Option<&LuaTypeDecl> {
+        read_set::record_file_scoped(
+            &self.file_write_epochs,
+            &file_id,
+            read_set::FileScopedKind::TypeFile,
+        );
+        let id = self.declaration_sites.get(&file_id)?.get(&range)?;
+        self.get_type_decl(id)
     }
 
     pub fn find_type_decls(
@@ -1678,6 +1734,110 @@ impl LuaTypeIndex {
             read_set::TypeDeclKind::GenericParams,
         );
         self.generic_params.get(decl_id)
+    }
+
+    /// Publishes one declaration site's alias payload and re-selects the
+    /// effective origin/generic-params pair.
+    ///
+    /// The contribution is keyed by the site's `(file, name-token range)`, so
+    /// re-analyzing a file replaces its own site instead of appending, and
+    /// the winner is chosen by [`LuaDeclSourceKey`] precedence rather than
+    /// write order — two files declaring the same alias no longer oscillate
+    /// with ingestion order. Re-publishing an identical source is a no-op;
+    /// a hidden (losing) contribution only moves the file-scoped epoch.
+    pub fn set_alias_source(&mut self, decl_id: LuaTypeDeclId, source: LuaAliasSource) {
+        if op_log::recording() {
+            let decl_id2 = decl_id.clone();
+            let source2 = source.clone();
+            op_log::push(
+                op_log::Domain::Type,
+                Box::new([
+                    WriteKey::TypeDecl(decl_id.clone()),
+                    WriteKey::FileScoped(source.site.file_id),
+                ]),
+                move |db| db.get_type_index_mut().set_alias_source(decl_id2, source2),
+            );
+        }
+        let site = source.site.clone();
+        let file_id = site.file_id;
+        if self
+            .alias_sources
+            .get(&decl_id)
+            .and_then(|sources| sources.get(&site))
+            == Some(&source)
+        {
+            return;
+        }
+        self.alias_sources
+            .entry(decl_id.clone())
+            .or_default()
+            .insert(site, source);
+        self.reselect_alias_source(&decl_id);
+        self.file_write_epochs.note(file_id);
+    }
+
+    /// Installs the winning site's origin and generic params on the decl.
+    ///
+    /// Both slots move together from the same contribution, so an origin is
+    /// never instantiated against another file's params. An unchanged
+    /// effective value skips the semantic write — hidden contributions still
+    /// update — so a losing publish does not churn `generic_params` readers.
+    fn reselect_alias_source(&mut self, decl_id: &LuaTypeDeclId) {
+        let Some(sources) = self.alias_sources.get(decl_id) else {
+            return;
+        };
+        let winner = sources
+            .values()
+            .min_by(|a, b| a.order_key.cmp(&b.order_key));
+        let new_origin = winner.map(|source| &source.origin);
+        let new_params = winner.and_then(|source| source.generic_params.as_ref());
+
+        let origin_changed = self
+            .full_name_type_map
+            .get(decl_id)
+            .is_some_and(|decl| decl.get_alias_ref() != new_origin);
+        let params_changed = self.generic_params.get(decl_id) != new_params;
+        // Clone only the slots that actually move; the `alias_sources` borrow
+        // ends here so the writes below can take `&mut self`.
+        let new_origin = if origin_changed {
+            new_origin.cloned()
+        } else {
+            None
+        };
+        let new_params = if params_changed {
+            new_params.cloned()
+        } else {
+            None
+        };
+
+        if origin_changed {
+            if let Some(decl) = self.full_name_type_map.get_mut(decl_id) {
+                decl.set_alias_origin(new_origin);
+            }
+            self.decl_key_epochs
+                .note((decl_id.clone(), read_set::TypeDeclKind::Object));
+            self.note_type_decl_write();
+        }
+        if params_changed {
+            match new_params {
+                Some(params) => {
+                    self.generic_params.insert(decl_id.clone(), params);
+                }
+                None => {
+                    self.generic_params.remove(decl_id);
+                }
+            }
+            self.decl_key_epochs
+                .note((decl_id.clone(), read_set::TypeDeclKind::GenericParams));
+            self.note_type_decl_write();
+        }
+    }
+    /// Every stored alias contribution, borrowed, for deterministic snapshot
+    /// dumps of the complete index — the consumer sorts the records itself.
+    pub fn iter_alias_sources(&self) -> impl Iterator<Item = (&LuaTypeDeclId, &LuaAliasSource)> {
+        self.alias_sources
+            .iter()
+            .flat_map(|(decl_id, sources)| sources.values().map(move |source| (decl_id, source)))
     }
 
     pub fn add_super_type(
@@ -2018,8 +2178,13 @@ impl LuaTypeIndex {
     /// `LuaTypeDecl` under the same id. Side maps (supertypes, generic
     /// params, file_types) are owned by the replayed ops. Runs only on the
     /// merge thread.
+    ///
+    /// The installed object carries the alias origin the fork selected from
+    /// its partial view of the contributions; re-selecting restores the
+    /// canonical winner whenever this decl has any.
     pub(crate) fn replace_type_decl_object(&mut self, decl_id: &LuaTypeDeclId, decl: LuaTypeDecl) {
         self.full_name_type_map.insert(decl_id.clone(), decl);
+        self.reselect_alias_source(decl_id);
         self.note_type_decl_write();
         self.decl_key_epochs
             .note((decl_id.clone(), read_set::TypeDeclKind::Object));
@@ -3261,11 +3426,13 @@ impl LuaIndex for LuaTypeIndex {
         self.decl_key_epochs.clear();
         self.bound_decl_epochs.clear();
         self.fact_epochs.clear();
+        self.file_types.clear();
+        self.declaration_sites.clear();
         self.file_namespace.clear();
         self.file_using_namespace.clear();
-        self.file_types.clear();
         self.full_name_type_map.clear();
         self.generic_params.clear();
+        self.alias_sources.clear();
         self.supers.clear();
         self.supers_by_file.clear();
         self.sub_types.clear();
@@ -3303,6 +3470,7 @@ impl LuaTypeIndex {
         self.file_namespace.remove(&file_id);
         self.file_using_namespace.remove(&file_id);
         self.file_write_epochs.note(file_id);
+        self.declaration_sites.remove(&file_id);
         if let Some(type_id_list) = self.file_types.remove(&file_id) {
             for id in type_id_list {
                 let mut remove_type = false;
@@ -3322,6 +3490,22 @@ impl LuaTypeIndex {
 
                 if remove_type {
                     self.generic_params.remove(&id);
+                    self.alias_sources.remove(&id);
+                } else if self.alias_sources.contains_key(&id) {
+                    // The decl survives on other files' locations; drop this
+                    // file's sites and re-select — an emptied map clears the
+                    // effective pair, a surviving winner stays put.
+                    if let Some(sources) = self.alias_sources.get_mut(&id) {
+                        sources.retain(|site, _| site.file_id != file_id);
+                    }
+                    self.reselect_alias_source(&id);
+                    if self
+                        .alias_sources
+                        .get(&id)
+                        .is_some_and(|sources| sources.is_empty())
+                    {
+                        self.alias_sources.remove(&id);
+                    }
                 }
                 self.note_type_decl_write();
                 for kind in [
