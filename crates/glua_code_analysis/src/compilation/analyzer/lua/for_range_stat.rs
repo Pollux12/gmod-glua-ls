@@ -1,13 +1,14 @@
-use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat};
+use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaIndexExpr, LuaIndexKey};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
     DbIndex, FileId, FuncGenericBinding, FuncGenericBindingState, GenericTplId, InferFailReason,
-    LuaAliasCallKind, LuaAliasCallType, LuaDeclId, LuaInferCache, LuaMemberKey, LuaMemberOwner,
-    LuaObjectType, LuaOperatorMetaMethod, LuaType, LuaTypeCache, TplContext, TypeOps,
-    TypeSubstitutor, VariadicType,
+    LuaAliasCallKind, LuaAliasCallType, LuaDeclId, LuaInferCache, LuaMemberInfo, LuaMemberKey,
+    LuaMemberOwner, LuaObjectType, LuaOperatorMetaMethod, LuaSemanticDeclId, LuaType, LuaTypeCache,
+    TplContext, TypeOps, TypeSubstitutor, VariadicType,
     compilation::analyzer::{
         common::{TypeCacheWriteMode, write_type_cache},
+        dynamic_field::for_range_pairs_source_for_var,
         is_provably_builtin_iterator_call,
         unresolve::UnResolveIterVar,
     },
@@ -486,34 +487,101 @@ fn try_infer_pairs_iter_types_from_table_members(
     // Sort borrowed entries: the walk below only needs each member's `typ`
     // clone, so cloning the whole map's keys and info vectors up front would
     // pay a second deep clone of every member type for nothing.
-    let mut member_entries = members.iter().collect::<Vec<_>>();
-    member_entries.sort_by_key(|(key, _)| member_key_stable_key(key));
+    let mut member_entries = members
+        .iter()
+        .map(|(key, infos)| (key, infos, false))
+        .collect::<Vec<_>>();
+    member_entries.sort_by_key(|(key, _, _)| member_key_stable_key(key));
 
     // A dynamic key aliases every access whose key infers to the same type
     // rather than naming a member, so once one is present the literal keys
     // beside it are a sample of the indices some file happened to write, not
     // the table's key domain. Which samples are in the map depends on how far
     // inference had progressed, so the keys are reported by kind.
+    //
+    // A member filed by writing the iterated table back through this loop's
+    // own key variable (`T[k] = v` inside `for k in pairs(T)`) is feedback,
+    // not evidence: its key was minted from the loop variable's settling
+    // answer, so counting it would widen the very domain being derived. Such
+    // a member is excluded from the key domain — and from the sampling
+    // decision — only when every writer under the key is one of these
+    // self-writes and the key variable was not reassigned before the write;
+    // a reassigned key or an independent writer under the same key is real
+    // computed-key evidence.
+    let file_id = cache.get_file_id();
+    let key_decl_id = iter_expr
+        .syntax()
+        .ancestors()
+        .find_map(LuaForRangeStat::cast)
+        .and_then(|for_range| for_range.get_var_name_list().next())
+        .map(|name| LuaDeclId::new(file_id, name.get_position()));
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .map(|tree| tree.get_red_root());
+    let self_write_only = |member_infos: &[LuaMemberInfo]| {
+        let (Some(key_decl_id), Some(root)) = (key_decl_id, root.as_ref()) else {
+            return false;
+        };
+        !member_infos.is_empty()
+            && member_infos.iter().all(|member| {
+                let Some(LuaSemanticDeclId::Member(member_id)) = &member.property_owner_id else {
+                    return false;
+                };
+                if member_id.file_id != file_id {
+                    return false;
+                }
+                let Some(index_expr) = member_id
+                    .get_syntax_id()
+                    .to_node_from_root(root)
+                    .and_then(LuaIndexExpr::cast)
+                else {
+                    return false;
+                };
+                let Some(LuaIndexKey::Expr(LuaExpr::NameExpr(name_expr))) =
+                    index_expr.get_index_key()
+                else {
+                    return false;
+                };
+                let Some(source) = for_range_pairs_source_for_var(db, file_id, &name_expr, 0)
+                else {
+                    return false;
+                };
+                if source.iter_decl_id != key_decl_id {
+                    return false;
+                }
+                db.get_reference_index()
+                    .first_local_reassignment(file_id, &key_decl_id)
+                    .is_none_or(|position| position >= index_expr.get_position())
+            })
+    };
+    for (_, member_infos, self_feedback) in &mut member_entries {
+        *self_feedback = self_write_only(member_infos);
+    }
     let keys_are_sampled = member_entries
         .iter()
-        .any(|(key, _)| matches!(key, LuaMemberKey::ExprType(_)));
+        .any(|(key, _, self_feedback)| matches!(key, LuaMemberKey::ExprType(_)) && !self_feedback);
 
-    for (key, member_infos) in member_entries {
-        let key_type = if keys_are_sampled {
-            match table_projection_member_key_type(key) {
-                Some(typ) => typ,
-                None => continue,
-            }
-        } else {
-            match key {
-                LuaMemberKey::Integer(i) => LuaType::IntegerConst(*i),
-                LuaMemberKey::Name(name) => LuaType::StringConst(name.clone().into()),
-                LuaMemberKey::ExprType(typ) => typ.clone(),
-                LuaMemberKey::None => continue,
-            }
-        };
-        keys.push(key_type);
+    for (key, member_infos, self_feedback) in member_entries {
+        if !self_feedback {
+            let key_type = if keys_are_sampled {
+                match table_projection_member_key_type(key) {
+                    Some(typ) => typ,
+                    None => continue,
+                }
+            } else {
+                match key {
+                    LuaMemberKey::Integer(i) => LuaType::IntegerConst(*i),
+                    LuaMemberKey::Name(name) => LuaType::StringConst(name.clone().into()),
+                    LuaMemberKey::ExprType(typ) => typ.clone(),
+                    LuaMemberKey::None => continue,
+                }
+            };
+            keys.push(key_type);
+        }
 
+        // The value half of a self-write is still evidence about what the
+        // table holds; only its key-domain contribution is circular.
         let value_type = match member_infos.as_slice() {
             [] => LuaType::Any,
             [member] => member.typ.clone(),

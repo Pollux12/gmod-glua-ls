@@ -7,8 +7,8 @@ mod test {
     use smol_str::SmolStr;
 
     use crate::{
-        GenericTpl, GenericTplId, GlobalId, LuaMemberOwner, LuaType, LuaUnionType,
-        VirtualWorkspace, compilation::analyzer::settled_assign_write_committable,
+        GenericTpl, GenericTplId, GlobalId, LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType,
+        VirtualWorkspace, compilation::analyzer::settled_assign_write_committable, get_member_map,
     };
 
     #[test]
@@ -1183,5 +1183,189 @@ mod test {
         // member key must move after `kb` settles, forcing the unfiltered
         // round that rederives the second loop.
         assert_eq!(ws.expr_ty("mp_key_out"), kb_ty);
+    }
+
+    /// `T[k] = v` inside `pairs(T)` writes the iterated table back through its
+    /// own loop key. The write's member key is minted while `k` is still a
+    /// settling iter var, so it lands as `ExprType(Unknown)`; the loop's retry
+    /// then enumerates that placeholder as a sampled dynamic key and the exact
+    /// `a|b` domain degrades to `string|unknown`. The self-write is feedback,
+    /// not evidence: the key domain must stay exactly the member names.
+    ///
+    /// The copies are read through the declaration caches — a global copy
+    /// could answer from flow facts and mask a stale lifetime type.
+    #[test]
+    fn pairs_self_write_key_feedback_keeps_exact_key_domain() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_ids = ws.def_files(vec![(
+            "lua/autorun/a_pairs_self_write.lua",
+            r#"
+            local T = { a = "x", b = "y" }
+            for k, v in pairs(T) do
+                T[k] = v
+                local observed_key = k
+                local observed_value = v
+            end
+            "#,
+        )]);
+        let loop_file = file_ids[0];
+
+        let expected_keys: HashSet<_> = vec![
+            LuaType::StringConst(SmolStr::new("a").into()),
+            LuaType::StringConst(SmolStr::new("b").into()),
+        ]
+        .into_iter()
+        .collect();
+        let assert_domain = |ws: &mut VirtualWorkspace| {
+            let key_ty = settled_assign_decl_cached_ty(ws, loop_file, "observed_key")
+                .expect("observed_key cache");
+            let LuaType::Union(key_union) = &key_ty else {
+                panic!("expected exact key domain union, got {key_ty:?}");
+            };
+            assert_eq!(key_union.into_set(), expected_keys);
+
+            let k_ty = settled_assign_decl_cached_ty(ws, loop_file, "k").expect("k cache");
+            assert_eq!(k_ty, key_ty);
+
+            let value_ty = settled_assign_decl_cached_ty(ws, loop_file, "observed_value")
+                .expect("observed_value cache");
+            let concrete_strings = match &value_ty {
+                LuaType::String => true,
+                LuaType::Union(union) => union
+                    .types()
+                    .all(|arm| matches!(arm, LuaType::StringConst(_))),
+                _ => false,
+            };
+            assert!(
+                concrete_strings,
+                "expected concrete string values, got {value_ty:?}"
+            );
+        };
+
+        assert_domain(&mut ws);
+        ws.analysis.reindex_files_without_expansion(vec![loop_file]);
+        assert_domain(&mut ws);
+    }
+
+    /// The same write is genuine evidence when the key is unknowable on its
+    /// own: `k` reassigned from an untyped call result before `T[k] = v` must
+    /// still file an `ExprType(Unknown)` member on `T`. Filtering
+    /// `ExprType(Unknown)` member keys outright — the tempting fix for the
+    /// self-write — would drop this evidence. The loop key's own settled
+    /// answer is not asserted here: a reassigned loop variable is a separate
+    /// behavior, and the before-assignment copy reads whatever the walk had
+    /// derived at that point.
+    #[test]
+    fn pairs_self_write_with_unknowable_key_keeps_unknown_member() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_ids = ws.def_files(vec![(
+            "lua/autorun/a_pairs_self_write_unknown.lua",
+            r#"
+            local T = { a = "x", b = "y" }
+            local function f(mk)
+                for k, v in pairs(T) do
+                    k = mk()
+                    T[k] = v
+                end
+            end
+            "#,
+        )]);
+        let loop_file = file_ids[0];
+
+        let t_ty = settled_assign_decl_cached_ty(&mut ws, loop_file, "T").expect("T cache");
+        let db = ws.get_db_mut();
+        let t_members = get_member_map(db, &t_ty).expect("T member map");
+        assert!(
+            t_members
+                .keys()
+                .any(|key| matches!(key, LuaMemberKey::ExprType(LuaType::Unknown))),
+            "expected computed-key member on T, got {:?}",
+            t_members.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// An independent `ExprType(Unknown)` write sharing the member key the
+    /// self-write mints must survive: removing the placeholder contribution
+    /// may not take `T[mk()] = 1`'s evidence with it. The loop key stays
+    /// `string|unknown` because the dynamic write is real.
+    #[test]
+    fn pairs_self_write_does_not_remove_independent_unknown_key() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_ids = ws.def_files(vec![(
+            "lua/autorun/a_pairs_self_write_shared.lua",
+            r#"
+            local T = { a = "x", b = "y" }
+            local function f(mk)
+                T[mk()] = 1
+                for k, v in pairs(T) do
+                    T[k] = v
+                    local observed_key = k
+                end
+            end
+            "#,
+        )]);
+        let loop_file = file_ids[0];
+
+        let key_ty = settled_assign_decl_cached_ty(&mut ws, loop_file, "observed_key")
+            .expect("observed_key cache");
+        let LuaType::Union(key_union) = &key_ty else {
+            panic!("expected sampled key union, got {key_ty:?}");
+        };
+        let key_set = key_union.into_set();
+        assert!(
+            key_set.contains(&LuaType::Unknown),
+            "unknown arm in {key_set:?}"
+        );
+        assert!(
+            key_set.contains(&LuaType::String),
+            "string arm in {key_set:?}"
+        );
+    }
+
+    /// `U[k] = v` writes a different table through the settling key: the
+    /// dynamic member lands on `U`, never on `T`, so `T`'s domain is exactly
+    /// its own members — including `other`, contributed by a sibling write
+    /// outside the literal — while `U` holds the computed-key member.
+    #[test]
+    fn pairs_iter_var_write_to_sibling_table_stays_off_the_iterated_domain() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_ids = ws.def_files(vec![(
+            "lua/autorun/a_pairs_sibling_write.lua",
+            r#"
+            local T = { a = "x", b = "y" }
+            local U = {}
+            for k, v in pairs(T) do
+                U[k] = v
+                local observed_key = k
+            end
+            T.other = "z"
+            "#,
+        )]);
+        let loop_file = file_ids[0];
+
+        let key_ty = settled_assign_decl_cached_ty(&mut ws, loop_file, "observed_key")
+            .expect("observed_key cache");
+        let LuaType::Union(key_union) = &key_ty else {
+            panic!("expected exact key domain union, got {key_ty:?}");
+        };
+        let expected_keys: HashSet<_> = vec![
+            LuaType::StringConst(SmolStr::new("a").into()),
+            LuaType::StringConst(SmolStr::new("b").into()),
+            LuaType::StringConst(SmolStr::new("other").into()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(key_union.into_set(), expected_keys);
+
+        let u_ty = settled_assign_decl_cached_ty(&mut ws, loop_file, "U").expect("U cache");
+        let db = ws.get_db_mut();
+        let u_members = get_member_map(db, &u_ty).expect("U member map");
+        assert!(
+            u_members
+                .keys()
+                .any(|key| matches!(key, LuaMemberKey::ExprType(_))),
+            "expected computed-key member on U, got {:?}",
+            u_members.keys().collect::<Vec<_>>()
+        );
     }
 }
