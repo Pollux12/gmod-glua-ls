@@ -176,6 +176,7 @@ impl Engine {
                 .stale_readers(key, self.key_holds(db, key))
                 .collect::<Vec<_>>();
             for reader in readers {
+                self.stats.requeued(key, self.cursor, reader);
                 match reader.kind {
                     DerivationKind::Diagnostics => {}
                     DerivationKind::Source => {
@@ -270,7 +271,16 @@ impl Engine {
                     .map(|member| member.file_id)
                     .filter(|file_id| *file_id != crate::FileId::VIRTUAL),
             );
+            let started = self.stats.profiling().then(std::time::Instant::now);
             let touched = evaluate_group(db, &group, recipe);
+            if let Some(started) = started {
+                *self.stats.time.entry(id.kind).or_default() += started.elapsed();
+                for member in &group {
+                    for key in db.reader_graph().reads_of(*member) {
+                        *self.stats.reads.entry(variant_name(key)).or_default() += 1;
+                    }
+                }
+            }
             // A member that now shares a key with a derivation outside the
             // group ran without it; the next evaluation takes both.
             let widened = group.iter().find_map(|member| {
@@ -306,9 +316,39 @@ pub(crate) struct EngineStats {
     evaluations: BTreeMap<DerivationKind, usize>,
     /// Rounds after the first.
     pub(crate) rounds: usize,
+    /// Under `GLUALS_PROFILE`: time per kind, and how often a key's move
+    /// queued a reader, by key variant and the writer's and reader's kinds.
+    time: BTreeMap<DerivationKind, std::time::Duration>,
+    requeues: BTreeMap<(String, Option<DerivationKind>, DerivationKind), usize>,
+    /// Recorded reads by key variant.
+    reads: BTreeMap<String, usize>,
+}
+
+fn variant_name(key: &FactKey) -> String {
+    let name = format!("{key:?}");
+    name.split(['(', ' '])
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 impl EngineStats {
+    fn profiling(&self) -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("GLUALS_PROFILE").is_some())
+    }
+
+    fn requeued(&mut self, key: &FactKey, writer: Option<DerivationId>, reader: DerivationId) {
+        if !self.profiling() {
+            return;
+        }
+        let variant = variant_name(key);
+        *self
+            .requeues
+            .entry((variant, writer.map(|writer| writer.kind), reader.kind))
+            .or_default() += 1;
+    }
+
     fn evaluated(&mut self, id: DerivationId) {
         *self.evaluations.entry(id.kind).or_default() += 1;
     }
@@ -339,6 +379,28 @@ impl EngineStats {
             self.rounds,
             kinds.join(" ")
         );
+        let mut time = self.time.iter().collect::<Vec<_>>();
+        time.sort_by(|left, right| right.1.cmp(left.1));
+        for (kind, time) in time {
+            eprintln!("[engine] time {kind:?} {time:?}");
+        }
+        let mut reads = self.reads.iter().collect::<Vec<_>>();
+        reads.sort_by(|left, right| right.1.cmp(left.1));
+        let total = reads.iter().map(|(_, count)| **count).sum::<usize>();
+        eprintln!("[engine] recorded reads {total}");
+        for (variant, count) in reads.into_iter().take(25) {
+            eprintln!("[engine] reads {count} {variant}");
+        }
+        let mut requeues = self.requeues.iter().collect::<Vec<_>>();
+        requeues.sort_by(|left, right| right.1.cmp(left.1));
+        for ((variant, writer, reader), count) in requeues.into_iter().take(60) {
+            let back = if writer.is_some_and(|writer| reader.rank() < writer.rank()) {
+                " back"
+            } else {
+                ""
+            };
+            eprintln!("[engine] queued {count} {variant} {writer:?} -> {reader:?}{back}");
+        }
     }
 }
 
