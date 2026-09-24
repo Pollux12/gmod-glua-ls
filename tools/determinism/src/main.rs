@@ -301,10 +301,6 @@ struct IndexSnapshot {
     signature_casts: BTreeMap<String, String>,
     special_call_effects: BTreeMap<String, String>,
     special_call_facts: BTreeMap<String, String>,
-    /// Sites where a special-call write was recorded. Only the site set is
-    /// snapshotted: the version values are a monotonic epoch, so they differ
-    /// between a cold build and any re-index of the same text.
-    special_call_write_sites: BTreeMap<String, String>,
     accessor_func_annotations: HashDumpResult,
     accessor_func_annotation_files: HashDumpResult,
     numeric_range_file_populations: HashDumpResult,
@@ -742,14 +738,6 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         let text = format!("{fact:?}");
         special_call_facts.insert(text.clone(), text);
     }
-    // Only the site set is semantic: the version values are a monotonic epoch
-    // bumped once per novel write, so a re-index of unchanged text rewrites
-    // them. Facts and effects carry the semantic payload.
-    let mut special_call_write_sites = BTreeMap::new();
-    for &(file_id, position) in flow.special_call_write_sites() {
-        let site = format!("{}|{position:?}", file_label(analysis, file_id));
-        special_call_write_sites.insert(site.clone(), site);
-    }
     let mut inferred_params = BTreeMap::new();
     for (signature_id, param_idx, fact) in db.get_call_site_param_index().iter_inferred_params() {
         inferred_params.insert(
@@ -1148,7 +1136,7 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
     }
 
     eprintln!(
-        "[{label}] index type_caches={} members={} net_flows={} flow_trees={} signature_casts={} special_call_effects={} special_call_facts={} special_call_sites={} accessor_annotations={} accessor_annotation_files={} numeric_range_files={} numeric_range_globals={} type_decl_states={} type_decl_generic_params={} ({:.2}s)",
+        "[{label}] index type_caches={} members={} net_flows={} flow_trees={} signature_casts={} special_call_effects={} special_call_facts={} accessor_annotations={} accessor_annotation_files={} numeric_range_files={} numeric_range_globals={} type_decl_states={} type_decl_generic_params={} ({:.2}s)",
         type_caches.len(),
         members.len(),
         net_flows.len(),
@@ -1156,7 +1144,6 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         signature_casts.len(),
         special_call_effects.len(),
         special_call_facts.len(),
-        special_call_write_sites.len(),
         accessor_func_annotations.hashes.len(),
         accessor_func_annotation_files.hashes.len(),
         numeric_range_file_populations.hashes.len(),
@@ -1181,7 +1168,6 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         signature_casts,
         special_call_effects,
         special_call_facts,
-        special_call_write_sites,
         accessor_func_annotations: accessor_func_annotations.finish(),
         accessor_func_annotation_files: accessor_func_annotation_files.finish(),
         numeric_range_file_populations: numeric_range_file_populations.finish(),
@@ -1239,7 +1225,6 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
             ("CAST", &snapshot.signature_casts),
             ("SCEFFECT", &snapshot.special_call_effects),
             ("SCFACT", &snapshot.special_call_facts),
-            ("SCSITE", &snapshot.special_call_write_sites),
         ] {
             for (key, value) in map {
                 out.push_str(&format!("{tag} {key} = {value}\n"));
@@ -1460,12 +1445,6 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
             "SCFACT",
             &base.special_call_facts,
             &other.special_call_facts,
-        ),
-        (
-            "special_call_write_sites",
-            "SCSITE",
-            &base.special_call_write_sites,
-            &other.special_call_write_sites,
         ),
         (
             "class_members",

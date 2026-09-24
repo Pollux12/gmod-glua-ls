@@ -24,20 +24,13 @@ pub struct LuaFlowIndex {
     /// [`FlowTree::content_fingerprint`] of each stored tree.
     flow_tree_fingerprints: HashMap<FileId, Fingerprint>,
     special_call_effects: HashMap<FileId, HashMap<TextSize, Vec<LuaSpecialCallEffect>>>,
-    /// Every special-call fact the epoch below has counted, keyed canonically.
+    /// Every special-call fact installed, keyed canonically.
     /// One call-site can install several facts (a synthesized class plus its
     /// super edge, say), and several call-sites can install facts for the same
     /// class, so neither the call-site nor the installed identity alone tells
     /// a replay from a novel fact: the pair does. Re-settling an identical
-    /// fact set hits this record in any visit order and bumps nothing.
+    /// fact set hits this record in any visit order and adds nothing.
     settled_special_call_facts: HashSet<SpecialCallFact>,
-    /// Count of special-call materializations, keyed by the call-site that
-    /// produced them. Special calls publish str-tpl decls, super edges,
-    /// `__call` installs and flow effects from the unresolve items, so without
-    /// this counter every such settle looks like unversioned state and forces
-    /// a full fixpoint requeue.
-    special_call_writes: u64,
-    special_call_write_versions: HashMap<(FileId, TextSize), u64>,
     /// Multiset fingerprint of `settled_special_call_facts` per site.
     special_call_fact_fingerprints: HashMap<(FileId, TextSize), Fingerprint>,
 }
@@ -55,8 +48,6 @@ impl LuaFlowIndex {
             flow_tree_fingerprints: HashMap::default(),
             special_call_effects: HashMap::default(),
             settled_special_call_facts: HashSet::default(),
-            special_call_writes: 0,
-            special_call_write_versions: HashMap::default(),
             special_call_fact_fingerprints: HashMap::default(),
         }
     }
@@ -78,10 +69,6 @@ impl LuaFlowIndex {
     }
 
     /// Installs one special-call effect, reporting whether it was new.
-    ///
-    /// Re-settling an identical call replays the same effects: only a novel
-    /// fact may bump the special-call epoch, or the fixpoint's staleness
-    /// filter degrades to a full requeue.
     pub fn add_special_call_effect(
         &mut self,
         file_id: FileId,
@@ -115,15 +102,9 @@ impl LuaFlowIndex {
         true
     }
 
-    /// Records special-call facts a settle installed, bumping the epoch once
-    /// when any of them is novel.
-    ///
-    /// The duplicate check, the record and the version bump happen together
-    /// under one `&mut` borrow, so two settlements of the same fact cannot
-    /// interleave a duplicate check past each other: the second sees the
-    /// first's record whatever order the pass visits them in. Callers consult
-    /// this only after their own index reported the install novel; the record
-    /// here is what makes the replay of an identical fact set bump nothing.
+    /// Records special-call facts a settle installed, reporting whether any of
+    /// them is novel. Replaying an identical fact set in any order adds
+    /// nothing.
     pub(crate) fn install_special_call_facts(
         &mut self,
         file_id: FileId,
@@ -147,28 +128,9 @@ impl LuaFlowIndex {
         novel
     }
 
-    /// Compare it across an operation to tell whether the operation
-    /// materialized a novel special-call fact.
-    pub fn special_call_writes(&self) -> u64 {
-        self.special_call_writes
-    }
-
-    /// Records a special-call materialization at `position` in `file_id`.
-    /// Callers bump only when the write added a novel fact; re-settling an
-    /// identical call-site must not bump, or the fixpoint's staleness filter
-    /// degrades to a full requeue.
+    /// Notes a novel special-call materialization at `position` in `file_id`.
     pub(crate) fn note_special_call_write(&mut self, file_id: FileId, position: TextSize) {
         derivation::note_write(|| FactKey::SpecialCall(file_id, position));
-        self.special_call_writes += 1;
-        self.special_call_write_versions
-            .insert((file_id, position), self.special_call_writes);
-    }
-
-    /// Iterates the special-call write sites recorded so far, exposing only
-    /// the `(FileId, TextSize)` keys — never the epoch values — so callers can
-    /// compare write-site sets without observing internal versioning.
-    pub fn special_call_write_sites(&self) -> impl Iterator<Item = &(FileId, TextSize)> {
-        self.special_call_write_versions.keys()
     }
 
     /// Rewrites the types stored on special-call effects.
@@ -217,8 +179,6 @@ impl LuaFlowIndex {
         self.settled_special_call_facts
             .retain(|fact| fact.site() != (file_id, position));
         self.special_call_fact_fingerprints
-            .remove(&(file_id, position));
-        self.special_call_write_versions
             .remove(&(file_id, position));
     }
 
@@ -363,7 +323,6 @@ impl LuaIndex for LuaFlowIndex {
         self.special_call_fact_fingerprints.clear();
         self.special_call_effects.clear();
         self.settled_special_call_facts.clear();
-        self.special_call_write_versions.clear();
     }
 }
 
@@ -537,10 +496,10 @@ mod tests {
         VarRefId::VarRef(crate::LuaDeclId::new(file_id, TextSize::new(0)))
     }
 
-    /// Re-installing an identical effect reports a duplicate and must not
-    /// bump, or the fixpoint filter degrades to a full requeue.
+    /// Re-installing an identical effect reports a duplicate and stores it
+    /// once.
     #[test]
-    fn reinstalling_identical_special_call_effect_bumps_no_epoch() {
+    fn reinstalling_identical_special_call_effect_is_a_duplicate() {
         let mut index = LuaFlowIndex::new();
         let file_id = FileId::new(1);
         let position = TextSize::new(16);
@@ -551,15 +510,12 @@ mod tests {
             effect_target(file_id),
             LuaType::String,
         ));
-        assert_eq!(index.special_call_writes(), 1);
-
         assert!(!index.add_special_call_effect(
             file_id,
             position,
             effect_target(file_id),
             LuaType::String,
         ));
-        assert_eq!(index.special_call_writes(), 1);
         assert_eq!(
             index
                 .get_special_call_effects(&file_id, position)
@@ -608,8 +564,8 @@ mod tests {
         SpecialCallFact::flow_effect(site.0, site.1, effect_target(site.0), LuaType::String)
     }
 
-    /// Settling the same fact set in two orders reaches the same epoch, and
-    /// the second pass bumps nothing in either order: identical facts always
+    /// Settling the same fact set in two orders reaches the same facts, and
+    /// the second pass adds nothing in either order: identical facts always
     /// build identical keys no matter how the pass interleaves the sites.
     #[test]
     fn special_call_facts_settle_identically_in_any_order() {
@@ -638,25 +594,20 @@ mod tests {
         for ((file_id, position), facts) in &pass_a {
             assert!(first_order.install_special_call_facts(*file_id, *position, facts.clone()));
         }
-        let writes_after_first_pass = first_order.special_call_writes();
-        assert_eq!(writes_after_first_pass, 2);
-
         // Pass B replays the identical fact set site by site in reverse order:
-        // every fact is a duplicate and bumps nothing.
+        // every fact is a duplicate.
         for ((file_id, position), facts) in &pass_b {
             assert!(
                 !first_order.install_special_call_facts(*file_id, *position, facts.clone()),
-                "replaying an identical fact must not bump"
+                "replaying an identical fact is a duplicate"
             );
         }
-        assert_eq!(first_order.special_call_writes(), writes_after_first_pass);
 
-        // A fresh index settled B-first reaches the same epoch and fact set.
+        // A fresh index settled B-first reaches the same fact set.
         let mut second_order = LuaFlowIndex::new();
         for ((file_id, position), facts) in &pass_b {
             assert!(second_order.install_special_call_facts(*file_id, *position, facts.clone()));
         }
-        assert_eq!(second_order.special_call_writes(), writes_after_first_pass);
         assert_eq!(
             second_order.settled_special_call_facts, first_order.settled_special_call_facts,
             "the fact set must not depend on visit order"
@@ -664,22 +615,20 @@ mod tests {
         for ((file_id, position), facts) in &pass_a {
             assert!(
                 !second_order.install_special_call_facts(*file_id, *position, facts.clone()),
-                "replaying an identical fact must not bump"
+                "replaying an identical fact is a duplicate"
             );
         }
-        assert_eq!(second_order.special_call_writes(), writes_after_first_pass);
     }
 
-    /// A re-settled duplicate inside one batch bumps once for the batch, not
-    /// once per fact: the epoch counts materializations, not keys.
+    /// A duplicate inside one batch is stored once.
     #[test]
-    fn duplicate_fact_inside_one_batch_bumps_once() {
+    fn duplicate_fact_inside_one_batch_is_stored_once() {
         let mut index = LuaFlowIndex::new();
         let site = (FileId::new(1), TextSize::new(16));
         let fact = flow_effect_fact(site);
 
         assert!(index.install_special_call_facts(site.0, site.1, [fact.clone(), fact]));
-        assert_eq!(index.special_call_writes(), 1);
+        assert_eq!(index.settled_special_call_facts().count(), 1);
     }
 
     /// Removing a file evicts its fact records, so reinstalling the same facts
@@ -690,7 +639,6 @@ mod tests {
         let site = (FileId::new(1), TextSize::new(16));
         assert!(index.install_special_call_facts(site.0, site.1, [str_tpl_decl_fact(site)]));
         assert!(!index.install_special_call_facts(site.0, site.1, [str_tpl_decl_fact(site)]));
-        let writes_before_remove = index.special_call_writes();
 
         index.remove(site.0);
 
@@ -698,6 +646,5 @@ mod tests {
             index.install_special_call_facts(site.0, site.1, [str_tpl_decl_fact(site)]),
             "a fact dropped with its file must count as novel when rebuilt"
         );
-        assert!(index.special_call_writes() > writes_before_remove);
     }
 }

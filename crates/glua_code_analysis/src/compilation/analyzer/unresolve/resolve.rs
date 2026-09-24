@@ -3172,6 +3172,21 @@ mod tests {
         util.TraceLine(traceData)
     "#;
 
+    /// Everything special calls have settled, as sorted text.
+    fn special_call_snapshot(db: &DbIndex) -> Vec<String> {
+        let flow = db.get_flow_index();
+        let mut snapshot = flow
+            .settled_special_call_facts()
+            .map(|fact| format!("{fact:?}"))
+            .chain(
+                flow.special_call_effects()
+                    .map(|entry| format!("{entry:?}")),
+            )
+            .collect::<Vec<_>>();
+        snapshot.sort();
+        snapshot
+    }
+
     fn special_call_workspace() -> (
         crate::VirtualWorkspace,
         Vec<(FileId, Vec<glua_parser::LuaCallExpr>)>,
@@ -3187,7 +3202,7 @@ mod tests {
         ];
         let db = ws.get_db_mut();
         assert!(
-            db.get_flow_index().special_call_writes() > 0,
+            !special_call_snapshot(db).is_empty(),
             "the fixture must settle special-call facts"
         );
         let generated = LuaTypeDeclId::global("prop_vehicle_jeep");
@@ -3214,16 +3229,16 @@ mod tests {
         (ws, sites)
     }
 
-    /// Re-drives every special-call site in `order`, returning how much the
-    /// replay moved the special-call epoch.
+    /// Re-drives every special-call site in `order`, returning whether the
+    /// replay changed what special calls have settled.
     fn resettle_special_calls(
         db: &mut DbIndex,
         sites: &[(FileId, Vec<glua_parser::LuaCallExpr>)],
         order: &[usize],
-    ) -> u64 {
+    ) -> bool {
         use super::{UnResolveSpecialCall, try_resolve_special_call};
 
-        let before = db.get_flow_index().special_call_writes();
+        let before = special_call_snapshot(db);
         for &idx in order {
             let (file_id, calls) = &sites[idx];
             for call_expr in calls {
@@ -3236,40 +3251,38 @@ mod tests {
                     .expect("expected the settled call to re-derive");
             }
         }
-        db.get_flow_index().special_call_writes() - before
+        special_call_snapshot(db) != before
     }
 
-    /// Replaying the same special-call fact set in two orders bumps nothing on
-    /// the second pass: identical facts build identical dedup keys however the
-    /// pass interleaves the sites, so the fixpoint's novelty trigger stays
-    /// quiet on re-settle.
+    /// Replaying the same special-call fact set in two orders changes nothing
+    /// on the second pass: identical facts build identical dedup keys however
+    /// the pass interleaves the sites.
     #[test]
-    fn resettling_special_calls_in_any_order_bumps_no_special_epoch() {
+    fn resettling_special_calls_in_any_order_changes_nothing() {
         use glua_parser::LuaAstNode;
 
         let (mut ws, mut sites) = special_call_workspace();
 
         let db = ws.get_db_mut();
-        assert_eq!(
-            resettle_special_calls(db, &sites, &[0, 1, 2]),
-            0,
-            "replaying settled special calls must not bump"
+        assert!(
+            !resettle_special_calls(db, &sites, &[0, 1, 2]),
+            "replaying settled special calls changes nothing"
         );
-        assert_eq!(
-            resettle_special_calls(db, &sites, &[2, 1, 0]),
-            0,
-            "replaying settled special calls in reverse order must not bump"
+        assert!(
+            !resettle_special_calls(db, &sites, &[2, 1, 0]),
+            "replaying settled special calls in reverse order changes nothing"
         );
 
-        // The epoch is live, not stuck: a genuinely new class still counts.
-        let live_before = db.get_flow_index().special_call_writes();
+        // A genuinely new class still settles.
+        let live_before = special_call_snapshot(db);
         let caller_d = ws.def_file(
             "caller_d.lua",
             r#"local found_d = ents.FindByClass("prop_vehicle_apc")"#,
         );
-        assert!(
-            ws.get_db_mut().get_flow_index().special_call_writes() > live_before,
-            "a novel class install must still bump the epoch"
+        assert_ne!(
+            special_call_snapshot(ws.get_db_mut()),
+            live_before,
+            "a novel class install still settles"
         );
         let db = ws.get_db_mut();
         let new_calls = db
@@ -3280,17 +3293,16 @@ mod tests {
             .descendants::<glua_parser::LuaCallExpr>()
             .collect::<Vec<_>>();
         sites.push((caller_d, new_calls));
-        assert_eq!(
-            resettle_special_calls(db, &sites, &[3, 2, 1, 0]),
-            0,
-            "replaying after a novel install must not bump again"
+        assert!(
+            !resettle_special_calls(db, &sites, &[3, 2, 1, 0]),
+            "replaying after a novel install changes nothing"
         );
     }
 
-    /// Defining the same callers in the opposite order settles the same epoch:
+    /// Defining the same callers in the opposite order settles as many facts:
     /// which site materializes a shared fact first must not change the count.
     #[test]
-    fn mirrored_workspaces_settle_special_calls_to_same_special_epoch() {
+    fn mirrored_workspaces_settle_the_same_number_of_special_call_facts() {
         let mut forward = crate::VirtualWorkspace::new();
         forward.def_file("defs.lua", SPECIAL_DEFS);
         forward.def_file("caller_a.lua", SPECIAL_CALLER_A);
@@ -3304,16 +3316,16 @@ mod tests {
         reverse.def_file("caller_a.lua", SPECIAL_CALLER_A);
 
         assert_eq!(
-            forward.get_db_mut().get_flow_index().special_call_writes(),
-            reverse.get_db_mut().get_flow_index().special_call_writes(),
-            "definition order must not change the settled special-call epoch"
+            special_call_snapshot(forward.get_db_mut()).len(),
+            special_call_snapshot(reverse.get_db_mut()).len(),
+            "definition order must not change how many facts settle"
         );
     }
 
     /// A constructor call's `__call` install reports itself the same way on
-    /// replay without moving the epoch: an existing install is not novel.
+    /// replay without changing anything: an existing install is not novel.
     #[test]
-    fn resettling_constructor_special_call_bumps_no_special_epoch() {
+    fn resettling_constructor_special_call_changes_nothing() {
         use glua_parser::LuaAstNode;
 
         use super::{UnResolveSpecialCall, try_resolve_special_call};
@@ -3342,8 +3354,11 @@ mod tests {
         );
 
         let db = ws.get_db_mut();
-        let baseline = db.get_flow_index().special_call_writes();
-        assert!(baseline > 0, "the fixture must settle special-call facts");
+        let baseline = special_call_snapshot(db);
+        assert!(
+            !baseline.is_empty(),
+            "the fixture must settle special-call facts"
+        );
         let calls = db
             .get_vfs()
             .get_syntax_tree(&caller_id)
@@ -3360,13 +3375,13 @@ mod tests {
             };
             let mut cache = crate::LuaInferCache::new(caller_id, Default::default());
             // An already-installed `__call` reports itself instead of
-            // reinstalling; either way the epoch must not move.
+            // reinstalling; either way nothing changes.
             let _ = try_resolve_special_call(db, &mut cache, &mut item);
         }
         assert_eq!(
-            db.get_flow_index().special_call_writes(),
+            special_call_snapshot(db),
             baseline,
-            "replaying a settled constructor call must not bump"
+            "replaying a settled constructor call changes nothing"
         );
     }
 
