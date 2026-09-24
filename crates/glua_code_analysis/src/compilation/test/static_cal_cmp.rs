@@ -62,4 +62,21 @@ mod test {
         "#,
         ));
     }
+
+    #[test]
+    fn test_unary_minus_distributes_over_union() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class TestVec
+            ---@operator unm: TestVec
+
+            ---@type TestVec|integer
+            V = nil
+            "#,
+        );
+
+        let ty = ws.expr_ty("-V");
+        assert_eq!(ws.humanize_type(ty), "(TestVec|integer)");
+    }
 }
