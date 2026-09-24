@@ -1,6 +1,6 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{DerivationId, EditMaps, FactKey, Fingerprint};
+use super::{DerivationId, EditMaps, FactKey, Fingerprint, HashedKey};
 use crate::FileId;
 
 /// A fact key's slot in [`ReaderGraph::keys`].
@@ -19,7 +19,7 @@ struct Record {
 /// saw) or produced it. `key` is `None` while the slot is free.
 #[derive(Debug, Clone, Default)]
 struct KeySlot {
-    key: Option<FactKey>,
+    key: Option<HashedKey>,
     readers: FxHashMap<DerivIdx, Fingerprint>,
     producers: Vec<DerivIdx>,
 }
@@ -39,7 +39,7 @@ struct DerivSlot {
 /// map. A slot nothing refers to any more is freed for reuse.
 #[derive(Debug, Clone, Default)]
 pub struct ReaderGraph {
-    key_slots: FxHashMap<FactKey, KeyIdx>,
+    key_slots: FxHashMap<HashedKey, KeyIdx>,
     keys: Vec<KeySlot>,
     free_keys: Vec<KeyIdx>,
     deriv_slots: FxHashMap<DerivationId, DerivIdx>,
@@ -59,9 +59,9 @@ impl ReaderGraph {
     pub fn replace(
         &mut self,
         id: DerivationId,
-        reads: Vec<(FactKey, Fingerprint)>,
-        outputs: Vec<FactKey>,
-    ) -> Vec<FactKey> {
+        reads: Vec<(HashedKey, Fingerprint)>,
+        outputs: Vec<HashedKey>,
+    ) -> Vec<HashedKey> {
         let deriv = self.intern_derivation(id);
         let mut reads = reads
             .into_iter()
@@ -136,7 +136,7 @@ impl ReaderGraph {
 
     /// Forgets every derivation of `file_id`, returning each with the facts
     /// it produced.
-    pub fn remove_file(&mut self, file_id: FileId) -> Vec<(DerivationId, Box<[FactKey]>)> {
+    pub fn remove_file(&mut self, file_id: FileId) -> Vec<(DerivationId, Box<[HashedKey]>)> {
         let Some(derivs) = self.by_file.remove(&file_id) else {
             return Vec::new();
         };
@@ -168,7 +168,7 @@ impl ReaderGraph {
     /// `holds(seen)` says whether the value a reader saw is still current.
     pub fn stale_readers<'a>(
         &'a self,
-        key: &FactKey,
+        key: &HashedKey,
         holds: impl Fn(Fingerprint) -> bool + 'a,
     ) -> impl Iterator<Item = DerivationId> + 'a {
         self.key_slots
@@ -184,7 +184,7 @@ impl ReaderGraph {
     pub fn is_stale(
         &self,
         id: DerivationId,
-        holds: impl Fn(&FactKey, Fingerprint) -> bool,
+        holds: impl Fn(&HashedKey, Fingerprint) -> bool,
     ) -> bool {
         let Some((deriv, record)) = self.record(id) else {
             return true;
@@ -198,7 +198,7 @@ impl ReaderGraph {
     }
 
     /// The keys `id` last read.
-    pub fn reads_of(&self, id: DerivationId) -> impl Iterator<Item = &FactKey> + '_ {
+    pub fn reads_of(&self, id: DerivationId) -> impl Iterator<Item = &HashedKey> + '_ {
         self.record(id)
             .into_iter()
             .flat_map(|(_, record)| record.reads.iter())
@@ -241,8 +241,8 @@ impl ReaderGraph {
                 continue;
             }
             match edits.map_key(key) {
-                Some(moved) if moved == *key => {}
-                Some(moved) => renames.push((*slot, moved)),
+                Some(moved) if moved == **key => {}
+                Some(moved) => renames.push((*slot, HashedKey::new(moved))),
                 None => lost.extend(
                     readers
                         .keys()
@@ -296,7 +296,7 @@ impl ReaderGraph {
         self.keys
             .iter()
             .filter(|slot| !slot.readers.is_empty())
-            .filter_map(|slot| slot.key.as_ref())
+            .filter_map(|slot| slot.key.as_deref())
     }
 
     /// Every derivation with a record.
@@ -312,14 +312,14 @@ impl ReaderGraph {
         self.record(id).is_some()
     }
 
-    pub fn outputs_of(&self, id: DerivationId) -> impl Iterator<Item = &FactKey> + '_ {
+    pub fn outputs_of(&self, id: DerivationId) -> impl Iterator<Item = &HashedKey> + '_ {
         self.record(id)
             .into_iter()
             .flat_map(|(_, record)| record.outputs.iter())
             .map(|key| self.key(*key))
     }
 
-    pub fn producers(&self, key: &FactKey) -> impl Iterator<Item = DerivationId> + '_ {
+    pub fn producers(&self, key: &HashedKey) -> impl Iterator<Item = DerivationId> + '_ {
         self.key_slots
             .get(key)
             .map(|slot| &self.keys[*slot as usize].producers)
@@ -341,7 +341,7 @@ impl ReaderGraph {
     pub fn dependent_files(&self) -> FxHashMap<FileId, FxHashSet<FileId>> {
         let mut dependents: FxHashMap<FileId, FxHashSet<FileId>> = FxHashMap::default();
         for slot in &self.keys {
-            let Some(owner) = slot.key.as_ref().and_then(FactKey::owning_file) else {
+            let Some(owner) = slot.key.as_deref().and_then(FactKey::owning_file) else {
                 continue;
             };
             for deriv in slot.readers.keys() {
@@ -359,14 +359,14 @@ impl ReaderGraph {
         Some((deriv, self.derivations[deriv as usize].record.as_ref()?))
     }
 
-    fn key(&self, slot: KeyIdx) -> &FactKey {
+    fn key(&self, slot: KeyIdx) -> &HashedKey {
         self.keys[slot as usize]
             .key
             .as_ref()
             .expect("a referenced key slot is live")
     }
 
-    fn intern_key(&mut self, key: FactKey) -> KeyIdx {
+    fn intern_key(&mut self, key: HashedKey) -> KeyIdx {
         if let Some(slot) = self.key_slots.get(&key) {
             return *slot;
         }
@@ -432,7 +432,7 @@ impl ReaderGraph {
 
     /// Removes `deriv`'s record and edges and frees its slot. Returns the
     /// facts it produced.
-    fn detach(&mut self, deriv: DerivIdx) -> Box<[FactKey]> {
+    fn detach(&mut self, deriv: DerivIdx) -> Box<[HashedKey]> {
         let id = self.derivations[deriv as usize].id;
         let record = self.derivations[deriv as usize]
             .record
@@ -515,8 +515,8 @@ mod tests {
         )
     }
 
-    fn key(file: u32) -> FactKey {
-        FactKey::DeclTree(FileId::new(file))
+    fn key(file: u32) -> HashedKey {
+        HashedKey::new(FactKey::DeclTree(FileId::new(file)))
     }
 
     #[test]

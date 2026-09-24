@@ -212,6 +212,54 @@ pub enum FactKey {
     FileSet,
 }
 
+/// A fact key with its hash taken once, so the sets and maps that record,
+/// fingerprint and index it do not hash the key again.
+#[derive(Debug, Clone)]
+pub struct HashedKey {
+    hash: u64,
+    key: FactKey,
+}
+
+impl HashedKey {
+    pub fn new(key: FactKey) -> Self {
+        use std::hash::BuildHasher;
+        Self {
+            hash: rustc_hash::FxBuildHasher.hash_one(&key),
+            key,
+        }
+    }
+
+    pub fn key(&self) -> &FactKey {
+        &self.key
+    }
+
+    pub fn into_key(self) -> FactKey {
+        self.key
+    }
+}
+
+impl PartialEq for HashedKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.key == other.key
+    }
+}
+
+impl Eq for HashedKey {}
+
+impl std::hash::Hash for HashedKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+impl std::ops::Deref for HashedKey {
+    type Target = FactKey;
+
+    fn deref(&self) -> &FactKey {
+        &self.key
+    }
+}
+
 /// Hash of a fact's value, [`ABSENT`] when the key holds nothing.
 pub type Fingerprint = u64;
 pub const ABSENT: Fingerprint = 0;
@@ -586,16 +634,16 @@ impl PartialOrd for DerivationId {
 #[derive(Debug)]
 pub struct Evaluation {
     pub id: DerivationId,
-    reads: FxHashSet<FactKey>,
-    outputs: FxHashSet<FactKey>,
+    reads: FxHashSet<HashedKey>,
+    outputs: FxHashSet<HashedKey>,
     /// Fingerprints taken when an earlier stage of a staged evaluation ended:
     /// other evaluations write between its stages.
-    staged: rustc_hash::FxHashMap<FactKey, Fingerprint>,
+    staged: rustc_hash::FxHashMap<HashedKey, Fingerprint>,
 }
 
 impl Evaluation {
     /// The keys the evaluation wrote.
-    pub fn outputs(&self) -> impl Iterator<Item = &FactKey> {
+    pub fn outputs(&self) -> impl Iterator<Item = &HashedKey> {
         self.outputs.iter()
     }
 
@@ -620,8 +668,8 @@ impl Evaluation {
     /// its own reader.
     pub fn into_parts(
         self,
-        fingerprint: impl Fn(&FactKey) -> Fingerprint,
-    ) -> (DerivationId, Vec<(FactKey, Fingerprint)>, Vec<FactKey>) {
+        fingerprint: impl Fn(&HashedKey) -> Fingerprint,
+    ) -> (DerivationId, Vec<(HashedKey, Fingerprint)>, Vec<HashedKey>) {
         let outputs = self.outputs;
         let file_id = self.id.file_id;
         let reads = self
@@ -650,12 +698,12 @@ thread_local! {
     static CURRENT: RefCell<Option<Evaluation>> = const { RefCell::new(None) };
     static UNTRACKED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static WRITE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static CAPTURED: RefCell<Option<FxHashSet<FactKey>>> = const { RefCell::new(None) };
+    static CAPTURED: RefCell<Option<FxHashSet<HashedKey>>> = const { RefCell::new(None) };
 }
 
 /// Runs `f` outside any evaluation and returns every key it wrote: a reset
 /// moves facts other derivations produced, whose readers must be re-checked.
-pub fn capture_writes(f: impl FnOnce()) -> FxHashSet<FactKey> {
+pub fn capture_writes(f: impl FnOnce()) -> FxHashSet<HashedKey> {
     debug_assert!(!recording(), "writes captured inside an evaluation");
     let previous = CAPTURED.with(|captured| captured.replace(Some(FxHashSet::default())));
     f();
@@ -726,7 +774,7 @@ pub fn note_read(key: impl FnOnce() -> FactKey) {
     }
     CURRENT.with(|current| {
         if let Some(evaluation) = current.borrow_mut().as_mut() {
-            evaluation.reads.insert(key());
+            evaluation.reads.insert(HashedKey::new(key()));
         }
     });
 }
@@ -738,7 +786,9 @@ pub fn note_file_read(file_id: FileId) {
         if let Some(evaluation) = current.borrow_mut().as_mut()
             && evaluation.id.file_id != file_id
         {
-            evaluation.reads.insert(FactKey::FileText(file_id));
+            evaluation
+                .reads
+                .insert(HashedKey::new(FactKey::FileText(file_id)));
         }
     });
 }
@@ -748,11 +798,11 @@ pub fn note_write(key: impl FnOnce() -> FactKey) {
     CURRENT.with(|current| {
         if let Some(evaluation) = current.borrow_mut().as_mut() {
             WRITE_GENERATION.with(|generation| generation.set(generation.get() + 1));
-            evaluation.outputs.insert(key());
+            evaluation.outputs.insert(HashedKey::new(key()));
         } else {
             CAPTURED.with(|captured| {
                 if let Some(captured) = captured.borrow_mut().as_mut() {
-                    captured.insert(key());
+                    captured.insert(HashedKey::new(key()));
                 }
             });
         }

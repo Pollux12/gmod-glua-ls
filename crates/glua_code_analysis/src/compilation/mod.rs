@@ -86,7 +86,7 @@ impl LuaCompilation {
         reads.apply_edits(&edits);
         let db = &self.db;
         let edits = &edits;
-        reads.stale_files(&reanalysis.touched, |key| {
+        reads.stale_files(reanalysis.touched.iter().map(|key| key.key()), |key| {
             let current = db.fact_fingerprint(key);
             let key = key.clone();
             let before_edits = std::cell::OnceCell::new();
@@ -160,6 +160,10 @@ impl LuaCompilation {
         derivation::begin(id);
         let result = diagnose();
         let (_, reads, _) = derivation::end().into_parts(|key| self.db.fact_fingerprint(key));
+        let reads = reads
+            .into_iter()
+            .map(|(key, seen)| (key.into_key(), seen))
+            .collect();
         let mut store = self
             .diagnostic_reads
             .lock()

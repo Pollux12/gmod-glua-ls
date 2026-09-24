@@ -26,7 +26,7 @@ use std::cell::RefCell;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::DbIndex;
-use crate::db_index::derivation::{self, DerivationId, DerivationKind, FactKey};
+use crate::db_index::derivation::{self, DerivationId, DerivationKind, FactKey, HashedKey};
 
 /// Why a derivation is on the worklist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -87,7 +87,7 @@ pub(crate) struct Engine {
     /// layer is only ever rebuilt whole, so the caller re-analyses them.
     stale_sources: BTreeSet<crate::FileId>,
     /// Every key whose value may have changed during this engine's runs.
-    touched: FxHashSet<FactKey>,
+    touched: FxHashSet<HashedKey>,
     /// The files whose derivations this engine evaluated.
     evaluated: FxHashSet<crate::FileId>,
     /// Where the edits being re-analysed moved positions: a read of a fact
@@ -98,7 +98,7 @@ pub(crate) struct Engine {
     /// Fingerprints taken since the key was last written. Every write inside
     /// an evaluation is one of its outputs, so a group's outputs are the only
     /// keys it can move; writes outside `run` clear the whole cache.
-    fingerprints: RefCell<FxHashMap<FactKey, derivation::Fingerprint>>,
+    fingerprints: RefCell<FxHashMap<HashedKey, derivation::Fingerprint>>,
 }
 
 impl Engine {
@@ -117,7 +117,7 @@ impl Engine {
 
     /// Whether a read of `key` that saw `seen` still holds: the value is the
     /// same, or the same once the edits' moves are undone.
-    fn holds(&self, db: &DbIndex, key: &FactKey, seen: derivation::Fingerprint) -> bool {
+    fn holds(&self, db: &DbIndex, key: &HashedKey, seen: derivation::Fingerprint) -> bool {
         self.key_holds(db, key)(seen)
     }
 
@@ -126,7 +126,7 @@ impl Engine {
     fn key_holds<'a>(
         &'a self,
         db: &'a DbIndex,
-        key: &'a FactKey,
+        key: &'a HashedKey,
     ) -> impl Fn(derivation::Fingerprint) -> bool + 'a {
         let current = std::cell::OnceCell::new();
         let before_edits = std::cell::OnceCell::new();
@@ -143,7 +143,7 @@ impl Engine {
     }
 
     /// `key`'s current fingerprint, taken once per value.
-    fn fingerprint(&self, db: &DbIndex, key: &FactKey) -> derivation::Fingerprint {
+    fn fingerprint(&self, db: &DbIndex, key: &HashedKey) -> derivation::Fingerprint {
         if let Some(cached) = self.fingerprints.borrow().get(key).copied() {
             if check_fingerprints() {
                 assert_eq!(
@@ -166,7 +166,7 @@ impl Engine {
     fn verify_fingerprints(
         &self,
         db: &DbIndex,
-        except: &FxHashSet<FactKey>,
+        except: &FxHashSet<HashedKey>,
         step: impl Fn() -> String,
     ) {
         if !check_fingerprints() {
@@ -217,7 +217,7 @@ impl Engine {
     pub(crate) fn readers_of<'a>(
         &mut self,
         db: &DbIndex,
-        keys: impl IntoIterator<Item = &'a FactKey>,
+        keys: impl IntoIterator<Item = &'a HashedKey>,
     ) {
         for key in keys {
             self.touched.insert(key.clone());
@@ -244,7 +244,7 @@ impl Engine {
     }
 
     /// Every key whose value may have changed, emptied.
-    pub(crate) fn take_touched(&mut self) -> FxHashSet<FactKey> {
+    pub(crate) fn take_touched(&mut self) -> FxHashSet<HashedKey> {
         std::mem::take(&mut self.touched)
     }
 
@@ -299,7 +299,12 @@ impl Engine {
                 // the edit moved; outputs made from them are right only if the
                 // edit's remap rewrites them too.
                 let moved = db.reader_graph_mut().set_fingerprints(id, fingerprints);
-                if !moved || db.reader_graph().outputs_of(id).all(FactKey::follows_edits) {
+                if !moved
+                    || db
+                        .reader_graph()
+                        .outputs_of(id)
+                        .all(|key| key.follows_edits())
+                {
                     continue;
                 }
             }
@@ -355,7 +360,7 @@ impl Engine {
         db: &mut DbIndex,
         group: &[DerivationId],
         recipe: &mut dyn FnMut(&mut DbIndex, DerivationId),
-    ) -> FxHashSet<FactKey> {
+    ) -> FxHashSet<HashedKey> {
         let mut touched = FxHashSet::default();
         for member in group {
             touched.extend(db.reader_graph().outputs_of(*member).cloned());

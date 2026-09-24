@@ -492,8 +492,8 @@ mod test {
         let workspace_wide = db
             .reader_graph()
             .reads_of(network)
-            .filter(|key| matches!(key, FactKey::ReferencesByName(_)))
-            .cloned()
+            .filter(|key| matches!(key.key(), FactKey::ReferencesByName(_)))
+            .map(|key| key.key().clone())
             .collect::<Vec<_>>();
         expect_that!(workspace_wide, is_empty());
     }
@@ -582,7 +582,7 @@ end
         let reads = db
             .reader_graph()
             .reads_of(network)
-            .cloned()
+            .map(|key| key.key().clone())
             .collect::<Vec<_>>();
         expect_that!(reads.contains(&FactKey::NetHelpers(helpers)), eq(true));
         expect_that!(reads.contains(&FactKey::FileText(helpers)), eq(false));

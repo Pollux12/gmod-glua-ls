@@ -100,7 +100,7 @@ impl ScriptedScopes {
 /// What one [`reanalyze`] did.
 pub(crate) struct Reanalysis {
     /// Every key whose value may have changed.
-    pub touched: HashSet<derivation::FactKey>,
+    pub touched: HashSet<derivation::HashedKey>,
     /// The files whose source layer was rebuilt or whose derivations were
     /// evaluated, sorted.
     pub evaluated_files: Vec<FileId>,
@@ -151,11 +151,13 @@ fn replace_files(
     engine: &mut engine::Engine,
     file_ids: &[FileId],
     scopes: &ScriptedScopes,
-) -> HashSet<derivation::FactKey> {
+) -> HashSet<derivation::HashedKey> {
     let mut touched = HashSet::default();
-    touched.insert(derivation::FactKey::FileSet);
+    touched.insert(derivation::HashedKey::new(derivation::FactKey::FileSet));
     for file_id in file_ids {
-        touched.insert(derivation::FactKey::FileText(*file_id));
+        touched.insert(derivation::HashedKey::new(derivation::FactKey::FileText(
+            *file_id,
+        )));
         for producer in db.reader_graph().foreign_producers(*file_id) {
             if file_ids.contains(&producer.file_id) {
                 continue;
@@ -244,8 +246,8 @@ fn follow_edits(
     db: &mut DbIndex,
     engine: &mut engine::Engine,
     edits: &derivation::EditMaps,
-    touched: HashSet<derivation::FactKey>,
-) -> HashSet<derivation::FactKey> {
+    touched: HashSet<derivation::HashedKey>,
+) -> HashSet<derivation::HashedKey> {
     let mut files = edits.files().collect::<Vec<_>>();
     files.sort();
     for file_id in files {
@@ -273,7 +275,10 @@ fn follow_edits(
     touched
         .into_iter()
         .flat_map(|key| {
-            let moved = edits.map_key(&key).filter(|moved| *moved != key);
+            let moved = edits
+                .map_key(&key)
+                .filter(|moved| moved != key.key())
+                .map(derivation::HashedKey::new);
             std::iter::once(key).chain(moved)
         })
         .collect()
@@ -281,10 +286,10 @@ fn follow_edits(
 
 /// Re-takes which files the signatures of every file whose signatures moved
 /// name, so the next edit's remap finds them.
-fn refresh_payload_refs(db: &mut DbIndex, touched: &HashSet<derivation::FactKey>) {
+fn refresh_payload_refs(db: &mut DbIndex, touched: &HashSet<derivation::HashedKey>) {
     let mut holders = touched
         .iter()
-        .filter_map(|key| match key {
+        .filter_map(|key| match key.key() {
             derivation::FactKey::Signature(signature_id)
             | derivation::FactKey::InferredGuard(signature_id) => Some(signature_id.get_file_id()),
             _ => None,
@@ -349,7 +354,7 @@ fn document_source(
     db: &mut DbIndex,
     evaluation: derivation::Evaluation,
     mut context: AnalyzeContext,
-) -> (Vec<derivation::FactKey>, Vec<InFiled<LuaSyntaxId>>) {
+) -> (Vec<derivation::HashedKey>, Vec<InFiled<LuaSyntaxId>>) {
     derivation::resume(evaluation);
     run_analysis::<doc::DocAnalysisPipeline>(db, &mut context);
     publish_callable_signatures(db, &context);
