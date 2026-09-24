@@ -1118,9 +1118,6 @@ fn merge_antecedent_types(
         let branch_type = with_flow_query_realm(cache, target_realm, |cache| {
             get_merged_flow_type_or_nil(db, tree, cache, root, var_ref_id, flow_id, policy)
         })?;
-        if branch_type.is_unknown() {
-            return Ok(LuaType::Unknown);
-        }
         branch_types.push(branch_type);
     }
 
@@ -1146,9 +1143,6 @@ fn merge_antecedent_types(
         let branch_type = with_flow_query_realm(cache, target_realm, |cache| {
             get_merged_flow_type_or_nil(db, tree, cache, root, var_ref_id, flow_id, policy)
         })?;
-        if branch_type.is_unknown() {
-            return Ok(LuaType::Unknown);
-        }
         branch_types.push(branch_type);
     }
 

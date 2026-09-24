@@ -8605,4 +8605,28 @@ _2 = a[1]
             "#
         ));
     }
+
+    /// A branch that assigns `nil` keeps its arm when the other branch's type is
+    /// unknown, so the merge stays nullable instead of collapsing to `unknown`.
+    #[test]
+    fn merge_with_an_unknown_branch_keeps_the_nil_arm() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            local function ModifyColor(color, mode)
+                if mode == "bad" then color = nil end
+                local merged = color
+                return merged
+            end
+            "#,
+        );
+
+        let merged = nth_name_expr_type_from_end(&mut ws, file_id, "merged", 0);
+        assert!(
+            merged.is_nullable(),
+            "merge must keep the nil arm, got: {}",
+            ws.humanize_type(merged)
+        );
+    }
 }
