@@ -26,4 +26,23 @@ mod test {
         assert_eq!(stats.evaluations(DerivationKind::GmodLoad), 1);
         assert_eq!(stats.evaluations(DerivationKind::LocalStat), 3);
     }
+
+    #[test]
+    fn a_helper_scan_reads_a_method_definition_as_the_source_declares_it() {
+        let mut ws = gmod_workspace();
+
+        ws.def_file(
+            "addons/a/lua/autorun/client/methods.lua",
+            r#"
+            Messages = {}
+
+            ---@[call_arg("gmod.net_message", "start")]
+            ---@param name string
+            function Messages:Begin(name) end
+            "#,
+        );
+
+        let stats = ws.analysis.compilation.last_stats();
+        assert_eq!(stats.evaluations(DerivationKind::GmodCallRoles), 1);
+    }
 }

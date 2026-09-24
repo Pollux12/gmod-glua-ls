@@ -252,6 +252,15 @@ fn analyze_closure_params(
         .db
         .get_signature_index_mut()
         .get_or_create(*signature_id);
+    signature.is_colon_define = closure
+        .get_parent::<LuaFuncStat>()
+        .and_then(|func_stat| func_stat.get_func_name())
+        .is_some_and(|name| match name {
+            LuaVarExpr::IndexExpr(index_expr) => index_expr
+                .get_index_token()
+                .is_some_and(|token| token.is_colon()),
+            _ => false,
+        });
     let params = closure.get_params_list()?.get_params();
     let mut is_vararg = false;
     for param in params {

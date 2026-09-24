@@ -49,7 +49,6 @@ fn closure_own_return_stats(
 pub fn analyze_closure(analyzer: &mut LuaAnalyzer, closure: LuaClosureExpr) -> Option<()> {
     let signature_id = LuaSignatureId::from_closure(analyzer.file_id, &closure);
 
-    analyze_colon_define(analyzer, &signature_id, &closure);
     analyze_lambda_params(analyzer, &signature_id, &closure);
     analyze_require_guard_param(analyzer, &signature_id, &closure);
     analyze_nil_return_guard_params(analyzer, &signature_id, &closure);
@@ -1600,26 +1599,6 @@ fn expr_source_text_with_param_subs(expr: &LuaExpr, substitutions: &[(String, St
 
 fn var_source_text(var: &LuaVarExpr) -> String {
     var.syntax().text().to_string().split_whitespace().collect()
-}
-
-fn analyze_colon_define(
-    analyzer: &mut LuaAnalyzer,
-    signature_id: &LuaSignatureId,
-    closure: &LuaClosureExpr,
-) -> Option<()> {
-    let signature = analyzer
-        .db
-        .get_signature_index_mut()
-        .get_or_create(*signature_id);
-
-    let func_stat = closure.get_parent::<LuaFuncStat>()?;
-    let func_name = func_stat.get_func_name()?;
-    if let LuaVarExpr::IndexExpr(index_expr) = func_name {
-        let index_token = index_expr.get_index_token()?;
-        signature.is_colon_define = index_token.is_colon();
-    }
-
-    Some(())
 }
 
 fn analyze_lambda_params(

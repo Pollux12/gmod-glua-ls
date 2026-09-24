@@ -308,9 +308,7 @@ pub fn analyze_outparam(analyzer: &mut DocAnalyzer, tag: LuaDocTagOutparam) -> O
         .db
         .get_signature_index_mut()
         .get_or_create(signature_id);
-    let root = if param_name == "self"
-        && (signature.is_colon_define || closure_is_colon_define(&closure))
-    {
+    let root = if param_name == "self" && signature.is_colon_define {
         LuaOutParamRoot::SelfReceiver
     } else {
         let Some(param_idx) = signature.find_param_idx(&param_name) else {
@@ -346,18 +344,6 @@ pub fn analyze_outparam(analyzer: &mut DocAnalyzer, tag: LuaDocTagOutparam) -> O
             .add_receiver_out_param_member_name(analyzer.file_id, member_name);
     }
     Some(())
-}
-
-fn closure_is_colon_define(closure: &LuaClosureExpr) -> bool {
-    let Some(func_stat) = closure.get_parent::<LuaFuncStat>() else {
-        return false;
-    };
-    let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
-        return false;
-    };
-    index_expr
-        .get_index_token()
-        .is_some_and(|token| token.is_colon())
 }
 
 fn receiver_member_name_for_closure(closure: &LuaClosureExpr) -> Option<String> {
