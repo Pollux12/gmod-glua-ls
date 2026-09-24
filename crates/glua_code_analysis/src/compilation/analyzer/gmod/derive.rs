@@ -85,7 +85,7 @@ pub(crate) fn evaluate_pre(db: &mut DbIndex, context: &mut AnalyzeContext) {
     let scripted_scope_files = context.get_or_compute_scripted_scope_files(db);
     let tree_list = context.tree_list.clone();
     let file_ids: Vec<FileId> = tree_list.iter().map(|tree| tree.file_id).collect();
-    synthesize_vgui_registrations(db, context, &file_ids);
+    synthesize_vgui_registrations(db, context, &file_ids, VguiSynthesisPhase::Bind);
 
     for in_filed_tree in &tree_list {
         let file_id = in_filed_tree.file_id;
@@ -208,7 +208,7 @@ pub(crate) fn evaluate_post(db: &mut DbIndex, context: &mut AnalyzeContext) {
     let scripted_scope_files = context.get_or_compute_scripted_scope_files(db);
     let file_ids: Vec<FileId> = context.tree_list.iter().map(|tree| tree.file_id).collect();
     resolve_getmember_network_var_delegations(db, &scripted_scope_files, context);
-    synthesize_vgui_registrations(db, context, &file_ids);
+    synthesize_vgui_registrations(db, context, &file_ids, VguiSynthesisPhase::TransferMembers);
     synthesize_scripted_ent_registrations(db, &file_ids);
     synthesize_scripted_class_members(db, &scripted_scope_files, &file_ids);
     collect_numeric_range_table_populations(db, context);

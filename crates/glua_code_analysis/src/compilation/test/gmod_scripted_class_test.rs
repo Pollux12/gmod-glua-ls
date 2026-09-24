@@ -12813,4 +12813,84 @@ GM.TestValue = 1"#,
             "guarded trace.Entity access should not be flagged, got {field_diags:?}"
         );
     }
+
+    #[gtest]
+    fn test_vgui_create_field_keeps_created_class_when_registration_binds_after_statements() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_ids = ws.def_files(vec![
+            (
+                "annotations/panel.lua",
+                r#"
+                ---@meta
+                ---@class Panel
+                Panel = Panel or {}
+
+                ---@class (partial) DPanel : Panel
+                local DPanel = {}
+
+                ---@class (partial) DImage : DPanel
+                local DImage = {}
+
+                ---@param strImage string
+                ---@param strBackup? string
+                function DImage:SetImage(strImage, strBackup) end
+                "#,
+            ),
+            (
+                "annotations/vgui.lua",
+                r#"
+                ---@meta
+                vgui = {}
+                derma = {}
+
+                ---@generic T: Panel
+                ---@overload fun(classname: string, parent?: Panel, name?: string): Panel?
+                ---@[call_arg("gmod.vgui_panel", "reference")]
+                ---@param classname `T`
+                ---@[call_arg("gmod.vgui_panel", "parent")]
+                ---@param parent Panel?
+                ---@param name string?
+                ---@return (instance) T?
+                function vgui.Create(classname, parent, name) end
+
+                ---@[call_arg("gmod.vgui_panel", "define_control")]
+                ---@param name string
+                ---@param description string
+                ---@[call_arg("gmod.vgui_panel", "table")]
+                ---@param tab table
+                ---@[call_arg("gmod.vgui_panel", "base")]
+                ---@param derive string
+                function derma.DefineControl(name, description, tab, derive) end
+                "#,
+            ),
+            (
+                "gamemodes/cityrp/gamemode/core/derma/cl_hud_vehicle.lua",
+                r#"
+                local PANEL = {}
+
+                function PANEL:Init()
+                    self.fuelPanel = vgui.Create("DImage", self)
+                end
+
+                function PANEL:Think()
+                    self.fuelPanel:SetImage("a.png", "b.png")
+                end
+
+                derma.DefineControl("HudVehicle", "", PANEL, "DPanel")
+                "#,
+            ),
+        ]);
+        let hud_file_id = *file_ids.last().expect("hud file");
+
+        let mut field_type =
+            index_expr_prefix_type(&mut ws, hud_file_id, "self.fuelPanel:SetImage");
+        while let LuaType::Instance(instance) = field_type {
+            field_type = instance.get_base().clone();
+        }
+        assert_eq!(field_type, LuaType::Ref(LuaTypeDeclId::global("DImage")));
+    }
 }
