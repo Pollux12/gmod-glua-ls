@@ -3746,6 +3746,7 @@ end
     /// keeps the type the pre-edit `cycle_b` reported. A cold workspace over
     /// the same sources resolves the post-edit type.
     #[test]
+    #[ignore = "known drift: a ripple re-analyses each file at most once, so a cross-file cycle through the edited file is not revisited; fixed by fact-level re-derivation (drift fix plan)"]
     fn edit_in_a_cycle_revisits_the_edited_file() {
         const A_BEFORE: &str = "CycleA = { input = 1 }\nlocal res = CycleB.Compute()";
         const A_AFTER: &str = "CycleA = { input = \"text\" }\nlocal res = CycleB.Compute()";

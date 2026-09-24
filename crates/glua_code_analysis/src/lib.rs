@@ -1715,9 +1715,7 @@ impl EmmyLuaAnalysis {
     ///
     /// Each round re-analyses a batch and diffs each file's exports against
     /// the map taken just before it, so a file that re-derives the same facts
-    /// adds nothing. Scheduling is the fixed point of that diff: a file is
-    /// re-analysed again whenever a later batch's export diff names it, and
-    /// the ripple ends when no diff names further work.
+    /// adds nothing. A file is re-analysed at most once per ripple.
     ///
     /// Returns every live file whose diagnostics this edit may have moved:
     /// the files re-analysed, propagation included, plus the readers the diff
@@ -1767,6 +1765,8 @@ impl EmmyLuaAnalysis {
             .get_call_site_param_index_mut()
             .forget_removed_files(&dirty.removed);
 
+        let mut settled = dirty.sources.clone();
+        settled.extend(dirty.removed.iter().copied());
         let mut reanalyzed = dirty.sources.iter().copied().collect::<Vec<_>>();
         reanalyzed.sort_unstable();
         let mut pending = std::mem::take(&mut dirty.files);
@@ -1792,6 +1792,7 @@ impl EmmyLuaAnalysis {
         while !pending.is_empty() {
             let mut batch = pending
                 .drain()
+                .filter(|file_id| !settled.contains(file_id))
                 // A file with a stashed text owes its own self-index, which is
                 // the only pass that can re-home the references into it.
                 // Re-indexing it here would drop that stash and strand them.
@@ -1852,6 +1853,7 @@ impl EmmyLuaAnalysis {
             self.compilation.remove_index(batch.clone());
             self.compilation.update_index(batch.clone());
             reanalyzed.extend(batch.iter().copied());
+            settled.extend(batch.iter().copied());
 
             for file_id in &batch {
                 let after = export_map(
@@ -1929,7 +1931,9 @@ impl EmmyLuaAnalysis {
                     .chain(evidence)
                 {
                     touched.insert(dependent);
-                    pending.insert(dependent);
+                    if !settled.contains(&dependent) {
+                        pending.insert(dependent);
+                    }
                 }
             }
         }
