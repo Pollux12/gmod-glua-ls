@@ -4,7 +4,7 @@ use crate::{
     LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaSemanticDeclId, LuaTupleType, LuaType,
     LuaTypeDecl, LuaTypeDeclId, RenderLevel, humanize_type,
     semantic::{
-        member::find_members,
+        member::{find_declared_members, find_members},
         type_check::{
             complex_type::structural_object_from_members,
             intersection_utils::intersection_to_object, type_check_context::TypeCheckContext,
@@ -358,7 +358,7 @@ fn check_ref_type_compact_table(
         .unwrap_or_default();
 
     let source_type = LuaType::Ref(source_type_id.clone());
-    let source_type_members = find_members(context.db, &source_type);
+    let source_type_members = find_declared_members(context.db, &source_type);
     let Some(source_type_members) = source_type_members else {
         return Ok(()); // empty member donot need check
     };
@@ -451,7 +451,8 @@ fn check_ref_type_compact_object(
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
     // ref 可能继承自其他类型, 所以需要使用 infer_members 来获取所有成员
-    let Some(source_type_members) = find_members(context.db, &LuaType::Ref(source_type_id.clone()))
+    let Some(source_type_members) =
+        find_declared_members(context.db, &LuaType::Ref(source_type_id.clone()))
     else {
         return Ok(());
     };

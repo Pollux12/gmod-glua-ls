@@ -36,6 +36,17 @@ pub fn find_members(db: &DbIndex, prefix_type: &LuaType) -> FindMembersResult {
     find_members_guard(db, prefix_type, &ctx, &FindMemberFilter::All)
 }
 
+/// [`find_members`] without dynamic fields. Outside a file they are listed as
+/// `any` and never required, so a structural check against a type's members
+/// cannot be decided by them.
+pub(crate) fn find_declared_members(db: &DbIndex, prefix_type: &LuaType) -> FindMembersResult {
+    let ctx = FindMembersContext {
+        dynamic_fields: false,
+        ..FindMembersContext::new(InferGuard::new())
+    };
+    find_members_guard(db, prefix_type, &ctx, &FindMemberFilter::All)
+}
+
 pub fn find_members_in_workspace_for_file(
     db: &DbIndex,
     prefix_type: &LuaType,
@@ -152,6 +163,7 @@ struct FindMembersContext {
     workspace_id: Option<WorkspaceId>,
     file_id: Option<FileId>,
     caller_position: Option<TextSize>,
+    dynamic_fields: bool,
 }
 
 impl FindMembersContext {
@@ -162,6 +174,7 @@ impl FindMembersContext {
             workspace_id: None,
             file_id: None,
             caller_position: None,
+            dynamic_fields: true,
         }
     }
 
@@ -176,6 +189,7 @@ impl FindMembersContext {
             workspace_id: Some(workspace_id),
             file_id: Some(file_id),
             caller_position: None,
+            dynamic_fields: true,
         }
     }
 
@@ -191,6 +205,7 @@ impl FindMembersContext {
             workspace_id: Some(workspace_id),
             file_id: Some(file_id),
             caller_position: Some(caller_position),
+            dynamic_fields: true,
         }
     }
 
@@ -201,6 +216,7 @@ impl FindMembersContext {
             workspace_id: self.workspace_id,
             file_id: self.file_id,
             caller_position: self.caller_position,
+            dynamic_fields: self.dynamic_fields,
         }
     }
 
@@ -211,6 +227,7 @@ impl FindMembersContext {
             workspace_id: self.workspace_id,
             file_id: self.file_id,
             caller_position: self.caller_position,
+            dynamic_fields: self.dynamic_fields,
         }
     }
 
@@ -1095,8 +1112,12 @@ fn find_namespace_members(
         &LuaMemberOwner::GlobalPath(GlobalId::new(ns)),
         filter,
     ) {
+        let mut existing = members
+            .iter()
+            .map(|member| member.key.clone())
+            .collect::<HashSet<_>>();
         for member in global_path_members {
-            if members.iter().any(|existing| existing.key == member.key) {
+            if !existing.insert(member.key.clone()) {
                 continue;
             }
 
@@ -1118,6 +1139,9 @@ fn append_dynamic_fields_for_type(
     members: &mut Vec<LuaMemberInfo>,
     filter: &FindMemberFilter,
 ) -> bool {
+    if !ctx.dynamic_fields {
+        return false;
+    }
     let emmyrc = db.get_emmyrc();
     if !emmyrc.gmod.enabled || !emmyrc.gmod.infer_dynamic_fields {
         return false;
@@ -1157,7 +1181,12 @@ fn append_dynamic_fields_for_type(
     };
 
     field_names.sort_unstable();
+    field_names.dedup();
     let access_site = ctx.dynamic_field_access_site(db);
+    let existing = members
+        .iter()
+        .map(|member| member.key.clone())
+        .collect::<HashSet<_>>();
 
     for field_name in field_names {
         let member_key = LuaMemberKey::Name(field_name.clone());
@@ -1165,7 +1194,7 @@ fn append_dynamic_fields_for_type(
             continue;
         }
 
-        if members.iter().any(|member| member.key == member_key) {
+        if existing.contains(&member_key) {
             continue;
         }
 
@@ -1204,6 +1233,9 @@ fn append_dynamic_fields_for_table(
     members: &mut Vec<LuaMemberInfo>,
     filter: &FindMemberFilter,
 ) -> bool {
+    if !ctx.dynamic_fields {
+        return false;
+    }
     let emmyrc = db.get_emmyrc();
     if !emmyrc.gmod.enabled || !emmyrc.gmod.infer_dynamic_fields {
         return false;
@@ -1246,7 +1278,12 @@ fn append_dynamic_fields_for_table(
     };
 
     field_names.sort_unstable();
+    field_names.dedup();
     let access_site = ctx.dynamic_field_access_site(db);
+    let existing = members
+        .iter()
+        .map(|member| member.key.clone())
+        .collect::<HashSet<_>>();
 
     for field_name in field_names {
         let member_key = LuaMemberKey::Name(field_name.clone());
@@ -1254,7 +1291,7 @@ fn append_dynamic_fields_for_table(
             continue;
         }
 
-        if members.iter().any(|member| member.key == member_key) {
+        if existing.contains(&member_key) {
             continue;
         }
 
@@ -1392,7 +1429,8 @@ mod tests {
     use rowan::{TextRange, TextSize};
 
     use super::{
-        FindMembersContext, find_members_in_workspace_for_file, find_members_with_key,
+        FindMembersContext, find_declared_members, find_members,
+        find_members_in_workspace_for_file, find_members_with_key,
         find_members_with_key_in_workspace_for_file, super_types_for_context,
     };
     use crate::{
@@ -1876,5 +1914,45 @@ mod tests {
         )
         .expect("keyed global dynamic-field lookup should return a result");
         assert_eq!(global_members.len(), 1);
+    }
+
+    #[test]
+    fn context_free_dynamic_fields_are_untyped_and_left_out_of_declared_members() {
+        let mut db = make_db();
+        let file_id = FileId::new(61);
+        let type_decl_id = LuaTypeDeclId::global("PanelLike");
+        add_type_decl(&mut db, file_id, type_decl_id.clone());
+        let declared = make_member_id(file_id, 1);
+        db.get_member_index_mut().add_member(
+            LuaMemberOwner::Type(type_decl_id.clone()),
+            LuaMember::new(
+                declared,
+                LuaMemberKey::Name("declared".into()),
+                LuaMemberFeature::FileFieldDecl,
+                None,
+            ),
+        );
+        bind_member_type(&mut db, declared, LuaType::String);
+        for (at, name) in [(10, "dynamicA"), (20, "dynamicB")] {
+            db.get_dynamic_field_index_mut().add_field(
+                DynamicFieldOwner::Type(type_decl_id.clone()),
+                name.into(),
+                file_id,
+                TextRange::new(TextSize::new(at), TextSize::new(at + 1)),
+            );
+        }
+        let prefix = LuaType::Ref(type_decl_id);
+
+        let all = find_members(&db, &prefix).expect("members");
+        let dynamic = all
+            .iter()
+            .filter(|member| member.property_owner_id.is_none())
+            .collect::<Vec<_>>();
+        assert_eq!(dynamic.len(), 2);
+        assert!(dynamic.iter().all(|member| member.typ == LuaType::Any));
+
+        let declared_only = find_declared_members(&db, &prefix).expect("members");
+        assert_eq!(declared_only.len(), 1);
+        assert_eq!(declared_only[0].key, LuaMemberKey::Name("declared".into()));
     }
 }
