@@ -1500,7 +1500,7 @@ struct TryResolveProfile {
     spec_conflict: usize,
     spec_time: Duration,
     apply_time: Duration,
-    kind_counts: [usize; 11],
+    kind_counts: [usize; UNRESOLVE_KIND_COUNT],
 }
 
 #[derive(Default)]
@@ -1566,7 +1566,7 @@ impl TryResolveProfile {
     fn log(&self, loop_count: usize) {
         if unresolve_profile_enabled() && self.spec_items != 0 {
             eprintln!(
-                "  [unres] loop {loop_count} spec: items={} applied={} stale={} conflict={} t={:>7.3}s apply_t={:>7.3}s kinds=[iter={} decl={} member={} module={} ret={} cparam={} cret={} cpparam={} tfield={} scall={} csite={}]",
+                "  [unres] loop {loop_count} spec: items={} applied={} stale={} conflict={} t={:>7.3}s apply_t={:>7.3}s kinds=[iter={} decl={} member={} module={} ret={} cparam={} cret={} cpparam={} tfield={} scall={} csite={} cretc={}]",
                 self.spec_items,
                 self.spec_applied,
                 self.spec_stale,
@@ -1584,6 +1584,7 @@ impl TryResolveProfile {
                 self.kind_counts[8],
                 self.kind_counts[9],
                 self.kind_counts[10],
+                self.kind_counts[11],
             );
         }
         let mut stats = self
@@ -1728,6 +1729,9 @@ fn infer_fail_reason_stable_cmp(a: &InferFailReason, b: &InferFailReason) -> Ord
         _ => Ordering::Equal,
     }
 }
+
+/// Number of distinct [`unresolve_kind_rank`] values.
+const UNRESOLVE_KIND_COUNT: usize = 12;
 
 fn unresolve_kind_rank(unresolve: &UnResolve) -> u8 {
     match unresolve {
