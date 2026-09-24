@@ -492,7 +492,6 @@ mod test {
         let workspace_wide = db
             .reader_graph()
             .reads_of(network)
-            .iter()
             .filter(|key| matches!(key, FactKey::ReferencesByName(_)))
             .cloned()
             .collect::<Vec<_>>();
@@ -529,7 +528,7 @@ end
                 .derivations_of_file(caller)
                 .find(|id| id.kind == DerivationKind::Network)
                 .expect("the caller has a network derivation");
-            db.reader_graph().reads_of(network).len()
+            db.reader_graph().reads_of(network).count()
         };
 
         expect_that!(network_reads(40), eq(network_reads(5)));

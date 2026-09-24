@@ -1248,7 +1248,7 @@ end
             .derivations_of_file(unrelated_file)
             .find(|id| id.kind == DerivationKind::ValidGuardScan)
             .expect("the file has a valid-guard scan");
-        let reads = db.reader_graph().reads_of(scan).len();
+        let reads = db.reader_graph().reads_of(scan).count();
         assert!(reads < 20, "the scan read {reads} facts");
     }
 

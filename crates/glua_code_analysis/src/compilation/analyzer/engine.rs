@@ -293,20 +293,13 @@ impl Engine {
                 let fingerprints = db
                     .reader_graph()
                     .reads_of(id)
-                    .iter()
                     .map(|key| self.fingerprint(db, key))
                     .collect();
                 // A read that held only with the edit mapped back saw positions
                 // the edit moved; outputs made from them are right only if the
                 // edit's remap rewrites them too.
                 let moved = db.reader_graph_mut().set_fingerprints(id, fingerprints);
-                if !moved
-                    || db
-                        .reader_graph()
-                        .outputs_of(id)
-                        .iter()
-                        .all(FactKey::follows_edits)
-                {
+                if !moved || db.reader_graph().outputs_of(id).all(FactKey::follows_edits) {
                     continue;
                 }
             }
@@ -334,20 +327,17 @@ impl Engine {
             // A member that now shares a key with a derivation outside the
             // group ran without it; the next evaluation takes both.
             let widened = group.iter().find_map(|member| {
-                db.reader_graph()
-                    .outputs_of(*member)
-                    .iter()
-                    .find_map(|key| {
-                        if !key.is_primary() {
-                            return None;
-                        }
-                        db.reader_graph()
-                            .producers(key)
-                            .find(|producer| {
-                                producer.kind != DerivationKind::Source && !group.contains(producer)
-                            })
-                            .map(|producer| (key.clone(), producer))
-                    })
+                db.reader_graph().outputs_of(*member).find_map(|key| {
+                    if !key.is_primary() {
+                        return None;
+                    }
+                    db.reader_graph()
+                        .producers(key)
+                        .find(|producer| {
+                            producer.kind != DerivationKind::Source && !group.contains(producer)
+                        })
+                        .map(|producer| (key.clone(), producer))
+                })
             });
             if widened.is_some() {
                 // Again in this round: nothing ran after it yet.
@@ -368,7 +358,7 @@ impl Engine {
     ) -> FxHashSet<FactKey> {
         let mut touched = FxHashSet::default();
         for member in group {
-            touched.extend(db.reader_graph().outputs_of(*member).iter().cloned());
+            touched.extend(db.reader_graph().outputs_of(*member).cloned());
         }
         let reset = derivation::capture_writes(|| {
             for key in touched.iter().filter(|key| key.is_primary()) {
@@ -507,11 +497,7 @@ fn co_producers(db: &DbIndex, id: DerivationId) -> Vec<DerivationId> {
     let mut group = BTreeSet::from([id]);
     let mut pending = vec![id];
     while let Some(member) = pending.pop() {
-        for key in graph
-            .outputs_of(member)
-            .iter()
-            .filter(|key| key.is_primary())
-        {
+        for key in graph.outputs_of(member).filter(|key| key.is_primary()) {
             // The source layer is what a reset restores, not a co-producer.
             for producer in graph
                 .producers(key)
