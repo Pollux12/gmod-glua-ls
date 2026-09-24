@@ -12,6 +12,7 @@ rowan.workspace = true
 tokio-util.workspace = true
 lsp_types.workspace = true
 mimalloc.workspace = true
+rayon.workspace = true
 
 [[bin]]
 name = "determinism"

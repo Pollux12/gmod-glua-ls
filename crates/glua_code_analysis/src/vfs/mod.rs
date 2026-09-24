@@ -93,6 +93,24 @@ impl Default for Vfs {
     }
 }
 
+/// The parser's `NodeCache` only deduplicates green nodes, so a clone starts
+/// with an empty one.
+impl Clone for Vfs {
+    fn clone(&self) -> Self {
+        Vfs {
+            file_id_map: self.file_id_map.clone(),
+            file_path_map: self.file_path_map.clone(),
+            remote_file_id_map: self.remote_file_id_map.clone(),
+            file_data: self.file_data.clone(),
+            line_index_map: self.line_index_map.clone(),
+            tree_map: self.tree_map.clone(),
+            emmyrc: self.emmyrc.clone(),
+            node_cache: NodeCache::default(),
+            content_revision: self.content_revision,
+        }
+    }
+}
+
 impl Vfs {
     pub fn new() -> Self {
         Vfs {
@@ -485,7 +503,7 @@ impl Vfs {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FileContent {
     content: String,
     is_remote: bool,

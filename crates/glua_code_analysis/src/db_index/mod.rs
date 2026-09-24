@@ -69,8 +69,8 @@ pub use r#type::*;
 /// cheap handle for the parallel lua-analyze walk: cloning a fork bumps ref
 /// counts, and the first mutable access to a domain clones just that domain
 /// (`Arc::make_mut`), so an unwritten domain is shared with the base index for
-/// free. Forks are scoped to the walk and dropped before merge; mutation entry
-/// points outside the walk rely on there being no live fork.
+/// free. [`DbIndex::fork_independent`] uses the same sharing for a long-lived
+/// copy.
 #[derive(Debug)]
 pub struct DbIndex {
     decl_index: Arc<LuaDeclIndex>,
@@ -570,10 +570,7 @@ impl DbIndex {
     }
 
     pub fn get_vfs_mut(&mut self) -> &mut Vfs {
-        // Vfs is not `Clone`, so `make_mut` is unavailable; forks only exist
-        // inside the parallel lua-analyze walk where the vfs is read-only, so
-        // a strong count above one here would mean a fork outlived the walk.
-        Arc::get_mut(&mut self.vfs).expect("vfs mutation while a DbIndex fork is live")
+        Arc::make_mut(&mut self.vfs)
     }
 
     pub fn get_file_dependencies_index(&self) -> &LuaDependencyIndex {
@@ -613,9 +610,7 @@ impl DbIndex {
     }
 
     pub fn update_config(&mut self, config: Arc<Emmyrc>) {
-        Arc::get_mut(&mut self.vfs)
-            .expect("vfs mutation while a DbIndex fork is live")
-            .update_config(config.clone());
+        Arc::make_mut(&mut self.vfs).update_config(config.clone());
         Arc::make_mut(&mut self.modules_index).update_config(config.clone());
         self.emmyrc = config;
     }
@@ -639,11 +634,11 @@ impl DbIndex {
     /// A worker-side view of this index for the parallel lua-analyze walk.
     /// Every domain shares its `Arc` with the base until the first mutable
     /// accessor clones it (`Arc::make_mut`), so a fork costs refcount bumps
-    /// plus one clone per domain actually written. The vfs is shared
-    /// read-only: `get_vfs_mut` panics while any fork is live.
+    /// plus one clone per domain actually written, the vfs included.
     ///
-    /// A fork must not outlive the walk that created it — mutation entry
-    /// points outside the walk assume exclusive ownership.
+    /// The fork keeps the base's `type_structure_revision`, so it must not
+    /// outlive the walk that created it; use [`Self::fork_independent`] for a
+    /// copy that lives on.
     pub(crate) fn fork(&self) -> Self {
         Self {
             type_structure_revision: self.type_structure_revision,
@@ -679,6 +674,16 @@ impl DbIndex {
                     .map(|(rev, value)| (*rev, Arc::clone(value))),
             ),
             file_helper_scan_cache: self.file_helper_scan_cache.clone(),
+        }
+    }
+
+    /// A copy-on-write copy that evolves independently of `self`. It takes a
+    /// fresh `type_structure_revision`, so thread-local memos keyed by the
+    /// revision never hand one copy's answers to the other.
+    pub(crate) fn fork_independent(&self) -> Self {
+        Self {
+            type_structure_revision: next_type_structure_revision(),
+            ..self.fork()
         }
     }
 }

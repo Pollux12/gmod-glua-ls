@@ -26,7 +26,7 @@ use crate::{DbIndex, DiagnosticCode, Emmyrc, FileId, LuaCompilation, WorkspaceId
 use lsp_types::Diagnostic;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LuaDiagnostic {
     enable: bool,
     config: Arc<LuaDiagnosticConfig>,

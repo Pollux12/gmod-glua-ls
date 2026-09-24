@@ -556,6 +556,7 @@ dependencies = [
  "glua_code_analysis",
  "glua_parser",
  "mimalloc",
+ "rayon",
  "rowan",
  "tokio-util",
 ]

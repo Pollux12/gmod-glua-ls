@@ -1,19 +1,45 @@
 //! Determinism of settled language-server workspace updates.
 //!
-//! Four workflows mirror the server: a single edit, a reverted edit, a typing
-//! burst, and watched-file deletion/recreation. Each compares diagnostics and
-//! derived index state with an equivalent cold or independently settled state.
+//! Every stage runs production update paths on a copy-on-write fork of one
+//! cold base build and compares the settled index and diagnostics with a cold
+//! build of the same final input (the oracle). Each distinct oracle is built
+//! once per run and kept only as its snapshot.
 //!
-//! DET_CODEBASE and DET_ANNOTATIONS select the workspaces. DET_TARGETS names
-//! comma-separated files relative to DET_CODEBASE. DET_EDIT_FIND and
-//! DET_EDIT_REPLACE specify the edit used by the first three workflows.
-//! DET_STAGES may select edit,revert,burst,watch (default: all four).
+//! Stages (`DET_STAGES`, comma list; default `edit,revert,burst,watch`):
+//! - `edit`: apply `DET_EDIT_FIND` -> `DET_EDIT_REPLACE` to each target, settle.
+//! - `revert`: the edit, then the original text; the oracle is the base.
+//! - `burst`: three edits of every target before one ripple, ending on the
+//!   edited text, so a single target shares the edit oracle.
+//! - `watch`: watched delete of each target (oracle: the file never existed),
+//!   then watched re-creation (oracle: cold build with the same new file ids).
+//! - `noop`: re-index each target with unchanged text; the oracle is the base.
+//! - `exact`: remove and re-add exactly the targets in one batch.
+//! - `split:N`: cold build in N batches, compared with the base.
+//! - `touch`, `shift`, `delete`, `recreate`, `rename`: sweeps over every
+//!   `DET_STRIDE`-th (default 25) main file from `DET_STRIDE_OFFSET` (default
+//!   0), or the files named in `DET_ONLY`. Touch appends a comment, shift
+//!   prepends a newline, rename moves each file to `<stem>_rn.lua`.
+//!
+//! Locality: every stage prints its dirty, rippled and re-analysed file
+//! counts. For `noop`, `touch` and `shift` any such file outside the edited
+//! files is a divergence.
+//!
+//! `DET_REPLAY=1` also replays the warm run's `update_index` batch log onto a
+//! fork of the oracle and compares again: drift that disappears depends on
+//! batch composition, drift that survives is an incremental-path bug.
+//!
+//! Environment: `DET_CODEBASE`, `DET_ANNOTATIONS` (required); `DET_TARGETS`
+//! (files relative to `DET_CODEBASE`, for target stages); `DET_EDIT_FIND`,
+//! `DET_EDIT_REPLACE`; `DET_DUMP_INDEX_DETAIL` (index names or `all`, keeps
+//! entry text for per-entry diffs); `DET_DUMP_INDEX` (directory for full
+//! snapshots); `DET_DUMP` (cold diagnostics file); `DET_FILTER`, `DET_LIMIT`.
+//! Any divergence exits 1.
 
 use mimalloc::MiMalloc;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,6 +51,7 @@ use glua_code_analysis::{
 };
 use glua_parser::{LineIndex, LuaParser};
 use lsp_types::{DiagnosticSeverity, NumberOrString};
+use rayon::prelude::*;
 use rowan::NodeCache;
 use tokio_util::sync::CancellationToken;
 
@@ -76,21 +103,6 @@ fn discover_config_files(root: &Path) -> Vec<PathBuf> {
     .collect()
 }
 
-fn build_analysis(codebase: &Path, annotations: &Path) -> EmmyLuaAnalysis {
-    build_analysis_with(codebase, annotations, &[], None)
-}
-
-/// Cold build of a workspace that never contained `exclude`: the file is
-/// dropped from the collected list before indexing, which is not the same
-/// state as indexing it and then removing it.
-fn build_analysis_excluding(
-    codebase: &Path,
-    annotations: &Path,
-    exclude: &Path,
-) -> EmmyLuaAnalysis {
-    build_analysis_with(codebase, annotations, &[], Some(exclude))
-}
-
 /// Comparison key for a workspace file path. `DET_TARGETS` is written by hand,
 /// so it has to match the loader's paths regardless of separator or case.
 fn path_key(path: &Path) -> String {
@@ -100,8 +112,8 @@ fn path_key(path: &Path) -> String {
 /// Ordering key `update_files_by_uri` sorts on before assigning file ids:
 /// the path round-tripped through its URI, normalized like
 /// `normalize_path_for_ordering` (which is crate-private). The reservation
-/// pass in `build_analysis_with` has to allocate ids in exactly this order
-/// or every file's id shifts.
+/// pass in `build_cold` has to allocate ids in exactly this order or every
+/// file's id shifts.
 fn uri_order_key(path: &Path) -> String {
     let Some(uri) = glua_code_analysis::file_path_to_uri(&path.to_path_buf()) else {
         return String::new();
@@ -119,11 +131,27 @@ fn uri_order_key(path: &Path) -> String {
     normalized
 }
 
-fn build_analysis_with(
+fn file_uri(path: &Path) -> lsp_types::Uri {
+    glua_code_analysis::file_path_to_uri(&path.to_path_buf())
+        .unwrap_or_else(|| panic!("cannot build URI for {}", path.display()))
+}
+
+/// The final input of a cold build: the collected workspace with `overrides`
+/// replacing file text and `removed` never present. `created` files get new
+/// ids after every collected file's id is reserved, as the watcher path
+/// assigns them.
+#[derive(Clone, Default, Eq, Hash, PartialEq)]
+struct ColdInput {
+    overrides: Vec<(PathBuf, String)>,
+    removed: Vec<PathBuf>,
+    created: Vec<(PathBuf, String)>,
+}
+
+fn build_cold(
     codebase: &Path,
     annotations: &Path,
-    overrides: &[(PathBuf, String)],
-    exclude: Option<&Path>,
+    input: &ColdInput,
+    batches: usize,
 ) -> EmmyLuaAnalysis {
     let config_files = discover_config_files(codebase);
     let mut emmyrc = if config_files.is_empty() {
@@ -157,72 +185,53 @@ fn build_analysis_with(
         .filter(|file| !file.path.ends_with(".editorconfig"))
         .map(|file| file.into_tuple())
         .collect::<Vec<_>>();
-    let mut excluded = None;
-    if let Some(exclude) = exclude {
-        let want = path_key(exclude);
+    for (path, content) in &input.overrides {
+        let want = path_key(path);
         let mut matched = 0;
-        for file in files.iter_mut() {
-            if path_key(&file.0) == want {
-                file.1 = None;
-                excluded = Some(file.0.clone());
-                matched += 1;
-            }
-        }
-        // A silently unapplied exclusion would make this build a copy of the
-        // full baseline, and every diff taken against it would read as
-        // "identical".
-        assert_eq!(
-            matched, 1,
-            "excluded path did not match exactly one collected workspace file"
-        );
-    }
-    if !overrides.is_empty() {
-        let mut applied = 0;
-        for (path, content) in overrides {
-            let want = path_key(path);
-            for file in files.iter_mut() {
-                if path_key(&file.0) == want {
-                    file.1 = Some(content.clone());
-                    applied += 1;
-                }
-            }
+        for file in files.iter_mut().filter(|file| path_key(&file.0) == want) {
+            file.1 = Some(content.clone());
+            matched += 1;
         }
         // A silently unapplied override would make this build a copy of the
         // baseline, and every diff taken against it would read as "identical".
+        assert_eq!(matched, 1, "override did not match one workspace file");
+    }
+    if !input.removed.is_empty() || !input.created.is_empty() {
+        files.sort_by_cached_key(|(path, _)| uri_order_key(path));
+        let vfs = analysis.compilation.get_db_mut().get_vfs_mut();
+        for (path, _) in &files {
+            vfs.set_file_content(&file_uri(path), None);
+        }
+        let removed = input
+            .removed
+            .iter()
+            .map(|path| path_key(path))
+            .collect::<BTreeSet<_>>();
+        let before = files.len();
+        files.retain(|(path, _)| !removed.contains(&path_key(path)));
         assert_eq!(
-            applied,
-            overrides.len(),
-            "content override did not match a collected workspace file"
+            before - files.len(),
+            removed.len(),
+            "removed path did not match one workspace file"
         );
-        eprintln!("[setup] applied {applied} content override(s)");
+        for path in &input.removed {
+            vfs.remove_file(&file_uri(path));
+        }
+        let mut created = input.created.clone();
+        created.sort_by_cached_key(|(path, _)| uri_order_key(path));
+        for (path, text) in created {
+            vfs.set_file_content(&file_uri(&path), None);
+            files.push((path, Some(text)));
+        }
     }
     let t = Instant::now();
-    if let Some(excluded_path) = excluded {
-        // Reserve the normal file IDs before indexing the surviving files.
-        let mut ordered = files.clone();
-        ordered.sort_by_cached_key(|(path, _)| uri_order_key(path));
-        for (path, _) in &ordered {
-            let Some(uri) = glua_code_analysis::file_path_to_uri(path) else {
-                continue;
-            };
-            analysis
-                .compilation
-                .get_db_mut()
-                .get_vfs_mut()
-                .set_file_content(&uri, None);
-        }
-        // One ordinary batch over the surviving files; the tombstone is not
-        // in it, so the excluded file is never indexed.
-        let surviving = files
-            .into_iter()
-            .filter(|(path, _)| path != &excluded_path)
-            .collect();
-        analysis.update_files_by_path(surviving);
-    } else {
-        analysis.update_files_by_path(files);
+    for group in files.chunks(files.len().div_ceil(batches)) {
+        analysis.update_files_by_path(group.to_vec());
     }
-
-    eprintln!("[setup] indexed in {:.2}s", t.elapsed().as_secs_f64());
+    eprintln!(
+        "[setup] cold build indexed in {:.2}s",
+        t.elapsed().as_secs_f64()
+    );
     analysis
 }
 
@@ -230,19 +239,14 @@ fn collect(analysis: &EmmyLuaAnalysis, label: &str) -> BTreeSet<Snapshot> {
     let t = Instant::now();
     let shared = analysis.precompute_diagnostic_shared_data();
     let file_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
-    let mut out = BTreeSet::new();
-    for file_id in file_ids {
-        let Some(diagnostics) =
-            analysis.diagnose_file_with_shared(file_id, CancellationToken::new(), shared.clone())
-        else {
-            continue;
-        };
-        if diagnostics.is_empty() {
-            continue;
-        }
-        let file = file_label(analysis, file_id);
-        for diagnostic in diagnostics {
-            out.insert(Snapshot {
+    let out = file_ids
+        .into_par_iter()
+        .flat_map_iter(|file_id| {
+            let diagnostics = analysis
+                .diagnose_file_with_shared(file_id, CancellationToken::new(), shared.clone())
+                .unwrap_or_default();
+            let file = file_label(analysis, file_id);
+            diagnostics.into_iter().map(move |diagnostic| Snapshot {
                 file: file.clone(),
                 code: match &diagnostic.code {
                     Some(NumberOrString::String(code)) => code.clone(),
@@ -260,9 +264,10 @@ fn collect(analysis: &EmmyLuaAnalysis, label: &str) -> BTreeSet<Snapshot> {
                 end_line: diagnostic.range.end.line,
                 end_character: diagnostic.range.end.character,
                 message: diagnostic.message,
-            });
-        }
-    }
+            })
+        })
+        .collect::<Vec<_>>();
+    let out = out.into_iter().collect::<BTreeSet<_>>();
     let (errors, warnings) = counts(&out);
     eprintln!(
         "[{label}] total={} errors={errors} warnings={warnings} ({:.2}s)",
@@ -419,7 +424,8 @@ struct HashDumpResult {
 
 impl HashDump {
     fn new(name: &str) -> Self {
-        let want_detail = std::env::var("DET_DUMP_INDEX_DETAIL").is_ok_and(|want| want == name);
+        let want_detail = std::env::var("DET_DUMP_INDEX_DETAIL")
+            .is_ok_and(|want| want.split(',').any(|want| want == name || want == "all"));
         Self {
             hashes: Vec::new(),
             detail: want_detail.then(BTreeMap::new),
@@ -515,6 +521,7 @@ fn diff_hash_dump(
 }
 
 fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
+    let t = Instant::now();
     let db = analysis.compilation.get_db();
     let type_index = db.get_type_index();
     let mut type_caches = BTreeMap::new();
@@ -1311,7 +1318,7 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
     }
 
     eprintln!(
-        "[{label}] index type_caches={} members={} net_flows={} flow_trees={} signature_casts={} special_call_effects={} special_call_facts={} special_call_sites={} accessor_annotations={} accessor_annotation_files={} numeric_range_files={} numeric_range_globals={} type_decl_states={} type_decl_generic_params={}",
+        "[{label}] index type_caches={} members={} net_flows={} flow_trees={} signature_casts={} special_call_effects={} special_call_facts={} special_call_sites={} accessor_annotations={} accessor_annotation_files={} numeric_range_files={} numeric_range_globals={} type_decl_states={} type_decl_generic_params={} ({:.2}s)",
         type_caches.len(),
         members.len(),
         net_flows.len(),
@@ -1325,7 +1332,8 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         numeric_range_file_populations.hashes.len(),
         numeric_range_global_populations.hashes.len(),
         type_decl_states.hashes.len(),
-        type_decl_generic_params.hashes.len()
+        type_decl_generic_params.hashes.len(),
+        t.elapsed().as_secs_f64()
     );
 
     let snapshot = IndexSnapshot {
@@ -2110,8 +2118,7 @@ fn target(
     relative: &str,
 ) -> (PathBuf, lsp_types::Uri, FileId, String) {
     let path = codebase.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
-    let uri = glua_code_analysis::file_path_to_uri(&path)
-        .unwrap_or_else(|| panic!("cannot build URI for {}", path.display()));
+    let uri = file_uri(&path);
     let file_id = analysis
         .get_file_id(&uri)
         .unwrap_or_else(|| panic!("target is not indexed: {}", path.display()));
@@ -2153,118 +2160,527 @@ fn apply_text(
     drop(old);
 }
 
+/// Files a warm run marked dirty and the files its ripple reported.
+#[derive(Default)]
+struct Reach {
+    dirty: Vec<FileId>,
+    rippled: Vec<FileId>,
+}
+
+impl Reach {
+    fn extend(&mut self, other: Reach) {
+        self.dirty.extend(other.dirty);
+        self.rippled.extend(other.rippled);
+    }
+}
+
+fn ripple(analysis: &mut EmmyLuaAnalysis, dirty: DirtySet) -> Reach {
+    let dirty_files = dirty.dirty_files().iter().copied().collect();
+    Reach {
+        dirty: dirty_files,
+        rippled: analysis.ripple(dirty),
+    }
+}
+
 fn settle(
     analysis: &mut EmmyLuaAnalysis,
     uri: &lsp_types::Uri,
     file_id: FileId,
     text: String,
     version: i32,
-) {
+) -> Reach {
     apply_text(analysis, uri, file_id, text, version);
     let dirty = analysis.self_index_and_diff(vec![file_id]);
-    analysis.ripple(dirty);
+    ripple(analysis, dirty)
 }
 
-fn compare(truth: &EmmyLuaAnalysis, actual: &EmmyLuaAnalysis, label: &str) {
+/// Prints how far a warm run reached. With `strict`, any dirty, rippled or
+/// re-analysed file outside `edited` is a locality divergence.
+fn report_reach(
+    analysis: &EmmyLuaAnalysis,
+    label: &str,
+    edited: &[FileId],
+    reach: &Reach,
+    log: &[Vec<FileId>],
+    strict: bool,
+) {
+    let dirty = reach.dirty.iter().collect::<BTreeSet<_>>();
+    let rippled = reach.rippled.iter().collect::<BTreeSet<_>>();
+    let reanalysed = log.iter().flatten().collect::<BTreeSet<_>>();
+    let beyond = dirty
+        .iter()
+        .chain(&rippled)
+        .chain(&reanalysed)
+        .filter(|file_id| !edited.contains(file_id))
+        .collect::<BTreeSet<_>>();
+    println!(
+        "[reach {label}] dirty={} rippled={} reanalysed={} beyond_edited={}",
+        dirty.len(),
+        rippled.len(),
+        reanalysed.len(),
+        beyond.len()
+    );
+    if strict && !beyond.is_empty() {
+        record_divergence();
+        println!(
+            "LOCALITY {label}: {} file(s) beyond the edited set",
+            beyond.len()
+        );
+        for file_id in beyond.iter().take(diff_limit()) {
+            println!("  BEYOND {}", file_label(analysis, ***file_id));
+        }
+    }
+}
+
+fn replay(analysis: &mut EmmyLuaAnalysis, log: &[Vec<FileId>]) {
+    for batch in log {
+        analysis.compilation.remove_index(batch.clone());
+        analysis.compilation.update_index(batch.clone());
+    }
+}
+
+/// Index and diagnostics of one analysis.
+struct Snap {
+    index: IndexSnapshot,
+    diagnostics: BTreeSet<Snapshot>,
+}
+
+fn snapshot(analysis: &EmmyLuaAnalysis, label: &str) -> Snap {
+    let (index, diagnostics) = rayon::join(
+        || collect_index(analysis, label),
+        || collect(analysis, label),
+    );
+    Snap { index, diagnostics }
+}
+
+fn compare(expected_label: &str, expected: &Snap, label: &str, actual: &Snap) {
     let before = DIVERGENCES.load(Ordering::Relaxed);
-    let expected_index = collect_index(truth, &format!("expected_{label}"));
-    let actual_index = collect_index(actual, label);
-    diff_index("expected", &expected_index, label, &actual_index);
-    let expected = collect(truth, "expected");
-    let observed = collect(actual, label);
-    diff("expected", &expected, label, &observed);
+    diff_index(expected_label, &expected.index, label, &actual.index);
+    diff(
+        expected_label,
+        &expected.diagnostics,
+        label,
+        &actual.diagnostics,
+    );
     if DIVERGENCES.load(Ordering::Relaxed) == before {
         println!("[{label}] +0 index, +0 diagnostics");
     }
 }
 
-fn edit(codebase: &Path, annotations: &Path, targets: &[String], find: &str, replace: &str) {
-    for relative in targets {
-        let mut warm = build_analysis(codebase, annotations);
-        let (path, uri, file_id, original) = target(&warm, codebase, relative);
-        let changed = edited(&original, find, replace);
-        settle(&mut warm, &uri, file_id, changed.clone(), 1);
-        let truth = build_analysis_with(codebase, annotations, &[(path, changed)], None);
-        compare(&truth, &warm, &format!("edit[{relative}]"));
-    }
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
 }
 
-fn revert(codebase: &Path, annotations: &Path, targets: &[String], find: &str, replace: &str) {
-    for relative in targets {
-        let mut warm = build_analysis(codebase, annotations);
-        let (_, uri, file_id, original) = target(&warm, codebase, relative);
-        let before_index = collect_index(&warm, "before_revert");
-        let before = collect(&warm, "before_revert");
-        settle(
-            &mut warm,
-            &uri,
-            file_id,
-            edited(&original, find, replace),
-            1,
+/// One `apply_file_system_changes` batch: each URI with its new text, or
+/// `None` for a deletion.
+type WatchEvents = Vec<(lsp_types::Uri, Option<String>)>;
+
+struct Harness {
+    codebase: PathBuf,
+    annotations: PathBuf,
+    replay: bool,
+    /// Cold build of the unmodified workspace; every warm run starts as a
+    /// fork of it.
+    base: EmmyLuaAnalysis,
+    /// Each oracle's snapshot, collected once.
+    snapshots: HashMap<ColdInput, Arc<Snap>>,
+    /// The most recent non-base oracle, kept only for replay.
+    oracle: Option<(ColdInput, EmmyLuaAnalysis)>,
+    warm_started: Instant,
+}
+
+impl Harness {
+    fn cold(&self, input: &ColdInput, batches: usize) -> EmmyLuaAnalysis {
+        build_cold(&self.codebase, &self.annotations, input, batches)
+    }
+
+    /// A fork of the base that records its `update_index` batches.
+    fn warm(&mut self) -> EmmyLuaAnalysis {
+        self.warm_started = Instant::now();
+        let mut warm = self.base.fork();
+        warm.compilation.start_batch_log();
+        warm
+    }
+
+    fn oracle_analysis(&mut self, input: &ColdInput) -> &EmmyLuaAnalysis {
+        if *input == ColdInput::default() {
+            return &self.base;
+        }
+        if self.oracle.as_ref().is_none_or(|(kept, _)| kept != input) {
+            self.oracle = None;
+            self.oracle = Some((input.clone(), self.cold(input, 1)));
+        }
+        &self.oracle.as_ref().expect("oracle was just built").1
+    }
+
+    fn expected(&mut self, input: &ColdInput) -> Arc<Snap> {
+        if let Some(snap) = self.snapshots.get(input) {
+            return Arc::clone(snap);
+        }
+        let snap = Arc::new(if *input == ColdInput::default() {
+            snapshot(&self.base, "base")
+        } else if self.replay {
+            snapshot(self.oracle_analysis(input), "oracle")
+        } else {
+            snapshot(&self.cold(input, 1), "oracle")
+        });
+        self.snapshots.insert(input.clone(), Arc::clone(&snap));
+        snap
+    }
+
+    /// Reports how far the warm run reached and returns its batch log.
+    fn observe(
+        &self,
+        label: &str,
+        warm: &mut EmmyLuaAnalysis,
+        edited: &[FileId],
+        reach: &Reach,
+        strict: bool,
+    ) -> Vec<Vec<FileId>> {
+        eprintln!(
+            "[{label}] warm run {:.2}s",
+            self.warm_started.elapsed().as_secs_f64()
         );
-        settle(&mut warm, &uri, file_id, original, 2);
-        let label = format!("revert[{relative}]");
-        let after_index = collect_index(&warm, &label);
-        diff_index("before_revert", &before_index, &label, &after_index);
-        let after = collect(&warm, &label);
-        diff("before_revert", &before, &label, &after);
+        let log = warm.compilation.take_batch_log();
+        report_reach(warm, label, edited, reach, &log, strict);
+        log
     }
-}
 
-fn burst(codebase: &Path, annotations: &Path, targets: &[String], find: &str, replace: &str) {
-    let mut warm = build_analysis(codebase, annotations);
-    let resolved: Vec<_> = targets
-        .iter()
-        .map(|relative| target(&warm, codebase, relative))
-        .collect();
-    let final_texts: Vec<_> = resolved
-        .iter()
-        .map(|(path, _, _, original)| {
-            let changed = edited(original, find, replace);
-            (path.clone(), format!("\n{changed}"))
-        })
-        .collect();
-    let mut owed: Option<DirtySet> = None;
-    for step in 0..3 {
-        for (path, uri, file_id, original) in &resolved {
-            let text = match step {
-                0 => original.replace(find, ""),
-                1 => edited(original, find, replace),
-                _ => final_texts
-                    .iter()
-                    .find(|(candidate, _)| candidate == path)
-                    .unwrap()
-                    .1
-                    .clone(),
-            };
-            apply_text(&mut warm, uri, *file_id, text, step + 1);
-            let dirty = warm.self_index_and_diff(vec![*file_id]);
-            match &mut owed {
-                Some(owed) => owed.extend(dirty),
-                None => owed = Some(dirty),
-            }
+    /// Compares the warm run with the cold oracle of `input` and, with
+    /// replay, with that oracle after replaying the warm run's batch log. The
+    /// oracle is built while the warm run is snapshotted.
+    fn check(
+        &mut self,
+        label: &str,
+        warm: EmmyLuaAnalysis,
+        log: &[Vec<FileId>],
+        input: &ColdInput,
+    ) {
+        let (actual, expected) = rayon::join(|| snapshot(&warm, label), || self.expected(input));
+        drop(warm);
+        compare("expected", &expected, label, &actual);
+        if self.replay {
+            let mut replayed = self.oracle_analysis(input).fork();
+            replay(&mut replayed, log);
+            let replay_label = format!("{label}+replay");
+            let expected = snapshot(&replayed, &format!("expected_{replay_label}"));
+            drop(replayed);
+            compare("replayed", &expected, &replay_label, &actual);
         }
     }
-    warm.ripple(owed.expect("a burst has edited files"));
-    let truth = build_analysis_with(codebase, annotations, &final_texts, None);
-    compare(&truth, &warm, "burst");
-}
 
-fn watch(codebase: &Path, annotations: &Path, targets: &[String]) {
-    for relative in targets {
-        let mut warm = build_analysis(codebase, annotations);
-        let (path, uri, _, original) = target(&warm, codebase, relative);
-        let mut absent = build_analysis_excluding(codebase, annotations, &path);
-        absent
-            .compilation
-            .get_db_mut()
-            .get_vfs_mut()
-            .remove_file(&uri);
-        warm.apply_file_system_changes(vec![(uri.clone(), None)]);
-        compare(&absent, &warm, &format!("watch_deleted[{relative}]"));
-        warm.apply_file_system_changes(vec![(uri.clone(), Some(original.clone()))]);
-        absent.apply_file_system_changes(vec![(uri, Some(original))]);
-        compare(&absent, &warm, &format!("watch_created[{relative}]"));
+    /// [`Self::observe`], then [`Self::check`].
+    fn finish(
+        &mut self,
+        label: &str,
+        mut warm: EmmyLuaAnalysis,
+        edited: &[FileId],
+        reach: &Reach,
+        strict: bool,
+        input: &ColdInput,
+    ) {
+        let log = self.observe(label, &mut warm, edited, reach, strict);
+        self.check(label, warm, &log, input);
+    }
+
+    fn edit(&mut self, targets: &[String], find: &str, replace: &str) {
+        for relative in targets {
+            let (path, uri, file_id, original) = target(&self.base, &self.codebase, relative);
+            let changed = edited(&original, find, replace);
+            let mut warm = self.warm();
+            let reach = settle(&mut warm, &uri, file_id, changed.clone(), 1);
+            let input = ColdInput {
+                overrides: vec![(path, changed)],
+                ..ColdInput::default()
+            };
+            self.finish(
+                &format!("edit[{relative}]"),
+                warm,
+                &[file_id],
+                &reach,
+                false,
+                &input,
+            );
+        }
+    }
+
+    fn revert(&mut self, targets: &[String], find: &str, replace: &str) {
+        for relative in targets {
+            let (_, uri, file_id, original) = target(&self.base, &self.codebase, relative);
+            let mut warm = self.warm();
+            let mut reach = settle(
+                &mut warm,
+                &uri,
+                file_id,
+                edited(&original, find, replace),
+                1,
+            );
+            reach.extend(settle(&mut warm, &uri, file_id, original, 2));
+            self.finish(
+                &format!("revert[{relative}]"),
+                warm,
+                &[file_id],
+                &reach,
+                false,
+                &ColdInput::default(),
+            );
+        }
+    }
+
+    fn burst(&mut self, targets: &[String], find: &str, replace: &str) {
+        let resolved = targets
+            .iter()
+            .map(|relative| target(&self.base, &self.codebase, relative))
+            .collect::<Vec<_>>();
+        let mut warm = self.warm();
+        let mut owed: Option<DirtySet> = None;
+        for step in 0..3 {
+            for (_, uri, file_id, original) in &resolved {
+                let text = match step {
+                    0 => original.replace(find, ""),
+                    1 => format!("\n{}", edited(original, find, replace)),
+                    _ => edited(original, find, replace),
+                };
+                apply_text(&mut warm, uri, *file_id, text, step + 1);
+                let dirty = warm.self_index_and_diff(vec![*file_id]);
+                match &mut owed {
+                    Some(owed) => owed.extend(dirty),
+                    None => owed = Some(dirty),
+                }
+            }
+        }
+        let reach = ripple(&mut warm, owed.expect("a burst has edited files"));
+        let ids = resolved.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
+        let input = ColdInput {
+            overrides: resolved
+                .into_iter()
+                .map(|(path, _, _, original)| {
+                    let changed = edited(&original, find, replace);
+                    (path, changed)
+                })
+                .collect(),
+            ..ColdInput::default()
+        };
+        self.finish("burst", warm, &ids, &reach, false, &input);
+    }
+
+    /// Applies watched-file event batches in order to a warm fork.
+    fn watched(
+        &mut self,
+        label: &str,
+        steps: Vec<WatchEvents>,
+        edited: &[FileId],
+        input: &ColdInput,
+    ) {
+        let mut warm = self.warm();
+        let mut reach = Reach::default();
+        for events in steps {
+            reach.rippled.extend(warm.apply_file_system_changes(events));
+        }
+        self.finish(label, warm, edited, &reach, false, input);
+    }
+
+    fn watch(&mut self, targets: &[String]) {
+        for relative in targets {
+            let (path, uri, file_id, original) = target(&self.base, &self.codebase, relative);
+            let mut warm = self.warm();
+            let reach = Reach {
+                rippled: warm.apply_file_system_changes(vec![(uri.clone(), None)]),
+                ..Reach::default()
+            };
+            let label = format!("watch_deleted[{relative}]");
+            let mut log = self.observe(&label, &mut warm, &[file_id], &reach, false);
+            let removed = ColdInput {
+                removed: vec![path.clone()],
+                ..ColdInput::default()
+            };
+            self.check(&label, warm.fork(), &log, &removed);
+
+            self.warm_started = Instant::now();
+            warm.compilation.start_batch_log();
+            let reach = Reach {
+                rippled: warm
+                    .apply_file_system_changes(vec![(uri.clone(), Some(original.clone()))]),
+                ..Reach::default()
+            };
+            let created_id = warm.get_file_id(&uri).expect("re-created target has an id");
+            let label = format!("watch_created[{relative}]");
+            log.extend(self.observe(&label, &mut warm, &[created_id], &reach, false));
+            let recreated = ColdInput {
+                created: vec![(path, original)],
+                ..removed
+            };
+            self.check(&label, warm, &log, &recreated);
+        }
+    }
+
+    fn noop(&mut self, targets: &[String]) {
+        for relative in targets {
+            let (_, _, file_id, _) = target(&self.base, &self.codebase, relative);
+            let mut warm = self.warm();
+            let dirty = warm.self_index_and_diff(vec![file_id]);
+            let reach = ripple(&mut warm, dirty);
+            self.finish(
+                &format!("noop[{relative}]"),
+                warm,
+                &[file_id],
+                &reach,
+                true,
+                &ColdInput::default(),
+            );
+        }
+    }
+
+    fn exact(&mut self, targets: &[String]) {
+        let ids = targets
+            .iter()
+            .map(|relative| target(&self.base, &self.codebase, relative).2)
+            .collect::<Vec<_>>();
+        let mut warm = self.warm();
+        warm.self_index_files(ids.clone());
+        self.finish(
+            "exact",
+            warm,
+            &ids,
+            &Reach::default(),
+            false,
+            &ColdInput::default(),
+        );
+    }
+
+    fn split(&mut self, batches: usize) {
+        let label = format!("split:{batches}");
+        let split = self.cold(&ColdInput::default(), batches);
+        let actual = snapshot(&split, &label);
+        drop(split);
+        compare(
+            "base",
+            &self.expected(&ColdInput::default()),
+            &label,
+            &actual,
+        );
+    }
+
+    /// The sweep's files: every `DET_STRIDE`-th main file from
+    /// `DET_STRIDE_OFFSET`, or the files whose path ends with an entry of
+    /// `DET_ONLY`.
+    fn stride_files(&self) -> Vec<(PathBuf, lsp_types::Uri, FileId, String)> {
+        let stride = env_usize("DET_STRIDE", 25);
+        let offset = env_usize("DET_STRIDE_OFFSET", 0);
+        let only = std::env::var("DET_ONLY").ok().map(|value| {
+            value
+                .split(',')
+                .map(|entry| entry.trim().replace('\\', "/").to_lowercase())
+                .collect::<Vec<_>>()
+        });
+        let vfs = self.base.compilation.get_db().get_vfs();
+        let mut ids = self.base.get_main_workspace_file_ids_for_diagnostics();
+        ids.sort_unstable();
+        let files = ids
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, file_id)| {
+                let path = vfs.get_file_path(&file_id)?;
+                let selected = match &only {
+                    Some(only) => only
+                        .iter()
+                        .any(|entry| path_key(path).ends_with(entry.as_str())),
+                    None => i % stride == offset,
+                };
+                selected.then(|| {
+                    let text = vfs.get_file_content(&file_id)?.clone();
+                    Some((path.clone(), file_uri(path), file_id, text))
+                })?
+            })
+            .collect::<Vec<_>>();
+        eprintln!("[sweep] {} file(s)", files.len());
+        files
+    }
+
+    /// Edits every sweep file with `edit` and settles them in one batch.
+    fn sweep_edit(&mut self, label: &str, edit: impl Fn(&str) -> String) {
+        let files = self.stride_files();
+        let mut warm = self.warm();
+        for (_, uri, file_id, text) in &files {
+            apply_text(&mut warm, uri, *file_id, edit(text), 1);
+        }
+        let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
+        let dirty = warm.self_index_and_diff(ids.clone());
+        let reach = ripple(&mut warm, dirty);
+        let input = ColdInput {
+            overrides: files
+                .iter()
+                .map(|(path, _, _, text)| (path.clone(), edit(text)))
+                .collect(),
+            ..ColdInput::default()
+        };
+        self.finish(label, warm, &ids, &reach, true, &input);
+    }
+
+    fn sweep_delete(&mut self) {
+        let files = self.stride_files();
+        let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
+        let input = ColdInput {
+            removed: files.iter().map(|(path, ..)| path.clone()).collect(),
+            ..ColdInput::default()
+        };
+        let events = files.into_iter().map(|(_, uri, ..)| (uri, None)).collect();
+        self.watched("delete", vec![events], &ids, &input);
+    }
+
+    fn sweep_recreate(&mut self) {
+        let files = self.stride_files();
+        let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
+        let input = ColdInput {
+            removed: files.iter().map(|(path, ..)| path.clone()).collect(),
+            created: files
+                .iter()
+                .map(|(path, _, _, text)| (path.clone(), text.clone()))
+                .collect(),
+            ..ColdInput::default()
+        };
+        let deletes = files
+            .iter()
+            .map(|(_, uri, ..)| (uri.clone(), None))
+            .collect();
+        let creates = files
+            .into_iter()
+            .map(|(_, uri, _, text)| (uri, Some(text)))
+            .collect();
+        self.watched("recreate", vec![deletes, creates], &ids, &input);
+    }
+
+    fn sweep_rename(&mut self) {
+        let files = self.stride_files();
+        let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
+        let renamed = files
+            .iter()
+            .map(|(path, _, _, text)| {
+                let stem = path
+                    .file_stem()
+                    .expect("workspace file has a name")
+                    .to_string_lossy();
+                (path.with_file_name(format!("{stem}_rn.lua")), text.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut events = files
+            .iter()
+            .map(|(_, uri, ..)| (uri.clone(), None))
+            .collect::<Vec<_>>();
+        events.extend(
+            renamed
+                .iter()
+                .map(|(path, text)| (file_uri(path), Some(text.clone()))),
+        );
+        let input = ColdInput {
+            removed: files.into_iter().map(|(path, ..)| path).collect(),
+            created: renamed,
+            ..ColdInput::default()
+        };
+        self.watched("rename", vec![events], &ids, &input);
     }
 }
 
@@ -2291,40 +2707,82 @@ fn run() {
         !stages.is_empty(),
         "DET_STAGES must select at least one check"
     );
+    let split_batches = |stage: &str| {
+        stage
+            .strip_prefix("split:")
+            .and_then(|n| n.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+    };
     for stage in &stages {
         assert!(
-            matches!(*stage, "edit" | "revert" | "burst" | "watch"),
+            split_batches(stage).is_some()
+                || matches!(
+                    *stage,
+                    "edit"
+                        | "revert"
+                        | "burst"
+                        | "watch"
+                        | "noop"
+                        | "exact"
+                        | "touch"
+                        | "shift"
+                        | "delete"
+                        | "recreate"
+                        | "rename"
+                ),
             "unknown check: {stage}"
         );
     }
-    let targets = std::env::var("DET_TARGETS").expect("DET_TARGETS is required");
-    let targets: Vec<_> = targets
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    assert!(!targets.is_empty(), "DET_TARGETS must name indexed files");
+    let needs_targets = stages
+        .iter()
+        .any(|s| matches!(*s, "edit" | "revert" | "burst" | "watch" | "noop" | "exact"));
+    let targets: Vec<String> = if needs_targets {
+        std::env::var("DET_TARGETS")
+            .expect("DET_TARGETS is required")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    assert!(
+        !needs_targets || !targets.is_empty(),
+        "DET_TARGETS must name indexed files"
+    );
     let needs_edit = stages
         .iter()
         .any(|s| matches!(*s, "edit" | "revert" | "burst"));
-    let find = if needs_edit {
-        std::env::var("DET_EDIT_FIND").expect("DET_EDIT_FIND is required")
+    let (find, replace) = if needs_edit {
+        (
+            std::env::var("DET_EDIT_FIND").expect("DET_EDIT_FIND is required"),
+            std::env::var("DET_EDIT_REPLACE").expect("DET_EDIT_REPLACE is required"),
+        )
     } else {
-        String::new()
-    };
-    let replace = if needs_edit {
-        std::env::var("DET_EDIT_REPLACE").expect("DET_EDIT_REPLACE is required")
-    } else {
-        String::new()
+        (String::new(), String::new())
     };
     assert!(
         !needs_edit || !find.is_empty(),
         "DET_EDIT_FIND must be nonempty"
     );
+
+    let started = Instant::now();
+    let base = build_cold(&codebase, &annotations, &ColdInput::default(), 1);
+    let mut harness = Harness {
+        replay: std::env::var("DET_REPLAY").is_ok_and(|value| value == "1"),
+        codebase,
+        annotations,
+        base,
+        snapshots: HashMap::new(),
+        oracle: None,
+        warm_started: Instant::now(),
+    };
+    println!("[time] setup {:.1}s", started.elapsed().as_secs_f64());
     if let Ok(dump_path) = std::env::var("DET_DUMP") {
-        let cold = build_analysis(&codebase, &annotations);
-        let rendered = collect(&cold, "cold")
+        let rendered = harness
+            .expected(&ColdInput::default())
+            .diagnostics
             .iter()
             .map(Snapshot::render)
             .collect::<Vec<_>>()
@@ -2332,14 +2790,24 @@ fn run() {
         std::fs::write(dump_path, rendered).expect("diagnostic dump should succeed");
     }
     for stage in stages {
+        let t = Instant::now();
         match stage {
-            "edit" => edit(&codebase, &annotations, &targets, &find, &replace),
-            "revert" => revert(&codebase, &annotations, &targets, &find, &replace),
-            "burst" => burst(&codebase, &annotations, &targets, &find, &replace),
-            "watch" => watch(&codebase, &annotations, &targets),
-            _ => unreachable!(),
+            "edit" => harness.edit(&targets, &find, &replace),
+            "revert" => harness.revert(&targets, &find, &replace),
+            "burst" => harness.burst(&targets, &find, &replace),
+            "watch" => harness.watch(&targets),
+            "noop" => harness.noop(&targets),
+            "exact" => harness.exact(&targets),
+            "touch" => harness.sweep_edit("touch", |text| format!("{text}\n-- touch\n")),
+            "shift" => harness.sweep_edit("shift", |text| format!("\n{text}")),
+            "delete" => harness.sweep_delete(),
+            "recreate" => harness.sweep_recreate(),
+            "rename" => harness.sweep_rename(),
+            _ => harness.split(split_batches(stage).expect("validated above")),
         }
+        println!("[time] {stage} {:.1}s", t.elapsed().as_secs_f64());
     }
+    println!("[time] total {:.1}s", started.elapsed().as_secs_f64());
     let divergences = DIVERGENCES.load(Ordering::Relaxed);
     if divergences != 0 {
         eprintln!("[determinism] {divergences} comparison(s) differed");

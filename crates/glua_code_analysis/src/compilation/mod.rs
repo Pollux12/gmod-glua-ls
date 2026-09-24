@@ -18,6 +18,9 @@ use crate::{
 pub struct LuaCompilation {
     db: DbIndex,
     emmyrc: Arc<Emmyrc>,
+    /// Every `update_index` batch since [`Self::start_batch_log`], for the
+    /// determinism harness's replay.
+    batch_log: Option<Vec<Vec<FileId>>>,
 }
 
 impl LuaCompilation {
@@ -25,6 +28,7 @@ impl LuaCompilation {
         let mut compilation = Self {
             db: DbIndex::new(),
             emmyrc: emmyrc.clone(),
+            batch_log: None,
         };
 
         compilation.db.update_config(emmyrc.clone());
@@ -50,6 +54,9 @@ impl LuaCompilation {
     /// external callers no longer need to schedule another indexing pass and
     /// this list is always empty.
     pub fn update_index(&mut self, file_ids: Vec<FileId>) -> Vec<FileId> {
+        if let Some(log) = &mut self.batch_log {
+            log.push(file_ids.clone());
+        }
         let mut need_analyzed_files = vec![];
         let mut analyzed_file_ids = vec![];
         for file_id in file_ids {
@@ -79,6 +86,26 @@ impl LuaCompilation {
 
         analyzer::analyze(&mut self.db, need_analyzed_files);
         Vec::new()
+    }
+
+    /// An independent copy-on-write copy; see [`DbIndex::fork_independent`].
+    pub fn fork(&self) -> Self {
+        Self {
+            db: self.db.fork_independent(),
+            emmyrc: self.emmyrc.clone(),
+            batch_log: None,
+        }
+    }
+
+    /// Starts recording every `update_index` batch, discarding any earlier log.
+    pub fn start_batch_log(&mut self) {
+        self.batch_log = Some(Vec::new());
+    }
+
+    /// Stops recording and returns the batches recorded since
+    /// [`Self::start_batch_log`].
+    pub fn take_batch_log(&mut self) -> Vec<Vec<FileId>> {
+        self.batch_log.take().unwrap_or_default()
     }
 
     pub fn remove_index(&mut self, file_ids: Vec<FileId>) {

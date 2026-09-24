@@ -709,6 +709,7 @@ fn snapshot_batch_pre_additions(db: &DbIndex, file_id: FileId) -> BatchPreAdditi
 ///   `files_referencing_name`;
 /// - unresolved doc-type names, filed under the would-be global type id,
 ///   through `get_type_references`.
+///
 /// Unresolved include/require readers are deliberately absent: the batch
 /// expansion already reaches them through `unresolved_path_dependents`.
 fn batch_addition_readers(
@@ -973,6 +974,20 @@ impl EmmyLuaAnalysis {
             #[cfg(test)]
             inferred_guard_propagation_stats: InferredGuardPropagationStats::default(),
             pending_indexed_text: rustc_hash::FxHashMap::default(),
+        }
+    }
+
+    /// An independent copy-on-write copy: index domains and the vfs are
+    /// shared until one side first writes them, and edits to either side never
+    /// reach the other.
+    pub fn fork(&self) -> Self {
+        Self {
+            compilation: self.compilation.fork(),
+            diagnostic: self.diagnostic.clone(),
+            emmyrc: self.emmyrc.clone(),
+            #[cfg(test)]
+            inferred_guard_propagation_stats: self.inferred_guard_propagation_stats,
+            pending_indexed_text: self.pending_indexed_text.clone(),
         }
     }
 
@@ -2682,7 +2697,7 @@ impl EmmyLuaAnalysis {
         for file_id in updated_files.iter().copied() {
             let appeared = vfs
                 .get_file_path(&file_id)
-                .and_then(|path| file_path_to_uri(path))
+                .and_then(file_path_to_uri)
                 .is_some_and(|uri| appeared_uris.contains(&uri));
             if appeared {
                 // Every export is an addition: the same diff
