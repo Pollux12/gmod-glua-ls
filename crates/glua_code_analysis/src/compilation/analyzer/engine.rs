@@ -10,16 +10,23 @@
 //! queued, and re-checked when reached, so a key that moved and moved back (a
 //! burst, a transient) costs nothing. Cold builds and incremental operations
 //! both end here, so they cannot disagree about a fact.
+//!
+//! The worklist runs in rounds. A round takes ranks in order, so a producer
+//! runs before the readers that rank after it, and within a rank runs every
+//! changed derivation before re-checking any reader: statements read each
+//! other in both directions, and a reader checked once after the rank's new
+//! work has run is checked once, not after each writer. A reader that ranks
+//! before the derivation that queued it (a back edge) waits for the next
+//! round, which re-checks it once however many later producers moved it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::DbIndex;
 use crate::db_index::derivation::{self, DerivationId, DerivationKind, FactKey};
 
-/// Why a derivation is on the worklist. Changed work runs before read checks,
-/// so a reader is checked after the producers the operation re-ran.
+/// Why a derivation is on the worklist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Reason {
     /// Its site is new or its outputs were dropped: always evaluated.
@@ -28,9 +35,52 @@ pub(crate) enum Reason {
     Read,
 }
 
+/// Queued derivations in the order a round takes them.
+#[derive(Default)]
+struct Queue {
+    order: BTreeSet<(u8, Reason, DerivationId)>,
+    reasons: FxHashMap<DerivationId, Reason>,
+}
+
+impl Queue {
+    /// Queues `id`; a changed entry stays changed.
+    fn insert(&mut self, id: DerivationId, reason: Reason) {
+        if let Some(queued) = self.reasons.get(&id) {
+            if *queued <= reason {
+                return;
+            }
+            self.order.remove(&(id.kind.rank(), *queued, id));
+        }
+        self.reasons.insert(id, reason);
+        self.order.insert((id.kind.rank(), reason, id));
+    }
+
+    fn remove(&mut self, id: DerivationId) {
+        if let Some(reason) = self.reasons.remove(&id) {
+            self.order.remove(&(id.kind.rank(), reason, id));
+        }
+    }
+
+    fn pop_first(&mut self) -> Option<(DerivationId, Reason)> {
+        let (_, reason, id) = self.order.pop_first()?;
+        self.reasons.remove(&id);
+        Some((id, reason))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Engine {
-    worklist: BTreeSet<(Reason, DerivationId)>,
+    /// This round's work.
+    worklist: Queue,
+    /// Back edges: readers ranked before the derivation that queued them.
+    next_round: Queue,
+    /// The derivation this round evaluated last.
+    cursor: Option<DerivationId>,
+    stats: EngineStats,
     /// Files whose source passes read a fact that moved. A file's source
     /// layer is only ever rebuilt whole, so the caller re-analyses them.
     stale_sources: BTreeSet<crate::FileId>,
@@ -87,7 +137,29 @@ impl Engine {
     }
 
     pub(crate) fn changed(&mut self, id: DerivationId) {
-        self.worklist.insert((Reason::Changed, id));
+        self.queue(id, Reason::Changed);
+    }
+
+    /// Queues `id` in this round unless it ranks before the derivation being
+    /// evaluated, else in the next. A changed entry stays changed.
+    fn queue(&mut self, id: DerivationId, reason: Reason) {
+        if self
+            .cursor
+            .is_some_and(|cursor| id.kind.rank() < cursor.kind.rank())
+        {
+            self.next_round.insert(id, reason);
+        } else {
+            self.worklist.insert(id, reason);
+        }
+    }
+
+    fn unqueue(&mut self, id: DerivationId) {
+        self.worklist.remove(id);
+        self.next_round.remove(id);
+    }
+
+    pub(crate) fn stats(&self) -> &EngineStats {
+        &self.stats
     }
 
     /// Queues the readers of `keys` whose recorded fingerprint differs from
@@ -109,9 +181,7 @@ impl Engine {
                     DerivationKind::Source => {
                         self.stale_sources.insert(reader.file_id);
                     }
-                    _ => {
-                        self.worklist.insert((Reason::Read, reader));
-                    }
+                    _ => self.queue(reader, Reason::Read),
                 }
             }
         }
@@ -150,7 +220,17 @@ impl Engine {
         db: &mut DbIndex,
         recipe: &mut dyn FnMut(&mut DbIndex, DerivationId),
     ) {
-        while let Some((reason, id)) = self.worklist.pop_first() {
+        loop {
+            let Some((id, reason)) = self.worklist.pop_first() else {
+                if self.next_round.is_empty() {
+                    break;
+                }
+                self.worklist = std::mem::take(&mut self.next_round);
+                self.cursor = None;
+                self.stats.rounds += 1;
+                continue;
+            };
+            self.cursor = Some(id);
             if reason == Reason::Read
                 && !db
                     .reader_graph()
@@ -181,8 +261,8 @@ impl Engine {
             }
             let group = co_producers(db, id);
             for member in &group {
-                self.worklist.remove(&(Reason::Changed, *member));
-                self.worklist.remove(&(Reason::Read, *member));
+                self.unqueue(*member);
+                self.stats.evaluated(*member);
             }
             self.evaluated.extend(
                 group
@@ -210,10 +290,55 @@ impl Engine {
                     })
             });
             if widened.is_some() {
-                self.changed(id);
+                // Again in this round: nothing ran after it yet.
+                self.worklist.insert(id, Reason::Changed);
             }
             self.readers_of(db, touched.iter());
         }
+        self.cursor = None;
+    }
+}
+
+/// What the engine evaluated, for the profile and for tests that pin how much
+/// work an operation costs.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct EngineStats {
+    evaluations: BTreeMap<DerivationKind, usize>,
+    /// Rounds after the first.
+    pub(crate) rounds: usize,
+}
+
+impl EngineStats {
+    fn evaluated(&mut self, id: DerivationId) {
+        *self.evaluations.entry(id.kind).or_default() += 1;
+    }
+
+    /// How many times derivations of `kind` were evaluated.
+    #[cfg(test)]
+    pub(crate) fn evaluations(&self, kind: DerivationKind) -> usize {
+        self.evaluations.get(&kind).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn total_evaluations(&self) -> usize {
+        self.evaluations.values().sum()
+    }
+
+    /// Prints the counts under `GLUALS_PROFILE`.
+    pub(crate) fn report(&self) {
+        if std::env::var_os("GLUALS_PROFILE").is_none() || self.evaluations.is_empty() {
+            return;
+        }
+        let kinds = self
+            .evaluations
+            .iter()
+            .map(|(kind, count)| format!("{kind:?}={count}"))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "[engine] evaluations={} rounds={} {}",
+            self.total_evaluations(),
+            self.rounds,
+            kinds.join(" ")
+        );
     }
 }
 

@@ -495,7 +495,7 @@ pub enum DerivationKind {
 }
 
 impl DerivationKind {
-    fn rank(self) -> u8 {
+    pub fn rank(self) -> u8 {
         match self {
             Self::LocalStat
             | Self::AssignStat

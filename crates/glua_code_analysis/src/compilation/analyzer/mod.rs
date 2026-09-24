@@ -17,6 +17,7 @@ pub(crate) mod unresolve;
 pub(crate) use common::{union_widens_cached_type, widen_mutable_decl_literal};
 pub(crate) use dynamic_field::for_range_pairs_source_for_var;
 pub(crate) use dynamic_field::is_provably_builtin_iterator_call;
+pub(crate) use engine::EngineStats;
 pub use lua::is_member_assignment_in_conditional_branch;
 pub(crate) use lua::{
     dominating_guarded_table_bootstrap_range, infer_for_range_iter_expr_func,
@@ -103,6 +104,7 @@ pub(crate) struct Reanalysis {
     /// The files whose source layer was rebuilt or whose derivations were
     /// evaluated, sorted.
     pub evaluated_files: Vec<FileId>,
+    pub(crate) stats: engine::EngineStats,
 }
 
 /// Re-analyses `file_ids` from their current text, and whatever read a fact
@@ -131,9 +133,12 @@ pub(crate) fn reanalyze(
     db.flush_inference_derived_state();
     let touched = engine.take_touched();
     refresh_payload_refs(db, &touched);
+    let stats = engine.stats().clone();
+    stats.report();
     Reanalysis {
         touched,
         evaluated_files: engine.evaluated_files(),
+        stats,
     }
 }
 

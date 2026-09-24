@@ -10,6 +10,7 @@ mod closure_return_test;
 mod decl_test;
 mod dependency_test;
 mod diagnostic_disable_test;
+mod engine_schedule_test;
 mod export_test;
 mod flat_enum_test;
 mod flow;

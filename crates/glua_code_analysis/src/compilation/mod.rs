@@ -31,6 +31,7 @@ pub struct LuaCompilation {
     diagnostic_reads: Mutex<DiagnosticReads>,
     /// The files the last `update_index` re-analysed, for locality checks.
     last_evaluated_files: Vec<FileId>,
+    last_stats: analyzer::EngineStats,
 }
 
 impl LuaCompilation {
@@ -41,6 +42,7 @@ impl LuaCompilation {
             batch_log: None,
             diagnostic_reads: Mutex::default(),
             last_evaluated_files: Vec::new(),
+            last_stats: analyzer::EngineStats::default(),
         };
 
         compilation.db.update_config(emmyrc.clone());
@@ -71,6 +73,7 @@ impl LuaCompilation {
         );
         let reanalysis = analyzer::reanalyze(&mut self.db, file_ids.clone(), edits.clone());
         self.last_evaluated_files = reanalysis.evaluated_files;
+        self.last_stats = reanalysis.stats;
         let reads = self
             .diagnostic_reads
             .get_mut()
@@ -104,6 +107,12 @@ impl LuaCompilation {
     /// source layer was rebuilt or whose derivations were evaluated.
     pub fn last_evaluated_files(&self) -> &[FileId] {
         &self.last_evaluated_files
+    }
+
+    /// What the last [`Self::update_index`] evaluated.
+    #[cfg(test)]
+    pub(crate) fn last_stats(&self) -> &analyzer::EngineStats {
+        &self.last_stats
     }
 
     /// Whether `file_id`'s facts were built from its current text.
@@ -175,6 +184,7 @@ impl LuaCompilation {
             batch_log: None,
             diagnostic_reads: Mutex::new(reads),
             last_evaluated_files: Vec::new(),
+            last_stats: analyzer::EngineStats::default(),
         }
     }
 
