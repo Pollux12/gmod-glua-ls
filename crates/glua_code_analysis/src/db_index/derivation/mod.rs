@@ -108,6 +108,8 @@ pub enum FactKey {
     ValidGuardFile(FileId),
     /// The files that have valid-guard signatures.
     ValidGuardFiles,
+    /// The names of the definitions marked `valid_guard`.
+    ValidGuardNames,
     /// A file's signatures and receiver out-param names.
     SignatureFile(FileId),
     /// Out-param member names a receiver type is known to carry.
@@ -410,6 +412,7 @@ impl FactKey {
             | K::HelperScanFiles
             | K::FileSet
             | K::ValidGuardFiles
+            | K::ValidGuardNames
             | K::NetHelperNames
             | K::Property(_)
             | K::Global(_)
@@ -489,7 +492,7 @@ pub enum DerivationKind {
 }
 
 impl DerivationKind {
-    fn rank(self) -> u8 {
+    pub(crate) fn rank(self) -> u8 {
         match self {
             Self::LocalStat
             | Self::AssignStat

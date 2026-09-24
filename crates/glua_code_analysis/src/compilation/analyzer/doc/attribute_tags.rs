@@ -1,11 +1,12 @@
 use glua_parser::{
-    LuaAst, LuaAstNode, LuaDocTagAttributeUse, LuaDocType, LuaExpr, LuaKind, LuaLiteralExpr,
-    LuaLiteralToken, LuaSyntaxKind, LuaSyntaxNode, LuaTokenKind, NumberResult,
+    LuaAst, LuaAstNode, LuaDocTagAttributeUse, LuaDocType, LuaExpr, LuaIndexKey, LuaKind,
+    LuaLiteralExpr, LuaLiteralToken, LuaLocalName, LuaSyntaxKind, LuaSyntaxNode, LuaTokenKind,
+    LuaVarExpr, NumberResult,
 };
 use smol_str::SmolStr;
 
 use crate::{
-    GMOD_ATTR_WRITES_GLOBAL, LuaAttributeUse, LuaSemanticDeclId, LuaType,
+    GMOD_ATTR_VALID_GUARD, GMOD_ATTR_WRITES_GLOBAL, LuaAttributeUse, LuaSemanticDeclId, LuaType,
     compilation::analyzer::doc::{
         DocAnalyzer,
         infer_type::infer_type,
@@ -27,7 +28,7 @@ pub fn analyze_tag_attribute_use(
         }
     };
 
-    if let Some(owner) = owner {
+    if let Some(owner) = owner.clone() {
         match (owner, &owner_id) {
             (LuaAst::LuaDocTagParam(_), LuaSemanticDeclId::Signature(_))
             | (LuaAst::LuaDocTagReturn(_), LuaSemanticDeclId::Signature(_)) => {
@@ -49,6 +50,14 @@ pub fn analyze_tag_attribute_use(
 
     let attribute_uses = infer_attribute_uses(analyzer, tag_use)?;
     for attribute_use in attribute_uses {
+        if attribute_use.id.get_name() == GMOD_ATTR_VALID_GUARD
+            && let Some(name) = owner.as_ref().and_then(documented_definition_name)
+        {
+            analyzer
+                .db
+                .get_signature_index_mut()
+                .add_valid_guard_name(analyzer.file_id, name);
+        }
         analyzer.db.get_property_index_mut().add_attribute_use(
             analyzer.file_id,
             owner_id.clone(),
@@ -56,6 +65,41 @@ pub fn analyze_tag_attribute_use(
         );
     }
     Some(())
+}
+
+/// The name of the definition a doc comment documents: the function, local,
+/// assignment target or table field it is attached to.
+fn documented_definition_name(owner: &LuaAst) -> Option<SmolStr> {
+    let var_name = |var: LuaVarExpr| match var {
+        LuaVarExpr::NameExpr(name) => name.get_name_text().map(SmolStr::new),
+        LuaVarExpr::IndexExpr(index) => index_key_name(index.get_index_key()?),
+    };
+    match owner {
+        LuaAst::LuaFuncStat(stat) => var_name(stat.get_func_name()?),
+        LuaAst::LuaLocalFuncStat(stat) => Some(
+            stat.get_local_name()?
+                .get_name_token()?
+                .get_name_text()
+                .into(),
+        ),
+        LuaAst::LuaAssignStat(stat) => var_name(stat.child::<LuaVarExpr>()?),
+        LuaAst::LuaLocalStat(stat) => Some(
+            stat.child::<LuaLocalName>()?
+                .get_name_token()?
+                .get_name_text()
+                .into(),
+        ),
+        LuaAst::LuaTableField(field) => index_key_name(field.get_field_key()?),
+        _ => None,
+    }
+}
+
+fn index_key_name(key: LuaIndexKey) -> Option<SmolStr> {
+    match key {
+        LuaIndexKey::Name(name) => Some(name.get_name_text().into()),
+        LuaIndexKey::String(string) => Some(string.get_value().into()),
+        _ => None,
+    }
 }
 
 pub fn infer_attribute_uses(

@@ -123,7 +123,7 @@ pub(crate) fn reanalyze(
         let scopes = ScriptedScopes::new(db);
         engine.note_rebuilt(&pending);
         let touched = replace_files(db, &mut engine, &pending, &scopes);
-        engine.readers_of(db, touched.iter());
+        engine.readers_of(db, touched.iter(), 0);
         let recipes = derive::Recipes::new(db, scopes);
         engine.run(db, &mut |db, id| recipes.evaluate(db, id));
         pending = engine.take_stale_sources().into_iter().collect();

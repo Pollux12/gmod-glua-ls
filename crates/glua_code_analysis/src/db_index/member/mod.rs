@@ -2680,6 +2680,23 @@ impl LuaMemberIndex {
         }
     }
 
+    /// The members filed under `file_id`, sorted.
+    pub(crate) fn file_member_ids(&self, file_id: FileId) -> Vec<LuaMemberId> {
+        derivation::note_read(|| FactKey::MemberFile(file_id));
+        let mut ids = self
+            .in_filed
+            .get(&file_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| match entry {
+                MemberOrOwner::Member(member_id) => Some(*member_id),
+                MemberOrOwner::Owner(_) => None,
+            })
+            .collect::<Vec<_>>();
+        ids.sort_by_key(|id| member_id_sort_key(*id));
+        ids
+    }
+
     pub fn get_file_members(&self, file_id: FileId) -> Vec<&LuaMember> {
         derivation::note_read(|| FactKey::MemberFile(file_id));
         let Some(member_or_owners) = self.in_filed.get(&file_id) else {

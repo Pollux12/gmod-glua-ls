@@ -603,10 +603,14 @@ fn valid_guard_globals_in_file(
     let Some(tree) = db.get_decl_index().get_decl_tree(&file_id) else {
         return effective_signatures;
     };
+    let signature_index = db.get_signature_index();
     let mut decl_ids = tree
         .get_decls()
         .values()
-        .filter(|decl| matches!(decl.extra, LuaDeclExtra::Global { .. }))
+        .filter(|decl| {
+            matches!(decl.extra, LuaDeclExtra::Global { .. })
+                && signature_index.is_valid_guard_name(decl.get_name())
+        })
         .map(|decl| decl.get_id())
         .collect::<Vec<_>>();
     decl_ids.sort_by_key(|decl_id| decl_id.position);
@@ -638,11 +642,22 @@ fn valid_guard_contributions_for_file(
     file_id: FileId,
 ) -> Vec<(LuaSignatureId, GmodStateMask)> {
     let mut found = Vec::new();
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .map(|tree| tree.get_red_root())
+    else {
+        return found;
+    };
+    let signature_index = db.get_signature_index();
     let member_ids = db
         .get_member_index()
-        .get_file_members(file_id)
+        .file_member_ids(file_id)
         .into_iter()
-        .map(|member| member.get_id())
+        .filter(|member_id| {
+            member_syntax_name(&root, member_id)
+                .is_some_and(|name| signature_index.is_valid_guard_name(&name))
+        })
         .collect::<Vec<_>>();
     for member_id in member_ids {
         let semantic_decl = LuaSemanticDeclId::from(member_id);
@@ -676,6 +691,26 @@ pub fn signature_is_valid_guard_or_base_runtime_isvalid_in_realm(
         .and_then(|path| path.to_str())
         .map(|path| path.replace('\\', "/"))
         .is_some_and(|path| path.ends_with("/lua/includes/util.lua"))
+}
+
+/// The name a member's own syntax gives it: the key of `x.name`, `x:name` or
+/// a `name = value` table field.
+fn member_syntax_name(
+    root: &glua_parser::LuaSyntaxNode,
+    member_id: &LuaMemberId,
+) -> Option<SmolStr> {
+    use glua_parser::{LuaAstNode, LuaIndexExpr, LuaIndexKey, LuaTableField};
+    let node = member_id.get_syntax_id().to_node_from_root(root)?;
+    let key = if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
+        index_expr.get_index_key()?
+    } else {
+        LuaTableField::cast(node)?.get_field_key()?
+    };
+    match key {
+        LuaIndexKey::Name(name) => Some(name.get_name_text().into()),
+        LuaIndexKey::String(string) => Some(string.get_value().into()),
+        _ => None,
+    }
 }
 
 fn global_identity_direct_valid_guard_mask(
@@ -1151,6 +1186,70 @@ mod tests {
             GMOD_CALL_ARG_DOMAINS.len(),
             "GMOD_CALL_ARG_DOMAINS has no duplicates"
         );
+    }
+
+    /// Only definitions named like an annotated guard can take its identity,
+    /// so a file of unrelated functions is not scanned member by member: its
+    /// valid-guard scan reads a handful of facts, not one per definition,
+    /// while a same-named shadow still becomes a guard.
+    #[test]
+    fn valid_guard_scan_reads_only_same_named_definitions() {
+        use crate::Emmyrc;
+        use crate::db_index::derivation::DerivationKind;
+
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/includes/valid_guard_anno.lua",
+            r#"
+            ---@meta
+            ---@attribute valid_guard()
+
+            ---@param value any
+            ---@return boolean
+            ---@[valid_guard]
+            function IsValid(value) end
+            "#,
+        );
+        let mut unrelated = String::from(
+            "Helpers = {}
+",
+        );
+        for i in 0..200 {
+            unrelated.push_str(&format!(
+                "function Helpers.f{i}(x) return x end
+"
+            ));
+        }
+        let unrelated_file = ws.def_file("lua/autorun/helpers.lua", &unrelated);
+        let shadow_file = ws.def_file(
+            "lua/autorun/shadow.lua",
+            "function IsValid(value)
+    return value ~= nil
+end
+",
+        );
+
+        let db = ws.analysis.compilation.get_db();
+        assert!(
+            db.get_signature_index()
+                .iter()
+                .any(|(id, _)| id.get_file_id() == shadow_file
+                    && db
+                        .get_signature_index()
+                        .effective_valid_guard_signature_mask(id)
+                        .is_some()),
+            "the same-named shadow is a guard"
+        );
+        let scan = db
+            .reader_graph()
+            .derivations_of_file(unrelated_file)
+            .find(|id| id.kind == DerivationKind::ValidGuardScan)
+            .expect("the file has a valid-guard scan");
+        let reads = db.reader_graph().reads_of(scan).len();
+        assert!(reads < 20, "the scan read {reads} facts");
     }
 
     /// Removing the file that shadows a valid-guard annotation drops its
