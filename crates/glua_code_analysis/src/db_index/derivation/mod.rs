@@ -639,6 +639,18 @@ thread_local! {
     static CURRENT: RefCell<Option<Evaluation>> = const { RefCell::new(None) };
     static UNTRACKED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static WRITE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static CAPTURED: RefCell<Option<FxHashSet<FactKey>>> = const { RefCell::new(None) };
+}
+
+/// Runs `f` outside any evaluation and returns every key it wrote: a reset
+/// moves facts other derivations produced, whose readers must be re-checked.
+pub fn capture_writes(f: impl FnOnce()) -> FxHashSet<FactKey> {
+    debug_assert!(!recording(), "writes captured inside an evaluation");
+    let previous = CAPTURED.with(|captured| captured.replace(Some(FxHashSet::default())));
+    f();
+    CAPTURED
+        .with(|captured| captured.replace(previous))
+        .unwrap_or_default()
 }
 
 /// Advances whenever an evaluation writes a fact, so inference memoised
@@ -726,6 +738,12 @@ pub fn note_write(key: impl FnOnce() -> FactKey) {
         if let Some(evaluation) = current.borrow_mut().as_mut() {
             WRITE_GENERATION.with(|generation| generation.set(generation.get() + 1));
             evaluation.outputs.insert(key());
+        } else {
+            CAPTURED.with(|captured| {
+                if let Some(captured) = captured.borrow_mut().as_mut() {
+                    captured.insert(key());
+                }
+            });
         }
     });
 }

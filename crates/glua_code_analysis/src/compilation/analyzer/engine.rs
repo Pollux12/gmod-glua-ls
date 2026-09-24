@@ -441,9 +441,12 @@ fn evaluate_group(
     for member in group {
         touched.extend(db.reader_graph().outputs_of(*member).iter().cloned());
     }
-    for key in touched.iter().filter(|key| key.is_primary()) {
-        db.reset_fact(key);
-    }
+    let reset = derivation::capture_writes(|| {
+        for key in touched.iter().filter(|key| key.is_primary()) {
+            db.reset_fact(key);
+        }
+    });
+    touched.extend(reset);
     // Fingerprints are taken once the whole group has run: the group always
     // re-runs as a unit, so a member's read of what a later member writes is
     // internal to it, not a stale input.

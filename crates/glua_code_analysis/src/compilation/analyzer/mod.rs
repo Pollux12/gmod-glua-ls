@@ -168,7 +168,7 @@ fn replace_files(
         for (_, outputs) in removed {
             for key in outputs.iter() {
                 if key.is_primary() && key.owning_file() != Some(*file_id) {
-                    db.reset_fact(key);
+                    touched.extend(derivation::capture_writes(|| db.reset_fact(key)));
                     for producer in db.reader_graph().producers(key).collect::<Vec<_>>() {
                         if producer.kind != derivation::DerivationKind::Source {
                             engine.changed(producer);

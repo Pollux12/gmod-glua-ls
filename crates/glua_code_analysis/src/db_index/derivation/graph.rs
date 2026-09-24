@@ -214,6 +214,12 @@ impl ReaderGraph {
         self.readers.keys()
     }
 
+    /// Every derivation with a record.
+    #[cfg(test)]
+    pub fn derivations(&self) -> impl Iterator<Item = DerivationId> + '_ {
+        self.records.keys().copied()
+    }
+
     pub fn contains(&self, id: DerivationId) -> bool {
         self.records.contains_key(&id)
     }
