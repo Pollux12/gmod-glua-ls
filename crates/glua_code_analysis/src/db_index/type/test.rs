@@ -749,6 +749,27 @@ mod test {
     }
 
     #[test]
+    fn publishing_inference_facts_defers_the_derived_state_rebuild() {
+        let mut db = DbIndex::new();
+        let fact = LuaTypeFact::new(
+            LuaType::String,
+            LuaInferenceConfidence::Anchored,
+            anchored_metadata().provenance,
+        );
+        db.publish_inference_facts(vec![(LuaInferenceNodeId::TypeOwner(owner()), fact)]);
+        assert!(db.get_type_index().inference_derived_state_is_stale());
+
+        db.flush_inference_derived_state();
+        assert!(!db.get_type_index().inference_derived_state_is_stale());
+        assert_eq!(
+            db.get_type_index()
+                .get_inference_events_for_file(file_id())
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn test_resolve_alias_type_handles_def_alias() {
         let mut db = DbIndex::default();
         let file_id = FileId { id: 1 };

@@ -2322,6 +2322,10 @@ impl LuaTypeIndex {
     }
 
     pub fn get_inference_events_for_file(&self, file_id: FileId) -> &[LuaInferenceDiagnosticEvent] {
+        debug_assert!(
+            !self.derived_state_dirty,
+            "inference events read before a flush"
+        );
         self.inference_events_by_file
             .get(&file_id)
             .map(AsRef::as_ref)
@@ -2332,6 +2336,10 @@ impl LuaTypeIndex {
         &self,
         file_ids: &std::collections::HashSet<FileId, S>,
     ) -> HashSet<FileId> {
+        debug_assert!(
+            !self.derived_state_dirty,
+            "support dependents read before a flush"
+        );
         let mut dependents = HashSet::default();
         for file_id in file_ids {
             if let Some(files) = self.support_file_dependents.get(file_id) {
@@ -2346,6 +2354,10 @@ impl LuaTypeIndex {
         &self,
         nodes: &[LuaInferenceNodeId],
     ) -> HashSet<FileId> {
+        debug_assert!(
+            !self.derived_state_dirty,
+            "support dependents read before a flush"
+        );
         let mut dependents = HashSet::default();
         for node in nodes {
             if let Some(files) = self.support_dependents.get(node) {
@@ -2585,6 +2597,12 @@ impl LuaTypeIndex {
     /// support dependents by reindex expansion, both after `analyze` returns.
     pub(crate) fn mark_inference_derived_state_dirty(&mut self) {
         self.derived_state_dirty = true;
+    }
+
+    /// Whether a binding left the inference-derived state for a flush.
+    #[cfg(test)]
+    pub(crate) fn inference_derived_state_is_stale(&self) -> bool {
+        self.derived_state_dirty
     }
 
     /// Rebuilds the inference-derived state if any binding marked it stale.

@@ -543,7 +543,6 @@ impl DbIndex {
         if !changed_files.is_empty() {
             Arc::make_mut(&mut self.types_index).mark_inference_derived_state_dirty();
         }
-        Arc::make_mut(&mut self.types_index).flush_inference_derived_state();
         changed_files
     }
 

@@ -516,6 +516,7 @@ mod tests {
                 .into(),
             ),
         )]);
+        ws.get_db_mut().flush_inference_derived_state();
         let call = root
             .descendants::<LuaCallExpr>()
             .find(|call| {
@@ -921,6 +922,7 @@ mod tests {
                 .into(),
             ),
         )]);
+        ws.get_db_mut().flush_inference_derived_state();
 
         let found = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
         assert_eq!(found.len(), 1, "{found:?}");
