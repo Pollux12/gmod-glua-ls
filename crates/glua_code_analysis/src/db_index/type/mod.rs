@@ -3,7 +3,6 @@ mod humanize_type;
 #[cfg(test)]
 mod identity_tests;
 mod inference_fact;
-pub(crate) mod read_set;
 mod test;
 mod type_decl;
 mod type_ops;
@@ -12,12 +11,12 @@ mod type_visit_trait;
 mod types;
 
 use super::traits::LuaIndex;
-use crate::db_index::op_log;
-use crate::db_index::r#type::read_set::WriteKey;
+use crate::db_index::derivation::{self, DerivationId, FactKey, Fingerprint};
 use crate::{
-    DbIndex, FileId, InFiled, LuaDeclId, LuaDeclSourceKey, LuaMemberId, LuaMemberKey,
-    LuaMemberOwner, LuaSignatureId, db_index::r#type::type_decl::LuaTypeIdentifier,
+    DbIndex, FileId, InFiled, LuaDeclId, LuaDeclSourceKey, LuaMemberOwner, LuaSignatureId,
+    db_index::r#type::type_decl::LuaTypeIdentifier,
 };
+use flagset::FlagSet;
 pub use generic_param::GenericParam;
 pub use humanize_type::{
     DEFAULT_DETAIL_MEMBER_DISPLAY_COUNT, RenderLevel, format_union_type, humanize_member_key_name,
@@ -29,6 +28,7 @@ use rowan::{TextRange, TextSize};
 // hashing alone was 3.9% of all CPU under the default SipHash.
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
+pub(crate) use type_decl::LuaTypeExtra;
 pub use type_decl::{LuaDeclLocation, LuaDeclTypeKind, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag};
 pub use type_ops::TypeOps;
 pub(crate) use type_owner::is_undetermined_type;
@@ -70,18 +70,12 @@ pub(crate) struct LuaSuperType {
     pub(crate) typ: LuaType,
 }
 
-/// The slots a type-cache write lands in for merge keying: the owner's cache
-/// slot, plus the decl↔type bind maps when the owner is a decl bound to a
-/// `---` reference — `insert_type_cache` maintains both from the one call.
-fn type_bind_keys(owner: &LuaTypeOwner, cache: &LuaTypeCache) -> Box<[WriteKey]> {
-    let mut keys = vec![WriteKey::TypeOwner(owner.clone())];
-    if let (LuaTypeOwner::Decl(decl_id), LuaType::Ref(type_id) | LuaType::Def(type_id)) =
-        (owner, cache.as_type())
-    {
-        keys.push(WriteKey::DeclMisc(*decl_id));
-        keys.push(WriteKey::TypeDecl(type_id.clone()));
+impl derivation::FilePosition for LuaSuperType {
+    fn hash_in_file<H: std::hash::Hasher>(&self, file_id: FileId, state: &mut H) {
+        use std::hash::Hash;
+        self.source_range.hash_in_file(file_id, state);
+        self.typ.hash(state);
     }
-    keys.into()
 }
 
 pub fn resolve_alias_type(db: &DbIndex, typ: &LuaType) -> LuaResolvedAliasType {
@@ -127,55 +121,26 @@ fn resolve_alias_type_inner(
     resolve_alias_type_inner(db, &origin, alias_id, visited_aliases)
 }
 
-fn replace_table_const_in_type(
-    typ: &LuaType,
-    table_range: &InFiled<TextRange>,
-    replacement: &LuaType,
-) -> Option<LuaType> {
+/// The table literals `typ` names where a registration can replace them.
+fn collect_table_consts(typ: &LuaType, tables: &mut Vec<InFiled<TextRange>>) {
     match typ {
-        LuaType::TableConst(existing_range) if existing_range == table_range => {
-            Some(replacement.clone())
-        }
+        LuaType::TableConst(range) => tables.push(range.clone()),
         LuaType::Union(union) => {
-            let mut changed = false;
-            let new_types: Vec<LuaType> = union
-                .into_vec()
-                .into_iter()
-                .map(|sub_type| {
-                    replace_table_const_in_type(&sub_type, table_range, replacement)
-                        .inspect(|_| changed = true)
-                        .unwrap_or(sub_type)
-                })
-                .collect();
-            changed.then(|| LuaType::from_vec(new_types))
+            for sub_type in union.into_vec() {
+                collect_table_consts(&sub_type, tables);
+            }
         }
         LuaType::Intersection(intersection) => {
-            let mut changed = false;
-            let new_types: Vec<LuaType> = intersection
-                .get_types()
-                .iter()
-                .map(|sub_type| {
-                    replace_table_const_in_type(sub_type, table_range, replacement)
-                        .inspect(|_| changed = true)
-                        .unwrap_or_else(|| sub_type.clone())
-                })
-                .collect();
-            changed.then(|| LuaType::from_vec(new_types))
+            for sub_type in intersection.get_types() {
+                collect_table_consts(sub_type, tables);
+            }
         }
         LuaType::MergedTable(merged) => {
-            let mut changed = false;
-            let new_types: Vec<LuaType> = merged
-                .get_types()
-                .iter()
-                .map(|sub_type| {
-                    replace_table_const_in_type(sub_type, table_range, replacement)
-                        .inspect(|_| changed = true)
-                        .unwrap_or_else(|| sub_type.clone())
-                })
-                .collect();
-            changed.then(|| LuaMergedTableType::new(new_types).into())
+            for sub_type in merged.get_types() {
+                collect_table_consts(sub_type, tables);
+            }
         }
-        _ => None,
+        _ => {}
     }
 }
 
@@ -1256,28 +1221,6 @@ fn sort_type_decls_for_sub_types(sub_types: &mut Vec<&LuaTypeDecl>) {
     });
 }
 
-/// Direct subtype members by base class, as derived by the unguarded-child
-/// pass: base class id → member key → ids of the direct subclasses carrying
-/// that member. Cached on [`LuaTypeIndex`] instead of rebuilt per pass.
-pub(crate) type DirectSubtypeMembers =
-    HashMap<LuaTypeDeclId, HashMap<LuaMemberKey, Vec<LuaTypeDeclId>>>;
-
-/// What [`LuaTypeIndex::cached_direct_subtype_members`] was derived from.
-///
-/// All four counters are exact write revisions, so the key is O(1) to build:
-/// `super_revision` counts super-type writes, `member_revision` member
-/// re-homings, `member_writes` the member index's `move_clock` (every member,
-/// owner or key mutation — a superset of the member-count snapshot this used
-/// to need), and `dynamic_writes` the dynamic-field index's definition
-/// counter (a superset of the per-owner name fingerprint it replaces).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DirectSubtypeMembersKey {
-    pub(crate) super_revision: u64,
-    pub(crate) member_revision: u64,
-    pub(crate) member_writes: u64,
-    pub(crate) dynamic_writes: u64,
-}
-
 fn collect_type_cache_refs(typ: &LuaType) -> HashSet<TypeCacheRef> {
     let mut refs = HashSet::default();
     typ.visit_type_identities(&mut |inner| {
@@ -1319,6 +1262,10 @@ pub struct LuaTypeIndex {
     /// sites it owned — a contribution always lands on the decl the file's
     /// own declaration produced.
     alias_sources: HashMap<LuaTypeDeclId, HashMap<InFiled<TextRange>, LuaAliasSource>>,
+    /// Per-site `---@enum` and `---@attribute` payloads with their
+    /// precedence; the decl carries the winning site's payload.
+    extra_sources:
+        HashMap<LuaTypeDeclId, HashMap<InFiled<TextRange>, (LuaDeclSourceKey, LuaTypeExtra)>>,
     supers: HashMap<LuaTypeDeclId, Vec<InFiled<LuaSuperType>>>,
     /// Super-type edges by the file that declared them, so removing a file
     /// visits only its own edges instead of retaining over every edge in the
@@ -1338,20 +1285,9 @@ pub struct LuaTypeIndex {
     /// type-cache write and file removal alongside the caches themselves.
     decl_type_binds: HashMap<LuaDeclId, LuaTypeDeclId>,
     type_bound_decls: HashMap<LuaTypeDeclId, HashSet<LuaDeclId>>,
-    /// Counts super-type writes. Together with the member and dynamic-field
-    /// state captured in [`DirectSubtypeMembersKey`] it decides whether the
-    /// cached [`DirectSubtypeMembers`] is still fresh.
-    super_write_revision: u64,
-    cached_direct_subtype_members: Option<(DirectSubtypeMembersKey, Arc<DirectSubtypeMembers>)>,
     types: HashMap<LuaTypeOwner, LuaTypeCache>,
     cache_refs: TypeCacheRefIndex,
     in_filed_type_owner: HashMap<FileId, HashSet<LuaTypeOwner>>,
-    settled_reads_by_file: HashMap<FileId, HashSet<LuaTypeOwner>>,
-    settled_read_dependents: HashMap<LuaTypeOwner, HashSet<FileId>>,
-    /// The keys of [`Self::settled_read_dependents`] by the file the key
-    /// lives in, so remapping one file visits only its own keys instead of
-    /// scanning every settled owner in the workspace.
-    settled_owners_by_file: HashMap<FileId, HashSet<LuaTypeOwner>>,
     fact_metadata: HashMap<LuaTypeOwner, LuaTypeFactMetadata>,
     /// The files one fact's provenance and step types name, per fact owner,
     /// with the reverse map beside it. [`Self::remap_inference_facts`] visits
@@ -1371,36 +1307,68 @@ pub struct LuaTypeIndex {
     /// position, and whether its right-hand side was a call or index read. See
     /// `bind_decl_write`.
     decl_write_claims: HashMap<LuaDeclId, (TextSize, bool)>,
-    /// Counts stored types that actually moved, so a caller can tell a no-op
-    /// write from one that invalidates memoised inference.
-    type_writes: u64,
-    type_write_versions: HashMap<LuaTypeOwner, u64>,
     definition_facts: HashMap<LuaDefinitionId, LuaTypeFact>,
     inference_events_by_file: HashMap<FileId, Arc<[LuaInferenceDiagnosticEvent]>>,
     support_dependents: HashMap<LuaInferenceNodeId, HashSet<FileId>>,
     support_file_dependents: HashMap<FileId, HashSet<FileId>>,
     derived_state_dirty: bool,
-    /// Write epochs for the file-keyed side maps (`file_namespace`,
-    /// `file_using_namespace`, `file_types`) — `FileScopedKind::TypeFile`.
-    pub(crate) file_write_epochs: read_set::KeyedEpochs<FileId>,
-    /// Write epochs for `decl_write_claims`, stamped per claimed decl so a
-    /// mid-fixpoint claim write stales only readers of that claim.
-    pub(crate) claim_write_epochs: read_set::KeyedEpochs<LuaDeclId>,
-    /// Write epochs for the `---` type declarations (`full_name_type_map`,
-    /// supers, generic params, decl binds), stamped per decl so a decl write
-    /// stales only readers of that decl — `type_decl_scan` still uses the
-    /// domain counter since a scan observes the whole map.
-    pub(crate) decl_key_epochs: read_set::KeyedEpochs<(LuaTypeDeclId, read_set::TypeDeclKind)>,
-    /// Write epochs for `type_bound_decls`, stamped per (bound-to type,
-    /// bound decl's file) — the only caller filters the set by the class's
-    /// own files, so a bind elsewhere cannot move its result.
-    pub(crate) bound_decl_epochs: read_set::KeyedEpochs<(LuaTypeDeclId, FileId)>,
-    /// Write epochs for `definition_facts`, stamped per definition.
-    pub(crate) fact_epochs: read_set::KeyedEpochs<LuaDefinitionId>,
-    /// Domain counter for type-declaration writes (`full_name_type_map`,
-    /// supers, generic params) — the `type_decl_scan` whole-map read still
-    /// answers through this since a scan observes every decl.
-    pub(crate) type_decl_writes: u64,
+    /// Multiset fingerprint of every id in `full_name_type_map`, for
+    /// `TypeDeclScan`.
+    decl_scan_fingerprint: Fingerprint,
+    /// Each owner's cache and metadata as the source layer left them; a reset
+    /// restores these. See [`derivation::writes_source`].
+    source_types: HashMap<LuaTypeOwner, (LuaTypeCache, Option<LuaTypeFactMetadata>)>,
+    /// The locations the source layer declared each type decl at. Doc-time
+    /// name resolution only sees these, so a class a derivation registers
+    /// never changes how a file's annotations resolve.
+    source_decl_locations: HashMap<LuaTypeDeclId, Vec<LuaDeclLocation>>,
+    /// The declaration locations and super edges each derivation added, so
+    /// they are retracted before it runs again.
+    derived_contributions: HashMap<DerivationId, Vec<TypeContribution>>,
+    /// Who holds each declaration location, with the flags it gave. A
+    /// location's flags are its holders' union; it leaves with its last one.
+    location_holders:
+        HashMap<(LuaTypeDeclId, FileId, TextRange), Vec<(Holder, FlagSet<LuaTypeFlag>)>>,
+    /// Who holds each super edge; an edge leaves with its last holder.
+    super_holders: HashMap<(LuaTypeDeclId, InFiled<LuaSuperType>), Vec<Holder>>,
+    /// Table literals a registration turned into a class (a vgui panel
+    /// table, a scripted entity table), with the derivations registering
+    /// each. A stored type that names the literal names the class instead.
+    table_classes: HashMap<InFiled<TextRange>, Vec<(DerivationId, LuaType)>>,
+}
+
+/// The layer holding a type-index entry: `None` for the source layer, else
+/// the derivation that added it.
+type Holder = Option<DerivationId>;
+
+fn current_holder() -> Holder {
+    if derivation::writes_source() {
+        None
+    } else {
+        derivation::current()
+    }
+}
+
+fn union_flags(holders: &[(Holder, FlagSet<LuaTypeFlag>)]) -> FlagSet<LuaTypeFlag> {
+    holders
+        .iter()
+        .fold(FlagSet::default(), |flags, (_, flag)| flags | *flag)
+}
+
+/// A type-index entry a derivation added on top of the source layer.
+#[derive(Debug, Clone, Hash)]
+enum TypeContribution {
+    Location {
+        decl_id: LuaTypeDeclId,
+        location: LuaDeclLocation,
+    },
+    Super {
+        decl_id: LuaTypeDeclId,
+        entry: InFiled<LuaSuperType>,
+    },
+    TableClass {
+        table: InFiled<TextRange>,
+    },
 }
 
 impl Default for LuaTypeIndex {
@@ -1418,127 +1386,248 @@ impl LuaTypeIndex {
             declaration_sites: HashMap::default(),
             full_name_type_map: HashMap::default(),
             alias_sources: HashMap::default(),
+            extra_sources: HashMap::default(),
             generic_params: HashMap::default(),
             supers: HashMap::default(),
             supers_by_file: HashMap::default(),
             sub_types: HashMap::default(),
             decl_type_binds: HashMap::default(),
             type_bound_decls: HashMap::default(),
-            super_write_revision: 0,
-            cached_direct_subtype_members: None,
             types: HashMap::default(),
             cache_refs: TypeCacheRefIndex::default(),
             in_filed_type_owner: HashMap::default(),
-            settled_reads_by_file: HashMap::default(),
-            settled_read_dependents: HashMap::default(),
-            settled_owners_by_file: HashMap::default(),
             fact_ref_files: HashMap::default(),
             fact_refs_by_file: HashMap::default(),
             definition_fact_ref_files: HashMap::default(),
             definition_fact_refs_by_file: HashMap::default(),
             fact_metadata: HashMap::default(),
             decl_write_claims: HashMap::default(),
-            type_writes: 0,
-            type_write_versions: HashMap::default(),
             definition_facts: HashMap::default(),
             inference_events_by_file: HashMap::default(),
             support_dependents: HashMap::default(),
             support_file_dependents: HashMap::default(),
             derived_state_dirty: false,
-            file_write_epochs: read_set::KeyedEpochs::default(),
-            claim_write_epochs: read_set::KeyedEpochs::default(),
-            decl_key_epochs: read_set::KeyedEpochs::default(),
-            bound_decl_epochs: read_set::KeyedEpochs::default(),
-            fact_epochs: read_set::KeyedEpochs::default(),
-            type_decl_writes: 0,
+            decl_scan_fingerprint: derivation::ABSENT,
+            source_types: HashMap::default(),
+            source_decl_locations: HashMap::default(),
+            derived_contributions: HashMap::default(),
+            location_holders: HashMap::default(),
+            super_holders: HashMap::default(),
+            table_classes: HashMap::default(),
         }
     }
 
     pub fn add_file_namespace(&mut self, file_id: FileId, namespace: String) {
-        if op_log::recording() {
-            let namespace2 = namespace.clone();
-            op_log::push_one(
-                op_log::Domain::Type,
-                WriteKey::FileScoped(file_id),
-                move |db| {
-                    db.get_type_index_mut()
-                        .add_file_namespace(file_id, namespace2)
-                },
-            );
-        }
         self.file_namespace.insert(file_id, namespace);
-        self.file_write_epochs.note(file_id);
+        derivation::note_write(|| FactKey::TypeFile(file_id));
     }
 
     pub fn get_file_namespace(&self, file_id: &FileId) -> Option<&String> {
-        read_set::record_file_scoped(
-            &self.file_write_epochs,
-            file_id,
-            read_set::FileScopedKind::TypeFile,
-        );
+        derivation::note_read(|| FactKey::TypeFile(*file_id));
         self.file_namespace.get(file_id)
     }
 
     pub fn add_file_using_namespace(&mut self, file_id: FileId, namespace: String) {
-        if op_log::recording() {
-            let namespace2 = namespace.clone();
-            op_log::push_one(
-                op_log::Domain::Type,
-                WriteKey::FileScoped(file_id),
-                move |db| {
-                    db.get_type_index_mut()
-                        .add_file_using_namespace(file_id, namespace2)
-                },
-            );
-        }
         self.file_using_namespace
             .entry(file_id)
             .or_default()
             .push(namespace);
-        self.file_write_epochs.note(file_id);
+        derivation::note_write(|| FactKey::TypeFile(file_id));
     }
 
     pub fn get_file_using_namespace(&self, file_id: &FileId) -> Option<&Vec<String>> {
-        read_set::record_file_scoped(
-            &self.file_write_epochs,
-            file_id,
-            read_set::FileScopedKind::TypeFile,
-        );
+        derivation::note_read(|| FactKey::TypeFile(*file_id));
         self.file_using_namespace.get(file_id)
     }
 
     /// return previous FileId if exist
+    fn record_contribution(&mut self, contribution: TypeContribution) {
+        let Some(id) = derivation::current() else {
+            return;
+        };
+        derivation::note_write(|| FactKey::TypeContrib(id));
+        self.derived_contributions
+            .entry(id)
+            .or_default()
+            .push(contribution);
+    }
+
+    /// Removes what derivation `id` added, before it runs again or after its
+    /// file is gone.
+    pub(crate) fn retract_contributions(&mut self, id: &DerivationId) {
+        let Some(contributions) = self.derived_contributions.remove(id) else {
+            return;
+        };
+        for contribution in contributions.into_iter().rev() {
+            match contribution {
+                TypeContribution::Location { decl_id, location } => {
+                    self.release_location(&decl_id, &location, Some(*id))
+                }
+                TypeContribution::Super { decl_id, entry } => {
+                    self.release_super_entry(&decl_id, &entry, Some(*id))
+                }
+                TypeContribution::TableClass { table } => self.release_table_class(&table, id),
+            }
+        }
+    }
+
+    /// Files a source-layer location in canonical order, so a file's rebuild
+    /// restores the list a cold build has.
+    fn add_source_location(&mut self, decl_id: &LuaTypeDeclId, location: LuaDeclLocation) {
+        derivation::note_write(|| FactKey::SourceTypeDecl(decl_id.clone()));
+        let locations = self
+            .source_decl_locations
+            .entry(decl_id.clone())
+            .or_default();
+        let at = locations.partition_point(|existing| {
+            (
+                existing.file_id,
+                existing.range.start(),
+                existing.range.end(),
+            ) <= (
+                location.file_id,
+                location.range.start(),
+                location.range.end(),
+            )
+        });
+        locations.insert(at, location);
+    }
+
+    fn hold_location(
+        &mut self,
+        decl_id: &LuaTypeDeclId,
+        location: &LuaDeclLocation,
+        holder: Holder,
+    ) {
+        self.location_holders
+            .entry((decl_id.clone(), location.file_id, location.range))
+            .or_default()
+            .push((holder, location.flag));
+    }
+
+    /// Drops `holder`'s hold on `location`, removing it once nothing holds it.
+    fn release_location(
+        &mut self,
+        decl_id: &LuaTypeDeclId,
+        location: &LuaDeclLocation,
+        holder: Holder,
+    ) {
+        let file_id = location.file_id;
+        let site = (decl_id.clone(), file_id, location.range);
+        let Some(holders) = self.location_holders.get_mut(&site) else {
+            return;
+        };
+        let Some(at) = holders.iter().position(|(existing, _)| *existing == holder) else {
+            return;
+        };
+        holders.remove(at);
+        let remaining = (!holders.is_empty()).then(|| union_flags(holders));
+        if remaining.is_none() {
+            self.location_holders.remove(&site);
+        }
+        let Some(decl) = self.full_name_type_map.get_mut(decl_id) else {
+            return;
+        };
+        let locations = decl.get_mut_locations();
+        let Some(at) = locations
+            .iter()
+            .position(|existing| existing.file_id == file_id && existing.range == location.range)
+        else {
+            return;
+        };
+        if let Some(flag) = remaining {
+            if locations[at].flag != flag {
+                locations[at].flag = flag;
+                derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
+            }
+            return;
+        }
+        locations.remove(at);
+        let emptied = locations.is_empty();
+        derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
+        if emptied {
+            self.full_name_type_map.remove(decl_id);
+            self.remove_from_decl_scan(decl_id);
+            self.generic_params.remove(decl_id);
+            self.alias_sources.remove(decl_id);
+        }
+    }
+
+    /// Drops `holder`'s hold on a super edge, removing it once nothing holds it.
+    fn release_super_entry(
+        &mut self,
+        decl_id: &LuaTypeDeclId,
+        entry: &InFiled<LuaSuperType>,
+        holder: Holder,
+    ) {
+        let edge = (decl_id.clone(), entry.clone());
+        let Some(holders) = self.super_holders.get_mut(&edge) else {
+            return;
+        };
+        let Some(at) = holders.iter().position(|existing| *existing == holder) else {
+            return;
+        };
+        holders.remove(at);
+        if !holders.is_empty() {
+            return;
+        }
+        self.super_holders.remove(&edge);
+        let Some(supers) = self.supers.get_mut(decl_id) else {
+            return;
+        };
+        let Some(at) = supers.iter().position(|existing| existing == entry) else {
+            return;
+        };
+        supers.remove(at);
+        if supers.is_empty() {
+            self.supers.remove(decl_id);
+        }
+        derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
+        if let LuaType::Ref(base_id) = &entry.value.typ {
+            let still_derives = self.supers.get(decl_id).is_some_and(|supers| {
+                supers
+                    .iter()
+                    .any(|other| matches!(&other.value.typ, LuaType::Ref(base) if base == base_id))
+            });
+            if !still_derives && let Some(children) = self.sub_types.get_mut(base_id) {
+                children.retain(|child| child != decl_id);
+                if children.is_empty() {
+                    self.sub_types.remove(base_id);
+                }
+                derivation::note_write(|| FactKey::SubTypes(base_id.clone()));
+            }
+        }
+    }
+
     pub fn add_type_decl(&mut self, file_id: FileId, type_decl: LuaTypeDecl) {
-        if op_log::recording() {
-            let type_decl2 = type_decl.clone();
-            op_log::push(
-                op_log::Domain::Type,
-                Box::new([
-                    WriteKey::TypeDecl(type_decl.get_id()),
-                    WriteKey::TypeDeclScan,
-                    WriteKey::FileScoped(file_id),
-                ]),
-                move |db| db.get_type_index_mut().add_type_decl(file_id, type_decl2),
-            );
-        }
         let id = type_decl.get_id();
-        let sites = self.declaration_sites.entry(file_id).or_default();
+        derivation::note_write(|| FactKey::TypeDecl(id.clone()));
+        let holder = current_holder();
         for location in type_decl.get_locations() {
-            sites.insert(location.range, id.clone());
+            self.hold_location(&id, location, holder);
         }
-        self.file_types.entry(file_id).or_default().push(id.clone());
-        self.decl_key_epochs
-            .note((id.clone(), read_set::TypeDeclKind::Object));
+        if derivation::writes_source() {
+            for location in type_decl.get_locations() {
+                self.add_source_location(&id, location.clone());
+            }
+            self.add_source_site(file_id, &id, type_decl.get_locations());
+        } else {
+            for location in type_decl.get_locations() {
+                self.record_contribution(TypeContribution::Location {
+                    decl_id: id.clone(),
+                    location: location.clone(),
+                });
+            }
+        }
 
         if let Some(old_decl) = self.full_name_type_map.get_mut(&id) {
             for location in type_decl.get_locations() {
                 old_decl.add_location(location.clone());
             }
         } else {
+            self.add_to_decl_scan(&id);
             self.full_name_type_map.insert(id, type_decl);
         }
-        self.note_type_decl_write();
-        self.file_write_epochs.note(file_id);
     }
 
     pub fn add_type_decl_location(
@@ -1547,46 +1636,91 @@ impl LuaTypeIndex {
         decl_id: &LuaTypeDeclId,
         location: LuaDeclLocation,
     ) {
-        if op_log::recording() {
-            let decl_id2 = decl_id.clone();
-            let location2 = location.clone();
-            op_log::push(
-                op_log::Domain::Type,
-                Box::new([
-                    WriteKey::TypeDecl(decl_id.clone()),
-                    WriteKey::FileScoped(file_id),
-                ]),
-                move |db| {
-                    db.get_type_index_mut()
-                        .add_type_decl_location(file_id, &decl_id2, location2)
-                },
-            );
+        if !self.full_name_type_map.contains_key(decl_id) {
+            return;
         }
+        let holder = current_holder();
+        if holder.is_some() {
+            self.record_contribution(TypeContribution::Location {
+                decl_id: decl_id.clone(),
+                location: location.clone(),
+            });
+        } else if derivation::writes_source() {
+            self.add_source_location(decl_id, location.clone());
+            self.add_source_site(file_id, decl_id, std::slice::from_ref(&location));
+        }
+        self.hold_location(decl_id, &location, holder);
         if let Some(decl) = self.full_name_type_map.get_mut(decl_id) {
-            self.declaration_sites
-                .entry(file_id)
-                .or_default()
-                .insert(location.range, decl_id.clone());
+            derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
             decl.add_location(location);
-            self.file_types
-                .entry(file_id)
-                .or_default()
-                .push(decl_id.clone());
-            self.note_type_decl_write();
-            self.decl_key_epochs
-                .note((decl_id.clone(), read_set::TypeDeclKind::Object));
-            self.file_write_epochs.note(file_id);
         }
+    }
+
+    /// Files a source-layer declaration under its sites and its file: what a
+    /// file declares, as its own doc passes look it up.
+    fn add_source_site(
+        &mut self,
+        file_id: FileId,
+        decl_id: &LuaTypeDeclId,
+        locations: &[LuaDeclLocation],
+    ) {
+        derivation::note_write(|| FactKey::TypeFile(file_id));
+        let sites = self.declaration_sites.entry(file_id).or_default();
+        for location in locations {
+            sites.insert(location.range, decl_id.clone());
+        }
+        self.file_types
+            .entry(file_id)
+            .or_default()
+            .push(decl_id.clone());
+    }
+
+    /// [`Self::find_type_decl`] over the source layer's declarations only.
+    /// Doc annotations resolve through this, so their meaning depends only on
+    /// what files declare, never on what analysis synthesized.
+    pub fn find_source_type_decl(&self, file_id: FileId, name: &str) -> Option<&LuaTypeDecl> {
+        let namespaced = |ns: &str| LuaTypeDeclId::global(&format!("{}.{}", ns, name));
+        let candidates = self
+            .file_namespace
+            .get(&file_id)
+            .map(|ns| namespaced(ns))
+            .into_iter()
+            .chain(
+                self.file_using_namespace
+                    .get(&file_id)
+                    .into_iter()
+                    .flatten()
+                    .map(|ns| namespaced(ns)),
+            )
+            .chain([
+                LuaTypeDeclId::local(file_id, name),
+                LuaTypeDeclId::global(name),
+            ]);
+        for id in candidates {
+            if let Some(decl) = self.get_source_type_decl(&id) {
+                return Some(decl);
+            }
+        }
+        None
+    }
+
+    /// The type decl `id` when the source layer declares it.
+    pub fn get_source_type_decl(&self, id: &LuaTypeDeclId) -> Option<&LuaTypeDecl> {
+        derivation::note_read(|| FactKey::SourceTypeDecl(id.clone()));
+        if self
+            .source_decl_locations
+            .get(id)
+            .is_none_or(|locations| locations.is_empty())
+        {
+            return None;
+        }
+        self.full_name_type_map.get(id)
     }
 
     pub fn find_type_decl(&self, file_id: FileId, name: &str) -> Option<&LuaTypeDecl> {
         if let Some(ns) = self.get_file_namespace(&file_id) {
             let full_name = LuaTypeDeclId::global(&format!("{}.{}", ns, name));
-            read_set::record_type_decl(
-                &self.decl_key_epochs,
-                &full_name,
-                read_set::TypeDeclKind::Object,
-            );
+            derivation::note_read(|| FactKey::TypeDecl(full_name.clone()));
             if let Some(decl) = self.full_name_type_map.get(&full_name) {
                 return Some(decl);
             }
@@ -1594,11 +1728,7 @@ impl LuaTypeIndex {
         if let Some(usings) = self.get_file_using_namespace(&file_id) {
             for ns in usings {
                 let full_name = LuaTypeDeclId::global(&format!("{}.{}", ns, name));
-                read_set::record_type_decl(
-                    &self.decl_key_epochs,
-                    &full_name,
-                    read_set::TypeDeclKind::Object,
-                );
+                derivation::note_read(|| FactKey::TypeDecl(full_name.clone()));
                 if let Some(decl) = self.full_name_type_map.get(&full_name) {
                     return Some(decl);
                 }
@@ -1606,21 +1736,13 @@ impl LuaTypeIndex {
         }
 
         let local_id = LuaTypeDeclId::local(file_id, name);
-        read_set::record_type_decl(
-            &self.decl_key_epochs,
-            &local_id,
-            read_set::TypeDeclKind::Object,
-        );
+        derivation::note_read(|| FactKey::TypeDecl(local_id.clone()));
         if let Some(decl) = self.full_name_type_map.get(&local_id) {
             return Some(decl);
         }
 
         let global_id = LuaTypeDeclId::global(name);
-        read_set::record_type_decl(
-            &self.decl_key_epochs,
-            &global_id,
-            read_set::TypeDeclKind::Object,
-        );
+        derivation::note_read(|| FactKey::TypeDecl(global_id.clone()));
         self.full_name_type_map.get(&global_id)
     }
 
@@ -1632,13 +1754,9 @@ impl LuaTypeIndex {
         file_id: FileId,
         range: TextRange,
     ) -> Option<&LuaTypeDecl> {
-        read_set::record_file_scoped(
-            &self.file_write_epochs,
-            &file_id,
-            read_set::FileScopedKind::TypeFile,
-        );
+        derivation::note_read(|| FactKey::TypeFile(file_id));
         let id = self.declaration_sites.get(&file_id)?.get(&range)?;
-        self.get_type_decl(id)
+        self.full_name_type_map.get(id)
     }
 
     pub fn find_type_decls(
@@ -1646,7 +1764,7 @@ impl LuaTypeIndex {
         file_id: FileId,
         prefix: &str,
     ) -> HashMap<String, Option<LuaTypeDeclId>> {
-        read_set::record_type_decl_scan();
+        derivation::note_read(|| FactKey::TypeDeclScan);
         let mut result = HashMap::default();
         let all_type_ids = self.full_name_type_map.keys().collect::<Vec<_>>();
         if let Some(ns) = self.get_file_namespace(&file_id) {
@@ -1709,30 +1827,12 @@ impl LuaTypeIndex {
     }
 
     pub fn add_generic_params(&mut self, decl_id: LuaTypeDeclId, params: Vec<GenericParam>) {
-        if op_log::recording() {
-            let decl_id2 = decl_id.clone();
-            let params2 = params.clone();
-            op_log::push_one(
-                op_log::Domain::Type,
-                WriteKey::TypeDecl(decl_id.clone()),
-                move |db| {
-                    db.get_type_index_mut()
-                        .add_generic_params(decl_id2, params2)
-                },
-            );
-        }
+        derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
         self.generic_params.insert(decl_id.clone(), params);
-        self.note_type_decl_write();
-        self.decl_key_epochs
-            .note((decl_id.clone(), read_set::TypeDeclKind::GenericParams));
     }
 
     pub fn get_generic_params(&self, decl_id: &LuaTypeDeclId) -> Option<&Vec<GenericParam>> {
-        read_set::record_type_decl(
-            &self.decl_key_epochs,
-            decl_id,
-            read_set::TypeDeclKind::GenericParams,
-        );
+        derivation::note_read(|| FactKey::TypeDecl(decl_id.clone()));
         self.generic_params.get(decl_id)
     }
 
@@ -1743,23 +1843,9 @@ impl LuaTypeIndex {
     /// re-analyzing a file replaces its own site instead of appending, and
     /// the winner is chosen by [`LuaDeclSourceKey`] precedence rather than
     /// write order — two files declaring the same alias no longer oscillate
-    /// with ingestion order. Re-publishing an identical source is a no-op;
-    /// a hidden (losing) contribution only moves the file-scoped epoch.
+    /// with ingestion order. Re-publishing an identical source is a no-op.
     pub fn set_alias_source(&mut self, decl_id: LuaTypeDeclId, source: LuaAliasSource) {
-        if op_log::recording() {
-            let decl_id2 = decl_id.clone();
-            let source2 = source.clone();
-            op_log::push(
-                op_log::Domain::Type,
-                Box::new([
-                    WriteKey::TypeDecl(decl_id.clone()),
-                    WriteKey::FileScoped(source.site.file_id),
-                ]),
-                move |db| db.get_type_index_mut().set_alias_source(decl_id2, source2),
-            );
-        }
         let site = source.site.clone();
-        let file_id = site.file_id;
         if self
             .alias_sources
             .get(&decl_id)
@@ -1773,7 +1859,36 @@ impl LuaTypeIndex {
             .or_default()
             .insert(site, source);
         self.reselect_alias_source(&decl_id);
-        self.file_write_epochs.note(file_id);
+    }
+
+    /// Publishes one declaration site's `---@enum` or `---@attribute` payload.
+    pub fn set_extra_source(
+        &mut self,
+        decl_id: LuaTypeDeclId,
+        site: InFiled<TextRange>,
+        order_key: LuaDeclSourceKey,
+        extra: LuaTypeExtra,
+    ) {
+        self.extra_sources
+            .entry(decl_id.clone())
+            .or_default()
+            .insert(site, (order_key, extra));
+        self.reselect_extra_source(&decl_id);
+    }
+
+    fn reselect_extra_source(&mut self, decl_id: &LuaTypeDeclId) {
+        let winner = self.extra_sources.get(decl_id).and_then(|sources| {
+            sources
+                .values()
+                .min_by(|a, b| a.0.cmp(&b.0))
+                .map(|(_, extra)| extra)
+        });
+        let Some(decl) = self.full_name_type_map.get_mut(decl_id) else {
+            return;
+        };
+        if decl.install_site_extra(winner) {
+            derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
+        }
     }
 
     /// Installs the winning site's origin and generic params on the decl.
@@ -1810,13 +1925,13 @@ impl LuaTypeIndex {
             None
         };
 
+        if origin_changed || params_changed {
+            derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
+        }
         if origin_changed {
             if let Some(decl) = self.full_name_type_map.get_mut(decl_id) {
                 decl.set_alias_origin(new_origin);
             }
-            self.decl_key_epochs
-                .note((decl_id.clone(), read_set::TypeDeclKind::Object));
-            self.note_type_decl_write();
         }
         if params_changed {
             match new_params {
@@ -1827,9 +1942,6 @@ impl LuaTypeIndex {
                     self.generic_params.remove(decl_id);
                 }
             }
-            self.decl_key_epochs
-                .note((decl_id.clone(), read_set::TypeDeclKind::GenericParams));
-            self.note_type_decl_write();
         }
     }
     /// Every stored alias contribution, borrowed, for deterministic snapshot
@@ -1846,22 +1958,7 @@ impl LuaTypeIndex {
         file_id: FileId,
         source_range: TextRange,
         super_type: LuaType,
-    ) {
-        if op_log::recording() {
-            let mut keys = vec![
-                WriteKey::TypeDecl(decl_id.clone()),
-                WriteKey::FileScoped(file_id),
-            ];
-            if let LuaType::Ref(base_id) = &super_type {
-                keys.push(WriteKey::TypeDecl(base_id.clone()));
-            }
-            let decl_id2 = decl_id.clone();
-            let super_type2 = super_type.clone();
-            op_log::push(op_log::Domain::Type, keys.into(), move |db| {
-                db.get_type_index_mut()
-                    .add_super_type(decl_id2, file_id, source_range, super_type2)
-            });
-        }
+    ) -> bool {
         // Kept in source order rather than the order the files happened to be
         // analysed in: an incremental re-analysis visits the declaring files in
         // a different order than a cold build, and the first entry decides
@@ -1877,67 +1974,39 @@ impl LuaTypeIndex {
                 typ: super_type,
             },
         );
+        let holder = current_holder();
+        if holder.is_some() {
+            self.record_contribution(TypeContribution::Super {
+                decl_id: decl_id.clone(),
+                entry: entry.clone(),
+            });
+        } else {
+            self.supers_by_file
+                .entry(file_id)
+                .or_default()
+                .push((decl_id.clone(), entry.clone()));
+        }
+        let holders = self
+            .super_holders
+            .entry((decl_id.clone(), entry.clone()))
+            .or_default();
+        holders.push(holder);
+        if holders.len() > 1 {
+            return false;
+        }
+        derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
         let supers = self.supers.entry(decl_id.clone()).or_default();
         let at = supers.partition_point(|existing| {
             super_entry_sort_key(existing) <= super_entry_sort_key(&entry)
         });
-        supers.insert(at, entry.clone());
-        self.supers_by_file
-            .entry(file_id)
-            .or_default()
-            .push((decl_id.clone(), entry));
+        supers.insert(at, entry);
         if let Some(base_id) = base_id {
             let children = self.sub_types.entry(base_id.clone()).or_default();
             if !children.contains(&decl_id) {
                 children.push(decl_id.clone());
+                derivation::note_write(|| FactKey::SubTypes(base_id.clone()));
             }
-            self.decl_key_epochs
-                .note((base_id.clone(), read_set::TypeDeclKind::SubTypes));
         }
-        self.decl_key_epochs
-            .note((decl_id.clone(), read_set::TypeDeclKind::Supers));
-        self.bump_super_write_revision();
-        self.note_type_decl_write();
-        self.file_write_epochs.note(file_id);
-    }
-
-    fn has_super_type_at_source(
-        &self,
-        decl_id: &LuaTypeDeclId,
-        file_id: FileId,
-        source_range: TextRange,
-        super_type: &LuaType,
-    ) -> bool {
-        read_set::record_type_decl(
-            &self.decl_key_epochs,
-            decl_id,
-            read_set::TypeDeclKind::Supers,
-        );
-        self.supers.get(decl_id).is_some_and(|supers| {
-            supers.iter().any(|entry| {
-                entry.file_id == file_id
-                    && entry.value.source_range == source_range
-                    && &entry.value.typ == super_type
-            })
-        })
-    }
-
-    /// Inserts `super_type` unless the same edge from the same source already
-    /// exists, reporting whether it was new. Re-settling an identical edge
-    /// moves nothing observable: only a novel insert may bump a write epoch,
-    /// or the fixpoint's staleness filter degrades to a full requeue.
-    pub fn add_super_type_if_missing(
-        &mut self,
-        decl_id: LuaTypeDeclId,
-        file_id: FileId,
-        source_range: TextRange,
-        super_type: LuaType,
-    ) -> bool {
-        if self.has_super_type_at_source(&decl_id, file_id, source_range, &super_type) {
-            return false;
-        }
-
-        self.add_super_type(decl_id, file_id, source_range, super_type);
         true
     }
 
@@ -1950,11 +2019,7 @@ impl LuaTypeIndex {
         &self,
         decl_id: &LuaTypeDeclId,
     ) -> Option<impl Iterator<Item = &LuaType> + '_> {
-        read_set::record_type_decl(
-            &self.decl_key_epochs,
-            decl_id,
-            read_set::TypeDeclKind::Supers,
-        );
+        derivation::note_read(|| FactKey::TypeDecl(decl_id.clone()));
         self.supers.get(decl_id).map(|supers| {
             supers
                 .iter()
@@ -1972,11 +2037,7 @@ impl LuaTypeIndex {
         &self,
         decl_id: &LuaTypeDeclId,
     ) -> Option<&[InFiled<LuaSuperType>]> {
-        read_set::record_type_decl(
-            &self.decl_key_epochs,
-            decl_id,
-            read_set::TypeDeclKind::Supers,
-        );
+        derivation::note_read(|| FactKey::TypeDecl(decl_id.clone()));
         self.supers.get(decl_id).map(Vec::as_slice)
     }
 
@@ -1989,7 +2050,7 @@ impl LuaTypeIndex {
         files: &'a HashSet<FileId>,
     ) -> impl Iterator<Item = LuaDeclId> + 'a {
         for file_id in files {
-            read_set::record_bound_decl(&self.bound_decl_epochs, type_id, *file_id);
+            derivation::note_read(|| FactKey::BoundDecls(type_id.clone(), *file_id));
         }
         self.type_bound_decls
             .get(type_id)
@@ -2004,75 +2065,39 @@ impl LuaTypeIndex {
             return;
         }
         self.unbind_decl(&decl_id);
+        derivation::note_write(|| FactKey::BoundDecls(type_id.clone(), decl_id.file_id));
         self.decl_type_binds.insert(decl_id, type_id.clone());
         self.type_bound_decls
             .entry(type_id.clone())
             .or_default()
             .insert(decl_id);
-        self.bound_decl_epochs
-            .note((type_id.clone(), decl_id.file_id));
-        self.note_type_decl_write();
     }
 
     fn unbind_decl(&mut self, decl_id: &LuaDeclId) {
         let Some(type_id) = self.decl_type_binds.remove(decl_id) else {
             return;
         };
+        derivation::note_write(|| FactKey::BoundDecls(type_id.clone(), decl_id.file_id));
         if let Some(decls) = self.type_bound_decls.get_mut(&type_id) {
             decls.remove(decl_id);
             if decls.is_empty() {
                 self.type_bound_decls.remove(&type_id);
             }
         }
-        self.bound_decl_epochs.note((type_id, decl_id.file_id));
-        self.note_type_decl_write();
-    }
-
-    /// Counts the super-type writes so far. Compare it across an operation to
-    /// learn whether the inheritance edges moved.
-    pub(crate) fn super_write_revision(&self) -> u64 {
-        self.super_write_revision
-    }
-
-    fn bump_super_write_revision(&mut self) {
-        self.super_write_revision = self.super_write_revision.wrapping_add(1);
-        self.cached_direct_subtype_members = None;
-    }
-
-    /// Domain-counter bump for `---` type-declaration writes — readers
-    /// record `type_decls`/`type_decl_scan` without per-key clocks, so any
-    /// write in the domain stales them (see `untracked_reads_changed`).
-    fn note_type_decl_write(&mut self) {
-        self.type_decl_writes = self.type_decl_writes.wrapping_add(1);
-    }
-
-    pub(crate) fn direct_subtype_members_cache(
-        &self,
-    ) -> Option<(&DirectSubtypeMembersKey, &Arc<DirectSubtypeMembers>)> {
-        self.cached_direct_subtype_members
-            .as_ref()
-            .map(|(key, map)| (key, map))
-    }
-
-    pub(crate) fn store_direct_subtype_members(
-        &mut self,
-        key: DirectSubtypeMembersKey,
-        map: Arc<DirectSubtypeMembers>,
-    ) {
-        self.cached_direct_subtype_members = Some((key, map));
     }
 
     /// Get all direct subclasses of a given type
     /// Returns a vector of type declarations that directly inherit from the given type
     pub fn get_sub_types(&self, decl_id: &LuaTypeDeclId) -> Vec<&LuaTypeDecl> {
-        read_set::record_type_decl(
-            &self.decl_key_epochs,
-            decl_id,
-            read_set::TypeDeclKind::SubTypes,
-        );
+        derivation::note_read(|| FactKey::SubTypes(decl_id.clone()));
         let Some(children) = self.sub_types.get(decl_id) else {
             return Vec::new();
         };
+        if derivation::recording() {
+            for child_id in children {
+                derivation::note_read(|| FactKey::TypeDecl(child_id.clone()));
+            }
+        }
 
         let mut sub_types = children
             .iter()
@@ -2111,11 +2136,7 @@ impl LuaTypeIndex {
     }
 
     pub fn get_type_decl(&self, decl_id: &LuaTypeDeclId) -> Option<&LuaTypeDecl> {
-        read_set::record_type_decl(
-            &self.decl_key_epochs,
-            decl_id,
-            read_set::TypeDeclKind::Object,
-        );
+        derivation::note_read(|| FactKey::TypeDecl(decl_id.clone()));
         self.full_name_type_map.get(decl_id)
     }
 
@@ -2140,14 +2161,17 @@ impl LuaTypeIndex {
     }
 
     pub fn get_all_types(&self) -> Vec<&LuaTypeDecl> {
-        self.full_name_type_map.values().collect()
+        self.iter_type_decls().collect()
     }
 
     /// [`get_all_types`](Self::get_all_types) without collecting, for the
     /// analyzer paths that only scan and would otherwise allocate a vector of
     /// every type in the workspace on each call.
     pub fn iter_type_decls(&self) -> impl Iterator<Item = &LuaTypeDecl> {
-        self.full_name_type_map.values()
+        derivation::note_read(|| FactKey::TypeDeclScan);
+        self.full_name_type_map.values().inspect(|decl| {
+            derivation::note_read(|| FactKey::TypeDecl(decl.get_id()));
+        })
     }
 
     pub fn get_file_namespaces(&self) -> Vec<String> {
@@ -2159,37 +2183,6 @@ impl LuaTypeIndex {
             .collect()
     }
 
-    pub fn get_type_decl_mut(&mut self, decl_id: &LuaTypeDeclId) -> Option<&mut LuaTypeDecl> {
-        op_log::note_mut_ref(op_log::MutRef::TypeDecl(decl_id.clone()));
-        read_set::record_type_decl(
-            &self.decl_key_epochs,
-            decl_id,
-            read_set::TypeDeclKind::Object,
-        );
-        if self.full_name_type_map.contains_key(decl_id) {
-            self.note_type_decl_write();
-            self.decl_key_epochs
-                .note((decl_id.clone(), read_set::TypeDeclKind::Object));
-        }
-        self.full_name_type_map.get_mut(decl_id)
-    }
-
-    /// Boundary replace for the parallel lua walk: installs the fork's final
-    /// `LuaTypeDecl` under the same id. Side maps (supertypes, generic
-    /// params, file_types) are owned by the replayed ops. Runs only on the
-    /// merge thread.
-    ///
-    /// The installed object carries the alias origin the fork selected from
-    /// its partial view of the contributions; re-selecting restores the
-    /// canonical winner whenever this decl has any.
-    pub(crate) fn replace_type_decl_object(&mut self, decl_id: &LuaTypeDeclId, decl: LuaTypeDecl) {
-        self.full_name_type_map.insert(decl_id.clone(), decl);
-        self.reselect_alias_source(decl_id);
-        self.note_type_decl_write();
-        self.decl_key_epochs
-            .note((decl_id.clone(), read_set::TypeDeclKind::Object));
-    }
-
     /// Stores `cache` for `owner`, keeping any type already bound there unless
     /// `cache` supersedes it.
     ///
@@ -2197,37 +2190,19 @@ impl LuaTypeIndex {
     /// it has to go with it; otherwise [`get_type_fact`](Self::get_type_fact)
     /// pairs the new type with the old confidence and provenance.
     pub fn bind_type(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
-        if op_log::recording() {
-            let owner2 = owner.clone();
-            let cache2 = cache.clone();
-            op_log::push(
-                op_log::Domain::Type,
-                type_bind_keys(&owner, &cache),
-                move |db| db.get_type_index_mut().bind_type(owner2, cache2),
-            );
-        }
         if let Some(existing) = self.types.get(&owner)
             && !cache.supersedes(existing)
         {
             return;
         }
-        self.commit_type_cache(owner, cache);
-    }
-
-    /// See [`LuaTypeIndex::type_writes`]. Compare it across an operation to
-    /// learn whether that operation moved any stored type.
-    pub fn type_writes(&self) -> u64 {
-        self.type_writes
-    }
-
-    pub(crate) fn type_write_version(&self, owner: &LuaTypeOwner) -> u64 {
-        self.type_write_versions.get(owner).copied().unwrap_or(0)
+        self.commit_type_cache(owner.clone(), cache);
+        self.record_source_write(&owner);
     }
 
     /// The write that seeded `decl_id`'s type: its source position, and whether
     /// its right-hand side read through a call or index.
     pub fn decl_write_claim(&self, decl_id: &LuaDeclId) -> Option<(TextSize, bool)> {
-        read_set::record_decl_claim(&self.claim_write_epochs, decl_id);
+        derivation::note_read(|| FactKey::DeclClaim(*decl_id));
         self.decl_write_claims.get(decl_id).copied()
     }
 
@@ -2237,25 +2212,12 @@ impl LuaTypeIndex {
         position: TextSize,
         reads_through_call_or_index: bool,
     ) {
-        if op_log::recording() {
-            op_log::push_one(
-                op_log::Domain::Type,
-                WriteKey::DeclMisc(decl_id),
-                move |db| {
-                    db.get_type_index_mut().record_decl_write_claim(
-                        decl_id,
-                        position,
-                        reads_through_call_or_index,
-                    )
-                },
-            );
-        }
         if self
             .decl_write_claims
             .insert(decl_id, (position, reads_through_call_or_index))
             != Some((position, reads_through_call_or_index))
         {
-            self.claim_write_epochs.note(decl_id.clone());
+            derivation::note_write(|| FactKey::DeclClaim(decl_id));
         }
     }
 
@@ -2279,164 +2241,12 @@ impl LuaTypeIndex {
         self.in_filed_type_owner.get(&file_id)
     }
 
-    pub(crate) fn set_settled_reads(
-        &mut self,
-        file_id: FileId,
-        reads: impl IntoIterator<Item = LuaTypeOwner>,
-    ) {
-        self.clear_settled_reads(file_id);
-        let reads = reads
-            .into_iter()
-            .filter(|owner| owner.get_file_id() != file_id)
-            .collect::<HashSet<_>>();
-        if reads.is_empty() {
-            return;
-        }
-        for owner in &reads {
-            self.settled_read_dependents
-                .entry(owner.clone())
-                .or_default()
-                .insert(file_id);
-            self.link_settled_owner(owner);
-        }
-        self.settled_reads_by_file.insert(file_id, reads);
-    }
-
-    fn clear_settled_reads(&mut self, file_id: FileId) {
-        let Some(reads) = self.settled_reads_by_file.remove(&file_id) else {
-            return;
-        };
-        for owner in reads {
-            if let Some(dependents) = self.settled_read_dependents.get_mut(&owner) {
-                dependents.remove(&file_id);
-                if dependents.is_empty() {
-                    self.settled_read_dependents.remove(&owner);
-                    self.unlink_settled_owner(&owner);
-                }
-            }
-        }
-    }
-
-    /// Rewrites the settled-read keys that live in the edited file.
-    ///
-    /// A key naming a member the file had filed is an identity like any other:
-    /// the validated remap confirms it against the re-indexed member index, so
-    /// a member the edit removed drops its key and dirties its readers. A key
-    /// naming no filed member is speculative - a settled pass keyed the read on
-    /// the range of the expression it read (a call like `ply:GetActiveWeapon()`)
-    /// and no `LuaMember` was ever filed for it - so `pre_edit_member_ids` is
-    /// what tells the two apart. See [`Self::settled_read_image`] for the key
-    /// itself.
-    fn remap_settled_reads(
-        &mut self,
-        remap: &crate::FileRemap,
-        pre_edit_member_ids: &rustc_hash::FxHashSet<LuaMemberId>,
-    ) -> HashSet<FileId> {
-        // Only the keys living in the edited file can move; the per-file side
-        // map locates them without scanning every settled owner.
-        let old_owners = self
-            .settled_owners_by_file
-            .get(&remap.file_id)
-            .map(|owners| owners.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        let mut dirty = HashSet::default();
-        let mut updates: Vec<(LuaTypeOwner, Option<LuaTypeOwner>, HashSet<FileId>)> = Vec::new();
-        for old_owner in old_owners {
-            let image = Self::settled_read_image(remap, pre_edit_member_ids, &old_owner);
-            let new_owner = match image {
-                crate::Remap::Moved(new_owner) if new_owner != old_owner => Some(new_owner),
-                crate::Remap::Moved(_) | crate::Remap::Unrelated => continue,
-                crate::Remap::Lost => None,
-            };
-            let dependents = self
-                .settled_read_dependents
-                .get(&old_owner)
-                .cloned()
-                .unwrap_or_default();
-            if new_owner.is_none() {
-                dirty.extend(dependents.iter().copied());
-            }
-            updates.push((old_owner, new_owner, dependents));
-        }
-
-        // Ordered by a real key rather than hash-map iteration order, so the
-        // re-keyed entries land deterministically.
-        updates.sort_by(|left, right| left.0.stable_cmp(&right.0));
-        for (old_owner, _, _) in &updates {
-            self.settled_read_dependents.remove(old_owner);
-            self.unlink_settled_owner(old_owner);
-        }
-        for (old_owner, new_owner, dependents) in updates {
-            for dependent in &dependents {
-                if let Some(reads) = self.settled_reads_by_file.get_mut(dependent) {
-                    reads.remove(&old_owner);
-                    if let Some(new_owner) = &new_owner {
-                        reads.insert(new_owner.clone());
-                    }
-                }
-            }
-            if let Some(new_owner) = new_owner {
-                self.settled_read_dependents
-                    .entry(new_owner.clone())
-                    .or_default()
-                    .extend(dependents);
-                self.link_settled_owner(&new_owner);
-            }
-        }
-        dirty
-    }
-
-    /// The image of one settled-read key.
-    ///
-    /// A key naming a member the file had filed is confirmed against the
-    /// re-indexed member index like every other identity, so a member the edit
-    /// removed reads as `Lost` and its readers are dirtied.
-    ///
-    /// A key naming no filed member is speculative: the analyzer keyed a
-    /// settled read on the range of an expression (a call like
-    /// `ply:GetActiveWeapon()`), and no `LuaMember` was ever filed for it.
-    /// Nothing in the member index can confirm or deny such a key, so the
-    /// position map alone decides - the same geometric answer `member_id`
-    /// gives, taken without the file's facts. The reader still reads the same
-    /// text, so it is not dirtied; only a range the edit destroyed is a loss.
-    fn settled_read_image(
-        remap: &crate::FileRemap,
-        pre_edit_member_ids: &rustc_hash::FxHashSet<LuaMemberId>,
-        old_owner: &LuaTypeOwner,
-    ) -> crate::Remap<LuaTypeOwner> {
-        if let LuaTypeOwner::Member(member_id) = old_owner
-            && !pre_edit_member_ids.contains(member_id)
-        {
-            return match crate::FileRemap::unvalidated(remap.file_id, remap.map)
-                .member_id(*member_id)
-            {
-                crate::Remap::Moved(member_id) => {
-                    crate::Remap::Moved(LuaTypeOwner::Member(member_id))
-                }
-                crate::Remap::Lost => crate::Remap::Lost,
-                // Both remaps are bound to the edited file, and every key the
-                // settled-owner side map hands out lives in it, so a key can
-                // never read as unrelated.
-                crate::Remap::Unrelated => crate::Remap::Unrelated,
-            };
-        }
-        remap.type_owner(old_owner)
-    }
-
     pub fn get_file_type_decl_ids(&self, file_id: FileId) -> Option<&Vec<LuaTypeDeclId>> {
+        derivation::note_read(|| FactKey::TypeFile(file_id));
         self.file_types.get(&file_id)
     }
 
     pub fn force_bind_type(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
-        if op_log::recording() {
-            let owner2 = owner.clone();
-            let cache2 = cache.clone();
-            op_log::push(
-                op_log::Domain::Type,
-                type_bind_keys(&owner, &cache),
-                move |db| db.get_type_index_mut().force_bind_type(owner2, cache2),
-            );
-        }
         let file_id = owner.get_file_id();
         self.insert_type_cache(owner.clone(), cache);
         self.in_filed_type_owner
@@ -2447,37 +2257,7 @@ impl LuaTypeIndex {
             self.drop_fact_refs(&owner);
             self.mark_inference_derived_state_dirty();
         }
-    }
-
-    /// Replaces an inferred cache's type with `widened`, keeping the entry's
-    /// fact metadata. Used by the settled-tail widening operator, which rewrites
-    /// a literal that grew across a fixpoint boundary into its primitive; the
-    /// provenance that produced the literal still describes the widened fact.
-    ///
-    /// No-op on a documented cache: an annotation is authoritative and is never
-    /// widened over.
-    pub(crate) fn widen_infer_type_cache(&mut self, owner: &LuaTypeOwner, widened: LuaType) {
-        if op_log::recording() {
-            let owner2 = owner.clone();
-            let widened2 = widened.clone();
-            op_log::push_one(
-                op_log::Domain::Type,
-                WriteKey::TypeOwner(owner.clone()),
-                move |db| {
-                    db.get_type_index_mut()
-                        .widen_infer_type_cache(&owner2, widened2)
-                },
-            );
-        }
-        let Some(existing) = self.types.get(owner) else {
-            return;
-        };
-        if !existing.is_infer() || existing.as_type() == &widened {
-            return;
-        }
-        self.insert_type_cache(owner.clone(), LuaTypeCache::InferType(widened));
-        self.refresh_fact_refs(owner);
-        self.mark_inference_derived_state_dirty();
+        self.record_source_write(&owner);
     }
 
     /// Fact-carrying counterpart of [`bind_type`](Self::bind_type); the same
@@ -2488,19 +2268,6 @@ impl LuaTypeIndex {
         cache: LuaTypeCache,
         metadata: LuaTypeFactMetadata,
     ) {
-        if op_log::recording() {
-            let owner2 = owner.clone();
-            let cache2 = cache.clone();
-            let metadata2 = metadata.clone();
-            op_log::push(
-                op_log::Domain::Type,
-                type_bind_keys(&owner, &cache),
-                move |db| {
-                    db.get_type_index_mut()
-                        .bind_type_fact(owner2, cache2, metadata2)
-                },
-            );
-        }
         if let Some(existing) = self.types.get(&owner)
             && !cache.supersedes(existing)
         {
@@ -2517,6 +2284,7 @@ impl LuaTypeIndex {
         self.fact_metadata.insert(owner.clone(), metadata);
         self.refresh_fact_refs(&owner);
         self.mark_inference_derived_state_dirty();
+        self.record_source_write(&owner);
     }
 
     pub fn force_bind_type_fact(
@@ -2525,19 +2293,6 @@ impl LuaTypeIndex {
         cache: LuaTypeCache,
         metadata: LuaTypeFactMetadata,
     ) {
-        if op_log::recording() {
-            let owner2 = owner.clone();
-            let cache2 = cache.clone();
-            let metadata2 = metadata.clone();
-            op_log::push(
-                op_log::Domain::Type,
-                type_bind_keys(&owner, &cache),
-                move |db| {
-                    db.get_type_index_mut()
-                        .force_bind_type_fact(owner2, cache2, metadata2)
-                },
-            );
-        }
         self.force_bind_type_fact_unchecked(owner, cache, metadata);
         self.mark_inference_derived_state_dirty();
     }
@@ -2557,23 +2312,12 @@ impl LuaTypeIndex {
     }
 
     pub fn bind_definition_fact(&mut self, definition: LuaDefinitionId, fact: LuaTypeFact) {
-        if op_log::recording() {
-            let fact2 = fact.clone();
-            op_log::push_one(
-                op_log::Domain::Type,
-                WriteKey::DefinitionFact(definition),
-                move |db| {
-                    db.get_type_index_mut()
-                        .bind_definition_fact(definition, fact2)
-                },
-            );
-        }
         self.bind_definition_fact_unchecked(definition, fact);
         self.mark_inference_derived_state_dirty();
     }
 
     pub fn get_definition_fact(&self, definition: &LuaDefinitionId) -> Option<&LuaTypeFact> {
-        read_set::record_definition_fact(&self.fact_epochs, definition);
+        derivation::note_read(|| FactKey::DefinitionFact(*definition));
         self.definition_facts.get(definition)
     }
 
@@ -2594,11 +2338,6 @@ impl LuaTypeIndex {
                 dependents.extend(files.iter().copied());
             }
         }
-        for (owner, files) in &self.settled_read_dependents {
-            if file_ids.contains(&owner.get_file_id()) {
-                dependents.extend(files.iter().copied());
-            }
-        }
         dependents
     }
 
@@ -2612,11 +2351,6 @@ impl LuaTypeIndex {
             if let Some(files) = self.support_dependents.get(node) {
                 dependents.extend(files.iter().copied());
             }
-            if let LuaInferenceNodeId::TypeOwner(owner) = node
-                && let Some(files) = self.settled_read_dependents.get(owner)
-            {
-                dependents.extend(files.iter().copied());
-            }
         }
         dependents
     }
@@ -2625,17 +2359,12 @@ impl LuaTypeIndex {
         self.read_type_cache(owner)
     }
 
-    /// The one way an inference reads a stored type, so every such read lands in
-    /// the read set.
-    ///
-    /// The settled tail skips a candidate whose reads have not moved, so a read
-    /// that goes unrecorded is a candidate that never gets re-derived — a stale
-    /// answer with nothing to report it. Recording one that did not matter only
-    /// costs a re-derivation, so anything reaching `types` on behalf of a caller
-    /// goes through here. The write paths compare against `types` directly:
-    /// what a write overwrites is not something it depends on.
+    /// The one way an inference reads a stored type, so every such read is
+    /// noted as a derivation read. Anything reaching `types` on behalf of a
+    /// caller goes through here. The write paths compare against `types`
+    /// directly: what a write overwrites is not something it depends on.
     fn read_type_cache(&self, owner: &LuaTypeOwner) -> Option<&LuaTypeCache> {
-        read_set::record(owner);
+        derivation::note_read(|| FactKey::TypeCache(owner.clone()));
         self.types.get(owner)
     }
 
@@ -2654,6 +2383,7 @@ impl LuaTypeIndex {
             .insert(owner.clone());
         self.fact_metadata.insert(owner.clone(), metadata);
         self.refresh_fact_refs(&owner);
+        self.record_source_write(&owner);
         file_id
     }
 
@@ -2675,13 +2405,14 @@ impl LuaTypeIndex {
             }
             _ => cache,
         };
-        if self
-            .types
-            .get(&owner)
-            .is_none_or(|existing| existing.as_type() != cache.as_type())
-        {
-            self.note_type_write(&owner);
-        }
+        let cache = match self.with_table_classes(cache.as_type()) {
+            Some(typ) => match cache {
+                LuaTypeCache::DocType(_) => LuaTypeCache::DocType(typ),
+                LuaTypeCache::InferType(_) => LuaTypeCache::InferType(typ),
+            },
+            None => cache,
+        };
+        derivation::note_write(|| FactKey::TypeCache(owner.clone()));
         match (&owner, cache.as_type()) {
             (LuaTypeOwner::Decl(decl_id), LuaType::Ref(type_id) | LuaType::Def(type_id)) => {
                 self.bind_decl_to_type(*decl_id, type_id.clone());
@@ -2700,10 +2431,73 @@ impl LuaTypeIndex {
         true
     }
 
-    fn note_type_write(&mut self, owner: &LuaTypeOwner) {
-        self.type_writes += 1;
-        self.type_write_versions
-            .insert(owner.clone(), self.type_writes);
+    /// Keeps `owner`'s current value as its source value when the write that
+    /// just landed belongs to the source layer.
+    fn record_source_write(&mut self, owner: &LuaTypeOwner) {
+        if !derivation::writes_source() {
+            return;
+        }
+        match self.types.get(owner) {
+            Some(cache) => {
+                let metadata = self.fact_metadata.get(owner).cloned();
+                self.source_types
+                    .insert(owner.clone(), (cache.clone(), metadata));
+            }
+            None => {
+                self.source_types.remove(owner);
+            }
+        }
+    }
+
+    /// Restores `owner` to its source value, dropping whatever derivations
+    /// wrote over it.
+    pub(crate) fn reset_type_cache(&mut self, owner: &LuaTypeOwner) {
+        derivation::note_write(|| FactKey::TypeCache(owner.clone()));
+        match self.source_types.get(owner).cloned() {
+            Some((cache, metadata)) => {
+                self.insert_type_cache(owner.clone(), cache);
+                match metadata {
+                    Some(metadata) => {
+                        self.fact_metadata.insert(owner.clone(), metadata);
+                        self.refresh_fact_refs(owner);
+                    }
+                    None => {
+                        if self.fact_metadata.remove(owner).is_some() {
+                            self.drop_fact_refs(owner);
+                        }
+                    }
+                }
+            }
+            None => {
+                if let Some(set) = self.in_filed_type_owner.get_mut(&owner.get_file_id()) {
+                    set.remove(owner);
+                }
+                if let LuaTypeOwner::Decl(decl_id) = owner {
+                    self.unbind_decl(decl_id);
+                }
+                if let Some(previous) = self.types.remove(owner) {
+                    self.cache_refs
+                        .remove(owner.get_file_id(), previous.as_type());
+                }
+                if self.fact_metadata.remove(owner).is_some() {
+                    self.drop_fact_refs(owner);
+                }
+            }
+        }
+        self.mark_inference_derived_state_dirty();
+    }
+
+    pub(crate) fn reset_decl_claim(&mut self, decl_id: &LuaDeclId) {
+        if self.decl_write_claims.remove(decl_id).is_some() {
+            derivation::note_write(|| FactKey::DeclClaim(*decl_id));
+        }
+    }
+
+    pub(crate) fn reset_definition_fact(&mut self, definition: &LuaDefinitionId) {
+        if self.definition_facts.remove(definition).is_some() {
+            self.drop_definition_fact_refs(definition);
+            derivation::note_write(|| FactKey::DefinitionFact(*definition));
+        }
     }
 
     pub(crate) fn bind_definition_fact_unchecked(
@@ -2715,7 +2509,7 @@ impl LuaTypeIndex {
         if self.definition_facts.get(&definition) != Some(&fact) {
             self.definition_facts.insert(definition, fact);
             self.refresh_definition_fact_refs(&definition);
-            self.fact_epochs.note(definition.clone());
+            derivation::note_write(|| FactKey::DefinitionFact(definition));
         }
         file_id
     }
@@ -2780,26 +2574,6 @@ impl LuaTypeIndex {
             &mut self.definition_fact_ref_files,
             definition,
         );
-    }
-
-    /// Records `owner` as a settled-read key living in its own file. The key
-    /// is created exactly where [`Self::settled_read_dependents`] gains one.
-    fn link_settled_owner(&mut self, owner: &LuaTypeOwner) {
-        self.settled_owners_by_file
-            .entry(owner.get_file_id())
-            .or_default()
-            .insert(owner.clone());
-    }
-
-    /// Forgets `owner` once [`Self::settled_read_dependents`] loses its key.
-    fn unlink_settled_owner(&mut self, owner: &LuaTypeOwner) {
-        let file_id = owner.get_file_id();
-        if let Some(owners) = self.settled_owners_by_file.get_mut(&file_id) {
-            owners.remove(owner);
-            if owners.is_empty() {
-                self.settled_owners_by_file.remove(&file_id);
-            }
-        }
     }
 
     /// Marks the inference-derived state stale.
@@ -2874,67 +2648,54 @@ impl LuaTypeIndex {
         self.types.iter()
     }
 
-    pub fn replace_table_const_type(
-        &mut self,
-        table_range: &InFiled<TextRange>,
-        replacement: &LuaType,
-    ) {
-        let updates: Vec<(LuaTypeOwner, LuaTypeCache)> = self
-            .types
-            .iter()
-            .filter_map(|(owner, cache)| {
-                replace_table_const_in_type(cache.as_type(), table_range, replacement).map(
-                    |new_type| {
-                        let new_cache = match cache {
-                            LuaTypeCache::DocType(_) => LuaTypeCache::DocType(new_type),
-                            LuaTypeCache::InferType(_) => LuaTypeCache::InferType(new_type),
-                        };
-                        (owner.clone(), new_cache)
-                    },
-                )
-            })
-            .collect();
-
-        let mut changed_files = HashSet::default();
-        for (owner, new_cache) in updates {
-            changed_files.insert(owner.get_file_id());
-            self.insert_type_cache(owner, new_cache);
-        }
-        if !changed_files.is_empty() {
-            self.mark_inference_derived_state_dirty();
-        }
+    /// Registers the class a table literal became. Stored types that name
+    /// the literal name the class instead, and their writers run again.
+    pub(crate) fn register_table_class(&mut self, table: InFiled<TextRange>, class_type: LuaType) {
+        let Some(id) = derivation::current() else {
+            return;
+        };
+        self.record_contribution(TypeContribution::TableClass {
+            table: table.clone(),
+        });
+        derivation::note_write(|| FactKey::TableClass(table.clone()));
+        let registrations = self.table_classes.entry(table).or_default();
+        let at = registrations.partition_point(|(existing, _)| *existing <= id);
+        registrations.insert(at, (id, class_type));
     }
 
-    pub fn replace_table_const_types<S: std::hash::BuildHasher>(
-        &mut self,
-        replacements: &std::collections::HashMap<InFiled<TextRange>, LuaType, S>,
-    ) {
-        if replacements.is_empty() {
+    fn release_table_class(&mut self, table: &InFiled<TextRange>, id: &DerivationId) {
+        let Some(registrations) = self.table_classes.get_mut(table) else {
             return;
-        }
-
-        let updates: Vec<(LuaTypeOwner, LuaTypeCache)> = self
-            .types
+        };
+        let Some(at) = registrations
             .iter()
-            .filter_map(|(owner, cache)| {
-                replace_table_consts_in_type(cache.as_type(), replacements).map(|new_type| {
-                    let new_cache = match cache {
-                        LuaTypeCache::DocType(_) => LuaTypeCache::DocType(new_type),
-                        LuaTypeCache::InferType(_) => LuaTypeCache::InferType(new_type),
-                    };
-                    (owner.clone(), new_cache)
-                })
-            })
-            .collect();
+            .position(|(existing, _)| existing == id)
+        else {
+            return;
+        };
+        registrations.remove(at);
+        if registrations.is_empty() {
+            self.table_classes.remove(table);
+        }
+        derivation::note_write(|| FactKey::TableClass(table.clone()));
+    }
 
-        let mut changed_files = HashSet::default();
-        for (owner, new_cache) in updates {
-            changed_files.insert(owner.get_file_id());
-            self.insert_type_cache(owner, new_cache);
+    /// `typ` with every table literal a registration turned into a class
+    /// replaced by the class.
+    fn with_table_classes(&self, typ: &LuaType) -> Option<LuaType> {
+        let mut tables = Vec::new();
+        collect_table_consts(typ, &mut tables);
+        if tables.is_empty() {
+            return None;
         }
-        if !changed_files.is_empty() {
-            self.mark_inference_derived_state_dirty();
+        let mut replacements = std::collections::HashMap::new();
+        for table in tables {
+            derivation::note_read(|| FactKey::TableClass(table.clone()));
+            if let Some((_, class_type)) = self.table_classes.get(&table).and_then(|r| r.first()) {
+                replacements.insert(table, class_type.clone());
+            }
         }
+        replace_table_consts_in_type(typ, &replacements)
     }
 
     /// Drops the cached types of members that were removed on their own,
@@ -2944,19 +2705,9 @@ impl LuaTypeIndex {
     /// re-index will reach, because the file it belongs to is not being
     /// re-analysed.
     pub fn remove_member_type_caches(&mut self, member_ids: &[crate::LuaMemberId]) {
-        if op_log::recording() {
-            let member_ids2 = member_ids.to_vec();
-            let keys: Box<[WriteKey]> = member_ids
-                .iter()
-                .map(|id| WriteKey::TypeOwner(LuaTypeOwner::Member(*id)))
-                .collect();
-            op_log::push(op_log::Domain::Type, keys, move |db| {
-                db.get_type_index_mut()
-                    .remove_member_type_caches(&member_ids2)
-            });
-        }
         for member_id in member_ids {
             let owner = LuaTypeOwner::Member(*member_id);
+            derivation::note_write(|| FactKey::TypeCache(owner.clone()));
             if let Some(set) = self.in_filed_type_owner.get_mut(&member_id.file_id) {
                 set.remove(&owner);
             }
@@ -2965,10 +2716,10 @@ impl LuaTypeIndex {
             if let Some(previous) = self.types.remove(&owner) {
                 self.cache_refs
                     .remove(member_id.file_id, previous.as_type());
-                self.note_type_write(&owner);
             }
             self.fact_metadata.remove(&owner);
             self.drop_fact_refs(&owner);
+            self.source_types.remove(&owner);
         }
     }
 
@@ -2977,15 +2728,7 @@ impl LuaTypeIndex {
     ///
     /// Returns the files whose entry named something the edit destroyed: those
     /// cannot be rewritten and have to be re-analysed instead.
-    ///
-    /// `pre_edit_member_ids` names the members the edited file had filed
-    /// before the edit, which is what [`Self::remap_settled_reads`] needs to
-    /// tell a settled read on a member from one on a speculative key.
-    pub fn remap_file_identities(
-        &mut self,
-        remap: &crate::FileRemap,
-        pre_edit_member_ids: &rustc_hash::FxHashSet<LuaMemberId>,
-    ) -> HashSet<FileId> {
+    pub fn remap_file_identities(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
         let mut dirty = HashSet::default();
 
         // Only caches that actually name an identity in the edited file can
@@ -3030,7 +2773,6 @@ impl LuaTypeIndex {
             self.mark_inference_derived_state_dirty();
         }
         dirty.extend(self.remap_inference_facts(remap));
-        dirty.extend(self.remap_settled_reads(remap, pre_edit_member_ids));
         dirty.remove(&remap.file_id);
         dirty
     }
@@ -3075,6 +2817,7 @@ impl LuaTypeIndex {
         // Ordered by a real key rather than hash-map iteration order.
         metadata_updates.sort_by(|left, right| left.0.stable_cmp(&right.0));
         for (owner, metadata) in metadata_updates {
+            derivation::note_write(|| FactKey::TypeCache(owner.clone()));
             self.fact_metadata.insert(owner, metadata);
         }
 
@@ -3112,9 +2855,117 @@ impl LuaTypeIndex {
         fact_updates.sort_by(|left, right| left.0.stable_cmp(&right.0));
         for (definition, fact) in fact_updates {
             self.definition_facts.insert(definition, fact);
-            self.fact_epochs.note(definition.clone());
+            derivation::note_write(|| FactKey::DefinitionFact(definition));
         }
         dirty
+    }
+
+    fn add_to_decl_scan(&mut self, decl_id: &LuaTypeDeclId) {
+        self.decl_scan_fingerprint = self
+            .decl_scan_fingerprint
+            .wrapping_add(derivation::fingerprint_of(decl_id.get_id()));
+        derivation::note_write(|| FactKey::TypeDeclScan);
+    }
+
+    fn remove_from_decl_scan(&mut self, decl_id: &LuaTypeDeclId) {
+        self.decl_scan_fingerprint = self
+            .decl_scan_fingerprint
+            .wrapping_sub(derivation::fingerprint_of(decl_id.get_id()));
+        derivation::note_write(|| FactKey::TypeDeclScan);
+    }
+
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        if let FactKey::TableClass(table) = key {
+            return derivation::fingerprint_opt(
+                self.table_classes
+                    .get(table)
+                    .and_then(|registrations| registrations.first())
+                    .map(|(_, class_type)| class_type),
+            );
+        }
+        if let FactKey::TypeContrib(id) = key {
+            return derivation::fingerprint_opt(self.derived_contributions.get(id));
+        }
+        if let FactKey::SourceTypeDecl(id) = key {
+            let Some(locations) = self.source_decl_locations.get(id) else {
+                return derivation::ABSENT;
+            };
+            let decl = self.full_name_type_map.get(id);
+            return derivation::fingerprint_of(&(
+                locations,
+                decl.map(|decl| decl.get_attribute_type()),
+            ));
+        }
+        match key {
+            FactKey::TypeCache(owner) => match self.types.get(owner) {
+                Some(cache) => derivation::fingerprint_of(&(cache, self.fact_metadata.get(owner))),
+                None => derivation::ABSENT,
+            },
+            FactKey::DefinitionFact(definition) => {
+                derivation::fingerprint_opt(self.definition_facts.get(definition))
+            }
+            FactKey::TypeDecl(decl_id) => {
+                let decl = self.full_name_type_map.get(decl_id);
+                let supers = self.supers.get(decl_id);
+                let generic_params = self.generic_params.get(decl_id);
+                if decl.is_none() && supers.is_none() && generic_params.is_none() {
+                    return derivation::ABSENT;
+                }
+                derivation::fingerprint_of(&(decl, supers, generic_params))
+            }
+            FactKey::SubTypes(decl_id) => {
+                let Some(children) = self.sub_types.get(decl_id) else {
+                    return derivation::ABSENT;
+                };
+                let mut children = children.iter().collect::<Vec<_>>();
+                children.sort_by(|left, right| left.stable_cmp(right));
+                let children = children
+                    .into_iter()
+                    .map(LuaTypeDeclId::get_id)
+                    .collect::<Vec<_>>();
+                derivation::fingerprint_of(&children)
+            }
+            FactKey::BoundDecls(type_id, file_id) => {
+                let mut decls = self
+                    .type_bound_decls
+                    .get(type_id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|decl_id| decl_id.file_id == *file_id)
+                    .map(|decl_id| u32::from(decl_id.position))
+                    .collect::<Vec<_>>();
+                if decls.is_empty() {
+                    return derivation::ABSENT;
+                }
+                decls.sort_unstable();
+                derivation::fingerprint_of(&decls)
+            }
+            FactKey::DeclClaim(decl_id) => {
+                derivation::fingerprint_opt(self.decl_write_claims.get(decl_id))
+            }
+            FactKey::TypeDeclScan => self.decl_scan_fingerprint,
+            FactKey::TypeFile(file_id) => {
+                let namespace = self.file_namespace.get(file_id);
+                let using = self.file_using_namespace.get(file_id);
+                let types = self.file_types.get(file_id);
+                let sites = self.declaration_sites.get(file_id).map(|sites| {
+                    let mut sites = sites
+                        .iter()
+                        .map(|(range, decl_id)| ((range.start(), range.end()), decl_id))
+                        .collect::<Vec<_>>();
+                    sites.sort_unstable_by_key(|(range, _)| *range);
+                    sites
+                });
+                if namespace.is_none() && using.is_none() && types.is_none() && sites.is_none() {
+                    return derivation::ABSENT;
+                }
+                derivation::fingerprint_of(&(namespace, using, types, sites))
+            }
+            _ => {
+                debug_assert!(false, "{key:?} is not a type fact");
+                derivation::ABSENT
+            }
+        }
     }
 
     pub fn files_with_type_caches_referencing_files<S: std::hash::BuildHasher>(
@@ -3343,6 +3194,16 @@ impl LuaIndex for LuaTypeIndex {
                 continue;
             };
             for (child_id, entry) in records {
+                let edge = (child_id.clone(), entry.clone());
+                if let Some(holders) = self.super_holders.get_mut(&edge)
+                    && let Some(at) = holders.iter().position(Option::is_none)
+                {
+                    holders.remove(at);
+                    if !holders.is_empty() {
+                        continue;
+                    }
+                    self.super_holders.remove(&edge);
+                }
                 if let LuaType::Ref(base_id) = &entry.value.typ {
                     affected_bases.insert(base_id.clone());
                 }
@@ -3352,8 +3213,7 @@ impl LuaIndex for LuaTypeIndex {
                 if let Some(at) = supers.iter().position(|existing| existing == &entry) {
                     supers.remove(at);
                     pruned_edges += 1;
-                    self.decl_key_epochs
-                        .note((child_id.clone(), read_set::TypeDeclKind::Supers));
+                    derivation::note_write(|| FactKey::TypeDecl(child_id.clone()));
                 }
                 if supers.is_empty() {
                     self.supers.remove(&child_id);
@@ -3380,13 +3240,10 @@ impl LuaIndex for LuaTypeIndex {
                         self.sub_types.remove(&base_id);
                     }
                 }
-                self.decl_key_epochs
-                    .note((base_id.clone(), read_set::TypeDeclKind::SubTypes));
+                derivation::note_write(|| FactKey::SubTypes(base_id.clone()));
             }
             // Pruning dropped an edge the cached map may have been derived
             // from; the next read rebuilds it lazily.
-            self.bump_super_write_revision();
-            self.note_type_decl_write();
         }
 
         let mut dropped_definitions = Vec::new();
@@ -3400,7 +3257,7 @@ impl LuaIndex for LuaTypeIndex {
         });
         for definition in dropped_definitions {
             self.drop_definition_fact_refs(&definition);
-            self.fact_epochs.note(definition.clone());
+            derivation::note_write(|| FactKey::DefinitionFact(definition));
         }
 
         if !changed_files.is_empty() {
@@ -3410,22 +3267,8 @@ impl LuaIndex for LuaTypeIndex {
     }
 
     fn clear(&mut self) {
-        for file_id in self
-            .file_types
-            .keys()
-            .chain(self.file_namespace.keys())
-            .chain(self.file_using_namespace.keys())
-        {
-            self.file_write_epochs.note(*file_id);
-        }
-        self.note_type_decl_write();
-        // Resetting the keyed stores stales every recorded read of a removed
-        // slot (a recorded epoch is nonzero; `epoch` then reads `0`) — a
-        // rebuilt identical map lands on the same ticks, which is the same
-        // answer.
-        self.decl_key_epochs.clear();
-        self.bound_decl_epochs.clear();
-        self.fact_epochs.clear();
+        self.note_clear_writes();
+        self.decl_scan_fingerprint = derivation::ABSENT;
         self.file_types.clear();
         self.declaration_sites.clear();
         self.file_namespace.clear();
@@ -3433,27 +3276,25 @@ impl LuaIndex for LuaTypeIndex {
         self.full_name_type_map.clear();
         self.generic_params.clear();
         self.alias_sources.clear();
+        self.extra_sources.clear();
         self.supers.clear();
         self.supers_by_file.clear();
         self.sub_types.clear();
-        self.super_write_revision = 0;
-        self.cached_direct_subtype_members = None;
         self.types.clear();
+        self.source_types.clear();
+        self.source_decl_locations.clear();
+        self.derived_contributions.clear();
+        self.location_holders.clear();
+        self.super_holders.clear();
+        self.table_classes.clear();
         self.cache_refs = TypeCacheRefIndex::default();
         self.in_filed_type_owner.clear();
-        self.settled_reads_by_file.clear();
-        self.settled_read_dependents.clear();
-        self.settled_owners_by_file.clear();
         self.fact_metadata.clear();
         self.fact_ref_files.clear();
         self.fact_refs_by_file.clear();
-        for decl_id in self.decl_write_claims.keys() {
-            self.claim_write_epochs.note(*decl_id);
-        }
         self.decl_write_claims.clear();
         self.decl_type_binds.clear();
         self.type_bound_decls.clear();
-        self.type_write_versions.clear();
         self.definition_facts.clear();
         self.definition_fact_ref_files.clear();
         self.definition_fact_refs_by_file.clear();
@@ -3466,19 +3307,42 @@ impl LuaIndex for LuaTypeIndex {
 
 impl LuaTypeIndex {
     fn remove_file_raw(&mut self, file_id: FileId) {
-        self.clear_settled_reads(file_id);
         self.file_namespace.remove(&file_id);
         self.file_using_namespace.remove(&file_id);
-        self.file_write_epochs.note(file_id);
+        derivation::note_write(|| FactKey::TypeFile(file_id));
         self.declaration_sites.remove(&file_id);
         if let Some(type_id_list) = self.file_types.remove(&file_id) {
             for id in type_id_list {
+                derivation::note_write(|| FactKey::TypeDecl(id.clone()));
+                if let Some(locations) = self.source_decl_locations.get_mut(&id) {
+                    derivation::note_write(|| FactKey::SourceTypeDecl(id.clone()));
+                    locations.retain(|loc| loc.file_id != file_id);
+                    if locations.is_empty() {
+                        self.source_decl_locations.remove(&id);
+                    }
+                }
                 let mut remove_type = false;
                 if let Some(decl) = self.full_name_type_map.get_mut(&id) {
-                    decl.get_mut_locations()
-                        .retain(|loc| loc.file_id != file_id);
+                    let location_holders = &mut self.location_holders;
+                    decl.get_mut_locations().retain_mut(|loc| {
+                        if loc.file_id != file_id {
+                            return true;
+                        }
+                        let site = (id.clone(), file_id, loc.range);
+                        let Some(holders) = location_holders.get_mut(&site) else {
+                            return false;
+                        };
+                        holders.retain(|(holder, _)| holder.is_some());
+                        if holders.is_empty() {
+                            location_holders.remove(&site);
+                            return false;
+                        }
+                        loc.flag = union_flags(holders);
+                        true
+                    });
                     if decl.get_mut_locations().is_empty() {
                         self.full_name_type_map.remove(&id);
+                        self.remove_from_decl_scan(&id);
                         remove_type = true;
                         log::info!(
                             "type_index: type '{}' fully removed (file_id={:?})",
@@ -3488,6 +3352,15 @@ impl LuaTypeIndex {
                     }
                 }
 
+                if let Some(sources) = self.extra_sources.get_mut(&id) {
+                    sources.retain(|site, _| site.file_id != file_id);
+                    if remove_type || sources.is_empty() {
+                        self.extra_sources.remove(&id);
+                    }
+                    if !remove_type {
+                        self.reselect_extra_source(&id);
+                    }
+                }
                 if remove_type {
                     self.generic_params.remove(&id);
                     self.alias_sources.remove(&id);
@@ -3507,35 +3380,68 @@ impl LuaTypeIndex {
                         self.alias_sources.remove(&id);
                     }
                 }
-                self.note_type_decl_write();
-                for kind in [
-                    read_set::TypeDeclKind::Object,
-                    read_set::TypeDeclKind::Supers,
-                    read_set::TypeDeclKind::SubTypes,
-                    read_set::TypeDeclKind::GenericParams,
-                ] {
-                    self.decl_key_epochs.note((id.clone(), kind));
-                }
             }
         }
 
         if let Some(type_owners) = self.in_filed_type_owner.remove(&file_id) {
             for type_owner in type_owners {
+                derivation::note_write(|| FactKey::TypeCache(type_owner.clone()));
                 if let LuaTypeOwner::Decl(decl_id) = &type_owner {
                     if self.decl_write_claims.remove(decl_id).is_some() {
-                        self.claim_write_epochs.note(*decl_id);
+                        derivation::note_write(|| FactKey::DeclClaim(*decl_id));
                     }
                     self.unbind_decl(decl_id);
                 }
-                if self.types.remove(&type_owner).is_some() {
-                    self.note_type_write(&type_owner);
-                }
+                self.types.remove(&type_owner);
                 self.fact_metadata.remove(&type_owner);
                 self.drop_fact_refs(&type_owner);
+                self.source_types.remove(&type_owner);
             }
         }
 
         self.cache_refs.remove_file(file_id);
+    }
+
+    /// Notes every fact [`LuaIndex::clear`] is about to drop.
+    fn note_clear_writes(&self) {
+        if !derivation::recording() {
+            return;
+        }
+        derivation::note_write(|| FactKey::TypeDeclScan);
+        for file_id in self
+            .file_types
+            .keys()
+            .chain(self.file_namespace.keys())
+            .chain(self.file_using_namespace.keys())
+            .chain(self.declaration_sites.keys())
+        {
+            derivation::note_write(|| FactKey::TypeFile(*file_id));
+        }
+        for decl_id in self
+            .full_name_type_map
+            .keys()
+            .chain(self.supers.keys())
+            .chain(self.generic_params.keys())
+        {
+            derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
+        }
+        for decl_id in self.sub_types.keys() {
+            derivation::note_write(|| FactKey::SubTypes(decl_id.clone()));
+        }
+        for (type_id, decls) in &self.type_bound_decls {
+            for decl_id in decls {
+                derivation::note_write(|| FactKey::BoundDecls(type_id.clone(), decl_id.file_id));
+            }
+        }
+        for owner in self.types.keys() {
+            derivation::note_write(|| FactKey::TypeCache(owner.clone()));
+        }
+        for decl_id in self.decl_write_claims.keys() {
+            derivation::note_write(|| FactKey::DeclClaim(*decl_id));
+        }
+        for definition in self.definition_facts.keys() {
+            derivation::note_write(|| FactKey::DefinitionFact(*definition));
+        }
     }
 }
 
@@ -3856,49 +3762,6 @@ mod super_type_tests {
         assert_eq!(names, vec!["Apple"]);
         assert_eq!(index.get_all_sub_types(&parent_id).len(), 1);
     }
-
-    /// Super-type writes bump the revision the subtype-member cache keys on,
-    /// and pruning edges drops a cached map so the next read rebuilds it.
-    #[test]
-    fn super_type_writes_bump_the_subtype_cache_revision() {
-        let mut index = LuaTypeIndex::new();
-        assert_eq!(index.super_write_revision(), 0);
-
-        let child_id = LuaTypeDeclId::global("Child");
-        let parent_type = LuaType::Ref(LuaTypeDeclId::global("Parent"));
-        let edge_file = FileId::new(1);
-        let range = TextRange::new(10.into(), 20.into());
-        index.add_super_type(child_id, edge_file, range, parent_type.clone());
-        assert_eq!(index.super_write_revision(), 1);
-
-        // Re-adding the identical edge is a no-op write: no bump.
-        index.add_super_type_if_missing(
-            LuaTypeDeclId::global("Child"),
-            edge_file,
-            range,
-            parent_type,
-        );
-        assert_eq!(index.super_write_revision(), 1);
-
-        let key = DirectSubtypeMembersKey {
-            super_revision: index.super_write_revision(),
-            member_revision: 0,
-            member_writes: 0,
-            dynamic_writes: 0,
-        };
-        index.store_direct_subtype_members(key, Arc::new(DirectSubtypeMembers::default()));
-        assert!(index.direct_subtype_members_cache().is_some());
-
-        // Removing an unrelated file prunes no edge: revision and cache stay.
-        index.remove_files(&[FileId::new(9)]);
-        assert_eq!(index.super_write_revision(), 1);
-        assert!(index.direct_subtype_members_cache().is_some());
-
-        // Removing the edge file prunes the edge: revision bumps, cache drops.
-        index.remove_files(&[edge_file]);
-        assert_eq!(index.super_write_revision(), 2);
-        assert!(index.direct_subtype_members_cache().is_none());
-    }
 }
 
 #[cfg(test)]
@@ -4055,11 +3918,6 @@ mod batch_removal_tests {
         assert_eq!(left.sub_types, right.sub_types);
         assert_eq!(left.decl_type_binds, right.decl_type_binds);
         assert_eq!(left.type_bound_decls, right.type_bound_decls);
-        assert_eq!(left.super_write_revision, right.super_write_revision);
-        assert_eq!(
-            left.cached_direct_subtype_members,
-            right.cached_direct_subtype_members
-        );
         assert_eq!(type_cache_types(left), type_cache_types(right));
         assert_eq!(left.in_filed_type_owner, right.in_filed_type_owner);
         assert_eq!(left.fact_metadata, right.fact_metadata);
@@ -4071,9 +3929,6 @@ mod batch_removal_tests {
         assert_eq!(left.support_dependents, right.support_dependents);
         assert_eq!(left.support_file_dependents, right.support_file_dependents);
         assert_eq!(left.cache_refs, right.cache_refs);
-        assert_eq!(left.settled_reads_by_file, right.settled_reads_by_file);
-        assert_eq!(left.settled_read_dependents, right.settled_read_dependents);
-        assert_eq!(left.settled_owners_by_file, right.settled_owners_by_file);
         assert_eq!(left.fact_ref_files, right.fact_ref_files);
         assert_eq!(left.fact_refs_by_file, right.fact_refs_by_file);
         assert_eq!(
@@ -4120,9 +3975,8 @@ mod batch_removal_tests {
     }
 
     /// The reverse lookup maps stay consistent with the primary maps: every
-    /// forward entry recomputes to the same file set, every reverse bucket is
-    /// exactly the forward entries naming it, and the settled-owner buckets
-    /// are exactly the dependent keys living in each file.
+    /// forward entry recomputes to the same file set, and every reverse bucket
+    /// is exactly the forward entries naming it.
     fn assert_reverse_maps_consistent(index: &LuaTypeIndex) {
         for (owner, metadata) in &index.fact_metadata {
             let expected = LuaTypeIndex::metadata_referenced_files(metadata);
@@ -4166,15 +4020,6 @@ mod batch_removal_tests {
             }
         }
         assert_eq!(index.definition_fact_refs_by_file, expected_definitions);
-
-        let mut expected_owners: HashMap<FileId, HashSet<LuaTypeOwner>> = HashMap::default();
-        for owner in index.settled_read_dependents.keys() {
-            expected_owners
-                .entry(owner.get_file_id())
-                .or_default()
-                .insert(owner.clone());
-        }
-        assert_eq!(index.settled_owners_by_file, expected_owners);
 
         let mut expected_edges: HashMap<FileId, Vec<(LuaTypeDeclId, InFiled<LuaSuperType>)>> =
             HashMap::default();
@@ -4240,14 +4085,6 @@ mod batch_removal_tests {
                     LuaTypeFact::certain(LuaType::Number),
                 );
             }
-            // Cross-file settled reads, recorded on both sides so the removed
-            // index and the fresh one observe the same reader entries.
-            if files.contains(&file_id(1)) {
-                index.set_settled_reads(file_id(1), [owner(file_id(3), 10)]);
-            }
-            if files.contains(&file_id(3)) {
-                index.set_settled_reads(file_id(3), [owner(file_id(1), 10)]);
-            }
             index.flush_inference_derived_state();
             index
         }
@@ -4294,16 +4131,10 @@ mod batch_removal_tests {
             fresh.support_file_dependents
         );
         assert_eq!(removed.cache_refs, fresh.cache_refs);
-        assert_eq!(removed.settled_reads_by_file, fresh.settled_reads_by_file);
-        assert_eq!(
-            removed.settled_read_dependents,
-            fresh.settled_read_dependents
-        );
-        assert_eq!(removed.settled_owners_by_file, fresh.settled_owners_by_file);
     }
 
     /// Remapping one file visits only the facts that name it: an unrelated
-    /// file's facts, payloads and settled reads come out byte-identical.
+    /// file's facts and payloads come out byte-identical.
     #[test]
     fn remap_visits_only_facts_naming_the_edited_file() {
         use crate::db_index::edit::{FileRemap, PositionMap};
@@ -4333,7 +4164,6 @@ mod batch_removal_tests {
             LuaDefinitionId::Declaration(LuaDeclId::new(unrelated, 40.into())),
             LuaTypeFact::certain(LuaType::Number),
         );
-        index.set_settled_reads(unrelated, [owner(unrelated, 20)]);
         assert_reverse_maps_consistent(&index);
         assert!(
             index
@@ -4344,11 +4174,10 @@ mod batch_removal_tests {
 
         let before_metadata = index.fact_metadata.clone();
         let before_definitions = index.definition_facts.clone();
-        let before_settled = index.settled_read_dependents.clone();
 
         // An insertion at offset 3 shifts everything after it by two.
         let remap = FileRemap::unvalidated(edited, PositionMap::new("abcdef", "abcXXdef"));
-        index.remap_file_identities(&remap, &HashSet::default());
+        index.remap_file_identities(&remap);
         assert_reverse_maps_consistent(&index);
 
         assert_eq!(
@@ -4356,7 +4185,6 @@ mod batch_removal_tests {
             before_metadata.get(&unrelated_owner)
         );
         assert_eq!(index.definition_facts, before_definitions);
-        assert_eq!(index.settled_read_dependents, before_settled);
     }
 }
 
@@ -4396,11 +4224,7 @@ mod remap_walker_tests {
         let mut index = LuaTypeIndex::new();
         index.bind_definition_fact(definition, LuaTypeFact::certain(instance(3, 5)));
         let insertion = FileRemap::unvalidated(source, PositionMap::new("abcde", "XXabcde"));
-        assert!(
-            index
-                .remap_file_identities(&insertion, &HashSet::default())
-                .is_empty()
-        );
+        assert!(index.remap_file_identities(&insertion).is_empty());
         assert_eq!(
             index.get_definition_fact(&definition).unwrap().typ(),
             &instance(5, 7),
@@ -4408,7 +4232,7 @@ mod remap_walker_tests {
 
         let deletion = FileRemap::unvalidated(source, PositionMap::new("XXabcde", "XXa"));
         assert_eq!(
-            index.remap_file_identities(&deletion, &HashSet::default()),
+            index.remap_file_identities(&deletion),
             [consumer].into_iter().collect(),
         );
     }

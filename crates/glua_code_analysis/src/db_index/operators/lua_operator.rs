@@ -10,7 +10,7 @@ use crate::{
 
 use super::lua_operator_meta_method::LuaOperatorMetaMethod;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct LuaOperator {
     owner: LuaOperatorOwner,
     op: LuaOperatorMetaMethod,
@@ -19,7 +19,7 @@ pub struct LuaOperator {
     func: OperatorFunction,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub enum OperatorFunction {
     Func(Arc<LuaFunctionType>),
     Signature(LuaSignatureId),

@@ -20,8 +20,8 @@ pub use gmod_domains::{
     collect_call_arg_roles_for_param, find_best_call_arg_role_for_param,
     find_best_call_arg_role_from_type, find_best_direct_call_arg_role_for_param,
     find_best_direct_call_arg_role_from_type, find_signature_attribute_use,
-    rebuild_effective_valid_guard_signatures, signature_attribute_uses,
-    signature_has_net_op_metadata, signature_is_valid_guard_in_realm,
+    rebuild_effective_valid_guard_signatures, scan_valid_guard_signatures,
+    signature_attribute_uses, signature_has_net_op_metadata, signature_is_valid_guard_in_realm,
     signature_is_valid_guard_or_base_runtime_isvalid_in_realm, signature_net_bits_param_idx,
     signature_net_callback_param_idx, signature_net_payload, signature_net_send,
     signature_owner_for, signature_writes_global_roots, type_is_net_read_op,
@@ -35,8 +35,7 @@ pub use signature::{
     visit_call_arg_roles_from_type,
 };
 
-use crate::db_index::op_log;
-use crate::db_index::read_set::WriteKey;
+use crate::db_index::derivation::{self, FactKey, Fingerprint};
 use crate::{FileId, GmodStateMask, LuaType, db_index::LuaDeclId};
 
 use super::traits::LuaIndex;
@@ -44,6 +43,10 @@ use super::traits::LuaIndex;
 #[derive(Debug, Clone)]
 pub struct LuaSignatureIndex {
     signatures: HashMap<LuaSignatureId, LuaSignature>,
+    /// Each signature a derivation has changed since the last reset, as the
+    /// source layer left it (`None`: the source layer has no such signature).
+    /// A reset restores it.
+    source_signatures: HashMap<LuaSignatureId, Option<LuaSignature>>,
     in_file_signatures: HashMap<FileId, HashSet<LuaSignatureId>>,
     local_func_decls: HashMap<LuaSignatureId, LuaDeclId>,
     effective_valid_guard_signatures: HashMap<LuaSignatureId, GmodStateMask>,
@@ -55,12 +58,10 @@ pub struct LuaSignatureIndex {
     valid_guard_file_contributions: HashMap<FileId, Vec<(LuaSignatureId, GmodStateMask)>>,
     /// The global-declaration part of the same derivation. `None` until the
     /// first rebuild; always recomputed together with any dirty file part.
-    valid_guard_global_contributions: Option<Vec<(LuaSignatureId, GmodStateMask)>>,
+
     /// Files whose contributions must be re-derived on the next rebuild:
     /// every removal lands here, as does every global-decl change via
     /// [`Self::valid_guard_global_dirty`].
-    valid_guard_contribution_dirty_files: HashSet<FileId>,
-    valid_guard_global_dirty: bool,
     inferred_positive_guards: HashMap<LuaSignatureId, LuaInferredPositiveGuard>,
     inferred_guard_owners: HashMap<LuaSignatureId, LuaInferredGuardOwner>,
     inferred_guard_facts: HashMap<LuaInferredGuardOwner, LuaInferredPositiveGuard>,
@@ -69,35 +70,15 @@ pub struct LuaSignatureIndex {
     inferred_guard_dependencies: HashMap<FileId, HashSet<LuaInferredGuardOwner>>,
     inferred_return_dependencies: HashMap<LuaSignatureId, HashSet<FileId>>,
     inferred_return_consumers: HashMap<FileId, HashSet<LuaSignatureId>>,
-    settled_reads_by_file: HashMap<FileId, HashSet<LuaSignatureId>>,
-    settled_read_dependents: HashMap<LuaSignatureId, HashSet<FileId>>,
     payload_sources_by_holder: HashMap<FileId, HashSet<FileId>>,
     payload_holders_by_source: HashMap<FileId, HashSet<FileId>>,
     inferred_positive_guards_changed: bool,
-    /// Count of inferred-return changes, for telling a pass that moved a
-    /// return from one that did not.
-    return_writes: u64,
-    return_write_versions: HashMap<LuaSignatureId, u64>,
-    /// Count of closure-parameter changes, for telling a pass that moved a
-    /// signature's parameter contract from one that did not. Closure params
-    /// are written by the unresolve items, not by the type cache, so without
-    /// this counter every such write looks like unversioned state and forces
-    /// a full fixpoint requeue.
-    param_writes: u64,
-    param_write_versions: HashMap<LuaSignatureId, u64>,
     receiver_out_param_member_names: HashMap<String, usize>,
     in_file_receiver_out_param_member_names: HashMap<FileId, HashSet<String>>,
-    /// Write epochs for the file-keyed signature maps (`in_file_signatures`,
-    /// `in_file_receiver_out_param_member_names`) — `FileScopedKind::SignatureFile`.
-    pub(crate) file_write_epochs: crate::db_index::read_set::KeyedEpochs<FileId>,
-    /// Domain counter for name-keyed gmod metadata writes
-    /// (`receiver_out_param_member_names`) — `record_gmod_meta` readers have
-    /// no per-key clocks, so any write stales them.
-    pub(crate) gmod_meta_writes: u64,
 }
 
 /// A conservative true-branch parameter narrowing derived from a function body.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaInferredPositiveGuard {
     pub param_idx: usize,
     pub narrowed_type: LuaType,
@@ -157,71 +138,25 @@ impl Default for LuaSignatureIndex {
 }
 
 impl LuaSignatureIndex {
-    /// Compare it across an operation to tell whether the operation changed
-    /// any inferred return.
-    pub fn return_writes(&self) -> u64 {
-        self.return_writes
-    }
-
     pub(crate) fn note_return_write(&mut self, signature_id: LuaSignatureId) {
-        if op_log::recording() {
-            op_log::push_one(
-                op_log::Domain::Signature,
-                WriteKey::Signature(signature_id),
-                move |db| db.get_signature_index_mut().note_return_write(signature_id),
-            );
-        }
-        self.return_writes += 1;
-        self.return_write_versions
-            .insert(signature_id, self.return_writes);
+        derivation::note_write(|| FactKey::Signature(signature_id));
     }
 
-    pub(crate) fn return_write_version(&self, signature_id: &LuaSignatureId) -> u64 {
-        self.return_write_versions
-            .get(signature_id)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Compare it across an operation to tell whether the operation changed
-    /// any signature's parameter contract.
-    pub fn param_writes(&self) -> u64 {
-        self.param_writes
-    }
-
-    /// Records a parameter-contract change. Callers bump only when the write
-    /// added a novel fact; re-settling an identical contract must not bump,
-    /// or the fixpoint's staleness filter degrades to a full requeue.
+    /// Records a parameter-contract change. Callers note only when the write
+    /// added a novel fact.
     pub(crate) fn note_param_write(&mut self, signature_id: LuaSignatureId) {
-        if op_log::recording() {
-            op_log::push_one(
-                op_log::Domain::Signature,
-                WriteKey::Param(signature_id),
-                move |db| db.get_signature_index_mut().note_param_write(signature_id),
-            );
-        }
-        self.param_writes += 1;
-        self.param_write_versions
-            .insert(signature_id, self.param_writes);
-    }
-
-    pub(crate) fn param_write_version(&self, signature_id: &LuaSignatureId) -> u64 {
-        self.param_write_versions
-            .get(signature_id)
-            .copied()
-            .unwrap_or(0)
+        derivation::note_write(|| FactKey::Signature(signature_id));
     }
 
     pub fn new() -> Self {
         Self {
             signatures: HashMap::default(),
+            source_signatures: HashMap::default(),
             in_file_signatures: HashMap::default(),
             local_func_decls: HashMap::default(),
             effective_valid_guard_signatures: HashMap::default(),
             valid_guard_file_contributions: HashMap::default(),
-            valid_guard_global_contributions: None,
-            valid_guard_contribution_dirty_files: HashSet::default(),
-            valid_guard_global_dirty: false,
+
             inferred_positive_guards: HashMap::default(),
             inferred_guard_owners: HashMap::default(),
             inferred_guard_facts: HashMap::default(),
@@ -230,100 +165,80 @@ impl LuaSignatureIndex {
             inferred_guard_dependencies: HashMap::default(),
             inferred_return_dependencies: HashMap::default(),
             inferred_return_consumers: HashMap::default(),
-            settled_reads_by_file: HashMap::default(),
-            settled_read_dependents: HashMap::default(),
             payload_sources_by_holder: HashMap::default(),
             payload_holders_by_source: HashMap::default(),
             inferred_positive_guards_changed: false,
-            return_writes: 0,
-            return_write_versions: HashMap::default(),
-            param_writes: 0,
-            param_write_versions: HashMap::default(),
             receiver_out_param_member_names: HashMap::default(),
             in_file_receiver_out_param_member_names: HashMap::default(),
-            file_write_epochs: crate::db_index::read_set::KeyedEpochs::default(),
-            gmod_meta_writes: 0,
         }
     }
 
-    /// Domain-counter bump for name-keyed gmod metadata writes — see
-    /// `record_gmod_meta`/`untracked_reads_changed`.
-    fn note_gmod_meta_write(&mut self) {
-        self.gmod_meta_writes = self.gmod_meta_writes.wrapping_add(1);
+    /// Keeps the source layer's version of `signature_id` before a
+    /// derivation first changes it.
+    fn snapshot_source(&mut self, signature_id: LuaSignatureId) {
+        if derivation::writes_source() {
+            return;
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            self.source_signatures.entry(signature_id)
+        {
+            entry.insert(self.signatures.get(&signature_id).cloned());
+        }
+    }
+
+    /// Restores `signature_id` to what the source layer left.
+    pub(crate) fn reset_signature(&mut self, signature_id: &LuaSignatureId) {
+        let Some(source) = self.source_signatures.remove(signature_id) else {
+            return;
+        };
+        match source {
+            Some(signature) => {
+                self.signatures.insert(*signature_id, signature);
+            }
+            None => {
+                self.signatures.remove(signature_id);
+                if let Some(ids) = self.in_file_signatures.get_mut(&signature_id.get_file_id()) {
+                    ids.remove(signature_id);
+                }
+            }
+        }
     }
 
     pub fn get_or_create(&mut self, signature_id: LuaSignatureId) -> &mut LuaSignature {
-        op_log::note_mut_ref(op_log::MutRef::Signature(signature_id));
-        crate::db_index::read_set::record_signature(&signature_id);
+        self.snapshot_source(signature_id);
+        derivation::note_write(|| FactKey::Signature(signature_id));
         if self
             .in_file_signatures
             .entry(signature_id.get_file_id())
             .or_default()
             .insert(signature_id)
         {
-            self.file_write_epochs.note(signature_id.get_file_id());
+            derivation::note_write(|| FactKey::SignatureFile(signature_id.get_file_id()));
         }
         self.signatures.entry(signature_id).or_default()
     }
 
     pub fn get(&self, signature_id: &LuaSignatureId) -> Option<&LuaSignature> {
-        crate::db_index::read_set::record_signature(signature_id);
+        derivation::note_read(|| FactKey::Signature(*signature_id));
         self.signatures.get(signature_id)
     }
 
     pub fn get_mut(&mut self, signature_id: &LuaSignatureId) -> Option<&mut LuaSignature> {
-        op_log::note_mut_ref(op_log::MutRef::Signature(*signature_id));
-        crate::db_index::read_set::record_signature(signature_id);
+        self.snapshot_source(*signature_id);
+        derivation::note_write(|| FactKey::Signature(*signature_id));
         self.signatures.get_mut(signature_id)
-    }
-
-    /// Boundary replace for the parallel lua walk: installs the fork's final
-    /// object under the same id, keeping `in_file_signatures` registered the
-    /// way `get_or_create` does. Runs only on the merge thread.
-    pub(crate) fn replace_signature_object(
-        &mut self,
-        signature_id: LuaSignatureId,
-        signature: LuaSignature,
-    ) {
-        if self
-            .in_file_signatures
-            .entry(signature_id.get_file_id())
-            .or_default()
-            .insert(signature_id)
-        {
-            self.file_write_epochs.note(signature_id.get_file_id());
-        }
-        self.signatures.insert(signature_id, signature);
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&LuaSignatureId, &LuaSignature)> {
         self.signatures.iter()
     }
 
-    /// Number of signatures currently indexed. `O(1)`.
-    pub fn indexed_signature_count(&self) -> usize {
-        self.signatures.len()
-    }
-
     pub fn local_func_decl_for(&self, signature_id: &LuaSignatureId) -> Option<LuaDeclId> {
-        crate::db_index::read_set::record_signature(signature_id);
+        derivation::note_read(|| FactKey::Signature(*signature_id));
         self.local_func_decls.get(signature_id).copied()
     }
 
     pub fn bind_local_func_decl(&mut self, signature_id: LuaSignatureId, decl_id: LuaDeclId) {
-        if op_log::recording() {
-            op_log::push(
-                op_log::Domain::Signature,
-                Box::new([
-                    WriteKey::Signature(signature_id),
-                    WriteKey::DeclMisc(decl_id),
-                ]),
-                move |db| {
-                    db.get_signature_index_mut()
-                        .bind_local_func_decl(signature_id, decl_id)
-                },
-            );
-        }
         if self.local_func_decls.get(&signature_id) != Some(&decl_id) {
             self.local_func_decls.insert(signature_id, decl_id);
             // `local_func_decl_for` records a signature read: the write
@@ -333,6 +248,9 @@ impl LuaSignatureIndex {
     }
 
     pub fn clear_effective_valid_guard_signatures(&mut self) {
+        for signature_id in self.effective_valid_guard_signatures.keys() {
+            derivation::note_write(|| FactKey::ValidGuard(*signature_id));
+        }
         self.effective_valid_guard_signatures.clear();
     }
 
@@ -341,16 +259,7 @@ impl LuaSignatureIndex {
         signature_id: LuaSignatureId,
         state_mask: GmodStateMask,
     ) {
-        if op_log::recording() {
-            op_log::push_one(
-                op_log::Domain::Signature,
-                WriteKey::Signature(signature_id),
-                move |db| {
-                    db.get_signature_index_mut()
-                        .mark_effective_valid_guard_signature(signature_id, state_mask)
-                },
-            );
-        }
+        derivation::note_write(|| FactKey::ValidGuard(signature_id));
         self.effective_valid_guard_signatures
             .entry(signature_id)
             .and_modify(|existing| existing.insert(state_mask))
@@ -358,7 +267,7 @@ impl LuaSignatureIndex {
     }
 
     pub fn is_effective_valid_guard_signature(&self, signature_id: &LuaSignatureId) -> bool {
-        crate::db_index::read_set::record_signature(signature_id);
+        derivation::note_read(|| FactKey::ValidGuard(*signature_id));
         self.effective_valid_guard_signatures
             .contains_key(signature_id)
     }
@@ -367,57 +276,38 @@ impl LuaSignatureIndex {
         &self,
         signature_id: &LuaSignatureId,
     ) -> Option<GmodStateMask> {
-        crate::db_index::read_set::record_signature(signature_id);
+        derivation::note_read(|| FactKey::ValidGuard(*signature_id));
         self.effective_valid_guard_signatures
             .get(signature_id)
             .copied()
     }
 
-    pub(crate) fn valid_guard_global_contributions(
-        &self,
-    ) -> Option<&[(LuaSignatureId, GmodStateMask)]> {
-        self.valid_guard_global_contributions.as_deref()
-    }
-
-    pub(crate) fn valid_guard_global_dirty(&self) -> bool {
-        self.valid_guard_global_dirty
-    }
-
-    pub(crate) fn valid_guard_file_contributions(
-        &self,
-    ) -> &HashMap<FileId, Vec<(LuaSignatureId, GmodStateMask)>> {
-        &self.valid_guard_file_contributions
-    }
-
-    pub(crate) fn take_valid_guard_dirty_files(&mut self) -> HashSet<FileId> {
-        std::mem::take(&mut self.valid_guard_contribution_dirty_files)
-    }
-
-    pub(crate) fn store_valid_guard_global_contributions(
-        &mut self,
-        contributions: Vec<(LuaSignatureId, GmodStateMask)>,
-    ) {
-        self.valid_guard_global_contributions = Some(contributions);
-        self.valid_guard_global_dirty = false;
-    }
-
+    /// Stores one file's valid-guard signatures.
     pub(crate) fn store_valid_guard_file_contributions(
         &mut self,
         file_id: FileId,
         contributions: Vec<(LuaSignatureId, GmodStateMask)>,
     ) {
-        self.valid_guard_file_contributions
-            .insert(file_id, contributions);
-        self.valid_guard_contribution_dirty_files.remove(&file_id);
+        derivation::note_write(|| FactKey::ValidGuardFile(file_id));
+        if self
+            .valid_guard_file_contributions
+            .insert(file_id, contributions)
+            .is_none()
+        {
+            derivation::note_write(|| FactKey::ValidGuardFiles);
+        }
     }
 
-    /// Drops one file's contributions explicitly and marks the global part
-    /// dirty: member removal can change the global member-identity masks, and
-    /// decl removal can drop a global identity altogether.
+    /// Drops one file's valid-guard signatures.
     pub(crate) fn remove_valid_guard_file_contributions(&mut self, file_id: FileId) {
-        self.valid_guard_file_contributions.remove(&file_id);
-        self.valid_guard_contribution_dirty_files.remove(&file_id);
-        self.valid_guard_global_dirty = true;
+        if self
+            .valid_guard_file_contributions
+            .remove(&file_id)
+            .is_some()
+        {
+            derivation::note_write(|| FactKey::ValidGuardFile(file_id));
+            derivation::note_write(|| FactKey::ValidGuardFiles);
+        }
     }
 
     /// Re-derives the effective set as the union of the stored contributions.
@@ -433,22 +323,30 @@ impl LuaSignatureIndex {
                 .and_modify(|existing| existing.insert(state_mask))
                 .or_insert(state_mask);
         };
-        if let Some(global) = self.valid_guard_global_contributions.clone() {
-            for (signature_id, state_mask) in global {
-                union(&mut effective, signature_id, state_mask);
+        derivation::note_read(|| FactKey::ValidGuardFiles);
+        for (file_id, contributions) in &self.valid_guard_file_contributions {
+            derivation::note_read(|| FactKey::ValidGuardFile(*file_id));
+            for (signature_id, state_mask) in contributions {
+                union(&mut effective, *signature_id, *state_mask);
             }
         }
-        for (signature_id, state_mask) in self.valid_guard_file_contributions.values().flatten() {
-            union(&mut effective, *signature_id, *state_mask);
+        if derivation::recording() {
+            for (signature_id, mask) in &effective {
+                if self.effective_valid_guard_signatures.get(signature_id) != Some(mask) {
+                    derivation::note_write(|| FactKey::ValidGuard(*signature_id));
+                }
+            }
+            for signature_id in self.effective_valid_guard_signatures.keys() {
+                if !effective.contains_key(signature_id) {
+                    derivation::note_write(|| FactKey::ValidGuard(*signature_id));
+                }
+            }
         }
         self.effective_valid_guard_signatures = effective;
     }
 
     pub(crate) fn clear_valid_guard_contributions(&mut self) {
         self.valid_guard_file_contributions.clear();
-        self.valid_guard_global_contributions = None;
-        self.valid_guard_contribution_dirty_files.clear();
-        self.valid_guard_global_dirty = false;
     }
 
     pub fn set_inferred_positive_guard(
@@ -459,6 +357,7 @@ impl LuaSignatureIndex {
         if self.inferred_positive_guards.get(&signature_id) != Some(&guard) {
             self.inferred_positive_guards_changed = true;
         }
+        derivation::note_write(|| FactKey::InferredGuard(signature_id));
         self.inferred_positive_guards.insert(signature_id, guard);
     }
 
@@ -471,6 +370,7 @@ impl LuaSignatureIndex {
         if self.inferred_guard_facts.get(&owner) != Some(&guard) {
             self.inferred_positive_guards_changed = true;
         }
+        derivation::note_write(|| FactKey::InferredGuard(signature_id));
         self.inferred_positive_guards
             .insert(signature_id, guard.clone());
         self.inferred_guard_owners
@@ -482,11 +382,30 @@ impl LuaSignatureIndex {
             .insert(owner);
     }
 
+    /// Drops the inferred guard a derivation published for `signature_id`,
+    /// before that derivation runs again.
+    pub(crate) fn reset_inferred_guard(&mut self, signature_id: &LuaSignatureId) {
+        if self.inferred_positive_guards.remove(signature_id).is_some() {
+            self.inferred_positive_guards_changed = true;
+        }
+        let Some(owner) = self.inferred_guard_owners.remove(signature_id) else {
+            return;
+        };
+        self.inferred_guard_facts.remove(&owner);
+        let file_id = owner.source_file_id();
+        if let Some(owners) = self.inferred_guard_owners_by_file.get_mut(&file_id) {
+            owners.remove(&owner);
+            if owners.is_empty() {
+                self.inferred_guard_owners_by_file.remove(&file_id);
+            }
+        }
+    }
+
     pub fn inferred_positive_guard(
         &self,
         signature_id: &LuaSignatureId,
     ) -> Option<&LuaInferredPositiveGuard> {
-        crate::db_index::read_set::record_signature(signature_id);
+        derivation::note_read(|| FactKey::InferredGuard(*signature_id));
         self.inferred_positive_guards.get(signature_id)
     }
 
@@ -494,7 +413,7 @@ impl LuaSignatureIndex {
         &self,
         signature_id: &LuaSignatureId,
     ) -> Option<&LuaInferredGuardOwner> {
-        crate::db_index::read_set::record_signature(signature_id);
+        derivation::note_read(|| FactKey::InferredGuard(*signature_id));
         self.inferred_guard_owners.get(signature_id)
     }
 
@@ -593,24 +512,6 @@ impl LuaSignatureIndex {
         }
     }
 
-    pub(crate) fn set_inferred_return_dependencies(
-        &mut self,
-        signature_id: LuaSignatureId,
-        source_file_ids: HashSet<FileId>,
-    ) {
-        self.clear_inferred_return_dependencies(signature_id);
-        for source_file_id in &source_file_ids {
-            self.inferred_return_consumers
-                .entry(*source_file_id)
-                .or_default()
-                .insert(signature_id);
-        }
-        if !source_file_ids.is_empty() {
-            self.inferred_return_dependencies
-                .insert(signature_id, source_file_ids);
-        }
-    }
-
     fn clear_inferred_return_dependencies(&mut self, signature_id: LuaSignatureId) {
         let Some(source_file_ids) = self.inferred_return_dependencies.remove(&signature_id) else {
             return;
@@ -623,124 +524,6 @@ impl LuaSignatureIndex {
                 }
             }
         }
-    }
-
-    pub(crate) fn inferred_return_dependents_for_files(
-        &self,
-        source_file_ids: &HashSet<FileId>,
-    ) -> HashSet<FileId> {
-        source_file_ids
-            .iter()
-            .filter_map(|file_id| self.inferred_return_consumers.get(file_id))
-            .flatten()
-            .map(LuaSignatureId::get_file_id)
-            .collect()
-    }
-
-    pub(crate) fn set_settled_reads(
-        &mut self,
-        file_id: FileId,
-        reads: impl IntoIterator<Item = LuaSignatureId>,
-    ) {
-        self.clear_settled_reads(file_id);
-        let reads = reads
-            .into_iter()
-            .filter(|signature_id| signature_id.get_file_id() != file_id)
-            .collect::<HashSet<_>>();
-        for signature_id in &reads {
-            self.settled_read_dependents
-                .entry(*signature_id)
-                .or_default()
-                .insert(file_id);
-        }
-        if !reads.is_empty() {
-            self.settled_reads_by_file.insert(file_id, reads);
-        }
-    }
-
-    fn clear_settled_reads(&mut self, file_id: FileId) {
-        let Some(reads) = self.settled_reads_by_file.remove(&file_id) else {
-            return;
-        };
-        for signature_id in reads {
-            if let Some(dependents) = self.settled_read_dependents.get_mut(&signature_id) {
-                dependents.remove(&file_id);
-                if dependents.is_empty() {
-                    self.settled_read_dependents.remove(&signature_id);
-                }
-            }
-        }
-    }
-
-    pub(crate) fn settled_read_dependents_for_signatures(
-        &self,
-        signature_ids: &[LuaSignatureId],
-    ) -> HashSet<FileId> {
-        signature_ids
-            .iter()
-            .filter_map(|signature_id| self.settled_read_dependents.get(signature_id))
-            .flatten()
-            .copied()
-            .collect()
-    }
-
-    pub(crate) fn settled_read_dependents_for_files(
-        &self,
-        file_ids: &HashSet<FileId>,
-    ) -> HashSet<FileId> {
-        self.settled_read_dependents
-            .iter()
-            .filter(|(signature_id, _)| file_ids.contains(&signature_id.get_file_id()))
-            .flat_map(|(_, dependents)| dependents.iter().copied())
-            .collect()
-    }
-
-    pub(crate) fn remap_settled_reads(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
-        let old_ids = self
-            .settled_read_dependents
-            .keys()
-            .filter(|signature_id| signature_id.get_file_id() == remap.file_id)
-            .copied()
-            .collect::<Vec<_>>();
-        let mut dirty = HashSet::default();
-        let mut updates = Vec::new();
-        for old_id in old_ids {
-            let new_id = match remap.signature_id(old_id) {
-                crate::Remap::Moved(new_id) if new_id != old_id => Some(new_id),
-                crate::Remap::Moved(_) | crate::Remap::Unrelated => continue,
-                crate::Remap::Lost => None,
-            };
-            let dependents = self
-                .settled_read_dependents
-                .get(&old_id)
-                .cloned()
-                .unwrap_or_default();
-            if new_id.is_none() {
-                dirty.extend(dependents.iter().copied());
-            }
-            updates.push((old_id, new_id, dependents));
-        }
-
-        for (old_id, _, _) in &updates {
-            self.settled_read_dependents.remove(old_id);
-        }
-        for (old_id, new_id, dependents) in updates {
-            for dependent in &dependents {
-                if let Some(reads) = self.settled_reads_by_file.get_mut(dependent) {
-                    reads.remove(&old_id);
-                    if let Some(new_id) = new_id {
-                        reads.insert(new_id);
-                    }
-                }
-            }
-            if let Some(new_id) = new_id {
-                self.settled_read_dependents
-                    .entry(new_id)
-                    .or_default()
-                    .extend(dependents);
-            }
-        }
-        dirty
     }
 
     /// Indexed per-holder payload population shared by snapshot and remap.
@@ -895,6 +678,8 @@ impl LuaSignatureIndex {
             let mut holder_lost = false;
             let (signature_ids, fact_owners) = self.holder_payload_keys(holder);
             for signature_id in signature_ids {
+                derivation::note_write(|| FactKey::Signature(signature_id));
+                derivation::note_write(|| FactKey::InferredGuard(signature_id));
                 if let Some(signature) = self.signatures.get_mut(&signature_id) {
                     let outcome = signature.remap_payload_types(remap);
                     if outcome.lost {
@@ -953,10 +738,17 @@ impl LuaSignatureIndex {
                 }
             }
         }
+        let retain = |signature_id: &LuaSignatureId| {
+            let keep = signature_id.get_file_id() != file_id;
+            if !keep {
+                derivation::note_write(|| FactKey::InferredGuard(*signature_id));
+            }
+            keep
+        };
         self.inferred_positive_guards
-            .retain(|signature_id, _| signature_id.get_file_id() != file_id);
+            .retain(|signature_id, _| retain(signature_id));
         self.inferred_guard_owners
-            .retain(|signature_id, _| signature_id.get_file_id() != file_id);
+            .retain(|signature_id, _| retain(signature_id));
         self.inferred_positive_guards_changed |= changed;
     }
 
@@ -965,20 +757,6 @@ impl LuaSignatureIndex {
     }
 
     pub fn add_receiver_out_param_member_name(&mut self, file_id: FileId, member_name: String) {
-        if op_log::recording() {
-            let member_name2 = member_name.clone();
-            op_log::push(
-                op_log::Domain::Signature,
-                Box::new([
-                    WriteKey::FileScoped(file_id),
-                    WriteKey::GmodMeta(member_name.clone().into()),
-                ]),
-                move |db| {
-                    db.get_signature_index_mut()
-                        .add_receiver_out_param_member_name(file_id, member_name2)
-                },
-            );
-        }
         if !self
             .in_file_receiver_out_param_member_names
             .entry(file_id)
@@ -988,33 +766,85 @@ impl LuaSignatureIndex {
             return;
         }
 
+        derivation::note_write(|| FactKey::ReceiverOutParam(member_name.as_str().into()));
         *self
             .receiver_out_param_member_names
             .entry(member_name)
             .or_default() += 1;
-        self.note_gmod_meta_write();
-        self.file_write_epochs.note(file_id);
     }
 
     pub fn has_receiver_out_param_member_name(&self, member_name: &str) -> bool {
-        crate::db_index::read_set::record_gmod_meta(&member_name.into());
+        derivation::note_read(|| FactKey::ReceiverOutParam(member_name.into()));
         self.receiver_out_param_member_names
             .contains_key(member_name)
     }
 
     pub fn receiver_out_param_member_names(&self) -> impl Iterator<Item = &str> {
-        op_log::note_untracked_read(op_log::UntrackedDomain::SignatureAux);
         self.receiver_out_param_member_names
             .keys()
             .map(String::as_str)
     }
 
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        match key {
+            FactKey::Signature(signature_id) => {
+                let signature = self.signatures.get(signature_id);
+                let local_func_decl = self.local_func_decls.get(signature_id);
+                if signature.is_none() && local_func_decl.is_none() {
+                    return derivation::ABSENT;
+                }
+                derivation::fingerprint_of(&(signature, local_func_decl))
+            }
+            FactKey::ValidGuardFile(file_id) => {
+                derivation::fingerprint_opt(self.valid_guard_file_contributions.get(file_id))
+            }
+            FactKey::ValidGuardFiles => {
+                let mut file_ids = self
+                    .valid_guard_file_contributions
+                    .keys()
+                    .collect::<Vec<_>>();
+                file_ids.sort_unstable();
+                derivation::fingerprint_of(&file_ids)
+            }
+            FactKey::ValidGuard(signature_id) => {
+                derivation::fingerprint_opt(self.effective_valid_guard_signatures.get(signature_id))
+            }
+            FactKey::InferredGuard(signature_id) => {
+                let positive_guard = self.inferred_positive_guards.get(signature_id);
+                let guard_owner = self.inferred_guard_owners.get(signature_id);
+                if positive_guard.is_none() && guard_owner.is_none() {
+                    return derivation::ABSENT;
+                }
+                derivation::fingerprint_of(&(positive_guard, guard_owner))
+            }
+            FactKey::SignatureFile(file_id) => {
+                self.in_file_signatures
+                    .get(file_id)
+                    .map_or(derivation::ABSENT, |ids| {
+                        let mut ids: Vec<_> = ids.iter().collect();
+                        ids.sort_unstable_by_key(|id| u32::from(id.get_position()));
+                        derivation::fingerprint_of(&ids)
+                    })
+            }
+            FactKey::ReceiverOutParam(member_name) => {
+                if self
+                    .receiver_out_param_member_names
+                    .contains_key(member_name.as_str())
+                {
+                    derivation::fingerprint_of(&true)
+                } else {
+                    derivation::ABSENT
+                }
+            }
+            _ => {
+                debug_assert!(false, "{key:?} is not a signature fact");
+                derivation::ABSENT
+            }
+        }
+    }
+
     pub fn get_file_signature_ids(&self, file_id: FileId) -> Option<&HashSet<LuaSignatureId>> {
-        crate::db_index::read_set::record_file_scoped(
-            &self.file_write_epochs,
-            &file_id,
-            crate::db_index::read_set::FileScopedKind::SignatureFile,
-        );
+        derivation::note_read(|| FactKey::SignatureFile(file_id));
         self.in_file_signatures.get(&file_id)
     }
 }
@@ -1024,12 +854,13 @@ impl LuaIndex for LuaSignatureIndex {
         // Drop only the removed file's holder edges. Reverse edges where it is
         // the referenced source stay so a later remap can still report loss.
         self.drop_payload_holder_edges(file_id);
-        self.clear_settled_reads(file_id);
         self.clear_inferred_guard_dependencies(file_id);
         if let Some(signature_ids) = self.in_file_signatures.remove(&file_id) {
-            self.file_write_epochs.note(file_id);
+            derivation::note_write(|| FactKey::SignatureFile(file_id));
             for signature_id in signature_ids {
+                derivation::note_write(|| FactKey::Signature(signature_id));
                 self.clear_inferred_return_dependencies(signature_id);
+                self.source_signatures.remove(&signature_id);
                 if self.signatures.remove(&signature_id).is_some() {
                     self.note_return_write(signature_id);
                     self.note_param_write(signature_id);
@@ -1052,13 +883,14 @@ impl LuaIndex for LuaSignatureIndex {
             .in_file_receiver_out_param_member_names
             .remove(&file_id)
         {
-            self.file_write_epochs.note(file_id);
             for member_name in member_names {
                 match self.receiver_out_param_member_names.get_mut(&member_name) {
                     Some(count) if *count > 1 => *count -= 1,
                     Some(_) => {
+                        derivation::note_write(|| {
+                            FactKey::ReceiverOutParam(member_name.as_str().into())
+                        });
                         self.receiver_out_param_member_names.remove(&member_name);
-                        self.note_gmod_meta_write();
                     }
                     None => {}
                 }
@@ -1081,19 +913,31 @@ impl LuaIndex for LuaSignatureIndex {
     }
 
     fn clear(&mut self) {
-        for file_id in self
-            .in_file_signatures
-            .keys()
-            .chain(self.in_file_receiver_out_param_member_names.keys())
-        {
-            self.file_write_epochs.note(*file_id);
+        if derivation::recording() {
+            for file_id in self.in_file_signatures.keys() {
+                derivation::note_write(|| FactKey::SignatureFile(*file_id));
+            }
+            for signature_id in self.signatures.keys().chain(self.local_func_decls.keys()) {
+                derivation::note_write(|| FactKey::Signature(*signature_id));
+            }
+            for signature_id in self.effective_valid_guard_signatures.keys() {
+                derivation::note_write(|| FactKey::ValidGuard(*signature_id));
+            }
+            for signature_id in self
+                .inferred_positive_guards
+                .keys()
+                .chain(self.inferred_guard_owners.keys())
+            {
+                derivation::note_write(|| FactKey::InferredGuard(*signature_id));
+            }
+            for member_name in self.receiver_out_param_member_names.keys() {
+                derivation::note_write(|| FactKey::ReceiverOutParam(member_name.as_str().into()));
+            }
         }
-        self.note_gmod_meta_write();
         self.signatures.clear();
+        self.source_signatures.clear();
         self.in_file_signatures.clear();
         self.local_func_decls.clear();
-        self.return_write_versions.clear();
-        self.param_write_versions.clear();
         self.effective_valid_guard_signatures.clear();
         self.clear_valid_guard_contributions();
         self.inferred_positive_guards.clear();
@@ -1104,8 +948,6 @@ impl LuaIndex for LuaSignatureIndex {
         self.inferred_guard_dependencies.clear();
         self.inferred_return_dependencies.clear();
         self.inferred_return_consumers.clear();
-        self.settled_reads_by_file.clear();
-        self.settled_read_dependents.clear();
         self.payload_sources_by_holder.clear();
         self.payload_holders_by_source.clear();
         self.inferred_positive_guards_changed = false;
@@ -1403,32 +1245,5 @@ mod tests {
         index.clear();
         assert!(index.payload_sources_by_holder.is_empty());
         assert!(index.payload_holders_by_source.is_empty());
-    }
-
-    #[test]
-    fn param_write_versions_start_at_zero_and_bump_per_signature() {
-        let source_file_id = FileId::new(1);
-        let signature_id = LuaSignatureId::new(source_file_id, 0.into());
-        let other_id = LuaSignatureId::new(source_file_id, 40.into());
-        let mut index = LuaSignatureIndex::new();
-
-        assert_eq!(index.param_writes(), 0);
-        assert_eq!(index.param_write_version(&signature_id), 0);
-
-        index.note_param_write(signature_id);
-        assert_eq!(index.param_writes(), 1);
-        assert_eq!(index.param_write_version(&signature_id), 1);
-        assert_eq!(index.param_write_version(&other_id), 0);
-    }
-
-    #[test]
-    fn removing_signature_bumps_its_param_version() {
-        let source_file_id = FileId::new(1);
-        let signature_id = LuaSignatureId::new(source_file_id, 0.into());
-        let mut index = LuaSignatureIndex::new();
-        index.get_or_create(signature_id);
-
-        index.remove(source_file_id);
-        assert_eq!(index.param_write_version(&signature_id), 1);
     }
 }

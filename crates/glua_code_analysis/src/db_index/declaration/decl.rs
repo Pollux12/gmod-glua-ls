@@ -1,4 +1,7 @@
+use std::hash::{Hash, Hasher};
+
 use crate::FileId;
+use crate::db_index::derivation::FilePosition;
 use crate::{LuaMemberId, LuaSignatureId};
 use glua_parser::{LuaKind, LuaSyntaxId, LuaSyntaxKind};
 use rowan::{TextRange, TextSize};
@@ -6,7 +9,7 @@ use smol_str::SmolStr;
 
 use super::decl_id::LuaDeclId;
 
-#[derive(Eq, PartialEq, Hash, Debug, Clone)]
+#[derive(Eq, PartialEq, Debug, Clone)]
 pub struct LuaDecl {
     name: SmolStr,
     file_id: FileId,
@@ -14,6 +17,24 @@ pub struct LuaDecl {
     expr_id: Option<LuaSyntaxId>,
     initializer: Option<LuaDeclInitializer>,
     pub extra: LuaDeclExtra,
+}
+
+impl Hash for LuaDecl {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.file_id.hash(state);
+        self.range.hash_in_file(self.file_id, state);
+        self.expr_id.is_some().hash(state);
+        if let Some(expr_id) = &self.expr_id {
+            expr_id.hash_in_file(self.file_id, state);
+        }
+        self.initializer.is_some().hash(state);
+        if let Some(initializer) = &self.initializer {
+            initializer.expr_id.hash_in_file(self.file_id, state);
+            initializer.ret_idx.hash(state);
+        }
+        self.extra.hash(state);
+    }
 }
 
 #[derive(Eq, PartialEq, Hash, Debug, Clone, Copy)]

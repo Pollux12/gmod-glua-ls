@@ -15,15 +15,14 @@ use rowan::TextRange;
 use smol_str::SmolStr;
 
 use crate::LuaDocDefaultValue;
-use crate::db_index::op_log;
+use crate::db_index::derivation::{self, FactKey, Fingerprint};
 pub use crate::db_index::property::property::LuaAttributeUse;
-use crate::db_index::read_set::WriteKey;
 use crate::{DbIndex, FileId, LuaDeclId, LuaMember, LuaSignatureId};
 
 use super::{LuaSemanticDeclId, traits::LuaIndex};
 
 /// An inferred string default from a self-coalescing `x = x or "literal"` pattern.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct LuaInferredStringDefault {
     /// The string value (e.g. "DScrollPanel").
     pub value: SmolStr,
@@ -82,9 +81,6 @@ pub struct LuaPropertyIndex {
     /// function).  File ownership is tracked for cleanup on reindex.
     inferred_string_defaults: HashMap<LuaDeclId, Vec<LuaInferredStringDefault>>,
     inferred_string_defaults_file_owners: HashMap<FileId, HashSet<LuaDeclId>>,
-    /// Write epochs for `inferred_string_defaults`, stamped per decl so a
-    /// default landing mid-fixpoint stales only that decl's readers.
-    pub(crate) default_write_epochs: crate::db_index::read_set::KeyedEpochs<LuaDeclId>,
 }
 
 impl Default for LuaPropertyIndex {
@@ -106,7 +102,6 @@ impl LuaPropertyIndex {
             file_merge_order: HashMap::default(),
             inferred_string_defaults: HashMap::default(),
             inferred_string_defaults_file_owners: HashMap::default(),
-            default_write_epochs: crate::db_index::read_set::KeyedEpochs::default(),
         }
     }
 
@@ -158,6 +153,7 @@ impl LuaPropertyIndex {
         write: impl FnOnce(&mut LuaCommonProperty),
     ) -> Option<()> {
         let (_, property_id) = self.get_or_create_property(owner_id.clone())?;
+        self.note_property_write(property_id);
 
         self.in_filed_owner
             .entry(file_id)
@@ -222,6 +218,8 @@ impl LuaPropertyIndex {
         file_id: FileId,
     ) -> Option<()> {
         let (_, property_id) = self.get_or_create_property(source_owner_id.clone())?;
+        derivation::note_write(|| FactKey::Property(same_property_owner_id.clone()));
+        self.note_property_write(property_id);
         // Owner aliases are always within one file, so this file owns the property outright
         // unless a doc contribution has already promoted it.
         self.sole_contributor.entry(property_id).or_insert(file_id);
@@ -389,6 +387,7 @@ impl LuaPropertyIndex {
     }
 
     pub fn get_property(&self, owner_id: &LuaSemanticDeclId) -> Option<&LuaCommonProperty> {
+        derivation::note_read(|| FactKey::Property(owner_id.clone()));
         self.property_owners_map
             .get(owner_id)
             .and_then(|id| self.properties.get(id))
@@ -398,6 +397,7 @@ impl LuaPropertyIndex {
         &self,
         owner_id: &LuaSemanticDeclId,
     ) -> Option<crate::LuaSignatureId> {
+        derivation::note_read(|| FactKey::Property(owner_id.clone()));
         let property_id = self.property_owners_map.get(owner_id)?;
         self.signature_owner_by_property.get(property_id).copied()
     }
@@ -475,21 +475,7 @@ impl LuaPropertyIndex {
             value,
             source_range,
         };
-        if op_log::recording() {
-            let entry2 = entry.clone();
-            op_log::push(
-                op_log::Domain::Property,
-                Box::new([WriteKey::DeclMisc(decl_id), WriteKey::FileScoped(file_id)]),
-                move |db| {
-                    db.get_property_index_mut().add_inferred_string_default(
-                        file_id,
-                        decl_id,
-                        entry2.value,
-                        entry2.source_range,
-                    )
-                },
-            );
-        }
+        derivation::note_write(|| FactKey::DeclDefault(decl_id));
         self.inferred_string_defaults
             .entry(decl_id)
             .or_default()
@@ -498,7 +484,14 @@ impl LuaPropertyIndex {
             .entry(file_id)
             .or_default()
             .insert(decl_id);
-        self.default_write_epochs.note(decl_id);
+    }
+
+    /// Drops `decl_id`'s inferred string defaults before the derivations that
+    /// inferred them run again.
+    pub(crate) fn reset_inferred_string_defaults(&mut self, decl_id: &LuaDeclId) {
+        if self.inferred_string_defaults.remove(decl_id).is_some() {
+            derivation::note_write(|| FactKey::DeclDefault(*decl_id));
+        }
     }
 
     /// Get all inferred string default candidates for a declaration.
@@ -506,10 +499,44 @@ impl LuaPropertyIndex {
         &self,
         decl_id: &LuaDeclId,
     ) -> Option<&[LuaInferredStringDefault]> {
-        crate::db_index::read_set::record_decl_default(&self.default_write_epochs, decl_id);
+        derivation::note_read(|| FactKey::DeclDefault(*decl_id));
         self.inferred_string_defaults
             .get(decl_id)
             .map(|v| v.as_slice())
+    }
+
+    /// Notes a write to every owner mapped to `property_id`: aliases share one
+    /// property, so a write through any of them changes what each one reads.
+    fn note_property_write(&self, property_id: LuaPropertyId) {
+        if !derivation::recording() {
+            return;
+        }
+        for (owner_id, id) in &self.property_owners_map {
+            if *id == property_id {
+                derivation::note_write(|| FactKey::Property(owner_id.clone()));
+            }
+        }
+    }
+
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        match key {
+            FactKey::Property(owner_id) => {
+                let Some(property_id) = self.property_owners_map.get(owner_id) else {
+                    return derivation::ABSENT;
+                };
+                derivation::fingerprint_of(&(
+                    self.properties.get(property_id),
+                    self.signature_owner_by_property.get(property_id),
+                ))
+            }
+            FactKey::DeclDefault(decl_id) => {
+                derivation::fingerprint_opt(self.inferred_string_defaults.get(decl_id))
+            }
+            _ => {
+                debug_assert!(false, "{key:?} is not a property fact");
+                derivation::ABSENT
+            }
+        }
     }
 }
 
@@ -520,6 +547,7 @@ impl LuaPropertyIndex {
         let Some(property_id) = self.property_owners_map.get(owner_id).copied() else {
             return;
         };
+        self.note_property_write(property_id);
 
         if let Some(contributions) = self.contributions.get_mut(&property_id) {
             contributions.retain(|key, _| key.file_id != file_id.id);
@@ -571,14 +599,17 @@ impl LuaIndex for LuaPropertyIndex {
         if let Some(decl_ids) = self.inferred_string_defaults_file_owners.remove(&file_id) {
             for decl_id in decl_ids {
                 self.inferred_string_defaults.remove(&decl_id);
-                self.default_write_epochs.note(decl_id);
+                derivation::note_write(|| FactKey::DeclDefault(decl_id));
             }
         }
     }
 
     fn clear(&mut self) {
         for decl_id in self.inferred_string_defaults.keys() {
-            self.default_write_epochs.note(*decl_id);
+            derivation::note_write(|| FactKey::DeclDefault(*decl_id));
+        }
+        for owner_id in self.property_owners_map.keys() {
+            derivation::note_write(|| FactKey::Property(owner_id.clone()));
         }
         self.properties.clear();
         self.property_owners_map.clear();

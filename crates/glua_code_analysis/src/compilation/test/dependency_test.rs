@@ -110,4 +110,26 @@ mod test {
 
         assert!(dependency_index.get_required_files(&source_id).is_none());
     }
+
+    /// A file indexed in the same batch after its includer is still the
+    /// include's target: a cold build must not depend on batch order.
+    #[test]
+    fn test_include_resolves_to_a_file_later_in_the_same_batch() {
+        let mut ws = VirtualWorkspace::new();
+
+        let ids = ws.def_files(vec![
+            (
+                "lua/autorun/includer.lua",
+                r#"include("mixins/included.lua")"#,
+            ),
+            ("lua/mixins/included.lua", "return {}"),
+        ]);
+
+        let dependency_index = ws.get_db_mut().get_file_dependencies_index();
+        assert!(
+            dependency_index
+                .get_required_files(&ids[0])
+                .is_some_and(|files| files.contains(&ids[1]))
+        );
+    }
 }

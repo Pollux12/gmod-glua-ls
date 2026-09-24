@@ -12,18 +12,11 @@ use rowan::TextSize;
 
 use crate::{
     DbIndex, FileId, GlobalId, InFiled, InferFailReason, LuaDeclId, LuaDeclOrMemberId,
-    LuaDeclTypeKind, LuaDocReturnInfo, LuaInferenceConfidence, LuaInferenceEventId,
-    LuaInferenceNodeId, LuaInferenceProvenanceKind, LuaInferenceStep, LuaMember, LuaMemberId,
-    LuaMemberInfo, LuaMemberKey, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner,
-    LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFact, LuaTypeFlag,
-    LuaTypeOwner, OperatorFunction, RenderLevel, ReturnTypeKind, SemanticDeclLevel,
-    SignatureReturnStatus, TypeOps, VariadicType,
+    LuaDeclTypeKind, LuaDocReturnInfo, LuaMember, LuaMemberId, LuaMemberInfo, LuaMemberKey,
+    LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeCache,
+    LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, OperatorFunction, RenderLevel,
+    ReturnTypeKind, SemanticDeclLevel, SignatureReturnStatus, TypeOps, VariadicType,
     compilation::analyzer::{
-        call_site_params::{
-            argument_type_is_usable, collect_deferred_result_consumers,
-            exact_receiver_type_is_usable, infer_supported_call_site_arg_type,
-            snapshot_callback_table_type,
-        },
         common::{
             DeclWrite, TypeCacheWriteMode, add_member, bind_decl_write, bind_resolved_type,
             holds_unbound_iter_template, write_type_cache,
@@ -49,133 +42,10 @@ use crate::{
 };
 
 use super::{
-    CallSiteContributionKind, ResolveResult, UnResolveCallSiteContribution,
-    UnResolveCallSiteReturnConsumers, UnResolveDecl, UnResolveIterVar, UnResolveMember,
-    UnResolveModule, UnResolveReturn, UnResolveTableField,
-    resolve_closure::inferred_return_tail_matching_documented_first,
-    writes::{ResolveWrites, WriteKey},
+    ResolveResult, UnResolveDecl, UnResolveIterVar, UnResolveMember, UnResolveModule,
+    UnResolveReturn, UnResolveTableField,
+    resolve_closure::inferred_return_tail_matching_documented_first, writes::ResolveWrites,
 };
-
-/// Re-derive one call-site parameter contribution whose type was not
-/// buildable when its file was walked, and merge it into that file's
-/// contribution set.
-pub fn try_resolve_call_site_contribution(
-    db: &mut DbIndex,
-    cache: &mut LuaInferCache,
-    contribution: &mut UnResolveCallSiteContribution,
-) -> ResolveResult {
-    let Some(expr) = db
-        .get_vfs()
-        .get_syntax_tree(&contribution.expr_file_id)
-        .map(|tree| tree.get_red_root())
-        .and_then(|root| contribution.expr_syntax_id.to_node_from_root(&root))
-        .and_then(LuaExpr::cast)
-    else {
-        return Err(InferFailReason::None);
-    };
-    let Ok(param_idx) = u16::try_from(contribution.param_idx) else {
-        return Err(InferFailReason::None);
-    };
-
-    let (typ, confidence, provenance_kind, carries_inferred_type) = match contribution.kind {
-        CallSiteContributionKind::ExactReceiver => {
-            let typ = infer_expr(db, cache, expr)?;
-            if !exact_receiver_type_is_usable(&typ) {
-                return Err(InferFailReason::None);
-            }
-            (
-                typ,
-                LuaInferenceConfidence::Anchored,
-                LuaInferenceProvenanceKind::ContextualUnknown,
-                true,
-            )
-        }
-        CallSiteContributionKind::Argument => {
-            let typ =
-                infer_supported_call_site_arg_type(db, cache, contribution.expr_file_id, expr)?;
-            if !db
-                .get_signature_index()
-                .get(&contribution.signature_id)
-                .is_some_and(|signature| {
-                    argument_type_is_usable(signature, contribution.param_idx, &typ)
-                })
-            {
-                return Err(InferFailReason::None);
-            }
-            (
-                typ,
-                LuaInferenceConfidence::Anchored,
-                LuaInferenceProvenanceKind::ContextualUnknown,
-                true,
-            )
-        }
-        CallSiteContributionKind::CallbackTable => {
-            let inferred = infer_expr(db, cache, expr)?;
-            let Some(typ) = snapshot_callback_table_type(db, &inferred) else {
-                return Err(InferFailReason::None);
-            };
-            (
-                typ,
-                LuaInferenceConfidence::Certain,
-                LuaInferenceProvenanceKind::ConcreteValue,
-                false,
-            )
-        }
-    };
-
-    let step = LuaInferenceStep {
-        event: LuaInferenceEventId {
-            node: LuaInferenceNodeId::SignatureParam {
-                signature_id: contribution.signature_id,
-                param_idx,
-            },
-            kind: provenance_kind,
-            source: InFiled::new(contribution.expr_file_id, contribution.expr_syntax_id),
-        },
-        support: Arc::from([]),
-        inferred_type: carries_inferred_type.then(|| Arc::new(typ.clone())),
-        found_type: None,
-    };
-    db.get_call_site_param_index_mut()
-        .queue_deferred_contribution(
-            contribution.file_id,
-            contribution.signature_id,
-            contribution.param_idx,
-            LuaTypeFact::new(typ, confidence, Arc::from([step])),
-        );
-    Ok(())
-}
-
-/// Re-runs the result-consumer collection for a call whose callee signature
-/// was not resolvable when its file was walked, and buffers the consumers on
-/// the index for the next flush.
-///
-/// A still-unresolvable callee stays queued: the record set a warm re-index
-/// would produce is exactly what this retry collects once the signature
-/// resolves, so the item only retires with the collection applied.
-pub fn try_resolve_call_site_return_consumers(
-    db: &mut DbIndex,
-    cache: &mut LuaInferCache,
-    consumers: &mut UnResolveCallSiteReturnConsumers,
-) -> ResolveResult {
-    let Some(call_expr) = db
-        .get_vfs()
-        .get_syntax_tree(&consumers.file_id)
-        .map(|tree| tree.get_red_root())
-        .and_then(|root| consumers.call_syntax_id.to_node_from_root(&root))
-        .and_then(LuaCallExpr::cast)
-    else {
-        return Err(InferFailReason::None);
-    };
-    let Some(collected) =
-        collect_deferred_result_consumers(db, cache, consumers.file_id, &call_expr)
-    else {
-        return Err(InferFailReason::None);
-    };
-    db.get_call_site_param_index_mut()
-        .queue_deferred_return_consumers(consumers.file_id, collected);
-    Ok(())
-}
 
 pub fn try_resolve_decl(
     db: &DbIndex,
@@ -238,12 +108,9 @@ pub fn try_resolve_decl(
             &expr,
         ),
     };
-    writes.push(
-        WriteKey::TypeOwner(LuaTypeOwner::Decl(decl_id)),
-        move |db, _| {
-            bind_decl_write(db, decl_id, LuaTypeCache::InferType(expr_type), write);
-        },
-    );
+    writes.push(move |db, _| {
+        bind_decl_write(db, decl_id, LuaTypeCache::InferType(expr_type), write);
+    });
     Ok(())
 }
 
@@ -385,16 +252,9 @@ pub fn try_resolve_member(
     cache: &mut LuaInferCache,
     unresolve_member: &mut UnResolveMember,
 ) -> ResolveResult {
-    // The member's pre-write home, read once for the deferred writes that
-    // need it below: re-homing stamps the old owner's move epoch, and the
-    // assignment mark lands on whichever owner the member lives on. The read
-    // must precede the create+home push — after it, this same slot read
-    // would count as reading the attempt's own write.
-    let existing_owner = db
-        .get_member_index()
-        .get_member_owner(&unresolve_member.member_id)
-        .cloned();
-    let mut mark_owners: Vec<LuaMemberOwner> = Vec::new();
+    // Registers the member's derivation read before any deferred write.
+    db.get_member_index()
+        .get_member_owner(&unresolve_member.member_id);
     if let Some(prefix_expr) = &unresolve_member.prefix {
         let prefix_type = infer_expr(db, cache, prefix_expr.clone())?;
         let member_id = unresolve_member.member_id;
@@ -464,7 +324,7 @@ pub fn try_resolve_member(
                         return Err(InferFailReason::FieldNotFound);
                     }
                     let alias_owner = LuaMemberOwner::Type(type_decl_id);
-                    writes.push(WriteKey::MemberOwner(alias_owner.clone()), move |db, _| {
+                    writes.push(move |db, _| {
                         let _ = db
                             .get_member_index_mut()
                             .add_member_alias_to_owner(alias_owner, member_id);
@@ -488,21 +348,13 @@ pub fn try_resolve_member(
                 }
                 _ => None,
             };
-            // The member's pre-write home is recorded for the intra-item
-            // ordering check: re-homing it stamps the old owner's move epoch,
-            // which is a member-map write to that owner.
-            let mut owner_keys = vec![member_owner.clone()];
-            if let Some(existing) = &existing_owner {
-                owner_keys.push(existing.clone());
-            }
-            mark_owners = owner_keys.clone();
             // The whole gate + create + home block replays verbatim when the
             // write lands: `get_member` is re-asked against the live index,
             // so a member another write created in between is skipped exactly
             // as the serial attempt would skip it, and the member-key
             // inference inside `create_deferred_index_expr_member` reads the
             // state it would have read inline.
-            writes.push_multi(owner_keys.into_iter().map(WriteKey::MemberOwner), {
+            writes.push({
                 let prefix_type = prefix_type.clone();
                 move |db, infer_manager| {
                     // The Lua pass creates a missing member before it looks at
@@ -592,29 +444,16 @@ pub fn try_resolve_member(
 
         let member_id = unresolve_member.member_id;
         let type_owner: crate::LuaTypeOwner = member_id.into();
-        writes.push(WriteKey::TypeOwner(type_owner.clone()), move |db, _| {
+        writes.push(move |db, _| {
             bind_resolved_type(
                 db,
                 type_owner.clone(),
                 LuaTypeCache::InferType(expr_type.clone()),
             );
         });
-        // The mark lands on whatever owner the member lives on when it
-        // applies: the pre-write home if the create+home write did not move
-        // it, the new owner if it did. Both were read before that push, so
-        // this covers the landing site without reading a slot the attempt
-        // already queued a write to.
-        if mark_owners.is_empty()
-            && let Some(existing_owner) = &existing_owner
-        {
-            mark_owners.push(existing_owner.clone());
-        }
-        writes.push_multi(
-            mark_owners.into_iter().map(WriteKey::MemberOwner),
-            move |db, _| {
-                crate::compilation::analyzer::lua::mark_resolved_member_assignment(db, member_id);
-            },
-        );
+        writes.push(move |db, _| {
+            crate::compilation::analyzer::lua::mark_resolved_member_assignment(db, member_id);
+        });
     }
 
     Ok(())
@@ -810,7 +649,7 @@ pub fn try_resolve_return_point(
     }
 
     let (return_correlations, return_docs) =
-        derive_inferred_return_with_reads(db, cache, return_.signature_id, &return_.return_points);
+        derive_inferred_return_with_reads(db, cache, &return_.return_points);
     let return_docs = return_docs?;
 
     let inferred_return = return_docs_to_type(&return_docs);
@@ -842,7 +681,7 @@ pub fn try_resolve_return_point(
     // The mutation reads the slot's live `resolve_return`/`return_docs` when
     // it lands, so the deferred closure replays the whole decision verbatim —
     // the same state the serial attempt would have mutated in place.
-    writes.push_multi([WriteKey::Signature(signature_id)], move |db, _| {
+    writes.push(move |db, _| {
         let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id) else {
             return;
         };
@@ -971,23 +810,6 @@ fn return_docs_to_type(return_docs: &[LuaDocReturnInfo]) -> LuaType {
     }
 }
 
-/// [`try_resolve_iter_var`] for the settled re-derivation, minus the writes.
-///
-/// The answer is taken against the complete member map, so it replaces whatever
-/// partial one a wave left behind rather than only widening it. The pass runs on
-/// parallel workers against an immutable index and applies the updates it
-/// returns in file order afterwards, so each one pairs a variable's resolved
-/// type with the write-mode decision it earned.
-pub fn resolve_settled_iter_var_readonly(
-    db: &DbIndex,
-    cache: &mut LuaInferCache,
-    file_id: FileId,
-    iter_exprs: &[LuaExpr],
-    var_positions: &[TextSize],
-) -> Result<Vec<IterVarTypeUpdate>, InferFailReason> {
-    compute_iter_var_updates(db, cache, file_id, iter_exprs, var_positions, true)
-}
-
 pub fn try_resolve_iter_var(
     db: &DbIndex,
     writes: &mut ResolveWrites,
@@ -1038,7 +860,7 @@ pub(super) fn try_resolve_iter_var_updates(
             }
         };
     for update in updates {
-        writes.push(WriteKey::TypeOwner(update.owner.clone()), move |db, _| {
+        writes.push(move |db, _| {
             write_type_cache(db, update.owner, update.cache, update.mode);
         });
     }
@@ -2144,7 +1966,6 @@ fn collect_signature_special_call_params(
     signature: &LuaSignature,
     signature_id: LuaSignatureId,
 ) -> Vec<SpecialCallParamInfo> {
-    crate::db_index::read_set::record_param(&signature_id);
     let mut param_infos = Vec::new();
     for (idx, param_info) in &signature.param_docs {
         let is_constructor = param_info.get_attribute_by_name("constructor").is_some();
@@ -2691,7 +2512,7 @@ fn materialize_str_tpl_class_from_call(
 
     let super_type = LuaType::Ref(constraint);
     let source_range = arg_expr.get_range();
-    if db.get_type_index_mut().add_super_type_if_missing(
+    if db.get_type_index_mut().add_super_type(
         class_decl_id.clone(),
         file_id,
         source_range,
@@ -2727,7 +2548,6 @@ fn try_resolve_constructor_param(
             .get_signature_index()
             .get(&signature_id)
             .ok_or(InferFailReason::None)?;
-        crate::db_index::read_set::record_param(&signature_id);
         let param_doc = signature
             .get_param_info_by_id(param_info.param_idx)
             .ok_or(InferFailReason::None)?;
@@ -2798,7 +2618,7 @@ fn try_resolve_constructor_param(
             .map(|arg| arg.get_range())
             .unwrap_or_else(|| call_expr.get_range());
             let root_type = LuaType::Ref(root_type_id.clone());
-            if db.get_type_index_mut().add_super_type_if_missing(
+            if db.get_type_index_mut().add_super_type(
                 target_id.clone(),
                 file_id,
                 source_range,
@@ -3317,153 +3137,6 @@ mod tests {
             alpha_first_selected.get_prefix(),
             beta_first_selected.get_prefix(),
             "string template selection should be independent of union member order"
-        );
-    }
-
-    fn never_return_doc() -> crate::LuaDocReturnInfo {
-        crate::LuaDocReturnInfo {
-            name: None,
-            type_ref: LuaType::Never,
-            default_value: None,
-            description: None,
-            attributes: None,
-            return_kind: crate::ReturnTypeKind::default(),
-        }
-    }
-
-    fn stale_correlation() -> crate::LuaReturnCorrelation {
-        crate::LuaReturnCorrelation {
-            discriminant_slot: 0,
-            implied_non_nil_slots: vec![1],
-        }
-    }
-
-    #[test]
-    fn return_write_version_advances_on_correlation_only_change() {
-        use crate::{LuaInferCache, LuaSignatureId, SignatureReturnStatus};
-        use rowan::TextSize;
-
-        let file_id = FileId::new(77);
-        let signature_id = LuaSignatureId::new(file_id, TextSize::new(0));
-        let mut db = make_db();
-        {
-            let signature = db.get_signature_index_mut().get_or_create(signature_id);
-            signature.resolve_return = SignatureReturnStatus::UnResolve;
-            signature.return_docs = vec![never_return_doc()];
-            signature.set_return_correlations(vec![stale_correlation()]);
-        }
-        let before = db.get_signature_index().return_write_version(&signature_id);
-
-        let mut cache = LuaInferCache::new(file_id, Default::default());
-        let mut unresolve = super::UnResolveReturn {
-            file_id,
-            signature_id,
-            body: None,
-            return_points: Vec::new(),
-        };
-        let mut writes = crate::compilation::analyzer::unresolve::writes::ResolveWrites::new();
-        let result = super::try_resolve_return_point(&db, &mut writes, &mut cache, &mut unresolve);
-        writes.apply(
-            &mut db,
-            &mut crate::compilation::analyzer::infer_cache_manager::InferCacheManager::new(),
-        );
-        result.expect("empty return points resolve to never");
-
-        let after = db.get_signature_index().return_write_version(&signature_id);
-        assert!(
-            after > before,
-            "correlation-only change must advance return_write_version"
-        );
-        assert!(
-            db.get_signature_index()
-                .get(&signature_id)
-                .expect("signature")
-                .return_correlations()
-                .is_empty(),
-            "stale correlation must be replaced by the re-derived empty set"
-        );
-    }
-
-    #[test]
-    fn return_write_version_stays_on_same_correlation_noop() {
-        use crate::{LuaInferCache, LuaSignatureId, SignatureReturnStatus};
-        use rowan::TextSize;
-
-        let file_id = FileId::new(78);
-        let signature_id = LuaSignatureId::new(file_id, TextSize::new(0));
-        let mut db = make_db();
-        {
-            let signature = db.get_signature_index_mut().get_or_create(signature_id);
-            signature.resolve_return = SignatureReturnStatus::UnResolve;
-            signature.return_docs = vec![never_return_doc()];
-            signature.set_return_correlations(Vec::new());
-        }
-        let before = db.get_signature_index().return_write_version(&signature_id);
-
-        let mut cache = LuaInferCache::new(file_id, Default::default());
-        let mut unresolve = super::UnResolveReturn {
-            file_id,
-            signature_id,
-            body: None,
-            return_points: Vec::new(),
-        };
-        let mut writes = crate::compilation::analyzer::unresolve::writes::ResolveWrites::new();
-        let result = super::try_resolve_return_point(&db, &mut writes, &mut cache, &mut unresolve);
-        writes.apply(
-            &mut db,
-            &mut crate::compilation::analyzer::infer_cache_manager::InferCacheManager::new(),
-        );
-        result.expect("empty return points resolve to never");
-
-        let after = db.get_signature_index().return_write_version(&signature_id);
-        assert_eq!(
-            before, after,
-            "identical docs and correlations must not advance return_write_version"
-        );
-    }
-
-    /// Installing a module export bumps its epoch once; re-settling the
-    /// identical export must not bump, or the fixpoint filter degrades to a
-    /// full requeue.
-    #[test]
-    fn resettling_module_export_without_changes_bumps_no_module_epoch() {
-        use glua_parser::{LuaAstNode, LuaExpr, LuaParser, LuaTableExpr, ParserConfig};
-
-        use super::{UnResolveModule, try_resolve_module};
-
-        let mut db = make_db();
-        let file_id = FileId::new(1);
-        db.get_module_index_mut()
-            .add_workspace_root(Path::new("C:/proj").into(), WorkspaceId::MAIN);
-        db.get_module_index_mut()
-            .add_module_by_path(file_id, "C:/proj/mylib.lua");
-
-        let tree = LuaParser::parse("return { value = 1 }", ParserConfig::default());
-        let table_expr = tree
-            .get_chunk_node()
-            .descendants::<LuaTableExpr>()
-            .next()
-            .expect("expected table expression");
-        let mut item = UnResolveModule {
-            file_id,
-            expr: LuaExpr::TableExpr(table_expr),
-        };
-        let mut cache = crate::LuaInferCache::new(file_id, Default::default());
-
-        try_resolve_module(&mut db, &mut cache, &mut item)
-            .expect("expected the novel export install to succeed");
-        assert_eq!(
-            db.get_module_index().module_writes(),
-            1,
-            "the novel export install must bump the module epoch"
-        );
-
-        try_resolve_module(&mut db, &mut cache, &mut item)
-            .expect("expected the identical re-settle to succeed");
-        assert_eq!(
-            db.get_module_index().module_writes(),
-            1,
-            "re-settling an identical export must not bump the module epoch"
         );
     }
 

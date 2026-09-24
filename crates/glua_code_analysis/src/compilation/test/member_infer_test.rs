@@ -4889,7 +4889,7 @@ end
         );
 
         let cold_ty = local_name_type(&mut ws, reader, "cfg");
-        ws.analysis.reindex_files_without_expansion(vec![reader]);
+        ws.analysis.reindex_files(vec![reader]);
         let warm_ty = local_name_type(&mut ws, reader, "cfg");
         assert_that!(
             warm_ty,
@@ -5433,7 +5433,7 @@ SWEP.Attachments = {[1] = {header = "Sight", offset = {800, -500}}}
             "keyText must have a real owner after the cold batch, got {cold_owner:?}"
         );
 
-        ws.analysis.reindex_files_without_expansion(vec![base_file]);
+        ws.analysis.reindex_files(vec![base_file]);
         assert_that!(member_owner(&ws), eq(&cold_owner));
     }
 
@@ -5905,7 +5905,7 @@ end
             "inherited return must contain the settled slot, got {rendered}"
         );
 
-        ws.analysis.reindex_files_without_expansion(vec![base_file]);
+        ws.analysis.reindex_files(vec![base_file]);
         let (filled_after, warm_return) = child_signature(&ws);
         assert_that!(warm_return, eq(&cold_return));
         assert_that!(filled_after, eq(filled_from_slot));

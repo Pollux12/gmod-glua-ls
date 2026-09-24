@@ -1187,7 +1187,7 @@ mod tests {
             .set_member_owner_only(owner.clone(), file_id, member_id)
             .expect("owner-only filing should succeed");
         assert_eq!(index.get_current_owner(&member_id), Some(&owner));
-        assert!(index.is_owner_only_member(&member_id));
+        assert!(index.owner_only_members.contains(&member_id));
         assert!(
             index.get_members(&owner).is_none_or(|members| {
                 !members.iter().any(|member| member.get_id() == member_id)
@@ -1198,7 +1198,7 @@ mod tests {
             .set_member_owner(owner.clone(), file_id, member_id)
             .expect("owner reassignment should succeed");
         index.add_member_to_owner(owner.clone(), member_id);
-        assert!(!index.is_owner_only_member(&member_id));
+        assert!(!index.owner_only_members.contains(&member_id));
         assert_eq!(owner_member_ids(&index, &owner), vec![member_id]);
     }
 

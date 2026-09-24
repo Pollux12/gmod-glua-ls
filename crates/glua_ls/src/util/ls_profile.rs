@@ -307,92 +307,22 @@ pub fn emit_ls_did_change(
 
 // ---------------------------------------------------------------- reindex ---
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum HandoffOutcome {
-    Idle,
-    Released,
-    Timeout,
-}
-
-impl HandoffOutcome {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::Released => "released",
-            Self::Timeout => "timeout",
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum QuietOutcome {
-    Edit,
-    Timer,
-    MaxDeferral,
-}
-
-impl QuietOutcome {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Edit => "edit",
-            Self::Timer => "timer",
-            Self::MaxDeferral => "max_deferral",
-        }
-    }
-}
-
 #[derive(Default)]
-pub struct SelfWriteTimings {
+pub struct WriteTimings {
     pub wait: Duration,
     pub hold: Duration,
 }
 
-#[derive(Default)]
-pub struct RippleWriteTimings {
-    pub wait: Duration,
-    pub hold: Duration,
-}
-
-#[derive(Default)]
-pub struct HandoffTiming {
-    pub wait: Duration,
-    pub outcome: Option<HandoffOutcome>,
-}
-
-#[derive(Default)]
-pub struct QuietTiming {
-    pub wait: Duration,
-    pub outcome: Option<QuietOutcome>,
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn emit_ls_reindex(
-    cycle: u64,
-    debounce: Duration,
-    self_wait: Duration,
-    self_hold: Duration,
-    handoff_wait: Duration,
-    handoff_outcome: HandoffOutcome,
-    quiet_wait: Duration,
-    quiet_outcome: QuietOutcome,
-    ripple_wait: Duration,
-    ripple_hold: Duration,
-) {
+pub fn emit_ls_reindex(cycle: u64, debounce: Duration, write_wait: Duration, write_hold: Duration) {
     if !ls_profile_enabled() {
         return;
     }
     eprintln!(
-        "[profile] ls_reindex cycle={} debounce_ms={} self_write_wait_ms={} self_write_hold_ms={} handoff_wait_ms={} handoff_outcome={} quiet_wait_ms={} quiet_outcome={} ripple_write_wait_ms={} ripple_write_hold_ms={}",
+        "[profile] ls_reindex cycle={} debounce_ms={} write_wait_ms={} write_hold_ms={}",
         cycle,
         ms(debounce),
-        ms(self_wait),
-        ms(self_hold),
-        ms(handoff_wait),
-        handoff_outcome.as_str(),
-        ms(quiet_wait),
-        quiet_outcome.as_str(),
-        ms(ripple_wait),
-        ms(ripple_hold),
+        ms(write_wait),
+        ms(write_hold),
     );
 }
 

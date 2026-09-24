@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 use rustc_hash::FxHashMap as HashMap;
 
 use super::member_id_sort_key;
+use crate::db_index::derivation::{Fingerprint, fingerprint_of, mapping_back};
 use crate::{LuaMemberId, LuaMemberIndexItem, LuaMemberKey};
 
 #[allow(unused)]
@@ -12,7 +13,6 @@ pub struct LuaOwnerMembers {
     // `members` is private and these four mutators are the complete id-set
     // invalidation surface: `add_member`, `get_member_mut`, `iter_mut`, and
     // `remove_member`.
-    revision: u64,
     sorted_ids_cache: OnceLock<Vec<LuaMemberId>>,
     sorted_expr_ids_cache: OnceLock<Vec<LuaMemberId>>,
     /// The subset of `members` keyed by an expression rather than a name.
@@ -21,6 +21,24 @@ pub struct LuaOwnerMembers {
     /// that hand out an item leave keys alone.
     expr_keys: Vec<LuaMemberKey>,
     resolve_state: OwnerMemberStatus,
+    /// Wrapping sum of [`listed_id_fingerprint`] over every listed
+    /// `(key, id)`. `add_member`, `remove_member` and `remove_id` keep it;
+    /// callers of `get_member_mut`/`iter_mut` report their edits through
+    /// `note_id_added`/`note_id_removed`.
+    fingerprint: Fingerprint,
+}
+
+fn listed_id_fingerprint(key: &LuaMemberKey, id: LuaMemberId) -> Fingerprint {
+    fingerprint_of(&(key, id))
+}
+
+fn item_fingerprint(key: &LuaMemberKey, item: &LuaMemberIndexItem) -> Fingerprint {
+    match item {
+        LuaMemberIndexItem::One(id) => listed_id_fingerprint(key, *id),
+        LuaMemberIndexItem::Many(ids) => ids.iter().fold(0, |sum: Fingerprint, id| {
+            sum.wrapping_add(listed_id_fingerprint(key, *id))
+        }),
+    }
 }
 
 #[allow(unused)]
@@ -28,20 +46,75 @@ impl LuaOwnerMembers {
     pub fn new() -> Self {
         Self {
             members: HashMap::default(),
-            revision: 0,
             sorted_ids_cache: OnceLock::new(),
             sorted_expr_ids_cache: OnceLock::new(),
             expr_keys: Vec::new(),
             resolve_state: OwnerMemberStatus::UnResolved,
+            fingerprint: 0,
         }
     }
 
     pub fn add_member(&mut self, key: LuaMemberKey, item: LuaMemberIndexItem) {
         self.invalidate_sorted_member_ids();
-        if key.is_expr() && !self.members.contains_key(&key) {
-            self.expr_keys.push(key.clone());
+        match self.members.get(&key) {
+            Some(old) => {
+                self.fingerprint = self.fingerprint.wrapping_sub(item_fingerprint(&key, old));
+            }
+            None if key.is_expr() => self.expr_keys.push(key.clone()),
+            None => {}
         }
+        self.fingerprint = self.fingerprint.wrapping_add(item_fingerprint(&key, &item));
         self.members.insert(key, item);
+    }
+
+    /// The listed `(key, id)` pairs as an order-independent fingerprint.
+    pub fn fingerprint(&self) -> Fingerprint {
+        if !mapping_back() {
+            return self.fingerprint;
+        }
+        self.members
+            .iter()
+            .fold(0, |sum: Fingerprint, (key, item)| {
+                sum.wrapping_add(item_fingerprint(key, item))
+            })
+    }
+
+    /// Records that `id` was listed under `key` through `get_member_mut`.
+    pub fn note_id_added(&mut self, key: &LuaMemberKey, id: LuaMemberId) {
+        self.fingerprint = self
+            .fingerprint
+            .wrapping_add(listed_id_fingerprint(key, id));
+    }
+
+    /// Records that `id` was unlisted from `key` through `iter_mut`.
+    pub fn note_id_removed(&mut self, key: &LuaMemberKey, id: LuaMemberId) {
+        self.fingerprint = self
+            .fingerprint
+            .wrapping_sub(listed_id_fingerprint(key, id));
+    }
+
+    /// Unlists `id` from the item under `key`, dropping the key once its item
+    /// is empty. Returns whether `id` was listed.
+    pub fn remove_id(&mut self, key: &LuaMemberKey, id: LuaMemberId) -> bool {
+        let many = match self.get_member(key) {
+            Some(LuaMemberIndexItem::One(existing)) if *existing == id => false,
+            Some(LuaMemberIndexItem::Many(ids)) if ids.contains(&id) => true,
+            _ => return false,
+        };
+        let drop_key = match self.get_member_mut(key) {
+            Some(LuaMemberIndexItem::Many(ids)) => {
+                ids.retain(|held| *held != id);
+                ids.is_empty()
+            }
+            _ => true,
+        };
+        if many {
+            self.note_id_removed(key, id);
+        }
+        if drop_key {
+            self.remove_member(key);
+        }
+        true
     }
 
     pub fn expr_keys(&self) -> impl Iterator<Item = &LuaMemberKey> {
@@ -112,7 +185,11 @@ impl LuaOwnerMembers {
         if key.is_expr() {
             self.expr_keys.retain(|expr_key| expr_key != key);
         }
-        self.members.remove(key)
+        let removed = self.members.remove(key);
+        if let Some(item) = &removed {
+            self.fingerprint = self.fingerprint.wrapping_sub(item_fingerprint(key, item));
+        }
+        removed
     }
 
     pub fn is_empty(&self) -> bool {
@@ -131,12 +208,7 @@ impl LuaOwnerMembers {
         matches!(self.resolve_state, OwnerMemberStatus::Resolved)
     }
 
-    pub(crate) fn revision(&self) -> u64 {
-        self.revision
-    }
-
     fn invalidate_sorted_member_ids(&mut self) {
-        self.revision += 1;
         self.sorted_ids_cache = OnceLock::new();
         self.sorted_expr_ids_cache = OnceLock::new();
     }

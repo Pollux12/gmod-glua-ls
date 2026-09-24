@@ -80,6 +80,15 @@ impl PositionMap {
         }
     }
 
+    /// The map from the new text back to the old one.
+    pub fn inverse(&self) -> Self {
+        Self {
+            hunk_start: self.hunk_start,
+            old_hunk_end: self.new_hunk_end,
+            new_hunk_end: self.old_hunk_end,
+        }
+    }
+
     /// Whether every offset maps to itself, so the remap pass can be skipped.
     pub fn is_identity(&self) -> bool {
         self.hunk_start == self.old_hunk_end && self.old_hunk_end == self.new_hunk_end

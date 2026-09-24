@@ -14,10 +14,7 @@ pub use position_map::{FileFacts, FileRemap, PositionMap, Remap};
 
 use std::collections::HashSet;
 
-use rustc_hash::FxHashSet;
-
 use super::{DbIndex, FileId};
-use crate::LuaMemberId;
 
 /// Rewrites every reference into `remap.file_id` that another file holds.
 ///
@@ -25,17 +22,7 @@ use crate::LuaMemberId;
 /// by that, and what survives on an old position is what some *other* file
 /// recorded about it. Returns the files whose reference could not be
 /// rewritten - they have to be re-analysed instead.
-///
-/// `pre_edit_member_ids` names the members the edited file had filed before
-/// the edit. A settled read can be keyed on a member id outside it - a
-/// speculative key naming an expression's range rather than a filed member -
-/// and such a key has no filed identity to confirm, so it is moved by
-/// geometry instead of being reported lost (`LuaTypeIndex::remap_settled_reads`).
-pub fn remap_into_file(
-    db: &mut DbIndex,
-    remap: &FileRemap,
-    pre_edit_member_ids: &FxHashSet<LuaMemberId>,
-) -> HashSet<FileId> {
+pub fn remap_into_file(db: &mut DbIndex, remap: &FileRemap) -> HashSet<FileId> {
     let mut dirty = HashSet::default();
     if remap.map.is_identity() {
         return dirty;
@@ -49,17 +36,9 @@ pub fn remap_into_file(
             .remove_member_type_caches(&forgotten);
     }
 
-    let pass = db
-        .get_call_site_param_index_mut()
-        .remap_file_signatures(remap);
-    dirty.extend(pass);
-    let pass = db.get_signature_index_mut().remap_settled_reads(remap);
-    dirty.extend(pass);
     let pass = db.get_signature_index_mut().remap_payload_types(remap);
     dirty.extend(pass);
-    let pass = db
-        .get_type_index_mut()
-        .remap_file_identities(remap, pre_edit_member_ids);
+    let pass = db.get_type_index_mut().remap_file_identities(remap);
     dirty.extend(pass);
     let pass = db
         .get_dynamic_field_index_mut()

@@ -146,6 +146,16 @@ impl Eq for LuaType {}
 /// differently and shifted a diagnostic.
 impl Hash for LuaType {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        if crate::db_index::derivation::fingerprinting() {
+            self.hash_content(state);
+        } else {
+            self.hash_summary(state);
+        }
+    }
+}
+
+impl LuaType {
+    fn hash_summary<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
             LuaType::Unknown => 0.hash(state),
             LuaType::Any => 1.hash(state),
@@ -211,6 +221,39 @@ impl Hash for LuaType {
             LuaType::Mapped(a) => (51, a.param.0, a.is_readonly, a.is_optional).hash(state),
             LuaType::DocAttribute(a) => (52, a).hash(state),
             LuaType::TableOf(a) => (53, a).hash(state),
+        }
+    }
+}
+
+impl LuaType {
+    /// Hashes everything the type holds, for fingerprints: the ordinary hash
+    /// summarizes composite types (field counts, arities) to stay cheap as a
+    /// map key, which would let two different values fingerprint alike.
+    fn hash_content<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            LuaType::Object(object) => {
+                for (key, value) in &object.fields {
+                    key.hash(state);
+                    value.hash(state);
+                }
+                object.index_access.hash(state);
+            }
+            LuaType::Union(union) => match union.as_ref() {
+                LuaUnionType::Nullable(inner) => (0u8, inner).hash(state),
+                LuaUnionType::Multi(types) => (1u8, types).hash(state),
+            },
+            LuaType::Intersection(a) => a.hash(state),
+            LuaType::Generic(a) => a.hash(state),
+            LuaType::TableGeneric(a) => a.hash(state),
+            LuaType::TplRef(a) | LuaType::ConstTplRef(a) => {
+                (a.tpl_id, a.name.as_str(), &a.constraint).hash(state)
+            }
+            LuaType::Variadic(a) => a.hash(state),
+            LuaType::MultiLineUnion(a) => a.hash(state),
+            LuaType::Conditional(a) => a.hash(state),
+            LuaType::Mapped(a) => a.hash(state),
+            _ => self.hash_summary(state),
         }
     }
 }

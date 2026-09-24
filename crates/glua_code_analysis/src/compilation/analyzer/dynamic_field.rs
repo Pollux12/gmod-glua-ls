@@ -10,8 +10,7 @@ use rowan::TextSize;
 use smol_str::SmolStr;
 
 use crate::{
-    InFiled, LuaDeclId, LuaInferredGuardOwner, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType,
-    LuaTypeOwner, VarRefId,
+    InFiled, LuaDeclId, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType, LuaTypeOwner, VarRefId,
     db_index::{DbIndex, DynamicFieldOwner, LuaMemberOwner, LuaSemanticDeclId, WorkspaceKind},
     find_signature_attribute_use,
     profile::Profile,
@@ -48,17 +47,8 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
     }
 }
 
-pub struct EarlyDynamicFieldAnalysisPipeline;
-
-impl AnalysisPipeline for EarlyDynamicFieldAnalysisPipeline {
-    fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
-        analyze_dynamic_fields(db, context, DynamicFieldAnalysisMode::Early);
-    }
-}
-
 #[derive(Clone, Copy)]
 enum DynamicFieldAnalysisMode {
-    Early,
     Full,
 }
 
@@ -92,31 +82,16 @@ type FiniteNamedMemberEvidence = (
 
 #[derive(Default, Clone)]
 struct FieldSetterHelperCache {
-    complete_helper_registry: bool,
     helpers: FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>>,
     non_helpers: FxHashSet<LuaSignatureId>,
-    member_names: FxHashSet<SmolStr>,
 }
 
 impl FieldSetterHelperCache {
-    fn from_tree_list(
-        tree_list: &[InFiled<glua_parser::LuaChunk>],
-        enable_member_name_prefilter: bool,
-    ) -> Self {
-        let (helpers, mut member_names) = collect_field_setter_helpers(tree_list);
-        if !enable_member_name_prefilter {
-            member_names.clear();
-        }
+    fn from_tree_list(tree_list: &[InFiled<glua_parser::LuaChunk>]) -> Self {
         Self {
-            complete_helper_registry: enable_member_name_prefilter,
-            helpers,
+            helpers: collect_field_setter_helpers(tree_list),
             non_helpers: FxHashSet::default(),
-            member_names,
         }
-    }
-
-    fn definitely_has_no_helpers(&self) -> bool {
-        self.complete_helper_registry && self.helpers.is_empty()
     }
 
     fn patterns_for_signature(
@@ -140,21 +115,6 @@ impl FieldSetterHelperCache {
         }
 
         patterns
-    }
-
-    fn definitely_not_member_helper_call(&self, prefix_expr: &LuaExpr) -> bool {
-        if self.member_names.is_empty() {
-            return false;
-        }
-
-        let LuaExpr::IndexExpr(index_expr) = prefix_expr else {
-            return false;
-        };
-        let Some(member_name) = simple_index_key_name(index_expr) else {
-            return false;
-        };
-
-        !self.member_names.contains(&member_name)
     }
 }
 
@@ -231,12 +191,6 @@ fn field_definition_sites(
 /// cache yields identical inference results) and a local clone of the workspace
 /// field-setter-helper registry (a deterministic memoization cache). This makes
 /// the collection safe to run concurrently across files.
-///
-/// The last tuple element pairs each write site with the read set its
-/// collection consulted: the answers this pass computes are read off a
-/// mid-batch index, so the settled tail re-derives any site whose recorded
-/// reads moved — a partially resolved prefix must not stand as the final
-/// answer just because it already named one owner.
 fn collect_dynamic_fields_for_file(
     db: &DbIndex,
     file_id: crate::FileId,
@@ -248,13 +202,8 @@ fn collect_dynamic_fields_for_file(
     Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
     Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
     Vec<FiniteNamedMemberEvidence>,
-    rustc_hash::FxHashSet<LuaInferredGuardOwner>,
     Vec<(SmolStr, rowan::TextRange)>,
     Vec<glua_parser::LuaSyntaxId>,
-    Vec<(
-        glua_parser::LuaSyntaxId,
-        crate::db_index::read_set::InferenceReadSet,
-    )>,
 ) {
     let mut collected_unattributed: Vec<(SmolStr, rowan::TextRange)> = Vec::new();
     let mut dynamic_field_retry: Vec<glua_parser::LuaSyntaxId> = Vec::new();
@@ -270,15 +219,6 @@ fn collect_dynamic_fields_for_file(
         Vec::new();
     let mut collected_finite_members = Vec::new();
     let mut field_setter_helpers = field_setter_helpers.clone();
-    let mut site_reads: Vec<(
-        (glua_parser::LuaSyntaxId, Option<PrefixCacheKey>),
-        crate::db_index::read_set::InferenceReadSet,
-    )> = Vec::new();
-    // The reads that produced each `prefix_type_cache` entry. A cache-hit
-    // site performs none of the instrumented reads that produced the cached
-    // type, so they are replayed into its record from here.
-    let mut prefix_reads: FxHashMap<PrefixCacheKey, crate::db_index::read_set::InferenceReadSet> =
-        FxHashMap::default();
     // The records are what this pass is building. A cold build has none yet,
     // and a re-index of some files has the rest of the workspace's, with the
     // re-indexed files' contributions removed: a partial record that names a
@@ -289,7 +229,6 @@ fn collect_dynamic_fields_for_file(
         crate::CacheOptions {
             analysis_phase: crate::LuaAnalysisPhase::Force,
             dynamic_fields_visible: false,
-            building_dynamic_field_index: true,
             call_site_params_visible: false,
         },
     );
@@ -306,17 +245,6 @@ fn collect_dynamic_fields_for_file(
             let Some(definition_range) = index_expr.get_index_key().and_then(|k| k.get_range())
             else {
                 continue;
-            };
-
-            // Everything that decides where this write lands — the candidate
-            // names, the prefix's type, and the collect walk below — reads a
-            // still-mutable index. The armed scope records those reads so the
-            // settled tail can re-derive the site the moment any of them
-            // move; the drain pushes the record on every exit path.
-            crate::db_index::read_set::arm_with_member_maps();
-            let mut read_drain = super::ReadDrain {
-                slot: &mut site_reads,
-                key: (index_expr.get_syntax_id(), None),
             };
 
             let field_names = get_field_names(
@@ -343,7 +271,6 @@ fn collect_dynamic_fields_for_file(
             }
 
             let cache_key = PrefixCacheKey::from_expr(db, cache, &prefix_expr);
-            read_drain.key.1 = Some(cache_key.clone());
             let prefix_type = if let Some(cached_type) = prefix_type_cache.get(&cache_key) {
                 match cached_type {
                     Some(prefix_type) => prefix_type.clone(),
@@ -355,14 +282,7 @@ fn collect_dynamic_fields_for_file(
                     }
                 }
             } else {
-                // Nested scope: `disarm` above depth one snapshots without
-                // draining, so the infer's reads stay in this site's own
-                // record and are also stored beside the cached type for
-                // cache-hit sites to replay.
-                crate::db_index::read_set::arm();
                 let inferred = infer_expr(db, cache, prefix_expr.clone()).ok();
-                let infer_reads = crate::db_index::read_set::disarm();
-                prefix_reads.insert(cache_key.clone(), infer_reads);
                 prefix_type_cache.insert(cache_key, inferred.clone());
                 let Some(prefix_type) = inferred else {
                     dynamic_field_retry.push(index_expr.get_syntax_id());
@@ -412,11 +332,7 @@ fn collect_dynamic_fields_for_file(
                 continue;
             };
 
-            // Site-local buffers: super-type propagation runs inside this
-            // site's armed scope so the `collect_super_types` reads join the
-            // reads that re-derive it. A super edge landing after collection
-            // otherwise leaves the propagated fields frozen at the partial
-            // set.
+            // Site-local buffers: super-type propagation runs per site.
             let mut site_named: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
                 Vec::new();
             for field_name in field_names.names {
@@ -465,9 +381,8 @@ fn collect_dynamic_fields_for_file(
         }
     }
     if mode.collect_setmetatable_tables() {
-        // The helper/setmetatable producers are not per-site armed scopes, so
-        // their propagation runs here rather than inside one. Their reads are
-        // not settle-tracked either way.
+        // The helper/setmetatable producers are not per-site, so their
+        // propagation runs here.
         let non_site_start = collected.len();
         for call_expr in root.descendants::<LuaCallExpr>() {
             collect_field_setter_helper_call_fields(
@@ -494,31 +409,13 @@ fn collect_dynamic_fields_for_file(
             ));
         }
     }
-    // Every site that consulted mutable index state is a settled candidate:
-    // its answer was read off a mid-batch index and may be partial. Sites
-    // that hit `prefix_type_cache` replay the reads the miss recorded; a site
-    // that consulted nothing mutable answers identically in every round and
-    // is not worth a candidate slot.
-    let site_read_records = site_reads
-        .into_iter()
-        .filter_map(|((syntax_id, prefix_key), mut reads)| {
-            if let Some(prefix_key) = prefix_key
-                && let Some(prefix_reads) = prefix_reads.get(&prefix_key)
-            {
-                reads.extend(prefix_reads.clone());
-            }
-            (!reads.is_empty()).then_some((syntax_id, reads))
-        })
-        .collect();
     (
         collected,
         collected_propagated,
         collected_wildcards,
         collected_finite_members,
-        cache.take_inferred_guard_dependencies(),
         collected_unattributed,
         dynamic_field_retry,
-        site_read_records,
     )
 }
 
@@ -545,8 +442,7 @@ fn analyze_dynamic_fields(
     let mut profile = profile_enabled.then(DynamicFieldProfile::default);
     let helper_start = profile_enabled.then(std::time::Instant::now);
     let field_setter_helpers = if mode.collect_direct_assignments() {
-        let context_covers_workspace = context_covers_workspace(&*db, context, &tree_list);
-        FieldSetterHelperCache::from_tree_list(&tree_list, context_covers_workspace)
+        FieldSetterHelperCache::from_tree_list(&tree_list)
     } else {
         FieldSetterHelperCache::default()
     };
@@ -558,13 +454,6 @@ fn analyze_dynamic_fields(
     // per-file local buffers, so it runs concurrently across files. Results are
     // concatenated in deterministic file order and merged into the db below.
     let file_ids: Vec<crate::FileId> = tree_list.iter().map(|t| t.file_id).collect();
-    // The version the collection reads observed: the parallel walk runs
-    // against an immutable index, so this capture is exactly the state every
-    // site consulted. Writes the merge and the later passes then file stale
-    // only the sites that read the slots they touched — including a site's
-    // own fresh definitions, whose identical re-derivation files nothing and
-    // is where the round ends.
-    let collection_read_version = crate::db_index::read_set::InferenceReadVersion::capture(&*db);
     let collection_start = profile_enabled.then(std::time::Instant::now);
     let per_file = super::parallel::map_files_collect(&*db, &file_ids, |db, file_id| {
         let Some(root) = db
@@ -576,8 +465,6 @@ fn analyze_dynamic_fields(
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
-                Default::default(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -596,10 +483,8 @@ fn analyze_dynamic_fields(
             file_propagated,
             file_wildcards,
             file_finite_members,
-            dependencies,
             file_unattributed,
             file_dynamic_field_retry,
-            file_site_reads,
         ),
         file_id,
     ) in per_file.into_iter().zip(file_ids)
@@ -616,27 +501,13 @@ fn analyze_dynamic_fields(
         for syntax_id in file_dynamic_field_retry {
             context.record_settled_dynamic_field_candidate(file_id, syntax_id);
         }
-        // Every site that read mutable state is a candidate whose own reads
-        // gate its re-derivation; a site that produced only a partial fan-out
-        // at collection time is exactly the case this covers.
-        for (syntax_id, reads) in file_site_reads {
-            context.record_settled_dynamic_field_candidate(file_id, syntax_id);
-            context.record_settled_candidate_reads(
-                super::SettledReadPass::Dynamic,
-                super::SettledCandidate::Dynamic(file_id, syntax_id),
-                collection_read_version,
-                reads,
-            );
-        }
-        context.add_inferred_guard_dependencies(file_id, dependencies);
     }
     if let (Some(profile), Some(merge_start)) = (profile.as_mut(), merge_start) {
         profile.collection_merge_time += merge_start.elapsed();
     }
 
-    // Owners were canonicalized at push inside each site's armed read scope,
-    // and super-type propagation ran there too, so the reads that decide both
-    // are the reads that re-derive the site.
+    // Owners were canonicalized at push, and super-type propagation ran per
+    // site.
     let insert_start = profile_enabled.then(std::time::Instant::now);
     let index = db.get_dynamic_field_index_mut();
     for (field_name, file_id, range) in collected_unattributed {
@@ -672,12 +543,8 @@ fn analyze_dynamic_fields(
 
 fn collect_field_setter_helpers(
     tree_list: &[InFiled<glua_parser::LuaChunk>],
-) -> (
-    FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>>,
-    FxHashSet<SmolStr>,
-) {
+) -> FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>> {
     let mut helpers: FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>> = FxHashMap::default();
-    let mut member_names = FxHashSet::default();
 
     for in_filed_tree in tree_list {
         let file_id = in_filed_tree.file_id;
@@ -687,92 +554,11 @@ fn collect_field_setter_helpers(
             let patterns = collect_field_setter_helpers_in_closure(&closure);
             if !patterns.is_empty() {
                 helpers.insert(signature_id, patterns);
-                collect_helper_member_names_for_closure(&closure, &mut member_names);
             }
         }
     }
 
-    (helpers, member_names)
-}
-
-fn context_covers_workspace(
-    db: &DbIndex,
-    context: &AnalyzeContext,
-    tree_list: &[InFiled<glua_parser::LuaChunk>],
-) -> bool {
-    let Some(workspace_id) = context.workspace_id else {
-        return false;
-    };
-
-    let tree_file_ids = tree_list
-        .iter()
-        .map(|in_filed_tree| in_filed_tree.file_id)
-        .collect::<FxHashSet<_>>();
-    let mut found_workspace_file = false;
-    for file_id in db.get_vfs().get_all_file_ids() {
-        if db.get_vfs().get_syntax_tree(&file_id).is_none() {
-            continue;
-        }
-
-        if db.get_module_index().get_workspace_id(file_id) != Some(workspace_id) {
-            continue;
-        }
-
-        found_workspace_file = true;
-        if !tree_file_ids.contains(&file_id) {
-            return false;
-        }
-    }
-
-    found_workspace_file
-}
-
-fn collect_helper_member_names_for_closure(
-    closure: &LuaClosureExpr,
-    member_names: &mut FxHashSet<SmolStr>,
-) {
-    for ancestor in closure.syntax().ancestors().skip(1) {
-        if let Some(func_stat) = LuaFuncStat::cast(ancestor.clone()) {
-            if let Some(func_name) = func_stat.get_func_name() {
-                collect_helper_member_name_from_var(&func_name, member_names);
-            }
-            return;
-        }
-
-        if let Some(assign) = LuaAssignStat::cast(ancestor.clone()) {
-            let (vars, exprs) = assign.get_var_and_expr_list();
-            for (var, expr) in vars.iter().zip(exprs.iter()) {
-                if expr.syntax() == closure.syntax() {
-                    collect_helper_member_name_from_var(var, member_names);
-                }
-            }
-            return;
-        }
-
-        if LuaTableField::can_cast(ancestor.kind().into()) {
-            if let Some(field) = LuaTableField::cast(ancestor) {
-                if let Some(field_key) = field.get_field_key() {
-                    collect_helper_member_name_from_key(&field_key, member_names);
-                }
-            }
-            return;
-        }
-    }
-}
-
-fn collect_helper_member_name_from_var(var: &LuaVarExpr, member_names: &mut FxHashSet<SmolStr>) {
-    let LuaVarExpr::IndexExpr(index_expr) = var else {
-        return;
-    };
-    if let Some(member_name) = simple_index_key_name(index_expr) {
-        member_names.insert(member_name);
-    }
-}
-
-fn collect_helper_member_name_from_key(key: &LuaIndexKey, member_names: &mut FxHashSet<SmolStr>) {
-    if let Some(member_name) = simple_key_name(key) {
-        member_names.insert(member_name);
-    }
+    helpers
 }
 
 fn collect_field_setter_helpers_in_closure(closure: &LuaClosureExpr) -> Vec<FieldSetterHelper> {
@@ -914,10 +700,6 @@ fn helper_patterns_for_call(
         return helpers.patterns_for_signature(db, signature_id);
     }
 
-    if helpers.definitely_has_no_helpers() {
-        return Vec::new();
-    }
-
     helper_patterns_for_call_fallback(db, cache, prefix_expr, helpers)
 }
 
@@ -927,10 +709,6 @@ fn helper_patterns_for_call_fallback(
     prefix_expr: &LuaExpr,
     helpers: &mut FieldSetterHelperCache,
 ) -> Vec<FieldSetterHelper> {
-    if helpers.definitely_not_member_helper_call(prefix_expr) {
-        return Vec::new();
-    }
-
     let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) else {
         return Vec::new();
     };
@@ -977,18 +755,6 @@ fn direct_name_expr_signature_id(
     };
 
     Some(LuaSignatureId::from_closure(decl.get_file_id(), &closure))
-}
-
-fn simple_index_key_name(index_expr: &glua_parser::LuaIndexExpr) -> Option<SmolStr> {
-    simple_key_name(&index_expr.get_index_key()?)
-}
-
-fn simple_key_name(key: &LuaIndexKey) -> Option<SmolStr> {
-    match key {
-        LuaIndexKey::Name(name) => Some(name.get_name_text().into()),
-        LuaIndexKey::String(string) => Some(string.get_value().into()),
-        _ => None,
-    }
 }
 
 fn collect_field_setter_helpers_for_signature(
@@ -2097,43 +1863,6 @@ fn collect_string_const_names(typ: &LuaType, names: &mut Vec<SmolStr>) {
     }
 }
 
-/// One re-derived write site's replacement contribution set: what the site
-/// produces against the settled index, reconciled at merge against whatever
-/// it filed when it was collected — late-arriving owners add their
-/// definitions, owners the site no longer resolves to lose them.
-struct DynamicFieldSiteRefresh {
-    /// The site's index-key range — its contribution identity.
-    definition_range: rowan::TextRange,
-    /// The site's member identity — its finite-named-member marks live under
-    /// this key.
-    member_id: crate::LuaMemberId,
-    named: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
-    /// Super-type propagation of `named`, computed inside the site's armed
-    /// read scope so the `collect_super_types` reads join the reads that
-    /// re-derive it.
-    propagated: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
-    wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
-    /// The site's exact current unattributed name set: names that resolved
-    /// to nothing this round. `replace_site_contributions` reconciles the
-    /// site's prior records against it — a name absent here loses its
-    /// record whether it attributed this round or vanished entirely.
-    unattributed: Vec<SmolStr>,
-    /// Owners the re-derived site claims finite-named member marks for —
-    /// collection's `has_finite_domain && !wildcard-covered` rule applied to
-    /// this round's evidence.
-    finite_marked: rustc_hash::FxHashSet<DynamicFieldOwner>,
-}
-
-struct DynamicFieldRefreshResult {
-    sites: Vec<DynamicFieldSiteRefresh>,
-    /// Each re-derived site's recorded reads, saved so the next round can skip
-    /// candidates whose own reads did not move.
-    candidate_reads: Vec<(
-        super::SettledCandidate,
-        crate::db_index::read_set::InferenceReadSet,
-    )>,
-}
-
 /// Propagates collected dynamic fields to the super types of their owners so
 /// that e.g. a field assigned on `base_glide` (which extends `Entity`) is also
 /// visible when the variable is typed as `Entity`.  This avoids false-positive
@@ -2185,255 +1914,6 @@ fn propagate_dynamic_fields_to_super_types(
     propagated
 }
 
-/// Re-derives the dynamic-field sites whose collection read mutable index
-/// state: wildcards that were silently dropped, named writes that landed
-/// unattributed, and fan-outs that committed to a partial answer.
-///
-/// The collection pass runs before the unresolve waves and the settled tail,
-/// so a prefix fed by a late-settling fact (a member still widening, an
-/// iterator variable over one) answers against an incomplete index — a union
-/// that has only some of its arms lands the write on only some owners, and
-/// whether it does is a property of how far the batch had settled, not of
-/// the source. Every site that consulted mutable state is re-derived once
-/// its recorded reads move, and the re-derived answer *replaces* the site's
-/// contribution set — owners it no longer resolves to lose their
-/// definitions, matching what a collection that saw the settled state would
-/// have filed. A named write the retry attributes takes its unattributed
-/// record with it; one that stops attributing gains one, as an in-phase
-/// collection would have produced.
-/// Returns whether it changed the dynamic-field index at all, so the settled
-/// tail knows to run another round: the records it adds feed the same reads
-/// (member maps, iterated tables) the other settled passes re-derive from.
-pub(crate) fn rederive_settled_dynamic_fields(
-    db: &mut DbIndex,
-    context: &mut AnalyzeContext,
-    moved_owners: Option<&FxHashSet<LuaTypeOwner>>,
-) -> bool {
-    let read_pass = super::SettledReadPass::Dynamic;
-    let read_version = crate::db_index::read_set::InferenceReadVersion::capture(db);
-    // Kept, not taken: the settled tail runs to a fixpoint and each round
-    // re-derives the same candidates against what the previous one landed.
-    // Sites carry the reads their collection performed, so even the first
-    // round re-derives only those whose inputs moved since they answered;
-    // a candidate with no record (queued before records existed) runs.
-    let rederive_all = moved_owners.is_none();
-    let candidate_reads = &context.settled_candidate_reads;
-    let mut candidates = context.settled_dynamic_field_candidates.clone();
-    if candidates.is_empty() {
-        return false;
-    }
-    candidates.sort_by_key(|(file_id, syntax_id)| (*file_id, syntax_id.get_range().start()));
-    candidates.dedup();
-
-    let mut candidates_by_file: FxHashMap<crate::FileId, Vec<glua_parser::LuaSyntaxId>> =
-        FxHashMap::default();
-    for (file_id, syntax_id) in candidates {
-        candidates_by_file
-            .entry(file_id)
-            .or_default()
-            .push(syntax_id);
-    }
-    let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
-    file_ids.sort_unstable();
-    let results = super::parallel::map_files_collect(db, &file_ids, |db, file_id| {
-        let mut result = DynamicFieldRefreshResult {
-            sites: Vec::new(),
-            candidate_reads: Vec::new(),
-        };
-        let file_candidates = &candidates_by_file[&file_id];
-        // The tree and cache only serve a file that re-derives a site this
-        // round — an all-fresh file early-outs on the same per-site staleness
-        // check, paying only the scan.
-        if !rederive_all
-            && !file_candidates.iter().any(|syntax_id| {
-                candidate_reads
-                    .get(&(
-                        read_pass,
-                        super::SettledCandidate::Dynamic(file_id, *syntax_id),
-                    ))
-                    .is_none_or(|(version, reads)| {
-                        version.is_stale_against(&read_version, db, reads)
-                    })
-            })
-        {
-            return result;
-        }
-        let Some(root) = db
-            .get_vfs()
-            .get_syntax_tree(&file_id)
-            .map(|tree| tree.get_chunk_node())
-        else {
-            return result;
-        };
-        let mut cache = crate::LuaInferCache::new(
-            file_id,
-            crate::CacheOptions {
-                analysis_phase: crate::LuaAnalysisPhase::Force,
-                dynamic_fields_visible: true,
-                building_dynamic_field_index: true,
-                call_site_params_visible: true,
-            },
-        );
-        let mut local_reassignment_positions = None;
-        for syntax_id in file_candidates {
-            let key = super::SettledCandidate::Dynamic(file_id, *syntax_id);
-            // A site whose recorded reads did not move answers the same as
-            // when it collected them; one with no record has never run.
-            let stale = candidate_reads
-                .get(&(read_pass, key))
-                .map_or(rederive_all, |(version, reads)| {
-                    version.is_stale_against(&read_version, db, reads)
-                });
-            if !stale {
-                continue;
-            }
-            // Reads are armed per site so the next round re-derives this site
-            // alone rather than every candidate in the file; sites that fail
-            // the AST lookups record an empty set and stop retrying. The
-            // guard disarms on whichever path the body takes.
-            crate::db_index::read_set::arm_with_member_maps();
-            let _drain = super::ReadDrain {
-                slot: &mut result.candidate_reads,
-                key,
-            };
-            let Some(index_expr) = syntax_id
-                .to_node_from_root(root.syntax())
-                .and_then(glua_parser::LuaIndexExpr::cast)
-            else {
-                continue;
-            };
-            let Some(prefix_expr) = index_expr.get_prefix_expr() else {
-                continue;
-            };
-            let Some(definition_range) = index_expr.get_index_key().and_then(|k| k.get_range())
-            else {
-                continue;
-            };
-            let field_names = get_field_names(
-                db,
-                &mut cache,
-                &root,
-                &mut local_reassignment_positions,
-                &index_expr,
-            );
-            let mut site = DynamicFieldSiteRefresh {
-                definition_range,
-                member_id: LuaMemberId::new(*syntax_id, file_id),
-                named: Vec::new(),
-                propagated: Vec::new(),
-                wildcards: Vec::new(),
-                unattributed: Vec::new(),
-                finite_marked: Default::default(),
-            };
-            let Ok(prefix_type) = infer_expr(db, &mut cache, prefix_expr.clone()) else {
-                // The site yields nothing this round, so whatever it filed
-                // when collected is stale: reconcile withdraws it, and the
-                // empty unattributed set retracts any record the site held —
-                // as a collection that saw this state would have filed
-                // neither.
-                result.sites.push(site);
-                continue;
-            };
-            let effective_type = infer_setmetatable_target_type(
-                db,
-                &mut cache,
-                &prefix_expr,
-                index_expr.get_range(),
-            )
-            .unwrap_or(prefix_type);
-
-            let is_dynamic_key = is_dynamic_index_key(&index_expr);
-            if is_dynamic_key && field_names.may_have_other_string_names {
-                collect_wildcard_for_type(
-                    db,
-                    &effective_type,
-                    file_id,
-                    definition_range,
-                    &mut site.wildcards,
-                );
-            }
-            if is_dynamic_key && !field_names.names.is_empty() {
-                let mut finite_evidence = Vec::new();
-                collect_finite_member_for_type(
-                    db,
-                    &effective_type,
-                    LuaMemberId::new(*syntax_id, file_id),
-                    file_id,
-                    definition_range,
-                    !field_names.may_have_other_string_names,
-                    &mut finite_evidence,
-                );
-                // Same mark rule the collection merge applies: a finite claim
-                // loses to a wildcard the site filed on the same owner.
-                site.finite_marked = finite_evidence
-                    .into_iter()
-                    .filter(|(owner, _, file_id, range, has_finite_domain)| {
-                        *has_finite_domain
-                            && !site.wildcards.contains(&(owner.clone(), *file_id, *range))
-                    })
-                    .map(|(owner, ..)| owner)
-                    .collect();
-            }
-            for field_name in field_names.names {
-                let before = site.named.len();
-                collect_for_type(
-                    db,
-                    &effective_type,
-                    &field_name,
-                    file_id,
-                    definition_range,
-                    &mut site.named,
-                );
-                if site.named.len() == before {
-                    site.unattributed.push(field_name);
-                }
-            }
-            // Inside the armed scope: the super-type reads that decide the
-            // propagated set are reads this site re-derives on.
-            site.propagated = propagate_dynamic_fields_to_super_types(db, &site.named);
-            result.sites.push(site);
-        }
-        result
-    });
-
-    let mut changed = false;
-    for (result, file_id) in results.into_iter().zip(file_ids.iter().copied()) {
-        for (candidate, reads) in result.candidate_reads {
-            context.record_settled_candidate_reads(read_pass, candidate, read_version, reads);
-        }
-        for site in result.sites {
-            let direct = site
-                .named
-                .iter()
-                .map(|(owner, field_name, _, _)| (owner.clone(), field_name.clone()))
-                .collect::<Vec<_>>();
-            let propagated = site
-                .propagated
-                .iter()
-                .map(|(owner, field_name, _, _)| (owner.clone(), field_name.clone()))
-                .collect::<Vec<_>>();
-            let wildcards = site
-                .wildcards
-                .iter()
-                .map(|(owner, ..)| owner.clone())
-                .collect::<Vec<_>>();
-            let index = db.get_dynamic_field_index_mut();
-            changed |= index.replace_site_contributions(
-                file_id,
-                site.definition_range,
-                &direct,
-                &propagated,
-                &wildcards,
-                &site.unattributed,
-            );
-            // The member id names the site itself, so every mark under it is
-            // this site's to keep or withdraw.
-            changed |= index.replace_site_finite_members(site.member_id, &site.finite_marked);
-        }
-    }
-    changed
-}
-
 fn collect_wildcard_for_type(
     db: &DbIndex,
     typ: &LuaType,
@@ -2461,7 +1941,7 @@ fn collect_wildcard_for_type_inner(
             result.push((DynamicFieldOwner::Type(id.clone()), file_id, range));
         }
         // Canonicalized at push, like `collect_for_type`: the
-        // `definition_site_owner` read belongs to the site's armed scope so a
+        // `definition_site_owner` read is noted during collection so a
         // late literal→path binding re-derives it.
         LuaType::TableConst(table_range) => {
             result.push((
@@ -2535,7 +2015,7 @@ fn collect_for_type_inner(
                 range,
             ));
         }
-        // The owner is canonicalized here, inside the site's armed read
+        // The owner is canonicalized here, during the site's collection
         // scope: a literal that initializes a global path belongs to the
         // path, and the `definition_site_owner` read that decides it is what
         // re-derives this site when the binding lands after collection.
@@ -2630,7 +2110,7 @@ fn collect_finite_member_for_type_inner(
         }
         // Canonicalized at push, like `collect_for_type`: the mark must land
         // on the owner readers consult, and the `definition_site_owner` read
-        // belongs to the site's armed scope so a late literal→path binding
+        // is noted during collection so a late literal→path binding
         // re-derives it.
         LuaType::TableConst(table_range) => {
             result.push((

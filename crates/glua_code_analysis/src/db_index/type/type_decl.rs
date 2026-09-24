@@ -22,6 +22,7 @@ pub enum LuaDeclTypeKind {
 }
 
 flags! {
+    #[derive(Hash)]
     pub enum LuaTypeFlag: u8 {
         None,
         Key,
@@ -34,7 +35,7 @@ flags! {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Clone)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub struct LuaTypeDecl {
     simple_name: String,
     locations: Vec<LuaDeclLocation>,
@@ -222,10 +223,27 @@ impl LuaTypeDecl {
         }
     }
 
-    pub fn add_enum_base(&mut self, base_type: LuaType) {
-        if let LuaTypeExtra::Enum { base, .. } = &mut self.extra {
-            *base = Some(base_type);
+    /// Installs a declaration site's `---@enum` or `---@attribute` payload,
+    /// or with `None` clears it, when it matches the decl's kind. Returns
+    /// whether the decl changed.
+    pub(crate) fn install_site_extra(&mut self, extra: Option<&LuaTypeExtra>) -> bool {
+        let next = match (extra, &self.extra) {
+            (Some(extra @ LuaTypeExtra::Enum { .. }), LuaTypeExtra::Enum { .. })
+            | (Some(extra @ LuaTypeExtra::Attribute { .. }), LuaTypeExtra::Attribute { .. }) => {
+                extra.clone()
+            }
+            (None, LuaTypeExtra::Enum { .. }) => LuaTypeExtra::Enum {
+                base: None,
+                flat: false,
+            },
+            (None, LuaTypeExtra::Attribute { .. }) => LuaTypeExtra::Attribute { typ: None },
+            _ => return false,
+        };
+        if next == self.extra {
+            return false;
         }
+        self.extra = next;
+        true
     }
 
     /// The declared base type of `---@enum X : T`. Values of the enum are `T`,
@@ -242,18 +260,6 @@ impl LuaTypeDecl {
     /// than owning a runtime table. Garry's Mod enums are all of this shape.
     pub fn is_flat_enum(&self) -> bool {
         matches!(self.extra, LuaTypeExtra::Enum { flat: true, .. })
-    }
-
-    pub fn mark_flat_enum(&mut self) {
-        if let LuaTypeExtra::Enum { flat, .. } = &mut self.extra {
-            *flat = true;
-        }
-    }
-
-    pub fn add_attribute_type(&mut self, attribute_type: LuaType) {
-        if let LuaTypeExtra::Attribute { typ } = &mut self.extra {
-            *typ = Some(attribute_type);
-        }
     }
 
     pub fn get_attribute_type(&self) -> Option<&LuaType> {
@@ -282,8 +288,18 @@ impl LuaTypeDecl {
             existing.flag |= location.flag;
             return;
         }
-
-        self.locations.push(location);
+        let at = self.locations.partition_point(|existing| {
+            (
+                existing.file_id,
+                existing.range.start(),
+                existing.range.end(),
+            ) < (
+                location.file_id,
+                location.range.start(),
+                location.range.end(),
+            )
+        });
+        self.locations.insert(at, location);
     }
 
     /// The value an enum member stands for. A table enum stores it on the member
@@ -567,7 +583,7 @@ impl<'de> Deserialize<'de> for LuaTypeDeclId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaDeclLocation {
     pub file_id: FileId,
     pub range: TextRange,

@@ -53,8 +53,7 @@ mod tests {
         let provider = fork
             .update_file_text_only(&provider_uri, EDITED_PROVIDER.to_string())
             .expect("provider file id");
-        let dirty = fork.self_index_and_diff(vec![provider]);
-        fork.ripple(dirty);
+        fork.reindex_files(vec![provider]);
 
         let (cold, cold_consumer) = workspace(EDITED_PROVIDER);
         expect_that!(described_type(base, consumer), eq(&base_type));

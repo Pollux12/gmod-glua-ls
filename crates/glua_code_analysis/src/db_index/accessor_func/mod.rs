@@ -4,9 +4,12 @@ use glua_parser::LuaSyntaxId;
 use smol_str::SmolStr;
 
 use super::traits::LuaIndex;
-use crate::{FileId, LuaTypeDeclId, db_index::op_log, db_index::read_set::WriteKey};
+use crate::{
+    FileId, LuaTypeDeclId,
+    db_index::derivation::{self, FactKey, Fingerprint},
+};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct AccessorFuncAnnotation {
     pub name_param_index: usize,
     pub file_id: FileId,
@@ -24,6 +27,7 @@ impl AccessorFuncAnnotationIndex {
     }
 
     pub fn register(&mut self, name: SmolStr, annotation: AccessorFuncAnnotation) {
+        derivation::note_write(|| FactKey::AccessorFunc(name.clone()));
         let file_id = annotation.file_id;
         self.by_name
             .entry(name.clone())
@@ -57,20 +61,38 @@ impl AccessorFuncAnnotationIndex {
     }
 
     pub fn contains_name(&self, name: &str) -> bool {
+        derivation::note_read(|| FactKey::AccessorFunc(SmolStr::new(name)));
         self.by_name.contains_key(name)
     }
 
     pub fn get_annotations(&self, name: &str) -> Option<&Vec<AccessorFuncAnnotation>> {
+        derivation::note_read(|| FactKey::AccessorFunc(SmolStr::new(name)));
         self.by_name.get(name)
     }
     pub fn annotation_entries(
         &self,
     ) -> impl Iterator<Item = (&SmolStr, &Vec<AccessorFuncAnnotation>)> {
-        self.by_name.iter()
+        self.by_name.iter().inspect(|(name, _)| {
+            derivation::note_read(|| FactKey::AccessorFunc((*name).clone()));
+        })
     }
 
     pub fn annotation_files(&self) -> impl Iterator<Item = (&FileId, &Vec<SmolStr>)> {
-        self.by_file.iter()
+        self.by_file.iter().inspect(|(_, names)| {
+            for name in names.iter() {
+                derivation::note_read(|| FactKey::AccessorFunc(name.clone()));
+            }
+        })
+    }
+
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        match key {
+            FactKey::AccessorFunc(name) => derivation::fingerprint_opt(self.by_name.get(name)),
+            _ => {
+                debug_assert!(false, "{key:?} is not an accessor-func annotation fact");
+                derivation::ABSENT
+            }
+        }
     }
 }
 
@@ -78,6 +100,7 @@ impl LuaIndex for AccessorFuncAnnotationIndex {
     fn remove(&mut self, file_id: FileId) {
         if let Some(names) = self.by_file.remove(&file_id) {
             for name in names {
+                derivation::note_write(|| FactKey::AccessorFunc(name.clone()));
                 if let Some(annotations) = self.by_name.get_mut(&name) {
                     annotations.retain(|annotation| annotation.file_id != file_id);
                     if annotations.is_empty() {
@@ -89,12 +112,17 @@ impl LuaIndex for AccessorFuncAnnotationIndex {
     }
 
     fn clear(&mut self) {
+        if derivation::recording() {
+            for name in self.by_name.keys() {
+                derivation::note_write(|| FactKey::AccessorFunc(name.clone()));
+            }
+        }
         self.by_name.clear();
         self.by_file.clear();
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct AccessorFuncCallMetadata {
     pub syntax_id: LuaSyntaxId,
     pub owner_type_id: LuaTypeDeclId,
@@ -113,31 +141,46 @@ impl AccessorFuncCallIndex {
     }
 
     pub fn add_call(&mut self, file_id: FileId, metadata: AccessorFuncCallMetadata) {
-        if op_log::recording() {
-            let replay = metadata.clone();
-            op_log::push(
-                op_log::Domain::AccessorFuncCall,
-                Box::new([WriteKey::FileScoped(file_id)]),
-                move |db| {
-                    db.get_accessor_func_call_index_mut()
-                        .add_call(file_id, replay)
-                },
-            );
-        }
+        derivation::note_write(|| FactKey::AccessorCalls(file_id));
         self.calls.entry(file_id).or_default().push(metadata);
     }
 
+    /// Drops `file_id`'s accessor calls before the derivations that found
+    /// them run again.
+    pub(crate) fn reset_file(&mut self, file_id: FileId) {
+        derivation::note_write(|| FactKey::AccessorCalls(file_id));
+        self.calls.remove(&file_id);
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&FileId, &Vec<AccessorFuncCallMetadata>)> {
-        self.calls.iter()
+        self.calls.iter().inspect(|(file_id, _)| {
+            derivation::note_read(|| FactKey::AccessorCalls(**file_id));
+        })
+    }
+
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        match key {
+            FactKey::AccessorCalls(file_id) => derivation::fingerprint_opt(self.calls.get(file_id)),
+            _ => {
+                debug_assert!(false, "{key:?} is not an accessor-func call fact");
+                derivation::ABSENT
+            }
+        }
     }
 }
 
 impl LuaIndex for AccessorFuncCallIndex {
     fn remove(&mut self, file_id: FileId) {
+        derivation::note_write(|| FactKey::AccessorCalls(file_id));
         self.calls.remove(&file_id);
     }
 
     fn clear(&mut self) {
+        if derivation::recording() {
+            for file_id in self.calls.keys() {
+                derivation::note_write(|| FactKey::AccessorCalls(*file_id));
+            }
+        }
         self.calls.clear();
     }
 }

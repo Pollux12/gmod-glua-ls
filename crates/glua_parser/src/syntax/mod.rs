@@ -337,6 +337,14 @@ impl LuaSyntaxId {
         self.range
     }
 
+    /// The same syntax kind at `range`.
+    pub fn with_range(&self, range: TextRange) -> Self {
+        LuaSyntaxId {
+            kind: self.kind,
+            range,
+        }
+    }
+
     pub fn to_node(&self, tree: &LuaSyntaxTree) -> Option<LuaSyntaxNode> {
         let root = tree.get_red_root();
         if root.parent().is_some() {

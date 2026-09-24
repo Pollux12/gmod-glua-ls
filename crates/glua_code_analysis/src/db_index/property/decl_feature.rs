@@ -4,7 +4,7 @@ pub enum PropertyDeclFeature {
     ReadOnly = 1 << 0,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeclFeatureFlag(u32);
 
 impl DeclFeatureFlag {

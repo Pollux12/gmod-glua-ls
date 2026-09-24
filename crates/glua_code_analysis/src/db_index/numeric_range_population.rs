@@ -2,9 +2,14 @@ use rustc_hash::FxHashMap;
 
 use rowan::TextRange;
 
-use crate::{FileId, LuaType};
+use smol_str::SmolStr;
 
-#[derive(Debug, Clone)]
+use crate::{
+    FileId, LuaType,
+    db_index::derivation::{self, FactKey, Fingerprint},
+};
+
+#[derive(Debug, Clone, Hash)]
 pub struct TableNumericRangePopulation {
     pub table_global: String,
     pub start: i64,
@@ -34,6 +39,9 @@ impl NumericRangePopulationIndex {
     ) {
         self.remove(file_id);
         for population in &populations {
+            derivation::note_write(|| {
+                FactKey::NumericPopulation(SmolStr::new(&population.table_global))
+            });
             self.by_global
                 .entry(population.table_global.clone())
                 .or_default()
@@ -45,6 +53,7 @@ impl NumericRangePopulationIndex {
     }
 
     pub fn get_for_global(&self, table_global: &str) -> &[TableNumericRangePopulation] {
+        derivation::note_read(|| FactKey::NumericPopulation(SmolStr::new(table_global)));
         self.by_global
             .get(table_global)
             .map(Vec::as_slice)
@@ -52,24 +61,48 @@ impl NumericRangePopulationIndex {
     }
 
     pub fn has_global(&self, table_global: &str) -> bool {
+        derivation::note_read(|| FactKey::NumericPopulation(SmolStr::new(table_global)));
         self.by_global.contains_key(table_global)
     }
 
     pub fn populations_by_file(
         &self,
     ) -> impl Iterator<Item = (&FileId, &Vec<TableNumericRangePopulation>)> {
-        self.by_file.iter()
+        self.by_file.iter().inspect(|(_, populations)| {
+            for population in populations.iter() {
+                derivation::note_read(|| {
+                    FactKey::NumericPopulation(SmolStr::new(&population.table_global))
+                });
+            }
+        })
     }
 
     pub fn populations_by_global(
         &self,
     ) -> impl Iterator<Item = (&String, &Vec<TableNumericRangePopulation>)> {
-        self.by_global.iter()
+        self.by_global.iter().inspect(|(table_global, _)| {
+            derivation::note_read(|| FactKey::NumericPopulation(SmolStr::new(table_global)));
+        })
+    }
+
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        match key {
+            FactKey::NumericPopulation(table_global) => {
+                derivation::fingerprint_opt(self.by_global.get(table_global.as_str()))
+            }
+            _ => {
+                debug_assert!(false, "{key:?} is not a numeric-population fact");
+                derivation::ABSENT
+            }
+        }
     }
 
     pub fn remove(&mut self, file_id: FileId) {
         if let Some(populations) = self.by_file.remove(&file_id) {
             for population in populations {
+                derivation::note_write(|| {
+                    FactKey::NumericPopulation(SmolStr::new(&population.table_global))
+                });
                 if let Some(entries) = self.by_global.get_mut(&population.table_global) {
                     entries.retain(|entry| entry.file_id != file_id);
                     if entries.is_empty() {
@@ -81,6 +114,11 @@ impl NumericRangePopulationIndex {
     }
 
     pub fn clear(&mut self) {
+        if derivation::recording() {
+            for table_global in self.by_global.keys() {
+                derivation::note_write(|| FactKey::NumericPopulation(SmolStr::new(table_global)));
+            }
+        }
         self.by_file.clear();
         self.by_global.clear();
     }

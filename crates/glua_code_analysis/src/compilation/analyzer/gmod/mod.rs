@@ -22,12 +22,12 @@ use crate::{
     GmodClassCallLiteral, GmodDermaSkinCallRoles, GmodNamedStringCallRoles,
     GmodNetworkVarCallRoles, GmodScriptedClassCallKind, GmodScriptedClassCallMetadata,
     GmodScriptedClassFileMetadata, GmodVguiPanelCallRoles, GmodVguiParentCallMetadata,
-    GmodVguiParentCallOrigin, GmodVguiParentSource, InFiled, LuaCallArgRole, LuaDecl, LuaDeclExtra,
-    LuaDeclId, LuaDeclLocation, LuaDeclTypeKind, LuaFunctionType, LuaInferCache, LuaMember,
-    LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignature, LuaSignatureId, LuaType,
-    LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
+    GmodVguiParentSource, InFiled, LuaCallArgRole, LuaDecl, LuaDeclExtra, LuaDeclId,
+    LuaDeclTypeKind, LuaFunctionType, LuaInferCache, LuaMember, LuaMemberFeature, LuaMemberId,
+    LuaMemberKey, LuaSignature, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId,
+    LuaTypeFlag, LuaTypeOwner,
     compilation::analyzer::{
-        AnalysisPipeline, AnalyzeContext,
+        AnalyzeContext,
         common::{TypeCacheWriteMode, add_member, write_type_cache},
     },
     db_index::rebuild_effective_valid_guard_signatures,
@@ -39,20 +39,25 @@ use crate::{
         GmodLoadRootKind, GmodLoadStatus, GmodNamedSiteMetadata, GmodNetReceiveSiteMetadata,
         GmodRealm, GmodRealmFileMetadata, GmodRealmRange, GmodScopedClassInfo, GmodStateMask,
         GmodSystemFileMetadata, GmodTimerKind, GmodTimerSiteMetadata, LuaDependencyKind,
-        LuaDependencySite, LuaMemberOwner, NetFlowFrame, NetFlowKind, NetHelperNameMemo,
-        NetNameExpansion, NetOpDescriptor, NetOpDirection, NetOpEntry, NetReceiveFlow, NetSendFlow,
-        NetSendKind, TableNumericRangePopulation, WorkspaceKind,
+        LuaDependencySite, LuaMemberOwner, NetFlowFrame, NetFlowKind, NetNameExpansion,
+        NetOpDescriptor, NetOpDirection, NetOpEntry, NetReceiveFlow, NetSendFlow, NetSendKind,
+        TableNumericRangePopulation, WorkspaceKind,
     },
     infer_expr,
-    profile::Profile,
     semantic::find_latest_decl_write_before_position,
 };
 use rowan::{TextRange, TextSize};
-use rustc_hash::FxHasher;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
+mod derive;
 mod numeric_range_population;
+
+pub(crate) use derive::{
+    evaluate_call_roles, evaluate_class_call_sites, evaluate_load, evaluate_load_call_sites,
+    evaluate_net_helper_names, evaluate_network, evaluate_post, evaluate_pre,
+    evaluate_valid_guards, evaluate_vgui_chains,
+};
 
 /// Cheap pre-analysis flags used to skip unrelated GMod collectors.
 #[derive(Default)]
@@ -139,540 +144,37 @@ fn scan_gmod_keywords(
     }
 }
 
-/// Pre-analysis phase: runs BEFORE lua_analyze.
-/// Collects purely syntactic metadata (hooks, network, realm, scripted class
-/// type declarations) so that lua_analyze has correct realm keys and scripted
-/// class types available from the start. Without them lua_analyze would see
-/// `GmodRealm::Unknown` and the unresolve phase would have to recompute every
-/// flow once the realm became known.
-pub struct GmodPreAnalysisPipeline;
-
-impl AnalysisPipeline for GmodPreAnalysisPipeline {
-    fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
-        if !db.get_emmyrc().gmod.enabled {
-            return;
-        }
-
-        let _p = Profile::cond_new("gmod pre-analyze", context.tree_list.len() > 1);
-        let tree_list = context.tree_list.clone();
-        let do_profile = tree_list.len() > 100 && log::log_enabled!(log::Level::Info);
-
-        // Pre-compute scripted class scope for all files (compile globs once)
-        let scripted_scope_files = crate::profile::phase("gmodpre/scripted_scope_files", || {
-            context.get_or_compute_scripted_scope_files(db).clone()
-        });
-
-        let t0 = do_profile.then(std::time::Instant::now);
-        let mut branch_realm_ranges: HashMap<FileId, Vec<GmodRealmRange>> = HashMap::default();
-        let mut annotation_realms: HashMap<FileId, GmodRealm> = HashMap::default();
-        // Wall-clock for the parallel read-only collection pass (hook/system/net
-        // flow/realm/fileparam metadata) and the sequential scoped-class merge.
-        let mut t_collect = std::time::Duration::ZERO;
-        let mut t_scoped = std::time::Duration::ZERO;
-        let mut profile = do_profile.then(GmodPreProfile::default);
-
-        // The registry is derived by scanning the entire signature index, so the
-        // cache key has to cover how much of that index existed when it was
-        // built — not just VFS content. Keying on content alone let a registry
-        // built during an earlier workspace group (with fewer files indexed) be
-        // served to a later group that could see more.
-        let helper_revision = helper_registry_revision(db);
-        // `collect_gmod_call_sites` already built this pair for every group
-        // before any group entered resolution, so reuse it whenever the
-        // signature index has not grown since — deriving it again means
-        // another fold over the whole signature index.
-        //
-        // On a miss the rebuild is served from the per-file scan cache, so it
-        // only re-derives the files that changed.
-        let reusable_roles = context
-            .gmod_global_call_roles
-            .as_ref()
-            .filter(|(revision, _)| *revision == helper_revision)
-            .map(|(_, roles)| roles.clone());
-        let cached_registry = db.get_cached_helper_registry(helper_revision);
-        let (helper_registry, annotated_global_call_roles) = match (cached_registry, reusable_roles)
-        {
-            (Some(registry), Some(roles)) => (registry, roles),
-            _ => crate::profile::phase("gmodpre/call_roles_and_registry", || {
-                build_call_roles_and_registry(db)
-            }),
-        };
-        // Publish the canonical op-name table so diagnostics and completions can
-        // name a net op they have no call expression for.
-        db.get_gmod_network_index_mut()
-            .set_canonical_ops(annotated_global_call_roles.canonical_net_ops());
-        context.gmod_global_call_roles =
-            Some((helper_revision, annotated_global_call_roles.clone()));
-
-        let prefixes =
-            crate::profile::phase("gmodpre/hook_prefixes", || formatted_hook_prefixes(db));
-
-        let t_vgui = do_profile.then(std::time::Instant::now);
-        let file_ids: Vec<FileId> = tree_list.iter().map(|tree| tree.file_id).collect();
-        crate::profile::phase("gmodpre/vgui_registrations", || {
-            synthesize_vgui_registrations(db, context, &file_ids)
-        });
-        if let Some(t_vgui) = t_vgui {
-            log::info!(
-                "gmod pre: vgui_registration_bindings cost {:?}",
-                t_vgui.elapsed()
-            );
-        }
-
-        // Per-file metadata collection is read-only against `&DbIndex` (it only
-        // reads the reference/decl indexes built by earlier passes plus each
-        // file's own AST), so it runs in parallel across files. The collected
-        // results are merged into the db sequentially afterward in file order to
-        // preserve identical behavior. The scoped-class (`is_in_scope`) work
-        // mutates the db and stays in the sequential merge loop.
-        let s_collect = do_profile.then(std::time::Instant::now);
-        let collect_file_ids: Vec<FileId> = tree_list.iter().map(|tree| tree.file_id).collect();
-        let collected = crate::profile::phase("gmodpre/collect_file_metadata", || {
-            super::parallel::map_files_collect(db, &collect_file_ids, |db, file_id| {
-                collect_file_gmod_metadata(
-                    db,
-                    file_id,
-                    &helper_registry,
-                    &prefixes,
-                    &annotated_global_call_roles,
-                )
-            })
-        });
-        if let Some(s_collect) = s_collect {
-            t_collect += s_collect.elapsed();
-        }
-
-        for (in_filed_tree, result) in tree_list.iter().zip(collected) {
-            let file_id = in_filed_tree.file_id;
-            let is_in_scope = scripted_scope_files.contains(&file_id);
-            let GmodFileMetadataResult {
-                keywords,
-                hook_metadata,
-                member_ranges,
-                branch_ranges,
-                annotation_realm,
-                file_params,
-                missed_member_reads,
-            } = result;
-            context
-                .infer_manager
-                .extend_missed_member_reads(file_id, missed_member_reads);
-
-            if let Some(profile) = profile.as_mut() {
-                profile.files_scanned += 1;
-                profile.record_keywords(&keywords, is_in_scope);
-            }
-
-            if let Some((hook_sites, system_metadata, gm_method_realms)) = hook_metadata {
-                if let Some(profile) = profile.as_mut() {
-                    profile.gm_method_realms += gm_method_realms.len();
-                }
-                db.get_gmod_infer_index_mut()
-                    .add_hook_sites(file_id, hook_sites);
-                db.get_gmod_infer_index_mut()
-                    .set_system_file_metadata(file_id, system_metadata);
-                if !gm_method_realms.is_empty() {
-                    db.get_gmod_infer_index_mut()
-                        .set_gm_method_realm_annotations(file_id, gm_method_realms);
-                }
-            } else if let Some(profile) = profile.as_mut() {
-                profile.hook_metadata_skips += 1;
-            }
-
-            if is_in_scope {
-                let s = do_profile.then(std::time::Instant::now);
-                // Use cached scoped class info from decl phase, or detect if not cached
-                let scope_match = db
-                    .get_gmod_infer_index()
-                    .get_scoped_class_info(&file_id)
-                    .map(|info| GmodScopedClassMatch {
-                        class_name: info.class_name.clone(),
-                        global_name: info.global_name.clone(),
-                        is_global_singleton: info.is_global_singleton,
-                        aliases: info.aliases.clone(),
-                        super_types: info.super_types.clone(),
-                        class_name_prefix: info.class_name_prefix.clone(),
-                    })
-                    .or_else(|| {
-                        let m = detect_scoped_class_from_path(db, file_id)?;
-                        db.get_gmod_infer_index_mut().set_scoped_class_info(
-                            file_id,
-                            GmodScopedClassInfo {
-                                class_name: m.class_name.clone(),
-                                global_name: m.global_name.clone(),
-                                is_global_singleton: m.is_global_singleton,
-                                aliases: m.aliases.clone(),
-                                super_types: m.super_types.clone(),
-                                class_name_prefix: m.class_name_prefix.clone(),
-                            },
-                        );
-                        Some(m)
-                    });
-                if let Some(scope_match) = scope_match {
-                    if let Some(profile) = profile.as_mut() {
-                        profile.scoped_class_matches += 1;
-                    }
-                    ensure_scoped_class_type_decl(
-                        db,
-                        file_id,
-                        &scope_match.class_name,
-                        &scope_match.global_name,
-                        &scope_match.super_types,
-                        in_filed_tree.value.syntax().text_range(),
-                    );
-
-                    collect_scripted_scope_type_bindings_with(db, file_id, &scope_match);
-                    synthesize_scoped_base_assignments_with(
-                        db,
-                        file_id,
-                        in_filed_tree.value.clone(),
-                        &scope_match,
-                    );
-                }
-                if let Some(s) = s {
-                    t_scoped += s.elapsed();
-                }
-            }
-
-            if keywords.has_realm_branch {
-                if let Some(profile) = profile.as_mut() {
-                    profile.branch_realm_ranges += branch_ranges.len();
-                }
-                if !branch_ranges.is_empty() {
-                    branch_realm_ranges.insert(file_id, branch_ranges);
-                }
-            }
-            if keywords.has_realm_anno {
-                if let Some(realm) = annotation_realm {
-                    annotation_realms.insert(file_id, realm);
-                    if let Some(profile) = profile.as_mut() {
-                        profile.annotation_realms += 1;
-                    }
-                }
-                if let Some(profile) = profile.as_mut() {
-                    profile.member_realm_ranges += member_ranges.len();
-                }
-            }
-            // Every analyzed file records an entry, so the index answers for all
-            // of them and no reader has to walk the tree itself to find out.
-            // A file whose content never mentions `@realm` cannot carry a realm
-            // doc tag, so its empty vector is derived, not assumed: the producer
-            // skips the walk and this records the same answer it would have got.
-            db.get_gmod_infer_index_mut()
-                .set_member_realm_ranges(file_id, member_ranges);
-
-            if let Some(file_params) = file_params
-                && !file_params.is_empty()
-            {
-                db.get_gmod_infer_index_mut()
-                    .set_file_params(file_id, file_params);
-            }
-        }
-        if do_profile {
-            if let Some(profile) = profile.as_ref() {
-                profile.log();
-            }
-            log::info!(
-                "gmod pre: per-file metadata cost {:?} (parallel_collect={:?}, scoped_merge={:?})",
-                t0.map(|t0| t0.elapsed()).unwrap_or_default(),
-                t_collect,
-                t_scoped,
-            );
-        }
-
-        // Network var wrappers are purely syntactic (AST pattern matching)
-        let t1 = do_profile.then(std::time::Instant::now);
-        let tree_map: HashMap<FileId, LuaChunk> = tree_list
-            .iter()
-            .map(|x| (x.file_id, x.value.clone()))
-            .collect();
-        crate::profile::phase("gmodpre/network_var_wrappers", || {
-            synthesize_network_var_wrappers(db, &scripted_scope_files, &tree_map)
-        });
-        if let Some(t1) = t1 {
-            log::info!("gmod pre: network_var_wrappers cost {:?}", t1.elapsed());
-        }
-
-        let t_load = do_profile.then(std::time::Instant::now);
-        let load_roles_ptr = Arc::as_ptr(&annotated_global_call_roles) as usize;
-        crate::profile::phase("gmodpre/rebuild_load_index", || {
-            rebuild_gmod_load_index(
-                db,
-                &branch_realm_ranges,
-                &annotation_realms,
-                &file_ids,
-                &annotated_global_call_roles,
-                load_roles_ptr,
-            )
-        });
-        if let Some(t_load) = t_load {
-            log::info!(
-                "gmod pre: rebuild_gmod_load_index cost {:?}",
-                t_load.elapsed()
-            );
-        }
-
-        let t2 = do_profile.then(std::time::Instant::now);
-        crate::profile::phase("gmodpre/rebuild_realm_metadata", || {
-            rebuild_realm_metadata(db, branch_realm_ranges, annotation_realms, &file_ids)
-        });
-        if let Some(t2) = t2 {
-            log::info!("gmod pre: rebuild_realm_metadata cost {:?}", t2.elapsed());
-        }
-
-        crate::profile::phase("gmodpre/effective_valid_guard_signatures", || {
-            rebuild_effective_valid_guard_signatures(db)
-        });
-    }
-}
-
-#[derive(Default)]
-struct GmodPreProfile {
-    files_scanned: usize,
-    hook_keyword_files: usize,
-    system_call_keyword_files: usize,
-    gm_func_keyword_files: usize,
-    realm_branch_keyword_files: usize,
-    realm_annotation_keyword_files: usize,
-    scoped_files: usize,
-    hook_metadata_skips: usize,
-    gm_method_realms: usize,
-    scoped_class_matches: usize,
-    branch_realm_ranges: usize,
-    annotation_realms: usize,
-    member_realm_ranges: usize,
-}
-
-impl GmodPreProfile {
-    fn record_keywords(&mut self, keywords: &GmodKeywords, is_scoped: bool) {
-        self.hook_keyword_files += usize::from(keywords.has_hook);
-        self.system_call_keyword_files += usize::from(keywords.has_system_call);
-        self.gm_func_keyword_files += usize::from(keywords.has_gm_func);
-        self.realm_branch_keyword_files += usize::from(keywords.has_realm_branch);
-        self.realm_annotation_keyword_files += usize::from(keywords.has_realm_anno);
-        self.scoped_files += usize::from(is_scoped);
-    }
-
-    fn log(&self) {
-        log::info!(
-            "gmod pre profile: files={} keyword_files hook={} system={} gm_func={} realm_branch={} realm_anno={} scoped={} hook_skips={} gm_method_realms={} scoped_matches={} branch_ranges={} annotation_realms={} member_ranges={}",
-            self.files_scanned,
-            self.hook_keyword_files,
-            self.system_call_keyword_files,
-            self.gm_func_keyword_files,
-            self.realm_branch_keyword_files,
-            self.realm_annotation_keyword_files,
-            self.scoped_files,
-            self.hook_metadata_skips,
-            self.gm_method_realms,
-            self.scoped_class_matches,
-            self.branch_realm_ranges,
-            self.annotation_realms,
-            self.member_realm_ranges,
+/// Collects the net message flows of the context's files.
+///
+/// Flow collection reads resolved signatures, receivers and members, so a
+/// file's flows re-derive whenever one of those it read changes.
+fn collect_network_flows(
+    db: &mut DbIndex,
+    context: &AnalyzeContext,
+    helper_registry: &HelperRegistry,
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
+) {
+    let file_ids: Vec<FileId> = context.tree_list.iter().map(|tree| tree.file_id).collect();
+    let collected_files: FxHashSet<FileId> = file_ids.iter().copied().collect();
+    let reach = HelperStartReachCache::default();
+    let resolve_shared = Arc::new(NetResolveShared::default());
+    let names = db.get_gmod_network_index().helper_names();
+    let helper_call_sites = net_helper_call_sites(db, (*names).clone(), &collected_files);
+    for file_id in file_ids {
+        let (network_data, _, _) = collect_file_network_flows(
+            db,
+            file_id,
+            helper_registry,
+            annotated_global_call_roles,
+            &reach,
+            &helper_call_sites,
+            &resolve_shared,
         );
-    }
-}
-
-/// Collects GMod `net` message flows.
-///
-/// This runs at the very end of the batch, after declaration, doc, lua and
-/// unresolve analysis, because flow collection *reads* what those produce:
-/// resolving `net.Start`/`net.Send` reached through a wrapper needs the
-/// wrapper's signature, its receiver's type, and the members those depend on.
-///
-/// Collecting any earlier would let the collector see a poorer index on a cold
-/// build than on a re-index, which makes `gmod-net-*` diagnostics change across
-/// the workspace after the first edit. Nothing in the analysis pipeline reads
-/// the network index (only diagnostics do), so collecting it last costs nothing
-/// and is the only point at which the input state is the same for a cold build
-/// and a partial re-index.
-pub struct GmodNetworkAnalysisPipeline;
-
-impl AnalysisPipeline for GmodNetworkAnalysisPipeline {
-    fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
-        if !db.get_emmyrc().gmod.enabled {
-            return;
+        if network_data.send_flows.is_empty() && network_data.receive_flows.is_empty() {
+            continue;
         }
-
-        let tree_list = context.tree_list.clone();
-        if tree_list.is_empty() {
-            return;
-        }
-        let _p = Profile::cond_new("gmod net-analyze", tree_list.len() > 1);
-
-        // The gmod pre-pass already built these for this batch; reuse them
-        // unless the signature index has grown since (the revision covers that).
-        // On a miss the rebuild is served from the per-file scan cache, so it
-        // only re-derives the files that changed.
-        let helper_revision = helper_registry_revision(db);
-        let reusable_roles = context
-            .gmod_global_call_roles
-            .as_ref()
-            .filter(|(revision, _)| *revision == helper_revision)
-            .map(|(_, roles)| roles.clone());
-        let cached_registry = db.get_cached_helper_registry(helper_revision);
-
-        let (helper_registry, annotated_global_call_roles) = match (cached_registry, reusable_roles)
-        {
-            (Some(registry), Some(roles)) => (registry, roles),
-            _ => crate::profile::phase("gmodnet/build_registry", || {
-                let (registry, roles) = build_call_roles_and_registry(db);
-                context.gmod_global_call_roles = Some((helper_revision, roles.clone()));
-                (registry, roles)
-            }),
-        };
-
-        let file_ids: Vec<FileId> = tree_list.iter().map(|tree| tree.file_id).collect();
-        let collected_files: FxHashSet<FileId> = file_ids.iter().copied().collect();
-        let reach = HelperStartReachCache::default();
-        let resolve_shared = Arc::new(NetResolveShared::default());
-        let mut helper_name_memo = db.get_gmod_network_index_mut().take_helper_name_memo();
-        let helper_call_sites = {
-            let db: &DbIndex = db;
-            crate::profile::phase("gmodnet/helper_call_sites", || {
-                let op_names = net_operation_names(&annotated_global_call_roles);
-                let mut names = crate::profile::phase("gmodnet/helper_names", || {
-                    net_producing_function_names(db, &op_names, &mut helper_name_memo)
-                });
-                names.extend(op_names);
-                net_helper_call_sites(db, names, &collected_files)
-            })
-        };
         db.get_gmod_network_index_mut()
-            .restore_helper_name_memo(helper_name_memo);
-        // The registry and semantic revision together identify call-resolution inputs.
-        let registry_identity = Arc::as_ptr(&helper_registry) as usize;
-        // Retain parked flows only while their syntax and semantic inputs match.
-        let recollect: Vec<FileId> = file_ids
-            .iter()
-            .copied()
-            .filter(|file_id| !network_staged_inputs_are_fresh(db, *file_id, registry_identity))
-            .collect();
-        // Restoring first keeps `iter_send_flows` (sorted by file id, with
-        // replaced definitions hidden through the refcount) deterministic
-        // regardless of which files recollected: retained entries never leave
-        // the index in a different order.
-        let recollect_set: HashSet<FileId> = recollect.iter().copied().collect();
-        for file_id in file_ids
-            .iter()
-            .copied()
-            .filter(|file_id| !recollect_set.contains(file_id))
-        {
-            db.get_gmod_network_index_mut().restore_staged_file(file_id);
-        }
-        let collected = crate::profile::phase("gmodnet/collect_flows", || {
-            super::parallel::map_files_collect(db, &recollect, |db, file_id| {
-                collect_file_network_flows(
-                    db,
-                    file_id,
-                    &helper_registry,
-                    &annotated_global_call_roles,
-                    &reach,
-                    &helper_call_sites,
-                    &resolve_shared,
-                )
-            })
-        });
-        for (file_id, (network_data, expanded_helpers, missed_member_reads)) in
-            recollect.iter().zip(collected)
-        {
-            context
-                .infer_manager
-                .extend_missed_member_reads(*file_id, missed_member_reads);
-            let inputs = network_file_inputs_for_collection(
-                db,
-                *file_id,
-                registry_identity,
-                &expanded_helpers,
-            );
-            if network_data.send_flows.is_empty() && network_data.receive_flows.is_empty() {
-                // No flows to store, but the inputs still describe the file:
-                // recording them keeps empty files retainable without
-                // recollecting. Any previously parked entry was superseded.
-                db.get_gmod_network_index_mut().drop_staged_file(*file_id);
-                db.get_gmod_network_index_mut()
-                    .set_file_inputs(*file_id, inputs);
-                continue;
-            }
-            db.get_gmod_network_index_mut()
-                .add_file_data(*file_id, network_data);
-            db.get_gmod_network_index_mut()
-                .set_file_inputs(*file_id, inputs);
-        }
-        // Anything still parked belongs to a deleted file: live files were
-        // either recollected or restored above.
-        let live_check: Vec<FileId> = db.get_vfs().get_all_file_ids().into_iter().collect();
-        let live_set: HashSet<FileId> = live_check.into_iter().collect();
-        db.get_gmod_network_index_mut()
-            .prune_staged_dead_files(|file_id| live_set.contains(&file_id));
-    }
-}
-
-/// Hash of a file's content for the B8 retain check. `None` when the file has
-/// no content (deleted or never loaded) — a missing tree can never be fresh.
-fn hash_network_file_content(db: &DbIndex, file_id: &FileId) -> Option<u64> {
-    db.get_vfs()
-        .get_file_content(file_id)
-        .map(|content| hash_u64_with(|h| content.hash(h)))
-}
-
-/// Whether the flows parked for `file_id` still describe it: the staged
-/// inputs exist, the semantic revision and fold match, the file's own content
-/// hashes equal, and every expanded helper file's content hashes equal.
-/// Conservative throughout: anything unreadable or changed recollects.
-fn network_staged_inputs_are_fresh(
-    db: &DbIndex,
-    file_id: FileId,
-    registry_identity: usize,
-) -> bool {
-    let Some(staged) = db.get_gmod_network_index().staged_file_inputs(file_id) else {
-        return false;
-    };
-    if staged.registry_identity != registry_identity
-        || staged.semantic_revision != db.type_structure_revision()
-    {
-        return false;
-    }
-    if hash_network_file_content(db, &file_id) != Some(staged.content_hash) {
-        return false;
-    }
-    staged
-        .helper_contents
-        .iter()
-        .all(|(helper_file_id, _, hash)| hash_network_file_content(db, helper_file_id) == *hash)
-}
-
-/// Inputs describing a fresh collection, for [`NetworkFileInputs`].
-/// `expanded_helpers` holds every cross-file body the walks resolved, so the
-/// retain check pins exactly the files the flows were derived from.
-fn network_file_inputs_for_collection(
-    db: &DbIndex,
-    file_id: FileId,
-    registry_identity: usize,
-    expanded_helpers: &HashSet<HelperId>,
-) -> crate::db_index::NetworkFileInputs {
-    let mut helper_contents: Vec<(FileId, TextRange, Option<u64>)> = expanded_helpers
-        .iter()
-        .map(|(helper_file_id, range)| {
-            (
-                *helper_file_id,
-                *range,
-                hash_network_file_content(db, helper_file_id),
-            )
-        })
-        .collect();
-    helper_contents.sort_by_key(|(helper_file_id, range, _)| {
-        (
-            *helper_file_id,
-            u32::from(range.start()),
-            u32::from(range.end()),
-        )
-    });
-    crate::db_index::NetworkFileInputs {
-        semantic_revision: db.type_structure_revision(),
-        content_hash: hash_network_file_content(db, &file_id).unwrap_or(0),
-        registry_identity,
-        helper_contents,
+            .add_file_data(file_id, network_data);
     }
 }
 
@@ -766,124 +268,6 @@ fn collect_file_network_flows(
     (data, expanded_helpers, net.drain_missed_member_reads())
 }
 
-/// Post-analysis phase: runs AFTER lua_analyze.
-///
-/// Synthesizes members that depend on metadata collected during lua_analyze
-/// (gmod_class_metadata_index: AccessorFunc, NetworkVar, VGUI register calls).
-pub struct GmodPostAnalysisPipeline;
-
-impl AnalysisPipeline for GmodPostAnalysisPipeline {
-    fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
-        if !db.get_emmyrc().gmod.enabled {
-            return;
-        }
-
-        let _p = Profile::cond_new("gmod post-analyze", context.tree_list.len() > 1);
-        let file_ids: Vec<FileId> = context.tree_list.iter().map(|x| x.file_id).collect();
-        let stderr_profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
-        let do_profile = context.tree_list.len() > 100
-            && (log::log_enabled!(log::Level::Info) || stderr_profile_enabled);
-
-        let scripted_scope_files = crate::profile::phase("gmodpost/scripted_scope_files", || {
-            context.get_or_compute_scripted_scope_files(db).clone()
-        });
-
-        // Resolve scripted_ents.GetMember delegations BEFORE synthesizing
-        // members so that NetworkVar calls copied from target entities are
-        // picked up by synthesize_scripted_class_members.
-        let t_deleg = do_profile.then(std::time::Instant::now);
-        crate::profile::phase("gmodpost/getmember_delegations", || {
-            resolve_getmember_network_var_delegations(db, &scripted_scope_files, context)
-        });
-        if let Some(t_deleg) = t_deleg {
-            log::info!(
-                "gmod post: getmember_delegations cost {:?}",
-                t_deleg.elapsed()
-            );
-        }
-
-        let t_class = do_profile.then(std::time::Instant::now);
-        // Same per-file cached scan the net pass uses. Folding the signature
-        // index directly here took its `HashMap` iteration order, so a call path
-        // defined by two files resolved differently between processes.
-        //
-        // The earlier passes in this batch already derived these roles. Lua
-        // analysis since then can have grown the signature index, so they are
-        // only reusable while the revision they were built at still holds; the
-        // registry beside them is not wanted here.
-        let helper_revision = helper_registry_revision(db);
-        let reusable_roles = context
-            .gmod_global_call_roles
-            .as_ref()
-            .filter(|(revision, _)| *revision == helper_revision)
-            .map(|(_, roles)| roles.clone());
-        let annotated_global_call_roles = match reusable_roles {
-            Some(roles) => roles,
-            None => crate::profile::phase("gmodpost/call_roles_and_registry", || {
-                let (_, roles) = build_call_roles_and_registry(db);
-                context.gmod_global_call_roles = Some((helper_revision, roles.clone()));
-                roles
-            }),
-        };
-        crate::profile::phase("gmodpost/scripted_class_calls", || {
-            collect_annotated_scripted_class_calls(db, context, &annotated_global_call_roles)
-        });
-        crate::profile::phase("gmodpost/compilefile_environments", || {
-            update_compilefile_execution_environments(db, context, &annotated_global_call_roles)
-        });
-        if let Some(t_class) = t_class {
-            log::info!(
-                "gmod post: annotated_scripted_class_calls cost {:?}",
-                t_class.elapsed()
-            );
-        }
-
-        let t1 = do_profile.then(std::time::Instant::now);
-        crate::profile::phase("gmodpost/vgui_registrations", || {
-            synthesize_vgui_registrations(db, context, &file_ids)
-        });
-        if let Some(t1) = t1 {
-            log::info!("gmod post: vgui_registrations cost {:?}", t1.elapsed());
-        }
-        let t_parent = do_profile.then(std::time::Instant::now);
-        crate::profile::phase("gmodpost/vgui_parent_relations", || {
-            resolve_vgui_parent_relations(db, context, &file_ids)
-        });
-        crate::profile::phase("gmodpost/vgui_parent_fallback_rederive", || {
-            crate::compilation::analyzer::rederive_vgui_parent_fallbacks(db, context)
-        });
-        if let Some(t_parent) = t_parent {
-            log::info!(
-                "gmod post: vgui_parent_relations cost {:?}",
-                t_parent.elapsed()
-            );
-        }
-
-        let t_local_register = do_profile.then(std::time::Instant::now);
-        crate::profile::phase("gmodpost/scripted_ent_registrations", || {
-            synthesize_scripted_ent_registrations(db, &file_ids)
-        });
-        if let Some(t_local_register) = t_local_register {
-            log::info!(
-                "gmod post: scripted_ent_registrations cost {:?}",
-                t_local_register.elapsed()
-            );
-        }
-
-        let t0 = do_profile.then(std::time::Instant::now);
-        crate::profile::phase("gmodpost/scripted_class_members", || {
-            synthesize_scripted_class_members(db, &scripted_scope_files, &file_ids)
-        });
-        if let Some(t0) = t0 {
-            log::info!("gmod post: scripted_class_members cost {:?}", t0.elapsed());
-        }
-
-        crate::profile::phase("gmodpost/numeric_range_populations", || {
-            collect_numeric_range_table_populations(db, context)
-        });
-    }
-}
-
 fn collect_numeric_range_table_populations(db: &mut DbIndex, context: &AnalyzeContext) {
     for in_filed_tree in &context.tree_list {
         let file_id = in_filed_tree.file_id;
@@ -917,15 +301,6 @@ fn formatted_hook_prefixes(db: &DbIndex) -> Vec<String> {
         .collect()
 }
 
-fn collect_annotated_scripted_class_calls(
-    db: &mut DbIndex,
-    context: &mut AnalyzeContext,
-    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
-) {
-    let prefixes = formatted_hook_prefixes(db);
-    collect_annotated_call_sites_with(db, context, &prefixes, annotated_global_call_roles, false);
-}
-
 /// A db write produced by the per-file annotated call-site scan.
 ///
 /// The scan itself reads only the file's own AST plus immutable db state; the
@@ -935,7 +310,7 @@ enum PendingCallSite {
     VguiParent(GmodVguiParentCallMetadata),
     /// A parent call whose receiver the index could not type yet. See
     /// [`resolve_deferred_vgui_parent_calls`].
-    DeferredVguiParent(LuaSyntaxId),
+    DeferredVguiParent,
     ScriptedClass(GmodScriptedClassCallKind, GmodScriptedClassCallMetadata),
     Dependency(LuaDependencySite),
 }
@@ -948,6 +323,7 @@ fn collect_annotated_call_sites_with(
     formatted_hook_prefixes: &[String],
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
     include_load: bool,
+    include_class_calls: bool,
 ) {
     let file_ids = context
         .tree_list
@@ -967,7 +343,8 @@ fn collect_annotated_call_sites_with(
             })
             .unwrap_or_default();
         let scan_load = include_load && keywords.has_load_call;
-        if !keywords.has_scripted_class_call && !scan_load {
+        let scan_class_calls = include_class_calls && keywords.has_scripted_class_call;
+        if !scan_class_calls && !scan_load {
             return Vec::new();
         }
         let Some(root) = db
@@ -982,7 +359,7 @@ fn collect_annotated_call_sites_with(
             AnnotatedGmodCallRoleMap::build(db, file_id, &root, annotated_global_call_roles);
         let mut pending = Vec::new();
         for call_expr in root.syntax().descendants().filter_map(LuaCallExpr::cast) {
-            if keywords.has_scripted_class_call {
+            if scan_class_calls {
                 collect_annotated_scripted_class_call_metadata(
                     db,
                     file_id,
@@ -1010,9 +387,9 @@ fn collect_annotated_call_sites_with(
                 PendingCallSite::VguiParent(call) => db
                     .get_gmod_class_metadata_index_mut()
                     .add_vgui_parent_call(*file_id, call),
-                PendingCallSite::DeferredVguiParent(syntax_id) => {
-                    context.record_deferred_vgui_parent_call(*file_id, syntax_id)
-                }
+                // Its receiver has no type yet; the site is collected once
+                // the receiver's type lands and this derivation re-runs.
+                PendingCallSite::DeferredVguiParent => {}
                 PendingCallSite::ScriptedClass(kind, call) => db
                     .get_gmod_class_metadata_index_mut()
                     .add_call(*file_id, kind, call),
@@ -1022,28 +399,6 @@ fn collect_annotated_call_sites_with(
             }
         }
     }
-}
-
-/// Scripted-class registration and `load`-style call sites for one
-/// workspace group, collected before *any* group resolves.
-///
-/// The role map is stashed on the context because `GmodPreAnalysisPipeline`
-/// needs the same one; rebuilding it there would repeat a full signature-index
-/// fold per group.
-pub(crate) fn collect_gmod_call_sites(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    if !db.get_emmyrc().gmod.enabled {
-        return;
-    }
-
-    let prefixes = formatted_hook_prefixes(db);
-    let helper_revision = helper_registry_revision(db);
-    let (_, annotated_global_call_roles) = {
-        let _p = Profile::new("ccs: build_call_roles_and_registry");
-        build_call_roles_and_registry(db)
-    };
-    context.gmod_global_call_roles = Some((helper_revision, annotated_global_call_roles.clone()));
-    let _p = Profile::new("ccs: walk");
-    collect_annotated_call_sites_with(db, context, &prefixes, &annotated_global_call_roles, true);
 }
 
 fn collect_annotated_load_dependency_site(
@@ -1098,221 +453,96 @@ pub(crate) struct HelperRegistry {
     signatures: HashMap<LuaSignatureId, (FileId, LuaSyntaxId)>,
 }
 
+impl HelperRegistry {
+    /// A value fingerprint of the registry: its entries in a stable order.
+    fn fingerprint(&self) -> crate::db_index::derivation::Fingerprint {
+        let mut globals = self.globals.iter().collect::<Vec<_>>();
+        globals.sort_by(|a, b| a.0.get_name().cmp(b.0.get_name()));
+        let mut methods = self.methods.iter().collect::<Vec<_>>();
+        methods.sort_by(|a, b| a.0.cmp(b.0));
+        let mut signatures = self.signatures.iter().collect::<Vec<_>>();
+        signatures.sort_by_key(|(id, _)| (id.get_file_id(), id.get_position()));
+        crate::db_index::derivation::fingerprint_of(&(globals, methods, signatures))
+    }
+}
+
 type IndexedHelperDefinition = (LuaSignatureId, FileId, LuaSyntaxId, Option<GlobalId>);
 
-/// Cache key for the within-analyze fast path.
-///
-/// The revision-keyed `helper_registry_cache` slot is only a shortcut for
-/// reusing the fold between the pipelines of a single analyze batch (VFS
-/// content cannot change mid-batch, so the key is stable there). It misses on
-/// every edit by construction (`content_revision` moves on any VFS write, and
-/// `remove_index` clears the slot), so the cross-edit fold cache is the
-/// scan-set-keyed [`CachedHelperFold`] below instead. Both reads are `O(1)`.
-fn helper_registry_revision(db: &DbIndex) -> u64 {
-    let content_revision = db.get_vfs().content_revision();
-    let signature_count = db.get_signature_index().indexed_signature_count() as u64;
-    content_revision
-        .rotate_left(32)
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ signature_count
-}
-
-/// Sentinel `FileId`s for workspace-wide fold caches kept in
-/// `file_helper_scan_cache`.
-///
-/// `FileId::VIRTUAL` already takes `u32::MAX`, and real ids are handed out
-/// sequentially from zero, so these are unreachable by real files. They are
-/// never passed to `remove_index` (which only ever names real batch files),
-/// which is what lets the caches below survive the per-edit invalidation that
-/// clears the revision-keyed `helper_registry_cache` slot on every edit.
-fn helper_fold_cache_sentinel() -> FileId {
-    FileId::new(u32::MAX - 1)
-}
-
-fn load_snapshot_cache_sentinel() -> FileId {
-    FileId::new(u32::MAX - 2)
-}
-
-/// A single file's cached contribution to the gmod net-helper scan.
-struct FileHelperScan {
+/// One file's contribution to the gmod call roles and net-helper registry.
+pub(crate) struct FileHelperScan {
     role_map: AnnotatedGmodGlobalCallRoleMap,
     definitions: Vec<IndexedHelperDefinition>,
 }
 
-/// The folded call-role map plus helper registry, keyed on the scan set they
-/// were derived from.
-///
-/// A file's scan is a pure function of that file's own signatures and syntax
-/// tree, so the fold is a pure function of the scan set. Identity is by `Arc`
-/// pointer per path-sorted entry: an unchanged file keeps its cached `Arc`,
-/// while any recomputed, added or removed scan changes the entry. Pointer
-/// equality of the whole vector therefore implies identical fold inputs and
-/// the fold can be reused as-is (the stored registry's `(FileId, LuaSyntaxId)`
-/// targets stay valid because no contributing file changed).
-///
-/// This is deliberately conservative: a recomputed scan whose content happens
-/// to be identical still rebuilds the fold. That only costs an extra fold on
-/// edits that touch helper-carrying files; edits to files without scans
-/// (the common data/config case) keep every `Arc` and skip the fold whole.
-struct CachedHelperFold {
-    scans: Vec<(String, Arc<FileHelperScan>)>,
-    registry: Arc<HelperRegistry>,
-    roles: Arc<AnnotatedGmodGlobalCallRoleMap>,
+impl FileHelperScan {
+    fn fingerprint(&self) -> crate::db_index::derivation::Fingerprint {
+        crate::db_index::derivation::fingerprint_of(&(
+            self.role_map.fingerprint(),
+            &self.definitions,
+        ))
+    }
 }
 
-/// Builds the annotated call-role map and the net-helper registry from
-/// per-file cached scans.
+/// Scans one file's signatures for call roles and net-helper definitions.
+pub(crate) fn evaluate_helper_scan(db: &mut DbIndex, file_id: FileId) {
+    if !db.get_emmyrc().gmod.enabled {
+        return;
+    }
+    let mut signature_ids = db
+        .get_signature_index()
+        .get_file_signature_ids(file_id)
+        .map(|ids| ids.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if signature_ids.is_empty() {
+        return;
+    }
+    signature_ids.sort_unstable_by_key(|signature_id| signature_id.get_position());
+    let has_calls = db.get_vfs().get_syntax_tree(&file_id).is_some_and(|tree| {
+        tree.get_chunk_node()
+            .syntax()
+            .descendants()
+            .any(|node| LuaCallExpr::can_cast(node.kind().into()))
+    });
+    let scan = AnnotatedGmodGlobalCallRoleMap::build_for_file(db, &signature_ids, has_calls);
+    let fingerprint = scan.fingerprint();
+    db.set_helper_scan(file_id, Arc::new(scan), fingerprint);
+}
+
+/// Folds every file's helper scan into the call-role map and the net-helper
+/// registry. Files merge in path order, so the file that wins a call path
+/// both define is a property of the source, not of the session.
 fn build_call_roles_and_registry(
-    db: &mut DbIndex,
+    db: &DbIndex,
 ) -> (Arc<HelperRegistry>, Arc<AnnotatedGmodGlobalCallRoleMap>) {
-    let helper_revision = helper_registry_revision(db);
-    let cached_helper_registry = db.get_cached_helper_registry::<HelperRegistry>(helper_revision);
-
-    let mut signatures_by_file: HashMap<FileId, Vec<LuaSignatureId>> =
-        crate::profile::phase("ccs/signatures_by_file", || {
-            let mut map: HashMap<FileId, Vec<LuaSignatureId>> = HashMap::default();
-            for (signature_id, _) in db.get_signature_index().iter() {
-                map.entry(signature_id.get_file_id())
-                    .or_default()
-                    .push(*signature_id);
-            }
-            map
-        });
-    // Merge order decides which file wins a call path both define, so it has to
-    // be a property of the source, not of the session. `FileId`s are handed out
-    // in workspace-collection order and shift when a file is removed and
-    // re-added, so order by normalized path — the same policy
-    // `HelperRegistryBuilder::build` already uses for its definitions.
-    let scan_files = crate::profile::phase("ccs/sort_scan_files", || {
-        let vfs = db.get_vfs();
-        let mut scan_files = signatures_by_file.keys().copied().collect::<Vec<_>>();
-        scan_files.sort_by_cached_key(|file_id| {
-            let raw_path = vfs
-                .get_file_path(file_id)
-                .map(|path| path.to_string_lossy().to_string())
-                .unwrap_or_default();
-            (
-                crate::vfs::normalize_path_for_ordering(&raw_path),
-                raw_path,
-                file_id.id,
-            )
-        });
-        scan_files
-    });
-
-    // A file's scan reads only its own signatures plus immutable db state, so
-    // the uncached ones are derived concurrently. On a cold index that is every
-    // file in the workspace, and the per-file syntax-tree walk behind
-    // `has_calls` dominates. Results are stored and merged below in exactly the
-    // previous fixed file order, so the fold is unchanged.
-    let uncached = scan_files
-        .iter()
-        .copied()
-        .filter(|file_id| {
-            db.get_cached_file_helper_scan::<FileHelperScan>(*file_id)
-                .is_none()
-        })
-        .collect::<Vec<_>>();
-    let sorted_signatures = uncached
-        .iter()
-        .map(|file_id| {
-            let mut signature_ids = signatures_by_file.remove(file_id).unwrap_or_default();
-            signature_ids.sort_unstable_by_key(|signature_id| signature_id.get_position());
-            (*file_id, signature_ids)
-        })
-        .collect::<HashMap<_, _>>();
-    let scanned = super::parallel::map_files_collect(db, &uncached, |db, file_id| {
-        let has_calls = db
-            .get_vfs()
-            .get_syntax_tree(&file_id)
-            .map(|tree| {
-                tree.get_chunk_node()
-                    .syntax()
-                    .descendants()
-                    .any(|node| LuaCallExpr::can_cast(node.kind().into()))
-            })
-            .unwrap_or(false);
-        Arc::new(AnnotatedGmodGlobalCallRoleMap::build_for_file(
-            db,
-            &sorted_signatures[&file_id],
-            has_calls,
-        ))
-    });
-    for (file_id, scan) in uncached.iter().zip(scanned) {
-        db.set_cached_file_helper_scan(*file_id, scan);
-    }
-
-    // B5: the fold is keyed on the scan set itself, not on `content_revision`.
-    // `scan_files` is already in fixed path order, so zipping the cached
-    // `Arc`s in that order is a deterministic identity of the fold inputs.
-    // Every entry is an `Arc` hit unless its file was (re)scanned above,
-    // added, or removed — pointer equality of the whole vector therefore
-    // means no scan changed and the stored fold is still the answer.
-    let current_scans: Vec<(String, Arc<FileHelperScan>)> = scan_files
-        .iter()
-        .filter_map(|file_id| {
-            let scan = db.get_cached_file_helper_scan::<FileHelperScan>(*file_id)?;
-            let raw_path = db
-                .get_vfs()
-                .get_file_path(file_id)
-                .map(|path| path.to_string_lossy().to_string())
-                .unwrap_or_default();
-            Some((raw_path, scan))
-        })
-        .collect();
-    if let Some(cached) =
-        db.get_cached_file_helper_scan::<CachedHelperFold>(helper_fold_cache_sentinel())
-        && cached.scans.len() == current_scans.len()
-        && cached.scans.iter().zip(current_scans.iter()).all(
-            |((cached_path, cached_scan), (current_path, current_scan))| {
-                cached_path == current_path && Arc::ptr_eq(cached_scan, current_scan)
-            },
+    let mut scan_files = db.helper_scan_files();
+    let vfs = db.get_vfs();
+    scan_files.sort_by_cached_key(|file_id| {
+        let raw_path = vfs
+            .get_file_path(file_id)
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default();
+        (
+            crate::vfs::normalize_path_for_ordering(&raw_path),
+            raw_path,
+            file_id.id,
         )
-    {
-        return (cached.registry.clone(), cached.roles.clone());
+    });
+    let mut role_map = AnnotatedGmodGlobalCallRoleMap::default();
+    let mut definitions: Vec<IndexedHelperDefinition> = Vec::new();
+    for file_id in scan_files {
+        let Some(scan) = db.get_helper_scan::<FileHelperScan>(file_id) else {
+            continue;
+        };
+        role_map.merge_from(&scan.role_map);
+        definitions.extend(scan.definitions.iter().cloned());
     }
-
-    let (mut role_map, definitions) = crate::profile::phase("ccs/merge_scans", || {
-        let mut role_map = AnnotatedGmodGlobalCallRoleMap::default();
-        let mut definitions: Vec<IndexedHelperDefinition> = Vec::new();
-        for file_id in scan_files {
-            let Some(scan) = db.get_cached_file_helper_scan::<FileHelperScan>(file_id) else {
-                continue;
-            };
-            role_map.merge_from(&scan.role_map);
-            if cached_helper_registry.is_none() {
-                definitions.extend(scan.definitions.iter().cloned());
-            }
-        }
-        (role_map, definitions)
-    });
-    crate::profile::phase("ccs/rebuild_call_path_set", || {
-        role_map.rebuild_candidate_call_path_set()
-    });
-
-    let registry = match cached_helper_registry {
-        Some(registry) => registry,
-        None => crate::profile::phase("ccs/build_registry", || {
-            let builder = HelperRegistryBuilder {
-                definitions,
-                ..Default::default()
-            };
-            let registry = Arc::new(builder.build(db));
-            db.set_cached_helper_registry(helper_revision, registry.clone());
-            registry
-        }),
-    };
-
-    let roles = Arc::new(role_map);
-    db.set_cached_file_helper_scan(
-        helper_fold_cache_sentinel(),
-        Arc::new(CachedHelperFold {
-            scans: current_scans,
-            registry: registry.clone(),
-            roles: roles.clone(),
-        }),
-    );
-    (registry, roles)
+    role_map.rebuild_candidate_call_path_set();
+    let registry = HelperRegistryBuilder {
+        definitions,
+        ..Default::default()
+    }
+    .build(db);
+    (Arc::new(registry), Arc::new(role_map))
 }
 
 #[derive(Default)]
@@ -1520,10 +750,9 @@ fn var_expr_written_name(var_expr: &LuaVarExpr) -> Option<SmolStr> {
 ///
 /// Nothing is scanned. The cost is proportional to how much net code the
 /// workspace actually has, not to its size.
-fn net_producing_function_names(
+pub(super) fn net_producing_function_names(
     db: &DbIndex,
     op_names: &HashSet<SmolStr>,
-    memo: &mut NetHelperNameMemo,
 ) -> HashSet<SmolStr> {
     let reference_index = db.get_reference_index();
     let mut names: HashSet<SmolStr> = HashSet::default();
@@ -1542,31 +771,19 @@ fn net_producing_function_names(
                 .files_referencing_name(&name)
                 .into_iter()
                 .map(|file_id| {
-                    let revision = reference_index.file_reference_revision(file_id);
-                    if let Some(expansion) = memo.name(file_id, revision, &name) {
-                        return expansion.clone();
-                    }
-                    let expansion = expand_sites(
+                    expand_sites(
                         db,
                         file_id,
                         &reference_index.name_references_in_file(&name, file_id),
-                    );
-                    memo.set_name(file_id, revision, name.clone(), expansion.clone());
-                    expansion
+                    )
                 })
                 .collect::<Vec<_>>()
         } else if let Some(decl_id) = pending_decls.pop() {
-            let file_id = decl_id.file_id;
-            let revision = reference_index.file_reference_revision(file_id);
-            let expansion = match memo.decl(file_id, revision, &decl_id) {
-                Some(expansion) => expansion.clone(),
-                None => {
-                    let expansion = expand_sites(db, file_id, &decl_read_sites(db, decl_id));
-                    memo.set_decl(file_id, revision, decl_id, expansion.clone());
-                    expansion
-                }
-            };
-            vec![expansion]
+            vec![expand_sites(
+                db,
+                decl_id.file_id,
+                &decl_read_sites(db, decl_id),
+            )]
         } else {
             break;
         };
@@ -1598,8 +815,6 @@ fn net_producing_function_names(
 /// each site's innermost enclosing closure, and that closure's local binding
 /// when it has one.
 ///
-/// Pure in the file's syntax tree and its own declaration references, which is
-/// what [`NetHelperNameMemo`] keys on.
 fn expand_sites(db: &DbIndex, file_id: FileId, sites: &[LuaSyntaxId]) -> NetNameExpansion {
     let mut expansion = NetNameExpansion::default();
     let Some(root) = db
@@ -1910,7 +1125,6 @@ impl LocalFnCache {
 /// Produced by [`collect_file_gmod_metadata`] (read-only against `&DbIndex`) and
 /// merged into the db sequentially by the pipeline in file order.
 struct GmodFileMetadataResult {
-    keywords: GmodKeywords,
     /// `Some` when hook metadata was collected (file had hook-relevant
     /// keywords): (hook sites, system metadata, gm-method realm annotations).
     /// `None` means the hook walk was skipped for this file.
@@ -1927,10 +1141,6 @@ struct GmodFileMetadataResult {
     annotation_realm: Option<GmodRealm>,
     /// `@fileparam` annotations, when the file content mentions `@fileparam`.
     file_params: Option<Vec<(String, String)>>,
-    /// Member lookups the hook-metadata walk's detached resolver caches
-    /// observed failing. Filed as this file's missed-reader edges so a member
-    /// that appears later re-analyses the file.
-    missed_member_reads: FxHashSet<(LuaMemberOwner, LuaMemberKey)>,
 }
 
 /// Collect all per-file gmod pre-analysis metadata for `file_id`. Read-only
@@ -1964,13 +1174,11 @@ fn collect_file_gmod_metadata(
         .map(|tree| tree.get_chunk_node())
     else {
         return GmodFileMetadataResult {
-            keywords,
             hook_metadata: None,
             member_ranges: Vec::new(),
             branch_ranges: Vec::new(),
             annotation_realm: None,
             file_params: None,
-            missed_member_reads: FxHashSet::default(),
         };
     };
 
@@ -2034,13 +1242,11 @@ fn collect_file_gmod_metadata(
     };
 
     GmodFileMetadataResult {
-        keywords,
         hook_metadata,
         member_ranges,
         branch_ranges,
         annotation_realm,
         file_params,
-        missed_member_reads: net.drain_missed_member_reads(),
     }
 }
 
@@ -4840,46 +4046,21 @@ fn ensure_scoped_class_type_decl(
     range: rowan::TextRange,
 ) -> LuaTypeDeclId {
     let class_decl_id = get_scripted_class_type_decl_id(global_name, class_name);
-    if db.get_type_index().get_type_decl(&class_decl_id).is_none() {
-        db.get_type_index_mut().add_type_decl(
-            file_id,
-            LuaTypeDecl::new(
-                file_id,
-                range,
-                class_decl_id.get_simple_name().to_string(),
-                LuaDeclTypeKind::Class,
-                LuaTypeFlag::None.into(),
-                class_decl_id.clone(),
-            ),
-        );
-    } else if db
-        .get_type_index()
-        .get_type_decl(&class_decl_id)
-        .is_some_and(|decl| {
-            !decl
-                .get_locations()
-                .iter()
-                .any(|loc| loc.file_id == file_id)
-        })
-    {
-        db.get_type_index_mut().add_type_decl_location(
-            file_id,
-            &class_decl_id,
-            LuaDeclLocation {
-                file_id,
-                range,
-                flag: LuaTypeFlag::None.into(),
-            },
-        );
-    }
-
-    for super_type in scoped_class_super_types(global_name, class_name, configured_super_types) {
-        db.get_type_index_mut().add_super_type_if_missing(
-            class_decl_id.clone(),
+    db.get_type_index_mut().add_type_decl(
+        file_id,
+        LuaTypeDecl::new(
             file_id,
             range,
-            super_type,
-        );
+            class_decl_id.get_simple_name().to_string(),
+            LuaDeclTypeKind::Class,
+            LuaTypeFlag::None.into(),
+            class_decl_id.clone(),
+        ),
+    );
+
+    for super_type in scoped_class_super_types(global_name, class_name, configured_super_types) {
+        db.get_type_index_mut()
+            .add_super_type(class_decl_id.clone(), file_id, range, super_type);
     }
     class_decl_id
 }
@@ -4911,13 +4092,10 @@ pub(crate) fn resolve_scoped_authoring_type(
         .then(|| get_scripted_class_type_decl_id(&info.global_name, &info.class_name))
 }
 
-use crate::{
-    GmodVguiParentSourceResolution as ResolvedVguiParentSource, GmodVguiResolvedParentSource,
-};
+use crate::GmodVguiParentSourceResolution as ResolvedVguiParentSource;
 
 #[derive(Clone)]
 struct ResolvedVguiParentRelation {
-    syntax_id: LuaSyntaxId,
     child_type_ids: Vec<LuaTypeDeclId>,
     parent: ResolvedVguiParentSource,
 }
@@ -4939,33 +4117,8 @@ enum ForwardingParentCandidate {
     Conflicted,
 }
 
-fn resolve_vgui_parent_relations(
-    db: &mut DbIndex,
-    context: &mut AnalyzeContext,
-    batch_file_ids: &[FileId],
-) {
-    // This group's files have had their calls re-collected by the passes
-    // before this one, so their removal marks come off: whatever relations
-    // they still contribute are resolved below. A marked file with no syntax
-    // tree left was deleted outright, and its relations are legitimately gone.
-    let mut settled_pending = db
-        .get_gmod_class_metadata_index()
-        .pending_vgui_parent_relation_file_ids()
-        .into_iter()
-        .filter(|file_id| db.get_vfs().get_syntax_tree(file_id).is_none())
-        .collect::<Vec<_>>();
-    settled_pending.extend_from_slice(batch_file_ids);
-    db.get_gmod_class_metadata_index_mut()
-        .clear_pending_vgui_parent_relation_files(&settled_pending);
-
-    let mut file_ids = db
-        .get_gmod_class_metadata_index()
-        .iter_file_metadata()
-        .filter_map(|(file_id, metadata)| {
-            (!metadata.vgui_parent_calls.is_empty()).then_some(*file_id)
-        })
-        .collect::<Vec<_>>();
-    file_ids.sort_by_key(|file_id| file_id.id);
+fn resolve_vgui_parent_relations(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    let file_ids = db.get_gmod_class_metadata_index().vgui_parent_call_files();
     let _p_cand = crate::profile::PhaseGuard::new("vgui/parent_candidates");
     let mut forwarding_parent_candidates =
         HashMap::<(LuaTypeDeclId, String), ForwardingParentCandidate>::default();
@@ -4993,60 +4146,35 @@ fn resolve_vgui_parent_relations(
     drop(_p_cand);
     let forwarding_parents =
         finalize_vgui_forwarding_parent_candidates(forwarding_parent_candidates);
-    let forwarding_parents_changed = db
-        .get_gmod_class_metadata_index_mut()
-        .update_vgui_forwarding_parents(&forwarding_parents);
-    let forwarding_scan_file_ids = if forwarding_parents_changed {
-        db.get_vfs().get_all_file_ids()
-    } else {
-        context.tree_list.iter().map(|tree| tree.file_id).collect()
-    };
-    if forwarding_parents_changed {
-        db.get_gmod_class_metadata_index_mut()
-            .clear_forwarded_vgui_parent_calls();
-    } else {
-        db.get_gmod_class_metadata_index_mut()
-            .clear_forwarded_vgui_parent_calls_for_files(&forwarding_scan_file_ids);
-    }
-    let _p_fwd = crate::profile::PhaseGuard::new("vgui/forwarding_scan");
-    file_ids.extend(collect_vgui_forwarding_parent_calls(
+    let forwarding_scan_file_ids = db.get_vfs().get_all_file_ids();
+    let mut calls_by_file = file_ids
+        .iter()
+        .map(|file_id| {
+            let calls = db
+                .get_gmod_class_metadata_index()
+                .get_vgui_parent_calls(file_id)
+                .to_vec();
+            (*file_id, calls)
+        })
+        .collect::<HashMap<_, _>>();
+    for (file_id, forwarded) in collect_vgui_forwarding_parent_calls(
         db,
         context,
         &forwarding_parents,
         &forwarding_scan_file_ids,
-    ));
-    drop(_p_fwd);
-    let _p_rel = crate::profile::PhaseGuard::new("vgui/resolve_relations");
-    file_ids.sort_by_key(|file_id| file_id.id);
-    file_ids.dedup();
+    ) {
+        calls_by_file.entry(file_id).or_default().extend(forwarded);
+    }
+    let mut calls_by_file = calls_by_file.into_iter().collect::<Vec<_>>();
+    calls_by_file.sort_by_key(|(file_id, _)| file_id.id);
     let mut relations_by_file = Vec::new();
-    for file_id in file_ids {
-        let calls = db
-            .get_gmod_class_metadata_index()
-            .get_vgui_parent_calls(&file_id);
-        if calls.is_empty() {
-            continue;
-        }
-        // Every call already resolved means this file was not rebuilt, so
-        // walking its syntax tree would reproduce what is cached. Skipping it is
-        // the whole point: only a handful of the workspace's vgui files are
-        // touched by any one edit.
-        if let Some(cached) = calls
-            .iter()
-            .map(|call| {
-                call.resolved_source
-                    .as_ref()
-                    .map(|source| ResolvedVguiParentRelation {
-                        syntax_id: call.syntax_id,
-                        child_type_ids: source.child_type_ids.clone(),
-                        parent: source.parent.clone(),
-                    })
-            })
-            .collect::<Option<Vec<_>>>()
-        {
-            relations_by_file.push((file_id, cached));
-            continue;
-        }
+    for (file_id, mut calls) in calls_by_file {
+        calls.sort_by_key(|call| {
+            (
+                call.syntax_id.get_range().start(),
+                call.syntax_id.get_range().end(),
+            )
+        });
         let Some(root) = db
             .get_vfs()
             .get_syntax_tree(&file_id)
@@ -5082,34 +4210,12 @@ fn resolve_vgui_parent_relations(
                 &call.parent,
             );
             relations.push(ResolvedVguiParentRelation {
-                syntax_id: call.syntax_id,
                 child_type_ids,
                 parent,
             });
         }
         relations_by_file.push((file_id, relations));
     }
-
-    let resolved_sources_by_file = relations_by_file
-        .iter()
-        .map(|(file_id, relations)| {
-            let sources = relations
-                .iter()
-                .map(|relation| {
-                    (
-                        relation.syntax_id,
-                        GmodVguiResolvedParentSource {
-                            child_type_ids: relation.child_type_ids.clone(),
-                            parent: relation.parent.clone(),
-                        },
-                    )
-                })
-                .collect();
-            (*file_id, sources)
-        })
-        .collect::<Vec<_>>();
-    db.get_gmod_class_metadata_index_mut()
-        .set_vgui_resolved_parent_sources(&resolved_sources_by_file);
 
     let mut direct_parents_by_child = HashMap::<LuaTypeDeclId, Vec<Vec<LuaTypeDeclId>>>::default();
     let mut relations_by_child = HashMap::<LuaTypeDeclId, Vec<ResolvedVguiParentSource>>::default();
@@ -5131,39 +4237,32 @@ fn resolve_vgui_parent_relations(
     }
 
     let mut direct_chain_memo = HashMap::default();
-    let mut resolved_by_file = Vec::new();
-    for (file_id, relations) in relations_by_file {
-        let mut resolved = Vec::with_capacity(relations.len());
+    let mut resolved = Vec::new();
+    for (_, relations) in relations_by_file {
         for relation in relations {
-            let child_relations = relation
-                .child_type_ids
-                .into_iter()
-                .map(|child_type_id| {
-                    let resolution = resolve_vgui_parent_chain(
-                        &child_type_id,
-                        &relations_by_child,
-                        &direct_parents_by_child,
-                        &mut direct_chain_memo,
-                    );
-                    let (parent_chain, parent_chain_complete) = match resolution {
-                        VguiParentChainResolution::Complete(chain) => (chain, true),
-                        VguiParentChainResolution::None | VguiParentChainResolution::Incomplete => {
-                            (Vec::new(), false)
-                        }
-                    };
-                    crate::GmodVguiParentRelation {
-                        child_type_id,
-                        parent_chain,
-                        parent_chain_complete,
+            resolved.extend(relation.child_type_ids.into_iter().map(|child_type_id| {
+                let resolution = resolve_vgui_parent_chain(
+                    &child_type_id,
+                    &relations_by_child,
+                    &direct_parents_by_child,
+                    &mut direct_chain_memo,
+                );
+                let (parent_chain, parent_chain_complete) = match resolution {
+                    VguiParentChainResolution::Complete(chain) => (chain, true),
+                    VguiParentChainResolution::None | VguiParentChainResolution::Incomplete => {
+                        (Vec::new(), false)
                     }
-                })
-                .collect();
-            resolved.push((relation.syntax_id, child_relations));
+                };
+                crate::GmodVguiParentRelation {
+                    child_type_id,
+                    parent_chain,
+                    parent_chain_complete,
+                }
+            }));
         }
-        resolved_by_file.push((file_id, resolved));
     }
     db.get_gmod_class_metadata_index_mut()
-        .set_vgui_parent_relations(resolved_by_file);
+        .set_vgui_parent_relations(&resolved);
 }
 
 fn index_vgui_forwarding_parent_candidates(
@@ -5175,9 +4274,6 @@ fn index_vgui_forwarding_parent_candidates(
     candidates: &mut HashMap<(LuaTypeDeclId, String), ForwardingParentCandidate>,
 ) {
     for call in calls {
-        if call.origin != GmodVguiParentCallOrigin::Annotated {
-            continue;
-        }
         let GmodVguiParentSource::Expr(child_syntax_id) = &call.child else {
             continue;
         };
@@ -5288,7 +4384,7 @@ fn collect_vgui_forwarding_parent_calls(
     context: &mut AnalyzeContext,
     forwarding_parents: &HashMap<(LuaTypeDeclId, String), Vec<LuaTypeDeclId>>,
     file_ids: &[FileId],
-) -> Vec<FileId> {
+) -> Vec<(FileId, Vec<GmodVguiParentCallMetadata>)> {
     if forwarding_parents.is_empty() {
         return Vec::new();
     }
@@ -5317,7 +4413,7 @@ fn collect_vgui_forwarding_parent_calls(
                 })
         })
         .collect::<Vec<_>>();
-    let mut added_file_ids = Vec::new();
+    let mut forwarded = Vec::new();
     for (file_id, root) in files {
         let existing_call_syntax_ids = db
             .get_gmod_class_metadata_index()
@@ -5369,20 +4465,13 @@ fn collect_vgui_forwarding_parent_calls(
                 syntax_id: call_expr.get_syntax_id(),
                 child: GmodVguiParentSource::Expr(child.get_syntax_id()),
                 parent: GmodVguiParentSource::LiteralName(parent_type_id.get_name().to_string()),
-                relations: Vec::new(),
-                resolved_source: None,
-                origin: GmodVguiParentCallOrigin::Forwarded,
             });
         }
         if !calls.is_empty() {
-            added_file_ids.push(file_id);
-        }
-        let metadata = db.get_gmod_class_metadata_index_mut();
-        for call in calls {
-            metadata.add_vgui_parent_call(file_id, call);
+            forwarded.push((file_id, calls));
         }
     }
-    added_file_ids
+    forwarded
 }
 
 #[cfg(test)]
@@ -5446,12 +4535,8 @@ mod forwarding_parent_candidate_tests {
 }
 
 #[cfg(test)]
-mod perf_cache_tests {
-    use std::sync::Arc;
-
+mod edit_tests {
     use crate::{Emmyrc, VirtualWorkspace};
-
-    use super::{CachedHelperFold, helper_fold_cache_sentinel, load_snapshot_cache_sentinel};
 
     fn set_gmod_enabled(ws: &mut VirtualWorkspace) {
         let mut emmyrc = Emmyrc::default();
@@ -5462,46 +4547,7 @@ mod perf_cache_tests {
         ws.def_gmod_call_arg_builtins();
     }
 
-    fn helper_fold_registry(ws: &mut VirtualWorkspace) -> Arc<super::HelperRegistry> {
-        ws.get_db_mut()
-            .get_cached_file_helper_scan::<CachedHelperFold>(helper_fold_cache_sentinel())
-            .expect("helper fold cache should exist after analysis")
-            .registry
-            .clone()
-    }
-
-    /// B5: editing a file without helper scans reuses the folded roles and
-    /// registry, while editing a scan-carrying file rebuilds them.
-    #[test]
-    fn helper_fold_reused_for_scanless_edits_and_rebuilt_for_scan_edits() {
-        let mut ws = VirtualWorkspace::new();
-        set_gmod_enabled(&mut ws);
-        ws.def_file("lua/b5_plain.lua", "local x = 1\n");
-        ws.def_file(
-            "lua/b5_helper.lua",
-            "local M = {}\nfunction M.helper() end\nreturn M\n",
-        );
-
-        let before = helper_fold_registry(&mut ws);
-        // No functions, so no signatures and no scan: the fold must survive.
-        ws.def_file("lua/b5_plain.lua", "local x = 2\n");
-        assert!(
-            Arc::ptr_eq(&before, &helper_fold_registry(&mut ws)),
-            "scanless edit should reuse the helper fold"
-        );
-
-        // A new function changes the file's scan: the fold must rebuild.
-        ws.def_file(
-            "lua/b5_helper.lua",
-            "local M = {}\nfunction M.helper() end\nfunction M.other() end\nreturn M\n",
-        );
-        assert!(
-            !Arc::ptr_eq(&before, &helper_fold_registry(&mut ws)),
-            "scan-changing edit should rebuild the helper fold"
-        );
-    }
-
-    /// B6: adding and removing an `include(...)` moves the load index.
+    /// Adding and removing an `include(...)` moves the load index.
     #[test]
     fn adding_and_removing_include_moves_load_index() {
         let mut ws = VirtualWorkspace::new();
@@ -5529,16 +4575,6 @@ mod perf_cache_tests {
             has_edge_from_main(&mut ws),
             "adding include should move the load index"
         );
-        // The rebuild records its inputs for the next analyze.
-        assert!(
-            ws.get_db_mut()
-                .get_cached_file_helper_scan::<super::CachedLoadSnapshot>(
-                    load_snapshot_cache_sentinel()
-                )
-                .is_some(),
-            "load snapshot should exist after a rebuild"
-        );
-
         ws.def_file("lua/b6_main.lua", "return {}\n");
         assert!(
             !has_edge_from_main(&mut ws),
@@ -5546,12 +4582,12 @@ mod perf_cache_tests {
         );
     }
 
-    /// B8: network flows survive an unrelated edit and follow a helper edit.
+    /// Network flows survive an unrelated edit and follow a helper edit.
     #[test]
     fn network_flows_retained_across_unrelated_edit_and_updated_on_helper_edit() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
-        let helper_id = ws.def_file(
+        ws.def_file(
             "lua/b8_helper.lua",
             "function SendGreeting()\nnet.Start(\"B8Msg\")\nnet.Broadcast()\nend\n",
         );
@@ -5571,23 +4607,6 @@ mod perf_cache_tests {
                 .unwrap_or_default()
         };
         assert_eq!(caller_messages(&mut ws), vec!["B8Msg".to_string()]);
-        // Inputs are recorded for the caller, the helper and the (empty)
-        // plain file alike.
-        for file_id in [helper_id, caller_id] {
-            assert!(
-                ws.get_db_mut()
-                    .get_gmod_network_index()
-                    .get_file_inputs(file_id)
-                    .is_some(),
-                "network inputs should be recorded"
-            );
-        }
-        let caller_inputs_before = ws
-            .get_db_mut()
-            .get_gmod_network_index()
-            .get_file_inputs(caller_id)
-            .cloned();
-
         // A scanless, flowless edit cannot move any network input.
         ws.def_file("lua/b8_plain.lua", "local y = 2\n");
         assert_eq!(
@@ -5595,14 +4614,6 @@ mod perf_cache_tests {
             vec!["B8Msg".to_string()],
             "unrelated edit should keep network flows"
         );
-        assert_eq!(
-            ws.get_db_mut()
-                .get_gmod_network_index()
-                .get_file_inputs(caller_id),
-            caller_inputs_before.as_ref(),
-            "unrelated edit should keep the caller's network inputs"
-        );
-
         // Editing the expanded helper must invalidate the caller.
         ws.def_file(
             "lua/b8_helper.lua",
@@ -7328,9 +6339,14 @@ fn flush_vgui_table_const_replacements(db: &mut DbIndex, cache: &mut VguiSynthes
         return;
     }
 
-    let replacements = std::mem::take(&mut cache.table_const_replacements);
-    db.get_type_index_mut()
-        .replace_table_const_types(&replacements);
+    let mut replacements = std::mem::take(&mut cache.table_const_replacements)
+        .into_iter()
+        .collect::<Vec<_>>();
+    replacements.sort_by_key(|(table, _)| (table.file_id, table.value.start(), table.value.end()));
+    for (table, class_type) in replacements {
+        db.get_type_index_mut()
+            .register_table_class(table, class_type);
+    }
 }
 
 fn resolve_vgui_registration_name(
@@ -7492,14 +6508,14 @@ fn synthesize_scripted_ent_registration(
     }
 
     db.get_type_index_mut()
-        .replace_table_const_type(&table_range, &class_type);
+        .register_table_class(table_range.clone(), class_type.clone());
 
     let base =
         resolve_registered_scripted_ent_base(table_expr.clone(), metadata, register_position);
     if let Some((base_name, source_range)) = base {
         let super_type = LuaType::Ref(LuaTypeDeclId::global(&base_name));
         if super_type != class_type {
-            db.get_type_index_mut().add_super_type_if_missing(
+            db.get_type_index_mut().add_super_type(
                 class_decl_id.clone(),
                 file_id,
                 source_range,
@@ -7520,7 +6536,7 @@ fn synthesize_scripted_ent_registration(
     {
         let super_type = LuaType::Ref(LuaTypeDeclId::global(&super_name));
         if super_type != class_type {
-            db.get_type_index_mut().add_super_type_if_missing(
+            db.get_type_index_mut().add_super_type(
                 class_decl_id.clone(),
                 file_id,
                 source_range,
@@ -7774,7 +6790,7 @@ fn add_scoped_super_type_if_missing(
     if super_type == LuaType::Ref(class_decl_id.clone()) {
         return;
     }
-    db.get_type_index_mut().add_super_type_if_missing(
+    db.get_type_index_mut().add_super_type(
         class_decl_id.clone(),
         file_id,
         source_range,
@@ -8242,7 +7258,7 @@ fn synthesize_inheritance_base(
     materialize_scoped_gamemode_base(db, file_id, class_name_prefix, &effective_base_name);
 
     let super_type = LuaType::Ref(LuaTypeDeclId::global(&effective_base_name));
-    db.get_type_index_mut().add_super_type_if_missing(
+    db.get_type_index_mut().add_super_type(
         class_decl_id.clone(),
         file_id,
         source_syntax_id.get_range(),
@@ -8949,7 +7965,7 @@ fn synthesize_vgui_register_file_target(
     }
 
     let super_type = LuaType::Ref(LuaTypeDeclId::global(&base_panel));
-    db.get_type_index_mut().add_super_type_if_missing(
+    db.get_type_index_mut().add_super_type(
         class_decl_id.clone(),
         target_file_id,
         base_source_range,
@@ -9055,9 +8071,7 @@ fn ensure_register_file_panel_decls(db: &mut DbIndex, file_id: FileId) -> Option
     );
     let decl_id = panel_decl.get_id();
 
-    if let Some(decl_tree) = db.get_decl_index_mut().get_decl_tree_mut(&file_id) {
-        decl_tree.add_decl(panel_decl);
-    }
+    db.get_decl_index_mut().add_derived_decl(panel_decl);
     db.get_global_index_mut().add_global_decl("PANEL", decl_id);
 
     Some(vec![decl_id])
@@ -9148,10 +8162,7 @@ fn register_global_panel(
 
     let decl_id = global_decl.get_id();
 
-    // Add the declaration to the declaration tree
-    if let Some(decl_tree) = db.get_decl_index_mut().get_decl_tree_mut(&file_id) {
-        decl_tree.add_decl(global_decl);
-    }
+    db.get_decl_index_mut().add_derived_decl(global_decl);
 
     // Register the global in the global index
     db.get_global_index_mut()
@@ -9344,7 +8355,7 @@ fn synthesize_panel_class_with_id(
     // Set super type from base panel
     if let Some(base_name) = base_panel {
         let super_type = LuaType::Ref(LuaTypeDeclId::global(base_name));
-        db.get_type_index_mut().add_super_type_if_missing(
+        db.get_type_index_mut().add_super_type(
             class_decl_id.clone(),
             file_id,
             call.syntax_id.get_range(),
@@ -10065,7 +9076,7 @@ pub(crate) fn get_scripted_class_info_with_prefix(
         .map(|m| (m.class_name, m.global_name, m.class_name_prefix))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum GmodSystemCallKind {
     AddNetworkString,
     NetStart,
@@ -10115,7 +9126,7 @@ struct AnnotatedGmodCallRoleMap<'a> {
     local_candidate_names: HashSet<String>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Hash)]
 struct AnnotatedGmodCallArgRole {
     param_idx: usize,
     priority: i64,
@@ -10160,7 +9171,7 @@ impl AnnotatedGmodCallArgRole {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Hash)]
 struct AnnotatedGmodCallRoles {
     is_colon_define: bool,
     params: Vec<Option<LuaType>>,
@@ -10847,7 +9858,7 @@ fn match_bool(matches: bool) -> StaticArgTypeMatch {
 /// Total precedence of canonical net metadata, lowest wins. Workspace class is
 /// the meaningful preference; path and position make equal-name duplicates
 /// deterministic even when their metadata conflicts.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct CanonicalNetOpRank {
     workspace: u8,
     normalized_path: String,
@@ -10881,6 +9892,26 @@ fn canonical_net_op_rank(db: &DbIndex, signature_id: LuaSignatureId) -> Canonica
 }
 
 impl AnnotatedGmodGlobalCallRoleMap {
+    /// A value fingerprint of the role map: its entries in a stable order.
+    fn fingerprint(&self) -> crate::db_index::derivation::Fingerprint {
+        let mut roles = self.roles_by_path.iter().collect::<Vec<_>>();
+        roles.sort_by(|a, b| a.0.cmp(b.0));
+        let mut environment_files = self
+            .environment_role_source_files
+            .iter()
+            .collect::<Vec<_>>();
+        environment_files.sort();
+        let mut net_ops = self
+            .canonical_net_ops
+            .iter()
+            .map(|((name, direction), (rank, op))| {
+                (name, format!("{direction:?}"), rank, format!("{op:?}"))
+            })
+            .collect::<Vec<_>>();
+        net_ops.sort();
+        crate::db_index::derivation::fingerprint_of(&(roles, environment_files, net_ops))
+    }
+
     /// One file's contribution to the role map, plus the helper definitions its
     /// signatures produced. Cached on the db and re-derived only when the file
     /// is re-analysed — see `DbIndex::get_cached_file_helper_scan`.
@@ -11478,69 +10509,6 @@ fn receiver_type_undetermined(db: &DbIndex, file_id: FileId, call_expr: &LuaCall
     }
 }
 
-/// Re-collects the parent calls [`collect_annotated_scripted_class_call_metadata`]
-/// deferred, now that the index can type their receivers, and resolves the
-/// relations they add.
-pub(crate) fn resolve_deferred_vgui_parent_calls(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    let deferred = std::mem::take(&mut context.deferred_vgui_parent_call_sites);
-    if deferred.is_empty() {
-        return;
-    }
-    let Some((_, global_roles)) = context.gmod_global_call_roles.clone() else {
-        return;
-    };
-    let mut file_ids = deferred.keys().copied().collect::<Vec<_>>();
-    file_ids.sort_by_key(|file_id| file_id.id);
-    let per_file = super::parallel::map_files_collect(db, &file_ids, |db, file_id| {
-        let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
-            return Vec::new();
-        };
-        let root = tree.get_red_root();
-        let chunk = tree.get_chunk_node();
-        let annotated_call_roles =
-            AnnotatedGmodCallRoleMap::build(db, file_id, &chunk, &global_roles);
-        let mut syntax_ids = deferred[&file_id].iter().copied().collect::<Vec<_>>();
-        syntax_ids
-            .sort_by_key(|syntax_id| (syntax_id.get_range().start(), syntax_id.get_range().end()));
-        let mut pending = Vec::new();
-        for syntax_id in syntax_ids {
-            let Some(call_expr) = syntax_id
-                .to_node_from_root(&root)
-                .and_then(LuaCallExpr::cast)
-            else {
-                continue;
-            };
-            collect_annotated_scripted_class_call_metadata(
-                db,
-                file_id,
-                &annotated_call_roles,
-                call_expr,
-                &mut pending,
-            );
-        }
-        pending
-    });
-
-    let mut added_file_ids = Vec::new();
-    for (file_id, pending) in file_ids.iter().zip(per_file) {
-        for write in pending {
-            // Every other write for these sites landed on the first scan, and a
-            // receiver still untyped now stays untyped.
-            if let PendingCallSite::VguiParent(call) = write {
-                db.get_gmod_class_metadata_index_mut()
-                    .add_vgui_parent_call(*file_id, call);
-                added_file_ids.push(*file_id);
-            }
-        }
-    }
-    added_file_ids.dedup();
-    if added_file_ids.is_empty() {
-        return;
-    }
-    resolve_vgui_parent_relations(db, context, &added_file_ids);
-    crate::compilation::analyzer::rederive_vgui_parent_fallbacks(db, context);
-}
-
 fn roles_from_inferred_receiver_method(
     db: &DbIndex,
     file_id: FileId,
@@ -11967,9 +10935,6 @@ fn collect_annotated_scripted_class_call_metadata(
                 syntax_id: call_expr.get_syntax_id(),
                 child,
                 parent,
-                relations: Vec::new(),
-                resolved_source: None,
-                origin: GmodVguiParentCallOrigin::Annotated,
             }));
         }
     } else if inferred_receiver_method_candidate(&call_expr, &call_path)
@@ -11980,9 +10945,7 @@ fn collect_annotated_scripted_class_call_metadata(
         // walk defers it until the dynamic-field index seals. Retried once the
         // index has settled, so the relation does not depend on whether a
         // retained cache happened to answer.
-        pending.push(PendingCallSite::DeferredVguiParent(
-            call_expr.get_syntax_id(),
-        ));
+        pending.push(PendingCallSite::DeferredVguiParent);
     }
 
     if let Some((kind, inheritance_roles)) =
@@ -13177,25 +12140,9 @@ enum CompilefileTargetState {
 
 fn update_compilefile_execution_environments(
     db: &mut DbIndex,
-    context: &AnalyzeContext,
+    files_to_update: &[FileId],
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
 ) {
-    let analyzed_file_ids = context
-        .tree_list
-        .iter()
-        .map(|tree| tree.file_id)
-        .collect::<HashSet<_>>();
-    let roles_changed = db
-        .get_gmod_load_index()
-        .execution_environment_roles_changed(
-            annotated_global_call_roles.environment_role_source_files(),
-            &analyzed_file_ids,
-        );
-    let files_to_update = if roles_changed {
-        db.get_vfs().get_all_local_file_ids()
-    } else {
-        analyzed_file_ids.iter().copied().collect()
-    };
     let flow_updates = files_to_update
         .iter()
         .map(|file_id| {
@@ -13220,7 +12167,7 @@ fn update_compilefile_execution_environments(
             .clone(),
     );
 
-    rebuild_compilefile_execution_environments(db, files_to_update.len(), roles_changed);
+    rebuild_compilefile_execution_environments(db, files_to_update.len(), true);
 }
 
 fn collect_compilefile_execution_environment_flow(
@@ -13700,412 +12647,15 @@ fn collect_reassigned_local_decls(
         .collect()
 }
 
-/// Per-file load-relevant fingerprint (B6).
-///
-/// Covers exactly the inputs `rebuild_gmod_load_index` reads for one file:
-/// its dependency sites (with ranges — an edit shifting a call site moves the
-/// recorded edge), its branch realm ranges and file-level annotation realm
-/// (freshly collected for batch files, stored metadata otherwise), and the
-/// dynamic-loader gate. Files whose content can feed `collect_dynamic_loaders`
-/// (`file.Find` patterns or annotated load wrappers) additionally carry their
-/// content hash, so any edit to a dynamic file rebuilds; other files skip it
-/// and keep the index on comment-only edits.
-#[derive(Clone, PartialEq, Eq)]
-struct LoadFilePrint {
-    deps_hash: u64,
-    branch_hash: u64,
-    annotation_hash: u64,
-    has_dynamic_gate: bool,
-    content_hash: Option<u64>,
-}
-
-/// Workspace-wide snapshot of the load index inputs (B6).
-///
-/// `per_file` is path-sorted. Non-batch entries carry their dynamic gate and
-/// content hash over from the previous snapshot: an untouched file's content
-/// cannot change without the file joining the batch, so the carried values
-/// stay valid. `roles_ptr` pins the annotated call-role fold the dynamic
-/// patterns were derived from — a rebuilt fold can match new wrapper paths
-/// against untouched files' contents, so it rebuilds even when every print
-/// matches.
-///
-/// `file_infos`/`unresolved_edges` are the index this snapshot was taken
-/// from. The batch's entries are already gone when the gate runs
-/// (`remove_index` drops them before re-analysis), so a hit restores them
-/// instead of rebuilding: the inputs prove a rebuild would derive exactly
-/// this index.
-struct CachedLoadSnapshot {
-    files_hash: u64,
-    config_hash: u64,
-    roles_ptr: usize,
-    per_file: Vec<(String, LoadFilePrint)>,
-    file_infos: HashMap<FileId, GmodFileLoadInfo>,
-    unresolved_edges: Vec<GmodLoadEdge>,
-}
-
-fn hash_u64_with(build: impl FnOnce(&mut FxHasher)) -> u64 {
-    let mut hasher = FxHasher::default();
-    build(&mut hasher);
-    hasher.finish()
-}
-
-/// Sort key identifying the workspace file set plus the per-file
-/// path-derived load inputs (engine roots, load-path hints and workspace
-/// shadowing all derive from these, so an add/remove/rename or workspace
-/// reassignment rebuilds even when no batch print moved). `FileId` is part
-/// of the key: a remove/re-add cycle hands out a new id for the same path,
-/// and a snapshot taken under the old id must not be restored for the new
-/// one.
-fn load_files_hash(db: &DbIndex, file_ids: &[FileId]) -> u64 {
-    let mut entries: Vec<(String, u32, String, String)> = file_ids
-        .iter()
-        .map(|file_id| {
-            let raw_path = db
-                .get_vfs()
-                .get_file_path(file_id)
-                .map(|path| path.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let module_index = db.get_module_index();
-            let workspace = module_index
-                .get_workspace_id(*file_id)
-                .map(|id| format!("{id:?}"))
-                .unwrap_or_default();
-            let kind = module_index
-                .get_workspace_id(*file_id)
-                .map(|id| format!("{:?}", module_index.get_workspace_kind(id)))
-                .unwrap_or_default();
-            (raw_path, file_id.id, workspace, kind)
-        })
-        .collect();
-    entries.sort();
-    hash_u64_with(|h| entries.hash(h))
-}
-
-fn load_config_hash(db: &DbIndex) -> u64 {
-    let emmyrc = db.get_emmyrc();
-    hash_u64_with(|h| {
-        format!("{:?}", emmyrc.gmod.default_realm).hash(h);
-        emmyrc.gmod.detect_realm_from_filename.hash(h);
-        emmyrc.gmod.detect_realm_from_calls.hash(h);
-    })
-}
-
-fn hash_dependency_sites(sites: &[LuaDependencySite], required: &[u32]) -> u64 {
-    // Sorted by a property of the source: the dependency index stores sites in
-    // walk order, which must not leak into the fingerprint.
-    let mut texts: Vec<String> = sites
-        .iter()
-        .map(|site| {
-            format!(
-                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}",
-                site.kind,
-                site.target_file_id,
-                site.path,
-                site.path_keys,
-                site.call_range,
-                site.range,
-                site.original_expr,
-            )
-        })
-        .collect();
-    texts.sort();
-    let mut required = required.to_vec();
-    required.sort_unstable();
-    hash_u64_with(|h| {
-        texts.hash(h);
-        required.hash(h);
-    })
-}
-
-/// Whether `content` can feed `collect_dynamic_loaders`, using the same gate
-/// that collector uses before walking a file.
-fn load_dynamic_gate(
-    content: &str,
-    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
-) -> bool {
-    content.contains("gmod.file_find")
-        || content.contains("gmod.load")
-        || annotated_global_call_roles
-            .candidate_call_paths_in_content(content)
-            .has_file_find
-        || annotated_global_call_roles
-            .candidate_call_paths_in_content(content)
-            .has_load
-}
-
-fn load_file_print_for_batch(
-    db: &DbIndex,
-    file_id: FileId,
-    branch_ranges: &[GmodRealmRange],
-    annotation_realm: Option<GmodRealm>,
-    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
-) -> LoadFilePrint {
-    let (deps_hash, branch_hash, annotation_hash) =
-        load_index_print(db, file_id, branch_ranges, annotation_realm);
-    // The gate is read for every batch file (one substring scan plus the
-    // candidate matcher the dynamic collector runs anyway); the content hash
-    // is only paid for files that can actually feed the collector.
-    let (has_dynamic_gate, content_hash) = db
-        .get_vfs()
-        .get_file_content(&file_id)
-        .map(|content| {
-            let gate = load_dynamic_gate(content, annotated_global_call_roles);
-            let hash = gate.then(|| hash_u64_with(|h| content.hash(h)));
-            (gate, hash)
-        })
-        .unwrap_or((false, None));
-    LoadFilePrint {
-        deps_hash,
-        branch_hash,
-        annotation_hash,
-        has_dynamic_gate,
-        content_hash,
-    }
-}
-
-/// Index-derived half of a [`LoadFilePrint`]: dependency sites plus the
-/// branch/annotation inputs. No syntax tree or file content is touched.
-fn load_index_print(
-    db: &DbIndex,
-    file_id: FileId,
-    branch_ranges: &[GmodRealmRange],
-    annotation_realm: Option<GmodRealm>,
-) -> (u64, u64, u64) {
-    let dependency_index = db.get_file_dependencies_index();
-    let sites: &[LuaDependencySite] = dependency_index
-        .get_dependency_sites(&file_id)
-        .unwrap_or_default();
-    let required: Vec<u32> = dependency_index
-        .get_required_files(&file_id)
-        .map(|files| files.iter().map(|file| file.id).collect())
-        .unwrap_or_default();
-    (
-        hash_dependency_sites(sites, &required),
-        hash_u64_with(|h| format!("{branch_ranges:?}").hash(h)),
-        hash_u64_with(|h| format!("{annotation_realm:?}").hash(h)),
-    )
-}
-
-/// Fresh print for a non-batch file with no previous snapshot entry (first
-/// build after `clear`, or a file the previous snapshot never saw). Reads the
-/// file's content once; afterwards the dynamic values are carried over until
-/// the file joins a batch.
-fn load_file_print_from_index(
-    db: &DbIndex,
-    file_id: FileId,
-    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
-) -> LoadFilePrint {
-    let stored = db.get_gmod_infer_index().get_realm_file_metadata(&file_id);
-    let branch_ranges = stored
-        .map(|metadata| metadata.branch_realm_ranges.as_slice())
-        .unwrap_or_default();
-    let annotation_realm = stored.and_then(|metadata| metadata.annotation_realm);
-    load_file_print_for_batch(
-        db,
-        file_id,
-        branch_ranges,
-        annotation_realm,
-        annotated_global_call_roles,
-    )
-}
-
-fn load_snapshot_lookup<'a>(
-    snapshot: &'a CachedLoadSnapshot,
-    path: &str,
-) -> Option<&'a LoadFilePrint> {
-    snapshot
-        .per_file
-        .binary_search_by(|(candidate, _)| candidate.as_str().cmp(path))
-        .ok()
-        .map(|idx| &snapshot.per_file[idx].1)
-}
-
-/// The snapshot to restore when the stored load index was derived from the
-/// current load inputs (see [`CachedLoadSnapshot`]).
-///
-/// Compares the workspace file set, the gmod realm config, the call-role fold
-/// identity, and every batch file's [`LoadFilePrint`] against the snapshot
-/// taken by the last rebuild. Non-batch files are untouched by definition
-/// (their content cannot change outside the batch) and their carried prints
-/// stay valid while the file set and fold are pinned. Conservative by
-/// construction: anything not proven identical rebuilds.
-fn load_snapshot_for_restore(
-    db: &DbIndex,
-    branch_realm_ranges: &HashMap<FileId, Vec<GmodRealmRange>>,
-    annotation_realms: &HashMap<FileId, GmodRealm>,
-    analyzed_file_ids: &HashSet<FileId>,
-    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
-    roles_ptr: usize,
-    files_hash: u64,
-) -> Option<Arc<CachedLoadSnapshot>> {
-    let snapshot =
-        db.get_cached_file_helper_scan::<CachedLoadSnapshot>(load_snapshot_cache_sentinel())?;
-    if snapshot.files_hash != files_hash
-        || snapshot.config_hash != load_config_hash(db)
-        || snapshot.roles_ptr != roles_ptr
-    {
-        return None;
-    }
-    analyzed_file_ids
-        .iter()
-        .all(|file_id| {
-            let raw_path = db
-                .get_vfs()
-                .get_file_path(file_id)
-                .map(|path| path.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let Some(previous) = load_snapshot_lookup(&snapshot, &raw_path) else {
-                return false;
-            };
-            // Same fresh-or-empty rule `rebuild_gmod_load_index` itself applies:
-            // a batch file without newly collected ranges contributes none.
-            let branch_ranges = branch_realm_ranges
-                .get(file_id)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            let annotation_realm = annotation_realms.get(file_id).copied();
-            let current = load_file_print_for_batch(
-                db,
-                *file_id,
-                branch_ranges,
-                annotation_realm,
-                annotated_global_call_roles,
-            );
-            current == *previous
-        })
-        .then_some(snapshot)
-}
-
-/// Records the inputs the just-finished rebuild derived the load index from.
-/// Batch files are fingerprinted fresh (including their dynamic content
-/// hashes); every other file keeps its cheap index-derived print while its
-/// dynamic gate values are carried over from the previous snapshot by path.
-fn store_load_snapshot(
-    db: &mut DbIndex,
-    branch_realm_ranges: &HashMap<FileId, Vec<GmodRealmRange>>,
-    annotation_realms: &HashMap<FileId, GmodRealm>,
-    analyzed_file_ids: &HashSet<FileId>,
-    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
-    roles_ptr: usize,
-    file_ids: &[FileId],
-    files_hash: u64,
-) {
-    let previous =
-        db.get_cached_file_helper_scan::<CachedLoadSnapshot>(load_snapshot_cache_sentinel());
-    let mut per_file: Vec<(String, LoadFilePrint)> = file_ids
-        .iter()
-        .map(|file_id| {
-            let raw_path = db
-                .get_vfs()
-                .get_file_path(file_id)
-                .map(|path| path.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let print = if analyzed_file_ids.contains(file_id) {
-                let branch_ranges = branch_realm_ranges
-                    .get(file_id)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                let annotation_realm = annotation_realms.get(file_id).copied();
-                load_file_print_for_batch(
-                    db,
-                    *file_id,
-                    branch_ranges,
-                    annotation_realm,
-                    annotated_global_call_roles,
-                )
-            } else if let Some(carried) = previous
-                .as_ref()
-                .and_then(|snapshot| load_snapshot_lookup(&snapshot, &raw_path))
-            {
-                // Untouched file: the index-derived inputs are re-read cheaply
-                // while the dynamic gate values are carried over, so no file
-                // content is touched outside the batch.
-                let stored = db.get_gmod_infer_index().get_realm_file_metadata(file_id);
-                let branch_ranges = stored
-                    .map(|metadata| metadata.branch_realm_ranges.as_slice())
-                    .unwrap_or_default();
-                let annotation_realm = stored.and_then(|metadata| metadata.annotation_realm);
-                let (deps_hash, branch_hash, annotation_hash) =
-                    load_index_print(db, *file_id, branch_ranges, annotation_realm);
-                LoadFilePrint {
-                    deps_hash,
-                    branch_hash,
-                    annotation_hash,
-                    has_dynamic_gate: carried.has_dynamic_gate,
-                    content_hash: carried.content_hash,
-                }
-            } else {
-                load_file_print_from_index(db, *file_id, annotated_global_call_roles)
-            };
-            (raw_path, print)
-        })
-        .collect();
-    per_file.sort_by(|left, right| left.0.cmp(&right.0));
-    // The index this snapshot describes, so a hit can restore the batch
-    // entries `remove_index` dropped instead of rebuilding.
-    let (file_infos, unresolved_edges) = {
-        let load_index = db.get_gmod_load_index();
-        (
-            load_index
-                .iter_file_infos()
-                .map(|(file_id, info)| (*file_id, info.clone()))
-                .collect(),
-            load_index.unresolved_edges().to_vec(),
-        )
-    };
-    db.set_cached_file_helper_scan(
-        load_snapshot_cache_sentinel(),
-        Arc::new(CachedLoadSnapshot {
-            files_hash,
-            config_hash: load_config_hash(db),
-            roles_ptr,
-            per_file,
-            file_infos,
-            unresolved_edges,
-        }),
-    );
-}
-
 fn rebuild_gmod_load_index(
     db: &mut DbIndex,
     branch_realm_ranges: &HashMap<FileId, Vec<GmodRealmRange>>,
-    annotation_realms: &HashMap<FileId, GmodRealm>,
     analyzed_file_ids: &[FileId],
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
-    roles_ptr: usize,
 ) {
     let _p_prep = crate::profile::PhaseGuard::new("gmodload/prep");
     let file_ids = db.get_vfs().get_all_local_file_ids();
     let analyzed_file_ids: HashSet<FileId> = analyzed_file_ids.iter().copied().collect();
-    // B6: the load index is workspace-global but its inputs only move with
-    // the batch. When the file set, the realm config, the call-role fold and
-    // every batch file's load-relevant print match the last rebuild, the
-    // stored index is still the answer and the fixpoint below is skipped.
-    // Realm and load order stay first-class by keeping the index (not the
-    // fingerprint) as the source of truth: anything not proven identical
-    // rebuilds.
-    let files_hash = load_files_hash(db, &file_ids);
-    // B6: the batch's entries are already gone (`remove_index` drops them
-    // before re-analysis), so a hit restores the index the snapshot was
-    // taken from: its inputs prove a rebuild would derive exactly this.
-    // Realm and load order stay first-class by keeping the index (not the
-    // fingerprint) as the source of truth: anything not proven identical
-    // rebuilds.
-    if let Some(snapshot) = load_snapshot_for_restore(
-        db,
-        branch_realm_ranges,
-        annotation_realms,
-        &analyzed_file_ids,
-        annotated_global_call_roles,
-        roles_ptr,
-        files_hash,
-    ) {
-        db.get_gmod_load_index_mut().set_all_file_infos(
-            snapshot.file_infos.clone(),
-            snapshot.unresolved_edges.clone(),
-        );
-        return;
-    }
     let resolved_branch_ranges = file_ids
         .iter()
         .map(|file_id| {
@@ -14141,15 +12691,22 @@ fn rebuild_gmod_load_index(
 
     drop(_p_prep);
     let _p_sites = crate::profile::PhaseGuard::new("gmodload/resolve_sites");
+    let dependencies = db.get_file_dependencies_index();
     let mut dependency_sites = db
-        .get_file_dependencies_index()
-        .iter_dependency_sites()
-        .flat_map(|(_, sites)| sites.iter().cloned())
+        .get_vfs()
+        .get_all_file_ids()
+        .iter()
+        .flat_map(|file_id| {
+            dependencies
+                .get_dependency_sites(file_id)
+                .unwrap_or_default()
+        })
+        .cloned()
         .map(|site| resolve_load_dependency_site(db, site))
         .collect::<Vec<_>>();
-    // `iter_dependency_sites` walks a `HashMap`, and this vector is the visit order of the
-    // load fixpoint below, so it decides both the edge order and (through the `states` stamp)
-    // the edge set. Order it by a property of the source text instead.
+    // This vector is the visit order of the load fixpoint below, so it decides both the edge
+    // order and (through the `states` stamp) the edge set. Order it by a property of the
+    // source text.
     dependency_sites.sort_by_cached_key(|site| load_site_sort_key(db, site));
     drop(_p_sites);
     let _p_dyn = crate::profile::PhaseGuard::new("gmodload/dynamic_loaders");
@@ -14198,19 +12755,6 @@ fn rebuild_gmod_load_index(
 
     db.get_gmod_load_index_mut()
         .set_all_file_infos(file_infos, unresolved_edges);
-
-    // B6: record the inputs this rebuild derived the index from, so the next
-    // analyze can keep the index when the batch moved nothing load-relevant.
-    store_load_snapshot(
-        db,
-        branch_realm_ranges,
-        annotation_realms,
-        &analyzed_file_ids,
-        annotated_global_call_roles,
-        roles_ptr,
-        &file_ids,
-        files_hash,
-    );
 }
 
 fn mark_main_workspace_load_shadows(

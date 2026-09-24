@@ -52,7 +52,7 @@ impl cmp::Ord for FileId {
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InFiled<N> {
     pub file_id: FileId,
     pub value: N,

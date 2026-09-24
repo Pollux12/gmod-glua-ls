@@ -188,108 +188,6 @@ mod test {
     }
 
     #[test]
-    fn inference_fact_authority_order_rejects_self_confirming_upgrades() {
-        let target = LuaInferenceNodeId::TypeOwner(owner());
-        let contextual = LuaTypeFact::new(
-            LuaType::Number,
-            LuaInferenceConfidence::Anchored,
-            anchored_metadata().provenance,
-        );
-        let concrete = LuaTypeFact::certain(LuaType::Number);
-        let explicit = LuaTypeFact::from_normalized_parts(
-            LuaType::Number,
-            LuaInferenceConfidence::Certain,
-            Some(LuaInferenceProvenanceKind::ExplicitAnnotation),
-            Arc::from([]),
-        );
-        let cyclic = LuaTypeFact::new(
-            LuaType::Number,
-            LuaInferenceConfidence::Certain,
-            Arc::from([LuaInferenceStep {
-                event: LuaInferenceEventId {
-                    node: target.clone(),
-                    kind: LuaInferenceProvenanceKind::ConcreteValue,
-                    source: source(30),
-                },
-                support: Arc::from([target.clone()]),
-                inferred_type: None,
-                found_type: None,
-            }]),
-        );
-
-        assert!(concrete.has_independently_stronger_authority_than(&contextual, &target));
-        assert!(explicit.has_independently_stronger_authority_than(&concrete, &target));
-        assert!(!contextual.has_independently_stronger_authority_than(&concrete, &target));
-        assert!(!cyclic.has_independently_stronger_authority_than(&contextual, &target));
-    }
-
-    #[test]
-    fn declared_base_does_not_replace_its_unguarded_child_runtime_refinement() {
-        let target = LuaInferenceNodeId::TypeOwner(owner());
-        let base_type = LuaType::Ref(LuaTypeDeclId::global("Entity"));
-        let refined_type = LuaType::Ref(LuaTypeDeclId::global("Player"));
-        let unguarded_child = LuaTypeFact::new(
-            refined_type,
-            LuaInferenceConfidence::Heuristic,
-            Arc::from([LuaInferenceStep {
-                event: LuaInferenceEventId {
-                    node: LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(
-                        LuaDeclId::new(file_id(), 10.into()),
-                    )),
-                    kind: LuaInferenceProvenanceKind::UnguardedChild,
-                    source: source(30),
-                },
-                support: Arc::from([]),
-                inferred_type: Some(Arc::new(LuaType::Ref(LuaTypeDeclId::global("Player")))),
-                found_type: Some(Arc::new(base_type.clone())),
-            }]),
-        );
-        let declared_base = LuaTypeFact::from_normalized_parts(
-            base_type.clone(),
-            LuaInferenceConfidence::Certain,
-            Some(LuaInferenceProvenanceKind::ExplicitAnnotation),
-            Arc::from([]),
-        );
-        let changed_declaration = LuaTypeFact::from_normalized_parts(
-            LuaType::Number,
-            LuaInferenceConfidence::Certain,
-            Some(LuaInferenceProvenanceKind::ExplicitAnnotation),
-            Arc::from([]),
-        );
-
-        assert!(
-            !declared_base.has_independently_stronger_authority_than(&unguarded_child, &target)
-        );
-        assert!(
-            changed_declaration
-                .has_independently_stronger_authority_than(&unguarded_child, &target)
-        );
-
-        let inherited_receiver_provenance = LuaTypeFact::new(
-            LuaType::Ref(LuaTypeDeclId::global("Vector")),
-            LuaInferenceConfidence::Heuristic,
-            Arc::from([LuaInferenceStep {
-                event: LuaInferenceEventId {
-                    node: LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(
-                        LuaDeclId::new(file_id(), 20.into()),
-                    )),
-                    kind: LuaInferenceProvenanceKind::UnguardedChild,
-                    source: source(30),
-                },
-                support: Arc::from([]),
-                inferred_type: Some(Arc::new(LuaType::Ref(LuaTypeDeclId::global("Vector")))),
-                found_type: Some(Arc::new(base_type)),
-            }]),
-        );
-        assert!(
-            declared_base.has_independently_stronger_authority_than(
-                &inherited_receiver_provenance,
-                &target,
-            )
-        );
-    }
-
-    #[test]
     fn ref_type_cache_tracks_the_declaring_file_as_an_incremental_dependency() {
         let provider = FileId::new(1);
         let consumer = FileId::new(2);
@@ -786,29 +684,6 @@ mod test {
         assert!(index.get_type_fact(&owner()).is_none());
         assert!(index.get_definition_fact(&definition).is_none());
         assert!(index.get_inference_events_for_file(file_id()).is_empty());
-    }
-
-    #[test]
-    fn inference_fact_table_const_replacement_keeps_event_fact_in_sync() {
-        let mut index = LuaTypeIndex::new();
-        let table_range = InFiled::new(file_id(), TextRange::new(30.into(), 32.into()));
-        index.force_bind_type_fact(
-            owner(),
-            LuaTypeCache::InferType(LuaType::TableConst(table_range.clone())),
-            anchored_metadata(),
-        );
-
-        index.replace_table_const_type(&table_range, &LuaType::Table);
-
-        index.flush_inference_derived_state();
-        assert_eq!(
-            index.get_type_fact(&owner()).unwrap().typ(),
-            &LuaType::Table
-        );
-        assert_eq!(
-            index.get_inference_events_for_file(file_id())[0].fact.typ(),
-            &LuaType::Table
-        );
     }
 
     #[test]

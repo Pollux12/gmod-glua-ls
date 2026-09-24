@@ -33,6 +33,7 @@ mod out_of_order;
 mod overload_field;
 mod overload_test;
 mod pcall_test;
+mod retraction_test;
 mod return_unwrap_test;
 mod stack_exhaustion_test;
 mod static_cal_cmp;

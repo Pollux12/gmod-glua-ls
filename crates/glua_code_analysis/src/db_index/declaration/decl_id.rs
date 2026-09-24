@@ -8,7 +8,7 @@ use serde::{
 
 use crate::FileId;
 
-#[derive(Eq, PartialEq, Hash, Debug, Clone, Copy)]
+#[derive(Eq, PartialEq, Debug, Clone, Copy)]
 pub struct LuaDeclId {
     pub file_id: FileId,
     pub position: TextSize,

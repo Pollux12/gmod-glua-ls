@@ -139,17 +139,12 @@ fn get_str_tpl_infer_type(
                 ref_type
             } else if let Some(extend_type) = extend_type {
                 if let LuaType::Ref(extend_type_decl_id) = extend_type
-                    && let Some(extend_type_decl) = context
+                    && context
                         .db
                         .get_type_index()
                         .get_type_decl(extend_type_decl_id)
-                    && extend_type_decl.is_class()
+                        .is_some_and(|decl| decl.is_class())
                 {
-                    context.cache.add_pending_str_tpl_type_decl(
-                        context.source_range,
-                        type_decl_id,
-                        extend_type.clone(),
-                    );
                     ref_type
                 } else {
                     extend_type.clone()

@@ -8,8 +8,8 @@
 //! Stages (`DET_STAGES`, comma list; default `edit,revert,burst,watch`):
 //! - `edit`: apply `DET_EDIT_FIND` -> `DET_EDIT_REPLACE` to each target, settle.
 //! - `revert`: the edit, then the original text; the oracle is the base.
-//! - `burst`: three edits of every target before one ripple, ending on the
-//!   edited text, so a single target shares the edit oracle.
+//! - `burst`: three edits of every target before one re-analysis, ending on
+//!   the edited text, so a single target shares the edit oracle.
 //! - `watch`: watched delete of each target (oracle: the file never existed),
 //!   then watched re-creation (oracle: cold build with the same new file ids).
 //! - `noop`: re-index each target with unchanged text; the oracle is the base.
@@ -20,9 +20,9 @@
 //!   0), or the files named in `DET_ONLY`. Touch appends a comment, shift
 //!   prepends a newline, rename moves each file to `<stem>_rn.lua`.
 //!
-//! Locality: every stage prints its dirty, rippled and re-analysed file
-//! counts. For `noop`, `touch` and `shift` any such file outside the edited
-//! files is a divergence.
+//! Locality: every stage prints how many files the re-analysis evaluated and
+//! how many files' diagnostics it reported affected. For `noop`, `touch` and
+//! `shift` any evaluated file outside the edited files is a divergence.
 //!
 //! `DET_REPLAY=1` also replays the warm run's `update_index` batch log onto a
 //! fork of the oracle and compares again: drift that disappears depends on
@@ -46,8 +46,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use glua_code_analysis::{
-    DirtySet, EmmyLuaAnalysis, Emmyrc, FileId, WorkspaceFolder, collect_workspace_files,
-    load_configs,
+    EmmyLuaAnalysis, Emmyrc, FileId, WorkspaceFolder, collect_workspace_files, load_configs,
 };
 use glua_parser::{LineIndex, LuaParser};
 use lsp_types::{DiagnosticSeverity, NumberOrString};
@@ -357,46 +356,8 @@ struct IndexSnapshot {
     properties: HashDumpResult,
     metatables: HashDumpResult,
     metatable_factory_bindings: HashDumpResult,
-    /// Source access paths each file declares, with the signature they
-    /// resolve to and the parameter indexes that file mutates.
-    call_site_source_signatures: HashDumpResult,
-    /// Source signatures a re-indexed file had before its removal, parked so
-    /// the update can tell which of its signatures merely moved.
-    call_site_previous_source_signatures: HashDumpResult,
-    /// Access path → current source function signature candidates.
-    call_site_signatures_by_path: HashDumpResult,
-    /// Signature → parameter indexes mutated by its source function.
-    call_site_mutated_params: HashDumpResult,
     /// Observed call-site param evidence contributed by calls in each file.
     call_site_contributions: HashDumpResult,
-    /// Files that have supplied call-site evidence for each signature.
-    call_site_contributor_files: HashDumpResult,
-    /// Signatures of each file that have call-site contributors.
-    call_site_contributor_signatures: HashDumpResult,
-    /// Facts parked across a remove/re-add so a re-index can tell which of
-    /// its signatures merely moved.
-    call_site_pending_previous_params: HashDumpResult,
-    /// Return consumers recorded by each file's calls.
-    call_site_file_return_consumers: HashDumpResult,
-    /// Return consumers keyed by the signature whose return they read.
-    call_site_return_consumers: HashDumpResult,
-    /// Return consumers keyed by the file declaring the consumed signature.
-    call_site_return_consumers_by_signature_file: HashDumpResult,
-    /// Files owning callback parameters inferred from concrete structural
-    /// table values.
-    call_site_callback_files: HashDumpResult,
-    /// Inference diagnostic events filed under each source file.
-    call_site_inference_events: HashDumpResult,
-    /// Consumer file → producer sources its call-site inference read.
-    call_site_source_dependencies: HashDumpResult,
-    /// Producer source → consumer files that read it.
-    call_site_source_dependents: HashDumpResult,
-    /// Producer file → consumer files that read one of its sources.
-    call_site_source_file_dependents: HashDumpResult,
-    /// File → workspace path, for source-path dependency lookups.
-    call_site_source_paths: HashDumpResult,
-    /// Workspace path → consumer files depending on the file at that path.
-    call_site_source_path_dependents: HashDumpResult,
     /// Schema URL → resolution state.
     schema_files: HashDumpResult,
 }
@@ -951,8 +912,13 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
     }
 
     let mut dependency_sites = HashDump::new("dependency_sites");
-    for (file_id, sites) in db.get_file_dependencies_index().iter_dependency_sites() {
-        dependency_sites.insert(file_label(analysis, *file_id), format!("{sites:?}"));
+    for file_id in db.get_vfs().get_all_file_ids() {
+        if let Some(sites) = db
+            .get_file_dependencies_index()
+            .get_dependency_sites(&file_id)
+        {
+            dependency_sites.insert(file_label(analysis, file_id), format!("{sites:?}"));
+        }
     }
 
     let mut gmod_load_files = HashDump::new("gmod_load_files");
@@ -1162,154 +1128,13 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         }
     }
 
-    // The call-site param index's persisted relations. `deferred_contributions`
-    // is a transient queue and `contrib_writes`/`contrib_write_versions` are
-    // raw epochs, so both stay out; everything else is semantic state a
-    // re-index has to reproduce. Hash-set values render sorted so two
-    // processes agree on the text.
+    // The call-site param index's persisted relation: each file's evidence.
+    // The folded params are dumped with the inferred params above.
     let call_site = db.get_call_site_param_index();
-    let mut call_site_source_signatures = HashDump::new("call_site_source_signatures");
-    for (file_id, signatures) in call_site.iter_file_source_signatures() {
-        call_site_source_signatures
-            .insert(file_label(analysis, *file_id), format!("{signatures:?}"));
-    }
-    let mut call_site_previous_source_signatures =
-        HashDump::new("call_site_previous_source_signatures");
-    for (file_id, signatures) in call_site.iter_previous_source_signatures() {
-        call_site_previous_source_signatures
-            .insert(file_label(analysis, *file_id), format!("{signatures:?}"));
-    }
-    let mut call_site_signatures_by_path = HashDump::new("call_site_signatures_by_path");
-    for (path, signature_ids) in call_site.iter_source_signatures_by_path() {
-        call_site_signatures_by_path.insert(path.clone(), format!("{signature_ids:?}"));
-    }
-    let mut call_site_mutated_params = HashDump::new("call_site_mutated_params");
-    for (signature_id, params) in call_site.iter_mutated_params() {
-        call_site_mutated_params.insert(
-            format!(
-                "{}|{signature_id:?}",
-                file_label(analysis, signature_id.get_file_id())
-            ),
-            format!("{params:?}"),
-        );
-    }
     let mut call_site_contributions = HashDump::new("call_site_contributions");
     for (file_id, contributions) in call_site.iter_file_contributions() {
         call_site_contributions
             .insert(file_label(analysis, *file_id), format!("{contributions:?}"));
-    }
-    let mut call_site_contributor_files = HashDump::new("call_site_contributor_files");
-    for (signature_id, files) in call_site.iter_contributor_files_by_signature() {
-        let mut files = files
-            .iter()
-            .map(|file_id| file_label(analysis, *file_id))
-            .collect::<Vec<_>>();
-        files.sort_unstable();
-        call_site_contributor_files.insert(
-            format!(
-                "{}|{signature_id:?}",
-                file_label(analysis, signature_id.get_file_id())
-            ),
-            format!("{files:?}"),
-        );
-    }
-    let mut call_site_contributor_signatures = HashDump::new("call_site_contributor_signatures");
-    for (file_id, signature_ids) in call_site.iter_contributor_signatures_by_file() {
-        let mut signature_ids = signature_ids
-            .iter()
-            .map(|signature_id| format!("{signature_id:?}"))
-            .collect::<Vec<_>>();
-        signature_ids.sort_unstable();
-        call_site_contributor_signatures
-            .insert(file_label(analysis, *file_id), format!("{signature_ids:?}"));
-    }
-    let mut call_site_pending_previous_params = HashDump::new("call_site_pending_previous_params");
-    for ((signature_id, param_idx), fact) in call_site.iter_pending_previous_params() {
-        call_site_pending_previous_params.insert(
-            format!(
-                "{}|{signature_id:?}|param{param_idx}",
-                file_label(analysis, signature_id.get_file_id())
-            ),
-            format!("{fact:?}"),
-        );
-    }
-    let mut call_site_file_return_consumers = HashDump::new("call_site_file_return_consumers");
-    for (file_id, consumers) in call_site.iter_file_return_consumers() {
-        call_site_file_return_consumers
-            .insert(file_label(analysis, *file_id), format!("{consumers:?}"));
-    }
-    let mut call_site_return_consumers = HashDump::new("call_site_return_consumers");
-    for (signature_id, consumers) in call_site.iter_return_consumers() {
-        call_site_return_consumers.insert(
-            format!(
-                "{}|{signature_id:?}",
-                file_label(analysis, signature_id.get_file_id())
-            ),
-            format!("{consumers:?}"),
-        );
-    }
-    let mut call_site_return_consumers_by_signature_file =
-        HashDump::new("call_site_return_consumers_by_signature_file");
-    for (file_id, consumers) in call_site.iter_return_consumers_by_signature_file() {
-        call_site_return_consumers_by_signature_file
-            .insert(file_label(analysis, *file_id), format!("{consumers:?}"));
-    }
-    let mut call_site_callback_files = HashDump::new("call_site_callback_files");
-    for file_id in call_site.iter_concrete_structural_callback_files() {
-        let file = file_label(analysis, *file_id);
-        call_site_callback_files.insert(file.clone(), file);
-    }
-    let mut call_site_inference_events = HashDump::new("call_site_inference_events");
-    for (file_id, events) in call_site.iter_inference_events_by_file() {
-        call_site_inference_events.insert(file_label(analysis, *file_id), format!("{events:?}"));
-    }
-    let mut call_site_source_dependencies = HashDump::new("call_site_source_dependencies");
-    for (file_id, sources) in call_site.iter_file_source_dependencies() {
-        let mut sources = sources
-            .iter()
-            .map(|source| format!("{source:?}"))
-            .collect::<Vec<_>>();
-        sources.sort_unstable();
-        call_site_source_dependencies
-            .insert(file_label(analysis, *file_id), format!("{sources:?}"));
-    }
-    let mut call_site_source_dependents = HashDump::new("call_site_source_dependents");
-    for (source, files) in call_site.iter_source_dependents() {
-        let mut files = files
-            .iter()
-            .map(|file_id| file_label(analysis, *file_id))
-            .collect::<Vec<_>>();
-        files.sort_unstable();
-        call_site_source_dependents.insert(format!("{source:?}"), format!("{files:?}"));
-    }
-    let mut call_site_source_file_dependents = HashDump::new("call_site_source_file_dependents");
-    for (file_id, files) in call_site.iter_source_file_dependents() {
-        let mut files = files
-            .iter()
-            .map(|file_id| file_label(analysis, *file_id))
-            .collect::<Vec<_>>();
-        files.sort_unstable();
-        call_site_source_file_dependents
-            .insert(file_label(analysis, *file_id), format!("{files:?}"));
-    }
-    let mut call_site_source_paths = HashDump::new("call_site_source_paths");
-    for (file_id, path) in call_site.iter_source_paths() {
-        call_site_source_paths.insert(
-            file_label(analysis, *file_id),
-            path.display().to_string().replace('\\', "/"),
-        );
-    }
-    let mut call_site_source_path_dependents = HashDump::new("call_site_source_path_dependents");
-    for (path, files) in call_site.iter_source_path_dependents() {
-        let mut files = files
-            .iter()
-            .map(|file_id| file_label(analysis, *file_id))
-            .collect::<Vec<_>>();
-        files.sort_unstable();
-        call_site_source_path_dependents.insert(
-            path.display().to_string().replace('\\', "/"),
-            format!("{files:?}"),
-        );
     }
 
     let mut schema_files = HashDump::new("schema_files");
@@ -1388,25 +1213,7 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         properties: properties.finish(),
         metatables: metatables.finish(),
         metatable_factory_bindings: metatable_factory_bindings.finish(),
-        call_site_source_signatures: call_site_source_signatures.finish(),
-        call_site_previous_source_signatures: call_site_previous_source_signatures.finish(),
-        call_site_signatures_by_path: call_site_signatures_by_path.finish(),
-        call_site_mutated_params: call_site_mutated_params.finish(),
         call_site_contributions: call_site_contributions.finish(),
-        call_site_contributor_files: call_site_contributor_files.finish(),
-        call_site_contributor_signatures: call_site_contributor_signatures.finish(),
-        call_site_pending_previous_params: call_site_pending_previous_params.finish(),
-        call_site_file_return_consumers: call_site_file_return_consumers.finish(),
-        call_site_return_consumers: call_site_return_consumers.finish(),
-        call_site_return_consumers_by_signature_file: call_site_return_consumers_by_signature_file
-            .finish(),
-        call_site_callback_files: call_site_callback_files.finish(),
-        call_site_inference_events: call_site_inference_events.finish(),
-        call_site_source_dependencies: call_site_source_dependencies.finish(),
-        call_site_source_dependents: call_site_source_dependents.finish(),
-        call_site_source_file_dependents: call_site_source_file_dependents.finish(),
-        call_site_source_paths: call_site_source_paths.finish(),
-        call_site_source_path_dependents: call_site_source_path_dependents.finish(),
         schema_files: schema_files.finish(),
     };
 
@@ -1479,27 +1286,7 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
             ("PROP", &snapshot.properties),
             ("METATBL", &snapshot.metatables),
             ("METAFACT", &snapshot.metatable_factory_bindings),
-            ("CSSIG", &snapshot.call_site_source_signatures),
-            ("CSPREVSIG", &snapshot.call_site_previous_source_signatures),
-            ("CSSIGPATH", &snapshot.call_site_signatures_by_path),
-            ("CSMUT", &snapshot.call_site_mutated_params),
             ("CSCONTRIB", &snapshot.call_site_contributions),
-            ("CSCONTRIBF", &snapshot.call_site_contributor_files),
-            ("CSCONTRIBS", &snapshot.call_site_contributor_signatures),
-            ("CSPREV", &snapshot.call_site_pending_previous_params),
-            ("CSFCONS", &snapshot.call_site_file_return_consumers),
-            ("CSCONS", &snapshot.call_site_return_consumers),
-            (
-                "CSCONSSIGF",
-                &snapshot.call_site_return_consumers_by_signature_file,
-            ),
-            ("CSCB", &snapshot.call_site_callback_files),
-            ("CSEVENTS", &snapshot.call_site_inference_events),
-            ("CSDEP", &snapshot.call_site_source_dependencies),
-            ("CSSRCDEP", &snapshot.call_site_source_dependents),
-            ("CSFILEDEP", &snapshot.call_site_source_file_dependents),
-            ("CSPATH", &snapshot.call_site_source_paths),
-            ("CSPATHDEP", &snapshot.call_site_source_path_dependents),
             ("SCHEMA", &snapshot.schema_files),
         ] {
             if let Some(detail) = &dump.detail {
@@ -1890,112 +1677,10 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
             &other.metatable_factory_bindings,
         ),
         (
-            "call_site_source_signatures",
-            "CSSIG",
-            &base.call_site_source_signatures,
-            &other.call_site_source_signatures,
-        ),
-        (
-            "call_site_previous_source_signatures",
-            "CSPREVSIG",
-            &base.call_site_previous_source_signatures,
-            &other.call_site_previous_source_signatures,
-        ),
-        (
-            "call_site_signatures_by_path",
-            "CSSIGPATH",
-            &base.call_site_signatures_by_path,
-            &other.call_site_signatures_by_path,
-        ),
-        (
-            "call_site_mutated_params",
-            "CSMUT",
-            &base.call_site_mutated_params,
-            &other.call_site_mutated_params,
-        ),
-        (
             "call_site_contributions",
             "CSCONTRIB",
             &base.call_site_contributions,
             &other.call_site_contributions,
-        ),
-        (
-            "call_site_contributor_files",
-            "CSCONTRIBF",
-            &base.call_site_contributor_files,
-            &other.call_site_contributor_files,
-        ),
-        (
-            "call_site_contributor_signatures",
-            "CSCONTRIBS",
-            &base.call_site_contributor_signatures,
-            &other.call_site_contributor_signatures,
-        ),
-        (
-            "call_site_pending_previous_params",
-            "CSPREV",
-            &base.call_site_pending_previous_params,
-            &other.call_site_pending_previous_params,
-        ),
-        (
-            "call_site_file_return_consumers",
-            "CSFCONS",
-            &base.call_site_file_return_consumers,
-            &other.call_site_file_return_consumers,
-        ),
-        (
-            "call_site_return_consumers",
-            "CSCONS",
-            &base.call_site_return_consumers,
-            &other.call_site_return_consumers,
-        ),
-        (
-            "call_site_return_consumers_by_signature_file",
-            "CSCONSSIGF",
-            &base.call_site_return_consumers_by_signature_file,
-            &other.call_site_return_consumers_by_signature_file,
-        ),
-        (
-            "call_site_callback_files",
-            "CSCB",
-            &base.call_site_callback_files,
-            &other.call_site_callback_files,
-        ),
-        (
-            "call_site_inference_events",
-            "CSEVENTS",
-            &base.call_site_inference_events,
-            &other.call_site_inference_events,
-        ),
-        (
-            "call_site_source_dependencies",
-            "CSDEP",
-            &base.call_site_source_dependencies,
-            &other.call_site_source_dependencies,
-        ),
-        (
-            "call_site_source_dependents",
-            "CSSRCDEP",
-            &base.call_site_source_dependents,
-            &other.call_site_source_dependents,
-        ),
-        (
-            "call_site_source_file_dependents",
-            "CSFILEDEP",
-            &base.call_site_source_file_dependents,
-            &other.call_site_source_file_dependents,
-        ),
-        (
-            "call_site_source_paths",
-            "CSPATH",
-            &base.call_site_source_paths,
-            &other.call_site_source_paths,
-        ),
-        (
-            "call_site_source_path_dependents",
-            "CSPATHDEP",
-            &base.call_site_source_path_dependents,
-            &other.call_site_source_path_dependents,
         ),
         (
             "schema_files",
@@ -2160,25 +1845,31 @@ fn apply_text(
     drop(old);
 }
 
-/// Files a warm run marked dirty and the files its ripple reported.
+/// The files a warm run's re-analyses evaluated and the files whose
+/// diagnostics they reported affected.
 #[derive(Default)]
 struct Reach {
-    dirty: Vec<FileId>,
-    rippled: Vec<FileId>,
+    evaluated: Vec<FileId>,
+    affected: Vec<FileId>,
 }
 
 impl Reach {
     fn extend(&mut self, other: Reach) {
-        self.dirty.extend(other.dirty);
-        self.rippled.extend(other.rippled);
+        self.evaluated.extend(other.evaluated);
+        self.affected.extend(other.affected);
     }
-}
 
-fn ripple(analysis: &mut EmmyLuaAnalysis, dirty: DirtySet) -> Reach {
-    let dirty_files = dirty.dirty_files().iter().copied().collect();
-    Reach {
-        dirty: dirty_files,
-        rippled: analysis.ripple(dirty),
+    /// Records one re-analysis that reported `affected`.
+    fn note(&mut self, analysis: &EmmyLuaAnalysis, affected: Vec<FileId>) {
+        self.evaluated
+            .extend_from_slice(analysis.compilation.last_evaluated_files());
+        self.affected.extend(affected);
+    }
+
+    fn of(analysis: &EmmyLuaAnalysis, affected: Vec<FileId>) -> Self {
+        let mut reach = Self::default();
+        reach.note(analysis, affected);
+        reach
     }
 }
 
@@ -2190,34 +1881,29 @@ fn settle(
     version: i32,
 ) -> Reach {
     apply_text(analysis, uri, file_id, text, version);
-    let dirty = analysis.self_index_and_diff(vec![file_id]);
-    ripple(analysis, dirty)
+    let affected = analysis.reindex_files(vec![file_id]);
+    Reach::of(analysis, affected)
 }
 
-/// Prints how far a warm run reached. With `strict`, any dirty, rippled or
-/// re-analysed file outside `edited` is a locality divergence.
+/// Prints how far a warm run reached. With `strict`, any evaluated file
+/// outside `edited` is a locality divergence.
 fn report_reach(
     analysis: &EmmyLuaAnalysis,
     label: &str,
     edited: &[FileId],
     reach: &Reach,
-    log: &[Vec<FileId>],
     strict: bool,
 ) {
-    let dirty = reach.dirty.iter().collect::<BTreeSet<_>>();
-    let rippled = reach.rippled.iter().collect::<BTreeSet<_>>();
-    let reanalysed = log.iter().flatten().collect::<BTreeSet<_>>();
-    let beyond = dirty
+    let evaluated = reach.evaluated.iter().collect::<BTreeSet<_>>();
+    let affected = reach.affected.iter().collect::<BTreeSet<_>>();
+    let beyond = evaluated
         .iter()
-        .chain(&rippled)
-        .chain(&reanalysed)
         .filter(|file_id| !edited.contains(file_id))
         .collect::<BTreeSet<_>>();
     println!(
-        "[reach {label}] dirty={} rippled={} reanalysed={} beyond_edited={}",
-        dirty.len(),
-        rippled.len(),
-        reanalysed.len(),
+        "[reach {label}] evaluated={} affected={} beyond_edited={}",
+        evaluated.len(),
+        affected.len(),
         beyond.len()
     );
     if strict && !beyond.is_empty() {
@@ -2345,7 +2031,7 @@ impl Harness {
             self.warm_started.elapsed().as_secs_f64()
         );
         let log = warm.compilation.take_batch_log();
-        report_reach(warm, label, edited, reach, &log, strict);
+        report_reach(warm, label, edited, reach, strict);
         log
     }
 
@@ -2436,7 +2122,7 @@ impl Harness {
             .map(|relative| target(&self.base, &self.codebase, relative))
             .collect::<Vec<_>>();
         let mut warm = self.warm();
-        let mut owed: Option<DirtySet> = None;
+        let mut reach = Reach::default();
         for step in 0..3 {
             for (_, uri, file_id, original) in &resolved {
                 let text = match step {
@@ -2445,15 +2131,11 @@ impl Harness {
                     _ => edited(original, find, replace),
                 };
                 apply_text(&mut warm, uri, *file_id, text, step + 1);
-                let dirty = warm.self_index_and_diff(vec![*file_id]);
-                match &mut owed {
-                    Some(owed) => owed.extend(dirty),
-                    None => owed = Some(dirty),
-                }
             }
         }
-        let reach = ripple(&mut warm, owed.expect("a burst has edited files"));
         let ids = resolved.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
+        let affected = warm.reindex_files(ids.clone());
+        reach.note(&warm, affected);
         let input = ColdInput {
             overrides: resolved
                 .into_iter()
@@ -2478,7 +2160,8 @@ impl Harness {
         let mut warm = self.warm();
         let mut reach = Reach::default();
         for events in steps {
-            reach.rippled.extend(warm.apply_file_system_changes(events));
+            let affected = warm.apply_file_system_changes(events);
+            reach.note(&warm, affected);
         }
         self.finish(label, warm, edited, &reach, false, input);
     }
@@ -2487,10 +2170,8 @@ impl Harness {
         for relative in targets {
             let (path, uri, file_id, original) = target(&self.base, &self.codebase, relative);
             let mut warm = self.warm();
-            let reach = Reach {
-                rippled: warm.apply_file_system_changes(vec![(uri.clone(), None)]),
-                ..Reach::default()
-            };
+            let affected = warm.apply_file_system_changes(vec![(uri.clone(), None)]);
+            let reach = Reach::of(&warm, affected);
             let label = format!("watch_deleted[{relative}]");
             let mut log = self.observe(&label, &mut warm, &[file_id], &reach, false);
             let removed = ColdInput {
@@ -2501,11 +2182,9 @@ impl Harness {
 
             self.warm_started = Instant::now();
             warm.compilation.start_batch_log();
-            let reach = Reach {
-                rippled: warm
-                    .apply_file_system_changes(vec![(uri.clone(), Some(original.clone()))]),
-                ..Reach::default()
-            };
+            let affected =
+                warm.apply_file_system_changes(vec![(uri.clone(), Some(original.clone()))]);
+            let reach = Reach::of(&warm, affected);
             let created_id = warm.get_file_id(&uri).expect("re-created target has an id");
             let label = format!("watch_created[{relative}]");
             log.extend(self.observe(&label, &mut warm, &[created_id], &reach, false));
@@ -2521,8 +2200,8 @@ impl Harness {
         for relative in targets {
             let (_, _, file_id, _) = target(&self.base, &self.codebase, relative);
             let mut warm = self.warm();
-            let dirty = warm.self_index_and_diff(vec![file_id]);
-            let reach = ripple(&mut warm, dirty);
+            let affected = warm.reindex_files(vec![file_id]);
+            let reach = Reach::of(&warm, affected);
             self.finish(
                 &format!("noop[{relative}]"),
                 warm,
@@ -2540,15 +2219,9 @@ impl Harness {
             .map(|relative| target(&self.base, &self.codebase, relative).2)
             .collect::<Vec<_>>();
         let mut warm = self.warm();
-        warm.self_index_files(ids.clone());
-        self.finish(
-            "exact",
-            warm,
-            &ids,
-            &Reach::default(),
-            false,
-            &ColdInput::default(),
-        );
+        let affected = warm.reindex_files(ids.clone());
+        let reach = Reach::of(&warm, affected);
+        self.finish("exact", warm, &ids, &reach, false, &ColdInput::default());
     }
 
     fn split(&mut self, batches: usize) {
@@ -2608,8 +2281,8 @@ impl Harness {
             apply_text(&mut warm, uri, *file_id, edit(text), 1);
         }
         let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
-        let dirty = warm.self_index_and_diff(ids.clone());
-        let reach = ripple(&mut warm, dirty);
+        let affected = warm.reindex_files(ids.clone());
+        let reach = Reach::of(&warm, affected);
         let input = ColdInput {
             overrides: files
                 .iter()

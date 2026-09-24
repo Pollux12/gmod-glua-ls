@@ -2,6 +2,39 @@
 mod test {
     use crate::VirtualWorkspace;
 
+    /// A callee that reassigns its callback parameter supplies no call-site
+    /// evidence for the callback's parameters, whichever of the caller and the
+    /// callee is analysed first.
+    #[test]
+    fn test_mutated_callback_param_suppresses_evidence_in_any_file_order() {
+        const CALLER: &str = r#"
+            M.run(function(data)
+                local value = data
+            end)
+            "#;
+        const CALLEE: &str = r#"
+            M = {}
+            function M.run(callback)
+                callback({ x = 1 })
+                callback = nil
+            end
+            "#;
+        let ws = VirtualWorkspace::assert_warm_matches_cold(
+            |_| {},
+            &[("lua/caller.lua", "")],
+            &[("lua/callee.lua", CALLEE), ("lua/caller.lua", CALLER)],
+        );
+        assert_eq!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_call_site_param_index()
+                .iter_inferred_params()
+                .count(),
+            0
+        );
+    }
+
     /// `local orig = tonumber` runs before the `function tonumber` statement
     /// below it, so it must capture the std global, not the same-file wrapper.
     /// Binding it to the wrapper makes the wrapper self-recursive and its

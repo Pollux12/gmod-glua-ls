@@ -6,12 +6,25 @@ use std::collections::BTreeMap;
 pub use global_id::GlobalId;
 
 use crate::FileId;
+use crate::db_index::derivation::{self, FactKey, Fingerprint};
+use smol_str::SmolStr;
 
 use super::{LuaDeclId, LuaIndex, LuaModuleIndex, WorkspaceId};
 
 #[derive(Debug, Clone)]
 pub struct LuaGlobalIndex {
     global_decl: FxHashMap<GlobalId, Vec<LuaDeclId>>,
+    /// Multiset fingerprint of every `(name, decl id)`, for `GlobalScan`.
+    scan_fingerprint: Fingerprint,
+}
+
+fn scan_element(name: &str, decl_id: LuaDeclId) -> Fingerprint {
+    derivation::fingerprint_of(&(name, decl_id))
+}
+
+fn note_global_write(name: &str) {
+    derivation::note_write(|| FactKey::Global(SmolStr::new(name)));
+    derivation::note_write(|| FactKey::GlobalScan);
 }
 
 /// Canonical order for a global's declarations: source position, with the file
@@ -31,6 +44,7 @@ impl LuaGlobalIndex {
     pub fn new() -> Self {
         Self {
             global_decl: FxHashMap::default(),
+            scan_fingerprint: derivation::ABSENT,
         }
     }
 
@@ -43,10 +57,34 @@ impl LuaGlobalIndex {
             .binary_search_by_key(&decl_sort_key(decl_id), |existing| decl_sort_key(*existing))
         {
             decl_ids.insert(insert_at, decl_id);
+            self.scan_fingerprint = self
+                .scan_fingerprint
+                .wrapping_add(scan_element(name, decl_id));
+            note_global_write(name);
         }
     }
 
+    /// Drops one declaration of `name`.
+    pub(crate) fn remove_global_decl(&mut self, name: &str, decl_id: LuaDeclId) {
+        let id = GlobalId::new(name);
+        let Some(decl_ids) = self.global_decl.get_mut(&id) else {
+            return;
+        };
+        let Some(at) = decl_ids.iter().position(|existing| *existing == decl_id) else {
+            return;
+        };
+        decl_ids.remove(at);
+        if decl_ids.is_empty() {
+            self.global_decl.remove(&id);
+        }
+        self.scan_fingerprint = self
+            .scan_fingerprint
+            .wrapping_sub(scan_element(name, decl_id));
+        note_global_write(name);
+    }
+
     pub fn get_all_global_decl_ids(&self) -> Vec<LuaDeclId> {
+        derivation::note_read(|| FactKey::GlobalScan);
         // `global_decl` is a `FxHashMap`, so its iteration order is not stable
         // across index states; sort so callers see the same sequence whatever
         // order the globals were discovered in.
@@ -63,6 +101,7 @@ impl LuaGlobalIndex {
     pub fn get_global_decl_ids(&self, name: &str) -> Option<&Vec<LuaDeclId>> {
         // Borrowed lookup: `GlobalId` hashes by name and borrows as `str`,
         // so this finds the same bucket without interning a new id per call.
+        derivation::note_read(|| FactKey::Global(SmolStr::new(name)));
         self.global_decl.get(name)
     }
 
@@ -110,8 +149,8 @@ impl LuaGlobalIndex {
     }
 
     pub fn is_exist_global_decl(&self, name: &str) -> bool {
-        let id = GlobalId::new(name);
-        self.global_decl.contains_key(&id)
+        derivation::note_read(|| FactKey::Global(SmolStr::new(name)));
+        self.global_decl.contains_key(name)
     }
 
     pub fn is_exist_global_decl_in_workspace(
@@ -123,23 +162,59 @@ impl LuaGlobalIndex {
         self.get_global_decl_ids_in_workspace(name, module_index, current_workspace_id)
             .is_some_and(|decl_ids| !decl_ids.is_empty())
     }
+
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        match key {
+            FactKey::Global(name) => {
+                derivation::fingerprint_opt(self.global_decl.get(name.as_str()))
+            }
+            FactKey::GlobalScan => self.scan_fingerprint,
+            _ => {
+                debug_assert!(false, "{key:?} is not a global fact");
+                derivation::ABSENT
+            }
+        }
+    }
+
+    /// Drops the declarations whose file matches `removed`, keeping the scan
+    /// fingerprint and fact notes in step. Calls `on_emptied` for each global
+    /// left with no declaration.
+    fn retain_decls(&mut self, removed: impl Fn(FileId) -> bool, on_emptied: impl Fn(&GlobalId)) {
+        let mut scan_fingerprint = self.scan_fingerprint;
+        self.global_decl.retain(|global_id, decl_ids| {
+            let before_len = decl_ids.len();
+            decl_ids.retain(|decl_id| {
+                if !removed(decl_id.file_id) {
+                    return true;
+                }
+                scan_fingerprint =
+                    scan_fingerprint.wrapping_sub(scan_element(global_id.get_name(), *decl_id));
+                false
+            });
+            if decl_ids.len() != before_len {
+                note_global_write(global_id.get_name());
+            }
+            if decl_ids.is_empty() && before_len > 0 {
+                on_emptied(global_id);
+            }
+            !decl_ids.is_empty()
+        });
+        self.scan_fingerprint = scan_fingerprint;
+    }
 }
 
 impl LuaIndex for LuaGlobalIndex {
     fn remove(&mut self, file_id: FileId) {
-        self.global_decl.retain(|global_id, v| {
-            let before_len = v.len();
-            v.retain(|decl_id| decl_id.file_id != file_id);
-            // Log when a global is completely removed (last declaration gone)
-            if v.is_empty() && before_len > 0 {
+        self.retain_decls(
+            |decl_file_id| decl_file_id == file_id,
+            |global_id| {
                 log::info!(
                     "global_index: global '{}' fully removed (file_id={:?})",
                     global_id.get_name(),
                     file_id,
                 );
-            }
-            !v.is_empty()
-        });
+            },
+        );
     }
 
     fn remove_files(&mut self, file_ids: &[FileId]) {
@@ -147,14 +222,15 @@ impl LuaIndex for LuaGlobalIndex {
             .iter()
             .copied()
             .collect::<rustc_hash::FxHashSet<_>>();
-        self.global_decl.retain(|_, decl_ids| {
-            decl_ids.retain(|decl_id| !removed_file_ids.contains(&decl_id.file_id));
-            !decl_ids.is_empty()
-        });
+        self.retain_decls(|file_id| removed_file_ids.contains(&file_id), |_| {});
     }
 
     fn clear(&mut self) {
+        for global_id in self.global_decl.keys() {
+            note_global_write(global_id.get_name());
+        }
         self.global_decl.clear();
+        self.scan_fingerprint = derivation::ABSENT;
     }
 }
 

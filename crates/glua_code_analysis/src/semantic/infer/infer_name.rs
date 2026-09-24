@@ -865,11 +865,7 @@ fn infer_implicit_self_type_from_call_site(
     if !signature.is_colon_define {
         return None;
     }
-    // Record the read even while call-site params are still being collected:
-    // the slot is empty now, but the contrib edge is what flags this read
-    // stale once the pipeline lands the receiver a caller contributed.
     if !cache.get_config().call_site_params_visible {
-        crate::db_index::read_set::record_contrib(&signature_id, signature.params.len());
         return None;
     }
     db.get_call_site_param_index()
@@ -1012,8 +1008,6 @@ fn infer_param_inner(
     let mut colon_define = false;
     // find local annotation
     if let Some(signature) = db.get_signature_index().get(&signature_id) {
-        // A missing contract is a read too: a later fill changes this answer.
-        crate::db_index::read_set::record_param(&signature_id);
         colon_define = signature.is_colon_define;
         if let Some(param_info) = signature.get_param_info_by_id(param_idx) {
             let mut typ = param_info.type_ref.clone();
@@ -1625,88 +1619,8 @@ fn find_param_type_from_sibling_members(
     final_type
 }
 
-type InheritedParamKey = (LuaMemberId, usize, bool, bool, FileId, TextSize);
-
-thread_local! {
-    /// Memo for [`find_param_type_from_inherited_members`], paired with the
-    /// `type_structure_revision` it was built against.
-    ///
-    /// Thread-local rather than a field on `DbIndex` because `&DbIndex` is
-    /// shared across worker threads, so the memo cannot live behind a `RefCell`
-    /// on the struct without giving up `Sync`.
-    static INHERITED_PARAM_MEMO: std::cell::RefCell<(u64, rustc_hash::FxHashMap<InheritedParamKey, Option<LuaType>>)> =
-        std::cell::RefCell::new((u64::MAX, rustc_hash::FxHashMap::default()));
-}
-
 /// The parameter's type as declared by an inherited member, if any.
-///
-/// This is the most expensive step of parameter inference: the unresolve
-/// pipeline's reachability probe calls it once per deferred parameter, and the
-/// cost is almost entirely the visibility-aware member lookup it performs per
-/// super type.
-///
-/// The same key is asked repeatedly across the retry loop's iterations, so the
-/// answer is memoized against `type_structure_revision`. Mutating the member,
-/// type, signature or module index bumps that revision, which covers the inputs
-/// the loop itself moves as it resolves.
-///
-/// It is not a complete read set. The visibility-aware lookup below also reads
-/// the dynamic-field and gmod-infer indexes, and neither bumps the revision, so
-/// a member that becomes visible between two unresolve runs can be missed by a
-/// memo entry computed before it existed.
 fn find_param_type_from_inherited_members(
-    db: &DbIndex,
-    current_member_id: LuaMemberId,
-    param_idx: usize,
-    colon_define: bool,
-    is_dots: bool,
-    caller_file_id: FileId,
-    caller_position: TextSize,
-) -> Option<LuaType> {
-    let revision = db.type_structure_revision();
-    let key = (
-        current_member_id,
-        param_idx,
-        colon_define,
-        is_dots,
-        caller_file_id,
-        caller_position,
-    );
-
-    let cached = INHERITED_PARAM_MEMO.with(|memo| {
-        let mut memo = memo.borrow_mut();
-        if memo.0 != revision {
-            memo.0 = revision;
-            memo.1.clear();
-            return None;
-        }
-        memo.1.get(&key).cloned()
-    });
-    if let Some(cached) = cached {
-        return cached;
-    }
-
-    let found = find_param_type_from_inherited_members_uncached(
-        db,
-        current_member_id,
-        param_idx,
-        colon_define,
-        is_dots,
-        caller_file_id,
-        caller_position,
-    );
-
-    INHERITED_PARAM_MEMO.with(|memo| {
-        let mut memo = memo.borrow_mut();
-        // Only store if nothing bumped the revision while we were computing.
-        if memo.0 == revision {
-            memo.1.insert(key, found.clone());
-        }
-    });
-    found
-}
-
-fn find_param_type_from_inherited_members_uncached(
     db: &DbIndex,
     current_member_id: LuaMemberId,
     param_idx: usize,
@@ -1964,12 +1878,6 @@ pub fn infer_param_with_cache(
     cache: &mut LuaInferCache,
     decl: &LuaDecl,
 ) -> InferResult {
-    // The memoised answer below derives from this signature's parameter
-    // contract, so a cache hit must still record the read: the contract can
-    // move after the answer was memoised.
-    if let LuaDeclExtra::Param { signature_id, .. } = &decl.extra {
-        crate::db_index::read_set::record_param(signature_id);
-    }
     let decl_id = decl.get_id();
     if let Some(cache_entry) = cache.param_type_cache.get(&decl_id) {
         return match cache_entry {
@@ -2257,7 +2165,6 @@ fn find_param_type_from_type(
     match source_type {
         LuaType::Signature(signature_id) => {
             let signature = db.get_signature_index().get(&signature_id)?;
-            crate::db_index::read_set::record_param(&signature_id);
             let adjusted_idx =
                 adjust_param_idx(param_idx, current_colon_define, signature.is_colon_define);
 
@@ -2350,7 +2257,6 @@ fn find_param_type_from_union(
     match source_type {
         LuaType::Signature(signature_id) => {
             let signature = db.get_signature_index().get(&signature_id)?;
-            crate::db_index::read_set::record_param(&signature_id);
             if !signature.param_docs.is_empty() {
                 let adjusted_idx =
                     adjust_param_idx(param_idx, origin_colon_define, signature.is_colon_define);
@@ -2485,22 +2391,12 @@ pub fn infer_global_type(
 fn record_missing_global_read(db: &DbIndex, name: &str) {
     let owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new(name));
     let key = LuaMemberKey::Name(name.into());
-    let member_count = db
-        .get_member_index()
+    db.get_member_index()
         .get_member_count_for_owner_key(&owner, &key);
-    let dynamic_field_count = crate::dynamic_field_owner_of(db, &owner)
-        .map(|dynamic_owner| {
-            db.get_dynamic_field_index()
-                .field_definitions(&dynamic_owner, name)
-                .len()
-        })
-        .unwrap_or(0);
-    crate::db_index::read_set::record_missing_member_slot(
-        &owner,
-        &key,
-        member_count,
-        dynamic_field_count,
-    );
+    if let Some(dynamic_owner) = crate::dynamic_field_owner_of(db, &owner) {
+        db.get_dynamic_field_index()
+            .field_definitions(&dynamic_owner, name);
+    }
 }
 
 fn infer_global_type_impl(

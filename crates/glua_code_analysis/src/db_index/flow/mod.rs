@@ -7,7 +7,10 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
     FileId, LuaSignatureId, LuaType, VarRefId,
-    db_index::{LuaOperatorId, LuaOperatorOwner, LuaTypeDeclId},
+    db_index::{
+        LuaOperatorId, LuaOperatorOwner, LuaTypeDeclId,
+        derivation::{self, FactKey, Fingerprint},
+    },
 };
 pub use flow_node::*;
 pub use flow_tree::{
@@ -21,6 +24,8 @@ use super::traits::LuaIndex;
 #[derive(Debug, Clone)]
 pub struct LuaFlowIndex {
     file_flow_tree: HashMap<FileId, FlowTree>,
+    /// [`FlowTree::content_fingerprint`] of each stored tree.
+    flow_tree_fingerprints: HashMap<FileId, Fingerprint>,
     signature_cast_cache: HashMap<FileId, HashMap<LuaSignatureId, LuaSignatureCast>>,
     special_call_effects: HashMap<FileId, HashMap<TextSize, Vec<LuaSpecialCallEffect>>>,
     /// Every special-call fact the epoch below has counted, keyed canonically.
@@ -37,6 +42,8 @@ pub struct LuaFlowIndex {
     /// a full fixpoint requeue.
     special_call_writes: u64,
     special_call_write_versions: HashMap<(FileId, TextSize), u64>,
+    /// Multiset fingerprint of `settled_special_call_facts` per site.
+    special_call_fact_fingerprints: HashMap<(FileId, TextSize), Fingerprint>,
 }
 
 impl Default for LuaFlowIndex {
@@ -49,19 +56,25 @@ impl LuaFlowIndex {
     pub fn new() -> Self {
         Self {
             file_flow_tree: HashMap::default(),
+            flow_tree_fingerprints: HashMap::default(),
             signature_cast_cache: HashMap::default(),
             special_call_effects: HashMap::default(),
             settled_special_call_facts: HashSet::default(),
             special_call_writes: 0,
             special_call_write_versions: HashMap::default(),
+            special_call_fact_fingerprints: HashMap::default(),
         }
     }
 
     pub fn add_flow_tree(&mut self, file_id: FileId, flow_tree: FlowTree) {
+        derivation::note_write(|| FactKey::FlowTree(file_id));
+        self.flow_tree_fingerprints
+            .insert(file_id, flow_tree.content_fingerprint());
         self.file_flow_tree.insert(file_id, flow_tree);
     }
 
     pub fn get_flow_tree(&self, file_id: &FileId) -> Option<&FlowTree> {
+        derivation::note_read(|| FactKey::FlowTree(*file_id));
         self.file_flow_tree.get(file_id)
     }
 
@@ -70,6 +83,7 @@ impl LuaFlowIndex {
     }
 
     pub fn get_signature_cast(&self, signature_id: &LuaSignatureId) -> Option<&LuaSignatureCast> {
+        derivation::note_read(|| FactKey::FlowTree(signature_id.get_file_id()));
         self.signature_cast_cache
             .get(&signature_id.get_file_id())?
             .get(signature_id)
@@ -91,6 +105,8 @@ impl LuaFlowIndex {
         cast: LuaAstPtr<LuaDocOpType>,
         fallback_cast: Option<LuaAstPtr<LuaDocOpType>>,
     ) {
+        derivation::note_write(|| FactKey::FlowTree(file_id));
+        derivation::note_write(|| FactKey::FlowTree(signature_id.get_file_id()));
         self.signature_cast_cache
             .entry(file_id)
             .or_default()
@@ -130,6 +146,8 @@ impl LuaFlowIndex {
             return false;
         }
         effects.push(effect);
+        derivation::note_write(|| FactKey::SpecialCall(file_id, position));
+        derivation::note_write(|| FactKey::SpecialCallFile(file_id));
         self.install_special_call_facts(
             file_id,
             position,
@@ -157,7 +175,14 @@ impl LuaFlowIndex {
     ) -> bool {
         let mut novel = false;
         for fact in facts {
-            novel |= self.settled_special_call_facts.insert(fact);
+            let site = fact.site();
+            let fingerprint = derivation::fingerprint_of(&fact);
+            if self.settled_special_call_facts.insert(fact) {
+                novel = true;
+                derivation::note_write(|| FactKey::SpecialCall(site.0, site.1));
+                let sum = self.special_call_fact_fingerprints.entry(site).or_default();
+                *sum = sum.wrapping_add(fingerprint);
+            }
         }
         if novel {
             self.note_special_call_write(file_id, position);
@@ -176,16 +201,10 @@ impl LuaFlowIndex {
     /// identical call-site must not bump, or the fixpoint's staleness filter
     /// degrades to a full requeue.
     pub(crate) fn note_special_call_write(&mut self, file_id: FileId, position: TextSize) {
+        derivation::note_write(|| FactKey::SpecialCall(file_id, position));
         self.special_call_writes += 1;
         self.special_call_write_versions
             .insert((file_id, position), self.special_call_writes);
-    }
-
-    pub(crate) fn special_call_write_version(&self, file_id: &FileId, position: &TextSize) -> u64 {
-        self.special_call_write_versions
-            .get(&(*file_id, *position))
-            .copied()
-            .unwrap_or(0)
     }
 
     /// Iterates the special-call write sites recorded so far, exposing only
@@ -210,13 +229,15 @@ impl LuaFlowIndex {
         }
         let mut dirty = rustc_hash::FxHashSet::default();
         for (holder, effects) in self.special_call_effects.iter_mut() {
-            for effects in effects.values_mut() {
+            for (position, effects) in effects.iter_mut() {
                 for effect in effects.iter_mut() {
                     let result = crate::db_index::remap_identities_in_type(&effect.type_ref, remap);
                     if result.lost {
                         dirty.insert(*holder);
                     } else if let Some(typ) = result.typ {
                         effect.type_ref = typ;
+                        derivation::note_write(|| FactKey::SpecialCall(*holder, *position));
+                        derivation::note_write(|| FactKey::FlowTree(*holder));
                     }
                 }
             }
@@ -224,12 +245,32 @@ impl LuaFlowIndex {
         dirty
     }
 
+    /// Drops what the special call at `position` settled, before the
+    /// derivation that settled it runs again.
+    pub(crate) fn reset_special_call(&mut self, file_id: FileId, position: TextSize) {
+        derivation::note_write(|| FactKey::SpecialCall(file_id, position));
+        if let Some(effects) = self.special_call_effects.get_mut(&file_id)
+            && effects.remove(&position).is_some()
+        {
+            derivation::note_write(|| FactKey::SpecialCallFile(file_id));
+            if effects.is_empty() {
+                self.special_call_effects.remove(&file_id);
+            }
+        }
+        self.settled_special_call_facts
+            .retain(|fact| fact.site() != (file_id, position));
+        self.special_call_fact_fingerprints
+            .remove(&(file_id, position));
+        self.special_call_write_versions
+            .remove(&(file_id, position));
+    }
+
     pub fn get_special_call_effects(
         &self,
         file_id: &FileId,
         position: TextSize,
     ) -> Option<&[LuaSpecialCallEffect]> {
-        crate::db_index::read_set::record_special_call(file_id, position);
+        derivation::note_read(|| FactKey::SpecialCall(*file_id, position));
         self.special_call_effects
             .get(file_id)?
             .get(&position)
@@ -256,6 +297,7 @@ impl LuaFlowIndex {
     /// fast-path: special calls can narrow arbitrary var-refs at runtime, so a
     /// file with any such effect must not skip narrowing walks.
     pub fn has_any_special_call_effect(&self, file_id: &FileId) -> bool {
+        derivation::note_read(|| FactKey::SpecialCallFile(*file_id));
         self.special_call_effects
             .get(file_id)
             .is_some_and(|by_pos| !by_pos.is_empty())
@@ -267,6 +309,7 @@ impl LuaFlowIndex {
         position: TextSize,
         target: &VarRefId,
     ) -> bool {
+        derivation::note_read(|| FactKey::SpecialCallFile(*file_id));
         self.special_call_effects
             .get(file_id)
             .is_some_and(|effects_by_position| {
@@ -278,14 +321,72 @@ impl LuaFlowIndex {
                     })
             })
     }
+
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        match key {
+            FactKey::FlowTree(file_id) => {
+                let tree = self.flow_tree_fingerprints.get(file_id);
+                let casts = self.signature_cast_cache.get(file_id);
+                if tree.is_none() && casts.is_none() {
+                    return derivation::ABSENT;
+                }
+                let casts = casts.map(|casts| {
+                    casts
+                        .iter()
+                        .map(|entry| derivation::fingerprint_of(&entry))
+                        .fold(0u64, u64::wrapping_add)
+                });
+                derivation::fingerprint_of(&(tree, casts))
+            }
+            FactKey::SpecialCallFile(file_id) => {
+                self.special_call_effects
+                    .get(file_id)
+                    .map_or(derivation::ABSENT, |effects| {
+                        effects
+                            .iter()
+                            .map(|entry| derivation::fingerprint_of(&entry))
+                            .fold(0u64, u64::wrapping_add)
+                            .max(1)
+                    })
+            }
+            FactKey::SpecialCall(file_id, position) => {
+                let effects = self
+                    .special_call_effects
+                    .get(file_id)
+                    .and_then(|effects| effects.get(position));
+                let facts = self
+                    .special_call_fact_fingerprints
+                    .get(&(*file_id, *position))
+                    .copied()
+                    .unwrap_or(0);
+                if effects.is_none() && facts == 0 {
+                    return derivation::ABSENT;
+                }
+                derivation::fingerprint_of(&(effects, facts))
+            }
+            _ => {
+                debug_assert!(false, "{key:?} is not a flow fact");
+                derivation::ABSENT
+            }
+        }
+    }
 }
 
 impl LuaIndex for LuaFlowIndex {
     fn remove(&mut self, file_id: FileId) {
+        derivation::note_write(|| FactKey::FlowTree(file_id));
         self.file_flow_tree.remove(&file_id);
+        self.flow_tree_fingerprints.remove(&file_id);
         self.signature_cast_cache.remove(&file_id);
         self.settled_special_call_facts
             .retain(|fact| fact.site_file() != file_id);
+        self.special_call_fact_fingerprints.retain(|site, _| {
+            let keep = site.0 != file_id;
+            if !keep {
+                derivation::note_write(|| FactKey::SpecialCall(site.0, site.1));
+            }
+            keep
+        });
         // Dropping the effects is a novel fact for their readers, mirroring
         // the signature index's removal tombstones.
         if let Some(by_position) = self.special_call_effects.remove(&file_id) {
@@ -295,7 +396,27 @@ impl LuaIndex for LuaFlowIndex {
         }
     }
     fn clear(&mut self) {
+        if derivation::recording() {
+            for file_id in self
+                .file_flow_tree
+                .keys()
+                .chain(self.signature_cast_cache.keys())
+                .chain(self.special_call_effects.keys())
+            {
+                derivation::note_write(|| FactKey::FlowTree(*file_id));
+            }
+            for (file_id, effects) in &self.special_call_effects {
+                for position in effects.keys() {
+                    derivation::note_write(|| FactKey::SpecialCall(*file_id, *position));
+                }
+            }
+            for site in self.special_call_fact_fingerprints.keys() {
+                derivation::note_write(|| FactKey::SpecialCall(site.0, site.1));
+            }
+        }
         self.file_flow_tree.clear();
+        self.flow_tree_fingerprints.clear();
+        self.special_call_fact_fingerprints.clear();
         self.signature_cast_cache.clear();
         self.special_call_effects.clear();
         self.settled_special_call_facts.clear();
@@ -303,7 +424,7 @@ impl LuaIndex for LuaFlowIndex {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaSpecialCallEffect {
     pub target: VarRefId,
     pub type_ref: LuaType,
@@ -329,7 +450,7 @@ pub enum SpecialCallFact {
         is_colon_call: bool,
     },
     /// An inheritance edge installed for a synthesized class (str-tpl or
-    /// constructor root edge), mirroring `has_super_type_at_source`.
+    /// constructor root edge).
     SuperEdge {
         site_file: FileId,
         site_position: TextSize,
@@ -430,6 +551,31 @@ impl SpecialCallFact {
         }
     }
 
+    fn site(&self) -> (FileId, TextSize) {
+        match self {
+            Self::StrTplDecl {
+                site_file,
+                site_position,
+                ..
+            }
+            | Self::SuperEdge {
+                site_file,
+                site_position,
+                ..
+            }
+            | Self::CallOperator {
+                site_file,
+                site_position,
+                ..
+            }
+            | Self::FlowEffect {
+                site_file,
+                site_position,
+                ..
+            } => (*site_file, *site_position),
+        }
+    }
+
     fn site_file(&self) -> FileId {
         match self {
             Self::StrTplDecl { site_file, .. }
@@ -446,24 +592,6 @@ mod tests {
 
     fn effect_target(file_id: FileId) -> VarRefId {
         VarRefId::VarRef(crate::LuaDeclId::new(file_id, TextSize::new(0)))
-    }
-
-    #[test]
-    fn special_call_write_versions_start_at_zero_and_bump_per_site() {
-        let mut index = LuaFlowIndex::new();
-        let file_id = FileId::new(1);
-        let position = TextSize::new(16);
-
-        assert_eq!(index.special_call_writes(), 0);
-        assert_eq!(index.special_call_write_version(&file_id, &position), 0);
-
-        index.note_special_call_write(file_id, position);
-        assert_eq!(index.special_call_writes(), 1);
-        assert_eq!(index.special_call_write_version(&file_id, &position), 1);
-        assert_eq!(
-            index.special_call_write_version(&file_id, &TextSize::new(64)),
-            0
-        );
     }
 
     /// Re-installing an identical effect reports a duplicate and must not
@@ -495,21 +623,6 @@ mod tests {
                 .expect("expected the effect")
                 .len(),
             1
-        );
-    }
-
-    #[test]
-    fn removing_file_bumps_its_dropped_effect_versions() {
-        let mut index = LuaFlowIndex::new();
-        let file_id = FileId::new(1);
-        let position = TextSize::new(16);
-        index.add_special_call_effect(file_id, position, effect_target(file_id), LuaType::String);
-        let version_before = index.special_call_write_version(&file_id, &position);
-
-        index.remove(file_id);
-        assert!(
-            index.special_call_write_version(&file_id, &position) > version_before,
-            "dropping the effect must invalidate its readers"
         );
     }
 
@@ -594,14 +707,6 @@ mod tests {
             );
         }
         assert_eq!(first_order.special_call_writes(), writes_after_first_pass);
-        assert_eq!(
-            first_order.special_call_write_version(&site_a.0, &site_a.1),
-            1
-        );
-        assert_eq!(
-            first_order.special_call_write_version(&site_b.0, &site_b.1),
-            2
-        );
 
         // A fresh index settled B-first reaches the same epoch and fact set.
         let mut second_order = LuaFlowIndex::new();

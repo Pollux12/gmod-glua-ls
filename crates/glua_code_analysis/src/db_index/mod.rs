@@ -2,6 +2,7 @@ mod accessor_func;
 mod call_site_param;
 mod declaration;
 mod dependency;
+pub(crate) mod derivation;
 mod diagnostic;
 mod dynamic_field;
 mod edit;
@@ -16,7 +17,6 @@ mod member;
 mod metatable;
 mod module;
 mod numeric_range_population;
-pub(crate) mod op_log;
 mod operators;
 mod property;
 mod reference;
@@ -26,18 +26,13 @@ mod signature;
 mod traits;
 mod r#type;
 pub(crate) use intern::intern_smol_str;
-pub(crate) use r#type::read_set;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{path::PathBuf, sync::Arc};
 
-use self::read_set::WriteKey;
 use crate::{Emmyrc, FileId, Vfs, profile::Profile};
 pub use accessor_func::*;
-pub use call_site_param::{
-    CallSiteParamContribution, CallSiteParamIndex, CallSiteReturnConsumer,
-    CallSiteReturnConsumerTarget, CallSiteSourceId,
-};
+pub use call_site_param::{CallSiteParamContribution, CallSiteParamIndex};
 pub use declaration::*;
 pub use dependency::{LuaDependencyIndex, LuaDependencyKind, LuaDependencySite};
 pub use diagnostic::{AnalyzeError, DiagnosticAction, DiagnosticActionKind, DiagnosticIndex};
@@ -97,13 +92,24 @@ pub struct DbIndex {
     metatable_index: Arc<LuaMetatableIndex>,
     global_index: Arc<LuaGlobalIndex>,
     json_schema_index: Arc<JsonSchemaIndex>,
+    /// Who read and produced which fact; see [`derivation`].
+    derivations: Arc<derivation::ReaderGraph>,
+    /// The workspace gmod call roles with their content fingerprint.
+    /// Type-erased so `db_index` does not name the analyzer's types.
+    gmod_call_roles: Option<(
+        Arc<dyn std::any::Any + Send + Sync>,
+        derivation::Fingerprint,
+    )>,
     emmyrc: Arc<Emmyrc>,
-    /// Revision-keyed cache for workspace-wide derived structures that are pure
-    /// functions of VFS content (currently the gmod net-helper registry). Stored
-    /// type-erased so `db_index` stays decoupled from the analyzer crate layer.
-    /// Invalidated automatically by comparing `Vfs::content_revision`.
-    helper_registry_cache: RevisionedCache,
-    file_helper_scan_cache: FxHashMap<FileId, Arc<dyn std::any::Any + Send + Sync>>,
+    /// Each file's gmod helper scan with its content fingerprint, type-erased
+    /// like `gmod_call_roles`.
+    helper_scans: FxHashMap<
+        FileId,
+        (
+            Arc<dyn std::any::Any + Send + Sync>,
+            derivation::Fingerprint,
+        ),
+    >,
     /// Bumped on every *mutable* handle to the type, member, signature or module
     /// index; memos over facts derived from those key on it. It covers those four
     /// and no others — the decl, global, dynamic-field and gmod-infer indexes all
@@ -120,19 +126,6 @@ pub struct DbIndex {
 fn next_type_structure_revision() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Type-erased, revision-keyed cache slot (see `DbIndex::helper_registry_cache`).
-#[derive(Default)]
-struct RevisionedCache(Option<(u64, Arc<dyn std::any::Any + Send + Sync>)>);
-
-impl std::fmt::Debug for RevisionedCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.0 {
-            Some((rev, _)) => write!(f, "RevisionedCache(rev={rev})"),
-            None => write!(f, "RevisionedCache(empty)"),
-        }
-    }
 }
 
 #[allow(unused)]
@@ -170,71 +163,232 @@ impl DbIndex {
             metatable_index: Arc::new(LuaMetatableIndex::new()),
             global_index: Arc::new(LuaGlobalIndex::new()),
             json_schema_index: Arc::new(JsonSchemaIndex::new()),
+            derivations: Arc::default(),
+            gmod_call_roles: None,
             emmyrc: Arc::new(Emmyrc::default()),
-            helper_registry_cache: RevisionedCache::default(),
-            file_helper_scan_cache: FxHashMap::default(),
+            helper_scans: FxHashMap::default(),
         }
     }
 
-    /// One file's contribution to the gmod net-helper scan.
-    pub fn get_cached_file_helper_scan<T: std::any::Any + Send + Sync>(
-        &self,
-        file_id: FileId,
-    ) -> Option<Arc<T>> {
-        op_log::note_untracked_read(op_log::UntrackedDomain::HelperCache);
-        self.file_helper_scan_cache
-            .get(&file_id)
-            .and_then(|value| value.clone().downcast::<T>().ok())
+    pub(crate) fn reader_graph(&self) -> &derivation::ReaderGraph {
+        &self.derivations
     }
 
-    pub fn set_cached_file_helper_scan<T: std::any::Any + Send + Sync>(
-        &mut self,
-        file_id: FileId,
-        value: Arc<T>,
-    ) {
-        if op_log::recording() {
-            let value2 = value.clone();
-            op_log::push_one(
-                op_log::Domain::HelperCache,
-                WriteKey::HelperCache(file_id),
-                move |db| db.set_cached_file_helper_scan(file_id, value2),
-            );
-        }
-        self.file_helper_scan_cache.insert(file_id, value);
+    pub(crate) fn reader_graph_mut(&mut self) -> &mut derivation::ReaderGraph {
+        Arc::make_mut(&mut self.derivations)
     }
 
-    /// Fetch the cached gmod net-helper registry if it was built at `revision`.
-    /// Type-erased so the `db_index` layer need not name the analyzer's registry
-    /// type; the caller downcasts to its concrete `T`.
-    pub fn get_cached_helper_registry<T: std::any::Any + Send + Sync>(
-        &self,
-        revision: u64,
-    ) -> Option<Arc<T>> {
-        op_log::note_untracked_read(op_log::UntrackedDomain::HelperCache);
-        match &self.helper_registry_cache.0 {
-            Some((cached_rev, value)) if *cached_rev == revision => {
-                value.clone().downcast::<T>().ok()
+    /// Restores a primary fact to its source-layer value, dropping what every
+    /// derivation stored under it. The engine re-runs all of the key's
+    /// producers afterwards, so a multi-writer key is rebuilt in canonical
+    /// order.
+    pub(crate) fn reset_fact(&mut self, key: &derivation::FactKey) {
+        use derivation::FactKey as K;
+        match key {
+            K::TypeCache(owner) => self.get_type_index_mut().reset_type_cache(owner),
+            K::HelperScan(file_id) => self.remove_helper_scan(*file_id),
+            K::DeclClaim(decl_id) => self.get_type_index_mut().reset_decl_claim(decl_id),
+            K::DefinitionFact(definition) => {
+                self.get_type_index_mut().reset_definition_fact(definition)
             }
-            _ => None,
+            K::Signature(signature_id) => {
+                self.get_signature_index_mut().reset_signature(signature_id)
+            }
+            K::ValidGuardFile(file_id) => self
+                .get_signature_index_mut()
+                .remove_valid_guard_file_contributions(*file_id),
+            K::InferredGuard(signature_id) => self
+                .get_signature_index_mut()
+                .reset_inferred_guard(signature_id),
+            K::Member(member_id) => self.get_member_index_mut().reset_member(*member_id),
+            K::TypeContrib(id) => self.get_type_index_mut().retract_contributions(id),
+            K::PathClassContrib(id) => self.get_member_index_mut().retract_path_classes(id),
+            K::OperatorContrib(id) => self.get_operator_index_mut().retract_contributions(id),
+            K::ReferenceContrib(id) => self.get_reference_index_mut().retract_index_references(id),
+            K::DeclContrib(id) => {
+                for decl in self.get_decl_index_mut().retract_derived_decls(id) {
+                    if decl.is_global() {
+                        self.get_global_index_mut()
+                            .remove_global_decl(decl.get_name(), decl.get_id());
+                    }
+                }
+            }
+            K::SpecialCall(file_id, position) => self
+                .get_flow_index_mut()
+                .reset_special_call(*file_id, *position),
+            K::DynamicFieldFile(file_id) => {
+                self.get_dynamic_field_index_mut().remove_files(&[*file_id])
+            }
+            K::NetworkFile(file_id) => self.get_gmod_network_index_mut().remove_file(*file_id),
+            K::Module(file_id) => self.get_module_index_mut().reset_export(*file_id),
+            K::Metatable(table) => self.get_metatable_index_mut().reset_table(table),
+            K::MetatableFactory(file_id) => self
+                .get_metatable_index_mut()
+                .reset_factory_bindings(*file_id),
+            K::LoadSites(file_id) => self
+                .get_file_dependencies_index_mut()
+                .reset_derived_sites(*file_id),
+            K::DeclDefault(decl_id) => self
+                .get_property_index_mut()
+                .reset_inferred_string_defaults(decl_id),
+            K::AccessorCalls(file_id) => {
+                self.get_accessor_func_call_index_mut().reset_file(*file_id)
+            }
+            K::GmodInferFile(file_id) => self
+                .get_gmod_infer_index_mut()
+                .reset_file_metadata(*file_id),
+            K::GmodClassFile(file_id) => self
+                .get_gmod_class_metadata_index_mut()
+                .remove_files(&[*file_id]),
+            K::CallSiteFile(file_id) => self.get_call_site_param_index_mut().retract_file(*file_id),
+            _ => {}
         }
     }
 
-    /// Store a freshly built gmod net-helper registry keyed by the VFS content
-    /// revision it was derived from.
-    pub fn set_cached_helper_registry<T: std::any::Any + Send + Sync>(
+    pub(crate) fn get_gmod_call_roles<T: std::any::Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        derivation::note_read(|| derivation::FactKey::HelperRegistry);
+        self.gmod_call_roles
+            .as_ref()
+            .and_then(|(roles, _)| roles.clone().downcast::<T>().ok())
+    }
+
+    pub(crate) fn set_gmod_call_roles<T: std::any::Any + Send + Sync>(
         &mut self,
-        revision: u64,
-        value: Arc<T>,
+        roles: Arc<T>,
+        fingerprint: derivation::Fingerprint,
     ) {
-        if op_log::recording() {
-            let value2 = value.clone();
-            op_log::push_one(
-                op_log::Domain::HelperCache,
-                WriteKey::HelperRegistry,
-                move |db| db.set_cached_helper_registry(revision, value2),
-            );
+        derivation::note_write(|| derivation::FactKey::HelperRegistry);
+        self.gmod_call_roles = Some((roles, fingerprint.max(1)));
+    }
+
+    /// The fingerprint of what a read of `key` observes now.
+    pub(crate) fn fact_fingerprint(&self, key: &derivation::FactKey) -> derivation::Fingerprint {
+        use derivation::FactKey as K;
+        match key {
+            K::TypeCache(_)
+            | K::DefinitionFact(_)
+            | K::TypeDecl(_)
+            | K::SourceTypeDecl(_)
+            | K::TypeContrib(_)
+            | K::SubTypes(_)
+            | K::BoundDecls(..)
+            | K::DeclClaim(_)
+            | K::TypeDeclScan
+            | K::TypeFile(_)
+            | K::TableClass(_) => self.types_index.fact_fingerprint(key),
+            K::Decl(_) | K::DeclTree(_) | K::DeclContrib(_) => {
+                self.decl_index.fact_fingerprint(key)
+            }
+            K::Member(_)
+            | K::MemberSlot(..)
+            | K::MemberOwnerMap(_)
+            | K::MemberKey(_)
+            | K::MemberFile(_)
+            | K::GlobalPath(_)
+            | K::PathClassContrib(_)
+            | K::DefinitionSite(_) => self.members_index.fact_fingerprint(key),
+            K::Signature(_)
+            | K::ValidGuard(_)
+            | K::ValidGuardFile(_)
+            | K::ValidGuardFiles
+            | K::InferredGuard(_)
+            | K::SignatureFile(_)
+            | K::ReceiverOutParam(_) => self.signature_index.fact_fingerprint(key),
+            K::Contrib(..) | K::CallSiteFile(_) => self.call_site_param_index.fact_fingerprint(key),
+            K::Module(_)
+            | K::ModuleMeta(_)
+            | K::ModuleName(_)
+            | K::ModuleNamespace(_)
+            | K::ModuleFiles => self.modules_index.fact_fingerprint(key),
+            K::SpecialCall(..) | K::SpecialCallFile(_) | K::FlowTree(_) => {
+                self.flow_index.fact_fingerprint(key)
+            }
+            K::DynamicField(..) | K::UnattributedField(_) | K::DynamicFieldFile(_) => {
+                self.dynamic_field_index.fact_fingerprint(key)
+            }
+            K::OperatorOwner(_) | K::OperatorFile(_) | K::OperatorContrib(_) => {
+                self.operator_index.fact_fingerprint(key)
+            }
+            K::Metatable(_) | K::MetatableFactory(_) => self.metatable_index.fact_fingerprint(key),
+            K::GmodMeta(_) | K::GmodClassFile(_) | K::VguiChain(_) | K::VguiParentCallFiles => {
+                self.gmod_class_index.fact_fingerprint(key)
+            }
+            K::GmodInferFile(_) | K::GmodRealm(_) | K::GmodInferScan => {
+                self.gmod_infer_index.fact_fingerprint(key)
+            }
+            K::GmodLoadFile(_) => self.gmod_load_index.fact_fingerprint(key),
+            K::NetworkFile(_) | K::NetworkScan | K::NetHelperNames => {
+                self.gmod_network_index.fact_fingerprint(key)
+            }
+            K::HelperRegistry => self
+                .gmod_call_roles
+                .as_ref()
+                .map_or(derivation::ABSENT, |(_, fingerprint)| *fingerprint),
+            K::HelperScan(file_id) => self
+                .helper_scans
+                .get(file_id)
+                .map_or(derivation::ABSENT, |(_, fingerprint)| *fingerprint),
+            K::HelperScanFiles => {
+                let mut file_ids = self.helper_scans.keys().collect::<Vec<_>>();
+                file_ids.sort_unstable();
+                derivation::fingerprint_of(&file_ids)
+            }
+            K::Property(_) | K::DeclDefault(_) => self.property_index.fact_fingerprint(key),
+            K::Global(_) | K::GlobalScan => self.global_index.fact_fingerprint(key),
+            K::References(_) | K::ReferencesByName(_) | K::ReferenceContrib(_) => {
+                self.references_index.fact_fingerprint(key)
+            }
+            K::NumericPopulation(_) => self.numeric_range_population_index.fact_fingerprint(key),
+            K::AccessorFunc(_) => self.accessor_func_index.fact_fingerprint(key),
+            K::AccessorCalls(_) => self.accessor_func_call_index.fact_fingerprint(key),
+            K::Dependency(_) | K::LoadSites(_) => {
+                self.file_dependencies_index.fact_fingerprint(key)
+            }
+            K::DiagnosticFile(_) => self.diagnostic_index.fact_fingerprint(key),
+            K::FileText(file_id) => self.vfs.text_fingerprint(file_id),
+            K::FileSet => self.vfs.file_set_fingerprint(),
         }
-        self.helper_registry_cache.0 = Some((revision, value));
+    }
+
+    pub(crate) fn get_helper_scan<T: std::any::Any + Send + Sync>(
+        &self,
+        file_id: FileId,
+    ) -> Option<Arc<T>> {
+        derivation::note_read(|| derivation::FactKey::HelperScan(file_id));
+        self.helper_scans
+            .get(&file_id)
+            .and_then(|(scan, _)| scan.clone().downcast::<T>().ok())
+    }
+
+    pub(crate) fn set_helper_scan<T: std::any::Any + Send + Sync>(
+        &mut self,
+        file_id: FileId,
+        scan: Arc<T>,
+        fingerprint: derivation::Fingerprint,
+    ) {
+        derivation::note_write(|| derivation::FactKey::HelperScan(file_id));
+        if self
+            .helper_scans
+            .insert(file_id, (scan, fingerprint.max(1)))
+            .is_none()
+        {
+            derivation::note_write(|| derivation::FactKey::HelperScanFiles);
+        }
+    }
+
+    fn remove_helper_scan(&mut self, file_id: FileId) {
+        if self.helper_scans.remove(&file_id).is_some() {
+            derivation::note_write(|| derivation::FactKey::HelperScan(file_id));
+            derivation::note_write(|| derivation::FactKey::HelperScanFiles);
+        }
+    }
+
+    /// The files that have a gmod helper scan, sorted.
+    pub(crate) fn helper_scan_files(&self) -> Vec<FileId> {
+        derivation::note_read(|| derivation::FactKey::HelperScanFiles);
+        let mut file_ids = self.helper_scans.keys().copied().collect::<Vec<_>>();
+        file_ids.sort_unstable();
+        file_ids
     }
 
     pub fn remove_index(&mut self, mut file_ids: Vec<FileId>) {
@@ -245,12 +399,8 @@ impl DbIndex {
         }
 
         let _profile = Profile::cond_new("remove indexes", file_ids.len() > 1);
-        // Same reasoning as in `clear`: both halves of the revision key can
-        // return to a previously cached value after a remove + update while the
-        // underlying index has changed.
-        self.helper_registry_cache = RevisionedCache::default();
         for &file_id in &file_ids {
-            self.file_helper_scan_cache.remove(&file_id);
+            self.remove_helper_scan(file_id);
         }
         for &file_id in &file_ids {
             if let Some(path) = self.get_vfs().get_file_path(&file_id) {
@@ -267,7 +417,6 @@ impl DbIndex {
     }
 
     pub fn get_metatable_index_mut(&mut self) -> &mut LuaMetatableIndex {
-        op_log::note_domain_touch(op_log::Domain::Metatable);
         Arc::make_mut(&mut self.metatable_index)
     }
 
@@ -278,24 +427,20 @@ impl DbIndex {
     }
 
     pub fn get_decl_index_mut(&mut self) -> &mut LuaDeclIndex {
-        op_log::note_domain_touch(op_log::Domain::Decl);
         Arc::make_mut(&mut self.decl_index)
     }
 
     pub fn get_reference_index_mut(&mut self) -> &mut LuaReferenceIndex {
-        op_log::note_domain_touch(op_log::Domain::Reference);
         Arc::make_mut(&mut self.references_index)
     }
 
     /// Rebuilds the inference-derived state left stale by a batch of fact
     /// bindings. See [`LuaTypeIndex::flush_inference_derived_state`].
     pub fn flush_inference_derived_state(&mut self) {
-        op_log::note_domain_touch(op_log::Domain::Type);
         Arc::make_mut(&mut self.types_index).flush_inference_derived_state();
     }
 
     pub fn get_type_index_mut(&mut self) -> &mut LuaTypeIndex {
-        op_log::note_domain_touch(op_log::Domain::Type);
         self.type_structure_revision = next_type_structure_revision();
         Arc::make_mut(&mut self.types_index)
     }
@@ -332,7 +477,6 @@ impl DbIndex {
         // Writes into `types_index` below go direct rather than through
         // `get_type_index_mut`, so bump the revision and note the touch here
         // too.
-        op_log::note_domain_touch(op_log::Domain::Type);
         self.type_structure_revision = next_type_structure_revision();
         updates.sort_by(|(left_node, _), (right_node, _)| left_node.stable_cmp(right_node));
 
@@ -393,42 +537,35 @@ impl DbIndex {
     }
 
     pub fn get_module_index_mut(&mut self) -> &mut LuaModuleIndex {
-        op_log::note_domain_touch(op_log::Domain::Module);
         self.type_structure_revision = next_type_structure_revision();
         Arc::make_mut(&mut self.modules_index)
     }
 
     #[track_caller]
     pub fn get_member_index_mut(&mut self) -> &mut LuaMemberIndex {
-        op_log::note_domain_touch(op_log::Domain::Member);
         self.type_structure_revision = next_type_structure_revision();
         Arc::make_mut(&mut self.members_index)
     }
 
     #[track_caller]
     pub fn get_property_index_mut(&mut self) -> &mut LuaPropertyIndex {
-        op_log::note_domain_touch(op_log::Domain::Property);
         Arc::make_mut(&mut self.property_index)
     }
 
     pub fn get_signature_index_mut(&mut self) -> &mut LuaSignatureIndex {
-        op_log::note_domain_touch(op_log::Domain::Signature);
         self.type_structure_revision = next_type_structure_revision();
         Arc::make_mut(&mut self.signature_index)
     }
 
     pub fn get_diagnostic_index_mut(&mut self) -> &mut DiagnosticIndex {
-        op_log::note_domain_touch(op_log::Domain::Diagnostic);
         Arc::make_mut(&mut self.diagnostic_index)
     }
 
     pub fn get_operator_index_mut(&mut self) -> &mut LuaOperatorIndex {
-        op_log::note_domain_touch(op_log::Domain::Operator);
         Arc::make_mut(&mut self.operator_index)
     }
 
     pub fn get_flow_index_mut(&mut self) -> &mut LuaFlowIndex {
-        op_log::note_domain_touch(op_log::Domain::Flow);
         Arc::make_mut(&mut self.flow_index)
     }
 
@@ -444,20 +581,6 @@ impl DbIndex {
         self.types_index.as_ref()
     }
 
-    /// The current write counters for the read-set domains without per-key
-    /// clocks, in [`read_set::UntrackedDomain`] order. The counters live on
-    /// the owning indexes — `TypeDecl` and `GmodMeta` each span two of them
-    /// (the gmod index's `vgui_forwarding_parents` and the signature index's
-    /// `receiver_out_param_member_names` feed the same readers), so those
-    /// slots sum. Instance-scoped: a write on another `DbIndex` cannot
-    /// stale this instance's readers.
-    pub(crate) fn untracked_write_epochs(&self) -> [u64; read_set::UNTRACKED_DOMAIN_COUNT] {
-        [
-            self.types_index.type_decl_writes + self.gmod_class_index.type_decl_writes,
-            self.signature_index.gmod_meta_writes + self.gmod_class_index.gmod_meta_writes,
-        ]
-    }
-
     pub fn get_module_index(&self) -> &LuaModuleIndex {
         self.modules_index.as_ref()
     }
@@ -467,7 +590,6 @@ impl DbIndex {
     }
 
     pub fn get_property_index(&self) -> &LuaPropertyIndex {
-        op_log::note_untracked_read(op_log::UntrackedDomain::Property);
         self.property_index.as_ref()
     }
 
@@ -495,7 +617,6 @@ impl DbIndex {
     }
 
     pub fn get_accessor_func_index_mut(&mut self) -> &mut AccessorFuncAnnotationIndex {
-        op_log::note_domain_touch(op_log::Domain::AccessorFunc);
         Arc::make_mut(&mut self.accessor_func_index)
     }
 
@@ -504,7 +625,6 @@ impl DbIndex {
     }
 
     pub fn get_accessor_func_call_index_mut(&mut self) -> &mut AccessorFuncCallIndex {
-        op_log::note_domain_touch(op_log::Domain::AccessorFuncCall);
         Arc::make_mut(&mut self.accessor_func_call_index)
     }
 
@@ -513,7 +633,6 @@ impl DbIndex {
     }
 
     pub fn get_call_site_param_index_mut(&mut self) -> &mut CallSiteParamIndex {
-        op_log::note_domain_touch(op_log::Domain::CallSiteParam);
         Arc::make_mut(&mut self.call_site_param_index)
     }
 
@@ -524,17 +643,14 @@ impl DbIndex {
     }
 
     pub fn get_gmod_class_metadata_index_mut(&mut self) -> &mut GmodClassMetadataIndex {
-        op_log::note_domain_touch(op_log::Domain::GmodClass);
         Arc::make_mut(&mut self.gmod_class_index)
     }
 
     pub fn get_gmod_infer_index(&self) -> &GmodInferIndex {
-        op_log::note_untracked_read(op_log::UntrackedDomain::GmodInfer);
         self.gmod_infer_index.as_ref()
     }
 
     pub fn get_gmod_infer_index_mut(&mut self) -> &mut GmodInferIndex {
-        op_log::note_domain_touch(op_log::Domain::GmodInfer);
         Arc::make_mut(&mut self.gmod_infer_index)
     }
 
@@ -543,7 +659,6 @@ impl DbIndex {
     }
 
     pub fn get_gmod_load_index_mut(&mut self) -> &mut GmodLoadIndex {
-        op_log::note_domain_touch(op_log::Domain::GmodLoad);
         Arc::make_mut(&mut self.gmod_load_index)
     }
 
@@ -552,7 +667,6 @@ impl DbIndex {
     }
 
     pub fn get_gmod_network_index_mut(&mut self) -> &mut GmodNetworkIndex {
-        op_log::note_domain_touch(op_log::Domain::GmodNetwork);
         Arc::make_mut(&mut self.gmod_network_index)
     }
 
@@ -561,7 +675,6 @@ impl DbIndex {
     }
 
     pub fn get_dynamic_field_index_mut(&mut self) -> &mut DynamicFieldIndex {
-        op_log::note_domain_touch(op_log::Domain::DynamicField);
         Arc::make_mut(&mut self.dynamic_field_index)
     }
 
@@ -578,7 +691,6 @@ impl DbIndex {
     }
 
     pub fn get_file_dependencies_index_mut(&mut self) -> &mut LuaDependencyIndex {
-        op_log::note_domain_touch(op_log::Domain::Dependency);
         Arc::make_mut(&mut self.file_dependencies_index)
     }
 
@@ -587,7 +699,6 @@ impl DbIndex {
     }
 
     pub fn get_numeric_range_population_index_mut(&mut self) -> &mut NumericRangePopulationIndex {
-        op_log::note_domain_touch(op_log::Domain::NumericRange);
         Arc::make_mut(&mut self.numeric_range_population_index)
     }
 
@@ -596,7 +707,6 @@ impl DbIndex {
     }
 
     pub fn get_global_index_mut(&mut self) -> &mut LuaGlobalIndex {
-        op_log::note_domain_touch(op_log::Domain::Global);
         Arc::make_mut(&mut self.global_index)
     }
 
@@ -605,7 +715,6 @@ impl DbIndex {
     }
 
     pub fn get_json_schema_index_mut(&mut self) -> &mut JsonSchemaIndex {
-        op_log::note_domain_touch(op_log::Domain::JsonSchema);
         Arc::make_mut(&mut self.json_schema_index)
     }
 
@@ -666,14 +775,10 @@ impl DbIndex {
             metatable_index: Arc::clone(&self.metatable_index),
             global_index: Arc::clone(&self.global_index),
             json_schema_index: Arc::clone(&self.json_schema_index),
+            derivations: Arc::clone(&self.derivations),
+            gmod_call_roles: self.gmod_call_roles.clone(),
             emmyrc: Arc::clone(&self.emmyrc),
-            helper_registry_cache: RevisionedCache(
-                self.helper_registry_cache
-                    .0
-                    .as_ref()
-                    .map(|(rev, value)| (*rev, Arc::clone(value))),
-            ),
-            file_helper_scan_cache: self.file_helper_scan_cache.clone(),
+            helper_scans: self.helper_scans.clone(),
         }
     }
 
@@ -822,35 +927,8 @@ impl LuaIndex for DbIndex {
         Arc::make_mut(&mut self.metatable_index).clear();
         Arc::make_mut(&mut self.global_index).clear();
         Arc::make_mut(&mut self.json_schema_index).clear();
-        // Derived caches have to go with the facts they were derived from.
-        // `clear` does not touch the VFS, so `content_revision` and the
-        // signature count both return to their old values once the same file
-        // set is re-indexed — the revision key would hand back a registry built
-        // against the discarded index.
-        self.helper_registry_cache = RevisionedCache::default();
-        self.file_helper_scan_cache.clear();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::DbIndex;
-    use crate::FileId;
-
-    #[test]
-    fn remove_index_resets_the_helper_registry_cache() {
-        let mut db = DbIndex::new();
-        let revision = 7u64;
-        db.set_cached_helper_registry(revision, Arc::new(42u32));
-        assert_eq!(
-            db.get_cached_helper_registry::<u32>(revision).as_deref(),
-            Some(&42)
-        );
-
-        db.remove_index(vec![FileId::new(1)]);
-
-        assert!(db.get_cached_helper_registry::<u32>(revision).is_none());
+        self.helper_scans.clear();
+        self.derivations = Arc::default();
+        self.gmod_call_roles = None;
     }
 }

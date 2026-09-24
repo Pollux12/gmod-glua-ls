@@ -1,12 +1,11 @@
 use googletest::prelude::*;
 use lsp_types::Uri;
 use rowan::{TextRange, TextSize};
-use rustc_hash::FxHashSet;
 
 use super::{ExportKey, FileRemap, PositionMap, export_map, remap_into_file};
 use crate::{
-    DbIndex, Emmyrc, FileId, InFiled, LuaInferenceNodeId, LuaMemberId, LuaSignatureId, LuaType,
-    LuaTypeOwner, SignatureReturnStatus, TypeVisitTrait, VirtualWorkspace, diff_exports,
+    DbIndex, Emmyrc, FileId, InFiled, LuaSignatureId, LuaType, LuaTypeOwner, SignatureReturnStatus,
+    TypeVisitTrait, VirtualWorkspace, diff_exports,
 };
 
 fn range(start: u32, end: u32) -> TextRange {
@@ -163,7 +162,7 @@ fn a_setmetatable_instance_keeps_inherited_members_after_edit_and_reopen() {
     }));
 
     assert!(
-        !edit_and_remap(&mut ws, &provider_uri, provider_id, first, &second).contains(&consumer_id)
+        !edit_and_reevaluated(&mut ws, &provider_uri, provider_id, &second).contains(&consumer_id)
     );
     let after = inherited_member(&ws, consumer_id).unwrap();
     let mut cold = workspace();
@@ -178,7 +177,7 @@ fn a_setmetatable_instance_keeps_inherited_members_after_edit_and_reopen() {
     assert_eq!(after, inherited_member(&cold, cold_consumer_id).unwrap());
     assert_eq!(after, before);
 
-    edit_and_remap(&mut ws, &provider_uri, provider_id, &second, first);
+    edit_and_reevaluated(&mut ws, &provider_uri, provider_id, first);
     assert_eq!(inherited_member(&ws, consumer_id).unwrap(), before);
     write(&mut ws, &provider_uri, first);
     assert_eq!(inherited_member(&ws, consumer_id).unwrap(), before);
@@ -488,12 +487,9 @@ fn shift_only_blank_line_inside_body_hash_stable() {
     expect_that!(diff.is_empty(), is_true(), "shift-only movers: {diff:?}");
 }
 
-/// The `diff_after_edit` probes above re-index through the fast test-only
-/// `update_file_by_uri` path; the production edit path (`update_file_text_only`
-/// + `self_index_and_diff` with a validated remap over the re-indexed file)
-/// runs `remap_into_file` first, so a key that survives here must also
-/// survive there. A shift-only edit through that path must produce an empty
-/// diff and no remap-loss dirty set.
+/// A shift-only edit through the production edit path (`update_file_text_only`
+/// + `reindex_files`) must report only the edited file: a diagnosed reader of
+/// its exports reads nothing that moved.
 #[gtest]
 fn shift_only_edit_through_self_index_and_diff_is_empty() {
     let first = "config = config or {}\nfunction config.describe(name)\nreturn name\nend\n";
@@ -501,17 +497,20 @@ fn shift_only_edit_through_self_index_and_diff_is_empty() {
     let mut ws = workspace();
     let uri = ws.virtual_url_generator.new_uri("lua/shift_settle.lua");
     let file_id = write(&mut ws, &uri, first);
+    let reader_uri = ws.virtual_url_generator.new_uri("lua/shift_reader.lua");
+    let reader_id = write(
+        &mut ws,
+        &reader_uri,
+        "local described = config.describe(\"name\")\n",
+    );
+    ws.analysis
+        .diagnose_file(reader_id, tokio_util::sync::CancellationToken::new())
+        .expect("reader diagnostics");
     ws.analysis
         .update_file_text_only(&uri, second.clone())
         .expect("staged text");
-    let dirty = ws.analysis.self_index_and_diff(vec![file_id]);
-    expect_that!(dirty.dirty_len(), eq(0));
-    expect_that!(
-        dirty.textual_refresh_names_len(),
-        eq(0),
-        "shift-only edit must name no refresh names"
-    );
-    ws.analysis.ripple(dirty);
+    let affected = ws.analysis.reindex_files(vec![file_id]);
+    expect_that!(affected, eq(&vec![file_id]));
 }
 /// `ContextualUnknown` support names a synthesized `DocTagClass` id per
 /// `---@class` site of the inferred type (`local_inference/mod.rs`
@@ -687,40 +686,27 @@ fn deleted_covering_decl_still_loses_the_synthesized_id() {
 
 // --- Remap ---
 
-/// Writes `text` to `uri` without re-indexing, then re-indexes that file alone
-/// and applies the remap. Returns the files the remap could not rewrite.
-fn edit_and_remap(
+/// Writes `new_text` over `uri` and re-indexes it through the ordinary
+/// path. Returns the other files whose derivations had to be evaluated
+/// again.
+fn edit_and_reevaluated(
     ws: &mut VirtualWorkspace,
     uri: &Uri,
     file_id: FileId,
-    old_text: &str,
     new_text: &str,
 ) -> Vec<FileId> {
-    // The members as they were before the edit: `remap_into_file` needs them
-    // to tell a settled read on a filed member from one on a speculative key.
-    let pre_edit_member_ids = ws
+    ws.analysis.update_file_text_only(uri, new_text.to_string());
+    ws.analysis.reindex_files(vec![file_id]);
+    let mut evaluated = ws
         .analysis
         .compilation
-        .get_db()
-        .get_member_index()
-        .get_file_members(file_id)
+        .last_evaluated_files()
         .iter()
-        .map(|member| member.get_id())
-        .collect::<FxHashSet<_>>();
-    ws.analysis.update_file_text_only(uri, new_text.to_string());
-    ws.analysis.compilation.remove_index(vec![file_id]);
-    ws.analysis.compilation.update_index(vec![file_id]);
-    let map = PositionMap::new(old_text, new_text);
-    let remap = FileRemap::validated(ws.analysis.compilation.get_db(), file_id, map);
-    let mut dirty: Vec<FileId> = remap_into_file(
-        ws.analysis.compilation.get_db_mut(),
-        &remap,
-        &pre_edit_member_ids,
-    )
-    .into_iter()
-    .collect();
-    dirty.sort_by_key(|file_id| file_id.id);
-    dirty
+        .copied()
+        .filter(|evaluated| *evaluated != file_id)
+        .collect::<Vec<_>>();
+    evaluated.sort_by_key(|file_id| file_id.id);
+    evaluated
 }
 
 /// Every position-carrying identity a file's cached types name, as text.
@@ -768,7 +754,7 @@ fn a_cross_file_signature_cache_follows_an_offset_shift() {
         is_true()
     );
 
-    edit_and_remap(&mut ws, &provider_uri, provider_id, first, second);
+    edit_and_reevaluated(&mut ws, &provider_uri, provider_id, second);
 
     let after = cached_identities(ws.analysis.compilation.get_db(), consumer_id);
     expect_that!(after, not(eq(&before)));
@@ -822,7 +808,7 @@ fn a_cross_file_signature_cache_survives_a_collision_at_its_old_offset() {
         is_true()
     );
 
-    edit_and_remap(&mut ws, &provider_uri, provider_id, first, second);
+    edit_and_reevaluated(&mut ws, &provider_uri, provider_id, second);
 
     let mapped_pos = PositionMap::new(first, second)
         .map(old_id.get_position())
@@ -861,20 +847,18 @@ fn a_same_length_replacement_that_destroys_its_target_dirties_the_dependent() {
         is_true()
     );
 
-    let dirty = edit_and_remap(&mut ws, &provider_uri, provider_id, first, &second);
+    let dirty = edit_and_reevaluated(&mut ws, &provider_uri, provider_id, &second);
 
     let db = ws.analysis.compilation.get_db();
-    // The signature is gone ...
-    let old_pos = cached_signature_ids(db, consumer_id)
-        .iter()
-        .find(|id| id.get_file_id() == provider_id)
-        .map(|id| u32::from(id.get_position()))
-        .expect("the consumer still names the stale signature");
+    // The dependent was re-derived and names no signature the edit destroyed.
+    let live = live_signature_positions(db, provider_id);
     expect_that!(
-        live_signature_positions(db, provider_id).contains(&old_pos),
-        is_false()
+        cached_signature_ids(db, consumer_id)
+            .iter()
+            .filter(|id| id.get_file_id() == provider_id)
+            .all(|id| live.contains(&u32::from(id.get_position()))),
+        is_true()
     );
-    // ... and the dependent is dirty rather than silently kept.
     expect_that!(dirty, contains(eq(&consumer_id)));
 }
 
@@ -900,7 +884,7 @@ fn a_same_length_edit_mapping_a_table_onto_itself_still_loses_it() {
         is_true()
     );
 
-    let dirty = edit_and_remap(&mut ws, &provider_uri, provider_id, first, second);
+    let dirty = edit_and_reevaluated(&mut ws, &provider_uri, provider_id, second);
 
     let db = ws.analysis.compilation.get_db();
     expect_that!(live_table_ranges(db, provider_id), is_empty());
@@ -921,7 +905,7 @@ fn a_cross_file_table_cache_follows_an_offset_shift() {
     let before = cached_identities(ws.analysis.compilation.get_db(), consumer_id);
     expect_that!(before.iter().any(|id| id.contains("InFiled")), is_true());
 
-    edit_and_remap(&mut ws, &provider_uri, provider_id, first, second);
+    edit_and_reevaluated(&mut ws, &provider_uri, provider_id, second);
 
     let after = cached_identities(ws.analysis.compilation.get_db(), consumer_id);
     expect_that!(after, not(eq(&before)));
@@ -990,7 +974,7 @@ fn a_destroyed_table_reports_its_dependent_as_dirty() {
         is_true()
     );
 
-    let dirty = edit_and_remap(&mut ws, &provider_uri, provider_id, first, second);
+    let dirty = edit_and_reevaluated(&mut ws, &provider_uri, provider_id, second);
     expect_that!(dirty, contains(eq(&consumer_id)));
 }
 
@@ -1047,7 +1031,7 @@ fn a_foreign_inferred_return_table_follows_an_offset_shift() {
         (consumer_sig, old_range)
     };
 
-    edit_and_remap(&mut ws, &provider_uri, provider_id, first, second);
+    edit_and_reevaluated(&mut ws, &provider_uri, provider_id, second);
 
     let db = ws.analysis.compilation.get_db();
     let after = db
@@ -1128,7 +1112,7 @@ fn a_foreign_inferred_return_signature_follows_an_offset_shift() {
         (consumer_sig, old_id)
     };
 
-    edit_and_remap(&mut ws, &provider_uri, provider_id, first, second);
+    edit_and_reevaluated(&mut ws, &provider_uri, provider_id, second);
 
     let db = ws.analysis.compilation.get_db();
     let after = db
@@ -1207,12 +1191,13 @@ fn a_destroyed_table_in_a_foreign_inferred_return_dirties_its_owner() {
         (consumer_sig, old_range)
     };
 
-    let dirty = edit_and_remap(&mut ws, &provider_uri, provider_id, first, second);
+    let dirty = edit_and_reevaluated(&mut ws, &provider_uri, provider_id, second);
 
     let db = ws.analysis.compilation.get_db();
     // The literal is gone ...
     expect_that!(live_table_ranges(db, provider_id), is_empty());
-    // ... and the owner is dirty rather than left dangling on the old range.
+    // ... and the owner was re-derived rather than left dangling on the old
+    // range.
     expect_that!(
         db.get_signature_index()
             .get(&consumer_sig)
@@ -1220,7 +1205,7 @@ fn a_destroyed_table_in_a_foreign_inferred_return_dirties_its_owner() {
             .return_docs[0]
             .type_ref
             .clone(),
-        eq(&LuaType::TableConst(old_range))
+        not(eq(&LuaType::TableConst(old_range)))
     );
     expect_that!(dirty, contains(eq(&consumer_id)));
 }
@@ -1280,12 +1265,12 @@ fn a_destroyed_signature_in_a_foreign_inferred_return_dirties_its_owner() {
         (consumer_sig, old_id)
     };
 
-    let dirty = edit_and_remap(&mut ws, &provider_uri, provider_id, first, second);
+    let dirty = edit_and_reevaluated(&mut ws, &provider_uri, provider_id, second);
 
     let db = ws.analysis.compilation.get_db();
     // The provider signature is gone ...
     expect_that!(db.get_signature_index().get(&old_id).is_none(), is_true());
-    // ... and the owner is dirty rather than left dangling on it.
+    // ... and the owner was re-derived rather than left dangling on it.
     expect_that!(
         db.get_signature_index()
             .get(&consumer_sig)
@@ -1293,7 +1278,7 @@ fn a_destroyed_signature_in_a_foreign_inferred_return_dirties_its_owner() {
             .return_docs[0]
             .type_ref
             .clone(),
-        eq(&LuaType::Signature(old_id))
+        not(eq(&LuaType::Signature(old_id)))
     );
     expect_that!(dirty, contains(eq(&consumer_id)));
 }
@@ -1347,154 +1332,7 @@ fn an_identity_remap_leaves_every_owner_alone() {
         );
     }
     expect_that!(
-        remap_into_file(
-            ws.analysis.compilation.get_db_mut(),
-            &remap,
-            &FxHashSet::default()
-        ),
-        is_empty()
-    );
-}
-
-/// Records the settled read a pass makes on a range the member index never
-/// filed: a `CallExpr` member id, the shape a pass records for the expression
-/// it read (`ply:GetActiveWeapon()` carries no member of its own). The key is
-/// stored under `consumer_id` with the provider file as the key's own file,
-/// exactly as `set_settled_reads` keeps it. Returns the key and its range.
-fn record_speculative_settled_read(
-    ws: &mut VirtualWorkspace,
-    provider_id: FileId,
-    consumer_id: FileId,
-) -> (LuaMemberId, TextRange) {
-    use glua_parser::{LuaAstNode, LuaCallExpr, LuaSyntaxId, LuaSyntaxKind};
-
-    let call_range = ws
-        .analysis
-        .compilation
-        .get_db()
-        .get_vfs()
-        .get_syntax_tree(&provider_id)
-        .expect("provider syntax tree")
-        .get_red_root()
-        .descendants()
-        .filter_map(LuaCallExpr::cast)
-        .map(|call| call.get_range())
-        .next()
-        .expect("the provider holds a call expression");
-    let member_id = LuaMemberId::new(
-        LuaSyntaxId::new(LuaSyntaxKind::CallExpr.into(), call_range),
-        provider_id,
-    );
-    expect_that!(
-        ws.analysis
-            .compilation
-            .get_db()
-            .get_member_index()
-            .get_file_members(provider_id)
-            .iter()
-            .any(|member| member.get_id() == member_id),
-        is_false(),
-        "the scenario needs a key the member index never filed"
-    );
-    ws.analysis
-        .compilation
-        .get_db_mut()
-        .get_type_index_mut()
-        .set_settled_reads(consumer_id, [LuaTypeOwner::Member(member_id)]);
-    (member_id, call_range)
-}
-
-/// A settled read can be keyed on a member id the index never filed: a pass
-/// keys such a read on the range of the expression it read, and a call files
-/// no member. The member layer is right to call such a key `Lost` - there is
-/// no member to confirm - but the key names a range in the edited file, not an
-/// identity, so a shift moves it with the text and its reader stays settled.
-/// Live CityRP observation: `cl_umsgs.lua`'s shift reported `settled-read
-/// lost: owner Member(1476 @107..126)` and dirtied the reader over a key that
-/// had only moved.
-#[gtest]
-fn a_shift_moves_a_speculative_settled_read_key_without_dirtying_its_reader() {
-    use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
-
-    let mut ws = workspace();
-    let provider_uri = ws.virtual_url_generator.new_uri("lua/provider.lua");
-    let first =
-        "provider = provider or {}\nfunction provider.Describe() end\nprovider:Describe()\n";
-    let shifted = format!("\n{first}");
-    let provider_id = write(&mut ws, &provider_uri, first);
-    let consumer_uri = ws.virtual_url_generator.new_uri("lua/consumer.lua");
-    let consumer_id = write(&mut ws, &consumer_uri, "local cached = 1\n");
-
-    let (speculative_id, call_range) =
-        record_speculative_settled_read(&mut ws, provider_id, consumer_id);
-
-    expect_that!(
-        edit_and_remap(&mut ws, &provider_uri, provider_id, first, &shifted),
-        is_empty(),
-        "a shift only moves the key: no reader is dirty"
-    );
-
-    let db = ws.analysis.compilation.get_db();
-    let shifted_range = PositionMap::new(first, &shifted)
-        .map_range(call_range)
-        .expect("a shift maps the call range");
-    let shifted_key = LuaTypeOwner::Member(LuaMemberId::new(
-        LuaSyntaxId::new(LuaSyntaxKind::CallExpr.into(), shifted_range),
-        provider_id,
-    ));
-    // The reader is still settled on the key, now at its shifted range ...
-    expect_that!(
-        db.get_type_index()
-            .files_depending_on_inference_nodes(&[LuaInferenceNodeId::TypeOwner(shifted_key)])
-            .contains(&consumer_id),
-        is_true()
-    );
-    // ... and nothing is left on the range the key came from.
-    expect_that!(
-        db.get_type_index()
-            .files_depending_on_inference_nodes(&[LuaInferenceNodeId::TypeOwner(
-                LuaTypeOwner::Member(speculative_id)
-            )])
-            .is_empty(),
-        is_true()
-    );
-}
-
-/// The same key on a range the edit destroyed is a real loss: no text is left
-/// for the read to name, so the key is dropped and its reader is dirty.
-#[gtest]
-fn a_deleted_speculative_settled_read_key_loses_its_reader() {
-    let mut ws = workspace();
-    let provider_uri = ws.virtual_url_generator.new_uri("lua/provider.lua");
-    let first =
-        "provider = provider or {}\nfunction provider.Describe() end\nprovider:Describe()\n";
-    // The call line is gone, so the key's range has no image.
-    let second = "provider = provider or {}\nfunction provider.Describe() end\n";
-    let provider_id = write(&mut ws, &provider_uri, first);
-    let consumer_uri = ws.virtual_url_generator.new_uri("lua/consumer.lua");
-    let consumer_id = write(&mut ws, &consumer_uri, "local cached = 1\n");
-
-    let (speculative_id, call_range) =
-        record_speculative_settled_read(&mut ws, provider_id, consumer_id);
-    expect_that!(
-        PositionMap::new(first, second).map_range(call_range),
-        none(),
-        "the deleted line leaves the key's range no image"
-    );
-
-    expect_that!(
-        edit_and_remap(&mut ws, &provider_uri, provider_id, first, second),
-        contains(eq(&consumer_id)),
-        "the reader has to be re-analysed"
-    );
-    expect_that!(
-        ws.analysis
-            .compilation
-            .get_db()
-            .get_type_index()
-            .files_depending_on_inference_nodes(&[LuaInferenceNodeId::TypeOwner(
-                LuaTypeOwner::Member(speculative_id)
-            )]),
+        remap_into_file(ws.analysis.compilation.get_db_mut(), &remap),
         is_empty()
     );
 }

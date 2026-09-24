@@ -39,22 +39,12 @@ impl Default for LuaDiagnostic {
     }
 }
 
-/// Revision snapshot gating every index-derived diagnostic component.
-///
-/// `type_structure` moves on any type/member/signature/module mutation, so a
-/// matching snapshot proves none of those moved; the remaining counters tell
-/// whole-workspace rebuilds apart at a glance. Indexes without a public
-/// revision (properties, network flows, dynamic fields, decls, gmod
-/// metadata) are covered transitively: their writes land through re-analysis
-/// batches that also move `type_structure` or the file lists. Explicit cache
-/// invalidation on reindex stays authoritative; these keys only let a quiet
-/// workspace reuse its components.
+/// Snapshot gating every index-derived diagnostic component. The index is a
+/// function of the file contents and the workspace layout, so an unchanged
+/// content revision and layout proves every component is still current.
 #[derive(Clone, PartialEq, Eq)]
 struct DiagnosticRevisionSnapshot {
-    type_structure: u64,
-    type_writes: u64,
-    member_homing: u64,
-    signature_count: usize,
+    content_revision: u64,
     main_workspace_file_ids: Vec<FileId>,
     local_file_ids: Vec<FileId>,
     main_workspace_ids: Vec<WorkspaceId>,
@@ -68,10 +58,7 @@ impl DiagnosticRevisionSnapshot {
         main_workspace_ids: Vec<WorkspaceId>,
     ) -> Self {
         Self {
-            type_structure: db.type_structure_revision(),
-            type_writes: db.get_type_index().type_writes(),
-            member_homing: db.get_member_index().homing_revision(),
-            signature_count: db.get_signature_index().indexed_signature_count(),
+            content_revision: db.get_vfs().content_revision(),
             main_workspace_file_ids,
             local_file_ids,
             main_workspace_ids,

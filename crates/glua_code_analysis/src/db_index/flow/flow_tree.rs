@@ -1,10 +1,20 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::hash::{Hash, Hasher};
 
 use glua_parser::{LuaAstPtr, LuaExpr, LuaSyntaxId};
 use internment::ArcIntern;
 use smol_str::SmolStr;
 
+use crate::db_index::derivation::{self, Fingerprint};
 use crate::{FlowId, FlowNode, FlowNodeKind, LuaDeclId, LuaDefinitionId};
+
+/// Order-independent hash of a set's elements.
+fn unordered_fingerprint<T: Hash>(items: impl IntoIterator<Item = T>) -> Fingerprint {
+    items
+        .into_iter()
+        .map(|item| derivation::fingerprint_of(&item))
+        .fold(0, u64::wrapping_add)
+}
 
 /// File-wide summary of which variables/paths can possibly be narrowed by the
 /// backward flow walk. Used to skip the (expensive) walk entirely for variable
@@ -32,6 +42,15 @@ pub struct FileNarrowingCapability {
     pub has_opaque_index_target: bool,
 }
 
+impl Hash for FileNarrowingCapability {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        unordered_fingerprint(&self.referenced_names).hash(state);
+        unordered_fingerprint(&self.referenced_index_paths).hash(state);
+        self.has_opaque_name_target.hash(state);
+        self.has_opaque_index_target.hash(state);
+    }
+}
+
 impl FileNarrowingCapability {
     /// Whether a bare-name reference (`VarRef`/`SelfRef`/`GlobalName`) named
     /// `name` could be narrowed somewhere in the file.
@@ -52,7 +71,7 @@ impl FileNarrowingCapability {
 /// all branches are alive), the merge is guaranteed to produce the same type as
 /// the node before the branch (`common_predecessor`).  The walk can skip
 /// directly to that predecessor, turning an O(branches × depth) merge into O(1).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct BranchLabelInfo {
     /// FlowId of the node immediately before the if/elseif/else split.
     pub common_predecessor: FlowId,
@@ -76,7 +95,7 @@ pub struct BranchLabelInfo {
     pub narrowing_capability: FileNarrowingCapability,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Hash)]
 pub struct AssignmentFlowInfo {
     pub name_targets: Vec<AssignmentNameTarget>,
     pub index_paths: Vec<ArcIntern<SmolStr>>,
@@ -341,7 +360,7 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AssignmentNameTarget {
     pub decl_id: LuaDeclId,
     pub target_idx: u16,
@@ -388,6 +407,19 @@ impl FlowTree {
             assignment_flow_info,
             narrowing_capability,
         }
+    }
+
+    /// Content hash of everything the tree's accessors can observe.
+    pub(crate) fn content_fingerprint(&self) -> Fingerprint {
+        derivation::fingerprint_of(&(
+            unordered_fingerprint(&self.decl_bind_expr_ref),
+            &self.flow_nodes,
+            &self.multiple_antecedents,
+            unordered_fingerprint(&self.bindings),
+            unordered_fingerprint(&self.branch_label_info),
+            &self.assignment_flow_info,
+            &self.narrowing_capability,
+        ))
     }
 
     pub fn get_narrowing_capability(&self) -> &FileNarrowingCapability {

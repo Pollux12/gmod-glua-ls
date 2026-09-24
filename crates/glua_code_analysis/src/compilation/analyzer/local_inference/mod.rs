@@ -19,7 +19,6 @@ use crate::{
     LuaMemberKey, LuaMemberOwner, LuaSignatureId, LuaType, LuaTypeDeclId, LuaTypeFact,
     SignatureReturnStatus, TypeOps,
     compilation::analyzer::AnalyzeContext,
-    db_index::{DirectSubtypeMembers, DirectSubtypeMembersKey},
     semantic::{
         infer_bind_value_type, infer_expr, infer_true_condition_narrowing,
         resolve_dynamic_field_member,
@@ -415,8 +414,6 @@ struct MemberPathEvidence<'a> {
     file_id: crate::FileId,
     root_decl_id: crate::LuaDeclId,
     declared_root_type: Option<&'a LuaType>,
-    direct_subtype_members: &'a DirectSubtypeMembers,
-    candidate_members: &'a FxHashSet<LuaMemberKey>,
     declared_path_bases: &'a mut DeclaredPathBases,
     scores: &'a mut HashMap<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>,
 }
@@ -472,16 +469,6 @@ pub(super) fn stabilize_unguarded_children(
         HashMap::<(LuaDefinitionId, crate::LuaTypeDeclId), InFiled<glua_parser::LuaSyntaxId>>::new(
         );
     let mut initializer_refinements = HashMap::<crate::LuaDeclId, LuaType>::default();
-    let subtype_index_start = profile.as_ref().map(|_| std::time::Instant::now());
-    let subtype_members_cache = direct_subtype_members_cached(db);
-    let direct_subtype_members: &DirectSubtypeMembers = &subtype_members_cache;
-    let nested_candidate_members = direct_subtype_members
-        .values()
-        .flat_map(|members| members.keys().cloned())
-        .collect::<FxHashSet<_>>();
-    if let (Some(profile), Some(start)) = (&mut profile, subtype_index_start) {
-        profile.subtype_index = start.elapsed();
-    }
 
     let reference_scan_start = profile.as_ref().map(|_| std::time::Instant::now());
     let mut seen_file_ids = FxHashSet::default();
@@ -494,7 +481,6 @@ pub(super) fn stabilize_unguarded_children(
     let cache_options = crate::CacheOptions {
         analysis_phase: context.infer_manager.current_phase(),
         dynamic_fields_visible: context.infer_manager.dynamic_fields_visible(),
-        building_dynamic_field_index: false,
         call_site_params_visible: context.infer_manager.call_site_params_visible(),
     };
     let mut jobs = Vec::new();
@@ -592,8 +578,6 @@ pub(super) fn stabilize_unguarded_children(
         jobs,
         context.workspace_id,
         only_return_evidence,
-        direct_subtype_members,
-        &nested_candidate_members,
         profile.is_some(),
     );
     for result in results {
@@ -865,8 +849,6 @@ fn collect_unguarded_child_files(
     jobs: Vec<UnguardedChildFileJob>,
     workspace_id: Option<crate::WorkspaceId>,
     only_return_evidence: bool,
-    direct_subtype_members: &DirectSubtypeMembers,
-    nested_candidate_members: &FxHashSet<LuaMemberKey>,
     collect_profile: bool,
 ) -> Vec<UnguardedChildFileResult> {
     let run = |job| {
@@ -876,8 +858,6 @@ fn collect_unguarded_child_files(
                 job,
                 workspace_id,
                 only_return_evidence,
-                direct_subtype_members,
-                nested_candidate_members,
                 collect_profile,
             )
         })
@@ -895,8 +875,6 @@ fn collect_unguarded_child_file(
     job: UnguardedChildFileJob,
     workspace_id: Option<crate::WorkspaceId>,
     only_return_evidence: bool,
-    direct_subtype_members: &DirectSubtypeMembers,
-    nested_candidate_members: &FxHashSet<LuaMemberKey>,
     collect_profile: bool,
 ) -> UnguardedChildFileResult {
     let file_id = job.file_id;
@@ -958,8 +936,6 @@ fn collect_unguarded_child_file(
             file_id,
             root_decl_id: decl_id,
             declared_root_type: base_type.as_ref(),
-            direct_subtype_members,
-            candidate_members: nested_candidate_members,
             declared_path_bases: &mut declared_path_bases,
             scores: &mut nested_scores,
         };
@@ -984,9 +960,9 @@ fn collect_unguarded_child_file(
         let Some(base_id) = unguarded_child_base_id(&base_type) else {
             continue;
         };
-        let Some(members) = direct_subtype_members.get(&base_id) else {
+        if db.get_type_index().get_sub_types(&base_id).is_empty() {
             continue;
-        };
+        }
 
         for (name_expr, index_expr, _) in &all_sites {
             if let Some(profile) = &mut profile {
@@ -1020,7 +996,7 @@ fn collect_unguarded_child_file(
             else {
                 continue;
             };
-            let Some(children) = members.get(&member_key) else {
+            let Some(children) = direct_subtypes_with_member(db, &base_id, &member_key) else {
                 continue;
             };
 
@@ -1094,11 +1070,6 @@ fn collect_unguarded_child_file(
                         None,
                     ) {
                         Ok(resolution) => resolution.is_some(),
-                        // The index is still unsealed, so this child's
-                        // membership is unknown. Scoring the definition now
-                        // would publish a narrowed fact that the sealed pass
-                        // can no longer revise, so defer the whole definition
-                        // to that pass instead.
                         Err(reason) if reason.is_need_resolve() => {
                             deferred_definitions.extend(definitions.iter().cloned());
                             break;
@@ -1187,9 +1158,6 @@ fn collect_member_path_unguarded_child_evidence(
     let Ok(member_key) = LuaMemberKey::from_index_key(db, cache, &index_key) else {
         return;
     };
-    if !evidence.candidate_members.contains(&member_key) {
-        return;
-    }
     if is_assignment_target(index_expr) {
         return;
     }
@@ -1256,12 +1224,7 @@ fn collect_member_path_unguarded_child_evidence(
         // The declaration already names the base, so the child lookup can rule
         // the use out before its narrowed type is worth computing.
         Some((declared, base_id)) => {
-            if evidence
-                .direct_subtype_members
-                .get(&base_id)
-                .and_then(|members| members.get(&member_key))
-                .is_none()
-            {
+            if direct_subtypes_with_member(db, &base_id, &member_key).is_none() {
                 return;
             }
             let current = infer_expr(db, cache, LuaExpr::IndexExpr(receiver.clone()))
@@ -1289,11 +1252,7 @@ fn collect_member_path_unguarded_child_evidence(
             (base_id, current)
         }
     };
-    let Some(children) = evidence
-        .direct_subtype_members
-        .get(&base_id)
-        .and_then(|members| members.get(&member_key))
-    else {
+    let Some(children) = direct_subtypes_with_member(db, &base_id, &member_key) else {
         return;
     };
     if is_matching_short_circuit_guard(db, cache, index_expr) {
@@ -1417,14 +1376,22 @@ pub(super) fn publish_inferred_positive_guards(
         let Some(closure) = LuaClosureExpr::cast(node) else {
             continue;
         };
+        let signature_id = LuaSignatureId::from_closure(file_id, &closure);
+        let owner = inferred_guard_owner(db, signature_id, &closure);
+        // A guard is published under the name its definition assigns; a
+        // definition whose target has no static name has none to publish.
+        if owner.is_none()
+            && (closure.get_parent::<LuaFuncStat>().is_some()
+                || closure.get_parent::<LuaAssignStat>().is_some())
+        {
+            continue;
+        }
         let Some((guard, returns)) =
             inferred_positive_guard_for_closure(db, context, file_id, &closure)
         else {
             pending.push(candidate);
             continue;
         };
-        let signature_id = LuaSignatureId::from_closure(file_id, &closure);
-        let owner = inferred_guard_owner(db, signature_id, &closure);
         let mut return_changed = false;
         if let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id)
             && signature.resolve_return == SignatureReturnStatus::UnResolve
@@ -1783,107 +1750,40 @@ fn type_has_visible_static_member_at_use(
     })
 }
 
-/// The cached [`precompute_direct_subtype_members`] map, rebuilt lazily only
-/// when a super-type, member or dynamic-field write moved the revision key
-/// underneath it. The [`Arc`] clone is what `stabilize_unguarded_children`
-/// holds: the map borrows nothing, so the pass keeps using `db` freely.
-pub(crate) fn direct_subtype_members_cached(db: &mut crate::DbIndex) -> Arc<DirectSubtypeMembers> {
-    let key = direct_subtype_members_key(db);
-    if let Some((cached_key, cached_map)) = db.get_type_index().direct_subtype_members_cache()
-        && cached_key == &key
-    {
-        return cached_map.clone();
-    }
-
-    let map = Arc::new(precompute_direct_subtype_members(db));
-    db.get_type_index_mut()
-        .store_direct_subtype_members(key, map.clone());
-    map
-}
-
-/// The four write revisions covering everything
-/// [`precompute_direct_subtype_members`] reads — O(1) instead of the old
-/// per-file member-count snapshot plus dynamic-field name fold.
-fn direct_subtype_members_key(db: &crate::DbIndex) -> DirectSubtypeMembersKey {
-    DirectSubtypeMembersKey {
-        super_revision: db.get_type_index().super_write_revision(),
-        member_revision: db.get_member_index().homing_revision(),
-        member_writes: db.get_member_index().move_clock(),
-        dynamic_writes: db.get_dynamic_field_index().dynamic_writes(),
-    }
-}
-
-fn precompute_direct_subtype_members(db: &crate::DbIndex) -> DirectSubtypeMembers {
-    let type_index = db.get_type_index();
+/// The direct subclasses of `base_id` that declare `member_key`, as a member
+/// or a direct dynamic field, ordered by name. `None` when there are none.
+fn direct_subtypes_with_member(
+    db: &crate::DbIndex,
+    base_id: &LuaTypeDeclId,
+    member_key: &LuaMemberKey,
+) -> Option<Vec<LuaTypeDeclId>> {
     let member_index = db.get_member_index();
-    let mut candidates =
-        FxHashMap::<LuaTypeDeclId, FxHashMap<LuaMemberKey, FxHashSet<LuaTypeDeclId>>>::default();
-
-    for child in type_index.iter_type_decls() {
-        let child_id = child.get_id();
-        let owner = LuaMemberOwner::Type(child_id.clone());
-        let members = member_index.get_members(&owner);
-        let dynamic_owner = crate::DynamicFieldOwner::Type(child_id.clone());
-        let dynamic_fields = db
-            .get_dynamic_field_index()
-            .get_direct_fields(&dynamic_owner);
-        if members.is_none() && dynamic_fields.is_none() {
-            continue;
-        }
-        let Some(super_types) = type_index.get_super_types_iter(&child_id) else {
-            continue;
-        };
-
-        for super_type in super_types {
-            let (LuaType::Ref(base_id) | LuaType::Def(base_id)) = super_type else {
-                continue;
-            };
-            let members_for_base = candidates.entry(base_id.clone()).or_default();
-            if let Some(members) = &members {
-                for member in members {
-                    members_for_base
-                        .entry(member.get_key().clone())
-                        .or_default()
-                        .insert(child_id.clone());
-                }
-            }
-            if let Some(dynamic_fields) = dynamic_fields {
-                for field_name in dynamic_fields.keys() {
-                    members_for_base
-                        .entry(LuaMemberKey::Name(field_name.clone()))
-                        .or_default()
-                        .insert(child_id.clone());
-                }
-            }
-        }
-    }
-
-    candidates
+    let dynamic_index = db.get_dynamic_field_index();
+    let mut children = db
+        .get_type_index()
+        .get_sub_types(base_id)
         .into_iter()
-        .map(|(base_id, members)| {
-            let members = members
-                .into_iter()
-                .map(|(member_key, child_ids)| {
-                    let mut child_ids = child_ids.into_iter().collect::<Vec<_>>();
-                    child_ids.sort_by(|left, right| {
-                        type_index
-                            .get_type_decl(left)
-                            .map(|decl| decl.get_name())
-                            .unwrap_or_else(|| left.get_name())
-                            .cmp(
-                                type_index
-                                    .get_type_decl(right)
-                                    .map(|decl| decl.get_name())
-                                    .unwrap_or_else(|| right.get_name()),
-                            )
-                            .then_with(|| left.get_name().cmp(right.get_name()))
-                    });
-                    (member_key, child_ids)
-                })
-                .collect();
-            (base_id, members)
+        .filter(|child| {
+            let child_id = child.get_id();
+            member_index
+                .get_member_item(&LuaMemberOwner::Type(child_id.clone()), member_key)
+                .is_some()
+                || matches!(member_key, LuaMemberKey::Name(name) if dynamic_index
+                    .get_direct_fields(&crate::DynamicFieldOwner::Type(child_id))
+                    .is_some_and(|fields| fields.contains_key(name)))
         })
-        .collect()
+        .map(|child| (child.get_name().to_string(), child.get_id()))
+        .collect::<Vec<_>>();
+    if children.is_empty() {
+        return None;
+    }
+    children.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.stable_cmp(&right.1))
+    });
+    children.dedup_by(|left, right| left.1 == right.1);
+    Some(children.into_iter().map(|(_, child_id)| child_id).collect())
 }
 
 fn is_condition_evidence(index_expr: &LuaIndexExpr) -> bool {

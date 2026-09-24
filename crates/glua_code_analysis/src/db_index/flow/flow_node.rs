@@ -11,7 +11,7 @@ use smol_str::SmolStr;
 pub struct FlowId(pub u32);
 
 /// Represents how flow nodes are connected
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FlowAntecedent {
     /// Single predecessor node
     Single(FlowId),
@@ -20,7 +20,7 @@ pub enum FlowAntecedent {
 }
 
 /// Main flow node structure containing all flow analysis information
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FlowNode {
     pub id: FlowId,
     pub kind: FlowNodeKind,
@@ -29,7 +29,7 @@ pub struct FlowNode {
 
 /// Lightweight hint about which kinds of LHS variables appear in an assignment.
 /// Used to skip non-matching assignments in flow analysis without AST reconstruction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AssignVarHint {
     /// Only simple name expressions (local variables / globals)
     NameOnly,
@@ -40,7 +40,7 @@ pub enum AssignVarHint {
 }
 
 /// Different types of flow nodes in the control flow graph
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FlowNodeKind {
     /// Entry point of the flow
     Start,

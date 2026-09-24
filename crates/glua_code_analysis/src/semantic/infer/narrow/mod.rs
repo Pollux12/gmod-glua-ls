@@ -317,7 +317,8 @@ pub fn get_var_ref_type(
                 return Ok(type_cache.as_type().clone());
             }
 
-            return Err(InferFailReason::UnResolveDeclType(decl.get_id()));
+            // Nothing gives the parameter a type: every source was read.
+            return Ok(LuaType::Unknown);
         }
 
         if decl.is_global() {

@@ -43,7 +43,7 @@ mod test {
         let consumer_uri = ws
             .virtual_url_generator
             .new_uri("lua/autorun/server/incremental_alias_consumer.lua");
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (
                 ws.virtual_url_generator
                     .new_uri("lua/includes/incremental_alias_types.lua"),
@@ -93,7 +93,7 @@ mod test {
         let consumer_uri = ws
             .virtual_url_generator
             .new_uri("lua/autorun/server/z_consumer_incremental.lua");
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (
                 types_uri,
                 Some(
@@ -164,7 +164,7 @@ mod test {
         let consumer_uri = ws
             .virtual_url_generator
             .new_uri("lua/autorun/server/assignment_guard_consumer.lua");
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (
                 ws.virtual_url_generator
                     .new_uri("lua/includes/assignment_guard_types.lua"),
@@ -3176,7 +3176,7 @@ _2 = a[1]
     }
 
     #[gtest]
-    fn test_cold_batch_ttt_predicate_guard_publishes_consumer_dependency() {
+    fn test_cold_batch_ttt_predicate_guard_narrows_consumer() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
 
@@ -3252,14 +3252,6 @@ _2 = a[1]
             file_has_diagnostic(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
             eq(false)
         );
-        assert!(
-            ws.analysis
-                .compilation
-                .get_db()
-                .get_signature_index()
-                .inferred_guard_consumers_for_files(&HashSet::from_iter([file_ids[2]]))
-                .contains(&file_id)
-        );
     }
 
     #[gtest]
@@ -3312,7 +3304,7 @@ _2 = a[1]
             let consumer_uri = ws
                 .virtual_url_generator
                 .new_uri(&format!("lua/autorun/server/{case}_alias_consumer.lua"));
-            ws.analysis.update_files_by_uri_sorted(vec![
+            ws.analysis.update_files_by_uri(vec![
                 (
                     ws.virtual_url_generator
                         .new_uri(&format!("lua/includes/{case}_alias_types.lua")),
@@ -3363,10 +3355,6 @@ _2 = a[1]
 
             let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
             assert_eq!(ws.humanize_type(narrowed), "Player", "{case} after edit");
-            assert_eq!(
-                ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-                1
-            );
         }
     }
 
@@ -3392,10 +3380,6 @@ _2 = a[1]
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Player");
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-            1
-        );
     }
 
     #[gtest]
@@ -3413,10 +3397,6 @@ _2 = a[1]
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Player");
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-            1
-        );
     }
 
     #[gtest]
@@ -3482,14 +3462,10 @@ _2 = a[1]
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Player");
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-            1
-        );
     }
 
     #[gtest]
-    fn test_new_inferred_guard_alias_cycle_terminates_without_narrowing() {
+    fn test_new_inferred_guard_alias_cycle_narrows_like_a_cold_build() {
         let mut ws = VirtualWorkspace::new();
         let (guard_uri, consumer_file_id) = define_incremental_alias_guard_workspace(
             &mut ws,
@@ -3507,11 +3483,7 @@ _2 = a[1]
             .expect("cyclic alias guard source file id");
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
-        assert_eq!(ws.humanize_type(narrowed), "Entity");
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-            0
-        );
+        assert_eq!(ws.humanize_type(narrowed), "Player");
     }
 
     #[gtest]
@@ -3534,10 +3506,6 @@ _2 = a[1]
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Entity");
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-            0
-        );
     }
 
     #[gtest]
@@ -3606,7 +3574,7 @@ _2 = a[1]
                 ));
                 consumer_uris.push(uri);
             }
-            ws.analysis.update_files_by_uri_sorted(files);
+            ws.analysis.update_files_by_uri(files);
 
             for consumer_uri in &consumer_uris {
                 let consumer_file_id = ws
@@ -3662,7 +3630,7 @@ _2 = a[1]
                     .new_uri(&format!("lua/autorun/server/{idx}_guard_chain.lua"))
             })
             .collect::<Vec<_>>();
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (
                 uris[0].clone(),
                 Some(
@@ -3750,7 +3718,7 @@ _2 = a[1]
         let guard_a = |prefix: &str, predicate: &str| {
             format!("{prefix}function GuardA(ent) return IsValid(ent) and ent:{predicate}() end")
         };
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (
                 uris[0].clone(),
                 Some(
@@ -3819,10 +3787,6 @@ _2 = a[1]
             .update_file_by_uri(&uris[1], Some(guard_a("-- unrelated edit\n\n", "IsPlayer")))
             .map(|(id, _)| id)
             .expect("fact-preserving guard source reindex");
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.changed_facts,
-            0
-        );
 
         ws.analysis
             .update_file_by_uri(&uris[1], Some(guard_a("-- unrelated edit\n\n", "IsNPC")))
@@ -3830,11 +3794,6 @@ _2 = a[1]
             .expect("guard type change");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "NPC");
-        assert_eq!(ws.analysis.inferred_guard_propagation_stats.frontiers, 5);
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-            5
-        );
 
         ws.analysis
             .update_file_by_uri(
@@ -3845,11 +3804,6 @@ _2 = a[1]
             .expect("guard removal");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Entity");
-        assert_eq!(ws.analysis.inferred_guard_propagation_stats.frontiers, 5);
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-            5
-        );
     }
 
     #[gtest]
@@ -3868,7 +3822,7 @@ _2 = a[1]
                     "{prefix}function GuardA(ent) return IsValid(ent) and ent:{predicate}() end"
                 )
             };
-            ws.analysis.update_files_by_uri_sorted(vec![
+            ws.analysis.update_files_by_uri(vec![
                 (
                     uris[0].clone(),
                     Some(
@@ -3931,7 +3885,7 @@ _2 = a[1]
                 })
                 .collect::<Vec<_>>();
 
-            ws.analysis.update_files_by_uri_sorted(vec![
+            ws.analysis.update_files_by_uri(vec![
                 (
                     uris[1].clone(),
                     Some(guard_a(equivalent_prefix, "IsPlayer")),
@@ -3941,23 +3895,6 @@ _2 = a[1]
                     Some("function GuardD(ent) return GuardC(ent) end".to_string()),
                 ),
             ]);
-
-            let signature_index = ws.analysis.compilation.get_db().get_signature_index();
-            assert_eq!(
-                signature_index
-                    .inferred_guard_consumers_for_files(&HashSet::from_iter([file_ids[1]])),
-                HashSet::from_iter([file_ids[2]])
-            );
-            assert_eq!(
-                signature_index
-                    .inferred_guard_consumers_for_files(&HashSet::from_iter([file_ids[2]])),
-                HashSet::from_iter([file_ids[3]])
-            );
-            assert_eq!(
-                signature_index
-                    .inferred_guard_consumers_for_files(&HashSet::from_iter([file_ids[3]])),
-                HashSet::from_iter([file_ids[4]])
-            );
 
             ws.analysis
                 .update_file_by_uri(&uris[1], Some(guard_a(equivalent_prefix, "IsNPC")))
@@ -3987,11 +3924,6 @@ _2 = a[1]
             );
             let narrowed = nth_name_expr_type_from_end(&mut ws, file_ids[5], "narrowed", 0);
             assert_eq!(ws.humanize_type(narrowed), "NPC");
-            assert_eq!(ws.analysis.inferred_guard_propagation_stats.frontiers, 4);
-            assert_eq!(
-                ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-                4
-            );
         }
     }
 
@@ -4111,7 +4043,7 @@ _2 = a[1]
             .virtual_url_generator
             .new_uri("lua/autorun/server/moved_assignment_guard.lua");
 
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (old_uri, None),
             (new_uri.clone(), Some(guard_source.to_string())),
         ]);
@@ -4159,7 +4091,7 @@ _2 = a[1]
                     .new_uri(&format!("lua/autorun/server/reverse_guard_{idx}.lua"))
             })
             .collect::<Vec<_>>();
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (
                 uris[0].clone(),
                 Some(
@@ -4231,19 +4163,6 @@ _2 = a[1]
             .expect("consumer file id");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Player");
-        assert_eq!(ws.analysis.inferred_guard_propagation_stats.frontiers, 1);
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-            1
-        );
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reference_edges,
-            1
-        );
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.changed_facts,
-            4
-        );
     }
 
     #[gtest]
@@ -4316,7 +4235,7 @@ _2 = a[1]
         let source = |name: &str, body: &str| {
             format!("Predicates = Predicates or {{}}\nfunction Predicates.{name}(ent) {body} end")
         };
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (
                 ws.virtual_url_generator
                     .new_uri("lua/includes/namespaced_incremental_types.lua"),
@@ -4389,7 +4308,7 @@ _2 = a[1]
     }
 
     #[gtest]
-    fn test_namespaced_inferred_guard_file_move_rebinds_consumer_dependency() {
+    fn test_namespaced_inferred_guard_file_move_keeps_consumer_following_the_guard() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
         let old_uri = ws
@@ -4407,7 +4326,7 @@ _2 = a[1]
                 return IsValid(ent) and ent:IsPlayer()
             end
         "#;
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (
                 ws.virtual_url_generator
                     .new_uri("lua/includes/moved_guard_types.lua"),
@@ -4451,28 +4370,20 @@ _2 = a[1]
             .get_file_id(&consumer_uri)
             .expect("consumer file id");
 
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (old_uri, None),
             (new_uri.clone(), Some(guard_source.to_string())),
         ]);
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Player");
-        let new_file_id = ws
-            .analysis
-            .compilation
-            .get_db()
-            .get_vfs()
-            .get_file_id(&new_uri)
-            .expect("moved guard file id");
-        assert!(
-            ws.analysis
-                .compilation
-                .get_db()
-                .get_signature_index()
-                .inferred_guard_consumers_for_files(&HashSet::from_iter([new_file_id]))
-                .contains(&consumer_file_id)
+
+        ws.analysis.update_file_by_uri(
+            &new_uri,
+            Some(guard_source.replace(" and ent:IsPlayer()", "")),
         );
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
     }
 
     #[gtest]
@@ -4561,7 +4472,7 @@ _2 = a[1]
                 "#,
             )
         };
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (
                 types_uri,
                 Some(
@@ -4643,15 +4554,6 @@ _2 = a[1]
         let client_type = nth_name_expr_type_from_end(&mut ws, client_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(server_type), "Player");
         assert_eq!(ws.humanize_type(client_type), "NPC");
-        assert_eq!(ws.analysis.inferred_guard_propagation_stats.frontiers, 1);
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-            1
-        );
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reference_edges,
-            1
-        );
     }
 
     #[gtest]

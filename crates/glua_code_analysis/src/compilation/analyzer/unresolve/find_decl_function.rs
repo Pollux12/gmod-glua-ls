@@ -225,9 +225,13 @@ fn find_custom_type_function_member(
     if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) {
         let index_member_id = get_member_id(cache, &index_expr);
         let mut result_type = LuaType::Never;
-        for member_id in member_item.get_member_ids() {
-            if index_member_id != member_id
-                && let Some(type_cache) = db.get_type_index().get_type_cache(&member_id.into())
+        for member_id in member_item.visible_member_ids_with_realm_at_offset(
+            db,
+            &cache.get_file_id(),
+            index_expr.get_position(),
+        ) {
+            if let Some(type_cache) = db.get_type_index().get_type_cache(&member_id.into())
+                && (index_member_id != member_id || type_cache.is_doc())
             {
                 result_type = TypeOps::Union.apply(db, &result_type, type_cache.as_type());
             }

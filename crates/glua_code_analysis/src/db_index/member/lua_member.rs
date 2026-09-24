@@ -88,7 +88,7 @@ impl LuaMember {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Clone, Copy, Hash, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Serialize, Deserialize)]
 pub struct LuaMemberId {
     pub file_id: FileId,
     id: LuaSyntaxId,

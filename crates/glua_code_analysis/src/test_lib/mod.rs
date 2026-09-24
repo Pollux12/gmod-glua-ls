@@ -656,7 +656,7 @@ impl VirtualWorkspace {
             .iter()
             .map(|(uri, _)| uri.clone())
             .collect::<Vec<_>>();
-        self.analysis.update_files_by_uri_sorted(file_infos);
+        self.analysis.update_files_by_uri(file_infos);
         let mut file_ids = uris
             .iter()
             .map(|uri| self.analysis.get_file_id(uri).expect("defined file id"))
@@ -865,6 +865,98 @@ impl VirtualWorkspace {
             .unwrap_or_else(|| format!("file-id:{}", file_id.id));
 
         diagnostics_to_snapshot_set(normalized_file, diagnostics)
+    }
+
+    /// Every main-workspace file's name/index expression types and
+    /// diagnostics, in path order.
+    #[cfg(test)]
+    pub fn semantic_digest(&self) -> Vec<String> {
+        use glua_parser::LuaExpr;
+
+        let db = self.analysis.compilation.get_db();
+        let mut files = db
+            .get_module_index()
+            .get_main_workspace_file_ids()
+            .into_iter()
+            .map(|file_id| {
+                let path = db
+                    .get_vfs()
+                    .get_file_path(&file_id)
+                    .map(|path| normalize_snapshot_file(&self.virtual_url_generator.base, path))
+                    .unwrap_or_default();
+                (path, file_id)
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+
+        let mut digest = Vec::new();
+        for (path, file_id) in files {
+            let model = self
+                .analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("semantic model");
+            for expr in model.get_root().descendants::<LuaExpr>() {
+                if !matches!(expr, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)) {
+                    continue;
+                }
+                let typ = model
+                    .get_semantic_info(expr.syntax().clone().into())
+                    .map(|info| self.humanize_type(info.display_typ().clone()))
+                    .unwrap_or_default();
+                let range = expr.syntax().text_range();
+                digest.push(format!(
+                    "{path}@{:?}: {} = {typ}",
+                    range,
+                    expr.syntax().text()
+                ));
+            }
+            let diagnostics = self
+                .analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default();
+            digest.extend(
+                diagnostics_to_snapshot_set(path, diagnostics)
+                    .into_iter()
+                    .map(|snapshot| format!("{snapshot:?}")),
+            );
+        }
+        digest
+    }
+
+    /// Applies `edits` one at a time to a workspace holding `files`, builds a
+    /// fresh workspace from the final texts, and asserts both digests match.
+    /// `setup` configures each workspace before any file is added. Returns
+    /// the incrementally edited workspace.
+    #[cfg(test)]
+    pub fn assert_warm_matches_cold(
+        setup: impl Fn(&mut VirtualWorkspace),
+        files: &[(&str, &str)],
+        edits: &[(&str, &str)],
+    ) -> VirtualWorkspace {
+        let mut warm = VirtualWorkspace::new();
+        setup(&mut warm);
+        warm.def_files(files.to_vec());
+        for (path, text) in edits {
+            warm.def_file(path, text);
+        }
+
+        let mut final_files = files.to_vec();
+        for (path, text) in edits {
+            match final_files
+                .iter_mut()
+                .find(|(existing, _)| existing == path)
+            {
+                Some(entry) => entry.1 = text,
+                None => final_files.push((path, text)),
+            }
+        }
+        let mut cold = VirtualWorkspace::new();
+        setup(&mut cold);
+        cold.def_files(final_files);
+
+        assert_eq!(warm.semantic_digest(), cold.semantic_digest());
+        warm
     }
 }
 

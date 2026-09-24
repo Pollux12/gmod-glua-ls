@@ -1,12 +1,8 @@
 use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaLiteralToken};
 use rowan::{TextRange, TextSize};
 
-mod fixpoint_fuse;
-
-pub use fixpoint_fuse::FixpointFuse;
-
 use crate::{
-    FileId, InFiled, LuaDeclId, LuaMemberId, LuaTypeCache, LuaTypeOwner,
+    FileId, InFiled, LuaDeclId, LuaMemberId, LuaTypeCache, LuaTypeOwner, LuaUnionType,
     compilation::analyzer::lua::iterates_table_member_map,
     db_index::{
         DbIndex, LuaMemberOwner, LuaType, LuaTypeDeclId, is_informative_type, is_undetermined_type,
@@ -476,6 +472,20 @@ pub fn bind_decl_write(
         }
     };
     if !seeds {
+        // A later write that holds everything the slot holds and more widens
+        // the local to every value it is assigned.
+        if let Some(existing) = db.get_type_index().get_type_cache(&type_owner)
+            && existing.is_infer()
+            && type_cache.is_infer()
+            && is_informative_type(type_cache.as_type())
+            && (union_widens_cached_type(type_cache.as_type(), existing.as_type())
+                || settled_covers_cached_type(type_cache.as_type(), existing.as_type()))
+            && type_cache.as_type() != existing.as_type()
+        {
+            db.get_type_index_mut()
+                .force_bind_type(type_owner, type_cache);
+            return Some(());
+        }
         return fallback(db, type_cache);
     }
     db.get_type_index_mut()
@@ -659,6 +669,74 @@ pub fn add_member(db: &mut DbIndex, owner: LuaMemberOwner, member_id: LuaMemberI
         .add_member_to_owner(owner.clone(), member_id);
 
     Some(())
+}
+
+/// Whether the re-derived type is a union that already contains everything the
+/// cached one holds, plus more.
+///
+/// The cache then holds a subset snapshot taken before the other arms were
+/// visible, so replacing it widens to the settled answer instead of guessing a
+/// different one. A cached union is as much a subset snapshot as a cached single
+/// arm is: both are decided by which contributors happened to be indexed first.
+pub(crate) fn union_widens_cached_type(inferred: &LuaType, current: &LuaType) -> bool {
+    let LuaType::Union(inferred_union) = inferred else {
+        return false;
+    };
+    let inferred_arms = known_arms(inferred_union);
+    // A cached arm is covered when the settled union holds it verbatim or holds
+    // the primitive it widens to — `number` covers a cached `integer` the same
+    // way it covers a cached `5`.
+    let covered = |cached: &LuaType| {
+        inferred_arms
+            .iter()
+            .any(|arm| arm == cached || crate::db_index::widens_primitive(arm, cached))
+    };
+    match current {
+        LuaType::Union(current_union) => {
+            let current_arms = known_arms(current_union);
+            (current_arms.len() < inferred_arms.len()
+                || (current_arms.len() == inferred_arms.len()
+                    && current_union.types().count() < inferred_union.types().count()))
+                && current_arms.iter().all(covered)
+        }
+        current => covered(current),
+    }
+}
+
+/// Whether the settled answer is the cached one with more of the writer set
+/// folded in: every arm the cache holds is either an arm of the settled answer
+/// or a literal that one of its arms widens to.
+///
+/// [`union_widens_cached_type`] and [`settled_widens_cached_literals`] each
+/// cover one shape of this; a sibling merge produces both at once, `"a"|"b"`
+/// against `string|number` when a computed-key writer joins widened literal
+/// entries. A `nil` arm is covered only by a `nil` arm, so the collapse never
+/// drops one.
+pub(crate) fn settled_covers_cached_type(inferred: &LuaType, current: &LuaType) -> bool {
+    fn arms(typ: &LuaType) -> Vec<LuaType> {
+        match typ {
+            LuaType::Union(union) => known_arms(union),
+            other => vec![other.clone()],
+        }
+    }
+    let inferred_arms = arms(inferred);
+    let current_arms = arms(current);
+    !current_arms.is_empty()
+        && current_arms.iter().all(|cached| {
+            inferred_arms.iter().any(|settled| {
+                settled == cached || crate::db_index::widens_primitive(settled, cached)
+            })
+        })
+}
+
+/// The union arms that carry information. An `unknown` arm stands for a type
+/// that has not settled yet, so it can neither widen a cache nor block one.
+pub(crate) fn known_arms(union: &LuaUnionType) -> Vec<LuaType> {
+    union
+        .types()
+        .filter(|arm| !matches!(arm, LuaType::Unknown))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]

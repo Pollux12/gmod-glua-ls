@@ -10,7 +10,7 @@ use crate::{
     },
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaCommonProperty {
     pub visibility: VisibilityKind,
     pub description: Option<Box<String>>,
@@ -196,20 +196,20 @@ impl LuaCommonProperty {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LuaDeprecated {
     Deprecated,
     DeprecatedWithMessage(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LuaExportScope {
     Default, // 默认声明, 会根据配置文件作不同的处理.
     Global,
     Namespace,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaTagContent {
     pub tags: Vec<(String, String)>,
 }
@@ -234,7 +234,7 @@ impl LuaTagContent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaExport {
     pub scope: LuaExportScope,
 }

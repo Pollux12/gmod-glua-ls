@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 pub use virtual_url::VirtualUrlGenerator;
 
-use crate::Emmyrc;
+use crate::{Emmyrc, PositionMap};
 
 #[derive(Debug)]
 pub struct Vfs {
@@ -37,6 +37,9 @@ pub struct Vfs {
     /// NOT bumped by analysis/index updates, so the cold-index main pass and its
     /// stabilization re-run share a revision and the second build is a cache hit.
     content_revision: u64,
+    /// The text each changed file had when it was last indexed (`None` for a
+    /// file that had none), until the next index takes its edit.
+    edit_bases: FxHashMap<FileId, Option<String>>,
 }
 
 fn trees_semantically_equal(left: &LuaSyntaxTree, right: &LuaSyntaxTree) -> bool {
@@ -107,6 +110,7 @@ impl Clone for Vfs {
             emmyrc: self.emmyrc.clone(),
             node_cache: NodeCache::default(),
             content_revision: self.content_revision,
+            edit_bases: self.edit_bases.clone(),
         }
     }
 }
@@ -123,6 +127,7 @@ impl Vfs {
             emmyrc: None,
             node_cache: NodeCache::default(),
             content_revision: 0,
+            edit_bases: FxHashMap::default(),
         }
     }
 
@@ -228,6 +233,7 @@ impl Vfs {
             self.line_index_map.remove(&fid);
             self.tree_map.remove(&fid);
         }
+        self.note_edit_base(fid);
         self.file_data[fid.id as usize] = data.map(|content| FileContent {
             content,
             is_remote: false,
@@ -264,6 +270,7 @@ impl Vfs {
         }
 
         self.content_revision += 1;
+        self.note_edit_base(fid);
 
         match text {
             Some(content) => {
@@ -295,6 +302,7 @@ impl Vfs {
         line_index: LineIndex,
     ) {
         self.content_revision += 1;
+        self.note_edit_base(fid);
         self.tree_map.insert(fid, tree);
         self.line_index_map.insert(fid, line_index);
         self.file_data[fid.id as usize] = Some(FileContent {
@@ -336,6 +344,7 @@ impl Vfs {
         }
 
         self.content_revision += 1;
+        self.note_edit_base(fid);
 
         let mut deferred_drop = DeferredVfsDrop::default();
 
@@ -379,6 +388,7 @@ impl Vfs {
             self.line_index_map.remove(&fid);
             self.tree_map.remove(&fid);
         }
+        self.note_edit_base(fid);
         self.file_data[fid.id as usize] = data.map(|content| FileContent {
             content,
             is_remote: true,
@@ -393,6 +403,7 @@ impl Vfs {
         if let Some(path) = self.file_path_map.remove(&fid.id) {
             self.file_id_map.remove(&path);
         }
+        self.note_edit_base(fid);
         if let Some(data) = self.file_data.get_mut(fid.id as usize) {
             data.take();
         }
@@ -401,17 +412,59 @@ impl Vfs {
         Some(fid)
     }
 
+    fn note_edit_base(&mut self, fid: FileId) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.edit_bases.entry(fid) {
+            entry.insert(
+                self.file_data
+                    .get(fid.id as usize)
+                    .and_then(Option::as_ref)
+                    .map(|content| content.content.clone()),
+            );
+        }
+    }
+
+    /// Where the edits since `file_ids` were last indexed moved their
+    /// positions, for the files that had text then and still have it; the
+    /// edits are forgotten.
+    pub fn take_edit_maps(&mut self, file_ids: &[FileId]) -> Vec<(FileId, PositionMap)> {
+        let mut maps = Vec::new();
+        for file_id in file_ids {
+            let Some(Some(old_text)) = self.edit_bases.remove(file_id) else {
+                continue;
+            };
+            if let Some(content) = self
+                .file_data
+                .get(file_id.id as usize)
+                .and_then(Option::as_ref)
+            {
+                maps.push((*file_id, PositionMap::new(&old_text, &content.content)));
+            }
+        }
+        maps
+    }
+
     pub fn update_config(&mut self, emmyrc: Arc<Emmyrc>) {
         self.emmyrc = Some(emmyrc);
     }
 
     pub fn get_file_content(&self, id: &FileId) -> Option<&String> {
+        crate::db_index::derivation::note_file_read(*id);
         let opt = &self.file_data[id.id as usize];
         if let Some(s) = opt {
             Some(&s.content)
         } else {
             None
         }
+    }
+
+    /// The fingerprint of `id`'s text, for [`FactKey::FileText`](crate::db_index::derivation::FactKey::FileText).
+    pub(crate) fn text_fingerprint(&self, id: &FileId) -> crate::db_index::derivation::Fingerprint {
+        crate::db_index::derivation::fingerprint_opt(
+            self.file_data
+                .get(id.id as usize)
+                .and_then(Option::as_ref)
+                .map(|data| &data.content),
+        )
     }
 
     pub fn get_file_version(&self, id: &FileId) -> Option<i32> {
@@ -435,6 +488,7 @@ impl Vfs {
     }
 
     pub fn get_syntax_tree(&self, id: &FileId) -> Option<&LuaSyntaxTree> {
+        crate::db_index::derivation::note_file_read(*id);
         self.tree_map.get(id)
     }
 
@@ -448,7 +502,24 @@ impl Vfs {
         Some(errors.to_vec())
     }
 
+    /// The fingerprint of the file set, for [`FactKey::FileSet`](crate::db_index::derivation::FactKey::FileSet).
+    pub(crate) fn file_set_fingerprint(&self) -> crate::db_index::derivation::Fingerprint {
+        crate::db_index::derivation::fingerprint_of(
+            &self
+                .file_data
+                .iter()
+                .enumerate()
+                .filter_map(|(fid, content)| {
+                    let content = content.as_ref()?;
+                    let file_id = FileId { id: fid as u32 };
+                    Some((fid, content.is_remote, self.tree_map.contains_key(&file_id)))
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
     pub fn get_all_local_file_ids(&self) -> Vec<FileId> {
+        crate::db_index::derivation::note_read(|| crate::db_index::derivation::FactKey::FileSet);
         self.file_data
             .iter()
             .enumerate()
@@ -467,6 +538,7 @@ impl Vfs {
     }
 
     pub fn get_all_file_ids(&self) -> Vec<FileId> {
+        crate::db_index::derivation::note_read(|| crate::db_index::derivation::FactKey::FileSet);
         self.file_data
             .iter()
             .enumerate()
@@ -498,6 +570,7 @@ impl Vfs {
         self.file_data.clear();
         self.line_index_map.clear();
         self.tree_map.clear();
+        self.edit_bases.clear();
         self.emmyrc = None;
         self.node_cache = NodeCache::default();
     }

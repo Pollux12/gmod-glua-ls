@@ -5,7 +5,10 @@ use glua_parser::LuaSyntaxId;
 use rowan::TextRange;
 
 use super::{GmodLoadIndex, GmodLoadStatus, GmodStateMask, LuaIndex};
-use crate::FileId;
+use crate::{
+    FileId,
+    db_index::derivation::{self, FactKey, Fingerprint},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GmodRealm {
@@ -31,32 +34,32 @@ impl GmodRealm {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GmodHookKind {
     Add,
     GamemodeMethod,
     Emit,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GmodHookNameIssue {
     Empty,
     NonStringLiteral,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GmodConVarKind {
     Server,
     Client,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GmodTimerKind {
     Create,
     Simple,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodHookSiteMetadata {
     pub syntax_id: LuaSyntaxId,
     pub kind: GmodHookKind,
@@ -67,20 +70,20 @@ pub struct GmodHookSiteMetadata {
     pub callback_params: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodNamedSiteMetadata {
     pub syntax_id: LuaSyntaxId,
     pub name: Option<String>,
     pub name_range: Option<TextRange>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct GmodCallbackSiteMetadata {
     pub syntax_id: Option<LuaSyntaxId>,
     pub callback_range: Option<TextRange>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodNetReceiveSiteMetadata {
     pub syntax_id: LuaSyntaxId,
     pub message_name: Option<String>,
@@ -88,7 +91,7 @@ pub struct GmodNetReceiveSiteMetadata {
     pub callback: GmodCallbackSiteMetadata,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodConcommandSiteMetadata {
     pub syntax_id: LuaSyntaxId,
     pub command_name: Option<String>,
@@ -96,7 +99,7 @@ pub struct GmodConcommandSiteMetadata {
     pub callback: GmodCallbackSiteMetadata,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodConVarSiteMetadata {
     pub syntax_id: LuaSyntaxId,
     pub kind: GmodConVarKind,
@@ -104,7 +107,7 @@ pub struct GmodConVarSiteMetadata {
     pub name_range: Option<TextRange>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodTimerSiteMetadata {
     pub syntax_id: LuaSyntaxId,
     pub kind: GmodTimerKind,
@@ -113,12 +116,12 @@ pub struct GmodTimerSiteMetadata {
     pub callback: GmodCallbackSiteMetadata,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct GmodHookFileMetadata {
     pub sites: Vec<GmodHookSiteMetadata>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct GmodSystemFileMetadata {
     pub net_add_string_calls: Vec<GmodNamedSiteMetadata>,
     pub net_start_calls: Vec<GmodNamedSiteMetadata>,
@@ -220,13 +223,20 @@ impl GmodSystemAggregate {
 }
 
 /// A range within a file that has a narrowed realm (from `if CLIENT then` etc).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodRealmRange {
     pub range: TextRange,
     pub realm: GmodRealm,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A file's own realm evidence, before the workspace load graph combines it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct GmodRealmInputs {
+    pub branch_realm_ranges: Vec<GmodRealmRange>,
+    pub annotation_realm: Option<GmodRealm>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodRealmFileMetadata {
     pub inferred_realm: GmodRealm,
     pub load_realm: Option<GmodRealm>,
@@ -256,7 +266,7 @@ impl Default for GmodRealmFileMetadata {
 }
 
 /// Cached scoped class detection result and its configured semantic metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct GmodScopedClassInfo {
     pub class_name: String,
     pub global_name: String,
@@ -286,6 +296,10 @@ pub struct GmodInferIndex {
     system_file_metadata: HashMap<FileId, GmodSystemFileMetadata>,
     system_aggregate_cache: OnceLock<GmodSystemAggregate>,
     realm_file_metadata: HashMap<FileId, GmodRealmFileMetadata>,
+    /// Each file's own realm evidence: `if CLIENT`/`if SERVER` block ranges
+    /// and its `---@realm` annotation. The workspace realm derivation reads
+    /// these to produce `realm_file_metadata`.
+    realm_inputs: HashMap<FileId, GmodRealmInputs>,
     gm_method_realm_annotations: HashMap<FileId, Vec<(String, GmodRealm)>>,
     /// Per-file `---@realm` ranges over function decls (sorted, O(log n) lookup).
     member_realm_ranges: HashMap<FileId, Vec<GmodRealmRange>>,
@@ -293,6 +307,9 @@ pub struct GmodInferIndex {
     fileparam_index: HashMap<FileId, Vec<(String, String)>>,
     /// Cached scoped class detection results, computed once during gmod_pre.
     scoped_class_info: HashMap<FileId, GmodScopedClassInfo>,
+    /// Incremental multiset fingerprint of the hook sites, system sites and
+    /// gamemode-method realm annotations of every file.
+    scan_fingerprint: Fingerprint,
 }
 
 impl GmodInferIndex {
@@ -302,11 +319,58 @@ impl GmodInferIndex {
             system_file_metadata: HashMap::default(),
             system_aggregate_cache: OnceLock::new(),
             realm_file_metadata: HashMap::default(),
+            realm_inputs: HashMap::default(),
             gm_method_realm_annotations: HashMap::default(),
             member_realm_ranges: HashMap::default(),
             fileparam_index: HashMap::default(),
             scoped_class_info: HashMap::default(),
+            scan_fingerprint: 0,
         }
+    }
+
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        match key {
+            FactKey::GmodInferFile(file_id) => {
+                let slots = (
+                    self.hook_file_metadata.get(file_id),
+                    self.system_file_metadata.get(file_id),
+                    self.realm_inputs.get(file_id),
+                    self.gm_method_realm_annotations.get(file_id),
+                    self.member_realm_ranges.get(file_id),
+                    self.fileparam_index.get(file_id),
+                    self.scoped_class_info.get(file_id),
+                );
+                if slots.0.is_none()
+                    && slots.1.is_none()
+                    && slots.2.is_none()
+                    && slots.3.is_none()
+                    && slots.4.is_none()
+                    && slots.5.is_none()
+                    && slots.6.is_none()
+                {
+                    derivation::ABSENT
+                } else {
+                    derivation::fingerprint_of(&slots)
+                }
+            }
+            FactKey::GmodRealm(file_id) => {
+                derivation::fingerprint_opt(self.realm_file_metadata.get(file_id))
+            }
+            FactKey::GmodInferScan => self.scan_fingerprint,
+            _ => {
+                debug_assert!(false, "{key:?} is not a gmod infer fact");
+                derivation::ABSENT
+            }
+        }
+    }
+
+    fn note_scan_write(&mut self, file_id: FileId, added: Fingerprint, removed: Fingerprint) {
+        derivation::note_write(|| FactKey::GmodInferFile(file_id));
+        derivation::note_write(|| FactKey::GmodInferScan);
+        self.scan_fingerprint = self
+            .scan_fingerprint
+            .wrapping_add(added)
+            .wrapping_sub(removed);
     }
 
     fn invalidate_system_aggregate_cache(&mut self) {
@@ -377,6 +441,7 @@ impl GmodInferIndex {
     }
 
     pub fn add_hook_site(&mut self, file_id: FileId, site: GmodHookSiteMetadata) {
+        self.note_scan_write(file_id, scan_element(HOOK_SITE, file_id, &site), 0);
         self.hook_file_metadata
             .entry(file_id)
             .or_default()
@@ -391,6 +456,10 @@ impl GmodInferIndex {
         if sites.is_empty() {
             return;
         }
+        let added = sites.iter().fold(0, |sum: Fingerprint, site| {
+            sum.wrapping_add(scan_element(HOOK_SITE, file_id, site))
+        });
+        self.note_scan_write(file_id, added, 0);
         self.hook_file_metadata
             .entry(file_id)
             .or_default()
@@ -402,6 +471,15 @@ impl GmodInferIndex {
     /// sites) wholesale. Used by the parallel gmod-pre collection. Invalidates
     /// the system aggregate cache since registration counts may change.
     pub fn set_system_file_metadata(&mut self, file_id: FileId, metadata: GmodSystemFileMetadata) {
+        let removed = self
+            .system_file_metadata
+            .get(&file_id)
+            .map_or(0, |previous| system_scan_fingerprint(file_id, previous));
+        self.note_scan_write(
+            file_id,
+            system_scan_fingerprint(file_id, &metadata),
+            removed,
+        );
         if metadata == GmodSystemFileMetadata::default() {
             if self.system_file_metadata.remove(&file_id).is_some() {
                 self.invalidate_system_aggregate_cache();
@@ -413,16 +491,19 @@ impl GmodInferIndex {
     }
 
     pub fn get_hook_file_metadata(&self, file_id: &FileId) -> Option<&GmodHookFileMetadata> {
+        derivation::note_read(|| FactKey::GmodInferFile(*file_id));
         self.hook_file_metadata.get(file_id)
     }
 
     pub fn iter_hook_file_metadata(
         &self,
     ) -> impl Iterator<Item = (&FileId, &GmodHookFileMetadata)> {
+        derivation::note_read(|| FactKey::GmodInferScan);
         self.hook_file_metadata.iter()
     }
 
     pub fn add_net_message_registration(&mut self, file_id: FileId, site: GmodNamedSiteMetadata) {
+        self.note_scan_write(file_id, scan_element(NET_ADD_STRING, file_id, &site), 0);
         self.invalidate_system_aggregate_cache();
         self.system_file_metadata
             .entry(file_id)
@@ -432,6 +513,7 @@ impl GmodInferIndex {
     }
 
     pub fn add_net_start_site(&mut self, file_id: FileId, site: GmodNamedSiteMetadata) {
+        self.note_scan_write(file_id, scan_element(NET_START, file_id, &site), 0);
         self.system_file_metadata
             .entry(file_id)
             .or_default()
@@ -440,6 +522,7 @@ impl GmodInferIndex {
     }
 
     pub fn add_net_receive_site(&mut self, file_id: FileId, site: GmodNetReceiveSiteMetadata) {
+        self.note_scan_write(file_id, scan_element(NET_RECEIVE, file_id, &site), 0);
         self.system_file_metadata
             .entry(file_id)
             .or_default()
@@ -448,6 +531,7 @@ impl GmodInferIndex {
     }
 
     pub fn add_concommand_site(&mut self, file_id: FileId, site: GmodConcommandSiteMetadata) {
+        self.note_scan_write(file_id, scan_element(CONCOMMAND, file_id, &site), 0);
         self.invalidate_system_aggregate_cache();
         self.system_file_metadata
             .entry(file_id)
@@ -457,6 +541,7 @@ impl GmodInferIndex {
     }
 
     pub fn add_convar_site(&mut self, file_id: FileId, site: GmodConVarSiteMetadata) {
+        self.note_scan_write(file_id, scan_element(CONVAR, file_id, &site), 0);
         self.invalidate_system_aggregate_cache();
         self.system_file_metadata
             .entry(file_id)
@@ -466,6 +551,7 @@ impl GmodInferIndex {
     }
 
     pub fn add_timer_site(&mut self, file_id: FileId, site: GmodTimerSiteMetadata) {
+        self.note_scan_write(file_id, scan_element(TIMER, file_id, &site), 0);
         self.system_file_metadata
             .entry(file_id)
             .or_default()
@@ -474,16 +560,19 @@ impl GmodInferIndex {
     }
 
     pub fn get_system_file_metadata(&self, file_id: &FileId) -> Option<&GmodSystemFileMetadata> {
+        derivation::note_read(|| FactKey::GmodInferFile(*file_id));
         self.system_file_metadata.get(file_id)
     }
 
     pub fn iter_system_file_metadata(
         &self,
     ) -> impl Iterator<Item = (&FileId, &GmodSystemFileMetadata)> {
+        derivation::note_read(|| FactKey::GmodInferScan);
         self.system_file_metadata.iter()
     }
 
     pub fn get_system_aggregate(&self) -> &GmodSystemAggregate {
+        derivation::note_read(|| FactKey::GmodInferScan);
         self.system_aggregate_cache
             .get_or_init(|| self.build_system_aggregate())
     }
@@ -515,6 +604,7 @@ impl GmodInferIndex {
     }
 
     pub fn get_realm_file_metadata(&self, file_id: &FileId) -> Option<&GmodRealmFileMetadata> {
+        derivation::note_read(|| FactKey::GmodRealm(*file_id));
         self.realm_file_metadata.get(file_id)
     }
 
@@ -522,6 +612,7 @@ impl GmodInferIndex {
     /// If the offset is inside a branch-narrowed block, returns that block's realm.
     /// Otherwise returns the file-level inferred realm, or annotation realm if inferred is Unknown.
     pub fn get_realm_at_offset(&self, file_id: &FileId, offset: rowan::TextSize) -> GmodRealm {
+        derivation::note_read(|| FactKey::GmodRealm(*file_id));
         let Some(metadata) = self.realm_file_metadata.get(file_id) else {
             return GmodRealm::Unknown;
         };
@@ -544,6 +635,7 @@ impl GmodInferIndex {
         file_id: &FileId,
         offset: rowan::TextSize,
     ) -> GmodStateMask {
+        derivation::note_read(|| FactKey::GmodRealm(*file_id));
         let Some(metadata) = self.realm_file_metadata.get(file_id) else {
             return GmodStateMask::empty();
         };
@@ -588,7 +680,22 @@ impl GmodInferIndex {
         &mut self,
         metadata: HashMap<FileId, GmodRealmFileMetadata>,
     ) {
+        if derivation::recording() {
+            for file_id in self.realm_file_metadata.keys().chain(metadata.keys()) {
+                derivation::note_write(|| FactKey::GmodRealm(*file_id));
+            }
+        }
         self.realm_file_metadata = metadata;
+    }
+
+    pub fn set_realm_inputs(&mut self, file_id: FileId, inputs: GmodRealmInputs) {
+        derivation::note_write(|| FactKey::GmodInferFile(file_id));
+        self.realm_inputs.insert(file_id, inputs);
+    }
+
+    pub fn get_realm_inputs(&self, file_id: &FileId) -> Option<&GmodRealmInputs> {
+        derivation::note_read(|| FactKey::GmodInferFile(*file_id));
+        self.realm_inputs.get(file_id)
     }
 
     pub fn set_gm_method_realm_annotations(
@@ -596,6 +703,15 @@ impl GmodInferIndex {
         file_id: FileId,
         method_realms: Vec<(String, GmodRealm)>,
     ) {
+        let removed = self
+            .gm_method_realm_annotations
+            .get(&file_id)
+            .map_or(0, |previous| gm_method_scan_fingerprint(file_id, previous));
+        self.note_scan_write(
+            file_id,
+            gm_method_scan_fingerprint(file_id, &method_realms),
+            removed,
+        );
         if method_realms.is_empty() {
             self.gm_method_realm_annotations.remove(&file_id);
             return;
@@ -608,6 +724,7 @@ impl GmodInferIndex {
     pub fn iter_gm_method_realm_annotations(
         &self,
     ) -> impl Iterator<Item = (&FileId, &Vec<(String, GmodRealm)>)> {
+        derivation::note_read(|| FactKey::GmodInferScan);
         self.gm_method_realm_annotations.iter()
     }
 
@@ -621,6 +738,7 @@ impl GmodInferIndex {
     /// to tell apart. Removal of the file's entries is
     /// [`LuaIndex::remove`](crate::LuaIndex::remove)'s job.
     pub fn set_member_realm_ranges(&mut self, file_id: FileId, mut ranges: Vec<GmodRealmRange>) {
+        derivation::note_write(|| FactKey::GmodInferFile(file_id));
         ranges.sort_by_key(|r| r.range.start());
         self.member_realm_ranges.insert(file_id, ranges);
     }
@@ -629,6 +747,7 @@ impl GmodInferIndex {
     /// Use as a guard before calling `get_member_annotation_realm_at_offset` to distinguish
     /// "no ranges for this file" (pre ran, file had none) from "pre not yet run" (fall back).
     pub fn has_member_realm_ranges(&self, file_id: &FileId) -> bool {
+        derivation::note_read(|| FactKey::GmodInferFile(*file_id));
         self.member_realm_ranges.contains_key(file_id)
     }
 
@@ -638,6 +757,7 @@ impl GmodInferIndex {
         file_id: &FileId,
         offset: rowan::TextSize,
     ) -> Option<GmodRealm> {
+        derivation::note_read(|| FactKey::GmodInferFile(*file_id));
         let ranges = self.member_realm_ranges.get(file_id)?;
         let idx = match ranges.binary_search_by_key(&offset, |r| r.range.start()) {
             Ok(i) => i,
@@ -655,12 +775,14 @@ impl GmodInferIndex {
 
     pub fn set_file_params(&mut self, file_id: FileId, params: Vec<(String, String)>) {
         if !params.is_empty() {
+            derivation::note_write(|| FactKey::GmodInferFile(file_id));
             self.fileparam_index.insert(file_id, params);
         }
     }
 
     /// O(1) lookup for a @fileparam type text by file and parameter name.
     pub fn get_file_param_type_text(&self, file_id: &FileId, name_lowercase: &str) -> Option<&str> {
+        derivation::note_read(|| FactKey::GmodInferFile(*file_id));
         let params = self.fileparam_index.get(file_id)?;
         params
             .iter()
@@ -669,31 +791,76 @@ impl GmodInferIndex {
     }
 
     pub fn set_scoped_class_info(&mut self, file_id: FileId, info: GmodScopedClassInfo) {
+        derivation::note_write(|| FactKey::GmodInferFile(file_id));
         self.scoped_class_info.insert(file_id, info);
     }
 
     pub fn get_scoped_class_info(&self, file_id: &FileId) -> Option<&GmodScopedClassInfo> {
+        derivation::note_read(|| FactKey::GmodInferFile(*file_id));
         self.scoped_class_info.get(file_id)
+    }
+
+    /// Drops what a file's gmod pre-analysis derived, before it runs again:
+    /// everything but the source layer's scoped-class info and the realms
+    /// the load graph decided.
+    pub(crate) fn reset_file_metadata(&mut self, file_id: FileId) {
+        let removed = self
+            .hook_file_metadata
+            .remove(&file_id)
+            .map_or(0, |metadata| hook_scan_fingerprint(file_id, &metadata))
+            .wrapping_add(
+                self.system_file_metadata
+                    .remove(&file_id)
+                    .map_or(0, |metadata| system_scan_fingerprint(file_id, &metadata)),
+            )
+            .wrapping_add(
+                self.gm_method_realm_annotations
+                    .get(&file_id)
+                    .map_or(0, |method_realms| {
+                        gm_method_scan_fingerprint(file_id, method_realms)
+                    }),
+            );
+        self.note_scan_write(file_id, 0, removed);
+        self.invalidate_system_aggregate_cache();
+        derivation::note_write(|| FactKey::GmodInferFile(file_id));
+        self.realm_inputs.remove(&file_id);
+        self.gm_method_realm_annotations.remove(&file_id);
+        self.member_realm_ranges.remove(&file_id);
+        self.fileparam_index.remove(&file_id);
     }
 }
 
 impl LuaIndex for GmodInferIndex {
     fn remove(&mut self, file_id: FileId) {
-        self.hook_file_metadata.remove(&file_id);
-        self.system_file_metadata.remove(&file_id);
-        self.invalidate_system_aggregate_cache();
+        self.reset_file_metadata(file_id);
+        derivation::note_write(|| FactKey::GmodRealm(file_id));
         self.realm_file_metadata.remove(&file_id);
-        self.gm_method_realm_annotations.remove(&file_id);
-        self.member_realm_ranges.remove(&file_id);
-        self.fileparam_index.remove(&file_id);
         self.scoped_class_info.remove(&file_id);
     }
 
     fn clear(&mut self) {
+        if derivation::recording() {
+            for file_id in self
+                .hook_file_metadata
+                .keys()
+                .chain(self.system_file_metadata.keys())
+                .chain(self.realm_file_metadata.keys())
+                .chain(self.gm_method_realm_annotations.keys())
+                .chain(self.member_realm_ranges.keys())
+                .chain(self.fileparam_index.keys())
+                .chain(self.scoped_class_info.keys())
+            {
+                derivation::note_write(|| FactKey::GmodInferFile(*file_id));
+                derivation::note_write(|| FactKey::GmodRealm(*file_id));
+            }
+        }
+        derivation::note_write(|| FactKey::GmodInferScan);
+        self.scan_fingerprint = 0;
         self.hook_file_metadata.clear();
         self.system_file_metadata.clear();
         self.invalidate_system_aggregate_cache();
         self.realm_file_metadata.clear();
+        self.realm_inputs.clear();
         self.gm_method_realm_annotations.clear();
         self.member_realm_ranges.clear();
         self.fileparam_index.clear();
@@ -713,6 +880,58 @@ fn file_state_mask(metadata: &GmodRealmFileMetadata) -> GmodStateMask {
     }
 
     GmodStateMask::empty()
+}
+
+const HOOK_SITE: u8 = 0;
+const NET_ADD_STRING: u8 = 1;
+const NET_START: u8 = 2;
+const NET_RECEIVE: u8 = 3;
+const CONCOMMAND: u8 = 4;
+const CONVAR: u8 = 5;
+const TIMER: u8 = 6;
+const GM_METHOD_REALM: u8 = 7;
+
+/// One element of the [`FactKey::GmodInferScan`] multiset.
+fn scan_element<T: std::hash::Hash>(tag: u8, file_id: FileId, value: &T) -> Fingerprint {
+    derivation::fingerprint_of(&(tag, file_id, value))
+}
+
+fn scan_elements<T: std::hash::Hash>(tag: u8, file_id: FileId, values: &[T]) -> Fingerprint {
+    values.iter().fold(0, |sum: Fingerprint, value| {
+        sum.wrapping_add(scan_element(tag, file_id, value))
+    })
+}
+
+fn hook_scan_fingerprint(file_id: FileId, metadata: &GmodHookFileMetadata) -> Fingerprint {
+    scan_elements(HOOK_SITE, file_id, &metadata.sites)
+}
+
+fn system_scan_fingerprint(file_id: FileId, metadata: &GmodSystemFileMetadata) -> Fingerprint {
+    scan_elements(NET_ADD_STRING, file_id, &metadata.net_add_string_calls)
+        .wrapping_add(scan_elements(NET_START, file_id, &metadata.net_start_calls))
+        .wrapping_add(scan_elements(
+            NET_RECEIVE,
+            file_id,
+            &metadata.net_receive_calls,
+        ))
+        .wrapping_add(scan_elements(
+            CONCOMMAND,
+            file_id,
+            &metadata.concommand_add_calls,
+        ))
+        .wrapping_add(scan_elements(
+            CONVAR,
+            file_id,
+            &metadata.convar_create_calls,
+        ))
+        .wrapping_add(scan_elements(TIMER, file_id, &metadata.timer_calls))
+}
+
+fn gm_method_scan_fingerprint(
+    file_id: FileId,
+    method_realms: &[(String, GmodRealm)],
+) -> Fingerprint {
+    scan_elements(GM_METHOD_REALM, file_id, method_realms)
 }
 
 fn normalize_system_name(name: Option<&str>) -> Option<&str> {

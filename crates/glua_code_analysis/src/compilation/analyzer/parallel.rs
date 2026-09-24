@@ -37,7 +37,9 @@ const MIN_PARALLEL_FILES: usize = 8;
 /// The pool's size is [`init_pool`]'s business; this only decides whether to
 /// reach for it at all.
 pub(crate) fn runs_inline(file_count: usize) -> bool {
-    if file_count < MIN_PARALLEL_FILES {
+    // An evaluation records its reads on its own thread; work handed to a
+    // pool worker would read unrecorded.
+    if file_count < MIN_PARALLEL_FILES || crate::db_index::derivation::recording() {
         return true;
     }
     std::thread::available_parallelism()

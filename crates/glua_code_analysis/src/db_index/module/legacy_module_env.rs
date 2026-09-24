@@ -1,6 +1,6 @@
 use rowan::TextSize;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LegacyModuleEnv {
     pub module_path: String,
     pub activation_position: TextSize,

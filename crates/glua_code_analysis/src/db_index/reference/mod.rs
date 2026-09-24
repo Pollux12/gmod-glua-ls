@@ -10,7 +10,10 @@ use smol_str::SmolStr;
 pub use string_reference::StringReference;
 
 use super::{LuaDeclId, LuaMemberKey, LuaTypeDeclId, traits::LuaIndex};
-use crate::{FileId, InFiled};
+use crate::{
+    FileId, InFiled,
+    db_index::derivation::{self, DerivationId, FactKey, Fingerprint},
+};
 
 #[derive(Debug, Clone)]
 pub struct LuaReferenceIndex {
@@ -28,6 +31,18 @@ pub struct LuaReferenceIndex {
     /// removal.
     file_revision: HashMap<FileId, u64>,
     next_revision: u64,
+    /// Incremental multiset fingerprint of each file's reference entries.
+    file_fingerprints: HashMap<FileId, Fingerprint>,
+    /// Incremental multiset fingerprint of the name-keyed entries (global,
+    /// member-key, string and type references) under each name.
+    name_fingerprints: HashMap<SmolStr, Fingerprint>,
+    /// Member-key references derivations found once a key was inferred, with
+    /// how many derivations hold each; kept apart from what the source layer
+    /// indexed so a re-run retracts exactly its own.
+    derived_index_reference: HashMap<LuaMemberKey, HashMap<(FileId, LuaSyntaxId), usize>>,
+    /// The member-key references each derivation added.
+    derived_index_reference_holders:
+        HashMap<DerivationId, Vec<(LuaMemberKey, FileId, LuaSyntaxId)>>,
 }
 
 impl Default for LuaReferenceIndex {
@@ -47,11 +62,44 @@ impl LuaReferenceIndex {
             local_reassignments: HashMap::default(),
             file_revision: HashMap::default(),
             next_revision: 1,
+            file_fingerprints: HashMap::default(),
+            name_fingerprints: HashMap::default(),
+            derived_index_reference: HashMap::default(),
+            derived_index_reference_holders: HashMap::default(),
+        }
+    }
+
+    /// Withdraws the member-key references derivation `id` added, before it
+    /// runs again.
+    pub(crate) fn retract_index_references(&mut self, id: &DerivationId) {
+        for (key, file_id, syntax_id) in self
+            .derived_index_reference_holders
+            .remove(id)
+            .unwrap_or_default()
+        {
+            let Some(sites) = self.derived_index_reference.get_mut(&key) else {
+                continue;
+            };
+            let Some(count) = sites.get_mut(&(file_id, syntax_id)) else {
+                continue;
+            };
+            *count -= 1;
+            if *count > 0 {
+                continue;
+            }
+            sites.remove(&(file_id, syntax_id));
+            if sites.is_empty() {
+                self.derived_index_reference.remove(&key);
+            }
+            let name = member_key_name(&key);
+            let fingerprint = index_reference_fingerprint(file_id, &key, &syntax_id);
+            Self::sub_name_fingerprint(&mut self.name_fingerprints, &name, fingerprint);
         }
     }
 
     /// Revision of `file_id`'s references. Zero until the file records one.
     pub fn file_reference_revision(&self, file_id: FileId) -> u64 {
+        derivation::note_read(|| FactKey::References(file_id));
         self.file_revision.get(&file_id).copied().unwrap_or(0)
     }
 
@@ -65,6 +113,7 @@ impl LuaReferenceIndex {
     /// `file_revision` is intentionally untouched: a revision is minted on the
     /// first real write, and reserving must not consume one.
     pub fn reserve_for_file(&mut self, file_id: FileId, entries: usize) {
+        derivation::note_write(|| FactKey::References(file_id));
         self.file_references
             .entry(file_id)
             .or_default()
@@ -87,9 +136,220 @@ impl LuaReferenceIndex {
         self.file_revision.insert(file_id, revision);
     }
 
+    fn add_file_fingerprint(&mut self, file_id: FileId, fingerprint: Fingerprint) {
+        let slot = self.file_fingerprints.entry(file_id).or_default();
+        *slot = slot.wrapping_add(fingerprint);
+    }
+
+    fn add_name_fingerprint(&mut self, name: SmolStr, fingerprint: Fingerprint) {
+        let slot = self.name_fingerprints.entry(name).or_default();
+        *slot = slot.wrapping_add(fingerprint);
+    }
+
+    fn sub_name_fingerprint(
+        name_fingerprints: &mut HashMap<SmolStr, Fingerprint>,
+        name: &str,
+        fingerprint: Fingerprint,
+    ) {
+        derivation::note_write(|| FactKey::ReferencesByName(SmolStr::new(name)));
+        if let Some(slot) = name_fingerprints.get_mut(name) {
+            *slot = slot.wrapping_sub(fingerprint);
+            if *slot == 0 {
+                name_fingerprints.remove(name);
+            }
+        }
+    }
+
+    fn remove_file_name_fingerprints(
+        name_fingerprints: &mut HashMap<SmolStr, Fingerprint>,
+        file_id: FileId,
+        string_references: Option<StringReference>,
+        type_references: Option<HashMap<LuaTypeDeclId, HashSet<TextRange>>>,
+    ) {
+        for (string, ranges) in string_references
+            .iter()
+            .flat_map(StringReference::iter_string_references)
+        {
+            for range in ranges {
+                Self::sub_name_fingerprint(
+                    name_fingerprints,
+                    string,
+                    string_reference_fingerprint(file_id, string, range),
+                );
+            }
+        }
+        for (type_decl_id, ranges) in type_references.iter().flatten() {
+            for range in ranges {
+                Self::sub_name_fingerprint(
+                    name_fingerprints,
+                    type_decl_id.get_name(),
+                    type_reference_fingerprint(file_id, type_decl_id, range),
+                );
+            }
+        }
+    }
+
+    /// `file_id`'s entry fingerprints summed afresh, which is what the
+    /// incremental `file_fingerprints` sum holds.
+    fn recomputed_file_fingerprint(&self, file_id: FileId) -> Fingerprint {
+        let decls = self
+            .file_references
+            .get(&file_id)
+            .into_iter()
+            .flat_map(|file| file.get_decl_references_map())
+            .flat_map(|(decl_id, reference)| {
+                reference.cells.iter().map(move |cell| {
+                    decl_reference_fingerprint(file_id, *decl_id, cell.range, cell.is_write)
+                })
+            });
+        let globals = self.global_references.iter().flat_map(|(name, by_file)| {
+            by_file
+                .get(&file_id)
+                .into_iter()
+                .flatten()
+                .map(move |syntax_id| global_reference_fingerprint(file_id, name, syntax_id))
+        });
+        let indexes = self.index_reference.iter().flat_map(|(key, by_file)| {
+            by_file
+                .get(&file_id)
+                .into_iter()
+                .flatten()
+                .map(move |syntax_id| index_reference_fingerprint(file_id, key, syntax_id))
+        });
+        let strings = self
+            .string_references
+            .get(&file_id)
+            .into_iter()
+            .flat_map(StringReference::iter_string_references)
+            .flat_map(|(string, ranges)| {
+                ranges
+                    .iter()
+                    .map(move |range| string_reference_fingerprint(file_id, string, range))
+            });
+        let types = self
+            .type_references
+            .get(&file_id)
+            .into_iter()
+            .flatten()
+            .flat_map(|(type_decl_id, ranges)| {
+                ranges
+                    .iter()
+                    .map(move |range| type_reference_fingerprint(file_id, type_decl_id, range))
+            });
+        let reassignments = self
+            .local_reassignments
+            .get(&file_id)
+            .map(reassignments_fingerprint);
+        decls
+            .chain(globals)
+            .chain(indexes)
+            .chain(strings)
+            .chain(types)
+            .chain(reassignments)
+            .fold(0, Fingerprint::wrapping_add)
+    }
+
+    /// `name`'s entry fingerprints summed afresh, which is what the
+    /// incremental `name_fingerprints` sum holds.
+    fn recomputed_name_fingerprint(&self, name: &SmolStr) -> Fingerprint {
+        let globals = self
+            .global_references
+            .get(name)
+            .into_iter()
+            .flatten()
+            .flat_map(|(file_id, syntax_ids)| {
+                syntax_ids
+                    .iter()
+                    .map(|syntax_id| global_reference_fingerprint(*file_id, name, syntax_id))
+            });
+        let indexes = self
+            .index_reference
+            .iter()
+            .filter(|(key, _)| member_key_name(key) == *name)
+            .flat_map(|(key, by_file)| {
+                by_file.iter().flat_map(move |(file_id, syntax_ids)| {
+                    syntax_ids
+                        .iter()
+                        .map(move |syntax_id| index_reference_fingerprint(*file_id, key, syntax_id))
+                })
+            });
+        let derived = self
+            .derived_index_reference
+            .iter()
+            .filter(|(key, _)| member_key_name(key) == *name)
+            .flat_map(|(key, sites)| {
+                sites.keys().map(move |(file_id, syntax_id)| {
+                    index_reference_fingerprint(*file_id, key, syntax_id)
+                })
+            });
+        let strings = self
+            .string_references
+            .iter()
+            .flat_map(|(file_id, strings)| {
+                strings
+                    .iter_string_references()
+                    .filter(|(string, _)| *string == name.as_str())
+                    .flat_map(move |(string, ranges)| {
+                        ranges
+                            .iter()
+                            .map(move |range| string_reference_fingerprint(*file_id, string, range))
+                    })
+            });
+        let types = self.type_references.iter().flat_map(|(file_id, by_type)| {
+            by_type
+                .iter()
+                .filter(|(type_decl_id, _)| type_decl_id.get_name() == name.as_str())
+                .flat_map(move |(type_decl_id, ranges)| {
+                    ranges
+                        .iter()
+                        .map(move |range| type_reference_fingerprint(*file_id, type_decl_id, range))
+                })
+        });
+        globals
+            .chain(indexes)
+            .chain(derived)
+            .chain(strings)
+            .chain(types)
+            .fold(derivation::ABSENT, Fingerprint::wrapping_add)
+    }
+
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        match key {
+            FactKey::References(file_id) => {
+                let content = if derivation::mapping_back() {
+                    Some(self.recomputed_file_fingerprint(*file_id)).filter(|sum| *sum != 0)
+                } else {
+                    self.file_fingerprints.get(file_id).copied()
+                };
+                let present = self.file_references.contains_key(file_id);
+                if content.is_none() && !present {
+                    derivation::ABSENT
+                } else {
+                    derivation::fingerprint_of(&(content, present))
+                }
+            }
+            FactKey::ReferencesByName(name) if derivation::mapping_back() => {
+                self.recomputed_name_fingerprint(name)
+            }
+            FactKey::ReferencesByName(name) => self
+                .name_fingerprints
+                .get(name)
+                .copied()
+                .unwrap_or(derivation::ABSENT),
+            FactKey::ReferenceContrib(id) => {
+                derivation::fingerprint_opt(self.derived_index_reference_holders.get(id))
+            }
+            _ => {
+                debug_assert!(false, "{key:?} is not a reference fact");
+                derivation::ABSENT
+            }
+        }
+    }
+
     /// Every file that references `name`, from both name-keyed tables. The sites
     /// themselves are not materialized.
     pub fn files_referencing_name(&self, name: &SmolStr) -> HashSet<FileId> {
+        derivation::note_read(|| FactKey::ReferencesByName(name.clone()));
         let member_key = LuaMemberKey::Name(name.clone());
         self.index_reference
             .get(&member_key)
@@ -103,6 +363,7 @@ impl LuaReferenceIndex {
     /// Every site in `file_id` that references `name`, from both name-keyed
     /// tables.
     pub fn name_references_in_file(&self, name: &SmolStr, file_id: FileId) -> Vec<LuaSyntaxId> {
+        derivation::note_read(|| FactKey::ReferencesByName(name.clone()));
         let member_key = LuaMemberKey::Name(name.clone());
         self.index_reference
             .get(&member_key)
@@ -127,21 +388,34 @@ impl LuaReferenceIndex {
         range: TextRange,
         is_write: bool,
     ) {
-        self.file_references
-            .entry(file_id)
-            .or_default()
-            .add_decl_reference(decl_id, range, is_write);
+        derivation::note_write(|| FactKey::References(file_id));
+        let file_reference = self.file_references.entry(file_id).or_default();
+        if file_reference.get_decl_id(&range).is_none() {
+            file_reference.add_decl_reference(decl_id, range, is_write);
+            self.add_file_fingerprint(
+                file_id,
+                decl_reference_fingerprint(file_id, decl_id, range, is_write),
+            );
+        }
         self.bump_file_revision(file_id);
     }
 
     pub fn add_global_reference(&mut self, name: &str, file_id: FileId, syntax_id: LuaSyntaxId) {
         let key = SmolStr::new(name);
-        self.global_references
-            .entry(key)
+        derivation::note_write(|| FactKey::References(file_id));
+        derivation::note_write(|| FactKey::ReferencesByName(key.clone()));
+        let inserted = self
+            .global_references
+            .entry(key.clone())
             .or_default()
             .entry(file_id)
             .or_default()
             .insert(syntax_id);
+        if inserted {
+            let fingerprint = global_reference_fingerprint(file_id, &key, &syntax_id);
+            self.add_file_fingerprint(file_id, fingerprint);
+            self.add_name_fingerprint(key, fingerprint);
+        }
         self.bump_file_revision(file_id);
     }
 
@@ -151,16 +425,51 @@ impl LuaReferenceIndex {
         file_id: FileId,
         syntax_id: LuaSyntaxId,
     ) {
-        self.index_reference
+        let name = member_key_name(&key);
+        let fingerprint = index_reference_fingerprint(file_id, &key, &syntax_id);
+        if !derivation::writes_source()
+            && let Some(holder) = derivation::current()
+        {
+            derivation::note_write(|| FactKey::ReferenceContrib(holder));
+            self.derived_index_reference_holders
+                .entry(holder)
+                .or_default()
+                .push((key.clone(), file_id, syntax_id));
+            let count = self
+                .derived_index_reference
+                .entry(key)
+                .or_default()
+                .entry((file_id, syntax_id))
+                .or_default();
+            *count += 1;
+            if *count == 1 {
+                self.add_name_fingerprint(name.clone(), fingerprint);
+                derivation::note_write(|| FactKey::ReferencesByName(name));
+            }
+            return;
+        }
+        derivation::note_write(|| FactKey::References(file_id));
+        derivation::note_write(|| FactKey::ReferencesByName(name.clone()));
+        let inserted = self
+            .index_reference
             .entry(key)
             .or_default()
             .entry(file_id)
             .or_default()
             .insert(syntax_id);
+        if inserted {
+            self.add_file_fingerprint(file_id, fingerprint);
+            self.add_name_fingerprint(name, fingerprint);
+        }
         self.bump_file_revision(file_id);
     }
 
     pub fn add_string_reference(&mut self, file_id: FileId, string: &str, range: TextRange) {
+        derivation::note_write(|| FactKey::References(file_id));
+        derivation::note_write(|| FactKey::ReferencesByName(SmolStr::new(string)));
+        let fingerprint = string_reference_fingerprint(file_id, string, &range);
+        self.add_file_fingerprint(file_id, fingerprint);
+        self.add_name_fingerprint(SmolStr::new(string), fingerprint);
         self.string_references
             .entry(file_id)
             .or_insert_with(StringReference::new)
@@ -173,12 +482,21 @@ impl LuaReferenceIndex {
         type_decl_id: LuaTypeDeclId,
         range: TextRange,
     ) {
-        self.type_references
+        let name = SmolStr::new(type_decl_id.get_name());
+        derivation::note_write(|| FactKey::References(file_id));
+        derivation::note_write(|| FactKey::ReferencesByName(name.clone()));
+        let fingerprint = type_reference_fingerprint(file_id, &type_decl_id, &range);
+        let inserted = self
+            .type_references
             .entry(file_id)
             .or_default()
             .entry(type_decl_id)
             .or_default()
             .insert(range);
+        if inserted {
+            self.add_file_fingerprint(file_id, fingerprint);
+            self.add_name_fingerprint(name, fingerprint);
+        }
     }
 
     pub fn set_local_reassignments(
@@ -186,7 +504,13 @@ impl LuaReferenceIndex {
         file_id: FileId,
         positions: HashMap<LuaDeclId, TextSize>,
     ) {
-        self.local_reassignments.insert(file_id, positions);
+        derivation::note_write(|| FactKey::References(file_id));
+        let added = reassignments_fingerprint(&positions);
+        let removed = self
+            .local_reassignments
+            .insert(file_id, positions)
+            .map_or(0, |previous| reassignments_fingerprint(&previous));
+        self.add_file_fingerprint(file_id, added.wrapping_sub(removed));
     }
 
     /// Where `decl_id` is first reassigned within `file_id`, if at all.
@@ -195,6 +519,7 @@ impl LuaReferenceIndex {
         file_id: FileId,
         decl_id: &LuaDeclId,
     ) -> Option<TextSize> {
+        derivation::note_read(|| FactKey::References(file_id));
         self.local_reassignments
             .get(&file_id)?
             .get(decl_id)
@@ -202,10 +527,12 @@ impl LuaReferenceIndex {
     }
 
     pub fn get_local_reference(&self, file_id: &FileId) -> Option<&FileReference> {
+        derivation::note_read(|| FactKey::References(*file_id));
         self.file_references.get(file_id)
     }
 
     pub fn create_local_reference(&mut self, file_id: FileId) {
+        derivation::note_write(|| FactKey::References(file_id));
         self.file_references.entry(file_id).or_default();
     }
 
@@ -214,12 +541,14 @@ impl LuaReferenceIndex {
         file_id: &FileId,
         decl_id: &LuaDeclId,
     ) -> Option<&DeclReference> {
+        derivation::note_read(|| FactKey::References(*file_id));
         self.file_references
             .get(file_id)?
             .get_decl_references(decl_id)
     }
 
     pub fn get_var_reference_decl(&self, file_id: &FileId, range: TextRange) -> Option<LuaDeclId> {
+        derivation::note_read(|| FactKey::References(*file_id));
         self.file_references.get(file_id)?.get_decl_id(&range)
     }
 
@@ -227,6 +556,7 @@ impl LuaReferenceIndex {
         &self,
         file_id: &FileId,
     ) -> Option<&HashMap<LuaDeclId, DeclReference>> {
+        derivation::note_read(|| FactKey::References(*file_id));
         self.file_references
             .get(file_id)
             .map(|file_reference| file_reference.get_decl_references_map())
@@ -237,6 +567,7 @@ impl LuaReferenceIndex {
         name: &str,
         file_id: FileId,
     ) -> Option<Vec<LuaSyntaxId>> {
+        derivation::note_read(|| FactKey::ReferencesByName(SmolStr::new(name)));
         let results = self
             .global_references
             .get(name)?
@@ -256,6 +587,7 @@ impl LuaReferenceIndex {
     }
 
     pub fn get_global_references(&self, name: &str) -> Option<Vec<InFiled<LuaSyntaxId>>> {
+        derivation::note_read(|| FactKey::ReferencesByName(SmolStr::new(name)));
         let results = self
             .global_references
             .get(name)?
@@ -271,21 +603,32 @@ impl LuaReferenceIndex {
     }
 
     pub fn get_index_references(&self, key: &LuaMemberKey) -> Option<Vec<InFiled<LuaSyntaxId>>> {
-        let results = self
-            .index_reference
-            .get(key)?
-            .iter()
+        derivation::note_read(|| FactKey::ReferencesByName(member_key_name(key)));
+        let source = self.index_reference.get(key);
+        let derived = self.derived_index_reference.get(key);
+        if source.is_none() && derived.is_none() {
+            return None;
+        }
+        let mut results = source
+            .into_iter()
+            .flatten()
             .flat_map(|(file_id, syntax_ids)| {
                 syntax_ids
                     .iter()
                     .map(|syntax_id| InFiled::new(*file_id, *syntax_id))
             })
-            .collect();
-
+            .collect::<Vec<_>>();
+        for (file_id, syntax_id) in derived.into_iter().flat_map(|sites| sites.keys()) {
+            let reference = InFiled::new(*file_id, *syntax_id);
+            if !results.contains(&reference) {
+                results.push(reference);
+            }
+        }
         Some(results)
     }
 
     pub fn get_string_references(&self, string_value: &str) -> Vec<InFiled<TextRange>> {
+        derivation::note_read(|| FactKey::ReferencesByName(SmolStr::new(string_value)));
         self.string_references
             .iter()
             .flat_map(|(file_id, string_reference)| {
@@ -301,6 +644,7 @@ impl LuaReferenceIndex {
         &self,
         type_decl_id: &LuaTypeDeclId,
     ) -> Option<Vec<InFiled<TextRange>>> {
+        derivation::note_read(|| FactKey::ReferencesByName(SmolStr::new(type_decl_id.get_name())));
         let results = self
             .type_references
             .iter()
@@ -320,6 +664,7 @@ impl LuaReferenceIndex {
     /// `file_id`, including names that resolved to nothing when the file was
     /// analysed (those are stored under the would-be global id).
     pub fn get_type_references_at(&self, file_id: FileId, range: TextRange) -> Vec<LuaTypeDeclId> {
+        derivation::note_read(|| FactKey::References(file_id));
         let Some(type_references) = self.type_references.get(&file_id) else {
             return Vec::new();
         };
@@ -334,12 +679,6 @@ impl LuaReferenceIndex {
             .collect()
     }
 
-    /// Every file's declaration references: the decl → sites map and the
-    /// range → decl inverse map inside each [`FileReference`].
-    pub fn iter_file_references(&self) -> impl Iterator<Item = (&FileId, &FileReference)> {
-        self.file_references.iter()
-    }
-
     /// Every expression range mapped to the declaration it refers to — the
     /// stored range → decl inverse map inside each [`FileReference`].
     pub fn iter_reference_ranges(
@@ -348,6 +687,7 @@ impl LuaReferenceIndex {
         self.file_references
             .iter()
             .flat_map(|(file_id, reference)| {
+                derivation::note_read(|| FactKey::References(*file_id));
                 reference
                     .iter_references_to_decl()
                     .map(move |(range, decl_id)| (*file_id, *range, *decl_id))
@@ -358,46 +698,129 @@ impl LuaReferenceIndex {
     pub fn iter_index_references(
         &self,
     ) -> impl Iterator<Item = (&LuaMemberKey, &HashMap<FileId, HashSet<LuaSyntaxId>>)> {
-        self.index_reference.iter()
+        self.index_reference.iter().inspect(|(key, _)| {
+            derivation::note_read(|| FactKey::ReferencesByName(member_key_name(key)));
+        })
     }
 
     /// Global-name reference sites: name → file → syntax ids.
     pub fn iter_global_references(
         &self,
     ) -> impl Iterator<Item = (&SmolStr, &HashMap<FileId, HashSet<LuaSyntaxId>>)> {
-        self.global_references.iter()
+        self.global_references.iter().inspect(|(name, _)| {
+            derivation::note_read(|| FactKey::ReferencesByName((*name).clone()));
+        })
     }
 
     /// Per-file string literal reference sites.
     pub fn iter_string_references(&self) -> impl Iterator<Item = (&FileId, &StringReference)> {
-        self.string_references.iter()
+        self.string_references
+            .iter()
+            .inspect(|(file_id, _)| derivation::note_read(|| FactKey::References(**file_id)))
     }
 
     /// Doc type-name reference sites: file → type decl → ranges.
     pub fn iter_type_references(
         &self,
     ) -> impl Iterator<Item = (&FileId, &HashMap<LuaTypeDeclId, HashSet<TextRange>>)> {
-        self.type_references.iter()
+        self.type_references
+            .iter()
+            .inspect(|(file_id, _)| derivation::note_read(|| FactKey::References(**file_id)))
     }
 
     /// First reassignment position of each local: file → decl → position.
     pub fn iter_local_reassignments(
         &self,
     ) -> impl Iterator<Item = (&FileId, &HashMap<LuaDeclId, TextSize>)> {
-        self.local_reassignments.iter()
+        self.local_reassignments
+            .iter()
+            .inspect(|(file_id, _)| derivation::note_read(|| FactKey::References(**file_id)))
     }
+}
+
+/// The name a member-key reference is fingerprinted and read under.
+fn member_key_name(key: &LuaMemberKey) -> SmolStr {
+    match key {
+        LuaMemberKey::Name(name) => name.clone(),
+        LuaMemberKey::Integer(index) => SmolStr::new(format!("[{index}]")),
+        LuaMemberKey::None | LuaMemberKey::ExprType(_) => SmolStr::new_static("[]"),
+    }
+}
+
+fn decl_reference_fingerprint(
+    file_id: FileId,
+    decl_id: LuaDeclId,
+    range: TextRange,
+    is_write: bool,
+) -> Fingerprint {
+    derivation::fingerprint_of(&(0u8, decl_id, InFiled::new(file_id, range), is_write))
+}
+
+fn global_reference_fingerprint(
+    file_id: FileId,
+    name: &str,
+    syntax_id: &LuaSyntaxId,
+) -> Fingerprint {
+    derivation::fingerprint_of(&(1u8, name, InFiled::new(file_id, *syntax_id)))
+}
+
+fn index_reference_fingerprint(
+    file_id: FileId,
+    key: &LuaMemberKey,
+    syntax_id: &LuaSyntaxId,
+) -> Fingerprint {
+    derivation::fingerprint_of(&(2u8, key, InFiled::new(file_id, *syntax_id)))
+}
+
+fn string_reference_fingerprint(file_id: FileId, string: &str, range: &TextRange) -> Fingerprint {
+    derivation::fingerprint_of(&(3u8, string, InFiled::new(file_id, *range)))
+}
+
+fn type_reference_fingerprint(
+    file_id: FileId,
+    type_decl_id: &LuaTypeDeclId,
+    range: &TextRange,
+) -> Fingerprint {
+    derivation::fingerprint_of(&(4u8, type_decl_id, InFiled::new(file_id, *range)))
+}
+
+fn reassignments_fingerprint(positions: &HashMap<LuaDeclId, TextSize>) -> Fingerprint {
+    positions
+        .iter()
+        .fold(0, |sum: Fingerprint, (decl_id, position)| {
+            sum.wrapping_add(derivation::fingerprint_of(&(
+                5u8,
+                decl_id,
+                InFiled::new(decl_id.file_id, *position),
+            )))
+        })
 }
 
 impl LuaIndex for LuaReferenceIndex {
     fn remove(&mut self, file_id: FileId) {
+        derivation::note_write(|| FactKey::References(file_id));
         self.bump_file_revision(file_id);
+        self.file_fingerprints.remove(&file_id);
         self.file_references.remove(&file_id);
-        self.string_references.remove(&file_id);
-        self.type_references.remove(&file_id);
+        Self::remove_file_name_fingerprints(
+            &mut self.name_fingerprints,
+            file_id,
+            self.string_references.remove(&file_id),
+            self.type_references.remove(&file_id),
+        );
         self.local_reassignments.remove(&file_id);
         let mut to_be_remove = Vec::new();
         for (key, references) in self.index_reference.iter_mut() {
-            references.remove(&file_id);
+            if let Some(syntax_ids) = references.remove(&file_id) {
+                let name = member_key_name(key);
+                for syntax_id in &syntax_ids {
+                    Self::sub_name_fingerprint(
+                        &mut self.name_fingerprints,
+                        &name,
+                        index_reference_fingerprint(file_id, key, syntax_id),
+                    );
+                }
+            }
             if references.is_empty() {
                 to_be_remove.push(key.clone());
             }
@@ -409,7 +832,15 @@ impl LuaIndex for LuaReferenceIndex {
 
         let mut to_be_remove = Vec::new();
         for (key, references) in self.global_references.iter_mut() {
-            references.remove(&file_id);
+            if let Some(syntax_ids) = references.remove(&file_id) {
+                for syntax_id in &syntax_ids {
+                    Self::sub_name_fingerprint(
+                        &mut self.name_fingerprints,
+                        key,
+                        global_reference_fingerprint(file_id, key, syntax_id),
+                    );
+                }
+            }
             if references.is_empty() {
                 to_be_remove.push(key.clone());
             }
@@ -422,35 +853,83 @@ impl LuaIndex for LuaReferenceIndex {
 
     fn remove_files(&mut self, file_ids: &[FileId]) {
         for &file_id in file_ids {
+            derivation::note_write(|| FactKey::References(file_id));
             self.bump_file_revision(file_id);
         }
         let removed_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
+        for file_id in &removed_file_ids {
+            self.file_fingerprints.remove(file_id);
+            Self::remove_file_name_fingerprints(
+                &mut self.name_fingerprints,
+                *file_id,
+                self.string_references.remove(file_id),
+                self.type_references.remove(file_id),
+            );
+        }
         self.file_references
-            .retain(|file_id, _| !removed_file_ids.contains(file_id));
-        self.string_references
-            .retain(|file_id, _| !removed_file_ids.contains(file_id));
-        self.type_references
             .retain(|file_id, _| !removed_file_ids.contains(file_id));
         self.local_reassignments
             .retain(|file_id, _| !removed_file_ids.contains(file_id));
 
-        self.index_reference.retain(|_, references| {
-            references.retain(|file_id, _| !removed_file_ids.contains(file_id));
+        let name_fingerprints = &mut self.name_fingerprints;
+        self.index_reference.retain(|key, references| {
+            references.retain(|file_id, syntax_ids| {
+                if !removed_file_ids.contains(file_id) {
+                    return true;
+                }
+                let name = member_key_name(key);
+                for syntax_id in syntax_ids.iter() {
+                    Self::sub_name_fingerprint(
+                        name_fingerprints,
+                        &name,
+                        index_reference_fingerprint(*file_id, key, syntax_id),
+                    );
+                }
+                false
+            });
             !references.is_empty()
         });
-        self.global_references.retain(|_, references| {
-            references.retain(|file_id, _| !removed_file_ids.contains(file_id));
+        self.global_references.retain(|name, references| {
+            references.retain(|file_id, syntax_ids| {
+                if !removed_file_ids.contains(file_id) {
+                    return true;
+                }
+                for syntax_id in syntax_ids.iter() {
+                    Self::sub_name_fingerprint(
+                        name_fingerprints,
+                        name,
+                        global_reference_fingerprint(*file_id, name, syntax_id),
+                    );
+                }
+                false
+            });
             !references.is_empty()
         });
     }
 
     fn clear(&mut self) {
+        if derivation::recording() {
+            for file_id in self
+                .file_fingerprints
+                .keys()
+                .chain(self.file_references.keys())
+            {
+                derivation::note_write(|| FactKey::References(*file_id));
+            }
+            for name in self.name_fingerprints.keys() {
+                derivation::note_write(|| FactKey::ReferencesByName(name.clone()));
+            }
+        }
+        self.file_fingerprints.clear();
+        self.name_fingerprints.clear();
         self.file_revision.clear();
         self.file_references.clear();
         self.string_references.clear();
         self.type_references.clear();
         self.local_reassignments.clear();
         self.index_reference.clear();
+        self.derived_index_reference.clear();
+        self.derived_index_reference_holders.clear();
         self.global_references.clear();
     }
 }

@@ -2,7 +2,10 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use rowan::TextRange;
 
-use crate::{FileId, LuaDeclId};
+use crate::{
+    FileId, LuaDeclId,
+    db_index::derivation::{self, FactKey, Fingerprint},
+};
 
 use super::{GmodRealm, LuaDependencyKind, LuaIndex};
 
@@ -181,14 +184,14 @@ impl From<LuaDependencyKind> for GmodLoadEdgeKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodLoadRoot {
     pub kind: GmodLoadRootKind,
     pub states: GmodStateMask,
     pub path_sort_key: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodLoadEdge {
     pub source_file_id: FileId,
     pub target_file_id: Option<FileId>,
@@ -199,7 +202,7 @@ pub struct GmodLoadEdge {
     pub range: Option<TextRange>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodFileLoadInfo {
     pub status: GmodLoadStatus,
     pub realm: GmodRealm,
@@ -272,6 +275,31 @@ impl GmodExecutionEnvironmentFileFlow {
     pub(crate) fn is_empty(&self) -> bool {
         self.edges.is_empty() && self.seeds.is_empty() && self.sites.is_empty()
     }
+
+    /// Content fingerprint; `edges` and each site's `fields` are hashed
+    /// independently of their hash order.
+    fn fingerprint(&self) -> Fingerprint {
+        let edges = self
+            .edges
+            .iter()
+            .fold(0, |sum: Fingerprint, (decl_id, targets)| {
+                sum.wrapping_add(derivation::fingerprint_of(&(decl_id, targets)))
+            });
+        let sites = self
+            .sites
+            .iter()
+            .map(|site| {
+                let mut fields = site.fields.iter().collect::<Vec<_>>();
+                fields.sort_unstable();
+                let source = match &site.source {
+                    GmodExecutionEnvironmentSource::Decl(decl_id) => (Some(*decl_id), None),
+                    GmodExecutionEnvironmentSource::Path(path) => (None, Some(path)),
+                };
+                (source, fields)
+            })
+            .collect::<Vec<_>>();
+        derivation::fingerprint_of(&(edges, &self.seeds, sites))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -310,19 +338,62 @@ impl GmodLoadIndex {
         }
     }
 
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        let FactKey::GmodLoadFile(file_id) = key else {
+            debug_assert!(false, "{key:?} is not a gmod load fact");
+            return derivation::ABSENT;
+        };
+        let info = self.file_infos.get(file_id);
+        let environment = self.execution_environments.get(file_id).map(|fields| {
+            let mut fields = fields.iter().collect::<Vec<_>>();
+            fields.sort_unstable();
+            fields
+        });
+        let flow = self
+            .execution_environment_file_flows
+            .get(file_id)
+            .map(GmodExecutionEnvironmentFileFlow::fingerprint);
+        if info.is_none() && environment.is_none() && flow.is_none() {
+            return derivation::ABSENT;
+        }
+        derivation::fingerprint_of(&(info, environment, flow))
+    }
+
+    /// Notes a write of every file key this index currently holds.
+    fn note_all_file_writes(&self) {
+        if !derivation::recording() {
+            return;
+        }
+        for file_id in self
+            .file_infos
+            .keys()
+            .chain(self.execution_environments.keys())
+            .chain(self.execution_environment_file_flows.keys())
+        {
+            derivation::note_write(|| FactKey::GmodLoadFile(*file_id));
+        }
+    }
+
     pub fn get_file_info(&self, file_id: &FileId) -> Option<&GmodFileLoadInfo> {
+        derivation::note_read(|| FactKey::GmodLoadFile(*file_id));
         self.file_infos.get(file_id)
     }
 
     pub fn iter_file_infos(&self) -> impl Iterator<Item = (&FileId, &GmodFileLoadInfo)> {
-        self.file_infos.iter()
+        self.file_infos
+            .iter()
+            .inspect(|(file_id, _)| derivation::note_read(|| FactKey::GmodLoadFile(**file_id)))
     }
 
     pub fn unresolved_edges(&self) -> &[GmodLoadEdge] {
+        for edge in &self.unresolved_edges {
+            derivation::note_read(|| FactKey::GmodLoadFile(edge.source_file_id));
+        }
         &self.unresolved_edges
     }
 
     pub fn execution_environment_contains(&self, file_id: FileId, name: &str) -> bool {
+        derivation::note_read(|| FactKey::GmodLoadFile(file_id));
         self.execution_environments
             .get(&file_id)
             .is_some_and(|fields| fields.contains(name))
@@ -332,8 +403,10 @@ impl GmodLoadIndex {
         &mut self,
         execution_environment_sites: HashMap<FileId, HashMap<FileId, HashSet<String>>>,
     ) {
+        self.note_all_file_writes();
         self.execution_environment_sites = execution_environment_sites;
         self.rebuild_execution_environments();
+        self.note_all_file_writes();
     }
 
     pub(crate) fn set_execution_environment_file_flow(
@@ -341,6 +414,7 @@ impl GmodLoadIndex {
         file_id: FileId,
         flow: GmodExecutionEnvironmentFileFlow,
     ) {
+        derivation::note_write(|| FactKey::GmodLoadFile(file_id));
         if flow.is_empty() {
             self.execution_environment_file_flows.remove(&file_id);
         } else {
@@ -353,19 +427,9 @@ impl GmodLoadIndex {
     ) -> impl Iterator<Item = (FileId, &GmodExecutionEnvironmentFileFlow)> {
         self.execution_environment_file_flows
             .iter()
-            .map(|(file_id, flow)| (*file_id, flow))
-    }
-
-    pub(crate) fn execution_environment_roles_changed(
-        &self,
-        current_role_sources: &HashSet<FileId>,
-        analyzed_file_ids: &HashSet<FileId>,
-    ) -> bool {
-        self.execution_environment_roles_dirty
-            || self.execution_environment_role_sources != *current_role_sources
-            || analyzed_file_ids.iter().any(|file_id| {
-                self.execution_environment_role_sources.contains(file_id)
-                    || current_role_sources.contains(file_id)
+            .map(|(file_id, flow)| {
+                derivation::note_read(|| FactKey::GmodLoadFile(*file_id));
+                (*file_id, flow)
             })
     }
 
@@ -394,6 +458,8 @@ impl GmodLoadIndex {
         left: FileId,
         right: FileId,
     ) -> bool {
+        derivation::note_read(|| FactKey::GmodLoadFile(left));
+        derivation::note_read(|| FactKey::GmodLoadFile(right));
         let Some(left_info) = self.file_infos.get(&left) else {
             return false;
         };
@@ -412,6 +478,7 @@ impl GmodLoadIndex {
             .file_infos
             .iter()
             .flat_map(|(file_id, info)| {
+                derivation::note_read(|| FactKey::GmodLoadFile(*file_id));
                 info.roots.iter().filter_map(|root| {
                     if !root.states.intersects(state) {
                         return None;
@@ -449,8 +516,10 @@ impl GmodLoadIndex {
         file_infos: HashMap<FileId, GmodFileLoadInfo>,
         unresolved_edges: Vec<GmodLoadEdge>,
     ) {
+        self.note_all_file_writes();
         self.file_infos = file_infos;
         self.unresolved_edges = unresolved_edges;
+        self.note_all_file_writes();
     }
 }
 
@@ -548,6 +617,8 @@ fn is_base_gamemode_path(path_sort_key: &str) -> bool {
 
 impl LuaIndex for GmodLoadIndex {
     fn remove(&mut self, file_id: FileId) {
+        derivation::note_write(|| FactKey::GmodLoadFile(file_id));
+        self.note_all_file_writes();
         self.file_infos.remove(&file_id);
         self.execution_environment_file_flows.remove(&file_id);
         if self.execution_environment_role_sources.remove(&file_id) {
@@ -575,6 +646,10 @@ impl LuaIndex for GmodLoadIndex {
     }
 
     fn remove_files(&mut self, file_ids: &[FileId]) {
+        for file_id in file_ids {
+            derivation::note_write(|| FactKey::GmodLoadFile(*file_id));
+        }
+        self.note_all_file_writes();
         let removed_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
         self.file_infos
             .retain(|file_id, _| !removed_file_ids.contains(file_id));
@@ -622,6 +697,7 @@ impl LuaIndex for GmodLoadIndex {
     }
 
     fn clear(&mut self) {
+        self.note_all_file_writes();
         self.file_infos.clear();
         self.unresolved_edges.clear();
         self.execution_environments.clear();

@@ -180,7 +180,7 @@ fn infer_buildin_or_ref_type(
             let type_id = if let Some(name_type_decl) = analyzer
                 .db
                 .get_type_index_mut()
-                .find_type_decl(analyzer.file_id, name)
+                .find_source_type_decl(analyzer.file_id, name)
             {
                 founded = true;
                 name_type_decl.get_id()
@@ -236,7 +236,7 @@ fn infer_generic_type(analyzer: &mut DocAnalyzer, generic_type: &LuaDocGenericTy
         let id = if let Some(name_type_decl) = analyzer
             .db
             .get_type_index_mut()
-            .find_type_decl(analyzer.file_id, &name)
+            .find_source_type_decl(analyzer.file_id, &name)
         {
             name_type_decl.get_id()
         } else {

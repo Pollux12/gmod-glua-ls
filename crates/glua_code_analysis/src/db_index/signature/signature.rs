@@ -1,6 +1,7 @@
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::{collections::HashMap, sync::Arc};
 
 use glua_parser::{LuaAstNode, LuaClosureExpr, LuaDocFuncType};
@@ -54,19 +55,19 @@ pub struct LuaSignature {
     falsy_param_return_aliases: Vec<LuaFalsyParamReturnAlias>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaReturnCorrelation {
     pub discriminant_slot: usize,
     pub implied_non_nil_slots: Vec<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaFalsyParamNilFreeReturnSlot {
     pub param_idx: usize,
     pub return_slot: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaFalsyParamReturnAlias {
     pub falsy_param_idx: usize,
     pub aliased_param_idx: usize,
@@ -88,10 +89,38 @@ impl LuaCallArgRole {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LuaNoDiscard {
     NoDiscard,
     NoDiscardWithMessage(Box<String>),
+}
+
+/// Content hash; `param_docs` is hashed in param-index order.
+impl Hash for LuaSignature {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.generic_params.hash(state);
+        self.overloads.hash(state);
+        let mut param_docs: Vec<_> = self.param_docs.iter().collect();
+        param_docs.sort_unstable_by_key(|(idx, _)| **idx);
+        param_docs.hash(state);
+        self.out_params.hash(state);
+        self.params.hash(state);
+        self.return_docs.hash(state);
+        self.resolve_return.hash(state);
+        self.is_colon_define.hash(state);
+        self.async_state.hash(state);
+        self.nodiscard.hash(state);
+        self.is_vararg.hash(state);
+        self.params_filled_from_slot.hash(state);
+        self.return_filled_from_slot.hash(state);
+        self.require_guard_param.hash(state);
+        self.nil_return_guard_params.hash(state);
+        self.return_correlations.hash(state);
+        self.direct_param_return_alias.hash(state);
+        self.class_name_param_return_alias.hash(state);
+        self.falsy_param_nil_free_return_slots.hash(state);
+        self.falsy_param_return_aliases.hash(state);
+    }
 }
 
 impl Default for LuaSignature {
@@ -795,7 +824,7 @@ fn overload_has_special_call_params(func: &LuaFunctionType) -> bool {
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaDocParamInfo {
     pub name: String,
     pub type_ref: LuaType,
@@ -928,20 +957,20 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LuaOutParamRoot {
     Param(usize),
     SelfReceiver,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaOutParamInfo {
     pub root: LuaOutParamRoot,
     pub field_path: Vec<String>,
     pub type_ref: LuaType,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ReturnTypeKind {
     #[default]
     Reference,
@@ -958,7 +987,7 @@ pub enum LuaDocDefaultValue {
     Expression(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaDocReturnInfo {
     pub name: Option<String>,
     pub type_ref: LuaType,
@@ -968,7 +997,7 @@ pub struct LuaDocReturnInfo {
     pub return_kind: ReturnTypeKind,
 }
 
-#[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
 pub struct LuaSignatureId {
     file_id: FileId,
     position: TextSize,
@@ -1061,7 +1090,7 @@ pub enum SignatureReturnStatus {
     InferResolve,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct LuaGenericParamInfo {
     pub name: String,
     pub constraint: Option<LuaType>,

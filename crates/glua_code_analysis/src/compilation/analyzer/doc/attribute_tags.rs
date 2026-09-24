@@ -74,7 +74,7 @@ pub fn infer_attribute_uses(
             let param_names = analyzer
                 .db
                 .get_type_index()
-                .get_type_decl(&type_id)
+                .get_source_type_decl(&type_id)
                 .and_then(|decl| decl.get_attribute_type())
                 .and_then(|typ| match typ {
                     LuaType::DocAttribute(attr_type) => Some(

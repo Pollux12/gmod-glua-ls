@@ -854,7 +854,16 @@ fn expr_is_proven_non_nil(analyzer: &mut LuaAnalyzer, expr: &LuaExpr) -> bool {
             .get_infer_cache(analyzer.file_id),
         expr.clone(),
     )
-    .is_ok_and(|typ| !typ.is_nullable())
+    .is_ok_and(|typ| !typ.is_nullable() && !may_hold_unknown(&typ))
+}
+
+/// Whether some alternative of `typ` is `unknown`, which proves nothing.
+fn may_hold_unknown(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Unknown => true,
+        LuaType::Union(union) => union.types().any(|typ| typ.is_unknown()),
+        _ => false,
+    }
 }
 
 fn call_expr_is_known_nil_free_for_falsy_args(
@@ -2099,21 +2108,12 @@ fn analyze_return(
     };
 
     let return_points = analyze_func_body_returns(block.clone());
-    analyzer
-        .context
-        .add_inferred_return_candidate(UnResolveReturn {
-            file_id: analyzer.file_id,
-            signature_id: *signature_id,
-            body: Some(block.clone()),
-            return_points: return_points.clone(),
-        });
     let (return_correlations, returns) = derive_inferred_return_with_reads(
         analyzer.db,
         analyzer
             .context
             .infer_manager
             .get_infer_cache(analyzer.file_id),
-        *signature_id,
         &return_points,
     );
     let returns = match returns {
@@ -2132,7 +2132,6 @@ fn analyze_return(
             let unresolve = UnResolveReturn {
                 file_id: analyzer.file_id,
                 signature_id: *signature_id,
-                body: Some(block),
                 return_points,
             };
 
@@ -2159,24 +2158,13 @@ fn analyze_return(
 pub fn derive_inferred_return_with_reads(
     db: &DbIndex,
     cache: &mut LuaInferCache,
-    signature_id: LuaSignatureId,
     return_points: &Vec<LuaReturnPoint>,
 ) -> (
     Vec<LuaReturnCorrelation>,
     Result<Vec<LuaDocReturnInfo>, InferFailReason>,
 ) {
-    // Member maps are armed too: a return inferred off a member lookup must
-    // re-derive when that owner's membership moves, and the settled tail's
-    // per-record staleness check needs the read on record to see it.
-    crate::db_index::read_set::arm_with_member_maps();
     let correlations = analyze_return_correlations(db, cache, return_points);
     let returns = analyze_return_point(db, cache, return_points);
-    let mut reads = crate::db_index::read_set::disarm();
-    reads.signatures.remove(&signature_id);
-    cache.record_inferred_return_reads(
-        signature_id,
-        crate::db_index::read_set::InferredReturnReadRecord::captured(db, reads),
-    );
     (correlations, returns)
 }
 
@@ -2221,7 +2209,6 @@ fn analyze_lambda_returns(
         signature_id: *signature_id,
         call_expr,
         param_idx: founded_idx,
-        body: Some(block),
         return_points,
     };
 

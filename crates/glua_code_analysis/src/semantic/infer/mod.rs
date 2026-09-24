@@ -155,6 +155,14 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
                 cache.expr_cache.remove(&key);
             }
         }
+        Err(reason) if reason.is_need_resolve() && cache.get_config().analysis_phase.is_force() => {
+            // A fact that has not landed reads as unknown: the read is
+            // recorded, so its reader is evaluated again once it lands.
+            cache
+                .expr_cache
+                .insert(key, CacheEntry::Cache(LuaType::Unknown));
+            return Ok(LuaType::Unknown);
+        }
         Err(reason) => {
             if is_diagnostics {
                 cache

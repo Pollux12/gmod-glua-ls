@@ -1,6 +1,6 @@
 use glua_parser::{LuaAstPtr, LuaDocOpType};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct LuaSignatureCast {
     pub name: String,
     pub cast: LuaAstPtr<LuaDocOpType>,

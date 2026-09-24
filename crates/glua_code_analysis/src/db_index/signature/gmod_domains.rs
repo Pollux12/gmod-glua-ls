@@ -563,89 +563,57 @@ fn signature_has_valid_guard_attribute(db: &DbIndex, signature_id: LuaSignatureI
     find_signature_attribute_use(db, signature_id, GMOD_ATTR_VALID_GUARD).is_some()
 }
 
-/// Rebuilds the effective valid-guard signature set consumed by hot flow paths.
-///
-/// Source functions can shadow metadata-bearing annotation declarations of the
-/// same global/member identity. Resolve that identity once after declarations
-/// and docs are indexed, before flow/lua analysis, so call narrowing remains an
-/// O(1) signature lookup instead of re-inferring semantic declarations per call.
-///
-/// Incremental: the global-declaration part is recomputed only until it has
-/// been derived once and no removal dirtied it, and the per-file member part
-/// only for files removed since the last rebuild or never derived at all
-/// (added files). Everything else is reused from the stored per-file
-/// contributions, and the effective set is re-derived as their union.
+/// Rebuilds the effective valid-guard signature set consumed by hot flow
+/// paths: the union of every file's contributions.
 pub fn rebuild_effective_valid_guard_signatures(db: &mut DbIndex) {
-    if !db.get_emmyrc().gmod.enabled {
-        let signature_index = db.get_signature_index_mut();
-        signature_index.clear_effective_valid_guard_signatures();
-        signature_index.clear_valid_guard_contributions();
-        return;
-    }
-
-    let dirty_files = db.get_signature_index_mut().take_valid_guard_dirty_files();
-    let global_stale = {
-        let signature_index = db.get_signature_index();
-        signature_index.valid_guard_global_contributions().is_none()
-            || signature_index.valid_guard_global_dirty()
-    };
-
-    // Files drained from the dirty set but gone from the workspace need no
-    // entry: the removal hook already dropped their contributions. Files the
-    // map has never covered are added files, derived here once.
-    let all_file_ids = db.get_vfs().get_all_file_ids();
-    let mut work_files: Vec<FileId> = {
-        let signature_index = db.get_signature_index();
-        let contributions = signature_index.valid_guard_file_contributions();
-        let mut work: Vec<FileId> = dirty_files
-            .into_iter()
-            .filter(|file_id| all_file_ids.contains(file_id))
-            .collect();
-        for file_id in &all_file_ids {
-            if !contributions.contains_key(file_id) && !work.contains(file_id) {
-                work.push(*file_id);
-            }
-        }
-        work
-    };
-    work_files.sort_unstable();
-
-    let global_contributions = global_stale.then(|| valid_guard_global_contributions(db));
-    // The per-file member scan is read-only against `&DbIndex`, so the dirty
-    // and added files derive across files in parallel. Each file's result is
-    // stored under its own id, so scheduling order cannot change the merged
-    // set.
-    let per_file = if work_files.is_empty() {
-        Vec::new()
-    } else {
-        crate::compilation::analyzer::parallel::map_files_collect(db, &work_files, |db, file_id| {
-            (file_id, valid_guard_contributions_for_file(db, file_id))
-        })
-    };
-
+    let enabled = db.get_emmyrc().gmod.enabled;
     let signature_index = db.get_signature_index_mut();
-    if let Some(global) = global_contributions {
-        signature_index.store_valid_guard_global_contributions(global);
-    }
-    for (file_id, contributions) in per_file {
-        signature_index.store_valid_guard_file_contributions(file_id, contributions);
+    if !enabled {
+        signature_index.clear_effective_valid_guard_signatures();
+        return;
     }
     signature_index.rederive_effective_valid_guard_signatures();
 }
 
-/// The global-declaration part of the effective valid-guard derivation: every
-/// global's identity, resolved against the shadowing-aware semantic
-/// declaration.
-fn valid_guard_global_contributions(db: &DbIndex) -> Vec<(LuaSignatureId, GmodStateMask)> {
-    let mut effective_signatures = Vec::new();
+/// One file's valid-guard signatures: its global declarations' and members'
+/// identities, resolved against the shadowing-aware semantic declaration.
+/// Source functions can shadow metadata-bearing annotation declarations of the
+/// same global or member identity, so the identity is resolved once here and
+/// call narrowing stays an O(1) signature lookup.
+pub fn scan_valid_guard_signatures(db: &mut DbIndex, file_id: FileId) {
+    if !db.get_emmyrc().gmod.enabled {
+        return;
+    }
+    let mut found = valid_guard_globals_in_file(db, file_id);
+    found.extend(valid_guard_contributions_for_file(db, file_id));
+    if found.is_empty() {
+        return;
+    }
+    found
+        .sort_by_key(|(signature_id, _)| (signature_id.get_file_id(), signature_id.get_position()));
+    db.get_signature_index_mut()
+        .store_valid_guard_file_contributions(file_id, found);
+}
 
-    for decl_id in db.get_global_index().get_all_global_decl_ids() {
+fn valid_guard_globals_in_file(
+    db: &DbIndex,
+    file_id: FileId,
+) -> Vec<(LuaSignatureId, GmodStateMask)> {
+    let mut effective_signatures = Vec::new();
+    let Some(tree) = db.get_decl_index().get_decl_tree(&file_id) else {
+        return effective_signatures;
+    };
+    let mut decl_ids = tree
+        .get_decls()
+        .values()
+        .filter(|decl| matches!(decl.extra, LuaDeclExtra::Global { .. }))
+        .map(|decl| decl.get_id())
+        .collect::<Vec<_>>();
+    decl_ids.sort_by_key(|decl_id| decl_id.position);
+    for decl_id in decl_ids {
         let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
             continue;
         };
-        if !matches!(decl.extra, LuaDeclExtra::Global { .. }) {
-            continue;
-        }
         let semantic_decl = LuaSemanticDeclId::from(decl_id);
         let Some(signature_id) = signature_id_for_semantic_decl(db, &semantic_decl) else {
             continue;
@@ -660,7 +628,6 @@ fn valid_guard_global_contributions(db: &DbIndex) -> Vec<(LuaSignatureId, GmodSt
             effective_signatures.push((signature_id, state_mask));
         }
     }
-
     effective_signatures
 }
 

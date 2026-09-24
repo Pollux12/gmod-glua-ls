@@ -24,7 +24,7 @@ impl Checker for InferenceTrustChecker {
             .get_type_index()
             .get_inference_events_for_file(context.get_file_id())
             .to_vec();
-        events.extend_from_slice(
+        events.extend(
             semantic_model
                 .get_db()
                 .get_call_site_param_index()

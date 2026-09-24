@@ -296,16 +296,8 @@ fn try_inferred_positive_guard(
         return Ok(None);
     }
 
-    let guard_owner = db
-        .get_signature_index()
-        .inferred_guard_owner(&signature_id)
-        .cloned();
-
     let antecedent_type =
         get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
-    if let Some(owner) = guard_owner {
-        cache.add_inferred_guard_dependency(owner);
-    }
     Ok(Some(narrow_type_guard_true_branch(
         db,
         cache,

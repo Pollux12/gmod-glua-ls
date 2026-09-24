@@ -60,7 +60,6 @@ use crate::{
 use super::{
     InferFailReason, InferResult, infer_expr,
     infer_name::{contains_self_infer, infer_global_type},
-    type_decl_is_vgui_panel,
 };
 
 type TableMemberLookupGuard = FxHashSet<InFiled<TextRange>>;
@@ -187,7 +186,11 @@ pub fn infer_index_expr(
         }
     }
 
-    if prefix_is_unresolved_param {
+    // Analysis reads a fact that has not landed as unknown, and nothing is
+    // known about an unknown value's fields, including their absence.
+    if prefix_is_unresolved_param
+        || (prefix_type.is_unknown() && cache.get_config().analysis_phase.is_force())
+    {
         return Ok(LuaType::Unknown);
     }
 
@@ -688,7 +691,7 @@ fn infer_table_member_owner(
                 Some(index_expr.get_position()),
             )
             .unwrap_or_default()
-            && !matches!(dynamic_field.typ, LuaType::Any | LuaType::Unknown)
+            && !type_is_uninformative(&dynamic_field.typ)
         {
             return Ok(dynamic_field.typ);
         }
@@ -755,7 +758,7 @@ fn infer_table_member_owner(
             Some(index_expr.get_position()),
         )
         .unwrap_or_default()
-            && !matches!(dynamic_field.typ, LuaType::Any | LuaType::Unknown)
+            && !type_is_uninformative(&dynamic_field.typ)
         {
             return Ok(dynamic_field.typ);
         }
@@ -830,7 +833,7 @@ fn infer_table_member_owner(
             )
             .unwrap_or_default()
             {
-                if !matches!(dynamic_field.typ, LuaType::Any | LuaType::Unknown) {
+                if !type_is_uninformative(&dynamic_field.typ) {
                     return Ok(dynamic_field.typ);
                 }
 
@@ -2126,17 +2129,6 @@ fn infer_custom_type_member(
         &key,
         Some(index_expr.get_position()),
     );
-
-    // A panel field written by a dynamic `self.X = ...` is only knowable once the
-    // dynamic-field index seals. Falling through to the fallbacks below would elect a
-    // wrong member (typically a 0-arity signature) and memoise it, so defer instead.
-    if matches!(
-        dynamic_field_result,
-        Err(InferFailReason::UnSealedDynamicFields)
-    ) && type_decl_is_vgui_panel(db, &prefix_type_id, 0)
-    {
-        return Err(InferFailReason::UnSealedDynamicFields);
-    }
 
     // An entry that carries `unknown`/`nil` names a field without saying what it
     // holds, and answering with it ends the lookup: this type's own super walk

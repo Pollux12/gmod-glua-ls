@@ -9,9 +9,8 @@ use smol_str::SmolStr;
 use std::{collections::HashSet, sync::Arc};
 
 use crate::{
-    DbIndex, FileId, FlowId, GmodRealm, InFiled, LuaDeclId, LuaFunctionType, LuaInferredGuardOwner,
-    LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, VarRefId,
-    VarRefRootId,
+    DbIndex, FileId, FlowId, GmodRealm, InFiled, LuaDeclId, LuaFunctionType, LuaMemberId,
+    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, VarRefId, VarRefRootId,
     db_index::{LuaType, LuaTypeDeclId},
     semantic::{
         generic::FuncGenericBinding,
@@ -82,14 +81,6 @@ pub enum CacheEntry<T> {
     /// Cached error result — used during diagnostics to prevent recomputation
     /// of expressions whose type couldn't be resolved.
     Error(InferFailReason),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingStrTplTypeDecl {
-    pub file_id: FileId,
-    pub source_range: TextRange,
-    pub type_decl_id: LuaTypeDeclId,
-    pub super_type: LuaType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,7 +172,6 @@ pub struct LuaInferCache {
     pub expr_var_ref_id_cache: FxHashMap<LuaSyntaxId, VarRefId>,
     pub narrow_by_literal_stop_position_cache: HashSet<LuaSyntaxId>,
     pub scripted_global_singleton_type_cache: Option<FxHashMap<String, LuaTypeDeclId>>,
-    pub pending_str_tpl_type_decls: Vec<PendingStrTplTypeDecl>,
     /// Cache for `self` type per enclosing method (keyed by LuaFuncStat syntax_id).
     /// Avoids repeated ancestor walks and type resolution for each `self` reference
     /// within the same method body.
@@ -269,9 +259,6 @@ pub struct LuaInferCache {
     /// writers the batch had indexed, so a value bound from one is re-derived
     /// once the index settles. See `settled_sibling_merge_read_candidates`.
     pub sibling_merge_reads: u32,
-    inferred_guard_dependencies: FxHashSet<LuaInferredGuardOwner>,
-    inferred_return_reads:
-        FxHashMap<LuaSignatureId, crate::db_index::read_set::InferredReturnReadRecord>,
     /// Member reads that found no member. A read that fails records no type
     /// cache and so no dependency edge, yet the file's answer changes the
     /// moment another file defines the member; these are what the analyzer
@@ -304,7 +291,6 @@ impl LuaInferCache {
             expr_var_ref_id_cache: FxHashMap::default(),
             narrow_by_literal_stop_position_cache: HashSet::default(),
             scripted_global_singleton_type_cache: None,
-            pending_str_tpl_type_decls: Vec::new(),
             self_type_cache: FxHashMap::default(),
             self_base_seed: None,
             decl_cache: FxHashMap::default(),
@@ -324,8 +310,6 @@ impl LuaInferCache {
             signature_is_generic_cache: FxHashMap::default(),
             generic_call_bindings: FxHashMap::default(),
             sibling_merge_reads: 0,
-            inferred_guard_dependencies: FxHashSet::default(),
-            inferred_return_reads: FxHashMap::default(),
             missed_member_reads: FxHashSet::default(),
         }
     }
@@ -393,89 +377,21 @@ impl LuaInferCache {
         }
     }
 
-    pub fn add_pending_str_tpl_type_decl(
-        &mut self,
-        source_range: TextRange,
-        type_decl_id: LuaTypeDeclId,
-        super_type: LuaType,
-    ) {
-        let pending = PendingStrTplTypeDecl {
-            file_id: self.file_id,
-            source_range,
-            type_decl_id,
-            super_type,
-        };
-
-        if !self
-            .pending_str_tpl_type_decls
-            .iter()
-            .any(|exist| exist == &pending)
-        {
-            self.pending_str_tpl_type_decls.push(pending);
-        }
-    }
-
-    pub fn take_pending_str_tpl_type_decls(&mut self) -> Vec<PendingStrTplTypeDecl> {
-        std::mem::take(&mut self.pending_str_tpl_type_decls)
-    }
-
-    pub fn add_inferred_guard_dependency(&mut self, owner: LuaInferredGuardOwner) {
-        self.inferred_guard_dependencies.insert(owner);
-    }
-
-    pub fn take_inferred_guard_dependencies(&mut self) -> FxHashSet<LuaInferredGuardOwner> {
-        std::mem::take(&mut self.inferred_guard_dependencies)
-    }
-
-    pub(crate) fn record_inferred_return_reads(
-        &mut self,
-        signature_id: LuaSignatureId,
-        record: crate::db_index::read_set::InferredReturnReadRecord,
-    ) {
-        self.inferred_return_reads.insert(signature_id, record);
-    }
-
-    pub(crate) fn take_inferred_return_reads(
-        &mut self,
-    ) -> FxHashMap<LuaSignatureId, crate::db_index::read_set::InferredReturnReadRecord> {
-        std::mem::take(&mut self.inferred_return_reads)
-    }
-
     pub fn record_missed_member_read(
         &mut self,
         db: &crate::DbIndex,
         owner: crate::LuaMemberOwner,
         key: LuaMemberKey,
     ) {
-        // Version the miss by what the slot held when read: the member count,
-        // and for a `Name` key the dynamic-field definition count. A slot that
-        // was already non-empty — a realm-incompatible member the reader could
-        // not see, or a key a dynamic field already defines — is a definitive
-        // answer the settled pass reproduces, so it must not report stale every
-        // round; only the slot changing what it holds re-derives the read.
-        let member_count = db
-            .get_member_index()
+        // These reads register the slot and dynamic-field derivation dependencies.
+        db.get_member_index()
             .get_member_count_for_owner_key(&owner, &key);
-        let dynamic_field_count = match &key {
-            LuaMemberKey::Name(name) => crate::dynamic_field_owner_of(db, &owner)
-                .map(|dynamic_owner| {
-                    db.get_dynamic_field_index()
-                        .field_definitions(&dynamic_owner, name.as_str())
-                        .len()
-                })
-                .unwrap_or(0),
-            _ => 0,
-        };
-        crate::db_index::read_set::record_missing_member_slot(
-            &owner,
-            &key,
-            member_count,
-            dynamic_field_count,
-        );
-        // The cross-edit edge is separate from the slot version: the slot
-        // record only reaches the index through the settled-candidate passes,
-        // while a miss anywhere else still has to name this file when the key
-        // later appears.
+        if let LuaMemberKey::Name(name) = &key
+            && let Some(dynamic_owner) = crate::dynamic_field_owner_of(db, &owner)
+        {
+            db.get_dynamic_field_index()
+                .field_definitions(&dynamic_owner, name.as_str());
+        }
         self.missed_member_reads
             .insert((owner.clone(), key.clone()));
     }
@@ -516,7 +432,6 @@ impl LuaInferCache {
         self.expr_var_ref_id_cache.clear();
         self.narrow_by_literal_stop_position_cache.clear();
         self.scripted_global_singleton_type_cache = None;
-        self.pending_str_tpl_type_decls.clear();
         self.self_type_cache.clear();
         self.self_base_seed = None;
         self.decl_cache.clear();
@@ -649,7 +564,6 @@ impl LuaInferCache {
         self.expr_var_ref_id_cache
             .retain(|syntax_id, var_ref_id| var_ref_is_phase_stable(db, syntax_id, var_ref_id));
         self.narrow_by_literal_stop_position_cache.clear();
-        self.pending_str_tpl_type_decls.clear();
         self.self_type_cache.clear();
         self.self_base_seed = None;
         self.decl_cache.clear();

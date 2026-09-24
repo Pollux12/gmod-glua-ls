@@ -14,10 +14,6 @@ mod config;
 mod db_index;
 mod diagnostic;
 mod gamemode_base;
-mod inferred_guard;
-#[cfg(test)]
-pub(crate) use inferred_guard::InferredGuardPropagationStats;
-pub(crate) use inferred_guard::InferredGuardSnapshot;
 mod library_collision;
 pub mod profile;
 pub mod progress;
@@ -32,17 +28,15 @@ pub use db_index::*;
 pub use diagnostic::*;
 pub use gamemode_base::detect_gamemode_base_libraries;
 pub use glua_codestyle::*;
-use glua_parser::{LineIndex, LuaCallExpr, LuaLocalStat, LuaParser, LuaSyntaxTree};
+use glua_parser::{LineIndex, LuaCallExpr, LuaSyntaxTree};
 pub use library_collision::LibraryDefinitionCollision;
 use lsp_types::Uri;
 pub use profile::Profile;
 use resources::load_resource_std;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use schema_to_glua::SchemaConverter;
 pub use semantic::*;
-use smol_str::SmolStr;
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::path::{Component, Path};
 use std::str::FromStr;
 use std::{path::PathBuf, sync::Arc};
@@ -186,405 +180,6 @@ pub(crate) fn dependency_site_path_keys(
     keys
 }
 
-fn select_cross_file_stabilization_dependents(
-    all_dependents: impl IntoIterator<Item = FileId>,
-    changed: &FxHashSet<FileId>,
-) -> Vec<FileId> {
-    let mut dependents = all_dependents
-        .into_iter()
-        .filter(|file_id| !changed.contains(file_id))
-        .collect::<Vec<_>>();
-    dependents.sort_unstable();
-    dependents.dedup();
-    dependents
-}
-
-/// Pre-edit names for one changed file, so a removed export still contributes
-/// the name another file would use to name it.
-///
-/// Empirically, a removed [`LuaMemberId`]/[`LuaDeclId`] no longer resolves in
-/// the post-edit index (`get_member`/`get_decl` return `None` once
-/// `remove_index` has run). The snapshot therefore covers every member (owner
-/// always, key name when the key is a [`LuaMemberKey::Name`]) and every decl
-/// (name + locality): a non-name member such as an integer-indexed slot still
-/// names its owner, and [`LuaTypeDeclId`] carries its name inside the
-/// [`ExportKey`] itself and needs no snapshot.
-struct PreEditNameSnapshot {
-    members: FxHashMap<LuaMemberId, (Option<SmolStr>, Option<LuaMemberOwner>)>,
-    decls: FxHashMap<LuaDeclId, (SmolStr, bool)>,
-}
-
-fn snapshot_pre_edit_names(db: &DbIndex, file_id: FileId) -> PreEditNameSnapshot {
-    let mut members = FxHashMap::default();
-    let mut decls = FxHashMap::default();
-    for member in db.get_member_index().get_file_members(file_id) {
-        let name = match member.get_key() {
-            LuaMemberKey::Name(name) => Some(name.clone()),
-            LuaMemberKey::Integer(_) | LuaMemberKey::None | LuaMemberKey::ExprType(_) => None,
-        };
-        let owner = db
-            .get_member_index()
-            .get_member_owner(&member.get_id())
-            .cloned();
-        members.insert(member.get_id(), (name, owner));
-    }
-    if let Some(tree) = db.get_decl_index().get_decl_tree(&file_id) {
-        for (decl_id, decl) in tree.get_decls() {
-            let is_local = decl.is_local();
-            decls.insert(*decl_id, (SmolStr::new(decl.get_name()), is_local));
-        }
-    }
-    PreEditNameSnapshot { members, decls }
-}
-
-fn insert_global_path_parts(out: &mut FxHashSet<SmolStr>, path: &str) {
-    for part in path.split('.') {
-        if !part.is_empty() {
-            out.insert(SmolStr::new(part));
-        }
-    }
-}
-
-fn insert_type_name(out: &mut FxHashSet<SmolStr>, type_id: &LuaTypeDeclId) {
-    out.insert(SmolStr::new(type_id.get_name()));
-    let simple = type_id.get_simple_name();
-    if simple != type_id.get_name() {
-        out.insert(SmolStr::new(simple));
-    }
-}
-
-fn insert_member_owner_names(out: &mut FxHashSet<SmolStr>, owner: &LuaMemberOwner) {
-    match owner {
-        LuaMemberOwner::GlobalPath(path) => insert_global_path_parts(out, path.get_name()),
-        LuaMemberOwner::Type(type_id) => insert_type_name(out, type_id),
-        LuaMemberOwner::Element(_) | LuaMemberOwner::LocalUnresolve => {}
-    }
-}
-
-fn insert_member_id_names(
-    db: &DbIndex,
-    out: &mut FxHashSet<SmolStr>,
-    member_id: &LuaMemberId,
-    pre: Option<&PreEditNameSnapshot>,
-) {
-    // Emit both sides: a rename reuses the same position, so the post-edit
-    // entry exists but names the new key while the pre-edit snapshot still
-    // holds the old one. A removal only has the pre side; an addition only
-    // the post side. Either side also emits its owner's names, so a non-name
-    // member (integer slot, dynamic key) still names the global path or type
-    // another file uses to reach it.
-    if let Some(member) = db.get_member_index().get_member(member_id) {
-        if let LuaMemberKey::Name(name) = member.get_key() {
-            out.insert(name.clone());
-        }
-        if let Some(owner) = db.get_member_index().get_member_owner(member_id) {
-            insert_member_owner_names(out, owner);
-        }
-    }
-    // Removed — or renamed away from this key — the post-edit index no longer
-    // holds the old name (`get_member` returns `None` after `remove_index`,
-    // verified empirically), so the pre-edit snapshot supplies it.
-    if let Some((name, owner)) = pre.and_then(|pre| pre.members.get(member_id)) {
-        if let Some(name) = name {
-            out.insert(name.clone());
-        }
-        if let Some(owner) = owner {
-            insert_member_owner_names(out, owner);
-        }
-    }
-}
-
-fn insert_decl_id_names(
-    db: &DbIndex,
-    out: &mut FxHashSet<SmolStr>,
-    decl_id: &LuaDeclId,
-    pre: Option<&PreEditNameSnapshot>,
-) {
-    if let Some(decl) = db.get_decl_index().get_decl(decl_id) {
-        if !decl.is_local() {
-            out.insert(SmolStr::new(decl.get_name()));
-        }
-    }
-    if let Some((name, is_local)) = pre.and_then(|pre| pre.decls.get(decl_id)) {
-        if !is_local {
-            out.insert(name.clone());
-        }
-    }
-}
-
-/// Names of the exported owner a changed signature belongs to.
-///
-/// A [`LuaSignatureId`] names no Lua name itself; its owner does. The owner
-/// lives in the signature's own file (`signature_id.get_file_id()`), which for
-/// a [`ExportKey::ContributedParam`] is the callee's file rather than the
-/// contributor's. Two legs cover the two shapes that export a function:
-/// - a function stat (`function M.Fn() end`, `function G() end`) shares its
-///   property with the signature, so the property index maps the member or
-///   decl owner back to it;
-/// - an assignment (`M.Fn = function() end`) stores the signature in the
-///   member's or global's type cache, so scanning the file's type caches for
-///   the signature finds it.
-///
-/// Only exported owners count (non-local decls, members): an anonymous or
-/// purely local closure contributes nothing, which is what keeps a local-only
-/// signature change from widening diagnostics across the workspace.
-fn insert_signature_owner_names(
-    db: &DbIndex,
-    out: &mut FxHashSet<SmolStr>,
-    signature_id: &LuaSignatureId,
-    pre: &FxHashMap<FileId, PreEditNameSnapshot>,
-) {
-    let owner_file = signature_id.get_file_id();
-    let file_pre = pre.get(&owner_file);
-    let property_index = db.get_property_index();
-    for (owner_id, _) in property_index.properties_in_file(owner_file) {
-        if property_index.get_signature_owner(owner_id) != Some(*signature_id) {
-            continue;
-        }
-        match owner_id {
-            LuaSemanticDeclId::TypeDecl(type_id) => {
-                insert_type_name(out, type_id);
-            }
-            LuaSemanticDeclId::Member(member_id) => {
-                insert_member_id_names(db, out, member_id, file_pre);
-            }
-            LuaSemanticDeclId::LuaDecl(decl_id) => {
-                insert_decl_id_names(db, out, decl_id, file_pre);
-            }
-            LuaSemanticDeclId::Signature(_) => {}
-        }
-    }
-    let Some(owners) = db.get_type_index().file_type_owners(owner_file) else {
-        return;
-    };
-    for owner in owners {
-        let exported = match owner {
-            LuaTypeOwner::Decl(decl_id) => db
-                .get_decl_index()
-                .get_decl(decl_id)
-                .is_some_and(|decl| !decl.is_local()),
-            LuaTypeOwner::Member(_) => true,
-            LuaTypeOwner::SyntaxId(_) => false,
-        };
-        if !exported {
-            continue;
-        }
-        let Some(cache) = db.get_type_index().get_type_cache(owner) else {
-            continue;
-        };
-        let mut found = false;
-        TypeVisitTrait::visit_type(cache.as_type(), &mut |inner| {
-            if let LuaType::Signature(id) = inner
-                && id == signature_id
-            {
-                found = true;
-            }
-        });
-        if !found {
-            continue;
-        }
-        match owner {
-            LuaTypeOwner::Decl(decl_id) => {
-                insert_decl_id_names(db, out, decl_id, file_pre);
-            }
-            LuaTypeOwner::Member(member_id) => {
-                insert_member_id_names(db, out, member_id, file_pre);
-            }
-            LuaTypeOwner::SyntaxId(_) => {}
-        }
-    }
-}
-
-/// Old and new names of non-local declarations the edit renamed without
-/// moving any export.
-///
-/// A same-position rename (`function Old() end` to `function New() end`) keeps
-/// every position-derived [`ExportKey`] identical, so the export diff is empty
-/// and this check runs independently of it, before the empty-diff early exit.
-/// Pre-edit positions are mapped through the edit's [`PositionMap`]: a pre
-/// decl whose image holds a post decl under a different name contributes both
-/// names; pre decls lost inside the hunk paired with otherwise-unmatched post
-/// decls are an in-hunk rename and contribute both sides as well. One-sided
-/// leftovers are a pure addition or removal, which the export diff already
-/// covers, and are skipped. Diagnostic-only: the names never enter
-/// `dirty.files`.
-fn decl_rename_refresh_names(
-    db: &DbIndex,
-    file_id: FileId,
-    map: &PositionMap,
-    pre: Option<&PreEditNameSnapshot>,
-) -> FxHashSet<SmolStr> {
-    let mut names = FxHashSet::default();
-    let Some(pre) = pre else {
-        return names;
-    };
-    let Some(tree) = db.get_decl_index().get_decl_tree(&file_id) else {
-        return names;
-    };
-    let mut unmatched_post: FxHashMap<rowan::TextSize, SmolStr> = FxHashMap::default();
-    for (decl_id, decl) in tree.get_decls() {
-        if decl_id.file_id != file_id || decl.is_local() {
-            continue;
-        }
-        unmatched_post.insert(decl_id.position, SmolStr::new(decl.get_name()));
-    }
-    let mut unmatched_pre: Vec<SmolStr> = Vec::new();
-    for (decl_id, (name, is_local)) in &pre.decls {
-        if *is_local || decl_id.file_id != file_id {
-            continue;
-        }
-        let Some(mapped) = map.map(decl_id.position) else {
-            // Inside the hunk: a rename candidate, or a deletion the diff
-            // covers when no post side is left unmatched.
-            unmatched_pre.push(name.clone());
-            continue;
-        };
-        // A mapped position with no post decl means the declaration is gone;
-        // the export diff reports that as removed keys, so nothing is added.
-        if let Some(post_name) = unmatched_post.remove(&mapped)
-            && post_name != *name
-        {
-            names.insert(name.clone());
-            names.insert(post_name);
-        }
-    }
-    if !unmatched_pre.is_empty() && !unmatched_post.is_empty() {
-        names.extend(unmatched_pre);
-        names.extend(unmatched_post.into_values());
-    }
-    names
-}
-
-/// Names from one export diff that another file could reference textually.
-///
-/// Covers every [`ExportKey`] variant that names a Lua name:
-/// - `Member` / `TypeCache(Member)` / `Realm(Member)` / `Property(Member)`:
-///   the member key plus its owner's global-path segments or type name, on
-///   both the pre and the post side.
-/// - `TypeDecl` / `Operator(Type)` / `Property(TypeDecl)`: the type name.
-/// - `TypeCache(Decl)` / `Realm(Decl)` / `Property(Decl)`: the decl name.
-/// - `Signature` / `ContributedParam` / `Property(Signature)`: the changed
-///   signature's actual exported owner, resolved in the signature's own file
-///   (for a contributed param that is the callee's file, so the contributor's
-///   names stay out). An anonymous signature contributes nothing.
-/// - `InferredGuard(GlobalPath)`: its path segments directly; a guard that
-///   narrows differently without moving paths names nothing further.
-/// - `NetFlow` (a string-literal message name), `Metatable` (a literal range),
-///   `Operator(Table)` and `TypeCache(SyntaxId)` name no Lua reference and are
-///   skipped; file-level `ModuleExport`/`LoadEdges`/`Namespace`/
-///   `FileRealmMetadata` already expand through file dependencies.
-fn export_diff_changed_names(
-    db: &DbIndex,
-    file_id: FileId,
-    diff: &ChangedExports,
-    pre: &FxHashMap<FileId, PreEditNameSnapshot>,
-) -> FxHashSet<SmolStr> {
-    let mut names = FxHashSet::default();
-    let file_pre = pre.get(&file_id);
-    for key in diff.keys() {
-        match key {
-            ExportKey::Member(member_id, _) => {
-                insert_member_id_names(db, &mut names, member_id, file_pre);
-            }
-            ExportKey::TypeMemberList(type_id) => {
-                insert_type_name(&mut names, type_id);
-            }
-            ExportKey::TypeDecl(type_id) => {
-                insert_type_name(&mut names, type_id);
-            }
-            ExportKey::TypeCache(owner) => match owner {
-                LuaTypeOwner::Member(member_id) => {
-                    insert_member_id_names(db, &mut names, member_id, file_pre);
-                }
-                LuaTypeOwner::Decl(decl_id) => {
-                    insert_decl_id_names(db, &mut names, decl_id, file_pre);
-                }
-                LuaTypeOwner::SyntaxId(_) => {}
-            },
-            ExportKey::Signature(signature_id) => {
-                insert_signature_owner_names(db, &mut names, signature_id, pre);
-            }
-            ExportKey::ContributedParam(signature_id, _) => {
-                insert_signature_owner_names(db, &mut names, signature_id, pre);
-            }
-            ExportKey::CallSiteLink(signature_id) => {
-                insert_signature_owner_names(db, &mut names, signature_id, pre);
-            }
-            ExportKey::InferredGuard(owner) => {
-                for part in owner.path() {
-                    if !part.is_empty() {
-                        names.insert(part.clone());
-                    }
-                }
-            }
-            ExportKey::Property(semantic_id) => match semantic_id {
-                LuaSemanticDeclId::TypeDecl(type_id) => {
-                    insert_type_name(&mut names, type_id);
-                }
-                LuaSemanticDeclId::Member(member_id) => {
-                    insert_member_id_names(db, &mut names, member_id, file_pre);
-                }
-                LuaSemanticDeclId::LuaDecl(decl_id) => {
-                    insert_decl_id_names(db, &mut names, decl_id, file_pre);
-                }
-                LuaSemanticDeclId::Signature(signature_id) => {
-                    insert_signature_owner_names(db, &mut names, signature_id, pre);
-                }
-            },
-            ExportKey::Operator(owner, _) => match owner {
-                LuaOperatorOwner::Table(_) => {}
-                LuaOperatorOwner::Type(type_id) => {
-                    insert_type_name(&mut names, type_id);
-                }
-            },
-            ExportKey::NetFlow(_, _) | ExportKey::Metatable(_) => {}
-            ExportKey::Realm(subject) => match subject {
-                RealmSubject::Decl(decl_id) => {
-                    insert_decl_id_names(db, &mut names, decl_id, file_pre);
-                }
-                RealmSubject::Member(member_id) => {
-                    insert_member_id_names(db, &mut names, member_id, file_pre);
-                }
-            },
-            ExportKey::FileRealmMetadata
-            | ExportKey::ModuleExport
-            | ExportKey::LoadEdges
-            | ExportKey::Namespace => {}
-        }
-    }
-    names
-}
-
-fn dependency_path_keys_for_target(db: &DbIndex, target_path: &Path) -> Vec<String> {
-    let mut keys = FxHashSet::default();
-    let Some(target_path_text) = target_path.to_str() else {
-        return Vec::new();
-    };
-
-    let normalized_target_path = normalize_file_path(target_path);
-    insert_dependency_path_key_variants(&mut keys, normalized_target_path.clone());
-
-    if let Some(lua_idx) = normalized_target_path.find("/lua/") {
-        let lua_relative = normalized_target_path[(lua_idx + 1)..].to_string();
-        insert_dependency_path_key_variants(&mut keys, lua_relative.clone());
-        insert_dependency_path_key_variants(&mut keys, lua_relative.replace('/', "."));
-        if let Some(without_lua) = lua_relative.strip_prefix("lua/") {
-            insert_dependency_path_key_variants(&mut keys, without_lua.to_string());
-            insert_dependency_path_key_variants(&mut keys, without_lua.replace('/', "."));
-        }
-    }
-
-    if let Some((module_path, _)) = db.get_module_index().extract_module_path(target_path_text) {
-        let module_path = normalize_dependency_path(&module_path.replace('\\', "/"));
-        insert_dependency_path_key_variants(&mut keys, module_path.replace('.', "/"));
-        insert_dependency_path_key_variants(&mut keys, module_path);
-    }
-
-    let mut keys = keys.into_iter().collect::<Vec<_>>();
-    keys.sort_unstable();
-    keys
-}
-
 fn insert_dependency_path_key_variants(keys: &mut FxHashSet<String>, path: String) {
     let normalized = normalize_dependency_path(&path);
     if normalized.is_empty() {
@@ -641,327 +236,11 @@ fn lexically_normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
-/// The name-level facts a batch re-index can add, snapshotted before
-/// `remove_index` so additions are detectable afterwards.
-///
-/// Position-keyed export keys cannot be diffed here — the batch entry points
-/// never take a [`PositionMap`], so an old [`ExportMap`] has no coordinates to
-/// be expressed in. An addition does not need them: it is identifiable by
-/// name alone, and it is the only change whose readers recorded no dependency
-/// edge — a read that missed a slot, a name, or a type cached nothing to
-/// follow. Changed and removed exports already reach their readers through
-/// the edges the earlier index recorded.
-#[derive(Default)]
-struct BatchPreAdditions {
-    /// Member slots this file contributed to, with how many members each
-    /// slot held in total: a slot whose membership moved is an addition or
-    /// removal its missed readers must see.
-    member_slots: FxHashMap<(LuaMemberOwner, LuaMemberKey), usize>,
-    /// Names of the file's non-local declarations.
-    decl_names: FxHashSet<SmolStr>,
-    /// Type declarations this file defined.
-    type_decl_ids: FxHashSet<LuaTypeDeclId>,
-}
-
-fn snapshot_batch_pre_additions(db: &DbIndex, file_id: FileId) -> BatchPreAdditions {
-    let member_index = db.get_member_index();
-    let mut member_slots: FxHashMap<(LuaMemberOwner, LuaMemberKey), usize> = FxHashMap::default();
-    for member in member_index.get_file_members(file_id) {
-        if let Some(owner) = member_index.get_member_owner(&member.get_id()) {
-            member_slots
-                .entry((owner.clone(), member.get_key().clone()))
-                .or_insert_with(|| {
-                    member_index.visible_member_count_for_owner_key(owner, member.get_key())
-                });
-        }
-    }
-    let mut decl_names = FxHashSet::default();
-    if let Some(tree) = db.get_decl_index().get_decl_tree(&file_id) {
-        for decl in tree.get_decls().values() {
-            if !decl.is_local() {
-                decl_names.insert(SmolStr::new(decl.get_name()));
-            }
-        }
-    }
-    let type_decl_ids = db
-        .get_type_index()
-        .get_file_type_decl_ids(file_id)
-        .map(|ids| ids.iter().cloned().collect())
-        .unwrap_or_default();
-    BatchPreAdditions {
-        member_slots,
-        decl_names,
-        type_decl_ids,
-    }
-}
-
-/// The files whose reads of `file_id`'s additions missed before this batch
-/// re-indexed it.
-///
-/// `pre` is `None` for a file that appeared — never seen, or reopened past a
-/// tombstone — where every export is an addition and the full export diff
-/// applies; `Some` for a re-indexed file, where only the name-level delta is
-/// trustworthy without a position map. Three reader classes leave no edge a
-/// dependency expansion could follow:
-/// - missed member slots, through `missed_member_readers`;
-/// - textual name references (a bare global read that found nothing files a
-///   `global_references` entry and nothing else), through
-///   `files_referencing_name`;
-/// - unresolved doc-type names, filed under the would-be global type id,
-///   through `get_type_references`.
-///
-/// Unresolved include/require readers are deliberately absent: the batch
-/// expansion already reaches them through `unresolved_path_dependents`.
-fn batch_addition_readers(
-    db: &DbIndex,
-    file_id: FileId,
-    pre: Option<&BatchPreAdditions>,
-) -> FxHashSet<FileId> {
-    let member_index = db.get_member_index();
-    let reference_index = db.get_reference_index();
-    let mut readers = FxHashSet::default();
-    let mut names = FxHashSet::default();
-
-    for member in member_index.get_file_members(file_id) {
-        let Some(owner) = member_index.get_member_owner(&member.get_id()) else {
-            continue;
-        };
-        let slot = (owner.clone(), member.get_key().clone());
-        let before = pre
-            .and_then(|pre| pre.member_slots.get(&slot))
-            .copied()
-            .unwrap_or(0);
-        let now = member_index.visible_member_count_for_owner_key(owner, member.get_key());
-        if now == before {
-            continue;
-        }
-        readers.extend(member_index.missed_member_readers(owner, member.get_key()));
-        if let LuaMemberKey::Name(name) = member.get_key() {
-            names.insert(name.clone());
-        }
-    }
-
-    if let Some(tree) = db.get_decl_index().get_decl_tree(&file_id) {
-        for decl in tree.get_decls().values() {
-            if decl.is_local() {
-                continue;
-            }
-            let name = SmolStr::new(decl.get_name());
-            if pre.is_none_or(|pre| !pre.decl_names.contains(&name)) {
-                names.insert(name);
-            }
-        }
-    }
-
-    if let Some(type_ids) = db.get_type_index().get_file_type_decl_ids(file_id) {
-        for type_id in type_ids {
-            if pre.is_some_and(|pre| pre.type_decl_ids.contains(type_id)) {
-                continue;
-            }
-            for referenced in reference_index
-                .get_type_references(type_id)
-                .unwrap_or_default()
-            {
-                readers.insert(referenced.file_id);
-            }
-            // A doc name that resolved to nothing was filed under the
-            // would-be global id, which a namespaced declaration does not
-            // carry.
-            let global_id = LuaTypeDeclId::global(type_id.get_simple_name());
-            if global_id != *type_id {
-                for referenced in reference_index
-                    .get_type_references(&global_id)
-                    .unwrap_or_default()
-                {
-                    readers.insert(referenced.file_id);
-                }
-            }
-        }
-    }
-
-    for name in names {
-        readers.extend(reference_index.files_referencing_name(&name));
-    }
-    readers.remove(&file_id);
-    readers
-}
-
 #[derive(Debug)]
 pub struct EmmyLuaAnalysis {
     pub compilation: LuaCompilation,
     pub diagnostic: LuaDiagnostic,
     pub emmyrc: Arc<Emmyrc>,
-    #[cfg(test)]
-    pub(crate) inferred_guard_propagation_stats: InferredGuardPropagationStats,
-    /// The text each file's current index entries were built from, stashed by
-    /// the first write that does not re-index.
-    ///
-    /// Absent means the file's VFS content is still the text the index was
-    /// built from. The oldest stash is the one that matches the index, so a
-    /// burst of writes before an index costs one diff, not one per write.
-    pending_indexed_text: rustc_hash::FxHashMap<FileId, Arc<str>>,
-}
-
-/// The files an edit left needing re-analysis, and what the ripple has to know
-/// about the edit that produced them.
-#[derive(Debug, Default)]
-pub struct DirtySet {
-    files: FxHashSet<FileId>,
-    /// The files whose text this burst changed. Drives removal seeds, guard
-    /// propagation sources and `refresh_file_source_dependencies`.
-    sources: FxHashSet<FileId>,
-    removed: FxHashSet<FileId>,
-    guard_snapshot: InferredGuardSnapshot,
-    /// Whether guard facts or call-site-inferred params could have moved.
-    ///
-    /// Their consumers are reached through the propagation passes rather than
-    /// through the export graph, so a set with no dirty files can still owe
-    /// work.
-    guard_work: bool,
-    /// The edited files whose exports actually moved.
-    #[cfg(test)]
-    changed_sources: FxHashSet<FileId>,
-    /// Names whose textual referencers owe a diagnostic refresh.
-    ///
-    /// Two independent channels share this path downstream but are emitted and
-    /// filtered separately:
-    /// - `export_refresh_names`: from the batch's export diff in
-    ///   [`EmmyLuaAnalysis::self_index_and_diff`]. Each changed/added/removed
-    ///   [`ExportKey`] contributes the Lua name(s) another file would use to
-    ///   name it, resolved against the post-edit index with a pre-edit snapshot
-    ///   as fallback for removed keys (whose index entries are already gone).
-    ///   Some of these are deliberately callee-anchored: a
-    ///   [`ExportKey::ContributedParam`] resolves its owner in the *callee's*
-    ///   file, which the ripple may not have re-analysed when the name is
-    ///   emitted.
-    ///   These names are always legitimate and pass through untouched.
-    /// - `decl_rename_refresh_names`: from `decl_rename_refresh_names` in
-    ///   [`EmmyLuaAnalysis::self_index_and_diff`] and from the ripple's
-    ///   renamed-without-export moves. Anchored in the edited file's own
-    ///   declarations, these are the channel transient keystrokes pollute (a
-    ///   bare `p` parsed as a global decl at a fixed position, renamed to
-    ///   `pr`, `pri`, ... on each keystroke), so only this channel is
-    ///   validated before it fans out. The ripple's own export diffs contribute
-    ///   to both channels through `ripple_with_refresh_names`, merged with
-    ///   these after the ripple. Neither channel drives reindexing: they stay
-    ///   out of `pending` and `dirty.files` and only widen the watched-file
-    ///   method's returned diagnostic list. They are deliberately ignored by
-    ///   [`DirtySet::is_empty`] and [`DirtySet::dirty_len`].
-    export_refresh_names: FxHashSet<SmolStr>,
-    decl_rename_refresh_names: FxHashSet<SmolStr>,
-    /// Diagnostic provenance for the dirty set, populated in
-    /// [`EmmyLuaAnalysis::self_index_and_diff`]: the files `remap_into_file`
-    /// reported as unrewritable (`remap_losses`) vs the files the export diff
-    /// named (`diff_dependents`, including evidence and unresolved-path
-    /// dependents). Never read by the ripple and excluded from
-    /// [`DirtySet::dirty_len`] and [`DirtySet::is_empty`] like the refresh
-    /// sidebands; exists so the determinism harness can assert the remap path
-    /// lost nothing and attribute every dirty file to a named source.
-    remap_losses: FxHashSet<FileId>,
-    diff_dependents: FxHashSet<FileId>,
-}
-
-impl DirtySet {
-    /// Whether the ripple has nothing to do. The edited files themselves are
-    /// already settled by phase 1.
-    pub fn is_empty(&self) -> bool {
-        self.files.is_empty() && self.removed.is_empty() && !self.guard_work
-    }
-
-    /// Unions another phase-1 result into this one, keeping the oldest guard
-    /// facts: a later batch sees facts an earlier self-index already overwrote.
-    pub fn extend(&mut self, other: DirtySet) {
-        self.files.extend(other.files);
-        self.sources.extend(other.sources);
-        self.removed.extend(other.removed);
-        self.guard_work |= other.guard_work;
-        self.export_refresh_names.extend(other.export_refresh_names);
-        self.decl_rename_refresh_names
-            .extend(other.decl_rename_refresh_names);
-        self.remap_losses.extend(other.remap_losses);
-        self.diff_dependents.extend(other.diff_dependents);
-        #[cfg(test)]
-        self.changed_sources.extend(other.changed_sources);
-        self.guard_snapshot.merge(other.guard_snapshot);
-    }
-
-    /// How many files the ripple still owes.
-    ///
-    /// Textual refresh names never count: they owe diagnostics, not reanalysis.
-    /// Diagnostic provenance (`remap_losses`, `diff_dependents`) never counts
-    /// either: the ripple never reads it.
-    pub fn dirty_len(&self) -> usize {
-        self.files.len()
-    }
-
-    #[cfg(test)]
-    pub fn files(&self) -> &FxHashSet<FileId> {
-        &self.files
-    }
-
-    /// The files the ripple still owes. Read-only diagnostic access for the
-    /// determinism harness's accounting-completeness check; the ripple consumes
-    /// `dirty.files` by taking the set, never through this.
-    pub fn dirty_files(&self) -> &FxHashSet<FileId> {
-        &self.files
-    }
-
-    /// The files `remap_into_file` reported as unrewritable for this batch.
-    /// Read-only diagnostic provenance for the determinism harness: the ripple
-    /// never reads it, and it counts toward nothing.
-    pub fn remap_losses(&self) -> &FxHashSet<FileId> {
-        &self.remap_losses
-    }
-
-    /// The files the export diff named for this batch (diff dependents plus
-    /// evidence and unresolved-path dependents). Same read-only status as
-    /// [`DirtySet::remap_losses`].
-    pub fn diff_dependents(&self) -> &FxHashSet<FileId> {
-        &self.diff_dependents
-    }
-
-    #[cfg(test)]
-    pub fn changed_sources(&self) -> &FxHashSet<FileId> {
-        &self.changed_sources
-    }
-
-    /// The union of both sideband channels, for callers that resolve without
-    /// validating (watched-file widening, nested late-param merge).
-    pub fn textual_refresh_names(&self) -> FxHashSet<SmolStr> {
-        let mut names = self.export_refresh_names.clone();
-        names.extend(self.decl_rename_refresh_names.iter().cloned());
-        names
-    }
-
-    /// Takes the sideband textual refresh names out of the set, so a caller
-    /// can schedule their diagnostics without holding on to the ripple's
-    /// re-index work.
-    pub fn take_textual_refresh_names(&mut self) -> std::collections::HashSet<SmolStr> {
-        let mut names = std::mem::take(&mut self.export_refresh_names);
-        names.extend(std::mem::take(&mut self.decl_rename_refresh_names));
-        names.into_iter().collect()
-    }
-
-    /// Takes only the export-diff channel, leaving rename-channel names in
-    /// place for burst-boundary validation.
-    pub fn take_export_refresh_names(&mut self) -> std::collections::HashSet<SmolStr> {
-        std::mem::take(&mut self.export_refresh_names)
-            .into_iter()
-            .collect()
-    }
-
-    /// Takes only the rename-channel names, leaving export-diff names in
-    /// place.
-    pub fn take_decl_rename_refresh_names(&mut self) -> std::collections::HashSet<SmolStr> {
-        std::mem::take(&mut self.decl_rename_refresh_names)
-            .into_iter()
-            .collect()
-    }
-
-    /// How many sideband textual refresh names the set carries.
-    pub fn textual_refresh_names_len(&self) -> usize {
-        self.export_refresh_names.len() + self.decl_rename_refresh_names.len()
-    }
 }
 
 impl EmmyLuaAnalysis {
@@ -971,9 +250,6 @@ impl EmmyLuaAnalysis {
             compilation: LuaCompilation::new(emmyrc.clone()),
             diagnostic: LuaDiagnostic::new(),
             emmyrc,
-            #[cfg(test)]
-            inferred_guard_propagation_stats: InferredGuardPropagationStats::default(),
-            pending_indexed_text: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -985,9 +261,6 @@ impl EmmyLuaAnalysis {
             compilation: self.compilation.fork(),
             diagnostic: self.diagnostic.clone(),
             emmyrc: self.emmyrc.clone(),
-            #[cfg(test)]
-            inferred_guard_propagation_stats: self.inferred_guard_propagation_stats,
-            pending_indexed_text: self.pending_indexed_text.clone(),
         }
     }
 
@@ -1049,113 +322,34 @@ impl EmmyLuaAnalysis {
         module_index.add_workspace_root_with_kind(root, id, WorkspaceKind::Library);
     }
 
+    /// Sets `uri`'s text (`None` removes it) and re-analyses. Returns the file
+    /// and every live file whose diagnostics may have changed.
     pub fn update_file_by_uri(
         &mut self,
         uri: &Uri,
         text: Option<String>,
     ) -> Option<(FileId, Vec<FileId>)> {
-        let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(uri);
-        if let Some(file_id) = existing_file_id {
-            if let (Some(new_text), Some(old_text)) = (
-                text.as_deref(),
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_file_content(&file_id)
-                    .map(String::as_str),
-            ) && old_text == new_text
-            {
-                // Text unchanged — if the index is already built (has module info),
-                // skip the costly remove+re-add cycle. This avoids unnecessary
-                // reindexing when VS Code opens already-loaded files for
-                // peek/definition (e.g. annotation/library files).
-                if self
-                    .compilation
-                    .get_db()
-                    .get_module_index()
-                    .get_module(file_id)
-                    .is_some()
-                {
-                    return Some((file_id, Vec::new()));
-                }
-
-                // Index was cleared — fall through to rebuild it.
-                self.compilation.remove_index(vec![file_id]);
-                self.compilation.update_index(vec![file_id]);
-                return Some((file_id, Vec::new()));
-            }
-        } else if text.is_none() {
+        let existing = self.compilation.get_db().get_vfs().get_file_id(uri);
+        if existing.is_none() && text.is_none() {
             return None;
         }
-
-        // An edit whose significant token stream is unchanged — same kinds,
-        // same offsets, same texts, comments included — cannot change any
-        // derived fact, so re-indexing it (and its whole dependency
-        // expansion) would only re-derive facts the index already holds.
-        // Store the text and stop.
-        if let (Some(file_id), Some(new_text)) = (existing_file_id, text.as_deref())
-            && self
-                .compilation
-                .get_db()
-                .get_module_index()
-                .get_module(file_id)
-                .is_some()
-            && self
-                .compilation
-                .get_db_mut()
-                .get_vfs_mut()
-                .content_semantically_matches(file_id, new_text)
+        if let Some(file_id) = existing
+            && self.text_is_indexed(file_id, text.as_deref())
         {
-            self.compilation
-                .get_db_mut()
-                .get_vfs_mut()
-                .set_file_content(uri, text);
             return Some((file_id, Vec::new()));
-        }
-
-        // Two-phase incremental edit. Phase 1 re-indexes the edited file and
-        // re-homes every reference into it, so what the diff of its exports
-        // names is exactly the facts another file could be reading. Phase 2
-        // re-analyses those readers, and nothing else: a body-local edit
-        // produces no key at all and costs one file's analysis.
-        // A file that was not there - never seen, or deleted and now
-        // reopened - is not reachable from any dependency edge: a read that
-        // failed to resolve it recorded nothing to find it by.
-        let was_absent = existing_file_id.is_none_or(|file_id| {
-            self.compilation
-                .get_db()
-                .get_vfs()
-                .get_syntax_tree(&file_id)
-                .is_none()
-        });
-        let is_removed = text.is_none();
-        if let Some(existing) = existing_file_id {
-            // Before the mutation: this is the text the index was built from.
-            // For a deletion it is also what says every old offset is gone.
-            self.stash_indexed_text(existing);
         }
         let file_id = self
             .compilation
             .get_db_mut()
             .get_vfs_mut()
             .set_file_content(uri, text);
-
-        let mut dirty = profile::phase("edit/self-index", || {
-            self.self_index_and_diff(vec![file_id])
-        });
-        if was_absent || is_removed {
-            self.dirty_existence_dependents(&mut dirty, file_id);
-        }
-        // Phase 2 plus the textual widening: the caller gets every file whose
-        // diagnostics this edit may have moved, not only the edited file.
-        let widened = profile::phase("edit/ripple", || {
-            self.ripple_and_widen(dirty, vec![file_id])
-        });
-        profile::phase_report("update_file_by_uri");
-
-        Some((file_id, widened))
+        let affected = self.reindex_files(vec![file_id]);
+        Some((file_id, affected))
     }
 
+    /// [`update_file_by_uri`](Self::update_file_by_uri) with a tree parsed
+    /// off the analysis lock. A stale `version` is ignored; `trigger_reindex`
+    /// false only stores the text.
     pub fn update_file_preparsed(
         &mut self,
         uri: Uri,
@@ -1165,52 +359,12 @@ impl EmmyLuaAnalysis {
         version: Option<i32>,
         trigger_reindex: bool,
     ) -> Option<(FileId, Vec<FileId>)> {
-        let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(&uri);
-        if let Some(file_id) = existing_file_id {
-            if let (Some(incoming_version), Some(current_version)) = (
-                version,
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_file_version(&file_id),
-            ) && incoming_version < current_version
-            {
+        let existing = self.compilation.get_db().get_vfs().get_file_id(&uri);
+        if let Some(file_id) = existing {
+            if self.is_stale_version(file_id, version) {
                 return None;
             }
-
-            if let (Some(new_text), Some(old_text)) = (
-                text.as_deref(),
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_file_content(&file_id)
-                    .map(String::as_str),
-            ) && old_text == new_text
-            {
-                if self
-                    .compilation
-                    .get_db()
-                    .get_module_index()
-                    .get_module(file_id)
-                    .is_some()
-                {
-                    self.compilation
-                        .get_db_mut()
-                        .get_vfs_mut()
-                        .update_file_version(&file_id, version);
-                    return Some((file_id, Vec::new()));
-                }
-
-                if trigger_reindex {
-                    // Through `self_index_files`, so the anchor stash an
-                    // earlier text-only write left is consumed and applied.
-                    // Re-indexing without it leaves the stash describing a tree
-                    // two edits back, and the next edit would then remap from
-                    // ranges the index no longer holds.
-                    self.self_index_files(vec![file_id]);
-                    self.pending_indexed_text.remove(&file_id);
-                }
-
+            if self.text_is_indexed(file_id, text.as_deref()) {
                 self.compilation
                     .get_db_mut()
                     .get_vfs_mut()
@@ -1220,41 +374,20 @@ impl EmmyLuaAnalysis {
         } else if text.is_none() {
             return None;
         }
-
-        // The text the index was built from has to be read before the VFS
-        // mutation drops it. When this call also re-indexes, the diff below
-        // consumes it; otherwise it is left for whichever pass does index the
-        // file, because until then the index still describes the old text.
-        let was_absent = existing_file_id.is_none_or(|file_id| {
-            self.compilation
-                .get_db()
-                .get_vfs()
-                .get_syntax_tree(&file_id)
-                .is_none()
-        });
-        let is_removed = text.is_none();
-        if let Some(fid) = existing_file_id {
-            self.stash_indexed_text(fid);
-        }
-
         let file_id = self
             .compilation
             .get_db_mut()
             .get_vfs_mut()
             .set_file_content_preparsed(&uri, text, tree, line_index, version)?;
-
-        if trigger_reindex {
-            let mut dirty = self.self_index_and_diff(vec![file_id]);
-            if was_absent || is_removed {
-                self.dirty_existence_dependents(&mut dirty, file_id);
-            }
-            let widened = self.ripple_and_widen(dirty, vec![file_id]);
-            return Some((file_id, widened));
+        if !trigger_reindex {
+            return Some((file_id, Vec::new()));
         }
-
-        Some((file_id, Vec::new()))
+        let affected = self.reindex_files(vec![file_id]);
+        Some((file_id, affected))
     }
 
+    /// Stores a pre-parsed text without re-analysing, handing back the
+    /// replaced tree so the caller can drop it off the lock.
     pub fn update_file_preparsed_deferred(
         &mut self,
         uri: Uri,
@@ -1263,28 +396,12 @@ impl EmmyLuaAnalysis {
         line_index: LineIndex,
         version: Option<i32>,
     ) -> Option<(FileId, DeferredVfsDrop)> {
-        let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(&uri);
-        if let Some(file_id) = existing_file_id {
-            if let (Some(incoming_version), Some(current_version)) = (
-                version,
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_file_version(&file_id),
-            ) && incoming_version < current_version
-            {
+        let existing = self.compilation.get_db().get_vfs().get_file_id(&uri);
+        if let Some(file_id) = existing {
+            if self.is_stale_version(file_id, version) {
                 return None;
             }
-
-            if let (Some(new_text), Some(old_text)) = (
-                text.as_deref(),
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_file_content(&file_id)
-                    .map(String::as_str),
-            ) && old_text == new_text
-            {
+            if self.vfs_text_equals(file_id, text.as_deref()) {
                 self.compilation
                     .get_db_mut()
                     .get_vfs_mut()
@@ -1294,1651 +411,72 @@ impl EmmyLuaAnalysis {
         } else if text.is_none() {
             return None;
         }
-
-        if let Some(fid) = existing_file_id {
-            self.stash_indexed_text(fid);
-        }
-
         self.compilation
             .get_db_mut()
             .get_vfs_mut()
             .set_file_content_preparsed_deferred(&uri, text, tree, line_index, version)
     }
 
-    /// VFS-only update: parse and store the new text without touching the index.
-    /// The index remains stale but functional until `reindex_files` is called.
-    /// This is much faster than `update_file_by_uri`
+    /// Stores `text` without re-analysing; [`reindex_files`](Self::reindex_files)
+    /// brings the index up to date.
     pub fn update_file_text_only(&mut self, uri: &Uri, text: String) -> Option<FileId> {
-        let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(uri);
-        if let Some(file_id) = existing_file_id {
-            if let Some(old_text) = self
-                .compilation
-                .get_db()
-                .get_vfs()
-                .get_file_content(&file_id)
-                .map(String::as_str)
-            {
-                if old_text == text.as_str() {
-                    return Some(file_id);
-                }
-            }
-            self.stash_indexed_text(file_id);
-        }
-
-        let file_id = self
-            .compilation
-            .get_db_mut()
-            .get_vfs_mut()
-            .set_file_content(uri, Some(text));
-
-        Some(file_id)
-    }
-
-    /// Settles the index after these files' text changed under
-    /// [`update_file_text_only`](Self::update_file_text_only).
-    ///
-    /// Both phases of an edit: re-index the changed files and re-home the
-    /// references into them, then re-analyse whatever read a fact the edit
-    /// moved. Returns every live file whose diagnostics this settle may have
-    /// moved — the changed files, the files the ripple settled, and the
-    /// textual referencers of the moved names.
-    pub fn reindex_files(&mut self, file_ids: Vec<FileId>) -> Vec<FileId> {
-        let dirty = self.self_index_and_diff(file_ids.clone());
-        self.ripple_and_widen(dirty, file_ids)
-    }
-
-    /// [`reindex_files`](Self::reindex_files) against an expansion that was
-    /// computed earlier.
-    ///
-    /// The expansion has to be derived from the state *before* the edit landed,
-    /// so a caller that wants to do anything in between — re-index the edited
-    /// file on its own first, say, and release the write lock so a completion
-    /// can be answered — has to capture it up front and hand it back here.
-    /// Recomputing it against a partly-updated index under-expands badly:
-    /// measured on a gamemode workspace, an expansion of 739 files collapsed to
-    /// 8 and the workspace ended up with 18 diagnostics that a cold build does
-    /// not produce.
-    pub fn reindex_expanded_files(&mut self, file_ids: Vec<FileId>, expansion: Vec<FileId>) {
-        self.reindex_expanded_files_inner(file_ids, expansion);
-    }
-
-    /// Re-analyses `expansion` with `file_ids` as the files that changed.
-    ///
-    fn reindex_expanded_files_inner(&mut self, file_ids: Vec<FileId>, expansion: Vec<FileId>) {
-        let guard_fact_file_ids = expansion.iter().copied().collect::<FxHashSet<_>>();
-        let old_guard_facts = self.inferred_guard_snapshot(&guard_fact_file_ids);
-        self.reindex_expanded_files_with_old_snapshot(file_ids, expansion, old_guard_facts);
-    }
-
-    fn reindex_expanded_files_with_old_snapshot(
-        &mut self,
-        file_ids: Vec<FileId>,
-        expansion: Vec<FileId>,
-        old_guard_facts: InferredGuardSnapshot,
-    ) {
-        let incremental_source_file_ids = file_ids.iter().copied().collect::<FxHashSet<_>>();
-        let removed_file_ids = file_ids
-            .iter()
-            .copied()
-            .filter(|file_id| {
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_syntax_tree(file_id)
-                    .is_none()
-            })
-            .collect::<FxHashSet<_>>();
-
-        self.compilation
-            .get_db_mut()
-            .get_call_site_param_index_mut()
-            .forget_removed_files(&removed_file_ids);
-
-        let mut file_ids = expansion;
-        self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut file_ids);
-        let guard_fact_file_ids = file_ids.iter().copied().collect::<FxHashSet<_>>();
-        self.compilation.remove_index(file_ids.clone());
-        let update_file_ids = file_ids
-            .iter()
-            .copied()
-            .filter(|file_id| !removed_file_ids.contains(file_id))
-            .collect::<Vec<_>>();
-        if !update_file_ids.is_empty() {
-            self.compilation.update_index(update_file_ids.clone());
-            self.stabilize_cross_file_type_caches(&update_file_ids);
-        }
-        for file_id in &incremental_source_file_ids {
-            self.compilation
-                .get_db_mut()
-                .get_call_site_param_index_mut()
-                .refresh_file_source_dependencies(*file_id);
-        }
-        self.reindex_changed_inferred_guard_references(
-            &guard_fact_file_ids,
-            &old_guard_facts,
-            &file_ids,
-            &incremental_source_file_ids,
-        );
-        self.reindex_changed_inferred_param_consumers(&old_guard_facts, &file_ids);
-    }
-
-    /// Records the text the file's current index entries were built from,
-    /// unless an earlier write already recorded some.
-    ///
-    /// Must run before the VFS mutation. The oldest stash is the one that
-    /// matches the index: a write that does not re-index leaves the index
-    /// describing the text from before it.
-    fn stash_indexed_text(&mut self, file_id: FileId) {
-        if self.pending_indexed_text.contains_key(&file_id) {
-            return;
-        }
-        let Some(text) = self
-            .compilation
-            .get_db()
-            .get_vfs()
-            .get_file_content(&file_id)
-        else {
-            return;
-        };
-        let text: Arc<str> = Arc::from(text.as_str());
-        self.pending_indexed_text.insert(file_id, text);
-    }
-
-    /// Where the edit moved the file's offsets: from the stashed indexed text
-    /// to the text now in the VFS.
-    ///
-    /// No stash means nothing has written since the file was indexed, so
-    /// nothing moved.
-    fn take_position_map(&mut self, file_id: FileId) -> PositionMap {
-        let Some(old) = self.pending_indexed_text.remove(&file_id) else {
-            return PositionMap::identity();
-        };
-        match self
-            .compilation
-            .get_db()
-            .get_vfs()
-            .get_file_content(&file_id)
+        if let Some(file_id) = self.compilation.get_db().get_vfs().get_file_id(uri)
+            && self.vfs_text_equals(file_id, Some(&text))
         {
-            Some(new) => PositionMap::new(&old, new),
-            None => PositionMap::whole_file(old.len(), 0),
+            return Some(file_id);
         }
-    }
-
-    /// Phase 1 of an edit: re-index the edited files themselves, re-home every
-    /// other file's references into them, and report which files the edit
-    /// actually invalidated.
-    ///
-    /// Preconditions: the new text is already in the VFS and
-    /// [`stash_indexed_text`](Self::stash_indexed_text) ran before each write.
-    ///
-    /// The edited files are settled against their own text when this returns,
-    /// which is all a request positioned inside one of them needs. The dirty
-    /// set is what the caller still owes [`ripple`](Self::ripple).
-    pub fn self_index_and_diff(&mut self, file_ids: Vec<FileId>) -> DirtySet {
-        let mut dirty = DirtySet {
-            sources: file_ids.iter().copied().collect(),
-            ..DirtySet::default()
-        };
-        dirty.removed = file_ids
-            .iter()
-            .copied()
-            .filter(|file_id| {
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_syntax_tree(file_id)
-                    .is_none()
-            })
-            .collect();
-        // Before any removal: a self-index overwrites the facts propagation
-        // has to diff against.
-        dirty.guard_snapshot = self.inferred_guard_snapshot(&dirty.sources);
-        dirty.guard_work = !dirty.guard_snapshot.is_empty();
-
-        // Taken before any removal: the seed is chosen from the metadata the
-        // removed file still holds, and a live file has to be re-analysed for
-        // the forwarding pass to observe the removal at all.
-        let mut seeded = dirty.removed.iter().copied().collect::<Vec<_>>();
-        seeded.sort_unstable();
-        self.add_vgui_forwarding_removal_seed(&dirty.removed, &mut seeded);
-        dirty.files.extend(seeded);
-
-        // Every old map first, then one batch re-index, then every new map.
-        // The batch matters: analyser phases run over a whole batch, so
-        // re-indexing the files one at a time would derive different facts
-        // than a cold build does for the same set.
-        let mut pre_edit = Vec::with_capacity(file_ids.len());
-        // Pre-edit names for textual refresh: a removed export's index entries
-        // are gone after `remove_index`, so its old name only survives here.
-        let mut pre_names: FxHashMap<FileId, PreEditNameSnapshot> = FxHashMap::default();
-        for &file_id in &file_ids {
-            pre_names.insert(
-                file_id,
-                snapshot_pre_edit_names(self.compilation.get_db(), file_id),
-            );
-            let map = self.take_position_map(file_id);
-            // The members this file had filed before the edit. A settled read
-            // can be keyed on a member id the index never filed - a pass keys
-            // such a read on the range of the expression it read - and such a
-            // key has no filed identity for the validated remap to confirm, so
-            // `remap_into_file` moves it by geometry instead of dirtying every
-            // reader of it.
-            let pre_edit_member_ids = self
-                .compilation
-                .get_db()
-                .get_member_index()
-                .get_file_members(file_id)
-                .iter()
-                .map(|member| member.get_id())
-                .collect::<FxHashSet<LuaMemberId>>();
-            let removed = dirty.removed.contains(&file_id);
-            // Expressed in the new text's coordinates already, so it compares
-            // key for key against the map taken after the re-index.
-            let old = export_map(
-                self.compilation.get_db(),
-                file_id,
-                // A deleted file has no new coordinates to express its old
-                // exports in, and mapping them all onto nothing would drop
-                // every key instead of reporting it removed.
-                &if removed {
-                    FileRemap::identity(file_id)
-                } else {
-                    FileRemap::unvalidated(file_id, map)
-                },
-            );
-            pre_edit.push((file_id, map, old, pre_edit_member_ids));
-        }
-
-        self.compilation.remove_index(file_ids.clone());
-        let live = file_ids
-            .iter()
-            .copied()
-            .filter(|file_id| !dirty.removed.contains(file_id))
-            .collect::<Vec<_>>();
-        if !live.is_empty() {
-            self.compilation.update_index(live);
-        }
-
-        for (file_id, map, old, pre_edit_member_ids) in pre_edit {
-            let removed = dirty.removed.contains(&file_id);
-            let remap = FileRemap::validated(self.compilation.get_db(), file_id, map);
-            let lost = remap_into_file(self.compilation.get_db_mut(), &remap, &pre_edit_member_ids);
-            dirty.remap_losses.extend(lost.iter().copied());
-
-            let new = if removed {
-                ExportMap::default()
-            } else {
-                export_map(
-                    self.compilation.get_db(),
-                    file_id,
-                    &FileRemap::identity(file_id),
-                )
-            };
-            let diff = diff_exports(&old, &new);
-            // Diagnostic-refresh-only renames, independent of the export diff:
-            // a same-position rename moves no key, so without this its names
-            // never reach the watched-file refresh. Rename-channel: anchored in
-            // this file's own decls, validated at the burst boundary before it
-            // fans out. Runs before the early exit and never touches
-            // `dirty.files`.
-            {
-                let renamed = decl_rename_refresh_names(
-                    self.compilation.get_db(),
-                    file_id,
-                    &map,
-                    pre_names.get(&file_id),
-                );
-                dirty.decl_rename_refresh_names.extend(renamed);
-            }
-            if diff.is_empty() {
-                continue;
-            }
-            #[cfg(test)]
-            dirty.changed_sources.insert(file_id);
-            // The Lua names this diff moved, for the diagnostic-refresh
-            // sideband. Export-channel: callee-anchored (a contributed param
-            // resolves its owner in the callee's file), so these pass through
-            // untouched.
-            {
-                let mut changed = export_diff_changed_names(
-                    self.compilation.get_db(),
-                    file_id,
-                    &diff,
-                    &pre_names,
-                );
-                // Realm name-only keys for decls that no longer exist carry
-                // the same transient-decl pollution as the rename channel (a
-                // bare `p` parsed as a global decl vanishes once it becomes a
-                // callee). Route those through the rename channel where
-                // burst-boundary validation checks them; every other export
-                // name passes through untouched.
-                let mut transient = FxHashSet::default();
-                for key in diff.keys() {
-                    if let ExportKey::Realm(RealmSubject::Decl(decl_id)) = key {
-                        let post_name = self
-                            .compilation
-                            .get_db()
-                            .get_decl_index()
-                            .get_decl(decl_id)
-                            .filter(|decl| !decl.is_local())
-                            .map(|decl| SmolStr::new(decl.get_name()));
-                        let pre_name = pre_names
-                            .get(&file_id)
-                            .and_then(|pre| pre.decls.get(decl_id))
-                            .filter(|(_, is_local)| !is_local)
-                            .map(|(name, _)| name.clone());
-                        // Exactly one side names the decl: an addition or a
-                        // removal of a name-only decl (a bare transient like
-                        // `p` vanishing into a callee, or reappearing while
-                        // backspacing). Route it through the rename channel
-                        // where burst-boundary validation checks it; a genuine
-                        // addition/removal survives via the final/burst-start
-                        // state. Both sides present is a realm-value move of a
-                        // durable decl and stays on the export channel.
-                        match (post_name, pre_name) {
-                            (Some(name), None) | (None, Some(name)) => {
-                                if changed.remove(&name) {
-                                    transient.insert(name);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                dirty.export_refresh_names.extend(changed);
-                dirty.decl_rename_refresh_names.extend(transient);
-            }
-            dirty.guard_work |= diff.keys().any(|key| {
-                matches!(
-                    key,
-                    ExportKey::InferredGuard(_)
-                        | ExportKey::ContributedParam(..)
-                        | ExportKey::CallSiteLink(..)
-                )
-            });
-            let dependents = dependents_of(self.compilation.get_db(), file_id, &diff);
-            let evidence = self.evidence_dependents(file_id);
-            dirty.diff_dependents.extend(dependents.iter().copied());
-            dirty.diff_dependents.extend(evidence.iter().copied());
-            dirty.files.extend(dependents);
-            dirty.files.extend(evidence);
-            // the dependency index; one whose path did not resolve before is
-            // not in it at all.
-            if diff.keys().any(|key| {
-                matches!(
-                    key,
-                    ExportKey::LoadEdges
-                        | ExportKey::ModuleExport
-                        | ExportKey::Namespace
-                        | ExportKey::FileRealmMetadata
-                )
-            }) {
-                let unresolved =
-                    self.unresolved_path_dependency_dependents(&FxHashSet::from_iter([file_id]));
-                dirty.diff_dependents.extend(unresolved.iter().copied());
-                dirty.files.extend(unresolved);
-            }
-        }
-
-        for file_id in dirty.sources.iter().chain(dirty.removed.iter()) {
-            dirty.files.remove(file_id);
-        }
-        dirty
-    }
-
-    /// The files that read this file through evidence rather than through a
-    /// cached type.
-    ///
-    /// A call site contributes a parameter type, a callback source is matched
-    /// by path, and an inferred return reads source files. None is a type cache,
-    /// so none is reachable from the export diff. These edges are one hop, not
-    /// a transitive expansion, and are only paid when the file exported
-    /// something new.
-    ///
-    /// Inference support is deliberately absent: `dependents_of` already
-    /// queries it node by node for the nodes the diff names, and the
-    /// file-granular rollup would add every reader of every support node in
-    /// the file - including the ones this edit left byte for byte alone.
-    fn evidence_dependents(&self, file_id: FileId) -> Vec<FileId> {
-        let files = FxHashSet::from_iter([file_id]);
-        let db = self.compilation.get_db();
-        let call_site_index = db.get_call_site_param_index();
-        let mut dependents = call_site_index.collect_source_dependents(&files);
-        dependents.extend(call_site_index.collect_contributor_files(&files));
-        dependents.extend(
-            call_site_index.collect_source_path_dependents(db.get_vfs().get_file_path(&file_id)),
-        );
-        dependents.extend(
-            call_site_index
-                .get_return_consumers_for_signature_files(&files)
-                .into_iter()
-                .map(|consumer| consumer.file_id),
-        );
-        dependents.extend(
-            db.get_signature_index()
-                .inferred_return_dependents_for_files(&files),
-        );
-        dependents.extend(
-            db.get_signature_index()
-                .inferred_guard_consumers_for_files(&files),
-        );
-        dependents
-    }
-
-    /// Phase 2 of an edit: re-analyse the files the edit invalidated, and
-    /// whatever their own facts then invalidate, until nothing changes.
-    ///
-    /// Each round re-analyses a batch and diffs each file's exports against
-    /// the map taken just before it, so a file that re-derives the same facts
-    /// adds nothing. A file is re-analysed at most once per ripple.
-    ///
-    /// Returns every live file whose diagnostics this edit may have moved:
-    /// the files re-analysed, propagation included, plus the readers the diff
-    /// named that needed no re-index of their own. A caller that publishes
-    /// diagnostics needs that set and not just the files whose text changed —
-    /// the point of the ripple is the files nobody edited.
-    pub fn ripple(&mut self, dirty: DirtySet) -> Vec<FileId> {
-        self.ripple_with_refresh_names(dirty).0
-    }
-
-    /// [`ripple`](Self::ripple), plus the sideband textual names every ripple
-    /// export diff moved, split by channel.
-    ///
-    /// Each batch is snapshotted before its re-index (a rippled file's removed
-    /// entries are gone afterwards, exactly like an edited file's), and the
-    /// names resolve after the ripple under a shared borrow. They never enter
-    /// `pending` or `dirty.files` and steer no reindex decision: which files
-    /// the ripple settled is decided by the change-driven pass alone. The
-    /// late parameter-consumer pass contributes its own sideband below, merged
-    /// the same way.
-    pub fn ripple_with_refresh_names(
-        &mut self,
-        dirty: DirtySet,
-    ) -> (Vec<FileId>, std::collections::HashSet<SmolStr>) {
-        let (rippled, export_names, rename_names) = self.ripple_with_refresh_names_split(dirty);
-        let mut names = export_names;
-        names.extend(rename_names);
-        (rippled, names)
-    }
-
-    /// [`ripple_with_refresh_names`](Self::ripple_with_refresh_names), with the
-    /// two sideband channels kept separate so callers can validate only the
-    /// rename channel.
-    pub fn ripple_with_refresh_names_split(
-        &mut self,
-        mut dirty: DirtySet,
-    ) -> (
-        Vec<FileId>,
-        std::collections::HashSet<SmolStr>,
-        std::collections::HashSet<SmolStr>,
-    ) {
-        if dirty.is_empty() {
-            return (Vec::new(), Default::default(), Default::default());
-        }
-        self.compilation
-            .get_db_mut()
-            .get_call_site_param_index_mut()
-            .forget_removed_files(&dirty.removed);
-
-        let mut settled = dirty.sources.clone();
-        settled.extend(dirty.removed.iter().copied());
-        let mut reanalyzed = dirty.sources.iter().copied().collect::<Vec<_>>();
-        reanalyzed.sort_unstable();
-        let mut pending = std::mem::take(&mut dirty.files);
-        // Every file the diff named, whether or not it ends up re-indexed. A
-        // reader can need no new index entries and still diagnose differently,
-        // because it resolves the fact that moved when it is diagnosed rather
-        // than when it is indexed. Reporting only what was re-analysed leaves
-        // exactly those files holding a stale report.
-        let mut touched: FxHashSet<FileId> = dirty.sources.iter().copied().collect();
-        touched.extend(pending.iter().copied());
-        let mut round = 0usize;
-        // Sideband textual names from every ripple export diff, resolved after
-        // the ripple. Diagnostic-only: never enters `pending` or `touched`
-        // below, and steers no reindex decision. Split by channel: export-diff
-        // names pass through untouched, rename-channel names are validated at
-        // the burst boundary. `dirty`'s own incoming sideband joins the
-        // channel it was emitted on.
-        let mut export_sideband: FxHashSet<SmolStr> =
-            std::mem::take(&mut dirty.export_refresh_names);
-        let mut rename_sideband: FxHashSet<SmolStr> =
-            std::mem::take(&mut dirty.decl_rename_refresh_names);
-
-        while !pending.is_empty() {
-            let mut batch = pending
-                .drain()
-                .filter(|file_id| !settled.contains(file_id))
-                // A file with a stashed text owes its own self-index, which is
-                // the only pass that can re-home the references into it.
-                // Re-indexing it here would drop that stash and strand them.
-                .filter(|file_id| !self.pending_indexed_text.contains_key(file_id))
-                .filter(|file_id| {
-                    self.compilation
-                        .get_db()
-                        .get_vfs()
-                        .get_syntax_tree(file_id)
-                        .is_some()
-                })
-                .collect::<Vec<_>>();
-            if batch.is_empty() {
-                break;
-            }
-            batch.sort_unstable();
-            round += 1;
-            if round == 8 {
-                log::warn!(
-                    "ripple has not converged after 8 rounds; {} file(s) still changing",
-                    batch.len()
-                );
-            }
-
-            let before = batch
-                .iter()
-                .map(|file_id| {
-                    (
-                        *file_id,
-                        export_map(
-                            self.compilation.get_db(),
-                            *file_id,
-                            &FileRemap::identity(*file_id),
-                        ),
-                    )
-                })
-                .collect::<FxHashMap<_, _>>();
-            // Their pre-batch guard facts join the snapshot for the same
-            // reason the edited files' did: the re-index below overwrites them.
-            // The pre-batch name snapshots serve the sideband for the same
-            // reason: a rippled file's removed entries are gone afterwards.
-            let batch_set = batch.iter().copied().collect::<FxHashSet<_>>();
-            dirty
-                .guard_snapshot
-                .merge(self.inferred_guard_snapshot(&batch_set));
-            let mut batch_pres: FxHashMap<FileId, PreEditNameSnapshot> = FxHashMap::default();
-            for file_id in &batch {
-                batch_pres.insert(
-                    *file_id,
-                    snapshot_pre_edit_names(self.compilation.get_db(), *file_id),
-                );
-            }
-
-            let profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
-            if profile_enabled {
-                eprintln!("[profile] ripple round {round}: {} file(s)", batch.len());
-            }
-            self.compilation.remove_index(batch.clone());
-            self.compilation.update_index(batch.clone());
-            reanalyzed.extend(batch.iter().copied());
-            settled.extend(batch.iter().copied());
-
-            for file_id in &batch {
-                let after = export_map(
-                    self.compilation.get_db(),
-                    *file_id,
-                    &FileRemap::identity(*file_id),
-                );
-                let diff = diff_exports(&before[file_id], &after);
-                // A rippled file whose own exports moved names them for the
-                // diagnostic-refresh sideband — the same accounting
-                // `self_index_and_diff` applies to an edit's diff.
-                {
-                    let mut changed = export_diff_changed_names(
-                        self.compilation.get_db(),
-                        *file_id,
-                        &diff,
-                        &batch_pres,
-                    );
-                    let mut transient = FxHashSet::default();
-                    for key in diff.keys() {
-                        if let ExportKey::Realm(RealmSubject::Decl(decl_id)) = key {
-                            let post_name = self
-                                .compilation
-                                .get_db()
-                                .get_decl_index()
-                                .get_decl(decl_id)
-                                .filter(|decl| !decl.is_local())
-                                .map(|decl| SmolStr::new(decl.get_name()));
-                            let pre_name = batch_pres
-                                .get(file_id)
-                                .and_then(|pre| pre.decls.get(decl_id))
-                                .filter(|(_, is_local)| !is_local)
-                                .map(|(name, _)| name.clone());
-                            match (post_name, pre_name) {
-                                (Some(name), None) | (None, Some(name)) => {
-                                    if changed.remove(&name) {
-                                        transient.insert(name);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    let renamed = decl_rename_refresh_names(
-                        self.compilation.get_db(),
-                        *file_id,
-                        &PositionMap::identity(),
-                        batch_pres.get(file_id),
-                    );
-                    export_sideband.extend(changed);
-                    rename_sideband.extend(transient);
-                    rename_sideband.extend(renamed);
-                }
-                if diff.is_empty() {
-                    continue;
-                }
-                if profile_enabled {
-                    let keys = diff
-                        .keys()
-                        .take(6)
-                        .map(|key| {
-                            let text = format!("{key:?}");
-                            text.chars().take(110).collect::<String>()
-                        })
-                        .collect::<Vec<_>>();
-                    eprintln!(
-                        "[profile] ripple round {round}: {:?} changed {} export(s): {keys:?}",
-                        self.compilation.get_db().get_vfs().get_file_path(file_id),
-                        diff.keys().count()
-                    );
-                }
-                let evidence = self.evidence_dependents(*file_id);
-                for dependent in dependents_of(self.compilation.get_db(), *file_id, &diff)
-                    .into_iter()
-                    .chain(evidence)
-                {
-                    touched.insert(dependent);
-                    if !settled.contains(&dependent) {
-                        pending.insert(dependent);
-                    }
-                }
-            }
-        }
-
-        for file_id in &dirty.sources {
+        Some(
             self.compilation
                 .get_db_mut()
-                .get_call_site_param_index_mut()
-                .refresh_file_source_dependencies(*file_id);
-        }
-        let guard_fact_file_ids = dirty.guard_snapshot.snapshot_file_ids().clone();
-        let guard_reindexed = self.reindex_changed_inferred_guard_references(
-            &guard_fact_file_ids,
-            &dirty.guard_snapshot,
-            &reanalyzed,
-            &dirty.sources,
-        );
-        // The late callee reindex can move exports of its own (a
-        // contributed-parameter change altering a differently named export),
-        // and its own ripple can move more. Both name sets bubble here;
-        // diagnostic-only, like every other sideband merge.
-        let (param_reindexed, param_names) = self
-            .reindex_changed_inferred_param_consumers_with_refresh_names(
-                &dirty.guard_snapshot,
-                &reanalyzed,
-            );
-
-        reanalyzed.extend(guard_reindexed);
-        reanalyzed.extend(param_reindexed);
-        // The nested pass returns a merged union; its export-channel names are
-        // already in the sideband via the nested self-index, and the union can
-        // only add rename-channel names here. Keep the split conservative:
-        // export names pass through, the union joins the rename channel where
-        // burst-boundary validation will check it.
-        rename_sideband.extend(param_names);
-        reanalyzed.extend(touched);
-        reanalyzed.retain(|file_id| {
-            self.compilation
-                .get_db()
-                .get_vfs()
-                .get_syntax_tree(file_id)
-                .is_some()
-        });
-        reanalyzed.sort_unstable();
-        reanalyzed.dedup();
-        (
-            reanalyzed,
-            export_sideband.into_iter().collect(),
-            rename_sideband.into_iter().collect(),
+                .get_vfs_mut()
+                .set_file_content(uri, Some(text)),
         )
     }
 
-    /// Rebuilds only these files' own index entries.
-    ///
-    /// Nothing cross-file is settled: dependents keep whatever they inferred
-    /// before, and the caller still owes them a
-    /// [`reindex_expanded_files`](Self::reindex_expanded_files) against an
-    /// expansion captured beforehand. What this does buy is that the edited
-    /// file's declarations, members and signatures line up with its text again,
-    /// which is all a request positioned *inside that file* needs — the index
-    /// entries are keyed by position, so an edit that shifts offsets is exactly
-    /// what makes them stop matching the tree.
-    pub fn self_index_files(&mut self, file_ids: Vec<FileId>) {
-        self.compilation.remove_index(file_ids.clone());
-        self.compilation.update_index(file_ids);
-    }
-
-    /// Keep only the rename-channel names a burst actually moved.
-    ///
-    /// `burst_start` snapshots each edited file's non-local declaration names at
-    /// the burst's start; the current index is the settled-final state. A name is
-    /// legitimate iff its presence differs between the two boundary states (an
-    /// add, a removal, or a rename pairing two such names):
-    /// - a burst that ends where it started keeps every name on both sides, so a
-    ///   type-then-erase gesture emits nothing;
-    /// - a genuine rename keeps old (start-only) + new (final-only);
-    /// - a genuine new declaration keeps its (final-only) name;
-    /// - a genuine removal keeps its (start-only) name, which the export diff
-    ///   already covers on its own channel.
-    ///
-    /// The export-diff channel is never passed here: it is callee-anchored and
-    /// passes through untouched.
-    pub fn validate_rename_refresh_names(
-        &self,
-        names: std::collections::HashSet<SmolStr>,
-        burst_start: &FxHashMap<FileId, FxHashSet<SmolStr>>,
-    ) -> std::collections::HashSet<SmolStr> {
-        if names.is_empty() {
-            return names;
-        }
-        let db = self.compilation.get_db();
-        let mut final_names = FxHashSet::default();
-        for file_id in burst_start.keys() {
-            if let Some(tree) = db.get_decl_index().get_decl_tree(file_id) {
-                for decl in tree.get_decls().values() {
-                    if decl.get_file_id() == *file_id && !decl.is_local() {
-                        final_names.insert(SmolStr::new(decl.get_name()));
-                    }
-                }
-            }
-        }
-        let start_names: FxHashSet<&SmolStr> = burst_start.values().flatten().collect();
-        names
-            .into_iter()
-            .filter(|name| {
-                // XOR: present on exactly one side of the burst boundary.
-                start_names.contains(name) != final_names.contains(name)
-            })
-            .collect()
-    }
-
-    /// The export-diff names of `file_ids` recomputed between the burst-start
-    /// index state and the current (settled-final) state.
-    ///
-    /// Burst-boundary semantics for the export channel: the refresh set a burst
-    /// produces is the difference between the burst's start and its settled
-    /// final, not the union of per-settle diffs. A burst that ends where it
-    /// started recomputes an empty diff and emits nothing, while a durable
-    /// change (a member type flip whose name exists at both ends) still
-    /// recomputes the same moved keys and emits its names. One-sided
-    /// Realm(Decl) name-only keys (a transient decl that existed on exactly
-    /// one side) are excluded here; the rename channel's boundary check
-    /// already drops them.
-    pub fn burst_boundary_export_names(
-        &self,
-        burst_start: &FxHashMap<FileId, ExportMap>,
-    ) -> FxHashSet<SmolStr> {
-        let mut names = FxHashSet::default();
-        let mut pre_names: FxHashMap<FileId, PreEditNameSnapshot> = FxHashMap::default();
-        for file_id in burst_start.keys() {
-            pre_names.insert(
-                *file_id,
-                snapshot_pre_edit_names(self.compilation.get_db(), *file_id),
-            );
-        }
-        for (file_id, old) in burst_start {
-            let new = export_map(
-                self.compilation.get_db(),
-                *file_id,
-                &FileRemap::identity(*file_id),
-            );
-            let diff = diff_exports(old, &new);
-            if diff.is_empty() {
-                continue;
-            }
-            let mut changed =
-                export_diff_changed_names(self.compilation.get_db(), *file_id, &diff, &pre_names);
-            // Drop one-sided Realm(Decl) name-only keys: transient decls the
-            // rename channel already rejects. Durable realm-value moves (both
-            // sides name the decl) stay.
-            for key in diff.keys() {
-                if let ExportKey::Realm(RealmSubject::Decl(decl_id)) = key {
-                    let post_name = self
-                        .compilation
-                        .get_db()
-                        .get_decl_index()
-                        .get_decl(decl_id)
-                        .filter(|decl| !decl.is_local())
-                        .map(|decl| SmolStr::new(decl.get_name()));
-                    let pre_name = pre_names
-                        .get(file_id)
-                        .and_then(|pre| pre.decls.get(decl_id))
-                        .filter(|(_, is_local)| !is_local)
-                        .map(|(name, _)| name.clone());
-                    match (post_name, pre_name) {
-                        (Some(name), None) | (None, Some(name)) => {
-                            changed.remove(&name);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            names.extend(changed);
-        }
-        names
-    }
-
-    /// Snapshot the export maps of `file_ids` in the current index: the
-    /// burst-start baseline the export-channel validation diffs the
-    /// settled-final state against.
-    pub fn snapshot_burst_start_exports(
-        &self,
-        file_ids: &[FileId],
-    ) -> FxHashMap<FileId, ExportMap> {
-        let db = self.compilation.get_db();
-        let mut start = FxHashMap::default();
-        for file_id in file_ids {
-            start.insert(
-                *file_id,
-                export_map(db, *file_id, &FileRemap::identity(*file_id)),
-            );
-        }
-        start
-    }
-
-    /// Snapshot the non-local declaration names of `file_ids` in the current
-    /// index: the burst-start baseline the rename-channel validation diffs the
-    /// settled-final state against.
-    pub fn snapshot_burst_start_names(
-        &self,
-        file_ids: &[FileId],
-    ) -> FxHashMap<FileId, FxHashSet<SmolStr>> {
-        let db = self.compilation.get_db();
-        let mut start = FxHashMap::default();
-        for file_id in file_ids {
-            let mut names = FxHashSet::default();
-            if let Some(tree) = db.get_decl_index().get_decl_tree(file_id) {
-                for decl in tree.get_decls().values() {
-                    if decl.get_file_id() == *file_id && !decl.is_local() {
-                        names.insert(SmolStr::new(decl.get_name()));
-                    }
-                }
-            }
-            start.insert(*file_id, names);
-        }
-        start
-    }
-
-    fn stabilize_cross_file_type_caches(&mut self, file_ids: &[FileId]) {
-        if file_ids.is_empty() {
-            return;
-        }
-
-        let changed = file_ids.iter().copied().collect::<FxHashSet<_>>();
-        let all_dependents = self
-            .compilation
-            .get_db()
-            .get_type_index()
-            .files_with_cross_file_type_caches_referencing_files(&changed);
-        let dependents = select_cross_file_stabilization_dependents(all_dependents, &changed)
-            .into_iter()
-            .filter(|file_id| {
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_syntax_tree(file_id)
-                    .is_some()
-            })
-            .collect::<Vec<_>>();
-        if dependents.is_empty() {
-            return;
-        }
-
-        self.compilation.remove_index(dependents.clone());
-        self.compilation.update_index(dependents);
-    }
-
-    /// Re-analyses exactly `file_ids`, skipping dependency expansion.
-    pub fn reindex_files_without_expansion(&mut self, file_ids: Vec<FileId>) {
-        // Re-derived from the current text, so a stashed pre-index text now
-        // describes a state that no longer exists.
-        for file_id in &file_ids {
-            self.pending_indexed_text.remove(file_id);
-        }
-        self.compilation.remove_index(file_ids.clone());
-        self.compilation.update_index(file_ids.clone());
-        self.stabilize_cross_file_type_caches(&file_ids);
-    }
-
-    pub fn expand_reindex_file_ids(&self, file_ids: Vec<FileId>) -> Vec<FileId> {
-        let _p = Profile::new("expand_reindex_file_ids");
-        let mut expanded = file_ids.into_iter().collect::<FxHashSet<_>>();
-        loop {
-            // Include/require callers must be rebuilt with their changed target.
-            // Traverse the indexed dependency graph; never rescan workspace ASTs.
-            let dependency_dependents = self
-                .compilation
-                .get_db()
-                .get_file_dependencies_index()
-                .get_file_dependencies()
-                .collect_file_dependents(expanded.iter().copied().collect());
-            let unresolved_path_dependents = self.unresolved_path_dependency_dependents(&expanded);
-            let dependent_files = self
-                .compilation
-                .get_db()
-                .get_type_index()
-                .files_with_type_caches_referencing_files(&expanded);
-            let inference_dependents = self
-                .compilation
-                .get_db()
-                .get_type_index()
-                .files_depending_on_inference_support(&expanded);
-            let callback_dependents = self
-                .compilation
-                .get_db()
-                .get_call_site_param_index()
-                .collect_source_dependents(&expanded);
-            let contributor_dependents = self
-                .compilation
-                .get_db()
-                .get_call_site_param_index()
-                .collect_contributor_files(&expanded);
-            let callback_source_paths = expanded
-                .iter()
-                .filter_map(|file_id| self.compilation.get_db().get_vfs().get_file_path(file_id))
-                .collect::<Vec<_>>();
-            let callback_path_dependents = self
-                .compilation
-                .get_db()
-                .get_call_site_param_index()
-                .collect_source_path_dependents(callback_source_paths);
-            let return_consumers = self
-                .compilation
-                .get_db()
-                .get_call_site_param_index()
-                .get_return_consumers_for_signature_files(&expanded)
-                .into_iter()
-                .map(|consumer| consumer.file_id);
-            let inferred_return_dependents = self
-                .compilation
-                .get_db()
-                .get_signature_index()
-                .inferred_return_dependents_for_files(&expanded);
-            let settled_signature_dependents = self
-                .compilation
-                .get_db()
-                .get_signature_index()
-                .settled_read_dependents_for_files(&expanded);
-            let mut added = false;
-            for file_id in dependency_dependents
-                .into_iter()
-                .chain(unresolved_path_dependents)
-                .chain(dependent_files)
-                .chain(inference_dependents)
-                .chain(callback_dependents)
-                .chain(contributor_dependents)
-                .chain(callback_path_dependents)
-                .chain(return_consumers)
-                .chain(inferred_return_dependents)
-                .chain(settled_signature_dependents)
-            {
-                added |= expanded.insert(file_id);
-            }
-
-            if !added {
-                break;
-            }
-        }
-
-        let mut expanded = expanded.into_iter().collect::<Vec<_>>();
-        expanded.sort_unstable();
-        expanded
-    }
-
-    fn add_vgui_forwarding_removal_seed(
-        &self,
-        removed_file_ids: &FxHashSet<FileId>,
-        reindex_file_ids: &mut Vec<FileId>,
-    ) {
-        if removed_file_ids.is_empty() {
-            return;
-        }
-        let db = self.compilation.get_db();
-        let vfs = db.get_vfs();
-        let module_index = db.get_module_index();
-        let gmod_index = db.get_gmod_class_metadata_index();
-        let affected_workspace_id = reindex_file_ids
-            .iter()
-            .filter(|file_id| removed_file_ids.contains(file_id))
-            .find_map(|file_id| {
-                gmod_index
-                    .has_annotated_vgui_parent_calls(*file_id)
-                    .then(|| module_index.get_workspace_id(*file_id))
-                    .flatten()
-            });
-        let Some(affected_workspace_id) = affected_workspace_id else {
-            return;
-        };
-        if reindex_file_ids.iter().any(|file_id| {
-            !removed_file_ids.contains(file_id) && vfs.get_syntax_tree(file_id).is_some()
-        }) {
-            return;
-        }
-
-        let all_file_ids = vfs.get_all_file_ids();
-        let seed_file_id = all_file_ids
-            .iter()
-            .copied()
-            .filter(|file_id| {
-                !removed_file_ids.contains(file_id) && vfs.get_syntax_tree(file_id).is_some()
-            })
-            .find(|file_id| module_index.get_workspace_id(*file_id) == Some(affected_workspace_id))
-            .or_else(|| {
-                all_file_ids.iter().copied().find(|file_id| {
-                    !removed_file_ids.contains(file_id) && vfs.get_syntax_tree(file_id).is_some()
-                })
-            });
-        let Some(seed_file_id) = seed_file_id else {
-            return;
-        };
-        reindex_file_ids.push(seed_file_id);
-        reindex_file_ids.sort_unstable();
-        reindex_file_ids.dedup();
-    }
-
-    /// Marks the files that have to be re-analysed because `file_id` appeared or
-    /// vanished, rather than because its contents changed.
-    ///
-    /// Whether a file exists is not a fact that file exports, so the export diff
-    /// cannot see it. Every `include` of the path resolves differently now, both
-    /// the ones that resolved to it and the ones that failed to resolve at all.
-    /// The file itself is dropped from the set: the caller has already indexed
-    /// it, or it is gone.
-    fn dirty_existence_dependents(&self, dirty: &mut DirtySet, file_id: FileId) {
-        let dependents = self
-            .compilation
-            .get_db()
-            .get_file_dependencies_index()
-            .get_file_dependencies()
-            .collect_file_dependents(vec![file_id]);
-        dirty.files.extend(dependents);
-        let unresolved =
-            self.unresolved_path_dependency_dependents(&FxHashSet::from_iter([file_id]));
-        dirty.files.extend(unresolved);
-        dirty.files.remove(&file_id);
-    }
-
-    fn unresolved_path_dependency_dependents(&self, file_ids: &FxHashSet<FileId>) -> Vec<FileId> {
-        let db = self.compilation.get_db();
-        let target_path_keys = file_ids
-            .iter()
-            .filter_map(|file_id| db.get_vfs().get_file_path(file_id).cloned())
-            .flat_map(|target_path| dependency_path_keys_for_target(db, &target_path))
-            .collect::<FxHashSet<_>>();
-
-        db.get_file_dependencies_index()
-            .collect_unresolved_path_dependents(target_path_keys)
-    }
-
-    /// Textual diagnostic-refresh candidates for `names`, without reindexing.
-    ///
-    /// Each name is looked up in the reference index (`files_referencing_name`,
-    /// which unions global and member-key references) and the union is filtered
-    /// to live diagnostic-eligible workspace files: a file must still have a
-    /// syntax tree, must belong to a `Main` module workspace, and must not
-    /// already be in `exclude` (the change-driven settle set). Takes `&self`
-    /// only, so diagnosing the result mutates nothing and no index snapshot
-    /// moves; in particular `file_reference_revision` is untouched.
-    ///
-    /// Eligibility decision (documented per review): `Main` only. `Library`
-    /// (shipped annotations and other library workspaces), `Std` and `Remote`
-    /// files are excluded: the language server only pulls/diagnoses main
-    /// workspace files (see `get_main_workspace_file_ids_for_diagnostics`),
-    /// and refreshing annotations would fan out over every consumer of a hub
-    /// name for files nobody diagnoses. The changed file's own workspace does
-    /// not matter: a library edit still refreshes its main-workspace
-    /// referencers; only candidates are filtered.
-    ///
-    /// No caps or prefilters: every referencer is reported, however large the
-    /// fanout, and per-name fanout is logged without truncation so a hub name
-    /// stays visible.
-    pub fn textual_refresh_candidates(
-        &self,
-        names: &std::collections::HashSet<SmolStr>,
-        exclude: &std::collections::HashSet<FileId>,
-    ) -> Vec<FileId> {
-        if names.is_empty() {
-            return Vec::new();
-        }
-        let db = self.compilation.get_db();
-        let reference_index = db.get_reference_index();
-        let module_index = db.get_module_index();
-        let vfs = db.get_vfs();
-        let mut sorted_names: Vec<&SmolStr> = names.iter().collect();
-        sorted_names.sort_unstable();
-        let mut candidates = FxHashSet::default();
-        for name in sorted_names {
-            let referencers = reference_index.files_referencing_name(name);
-            // No caps: report the full fanout even for hub names.
-            log::info!(
-                "textual refresh: name `{}` fans out to {} file(s)",
-                name.as_str(),
-                referencers.len()
-            );
-            candidates.extend(referencers);
-        }
-        let mut filtered: Vec<FileId> = candidates
-            .into_iter()
-            .filter(|file_id| !exclude.contains(file_id))
-            .filter(|file_id| vfs.get_syntax_tree(file_id).is_some())
-            .filter(|file_id| module_index.is_main(file_id))
-            .collect();
-        filtered.sort_unstable();
-        filtered.dedup();
-        if !filtered.is_empty() {
-            log::info!(
-                "textual refresh: {} additional file(s) from {} name(s)",
-                filtered.len(),
-                names.len()
-            );
-        }
-        filtered
-    }
-
-    pub fn update_remote_file_by_uri(&mut self, uri: &Uri, text: Option<String>) -> FileId {
-        let is_removed = text.is_none();
-        let fid = self
-            .compilation
-            .get_db_mut()
-            .get_vfs_mut()
-            .set_remote_file_content(uri, text);
-
-        let removed_file_ids = is_removed
-            .then_some(fid)
-            .into_iter()
-            .collect::<FxHashSet<_>>();
-        let mut reindex_file_ids = vec![fid];
-        self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut reindex_file_ids);
-        self.compilation.remove_index(reindex_file_ids.clone());
-        let update_file_ids = reindex_file_ids
-            .into_iter()
-            .filter(|file_id| !removed_file_ids.contains(file_id))
-            .collect::<Vec<_>>();
-        if !update_file_ids.is_empty() {
-            self.compilation.update_index(update_file_ids);
-        }
-        fid
-    }
-
-    pub fn update_files_by_uri(&mut self, files: Vec<(Uri, Option<String>)>) -> Vec<FileId> {
-        let mut removed_files = FxHashSet::default();
-        let mut updated_files = FxHashSet::default();
-        let mut files = files;
-        files.sort_by_cached_key(|(uri, _)| uri_sort_key(uri));
-        let old_source_file_ids = files
-            .iter()
-            .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
-            .collect::<FxHashSet<_>>();
-        let removed_source_file_ids = files
-            .iter()
-            .filter(|(_, text)| text.is_none())
-            .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
-            .collect::<FxHashSet<_>>();
-        let mut old_guard_fact_file_ids =
-            self.expand_reindex_file_ids(old_source_file_ids.iter().copied().collect());
-        self.add_vgui_forwarding_removal_seed(
-            &removed_source_file_ids,
-            &mut old_guard_fact_file_ids,
-        );
-        let old_guard_fact_file_ids = old_guard_fact_file_ids
-            .into_iter()
-            .collect::<FxHashSet<_>>();
-        let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
-
-        // Separate files into: unchanged (skip), to-remove, and to-parse.
-        // `appeared_uris` tracks the files this batch introduces — never seen,
-        // or reopened past a tombstone — whose exports no recorded edge names.
-        let mut to_parse: Vec<(Uri, String)> = Vec::new();
-        let mut appeared_uris = FxHashSet::default();
-        {
-            let _p = Profile::new("update files: classify");
-            for (uri, text) in files {
-                let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(&uri);
-                if let Some(file_id) = existing_file_id {
-                    if let (Some(new_text), Some(old_text)) = (
-                        text.as_deref(),
-                        self.compilation
-                            .get_db()
-                            .get_vfs()
-                            .get_file_content(&file_id)
-                            .map(String::as_str),
-                    ) && old_text == new_text
-                    {
-                        removed_files.insert(file_id);
-                        updated_files.insert(file_id);
-                        continue;
-                    }
-                    if self
-                        .compilation
-                        .get_db()
-                        .get_vfs()
-                        .get_syntax_tree(&file_id)
-                        .is_none()
-                    {
-                        appeared_uris.insert(uri.clone());
-                    }
-                } else if text.is_none() {
-                    continue;
-                } else {
-                    appeared_uris.insert(uri.clone());
-                }
-
-                if let Some(text) = text {
-                    to_parse.push((uri, text));
-                } else {
-                    // File removal: assign ID and mark for removal
-                    let file_id = self
-                        .compilation
-                        .get_db_mut()
-                        .get_vfs_mut()
-                        .set_file_content(&uri, None);
-                    removed_files.insert(file_id);
-                }
-            }
-        }
-
-        // Parse files — parallel when enough files to benefit
-        const PARALLEL_THRESHOLD: usize = 50;
-        {
-            let _p = Profile::new("update files: parse");
-            if to_parse.len() >= PARALLEL_THRESHOLD {
-                // Pre-assign file IDs (sequential, fast)
-                let file_ids: Vec<FileId> = to_parse
-                    .iter()
-                    .map(|(uri, _)| self.compilation.get_db_mut().get_vfs_mut().file_id(uri))
-                    .collect();
-
-                // Parse in parallel on rayon's persistent pool. `collect` on an
-                // indexed parallel iterator preserves input order, so `parsed`
-                // stays aligned with `to_parse` and `file_ids`.
-                use rayon::prelude::*;
-                let config = self.emmyrc.clone();
-                crate::compilation::analyzer::parallel::init_pool();
-                let parsed: Vec<(LuaSyntaxTree, LineIndex)> = to_parse
-                    .par_iter()
-                    .map_init(rowan::NodeCache::default, |node_cache, (_, text)| {
-                        let parse_config = config.get_parse_config(node_cache);
-                        let tree = LuaParser::parse(text, parse_config);
-                        let line_index = LineIndex::parse(text);
-                        (tree, line_index)
-                    })
-                    .collect();
-
-                // Insert pre-parsed results (sequential, fast FxHashMap inserts)
-                let vfs = self.compilation.get_db_mut().get_vfs_mut();
-                for (((_uri, text), file_id), (tree, line_index)) in
-                    to_parse.into_iter().zip(file_ids.iter()).zip(parsed)
-                {
-                    vfs.insert_preparsed(*file_id, text, tree, line_index);
-                    removed_files.insert(*file_id);
-                    updated_files.insert(*file_id);
-                }
-            } else {
-                // Small batch: parse sequentially (avoids thread spawn overhead)
-                for (uri, text) in to_parse {
-                    let file_id = self
-                        .compilation
-                        .get_db_mut()
-                        .get_vfs_mut()
-                        .set_file_content(&uri, Some(text));
-                    removed_files.insert(file_id);
-                    updated_files.insert(file_id);
-                }
-            }
-        }
-
-        if removed_files.is_empty() {
-            return Vec::new();
-        }
-
-        let mut removed_files = self.expand_reindex_file_ids(removed_files.into_iter().collect());
-        self.add_vgui_forwarding_removal_seed(&removed_source_file_ids, &mut removed_files);
-        let guard_fact_file_ids = removed_files.iter().copied().collect::<FxHashSet<_>>();
-        // Name-level additions are the only change whose readers recorded no
-        // edge the expansion could follow; snapshot what each re-indexed file
-        // held before `remove_index` so the settle below can name them.
-        let pre_additions: FxHashMap<FileId, BatchPreAdditions> = removed_files
-            .iter()
-            .filter(|file_id| {
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_syntax_tree(file_id)
-                    .is_some()
-            })
-            .map(|file_id| {
-                (
-                    *file_id,
-                    snapshot_batch_pre_additions(self.compilation.get_db(), *file_id),
-                )
-            })
-            .collect();
-        self.compilation.remove_index(removed_files.clone());
-        updated_files.extend(removed_files.into_iter().filter(|file_id| {
-            self.compilation
-                .get_db()
-                .get_vfs()
-                .get_syntax_tree(file_id)
-                .is_some()
-        }));
-        let mut updated_files: Vec<FileId> = updated_files.into_iter().collect();
-        updated_files.sort();
-        self.compilation.update_index(updated_files.clone());
-        {
-            let _p = Profile::new("post: stabilize_cross_file_type_caches");
-            self.stabilize_cross_file_type_caches(&updated_files);
-        }
-        {
-            let _p = Profile::new("post: refresh_file_source_dependencies");
-            for file_id in &old_source_file_ids {
-                self.compilation
-                    .get_db_mut()
-                    .get_call_site_param_index_mut()
-                    .refresh_file_source_dependencies(*file_id);
-            }
-        }
-        {
-            let _p = Profile::new("post: reindex_changed_inferred_guard_references");
-            self.reindex_changed_inferred_guard_references(
-                &guard_fact_file_ids,
-                &old_guard_facts,
-                &updated_files,
-                &old_source_file_ids,
-            );
-        }
-        {
-            let _p = Profile::new("post: reindex_changed_inferred_param_consumers");
-            self.reindex_changed_inferred_param_consumers(&old_guard_facts, &updated_files);
-        }
-        {
-            let _p = Profile::new("post: settle_batch_addition_readers");
-            self.settle_batch_addition_readers(&appeared_uris, &pre_additions, &mut updated_files);
-        }
-        updated_files
-    }
-
-    /// Re-analyses the readers a batch's additions reached.
-    ///
-    /// The batch expansion follows edges the earlier index recorded; an
-    /// addition has none — a read that missed the slot, name, or type cached
-    /// nothing to point back at it. `appeared_uris` names the files this batch
-    /// introduced (never seen, or reopened past a tombstone): every export of
-    /// theirs is an addition, so the full export diff runs through
-    /// `dependents_of` like `self_index_and_diff` would drive it. For a file
-    /// that was already indexed the name-level delta in `pre_additions` is
-    /// what identifies its additions.
-    ///
-    /// Only files that existed before this batch can hold a stale read: a
-    /// file indexed inside the batch was analysed against the batch's hoisted
-    /// decls, so a reader that is itself in `updated_files` needs nothing.
-    /// The surviving readers are settled through `reindex_files` — the same
-    /// self-index + ripple an edit uses — so their own moved exports
-    /// propagate instead of stopping at one hop. Batch files enter that
-    /// ripple only as actual dependents of a moved seed export or a moved
-    /// name — the dependency chain the repair owes — never by virtue of
-    /// being in the batch.
-    fn settle_batch_addition_readers(
-        &mut self,
-        appeared_uris: &FxHashSet<Uri>,
-        pre_additions: &FxHashMap<FileId, BatchPreAdditions>,
-        updated_files: &mut Vec<FileId>,
-    ) {
-        let db = self.compilation.get_db();
-        let vfs = db.get_vfs();
-        let mut readers = FxHashSet::default();
-        for file_id in updated_files.iter().copied() {
-            let appeared = vfs
-                .get_file_path(&file_id)
-                .and_then(file_path_to_uri)
-                .is_some_and(|uri| appeared_uris.contains(&uri));
-            if appeared {
-                // Every export is an addition: the same diff
-                // `self_index_and_diff` produces for a file that was not
-                // there, driven through the shared dependents query.
-                let new = export_map(db, file_id, &FileRemap::identity(file_id));
-                let diff = diff_exports(&ExportMap::default(), &new);
-                readers.extend(dependents_of(db, file_id, &diff));
-                readers.extend(self.evidence_dependents(file_id));
-            }
-            readers.extend(batch_addition_readers(
-                db,
-                file_id,
-                pre_additions.get(&file_id),
-            ));
-        }
-        let batch_set: FxHashSet<FileId> = updated_files.iter().copied().collect();
-        let seeds: Vec<FileId> = readers
-            .into_iter()
-            .filter(|file_id| !batch_set.contains(file_id))
-            .filter(|file_id| vfs.get_syntax_tree(file_id).is_some())
-            .collect();
-        if seeds.is_empty() {
-            return;
-        }
-        if std::env::var_os("GLUALS_PROFILE").is_some() {
-            eprintln!(
-                "[profile] settle_batch_addition_readers: seeds={}",
-                seeds.len()
-            );
-        }
-        updated_files.extend(self.reindex_files(seeds));
-        updated_files.sort_unstable();
-        updated_files.dedup();
-    }
-
-    #[allow(unused)]
-    pub(crate) fn update_files_by_uri_sorted(
-        &mut self,
-        files: Vec<(Uri, Option<String>)>,
-    ) -> Vec<FileId> {
-        let mut files = files;
-        files.sort_by_cached_key(|(uri, _)| uri_sort_key(uri));
-        let old_source_file_ids = files
-            .iter()
-            .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
-            .collect::<FxHashSet<_>>();
-        let removed_source_file_ids = files
-            .iter()
-            .filter(|(_, text)| text.is_none())
-            .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
-            .collect::<FxHashSet<_>>();
-        let mut old_guard_fact_file_ids =
-            self.expand_reindex_file_ids(old_source_file_ids.iter().copied().collect());
-        self.add_vgui_forwarding_removal_seed(
-            &removed_source_file_ids,
-            &mut old_guard_fact_file_ids,
-        );
-        let old_guard_fact_file_ids = old_guard_fact_file_ids
-            .into_iter()
-            .collect::<FxHashSet<_>>();
-        let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
-        let mut removed_files = FxHashSet::default();
-        let mut updated_files = FxHashSet::default();
-        let mut appeared_uris = FxHashSet::default();
-        {
-            let _p = Profile::new("update files");
-            for (uri, text) in files {
-                let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(&uri);
-                if let Some(file_id) = existing_file_id {
-                    if let (Some(new_text), Some(old_text)) = (
-                        text.as_deref(),
-                        self.compilation
-                            .get_db()
-                            .get_vfs()
-                            .get_file_content(&file_id)
-                            .map(String::as_str),
-                    ) && old_text == new_text
-                    {
-                        removed_files.insert(file_id);
-                        updated_files.insert(file_id);
-                        continue;
-                    }
-                    if self
-                        .compilation
-                        .get_db()
-                        .get_vfs()
-                        .get_syntax_tree(&file_id)
-                        .is_none()
-                    {
-                        appeared_uris.insert(uri.clone());
-                    }
-                } else if text.is_none() {
-                    continue;
-                } else {
-                    appeared_uris.insert(uri.clone());
-                }
-
-                let is_new_text = text.is_some();
-                let file_id = self
-                    .compilation
-                    .get_db_mut()
-                    .get_vfs_mut()
-                    .set_file_content(&uri, text);
-                removed_files.insert(file_id);
-                if is_new_text {
-                    updated_files.insert(file_id);
-                }
-            }
-        }
-        if removed_files.is_empty() {
-            return Vec::new();
-        }
-
-        let mut removed_files = self.expand_reindex_file_ids(removed_files.into_iter().collect());
-        self.add_vgui_forwarding_removal_seed(&removed_source_file_ids, &mut removed_files);
-        let guard_fact_file_ids = removed_files.iter().copied().collect::<FxHashSet<_>>();
-        let pre_additions: FxHashMap<FileId, BatchPreAdditions> = removed_files
-            .iter()
-            .filter(|file_id| {
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_syntax_tree(file_id)
-                    .is_some()
-            })
-            .map(|file_id| {
-                (
-                    *file_id,
-                    snapshot_batch_pre_additions(self.compilation.get_db(), *file_id),
-                )
-            })
-            .collect();
-        self.compilation.remove_index(removed_files.clone());
-        updated_files.extend(removed_files.into_iter().filter(|file_id| {
-            self.compilation
-                .get_db()
-                .get_vfs()
-                .get_syntax_tree(file_id)
-                .is_some()
-        }));
-        let mut updated_files: Vec<FileId> = updated_files.into_iter().collect();
-        updated_files.sort();
-        self.compilation.update_index(updated_files.clone());
-        self.stabilize_cross_file_type_caches(&updated_files);
-        for file_id in &old_source_file_ids {
-            self.compilation
-                .get_db_mut()
-                .get_call_site_param_index_mut()
-                .refresh_file_source_dependencies(*file_id);
-        }
-        self.reindex_changed_inferred_guard_references(
-            &guard_fact_file_ids,
-            &old_guard_facts,
-            &updated_files,
-            &old_source_file_ids,
-        );
-        self.reindex_changed_inferred_param_consumers(&old_guard_facts, &updated_files);
-        self.settle_batch_addition_readers(&appeared_uris, &pre_additions, &mut updated_files);
-        updated_files
-    }
-
-    /// Removes a file the way the filesystem did.
-    ///
-    /// One deletion is a one-item batch. The whole-file purge the removal used
-    /// to do by hand — a `PositionMap::whole_file` remap, so members other files
-    /// own on this file's table literals lose every offset — is what
-    /// `take_position_map` already returns once the VFS holds no text for the
-    /// file, and the batch feeds the owners it reports back into the dirty set
-    /// instead of discarding them. The contribution-signature seed the expansion
-    /// needed has no counterpart here because a contributed parameter is an
-    /// exported fact: the diff against an emptied export map names its readers.
-    /// Removes a file the way the filesystem did, and reports what to re-diagnose.
-    pub fn remove_file_by_uri(&mut self, uri: &Uri) -> (Option<FileId>, Vec<FileId>) {
-        let Some(file_id) = self.compilation.get_db().get_vfs().get_file_id(uri) else {
-            return (None, Vec::new());
-        };
-        log::info!(
-            "remove_file_by_uri: uri={} file_id={:?}",
-            uri.as_str(),
-            file_id
-        );
-        let affected = self.apply_file_system_changes(vec![(uri.clone(), None)]);
-        (Some(file_id), affected)
-    }
-
-    /// Phase 2 of an edit plus the textual widening: re-analyse what `dirty`
-    /// invalidated, then resolve the sideband refresh names to
-    /// diagnostic-refresh-only candidates and append them.
-    ///
-    /// `changed` seeds the returned set (the edited batch); the files the
-    /// ripple settled and the textual referencers of the moved names join it.
-    /// Returns every live file whose diagnostics this edit may have moved,
-    /// sorted and deduped. Unlike
-    /// [`apply_file_system_changes`](Self::apply_file_system_changes), no
-    /// detached-file filtering happens here: a caller that detaches URIs
-    /// retains the live files itself afterwards.
-    fn ripple_and_widen(&mut self, dirty: DirtySet, changed: Vec<FileId>) -> Vec<FileId> {
-        let refresh_names: std::collections::HashSet<SmolStr> =
-            dirty.textual_refresh_names().into_iter().collect();
-        let mut affected = changed;
-        let (rippled, ripple_names) = self.ripple_with_refresh_names(dirty);
-        affected.extend(rippled);
-        // Diagnostic-refresh-only, after the change-driven settle: batch and
-        // ripple names merged, then resolved to textual candidates via
-        // `files_referencing_name`, filtered to live `Main` files. No reindex,
-        // no `dirty_len`.
-        let mut all_names = refresh_names;
-        all_names.extend(ripple_names);
-        let exclude: std::collections::HashSet<FileId> = affected.iter().copied().collect();
-        let textual = self.textual_refresh_candidates(&all_names, &exclude);
-        affected.extend(textual);
+    /// Re-analyses `file_ids` from the text the VFS holds for them. Returns
+    /// every live file whose diagnostics may have changed: the files
+    /// themselves and every file whose diagnostics read a fact that moved.
+    pub fn reindex_files(&mut self, file_ids: Vec<FileId>) -> Vec<FileId> {
+        let mut affected = self.compilation.update_index(file_ids.clone());
+        affected.extend(file_ids);
+        let vfs = self.compilation.get_db().get_vfs();
+        affected.retain(|file_id| vfs.get_syntax_tree(file_id).is_some());
         affected.sort_unstable();
         affected.dedup();
         affected
     }
 
-    /// Applies a batch of filesystem changes — the creates, changes and deletes
-    /// a watched-file notification delivers together — and returns every live
-    /// file whose diagnostics the batch may have moved.
-    ///
-    /// The returned set is what a caller has to re-diagnose. It is deliberately
-    /// not just the files whose text changed: the files the ripple settled are
-    /// the ones nobody edited and nobody would otherwise refresh. Past the
-    /// change-driven settle, textual referencers of the changed names — from
-    /// both the batch and the ripple diffs — are appended as
-    /// diagnostic-refresh-only candidates: they are collected via
-    /// `files_referencing_name` after the ripple, under a shared borrow, so
-    /// they raise no `DirtySet::dirty_len` and move no index snapshot.
-    ///
-    /// `None` means the file is gone from disk. Unlike
-    /// [`update_file_by_uri`](Self::update_file_by_uri), which leaves a
-    /// tombstone, the URI is detached once the settle is done so a later file at
-    /// the same path is a new [`FileId`]. The detach has to come last: until
-    /// then the path is what finds the files whose reads of it have to be
-    /// re-derived.
+    pub fn update_remote_file_by_uri(&mut self, uri: &Uri, text: Option<String>) -> FileId {
+        let file_id = self
+            .compilation
+            .get_db_mut()
+            .get_vfs_mut()
+            .set_remote_file_content(uri, text);
+        self.reindex_files(vec![file_id]);
+        file_id
+    }
+
+    /// Sets every file's text in one batch and re-analyses them together.
+    /// Returns every live file whose diagnostics may have changed.
+    pub fn update_files_by_uri(&mut self, files: Vec<(Uri, Option<String>)>) -> Vec<FileId> {
+        self.apply_file_system_changes(files)
+    }
+
+    /// Removes a file the way the filesystem did, and reports what to
+    /// re-diagnose.
+    pub fn remove_file_by_uri(&mut self, uri: &Uri) -> (Option<FileId>, Vec<FileId>) {
+        let Some(file_id) = self.compilation.get_db().get_vfs().get_file_id(uri) else {
+            return (None, Vec::new());
+        };
+        let affected = self.apply_file_system_changes(vec![(uri.clone(), None)]);
+        (Some(file_id), affected)
+    }
+
+    /// Applies a batch of file-system events, the last event per file
+    /// winning, and re-analyses what changed.
     pub fn apply_file_system_changes(&mut self, files: Vec<(Uri, Option<String>)>) -> Vec<FileId> {
         let mut files = files;
         files.sort_by_cached_key(|(uri, _)| uri_sort_key(uri));
-        // One URI can arrive several times in a burst; only the last event is
-        // the state on disk.
         let mut latest: Vec<(Uri, Option<String>)> = Vec::with_capacity(files.len());
         for (uri, text) in files {
             match latest.last_mut() {
@@ -2948,90 +486,51 @@ impl EmmyLuaAnalysis {
         }
 
         let mut changed = Vec::new();
-        let mut existence_changed = Vec::new();
         let mut removed_uris = Vec::new();
         for (uri, text) in latest {
             let existing = self.compilation.get_db().get_vfs().get_file_id(&uri);
             if let Some(file_id) = existing
-                && let (Some(new_text), Some(old_text)) = (
-                    text.as_deref(),
-                    self.compilation
-                        .get_db()
-                        .get_vfs()
-                        .get_file_content(&file_id)
-                        .map(String::as_str),
-                )
-                && old_text == new_text
+                && self.text_is_indexed(file_id, text.as_deref())
             {
-                // Same bytes. Already indexed means nothing to do; an index that
-                // was cleared still owes its rebuild, and with no stash the
-                // remap is the identity, which is what an unchanged file wants.
-                if self
-                    .compilation
-                    .get_db()
-                    .get_module_index()
-                    .get_module(file_id)
-                    .is_none()
-                {
-                    changed.push(file_id);
-                }
                 continue;
             }
             if existing.is_none() && text.is_none() {
                 continue;
             }
-
-            let was_absent = existing.is_none_or(|file_id| {
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_syntax_tree(&file_id)
-                    .is_none()
-            });
-            let is_removed = text.is_none();
-            if let Some(file_id) = existing {
-                self.stash_indexed_text(file_id);
+            if text.is_none() {
+                removed_uris.push(uri.clone());
             }
             let file_id = self
                 .compilation
                 .get_db_mut()
                 .get_vfs_mut()
                 .set_file_content(&uri, text);
-            if was_absent || is_removed {
-                existence_changed.push(file_id);
-            }
-            if is_removed {
-                removed_uris.push(uri);
-            }
             changed.push(file_id);
         }
-
         if changed.is_empty() {
             return Vec::new();
         }
-        changed.sort_unstable();
-        changed.dedup();
-
-        let mut dirty = self.self_index_and_diff(changed.clone());
-        for file_id in existence_changed {
-            self.dirty_existence_dependents(&mut dirty, file_id);
-        }
-        let mut affected = self.ripple_and_widen(dirty, changed);
-
+        let affected = self.reindex_files(changed);
         for uri in &removed_uris {
             self.compilation.get_db_mut().get_vfs_mut().remove_file(uri);
         }
-
-        affected.retain(|file_id| {
-            self.compilation
-                .get_db()
-                .get_vfs()
-                .get_syntax_tree(file_id)
-                .is_some()
-        });
-        affected.sort_unstable();
-        affected.dedup();
         affected
+    }
+
+    /// For every file, the other files whose analysis read a fact it owns,
+    /// sorted.
+    pub fn dependent_files(&self) -> HashMap<FileId, Vec<FileId>> {
+        self.compilation
+            .get_db()
+            .reader_graph()
+            .dependent_files()
+            .into_iter()
+            .map(|(file_id, dependents)| {
+                let mut dependents = dependents.into_iter().collect::<Vec<_>>();
+                dependents.sort_unstable();
+                (file_id, dependents)
+            })
+            .collect()
     }
 
     pub fn update_files_by_path(&mut self, files: Vec<(PathBuf, Option<String>)>) -> Vec<FileId> {
@@ -3043,6 +542,31 @@ impl EmmyLuaAnalysis {
             })
             .collect();
         self.update_files_by_uri(files)
+    }
+
+    /// Whether the VFS holds exactly `text` for `file_id`.
+    fn vfs_text_equals(&self, file_id: FileId, text: Option<&str>) -> bool {
+        let current = self
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_content(&file_id)
+            .map(String::as_str);
+        text.is_some() && current == text
+    }
+
+    /// Whether `file_id` already holds `text` and its index was built from it.
+    fn text_is_indexed(&self, file_id: FileId, text: Option<&str>) -> bool {
+        self.vfs_text_equals(file_id, text) && self.compilation.is_indexed(file_id)
+    }
+
+    fn is_stale_version(&self, file_id: FileId, version: Option<i32>) -> bool {
+        let current = self
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_version(&file_id);
+        matches!((version, current), (Some(incoming), Some(current)) if incoming < current)
     }
 
     pub fn update_config(&mut self, config: Arc<Emmyrc>) {
@@ -3080,8 +604,10 @@ impl EmmyLuaAnalysis {
         file_id: FileId,
         cancel_token: CancellationToken,
     ) -> Option<Vec<lsp_types::Diagnostic>> {
-        self.diagnostic
-            .diagnose_file(&self.compilation, file_id, cancel_token)
+        self.compilation.record_diagnostic_reads(Some(file_id), || {
+            self.diagnostic
+                .diagnose_file(&self.compilation, file_id, cancel_token)
+        })
     }
 
     pub fn diagnose_file_with_shared(
@@ -3090,18 +616,22 @@ impl EmmyLuaAnalysis {
         cancel_token: CancellationToken,
         shared_data: std::sync::Arc<diagnostic::SharedDiagnosticData>,
     ) -> Option<Vec<lsp_types::Diagnostic>> {
-        self.diagnostic.diagnose_file_with_shared(
-            &self.compilation,
-            file_id,
-            cancel_token,
-            shared_data,
-        )
+        self.compilation.record_diagnostic_reads(Some(file_id), || {
+            self.diagnostic.diagnose_file_with_shared(
+                &self.compilation,
+                file_id,
+                cancel_token,
+                shared_data,
+            )
+        })
     }
 
     pub fn precompute_diagnostic_shared_data(
         &self,
     ) -> std::sync::Arc<diagnostic::SharedDiagnosticData> {
-        self.diagnostic.precompute_shared_data(&self.compilation)
+        self.compilation.record_diagnostic_reads(None, || {
+            self.diagnostic.precompute_shared_data(&self.compilation)
+        })
     }
 
     /// Return main-workspace files in an order that keeps parallel diagnostic
@@ -3238,227 +768,13 @@ impl Default for EmmyLuaAnalysis {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+
     use std::path::PathBuf;
 
-    use glua_parser::LuaSyntaxId;
     use lsp_types::Uri;
     use tokio_util::sync::CancellationToken;
 
-    use crate::{
-        EmmyLuaAnalysis, FileId, GmodVguiParentCallMetadata, GmodVguiParentCallOrigin,
-        GmodVguiParentSource, LuaDependencyKind, select_cross_file_stabilization_dependents,
-    };
-
-    #[test]
-    fn reindex_expansion_includes_indexed_file_dependents() {
-        let changed = FileId { id: 1 };
-        let direct_caller = FileId { id: 2 };
-        let transitive_caller = FileId { id: 3 };
-        let unrelated = FileId { id: 4 };
-        let mut analysis = EmmyLuaAnalysis::new();
-        let dependencies = analysis
-            .compilation
-            .get_db_mut()
-            .get_file_dependencies_index_mut();
-        dependencies.add_dependency_file(direct_caller, changed, LuaDependencyKind::Include);
-        dependencies.add_dependency_file(
-            transitive_caller,
-            direct_caller,
-            LuaDependencyKind::Include,
-        );
-        dependencies.add_dependency_file(unrelated, unrelated, LuaDependencyKind::Include);
-
-        assert_eq!(
-            analysis.expand_reindex_file_ids(vec![changed]),
-            vec![changed, direct_caller, transitive_caller]
-        );
-    }
-
-    #[test]
-    fn reindex_expansion_includes_inferred_return_producers() {
-        let workspace = std::env::temp_dir().join("gmod_glua_ls_inferred_return_dependencies");
-        let producer_uri = Uri::parse_from_file_path(&workspace.join("producer.lua"))
-            .expect("producer URI should parse");
-        let returner_uri = Uri::parse_from_file_path(&workspace.join("returner.lua"))
-            .expect("returner URI should parse");
-        let mut analysis = EmmyLuaAnalysis::new();
-        analysis.add_main_workspace(workspace);
-        let producer = analysis
-            .update_file_by_uri(
-                &producer_uri,
-                Some("State = {}\nState.value = 1".to_string()),
-            )
-            .map(|(id, _)| id)
-            .expect("producer should be indexed");
-        let returner = analysis
-            .update_file_by_uri(
-                &returner_uri,
-                Some("function GetStateValue() return State.value end".to_string()),
-            )
-            .map(|(id, _)| id)
-            .expect("returner should be indexed");
-
-        assert!(
-            analysis
-                .expand_reindex_file_ids(vec![producer])
-                .contains(&returner),
-            "a producer edit must reindex functions whose inferred return reads it"
-        );
-    }
-
-    #[test]
-    fn reindex_expansion_includes_unresolved_path_dependents_for_reopened_file() {
-        let workspace = std::env::temp_dir().join("gmod_glua_ls_reopen_dependency_workspace");
-        let uri = |name: &str| {
-            Uri::parse_from_file_path(&workspace.join(name)).expect("uri should parse")
-        };
-        let target_uri = uri("lua/mixins/reopened.lua");
-        let caller_uri = uri("lua/autorun/reopen_consumer.lua");
-        let mut analysis = EmmyLuaAnalysis::new();
-        analysis.add_main_workspace(workspace);
-        let old_target = analysis
-            .update_file_by_uri(&target_uri, Some("return {}".to_string()))
-            .map(|(id, _)| id)
-            .expect("target should be created");
-        let caller = analysis
-            .update_file_by_uri(
-                &caller_uri,
-                Some(r#"local reopened = include("mixins/reopened.lua")"#.to_string()),
-            )
-            .map(|(id, _)| id)
-            .expect("caller should be created");
-
-        analysis
-            .remove_file_by_uri(&target_uri)
-            .0
-            .expect("target should be removed");
-        assert_ne!(
-            analysis
-                .compilation
-                .get_db()
-                .get_vfs()
-                .get_file_id(&target_uri),
-            Some(old_target)
-        );
-
-        let reopened_target = analysis
-            .compilation
-            .get_db_mut()
-            .get_vfs_mut()
-            .set_file_content(&target_uri, Some("return {}".to_string()));
-
-        assert!(
-            analysis
-                .expand_reindex_file_ids(vec![reopened_target])
-                .contains(&caller)
-        );
-    }
-
-    fn reopen_path_expands_to_caller(
-        target_path: &str,
-        caller_path: &str,
-        dependency_expr: &str,
-    ) -> bool {
-        let workspace = std::env::temp_dir().join(format!(
-            "gmod_glua_ls_reopen_path_variants_{}",
-            target_path.replace(['/', '.'], "_")
-        ));
-        let uri = |name: &str| {
-            Uri::parse_from_file_path(&workspace.join(name)).expect("uri should parse")
-        };
-        let target_uri = uri(target_path);
-        let caller_uri = uri(caller_path);
-        let mut analysis = EmmyLuaAnalysis::new();
-        analysis.add_main_workspace(workspace);
-        analysis
-            .update_file_by_uri(&target_uri, Some("return {}".to_string()))
-            .map(|(id, _)| id)
-            .expect("target should be created");
-        let caller = analysis
-            .update_file_by_uri(
-                &caller_uri,
-                Some(format!("local reopened = {dependency_expr}")),
-            )
-            .map(|(id, _)| id)
-            .expect("caller should be created");
-
-        analysis
-            .remove_file_by_uri(&target_uri)
-            .0
-            .expect("target should be removed");
-        let reopened_target = analysis
-            .compilation
-            .get_db_mut()
-            .get_vfs_mut()
-            .set_file_content(&target_uri, Some("return {}".to_string()));
-
-        analysis
-            .expand_reindex_file_ids(vec![reopened_target])
-            .contains(&caller)
-    }
-
-    #[test]
-    fn reindex_expansion_matches_reopened_dependency_path_variants() {
-        for (target_path, caller_path, dependency_expr) in [
-            (
-                "lua/autorun/mixins/parent.lua",
-                "lua/autorun/sub/parent_consumer.lua",
-                r#"include("../mixins/parent.lua")"#,
-            ),
-            (
-                "lua/mixins/lua_prefixed.lua",
-                "lua/autorun/lua_prefixed_consumer.lua",
-                r#"include("lua/mixins/lua_prefixed.lua")"#,
-            ),
-            (
-                "lua/mixins/extensionless.lua",
-                "lua/autorun/extensionless_consumer.lua",
-                r#"include("mixins/extensionless")"#,
-            ),
-            (
-                "lua/mixins/required.lua",
-                "lua/autorun/required_consumer.lua",
-                r#"require("mixins.required")"#,
-            ),
-        ] {
-            assert!(
-                reopen_path_expands_to_caller(target_path, caller_path, dependency_expr),
-                "{dependency_expr} should match {target_path}"
-            );
-        }
-    }
-
-    #[test]
-    fn reindex_expansion_path_case_matches_vfs_platform_semantics() {
-        let matched = reopen_path_expands_to_caller(
-            "lua/mixins/CaseSensitive.lua",
-            "lua/autorun/case_consumer.lua",
-            r#"include("mixins/casesensitive.lua")"#,
-        );
-        assert_eq!(matched, cfg!(target_os = "windows"));
-    }
-
-    #[test]
-    fn stabilization_dependents_exclude_files_already_analyzed_in_batch() {
-        let changed_a = FileId { id: 1 };
-        let changed_b = FileId { id: 2 };
-        let unchanged_dependent = FileId { id: 3 };
-        let changed = HashSet::from_iter([changed_a, changed_b]);
-
-        assert_eq!(
-            select_cross_file_stabilization_dependents(
-                [
-                    changed_b,
-                    unchanged_dependent,
-                    changed_a,
-                    unchanged_dependent
-                ],
-                &changed,
-            ),
-            vec![unchanged_dependent]
-        );
-    }
+    use crate::{EmmyLuaAnalysis, FileId};
 
     #[test]
     fn diagnostic_file_ids_are_prioritized_by_source_size_then_file_id() {
@@ -3616,159 +932,6 @@ mod tests {
         assert_eq!(
             b1_id, b2_id,
             "b.lua file id should be input-order independent"
-        );
-    }
-
-    #[test]
-    fn vgui_forwarding_removal_seed_falls_back_to_another_workspace() {
-        let root = std::env::temp_dir().join("gmod_glua_ls_vgui_forwarding_seed_workspace");
-        let main_workspace = root.join("main");
-        let library_workspace = root.join("library");
-        let main_uri = Uri::parse_from_file_path(&main_workspace.join("consumer.lua"))
-            .expect("uri should parse");
-        let helper_uri = Uri::parse_from_file_path(&library_workspace.join("helper.lua"))
-            .expect("uri should parse");
-
-        let mut analysis = EmmyLuaAnalysis::new();
-        analysis.add_main_workspace(main_workspace);
-        analysis.add_library_workspace(library_workspace);
-        let main_file_id = analysis
-            .update_file_by_uri(&main_uri, Some("return true".to_string()))
-            .map(|(id, _)| id)
-            .expect("main file should be indexed");
-        let helper_file_id = analysis
-            .update_file_by_uri(&helper_uri, Some("return true".to_string()))
-            .map(|(id, _)| id)
-            .expect("helper file should be indexed");
-        let helper_syntax_id = LuaSyntaxId::from_node(
-            &analysis
-                .compilation
-                .get_db()
-                .get_vfs()
-                .get_syntax_tree(&helper_file_id)
-                .expect("helper syntax tree should exist")
-                .get_red_root(),
-        );
-        analysis
-            .compilation
-            .get_db_mut()
-            .get_gmod_class_metadata_index_mut()
-            .add_vgui_parent_call(
-                helper_file_id,
-                GmodVguiParentCallMetadata {
-                    syntax_id: helper_syntax_id,
-                    child: GmodVguiParentSource::Unknown,
-                    parent: GmodVguiParentSource::Unknown,
-                    relations: Vec::new(),
-                    resolved_source: None,
-                    origin: GmodVguiParentCallOrigin::Annotated,
-                },
-            );
-
-        let removed_file_ids = HashSet::from_iter([helper_file_id]);
-        let mut reindex_file_ids = vec![helper_file_id];
-        analysis.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut reindex_file_ids);
-
-        assert_eq!(reindex_file_ids, vec![main_file_id, helper_file_id]);
-    }
-
-    /// The language server re-indexes an edited file on its own before running
-    /// its dependency ripple, so a completion positioned in that file can be
-    /// answered without waiting seconds for the ripple. This checks the split
-    /// path reaches the same diagnostics as doing it in one go.
-    ///
-    /// It does **not** pin the ordering constraint that makes the split safe —
-    /// that the expansion is captured *before* the self-index, because a
-    /// self-index drops the edited file's declarations and inbound dependency
-    /// edges and an expansion taken afterwards under-invalidates. That was
-    /// measured on a gamemode workspace (739 files before the self-index, 6
-    /// after) and this fixture is far too small to reproduce it: it passes with
-    /// the two swapped. The real guard is `tools/determinism` against a real
-    /// workspace, and the reasoning lives on `reindex_expanded_files`.
-    #[test]
-    fn two_phase_reindex_matches_single_phase_diagnostics() {
-        // A class definition plus a consumer whose inferred type references it:
-        // the expansion reaches the consumer through the type-cache relation,
-        // which is the one that collapses once the definition site is dropped.
-        let producer_source = |member: &str| {
-            format!(
-                "---@class Thing
-local Thing = {{}}
-function Thing:{member}() end
-return Thing
-"
-            )
-        };
-        let consumer_source = "---@type Thing
-local thing
-thing:name()
-consume(thing)
-";
-        let helper_source = "function consume(value) end
-";
-
-        let build = |dir: &str| {
-            let workspace = std::env::temp_dir().join(dir);
-            let uri = |name: &str| {
-                Uri::parse_from_file_path(&workspace.join(name)).expect("uri should parse")
-            };
-            let uris = [uri("producer.lua"), uri("consumer.lua"), uri("helper.lua")];
-            let mut analysis = EmmyLuaAnalysis::new();
-            analysis.add_main_workspace(workspace);
-            analysis.update_files_by_uri(vec![
-                (uris[0].clone(), Some(producer_source("name"))),
-                (uris[1].clone(), Some(consumer_source.to_string())),
-                (uris[2].clone(), Some(helper_source.to_string())),
-            ]);
-            (analysis, uris)
-        };
-
-        let snapshot = |analysis: &EmmyLuaAnalysis, uris: &[Uri; 3]| {
-            let shared = analysis.precompute_diagnostic_shared_data();
-            uris.iter()
-                .map(|uri| {
-                    let file_id = analysis.get_file_id(uri).expect("file should be indexed");
-                    analysis
-                        .diagnose_file_with_shared(
-                            file_id,
-                            CancellationToken::new(),
-                            shared.clone(),
-                        )
-                        .unwrap_or_default()
-                })
-                .collect::<Vec<_>>()
-        };
-
-        // Renaming the produced field is a real change: the consumer reads the
-        // old name, so the edit has to reach it.
-        let (mut single, single_uris) = build("gmod_glua_ls_two_phase_single");
-        let single_producer = single
-            .update_file_text_only(&single_uris[0], producer_source("title"))
-            .expect("producer should exist");
-        single.reindex_files(vec![single_producer]);
-
-        let (mut split, split_uris) = build("gmod_glua_ls_two_phase_split");
-        let split_producer = split
-            .get_file_id(&split_uris[0])
-            .expect("producer should be indexed");
-        let expansion = split.expand_reindex_file_ids(vec![split_producer]);
-        split
-            .update_file_text_only(&split_uris[0], producer_source("title"))
-            .expect("producer should exist");
-        split.self_index_files(vec![split_producer]);
-        split.reindex_expanded_files(vec![split_producer], expansion);
-
-        let single_diagnostics = snapshot(&single, &single_uris);
-        assert!(
-            single_diagnostics
-                .iter()
-                .any(|diagnostics| !diagnostics.is_empty()),
-            "fixture should exercise observable diagnostics"
-        );
-        assert_eq!(
-            snapshot(&split, &split_uris),
-            single_diagnostics,
-            "self-indexing the edited file first must not change the outcome"
         );
     }
 

@@ -3,12 +3,11 @@ mod test {
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    use internment::ArcIntern;
     use smol_str::SmolStr;
 
     use crate::{
-        GenericTpl, GenericTplId, GlobalId, LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType,
-        VirtualWorkspace, compilation::analyzer::settled_assign_write_committable, get_member_map,
+        GlobalId, LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType, VirtualWorkspace,
+        get_member_map,
     };
 
     #[test]
@@ -983,97 +982,6 @@ mod test {
         assert_eq!(selected_ty, key_ty);
     }
 
-    /// The holder-sideways clause admits only forward moves: the holder may
-    /// replace its own contribution with an informative settled answer, never
-    /// trade it for one that says nothing. `any` is authoritative, not an
-    /// unfinished placeholder, so `any -> nil` (and `any -> unknown`, and an
-    /// informative answer collapsing to `nil`) must reject even from the
-    /// claim holder.
-    #[test]
-    fn settled_assign_gate_rejects_holder_backward_moves() {
-        assert!(!settled_assign_write_committable(
-            true,
-            &LuaType::Nil,
-            Some(&LuaType::Any),
-        ));
-        assert!(!settled_assign_write_committable(
-            true,
-            &LuaType::Unknown,
-            Some(&LuaType::Any),
-        ));
-        assert!(!settled_assign_write_committable(
-            true,
-            &LuaType::Nil,
-            Some(&LuaType::String),
-        ));
-        assert!(!settled_assign_write_committable(
-            true,
-            &LuaType::IntegerConst(32),
-            Some(&LuaType::Number),
-        ));
-    }
-
-    /// A leaked template parameter is not an answer, so any write — holder or
-    /// not — may replace it with an informative, leak-free settled type. A
-    /// floored placeholder behaves the same way for a non-holder.
-    #[test]
-    fn settled_assign_gate_accepts_non_holder_leak_and_placeholder_to_concrete() {
-        let leaked = LuaType::TplRef(Arc::new(GenericTpl::new(
-            GenericTplId::Func(0),
-            ArcIntern::new(SmolStr::new("T")),
-            None,
-        )));
-        assert!(settled_assign_write_committable(
-            false,
-            &LuaType::String,
-            Some(&leaked),
-        ));
-        assert!(settled_assign_write_committable(
-            false,
-            &LuaType::String,
-            Some(&LuaType::Unknown),
-        ));
-    }
-
-    /// The rest of the gate is unchanged: the holder still takes a genuinely
-    /// sideways informative answer (the multi-declaration merge shape), an
-    /// informative settled type still displaces `any` from any write, a
-    /// settled leak or a settled answer that says nothing still commits from
-    /// nowhere, and a non-holder still cannot move one informative answer to
-    /// another.
-    #[test]
-    fn settled_assign_gate_keeps_sideways_and_any_ranking() {
-        assert!(settled_assign_write_committable(
-            true,
-            &LuaType::Integer,
-            Some(&LuaType::String),
-        ));
-        assert!(settled_assign_write_committable(
-            false,
-            &LuaType::String,
-            Some(&LuaType::Any),
-        ));
-        assert!(!settled_assign_write_committable(
-            false,
-            &LuaType::Integer,
-            Some(&LuaType::String),
-        ));
-        assert!(!settled_assign_write_committable(
-            false,
-            &LuaType::Nil,
-            Some(&LuaType::String),
-        ));
-        assert!(!settled_assign_write_committable(
-            true,
-            &LuaType::TplRef(Arc::new(GenericTpl::new(
-                GenericTplId::Func(1),
-                ArcIntern::new(SmolStr::new("U")),
-                None,
-            ))),
-            Some(&LuaType::String),
-        ));
-    }
-
     /// The settled tail advances several independent parts of the boundary
     /// across successive rounds — a widening union, a multi-declaration merge
     /// tracked through the holder-sideways clause, a deferred multi-target,
@@ -1243,7 +1151,7 @@ mod test {
         };
 
         assert_domain(&mut ws);
-        ws.analysis.reindex_files_without_expansion(vec![loop_file]);
+        ws.analysis.reindex_files(vec![loop_file]);
         assert_domain(&mut ws);
     }
 

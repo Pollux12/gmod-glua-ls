@@ -6,7 +6,7 @@ use smol_str::SmolStr;
 use super::traits::LuaIndex;
 use crate::{
     DbIndex, FileId, GlobalId, InFiled, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaTypeDeclId,
-    db_index::op_log, db_index::read_set::WriteKey,
+    db_index::derivation::{self, FactKey, Fingerprint},
 };
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -120,14 +120,18 @@ pub struct DynamicFieldIndex {
     /// file → unattributed (field_name, site range) pairs contributed by this
     /// file.
     unattributed_file_contributions: HashMap<FileId, Vec<(SmolStr, TextRange)>>,
-    /// Count of dynamic-field definition changes, keyed by owner and field
-    /// name (`None` is the wildcard bucket). Field assignments land from the
-    /// dynamic-field passes and from member resolution during inference, so
-    /// without this counter every such write looks like unversioned state to
-    /// the fixpoint filter.
-    dynamic_writes: u64,
-    dynamic_write_versions: HashMap<(DynamicFieldOwner, Option<SmolStr>), u64>,
-    sealed: bool,
+    /// Multiset fingerprint of each owner's named slots, maintained by
+    /// [`DynamicFieldIndex::settle_named`].
+    owner_named_fingerprints: HashMap<DynamicFieldOwner, Fingerprint>,
+}
+
+/// One named slot's contribution to its owner's multiset fingerprint.
+fn named_entry(field_name: &str, slot: Fingerprint) -> Fingerprint {
+    if slot == derivation::ABSENT {
+        0
+    } else {
+        derivation::fingerprint_of(&(field_name, slot))
+    }
 }
 
 fn definition_sort_key(definition: &InFiled<TextRange>) -> (u32, u32, u32) {
@@ -154,16 +158,23 @@ fn merge_field_definitions(
     }
 }
 
-/// Appends the wildcard definitions the target does not already hold.
-///
-/// Order is left alone: `add_wildcard_definition` files these in walk order
-/// rather than a canonical one, so sorting here would make a re-indexed
-/// workspace disagree with a cold build.
+/// Files `definition` in canonical order unless `into` already holds it,
+/// so a file's rebuild restores the list a cold build has. Returns whether
+/// it was new.
+fn insert_definition(into: &mut Vec<InFiled<TextRange>>, definition: InFiled<TextRange>) -> bool {
+    let at = into.partition_point(|existing| {
+        definition_sort_key(existing) < definition_sort_key(&definition)
+    });
+    if into.get(at) == Some(&definition) {
+        return false;
+    }
+    into.insert(at, definition);
+    true
+}
+
 fn merge_wildcard_definitions(into: &mut Vec<InFiled<TextRange>>, from: Vec<InFiled<TextRange>>) {
     for definition in from {
-        if !into.contains(&definition) {
-            into.push(definition);
-        }
+        insert_definition(into, definition);
     }
 }
 
@@ -181,21 +192,8 @@ impl DynamicFieldIndex {
         file_id: FileId,
         range: TextRange,
     ) -> bool {
-        if op_log::recording() {
-            let owner2 = owner.clone();
-            let field_name2 = field_name.clone();
-            op_log::push(
-                op_log::Domain::DynamicField,
-                Box::new([
-                    WriteKey::DynamicField(owner.clone(), Some(field_name.clone())),
-                    WriteKey::FileScoped(file_id),
-                ]),
-                move |db| {
-                    db.get_dynamic_field_index_mut()
-                        .add_field(owner2, field_name2, file_id, range);
-                },
-            );
-        }
+        derivation::note_write(|| FactKey::DynamicFieldFile(file_id));
+        let old_slot = self.named_slot_fingerprint(&owner, &field_name);
         let definition = InFiled::new(file_id, range);
         let direct_definitions = self
             .direct_field_definitions
@@ -203,12 +201,10 @@ impl DynamicFieldIndex {
             .or_default()
             .entry(field_name.clone())
             .or_default();
-        let is_new_direct = !direct_definitions.contains(&definition);
-        if is_new_direct {
-            direct_definitions.push(definition);
-        }
+        let is_new_direct = insert_definition(direct_definitions, definition);
         let is_new_definition =
             self.add_field_inner(owner.clone(), field_name.clone(), file_id, range);
+        self.settle_named(&owner, &field_name, old_slot);
         if is_new_direct && !is_new_definition {
             // The union already held the definition through propagation, so
             // `add_field_inner` filed nothing — but direct membership is a
@@ -225,26 +221,12 @@ impl DynamicFieldIndex {
         file_id: FileId,
         range: TextRange,
     ) -> bool {
-        if op_log::recording() {
-            let owner2 = owner.clone();
-            let field_name2 = field_name.clone();
-            op_log::push(
-                op_log::Domain::DynamicField,
-                Box::new([
-                    WriteKey::DynamicField(owner.clone(), Some(field_name.clone())),
-                    WriteKey::FileScoped(file_id),
-                ]),
-                move |db| {
-                    db.get_dynamic_field_index_mut().add_propagated_field(
-                        owner2,
-                        field_name2,
-                        file_id,
-                        range,
-                    );
-                },
-            );
-        }
-        self.add_field_inner(owner, field_name, file_id, range)
+        derivation::note_write(|| FactKey::DynamicFieldFile(file_id));
+        let old_slot = self.named_slot_fingerprint(&owner, &field_name);
+        let is_new_definition =
+            self.add_field_inner(owner.clone(), field_name.clone(), file_id, range);
+        self.settle_named(&owner, &field_name, old_slot);
+        is_new_definition
     }
 
     fn add_field_inner(
@@ -267,17 +249,7 @@ impl DynamicFieldIndex {
             .or_default()
             .entry(field_name.clone())
             .or_default();
-        let definition = InFiled::new(file_id, range);
-        // Kept in canonical order: `field_definitions` feeds a union of
-        // overloads, so insertion order would make the elected arm depend on the
-        // batch walk order rather than on the workspace.
-        let insert_at = field_definitions.partition_point(|existing| {
-            definition_sort_key(existing) < definition_sort_key(&definition)
-        });
-        let is_new_definition = field_definitions.get(insert_at) != Some(&definition);
-        if is_new_definition {
-            field_definitions.insert(insert_at, definition);
-        }
+        let is_new_definition = insert_definition(field_definitions, InFiled::new(file_id, range));
 
         if is_new_definition {
             self.note_dynamic_write(owner.clone(), Some(field_name.clone()));
@@ -296,25 +268,11 @@ impl DynamicFieldIndex {
         file_id: FileId,
         range: TextRange,
     ) -> bool {
-        if op_log::recording() {
-            let owner2 = owner.clone();
-            op_log::push(
-                op_log::Domain::DynamicField,
-                Box::new([
-                    WriteKey::DynamicField(owner.clone(), None),
-                    WriteKey::FileScoped(file_id),
-                ]),
-                move |db| {
-                    db.get_dynamic_field_index_mut()
-                        .add_wildcard_definition(owner2, file_id, range);
-                },
-            );
-        }
+        derivation::note_write(|| FactKey::DynamicFieldFile(file_id));
         let definitions = self.wildcard_definitions.entry(owner.clone()).or_default();
         let definition = InFiled::new(file_id, range);
-        let is_new_definition = !definitions.contains(&definition);
+        let is_new_definition = insert_definition(definitions, definition);
         if is_new_definition {
-            definitions.push(definition);
             self.note_dynamic_write(owner.clone(), None);
             self.wildcard_file_contributions
                 .entry(file_id)
@@ -324,28 +282,13 @@ impl DynamicFieldIndex {
         is_new_definition
     }
 
-    /// Compare it across an operation to tell whether the operation changed
-    /// any dynamic-field definition.
-    pub fn dynamic_writes(&self) -> u64 {
-        self.dynamic_writes
-    }
-
-    /// Records a dynamic-field definition change. Callers bump only when the
-    /// write added a novel fact (`is_new` at the add sites, a drained
-    /// definition at removal); re-adding an identical definition must not
-    /// bump, or the fixpoint's staleness filter degrades to a full requeue.
+    /// Records a dynamic-field definition change.
     pub(crate) fn note_dynamic_write(
         &mut self,
         owner: DynamicFieldOwner,
         field_name: Option<SmolStr>,
     ) {
-        self.dynamic_writes += 1;
-        self.dynamic_write_versions
-            .insert((owner, field_name), self.dynamic_writes);
-    }
-
-    pub(crate) fn dynamic_write_version(&self, key: &(DynamicFieldOwner, Option<SmolStr>)) -> u64 {
-        self.dynamic_write_versions.get(key).copied().unwrap_or(0)
+        derivation::note_write(|| FactKey::DynamicField(owner, field_name));
     }
 
     /// Returns whether the unattributed record was new to the index.
@@ -359,29 +302,14 @@ impl DynamicFieldIndex {
         file_id: FileId,
         range: TextRange,
     ) -> bool {
-        if op_log::recording() {
-            let field_name2 = field_name.clone();
-            op_log::push(
-                op_log::Domain::DynamicField,
-                Box::new([
-                    WriteKey::UnattributedField(field_name.clone()),
-                    WriteKey::FileScoped(file_id),
-                ]),
-                move |db| {
-                    db.get_dynamic_field_index_mut().add_unattributed_field(
-                        field_name2,
-                        file_id,
-                        range,
-                    );
-                },
-            );
-        }
+        derivation::note_write(|| FactKey::DynamicFieldFile(file_id));
         let is_new = self
             .unattributed_fields
             .entry(field_name.clone())
             .or_default()
             .insert(InFiled::new(file_id, range));
         if is_new {
+            derivation::note_write(|| FactKey::UnattributedField(field_name.clone()));
             self.unattributed_file_contributions
                 .entry(file_id)
                 .or_default()
@@ -440,6 +368,7 @@ impl DynamicFieldIndex {
             })
             .unwrap_or_default();
         for (owner, field_name) in stale_named {
+            let old_slot = self.named_slot_fingerprint(&owner, &field_name);
             remove_field_definition(
                 &mut self.field_definitions,
                 &owner,
@@ -472,6 +401,7 @@ impl DynamicFieldIndex {
                     self.owner_fields.remove(&owner);
                 }
             }
+            self.settle_named(&owner, &field_name, old_slot);
             if let Some(contributions) = self.file_contributions.get_mut(&file_id) {
                 contributions.retain(|(o, n, contribution_range)| {
                     !(o == &owner && n == &field_name && *contribution_range == range)
@@ -510,12 +440,14 @@ impl DynamicFieldIndex {
             })
             .unwrap_or_default();
         for (owner, field_name) in stale_direct {
+            let old_slot = self.named_slot_fingerprint(&owner, &field_name);
             remove_field_definition(
                 &mut self.direct_field_definitions,
                 &owner,
                 &field_name,
                 &definition,
             );
+            self.settle_named(&owner, &field_name, old_slot);
             self.note_dynamic_write(owner, Some(field_name));
             changed = true;
         }
@@ -579,6 +511,7 @@ impl DynamicFieldIndex {
             })
             .unwrap_or_default();
         for field_name in stale_unattributed {
+            derivation::note_write(|| FactKey::UnattributedField(field_name.clone()));
             let site = InFiled::new(file_id, range);
             if let Some(sites) = self.unattributed_fields.get_mut(field_name.as_str()) {
                 sites.remove(&site);
@@ -687,6 +620,8 @@ impl DynamicFieldIndex {
             let mut lost = lost.into_iter().collect::<Vec<_>>();
             lost.sort_by_cached_key(|owner| format!("{owner:?}"));
             for owner in &lost {
+                self.note_whole_owner_write(owner);
+                self.owner_named_fingerprints.remove(owner);
                 // Dropping the group is a novel fact for its readers.
                 let field_names = self
                     .owner_fields
@@ -776,6 +711,22 @@ impl DynamicFieldIndex {
             }};
         }
 
+        let remapped_owners: Vec<DynamicFieldOwner> = self
+            .owner_fields
+            .keys()
+            .chain(self.field_definitions.keys())
+            .chain(self.direct_field_definitions.keys())
+            .chain(self.finite_named_members.keys())
+            .chain(self.wildcard_definitions.keys())
+            .filter_map(|owner| Some([owner.clone(), remap_owner(owner, map)?]))
+            .flatten()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        for owner in &remapped_owners {
+            self.note_whole_owner_write(owner);
+        }
+
         remap_owner_keyed!(self.owner_fields, |slot, group| {
             for (field_name, files) in group {
                 slot.entry(field_name).or_default().extend(files);
@@ -793,6 +744,9 @@ impl DynamicFieldIndex {
         remap_owner_keyed!(self.wildcard_definitions, |slot, group| {
             merge_wildcard_definitions(slot, group)
         });
+        for owner in &remapped_owners {
+            self.recompute_owner_named(owner);
+        }
 
         for entries in self.file_contributions.values_mut() {
             for (owner, _, _) in entries.iter_mut() {
@@ -848,22 +802,13 @@ impl DynamicFieldIndex {
             .collect()
     }
 
-    /// Whether the index has finished being built for the current analysis
-    /// round. A read taken before that answers from however far the batch walk
-    /// happened to get, so an absent field is not yet known to be absent.
-    pub fn is_sealed(&self) -> bool {
-        self.sealed
-    }
-
-    pub fn set_sealed(&mut self, sealed: bool) {
-        self.sealed = sealed;
-    }
-
     pub fn has_unattributed_field(&self, field_name: &str) -> bool {
+        derivation::note_read(|| FactKey::UnattributedField(field_name.into()));
         self.unattributed_fields.contains_key(field_name)
     }
 
     pub fn has_field(&self, owner: &DynamicFieldOwner, field_name: &str) -> bool {
+        derivation::note_read(|| FactKey::DynamicField(owner.clone(), Some(field_name.into())));
         self.owner_fields
             .get(owner)
             .is_some_and(|fields| fields.contains_key(field_name))
@@ -875,6 +820,7 @@ impl DynamicFieldIndex {
         field_name: &str,
         file_id: FileId,
     ) -> bool {
+        derivation::note_read(|| FactKey::DynamicField(owner.clone(), Some(field_name.into())));
         self.owner_fields
             .get(owner)
             .and_then(|fields| fields.get(field_name))
@@ -885,6 +831,7 @@ impl DynamicFieldIndex {
         &self,
         owner: &DynamicFieldOwner,
     ) -> Option<&HashMap<SmolStr, HashSet<FileId>>> {
+        derivation::note_read(|| FactKey::DynamicField(owner.clone(), None));
         self.owner_fields.get(owner)
     }
 
@@ -892,6 +839,7 @@ impl DynamicFieldIndex {
         &self,
         owner: &DynamicFieldOwner,
     ) -> Option<&HashMap<SmolStr, Vec<InFiled<TextRange>>>> {
+        derivation::note_read(|| FactKey::DynamicField(owner.clone(), None));
         self.direct_field_definitions.get(owner)
     }
 
@@ -901,27 +849,14 @@ impl DynamicFieldIndex {
         owner: DynamicFieldOwner,
         member_id: LuaMemberId,
     ) -> bool {
-        if op_log::recording() {
-            let owner2 = owner.clone();
-            op_log::push(
-                op_log::Domain::DynamicField,
-                Box::new([
-                    WriteKey::DynamicField(owner.clone(), None),
-                    WriteKey::MemberId(member_id),
-                    WriteKey::FileScoped(member_id.file_id),
-                ]),
-                move |db| {
-                    db.get_dynamic_field_index_mut()
-                        .add_finite_named_member(owner2, member_id);
-                },
-            );
-        }
+        derivation::note_write(|| FactKey::DynamicFieldFile(member_id.file_id));
         let is_new = self
             .finite_named_members
             .entry(owner.clone())
             .or_default()
             .insert(member_id);
         if is_new {
+            derivation::note_write(|| FactKey::DynamicField(owner.clone(), None));
             self.finite_named_file_contributions
                 .entry(member_id.file_id)
                 .or_default()
@@ -935,9 +870,11 @@ impl DynamicFieldIndex {
         owner: &DynamicFieldOwner,
         member_id: LuaMemberId,
     ) {
+        derivation::note_write(|| FactKey::DynamicFieldFile(member_id.file_id));
         let Some(members) = self.finite_named_members.get_mut(owner) else {
             return;
         };
+        derivation::note_write(|| FactKey::DynamicField(owner.clone(), None));
         members.remove(&member_id);
         if members.is_empty() {
             self.finite_named_members.remove(owner);
@@ -959,18 +896,21 @@ impl DynamicFieldIndex {
         owner: &DynamicFieldOwner,
         member_id: LuaMemberId,
     ) -> bool {
+        derivation::note_read(|| FactKey::DynamicField(owner.clone(), None));
         self.finite_named_members
             .get(owner)
             .is_some_and(|members| members.contains(&member_id))
     }
 
     pub fn owner_has_finite_named_members(&self, owner: &DynamicFieldOwner) -> bool {
+        derivation::note_read(|| FactKey::DynamicField(owner.clone(), None));
         self.finite_named_members
             .get(owner)
             .is_some_and(|members| !members.is_empty())
     }
 
     pub fn get_fields_in_file(&self, owner: &DynamicFieldOwner, file_id: FileId) -> Vec<&SmolStr> {
+        derivation::note_read(|| FactKey::DynamicField(owner.clone(), None));
         self.owner_fields
             .get(owner)
             .map(|fields| {
@@ -988,7 +928,7 @@ impl DynamicFieldIndex {
         owner: &DynamicFieldOwner,
         field_name: &str,
     ) -> &[InFiled<TextRange>] {
-        crate::db_index::read_set::record_dynamic_field(owner, Some(field_name));
+        derivation::note_read(|| FactKey::DynamicField(owner.clone(), Some(field_name.into())));
         self.field_definitions
             .get(owner)
             .and_then(|fields| fields.get(field_name))
@@ -996,7 +936,7 @@ impl DynamicFieldIndex {
     }
 
     pub fn get_wildcard_definitions(&self, owner: &DynamicFieldOwner) -> Vec<InFiled<TextRange>> {
-        crate::db_index::read_set::record_dynamic_field(owner, None);
+        derivation::note_read(|| FactKey::DynamicField(owner.clone(), None));
         self.wildcard_definitions
             .get(owner)
             .cloned()
@@ -1004,7 +944,7 @@ impl DynamicFieldIndex {
     }
 
     pub fn has_wildcard_definitions(&self, owner: &DynamicFieldOwner) -> bool {
-        crate::db_index::read_set::record_dynamic_field(owner, None);
+        derivation::note_read(|| FactKey::DynamicField(owner.clone(), None));
         self.wildcard_definitions
             .get(owner)
             .is_some_and(|definitions| !definitions.is_empty())
@@ -1067,6 +1007,132 @@ impl DynamicFieldIndex {
         definitions.sort_by_key(|definition| (definition.file_id, definition.value.start()));
         definitions.dedup();
         definitions
+    }
+
+    /// What a read of `DynamicField(owner, Some(field_name))` observes: the
+    /// assigning files, the definitions and the direct definitions.
+    fn named_slot_fingerprint(&self, owner: &DynamicFieldOwner, field_name: &str) -> Fingerprint {
+        let files = self
+            .owner_fields
+            .get(owner)
+            .and_then(|fields| fields.get(field_name));
+        let definitions = self
+            .field_definitions
+            .get(owner)
+            .and_then(|fields| fields.get(field_name));
+        let direct = self
+            .direct_field_definitions
+            .get(owner)
+            .and_then(|fields| fields.get(field_name));
+        if files.is_none() && definitions.is_none() && direct.is_none() {
+            return derivation::ABSENT;
+        }
+        let files = files.map(|files| {
+            let mut files: Vec<FileId> = files.iter().copied().collect();
+            files.sort_unstable();
+            files
+        });
+        derivation::fingerprint_of(&(files, definitions, direct))
+    }
+
+    /// Notes a named slot's change since `old_slot` and folds it into the
+    /// owner's multiset fingerprint.
+    fn settle_named(&mut self, owner: &DynamicFieldOwner, field_name: &str, old_slot: Fingerprint) {
+        let new_slot = self.named_slot_fingerprint(owner, field_name);
+        if new_slot == old_slot {
+            return;
+        }
+        derivation::note_write(|| FactKey::DynamicField(owner.clone(), Some(field_name.into())));
+        derivation::note_write(|| FactKey::DynamicField(owner.clone(), None));
+        let digest = self
+            .owner_named_fingerprints
+            .entry(owner.clone())
+            .or_default();
+        *digest = digest
+            .wrapping_sub(named_entry(field_name, old_slot))
+            .wrapping_add(named_entry(field_name, new_slot));
+        if *digest == 0 {
+            self.owner_named_fingerprints.remove(owner);
+        }
+    }
+
+    fn owner_field_names(&self, owner: &DynamicFieldOwner) -> HashSet<SmolStr> {
+        [&self.field_definitions, &self.direct_field_definitions]
+            .into_iter()
+            .filter_map(|map| map.get(owner))
+            .flat_map(|fields| fields.keys().cloned())
+            .chain(
+                self.owner_fields
+                    .get(owner)
+                    .into_iter()
+                    .flat_map(|fields| fields.keys().cloned()),
+            )
+            .collect()
+    }
+
+    /// Notes every key of `owner` ahead of a whole-owner rewrite.
+    fn note_whole_owner_write(&self, owner: &DynamicFieldOwner) {
+        if !derivation::recording() {
+            return;
+        }
+        derivation::note_write(|| FactKey::DynamicField(owner.clone(), None));
+        for field_name in self.owner_field_names(owner) {
+            derivation::note_write(|| FactKey::DynamicField(owner.clone(), Some(field_name)));
+        }
+    }
+
+    /// Rebuilds `owner`'s multiset fingerprint after a whole-owner rewrite.
+    fn recompute_owner_named(&mut self, owner: &DynamicFieldOwner) {
+        let digest = self
+            .owner_field_names(owner)
+            .iter()
+            .map(|field_name| {
+                named_entry(field_name, self.named_slot_fingerprint(owner, field_name))
+            })
+            .fold(0u64, u64::wrapping_add);
+        if digest == 0 {
+            self.owner_named_fingerprints.remove(owner);
+        } else {
+            self.owner_named_fingerprints.insert(owner.clone(), digest);
+        }
+    }
+
+    /// `DynamicField(owner, None)` covers the owner-wide reads: wildcard
+    /// definitions, finite-named members and every named slot.
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        match key {
+            FactKey::DynamicFieldFile(file_id) => {
+                derivation::fingerprint_opt(self.file_contributions.get(file_id))
+            }
+            FactKey::DynamicField(owner, Some(field_name)) => {
+                self.named_slot_fingerprint(owner, field_name)
+            }
+            FactKey::DynamicField(owner, None) => {
+                let wildcards = self.wildcard_definitions.get(owner);
+                let finite = self.finite_named_members.get(owner).map(|members| {
+                    members
+                        .iter()
+                        .map(derivation::fingerprint_of)
+                        .fold(0u64, u64::wrapping_add)
+                });
+                let named = self.owner_named_fingerprints.get(owner);
+                if wildcards.is_none() && finite.is_none() && named.is_none() {
+                    return derivation::ABSENT;
+                }
+                derivation::fingerprint_of(&(wildcards, finite, named))
+            }
+            FactKey::UnattributedField(field_name) => {
+                if self.unattributed_fields.contains_key(field_name) {
+                    derivation::fingerprint_of(&true)
+                } else {
+                    derivation::ABSENT
+                }
+            }
+            _ => {
+                debug_assert!(false, "{key:?} is not a dynamic-field fact");
+                derivation::ABSENT
+            }
+        }
     }
 }
 
@@ -1171,6 +1237,7 @@ impl LuaIndex for DynamicFieldIndex {
         for &file_id in file_ids {
             if let Some(contributions) = self.file_contributions.remove(&file_id) {
                 for (owner, field_name, range) in contributions {
+                    let old_slot = self.named_slot_fingerprint(&owner, &field_name);
                     let definition = InFiled::new(file_id, range);
                     remove_field_definition(
                         &mut self.field_definitions,
@@ -1199,6 +1266,7 @@ impl LuaIndex for DynamicFieldIndex {
                             self.owner_fields.remove(&owner);
                         }
                     }
+                    self.settle_named(&owner, &field_name, old_slot);
                 }
             }
 
@@ -1217,6 +1285,7 @@ impl LuaIndex for DynamicFieldIndex {
 
             if let Some(contributions) = self.finite_named_file_contributions.remove(&file_id) {
                 for (owner, member_id) in contributions {
+                    derivation::note_write(|| FactKey::DynamicField(owner.clone(), None));
                     if let Some(members) = self.finite_named_members.get_mut(&owner) {
                         members.remove(&member_id);
                         if members.is_empty() {
@@ -1228,6 +1297,7 @@ impl LuaIndex for DynamicFieldIndex {
 
             if let Some(contributions) = self.unattributed_file_contributions.remove(&file_id) {
                 for (field_name, range) in contributions {
+                    derivation::note_write(|| FactKey::UnattributedField(field_name.clone()));
                     let site = InFiled::new(file_id, range);
                     if let Some(sites) = self.unattributed_fields.get_mut(&field_name) {
                         sites.remove(&site);
@@ -1241,6 +1311,23 @@ impl LuaIndex for DynamicFieldIndex {
     }
 
     fn clear(&mut self) {
+        if derivation::recording() {
+            let owners: HashSet<&DynamicFieldOwner> = self
+                .owner_fields
+                .keys()
+                .chain(self.field_definitions.keys())
+                .chain(self.direct_field_definitions.keys())
+                .chain(self.finite_named_members.keys())
+                .chain(self.wildcard_definitions.keys())
+                .collect();
+            for owner in owners {
+                self.note_whole_owner_write(owner);
+            }
+            for field_name in self.unattributed_fields.keys() {
+                derivation::note_write(|| FactKey::UnattributedField(field_name.clone()));
+            }
+        }
+        self.owner_named_fingerprints.clear();
         self.owner_fields.clear();
         self.field_definitions.clear();
         self.direct_field_definitions.clear();
@@ -1251,12 +1338,6 @@ impl LuaIndex for DynamicFieldIndex {
         self.wildcard_file_contributions.clear();
         self.unattributed_fields.clear();
         self.unattributed_file_contributions.clear();
-        self.dynamic_write_versions.clear();
-        // The counter survives a clear (it is monotonic, never an index
-        // position) but must still move: a consumer comparing it across the
-        // clear sees empty maps where definitions used to be.
-        self.dynamic_writes += 1;
-        self.sealed = false;
     }
 }
 
@@ -1626,85 +1707,6 @@ mod tests {
         );
     }
 
-    /// Only a novel definition may bump the dynamic epoch: re-adding an
-    /// identical definition reports not-new and leaves the version alone, or
-    /// the fixpoint filter degrades to a full requeue.
-    #[test]
-    fn readding_an_identical_definition_bumps_no_dynamic_epoch() {
-        let owner = DynamicFieldOwner::Type(LuaTypeDeclId::global("DynVersionTest"));
-        let field = SmolStr::new("value");
-        let file_id = FileId::new(1);
-
-        let mut index = DynamicFieldIndex::new();
-        assert!(index.add_field(owner.clone(), field.clone(), file_id, range(1, 2)));
-        let writes_after_insert = index.dynamic_writes();
-        assert!(writes_after_insert > 0);
-
-        assert!(!index.add_field(owner.clone(), field.clone(), file_id, range(1, 2)));
-        assert_eq!(index.dynamic_writes(), writes_after_insert);
-
-        let key = (owner.clone(), Some(field.clone()));
-        assert_eq!(index.dynamic_write_version(&key), writes_after_insert);
-    }
-
-    /// The wildcard bucket versions apart from the named slots: a wildcard
-    /// write must not requeue a reader of an unrelated named field.
-    #[test]
-    fn wildcard_and_named_slots_version_independently() {
-        let owner = DynamicFieldOwner::Type(LuaTypeDeclId::global("DynVersionTest"));
-        let file_id = FileId::new(1);
-
-        let mut index = DynamicFieldIndex::new();
-        index.add_field(owner.clone(), SmolStr::new("named"), file_id, range(1, 2));
-        let named_version =
-            index.dynamic_write_version(&(owner.clone(), Some(SmolStr::new("named"))));
-        assert_eq!(
-            index.dynamic_write_version(&(owner.clone(), None)),
-            0,
-            "a named write must not tick the wildcard bucket"
-        );
-
-        index.add_wildcard_definition(owner.clone(), file_id, range(3, 4));
-        assert_eq!(
-            index.dynamic_write_version(&(owner.clone(), Some(SmolStr::new("named")))),
-            named_version,
-            "a wildcard write must not tick an unrelated named slot"
-        );
-        assert!(
-            index.dynamic_write_version(&(owner.clone(), None)) > 0,
-            "the wildcard write must tick its own bucket"
-        );
-    }
-
-    /// Draining a definition is a novel fact for the slot's readers.
-    #[test]
-    fn removing_a_definition_bumps_its_slot_version() {
-        let owner = DynamicFieldOwner::Type(LuaTypeDeclId::global("DynVersionTest"));
-        let field = SmolStr::new("value");
-        let removed_file = FileId::new(1);
-        let remaining_file = FileId::new(2);
-
-        let mut index = DynamicFieldIndex::new();
-        index.add_field(owner.clone(), field.clone(), removed_file, range(1, 2));
-        index.add_field(owner.clone(), field.clone(), remaining_file, range(3, 4));
-        index.add_wildcard_definition(owner.clone(), removed_file, range(5, 6));
-        let key = (owner.clone(), Some(field.clone()));
-        let wildcard_key: (DynamicFieldOwner, Option<SmolStr>) = (owner.clone(), None);
-        let version_before = index.dynamic_write_version(&key);
-        let wildcard_before = index.dynamic_write_version(&wildcard_key);
-
-        index.remove(removed_file);
-
-        assert!(
-            index.dynamic_write_version(&key) > version_before,
-            "draining a definition must invalidate the slot's readers"
-        );
-        assert!(
-            index.dynamic_write_version(&wildcard_key) > wildcard_before,
-            "draining a wildcard must invalidate the bucket's readers"
-        );
-    }
-
     /// Contributions-driven removal leaves exactly the state a fresh index
     /// built from the surviving files' inputs holds, finite-named members
     /// included.
@@ -2004,9 +2006,7 @@ mod tests {
     /// Direct membership is a separate fact from the union of definitions:
     /// a site whose write moves between the direct and propagated tiers
     /// keeps its union slot, so reconciling only the union would leave the
-    /// direct set stale in both directions. Each move must also tick the
-    /// slot's version — a `get_direct_fields` reader that saw the old tier
-    /// is stale even though no definition was added or removed.
+    /// direct set stale in both directions.
     #[test]
     fn replace_site_contributions_reconciles_direct_membership_independently() {
         let site_file = FileId::new(1);
@@ -2016,7 +2016,6 @@ mod tests {
         let sibling_range = range(5, 6);
         let site_def = InFiled::new(site_file, site_range);
         let sibling_def = InFiled::new(site_file, sibling_range);
-        let key = (owner.clone(), Some(field.clone()));
 
         let mut index = DynamicFieldIndex::new();
         index.add_field(owner.clone(), field.clone(), site_file, site_range);
@@ -2025,7 +2024,6 @@ mod tests {
         // direct → propagated: the union is unchanged, but the site's
         // definition leaves the direct set. The sibling's direct record
         // survives — it is not this site's to withdraw.
-        let version_before = index.dynamic_write_version(&key);
         assert!(index.replace_site_contributions(
             site_file,
             site_range,
@@ -2047,14 +2045,9 @@ mod tests {
             Some(&[sibling_def.clone()][..]),
             "the site's definition left the direct set; the sibling's stands"
         );
-        assert!(
-            index.dynamic_write_version(&key) > version_before,
-            "a tier change is a novel fact for the slot's readers"
-        );
 
         // propagated → direct: the union is still unchanged, so only the
         // direct-set fix reports the move.
-        let version_before = index.dynamic_write_version(&key);
         assert!(index.replace_site_contributions(
             site_file,
             site_range,
@@ -2070,10 +2063,8 @@ mod tests {
             .unwrap_or_default();
         direct.sort_by_key(definition_sort_key);
         assert_eq!(direct, [site_def.clone(), sibling_def.clone()]);
-        assert!(index.dynamic_write_version(&key) > version_before);
 
-        // An identical replacement is a no-op: nothing moved, nothing ticks.
-        let version_before = index.dynamic_write_version(&key);
+        // An identical replacement is a no-op.
         assert!(!index.replace_site_contributions(
             site_file,
             site_range,
@@ -2082,7 +2073,6 @@ mod tests {
             &[],
             &[],
         ));
-        assert_eq!(index.dynamic_write_version(&key), version_before);
     }
 
     /// The site's unattributed set is exact: a name the site filed a record

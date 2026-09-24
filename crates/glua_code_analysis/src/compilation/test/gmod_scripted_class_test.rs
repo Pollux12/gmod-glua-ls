@@ -2726,6 +2726,66 @@ mod test {
         );
     }
 
+    fn vgui_table_class_setup(ws: &mut VirtualWorkspace) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+    }
+
+    const VGUI_PANEL_FILE: &str = "lua/vgui/panel_table.lua";
+    const VGUI_PANEL_UNREGISTERED: &str = r#"
+            local PANEL = {}
+            function PANEL:Init() end
+            MYPANEL = PANEL
+        "#;
+    const VGUI_PANEL_REGISTERED: &str = r#"
+            local PANEL = {}
+            function PANEL:Init() end
+            MYPANEL = PANEL
+            vgui.Register("MyPanel", PANEL, "DPanel")
+        "#;
+    const VGUI_PANEL_READER: (&str, &str) = (
+        "lua/vgui/panel_reader.lua",
+        r#"
+            local panel = MYPANEL
+            panel:Init()
+        "#,
+    );
+
+    fn reader_names_my_panel(ws: &VirtualWorkspace) -> bool {
+        ws.semantic_digest()
+            .iter()
+            .any(|line| line.contains("panel_reader") && line.contains("MyPanel"))
+    }
+
+    /// Dropping the registration turns another file's view of the table back
+    /// into the table, as in a build that never saw it.
+    #[gtest]
+    fn removing_a_vgui_registration_unclasses_the_table_elsewhere() {
+        let warm = VirtualWorkspace::assert_warm_matches_cold(
+            vgui_table_class_setup,
+            &[(VGUI_PANEL_FILE, VGUI_PANEL_REGISTERED), VGUI_PANEL_READER],
+            &[(VGUI_PANEL_FILE, VGUI_PANEL_UNREGISTERED)],
+        );
+        expect_false!(reader_names_my_panel(&warm));
+    }
+
+    /// Adding the registration classes another file's view of the table, as
+    /// in a build that saw it from the start.
+    #[gtest]
+    fn adding_a_vgui_registration_classes_the_table_elsewhere() {
+        let warm = VirtualWorkspace::assert_warm_matches_cold(
+            vgui_table_class_setup,
+            &[
+                (VGUI_PANEL_FILE, VGUI_PANEL_UNREGISTERED),
+                VGUI_PANEL_READER,
+            ],
+            &[(VGUI_PANEL_FILE, VGUI_PANEL_REGISTERED)],
+        );
+        expect_true!(reader_names_my_panel(&warm));
+    }
+
     #[gtest]
     fn test_vgui_register_creates_panel_class() {
         let mut ws = VirtualWorkspace::new();
@@ -12061,8 +12121,7 @@ GM.TestValue = 1"#,
         let hooks_file = file_ids[3];
 
         let cold = gm_signature_return_type(&mut ws, hooks_file, "PhysgunPickup");
-        ws.analysis
-            .reindex_files_without_expansion(vec![hooks_file]);
+        ws.analysis.reindex_files(vec![hooks_file]);
         let warm = gm_signature_return_type(&mut ws, hooks_file, "PhysgunPickup");
         assert_eq!(warm, cold, "cold={cold:?} warm={warm:?}");
     }
@@ -12595,8 +12654,7 @@ GM.TestValue = 1"#,
         ws.analysis
             .update_file_text_only(&uri, global_source.to_string())
             .expect("restage global file");
-        let dirty = ws.analysis.self_index_and_diff(vec![global_file]);
-        ws.analysis.ripple(dirty);
+        ws.analysis.reindex_files(vec![global_file]);
         assert_local_owner(ws.get_db_mut(), "warm");
     }
 

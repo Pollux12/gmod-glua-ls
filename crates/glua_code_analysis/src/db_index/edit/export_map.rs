@@ -353,44 +353,37 @@ fn contributed_params(
     remap: &FileRemap,
     map: &mut ExportMap,
 ) {
-    for ((signature_id, param_idx), typ) in db
-        .get_call_site_param_index()
-        .inferred_params_for_contributor_files(files)
-    {
-        let key_id = remapped(remap.signature_id(signature_id), signature_id);
-        map.insert(
-            ExportKey::ContributedParam(key_id, param_idx as u16),
-            hash_with(|h| hash_type(remap, &typ, h)),
-        );
+    let call_site_index = db.get_call_site_param_index();
+    for file_id in files {
+        for contribution in call_site_index.file_contributions(*file_id) {
+            let signature_id = contribution.signature_id;
+            let Some(typ) =
+                call_site_index.get_inferred_param(&signature_id, contribution.param_idx)
+            else {
+                continue;
+            };
+            let key_id = remapped(remap.signature_id(signature_id), signature_id);
+            map.insert(
+                ExportKey::ContributedParam(key_id, contribution.param_idx as u16),
+                hash_with(|h| hash_type(remap, typ, h)),
+            );
+        }
     }
 }
 
 // --- 6b. Call-site links this file contributes to signatures ---
 fn call_site_links(db: &DbIndex, file_id: FileId, remap: &FileRemap, map: &mut ExportMap) {
-    let call_site_index = db.get_call_site_param_index();
     let mut sig_contributions =
         FxHashMap::<LuaSignatureId, Vec<(usize, &crate::LuaTypeFact)>>::default();
-    if let Some(contributions) = call_site_index.file_contributions(file_id) {
-        for contribution in contributions {
-            sig_contributions
-                .entry(contribution.signature_id)
-                .or_default()
-                .push((contribution.param_idx, &contribution.param_fact));
-        }
-    }
-    let mut return_signatures = FxHashSet::default();
-    if let Some(consumers) = call_site_index.file_return_consumers(file_id) {
-        for consumer in consumers {
-            return_signatures.insert(consumer.signature_id);
-        }
+    for contribution in db.get_call_site_param_index().file_contributions(file_id) {
+        sig_contributions
+            .entry(contribution.signature_id)
+            .or_default()
+            .push((contribution.param_idx, &contribution.param_fact));
     }
 
-    let mut all_signatures: FxHashSet<LuaSignatureId> = sig_contributions.keys().copied().collect();
-    all_signatures.extend(return_signatures);
-
-    for signature_id in all_signatures {
+    for (signature_id, mut params) in sig_contributions {
         let key_id = remapped(remap.signature_id(signature_id), signature_id);
-        let mut params = sig_contributions.remove(&signature_id).unwrap_or_default();
         params.sort_by_key(|(idx, _)| *idx);
         map.insert(
             ExportKey::CallSiteLink(key_id),
@@ -1053,7 +1046,6 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Ha
     let mut type_refs: Vec<crate::TypeCacheRef> = vec![crate::TypeCacheRef::Module(file_id)];
     let mut nodes: Vec<LuaInferenceNodeId> = Vec::new();
     let mut signatures: Vec<LuaSignatureId> = Vec::new();
-    let mut return_consumer_signatures: Vec<LuaSignatureId> = Vec::new();
     // Each owner, and whether any key naming it appeared or vanished. One
     // entry per owner: a file with a thousand writes to one slot names that
     // owner a thousand times, and the member enumeration below is per owner,
@@ -1111,18 +1103,14 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Ha
             ExportKey::Signature(signature_id) => {
                 type_refs.push(crate::TypeCacheRef::Signature(*signature_id));
                 signatures.push(*signature_id);
-                return_consumer_signatures.push(*signature_id);
             }
             ExportKey::ContributedParam(signature_id, param_idx) => {
                 nodes.push(LuaInferenceNodeId::SignatureParam {
                     signature_id: *signature_id,
                     param_idx: *param_idx,
                 });
-                return_consumer_signatures.push(*signature_id);
             }
-            ExportKey::CallSiteLink(signature_id) => {
-                return_consumer_signatures.push(*signature_id);
-            }
+            ExportKey::CallSiteLink(_) => {}
             ExportKey::InferredGuard(owner) => {
                 signatures.push(owner.signature_id());
             }
@@ -1141,7 +1129,6 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Ha
                 LuaSemanticDeclId::Signature(signature_id) => {
                     type_refs.push(crate::TypeCacheRef::Signature(*signature_id));
                     signatures.push(*signature_id);
-                    return_consumer_signatures.push(*signature_id);
                 }
             },
             ExportKey::Operator(owner, _) => match owner {
@@ -1216,24 +1203,10 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Ha
     dependents.extend(type_index.files_with_type_caches_referencing(&type_refs));
     dependents.extend(type_index.files_depending_on_inference_nodes(&nodes));
 
-    let call_site_index = db.get_call_site_param_index();
-    dependents.extend(call_site_index.collect_signature_contributor_files(&signatures));
     dependents.extend(
-        db.get_signature_index()
-            .settled_read_dependents_for_signatures(&signatures),
+        db.get_call_site_param_index()
+            .contributor_files(&signatures),
     );
-    let sig_set = return_consumer_signatures
-        .iter()
-        .copied()
-        .collect::<rustc_hash::FxHashSet<_>>();
-    for consumer in call_site_index.get_return_consumers(&sig_set) {
-        dependents.insert(consumer.file_id);
-    }
-    let sources: Vec<crate::CallSiteSourceId> = signatures
-        .iter()
-        .map(|id| crate::CallSiteSourceId::Signature(*id))
-        .collect();
-    dependents.extend(call_site_index.collect_source_node_dependents(&sources));
     // A parameter's declared type is read by the callee itself.
     dependents.extend(signatures.iter().map(|id| id.get_file_id()));
 

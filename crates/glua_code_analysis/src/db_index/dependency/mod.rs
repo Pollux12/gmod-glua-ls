@@ -5,7 +5,10 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use file_dependency_relation::FileDependencyRelation;
 use rowan::TextRange;
 
-use crate::FileId;
+use crate::{
+    FileId,
+    db_index::derivation::{self, FactKey, Fingerprint},
+};
 
 use super::LuaIndex;
 
@@ -18,7 +21,7 @@ pub enum LuaDependencyKind {
     IncludeCS,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaDependencySite {
     pub source_file_id: FileId,
     pub target_file_id: Option<FileId>,
@@ -53,6 +56,9 @@ pub struct LuaDependencyIndex {
     /// back. Keyed by the removed target; each entry is the site's source file
     /// and the path it named.
     unresolved_by_removal: HashMap<FileId, Vec<(FileId, Option<String>)>>,
+    /// The sites derivations added, per source file, so a re-run can take
+    /// them back without the source layer's.
+    derived_sites: HashMap<FileId, Vec<LuaDependencySite>>,
     #[cfg(test)]
     target_transition_site_visits: usize,
 }
@@ -73,6 +79,7 @@ impl LuaDependencyIndex {
             resolved_sites_by_target: HashMap::default(),
             unresolved_dependents_by_path_key: HashMap::default(),
             unresolved_by_removal: HashMap::default(),
+            derived_sites: HashMap::default(),
             #[cfg(test)]
             target_transition_site_visits: 0,
         }
@@ -88,6 +95,7 @@ impl LuaDependencyIndex {
         dependency_id: FileId,
         kind: LuaDependencyKind,
     ) {
+        derivation::note_write(|| FactKey::Dependency(file_id));
         let inserted = self
             .dependencies
             .entry(file_id)
@@ -108,6 +116,13 @@ impl LuaDependencyIndex {
     }
 
     pub fn add_dependency_site(&mut self, site: LuaDependencySite) {
+        if !derivation::writes_source() {
+            derivation::note_write(|| FactKey::LoadSites(site.source_file_id));
+            self.derived_sites
+                .entry(site.source_file_id)
+                .or_default()
+                .push(site.clone());
+        }
         let is_new = !self
             .dependency_sites
             .get(&site.source_file_id)
@@ -115,6 +130,7 @@ impl LuaDependencyIndex {
         if !is_new {
             return;
         }
+        derivation::note_write(|| FactKey::Dependency(site.source_file_id));
 
         let site_index = self
             .dependency_sites
@@ -138,7 +154,27 @@ impl LuaDependencyIndex {
             .push(site);
     }
 
+    /// Drops the sites derivations found in `file_id` and rebuilds its edges
+    /// from the source layer's sites.
+    pub(crate) fn reset_derived_sites(&mut self, file_id: FileId) {
+        let Some(mut derived) = self.derived_sites.remove(&file_id) else {
+            return;
+        };
+        derivation::note_write(|| FactKey::Dependency(file_id));
+        let sites = self.dependency_sites.remove(&file_id).unwrap_or_default();
+        self.unindex_source_sites(file_id, &sites);
+        self.remove_source_dependency_edges(file_id);
+        for site in sites {
+            if let Some(at) = derived.iter().position(|existing| *existing == site) {
+                derived.swap_remove(at);
+                continue;
+            }
+            self.add_dependency_site(site);
+        }
+    }
+
     pub fn get_required_files(&self, file_id: &FileId) -> Option<&HashSet<FileId>> {
+        derivation::note_read(|| FactKey::Dependency(*file_id));
         self.dependencies.get(file_id)
     }
 
@@ -147,19 +183,15 @@ impl LuaDependencyIndex {
         file_id: &FileId,
         dependency_id: &FileId,
     ) -> Option<&HashSet<LuaDependencyKind>> {
+        derivation::note_read(|| FactKey::Dependency(*file_id));
         self.dependency_kinds
             .get(file_id)
             .and_then(|dependencies| dependencies.get(dependency_id))
     }
 
     pub fn get_dependency_sites(&self, file_id: &FileId) -> Option<&[LuaDependencySite]> {
+        derivation::note_read(|| FactKey::Dependency(*file_id));
         self.dependency_sites.get(file_id).map(Vec::as_slice)
-    }
-
-    pub fn iter_dependency_sites(&self) -> impl Iterator<Item = (&FileId, &[LuaDependencySite])> {
-        self.dependency_sites
-            .iter()
-            .map(|(file_id, sites)| (file_id, sites.as_slice()))
     }
 
     pub fn collect_unresolved_path_dependents(
@@ -255,6 +287,7 @@ impl LuaDependencyIndex {
             return;
         };
         for source_file_id in callers {
+            derivation::note_write(|| FactKey::Dependency(source_file_id));
             let remove_dependencies =
                 self.dependencies
                     .get_mut(&source_file_id)
@@ -304,6 +337,7 @@ impl LuaDependencyIndex {
                 if site.target_file_id.is_some() || site.path != path {
                     continue;
                 }
+                derivation::note_write(|| FactKey::Dependency(source_file_id));
                 let unresolved = site.clone();
                 site.target_file_id = Some(target_file_id);
                 restored.push((source_file_id, site_index, unresolved));
@@ -353,6 +387,7 @@ impl LuaDependencyIndex {
                 continue;
             };
             site.target_file_id = None;
+            derivation::note_write(|| FactKey::Dependency(location.source_file_id));
             Self::index_unresolved_site(unresolved_dependents_by_path_key, site);
             flipped.push((location.source_file_id, site.path.clone()));
         }
@@ -373,10 +408,44 @@ impl LuaDependencyIndex {
     pub fn get_file_dependencies<'a>(&'a self) -> FileDependencyRelation<'a> {
         FileDependencyRelation::new(&self.dependencies)
     }
+
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        if let FactKey::LoadSites(file_id) = key {
+            return derivation::fingerprint_opt(self.derived_sites.get(file_id));
+        }
+        let FactKey::Dependency(file_id) = key else {
+            debug_assert!(false, "{key:?} is not a dependency fact");
+            return derivation::ABSENT;
+        };
+        let dependencies = self.dependencies.get(file_id).map(|dependencies| {
+            let mut dependencies = dependencies.iter().copied().collect::<Vec<_>>();
+            dependencies.sort_unstable();
+            dependencies
+        });
+        let kinds = self.dependency_kinds.get(file_id).map(|kinds| {
+            let mut kinds = kinds
+                .iter()
+                .map(|(dependency_id, kinds)| {
+                    let mut kinds = kinds.iter().map(|kind| *kind as u8).collect::<Vec<_>>();
+                    kinds.sort_unstable();
+                    (*dependency_id, kinds)
+                })
+                .collect::<Vec<_>>();
+            kinds.sort_unstable();
+            kinds
+        });
+        let sites = self.dependency_sites.get(file_id);
+        if dependencies.is_none() && kinds.is_none() && sites.is_none() {
+            return derivation::ABSENT;
+        }
+        derivation::fingerprint_of(&(dependencies, kinds, sites))
+    }
 }
 
 impl LuaIndex for LuaDependencyIndex {
     fn remove(&mut self, file_id: FileId) {
+        derivation::note_write(|| FactKey::Dependency(file_id));
+        self.derived_sites.remove(&file_id);
         if let Some(sites) = self.dependency_sites.remove(&file_id) {
             self.unindex_source_sites(file_id, &sites);
         }
@@ -395,6 +464,16 @@ impl LuaIndex for LuaDependencyIndex {
     }
 
     fn clear(&mut self) {
+        if derivation::recording() {
+            for file_id in self
+                .dependencies
+                .keys()
+                .chain(self.dependency_kinds.keys())
+                .chain(self.dependency_sites.keys())
+            {
+                derivation::note_write(|| FactKey::Dependency(*file_id));
+            }
+        }
         self.dependencies.clear();
         self.dependency_kinds.clear();
         self.dependency_callers_by_target.clear();
@@ -402,6 +481,7 @@ impl LuaIndex for LuaDependencyIndex {
         self.resolved_sites_by_target.clear();
         self.unresolved_dependents_by_path_key.clear();
         self.unresolved_by_removal.clear();
+        self.derived_sites.clear();
         #[cfg(test)]
         {
             self.target_transition_site_visits = 0;

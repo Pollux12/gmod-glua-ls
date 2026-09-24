@@ -1,11 +1,15 @@
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rowan::TextRange;
 use smol_str::SmolStr;
 
 use super::{LuaDeclId, LuaIndex};
-use crate::{FileId, GmodRealm};
+use crate::{
+    FileId, GmodRealm,
+    db_index::derivation::{self, FactKey, Fingerprint},
+};
 
 mod pair;
 
@@ -56,7 +60,7 @@ pub struct NetOpDescriptor {
 /// This is metadata about the selected signature, not about an observed call.
 /// In particular, read completion must use the read signature's bit parameter
 /// rather than assuming it matches the writer's parameter layout.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CanonicalNetOp {
     pub name: String,
     pub has_bits_param: bool,
@@ -77,7 +81,7 @@ impl NetOpDescriptor {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NetOpEntry {
     pub op: NetOpDescriptor,
     /// Source path of the function actually called, e.g. `net.WriteString` or a
@@ -165,7 +169,7 @@ impl NetFlowKind {
 /// the pairing logic needs. `target_arg_idx` is the zero-based index of the
 /// recipient parameter, located through the `gmod.net_payload`/`target` call-arg
 /// role; `None` for terminators with no recipient such as `net.Broadcast`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NetSendKind {
     pub receiver_realm: GmodRealm,
     pub target_arg_idx: Option<usize>,
@@ -178,7 +182,7 @@ pub struct NetFlowOrigin {
     pub start_range: TextRange,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NetSendFlow {
     pub message_name: String,
     pub start_range: TextRange,
@@ -206,7 +210,7 @@ pub struct NetSendFlow {
     pub materialized_from: Option<NetFlowOrigin>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NetReceiveFlow {
     pub message_name: String,
     pub receive_range: TextRange,
@@ -219,7 +223,7 @@ pub struct NetReceiveFlow {
     pub reads_opaque: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct FileNetworkData {
     pub send_flows: Vec<NetSendFlow>,
     pub receive_flows: Vec<NetReceiveFlow>,
@@ -235,115 +239,9 @@ pub struct NetNameExpansion {
     pub locals: Vec<LuaDeclId>,
 }
 
-/// Memo of the per-file step of the net-helper name closure.
-///
-/// The step is a pure function of one file's syntax tree and one file's own
-/// references, so an entry stays valid until that file's reference revision
-/// moves — which covers a re-index, a removal, and a late cross-file reference
-/// written by a retained unresolve alike.
-#[derive(Debug, Default, Clone)]
-pub struct NetHelperNameMemo {
-    files: FxHashMap<FileId, NetHelperFileMemo>,
-}
-
-#[derive(Debug, Default, Clone)]
-struct NetHelperFileMemo {
-    revision: u64,
-    names: FxHashMap<SmolStr, NetNameExpansion>,
-    decls: FxHashMap<LuaDeclId, NetNameExpansion>,
-}
-
-impl NetHelperNameMemo {
-    fn valid(&self, file_id: FileId, revision: u64) -> Option<&NetHelperFileMemo> {
-        self.files
-            .get(&file_id)
-            .filter(|memo| memo.revision == revision)
-    }
-
-    fn entry(&mut self, file_id: FileId, revision: u64) -> &mut NetHelperFileMemo {
-        let memo = self.files.entry(file_id).or_default();
-        if memo.revision != revision {
-            *memo = NetHelperFileMemo {
-                revision,
-                ..Default::default()
-            };
-        }
-        memo
-    }
-
-    pub fn name(
-        &self,
-        file_id: FileId,
-        revision: u64,
-        name: &SmolStr,
-    ) -> Option<&NetNameExpansion> {
-        self.valid(file_id, revision)?.names.get(name)
-    }
-
-    pub fn set_name(
-        &mut self,
-        file_id: FileId,
-        revision: u64,
-        name: SmolStr,
-        expansion: NetNameExpansion,
-    ) {
-        self.entry(file_id, revision).names.insert(name, expansion);
-    }
-
-    pub fn decl(
-        &self,
-        file_id: FileId,
-        revision: u64,
-        decl_id: &LuaDeclId,
-    ) -> Option<&NetNameExpansion> {
-        self.valid(file_id, revision)?.decls.get(decl_id)
-    }
-
-    pub fn set_decl(
-        &mut self,
-        file_id: FileId,
-        revision: u64,
-        decl_id: LuaDeclId,
-        expansion: NetNameExpansion,
-    ) {
-        self.entry(file_id, revision)
-            .decls
-            .insert(decl_id, expansion);
-    }
-}
-
-/// Inputs a file's network flows were collected from (B8).
-///
-/// The network pass recollects its batch every analyze; files whose own tree,
-/// expanded helpers, helper-registry fold and semantic revision are unchanged keep their
-/// stored flows instead. `helper_contents` is sorted by `(file id, range)` so
-/// the comparison is deterministic.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NetworkFileInputs {
-    /// Revision of the type, member, signature and module inputs to call resolution.
-    pub semantic_revision: u64,
-    /// Hash of the file's own content at collect time.
-    pub content_hash: u64,
-    /// Identity of the helper-registry/call-role fold the collection
-    /// resolved helpers through (the fold's `Arc` address: a reused fold
-    /// keeps its allocation, a rebuild does not).
-    pub registry_identity: usize,
-    /// Cross-file helper bodies expanded while collecting, with their
-    /// content hashes at collect time. Same-file expansions are covered by
-    /// `content_hash`.
-    pub helper_contents: Vec<(FileId, TextRange, Option<u64>)>,
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct GmodNetworkIndex {
     file_data: FxHashMap<FileId, FileNetworkData>,
-    file_inputs: FxHashMap<FileId, NetworkFileInputs>,
-    /// Data (plus inputs) parked by `remove` while its file is re-analysed.
-    /// `remove` runs before every re-index, so dropping here would force the
-    /// network pass to recollect files whose inputs never changed; the pass
-    /// restores retained entries and prunes the rest (deleted files).
-    staged_data: FxHashMap<FileId, FileNetworkData>,
-    staged_inputs: FxHashMap<FileId, NetworkFileInputs>,
     send_flows_by_message: FxHashMap<String, Vec<(FileId, usize)>>,
     receive_flows_by_message: FxHashMap<String, Vec<(FileId, usize)>>,
     materialized_definition_counts: FxHashMap<(FileId, TextRange), usize>,
@@ -353,36 +251,60 @@ pub struct GmodNetworkIndex {
     /// call to name — resolve it here instead of from a hardcoded table.
     /// Workspace-global and rebuilt per analyze pass, so it is not per-file state.
     canonical_ops: FxHashMap<(SmolStr, NetOpDirection), CanonicalNetOp>,
-    /// See [`NetHelperNameMemo`]. Kept here so it survives across analyze
-    /// passes; its own revision guard, not this index's lifecycle, decides
-    /// whether an entry is usable.
-    helper_name_memo: NetHelperNameMemo,
+    /// The names of functions that can produce a net operation, directly or
+    /// through other such functions.
+    helper_names: Arc<FxHashSet<SmolStr>>,
+    helper_names_fingerprint: Fingerprint,
+    /// Incremental multiset fingerprint of every live file's network data.
+    flows_fingerprint: Fingerprint,
+    /// Fingerprint of `canonical_ops`, taken when the table is replaced.
+    canonical_ops_fingerprint: Fingerprint,
 }
 
 impl GmodNetworkIndex {
     pub fn new() -> Self {
         Self {
             file_data: FxHashMap::default(),
-            file_inputs: FxHashMap::default(),
-            staged_data: FxHashMap::default(),
-            staged_inputs: FxHashMap::default(),
             send_flows_by_message: FxHashMap::default(),
             receive_flows_by_message: FxHashMap::default(),
             materialized_definition_counts: FxHashMap::default(),
             canonical_ops: FxHashMap::default(),
-            helper_name_memo: NetHelperNameMemo::default(),
+            helper_names: Arc::default(),
+            helper_names_fingerprint: derivation::ABSENT,
+            flows_fingerprint: 0,
+            canonical_ops_fingerprint: 0,
         }
     }
 
-    /// Lends the net-helper name memo out for a pass. The index holds it again
-    /// through [`Self::restore_helper_name_memo`]; leaving it out only costs the
-    /// pass its hits.
-    pub fn take_helper_name_memo(&mut self) -> NetHelperNameMemo {
-        std::mem::take(&mut self.helper_name_memo)
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        match key {
+            FactKey::NetworkFile(file_id) => {
+                derivation::fingerprint_opt(self.file_data.get(file_id))
+            }
+            FactKey::NetHelperNames => self.helper_names_fingerprint,
+            FactKey::NetworkScan => self
+                .flows_fingerprint
+                .wrapping_add(self.canonical_ops_fingerprint),
+            _ => {
+                debug_assert!(false, "{key:?} is not a gmod network fact");
+                derivation::ABSENT
+            }
+        }
     }
 
-    pub fn restore_helper_name_memo(&mut self, memo: NetHelperNameMemo) {
-        self.helper_name_memo = memo;
+    /// Replaces the net-helper names.
+    pub(crate) fn set_helper_names(&mut self, names: FxHashSet<SmolStr>) {
+        let mut sorted = names.iter().collect::<Vec<_>>();
+        sorted.sort_unstable();
+        let fingerprint = derivation::fingerprint_of(&sorted);
+        derivation::note_write(|| FactKey::NetHelperNames);
+        self.helper_names_fingerprint = fingerprint;
+        self.helper_names = Arc::new(names);
+    }
+
+    pub(crate) fn helper_names(&self) -> Arc<FxHashSet<SmolStr>> {
+        derivation::note_read(|| FactKey::NetHelperNames);
+        self.helper_names.clone()
     }
 
     /// Replaces the canonical op table. Called once per analyze pass with
@@ -391,6 +313,10 @@ impl GmodNetworkIndex {
         &mut self,
         canonical_ops: FxHashMap<(SmolStr, NetOpDirection), CanonicalNetOp>,
     ) {
+        derivation::note_write(|| FactKey::NetworkScan);
+        self.canonical_ops_fingerprint = canonical_ops.iter().fold(0, |sum: Fingerprint, entry| {
+            sum.wrapping_add(derivation::fingerprint_of(&entry))
+        });
         self.canonical_ops = canonical_ops;
     }
 
@@ -399,6 +325,7 @@ impl GmodNetworkIndex {
         wire_format: &str,
         direction: NetOpDirection,
     ) -> Option<&CanonicalNetOp> {
+        derivation::note_read(|| FactKey::NetworkScan);
         self.canonical_ops
             .get(&(SmolStr::new(wire_format), direction))
     }
@@ -417,6 +344,7 @@ impl GmodNetworkIndex {
     /// for it. Used by the coverage test that guards against a typo silently
     /// breaking pairing for one op.
     pub fn wire_format_coverage(&self) -> HashMap<SmolStr, (bool, bool)> {
+        derivation::note_read(|| FactKey::NetworkScan);
         let mut coverage: HashMap<SmolStr, (bool, bool)> = HashMap::default();
         for (wire_format, direction) in self.canonical_ops.keys() {
             let entry = coverage
@@ -431,72 +359,15 @@ impl GmodNetworkIndex {
     }
 
     pub fn add_file_data(&mut self, file_id: FileId, data: FileNetworkData) {
+        derivation::note_write(|| FactKey::NetworkFile(file_id));
         self.remove_file(file_id);
-        // Fresh facts supersede anything parked for this file: without this a
-        // recollect would leave its own pre-edit data staged behind it.
-        self.staged_data.remove(&file_id);
-        self.staged_inputs.remove(&file_id);
         self.index_file_data(file_id, &data);
         self.file_data.insert(file_id, data);
     }
 
     pub fn get_file_data(&self, file_id: FileId) -> Option<&FileNetworkData> {
+        derivation::note_read(|| FactKey::NetworkFile(file_id));
         self.file_data.get(&file_id)
-    }
-
-    /// Records the inputs `data` was collected from. Always paired with
-    /// [`Self::add_file_data`] (including for empty data, so files without
-    /// flows are retainable too).
-    pub fn set_file_inputs(&mut self, file_id: FileId, inputs: NetworkFileInputs) {
-        self.file_inputs.insert(file_id, inputs);
-    }
-
-    pub fn get_file_inputs(&self, file_id: FileId) -> Option<&NetworkFileInputs> {
-        self.file_inputs.get(&file_id)
-    }
-
-    /// Inputs parked by [`Self::remove_file`] while the file is re-analysed.
-    pub fn staged_file_inputs(&self, file_id: FileId) -> Option<&NetworkFileInputs> {
-        self.staged_inputs.get(&file_id)
-    }
-
-    /// Restores data parked by [`Self::remove_file`]. The staged entry is
-    /// re-indexed exactly as [`Self::add_file_data`] would index it, so
-    /// `materialized_definition_counts` (a cross-file refcount) and the
-    /// per-message indexes come back whole. Returns whether anything was
-    /// restored.
-    pub fn restore_staged_file(&mut self, file_id: FileId) -> bool {
-        let Some(data) = self.staged_data.remove(&file_id) else {
-            // No parked data, but parked inputs may still describe a file
-            // whose last collection found no flows — adopt them so the file
-            // stays retainable without recollecting.
-            if let Some(inputs) = self.staged_inputs.remove(&file_id) {
-                self.file_inputs.insert(file_id, inputs);
-            }
-            return false;
-        };
-        let inputs = self.staged_inputs.remove(&file_id);
-        self.index_file_data(file_id, &data);
-        self.file_data.insert(file_id, data);
-        if let Some(inputs) = inputs {
-            self.file_inputs.insert(file_id, inputs);
-        }
-        true
-    }
-
-    /// Drops a parked entry without restoring it, after a fresh collection
-    /// (or a retain decision that found nothing to keep) superseded it.
-    pub fn drop_staged_file(&mut self, file_id: FileId) {
-        self.staged_data.remove(&file_id);
-        self.staged_inputs.remove(&file_id);
-    }
-
-    /// Drops parked entries for files that no longer exist. Called at the end
-    /// of the network pass: anything still parked then belongs to a deleted
-    /// file (live files are either recollected or restored above).
-    pub fn prune_staged_dead_files(&mut self, is_live: impl Fn(FileId) -> bool) {
-        self.staged_data.retain(|file_id, _| is_live(*file_id));
-        self.staged_inputs.retain(|file_id, _| is_live(*file_id));
     }
 
     /// File ids in canonical order. `file_data` is a `RandomState` map, so
@@ -508,6 +379,7 @@ impl GmodNetworkIndex {
     }
 
     pub fn iter_send_flows(&self) -> impl Iterator<Item = (FileId, usize, &NetSendFlow)> {
+        derivation::note_read(|| FactKey::NetworkScan);
         self.ordered_file_ids()
             .into_iter()
             .flat_map(move |file_id| {
@@ -525,6 +397,7 @@ impl GmodNetworkIndex {
     }
 
     pub fn iter_receive_flows(&self) -> impl Iterator<Item = (FileId, &NetReceiveFlow)> {
+        derivation::note_read(|| FactKey::NetworkScan);
         self.ordered_file_ids()
             .into_iter()
             .flat_map(move |file_id| {
@@ -538,6 +411,7 @@ impl GmodNetworkIndex {
     }
 
     pub fn get_send_flows_for_message(&self, name: &str) -> Vec<(FileId, &NetSendFlow)> {
+        derivation::note_read(|| FactKey::NetworkScan);
         let mut flows: Vec<_> = self
             .send_flows_by_message
             .get(name)
@@ -567,6 +441,7 @@ impl GmodNetworkIndex {
     }
 
     pub fn get_receive_flows_for_message(&self, name: &str) -> Vec<(FileId, &NetReceiveFlow)> {
+        derivation::note_read(|| FactKey::NetworkScan);
         let mut flows: Vec<_> = self
             .receive_flows_by_message
             .get(name)
@@ -590,35 +465,36 @@ impl GmodNetworkIndex {
     }
 
     pub fn remove_file(&mut self, file_id: FileId) {
-        // Park rather than drop: `remove` runs before every re-index, and the
-        // network pass restores the entry when the file's inputs prove it
-        // still describes the file (see `restore_staged_file`). De-indexing
-        // first keeps `materialized_definition_counts` exact while parked —
-        // restoring re-indexes — and `add_file_data` stays idempotent per
-        // file: it re-parks (a no-op, nothing is live) and then clears the
-        // parked entry it just superseded.
+        derivation::note_write(|| FactKey::NetworkFile(file_id));
         if let Some(data) = self.file_data.remove(&file_id) {
             self.remove_file_data_indexes(file_id, &data);
-            self.staged_data.insert(file_id, data);
-        }
-        if let Some(inputs) = self.file_inputs.remove(&file_id) {
-            self.staged_inputs.insert(file_id, inputs);
         }
     }
 
     pub fn clear(&mut self) {
+        if derivation::recording() {
+            for file_id in self.file_data.keys() {
+                derivation::note_write(|| FactKey::NetworkFile(*file_id));
+            }
+        }
+        derivation::note_write(|| FactKey::NetworkScan);
+        self.flows_fingerprint = 0;
+        self.canonical_ops_fingerprint = 0;
         self.file_data.clear();
-        self.file_inputs.clear();
-        self.staged_data.clear();
-        self.staged_inputs.clear();
         self.send_flows_by_message.clear();
         self.receive_flows_by_message.clear();
         self.materialized_definition_counts.clear();
         self.canonical_ops.clear();
-        self.helper_name_memo.files.clear();
+        derivation::note_write(|| FactKey::NetHelperNames);
+        self.helper_names = Arc::default();
+        self.helper_names_fingerprint = derivation::ABSENT;
     }
 
     fn index_file_data(&mut self, file_id: FileId, data: &FileNetworkData) {
+        derivation::note_write(|| FactKey::NetworkScan);
+        self.flows_fingerprint = self
+            .flows_fingerprint
+            .wrapping_add(derivation::fingerprint_of(&(file_id, data)));
         for (flow_idx, send_flow) in data.send_flows.iter().enumerate() {
             self.send_flows_by_message
                 .entry(send_flow.message_name.clone())
@@ -641,6 +517,10 @@ impl GmodNetworkIndex {
     }
 
     fn remove_file_data_indexes(&mut self, file_id: FileId, data: &FileNetworkData) {
+        derivation::note_write(|| FactKey::NetworkScan);
+        self.flows_fingerprint = self
+            .flows_fingerprint
+            .wrapping_sub(derivation::fingerprint_of(&(file_id, data)));
         for send_flow in &data.send_flows {
             if let Some(origin) = send_flow.materialized_from {
                 let key = (origin.file_id, origin.start_range);
@@ -679,6 +559,7 @@ impl GmodNetworkIndex {
     }
 
     pub(crate) fn is_replaced_definition(&self, file_id: FileId, flow: &NetSendFlow) -> bool {
+        derivation::note_read(|| FactKey::NetworkScan);
         flow.materialized_from.is_none()
             && self
                 .materialized_definition_counts
@@ -689,9 +570,6 @@ impl GmodNetworkIndex {
 impl LuaIndex for GmodNetworkIndex {
     fn remove(&mut self, file_id: FileId) {
         self.remove_file(file_id);
-        // Memory hygiene only: the memo's revision guard already rejects a stale
-        // entry, this stops a removed file's entry from outliving the file.
-        self.helper_name_memo.files.remove(&file_id);
     }
 
     fn clear(&mut self) {
@@ -733,32 +611,6 @@ mod tests {
             reads: Vec::new(),
             reads_opaque: false,
         }
-    }
-
-    #[test]
-    fn helper_name_memo_entries_only_answer_for_the_revision_they_were_stored_at() {
-        let file_id = FileId::new(1);
-        let name: SmolStr = "Send".into();
-        let expansion = NetNameExpansion {
-            names: vec![SmolStr::new("SendThing")],
-            locals: Vec::new(),
-        };
-        let mut memo = NetHelperNameMemo::default();
-
-        memo.set_name(file_id, 7, name.clone(), expansion);
-        assert!(memo.name(file_id, 7, &name).is_some());
-        assert!(memo.name(file_id, 8, &name).is_none());
-        assert!(memo.name(FileId::new(2), 7, &name).is_none());
-
-        // Storing at a newer revision drops everything the old one held.
-        memo.set_name(
-            file_id,
-            8,
-            SmolStr::new("Other"),
-            NetNameExpansion::default(),
-        );
-        assert!(memo.name(file_id, 8, &name).is_none());
-        assert!(memo.name(file_id, 8, &SmolStr::new("Other")).is_some());
     }
 
     #[test]
@@ -872,148 +724,5 @@ mod tests {
 
         let flows = index.get_send_flows_for_message("SharedMessage");
         assert_eq!(flows.len(), 2);
-    }
-
-    fn test_inputs(content_hash: u64) -> NetworkFileInputs {
-        NetworkFileInputs {
-            semantic_revision: 0,
-            content_hash,
-            registry_identity: 1,
-            helper_contents: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn remove_parks_data_and_inputs_for_restore() {
-        let file_id = FileId::new(11);
-        let mut index = GmodNetworkIndex::new();
-        index.add_file_data(
-            file_id,
-            FileNetworkData {
-                send_flows: vec![send_flow("Parked", 1)],
-                receive_flows: Vec::new(),
-            },
-        );
-        index.set_file_inputs(file_id, test_inputs(7));
-
-        index.remove_file(file_id);
-        // Parked entries stay invisible to every reader.
-        assert!(index.get_file_data(file_id).is_none());
-        assert!(index.get_file_inputs(file_id).is_none());
-        assert!(index.get_send_flows_for_message("Parked").is_empty());
-
-        assert!(index.restore_staged_file(file_id));
-        assert_eq!(
-            index
-                .get_file_data(file_id)
-                .expect("restored data")
-                .send_flows
-                .len(),
-            1
-        );
-        assert_eq!(
-            index
-                .get_file_inputs(file_id)
-                .map(|inputs| inputs.content_hash),
-            Some(7)
-        );
-        assert_eq!(index.get_send_flows_for_message("Parked").len(), 1);
-    }
-
-    #[test]
-    fn restore_reindexes_materialized_definition_counts() {
-        let definition_file_id = FileId::new(12);
-        let call_file_id = FileId::new(13);
-        let definition_start = range(10);
-        let mut materialized = send_flow("StagedWrapped", 30);
-        materialized.materialized_from = Some(NetFlowOrigin {
-            file_id: definition_file_id,
-            start_range: definition_start,
-        });
-
-        let mut index = GmodNetworkIndex::new();
-        index.add_file_data(
-            definition_file_id,
-            FileNetworkData {
-                send_flows: vec![send_flow("StagedWrapped", 10)],
-                receive_flows: Vec::new(),
-            },
-        );
-        index.set_file_inputs(definition_file_id, test_inputs(1));
-        index.add_file_data(
-            call_file_id,
-            FileNetworkData {
-                send_flows: vec![materialized],
-                receive_flows: Vec::new(),
-            },
-        );
-        index.set_file_inputs(call_file_id, test_inputs(2));
-
-        // Parking the call file drops its refcount, so the definition shows
-        // again; restoring brings the replacement back exactly once.
-        index.remove_file(call_file_id);
-        let flows = index.get_send_flows_for_message("StagedWrapped");
-        assert_eq!(flows.len(), 1);
-        assert_eq!(flows[0].0, definition_file_id);
-
-        assert!(index.restore_staged_file(call_file_id));
-        let flows = index.get_send_flows_for_message("StagedWrapped");
-        assert_eq!(flows.len(), 1);
-        assert_eq!(flows[0].0, call_file_id);
-
-        // Restoring twice must not double-count the refcount.
-        assert!(!index.restore_staged_file(call_file_id));
-        let flows = index.get_send_flows_for_message("StagedWrapped");
-        assert_eq!(flows.len(), 1);
-        assert_eq!(flows[0].0, call_file_id);
-    }
-
-    #[test]
-    fn fresh_add_supersedes_parked_entry() {
-        let file_id = FileId::new(14);
-        let mut index = GmodNetworkIndex::new();
-        index.add_file_data(
-            file_id,
-            FileNetworkData {
-                send_flows: vec![send_flow("OldParked", 1)],
-                receive_flows: Vec::new(),
-            },
-        );
-        index.set_file_inputs(file_id, test_inputs(3));
-        index.remove_file(file_id);
-
-        index.add_file_data(
-            file_id,
-            FileNetworkData {
-                send_flows: vec![send_flow("NewLive", 5)],
-                receive_flows: Vec::new(),
-            },
-        );
-        assert!(index.get_send_flows_for_message("OldParked").is_empty());
-        assert_eq!(index.get_send_flows_for_message("NewLive").len(), 1);
-        assert!(!index.restore_staged_file(file_id));
-    }
-
-    #[test]
-    fn prune_drops_only_dead_parked_files() {
-        let live_id = FileId::new(15);
-        let dead_id = FileId::new(16);
-        let mut index = GmodNetworkIndex::new();
-        for file_id in [live_id, dead_id] {
-            index.add_file_data(
-                file_id,
-                FileNetworkData {
-                    send_flows: vec![send_flow("PruneMe", file_id.id)],
-                    receive_flows: Vec::new(),
-                },
-            );
-            index.set_file_inputs(file_id, test_inputs(u64::from(file_id.id)));
-            index.remove_file(file_id);
-        }
-
-        index.prune_staged_dead_files(|file_id| file_id == live_id);
-        assert!(index.restore_staged_file(live_id));
-        assert!(!index.restore_staged_file(dead_id));
-        assert!(index.staged_file_inputs(dead_id).is_none());
     }
 }

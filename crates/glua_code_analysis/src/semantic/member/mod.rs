@@ -766,15 +766,6 @@ pub(crate) fn resolve_dynamic_field_member(
         access_position,
     );
     if definitions.is_empty() {
-        // Absence is only knowable once the index is complete: until then
-        // the walk may simply not have reached the defining file yet. Never
-        // memoise this — the answer is about build state, not about the
-        // field.
-        if !db.get_dynamic_field_index().is_sealed()
-            && !cache.get_config().building_dynamic_field_index
-        {
-            return Err(InferFailReason::UnSealedDynamicFields);
-        }
         cache.dynamic_field_resolution_cache.insert(cache_key, None);
         return Ok(None);
     }
@@ -940,20 +931,10 @@ fn dynamic_field_definitions(
     }
 }
 fn record_dynamic_field_read_for_prefix(db: &DbIndex, prefix_type: &LuaType, field_name: &str) {
-    // The lookup answered "no field" because the dynamic-field index is hidden
-    // right now, not because the field is absent. When the index already holds
-    // definitions for it the answer is a masking artifact — flag the read so
-    // the visible pass re-derives it, since no write epoch can express a
-    // change that was never a write.
     // `field_definitions` records the `(owner, field)` read itself.
     fn flag_masked_if_present(db: &DbIndex, owner: &crate::DynamicFieldOwner, field_name: &str) {
-        if !db
-            .get_dynamic_field_index()
-            .field_definitions(owner, field_name)
-            .is_empty()
-        {
-            crate::db_index::read_set::record_dynamic_field_masked();
-        }
+        db.get_dynamic_field_index()
+            .field_definitions(owner, field_name);
     }
 
     match prefix_type {

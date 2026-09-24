@@ -17,7 +17,7 @@ use crate::{
     compilation::analyzer::common::bind_type,
     db_index::{
         LuaDeclId, LuaGenericParamInfo, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey,
-        LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType,
+        LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeExtra,
     },
 };
 use std::sync::Arc;
@@ -156,22 +156,29 @@ pub fn analyze_enum(analyzer: &mut DocAnalyzer, tag: LuaDocTagEnum) -> Option<()
 
     analyzer.current_type_id = Some(enum_decl_id.clone());
 
-    if let Some(base_type) = tag.get_base_type() {
-        let base_type = infer_type(analyzer, base_type);
-        if base_type.is_unknown() {
-            return None;
+    let base = match tag.get_base_type() {
+        Some(base_type) => {
+            let base_type = infer_type(analyzer, base_type);
+            if base_type.is_unknown() {
+                return None;
+            }
+            Some(base_type)
         }
-
-        let enum_decl = analyzer
-            .db
-            .get_type_index_mut()
-            .get_type_decl_mut(&enum_decl_id)?;
-        enum_decl.add_enum_base(base_type);
-    }
+        None => None,
+    };
 
     add_description_for_type_decl(analyzer, &enum_decl_id, tag.get_descriptions());
 
     let is_flat = analyze_enum_fields(analyzer, &enum_decl_id, &tag);
+    publish_extra_source(
+        analyzer,
+        &enum_decl_id,
+        site_range,
+        LuaTypeExtra::Enum {
+            base,
+            flat: is_flat,
+        },
+    );
 
     // A flat enum has no runtime table to bind to; binding would attach the enum
     // type to whatever statement happens to follow the annotation block.
@@ -237,16 +244,27 @@ fn analyze_enum_fields(
         registered = true;
     }
 
-    if registered
-        && let Some(enum_decl) = analyzer
-            .db
-            .get_type_index_mut()
-            .get_type_decl_mut(enum_decl_id)
-    {
-        enum_decl.mark_flat_enum();
-    }
-
     registered
+}
+
+fn publish_extra_source(
+    analyzer: &mut DocAnalyzer,
+    decl_id: &LuaTypeDeclId,
+    site_range: TextRange,
+    extra: LuaTypeExtra,
+) {
+    let file_id = analyzer.file_id;
+    let order_key = analyzer.db.get_module_index().decl_source_key(
+        file_id,
+        analyzer.db.get_vfs().file_order_key(&file_id),
+        site_range,
+    );
+    analyzer.db.get_type_index_mut().set_extra_source(
+        decl_id.clone(),
+        InFiled::new(file_id, site_range),
+        order_key,
+        extra,
+    );
 }
 
 fn comment_has_explicit_owner_type(comment: &LuaComment) -> bool {
@@ -331,11 +349,14 @@ pub fn analyze_attribute(analyzer: &mut DocAnalyzer, tag: LuaDocTagAttribute) ->
         decl.get_id()
     };
     let attribute_type = infer_type(analyzer, tag.get_type()?);
-    let attribute_decl = analyzer
-        .db
-        .get_type_index_mut()
-        .get_type_decl_mut(&decl_id)?;
-    attribute_decl.add_attribute_type(attribute_type);
+    publish_extra_source(
+        analyzer,
+        &decl_id,
+        site_range,
+        LuaTypeExtra::Attribute {
+            typ: Some(attribute_type),
+        },
+    );
 
     add_description_for_type_decl(analyzer, &decl_id, tag.get_descriptions());
     Some(())

@@ -136,36 +136,26 @@ macro_rules! dispatch_request {
                             if !crate::util::ls_profile::ls_profile_enabled() {
                                 // Symbol resolution against a stale index silently
                                 // returns empty; wait for the reindex. A request
-                                // aimed at one file only needs that file's own
-                                // entries to match its text, so it waits for those
-                                // rather than for the edit's whole dependency
-                                // ripple — seconds apart on a large gamemode.
-                                // The handoff is held across the handler so the
-                                // ripple waits for this request to take its read
-                                // lock rather than putting it behind the ripple it
-                                // was just released from.
-                                let (freshness, _handoff) = match target_uri.as_ref() {
+                                // aimed at one file waits only for that file.
+                                let freshness = match target_uri.as_ref() {
                                     Some(uri) => {
-                                        let debounced = snapshot.debounced_analysis_arc();
-                                        let handoff = debounced.begin_reader_handoff();
-                                        let fresh = debounced
+                                        snapshot
+                                            .debounced_analysis()
                                             .wait_until_file_fresh_for(
                                                 &cancel_token,
                                                 <$fresh_req_type>::METHOD,
                                                 uri,
                                             )
-                                            .await;
-                                        (fresh, Some(handoff))
+                                            .await
                                     }
                                     None => {
-                                        let fresh = snapshot
+                                        snapshot
                                             .debounced_analysis()
                                             .wait_until_fresh_for(
                                                 &cancel_token,
                                                 <$fresh_req_type>::METHOD,
                                             )
-                                            .await;
-                                        (fresh, None)
+                                            .await
                                     }
                                 };
                                 match freshness {
@@ -182,8 +172,8 @@ macro_rules! dispatch_request {
                                 let result = $fresh_handler(snapshot, params, cancel_token).await;
                                 Some(Response::new_ok(id, result))
                             } else {
-                                // Profiled path: identical wake-up and handoff
-                                // behavior, plus one `[profile] ls_request` line
+                                // Profiled path: identical wake-up behavior, plus
+                                // one `[profile] ls_request` line
                                 // accumulating fresh-wait by observed state.
                                 // `analysis_read_wait` is contributed by
                                 // `read_analysis` via the scoped accumulator;
@@ -199,28 +189,25 @@ macro_rules! dispatch_request {
                                 let accum_scope = accum.clone();
                                 crate::util::ls_profile::LS_REQUEST_ACCUM
                                     .scope(accum_scope, async move {
-                                        let (freshness, _handoff, breakdown) = match target_uri.as_ref() {
+                                        let (freshness, breakdown) = match target_uri.as_ref() {
                                             Some(uri) => {
-                                                let debounced = snapshot.debounced_analysis_arc();
-                                                let handoff = debounced.begin_reader_handoff();
-                                                let (fresh, breakdown) = debounced
+                                                snapshot
+                                                    .debounced_analysis()
                                                     .wait_until_file_fresh_for_profiled(
                                                         &cancel_token,
                                                         <$fresh_req_type>::METHOD,
                                                         uri,
                                                     )
-                                                    .await;
-                                                (fresh, Some(handoff), breakdown)
+                                                    .await
                                             }
                                             None => {
-                                                let (fresh, breakdown) = snapshot
+                                                snapshot
                                                     .debounced_analysis()
                                                     .wait_until_fresh_for_profiled(
                                                         &cancel_token,
                                                         <$fresh_req_type>::METHOD,
                                                     )
-                                                    .await;
-                                                (fresh, None, breakdown)
+                                                    .await
                                             }
                                         };
                                         if freshness != Freshness::Fresh {
@@ -282,12 +269,7 @@ macro_rules! dispatch_request {
                         $context.task(id.clone(), task_metadata, |cancel_token| async move {
                             let debounced = snapshot.debounced_analysis_arc();
                             // Aimed at one document, so its own entries are what
-                            // it needs. Waiting on the workspace instead parks it
-                            // behind the whole dependency ripple, and refuses it
-                            // outright while any other file is mid-edit.
-                            let _handoff = target_uri
-                                .as_ref()
-                                .map(|_| debounced.begin_reader_handoff());
+                            // it needs: another file mid-edit must not refuse it.
                             let stale = || async {
                                 match target_uri.as_ref() {
                                     Some(uri) => !debounced.file_is_answerable(uri).await,

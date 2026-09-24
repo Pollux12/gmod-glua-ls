@@ -130,9 +130,10 @@ struct BenchmarkResult {
 static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 /// Edit each sampled file (append a comment, so the token-identity no-op gate
-/// does not skip the work), timing the full production keystroke cost: reindex
-/// of the file plus its dependency expansion, then the post-edit diagnostics
-/// pass. Restores the original text after each edit. Returns the worst edit.
+/// does not skip the work), timing the full production keystroke cost: the
+/// re-analysis of the file and of everything that read a fact it moved, then
+/// the post-edit diagnostics pass. Restores the original text after each edit.
+/// Returns the worst edit.
 fn run_incremental_edits(
     analysis: &mut EmmyLuaAnalysis,
     sample: Vec<(FileId, usize)>,
@@ -190,43 +191,14 @@ fn run_incremental_edits(
                         .map_or(0.0, |s| s.elapsed().as_secs_f64())
                 );
             }
-            // `BENCH_EDIT_STAGED=1` splits the keystroke into the two halves a
-            // position-based request actually depends on: re-indexing the edited
-            // file alone, then the dependency ripple. It reports what a handler
-            // gated on the edited file's own freshness would wait for.
-            let reindex = if std::env::var_os("BENCH_EDIT_STAGED").is_some() {
-                analysis.update_file_text_only(&uri, edited_text);
-                // Phase 1: the edited file's own entries, the remap of every
-                // reference into it, and the diff that says who still has to be
-                // re-analysed. This is the floor a position-based request has to
-                // wait for if it is gated on its own file rather than on the ripple.
-                let t = Instant::now();
-                let dirty = analysis.self_index_and_diff(vec![file_id]);
-                let self_only = t.elapsed();
-                let dirty_len = dirty.dirty_len();
-                // `BENCH_EDIT_SELF_ONLY=1` stops after phase 1, so a profile of the
-                // run contains nothing but the cost a per-file freshness gate pays.
-                let ripple = if std::env::var_os("BENCH_EDIT_SELF_ONLY").is_some() {
-                    std::time::Duration::ZERO
-                } else {
-                    let t = Instant::now();
-                    analysis.ripple(dirty);
-                    t.elapsed()
-                };
-                eprintln!("  [incremental] {name} dirty set: {dirty_len} file(s)");
-                eprintln!(
-                    "  [incremental] {name} staged: {:.3}s self-only + {:.3}s ripple",
-                    self_only.as_secs_f64(),
-                    ripple.as_secs_f64()
-                );
-                self_only + ripple
-            } else {
-                let t = Instant::now();
-                analysis
-                    .update_file_by_uri(&uri, Some(edited_text))
-                    .map(|(id, _)| id);
-                t.elapsed()
-            };
+            analysis.update_file_text_only(&uri, edited_text);
+            let t = Instant::now();
+            let affected = analysis.reindex_files(vec![file_id]);
+            let reindex = t.elapsed();
+            eprintln!(
+                "  [incremental] {name} affects the diagnostics of {} file(s)",
+                affected.len()
+            );
 
             let t = Instant::now();
             let shared = analysis.precompute_diagnostic_shared_data();
@@ -237,24 +209,12 @@ fn run_incremental_edits(
             worst = worst.max(elapsed);
             edited += 1;
             eprintln!(
-                "  [incremental] {name} (reindexes {expansion} files): {:.3}s ({:.3}s reindex + {:.3}s diagnostics)",
+                "  [incremental] {name} (read by {expansion} files): {:.3}s ({:.3}s reindex + {:.3}s diagnostics)",
                 elapsed.as_secs_f64(),
                 reindex.as_secs_f64(),
                 diagnostics.as_secs_f64()
             );
-            // Reverting through the full path costs a whole ripple per iteration —
-            // several times the self-index being measured, and untimed, so it
-            // would dominate any profile of this loop. `BENCH_EDIT_SELF_ONLY`
-            // exists to leave nothing but the self-index in the profile, so the
-            // revert has to match it.
-            if std::env::var_os("BENCH_EDIT_SELF_ONLY").is_some() {
-                analysis.update_file_text_only(&uri, text);
-                analysis.self_index_files(vec![file_id]);
-            } else {
-                analysis
-                    .update_file_by_uri(&uri, Some(text))
-                    .map(|(id, _)| id);
-            }
+            analysis.update_file_by_uri(&uri, Some(text));
         }
     }
     if edited == 0 {
@@ -338,7 +298,14 @@ fn contribution_entries(analysis: &EmmyLuaAnalysis, file_id: FileId) -> Vec<Stri
 /// changed?" optimisation downstream is dead on arrival, because every file
 /// reports itself as changed.
 fn report_reindex_idempotency(analysis: &mut EmmyLuaAnalysis, file_id: FileId) {
-    let expansion = analysis.expand_reindex_file_ids(vec![file_id]);
+    let expansion = std::iter::once(file_id)
+        .chain(
+            analysis
+                .dependent_files()
+                .remove(&file_id)
+                .unwrap_or_default(),
+        )
+        .collect::<Vec<_>>();
     let before = expansion
         .iter()
         .map(|id| (*id, contribution_entries(analysis, *id)))
@@ -595,11 +562,11 @@ async fn run() {
     });
 
     // Phase 4b: Incremental edit latency — the full cost a keystroke pays
-    // once it lands: reindex of the edited file plus its whole dependency
-    // expansion, then the post-edit diagnostics pass (shared-data recompute
-    // + the edited file), matching the production LS flow. Worst-case
-    // biased: files are ranked by reindex-expansion size and the top hubs
-    // are edited.
+    // once it lands: re-analysis of the edited file and everything that
+    // read a fact it moved, then the post-edit diagnostics pass (shared-data
+    // recompute + the edited file), matching the production LS flow.
+    // Worst-case biased: files are ranked by how many other files read their
+    // facts and the top hubs are edited.
     let mut incremental_worst: Option<std::time::Duration> = None;
     if std::env::var("BENCH_INCREMENTAL").is_ok() {
         let main_ids = analysis
@@ -610,6 +577,7 @@ async fn run() {
         // `BENCH_EDIT_TARGETS=a.lua,b.lua` edits exactly those files and skips
         // the ranking pass, which costs ~27s and swamps a CPU profile.
         let explicit_targets = std::env::var("BENCH_EDIT_TARGETS").ok();
+        let dependents = analysis.dependent_files();
         if let Some(targets) = &explicit_targets {
             // A target is either a bare file name or a path suffix, so that a
             // common name like `shared.lua` can be pinned to one entity.
@@ -630,7 +598,7 @@ async fn run() {
                             wanted.iter().any(|wanted| path.ends_with(wanted.as_str()))
                         })
                 })
-                .map(|id| (*id, analysis.expand_reindex_file_ids(vec![*id]).len()))
+                .map(|id| (*id, dependents.get(id).map_or(0, Vec::len)))
                 .collect();
             #[cfg(feature = "dhat-heap")]
             let dhat_edit = dhat::Profiler::builder()
@@ -645,7 +613,7 @@ async fn run() {
             let t_rank = Instant::now();
             let mut ranked: Vec<(FileId, usize)> = main_ids
                 .iter()
-                .map(|id| (*id, analysis.expand_reindex_file_ids(vec![*id]).len()))
+                .map(|id| (*id, dependents.get(id).map_or(0, Vec::len)))
                 .collect();
             ranked.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
             {
@@ -666,7 +634,7 @@ async fn run() {
                     }
                 }
                 eprintln!(
-                    "  [incremental] expansion distribution over {total} files: median {} p75 {} p90 {} p99 {} max {}",
+                    "  [incremental] dependent-file distribution over {total} files: median {} p75 {} p90 {} p99 {} max {}",
                     pct(50),
                     pct(75),
                     pct(90),

@@ -27,6 +27,34 @@ mod test {
             .clone()
     }
 
+    /// The callback's return binds the method's generic from its body, with
+    /// the parameter typed by the call. Resolving the parameter writes the
+    /// closure's signature mid-evaluation; the body inference after it must
+    /// not reuse what was inferred before that write.
+    #[test]
+    fn test_generic_callback_return_uses_its_contextual_param() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Observable<T>
+            local Observable
+
+            ---@generic R
+            ---@param selector fun(value: T, index?: integer): R
+            ---@return R
+            function Observable:select(selector) end
+
+            ---@type Observable<integer>
+            source = {}
+
+            result = source:select(function(value)
+                return value
+            end)
+            "#,
+        );
+        assert_eq!(ws.expr_ty("result"), LuaType::Integer);
+    }
+
     #[test]
     fn test_flow() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
@@ -286,7 +314,7 @@ mod test {
         let consumer = file_ids[0];
 
         let cold = local_decl_type(&mut ws, consumer, "v");
-        ws.analysis.reindex_files_without_expansion(vec![consumer]);
+        ws.analysis.reindex_files(vec![consumer]);
         let warm = local_decl_type(&mut ws, consumer, "v");
         assert_eq!(cold, warm, "cold {cold:?} vs warm {warm:?}");
     }

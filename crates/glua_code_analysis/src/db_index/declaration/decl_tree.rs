@@ -1,7 +1,9 @@
 use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use super::{LuaDeclId, decl, scope};
+use crate::db_index::derivation::{self, FactKey, Fingerprint};
 use crate::{FileId, db_index::LuaMemberId};
 use decl::LuaDecl;
 use rowan::{TextRange, TextSize};
@@ -28,6 +30,9 @@ pub struct LuaDeclarationTree {
     /// the source-order walk and scope boundaries intact.
     interesting_children_by_name:
         FxHashMap<LuaScopeId, FxHashMap<SmolStr, Vec<((TextSize, u32), InterestingChild)>>>,
+    /// Content fingerprint for `FactKey::DeclTree`, computed on first use and
+    /// reset by every mutation.
+    fingerprint: OnceLock<Fingerprint>,
 }
 
 impl LuaDeclarationTree {
@@ -40,7 +45,25 @@ impl LuaDeclarationTree {
             scope_child_index: Vec::new(),
             interesting_children: FxHashMap::default(),
             interesting_children_by_name: FxHashMap::default(),
+            fingerprint: OnceLock::new(),
         }
+    }
+
+    /// Hash of the declarations (in id order) and scopes; the remaining maps
+    /// are derived from those two.
+    pub(crate) fn fingerprint(&self) -> Fingerprint {
+        *self.fingerprint.get_or_init(|| {
+            let mut decls = self.decls.iter().collect::<Vec<_>>();
+            decls.sort_unstable_by_key(|(decl_id, _)| {
+                (decl_id.file_id.id, u32::from(decl_id.position))
+            });
+            derivation::fingerprint_of(&(self.file_id, decls, &self.scopes))
+        })
+    }
+
+    /// Every declaration id the tree holds.
+    pub(crate) fn decl_ids(&self) -> impl Iterator<Item = &LuaDeclId> {
+        self.decls.keys()
     }
 
     pub fn file_id(&self) -> FileId {
@@ -338,6 +361,9 @@ impl LuaDeclarationTree {
     }
 
     pub fn add_decl(&mut self, decl: LuaDecl) -> LuaDeclId {
+        self.fingerprint.take();
+        derivation::note_write(|| FactKey::Decl(decl.get_id()));
+        derivation::note_write(|| FactKey::DeclTree(self.file_id));
         if decl.is_module_scoped() {
             self.module_decls_by_name
                 .entry(decl.get_name().to_string())
@@ -351,6 +377,9 @@ impl LuaDeclarationTree {
 
     #[allow(unused)]
     pub fn get_decl_mut(&mut self, decl_id: LuaDeclId) -> Option<&mut LuaDecl> {
+        self.fingerprint.take();
+        derivation::note_write(|| FactKey::Decl(decl_id));
+        derivation::note_write(|| FactKey::DeclTree(self.file_id));
         self.decls.get_mut(&decl_id)
     }
 
@@ -359,6 +388,8 @@ impl LuaDeclarationTree {
     }
 
     pub fn create_scope(&mut self, range: TextRange, kind: LuaScopeKind) -> LuaScopeId {
+        self.fingerprint.take();
+        derivation::note_write(|| FactKey::DeclTree(self.file_id));
         let id = self.scopes.len() as u32;
         let scope_id = LuaScopeId {
             file_id: self.file_id,
@@ -372,6 +403,8 @@ impl LuaDeclarationTree {
     }
 
     pub fn add_decl_to_scope(&mut self, scope_id: LuaScopeId, decl_id: LuaDeclId) {
+        self.fingerprint.take();
+        derivation::note_write(|| FactKey::DeclTree(self.file_id));
         let decl_name = self
             .get_decl(&decl_id)
             .map(|decl| SmolStr::new(decl.get_name()));
@@ -430,6 +463,8 @@ impl LuaDeclarationTree {
     }
 
     pub fn add_child_scope(&mut self, parent_id: LuaScopeId, child_id: LuaScopeId) {
+        self.fingerprint.take();
+        derivation::note_write(|| FactKey::DeclTree(self.file_id));
         if let Some(parent) = self.scopes.get_mut(parent_id.id as usize) {
             let vec_index = parent.get_children().len() as u32;
             parent.add_child(child_id);

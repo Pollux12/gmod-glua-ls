@@ -402,21 +402,18 @@ mod test {
         let alias_uri = ws.virtual_url_generator.new_uri(alias_path);
         ws.analysis
             .update_file_text_only(&alias_uri, "WritePayload = net.WriteBool".into());
-        ws.analysis
-            .reindex_expanded_files(vec![alias_id], vec![alias_id, sender_id]);
+        ws.analysis.reindex_files(vec![alias_id]);
         assert_eq!(writes(&ws), vec!["bool"]);
         let incremental = writes(&ws);
         ws.analysis.reindex();
         assert_eq!(writes(&ws), incremental);
 
         ws.analysis.update_file_by_uri(&alias_uri, None);
-        ws.analysis
-            .reindex_expanded_files(vec![alias_id], vec![alias_id, sender_id]);
+        ws.analysis.reindex_files(vec![alias_id]);
         assert!(writes(&ws).is_empty());
 
         let reopened_id = ws.def_file(alias_path, "WritePayload = net.WriteString");
-        ws.analysis
-            .reindex_expanded_files(vec![reopened_id], vec![reopened_id, sender_id]);
+        ws.analysis.reindex_files(vec![reopened_id]);
         assert_eq!(writes(&ws), vec!["string"]);
     }
 

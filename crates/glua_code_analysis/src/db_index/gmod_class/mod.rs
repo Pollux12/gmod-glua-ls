@@ -2,11 +2,15 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use glua_parser::LuaSyntaxId;
 use rowan::TextSize;
+use smol_str::SmolStr;
 
 use super::LuaIndex;
-use crate::{FileId, LuaTypeDeclId, db_index::op_log, db_index::read_set::WriteKey};
+use crate::{
+    FileId, LuaTypeDeclId,
+    db_index::derivation::{self, FactKey, Fingerprint},
+};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GmodScriptedClassCallKind {
     DefineBaseClass,
     DeriveGamemode,
@@ -45,7 +49,21 @@ pub enum GmodClassCallLiteral {
     NameRef(String),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl std::hash::Hash for GmodClassCallLiteral {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::String(value) | Self::NameRef(value) => value.hash(state),
+            Self::Integer(value) => value.hash(state),
+            Self::Unsigned(value) => value.hash(state),
+            Self::Float(value) => value.to_bits().hash(state),
+            Self::Boolean(value) => value.hash(state),
+            Self::Nil => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct GmodClassCallArg {
     pub syntax_id: LuaSyntaxId,
     pub value: Option<GmodClassCallLiteral>,
@@ -66,14 +84,14 @@ impl GmodClassCallArgSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct GmodClassCallFieldArg {
     pub source: GmodClassCallArgSource,
     pub syntax_id: LuaSyntaxId,
     pub value: Option<GmodClassCallLiteral>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct GmodScriptedClassCallMetadata {
     pub syntax_id: LuaSyntaxId,
     pub literal_args: Vec<Option<GmodClassCallLiteral>>,
@@ -85,25 +103,25 @@ pub struct GmodScriptedClassCallMetadata {
     pub derma_skin_roles: Option<GmodDermaSkinCallRoles>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GmodNamedStringCallRoles {
     pub name_arg_idx: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GmodNetworkVarCallRoles {
     pub type_arg_idx: Option<usize>,
     pub name_arg_idx: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodVguiPanelCallRoles {
     pub define: GmodClassCallArgSource,
     pub table: Option<GmodClassCallArgSource>,
     pub base: Option<GmodClassCallArgSource>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GmodDermaSkinCallRoles {
     pub define_arg_idx: usize,
 }
@@ -209,7 +227,7 @@ impl GmodScriptedClassCallMetadata {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Hash)]
 pub struct GmodScriptedClassFileMetadata {
     pub define_baseclass_calls: Vec<GmodScriptedClassCallMetadata>,
     pub derive_gamemode_calls: Vec<GmodScriptedClassCallMetadata>,
@@ -225,7 +243,7 @@ pub struct GmodScriptedClassFileMetadata {
     pub vgui_parent_calls: Vec<GmodVguiParentCallMetadata>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GmodVguiParentSource {
     LiteralName(String),
     Expr(LuaSyntaxId),
@@ -234,40 +252,22 @@ pub enum GmodVguiParentSource {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodVguiParentRelation {
     pub child_type_id: LuaTypeDeclId,
     pub parent_chain: Vec<LuaTypeDeclId>,
     pub parent_chain_complete: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GmodVguiParentCallOrigin {
-    Annotated,
-    Forwarded,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodVguiParentCallMetadata {
     pub syntax_id: LuaSyntaxId,
     pub child: GmodVguiParentSource,
     pub parent: GmodVguiParentSource,
-    pub relations: Vec<GmodVguiParentRelation>,
-    pub origin: GmodVguiParentCallOrigin,
-    /// This call resolved against its file's syntax tree, before the
-    /// inheritance chain is walked.
-    ///
-    /// The chain walk is global and has to see every call, but resolving a call
-    /// means walking the declaring file's syntax tree — and re-analysing one
-    /// file cannot change what another file's call resolves to on its own.
-    /// Caching it here means a re-analysis only walks the files it rebuilt:
-    /// analysis creates calls with this empty, so a rebuilt file recomputes and
-    /// an untouched file reuses, with no dirty set to keep in step.
-    pub resolved_source: Option<GmodVguiResolvedParentSource>,
 }
 
 /// How a vgui parent call names its parent, resolved to type ids.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GmodVguiParentSourceResolution {
     Direct(Vec<LuaTypeDeclId>),
     AssignedField {
@@ -281,12 +281,6 @@ pub enum GmodVguiParentSourceResolution {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GmodVguiResolvedParentSource {
-    pub child_type_ids: Vec<LuaTypeDeclId>,
-    pub parent: GmodVguiParentSourceResolution,
-}
-
 impl GmodScriptedClassFileMetadata {
     pub fn get_define_baseclass_name(&self) -> Option<&str> {
         self.define_baseclass_calls.iter().rev().find_map(|call| {
@@ -297,25 +291,6 @@ impl GmodScriptedClassFileMetadata {
                 _ => None,
             }
         })
-    }
-
-    fn calls_by_kind(
-        &self,
-        kind: GmodScriptedClassCallKind,
-    ) -> &Vec<GmodScriptedClassCallMetadata> {
-        match kind {
-            GmodScriptedClassCallKind::DefineBaseClass => &self.define_baseclass_calls,
-            GmodScriptedClassCallKind::DeriveGamemode => &self.derive_gamemode_calls,
-            GmodScriptedClassCallKind::AccessorFunc => &self.accessor_func_calls,
-            GmodScriptedClassCallKind::NetworkVar => &self.network_var_calls,
-            GmodScriptedClassCallKind::NetworkVarElement => &self.network_var_element_calls,
-            GmodScriptedClassCallKind::ScriptedEntRegister => &self.scripted_ent_register_calls,
-            GmodScriptedClassCallKind::VguiRegister => &self.vgui_register_calls,
-            GmodScriptedClassCallKind::VguiRegisterFile => &self.vgui_register_file_calls,
-            GmodScriptedClassCallKind::VguiRegisterTable => &self.vgui_register_table_calls,
-            GmodScriptedClassCallKind::DermaDefineControl => &self.derma_define_control_calls,
-            GmodScriptedClassCallKind::DermaDefineSkin => &self.derma_define_skin_calls,
-        }
     }
 
     fn calls_by_kind_mut(
@@ -343,33 +318,11 @@ pub struct GmodClassMetadataIndex {
     file_metadata: HashMap<FileId, GmodScriptedClassFileMetadata>,
     vgui_panels: HashMap<String, Vec<VguiPanelDefinition>>,
     derma_skins: HashMap<String, Vec<DermaSkinDefinition>>,
-    vgui_forwarding_parents: HashMap<(LuaTypeDeclId, String), Vec<LuaTypeDeclId>>,
     vgui_panel_parent_chains: HashMap<LuaTypeDeclId, Vec<LuaTypeDeclId>>,
     incomplete_vgui_panel_parent_chains: HashSet<LuaTypeDeclId>,
-    /// Children whose parent relations came from a file that has been removed
-    /// from the index but not yet re-analysed.
-    ///
-    /// A batch removes every file up front and re-analyses them group by group,
-    /// so between those two points the relation set is missing evidence it will
-    /// get back. A chain must stay incomplete while any of its contributing
-    /// files is in that window: deriving completeness from the partial set let
-    /// a conflicting creation site vanish transiently, and inference that ran
-    /// in the gap kept the answer the full relation set contradicts.
-    pending_vgui_parent_relation_files: HashMap<FileId, Vec<LuaTypeDeclId>>,
-    /// Write epochs for `file_metadata` — `FileScopedKind::GmodMetaFile`.
-    pub(crate) file_write_epochs: crate::db_index::read_set::KeyedEpochs<FileId>,
-    /// Domain counter for name-keyed metadata writes (`vgui_panels`,
-    /// `derma_skins`) — `record_gmod_meta` readers have no per-key clocks,
-    /// so any write stales them.
-    pub(crate) gmod_meta_writes: u64,
-    /// Domain counter for `vgui_forwarding_parents` writes — readers reach
-    /// the forwarding parents through type-decl paths, so a change here
-    /// stales `type_decls` readers (summed with the type index's counter).
-    pub(crate) type_decl_writes: u64,
-    /// Write epochs for `vgui_panel_parent_chains` /
-    /// `incomplete_vgui_panel_parent_chains`, keyed by child decl — a chain
-    /// rewrite under one child stales only readers of that child.
-    pub(crate) decl_key_epochs: crate::db_index::read_set::KeyedEpochs<LuaTypeDeclId>,
+    /// Incremental multiset fingerprint, per panel/skin name, of the
+    /// registration calls a name-keyed read can observe.
+    meta_fingerprints: HashMap<SmolStr, Fingerprint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -391,28 +344,101 @@ impl GmodClassMetadataIndex {
             file_metadata: HashMap::default(),
             vgui_panels: HashMap::default(),
             derma_skins: HashMap::default(),
-            vgui_forwarding_parents: HashMap::default(),
             vgui_panel_parent_chains: HashMap::default(),
             incomplete_vgui_panel_parent_chains: HashSet::default(),
-            pending_vgui_parent_relation_files: HashMap::default(),
-            file_write_epochs: crate::db_index::read_set::KeyedEpochs::default(),
-            gmod_meta_writes: 0,
-            type_decl_writes: 0,
-            decl_key_epochs: crate::db_index::read_set::KeyedEpochs::default(),
+            meta_fingerprints: HashMap::default(),
         }
     }
 
-    /// Domain-counter bump for name-keyed metadata writes — see
-    /// `record_gmod_meta`/`untracked_reads_changed`.
-    fn note_gmod_meta_write(&mut self) {
-        self.gmod_meta_writes = self.gmod_meta_writes.wrapping_add(1);
+    /// The names under which name-keyed reads observe `call`: the literal
+    /// define argument (`find_*_definitions`) and the cached panel/skin name.
+    fn meta_names(
+        kind: GmodScriptedClassCallKind,
+        call: &GmodScriptedClassCallMetadata,
+    ) -> Vec<SmolStr> {
+        let (define_arg_index, cached_name) = match kind {
+            GmodScriptedClassCallKind::VguiRegister
+            | GmodScriptedClassCallKind::DermaDefineControl => (
+                call.vgui_panel_define_arg_idx(),
+                Self::maybe_extract_vgui_panel(kind, call).map(|(name, _)| name),
+            ),
+            GmodScriptedClassCallKind::DermaDefineSkin => (
+                call.derma_skin_define_arg_idx(),
+                Self::extract_non_empty_string_arg(call, call.derma_skin_define_arg_idx()),
+            ),
+            _ => return Vec::new(),
+        };
+        let mut names = Vec::new();
+        if let Some(Some(GmodClassCallLiteral::String(name))) =
+            call.literal_args.get(define_arg_index)
+        {
+            names.push(SmolStr::new(name));
+        }
+        if let Some(name) = cached_name
+            && !names.iter().any(|existing| existing.as_str() == name)
+        {
+            names.push(SmolStr::new(name));
+        }
+        names
     }
 
-    /// Domain-counter bump for `vgui_forwarding_parents` writes — readers
-    /// reach them through type-decl paths, so a change here stales
-    /// `type_decls` readers (summed with the type index's counter).
-    fn note_type_decl_write(&mut self) {
-        self.type_decl_writes = self.type_decl_writes.wrapping_add(1);
+    /// Adds (`add`) or removes `call`'s contribution to the name-keyed
+    /// fingerprints.
+    fn update_meta_fingerprints(
+        meta_fingerprints: &mut HashMap<SmolStr, Fingerprint>,
+        file_id: FileId,
+        kind: GmodScriptedClassCallKind,
+        call: &GmodScriptedClassCallMetadata,
+        add: bool,
+    ) {
+        let names = Self::meta_names(kind, call);
+        if names.is_empty() {
+            return;
+        }
+        let fingerprint = derivation::fingerprint_of(&(kind, file_id, call));
+        for name in names {
+            derivation::note_write(|| FactKey::GmodMeta(name.clone()));
+            let previous = meta_fingerprints.get(&name).copied().unwrap_or_default();
+            let value = if add {
+                previous.wrapping_add(fingerprint)
+            } else {
+                previous.wrapping_sub(fingerprint)
+            };
+            if value == 0 {
+                meta_fingerprints.remove(&name);
+            } else {
+                meta_fingerprints.insert(name, value);
+            }
+        }
+    }
+
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        match key {
+            FactKey::GmodMeta(name) => self
+                .meta_fingerprints
+                .get(name)
+                .copied()
+                .unwrap_or(derivation::ABSENT),
+            FactKey::GmodClassFile(file_id) => {
+                derivation::fingerprint_opt(self.file_metadata.get(file_id))
+            }
+            FactKey::VguiParentCallFiles => {
+                derivation::fingerprint_of(&self.collect_vgui_parent_call_files())
+            }
+            FactKey::VguiChain(type_id) => {
+                let chain = self.vgui_panel_parent_chains.get(type_id);
+                let incomplete = self.incomplete_vgui_panel_parent_chains.contains(type_id);
+                if chain.is_none() && !incomplete {
+                    derivation::ABSENT
+                } else {
+                    derivation::fingerprint_of(&(chain, incomplete))
+                }
+            }
+            _ => {
+                debug_assert!(false, "{key:?} is not a gmod class fact");
+                derivation::ABSENT
+            }
+        }
     }
 
     fn extract_non_empty_string_literal(literal: &GmodClassCallLiteral) -> Option<String> {
@@ -619,38 +645,8 @@ impl GmodClassMetadataIndex {
             }
         }
 
-        if self.vgui_panels != vgui_panels || self.derma_skins != derma_skins {
-            self.note_gmod_meta_write();
-        }
         self.vgui_panels = vgui_panels;
         self.derma_skins = derma_skins;
-        self.recompute_vgui_panel_parent_chains();
-    }
-
-    /// The name-keyed cache slots (`vgui_panels`/`derma_skins`) a call write
-    /// touches, as write keys — name-keyed readers stale only on a same-name
-    /// write, not on every `add_call`.
-    fn call_cache_keys(
-        kind: GmodScriptedClassCallKind,
-        call_metadata: &GmodScriptedClassCallMetadata,
-    ) -> Vec<WriteKey> {
-        let mut keys = Vec::new();
-        if matches!(
-            kind,
-            GmodScriptedClassCallKind::VguiRegister | GmodScriptedClassCallKind::DermaDefineControl
-        ) && let Some((panel_name, _)) = Self::maybe_extract_vgui_panel(kind, call_metadata)
-        {
-            keys.push(WriteKey::GmodMeta(panel_name.into()));
-        }
-        if kind == GmodScriptedClassCallKind::DermaDefineSkin
-            && let Some(skin_name) = Self::extract_non_empty_string_arg(
-                call_metadata,
-                call_metadata.derma_skin_define_arg_idx(),
-            )
-        {
-            keys.push(WriteKey::GmodMeta(skin_name.into()));
-        }
-        keys
     }
 
     pub fn add_call(
@@ -659,33 +655,7 @@ impl GmodClassMetadataIndex {
         kind: GmodScriptedClassCallKind,
         call_metadata: GmodScriptedClassCallMetadata,
     ) {
-        if op_log::recording() {
-            let metadata = call_metadata.clone();
-            let mut keys = vec![WriteKey::FileScoped(file_id)];
-            keys.extend(Self::call_cache_keys(kind, &call_metadata));
-            // Re-adding a call site replaces the previous one's cache entries
-            // — its names are written slots too.
-            if let Some(existing) = self
-                .file_metadata
-                .get(&file_id)
-                .map(|m| m.calls_by_kind(kind))
-                .and_then(|calls| {
-                    calls
-                        .iter()
-                        .find(|call| call.syntax_id == call_metadata.syntax_id)
-                })
-            {
-                keys.extend(Self::call_cache_keys(kind, existing));
-            }
-            op_log::push(
-                op_log::Domain::GmodClass,
-                keys.into_boxed_slice(),
-                move |db| {
-                    db.get_gmod_class_metadata_index_mut()
-                        .add_call(file_id, kind, metadata)
-                },
-            );
-        }
+        derivation::note_write(|| FactKey::GmodClassFile(file_id));
         {
             let calls = self
                 .file_metadata
@@ -702,48 +672,51 @@ impl GmodClassMetadataIndex {
                 // instead of rebuilding every file's panels/skins, which would
                 // make a full analysis O(calls * total_calls).
                 let old_metadata = std::mem::replace(existing, call_metadata.clone());
+                Self::update_meta_fingerprints(
+                    &mut self.meta_fingerprints,
+                    file_id,
+                    kind,
+                    &old_metadata,
+                    false,
+                );
+                Self::update_meta_fingerprints(
+                    &mut self.meta_fingerprints,
+                    file_id,
+                    kind,
+                    &call_metadata,
+                    true,
+                );
                 self.replace_cached_call(file_id, kind, &old_metadata, &call_metadata);
-                self.file_write_epochs.note(file_id);
-                if !Self::call_cache_keys(kind, &call_metadata).is_empty()
-                    || !Self::call_cache_keys(kind, &old_metadata).is_empty()
-                {
-                    self.note_gmod_meta_write();
-                }
                 return;
             }
         }
 
         self.update_vgui_panels_from_call(file_id, kind, &call_metadata);
         self.update_derma_skins_from_call(file_id, kind, &call_metadata);
-        let cache_touched = !Self::call_cache_keys(kind, &call_metadata).is_empty();
+        Self::update_meta_fingerprints(
+            &mut self.meta_fingerprints,
+            file_id,
+            kind,
+            &call_metadata,
+            true,
+        );
         self.file_metadata
             .entry(file_id)
             .or_default()
             .calls_by_kind_mut(kind)
             .push(call_metadata);
-        self.file_write_epochs.note(file_id);
-        if cache_touched {
-            self.note_gmod_meta_write();
-        }
     }
 
     pub fn add_vgui_parent_call(&mut self, file_id: FileId, call: GmodVguiParentCallMetadata) {
-        if op_log::recording() {
-            let replay = call.clone();
-            op_log::push(
-                op_log::Domain::GmodClass,
-                Box::new([WriteKey::FileScoped(file_id)]),
-                move |db| {
-                    db.get_gmod_class_metadata_index_mut()
-                        .add_vgui_parent_call(file_id, replay)
-                },
-            );
-        }
+        derivation::note_write(|| FactKey::GmodClassFile(file_id));
         let calls = &mut self
             .file_metadata
             .entry(file_id)
             .or_default()
             .vgui_parent_calls;
+        if calls.is_empty() {
+            derivation::note_write(|| FactKey::VguiParentCallFiles);
+        }
         if let Some(existing) = calls
             .iter_mut()
             .find(|existing| existing.syntax_id == call.syntax_id)
@@ -764,140 +737,48 @@ impl GmodClassMetadataIndex {
             });
             calls.insert(insert_at, call);
         }
-        self.file_write_epochs.note(file_id);
-    }
-
-    pub fn clear_forwarded_vgui_parent_calls(&mut self) {
-        for (file_id, metadata) in self.file_metadata.iter_mut() {
-            let before = metadata.vgui_parent_calls.len();
-            metadata
-                .vgui_parent_calls
-                .retain(|call| call.origin != GmodVguiParentCallOrigin::Forwarded);
-            if metadata.vgui_parent_calls.len() != before {
-                self.file_write_epochs.note(*file_id);
-            }
-        }
-    }
-
-    pub fn clear_forwarded_vgui_parent_calls_for_files(&mut self, file_ids: &[FileId]) {
-        for file_id in file_ids {
-            let Some(metadata) = self.file_metadata.get_mut(file_id) else {
-                continue;
-            };
-            let before = metadata.vgui_parent_calls.len();
-            metadata
-                .vgui_parent_calls
-                .retain(|call| call.origin != GmodVguiParentCallOrigin::Forwarded);
-            if metadata.vgui_parent_calls.len() != before {
-                self.file_write_epochs.note(*file_id);
-            }
-        }
     }
 
     pub fn has_annotated_vgui_parent_calls(&self, file_id: FileId) -> bool {
-        crate::db_index::read_set::record_file_scoped(
-            &self.file_write_epochs,
-            &file_id,
-            crate::db_index::read_set::FileScopedKind::GmodMetaFile,
-        );
-        self.file_metadata.get(&file_id).is_some_and(|metadata| {
-            metadata
-                .vgui_parent_calls
-                .iter()
-                .any(|call| call.origin == GmodVguiParentCallOrigin::Annotated)
-        })
-    }
-
-    pub fn update_vgui_forwarding_parents(
-        &mut self,
-        forwarding_parents: &HashMap<(LuaTypeDeclId, String), Vec<LuaTypeDeclId>>,
-    ) -> bool {
-        if &self.vgui_forwarding_parents == forwarding_parents {
-            return false;
-        }
-        self.vgui_forwarding_parents.clone_from(forwarding_parents);
-        self.note_type_decl_write();
-        true
+        derivation::note_read(|| FactKey::GmodClassFile(file_id));
+        self.file_metadata
+            .get(&file_id)
+            .is_some_and(|metadata| !metadata.vgui_parent_calls.is_empty())
     }
 
     pub fn get_vgui_parent_calls(&self, file_id: &FileId) -> &[GmodVguiParentCallMetadata] {
-        crate::db_index::read_set::record_file_scoped(
-            &self.file_write_epochs,
-            file_id,
-            crate::db_index::read_set::FileScopedKind::GmodMetaFile,
-        );
+        derivation::note_read(|| FactKey::GmodClassFile(*file_id));
         self.file_metadata
             .get(file_id)
             .map(|metadata| metadata.vgui_parent_calls.as_slice())
             .unwrap_or_default()
     }
 
-    /// Cache each call's pre-chain resolution, so the next re-analysis only
-    /// walks the syntax trees of files it rebuilt.
-    pub fn set_vgui_resolved_parent_sources(
-        &mut self,
-        resolved_by_file: &[(FileId, Vec<(LuaSyntaxId, GmodVguiResolvedParentSource)>)],
-    ) {
-        for (file_id, resolved) in resolved_by_file {
-            let Some(metadata) = self.file_metadata.get_mut(file_id) else {
-                continue;
-            };
-            for call in &mut metadata.vgui_parent_calls {
-                call.resolved_source = resolved
-                    .iter()
-                    .find(|(syntax_id, _)| *syntax_id == call.syntax_id)
-                    .map(|(_, source)| source.clone());
-            }
-            self.file_write_epochs.note(*file_id);
-        }
-    }
-
-    pub fn set_vgui_parent_relations(
-        &mut self,
-        resolved_by_file: Vec<(FileId, Vec<(LuaSyntaxId, Vec<GmodVguiParentRelation>)>)>,
-    ) {
-        for (file_id, resolved) in resolved_by_file {
-            let Some(metadata) = self.file_metadata.get_mut(&file_id) else {
-                continue;
-            };
-            for call in &mut metadata.vgui_parent_calls {
-                call.relations = resolved
-                    .iter()
-                    .find(|(syntax_id, _)| *syntax_id == call.syntax_id)
-                    .map(|(_, relations)| relations.clone())
-                    .unwrap_or_default();
-            }
-            self.file_write_epochs.note(file_id);
-        }
-        self.recompute_vgui_panel_parent_chains();
-    }
-
     pub fn get_vgui_panel_parent_chain(
         &self,
         child_type_id: &LuaTypeDeclId,
     ) -> Option<&[LuaTypeDeclId]> {
-        crate::db_index::read_set::record_vgui_type_decl(&self.decl_key_epochs, child_type_id);
+        derivation::note_read(|| FactKey::VguiChain(child_type_id.clone()));
         self.vgui_panel_parent_chains
             .get(child_type_id)
             .map(Vec::as_slice)
     }
 
     pub fn vgui_panel_parent_chain_is_complete(&self, child_type_id: &LuaTypeDeclId) -> bool {
-        crate::db_index::read_set::record_vgui_type_decl(&self.decl_key_epochs, child_type_id);
+        derivation::note_read(|| FactKey::VguiChain(child_type_id.clone()));
         !self
             .incomplete_vgui_panel_parent_chains
             .contains(child_type_id)
     }
 
-    fn recompute_vgui_panel_parent_chains(&mut self) {
-        // Order-free despite the hash-ordered walk: a chain survives only if
-        // every relation agrees on it — any disagreement marks the child
-        // incomplete and the entry is dropped below, whichever one landed first.
+    /// Replaces the parent chains with those `relations` agree on. A child
+    /// with an incomplete relation or two disagreeing chains has none.
+    pub fn set_vgui_parent_relations(&mut self, relations: &[GmodVguiParentRelation]) {
         let mut parent_chains = HashMap::<LuaTypeDeclId, Vec<LuaTypeDeclId>>::default();
         let mut incomplete = HashSet::default();
-        for metadata in self.file_metadata.values() {
-            for call in &metadata.vgui_parent_calls {
-                for relation in &call.relations {
+        {
+            {
+                for relation in relations {
                     if !relation.parent_chain_complete || relation.parent_chain.is_empty() {
                         incomplete.insert(relation.child_type_id.clone());
                         continue;
@@ -917,20 +798,12 @@ impl GmodClassMetadataIndex {
                 }
             }
         }
-        // A removed-but-not-reanalysed file's relations are evidence in
-        // transit, not evidence gone: its children stay incomplete until the
-        // file's re-analysis puts its relations back (or its deletion is
-        // confirmed and the mark is cleared).
-        for children in self.pending_vgui_parent_relation_files.values() {
-            incomplete.extend(children.iter().cloned());
-        }
         for type_id in &incomplete {
             parent_chains.remove(type_id);
         }
         if self.vgui_panel_parent_chains != parent_chains
             || self.incomplete_vgui_panel_parent_chains != incomplete
         {
-            self.note_type_decl_write();
             // Stamp every child whose chain or completeness could have moved —
             // old and new keys both, so removed and gained chains stale their
             // readers alike.
@@ -941,43 +814,17 @@ impl GmodClassMetadataIndex {
                 .chain(self.incomplete_vgui_panel_parent_chains.iter())
                 .chain(incomplete.iter())
             {
-                self.decl_key_epochs.note(type_id.clone());
+                derivation::note_write(|| FactKey::VguiChain(type_id.clone()));
             }
         }
         self.vgui_panel_parent_chains = parent_chains;
         self.incomplete_vgui_panel_parent_chains = incomplete;
     }
 
-    /// Clears the removed-file marks for files whose parent relations have been
-    /// re-derived (or that no longer exist), so their children's chains can
-    /// settle again. Callers must recompute the chains afterwards; both call
-    /// sites do so via [`Self::set_vgui_parent_relations`].
-    pub fn clear_pending_vgui_parent_relation_files(&mut self, file_ids: &[FileId]) {
-        for file_id in file_ids {
-            self.pending_vgui_parent_relation_files.remove(file_id);
-            self.file_write_epochs.note(*file_id);
-        }
-    }
-
     /// The files whose removal is still holding their children's chains
     /// incomplete.
-    pub fn pending_vgui_parent_relation_file_ids(&self) -> Vec<FileId> {
-        op_log::note_untracked_read(op_log::UntrackedDomain::GmodClass);
-        let mut file_ids = self
-            .pending_vgui_parent_relation_files
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        file_ids.sort_by_key(|file_id| file_id.id);
-        file_ids
-    }
-
     pub fn get_file_metadata(&self, file_id: &FileId) -> Option<&GmodScriptedClassFileMetadata> {
-        crate::db_index::read_set::record_file_scoped(
-            &self.file_write_epochs,
-            file_id,
-            crate::db_index::read_set::FileScopedKind::GmodMetaFile,
-        );
+        derivation::note_read(|| FactKey::GmodClassFile(*file_id));
         self.file_metadata.get(file_id)
     }
 
@@ -985,18 +832,36 @@ impl GmodClassMetadataIndex {
         self.get_file_metadata(file_id)?.get_define_baseclass_name()
     }
 
+    /// Every file's metadata, unordered and unrecorded: for editor requests,
+    /// not analysis.
     pub fn iter_file_metadata(
         &self,
     ) -> impl Iterator<Item = (&FileId, &GmodScriptedClassFileMetadata)> {
-        op_log::note_untracked_read(op_log::UntrackedDomain::GmodClass);
         self.file_metadata.iter()
+    }
+
+    /// The files that have vgui parent calls, sorted.
+    pub fn vgui_parent_call_files(&self) -> Vec<FileId> {
+        derivation::note_read(|| FactKey::VguiParentCallFiles);
+        self.collect_vgui_parent_call_files()
+    }
+
+    fn collect_vgui_parent_call_files(&self) -> Vec<FileId> {
+        let mut file_ids = self
+            .file_metadata
+            .iter()
+            .filter(|(_, metadata)| !metadata.vgui_parent_calls.is_empty())
+            .map(|(file_id, _)| *file_id)
+            .collect::<Vec<_>>();
+        file_ids.sort_unstable();
+        file_ids
     }
 
     pub fn find_vgui_panel_definitions(
         &self,
         name: &str,
     ) -> Vec<(FileId, &GmodScriptedClassCallMetadata)> {
-        crate::db_index::read_set::record_gmod_meta(&name.into());
+        derivation::note_read(|| FactKey::GmodMeta(SmolStr::new(name)));
         if name.trim().is_empty() {
             return Vec::new();
         }
@@ -1029,7 +894,7 @@ impl GmodClassMetadataIndex {
         &self,
         name: &str,
     ) -> Vec<(FileId, &GmodScriptedClassCallMetadata)> {
-        crate::db_index::read_set::record_gmod_meta(&name.into());
+        derivation::note_read(|| FactKey::GmodMeta(SmolStr::new(name)));
         if name.trim().is_empty() {
             return Vec::new();
         }
@@ -1055,7 +920,7 @@ impl GmodClassMetadataIndex {
     }
 
     pub fn get_vgui_panel_base(&self, name: &str) -> Option<Option<String>> {
-        crate::db_index::read_set::record_gmod_meta(&name.into());
+        derivation::note_read(|| FactKey::GmodMeta(SmolStr::new(name)));
         self.vgui_panels.get(name).map(|definitions| {
             definitions
                 .iter()
@@ -1075,18 +940,33 @@ impl LuaIndex for GmodClassMetadataIndex {
             let Some(metadata) = self.file_metadata.remove(&file_id) else {
                 continue;
             };
-            self.file_write_epochs.note(file_id);
-            let mut children = metadata
-                .vgui_parent_calls
-                .iter()
-                .flat_map(|call| &call.relations)
-                .map(|relation| relation.child_type_id.clone())
-                .collect::<Vec<_>>();
-            children.sort_by(|left, right| left.get_name().cmp(right.get_name()));
-            children.dedup();
-            if !children.is_empty() {
-                self.pending_vgui_parent_relation_files
-                    .insert(file_id, children);
+            derivation::note_write(|| FactKey::GmodClassFile(file_id));
+            if !metadata.vgui_parent_calls.is_empty() {
+                derivation::note_write(|| FactKey::VguiParentCallFiles);
+            }
+            for (kind, calls) in [
+                (
+                    GmodScriptedClassCallKind::VguiRegister,
+                    &metadata.vgui_register_calls,
+                ),
+                (
+                    GmodScriptedClassCallKind::DermaDefineControl,
+                    &metadata.derma_define_control_calls,
+                ),
+                (
+                    GmodScriptedClassCallKind::DermaDefineSkin,
+                    &metadata.derma_define_skin_calls,
+                ),
+            ] {
+                for call in calls {
+                    Self::update_meta_fingerprints(
+                        &mut self.meta_fingerprints,
+                        file_id,
+                        kind,
+                        call,
+                        false,
+                    );
+                }
             }
         }
         self.recompute_derived_caches();
@@ -1094,24 +974,25 @@ impl LuaIndex for GmodClassMetadataIndex {
 
     fn clear(&mut self) {
         for file_id in self.file_metadata.keys() {
-            self.file_write_epochs.note(*file_id);
+            derivation::note_write(|| FactKey::GmodClassFile(*file_id));
         }
+        derivation::note_write(|| FactKey::VguiParentCallFiles);
         for type_id in self
             .vgui_panel_parent_chains
             .keys()
             .chain(self.incomplete_vgui_panel_parent_chains.iter())
         {
-            self.decl_key_epochs.note(type_id.clone());
+            derivation::note_write(|| FactKey::VguiChain(type_id.clone()));
         }
-        self.note_gmod_meta_write();
-        self.note_type_decl_write();
+        for name in self.meta_fingerprints.keys() {
+            derivation::note_write(|| FactKey::GmodMeta(name.clone()));
+        }
+        self.meta_fingerprints.clear();
         self.file_metadata.clear();
         self.vgui_panels.clear();
         self.derma_skins.clear();
-        self.vgui_forwarding_parents.clear();
         self.vgui_panel_parent_chains.clear();
         self.incomplete_vgui_panel_parent_chains.clear();
-        self.pending_vgui_parent_relation_files.clear();
     }
 }
 
@@ -1290,69 +1171,5 @@ mod tests {
         assert_eq!(index.file_metadata, expected.file_metadata);
         assert_eq!(index.vgui_panels, expected.vgui_panels);
         assert_eq!(index.derma_skins, expected.derma_skins);
-    }
-
-    fn parent_call(
-        start: u32,
-        child: &str,
-        parent: &str,
-        complete: bool,
-    ) -> super::GmodVguiParentCallMetadata {
-        super::GmodVguiParentCallMetadata {
-            syntax_id: LuaSyntaxId::new(LuaSyntaxKind::CallExpr.into(), range(start)),
-            child: super::GmodVguiParentSource::LiteralName(child.to_string()),
-            parent: super::GmodVguiParentSource::LiteralName(parent.to_string()),
-            relations: vec![super::GmodVguiParentRelation {
-                child_type_id: crate::LuaTypeDeclId::global(child),
-                parent_chain: if complete {
-                    vec![crate::LuaTypeDeclId::global(parent)]
-                } else {
-                    Vec::new()
-                },
-                parent_chain_complete: complete,
-            }],
-            origin: super::GmodVguiParentCallOrigin::Annotated,
-            resolved_source: None,
-        }
-    }
-
-    #[test]
-    fn removed_relation_file_keeps_child_chain_incomplete_until_cleared() {
-        let mut index = GmodClassMetadataIndex::new();
-        let agreeing_file = FileId::new(1);
-        let conflicting_file = FileId::new(2);
-        let child = crate::LuaTypeDeclId::global("ChildPanel");
-
-        index.add_vgui_parent_call(
-            agreeing_file,
-            parent_call(10, "ChildPanel", "ParentA", true),
-        );
-        index.add_vgui_parent_call(
-            conflicting_file,
-            parent_call(20, "ChildPanel", "ParentB", true),
-        );
-        index.set_vgui_parent_relations(Vec::new());
-        assert!(!index.vgui_panel_parent_chain_is_complete(&child));
-
-        // Removing the conflicting creation site for a re-index must not let
-        // the surviving relation settle the chain: the removed file's evidence
-        // is in transit, not gone.
-        index.remove(conflicting_file);
-        assert!(!index.vgui_panel_parent_chain_is_complete(&child));
-        assert!(index.get_vgui_panel_parent_chain(&child).is_none());
-        assert_eq!(
-            index.pending_vgui_parent_relation_file_ids(),
-            vec![conflicting_file]
-        );
-
-        // Once the file's relations are re-derived (here: it genuinely lost its
-        // call), the surviving relation may settle the chain again.
-        index.clear_pending_vgui_parent_relation_files(&[conflicting_file]);
-        index.set_vgui_parent_relations(Vec::new());
-        assert!(index.vgui_panel_parent_chain_is_complete(&child));
-        assert_eq!(
-            index.get_vgui_panel_parent_chain(&child),
-            Some(&[crate::LuaTypeDeclId::global("ParentA")][..])
-        );
     }
 }

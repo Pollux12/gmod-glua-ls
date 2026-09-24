@@ -1,6 +1,5 @@
-use glua_code_analysis::{DirtySet, EmmyLuaAnalysis, FileId};
+use glua_code_analysis::{EmmyLuaAnalysis, FileId};
 use lsp_types::Uri;
-use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -15,27 +14,6 @@ const FRESHNESS_STUCK_WARN_AFTER: Duration = Duration::from_secs(5);
 /// How long the user must stay idle after a reindex before the whole workspace
 /// is re-diagnosed.
 const IDLE_WORKSPACE_DIAGNOSTIC_DELAY: Duration = Duration::from_millis(2000);
-
-/// How long the user must stay idle before the dependency ripple runs.
-///
-/// The edited file's own re-index runs on the much shorter debounce, which is
-/// all a request positioned inside that file needs. This timer governs only the
-/// cross-file settle, which holds the write lock for seconds on a large
-/// gamemode — and while it does, no keystroke can even be applied. Starting it
-/// after every brief pause is what put a ripple in flight for nearly every
-/// completion.
-const RIPPLE_QUIET: Duration = Duration::from_millis(1000);
-
-/// Cap on how long one typing burst can hold the ripple off, so diagnostics
-/// still settle during sustained typing.
-const MAX_RIPPLE_DEFERRAL: Duration = Duration::from_secs(5);
-
-/// How long the ripple gives requests released by the self-index to take their
-/// read lock before it takes the write lock back.
-///
-/// Bounded so a stream of requests cannot starve the ripple: past this, the
-/// ripple proceeds and the stragglers wait it out as they did before.
-const READER_HANDOFF_GRACE: Duration = Duration::from_millis(250);
 
 /// Breakdown of a freshness wait by observed state, so one summary line
 /// can report where the wait went without per-iteration logging.
@@ -90,22 +68,11 @@ pub struct DebouncedAnalysis {
     /// Set once, never re-armed: a dead loop stays dead for process lifetime.
     debounce_loop_alive: AtomicBool,
     in_flight_changes: AtomicUsize,
-    /// Requests aimed at one document that are waiting for, or reading against,
-    /// that document's own index entries.
-    ///
-    /// The self-index releases them and then immediately queues the ripple's
-    /// write lock. A woken request still has to be polled before it can queue
-    /// its read, and the lock is fair-FIFO, so without this the ripple wins the
-    /// race every time and the request waits out the whole ripple it was just
-    /// released from.
-    pending_readers: AtomicUsize,
-    readers_idle_notify: Notify,
     notify: Notify,
     reindex_notify: Notify,
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
     shared_diagnostic_data_cache: SharedDiagnosticDataCache,
-    /// Used to schedule diagnostic-only refreshes for textual refresh names:
-    /// referencers of a name an edit moved that need no re-index of their own.
+    /// Re-diagnoses the files an edit's re-analysis reports as affected.
     file_diagnostic: Arc<FileDiagnostic>,
     debounce_duration: Duration,
     shutdown: CancellationToken,
@@ -136,8 +103,6 @@ impl DebouncedAnalysis {
             has_pending_changes: AtomicBool::new(false),
             debounce_loop_alive: AtomicBool::new(true),
             in_flight_changes: AtomicUsize::new(0),
-            pending_readers: AtomicUsize::new(0),
-            readers_idle_notify: Notify::new(),
             notify: Notify::new(),
             reindex_notify: Notify::new(),
             analysis,
@@ -244,83 +209,6 @@ impl DebouncedAnalysis {
     #[cfg(test)]
     pub(crate) fn freshness_wait_count(&self) -> usize {
         self.freshness_waits.load(Ordering::Acquire)
-    }
-
-    /// Register that a request is waiting on, or reading against, one
-    /// document's own index entries.
-    ///
-    /// Hold the guard until the request has finished reading. The ripple yields
-    /// to outstanding guards — up to [`READER_HANDOFF_GRACE`] — before it takes
-    /// the write lock back, so a request the self-index just released is not
-    /// made to wait out the ripple anyway.
-    pub fn begin_reader_handoff(self: &Arc<Self>) -> ReaderHandoff {
-        self.pending_readers.fetch_add(1, Ordering::AcqRel);
-        ReaderHandoff {
-            analysis: self.clone(),
-        }
-    }
-
-    /// Let outstanding [`ReaderHandoff`]s take their read lock before the
-    /// caller takes the write lock.
-    ///
-    /// Returns as soon as none are outstanding, or after
-    /// [`READER_HANDOFF_GRACE`] so a stream of requests cannot starve the
-    /// ripple.
-    async fn await_reader_handoff(
-        &self,
-        timing: Option<&mut crate::util::ls_profile::HandoffTiming>,
-    ) {
-        let profile = timing.is_some();
-        let start = profile.then(Instant::now);
-        // Whether any reader was ever observed: distinguishes `idle` (none at
-        // entry) from `released` (drained within the grace).
-        let mut saw_reader = false;
-        let outcome = self.await_reader_handoff_inner(&mut saw_reader).await;
-        if let (Some(timing), Some(start)) = (timing, start) {
-            timing.wait = start.elapsed();
-            timing.outcome = Some(outcome);
-        }
-    }
-
-    async fn await_reader_handoff_inner(
-        &self,
-        saw_reader: &mut bool,
-    ) -> crate::util::ls_profile::HandoffOutcome {
-        use crate::util::ls_profile::HandoffOutcome;
-        let deadline = Instant::now() + READER_HANDOFF_GRACE;
-
-        loop {
-            // Register before testing, or a drop landing in between is lost.
-            let idle = self.readers_idle_notify.notified();
-            tokio::pin!(idle);
-            idle.as_mut().enable();
-
-            if self.pending_readers.load(Ordering::Acquire) == 0 {
-                return if *saw_reader {
-                    HandoffOutcome::Released
-                } else {
-                    HandoffOutcome::Idle
-                };
-            }
-            *saw_reader = true;
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return HandoffOutcome::Timeout;
-            }
-
-            tokio::select! {
-                _ = idle => {}
-                _ = tokio::time::sleep(remaining) => return HandoffOutcome::Timeout,
-                _ = self.shutdown.cancelled() => {
-                    return if self.pending_readers.load(Ordering::Acquire) == 0 {
-                        if *saw_reader { HandoffOutcome::Released } else { HandoffOutcome::Idle }
-                    } else {
-                        HandoffOutcome::Timeout
-                    };
-                }
-            }
-        }
     }
 
     /// Wait until all pending document changes have been reindexed.
@@ -638,220 +526,6 @@ impl DebouncedAnalysis {
         }
     }
 
-    /// Snapshot the burst-start declaration names for `file_ids`: the baseline
-    /// the rename-channel validation diffs the settled-final state against.
-    ///
-    /// Runs under a read lock before the burst's first self-index settles, so
-    /// the names describe the index the burst started from. Files already in
-    /// the baseline keep their first snapshot: the comparison is burst-start
-    /// to burst-end, not keystroke to keystroke.
-    async fn snapshot_burst_start(
-        &self,
-        file_ids: &[FileId],
-        burst_start_names: &mut HashMap<FileId, HashSet<SmolStr>>,
-        burst_start_exports: &mut HashMap<FileId, glua_code_analysis::ExportMap>,
-    ) {
-        let fresh: Vec<FileId> = file_ids
-            .iter()
-            .copied()
-            .filter(|id| !burst_start_names.contains_key(id))
-            .collect();
-        if fresh.is_empty() {
-            return;
-        }
-        let analysis = self.analysis.clone();
-        let snapshot = tokio::task::spawn_blocking(move || {
-            let guard = analysis.blocking_read();
-            let names = guard.snapshot_burst_start_names(&fresh);
-            let exports = guard.snapshot_burst_start_exports(&fresh);
-            (names, exports)
-        })
-        .await
-        .unwrap_or_default();
-        for (file_id, names) in snapshot.0 {
-            burst_start_names.insert(file_id, names.into_iter().collect());
-        }
-        for (file_id, map) in snapshot.1 {
-            burst_start_exports.insert(file_id, map);
-        }
-    }
-
-    /// Merge the two refresh-name channels after validating the rename
-    /// channel: a rename-channel name survives iff it names a declaration in
-    /// the burst-start baseline or in the settled-final index. Export-channel
-    /// names pass through untouched.
-    async fn validate_and_merge_refresh_names(
-        &self,
-        fallback_export_names: HashSet<SmolStr>,
-        rename_names: HashSet<SmolStr>,
-        burst_start: &HashMap<FileId, HashSet<SmolStr>>,
-        burst_exports: HashMap<FileId, glua_code_analysis::ExportMap>,
-    ) -> HashSet<SmolStr> {
-        let analysis = self.analysis.clone();
-        let burst_start = burst_start
-            .iter()
-            .map(|(file_id, names)| (*file_id, names.iter().cloned().collect()))
-            .collect::<rustc_hash::FxHashMap<_, _>>();
-        let burst_exports = burst_exports
-            .into_iter()
-            .collect::<rustc_hash::FxHashMap<_, _>>();
-        tokio::task::spawn_blocking(move || {
-            let guard = analysis.blocking_read();
-            // Export channel: recompute start-vs-final; a burst that ends
-            // where it started yields nothing. Fall back to the per-settle
-            // union only when no baseline was captured (should not happen:
-            // the baseline anchors before the first self-index).
-            let mut names: HashSet<SmolStr> = if burst_exports.is_empty() {
-                fallback_export_names
-            } else {
-                guard
-                    .burst_boundary_export_names(&burst_exports)
-                    .into_iter()
-                    .collect()
-            };
-            let kept = guard.validate_rename_refresh_names(rename_names, &burst_start);
-            names.extend(kept);
-            names
-        })
-        .await
-        .unwrap_or_default()
-    }
-
-    /// Re-index the edited files' own entries, and report which other files
-    /// the edit invalidated.
-    ///
-    /// This takes the write lock and gives it back, which is the whole point: a
-    /// freshness flag published while the lock is still held buys a waiting
-    /// request nothing, since it cannot read the index until the lock is free.
-    async fn self_index_without_queuing(
-        &self,
-        file_ids: Vec<FileId>,
-        timing: Option<&mut crate::util::ls_profile::SelfWriteTimings>,
-    ) -> Option<DirtySet> {
-        let profile = timing.is_some();
-        let analysis = self.analysis.clone();
-        let cache = self.shared_diagnostic_data_cache.clone();
-
-        tokio::select! {
-            _ = self.shutdown.cancelled() => None,
-            result = tokio::task::spawn_blocking(move || {
-                let wait_start = profile.then(Instant::now);
-                let mut guard = analysis.blocking_write();
-                let wait = wait_start.map(|start| start.elapsed()).unwrap_or_default();
-                let hold_start = profile.then(Instant::now);
-                // Change-aware: the dirty set holds only the files that read a
-                // fact this edit actually moved. Most keystrokes (typing inside
-                // a function, trailing comment, local rename) export nothing
-                // new and leave it empty.
-                let dirty = guard.self_index_and_diff(file_ids);
-                cache.invalidate();
-                let hold = hold_start.map(|start| start.elapsed()).unwrap_or_default();
-                (dirty, wait, hold)
-            }) => match result {
-                Ok((result, wait, hold)) => {
-                    if let Some(timing) = timing {
-                        timing.wait = wait;
-                        timing.hold = hold;
-                    }
-                    Some(result)
-                }
-                Err(err) => {
-                    log::error!("self-index task failed: {}", err);
-                    None
-                }
-            }
-        }
-    }
-
-    async fn ripple_without_queuing(
-        &self,
-        dirty: DirtySet,
-        timing: Option<&mut crate::util::ls_profile::RippleWriteTimings>,
-    ) -> (bool, HashSet<SmolStr>, HashSet<SmolStr>, Vec<FileId>) {
-        let profile = timing.is_some();
-        let analysis = self.analysis.clone();
-        let cache = self.shared_diagnostic_data_cache.clone();
-
-        // Re-index under a blocking write lock on a blocking thread: the wait
-        // for the lock and the CPU work both stay off the Tokio workers.
-        tokio::select! {
-            _ = self.shutdown.cancelled() => (false, HashSet::default(), HashSet::default(), Vec::new()),
-            result = tokio::task::spawn_blocking(move || {
-                let wait_start = profile.then(Instant::now);
-                let mut guard = analysis.blocking_write();
-                let wait = wait_start.map(|start| start.elapsed()).unwrap_or_default();
-                let hold_start = profile.then(Instant::now);
-                let (rippled, export_names, rename_names) =
-                    guard.ripple_with_refresh_names_split(dirty);
-                // Invalidate under the write lock so no reader can observe the
-                // fresh index next to the stale shared diagnostic data.
-                cache.invalidate();
-                let hold = hold_start.map(|start| start.elapsed()).unwrap_or_default();
-                (rippled, export_names, rename_names, wait, hold)
-            }) => {
-                match result {
-                    Ok((rippled, export_names, rename_names, wait, hold)) => {
-                        if let Some(timing) = timing {
-                            timing.wait = wait;
-                            timing.hold = hold;
-                        }
-                        (true, export_names, rename_names, rippled)
-                    }
-                    Err(err) => {
-                        log::error!("reindex task failed: {}", err);
-                        (false, HashSet::default(), HashSet::default(), Vec::new())
-                    }
-                }
-            }
-        }
-    }
-
-    /// Resolve owed textual refresh names to their main-workspace referencers
-    /// and schedule diagnostic-only tasks for them.
-    ///
-    /// Never reindexes: the candidates go to
-    /// [`FileDiagnostic::add_files_diagnostic_task`], the same path a
-    /// watched-file change uses. `exclude` carries the files the edit path
-    /// already settled (the edited batch, the files owed a ripple, and the
-    /// files the ripple re-analysed), which the candidate filter drops.
-    async fn schedule_textual_refresh(
-        &self,
-        names: HashSet<SmolStr>,
-        exclude: &HashSet<FileId>,
-    ) -> bool {
-        if names.is_empty() {
-            return false;
-        }
-        let analysis = self.analysis.clone();
-        let exclude = exclude.clone();
-        let resolved = tokio::task::spawn_blocking(move || {
-            let guard = analysis.blocking_read();
-            let interval = guard
-                .get_emmyrc()
-                .diagnostics
-                .diagnostic_interval
-                .unwrap_or(500);
-            let candidates = guard.textual_refresh_candidates(&names, &exclude);
-            (candidates, interval)
-        })
-        .await;
-        match resolved {
-            Ok((candidates, interval)) => {
-                if candidates.is_empty() {
-                    return false;
-                }
-                self.file_diagnostic
-                    .add_files_diagnostic_task(candidates, interval, None)
-                    .await;
-                true
-            }
-            Err(err) => {
-                log::error!("textual refresh resolve task failed: {}", err);
-                false
-            }
-        }
-    }
-
     /// Arm an idle workspace diagnostic refresh so closed files hit by
     /// cross-file changes get re-diagnosed once typing pauses.
     ///
@@ -888,119 +562,91 @@ impl DebouncedAnalysis {
         });
     }
 
-    /// Hold the owed ripple until typing has stopped for [`RIPPLE_QUIET`].
-    ///
-    /// Returns `true` when the caller should run the ripple now, `false` when
-    /// another edit arrived and the loop should self-index that first — the
-    /// ripple it owes then joins the one already outstanding.
-    async fn ripple_quiet_elapsed(
+    /// Re-analyses the edited files under the write lock, on a blocking
+    /// thread so neither the wait for the lock nor the work stalls the Tokio
+    /// workers. Returns the files whose diagnostics may have changed.
+    async fn reindex_without_queuing(
         &self,
-        burst_started_at: Instant,
-        timing: Option<&mut crate::util::ls_profile::QuietTiming>,
-    ) -> bool {
-        use crate::util::ls_profile::QuietOutcome;
+        file_ids: Vec<FileId>,
+        timing: Option<&mut crate::util::ls_profile::WriteTimings>,
+    ) -> Option<Vec<FileId>> {
         let profile = timing.is_some();
-        let start = profile.then(Instant::now);
-        let extra = RIPPLE_QUIET.saturating_sub(self.debounce_duration);
-        let deferral_left = MAX_RIPPLE_DEFERRAL.saturating_sub(burst_started_at.elapsed());
-        // Capped by the deferral budget rather than by quiet: sustained typing
-        // must not hold diagnostics off indefinitely.
-        let capped_by_deferral = deferral_left <= extra;
-        if extra.is_zero() || deferral_left.is_zero() {
-            if let (Some(timing), Some(start)) = (timing, start) {
-                timing.wait = start.elapsed();
-                timing.outcome = Some(if deferral_left.is_zero() && !extra.is_zero() {
-                    QuietOutcome::MaxDeferral
-                } else if extra.is_zero() && deferral_left.is_zero() {
-                    // Both exhausted: the deferral cap is what forces the run.
-                    QuietOutcome::MaxDeferral
-                } else {
-                    QuietOutcome::Timer
-                });
-            }
-            return true;
-        }
+        let analysis = self.analysis.clone();
+        let cache = self.shared_diagnostic_data_cache.clone();
 
-        enum QuietWait {
-            Shutdown,
-            Edit,
-            Timer,
-        }
-        let wait_outcome = tokio::select! {
-            biased;
-            _ = self.shutdown.cancelled() => QuietWait::Shutdown,
-            _ = self.notify.notified() => QuietWait::Edit,
-            _ = tokio::time::sleep(extra.min(deferral_left)) => QuietWait::Timer,
-        };
-        let run_now = match wait_outcome {
-            QuietWait::Edit => false,
-            QuietWait::Shutdown => true,
-            QuietWait::Timer => {
-                // A notify landing before the select registered would be lost, so the
-                // timer expiring is not on its own proof that nothing arrived.
-                self.pending_files.lock().await.is_empty()
-            }
-        };
-        if let (Some(timing), Some(start)) = (timing, start) {
-            timing.wait = start.elapsed();
-            timing.outcome = Some(match wait_outcome {
-                QuietWait::Edit => QuietOutcome::Edit,
-                QuietWait::Shutdown => QuietOutcome::Timer,
-                QuietWait::Timer => {
-                    if run_now {
-                        if capped_by_deferral {
-                            QuietOutcome::MaxDeferral
-                        } else {
-                            QuietOutcome::Timer
-                        }
-                    } else {
-                        // Timer fired but an edit landed just before the check.
-                        QuietOutcome::Edit
+        tokio::select! {
+            _ = self.shutdown.cancelled() => None,
+            result = tokio::task::spawn_blocking(move || {
+                let wait_start = profile.then(Instant::now);
+                let mut guard = analysis.blocking_write();
+                let wait = wait_start.map(|start| start.elapsed()).unwrap_or_default();
+                let hold_start = profile.then(Instant::now);
+                let affected = guard.reindex_files(file_ids);
+                // Under the write lock, so no reader sees the new index next
+                // to stale shared diagnostic data.
+                cache.invalidate();
+                let hold = hold_start.map(|start| start.elapsed()).unwrap_or_default();
+                (affected, wait, hold)
+            }) => match result {
+                Ok((affected, wait, hold)) => {
+                    if let Some(timing) = timing {
+                        timing.wait = wait;
+                        timing.hold = hold;
                     }
+                    Some(affected)
                 }
-            });
+                Err(err) => {
+                    log::error!("reindex task failed: {}", err);
+                    None
+                }
+            }
         }
-        run_now
     }
 
-    /// Background loop: waits for events, debounces, then runs reindex.
+    /// Re-diagnoses the files an edit affected besides the edited documents,
+    /// whose diagnostics the client pulls itself, and refreshes the client's
+    /// derived views when the edit reached other files.
+    async fn refresh_affected(
+        &self,
+        edited: &[FileId],
+        affected: Vec<FileId>,
+        idle_workspace_diagnostic_token: &mut Option<CancellationToken>,
+    ) {
+        let others = affected
+            .iter()
+            .copied()
+            .filter(|file_id| !edited.contains(file_id))
+            .collect::<Vec<_>>();
+        if others.is_empty() {
+            return;
+        }
+        if self.lsp_features.supports_semantic_tokens_refresh() {
+            self.client.refresh_semantic_tokens();
+        }
+        if self.lsp_features.supports_inlay_hint_refresh() {
+            self.client.refresh_inlay_hints();
+        }
+        let interval = self
+            .analysis
+            .read()
+            .await
+            .get_emmyrc()
+            .diagnostics
+            .diagnostic_interval
+            .unwrap_or(500);
+        self.file_diagnostic
+            .note_scoped_sweep_files(affected.iter().copied())
+            .await;
+        self.file_diagnostic
+            .add_files_diagnostic_task(others, interval, None)
+            .await;
+        self.arm_idle_workspace_diagnostic(idle_workspace_diagnostic_token);
+    }
+
+    /// Background loop: waits for edits, debounces, then re-analyses them.
     /// Spawn this once at server startup.
     pub async fn run(&self) {
         let mut idle_workspace_diagnostic_token: Option<CancellationToken> = None;
-        // The ripple owed by the self-indexes run so far in this typing burst,
-        // and the union of the dirty sets each of them reported.
-        let mut owed_files: HashSet<FileId> = HashSet::new();
-        let mut owed_ripple: Option<DirtySet> = None;
-        // Textual refresh names owed a diagnostic-only refresh, split by
-        // channel. Export-diff names are callee-anchored and pass through
-        // untouched; rename-channel names are anchored in the edited files'
-        // own decls and are validated against the burst baseline before they
-        // fan out, so transient keystroke decls (`p` -> `pr` -> ...) that no
-        // longer exist at burst end emit nothing. Both steer no reindex: they
-        // are drained whenever no ripple is owed.
-        let mut owed_export_names: HashSet<SmolStr> = HashSet::default();
-        let mut owed_rename_names: HashSet<SmolStr> = HashSet::default();
-        // Export names the settled ripple itself reported (a rippled file's
-        // moved inference, e.g. a middleman's `Binferred`). The ripple runs
-        // once at quiet against the settled-final state, so these are already
-        // boundary-clean and pass through untouched — unlike the edited
-        // files' per-settle union above, which the burst boundary recomputes.
-        let mut owed_ripple_export_names: HashSet<SmolStr> = HashSet::default();
-        // Files the edit path already settled (edited batch, ripple-settled),
-        // excluded from the textual refresh resolution.
-        let mut refresh_exclude: HashSet<FileId> = HashSet::default();
-        // Burst-start non-local declaration names per edited file, snapshotted
-        // under the read lock before the burst's first self-index settles.
-        // The rename-channel validation diffs this against the settled-final
-        // index: a name survives iff its presence differs between the two.
-        let mut burst_start_names: HashMap<FileId, HashSet<SmolStr>> = HashMap::new();
-        // Burst-start export maps per edited file: the export channel
-        // recomputes its diff against the settled-final state at burst end,
-        // so a burst that ends where it started emits nothing while a durable
-        // change still emits the keys it moved.
-        let mut burst_start_exports: HashMap<FileId, glua_code_analysis::ExportMap> =
-            HashMap::new();
-        let mut burst_started_at: Option<Instant> = None;
         loop {
             // Register before testing the condition: `notify_waiters()` stores
             // no permit, so a signal landing in between would be lost.
@@ -1009,11 +655,7 @@ impl DebouncedAnalysis {
             notified.as_mut().enable();
 
             let needs_work = !self.pending_files.lock().await.is_empty()
-                || self.has_pending_changes.load(Ordering::Acquire)
-                || !owed_files.is_empty()
-                || !owed_export_names.is_empty()
-                || !owed_rename_names.is_empty()
-                || !owed_ripple_export_names.is_empty();
+                || self.has_pending_changes.load(Ordering::Acquire);
             if !needs_work {
                 tokio::select! {
                     _ = notified => {}
@@ -1022,8 +664,8 @@ impl DebouncedAnalysis {
             }
 
             // Debounce: keep resetting the timer while new events arrive.
-            let profile_cycle = crate::util::ls_profile::ls_profile_enabled();
-            let cycle_id = profile_cycle.then(crate::util::ls_profile::next_reindex_cycle);
+            let cycle_id = crate::util::ls_profile::ls_profile_enabled()
+                .then(crate::util::ls_profile::next_reindex_cycle);
             let debounce_start = crate::util::ls_profile::profile_instant();
             loop {
                 tokio::select! {
@@ -1036,20 +678,13 @@ impl DebouncedAnalysis {
             let debounce_elapsed = debounce_start
                 .map(|start| start.elapsed())
                 .unwrap_or_default();
-            let mut self_timings = crate::util::ls_profile::SelfWriteTimings::default();
-            let mut handoff_timing = crate::util::ls_profile::HandoffTiming::default();
-            let mut quiet_timing = crate::util::ls_profile::QuietTiming::default();
-            let mut ripple_timings = crate::util::ls_profile::RippleWriteTimings::default();
 
-            // Timer expired — drain pending files and reindex
             let file_ids: Vec<FileId> = {
                 let mut pending = self.pending_files.lock().await;
                 let mut reindexing = self.reindexing_files.lock().await;
                 let mut ids: Vec<FileId> = pending.drain().collect();
                 ids.sort();
-                for id in &ids {
-                    reindexing.insert(*id);
-                }
+                reindexing.extend(ids.iter().copied());
                 ids
             };
 
@@ -1059,330 +694,48 @@ impl DebouncedAnalysis {
                     file_ids.len(),
                     self.debounce_duration.as_millis()
                 );
-
-                // Anchor the burst baseline before the first self-index
-                // settles: later keystrokes join the same baseline, so the
-                // validation compares burst-start to burst-end.
-                self.snapshot_burst_start(
-                    &file_ids,
-                    &mut burst_start_names,
-                    &mut burst_start_exports,
-                )
-                .await;
-                // Re-index the edited files themselves first and release the
-                // write lock, so a completion or hover positioned inside one of
-                // them can be answered against entries that match its text
-                // instead of waiting out the whole dependency ripple. The
-                // ripple is by far the larger half — measured on a gamemode
-                // workspace, 106ms against 5.1s.
-                let self_timing = profile_cycle.then_some(&mut self_timings);
-                let Some(mut dirty) = self
-                    .self_index_without_queuing(file_ids.clone(), self_timing)
-                    .await
-                else {
-                    if self.shutdown.is_cancelled() {
-                        return;
-                    }
-                    // Release the batch, or every request aimed at these
-                    // documents parks until some later edit happens to cover
-                    // them.
+                let mut timings = crate::util::ls_profile::WriteTimings::default();
+                let affected = self
+                    .reindex_without_queuing(file_ids.clone(), cycle_id.map(|_| &mut timings))
+                    .await;
+                {
                     let mut reindexing = self.reindexing_files.lock().await;
                     let mut blocked = self.blocked_documents.lock().await;
                     for id in &file_ids {
                         reindexing.remove(id);
                         blocked.remove(id);
                     }
-                    drop(blocked);
-                    drop(reindexing);
-                    self.refresh_dirty_state().await;
-                    self.reindex_notify.notify_waiters();
-                    if let Some(cycle) = cycle_id {
-                        use crate::util::ls_profile::{HandoffOutcome, QuietOutcome};
-                        crate::util::ls_profile::emit_ls_reindex(
-                            cycle,
-                            debounce_elapsed,
-                            self_timings.wait,
-                            self_timings.hold,
-                            std::time::Duration::ZERO,
-                            HandoffOutcome::Idle,
-                            std::time::Duration::ZERO,
-                            QuietOutcome::Timer,
-                            std::time::Duration::ZERO,
-                            std::time::Duration::ZERO,
-                        );
-                    }
-                    continue;
-                };
-
-                {
-                    let mut blocked = self.blocked_documents.lock().await;
-                    for file_id in &file_ids {
-                        blocked.remove(file_id);
-                    }
                 }
-                self.reindex_notify.notify_waiters();
-
-                // The requests just released still have to be polled before
-                // they can queue their read. Taking the write lock back now
-                // would put them behind the whole ripple.
-                let handoff_opt = profile_cycle.then_some(&mut handoff_timing);
-                self.await_reader_handoff(handoff_opt).await;
-                // Refresh names ride along whichever path the dirty set takes:
-                // they are taken before the emptiness check, which ignores
-                // them by design. Export-channel names pass through; the
-                // rename channel accumulates for burst-boundary validation and
-                // drains only when no ripple is owed.
-                owed_export_names.extend(dirty.take_export_refresh_names());
-                owed_rename_names.extend(dirty.take_decl_rename_refresh_names());
-                refresh_exclude.extend(file_ids.iter().copied());
-                if !owed_export_names.is_empty() || !owed_rename_names.is_empty() {
-                    burst_started_at.get_or_insert_with(Instant::now);
+                if let Some(cycle) = cycle_id {
+                    crate::util::ls_profile::emit_ls_reindex(
+                        cycle,
+                        debounce_elapsed,
+                        timings.wait,
+                        timings.hold,
+                    );
                 }
-
-                if dirty.is_empty() {
-                    // Nothing else reads a fact this edit moved - the
-                    // self-index already makes these files answerable. Clear
-                    // them from reindexing immediately so dirty state can
-                    // settle without waiting for a ripple that will never come.
-                    {
-                        let mut reindexing = self.reindexing_files.lock().await;
-                        for id in &file_ids {
-                            reindexing.remove(id);
-                        }
-                    }
-                    self.refresh_dirty_state().await;
-                    // Refresh names still owed: fall through so the gate below
-                    // drains them without a ripple.
-                    if owed_ripple.is_none()
-                        && owed_export_names.is_empty()
-                        && owed_rename_names.is_empty()
-                        && owed_ripple_export_names.is_empty()
-                    {
-                        if let Some(cycle) = cycle_id {
-                            use crate::util::ls_profile::{HandoffOutcome, QuietOutcome};
-                            crate::util::ls_profile::emit_ls_reindex(
-                                cycle,
-                                debounce_elapsed,
-                                self_timings.wait,
-                                self_timings.hold,
-                                handoff_timing.wait,
-                                handoff_timing.outcome.unwrap_or(HandoffOutcome::Idle),
-                                std::time::Duration::ZERO,
-                                QuietOutcome::Timer,
-                                std::time::Duration::ZERO,
-                                std::time::Duration::ZERO,
-                            );
-                        }
-                        continue;
-                    }
-                } else {
-                    owed_files.extend(file_ids.iter().copied());
-                    match &mut owed_ripple {
-                        Some(owed) => owed.extend(dirty),
-                        none => *none = Some(dirty),
-                    }
-                    burst_started_at.get_or_insert_with(Instant::now);
-                }
-            }
-
-            let Some(owed) = owed_ripple.take() else {
-                // The settled ripple's own exports are already boundary-clean
-                // (the ripple ran once at quiet), so they drain on the next
-                // debounce tick without waiting for another full quiet window.
-                // Edited-file names still wait below for the burst boundary.
-                if !owed_ripple_export_names.is_empty()
-                    && owed_export_names.is_empty()
-                    && owed_rename_names.is_empty()
-                {
-                    let passthrough = std::mem::take(&mut owed_ripple_export_names);
-                    let exclude = std::mem::take(&mut refresh_exclude);
-                    let scheduled = self.schedule_textual_refresh(passthrough, &exclude).await;
-                    self.refresh_dirty_state().await;
-                    self.reindex_notify.notify_waiters();
-                    if scheduled {
-                        self.file_diagnostic
-                            .note_scoped_sweep_files(exclude.iter().copied())
-                            .await;
-                        self.arm_idle_workspace_diagnostic(&mut idle_workspace_diagnostic_token);
-                    }
-                    continue;
-                }
-                if owed_export_names.is_empty()
-                    && owed_rename_names.is_empty()
-                    && owed_ripple_export_names.is_empty()
-                {
-                    self.refresh_dirty_state().await;
-                    self.reindex_notify.notify_waiters();
-                    continue;
-                }
-                // No ripple is owed, but textual refresh names are: hold them
-                // until typing has genuinely stopped, then validate the rename
-                // channel against the burst baseline (export names pass
-                // through), resolve them, schedule diagnostics, and settle the
-                // burst. Draining per settle would validate each keystroke
-                // against its own micro-baseline, where the transient decl
-                // still exists, and keep every transient name.
-                let burst_started_at_instant = burst_started_at.unwrap_or_else(Instant::now);
-                let names_quiet_opt = profile_cycle.then_some(&mut quiet_timing);
-                if !self
-                    .ripple_quiet_elapsed(burst_started_at_instant, names_quiet_opt)
-                    .await
-                {
-                    if let Some(cycle) = cycle_id {
-                        use crate::util::ls_profile::{HandoffOutcome, QuietOutcome};
-                        crate::util::ls_profile::emit_ls_reindex(
-                            cycle,
-                            debounce_elapsed,
-                            self_timings.wait,
-                            self_timings.hold,
-                            handoff_timing.wait,
-                            handoff_timing.outcome.unwrap_or(HandoffOutcome::Idle),
-                            quiet_timing.wait,
-                            quiet_timing.outcome.unwrap_or(QuietOutcome::Edit),
-                            std::time::Duration::ZERO,
-                            std::time::Duration::ZERO,
-                        );
-                    }
-                    continue;
-                }
-                burst_started_at = None;
-                let fallback_export_names = std::mem::take(&mut owed_export_names);
-                let rename_names = std::mem::take(&mut owed_rename_names);
-                let exclude = std::mem::take(&mut refresh_exclude);
-                let burst_start = std::mem::take(&mut burst_start_names);
-                let burst_exports = std::mem::take(&mut burst_start_exports);
-                let names = self
-                    .validate_and_merge_refresh_names(
-                        fallback_export_names,
-                        rename_names,
-                        &burst_start,
-                        burst_exports,
-                    )
-                    .await;
-                let scheduled = self.schedule_textual_refresh(names, &exclude).await;
-                self.refresh_dirty_state().await;
-                self.reindex_notify.notify_waiters();
-                if scheduled {
-                    self.file_diagnostic
-                        .note_scoped_sweep_files(exclude.iter().copied())
+                match affected {
+                    Some(affected) => {
+                        self.refresh_affected(
+                            &file_ids,
+                            affected,
+                            &mut idle_workspace_diagnostic_token,
+                        )
                         .await;
-                    self.arm_idle_workspace_diagnostic(&mut idle_workspace_diagnostic_token);
-                }
-                continue;
-            };
-
-            // Hold the ripple until typing has genuinely stopped. Another edit
-            // sends us back for its own self-index, and the ripple it owes
-            // joins this one.
-            let burst_started_at_instant = burst_started_at.unwrap_or_else(Instant::now);
-            let quiet_opt = profile_cycle.then_some(&mut quiet_timing);
-            if !self
-                .ripple_quiet_elapsed(burst_started_at_instant, quiet_opt)
-                .await
-            {
-                owed_ripple = Some(owed);
-                if let Some(cycle) = cycle_id {
-                    use crate::util::ls_profile::{HandoffOutcome, QuietOutcome};
-                    crate::util::ls_profile::emit_ls_reindex(
-                        cycle,
-                        debounce_elapsed,
-                        self_timings.wait,
-                        self_timings.hold,
-                        handoff_timing.wait,
-                        handoff_timing.outcome.unwrap_or(HandoffOutcome::Idle),
-                        quiet_timing.wait,
-                        quiet_timing.outcome.unwrap_or(QuietOutcome::Edit),
-                        std::time::Duration::ZERO,
-                        std::time::Duration::ZERO,
-                    );
-                }
-                continue;
-            }
-
-            {
-                let ripple_files: Vec<FileId> = {
-                    let mut ids: Vec<FileId> = owed_files.iter().copied().collect();
-                    ids.sort();
-                    ids
-                };
-                log::info!(
-                    "ripple: {} edited file(s) over {} dirty file(s) after {}ms quiet",
-                    ripple_files.len(),
-                    owed.dirty_len(),
-                    RIPPLE_QUIET.as_millis()
-                );
-
-                let ripple_opt = profile_cycle.then_some(&mut ripple_timings);
-                let (reindex_completed, ripple_export_names, ripple_rename_names, rippled) =
-                    self.ripple_without_queuing(owed, ripple_opt).await;
-                // The ripple's own sideband is already boundary-clean: the
-                // ripple settled once against the quiet state, so its export
-                // names join the passthrough set (validated bursts rejoin it
-                // at their drain). They drain after this block without waiting
-                // for another full quiet window.
-                owed_ripple_export_names.extend(ripple_export_names);
-                owed_rename_names.extend(ripple_rename_names);
-                refresh_exclude.extend(rippled.iter().copied());
-
-                {
-                    let mut reindexing = self.reindexing_files.lock().await;
-                    for id in &ripple_files {
-                        reindexing.remove(id);
                     }
-                }
-                owed_files.clear();
-                burst_started_at = None;
-
-                self.reindex_notify.notify_waiters();
-                if let Some(cycle) = cycle_id {
-                    use crate::util::ls_profile::{HandoffOutcome, QuietOutcome};
-                    crate::util::ls_profile::emit_ls_reindex(
-                        cycle,
-                        debounce_elapsed,
-                        self_timings.wait,
-                        self_timings.hold,
-                        handoff_timing.wait,
-                        handoff_timing.outcome.unwrap_or(HandoffOutcome::Idle),
-                        quiet_timing.wait,
-                        quiet_timing.outcome.unwrap_or(QuietOutcome::Timer),
-                        ripple_timings.wait,
-                        ripple_timings.hold,
-                    );
-                }
-                if !reindex_completed {
-                    // Only shutdown stops the loop; a panicked reindex must
-                    // fall through so `refresh_dirty_state()` releases waiters.
-                    if self.shutdown.is_cancelled() {
-                        return;
-                    }
-                    log::error!(
+                    // Only shutdown stops the loop; a failed reindex falls
+                    // through so freshness waiters are released.
+                    None if self.shutdown.is_cancelled() => return,
+                    None => log::error!(
                         "LS_REINDEX_FAILED reindex of {} file(s) did not complete; continuing so freshness waiters are released",
-                        ripple_files.len()
-                    );
+                        file_ids.len()
+                    ),
                 }
-
-                if self.lsp_features.supports_semantic_tokens_refresh() {
-                    self.client.refresh_semantic_tokens();
-                }
-                if self.lsp_features.supports_inlay_hint_refresh() {
-                    self.client.refresh_inlay_hints();
-                }
-
-                // Arm an idle workspace diagnostic refresh so closed files hit
-                // by cross-file changes get re-diagnosed once typing pauses.
-                // The sweep is scoped to the files this burst touched —
-                // refresh_exclude has accumulated every edited and rippled id.
-                self.file_diagnostic
-                    .note_scoped_sweep_files(refresh_exclude.iter().copied())
-                    .await;
-                self.arm_idle_workspace_diagnostic(&mut idle_workspace_diagnostic_token);
             }
 
             self.refresh_dirty_state().await;
-
-            // Always notify waiters so they can re-check the condition.
-            // Even if we didn't reindex (pending was empty), clearing the
-            // dirty flag means waiters should proceed with available data.
+            // Waiters re-check their condition even when nothing was pending:
+            // clearing the dirty flag lets them proceed.
             self.reindex_notify.notify_waiters();
         }
     }
@@ -1410,21 +763,6 @@ impl DebouncedAnalysis {
         // sets the flag itself, and `finish_in_flight_changes` calls back here.
         if self.in_flight_changes.load(Ordering::Acquire) > 0 {
             self.has_pending_changes.store(true, Ordering::Release);
-        }
-    }
-}
-
-/// Keeps the ripple off the write lock while one request takes its read lock.
-///
-/// See [`DebouncedAnalysis::begin_reader_handoff`].
-pub struct ReaderHandoff {
-    analysis: Arc<DebouncedAnalysis>,
-}
-
-impl Drop for ReaderHandoff {
-    fn drop(&mut self) {
-        if self.analysis.pending_readers.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.analysis.readers_idle_notify.notify_waiters();
         }
     }
 }
@@ -1478,7 +816,7 @@ mod tests {
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::time::{Duration, Instant};
 
-    use super::{Freshness, MAX_RIPPLE_DEFERRAL, READER_HANDOFF_GRACE};
+    use super::Freshness;
 
     use glua_code_analysis::{DiagnosticCode, EmmyLuaAnalysis, FileId, file_path_to_uri};
     use googletest::prelude::*;
@@ -1681,111 +1019,6 @@ mod tests {
         })
     }
 
-    /// Typing must send the ripple back rather than let it start: while it
-    /// runs, no keystroke can even be applied.
-    #[gtest]
-    fn a_new_edit_sends_the_ripple_back() -> Result<()> {
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
-        runtime.block_on(async {
-            let debounced_analysis = test_debounced_analysis();
-            let uri = Uri::from_str("file:///workspace/edited.lua").expect("uri should parse");
-
-            let scheduler = debounced_analysis.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                scheduler.schedule(FileId { id: 1 }, uri).await;
-            });
-
-            let run_the_ripple = tokio::time::timeout(
-                Duration::from_millis(500),
-                debounced_analysis.ripple_quiet_elapsed(Instant::now(), None),
-            )
-            .await
-            .expect("an edit should send the ripple back well inside the quiet window");
-
-            verify_that!(run_the_ripple, eq(false))?;
-            Ok(())
-        })
-    }
-
-    /// Sustained typing must not hold diagnostics off indefinitely.
-    #[gtest]
-    fn a_long_burst_cannot_hold_the_ripple_off_forever() -> Result<()> {
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
-        runtime.block_on(async {
-            let debounced_analysis = test_debounced_analysis();
-            let uri = Uri::from_str("file:///workspace/edited.lua").expect("uri should parse");
-            debounced_analysis.schedule(FileId { id: 1 }, uri).await;
-
-            let started_at = Instant::now()
-                .checked_sub(MAX_RIPPLE_DEFERRAL)
-                .expect("the deferral cap should fit before now");
-
-            let run_the_ripple = tokio::time::timeout(
-                Duration::from_millis(100),
-                debounced_analysis.ripple_quiet_elapsed(started_at, None),
-            )
-            .await
-            .expect("the cap should release the ripple immediately");
-
-            verify_that!(run_the_ripple, eq(true))?;
-            Ok(())
-        })
-    }
-
-    /// The ripple must yield to a request the self-index just released, or the
-    /// request queues behind the write lock and waits out the ripple anyway.
-    #[gtest]
-    fn the_ripple_waits_for_an_outstanding_reader() -> Result<()> {
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
-        runtime.block_on(async {
-            let debounced_analysis = test_debounced_analysis();
-
-            // Nothing outstanding: the ripple must not pay the grace.
-            tokio::time::timeout(
-                Duration::from_millis(50),
-                debounced_analysis.await_reader_handoff(None),
-            )
-            .await
-            .expect("no readers should let the ripple straight through");
-
-            let handoff = debounced_analysis.begin_reader_handoff();
-            let held = tokio::time::timeout(
-                Duration::from_millis(50),
-                debounced_analysis.await_reader_handoff(None),
-            )
-            .await;
-            verify_that!(held.is_err(), eq(true))?;
-
-            drop(handoff);
-            tokio::time::timeout(
-                Duration::from_millis(250),
-                debounced_analysis.await_reader_handoff(None),
-            )
-            .await
-            .expect("dropping the last handoff should release the ripple");
-
-            Ok(())
-        })
-    }
-
-    /// A stream of requests must not starve the ripple.
-    #[gtest]
-    fn an_outstanding_reader_only_delays_the_ripple_by_the_grace() -> Result<()> {
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
-        runtime.block_on(async {
-            let debounced_analysis = test_debounced_analysis();
-            let _never_dropped = debounced_analysis.begin_reader_handoff();
-
-            let started_at = Instant::now();
-            debounced_analysis.await_reader_handoff(None).await;
-
-            verify_that!(started_at.elapsed() >= READER_HANDOFF_GRACE, eq(true))?;
-            verify_that!(started_at.elapsed() < READER_HANDOFF_GRACE * 4, eq(true))?;
-            Ok(())
-        })
-    }
-
     /// The point of the per-file gate: an edit to one document must not park
     /// requests aimed at a different one, and must park requests aimed at
     /// itself until its own entries have been rebuilt.
@@ -1917,13 +1150,10 @@ mod tests {
                 Arc::new(AtomicU8::new(0)),
                 test_lsp_features(),
             );
-            let dirty = debounced_analysis
-                .self_index_without_queuing(vec![api_file_id], None)
-                .await
-                .expect("self-index should complete");
-            let (completed, _export_names, _rename_names, _rippled) =
-                debounced_analysis.ripple_without_queuing(dirty, None).await;
-            verify_that!(completed, eq(true))?;
+            let affected = debounced_analysis
+                .reindex_without_queuing(vec![api_file_id], None)
+                .await;
+            verify_that!(affected.is_some(), eq(true))?;
 
             let updated_diagnostics = file_diagnostic
                 .pull_file_diagnostics(user_uri, CancellationToken::new())
@@ -1987,11 +1217,9 @@ mod tests {
             .file_reference_revision(file_id)
     }
 
-    /// A rename that dirties nothing must still reach its readers on the
-    /// editor path: the debounced loop drains the self-index's textual refresh
-    /// names, schedules diagnostic-only tasks for their referencers, and
-    /// leaves those referencers un-reindexed (mirrors
-    /// `global_function_rename_refreshes_old_and_new_referencers`).
+    /// A rename must reach its readers on the editor path: the consumer's
+    /// diagnostics read the renamed global, so the debounced loop re-diagnoses
+    /// it, without rebuilding the consumer's own source layer.
     #[gtest]
     fn a_rename_edit_refreshes_its_referencers_without_reindexing() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
@@ -2020,6 +1248,8 @@ mod tests {
                 .get_file_id(&consumer_uri)
                 .expect("consumer file id");
 
+            analysis.diagnose_file(consumer_id, CancellationToken::new());
+
             let analysis = Arc::new(RwLock::new(analysis));
             let (debounced_analysis, peer) = loop_test_debounced_analysis(analysis.clone());
             let revision_before = reference_revision(&analysis, consumer_id).await;
@@ -2041,7 +1271,7 @@ mod tests {
                 .await;
 
             // Nothing else publishes for the consumer in this test, so its
-            // first publish can only come from the names-only refresh task.
+            // first publish can only come from the loop's affected-file refresh.
             let published = tokio::time::timeout(Duration::from_secs(10), async {
                 tokio::task::spawn_blocking(move || {
                     loop {
@@ -2057,7 +1287,7 @@ mod tests {
                 .expect("the publish reader task must not panic")
             })
             .await
-            .expect("the consumer should be re-published by the textual refresh");
+            .expect("the consumer should be re-published after the rename");
             let undefined_global = DiagnosticCode::UndefinedGlobal.get_name().to_string();
             verify_that!(
                 published
@@ -2074,20 +1304,18 @@ mod tests {
                 .expect("the loop should stop on shutdown")
                 .expect("the loop task must not panic");
 
-            // The rename dirties nothing: the referencer must not have been
-            // reindexed on the way to its refresh.
+            // The rename leaves the consumer's text alone: its source layer
+            // must not have been rebuilt on the way to its refresh.
             let revision_after = reference_revision(&analysis, consumer_id).await;
             verify_that!(revision_after, eq(revision_before))?;
             Ok(())
         })
     }
 
-    /// Names carried by a ripple's own export diffs must survive the ripple
-    /// path: a file that only names a rippled inference comes back
-    /// diagnostic-only, un-reindexed (mirrors
-    /// `ripple_moved_inference_refreshes_its_lazy_reader`).
+    /// A change that moves an inference two files away reaches the file that
+    /// only reads the inferred value, without rebuilding its source layer.
     #[gtest]
-    fn a_ripple_and_its_sideband_names_both_reach_their_readers() -> Result<()> {
+    fn a_moved_inference_reaches_its_transitive_reader() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let mut analysis = EmmyLuaAnalysis::new();
@@ -2116,6 +1344,8 @@ mod tests {
                 .get_file_id(&consumer_uri)
                 .expect("consumer file id");
 
+            analysis.diagnose_file(consumer_id, CancellationToken::new());
+
             let analysis = Arc::new(RwLock::new(analysis));
             let (debounced_analysis, peer) = loop_test_debounced_analysis(analysis.clone());
             let revision_before = reference_revision(&analysis, consumer_id).await;
@@ -2138,9 +1368,8 @@ mod tests {
                 .schedule(provider_id, provider_uri.clone())
                 .await;
 
-            // The consumer only names `Binferred`, an export of the rippled
-            // middleman: its publish can only come from the sideband names the
-            // ripple reported, drained after the ripple ran.
+            // The consumer only names `Binferred`, inferred in the middleman:
+            // its publish can only come from its recorded read of it.
             tokio::time::timeout(Duration::from_secs(15), async {
                 tokio::task::spawn_blocking(move || {
                     loop {
@@ -2156,7 +1385,7 @@ mod tests {
                 .expect("the publish reader task must not panic")
             })
             .await
-            .expect("the consumer should be re-published by the ripple sideband");
+            .expect("the consumer should be re-published after the inference moved");
 
             debounced_analysis.shutdown.cancel();
             tokio::time::timeout(Duration::from_secs(5), loop_task)
