@@ -1,4 +1,6 @@
+use crate::db_index::derivation::hash_local;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
 
 use glua_parser::LuaSyntaxId;
@@ -59,7 +61,7 @@ pub enum GmodTimerKind {
     Simple,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmodHookSiteMetadata {
     pub syntax_id: LuaSyntaxId,
     pub kind: GmodHookKind,
@@ -70,20 +72,65 @@ pub struct GmodHookSiteMetadata {
     pub callback_params: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl Hash for GmodHookSiteMetadata {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            syntax_id,
+            kind,
+            hook_name,
+            name_range,
+            name_issue,
+            callback_arg_idx,
+            callback_params,
+        } = self;
+        hash_local(syntax_id, state);
+        kind.hash(state);
+        hook_name.hash(state);
+        hash_local(name_range, state);
+        name_issue.hash(state);
+        callback_arg_idx.hash(state);
+        callback_params.hash(state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmodNamedSiteMetadata {
     pub syntax_id: LuaSyntaxId,
     pub name: Option<String>,
     pub name_range: Option<TextRange>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+impl Hash for GmodNamedSiteMetadata {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            syntax_id,
+            name,
+            name_range,
+        } = self;
+        hash_local(syntax_id, state);
+        name.hash(state);
+        hash_local(name_range, state);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GmodCallbackSiteMetadata {
     pub syntax_id: Option<LuaSyntaxId>,
     pub callback_range: Option<TextRange>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl Hash for GmodCallbackSiteMetadata {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            syntax_id,
+            callback_range,
+        } = self;
+        hash_local(syntax_id, state);
+        hash_local(callback_range, state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmodNetReceiveSiteMetadata {
     pub syntax_id: LuaSyntaxId,
     pub message_name: Option<String>,
@@ -91,7 +138,22 @@ pub struct GmodNetReceiveSiteMetadata {
     pub callback: GmodCallbackSiteMetadata,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl Hash for GmodNetReceiveSiteMetadata {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            syntax_id,
+            message_name,
+            name_range,
+            callback,
+        } = self;
+        hash_local(syntax_id, state);
+        message_name.hash(state);
+        hash_local(name_range, state);
+        callback.hash(state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmodConcommandSiteMetadata {
     pub syntax_id: LuaSyntaxId,
     pub command_name: Option<String>,
@@ -99,7 +161,22 @@ pub struct GmodConcommandSiteMetadata {
     pub callback: GmodCallbackSiteMetadata,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl Hash for GmodConcommandSiteMetadata {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            syntax_id,
+            command_name,
+            name_range,
+            callback,
+        } = self;
+        hash_local(syntax_id, state);
+        command_name.hash(state);
+        hash_local(name_range, state);
+        callback.hash(state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmodConVarSiteMetadata {
     pub syntax_id: LuaSyntaxId,
     pub kind: GmodConVarKind,
@@ -107,13 +184,45 @@ pub struct GmodConVarSiteMetadata {
     pub name_range: Option<TextRange>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl Hash for GmodConVarSiteMetadata {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            syntax_id,
+            kind,
+            convar_name,
+            name_range,
+        } = self;
+        hash_local(syntax_id, state);
+        kind.hash(state);
+        convar_name.hash(state);
+        hash_local(name_range, state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmodTimerSiteMetadata {
     pub syntax_id: LuaSyntaxId,
     pub kind: GmodTimerKind,
     pub timer_name: Option<String>,
     pub name_range: Option<TextRange>,
     pub callback: GmodCallbackSiteMetadata,
+}
+
+impl Hash for GmodTimerSiteMetadata {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            syntax_id,
+            kind,
+            timer_name,
+            name_range,
+            callback,
+        } = self;
+        hash_local(syntax_id, state);
+        kind.hash(state);
+        timer_name.hash(state);
+        hash_local(name_range, state);
+        callback.hash(state);
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -223,10 +332,18 @@ impl GmodSystemAggregate {
 }
 
 /// A range within a file that has a narrowed realm (from `if CLIENT then` etc).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmodRealmRange {
     pub range: TextRange,
     pub realm: GmodRealm,
+}
+
+impl Hash for GmodRealmRange {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self { range, realm } = self;
+        hash_local(range, state);
+        realm.hash(state);
+    }
 }
 
 /// A file's own realm evidence, before the workspace load graph combines it.

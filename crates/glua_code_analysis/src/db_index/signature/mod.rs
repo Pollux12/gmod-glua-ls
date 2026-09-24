@@ -2,6 +2,7 @@ mod async_state;
 mod gmod_domains;
 #[allow(clippy::module_inception)]
 mod signature;
+mod signature_cast;
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smol_str::SmolStr;
@@ -34,6 +35,7 @@ pub use signature::{
     SignaturePayloadRemap, SignatureReturnStatus, find_call_arg_role_from_type,
     visit_call_arg_roles_from_type,
 };
+pub use signature_cast::{LuaCastAction, LuaCastOp, LuaCastTarget, LuaSignatureCast};
 
 use crate::db_index::derivation::{self, FactKey, Fingerprint};
 use crate::{FileId, GmodStateMask, LuaType, db_index::LuaDeclId};
@@ -56,6 +58,8 @@ pub struct LuaSignatureIndex {
     /// a metadata-bearing annotation), so removal drops these entries
     /// explicitly instead of filtering the effective map by signature file.
     valid_guard_file_contributions: HashMap<FileId, Vec<(LuaSignatureId, GmodStateMask)>>,
+    /// The set of files in `valid_guard_file_contributions`.
+    valid_guard_files: derivation::SetFingerprint,
     /// The global-declaration part of the same derivation. `None` until the
     /// first rebuild; always recomputed together with any dirty file part.
 
@@ -156,6 +160,7 @@ impl LuaSignatureIndex {
             local_func_decls: HashMap::default(),
             effective_valid_guard_signatures: HashMap::default(),
             valid_guard_file_contributions: HashMap::default(),
+            valid_guard_files: derivation::SetFingerprint::default(),
 
             inferred_positive_guards: HashMap::default(),
             inferred_guard_owners: HashMap::default(),
@@ -294,6 +299,7 @@ impl LuaSignatureIndex {
             .insert(file_id, contributions)
             .is_none()
         {
+            self.valid_guard_files.insert(&file_id);
             derivation::note_write(|| FactKey::ValidGuardFiles);
         }
     }
@@ -305,6 +311,7 @@ impl LuaSignatureIndex {
             .remove(&file_id)
             .is_some()
         {
+            self.valid_guard_files.remove(&file_id);
             derivation::note_write(|| FactKey::ValidGuardFile(file_id));
             derivation::note_write(|| FactKey::ValidGuardFiles);
         }
@@ -347,6 +354,7 @@ impl LuaSignatureIndex {
 
     pub(crate) fn clear_valid_guard_contributions(&mut self) {
         self.valid_guard_file_contributions.clear();
+        self.valid_guard_files = derivation::SetFingerprint::default();
     }
 
     pub fn set_inferred_positive_guard(
@@ -798,14 +806,7 @@ impl LuaSignatureIndex {
             FactKey::ValidGuardFile(file_id) => {
                 derivation::fingerprint_opt(self.valid_guard_file_contributions.get(file_id))
             }
-            FactKey::ValidGuardFiles => {
-                let mut file_ids = self
-                    .valid_guard_file_contributions
-                    .keys()
-                    .collect::<Vec<_>>();
-                file_ids.sort_unstable();
-                derivation::fingerprint_of(&file_ids)
-            }
+            FactKey::ValidGuardFiles => self.valid_guard_files.get(),
             FactKey::ValidGuard(signature_id) => {
                 derivation::fingerprint_opt(self.effective_valid_guard_signatures.get(signature_id))
             }

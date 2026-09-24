@@ -1,4 +1,6 @@
+use crate::db_index::derivation::hash_local;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::hash::{Hash, Hasher};
 
 use glua_parser::LuaSyntaxId;
 use rowan::TextSize;
@@ -63,10 +65,18 @@ impl std::hash::Hash for GmodClassCallLiteral {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Hash)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GmodClassCallArg {
     pub syntax_id: LuaSyntaxId,
     pub value: Option<GmodClassCallLiteral>,
+}
+
+impl Hash for GmodClassCallArg {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self { syntax_id, value } = self;
+        hash_local(syntax_id, state);
+        value.hash(state);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -84,14 +94,27 @@ impl GmodClassCallArgSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Hash)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GmodClassCallFieldArg {
     pub source: GmodClassCallArgSource,
     pub syntax_id: LuaSyntaxId,
     pub value: Option<GmodClassCallLiteral>,
 }
 
-#[derive(Debug, Clone, PartialEq, Hash)]
+impl Hash for GmodClassCallFieldArg {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            source,
+            syntax_id,
+            value,
+        } = self;
+        source.hash(state);
+        hash_local(syntax_id, state);
+        value.hash(state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct GmodScriptedClassCallMetadata {
     pub syntax_id: LuaSyntaxId,
     pub literal_args: Vec<Option<GmodClassCallLiteral>>,
@@ -101,6 +124,29 @@ pub struct GmodScriptedClassCallMetadata {
     pub network_var_roles: Option<GmodNetworkVarCallRoles>,
     pub vgui_panel_roles: Option<GmodVguiPanelCallRoles>,
     pub derma_skin_roles: Option<GmodDermaSkinCallRoles>,
+}
+
+impl Hash for GmodScriptedClassCallMetadata {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            syntax_id,
+            literal_args,
+            args,
+            field_args,
+            inheritance_roles,
+            network_var_roles,
+            vgui_panel_roles,
+            derma_skin_roles,
+        } = self;
+        hash_local(syntax_id, state);
+        literal_args.hash(state);
+        args.hash(state);
+        field_args.hash(state);
+        inheritance_roles.hash(state);
+        network_var_roles.hash(state);
+        vgui_panel_roles.hash(state);
+        derma_skin_roles.hash(state);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -243,13 +289,25 @@ pub struct GmodScriptedClassFileMetadata {
     pub vgui_parent_calls: Vec<GmodVguiParentCallMetadata>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GmodVguiParentSource {
     LiteralName(String),
     Expr(LuaSyntaxId),
     Receiver,
     ReceiverField(Vec<String>),
     Unknown,
+}
+
+impl Hash for GmodVguiParentSource {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::LiteralName(name) => name.hash(state),
+            Self::Expr(syntax_id) => hash_local(syntax_id, state),
+            Self::ReceiverField(fields) => fields.hash(state),
+            Self::Receiver | Self::Unknown => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -259,11 +317,24 @@ pub struct GmodVguiParentRelation {
     pub parent_chain_complete: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmodVguiParentCallMetadata {
     pub syntax_id: LuaSyntaxId,
     pub child: GmodVguiParentSource,
     pub parent: GmodVguiParentSource,
+}
+
+impl Hash for GmodVguiParentCallMetadata {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            syntax_id,
+            child,
+            parent,
+        } = self;
+        hash_local(syntax_id, state);
+        child.hash(state);
+        parent.hash(state);
+    }
 }
 
 /// How a vgui parent call names its parent, resolved to type ids.
@@ -316,6 +387,8 @@ impl GmodScriptedClassFileMetadata {
 #[derive(Debug, Default, Clone)]
 pub struct GmodClassMetadataIndex {
     file_metadata: HashMap<FileId, GmodScriptedClassFileMetadata>,
+    /// The set of files whose metadata has vgui parent calls.
+    vgui_parent_call_files: derivation::SetFingerprint,
     vgui_panels: HashMap<String, Vec<VguiPanelDefinition>>,
     derma_skins: HashMap<String, Vec<DermaSkinDefinition>>,
     vgui_panel_parent_chains: HashMap<LuaTypeDeclId, Vec<LuaTypeDeclId>>,
@@ -342,6 +415,7 @@ impl GmodClassMetadataIndex {
     pub fn new() -> Self {
         Self {
             file_metadata: HashMap::default(),
+            vgui_parent_call_files: derivation::SetFingerprint::default(),
             vgui_panels: HashMap::default(),
             derma_skins: HashMap::default(),
             vgui_panel_parent_chains: HashMap::default(),
@@ -382,6 +456,45 @@ impl GmodClassMetadataIndex {
         names
     }
 
+    fn meta_fingerprint(
+        kind: GmodScriptedClassCallKind,
+        file_id: FileId,
+        call: &GmodScriptedClassCallMetadata,
+    ) -> Fingerprint {
+        derivation::in_file(Some(file_id), || {
+            derivation::fingerprint_of(&(kind, file_id, call))
+        })
+    }
+
+    /// `name`'s meta fingerprint summed afresh from every file's calls, which
+    /// is what the incremental `meta_fingerprints` sum holds.
+    fn recomputed_meta_fingerprint(&self, name: &SmolStr) -> Fingerprint {
+        let mut sum: Fingerprint = 0;
+        for (file_id, metadata) in &self.file_metadata {
+            for (kind, calls) in [
+                (
+                    GmodScriptedClassCallKind::VguiRegister,
+                    &metadata.vgui_register_calls,
+                ),
+                (
+                    GmodScriptedClassCallKind::DermaDefineControl,
+                    &metadata.derma_define_control_calls,
+                ),
+                (
+                    GmodScriptedClassCallKind::DermaDefineSkin,
+                    &metadata.derma_define_skin_calls,
+                ),
+            ] {
+                for call in calls {
+                    if Self::meta_names(kind, call).contains(name) {
+                        sum = sum.wrapping_add(Self::meta_fingerprint(kind, *file_id, call));
+                    }
+                }
+            }
+        }
+        sum
+    }
+
     /// Adds (`add`) or removes `call`'s contribution to the name-keyed
     /// fingerprints.
     fn update_meta_fingerprints(
@@ -395,7 +508,7 @@ impl GmodClassMetadataIndex {
         if names.is_empty() {
             return;
         }
-        let fingerprint = derivation::fingerprint_of(&(kind, file_id, call));
+        let fingerprint = Self::meta_fingerprint(kind, file_id, call);
         for name in names {
             derivation::note_write(|| FactKey::GmodMeta(name.clone()));
             let previous = meta_fingerprints.get(&name).copied().unwrap_or_default();
@@ -414,6 +527,9 @@ impl GmodClassMetadataIndex {
 
     pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
         match key {
+            FactKey::GmodMeta(name) if derivation::mapping_back() => {
+                self.recomputed_meta_fingerprint(name)
+            }
             FactKey::GmodMeta(name) => self
                 .meta_fingerprints
                 .get(name)
@@ -422,9 +538,7 @@ impl GmodClassMetadataIndex {
             FactKey::GmodClassFile(file_id) => {
                 derivation::fingerprint_opt(self.file_metadata.get(file_id))
             }
-            FactKey::VguiParentCallFiles => {
-                derivation::fingerprint_of(&self.collect_vgui_parent_call_files())
-            }
+            FactKey::VguiParentCallFiles => self.vgui_parent_call_files.get(),
             FactKey::VguiChain(type_id) => {
                 let chain = self.vgui_panel_parent_chains.get(type_id);
                 let incomplete = self.incomplete_vgui_panel_parent_chains.contains(type_id);
@@ -715,6 +829,7 @@ impl GmodClassMetadataIndex {
             .or_default()
             .vgui_parent_calls;
         if calls.is_empty() {
+            self.vgui_parent_call_files.insert(&file_id);
             derivation::note_write(|| FactKey::VguiParentCallFiles);
         }
         if let Some(existing) = calls
@@ -843,10 +958,6 @@ impl GmodClassMetadataIndex {
     /// The files that have vgui parent calls, sorted.
     pub fn vgui_parent_call_files(&self) -> Vec<FileId> {
         derivation::note_read(|| FactKey::VguiParentCallFiles);
-        self.collect_vgui_parent_call_files()
-    }
-
-    fn collect_vgui_parent_call_files(&self) -> Vec<FileId> {
         let mut file_ids = self
             .file_metadata
             .iter()
@@ -942,6 +1053,7 @@ impl LuaIndex for GmodClassMetadataIndex {
             };
             derivation::note_write(|| FactKey::GmodClassFile(file_id));
             if !metadata.vgui_parent_calls.is_empty() {
+                self.vgui_parent_call_files.remove(&file_id);
                 derivation::note_write(|| FactKey::VguiParentCallFiles);
             }
             for (kind, calls) in [
@@ -989,6 +1101,7 @@ impl LuaIndex for GmodClassMetadataIndex {
         }
         self.meta_fingerprints.clear();
         self.file_metadata.clear();
+        self.vgui_parent_call_files = derivation::SetFingerprint::default();
         self.vgui_panels.clear();
         self.derma_skins.clear();
         self.vgui_panel_parent_chains.clear();

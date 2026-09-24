@@ -16,9 +16,22 @@ use rowan::{TextRange, TextSize};
 use rustc_hash::FxHashSet;
 
 pub use diagnostic_reads::DiagnosticReads;
+
+/// A value an analyzer derivation stores on the index without the index
+/// naming its type, fingerprinted on demand.
+pub trait DerivedFact: std::any::Any + Send + Sync {
+    fn fingerprint(&self) -> Fingerprint;
+}
+
+impl std::fmt::Debug for dyn DerivedFact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DerivedFact")
+    }
+}
 pub use graph::ReaderGraph;
 pub use positions::{
-    EditMaps, FilePosition, fingerprint_before_edits, fingerprinting, mapping_back,
+    EditMaps, FilePosition, fingerprint_before_edits, fingerprinting, hash_local, in_file,
+    mapping_back,
 };
 
 use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
@@ -206,6 +219,25 @@ pub fn fingerprint_of<T: std::hash::Hash + ?Sized>(value: &T) -> Fingerprint {
     hash.max(1)
 }
 
+/// An order-independent fingerprint of a set, kept up to date as members
+/// come and go so reading it costs nothing however large the set grows.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SetFingerprint(Fingerprint);
+
+impl SetFingerprint {
+    pub fn insert<T: std::hash::Hash + ?Sized>(&mut self, member: &T) {
+        self.0 = self.0.wrapping_add(fingerprint_of(member));
+    }
+
+    pub fn remove<T: std::hash::Hash + ?Sized>(&mut self, member: &T) {
+        self.0 = self.0.wrapping_sub(fingerprint_of(member));
+    }
+
+    pub fn get(&self) -> Fingerprint {
+        self.0
+    }
+}
+
 /// The fingerprint of an optional value.
 pub fn fingerprint_opt<T: std::hash::Hash>(value: Option<&T>) -> Fingerprint {
     value.map_or(ABSENT, fingerprint_of)
@@ -278,6 +310,24 @@ impl FactKey {
     /// The file whose slot the key names, or `None` for a workspace-wide key.
     /// Removing that file's facts removes whatever any derivation stored under
     /// the key.
+    /// Whether the edit remap (`remap_into_file`) rewrites the positions of an
+    /// edited file that this key's value names.
+    pub fn follows_edits(&self) -> bool {
+        use FactKey as K;
+        matches!(
+            self,
+            K::TypeCache(_)
+                | K::DefinitionFact(_)
+                | K::Signature(_)
+                | K::DynamicField(..)
+                | K::Metatable(_)
+                | K::SpecialCall(..)
+                | K::Member(_)
+                | K::MemberSlot(..)
+                | K::MemberOwnerMap(_)
+        )
+    }
+
     /// The file whose positions the key names, which an edit of that file
     /// renames: the owning file, or the file of a positional property owner.
     pub fn positional_file(&self) -> Option<FileId> {

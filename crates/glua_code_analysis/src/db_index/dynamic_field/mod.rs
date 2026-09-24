@@ -1081,15 +1081,20 @@ impl DynamicFieldIndex {
         }
     }
 
-    /// Rebuilds `owner`'s multiset fingerprint after a whole-owner rewrite.
-    fn recompute_owner_named(&mut self, owner: &DynamicFieldOwner) {
-        let digest = self
-            .owner_field_names(owner)
+    /// `owner`'s named slots summed afresh, which is what the incremental
+    /// `owner_named_fingerprints` sum holds.
+    fn owner_named_digest(&self, owner: &DynamicFieldOwner) -> Fingerprint {
+        self.owner_field_names(owner)
             .iter()
             .map(|field_name| {
                 named_entry(field_name, self.named_slot_fingerprint(owner, field_name))
             })
-            .fold(0u64, u64::wrapping_add);
+            .fold(0u64, u64::wrapping_add)
+    }
+
+    /// Rebuilds `owner`'s multiset fingerprint after a whole-owner rewrite.
+    fn recompute_owner_named(&mut self, owner: &DynamicFieldOwner) {
+        let digest = self.owner_named_digest(owner);
         if digest == 0 {
             self.owner_named_fingerprints.remove(owner);
         } else {
@@ -1102,7 +1107,15 @@ impl DynamicFieldIndex {
     pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
         match key {
             FactKey::DynamicFieldFile(file_id) => {
-                derivation::fingerprint_opt(self.file_contributions.get(file_id))
+                let entries = self.file_contributions.get(file_id).map(|entries| {
+                    entries
+                        .iter()
+                        .map(|(owner, field_name, range)| {
+                            (owner, field_name, InFiled::new(*file_id, *range))
+                        })
+                        .collect::<Vec<_>>()
+                });
+                derivation::fingerprint_opt(entries.as_ref())
             }
             FactKey::DynamicField(owner, Some(field_name)) => {
                 self.named_slot_fingerprint(owner, field_name)
@@ -1115,7 +1128,11 @@ impl DynamicFieldIndex {
                         .map(derivation::fingerprint_of)
                         .fold(0u64, u64::wrapping_add)
                 });
-                let named = self.owner_named_fingerprints.get(owner);
+                let named = if derivation::mapping_back() {
+                    Some(self.owner_named_digest(owner)).filter(|digest| *digest != 0)
+                } else {
+                    self.owner_named_fingerprints.get(owner).copied()
+                };
                 if wildcards.is_none() && finite.is_none() && named.is_none() {
                     return derivation::ABSENT;
                 }

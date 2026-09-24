@@ -13,7 +13,7 @@ use crate::{
     SemanticDeclLevel, SemanticModel, find_best_direct_call_arg_role_from_type,
     find_signature_attribute_use, get_var_expr_var_ref_id,
     semantic::{
-        InferConditionFlow, cast_type, contains_gmod_null_type, get_member_value_expr,
+        InferConditionFlow, apply_cast, contains_gmod_null_type, get_member_value_expr,
         remove_false_or_nil,
     },
     signature_is_valid_guard_in_realm, signature_is_valid_guard_or_base_runtime_isvalid_in_realm,
@@ -3333,22 +3333,12 @@ fn is_null_excluding_type_guard_call_guarding_expr(
         return false;
     }
 
-    let Some(syntax_tree) = db.get_vfs().get_syntax_tree(&signature_id.get_file_id()) else {
-        return false;
-    };
-    let signature_root = syntax_tree.get_chunk_node();
-    let Some(cast_op_type) = signature_cast.cast.to_node(&signature_root) else {
-        return false;
-    };
-    let Ok(casted_type) = cast_type(
+    let casted_type = apply_cast(
         db,
-        signature_id.get_file_id(),
-        cast_op_type,
+        &signature_cast.cast,
         guarded_type.clone(),
         InferConditionFlow::TrueCondition,
-    ) else {
-        return false;
-    };
+    );
 
     !contains_gmod_null_type(db, &casted_type)
 }
@@ -3368,8 +3358,10 @@ fn call_signature_cast<'a>(
     let signature_id = call_signature_id(semantic_model, guard_call)?;
     let signature_cast = semantic_model
         .get_db()
-        .get_flow_index()
-        .get_signature_cast(&signature_id)?;
+        .get_signature_index()
+        .get(&signature_id)?
+        .return_cast
+        .as_ref()?;
     Some((signature_id, signature_cast))
 }
 
@@ -3582,10 +3574,13 @@ fn type_returns_non_nullable_type_guard(semantic_model: &SemanticModel, typ: &Lu
                 return true;
             }
             // A `return_cast self` annotation explicitly casts the receiver after the call.
-            if let Some(cast) = db.get_flow_index().get_signature_cast(signature_id) {
-                if cast.name == "self" {
-                    return true;
-                }
+            if db
+                .get_signature_index()
+                .get(signature_id)
+                .and_then(|signature| signature.return_cast.as_ref())
+                .is_some_and(|cast| cast.name == "self")
+            {
+                return true;
             }
             false
         }

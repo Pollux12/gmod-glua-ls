@@ -186,6 +186,23 @@ thread_local! {
     static BACK_MAPS: RefCell<Option<EditMaps>> = const { RefCell::new(None) };
     static HASHING: Cell<bool> = const { Cell::new(false) };
     static FINGERPRINTING: Cell<bool> = const { Cell::new(false) };
+    static FACT_FILE: Cell<Option<FileId>> = const { Cell::new(None) };
+}
+
+/// Runs `f` with `file_id` as the file whose positions bare ranges, offsets
+/// and syntax ids name while fingerprinting (see [`hash_local`]).
+pub fn in_file<T>(file_id: Option<FileId>, f: impl FnOnce() -> T) -> T {
+    let outer = FACT_FILE.with(|current| current.replace(file_id));
+    let result = f();
+    FACT_FILE.with(|current| current.set(outer));
+    result
+}
+
+/// Hashes a position that does not carry its file: one of the file whose
+/// fact is being fingerprinted ([`in_file`]).
+pub fn hash_local<P: FilePosition + ?Sized, H: Hasher>(position: &P, state: &mut H) {
+    let file_id = FACT_FILE.with(Cell::get).unwrap_or(FileId::VIRTUAL);
+    position.hash_in_file(file_id, state);
 }
 
 /// Whether a fact value is being fingerprinted on this thread: types whose
@@ -347,6 +364,30 @@ impl FilePosition for TextSize {
 impl FilePosition for LuaSyntaxId {
     fn hash_in_file<H: Hasher>(&self, file_id: FileId, state: &mut H) {
         hash_mapped(file_id, self, |maps| maps.syntax_id(file_id, *self), state);
+    }
+}
+
+impl<P: FilePosition> FilePosition for Option<P> {
+    fn hash_in_file<H: Hasher>(&self, file_id: FileId, state: &mut H) {
+        self.is_some().hash(state);
+        if let Some(position) = self {
+            position.hash_in_file(file_id, state);
+        }
+    }
+}
+
+impl<P: FilePosition> FilePosition for [P] {
+    fn hash_in_file<H: Hasher>(&self, file_id: FileId, state: &mut H) {
+        self.len().hash(state);
+        for position in self {
+            position.hash_in_file(file_id, state);
+        }
+    }
+}
+
+impl<P: FilePosition> FilePosition for Vec<P> {
+    fn hash_in_file<H: Hasher>(&self, file_id: FileId, state: &mut H) {
+        self.as_slice().hash_in_file(file_id, state);
     }
 }
 

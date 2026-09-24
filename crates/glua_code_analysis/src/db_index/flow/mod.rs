@@ -1,6 +1,5 @@
 mod flow_node;
 mod flow_tree;
-mod signature_cast;
 
 use rowan::{TextRange, TextSize};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -16,8 +15,6 @@ pub use flow_node::*;
 pub use flow_tree::{
     AssignmentFlowInfo, AssignmentNameTarget, BranchLabelInfo, FileNarrowingCapability, FlowTree,
 };
-use glua_parser::{LuaAstPtr, LuaDocOpType};
-pub use signature_cast::LuaSignatureCast;
 
 use super::traits::LuaIndex;
 
@@ -26,7 +23,6 @@ pub struct LuaFlowIndex {
     file_flow_tree: HashMap<FileId, FlowTree>,
     /// [`FlowTree::content_fingerprint`] of each stored tree.
     flow_tree_fingerprints: HashMap<FileId, Fingerprint>,
-    signature_cast_cache: HashMap<FileId, HashMap<LuaSignatureId, LuaSignatureCast>>,
     special_call_effects: HashMap<FileId, HashMap<TextSize, Vec<LuaSpecialCallEffect>>>,
     /// Every special-call fact the epoch below has counted, keyed canonically.
     /// One call-site can install several facts (a synthesized class plus its
@@ -57,7 +53,6 @@ impl LuaFlowIndex {
         Self {
             file_flow_tree: HashMap::default(),
             flow_tree_fingerprints: HashMap::default(),
-            signature_cast_cache: HashMap::default(),
             special_call_effects: HashMap::default(),
             settled_special_call_facts: HashSet::default(),
             special_call_writes: 0,
@@ -80,44 +75,6 @@ impl LuaFlowIndex {
 
     pub fn flow_trees(&self) -> impl Iterator<Item = (&FileId, &FlowTree)> {
         self.file_flow_tree.iter()
-    }
-
-    pub fn get_signature_cast(&self, signature_id: &LuaSignatureId) -> Option<&LuaSignatureCast> {
-        derivation::note_read(|| FactKey::FlowTree(signature_id.get_file_id()));
-        self.signature_cast_cache
-            .get(&signature_id.get_file_id())?
-            .get(signature_id)
-    }
-
-    pub fn signature_casts(
-        &self,
-    ) -> impl Iterator<Item = (&FileId, &LuaSignatureId, &LuaSignatureCast)> {
-        self.signature_cast_cache
-            .iter()
-            .flat_map(|(file_id, casts)| casts.iter().map(move |(id, cast)| (file_id, id, cast)))
-    }
-
-    pub fn add_signature_cast(
-        &mut self,
-        file_id: FileId,
-        signature_id: LuaSignatureId,
-        name: String,
-        cast: LuaAstPtr<LuaDocOpType>,
-        fallback_cast: Option<LuaAstPtr<LuaDocOpType>>,
-    ) {
-        derivation::note_write(|| FactKey::FlowTree(file_id));
-        derivation::note_write(|| FactKey::FlowTree(signature_id.get_file_id()));
-        self.signature_cast_cache
-            .entry(file_id)
-            .or_default()
-            .insert(
-                signature_id,
-                LuaSignatureCast {
-                    name,
-                    cast,
-                    fallback_cast,
-                },
-            );
     }
 
     /// Installs one special-call effect, reporting whether it was new.
@@ -325,18 +282,7 @@ impl LuaFlowIndex {
     pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
         match key {
             FactKey::FlowTree(file_id) => {
-                let tree = self.flow_tree_fingerprints.get(file_id);
-                let casts = self.signature_cast_cache.get(file_id);
-                if tree.is_none() && casts.is_none() {
-                    return derivation::ABSENT;
-                }
-                let casts = casts.map(|casts| {
-                    casts
-                        .iter()
-                        .map(|entry| derivation::fingerprint_of(&entry))
-                        .fold(0u64, u64::wrapping_add)
-                });
-                derivation::fingerprint_of(&(tree, casts))
+                derivation::fingerprint_opt(self.flow_tree_fingerprints.get(file_id))
             }
             FactKey::SpecialCallFile(file_id) => {
                 self.special_call_effects
@@ -377,7 +323,6 @@ impl LuaIndex for LuaFlowIndex {
         derivation::note_write(|| FactKey::FlowTree(file_id));
         self.file_flow_tree.remove(&file_id);
         self.flow_tree_fingerprints.remove(&file_id);
-        self.signature_cast_cache.remove(&file_id);
         self.settled_special_call_facts
             .retain(|fact| fact.site_file() != file_id);
         self.special_call_fact_fingerprints.retain(|site, _| {
@@ -400,7 +345,6 @@ impl LuaIndex for LuaFlowIndex {
             for file_id in self
                 .file_flow_tree
                 .keys()
-                .chain(self.signature_cast_cache.keys())
                 .chain(self.special_call_effects.keys())
             {
                 derivation::note_write(|| FactKey::FlowTree(*file_id));
@@ -417,7 +361,6 @@ impl LuaIndex for LuaFlowIndex {
         self.file_flow_tree.clear();
         self.flow_tree_fingerprints.clear();
         self.special_call_fact_fingerprints.clear();
-        self.signature_cast_cache.clear();
         self.special_call_effects.clear();
         self.settled_special_call_facts.clear();
         self.special_call_write_versions.clear();

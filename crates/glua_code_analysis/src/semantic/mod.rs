@@ -39,7 +39,7 @@ pub(crate) use infer::get_prefix_expr_signature_id;
 pub(crate) use infer::infer_bind_value_type;
 pub use infer::infer_index_expr;
 pub(crate) use infer::narrow::infer_true_condition_narrowing;
-pub(crate) use infer::narrow::{InferConditionFlow, cast_type};
+pub(crate) use infer::narrow::{InferConditionFlow, apply_cast};
 pub use infer::narrow::{
     explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
 };

@@ -53,6 +53,7 @@ pub struct LuaSignature {
     class_name_param_return_alias: Option<usize>,
     falsy_param_nil_free_return_slots: Vec<LuaFalsyParamNilFreeReturnSlot>,
     falsy_param_return_aliases: Vec<LuaFalsyParamReturnAlias>,
+    pub return_cast: Option<super::LuaSignatureCast>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -120,6 +121,7 @@ impl Hash for LuaSignature {
         self.class_name_param_return_alias.hash(state);
         self.falsy_param_nil_free_return_slots.hash(state);
         self.falsy_param_return_aliases.hash(state);
+        self.return_cast.hash(state);
     }
 }
 
@@ -152,6 +154,7 @@ impl LuaSignature {
             class_name_param_return_alias: None,
             falsy_param_nil_free_return_slots: Vec::new(),
             falsy_param_return_aliases: Vec::new(),
+            return_cast: None,
         }
     }
 

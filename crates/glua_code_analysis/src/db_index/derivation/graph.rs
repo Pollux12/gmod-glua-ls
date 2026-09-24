@@ -137,19 +137,24 @@ impl ReaderGraph {
 
     /// Replaces the fingerprints `id` recorded for its reads, in
     /// [`Self::reads_of`] order.
-    pub fn set_fingerprints(&mut self, id: DerivationId, fingerprints: Vec<Fingerprint>) {
+    /// Replaces `id`'s recorded fingerprints, in read order. Returns whether
+    /// any differed.
+    pub fn set_fingerprints(&mut self, id: DerivationId, fingerprints: Vec<Fingerprint>) -> bool {
         let Some(record) = self.records.get(&id) else {
-            return;
+            return false;
         };
+        let mut moved = false;
         for (key, fingerprint) in record.reads.iter().zip(fingerprints) {
             if let Some(seen) = self
                 .readers
                 .get_mut(key)
                 .and_then(|readers| readers.get_mut(&id))
             {
+                moved |= *seen != fingerprint;
                 *seen = fingerprint;
             }
         }
+        moved
     }
 
     /// Renames every recorded read of a key `edits` moved to the key's new
@@ -201,6 +206,12 @@ impl ReaderGraph {
         lost.sort();
         lost.dedup();
         lost
+    }
+
+    /// Every key some derivation read.
+    #[cfg(test)]
+    pub fn read_keys(&self) -> impl Iterator<Item = &FactKey> {
+        self.readers.keys()
     }
 
     pub fn contains(&self, id: DerivationId) -> bool {

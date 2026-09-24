@@ -31,6 +31,8 @@ pub struct LuaModuleIndex {
     module_root_id: ModuleNodeId,
     module_nodes: FxHashMap<ModuleNodeId, ModuleNode>,
     file_module_map: FxHashMap<FileId, ModuleInfo>,
+    /// The `(file, module name, workspace)` of every module in `file_module_map`.
+    module_files: derivation::SetFingerprint,
     file_module_paths: FxHashMap<FileId, String>,
     module_name_to_file_ids: FxHashMap<String, Vec<FileId>>,
     legacy_module_envs: FxHashMap<FileId, Vec<LegacyModuleEnv>>,
@@ -94,6 +96,15 @@ impl Default for LuaModuleIndex {
     }
 }
 
+/// One module's contribution to [`FactKey::ModuleFiles`].
+fn module_files_entry(info: &ModuleInfo) -> (FileId, &str, WorkspaceId) {
+    (
+        info.file_id,
+        info.full_module_name.as_str(),
+        info.workspace_id,
+    )
+}
+
 impl LuaModuleIndex {
     pub fn new() -> Self {
         let mut index = Self {
@@ -101,6 +112,7 @@ impl LuaModuleIndex {
             module_root_id: ModuleNodeId { id: 0 },
             module_nodes: FxHashMap::default(),
             file_module_map: FxHashMap::default(),
+            module_files: derivation::SetFingerprint::default(),
             file_module_paths: FxHashMap::default(),
             module_name_to_file_ids: FxHashMap::default(),
             legacy_module_envs: FxHashMap::default(),
@@ -243,6 +255,7 @@ impl LuaModuleIndex {
             is_meta: false,
         };
 
+        self.module_files.insert(&module_files_entry(&module_info));
         self.file_module_map.insert(file_id, module_info);
         derivation::note_write(|| FactKey::ModuleFiles);
         self.module_name_to_file_ids
@@ -366,21 +379,7 @@ impl LuaModuleIndex {
                 modules.sort_by_key(|module| module.0);
                 derivation::fingerprint_of(&modules)
             }
-            FactKey::ModuleFiles => {
-                let mut modules = self
-                    .file_module_map
-                    .values()
-                    .map(|info| {
-                        (
-                            info.file_id,
-                            info.full_module_name.as_str(),
-                            info.workspace_id,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                modules.sort_by_key(|module| module.0);
-                derivation::fingerprint_of(&modules)
-            }
+            FactKey::ModuleFiles => self.module_files.get(),
             FactKey::ModuleNamespace(root) => {
                 let mut envs = self
                     .legacy_module_envs
@@ -1304,6 +1303,7 @@ impl LuaIndex for LuaModuleIndex {
         }
         let (mut parent_id, mut child_id) =
             if let Some(module_info) = self.file_module_map.remove(&file_id) {
+                self.module_files.remove(&module_files_entry(&module_info));
                 let module_id = module_info.module_id;
                 let node = match self.module_nodes.get_mut(&module_id) {
                     Some(node) => node,
@@ -1363,6 +1363,7 @@ impl LuaIndex for LuaModuleIndex {
         derivation::note_write(|| FactKey::ModuleFiles);
         self.module_nodes.clear();
         self.file_module_map.clear();
+        self.module_files = derivation::SetFingerprint::default();
         self.file_module_paths.clear();
         self.module_name_to_file_ids.clear();
         self.legacy_module_envs.clear();

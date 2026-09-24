@@ -1336,3 +1336,154 @@ fn an_identity_remap_leaves_every_owner_alone() {
         is_empty()
     );
 }
+
+const SHIFT_FIXTURE: [(&str, &str); 5] = [
+    (
+        "lua/autorun/sh_shift_lib.lua",
+        r#"---@class ShiftLib
+ShiftLib = ShiftLib or {}
+ShiftLib.Items = {}
+local Meta = {}
+Meta.__index = Meta
+Meta.__add = function(a, b) return a end
+---@param name string
+---@return table
+function ShiftLib.New(name)
+    local obj = setmetatable({ name = name }, Meta)
+    return obj
+end
+function Meta:GetName() return self.name end
+if SERVER then
+    util.AddNetworkString("shift_msg")
+    function ShiftLib.Send(ply)
+        net.Start("shift_msg")
+        net.WriteString("x")
+        net.Send(ply)
+    end
+else
+    net.Receive("shift_msg", function()
+        local s = net.ReadString()
+        print(s)
+    end)
+end
+hook.Add("Think", "shift_think", function() end)
+for i = 1, 3 do ShiftLib.Items[i] = i end
+include("vgui/shift_panel.lua")
+"#,
+    ),
+    (
+        "lua/vgui/shift_panel.lua",
+        r#"local PANEL = {}
+AccessorFunc(PANEL, "m_Value", "Value")
+function PANEL:Init() self.label = "x" end
+vgui.Register("ShiftPanel", PANEL, "DPanel")
+"#,
+    ),
+    (
+        "lua/autorun/client/cl_shift_reader.lua",
+        r#"local lib = ShiftLib.New("a")
+print(lib:GetName())
+local panel = vgui.Create("ShiftPanel")
+panel:SetValue(1)
+---@diagnostic disable-next-line: undefined-global
+print(UNDEFINED_SHIFT)
+local sum = lib + lib
+print(ShiftLib.Items[1], sum)
+local animal = ShiftAnimal.new(4)
+print(animal.legs, ShiftAnimal.Make("cat"), ShiftCounts[2])
+local total = ShiftVec + ShiftVec
+print(total, ShiftVec(1), shiftmod.value)
+"#,
+    ),
+    (
+        "lua/autorun/sh_shift_more.lua",
+        r#"---@class ShiftAnimal
+---@field legs integer
+ShiftAnimal = {}
+ShiftAnimal.__index = ShiftAnimal
+function ShiftAnimal.new(legs)
+    return setmetatable({ legs = legs }, ShiftAnimal)
+end
+---@param kind "cat"|"dog"
+---@return string
+function ShiftAnimal.Make(kind) return kind end
+ShiftVec = {}
+local VecMeta = {}
+VecMeta.__add = function(a, b) return a end
+VecMeta.__call = function(self, x) return x end
+setmetatable(ShiftVec, VecMeta)
+ShiftCounts = {}
+for i = 1, 10 do ShiftCounts[i] = i * 2 end
+local mode = "fast"
+ShiftMode = mode
+"#,
+    ),
+    (
+        "lua/includes/modules/shiftmod.lua",
+        r#"module("shiftmod", package.seeall)
+value = 1
+function get() return value end
+"#,
+    ),
+];
+
+/// A pure shift moves positions and nothing else, so every fact that names
+/// the shifted file's positions must fingerprint, with the edit mapped back,
+/// exactly as it did before. A fact that does not re-runs its readers in
+/// other files on every edit above it.
+#[gtest]
+fn every_fact_of_a_shifted_file_fingerprints_as_before() {
+    let mut ws = VirtualWorkspace::new_with_init_std_lib();
+    let mut emmyrc = Emmyrc::default();
+    emmyrc.gmod.enabled = true;
+    ws.update_emmyrc(emmyrc);
+    ws.def_gmod_call_arg_builtins();
+    ws.def_files(SHIFT_FIXTURE.to_vec());
+
+    let mut unstable = std::collections::BTreeSet::new();
+    for (path, text) in SHIFT_FIXTURE {
+        let uri = ws.virtual_url_generator.new_uri(path);
+        let file_id = ws.analysis.get_file_id(&uri).expect("fixture file");
+        for (other, _) in SHIFT_FIXTURE {
+            let other = ws.virtual_url_generator.new_uri(other);
+            let other = ws.analysis.get_file_id(&other).expect("fixture file");
+            ws.analysis
+                .diagnose_file(other, tokio_util::sync::CancellationToken::new());
+        }
+        let diagnostic_keys = ws.analysis.compilation.diagnostic_read_keys();
+        let db = ws.analysis.compilation.get_db();
+        let before = db
+            .reader_graph()
+            .read_keys()
+            .chain(diagnostic_keys.iter())
+            .filter(|key| {
+                key.positional_file() == Some(file_id)
+                    && !matches!(key, crate::db_index::derivation::FactKey::FileText(_))
+            })
+            .map(|key| (key.clone(), db.fact_fingerprint(key)))
+            .collect::<Vec<_>>();
+
+        let shifted = format!(
+            "
+{text}"
+        );
+        ws.analysis.update_file_text_only(&uri, shifted.clone());
+        ws.analysis.reindex_files(vec![file_id]);
+
+        let edits = crate::db_index::derivation::EditMaps::new([(
+            file_id,
+            PositionMap::new(text, &shifted),
+        )]);
+        let db = ws.analysis.compilation.get_db();
+        for (key, fingerprint) in before {
+            let moved = edits.map_key(&key).expect("a shift loses no position");
+            let after = crate::db_index::derivation::fingerprint_before_edits(&edits, || {
+                db.fact_fingerprint(&moved)
+            });
+            if after != fingerprint {
+                unstable.insert(format!("{path}: {key:?}"));
+            }
+        }
+    }
+    expect_that!(unstable, is_empty());
+}

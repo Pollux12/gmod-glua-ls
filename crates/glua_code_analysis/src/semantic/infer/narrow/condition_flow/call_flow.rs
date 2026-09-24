@@ -1,11 +1,9 @@
 use std::{ops::Deref, sync::Arc};
 
-use glua_parser::{
-    LuaAstNode, LuaCallExpr, LuaChunk, LuaDocOpType, LuaExpr, LuaIndexMemberExpr, LuaNameExpr,
-};
+use glua_parser::{LuaAstNode, LuaCallExpr, LuaChunk, LuaExpr, LuaIndexMemberExpr, LuaNameExpr};
 
 use crate::{
-    DbIndex, FileId, FlowNode, FlowTree, GMOD_ATTR_SELF_GUARD, InferFailReason, InferGuard,
+    DbIndex, FlowNode, FlowTree, GMOD_ATTR_SELF_GUARD, InferFailReason, InferGuard,
     LuaAliasCallKind, LuaAliasCallType, LuaFunctionType, LuaInferCache, LuaSemanticDeclId,
     LuaSignatureCast, LuaSignatureId, LuaType, TypeOps, find_signature_attribute_use,
     infer_call_expr_func, infer_expr,
@@ -18,7 +16,7 @@ use crate::{
             narrow::{
                 ResultTypeOrContinue,
                 condition_flow::{InferConditionFlow, get_condition_antecedent_type},
-                get_type_at_cast_flow::cast_type,
+                get_type_at_cast_flow::apply_cast,
                 get_type_at_flow::FlowWalkPolicy,
                 gmod_null_type, narrow_down_type, narrow_false_or_nil, remove_false_or_nil,
                 var_ref_id::get_var_expr_var_ref_id,
@@ -60,8 +58,9 @@ pub fn get_type_at_call_expr(
                     call_prefix_signature_is_valid_guard(db, cache, &call_expr_ref, signature_id)
                 });
                 let signature_cast = prefix_signature_id.and_then(|signature_id| {
-                    db.get_flow_index()
-                        .get_signature_cast(&signature_id)
+                    db.get_signature_index()
+                        .get(&signature_id)
+                        .and_then(|signature| signature.return_cast.as_ref())
                         .map(|cast| (cast, signature_id))
                 });
                 let return_type = f.get_ret();
@@ -110,7 +109,7 @@ pub fn get_type_at_call_expr(
                 };
 
                 let ret = signature.get_return_type();
-                let signature_cast = db.get_flow_index().get_signature_cast(&signature_id);
+                let signature_cast = signature.return_cast.as_ref();
                 let is_valid_guard =
                     call_prefix_signature_is_valid_guard(db, cache, &call_expr_ref, signature_id);
                 let mut type_guard_did_not_apply = false;
@@ -740,22 +739,34 @@ fn remove_non_validatable_primitives(typ: LuaType) -> LuaType {
     }
 }
 
-fn apply_positive_signature_cast(
+/// Narrows `source_type` by a `---@return_cast` on the branch `condition_flow`
+/// takes: the cast on a truthy return, otherwise the fallback cast when the
+/// signature has one, else the cast negated.
+fn apply_signature_cast(
     db: &DbIndex,
-    file_id: FileId,
-    cast_op_type: LuaDocOpType,
+    signature_cast: &LuaSignatureCast,
     source_type: LuaType,
-) -> Result<LuaType, InferFailReason> {
-    let cast_result = cast_type(
-        db,
-        file_id,
-        cast_op_type,
-        source_type.clone(),
-        InferConditionFlow::TrueCondition,
-    )?;
-
-    // A successful predicate adds a constraint; it must not widen an existing subtype.
-    Ok(narrow_down_type(db, source_type, cast_result.clone(), None).unwrap_or(cast_result))
+    condition_flow: InferConditionFlow,
+) -> LuaType {
+    match condition_flow {
+        InferConditionFlow::TrueCondition => {
+            let cast_result = apply_cast(
+                db,
+                &signature_cast.cast,
+                source_type.clone(),
+                InferConditionFlow::TrueCondition,
+            );
+            // A successful predicate adds a constraint; it must not widen an
+            // existing subtype.
+            narrow_down_type(db, source_type, cast_result.clone(), None).unwrap_or(cast_result)
+        }
+        InferConditionFlow::FalseCondition => match &signature_cast.fallback_cast {
+            Some(fallback) => {
+                apply_cast(db, fallback, source_type, InferConditionFlow::TrueCondition)
+            }
+            None => apply_cast(db, &signature_cast.cast, source_type, condition_flow),
+        },
+    }
 }
 
 fn is_inferred_mutable_param_without_declared_type(
@@ -940,44 +951,12 @@ fn apply_signature_cast_to_type_guard_result(
         return Ok(result_type);
     }
 
-    let Some(syntax_tree) = db.get_vfs().get_syntax_tree(&signature_id.get_file_id()) else {
-        return Ok(result_type);
-    };
-    let signature_root = syntax_tree.get_chunk_node();
-
-    match condition_flow {
-        InferConditionFlow::TrueCondition => {
-            let Some(cast_op_type) = signature_cast.cast.to_node(&signature_root) else {
-                return Ok(result_type);
-            };
-            apply_positive_signature_cast(db, signature_id.get_file_id(), cast_op_type, result_type)
-        }
-        InferConditionFlow::FalseCondition => {
-            if let Some(fallback_cast_ptr) = &signature_cast.fallback_cast {
-                let Some(fallback_op_type) = fallback_cast_ptr.to_node(&signature_root) else {
-                    return Ok(result_type);
-                };
-                cast_type(
-                    db,
-                    signature_id.get_file_id(),
-                    fallback_op_type,
-                    result_type,
-                    InferConditionFlow::TrueCondition,
-                )
-            } else {
-                let Some(cast_op_type) = signature_cast.cast.to_node(&signature_root) else {
-                    return Ok(result_type);
-                };
-                cast_type(
-                    db,
-                    signature_id.get_file_id(),
-                    cast_op_type,
-                    result_type,
-                    condition_flow,
-                )
-            }
-        }
-    }
+    Ok(apply_signature_cast(
+        db,
+        signature_cast,
+        result_type,
+        condition_flow,
+    ))
 }
 
 fn signature_cast_target_expr(
@@ -1065,53 +1044,7 @@ fn get_type_at_call_expr_by_signature_self(
         antecedent_type = narrow_valid_guard_true_branch(db, antecedent_type, LuaType::Any);
     }
 
-    let Some(syntax_tree) = db.get_vfs().get_syntax_tree(&signature_id.get_file_id()) else {
-        return Ok(ResultTypeOrContinue::Continue);
-    };
-
-    let signature_root = syntax_tree.get_chunk_node();
-
-    // Choose the appropriate cast based on condition_flow and whether fallback exists
-    let result_type = match condition_flow {
-        InferConditionFlow::TrueCondition => {
-            let Some(cast_op_type) = signature_cast.cast.to_node(&signature_root) else {
-                return Ok(ResultTypeOrContinue::Continue);
-            };
-            apply_positive_signature_cast(
-                db,
-                signature_id.get_file_id(),
-                cast_op_type,
-                antecedent_type,
-            )?
-        }
-        InferConditionFlow::FalseCondition => {
-            // Use fallback_cast if available, otherwise use the default behavior
-            if let Some(fallback_cast_ptr) = &signature_cast.fallback_cast {
-                let Some(fallback_op_type) = fallback_cast_ptr.to_node(&signature_root) else {
-                    return Ok(ResultTypeOrContinue::Continue);
-                };
-                cast_type(
-                    db,
-                    signature_id.get_file_id(),
-                    fallback_op_type,
-                    antecedent_type.clone(),
-                    InferConditionFlow::TrueCondition, // Apply fallback as force cast
-                )?
-            } else {
-                // Original behavior: remove the true type from antecedent
-                let Some(cast_op_type) = signature_cast.cast.to_node(&signature_root) else {
-                    return Ok(ResultTypeOrContinue::Continue);
-                };
-                cast_type(
-                    db,
-                    signature_id.get_file_id(),
-                    cast_op_type,
-                    antecedent_type,
-                    condition_flow,
-                )?
-            }
-        }
-    };
+    let result_type = apply_signature_cast(db, signature_cast, antecedent_type, condition_flow);
 
     Ok(ResultTypeOrContinue::Result(result_type))
 }
@@ -1174,53 +1107,7 @@ fn get_type_at_call_expr_by_signature_param_name(
     let antecedent_type =
         get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
 
-    let Some(syntax_tree) = db.get_vfs().get_syntax_tree(&signature_id.get_file_id()) else {
-        return Ok(ResultTypeOrContinue::Continue);
-    };
-
-    let signature_root = syntax_tree.get_chunk_node();
-
-    // Choose the appropriate cast based on condition_flow and whether fallback exists
-    let result_type = match condition_flow {
-        InferConditionFlow::TrueCondition => {
-            let Some(cast_op_type) = signature_cast.cast.to_node(&signature_root) else {
-                return Ok(ResultTypeOrContinue::Continue);
-            };
-            apply_positive_signature_cast(
-                db,
-                signature_id.get_file_id(),
-                cast_op_type,
-                antecedent_type,
-            )?
-        }
-        InferConditionFlow::FalseCondition => {
-            // Use fallback_cast if available, otherwise use the default behavior
-            if let Some(fallback_cast_ptr) = &signature_cast.fallback_cast {
-                let Some(fallback_op_type) = fallback_cast_ptr.to_node(&signature_root) else {
-                    return Ok(ResultTypeOrContinue::Continue);
-                };
-                cast_type(
-                    db,
-                    signature_id.get_file_id(),
-                    fallback_op_type,
-                    antecedent_type.clone(),
-                    InferConditionFlow::TrueCondition, // Apply fallback as force cast
-                )?
-            } else {
-                // Original behavior: remove the true type from antecedent
-                let Some(cast_op_type) = signature_cast.cast.to_node(&signature_root) else {
-                    return Ok(ResultTypeOrContinue::Continue);
-                };
-                cast_type(
-                    db,
-                    signature_id.get_file_id(),
-                    cast_op_type,
-                    antecedent_type,
-                    condition_flow,
-                )?
-            }
-        }
-    };
+    let result_type = apply_signature_cast(db, signature_cast, antecedent_type, condition_flow);
 
     Ok(ResultTypeOrContinue::Result(result_type))
 }

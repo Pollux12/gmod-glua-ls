@@ -719,11 +719,16 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         flow_trees.insert(file_label(analysis, *file_id), format!("{tree:?}"));
     }
     let mut signature_casts = BTreeMap::new();
-    for (file_id, signature_id, cast) in flow.signature_casts() {
-        signature_casts.insert(
-            format!("{}|{signature_id:?}", file_label(analysis, *file_id)),
-            format!("{cast:?}"),
-        );
+    for (signature_id, signature) in db.get_signature_index().iter() {
+        if let Some(cast) = &signature.return_cast {
+            signature_casts.insert(
+                format!(
+                    "{}|{signature_id:?}",
+                    file_label(analysis, signature_id.get_file_id())
+                ),
+                format!("{cast:?}"),
+            );
+        }
     }
     let mut special_call_effects = BTreeMap::new();
     for (file_id, position, effect) in flow.special_call_effects() {

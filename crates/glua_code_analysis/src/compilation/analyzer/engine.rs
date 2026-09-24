@@ -72,10 +72,10 @@ impl Engine {
         db: &'a DbIndex,
         key: &'a FactKey,
     ) -> impl Fn(derivation::Fingerprint) -> bool + 'a {
-        let current = db.fact_fingerprint(key);
+        let current = std::cell::OnceCell::new();
         let before_edits = std::cell::OnceCell::new();
         move |seen| {
-            seen == current
+            seen == *current.get_or_init(|| db.fact_fingerprint(key))
                 || (!self.edits.is_empty()
                     && seen
                         == *before_edits.get_or_init(|| {
@@ -156,16 +156,28 @@ impl Engine {
                     .reader_graph()
                     .is_stale(id, |key, seen| self.holds(db, key, seen))
             {
-                if !self.edits.is_empty() {
-                    let fingerprints = db
-                        .reader_graph()
-                        .reads_of(id)
-                        .iter()
-                        .map(|key| db.fact_fingerprint(key))
-                        .collect();
-                    db.reader_graph_mut().set_fingerprints(id, fingerprints);
+                if self.edits.is_empty() {
+                    continue;
                 }
-                continue;
+                let fingerprints = db
+                    .reader_graph()
+                    .reads_of(id)
+                    .iter()
+                    .map(|key| db.fact_fingerprint(key))
+                    .collect();
+                // A read that held only with the edit mapped back saw positions
+                // the edit moved; outputs made from them are right only if the
+                // edit's remap rewrites them too.
+                let moved = db.reader_graph_mut().set_fingerprints(id, fingerprints);
+                if !moved
+                    || db
+                        .reader_graph()
+                        .outputs_of(id)
+                        .iter()
+                        .all(FactKey::follows_edits)
+                {
+                    continue;
+                }
             }
             let group = co_producers(db, id);
             for member in &group {

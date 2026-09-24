@@ -1,4 +1,5 @@
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use flagset::{FlagSet, flags};
 use internment::ArcIntern;
@@ -383,9 +384,17 @@ pub enum LuaTypeIdentifier {
     Local(FileId, SmolStr),
 }
 
-#[derive(Debug, Eq, PartialEq, Hash, Clone)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub struct LuaTypeDeclId {
     id: ArcIntern<LuaTypeIdentifier>,
+}
+
+/// Hashes the name, not the interned pointer: an id interned again after its
+/// last holder dropped it must hash as before.
+impl Hash for LuaTypeDeclId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (*self.id).hash(state);
+    }
 }
 
 /// Per-thread memo in front of `ArcIntern`'s shared pool. Every type-name

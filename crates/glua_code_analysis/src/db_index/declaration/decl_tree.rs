@@ -52,13 +52,17 @@ impl LuaDeclarationTree {
     /// Hash of the declarations (in id order) and scopes; the remaining maps
     /// are derived from those two.
     pub(crate) fn fingerprint(&self) -> Fingerprint {
-        *self.fingerprint.get_or_init(|| {
-            let mut decls = self.decls.iter().collect::<Vec<_>>();
-            decls.sort_unstable_by_key(|(decl_id, _)| {
-                (decl_id.file_id.id, u32::from(decl_id.position))
-            });
-            derivation::fingerprint_of(&(self.file_id, decls, &self.scopes))
-        })
+        if derivation::mapping_back() {
+            return self.content_fingerprint();
+        }
+        *self.fingerprint.get_or_init(|| self.content_fingerprint())
+    }
+
+    fn content_fingerprint(&self) -> Fingerprint {
+        let mut decls = self.decls.iter().collect::<Vec<_>>();
+        decls
+            .sort_unstable_by_key(|(decl_id, _)| (decl_id.file_id.id, u32::from(decl_id.position)));
+        derivation::fingerprint_of(&(self.file_id, decls, &self.scopes))
     }
 
     /// Every declaration id the tree holds.

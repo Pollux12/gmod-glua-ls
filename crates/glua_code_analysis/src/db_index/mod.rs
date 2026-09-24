@@ -94,22 +94,13 @@ pub struct DbIndex {
     json_schema_index: Arc<JsonSchemaIndex>,
     /// Who read and produced which fact; see [`derivation`].
     derivations: Arc<derivation::ReaderGraph>,
-    /// The workspace gmod call roles with their content fingerprint.
-    /// Type-erased so `db_index` does not name the analyzer's types.
-    gmod_call_roles: Option<(
-        Arc<dyn std::any::Any + Send + Sync>,
-        derivation::Fingerprint,
-    )>,
+    /// The workspace gmod call roles with their fingerprint when stored.
+    gmod_call_roles: Option<(Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
     emmyrc: Arc<Emmyrc>,
-    /// Each file's gmod helper scan with its content fingerprint, type-erased
-    /// like `gmod_call_roles`.
-    helper_scans: FxHashMap<
-        FileId,
-        (
-            Arc<dyn std::any::Any + Send + Sync>,
-            derivation::Fingerprint,
-        ),
-    >,
+    /// Each file's gmod helper scan with its fingerprint when stored.
+    helper_scans: FxHashMap<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
+    /// The set of files in `helper_scans`.
+    helper_scan_files: derivation::SetFingerprint,
     /// Bumped on every *mutable* handle to the type, member, signature or module
     /// index; memos over facts derived from those key on it. It covers those four
     /// and no others — the decl, global, dynamic-field and gmod-infer indexes all
@@ -126,6 +117,25 @@ pub struct DbIndex {
 fn next_type_structure_revision() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A stored derived value's fingerprint: the one taken when it was stored,
+/// or taken afresh when fingerprinting with edits mapped back.
+fn stored_fact_fingerprint(
+    (fact, fingerprint): &(Arc<dyn derivation::DerivedFact>, derivation::Fingerprint),
+) -> derivation::Fingerprint {
+    if derivation::mapping_back() {
+        fact.fingerprint().max(1)
+    } else {
+        *fingerprint
+    }
+}
+
+fn downcast_fact<T: derivation::DerivedFact>(
+    fact: &Arc<dyn derivation::DerivedFact>,
+) -> Option<Arc<T>> {
+    let fact: Arc<dyn std::any::Any + Send + Sync> = fact.clone();
+    fact.downcast::<T>().ok()
 }
 
 #[allow(unused)]
@@ -167,6 +177,7 @@ impl DbIndex {
             gmod_call_roles: None,
             emmyrc: Arc::new(Emmyrc::default()),
             helper_scans: FxHashMap::default(),
+            helper_scan_files: derivation::SetFingerprint::default(),
         }
     }
 
@@ -245,24 +256,25 @@ impl DbIndex {
         }
     }
 
-    pub(crate) fn get_gmod_call_roles<T: std::any::Any + Send + Sync>(&self) -> Option<Arc<T>> {
+    pub(crate) fn get_gmod_call_roles<T: derivation::DerivedFact>(&self) -> Option<Arc<T>> {
         derivation::note_read(|| derivation::FactKey::HelperRegistry);
         self.gmod_call_roles
             .as_ref()
-            .and_then(|(roles, _)| roles.clone().downcast::<T>().ok())
+            .and_then(|(roles, _)| downcast_fact(roles))
     }
 
-    pub(crate) fn set_gmod_call_roles<T: std::any::Any + Send + Sync>(
-        &mut self,
-        roles: Arc<T>,
-        fingerprint: derivation::Fingerprint,
-    ) {
+    pub(crate) fn set_gmod_call_roles<T: derivation::DerivedFact>(&mut self, roles: Arc<T>) {
         derivation::note_write(|| derivation::FactKey::HelperRegistry);
-        self.gmod_call_roles = Some((roles, fingerprint.max(1)));
+        let fingerprint = roles.fingerprint().max(1);
+        self.gmod_call_roles = Some((roles, fingerprint));
     }
 
     /// The fingerprint of what a read of `key` observes now.
     pub(crate) fn fact_fingerprint(&self, key: &derivation::FactKey) -> derivation::Fingerprint {
+        derivation::in_file(key.positional_file(), || self.fact_fingerprint_in_file(key))
+    }
+
+    fn fact_fingerprint_in_file(&self, key: &derivation::FactKey) -> derivation::Fingerprint {
         use derivation::FactKey as K;
         match key {
             K::TypeCache(_)
@@ -323,16 +335,12 @@ impl DbIndex {
             K::HelperRegistry => self
                 .gmod_call_roles
                 .as_ref()
-                .map_or(derivation::ABSENT, |(_, fingerprint)| *fingerprint),
+                .map_or(derivation::ABSENT, stored_fact_fingerprint),
             K::HelperScan(file_id) => self
                 .helper_scans
                 .get(file_id)
-                .map_or(derivation::ABSENT, |(_, fingerprint)| *fingerprint),
-            K::HelperScanFiles => {
-                let mut file_ids = self.helper_scans.keys().collect::<Vec<_>>();
-                file_ids.sort_unstable();
-                derivation::fingerprint_of(&file_ids)
-            }
+                .map_or(derivation::ABSENT, stored_fact_fingerprint),
+            K::HelperScanFiles => self.helper_scan_files.get(),
             K::Property(_) | K::DeclDefault(_) => self.property_index.fact_fingerprint(key),
             K::Global(_) | K::GlobalScan => self.global_index.fact_fingerprint(key),
             K::References(_) | K::ReferencesByName(_) | K::ReferenceContrib(_) => {
@@ -350,34 +358,36 @@ impl DbIndex {
         }
     }
 
-    pub(crate) fn get_helper_scan<T: std::any::Any + Send + Sync>(
+    pub(crate) fn get_helper_scan<T: derivation::DerivedFact>(
         &self,
         file_id: FileId,
     ) -> Option<Arc<T>> {
         derivation::note_read(|| derivation::FactKey::HelperScan(file_id));
         self.helper_scans
             .get(&file_id)
-            .and_then(|(scan, _)| scan.clone().downcast::<T>().ok())
+            .and_then(|(scan, _)| downcast_fact(scan))
     }
 
-    pub(crate) fn set_helper_scan<T: std::any::Any + Send + Sync>(
+    pub(crate) fn set_helper_scan<T: derivation::DerivedFact>(
         &mut self,
         file_id: FileId,
         scan: Arc<T>,
-        fingerprint: derivation::Fingerprint,
     ) {
         derivation::note_write(|| derivation::FactKey::HelperScan(file_id));
+        let fingerprint = derivation::in_file(Some(file_id), || scan.fingerprint()).max(1);
         if self
             .helper_scans
-            .insert(file_id, (scan, fingerprint.max(1)))
+            .insert(file_id, (scan, fingerprint))
             .is_none()
         {
+            self.helper_scan_files.insert(&file_id);
             derivation::note_write(|| derivation::FactKey::HelperScanFiles);
         }
     }
 
     fn remove_helper_scan(&mut self, file_id: FileId) {
         if self.helper_scans.remove(&file_id).is_some() {
+            self.helper_scan_files.remove(&file_id);
             derivation::note_write(|| derivation::FactKey::HelperScan(file_id));
             derivation::note_write(|| derivation::FactKey::HelperScanFiles);
         }
@@ -779,6 +789,7 @@ impl DbIndex {
             gmod_call_roles: self.gmod_call_roles.clone(),
             emmyrc: Arc::clone(&self.emmyrc),
             helper_scans: self.helper_scans.clone(),
+            helper_scan_files: self.helper_scan_files,
         }
     }
 
@@ -928,6 +939,7 @@ impl LuaIndex for DbIndex {
         Arc::make_mut(&mut self.global_index).clear();
         Arc::make_mut(&mut self.json_schema_index).clear();
         self.helper_scans.clear();
+        self.helper_scan_files = derivation::SetFingerprint::default();
         self.derivations = Arc::default();
         self.gmod_call_roles = None;
     }

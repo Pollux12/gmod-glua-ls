@@ -106,12 +106,12 @@ fn file_member_element(id: LuaMemberId) -> Fingerprint {
     fingerprint_of(&(0u8, id))
 }
 
-fn file_scope_element(range: TextRange) -> Fingerprint {
-    fingerprint_of(&(1u8, range))
+fn file_scope_element(file_id: FileId, range: TextRange) -> Fingerprint {
+    fingerprint_of(&(1u8, crate::InFiled::new(file_id, range)))
 }
 
-fn file_element_owner_element(range: TextRange) -> Fingerprint {
-    fingerprint_of(&(2u8, range))
+fn file_element_owner_element(site: &crate::InFiled<TextRange>) -> Fingerprint {
+    fingerprint_of(&(2u8, site))
 }
 
 fn note_slot_write(owner: &LuaMemberOwner, key: &LuaMemberKey) {
@@ -339,6 +339,9 @@ impl LuaMemberIndex {
                 items.wrapping_add(self.owner_history_fingerprint(owner))
             }
             FactKey::MemberKey(key) => self.key_fingerprints.get(key).copied().unwrap_or(ABSENT),
+            FactKey::MemberFile(file_id) if derivation::mapping_back() => {
+                self.recomputed_file_fingerprint(*file_id)
+            }
             FactKey::MemberFile(file_id) => self
                 .file_fingerprints
                 .get(file_id)
@@ -516,6 +519,36 @@ impl LuaMemberIndex {
         );
     }
 
+    /// `file_id`'s member-file fingerprint summed afresh, which is what the
+    /// incremental `file_fingerprints` sum holds.
+    fn recomputed_file_fingerprint(&self, file_id: FileId) -> Fingerprint {
+        let members = self
+            .in_filed
+            .get(&file_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| match entry {
+                MemberOrOwner::Member(id) => Some(file_member_element(*id)),
+                MemberOrOwner::Owner(_) => None,
+            });
+        let scopes = self
+            .function_scope_ranges
+            .get(&file_id)
+            .into_iter()
+            .flatten()
+            .map(|range| file_scope_element(file_id, *range));
+        let element_owners = self.owner_members.keys().filter_map(|owner| match owner {
+            LuaMemberOwner::Element(site) if site.file_id == file_id => {
+                Some(file_element_owner_element(site))
+            }
+            _ => None,
+        });
+        members
+            .chain(scopes)
+            .chain(element_owners)
+            .fold(ABSENT, Fingerprint::wrapping_add)
+    }
+
     fn fold_file_fingerprint(&mut self, file_id: FileId, element: Fingerprint, add: bool) {
         derivation::note_write(|| FactKey::MemberFile(file_id));
         fold_fingerprint(&mut self.file_fingerprints, file_id, element, add);
@@ -531,11 +564,7 @@ impl LuaMemberIndex {
             }
         }
         if let LuaMemberOwner::Element(range) = owner {
-            self.fold_file_fingerprint(
-                range.file_id,
-                file_element_owner_element(range.value),
-                false,
-            );
+            self.fold_file_fingerprint(range.file_id, file_element_owner_element(range), false);
         }
         Some(removed)
     }
@@ -1101,11 +1130,7 @@ impl LuaMemberIndex {
         if let LuaMemberOwner::Element(range) = &owner
             && !self.owner_members.contains_key(&owner)
         {
-            self.fold_file_fingerprint(
-                range.file_id,
-                file_element_owner_element(range.value),
-                true,
-            );
+            self.fold_file_fingerprint(range.file_id, file_element_owner_element(range), true);
         }
         let owner_members = self
             .owner_members
@@ -2338,7 +2363,7 @@ impl LuaMemberIndex {
         match ranges.binary_search_by_key(&range.start(), |range| range.start()) {
             Ok(index) | Err(index) => ranges.insert(index, range),
         }
-        self.fold_file_fingerprint(file_id, file_scope_element(range), true);
+        self.fold_file_fingerprint(file_id, file_scope_element(file_id, range), true);
     }
 
     pub fn enclosing_function_scope_range(
@@ -2829,7 +2854,7 @@ impl LuaMemberIndex {
             .remove(&file_id)
             .unwrap_or_default()
         {
-            self.fold_file_fingerprint(file_id, file_scope_element(range), false);
+            self.fold_file_fingerprint(file_id, file_scope_element(file_id, range), false);
         }
         self.remove_file_definition_sites(file_id);
         self.recompute_global_path_class_winners(file_id);

@@ -807,10 +807,12 @@ fn type_has_self_guard_metadata(semantic_model: &SemanticModel, typ: &LuaType) -
                     return true;
                 }
                 // Check for return_cast targeting self.
-                if let Some(cast) = db.get_flow_index().get_signature_cast(signature_id) {
-                    if cast.name == "self" {
-                        return true;
-                    }
+                if signature
+                    .return_cast
+                    .as_ref()
+                    .is_some_and(|cast| cast.name == "self")
+                {
+                    return true;
                 }
             }
             false

@@ -117,6 +117,16 @@ impl LuaCompilation {
 
     /// Runs `diagnose` recording what it reads as `file_id`'s diagnostics
     /// (`None`: the data every file's diagnostics share).
+    #[cfg(test)]
+    pub(crate) fn diagnostic_read_keys(&self) -> Vec<derivation::FactKey> {
+        self.diagnostic_reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .read_keys()
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn record_diagnostic_reads<T>(
         &self,
         file_id: Option<FileId>,

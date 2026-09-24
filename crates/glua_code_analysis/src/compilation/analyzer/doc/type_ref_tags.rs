@@ -1,9 +1,9 @@
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaClosureExpr,
-    LuaDocDescriptionOwner, LuaDocTagAs, LuaDocTagCast, LuaDocTagModule, LuaDocTagOther,
-    LuaDocTagOutparam, LuaDocTagOverload, LuaDocTagParam, LuaDocTagReturn, LuaDocTagReturnCast,
-    LuaDocTagSchema, LuaDocTagSee, LuaDocTagType, LuaDocTypeFlag, LuaExpr, LuaFuncStat,
-    LuaIndexExpr, LuaIndexKey, LuaLocalName, LuaTokenKind, LuaVarExpr,
+    LuaDocDescriptionOwner, LuaDocOpType, LuaDocTagAs, LuaDocTagCast, LuaDocTagModule,
+    LuaDocTagOther, LuaDocTagOutparam, LuaDocTagOverload, LuaDocTagParam, LuaDocTagReturn,
+    LuaDocTagReturnCast, LuaDocTagSchema, LuaDocTagSee, LuaDocTagType, LuaDocTypeFlag, LuaExpr,
+    LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLocalName, LuaTokenKind, LuaVarExpr,
 };
 use std::sync::Arc;
 
@@ -21,8 +21,9 @@ use crate::{
     },
 };
 use crate::{
-    InFiled, JsonSchemaFile, LuaCallArgRole, LuaOperatorMetaMethod, LuaTypeCache, LuaTypeOwner,
-    OVERLOAD_CALL_ARG_ATTRIBUTE, OperatorFunction, ReturnTypeKind, SignatureReturnStatus,
+    InFiled, JsonSchemaFile, LuaCallArgRole, LuaCastOp, LuaOperatorMetaMethod, LuaSignatureCast,
+    LuaTypeCache, LuaTypeOwner, OVERLOAD_CALL_ARG_ATTRIBUTE, OperatorFunction, ReturnTypeKind,
+    SignatureReturnStatus,
     compilation::analyzer::common::{TypeCacheWriteMode, bind_type, write_type_cache},
     db_index::{
         AccessorFuncAnnotation, LuaDeclId, LuaDocParamInfo, LuaDocReturnInfo, LuaInstanceType,
@@ -463,43 +464,37 @@ pub fn analyze_return(analyzer: &mut DocAnalyzer, tag: LuaDocTagReturn) -> Optio
     Some(())
 }
 
+/// Resolves one cast operation, binding its doc type's type as for any doc type.
+fn resolve_cast_op(analyzer: &mut DocAnalyzer, op_type: &LuaDocOpType) -> LuaCastOp {
+    let typ = op_type.get_type().map(|node_type| {
+        let typ = infer_type(analyzer, node_type.clone());
+        let type_owner =
+            LuaTypeOwner::SyntaxId(InFiled::new(analyzer.file_id, node_type.get_syntax_id()));
+        bind_type(analyzer.db, type_owner, LuaTypeCache::DocType(typ.clone()));
+        typ
+    });
+    LuaCastOp::new(op_type, typ)
+}
+
 pub fn analyze_return_cast(analyzer: &mut DocAnalyzer, tag: LuaDocTagReturnCast) -> Option<()> {
     if let Some(LuaSemanticDeclId::Signature(signature_id)) = get_owner_id(analyzer, None, false) {
         let name_token = tag.get_name_token()?;
         let name = name_token.get_name_text();
 
-        let op_types: Vec<_> = tag.get_op_types().collect();
-        let cast_op_type = op_types.first()?;
-
-        // Bind the true condition type
-        if let Some(node_type) = cast_op_type.get_type() {
-            let typ = infer_type(analyzer, node_type.clone());
-            let infiled_syntax_id = InFiled::new(analyzer.file_id, node_type.get_syntax_id());
-            let type_owner = LuaTypeOwner::SyntaxId(infiled_syntax_id);
-            bind_type(analyzer.db, type_owner, LuaTypeCache::DocType(typ));
-        };
-
-        // Bind the false condition type if present
-        let fallback_cast = if op_types.len() > 1 {
-            let fallback_op_type = &op_types[1];
-            if let Some(node_type) = fallback_op_type.get_type() {
-                let typ = infer_type(analyzer, node_type.clone());
-                let infiled_syntax_id = InFiled::new(analyzer.file_id, node_type.get_syntax_id());
-                let type_owner = LuaTypeOwner::SyntaxId(infiled_syntax_id);
-                bind_type(analyzer.db, type_owner, LuaTypeCache::DocType(typ));
-            }
-            Some(fallback_op_type.to_ptr())
-        } else {
-            None
-        };
-
-        analyzer.db.get_flow_index_mut().add_signature_cast(
-            analyzer.file_id,
-            signature_id,
-            name.to_string(),
-            cast_op_type.to_ptr(),
+        let mut ops = tag
+            .get_op_types()
+            .map(|op_type| resolve_cast_op(analyzer, &op_type));
+        let cast = ops.next()?;
+        let fallback_cast = ops.next();
+        analyzer
+            .db
+            .get_signature_index_mut()
+            .get_or_create(signature_id)
+            .return_cast = Some(LuaSignatureCast {
+            name: name.to_string(),
+            cast,
             fallback_cast,
-        );
+        });
     } else {
         report_orphan_tag(analyzer, &tag);
     }

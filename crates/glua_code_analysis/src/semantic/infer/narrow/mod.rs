@@ -16,7 +16,7 @@ use crate::{
     },
 };
 pub(crate) use condition_flow::InferConditionFlow;
-pub(crate) use get_type_at_cast_flow::cast_type;
+pub(crate) use get_type_at_cast_flow::apply_cast;
 pub use get_type_at_cast_flow::get_type_at_call_expr_inline_cast;
 pub use get_type_at_flow::{
     explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,

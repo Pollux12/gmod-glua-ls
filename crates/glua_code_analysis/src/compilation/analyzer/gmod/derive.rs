@@ -19,6 +19,15 @@ pub(crate) struct GmodCallRoles {
     pub(super) roles: Arc<AnnotatedGmodGlobalCallRoleMap>,
 }
 
+impl crate::db_index::derivation::DerivedFact for GmodCallRoles {
+    fn fingerprint(&self) -> crate::db_index::derivation::Fingerprint {
+        crate::db_index::derivation::fingerprint_of(&(
+            self.registry.fingerprint(),
+            self.roles.fingerprint(),
+        ))
+    }
+}
+
 /// The current call roles, or empty ones before the fold first ran.
 pub(super) fn call_roles(db: &DbIndex) -> Arc<GmodCallRoles> {
     db.get_gmod_call_roles::<GmodCallRoles>()
@@ -37,11 +46,9 @@ pub(crate) fn evaluate_call_roles(db: &mut DbIndex) {
         return;
     }
     let (registry, roles) = build_call_roles_and_registry(db);
-    let fingerprint =
-        crate::db_index::derivation::fingerprint_of(&(registry.fingerprint(), roles.fingerprint()));
     db.get_gmod_network_index_mut()
         .set_canonical_ops(roles.canonical_net_ops());
-    db.set_gmod_call_roles(Arc::new(GmodCallRoles { registry, roles }), fingerprint);
+    db.set_gmod_call_roles(Arc::new(GmodCallRoles { registry, roles }));
 }
 
 /// The functions that can produce a net operation, directly or through other

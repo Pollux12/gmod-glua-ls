@@ -1,5 +1,7 @@
+use crate::db_index::derivation::{FilePosition, hash_local};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use rowan::TextRange;
@@ -81,7 +83,7 @@ impl NetOpDescriptor {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetOpEntry {
     pub op: NetOpDescriptor,
     /// Source path of the function actually called, e.g. `net.WriteString` or a
@@ -118,7 +120,30 @@ pub struct NetOpEntry {
     pub flow_path: Vec<NetFlowFrame>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl Hash for NetOpEntry {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            op,
+            display_name,
+            range,
+            dynamic,
+            bits,
+            has_bits_param,
+            value_text,
+            flow_path,
+        } = self;
+        op.hash(state);
+        display_name.hash(state);
+        hash_local(range, state);
+        dynamic.hash(state);
+        bits.hash(state);
+        has_bits_param.hash(state);
+        value_text.hash(state);
+        flow_path.hash(state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetFlowFrame {
     pub kind: NetFlowKind,
     /// Single-line summary of the statement opener: `if cond then`,
@@ -131,6 +156,15 @@ pub struct NetFlowFrame {
     /// Range start of the statement node — different statements have
     /// different ranges, so equal `id` means literally the same source frame.
     pub id: u32,
+}
+
+impl Hash for NetFlowFrame {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self { kind, header, id } = self;
+        kind.hash(state);
+        header.hash(state);
+        hash_local(&rowan::TextSize::from(*id), state);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -176,13 +210,24 @@ pub struct NetSendKind {
 }
 
 /// Definition-site transaction represented by a complete helper call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetFlowOrigin {
     pub file_id: FileId,
     pub start_range: TextRange,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl Hash for NetFlowOrigin {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            file_id,
+            start_range,
+        } = self;
+        file_id.hash(state);
+        start_range.hash_in_file(*file_id, state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetSendFlow {
     pub message_name: String,
     pub start_range: TextRange,
@@ -210,7 +255,32 @@ pub struct NetSendFlow {
     pub materialized_from: Option<NetFlowOrigin>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl Hash for NetSendFlow {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            message_name,
+            start_range,
+            writes,
+            send_range,
+            send_kind,
+            send_display_name,
+            send_target,
+            is_wrapped,
+            materialized_from,
+        } = self;
+        message_name.hash(state);
+        hash_local(start_range, state);
+        writes.hash(state);
+        hash_local(send_range, state);
+        send_kind.hash(state);
+        send_display_name.hash(state);
+        send_target.hash(state);
+        is_wrapped.hash(state);
+        materialized_from.hash(state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetReceiveFlow {
     pub message_name: String,
     pub receive_range: TextRange,
@@ -221,6 +291,21 @@ pub struct NetReceiveFlow {
     /// must be skipped for read/write mismatch diagnostics — we cannot
     /// inspect their reads, so any count comparison would be unreliable.
     pub reads_opaque: bool,
+}
+
+impl Hash for NetReceiveFlow {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            message_name,
+            receive_range,
+            reads,
+            reads_opaque,
+        } = self;
+        message_name.hash(state);
+        hash_local(receive_range, state);
+        reads.hash(state);
+        reads_opaque.hash(state);
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -261,6 +346,12 @@ pub struct GmodNetworkIndex {
     canonical_ops_fingerprint: Fingerprint,
 }
 
+fn file_data_fingerprint(file_id: FileId, data: &FileNetworkData) -> Fingerprint {
+    derivation::in_file(Some(file_id), || {
+        derivation::fingerprint_of(&(file_id, data))
+    })
+}
+
 impl GmodNetworkIndex {
     pub fn new() -> Self {
         Self {
@@ -282,6 +373,13 @@ impl GmodNetworkIndex {
                 derivation::fingerprint_opt(self.file_data.get(file_id))
             }
             FactKey::NetHelperNames => self.helper_names_fingerprint,
+            FactKey::NetworkScan if derivation::mapping_back() => self
+                .file_data
+                .iter()
+                .fold(0, |sum: Fingerprint, (file_id, data)| {
+                    sum.wrapping_add(file_data_fingerprint(*file_id, data))
+                })
+                .wrapping_add(self.canonical_ops_fingerprint),
             FactKey::NetworkScan => self
                 .flows_fingerprint
                 .wrapping_add(self.canonical_ops_fingerprint),
@@ -494,7 +592,7 @@ impl GmodNetworkIndex {
         derivation::note_write(|| FactKey::NetworkScan);
         self.flows_fingerprint = self
             .flows_fingerprint
-            .wrapping_add(derivation::fingerprint_of(&(file_id, data)));
+            .wrapping_add(file_data_fingerprint(file_id, data));
         for (flow_idx, send_flow) in data.send_flows.iter().enumerate() {
             self.send_flows_by_message
                 .entry(send_flow.message_name.clone())
@@ -520,7 +618,7 @@ impl GmodNetworkIndex {
         derivation::note_write(|| FactKey::NetworkScan);
         self.flows_fingerprint = self
             .flows_fingerprint
-            .wrapping_sub(derivation::fingerprint_of(&(file_id, data)));
+            .wrapping_sub(file_data_fingerprint(file_id, data));
         for send_flow in &data.send_flows {
             if let Some(origin) = send_flow.materialized_from {
                 let key = (origin.file_id, origin.start_range);

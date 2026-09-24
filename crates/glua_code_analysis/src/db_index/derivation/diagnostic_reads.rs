@@ -23,6 +23,12 @@ impl DiagnosticReads {
         self.files.insert(file_id, reads.into_iter().collect());
     }
 
+    /// Every key some file's diagnostics or the shared data read.
+    #[cfg(test)]
+    pub fn read_keys(&self) -> impl Iterator<Item = &FactKey> {
+        self.readers.keys().chain(self.shared.keys())
+    }
+
     /// Replaces the shared data's reads.
     pub fn record_shared(&mut self, reads: Vec<(FactKey, Fingerprint)>) {
         self.shared = reads.into_iter().collect();

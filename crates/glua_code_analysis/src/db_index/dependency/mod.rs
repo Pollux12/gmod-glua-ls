@@ -1,6 +1,8 @@
 mod file_dependency_relation;
 
+use crate::db_index::derivation::FilePosition;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::hash::{Hash, Hasher};
 
 use file_dependency_relation::FileDependencyRelation;
 use rowan::TextRange;
@@ -21,7 +23,7 @@ pub enum LuaDependencyKind {
     IncludeCS,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LuaDependencySite {
     pub source_file_id: FileId,
     pub target_file_id: Option<FileId>,
@@ -35,6 +37,29 @@ pub struct LuaDependencySite {
     /// range used by load diagnostics.
     pub call_range: TextRange,
     pub range: TextRange,
+}
+
+impl Hash for LuaDependencySite {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            source_file_id,
+            target_file_id,
+            kind,
+            path,
+            path_keys,
+            original_expr,
+            call_range,
+            range,
+        } = self;
+        source_file_id.hash(state);
+        target_file_id.hash(state);
+        kind.hash(state);
+        path.hash(state);
+        path_keys.hash(state);
+        original_expr.hash(state);
+        call_range.hash_in_file(*source_file_id, state);
+        range.hash_in_file(*source_file_id, state);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

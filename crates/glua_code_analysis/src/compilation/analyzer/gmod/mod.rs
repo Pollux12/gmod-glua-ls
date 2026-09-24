@@ -474,12 +474,16 @@ pub(crate) struct FileHelperScan {
     definitions: Vec<IndexedHelperDefinition>,
 }
 
-impl FileHelperScan {
+impl crate::db_index::derivation::DerivedFact for FileHelperScan {
     fn fingerprint(&self) -> crate::db_index::derivation::Fingerprint {
-        crate::db_index::derivation::fingerprint_of(&(
-            self.role_map.fingerprint(),
-            &self.definitions,
-        ))
+        let definitions = self
+            .definitions
+            .iter()
+            .map(|(signature_id, file_id, syntax_id, global)| {
+                (signature_id, InFiled::new(*file_id, *syntax_id), global)
+            })
+            .collect::<Vec<_>>();
+        crate::db_index::derivation::fingerprint_of(&(self.role_map.fingerprint(), definitions))
     }
 }
 
@@ -504,8 +508,7 @@ pub(crate) fn evaluate_helper_scan(db: &mut DbIndex, file_id: FileId) {
             .any(|node| LuaCallExpr::can_cast(node.kind().into()))
     });
     let scan = AnnotatedGmodGlobalCallRoleMap::build_for_file(db, &signature_ids, has_calls);
-    let fingerprint = scan.fingerprint();
-    db.set_helper_scan(file_id, Arc::new(scan), fingerprint);
+    db.set_helper_scan(file_id, Arc::new(scan));
 }
 
 /// Folds every file's helper scan into the call-role map and the net-helper
