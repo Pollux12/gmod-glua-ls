@@ -588,6 +588,11 @@ pub struct Evaluation {
 }
 
 impl Evaluation {
+    /// The keys the evaluation wrote.
+    pub fn outputs(&self) -> impl Iterator<Item = &FactKey> {
+        self.outputs.iter()
+    }
+
     /// Fingerprints the reads made so far, for an evaluation suspended while
     /// other evaluations run: what it read is compared with what it saw, not
     /// with what they wrote afterwards.

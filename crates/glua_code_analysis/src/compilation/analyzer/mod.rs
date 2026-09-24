@@ -125,6 +125,7 @@ pub(crate) fn reanalyze(
         let scopes = ScriptedScopes::new(db);
         engine.note_rebuilt(&pending);
         let touched = replace_files(db, &mut engine, &pending, &scopes);
+        engine.forget_fingerprints();
         engine.readers_of(db, touched.iter());
         let recipes = derive::Recipes::new(db, scopes);
         engine.run(db, &mut |db, id| recipes.evaluate(db, id));

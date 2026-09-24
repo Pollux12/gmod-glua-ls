@@ -21,6 +21,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use std::cell::RefCell;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::DbIndex;
@@ -93,6 +95,10 @@ pub(crate) struct Engine {
     edits: derivation::EditMaps,
     /// Whether other files' references still have to follow `edits`.
     edits_pending: bool,
+    /// Fingerprints taken since the key was last written. Every write inside
+    /// an evaluation is one of its outputs, so a group's outputs are the only
+    /// keys it can move; writes outside `run` clear the whole cache.
+    fingerprints: RefCell<FxHashMap<FactKey, derivation::Fingerprint>>,
 }
 
 impl Engine {
@@ -125,7 +131,7 @@ impl Engine {
         let current = std::cell::OnceCell::new();
         let before_edits = std::cell::OnceCell::new();
         move |seen| {
-            seen == *current.get_or_init(|| db.fact_fingerprint(key))
+            seen == *current.get_or_init(|| self.fingerprint(db, key))
                 || (!self.edits.is_empty()
                     && seen
                         == *before_edits.get_or_init(|| {
@@ -134,6 +140,50 @@ impl Engine {
                             })
                         }))
         }
+    }
+
+    /// `key`'s current fingerprint, taken once per value.
+    fn fingerprint(&self, db: &DbIndex, key: &FactKey) -> derivation::Fingerprint {
+        if let Some(cached) = self.fingerprints.borrow().get(key).copied() {
+            if check_fingerprints() {
+                assert_eq!(
+                    cached,
+                    db.fact_fingerprint(key),
+                    "{key:?} moved without being written"
+                );
+            }
+            return cached;
+        }
+        let fingerprint = db.fact_fingerprint(key);
+        self.fingerprints
+            .borrow_mut()
+            .insert(key.clone(), fingerprint);
+        fingerprint
+    }
+
+    /// Under `GLUALS_CHECK_FINGERPRINTS`, panics if a cached key other than
+    /// `except` no longer holds its cached fingerprint.
+    fn verify_fingerprints(
+        &self,
+        db: &DbIndex,
+        except: &FxHashSet<FactKey>,
+        step: impl Fn() -> String,
+    ) {
+        if !check_fingerprints() {
+            return;
+        }
+        for (key, cached) in self.fingerprints.borrow().iter() {
+            assert!(
+                except.contains(key) || *cached == db.fact_fingerprint(key),
+                "{key:?} moved without being written while {}",
+                step()
+            );
+        }
+    }
+
+    /// Forgets every cached fingerprint: the index changed outside `run`.
+    pub(crate) fn forget_fingerprints(&mut self) {
+        self.fingerprints.get_mut().clear();
     }
 
     pub(crate) fn changed(&mut self, id: DerivationId) {
@@ -244,7 +294,7 @@ impl Engine {
                     .reader_graph()
                     .reads_of(id)
                     .iter()
-                    .map(|key| db.fact_fingerprint(key))
+                    .map(|key| self.fingerprint(db, key))
                     .collect();
                 // A read that held only with the edit mapped back saw positions
                 // the edit moved; outputs made from them are right only if the
@@ -272,7 +322,7 @@ impl Engine {
                     .filter(|file_id| *file_id != crate::FileId::VIRTUAL),
             );
             let started = self.stats.profiling().then(std::time::Instant::now);
-            let touched = evaluate_group(db, &group, recipe);
+            let touched = self.evaluate_group(db, &group, recipe);
             if let Some(started) = started {
                 *self.stats.time.entry(id.kind).or_default() += started.elapsed();
                 for member in &group {
@@ -306,6 +356,52 @@ impl Engine {
             self.readers_of(db, touched.iter());
         }
         self.cursor = None;
+    }
+
+    /// Resets the group's primary outputs and re-runs it. Returns every key the
+    /// group touched: its previous outputs and its new ones.
+    fn evaluate_group(
+        &self,
+        db: &mut DbIndex,
+        group: &[DerivationId],
+        recipe: &mut dyn FnMut(&mut DbIndex, DerivationId),
+    ) -> FxHashSet<FactKey> {
+        let mut touched = FxHashSet::default();
+        for member in group {
+            touched.extend(db.reader_graph().outputs_of(*member).iter().cloned());
+        }
+        let reset = derivation::capture_writes(|| {
+            for key in touched.iter().filter(|key| key.is_primary()) {
+                db.reset_fact(key);
+            }
+        });
+        touched.extend(reset);
+        self.verify_fingerprints(db, &touched, || format!("resetting {group:?}"));
+        // Fingerprints are taken once the whole group has run: the group always
+        // re-runs as a unit, so a member's read of what a later member writes is
+        // internal to it, not a stale input.
+        let mut evaluations = Vec::with_capacity(group.len());
+        for member in group {
+            derivation::begin(*member);
+            recipe(db, *member);
+            evaluations.push(derivation::end());
+        }
+        {
+            let mut fingerprints = self.fingerprints.borrow_mut();
+            for key in touched
+                .iter()
+                .chain(evaluations.iter().flat_map(derivation::Evaluation::outputs))
+            {
+                fingerprints.remove(key);
+            }
+        }
+        self.verify_fingerprints(db, &touched, || format!("evaluating {group:?}"));
+        for evaluation in evaluations {
+            let (id, reads, outputs) = evaluation.into_parts(|key| self.fingerprint(db, key));
+            touched.extend(outputs.iter().cloned());
+            db.reader_graph_mut().replace(id, reads, outputs);
+        }
+        touched
     }
 }
 
@@ -430,36 +526,9 @@ fn co_producers(db: &DbIndex, id: DerivationId) -> Vec<DerivationId> {
     group.into_iter().collect()
 }
 
-/// Resets the group's primary outputs and re-runs it. Returns every key the
-/// group touched: its previous outputs and its new ones.
-fn evaluate_group(
-    db: &mut DbIndex,
-    group: &[DerivationId],
-    recipe: &mut dyn FnMut(&mut DbIndex, DerivationId),
-) -> FxHashSet<FactKey> {
-    let mut touched = FxHashSet::default();
-    for member in group {
-        touched.extend(db.reader_graph().outputs_of(*member).iter().cloned());
-    }
-    let reset = derivation::capture_writes(|| {
-        for key in touched.iter().filter(|key| key.is_primary()) {
-            db.reset_fact(key);
-        }
-    });
-    touched.extend(reset);
-    // Fingerprints are taken once the whole group has run: the group always
-    // re-runs as a unit, so a member's read of what a later member writes is
-    // internal to it, not a stale input.
-    let mut evaluations = Vec::with_capacity(group.len());
-    for member in group {
-        derivation::begin(*member);
-        recipe(db, *member);
-        evaluations.push(derivation::end());
-    }
-    for evaluation in evaluations {
-        let (id, reads, outputs) = evaluation.into_parts(|key| db.fact_fingerprint(key));
-        touched.extend(outputs.iter().cloned());
-        db.reader_graph_mut().replace(id, reads, outputs);
-    }
-    touched
+/// `GLUALS_CHECK_FINGERPRINTS`: recompute every cached fingerprint and panic on
+/// a key that moved without being written.
+fn check_fingerprints() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("GLUALS_CHECK_FINGERPRINTS").is_some())
 }
