@@ -3350,7 +3350,8 @@ fn special_assign_pattern(
                     reads_out_of_decl: false,
                     may_narrow_uninformative: false,
                     resolved_initializer: false,
-                    fills_own_default: false,
+                    // `x = x or <default>`, matched above.
+                    fills_own_default: true,
                 },
             );
         }

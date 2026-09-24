@@ -405,11 +405,15 @@ pub fn bind_decl_write(
         // Only a default fill: a reassignment to something else — splitting a
         // string parameter into a list, say — states what the parameter becomes
         // further down one branch, not what it was passed.
+        //
+        // Anything else is not the parameter's type: binding it would make a
+        // read before the write (`local copy = arg; arg = { copy }`) see the
+        // write's value, and through it its own.
         if fills_own_default {
             let widened = widen_mutable_decl_literal(db, &type_owner, type_cache);
             return bind_resolved_type(db, type_owner, widened);
         }
-        return fallback(db, type_cache);
+        return Some(());
     }
     let seeded = widen_mutable_decl_literal(db, &type_owner, type_cache.clone());
     let seeds = match db.get_type_index().get_type_cache(&type_owner) {

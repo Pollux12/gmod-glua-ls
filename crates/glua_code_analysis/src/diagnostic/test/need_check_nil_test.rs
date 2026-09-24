@@ -6294,6 +6294,7 @@ mod test {
             ROLE_COLORS = {}
             COLOR_WHITE = { r = 255 }
 
+            ---@param color table
             local function ModifyColor(color, mode)
                 if mode == "bad" then
                     color = nil

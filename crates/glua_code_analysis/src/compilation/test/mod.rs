@@ -35,6 +35,7 @@ mod overload_test;
 mod pcall_test;
 mod retraction_test;
 mod return_unwrap_test;
+mod self_nesting_cycle_test;
 mod stack_exhaustion_test;
 mod static_cal_cmp;
 mod syntax_error_test;
