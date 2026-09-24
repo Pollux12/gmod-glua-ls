@@ -905,28 +905,15 @@ fn net_helper_call_sites(
     names: HashSet<SmolStr>,
     collected_files: &FxHashSet<FileId>,
 ) -> NetHelperCallSites {
-    let mut by_file: FxHashMap<FileId, Vec<LuaSyntaxId>> = FxHashMap::default();
     let reference_index = db.get_reference_index();
-    for name in &names {
-        let member_key = LuaMemberKey::Name(name.clone());
-        for reference in reference_index
-            .get_index_references(&member_key)
-            .into_iter()
-            .flatten()
-            .chain(
-                reference_index
-                    .get_global_references(name)
-                    .into_iter()
-                    .flatten(),
-            )
-        {
-            if !collected_files.contains(&reference.file_id) {
-                continue;
-            }
-            by_file
-                .entry(reference.file_id)
-                .or_default()
-                .push(reference.value);
+    let mut by_file: FxHashMap<FileId, Vec<LuaSyntaxId>> = FxHashMap::default();
+    for file_id in collected_files {
+        let sites = names
+            .iter()
+            .flat_map(|name| reference_index.name_sites_in_file(name, *file_id))
+            .collect::<Vec<_>>();
+        if !sites.is_empty() {
+            by_file.insert(*file_id, sites);
         }
     }
     // Source order, so a file's flows are collected in the same order the walk

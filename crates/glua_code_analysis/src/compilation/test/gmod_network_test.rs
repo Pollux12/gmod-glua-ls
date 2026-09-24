@@ -454,4 +454,48 @@ mod test {
         assert_that!(chained.len(), ge(1usize));
         assert_that!(send_op_kinds(chained[0]), eq(&vec!["string".to_string()]));
     }
+
+    #[gtest]
+    fn a_files_network_flows_read_only_its_own_helper_call_sites() {
+        use crate::db_index::derivation::{DerivationKind, FactKey};
+
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "addons/mytest/lua/autorun/client/helpers.lua",
+            r#"
+            function SendPing()
+                net.Start("Ping")
+                net.SendToServer()
+            end
+            "#,
+        );
+        let caller = ws.def_file(
+            "addons/mytest/lua/autorun/client/caller.lua",
+            r#"
+            SendPing()
+            "#,
+        );
+        ws.def_file(
+            "addons/mytest/lua/autorun/client/other.lua",
+            r#"
+            SendPing()
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let network = db
+            .reader_graph()
+            .derivations_of_file(caller)
+            .find(|id| id.kind == DerivationKind::Network)
+            .expect("the caller has a network derivation");
+        let workspace_wide = db
+            .reader_graph()
+            .reads_of(network)
+            .iter()
+            .filter(|key| matches!(key, FactKey::ReferencesByName(_)))
+            .cloned()
+            .collect::<Vec<_>>();
+        expect_that!(workspace_wide, is_empty());
+    }
 }

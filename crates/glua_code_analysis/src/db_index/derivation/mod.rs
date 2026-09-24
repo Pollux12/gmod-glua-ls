@@ -190,6 +190,8 @@ pub enum FactKey {
     References(FileId),
     /// Name-keyed references across files.
     ReferencesByName(SmolStr),
+    /// The references to a name in one file, derived ones included.
+    NameReferencesInFile(SmolStr, FileId),
     /// Numeric-range populations of one global table.
     NumericPopulation(SmolStr),
     /// Accessor-function annotations of one function name.
@@ -387,6 +389,7 @@ impl FactKey {
             | K::LoadSites(file_id)
             | K::DiagnosticFile(file_id)
             | K::CallSiteFile(file_id)
+            | K::NameReferencesInFile(_, file_id)
             | K::FileText(file_id) => Some(*file_id),
             K::DynamicField(DynamicFieldOwner::Table(site), _) => Some(site.file_id),
             K::OperatorOwner(LuaOperatorOwner::Table(site)) => Some(site.file_id),

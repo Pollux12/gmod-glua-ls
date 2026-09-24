@@ -336,6 +336,9 @@ impl LuaReferenceIndex {
                 .get(name)
                 .copied()
                 .unwrap_or(derivation::ABSENT),
+            FactKey::NameReferencesInFile(name, file_id) => {
+                self.name_sites_in_file_fingerprint(name, *file_id)
+            }
             FactKey::ReferenceContrib(id) => {
                 derivation::fingerprint_opt(self.derived_index_reference_holders.get(id))
             }
@@ -379,6 +382,73 @@ impl LuaReferenceIndex {
             )
             .copied()
             .collect()
+    }
+
+    /// Every site in `file_id` that references `name`, including the index
+    /// references derivations resolved: [`Self::get_global_references`] and
+    /// [`Self::get_index_references`] narrowed to one file, read as that file's
+    /// fact alone.
+    pub fn name_sites_in_file(&self, name: &SmolStr, file_id: FileId) -> Vec<LuaSyntaxId> {
+        derivation::note_read(|| FactKey::NameReferencesInFile(name.clone(), file_id));
+        let member_key = LuaMemberKey::Name(name.clone());
+        let mut sites = self
+            .global_references
+            .get(name)
+            .and_then(|references| references.get(&file_id))
+            .into_iter()
+            .flatten()
+            .chain(
+                self.index_reference
+                    .get(&member_key)
+                    .and_then(|references| references.get(&file_id))
+                    .into_iter()
+                    .flatten(),
+            )
+            .copied()
+            .collect::<Vec<_>>();
+        sites.extend(
+            self.derived_index_reference
+                .get(&member_key)
+                .into_iter()
+                .flat_map(|derived| derived.keys())
+                .filter(|(site_file, _)| *site_file == file_id)
+                .map(|(_, syntax_id)| *syntax_id),
+        );
+        sites
+    }
+
+    /// What [`Self::name_sites_in_file`] can observe.
+    fn name_sites_in_file_fingerprint(&self, name: &SmolStr, file_id: FileId) -> Fingerprint {
+        let member_key = LuaMemberKey::Name(name.clone());
+        let globals = self
+            .global_references
+            .get(name)
+            .and_then(|references| references.get(&file_id))
+            .into_iter()
+            .flatten()
+            .map(|syntax_id| global_reference_fingerprint(file_id, name, syntax_id));
+        let indexes = self
+            .index_reference
+            .get(&member_key)
+            .and_then(|references| references.get(&file_id))
+            .into_iter()
+            .flatten()
+            .map(|syntax_id| index_reference_fingerprint(file_id, &member_key, syntax_id));
+        let derived = self
+            .derived_index_reference
+            .get(&member_key)
+            .into_iter()
+            .flat_map(|derived| derived.keys())
+            .filter(|(site_file, _)| *site_file == file_id)
+            .map(|(_, syntax_id)| {
+                // Distinct from a source site at the same place: a derived
+                // reference is listed alongside it.
+                derivation::fingerprint_of(&(3u8, &member_key, InFiled::new(file_id, *syntax_id)))
+            });
+        globals
+            .chain(indexes)
+            .chain(derived)
+            .fold(derivation::ABSENT, Fingerprint::wrapping_add)
     }
 
     pub fn add_decl_reference(
@@ -619,9 +689,11 @@ impl LuaReferenceIndex {
             })
             .collect::<Vec<_>>();
         for (file_id, syntax_id) in derived.into_iter().flat_map(|sites| sites.keys()) {
-            let reference = InFiled::new(*file_id, *syntax_id);
-            if !results.contains(&reference) {
-                results.push(reference);
+            let in_source = source
+                .and_then(|by_file| by_file.get(file_id))
+                .is_some_and(|sites| sites.contains(syntax_id));
+            if !in_source {
+                results.push(InFiled::new(*file_id, *syntax_id));
             }
         }
         Some(results)

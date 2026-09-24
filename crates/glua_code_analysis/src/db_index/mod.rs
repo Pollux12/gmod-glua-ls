@@ -344,9 +344,10 @@ impl DbIndex {
             K::HelperScanFiles => self.helper_scan_files.get(),
             K::Property(_) | K::DeclDefault(_) => self.property_index.fact_fingerprint(key),
             K::Global(_) | K::GlobalScan => self.global_index.fact_fingerprint(key),
-            K::References(_) | K::ReferencesByName(_) | K::ReferenceContrib(_) => {
-                self.references_index.fact_fingerprint(key)
-            }
+            K::References(_)
+            | K::ReferencesByName(_)
+            | K::NameReferencesInFile(..)
+            | K::ReferenceContrib(_) => self.references_index.fact_fingerprint(key),
             K::NumericPopulation(_) => self.numeric_range_population_index.fact_fingerprint(key),
             K::AccessorFunc(_) => self.accessor_func_index.fact_fingerprint(key),
             K::AccessorCalls(_) => self.accessor_func_call_index.fact_fingerprint(key),
