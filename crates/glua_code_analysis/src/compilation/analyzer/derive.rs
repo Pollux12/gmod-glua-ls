@@ -56,6 +56,7 @@ pub(super) fn file_derivations(
         DerivationKind::SetmetatableFactory,
         DerivationKind::CallSiteParams,
         DerivationKind::LocalFallbacks,
+        DerivationKind::NetHelpers,
         DerivationKind::Network,
     ] {
         ids.push(DerivationId::new(kind, file_id, chunk));
@@ -98,6 +99,7 @@ impl Recipes {
     pub(super) fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
         match id.kind {
             DerivationKind::GmodHelperScan => gmod::evaluate_helper_scan(db, id.file_id),
+            DerivationKind::NetHelpers => gmod::evaluate_net_helpers(db, id.file_id),
             DerivationKind::ValidGuardScan => {
                 crate::db_index::scan_valid_guard_signatures(db, id.file_id)
             }
@@ -171,6 +173,7 @@ impl Recipes {
             DerivationKind::Network => gmod::evaluate_network(db, context),
             DerivationKind::Source
             | DerivationKind::GmodHelperScan
+            | DerivationKind::NetHelpers
             | DerivationKind::ValidGuardScan
             | DerivationKind::GmodCallRoles
             | DerivationKind::NetHelperNames

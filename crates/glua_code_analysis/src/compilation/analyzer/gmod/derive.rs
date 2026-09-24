@@ -95,7 +95,7 @@ pub(crate) fn evaluate_pre(db: &mut DbIndex, context: &mut AnalyzeContext) {
             branch_ranges,
             annotation_realm,
             file_params,
-        } = collect_file_gmod_metadata(db, file_id, &roles.registry, &prefixes, &roles.roles);
+        } = collect_file_gmod_metadata(db, file_id, &prefixes, &roles.roles);
         if let Some((hook_sites, system_metadata, gm_method_realms)) = hook_metadata {
             db.get_gmod_infer_index_mut()
                 .add_hook_sites(file_id, hook_sites);
@@ -227,6 +227,5 @@ pub(crate) fn evaluate_network(db: &mut DbIndex, context: &mut AnalyzeContext) {
     if !db.get_emmyrc().gmod.enabled {
         return;
     }
-    let roles = call_roles(db);
-    collect_network_flows(db, context, &roles.registry, &roles.roles);
+    network::collect_network_flows(db, context);
 }

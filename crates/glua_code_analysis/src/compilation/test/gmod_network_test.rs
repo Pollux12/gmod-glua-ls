@@ -533,4 +533,86 @@ end
 
         expect_that!(network_reads(40), eq(network_reads(5)));
     }
+
+    fn define_send_ping_helper(ws: &mut VirtualWorkspace) -> crate::FileId {
+        ws.def_file(
+            "addons/mytest/lua/autorun/server/helpers.lua",
+            r#"
+            function SendPing(target)
+                net.Start("Ping")
+                net.WriteString("payload")
+                net.Send(target)
+            end
+            "#,
+        )
+    }
+
+    #[gtest]
+    fn a_callers_network_flows_read_the_helpers_summary_not_its_body() {
+        use crate::db_index::derivation::{DerivationKind, FactKey};
+
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let helpers = define_send_ping_helper(&mut ws);
+        let caller = ws.def_file(
+            "addons/mytest/lua/autorun/server/caller.lua",
+            "SendPing(ply)\n",
+        );
+
+        let db = ws.get_db_mut();
+        let flows = db
+            .get_gmod_network_index()
+            .get_file_data(caller)
+            .expect("the caller has network data")
+            .send_flows
+            .clone();
+        assert_that!(flows.len(), eq(1usize));
+        expect_that!(flows[0].message_name, eq("Ping"));
+        expect_that!(send_op_kinds(&flows[0]), eq(&vec!["string".to_string()]));
+        expect_that!(
+            flows[0].materialized_from.map(|origin| origin.file_id),
+            some(eq(helpers))
+        );
+
+        let network = db
+            .reader_graph()
+            .derivations_of_file(caller)
+            .find(|id| id.kind == DerivationKind::Network)
+            .expect("the caller has a network derivation");
+        let reads = db
+            .reader_graph()
+            .reads_of(network)
+            .cloned()
+            .collect::<Vec<_>>();
+        expect_that!(reads.contains(&FactKey::NetHelpers(helpers)), eq(true));
+        expect_that!(reads.contains(&FactKey::FileText(helpers)), eq(false));
+    }
+
+    #[gtest]
+    fn reindexing_a_caller_does_not_reanalyse_the_helper_body() {
+        use crate::db_index::derivation::DerivationKind;
+
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        define_send_ping_helper(&mut ws);
+        for i in 0..3 {
+            ws.def_file(
+                &format!("addons/mytest/lua/autorun/server/caller{i}.lua"),
+                "SendPing(ply)\n",
+            );
+        }
+        let caller_path = "addons/mytest/lua/autorun/server/caller0.lua";
+        let caller = ws.def_file(caller_path, "SendPing(ply)\nSendPing(ply)\n");
+
+        let stats = ws.analysis.compilation.last_stats();
+        expect_that!(stats.evaluations(DerivationKind::NetHelpers), eq(1));
+        let flows = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(caller)
+            .expect("the caller has network data")
+            .send_flows
+            .len();
+        expect_that!(flows, eq(2usize));
+    }
 }

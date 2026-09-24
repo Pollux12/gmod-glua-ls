@@ -178,6 +178,8 @@ pub enum FactKey {
     HelperScanFiles,
     /// The names of functions that can produce a net operation.
     NetHelperNames,
+    /// One file's net call roles and function-body net summaries.
+    NetHelpers(FileId),
     /// A property (docs, attributes, visibility) of a semantic declaration.
     Property(LuaSemanticDeclId),
     /// A declaration's inferred string default.
@@ -277,6 +279,7 @@ impl FactKey {
                 | K::NetworkFile(_)
                 | K::HelperRegistry
                 | K::HelperScan(_)
+                | K::NetHelpers(_)
                 | K::DeclDefault(_)
                 | K::AccessorCalls(_)
                 | K::LoadSites(_)
@@ -383,6 +386,7 @@ impl FactKey {
             | K::GmodLoadFile(file_id)
             | K::NetworkFile(file_id)
             | K::HelperScan(file_id)
+            | K::NetHelpers(file_id)
             | K::References(file_id)
             | K::AccessorCalls(file_id)
             | K::Dependency(file_id)
@@ -488,6 +492,8 @@ pub enum DerivationKind {
     CallSiteParams,
     /// A file's local types guessed from their uses.
     LocalFallbacks,
+    /// A file's net call roles and function-body net summaries.
+    NetHelpers,
     /// A file's net message flows.
     Network,
     /// A file's diagnostics: reads only, never evaluated by the engine.

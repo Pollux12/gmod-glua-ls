@@ -101,6 +101,8 @@ pub struct DbIndex {
     helper_scans: FxHashMap<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
     /// The set of files in `helper_scans`.
     helper_scan_files: derivation::SetFingerprint,
+    /// Each file's net helper summaries with their fingerprint when stored.
+    net_helpers: FxHashMap<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
     /// Bumped on every *mutable* handle to the type, member, signature or module
     /// index; memos over facts derived from those key on it. It covers those four
     /// and no others — the decl, global, dynamic-field and gmod-infer indexes all
@@ -178,6 +180,7 @@ impl DbIndex {
             emmyrc: Arc::new(Emmyrc::default()),
             helper_scans: FxHashMap::default(),
             helper_scan_files: derivation::SetFingerprint::default(),
+            net_helpers: FxHashMap::default(),
         }
     }
 
@@ -198,6 +201,7 @@ impl DbIndex {
         match key {
             K::TypeCache(owner) => self.get_type_index_mut().reset_type_cache(owner),
             K::HelperScan(file_id) => self.remove_helper_scan(*file_id),
+            K::NetHelpers(file_id) => self.remove_net_helpers(*file_id),
             K::DeclClaim(decl_id) => self.get_type_index_mut().reset_decl_claim(decl_id),
             K::DefinitionFact(definition) => {
                 self.get_type_index_mut().reset_definition_fact(definition)
@@ -342,6 +346,10 @@ impl DbIndex {
                 .get(file_id)
                 .map_or(derivation::ABSENT, stored_fact_fingerprint),
             K::HelperScanFiles => self.helper_scan_files.get(),
+            K::NetHelpers(file_id) => self
+                .net_helpers
+                .get(file_id)
+                .map_or(derivation::ABSENT, stored_fact_fingerprint),
             K::Property(_) | K::DeclDefault(_) => self.property_index.fact_fingerprint(key),
             K::Global(_) | K::GlobalScan => self.global_index.fact_fingerprint(key),
             K::References(_)
@@ -395,6 +403,32 @@ impl DbIndex {
         }
     }
 
+    pub(crate) fn get_net_helpers<T: derivation::DerivedFact>(
+        &self,
+        file_id: FileId,
+    ) -> Option<Arc<T>> {
+        derivation::note_read(|| derivation::FactKey::NetHelpers(file_id));
+        self.net_helpers
+            .get(&file_id)
+            .and_then(|(helpers, _)| downcast_fact(helpers))
+    }
+
+    pub(crate) fn set_net_helpers<T: derivation::DerivedFact>(
+        &mut self,
+        file_id: FileId,
+        helpers: Arc<T>,
+    ) {
+        derivation::note_write(|| derivation::FactKey::NetHelpers(file_id));
+        let fingerprint = derivation::in_file(Some(file_id), || helpers.fingerprint()).max(1);
+        self.net_helpers.insert(file_id, (helpers, fingerprint));
+    }
+
+    fn remove_net_helpers(&mut self, file_id: FileId) {
+        if self.net_helpers.remove(&file_id).is_some() {
+            derivation::note_write(|| derivation::FactKey::NetHelpers(file_id));
+        }
+    }
+
     /// The files that have a gmod helper scan, sorted.
     pub(crate) fn helper_scan_files(&self) -> Vec<FileId> {
         derivation::note_read(|| derivation::FactKey::HelperScanFiles);
@@ -413,6 +447,7 @@ impl DbIndex {
         let _profile = Profile::cond_new("remove indexes", file_ids.len() > 1);
         for &file_id in &file_ids {
             self.remove_helper_scan(file_id);
+            self.remove_net_helpers(file_id);
         }
         for &file_id in &file_ids {
             if let Some(path) = self.get_vfs().get_file_path(&file_id) {
@@ -791,6 +826,7 @@ impl DbIndex {
             emmyrc: Arc::clone(&self.emmyrc),
             helper_scans: self.helper_scans.clone(),
             helper_scan_files: self.helper_scan_files,
+            net_helpers: self.net_helpers.clone(),
         }
     }
 
@@ -941,6 +977,7 @@ impl LuaIndex for DbIndex {
         Arc::make_mut(&mut self.json_schema_index).clear();
         self.helper_scans.clear();
         self.helper_scan_files = derivation::SetFingerprint::default();
+        self.net_helpers.clear();
         self.derivations = Arc::default();
         self.gmod_call_roles = None;
     }
