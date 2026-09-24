@@ -13,16 +13,14 @@
 
 use std::collections::BTreeSet;
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 
 use crate::DbIndex;
 use crate::db_index::derivation::{self, DerivationId, DerivationKind, FactKey};
 
-/// Why a derivation is on the worklist. The worklist runs in derivation order,
-/// which puts producers before their readers. A reader queued by a producer
-/// that ranks after it (a back edge) waits until that producer's rank has run,
-/// so it is checked once after all of them instead of after each.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Why a derivation is on the worklist. Changed work runs before read checks,
+/// so a reader is checked after the producers the operation re-ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Reason {
     /// Its site is new or its outputs were dropped: always evaluated.
     Changed,
@@ -32,9 +30,7 @@ pub(crate) enum Reason {
 
 #[derive(Default)]
 pub(crate) struct Engine {
-    worklist: BTreeSet<(u8, DerivationId, Reason)>,
-    /// The rank each queued entry runs at, to find it again.
-    queued: FxHashMap<(DerivationId, Reason), u8>,
+    worklist: BTreeSet<(Reason, DerivationId)>,
     /// Files whose source passes read a fact that moved. A file's source
     /// layer is only ever rebuilt whole, so the caller re-analyses them.
     stale_sources: BTreeSet<crate::FileId>,
@@ -91,36 +87,15 @@ impl Engine {
     }
 
     pub(crate) fn changed(&mut self, id: DerivationId) {
-        self.queue(id, Reason::Changed, 0);
-    }
-
-    /// Queues `id` to run no earlier than the derivations of `after_rank`; an
-    /// entry already queued keeps its earlier place.
-    fn queue(&mut self, id: DerivationId, reason: Reason, after_rank: u8) {
-        let rank = id.kind.rank().max(after_rank);
-        if let Some(queued) = self.queued.get(&(id, reason))
-            && *queued <= rank
-        {
-            return;
-        }
-        self.unqueue(id, reason);
-        self.queued.insert((id, reason), rank);
-        self.worklist.insert((rank, id, reason));
-    }
-
-    fn unqueue(&mut self, id: DerivationId, reason: Reason) {
-        if let Some(rank) = self.queued.remove(&(id, reason)) {
-            self.worklist.remove(&(rank, id, reason));
-        }
+        self.worklist.insert((Reason::Changed, id));
     }
 
     /// Queues the readers of `keys` whose recorded fingerprint differs from
-    /// the current value, to run no earlier than the writers' rank.
+    /// the current value.
     pub(crate) fn readers_of<'a>(
         &mut self,
         db: &DbIndex,
         keys: impl IntoIterator<Item = &'a FactKey>,
-        writer_rank: u8,
     ) {
         for key in keys {
             self.touched.insert(key.clone());
@@ -134,7 +109,9 @@ impl Engine {
                     DerivationKind::Source => {
                         self.stale_sources.insert(reader.file_id);
                     }
-                    _ => self.queue(reader, Reason::Read, writer_rank),
+                    _ => {
+                        self.worklist.insert((Reason::Read, reader));
+                    }
                 }
             }
         }
@@ -173,8 +150,7 @@ impl Engine {
         db: &mut DbIndex,
         recipe: &mut dyn FnMut(&mut DbIndex, DerivationId),
     ) {
-        while let Some((_, id, reason)) = self.worklist.pop_first() {
-            self.queued.remove(&(id, reason));
+        while let Some((reason, id)) = self.worklist.pop_first() {
             if reason == Reason::Read
                 && !db
                     .reader_graph()
@@ -205,8 +181,8 @@ impl Engine {
             }
             let group = co_producers(db, id);
             for member in &group {
-                self.unqueue(*member, Reason::Changed);
-                self.unqueue(*member, Reason::Read);
+                self.worklist.remove(&(Reason::Changed, *member));
+                self.worklist.remove(&(Reason::Read, *member));
             }
             self.evaluated.extend(
                 group
@@ -236,7 +212,7 @@ impl Engine {
             if widened.is_some() {
                 self.changed(id);
             }
-            self.readers_of(db, touched.iter(), id.kind.rank());
+            self.readers_of(db, touched.iter());
         }
     }
 }
