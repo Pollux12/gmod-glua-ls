@@ -10,7 +10,7 @@ use crate::{
         common::{TypeCacheWriteMode, write_type_cache},
         dynamic_field::for_range_pairs_source_for_var,
         is_provably_builtin_iterator_call,
-        unresolve::UnResolveIterVar,
+        unresolve::iter_var_updates,
     },
     get_member_map, infer_expr, instantiate_doc_function, tpl_pattern_match_args,
 };
@@ -52,20 +52,21 @@ pub fn analyze_for_range_stat(
             if iter_var_types.degraded_unbound_tpl || enumerates_member_map {
                 // Either a generic iterator left templates nothing bound, so
                 // the vars hold degraded placeholders, or the types came from
-                // enumerating a table's member map. Either way the answer only
-                // covers the members indexed when this ran, and which those
-                // are depends on the order files were analysed in.
-                let unresolved = UnResolveIterVar {
-                    file_id: analyzer.file_id,
-                    iter_exprs: iter_exprs.clone(),
-                    iter_vars: var_name_list,
-                };
-                analyzer
-                    .context
-                    .record_settled_iter_var_candidate(unresolved.clone());
-                analyzer
-                    .context
-                    .add_unresolve(unresolved.into(), InferFailReason::UnResolveIterTemplate);
+                // enumerating a table's member map. The bound arms, or the
+                // enumerated union, replace what the insert kept when they
+                // widen it.
+                let var_positions = var_name_list
+                    .iter()
+                    .map(LuaAstToken::get_position)
+                    .collect::<Vec<_>>();
+                for update in iter_var_updates(
+                    analyzer.db,
+                    analyzer.file_id,
+                    &iter_var_types,
+                    &var_positions,
+                ) {
+                    write_type_cache(analyzer.db, update.owner, update.cache, update.mode);
+                }
             }
         }
         Err(InferFailReason::None) => {
@@ -80,20 +81,9 @@ pub fn analyze_for_range_stat(
                 );
             }
         }
-        Err(reason) => {
-            let unresolved = UnResolveIterVar {
-                file_id: analyzer.file_id,
-                iter_exprs: iter_exprs.clone(),
-                iter_vars: var_name_list,
-            };
-
-            analyzer
-                .context
-                .record_settled_iter_var_candidate(unresolved.clone());
-            analyzer
-                .context
-                .add_unresolve(unresolved.into(), reason.clone());
-        }
+        // Nothing to write: the statement runs again once a fact the iterator
+        // read changes.
+        Err(_) => {}
     }
 
     Some(())

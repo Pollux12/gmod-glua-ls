@@ -11,16 +11,14 @@ use crate::{
     db_index::{DbIndex, LuaDeclId, LuaMemberId, LuaSignatureId},
 };
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaFuncStat, LuaNameToken,
-    LuaTableExpr, LuaTableField,
+    LuaAssignStat, LuaAstNode, LuaCallExpr, LuaExpr, LuaFuncStat, LuaTableExpr, LuaTableField,
 };
-use resolve::{
-    try_resolve_decl, try_resolve_iter_var, try_resolve_module, try_resolve_table_field,
-};
+use resolve::{try_resolve_decl, try_resolve_module, try_resolve_table_field};
 use resolve_closure::{try_resolve_call_closure_params, try_resolve_closure_return};
 
 pub(crate) use resolve::get_wrapped_callable_target_expr;
 pub(crate) use resolve::is_unsettled_inferred_return;
+pub(crate) use resolve::iter_var_updates;
 pub(crate) use resolve::{try_resolve_member, try_resolve_return_point};
 pub use resolve_closure::extract_hook_name;
 pub(crate) use resolve_closure::try_resolve_closure_parent_params;
@@ -103,11 +101,6 @@ fn attempt_resolve(
                 try_resolve_closure_return(db, writes, cache, un_resolve_closure_return)
             })
         }
-        UnResolve::IterDecl(un_resolve_iter_var) => {
-            buffered_attempt(db, infer_manager, file_id, |db, writes, cache| {
-                try_resolve_iter_var(db, writes, cache, un_resolve_iter_var)
-            })
-        }
         UnResolve::ClosureParentParams(un_resolve_closure_params) => {
             buffered_attempt(db, infer_manager, file_id, |db, writes, cache| {
                 try_resolve_closure_parent_params(db, writes, cache, un_resolve_closure_params)
@@ -126,9 +119,6 @@ fn attempt_resolve(
 
 fn unresolve_kind_rank(unresolve: &UnResolve) -> u8 {
     match unresolve {
-        // Ahead of every consumer: a loop variable is an input to the facts the
-        // body derives from it, and both sit in the same reason group.
-        UnResolve::IterDecl(_) => 0,
         UnResolve::Decl(_) => 1,
         UnResolve::Member(_) => 2,
         UnResolve::Module(_) => 3,
@@ -150,7 +140,6 @@ fn unresolve_stable_cmp(a: &UnResolve, b: &UnResolve) -> Ordering {
 #[derive(Debug)]
 pub enum UnResolve {
     Decl(Box<UnResolveDecl>),
-    IterDecl(Box<UnResolveIterVar>),
     Member(Box<UnResolveMember>),
     Module(Box<UnResolveModule>),
     Return(Box<UnResolveReturn>),
@@ -166,7 +155,6 @@ impl UnResolve {
     pub fn get_file_id(&self) -> Option<FileId> {
         match self {
             UnResolve::Decl(un_resolve_decl) => Some(un_resolve_decl.file_id),
-            UnResolve::IterDecl(un_resolve_iter_var) => Some(un_resolve_iter_var.file_id),
             UnResolve::Member(un_resolve_member) => Some(un_resolve_member.file_id),
             UnResolve::Module(un_resolve_module) => Some(un_resolve_module.file_id),
             UnResolve::Return(un_resolve_return) => Some(un_resolve_return.file_id),
@@ -229,13 +217,6 @@ impl UnResolve {
     fn sort_key_site(&self) -> (u32, u32) {
         match self {
             UnResolve::Decl(d) => (d.file_id.id, u32::from(d.decl_id.position)),
-            UnResolve::IterDecl(d) => (
-                d.file_id.id,
-                d.iter_vars
-                    .first()
-                    .map(|v| u32::from(v.syntax().text_range().start()))
-                    .unwrap_or(0),
-            ),
             UnResolve::Member(d) => (d.file_id.id, u32::from(d.member_id.get_position())),
             UnResolve::Module(d) => (
                 d.file_id.id,
@@ -330,19 +311,6 @@ pub struct UnResolveCallClosureParams {
 impl From<UnResolveCallClosureParams> for UnResolve {
     fn from(un_resolve_closure_params: UnResolveCallClosureParams) -> Self {
         UnResolve::ClosureParams(Box::new(un_resolve_closure_params))
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct UnResolveIterVar {
-    pub file_id: FileId,
-    pub iter_exprs: Vec<LuaExpr>,
-    pub iter_vars: Vec<LuaNameToken>,
-}
-
-impl From<UnResolveIterVar> for UnResolve {
-    fn from(un_resolve_iter_var: UnResolveIterVar) -> Self {
-        UnResolve::IterDecl(Box::new(un_resolve_iter_var))
     }
 }
 

@@ -22,10 +22,10 @@ use crate::{
             holds_unbound_iter_template, write_type_cache,
         },
         lua::{
-            alias_target_global_path, compute_module_semantic_id,
+            IterVarInference, alias_target_global_path, compute_module_semantic_id,
             derive_inferred_return_with_reads, has_multiple_distinct_index_expr_member_owners,
-            infer_for_range_iter_expr_func, is_guarded_table_assignment_index_expr,
-            mark_resolved_member_assignment, resolve_index_expr_member_owner_for_file,
+            is_guarded_table_assignment_index_expr, mark_resolved_member_assignment,
+            resolve_index_expr_member_owner_for_file,
         },
         unresolve::UnResolveSpecialCall,
     },
@@ -42,9 +42,9 @@ use crate::{
 };
 
 use super::{
-    ResolveResult, UnResolveDecl, UnResolveIterVar, UnResolveMember, UnResolveModule,
-    UnResolveReturn, UnResolveTableField,
-    resolve_closure::inferred_return_tail_matching_documented_first, writes::ResolveWrites,
+    ResolveResult, UnResolveDecl, UnResolveMember, UnResolveModule, UnResolveReturn,
+    UnResolveTableField, resolve_closure::inferred_return_tail_matching_documented_first,
+    writes::ResolveWrites,
 };
 
 pub fn try_resolve_decl(
@@ -810,81 +810,21 @@ fn return_docs_to_type(return_docs: &[LuaDocReturnInfo]) -> LuaType {
     }
 }
 
-pub fn try_resolve_iter_var(
-    db: &DbIndex,
-    writes: &mut ResolveWrites,
-    cache: &mut LuaInferCache,
-    unresolve_iter_var: &mut UnResolveIterVar,
-) -> ResolveResult {
-    let var_positions = unresolve_iter_var
-        .iter_vars
-        .iter()
-        .map(LuaAstToken::get_position)
-        .collect::<Vec<_>>();
-    try_resolve_iter_var_updates(
-        db,
-        writes,
-        cache,
-        unresolve_iter_var.file_id,
-        &unresolve_iter_var.iter_exprs,
-        &var_positions,
-    )
-}
-
-/// The worker-facing half of [`try_resolve_iter_var`]: iterator variables are
-/// identified by position, so a caller without the syntax tokens — a
-/// speculative worker rebuilding the item from ids — can run the same
-/// attempt.
-pub(super) fn try_resolve_iter_var_updates(
-    db: &DbIndex,
-    writes: &mut ResolveWrites,
-    cache: &mut LuaInferCache,
-    file_id: FileId,
-    iter_exprs: &[LuaExpr],
-    var_positions: &[rowan::TextSize],
-) -> ResolveResult {
-    let updates =
-        match compute_iter_var_updates(db, cache, file_id, iter_exprs, var_positions, false) {
-            Ok(updates) => updates,
-            // Placeholder items have nothing to add on a failed retry: the template
-            // ref is already cached. Keep the failure in this reason's own group
-            // rather than injecting the item into another group's fixpoint.
-            Err(reason) => {
-                return Err(
-                    if iter_var_holds_tpl_placeholder_at(db, file_id, var_positions, 0) {
-                        InferFailReason::UnResolveIterTemplate
-                    } else {
-                        reason
-                    },
-                );
-            }
-        };
-    for update in updates {
-        writes.push(move |db, _| {
-            write_type_cache(db, update.owner, update.cache, update.mode);
-        });
-    }
-    Ok(())
-}
-
-/// A resolved iterator-variable type plus the write-mode decision it earned, so
-/// the settled re-derivation can run the inference read-only on parallel workers
-/// and apply the updates in stable file order.
+/// A resolved iterator-variable type plus the write mode it earned.
 pub struct IterVarTypeUpdate {
     pub(crate) owner: LuaTypeOwner,
     pub(crate) cache: LuaTypeCache,
     pub(crate) mode: TypeCacheWriteMode,
 }
 
-fn compute_iter_var_updates(
+/// The loop variables' types from `iter_var_types`: template arms an unbound
+/// generic left are dropped, and proven overrides win.
+pub(crate) fn iter_var_updates(
     db: &DbIndex,
-    cache: &mut LuaInferCache,
     file_id: FileId,
-    iter_exprs: &[LuaExpr],
+    iter_var_types: &IterVarInference,
     var_positions: &[TextSize],
-    settled: bool,
-) -> Result<Vec<IterVarTypeUpdate>, InferFailReason> {
-    let iter_var_types = infer_for_range_iter_expr_func(db, cache, iter_exprs)?;
+) -> Vec<IterVarTypeUpdate> {
     let mut updates = Vec::with_capacity(var_positions.len());
     for (idx, &position) in var_positions.iter().enumerate() {
         let decl_id = LuaDeclId::new(file_id, position);
@@ -920,39 +860,14 @@ fn compute_iter_var_updates(
 
         let owner: LuaTypeOwner = decl_id.into();
         let cached = db.get_type_index().get_type_cache(&owner);
-        let mode = if settled {
-            settled_iter_var_write_mode(cached, &ret_type)
-        } else {
-            iter_var_write_mode(cached, &ret_type)
-        };
+        let mode = iter_var_write_mode(cached, &ret_type);
         updates.push(IterVarTypeUpdate {
             owner,
             cache: LuaTypeCache::InferType(ret_type),
             mode,
         });
     }
-    Ok(updates)
-}
-
-/// Write mode for the settled re-derivation.
-///
-/// [`iter_var_write_mode`] only accepts an answer that widens the cached one,
-/// and what is cached is whatever the wave reached — a property of how far the
-/// batch had got. Here the answer was taken against the complete member map, so
-/// it replaces the cached one outright. The one thing it may not do is put a raw
-/// template ref back over a resolved type: an unbound generic is a placeholder,
-/// not an answer.
-fn settled_iter_var_write_mode(
-    cached: Option<&LuaTypeCache>,
-    settled: &LuaType,
-) -> TypeCacheWriteMode {
-    let Some(cached) = cached.filter(|cached| !cached.is_doc()) else {
-        return TypeCacheWriteMode::InsertOnly;
-    };
-    if settled.contain_tpl() && !cached.as_type().contain_tpl() {
-        return TypeCacheWriteMode::InsertOnly;
-    }
-    TypeCacheWriteMode::ForceOverwrite
+    updates
 }
 
 /// The write mode for a settled iterator-variable type.
@@ -974,23 +889,6 @@ fn iter_var_write_mode(cached: Option<&LuaTypeCache>, settled: &LuaType) -> Type
     } else {
         TypeCacheWriteMode::InsertOnly
     }
-}
-
-/// Whether the iterator var at `idx` still caches a raw template ref, the
-/// placeholder an unbound generic leaves behind.
-fn iter_var_holds_tpl_placeholder_at(
-    db: &DbIndex,
-    file_id: FileId,
-    var_positions: &[rowan::TextSize],
-    idx: usize,
-) -> bool {
-    let Some(&position) = var_positions.get(idx) else {
-        return false;
-    };
-    let decl_id = LuaDeclId::new(file_id, position);
-    db.get_type_index()
-        .get_type_cache(&decl_id.into())
-        .is_some_and(|cache| cache.as_type().contain_tpl())
 }
 
 pub fn try_resolve_special_call(

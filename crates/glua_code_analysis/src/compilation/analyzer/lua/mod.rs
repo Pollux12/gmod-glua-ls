@@ -12,7 +12,9 @@ use rustc_hash::FxHashMap;
 use closure::analyze_closure;
 pub use closure::{analyze_return_point, derive_inferred_return_with_reads};
 use for_range_stat::analyze_for_range_stat;
-pub use for_range_stat::{infer_for_range_iter_expr_func, iterates_table_member_map};
+pub use for_range_stat::{
+    IterVarInference, infer_for_range_iter_expr_func, iterates_table_member_map,
+};
 pub use func_body::LuaReturnPoint;
 use glua_parser::{LuaAst, LuaAstNode, LuaChunk, LuaExpr, LuaSyntaxId, with_syntax_resolver};
 pub(in crate::compilation::analyzer) use member_write_policy::alias_target_global_path;

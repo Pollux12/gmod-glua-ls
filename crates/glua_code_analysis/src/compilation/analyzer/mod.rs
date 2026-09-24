@@ -37,7 +37,7 @@ use crate::{
 };
 use glua_parser::{LuaAstNode, LuaChunk, LuaClosureExpr, LuaExpr, LuaSyntaxId, LuaSyntaxNode};
 use infer_cache_manager::InferCacheManager;
-use unresolve::{UnResolve, UnResolveIterVar};
+use unresolve::UnResolve;
 
 pub(crate) fn infer_closure_body_function_type(
     db: &DbIndex,
@@ -596,8 +596,6 @@ pub struct AnalyzeContext {
     /// Guarded table bootstraps whose canonical writer was picked from an
     /// incomplete sibling set. See `resettle_guarded_table_bootstraps`.
     settled_guarded_bootstrap_candidates: Vec<LuaMemberId>,
-    /// See [`AnalyzeContext::record_settled_iter_var_candidate`].
-    settled_iter_var_candidates: Vec<UnResolveIterVar>,
     /// See [`AnalyzeContext::record_settled_global_read_candidate`].
     settled_global_read_candidates: Vec<(LuaDeclId, LuaExpr)>,
     /// Decls reading through a multi-declaration global. Unlike
@@ -640,7 +638,6 @@ impl AnalyzeContext {
             early_member_owner_candidates: Vec::new(),
             settled_member_attach_candidates: Vec::new(),
             settled_guarded_bootstrap_candidates: Vec::new(),
-            settled_iter_var_candidates: Vec::new(),
             settled_global_read_candidates: Vec::new(),
             settled_multi_decl_global_read_candidates: Vec::new(),
             settled_dynamic_field_candidates: Vec::new(),
@@ -686,17 +683,6 @@ impl AnalyzeContext {
             self.pending_unresolve_decl_ids.insert(decl.decl_id);
         }
         self.unresolves.push((un_resolve, reason));
-    }
-
-    /// Remembers an assignment whose widening skipped a sibling that had no type
-    /// yet. The assigned type is kept as written, not as widened, so the settled
-    /// pass can re-derive the merge instead of growing the partial answer.
-    /// Remembers a `for ... in pairs(t)` whose variable types were read off
-    /// `t`'s member map. Which members were attached when it ran is a property
-    /// of how far the batch had got, so it is taken again once the settled
-    /// member passes have finished attaching them.
-    pub(crate) fn record_settled_iter_var_candidate(&mut self, iter_var: UnResolveIterVar) {
-        self.settled_iter_var_candidates.push(iter_var);
     }
 
     /// Remembers a dynamic write whose prefix had no nameable table type yet,
