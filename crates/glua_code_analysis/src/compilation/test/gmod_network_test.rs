@@ -498,4 +498,40 @@ mod test {
             .collect::<Vec<_>>();
         expect_that!(workspace_wide, is_empty());
     }
+
+    #[gtest]
+    fn a_files_network_reads_do_not_grow_with_the_workspace_helper_names() {
+        use crate::db_index::derivation::DerivationKind;
+
+        let network_reads = |helper_count: usize| {
+            let mut ws = VirtualWorkspace::new();
+            set_gmod_enabled(&mut ws);
+            let helpers = (0..helper_count)
+                .map(|i| {
+                    format!(
+                        "function SendPing{i}()
+    net.Start(\"Ping{i}\")
+    net.SendToServer()
+end
+"
+                    )
+                })
+                .collect::<String>();
+            ws.def_file("addons/mytest/lua/autorun/client/helpers.lua", &helpers);
+            let caller = ws.def_file(
+                "addons/mytest/lua/autorun/client/caller.lua",
+                "SendPing0()
+",
+            );
+            let db = ws.get_db_mut();
+            let network = db
+                .reader_graph()
+                .derivations_of_file(caller)
+                .find(|id| id.kind == DerivationKind::Network)
+                .expect("the caller has a network derivation");
+            db.reader_graph().reads_of(network).len()
+        };
+
+        expect_that!(network_reads(40), eq(network_reads(5)));
+    }
 }

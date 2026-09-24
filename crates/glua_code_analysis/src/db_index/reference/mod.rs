@@ -40,6 +40,8 @@ pub struct LuaReferenceIndex {
     /// how many derivations hold each; kept apart from what the source layer
     /// indexed so a re-run retracts exactly its own.
     derived_index_reference: HashMap<LuaMemberKey, HashMap<(FileId, LuaSyntaxId), usize>>,
+    /// Incremental multiset fingerprint of the derived references in each file.
+    derived_file_fingerprints: HashMap<FileId, Fingerprint>,
     /// The member-key references each derivation added.
     derived_index_reference_holders:
         HashMap<DerivationId, Vec<(LuaMemberKey, FileId, LuaSyntaxId)>>,
@@ -65,6 +67,7 @@ impl LuaReferenceIndex {
             file_fingerprints: HashMap::default(),
             name_fingerprints: HashMap::default(),
             derived_index_reference: HashMap::default(),
+            derived_file_fingerprints: HashMap::default(),
             derived_index_reference_holders: HashMap::default(),
         }
     }
@@ -94,6 +97,12 @@ impl LuaReferenceIndex {
             let name = member_key_name(&key);
             let fingerprint = index_reference_fingerprint(file_id, &key, &syntax_id);
             Self::sub_name_fingerprint(&mut self.name_fingerprints, &name, fingerprint);
+            if let Some(sum) = self.derived_file_fingerprints.get_mut(&file_id) {
+                *sum = sum.wrapping_sub(fingerprint);
+                if *sum == derivation::ABSENT {
+                    self.derived_file_fingerprints.remove(&file_id);
+                }
+            }
         }
     }
 
@@ -336,9 +345,14 @@ impl LuaReferenceIndex {
                 .get(name)
                 .copied()
                 .unwrap_or(derivation::ABSENT),
-            FactKey::NameReferencesInFile(name, file_id) => {
-                self.name_sites_in_file_fingerprint(name, *file_id)
+            FactKey::DerivedReferences(file_id) if derivation::mapping_back() => {
+                self.recomputed_derived_file_fingerprint(*file_id)
             }
+            FactKey::DerivedReferences(file_id) => self
+                .derived_file_fingerprints
+                .get(file_id)
+                .copied()
+                .unwrap_or(derivation::ABSENT),
             FactKey::ReferenceContrib(id) => {
                 derivation::fingerprint_opt(self.derived_index_reference_holders.get(id))
             }
@@ -387,9 +401,10 @@ impl LuaReferenceIndex {
     /// Every site in `file_id` that references `name`, including the index
     /// references derivations resolved: [`Self::get_global_references`] and
     /// [`Self::get_index_references`] narrowed to one file, read as that file's
-    /// fact alone.
+    /// facts alone.
     pub fn name_sites_in_file(&self, name: &SmolStr, file_id: FileId) -> Vec<LuaSyntaxId> {
-        derivation::note_read(|| FactKey::NameReferencesInFile(name.clone(), file_id));
+        derivation::note_read(|| FactKey::References(file_id));
+        derivation::note_read(|| FactKey::DerivedReferences(file_id));
         let member_key = LuaMemberKey::Name(name.clone());
         let mut sites = self
             .global_references
@@ -417,37 +432,17 @@ impl LuaReferenceIndex {
         sites
     }
 
-    /// What [`Self::name_sites_in_file`] can observe.
-    fn name_sites_in_file_fingerprint(&self, name: &SmolStr, file_id: FileId) -> Fingerprint {
-        let member_key = LuaMemberKey::Name(name.clone());
-        let globals = self
-            .global_references
-            .get(name)
-            .and_then(|references| references.get(&file_id))
-            .into_iter()
-            .flatten()
-            .map(|syntax_id| global_reference_fingerprint(file_id, name, syntax_id));
-        let indexes = self
-            .index_reference
-            .get(&member_key)
-            .and_then(|references| references.get(&file_id))
-            .into_iter()
-            .flatten()
-            .map(|syntax_id| index_reference_fingerprint(file_id, &member_key, syntax_id));
-        let derived = self
-            .derived_index_reference
-            .get(&member_key)
-            .into_iter()
-            .flat_map(|derived| derived.keys())
-            .filter(|(site_file, _)| *site_file == file_id)
-            .map(|(_, syntax_id)| {
-                // Distinct from a source site at the same place: a derived
-                // reference is listed alongside it.
-                derivation::fingerprint_of(&(3u8, &member_key, InFiled::new(file_id, *syntax_id)))
-            });
-        globals
-            .chain(indexes)
-            .chain(derived)
+    /// `file_id`'s derived reference fingerprints summed afresh, which is what
+    /// the incremental `derived_file_fingerprints` sum holds.
+    fn recomputed_derived_file_fingerprint(&self, file_id: FileId) -> Fingerprint {
+        self.derived_index_reference
+            .iter()
+            .flat_map(|(key, sites)| {
+                sites
+                    .keys()
+                    .filter(move |(site_file, _)| *site_file == file_id)
+                    .map(move |(_, syntax_id)| index_reference_fingerprint(file_id, key, syntax_id))
+            })
             .fold(derivation::ABSENT, Fingerprint::wrapping_add)
     }
 
@@ -514,7 +509,10 @@ impl LuaReferenceIndex {
             *count += 1;
             if *count == 1 {
                 self.add_name_fingerprint(name.clone(), fingerprint);
+                let sum = self.derived_file_fingerprints.entry(file_id).or_default();
+                *sum = sum.wrapping_add(fingerprint);
                 derivation::note_write(|| FactKey::ReferencesByName(name));
+                derivation::note_write(|| FactKey::DerivedReferences(file_id));
             }
             return;
         }
@@ -1001,6 +999,7 @@ impl LuaIndex for LuaReferenceIndex {
         self.local_reassignments.clear();
         self.index_reference.clear();
         self.derived_index_reference.clear();
+        self.derived_file_fingerprints.clear();
         self.derived_index_reference_holders.clear();
         self.global_references.clear();
     }
