@@ -111,6 +111,7 @@ impl super::engine::Recipe for Recipes {
                 | DerivationKind::DynamicFields
                 | DerivationKind::GmodLoadCallSites
                 | DerivationKind::GmodClassCallSites
+                | DerivationKind::LocalFallbacks
         )
     }
 
@@ -121,6 +122,9 @@ impl super::engine::Recipe for Recipes {
             }
             DerivationKind::NetHelpers => Box::new(gmod::compute_net_helpers(db, id.file_id)),
             DerivationKind::Network => Box::new(gmod::compute_network_flows(db, id.file_id)),
+            DerivationKind::LocalFallbacks => {
+                Box::new(local_inference::scan_unguarded_children(db, id.file_id))
+            }
             DerivationKind::GmodLoadCallSites => Box::new(gmod::compute_annotated_call_sites(
                 db, id.file_id, true, false,
             )),
@@ -156,6 +160,17 @@ impl super::engine::Recipe for Recipes {
                     .downcast::<crate::db_index::FileNetworkData>()
                     .expect("net flows");
                 gmod::apply_network_flows(db, id.file_id, flows);
+            }
+            DerivationKind::LocalFallbacks => {
+                let scan = *computed
+                    .downcast::<Option<local_inference::UnguardedChildFileResult>>()
+                    .expect("unguarded-child evidence");
+                let mut context = AnalyzeContext::for_files(db, vec![id.file_id], &self.scopes);
+                if let Some(scan) = scan {
+                    local_inference::publish_unguarded_children(db, &mut context, vec![scan]);
+                }
+                local_inference::stabilize_unknown_locals(db, &mut context);
+                unresolve::resolve_inline(db, &mut context);
             }
             DerivationKind::GmodLoadCallSites | DerivationKind::GmodClassCallSites => {
                 let sites = *computed

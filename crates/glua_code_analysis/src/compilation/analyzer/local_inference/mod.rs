@@ -418,7 +418,7 @@ struct MemberPathEvidence<'a> {
     scores: &'a mut HashMap<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>,
 }
 
-struct UnguardedChildFileResult {
+pub(crate) struct UnguardedChildFileResult {
     file_id: crate::FileId,
     infer_cache: crate::LuaInferCache,
     scores: HashMap<LuaDefinitionId, UnguardedChildCandidates>,
@@ -435,22 +435,9 @@ pub(super) fn stabilize_unguarded_children(
 ) -> Vec<InFiled<glua_parser::LuaSyntaxId>> {
     let _profile =
         crate::profile::Profile::cond_new("unguarded child inference", context.tree_list.len() > 1);
-    let mut profile = std::env::var_os("GLUALS_PROFILE")
-        .is_some()
-        .then(UnguardedChildProfile::default);
     if !db.get_emmyrc().gmod.enabled {
         return Vec::new();
     }
-    let mut scores = HashMap::<LuaDefinitionId, UnguardedChildCandidates>::default();
-    let mut deferred_definitions = FxHashSet::<LuaDefinitionId>::default();
-    let mut nested_scores =
-        HashMap::<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>::default();
-    let mut sources =
-        HashMap::<(LuaDefinitionId, crate::LuaTypeDeclId), InFiled<glua_parser::LuaSyntaxId>>::new(
-        );
-    let mut initializer_refinements = HashMap::<crate::LuaDeclId, LuaType>::default();
-
-    let reference_scan_start = profile.as_ref().map(|_| std::time::Instant::now());
     let mut seen_file_ids = FxHashSet::default();
     let file_ids = context
         .tree_list
@@ -475,10 +462,58 @@ pub(super) fn stabilize_unguarded_children(
                 file_id,
                 infer_cache,
                 context.workspace_id,
-                profile.is_some(),
+                std::env::var_os("GLUALS_PROFILE").is_some(),
             )
         })
         .collect::<Vec<_>>();
+    publish_unguarded_children(db, context, results)
+}
+
+/// One file's unguarded-child evidence, read off the index under the view a
+/// file derivation infers with; [`publish_unguarded_children`] settles it.
+pub(crate) fn scan_unguarded_children(
+    db: &crate::DbIndex,
+    file_id: crate::FileId,
+) -> Option<UnguardedChildFileResult> {
+    if !db.get_emmyrc().gmod.enabled {
+        return None;
+    }
+    let infer_cache = crate::LuaInferCache::new(
+        file_id,
+        crate::CacheOptions {
+            analysis_phase: crate::LuaAnalysisPhase::Force,
+            dynamic_fields_visible: true,
+            call_site_params_visible: true,
+        },
+    );
+    Some(collect_unguarded_child_file(
+        db,
+        file_id,
+        infer_cache,
+        db.get_module_index().get_workspace_id(file_id),
+        std::env::var_os("GLUALS_PROFILE").is_some(),
+    ))
+}
+
+/// Settles files' unguarded-child evidence into published facts. Returns the
+/// sources of the facts that changed.
+pub(crate) fn publish_unguarded_children(
+    db: &mut crate::DbIndex,
+    context: &mut AnalyzeContext,
+    results: Vec<UnguardedChildFileResult>,
+) -> Vec<InFiled<glua_parser::LuaSyntaxId>> {
+    let mut profile = std::env::var_os("GLUALS_PROFILE")
+        .is_some()
+        .then(UnguardedChildProfile::default);
+    let mut scores = HashMap::<LuaDefinitionId, UnguardedChildCandidates>::default();
+    let mut deferred_definitions = FxHashSet::<LuaDefinitionId>::default();
+    let mut nested_scores =
+        HashMap::<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>::default();
+    let mut sources =
+        HashMap::<(LuaDefinitionId, crate::LuaTypeDeclId), InFiled<glua_parser::LuaSyntaxId>>::new(
+        );
+    let mut initializer_refinements = HashMap::<crate::LuaDeclId, LuaType>::default();
+
     for result in results {
         context
             .infer_manager
@@ -536,10 +571,6 @@ pub(super) fn stabilize_unguarded_children(
             profile.absorb(file_profile);
         }
     }
-    if let (Some(profile), Some(start)) = (&mut profile, reference_scan_start) {
-        profile.reference_scan = start.elapsed();
-    }
-
     if !deferred_definitions.is_empty() {
         scores.retain(|definition, _| !deferred_definitions.contains(definition));
         sources.retain(|(definition, _), _| !deferred_definitions.contains(definition));
