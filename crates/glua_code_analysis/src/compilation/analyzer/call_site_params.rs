@@ -19,6 +19,7 @@ use rowan::{TextRange, TextSize};
 
 use super::{
     AnalysisPipeline, AnalyzeContext,
+    function_summary::function_summaries,
     gmod::{is_vgui_register_table_call, vgui_register_table_type_decl_id},
 };
 
@@ -52,9 +53,7 @@ struct FileScope {
     source_signatures: HashMap<String, Vec<LuaSignatureId>>,
     returned_tables: HashMap<FileId, Option<Arc<ReturnedTableInfo>>>,
     exact_receiver_candidates: HashMap<LuaMemberKey, bool>,
-    exact_receiver_eligibility: HashMap<LuaSignatureId, bool>,
     authoritative_receivers: HashMap<LuaSignatureId, bool>,
-    mutated_params: HashMap<LuaSignatureId, Vec<usize>>,
     closures: HashMap<LuaSignatureId, Option<LuaClosureExpr>>,
 }
 
@@ -67,9 +66,7 @@ impl FileScope {
                 db,
                 exact_receiver_member_keys_in_file(root),
             ),
-            exact_receiver_eligibility: HashMap::default(),
             authoritative_receivers: HashMap::default(),
-            mutated_params: HashMap::default(),
             closures: HashMap::default(),
         }
     }
@@ -95,20 +92,17 @@ impl FileScope {
             .copied()
             .find(|signature_id| signature_id.get_position() <= position)
     }
+}
 
-    /// Whether the function statement declaring `signature_id` assigns to
-    /// parameter `param_idx`.
-    fn is_param_mutated(
-        &mut self,
-        db: &DbIndex,
-        signature_id: LuaSignatureId,
-        param_idx: usize,
-    ) -> bool {
-        self.mutated_params
-            .entry(signature_id)
-            .or_insert_with(|| source_function_mutated_params(db, signature_id))
-            .contains(&param_idx)
-    }
+/// Whether the function statement declaring `signature_id` assigns to
+/// parameter `param_idx`.
+fn is_param_mutated(db: &DbIndex, signature_id: LuaSignatureId, param_idx: usize) -> bool {
+    function_summaries(db, signature_id.get_file_id()).is_some_and(|summaries| {
+        summaries
+            .mutated_params
+            .get(&signature_id.get_position())
+            .is_some_and(|params| params.contains(&param_idx))
+    })
 }
 
 const RETURN_ALIAS_ATTRIBUTE: &str = "return_alias";
@@ -156,14 +150,7 @@ fn collect_file_contributions(db: &DbIndex, file_id: FileId) -> Vec<Contribution
             &mut contributions,
         );
     }
-    collect_vgui_named_callback_receiver_types(
-        db,
-        &mut cache,
-        &mut scope,
-        file_id,
-        &root,
-        &mut contributions,
-    );
+    collect_vgui_named_callback_receiver_types(db, &mut cache, file_id, &root, &mut contributions);
     contributions
 }
 
@@ -177,7 +164,6 @@ struct VguiNamedCallbackCandidate {
 fn collect_vgui_named_callback_receiver_types(
     db: &DbIndex,
     cache: &mut LuaInferCache,
-    scope: &mut FileScope,
     file_id: FileId,
     root: &glua_parser::LuaChunk,
     contributions: &mut Vec<Contribution>,
@@ -284,7 +270,7 @@ fn collect_vgui_named_callback_receiver_types(
         if signature.is_colon_define
             || signature.params.is_empty()
             || signature.param_docs.contains_key(&0)
-            || scope.is_param_mutated(db, candidate.signature_id, 0)
+            || is_param_mutated(db, candidate.signature_id, 0)
         {
             continue;
         }
@@ -484,12 +470,35 @@ fn source_signatures_in_file(
     signatures
 }
 
+/// Each file function's syntactic parameter facts, keyed by closure position:
+/// the parameters each function statement assigns to, and the closures whose
+/// unmutated explicit `self` parameter is returned.
+pub(super) fn collect_param_summaries(
+    db: &DbIndex,
+    file_id: FileId,
+    root: &glua_parser::LuaChunk,
+) -> (HashMap<TextSize, Vec<usize>>, HashSet<TextSize>) {
+    let mut mutated_params = HashMap::default();
+    let mut returns_explicit_self = HashSet::default();
+    for closure in root.descendants::<LuaClosureExpr>() {
+        let mutated = function_statement_mutated_params(db, file_id, &closure);
+        if !mutated.is_empty() {
+            mutated_params.insert(closure.get_position(), mutated);
+        }
+        if returns_unmutated_explicit_self(db, file_id, &closure) {
+            returns_explicit_self.insert(closure.get_position());
+        }
+    }
+    (mutated_params, returns_explicit_self)
+}
+
 /// The parameters a function statement assigns to; empty for any other
 /// function.
-fn source_function_mutated_params(db: &DbIndex, signature_id: LuaSignatureId) -> Vec<usize> {
-    let Some(closure) = exact_signature_closure(db, signature_id) else {
-        return Vec::new();
-    };
+fn function_statement_mutated_params(
+    db: &DbIndex,
+    file_id: FileId,
+    closure: &LuaClosureExpr,
+) -> Vec<usize> {
     let Some(func_name) = closure
         .get_parent::<LuaFuncStat>()
         .and_then(|func_stat| func_stat.get_func_name())
@@ -505,7 +514,7 @@ fn source_function_mutated_params(db: &DbIndex, signature_id: LuaSignatureId) ->
             .is_some_and(|token| token.is_colon()),
         LuaVarExpr::NameExpr(_) => false,
     };
-    get_mutated_params(db, signature_id.get_file_id(), &closure, is_colon_define)
+    get_mutated_params(db, file_id, closure, is_colon_define)
 }
 
 fn get_mutated_params(
@@ -741,7 +750,7 @@ fn collect_call_site_param_types(
                     continue;
                 }
             }
-            if scope.is_param_mutated(db, signature_id, param_idx) {
+            if is_param_mutated(db, signature_id, param_idx) {
                 continue;
             }
             let arg_syntax_id = arg.get_syntax_id();
@@ -793,6 +802,12 @@ fn collect_direct_callback_param_types(
     call_args: &[LuaExpr],
     contributions: &mut Vec<Contribution>,
 ) {
+    if !call_args
+        .iter()
+        .any(|arg| matches!(arg, LuaExpr::ClosureExpr(_)))
+    {
+        return;
+    }
     let Some(callee_signature) = db.get_signature_index().get(&callee_signature_id) else {
         return;
     };
@@ -829,7 +844,7 @@ fn collect_direct_callback_param_types(
             continue;
         };
         if callee_signature.param_docs.contains_key(&callee_param_idx)
-            || scope.is_param_mutated(db, callee_signature_id, callee_param_idx)
+            || is_param_mutated(db, callee_signature_id, callee_param_idx)
         {
             continue;
         }
@@ -872,7 +887,7 @@ fn collect_direct_callback_param_types(
             for (target_param_idx, callback_arg) in callback_args.get_args().enumerate() {
                 if target_param_idx >= target_signature.params.len()
                     || target_signature.param_docs.contains_key(&target_param_idx)
-                    || scope.is_param_mutated(db, target_signature_id, target_param_idx)
+                    || is_param_mutated(db, target_signature_id, target_param_idx)
                 {
                     continue;
                 }
@@ -976,11 +991,8 @@ fn collect_exact_colon_receiver_type(
     if signature.is_colon_define
         || signature.params.first().is_none_or(|param| param != "self")
         || signature.param_docs.contains_key(&0)
-        || scope.is_param_mutated(db, signature_id, 0)
-        || !*scope
-            .exact_receiver_eligibility
-            .entry(signature_id)
-            .or_insert_with(|| exact_explicit_self_param_is_eligible(db, signature_id))
+        || is_param_mutated(db, signature_id, 0)
+        || !exact_explicit_self_param_is_eligible(db, signature_id)
     {
         return None;
     }
@@ -1146,38 +1158,46 @@ fn exact_explicit_self_param_is_eligible(db: &DbIndex, signature_id: LuaSignatur
     let Some(signature) = db.get_signature_index().get(&signature_id) else {
         return false;
     };
-    if !matches!(
+    matches!(
         signature.resolve_return,
         crate::SignatureReturnStatus::UnResolve | crate::SignatureReturnStatus::InferResolve
-    ) {
-        return false;
-    }
+    ) && function_summaries(db, signature_id.get_file_id()).is_some_and(|summaries| {
+        summaries
+            .returns_explicit_self
+            .contains(&signature_id.get_position())
+    })
+}
 
-    let Some(closure) = exact_signature_closure(db, signature_id) else {
-        return false;
-    };
-    if get_mutated_params(db, signature_id.get_file_id(), &closure, false).contains(&0) {
-        return false;
-    }
-    let Some(self_decl_id) = closure
+/// Whether `closure`'s explicit `self` parameter is never assigned and is
+/// named by one of its own return statements.
+fn returns_unmutated_explicit_self(
+    db: &DbIndex,
+    file_id: FileId,
+    closure: &LuaClosureExpr,
+) -> bool {
+    let Some(self_token) = closure
         .get_params_list()
         .and_then(|params| params.get_params().next())
         .and_then(|param| param.get_name_token())
-        .map(|token| LuaDeclId::new(signature_id.get_file_id(), token.get_range().start()))
+        .filter(|token| token.get_name_text() == "self")
     else {
         return false;
     };
+    if get_mutated_params(db, file_id, closure, false).contains(&0) {
+        return false;
+    }
+    let self_decl_id = LuaDeclId::new(file_id, self_token.get_range().start());
     let Some(block) = closure.get_block() else {
         return false;
     };
 
     block.descendants::<LuaReturnStat>().any(|return_stat| {
-        if return_stat.ancestors::<LuaClosureExpr>().next().as_ref() != Some(&closure) {
+        if return_stat.ancestors::<LuaClosureExpr>().next().as_ref() != Some(closure) {
             return false;
         }
         return_stat.descendants::<LuaNameExpr>().any(|name_expr| {
             db.get_reference_index()
-                .get_var_reference_decl(&signature_id.get_file_id(), name_expr.get_range())
+                .get_var_reference_decl(&file_id, name_expr.get_range())
                 == Some(self_decl_id)
         })
     })

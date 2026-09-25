@@ -1,6 +1,4 @@
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 use std::time::Duration;
 
 use glua_parser::{
@@ -55,7 +53,7 @@ enum DynamicFieldAnalysisMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct FieldSetterHelper {
+pub(super) struct FieldSetterHelper {
     table_param_index: usize,
     key_param_index: usize,
 }
@@ -82,47 +80,14 @@ type FiniteNamedMemberEvidence = (
     bool,
 );
 
-/// One file's field-setter helpers: the closures, by position, whose body
-/// writes `table_param[key_param]`.
-#[derive(Debug, Default)]
-pub(crate) struct FileFieldSetterHelpers(FxHashMap<TextSize, Vec<FieldSetterHelper>>);
-
-impl Hash for FileFieldSetterHelpers {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        let mut helpers = self.0.iter().collect::<Vec<_>>();
-        helpers.sort_by_key(|(position, _)| **position);
-        helpers.len().hash(state);
-        for (position, patterns) in helpers {
-            crate::db_index::derivation::hash_local(position, state);
-            patterns.hash(state);
-        }
-    }
-}
-
-impl crate::db_index::derivation::DerivedFact for FileFieldSetterHelpers {
-    fn fingerprint(&self) -> crate::db_index::derivation::Fingerprint {
-        crate::db_index::derivation::fingerprint_of(self)
-    }
-}
-
-/// Stores `file_id`'s field-setter helpers: part of its source layer.
-pub(super) fn index_field_setter_helpers(db: &mut DbIndex, file_id: crate::FileId) {
-    let Some(root) = db
-        .get_vfs()
-        .get_syntax_tree(&file_id)
-        .map(|tree| tree.get_chunk_node())
-    else {
-        return;
-    };
-    let helpers = collect_field_setter_helpers(&root);
-    if !helpers.0.is_empty() {
-        db.set_field_setter_helpers(file_id, Arc::new(helpers));
-    }
-}
-
 fn patterns_for_signature(db: &DbIndex, signature_id: LuaSignatureId) -> Vec<FieldSetterHelper> {
-    db.get_field_setter_helpers::<FileFieldSetterHelpers>(signature_id.get_file_id())
-        .and_then(|helpers| helpers.0.get(&signature_id.get_position()).cloned())
+    super::function_summary::function_summaries(db, signature_id.get_file_id())
+        .and_then(|summaries| {
+            summaries
+                .field_setter_helpers
+                .get(&signature_id.get_position())
+                .cloned()
+        })
         .unwrap_or_default()
 }
 
@@ -493,7 +458,9 @@ fn analyze_dynamic_fields(
     }
 }
 
-fn collect_field_setter_helpers(root: &glua_parser::LuaChunk) -> FileFieldSetterHelpers {
+pub(super) fn collect_field_setter_helpers(
+    root: &glua_parser::LuaChunk,
+) -> FxHashMap<TextSize, Vec<FieldSetterHelper>> {
     let mut helpers: FxHashMap<TextSize, Vec<FieldSetterHelper>> = FxHashMap::default();
     for assign in root.descendants::<LuaAssignStat>() {
         let Some(closure) = assign.ancestors::<LuaClosureExpr>().next() else {
@@ -542,7 +509,7 @@ fn collect_field_setter_helpers(root: &glua_parser::LuaChunk) -> FileFieldSetter
         }
     }
 
-    FileFieldSetterHelpers(helpers)
+    helpers
 }
 
 fn collect_field_setter_helper_call_fields(

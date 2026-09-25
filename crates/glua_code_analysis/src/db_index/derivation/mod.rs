@@ -188,8 +188,8 @@ pub enum FactKey {
     NetHelperNames,
     /// One file's net call roles and function-body net summaries.
     NetHelpers(FileId),
-    /// A file's field-setter helper functions, from its syntax.
-    FieldSetterHelpers(FileId),
+    /// A file's function-body summaries, from its syntax and local references.
+    FunctionSummaries(FileId),
     /// A property (docs, attributes, visibility) of a semantic declaration.
     Property(LuaSemanticDeclId),
     /// A declaration's inferred string default.
@@ -369,7 +369,7 @@ impl FactKey {
                 | K::TypeFile(_)
                 | K::ModuleMeta(_)
                 | K::DiagnosticFile(_)
-                | K::FieldSetterHelpers(_)
+                | K::FunctionSummaries(_)
         )
     }
 
@@ -452,7 +452,7 @@ impl FactKey {
             | K::NetworkFile(file_id)
             | K::HelperScan(file_id)
             | K::NetHelpers(file_id)
-            | K::FieldSetterHelpers(file_id)
+            | K::FunctionSummaries(file_id)
             | K::References(file_id)
             | K::AccessorCalls(file_id)
             | K::Dependency(file_id)
@@ -859,7 +859,7 @@ pub enum FileFact {
     References,
     FlowTree,
     DeclTree,
-    FieldSetterHelpers,
+    FunctionSummaries,
 }
 
 /// Records a read of `file_id`'s `fact`.
@@ -871,7 +871,7 @@ pub fn note_file_fact_read(fact: FileFact, file_id: FileId) {
         FileFact::References => FactKey::References(file_id),
         FileFact::FlowTree => FactKey::FlowTree(file_id),
         FileFact::DeclTree => FactKey::DeclTree(file_id),
-        FileFact::FieldSetterHelpers => FactKey::FieldSetterHelpers(file_id),
+        FileFact::FunctionSummaries => FactKey::FunctionSummaries(file_id),
     });
 }
 

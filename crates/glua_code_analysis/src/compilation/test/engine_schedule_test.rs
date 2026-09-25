@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use crate::db_index::derivation::{DerivationId, DerivationKind};
+    use crate::db_index::derivation::{DerivationId, DerivationKind, FactKey};
     use crate::{Emmyrc, VirtualWorkspace};
 
     /// The derivations a read of which no longer holds: after an update the
@@ -158,5 +158,27 @@ mod test {
 
         ws.def_file("lua/autorun/sh_helpers.lua", SETTER_HELPERS);
         assert!(has_dynamic_field(&ws, "buoyancy"));
+    }
+
+    #[test]
+    fn a_callers_call_site_params_read_the_callees_function_summaries_not_its_references() {
+        let mut ws = VirtualWorkspace::new();
+        let lib = ws.def_file(
+            "lua/autorun/sh_lib.lua",
+            "Lib = {}\nfunction Lib.Get(self)\n    return self\nend\n",
+        );
+        let caller = ws.def_file(
+            "lua/autorun/sh_use.lua",
+            "local obj = {}\nobj.Get = Lib.Get\nlocal v = obj:Get()\n",
+        );
+
+        let graph = ws.analysis.compilation.get_db().reader_graph();
+        let id = graph
+            .derivations_of_file(caller)
+            .find(|id| id.kind == DerivationKind::CallSiteParams)
+            .expect("caller call-site params");
+        let reads = graph.reads_of(id).map(|key| key.key()).collect::<Vec<_>>();
+        assert!(reads.contains(&&FactKey::FunctionSummaries(lib)));
+        assert!(!reads.contains(&&FactKey::References(lib)));
     }
 }

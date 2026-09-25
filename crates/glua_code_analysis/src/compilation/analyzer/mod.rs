@@ -6,6 +6,7 @@ mod doc;
 mod dynamic_field;
 mod engine;
 mod flow;
+mod function_summary;
 pub(crate) mod gmod;
 mod infer_cache_manager;
 mod local_inference;
@@ -213,7 +214,7 @@ fn replace_files(
         .map(|(file_id, evaluation)| (file_id, declare_source(db, file_id, evaluation, scopes)))
         .collect::<Vec<_>>();
     for (file_id, (evaluation, context)) in declared {
-        let (outputs, guard_candidates) = document_source(db, evaluation, context);
+        let (outputs, guard_candidates) = document_source(db, file_id, evaluation, context);
         touched.extend(outputs);
         let Some(root) = db
             .get_vfs()
@@ -342,17 +343,18 @@ fn declare_source(
     derivation::resume(evaluation);
     let mut context = AnalyzeContext::for_files(db, vec![file_id], scopes);
     run_analysis::<decl::DeclAnalysisPipeline>(db, &mut context);
-    dynamic_field::index_field_setter_helpers(db, file_id);
     let mut evaluation = derivation::end();
     evaluation.fingerprint_stage(|key| db.fact_fingerprint(key));
     (evaluation, context)
 }
 
 /// The last stage of a file's source layer: docs, callable signatures,
-/// early member owners, guard candidates and flow. Returns what the whole
-/// source layer wrote and the closures that are guard candidates.
+/// early member owners, guard candidates, flow and function summaries.
+/// Returns what the whole source layer wrote and the closures that are
+/// guard candidates.
 fn document_source(
     db: &mut DbIndex,
+    file_id: FileId,
     evaluation: derivation::Evaluation,
     mut context: AnalyzeContext,
 ) -> (Vec<derivation::HashedKey>, Vec<InFiled<LuaSyntaxId>>) {
@@ -362,6 +364,7 @@ fn document_source(
     resolve_early_member_owners(db, &mut context);
     local_inference::prepare_inferred_positive_guards(db, &context);
     run_analysis::<flow::FlowAnalysisPipeline>(db, &mut context);
+    function_summary::index_function_summaries(db, file_id);
     let (id, reads, outputs) = derivation::end().into_parts(|key| db.fact_fingerprint(key));
     let reads = reads
         .into_iter()

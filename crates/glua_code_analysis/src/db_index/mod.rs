@@ -103,8 +103,8 @@ pub struct DbIndex {
     helper_scan_files: derivation::SetFingerprint,
     /// Each file's net helper summaries with their fingerprint when stored.
     net_helpers: FxHashMap<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
-    /// Each file's field-setter helpers with their fingerprint when stored.
-    field_setter_helpers:
+    /// Each file's function-body summaries with their fingerprint when stored.
+    function_summaries:
         FxHashMap<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
     /// Bumped on every *mutable* handle to the type, member, signature or module
     /// index; memos over facts derived from those key on it. It covers those four
@@ -184,7 +184,7 @@ impl DbIndex {
             helper_scans: FxHashMap::default(),
             helper_scan_files: derivation::SetFingerprint::default(),
             net_helpers: FxHashMap::default(),
-            field_setter_helpers: FxHashMap::default(),
+            function_summaries: FxHashMap::default(),
         }
     }
 
@@ -358,8 +358,8 @@ impl DbIndex {
                 .net_helpers
                 .get(file_id)
                 .map_or(derivation::ABSENT, stored_fact_fingerprint),
-            K::FieldSetterHelpers(file_id) => self
-                .field_setter_helpers
+            K::FunctionSummaries(file_id) => self
+                .function_summaries
                 .get(file_id)
                 .map_or(derivation::ABSENT, stored_fact_fingerprint),
             K::Property(_) | K::DeclDefault(_) => self.property_index.fact_fingerprint(key),
@@ -441,24 +441,24 @@ impl DbIndex {
         }
     }
 
-    pub(crate) fn get_field_setter_helpers<T: derivation::DerivedFact>(
+    pub(crate) fn get_function_summaries<T: derivation::DerivedFact>(
         &self,
         file_id: FileId,
     ) -> Option<Arc<T>> {
-        derivation::note_file_fact_read(derivation::FileFact::FieldSetterHelpers, file_id);
-        self.field_setter_helpers
+        derivation::note_file_fact_read(derivation::FileFact::FunctionSummaries, file_id);
+        self.function_summaries
             .get(&file_id)
             .and_then(|(helpers, _)| downcast_fact(helpers))
     }
 
-    pub(crate) fn set_field_setter_helpers<T: derivation::DerivedFact>(
+    pub(crate) fn set_function_summaries<T: derivation::DerivedFact>(
         &mut self,
         file_id: FileId,
         helpers: Arc<T>,
     ) {
-        derivation::note_write(|| derivation::FactKey::FieldSetterHelpers(file_id));
+        derivation::note_write(|| derivation::FactKey::FunctionSummaries(file_id));
         let fingerprint = derivation::in_file(Some(file_id), || helpers.fingerprint()).max(1);
-        self.field_setter_helpers
+        self.function_summaries
             .insert(file_id, (helpers, fingerprint));
     }
 
@@ -481,8 +481,8 @@ impl DbIndex {
         for &file_id in &file_ids {
             self.remove_helper_scan(file_id);
             self.remove_net_helpers(file_id);
-            if self.field_setter_helpers.remove(&file_id).is_some() {
-                derivation::note_write(|| derivation::FactKey::FieldSetterHelpers(file_id));
+            if self.function_summaries.remove(&file_id).is_some() {
+                derivation::note_write(|| derivation::FactKey::FunctionSummaries(file_id));
             }
         }
         for &file_id in &file_ids {
@@ -863,7 +863,7 @@ impl DbIndex {
             helper_scans: self.helper_scans.clone(),
             helper_scan_files: self.helper_scan_files,
             net_helpers: self.net_helpers.clone(),
-            field_setter_helpers: self.field_setter_helpers.clone(),
+            function_summaries: self.function_summaries.clone(),
         }
     }
 
@@ -1015,7 +1015,7 @@ impl LuaIndex for DbIndex {
         self.helper_scans.clear();
         self.helper_scan_files = derivation::SetFingerprint::default();
         self.net_helpers.clear();
-        self.field_setter_helpers.clear();
+        self.function_summaries.clear();
         self.derivations = Arc::default();
         self.gmod_call_roles = None;
     }
