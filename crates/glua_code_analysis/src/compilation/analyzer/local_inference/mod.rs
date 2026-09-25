@@ -177,7 +177,7 @@ pub(super) fn stabilize_unknown_locals(
     );
     let changed = db.publish_inference_facts(solved.facts);
     let changed_any = !changed.is_empty();
-    if std::env::var_os("GLUALS_PROFILE").is_some() {
+    if crate::profile::phase_enabled() {
         eprintln!(
             "[profile] local_inference candidates={} evidence={} sccs={} resolved={} unresolved={} changed_files={}",
             solved.stats.nodes,
@@ -462,7 +462,7 @@ pub(super) fn stabilize_unguarded_children(
                 file_id,
                 infer_cache,
                 context.workspace_id,
-                std::env::var_os("GLUALS_PROFILE").is_some(),
+                crate::profile::phase_enabled(),
             )
         })
         .collect::<Vec<_>>();
@@ -491,7 +491,7 @@ pub(crate) fn scan_unguarded_children(
         file_id,
         infer_cache,
         db.get_module_index().get_workspace_id(file_id),
-        std::env::var_os("GLUALS_PROFILE").is_some(),
+        crate::profile::phase_enabled(),
     ))
 }
 
@@ -502,9 +502,7 @@ pub(crate) fn publish_unguarded_children(
     context: &mut AnalyzeContext,
     results: Vec<UnguardedChildFileResult>,
 ) -> Vec<InFiled<glua_parser::LuaSyntaxId>> {
-    let mut profile = std::env::var_os("GLUALS_PROFILE")
-        .is_some()
-        .then(UnguardedChildProfile::default);
+    let mut profile = crate::profile::phase_enabled().then(UnguardedChildProfile::default);
     let mut scores = HashMap::<LuaDefinitionId, UnguardedChildCandidates>::default();
     let mut deferred_definitions = FxHashSet::<LuaDefinitionId>::default();
     let mut nested_scores =

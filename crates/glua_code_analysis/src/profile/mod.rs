@@ -50,8 +50,9 @@ fn alloc_snapshot() -> (u64, u64) {
     )
 }
 
-/// Named sub-phase accumulator, gated on `GLUALS_PROFILE_PHASE`.
-fn phase_enabled() -> bool {
+/// Named sub-phase accumulator, gated on `GLUALS_PROFILE_PHASE`. Per-file
+/// detail prints are gated on it too, so `GLUALS_PROFILE` stays per-run.
+pub(crate) fn phase_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("GLUALS_PROFILE_PHASE").is_some())
 }
@@ -149,7 +150,7 @@ pub struct Profile<'a> {
 /// When `GLUALS_PROFILE` is set, phase-level `Profile` timers print to stderr
 /// even without Info-level logging. This gives clean per-phase numbers without
 /// the per-node instrumentation overhead that distorts Info-level runs.
-fn phase_profile_enabled() -> bool {
+pub(crate) fn profiling() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("GLUALS_PROFILE").is_some())
 }
@@ -168,7 +169,7 @@ impl<'a> Profile<'a> {
     }
 
     pub fn cond_new(name: &'a str, cond: bool) -> Option<Self> {
-        if (cond && log::log_enabled!(log::Level::Info)) || phase_profile_enabled() {
+        if cond && (log::log_enabled!(log::Level::Info) || profiling()) {
             Some(Self::new(name))
         } else {
             None
@@ -185,7 +186,7 @@ impl<'a> Drop for Profile<'a> {
         if log::log_enabled!(log::Level::Info) {
             info!("{}: cost {:?}", self.name, duration);
         }
-        if phase_profile_enabled() {
+        if profiling() {
             let (count, bytes) = alloc_snapshot();
             let allocs = count.saturating_sub(self.allocs.0);
             if allocs == 0 {

@@ -501,8 +501,7 @@ pub fn check_tsc() -> bool {
 }
 
 fn profiling() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("GLUALS_PROFILE").is_some())
+    crate::profile::profiling()
 }
 
 fn count(f: impl FnOnce(&mut FrameStats)) {
