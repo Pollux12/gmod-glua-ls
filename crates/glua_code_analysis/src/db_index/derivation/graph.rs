@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{DerivationId, EditMaps, FactKey, Fingerprint, HashedKey};
@@ -17,12 +19,43 @@ struct Record {
 
 /// A fact key and the derivations that read it (with the fingerprint each
 /// saw) or produced it. `key` is `None` while the slot is free.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
 struct KeySlot {
     key: Option<HashedKey>,
     readers: FxHashMap<DerivIdx, Fingerprint>,
     producers: Vec<DerivIdx>,
+    /// The key's fingerprint as last taken, and the generation it was taken in
+    /// ([`NO_GENERATION`]: none); see [`ReaderGraph::current_fingerprint`].
+    /// Only the analysis thread takes fingerprints, so relaxed order suffices.
+    current: AtomicU64,
+    current_generation: AtomicU32,
 }
+
+impl Clone for KeySlot {
+    fn clone(&self) -> Self {
+        Self {
+            key: self.key.clone(),
+            readers: self.readers.clone(),
+            producers: self.producers.clone(),
+            current: AtomicU64::new(self.current.load(Ordering::Relaxed)),
+            current_generation: AtomicU32::new(self.current_generation.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl Default for KeySlot {
+    fn default() -> Self {
+        Self {
+            key: None,
+            readers: FxHashMap::default(),
+            producers: Vec::new(),
+            current: AtomicU64::new(0),
+            current_generation: AtomicU32::new(NO_GENERATION),
+        }
+    }
+}
+
+const NO_GENERATION: u32 = u32::MAX;
 
 #[derive(Debug, Clone)]
 struct DerivSlot {
@@ -50,22 +83,82 @@ pub struct ReaderGraph {
     /// Removing the file's facts removes their outputs too, so they must run
     /// again when it is re-analysed.
     foreign_producers: FxHashMap<FileId, FxHashSet<DerivIdx>>,
+    /// Cached fingerprints taken in an older generation are forgotten.
+    generation: u32,
 }
 
 impl ReaderGraph {
+    /// `key`'s fingerprint, taken by `fingerprint` once per value: a read
+    /// key's slot keeps it until [`Self::forget_fingerprint`] or
+    /// [`Self::forget_fingerprints`].
+    pub fn current_fingerprint(
+        &self,
+        key: &HashedKey,
+        fingerprint: impl FnOnce(&HashedKey) -> Fingerprint,
+    ) -> Fingerprint {
+        match self.key_slots.get(key) {
+            Some(slot) => self.slot_fingerprint(*slot, fingerprint),
+            None => fingerprint(key),
+        }
+    }
+
+    fn slot_fingerprint(
+        &self,
+        slot: KeyIdx,
+        fingerprint: impl FnOnce(&HashedKey) -> Fingerprint,
+    ) -> Fingerprint {
+        let entry = &self.keys[slot as usize];
+        if entry.current_generation.load(Ordering::Relaxed) == self.generation {
+            return entry.current.load(Ordering::Relaxed);
+        }
+        let current = fingerprint(self.key(slot));
+        entry.current.store(current, Ordering::Relaxed);
+        entry
+            .current_generation
+            .store(self.generation, Ordering::Relaxed);
+        current
+    }
+
+    /// Forgets `key`'s cached fingerprint: its value may have moved.
+    pub fn forget_fingerprint(&self, key: &HashedKey) {
+        if let Some(slot) = self.key_slots.get(key) {
+            self.keys[*slot as usize]
+                .current_generation
+                .store(NO_GENERATION, Ordering::Relaxed);
+        }
+    }
+
+    /// Forgets every cached fingerprint.
+    pub fn forget_fingerprints(&mut self) {
+        self.generation = (self.generation + 1) % NO_GENERATION;
+    }
+
+    /// Every key whose fingerprint is cached, with it.
+    pub fn cached_fingerprints(&self) -> impl Iterator<Item = (&HashedKey, Fingerprint)> {
+        self.keys.iter().filter_map(|slot| {
+            (slot.current_generation.load(Ordering::Relaxed) == self.generation)
+                .then(|| Some((slot.key.as_ref()?, slot.current.load(Ordering::Relaxed))))?
+        })
+    }
+
     /// Replaces `id`'s record with the reads and outputs of its latest
     /// evaluation. Returns the outputs the previous evaluation produced and
     /// this one did not.
     pub fn replace(
         &mut self,
         id: DerivationId,
-        reads: Vec<(HashedKey, Fingerprint)>,
+        reads: Vec<(HashedKey, Option<Fingerprint>)>,
         outputs: Vec<HashedKey>,
+        fingerprint: impl Fn(&HashedKey) -> Fingerprint,
     ) -> Vec<HashedKey> {
         let deriv = self.intern_derivation(id);
         let mut reads = reads
             .into_iter()
-            .map(|(key, fingerprint)| (self.intern_key(key), fingerprint))
+            .map(|(key, seen)| {
+                let slot = self.intern_key(key);
+                let seen = seen.unwrap_or_else(|| self.slot_fingerprint(slot, &fingerprint));
+                (slot, seen)
+            })
             .collect::<Vec<_>>();
         reads.sort_unstable_by_key(|(key, _)| *key);
         let mut outputs = outputs
@@ -180,20 +273,26 @@ impl ReaderGraph {
             .map(|(deriv, _)| self.derivations[*deriv as usize].id)
     }
 
-    /// Whether any read `id` last made no longer holds.
+    /// Whether any read `id` last made no longer holds: it saw another
+    /// fingerprint than the key's current one, and `holds_moved` does not
+    /// excuse the difference.
     pub fn is_stale(
         &self,
         id: DerivationId,
-        holds: impl Fn(&HashedKey, Fingerprint) -> bool,
+        fingerprint: impl Fn(&HashedKey) -> Fingerprint,
+        holds_moved: impl Fn(&HashedKey, Fingerprint) -> bool,
     ) -> bool {
         let Some((deriv, record)) = self.record(id) else {
             return true;
         };
-        record.reads.iter().any(|key| {
-            self.keys[*key as usize]
+        record.reads.iter().any(|slot| {
+            self.keys[*slot as usize]
                 .readers
                 .get(&deriv)
-                .is_none_or(|seen| !holds(self.key(*key), *seen))
+                .is_none_or(|seen| {
+                    *seen != self.slot_fingerprint(*slot, &fingerprint)
+                        && !holds_moved(self.key(*slot), *seen)
+                })
         })
     }
 
@@ -378,6 +477,9 @@ impl ReaderGraph {
             }
         };
         self.keys[slot as usize].key = Some(key.clone());
+        self.keys[slot as usize]
+            .current_generation
+            .store(NO_GENERATION, Ordering::Relaxed);
         self.key_slots.insert(key, slot);
         slot
     }
@@ -522,8 +624,8 @@ mod tests {
     #[test]
     fn stale_readers_are_those_that_saw_another_fingerprint() {
         let mut graph = ReaderGraph::default();
-        graph.replace(id(1, 0), vec![(key(9), 5)], vec![key(1)]);
-        graph.replace(id(2, 0), vec![(key(9), 6)], vec![key(2)]);
+        graph.replace(id(1, 0), vec![(key(9), Some(5))], vec![key(1)], |_| 0);
+        graph.replace(id(2, 0), vec![(key(9), Some(6))], vec![key(2)], |_| 0);
 
         let stale: Vec<_> = graph.stale_readers(&key(9), |seen| seen == 6).collect();
 
@@ -533,9 +635,14 @@ mod tests {
     #[test]
     fn replace_drops_old_edges_and_reports_outputs_no_longer_produced() {
         let mut graph = ReaderGraph::default();
-        graph.replace(id(1, 0), vec![(key(9), 5)], vec![key(1), key(2)]);
+        graph.replace(
+            id(1, 0),
+            vec![(key(9), Some(5))],
+            vec![key(1), key(2)],
+            |_| 0,
+        );
 
-        let dropped = graph.replace(id(1, 0), vec![(key(8), 1)], vec![key(2)]);
+        let dropped = graph.replace(id(1, 0), vec![(key(8), Some(1))], vec![key(2)], |_| 0);
 
         assert_eq!(dropped, vec![key(1)]);
         assert_eq!(graph.stale_readers(&key(9), |seen| seen == 0).count(), 0);
@@ -546,9 +653,14 @@ mod tests {
     #[test]
     fn a_read_kept_across_evaluations_holds_the_latest_fingerprint() {
         let mut graph = ReaderGraph::default();
-        graph.replace(id(1, 0), vec![(key(9), 5), (key(8), 1)], vec![]);
+        graph.replace(
+            id(1, 0),
+            vec![(key(9), Some(5)), (key(8), Some(1))],
+            vec![],
+            |_| 0,
+        );
 
-        graph.replace(id(1, 0), vec![(key(9), 7)], vec![]);
+        graph.replace(id(1, 0), vec![(key(9), Some(7))], vec![], |_| 0);
 
         assert_eq!(graph.stale_readers(&key(9), |seen| seen == 7).count(), 0);
         assert_eq!(
@@ -564,13 +676,13 @@ mod tests {
     #[test]
     fn a_key_nothing_refers_to_is_forgotten_and_its_slot_reused() {
         let mut graph = ReaderGraph::default();
-        graph.replace(id(1, 0), vec![(key(9), 5)], vec![key(1)]);
-        graph.replace(id(1, 0), vec![], vec![]);
+        graph.replace(id(1, 0), vec![(key(9), Some(5))], vec![key(1)], |_| 0);
+        graph.replace(id(1, 0), vec![], vec![], |_| 0);
 
         assert_eq!(graph.read_keys().count(), 0);
         assert_eq!(graph.producers(&key(1)).count(), 0);
 
-        graph.replace(id(1, 0), vec![(key(7), 1)], vec![key(6)]);
+        graph.replace(id(1, 0), vec![(key(7), Some(1))], vec![key(6)], |_| 0);
 
         assert_eq!(graph.keys.len(), 2);
     }
@@ -578,8 +690,8 @@ mod tests {
     #[test]
     fn remove_file_returns_outputs_and_forgets_its_readers() {
         let mut graph = ReaderGraph::default();
-        graph.replace(id(1, 0), vec![(key(9), 5)], vec![key(1)]);
-        graph.replace(id(2, 0), vec![(key(1), 5)], vec![key(2)]);
+        graph.replace(id(1, 0), vec![(key(9), Some(5))], vec![key(1)], |_| 0);
+        graph.replace(id(2, 0), vec![(key(1), Some(5))], vec![key(2)], |_| 0);
 
         let removed = graph.remove_file(FileId::new(1));
 
@@ -598,12 +710,12 @@ mod tests {
     #[test]
     fn a_derivation_writing_another_files_key_is_its_foreign_producer() {
         let mut graph = ReaderGraph::default();
-        graph.replace(id(2, 0), vec![], vec![key(1), key(2)]);
+        graph.replace(id(2, 0), vec![], vec![key(1), key(2)], |_| 0);
 
         assert_eq!(graph.foreign_producers(FileId::new(1)), vec![id(2, 0)]);
         assert!(graph.foreign_producers(FileId::new(2)).is_empty());
 
-        graph.replace(id(2, 0), vec![], vec![key(2)]);
+        graph.replace(id(2, 0), vec![], vec![key(2)], |_| 0);
 
         assert!(graph.foreign_producers(FileId::new(1)).is_empty());
     }
@@ -611,9 +723,9 @@ mod tests {
     #[test]
     fn a_key_read_before_and_produced_now_stays_live() {
         let mut graph = ReaderGraph::default();
-        graph.replace(id(1, 0), vec![(key(9), 5)], vec![]);
+        graph.replace(id(1, 0), vec![(key(9), Some(5))], vec![], |_| 0);
 
-        graph.replace(id(1, 0), vec![], vec![key(9)]);
+        graph.replace(id(1, 0), vec![], vec![key(9)], |_| 0);
 
         assert_eq!(graph.producers(&key(9)).collect::<Vec<_>>(), vec![id(1, 0)]);
         assert_eq!(

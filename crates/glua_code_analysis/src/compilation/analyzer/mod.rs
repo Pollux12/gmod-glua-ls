@@ -125,7 +125,7 @@ pub(crate) fn reanalyze(
         let scopes = ScriptedScopes::new(db);
         engine.note_rebuilt(&pending);
         let touched = replace_files(db, &mut engine, &pending, &scopes);
-        engine.forget_fingerprints();
+        db.reader_graph_mut().forget_fingerprints();
         engine.readers_of(db, touched.iter());
         let recipes = derive::Recipes::new(db, scopes);
         engine.run(db, &mut |db, id| recipes.evaluate(db, id));
@@ -362,7 +362,12 @@ fn document_source(
     local_inference::prepare_inferred_positive_guards(db, &context);
     run_analysis::<flow::FlowAnalysisPipeline>(db, &mut context);
     let (id, reads, outputs) = derivation::end().into_parts(|key| db.fact_fingerprint(key));
-    db.reader_graph_mut().replace(id, reads, outputs.clone());
+    let reads = reads
+        .into_iter()
+        .map(|(key, seen)| (key, Some(seen)))
+        .collect();
+    db.reader_graph_mut()
+        .replace(id, reads, outputs.clone(), |_| derivation::ABSENT);
     (
         outputs,
         std::mem::take(&mut context.inferred_guard_candidates),

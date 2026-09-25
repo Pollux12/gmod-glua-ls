@@ -21,8 +21,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use std::cell::RefCell;
-
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::DbIndex;
@@ -95,10 +93,6 @@ pub(crate) struct Engine {
     edits: derivation::EditMaps,
     /// Whether other files' references still have to follow `edits`.
     edits_pending: bool,
-    /// Fingerprints taken since the key was last written. Every write inside
-    /// an evaluation is one of its outputs, so a group's outputs are the only
-    /// keys it can move; writes outside `run` clear the whole cache.
-    fingerprints: RefCell<FxHashMap<HashedKey, derivation::Fingerprint>>,
 }
 
 impl Engine {
@@ -115,14 +109,8 @@ impl Engine {
         std::mem::take(&mut self.edits_pending).then(|| self.edits.clone())
     }
 
-    /// Whether a read of `key` that saw `seen` still holds: the value is the
-    /// same, or the same once the edits' moves are undone.
-    fn holds(&self, db: &DbIndex, key: &HashedKey, seen: derivation::Fingerprint) -> bool {
-        self.key_holds(db, key)(seen)
-    }
-
-    /// [`Self::holds`] for many readers of one key: each fingerprint is taken
-    /// once.
+    /// Whether reads of `key` that saw a fingerprint still hold: the value is
+    /// the same, or the same once the edits' moves are undone.
     fn key_holds<'a>(
         &'a self,
         db: &'a DbIndex,
@@ -133,32 +121,20 @@ impl Engine {
         move |seen| {
             seen == *current.get_or_init(|| self.fingerprint(db, key))
                 || (!self.edits.is_empty()
-                    && seen
-                        == *before_edits.get_or_init(|| {
-                            derivation::fingerprint_before_edits(&self.edits, || {
-                                db.fact_fingerprint(key)
-                            })
-                        }))
+                    && seen == *before_edits.get_or_init(|| self.fingerprint_before_edits(db, key)))
         }
     }
 
-    /// `key`'s current fingerprint, taken once per value.
+    fn fingerprint_before_edits(&self, db: &DbIndex, key: &HashedKey) -> derivation::Fingerprint {
+        derivation::fingerprint_before_edits(&self.edits, || db.fact_fingerprint(key))
+    }
+
+    /// `key`'s current fingerprint, taken once per value. Every write inside
+    /// an evaluation is one of its outputs, so a group's touched keys are the
+    /// only ones it can move; writes outside `run` forget every fingerprint.
     fn fingerprint(&self, db: &DbIndex, key: &HashedKey) -> derivation::Fingerprint {
-        if let Some(cached) = self.fingerprints.borrow().get(key).copied() {
-            if check_fingerprints() {
-                assert_eq!(
-                    cached,
-                    db.fact_fingerprint(key),
-                    "{key:?} moved without being written"
-                );
-            }
-            return cached;
-        }
-        let fingerprint = db.fact_fingerprint(key);
-        self.fingerprints
-            .borrow_mut()
-            .insert(key.clone(), fingerprint);
-        fingerprint
+        db.reader_graph()
+            .current_fingerprint(key, |key| db.fact_fingerprint(key))
     }
 
     /// Under `GLUALS_CHECK_FINGERPRINTS`, panics if a cached key other than
@@ -172,18 +148,13 @@ impl Engine {
         if !check_fingerprints() {
             return;
         }
-        for (key, cached) in self.fingerprints.borrow().iter() {
+        for (key, cached) in db.reader_graph().cached_fingerprints() {
             assert!(
-                except.contains(key) || *cached == db.fact_fingerprint(key),
+                except.contains(key) || cached == db.fact_fingerprint(key),
                 "{key:?} moved without being written while {}",
                 step()
             );
         }
-    }
-
-    /// Forgets every cached fingerprint: the index changed outside `run`.
-    pub(crate) fn forget_fingerprints(&mut self) {
-        self.fingerprints.get_mut().clear();
     }
 
     pub(crate) fn changed(&mut self, id: DerivationId) {
@@ -283,9 +254,13 @@ impl Engine {
             };
             self.cursor = Some(id);
             if reason == Reason::Read
-                && !db
-                    .reader_graph()
-                    .is_stale(id, |key, seen| self.holds(db, key, seen))
+                && !db.reader_graph().is_stale(
+                    id,
+                    |key| db.fact_fingerprint(key),
+                    |key, seen| {
+                        !self.edits.is_empty() && seen == self.fingerprint_before_edits(db, key)
+                    },
+                )
             {
                 if self.edits.is_empty() {
                     continue;
@@ -381,21 +356,22 @@ impl Engine {
             recipe(db, *member);
             evaluations.push(derivation::end());
         }
+        for key in touched
+            .iter()
+            .chain(evaluations.iter().flat_map(derivation::Evaluation::outputs))
         {
-            let mut fingerprints = self.fingerprints.borrow_mut();
-            for key in touched
-                .iter()
-                .chain(evaluations.iter().flat_map(derivation::Evaluation::outputs))
-            {
-                fingerprints.remove(key);
-            }
+            db.reader_graph().forget_fingerprint(key);
         }
         self.verify_fingerprints(db, &touched, || format!("evaluating {group:?}"));
+        // Out of the index while its records are replaced, so the reads can be
+        // fingerprinted against it.
+        let mut graph = std::mem::take(db.reader_graph_mut());
         for evaluation in evaluations {
-            let (id, reads, outputs) = evaluation.into_parts(|key| self.fingerprint(db, key));
+            let (id, reads, outputs) = evaluation.into_unfingerprinted_parts();
             touched.extend(outputs.iter().cloned());
-            db.reader_graph_mut().replace(id, reads, outputs);
+            graph.replace(id, reads, outputs, |key| db.fact_fingerprint(key));
         }
+        *db.reader_graph_mut() = graph;
         touched
     }
 }

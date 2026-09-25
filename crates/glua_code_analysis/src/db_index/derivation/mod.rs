@@ -690,6 +690,27 @@ impl Evaluation {
         self,
         fingerprint: impl Fn(&HashedKey) -> Fingerprint,
     ) -> (DerivationId, Vec<(HashedKey, Fingerprint)>, Vec<HashedKey>) {
+        let (id, reads, outputs) = self.into_unfingerprinted_parts();
+        let reads = reads
+            .into_iter()
+            .map(|(key, seen)| {
+                let seen = seen.unwrap_or_else(|| fingerprint(&key));
+                (key, seen)
+            })
+            .collect();
+        (id, reads, outputs)
+    }
+
+    /// [`Self::into_parts`] with each read's fingerprint left to the caller,
+    /// except those an earlier stage already took.
+    #[allow(clippy::type_complexity)]
+    pub fn into_unfingerprinted_parts(
+        self,
+    ) -> (
+        DerivationId,
+        Vec<(HashedKey, Option<Fingerprint>)>,
+        Vec<HashedKey>,
+    ) {
         let outputs = self.outputs;
         let file_id = self.id.file_id;
         let reads = self
@@ -703,10 +724,11 @@ impl Evaluation {
                     && !(own && (key.is_file_source() || self.id.kind == DerivationKind::Source))
             })
             .map(|key| {
-                let seen = match self.staged.get(&key) {
-                    Some(seen) if !outputs.contains(&key) => *seen,
-                    _ => fingerprint(&key),
-                };
+                let seen = self
+                    .staged
+                    .get(&key)
+                    .filter(|_| !outputs.contains(&key))
+                    .copied();
                 (key, seen)
             })
             .collect();

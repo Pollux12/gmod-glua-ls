@@ -7,11 +7,12 @@ mod test {
     /// engine must leave none.
     fn stale_derivations(ws: &VirtualWorkspace) -> Vec<DerivationId> {
         let db = ws.analysis.compilation.get_db();
-        let graph = db.reader_graph();
+        let mut graph = db.reader_graph().clone();
+        graph.forget_fingerprints();
         let mut stale = graph
             .derivations()
             .filter(|id| id.kind != DerivationKind::Diagnostics)
-            .filter(|id| graph.is_stale(*id, |key, seen| db.fact_fingerprint(key) == seen))
+            .filter(|id| graph.is_stale(*id, |key| db.fact_fingerprint(key), |_, _| false))
             .collect::<Vec<_>>();
         stale.sort();
         stale
