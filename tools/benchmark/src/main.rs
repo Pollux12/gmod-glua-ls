@@ -437,6 +437,31 @@ async fn run() {
 
     let mut results = Vec::new();
 
+    // `BENCH_THREADS` sizes both the analyzer's pool and the diagnostics
+    // threads, so `BENCH_THREADS=1` measures the whole run on one core.
+    let parallelism = match std::env::var("BENCH_THREADS") {
+        Ok(val) => match val.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            Ok(_) => {
+                eprintln!(
+                    "ERROR: BENCH_THREADS must be a positive integer, got: {}",
+                    val
+                );
+                std::process::exit(1);
+            }
+            Err(_) => {
+                eprintln!("ERROR: BENCH_THREADS is not a valid integer: {}", val);
+                std::process::exit(1);
+            }
+        },
+        Err(_) => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(16),
+    };
+    glua_code_analysis::set_analysis_threads(parallelism);
+    eprintln!("Threads: {parallelism}");
+
     // Phase 1: Config loading
     let t = Instant::now();
     let config_files = discover_config_files(&large_path);
@@ -694,26 +719,6 @@ async fn run() {
         precompute_t.elapsed().as_secs_f64()
     );
 
-    let parallelism = match std::env::var("BENCH_THREADS") {
-        Ok(val) => match val.parse::<usize>() {
-            Ok(n) if n > 0 => n,
-            Ok(_) => {
-                eprintln!(
-                    "ERROR: BENCH_THREADS must be a positive integer, got: {}",
-                    val
-                );
-                std::process::exit(1);
-            }
-            Err(_) => {
-                eprintln!("ERROR: BENCH_THREADS is not a valid integer: {}", val);
-                std::process::exit(1);
-            }
-        },
-        Err(_) => std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(16),
-    };
     eprintln!(
         "Diagnostics: {} files, {} threads",
         diag_file_count, parallelism

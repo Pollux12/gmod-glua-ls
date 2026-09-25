@@ -31,6 +31,27 @@ use crate::{FileId, profile::Profile};
 /// out to a worker pool.
 const MIN_PARALLEL_FILES: usize = 8;
 
+/// Analysis threads requested through [`set_analysis_threads`]; 0 until then.
+static REQUESTED_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// Sets how many threads analysis uses, pool and caller included. One runs
+/// every batch on the caller's thread. Takes effect for the pool only if set
+/// before its first use, so callers set it before indexing.
+pub fn set_analysis_threads(threads: usize) {
+    REQUESTED_THREADS.store(threads, Ordering::Relaxed);
+}
+
+/// The requested thread count, else the machine's parallelism capped at 16.
+fn analysis_threads() -> usize {
+    match REQUESTED_THREADS.load(Ordering::Relaxed) {
+        0 => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 16),
+        threads => threads,
+    }
+}
+
 /// Whether this batch is better run on the caller's thread than handed to the
 /// pool: too few files to pay the dispatch, or nothing to run in parallel on.
 ///
@@ -39,17 +60,13 @@ const MIN_PARALLEL_FILES: usize = 8;
 pub(crate) fn runs_inline(file_count: usize) -> bool {
     // An evaluation records its reads on its own thread; work handed to a
     // pool worker would read unrecorded.
-    if file_count < MIN_PARALLEL_FILES || crate::db_index::derivation::recording() {
-        return true;
-    }
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        <= 1
+    file_count < MIN_PARALLEL_FILES
+        || crate::db_index::derivation::recording()
+        || analysis_threads() <= 1
 }
 
-/// Size rayon's global pool to the same 16-thread cap the scoped pool used, and
-/// give its workers the stack analysis needs.
+/// Size rayon's global pool to [`analysis_threads`], and give its workers the
+/// stack analysis needs.
 ///
 /// Workers run the same recursive inference and type-graph walks the caller's
 /// thread does, so they get [`crate::ANALYSIS_STACK_SIZE`] rather than the
@@ -58,11 +75,8 @@ pub(crate) fn runs_inline(file_count: usize) -> bool {
 pub(crate) fn init_pool() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
         let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(cores.clamp(1, 16))
+            .num_threads(analysis_threads())
             .stack_size(crate::ANALYSIS_STACK_SIZE)
             .build_global();
     });
@@ -138,4 +152,24 @@ pub(crate) fn dispatch_order(db: &DbIndex, file_ids: &[FileId]) -> Vec<usize> {
         (std::cmp::Reverse(size), idx)
     });
     order
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_analysis_thread_runs_every_batch_on_the_caller() {
+        let mut ws = crate::VirtualWorkspace::new();
+        let file_ids = (0..MIN_PARALLEL_FILES * 2)
+            .map(|index| ws.def_file(&format!("lua/autorun/f{index}.lua"), "local a = 1"))
+            .collect::<Vec<_>>();
+        let caller = std::thread::current().id();
+        set_analysis_threads(1);
+        let threads = map_files_collect(ws.get_db_mut(), &file_ids, |_, _| {
+            std::thread::current().id()
+        });
+        set_analysis_threads(0);
+        assert!(threads.iter().all(|thread| *thread == caller));
+    }
 }
