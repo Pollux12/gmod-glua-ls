@@ -120,6 +120,7 @@ fn note_slot_write(owner: &LuaMemberOwner, key: &LuaMemberKey) {
 
 fn note_owner_map_write(owner: &LuaMemberOwner) {
     derivation::note_write(|| FactKey::MemberOwnerMap(owner.clone()));
+    derivation::note_write(|| FactKey::MemberOwnerExprKeys(owner.clone()));
 }
 
 fn note_slot_read(owner: &LuaMemberOwner, key: &LuaMemberKey) {
@@ -330,6 +331,11 @@ impl LuaMemberIndex {
         match key {
             FactKey::Member(id) => self.member_fingerprint(*id),
             FactKey::MemberSlot(owner, key) => self.slot_fingerprint(owner, key),
+            FactKey::MemberOwnerExprKeys(owner) => {
+                self.owner_members.get(owner).map_or(ABSENT, |members| {
+                    fingerprint_of(&members.sorted_expr_key_member_ids())
+                })
+            }
             FactKey::MemberOwnerMap(owner) => {
                 let items = self.owner_members.get(owner).map_or(ABSENT, |members| {
                     members
@@ -461,19 +467,13 @@ impl LuaMemberIndex {
         classes: &[Option<&crate::LuaTypeDeclId>],
     ) {
         derivation::note_write(|| FactKey::GlobalPath(path.clone()));
-        derivation::note_write(|| {
-            FactKey::MemberOwnerMap(LuaMemberOwner::GlobalPath(path.clone()))
-        });
+        note_owner_map_write(&LuaMemberOwner::GlobalPath(path.clone()));
         if let Some(site) = site {
             derivation::note_write(|| FactKey::DefinitionSite(site.clone()));
-            derivation::note_write(|| {
-                FactKey::MemberOwnerMap(LuaMemberOwner::Element(site.clone()))
-            });
+            note_owner_map_write(&LuaMemberOwner::Element(site.clone()));
         }
         for class in classes.iter().flatten() {
-            derivation::note_write(|| {
-                FactKey::MemberOwnerMap(LuaMemberOwner::Type((*class).clone()))
-            });
+            note_owner_map_write(&LuaMemberOwner::Type((*class).clone()));
         }
     }
 
@@ -2069,7 +2069,7 @@ impl LuaMemberIndex {
     /// the same order [`Self::get_members`] would yield them.
     pub fn get_expr_key_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
         let owner = self.canonical(owner);
-        note_owner_map_read(owner);
+        derivation::note_read(|| FactKey::MemberOwnerExprKeys(owner.clone()));
         let owner_members = self.owner_members.get(owner)?;
         Some(
             owner_members

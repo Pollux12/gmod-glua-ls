@@ -835,6 +835,15 @@ impl DynamicFieldIndex {
         self.owner_fields.get(owner)
     }
 
+    /// Whether `owner` has a direct definition of `field_name`: read as that
+    /// field alone, not the owner's whole field set.
+    pub fn has_direct_field(&self, owner: &DynamicFieldOwner, field_name: &str) -> bool {
+        derivation::note_read(|| FactKey::DynamicField(owner.clone(), Some(field_name.into())));
+        self.direct_field_definitions
+            .get(owner)
+            .is_some_and(|fields| fields.contains_key(field_name))
+    }
+
     pub fn get_direct_fields(
         &self,
         owner: &DynamicFieldOwner,

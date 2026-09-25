@@ -1769,8 +1769,7 @@ fn direct_subtypes_with_member(
                 .get_member_item(&LuaMemberOwner::Type(child_id.clone()), member_key)
                 .is_some()
                 || matches!(member_key, LuaMemberKey::Name(name) if dynamic_index
-                    .get_direct_fields(&crate::DynamicFieldOwner::Type(child_id))
-                    .is_some_and(|fields| fields.contains_key(name)))
+                    .has_direct_field(&crate::DynamicFieldOwner::Type(child_id), name))
         })
         .map(|child| (child.get_name().to_string(), child.get_id()))
         .collect::<Vec<_>>();
