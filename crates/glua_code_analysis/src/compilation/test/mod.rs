@@ -12,6 +12,7 @@ mod dependency_test;
 mod diagnostic_disable_test;
 mod engine_schedule_test;
 mod export_test;
+mod fanout_test;
 mod flat_enum_test;
 mod flow;
 mod for_range_var_infer_test;
