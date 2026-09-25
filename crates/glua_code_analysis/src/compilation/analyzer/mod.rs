@@ -342,6 +342,7 @@ fn declare_source(
     derivation::resume(evaluation);
     let mut context = AnalyzeContext::for_files(db, vec![file_id], scopes);
     run_analysis::<decl::DeclAnalysisPipeline>(db, &mut context);
+    dynamic_field::index_field_setter_helpers(db, file_id);
     let mut evaluation = derivation::end();
     evaluation.fingerprint_stage(|key| db.fact_fingerprint(key));
     (evaluation, context)

@@ -1,4 +1,6 @@
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::time::Duration;
 
 use glua_parser::{
@@ -52,7 +54,7 @@ enum DynamicFieldAnalysisMode {
     Full,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FieldSetterHelper {
     table_param_index: usize,
     key_param_index: usize,
@@ -80,42 +82,48 @@ type FiniteNamedMemberEvidence = (
     bool,
 );
 
-#[derive(Default, Clone)]
-struct FieldSetterHelperCache {
-    helpers: FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>>,
-    non_helpers: FxHashSet<LuaSignatureId>,
+/// One file's field-setter helpers: the closures, by position, whose body
+/// writes `table_param[key_param]`.
+#[derive(Debug, Default)]
+pub(crate) struct FileFieldSetterHelpers(FxHashMap<TextSize, Vec<FieldSetterHelper>>);
+
+impl Hash for FileFieldSetterHelpers {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let mut helpers = self.0.iter().collect::<Vec<_>>();
+        helpers.sort_by_key(|(position, _)| **position);
+        helpers.len().hash(state);
+        for (position, patterns) in helpers {
+            crate::db_index::derivation::hash_local(position, state);
+            patterns.hash(state);
+        }
+    }
 }
 
-impl FieldSetterHelperCache {
-    fn from_tree_list(tree_list: &[InFiled<glua_parser::LuaChunk>]) -> Self {
-        Self {
-            helpers: collect_field_setter_helpers(tree_list),
-            non_helpers: FxHashSet::default(),
-        }
+impl crate::db_index::derivation::DerivedFact for FileFieldSetterHelpers {
+    fn fingerprint(&self) -> crate::db_index::derivation::Fingerprint {
+        crate::db_index::derivation::fingerprint_of(self)
     }
+}
 
-    fn patterns_for_signature(
-        &mut self,
-        db: &DbIndex,
-        signature_id: LuaSignatureId,
-    ) -> Vec<FieldSetterHelper> {
-        if let Some(patterns) = self.helpers.get(&signature_id) {
-            return patterns.clone();
-        }
-
-        if self.non_helpers.contains(&signature_id) {
-            return Vec::new();
-        }
-
-        let patterns = collect_field_setter_helpers_for_signature(db, signature_id);
-        if patterns.is_empty() {
-            self.non_helpers.insert(signature_id);
-        } else {
-            self.helpers.insert(signature_id, patterns.clone());
-        }
-
-        patterns
+/// Stores `file_id`'s field-setter helpers: part of its source layer.
+pub(super) fn index_field_setter_helpers(db: &mut DbIndex, file_id: crate::FileId) {
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .map(|tree| tree.get_chunk_node())
+    else {
+        return;
+    };
+    let helpers = collect_field_setter_helpers(&root);
+    if !helpers.0.is_empty() {
+        db.set_field_setter_helpers(file_id, Arc::new(helpers));
     }
+}
+
+fn patterns_for_signature(db: &DbIndex, signature_id: LuaSignatureId) -> Vec<FieldSetterHelper> {
+    db.get_field_setter_helpers::<FileFieldSetterHelpers>(signature_id.get_file_id())
+        .and_then(|helpers| helpers.0.get(&signature_id.get_position()).cloned())
+        .unwrap_or_default()
 }
 
 impl DynamicFieldAnalysisMode {
@@ -188,15 +196,13 @@ fn field_definition_sites(
 /// (lua/unresolve analysis is complete) plus the file's own AST, and writes
 /// nothing to the db — all results are returned for sequential merge. Uses a
 /// fresh per-file infer cache (the db is immutable during this pass, so a cold
-/// cache yields identical inference results) and a local clone of the workspace
-/// field-setter-helper registry (a deterministic memoization cache). This makes
-/// the collection safe to run concurrently across files.
+/// cache yields identical inference results). This makes the collection safe
+/// to run concurrently across files.
 fn collect_dynamic_fields_for_file(
     db: &DbIndex,
     file_id: crate::FileId,
     root: &glua_parser::LuaChunk,
     mode: DynamicFieldAnalysisMode,
-    field_setter_helpers: &FieldSetterHelperCache,
 ) -> (
     Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
     Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
@@ -216,7 +222,6 @@ fn collect_dynamic_fields_for_file(
     let mut collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)> =
         Vec::new();
     let mut collected_finite_members = Vec::new();
-    let mut field_setter_helpers = field_setter_helpers.clone();
     // The records are what this pass is building. A cold build has none yet,
     // and a re-index of some files has the rest of the workspace's, with the
     // re-indexed files' contributions removed: a partial record that names a
@@ -366,14 +371,7 @@ fn collect_dynamic_fields_for_file(
         // propagation runs here.
         let non_site_start = collected.len();
         for call_expr in root.descendants::<LuaCallExpr>() {
-            collect_field_setter_helper_call_fields(
-                db,
-                cache,
-                &call_expr,
-                file_id,
-                &mut field_setter_helpers,
-                &mut collected,
-            );
+            collect_field_setter_helper_call_fields(db, cache, &call_expr, file_id, &mut collected);
             collect_setmetatable_table_fields(
                 db,
                 cache,
@@ -420,15 +418,6 @@ fn analyze_dynamic_fields(
     let stderr_profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
     let profile_enabled = log::log_enabled!(log::Level::Info) || stderr_profile_enabled;
     let mut profile = profile_enabled.then(DynamicFieldProfile::default);
-    let helper_start = profile_enabled.then(std::time::Instant::now);
-    let field_setter_helpers = if mode.collect_direct_assignments() {
-        FieldSetterHelperCache::from_tree_list(&tree_list)
-    } else {
-        FieldSetterHelperCache::default()
-    };
-    if let (Some(profile), Some(helper_start)) = (profile.as_mut(), helper_start) {
-        profile.helper_cache_time += helper_start.elapsed();
-    }
 
     // Collection is read-only against an immutable `&DbIndex` and writes only to
     // per-file local buffers, so it runs concurrently across files. Results are
@@ -443,7 +432,7 @@ fn analyze_dynamic_fields(
         else {
             return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         };
-        collect_dynamic_fields_for_file(db, file_id, &root, mode, &field_setter_helpers)
+        collect_dynamic_fields_for_file(db, file_id, &root, mode)
     });
     if let (Some(profile), Some(collection_start)) = (profile.as_mut(), collection_start) {
         profile.collection_time += collection_start.elapsed();
@@ -504,49 +493,24 @@ fn analyze_dynamic_fields(
     }
 }
 
-fn collect_field_setter_helpers(
-    tree_list: &[InFiled<glua_parser::LuaChunk>],
-) -> FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>> {
-    let mut helpers: FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>> = FxHashMap::default();
-
-    for in_filed_tree in tree_list {
-        let file_id = in_filed_tree.file_id;
-        let root = in_filed_tree.value.clone();
-        for closure in root.descendants::<LuaClosureExpr>() {
-            let signature_id = LuaSignatureId::from_closure(file_id, &closure);
-            let patterns = collect_field_setter_helpers_in_closure(&closure);
-            if !patterns.is_empty() {
-                helpers.insert(signature_id, patterns);
-            }
-        }
-    }
-
-    helpers
-}
-
-fn collect_field_setter_helpers_in_closure(closure: &LuaClosureExpr) -> Vec<FieldSetterHelper> {
-    let Some(params_list) = closure.get_params_list() else {
-        return Vec::new();
-    };
-    let param_names = params_list
-        .get_params()
-        .filter_map(|param| {
-            param
-                .get_name_token()
-                .map(|token| token.get_name_text().to_string())
-        })
-        .collect::<Vec<_>>();
-    if param_names.len() < 2 {
-        return Vec::new();
-    }
-
-    let Some(block) = closure.get_block() else {
-        return Vec::new();
-    };
-
-    let mut helpers = Vec::new();
-    for assign in block.descendants::<LuaAssignStat>() {
-        if assign.ancestors::<LuaClosureExpr>().next().as_ref() != Some(closure) {
+fn collect_field_setter_helpers(root: &glua_parser::LuaChunk) -> FileFieldSetterHelpers {
+    let mut helpers: FxHashMap<TextSize, Vec<FieldSetterHelper>> = FxHashMap::default();
+    for assign in root.descendants::<LuaAssignStat>() {
+        let Some(closure) = assign.ancestors::<LuaClosureExpr>().next() else {
+            continue;
+        };
+        let Some(params_list) = closure.get_params_list() else {
+            continue;
+        };
+        let param_names = params_list
+            .get_params()
+            .filter_map(|param| {
+                param
+                    .get_name_token()
+                    .map(|token| token.get_name_text().to_string())
+            })
+            .collect::<Vec<_>>();
+        if param_names.len() < 2 {
             continue;
         }
 
@@ -568,14 +532,17 @@ fn collect_field_setter_helpers_in_closure(closure: &LuaClosureExpr) -> Vec<Fiel
                 continue;
             };
 
-            helpers.push(FieldSetterHelper {
-                table_param_index,
-                key_param_index,
-            });
+            helpers
+                .entry(closure.get_position())
+                .or_default()
+                .push(FieldSetterHelper {
+                    table_param_index,
+                    key_param_index,
+                });
         }
     }
 
-    helpers
+    FileFieldSetterHelpers(helpers)
 }
 
 fn collect_field_setter_helper_call_fields(
@@ -583,7 +550,6 @@ fn collect_field_setter_helper_call_fields(
     cache: &mut crate::LuaInferCache,
     call_expr: &LuaCallExpr,
     file_id: crate::FileId,
-    helpers: &mut FieldSetterHelperCache,
     collected: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
 ) {
     let Some(args_list) = call_expr.get_args_list() else {
@@ -600,7 +566,7 @@ fn collect_field_setter_helper_call_fields(
     let Some(prefix_expr) = call_expr.get_prefix_expr() else {
         return;
     };
-    let helper_patterns = helper_patterns_for_call(db, cache, &prefix_expr, helpers);
+    let helper_patterns = helper_patterns_for_call(db, cache, &prefix_expr);
     if helper_patterns.is_empty() {
         return;
     };
@@ -655,48 +621,45 @@ fn helper_patterns_for_call(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
     prefix_expr: &LuaExpr,
-    helpers: &mut FieldSetterHelperCache,
 ) -> Vec<FieldSetterHelper> {
     if let LuaExpr::NameExpr(name_expr) = prefix_expr
         && let Some(signature_id) = direct_name_expr_signature_id(db, cache, name_expr)
     {
-        return helpers.patterns_for_signature(db, signature_id);
+        return patterns_for_signature(db, signature_id);
     }
 
-    helper_patterns_for_call_fallback(db, cache, prefix_expr, helpers)
+    helper_patterns_for_call_fallback(db, cache, prefix_expr)
 }
 
 fn helper_patterns_for_call_fallback(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
     prefix_expr: &LuaExpr,
-    helpers: &mut FieldSetterHelperCache,
 ) -> Vec<FieldSetterHelper> {
     let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) else {
         return Vec::new();
     };
 
     let mut result = Vec::new();
-    collect_helper_patterns_from_type(db, &prefix_type, helpers, &mut result);
+    collect_helper_patterns_from_type(db, &prefix_type, &mut result);
     result
 }
 
 fn collect_helper_patterns_from_type(
     db: &DbIndex,
     typ: &LuaType,
-    helpers: &mut FieldSetterHelperCache,
     result: &mut Vec<FieldSetterHelper>,
 ) {
     match typ {
         LuaType::Signature(signature_id) => {
-            result.extend(helpers.patterns_for_signature(db, *signature_id));
+            result.extend(patterns_for_signature(db, *signature_id));
         }
         LuaType::Union(union_type) => {
             for typ in union_type.types() {
-                collect_helper_patterns_from_type(db, typ, helpers, result);
+                collect_helper_patterns_from_type(db, typ, result);
             }
         }
-        LuaType::TypeGuard(inner) => collect_helper_patterns_from_type(db, inner, helpers, result),
+        LuaType::TypeGuard(inner) => collect_helper_patterns_from_type(db, inner, result),
         _ => {}
     }
 }
@@ -711,28 +674,8 @@ fn direct_name_expr_signature_id(
         .get_var_reference_decl(&cache.get_file_id(), name_expr.get_range())?;
     let decl = db.get_decl_index().get_decl(&decl_id)?;
     let value_syntax_id = decl.get_value_syntax_id()?;
-    let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
-    let value_expr = LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)?;
-    let LuaExpr::ClosureExpr(closure) = value_expr else {
-        return None;
-    };
-
-    Some(LuaSignatureId::from_closure(decl.get_file_id(), &closure))
-}
-
-fn collect_field_setter_helpers_for_signature(
-    db: &DbIndex,
-    signature_id: LuaSignatureId,
-) -> Vec<FieldSetterHelper> {
-    let Some(tree) = db.get_vfs().get_syntax_tree(&signature_id.get_file_id()) else {
-        return Vec::new();
-    };
-
-    tree.get_chunk_node()
-        .descendants::<LuaClosureExpr>()
-        .find(|closure| closure.get_position() == signature_id.get_position())
-        .map(|closure| collect_field_setter_helpers_in_closure(&closure))
-        .unwrap_or_default()
+    (value_syntax_id.get_kind() == LuaSyntaxKind::ClosureExpr)
+        .then(|| LuaSignatureId::new(decl.get_file_id(), value_syntax_id.get_range().start()))
 }
 
 fn param_index_key_index(key: &LuaIndexKey, param_names: &[String]) -> Option<usize> {
@@ -763,7 +706,6 @@ struct DynamicFieldProfile {
     owner_cache_hits: usize,
     owner_cache_misses: usize,
     owner_infer_time: Duration,
-    helper_cache_time: Duration,
     collection_time: Duration,
     collection_merge_time: Duration,
     propagation_time: Duration,
@@ -773,7 +715,7 @@ struct DynamicFieldProfile {
 impl DynamicFieldProfile {
     fn summary(&self, file_count: usize, collected: usize, propagated: usize) -> String {
         format!(
-            "dynamic field profile: files={} assignments={} vars={} index_candidates={} no_field_name_skips={} calls={} fields_collected={} collected_entries={} propagated={} owner_cache_hits={} owner_cache_misses={} owner_infer_time={:?} helper_cache_time={:?} collection_time={:?} collection_merge_time={:?} propagation_time={:?} insertion_time={:?}",
+            "dynamic field profile: files={} assignments={} vars={} index_candidates={} no_field_name_skips={} calls={} fields_collected={} collected_entries={} propagated={} owner_cache_hits={} owner_cache_misses={} owner_infer_time={:?} collection_time={:?} collection_merge_time={:?} propagation_time={:?} insertion_time={:?}",
             file_count,
             self.assignments_scanned,
             self.vars_scanned,
@@ -786,7 +728,6 @@ impl DynamicFieldProfile {
             self.owner_cache_hits,
             self.owner_cache_misses,
             self.owner_infer_time,
-            self.helper_cache_time,
             self.collection_time,
             self.collection_merge_time,
             self.propagation_time,

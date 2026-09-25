@@ -93,4 +93,70 @@ mod test {
 
         assert_eq!(stale_derivations(&ws), Vec::new());
     }
+
+    fn helper_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws
+    }
+
+    const SETTER_HELPERS: &str =
+        "Glide = {}\nfunction Glide.SetNumber(t, k, v)\n    t[k] = v\nend\n";
+    const SETTER_CALLER: &str =
+        "local data = {}\nGlide.SetNumber(data, \"buoyancy\", 1)\nlocal offset = data.buoyancy\n";
+
+    fn has_dynamic_field(ws: &VirtualWorkspace, name: &str) -> bool {
+        ws.analysis
+            .compilation
+            .get_db()
+            .get_dynamic_field_index()
+            .iter_all_field_definitions()
+            .any(|(_, fields)| fields.keys().any(|field| field.as_str() == name))
+    }
+
+    #[test]
+    fn a_callee_edit_that_keeps_its_setter_helpers_leaves_callers_dynamic_fields_settled() {
+        let mut ws = helper_workspace();
+        ws.def_file("lua/autorun/sh_helpers.lua", SETTER_HELPERS);
+        ws.def_file("lua/autorun/sh_caller.lua", SETTER_CALLER);
+        assert!(has_dynamic_field(&ws, "buoyancy"));
+
+        ws.def_file(
+            "lua/autorun/sh_helpers.lua",
+            &format!("{SETTER_HELPERS}local unrelated = 1\n"),
+        );
+
+        let stats = ws.analysis.compilation.last_stats();
+        assert_eq!(stats.evaluations(DerivationKind::DynamicFields), 1);
+        assert!(has_dynamic_field(&ws, "buoyancy"));
+    }
+
+    #[test]
+    fn a_callers_helper_fields_follow_edit_delete_and_reopen_of_the_helper_file() {
+        let mut ws = helper_workspace();
+        let helpers_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/sh_helpers.lua");
+        ws.def_file("lua/autorun/sh_helpers.lua", SETTER_HELPERS);
+        ws.def_file("lua/autorun/sh_caller.lua", SETTER_CALLER);
+        assert!(has_dynamic_field(&ws, "buoyancy"));
+
+        ws.def_file(
+            "lua/autorun/sh_helpers.lua",
+            "Glide = {}\nfunction Glide.SetNumber(t, k, v)\n    t.other = v\nend\n",
+        );
+        assert!(!has_dynamic_field(&ws, "buoyancy"));
+
+        ws.def_file("lua/autorun/sh_helpers.lua", SETTER_HELPERS);
+        assert!(has_dynamic_field(&ws, "buoyancy"));
+
+        ws.analysis.remove_file_by_uri(&helpers_uri);
+        assert!(!has_dynamic_field(&ws, "buoyancy"));
+
+        ws.def_file("lua/autorun/sh_helpers.lua", SETTER_HELPERS);
+        assert!(has_dynamic_field(&ws, "buoyancy"));
+    }
 }
