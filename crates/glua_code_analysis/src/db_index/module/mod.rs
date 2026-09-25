@@ -289,6 +289,47 @@ impl LuaModuleIndex {
         }
     }
 
+    /// Rewrites the exports of other files' modules that name positions of
+    /// `remap.file_id`. Returns the files whose export named a position the
+    /// edit destroyed: they are re-analysed instead.
+    pub fn remap_file_exports(&mut self, remap: &crate::FileRemap) -> FxHashSet<FileId> {
+        let mut lost = FxHashSet::default();
+        for (file_id, info) in &mut self.file_module_map {
+            if *file_id == remap.file_id {
+                continue;
+            }
+            let export = info
+                .export_type
+                .as_ref()
+                .map(|typ| crate::remap_identities_in_type(typ, remap));
+            let semantic_id = info
+                .semantic_id
+                .as_ref()
+                .map(|id| remap.semantic_decl_id(id));
+            if export.as_ref().is_some_and(|export| export.lost)
+                || semantic_id.as_ref().is_some_and(crate::Remap::is_lost)
+            {
+                lost.insert(*file_id);
+                continue;
+            }
+            let mut moved = false;
+            if let Some(typ) = export.and_then(|export| export.typ) {
+                info.export_type = Some(typ);
+                moved = true;
+            }
+            if let Some(crate::Remap::Moved(id)) = semantic_id
+                && info.semantic_id.as_ref() != Some(&id)
+            {
+                info.semantic_id = Some(id);
+                moved = true;
+            }
+            if moved {
+                note_module_fact_write(*file_id);
+            }
+        }
+        lost
+    }
+
     pub fn get_module_mut(&mut self, file_id: FileId) -> Option<&mut ModuleInfo> {
         derivation::note_read(|| FactKey::Module(file_id));
         self.note_lookup_keys(file_id);

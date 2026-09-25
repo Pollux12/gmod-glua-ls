@@ -40,6 +40,8 @@ pub fn remap_into_file(db: &mut DbIndex, remap: &FileRemap) -> HashSet<FileId> {
     dirty.extend(pass);
     let pass = db.get_metatable_index_mut().remap_file_ranges(remap);
     dirty.extend(pass);
+    let pass = db.get_module_index_mut().remap_file_exports(remap);
+    dirty.extend(pass);
     let pass = db
         .get_flow_index_mut()
         .remap_special_call_effect_types(remap);

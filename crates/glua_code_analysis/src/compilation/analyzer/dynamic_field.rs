@@ -1512,7 +1512,7 @@ fn collect_pairs_source_owners(typ: &LuaType, owners: &mut Vec<LuaMemberOwner>) 
 fn member_key_is_written_literally(db: &DbIndex, member: &crate::LuaMember) -> bool {
     let Some(root) = db
         .get_vfs()
-        .get_syntax_tree(&member.get_file_id())
+        .syntax_tree_around(&member.get_file_id(), member.get_syntax_id().get_range())
         .map(|tree| tree.get_red_root())
     else {
         return false;

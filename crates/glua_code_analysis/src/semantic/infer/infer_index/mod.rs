@@ -1721,7 +1721,7 @@ fn is_dynamic_field_fallback_realm_compatible(
 }
 
 fn is_table_const_from_doc_tag(db: &DbIndex, inst: &InFiled<TextRange>) -> bool {
-    let Some(root) = db.get_vfs().get_syntax_tree(&inst.file_id) else {
+    let Some(root) = db.get_vfs().syntax_tree_around(&inst.file_id, inst.value) else {
         return false;
     };
 

@@ -1172,11 +1172,15 @@ fn is_table_const_from_doc_tag(
     semantic_model: &SemanticModel,
     id: &crate::InFiled<rowan::TextRange>,
 ) -> bool {
-    let Some(root) = semantic_model.get_root_by_file_id(id.file_id) else {
+    let Some(tree) = semantic_model
+        .get_db()
+        .get_vfs()
+        .syntax_tree_around(&id.file_id, id.value)
+    else {
         return false;
     };
 
-    is_doc_tag_table_const(root.syntax(), id.value)
+    is_doc_tag_table_const(&tree.get_red_root(), id.value)
 }
 
 /// 检查枚举类型的自引用

@@ -9,11 +9,14 @@ pub use collect_workspace_files::*;
 pub use document::LuaDocument;
 pub use file_id::{FileId, InFiled};
 pub use file_uri_handler::{file_path_to_uri, uri_to_file_path};
-use glua_parser::{LineIndex, LuaParseError, LuaParser, LuaSyntaxTree, LuaTokenKind};
+use glua_parser::{
+    LineIndex, LuaAstNode, LuaParseError, LuaParser, LuaSyntaxNode, LuaSyntaxTree, LuaTokenKind,
+};
 pub(crate) use loader::normalize_path_for_ordering;
 pub use loader::{LuaFileInfo, load_workspace_files, read_file_with_encoding};
 use lsp_types::Uri;
 use rowan::NodeCache;
+use rowan::TextRange;
 use rustc_hash::FxHashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,6 +43,15 @@ pub struct Vfs {
     /// The text each changed file had when it was last indexed (`None` for a
     /// file that had none), until the next index takes its edit.
     edit_bases: FxHashMap<FileId, Option<String>>,
+}
+
+/// The child of `tree`'s top-level block that contains `range`.
+fn top_level_statement(tree: &LuaSyntaxTree, range: TextRange) -> Option<LuaSyntaxNode> {
+    tree.get_chunk_node()
+        .get_block()?
+        .syntax()
+        .child_or_token_at_range(range)?
+        .into_node()
 }
 
 fn trees_semantically_equal(left: &LuaSyntaxTree, right: &LuaSyntaxTree) -> bool {
@@ -465,6 +477,37 @@ impl Vfs {
                 .and_then(Option::as_ref)
                 .map(|data| &data.content),
         )
+    }
+
+    /// `id`'s syntax tree, for a caller that inspects only the top-level
+    /// statement containing `range`: that statement is what it reads, not the
+    /// whole file, so edits elsewhere in the file leave the read standing.
+    pub fn syntax_tree_around(&self, id: &FileId, range: TextRange) -> Option<&LuaSyntaxTree> {
+        let tree = self.tree_map.get(id)?;
+        if crate::db_index::derivation::recording() {
+            match top_level_statement(tree, range) {
+                Some(statement) => {
+                    crate::db_index::derivation::note_syntax_read(*id, statement.text_range())
+                }
+                None => crate::db_index::derivation::note_file_read(*id),
+            }
+        }
+        Some(tree)
+    }
+
+    /// The fingerprint of the top-level statement at `site`, for
+    /// [`FactKey::Syntax`](crate::db_index::derivation::FactKey::Syntax).
+    pub(crate) fn statement_fingerprint(
+        &self,
+        site: &InFiled<TextRange>,
+    ) -> crate::db_index::derivation::Fingerprint {
+        let statement = self
+            .tree_map
+            .get(&site.file_id)
+            .and_then(|tree| top_level_statement(tree, site.value))
+            .filter(|statement| statement.text_range() == site.value)
+            .map(|statement| (site, statement.kind(), statement.text().to_string()));
+        crate::db_index::derivation::fingerprint_opt(statement.as_ref())
     }
 
     pub fn get_file_version(&self, id: &FileId) -> Option<i32> {

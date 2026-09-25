@@ -155,6 +155,7 @@ impl EditMaps {
             K::DefinitionSite(site) => K::DefinitionSite(self.site(site)?),
             K::Metatable(site) => K::Metatable(self.site(site)?),
             K::TableClass(site) => K::TableClass(self.site(site)?),
+            K::Syntax(site) => K::Syntax(self.site(site)?),
             K::Signature(id) => K::Signature(self.signature_id(*id)?),
             K::ValidGuard(id) => K::ValidGuard(self.signature_id(*id)?),
             K::InferredGuard(id) => K::InferredGuard(self.signature_id(*id)?),

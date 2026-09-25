@@ -885,7 +885,7 @@ fn dynamic_field_member_type_inner(
 
     let root = db
         .get_vfs()
-        .get_syntax_tree(&member_id.file_id)?
+        .syntax_tree_around(&member_id.file_id, member_id.get_syntax_id().get_range())?
         .get_red_root();
     let node = member_id.get_syntax_id().to_node_from_root(&root)?;
 
@@ -1125,7 +1125,7 @@ fn dynamic_field_definition_syntax_uncached(
     let mut syntax = DynamicFieldDefinitionSyntax::default();
     let file_id = definition.file_id;
     let range = definition.value;
-    let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
+    let Some(tree) = db.get_vfs().syntax_tree_around(&file_id, range) else {
         return syntax;
     };
     let root = tree.get_red_root();
@@ -1215,7 +1215,7 @@ pub(crate) fn member_key_as_type(key: &LuaMemberKey) -> Option<LuaType> {
 pub fn get_member_value_expr(db: &DbIndex, member_id: LuaMemberId) -> Option<LuaExpr> {
     let root = db
         .get_vfs()
-        .get_syntax_tree(&member_id.file_id)?
+        .syntax_tree_around(&member_id.file_id, member_id.get_syntax_id().get_range())?
         .get_red_root();
     let node = member_id.get_syntax_id().to_node_from_root(&root)?;
 
@@ -1349,7 +1349,7 @@ fn resolve_member_owner(
 ) -> Option<LuaSemanticDeclId> {
     let root = db
         .get_vfs()
-        .get_syntax_tree(&member_id.file_id)?
+        .syntax_tree_around(&member_id.file_id, member_id.get_syntax_id().get_range())?
         .get_red_root();
     let current_node = member_id.get_syntax_id().to_node_from_root(&root)?;
     match member_id.get_syntax_id().get_kind() {

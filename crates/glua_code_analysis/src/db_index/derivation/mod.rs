@@ -228,6 +228,8 @@ pub enum FactKey {
     DiagnosticFile(FileId),
     /// A file's text and syntax tree.
     FileText(FileId),
+    /// One top-level statement of a file, by its range: its kind and text.
+    Syntax(InFiled<TextRange>),
     /// The set of files in the workspace.
     FileSet,
 }
@@ -387,12 +389,20 @@ impl FactKey {
     /// Removing that file's facts removes whatever any derivation stored under
     /// the key.
     /// Whether the edit remap (`remap_into_file`) rewrites the positions of an
-    /// edited file that this key's value names.
+    /// edited file that this key's value names. A decl claim, module metadata
+    /// and module names name no position outside the writer's own file, so
+    /// they never name an edited file's position for a writer that did not
+    /// run.
     pub fn follows_edits(&self) -> bool {
         use FactKey as K;
         matches!(
             self,
-            K::TypeCache(_)
+            K::DeclClaim(_)
+                | K::Module(_)
+                | K::ModuleMeta(_)
+                | K::ModuleName(_)
+                | K::DynamicFieldFile(_)
+                | K::TypeCache(_)
                 | K::DefinitionFact(_)
                 | K::Signature(_)
                 | K::DynamicField(..)
@@ -437,9 +447,10 @@ impl FactKey {
                 LuaMemberOwner::Element(site) => Some(site.file_id),
                 _ => None,
             },
-            K::DefinitionSite(site) | K::Metatable(site) | K::TableClass(site) => {
-                Some(site.file_id)
-            }
+            K::DefinitionSite(site)
+            | K::Metatable(site)
+            | K::TableClass(site)
+            | K::Syntax(site) => Some(site.file_id),
             K::Signature(signature_id)
             | K::ValidGuard(signature_id)
             | K::InferredGuard(signature_id)
@@ -1089,6 +1100,21 @@ pub fn note_type_cache_read(owner: &LuaTypeOwner) {
 /// since the last call.
 pub fn take_noted_reads() -> u64 {
     NOTED_READS.with(|count| count.replace(0))
+}
+
+/// Records a read of the top-level statement `statement` of `file_id`. A
+/// derivation's own file is not a read, as for [`note_file_read`].
+pub fn note_syntax_read(file_id: FileId, statement: TextRange) {
+    CURRENT.with(|current| {
+        if let Some(evaluation) = current.borrow_mut().as_mut()
+            && evaluation.id.file_id != file_id
+        {
+            record_read(
+                evaluation,
+                HashedKey::new(FactKey::Syntax(InFiled::new(file_id, statement))),
+            );
+        }
+    });
 }
 
 /// Records a read of `file_id`'s text. A derivation's own file is not a
