@@ -15,6 +15,9 @@
 //! - `noop`: re-index each target with unchanged text; the oracle is the base.
 //! - `exact`: remove and re-add exactly the targets in one batch.
 //! - `split:N`: cold build in N batches, compared with the base.
+//! - `schedule`: cold build taking files in reverse order within each rank,
+//!   compared with the base; `schedule:SEED` takes them in an order fixed by
+//!   the seed. The settled result must not depend on the order files run in.
 //! - `touch`, `shift`, `delete`, `recreate`, `rename`: sweeps over every
 //!   `DET_STRIDE`-th (default 25) main file from `DET_STRIDE_OFFSET` (default
 //!   0), or the files named in `DET_ONLY`. Touch appends a comment, shift
@@ -46,7 +49,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, FileId, WorkspaceFolder, collect_workspace_files, load_configs,
+    EmmyLuaAnalysis, Emmyrc, FileId, Schedule, WorkspaceFolder, collect_workspace_files,
+    load_configs,
 };
 use glua_parser::{LineIndex, LuaParser};
 use lsp_types::{DiagnosticSeverity, NumberOrString};
@@ -151,6 +155,7 @@ fn build_cold(
     annotations: &Path,
     input: &ColdInput,
     batches: usize,
+    schedule: Schedule,
 ) -> EmmyLuaAnalysis {
     let config_files = discover_config_files(codebase);
     let mut emmyrc = if config_files.is_empty() {
@@ -162,6 +167,7 @@ fn build_cold(
     emmyrc.pre_process_emmyrc(codebase);
 
     let mut analysis = EmmyLuaAnalysis::new();
+    analysis.compilation.set_schedule(schedule);
     analysis.update_config(Arc::new(emmyrc.clone()));
     analysis.init_std_lib();
     analysis.add_library_workspace(annotations.to_path_buf());
@@ -1964,7 +1970,13 @@ struct Harness {
 
 impl Harness {
     fn cold(&self, input: &ColdInput, batches: usize) -> EmmyLuaAnalysis {
-        build_cold(&self.codebase, &self.annotations, input, batches)
+        build_cold(
+            &self.codebase,
+            &self.annotations,
+            input,
+            batches,
+            Schedule::Canonical,
+        )
     }
 
     /// A fork of the base that records its `update_index` batches.
@@ -2208,6 +2220,24 @@ impl Harness {
         self.finish("exact", warm, &ids, &reach, false, &ColdInput::default());
     }
 
+    fn schedule(&mut self, label: &str, schedule: Schedule) {
+        let scheduled = build_cold(
+            &self.codebase,
+            &self.annotations,
+            &ColdInput::default(),
+            1,
+            schedule,
+        );
+        let actual = snapshot(&scheduled, label);
+        drop(scheduled);
+        compare(
+            "base",
+            &self.expected(&ColdInput::default()),
+            label,
+            &actual,
+        );
+    }
+
     fn split(&mut self, batches: usize) {
         let label = format!("split:{batches}");
         let split = self.cold(&ColdInput::default(), batches);
@@ -2370,9 +2400,17 @@ fn run() {
             .and_then(|n| n.parse::<usize>().ok())
             .filter(|n| *n > 0)
     };
+    let schedule_of = |stage: &str| match stage {
+        "schedule" => Some(Schedule::Reversed),
+        _ => stage
+            .strip_prefix("schedule:")
+            .and_then(|seed| seed.parse::<u64>().ok())
+            .map(Schedule::Shuffled),
+    };
     for stage in &stages {
         assert!(
             split_batches(stage).is_some()
+                || schedule_of(stage).is_some()
                 || matches!(
                     *stage,
                     "edit"
@@ -2425,7 +2463,13 @@ fn run() {
     );
 
     let started = Instant::now();
-    let base = build_cold(&codebase, &annotations, &ColdInput::default(), 1);
+    let base = build_cold(
+        &codebase,
+        &annotations,
+        &ColdInput::default(),
+        1,
+        Schedule::Canonical,
+    );
     let mut harness = Harness {
         replay: std::env::var("DET_REPLAY").is_ok_and(|value| value == "1"),
         codebase,
@@ -2460,7 +2504,10 @@ fn run() {
             "delete" => harness.sweep_delete(),
             "recreate" => harness.sweep_recreate(),
             "rename" => harness.sweep_rename(),
-            _ => harness.split(split_batches(stage).expect("validated above")),
+            _ => match schedule_of(stage) {
+                Some(schedule) => harness.schedule(stage, schedule),
+                None => harness.split(split_batches(stage).expect("validated above")),
+            },
         }
         println!("[time] {stage} {:.1}s", t.elapsed().as_secs_f64());
     }
