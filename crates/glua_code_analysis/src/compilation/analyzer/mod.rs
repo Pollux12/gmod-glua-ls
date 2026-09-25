@@ -144,10 +144,11 @@ pub(crate) fn reanalyze(
     });
     crate::profile::phase_report("reanalyze");
     let stats = engine.stats().clone();
-    stats.report();
+    let evaluated_files = engine.evaluated_files();
+    stats.report(evaluated_files.len());
     Reanalysis {
         touched,
-        evaluated_files: engine.evaluated_files(),
+        evaluated_files,
         stats,
     }
 }

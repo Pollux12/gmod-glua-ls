@@ -298,6 +298,10 @@ impl Engine {
                 self.run_batch(db, id, recipe);
                 continue;
             }
+            let rerun = self.stats.profiling()
+                && group
+                    .iter()
+                    .all(|member| self.stats.distinct.contains(member));
             for member in &group {
                 self.unqueue(*member);
                 self.stats.evaluated(*member);
@@ -313,7 +317,8 @@ impl Engine {
                 self.evaluate_group(db, &group, recipe)
             });
             if let Some(started) = started {
-                *self.stats.time.entry(id.kind).or_default() += started.elapsed();
+                self.stats
+                    .timed(id.kind, started.elapsed(), usize::from(rerun), 1);
                 for member in &group {
                     for key in db.reader_graph().reads_of(*member) {
                         *self.stats.reads.entry(variant_name(key)).or_default() += 1;
@@ -393,6 +398,10 @@ impl Engine {
                 alone.push(id);
             }
         }
+        let reruns = batch
+            .iter()
+            .filter(|member| self.stats.distinct.contains(member))
+            .count();
         for member in &batch {
             self.unqueue(*member);
             self.stats.evaluated(*member);
@@ -432,7 +441,8 @@ impl Engine {
             format!("evaluating {batch:?}")
         });
         if let Some(started) = started {
-            *self.stats.time.entry(first.kind).or_default() += started.elapsed();
+            self.stats
+                .timed(first.kind, started.elapsed(), reruns, batch.len());
         }
         // A member that now shares a key with another derivation ran without
         // it; the next evaluation takes both.
@@ -567,9 +577,11 @@ pub(crate) struct EngineStats {
     evaluations: BTreeMap<DerivationKind, usize>,
     /// Rounds after the first.
     pub(crate) rounds: usize,
-    /// Under `GLUALS_PROFILE`: time per kind, and how often a key's move
+    /// Under `GLUALS_PROFILE`: time per kind, the part of it spent
+    /// re-evaluating derivations already evaluated, and how often a key's move
     /// queued a reader, by key variant and the writer's and reader's kinds.
     time: BTreeMap<DerivationKind, std::time::Duration>,
+    rerun_time: BTreeMap<DerivationKind, std::time::Duration>,
     requeues: BTreeMap<(String, Option<DerivationKind>, DerivationKind), usize>,
     /// Recorded reads by key variant.
     reads: BTreeMap<String, usize>,
@@ -590,8 +602,23 @@ fn variant_name(key: &FactKey) -> String {
 
 impl EngineStats {
     fn profiling(&self) -> bool {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os("GLUALS_PROFILE").is_some())
+        crate::profile::profiling()
+    }
+
+    /// Adds `elapsed` to `kind`'s time: `reruns` of the `evaluated`
+    /// derivations it covers had been evaluated before.
+    fn timed(
+        &mut self,
+        kind: DerivationKind,
+        elapsed: std::time::Duration,
+        reruns: usize,
+        evaluated: usize,
+    ) {
+        *self.time.entry(kind).or_default() += elapsed;
+        if reruns > 0 {
+            *self.rerun_time.entry(kind).or_default() +=
+                elapsed.mul_f64(reruns as f64 / evaluated.max(1) as f64);
+        }
     }
 
     fn requeued(&mut self, key: &FactKey, writer: Option<DerivationId>, reader: DerivationId) {
@@ -622,9 +649,10 @@ impl EngineStats {
         self.evaluations.values().sum()
     }
 
-    /// Prints the counts under `GLUALS_PROFILE`.
-    pub(crate) fn report(&self) {
-        if std::env::var_os("GLUALS_PROFILE").is_none() || self.evaluations.is_empty() {
+    /// Prints the counts under `GLUALS_PROFILE`, with how many files had
+    /// derivations evaluated or their source layer rebuilt.
+    pub(crate) fn report(&self, files: usize) {
+        if !self.profiling() || self.evaluations.is_empty() {
             return;
         }
         let kinds = self
@@ -633,7 +661,7 @@ impl EngineStats {
             .map(|(kind, count)| format!("{kind:?}={count}"))
             .collect::<Vec<_>>();
         eprintln!(
-            "[engine] evaluations={} rounds={} {}",
+            "[engine] evaluations={} rounds={} files={files} {}",
             self.total_evaluations(),
             self.rounds,
             kinds.join(" ")
@@ -654,7 +682,12 @@ impl EngineStats {
         let mut time = self.time.iter().collect::<Vec<_>>();
         time.sort_by(|left, right| right.1.cmp(left.1));
         for (kind, time) in time {
-            eprintln!("[engine] time {kind:?} {time:?}");
+            eprintln!(
+                "[engine] time {kind:?} {time:?} rerun {:?} evaluations {} distinct {}",
+                self.rerun_time.get(kind).copied().unwrap_or_default(),
+                self.evaluations.get(kind).copied().unwrap_or(0),
+                distinct.get(kind).copied().unwrap_or(0)
+            );
         }
         let mut reads = self.reads.iter().collect::<Vec<_>>();
         reads.sort_by(|left, right| right.1.cmp(left.1));

@@ -195,6 +195,7 @@ fn run_incremental_edits(
             let t = Instant::now();
             let affected = analysis.reindex_files(vec![file_id]);
             let reindex = t.elapsed();
+            glua_code_analysis::profile::work::report(&format!("edit {name}"));
             eprintln!(
                 "  [incremental] {name} affects the diagnostics of {} file(s)",
                 affected.len()
@@ -590,6 +591,7 @@ async fn run() {
     #[cfg(feature = "dhat-heap")]
     drop(dhat_profiler);
     let indexing_duration = t.elapsed();
+    glua_code_analysis::profile::work::report("index");
     alloc_report!("indexing", alloc_mark);
     results.push(BenchmarkResult {
         phase: "indexing (total)".into(),
@@ -792,6 +794,7 @@ async fn run() {
     let infos = info_count.load(std::sync::atomic::Ordering::Relaxed);
     let hints = hint_count.load(std::sync::atomic::Ordering::Relaxed);
     let diagnostics_duration = t.elapsed();
+    glua_code_analysis::profile::work::report("diagnostics");
     alloc_report!("diagnostics", alloc_mark);
     results.push(BenchmarkResult {
         phase: format!(
