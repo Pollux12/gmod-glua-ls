@@ -5,30 +5,43 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::{DerivationId, EditMaps, FactKey, Fingerprint, HashedKey};
 use crate::FileId;
 
-/// A fact key's slot in [`ReaderGraph::keys`].
-type KeyIdx = u32;
+/// A fact key's slot in a [`KeyTable`].
+pub type KeyIdx = u32;
 /// A derivation's slot in [`ReaderGraph::derivations`].
 type DerivIdx = u32;
 
-/// What one derivation's last evaluation read and wrote, as sorted key slots.
+/// What one derivation's last evaluation read, with the fingerprint each read
+/// saw, and wrote, as sorted key slots.
 #[derive(Debug, Clone, Default)]
 struct Record {
-    reads: Box<[KeyIdx]>,
+    reads: Box<[(KeyIdx, Fingerprint)]>,
     outputs: Box<[KeyIdx]>,
 }
 
-/// A fact key and the derivations that read it (with the fingerprint each
-/// saw) or produced it. `key` is `None` while the slot is free.
+impl Record {
+    fn seen(&self, key: KeyIdx) -> Option<Fingerprint> {
+        self.reads
+            .binary_search_by_key(&key, |(read, _)| *read)
+            .ok()
+            .map(|at| self.reads[at].1)
+    }
+}
+
+/// A fact key and the derivations that read or produced it. `key` is `None`
+/// while the slot is free.
 #[derive(Debug)]
 struct KeySlot {
     key: Option<HashedKey>,
-    readers: FxHashMap<DerivIdx, Fingerprint>,
+    readers: FxHashSet<DerivIdx>,
     producers: Vec<DerivIdx>,
     /// The key's fingerprint as last taken, and the generation it was taken in
     /// ([`NO_GENERATION`]: none); see [`ReaderGraph::current_fingerprint`].
     /// Only the analysis thread takes fingerprints, so relaxed order suffices.
     current: AtomicU64,
     current_generation: AtomicU32,
+    /// The evaluation that last recorded a read of the key; see
+    /// [`KeyTable::note_read`].
+    stamp: u32,
 }
 
 impl Clone for KeySlot {
@@ -39,6 +52,7 @@ impl Clone for KeySlot {
             producers: self.producers.clone(),
             current: AtomicU64::new(self.current.load(Ordering::Relaxed)),
             current_generation: AtomicU32::new(self.current_generation.load(Ordering::Relaxed)),
+            stamp: self.stamp,
         }
     }
 }
@@ -47,10 +61,11 @@ impl Default for KeySlot {
     fn default() -> Self {
         Self {
             key: None,
-            readers: FxHashMap::default(),
+            readers: FxHashSet::default(),
             producers: Vec::new(),
             current: AtomicU64::new(0),
             current_generation: AtomicU32::new(NO_GENERATION),
+            stamp: 0,
         }
     }
 }
@@ -70,11 +85,52 @@ struct DerivSlot {
 /// Keys and derivations are interned to slots, so recording an evaluation
 /// again diffs two sorted slot lists and only the edges that changed touch a
 /// map. A slot nothing refers to any more is freed for reuse.
+/// Fact keys interned to slots. While the engine evaluates a group, the table
+/// is lent to the recording thread so a read is interned where it is made.
 #[derive(Debug, Clone, Default)]
-pub struct ReaderGraph {
+pub struct KeyTable {
     key_slots: FxHashMap<HashedKey, KeyIdx>,
     keys: Vec<KeySlot>,
     free_keys: Vec<KeyIdx>,
+}
+
+impl KeyTable {
+    fn intern(&mut self, key: HashedKey) -> KeyIdx {
+        if let Some(slot) = self.key_slots.get(&key) {
+            return *slot;
+        }
+        let slot = match self.free_keys.pop() {
+            Some(slot) => slot,
+            None => {
+                self.keys.push(KeySlot::default());
+                KeyIdx::try_from(self.keys.len() - 1).expect("fewer than 2^32 fact keys")
+            }
+        };
+        let entry = &mut self.keys[slot as usize];
+        entry.key = Some(key.clone());
+        entry.stamp = 0;
+        entry
+            .current_generation
+            .store(NO_GENERATION, Ordering::Relaxed);
+        self.key_slots.insert(key, slot);
+        slot
+    }
+
+    /// Interns `key` and returns its slot if evaluation `stamp` has not
+    /// recorded it yet.
+    pub(super) fn note_read(&mut self, key: HashedKey, stamp: u32) -> Option<KeyIdx> {
+        let slot = self.intern(key);
+        let entry = &mut self.keys[slot as usize];
+        (entry.stamp != stamp).then(|| {
+            entry.stamp = stamp;
+            slot
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ReaderGraph {
+    table: KeyTable,
     deriv_slots: FxHashMap<DerivationId, DerivIdx>,
     derivations: Vec<DerivSlot>,
     free_derivations: Vec<DerivIdx>,
@@ -88,6 +144,16 @@ pub struct ReaderGraph {
 }
 
 impl ReaderGraph {
+    /// Lends the key table out, until [`Self::restore_keys`].
+    pub fn lend_keys(&mut self) -> KeyTable {
+        std::mem::take(&mut self.table)
+    }
+
+    pub fn restore_keys(&mut self, table: KeyTable) {
+        debug_assert!(self.table.keys.is_empty(), "keys restored twice");
+        self.table = table;
+    }
+
     /// `key`'s fingerprint, taken by `fingerprint` once per value: a read
     /// key's slot keeps it until [`Self::forget_fingerprint`] or
     /// [`Self::forget_fingerprints`].
@@ -96,7 +162,7 @@ impl ReaderGraph {
         key: &HashedKey,
         fingerprint: impl FnOnce(&HashedKey) -> Fingerprint,
     ) -> Fingerprint {
-        match self.key_slots.get(key) {
+        match self.table.key_slots.get(key) {
             Some(slot) => self.slot_fingerprint(*slot, fingerprint),
             None => fingerprint(key),
         }
@@ -107,7 +173,7 @@ impl ReaderGraph {
         slot: KeyIdx,
         fingerprint: impl FnOnce(&HashedKey) -> Fingerprint,
     ) -> Fingerprint {
-        let entry = &self.keys[slot as usize];
+        let entry = &self.table.keys[slot as usize];
         if entry.current_generation.load(Ordering::Relaxed) == self.generation {
             return entry.current.load(Ordering::Relaxed);
         }
@@ -121,8 +187,8 @@ impl ReaderGraph {
 
     /// Forgets `key`'s cached fingerprint: its value may have moved.
     pub fn forget_fingerprint(&self, key: &HashedKey) {
-        if let Some(slot) = self.key_slots.get(key) {
-            self.keys[*slot as usize]
+        if let Some(slot) = self.table.key_slots.get(key) {
+            self.table.keys[*slot as usize]
                 .current_generation
                 .store(NO_GENERATION, Ordering::Relaxed);
         }
@@ -135,7 +201,7 @@ impl ReaderGraph {
 
     /// Every key whose fingerprint is cached, with it.
     pub fn cached_fingerprints(&self) -> impl Iterator<Item = (&HashedKey, Fingerprint)> {
-        self.keys.iter().filter_map(|slot| {
+        self.table.keys.iter().filter_map(|slot| {
             (slot.current_generation.load(Ordering::Relaxed) == self.generation)
                 .then(|| Some((slot.key.as_ref()?, slot.current.load(Ordering::Relaxed))))?
         })
@@ -151,15 +217,49 @@ impl ReaderGraph {
         outputs: Vec<HashedKey>,
         fingerprint: impl Fn(&HashedKey) -> Fingerprint,
     ) -> Vec<HashedKey> {
-        let deriv = self.intern_derivation(id);
-        let mut reads = reads
+        let slots = reads
             .into_iter()
-            .map(|(key, seen)| {
-                let slot = self.intern_key(key);
-                let seen = seen.unwrap_or_else(|| self.slot_fingerprint(slot, &fingerprint));
-                (slot, seen)
-            })
-            .collect::<Vec<_>>();
+            .map(|(key, seen)| (self.intern_key(key), seen))
+            .collect();
+        let mut released = Vec::new();
+        let dropped = self.replace_slots(id, slots, outputs, fingerprint, &mut released);
+        self.release_keys(released);
+        dropped
+    }
+
+    /// Frees each slot of `slots` nothing refers to any more.
+    pub fn release_keys(&mut self, slots: Vec<KeyIdx>) {
+        for slot in slots {
+            self.release_key(slot);
+        }
+    }
+
+    /// [`Self::replace`] with the reads already interned. The slots of reads
+    /// the record no longer keeps (see [`super::records_read`]) go to
+    /// `released`, to free with [`Self::release_keys`] once every record of
+    /// the group sharing the lent table is replaced: another member may hold
+    /// the same slot.
+    pub fn replace_slots(
+        &mut self,
+        id: DerivationId,
+        slots: Vec<(KeyIdx, Option<Fingerprint>)>,
+        outputs: Vec<HashedKey>,
+        fingerprint: impl Fn(&HashedKey) -> Fingerprint,
+        released: &mut Vec<KeyIdx>,
+    ) -> Vec<HashedKey> {
+        let deriv = self.intern_derivation(id);
+        let output_set = outputs.iter().collect::<FxHashSet<_>>();
+        let mut dropped_reads = Vec::new();
+        let mut reads = Vec::with_capacity(slots.len());
+        for (slot, seen) in slots {
+            if !super::records_read(id, self.key(slot), |key| output_set.contains(key)) {
+                dropped_reads.push(slot);
+                continue;
+            }
+            let seen = seen.unwrap_or_else(|| self.slot_fingerprint(slot, &fingerprint));
+            reads.push((slot, seen));
+        }
+        drop(output_set);
         reads.sort_unstable_by_key(|(key, _)| *key);
         let mut outputs = outputs
             .into_iter()
@@ -173,29 +273,30 @@ impl ReaderGraph {
             .unwrap_or_default();
 
         let mut unread = Vec::new();
+        let mut added_reads = Vec::new();
         merge_sorted(
-            &old.reads,
+            old.reads.iter().map(|(key, _)| *key),
             reads.iter().map(|(key, _)| *key),
             |key| unread.push(key),
-            |_| {},
+            |key| added_reads.push(key),
         );
-        for (key, fingerprint) in &reads {
-            self.keys[*key as usize].readers.insert(deriv, *fingerprint);
+        for key in added_reads {
+            self.table.keys[key as usize].readers.insert(deriv);
         }
         for key in &unread {
-            self.keys[*key as usize].readers.remove(&deriv);
+            self.table.keys[*key as usize].readers.remove(&deriv);
         }
 
         let mut dropped = Vec::new();
         let mut added = Vec::new();
         merge_sorted(
-            &old.outputs,
+            old.outputs.iter().copied(),
             outputs.iter().copied(),
             |key| dropped.push(key),
             |key| added.push(key),
         );
         for key in added {
-            self.keys[key as usize].producers.push(deriv);
+            self.table.keys[key as usize].producers.push(deriv);
             if let Some(owner) = self.key(key).owning_file()
                 && owner != id.file_id
             {
@@ -215,13 +316,12 @@ impl ReaderGraph {
             .collect();
         // Only now: a key this evaluation stopped reading may be one it
         // started producing.
-        for key in unread {
-            self.release_key(key);
-        }
+        released.extend(unread);
+        released.extend(dropped_reads);
 
         self.by_file.entry(id.file_id).or_default().insert(deriv);
         self.derivations[deriv as usize].record = Some(Record {
-            reads: reads.into_iter().map(|(key, _)| key).collect(),
+            reads: reads.into_boxed_slice(),
             outputs: outputs.into_boxed_slice(),
         });
         dropped
@@ -264,13 +364,18 @@ impl ReaderGraph {
         key: &HashedKey,
         holds: impl Fn(Fingerprint) -> bool + 'a,
     ) -> impl Iterator<Item = DerivationId> + 'a {
-        self.key_slots
-            .get(key)
-            .map(|slot| &self.keys[*slot as usize].readers)
+        let slot = self.table.key_slots.get(key).copied();
+        slot.map(|slot| (slot, &self.table.keys[slot as usize].readers))
             .into_iter()
-            .flatten()
-            .filter(move |(_, seen)| !holds(**seen))
-            .map(|(deriv, _)| self.derivations[*deriv as usize].id)
+            .flat_map(|(slot, readers)| readers.iter().map(move |deriv| (slot, *deriv)))
+            .filter(move |(slot, deriv)| {
+                self.derivations[*deriv as usize]
+                    .record
+                    .as_ref()
+                    .and_then(|record| record.seen(*slot))
+                    .is_none_or(|seen| !holds(seen))
+            })
+            .map(|(_, deriv)| self.derivations[deriv as usize].id)
     }
 
     /// Whether any read `id` last made no longer holds: it saw another
@@ -282,17 +387,12 @@ impl ReaderGraph {
         fingerprint: impl Fn(&HashedKey) -> Fingerprint,
         holds_moved: impl Fn(&HashedKey, Fingerprint) -> bool,
     ) -> bool {
-        let Some((deriv, record)) = self.record(id) else {
+        let Some((_, record)) = self.record(id) else {
             return true;
         };
-        record.reads.iter().any(|slot| {
-            self.keys[*slot as usize]
-                .readers
-                .get(&deriv)
-                .is_none_or(|seen| {
-                    *seen != self.slot_fingerprint(*slot, &fingerprint)
-                        && !holds_moved(self.key(*slot), *seen)
-                })
+        record.reads.iter().any(|(slot, seen)| {
+            *seen != self.slot_fingerprint(*slot, &fingerprint)
+                && !holds_moved(self.key(*slot), *seen)
         })
     }
 
@@ -301,7 +401,7 @@ impl ReaderGraph {
         self.record(id)
             .into_iter()
             .flat_map(|(_, record)| record.reads.iter())
-            .map(|key| self.key(*key))
+            .map(|(key, _)| self.key(*key))
     }
 
     /// Replaces `id`'s recorded fingerprints, in [`Self::reads_of`] order.
@@ -310,15 +410,13 @@ impl ReaderGraph {
         let Some(deriv) = self.deriv_slots.get(&id).copied() else {
             return false;
         };
-        let Some(record) = self.derivations[deriv as usize].record.as_ref() else {
+        let Some(record) = self.derivations[deriv as usize].record.as_mut() else {
             return false;
         };
         let mut moved = false;
-        for (key, fingerprint) in record.reads.iter().zip(fingerprints) {
-            if let Some(seen) = self.keys[*key as usize].readers.get_mut(&deriv) {
-                moved |= *seen != fingerprint;
-                *seen = fingerprint;
-            }
+        for ((_, seen), fingerprint) in record.reads.iter_mut().zip(fingerprints) {
+            moved |= *seen != fingerprint;
+            *seen = fingerprint;
         }
         moved
     }
@@ -330,8 +428,8 @@ impl ReaderGraph {
         let files: FxHashSet<FileId> = edits.files().collect();
         let mut renames = Vec::new();
         let mut lost = Vec::new();
-        for (key, slot) in &self.key_slots {
-            let readers = &self.keys[*slot as usize].readers;
+        for (key, slot) in &self.table.key_slots {
+            let readers = &self.table.keys[*slot as usize].readers;
             if readers.is_empty()
                 || !key
                     .positional_file()
@@ -344,7 +442,7 @@ impl ReaderGraph {
                 Some(moved) => renames.push((*slot, HashedKey::new(moved))),
                 None => lost.extend(
                     readers
-                        .keys()
+                        .iter()
                         .map(|deriv| self.derivations[*deriv as usize].id),
                 ),
             }
@@ -355,7 +453,7 @@ impl ReaderGraph {
         let moved = renames
             .into_iter()
             .map(|(slot, new_key)| {
-                let readers = std::mem::take(&mut self.keys[slot as usize].readers);
+                let readers = std::mem::take(&mut self.table.keys[slot as usize].readers);
                 (slot, new_key, readers)
             })
             .collect::<Vec<_>>();
@@ -363,8 +461,8 @@ impl ReaderGraph {
         let mut vacated = Vec::with_capacity(moved.len());
         for (slot, new_key, readers) in moved {
             let target = self.intern_key(new_key);
-            for (deriv, seen) in readers {
-                self.keys[target as usize].readers.insert(deriv, seen);
+            for deriv in readers {
+                self.table.keys[target as usize].readers.insert(deriv);
                 rewrites.entry(deriv).or_default().insert(slot, target);
             }
             vacated.push(slot);
@@ -374,10 +472,10 @@ impl ReaderGraph {
                 let mut reads = record
                     .reads
                     .iter()
-                    .map(|key| rewrite.get(key).copied().unwrap_or(*key))
+                    .map(|(key, seen)| (rewrite.get(key).copied().unwrap_or(*key), *seen))
                     .collect::<Vec<_>>();
-                reads.sort_unstable();
-                reads.dedup();
+                reads.sort_by_key(|(key, _)| *key);
+                reads.dedup_by_key(|(key, _)| *key);
                 record.reads = reads.into_boxed_slice();
             }
         }
@@ -392,7 +490,8 @@ impl ReaderGraph {
     /// Every key some derivation read.
     #[cfg(test)]
     pub fn read_keys(&self) -> impl Iterator<Item = &FactKey> {
-        self.keys
+        self.table
+            .keys
             .iter()
             .filter(|slot| !slot.readers.is_empty())
             .filter_map(|slot| slot.key.as_deref())
@@ -419,9 +518,10 @@ impl ReaderGraph {
     }
 
     pub fn producers(&self, key: &HashedKey) -> impl Iterator<Item = DerivationId> + '_ {
-        self.key_slots
+        self.table
+            .key_slots
             .get(key)
-            .map(|slot| &self.keys[*slot as usize].producers)
+            .map(|slot| &self.table.keys[*slot as usize].producers)
             .into_iter()
             .flatten()
             .map(|deriv| self.derivations[*deriv as usize].id)
@@ -439,11 +539,11 @@ impl ReaderGraph {
     /// owns.
     pub fn dependent_files(&self) -> FxHashMap<FileId, FxHashSet<FileId>> {
         let mut dependents: FxHashMap<FileId, FxHashSet<FileId>> = FxHashMap::default();
-        for slot in &self.keys {
+        for slot in &self.table.keys {
             let Some(owner) = slot.key.as_deref().and_then(FactKey::owning_file) else {
                 continue;
             };
-            for deriv in slot.readers.keys() {
+            for deriv in &slot.readers {
                 let reader = self.derivations[*deriv as usize].id.file_id;
                 if reader != owner && reader != FileId::VIRTUAL {
                     dependents.entry(owner).or_default().insert(reader);
@@ -459,40 +559,30 @@ impl ReaderGraph {
     }
 
     fn key(&self, slot: KeyIdx) -> &HashedKey {
-        self.keys[slot as usize]
+        self.table.keys[slot as usize]
             .key
             .as_ref()
             .expect("a referenced key slot is live")
     }
 
     fn intern_key(&mut self, key: HashedKey) -> KeyIdx {
-        if let Some(slot) = self.key_slots.get(&key) {
-            return *slot;
-        }
-        let slot = match self.free_keys.pop() {
-            Some(slot) => slot,
-            None => {
-                self.keys.push(KeySlot::default());
-                KeyIdx::try_from(self.keys.len() - 1).expect("fewer than 2^32 fact keys")
-            }
-        };
-        self.keys[slot as usize].key = Some(key.clone());
-        self.keys[slot as usize]
-            .current_generation
-            .store(NO_GENERATION, Ordering::Relaxed);
-        self.key_slots.insert(key, slot);
-        slot
+        self.table.intern(key)
+    }
+
+    /// Interns a read made while no key table was lent.
+    pub fn intern_read(&mut self, key: HashedKey) -> KeyIdx {
+        self.table.intern(key)
     }
 
     /// Frees `slot` once no derivation reads or produces its key.
     fn release_key(&mut self, slot: KeyIdx) {
-        let entry = &mut self.keys[slot as usize];
+        let entry = &mut self.table.keys[slot as usize];
         if !entry.readers.is_empty() || !entry.producers.is_empty() {
             return;
         }
         if let Some(key) = entry.key.take() {
-            self.key_slots.remove(&key);
-            self.free_keys.push(slot);
+            self.table.key_slots.remove(&key);
+            self.table.free_keys.push(slot);
         }
     }
 
@@ -516,7 +606,7 @@ impl ReaderGraph {
     }
 
     fn drop_producer(&mut self, key: KeyIdx, deriv: DerivIdx, file_id: FileId) {
-        let producers = &mut self.keys[key as usize].producers;
+        let producers = &mut self.table.keys[key as usize].producers;
         if let Some(at) = producers.iter().position(|producer| *producer == deriv) {
             producers.swap_remove(at);
         }
@@ -540,8 +630,8 @@ impl ReaderGraph {
             .record
             .take()
             .unwrap_or_default();
-        for key in record.reads.iter() {
-            self.keys[*key as usize].readers.remove(&deriv);
+        for (key, _) in record.reads.iter() {
+            self.table.keys[*key as usize].readers.remove(&deriv);
             self.release_key(*key);
         }
         let outputs = record
@@ -568,12 +658,12 @@ impl ReaderGraph {
 /// Walks two sorted slot lists, calling `only_old` for each slot only `old`
 /// has and `only_new` for each slot only `new` has.
 fn merge_sorted(
-    old: &[KeyIdx],
+    old: impl Iterator<Item = KeyIdx>,
     new: impl Iterator<Item = KeyIdx>,
     mut only_old: impl FnMut(KeyIdx),
     mut only_new: impl FnMut(KeyIdx),
 ) {
-    let mut old = old.iter().copied().peekable();
+    let mut old = old.peekable();
     let mut new = new.peekable();
     loop {
         match (old.peek().copied(), new.peek().copied()) {
@@ -684,7 +774,7 @@ mod tests {
 
         graph.replace(id(1, 0), vec![(key(7), Some(1))], vec![key(6)], |_| 0);
 
-        assert_eq!(graph.keys.len(), 2);
+        assert_eq!(graph.table.keys.len(), 2);
     }
 
     #[test]
@@ -718,6 +808,37 @@ mod tests {
         graph.replace(id(2, 0), vec![], vec![key(2)], |_| 0);
 
         assert!(graph.foreign_producers(FileId::new(1)).is_empty());
+    }
+
+    #[test]
+    fn a_slot_one_member_drops_stays_live_for_another_member_of_its_group() {
+        let mut graph = ReaderGraph::default();
+        let mut table = graph.lend_keys();
+        let slot = table.note_read(key(9), 1).expect("first read");
+        assert_eq!(table.note_read(key(9), 2), Some(slot));
+        graph.restore_keys(table);
+        let producer = DerivationId::new(
+            DerivationKind::LocalStat,
+            FileId::new(9),
+            LuaSyntaxId::new(
+                LuaSyntaxKind::LocalStat.into(),
+                TextRange::at(TextSize::new(0), TextSize::new(1)),
+            ),
+        );
+
+        let mut released = Vec::new();
+        graph.replace_slots(
+            producer,
+            vec![(slot, None)],
+            vec![key(9)],
+            |_| 0,
+            &mut released,
+        );
+        graph.replace_slots(id(2, 0), vec![(slot, None)], vec![], |_| 5, &mut released);
+        graph.release_keys(released);
+
+        assert_eq!(graph.reads_of(id(2, 0)).collect::<Vec<_>>(), vec![&key(9)]);
+        assert_eq!(graph.reads_of(producer).count(), 0);
     }
 
     #[test]

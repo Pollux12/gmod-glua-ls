@@ -28,7 +28,7 @@ impl std::fmt::Debug for dyn DerivedFact {
         f.write_str("DerivedFact")
     }
 }
-pub use graph::ReaderGraph;
+pub use graph::{KeyIdx, KeyTable, ReaderGraph};
 pub use positions::{
     EditMaps, FilePosition, fingerprint_before_edits, fingerprinting, hash_local, in_file,
     mapping_back,
@@ -661,6 +661,11 @@ impl PartialOrd for DerivationId {
 #[derive(Debug)]
 pub struct Evaluation {
     pub id: DerivationId,
+    /// Reads interned in the lent [`KeyTable`], once each.
+    slots: Vec<KeyIdx>,
+    /// Marks the slots this evaluation recorded; see [`KeyTable::note_read`].
+    stamp: u32,
+    /// Reads made while no key table is lent.
     reads: FxHashSet<HashedKey>,
     /// Cheap identities of keys already in `reads`, see [`note_read_by`].
     read_identities: FxHashSet<(u8, u64)>,
@@ -710,6 +715,18 @@ impl Evaluation {
         (id, reads, outputs)
     }
 
+    /// The evaluation's interned reads, its reads made while no key table
+    /// was lent, and its outputs.
+    #[allow(clippy::type_complexity)]
+    pub fn into_recorded(self) -> (DerivationId, Vec<KeyIdx>, Vec<HashedKey>, Vec<HashedKey>) {
+        (
+            self.id,
+            self.slots,
+            self.reads.into_iter().collect(),
+            self.outputs.into_iter().collect(),
+        )
+    }
+
     /// [`Self::into_parts`] with each read's fingerprint left to the caller,
     /// except those an earlier stage already took.
     #[allow(clippy::type_complexity)]
@@ -720,18 +737,13 @@ impl Evaluation {
         Vec<(HashedKey, Option<Fingerprint>)>,
         Vec<HashedKey>,
     ) {
+        debug_assert!(self.slots.is_empty(), "interned reads need the key table");
         let outputs = self.outputs;
-        let file_id = self.id.file_id;
+        let id = self.id;
         let reads = self
             .reads
             .into_iter()
-            .filter(|key| {
-                let own = key.owning_file() == Some(file_id);
-                // A source layer runs before any of its file's derivations,
-                // so its own file's facts are source values it is part of.
-                !(key.is_primary() && outputs.contains(key))
-                    && !(own && (key.is_file_source() || self.id.kind == DerivationKind::Source))
-            })
+            .filter(|key| records_read(id, key, |key| outputs.contains(key)))
             .map(|key| {
                 let seen = self
                     .staged
@@ -745,7 +757,23 @@ impl Evaluation {
     }
 }
 
+/// Whether evaluation `id` records its read of `key`. A primary fact it
+/// produced itself is not a read, nor is a source fact of its own file: a
+/// change replaces all of that file's derivations, and a source layer runs
+/// before any of its file's derivations.
+pub(crate) fn records_read(
+    id: DerivationId,
+    key: &HashedKey,
+    is_output: impl Fn(&HashedKey) -> bool,
+) -> bool {
+    let own = key.owning_file() == Some(id.file_id);
+    !(key.is_primary() && is_output(key))
+        && !(own && (key.is_file_source() || id.kind == DerivationKind::Source))
+}
+
 thread_local! {
+    static KEYS: RefCell<Option<KeyTable>> = const { RefCell::new(None) };
+    static STAMP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static CURRENT: RefCell<Option<Evaluation>> = const { RefCell::new(None) };
     static UNTRACKED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static WRITE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -783,11 +811,30 @@ pub fn untracked<T>(f: impl FnOnce() -> T) -> T {
     result
 }
 
+/// Lends `table` to this thread: evaluations begun until [`take_keys`]
+/// intern their reads as they make them.
+pub fn lend_keys(table: KeyTable) {
+    KEYS.with(|keys| *keys.borrow_mut() = Some(table));
+}
+
+/// Takes back the table [`lend_keys`] lent.
+pub fn take_keys() -> KeyTable {
+    KEYS.with(|keys| keys.borrow_mut().take())
+        .expect("take_keys without lend_keys")
+}
+
 /// Starts recording the evaluation of `id` on this thread.
 pub fn begin(id: DerivationId) {
+    let stamp = STAMP.with(|stamp| {
+        let next = stamp.get().wrapping_add(1).max(1);
+        stamp.set(next);
+        next
+    });
     CURRENT.with(|current| {
         let previous = current.borrow_mut().replace(Evaluation {
             id,
+            slots: Vec::new(),
+            stamp,
             reads: FxHashSet::default(),
             read_identities: FxHashSet::default(),
             outputs: FxHashSet::default(),
@@ -832,9 +879,24 @@ pub fn note_read(key: impl FnOnce() -> FactKey) {
     CURRENT.with(|current| {
         if let Some(evaluation) = current.borrow_mut().as_mut() {
             NOTED_READS.with(|count| count.set(count.get() + 1));
-            evaluation.reads.insert(HashedKey::new(key()));
+            record_read(evaluation, HashedKey::new(key()));
         }
     });
+}
+
+fn record_read(evaluation: &mut Evaluation, key: HashedKey) {
+    let recorded = KEYS.with(|keys| {
+        keys.borrow_mut()
+            .as_mut()
+            .map(|table| table.note_read(key.clone(), evaluation.stamp))
+    });
+    match recorded {
+        Some(Some(slot)) => evaluation.slots.push(slot),
+        Some(None) => {}
+        None => {
+            evaluation.reads.insert(key);
+        }
+    }
 }
 
 /// Records a read of `key`, which `identity` names exactly: a repeat within
@@ -849,7 +911,7 @@ fn note_read_by(identity: (u8, u64), key: impl FnOnce() -> FactKey) {
         if let Some(evaluation) = current.borrow_mut().as_mut() {
             NOTED_READS.with(|count| count.set(count.get() + 1));
             if evaluation.read_identities.insert(identity) {
-                evaluation.reads.insert(HashedKey::new(key()));
+                record_read(evaluation, HashedKey::new(key()));
             }
         }
     });
@@ -901,9 +963,7 @@ pub fn note_file_read(file_id: FileId) {
         if let Some(evaluation) = current.borrow_mut().as_mut()
             && evaluation.id.file_id != file_id
         {
-            evaluation
-                .reads
-                .insert(HashedKey::new(FactKey::FileText(file_id)));
+            record_read(evaluation, HashedKey::new(FactKey::FileText(file_id)));
         }
     });
 }

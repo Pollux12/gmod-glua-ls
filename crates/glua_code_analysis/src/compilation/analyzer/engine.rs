@@ -351,11 +351,13 @@ impl Engine {
         // re-runs as a unit, so a member's read of what a later member writes is
         // internal to it, not a stale input.
         let mut evaluations = Vec::with_capacity(group.len());
+        derivation::lend_keys(db.reader_graph_mut().lend_keys());
         for member in group {
             derivation::begin(*member);
             recipe(db, *member);
             evaluations.push(derivation::end());
         }
+        db.reader_graph_mut().restore_keys(derivation::take_keys());
         for key in touched
             .iter()
             .chain(evaluations.iter().flat_map(derivation::Evaluation::outputs))
@@ -366,11 +368,20 @@ impl Engine {
         // Out of the index while its records are replaced, so the reads can be
         // fingerprinted against it.
         let mut graph = std::mem::take(db.reader_graph_mut());
+        let mut released = Vec::new();
         for evaluation in evaluations {
-            let (id, reads, outputs) = evaluation.into_unfingerprinted_parts();
+            let (id, mut slots, reads, outputs) = evaluation.into_recorded();
+            slots.extend(reads.into_iter().map(|key| graph.intern_read(key)));
             touched.extend(outputs.iter().cloned());
-            graph.replace(id, reads, outputs, |key| db.fact_fingerprint(key));
+            graph.replace_slots(
+                id,
+                slots.into_iter().map(|slot| (slot, None)).collect(),
+                outputs,
+                |key| db.fact_fingerprint(key),
+                &mut released,
+            );
         }
+        graph.release_keys(released);
         *db.reader_graph_mut() = graph;
         touched
     }
