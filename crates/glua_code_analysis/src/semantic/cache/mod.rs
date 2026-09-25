@@ -388,10 +388,10 @@ impl LuaInferCache {
 
     /// The view gates this cache infers under.
     fn view_gates(&self) -> Gates {
-        u8::from(self.config.dynamic_fields_visible) * DYNAMIC_FIELDS_GATE
-            | u8::from(self.config.call_site_params_visible) * CALL_SITE_PARAMS_GATE
-            | u8::from(self.self_base_seed.is_some()) * SELF_SEED_GATE
-            | u8::from(!self.index_ref_origin_type_cache.is_empty()) * INDEX_ORIGIN_GATE
+        (u8::from(self.config.dynamic_fields_visible) * DYNAMIC_FIELDS_GATE)
+            | (u8::from(self.config.call_site_params_visible) * CALL_SITE_PARAMS_GATE)
+            | (u8::from(self.self_base_seed.is_some()) * SELF_SEED_GATE)
+            | (u8::from(!self.index_ref_origin_type_cache.is_empty()) * INDEX_ORIGIN_GATE)
     }
 
     /// What a tracked lookup is made under now.
@@ -928,10 +928,8 @@ impl LuaInferCache {
 
     /// The context key flow walks of `cache_key` absorb reads of.
     pub(crate) fn flow_context_key(cache_key: &VarRefCacheKey) -> u64 {
-        use std::hash::{BuildHasher, Hash, Hasher};
-        let mut hasher = rustc_hash::FxBuildHasher.build_hasher();
-        cache_key.hash(&mut hasher);
-        hasher.finish() | 1
+        use std::hash::BuildHasher;
+        rustc_hash::FxBuildHasher.hash_one(cache_key) | 1
     }
 
     pub fn take_flow_cache_for_var_ref(&mut self, var_ref_id: &VarRefId) -> Option<FlowEntries> {

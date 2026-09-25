@@ -528,7 +528,7 @@ pub fn report_frames() {
         stats.other_context
     );
     let mut taints = stats.taints.into_iter().collect::<Vec<_>>();
-    taints.sort_by(|left, right| right.1.cmp(&left.1));
+    taints.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
     for (caller, count) in taints.into_iter().take(25) {
         eprintln!("[frames] taint {count} {caller}");
     }
