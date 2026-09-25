@@ -64,6 +64,8 @@ pub struct LuaPropertyIndex {
     /// the contribution itself and nothing else is stored.
     properties: HashMap<LuaPropertyId, LuaCommonProperty>,
     property_owners_map: HashMap<LuaSemanticDeclId, LuaPropertyId>,
+    /// `property_owners_map` inverted: the owners sharing each property.
+    owners_by_property: HashMap<LuaPropertyId, Vec<LuaSemanticDeclId>>,
     signature_owner_by_property: HashMap<LuaPropertyId, LuaSignatureId>,
 
     /// `TypeDecl` properties are keyed by class name alone, so several files can document one
@@ -96,6 +98,7 @@ impl LuaPropertyIndex {
             in_filed_owner: HashMap::default(),
             properties: HashMap::default(),
             property_owners_map: HashMap::default(),
+            owners_by_property: HashMap::default(),
             signature_owner_by_property: HashMap::default(),
             sole_contributor: HashMap::default(),
             contributions: HashMap::default(),
@@ -116,7 +119,7 @@ impl LuaPropertyIndex {
         } else {
             let id = LuaPropertyId::new(self.id_count);
             self.id_count += 1;
-            self.property_owners_map.insert(owner_id.clone(), id);
+            self.map_owner(owner_id.clone(), id);
             if let LuaSemanticDeclId::Signature(signature_id) = owner_id {
                 self.signature_owner_by_property.insert(id, signature_id);
             }
@@ -223,8 +226,7 @@ impl LuaPropertyIndex {
         // Owner aliases are always within one file, so this file owns the property outright
         // unless a doc contribution has already promoted it.
         self.sole_contributor.entry(property_id).or_insert(file_id);
-        self.property_owners_map
-            .insert(same_property_owner_id.clone(), property_id);
+        self.map_owner(same_property_owner_id.clone(), property_id);
         if let LuaSemanticDeclId::Signature(signature_id) = &source_owner_id {
             self.signature_owner_by_property
                 .insert(property_id, *signature_id);
@@ -511,9 +513,43 @@ impl LuaPropertyIndex {
         if !derivation::recording() {
             return;
         }
-        for (owner_id, id) in &self.property_owners_map {
-            if *id == property_id {
-                derivation::note_write(|| FactKey::Property(owner_id.clone()));
+        for owner_id in self
+            .owners_by_property
+            .get(&property_id)
+            .into_iter()
+            .flatten()
+        {
+            derivation::note_write(|| FactKey::Property(owner_id.clone()));
+        }
+    }
+
+    fn map_owner(&mut self, owner_id: LuaSemanticDeclId, property_id: LuaPropertyId) {
+        if let Some(previous) = self
+            .property_owners_map
+            .insert(owner_id.clone(), property_id)
+        {
+            if previous == property_id {
+                return;
+            }
+            self.forget_owner(previous, &owner_id);
+        }
+        self.owners_by_property
+            .entry(property_id)
+            .or_default()
+            .push(owner_id);
+    }
+
+    fn unmap_owner(&mut self, owner_id: &LuaSemanticDeclId) {
+        if let Some(property_id) = self.property_owners_map.remove(owner_id) {
+            self.forget_owner(property_id, owner_id);
+        }
+    }
+
+    fn forget_owner(&mut self, property_id: LuaPropertyId, owner_id: &LuaSemanticDeclId) {
+        if let Some(owners) = self.owners_by_property.get_mut(&property_id) {
+            owners.retain(|owner| owner != owner_id);
+            if owners.is_empty() {
+                self.owners_by_property.remove(&property_id);
             }
         }
     }
@@ -580,7 +616,7 @@ impl LuaPropertyIndex {
             return;
         }
 
-        self.property_owners_map.remove(owner_id);
+        self.unmap_owner(owner_id);
         self.properties.remove(&property_id);
         self.signature_owner_by_property.remove(&property_id);
         self.sole_contributor.remove(&property_id);
@@ -613,6 +649,7 @@ impl LuaIndex for LuaPropertyIndex {
         }
         self.properties.clear();
         self.property_owners_map.clear();
+        self.owners_by_property.clear();
         self.signature_owner_by_property.clear();
         self.sole_contributor.clear();
         self.contributions.clear();
