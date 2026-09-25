@@ -1,6 +1,7 @@
 pub(crate) mod analyzer;
 mod test;
 
+pub use analyzer::Schedule;
 pub use analyzer::gmod::get_scripted_class_info_for_file;
 pub(crate) use analyzer::gmod::get_scripted_class_type_decl_id;
 pub use analyzer::is_member_assignment_in_conditional_branch;
@@ -33,6 +34,7 @@ pub struct LuaCompilation {
     /// The files the last `update_index` re-analysed, for locality checks.
     last_evaluated_files: Vec<FileId>,
     last_stats: analyzer::EngineStats,
+    schedule: Schedule,
 }
 
 impl LuaCompilation {
@@ -44,6 +46,7 @@ impl LuaCompilation {
             diagnostic_reads: Mutex::default(),
             last_evaluated_files: Vec::new(),
             last_stats: analyzer::EngineStats::default(),
+            schedule: Schedule::default(),
         };
 
         compilation.db.update_config(emmyrc.clone());
@@ -72,7 +75,8 @@ impl LuaCompilation {
         let edits = crate::db_index::derivation::EditMaps::new(
             self.db.get_vfs_mut().take_edit_maps(&file_ids),
         );
-        let reanalysis = analyzer::reanalyze(&mut self.db, file_ids.clone(), edits.clone());
+        let reanalysis =
+            analyzer::reanalyze(&mut self.db, file_ids.clone(), edits.clone(), self.schedule);
         self.last_evaluated_files = reanalysis.evaluated_files;
         self.last_stats = reanalysis.stats;
         let reads = self
@@ -102,6 +106,11 @@ impl LuaCompilation {
                             }))
             }
         })
+    }
+
+    /// Sets the order re-analyses take files in; see [`Schedule`].
+    pub fn set_schedule(&mut self, schedule: Schedule) {
+        self.schedule = schedule;
     }
 
     /// The files the last [`Self::update_index`] re-analysed: those whose
@@ -190,6 +199,7 @@ impl LuaCompilation {
             diagnostic_reads: Mutex::new(reads),
             last_evaluated_files: Vec::new(),
             last_stats: analyzer::EngineStats::default(),
+            schedule: self.schedule,
         }
     }
 

@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod test {
     use crate::db_index::derivation::{DerivationId, DerivationKind, FactKey};
-    use crate::{Emmyrc, VirtualWorkspace};
+    use crate::{Emmyrc, Schedule, VirtualWorkspace};
 
     /// The derivations a read of which no longer holds: after an update the
     /// engine must leave none.
@@ -16,6 +16,35 @@ mod test {
             .collect::<Vec<_>>();
         stale.sort();
         stale
+    }
+
+    /// A reader ordered before its producer, cold-built under `schedule`:
+    /// how often its statement ran, and what the workspace settled to.
+    fn scheduled(schedule: Schedule) -> (usize, Vec<String>) {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis.compilation.set_schedule(schedule);
+        ws.def_files(vec![
+            ("lua/autorun/a_reader.lua", "local value = Shared.Value\n"),
+            (
+                "lua/autorun/b_producer.lua",
+                "Shared = {}\nShared.Value = 1\n",
+            ),
+        ]);
+        let evaluations = ws
+            .analysis
+            .compilation
+            .last_stats()
+            .evaluations(DerivationKind::LocalStat);
+        (evaluations, ws.semantic_digest())
+    }
+
+    #[test]
+    fn a_reversed_schedule_runs_the_producer_first_and_settles_the_same() {
+        let (canonical_evaluations, canonical) = scheduled(Schedule::Canonical);
+        let (reversed_evaluations, reversed) = scheduled(Schedule::Reversed);
+
+        assert_eq!(reversed, canonical);
+        assert_eq!((canonical_evaluations, reversed_evaluations), (2, 1));
     }
 
     fn gmod_workspace() -> VirtualWorkspace {

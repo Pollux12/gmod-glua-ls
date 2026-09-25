@@ -35,41 +35,87 @@ pub(crate) enum Reason {
     Read,
 }
 
+/// The order a round takes files in within a rank. A file's derivations
+/// always run in source order, and co-producers in canonical order; only
+/// which file goes first varies. The settled result must not depend on it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Schedule {
+    /// Files in file-id order.
+    #[default]
+    Canonical,
+    /// Files in reverse file-id order.
+    Reversed,
+    /// Files in an order fixed by the seed.
+    Shuffled(u64),
+}
+
+impl Schedule {
+    fn file_key(self, file_id: crate::FileId) -> u64 {
+        match self {
+            Self::Canonical => u64::from(file_id.id),
+            Self::Reversed => u64::MAX - u64::from(file_id.id),
+            Self::Shuffled(seed) => {
+                use std::hash::BuildHasher;
+                rustc_hash::FxBuildHasher.hash_one((seed, file_id.id))
+            }
+        }
+    }
+}
+
 /// Queued derivations in the order a round takes them.
 #[derive(Default)]
 struct Queue {
-    order: BTreeSet<(u8, Reason, DerivationId)>,
+    schedule: Schedule,
+    order: BTreeSet<(u8, Reason, u64, DerivationId)>,
     reasons: FxHashMap<DerivationId, Reason>,
 }
 
 impl Queue {
+    fn new(schedule: Schedule) -> Self {
+        Self {
+            schedule,
+            ..Self::default()
+        }
+    }
+
+    fn entry(&self, id: DerivationId, reason: Reason) -> (u8, Reason, u64, DerivationId) {
+        (
+            id.kind.rank(),
+            reason,
+            self.schedule.file_key(id.file_id),
+            id,
+        )
+    }
+
     /// Queues `id`; a changed entry stays changed.
     fn insert(&mut self, id: DerivationId, reason: Reason) {
         if let Some(queued) = self.reasons.get(&id) {
             if *queued <= reason {
                 return;
             }
-            self.order.remove(&(id.kind.rank(), *queued, id));
+            let entry = self.entry(id, *queued);
+            self.order.remove(&entry);
         }
         self.reasons.insert(id, reason);
-        self.order.insert((id.kind.rank(), reason, id));
+        self.order.insert(self.entry(id, reason));
     }
 
     fn remove(&mut self, id: DerivationId) {
         if let Some(reason) = self.reasons.remove(&id) {
-            self.order.remove(&(id.kind.rank(), reason, id));
+            let entry = self.entry(id, reason);
+            self.order.remove(&entry);
         }
     }
 
     fn pop_first(&mut self) -> Option<(DerivationId, Reason)> {
-        let (_, reason, id) = self.order.pop_first()?;
+        let (_, reason, _, id) = self.order.pop_first()?;
         self.reasons.remove(&id);
         Some((id, reason))
     }
 
     /// Pops the first entry if it is of `kind`.
     fn pop_first_of(&mut self, kind: DerivationKind) -> Option<(DerivationId, Reason)> {
-        let (_, _, id) = self.order.first()?;
+        let (_, _, _, id) = self.order.first()?;
         if id.kind != kind {
             return None;
         }
@@ -123,8 +169,10 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
-    pub(crate) fn with_edits(edits: derivation::EditMaps) -> Self {
+    pub(crate) fn new(edits: derivation::EditMaps, schedule: Schedule) -> Self {
         Self {
+            worklist: Queue::new(schedule),
+            next_round: Queue::new(schedule),
             edits_pending: !edits.is_empty(),
             edits,
             ..Self::default()
@@ -281,7 +329,8 @@ impl Engine {
                 if self.next_round.is_empty() {
                     break;
                 }
-                self.worklist = std::mem::take(&mut self.next_round);
+                let schedule = self.next_round.schedule;
+                self.worklist = std::mem::replace(&mut self.next_round, Queue::new(schedule));
                 self.cursor = None;
                 self.stats.rounds += 1;
                 continue;

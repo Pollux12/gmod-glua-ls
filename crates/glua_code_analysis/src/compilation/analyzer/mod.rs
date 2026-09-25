@@ -19,6 +19,7 @@ pub(crate) use common::{union_widens_cached_type, widen_mutable_decl_literal};
 pub(crate) use dynamic_field::for_range_pairs_source_for_var;
 pub(crate) use dynamic_field::is_provably_builtin_iterator_call;
 pub(crate) use engine::EngineStats;
+pub use engine::Schedule;
 pub use lua::is_member_assignment_in_conditional_branch;
 pub(crate) use lua::{
     dominating_guarded_table_bootstrap_range, infer_for_range_iter_expr_func,
@@ -114,8 +115,9 @@ pub(crate) fn reanalyze(
     db: &mut DbIndex,
     file_ids: Vec<FileId>,
     edits: derivation::EditMaps,
+    schedule: engine::Schedule,
 ) -> Reanalysis {
-    let mut engine = engine::Engine::with_edits(edits);
+    let mut engine = engine::Engine::new(edits, schedule);
     let mut pending: Vec<FileId> = file_ids;
     loop {
         pending.sort();
