@@ -94,12 +94,12 @@ impl LuaDeclIndex {
     }
 
     pub fn get_decl_tree(&self, file_id: &FileId) -> Option<&LuaDeclarationTree> {
-        derivation::note_read(|| FactKey::DeclTree(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::DeclTree, *file_id);
         self.decl_trees.get(file_id)
     }
 
     pub fn get_decl_tree_mut(&mut self, file_id: &FileId) -> Option<&mut LuaDeclarationTree> {
-        derivation::note_read(|| FactKey::DeclTree(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::DeclTree, *file_id);
         if self.decl_trees.contains_key(file_id) {
             derivation::note_write(|| FactKey::DeclTree(*file_id));
         }

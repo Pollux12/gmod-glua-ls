@@ -108,7 +108,7 @@ impl LuaReferenceIndex {
 
     /// Revision of `file_id`'s references. Zero until the file records one.
     pub fn file_reference_revision(&self, file_id: FileId) -> u64 {
-        derivation::note_read(|| FactKey::References(file_id));
+        derivation::note_file_fact_read(derivation::FileFact::References, file_id);
         self.file_revision.get(&file_id).copied().unwrap_or(0)
     }
 
@@ -398,37 +398,44 @@ impl LuaReferenceIndex {
             .collect()
     }
 
-    /// Every site in `file_id` that references `name`, including the index
-    /// references derivations resolved: [`Self::get_global_references`] and
-    /// [`Self::get_index_references`] narrowed to one file, read as that file's
-    /// facts alone.
-    pub fn name_sites_in_file(&self, name: &SmolStr, file_id: FileId) -> Vec<LuaSyntaxId> {
-        derivation::note_read(|| FactKey::References(file_id));
+    /// Every site in `file_id` that references one of `names`, including the
+    /// index references derivations resolved: [`Self::get_global_references`]
+    /// and [`Self::get_index_references`] narrowed to one file, read as that
+    /// file's facts alone.
+    pub fn name_sites_in_file<'a>(
+        &self,
+        names: impl IntoIterator<Item = &'a SmolStr>,
+        file_id: FileId,
+    ) -> Vec<LuaSyntaxId> {
+        derivation::note_file_fact_read(derivation::FileFact::References, file_id);
         derivation::note_read(|| FactKey::DerivedReferences(file_id));
-        let member_key = LuaMemberKey::Name(name.clone());
-        let mut sites = self
-            .global_references
-            .get(name)
-            .and_then(|references| references.get(&file_id))
-            .into_iter()
-            .flatten()
-            .chain(
-                self.index_reference
-                    .get(&member_key)
+        let mut sites = Vec::new();
+        for name in names {
+            let member_key = LuaMemberKey::Name(name.clone());
+            sites.extend(
+                self.global_references
+                    .get(name)
                     .and_then(|references| references.get(&file_id))
                     .into_iter()
-                    .flatten(),
-            )
-            .copied()
-            .collect::<Vec<_>>();
-        sites.extend(
-            self.derived_index_reference
-                .get(&member_key)
-                .into_iter()
-                .flat_map(|derived| derived.keys())
-                .filter(|(site_file, _)| *site_file == file_id)
-                .map(|(_, syntax_id)| *syntax_id),
-        );
+                    .flatten()
+                    .chain(
+                        self.index_reference
+                            .get(&member_key)
+                            .and_then(|references| references.get(&file_id))
+                            .into_iter()
+                            .flatten(),
+                    )
+                    .copied(),
+            );
+            sites.extend(
+                self.derived_index_reference
+                    .get(&member_key)
+                    .into_iter()
+                    .flat_map(|derived| derived.keys())
+                    .filter(|(site_file, _)| *site_file == file_id)
+                    .map(|(_, syntax_id)| *syntax_id),
+            );
+        }
         sites
     }
 
@@ -587,7 +594,7 @@ impl LuaReferenceIndex {
         file_id: FileId,
         decl_id: &LuaDeclId,
     ) -> Option<TextSize> {
-        derivation::note_read(|| FactKey::References(file_id));
+        derivation::note_file_fact_read(derivation::FileFact::References, file_id);
         self.local_reassignments
             .get(&file_id)?
             .get(decl_id)
@@ -595,7 +602,7 @@ impl LuaReferenceIndex {
     }
 
     pub fn get_local_reference(&self, file_id: &FileId) -> Option<&FileReference> {
-        derivation::note_read(|| FactKey::References(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::References, *file_id);
         self.file_references.get(file_id)
     }
 
@@ -609,14 +616,14 @@ impl LuaReferenceIndex {
         file_id: &FileId,
         decl_id: &LuaDeclId,
     ) -> Option<&DeclReference> {
-        derivation::note_read(|| FactKey::References(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::References, *file_id);
         self.file_references
             .get(file_id)?
             .get_decl_references(decl_id)
     }
 
     pub fn get_var_reference_decl(&self, file_id: &FileId, range: TextRange) -> Option<LuaDeclId> {
-        derivation::note_read(|| FactKey::References(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::References, *file_id);
         self.file_references.get(file_id)?.get_decl_id(&range)
     }
 
@@ -624,7 +631,7 @@ impl LuaReferenceIndex {
         &self,
         file_id: &FileId,
     ) -> Option<&HashMap<LuaDeclId, DeclReference>> {
-        derivation::note_read(|| FactKey::References(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::References, *file_id);
         self.file_references
             .get(file_id)
             .map(|file_reference| file_reference.get_decl_references_map())
@@ -734,7 +741,7 @@ impl LuaReferenceIndex {
     /// `file_id`, including names that resolved to nothing when the file was
     /// analysed (those are stored under the would-be global id).
     pub fn get_type_references_at(&self, file_id: FileId, range: TextRange) -> Vec<LuaTypeDeclId> {
-        derivation::note_read(|| FactKey::References(file_id));
+        derivation::note_file_fact_read(derivation::FileFact::References, file_id);
         let Some(type_references) = self.type_references.get(&file_id) else {
             return Vec::new();
         };
@@ -757,7 +764,7 @@ impl LuaReferenceIndex {
         self.file_references
             .iter()
             .flat_map(|(file_id, reference)| {
-                derivation::note_read(|| FactKey::References(*file_id));
+                derivation::note_file_fact_read(derivation::FileFact::References, *file_id);
                 reference
                     .iter_references_to_decl()
                     .map(move |(range, decl_id)| (*file_id, *range, *decl_id))
@@ -784,27 +791,27 @@ impl LuaReferenceIndex {
 
     /// Per-file string literal reference sites.
     pub fn iter_string_references(&self) -> impl Iterator<Item = (&FileId, &StringReference)> {
-        self.string_references
-            .iter()
-            .inspect(|(file_id, _)| derivation::note_read(|| FactKey::References(**file_id)))
+        self.string_references.iter().inspect(|(file_id, _)| {
+            derivation::note_file_fact_read(derivation::FileFact::References, **file_id)
+        })
     }
 
     /// Doc type-name reference sites: file → type decl → ranges.
     pub fn iter_type_references(
         &self,
     ) -> impl Iterator<Item = (&FileId, &HashMap<LuaTypeDeclId, HashSet<TextRange>>)> {
-        self.type_references
-            .iter()
-            .inspect(|(file_id, _)| derivation::note_read(|| FactKey::References(**file_id)))
+        self.type_references.iter().inspect(|(file_id, _)| {
+            derivation::note_file_fact_read(derivation::FileFact::References, **file_id)
+        })
     }
 
     /// First reassignment position of each local: file → decl → position.
     pub fn iter_local_reassignments(
         &self,
     ) -> impl Iterator<Item = (&FileId, &HashMap<LuaDeclId, TextSize>)> {
-        self.local_reassignments
-            .iter()
-            .inspect(|(file_id, _)| derivation::note_read(|| FactKey::References(**file_id)))
+        self.local_reassignments.iter().inspect(|(file_id, _)| {
+            derivation::note_file_fact_read(derivation::FileFact::References, **file_id)
+        })
     }
 }
 

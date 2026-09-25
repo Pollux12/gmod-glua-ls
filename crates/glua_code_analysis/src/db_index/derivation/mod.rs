@@ -653,6 +653,8 @@ impl PartialOrd for DerivationId {
 pub struct Evaluation {
     pub id: DerivationId,
     reads: FxHashSet<HashedKey>,
+    /// Cheap identities of keys already in `reads`, see [`note_read_by`].
+    read_identities: FxHashSet<(u8, u64)>,
     outputs: FxHashSet<HashedKey>,
     /// Fingerprints taken when an earlier stage of a staged evaluation ended:
     /// other evaluations write between its stages.
@@ -717,6 +719,7 @@ thread_local! {
     static UNTRACKED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static WRITE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CAPTURED: RefCell<Option<FxHashSet<HashedKey>>> = const { RefCell::new(None) };
+    static NOTED_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Runs `f` outside any evaluation and returns every key it wrote: a reset
@@ -755,6 +758,7 @@ pub fn begin(id: DerivationId) {
         let previous = current.borrow_mut().replace(Evaluation {
             id,
             reads: FxHashSet::default(),
+            read_identities: FxHashSet::default(),
             outputs: FxHashSet::default(),
             staged: rustc_hash::FxHashMap::default(),
         });
@@ -796,9 +800,65 @@ pub fn note_read(key: impl FnOnce() -> FactKey) {
     }
     CURRENT.with(|current| {
         if let Some(evaluation) = current.borrow_mut().as_mut() {
+            NOTED_READS.with(|count| count.set(count.get() + 1));
             evaluation.reads.insert(HashedKey::new(key()));
         }
     });
+}
+
+/// Records a read of `key`, which `identity` names exactly: a repeat within
+/// the evaluation is one small-set probe instead of building and hashing the
+/// key. The identity must be unique to the key for as long as the recorded
+/// key lives.
+fn note_read_by(identity: (u8, u64), key: impl FnOnce() -> FactKey) {
+    if UNTRACKED.with(|depth| depth.get() > 0) {
+        return;
+    }
+    CURRENT.with(|current| {
+        if let Some(evaluation) = current.borrow_mut().as_mut() {
+            NOTED_READS.with(|count| count.set(count.get() + 1));
+            if evaluation.read_identities.insert(identity) {
+                evaluation.reads.insert(HashedKey::new(key()));
+            }
+        }
+    });
+}
+
+/// A per-file fact read often enough to be worth [`note_read_by`].
+#[derive(Debug, Clone, Copy)]
+pub enum FileFact {
+    GmodRealm,
+    GmodInferFile,
+    ModuleMeta,
+    References,
+    FlowTree,
+    DeclTree,
+}
+
+/// Records a read of `file_id`'s `fact`.
+pub fn note_file_fact_read(fact: FileFact, file_id: FileId) {
+    note_read_by((fact as u8, u64::from(file_id.id)), || match fact {
+        FileFact::GmodRealm => FactKey::GmodRealm(file_id),
+        FileFact::GmodInferFile => FactKey::GmodInferFile(file_id),
+        FileFact::ModuleMeta => FactKey::ModuleMeta(file_id),
+        FileFact::References => FactKey::References(file_id),
+        FileFact::FlowTree => FactKey::FlowTree(file_id),
+        FileFact::DeclTree => FactKey::DeclTree(file_id),
+    });
+}
+
+/// Records a read of the type declaration `decl_id`. Interned ids compare by
+/// address, which the recorded key keeps alive for the evaluation.
+pub fn note_type_decl_read(decl_id: &LuaTypeDeclId) {
+    note_read_by((u8::MAX, decl_id.interned_address()), || {
+        FactKey::TypeDecl(decl_id.clone())
+    });
+}
+
+/// How many reads evaluations on this thread noted, duplicates included,
+/// since the last call.
+pub fn take_noted_reads() -> u64 {
+    NOTED_READS.with(|count| count.replace(0))
 }
 
 /// Records a read of `file_id`'s text. A derivation's own file is not a

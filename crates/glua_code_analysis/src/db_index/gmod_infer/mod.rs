@@ -608,7 +608,7 @@ impl GmodInferIndex {
     }
 
     pub fn get_hook_file_metadata(&self, file_id: &FileId) -> Option<&GmodHookFileMetadata> {
-        derivation::note_read(|| FactKey::GmodInferFile(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::GmodInferFile, *file_id);
         self.hook_file_metadata.get(file_id)
     }
 
@@ -677,7 +677,7 @@ impl GmodInferIndex {
     }
 
     pub fn get_system_file_metadata(&self, file_id: &FileId) -> Option<&GmodSystemFileMetadata> {
-        derivation::note_read(|| FactKey::GmodInferFile(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::GmodInferFile, *file_id);
         self.system_file_metadata.get(file_id)
     }
 
@@ -721,7 +721,7 @@ impl GmodInferIndex {
     }
 
     pub fn get_realm_file_metadata(&self, file_id: &FileId) -> Option<&GmodRealmFileMetadata> {
-        derivation::note_read(|| FactKey::GmodRealm(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::GmodRealm, *file_id);
         self.realm_file_metadata.get(file_id)
     }
 
@@ -729,7 +729,7 @@ impl GmodInferIndex {
     /// If the offset is inside a branch-narrowed block, returns that block's realm.
     /// Otherwise returns the file-level inferred realm, or annotation realm if inferred is Unknown.
     pub fn get_realm_at_offset(&self, file_id: &FileId, offset: rowan::TextSize) -> GmodRealm {
-        derivation::note_read(|| FactKey::GmodRealm(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::GmodRealm, *file_id);
         let Some(metadata) = self.realm_file_metadata.get(file_id) else {
             return GmodRealm::Unknown;
         };
@@ -752,7 +752,7 @@ impl GmodInferIndex {
         file_id: &FileId,
         offset: rowan::TextSize,
     ) -> GmodStateMask {
-        derivation::note_read(|| FactKey::GmodRealm(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::GmodRealm, *file_id);
         let Some(metadata) = self.realm_file_metadata.get(file_id) else {
             return GmodStateMask::empty();
         };
@@ -811,7 +811,7 @@ impl GmodInferIndex {
     }
 
     pub fn get_realm_inputs(&self, file_id: &FileId) -> Option<&GmodRealmInputs> {
-        derivation::note_read(|| FactKey::GmodInferFile(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::GmodInferFile, *file_id);
         self.realm_inputs.get(file_id)
     }
 
@@ -864,7 +864,7 @@ impl GmodInferIndex {
     /// Use as a guard before calling `get_member_annotation_realm_at_offset` to distinguish
     /// "no ranges for this file" (pre ran, file had none) from "pre not yet run" (fall back).
     pub fn has_member_realm_ranges(&self, file_id: &FileId) -> bool {
-        derivation::note_read(|| FactKey::GmodInferFile(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::GmodInferFile, *file_id);
         self.member_realm_ranges.contains_key(file_id)
     }
 
@@ -874,7 +874,7 @@ impl GmodInferIndex {
         file_id: &FileId,
         offset: rowan::TextSize,
     ) -> Option<GmodRealm> {
-        derivation::note_read(|| FactKey::GmodInferFile(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::GmodInferFile, *file_id);
         let ranges = self.member_realm_ranges.get(file_id)?;
         let idx = match ranges.binary_search_by_key(&offset, |r| r.range.start()) {
             Ok(i) => i,
@@ -899,7 +899,7 @@ impl GmodInferIndex {
 
     /// O(1) lookup for a @fileparam type text by file and parameter name.
     pub fn get_file_param_type_text(&self, file_id: &FileId, name_lowercase: &str) -> Option<&str> {
-        derivation::note_read(|| FactKey::GmodInferFile(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::GmodInferFile, *file_id);
         let params = self.fileparam_index.get(file_id)?;
         params
             .iter()
@@ -913,7 +913,7 @@ impl GmodInferIndex {
     }
 
     pub fn get_scoped_class_info(&self, file_id: &FileId) -> Option<&GmodScopedClassInfo> {
-        derivation::note_read(|| FactKey::GmodInferFile(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::GmodInferFile, *file_id);
         self.scoped_class_info.get(file_id)
     }
 

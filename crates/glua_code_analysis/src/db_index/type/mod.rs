@@ -1720,7 +1720,7 @@ impl LuaTypeIndex {
     pub fn find_type_decl(&self, file_id: FileId, name: &str) -> Option<&LuaTypeDecl> {
         if let Some(ns) = self.get_file_namespace(&file_id) {
             let full_name = LuaTypeDeclId::global(&format!("{}.{}", ns, name));
-            derivation::note_read(|| FactKey::TypeDecl(full_name.clone()));
+            derivation::note_type_decl_read(&full_name);
             if let Some(decl) = self.full_name_type_map.get(&full_name) {
                 return Some(decl);
             }
@@ -1728,7 +1728,7 @@ impl LuaTypeIndex {
         if let Some(usings) = self.get_file_using_namespace(&file_id) {
             for ns in usings {
                 let full_name = LuaTypeDeclId::global(&format!("{}.{}", ns, name));
-                derivation::note_read(|| FactKey::TypeDecl(full_name.clone()));
+                derivation::note_type_decl_read(&full_name);
                 if let Some(decl) = self.full_name_type_map.get(&full_name) {
                     return Some(decl);
                 }
@@ -1736,13 +1736,13 @@ impl LuaTypeIndex {
         }
 
         let local_id = LuaTypeDeclId::local(file_id, name);
-        derivation::note_read(|| FactKey::TypeDecl(local_id.clone()));
+        derivation::note_type_decl_read(&local_id);
         if let Some(decl) = self.full_name_type_map.get(&local_id) {
             return Some(decl);
         }
 
         let global_id = LuaTypeDeclId::global(name);
-        derivation::note_read(|| FactKey::TypeDecl(global_id.clone()));
+        derivation::note_type_decl_read(&global_id);
         self.full_name_type_map.get(&global_id)
     }
 
@@ -1832,7 +1832,7 @@ impl LuaTypeIndex {
     }
 
     pub fn get_generic_params(&self, decl_id: &LuaTypeDeclId) -> Option<&Vec<GenericParam>> {
-        derivation::note_read(|| FactKey::TypeDecl(decl_id.clone()));
+        derivation::note_type_decl_read(&decl_id);
         self.generic_params.get(decl_id)
     }
 
@@ -2019,7 +2019,7 @@ impl LuaTypeIndex {
         &self,
         decl_id: &LuaTypeDeclId,
     ) -> Option<impl Iterator<Item = &LuaType> + '_> {
-        derivation::note_read(|| FactKey::TypeDecl(decl_id.clone()));
+        derivation::note_type_decl_read(&decl_id);
         self.supers.get(decl_id).map(|supers| {
             supers
                 .iter()
@@ -2037,7 +2037,7 @@ impl LuaTypeIndex {
         &self,
         decl_id: &LuaTypeDeclId,
     ) -> Option<&[InFiled<LuaSuperType>]> {
-        derivation::note_read(|| FactKey::TypeDecl(decl_id.clone()));
+        derivation::note_type_decl_read(&decl_id);
         self.supers.get(decl_id).map(Vec::as_slice)
     }
 
@@ -2095,7 +2095,7 @@ impl LuaTypeIndex {
         };
         if derivation::recording() {
             for child_id in children {
-                derivation::note_read(|| FactKey::TypeDecl(child_id.clone()));
+                derivation::note_type_decl_read(&child_id);
             }
         }
 
@@ -2136,7 +2136,7 @@ impl LuaTypeIndex {
     }
 
     pub fn get_type_decl(&self, decl_id: &LuaTypeDeclId) -> Option<&LuaTypeDecl> {
-        derivation::note_read(|| FactKey::TypeDecl(decl_id.clone()));
+        derivation::note_type_decl_read(&decl_id);
         self.full_name_type_map.get(decl_id)
     }
 

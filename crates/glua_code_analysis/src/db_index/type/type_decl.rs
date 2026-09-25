@@ -389,6 +389,13 @@ pub struct LuaTypeDeclId {
     id: ArcIntern<LuaTypeIdentifier>,
 }
 
+impl LuaTypeDeclId {
+    /// The interned value's address: equal for equal ids while either lives.
+    pub(crate) fn interned_address(&self) -> u64 {
+        std::ptr::from_ref::<LuaTypeIdentifier>(&self.id) as usize as u64
+    }
+}
+
 /// Hashes the name, not the interned pointer: an id interned again after its
 /// last holder dropped it must hash as before.
 impl Hash for LuaTypeDeclId {

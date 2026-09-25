@@ -481,7 +481,10 @@ impl EngineStats {
         let mut reads = self.reads.iter().collect::<Vec<_>>();
         reads.sort_by(|left, right| right.1.cmp(left.1));
         let total = reads.iter().map(|(_, count)| **count).sum::<usize>();
-        eprintln!("[engine] recorded reads {total}");
+        eprintln!(
+            "[engine] recorded reads {total}, noted {}",
+            derivation::take_noted_reads()
+        );
         for (variant, count) in reads.into_iter().take(25) {
             eprintln!("[engine] reads {count} {variant}");
         }

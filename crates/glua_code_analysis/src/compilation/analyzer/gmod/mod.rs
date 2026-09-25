@@ -786,10 +786,7 @@ fn net_helper_call_sites(
     let reference_index = db.get_reference_index();
     let mut by_file: FxHashMap<FileId, Vec<LuaSyntaxId>> = FxHashMap::default();
     for file_id in collected_files {
-        let sites = names
-            .iter()
-            .flat_map(|name| reference_index.name_sites_in_file(name, *file_id))
-            .collect::<Vec<_>>();
+        let sites = reference_index.name_sites_in_file(&names, *file_id);
         if !sites.is_empty() {
             by_file.insert(*file_id, sites);
         }

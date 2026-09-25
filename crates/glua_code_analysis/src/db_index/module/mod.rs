@@ -417,7 +417,7 @@ impl LuaModuleIndex {
     }
 
     pub fn get_legacy_module_env(&self, file_id: FileId) -> Option<&LegacyModuleEnv> {
-        derivation::note_read(|| FactKey::ModuleMeta(file_id));
+        derivation::note_file_fact_read(derivation::FileFact::ModuleMeta, file_id);
         self.legacy_module_envs.get(&file_id)?.last()
     }
 
@@ -426,7 +426,7 @@ impl LuaModuleIndex {
         file_id: FileId,
         position: TextSize,
     ) -> Option<&LegacyModuleEnv> {
-        derivation::note_read(|| FactKey::ModuleMeta(file_id));
+        derivation::note_file_fact_read(derivation::FileFact::ModuleMeta, file_id);
         self.legacy_module_envs
             .get(&file_id)?
             .iter()
@@ -1188,7 +1188,7 @@ impl LuaModuleIndex {
     }
 
     pub fn is_main(&self, file_id: &FileId) -> bool {
-        derivation::note_read(|| FactKey::ModuleMeta(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::ModuleMeta, *file_id);
         if let Some(module_info) = self.file_module_map.get(file_id) {
             return self.is_main_workspace_id(module_info.workspace_id);
         }
@@ -1197,7 +1197,7 @@ impl LuaModuleIndex {
     }
 
     pub fn is_std(&self, file_id: &FileId) -> bool {
-        derivation::note_read(|| FactKey::ModuleMeta(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::ModuleMeta, *file_id);
         if let Some(module_info) = self.file_module_map.get(file_id) {
             return self.is_std_workspace_id(module_info.workspace_id);
         }
@@ -1206,7 +1206,7 @@ impl LuaModuleIndex {
     }
 
     pub fn is_library(&self, file_id: &FileId) -> bool {
-        derivation::note_read(|| FactKey::ModuleMeta(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::ModuleMeta, *file_id);
         if let Some(module_info) = self.file_module_map.get(file_id) {
             return self.is_library_workspace_id(module_info.workspace_id);
         }
@@ -1248,7 +1248,7 @@ impl LuaModuleIndex {
     }
 
     pub fn is_meta_file(&self, file_id: &FileId) -> bool {
-        derivation::note_read(|| FactKey::ModuleMeta(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::ModuleMeta, *file_id);
         if let Some(module_info) = self.file_module_map.get(file_id) {
             return module_info.is_meta;
         }
@@ -1257,7 +1257,7 @@ impl LuaModuleIndex {
     }
 
     pub fn get_workspace_id(&self, file_id: FileId) -> Option<WorkspaceId> {
-        derivation::note_read(|| FactKey::ModuleMeta(file_id));
+        derivation::note_file_fact_read(derivation::FileFact::ModuleMeta, file_id);
         if let Some(module_info) = self.file_module_map.get(&file_id) {
             return Some(module_info.workspace_id);
         }

@@ -60,7 +60,7 @@ impl LuaFlowIndex {
     }
 
     pub fn get_flow_tree(&self, file_id: &FileId) -> Option<&FlowTree> {
-        derivation::note_read(|| FactKey::FlowTree(*file_id));
+        derivation::note_file_fact_read(derivation::FileFact::FlowTree, *file_id);
         self.file_flow_tree.get(file_id)
     }
 
