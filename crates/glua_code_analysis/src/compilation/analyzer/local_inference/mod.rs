@@ -874,6 +874,16 @@ fn collect_unguarded_child_file(
             else {
                 continue;
             };
+            if type_has_visible_member_at_use(
+                db,
+                workspace_id,
+                &LuaType::Ref(base_id.clone()),
+                &member_key,
+                file_id,
+                index_expr.get_position(),
+            ) {
+                continue;
+            }
             let Some(children) =
                 direct_subtypes_with_member(db, &mut subtypes_with_member, &base_id, &member_key)
             else {
@@ -885,16 +895,6 @@ fn collect_unguarded_child_file(
             let current = infer_expr(db, &mut infer_cache, LuaExpr::NameExpr(name_expr.clone()))
                 .unwrap_or(LuaType::Unknown);
             if !unguarded_child_current_matches_base(&current, &base_type, &base_id) {
-                continue;
-            }
-            if type_has_visible_member_at_use(
-                db,
-                workspace_id,
-                &LuaType::Ref(base_id.clone()),
-                &member_key,
-                file_id,
-                index_expr.get_position(),
-            ) {
                 continue;
             }
             // Prefer a stabilized initializer type (e.g. a later same-file
@@ -1100,11 +1100,27 @@ fn collect_member_path_unguarded_child_evidence(
             resolved
         }
     };
+    let base_has_visible_member = |base_id: &LuaTypeDeclId| {
+        type_has_visible_member_at_use(
+            db,
+            workspace_id,
+            &LuaType::Ref(base_id.clone()),
+            &member_key,
+            file_id,
+            index_expr.get_position(),
+        )
+    };
     let (base_id, current) = match declared_base {
         // The declaration already names the base, so the child lookup can rule
         // the use out before its narrowed type is worth computing.
         Some((declared, base_id)) => {
-            if direct_subtypes_with_member(db, evidence.subtypes_with_member, &base_id, &member_key)
+            if base_has_visible_member(&base_id)
+                || direct_subtypes_with_member(
+                    db,
+                    evidence.subtypes_with_member,
+                    &base_id,
+                    &member_key,
+                )
                 .is_none()
             {
                 return;
@@ -1131,6 +1147,9 @@ fn collect_member_path_unguarded_child_evidence(
             let Some(base_id) = unguarded_child_base_id(&current) else {
                 return;
             };
+            if base_has_visible_member(&base_id) {
+                return;
+            }
             (base_id, current)
         }
     };
@@ -1140,16 +1159,6 @@ fn collect_member_path_unguarded_child_evidence(
         return;
     };
     if is_matching_short_circuit_guard(db, cache, index_expr) {
-        return;
-    }
-    if type_has_visible_member_at_use(
-        db,
-        workspace_id,
-        &LuaType::Ref(base_id),
-        &member_key,
-        file_id,
-        index_expr.get_position(),
-    ) {
         return;
     }
     let Some(target) = nested_unguarded_child_target(db, cache, receiver, evidence.root_decl_id)
@@ -1967,6 +1976,45 @@ mod tests {
             (1..=evaluations).contains(&scans),
             "{scans} subtype scans over {evaluations} evaluations"
         );
+    }
+
+    #[test]
+    fn unguarded_child_skips_the_subtype_scan_for_members_the_base_has() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        super::SUBTYPE_SCANS.with(|scans| scans.set(0));
+
+        ws.def_files(vec![
+            (
+                "addons/scan_fixture/lua/autorun/sh_types.lua",
+                r#"
+                ---@class Vector
+                ---@class Entity
+                ---@field GetPos fun(self: Entity): Vector
+                ---@class Player: Entity
+                ---@field GetPos fun(self: Player): Vector
+                ---@class NPC: Entity
+                ---@class Holder
+                ---@field proc Entity
+                "#,
+            ),
+            (
+                "addons/scan_fixture/lua/autorun/server/consumer.lua",
+                r#"
+                ---@type Entity
+                local owner
+                local a = owner:GetPos()
+
+                ---@type Holder
+                local holder
+                local b = holder.proc:GetPos()
+                "#,
+            ),
+        ]);
+
+        assert_eq!(super::SUBTYPE_SCANS.with(std::cell::Cell::get), 0);
     }
 
     #[test]
