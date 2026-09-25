@@ -241,8 +241,6 @@ pub struct LuaMemberIndex {
     /// Member reads that found nothing, by the file that read. A file whose
     /// read failed cached no type and so left no dependency edge; when another
     /// file later defines that key, this is how the reader is found.
-    missed_member_reads_by_file: HashMap<FileId, Vec<(LuaMemberOwner, LuaMemberKey)>>,
-    missed_member_readers: HashMap<(LuaMemberOwner, LuaMemberKey), HashSet<FileId>>,
     /// Per-owner multiset fingerprint of its history-index entries and
     /// current-owner history, for [`FactKey::MemberOwnerMap`].
     owner_history_fingerprints: HashMap<LuaMemberOwner, Fingerprint>,
@@ -324,8 +322,6 @@ impl LuaMemberIndex {
             path_class_holders: HashMap::default(),
             derived_path_classes: HashMap::default(),
             member_path_provenance: HashMap::default(),
-            missed_member_reads_by_file: HashMap::default(),
-            missed_member_readers: HashMap::default(),
             owner_history_fingerprints: HashMap::default(),
             key_fingerprints: HashMap::default(),
             file_fingerprints: HashMap::default(),
@@ -3006,7 +3002,6 @@ impl LuaMemberIndex {
         }
 
         let mut dirty = HashSet::default();
-        dirty.extend(self.remap_missed_member_reads(remap));
         for range in &deleted {
             let owner = LuaMemberOwner::Element(range.clone());
             for member in self.get_members(&owner).unwrap_or_default() {
@@ -3044,58 +3039,6 @@ impl LuaMemberIndex {
         let forgotten = self.remove_deleted_element_owners(&deleted);
         dirty.remove(&remap.file_id);
         (forgotten, dirty)
-    }
-
-    fn remap_missed_member_reads(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
-        let updates = self
-            .missed_member_readers
-            .keys()
-            .filter_map(|(owner, key)| {
-                let LuaMemberOwner::Element(range) = owner else {
-                    return None;
-                };
-                match remap.table_range(range) {
-                    crate::Remap::Moved(new) if new != *range => Some((
-                        (owner.clone(), key.clone()),
-                        Some((LuaMemberOwner::Element(new), key.clone())),
-                    )),
-                    crate::Remap::Lost => Some(((owner.clone(), key.clone()), None)),
-                    crate::Remap::Moved(_) | crate::Remap::Unrelated => None,
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut dirty = HashSet::default();
-        let mut affected_readers = HashSet::default();
-
-        for (old, new) in updates {
-            let readers = self.missed_member_readers.remove(&old).unwrap_or_default();
-            affected_readers.extend(readers.iter().copied());
-            if let Some(new) = &new {
-                self.missed_member_readers
-                    .entry(new.clone())
-                    .or_default()
-                    .extend(readers.iter().copied());
-            } else {
-                dirty.extend(readers.iter().copied());
-            }
-            for reader in readers {
-                let Some(reads) = self.missed_member_reads_by_file.get_mut(&reader) else {
-                    continue;
-                };
-                reads.retain(|read| read != &old);
-                if let Some(new) = &new {
-                    reads.push(new.clone());
-                }
-            }
-        }
-
-        for reader in affected_readers {
-            if let Some(reads) = self.missed_member_reads_by_file.get_mut(&reader) {
-                reads.sort_unstable_by_key(|read| format!("{read:?}"));
-                reads.dedup();
-            }
-        }
-        dirty
     }
 
     pub fn remap_elements(
@@ -3220,57 +3163,6 @@ impl LuaMemberIndex {
 }
 
 impl LuaMemberIndex {
-    /// Replaces the member reads of `file_id` that found nothing.
-    pub fn set_missed_member_reads(
-        &mut self,
-        file_id: FileId,
-        reads: impl IntoIterator<Item = (LuaMemberOwner, LuaMemberKey)>,
-    ) {
-        self.clear_missed_member_reads(file_id);
-        let mut reads: Vec<_> = reads
-            .into_iter()
-            .map(|(owner, key)| (self.canonical_owner(owner), key))
-            .collect();
-        if reads.is_empty() {
-            return;
-        }
-        reads.sort_unstable_by_key(|read| format!("{read:?}"));
-        reads.dedup();
-        for read in &reads {
-            self.missed_member_readers
-                .entry(read.clone())
-                .or_default()
-                .insert(file_id);
-        }
-        self.missed_member_reads_by_file.insert(file_id, reads);
-    }
-
-    fn clear_missed_member_reads(&mut self, file_id: FileId) {
-        let Some(reads) = self.missed_member_reads_by_file.remove(&file_id) else {
-            return;
-        };
-        for read in reads {
-            if let Some(readers) = self.missed_member_readers.get_mut(&read) {
-                readers.remove(&file_id);
-                if readers.is_empty() {
-                    self.missed_member_readers.remove(&read);
-                }
-            }
-        }
-    }
-
-    /// Files whose read of `key` on `owner` found nothing when they were
-    /// analysed.
-    pub fn missed_member_readers(
-        &self,
-        owner: &LuaMemberOwner,
-        key: &LuaMemberKey,
-    ) -> impl Iterator<Item = FileId> + '_ {
-        self.missed_member_readers
-            .get(&(owner.clone(), key.clone()))
-            .into_iter()
-            .flat_map(|readers| readers.iter().copied())
-    }
 }
 
 impl LuaIndex for LuaMemberIndex {
@@ -3281,7 +3173,6 @@ impl LuaIndex for LuaMemberIndex {
     fn remove_files(&mut self, file_ids: &[FileId]) {
         for &file_id in file_ids {
             self.remove_file_owned_entries(file_id);
-            self.clear_missed_member_reads(file_id);
         }
         let removed: HashSet<FileId> = file_ids.iter().copied().collect();
         self.remove_files_members_from_owner_key_indexes(&removed);
@@ -3305,8 +3196,6 @@ impl LuaIndex for LuaMemberIndex {
         self.source_members.clear();
         self.in_filed.clear();
         self.owner_members.clear();
-        self.missed_member_reads_by_file.clear();
-        self.missed_member_readers.clear();
         self.member_current_owner.clear();
         self.member_owner_key_index.clear();
         self.member_owner_key_history_index.clear();

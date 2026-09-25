@@ -1,15 +1,9 @@
-//! Incremental-edit machinery: where an edit moved things, what a file
-//! exports, and who reads it.
+//! Incremental-edit machinery: where an edit moved things.
 
-mod export_map;
 mod position_map;
 #[cfg(test)]
 mod test;
 
-pub use export_map::{
-    ChangedExports, ExportKey, ExportMap, NetSide, RealmSubject, dependents_of, diff_exports,
-    export_map,
-};
 pub use position_map::{FileFacts, FileRemap, PositionMap, Remap};
 
 use std::collections::HashSet;

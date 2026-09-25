@@ -231,21 +231,6 @@ impl CallSiteParamIndex {
             .unwrap_or_default()
     }
 
-    /// The files contributing evidence for any parameter of `signatures`,
-    /// sorted.
-    pub(crate) fn contributor_files(&self, signatures: &[LuaSignatureId]) -> Vec<FileId> {
-        let signatures = signatures.iter().collect::<HashSet<_>>();
-        let mut files = self
-            .contributors
-            .iter()
-            .filter(|((signature_id, _), _)| signatures.contains(signature_id))
-            .flat_map(|(_, files)| files.iter().copied())
-            .collect::<Vec<_>>();
-        files.sort_unstable();
-        files.dedup();
-        files
-    }
-
     /// The inference events `file_id`'s own evidence carries, each with the
     /// parameter's folded fact.
     pub fn get_inference_events_for_file(

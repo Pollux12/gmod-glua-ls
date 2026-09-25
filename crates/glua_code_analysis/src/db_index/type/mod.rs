@@ -320,10 +320,6 @@ fn remap_generic_params(
 /// identity no store enumerates is still moved or reported lost. `lost`
 /// propagates out of every nested arm: a holder of a lost identity keeps its
 /// stored value and its owning file is dirtied instead.
-///
-/// The arm list must stay in step with `db_index::edit::export_map::hash_type`:
-/// a composite one walk descends into and the other does not leaves a nested
-/// identity unmoved while the diff still calls the export unchanged.
 pub fn remap_identities_in_type(typ: &LuaType, remap: &crate::FileRemap) -> TypeRemapResult {
     match typ {
         LuaType::Signature(old) => match remap.signature_id(*old) {

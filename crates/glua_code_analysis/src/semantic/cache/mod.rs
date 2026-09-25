@@ -254,11 +254,6 @@ pub struct LuaInferCache {
     /// expression. Consulted per call-site during inference, so re-inferring
     /// the call prefix each time is avoided.
     pub signature_is_generic_cache: FxHashMap<LuaSyntaxId, Option<bool>>,
-    /// Member reads that found no member. A read that fails records no type
-    /// cache and so no dependency edge, yet the file's answer changes the
-    /// moment another file defines the member; these are what the analyzer
-    /// files as that edge. See `LuaMemberIndex::set_missed_member_reads`.
-    missed_member_reads: FxHashSet<(crate::LuaMemberOwner, LuaMemberKey)>,
 }
 
 impl LuaInferCache {
@@ -304,7 +299,6 @@ impl LuaInferCache {
             call_returns_never_cache: FxHashMap::default(),
             signature_is_generic_cache: FxHashMap::default(),
             generic_call_bindings: FxHashMap::default(),
-            missed_member_reads: FxHashSet::default(),
         }
     }
 
@@ -386,22 +380,6 @@ impl LuaInferCache {
             db.get_dynamic_field_index()
                 .field_definitions(&dynamic_owner, name.as_str());
         }
-        self.missed_member_reads
-            .insert((owner.clone(), key.clone()));
-    }
-
-    pub fn take_missed_member_reads(&mut self) -> FxHashSet<(crate::LuaMemberOwner, LuaMemberKey)> {
-        std::mem::take(&mut self.missed_member_reads)
-    }
-
-    /// Folds reads recorded into a detached cache — one a parallel or
-    /// speculative pass built away from this manager — into the file's
-    /// canonical set so the analysis drain files them like a native read.
-    pub fn extend_missed_member_reads(
-        &mut self,
-        reads: impl IntoIterator<Item = (crate::LuaMemberOwner, LuaMemberKey)>,
-    ) {
-        self.missed_member_reads.extend(reads);
     }
 
     pub fn clear(&mut self) {
