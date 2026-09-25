@@ -55,6 +55,7 @@ struct FileScope {
     exact_receiver_eligibility: HashMap<LuaSignatureId, bool>,
     authoritative_receivers: HashMap<LuaSignatureId, bool>,
     mutated_params: HashMap<LuaSignatureId, Vec<usize>>,
+    closures: HashMap<LuaSignatureId, Option<LuaClosureExpr>>,
 }
 
 impl FileScope {
@@ -69,7 +70,20 @@ impl FileScope {
             exact_receiver_eligibility: HashMap::default(),
             authoritative_receivers: HashMap::default(),
             mutated_params: HashMap::default(),
+            closures: HashMap::default(),
         }
+    }
+
+    /// The closure `signature_id` was declared by, found once per signature.
+    fn signature_closure(
+        &mut self,
+        db: &DbIndex,
+        signature_id: LuaSignatureId,
+    ) -> Option<LuaClosureExpr> {
+        self.closures
+            .entry(signature_id)
+            .or_insert_with(|| exact_signature_closure(db, signature_id))
+            .clone()
     }
 
     /// The last function statement at or before `position` declaring `path`.
@@ -782,7 +796,7 @@ fn collect_direct_callback_param_types(
     let Some(callee_signature) = db.get_signature_index().get(&callee_signature_id) else {
         return;
     };
-    let Some(callee_closure) = exact_signature_closure(db, callee_signature_id) else {
+    let Some(callee_closure) = scope.signature_closure(db, callee_signature_id) else {
         return;
     };
     let Some(callee_params) = callee_closure.get_params_list() else {
