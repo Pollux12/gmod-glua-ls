@@ -107,7 +107,7 @@ impl LuaDeclIndex {
     }
 
     pub fn get_decl(&self, decl_id: &LuaDeclId) -> Option<&LuaDecl> {
-        derivation::note_read(|| FactKey::Decl(*decl_id));
+        derivation::note_decl_read(*decl_id);
         self.decl_trees
             .get(&decl_id.file_id)
             .and_then(|tree| tree.get_decl(decl_id))
@@ -115,7 +115,7 @@ impl LuaDeclIndex {
     }
 
     pub fn get_decl_mut(&mut self, decl_id: &LuaDeclId) -> Option<&mut LuaDecl> {
-        derivation::note_read(|| FactKey::Decl(*decl_id));
+        derivation::note_decl_read(*decl_id);
         if let Some(tree) = self.decl_trees.get_mut(&decl_id.file_id)
             && let Some(decl) = tree.get_decl_mut(*decl_id)
         {

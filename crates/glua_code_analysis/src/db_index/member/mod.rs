@@ -1058,7 +1058,7 @@ impl LuaMemberIndex {
     }
 
     pub fn has_synthesized_owner(&self, id: &LuaMemberId) -> bool {
-        derivation::note_read(|| FactKey::Member(*id));
+        derivation::note_member_read(*id);
         self.synthesized_owner_members.contains(id)
     }
 
@@ -1068,7 +1068,7 @@ impl LuaMemberIndex {
     /// class-flip machinery (`set_global_path_class`), not by the prefix-type
     /// read a settled pass re-derives.
     pub fn member_path_provenance(&self, id: &LuaMemberId) -> Option<&GlobalId> {
-        derivation::note_read(|| FactKey::Member(*id));
+        derivation::note_member_read(*id);
         self.member_path_provenance.get(id)
     }
 
@@ -1083,7 +1083,7 @@ impl LuaMemberIndex {
     }
 
     pub fn is_deferred_index_expr_member(&self, id: &LuaMemberId) -> bool {
-        derivation::note_read(|| FactKey::Member(*id));
+        derivation::note_member_read(*id);
         self.deferred_index_expr_members.contains(id)
     }
 
@@ -1495,7 +1495,7 @@ impl LuaMemberIndex {
     }
 
     pub fn get_member(&self, id: &LuaMemberId) -> Option<&LuaMember> {
-        derivation::note_read(|| FactKey::Member(*id));
+        derivation::note_member_read(*id);
         self.members.get(id)
     }
 
@@ -1731,7 +1731,7 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
     ) -> Option<LuaMemberOwner> {
         let class = owner.get_type_id()?;
-        derivation::note_read(|| FactKey::Member(id));
+        derivation::note_member_read(id);
         let provenance = self.member_path_provenance.get(&id)?;
         derivation::note_read(|| FactKey::GlobalPath(provenance.clone()));
         let candidates = self.global_path_class_candidates.get(provenance)?;
@@ -2175,7 +2175,7 @@ impl LuaMemberIndex {
         &self,
         member_id: LuaMemberId,
     ) -> Option<&LuaMemberIndexItem> {
-        derivation::note_read(|| FactKey::Member(member_id));
+        derivation::note_member_read(member_id);
         let owner = self.member_current_owner.get(&member_id)?;
         let member_key = self.members.get(&member_id)?.get_key();
         note_slot_read(owner, member_key);
@@ -2227,12 +2227,12 @@ impl LuaMemberIndex {
     }
 
     pub fn get_current_owner(&self, id: &LuaMemberId) -> Option<&LuaMemberOwner> {
-        derivation::note_read(|| FactKey::Member(*id));
+        derivation::note_member_read(*id);
         self.member_current_owner.get(id)
     }
 
     pub fn get_member_owner(&self, id: &LuaMemberId) -> Option<&LuaMemberOwner> {
-        derivation::note_read(|| FactKey::Member(*id));
+        derivation::note_member_read(*id);
         self.member_current_owner.get(id)
     }
 
@@ -2449,7 +2449,7 @@ impl LuaMemberIndex {
     }
 
     pub fn member_function_scope_range(&self, member_id: LuaMemberId) -> Option<TextRange> {
-        derivation::note_read(|| FactKey::Member(member_id));
+        derivation::note_member_read(member_id);
         self.member_function_scope_ranges.get(&member_id).copied()
     }
 
@@ -2537,7 +2537,7 @@ impl LuaMemberIndex {
     }
 
     pub fn is_non_overwriting_assignment_member(&self, member_id: LuaMemberId) -> bool {
-        derivation::note_read(|| FactKey::Member(member_id));
+        derivation::note_member_read(member_id);
         self.non_overwriting_assignment_members.contains(&member_id)
     }
 

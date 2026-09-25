@@ -187,7 +187,7 @@ impl LuaFlowIndex {
         file_id: &FileId,
         position: TextSize,
     ) -> Option<&[LuaSpecialCallEffect]> {
-        derivation::note_read(|| FactKey::SpecialCall(*file_id, position));
+        derivation::note_special_call_read(*file_id, position);
         self.special_call_effects
             .get(file_id)?
             .get(&position)

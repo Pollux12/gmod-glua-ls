@@ -227,7 +227,7 @@ impl LuaSignatureIndex {
     }
 
     pub fn get(&self, signature_id: &LuaSignatureId) -> Option<&LuaSignature> {
-        derivation::note_read(|| FactKey::Signature(*signature_id));
+        derivation::note_signature_read(*signature_id);
         self.signatures.get(signature_id)
     }
 
@@ -242,7 +242,7 @@ impl LuaSignatureIndex {
     }
 
     pub fn local_func_decl_for(&self, signature_id: &LuaSignatureId) -> Option<LuaDeclId> {
-        derivation::note_read(|| FactKey::Signature(*signature_id));
+        derivation::note_signature_read(*signature_id);
         self.local_func_decls.get(signature_id).copied()
     }
 

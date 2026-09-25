@@ -2377,7 +2377,7 @@ impl LuaTypeIndex {
     /// caller goes through here. The write paths compare against `types`
     /// directly: what a write overwrites is not something it depends on.
     fn read_type_cache(&self, owner: &LuaTypeOwner) -> Option<&LuaTypeCache> {
-        derivation::note_read(|| FactKey::TypeCache(owner.clone()));
+        derivation::note_type_cache_read(owner);
         self.types.get(owner)
     }
 

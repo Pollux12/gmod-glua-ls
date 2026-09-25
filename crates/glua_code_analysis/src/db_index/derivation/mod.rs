@@ -668,7 +668,7 @@ pub struct Evaluation {
     /// Reads made while no key table is lent.
     reads: FxHashSet<HashedKey>,
     /// Cheap identities of keys already in `reads`, see [`note_read_by`].
-    read_identities: FxHashSet<(u8, u64)>,
+    read_identities: FxHashSet<(u8, u128)>,
     outputs: FxHashSet<HashedKey>,
     /// Fingerprints taken when an earlier stage of a staged evaluation ended:
     /// other evaluations write between its stages.
@@ -907,7 +907,7 @@ fn record_read(evaluation: &mut Evaluation, key: HashedKey) {
 /// the evaluation is one small-set probe instead of building and hashing the
 /// key. The identity must be unique to the key for as long as the recorded
 /// key lives.
-fn note_read_by(identity: (u8, u64), key: impl FnOnce() -> FactKey) {
+fn note_read_by(identity: (u8, u128), key: impl FnOnce() -> FactKey) {
     if UNTRACKED.with(|depth| depth.get() > 0) {
         return;
     }
@@ -935,7 +935,7 @@ pub enum FileFact {
 
 /// Records a read of `file_id`'s `fact`.
 pub fn note_file_fact_read(fact: FileFact, file_id: FileId) {
-    note_read_by((fact as u8, u64::from(file_id.id)), || match fact {
+    note_read_by((fact as u8, u128::from(file_id.id)), || match fact {
         FileFact::GmodRealm => FactKey::GmodRealm(file_id),
         FileFact::GmodInferFile => FactKey::GmodInferFile(file_id),
         FileFact::ModuleMeta => FactKey::ModuleMeta(file_id),
@@ -949,9 +949,69 @@ pub fn note_file_fact_read(fact: FileFact, file_id: FileId) {
 /// Records a read of the type declaration `decl_id`. Interned ids compare by
 /// address, which the recorded key keeps alive for the evaluation.
 pub fn note_type_decl_read(decl_id: &LuaTypeDeclId) {
-    note_read_by((u8::MAX, decl_id.interned_address()), || {
+    note_read_by((u8::MAX, u128::from(decl_id.interned_address())), || {
         FactKey::TypeDecl(decl_id.clone())
     });
+}
+
+/// An exact identity for a position in a file.
+fn file_position(file_id: FileId, position: TextSize) -> u128 {
+    u128::from(file_id.id) << 32 | u128::from(u32::from(position))
+}
+
+/// An exact identity for a member.
+fn member_identity(id: &LuaMemberId) -> u128 {
+    let syntax = id.get_syntax_id();
+    let range = syntax.get_range();
+    u128::from(id.file_id.id) << 80
+        | u128::from(syntax.get_kind() as u16) << 64
+        | u128::from(u32::from(range.start())) << 32
+        | u128::from(u32::from(range.end()))
+}
+
+/// Records a read of the member object `id`.
+pub fn note_member_read(id: LuaMemberId) {
+    note_read_by((u8::MAX - 1, member_identity(&id)), || FactKey::Member(id));
+}
+
+/// Records a read of the declaration object `id`.
+pub fn note_decl_read(id: LuaDeclId) {
+    note_read_by(
+        (u8::MAX - 2, file_position(id.file_id, id.position)),
+        || FactKey::Decl(id),
+    );
+}
+
+/// Records a read of the special-call facts at `position` in `file_id`.
+pub fn note_special_call_read(file_id: FileId, position: TextSize) {
+    note_read_by((u8::MAX - 3, file_position(file_id, position)), || {
+        FactKey::SpecialCall(file_id, position)
+    });
+}
+
+/// Records a read of the signature object `id`.
+pub fn note_signature_read(id: LuaSignatureId) {
+    note_read_by(
+        (
+            u8::MAX - 4,
+            file_position(id.get_file_id(), id.get_position()),
+        ),
+        || FactKey::Signature(id),
+    );
+}
+
+/// Records a read of `owner`'s stored type.
+pub fn note_type_cache_read(owner: &LuaTypeOwner) {
+    match owner {
+        LuaTypeOwner::Decl(id) => note_read_by(
+            (u8::MAX - 5, file_position(id.file_id, id.position)),
+            || FactKey::TypeCache(owner.clone()),
+        ),
+        LuaTypeOwner::Member(id) => note_read_by((u8::MAX - 6, member_identity(id)), || {
+            FactKey::TypeCache(owner.clone())
+        }),
+        LuaTypeOwner::SyntaxId(_) => note_read(|| FactKey::TypeCache(owner.clone())),
+    }
 }
 
 /// How many reads evaluations on this thread noted, duplicates included,
