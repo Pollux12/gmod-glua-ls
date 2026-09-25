@@ -121,6 +121,11 @@ fn note_slot_write(owner: &LuaMemberOwner, key: &LuaMemberKey) {
 fn note_owner_map_write(owner: &LuaMemberOwner) {
     derivation::note_write(|| FactKey::MemberOwnerMap(owner.clone()));
     derivation::note_write(|| FactKey::MemberOwnerExprKeys(owner.clone()));
+    derivation::note_write(|| FactKey::MemberOwnerPresence(owner.clone()));
+}
+
+fn note_owner_presence_read(owner: &LuaMemberOwner) {
+    derivation::note_read(|| FactKey::MemberOwnerPresence(owner.clone()));
 }
 
 fn note_slot_read(owner: &LuaMemberOwner, key: &LuaMemberKey) {
@@ -331,6 +336,13 @@ impl LuaMemberIndex {
         match key {
             FactKey::Member(id) => self.member_fingerprint(*id),
             FactKey::MemberSlot(owner, key) => self.slot_fingerprint(owner, key),
+            FactKey::MemberOwnerPresence(owner) => {
+                if self.owner_members.contains_key(owner) {
+                    fingerprint_of(&true)
+                } else {
+                    ABSENT
+                }
+            }
             FactKey::MemberOwnerExprKeys(owner) => {
                 self.owner_members.get(owner).map_or(ABSENT, |members| {
                     fingerprint_of(&members.sorted_expr_key_member_ids())
@@ -1568,7 +1580,7 @@ impl LuaMemberIndex {
     /// compare through `read_version`.
     pub fn is_known_global_path(&self, path: &GlobalId) -> bool {
         derivation::note_read(|| FactKey::GlobalPath(path.clone()));
-        note_owner_map_read(&LuaMemberOwner::GlobalPath(path.clone()));
+        note_owner_presence_read(&LuaMemberOwner::GlobalPath(path.clone()));
         self.owner_members
             .contains_key(&LuaMemberOwner::GlobalPath(path.clone()))
             || self.global_path_class_candidates.contains_key(path)
@@ -2093,14 +2105,14 @@ impl LuaMemberIndex {
         let owner = self.canonical(owner);
         note_slot_read(owner, key);
         let Some(owner_members) = self.owner_members.get(owner) else {
-            note_owner_map_read(owner);
+            note_owner_presence_read(owner);
             return None;
         };
         let mut member_ids = match owner_members.get_member(key) {
             Some(LuaMemberIndexItem::One(id)) => vec![*id],
             Some(LuaMemberIndexItem::Many(ids)) => ids.clone(),
             None => {
-                note_owner_map_read(owner);
+                note_owner_presence_read(owner);
                 return Some(Vec::new());
             }
         };

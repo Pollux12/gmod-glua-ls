@@ -299,6 +299,7 @@ impl DbIndex {
             | K::MemberSlot(..)
             | K::MemberOwnerMap(_)
             | K::MemberOwnerExprKeys(_)
+            | K::MemberOwnerPresence(_)
             | K::MemberKey(_)
             | K::MemberFile(_)
             | K::GlobalPath(_)

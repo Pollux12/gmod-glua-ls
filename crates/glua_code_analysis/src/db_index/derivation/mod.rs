@@ -92,6 +92,8 @@ pub enum FactKey {
     MemberOwnerMap(LuaMemberOwner),
     /// The members of one owner whose key is an expression.
     MemberOwnerExprKeys(LuaMemberOwner),
+    /// Whether one owner has a member map at all.
+    MemberOwnerPresence(LuaMemberOwner),
     /// Every current member under one key, across owners.
     MemberKey(LuaMemberKey),
     /// A file's members and member-function scopes.
@@ -413,12 +415,13 @@ impl FactKey {
                 Some(decl_id.file_id)
             }
             K::Member(member_id) => Some(member_id.file_id),
-            K::MemberSlot(owner, _) | K::MemberOwnerMap(owner) | K::MemberOwnerExprKeys(owner) => {
-                match owner {
-                    LuaMemberOwner::Element(site) => Some(site.file_id),
-                    _ => None,
-                }
-            }
+            K::MemberSlot(owner, _)
+            | K::MemberOwnerMap(owner)
+            | K::MemberOwnerExprKeys(owner)
+            | K::MemberOwnerPresence(owner) => match owner {
+                LuaMemberOwner::Element(site) => Some(site.file_id),
+                _ => None,
+            },
             K::DefinitionSite(site) | K::Metatable(site) | K::TableClass(site) => {
                 Some(site.file_id)
             }
