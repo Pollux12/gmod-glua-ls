@@ -6,19 +6,15 @@ use std::time::Instant;
 use log::info;
 
 pub use super::checker::DiagnosticContext;
-use super::checker::precompute_await_candidates;
 use super::checker::precompute_callee_realm_data_for_workspace;
 use super::checker::precompute_gm_method_realms;
 use super::checker::precompute_missing_required_fields;
-use super::checker::precompute_nodiscard_candidates;
-use super::checker::precompute_param_type_candidates;
 use super::checker::precompute_property_name_candidates;
 use super::checker::precompute_sorted_send_flows;
 use super::checker::{
-    GmMethodRealmMap, PrecomputedAwaitCandidates, PrecomputedCalleeRealmMap,
-    PrecomputedMissingRequiredFields, PrecomputedNoDiscardCandidates,
-    PrecomputedParamTypeCandidates, PrecomputedPropertyNameCandidates,
-    PrecomputedRealmCallCandidates, SharedDiagnosticData, SortedSendFlowCache,
+    GmMethodRealmMap, PrecomputedCalleeRealmMap, PrecomputedMissingRequiredFields,
+    PrecomputedPropertyNameCandidates, PrecomputedRealmCallCandidates, SharedDiagnosticData,
+    SortedSendFlowCache,
 };
 use super::{checker::check_file, lua_diagnostic_config::LuaDiagnosticConfig};
 use crate::semantic::LuaAnalysisPhase;
@@ -88,15 +84,6 @@ struct DiagnosticComponentSlots {
         DiagnosticRevisionSnapshot,
         Arc<PrecomputedMissingRequiredFields>,
     )>,
-    await_candidates: Option<(DiagnosticRevisionSnapshot, Arc<PrecomputedAwaitCandidates>)>,
-    param_type_candidates: Option<(
-        DiagnosticRevisionSnapshot,
-        Arc<PrecomputedParamTypeCandidates>,
-    )>,
-    nodiscard_candidates: Option<(
-        DiagnosticRevisionSnapshot,
-        Arc<PrecomputedNoDiscardCandidates>,
-    )>,
     property_name_candidates: Option<(
         DiagnosticRevisionSnapshot,
         Arc<PrecomputedPropertyNameCandidates>,
@@ -111,9 +98,6 @@ struct FreshComponents {
     workspace_file_ids: Option<Arc<Vec<FileId>>>,
     realm_fragments: Option<HashMap<WorkspaceId, RealmWorkspaceFragment>>,
     missing_required_fields: Option<Arc<PrecomputedMissingRequiredFields>>,
-    await_candidates: Option<Arc<PrecomputedAwaitCandidates>>,
-    param_type_candidates: Option<Arc<PrecomputedParamTypeCandidates>>,
-    nodiscard_candidates: Option<Arc<PrecomputedNoDiscardCandidates>>,
     property_name_candidates: Option<Arc<PrecomputedPropertyNameCandidates>>,
     sorted_send_flows: Option<Arc<SortedSendFlowCache>>,
 }
@@ -177,18 +161,6 @@ impl SharedDiagnosticComponentCache {
                 .as_ref()
                 .is_some_and(|(key, _)| *key == snapshot)
             && slots
-                .await_candidates
-                .as_ref()
-                .is_some_and(|(key, _)| *key == snapshot)
-            && slots
-                .param_type_candidates
-                .as_ref()
-                .is_some_and(|(key, _)| *key == snapshot)
-            && slots
-                .nodiscard_candidates
-                .as_ref()
-                .is_some_and(|(key, _)| *key == snapshot)
-            && slots
                 .property_name_candidates
                 .as_ref()
                 .is_some_and(|(key, _)| *key == snapshot)
@@ -221,18 +193,6 @@ impl SharedDiagnosticComponentCache {
                 .missing_required_fields
                 .as_ref()
                 .and_then(|(key, shared)| (*key == *snapshot).then(|| shared.clone())),
-            await_candidates: slots
-                .await_candidates
-                .as_ref()
-                .and_then(|(key, shared)| (*key == *snapshot).then(|| shared.clone())),
-            param_type_candidates: slots
-                .param_type_candidates
-                .as_ref()
-                .and_then(|(key, shared)| (*key == *snapshot).then(|| shared.clone())),
-            nodiscard_candidates: slots
-                .nodiscard_candidates
-                .as_ref()
-                .and_then(|(key, shared)| (*key == *snapshot).then(|| shared.clone())),
             property_name_candidates: slots
                 .property_name_candidates
                 .as_ref()
@@ -251,9 +211,6 @@ impl SharedDiagnosticComponentCache {
         workspace_file_ids: &Arc<Vec<FileId>>,
         realm_fragments: HashMap<WorkspaceId, RealmWorkspaceFragment>,
         missing_required_fields: &Arc<PrecomputedMissingRequiredFields>,
-        await_candidates: &Arc<PrecomputedAwaitCandidates>,
-        param_type_candidates: &Arc<PrecomputedParamTypeCandidates>,
-        nodiscard_candidates: &Arc<PrecomputedNoDiscardCandidates>,
         property_name_candidates: &Arc<PrecomputedPropertyNameCandidates>,
         sorted_send_flows: &Arc<SortedSendFlowCache>,
     ) {
@@ -265,9 +222,6 @@ impl SharedDiagnosticComponentCache {
         slots.workspace_file_ids = Some((workspace_file_ids.to_vec(), workspace_file_ids.clone()));
         slots.realm_fragments = Some((snapshot.clone(), realm_fragments));
         slots.missing_required_fields = Some((snapshot.clone(), missing_required_fields.clone()));
-        slots.await_candidates = Some((snapshot.clone(), await_candidates.clone()));
-        slots.param_type_candidates = Some((snapshot.clone(), param_type_candidates.clone()));
-        slots.nodiscard_candidates = Some((snapshot.clone(), nodiscard_candidates.clone()));
         slots.property_name_candidates = Some((snapshot.clone(), property_name_candidates.clone()));
         slots.sorted_send_flows = Some((snapshot.clone(), sorted_send_flows.clone()));
     }
@@ -302,24 +256,6 @@ impl SharedDiagnosticComponentCache {
         identities.push(
             slots
                 .missing_required_fields
-                .as_ref()
-                .map_or(0, |(_, shared)| addr(shared)),
-        );
-        identities.push(
-            slots
-                .await_candidates
-                .as_ref()
-                .map_or(0, |(_, shared)| addr(shared)),
-        );
-        identities.push(
-            slots
-                .param_type_candidates
-                .as_ref()
-                .map_or(0, |(_, shared)| addr(shared)),
-        );
-        identities.push(
-            slots
-                .nodiscard_candidates
                 .as_ref()
                 .map_or(0, |(_, shared)| addr(shared)),
         );
@@ -452,9 +388,6 @@ impl LuaDiagnostic {
         crate::compilation::analyzer::parallel::init_pool();
         let mut workspace_realm_data = None;
         let mut missing_required_fields = None;
-        let mut await_candidates = None;
-        let mut param_type_candidates = None;
-        let mut nodiscard_candidates = None;
         let mut sorted_send_flows = None;
         let mut property_name_candidates = None;
         let realm_fragments = fresh.realm_fragments;
@@ -520,27 +453,6 @@ impl LuaDiagnostic {
                 );
             });
             s.spawn(|_| {
-                await_candidates = Some(
-                    fresh
-                        .await_candidates
-                        .unwrap_or_else(|| Arc::new(precompute_await_candidates(db))),
-                );
-            });
-            s.spawn(|_| {
-                param_type_candidates = Some(
-                    fresh
-                        .param_type_candidates
-                        .unwrap_or_else(|| Arc::new(precompute_param_type_candidates(db))),
-                );
-            });
-            s.spawn(|_| {
-                nodiscard_candidates = Some(
-                    fresh
-                        .nodiscard_candidates
-                        .unwrap_or_else(|| Arc::new(precompute_nodiscard_candidates(db))),
-                );
-            });
-            s.spawn(|_| {
                 property_name_candidates = Some(
                     fresh
                         .property_name_candidates
@@ -560,11 +472,6 @@ impl LuaDiagnostic {
         let workspace_realm_data = workspace_realm_data.expect("workspace realm precompute ran");
         let missing_required_fields =
             missing_required_fields.expect("precompute_missing_required_fields ran");
-        let await_candidates = await_candidates.expect("precompute_await_candidates ran");
-        let param_type_candidates =
-            param_type_candidates.expect("precompute_param_type_candidates ran");
-        let nodiscard_candidates =
-            nodiscard_candidates.expect("precompute_nodiscard_candidates ran");
         let sorted_send_flows = sorted_send_flows.expect("precompute_sorted_send_flows ran");
         let property_name_candidates =
             property_name_candidates.expect("precompute_property_name_candidates ran");
@@ -584,9 +491,6 @@ impl LuaDiagnostic {
             &workspace_file_ids,
             realm_fragments,
             &missing_required_fields,
-            &await_candidates,
-            &param_type_candidates,
-            &nodiscard_candidates,
             &property_name_candidates,
             &sorted_send_flows,
         );
@@ -596,9 +500,6 @@ impl LuaDiagnostic {
             callee_realms_by_workspace,
             realm_call_candidates_by_workspace,
             missing_required_fields,
-            await_candidates,
-            param_type_candidates,
-            nodiscard_candidates,
             property_name_candidates,
             sorted_send_flows,
         })

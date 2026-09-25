@@ -70,8 +70,6 @@ use super::{
     lua_diagnostic_config::LuaDiagnosticConfig,
 };
 
-pub use await_in_sync::{PrecomputedAwaitCandidates, precompute_await_candidates};
-pub use discard_returns::{PrecomputedNoDiscardCandidates, precompute_nodiscard_candidates};
 pub use gmod_network::SortedSendFlowCache;
 pub use gmod_network::precompute_sorted_send_flows;
 pub use gmod_realm_misuse::GmMethodRealmMap;
@@ -80,7 +78,6 @@ pub use gmod_realm_misuse::PrecomputedRealmCallCandidates;
 pub use gmod_realm_misuse::precompute_callee_realm_data_for_workspace;
 pub use gmod_realm_misuse::precompute_gm_method_realms;
 pub use missing_fields::precompute_missing_required_fields;
-pub use param_type_check::{PrecomputedParamTypeCandidates, precompute_param_type_candidates};
 pub use property_name_candidates::{
     PrecomputedPropertyNameCandidates, precompute_property_name_candidates,
 };
@@ -512,11 +509,7 @@ pub struct SharedDiagnosticData {
     /// Required non-method fields for each type declaration, including inherited fields.
     pub missing_required_fields: Arc<PrecomputedMissingRequiredFields>,
     /// Whether any indexed signature/type cache can produce an async callable.
-    pub await_candidates: Arc<PrecomputedAwaitCandidates>,
     /// Static callee names whose callable metadata has parameter types worth checking.
-    pub param_type_candidates: Arc<PrecomputedParamTypeCandidates>,
-    /// Static callee names whose signatures are marked @nodiscard.
-    pub nodiscard_candidates: Arc<PrecomputedNoDiscardCandidates>,
     /// Names the deprecated, readonly and visibility checkers could report on.
     pub property_name_candidates: Arc<PrecomputedPropertyNameCandidates>,
     /// Precomputed sorted send flows by message name. Built once per batch

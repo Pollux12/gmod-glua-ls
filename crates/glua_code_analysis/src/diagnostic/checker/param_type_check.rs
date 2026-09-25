@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::time::Duration;
 
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaExpr,
@@ -8,11 +8,10 @@ use rowan::TextRange;
 
 use crate::{
     DbIndex, DiagnosticCode, LuaDeclExtra, LuaFunctionType, LuaMemberId, LuaMemberKey,
-    LuaMemberOwner, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaSignature,
-    LuaSignatureId, LuaType, LuaTypeOwner, RenderLevel, SemanticDeclLevel, SemanticModel,
-    TypeCheckFailReason, TypeCheckResult, TypeOps, TypeVisitTrait, VariadicType,
+    LuaMemberOwner, LuaSemanticDeclId, LuaSignature, LuaType, RenderLevel, SemanticDeclLevel,
+    SemanticModel, TypeCheckFailReason, TypeCheckResult, TypeOps, VariadicType,
     diagnostic::checker::assign_type_mismatch::check_table_expr, humanize_type, infer_index_expr,
-    is_authoritative_self_receiver_type, resolve_alias_type,
+    is_authoritative_self_receiver_type,
 };
 
 use super::{Checker, DiagnosticContext, should_suppress_inferred_value_mismatch};
@@ -27,10 +26,6 @@ impl Checker for ParamTypeCheckChecker {
 
     /// a simple implementation of param type check, later we will do better
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let candidates = context
-            .get_shared_data_arc()
-            .map(|shared_data| shared_data.param_type_candidates.clone())
-            .unwrap_or_else(|| Arc::new(precompute_param_type_candidates(semantic_model.get_db())));
         let profile_enabled = log::log_enabled!(log::Level::Info);
         let mut profile = profile_enabled.then(ParamTypeCheckProfile::default);
 
@@ -49,7 +44,6 @@ impl Checker for ParamTypeCheckChecker {
                 context,
                 semantic_model,
                 call_expr,
-                &candidates,
                 profile.as_mut(),
                 &buckets.assign_stats,
             );
@@ -68,9 +62,6 @@ impl Checker for ParamTypeCheckChecker {
 struct ParamTypeCheckProfile {
     calls_scanned: usize,
     calls_without_actionable_args: usize,
-    static_candidate_hits: usize,
-    static_candidate_misses: usize,
-    unknown_static_names: usize,
     calls_checked: usize,
     calls_without_signature: usize,
     infer_func_time: Duration,
@@ -81,13 +72,10 @@ struct ParamTypeCheckProfile {
 impl ParamTypeCheckProfile {
     fn log(&self, file_id: crate::FileId) {
         log::info!(
-            "param type profile: file={:?} calls_scanned={} no_args={} static_hits={} static_misses={} unknown_names={} calls_checked={} no_signature={} infer_func_time={:?} infer_arg_time={:?} total_call_time={:?}",
+            "param type profile: file={:?} calls_scanned={} no_args={} calls_checked={} no_signature={} infer_func_time={:?} infer_arg_time={:?} total_call_time={:?}",
             file_id,
             self.calls_scanned,
             self.calls_without_actionable_args,
-            self.static_candidate_hits,
-            self.static_candidate_misses,
-            self.unknown_static_names,
             self.calls_checked,
             self.calls_without_signature,
             self.infer_func_time,
@@ -95,280 +83,6 @@ impl ParamTypeCheckProfile {
             self.total_call_time,
         );
     }
-}
-
-#[derive(Debug, Default)]
-pub struct PrecomputedParamTypeCandidates {
-    typed_callee_names: HashSet<String>,
-}
-
-impl PrecomputedParamTypeCandidates {
-    fn should_check_call_with_profile(
-        &self,
-        call_expr: &LuaCallExpr,
-        mut profile: Option<&mut ParamTypeCheckProfile>,
-    ) -> bool {
-        if self.typed_callee_names.is_empty() {
-            return true;
-        }
-        match static_call_name(call_expr) {
-            StaticCallName::Static(name) if self.typed_callee_names.contains(name.as_str()) => {
-                if let Some(profile) = profile.as_mut() {
-                    profile.static_candidate_hits += 1;
-                }
-                true
-            }
-            StaticCallName::Static(_) => {
-                if let Some(profile) = profile.as_mut() {
-                    profile.static_candidate_misses += 1;
-                }
-                false
-            }
-            StaticCallName::Unknown => {
-                if let Some(profile) = profile.as_mut() {
-                    profile.unknown_static_names += 1;
-                }
-                true
-            }
-        }
-    }
-
-    fn insert_owner(&mut self, db: &DbIndex, owner: &LuaTypeOwner, is_candidate: bool) {
-        if !is_candidate {
-            return;
-        }
-
-        if let Some(name) = owner_name(db, owner) {
-            self.typed_callee_names.insert(name);
-        }
-    }
-
-    fn insert_signature_param_names(&mut self, db: &DbIndex, signature: &LuaSignature) {
-        for param in signature.param_docs.values() {
-            let mut visited_signatures = HashSet::new();
-            if type_is_callable_with_actionable_params(db, &param.type_ref, &mut visited_signatures)
-            {
-                self.typed_callee_names.insert(param.name.clone());
-            }
-        }
-    }
-}
-
-enum StaticCallName {
-    Static(String),
-    Unknown,
-}
-
-fn static_call_name(call_expr: &LuaCallExpr) -> StaticCallName {
-    match call_expr.get_prefix_expr() {
-        Some(LuaExpr::NameExpr(name_expr)) => name_expr
-            .get_name_token()
-            .map(|token| StaticCallName::Static(token.get_name_text().to_string()))
-            .unwrap_or(StaticCallName::Unknown),
-        Some(LuaExpr::IndexExpr(index_expr)) => match index_expr.get_index_key() {
-            Some(LuaIndexKey::Name(name)) => {
-                StaticCallName::Static(name.get_name_text().to_string())
-            }
-            Some(LuaIndexKey::String(name)) => StaticCallName::Static(name.get_value()),
-            _ => StaticCallName::Unknown,
-        },
-        _ => StaticCallName::Unknown,
-    }
-}
-
-fn owner_name(db: &DbIndex, owner: &LuaTypeOwner) -> Option<String> {
-    match owner {
-        LuaTypeOwner::Decl(decl_id) => db
-            .get_decl_index()
-            .get_decl(decl_id)
-            .map(|decl| decl.get_name().to_string()),
-        LuaTypeOwner::Member(member_id) => db
-            .get_member_index()
-            .get_member(member_id)
-            .and_then(|member| member.get_key().get_name())
-            .map(str::to_string),
-        LuaTypeOwner::SyntaxId(_) => None,
-    }
-}
-
-pub fn precompute_param_type_candidates(db: &DbIndex) -> PrecomputedParamTypeCandidates {
-    let mut candidates = PrecomputedParamTypeCandidates::default();
-
-    for (_, signature) in db.get_signature_index().iter() {
-        candidates.insert_signature_param_names(db, signature);
-    }
-
-    for (owner, type_cache) in db.get_type_index().iter_type_caches() {
-        let mut visited_signatures = HashSet::new();
-        let is_candidate = type_is_callable_with_actionable_params(
-            db,
-            type_cache.as_type(),
-            &mut visited_signatures,
-        );
-        candidates.insert_owner(db, owner, is_candidate);
-    }
-
-    for (owner_id, _) in db.get_property_index().iter_owner_properties() {
-        let Some(owner) = property_owner_type_owner(owner_id) else {
-            continue;
-        };
-        let mut visited_signatures = HashSet::new();
-        let is_candidate = db
-            .get_type_index()
-            .get_type_cache(&owner)
-            .is_some_and(|type_cache| {
-                type_is_callable_with_actionable_params(
-                    db,
-                    type_cache.as_type(),
-                    &mut visited_signatures,
-                )
-            });
-        candidates.insert_owner(db, &owner, is_candidate);
-    }
-
-    candidates
-}
-
-fn property_owner_type_owner(owner_id: &LuaSemanticDeclId) -> Option<LuaTypeOwner> {
-    match owner_id {
-        LuaSemanticDeclId::LuaDecl(decl_id) => Some(LuaTypeOwner::Decl(*decl_id)),
-        LuaSemanticDeclId::Member(member_id) => Some(LuaTypeOwner::Member(*member_id)),
-        LuaSemanticDeclId::TypeDecl(_) | LuaSemanticDeclId::Signature(_) => None,
-    }
-}
-
-fn type_is_callable_with_actionable_params(
-    db: &DbIndex,
-    typ: &LuaType,
-    visited_signatures: &mut HashSet<LuaSignatureId>,
-) -> bool {
-    let mut is_candidate = false;
-    typ.visit_type(&mut |inner_type| {
-        if is_candidate {
-            return;
-        }
-
-        match inner_type {
-            LuaType::DocFunction(func) => {
-                is_candidate = function_has_actionable_params(func);
-            }
-            LuaType::Ref(_) | LuaType::Def(_) => {
-                let resolved = resolve_alias_type(db, inner_type);
-                if resolved.typ != *inner_type {
-                    is_candidate = type_is_callable_with_actionable_params(
-                        db,
-                        &resolved.typ,
-                        visited_signatures,
-                    );
-                }
-            }
-            LuaType::Signature(signature_id) => {
-                is_candidate =
-                    db.get_signature_index()
-                        .get(signature_id)
-                        .is_some_and(|signature| {
-                            signature_has_actionable_params(
-                                db,
-                                *signature_id,
-                                signature,
-                                visited_signatures,
-                            )
-                        });
-            }
-            LuaType::TableConst(table) => {
-                is_candidate = table_call_operator_has_actionable_params(db, table);
-            }
-            LuaType::Instance(instance) => {
-                is_candidate = type_is_callable_with_actionable_params(
-                    db,
-                    instance.get_base(),
-                    visited_signatures,
-                );
-            }
-            _ => {}
-        }
-    });
-    is_candidate
-}
-
-fn table_call_operator_has_actionable_params(
-    db: &DbIndex,
-    table: &crate::InFiled<TextRange>,
-) -> bool {
-    let Some(meta_table) = db.get_metatable_index().get(table) else {
-        return false;
-    };
-    let owner = LuaOperatorOwner::Table(meta_table.clone());
-    let Some(call_operators) = db
-        .get_operator_index()
-        .get_operators(&owner, LuaOperatorMetaMethod::Call)
-    else {
-        return false;
-    };
-
-    call_operators.iter().any(|operator_id| {
-        let Some(operator) = db.get_operator_index().get_operator(operator_id) else {
-            return false;
-        };
-        match operator.get_operator_func(db) {
-            LuaType::DocFunction(func) => {
-                call_operator_function_has_actionable_params(func.as_ref())
-            }
-            LuaType::Signature(signature_id) => {
-                let mut visited_signatures = HashSet::new();
-                db.get_signature_index()
-                    .get(&signature_id)
-                    .is_some_and(|signature| {
-                        signature_has_actionable_params(
-                            db,
-                            signature_id,
-                            signature,
-                            &mut visited_signatures,
-                        )
-                    })
-            }
-            _ => false,
-        }
-    })
-}
-
-fn call_operator_function_has_actionable_params(func: &LuaFunctionType) -> bool {
-    func.get_params()
-        .iter()
-        .enumerate()
-        .any(|(idx, (name, typ))| {
-            let is_hidden_self = idx == 0 && !func.is_colon_define();
-            !is_hidden_self && param_type_is_actionable(name, typ.as_ref())
-        })
-}
-
-fn signature_has_actionable_params(
-    db: &DbIndex,
-    signature_id: LuaSignatureId,
-    signature: &LuaSignature,
-    visited_signatures: &mut HashSet<LuaSignatureId>,
-) -> bool {
-    if !visited_signatures.insert(signature_id) {
-        return false;
-    }
-
-    signature
-        .get_type_params()
-        .iter()
-        .any(|(name, typ)| param_type_is_actionable(name, typ.as_ref()))
-        || signature
-            .overloads
-            .iter()
-            .any(|overload| function_has_actionable_params(overload))
-        || signature.param_docs.values().any(|param| {
-            type_is_callable_with_actionable_params(db, &param.type_ref, visited_signatures)
-        })
-}
-
-fn function_has_actionable_params(func: &LuaFunctionType) -> bool {
-    func.get_params()
-        .iter()
-        .any(|(name, typ)| param_type_is_actionable(name, typ.as_ref()))
 }
 
 fn param_type_is_actionable(name: &str, typ: Option<&LuaType>) -> bool {
@@ -386,7 +100,6 @@ fn check_call_expr(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     call_expr: LuaCallExpr,
-    candidates: &PrecomputedParamTypeCandidates,
     mut profile: Option<&mut ParamTypeCheckProfile>,
     assign_stats: &[LuaAssignStat],
 ) -> Option<()> {
@@ -402,10 +115,6 @@ fn check_call_expr(
         if let Some(profile) = profile.as_mut() {
             profile.calls_without_actionable_args += 1;
         }
-        return Some(());
-    }
-
-    if !candidates.should_check_call_with_profile(&call_expr, profile.as_deref_mut()) {
         return Some(());
     }
 
