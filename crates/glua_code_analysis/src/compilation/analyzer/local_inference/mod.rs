@@ -3,13 +3,12 @@ mod solver;
 
 use std::{cmp::Ordering, collections::HashMap, sync::Arc};
 
-use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaClosureExpr,
     LuaElseIfClauseStat, LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexExpr, LuaNameExpr, LuaRepeatStat,
-    LuaReturnStat, LuaVarExpr, LuaWhileStat,
+    LuaVarExpr, LuaWhileStat,
 };
 use rustc_hash::FxHashSet;
 
@@ -419,24 +418,6 @@ struct MemberPathEvidence<'a> {
     scores: &'a mut HashMap<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>,
 }
 
-/// The evidence sites of one declaration, with whether each sits inside a
-/// `return`.
-pub(super) type UnguardedChildSiteCache = HashMap<
-    (crate::FileId, crate::LuaDeclId),
-    Vec<(glua_parser::LuaSyntaxId, glua_parser::LuaSyntaxId, bool)>,
->;
-
-struct UnguardedChildFileJob {
-    file_id: crate::FileId,
-    declarations: Vec<UnguardedChildDeclInput>,
-    infer_cache: crate::LuaInferCache,
-}
-
-struct UnguardedChildDeclInput {
-    decl_id: crate::LuaDeclId,
-    sites: Vec<(glua_parser::LuaSyntaxId, glua_parser::LuaSyntaxId, bool)>,
-}
-
 struct UnguardedChildFileResult {
     file_id: crate::FileId,
     infer_cache: crate::LuaInferCache,
@@ -451,8 +432,6 @@ struct UnguardedChildFileResult {
 pub(super) fn stabilize_unguarded_children(
     db: &mut crate::DbIndex,
     context: &mut AnalyzeContext,
-    only_return_evidence: bool,
-    site_cache: &mut UnguardedChildSiteCache,
 ) -> Vec<InFiled<glua_parser::LuaSyntaxId>> {
     let _profile =
         crate::profile::Profile::cond_new("unguarded child inference", context.tree_list.len() > 1);
@@ -484,103 +463,22 @@ pub(super) fn stabilize_unguarded_children(
         dynamic_fields_visible: context.infer_manager.dynamic_fields_visible(),
         call_site_params_visible: context.infer_manager.call_site_params_visible(),
     };
-    let mut jobs = Vec::new();
-    for file_id in file_ids {
-        let Some(decl_ids) = db
-            .get_reference_index()
-            .get_decl_references_map(&file_id)
-            .map(|references| {
-                let mut decl_ids = references.keys().copied().collect::<Vec<_>>();
-                decl_ids.sort_by_key(|decl_id| decl_id.position);
-                decl_ids
-            })
-        else {
-            continue;
-        };
-        let Some(root) = db
-            .get_vfs()
-            .get_syntax_tree(&file_id)
-            .map(|tree| tree.get_red_root())
-        else {
-            continue;
-        };
-        let declarations = decl_ids
-            .into_iter()
-            .map(|decl_id| {
-                // The syntactic prerequisites for evidence — a read reference
-                // that is the prefix of an index expression — are pure tree
-                // lookups. Cache syntax identities rather than red nodes so
-                // the complete file job can cross the worker boundary.
-                let sites = site_cache.entry((file_id, decl_id)).or_insert_with(|| {
-                    db.get_reference_index()
-                        .get_decl_references_map(&file_id)
-                        .and_then(|references| references.get(&decl_id))
-                        .map(|references| {
-                            references
-                                .cells
-                                .iter()
-                                .filter(|cell| !cell.is_write)
-                                .filter_map(|cell| {
-                                    let name_expr = root
-                                        .covering_element(cell.range)
-                                        .ancestors()
-                                        .find_map(LuaNameExpr::cast)
-                                        .filter(|name| name.get_range() == cell.range)?;
-                                    let index_expr = name_expr
-                                        .syntax()
-                                        .ancestors()
-                                        .find_map(LuaIndexExpr::cast)
-                                        .filter(|index| {
-                                            index.get_prefix_expr().is_some_and(|prefix| {
-                                                prefix.syntax() == name_expr.syntax()
-                                            })
-                                        })?;
-                                    let in_return = index_expr
-                                        .syntax()
-                                        .ancestors()
-                                        .any(|node| LuaReturnStat::cast(node).is_some());
-                                    Some((
-                                        name_expr.get_syntax_id(),
-                                        index_expr.get_syntax_id(),
-                                        in_return,
-                                    ))
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default()
-                });
-                UnguardedChildDeclInput {
-                    decl_id,
-                    sites: sites.clone(),
-                }
-            })
-            .collect::<Vec<_>>();
-        if !declarations.iter().any(|declaration| {
-            declaration
-                .sites
-                .iter()
-                .any(|(_, _, in_return)| !only_return_evidence || *in_return)
-        }) {
-            continue;
-        }
-        let infer_cache = context
-            .infer_manager
-            .take_file(file_id)
-            .unwrap_or_else(|| crate::LuaInferCache::new(file_id, cache_options.clone()));
-        jobs.push(UnguardedChildFileJob {
-            file_id,
-            declarations,
-            infer_cache,
-        });
-    }
-
-    let results = collect_unguarded_child_files(
-        &*db,
-        jobs,
-        context.workspace_id,
-        only_return_evidence,
-        profile.is_some(),
-    );
+    let results = file_ids
+        .into_iter()
+        .map(|file_id| {
+            let infer_cache = context
+                .infer_manager
+                .take_file(file_id)
+                .unwrap_or_else(|| crate::LuaInferCache::new(file_id, cache_options.clone()));
+            collect_unguarded_child_file(
+                db,
+                file_id,
+                infer_cache,
+                context.workspace_id,
+                profile.is_some(),
+            )
+        })
+        .collect::<Vec<_>>();
     for result in results {
         context
             .infer_manager
@@ -684,18 +582,6 @@ pub(super) fn stabilize_unguarded_children(
         else {
             continue;
         };
-        if only_return_evidence
-            && !db
-                .get_vfs()
-                .get_syntax_tree(&source.file_id)
-                .and_then(|tree| source.value.to_node_from_root(&tree.get_red_root()))
-                .is_some_and(|node| {
-                    node.ancestors()
-                        .any(|node| LuaReturnStat::cast(node).is_some())
-                })
-        {
-            continue;
-        }
         let node = LuaInferenceNodeId::Definition(definition);
         let event = LuaInferenceEventId {
             node: node.clone(),
@@ -845,41 +731,13 @@ pub(super) fn stabilize_unguarded_children(
     }
 }
 
-fn collect_unguarded_child_files(
-    db: &crate::DbIndex,
-    jobs: Vec<UnguardedChildFileJob>,
-    workspace_id: Option<crate::WorkspaceId>,
-    only_return_evidence: bool,
-    collect_profile: bool,
-) -> Vec<UnguardedChildFileResult> {
-    let run = |job| {
-        glua_parser::with_syntax_resolvers(|| {
-            collect_unguarded_child_file(
-                db,
-                job,
-                workspace_id,
-                only_return_evidence,
-                collect_profile,
-            )
-        })
-    };
-    if super::parallel::runs_inline(jobs.len()) {
-        return jobs.into_iter().map(run).collect();
-    }
-
-    super::parallel::init_pool();
-    jobs.into_par_iter().map(run).collect()
-}
-
 fn collect_unguarded_child_file(
     db: &crate::DbIndex,
-    job: UnguardedChildFileJob,
+    file_id: crate::FileId,
+    mut infer_cache: crate::LuaInferCache,
     workspace_id: Option<crate::WorkspaceId>,
-    only_return_evidence: bool,
     collect_profile: bool,
 ) -> UnguardedChildFileResult {
-    let file_id = job.file_id;
-    let mut infer_cache = job.infer_cache;
     let mut scores = HashMap::<LuaDefinitionId, UnguardedChildCandidates>::default();
     let mut deferred_definitions = FxHashSet::<LuaDefinitionId>::default();
     let mut nested_scores =
@@ -892,11 +750,12 @@ fn collect_unguarded_child_file(
     let mut subtypes_with_member = SubtypesWithMember::default();
     let mut profile = collect_profile.then(UnguardedChildProfile::default);
 
-    let Some(root) = db
+    let references = db.get_reference_index().get_decl_references_map(&file_id);
+    let root = db
         .get_vfs()
         .get_syntax_tree(&file_id)
-        .map(|tree| tree.get_red_root())
-    else {
+        .map(|tree| tree.get_red_root());
+    let (Some(references), Some(root)) = (references, root) else {
         return UnguardedChildFileResult {
             file_id,
             infer_cache,
@@ -910,24 +769,35 @@ fn collect_unguarded_child_file(
     };
     let flow_tree = db.get_flow_index().get_flow_tree(&file_id);
 
-    for declaration in job.declarations {
-        let all_sites = declaration
-            .sites
+    let mut decl_ids = references.keys().copied().collect::<Vec<_>>();
+    decl_ids.sort_by_key(|decl_id| decl_id.position);
+    for decl_id in decl_ids {
+        let all_sites = references[&decl_id]
+            .cells
             .iter()
-            .filter_map(|(name_id, index_id, in_return)| {
-                if only_return_evidence && !in_return {
-                    return None;
-                }
-                let name_expr = LuaNameExpr::cast(name_id.to_node_from_root(&root)?)?;
-                let index_expr = LuaIndexExpr::cast(index_id.to_node_from_root(&root)?)?;
-                Some((name_expr, index_expr, *in_return))
+            .filter(|cell| !cell.is_write)
+            .filter_map(|cell| {
+                let name_expr = root
+                    .covering_element(cell.range)
+                    .ancestors()
+                    .find_map(LuaNameExpr::cast)
+                    .filter(|name| name.get_range() == cell.range)?;
+                let index_expr = name_expr
+                    .syntax()
+                    .ancestors()
+                    .find_map(LuaIndexExpr::cast)
+                    .filter(|index| {
+                        index
+                            .get_prefix_expr()
+                            .is_some_and(|prefix| prefix.syntax() == name_expr.syntax())
+                    })?;
+                Some((name_expr, index_expr))
             })
             .collect::<Vec<_>>();
         if all_sites.is_empty() {
             continue;
         }
 
-        let decl_id = declaration.decl_id;
         let base_type = declaration_base_type(db, &mut infer_cache, decl_id);
 
         // A member path reached from this declaration, e.g. `self.Owner` in
@@ -942,7 +812,7 @@ fn collect_unguarded_child_file(
             subtypes_with_member: &mut subtypes_with_member,
             scores: &mut nested_scores,
         };
-        for (_, receiver, _) in &all_sites {
+        for (_, receiver) in &all_sites {
             let mut receiver = receiver.clone();
             while let Some(index_expr) = member_path_parent(&receiver) {
                 collect_member_path_unguarded_child_evidence(
@@ -972,7 +842,7 @@ fn collect_unguarded_child_file(
             continue;
         }
 
-        for (name_expr, index_expr, _) in &all_sites {
+        for (name_expr, index_expr) in &all_sites {
             if let Some(profile) = &mut profile {
                 profile.references_scanned += 1;
             }

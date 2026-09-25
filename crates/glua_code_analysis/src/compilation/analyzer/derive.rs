@@ -166,8 +166,7 @@ impl Recipes {
                 call_site_params::CallSiteParamAnalysisPipeline::analyze(db, context)
             }
             DerivationKind::LocalFallbacks => {
-                let mut sites = local_inference::UnguardedChildSiteCache::new();
-                local_inference::stabilize_unguarded_children(db, context, false, &mut sites);
+                local_inference::stabilize_unguarded_children(db, context);
                 local_inference::stabilize_unknown_locals(db, context);
             }
             DerivationKind::Network => gmod::evaluate_network(db, context),
