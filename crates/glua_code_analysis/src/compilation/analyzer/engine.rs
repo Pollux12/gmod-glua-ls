@@ -117,6 +117,9 @@ pub(crate) struct Engine {
     edits: derivation::EditMaps,
     /// Whether other files' references still have to follow `edits`.
     edits_pending: bool,
+    /// Fingerprints of keys with `edits` undone, taken once per value: the
+    /// same moved key is checked for every reader it queued.
+    before_edits: std::cell::RefCell<FxHashMap<HashedKey, derivation::Fingerprint>>,
 }
 
 impl Engine {
@@ -150,7 +153,15 @@ impl Engine {
     }
 
     fn fingerprint_before_edits(&self, db: &DbIndex, key: &HashedKey) -> derivation::Fingerprint {
-        derivation::fingerprint_before_edits(&self.edits, || db.fact_fingerprint(key))
+        if let Some(fingerprint) = self.before_edits.borrow().get(key) {
+            return *fingerprint;
+        }
+        let fingerprint =
+            derivation::fingerprint_before_edits(&self.edits, || db.fact_fingerprint(key));
+        self.before_edits
+            .borrow_mut()
+            .insert(key.clone(), fingerprint);
+        fingerprint
     }
 
     /// `key`'s current fingerprint, taken once per value. Every write inside
@@ -215,6 +226,7 @@ impl Engine {
         keys: impl IntoIterator<Item = &'a HashedKey>,
     ) {
         for key in keys {
+            self.before_edits.get_mut().remove(key);
             self.touched.insert(key.clone());
             let readers = db
                 .reader_graph()
@@ -275,10 +287,13 @@ impl Engine {
                 continue;
             };
             self.cursor = Some(id);
-            if !self.needs_evaluation(db, id, reason) {
+            let stale = crate::profile::phase("engine: stale check", || {
+                self.needs_evaluation(db, id, reason)
+            });
+            if !stale {
                 continue;
             }
-            let group = co_producers(db, id);
+            let group = crate::profile::phase("engine: co-producers", || co_producers(db, id));
             if group.len() == 1 && recipe.splits(id.kind) {
                 self.run_batch(db, id, recipe);
                 continue;
@@ -294,7 +309,9 @@ impl Engine {
                     .filter(|file_id| *file_id != crate::FileId::VIRTUAL),
             );
             let started = self.stats.profiling().then(std::time::Instant::now);
-            let touched = self.evaluate_group(db, &group, recipe);
+            let touched = crate::profile::phase("engine: evaluate", || {
+                self.evaluate_group(db, &group, recipe)
+            });
             if let Some(started) = started {
                 *self.stats.time.entry(id.kind).or_default() += started.elapsed();
                 for member in &group {
@@ -322,7 +339,7 @@ impl Engine {
                 // Again in this round: nothing ran after it yet.
                 self.worklist.insert(id, Reason::Changed);
             }
-            self.readers_of(db, touched.iter());
+            crate::profile::phase("engine: readers of", || self.readers_of(db, touched.iter()));
         }
         self.cursor = None;
     }
@@ -489,8 +506,10 @@ impl Engine {
                 })
                 .collect()
         });
-        self.record(db, evaluations, &mut touched, || {
-            format!("evaluating {group:?}")
+        crate::profile::phase("engine: record", || {
+            self.record(db, evaluations, &mut touched, || {
+                format!("evaluating {group:?}")
+            })
         });
         touched
     }
@@ -509,6 +528,7 @@ impl Engine {
             .chain(evaluations.iter().flat_map(derivation::Evaluation::outputs))
         {
             db.reader_graph().forget_fingerprint(key);
+            self.before_edits.borrow_mut().remove(key);
         }
         self.verify_fingerprints(db, touched, step);
         // Out of the index while its records are replaced, so the reads can be

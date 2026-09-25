@@ -123,18 +123,26 @@ pub(crate) fn reanalyze(
         if pending.is_empty() {
             break;
         }
-        let scopes = ScriptedScopes::new(db);
+        let scopes = crate::profile::phase("reanalyze: scopes", || ScriptedScopes::new(db));
         engine.note_rebuilt(&pending);
-        let touched = replace_files(db, &mut engine, &pending, &scopes);
+        let touched = crate::profile::phase("reanalyze: replace files", || {
+            replace_files(db, &mut engine, &pending, &scopes)
+        });
         db.reader_graph_mut().forget_fingerprints();
-        engine.readers_of(db, touched.iter());
-        let recipes = derive::Recipes::new(db, scopes);
-        engine.run(db, &recipes);
+        crate::profile::phase("reanalyze: readers of touched", || {
+            engine.readers_of(db, touched.iter())
+        });
+        let recipes =
+            crate::profile::phase("reanalyze: recipes", || derive::Recipes::new(db, scopes));
+        crate::profile::phase("reanalyze: engine run", || engine.run(db, &recipes));
         pending = engine.take_stale_sources().into_iter().collect();
     }
-    db.flush_inference_derived_state();
+    crate::profile::phase("reanalyze: flush", || db.flush_inference_derived_state());
     let touched = engine.take_touched();
-    refresh_payload_refs(db, &touched);
+    crate::profile::phase("reanalyze: payload refs", || {
+        refresh_payload_refs(db, &touched)
+    });
+    crate::profile::phase_report("reanalyze");
     let stats = engine.stats().clone();
     stats.report();
     Reanalysis {
