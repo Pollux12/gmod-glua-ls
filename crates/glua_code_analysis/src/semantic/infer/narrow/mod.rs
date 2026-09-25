@@ -147,10 +147,10 @@ pub fn infer_expr_narrow_type(
     let query_realm = db
         .get_gmod_infer_index()
         .get_realm_at_offset(&file_id, expr.get_position());
-    let previous_query_realm = cache.flow_query_realm.replace(query_realm);
+    let previous_query_realm = cache.set_query_realm(Some(query_realm));
     let result =
         get_type_at_flow::get_type_at_flow(db, flow_tree, cache, &root, &var_ref_id, flow_id);
-    cache.flow_query_realm = previous_query_realm;
+    cache.restore_query_realm(previous_query_realm);
     result
 }
 
@@ -174,7 +174,7 @@ pub(crate) fn infer_true_condition_narrowing(
     let query_realm = db
         .get_gmod_infer_index()
         .get_realm_at_offset(&file_id, condition.get_position());
-    let previous_query_realm = cache.flow_query_realm.replace(query_realm);
+    let previous_query_realm = cache.set_query_realm(Some(query_realm));
     let result = (|| {
         let antecedent = condition_flow::get_condition_antecedent_type(
             db,
@@ -204,7 +204,7 @@ pub(crate) fn infer_true_condition_narrowing(
         };
         Some((antecedent, narrowed))
     })();
-    cache.flow_query_realm = previous_query_realm;
+    cache.restore_query_realm(previous_query_realm);
     result
 }
 
@@ -228,7 +228,7 @@ pub fn infer_expr_narrow_type_with_flow_origin(
     let query_realm = db
         .get_gmod_infer_index()
         .get_realm_at_offset(&file_id, expr.get_position());
-    let previous_query_realm = cache.flow_query_realm.replace(query_realm);
+    let previous_query_realm = cache.set_query_realm(Some(query_realm));
     let result = get_type_at_flow::get_type_at_flow_with_origin(
         db,
         flow_tree,
@@ -238,7 +238,7 @@ pub fn infer_expr_narrow_type_with_flow_origin(
         flow_id,
         flow_origin,
     );
-    cache.flow_query_realm = previous_query_realm;
+    cache.restore_query_realm(previous_query_realm);
     result
 }
 
@@ -264,11 +264,21 @@ pub fn infer_expr_narrow_type_with_self_base(
         return infer_expr_narrow_type(db, cache, expr, var_ref_id);
     };
 
+    let previous_flow_cache = cache.key_flow_cache(&var_ref_id, &self_base);
     let previous_seed = cache
         .self_base_seed
-        .replace((var_ref_id.clone(), self_base));
-    let result = infer_expr_narrow_type(db, cache, expr, var_ref_id);
+        .replace((var_ref_id.clone(), self_base.clone()));
+    let previous_mark = std::mem::replace(
+        &mut cache.self_base_seed_mark,
+        crate::db_index::derivation::scope_mark(),
+    );
+    // The seed changes what every flow node of this reference holds: walks
+    // made without it, or with another region's seed, answer for a different
+    // origin, so the reference walks its entries for this seed.
+    let result = infer_expr_narrow_type(db, cache, expr, var_ref_id.clone());
+    cache.unkey_flow_cache(&var_ref_id, self_base, previous_flow_cache);
     cache.self_base_seed = previous_seed;
+    cache.self_base_seed_mark = previous_mark;
     result
 }
 
@@ -281,10 +291,19 @@ pub fn get_var_ref_type(
     // reference, use it as the flow origin type instead of resolving the
     // (position-insensitive) receiver decl/member cache. See
     // `infer_expr_narrow_type_with_self_base`.
+    if var_ref_id.is_self_ref() {
+        cache.consult_self_seed();
+    }
     if var_ref_id.is_self_ref()
         && let Some((seed_ref, seed_type)) = cache.self_base_seed.as_ref()
         && seed_ref == var_ref_id
     {
+        crate::db_index::derivation::consult_absorbed(
+            LuaInferCache::flow_context_key(&crate::semantic::cache::VarRefCacheKey::from(
+                var_ref_id,
+            )),
+            cache.self_base_seed_mark,
+        );
         return Ok(seed_type.clone());
     }
 
@@ -294,10 +313,19 @@ pub fn get_var_ref_type(
             .get_decl(&decl_id)
             .ok_or(InferFailReason::None)?;
 
+        if decl.is_implicit_self() {
+            cache.consult_self_seed();
+        }
         if decl.is_implicit_self()
             && let Some((seed_ref, seed_type)) = cache.self_base_seed.as_ref()
             && seed_ref.get_decl_id_ref() == Some(decl.get_id())
         {
+            crate::db_index::derivation::consult_absorbed(
+                LuaInferCache::flow_context_key(&crate::semantic::cache::VarRefCacheKey::from(
+                    seed_ref,
+                )),
+                cache.self_base_seed_mark,
+            );
             return Ok(seed_type.clone());
         }
 

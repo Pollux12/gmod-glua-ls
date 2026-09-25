@@ -50,7 +50,7 @@ impl InferCacheManager {
         self.dynamic_fields_visible = true;
         for infer_cache in self.infer_map.values_mut() {
             infer_cache.config_mut().dynamic_fields_visible = true;
-            infer_cache.dynamic_field_resolution_cache.clear();
+            infer_cache.clear();
         }
     }
 
@@ -68,6 +68,7 @@ impl InferCacheManager {
         self.call_site_params_visible = true;
         for infer_cache in self.infer_map.values_mut() {
             infer_cache.config_mut().call_site_params_visible = true;
+            infer_cache.clear();
         }
     }
 

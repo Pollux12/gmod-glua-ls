@@ -119,11 +119,11 @@ fn resolve_str_default_from_arg(
     let use_site_realm = db
         .get_gmod_infer_index()
         .get_realm_at_offset(&file_id, range.start());
-    let previous_realm = cache.flow_query_realm.replace(use_site_realm);
+    let previous_realm = cache.set_query_realm(Some(use_site_realm));
 
     let result = resolve_str_default_from_arg_inner(db, cache, param_type, arg_expr, decl_id);
 
-    cache.flow_query_realm = previous_realm;
+    cache.restore_query_realm(previous_realm);
     result
 }
 
@@ -505,12 +505,15 @@ fn apply_call_generic_type_list(
 /// to `Nil` and propagates other errors. Falling back to `infer_expr` for
 /// those keeps the error paths identical.
 fn shared_call_arg_type(
-    cache: &LuaInferCache,
+    cache: &mut LuaInferCache,
     call_syntax_id: LuaSyntaxId,
     arg_exprs: &[LuaExpr],
     arg_idx: usize,
 ) -> Option<LuaType> {
-    let shared = cache.call_arg_types_cache.get(&(call_syntax_id, None))?;
+    let shared = cache.tracked_get(
+        |cache| &mut cache.call_arg_types_cache,
+        &(call_syntax_id, None),
+    )?;
     if shared.len() != arg_exprs.len() {
         return None;
     }

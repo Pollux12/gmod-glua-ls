@@ -249,17 +249,22 @@ pub(crate) fn cached_local_class_table_member_ids(
 ) -> Arc<Vec<LuaMemberId>> {
     let revision = db.type_structure_revision();
     let cache_key = (type_id.clone(), member_key.clone());
-    if let Some((cached_revision, member_ids)) =
-        cache.local_class_table_member_ids_cache.get(&cache_key)
-        && *cached_revision == revision
+    if let Some((cached_revision, member_ids)) = cache.tracked_get(
+        |cache| &mut cache.local_class_table_member_ids_cache,
+        &cache_key,
+    ) && cached_revision == revision
     {
-        return Arc::clone(member_ids);
+        return member_ids;
     }
 
+    let frame = crate::db_index::derivation::open_frame();
     let member_ids = Arc::new(local_class_table_member_ids(db, type_id, member_key));
-    cache
-        .local_class_table_member_ids_cache
-        .insert(cache_key, (revision, Arc::clone(&member_ids)));
+    cache.tracked_insert(
+        |cache| &mut cache.local_class_table_member_ids_cache,
+        cache_key,
+        (revision, Arc::clone(&member_ids)),
+        frame,
+    );
     member_ids
 }
 
@@ -735,11 +740,11 @@ pub(crate) fn resolve_dynamic_field_member(
 ) -> Result<Option<DynamicFieldResolution>, InferFailReason> {
     if !db.get_emmyrc().gmod.enabled
         || !db.get_emmyrc().gmod.infer_dynamic_fields
-        || !cache.get_config().dynamic_fields_visible
+        || !cache.dynamic_fields_visible()
     {
         if db.get_emmyrc().gmod.enabled
             && db.get_emmyrc().gmod.infer_dynamic_fields
-            && !cache.get_config().dynamic_fields_visible
+            && !cache.dynamic_fields_visible()
         {
             if let Some(field_name) = member_key.get_name() {
                 record_dynamic_field_read_for_prefix(db, prefix_type, field_name);
@@ -749,15 +754,35 @@ pub(crate) fn resolve_dynamic_field_member(
     }
 
     let cache_key = (prefix_type.clone(), member_key.clone(), access_position);
-    if let Some(cached) = cache.dynamic_field_resolution_cache.get(&cache_key) {
-        return Ok(cached
-            .clone()
-            .map(|(typ, semantic_decl)| DynamicFieldResolution { typ, semantic_decl }));
+    if let Some(cached) = cache.tracked_get(
+        |cache| &mut cache.dynamic_field_resolution_cache,
+        &cache_key,
+    ) {
+        return Ok(cached.map(|(typ, semantic_decl)| DynamicFieldResolution { typ, semantic_decl }));
     }
 
     let Some(field_name) = member_key.get_name() else {
         return Ok(None);
     };
+    let frame = crate::db_index::derivation::open_frame();
+    let resolved =
+        resolve_dynamic_field_uncached(db, cache, prefix_type, field_name, access_position);
+    cache.tracked_insert(
+        |cache| &mut cache.dynamic_field_resolution_cache,
+        cache_key,
+        resolved.clone(),
+        frame,
+    );
+    Ok(resolved.map(|(typ, semantic_decl)| DynamicFieldResolution { typ, semantic_decl }))
+}
+
+fn resolve_dynamic_field_uncached(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    prefix_type: &LuaType,
+    field_name: &str,
+    access_position: Option<TextSize>,
+) -> Option<(LuaType, Option<LuaSemanticDeclId>)> {
     let caller_file_id = cache.get_file_id();
     let definitions = dynamic_field_definitions(
         db,
@@ -768,8 +793,7 @@ pub(crate) fn resolve_dynamic_field_member(
         access_position,
     );
     if definitions.is_empty() {
-        cache.dynamic_field_resolution_cache.insert(cache_key, None);
-        return Ok(None);
+        return None;
     }
 
     let mut member_types = Vec::new();
@@ -801,10 +825,7 @@ pub(crate) fn resolve_dynamic_field_member(
         [only] => only.clone(),
         _ => LuaType::from_vec(member_types),
     };
-    cache
-        .dynamic_field_resolution_cache
-        .insert(cache_key, Some((typ.clone(), semantic_decl.clone())));
-    Ok(Some(DynamicFieldResolution { typ, semantic_decl }))
+    Some((typ, semantic_decl))
 }
 
 pub(crate) fn resolve_dynamic_field_member_for_file(
@@ -822,19 +843,28 @@ fn dynamic_field_member_type(
     cache: &mut LuaInferCache,
     member_id: &LuaMemberId,
 ) -> Option<LuaType> {
-    if let Some(cached) = cache.dynamic_field_type_cache.get(member_id) {
-        return cached.clone();
+    if let Some(cached) = cache.tracked_get(|cache| &mut cache.dynamic_field_type_cache, member_id)
+    {
+        return cached;
     }
 
-    if !cache.dynamic_field_resolving.insert(*member_id) {
+    if let Some(mark) = cache.dynamic_field_resolving.get(member_id) {
+        crate::db_index::derivation::consult_cycle(*mark);
         return None;
     }
 
+    let frame = crate::db_index::derivation::open_frame();
+    cache
+        .dynamic_field_resolving
+        .insert(*member_id, crate::db_index::derivation::scope_mark());
     let result = dynamic_field_member_type_inner(db, cache, member_id);
     cache.dynamic_field_resolving.remove(member_id);
-    cache
-        .dynamic_field_type_cache
-        .insert(*member_id, result.clone());
+    cache.tracked_insert(
+        |cache| &mut cache.dynamic_field_type_cache,
+        *member_id,
+        result.clone(),
+        frame,
+    );
     result
 }
 
@@ -1071,13 +1101,20 @@ fn dynamic_field_definition_syntax(
     cache: &mut LuaInferCache,
     definition: &crate::InFiled<TextRange>,
 ) -> DynamicFieldDefinitionSyntax {
-    if let Some(cached) = cache.dynamic_field_definition_syntax_cache.get(definition) {
-        return *cached;
+    if let Some(cached) = cache.tracked_get(
+        |cache| &mut cache.dynamic_field_definition_syntax_cache,
+        definition,
+    ) {
+        return cached;
     }
+    let frame = crate::db_index::derivation::open_frame();
     let syntax = dynamic_field_definition_syntax_uncached(db, definition);
-    cache
-        .dynamic_field_definition_syntax_cache
-        .insert(definition.clone(), syntax);
+    cache.tracked_insert(
+        |cache| &mut cache.dynamic_field_definition_syntax_cache,
+        definition.clone(),
+        syntax,
+        frame,
+    );
     syntax
 }
 

@@ -1,6 +1,7 @@
 //! Which derivations a file has, and how each kind is evaluated.
 
 use glua_parser::{LuaAst, LuaAstNode, LuaChunk, LuaSyntaxId};
+
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -77,6 +78,9 @@ pub(super) const WORKSPACE_DERIVATIONS: [DerivationKind; 5] = [
 pub(super) struct Recipes {
     special_call_direct_matcher: lua::call::SpecialCallDirectMatcher,
     scopes: ScriptedScopes,
+    /// Each file's inference memo, reused across its evaluations: an entry
+    /// holds for as long as the reads it was computed from do.
+    caches: std::sync::Mutex<FxHashMap<FileId, crate::LuaInferCache>>,
 }
 
 impl Recipes {
@@ -93,6 +97,7 @@ impl Recipes {
         Self {
             special_call_direct_matcher: lua::call::build_special_call_direct_matcher(db, &roots),
             scopes,
+            caches: std::sync::Mutex::default(),
         }
     }
 }
@@ -209,8 +214,18 @@ impl super::engine::Recipe for Recipes {
             }
             _ => {
                 let mut context = AnalyzeContext::for_files(db, vec![id.file_id], &self.scopes);
+                if let Some(cache) = self.caches.lock().expect("cache store").remove(&id.file_id) {
+                    context.infer_manager.restore_file(id.file_id, cache);
+                }
                 self.evaluate_file_derivation(db, &mut context, id);
                 unresolve::resolve_inline(db, &mut context);
+                if let Some(mut cache) = context.infer_manager.take_file(id.file_id) {
+                    cache.clear();
+                    self.caches
+                        .lock()
+                        .expect("cache store")
+                        .insert(id.file_id, cache);
+                }
             }
         }
     }

@@ -218,8 +218,19 @@ fn infer_member_type_pass_flow(
         return Ok(member_type.clone());
     };
 
-    cache.set_index_ref_origin_type_cache(&var_ref_id, CacheEntry::Cache(member_type.clone()));
-    let result = infer_expr_narrow_type(db, cache, LuaExpr::IndexExpr(index_expr), var_ref_id);
+    // The origin is this expression's member type: a walk of the same path
+    // from elsewhere starts from its own.
+    let previous_flow_cache = cache.key_flow_cache(&var_ref_id, &member_type);
+    let previous_origin = cache
+        .replace_index_ref_origin_type_cache(&var_ref_id, CacheEntry::Cache(member_type.clone()));
+    let result = infer_expr_narrow_type(
+        db,
+        cache,
+        LuaExpr::IndexExpr(index_expr),
+        var_ref_id.clone(),
+    );
+    cache.restore_index_ref_origin_type_cache(&var_ref_id, previous_origin);
+    cache.unkey_flow_cache(&var_ref_id, member_type.clone(), previous_flow_cache);
     match &result {
         Err(InferFailReason::None) => Ok(member_type.clone()),
         _ => result,
@@ -392,10 +403,32 @@ pub fn get_index_expr_var_ref_id(
     index_expr: &LuaIndexExpr,
 ) -> Option<VarRefId> {
     let syntax_id = index_expr.get_syntax_id();
-    if let Some(var_ref_id) = cache.expr_var_ref_id_cache.get(&syntax_id) {
-        return Some(var_ref_id.clone());
+    if let Some(var_ref_id) =
+        cache.tracked_get(|cache| &mut cache.expr_var_ref_id_cache, &syntax_id)
+    {
+        return Some(var_ref_id);
     }
 
+    let frame = crate::db_index::derivation::open_frame();
+    let Some(var_ref_id) = index_expr_var_ref_id_uncached(db, cache, index_expr) else {
+        cache.close_frame(frame);
+        return None;
+    };
+    cache.tracked_insert(
+        |cache| &mut cache.expr_var_ref_id_cache,
+        syntax_id,
+        var_ref_id.clone(),
+        frame,
+    );
+    Some(var_ref_id)
+}
+
+fn index_expr_var_ref_id_uncached(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexExpr,
+) -> Option<VarRefId> {
+    let syntax_id = index_expr.get_syntax_id();
     // Resolve the prefix first: it is usually cached, while the access path
     // below allocates a string and hits the global interner. Building the
     // path first would pay both on every miss that bails out here — and
@@ -414,11 +447,7 @@ pub fn get_index_expr_var_ref_id(
         };
 
         let access_path = interned_access_path(cache.get_file_id(), syntax_id, index_expr)?;
-        let var_ref_id = VarRefId::IndexRef(root, access_path);
-        cache
-            .expr_var_ref_id_cache
-            .insert(syntax_id, var_ref_id.clone());
-        return Some(var_ref_id);
+        return Some(VarRefId::IndexRef(root, access_path));
     }
 
     None

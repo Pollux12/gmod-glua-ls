@@ -59,26 +59,105 @@ pub type InferResult = Result<LuaType, InferFailReason>;
 pub use infer_call::InferCallFuncResult;
 
 pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> InferResult {
-    let syntax_id = expr.get_syntax_id();
-    let key = syntax_id;
-    if let Some(cache_entry) = cache.expr_cache.get(&key) {
+    let key = expr.get_syntax_id();
+    if let Some(mark) = cache.expr_in_progress.get(&key) {
+        crate::db_index::derivation::consult_cycle(*mark);
+        return Err(InferFailReason::RecursiveInfer);
+    }
+    let lookup = cache.lookup();
+    if crate::db_index::derivation::check_tsc() {
+        crate::db_index::derivation::take_reused_across();
+    }
+    if let Some(cache_entry) = cache.expr_cache.get(&key, lookup) {
         match cache_entry {
-            CacheEntry::Cache(ty) => return Ok(ty.clone()),
+            CacheEntry::Cache(ty) => {
+                let ty = ty.clone();
+                if crate::db_index::derivation::check_tsc()
+                    && crate::db_index::derivation::take_reused_across()
+                {
+                    let shared_reads = cache
+                        .expr_cache
+                        .provenance(&key)
+                        .map(crate::db_index::derivation::describe_reads)
+                        .unwrap_or_default();
+                    let mut fresh = cache.fork_fresh();
+                    let frame = crate::db_index::derivation::open_frame();
+                    let recomputed = infer_expr(db, &mut fresh, expr.clone());
+                    let fresh_reads = fresh
+                        .close_frame(frame)
+                        .map(|provenance| crate::db_index::derivation::describe_reads(&provenance))
+                        .unwrap_or_default();
+                    if recomputed.as_ref().ok() != Some(&ty) {
+                        let shared_keys = shared_reads
+                            .iter()
+                            .map(|(key, _)| key.as_str())
+                            .collect::<std::collections::HashSet<_>>();
+                        let only_fresh = fresh_reads
+                            .iter()
+                            .filter(|(key, _)| !shared_keys.contains(key.as_str()))
+                            .map(|(key, _)| key.as_str())
+                            .collect::<Vec<_>>();
+                        let written = shared_reads
+                            .iter()
+                            .filter(|(_, written)| *written)
+                            .map(|(key, _)| key.as_str())
+                            .collect::<Vec<_>>();
+                        if let Some(provenance) = cache.expr_cache.provenance(&key) {
+                            let (origin, keys) =
+                                crate::db_index::derivation::provenance_keys(provenance);
+                            if let Some(origin) = origin {
+                                let seen = db.reader_graph().recorded_slots(origin);
+                                let moved = keys
+                                    .iter()
+                                    .filter_map(|(slot, hashed)| {
+                                        let (_, then) =
+                                            seen.iter().find(|(read, _)| read == slot)?;
+                                        let now = db.fact_fingerprint(hashed);
+                                        (*then != now).then(|| format!("{:?}", &**hashed))
+                                    })
+                                    .collect::<Vec<_>>();
+                                eprintln!("[tsc] origin {origin:?} moved-unmarked={moved:?}");
+                            }
+                        }
+                        let gmod_class = shared_reads
+                            .iter()
+                            .filter(|(key, _)| key.contains("GmodClass"))
+                            .collect::<Vec<_>>();
+                        eprintln!("[tsc] gmod-class reads {gmod_class:?}");
+                        eprintln!(
+                            "[tsc] reads shared={} fresh={} only_fresh={only_fresh:?} written={written:?}",
+                            shared_reads.len(),
+                            fresh_reads.len(),
+                        );
+                        eprintln!(
+                            "[tsc] mismatch {:?} {:?} {:?} `{}` shared={ty:?} fresh={recomputed:?}",
+                            db.get_vfs()
+                                .get_uri(&cache.get_file_id())
+                                .map(|uri| uri.to_string()),
+                            expr.get_range(),
+                            crate::db_index::derivation::current(),
+                            expr.syntax().text(),
+                        );
+                    }
+                }
+                return Ok(ty);
+            }
             CacheEntry::Error(reason) => {
                 // If a cached UnResolveDeclType error is stale (the decl now
                 // has a type), invalidate the entry and re-infer. This handles
                 // cases where generic type resolution makes progress within
                 // the same Lua pass.
                 if let InferFailReason::UnResolveDeclType(decl_id) = reason {
+                    let decl_id = *decl_id;
                     if db
                         .get_type_index()
-                        .get_type_cache(&(*decl_id).into())
+                        .get_type_cache(&decl_id.into())
                         .is_some()
                     {
                         cache.expr_cache.remove(&key);
                     // Fall through to re-infer below
                     } else {
-                        return Err(reason.clone());
+                        return Err(InferFailReason::UnResolveDeclType(decl_id));
                     }
                 } else {
                     return Err(reason.clone());
@@ -88,26 +167,53 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
         }
     }
 
+    let frame = crate::db_index::derivation::open_frame();
+    let (result, stored) = infer_expr_miss(db, cache, expr, key);
+    let provenance = cache.close_frame(frame);
+    match stored {
+        Some(Some(entry)) => {
+            cache.expr_in_progress.remove(&key);
+            cache.expr_cache.insert(key, entry, provenance);
+        }
+        Some(None) => {
+            cache.expr_in_progress.remove(&key);
+            cache.expr_cache.remove(&key);
+        }
+        None => {}
+    }
+    result
+}
+
+/// Infers `expr` on a memo miss. Returns the result and what to store for
+/// it: an entry, `Some(None)` to drop the key, or `None` to leave it as is.
+#[allow(clippy::option_option)]
+fn infer_expr_miss(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+    key: glua_parser::LuaSyntaxId,
+) -> (InferResult, Option<Option<CacheEntry<LuaType>>>) {
     // for @as
     let file_id = cache.get_file_id();
-    let in_filed_syntax_id = InFiled::new(file_id, syntax_id);
+    let in_filed_syntax_id = InFiled::new(file_id, key);
     if let Some(bind_type_cache) = db
         .get_type_index()
         .get_type_cache(&in_filed_syntax_id.into())
     {
-        cache
-            .expr_cache
-            .insert(key, CacheEntry::Cache(bind_type_cache.as_type().clone()));
-        return Ok(bind_type_cache.as_type().clone());
+        let ty = bind_type_cache.as_type().clone();
+        return (Ok(ty.clone()), Some(Some(CacheEntry::Cache(ty))));
     }
 
     // The reserve check sits below the cache fast paths: cache hits return
     // without recursing, so they need no stack.
     if analysis_stack_exhausted() {
-        return Err(InferFailReason::RecursiveInfer);
+        crate::db_index::derivation::taint();
+        return (Err(InferFailReason::RecursiveInfer), None);
     }
 
-    cache.expr_cache.insert(key, CacheEntry::Ready);
+    cache
+        .expr_in_progress
+        .insert(key, crate::db_index::derivation::scope_mark());
 
     let result_type = match expr {
         LuaExpr::CallExpr(call_expr) => infer_call_expr(db, cache, call_expr),
@@ -116,11 +222,14 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
         LuaExpr::BinaryExpr(binary_expr) => infer_binary_expr(db, cache, binary_expr),
         LuaExpr::UnaryExpr(unary_expr) => infer_unary_expr(db, cache, unary_expr),
         LuaExpr::ClosureExpr(closure_expr) => infer_closure_expr(db, cache, closure_expr),
-        LuaExpr::ParenExpr(paren_expr) => infer_expr(
-            db,
-            cache,
-            paren_expr.get_expr().ok_or(InferFailReason::None)?,
-        ),
+        LuaExpr::ParenExpr(paren_expr) => match paren_expr.get_expr() {
+            Some(inner) => infer_expr(db, cache, inner),
+            // The key keeps its `Ready` marker.
+            None => {
+                crate::db_index::derivation::taint();
+                return (Err(InferFailReason::None), None);
+            }
+        },
         LuaExpr::NameExpr(name_expr) => infer_name_expr(db, cache, name_expr),
         LuaExpr::IndexExpr(index_expr) => infer_index_expr(db, cache, index_expr, true),
     };
@@ -129,46 +238,44 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
     // recomputation across diagnostic checkers. During analysis, unresolved errors are
     // removed so the unresolve phase can retry them.
     let is_diagnostics = cache.get_config().analysis_phase.is_diagnostics();
+    let is_force = cache.get_config().analysis_phase.is_force();
 
-    match &result_type {
+    match result_type {
         Ok(result_type) => {
-            cache
-                .expr_cache
-                .insert(key, CacheEntry::Cache(result_type.clone()));
+            let stored = CacheEntry::Cache(result_type.clone());
+            (Ok(result_type), Some(Some(stored)))
         }
-        Err(InferFailReason::None) | Err(InferFailReason::RecursiveInfer) => {
-            cache
-                .expr_cache
-                .insert(key, CacheEntry::Cache(LuaType::Unknown));
-            return Ok(LuaType::Unknown);
-        }
+        Err(InferFailReason::None) | Err(InferFailReason::RecursiveInfer) => (
+            Ok(LuaType::Unknown),
+            Some(Some(CacheEntry::Cache(LuaType::Unknown))),
+        ),
         Err(InferFailReason::FieldNotFound) => {
-            if cache.get_config().analysis_phase.is_force() {
-                cache
-                    .expr_cache
-                    .insert(key, CacheEntry::Cache(LuaType::Nil));
-                return Ok(LuaType::Nil);
+            if is_force {
+                (
+                    Ok(LuaType::Nil),
+                    Some(Some(CacheEntry::Cache(LuaType::Nil))),
+                )
             } else if is_diagnostics {
-                cache
-                    .expr_cache
-                    .insert(key, CacheEntry::Error(InferFailReason::FieldNotFound));
+                (
+                    Err(InferFailReason::FieldNotFound),
+                    Some(Some(CacheEntry::Error(InferFailReason::FieldNotFound))),
+                )
             } else {
-                cache.expr_cache.remove(&key);
+                (Err(InferFailReason::FieldNotFound), Some(None))
             }
         }
-        Err(reason) if reason.is_need_resolve() && cache.get_config().analysis_phase.is_force() => {
+        Err(reason) if reason.is_need_resolve() && is_force => {
             // A fact that has not landed reads as unknown: the read is
             // recorded, so its reader is evaluated again once it lands.
-            cache
-                .expr_cache
-                .insert(key, CacheEntry::Cache(LuaType::Unknown));
-            return Ok(LuaType::Unknown);
+            (
+                Ok(LuaType::Unknown),
+                Some(Some(CacheEntry::Cache(LuaType::Unknown))),
+            )
         }
         Err(reason) => {
             if is_diagnostics {
-                cache
-                    .expr_cache
-                    .insert(key, CacheEntry::Error(reason.clone()));
+                let stored = CacheEntry::Error(reason.clone());
+                (Err(reason), Some(Some(stored)))
             } else if matches!(reason, InferFailReason::UnResolveDeclType(_)) {
                 // Cache UnResolveDeclType as an error during analysis to prevent
                 // O(N×M) re-inference cascade. The decl's type depends on its
@@ -176,16 +283,13 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
                 // same Lua pass won't help. The unresolve phase calls clear()
                 // and re-infers from scratch. Other errors are still removed
                 // so same-pass re-inference can pick up newly-added members.
-                cache
-                    .expr_cache
-                    .insert(key, CacheEntry::Error(reason.clone()));
+                let stored = CacheEntry::Error(reason.clone());
+                (Err(reason), Some(Some(stored)))
             } else {
-                cache.expr_cache.remove(&key);
+                (Err(reason), Some(None))
             }
         }
     }
-
-    result_type
 }
 
 fn infer_literal_expr(
@@ -290,18 +394,19 @@ pub fn infer_call_arg_expr_list_types(
     var_count: Option<usize>,
 ) -> Arc<Vec<(LuaType, TextRange)>> {
     let key = (call_expr.get_syntax_id(), var_count);
-    if let Some(types) = cache.call_arg_types_cache.get(&key) {
-        return types.clone();
+    if let Some(types) = cache.tracked_get(|cache| &mut cache.call_arg_types_cache, &key) {
+        return types;
     }
     if let Some(var_count) = var_count {
         let full_key = (call_expr.get_syntax_id(), None);
-        if let Some(types) = cache.call_arg_types_cache.get(&full_key)
+        if let Some(types) = cache.tracked_get(|cache| &mut cache.call_arg_types_cache, &full_key)
             && types.len() >= var_count
         {
             return Arc::new(types[..var_count].to_vec());
         }
     }
 
+    let frame = crate::db_index::derivation::open_frame();
     let types = call_expr
         .get_args_list()
         .and_then(|args| {
@@ -313,7 +418,12 @@ pub fn infer_call_arg_expr_list_types(
         })
         .unwrap_or_default();
     let shared = Arc::new(types);
-    cache.call_arg_types_cache.insert(key, shared.clone());
+    cache.tracked_insert(
+        |cache| &mut cache.call_arg_types_cache,
+        key,
+        shared.clone(),
+        frame,
+    );
     shared
 }
 

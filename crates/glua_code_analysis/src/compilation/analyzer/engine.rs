@@ -417,7 +417,7 @@ impl Engine {
                 (derivation::end(), computed)
             })
         };
-        let evaluations = self.with_lent_keys(db, |db| {
+        let evaluations = self.with_lent_keys(db, &touched, |db| {
             batch
                 .iter()
                 .zip(computed)
@@ -471,13 +471,17 @@ impl Engine {
     }
 
     /// Runs `f` with the reader graph's key table lent to this thread.
+    /// `touched` moved before the table was lent: memos that read them are
+    /// stale from here on.
     fn with_lent_keys(
         &self,
         db: &mut DbIndex,
+        touched: &FxHashSet<HashedKey>,
         f: impl FnOnce(&mut DbIndex) -> Vec<derivation::Evaluation>,
     ) -> Vec<derivation::Evaluation> {
         derivation::lend_keys(db.reader_graph_mut().lend_keys());
         let lent = scopeguard_lent_keys();
+        derivation::note_written(touched.iter().cloned());
         let evaluations = f(db);
         db.reader_graph_mut().restore_keys(derivation::take_keys());
         std::mem::forget(lent);
@@ -496,7 +500,7 @@ impl Engine {
         // Fingerprints are taken once the whole group has run: the group always
         // re-runs as a unit, so a member's read of what a later member writes is
         // internal to it, not a stale input.
-        let evaluations = self.with_lent_keys(db, |db| {
+        let evaluations = self.with_lent_keys(db, &touched, |db| {
             group
                 .iter()
                 .map(|member| {
@@ -538,6 +542,10 @@ impl Engine {
         for evaluation in evaluations {
             let (id, mut slots, reads, outputs) = evaluation.into_recorded();
             slots.extend(reads.into_iter().map(|key| graph.intern_read(key)));
+            // A resumed evaluation read some keys both before and after the
+            // table was lent.
+            slots.sort_unstable();
+            slots.dedup();
             touched.extend(outputs.iter().cloned());
             graph.replace_slots(
                 id,
@@ -565,6 +573,8 @@ pub(crate) struct EngineStats {
     requeues: BTreeMap<(String, Option<DerivationKind>, DerivationKind), usize>,
     /// Recorded reads by key variant.
     reads: BTreeMap<String, usize>,
+    /// Under `GLUALS_PROFILE`: every derivation evaluated, to count repeats.
+    distinct: FxHashSet<DerivationId>,
 }
 
 fn variant_name(key: &FactKey) -> String {
@@ -597,6 +607,9 @@ impl EngineStats {
 
     fn evaluated(&mut self, id: DerivationId) {
         *self.evaluations.entry(id.kind).or_default() += 1;
+        if self.profiling() {
+            self.distinct.insert(id);
+        }
     }
 
     /// How many times derivations of `kind` were evaluated.
@@ -625,6 +638,19 @@ impl EngineStats {
             self.rounds,
             kinds.join(" ")
         );
+        let mut distinct = BTreeMap::<DerivationKind, usize>::new();
+        for id in &self.distinct {
+            *distinct.entry(id.kind).or_default() += 1;
+        }
+        eprintln!(
+            "[engine] distinct={} {}",
+            self.distinct.len(),
+            distinct
+                .iter()
+                .map(|(kind, count)| format!("{kind:?}={count}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         let mut time = self.time.iter().collect::<Vec<_>>();
         time.sort_by(|left, right| right.1.cmp(left.1));
         for (kind, time) in time {
@@ -640,6 +666,7 @@ impl EngineStats {
         for (variant, count) in reads.into_iter().take(25) {
             eprintln!("[engine] reads {count} {variant}");
         }
+        derivation::report_frames();
         let mut requeues = self.requeues.iter().collect::<Vec<_>>();
         requeues.sort_by(|left, right| right.1.cmp(left.1));
         for ((variant, writer, reader), count) in requeues.into_iter().take(60) {

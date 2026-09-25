@@ -442,7 +442,7 @@ fn clear_index_expr_type_cache(analyzer: &mut LuaAnalyzer, expr: &LuaExpr) {
     let mut current_expr = expr.clone();
     while let LuaExpr::IndexExpr(index_expr) = current_expr {
         let syntax_id = index_expr.get_syntax_id();
-        if matches!(cache.expr_cache.get(&syntax_id), Some(CacheEntry::Cache(typ)) if typ.is_nil() || is_weak_dynamic_index_alias_type(typ))
+        if matches!(cache.expr_cache.peek(&syntax_id), Some(CacheEntry::Cache(typ)) if typ.is_nil() || is_weak_dynamic_index_alias_type(typ))
         {
             cache.expr_cache.remove(&syntax_id);
             cache.expr_var_ref_id_cache.remove(&syntax_id);

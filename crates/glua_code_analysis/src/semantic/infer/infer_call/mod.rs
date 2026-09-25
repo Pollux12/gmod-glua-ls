@@ -53,17 +53,52 @@ pub fn infer_call_expr_func(
     let syntax_id = call_expr.get_syntax_id();
     if let Some(cache_entry) = cache.get_call_func_cache(syntax_id, args_count, &call_expr_type) {
         match cache_entry {
-            CacheEntry::Cache(ty) => return Ok(ty.clone()),
+            CacheEntry::Cache(ty) => return Ok(ty),
             _ => return Err(InferFailReason::RecursiveInfer),
         }
     }
 
+    let frame = crate::db_index::derivation::open_frame();
     cache.insert_call_func_cache(
         syntax_id,
         args_count,
         call_expr_type.clone(),
         CacheEntry::Ready,
+        None,
     );
+    let (result, stored) = infer_call_expr_func_miss(
+        db,
+        cache,
+        call_expr,
+        call_expr_type.clone(),
+        infer_guard,
+        args_count,
+    );
+    let provenance = cache.close_frame(frame);
+    match stored {
+        Some(Some(entry)) => {
+            cache.insert_call_func_cache(syntax_id, args_count, call_expr_type, entry, provenance)
+        }
+        Some(None) => cache.remove_call_func_cache(syntax_id, args_count, &call_expr_type),
+        None => {}
+    }
+    result
+}
+
+/// Resolves a call on a memo miss. Returns the result and what to store for
+/// it: an entry, `Some(None)` to drop the key, or `None` to leave it as is.
+#[allow(clippy::option_option)]
+fn infer_call_expr_func_miss(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: LuaCallExpr,
+    call_expr_type: LuaType,
+    infer_guard: &InferGuardRef,
+    args_count: Option<usize>,
+) -> (
+    InferCallFuncResult,
+    Option<Option<CacheEntry<Arc<LuaFunctionType>>>>,
+) {
     let prefix_signature_id = matches!(call_expr_type, LuaType::DocFunction(_))
         .then(|| get_prefix_expr_signature_id(db, cache, &call_expr))
         .flatten();
@@ -72,16 +107,11 @@ pub fn infer_call_expr_func(
     {
         let result =
             infer_signature_doc_function(db, cache, signature_id, call_expr.clone(), args_count);
-        cache.insert_call_func_cache(
-            syntax_id,
-            args_count,
-            call_expr_type,
-            result
-                .as_ref()
-                .map(|it| CacheEntry::Cache(it.clone()))
-                .unwrap_or_else(|err| CacheEntry::Error(err.clone())),
-        );
-        return result;
+        let stored = result
+            .as_ref()
+            .map(|it| CacheEntry::Cache(it.clone()))
+            .unwrap_or_else(|err| CacheEntry::Error(err.clone()));
+        return (result, Some(Some(stored)));
     }
 
     let result = match &call_expr_type {
@@ -217,25 +247,13 @@ pub fn infer_call_expr_func(
         result
     };
 
-    match &result {
-        Ok(func_ty) => {
-            cache.insert_call_func_cache(
-                syntax_id,
-                args_count,
-                call_expr_type,
-                CacheEntry::Cache(func_ty.clone()),
-            );
-        }
-        Err(r) if r.is_need_resolve() => {
-            cache.remove_call_func_cache(syntax_id, args_count, &call_expr_type);
-        }
-        Err(InferFailReason::None) => {
-            cache.remove_call_func_cache(syntax_id, args_count, &call_expr_type);
-        }
-        _ => {}
-    }
-
-    result
+    let stored = match &result {
+        Ok(func_ty) => Some(Some(CacheEntry::Cache(func_ty.clone()))),
+        Err(r) if r.is_need_resolve() => Some(None),
+        Err(InferFailReason::None) => Some(None),
+        _ => None,
+    };
+    (result, stored)
 }
 
 fn refine_known_vgui_panel_return(

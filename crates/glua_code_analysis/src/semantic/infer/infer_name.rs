@@ -811,21 +811,37 @@ fn infer_implicit_method_self_type(
     let func_syntax_id = func_stat.get_syntax_id();
 
     // Cache the unified result (including a negative result) for subsequent
-    // `self` references in the same method body.
-    //
-    // Only once the call-site parameter index is readable: a result computed
-    // before it is populated cannot distinguish "no call site says so" from
-    // "the index is not built yet", and memoising that `None` would freeze the
-    // pre-pipeline answer into every later read of this method.
-    let cacheable = cache.get_config().call_site_params_visible;
-    if cacheable && let Some(cached) = cache.self_type_cache.get(&func_syntax_id) {
-        return cached.clone();
+    // `self` references in the same method body. A result that consulted the
+    // call-site gate is only reused under the same view.
+    if crate::db_index::derivation::check_tsc() {
+        crate::db_index::derivation::take_reused_across();
+    }
+    if let Some(cached) = cache.tracked_get(|cache| &mut cache.self_type_cache, &func_syntax_id) {
+        if crate::db_index::derivation::check_tsc()
+            && crate::db_index::derivation::take_reused_across()
+        {
+            let mut fresh = cache.fork_fresh();
+            let recomputed = infer_implicit_method_self_type_inner(db, &mut fresh, name_expr);
+            if recomputed != cached {
+                eprintln!(
+                    "[tsc] self mismatch {:?} {:?} {:?} shared={cached:?} fresh={recomputed:?}",
+                    cache.get_file_id(),
+                    func_syntax_id,
+                    crate::db_index::derivation::current(),
+                );
+            }
+        }
+        return cached;
     }
 
+    let frame = crate::db_index::derivation::open_frame();
     let result = infer_implicit_method_self_type_inner(db, cache, name_expr);
-    if cacheable {
-        cache.self_type_cache.insert(func_syntax_id, result.clone());
-    }
+    cache.tracked_insert(
+        |cache| &mut cache.self_type_cache,
+        func_syntax_id,
+        result.clone(),
+        frame,
+    );
     result
 }
 
@@ -865,7 +881,7 @@ fn infer_implicit_self_type_from_call_site(
     if !signature.is_colon_define {
         return None;
     }
-    if !cache.get_config().call_site_params_visible {
+    if !cache.call_site_params_visible() {
         return None;
     }
     db.get_call_site_param_index()
@@ -934,10 +950,31 @@ pub fn get_name_expr_var_ref_id(
     name_expr: &LuaNameExpr,
 ) -> Option<VarRefId> {
     let syntax_id = name_expr.get_syntax_id();
-    if let Some(var_ref_id) = cache.expr_var_ref_id_cache.get(&syntax_id) {
-        return Some(var_ref_id.clone());
+    if let Some(var_ref_id) =
+        cache.tracked_get(|cache| &mut cache.expr_var_ref_id_cache, &syntax_id)
+    {
+        return Some(var_ref_id);
     }
 
+    let frame = crate::db_index::derivation::open_frame();
+    let Some(var_ref_id) = name_expr_var_ref_id_uncached(db, cache, name_expr) else {
+        cache.close_frame(frame);
+        return None;
+    };
+    cache.tracked_insert(
+        |cache| &mut cache.expr_var_ref_id_cache,
+        syntax_id,
+        var_ref_id.clone(),
+        frame,
+    );
+    Some(var_ref_id)
+}
+
+fn name_expr_var_ref_id_uncached(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: &LuaNameExpr,
+) -> Option<VarRefId> {
     let name_token = name_expr.get_name_token()?;
     let name = name_token.get_name_text();
     let var_ref_id = match name {
@@ -966,10 +1003,6 @@ pub fn get_name_expr_var_ref_id(
             }
         }
     };
-
-    cache
-        .expr_var_ref_id_cache
-        .insert(syntax_id, var_ref_id.clone());
     Some(var_ref_id)
 }
 
@@ -3190,12 +3223,12 @@ mod test {
         let mut cache = LuaInferCache::new(file_id, Default::default());
 
         expect_that!(
-            cache.expr_var_ref_id_cache.contains_key(&syntax_id),
+            cache.expr_var_ref_id_cache.peek(&syntax_id).is_some(),
             eq(false)
         );
         expect_that!(infer_name_expr(db, &mut cache, self_expr).is_ok(), eq(true));
         expect_that!(
-            cache.expr_var_ref_id_cache.contains_key(&syntax_id),
+            cache.expr_var_ref_id_cache.peek(&syntax_id).is_some(),
             eq(true)
         );
 
@@ -3372,7 +3405,7 @@ end
         cache.clear_for_unresolve(db);
 
         assert_eq!(
-            cache.expr_var_ref_id_cache.get(&syntax_id),
+            cache.expr_var_ref_id_cache.peek(&syntax_id),
             Some(&local_ref)
         );
     }

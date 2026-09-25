@@ -95,17 +95,42 @@ pub fn get_type_at_flow_with_origin(
     flow_origin: FlowOrigin,
 ) -> InferResult {
     let policy = FlowWalkPolicy::normal(flow_origin);
-    let query_realm = cache.flow_query_realm.unwrap_or_else(|| {
+    let query_realm = cache.query_realm().unwrap_or_else(|| {
         db.get_gmod_infer_index()
             .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())
     });
     // Build once per query: the walk below touches the cache at every node.
     let cache_key = VarRefCacheKey::from(var_ref_id);
+    if crate::db_index::derivation::check_tsc() {
+        crate::db_index::derivation::take_reused_across();
+    }
     // Check cache for both success and error results. The shared entries
     // only bump a refcount here; the owned type is cloned once on return.
     match cache.get_flow_cache_with_origin_by_key(&cache_key, flow_id, query_realm, policy.origin) {
         Some(CacheEntry::Cache(narrow_type)) => {
-            return Ok(narrow_type.as_ref().clone());
+            let narrow_type = narrow_type.as_ref().clone();
+            if crate::db_index::derivation::check_tsc()
+                && crate::db_index::derivation::take_reused_across()
+            {
+                let mut fresh = cache.fork_fresh();
+                let recomputed = get_type_at_flow_with_origin(
+                    db,
+                    tree,
+                    &mut fresh,
+                    root,
+                    var_ref_id,
+                    flow_id,
+                    flow_origin,
+                );
+                if recomputed.as_ref().ok() != Some(&narrow_type) {
+                    eprintln!(
+                        "[tsc] flow mismatch {:?} {var_ref_id:?} {flow_id:?} {:?} shared={narrow_type:?} fresh={recomputed:?}",
+                        cache.get_file_id(),
+                        crate::db_index::derivation::current(),
+                    );
+                }
+            }
+            return Ok(narrow_type);
         }
         Some(CacheEntry::Error(reason)) => {
             return Err(reason.clone());
@@ -115,6 +140,9 @@ pub fn get_type_at_flow_with_origin(
     // Reuse one allocation across queries; nested walks (through merge
     // points) get a throwaway buffer while this one is checked out.
     let (mut visited_flow_ids, scratch_owned) = cache.take_flow_walk_scratch();
+    let frame = crate::db_index::derivation::open_frame_absorbing(LuaInferCache::flow_context_key(
+        &cache_key,
+    ));
     let result = get_type_at_flow_walk(
         db,
         tree,
@@ -127,6 +155,7 @@ pub fn get_type_at_flow_with_origin(
         &mut visited_flow_ids,
         policy,
     );
+    let provenance = cache.close_frame(frame);
     // RecursiveInfer errors are transient (cycle detection) and must NOT be
     // cached — they'd poison future non-recursive queries.
     match &result {
@@ -141,6 +170,7 @@ pub fn get_type_at_flow_with_origin(
                 query_realm,
                 policy.origin,
                 entry,
+                provenance,
             );
         }
         Err(InferFailReason::RecursiveInfer) => {
@@ -163,6 +193,7 @@ pub fn get_type_at_flow_with_origin(
                     query_realm,
                     policy.origin,
                     entry,
+                    provenance,
                 );
             }
         }
@@ -198,7 +229,7 @@ pub(super) fn get_type_at_flow_in_mode(
             get_type_at_flow_with_origin(db, tree, cache, root, var_ref_id, flow_id, policy.origin)
         }
         FlowWalkMode::ClosureBaseline => {
-            let query_realm = cache.flow_query_realm.unwrap_or_else(|| {
+            let query_realm = cache.query_realm().unwrap_or_else(|| {
                 db.get_gmod_infer_index()
                     .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())
             });
@@ -207,12 +238,16 @@ pub(super) fn get_type_at_flow_in_mode(
                 (flow_id, query_realm, policy.origin),
             );
             if let Some(narrow_type) = cache.baseline_flow_memo.get(&memo_key) {
+                crate::db_index::derivation::consult_scope(cache.baseline_scope);
                 return Ok(narrow_type.clone());
             }
 
             #[cfg(test)]
             BASELINE_FLOW_WALKS.with(|walks| walks.set(walks.get() + 1));
 
+            if cache.baseline_flow_depth == 0 {
+                cache.baseline_scope = crate::db_index::derivation::scope_mark();
+            }
             cache.baseline_flow_depth += 1;
             let mut visited_flow_ids = Vec::new();
             let result = get_type_at_flow_walk(
@@ -912,9 +947,9 @@ fn with_flow_query_realm<T>(
     query_realm: GmodRealm,
     f: impl FnOnce(&mut LuaInferCache) -> T,
 ) -> T {
-    let previous = cache.flow_query_realm.replace(query_realm);
+    let previous = cache.set_query_realm(Some(query_realm));
     let result = f(cache);
-    cache.flow_query_realm = previous;
+    cache.restore_query_realm(previous);
     result
 }
 
@@ -1044,7 +1079,7 @@ fn merge_antecedent_types(
             .ok_or(InferFailReason::None)?,
         None => return Err(InferFailReason::None),
     };
-    let target_realm = cache.flow_query_realm.unwrap_or_else(|| {
+    let target_realm = cache.query_realm().unwrap_or_else(|| {
         db.get_gmod_infer_index()
             .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())
     });
@@ -1134,14 +1169,20 @@ fn call_expr_returns_never(
     call_expr: glua_parser::LuaCallExpr,
 ) -> bool {
     let syntax_id = call_expr.get_syntax_id();
-    if let Some(returns_never) = cache.call_returns_never_cache.get(&syntax_id) {
-        return *returns_never;
+    if let Some(returns_never) =
+        cache.tracked_get(|cache| &mut cache.call_returns_never_cache, &syntax_id)
+    {
+        return returns_never;
     }
 
+    let frame = crate::db_index::derivation::open_frame();
     let returns_never = call_expr_returns_never_uncached(db, cache, call_expr);
-    cache
-        .call_returns_never_cache
-        .insert(syntax_id, returns_never);
+    cache.tracked_insert(
+        |cache| &mut cache.call_returns_never_cache,
+        syntax_id,
+        returns_never,
+        frame,
+    );
     returns_never
 }
 
@@ -1407,12 +1448,18 @@ fn get_or_compute_flow_node_realm(
     flow_id: FlowId,
     flow_node: &FlowNode,
 ) -> GmodRealm {
-    if let Some(realm) = cache.flow_node_realm_cache.get(&flow_id) {
-        return *realm;
+    if let Some(realm) = cache.tracked_get(|cache| &mut cache.flow_node_realm_cache, &flow_id) {
+        return realm;
     }
 
+    let frame = crate::db_index::derivation::open_frame();
     let realm = get_flow_node_realm(db, cache.get_file_id(), root, flow_node);
-    cache.flow_node_realm_cache.insert(flow_id, realm);
+    cache.tracked_insert(
+        |cache| &mut cache.flow_node_realm_cache,
+        flow_id,
+        realm,
+        frame,
+    );
     realm
 }
 
@@ -1546,17 +1593,44 @@ fn antecedent_has_relevant_special_call_effect(
     // here: `true` short-circuits every `.any` above it, so no sibling is
     // ever explored afterwards.)
     let memo_key = (flow_id, stop_at, var_key.clone());
-    if let Some(cached) = cache.branch_special_call_effect_cache.get(&memo_key) {
-        return *cached;
+    if let Some(cached) = cache.tracked_get(
+        |cache| &mut cache.branch_special_call_effect_cache,
+        &memo_key,
+    ) {
+        return cached;
     }
     if !visited.insert(flow_id) {
+        // A cut: what lies past it was not read here.
+        crate::db_index::derivation::taint();
         return false;
     }
 
+    let frame = crate::db_index::derivation::open_frame();
+    let result = branch_special_call_effect_uncached(
+        db, tree, cache, root, flow_id, stop_at, var_ref_id, var_key, visited,
+    );
+    cache.tracked_insert(
+        |cache| &mut cache.branch_special_call_effect_cache,
+        memo_key,
+        result,
+        frame,
+    );
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn branch_special_call_effect_uncached(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    flow_id: FlowId,
+    stop_at: FlowId,
+    var_ref_id: &VarRefId,
+    var_key: &VarRefCacheKey,
+    visited: &mut HashSet<FlowId>,
+) -> bool {
     let Some(flow_node) = tree.get_flow_node(flow_id) else {
-        cache
-            .branch_special_call_effect_cache
-            .insert(memo_key, false);
         return false;
     };
 
@@ -1569,13 +1643,10 @@ fn antecedent_has_relevant_special_call_effect(
             .iter()
             .any(|effect| special_call_effect_matches_var_ref(&effect.target, var_ref_id))
     {
-        cache
-            .branch_special_call_effect_cache
-            .insert(memo_key, true);
         return true;
     }
 
-    let result = match &flow_node.antecedent {
+    match &flow_node.antecedent {
         Some(FlowAntecedent::Single(prev)) => antecedent_has_relevant_special_call_effect(
             db, tree, cache, root, *prev, stop_at, var_ref_id, var_key, visited,
         ),
@@ -1589,11 +1660,7 @@ fn antecedent_has_relevant_special_call_effect(
             })
         }
         None => false,
-    };
-    cache
-        .branch_special_call_effect_cache
-        .insert(memo_key, result);
-    result
+    }
 }
 
 fn special_call_effect_matches_var_ref(effect_target: &VarRefId, var_ref_id: &VarRefId) -> bool {
@@ -2549,18 +2616,21 @@ fn numeric_table_index_query(
     cache_key: &VarRefCacheKey,
 ) -> Option<NumericTableIndexQuery> {
     // Reuse the query shape across walks in the same realm.
-    let memo_key = (cache_key.clone(), cache.flow_query_realm);
-    if let Some(cached) = cache
-        .numeric_table_index_query_cache
-        .get(&memo_key)
-        .cloned()
-    {
+    let memo_key = (cache_key.clone(), cache.query_realm());
+    if let Some(cached) = cache.tracked_get(
+        |cache| &mut cache.numeric_table_index_query_cache,
+        &memo_key,
+    ) {
         return cached;
     }
+    let frame = crate::db_index::derivation::open_frame();
     let result = numeric_table_index_query_uncached(db, cache, root, var_ref_id);
-    cache
-        .numeric_table_index_query_cache
-        .insert(memo_key, result.clone());
+    cache.tracked_insert(
+        |cache| &mut cache.numeric_table_index_query_cache,
+        memo_key,
+        result.clone(),
+        frame,
+    );
     result
 }
 
@@ -3684,7 +3754,7 @@ fn walk_antecedents_for_explicit_default(
         ),
         Some(FlowAntecedent::Multiple(idx)) => {
             if let Some(antecedents) = tree.get_multi_antecedents(*idx) {
-                let target_realm = cache.flow_query_realm.unwrap_or_else(|| {
+                let target_realm = cache.query_realm().unwrap_or_else(|| {
                     db.get_gmod_infer_index()
                         .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())
                 });
@@ -3901,7 +3971,7 @@ fn walk_antecedents_for_default(
         ),
         Some(FlowAntecedent::Multiple(idx)) => {
             if let Some(antecedents) = tree.get_multi_antecedents(*idx) {
-                let target_realm = cache.flow_query_realm.unwrap_or_else(|| {
+                let target_realm = cache.query_realm().unwrap_or_else(|| {
                     db.get_gmod_infer_index()
                         .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())
                 });
@@ -4031,7 +4101,7 @@ mod tests {
             VarRefId::GlobalName(ArcIntern::from(SmolStr::new("value")), TextSize::new(0));
         let query_realm = GmodRealm::Shared;
         let mut cache = LuaInferCache::new(file_id, Default::default());
-        cache.flow_query_realm = Some(query_realm);
+        cache.set_query_realm(Some(query_realm));
 
         for antecedent in [FlowId(0), FlowId(1)] {
             cache.set_flow_cache_with_origin(
@@ -4127,7 +4197,7 @@ mod tests {
             VarRefId::GlobalName(ArcIntern::from(SmolStr::new("value")), TextSize::new(0));
         let query_realm = GmodRealm::Shared;
         let mut cache = LuaInferCache::new(file_id, Default::default());
-        cache.flow_query_realm = Some(query_realm);
+        cache.set_query_realm(Some(query_realm));
         cache.set_flow_cache_with_origin(
             &var_ref_id,
             FlowId(0),

@@ -7,6 +7,7 @@
 //! facts whose fingerprint changed.
 
 mod diagnostic_reads;
+mod frames;
 mod graph;
 mod positions;
 
@@ -16,6 +17,12 @@ use rowan::{TextRange, TextSize};
 use rustc_hash::FxHashSet;
 
 pub use diagnostic_reads::DiagnosticReads;
+pub use frames::{
+    Gates, OpenFrame, Provenance, ScopeMark, check_tsc, close_frame, consult_absorbed,
+    consult_cycle, consult_gates, consult_realm, consult_scope, describe_reads, frame_depth,
+    new_stamp, note_written, open_frame, open_frame_absorbing, provenance_keys, report_frames,
+    reuse, scope_mark, taint, take_reused_across,
+};
 
 /// A value an analyzer derivation stores on the index without the index
 /// naming its type, fingerprinted on demand.
@@ -661,14 +668,19 @@ impl PartialOrd for DerivationId {
 #[derive(Debug)]
 pub struct Evaluation {
     pub id: DerivationId,
-    /// Reads interned in the lent [`KeyTable`], once each.
-    slots: Vec<KeyIdx>,
-    /// Marks the slots this evaluation recorded; see [`KeyTable::note_read`].
-    stamp: u32,
+    /// Reads interned in the lent [`KeyTable`], in order, once per open
+    /// frame: a frame's reads are the log from where it opened.
+    log: Vec<KeyIdx>,
+    /// The open frames, innermost last; see [`frames`].
+    frames: Vec<frames::Frame>,
+    /// The log as memos outliving the evaluation see it.
+    log_handle: std::sync::Arc<frames::LogHandle>,
+    /// The stamp the evaluation began under.
+    stamp: u64,
     /// Reads made while no key table is lent.
     reads: FxHashSet<HashedKey>,
     /// Cheap identities of keys already in `reads`, see [`note_read_by`].
-    read_identities: FxHashSet<(u8, u128)>,
+    read_identities: rustc_hash::FxHashMap<(u8, u128), KeyIdx>,
     outputs: FxHashSet<HashedKey>,
     /// Fingerprints taken when an earlier stage of a staged evaluation ended:
     /// other evaluations write between its stages.
@@ -719,9 +731,12 @@ impl Evaluation {
     /// was lent, and its outputs.
     #[allow(clippy::type_complexity)]
     pub fn into_recorded(self) -> (DerivationId, Vec<KeyIdx>, Vec<HashedKey>, Vec<HashedKey>) {
+        let mut slots = self.log;
+        slots.sort_unstable();
+        slots.dedup();
         (
             self.id,
-            self.slots,
+            slots,
             self.reads.into_iter().collect(),
             self.outputs.into_iter().collect(),
         )
@@ -737,7 +752,7 @@ impl Evaluation {
         Vec<(HashedKey, Option<Fingerprint>)>,
         Vec<HashedKey>,
     ) {
-        debug_assert!(self.slots.is_empty(), "interned reads need the key table");
+        debug_assert!(self.log.is_empty(), "interned reads need the key table");
         let outputs = self.outputs;
         let id = self.id;
         let reads = self
@@ -773,7 +788,8 @@ pub(crate) fn records_read(
 
 thread_local! {
     static KEYS: RefCell<Option<KeyTable>> = const { RefCell::new(None) };
-    static STAMP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static STAMP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static LAST_WRITE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CURRENT: RefCell<Option<Evaluation>> = const { RefCell::new(None) };
     /// Evaluations suspended on this thread by one begun inside them.
     static SUSPENDED: RefCell<Vec<Evaluation>> = const { RefCell::new(Vec::new()) };
@@ -831,23 +847,17 @@ pub fn forget_lent_keys() {
     KEYS.with(|keys| keys.borrow_mut().take());
 }
 
-fn next_stamp() -> u32 {
-    STAMP.with(|stamp| {
-        let next = stamp.get().wrapping_add(1).max(1);
-        stamp.set(next);
-        next
-    })
-}
-
 /// Starts recording the evaluation of `id` on this thread.
 pub fn begin(id: DerivationId) {
     let stamp = next_stamp();
     start(Evaluation {
         id,
-        slots: Vec::new(),
+        log: Vec::new(),
+        frames: Vec::new(),
+        log_handle: std::sync::Arc::new(frames::LogHandle(Default::default(), Some(id))),
         stamp,
         reads: FxHashSet::default(),
-        read_identities: FxHashSet::default(),
+        read_identities: rustc_hash::FxHashMap::default(),
         outputs: FxHashSet::default(),
         staged: rustc_hash::FxHashMap::default(),
     });
@@ -870,17 +880,21 @@ pub fn resume(mut evaluation: Evaluation) {
     // Stamps are per thread: one taken on another thread can name an
     // evaluation this thread already ran.
     evaluation.stamp = next_stamp();
+    // Identities noted without this thread's key table name no slot in it.
+    evaluation.read_identities.clear();
     start(evaluation);
 }
 
 /// Stops recording and hands back what the evaluation read and wrote.
 pub fn end() -> Evaluation {
-    CURRENT.with(|current| {
+    let evaluation = CURRENT.with(|current| {
         let mut current = current.borrow_mut();
         let evaluation = current.take().expect("derivation::end without begin");
         *current = SUSPENDED.with(|suspended| suspended.borrow_mut().pop());
         evaluation
-    })
+    });
+    evaluation.log_handle.freeze(&evaluation.log);
+    evaluation
 }
 
 /// Whether an evaluation is recording on this thread. Callers building a
@@ -904,17 +918,49 @@ pub fn note_read(key: impl FnOnce() -> FactKey) {
     });
 }
 
-fn record_read(evaluation: &mut Evaluation, key: HashedKey) {
+fn next_stamp() -> u64 {
+    STAMP.with(|stamp| {
+        let next = stamp.get() + 1;
+        stamp.set(next);
+        next
+    })
+}
+
+/// The stamp of the latest write an evaluation made on this thread.
+fn last_write() -> u64 {
+    LAST_WRITE.with(std::cell::Cell::get)
+}
+
+fn latest_stamp() -> u64 {
+    STAMP.with(std::cell::Cell::get)
+}
+
+impl Evaluation {
+    /// The stamp of the innermost open frame, or of the evaluation.
+    fn frame_stamp(&self) -> u64 {
+        self.frames.last().map_or(self.stamp, |frame| frame.stamp)
+    }
+
+    fn log_slot(&mut self, table: &mut KeyTable, slot: KeyIdx) {
+        if table.log(slot, self.frame_stamp(), latest_stamp()) {
+            self.log.push(slot);
+        }
+    }
+}
+
+/// Records a read of `key`, interned if a key table is lent. Returns its slot.
+fn record_read(evaluation: &mut Evaluation, key: HashedKey) -> Option<KeyIdx> {
     KEYS.with(|keys| match keys.borrow_mut().as_mut() {
         Some(table) => {
-            if let Some(slot) = table.note_read(key, evaluation.stamp) {
-                evaluation.slots.push(slot);
-            }
+            let slot = table.intern_read(key, evaluation.stamp);
+            evaluation.log_slot(table, slot);
+            Some(slot)
         }
         None => {
             evaluation.reads.insert(key);
+            None
         }
-    });
+    })
 }
 
 /// Records a read of `key`, which `identity` names exactly: a repeat within
@@ -928,8 +974,19 @@ fn note_read_by(identity: (u8, u128), key: impl FnOnce() -> FactKey) {
     CURRENT.with(|current| {
         if let Some(evaluation) = current.borrow_mut().as_mut() {
             NOTED_READS.with(|count| count.set(count.get() + 1));
-            if evaluation.read_identities.insert(identity) {
-                record_read(evaluation, HashedKey::new(key()));
+            match evaluation.read_identities.get(&identity).copied() {
+                Some(slot) => KEYS.with(|keys| {
+                    if let Some(table) = keys.borrow_mut().as_mut() {
+                        evaluation.log_slot(table, slot);
+                    }
+                }),
+                None => {
+                    if let Some(slot) = record_read(evaluation, HashedKey::new(key())) {
+                        evaluation.read_identities.insert(identity, slot);
+                    } else {
+                        evaluation.read_identities.insert(identity, KeyIdx::MAX);
+                    }
+                }
             }
         }
     });
@@ -1056,11 +1113,18 @@ pub fn note_write(key: impl FnOnce() -> FactKey) {
             let read_here = KEYS.with(|keys| {
                 keys.borrow()
                     .as_ref()
-                    .is_none_or(|table| table.stamped(&key, evaluation.stamp))
+                    .is_none_or(|table| table.logged_since(&key, evaluation.stamp))
             });
             if read_here {
                 WRITE_GENERATION.with(|generation| generation.set(generation.get() + 1));
             }
+            let written = next_stamp();
+            LAST_WRITE.with(|last| last.set(written));
+            KEYS.with(|keys| {
+                if let Some(table) = keys.borrow_mut().as_mut() {
+                    table.mark_written(&key, written);
+                }
+            });
             evaluation.outputs.insert(key);
         } else {
             CAPTURED.with(|captured| {

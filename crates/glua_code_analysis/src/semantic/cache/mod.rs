@@ -1,4 +1,5 @@
 mod cache_options;
+mod tracked;
 
 pub use cache_options::{CacheOptions, LuaAnalysisPhase};
 use glua_parser::LuaSyntaxId;
@@ -7,7 +8,9 @@ use rowan::{TextRange, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 use std::{collections::HashSet, sync::Arc};
+pub use tracked::{Lookup, TrackedMap, Untracked};
 
+use crate::db_index::derivation::{self, Gates, OpenFrame, Provenance};
 use crate::{
     DbIndex, FileId, FlowId, GmodRealm, InFiled, LuaDeclId, LuaFunctionType, LuaMemberId,
     LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, VarRefId, VarRefRootId,
@@ -18,7 +21,31 @@ use crate::{
     },
 };
 
+const DYNAMIC_FIELDS_GATE: Gates = 1;
+const CALL_SITE_PARAMS_GATE: Gates = 2;
+/// Whether a region-aware `self` seed is in effect.
+const SELF_SEED_GATE: Gates = 4;
+/// Whether some index ref's walk has an origin set.
+const INDEX_ORIGIN_GATE: Gates = 8;
+
 pub type FlowCacheInnerKey = (FlowId, GmodRealm, FlowOrigin);
+
+trait IsEmpty {
+    fn is_empty(&self) -> bool;
+}
+
+impl<K, V, S> IsEmpty for std::collections::HashMap<K, V, S> {
+    fn is_empty(&self) -> bool {
+        std::collections::HashMap::is_empty(self)
+    }
+}
+
+impl<K, S> IsEmpty for std::collections::HashSet<K, S> {
+    fn is_empty(&self) -> bool {
+        std::collections::HashSet::is_empty(self)
+    }
+}
+pub type FlowEntries = TrackedMap<FlowCacheInnerKey, CacheEntry<Arc<LuaType>>>;
 
 /// The syntax-derived facts about one dynamic-field definition site.
 ///
@@ -106,7 +133,10 @@ impl GenericCallBindings {
 pub struct LuaInferCache {
     file_id: FileId,
     config: CacheOptions,
-    pub expr_cache: FxHashMap<LuaSyntaxId, CacheEntry<LuaType>>,
+    pub expr_cache: TrackedMap<LuaSyntaxId, CacheEntry<LuaType>>,
+    /// Expressions being inferred, and where each began: reaching one again
+    /// is a recursion cut.
+    pub(crate) expr_in_progress: FxHashMap<LuaSyntaxId, derivation::ScopeMark>,
     /// Call-site function resolution, keyed by the cheap syntax identity.
     ///
     /// The previous key hashed the whole prefix `LuaType` on every call, even
@@ -117,14 +147,23 @@ pub struct LuaInferCache {
     /// per-site bucket by equality instead. Buckets stay tiny (one entry for
     /// almost every call site), lookup order never affects the answer, and the
     /// `Ready` recursion guard keeps its per-type granularity.
-    pub call_cache:
+    #[allow(clippy::type_complexity)]
+    pub call_cache: FxHashMap<
+        (LuaSyntaxId, Option<usize>),
+        Vec<(LuaType, CacheEntry<Arc<LuaFunctionType>>, Provenance)>,
+    >,
+    /// Call resolutions only the evaluation that made them may use.
+    #[allow(clippy::type_complexity)]
+    call_cache_local:
         FxHashMap<(LuaSyntaxId, Option<usize>), Vec<(LuaType, CacheEntry<Arc<LuaFunctionType>>)>>,
     pub call_arg_types_cache:
-        FxHashMap<(LuaSyntaxId, Option<usize>), Arc<Vec<(LuaType, TextRange)>>>,
-    pub generic_call_bindings: FxHashMap<LuaSyntaxId, GenericCallBindings>,
-    pub flow_node_cache:
-        FxHashMap<VarRefCacheKey, FxHashMap<FlowCacheInnerKey, CacheEntry<Arc<LuaType>>>>,
-    pub flow_query_realm: Option<GmodRealm>,
+        TrackedMap<(LuaSyntaxId, Option<usize>), Arc<Vec<(LuaType, TextRange)>>>,
+    pub generic_call_bindings: Untracked<FxHashMap<LuaSyntaxId, GenericCallBindings>>,
+    pub flow_node_cache: FxHashMap<VarRefCacheKey, FlowEntries>,
+    /// Var refs whose flow entries include some only this evaluation may use.
+    flow_local_keys: Vec<VarRefCacheKey>,
+    /// The realm flow queries inherit, and the frame depth its scope began at.
+    flow_query_realm: Option<(GmodRealm, u32)>,
     /// Scratch memo for one top-level closure-baseline query. Without it that
     /// walk re-derives each merge point once per path into it.
     ///
@@ -133,7 +172,9 @@ pub struct LuaInferCache {
     /// must never answer a later query.
     pub baseline_flow_memo: FxHashMap<(VarRefCacheKey, FlowCacheInnerKey), LuaType>,
     pub baseline_flow_depth: u32,
-    pub flow_node_realm_cache: FxHashMap<FlowId, GmodRealm>,
+    /// Where the outermost closure-baseline query began.
+    pub(crate) baseline_scope: derivation::ScopeMark,
+    pub flow_node_realm_cache: TrackedMap<FlowId, GmodRealm>,
     /// Whether the numeric-index fast path applies to a var ref, keyed by the
     /// var ref plus the realm the query runs under (the index-key probe goes
     /// through `infer_expr`, which is realm sensitive).
@@ -141,12 +182,12 @@ pub struct LuaInferCache {
     /// Derives from the immutable decl initializer plus inference results, so
     /// it is dropped wherever `expr_cache` is dropped.
     pub numeric_table_index_query_cache:
-        FxHashMap<(VarRefCacheKey, Option<GmodRealm>), Option<(VarRefRootId, i64)>>,
+        TrackedMap<(VarRefCacheKey, Option<GmodRealm>), Option<(VarRefRootId, i64)>>,
     /// Result of the unambiguous-integer-const scan, keyed by name and the
     /// read position. The scan walks the whole decl tree, so each distinct
     /// (name, position) pays it at most once per inference wave. Dropped
     /// wherever `expr_cache` is dropped: the scanned types settle over waves.
-    pub unambiguous_int_const_cache: FxHashMap<(SmolStr, TextSize), Option<i64>>,
+    pub unambiguous_int_const_cache: Untracked<FxHashMap<(SmolStr, TextSize), Option<i64>>>,
     /// Lazily built per-file `name -> decls` lookup feeding the scan above.
     /// One decl-tree walk per wave instead of one per distinct (name,
     /// position) query. Derives only from the immutable decl tree, so it is
@@ -158,7 +199,7 @@ pub struct LuaInferCache {
     ///
     /// Pure syntax plus the immutable flow index, so it survives deferred and
     /// unresolve clearing like the other structural caches.
-    pub branch_special_call_effect_cache: FxHashMap<(FlowId, FlowId, VarRefCacheKey), bool>,
+    pub branch_special_call_effect_cache: TrackedMap<(FlowId, FlowId, VarRefCacheKey), bool>,
     /// Scratch `visited_flow_ids` buffer for the flow walk. Taken at the top
     /// of a walk and returned afterwards so repeated walks reuse one
     /// allocation. Walks nest (a merge point re-enters through
@@ -166,16 +207,20 @@ pub struct LuaInferCache {
     /// is set a nested walk uses a throwaway buffer instead.
     pub flow_walk_scratch: Vec<FlowId>,
     pub(crate) flow_walk_scratch_in_use: bool,
-    pub index_ref_origin_type_cache: FxHashMap<VarRefCacheKey, CacheEntry<LuaType>>,
-    pub param_type_cache: FxHashMap<LuaDeclId, CacheEntry<LuaType>>,
-    pub(crate) param_type_source_cache: FxHashMap<LuaDeclId, CacheEntry<ParamInferenceSource>>,
-    pub expr_var_ref_id_cache: FxHashMap<LuaSyntaxId, VarRefId>,
-    pub narrow_by_literal_stop_position_cache: HashSet<LuaSyntaxId>,
+    /// The origin type flow walks of an index ref start from, and where the
+    /// caller that set it began.
+    pub index_ref_origin_type_cache:
+        FxHashMap<VarRefCacheKey, (CacheEntry<LuaType>, derivation::ScopeMark)>,
+    pub param_type_cache: Untracked<FxHashMap<LuaDeclId, CacheEntry<LuaType>>>,
+    pub(crate) param_type_source_cache:
+        Untracked<FxHashMap<LuaDeclId, CacheEntry<ParamInferenceSource>>>,
+    pub expr_var_ref_id_cache: TrackedMap<LuaSyntaxId, VarRefId>,
+    pub narrow_by_literal_stop_position_cache: Untracked<HashSet<LuaSyntaxId>>,
     pub scripted_global_singleton_type_cache: Option<FxHashMap<String, LuaTypeDeclId>>,
     /// Cache for `self` type per enclosing method (keyed by LuaFuncStat syntax_id).
     /// Avoids repeated ancestor walks and type resolution for each `self` reference
     /// within the same method body.
-    pub self_type_cache: FxHashMap<LuaSyntaxId, Option<LuaType>>,
+    pub self_type_cache: TrackedMap<LuaSyntaxId, Option<LuaType>>,
     /// Region-aware base type seed for an implicit `self` flow query, set by
     /// `infer_self` for the duration of a single `infer_expr_narrow_type_with_self_base`
     /// call. When the flow walk reaches the origin for the matching `SelfRef`,
@@ -183,22 +228,29 @@ pub struct LuaInferCache {
     /// receiver decl/member cache, so reused locals resolve `self` per region
     /// while still going through the normal narrowing pipeline.
     pub self_base_seed: Option<(VarRefId, LuaType)>,
+    /// Where `self_base_seed`'s scope began.
+    pub(crate) self_base_seed_mark: derivation::ScopeMark,
+    /// Flow entries of a reference walked from a given origin — a `self`
+    /// seed or an index ref's member type — by that origin: they hold for it
+    /// alone.
+    keyed_flow_node_cache: FxHashMap<(VarRefCacheKey, LuaType), FlowEntries>,
     /// Cache for `find_decl` results so that multiple diagnostic checkers
     /// processing the same file don't redo the full member-resolution chain.
-    pub decl_cache: FxHashMap<LuaSyntaxId, Option<LuaSemanticDeclId>>,
+    pub decl_cache: Untracked<FxHashMap<LuaSyntaxId, Option<LuaSemanticDeclId>>>,
     /// Cache for resolved generic-for variable types. For `pairs` loops over
     /// templated tables, each use of the loop value can otherwise re-run the
     /// full iterator inference from the enclosing `for` statement.
-    pub for_range_iter_var_type_cache: FxHashMap<LuaDeclId, CacheEntry<LuaType>>,
+    pub for_range_iter_var_type_cache: Untracked<FxHashMap<LuaDeclId, CacheEntry<LuaType>>>,
     /// Cache for the in-place `ipairs` transform recogniser, keyed by the array
     /// local's declaration. `None` means the block holds no such transform loop;
     /// `Some((loop_end, element_type))` records where the transform completes and
     /// the element type it leaves, so a read is answered without re-scanning the
     /// declaration's block each time.
-    pub in_place_ipairs_transform_cache: FxHashMap<LuaDeclId, Option<(TextSize, LuaType)>>,
+    pub in_place_ipairs_transform_cache:
+        Untracked<FxHashMap<LuaDeclId, Option<(TextSize, LuaType)>>>,
     pub dynamic_field_scope_metatable_cache:
-        FxHashMap<TextRange, FxHashMap<VarRefId, Vec<(TextRange, LuaType)>>>,
-    pub dynamic_field_resolution_cache: FxHashMap<
+        Untracked<FxHashMap<TextRange, FxHashMap<VarRefId, Vec<(TextRange, LuaType)>>>>,
+    pub dynamic_field_resolution_cache: TrackedMap<
         (LuaType, LuaMemberKey, Option<TextSize>),
         Option<(LuaType, Option<LuaSemanticDeclId>)>,
     >,
@@ -209,15 +261,17 @@ pub struct LuaInferCache {
     /// comes only from offset visibility, which the position and cutoff in the
     /// key capture. Derived from member/type/realm index state, so it is
     /// dropped wherever expression inference results are dropped.
-    pub owner_raw_member_type_cache: FxHashMap<
-        (
-            LuaMemberOwner,
-            LuaMemberKey,
-            FileId,
-            Option<TextSize>,
-            Option<InFiled<TextSize>>,
-        ),
-        Result<LuaType, InferFailReason>,
+    pub owner_raw_member_type_cache: Untracked<
+        FxHashMap<
+            (
+                LuaMemberOwner,
+                LuaMemberKey,
+                FileId,
+                Option<TextSize>,
+                Option<InFiled<TextSize>>,
+            ),
+            Result<LuaType, InferFailReason>,
+        >,
     >,
     /// Memo for `local_class_table_member_ids`, keyed by class and member key.
     /// Each entry carries the `DbIndex::type_structure_revision` it was built
@@ -229,11 +283,13 @@ pub struct LuaInferCache {
     /// synthetic decl only becomes relevant after a type-index bind that
     /// bumps the revision.
     pub local_class_table_member_ids_cache:
-        FxHashMap<(LuaTypeDeclId, LuaMemberKey), (u64, Arc<Vec<LuaMemberId>>)>,
-    pub dynamic_field_type_cache: FxHashMap<LuaMemberId, Option<LuaType>>,
+        TrackedMap<(LuaTypeDeclId, LuaMemberKey), (u64, Arc<Vec<LuaMemberId>>)>,
+    pub dynamic_field_type_cache: TrackedMap<LuaMemberId, Option<LuaType>>,
     pub dynamic_field_definition_syntax_cache:
-        FxHashMap<InFiled<TextRange>, DynamicFieldDefinitionSyntax>,
-    pub dynamic_field_resolving: HashSet<LuaMemberId>,
+        TrackedMap<InFiled<TextRange>, DynamicFieldDefinitionSyntax>,
+    /// Dynamic fields being resolved, and where each began: a read of one is a
+    /// recursion cut.
+    pub dynamic_field_resolving: FxHashMap<LuaMemberId, derivation::ScopeMark>,
     pub vgui_parent_fallback_calls: FxHashSet<LuaSyntaxId>,
     /// `GetParent` reads answered *through* a resolved vgui parent chain.
     ///
@@ -249,11 +305,11 @@ pub struct LuaInferCache {
     /// this of every call node it reaches, and answering means resolving what
     /// the call targets through the reference, property, member and signature
     /// indexes.
-    pub call_returns_never_cache: FxHashMap<LuaSyntaxId, bool>,
+    pub call_returns_never_cache: TrackedMap<LuaSyntaxId, bool>,
     /// Whether a call site's signature is generic, keyed by the call
     /// expression. Consulted per call-site during inference, so re-inferring
     /// the call prefix each time is avoided.
-    pub signature_is_generic_cache: FxHashMap<LuaSyntaxId, Option<bool>>,
+    pub signature_is_generic_cache: Untracked<FxHashMap<LuaSyntaxId, Option<bool>>>,
 }
 
 impl LuaInferCache {
@@ -261,44 +317,50 @@ impl LuaInferCache {
         Self {
             file_id,
             config,
-            expr_cache: FxHashMap::default(),
-            call_cache: FxHashMap::default(),
-            call_arg_types_cache: FxHashMap::default(),
-            flow_node_cache: FxHashMap::default(),
+            expr_cache: Default::default(),
+            expr_in_progress: Default::default(),
+            call_cache: Default::default(),
+            call_cache_local: Default::default(),
+            call_arg_types_cache: Default::default(),
+            flow_node_cache: Default::default(),
+            flow_local_keys: Vec::new(),
             flow_query_realm: None,
-            baseline_flow_memo: FxHashMap::default(),
+            baseline_flow_memo: Default::default(),
             baseline_flow_depth: 0,
-            flow_node_realm_cache: FxHashMap::default(),
-            numeric_table_index_query_cache: FxHashMap::default(),
-            unambiguous_int_const_cache: FxHashMap::default(),
+            baseline_scope: derivation::ScopeMark::default(),
+            flow_node_realm_cache: Default::default(),
+            numeric_table_index_query_cache: Default::default(),
+            unambiguous_int_const_cache: Default::default(),
             decl_name_index: None,
-            branch_special_call_effect_cache: FxHashMap::default(),
+            branch_special_call_effect_cache: Default::default(),
             flow_walk_scratch: Vec::new(),
             flow_walk_scratch_in_use: false,
-            index_ref_origin_type_cache: FxHashMap::default(),
-            param_type_cache: FxHashMap::default(),
-            param_type_source_cache: FxHashMap::default(),
-            expr_var_ref_id_cache: FxHashMap::default(),
-            narrow_by_literal_stop_position_cache: HashSet::default(),
+            index_ref_origin_type_cache: Default::default(),
+            param_type_cache: Default::default(),
+            param_type_source_cache: Default::default(),
+            expr_var_ref_id_cache: Default::default(),
+            narrow_by_literal_stop_position_cache: Default::default(),
             scripted_global_singleton_type_cache: None,
-            self_type_cache: FxHashMap::default(),
+            self_type_cache: Default::default(),
             self_base_seed: None,
-            decl_cache: FxHashMap::default(),
-            for_range_iter_var_type_cache: FxHashMap::default(),
-            in_place_ipairs_transform_cache: FxHashMap::default(),
-            dynamic_field_scope_metatable_cache: FxHashMap::default(),
-            dynamic_field_resolution_cache: FxHashMap::default(),
-            owner_raw_member_type_cache: FxHashMap::default(),
-            local_class_table_member_ids_cache: FxHashMap::default(),
-            dynamic_field_type_cache: FxHashMap::default(),
-            dynamic_field_definition_syntax_cache: FxHashMap::default(),
-            dynamic_field_resolving: HashSet::default(),
-            vgui_parent_fallback_calls: FxHashSet::default(),
-            vgui_parent_chain_calls: FxHashSet::default(),
-            local_function_call_sites_cache: FxHashMap::default(),
-            call_returns_never_cache: FxHashMap::default(),
-            signature_is_generic_cache: FxHashMap::default(),
-            generic_call_bindings: FxHashMap::default(),
+            self_base_seed_mark: derivation::ScopeMark::default(),
+            keyed_flow_node_cache: Default::default(),
+            decl_cache: Default::default(),
+            for_range_iter_var_type_cache: Default::default(),
+            in_place_ipairs_transform_cache: Default::default(),
+            dynamic_field_scope_metatable_cache: Default::default(),
+            dynamic_field_resolution_cache: Default::default(),
+            owner_raw_member_type_cache: Default::default(),
+            local_class_table_member_ids_cache: Default::default(),
+            dynamic_field_type_cache: Default::default(),
+            dynamic_field_definition_syntax_cache: Default::default(),
+            dynamic_field_resolving: Default::default(),
+            vgui_parent_fallback_calls: Default::default(),
+            vgui_parent_chain_calls: Default::default(),
+            local_function_call_sites_cache: Default::default(),
+            call_returns_never_cache: Default::default(),
+            signature_is_generic_cache: Default::default(),
+            generic_call_bindings: Default::default(),
         }
     }
 
@@ -312,6 +374,86 @@ impl LuaInferCache {
 
     pub fn get_file_id(&self) -> FileId {
         self.file_id
+    }
+
+    /// An empty cache inferring under the same view and scoped context.
+    pub fn fork_fresh(&self) -> Self {
+        let mut fresh = Self::new(self.file_id, self.config.clone());
+        fresh.flow_query_realm = self.flow_query_realm;
+        fresh.self_base_seed = self.self_base_seed.clone();
+        fresh.self_base_seed_mark = self.self_base_seed_mark;
+        fresh.index_ref_origin_type_cache = self.index_ref_origin_type_cache.clone();
+        fresh
+    }
+
+    /// The view gates this cache infers under.
+    fn view_gates(&self) -> Gates {
+        u8::from(self.config.dynamic_fields_visible) * DYNAMIC_FIELDS_GATE
+            | u8::from(self.config.call_site_params_visible) * CALL_SITE_PARAMS_GATE
+            | u8::from(self.self_base_seed.is_some()) * SELF_SEED_GATE
+            | u8::from(!self.index_ref_origin_type_cache.is_empty()) * INDEX_ORIGIN_GATE
+    }
+
+    /// What a tracked lookup is made under now.
+    pub fn lookup(&self) -> Lookup {
+        Lookup {
+            gates: self.view_gates(),
+            realm: self.flow_query_realm,
+        }
+    }
+
+    /// Closes a frame opened for a memo miss: what the value was computed
+    /// from, or `None` when it stays with this evaluation.
+    #[track_caller]
+    pub fn close_frame(&self, frame: Option<OpenFrame>) -> Option<Provenance> {
+        derivation::close_frame(frame?, self.view_gates())
+    }
+
+    /// The realm flow queries inherit, if one is set.
+    pub fn query_realm(&self) -> Option<GmodRealm> {
+        match self.flow_query_realm {
+            Some((realm, base)) => {
+                derivation::consult_realm(Some(realm), base);
+                Some(realm)
+            }
+            None => {
+                derivation::consult_realm(None, 0);
+                None
+            }
+        }
+    }
+
+    /// Sets the realm nested flow queries inherit; hand the result back to
+    /// [`Self::restore_query_realm`].
+    pub fn set_query_realm(&mut self, realm: Option<GmodRealm>) -> Option<(GmodRealm, u32)> {
+        let depth = derivation::frame_depth();
+        std::mem::replace(
+            &mut self.flow_query_realm,
+            realm.map(|realm| (realm, depth)),
+        )
+    }
+
+    pub fn restore_query_realm(&mut self, previous: Option<(GmodRealm, u32)>) {
+        self.flow_query_realm = previous;
+    }
+
+    /// Notes that an implicit `self` was resolved, which reads whether a
+    /// region-aware seed is in effect.
+    pub fn consult_self_seed(&self) {
+        derivation::consult_gates(SELF_SEED_GATE);
+    }
+
+    /// Whether dynamic fields are visible, noting the gate consulted.
+    pub fn dynamic_fields_visible(&self) -> bool {
+        derivation::consult_gates(DYNAMIC_FIELDS_GATE);
+        self.config.dynamic_fields_visible
+    }
+
+    /// Whether call-site parameter facts are visible, noting the gate
+    /// consulted.
+    pub fn call_site_params_visible(&self) -> bool {
+        derivation::consult_gates(CALL_SITE_PARAMS_GATE);
+        self.config.call_site_params_visible
     }
 
     /// Presize the maps the file walk and the deferred waves fill, from the
@@ -336,16 +478,56 @@ impl LuaInferCache {
         self.for_range_iter_var_type_cache.reserve(entries / 16);
     }
 
+    /// The value `map` holds for `key` if it holds now, recording what it was
+    /// computed from.
+    #[track_caller]
+    pub fn tracked_get<K: std::hash::Hash + Eq, V: Clone>(
+        &mut self,
+        map: fn(&mut Self) -> &mut TrackedMap<K, V>,
+        key: &K,
+    ) -> Option<V> {
+        let lookup = self.lookup();
+        map(self).get(key, lookup).cloned()
+    }
+
+    /// Closes `frame` and stores the value computed in it.
+    #[track_caller]
+    pub fn tracked_insert<K: std::hash::Hash + Eq, V>(
+        &mut self,
+        map: fn(&mut Self) -> &mut TrackedMap<K, V>,
+        key: K,
+        value: V,
+        frame: Option<OpenFrame>,
+    ) {
+        let provenance = self.close_frame(frame);
+        map(self).insert(key, value, provenance);
+    }
+
+    /// Runs `f` inferring under `config`: memos made under another view are
+    /// kept only where tracked, and checked against the view they consulted.
+    pub fn with_config<T>(&mut self, config: CacheOptions, f: impl FnOnce(&mut Self) -> T) -> T {
+        let previous = std::mem::replace(&mut self.config, config);
+        self.clear();
+        let result = f(self);
+        self.clear();
+        self.config = previous;
+        result
+    }
+
     pub fn set_phase(&mut self, phase: LuaAnalysisPhase) {
         self.config.analysis_phase = phase;
     }
 
+    /// Records the bindings a generic call resolved with, for the statement
+    /// walk to read back: a side channel, so a memo computed through it is
+    /// not reusable without it.
     pub fn record_generic_call_bindings(
         &mut self,
         syntax_id: LuaSyntaxId,
         bindings: Vec<FuncGenericBinding>,
     ) {
-        match self.generic_call_bindings.entry(syntax_id) {
+        derivation::taint();
+        match self.generic_call_bindings.0.entry(syntax_id) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 entry.get_mut().record(bindings);
             }
@@ -382,45 +564,58 @@ impl LuaInferCache {
         }
     }
 
+    /// Drops every memo a write may have made stale. Tracked entries stay:
+    /// each is checked against its reads when next used.
     pub fn clear(&mut self) {
-        self.expr_cache.clear();
-        self.call_cache.clear();
-        self.call_arg_types_cache.clear();
-        self.generic_call_bindings.clear();
-        self.flow_node_cache.clear();
+        fn empty<M: Default + IsEmpty>(map: &mut M) {
+            if !map.is_empty() {
+                *map = M::default();
+            }
+        }
+        self.expr_cache.clear_local();
+        empty(&mut self.expr_in_progress);
+        self.expr_var_ref_id_cache.clear_local();
+        self.call_returns_never_cache.clear_local();
+        self.local_class_table_member_ids_cache.clear_local();
+        self.dynamic_field_resolution_cache.clear_local();
+        self.flow_node_realm_cache.clear_local();
+        self.numeric_table_index_query_cache.clear_local();
+        self.branch_special_call_effect_cache.clear_local();
+        for key in self.flow_local_keys.drain(..) {
+            if let Some(entries) = self.flow_node_cache.get_mut(&key) {
+                entries.clear_local();
+            }
+        }
+        empty(&mut self.call_cache_local);
+        self.call_arg_types_cache.clear_local();
+        empty(&mut self.generic_call_bindings.0);
         self.flow_query_realm = None;
-        self.baseline_flow_memo.clear();
+        empty(&mut self.baseline_flow_memo);
         self.baseline_flow_depth = 0;
-        self.flow_node_realm_cache.clear();
-        self.numeric_table_index_query_cache.clear();
-        self.unambiguous_int_const_cache.clear();
+        empty(&mut self.unambiguous_int_const_cache.0);
         self.decl_name_index = None;
-        self.branch_special_call_effect_cache.clear();
         self.flow_walk_scratch.clear();
         self.flow_walk_scratch_in_use = false;
-        self.index_ref_origin_type_cache.clear();
-        self.param_type_cache.clear();
-        self.param_type_source_cache.clear();
-        self.expr_var_ref_id_cache.clear();
-        self.narrow_by_literal_stop_position_cache.clear();
+        empty(&mut self.index_ref_origin_type_cache);
+        empty(&mut self.param_type_cache.0);
+        empty(&mut self.param_type_source_cache.0);
+        empty(&mut self.narrow_by_literal_stop_position_cache.0);
         self.scripted_global_singleton_type_cache = None;
-        self.self_type_cache.clear();
+        self.self_type_cache.clear_local();
         self.self_base_seed = None;
-        self.decl_cache.clear();
-        self.for_range_iter_var_type_cache.clear();
-        self.in_place_ipairs_transform_cache.clear();
-        self.dynamic_field_scope_metatable_cache.clear();
-        self.dynamic_field_resolution_cache.clear();
-        self.owner_raw_member_type_cache.clear();
-        self.local_class_table_member_ids_cache.clear();
-        self.dynamic_field_type_cache.clear();
-        self.dynamic_field_definition_syntax_cache.clear();
-        self.dynamic_field_resolving.clear();
-        self.vgui_parent_fallback_calls.clear();
-        self.vgui_parent_chain_calls.clear();
-        self.local_function_call_sites_cache.clear();
-        self.call_returns_never_cache.clear();
-        self.signature_is_generic_cache.clear();
+
+        empty(&mut self.decl_cache.0);
+        empty(&mut self.for_range_iter_var_type_cache.0);
+        empty(&mut self.in_place_ipairs_transform_cache.0);
+        empty(&mut self.dynamic_field_scope_metatable_cache.0);
+        empty(&mut self.owner_raw_member_type_cache.0);
+        self.dynamic_field_type_cache.clear_local();
+        self.dynamic_field_definition_syntax_cache.clear_local();
+        empty(&mut self.dynamic_field_resolving);
+        empty(&mut self.vgui_parent_fallback_calls);
+        empty(&mut self.vgui_parent_chain_calls);
+        empty(&mut self.local_function_call_sites_cache);
+        empty(&mut self.signature_is_generic_cache.0);
     }
 
     /// Discards the inference a wave of deferred resolution can have
@@ -428,6 +623,7 @@ impl LuaInferCache {
     pub fn clear_deferred_inference_results(&mut self) {
         self.expr_cache.clear();
         self.call_cache.clear();
+        self.call_cache_local.clear();
         self.call_arg_types_cache.clear();
         self.numeric_table_index_query_cache.clear();
         self.unambiguous_int_const_cache.clear();
@@ -462,6 +658,7 @@ impl LuaInferCache {
     pub fn clear_for_unresolve(&mut self, db: &DbIndex) {
         self.expr_cache.clear();
         self.call_cache.clear();
+        self.call_cache_local.clear();
         self.call_arg_types_cache.clear();
         self.numeric_table_index_query_cache.clear();
         self.unambiguous_int_const_cache.clear();
@@ -498,7 +695,7 @@ impl LuaInferCache {
     }
 
     pub fn get_flow_cache(
-        &self,
+        &mut self,
         var_ref_id: &VarRefId,
         flow_id: FlowId,
         query_realm: GmodRealm,
@@ -507,16 +704,14 @@ impl LuaInferCache {
     }
 
     pub fn get_flow_cache_with_origin(
-        &self,
+        &mut self,
         var_ref_id: &VarRefId,
         flow_id: FlowId,
         query_realm: GmodRealm,
         origin: FlowOrigin,
     ) -> Option<&CacheEntry<Arc<LuaType>>> {
         let cache_key = VarRefCacheKey::from(var_ref_id);
-        self.flow_node_cache
-            .get(&cache_key)
-            .and_then(|by_flow| by_flow.get(&(flow_id, query_realm, origin)))
+        self.get_flow_cache_with_origin_by_key(&cache_key, flow_id, query_realm, origin)
     }
 
     pub fn set_flow_cache(
@@ -538,19 +733,28 @@ impl LuaInferCache {
         entry: CacheEntry<Arc<LuaType>>,
     ) {
         let cache_key = VarRefCacheKey::from(var_ref_id);
-        self.set_flow_cache_with_origin_by_key(&cache_key, flow_id, query_realm, origin, entry);
+        self.set_flow_cache_with_origin_by_key(
+            &cache_key,
+            flow_id,
+            query_realm,
+            origin,
+            entry,
+            None,
+        );
     }
 
+    #[track_caller]
     pub fn get_flow_cache_with_origin_by_key(
-        &self,
+        &mut self,
         cache_key: &VarRefCacheKey,
         flow_id: FlowId,
         query_realm: GmodRealm,
         origin: FlowOrigin,
     ) -> Option<&CacheEntry<Arc<LuaType>>> {
+        let lookup = self.lookup();
         self.flow_node_cache
-            .get(cache_key)
-            .and_then(|by_flow| by_flow.get(&(flow_id, query_realm, origin)))
+            .get_mut(cache_key)?
+            .get(&(flow_id, query_realm, origin), lookup)
     }
 
     pub fn set_flow_cache_with_origin_by_key(
@@ -560,11 +764,15 @@ impl LuaInferCache {
         query_realm: GmodRealm,
         origin: FlowOrigin,
         entry: CacheEntry<Arc<LuaType>>,
+        provenance: Option<Provenance>,
     ) {
+        if provenance.is_none() {
+            self.flow_local_keys.push(cache_key.clone());
+        }
         self.flow_node_cache
             .entry(cache_key.clone())
             .or_default()
-            .insert((flow_id, query_realm, origin), entry);
+            .insert((flow_id, query_realm, origin), entry, provenance);
     }
 
     pub(crate) fn set_flow_cache_batch_with_origin_by_key(
@@ -575,12 +783,20 @@ impl LuaInferCache {
         query_realm: GmodRealm,
         origin: FlowOrigin,
         entry: CacheEntry<Arc<LuaType>>,
+        provenance: Option<Provenance>,
     ) {
+        if provenance.is_none() {
+            self.flow_local_keys.push(cache_key.clone());
+        }
         let by_flow = self.flow_node_cache.entry(cache_key.clone()).or_default();
         for visited_flow_id in visited_flow_ids {
-            by_flow.insert((*visited_flow_id, query_realm, origin), entry.clone());
+            by_flow.insert(
+                (*visited_flow_id, query_realm, origin),
+                entry.clone(),
+                provenance.clone(),
+            );
         }
-        by_flow.insert((flow_id, query_realm, origin), entry);
+        by_flow.insert((flow_id, query_realm, origin), entry, provenance);
     }
 
     /// Takes the reusable flow-walk scratch buffer. Walks nest through merge
@@ -603,17 +819,30 @@ impl LuaInferCache {
         }
     }
 
+    #[track_caller]
     pub fn get_call_func_cache(
-        &self,
+        &mut self,
         syntax_id: LuaSyntaxId,
         args_count: Option<usize>,
         call_expr_type: &LuaType,
-    ) -> Option<&CacheEntry<Arc<LuaFunctionType>>> {
-        self.call_cache
-            .get(&(syntax_id, args_count))?
-            .iter()
-            .find(|(ty, _)| ty == call_expr_type)
-            .map(|(_, entry)| entry)
+    ) -> Option<CacheEntry<Arc<LuaFunctionType>>> {
+        let key = (syntax_id, args_count);
+        if let Some((_, entry)) = self
+            .call_cache_local
+            .get(&key)
+            .and_then(|bucket| bucket.iter().find(|(ty, _)| ty == call_expr_type))
+        {
+            derivation::taint();
+            return Some(entry.clone());
+        }
+        let lookup = self.lookup();
+        let bucket = self.call_cache.get_mut(&key)?;
+        let at = bucket.iter().position(|(ty, _, _)| ty == call_expr_type)?;
+        if !derivation::reuse(&bucket[at].2, lookup.gates, lookup.realm) {
+            bucket.swap_remove(at);
+            return None;
+        }
+        Some(bucket[at].1.clone())
     }
 
     pub fn insert_call_func_cache(
@@ -622,12 +851,24 @@ impl LuaInferCache {
         args_count: Option<usize>,
         call_expr_type: LuaType,
         entry: CacheEntry<Arc<LuaFunctionType>>,
+        provenance: Option<Provenance>,
     ) {
-        let bucket = self.call_cache.entry((syntax_id, args_count)).or_default();
-        if let Some(slot) = bucket.iter_mut().find(|(ty, _)| *ty == call_expr_type) {
-            *slot = (call_expr_type, entry);
-        } else {
-            bucket.push((call_expr_type, entry));
+        let key = (syntax_id, args_count);
+        let Some(provenance) = provenance else {
+            let bucket = self.call_cache_local.entry(key).or_default();
+            match bucket.iter_mut().find(|(ty, _)| *ty == call_expr_type) {
+                Some(slot) => *slot = (call_expr_type, entry),
+                None => bucket.push((call_expr_type, entry)),
+            }
+            return;
+        };
+        if let Some(bucket) = self.call_cache_local.get_mut(&key) {
+            bucket.retain(|(ty, _)| *ty != call_expr_type);
+        }
+        let bucket = self.call_cache.entry(key).or_default();
+        match bucket.iter_mut().find(|(ty, _, _)| *ty == call_expr_type) {
+            Some(slot) => *slot = (call_expr_type, entry, provenance),
+            None => bucket.push((call_expr_type, entry, provenance)),
         }
     }
 
@@ -638,18 +879,62 @@ impl LuaInferCache {
         call_expr_type: &LuaType,
     ) {
         let key = (syntax_id, args_count);
-        if let Some(bucket) = self.call_cache.get_mut(&key) {
+        if let Some(bucket) = self.call_cache_local.get_mut(&key) {
             bucket.retain(|(ty, _)| ty != call_expr_type);
+        }
+        if let Some(bucket) = self.call_cache.get_mut(&key) {
+            bucket.retain(|(ty, _, _)| ty != call_expr_type);
             if bucket.is_empty() {
                 self.call_cache.remove(&key);
             }
         }
     }
 
-    pub fn take_flow_cache_for_var_ref(
+    /// Swaps in the flow entries `var_ref_id` holds walked from `origin`,
+    /// returning the ones it held before; see [`Self::unkey_flow_cache`].
+    pub(crate) fn key_flow_cache(
         &mut self,
         var_ref_id: &VarRefId,
-    ) -> Option<FxHashMap<FlowCacheInnerKey, CacheEntry<Arc<LuaType>>>> {
+        origin: &LuaType,
+    ) -> Option<FlowEntries> {
+        let cache_key = VarRefCacheKey::from(var_ref_id);
+        let keyed = self
+            .keyed_flow_node_cache
+            .remove(&(cache_key.clone(), origin.clone()));
+        match keyed {
+            Some(keyed) => self.flow_node_cache.insert(cache_key, keyed),
+            None => self.flow_node_cache.remove(&cache_key),
+        }
+    }
+
+    /// Keeps the entries walked from `origin` and restores `previous`. The
+    /// entries only this evaluation may use go.
+    pub(crate) fn unkey_flow_cache(
+        &mut self,
+        var_ref_id: &VarRefId,
+        origin: LuaType,
+        previous: Option<FlowEntries>,
+    ) {
+        let cache_key = VarRefCacheKey::from(var_ref_id);
+        if let Some(mut keyed) = self.flow_node_cache.remove(&cache_key) {
+            keyed.clear_local();
+            self.keyed_flow_node_cache
+                .insert((cache_key.clone(), origin), keyed);
+        }
+        if let Some(previous) = previous {
+            self.flow_node_cache.insert(cache_key, previous);
+        }
+    }
+
+    /// The context key flow walks of `cache_key` absorb reads of.
+    pub(crate) fn flow_context_key(cache_key: &VarRefCacheKey) -> u64 {
+        use std::hash::{BuildHasher, Hash, Hasher};
+        let mut hasher = rustc_hash::FxBuildHasher.build_hasher();
+        cache_key.hash(&mut hasher);
+        hasher.finish() | 1
+    }
+
+    pub fn take_flow_cache_for_var_ref(&mut self, var_ref_id: &VarRefId) -> Option<FlowEntries> {
         let cache_key = VarRefCacheKey::from(var_ref_id);
         self.flow_node_cache.remove(&cache_key)
     }
@@ -657,7 +942,7 @@ impl LuaInferCache {
     pub fn restore_flow_cache_for_var_ref(
         &mut self,
         var_ref_id: &VarRefId,
-        previous: Option<FxHashMap<FlowCacheInnerKey, CacheEntry<Arc<LuaType>>>>,
+        previous: Option<FlowEntries>,
     ) {
         let cache_key = VarRefCacheKey::from(var_ref_id);
         if let Some(previous) = previous {
@@ -667,12 +952,20 @@ impl LuaInferCache {
         }
     }
 
+    #[track_caller]
     pub fn get_index_ref_origin_type_cache(
         &self,
         var_ref_id: &VarRefId,
     ) -> Option<&CacheEntry<LuaType>> {
         let cache_key = VarRefCacheKey::from(var_ref_id);
-        self.index_ref_origin_type_cache.get(&cache_key)
+        let Some((entry, mark)) = self.index_ref_origin_type_cache.get(&cache_key) else {
+            // No origin is itself an answer: a walk from inside a setter's
+            // scope would have found one.
+            derivation::consult_gates(INDEX_ORIGIN_GATE);
+            return None;
+        };
+        derivation::consult_scope(*mark);
+        Some(entry)
     }
 
     pub fn set_index_ref_origin_type_cache(
@@ -681,22 +974,24 @@ impl LuaInferCache {
         entry: CacheEntry<LuaType>,
     ) {
         let cache_key = VarRefCacheKey::from(var_ref_id);
-        self.index_ref_origin_type_cache.insert(cache_key, entry);
+        self.index_ref_origin_type_cache
+            .insert(cache_key, (entry, derivation::scope_mark()));
     }
 
     pub fn replace_index_ref_origin_type_cache(
         &mut self,
         var_ref_id: &VarRefId,
         entry: CacheEntry<LuaType>,
-    ) -> Option<CacheEntry<LuaType>> {
+    ) -> Option<(CacheEntry<LuaType>, derivation::ScopeMark)> {
         let cache_key = VarRefCacheKey::from(var_ref_id);
-        self.index_ref_origin_type_cache.insert(cache_key, entry)
+        self.index_ref_origin_type_cache
+            .insert(cache_key, (entry, derivation::scope_mark()))
     }
 
     pub fn restore_index_ref_origin_type_cache(
         &mut self,
         var_ref_id: &VarRefId,
-        previous: Option<CacheEntry<LuaType>>,
+        previous: Option<(CacheEntry<LuaType>, derivation::ScopeMark)>,
     ) {
         let cache_key = VarRefCacheKey::from(var_ref_id);
         if let Some(previous) = previous {
@@ -763,13 +1058,13 @@ mod tests {
 
         cache
             .expr_cache
-            .insert(syntax_id, CacheEntry::Cache(LuaType::Integer));
+            .insert(syntax_id, CacheEntry::Cache(LuaType::Integer), None);
         cache
             .expr_var_ref_id_cache
-            .insert(syntax_id, VarRefId::VarRef(decl_id));
+            .insert(syntax_id, VarRefId::VarRef(decl_id), None);
         cache
             .flow_node_realm_cache
-            .insert(FlowId(1), GmodRealm::Server);
+            .insert(FlowId(1), GmodRealm::Server, None);
         cache
             .narrow_by_literal_stop_position_cache
             .insert(syntax_id);
@@ -779,7 +1074,7 @@ mod tests {
         assert!(cache.expr_cache.is_empty());
         assert!(cache.expr_var_ref_id_cache.is_empty());
         assert_eq!(
-            cache.flow_node_realm_cache.get(&FlowId(1)),
+            cache.flow_node_realm_cache.peek(&FlowId(1)),
             Some(&GmodRealm::Server)
         );
         assert!(cache.narrow_by_literal_stop_position_cache.is_empty());
@@ -837,16 +1132,16 @@ mod tests {
         let mut cache = LuaInferCache::new(file_id, Default::default());
         cache
             .expr_var_ref_id_cache
-            .insert(call_expr_id, index_ref.clone());
+            .insert(call_expr_id, index_ref.clone(), None);
         cache
             .expr_var_ref_id_cache
-            .insert(index_expr_id, index_ref.clone());
+            .insert(index_expr_id, index_ref.clone(), None);
 
         cache.clear_for_unresolve(&db);
 
-        assert!(!cache.expr_var_ref_id_cache.contains_key(&call_expr_id));
+        assert!(cache.expr_var_ref_id_cache.peek(&call_expr_id).is_none());
         assert_eq!(
-            cache.expr_var_ref_id_cache.get(&index_expr_id),
+            cache.expr_var_ref_id_cache.peek(&index_expr_id),
             Some(&index_ref)
         );
     }
@@ -865,6 +1160,7 @@ mod tests {
             query_realm,
             FlowOrigin::Real,
             CacheEntry::Cache(Arc::new(LuaType::String)),
+            None,
         );
         assert!(matches!(
             cache.get_flow_cache_with_origin_by_key(
@@ -883,6 +1179,7 @@ mod tests {
             query_realm,
             FlowOrigin::Real,
             CacheEntry::Cache(Arc::new(LuaType::Number)),
+            None,
         );
         for flow_id in [FlowId(2), FlowId(3), FlowId(4)] {
             assert!(matches!(
@@ -903,6 +1200,7 @@ mod tests {
             query_realm,
             FlowOrigin::Real,
             CacheEntry::Cache(Arc::new(LuaType::Integer)),
+            None,
         );
         for flow_id in [FlowId(5), FlowId(6)] {
             assert!(matches!(
@@ -931,6 +1229,7 @@ mod tests {
             query_realm,
             FlowOrigin::Real,
             CacheEntry::Error(InferFailReason::None),
+            None,
         );
         assert!(matches!(
             cache.get_flow_cache_with_origin_by_key(
@@ -949,6 +1248,7 @@ mod tests {
             query_realm,
             FlowOrigin::Real,
             CacheEntry::Error(InferFailReason::FieldNotFound),
+            None,
         );
         for flow_id in [FlowId(2), FlowId(3)] {
             assert!(matches!(

@@ -364,19 +364,29 @@ pub fn get_var_expr_var_ref_id(
     cache: &mut LuaInferCache,
     var_expr: LuaExpr,
 ) -> Option<VarRefId> {
-    if let Some(var_ref_id) = cache.expr_var_ref_id_cache.get(&var_expr.get_syntax_id()) {
-        return Some(var_ref_id.clone());
+    let syntax_id = var_expr.get_syntax_id();
+    if let Some(var_ref_id) =
+        cache.tracked_get(|cache| &mut cache.expr_var_ref_id_cache, &syntax_id)
+    {
+        return Some(var_ref_id);
     }
 
+    let frame = crate::db_index::derivation::open_frame();
     let ref_id = match &var_expr {
         LuaExpr::NameExpr(name_expr) => get_name_expr_var_ref_id(db, cache, name_expr),
         LuaExpr::IndexExpr(index_expr) => get_index_expr_var_ref_id(db, cache, index_expr),
         LuaExpr::CallExpr(call_expr) => get_call_expr_var_ref_id(db, cache, call_expr),
         _ => None,
-    }?;
-
-    cache
-        .expr_var_ref_id_cache
-        .insert(var_expr.get_syntax_id(), ref_id.clone());
+    };
+    let Some(ref_id) = ref_id else {
+        cache.close_frame(frame);
+        return None;
+    };
+    cache.tracked_insert(
+        |cache| &mut cache.expr_var_ref_id_cache,
+        syntax_id,
+        ref_id.clone(),
+        frame,
+    );
     Some(ref_id)
 }

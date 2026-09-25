@@ -465,7 +465,7 @@ fn resolve_decl_default_display(builder: &HoverBuilder, decl_id: LuaDeclId) -> S
     let use_site_realm = db
         .get_gmod_infer_index()
         .get_realm_at_offset(&file_id, trigger_token.text_range().start());
-    cache.flow_query_realm = Some(use_site_realm);
+    cache.set_query_realm(Some(use_site_realm));
 
     // 1. Explicit param default from signature metadata.
     if let Some(decl) = db.get_decl_index().get_decl(&decl_id) {

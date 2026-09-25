@@ -30,9 +30,10 @@ struct KeySlot {
     /// Only the analysis thread takes fingerprints, so relaxed order suffices.
     current: AtomicU64,
     current_generation: AtomicU32,
-    /// The evaluation that last recorded a read of the key; see
-    /// [`KeyTable::note_read`].
-    stamp: u32,
+    /// The stamp the key was last logged under; see [`KeyTable::log`].
+    stamp: u64,
+    /// The stamp current when the key was last written.
+    written: u64,
 }
 
 impl Clone for KeySlot {
@@ -44,6 +45,7 @@ impl Clone for KeySlot {
             current: AtomicU64::new(self.current.load(Ordering::Relaxed)),
             current_generation: AtomicU32::new(self.current_generation.load(Ordering::Relaxed)),
             stamp: self.stamp,
+            written: self.written,
         }
     }
 }
@@ -57,6 +59,7 @@ impl Default for KeySlot {
             current: AtomicU64::new(0),
             current_generation: AtomicU32::new(NO_GENERATION),
             stamp: 0,
+            written: 0,
         }
     }
 }
@@ -122,7 +125,9 @@ pub struct KeyTable {
 }
 
 impl KeyTable {
-    fn intern(&mut self, key: HashedKey) -> KeyIdx {
+    /// Interns `key`. A new slot counts as written at stamp `now`: older
+    /// memos cannot have read the key it now names.
+    fn intern(&mut self, key: HashedKey, now: u64) -> KeyIdx {
         if let Some(slot) = self.key_slots.get(&key) {
             return *slot;
         }
@@ -136,6 +141,7 @@ impl KeyTable {
         let entry = &mut self.keys[slot as usize];
         entry.key = Some(key.clone());
         entry.stamp = 0;
+        entry.written = now;
         entry
             .current_generation
             .store(NO_GENERATION, Ordering::Relaxed);
@@ -143,22 +149,49 @@ impl KeyTable {
         slot
     }
 
-    /// Whether evaluation `stamp` recorded a read of `key`.
-    pub(super) fn stamped(&self, key: &HashedKey, stamp: u32) -> bool {
+    /// Whether `key` was logged at or after stamp `since`.
+    pub(super) fn logged_since(&self, key: &HashedKey, since: u64) -> bool {
         self.key_slots
             .get(key)
-            .is_some_and(|slot| self.keys[*slot as usize].stamp == stamp)
+            .is_some_and(|slot| self.keys[*slot as usize].stamp >= since)
     }
 
-    /// Interns `key` and returns its slot if evaluation `stamp` has not
-    /// recorded it yet.
-    pub(super) fn note_read(&mut self, key: HashedKey, stamp: u32) -> Option<KeyIdx> {
-        let slot = self.intern(key);
-        let entry = &mut self.keys[slot as usize];
-        (entry.stamp != stamp).then(|| {
-            entry.stamp = stamp;
-            slot
+    pub(super) fn intern_read(&mut self, key: HashedKey, now: u64) -> KeyIdx {
+        self.intern(key, now)
+    }
+
+    /// The key in `slot` and the stamp it was last written, for diagnostics.
+    pub(super) fn describe(&self, slot: KeyIdx) -> (Option<HashedKey>, u64) {
+        let entry = &self.keys[slot as usize];
+        (entry.key.clone(), entry.written)
+    }
+
+    /// Marks `key` written at stamp `now`, if anything ever read it.
+    pub(super) fn mark_written(&mut self, key: &HashedKey, now: u64) {
+        if let Some(slot) = self.key_slots.get(key) {
+            self.keys[*slot as usize].written = now;
+        }
+    }
+
+    /// Whether none of `slots` was written after stamp `since`.
+    pub(super) fn unwritten_since(&self, slots: &[KeyIdx], since: u64) -> bool {
+        slots.iter().all(|slot| {
+            self.keys
+                .get(*slot as usize)
+                .is_some_and(|entry| entry.written <= since)
         })
+    }
+
+    /// Whether a read of `slot` goes into a log whose innermost open frame
+    /// began at stamp `frame`: not if it was logged since. Marks it logged at
+    /// `latest`, the newest stamp handed out.
+    pub(super) fn log(&mut self, slot: KeyIdx, frame: u64, latest: u64) -> bool {
+        let entry = &mut self.keys[slot as usize];
+        if entry.stamp >= frame {
+            return false;
+        }
+        entry.stamp = latest;
+        true
     }
 }
 
@@ -446,6 +479,13 @@ impl ReaderGraph {
         })
     }
 
+    /// For `GLUALS_CHECK_TSC`: `id`'s recorded reads by slot.
+    pub fn recorded_slots(&self, id: DerivationId) -> Vec<(KeyIdx, Fingerprint)> {
+        self.record(id)
+            .map(|(_, record)| record.reads.to_vec())
+            .unwrap_or_default()
+    }
+
     /// The keys `id` last read.
     pub fn reads_of(&self, id: DerivationId) -> impl Iterator<Item = &HashedKey> + '_ {
         self.record(id)
@@ -621,21 +661,24 @@ impl ReaderGraph {
     }
 
     fn intern_key(&mut self, key: HashedKey) -> KeyIdx {
-        self.table.intern(key)
+        self.table.intern(key, super::new_stamp())
     }
 
     /// Interns a read made while no key table was lent.
     pub fn intern_read(&mut self, key: HashedKey) -> KeyIdx {
-        self.table.intern(key)
+        self.table.intern(key, super::new_stamp())
     }
 
     /// Frees `slot` once no derivation reads or produces its key.
+    /// Frees `slot` if no record reads or produces it. A freed slot reads as
+    /// written after every memo, so none replays it.
     fn release_key(&mut self, slot: KeyIdx) {
         let entry = &mut self.table.keys[slot as usize];
         if !entry.readers.is_empty() || !entry.producers.is_empty() {
             return;
         }
         if let Some(key) = entry.key.take() {
+            entry.written = u64::MAX;
             self.table.key_slots.remove(&key);
             self.table.free_keys.push(slot);
         }
@@ -874,8 +917,10 @@ mod tests {
     fn a_slot_one_member_drops_stays_live_for_another_member_of_its_group() {
         let mut graph = ReaderGraph::default();
         let mut table = graph.lend_keys();
-        let slot = table.note_read(key(9), 1).expect("first read");
-        assert_eq!(table.note_read(key(9), 2), Some(slot));
+        let slot = table.intern_read(key(9), 0);
+        assert!(table.log(slot, 1, 1));
+        assert_eq!(table.intern_read(key(9), 0), slot);
+        assert!(table.log(slot, 2, 2));
         graph.restore_keys(table);
         let producer = DerivationId::new(
             DerivationKind::LocalStat,
@@ -906,7 +951,7 @@ mod tests {
         let mut graph = ReaderGraph::default();
         graph.replace(id(1, 0), vec![], vec![key(9)], |_| 0);
         let mut table = graph.lend_keys();
-        let slot = table.note_read(key(9), 1).expect("first read");
+        let slot = table.intern_read(key(9), 1);
         graph.restore_keys(table);
 
         let mut released = Vec::new();
