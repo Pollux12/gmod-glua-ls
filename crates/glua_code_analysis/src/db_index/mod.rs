@@ -320,9 +320,11 @@ impl DbIndex {
             K::SpecialCall(..) | K::SpecialCallFile(_) | K::FlowTree(_) => {
                 self.flow_index.fact_fingerprint(key)
             }
-            K::DynamicField(..) | K::UnattributedField(_) | K::DynamicFieldFile(_) => {
-                self.dynamic_field_index.fact_fingerprint(key)
-            }
+            K::DynamicField(..)
+            | K::DynamicFieldWildcards(_)
+            | K::DynamicFieldFinite(_)
+            | K::UnattributedField(_)
+            | K::DynamicFieldFile(_) => self.dynamic_field_index.fact_fingerprint(key),
             K::OperatorOwner(_) | K::OperatorFile(_) | K::OperatorContrib(_) => {
                 self.operator_index.fact_fingerprint(key)
             }

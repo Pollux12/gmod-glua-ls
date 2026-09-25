@@ -159,6 +159,12 @@ impl EditMaps {
             K::SpecialCall(file_id, position) => {
                 K::SpecialCall(*file_id, self.position(*file_id, *position)?)
             }
+            K::DynamicFieldWildcards(DynamicFieldOwner::Table(site)) => {
+                K::DynamicFieldWildcards(DynamicFieldOwner::Table(self.site(site)?))
+            }
+            K::DynamicFieldFinite(DynamicFieldOwner::Table(site)) => {
+                K::DynamicFieldFinite(DynamicFieldOwner::Table(self.site(site)?))
+            }
             K::DynamicField(DynamicFieldOwner::Table(site), name) => {
                 K::DynamicField(DynamicFieldOwner::Table(self.site(site)?), name.clone())
             }

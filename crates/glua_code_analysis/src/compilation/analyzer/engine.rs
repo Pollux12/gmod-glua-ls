@@ -416,6 +416,9 @@ pub(crate) struct EngineStats {
 }
 
 fn variant_name(key: &FactKey) -> String {
+    if let FactKey::DynamicField(_, None) = key {
+        return "DynamicField(wildcard)".to_string();
+    }
     let name = format!("{key:?}");
     name.split(['(', ' '])
         .next()

@@ -1605,10 +1605,10 @@ fn owner_wildcard_covers_literal_key(db: &DbIndex, owner: &LuaMemberOwner) -> bo
     };
 
     let index = db.get_dynamic_field_index();
-    index
-        .get_fields(&dynamic_owner)
-        .is_some_and(|fields| !fields.is_empty())
-        && index.has_wildcard_definitions(&dynamic_owner)
+    index.has_wildcard_definitions(&dynamic_owner)
+        && index
+            .get_fields(&dynamic_owner)
+            .is_some_and(|fields| !fields.is_empty())
         || crate::is_pure_wildcard_registry(db, &dynamic_owner)
 }
 

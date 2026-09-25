@@ -136,8 +136,12 @@ pub enum FactKey {
     SpecialCallFile(FileId),
     /// A file's flow tree and casts.
     FlowTree(FileId),
-    /// One dynamic field (`None`: the wildcard bucket).
+    /// One dynamic field (`None`: the owner's named fields as a whole).
     DynamicField(DynamicFieldOwner, Option<SmolStr>),
+    /// An owner's wildcard (dynamic-key) definition sites.
+    DynamicFieldWildcards(DynamicFieldOwner),
+    /// An owner's members written through a finite set of names.
+    DynamicFieldFinite(DynamicFieldOwner),
     /// An unattributed dynamic field, by name.
     UnattributedField(SmolStr),
     /// One operand owner's operator table.
@@ -375,6 +379,8 @@ impl FactKey {
                 | K::DefinitionFact(_)
                 | K::Signature(_)
                 | K::DynamicField(..)
+                | K::DynamicFieldWildcards(_)
+                | K::DynamicFieldFinite(_)
                 | K::Metatable(_)
                 | K::SpecialCall(..)
                 | K::Member(_)
@@ -443,7 +449,9 @@ impl FactKey {
             | K::CallSiteFile(file_id)
             | K::DerivedReferences(file_id)
             | K::FileText(file_id) => Some(*file_id),
-            K::DynamicField(DynamicFieldOwner::Table(site), _) => Some(site.file_id),
+            K::DynamicField(DynamicFieldOwner::Table(site), _)
+            | K::DynamicFieldWildcards(DynamicFieldOwner::Table(site))
+            | K::DynamicFieldFinite(DynamicFieldOwner::Table(site)) => Some(site.file_id),
             K::OperatorOwner(LuaOperatorOwner::Table(site)) => Some(site.file_id),
             K::TypeDecl(_)
             | K::SourceTypeDecl(_)
@@ -456,6 +464,8 @@ impl FactKey {
             | K::ModuleNamespace(_)
             | K::ModuleFiles
             | K::DynamicField(..)
+            | K::DynamicFieldWildcards(_)
+            | K::DynamicFieldFinite(_)
             | K::UnattributedField(_)
             | K::OperatorOwner(_)
             | K::GmodMeta(_)
@@ -704,7 +714,10 @@ thread_local! {
 /// Runs `f` outside any evaluation and returns every key it wrote: a reset
 /// moves facts other derivations produced, whose readers must be re-checked.
 pub fn capture_writes(f: impl FnOnce()) -> FxHashSet<HashedKey> {
-    debug_assert!(!recording(), "writes captured inside an evaluation");
+    debug_assert!(
+        CURRENT.with(|current| current.borrow().is_none()),
+        "writes captured inside an evaluation"
+    );
     let previous = CAPTURED.with(|captured| captured.replace(Some(FxHashSet::default())));
     f();
     CAPTURED
@@ -765,6 +778,7 @@ pub fn end() -> Evaluation {
 #[inline]
 pub fn recording() -> bool {
     CURRENT.with(|current| current.borrow().is_some())
+        || CAPTURED.with(|captured| captured.borrow().is_some())
 }
 
 /// Records a read of `key` by the current evaluation.

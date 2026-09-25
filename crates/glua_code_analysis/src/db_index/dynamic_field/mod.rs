@@ -273,7 +273,7 @@ impl DynamicFieldIndex {
         let definition = InFiled::new(file_id, range);
         let is_new_definition = insert_definition(definitions, definition);
         if is_new_definition {
-            self.note_dynamic_write(owner.clone(), None);
+            derivation::note_write(|| FactKey::DynamicFieldWildcards(owner.clone()));
             self.wildcard_file_contributions
                 .entry(file_id)
                 .or_default()
@@ -478,7 +478,7 @@ impl DynamicFieldIndex {
                     self.wildcard_definitions.remove(&owner);
                 }
             }
-            self.note_dynamic_write(owner.clone(), None);
+            derivation::note_write(|| FactKey::DynamicFieldWildcards(owner.clone()));
             if let Some(contributions) = self.wildcard_file_contributions.get_mut(&file_id) {
                 contributions.retain(|(o, contribution_range)| {
                     !(o == &owner && *contribution_range == range)
@@ -633,7 +633,7 @@ impl DynamicFieldIndex {
                     self.note_dynamic_write(owner.clone(), Some(field_name));
                 }
                 if has_wildcards {
-                    self.note_dynamic_write(owner.clone(), None);
+                    derivation::note_write(|| FactKey::DynamicFieldWildcards(owner.clone()));
                 }
                 self.owner_fields.remove(owner);
                 self.field_definitions.remove(owner);
@@ -856,7 +856,7 @@ impl DynamicFieldIndex {
             .or_default()
             .insert(member_id);
         if is_new {
-            derivation::note_write(|| FactKey::DynamicField(owner.clone(), None));
+            derivation::note_write(|| FactKey::DynamicFieldFinite(owner.clone()));
             self.finite_named_file_contributions
                 .entry(member_id.file_id)
                 .or_default()
@@ -874,7 +874,7 @@ impl DynamicFieldIndex {
         let Some(members) = self.finite_named_members.get_mut(owner) else {
             return;
         };
-        derivation::note_write(|| FactKey::DynamicField(owner.clone(), None));
+        derivation::note_write(|| FactKey::DynamicFieldFinite(owner.clone()));
         members.remove(&member_id);
         if members.is_empty() {
             self.finite_named_members.remove(owner);
@@ -896,14 +896,14 @@ impl DynamicFieldIndex {
         owner: &DynamicFieldOwner,
         member_id: LuaMemberId,
     ) -> bool {
-        derivation::note_read(|| FactKey::DynamicField(owner.clone(), None));
+        derivation::note_read(|| FactKey::DynamicFieldFinite(owner.clone()));
         self.finite_named_members
             .get(owner)
             .is_some_and(|members| members.contains(&member_id))
     }
 
     pub fn owner_has_finite_named_members(&self, owner: &DynamicFieldOwner) -> bool {
-        derivation::note_read(|| FactKey::DynamicField(owner.clone(), None));
+        derivation::note_read(|| FactKey::DynamicFieldFinite(owner.clone()));
         self.finite_named_members
             .get(owner)
             .is_some_and(|members| !members.is_empty())
@@ -936,7 +936,7 @@ impl DynamicFieldIndex {
     }
 
     pub fn get_wildcard_definitions(&self, owner: &DynamicFieldOwner) -> Vec<InFiled<TextRange>> {
-        derivation::note_read(|| FactKey::DynamicField(owner.clone(), None));
+        derivation::note_read(|| FactKey::DynamicFieldWildcards(owner.clone()));
         self.wildcard_definitions
             .get(owner)
             .cloned()
@@ -944,7 +944,7 @@ impl DynamicFieldIndex {
     }
 
     pub fn has_wildcard_definitions(&self, owner: &DynamicFieldOwner) -> bool {
-        derivation::note_read(|| FactKey::DynamicField(owner.clone(), None));
+        derivation::note_read(|| FactKey::DynamicFieldWildcards(owner.clone()));
         self.wildcard_definitions
             .get(owner)
             .is_some_and(|definitions| !definitions.is_empty())
@@ -1076,6 +1076,8 @@ impl DynamicFieldIndex {
             return;
         }
         derivation::note_write(|| FactKey::DynamicField(owner.clone(), None));
+        derivation::note_write(|| FactKey::DynamicFieldWildcards(owner.clone()));
+        derivation::note_write(|| FactKey::DynamicFieldFinite(owner.clone()));
         for field_name in self.owner_field_names(owner) {
             derivation::note_write(|| FactKey::DynamicField(owner.clone(), Some(field_name)));
         }
@@ -1121,22 +1123,27 @@ impl DynamicFieldIndex {
                 self.named_slot_fingerprint(owner, field_name)
             }
             FactKey::DynamicField(owner, None) => {
-                let wildcards = self.wildcard_definitions.get(owner);
-                let finite = self.finite_named_members.get(owner).map(|members| {
-                    members
-                        .iter()
-                        .map(derivation::fingerprint_of)
-                        .fold(0u64, u64::wrapping_add)
-                });
                 let named = if derivation::mapping_back() {
                     Some(self.owner_named_digest(owner)).filter(|digest| *digest != 0)
                 } else {
                     self.owner_named_fingerprints.get(owner).copied()
                 };
-                if wildcards.is_none() && finite.is_none() && named.is_none() {
-                    return derivation::ABSENT;
-                }
-                derivation::fingerprint_of(&(wildcards, finite, named))
+                derivation::fingerprint_opt(named.as_ref())
+            }
+            FactKey::DynamicFieldWildcards(owner) => {
+                derivation::fingerprint_opt(self.wildcard_definitions.get(owner))
+            }
+            FactKey::DynamicFieldFinite(owner) => {
+                self.finite_named_members
+                    .get(owner)
+                    .map_or(derivation::ABSENT, |members| {
+                        derivation::fingerprint_of(
+                            &members
+                                .iter()
+                                .map(derivation::fingerprint_of)
+                                .fold(0u64, u64::wrapping_add),
+                        )
+                    })
             }
             FactKey::UnattributedField(field_name) => {
                 if self.unattributed_fields.contains_key(field_name) {
@@ -1296,13 +1303,13 @@ impl LuaIndex for DynamicFieldIndex {
                             self.wildcard_definitions.remove(&owner);
                         }
                     }
-                    self.note_dynamic_write(owner, None);
+                    derivation::note_write(|| FactKey::DynamicFieldWildcards(owner.clone()));
                 }
             }
 
             if let Some(contributions) = self.finite_named_file_contributions.remove(&file_id) {
                 for (owner, member_id) in contributions {
-                    derivation::note_write(|| FactKey::DynamicField(owner.clone(), None));
+                    derivation::note_write(|| FactKey::DynamicFieldFinite(owner.clone()));
                     if let Some(members) = self.finite_named_members.get_mut(&owner) {
                         members.remove(&member_id);
                         if members.is_empty() {
