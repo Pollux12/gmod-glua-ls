@@ -109,6 +109,8 @@ impl super::engine::Recipe for Recipes {
                 | DerivationKind::NetHelpers
                 | DerivationKind::Network
                 | DerivationKind::DynamicFields
+                | DerivationKind::GmodLoadCallSites
+                | DerivationKind::GmodClassCallSites
         )
     }
 
@@ -119,6 +121,12 @@ impl super::engine::Recipe for Recipes {
             }
             DerivationKind::NetHelpers => Box::new(gmod::compute_net_helpers(db, id.file_id)),
             DerivationKind::Network => Box::new(gmod::compute_network_flows(db, id.file_id)),
+            DerivationKind::GmodLoadCallSites => Box::new(gmod::compute_annotated_call_sites(
+                db, id.file_id, true, false,
+            )),
+            DerivationKind::GmodClassCallSites => Box::new(gmod::compute_annotated_call_sites(
+                db, id.file_id, false, true,
+            )),
             DerivationKind::DynamicFields => Box::new(dynamic_field::compute_file_dynamic_fields(
                 db,
                 id.file_id,
@@ -148,6 +156,12 @@ impl super::engine::Recipe for Recipes {
                     .downcast::<crate::db_index::FileNetworkData>()
                     .expect("net flows");
                 gmod::apply_network_flows(db, id.file_id, flows);
+            }
+            DerivationKind::GmodLoadCallSites | DerivationKind::GmodClassCallSites => {
+                let sites = *computed
+                    .downcast::<Vec<gmod::PendingCallSite>>()
+                    .expect("annotated call sites");
+                gmod::apply_annotated_call_sites(db, id.file_id, sites);
             }
             DerivationKind::DynamicFields => {
                 let fields = *computed

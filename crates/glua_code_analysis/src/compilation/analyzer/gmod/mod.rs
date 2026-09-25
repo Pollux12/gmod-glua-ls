@@ -187,7 +187,7 @@ fn formatted_hook_prefixes(db: &DbIndex) -> Vec<String> {
 /// The scan itself reads only the file's own AST plus immutable db state; the
 /// writes are buffered so the scan can run off the caller's thread and be
 /// applied afterwards in the original file-then-call order.
-enum PendingCallSite {
+pub(crate) enum PendingCallSite {
     VguiParent(GmodVguiParentCallMetadata),
     /// A parent call whose receiver the index could not type yet. See
     /// [`resolve_deferred_vgui_parent_calls`].
@@ -212,72 +212,120 @@ fn collect_annotated_call_sites_with(
         .map(|in_filed_tree| in_filed_tree.file_id)
         .collect::<Vec<_>>();
     let per_file = super::parallel::map_files_collect(db, &file_ids, |db, file_id| {
-        let keywords = db
-            .get_vfs()
-            .get_file_content(&file_id)
-            .map(|content| {
-                scan_gmod_keywords(
-                    content,
-                    formatted_hook_prefixes,
-                    annotated_global_call_roles,
-                )
-            })
-            .unwrap_or_default();
-        let scan_load = include_load && keywords.has_load_call;
-        let scan_class_calls = include_class_calls && keywords.has_scripted_class_call;
-        if !scan_class_calls && !scan_load {
-            return Vec::new();
-        }
-        let Some(root) = db
-            .get_vfs()
-            .get_syntax_tree(&file_id)
-            .map(|tree| tree.get_chunk_node())
-        else {
-            return Vec::new();
-        };
-
-        let annotated_call_roles =
-            AnnotatedGmodCallRoleMap::build(db, file_id, &root, annotated_global_call_roles);
-        let mut pending = Vec::new();
-        for call_expr in root.syntax().descendants().filter_map(LuaCallExpr::cast) {
-            if scan_class_calls {
-                collect_annotated_scripted_class_call_metadata(
-                    db,
-                    file_id,
-                    &annotated_call_roles,
-                    call_expr.clone(),
-                    &mut pending,
-                );
-            }
-            if scan_load {
-                collect_annotated_load_dependency_site(
-                    db,
-                    file_id,
-                    &annotated_call_roles,
-                    call_expr,
-                    &mut pending,
-                );
-            }
-        }
-        pending
+        file_annotated_call_sites(
+            db,
+            file_id,
+            formatted_hook_prefixes,
+            annotated_global_call_roles,
+            include_load,
+            include_class_calls,
+        )
     });
-
     for (file_id, pending) in file_ids.iter().zip(per_file) {
-        for write in pending {
-            match write {
-                PendingCallSite::VguiParent(call) => db
-                    .get_gmod_class_metadata_index_mut()
-                    .add_vgui_parent_call(*file_id, call),
-                // Its receiver has no type yet; the site is collected once
-                // the receiver's type lands and this derivation re-runs.
-                PendingCallSite::DeferredVguiParent => {}
-                PendingCallSite::ScriptedClass(kind, call) => db
-                    .get_gmod_class_metadata_index_mut()
-                    .add_call(*file_id, kind, call),
-                PendingCallSite::Dependency(site) => db
-                    .get_file_dependencies_index_mut()
-                    .add_dependency_site(site),
-            }
+        apply_annotated_call_sites(db, *file_id, pending);
+    }
+}
+
+/// A file's annotated `load`-style or scripted-class call sites, read off the
+/// index; [`apply_annotated_call_sites`] stores them.
+pub(crate) fn compute_annotated_call_sites(
+    db: &DbIndex,
+    file_id: FileId,
+    include_load: bool,
+    include_class_calls: bool,
+) -> Vec<PendingCallSite> {
+    if !db.get_emmyrc().gmod.enabled {
+        return Vec::new();
+    }
+    let prefixes = formatted_hook_prefixes(db);
+    let roles = derive::call_roles(db);
+    file_annotated_call_sites(
+        db,
+        file_id,
+        &prefixes,
+        &roles.roles,
+        include_load,
+        include_class_calls,
+    )
+}
+
+fn file_annotated_call_sites(
+    db: &DbIndex,
+    file_id: FileId,
+    formatted_hook_prefixes: &[String],
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
+    include_load: bool,
+    include_class_calls: bool,
+) -> Vec<PendingCallSite> {
+    let keywords = db
+        .get_vfs()
+        .get_file_content(&file_id)
+        .map(|content| {
+            scan_gmod_keywords(
+                content,
+                formatted_hook_prefixes,
+                annotated_global_call_roles,
+            )
+        })
+        .unwrap_or_default();
+    let scan_load = include_load && keywords.has_load_call;
+    let scan_class_calls = include_class_calls && keywords.has_scripted_class_call;
+    if !scan_class_calls && !scan_load {
+        return Vec::new();
+    }
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .map(|tree| tree.get_chunk_node())
+    else {
+        return Vec::new();
+    };
+
+    let annotated_call_roles =
+        AnnotatedGmodCallRoleMap::build(db, file_id, &root, annotated_global_call_roles);
+    let mut pending = Vec::new();
+    for call_expr in root.syntax().descendants().filter_map(LuaCallExpr::cast) {
+        if scan_class_calls {
+            collect_annotated_scripted_class_call_metadata(
+                db,
+                file_id,
+                &annotated_call_roles,
+                call_expr.clone(),
+                &mut pending,
+            );
+        }
+        if scan_load {
+            collect_annotated_load_dependency_site(
+                db,
+                file_id,
+                &annotated_call_roles,
+                call_expr,
+                &mut pending,
+            );
+        }
+    }
+    pending
+}
+
+pub(crate) fn apply_annotated_call_sites(
+    db: &mut DbIndex,
+    file_id: FileId,
+    pending: Vec<PendingCallSite>,
+) {
+    for write in pending {
+        match write {
+            PendingCallSite::VguiParent(call) => db
+                .get_gmod_class_metadata_index_mut()
+                .add_vgui_parent_call(file_id, call),
+            // Its receiver has no type yet; the site is collected once
+            // the receiver's type lands and this derivation re-runs.
+            PendingCallSite::DeferredVguiParent => {}
+            PendingCallSite::ScriptedClass(kind, call) => db
+                .get_gmod_class_metadata_index_mut()
+                .add_call(file_id, kind, call),
+            PendingCallSite::Dependency(site) => db
+                .get_file_dependencies_index_mut()
+                .add_dependency_site(site),
         }
     }
 }
