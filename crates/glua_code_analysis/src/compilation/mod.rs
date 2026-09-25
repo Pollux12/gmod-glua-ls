@@ -216,6 +216,19 @@ impl LuaCompilation {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = DiagnosticReads::default();
     }
 
+    /// The reader graph's and the diagnostic reads' census, for the profile.
+    pub fn memory_census(&self) -> String {
+        let reads = self
+            .diagnostic_reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .census();
+        format!(
+            "reader graph: {}\ndiagnostic reads: {reads}",
+            self.db.reader_graph().census()
+        )
+    }
+
     pub fn get_db(&self) -> &DbIndex {
         &self.db
     }

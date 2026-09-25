@@ -14,6 +14,37 @@ pub struct DiagnosticReads {
 }
 
 impl DiagnosticReads {
+    /// Counts and estimated heap sizes, for the profile. Excludes what the
+    /// keys themselves point to.
+    pub fn census(&self) -> String {
+        use crate::profile::{hash_table_bytes, megabytes};
+        use std::mem::size_of;
+        let read_entry = size_of::<FactKey>() + size_of::<Fingerprint>();
+        let reads: usize = self.files.values().map(|reads| reads.len()).sum();
+        let file_bytes: usize = self
+            .files
+            .values()
+            .map(|reads| hash_table_bytes(reads.capacity(), read_entry))
+            .sum();
+        let reader_edges: usize = self.readers.values().map(|files| files.len()).sum();
+        let reader_bytes = hash_table_bytes(
+            self.readers.capacity(),
+            size_of::<FactKey>() + size_of::<FxHashSet<FileId>>(),
+        ) + self
+            .readers
+            .values()
+            .map(|files| hash_table_bytes(files.capacity(), size_of::<FileId>()))
+            .sum::<usize>();
+        format!(
+            "files {}, reads {reads}, distinct keys {}, reader edges {reader_edges}, shared {}; MB: per-file reads {}, readers {}",
+            self.files.len(),
+            self.readers.len(),
+            self.shared.len(),
+            megabytes(file_bytes),
+            megabytes(reader_bytes)
+        )
+    }
+
     /// Replaces `file_id`'s reads with those of its latest diagnostics.
     pub fn record(&mut self, file_id: FileId, reads: Vec<(FactKey, Fingerprint)>) {
         self.forget(file_id);

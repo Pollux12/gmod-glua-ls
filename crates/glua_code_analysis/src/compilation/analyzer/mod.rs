@@ -125,9 +125,11 @@ pub(crate) fn reanalyze(
         }
         let scopes = crate::profile::phase("reanalyze: scopes", || ScriptedScopes::new(db));
         engine.note_rebuilt(&pending);
+        crate::profile::memory::checkpoint("before the source layer");
         let touched = crate::profile::phase("reanalyze: replace files", || {
             replace_files(db, &mut engine, &pending, &scopes)
         });
+        crate::profile::memory::checkpoint("after the source layer");
         db.reader_graph_mut().forget_fingerprints();
         crate::profile::phase("reanalyze: readers of touched", || {
             engine.readers_of(db, touched.iter())
@@ -135,6 +137,7 @@ pub(crate) fn reanalyze(
         let recipes =
             crate::profile::phase("reanalyze: recipes", || derive::Recipes::new(db, scopes));
         crate::profile::phase("reanalyze: engine run", || engine.run(db, &recipes));
+        crate::profile::memory::checkpoint("after the engine run");
         pending = engine.take_stale_sources().into_iter().collect();
     }
     crate::profile::phase("reanalyze: flush", || db.flush_inference_derived_state());
@@ -146,6 +149,7 @@ pub(crate) fn reanalyze(
     let stats = engine.stats().clone();
     let evaluated_files = engine.evaluated_files();
     stats.report(evaluated_files.len());
+    crate::profile::memory::checkpoint("end of re-analysis");
     Reanalysis {
         touched,
         evaluated_files,

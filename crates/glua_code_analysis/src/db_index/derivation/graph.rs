@@ -211,6 +211,76 @@ pub struct ReaderGraph {
 }
 
 impl ReaderGraph {
+    /// Counts and estimated heap sizes of the graph's parts, for the profile.
+    pub fn census(&self) -> String {
+        use crate::profile::{hash_table_bytes, megabytes};
+        use std::mem::size_of;
+        let table = &self.table;
+        let live = table.keys.iter().filter(|slot| slot.key.is_some()).count();
+        let groups: usize = table.keys.iter().map(|slot| slot.readers.0.len()).sum();
+        let group_bytes: usize = table
+            .keys
+            .iter()
+            .map(|slot| slot.readers.0.capacity())
+            .sum::<usize>()
+            * size_of::<(Fingerprint, FxHashSet<DerivIdx>)>();
+        let edges: usize = table
+            .keys
+            .iter()
+            .flat_map(|slot| slot.readers.0.iter())
+            .map(|(_, readers)| readers.len())
+            .sum();
+        let set_bytes: usize = table
+            .keys
+            .iter()
+            .flat_map(|slot| slot.readers.0.iter())
+            .map(|(_, readers)| hash_table_bytes(readers.capacity(), size_of::<DerivIdx>()))
+            .sum();
+        let producer_bytes: usize = table
+            .keys
+            .iter()
+            .map(|slot| slot.producers.capacity())
+            .sum::<usize>()
+            * size_of::<DerivIdx>();
+        let (reads, outputs) = self
+            .derivations
+            .iter()
+            .filter_map(|slot| slot.record.as_ref())
+            .fold((0, 0), |(reads, outputs), record| {
+                (reads + record.reads.len(), outputs + record.outputs.len())
+            });
+        let key_map = hash_table_bytes(
+            table.key_slots.capacity(),
+            size_of::<HashedKey>() + size_of::<KeyIdx>(),
+        );
+        let key_slots = table.keys.capacity() * size_of::<KeySlot>();
+        let records = reads * size_of::<(KeyIdx, Fingerprint)>() + outputs * size_of::<KeyIdx>();
+        let derivation_maps = hash_table_bytes(
+            self.deriv_slots.capacity(),
+            size_of::<DerivationId>() + size_of::<DerivIdx>(),
+        ) + self.derivations.capacity() * size_of::<DerivSlot>();
+        let total = key_map
+            + key_slots
+            + group_bytes
+            + set_bytes
+            + producer_bytes
+            + records
+            + derivation_maps;
+        format!(
+            "keys {} (live {live}), reader groups {groups}, edges {edges}, derivations {}, record reads {reads}, outputs {outputs}; MB: key map {}, key slots {}, reader groups {}, reader sets {}, producers {}, records {}, derivation maps {}, total ~{}",
+            table.keys.len(),
+            self.derivations.len(),
+            megabytes(key_map),
+            megabytes(key_slots),
+            megabytes(group_bytes),
+            megabytes(set_bytes),
+            megabytes(producer_bytes),
+            megabytes(records),
+            megabytes(derivation_maps),
+            megabytes(total)
+        )
+    }
+
     /// Lends the key table out, until [`Self::restore_keys`].
     pub fn lend_keys(&mut self) -> KeyTable {
         std::mem::take(&mut self.table)

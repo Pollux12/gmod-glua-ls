@@ -1,3 +1,4 @@
+pub mod memory;
 pub mod work;
 
 use log::info;
@@ -24,6 +25,20 @@ pub static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 /// A count rather than a flag: the same phase name can be entered more than
 /// once at a time, and a plain flag would let the first exit turn sampling off
 /// underneath the others.
+/// Estimated heap bytes of a hash table with `capacity` entries of
+/// `entry_size` bytes: its buckets and their control bytes.
+pub(crate) fn hash_table_bytes(capacity: usize, entry_size: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = (capacity * 8 / 7).next_power_of_two();
+    buckets * (entry_size + 1)
+}
+
+pub(crate) fn megabytes(bytes: usize) -> usize {
+    bytes / 1_048_576
+}
+
 static SAMPLE_PHASE_DEPTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Whether the phase named by `GLUALS_PROFILE_SAMPLE` is currently running.
@@ -152,7 +167,7 @@ pub struct Profile<'a> {
 /// When `GLUALS_PROFILE` is set, phase-level `Profile` timers print to stderr
 /// even without Info-level logging. This gives clean per-phase numbers without
 /// the per-node instrumentation overhead that distorts Info-level runs.
-pub(crate) fn profiling() -> bool {
+pub fn profiling() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("GLUALS_PROFILE").is_some())
 }

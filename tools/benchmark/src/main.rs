@@ -592,6 +592,7 @@ async fn run() {
     drop(dhat_profiler);
     let indexing_duration = t.elapsed();
     glua_code_analysis::profile::work::report("index");
+    glua_code_analysis::profile::memory::checkpoint("after indexing");
     alloc_report!("indexing", alloc_mark);
     results.push(BenchmarkResult {
         phase: "indexing (total)".into(),
@@ -795,6 +796,10 @@ async fn run() {
     let hints = hint_count.load(std::sync::atomic::Ordering::Relaxed);
     let diagnostics_duration = t.elapsed();
     glua_code_analysis::profile::work::report("diagnostics");
+    glua_code_analysis::profile::memory::checkpoint("after diagnostics");
+    if glua_code_analysis::profile::profiling() {
+        eprintln!("[mem] {}", analysis.compilation.memory_census());
+    }
     alloc_report!("diagnostics", alloc_mark);
     results.push(BenchmarkResult {
         phase: format!(
@@ -877,5 +882,6 @@ async fn run() {
         );
         eprintln!("Target: ≤1s per edit (reindex ripple + edited-file diagnostics)");
     }
+    glua_code_analysis::profile::memory::report_peak();
     eprintln!("========================================");
 }
