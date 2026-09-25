@@ -67,9 +67,33 @@ impl Queue {
         Some((id, reason))
     }
 
+    /// Pops the first entry if it is of `kind`.
+    fn pop_first_of(&mut self, kind: DerivationKind) -> Option<(DerivationId, Reason)> {
+        let (_, _, id) = self.order.first()?;
+        if id.kind != kind {
+            return None;
+        }
+        self.pop_first()
+    }
+
     fn is_empty(&self) -> bool {
         self.order.is_empty()
     }
+}
+
+/// How the engine evaluates a derivation.
+pub(crate) trait Recipe: Sync {
+    fn evaluate(&self, db: &mut DbIndex, id: DerivationId);
+
+    /// Whether a derivation of `kind` splits into a read-only [`Self::compute`]
+    /// that reads nothing another derivation of `kind` writes, and an
+    /// [`Self::apply`] of its result. Such derivations queued together compute
+    /// concurrently.
+    fn splits(&self, kind: DerivationKind) -> bool;
+
+    fn compute(&self, db: &DbIndex, id: DerivationId) -> Box<dyn std::any::Any + Send>;
+
+    fn apply(&self, db: &mut DbIndex, id: DerivationId, computed: Box<dyn std::any::Any + Send>);
 }
 
 #[derive(Default)]
@@ -237,11 +261,7 @@ impl Engine {
     }
 
     /// Evaluates the worklist to quiescence.
-    pub(crate) fn run(
-        &mut self,
-        db: &mut DbIndex,
-        recipe: &mut dyn FnMut(&mut DbIndex, DerivationId),
-    ) {
+    pub(crate) fn run(&mut self, db: &mut DbIndex, recipe: &dyn Recipe) {
         crate::semantic::keep_access_paths();
         let _paths = OnDrop(crate::semantic::stop_keeping_access_paths);
         loop {
@@ -255,37 +275,14 @@ impl Engine {
                 continue;
             };
             self.cursor = Some(id);
-            if reason == Reason::Read
-                && !db.reader_graph().is_stale(
-                    id,
-                    |key| db.fact_fingerprint(key),
-                    |key, seen| {
-                        !self.edits.is_empty() && seen == self.fingerprint_before_edits(db, key)
-                    },
-                )
-            {
-                if self.edits.is_empty() {
-                    continue;
-                }
-                let fingerprints = db
-                    .reader_graph()
-                    .reads_of(id)
-                    .map(|key| self.fingerprint(db, key))
-                    .collect();
-                // A read that held only with the edit mapped back saw positions
-                // the edit moved; outputs made from them are right only if the
-                // edit's remap rewrites them too.
-                let moved = db.reader_graph_mut().set_fingerprints(id, fingerprints);
-                if !moved
-                    || db
-                        .reader_graph()
-                        .outputs_of(id)
-                        .all(|key| key.follows_edits())
-                {
-                    continue;
-                }
+            if !self.needs_evaluation(db, id, reason) {
+                continue;
             }
             let group = co_producers(db, id);
+            if group.len() == 1 && recipe.splits(id.kind) {
+                self.run_batch(db, id, recipe);
+                continue;
+            }
             for member in &group {
                 self.unqueue(*member);
                 self.stats.evaluated(*member);
@@ -330,16 +327,120 @@ impl Engine {
         self.cursor = None;
     }
 
-    /// Resets the group's primary outputs and re-runs it. Returns every key the
-    /// group touched: its previous outputs and its new ones.
-    fn evaluate_group(
-        &self,
-        db: &mut DbIndex,
-        group: &[DerivationId],
-        recipe: &mut dyn FnMut(&mut DbIndex, DerivationId),
-    ) -> FxHashSet<HashedKey> {
+    /// Whether `id`, queued for `reason`, has to run: a reader runs only if a
+    /// fact it read moved.
+    fn needs_evaluation(&mut self, db: &mut DbIndex, id: DerivationId, reason: Reason) -> bool {
+        if reason == Reason::Changed
+            || db.reader_graph().is_stale(
+                id,
+                |key| db.fact_fingerprint(key),
+                |key, seen| {
+                    !self.edits.is_empty() && seen == self.fingerprint_before_edits(db, key)
+                },
+            )
+        {
+            return true;
+        }
+        if self.edits.is_empty() {
+            return false;
+        }
+        let fingerprints = db
+            .reader_graph()
+            .reads_of(id)
+            .map(|key| self.fingerprint(db, key))
+            .collect();
+        // A read that held only with the edit mapped back saw positions the
+        // edit moved; outputs made from them are right only if the edit's
+        // remap rewrites them too.
+        let moved = db.reader_graph_mut().set_fingerprints(id, fingerprints);
+        moved
+            && !db
+                .reader_graph()
+                .outputs_of(id)
+                .all(|key| key.follows_edits())
+    }
+
+    /// Evaluates `first` with every derivation of its kind queued right after
+    /// it that has to run, computing them concurrently: none reads what
+    /// another writes, so each sees what it would have run alone.
+    fn run_batch(&mut self, db: &mut DbIndex, first: DerivationId, recipe: &dyn Recipe) {
+        let mut batch = vec![first];
+        let mut alone = Vec::new();
+        while let Some((id, reason)) = self.worklist.pop_first_of(first.kind) {
+            if !self.needs_evaluation(db, id, reason) {
+                continue;
+            }
+            if co_producers(db, id).len() == 1 {
+                batch.push(id);
+            } else {
+                alone.push(id);
+            }
+        }
+        for member in &batch {
+            self.unqueue(*member);
+            self.stats.evaluated(*member);
+        }
+        self.evaluated
+            .extend(batch.iter().map(|member| member.file_id));
+        let started = self.stats.profiling().then(std::time::Instant::now);
+        let mut touched = self.reset_outputs(db, &batch);
+        let computed = {
+            let db: &DbIndex = db;
+            let files = batch
+                .iter()
+                .map(|member| member.file_id)
+                .collect::<Vec<_>>();
+            super::parallel::map_files_collect(db, &files, |db, file_id| {
+                let id = *batch
+                    .iter()
+                    .find(|member| member.file_id == file_id)
+                    .expect("one batch member per file");
+                derivation::begin(id);
+                let computed = recipe.compute(db, id);
+                (derivation::end(), computed)
+            })
+        };
+        let evaluations = self.with_lent_keys(db, |db| {
+            batch
+                .iter()
+                .zip(computed)
+                .map(|(member, (evaluation, computed))| {
+                    derivation::resume(evaluation);
+                    recipe.apply(db, *member, computed);
+                    derivation::end()
+                })
+                .collect()
+        });
+        self.record(db, evaluations, &mut touched, || {
+            format!("evaluating {batch:?}")
+        });
+        if let Some(started) = started {
+            *self.stats.time.entry(first.kind).or_default() += started.elapsed();
+        }
+        // A member that now shares a key with another derivation ran without
+        // it; the next evaluation takes both.
+        for member in &batch {
+            let widened = db.reader_graph().outputs_of(*member).any(|key| {
+                key.is_primary()
+                    && db.reader_graph().producers(key).any(|producer| {
+                        producer.kind != DerivationKind::Source && producer != *member
+                    })
+            });
+            if widened {
+                self.worklist.insert(*member, Reason::Changed);
+            }
+        }
+        self.readers_of(db, touched.iter());
+        for id in alone {
+            self.worklist.insert(id, Reason::Changed);
+        }
+    }
+
+    /// Resets the primary outputs of `members` to the source layer. Returns
+    /// every key that moved or may move: their previous outputs.
+    fn reset_outputs(&self, db: &mut DbIndex, members: &[DerivationId]) -> FxHashSet<HashedKey> {
         let mut touched = FxHashSet::default();
-        for member in group {
+        for member in members {
             touched.extend(db.reader_graph().outputs_of(*member).cloned());
         }
         let reset = derivation::capture_writes(|| {
@@ -348,27 +449,68 @@ impl Engine {
             }
         });
         touched.extend(reset);
-        self.verify_fingerprints(db, &touched, || format!("resetting {group:?}"));
+        self.verify_fingerprints(db, &touched, || format!("resetting {members:?}"));
+        touched
+    }
+
+    /// Runs `f` with the reader graph's key table lent to this thread.
+    fn with_lent_keys(
+        &self,
+        db: &mut DbIndex,
+        f: impl FnOnce(&mut DbIndex) -> Vec<derivation::Evaluation>,
+    ) -> Vec<derivation::Evaluation> {
+        derivation::lend_keys(db.reader_graph_mut().lend_keys());
+        let lent = scopeguard_lent_keys();
+        let evaluations = f(db);
+        db.reader_graph_mut().restore_keys(derivation::take_keys());
+        std::mem::forget(lent);
+        evaluations
+    }
+
+    /// Resets the group's primary outputs and re-runs it. Returns every key the
+    /// group touched: its previous outputs and its new ones.
+    fn evaluate_group(
+        &self,
+        db: &mut DbIndex,
+        group: &[DerivationId],
+        recipe: &dyn Recipe,
+    ) -> FxHashSet<HashedKey> {
+        let mut touched = self.reset_outputs(db, group);
         // Fingerprints are taken once the whole group has run: the group always
         // re-runs as a unit, so a member's read of what a later member writes is
         // internal to it, not a stale input.
-        let mut evaluations = Vec::with_capacity(group.len());
-        derivation::lend_keys(db.reader_graph_mut().lend_keys());
-        let lent = scopeguard_lent_keys();
-        for member in group {
-            derivation::begin(*member);
-            recipe(db, *member);
-            evaluations.push(derivation::end());
-        }
-        db.reader_graph_mut().restore_keys(derivation::take_keys());
-        std::mem::forget(lent);
+        let evaluations = self.with_lent_keys(db, |db| {
+            group
+                .iter()
+                .map(|member| {
+                    derivation::begin(*member);
+                    recipe.evaluate(db, *member);
+                    derivation::end()
+                })
+                .collect()
+        });
+        self.record(db, evaluations, &mut touched, || {
+            format!("evaluating {group:?}")
+        });
+        touched
+    }
+
+    /// Replaces the records of `evaluations`, fingerprinting their reads as
+    /// they stand now, and adds their outputs to `touched`.
+    fn record(
+        &self,
+        db: &mut DbIndex,
+        evaluations: Vec<derivation::Evaluation>,
+        touched: &mut FxHashSet<HashedKey>,
+        step: impl Fn() -> String,
+    ) {
         for key in touched
             .iter()
             .chain(evaluations.iter().flat_map(derivation::Evaluation::outputs))
         {
             db.reader_graph().forget_fingerprint(key);
         }
-        self.verify_fingerprints(db, &touched, || format!("evaluating {group:?}"));
+        self.verify_fingerprints(db, touched, step);
         // Out of the index while its records are replaced, so the reads can be
         // fingerprinted against it.
         let mut graph = std::mem::take(db.reader_graph_mut());
@@ -387,7 +529,6 @@ impl Engine {
         }
         graph.release_keys(released);
         *db.reader_graph_mut() = graph;
-        touched
     }
 }
 

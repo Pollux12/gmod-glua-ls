@@ -59,7 +59,10 @@ pub(crate) use derive::{
     evaluate_net_helper_names, evaluate_network, evaluate_post, evaluate_pre,
     evaluate_valid_guards, evaluate_vgui_chains,
 };
-pub(crate) use network::evaluate_net_helpers;
+pub(crate) use network::{
+    FileNetHelpers, apply_net_helpers, apply_network_flows, compute_net_helpers,
+    compute_network_flows, evaluate_net_helpers,
+};
 
 /// Cheap pre-analysis flags used to skip unrelated GMod collectors.
 #[derive(Default)]

@@ -44,7 +44,7 @@ struct ReturnedMemberSignature {
     history: LuaMemberIndexItem,
 }
 
-type Contribution = (LuaSignatureId, usize, LuaTypeFact);
+pub(super) type Contribution = (LuaSignatureId, usize, LuaTypeFact);
 
 /// What the calls of one file's collection share. Lives for one evaluation,
 /// so every read behind a memoised answer is recorded by that evaluation.
@@ -122,7 +122,7 @@ impl AnalysisPipeline for CallSiteParamAnalysisPipeline {
     }
 }
 
-fn collect_file_contributions(db: &DbIndex, file_id: FileId) -> Vec<Contribution> {
+pub(super) fn collect_file_contributions(db: &DbIndex, file_id: FileId) -> Vec<Contribution> {
     let Some(root) = db
         .get_vfs()
         .get_syntax_tree(&file_id)

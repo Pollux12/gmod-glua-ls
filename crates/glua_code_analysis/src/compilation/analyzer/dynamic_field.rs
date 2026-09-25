@@ -1,5 +1,4 @@
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::time::Duration;
 
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr,
@@ -48,7 +47,7 @@ impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
 }
 
 #[derive(Clone, Copy)]
-enum DynamicFieldAnalysisMode {
+pub(super) enum DynamicFieldAnalysisMode {
     Full,
 }
 
@@ -362,52 +361,63 @@ fn collect_dynamic_fields_for_file(
     )
 }
 
+/// What one file's collection found: fields, propagated fields, wildcard
+/// definitions, finite-member evidence and unattributed fields.
+pub(super) type FileDynamicFields = (
+    Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
+    Vec<FiniteNamedMemberEvidence>,
+    Vec<(SmolStr, rowan::TextRange)>,
+);
+
 fn analyze_dynamic_fields(
     db: &mut DbIndex,
     context: &mut AnalyzeContext,
     mode: DynamicFieldAnalysisMode,
 ) {
     let _p = Profile::cond_new("dynamic field analyze", context.tree_list.len() > 1);
-    let tree_list = context.tree_list.clone();
-    let mut collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
-        Vec::new();
-    let mut collected_propagated: Vec<(
-        DynamicFieldOwner,
-        SmolStr,
-        crate::FileId,
-        rowan::TextRange,
-    )> = Vec::new();
-    let mut collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)> =
-        Vec::new();
-    let mut collected_finite_members = Vec::new();
-    let stderr_profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
-    let profile_enabled = log::log_enabled!(log::Level::Info) || stderr_profile_enabled;
-    let mut profile = profile_enabled.then(DynamicFieldProfile::default);
-
     // Collection is read-only against an immutable `&DbIndex` and writes only to
     // per-file local buffers, so it runs concurrently across files. Results are
-    // concatenated in deterministic file order and merged into the db below.
-    let file_ids: Vec<crate::FileId> = tree_list.iter().map(|t| t.file_id).collect();
-    let collection_start = profile_enabled.then(std::time::Instant::now);
+    // merged into the db in deterministic file order.
+    let file_ids: Vec<crate::FileId> = context.tree_list.iter().map(|t| t.file_id).collect();
     let per_file = super::parallel::map_files_collect(&*db, &file_ids, |db, file_id| {
-        let Some(root) = db
-            .get_vfs()
-            .get_syntax_tree(&file_id)
-            .map(|tree| tree.get_chunk_node())
-        else {
-            return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        };
-        collect_dynamic_fields_for_file(db, file_id, &root, mode)
+        compute_file_dynamic_fields(db, file_id, mode)
     });
-    if let (Some(profile), Some(collection_start)) = (profile.as_mut(), collection_start) {
-        profile.collection_time += collection_start.elapsed();
-    }
-    let merge_start = profile_enabled.then(std::time::Instant::now);
+    apply_dynamic_fields(db, per_file.into_iter().zip(file_ids));
+}
+
+/// A file's dynamic fields, read off the index; [`apply_dynamic_fields`]
+/// stores them.
+pub(super) fn compute_file_dynamic_fields(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    mode: DynamicFieldAnalysisMode,
+) -> FileDynamicFields {
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .map(|tree| tree.get_chunk_node())
+    else {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    };
+    collect_dynamic_fields_for_file(db, file_id, &root, mode)
+}
+
+/// Stores the dynamic fields files' collections found, in file order.
+pub(super) fn apply_dynamic_fields(
+    db: &mut DbIndex,
+    per_file: impl IntoIterator<Item = (FileDynamicFields, crate::FileId)>,
+) {
+    let mut collected = Vec::new();
+    let mut collected_propagated = Vec::new();
+    let mut collected_wildcards = Vec::new();
+    let mut collected_finite_members = Vec::new();
     let mut collected_unattributed: Vec<(SmolStr, crate::FileId, rowan::TextRange)> = Vec::new();
     for (
         (file_collected, file_propagated, file_wildcards, file_finite_members, file_unattributed),
         file_id,
-    ) in per_file.into_iter().zip(file_ids)
+    ) in per_file
     {
         collected.extend(file_collected);
         collected_propagated.extend(file_propagated);
@@ -419,13 +429,9 @@ fn analyze_dynamic_fields(
                 .map(|(field_name, range)| (field_name, file_id, range)),
         );
     }
-    if let (Some(profile), Some(merge_start)) = (profile.as_mut(), merge_start) {
-        profile.collection_merge_time += merge_start.elapsed();
-    }
 
     // Owners were canonicalized at push, and super-type propagation ran per
     // site.
-    let insert_start = profile_enabled.then(std::time::Instant::now);
     let index = db.get_dynamic_field_index_mut();
     for (field_name, file_id, range) in collected_unattributed {
         index.add_unattributed_field(field_name, file_id, range);
@@ -445,15 +451,6 @@ fn analyze_dynamic_fields(
             index.add_finite_named_member(owner, member_id);
         } else {
             index.remove_finite_named_member(&owner, member_id);
-        }
-    }
-    if let (Some(profile), Some(insert_start)) = (profile.as_mut(), insert_start) {
-        profile.insertion_time += insert_start.elapsed();
-    }
-    if let Some(profile) = profile {
-        profile.log(tree_list.len(), collected.len(), collected_propagated.len());
-        if stderr_profile_enabled {
-            profile.print(tree_list.len(), collected.len(), collected_propagated.len());
         }
     }
 }
@@ -660,55 +657,6 @@ fn param_expr_index(expr: &LuaExpr, param_names: &[String]) -> Option<usize> {
     param_names
         .iter()
         .position(|param_name| *param_name == name)
-}
-
-#[derive(Default)]
-struct DynamicFieldProfile {
-    assignments_scanned: usize,
-    vars_scanned: usize,
-    index_candidates: usize,
-    no_field_name_skips: usize,
-    calls_scanned: usize,
-    fields_collected: usize,
-    owner_cache_hits: usize,
-    owner_cache_misses: usize,
-    owner_infer_time: Duration,
-    collection_time: Duration,
-    collection_merge_time: Duration,
-    propagation_time: Duration,
-    insertion_time: Duration,
-}
-
-impl DynamicFieldProfile {
-    fn summary(&self, file_count: usize, collected: usize, propagated: usize) -> String {
-        format!(
-            "dynamic field profile: files={} assignments={} vars={} index_candidates={} no_field_name_skips={} calls={} fields_collected={} collected_entries={} propagated={} owner_cache_hits={} owner_cache_misses={} owner_infer_time={:?} collection_time={:?} collection_merge_time={:?} propagation_time={:?} insertion_time={:?}",
-            file_count,
-            self.assignments_scanned,
-            self.vars_scanned,
-            self.index_candidates,
-            self.no_field_name_skips,
-            self.calls_scanned,
-            self.fields_collected,
-            collected,
-            propagated,
-            self.owner_cache_hits,
-            self.owner_cache_misses,
-            self.owner_infer_time,
-            self.collection_time,
-            self.collection_merge_time,
-            self.propagation_time,
-            self.insertion_time,
-        )
-    }
-
-    fn log(&self, file_count: usize, collected: usize, propagated: usize) {
-        log::info!("{}", self.summary(file_count, collected, propagated));
-    }
-
-    fn print(&self, file_count: usize, collected: usize, propagated: usize) {
-        eprintln!("{}", self.summary(file_count, collected, propagated));
-    }
 }
 
 fn collect_setmetatable_table_fields(

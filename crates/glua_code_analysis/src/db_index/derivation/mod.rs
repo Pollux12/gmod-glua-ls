@@ -830,12 +830,16 @@ pub fn forget_lent_keys() {
 }
 
 /// Starts recording the evaluation of `id` on this thread.
-pub fn begin(id: DerivationId) {
-    let stamp = STAMP.with(|stamp| {
+fn next_stamp() -> u32 {
+    STAMP.with(|stamp| {
         let next = stamp.get().wrapping_add(1).max(1);
         stamp.set(next);
         next
-    });
+    })
+}
+
+pub fn begin(id: DerivationId) {
+    let stamp = next_stamp();
     CURRENT.with(|current| {
         let previous = current.borrow_mut().replace(Evaluation {
             id,
@@ -855,7 +859,10 @@ pub fn begin(id: DerivationId) {
 
 /// Continues recording an evaluation that [`end`] handed back, for a
 /// derivation evaluated in stages.
-pub fn resume(evaluation: Evaluation) {
+pub fn resume(mut evaluation: Evaluation) {
+    // Stamps are per thread: one taken on another thread can name an
+    // evaluation this thread already ran.
+    evaluation.stamp = next_stamp();
     CURRENT.with(|current| {
         let previous = current.borrow_mut().replace(evaluation);
         debug_assert!(previous.is_none(), "resumed inside {previous:?}");

@@ -129,7 +129,7 @@ pub(crate) fn reanalyze(
         db.reader_graph_mut().forget_fingerprints();
         engine.readers_of(db, touched.iter());
         let recipes = derive::Recipes::new(db, scopes);
-        engine.run(db, &mut |db, id| recipes.evaluate(db, id));
+        engine.run(db, &recipes);
         pending = engine.take_stale_sources().into_iter().collect();
     }
     db.flush_inference_derived_state();

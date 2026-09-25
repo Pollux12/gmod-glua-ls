@@ -95,8 +95,71 @@ impl Recipes {
             scopes,
         }
     }
+}
 
-    pub(super) fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
+impl super::engine::Recipe for Recipes {
+    fn splits(&self, kind: DerivationKind) -> bool {
+        // Call-site contributions are collected with call-site facts invisible;
+        // net helpers read other files' helper scans, and net flows their net
+        // helpers: no file's computation reads what another's of its kind writes.
+        // Dynamic fields are collected with dynamic fields invisible.
+        matches!(
+            kind,
+            DerivationKind::CallSiteParams
+                | DerivationKind::NetHelpers
+                | DerivationKind::Network
+                | DerivationKind::DynamicFields
+        )
+    }
+
+    fn compute(&self, db: &DbIndex, id: DerivationId) -> Box<dyn std::any::Any + Send> {
+        match id.kind {
+            DerivationKind::CallSiteParams => {
+                Box::new(call_site_params::collect_file_contributions(db, id.file_id))
+            }
+            DerivationKind::NetHelpers => Box::new(gmod::compute_net_helpers(db, id.file_id)),
+            DerivationKind::Network => Box::new(gmod::compute_network_flows(db, id.file_id)),
+            DerivationKind::DynamicFields => Box::new(dynamic_field::compute_file_dynamic_fields(
+                db,
+                id.file_id,
+                dynamic_field::DynamicFieldAnalysisMode::Full,
+            )),
+            kind => unreachable!("{kind:?} does not split"),
+        }
+    }
+
+    fn apply(&self, db: &mut DbIndex, id: DerivationId, computed: Box<dyn std::any::Any + Send>) {
+        match id.kind {
+            DerivationKind::CallSiteParams => {
+                let contributions = *computed
+                    .downcast::<Vec<call_site_params::Contribution>>()
+                    .expect("call-site contributions");
+                db.get_call_site_param_index_mut()
+                    .set_file_contributions(id.file_id, contributions);
+            }
+            DerivationKind::NetHelpers => {
+                let helpers = *computed
+                    .downcast::<Option<gmod::FileNetHelpers>>()
+                    .expect("net helpers");
+                gmod::apply_net_helpers(db, id.file_id, helpers);
+            }
+            DerivationKind::Network => {
+                let flows = *computed
+                    .downcast::<crate::db_index::FileNetworkData>()
+                    .expect("net flows");
+                gmod::apply_network_flows(db, id.file_id, flows);
+            }
+            DerivationKind::DynamicFields => {
+                let fields = *computed
+                    .downcast::<dynamic_field::FileDynamicFields>()
+                    .expect("dynamic fields");
+                dynamic_field::apply_dynamic_fields(db, [(fields, id.file_id)]);
+            }
+            kind => unreachable!("{kind:?} does not split"),
+        }
+    }
+
+    fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
         match id.kind {
             DerivationKind::GmodHelperScan => gmod::evaluate_helper_scan(db, id.file_id),
             DerivationKind::NetHelpers => gmod::evaluate_net_helpers(db, id.file_id),
@@ -122,7 +185,9 @@ impl Recipes {
             }
         }
     }
+}
 
+impl Recipes {
     fn evaluate_file_derivation(
         &self,
         db: &mut DbIndex,

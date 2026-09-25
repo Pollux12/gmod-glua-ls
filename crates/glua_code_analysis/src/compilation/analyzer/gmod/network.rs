@@ -253,14 +253,27 @@ impl crate::db_index::derivation::DerivedFact for FileNetHelpers {
 
 /// One file's net call facts and function-body summaries.
 pub(crate) fn evaluate_net_helpers(db: &mut DbIndex, file_id: FileId) {
+    let helpers = compute_net_helpers(db, file_id);
+    apply_net_helpers(db, file_id, helpers);
+}
+
+/// A file's net helpers, read off the index; [`apply_net_helpers`] stores them.
+pub(crate) fn compute_net_helpers(db: &DbIndex, file_id: FileId) -> Option<FileNetHelpers> {
     if !db.get_emmyrc().gmod.enabled {
-        return;
+        return None;
     }
     let roles = derive::call_roles(db);
-    let Some(helpers) = build_file_net_helpers(db, file_id, &roles.registry) else {
-        return;
-    };
-    db.set_net_helpers(file_id, Arc::new(helpers));
+    build_file_net_helpers(db, file_id, &roles.registry)
+}
+
+pub(crate) fn apply_net_helpers(
+    db: &mut DbIndex,
+    file_id: FileId,
+    helpers: Option<FileNetHelpers>,
+) {
+    if let Some(helpers) = helpers {
+        db.set_net_helpers(file_id, Arc::new(helpers));
+    }
 }
 
 fn build_file_net_helpers(
@@ -796,18 +809,42 @@ fn unique_signature_id_from_type(typ: &LuaType) -> Option<LuaSignatureId> {
 /// A file's flows read its own [`FileNetHelpers`] and those of the helpers it
 /// expands into, so they re-derive when one of those changes.
 pub(super) fn collect_network_flows(db: &mut DbIndex, context: &AnalyzeContext) {
-    let file_ids: Vec<FileId> = context.tree_list.iter().map(|tree| tree.file_id).collect();
-    let collected_files: FxHashSet<FileId> = file_ids.iter().copied().collect();
-    let names = db.get_gmod_network_index().helper_names();
-    let helper_call_sites = net_helper_call_sites(db, (*names).clone(), &collected_files);
-    for file_id in file_ids {
-        let network_data = collect_file_network_flows(db, file_id, &helper_call_sites);
-        if network_data.send_flows.is_empty() && network_data.receive_flows.is_empty() {
-            continue;
-        }
-        db.get_gmod_network_index_mut()
-            .add_file_data(file_id, network_data);
+    for file_id in context
+        .tree_list
+        .iter()
+        .map(|tree| tree.file_id)
+        .collect::<Vec<_>>()
+    {
+        let network_data = compute_network_flows(db, file_id);
+        apply_network_flows(db, file_id, network_data);
     }
+}
+
+/// A file's net message flows, read off the index; [`apply_network_flows`]
+/// stores them.
+pub(crate) fn compute_network_flows(
+    db: &DbIndex,
+    file_id: FileId,
+) -> crate::db_index::FileNetworkData {
+    if !db.get_emmyrc().gmod.enabled {
+        return crate::db_index::FileNetworkData::default();
+    }
+    let names = db.get_gmod_network_index().helper_names();
+    let helper_call_sites =
+        net_helper_call_sites(db, (*names).clone(), &FxHashSet::from_iter([file_id]));
+    collect_file_network_flows(db, file_id, &helper_call_sites)
+}
+
+pub(crate) fn apply_network_flows(
+    db: &mut DbIndex,
+    file_id: FileId,
+    network_data: crate::db_index::FileNetworkData,
+) {
+    if network_data.send_flows.is_empty() && network_data.receive_flows.is_empty() {
+        return;
+    }
+    db.get_gmod_network_index_mut()
+        .add_file_data(file_id, network_data);
 }
 
 fn collect_file_network_flows(
