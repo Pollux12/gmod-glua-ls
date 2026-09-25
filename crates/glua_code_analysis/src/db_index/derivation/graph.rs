@@ -362,7 +362,8 @@ impl ReaderGraph {
             .into_iter()
             .map(|key| {
                 let fact = self.key(key).clone();
-                self.drop_producer(key, deriv, id.file_id);
+                self.unproduce(key, deriv, id.file_id);
+                released.push(key);
                 fact
             })
             .collect();
@@ -660,6 +661,12 @@ impl ReaderGraph {
     }
 
     fn drop_producer(&mut self, key: KeyIdx, deriv: DerivIdx, file_id: FileId) {
+        self.unproduce(key, deriv, file_id);
+        self.release_key(key);
+    }
+
+    /// Removes `deriv` from `key`'s producers, leaving the slot allocated.
+    fn unproduce(&mut self, key: KeyIdx, deriv: DerivIdx, file_id: FileId) {
         let producers = &mut self.table.keys[key as usize].producers;
         if let Some(at) = producers.iter().position(|producer| *producer == deriv) {
             producers.swap_remove(at);
@@ -673,7 +680,6 @@ impl ReaderGraph {
                 self.foreign_producers.remove(&owner);
             }
         }
-        self.release_key(key);
     }
 
     /// Removes `deriv`'s record and edges and frees its slot. Returns the
@@ -893,6 +899,23 @@ mod tests {
 
         assert_eq!(graph.reads_of(id(2, 0)).collect::<Vec<_>>(), vec![&key(9)]);
         assert_eq!(graph.reads_of(producer).count(), 0);
+    }
+
+    #[test]
+    fn a_slot_one_member_stops_producing_stays_live_for_another_member_of_its_group() {
+        let mut graph = ReaderGraph::default();
+        graph.replace(id(1, 0), vec![], vec![key(9)], |_| 0);
+        let mut table = graph.lend_keys();
+        let slot = table.note_read(key(9), 1).expect("first read");
+        graph.restore_keys(table);
+
+        let mut released = Vec::new();
+        graph.replace_slots(id(1, 0), vec![], vec![], |_| 0, &mut released);
+        graph.replace_slots(id(2, 0), vec![(slot, None)], vec![], |_| 5, &mut released);
+        graph.release_keys(released);
+
+        assert_eq!(graph.reads_of(id(2, 0)).collect::<Vec<_>>(), vec![&key(9)]);
+        assert_eq!(graph.producers(&key(9)).count(), 0);
     }
 
     #[test]
