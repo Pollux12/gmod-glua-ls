@@ -415,6 +415,7 @@ struct MemberPathEvidence<'a> {
     root_decl_id: crate::LuaDeclId,
     declared_root_type: Option<&'a LuaType>,
     declared_path_bases: &'a mut DeclaredPathBases,
+    subtypes_with_member: &'a mut SubtypesWithMember,
     scores: &'a mut HashMap<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>,
 }
 
@@ -888,6 +889,7 @@ fn collect_unguarded_child_file(
         );
     let mut initializer_refinements = HashMap::<crate::LuaDeclId, LuaType>::default();
     let mut declared_path_bases = DeclaredPathBases::default();
+    let mut subtypes_with_member = SubtypesWithMember::default();
     let mut profile = collect_profile.then(UnguardedChildProfile::default);
 
     let Some(root) = db
@@ -937,6 +939,7 @@ fn collect_unguarded_child_file(
             root_decl_id: decl_id,
             declared_root_type: base_type.as_ref(),
             declared_path_bases: &mut declared_path_bases,
+            subtypes_with_member: &mut subtypes_with_member,
             scores: &mut nested_scores,
         };
         for (_, receiver, _) in &all_sites {
@@ -960,7 +963,12 @@ fn collect_unguarded_child_file(
         let Some(base_id) = unguarded_child_base_id(&base_type) else {
             continue;
         };
-        if db.get_type_index().get_sub_types(&base_id).is_empty() {
+        if db
+            .get_type_index()
+            .direct_sub_types(&base_id)
+            .next()
+            .is_none()
+        {
             continue;
         }
 
@@ -996,7 +1004,9 @@ fn collect_unguarded_child_file(
             else {
                 continue;
             };
-            let Some(children) = direct_subtypes_with_member(db, &base_id, &member_key) else {
+            let Some(children) =
+                direct_subtypes_with_member(db, &mut subtypes_with_member, &base_id, &member_key)
+            else {
                 continue;
             };
 
@@ -1224,7 +1234,9 @@ fn collect_member_path_unguarded_child_evidence(
         // The declaration already names the base, so the child lookup can rule
         // the use out before its narrowed type is worth computing.
         Some((declared, base_id)) => {
-            if direct_subtypes_with_member(db, &base_id, &member_key).is_none() {
+            if direct_subtypes_with_member(db, evidence.subtypes_with_member, &base_id, &member_key)
+                .is_none()
+            {
                 return;
             }
             let current = infer_expr(db, cache, LuaExpr::IndexExpr(receiver.clone()))
@@ -1252,7 +1264,9 @@ fn collect_member_path_unguarded_child_evidence(
             (base_id, current)
         }
     };
-    let Some(children) = direct_subtypes_with_member(db, &base_id, &member_key) else {
+    let Some(children) =
+        direct_subtypes_with_member(db, evidence.subtypes_with_member, &base_id, &member_key)
+    else {
         return;
     };
     if is_matching_short_circuit_guard(db, cache, index_expr) {
@@ -1291,7 +1305,7 @@ fn collect_member_path_unguarded_child_evidence(
     if source.value.get_range().start() < candidates.source.value.get_range().start() {
         candidates.source = source;
     }
-    for child_id in children {
+    for child_id in children.iter() {
         candidates
             .children
             .entry(child_id.clone())
@@ -1750,39 +1764,53 @@ fn type_has_visible_static_member_at_use(
     })
 }
 
+/// Direct subclasses already matched against a member key in this evaluation.
+type SubtypesWithMember = FxHashMap<(LuaTypeDeclId, LuaMemberKey), Option<Arc<[LuaTypeDeclId]>>>;
+
+#[cfg(test)]
+thread_local! {
+    static SUBTYPE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The direct subclasses of `base_id` that declare `member_key`, as a member
 /// or a direct dynamic field, ordered by name. `None` when there are none.
 fn direct_subtypes_with_member(
     db: &crate::DbIndex,
+    memo: &mut SubtypesWithMember,
     base_id: &LuaTypeDeclId,
     member_key: &LuaMemberKey,
-) -> Option<Vec<LuaTypeDeclId>> {
-    let member_index = db.get_member_index();
-    let dynamic_index = db.get_dynamic_field_index();
-    let mut children = db
-        .get_type_index()
-        .get_sub_types(base_id)
-        .into_iter()
-        .filter(|child| {
-            let child_id = child.get_id();
-            member_index
-                .get_member_item(&LuaMemberOwner::Type(child_id.clone()), member_key)
-                .is_some()
-                || matches!(member_key, LuaMemberKey::Name(name) if dynamic_index
-                    .has_direct_field(&crate::DynamicFieldOwner::Type(child_id), name))
+) -> Option<Arc<[LuaTypeDeclId]>> {
+    memo.entry((base_id.clone(), member_key.clone()))
+        .or_insert_with(|| {
+            #[cfg(test)]
+            SUBTYPE_SCANS.with(|scans| scans.set(scans.get() + 1));
+            let member_index = db.get_member_index();
+            let dynamic_index = db.get_dynamic_field_index();
+            let mut children = db
+                .get_type_index()
+                .direct_sub_types(base_id)
+                .filter(|child| {
+                    let child_id = child.get_id();
+                    member_index
+                        .get_member_item(&LuaMemberOwner::Type(child_id.clone()), member_key)
+                        .is_some()
+                        || matches!(member_key, LuaMemberKey::Name(name) if dynamic_index
+                            .has_direct_field(&crate::DynamicFieldOwner::Type(child_id), name))
+                })
+                .map(|child| (child.get_name(), child.get_id()))
+                .collect::<Vec<_>>();
+            if children.is_empty() {
+                return None;
+            }
+            children.sort_by(|left, right| {
+                left.0
+                    .cmp(right.0)
+                    .then_with(|| left.1.stable_cmp(&right.1))
+            });
+            children.dedup_by(|left, right| left.1 == right.1);
+            Some(children.into_iter().map(|(_, child_id)| child_id).collect())
         })
-        .map(|child| (child.get_name().to_string(), child.get_id()))
-        .collect::<Vec<_>>();
-    if children.is_empty() {
-        return None;
-    }
-    children.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.stable_cmp(&right.1))
-    });
-    children.dedup_by(|left, right| left.1 == right.1);
-    Some(children.into_iter().map(|(_, child_id)| child_id).collect())
+        .clone()
 }
 
 fn is_condition_evidence(index_expr: &LuaIndexExpr) -> bool {
@@ -2017,6 +2045,57 @@ mod tests {
         assert_eq!(
             compare_unguarded_child_candidates(&first, "SharedName", &second, "SharedName"),
             Ordering::Less
+        );
+    }
+
+    #[test]
+    fn unguarded_child_scans_a_bases_subtypes_once_per_member_per_evaluation() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        super::SUBTYPE_SCANS.with(|scans| scans.set(0));
+
+        ws.def_files(vec![
+            (
+                "addons/scan_fixture/lua/autorun/sh_types.lua",
+                r#"
+                ---@class Vector
+                ---@class Entity
+                ---@class Player: Entity
+                ---@field GetShootPos fun(self: Player): Vector
+                ---@class NPC: Entity
+                ---@class Holder
+                ---@field proc Entity
+                "#,
+            ),
+            (
+                "addons/scan_fixture/lua/autorun/server/consumer.lua",
+                r#"
+                ---@type Entity
+                local owner
+                local a = owner:GetShootPos()
+                local b = owner:GetShootPos()
+                local c = owner:GetShootPos()
+
+                ---@type Holder
+                local holder
+                local d = holder.proc:GetShootPos()
+                local e = holder.proc:GetShootPos()
+                local f = holder.proc:GetShootPos()
+                "#,
+            ),
+        ]);
+
+        let evaluations = ws
+            .analysis
+            .compilation
+            .last_stats()
+            .evaluations(crate::db_index::derivation::DerivationKind::LocalFallbacks);
+        let scans = super::SUBTYPE_SCANS.with(std::cell::Cell::get);
+        assert!(
+            (1..=evaluations).contains(&scans),
+            "{scans} subtype scans over {evaluations} evaluations"
         );
     }
 

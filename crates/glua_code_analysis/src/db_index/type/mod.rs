@@ -2086,23 +2086,24 @@ impl LuaTypeIndex {
         }
     }
 
+    /// The direct subclasses of `decl_id`, unordered. Each child's declaration
+    /// is read only when the iterator reaches it.
+    pub fn direct_sub_types(&self, decl_id: &LuaTypeDeclId) -> impl Iterator<Item = &LuaTypeDecl> {
+        derivation::note_read(|| FactKey::SubTypes(decl_id.clone()));
+        self.sub_types
+            .get(decl_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|child_id| {
+                derivation::note_type_decl_read(child_id);
+                self.full_name_type_map.get(child_id)
+            })
+    }
+
     /// Get all direct subclasses of a given type
     /// Returns a vector of type declarations that directly inherit from the given type
     pub fn get_sub_types(&self, decl_id: &LuaTypeDeclId) -> Vec<&LuaTypeDecl> {
-        derivation::note_read(|| FactKey::SubTypes(decl_id.clone()));
-        let Some(children) = self.sub_types.get(decl_id) else {
-            return Vec::new();
-        };
-        if derivation::recording() {
-            for child_id in children {
-                derivation::note_type_decl_read(&child_id);
-            }
-        }
-
-        let mut sub_types = children
-            .iter()
-            .filter_map(|type_id| self.full_name_type_map.get(type_id))
-            .collect::<Vec<_>>();
+        let mut sub_types = self.direct_sub_types(decl_id).collect::<Vec<_>>();
 
         // Sort to ensure deterministic ordering regardless of HashMap iteration order
         sort_type_decls_for_sub_types(&mut sub_types);
