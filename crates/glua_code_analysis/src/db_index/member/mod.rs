@@ -121,6 +121,7 @@ fn note_slot_write(owner: &LuaMemberOwner, key: &LuaMemberKey) {
 fn note_owner_map_write(owner: &LuaMemberOwner) {
     derivation::note_write(|| FactKey::MemberOwnerMap(owner.clone()));
     derivation::note_write(|| FactKey::MemberOwnerExprKeys(owner.clone()));
+    derivation::note_write(|| FactKey::MemberOwnerFields(owner.clone()));
     derivation::note_write(|| FactKey::MemberOwnerPresence(owner.clone()));
 }
 
@@ -342,6 +343,11 @@ impl LuaMemberIndex {
                 } else {
                     ABSENT
                 }
+            }
+            FactKey::MemberOwnerFields(owner) => {
+                self.owner_members.get(owner).map_or(ABSENT, |members| {
+                    fingerprint_of(&self.field_member_ids(members).collect::<Vec<_>>())
+                })
             }
             FactKey::MemberOwnerExprKeys(owner) => {
                 self.owner_members.get(owner).map_or(ABSENT, |members| {
@@ -2075,6 +2081,34 @@ impl LuaMemberIndex {
                 .filter_map(|member_id| self.get_member(member_id))
                 .collect(),
         )
+    }
+
+    /// The owner's members that are not methods, in the order
+    /// [`Self::get_members`] would yield them.
+    pub fn get_field_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
+        let owner = self.canonical(owner);
+        derivation::note_read(|| FactKey::MemberOwnerFields(owner.clone()));
+        let owner_members = self.owner_members.get(owner)?;
+        Some(
+            self.field_member_ids(owner_members)
+                .filter_map(|member_id| self.get_member(&member_id))
+                .collect(),
+        )
+    }
+
+    fn field_member_ids<'a>(
+        &'a self,
+        owner_members: &'a LuaOwnerMembers,
+    ) -> impl Iterator<Item = LuaMemberId> + 'a {
+        owner_members
+            .sorted_member_ids()
+            .iter()
+            .copied()
+            .filter(|member_id| {
+                self.members
+                    .get(member_id)
+                    .is_some_and(|member| !member.get_feature().is_method_decl())
+            })
     }
 
     /// The owner's members whose key is an expression rather than a name, in

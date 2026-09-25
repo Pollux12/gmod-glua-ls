@@ -22,6 +22,8 @@ use super::{
 pub enum FindMemberFilter {
     /// 寻找所有成员
     All,
+    /// Members that are not methods: what a structural check compares.
+    Fields,
     /// 根据指定的key寻找成员
     ByKey {
         /// 要搜索的成员key
@@ -36,15 +38,15 @@ pub fn find_members(db: &DbIndex, prefix_type: &LuaType) -> FindMembersResult {
     find_members_guard(db, prefix_type, &ctx, &FindMemberFilter::All)
 }
 
-/// [`find_members`] without dynamic fields. Outside a file they are listed as
-/// `any` and never required, so a structural check against a type's members
-/// cannot be decided by them.
-pub(crate) fn find_declared_members(db: &DbIndex, prefix_type: &LuaType) -> FindMembersResult {
+/// The members a structural check against `prefix_type` compares: no methods,
+/// and no dynamic fields, which outside a file are listed as `any` and never
+/// required.
+pub(crate) fn find_structural_members(db: &DbIndex, prefix_type: &LuaType) -> FindMembersResult {
     let ctx = FindMembersContext {
         dynamic_fields: false,
         ..FindMembersContext::new(InferGuard::new())
     };
-    find_members_guard(db, prefix_type, &ctx, &FindMemberFilter::All)
+    find_members_guard(db, prefix_type, &ctx, &FindMemberFilter::Fields)
 }
 
 pub fn find_members_in_workspace_for_file(
@@ -351,7 +353,7 @@ fn find_members_guard(
 /// 检查成员是否应该被包含
 fn should_include_member(key: &LuaMemberKey, filter: &FindMemberFilter) -> bool {
     match filter {
-        FindMemberFilter::All => true,
+        FindMemberFilter::All | FindMemberFilter::Fields => true,
         FindMemberFilter::ByKey { member_key, .. } => member_key == key,
     }
 }
@@ -604,6 +606,7 @@ fn find_unscoped_owner_members(
             member_index.get_members_with_key(owner, member_key)?
         }
         FindMemberFilter::All => member_index.get_members(owner)?,
+        FindMemberFilter::Fields => member_index.get_field_members(owner)?,
     };
 
     for member in owner_members {
@@ -642,8 +645,12 @@ fn find_workspace_scoped_owner_members(
     let member_index = db.get_member_index();
 
     match filter {
-        FindMemberFilter::All => {
-            let owner_members = member_index.get_members(owner)?;
+        FindMemberFilter::All | FindMemberFilter::Fields => {
+            let owner_members = if matches!(filter, FindMemberFilter::Fields) {
+                member_index.get_field_members(owner)?
+            } else {
+                member_index.get_members(owner)?
+            };
             let mut seen = HashSet::default();
             let mut members = Vec::new();
 
@@ -1429,9 +1436,9 @@ mod tests {
     use rowan::{TextRange, TextSize};
 
     use super::{
-        FindMembersContext, find_declared_members, find_members,
-        find_members_in_workspace_for_file, find_members_with_key,
-        find_members_with_key_in_workspace_for_file, super_types_for_context,
+        FindMembersContext, find_members, find_members_in_workspace_for_file,
+        find_members_with_key, find_members_with_key_in_workspace_for_file,
+        find_structural_members, super_types_for_context,
     };
     use crate::{
         DbIndex, DynamicFieldOwner, Emmyrc, FileId, GlobalId, GmodRealm, GmodRealmFileMetadata,
@@ -1951,7 +1958,7 @@ mod tests {
         assert_eq!(dynamic.len(), 2);
         assert!(dynamic.iter().all(|member| member.typ == LuaType::Any));
 
-        let declared_only = find_declared_members(&db, &prefix).expect("members");
+        let declared_only = find_structural_members(&db, &prefix).expect("members");
         assert_eq!(declared_only.len(), 1);
         assert_eq!(declared_only[0].key, LuaMemberKey::Name("declared".into()));
     }

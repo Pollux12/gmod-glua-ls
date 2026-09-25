@@ -28,6 +28,48 @@ mod test {
     }
 
     #[test]
+    fn a_structural_check_against_a_class_reads_its_fields_not_its_methods() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_ids = ws.def_files(vec![
+            (
+                "lib.lua",
+                r#"
+                ---@class Widget
+                ---@field size integer
+                Widget = {}
+
+                ---@param w Widget
+                ---@return integer
+                ---@overload fun(w: string): string
+                function use(w) end
+                "#,
+            ),
+            (
+                "methods.lua",
+                "function Widget:Extra() end
+",
+            ),
+            (
+                "user.lua",
+                "local r = use({ size = 1 })
+",
+            ),
+        ]);
+        let graph = ws.analysis.compilation.get_db().reader_graph();
+        let widget = crate::LuaMemberOwner::Type(crate::LuaTypeDeclId::global("Widget"));
+        let user_readers = |key: FactKey| {
+            graph
+                .derivations()
+                .filter(|id| id.file_id == file_ids[2])
+                .filter(|id| graph.reads_of(*id).any(|read| **read == key))
+                .count()
+        };
+
+        assert!(user_readers(FactKey::MemberOwnerFields(widget.clone())) > 0);
+        assert_eq!(user_readers(FactKey::MemberOwnerMap(widget)), 0);
+    }
+
+    #[test]
     fn a_batch_over_an_existing_load_fold_evaluates_each_statement_once() {
         let mut ws = gmod_workspace();
         ws.def_file("addons/a/lua/autorun/client/first.lua", "local a = 1\n");

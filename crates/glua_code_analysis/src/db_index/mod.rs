@@ -303,6 +303,7 @@ impl DbIndex {
             | K::MemberSlot(..)
             | K::MemberOwnerMap(_)
             | K::MemberOwnerExprKeys(_)
+            | K::MemberOwnerFields(_)
             | K::MemberOwnerPresence(_)
             | K::MemberKey(_)
             | K::MemberFile(_)

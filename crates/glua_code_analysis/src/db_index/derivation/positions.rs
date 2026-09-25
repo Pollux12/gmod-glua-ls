@@ -150,6 +150,7 @@ impl EditMaps {
             K::MemberSlot(owner, key) => K::MemberSlot(self.member_owner(owner)?, key.clone()),
             K::MemberOwnerMap(owner) => K::MemberOwnerMap(self.member_owner(owner)?),
             K::MemberOwnerExprKeys(owner) => K::MemberOwnerExprKeys(self.member_owner(owner)?),
+            K::MemberOwnerFields(owner) => K::MemberOwnerFields(self.member_owner(owner)?),
             K::MemberOwnerPresence(owner) => K::MemberOwnerPresence(self.member_owner(owner)?),
             K::DefinitionSite(site) => K::DefinitionSite(self.site(site)?),
             K::Metatable(site) => K::Metatable(self.site(site)?),
