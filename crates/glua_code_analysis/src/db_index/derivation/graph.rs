@@ -18,21 +18,12 @@ struct Record {
     outputs: Box<[KeyIdx]>,
 }
 
-impl Record {
-    fn seen(&self, key: KeyIdx) -> Option<Fingerprint> {
-        self.reads
-            .binary_search_by_key(&key, |(read, _)| *read)
-            .ok()
-            .map(|at| self.reads[at].1)
-    }
-}
-
 /// A fact key and the derivations that read or produced it. `key` is `None`
 /// while the slot is free.
 #[derive(Debug)]
 struct KeySlot {
     key: Option<HashedKey>,
-    readers: FxHashSet<DerivIdx>,
+    readers: Readers,
     producers: Vec<DerivIdx>,
     /// The key's fingerprint as last taken, and the generation it was taken in
     /// ([`NO_GENERATION`]: none); see [`ReaderGraph::current_fingerprint`].
@@ -61,7 +52,7 @@ impl Default for KeySlot {
     fn default() -> Self {
         Self {
             key: None,
-            readers: FxHashSet::default(),
+            readers: Readers::default(),
             producers: Vec::new(),
             current: AtomicU64::new(0),
             current_generation: AtomicU32::new(NO_GENERATION),
@@ -71,6 +62,42 @@ impl Default for KeySlot {
 }
 
 const NO_GENERATION: u32 = u32::MAX;
+
+/// A key's readers, grouped by the fingerprint each saw. Nearly every key has
+/// one group, so checking its readers against a new value is one comparison
+/// per group rather than one per reader.
+#[derive(Debug, Clone, Default)]
+struct Readers(Vec<(Fingerprint, FxHashSet<DerivIdx>)>);
+
+impl Readers {
+    fn insert(&mut self, deriv: DerivIdx, seen: Fingerprint) {
+        match self.0.iter_mut().find(|(group, _)| *group == seen) {
+            Some((_, derivs)) => {
+                derivs.insert(deriv);
+            }
+            None => self.0.push((seen, FxHashSet::from_iter([deriv]))),
+        }
+    }
+
+    fn remove(&mut self, deriv: DerivIdx, seen: Fingerprint) {
+        if let Some(at) = self.0.iter().position(|(group, _)| *group == seen) {
+            self.0[at].1.remove(&deriv);
+            if self.0[at].1.is_empty() {
+                self.0.swap_remove(at);
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (Fingerprint, DerivIdx)> + '_ {
+        self.0
+            .iter()
+            .flat_map(|(seen, derivs)| derivs.iter().map(move |deriv| (*seen, *deriv)))
+    }
+}
 
 #[derive(Debug, Clone)]
 struct DerivSlot {
@@ -273,18 +300,36 @@ impl ReaderGraph {
             .unwrap_or_default();
 
         let mut unread = Vec::new();
-        let mut added_reads = Vec::new();
-        merge_sorted(
-            old.reads.iter().map(|(key, _)| *key),
-            reads.iter().map(|(key, _)| *key),
-            |key| unread.push(key),
-            |key| added_reads.push(key),
-        );
-        for key in added_reads {
-            self.table.keys[key as usize].readers.insert(deriv);
-        }
-        for key in &unread {
-            self.table.keys[*key as usize].readers.remove(&deriv);
+        let (mut old_reads, mut new_reads) = (old.reads.iter().peekable(), reads.iter().peekable());
+        loop {
+            match (old_reads.peek().copied(), new_reads.peek().copied()) {
+                (Some((old_key, old_seen)), Some((new_key, new_seen))) if old_key == new_key => {
+                    if old_seen != new_seen {
+                        let readers = &mut self.table.keys[*new_key as usize].readers;
+                        readers.remove(deriv, *old_seen);
+                        readers.insert(deriv, *new_seen);
+                    }
+                    old_reads.next();
+                    new_reads.next();
+                }
+                (Some((old_key, old_seen)), next)
+                    if next.is_none_or(|(new_key, _)| old_key < new_key) =>
+                {
+                    self.table.keys[*old_key as usize]
+                        .readers
+                        .remove(deriv, *old_seen);
+                    unread.push(*old_key);
+                    old_reads.next();
+                }
+                (_, Some((new_key, new_seen))) => {
+                    self.table.keys[*new_key as usize]
+                        .readers
+                        .insert(deriv, *new_seen);
+                    new_reads.next();
+                }
+                (None, None) => break,
+                (Some(_), None) => unreachable!("handled above"),
+            }
         }
 
         let mut dropped = Vec::new();
@@ -364,18 +409,15 @@ impl ReaderGraph {
         key: &HashedKey,
         holds: impl Fn(Fingerprint) -> bool + 'a,
     ) -> impl Iterator<Item = DerivationId> + 'a {
-        let slot = self.table.key_slots.get(key).copied();
-        slot.map(|slot| (slot, &self.table.keys[slot as usize].readers))
+        self.table
+            .key_slots
+            .get(key)
+            .map(|slot| &self.table.keys[*slot as usize].readers.0)
             .into_iter()
-            .flat_map(|(slot, readers)| readers.iter().map(move |deriv| (slot, *deriv)))
-            .filter(move |(slot, deriv)| {
-                self.derivations[*deriv as usize]
-                    .record
-                    .as_ref()
-                    .and_then(|record| record.seen(*slot))
-                    .is_none_or(|seen| !holds(seen))
-            })
-            .map(|(_, deriv)| self.derivations[deriv as usize].id)
+            .flatten()
+            .filter(move |(seen, _)| !holds(*seen))
+            .flat_map(|(_, derivs)| derivs.iter())
+            .map(|deriv| self.derivations[*deriv as usize].id)
     }
 
     /// Whether any read `id` last made no longer holds: it saw another
@@ -414,9 +456,14 @@ impl ReaderGraph {
             return false;
         };
         let mut moved = false;
-        for ((_, seen), fingerprint) in record.reads.iter_mut().zip(fingerprints) {
-            moved |= *seen != fingerprint;
-            *seen = fingerprint;
+        for ((key, seen), fingerprint) in record.reads.iter_mut().zip(fingerprints) {
+            if *seen != fingerprint {
+                moved = true;
+                let readers = &mut self.table.keys[*key as usize].readers;
+                readers.remove(deriv, *seen);
+                readers.insert(deriv, fingerprint);
+                *seen = fingerprint;
+            }
         }
         moved
     }
@@ -443,7 +490,7 @@ impl ReaderGraph {
                 None => lost.extend(
                     readers
                         .iter()
-                        .map(|deriv| self.derivations[*deriv as usize].id),
+                        .map(|(_, deriv)| self.derivations[deriv as usize].id),
                 ),
             }
         }
@@ -461,8 +508,8 @@ impl ReaderGraph {
         let mut vacated = Vec::with_capacity(moved.len());
         for (slot, new_key, readers) in moved {
             let target = self.intern_key(new_key);
-            for deriv in readers {
-                self.table.keys[target as usize].readers.insert(deriv);
+            for (seen, deriv) in readers.iter() {
+                self.table.keys[target as usize].readers.insert(deriv, seen);
                 rewrites.entry(deriv).or_default().insert(slot, target);
             }
             vacated.push(slot);
@@ -543,8 +590,8 @@ impl ReaderGraph {
             let Some(owner) = slot.key.as_deref().and_then(FactKey::owning_file) else {
                 continue;
             };
-            for deriv in &slot.readers {
-                let reader = self.derivations[*deriv as usize].id.file_id;
+            for (_, deriv) in slot.readers.iter() {
+                let reader = self.derivations[deriv as usize].id.file_id;
                 if reader != owner && reader != FileId::VIRTUAL {
                     dependents.entry(owner).or_default().insert(reader);
                 }
@@ -630,8 +677,8 @@ impl ReaderGraph {
             .record
             .take()
             .unwrap_or_default();
-        for (key, _) in record.reads.iter() {
-            self.table.keys[*key as usize].readers.remove(&deriv);
+        for (key, seen) in record.reads.iter() {
+            self.table.keys[*key as usize].readers.remove(deriv, *seen);
             self.release_key(*key);
         }
         let outputs = record

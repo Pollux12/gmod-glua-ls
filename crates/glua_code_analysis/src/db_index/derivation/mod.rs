@@ -891,18 +891,16 @@ pub fn note_read(key: impl FnOnce() -> FactKey) {
 }
 
 fn record_read(evaluation: &mut Evaluation, key: HashedKey) {
-    let recorded = KEYS.with(|keys| {
-        keys.borrow_mut()
-            .as_mut()
-            .map(|table| table.note_read(key.clone(), evaluation.stamp))
-    });
-    match recorded {
-        Some(Some(slot)) => evaluation.slots.push(slot),
-        Some(None) => {}
+    KEYS.with(|keys| match keys.borrow_mut().as_mut() {
+        Some(table) => {
+            if let Some(slot) = table.note_read(key, evaluation.stamp) {
+                evaluation.slots.push(slot);
+            }
+        }
         None => {
             evaluation.reads.insert(key);
         }
-    }
+    });
 }
 
 /// Records a read of `key`, which `identity` names exactly: a repeat within
