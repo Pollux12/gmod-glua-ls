@@ -143,6 +143,13 @@ impl KeyTable {
         slot
     }
 
+    /// Whether evaluation `stamp` recorded a read of `key`.
+    pub(super) fn stamped(&self, key: &HashedKey, stamp: u32) -> bool {
+        self.key_slots
+            .get(key)
+            .is_some_and(|slot| self.keys[*slot as usize].stamp == stamp)
+    }
+
     /// Interns `key` and returns its slot if evaluation `stamp` has not
     /// recorded it yet.
     pub(super) fn note_read(&mut self, key: HashedKey, stamp: u32) -> Option<KeyIdx> {

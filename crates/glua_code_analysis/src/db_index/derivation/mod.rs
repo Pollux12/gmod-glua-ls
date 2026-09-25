@@ -1036,8 +1036,18 @@ pub fn note_file_read(file_id: FileId) {
 pub fn note_write(key: impl FnOnce() -> FactKey) {
     CURRENT.with(|current| {
         if let Some(evaluation) = current.borrow_mut().as_mut() {
-            WRITE_GENERATION.with(|generation| generation.set(generation.get() + 1));
-            evaluation.outputs.insert(HashedKey::new(key()));
+            let key = HashedKey::new(key());
+            // Inference memoised during an evaluation read only keys the
+            // evaluation recorded, so a write it did not read leaves it valid.
+            let read_here = KEYS.with(|keys| {
+                keys.borrow()
+                    .as_ref()
+                    .is_none_or(|table| table.stamped(&key, evaluation.stamp))
+            });
+            if read_here {
+                WRITE_GENERATION.with(|generation| generation.set(generation.get() + 1));
+            }
+            evaluation.outputs.insert(key);
         } else {
             CAPTURED.with(|captured| {
                 if let Some(captured) = captured.borrow_mut().as_mut() {
