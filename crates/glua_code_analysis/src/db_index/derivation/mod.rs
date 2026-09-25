@@ -775,6 +775,8 @@ thread_local! {
     static KEYS: RefCell<Option<KeyTable>> = const { RefCell::new(None) };
     static STAMP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static CURRENT: RefCell<Option<Evaluation>> = const { RefCell::new(None) };
+    /// Evaluations suspended on this thread by one begun inside them.
+    static SUSPENDED: RefCell<Vec<Evaluation>> = const { RefCell::new(Vec::new()) };
     static UNTRACKED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static WRITE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CAPTURED: RefCell<Option<FxHashSet<HashedKey>>> = const { RefCell::new(None) };
@@ -829,7 +831,6 @@ pub fn forget_lent_keys() {
     KEYS.with(|keys| keys.borrow_mut().take());
 }
 
-/// Starts recording the evaluation of `id` on this thread.
 fn next_stamp() -> u32 {
     STAMP.with(|stamp| {
         let next = stamp.get().wrapping_add(1).max(1);
@@ -838,22 +839,28 @@ fn next_stamp() -> u32 {
     })
 }
 
+/// Starts recording the evaluation of `id` on this thread.
 pub fn begin(id: DerivationId) {
     let stamp = next_stamp();
+    start(Evaluation {
+        id,
+        slots: Vec::new(),
+        stamp,
+        reads: FxHashSet::default(),
+        read_identities: FxHashSet::default(),
+        outputs: FxHashSet::default(),
+        staged: rustc_hash::FxHashMap::default(),
+    });
+}
+
+/// Makes `evaluation` the one recording on this thread. One already recording
+/// is suspended until `evaluation` ends: a thread waiting in the pool runs
+/// other work, which may record its own evaluation.
+fn start(evaluation: Evaluation) {
     CURRENT.with(|current| {
-        let previous = current.borrow_mut().replace(Evaluation {
-            id,
-            slots: Vec::new(),
-            stamp,
-            reads: FxHashSet::default(),
-            read_identities: FxHashSet::default(),
-            outputs: FxHashSet::default(),
-            staged: rustc_hash::FxHashMap::default(),
-        });
-        debug_assert!(
-            previous.is_none(),
-            "derivation {id:?} began inside {previous:?}"
-        );
+        if let Some(previous) = current.borrow_mut().replace(evaluation) {
+            SUSPENDED.with(|suspended| suspended.borrow_mut().push(previous));
+        }
     });
 }
 
@@ -863,17 +870,17 @@ pub fn resume(mut evaluation: Evaluation) {
     // Stamps are per thread: one taken on another thread can name an
     // evaluation this thread already ran.
     evaluation.stamp = next_stamp();
-    CURRENT.with(|current| {
-        let previous = current.borrow_mut().replace(evaluation);
-        debug_assert!(previous.is_none(), "resumed inside {previous:?}");
-    });
+    start(evaluation);
 }
 
 /// Stops recording and hands back what the evaluation read and wrote.
 pub fn end() -> Evaluation {
-    CURRENT
-        .with(|current| current.borrow_mut().take())
-        .expect("derivation::end without begin")
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        let evaluation = current.take().expect("derivation::end without begin");
+        *current = SUSPENDED.with(|suspended| suspended.borrow_mut().pop());
+        evaluation
+    })
 }
 
 /// Whether an evaluation is recording on this thread. Callers building a

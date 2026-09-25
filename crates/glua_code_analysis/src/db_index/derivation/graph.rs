@@ -919,6 +919,17 @@ mod tests {
     }
 
     #[test]
+    fn an_evaluation_begun_inside_another_suspends_it_until_it_ends() {
+        use super::super::{begin, end};
+
+        begin(id(1, 0));
+        begin(id(2, 0));
+
+        assert_eq!(end().id, id(2, 0));
+        assert_eq!(end().id, id(1, 0));
+    }
+
+    #[test]
     fn a_key_read_before_and_produced_now_stays_live() {
         let mut graph = ReaderGraph::default();
         graph.replace(id(1, 0), vec![(key(9), Some(5))], vec![], |_| 0);
