@@ -3162,8 +3162,7 @@ impl LuaMemberIndex {
     }
 }
 
-impl LuaMemberIndex {
-}
+impl LuaMemberIndex {}
 
 impl LuaIndex for LuaMemberIndex {
     fn remove(&mut self, file_id: FileId) {

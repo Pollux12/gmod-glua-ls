@@ -423,59 +423,6 @@ impl LuaInferCache {
         self.signature_is_generic_cache.clear();
     }
 
-    /// Drops every narrowing answer this file has memoised.
-    ///
-    /// A *successful* flow answer survives
-    /// [`Self::clear_deferred_inference_results`], and narrowing a name reads
-    /// the type of whatever it was derived from — so once a value the walk read
-    /// as "not determined yet" becomes known, every answer that read it is
-    /// void, whichever variable it happens to be keyed under. There is no way
-    /// to drop only the ones that read it: the key names what was narrowed, not
-    /// what the narrowing consulted.
-    pub fn clear_flow_results(&mut self) {
-        self.flow_node_cache.clear();
-        self.flow_query_realm = None;
-        self.numeric_table_index_query_cache.clear();
-        self.unambiguous_int_const_cache.clear();
-        self.decl_name_index = None;
-        self.index_ref_origin_type_cache.clear();
-    }
-
-    /// Drops the narrowing answers that a settling value can have invalidated.
-    ///
-    /// An answer that came back undetermined is one the walk could not pin
-    /// down, so it is exactly what a value becoming known makes wrong. An
-    /// answer that determined something did not read that value as unsettled,
-    /// and those are the expensive ones to rebuild — a fifth of a cold index if
-    /// the whole cache goes.
-    pub fn clear_undetermined_flow_results(&mut self) {
-        fn settled(entry: &CacheEntry<LuaType>) -> bool {
-            match entry {
-                CacheEntry::Cache(typ) => !crate::db_index::is_undetermined_type(typ),
-                _ => false,
-            }
-        }
-        self.flow_node_cache.retain(|_, inner| {
-            inner.retain(|_, entry| match entry {
-                CacheEntry::Cache(typ) => !crate::db_index::is_undetermined_type(typ.as_ref()),
-                _ => false,
-            });
-            !inner.is_empty()
-        });
-        self.numeric_table_index_query_cache.clear();
-        self.unambiguous_int_const_cache.clear();
-        self.decl_name_index = None;
-        self.index_ref_origin_type_cache
-            .retain(|_, entry| settled(entry));
-    }
-
-    /// Discards what a `for ... in pairs(t)` answer was built from, so it can be
-    /// taken again against a member map that has since grown.
-    pub fn clear_iter_var_results(&mut self) {
-        self.clear_deferred_inference_results();
-        self.for_range_iter_var_type_cache.clear();
-    }
-
     /// Discards the inference a wave of deferred resolution can have
     /// invalidated.
     pub fn clear_deferred_inference_results(&mut self) {
