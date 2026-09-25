@@ -203,10 +203,8 @@ fn collect_dynamic_fields_for_file(
     Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
     Vec<FiniteNamedMemberEvidence>,
     Vec<(SmolStr, rowan::TextRange)>,
-    Vec<glua_parser::LuaSyntaxId>,
 ) {
     let mut collected_unattributed: Vec<(SmolStr, rowan::TextRange)> = Vec::new();
-    let mut dynamic_field_retry: Vec<glua_parser::LuaSyntaxId> = Vec::new();
     let mut collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
         Vec::new();
     let mut collected_propagated: Vec<(
@@ -274,18 +272,12 @@ fn collect_dynamic_fields_for_file(
             let prefix_type = if let Some(cached_type) = prefix_type_cache.get(&cache_key) {
                 match cached_type {
                     Some(prefix_type) => prefix_type.clone(),
-                    None => {
-                        // A failed prefix infer is as settle-dependent as a
-                        // partial one — the site is a candidate either way.
-                        dynamic_field_retry.push(index_expr.get_syntax_id());
-                        continue;
-                    }
+                    None => continue,
                 }
             } else {
                 let inferred = infer_expr(db, cache, prefix_expr.clone()).ok();
                 prefix_type_cache.insert(cache_key, inferred.clone());
                 let Some(prefix_type) = inferred else {
-                    dynamic_field_retry.push(index_expr.get_syntax_id());
                     continue;
                 };
                 prefix_type
@@ -299,7 +291,6 @@ fn collect_dynamic_fields_for_file(
                 prefix_type
             };
             if should_collect_wildcard {
-                let before = collected_wildcards.len();
                 collect_wildcard_for_type(
                     db,
                     &effective_type,
@@ -307,13 +298,6 @@ fn collect_dynamic_fields_for_file(
                     definition_range,
                     &mut collected_wildcards,
                 );
-                // The write is dynamic and real, but the prefix's type held no
-                // nameable table yet. Whether it does is a property of how far
-                // the batch had settled, so the site is retried once settling
-                // is done. See `rederive_settled_dynamic_fields`.
-                if collected_wildcards.len() == before {
-                    dynamic_field_retry.push(index_expr.get_syntax_id());
-                }
             }
 
             if is_dynamic_index_key(&index_expr) && !field_names.names.is_empty() {
@@ -364,12 +348,9 @@ fn collect_dynamic_fields_for_file(
                     );
                     // The write is real but landed on no owner the index can
                     // name, so record that the field exists somewhere even
-                    // though no table claims it — and queue the site for the
-                    // settled retry, which attributes it properly once the
-                    // prefix's type has finished settling.
+                    // though no table claims it.
                     if site_named.len() == before {
                         collected_unattributed.push((field_name.clone(), definition_range));
-                        dynamic_field_retry.push(index_expr.get_syntax_id());
                     }
                 }
             }
@@ -415,7 +396,6 @@ fn collect_dynamic_fields_for_file(
         collected_wildcards,
         collected_finite_members,
         collected_unattributed,
-        dynamic_field_retry,
     )
 }
 
@@ -461,14 +441,7 @@ fn analyze_dynamic_fields(
             .get_syntax_tree(&file_id)
             .map(|tree| tree.get_chunk_node())
         else {
-            return (
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            );
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         };
         collect_dynamic_fields_for_file(db, file_id, &root, mode, &field_setter_helpers)
     });
@@ -478,14 +451,7 @@ fn analyze_dynamic_fields(
     let merge_start = profile_enabled.then(std::time::Instant::now);
     let mut collected_unattributed: Vec<(SmolStr, crate::FileId, rowan::TextRange)> = Vec::new();
     for (
-        (
-            file_collected,
-            file_propagated,
-            file_wildcards,
-            file_finite_members,
-            file_unattributed,
-            file_dynamic_field_retry,
-        ),
+        (file_collected, file_propagated, file_wildcards, file_finite_members, file_unattributed),
         file_id,
     ) in per_file.into_iter().zip(file_ids)
     {
@@ -498,9 +464,6 @@ fn analyze_dynamic_fields(
                 .into_iter()
                 .map(|(field_name, range)| (field_name, file_id, range)),
         );
-        for syntax_id in file_dynamic_field_retry {
-            context.record_settled_dynamic_field_candidate(file_id, syntax_id);
-        }
     }
     if let (Some(profile), Some(merge_start)) = (profile.as_mut(), merge_start) {
         profile.collection_merge_time += merge_start.elapsed();

@@ -132,9 +132,6 @@ struct LuaAnalyzer<'a> {
     gmod_enabled: bool,
     is_scripted_class_scope: bool,
     special_call_direct_matcher: &'a call::SpecialCallDirectMatcher,
-    /// Whether the last [`Self::infer_expr`] merged sibling members under a
-    /// computed key.
-    sibling_merge_read: bool,
     member_collection_assignment_widening_cache:
         FxHashMap<MemberAssignmentWideningCacheKey, MemberWideningCache<LuaType>>,
     pending_dynamic_key_collection_widenings: FxHashMap<DynamicKeyCollectionWideningKey, LuaType>,
@@ -176,7 +173,6 @@ impl LuaAnalyzer<'_> {
             gmod_enabled,
             is_scripted_class_scope,
             special_call_direct_matcher,
-            sibling_merge_read: false,
             member_collection_assignment_widening_cache: FxHashMap::default(),
             pending_dynamic_key_collection_widenings: FxHashMap::default(),
             guarded_table_assignment_type_cache: FxHashMap::default(),
@@ -197,9 +193,6 @@ impl LuaAnalyzer<'_> {
 impl LuaAnalyzer<'_> {
     pub fn infer_expr(&mut self, expr: &LuaExpr) -> Result<LuaType, InferFailReason> {
         let cache = self.context.infer_manager.get_infer_cache(self.file_id);
-        let merges_before = cache.sibling_merge_reads;
-        let result = infer_expr(self.db, cache, expr.clone());
-        self.sibling_merge_read = cache.sibling_merge_reads > merges_before;
-        result
+        infer_expr(self.db, cache, expr.clone())
     }
 }

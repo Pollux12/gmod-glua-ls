@@ -565,60 +565,10 @@ pub struct AnalyzeContext {
     scripted_scope_infos: Option<Arc<HashMap<FileId, GmodScopedClassInfo>>>,
     unresolves: Vec<(UnResolve, InferFailReason)>,
     pending_unresolve_decl_ids: HashSet<LuaDeclId>,
-    settled_decl_initializer_candidates: HashSet<LuaDeclId>,
-    member_initializer_reinfer_candidates: HashSet<LuaMemberId>,
-    /// Member writes whose value read through a field-exist guard. See
-    /// [`AnalyzeContext::request_guarded_member_read_reinfer`].
-    guarded_member_read_candidates: HashSet<LuaMemberId>,
-    /// Members whose value was answered by merging a table's sibling members
-    /// under a computed key. That merge reads whichever writers the batch had
-    /// indexed, with the types they held at the time; the settled passes widen
-    /// those writers and attach the cross-file ones, so the value is re-read
-    /// once they have. Cleared with the other settled candidate sets.
-    settled_sibling_merge_read_candidates: HashSet<LuaMemberId>,
-    /// Local assignments whose right-hand side reads a local the settled tail
-    /// has since moved (`selected = key`). Unlike member writes and immutable
-    /// locals, these read no cache of their own, so the settled tail replays
-    /// the write itself through `bind_decl_write`. Queued by
-    /// [`queue_settled_decl_dependents`], re-derived by
-    /// [`rederive_settled_assign_reads`]. Each entry carries the return index
-    /// the target takes out of a trailing variadic right-hand side
-    /// (`first, second = echo(key)` queues `(first, rhs, 0)` and
-    /// `(second, rhs, 1)`); a lone right-hand side always queues index `0`.
-    settled_assign_candidates: Vec<(LuaDeclId, LuaExpr, usize)>,
-    /// Dedup keys for [`Self::settled_assign_candidates`]: the walk queues
-    /// every call/index right-hand side onto a local, so membership cannot
-    /// stay a linear scan.
-    settled_assign_candidate_keys: HashSet<(LuaDeclId, rowan::TextRange, usize)>,
     infer_manager: InferCacheManager,
     inferred_guard_candidates: Vec<InFiled<LuaSyntaxId>>,
     early_callable_signatures: Vec<(crate::LuaTypeOwner, LuaSignatureId)>,
     early_member_owner_candidates: Vec<(LuaMemberId, LuaDeclId)>,
-    /// Index-expression member attaches that `set_index_expr_owner` dropped
-    /// because the prefix carried no owner information yet. See
-    /// [`attach_settled_index_expr_members`].
-    settled_member_attach_candidates: Vec<InFiled<LuaSyntaxId>>,
-    /// Guarded table bootstraps whose canonical writer was picked from an
-    /// incomplete sibling set. See `resettle_guarded_table_bootstraps`.
-    settled_guarded_bootstrap_candidates: Vec<LuaMemberId>,
-    /// See [`AnalyzeContext::record_settled_global_read_candidate`].
-    settled_global_read_candidates: Vec<(LuaDeclId, LuaExpr)>,
-    /// Decls reading through a multi-declaration global. Unlike
-    /// [`Self::settled_global_read_candidates`], the settled re-derivation is
-    /// allowed to replace the walk's answer even when it does not structurally
-    /// subsume it: a global declared once per realm is a single runtime table,
-    /// so the read against the complete set of backing tables is authoritative
-    /// over the read the walk took against whichever ones it had reached.
-    settled_multi_decl_global_read_candidates: Vec<(LuaDeclId, LuaExpr)>,
-    /// Dynamic-write sites whose prefix held no nameable table when the
-    /// dynamic-field pass ran. See
-    /// [`dynamic_field::rederive_settled_dynamic_fields`].
-    pub(crate) settled_dynamic_field_candidates: Vec<(FileId, glua_parser::LuaSyntaxId)>,
-    /// Files where a `panel:GetParent()` read resolved to the broad `Panel`
-    /// fallback because the vgui parent chain was not complete yet. The chains
-    /// are finished in the gmod-post pass, after which those reads (and anything
-    /// derived from them) are re-derived; see `rederive_vgui_parent_fallbacks`.
-    vgui_parent_fallback_files: HashSet<FileId>,
     pub workspace_id: Option<WorkspaceId>,
 }
 
@@ -631,22 +581,10 @@ impl AnalyzeContext {
             scripted_scope_infos: None,
             unresolves: Vec::new(),
             pending_unresolve_decl_ids: HashSet::default(),
-            settled_decl_initializer_candidates: HashSet::default(),
-            member_initializer_reinfer_candidates: HashSet::default(),
-            guarded_member_read_candidates: HashSet::default(),
-            settled_sibling_merge_read_candidates: HashSet::default(),
-            settled_assign_candidates: Vec::new(),
-            settled_assign_candidate_keys: HashSet::default(),
             infer_manager: InferCacheManager::new(),
             inferred_guard_candidates: Vec::new(),
             early_callable_signatures: Vec::new(),
             early_member_owner_candidates: Vec::new(),
-            settled_member_attach_candidates: Vec::new(),
-            settled_guarded_bootstrap_candidates: Vec::new(),
-            settled_global_read_candidates: Vec::new(),
-            settled_multi_decl_global_read_candidates: Vec::new(),
-            settled_dynamic_field_candidates: Vec::new(),
-            vgui_parent_fallback_files: HashSet::default(),
             workspace_id: None,
         }
     }
@@ -690,46 +628,6 @@ impl AnalyzeContext {
         self.unresolves.push((un_resolve, reason));
     }
 
-    /// Remembers a dynamic write whose prefix had no nameable table type yet,
-    /// so its wildcard can be taken again once the batch has settled.
-    pub(crate) fn record_settled_dynamic_field_candidate(
-        &mut self,
-        file_id: FileId,
-        syntax_id: glua_parser::LuaSyntaxId,
-    ) {
-        self.settled_dynamic_field_candidates
-            .push((file_id, syntax_id));
-    }
-
-    /// Remembers `local x = SomeGlobal`. A global's type is the merge of every
-    /// file that writes it, and a batch that retains some writers while its own
-    /// are still empty answers the read from a smaller set than a cold build
-    /// sees. See `rederive_settled_global_reads`.
-    pub(crate) fn record_settled_global_read_candidate(
-        &mut self,
-        decl_id: LuaDeclId,
-        expr: LuaExpr,
-    ) {
-        self.settled_global_read_candidates.push((decl_id, expr));
-    }
-
-    pub(crate) fn record_settled_multi_decl_global_read_candidate(
-        &mut self,
-        decl_id: LuaDeclId,
-        expr: LuaExpr,
-    ) {
-        self.settled_multi_decl_global_read_candidates
-            .push((decl_id, expr));
-    }
-
-    pub(crate) fn record_vgui_parent_fallback_file(&mut self, file_id: FileId) {
-        self.vgui_parent_fallback_files.insert(file_id);
-    }
-
-    pub(crate) fn record_settled_guarded_bootstrap_candidate(&mut self, member_id: LuaMemberId) {
-        self.settled_guarded_bootstrap_candidates.push(member_id);
-    }
-
     pub fn add_inferred_guard_candidate(&mut self, candidate: InFiled<LuaSyntaxId>) {
         self.inferred_guard_candidates.push(candidate);
     }
@@ -748,58 +646,9 @@ impl AnalyzeContext {
             .push((member_id, decl_id));
     }
 
-    pub(crate) fn add_settled_member_attach_candidate(&mut self, candidate: InFiled<LuaSyntaxId>) {
-        self.settled_member_attach_candidates.push(candidate);
-    }
-
     pub fn has_pending_decl_unresolve(&self, decl_id: LuaDeclId) -> bool {
         self.pending_unresolve_decl_ids.contains(&decl_id)
     }
-    /// Queues an assignment onto a local for the settled replay.
-    ///
-    /// The write bound during the walk to whatever its right-hand side read
-    /// then; a call or index answer that moves afterwards leaves the local's
-    /// cache stale with nothing to report it. Re-derived through
-    /// `bind_decl_write` once the batch settles.
-    pub fn request_settled_assign_candidate(
-        &mut self,
-        decl_id: LuaDeclId,
-        expr: LuaExpr,
-        ret_idx: usize,
-    ) {
-        if self
-            .settled_assign_candidate_keys
-            .insert((decl_id, expr.get_range(), ret_idx))
-        {
-            self.settled_assign_candidates
-                .push((decl_id, expr, ret_idx));
-        }
-    }
-
-    pub fn request_settled_decl_initializer_reinfer(&mut self, decl_id: LuaDeclId) {
-        self.settled_decl_initializer_candidates.insert(decl_id);
-    }
-
-    pub fn request_member_initializer_reinfer(&mut self, member_id: LuaMemberId) {
-        self.member_initializer_reinfer_candidates.insert(member_id);
-    }
-
-    /// Queues a member write whose value read a member the enclosing `if`
-    /// tested for existence.
-    ///
-    /// That guard narrows the receiver to the types owning the key, taken
-    /// straight off the member index, so the read answers from however many of
-    /// those types the batch had walked. Re-derived once they all stand.
-    pub fn request_guarded_member_read_reinfer(&mut self, member_id: LuaMemberId) {
-        self.guarded_member_read_candidates.insert(member_id);
-    }
-
-    /// Queues a member write whose value merged a table's sibling members
-    /// under a computed key. See `settled_sibling_merge_read_candidates`.
-    pub fn request_sibling_merge_read_reinfer(&mut self, member_id: LuaMemberId) {
-        self.settled_sibling_merge_read_candidates.insert(member_id);
-    }
-
     pub fn get_or_compute_scripted_scope_files(&mut self, db: &DbIndex) -> Arc<HashSet<FileId>> {
         self.ensure_scripted_scope_cache(db);
 
