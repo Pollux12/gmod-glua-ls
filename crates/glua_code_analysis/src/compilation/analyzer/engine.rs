@@ -242,7 +242,8 @@ impl Engine {
         db: &mut DbIndex,
         recipe: &mut dyn FnMut(&mut DbIndex, DerivationId),
     ) {
-        crate::semantic::clear_access_paths();
+        crate::semantic::keep_access_paths();
+        let _paths = OnDrop(crate::semantic::stop_keeping_access_paths);
         loop {
             let Some((id, reason)) = self.worklist.pop_first() else {
                 if self.next_round.is_empty() {
@@ -327,7 +328,6 @@ impl Engine {
             self.readers_of(db, touched.iter());
         }
         self.cursor = None;
-        crate::semantic::clear_access_paths();
     }
 
     /// Resets the group's primary outputs and re-runs it. Returns every key the
@@ -354,12 +354,14 @@ impl Engine {
         // internal to it, not a stale input.
         let mut evaluations = Vec::with_capacity(group.len());
         derivation::lend_keys(db.reader_graph_mut().lend_keys());
+        let lent = scopeguard_lent_keys();
         for member in group {
             derivation::begin(*member);
             recipe(db, *member);
             evaluations.push(derivation::end());
         }
         db.reader_graph_mut().restore_keys(derivation::take_keys());
+        std::mem::forget(lent);
         for key in touched
             .iter()
             .chain(evaluations.iter().flat_map(derivation::Evaluation::outputs))
@@ -510,6 +512,20 @@ fn co_producers(db: &DbIndex, id: DerivationId) -> Vec<DerivationId> {
         }
     }
     group.into_iter().collect()
+}
+
+/// Runs its function when dropped, including while unwinding.
+struct OnDrop(fn());
+
+impl Drop for OnDrop {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
+/// Forgets the lent key table if evaluating a group unwinds.
+fn scopeguard_lent_keys() -> OnDrop {
+    OnDrop(derivation::forget_lent_keys)
 }
 
 /// `GLUALS_CHECK_FINGERPRINTS`: recompute every cached fingerprint and panic on

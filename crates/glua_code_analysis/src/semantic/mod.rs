@@ -35,7 +35,6 @@ pub(crate) use gmod_vgui_context::{
     resolve_registered_vgui_method_context_for_func,
 };
 pub(crate) use infer::check_iter_var_range;
-pub(crate) use infer::clear_access_paths;
 pub(crate) use infer::get_prefix_expr_signature_id;
 pub(crate) use infer::infer_bind_value_type;
 pub use infer::infer_index_expr;
@@ -48,6 +47,7 @@ pub(crate) use infer::pairs_iter_value_registry_path;
 pub(crate) use infer::resolve_decl_backed_global_path_member_type;
 use infer::{infer_call_arg_expr_list_types, infer_expr_list_types, infer_expr_list_value_type_at};
 pub use infer::{infer_table_field_value_should_be, infer_table_should_be};
+pub(crate) use infer::{keep_access_paths, stop_keeping_access_paths};
 use lsp_types::Uri;
 pub use member::LuaMemberInfo;
 pub use member::find_index_operations;

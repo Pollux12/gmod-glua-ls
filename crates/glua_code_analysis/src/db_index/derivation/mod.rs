@@ -823,6 +823,12 @@ pub fn take_keys() -> KeyTable {
         .expect("take_keys without lend_keys")
 }
 
+/// Drops a lent table left behind by an evaluation that unwound, so later
+/// evaluations on this thread do not intern into it.
+pub fn forget_lent_keys() {
+    KEYS.with(|keys| keys.borrow_mut().take());
+}
+
 /// Starts recording the evaluation of `id` on this thread.
 pub fn begin(id: DerivationId) {
     let stamp = STAMP.with(|stamp| {

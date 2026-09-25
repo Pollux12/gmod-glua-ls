@@ -344,20 +344,29 @@ fn index_expr_has_flow_node(
         .is_some_and(|flow_tree| flow_tree.get_flow_id(index_expr.get_syntax_id()).is_some())
 }
 
+type AccessPaths = rustc_hash::FxHashMap<
+    (crate::FileId, glua_parser::LuaSyntaxId),
+    Option<internment::ArcIntern<smol_str::SmolStr>>,
+>;
+
 thread_local! {
-    static ACCESS_PATHS: std::cell::RefCell<
-        rustc_hash::FxHashMap<(crate::FileId, glua_parser::LuaSyntaxId), Option<internment::ArcIntern<smol_str::SmolStr>>>,
-    > = Default::default();
+    /// Set only while an engine run on this thread keeps paths: every file's
+    /// text is fixed for the run.
+    static ACCESS_PATHS: std::cell::RefCell<Option<AccessPaths>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Forgets the access paths [`interned_access_path`] kept: a file's text may
-/// change before the next engine run.
-pub(crate) fn clear_access_paths() {
-    ACCESS_PATHS.with(|paths| paths.borrow_mut().clear());
+/// Keeps the access paths [`interned_access_path`] builds on this thread
+/// until [`stop_keeping_access_paths`].
+pub(crate) fn keep_access_paths() {
+    ACCESS_PATHS.with(|paths| *paths.borrow_mut() = Some(AccessPaths::default()));
 }
 
-/// `index_expr`'s interned access path. While an engine run records, a path
-/// is built once per expression: it depends on the syntax alone.
+pub(crate) fn stop_keeping_access_paths() {
+    ACCESS_PATHS.with(|paths| *paths.borrow_mut() = None);
+}
+
+/// `index_expr`'s interned access path. During an engine run a path is built
+/// once per expression: it depends on the syntax alone.
 fn interned_access_path(
     file_id: crate::FileId,
     syntax_id: glua_parser::LuaSyntaxId,
@@ -368,15 +377,12 @@ fn interned_access_path(
             .get_access_path()
             .map(|path| crate::db_index::intern_smol_str(&path))
     };
-    if !crate::db_index::derivation::recording() {
-        return build();
-    }
-    ACCESS_PATHS.with(|paths| {
-        paths
-            .borrow_mut()
+    ACCESS_PATHS.with(|paths| match paths.borrow_mut().as_mut() {
+        Some(paths) => paths
             .entry((file_id, syntax_id))
             .or_insert_with(build)
-            .clone()
+            .clone(),
+        None => build(),
     })
 }
 
