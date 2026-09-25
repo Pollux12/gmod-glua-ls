@@ -8,6 +8,51 @@ mod test {
 
     use crate::{DiagnosticCode, Emmyrc, LuaMemberId, LuaType, LuaTypeCache, VirtualWorkspace};
 
+    /// Calling a module whose `__call` metamethod takes the module first
+    /// passes the arguments after it: the module is not the first argument.
+    #[test]
+    fn a_callable_module_checks_its_arguments_against_the_call_operator() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Buffer
+
+            ---@class BufferModule
+            ---@operator call(string|table): Buffer
+            local BufferModule = {}
+            setmetatable(BufferModule, {
+                __call = function(_, data, little_endian) return {} end,
+            })
+
+            ---@type boolean?
+            local little_endian
+            local buffer = BufferModule("data", little_endian)
+        "#
+        ));
+    }
+
+    /// `---@operator call: T` lists no parameters: the call's arguments are
+    /// unconstrained, not absent.
+    #[test]
+    fn a_call_operator_without_a_parameter_list_accepts_any_arguments() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ---@class Delta
+
+            ---@class DeltaModule
+            ---@operator call: Delta
+            local DeltaModule = {}
+
+            local delta = DeltaModule(5)
+        "#
+        ));
+    }
+
     #[test]
     fn test_issue_216() {
         let mut ws = VirtualWorkspace::new();

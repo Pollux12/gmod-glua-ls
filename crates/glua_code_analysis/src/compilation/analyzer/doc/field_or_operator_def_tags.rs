@@ -185,14 +185,23 @@ pub fn analyze_operator(analyzer: &mut DocAnalyzer, tag: LuaDocTagOperator) -> O
                 .collect()
         })
         .unwrap_or_default();
+    let unlisted_call_args =
+        op_kind == LuaOperatorMetaMethod::Call && tag.get_param_list().is_none();
+    if unlisted_call_args {
+        operands.push(("...".to_string(), Some(LuaType::Any)));
+    }
 
-    operands.insert(
-        0,
-        (
-            "self".to_string(),
-            Some(LuaType::Ref(current_type_id.clone())),
-        ),
-    );
+    // An operator's operands start with the value it is defined on, except a
+    // call's: `Module(x)` passes `x` alone, like any `---@overload`.
+    if op_kind != LuaOperatorMetaMethod::Call {
+        operands.insert(
+            0,
+            (
+                "self".to_string(),
+                Some(LuaType::Ref(current_type_id.clone())),
+            ),
+        );
+    }
 
     let return_type = if let Some(return_type) = tag.get_return_type() {
         infer_type(analyzer, return_type)
@@ -208,7 +217,7 @@ pub fn analyze_operator(analyzer: &mut DocAnalyzer, tag: LuaDocTagOperator) -> O
         OperatorFunction::Func(Arc::new(LuaFunctionType::new(
             AsyncState::None,
             false,
-            false,
+            unlisted_call_args,
             operands,
             return_type,
         ))),
