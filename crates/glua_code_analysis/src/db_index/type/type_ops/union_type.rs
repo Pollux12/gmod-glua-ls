@@ -167,17 +167,19 @@ impl FoldAcc {
     }
 }
 
-/// Whether joining `typ` onto a union takes the member-list step.
+/// Whether joining `typ` onto a union takes the member-list step. Only a
+/// top-level `any` has a rule of its own; an `any` arm is absorbed like any
+/// other member.
 fn steps_in_members(typ: &LuaType) -> bool {
     let plain = |typ: &LuaType| {
         !matches!(
             typ,
-            LuaType::Any | LuaType::Never | LuaType::Union(_) | LuaType::MultiLineUnion(_)
+            LuaType::Never | LuaType::Union(_) | LuaType::MultiLineUnion(_)
         )
     };
     match typ {
         LuaType::Union(union) => union.types().all(plain),
-        typ => plain(typ),
+        typ => !matches!(typ, LuaType::Any) && plain(typ),
     }
 }
 
@@ -975,7 +977,10 @@ mod union_shortcut_tests {
     }
 
     fn fold_sample(pick: u64) -> LuaType {
-        match pick % 24 {
+        match pick % 25 {
+            24 => LuaType::Union(
+                LuaUnionType::from_vec(vec![LuaType::Any, fold_sample(pick >> 5)]).into(),
+            ),
             16 => LuaType::Signature(LuaSignatureId::new(
                 FileId::new((pick % 3) as u32),
                 TextSize::new((pick % 2) as u32 * 8),
