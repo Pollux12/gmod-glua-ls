@@ -99,19 +99,29 @@ struct FoldMembers {
     members: Vec<LuaType>,
     present: u64,
     hashed: FxHashSet<LuaType>,
-    /// Whether `members` is in the order the pairwise step leaves it in.
+    /// Whether `members`, less the ones appended since the last step, is in
+    /// sort order.
     sorted: bool,
+    /// How many members the current step appended at the end.
+    appended: usize,
+    /// The union the list was taken from, while no step has changed it.
+    taken_from: Option<LuaType>,
 }
 
 impl FoldAcc {
     fn push(self, typ: LuaType) -> Self {
-        let steps_in_members = !matches!(
-            typ,
-            LuaType::Any | LuaType::Never | LuaType::Union(_) | LuaType::MultiLineUnion(_)
-        );
         match self {
-            FoldAcc::Members(mut members) if steps_in_members => {
-                members.absorb(typ);
+            FoldAcc::Members(mut members) if steps_in_members(&typ) => {
+                match typ {
+                    // Joining two unions absorbs the right one's members in
+                    // order, then canonicalises once.
+                    LuaType::Union(union) => {
+                        for member in union.into_vec() {
+                            members.absorb(member);
+                        }
+                    }
+                    typ => members.absorb(typ),
+                }
                 members.settle()
             }
             acc => {
@@ -125,18 +135,15 @@ impl FoldAcc {
         let LuaType::Union(union) = typ else {
             return FoldAcc::Type(typ);
         };
-        let members = match std::sync::Arc::try_unwrap(union) {
-            Ok(union) => union.into_vec_owned(),
-            Err(union) => union.into_vec(),
-        };
-        if members.iter().any(|member| {
-            matches!(
-                member,
-                LuaType::Any | LuaType::Never | LuaType::MultiLineUnion(_) | LuaType::Union(_)
-            )
-        }) {
-            return FoldAcc::Type(LuaType::from_vec_structural(members));
+        let mut seen = FxHashSet::default();
+        if union.types().nth(1).is_none()
+            || !steps_in_members(&LuaType::Union(union.clone()))
+            || !union.types().all(|member| seen.insert(member))
+        {
+            return FoldAcc::Type(LuaType::Union(union));
         }
+        let taken_from = LuaType::Union(union.clone());
+        let members = union.into_vec();
         let hashed = members
             .iter()
             .filter(|member| dedups_by_equality(member))
@@ -147,6 +154,8 @@ impl FoldAcc {
             members,
             hashed,
             sorted: false,
+            appended: 0,
+            taken_from: Some(taken_from),
         })
     }
 
@@ -158,8 +167,22 @@ impl FoldAcc {
     }
 }
 
+/// Whether joining `typ` onto a union takes the member-list step.
+fn steps_in_members(typ: &LuaType) -> bool {
+    let plain = |typ: &LuaType| {
+        !matches!(
+            typ,
+            LuaType::Any | LuaType::Never | LuaType::Union(_) | LuaType::MultiLineUnion(_)
+        )
+    };
+    match typ {
+        LuaType::Union(union) => union.types().all(plain),
+        typ => plain(typ),
+    }
+}
+
 impl FoldMembers {
-    /// [`add_member`], re-sorting as the pairwise step's `from_vec` would.
+    /// [`add_member`], leaving the order to [`Self::settle`].
     fn absorb(&mut self, ty: LuaType) {
         if dedups_by_equality(&ty)
             && collapse_partner_ordinals(&ty)
@@ -169,35 +192,40 @@ impl FoldMembers {
             if self.hashed.insert(ty.clone()) {
                 self.present |= 1 << lua_type_sort_ordinal(&ty);
                 self.members.push(ty);
-                self.place_last();
+                self.appended += 1;
+                self.taken_from = None;
             }
             return;
         }
         absorb(&mut self.members, &mut self.present, ty);
         self.sorted = false;
+        self.taken_from = None;
     }
 
-    /// Moves the member just pushed to where a stable sort by key puts it.
-    fn place_last(&mut self) {
+    /// Sorts as `from_vec` does, stably: members appended since the last step
+    /// go after the equal keys already present, in arrival order.
+    fn sort(&mut self) {
+        let appended = std::mem::take(&mut self.appended);
         if !self.sorted {
+            self.members.sort_by_cached_key(lua_type_sort_key);
+            self.sorted = true;
             return;
         }
-        let Some(last) = self.members.last() else {
-            return;
-        };
-        if !LuaUnionType::is_order_insensitive_member(last) {
-            self.sorted = false;
-            return;
+        let tail = self.members.split_off(self.members.len() - appended);
+        for member in tail {
+            let key = lua_type_sort_key(&member);
+            let at = self
+                .members
+                .partition_point(|existing| lua_type_sort_key(existing) <= key);
+            self.members.insert(at, member);
         }
-        let key = lua_type_sort_key(last);
-        let rest = &self.members[..self.members.len() - 1];
-        let at = rest.partition_point(|member| lua_type_sort_key(member) <= key);
-        let last = self.members.pop().expect("checked above");
-        self.members.insert(at, last);
     }
 
     /// The accumulated union as the pairwise step leaves it.
     fn settle(mut self) -> FoldAcc {
+        if self.taken_from.is_some() {
+            return FoldAcc::Members(self);
+        }
         match self.members.len() {
             0 => return FoldAcc::Type(LuaType::Nil),
             1 => return FoldAcc::Type(self.members.pop().expect("one member")),
@@ -207,11 +235,11 @@ impl FoldMembers {
             .members
             .iter()
             .all(LuaUnionType::is_order_insensitive_member);
-        if insensitive && !self.sorted {
-            self.members.sort_by_cached_key(lua_type_sort_key);
-            self.sorted = true;
-        } else if !insensitive {
+        if insensitive {
+            self.sort();
+        } else {
             self.sorted = false;
+            self.appended = 0;
         }
         if self.members.len() == 2
             && let Some(nil) = self
@@ -227,7 +255,10 @@ impl FoldMembers {
     }
 
     fn into_type(self) -> LuaType {
-        LuaType::Union(LuaUnionType::from_vec(self.members).into())
+        match self.taken_from {
+            Some(taken_from) => taken_from,
+            None => LuaType::Union(LuaUnionType::from_vec(self.members).into()),
+        }
     }
 }
 
@@ -965,6 +996,17 @@ mod union_shortcut_tests {
                 _ => "Delta",
             })),
             21 => LuaType::StringConst(ArcIntern::new(SmolStr::new("e"))),
+            22 => LuaType::Union(
+                LuaUnionType::from_vec(vec![fold_sample(pick >> 5), LuaType::Nil]).into(),
+            ),
+            23 => LuaType::Union(
+                LuaUnionType::from_vec(vec![
+                    fold_sample(pick >> 5),
+                    fold_sample(pick >> 11),
+                    fold_sample(pick >> 17),
+                ])
+                .into(),
+            ),
             _ => sample(pick),
         }
     }
@@ -998,7 +1040,7 @@ mod union_shortcut_tests {
     #[test]
     fn folding_into_one_member_list_matches_the_pairwise_fold() {
         let mut next = rng(0x5851_f42d_4c95_7f2d);
-        for _ in 0..20000 {
+        for _ in 0..60000 {
             let count = (next() % 14) as usize + 1;
             let types = (0..count).map(|_| fold_sample(next())).collect::<Vec<_>>();
             // `LuaUnionType` equality ignores member order, which is
