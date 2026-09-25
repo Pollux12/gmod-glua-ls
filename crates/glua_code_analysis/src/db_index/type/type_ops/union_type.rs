@@ -66,14 +66,168 @@ fn union_type_all_mode(types: Vec<LuaType>, inferred: bool) -> LuaType {
         {
             return union_all_absorbed_inferred(types);
         }
-        return types.into_iter().fold(LuaType::Never, |result, typ| {
-            union_type_shallow(&result, &typ)
-        });
+        return fold_union_shallow(types);
     }
     if inferred {
         union_all_absorbed_inferred(types)
     } else {
         union_all_absorbed(types)
+    }
+}
+
+/// [`union_type_shallow`] folded over `types` from `never`, keeping the
+/// accumulated union as one member list instead of rebuilding it at every
+/// step. Each step leaves the list exactly as the pairwise step would leave
+/// the union: absorbed as [`absorb`] does, sorted when every member is
+/// order-insensitive, and `T|nil` in its nullable order. Steps it does not
+/// model (a nested or multi-line union, `any`, `never`) take the pairwise
+/// step.
+fn fold_union_shallow(types: Vec<LuaType>) -> LuaType {
+    let mut acc = FoldAcc::Type(LuaType::Never);
+    for typ in types {
+        acc = acc.push(typ);
+    }
+    acc.into_type()
+}
+
+enum FoldAcc {
+    Type(LuaType),
+    Members(FoldMembers),
+}
+
+struct FoldMembers {
+    members: Vec<LuaType>,
+    present: u64,
+    hashed: FxHashSet<LuaType>,
+    /// Whether `members` is in the order the pairwise step leaves it in.
+    sorted: bool,
+}
+
+impl FoldAcc {
+    fn push(self, typ: LuaType) -> Self {
+        let steps_in_members = !matches!(
+            typ,
+            LuaType::Any | LuaType::Never | LuaType::Union(_) | LuaType::MultiLineUnion(_)
+        );
+        match self {
+            FoldAcc::Members(mut members) if steps_in_members => {
+                members.absorb(typ);
+                members.settle()
+            }
+            acc => {
+                let acc = acc.into_type();
+                FoldAcc::from_type(union_type_shallow(&acc, &typ))
+            }
+        }
+    }
+
+    fn from_type(typ: LuaType) -> Self {
+        let LuaType::Union(union) = typ else {
+            return FoldAcc::Type(typ);
+        };
+        let members = match std::sync::Arc::try_unwrap(union) {
+            Ok(union) => union.into_vec_owned(),
+            Err(union) => union.into_vec(),
+        };
+        if members.iter().any(|member| {
+            matches!(
+                member,
+                LuaType::Any | LuaType::Never | LuaType::MultiLineUnion(_) | LuaType::Union(_)
+            )
+        }) {
+            return FoldAcc::Type(LuaType::from_vec_structural(members));
+        }
+        let hashed = members
+            .iter()
+            .filter(|member| dedups_by_equality(member))
+            .cloned()
+            .collect();
+        FoldAcc::Members(FoldMembers {
+            present: ordinal_mask(&members),
+            members,
+            hashed,
+            sorted: false,
+        })
+    }
+
+    fn into_type(self) -> LuaType {
+        match self {
+            FoldAcc::Type(typ) => typ,
+            FoldAcc::Members(members) => members.into_type(),
+        }
+    }
+}
+
+impl FoldMembers {
+    /// [`add_member`], re-sorting as the pairwise step's `from_vec` would.
+    fn absorb(&mut self, ty: LuaType) {
+        if dedups_by_equality(&ty)
+            && collapse_partner_ordinals(&ty)
+                .iter()
+                .all(|ordinal| self.present & 1 << ordinal == 0)
+        {
+            if self.hashed.insert(ty.clone()) {
+                self.present |= 1 << lua_type_sort_ordinal(&ty);
+                self.members.push(ty);
+                self.place_last();
+            }
+            return;
+        }
+        absorb(&mut self.members, &mut self.present, ty);
+        self.sorted = false;
+    }
+
+    /// Moves the member just pushed to where a stable sort by key puts it.
+    fn place_last(&mut self) {
+        if !self.sorted {
+            return;
+        }
+        let Some(last) = self.members.last() else {
+            return;
+        };
+        if !LuaUnionType::is_order_insensitive_member(last) {
+            self.sorted = false;
+            return;
+        }
+        let key = lua_type_sort_key(last);
+        let rest = &self.members[..self.members.len() - 1];
+        let at = rest.partition_point(|member| lua_type_sort_key(member) <= key);
+        let last = self.members.pop().expect("checked above");
+        self.members.insert(at, last);
+    }
+
+    /// The accumulated union as the pairwise step leaves it.
+    fn settle(mut self) -> FoldAcc {
+        match self.members.len() {
+            0 => return FoldAcc::Type(LuaType::Nil),
+            1 => return FoldAcc::Type(self.members.pop().expect("one member")),
+            _ => {}
+        }
+        let insensitive = self
+            .members
+            .iter()
+            .all(LuaUnionType::is_order_insensitive_member);
+        if insensitive && !self.sorted {
+            self.members.sort_by_cached_key(lua_type_sort_key);
+            self.sorted = true;
+        } else if !insensitive {
+            self.sorted = false;
+        }
+        if self.members.len() == 2
+            && let Some(nil) = self
+                .members
+                .iter()
+                .position(|member| *member == LuaType::Nil)
+        {
+            // `T|nil` is stored as nullable, which yields `T` then `nil`.
+            self.members.swap(nil, 1);
+            self.sorted = false;
+        }
+        FoldAcc::Members(self)
+    }
+
+    fn into_type(self) -> LuaType {
+        LuaType::Union(LuaUnionType::from_vec(self.members).into())
     }
 }
 
@@ -785,6 +939,74 @@ mod union_shortcut_tests {
                 union_all_absorbed(types.clone()),
                 fold(types.clone()),
                 "absorbed and folded unions disagree for {types:?}"
+            );
+        }
+    }
+
+    fn fold_sample(pick: u64) -> LuaType {
+        match pick % 24 {
+            16 => LuaType::Signature(LuaSignatureId::new(
+                FileId::new((pick % 3) as u32),
+                TextSize::new((pick % 2) as u32 * 8),
+            )),
+            17 => LuaType::TableConst(crate::InFiled::new(
+                FileId::new((pick % 2) as u32),
+                rowan::TextRange::at(
+                    TextSize::new((pick % 4) as u32 * 4),
+                    TextSize::new((pick % 3) as u32 + 1),
+                ),
+            )),
+            18 => LuaType::Any,
+            19 => LuaType::Union(
+                LuaUnionType::from_vec(vec![sample(pick >> 3), sample(pick >> 7)]).into(),
+            ),
+            20 => LuaType::Ref(LuaTypeDeclId::global(match pick % 2 {
+                0 => "Alpha",
+                _ => "Delta",
+            })),
+            21 => LuaType::StringConst(ArcIntern::new(SmolStr::new("e"))),
+            _ => sample(pick),
+        }
+    }
+
+    /// The incremental fold is a faster spelling of the pairwise one, including
+    /// where visiting order shows: order-sensitive members, sort-key
+    /// collisions, merges into earlier slots and `T|nil`.
+    /// Members sharing a sort key keep the order a stable sort gives them.
+    #[test]
+    fn folding_keeps_members_with_one_sort_key_in_arrival_order() {
+        let table = |len| {
+            LuaType::TableConst(crate::InFiled::new(
+                FileId::new(0),
+                rowan::TextRange::at(TextSize::new(0), TextSize::new(len)),
+            ))
+        };
+        let types = vec![
+            table(1),
+            LuaType::Integer,
+            table(2),
+            LuaType::String,
+            table(3),
+        ];
+
+        assert_eq!(
+            format!("{:?}", fold_union_shallow(types.clone())),
+            format!("{:?}", fold(types))
+        );
+    }
+
+    #[test]
+    fn folding_into_one_member_list_matches_the_pairwise_fold() {
+        let mut next = rng(0x5851_f42d_4c95_7f2d);
+        for _ in 0..20000 {
+            let count = (next() % 14) as usize + 1;
+            let types = (0..count).map(|_| fold_sample(next())).collect::<Vec<_>>();
+            // `LuaUnionType` equality ignores member order, which is
+            // semantic here, so compare the members as listed.
+            assert_eq!(
+                format!("{:?}", fold_union_shallow(types.clone())),
+                format!("{:?}", fold(types.clone())),
+                "incremental and pairwise folds disagree for {types:?}"
             );
         }
     }

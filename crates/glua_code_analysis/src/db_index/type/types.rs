@@ -1262,7 +1262,7 @@ impl LuaUnionType {
         }
     }
 
-    fn into_vec_owned(self) -> Vec<LuaType> {
+    pub(crate) fn into_vec_owned(self) -> Vec<LuaType> {
         match self {
             LuaUnionType::Nullable(ty) => vec![ty, LuaType::Nil],
             LuaUnionType::Multi(types) => types,
