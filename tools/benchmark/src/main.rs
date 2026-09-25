@@ -236,6 +236,9 @@ fn run_incremental_edits(
 /// exports changes, so a correct edit path does no cross-file work at all.
 /// The other two do change what the file exports, which is what makes the
 /// ripple numbers a workload measurement rather than a floor.
+///
+/// `BENCH_EDIT_FIND` and `BENCH_EDIT_REPLACE` add a `find-replace` edit that
+/// replaces the first occurrence, for files that contain the text.
 fn incremental_edit_variants(text: &str) -> Vec<(&'static str, String)> {
     let mut variants = vec![
         ("no-op", format!("{text}\n-- bench incremental edit\n")),
@@ -246,6 +249,13 @@ fn incremental_edit_variants(text: &str) -> Vec<(&'static str, String)> {
     ];
     if let Some(edited) = add_param_to_first_function(text) {
         variants.push(("param-add", edited));
+    }
+    if let (Ok(find), Ok(replace)) = (
+        std::env::var("BENCH_EDIT_FIND"),
+        std::env::var("BENCH_EDIT_REPLACE"),
+    ) && text.contains(&find)
+    {
+        variants.push(("find-replace", text.replacen(&find, &replace, 1)));
     }
     variants
 }
