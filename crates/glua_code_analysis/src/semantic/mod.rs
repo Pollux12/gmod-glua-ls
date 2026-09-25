@@ -35,6 +35,7 @@ pub(crate) use gmod_vgui_context::{
     resolve_registered_vgui_method_context_for_func,
 };
 pub(crate) use infer::check_iter_var_range;
+pub(crate) use infer::clear_access_paths;
 pub(crate) use infer::get_prefix_expr_signature_id;
 pub(crate) use infer::infer_bind_value_type;
 pub use infer::infer_index_expr;

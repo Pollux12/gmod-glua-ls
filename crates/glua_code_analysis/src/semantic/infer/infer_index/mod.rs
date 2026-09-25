@@ -344,6 +344,42 @@ fn index_expr_has_flow_node(
         .is_some_and(|flow_tree| flow_tree.get_flow_id(index_expr.get_syntax_id()).is_some())
 }
 
+thread_local! {
+    static ACCESS_PATHS: std::cell::RefCell<
+        rustc_hash::FxHashMap<(crate::FileId, glua_parser::LuaSyntaxId), Option<internment::ArcIntern<smol_str::SmolStr>>>,
+    > = Default::default();
+}
+
+/// Forgets the access paths [`interned_access_path`] kept: a file's text may
+/// change before the next engine run.
+pub(crate) fn clear_access_paths() {
+    ACCESS_PATHS.with(|paths| paths.borrow_mut().clear());
+}
+
+/// `index_expr`'s interned access path. While an engine run records, a path
+/// is built once per expression: it depends on the syntax alone.
+fn interned_access_path(
+    file_id: crate::FileId,
+    syntax_id: glua_parser::LuaSyntaxId,
+    index_expr: &LuaIndexExpr,
+) -> Option<internment::ArcIntern<smol_str::SmolStr>> {
+    let build = || {
+        index_expr
+            .get_access_path()
+            .map(|path| crate::db_index::intern_smol_str(&path))
+    };
+    if !crate::db_index::derivation::recording() {
+        return build();
+    }
+    ACCESS_PATHS.with(|paths| {
+        paths
+            .borrow_mut()
+            .entry((file_id, syntax_id))
+            .or_insert_with(build)
+            .clone()
+    })
+}
+
 pub fn get_index_expr_var_ref_id(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -371,8 +407,7 @@ pub fn get_index_expr_var_ref_id(
             _ => return None,
         };
 
-        let path = index_expr.get_access_path()?;
-        let access_path = crate::db_index::intern_smol_str(&path);
+        let access_path = interned_access_path(cache.get_file_id(), syntax_id, index_expr)?;
         let var_ref_id = VarRefId::IndexRef(root, access_path);
         cache
             .expr_var_ref_id_cache

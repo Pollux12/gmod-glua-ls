@@ -242,6 +242,7 @@ impl Engine {
         db: &mut DbIndex,
         recipe: &mut dyn FnMut(&mut DbIndex, DerivationId),
     ) {
+        crate::semantic::clear_access_paths();
         loop {
             let Some((id, reason)) = self.worklist.pop_first() else {
                 if self.next_round.is_empty() {
@@ -326,6 +327,7 @@ impl Engine {
             self.readers_of(db, touched.iter());
         }
         self.cursor = None;
+        crate::semantic::clear_access_paths();
     }
 
     /// Resets the group's primary outputs and re-runs it. Returns every key the

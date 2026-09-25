@@ -62,18 +62,12 @@ impl From<rowan::SyntaxKind> for LuaTokenKind {
     }
 }
 
-/// Maximum number of resolved nodes retained by the compatibility memo for one
-/// root. Entries for an evicted root are re-walked on demand, so the bound
-/// trades a rare re-resolution for a ceiling on retained nodes.
-const MAX_ENTRIES_PER_ROOT: usize = 8192;
-
 /// A resolver for one red syntax root. Keeping the root alongside its
 /// nodes makes identity comparison sound for the resolver's lifetime.
 #[derive(Debug)]
 pub struct LuaSyntaxResolver {
     pub(crate) root: LuaSyntaxNode,
     pub(crate) entries: rustc_hash::FxHashMap<LuaSyntaxId, Option<LuaSyntaxNode>>,
-    bounded: bool,
 }
 
 impl LuaSyntaxResolver {
@@ -82,15 +76,6 @@ impl LuaSyntaxResolver {
         Self {
             root,
             entries: rustc_hash::FxHashMap::default(),
-            bounded: false,
-        }
-    }
-
-    fn bounded(root: LuaSyntaxNode) -> Self {
-        Self {
-            root,
-            entries: rustc_hash::FxHashMap::default(),
-            bounded: true,
         }
     }
 
@@ -101,9 +86,6 @@ impl LuaSyntaxResolver {
         }
 
         let resolved = id.walk_from_root(&self.root);
-        if self.bounded && self.entries.len() >= MAX_ENTRIES_PER_ROOT {
-            self.entries.clear();
-        }
         self.entries.insert(id, resolved.clone());
         resolved
     }
@@ -152,8 +134,7 @@ mod node_memo {
                     if self.roots.len() == MAX_ROOTS {
                         self.roots.pop();
                     }
-                    self.roots
-                        .insert(0, LuaSyntaxResolver::bounded(root.clone()));
+                    self.roots.insert(0, LuaSyntaxResolver::new(root.clone()));
                 }
             }
         }
