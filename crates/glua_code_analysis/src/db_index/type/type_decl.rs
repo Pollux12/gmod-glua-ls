@@ -7,6 +7,7 @@ use rowan::TextRange;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use smol_str::SmolStr;
 
+use crate::db_index::derivation::FilePosition;
 use crate::{
     DbIndex, FileId, LuaMember, LuaMemberKey, LuaMemberOwner, TypeSubstitutor,
     instantiate_type_generic,
@@ -599,11 +600,24 @@ impl<'de> Deserialize<'de> for LuaTypeDeclId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LuaDeclLocation {
     pub file_id: FileId,
     pub range: TextRange,
     pub flag: FlagSet<LuaTypeFlag>,
+}
+
+impl Hash for LuaDeclLocation {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            file_id,
+            range,
+            flag,
+        } = self;
+        file_id.hash(state);
+        range.hash_in_file(*file_id, state);
+        flag.hash(state);
+    }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]

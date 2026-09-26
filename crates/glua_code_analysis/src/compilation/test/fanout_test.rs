@@ -246,4 +246,36 @@ function WriteCityName(value) end
             vec![lighting]
         );
     }
+
+    /// A class's declaration sits at a position in its file; a shift there
+    /// moves it without changing the class, so its readers elsewhere stand.
+    #[test]
+    fn a_shift_in_a_file_that_declares_a_class_re_runs_nothing_in_other_files() {
+        const CAR: &str = "gamemodes/cityrp/gamemode/core/sh_car.lua";
+        const CAR_TEXT: &str = "---@class Car
+---@field speed number
+Car = {}
+";
+        let mut ws = VirtualWorkspace::new();
+        let files = ws.def_files(vec![
+            (CAR, CAR_TEXT),
+            (
+                "gamemodes/cityrp/gamemode/core/sv_drive.lua",
+                "---@param car Car
+function Drive(car) local speed = car.speed end
+",
+            ),
+        ]);
+        let car = files[0];
+
+        ws.def_file(
+            CAR,
+            &format!(
+                "
+{CAR_TEXT}"
+            ),
+        );
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![car]);
+    }
 }

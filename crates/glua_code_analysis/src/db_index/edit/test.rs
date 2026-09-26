@@ -1221,7 +1221,7 @@ fn an_identity_remap_leaves_every_owner_alone() {
     );
 }
 
-const SHIFT_FIXTURE: [(&str, &str); 5] = [
+const SHIFT_FIXTURE: [(&str, &str); 6] = [
     (
         "lua/autorun/sh_shift_lib.lua",
         r#"---@class ShiftLib
@@ -1277,6 +1277,12 @@ local animal = ShiftAnimal.new(4)
 print(animal.legs, ShiftAnimal.Make("cat"), ShiftCounts[2])
 local total = ShiftVec + ShiftVec
 print(total, ShiftVec(1), shiftmod.value)
+---@type shift_ent
+local ent
+print(ent:GetSpeed(), ent.Speed)
+---@type ShiftTrace
+local trace
+print(trace.Entity)
 "#,
     ),
     (
@@ -1300,6 +1306,20 @@ ShiftCounts = {}
 for i = 1, 10 do ShiftCounts[i] = i * 2 end
 local mode = "fast"
 ShiftMode = mode
+---@class ShiftTrace
+---@field Entity table
+---@param trace ShiftTrace
+function ShiftSwap(trace)
+    trace.Entity = trace.Entity.Owner
+end
+"#,
+    ),
+    (
+        "lua/entities/shift_ent/shared.lua",
+        r#"ENT.Type = "anim"
+ENT.Base = "base_anim"
+ENT.Speed = 1
+function ENT:GetSpeed() return self.Speed end
 "#,
     ),
     (
@@ -1311,12 +1331,13 @@ function get() return value end
     ),
 ];
 
-/// A pure shift moves positions and nothing else, so every fact that names
-/// the shifted file's positions must fingerprint, with the edit mapped back,
-/// exactly as it did before. A fact that does not re-runs its readers in
-/// other files on every edit above it.
+/// A pure shift, or a comment appended at the end, moves positions and
+/// nothing else, so every fact must fingerprint, with the edit mapped back,
+/// exactly as it did before: the shifted file's own facts and the facts
+/// elsewhere that hold its positions. A fact that does not re-runs its
+/// readers in other files on every such edit.
 #[gtest]
-fn every_fact_of_a_shifted_file_fingerprints_as_before() {
+fn every_fact_fingerprints_as_before_a_shift_or_an_appended_comment() {
     let mut ws = VirtualWorkspace::new_with_init_std_lib();
     let mut emmyrc = Emmyrc::default();
     emmyrc.gmod.enabled = true;
@@ -1328,44 +1349,50 @@ fn every_fact_of_a_shifted_file_fingerprints_as_before() {
     for (path, text) in SHIFT_FIXTURE {
         let uri = ws.virtual_url_generator.new_uri(path);
         let file_id = ws.analysis.get_file_id(&uri).expect("fixture file");
-        for (other, _) in SHIFT_FIXTURE {
-            let other = ws.virtual_url_generator.new_uri(other);
-            let other = ws.analysis.get_file_id(&other).expect("fixture file");
-            ws.analysis
-                .diagnose_file(other, tokio_util::sync::CancellationToken::new());
-        }
-        let diagnostic_keys = ws.analysis.compilation.diagnostic_read_keys();
-        let db = ws.analysis.compilation.get_db();
-        let before = db
-            .reader_graph()
-            .read_keys()
-            .chain(diagnostic_keys.iter())
-            .filter(|key| {
-                key.positional_file() == Some(file_id)
-                    && !matches!(key, crate::db_index::derivation::FactKey::FileText(_))
-            })
-            .map(|key| (key.clone(), db.fact_fingerprint(key)))
-            .collect::<Vec<_>>();
-
         let shifted = format!(
             "
 {text}"
         );
-        ws.analysis.update_file_text_only(&uri, shifted.clone());
-        ws.analysis.reindex_files(vec![file_id]);
+        let touched = format!(
+            "{shifted}-- touched
+"
+        );
+        for (before_text, after_text) in [(text, shifted.as_str()), (shifted.as_str(), &touched)] {
+            for (other, _) in SHIFT_FIXTURE {
+                let other = ws.virtual_url_generator.new_uri(other);
+                let other = ws.analysis.get_file_id(&other).expect("fixture file");
+                ws.analysis
+                    .diagnose_file(other, tokio_util::sync::CancellationToken::new());
+            }
+            let diagnostic_keys = ws.analysis.compilation.diagnostic_read_keys();
+            let db = ws.analysis.compilation.get_db();
+            let before = db
+                .reader_graph()
+                .read_keys()
+                .chain(diagnostic_keys.iter())
+                .filter(|key| {
+                    !matches!(key, crate::db_index::derivation::FactKey::FileText(text_file) if *text_file == file_id)
+                })
+                .map(|key| (key.clone(), db.fact_fingerprint(key)))
+                .collect::<Vec<_>>();
 
-        let edits = crate::db_index::derivation::EditMaps::new([(
-            file_id,
-            PositionMap::new(text, &shifted),
-        )]);
-        let db = ws.analysis.compilation.get_db();
-        for (key, fingerprint) in before {
-            let moved = edits.map_key(&key).expect("a shift loses no position");
-            let after = crate::db_index::derivation::fingerprint_before_edits(&edits, || {
-                db.fact_fingerprint(&moved)
-            });
-            if after != fingerprint {
-                unstable.insert(format!("{path}: {key:?}"));
+            ws.analysis
+                .update_file_text_only(&uri, after_text.to_string());
+            ws.analysis.reindex_files(vec![file_id]);
+
+            let edits = crate::db_index::derivation::EditMaps::new([(
+                file_id,
+                PositionMap::new(before_text, after_text),
+            )]);
+            let db = ws.analysis.compilation.get_db();
+            for (key, fingerprint) in before {
+                let moved = edits.map_key(&key).expect("the edit loses no position");
+                let after = crate::db_index::derivation::fingerprint_before_edits(&edits, || {
+                    db.fact_fingerprint(&moved)
+                });
+                if after != fingerprint {
+                    unstable.insert(format!("{path}: {key:?}"));
+                }
             }
         }
     }

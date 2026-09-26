@@ -191,7 +191,7 @@ pub struct GmodLoadRoot {
     pub path_sort_key: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmodLoadEdge {
     pub source_file_id: FileId,
     pub target_file_id: Option<FileId>,
@@ -200,6 +200,28 @@ pub struct GmodLoadEdge {
     pub path: Option<String>,
     pub original_expr: Option<String>,
     pub range: Option<TextRange>,
+}
+
+impl std::hash::Hash for GmodLoadEdge {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        use crate::db_index::derivation::FilePosition;
+        let Self {
+            source_file_id,
+            target_file_id,
+            kind,
+            states,
+            path,
+            original_expr,
+            range,
+        } = self;
+        source_file_id.hash(state);
+        target_file_id.hash(state);
+        kind.hash(state);
+        states.hash(state);
+        path.hash(state);
+        original_expr.hash(state);
+        range.hash_in_file(*source_file_id, state);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

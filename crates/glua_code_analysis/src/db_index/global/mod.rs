@@ -186,6 +186,15 @@ impl LuaGlobalIndex {
             FactKey::Global(name) => {
                 derivation::fingerprint_opt(self.global_decl.get(name.as_str()))
             }
+            FactKey::GlobalScan if derivation::mapping_back() => self
+                .global_decl
+                .iter()
+                .flat_map(|(id, decl_ids)| {
+                    decl_ids
+                        .iter()
+                        .map(|decl_id| scan_element(id.get_name(), *decl_id))
+                })
+                .fold(0, Fingerprint::wrapping_add),
             FactKey::GlobalScan => self.scan_fingerprint,
             _ => {
                 debug_assert!(false, "{key:?} is not a global fact");

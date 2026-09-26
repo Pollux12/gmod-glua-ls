@@ -473,12 +473,36 @@ impl GmodInferIndex {
             FactKey::GmodRealm(file_id) => {
                 derivation::fingerprint_opt(self.realm_file_metadata.get(file_id))
             }
+            FactKey::GmodInferScan if derivation::mapping_back() => {
+                self.recomputed_scan_fingerprint()
+            }
             FactKey::GmodInferScan => self.scan_fingerprint,
             _ => {
                 debug_assert!(false, "{key:?} is not a gmod infer fact");
                 derivation::ABSENT
             }
         }
+    }
+
+    /// The scan fingerprint summed afresh from its elements, which is what
+    /// the incremental `scan_fingerprint` sum holds.
+    fn recomputed_scan_fingerprint(&self) -> Fingerprint {
+        let hooks = self
+            .hook_file_metadata
+            .iter()
+            .map(|(file_id, metadata)| hook_scan_fingerprint(*file_id, metadata));
+        let systems = self
+            .system_file_metadata
+            .iter()
+            .map(|(file_id, metadata)| system_scan_fingerprint(*file_id, metadata));
+        let methods = self
+            .gm_method_realm_annotations
+            .iter()
+            .map(|(file_id, method_realms)| gm_method_scan_fingerprint(*file_id, method_realms));
+        hooks
+            .chain(systems)
+            .chain(methods)
+            .fold(0, Fingerprint::wrapping_add)
     }
 
     fn note_scan_write(&mut self, file_id: FileId, added: Fingerprint, removed: Fingerprint) {
@@ -1010,7 +1034,9 @@ const GM_METHOD_REALM: u8 = 7;
 
 /// One element of the [`FactKey::GmodInferScan`] multiset.
 fn scan_element<T: std::hash::Hash>(tag: u8, file_id: FileId, value: &T) -> Fingerprint {
-    derivation::fingerprint_of(&(tag, file_id, value))
+    derivation::in_file(Some(file_id), || {
+        derivation::fingerprint_of(&(tag, file_id, value))
+    })
 }
 
 fn scan_elements<T: std::hash::Hash>(tag: u8, file_id: FileId, values: &[T]) -> Fingerprint {

@@ -358,6 +358,15 @@ impl LuaMemberIndex {
                 });
                 items.wrapping_add(self.owner_history_fingerprint(owner))
             }
+            FactKey::MemberKey(key) if derivation::mapping_back() => self
+                .current_members_by_key
+                .get(key)
+                .map_or(ABSENT, |members| {
+                    members
+                        .values()
+                        .map(|id| fingerprint_of(id))
+                        .fold(ABSENT, Fingerprint::wrapping_add)
+                }),
             FactKey::MemberKey(key) => self.key_fingerprints.get(key).copied().unwrap_or(ABSENT),
             FactKey::MemberFile(file_id) if derivation::mapping_back() => {
                 self.recomputed_file_fingerprint(*file_id)
