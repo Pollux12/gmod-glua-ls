@@ -678,6 +678,34 @@ function Carry(bag) local weight = bag.weight end
         assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![bag]);
     }
 
+    /// Registered net messages, console commands and convars are read by name,
+    /// so renaming a net message leaves a convar lookup elsewhere standing.
+    #[test]
+    fn renaming_a_net_message_re_runs_nothing_in_a_file_that_looks_up_a_convar() {
+        const NET: &str = "gamemodes/cityrp/gamemode/core/sv_net.lua";
+        const NET_TEXT: &str = "util.AddNetworkString(\"cityrp_ping\")\n";
+        let mut workspace = cityrp_workspace();
+        workspace.ws.def_file(
+            "lua/includes/convar.lua",
+            "---@class ConVar\n---@[call_arg(\"gmod.convar\", \"reference\")]\n---@param name string\n---@return ConVar?\nfunction GetConVar(name) end\n",
+        );
+        workspace.ws.def_file(
+            "gamemodes/cityrp/gamemode/core/sh_convars.lua",
+            "CreateConVar(\"cityrp_speed\", \"1\")\n",
+        );
+        workspace.ws.def_file(
+            "gamemodes/cityrp/gamemode/core/sh_speed.lua",
+            "local speed = GetConVar(\"cityrp_speed\")\n",
+        );
+        let net = workspace.ws.def_file(NET, NET_TEXT);
+
+        workspace
+            .ws
+            .def_file(NET, &NET_TEXT.replace("cityrp_ping", "cityrp_pong"));
+
+        assert_eq!(workspace.evaluated_files(), vec![net]);
+    }
+
     /// A class named by string is declared by the calls that name it, once
     /// every registration has run. Re-indexing one such file rebuilds its
     /// declaration before any other file is re-checked, so the class other

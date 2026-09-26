@@ -5,10 +5,11 @@ use std::sync::OnceLock;
 
 use glua_parser::LuaSyntaxId;
 use rowan::TextRange;
+use smol_str::SmolStr;
 
 use super::{GmodLoadIndex, GmodLoadStatus, GmodStateMask, LuaIndex};
 use crate::{
-    FileId,
+    FileId, InFiled,
     db_index::derivation::{self, FactKey, Fingerprint},
 };
 
@@ -266,16 +267,49 @@ pub struct GmodSystemRegistration {
     pub name_range: TextRange,
 }
 
+/// Records a read of the registrations of `kind` under `name`.
+fn note_system_read(kind: GmodSystemRegistrationKind, name: &str) {
+    derivation::note_read(|| FactKey::GmodSystem(kind, SmolStr::new(name)));
+}
+
+/// Records writes of the registrations `metadata` makes.
+fn note_system_writes(metadata: &GmodSystemFileMetadata) {
+    let names = metadata
+        .net_add_string_calls
+        .iter()
+        .map(|site| (GmodSystemRegistrationKind::NetMessage, site.name.as_deref()))
+        .chain(metadata.concommand_add_calls.iter().map(|site| {
+            (
+                GmodSystemRegistrationKind::Concommand,
+                site.command_name.as_deref(),
+            )
+        }))
+        .chain(metadata.convar_create_calls.iter().map(|site| {
+            (
+                GmodSystemRegistrationKind::Convar,
+                site.convar_name.as_deref(),
+            )
+        }));
+    for (kind, name) in names {
+        if let Some(name) = normalize_system_name(name) {
+            derivation::note_write(|| FactKey::GmodSystem(kind, SmolStr::new(name)));
+        }
+    }
+}
+
 impl GmodSystemAggregate {
     pub fn is_known_net_message(&self, name: &str) -> bool {
+        note_system_read(GmodSystemRegistrationKind::NetMessage, name);
         self.known_net_messages.contains(name)
     }
 
     pub fn net_registration_count(&self, name: &str) -> usize {
+        note_system_read(GmodSystemRegistrationKind::NetMessage, name);
         self.net_registration_count.get(name).copied().unwrap_or(0)
     }
 
     pub fn concommand_registration_count(&self, name: &str) -> usize {
+        note_system_read(GmodSystemRegistrationKind::Concommand, name);
         self.concommand_registration_count
             .get(name)
             .copied()
@@ -283,10 +317,38 @@ impl GmodSystemAggregate {
     }
 
     pub fn convar_registration_count(&self, name: &str) -> usize {
+        note_system_read(GmodSystemRegistrationKind::Convar, name);
         self.convar_registration_count
             .get(name)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// The fingerprint of the registrations of `kind` under `name`.
+    fn entry_fingerprint(&self, kind: GmodSystemRegistrationKind, name: &str) -> Fingerprint {
+        let count = match kind {
+            GmodSystemRegistrationKind::NetMessage => self.net_registration_count.get(name),
+            GmodSystemRegistrationKind::Concommand => self.concommand_registration_count.get(name),
+            GmodSystemRegistrationKind::Convar => self.convar_registration_count.get(name),
+        };
+        let registrations = self
+            .duplicate_registrations
+            .get(&(kind, name.to_string()))
+            .map(|registrations| {
+                registrations
+                    .iter()
+                    .map(|registration| {
+                        (
+                            registration.convar_kind,
+                            InFiled::new(registration.file_id, registration.name_range),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+        if count.is_none() && registrations.is_none() {
+            return derivation::ABSENT;
+        }
+        derivation::fingerprint_of(&(count, registrations))
     }
 
     pub fn convar_registrations(&self, name: &str) -> &[GmodSystemRegistration] {
@@ -324,6 +386,7 @@ impl GmodSystemAggregate {
         kind: GmodSystemRegistrationKind,
         name: &str,
     ) -> &[GmodSystemRegistration] {
+        note_system_read(kind, name);
         self.duplicate_registrations
             .get(&(kind, name.to_string()))
             .map(Vec::as_slice)
@@ -477,6 +540,9 @@ impl GmodInferIndex {
                 self.recomputed_scan_fingerprint()
             }
             FactKey::GmodInferScan => self.scan_fingerprint,
+            FactKey::GmodSystem(kind, name) => {
+                self.get_system_aggregate().entry_fingerprint(*kind, name)
+            }
             _ => {
                 debug_assert!(false, "{key:?} is not a gmod infer fact");
                 derivation::ABSENT
@@ -612,6 +678,10 @@ impl GmodInferIndex {
     /// sites) wholesale. Used by the parallel gmod-pre collection. Invalidates
     /// the system aggregate cache since registration counts may change.
     pub fn set_system_file_metadata(&mut self, file_id: FileId, metadata: GmodSystemFileMetadata) {
+        if let Some(previous) = self.system_file_metadata.get(&file_id) {
+            note_system_writes(previous);
+        }
+        note_system_writes(&metadata);
         let removed = self
             .system_file_metadata
             .get(&file_id)
@@ -712,8 +782,8 @@ impl GmodInferIndex {
         self.system_file_metadata.iter()
     }
 
+    /// The system registrations across files, read by kind and name.
     pub fn get_system_aggregate(&self) -> &GmodSystemAggregate {
-        derivation::note_read(|| FactKey::GmodInferScan);
         self.system_aggregate_cache
             .get_or_init(|| self.build_system_aggregate())
     }
@@ -945,6 +1015,9 @@ impl GmodInferIndex {
     /// everything but the source layer's scoped-class info and the realms
     /// the load graph decided.
     pub(crate) fn reset_file_metadata(&mut self, file_id: FileId) {
+        if let Some(previous) = self.system_file_metadata.get(&file_id) {
+            note_system_writes(previous);
+        }
         let removed = self
             .hook_file_metadata
             .remove(&file_id)
@@ -996,6 +1069,9 @@ impl LuaIndex for GmodInferIndex {
             }
         }
         derivation::note_write(|| FactKey::GmodInferScan);
+        for metadata in self.system_file_metadata.values() {
+            note_system_writes(metadata);
+        }
         self.scan_fingerprint = 0;
         self.hook_file_metadata.clear();
         self.system_file_metadata.clear();
