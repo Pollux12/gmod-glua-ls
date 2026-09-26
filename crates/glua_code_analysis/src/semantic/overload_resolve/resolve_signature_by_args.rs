@@ -38,10 +38,11 @@ pub fn resolve_signature_by_args(
     let mut best_match_result = need_resolve_funcs[0]
         .clone()
         .expect("Match result should exist");
+    let mut fits_only_union_components = vec![false; need_resolve_funcs.len()];
     for (arg_index, (expr_type, _)) in expr_types.iter().enumerate() {
         let mut current_match_result = ParamMatchResult::Not;
         let mut skipped_implicit_self = false;
-        for opt_func in &mut need_resolve_funcs {
+        for (func_index, opt_func) in need_resolve_funcs.iter_mut().enumerate() {
             let func = match opt_func.as_ref() {
                 None => continue,
                 Some(func) => func,
@@ -116,6 +117,9 @@ pub fn resolve_signature_by_args(
                 *opt_func = None;
                 continue;
             }
+            if match_result == ParamMatchResult::UnionComponent {
+                fits_only_union_components[func_index] = true;
+            }
 
             if match_result >= ParamMatchResult::Exact
                 && arg_index + 1 == expr_len
@@ -130,10 +134,15 @@ pub fn resolve_signature_by_args(
         }
     }
 
+    let some_func_fits_every_arg = need_resolve_funcs
+        .iter()
+        .zip(&fits_only_union_components)
+        .any(|(func, partial)| func.is_some() && !partial);
     let mut rest_need_resolve_funcs = need_resolve_funcs
         .iter()
-        .filter_map(|it| it.clone())
-        .map(Some)
+        .zip(&fits_only_union_components)
+        .filter(|(func, partial)| func.is_some() && !(some_func_fits_every_arg && **partial))
+        .map(|(func, _)| func.clone())
         .collect::<Vec<_>>();
 
     let rest_len = rest_need_resolve_funcs.len();

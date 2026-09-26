@@ -3370,6 +3370,27 @@ mod test {
     }
 
     #[test]
+    fn a_table_or_unknown_argument_takes_the_table_signature_over_a_nil_overload() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@generic T : table
+            ---@overload fun(originalTable: nil): nil
+            ---@param originalTable T?
+            ---@param lookupTable? table<any, any>
+            ---@return T?
+            local function copy(originalTable, lookupTable) end
+
+            local function adjust(fresh, u)
+                local data = fresh and {} or u
+                local copied = copy(data)
+            end
+            "#
+        ));
+    }
+
+    #[test]
     fn pcall_accepts_a_union_of_functions() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(ws.check_code_for(
