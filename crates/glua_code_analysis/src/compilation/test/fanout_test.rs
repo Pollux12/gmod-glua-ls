@@ -215,6 +215,27 @@ end
         );
     }
 
+    /// Whether another file's write bootstraps a shared table is read off the
+    /// statement that writes it, so a statement added elsewhere in that file
+    /// leaves the other files' bootstraps standing.
+    #[test]
+    fn a_statement_added_after_a_shared_table_bootstrap_re_runs_nothing_in_other_bootstraps() {
+        const MENU: &str = "gamemodes/cityrp/gamemode/core/derma/cl_menu.lua";
+        const MENU_TEXT: &str = "cityrp.menu = cityrp.menu or {}\n";
+        let mut workspace = cityrp_workspace();
+        let menu = workspace.ws.def_file(MENU, MENU_TEXT);
+        workspace.ws.def_file(
+            "gamemodes/cityrp/gamemode/core/derma/cl_interaction.lua",
+            MENU_TEXT,
+        );
+
+        workspace
+            .ws
+            .def_file(MENU, &format!("{MENU_TEXT}local unused = 1\n"));
+
+        assert_eq!(workspace.evaluated_files(), vec![menu]);
+    }
+
     /// The call-site index keeps the evidence other files give a re-indexed
     /// file's parameters, so the callers do not gather it again.
     #[test]

@@ -1206,7 +1206,10 @@ fn returns_unmutated_explicit_self(
 fn exact_signature_closure(db: &DbIndex, signature_id: LuaSignatureId) -> Option<LuaClosureExpr> {
     let root = db
         .get_vfs()
-        .get_syntax_tree(&signature_id.get_file_id())
+        .syntax_tree_around(
+            &signature_id.get_file_id(),
+            rowan::TextRange::empty(signature_id.get_position()),
+        )
         .map(|tree| tree.get_red_root())?;
     root.token_at_offset(signature_id.get_position())
         .right_biased()

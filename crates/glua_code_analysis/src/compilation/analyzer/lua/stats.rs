@@ -2079,17 +2079,7 @@ fn is_dynamic_expr_key_member_assignment(
     let LuaTypeOwner::Member(member_id) = type_owner else {
         return false;
     };
-    let Some(root) = analyzer
-        .db
-        .get_vfs()
-        .get_syntax_tree(&member_id.file_id)
-        .map(|tree| tree.get_red_root())
-    else {
-        return false;
-    };
-    member_id
-        .get_syntax_id()
-        .to_node_from_root(&root)
+    member_write_node(analyzer.db, *member_id)
         .and_then(LuaIndexExpr::cast)
         .and_then(|index_expr| index_expr.get_index_key())
         .is_some_and(|key| matches!(key, LuaIndexKey::Expr(_)))
@@ -2135,11 +2125,7 @@ pub(in crate::compilation::analyzer) fn mark_resolved_member_assignment(
 /// Whether this write sits inside a branch or loop body, so it may not run
 /// and does not overwrite the writers before it in the same scope.
 pub fn is_member_assignment_in_conditional_branch(db: &DbIndex, member_id: LuaMemberId) -> bool {
-    let Some(tree) = db.get_vfs().get_syntax_tree(&member_id.file_id) else {
-        return false;
-    };
-    let root = tree.get_red_root();
-    let Some(node) = member_id.get_syntax_id().to_node_from_root(&root) else {
+    let Some(node) = member_write_node(db, member_id) else {
         return false;
     };
 
@@ -2190,14 +2176,19 @@ pub(in crate::compilation::analyzer) fn is_guarded_table_assignment_member(
     db: &crate::DbIndex,
     member_id: LuaMemberId,
 ) -> bool {
-    let Some(tree) = db.get_vfs().get_syntax_tree(&member_id.file_id) else {
-        return false;
-    };
-    let root = tree.get_red_root();
-    let Some(node) = member_id.get_syntax_id().to_node_from_root(&root) else {
-        return false;
-    };
-    guarded_bootstrap_range_for_node(node, false).is_some()
+    member_write_node(db, member_id)
+        .and_then(|node| guarded_bootstrap_range_for_node(node, false))
+        .is_some()
+}
+
+/// The node that wrote `member_id`. The checks that ask look only at it and
+/// its ancestors, so only the statement holding it is read.
+fn member_write_node(db: &DbIndex, member_id: LuaMemberId) -> Option<glua_parser::LuaSyntaxNode> {
+    let syntax_id = member_id.get_syntax_id();
+    let tree = db
+        .get_vfs()
+        .syntax_tree_around(&member_id.file_id, syntax_id.get_range())?;
+    syntax_id.to_node_from_root(&tree.get_red_root())
 }
 
 pub(in crate::compilation::analyzer) fn is_guarded_table_assignment_index_expr(
@@ -2411,12 +2402,7 @@ fn guarded_table_bootstrap_range(
     member_id: LuaMemberId,
     empty_only: bool,
 ) -> Option<rowan::TextRange> {
-    let tree = db.get_vfs().get_syntax_tree(&member_id.file_id)?;
-    let root = tree.get_red_root();
-    guarded_bootstrap_range_for_node(
-        member_id.get_syntax_id().to_node_from_root(&root)?,
-        empty_only,
-    )
+    guarded_bootstrap_range_for_node(member_write_node(db, member_id)?, empty_only)
 }
 
 /// Per-`(owner, key)` memo for
