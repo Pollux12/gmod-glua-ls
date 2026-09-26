@@ -152,62 +152,46 @@ impl LuaDeclarationTree {
 
     /// Innermost direct child scope of `scope` containing `position`, if any.
     ///
-    /// Children are appended in walk (source) order and sibling scopes cover
-    /// disjoint syntax ranges, so child starts are ordered and at most one
-    /// sibling contains the position: binary search finds it instead of
-    /// scanning every statement scope of the file on each lookup. An
-    /// unresolvable key falls back to the linear scan; a candidate that does
-    /// not contain the position means no sibling does (earlier ones end no
-    /// later than its start), so that answers `None` directly. Debug builds
-    /// check every answer against the linear scan.
+    /// Sibling scopes are appended in walk (source) order and cover disjoint
+    /// syntax ranges, so their starts are ordered and at most one contains the
+    /// position: binary search finds it instead of scanning every statement
+    /// scope of the file on each lookup. Declarations interleaved with them
+    /// have no such order (scoped-class seeds sit at synthetic chunk offsets,
+    /// and assignment targets are filed before closures nested in earlier
+    /// targets) and never contain a position, so the search keys each entry
+    /// by the nearest scope at or before it. An unresolvable scope falls back
+    /// to the linear scan; a candidate that does not contain the position
+    /// means no sibling does (earlier ones end no later than its start), so
+    /// that answers `None` directly. Debug builds check every answer against
+    /// the linear scan.
     fn find_child_scope(&self, scope: &LuaScope, position: TextSize) -> Option<&LuaScope> {
         let children = scope.get_children();
-        if children.is_empty() {
-            return None;
-        }
-        let child_start = |child: &ScopeOrDeclId| -> Option<TextSize> {
-            match child {
-                ScopeOrDeclId::Scope(child_id) => self
-                    .scopes
-                    .get(child_id.id as usize)
-                    .map(|child_scope| child_scope.get_position()),
-                ScopeOrDeclId::Decl(decl_id) => {
-                    self.get_decl(decl_id).map(|decl| decl.get_position())
-                }
-            }
-        };
 
-        // First index whose start lies past `position`. Children arrive in
-        // walk (source) order, so starts are ordered and this is a binary
-        // search; any unresolvable key falls back to the linear scan.
+        // First index whose nearest scope at or before it starts past
+        // `position`. Every entry before `lo` keys at or before `position`,
+        // so a probe with no scope in `lo..=mid` does too.
         let mut lo = 0usize;
         let mut hi = children.len();
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            match child_start(&children[mid]) {
-                None => return self.linear_find_child_scope(scope, position),
-                Some(start) if start <= position => lo = mid + 1,
-                Some(_) => hi = mid,
+            let past_position = match last_child_scope(&children[lo..=mid]) {
+                None => false,
+                Some(child_id) => match self.scopes.get(child_id.id as usize) {
+                    Some(child_scope) => child_scope.get_position() > position,
+                    None => return self.linear_find_child_scope(scope, position),
+                },
+            };
+            if past_position {
+                hi = mid;
+            } else {
+                lo = mid + 1;
             }
         }
-        // The containing scope, if any, is the nearest preceding scope entry:
-        // entries between it and `lo` are declarations, which never contain.
-        // Scopes past `lo` start beyond `position` and cannot contain it, and
-        // under the ordering invariant earlier scopes end no later than this
-        // one's start, so a miss here means no sibling contains the position.
-        let mut found: Option<&LuaScope> = None;
-        let mut back = lo;
-        while back > 0 {
-            back -= 1;
-            match &children[back] {
-                ScopeOrDeclId::Decl(_) => continue,
-                ScopeOrDeclId::Scope(child_id) => {
-                    found = self.scopes.get(child_id.id as usize);
-                    break;
-                }
-            }
-        }
-        let hit = found.filter(|candidate| candidate.get_range().contains(position));
+        // Scopes from `lo` on start past `position`, and earlier ones end no
+        // later than the last scope before `lo` starts, so only it can contain.
+        let hit = last_child_scope(&children[..lo])
+            .and_then(|child_id| self.scopes.get(child_id.id as usize))
+            .filter(|candidate| candidate.get_range().contains(position));
         #[cfg(debug_assertions)]
         debug_assert_eq!(
             hit.map(|candidate| candidate.get_id()),
@@ -551,6 +535,14 @@ impl LuaDeclarationTree {
     pub fn get_decls(&self) -> &FxHashMap<LuaDeclId, LuaDecl> {
         &self.decls
     }
+}
+
+/// The last scope among `entries`.
+fn last_child_scope(entries: &[ScopeOrDeclId]) -> Option<&LuaScopeId> {
+    entries.iter().rev().find_map(|entry| match entry {
+        ScopeOrDeclId::Scope(scope_id) => Some(scope_id),
+        ScopeOrDeclId::Decl(_) => None,
+    })
 }
 
 /// A child `base_walk_up` visits that can match: a direct declaration, or a

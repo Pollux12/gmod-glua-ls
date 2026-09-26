@@ -1,9 +1,12 @@
 #[cfg(test)]
 mod test {
-    use glua_parser::{LuaAstNode, LuaAstToken, LuaFuncStat, LuaNameExpr, LuaVarExpr};
+    use glua_parser::{
+        LuaAssignStat, LuaAstNode, LuaAstToken, LuaFuncStat, LuaNameExpr, LuaVarExpr,
+    };
     use googletest::prelude::*;
+    use rowan::TextSize;
 
-    use crate::{DiagnosticCode, LuaType, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, FileId, LuaDecl, LuaType, VirtualWorkspace};
 
     #[test]
     fn unknown_local_stabilizes_from_anchored_usage_for_every_raw_query() {
@@ -483,5 +486,82 @@ mod test {
                 contains(eq(&"Name(\"ViaAssert\")".to_string()))
             ]
         );
+    }
+
+    fn last_name_expr(ws: &VirtualWorkspace, file_id: FileId, name: &str) -> LuaNameExpr {
+        ws.analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("expected syntax tree")
+            .get_chunk_node()
+            .descendants::<LuaNameExpr>()
+            .filter(|name_expr| name_expr.get_name_text().as_deref() == Some(name))
+            .last()
+            .expect("expected name expression")
+    }
+
+    fn referenced_decl<'a>(
+        ws: &'a VirtualWorkspace,
+        file_id: FileId,
+        name_expr: &LuaNameExpr,
+    ) -> Option<&'a LuaDecl> {
+        let db = ws.analysis.compilation.get_db();
+        let decl_id = db
+            .get_reference_index()
+            .get_local_reference(&file_id)?
+            .get_decl_id(&name_expr.get_range())?;
+        db.get_decl_index().get_decl(&decl_id)
+    }
+
+    /// A schema file's `SCHEMA` and `Schema` singleton seeds sit at chunk
+    /// offsets 0 and 1, ahead of the file body, which also starts at 0 when
+    /// the first statement opens the file (Helix `schema/classes/sh_citizen.lua`).
+    #[test]
+    fn schema_file_opening_with_a_statement_resolves_its_first_global() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let content = "CLASS_CITIZEN = 1\nlocal citizen = CLASS_CITIZEN\n";
+        let file_id = ws.def_file(
+            "gamemodes/helix-hl2rp/schema/classes/sh_citizen.lua",
+            content,
+        );
+
+        let alias_seed = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_decl_index()
+            .get_decl_tree(&file_id)
+            .expect("expected decl tree")
+            .find_local_decl("Schema", TextSize::of(content))
+            .map(|decl| u32::from(decl.get_position()));
+        assert_that!(alias_seed, some(eq(1)));
+
+        let citizen_use = last_name_expr(&ws, file_id, "CLASS_CITIZEN");
+        let resolved =
+            referenced_decl(&ws, file_id, &citizen_use).map(|decl| u32::from(decl.get_position()));
+        assert_that!(resolved, some(eq(0)));
+    }
+
+    /// Assignment targets file their global declarations when the statement is
+    /// entered, before the walk reaches a closure nested in an earlier target,
+    /// so the statement scope lists `a` and `b` ahead of that closure's scope.
+    #[test]
+    fn closure_in_an_assignment_target_resolves_its_own_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def("local t = {}\nt[function(p) return p end], a, b = 1, 2, 3\n");
+
+        let (vars, _) = ws
+            .get_node::<LuaAssignStat>(file_id)
+            .get_var_and_expr_list();
+        assert_that!(vars.len(), eq(3));
+
+        let param_use = last_name_expr(&ws, file_id, "p");
+        let resolved = referenced_decl(&ws, file_id, &param_use).map(|decl| decl.is_param());
+        assert_that!(resolved, some(eq(true)));
     }
 }
