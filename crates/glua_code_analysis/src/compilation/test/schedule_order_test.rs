@@ -162,4 +162,49 @@ function Entity:Use(activator, caller, useType, value) end
     activator.cityrp._PlantsHarvested = activator.cityrp._PlantsHarvested + 1
 end
 "#;
+
+    #[test]
+    #[ignore = "a member cycle keeps an `any` read before `getTable` resolved"]
+    fn a_cached_entity_field_read_through_a_documented_table_settles_the_same_in_either_order() {
+        assert_schedule_independent(&[
+            (
+                "lua/aaa_annotations/entity.lua",
+                r#"---@class Entity
+---@return tableof<self>
+function Entity:GetTable() end
+
+---@generic T : table
+---@param metaName `T`
+---@return (definition) T
+function _G.FindMetaTable(metaName) end
+"#,
+            ),
+            (
+                "lua/entities/base_glide_car/init.lua",
+                r#"function ENT:OnPostThink(dt, selfTbl)
+    ---@type base_glide_car
+    selfTbl = selfTbl or getTable(self)
+    local isElectric = self:IsElectric()
+    selfTbl._isElectric = isElectric
+end
+"#,
+            ),
+            (
+                "lua/entities/base_glide_car/shared.lua",
+                r#"local getTable = FindMetaTable("Entity").GetTable
+--- @param selfTbl table|nil Optional cached entity table from GetTable()
+function ENT:IsElectric(selfTbl)
+    selfTbl = selfTbl or getTable(self)
+    local cached = selfTbl._isElectric
+    if cached ~= nil then
+        return cached
+    end
+    cached = self:GetEngineTypeId() == 1
+    selfTbl._isElectric = cached
+    return cached
+end
+"#,
+            ),
+        ]);
+    }
 }
