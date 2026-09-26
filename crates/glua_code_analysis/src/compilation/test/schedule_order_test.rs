@@ -5,7 +5,7 @@ mod test {
 
     use crate::{Emmyrc, GMOD_CALL_ARG_BUILTINS_FIXTURE, Schedule, VirtualWorkspace};
 
-    /// Every type cache, dynamic field and the semantic digest of `files`
+    /// Every type cache, dynamic field, net flow and the semantic digest of `files`
     /// cold-built in one batch under `schedule`, as sorted text; `None` when
     /// the build does not settle within a generous bound.
     fn settled(schedule: Schedule, files: &[(&str, &str)]) -> Option<Vec<String>> {
@@ -43,6 +43,17 @@ mod test {
                             }),
                     )
                     .collect::<Vec<_>>();
+                let network = db.get_gmod_network_index();
+                settled.extend(
+                    network
+                        .iter_send_flows()
+                        .map(|(file_id, _, flow)| format!("{file_id:?} sends {flow:?}")),
+                );
+                settled.extend(
+                    network
+                        .iter_receive_flows()
+                        .map(|(file_id, flow)| format!("{file_id:?} receives {flow:?}")),
+                );
                 settled.extend(ws.semantic_digest());
                 settled.sort();
                 let _ = tx.send(settled);
@@ -219,6 +230,67 @@ end
             (
                 "gamemodes/cityrp/plugins/scoreboard/ui/cl_player_frame.lua",
                 REGISTER,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_hook_two_plugins_override_settles_the_same_in_either_order() {
+        assert_schedule_independent(&[
+            (
+                "lua/aaa_annotations/global.lua",
+                r#"---@generic T : table
+---@param metaName `T`
+---@return (definition) T
+function _G.FindMetaTable(metaName) end
+"#,
+            ),
+            (
+                "lua/aaa_annotations/gm.lua",
+                "---@param victim Player
+function GM:PlayerDeath(victim, inflictor, attacker) end
+",
+            ),
+            (
+                "lua/aaa_annotations/net.lua",
+                r#"---@[net_send("client")]
+function net.Broadcast() end
+---@[call_arg("gmod.net_message", "start")]
+---@param messageName string
+function net.Start(messageName, unreliable) end
+"#,
+            ),
+            (
+                "lua/aaa_annotations/player.lua",
+                "---@class (partial) Player : Entity
+",
+            ),
+            (
+                "gamemodes/cityrp/gamemode/core/libraries/sh_plugin.lua",
+                "--- @class PLUGIN
+",
+            ),
+            (
+                "gamemodes/cityrp/plugins/accessories/sv_plugin.lua",
+                r#"---@type PLUGIN
+local PLUGIN = PLUGIN
+local meta = FindMetaTable("Player")
+function meta:ResetParts()
+    net.Start("cityrpPartReset")
+    net.Broadcast()
+end
+function PLUGIN:PlayerDeath(client)
+    client:ResetParts()
+end
+"#,
+            ),
+            (
+                "gamemodes/cityrp/plugins/kevlar/sv_init.lua",
+                "---@type PLUGIN
+local PLUGIN = PLUGIN
+function PLUGIN:PlayerDeath(ply)
+end
+",
             ),
         ]);
     }

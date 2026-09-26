@@ -38,6 +38,13 @@ impl DeepLevel {
     pub fn get(&self) -> usize {
         self.deep
     }
+
+    /// The owner answering also holds the definition itself, as a shared base
+    /// that every scoped subclass's definition is registered on does: its
+    /// other members are the definition's siblings, not a parent's contract.
+    pub fn answered_by_own_owner(&mut self) {
+        self.deep = 0;
+    }
 }
 
 fn get_member_id(cache: &mut LuaInferCache, index_member_expr: &LuaIndexMemberExpr) -> LuaMemberId {
@@ -237,6 +244,9 @@ fn find_custom_type_function_member(
             }
         }
         if !result_type.is_never() {
+            if member_item.member_ids_slice().contains(&index_member_id) {
+                deep_guard.answered_by_own_owner();
+            }
             return Ok(result_type);
         }
     }

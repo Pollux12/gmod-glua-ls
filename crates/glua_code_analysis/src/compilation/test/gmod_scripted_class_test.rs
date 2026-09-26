@@ -605,6 +605,55 @@ mod test {
     }
 
     #[gtest]
+    fn a_hook_two_plugins_override_types_each_override_from_the_hook() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_files(vec![
+            (
+                "lua/aaa_annotations/gm.lua",
+                "---@class Player
+---@param victim Player
+function GM:PlayerDeath(victim, inflictor, attacker) end
+",
+            ),
+            (
+                "gamemodes/cityrp/gamemode/core/libraries/sh_plugin.lua",
+                "--- @class PLUGIN
+",
+            ),
+            (
+                "gamemodes/cityrp/plugins/accessories/sv_plugin.lua",
+                "---@type PLUGIN
+local PLUGIN = PLUGIN
+function PLUGIN:PlayerDeath(client)
+    local _ = client
+end
+",
+            ),
+            (
+                "gamemodes/cityrp/plugins/kevlar/sv_init.lua",
+                "---@type PLUGIN
+local PLUGIN = PLUGIN
+function PLUGIN:PlayerDeath(ply)
+    local _ = ply
+end
+",
+            ),
+        ]);
+
+        let digest = ws.semantic_digest();
+        for param in ["client", "ply"] {
+            let suffix = format!(": {param} = Player");
+            expect_true!(
+                digest.iter().any(|line| line.ends_with(&suffix)),
+                "{param} should take the hook's Player, digest: {digest:#?}"
+            );
+        }
+    }
+
+    #[gtest]
     fn test_plugin_scope_binds_plugin_decl_with_self_reference_initializer() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
