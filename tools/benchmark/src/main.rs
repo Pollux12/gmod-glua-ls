@@ -493,6 +493,22 @@ async fn run() {
     // Phase 2: Create analysis + add workspaces
     let t = Instant::now();
     let mut analysis = EmmyLuaAnalysis::new();
+    // `BENCH_SCHEDULE=reversed` or `=<seed>` changes the order files run in.
+    match std::env::var("BENCH_SCHEDULE").as_deref() {
+        Ok("reversed") => analysis
+            .compilation
+            .set_schedule(glua_code_analysis::Schedule::Reversed),
+        Ok(seed) => match seed.parse::<u64>() {
+            Ok(seed) => analysis
+                .compilation
+                .set_schedule(glua_code_analysis::Schedule::Shuffled(seed)),
+            Err(_) => {
+                eprintln!("ERROR: BENCH_SCHEDULE must be `reversed` or a seed, got: {seed}");
+                std::process::exit(1);
+            }
+        },
+        Err(_) => {}
+    }
     analysis.update_config(Arc::new(emmyrc.clone()));
     analysis.init_std_lib();
 

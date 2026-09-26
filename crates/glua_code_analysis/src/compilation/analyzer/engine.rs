@@ -333,6 +333,7 @@ impl Engine {
                 self.worklist = std::mem::replace(&mut self.next_round, Queue::new(schedule));
                 self.cursor = None;
                 self.stats.rounds += 1;
+                self.stats.round_started(self.worklist.order.len());
                 continue;
             };
             self.cursor = Some(id);
@@ -667,6 +668,18 @@ impl EngineStats {
         if reruns > 0 {
             *self.rerun_time.entry(kind).or_default() +=
                 elapsed.mul_f64(reruns as f64 / evaluated.max(1) as f64);
+        }
+    }
+
+    /// Under `GLUALS_PROFILE`, prints each round's start as it happens, so a
+    /// run that settles slowly shows where its rounds go.
+    fn round_started(&self, queued: usize) {
+        if self.profiling() {
+            eprintln!(
+                "[engine] round {} starts with {queued} queued after {} evaluations",
+                self.rounds,
+                self.total_evaluations()
+            );
         }
     }
 
