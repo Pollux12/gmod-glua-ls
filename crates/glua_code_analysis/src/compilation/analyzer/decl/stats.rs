@@ -282,45 +282,46 @@ fn assign_stat_var_carries_doc_type(stat: &LuaAssignStat, var_idx: usize) -> boo
         })
 }
 
+/// Declares the global that `_G.name` or `_ENV.name` writes. Returns it, or
+/// `None` when the prefix is not the global table.
 fn analyze_maybe_global_index_expr(
     analyzer: &mut DeclAnalyzer,
     index_expr: &LuaIndexExpr,
     index_name: &str,
     value_expr_id: Option<LuaSyntaxId>,
-) -> Option<()> {
+) -> Option<crate::LuaDeclId> {
     let file_id = analyzer.get_file_id();
     let prefix = index_expr.get_prefix_expr()?;
-    if let LuaExpr::NameExpr(name_expr) = prefix {
-        let name_token = name_expr.get_name_token()?;
-        let name_token_text = name_token.get_name_text();
-        if name_token_text == "_G" || name_token_text == "_ENV" {
-            let range = index_expr.get_range();
-            let decl_id = crate::LuaDeclId::new(file_id, range.start());
-            if let Some(decl) = analyzer.db.get_decl_index().get_decl(&decl_id)
-                && decl.is_global()
-            {
-                let decl_id = decl.get_id();
-                analyzer
-                    .db
-                    .get_reference_index_mut()
-                    .add_decl_reference(decl_id, file_id, range, true);
-            } else {
-                let decl = LuaDecl::new(
-                    index_name,
-                    file_id,
-                    range,
-                    LuaDeclExtra::Global {
-                        kind: LuaSyntaxKind::IndexExpr.into(),
-                    },
-                    value_expr_id,
-                );
-
-                analyzer.add_decl(decl);
-            }
-        }
+    let LuaExpr::NameExpr(name_expr) = prefix else {
+        return None;
+    };
+    let name_token = name_expr.get_name_token()?;
+    let name_token_text = name_token.get_name_text();
+    if name_token_text != "_G" && name_token_text != "_ENV" {
+        return None;
     }
-
-    Some(())
+    let range = index_expr.get_range();
+    let decl_id = crate::LuaDeclId::new(file_id, range.start());
+    if let Some(decl) = analyzer.db.get_decl_index().get_decl(&decl_id)
+        && decl.is_global()
+    {
+        let decl_id = decl.get_id();
+        analyzer
+            .db
+            .get_reference_index_mut()
+            .add_decl_reference(decl_id, file_id, range, true);
+        return Some(decl_id);
+    }
+    let decl = LuaDecl::new(
+        index_name,
+        file_id,
+        range,
+        LuaDeclExtra::Global {
+            kind: LuaSyntaxKind::IndexExpr.into(),
+        },
+        value_expr_id,
+    );
+    Some(analyzer.add_decl(decl))
 }
 
 pub fn analyze_for_stat(analyzer: &mut DeclAnalyzer, stat: LuaForStat) -> Option<()> {
@@ -482,8 +483,18 @@ pub fn analyze_func_stat(analyzer: &mut DeclAnalyzer, stat: LuaFuncStat) -> Opti
                     .add_early_member_owner_candidate(member_id, decl_id);
             }
 
-            if let LuaMemberKey::Name(name) = &key {
-                analyze_maybe_global_index_expr(analyzer, &index_expr, name, None);
+            // `function _G.name()` declares the global `name` as well as the
+            // member: its type is the signature from the start, like the
+            // member's, so no read of the name sees it untyped.
+            if let LuaMemberKey::Name(name) = &key
+                && let Some(global_decl_id) =
+                    analyze_maybe_global_index_expr(analyzer, &index_expr, name, None)
+                && let Some(closure) = stat.get_closure()
+            {
+                analyzer.context.add_early_callable_signature(
+                    global_decl_id.into(),
+                    LuaSignatureId::from_closure(analyzer.get_file_id(), &closure),
+                );
             }
             LuaSemanticDeclId::Member(member_id)
         }

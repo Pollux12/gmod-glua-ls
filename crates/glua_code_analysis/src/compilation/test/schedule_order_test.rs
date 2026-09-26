@@ -88,7 +88,6 @@ mod test {
     }
 
     #[test]
-    #[ignore = "a member cycle keeps whichever seed it first saw, `nil` or an `unknown` from an input not analysed yet"]
     fn a_field_written_only_with_its_own_value_settles_the_same_in_either_order() {
         assert_schedule_independent(&[
             (
@@ -164,7 +163,6 @@ end
 "#;
 
     #[test]
-    #[ignore = "a member cycle keeps an `any` read before `getTable` resolved"]
     fn a_cached_entity_field_read_through_a_documented_table_settles_the_same_in_either_order() {
         assert_schedule_independent(&[
             (
