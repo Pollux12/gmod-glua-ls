@@ -42,6 +42,22 @@ pub trait DerivedFact: std::any::Any + Send + Sync {
     }
 }
 
+/// The workspace call roles and net-helper registry: the folds read it whole,
+/// a per-file pass entry by entry, as [`FactKey::CallRole`].
+pub trait CallRoles: DerivedFact {
+    /// Every entry.
+    fn entries(&self) -> Vec<CallRoleKey>;
+
+    /// One entry's fingerprint, [`ABSENT`] when there is none.
+    fn entry_fingerprint(&self, key: &CallRoleKey) -> Fingerprint;
+}
+
+impl std::fmt::Debug for dyn CallRoles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CallRoles")
+    }
+}
+
 impl std::fmt::Debug for dyn DerivedFact {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("DerivedFact")
@@ -113,6 +129,21 @@ impl StageRule {
                 Self::FloorUnsettled => AnalysisStage::Closed,
             }
     }
+}
+
+/// One entry of the workspace call roles and net-helper registry, as a
+/// per-file pass looks it up: present or absent, so an entry added later
+/// reaches exactly the files that asked for it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CallRoleKey {
+    /// A global call path's annotated roles.
+    Path(SmolStr),
+    /// The helper body a global function names.
+    Global(GlobalId),
+    /// The helper body a method name uniquely names.
+    Method(SmolStr),
+    /// The helper body a signature resolves to.
+    Signature(LuaSignatureId),
 }
 
 /// One readable fact. Every analysis read of an index lands on exactly one
@@ -263,6 +294,10 @@ pub enum FactKey {
     NetworkScan,
     /// The workspace net-helper registry.
     HelperRegistry,
+    /// One entry of the workspace call roles and net-helper registry.
+    CallRole(CallRoleKey),
+    /// The global paths one file's syntax names.
+    RoleMentions(FileId),
     /// One file's gmod helper scan: its call roles and net-helper definitions.
     HelperScan(FileId),
     /// The set of files that have a gmod helper scan.
@@ -424,7 +459,9 @@ impl FactKey {
                 | K::LoadScan(_)
                 | K::NetworkFile(_)
                 | K::HelperRegistry
+                | K::CallRole(_)
                 | K::HelperScan(_)
+                | K::RoleMentions(_)
                 | K::NetHelpers(_)
                 | K::DeclDefault(_)
                 | K::AccessorCalls(_)
@@ -515,7 +552,8 @@ impl FactKey {
     /// stored under the key: the member, dynamic-field and call-site indexes
     /// file each contribution under its contributing file, and the edit remap
     /// re-homes an owner or signature that moved, or reports its contributors
-    /// when it is gone.
+    /// when it is gone. The call-role fold keeps its entries until it runs
+    /// again, which the re-indexed file's helper scan decides.
     pub fn keeps_foreign_contributions(&self) -> bool {
         use FactKey as K;
         matches!(
@@ -529,6 +567,7 @@ impl FactKey {
                 | K::DynamicFieldWildcards(_)
                 | K::DynamicFieldFinite(_)
                 | K::Contrib(..)
+                | K::CallRole(_)
         )
     }
 
@@ -577,7 +616,8 @@ impl FactKey {
             K::Signature(signature_id)
             | K::ValidGuard(signature_id)
             | K::InferredGuard(signature_id)
-            | K::Contrib(signature_id, _) => Some(signature_id.get_file_id()),
+            | K::Contrib(signature_id, _)
+            | K::CallRole(CallRoleKey::Signature(signature_id)) => Some(signature_id.get_file_id()),
             K::SpecialCall(file_id, _)
             | K::SpecialCallFile(file_id)
             | K::ValidGuardFile(file_id)
@@ -598,6 +638,7 @@ impl FactKey {
             | K::LoadScan(file_id)
             | K::NetworkFile(file_id)
             | K::HelperScan(file_id)
+            | K::RoleMentions(file_id)
             | K::NetHelpers(file_id)
             | K::FunctionSummaries(file_id)
             | K::References(file_id)
@@ -635,6 +676,7 @@ impl FactKey {
             | K::GmodInferScan
             | K::NetworkScan
             | K::HelperRegistry
+            | K::CallRole(CallRoleKey::Path(_) | CallRoleKey::Global(_) | CallRoleKey::Method(_))
             | K::HelperScanFiles
             | K::LoadScanFiles
             | K::FileSet

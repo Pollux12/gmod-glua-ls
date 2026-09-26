@@ -354,7 +354,7 @@ pub(crate) fn compute_net_helpers(db: &DbIndex, file_id: FileId) -> Option<FileN
     if !db.get_emmyrc().gmod.enabled {
         return None;
     }
-    let roles = derive::call_roles(db);
+    let roles = derive::call_role_entries(db);
     build_file_net_helpers(db, file_id, &roles.registry)
 }
 
@@ -731,7 +731,7 @@ fn resolve_call_to_function_block(
     {
         let call_path = call_path.strip_prefix("_G.").unwrap_or(&call_path);
         let global_id = GlobalId::new(call_path);
-        if let Some((file_id, syntax_id)) = helper_registry.globals.get(&global_id)
+        if let Some((file_id, syntax_id)) = helper_registry.global(&global_id)
             && let Some(helper) = resolve_registry_entry(roots, db, file_id, syntax_id)
         {
             return Some(helper);
@@ -739,7 +739,7 @@ fn resolve_call_to_function_block(
     }
 
     if let Some(signature_id) = net.signature_id(db, call_expr)
-        && let Some((file_id, syntax_id)) = helper_registry.signatures.get(&signature_id)
+        && let Some((file_id, syntax_id)) = helper_registry.signature(&signature_id)
         && let Some(helper) = resolve_registry_entry(roots, db, file_id, syntax_id)
     {
         return Some(helper);
@@ -763,7 +763,7 @@ fn resolve_call_to_function_block(
         && let Some(LuaIndexKey::Name(method_token)) = index_expr.get_index_key()
     {
         let method_name = SmolStr::new(method_token.get_name_text());
-        if let Some((file_id, syntax_id)) = helper_registry.methods.get(&method_name)
+        if let Some((file_id, syntax_id)) = helper_registry.method(&method_name)
             && let Some(helper) = resolve_registry_entry(roots, db, file_id, syntax_id)
         {
             return Some(helper);

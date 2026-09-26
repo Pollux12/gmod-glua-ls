@@ -112,6 +112,8 @@ impl GmodKeywords {
 }
 
 fn scan_gmod_keywords(
+    db: &DbIndex,
+    file_id: FileId,
     content: &str,
     formatted_hook_prefixes: &[String],
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
@@ -129,7 +131,7 @@ fn scan_gmod_keywords(
         || content.contains("gmod.class_base")
         || content.contains("gmod.gamemode");
     let has_load_annotation = content.contains("gmod.load");
-    let annotated_candidates = annotated_global_call_roles.candidate_call_paths_in_content(content);
+    let annotated_candidates = annotated_global_call_roles.candidate_presence(db, file_id);
     GmodKeywords {
         has_hook: content.contains("hook") || has_hook_annotation || annotated_candidates.has_hook,
         has_system_call: content.contains("timer.")
@@ -263,7 +265,7 @@ pub(crate) fn compute_annotated_call_sites(
         return Vec::new();
     }
     let prefixes = formatted_hook_prefixes(db);
-    let roles = derive::call_roles(db);
+    let roles = derive::call_role_entries(db);
     file_annotated_call_sites(
         db,
         file_id,
@@ -298,6 +300,8 @@ fn file_annotated_call_sites(
         .get_file_content(&file_id)
         .map(|content| {
             scan_gmod_keywords(
+                db,
+                file_id,
                 content,
                 formatted_hook_prefixes,
                 annotated_global_call_roles,
@@ -420,6 +424,36 @@ pub(crate) struct HelperRegistry {
 }
 
 impl HelperRegistry {
+    /// The helper body a global function names, read as that entry.
+    fn global(&self, global_id: &GlobalId) -> Option<&(FileId, LuaSyntaxId)> {
+        crate::db_index::derivation::note_read(|| {
+            crate::db_index::derivation::FactKey::CallRole(
+                crate::db_index::derivation::CallRoleKey::Global(global_id.clone()),
+            )
+        });
+        self.globals.get(global_id)
+    }
+
+    /// The helper body a method name uniquely names, read as that entry.
+    fn method(&self, name: &SmolStr) -> Option<&(FileId, LuaSyntaxId)> {
+        crate::db_index::derivation::note_read(|| {
+            crate::db_index::derivation::FactKey::CallRole(
+                crate::db_index::derivation::CallRoleKey::Method(name.clone()),
+            )
+        });
+        self.methods.get(name)
+    }
+
+    /// The helper body a signature resolves to, read as that entry.
+    fn signature(&self, signature_id: &LuaSignatureId) -> Option<&(FileId, LuaSyntaxId)> {
+        crate::db_index::derivation::note_read(|| {
+            crate::db_index::derivation::FactKey::CallRole(
+                crate::db_index::derivation::CallRoleKey::Signature(*signature_id),
+            )
+        });
+        self.signatures.get(signature_id)
+    }
+
     /// A value fingerprint of the registry: its entries in a stable order.
     fn fingerprint(&self) -> crate::db_index::derivation::Fingerprint {
         let site =
@@ -491,6 +525,73 @@ pub(crate) fn evaluate_helper_scan(db: &mut DbIndex, file_id: FileId) {
     db.set_helper_scan(file_id, Arc::new(scan));
 }
 
+/// Records the global paths `file_id`'s syntax names, which its gmod passes
+/// look their call roles up by.
+pub(crate) fn index_role_mentions(db: &mut DbIndex, file_id: FileId) {
+    if !db.get_emmyrc().gmod.enabled {
+        return;
+    }
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .map(|tree| tree.get_chunk_node())
+    else {
+        return;
+    };
+    let mentions = global_path_mentions(db, file_id, &root);
+    db.set_role_mentions(file_id, mentions);
+}
+
+/// The global paths `root`'s syntax names, sorted: every path a call-role
+/// lookup in the file can ask for. A name that resolves to a local, and every
+/// path through it, names no global.
+fn global_path_mentions(db: &DbIndex, file_id: FileId, root: &LuaChunk) -> Arc<[SmolStr]> {
+    let references = db.get_reference_index();
+    let decl_tree = db.get_decl_index().get_decl_tree(&file_id);
+    let is_local = |name_expr: &LuaNameExpr| {
+        references
+            .get_var_reference_decl(&file_id, name_expr.get_range())
+            .and_then(|decl_id| decl_tree?.get_decl(&decl_id))
+            .is_some_and(|decl| decl.is_local())
+    };
+    let mut paths = Vec::new();
+    for name_expr in root.descendants::<LuaNameExpr>() {
+        if is_local(&name_expr) {
+            continue;
+        }
+        let Some(name) = name_expr.get_name_text() else {
+            continue;
+        };
+        paths.push(name);
+        let mut node = name_expr.syntax().clone();
+        while let Some(parent) = node.parent() {
+            let is_prefix =
+                if let Some(index_expr) = glua_parser::LuaIndexExpr::cast(parent.clone()) {
+                    let is_prefix = index_expr
+                        .get_prefix_expr()
+                        .is_some_and(|prefix| *prefix.syntax() == node);
+                    if is_prefix && let Some(path) = index_expr.get_access_path() {
+                        paths.push(path);
+                    }
+                    is_prefix
+                } else if let Some(call_expr) = LuaCallExpr::cast(parent.clone()) {
+                    call_expr
+                        .get_prefix_expr()
+                        .is_some_and(|prefix| *prefix.syntax() == node)
+                } else {
+                    false
+                };
+            if !is_prefix {
+                break;
+            }
+            node = parent;
+        }
+    }
+    paths.sort_unstable();
+    paths.dedup();
+    paths.into()
+}
+
 /// Folds every file's helper scan into the call-role map and the net-helper
 /// registry. Files merge in path order, so the file that wins a call path
 /// both define is a property of the source, not of the session.
@@ -519,7 +620,6 @@ fn build_call_roles_and_registry(
         role_map.merge_from(&scan.role_map);
         definitions.extend(scan.definitions.iter().cloned());
     }
-    role_map.rebuild_candidate_call_path_set();
     let registry = HelperRegistryBuilder {
         definitions,
         ..Default::default()
@@ -1098,6 +1198,8 @@ fn collect_file_gmod_metadata(
     let keywords = content
         .map(|content| {
             scan_gmod_keywords(
+                db,
+                file_id,
                 content,
                 formatted_hook_prefixes,
                 annotated_global_call_roles,
@@ -6809,8 +6911,8 @@ impl std::fmt::Debug for AnnotatedGmodGlobalCallRoleMap {
 #[derive(Default, Clone)]
 pub(crate) struct AnnotatedGmodGlobalCallRoleMap {
     roles_by_path: HashMap<String, AnnotatedGmodCallRoles>,
-    candidate_call_path_matcher: Option<AhoCorasick>,
-    candidate_call_path_kinds: Vec<AnnotatedGmodCandidatePresence>,
+    /// Each path's roles fingerprinted once, when its file's scan is built.
+    path_fingerprints: HashMap<String, crate::db_index::derivation::Fingerprint>,
     environment_role_source_files: HashSet<FileId>,
     /// Canonical function metadata per `(wire_format, direction)`, published to
     /// the network index for features that must emit a net call. Values keep
@@ -7654,9 +7756,12 @@ impl AnnotatedGmodGlobalCallRoleMap {
     /// took the signature index's `HashMap` order, which varies per process.
     fn merge_from(&mut self, other: &Self) {
         for (path, roles) in &other.roles_by_path {
-            self.roles_by_path
-                .entry(path.clone())
-                .or_insert_with(|| roles.clone());
+            if !self.roles_by_path.contains_key(path) {
+                self.roles_by_path.insert(path.clone(), roles.clone());
+                if let Some(fingerprint) = other.path_fingerprints.get(path) {
+                    self.path_fingerprints.insert(path.clone(), *fingerprint);
+                }
+            }
         }
         self.environment_role_source_files
             .extend(other.environment_role_source_files.iter().copied());
@@ -7727,64 +7832,15 @@ impl AnnotatedGmodGlobalCallRoleMap {
             .collect()
     }
 
-    fn rebuild_candidate_call_path_set(&mut self) {
-        let mut call_paths = Vec::new();
-        self.candidate_call_path_kinds.clear();
-
-        for (call_path, roles) in &self.roles_by_path {
-            let presence = roles.candidate_presence();
-            if !presence.has_system
-                && !presence.has_hook
-                && !presence.has_scripted_class
-                && !presence.has_load
-                && !presence.has_environment
-                && !presence.has_file_find
-            {
-                continue;
-            }
-
-            call_paths.push(call_path.as_str());
-            self.candidate_call_path_kinds.push(presence);
-        }
-
-        self.candidate_call_path_matcher = if call_paths.is_empty() {
-            None
-        } else {
-            AhoCorasick::new(call_paths).ok()
-        };
-    }
-
-    fn candidate_call_paths_in_content(&self, content: &str) -> AnnotatedGmodCandidatePresence {
+    /// Whether the global paths `file_id`'s syntax names include a call role
+    /// of each kind. Every path is looked up, present or absent.
+    fn candidate_presence(&self, db: &DbIndex, file_id: FileId) -> AnnotatedGmodCandidatePresence {
         let mut presence = AnnotatedGmodCandidatePresence::default();
-        let Some(matcher) = &self.candidate_call_path_matcher else {
-            return presence;
-        };
-
-        for mat in matcher.find_iter(content) {
-            let Some(candidate_presence) =
-                self.candidate_call_path_kinds.get(mat.pattern().as_usize())
-            else {
-                continue;
-            };
-
-            presence.has_system |= candidate_presence.has_system;
-            presence.has_hook |= candidate_presence.has_hook;
-            presence.has_scripted_class |= candidate_presence.has_scripted_class;
-            presence.has_load |= candidate_presence.has_load;
-            presence.has_environment |= candidate_presence.has_environment;
-            presence.has_file_find |= candidate_presence.has_file_find;
-
-            if presence.has_system
-                && presence.has_hook
-                && presence.has_scripted_class
-                && presence.has_load
-                && presence.has_environment
-                && presence.has_file_find
-            {
-                break;
+        for path in db.role_mentions(file_id).iter() {
+            if let Some(roles) = self.roles(path) {
+                presence.merge(roles.candidate_presence());
             }
         }
-
         presence
     }
 
@@ -7803,29 +7859,38 @@ impl AnnotatedGmodGlobalCallRoleMap {
                 self.environment_role_source_files
                     .insert(signature_id.get_file_id());
             }
+            let fingerprint = crate::db_index::derivation::fingerprint_of(&roles);
             self.roles_by_path.insert(call_path.clone(), roles.clone());
+            self.path_fingerprints
+                .insert(call_path.clone(), fingerprint);
             if let Some(global_path) = call_path.strip_prefix("_G.") {
                 self.roles_by_path.insert(global_path.to_string(), roles);
+                self.path_fingerprints
+                    .insert(global_path.to_string(), fingerprint);
             }
         }
     }
 
+    /// The roles of `call_path`, or of the path under `_G.`. Reads each path it
+    /// consults as its entry, present or absent.
+    fn roles(&self, call_path: &str) -> Option<&AnnotatedGmodCallRoles> {
+        let entry = |path: &str| {
+            crate::db_index::derivation::note_read(|| {
+                crate::db_index::derivation::FactKey::CallRole(
+                    crate::db_index::derivation::CallRoleKey::Path(SmolStr::new(path)),
+                )
+            });
+            self.roles_by_path.get(path)
+        };
+        entry(call_path).or_else(|| entry(call_path.strip_prefix("_G.")?))
+    }
+
     fn get(&self, call_path: &str) -> Option<AnnotatedGmodCallRoles> {
-        self.roles_by_path
-            .get(call_path)
-            .or_else(|| {
-                call_path
-                    .strip_prefix("_G.")
-                    .and_then(|global_path| self.roles_by_path.get(global_path))
-            })
-            .cloned()
+        self.roles(call_path).cloned()
     }
 
     fn contains(&self, call_path: &str) -> bool {
-        self.roles_by_path.contains_key(call_path)
-            || call_path
-                .strip_prefix("_G.")
-                .is_some_and(|global_path| self.roles_by_path.contains_key(global_path))
+        self.roles(call_path).is_some()
     }
 }
 
@@ -9843,7 +9908,7 @@ fn collect_compilefile_execution_environment_flow(
     let Some(content) = db.get_vfs().get_file_content(&file_id) else {
         return GmodExecutionEnvironmentFileFlow::default();
     };
-    let candidates = annotated_global_call_roles.candidate_call_paths_in_content(content);
+    let candidates = annotated_global_call_roles.candidate_presence(db, file_id);
     if !candidates.has_environment
         && !content.contains("gmod.environment")
         && !content.contains("compilefile")
@@ -10754,7 +10819,7 @@ fn collect_file_dynamic_loaders(
     let Some(content) = db.get_vfs().get_file_content(&source_file_id) else {
         return candidates;
     };
-    let annotated_candidates = annotated_global_call_roles.candidate_call_paths_in_content(content);
+    let annotated_candidates = annotated_global_call_roles.candidate_presence(db, source_file_id);
     if !content.contains("gmod.file_find") && !annotated_candidates.has_file_find {
         return candidates;
     }

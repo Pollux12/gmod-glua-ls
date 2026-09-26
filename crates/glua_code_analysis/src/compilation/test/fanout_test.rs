@@ -358,6 +358,45 @@ end
         assert_eq!(workspace.evaluated_files(), vec![menu]);
     }
 
+    /// A new call role reaches only the files whose syntax names its path.
+    #[test]
+    fn annotating_a_net_payload_helper_re_runs_only_files_that_call_it() {
+        const WRAPPER: &str = "gamemodes/cityrp/gamemode/core/sh_netwrap.lua";
+        const WRAPPER_TEXT: &str = "function WriteCityName(value) end\n";
+        let mut workspace = cityrp_workspace();
+        workspace.ws.def_file(WRAPPER, WRAPPER_TEXT);
+        let caller = workspace.ws.def_file(
+            "gamemodes/cityrp/gamemode/core/cl_city.lua",
+            "net.Start(\"cityrp_city\")\nWriteCityName(\"x\")\nnet.SendToServer()\n",
+        );
+
+        let wrapper = workspace.ws.def_file(
+            WRAPPER,
+            &format!("---@[net_payload(\"write\", \"string\")]\n{WRAPPER_TEXT}"),
+        );
+
+        assert_eq!(workspace.evaluated_files(), vec![wrapper, caller]);
+    }
+
+    /// Per-file passes look call roles up by path; only the workspace folds
+    /// read the whole registry.
+    #[test]
+    fn no_per_file_derivation_reads_the_whole_call_role_registry() {
+        let workspace = cityrp_workspace();
+        let graph = workspace.ws.analysis.compilation.get_db().reader_graph();
+        let registry = crate::db_index::derivation::HashedKey::new(
+            crate::db_index::derivation::FactKey::HelperRegistry,
+        );
+
+        let per_file_readers = graph
+            .stale_readers(&registry, |_| false)
+            .filter(|reader| reader.file_id != FileId::VIRTUAL)
+            .map(|reader| reader.kind)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(per_file_readers, std::collections::BTreeSet::new());
+    }
+
     /// Whether a table literal is array-shaped is read off the statement that
     /// holds it, so a statement added elsewhere in its file leaves the files
     /// that index it standing.

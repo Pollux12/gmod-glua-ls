@@ -11,6 +11,7 @@ use rustc_hash::FxHashMap as HashMap;
 
 use super::*;
 use crate::db_index::GmodRealmInputs;
+use crate::db_index::derivation::CallRoleKey;
 
 /// The workspace call roles and net-helper registry, folded from every file's
 /// helper scan.
@@ -28,15 +29,86 @@ impl crate::db_index::derivation::DerivedFact for GmodCallRoles {
     }
 }
 
-/// The current call roles, or empty ones before the fold first ran.
+impl crate::db_index::derivation::CallRoles for GmodCallRoles {
+    fn entries(&self) -> Vec<CallRoleKey> {
+        let paths = self
+            .roles
+            .roles_by_path
+            .keys()
+            .map(|path| CallRoleKey::Path(SmolStr::new(path)));
+        let globals = self
+            .registry
+            .globals
+            .keys()
+            .cloned()
+            .map(CallRoleKey::Global);
+        let methods = self
+            .registry
+            .methods
+            .keys()
+            .cloned()
+            .map(CallRoleKey::Method);
+        let signatures = self
+            .registry
+            .signatures
+            .keys()
+            .copied()
+            .map(CallRoleKey::Signature);
+        paths
+            .chain(globals)
+            .chain(methods)
+            .chain(signatures)
+            .collect()
+    }
+
+    fn entry_fingerprint(&self, key: &CallRoleKey) -> crate::db_index::derivation::Fingerprint {
+        use crate::db_index::derivation::fingerprint_opt;
+        let site =
+            |(file_id, syntax_id): &(FileId, LuaSyntaxId)| InFiled::new(*file_id, *syntax_id);
+        match key {
+            CallRoleKey::Path(path) if !crate::db_index::derivation::mapping_back() => self
+                .roles
+                .path_fingerprints
+                .get(path.as_str())
+                .copied()
+                .unwrap_or(crate::db_index::derivation::ABSENT),
+            CallRoleKey::Path(path) => fingerprint_opt(self.roles.roles_by_path.get(path.as_str())),
+            CallRoleKey::Global(global_id) => {
+                fingerprint_opt(self.registry.globals.get(global_id).map(site).as_ref())
+            }
+            CallRoleKey::Method(name) => {
+                fingerprint_opt(self.registry.methods.get(name).map(site).as_ref())
+            }
+            CallRoleKey::Signature(signature_id) => fingerprint_opt(
+                self.registry
+                    .signatures
+                    .get(signature_id)
+                    .map(site)
+                    .as_ref(),
+            ),
+        }
+    }
+}
+
+fn empty_call_roles() -> Arc<GmodCallRoles> {
+    Arc::new(GmodCallRoles {
+        registry: Arc::new(HelperRegistry::default()),
+        roles: Arc::new(AnnotatedGmodGlobalCallRoleMap::default()),
+    })
+}
+
+/// The current call roles for a fold over them, or empty ones before the
+/// fold first ran.
 pub(super) fn call_roles(db: &DbIndex) -> Arc<GmodCallRoles> {
     db.get_gmod_call_roles::<GmodCallRoles>()
-        .unwrap_or_else(|| {
-            Arc::new(GmodCallRoles {
-                registry: Arc::new(HelperRegistry::default()),
-                roles: Arc::new(AnnotatedGmodGlobalCallRoleMap::default()),
-            })
-        })
+        .unwrap_or_else(empty_call_roles)
+}
+
+/// The current call roles for a per-file pass, which reads each entry it
+/// looks up, or empty ones before the fold first ran.
+pub(super) fn call_role_entries(db: &DbIndex) -> Arc<GmodCallRoles> {
+    db.gmod_call_role_entries::<GmodCallRoles>()
+        .unwrap_or_else(empty_call_roles)
 }
 
 /// Folds every file's helper scan into the call roles and the net-helper
@@ -70,7 +142,7 @@ pub(crate) fn evaluate_load_call_sites(db: &mut DbIndex, context: &mut AnalyzeCo
         return;
     }
     let prefixes = formatted_hook_prefixes(db);
-    let roles = call_roles(db);
+    let roles = call_role_entries(db);
     collect_annotated_call_sites_with(db, context, &prefixes, &roles.roles, true, false);
 }
 
@@ -80,7 +152,7 @@ pub(crate) fn evaluate_pre(db: &mut DbIndex, context: &mut AnalyzeContext) {
     if !db.get_emmyrc().gmod.enabled {
         return;
     }
-    let roles = call_roles(db);
+    let roles = call_role_entries(db);
     let prefixes = formatted_hook_prefixes(db);
     let scripted_scope_files = context.get_or_compute_scripted_scope_files(db);
     let tree_list = context.tree_list.clone();
@@ -194,7 +266,7 @@ pub(crate) fn evaluate_class_call_sites(db: &mut DbIndex, context: &mut AnalyzeC
         return;
     }
     let prefixes = formatted_hook_prefixes(db);
-    let roles = call_roles(db);
+    let roles = call_role_entries(db);
     collect_annotated_call_sites_with(db, context, &prefixes, &roles.roles, false, true);
 }
 

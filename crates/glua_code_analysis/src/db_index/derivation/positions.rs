@@ -160,6 +160,9 @@ impl EditMaps {
             K::ValidGuard(id) => K::ValidGuard(self.signature_id(*id)?),
             K::InferredGuard(id) => K::InferredGuard(self.signature_id(*id)?),
             K::Contrib(id, idx) => K::Contrib(self.signature_id(*id)?, *idx),
+            K::CallRole(super::CallRoleKey::Signature(id)) => {
+                K::CallRole(super::CallRoleKey::Signature(self.signature_id(*id)?))
+            }
             K::SpecialCall(file_id, position) => {
                 K::SpecialCall(*file_id, self.position(*file_id, *position)?)
             }

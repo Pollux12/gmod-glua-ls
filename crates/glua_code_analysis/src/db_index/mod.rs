@@ -95,7 +95,11 @@ pub struct DbIndex {
     /// Who read and produced which fact; see [`derivation`].
     derivations: Arc<derivation::ReaderGraph>,
     /// The workspace gmod call roles with their fingerprint when stored.
-    gmod_call_roles: Option<(Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
+    gmod_call_roles: Option<(Arc<dyn derivation::CallRoles>, derivation::Fingerprint)>,
+    /// Each call-role entry's fingerprint when the call roles were stored.
+    call_role_fingerprints: FxHashMap<derivation::CallRoleKey, derivation::Fingerprint>,
+    /// The global paths each file's syntax names.
+    role_mentions: FxHashMap<FileId, Arc<[smol_str::SmolStr]>>,
     emmyrc: Arc<Emmyrc>,
     /// Each file's gmod helper scan with its fingerprint when stored.
     helper_scans: FxHashMap<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
@@ -189,6 +193,8 @@ impl DbIndex {
             json_schema_index: Arc::new(JsonSchemaIndex::new()),
             derivations: Arc::default(),
             gmod_call_roles: None,
+            call_role_fingerprints: FxHashMap::default(),
+            role_mentions: FxHashMap::default(),
             emmyrc: Arc::new(Emmyrc::default()),
             helper_scans: FxHashMap::default(),
             helper_scan_files: derivation::SetFingerprint::default(),
@@ -218,6 +224,7 @@ impl DbIndex {
         match key {
             K::TypeCache(owner) => self.get_type_index_mut().reset_type_cache(owner),
             K::HelperScan(file_id) => self.remove_helper_scan(*file_id),
+            K::RoleMentions(file_id) => self.remove_role_mentions(*file_id),
             K::LoadScan(file_id) => self.remove_load_scan(*file_id),
             K::NetHelpers(file_id) => self.remove_net_helpers(*file_id),
             K::DeclClaim(decl_id) => self.get_type_index_mut().reset_decl_claim(decl_id),
@@ -278,8 +285,8 @@ impl DbIndex {
         }
     }
 
-    /// Every stored per-file fact by kind, with the fingerprint it was stored
-    /// with, sorted: for comparing two analyses of the same workspace.
+    /// Every stored per-file fact by kind, with its fingerprint, sorted: for
+    /// comparing two analyses of the same workspace.
     pub fn stored_fact_fingerprints(&self) -> Vec<(&'static str, FileId, u64)> {
         let tables = [
             ("helper_scan", &self.helper_scans),
@@ -294,22 +301,80 @@ impl DbIndex {
                     .iter()
                     .map(move |(file_id, (_, fingerprint))| (kind, *file_id, *fingerprint))
             })
+            .chain(self.role_mentions.iter().map(|(file_id, mentions)| {
+                (
+                    "role_mentions",
+                    *file_id,
+                    derivation::fingerprint_of(mentions),
+                )
+            }))
             .collect::<Vec<_>>();
         facts.sort_unstable();
         facts
     }
 
-    pub(crate) fn get_gmod_call_roles<T: derivation::DerivedFact>(&self) -> Option<Arc<T>> {
+    /// The call roles as a whole, for a fold over them.
+    pub(crate) fn get_gmod_call_roles<T: derivation::CallRoles>(&self) -> Option<Arc<T>> {
         derivation::note_read(|| derivation::FactKey::HelperRegistry);
-        self.gmod_call_roles
-            .as_ref()
-            .and_then(|(roles, _)| downcast_fact(roles))
+        self.gmod_call_role_entries()
     }
 
-    pub(crate) fn set_gmod_call_roles<T: derivation::DerivedFact>(&mut self, roles: Arc<T>) {
+    /// The call roles for a per-file pass, which reads the entries it looks up
+    /// one by one.
+    pub(crate) fn gmod_call_role_entries<T: derivation::CallRoles>(&self) -> Option<Arc<T>> {
+        let (roles, _) = self.gmod_call_roles.as_ref()?;
+        let roles: Arc<dyn std::any::Any + Send + Sync> = roles.clone();
+        roles.downcast::<T>().ok()
+    }
+
+    /// Stores the call roles, writing each entry that moved.
+    pub(crate) fn set_gmod_call_roles<T: derivation::CallRoles>(&mut self, roles: Arc<T>) {
         derivation::note_write(|| derivation::FactKey::HelperRegistry);
+        let entries = roles
+            .entries()
+            .into_iter()
+            .map(|key| {
+                let fingerprint = roles.entry_fingerprint(&key);
+                (key, fingerprint)
+            })
+            .collect::<FxHashMap<_, _>>();
+        for (key, fingerprint) in &entries {
+            if self.call_role_fingerprints.get(key) != Some(fingerprint) {
+                derivation::note_write(|| derivation::FactKey::CallRole(key.clone()));
+            }
+        }
+        for key in self.call_role_fingerprints.keys() {
+            if !entries.contains_key(key) {
+                derivation::note_write(|| derivation::FactKey::CallRole(key.clone()));
+            }
+        }
+        self.call_role_fingerprints = entries;
         let fingerprint = roles.fingerprint().max(1);
         self.gmod_call_roles = Some((roles, fingerprint));
+    }
+
+    /// The global paths `file_id`'s syntax names.
+    pub(crate) fn role_mentions(&self, file_id: FileId) -> Arc<[smol_str::SmolStr]> {
+        derivation::note_read(|| derivation::FactKey::RoleMentions(file_id));
+        self.role_mentions
+            .get(&file_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_role_mentions(
+        &mut self,
+        file_id: FileId,
+        mentions: Arc<[smol_str::SmolStr]>,
+    ) {
+        derivation::note_write(|| derivation::FactKey::RoleMentions(file_id));
+        self.role_mentions.insert(file_id, mentions);
+    }
+
+    fn remove_role_mentions(&mut self, file_id: FileId) {
+        if self.role_mentions.remove(&file_id).is_some() {
+            derivation::note_write(|| derivation::FactKey::RoleMentions(file_id));
+        }
     }
 
     /// The fingerprint of what a read of `key` observes now.
@@ -383,10 +448,28 @@ impl DbIndex {
             K::NetworkFile(_) | K::NetworkScan | K::NetHelperNames => {
                 self.gmod_network_index.fact_fingerprint(key)
             }
-            K::HelperRegistry => self
-                .gmod_call_roles
-                .as_ref()
-                .map_or(derivation::ABSENT, stored_fact_fingerprint),
+            K::HelperRegistry => {
+                self.gmod_call_roles
+                    .as_ref()
+                    .map_or(derivation::ABSENT, |(roles, fingerprint)| {
+                        if derivation::mapping_back() {
+                            roles.fingerprint().max(1)
+                        } else {
+                            *fingerprint
+                        }
+                    })
+            }
+            K::CallRole(entry) => match &self.gmod_call_roles {
+                Some((roles, _)) if derivation::mapping_back() => roles.entry_fingerprint(entry),
+                _ => self
+                    .call_role_fingerprints
+                    .get(entry)
+                    .copied()
+                    .unwrap_or(derivation::ABSENT),
+            },
+            K::RoleMentions(file_id) => {
+                derivation::fingerprint_opt(self.role_mentions.get(file_id))
+            }
             K::HelperScan(file_id) => self
                 .helper_scans
                 .get(file_id)
@@ -634,6 +717,7 @@ impl DbIndex {
         let _profile = Profile::cond_new("remove indexes", file_ids.len() > 1);
         for &file_id in &file_ids {
             self.remove_helper_scan(file_id);
+            self.remove_role_mentions(file_id);
             self.remove_load_scan(file_id);
             self.remove_net_helpers(file_id);
             if self.function_summaries.remove(&file_id).is_some() {
@@ -1014,6 +1098,8 @@ impl DbIndex {
             json_schema_index: Arc::clone(&self.json_schema_index),
             derivations: Arc::clone(&self.derivations),
             gmod_call_roles: self.gmod_call_roles.clone(),
+            call_role_fingerprints: self.call_role_fingerprints.clone(),
+            role_mentions: self.role_mentions.clone(),
             emmyrc: Arc::clone(&self.emmyrc),
             helper_scans: self.helper_scans.clone(),
             helper_scan_files: self.helper_scan_files,
@@ -1180,5 +1266,7 @@ impl LuaIndex for DbIndex {
         self.function_summaries.clear();
         self.derivations = Arc::default();
         self.gmod_call_roles = None;
+        self.call_role_fingerprints.clear();
+        self.role_mentions.clear();
     }
 }

@@ -395,6 +395,7 @@ fn document_source(
     local_inference::prepare_inferred_positive_guards(db, &context);
     run_analysis::<flow::FlowAnalysisPipeline>(db, &mut context);
     function_summary::index_function_summaries(db, file_id);
+    gmod::index_role_mentions(db, file_id);
     let evaluation = derivation::end();
     let moved = evaluation.moved().cloned().collect::<Vec<_>>();
     let (id, reads, outputs) = evaluation.into_parts(|key| db.fact_fingerprint(key));
