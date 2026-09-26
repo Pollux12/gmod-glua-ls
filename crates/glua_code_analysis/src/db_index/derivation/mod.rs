@@ -461,9 +461,6 @@ impl FactKey {
         )
     }
 
-    /// The file whose slot the key names, or `None` for a workspace-wide key.
-    /// Removing that file's facts removes whatever any derivation stored under
-    /// the key.
     /// Whether the edit remap (`remap_into_file`) rewrites the positions of an
     /// edited file that this key's value names. A decl claim, module metadata,
     /// module names, an owner's presence and a member-key entry name no
@@ -539,6 +536,9 @@ impl FactKey {
         }
     }
 
+    /// The file whose slot the key names, or `None` for a workspace-wide key.
+    /// Removing that file's facts removes whatever any derivation stored under
+    /// the key.
     pub fn owning_file(&self) -> Option<FileId> {
         use FactKey as K;
         match self {
