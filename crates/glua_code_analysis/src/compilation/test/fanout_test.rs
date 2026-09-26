@@ -659,6 +659,25 @@ function Carry(bag) local weight = bag.weight end
         );
     }
 
+    /// A field a class does not declare is looked up on the local tables bound
+    /// to it, which are read one declaration at a time: a new declaration
+    /// elsewhere in their file leaves that lookup standing.
+    #[test]
+    fn a_local_added_to_a_file_with_a_local_class_table_re_runs_nothing_in_other_files() {
+        const BAG: &str = "gamemodes/cityrp/gamemode/core/sh_bag.lua";
+        const BAG_TEXT: &str = "---@class Bag\nlocal Bag = {}\nBag.size = 1\n";
+        let mut ws = VirtualWorkspace::new();
+        let bag = ws.def_file(BAG, BAG_TEXT);
+        ws.def_file(
+            "gamemodes/cityrp/gamemode/core/sv_carry.lua",
+            "---@param bag Bag\nfunction Carry(bag) local weight = bag.weight end\n",
+        );
+
+        ws.def_file(BAG, &format!("{BAG_TEXT}local unused = 1\n"));
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![bag]);
+    }
+
     /// A class named by string is declared by the calls that name it, once
     /// every registration has run. Re-indexing one such file rebuilds its
     /// declaration before any other file is re-checked, so the class other

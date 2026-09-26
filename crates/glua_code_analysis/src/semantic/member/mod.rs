@@ -177,11 +177,8 @@ pub(crate) fn local_class_table_member_ids(
         let Some(decl_ids) = decls_by_file.get(&file_id) else {
             continue;
         };
-        let Some(decl_tree) = db.get_decl_index().get_decl_tree(&file_id) else {
-            continue;
-        };
         for decl_id in decl_ids {
-            let Some(decl) = decl_tree.get_decl(decl_id) else {
+            let Some(decl) = db.get_decl_index().get_decl(decl_id) else {
                 continue;
             };
             // `local_table_decl_member_owner` opens with these two conditions
