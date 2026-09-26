@@ -1212,6 +1212,9 @@ pub fn take_noted_reads() -> u64 {
 /// Records a read of the top-level statement `statement` of `file_id`. A
 /// derivation's own file is not a read, as for [`note_file_read`].
 pub fn note_syntax_read(file_id: FileId, statement: TextRange) {
+    if UNTRACKED.with(|depth| depth.get() > 0) {
+        return;
+    }
     CURRENT.with(|current| {
         if let Some(evaluation) = current.borrow_mut().as_mut()
             && evaluation.id.file_id != file_id
@@ -1227,6 +1230,9 @@ pub fn note_syntax_read(file_id: FileId, statement: TextRange) {
 /// Records a read of `file_id`'s text. A derivation's own file is not a
 /// read: its derivations are replaced whenever that text changes.
 pub fn note_file_read(file_id: FileId) {
+    if UNTRACKED.with(|depth| depth.get() > 0) {
+        return;
+    }
     CURRENT.with(|current| {
         if let Some(evaluation) = current.borrow_mut().as_mut()
             && evaluation.id.file_id != file_id

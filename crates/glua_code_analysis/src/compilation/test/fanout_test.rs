@@ -247,6 +247,41 @@ function WriteCityName(value) end
         );
     }
 
+    /// The class's file re-homed the other file's members, but where those
+    /// members sit in their file is that file's own business: editing it
+    /// leaves the class's file standing.
+    #[test]
+    fn editing_a_file_that_writes_a_class_bound_global_rebuilds_no_other_source() {
+        const LIGHTING: &str = "lua/glide/sh_lighting_api.lua";
+        const LIGHTING_TEXT: &str = "Glide.Lighting = Glide.Lighting or {}
+local adapters = Glide.Lighting
+";
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_files(vec![
+            (
+                "lua/autorun/sh_glide.lua",
+                "---@class Glide
+Glide = Glide or {}
+Glide.VEHICLE_TYPE = {}
+",
+            ),
+            (LIGHTING, LIGHTING_TEXT),
+        ]);
+
+        ws.def_file(
+            LIGHTING,
+            &format!(
+                "{LIGHTING_TEXT}local count = 1
+"
+            ),
+        );
+
+        assert_eq!(ws.analysis.compilation.last_stats().rebuilt_sources, 0);
+    }
+
     /// A class's declaration sits at a position in its file; a shift there
     /// moves it without changing the class, so its readers elsewhere stand.
     #[test]
