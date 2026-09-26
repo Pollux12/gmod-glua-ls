@@ -2160,9 +2160,11 @@ pub fn is_member_assignment_in_conditional_branch(db: &DbIndex, member_id: LuaMe
 
 pub(super) fn flush_pending_dynamic_key_collection_widenings(analyzer: &mut LuaAnalyzer) {
     let pending = std::mem::take(&mut analyzer.pending_dynamic_key_collection_widenings);
-    let mut pending_by_owner: FxHashMap<LuaMemberOwner, Vec<(LuaMemberKey, LuaType)>> =
-        FxHashMap::default();
-    for (cache_key, additional_base) in pending {
+    let mut pending_by_owner: FxHashMap<
+        LuaMemberOwner,
+        Vec<(LuaMemberKey, Vec<(Option<LuaMemberId>, LuaType)>)>,
+    > = FxHashMap::default();
+    for (cache_key, contributions) in pending {
         if !cache_key.key.is_expr() {
             continue;
         }
@@ -2170,7 +2172,7 @@ pub(super) fn flush_pending_dynamic_key_collection_widenings(analyzer: &mut LuaA
         pending_by_owner
             .entry(cache_key.owner)
             .or_default()
-            .push((cache_key.key, additional_base));
+            .push((cache_key.key, contributions));
     }
 
     for (owner, pending_items) in pending_by_owner {
@@ -3592,6 +3594,7 @@ mod tests {
                         analyzer,
                         owner.clone(),
                         LuaMemberKey::ExprType(LuaType::String),
+                        None,
                         additional_base,
                     );
                 }

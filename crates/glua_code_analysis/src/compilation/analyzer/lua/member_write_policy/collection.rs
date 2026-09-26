@@ -217,8 +217,11 @@ pub(in crate::compilation::analyzer::lua) fn widen_existing_member_collection_ty
         && try_defer_dynamic_key_collection_widening(analyzer, index_expr, value_type)
             .unwrap_or(false);
     if !deferred_collection_widening
-        && let Some(member_ids) = find_related_member_ids(analyzer, index_expr.clone())
+        && let Some(mut member_ids) = find_related_member_ids(analyzer, index_expr.clone())
     {
+        // The written member holds this value, not a collection it joins.
+        let written = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
+        member_ids.retain(|member_id| *member_id != written);
         widen_member_collections_with_collection_type(analyzer, &member_ids, value_type);
     }
 
@@ -246,7 +249,14 @@ pub(in crate::compilation::analyzer::lua) fn try_defer_dynamic_key_collection_wi
 ) -> Option<bool> {
     let incoming_array = normalize_infer_collection_type(analyzer.db, value_type)?;
     let (owner, key) = dynamic_key_owner_and_member_key(analyzer, index_expr)?;
-    record_pending_dynamic_key_collection_widening(analyzer, owner, key, incoming_array.get_base());
+    let written = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
+    record_pending_dynamic_key_collection_widening(
+        analyzer,
+        owner,
+        key,
+        Some(written),
+        incoming_array.get_base(),
+    );
     Some(true)
 }
 
@@ -256,7 +266,7 @@ pub(in crate::compilation::analyzer::lua) fn try_defer_dynamic_key_element_widen
     element_type: &LuaType,
 ) -> Option<bool> {
     let (owner, key) = dynamic_key_owner_and_member_key(analyzer, index_expr)?;
-    record_pending_dynamic_key_collection_widening(analyzer, owner, key, element_type);
+    record_pending_dynamic_key_collection_widening(analyzer, owner, key, None, element_type);
     Some(true)
 }
 
@@ -356,24 +366,28 @@ fn resolve_direct_local_table_prefix_member_owner(
     )))
 }
 
+/// Records that a write adds `additional_base` to the collections of the
+/// `owner`/`key` slot. `written` is the member the write stores its value in:
+/// that member holds the value itself, so the flush does not widen it with it.
 pub(in crate::compilation::analyzer::lua) fn record_pending_dynamic_key_collection_widening(
     analyzer: &mut LuaAnalyzer,
     owner: LuaMemberOwner,
     key: LuaMemberKey,
+    written: Option<LuaMemberId>,
     additional_base: &LuaType,
 ) {
-    let cache_key = DynamicKeyCollectionWideningKey { owner, key };
     let additional_base = crate::widen_literal_type_for_assignment(additional_base);
-    let widened_base = match analyzer
+    let contributions = analyzer
         .pending_dynamic_key_collection_widenings
-        .remove(&cache_key)
+        .entry(DynamicKeyCollectionWideningKey { owner, key })
+        .or_default();
+    match contributions
+        .iter_mut()
+        .find(|(writer, _)| *writer == written)
     {
-        Some(current) => TypeOps::Union.apply(analyzer.db, &current, &additional_base),
-        None => additional_base,
-    };
-    analyzer
-        .pending_dynamic_key_collection_widenings
-        .insert(cache_key, widened_base);
+        Some((_, base)) => *base = TypeOps::Union.apply(analyzer.db, base, &additional_base),
+        None => contributions.push((written, additional_base)),
+    }
 }
 
 pub(in crate::compilation::analyzer::lua) fn find_related_member_ids(
@@ -798,7 +812,7 @@ fn normalize_infer_collection_types<'a>(
 pub(in crate::compilation::analyzer::lua) fn flush_pending_dynamic_key_collection_widening_for_members(
     analyzer: &mut LuaAnalyzer,
     owner: LuaMemberOwner,
-    pending_items: Vec<(LuaMemberKey, LuaType)>,
+    pending_items: Vec<(LuaMemberKey, Vec<(Option<LuaMemberId>, LuaType)>)>,
 ) {
     let Some(members) = analyzer.db.get_member_index().get_members(&owner) else {
         return;
@@ -816,9 +830,18 @@ pub(in crate::compilation::analyzer::lua) fn flush_pending_dynamic_key_collectio
         }
     }
 
-    for ((_, additional_base), member_ids) in
-        pending_items.into_iter().zip(member_ids_by_pending_key)
+    for ((_, contributions), member_ids) in pending_items.into_iter().zip(member_ids_by_pending_key)
     {
-        widen_member_collections_with_element_type(analyzer, &member_ids, &additional_base);
+        for member_id in member_ids {
+            let Some(additional_base) = contributions
+                .iter()
+                .filter(|(written, _)| *written != Some(member_id))
+                .map(|(_, base)| base.clone())
+                .reduce(|left, right| TypeOps::Union.apply(analyzer.db, &left, &right))
+            else {
+                continue;
+            };
+            widen_member_collections_with_element_type(analyzer, &[member_id], &additional_base);
+        }
     }
 }

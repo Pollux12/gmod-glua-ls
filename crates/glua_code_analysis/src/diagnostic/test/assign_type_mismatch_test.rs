@@ -2103,6 +2103,27 @@ return t
     }
 
     #[test]
+    fn a_row_written_once_through_a_dynamic_key_keeps_its_positions() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                local quads = {}
+
+                local function add(i)
+                    quads[i] = { "a", 55 }
+                end
+
+                local function draw(i)
+                    local q = quads[i]
+                    ---@type string
+                    local tag = q[1]
+                end
+            "#
+        ));
+    }
+
+    #[test]
     fn test_annotated_tuple_member_collection_remains_strict() {
         let mut ws = VirtualWorkspace::new();
         assert!(!ws.check_code_for(
