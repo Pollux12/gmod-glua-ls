@@ -31,7 +31,7 @@ use crate::{
     },
     db_index::{
         LuaFunctionType, LuaMemberFeature, LuaMemberOwner, LuaOutParamRoot, LuaSignature,
-        LuaSignatureId, SpecialCallFact,
+        LuaSignatureId, SpecialCallFact, derivation::StageRule,
     },
     find_members_with_key, get_member_value_expr, humanize_type,
     semantic::{
@@ -2367,9 +2367,15 @@ fn materialize_str_tpl_class_from_call(
         str_tpl.get_suffix()
     );
     let class_decl_id = LuaTypeDeclId::global(&class_name);
+    // Whether a declaration owns the name is only final once every
+    // registration has run: deciding earlier would leave a placeholder behind
+    // for a class a later registration declares.
+    if !db.stage_rule_holds(StageRule::FloorUnsettled) {
+        return Ok(());
+    }
     // A real declaration already owns this name (a `---@class` the author
     // wrote, or a Register-synthesized one): the materialization must not add
-    // edges behind its back, or the result depends on which pass ran first.
+    // edges behind its back.
     let should_attach_super = !db.get_type_index().has_non_auto_declaration(&class_decl_id);
     // A re-settled call replays the same materialization: only a novel decl
     // or super edge may bump the special-call epoch. The facts carry their

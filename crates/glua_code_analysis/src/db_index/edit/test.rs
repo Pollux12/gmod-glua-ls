@@ -222,6 +222,76 @@ fn a_setmetatable_instance_keeps_inherited_members_after_edit_and_reopen() {
     assert!(inherited_member(&ws, consumer_id).is_err());
 }
 
+/// A panel one file creates by name and another registers is declared by
+/// what both files say, not by whether the registration had run when the
+/// creating file was last analysed.
+#[test]
+fn a_panel_another_file_registers_keeps_its_declaration_when_the_creating_file_is_reindexed() {
+    const MENU: &str = "cityrp = cityrp or {}
+cityrp.menu = cityrp.menu or {}
+function cityrp.menu.populateNoChar()
+    cityrp.menu.panel:AddSheet(\"Guides\", vgui.Create(\"cityrp_guides\"), \"icon\")
+end
+function cityrp.menu.populate()
+    cityrp.menu.panel:AddSheet(\"Guides\", vgui.Create(\"cityrp_guides\"), \"icon\")
+end
+";
+    let mut ws = VirtualWorkspace::new();
+    let mut emmyrc = Emmyrc::default();
+    emmyrc.gmod.enabled = true;
+    ws.update_emmyrc(emmyrc);
+    let menu_uri = ws
+        .virtual_url_generator
+        .new_uri("gamemodes/cityrp/gamemode/core/derma/cl_menu.lua");
+    ws.def_files(vec![
+        (
+            "lua/includes/builtins.lua",
+            crate::GMOD_CALL_ARG_BUILTINS_FIXTURE,
+        ),
+        (
+            "lua/includes/panels.lua",
+            "---@class Panel
+---@class DPanel: Panel
+",
+        ),
+        (
+            "gamemodes/cityrp/gamemode/core/derma/cl_guides.lua",
+            "local PANEL = {}
+vgui.Register(\"cityrp_guides\", PANEL, \"Panel\")
+",
+        ),
+        ("gamemodes/cityrp/gamemode/core/derma/cl_menu.lua", MENU),
+    ]);
+    let declaration = |ws: &VirtualWorkspace| {
+        let index = ws.analysis.compilation.get_db().get_type_index();
+        let id = crate::LuaTypeDeclId::global("cityrp_guides");
+        let mut locations = index
+            .get_type_decl(&id)
+            .map(|decl| {
+                decl.get_locations()
+                    .iter()
+                    .map(|location| format!("{location:?}"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        locations.sort();
+        let mut supers = index
+            .get_super_types(&id)
+            .unwrap_or_default()
+            .iter()
+            .map(|super_type| format!("{super_type:?}"))
+            .collect::<Vec<_>>();
+        supers.sort();
+        (locations, supers)
+    };
+    let cold = declaration(&ws);
+    let menu_id = ws.analysis.get_file_id(&menu_uri).expect("menu file");
+
+    edit_and_reevaluated(&mut ws, &menu_uri, menu_id, MENU);
+
+    assert_eq!(declaration(&ws), cold);
+}
+
 /// A shift-only edit through the production edit path (`update_file_text_only`
 /// + `reindex_files`) must report only the edited file: a diagnosed reader of
 /// its exports reads nothing that moved.
