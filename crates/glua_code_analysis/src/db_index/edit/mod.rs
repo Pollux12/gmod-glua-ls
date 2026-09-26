@@ -50,6 +50,9 @@ pub fn remap_into_file(db: &mut DbIndex, remap: &FileRemap) -> HashSet<FileId> {
         .get_call_site_param_index_mut()
         .remap_file_identities(remap);
     dirty.extend(pass);
+    dirty.extend(db.remap_net_helpers(remap));
+    let pass = db.get_gmod_network_index_mut().remap_file_positions(remap);
+    dirty.extend(pass);
 
     dirty.remove(&remap.file_id);
     dirty

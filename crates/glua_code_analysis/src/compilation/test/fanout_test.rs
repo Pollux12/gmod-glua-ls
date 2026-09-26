@@ -82,6 +82,19 @@ end
         }
     }
 
+    const SCORE: &str = "gamemodes/cityrp/gamemode/core/sh_score.lua";
+    /// A net helper whose payload write sits in a branch.
+    const SCORE_TEXT: &str = r#"function cityrp.SendScore(score)
+    net.Start("cityrp_score")
+    if score > 0 then
+        net.WriteUInt(score, 8)
+    end
+    net.SendToServer()
+end
+"#;
+    const SCORE_CALLER: &str = "gamemodes/cityrp/gamemode/core/cl_score.lua";
+    const SCORE_CALLER_TEXT: &str = "cityrp.SendScore(3)\n";
+
     const PER_FILE_GMOD_PASSES: [DerivationKind; 4] = [
         DerivationKind::GmodPre,
         DerivationKind::GmodLoadCallSites,
@@ -213,6 +226,75 @@ end
             edited.fingerprint(key.clone()),
             analysed_after.fingerprint(key)
         );
+    }
+
+    /// The payload a call composes from a helper in another file names the
+    /// helper's positions, which follow a shift there as a caller analysed
+    /// after the shift names them.
+    #[test]
+    fn a_shift_above_a_payload_helper_moves_the_ops_another_file_composed() {
+        let shifted = format!("\n{SCORE_TEXT}");
+        let mut edited = cityrp_workspace();
+        edited.ws.def_file(SCORE, SCORE_TEXT);
+        let caller = edited.ws.def_file(SCORE_CALLER, SCORE_CALLER_TEXT);
+        edited.ws.def_file(SCORE, &shifted);
+        let mut analysed_after = cityrp_workspace();
+        analysed_after.ws.def_file(SCORE, &shifted);
+        analysed_after.ws.def_file(SCORE_CALLER, SCORE_CALLER_TEXT);
+
+        let key = crate::db_index::derivation::FactKey::NetworkFile(caller);
+        assert_eq!(
+            edited.fingerprint(key.clone()),
+            analysed_after.fingerprint(key)
+        );
+    }
+
+    #[test]
+    fn a_shift_above_a_payload_helper_another_file_calls_re_runs_nothing_in_the_caller() {
+        let mut workspace = cityrp_workspace();
+        let score = workspace.ws.def_file(SCORE, SCORE_TEXT);
+        workspace.ws.def_file(SCORE_CALLER, SCORE_CALLER_TEXT);
+
+        workspace.ws.def_file(SCORE, &format!("\n{SCORE_TEXT}"));
+
+        assert_eq!(workspace.evaluated_files(), vec![score]);
+    }
+
+    /// The edit remap carries the call targets other files stored into the
+    /// shifted file, so their net helpers stand.
+    #[test]
+    fn a_shift_above_a_helper_another_file_calls_re_runs_nothing_in_the_caller() {
+        let mut workspace = cityrp_workspace();
+        workspace.ws.def_file(
+            "gamemodes/cityrp/gamemode/core/cl_config_menu.lua",
+            "cityrp.SendConfig(\"cityrp_config\")\n",
+        );
+
+        workspace
+            .ws
+            .def_file(CONFIGURATION, &format!("\n{CONFIGURATION_TEXT}"));
+
+        assert_eq!(workspace.evaluated_files(), vec![workspace.configuration]);
+    }
+
+    /// A second shift compares the caller's reads against the first shift's
+    /// result, not against the text before it.
+    #[test]
+    fn a_second_shift_above_a_helper_another_file_calls_re_runs_nothing_in_the_caller() {
+        let mut workspace = cityrp_workspace();
+        workspace.ws.def_file(
+            "gamemodes/cityrp/gamemode/core/cl_config_menu.lua",
+            "cityrp.SendConfig(\"cityrp_config\")\n",
+        );
+        workspace
+            .ws
+            .def_file(CONFIGURATION, &format!("\n{CONFIGURATION_TEXT}"));
+
+        workspace
+            .ws
+            .def_file(CONFIGURATION, &format!("\n\n{CONFIGURATION_TEXT}"));
+
+        assert_eq!(workspace.evaluated_files(), vec![workspace.configuration]);
     }
 
     /// Whether another file's write bootstraps a shared table is read off the
@@ -529,6 +611,31 @@ local first = controllers[1]
             ws.analysis.compilation.last_evaluated_files(),
             vec![lighting]
         );
+    }
+
+    /// A method's receiver is checked against the file that defines it, one
+    /// statement of it at a time: a shift there leaves the calling file
+    /// standing.
+    #[test]
+    fn a_shift_in_a_file_whose_method_other_files_call_re_runs_nothing_in_them() {
+        const SHARED: &str = "lua/entities/shift_car/shared.lua";
+        const SHARED_TEXT: &str =
+            "ENT.Type = \"anim\"\nfunction ENT:OnSimulatePhysics(phys, dt) end\n";
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_files(vec![
+            (SHARED, SHARED_TEXT),
+            (
+                "lua/entities/shift_car/init.lua",
+                "function ENT:PhysicsSimulate()\n    self:OnSimulatePhysics(1, 0.5)\nend\n",
+            ),
+        ]);
+
+        let shared = ws.def_file(SHARED, &format!("\n{SHARED_TEXT}"));
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![shared]);
     }
 
     /// Another file's field written onto a table literal is kept by the member

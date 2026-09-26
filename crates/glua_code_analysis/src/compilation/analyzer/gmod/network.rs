@@ -203,7 +203,7 @@ impl Hash for HelperSend {
 }
 
 /// What a function body contributes to net flows, without its callers.
-#[derive(Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 struct NetHelper {
     params: Vec<String>,
     /// Every call in the body, in document order.
@@ -245,9 +245,101 @@ impl Hash for FileNetHelpers {
     }
 }
 
+impl NetOpItem {
+    fn visit_target(&mut self, visit: &mut impl FnMut(&mut HelperId)) {
+        if let NetOpItem::Helper { target, .. } = self {
+            visit(target);
+        }
+    }
+}
+
+impl NetHelper {
+    /// Visits every helper the summary calls into.
+    fn visit_targets(&mut self, visit: &mut impl FnMut(&mut HelperId)) {
+        for call in &mut self.calls {
+            if let Some(target) = &mut call.target {
+                visit(target);
+            }
+            for item in call.receive_reads.items.iter_mut().flatten() {
+                item.visit_target(visit);
+            }
+        }
+        for item in &mut self.ops {
+            item.visit_target(visit);
+        }
+        for item in self
+            .sends
+            .iter_mut()
+            .flat_map(|send| send.stats.iter_mut().flatten())
+        {
+            item.visit_target(visit);
+        }
+    }
+}
+
 impl crate::db_index::derivation::DerivedFact for FileNetHelpers {
     fn fingerprint(&self) -> crate::db_index::derivation::Fingerprint {
         crate::db_index::derivation::fingerprint_of(self)
+    }
+
+    /// Every helper a summary calls into is some call's target.
+    fn named_files(&self, own: FileId) -> rustc_hash::FxHashSet<FileId> {
+        self.calls
+            .values()
+            .filter_map(|fact| fact.target.as_ref())
+            .map(|target| target.file_id)
+            .filter(|file_id| *file_id != own)
+            .collect()
+    }
+
+    fn remap(
+        &self,
+        remap: &crate::FileRemap,
+    ) -> crate::Remap<Arc<dyn crate::db_index::derivation::DerivedFact>> {
+        let mut moves = HashMap::default();
+        for target in self.calls.values().filter_map(|fact| fact.target.as_ref()) {
+            let block = LuaSyntaxId::new(
+                glua_parser::LuaKind::Syntax(glua_parser::LuaSyntaxKind::Block),
+                target.value,
+            );
+            match remap.syntax_id(target.file_id, block) {
+                crate::Remap::Moved(block) if block.get_range() != target.value => {
+                    moves.insert(
+                        target.clone(),
+                        InFiled::new(target.file_id, block.get_range()),
+                    );
+                }
+                crate::Remap::Lost => return crate::Remap::Lost,
+                crate::Remap::Moved(_) | crate::Remap::Unrelated => {}
+            }
+        }
+        if moves.is_empty() {
+            return crate::Remap::Unrelated;
+        }
+        let mut move_target = |target: &mut HelperId| {
+            if let Some(moved) = moves.get(target) {
+                *target = moved.clone();
+            }
+        };
+        let mut calls = self.calls.clone();
+        for target in calls.values_mut().filter_map(|fact| fact.target.as_mut()) {
+            move_target(target);
+        }
+        let helpers = self
+            .helpers
+            .iter()
+            .map(|(range, helper)| {
+                let mut moved = NetHelper::clone(helper);
+                moved.visit_targets(&mut move_target);
+                let helper = if moved == **helper {
+                    helper.clone()
+                } else {
+                    Arc::new(moved)
+                };
+                (*range, helper)
+            })
+            .collect();
+        crate::Remap::Moved(Arc::new(FileNetHelpers { calls, helpers }))
     }
 }
 
@@ -319,6 +411,7 @@ fn build_file_net_helpers(
         helpers: HashMap::default(),
     };
     let site = NetFileSite {
+        file_id,
         functions: &functions,
         calls: &file,
     };
@@ -338,6 +431,7 @@ fn build_file_net_helpers(
 
 /// A file's syntax together with its call facts.
 struct NetFileSite<'a> {
+    file_id: FileId,
     functions: &'a FileFunctionMap,
     calls: &'a FileNetHelpers,
 }
@@ -516,6 +610,7 @@ fn op_items(
         Some(NetCallRole::Payload(op)) => out.push(NetOpItem::Op(NetOpEntry {
             op: op.clone(),
             display_name: call_display_name(&call_expr),
+            file_id: site.file_id,
             range: call_expr.get_range(),
             dynamic: is_call_expr_in_dynamic_control_flow(block, &call_expr),
             bits: fact
@@ -523,7 +618,7 @@ fn op_items(
                 .and_then(|arg_idx| extract_bit_width_arg(&call_expr, arg_idx)),
             has_bits_param: fact.bits_param_idx.is_some(),
             value_text: extract_write_value_text(&call_expr, op),
-            flow_path: extract_flow_path(block, &call_expr),
+            flow_path: extract_flow_path(site.file_id, block, &call_expr),
         })),
         Some(_) => {}
         None => {
@@ -531,7 +626,7 @@ fn op_items(
                 out.push(NetOpItem::Helper {
                     target: target.clone(),
                     dynamic: is_call_expr_in_dynamic_control_flow(block, &call_expr),
-                    flow_path: extract_flow_path(block, &call_expr),
+                    flow_path: extract_flow_path(site.file_id, block, &call_expr),
                 });
             }
         }
@@ -866,6 +961,7 @@ fn collect_file_network_flows(
     let mut ctx = NetCollectCtx {
         db,
         site: NetFileSite {
+            file_id,
             functions: &functions,
             calls: &calls,
         },

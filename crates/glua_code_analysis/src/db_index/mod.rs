@@ -107,6 +107,8 @@ pub struct DbIndex {
     load_scan_files: derivation::SetFingerprint,
     /// Each file's net helper summaries with their fingerprint when stored.
     net_helpers: FxHashMap<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
+    /// Each file with the files whose net helpers name its positions.
+    net_helper_refs: FxHashMap<FileId, FxHashSet<FileId>>,
     /// Each file's function-body summaries with their fingerprint when stored.
     function_summaries:
         FxHashMap<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
@@ -193,6 +195,7 @@ impl DbIndex {
             load_scans: FxHashMap::default(),
             load_scan_files: derivation::SetFingerprint::default(),
             net_helpers: FxHashMap::default(),
+            net_helper_refs: FxHashMap::default(),
             function_summaries: FxHashMap::default(),
             analysis_stage: derivation::AnalysisStage::default(),
         }
@@ -505,15 +508,70 @@ impl DbIndex {
         file_id: FileId,
         helpers: Arc<T>,
     ) {
+        self.store_net_helpers(file_id, helpers);
+    }
+
+    fn store_net_helpers(&mut self, file_id: FileId, helpers: Arc<dyn derivation::DerivedFact>) {
         derivation::note_write(|| derivation::FactKey::NetHelpers(file_id));
+        self.forget_net_helper_refs(file_id);
+        for named in helpers.named_files(file_id) {
+            self.net_helper_refs
+                .entry(named)
+                .or_default()
+                .insert(file_id);
+        }
         let fingerprint = derivation::in_file(Some(file_id), || helpers.fingerprint()).max(1);
         self.net_helpers.insert(file_id, (helpers, fingerprint));
     }
 
     fn remove_net_helpers(&mut self, file_id: FileId) {
+        self.forget_net_helper_refs(file_id);
         if self.net_helpers.remove(&file_id).is_some() {
             derivation::note_write(|| derivation::FactKey::NetHelpers(file_id));
         }
+    }
+
+    fn forget_net_helper_refs(&mut self, file_id: FileId) {
+        let Some((helpers, _)) = self.net_helpers.get(&file_id) else {
+            return;
+        };
+        for named in helpers.named_files(file_id) {
+            if let Some(files) = self.net_helper_refs.get_mut(&named) {
+                files.remove(&file_id);
+                if files.is_empty() {
+                    self.net_helper_refs.remove(&named);
+                }
+            }
+        }
+    }
+
+    /// Carries the positions of `remap`'s file that other files' net helpers
+    /// name to their new place. Returns the files whose net helpers named one
+    /// the edit destroyed.
+    pub(crate) fn remap_net_helpers(
+        &mut self,
+        remap: &crate::FileRemap,
+    ) -> std::collections::HashSet<FileId> {
+        let mut files = self
+            .net_helper_refs
+            .get(&remap.file_id)
+            .map(|files| files.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        files.sort_unstable();
+        let mut lost = std::collections::HashSet::default();
+        for file_id in files {
+            let Some((helpers, _)) = self.net_helpers.get(&file_id) else {
+                continue;
+            };
+            match helpers.remap(remap) {
+                crate::Remap::Moved(helpers) => self.store_net_helpers(file_id, helpers),
+                crate::Remap::Lost => {
+                    lost.insert(file_id);
+                }
+                crate::Remap::Unrelated => {}
+            }
+        }
+        lost
     }
 
     pub(crate) fn get_function_summaries<T: derivation::DerivedFact>(
@@ -941,6 +999,7 @@ impl DbIndex {
             load_scans: self.load_scans.clone(),
             load_scan_files: self.load_scan_files,
             net_helpers: self.net_helpers.clone(),
+            net_helper_refs: self.net_helper_refs.clone(),
             function_summaries: self.function_summaries.clone(),
             analysis_stage: self.analysis_stage,
         }
@@ -1096,6 +1155,7 @@ impl LuaIndex for DbIndex {
         self.load_scans.clear();
         self.load_scan_files = derivation::SetFingerprint::default();
         self.net_helpers.clear();
+        self.net_helper_refs.clear();
         self.function_summaries.clear();
         self.derivations = Arc::default();
         self.gmod_call_roles = None;

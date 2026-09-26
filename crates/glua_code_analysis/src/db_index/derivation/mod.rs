@@ -28,6 +28,18 @@ pub use frames::{
 /// naming its type, fingerprinted on demand.
 pub trait DerivedFact: std::any::Any + Send + Sync {
     fn fingerprint(&self) -> Fingerprint;
+
+    /// The files other than `own` whose positions the value names.
+    fn named_files(&self, _own: FileId) -> FxHashSet<FileId> {
+        FxHashSet::default()
+    }
+
+    /// The value with the positions of `remap`'s file it names moved to their
+    /// new place: `Unrelated` when none of them moved, `Lost` when one did not
+    /// survive the edit.
+    fn remap(&self, _remap: &crate::FileRemap) -> crate::Remap<std::sync::Arc<dyn DerivedFact>> {
+        crate::Remap::Unrelated
+    }
 }
 
 impl std::fmt::Debug for dyn DerivedFact {
@@ -483,6 +495,9 @@ impl FactKey {
                 | K::MemberOwnerFields(_)
                 | K::Contrib(..)
                 | K::CallSiteFile(_)
+                | K::NetHelpers(_)
+                | K::NetworkFile(_)
+                | K::NetworkScan
         )
     }
 

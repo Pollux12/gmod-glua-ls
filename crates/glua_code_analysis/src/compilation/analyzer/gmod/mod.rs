@@ -1260,7 +1260,11 @@ fn is_call_expr_in_dynamic_control_flow(block: &LuaBlock, call_expr: &LuaCallExp
 /// The header text is a single-line trimmed summary of the statement opener
 /// (e.g. `if cond then`, `for i = 1, #items do`). Multi-line headers and
 /// excessively long ones are stored as `None` to keep hover popups compact.
-fn extract_flow_path(block: &LuaBlock, call_expr: &LuaCallExpr) -> Vec<NetFlowFrame> {
+fn extract_flow_path(
+    file_id: FileId,
+    block: &LuaBlock,
+    call_expr: &LuaCallExpr,
+) -> Vec<NetFlowFrame> {
     let mut frames: Vec<NetFlowFrame> = Vec::new();
     // When set, the next ancestor (which we know is the parent LuaIfStat of
     // an elseif/else clause we just captured) should be skipped so we don't
@@ -1284,6 +1288,7 @@ fn extract_flow_path(block: &LuaBlock, call_expr: &LuaCallExpr) -> Vec<NetFlowFr
                 kind: NetFlowKind::If,
                 header,
                 id: u32::from(node.text_range().start()),
+                file_id,
             });
             skip_parent_if = true;
             continue;
@@ -1293,6 +1298,7 @@ fn extract_flow_path(block: &LuaBlock, call_expr: &LuaCallExpr) -> Vec<NetFlowFr
                 kind: NetFlowKind::If,
                 header: Some("else".to_string()),
                 id: u32::from(node.text_range().start()),
+                file_id,
             });
             skip_parent_if = true;
             continue;
@@ -1317,6 +1323,7 @@ fn extract_flow_path(block: &LuaBlock, call_expr: &LuaCallExpr) -> Vec<NetFlowFr
             kind: flow_kind,
             header,
             id,
+            file_id,
         });
     }
     // ancestors() yields inner-to-outer; flip so outer is first.

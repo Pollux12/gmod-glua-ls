@@ -4,12 +4,12 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 
 use super::{LuaDeclId, LuaIndex};
 use crate::{
-    FileId, GmodRealm,
+    FileId, FileRemap, GmodRealm, Remap,
     db_index::derivation::{self, FactKey, Fingerprint},
 };
 
@@ -90,6 +90,9 @@ pub struct NetOpEntry {
     /// wrapper's own name. Captured at index time so diagnostics and hover show
     /// what the developer wrote rather than a canonical builtin name.
     pub display_name: SmolStr,
+    /// The file `range` is in: the flow's own, or that of the helper whose
+    /// payload walk the op was composed from.
+    pub file_id: FileId,
     pub range: TextRange,
     /// True if this op is contained inside a conditional/loop control-flow
     /// statement (if/elseif/else, while, repeat, for, generic-for) relative to
@@ -125,6 +128,7 @@ impl Hash for NetOpEntry {
         let Self {
             op,
             display_name,
+            file_id,
             range,
             dynamic,
             bits,
@@ -134,7 +138,8 @@ impl Hash for NetOpEntry {
         } = self;
         op.hash(state);
         display_name.hash(state);
-        hash_local(range, state);
+        file_id.hash(state);
+        range.hash_in_file(*file_id, state);
         dynamic.hash(state);
         bits.hash(state);
         has_bits_param.hash(state);
@@ -156,14 +161,23 @@ pub struct NetFlowFrame {
     /// Range start of the statement node — different statements have
     /// different ranges, so equal `id` means literally the same source frame.
     pub id: u32,
+    /// The file the statement is in: a composed walk prepends the caller's
+    /// frames to the helper's.
+    pub file_id: FileId,
 }
 
 impl Hash for NetFlowFrame {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let Self { kind, header, id } = self;
+        let Self {
+            kind,
+            header,
+            id,
+            file_id,
+        } = self;
         kind.hash(state);
         header.hash(state);
-        hash_local(&rowan::TextSize::from(*id), state);
+        file_id.hash(state);
+        TextSize::from(*id).hash_in_file(*file_id, state);
     }
 }
 
@@ -330,6 +344,8 @@ pub struct GmodNetworkIndex {
     send_flows_by_message: FxHashMap<String, Vec<(FileId, usize)>>,
     receive_flows_by_message: FxHashMap<String, Vec<(FileId, usize)>>,
     materialized_definition_counts: FxHashMap<(FileId, TextRange), usize>,
+    /// Each file with the other files whose flows name its positions.
+    referencing: FxHashMap<FileId, FxHashSet<FileId>>,
     /// Canonical function metadata per `(wire_format, direction)`, derived from
     /// annotated signatures during analysis. Features that must *emit* a net call
     /// — read completions, "expected `x`, got `y`" messages when one side has no
@@ -352,6 +368,101 @@ fn file_data_fingerprint(file_id: FileId, data: &FileNetworkData) -> Fingerprint
     })
 }
 
+/// The files other than `file_id` whose positions its flows name: the ops and
+/// frames composed from their helpers, and the definitions its calls
+/// materialize.
+fn named_files(file_id: FileId, data: &FileNetworkData) -> FxHashSet<FileId> {
+    let entries = data
+        .send_flows
+        .iter()
+        .flat_map(|flow| &flow.writes)
+        .chain(data.receive_flows.iter().flat_map(|flow| &flow.reads));
+    let mut files = entries
+        .flat_map(|entry| {
+            std::iter::once(entry.file_id).chain(entry.flow_path.iter().map(|frame| frame.file_id))
+        })
+        .chain(
+            data.send_flows
+                .iter()
+                .filter_map(|flow| flow.materialized_from)
+                .map(|origin| origin.file_id),
+        )
+        .collect::<FxHashSet<_>>();
+    files.remove(&file_id);
+    files
+}
+
+/// Whether a remap moved or lost anything it was asked about.
+#[derive(Default)]
+struct RemapOutcome {
+    moved: bool,
+    lost: bool,
+}
+
+impl RemapOutcome {
+    /// Moves the range of a call in `file_id`.
+    fn call_range(&mut self, remap: &FileRemap, file_id: FileId, range: &mut TextRange) {
+        let call = glua_parser::LuaSyntaxId::new(
+            glua_parser::LuaKind::Syntax(glua_parser::LuaSyntaxKind::CallExpr),
+            *range,
+        );
+        match remap.syntax_id(file_id, call) {
+            Remap::Moved(call) => {
+                self.moved |= call.get_range() != *range;
+                *range = call.get_range();
+            }
+            Remap::Lost => self.lost = true,
+            Remap::Unrelated => {}
+        }
+    }
+
+    fn entry(&mut self, remap: &FileRemap, entry: &mut NetOpEntry) {
+        self.call_range(remap, entry.file_id, &mut entry.range);
+        for frame in entry
+            .flow_path
+            .iter_mut()
+            .filter(|frame| frame.file_id == remap.file_id)
+        {
+            match remap.map.map(TextSize::from(frame.id)) {
+                Some(id) => {
+                    self.moved |= u32::from(id) != frame.id;
+                    frame.id = u32::from(id);
+                }
+                None => self.lost = true,
+            }
+        }
+    }
+}
+
+/// `data` with the positions of `remap`'s file it names moved to their new
+/// place.
+fn remap_file_data(data: &FileNetworkData, remap: &FileRemap) -> Remap<FileNetworkData> {
+    let mut data = data.clone();
+    let mut outcome = RemapOutcome::default();
+    for flow in &mut data.send_flows {
+        for entry in &mut flow.writes {
+            outcome.entry(remap, entry);
+        }
+        if let Some(origin) = &mut flow.materialized_from {
+            outcome.call_range(remap, origin.file_id, &mut origin.start_range);
+        }
+    }
+    for entry in data
+        .receive_flows
+        .iter_mut()
+        .flat_map(|flow| &mut flow.reads)
+    {
+        outcome.entry(remap, entry);
+    }
+    if outcome.lost {
+        Remap::Lost
+    } else if outcome.moved {
+        Remap::Moved(data)
+    } else {
+        Remap::Unrelated
+    }
+}
+
 impl GmodNetworkIndex {
     pub fn new() -> Self {
         Self {
@@ -359,6 +470,7 @@ impl GmodNetworkIndex {
             send_flows_by_message: FxHashMap::default(),
             receive_flows_by_message: FxHashMap::default(),
             materialized_definition_counts: FxHashMap::default(),
+            referencing: FxHashMap::default(),
             canonical_ops: FxHashMap::default(),
             helper_names: Arc::default(),
             helper_names_fingerprint: derivation::ABSENT,
@@ -569,6 +681,35 @@ impl GmodNetworkIndex {
         }
     }
 
+    /// Carries the positions of `remap`'s file that other files' flows name
+    /// to their new place. Returns the files whose flows named one the edit
+    /// destroyed.
+    pub(crate) fn remap_file_positions(
+        &mut self,
+        remap: &FileRemap,
+    ) -> std::collections::HashSet<FileId> {
+        let mut files = self
+            .referencing
+            .get(&remap.file_id)
+            .map(|files| files.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        files.sort_unstable();
+        let mut lost = std::collections::HashSet::default();
+        for file_id in files {
+            let Some(data) = self.file_data.get(&file_id) else {
+                continue;
+            };
+            match remap_file_data(data, remap) {
+                Remap::Moved(data) => self.add_file_data(file_id, data),
+                Remap::Lost => {
+                    lost.insert(file_id);
+                }
+                Remap::Unrelated => {}
+            }
+        }
+        lost
+    }
+
     pub fn clear(&mut self) {
         if derivation::recording() {
             for file_id in self.file_data.keys() {
@@ -582,6 +723,7 @@ impl GmodNetworkIndex {
         self.send_flows_by_message.clear();
         self.receive_flows_by_message.clear();
         self.materialized_definition_counts.clear();
+        self.referencing.clear();
         self.canonical_ops.clear();
         derivation::note_write(|| FactKey::NetHelperNames);
         self.helper_names = Arc::default();
@@ -593,6 +735,9 @@ impl GmodNetworkIndex {
         self.flows_fingerprint = self
             .flows_fingerprint
             .wrapping_add(file_data_fingerprint(file_id, data));
+        for named in named_files(file_id, data) {
+            self.referencing.entry(named).or_default().insert(file_id);
+        }
         for (flow_idx, send_flow) in data.send_flows.iter().enumerate() {
             self.send_flows_by_message
                 .entry(send_flow.message_name.clone())
@@ -619,6 +764,14 @@ impl GmodNetworkIndex {
         self.flows_fingerprint = self
             .flows_fingerprint
             .wrapping_sub(file_data_fingerprint(file_id, data));
+        for named in named_files(file_id, data) {
+            if let Some(files) = self.referencing.get_mut(&named) {
+                files.remove(&file_id);
+                if files.is_empty() {
+                    self.referencing.remove(&named);
+                }
+            }
+        }
         for send_flow in &data.send_flows {
             if let Some(origin) = send_flow.materialized_from {
                 let key = (origin.file_id, origin.start_range);
