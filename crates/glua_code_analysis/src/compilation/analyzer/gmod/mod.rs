@@ -385,11 +385,25 @@ pub(crate) struct HelperRegistry {
 impl HelperRegistry {
     /// A value fingerprint of the registry: its entries in a stable order.
     fn fingerprint(&self) -> crate::db_index::derivation::Fingerprint {
-        let mut globals = self.globals.iter().collect::<Vec<_>>();
+        let site =
+            |(file_id, syntax_id): &(FileId, LuaSyntaxId)| InFiled::new(*file_id, *syntax_id);
+        let mut globals = self
+            .globals
+            .iter()
+            .map(|(k, v)| (k, site(v)))
+            .collect::<Vec<_>>();
         globals.sort_by(|a, b| a.0.get_name().cmp(b.0.get_name()));
-        let mut methods = self.methods.iter().collect::<Vec<_>>();
+        let mut methods = self
+            .methods
+            .iter()
+            .map(|(k, v)| (k, site(v)))
+            .collect::<Vec<_>>();
         methods.sort_by(|a, b| a.0.cmp(b.0));
-        let mut signatures = self.signatures.iter().collect::<Vec<_>>();
+        let mut signatures = self
+            .signatures
+            .iter()
+            .map(|(k, v)| (k, site(v)))
+            .collect::<Vec<_>>();
         signatures.sort_by_key(|(id, _)| (id.get_file_id(), id.get_position()));
         crate::db_index::derivation::fingerprint_of(&(globals, methods, signatures))
     }
@@ -7541,14 +7555,14 @@ impl AnnotatedGmodGlobalCallRoleMap {
             .iter()
             .collect::<Vec<_>>();
         environment_files.sort();
+        // Readers see the selected op. Its rank only orders duplicates within
+        // one file, which an edit that shifts them cannot reorder.
         let mut net_ops = self
             .canonical_net_ops
             .iter()
-            .map(|((name, direction), (rank, op))| {
-                (name, format!("{direction:?}"), rank, format!("{op:?}"))
-            })
+            .map(|((name, direction), (_, op))| (name, format!("{direction:?}"), op))
             .collect::<Vec<_>>();
-        net_ops.sort();
+        net_ops.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
         crate::db_index::derivation::fingerprint_of(&(roles, environment_files, net_ops))
     }
 

@@ -97,7 +97,6 @@ end
     }
 
     #[test]
-    #[ignore = "the call-role registry fingerprints helper positions unmapped; plan task 2.1"]
     fn a_config_type_change_re_runs_only_its_readers() {
         let mut workspace = cityrp_workspace();
 
@@ -113,7 +112,6 @@ end
     }
 
     #[test]
-    #[ignore = "the call-role registry fingerprints helper positions unmapped; plan task 2.1"]
     fn adding_a_parameter_re_runs_no_gmod_pass_in_files_that_never_mention_the_function() {
         let mut workspace = cityrp_workspace();
 
@@ -128,7 +126,6 @@ end
     }
 
     #[test]
-    #[ignore = "the call-role registry fingerprints helper positions unmapped; plan task 2.1"]
     fn a_shift_in_a_file_that_defines_a_helper_re_runs_nothing_in_other_files() {
         let mut workspace = cityrp_workspace();
 
@@ -138,5 +135,25 @@ end
         );
 
         assert_eq!(workspace.evaluated_files(), vec![workspace.configuration]);
+    }
+
+    #[test]
+    fn a_shift_in_a_file_that_defines_a_net_payload_wrapper_re_runs_nothing_in_other_files() {
+        const WRAPPER: &str = "gamemodes/cityrp/gamemode/core/sh_netwrap.lua";
+        const WRAPPER_TEXT: &str = "---@[net_payload(\"write\", \"cityrp_name\")]
+function WriteCityName(value) end
+";
+        let mut workspace = cityrp_workspace();
+        let wrapper = workspace.ws.def_file(WRAPPER, WRAPPER_TEXT);
+
+        workspace.ws.def_file(
+            WRAPPER,
+            &format!(
+                "
+{WRAPPER_TEXT}"
+            ),
+        );
+
+        assert_eq!(workspace.evaluated_files(), vec![wrapper]);
     }
 }
