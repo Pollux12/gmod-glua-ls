@@ -90,22 +90,17 @@ impl LuaCompilation {
         }
         reads.apply_edits(&edits);
         let db = &self.db;
-        let edits = &edits;
-        reads.stale_files(reanalysis.touched.iter().map(|key| key.key()), |key| {
-            let current = db.fact_fingerprint(key);
-            let key = key.clone();
-            let before_edits = std::cell::OnceCell::new();
-            move |seen| {
-                seen == current
-                    || (!edits.is_empty()
-                        && seen
-                            == *before_edits.get_or_init(|| {
-                                crate::db_index::derivation::fingerprint_before_edits(edits, || {
-                                    db.fact_fingerprint(&key)
-                                })
-                            }))
-            }
-        })
+        reads.stale_files(
+            reanalysis.touched.iter().map(|key| key.key()),
+            |key| db.fact_fingerprint(key),
+            |key| {
+                (!edits.is_empty()).then(|| {
+                    crate::db_index::derivation::fingerprint_before_edits(&edits, || {
+                        db.fact_fingerprint(key)
+                    })
+                })
+            },
+        )
     }
 
     /// Sets the order re-analyses take files in; see [`Schedule`].

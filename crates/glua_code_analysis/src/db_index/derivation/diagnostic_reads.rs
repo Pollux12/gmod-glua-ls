@@ -145,16 +145,21 @@ impl DiagnosticReads {
         *self = renamed;
     }
 
-    /// The files whose recorded read of one of `touched` no longer holds
-    /// (`key_holds(key)(seen)`); every recorded file when the shared data's
-    /// reads moved.
-    pub fn stale_files<'a, F: Fn(Fingerprint) -> bool>(
-        &self,
+    /// The files whose recorded read of one of `touched` no longer holds: it
+    /// saw neither the key's `current` fingerprint nor, when edits moved the
+    /// key, its fingerprint `before_edits`. Every recorded file is stale when
+    /// the shared data's reads moved. A read that held only through the edits
+    /// is recorded again at the current fingerprint, so the next edit of the
+    /// same file compares against it.
+    pub fn stale_files<'a>(
+        &mut self,
         touched: impl IntoIterator<Item = &'a FactKey>,
-        key_holds: impl Fn(&FactKey) -> F,
+        current: impl Fn(&FactKey) -> Fingerprint,
+        before_edits: impl Fn(&FactKey) -> Option<Fingerprint>,
     ) -> Vec<FileId> {
         let mut stale = FxHashSet::default();
         let mut shared_stale = false;
+        let mut moved = Vec::new();
         for key in touched {
             let Some(&index) = self.keys.get(key) else {
                 continue;
@@ -164,14 +169,34 @@ impl DiagnosticReads {
             if shared.is_none() && readers.is_empty() {
                 continue;
             }
-            let holds = key_holds(key);
-            if shared.is_some_and(|seen| !holds(seen)) {
-                shared_stale = true;
+            let now = current(key);
+            let before = std::cell::OnceCell::new();
+            let held_moved =
+                |seen: Fingerprint| *before.get_or_init(|| before_edits(key)) == Some(seen);
+            match shared {
+                Some(seen) if seen != now && held_moved(seen) => moved.push((None, index, now)),
+                Some(seen) if seen != now => shared_stale = true,
+                _ => {}
             }
             for file_id in readers {
-                if seen_in(&self.files[file_id], index).is_none_or(|seen| !holds(seen)) {
-                    stale.insert(*file_id);
+                match seen_in(&self.files[file_id], index) {
+                    Some(seen) if seen == now => {}
+                    Some(seen) if held_moved(seen) => moved.push((Some(*file_id), index, now)),
+                    _ => {
+                        stale.insert(*file_id);
+                    }
                 }
+            }
+        }
+        for (file_id, index, now) in moved {
+            let reads = match file_id {
+                Some(file_id) => self.files.get_mut(&file_id),
+                None => Some(&mut self.shared),
+            };
+            if let Some(reads) = reads
+                && let Ok(at) = reads.binary_search_by_key(&index, |(read, _)| *read)
+            {
+                reads[at].1 = now;
             }
         }
         if shared_stale {
@@ -246,9 +271,25 @@ mod tests {
         )])
     }
 
+    /// Lengthens the edited file's first line again, moving the declaration
+    /// from 20 to 22.
+    fn lengthen_first_line_again() -> EditMaps {
+        EditMaps::new([(
+            edited(),
+            PositionMap::new(
+                "local x = 100
+local a = 1
+",
+                "local x = 10000
+local a = 1
+",
+            ),
+        )])
+    }
+
     fn stale_after_edit(reads: &mut DiagnosticReads, now: Fingerprint) -> Vec<FileId> {
         reads.apply_edits(&lengthen_first_line());
-        reads.stale_files([&decl_in_edited_file(20)], |_| move |seen| seen == now)
+        reads.stale_files([&decl_in_edited_file(20)], |_| now, |_| None)
     }
 
     #[test]
@@ -269,6 +310,21 @@ mod tests {
         reads.record(reader(), vec![(decl_in_edited_file(18), SEEN)]);
 
         assert_eq!(stale_after_edit(&mut reads, SEEN), Vec::<FileId>::new());
+    }
+
+    /// A read that held only because the edit moved its key reads the key as
+    /// it stands after that edit, so the next edit compares against that.
+    #[test]
+    fn a_read_the_edits_only_moved_stays_fresh_through_a_second_edit() {
+        let mut reads = DiagnosticReads::default();
+        reads.record(reader(), vec![(decl_in_edited_file(18), SEEN)]);
+        reads.apply_edits(&lengthen_first_line());
+        reads.stale_files([&decl_in_edited_file(20)], |_| SEEN + 1, |_| Some(SEEN));
+
+        reads.apply_edits(&lengthen_first_line_again());
+        let stale = reads.stale_files([&decl_in_edited_file(22)], |_| SEEN + 2, |_| Some(SEEN + 1));
+
+        assert_eq!(stale, Vec::<FileId>::new());
     }
 
     #[test]
