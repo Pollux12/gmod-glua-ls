@@ -4123,8 +4123,14 @@ fn synthesize_scripted_ent_registration(
     db.get_type_index_mut()
         .register_table_class(table_range.clone(), class_type.clone());
 
-    let base =
-        resolve_registered_scripted_ent_base(table_expr.clone(), metadata, register_position);
+    let entity_type = registered_table_string_field(db, &source_owner, "Type", register_position);
+    let base = resolve_registered_scripted_ent_base(
+        db,
+        &source_owner,
+        metadata,
+        register_position,
+        entity_type.as_ref(),
+    );
     if let Some((base_name, source_range)) = base {
         let super_type = LuaType::Ref(LuaTypeDeclId::global(&base_name));
         if super_type != class_type {
@@ -4144,7 +4150,7 @@ fn synthesize_scripted_ent_registration(
     // injection). Without this, `self:StartActivity()` on a `base_nextbot`
     // entity produces false-positive `undefined-field` diagnostics because
     // the synthesized `base_nextbot` class doesn't inherit from `NextBot`.
-    if let Some((type_name, source_range)) = resolve_registered_scripted_ent_type(&table_expr)
+    if let Some((type_name, source_range)) = entity_type
         && let Some(super_name) = super_type_for_entity_type(&type_name)
     {
         let super_type = LuaType::Ref(LuaTypeDeclId::global(&super_name));
@@ -4168,16 +4174,17 @@ fn synthesize_scripted_ent_registration(
     );
 }
 
+/// The base `scripted_ents.Register` gives the table: its `Base`, the last
+/// `DEFINE_BASECLASS` before the call, or the base its `Type` names.
 fn resolve_registered_scripted_ent_base(
-    table_expr: LuaTableExpr,
+    db: &DbIndex,
+    table_owner: &LuaMemberOwner,
     metadata: &GmodScriptedClassFileMetadata,
     register_position: TextSize,
+    entity_type: Option<&(String, TextRange)>,
 ) -> Option<(String, TextRange)> {
-    if let Some(field) = find_table_field_by_name(&table_expr, "Base")
-        && let Some(value_expr) = field.get_value_expr()
-        && let Some(base_name) = extract_scoped_base_name(&value_expr)
-    {
-        return Some((base_name, field.get_range()));
+    if let Some(base) = registered_table_string_field(db, table_owner, "Base", register_position) {
+        return Some(base);
     }
 
     metadata
@@ -4193,14 +4200,43 @@ fn resolve_registered_scripted_ent_base(
                 _ => None,
             },
         )
+        .or_else(|| {
+            let (type_name, source_range) = entity_type?;
+            default_base_for_entity_type(type_name).map(|base| (base.to_string(), *source_range))
+        })
 }
 
-/// Reads the `Type` field from a scripted-entity table literal (e.g.
-/// `ENT.Type = "nextbot"`).
-fn resolve_registered_scripted_ent_type(table_expr: &LuaTableExpr) -> Option<(String, TextRange)> {
-    let field = find_table_field_by_name(table_expr, "Type")?;
-    let value_expr = field.get_value_expr()?;
-    extract_scoped_base_name(&value_expr).map(|name| (name, field.get_range()))
+/// The name a registered table holds under `field` when
+/// `scripted_ents.Register` reads it: the last write before the call, a
+/// constructor field or an assignment.
+fn registered_table_string_field(
+    db: &DbIndex,
+    table_owner: &LuaMemberOwner,
+    field: &str,
+    register_position: TextSize,
+) -> Option<(String, TextRange)> {
+    let member_id = db
+        .get_member_index()
+        .get_members(table_owner)?
+        .iter()
+        .filter(|member| member.get_key().get_name() == Some(field))
+        .map(|member| member.get_id())
+        .filter(|member_id| member_id.get_position() < register_position)
+        .max_by_key(|member_id| member_id.get_position())?;
+    let value_expr = crate::get_member_value_expr(db, member_id)?;
+    extract_scoped_base_name(&value_expr).map(|name| (name, member_id.get_syntax_id().get_range()))
+}
+
+/// The base `scripted_ents.Register` falls back to for a table without
+/// `Base`, by its `Type`.
+fn default_base_for_entity_type(type_name: &str) -> Option<&'static str> {
+    match type_name {
+        "anim" => Some("base_anim"),
+        "point" => Some("base_point"),
+        "brush" => Some("base_brush"),
+        "filter" => Some("base_filter"),
+        _ => None,
+    }
 }
 
 /// Maps `ENT.Type` values to the annotation class that provides the

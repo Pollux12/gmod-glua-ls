@@ -2135,6 +2135,40 @@ end
         );
     }
 
+    /// `scripted_ents.Register` gives a table that sets no `Base` the base its
+    /// `Type` names, reading the table as it stands at the call.
+    #[gtest]
+    fn test_register_without_base_inherits_the_base_its_type_assignment_names() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/weapons/gmod_tool/stools/resizer.lua",
+            r#"
+            local ENT = {}
+            ENT.Type = "anim"
+
+            scripted_ents.Register(ENT, "size_handler")
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let super_types: Vec<_> = db
+            .get_type_index()
+            .get_super_types_iter(&LuaTypeDeclId::global("size_handler"))
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("base_anim"))),
+            "expected base_anim super type for size_handler, got {super_types:?}"
+        );
+    }
+
     /// Verifies that `SWEP.Type = "nextbot"` does NOT inject `NextBot` as a
     /// super-type. The `Type` field on non-entity scripted classes has
     /// different semantics and should not trigger entity framework injection.
