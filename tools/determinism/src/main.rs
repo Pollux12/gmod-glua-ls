@@ -383,6 +383,9 @@ struct IndexSnapshot {
     metatable_factory_bindings: HashDumpResult,
     /// Observed call-site param evidence contributed by calls in each file.
     call_site_contributions: HashDumpResult,
+    /// Each file's stored helper scan, load scan, net helpers and function
+    /// summaries, by the fingerprint they were stored with.
+    stored_facts: HashDumpResult,
     /// Schema URL → resolution state.
     schema_files: HashDumpResult,
 }
@@ -1159,6 +1162,14 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
             .insert(file_label(analysis, *file_id), format!("{contributions:?}"));
     }
 
+    let mut stored_facts = HashDump::new("stored_facts");
+    for (kind, file_id, fingerprint) in db.stored_fact_fingerprints() {
+        stored_facts.insert(
+            format!("{kind} {}", file_label(analysis, file_id)),
+            fingerprint.to_string(),
+        );
+    }
+
     let mut schema_files = HashDump::new("schema_files");
     for (url, schema_file) in db.get_json_schema_index().iter_schema_files() {
         schema_files.insert(url.as_str().to_string(), format!("{schema_file:?}"));
@@ -1234,6 +1245,7 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         metatables: metatables.finish(),
         metatable_factory_bindings: metatable_factory_bindings.finish(),
         call_site_contributions: call_site_contributions.finish(),
+        stored_facts: stored_facts.finish(),
         schema_files: schema_files.finish(),
     };
 
@@ -1306,6 +1318,7 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
             ("METATBL", &snapshot.metatables),
             ("METAFACT", &snapshot.metatable_factory_bindings),
             ("CSCONTRIB", &snapshot.call_site_contributions),
+            ("STORED", &snapshot.stored_facts),
             ("SCHEMA", &snapshot.schema_files),
         ] {
             if let Some(detail) = &dump.detail {
@@ -1694,6 +1707,12 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
             "CSCONTRIB",
             &base.call_site_contributions,
             &other.call_site_contributions,
+        ),
+        (
+            "stored_facts",
+            "STORED",
+            &base.stored_facts,
+            &other.stored_facts,
         ),
         (
             "schema_files",

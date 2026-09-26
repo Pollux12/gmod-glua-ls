@@ -278,6 +278,27 @@ impl DbIndex {
         }
     }
 
+    /// Every stored per-file fact by kind, with the fingerprint it was stored
+    /// with, sorted: for comparing two analyses of the same workspace.
+    pub fn stored_fact_fingerprints(&self) -> Vec<(&'static str, FileId, u64)> {
+        let tables = [
+            ("helper_scan", &self.helper_scans),
+            ("load_scan", &self.load_scans),
+            ("net_helpers", &self.net_helpers),
+            ("function_summaries", &self.function_summaries),
+        ];
+        let mut facts = tables
+            .into_iter()
+            .flat_map(|(kind, table)| {
+                table
+                    .iter()
+                    .map(move |(file_id, (_, fingerprint))| (kind, *file_id, *fingerprint))
+            })
+            .collect::<Vec<_>>();
+        facts.sort_unstable();
+        facts
+    }
+
     pub(crate) fn get_gmod_call_roles<T: derivation::DerivedFact>(&self) -> Option<Arc<T>> {
         derivation::note_read(|| derivation::FactKey::HelperRegistry);
         self.gmod_call_roles
