@@ -3032,11 +3032,22 @@ fn merge_guarded_table_assignment_type(
     if should_prefer_guarded_dynamic_index_rhs(analyzer, left, &left_type) {
         return Ok(right_type);
     }
-    if !(left_type.is_any() || left_type.is_table()) {
+    if !is_any_or_table(&left_type) {
         return analyzer.infer_expr(binary_expr);
     }
 
     Ok(TypeOps::Union.apply(analyzer.db, &left_type, &right_type))
+}
+
+/// Whether every value `typ` may hold is a table (or `any`). A guarded
+/// bootstrap's literal then joins what it reads, whether that is one table or
+/// several: dropping it for a union would depend on whether the literal's own
+/// earlier contribution was already part of what it reads.
+fn is_any_or_table(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Union(union) => union.into_vec().iter().all(is_any_or_table),
+        typ => typ.is_any() || typ.is_table(),
+    }
 }
 
 fn guarded_table_assignment_info(
