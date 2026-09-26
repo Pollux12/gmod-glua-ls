@@ -588,6 +588,38 @@ function Carry(bag) local weight = bag.weight end
         assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![bag]);
     }
 
+    /// Each file declares the class it names by string through its own
+    /// contribution, so a shift in one leaves the other's declaration
+    /// standing.
+    #[test]
+    fn a_shift_in_one_of_two_files_that_name_a_class_by_string_re_runs_only_that_file() {
+        const LIGHTING: &str = "lua/glide/sh_lighting_api.lua";
+        const LIGHTING_TEXT: &str =
+            "for _, controller in ipairs(ents.FindByClass(\"photon_controller\")) do end\n";
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_files(vec![
+            (
+                "lua/includes/ents.lua",
+                "---@class Entity\nents = {}\n---@generic T: Entity\n---@param class `T`\n---@return T[]\nfunction ents.FindByClass(class) end\n",
+            ),
+            (LIGHTING, LIGHTING_TEXT),
+            (
+                "lua/glide/client/lighting_photon.lua",
+                "local controllers = ents.FindByClass(\"photon_controller\")\nlocal first = controllers[1]\n",
+            ),
+        ]);
+
+        let lighting = ws.def_file(LIGHTING, &format!("\n{LIGHTING_TEXT}"));
+
+        assert_eq!(
+            ws.analysis.compilation.last_evaluated_files(),
+            vec![lighting]
+        );
+    }
+
     /// A class named by string is declared by the calls that name it, once
     /// every registration has run. Re-indexing one such file rebuilds its
     /// declaration before any other file is re-checked, so the class other

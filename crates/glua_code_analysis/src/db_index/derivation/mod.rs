@@ -498,6 +498,19 @@ impl FactKey {
         )
     }
 
+    /// For a key that folds every writer's share, the key holding `writer`'s
+    /// own share, which it writes alongside: the locations and super edges a
+    /// derivation added to a type declaration (it only ever declares classes,
+    /// so they are all it adds), and a file's entries in the gmod scan.
+    pub fn writer_share(&self, writer: DerivationId) -> Option<FactKey> {
+        use FactKey as K;
+        match self {
+            K::TypeDecl(_) | K::TypeSupers(_) => Some(K::TypeContrib(writer)),
+            K::GmodInferScan => Some(K::GmodInferFile(writer.file_id)),
+            _ => None,
+        }
+    }
+
     /// Whether removing the owning file keeps what other files' derivations
     /// stored under the key: the member, dynamic-field and call-site indexes
     /// file each contribution under its contributing file, and the edit remap

@@ -571,13 +571,21 @@ impl Engine {
         // A read that held only with the edit mapped back saw positions the
         // edit moved. An output made from them is still right if the edit's
         // remap rewrote it, or if it names none of the positions the edit
-        // moved: with the edit mapped back it fingerprints as it does now.
+        // moved: with the edit mapped back it fingerprints as it does now. A
+        // fold of every writer's share is judged by this writer's share, which
+        // it also wrote: the fold holds the edited files' shares too.
         let moved = db.reader_graph_mut().set_fingerprints(id, fingerprints);
-        moved
-            && !db.reader_graph().outputs_of(id).all(|key| {
-                key.follows_edits()
-                    || self.fingerprint(db, key) == self.fingerprint_before_edits(db, key)
-            })
+        if !moved {
+            return false;
+        }
+        let outputs = db.reader_graph().outputs_of(id).collect::<Vec<_>>();
+        !outputs.iter().all(|key| {
+            key.follows_edits()
+                || key
+                    .writer_share(id)
+                    .is_some_and(|share| outputs.iter().any(|output| *output.key() == share))
+                || self.fingerprint(db, key) == self.fingerprint_before_edits(db, key)
+        })
     }
 
     /// Evaluates `first` with every derivation of its kind queued right after
