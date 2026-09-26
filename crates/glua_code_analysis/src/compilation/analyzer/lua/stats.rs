@@ -2211,7 +2211,7 @@ pub(crate) fn is_guarded_table_definition_site(
     db: &DbIndex,
     site: &InFiled<rowan::TextRange>,
 ) -> bool {
-    let Some(tree) = db.get_vfs().get_syntax_tree(&site.file_id) else {
+    let Some(tree) = db.get_vfs().syntax_tree_around(&site.file_id, site.value) else {
         return false;
     };
     let root = tree.get_red_root();

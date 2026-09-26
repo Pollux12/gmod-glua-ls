@@ -156,4 +156,23 @@ function WriteCityName(value) end
 
         assert_eq!(workspace.evaluated_files(), vec![wrapper]);
     }
+
+    #[test]
+    fn a_shift_in_a_file_that_bootstraps_a_shared_global_re_runs_nothing_in_other_files() {
+        const PLUGIN: &str = "gamemodes/cityrp/gamemode/core/sh_plugin.lua";
+        const PLUGIN_TEXT: &str = "cityrp = cityrp or {}
+";
+        let mut workspace = cityrp_workspace();
+        let plugin = workspace.ws.def_file(PLUGIN, PLUGIN_TEXT);
+
+        workspace.ws.def_file(
+            PLUGIN,
+            &format!(
+                "
+{PLUGIN_TEXT}"
+            ),
+        );
+
+        assert_eq!(workspace.evaluated_files(), vec![plugin]);
+    }
 }

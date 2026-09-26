@@ -444,15 +444,17 @@ impl FactKey {
     /// Removing that file's facts removes whatever any derivation stored under
     /// the key.
     /// Whether the edit remap (`remap_into_file`) rewrites the positions of an
-    /// edited file that this key's value names. A decl claim, module metadata
-    /// and module names name no position outside the writer's own file, so
-    /// they never name an edited file's position for a writer that did not
-    /// run.
+    /// edited file that this key's value names. A decl claim, module metadata,
+    /// module names, an owner's presence and a member-key entry name no
+    /// position outside the writer's own file, so they never name an edited
+    /// file's position for a writer that did not run.
     pub fn follows_edits(&self) -> bool {
         use FactKey as K;
         matches!(
             self,
             K::DeclClaim(_)
+                | K::MemberOwnerPresence(_)
+                | K::MemberKey(_)
                 | K::Module(_)
                 | K::ModuleMeta(_)
                 | K::ModuleName(_)
