@@ -326,4 +326,36 @@ function Drive(car) local speed = car.speed end
 
         assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![car]);
     }
+
+    /// A field a class does not declare is looked up on the local tables bound
+    /// to it; an edit elsewhere in their file leaves that lookup standing.
+    #[test]
+    fn a_comment_appended_to_a_file_with_a_local_class_table_re_runs_nothing_in_other_files() {
+        const BAG: &str = "gamemodes/cityrp/gamemode/core/sh_bag.lua";
+        const BAG_TEXT: &str = "---@class Bag
+local Bag = {}
+Bag.size = 1
+";
+        let mut ws = VirtualWorkspace::new();
+        let files = ws.def_files(vec![
+            (BAG, BAG_TEXT),
+            (
+                "gamemodes/cityrp/gamemode/core/sv_carry.lua",
+                "---@param bag Bag
+function Carry(bag) local weight = bag.weight end
+",
+            ),
+        ]);
+        let bag = files[0];
+
+        ws.def_file(
+            BAG,
+            &format!(
+                "{BAG_TEXT}-- appended
+"
+            ),
+        );
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![bag]);
+    }
 }

@@ -27,7 +27,7 @@ pub use get_member_map::{
     get_member_map_in_workspace_for_file_at_offset,
 };
 use glua_parser::{
-    LuaAssignStat, LuaExpr, LuaFuncStat, LuaSyntaxKind, LuaSyntaxNode, LuaTableExpr, LuaTableField,
+    LuaAssignStat, LuaExpr, LuaFuncStat, LuaSyntaxKind, LuaTableExpr, LuaTableField,
 };
 use glua_parser::{LuaAstNode, LuaIndexExpr};
 pub(crate) use infer_raw_member::{
@@ -180,13 +180,6 @@ pub(crate) fn local_class_table_member_ids(
         let Some(decl_tree) = db.get_decl_index().get_decl_tree(&file_id) else {
             continue;
         };
-        let Some(root) = db
-            .get_vfs()
-            .get_syntax_tree(&file_id)
-            .map(|tree| tree.get_red_root())
-        else {
-            continue;
-        };
         for decl_id in decl_ids {
             let Some(decl) = decl_tree.get_decl(decl_id) else {
                 continue;
@@ -200,7 +193,7 @@ pub(crate) fn local_class_table_member_ids(
             {
                 continue;
             }
-            let Some(owner) = local_table_decl_member_owner(decl, &root) else {
+            let Some(owner) = local_table_decl_member_owner(decl) else {
                 continue;
             };
             let Some(member_item) = member_index.get_member_item(&owner, member_key) else {
@@ -268,7 +261,7 @@ pub(crate) fn cached_local_class_table_member_ids(
     member_ids
 }
 
-fn local_table_decl_member_owner(decl: &LuaDecl, root: &LuaSyntaxNode) -> Option<LuaMemberOwner> {
+fn local_table_decl_member_owner(decl: &LuaDecl) -> Option<LuaMemberOwner> {
     let initializer = decl.get_initializer()?;
     if initializer.get_ret_idx() != 0 {
         return None;
@@ -278,10 +271,9 @@ fn local_table_decl_member_owner(decl: &LuaDecl, root: &LuaSyntaxNode) -> Option
     if !LuaTableExpr::can_cast(expr_id.get_kind()) {
         return None;
     }
-    let table_expr = LuaTableExpr::cast(expr_id.to_node_from_root(root)?)?;
     Some(LuaMemberOwner::Element(InFiled::new(
         decl.get_id().file_id,
-        table_expr.get_range(),
+        expr_id.get_range(),
     )))
 }
 
