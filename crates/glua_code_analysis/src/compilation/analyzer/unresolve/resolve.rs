@@ -2377,7 +2377,9 @@ fn materialize_str_tpl_class_from_call(
     // in any order hits the same dedup keys.
     let call_position = call_expr.get_position();
     let mut novel_facts = Vec::new();
-    if db.get_type_index().get_type_decl(&class_decl_id).is_none() {
+    // Every site materializing the class declares it: which one ran first
+    // must not decide where the class is declared.
+    if should_attach_super {
         db.get_type_index_mut().add_type_decl(
             file_id,
             LuaTypeDecl::new(
@@ -3195,6 +3197,36 @@ mod tests {
             !resettle_special_calls(db, &sites, &[3, 2, 1, 0]),
             "replaying after a novel install changes nothing"
         );
+    }
+
+    /// Which caller runs first does not decide where a class both call sites
+    /// materialize is declared, nor which facts settle.
+    #[test]
+    fn a_str_tpl_class_two_sites_materialize_settles_the_same_in_either_order() {
+        let settle = |schedule| {
+            let mut ws = crate::VirtualWorkspace::new();
+            ws.analysis.compilation.set_schedule(schedule);
+            ws.def_files(vec![
+                ("defs.lua", SPECIAL_DEFS),
+                ("caller_a.lua", SPECIAL_CALLER_A),
+                ("caller_b.lua", SPECIAL_CALLER_B),
+            ]);
+            let db = ws.get_db_mut();
+            let locations = db
+                .get_type_index()
+                .get_type_decl(&LuaTypeDeclId::global("prop_vehicle_jeep"))
+                .expect("the str-tpl class is materialized")
+                .get_locations()
+                .iter()
+                .map(|location| (location.file_id, location.range))
+                .collect::<Vec<_>>();
+            (locations, special_call_snapshot(db))
+        };
+
+        let canonical = settle(crate::Schedule::Canonical);
+
+        assert_eq!(settle(crate::Schedule::Reversed), canonical);
+        assert_eq!(canonical.0.len(), 2);
     }
 
     /// Defining the same callers in the opposite order settles as many facts:
