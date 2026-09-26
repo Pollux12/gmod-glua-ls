@@ -3,14 +3,22 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::{EditMaps, FactKey, Fingerprint};
 use crate::FileId;
 
+/// An interned read key: its index into [`DiagnosticReads::readers`].
+type ReadKey = u32;
+
 /// What each file's last diagnostics read, so an analysis run knows which
 /// files to diagnose again: those whose recorded reads moved.
+///
+/// Each distinct key is stored once; a file's reads are its keys' indices
+/// with the fingerprints seen, sorted by index.
 #[derive(Debug, Clone, Default)]
 pub struct DiagnosticReads {
-    files: FxHashMap<FileId, FxHashMap<FactKey, Fingerprint>>,
-    readers: FxHashMap<FactKey, FxHashSet<FileId>>,
+    keys: FxHashMap<FactKey, ReadKey>,
+    /// The files that read each key, sorted.
+    readers: Vec<Vec<FileId>>,
+    files: FxHashMap<FileId, Box<[(ReadKey, Fingerprint)]>>,
     /// The reads of the workspace-wide data every file's diagnostics share.
-    shared: FxHashMap<FactKey, Fingerprint>,
+    shared: Box<[(ReadKey, Fingerprint)]>,
 }
 
 impl DiagnosticReads {
@@ -19,28 +27,30 @@ impl DiagnosticReads {
     pub fn census(&self) -> String {
         use crate::profile::{hash_table_bytes, megabytes};
         use std::mem::size_of;
-        let read_entry = size_of::<FactKey>() + size_of::<Fingerprint>();
+        let read_entry = size_of::<(ReadKey, Fingerprint)>();
         let reads: usize = self.files.values().map(|reads| reads.len()).sum();
-        let file_bytes: usize = self
-            .files
-            .values()
-            .map(|reads| hash_table_bytes(reads.capacity(), read_entry))
-            .sum();
-        let reader_edges: usize = self.readers.values().map(|files| files.len()).sum();
-        let reader_bytes = hash_table_bytes(
-            self.readers.capacity(),
-            size_of::<FactKey>() + size_of::<FxHashSet<FileId>>(),
-        ) + self
-            .readers
-            .values()
-            .map(|files| hash_table_bytes(files.capacity(), size_of::<FileId>()))
-            .sum::<usize>();
+        let file_bytes = hash_table_bytes(
+            self.files.capacity(),
+            size_of::<FileId>() + size_of::<Box<[(ReadKey, Fingerprint)]>>(),
+        ) + reads * read_entry;
+        let key_bytes = hash_table_bytes(
+            self.keys.capacity(),
+            size_of::<FactKey>() + size_of::<ReadKey>(),
+        );
+        let reader_edges: usize = self.readers.iter().map(Vec::len).sum();
+        let reader_bytes = self.readers.capacity() * size_of::<Vec<FileId>>()
+            + self
+                .readers
+                .iter()
+                .map(|files| files.capacity() * size_of::<FileId>())
+                .sum::<usize>();
         format!(
-            "files {}, reads {reads}, distinct keys {}, reader edges {reader_edges}, shared {}; MB: per-file reads {}, readers {}",
+            "files {}, reads {reads}, distinct keys {}, reader edges {reader_edges}, shared {}; MB: per-file reads {}, keys {}, readers {}",
             self.files.len(),
-            self.readers.len(),
+            self.keys.len(),
             self.shared.len(),
             megabytes(file_bytes),
+            megabytes(key_bytes),
             megabytes(reader_bytes)
         )
     }
@@ -48,33 +58,38 @@ impl DiagnosticReads {
     /// Replaces `file_id`'s reads with those of its latest diagnostics.
     pub fn record(&mut self, file_id: FileId, reads: Vec<(FactKey, Fingerprint)>) {
         self.forget(file_id);
-        for (key, _) in &reads {
-            self.readers.entry(key.clone()).or_default().insert(file_id);
+        let reads = self.intern_all(reads);
+        for (key, _) in reads.iter() {
+            let readers = &mut self.readers[*key as usize];
+            if let Err(at) = readers.binary_search(&file_id) {
+                readers.insert(at, file_id);
+            }
         }
-        self.files.insert(file_id, reads.into_iter().collect());
+        self.files.insert(file_id, reads);
     }
 
     /// Every key some file's diagnostics or the shared data read.
     #[cfg(test)]
     pub fn read_keys(&self) -> impl Iterator<Item = &FactKey> {
-        self.readers.keys().chain(self.shared.keys())
+        self.keys.iter().filter_map(|(key, index)| {
+            (!self.readers[*index as usize].is_empty() || seen_in(&self.shared, *index).is_some())
+                .then_some(key)
+        })
     }
 
     /// Replaces the shared data's reads.
     pub fn record_shared(&mut self, reads: Vec<(FactKey, Fingerprint)>) {
-        self.shared = reads.into_iter().collect();
+        self.shared = self.intern_all(reads);
     }
 
     pub fn forget(&mut self, file_id: FileId) {
         let Some(reads) = self.files.remove(&file_id) else {
             return;
         };
-        for key in reads.keys() {
-            if let Some(readers) = self.readers.get_mut(key) {
-                readers.remove(&file_id);
-                if readers.is_empty() {
-                    self.readers.remove(key);
-                }
+        for (key, _) in reads.iter() {
+            let readers = &mut self.readers[*key as usize];
+            if let Ok(at) = readers.binary_search(&file_id) {
+                readers.remove(at);
             }
         }
     }
@@ -82,51 +97,52 @@ impl DiagnosticReads {
     /// Renames the recorded reads of keys `edits` moved, keeping the
     /// fingerprints; a read of a key the edits destroyed can no longer hold.
     pub fn apply_edits(&mut self, edits: &EditMaps) {
-        let files: FxHashSet<FileId> = edits.files().collect();
-        let moves_key = |key: &FactKey| {
+        let edited: FxHashSet<FileId> = edits.files().collect();
+        let moves = |key: &FactKey| {
             key.positional_file()
-                .is_some_and(|file_id| files.contains(&file_id))
+                .is_some_and(|file_id| edited.contains(&file_id))
         };
-        let renamed = |key: FactKey| {
-            edits
-                .map_key(&key)
-                .unwrap_or(FactKey::FileText(FileId::VIRTUAL))
-        };
-        for reads in self.files.values_mut() {
-            if reads.keys().any(moves_key) {
-                *reads = std::mem::take(reads)
-                    .into_iter()
-                    .map(|(key, seen)| {
-                        if moves_key(&key) {
-                            (renamed(key), seen)
-                        } else {
-                            (key, seen)
-                        }
-                    })
-                    .collect();
+        if !self.keys.keys().any(moves) {
+            return;
+        }
+        let mut renamed = Self::default();
+        let mut index_of = vec![None; self.readers.len()];
+        for (key, index) in std::mem::take(&mut self.keys) {
+            let still_read =
+                !self.readers[index as usize].is_empty() || seen_in(&self.shared, index).is_some();
+            if !still_read {
+                continue;
             }
+            let key = if moves(&key) {
+                edits
+                    .map_key(&key)
+                    .unwrap_or(FactKey::FileText(FileId::VIRTUAL))
+            } else {
+                key
+            };
+            index_of[index as usize] = Some(renamed.intern(key));
         }
-        if self.shared.keys().any(moves_key) {
-            self.shared = std::mem::take(&mut self.shared)
-                .into_iter()
-                .map(|(key, seen)| {
-                    if moves_key(&key) {
-                        (renamed(key), seen)
-                    } else {
-                        (key, seen)
-                    }
-                })
-                .collect();
-        }
-        self.readers.clear();
+        let reindex = |reads: &[(ReadKey, Fingerprint)]| {
+            let mut reads = reads
+                .iter()
+                .filter_map(|(key, seen)| Some((index_of[*key as usize]?, *seen)))
+                .collect::<Vec<_>>();
+            reads.sort_unstable_by_key(|(key, _)| *key);
+            reads.dedup_by_key(|(key, _)| *key);
+            reads.into_boxed_slice()
+        };
+        renamed.shared = reindex(&self.shared);
         for (file_id, reads) in &self.files {
-            for key in reads.keys() {
-                self.readers
-                    .entry(key.clone())
-                    .or_default()
-                    .insert(*file_id);
+            let reads = reindex(reads);
+            for (key, _) in reads.iter() {
+                renamed.readers[*key as usize].push(*file_id);
             }
+            renamed.files.insert(*file_id, reads);
         }
+        for readers in &mut renamed.readers {
+            readers.sort_unstable();
+        }
+        *self = renamed;
     }
 
     /// The files whose recorded read of one of `touched` no longer holds
@@ -140,20 +156,20 @@ impl DiagnosticReads {
         let mut stale = FxHashSet::default();
         let mut shared_stale = false;
         for key in touched {
-            let shared = self.shared.get(key);
-            let readers = self.readers.get(key);
-            if shared.is_none() && readers.is_none() {
+            let Some(&index) = self.keys.get(key) else {
+                continue;
+            };
+            let shared = seen_in(&self.shared, index);
+            let readers = &self.readers[index as usize];
+            if shared.is_none() && readers.is_empty() {
                 continue;
             }
             let holds = key_holds(key);
-            if shared.is_some_and(|seen| !holds(*seen)) {
+            if shared.is_some_and(|seen| !holds(seen)) {
                 shared_stale = true;
             }
-            for file_id in readers.into_iter().flatten() {
-                if self.files[file_id]
-                    .get(key)
-                    .is_none_or(|seen| !holds(*seen))
-                {
+            for file_id in readers {
+                if seen_in(&self.files[file_id], index).is_none_or(|seen| !holds(seen)) {
                     stale.insert(*file_id);
                 }
             }
@@ -164,5 +180,116 @@ impl DiagnosticReads {
         let mut stale = stale.into_iter().collect::<Vec<_>>();
         stale.sort_unstable();
         stale
+    }
+
+    fn intern(&mut self, key: FactKey) -> ReadKey {
+        if let Some(&index) = self.keys.get(&key) {
+            return index;
+        }
+        let index = self.readers.len() as ReadKey;
+        self.readers.push(Vec::new());
+        self.keys.insert(key, index);
+        index
+    }
+
+    /// `reads` as interned keys, sorted and unique.
+    fn intern_all(&mut self, reads: Vec<(FactKey, Fingerprint)>) -> Box<[(ReadKey, Fingerprint)]> {
+        let mut reads = reads
+            .into_iter()
+            .map(|(key, seen)| (self.intern(key), seen))
+            .collect::<Vec<_>>();
+        reads.sort_unstable_by_key(|(key, _)| *key);
+        reads.dedup_by_key(|(key, _)| *key);
+        reads.into_boxed_slice()
+    }
+}
+
+/// The fingerprint `reads` saw for `key`.
+fn seen_in(reads: &[(ReadKey, Fingerprint)], key: ReadKey) -> Option<Fingerprint> {
+    reads
+        .binary_search_by_key(&key, |(read, _)| *read)
+        .ok()
+        .map(|at| reads[at].1)
+}
+
+#[cfg(test)]
+mod tests {
+    use rowan::TextSize;
+
+    use super::*;
+    use crate::{LuaDeclId, PositionMap};
+
+    const SEEN: Fingerprint = 7;
+
+    fn reader() -> FileId {
+        FileId::new(1)
+    }
+
+    fn other_reader() -> FileId {
+        FileId::new(2)
+    }
+
+    fn edited() -> FileId {
+        FileId::new(3)
+    }
+
+    fn decl_in_edited_file(position: u32) -> FactKey {
+        FactKey::Decl(LuaDeclId::new(edited(), TextSize::new(position)))
+    }
+
+    /// Lengthens the first line of the edited file, moving the declaration at
+    /// 18 (`a`) to 20.
+    fn lengthen_first_line() -> EditMaps {
+        EditMaps::new([(
+            edited(),
+            PositionMap::new("local x = 1\nlocal a = 1\n", "local x = 100\nlocal a = 1\n"),
+        )])
+    }
+
+    fn stale_after_edit(reads: &mut DiagnosticReads, now: Fingerprint) -> Vec<FileId> {
+        reads.apply_edits(&lengthen_first_line());
+        reads.stale_files([&decl_in_edited_file(20)], |_| move |seen| seen == now)
+    }
+
+    #[test]
+    fn a_key_one_file_read_marks_it_stale_after_an_edit_moved_the_key() {
+        let mut reads = DiagnosticReads::default();
+        reads.record(reader(), vec![(decl_in_edited_file(18), SEEN)]);
+        reads.record(
+            other_reader(),
+            vec![(FactKey::FileText(other_reader()), SEEN)],
+        );
+
+        assert_eq!(stale_after_edit(&mut reads, SEEN + 1), vec![reader()]);
+    }
+
+    #[test]
+    fn a_read_the_edit_only_moved_stays_fresh() {
+        let mut reads = DiagnosticReads::default();
+        reads.record(reader(), vec![(decl_in_edited_file(18), SEEN)]);
+
+        assert_eq!(stale_after_edit(&mut reads, SEEN), Vec::<FileId>::new());
+    }
+
+    #[test]
+    fn a_key_only_the_shared_data_read_survives_an_edit() {
+        let mut reads = DiagnosticReads::default();
+        reads.record_shared(vec![(decl_in_edited_file(18), SEEN)]);
+        reads.record(reader(), vec![(FactKey::FileText(reader()), SEEN)]);
+
+        assert_eq!(stale_after_edit(&mut reads, SEEN + 1), vec![reader()]);
+    }
+
+    #[test]
+    fn a_forgotten_file_is_not_stale_after_an_edit() {
+        let mut reads = DiagnosticReads::default();
+        reads.record(reader(), vec![(decl_in_edited_file(18), SEEN)]);
+        reads.forget(reader());
+        reads.record(
+            other_reader(),
+            vec![(FactKey::FileText(other_reader()), SEEN)],
+        );
+
+        assert_eq!(stale_after_edit(&mut reads, SEEN + 1), Vec::<FileId>::new());
     }
 }
