@@ -73,7 +73,7 @@ fn infer_table_array_summary(
             fields[0].get_value_expr().ok_or(InferFailReason::None)?,
         )?;
         return Ok(LuaType::Array(
-            LuaArrayType::from_base_type(first_type).into(),
+            LuaArrayType::from_base_type(summary_row_type(first_type)).into(),
         ));
     }
 
@@ -150,7 +150,7 @@ fn infer_table_array_summary(
         match typ {
             LuaType::Variadic(multi) => flatten_multi_into_tuple(&mut types, &multi),
             _ => {
-                types.push(typ);
+                types.push(summary_row_type(typ));
             }
         }
     }
@@ -158,6 +158,27 @@ fn infer_table_array_summary(
     Ok(LuaType::Tuple(
         LuaTupleType::new(types, LuaTupleStatus::InferResolve).into(),
     ))
+}
+
+/// A row's type as a summary holds it: an inferred tuple becomes `table`.
+///
+/// A summary's positions are evidence about the literal itself. Copying a
+/// row's own summary into them nests without bound when the row's value is
+/// the literal (`local c = G; G = { c }`), where `table` is the fixpoint.
+fn summary_row_type(typ: LuaType) -> LuaType {
+    match typ {
+        LuaType::Tuple(tuple) if matches!(tuple.status, LuaTupleStatus::InferResolve) => {
+            LuaType::Table
+        }
+        LuaType::Union(union) if union.into_vec().iter().any(is_inferred_tuple) => {
+            LuaType::from_vec(union.into_vec().into_iter().map(summary_row_type).collect())
+        }
+        typ => typ,
+    }
+}
+
+fn is_inferred_tuple(typ: &LuaType) -> bool {
+    matches!(typ, LuaType::Tuple(tuple) if matches!(tuple.status, LuaTupleStatus::InferResolve))
 }
 
 fn flatten_multi_into_tuple(tuple_list: &mut Vec<LuaType>, multi: &VariadicType) {

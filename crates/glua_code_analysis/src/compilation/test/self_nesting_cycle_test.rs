@@ -46,4 +46,16 @@ mod test {
             "the copy holds what was passed: {copy}"
         );
     }
+
+    /// `c` copies the global before the global is assigned a table holding
+    /// the copy, so each statement's type feeds the other's.
+    #[test]
+    fn a_global_assigned_a_table_of_its_own_copy_settles() {
+        let digest = settled_digest("local c = G\nG = { c }\n").expect("the analysis settles");
+        let types = digest
+            .iter()
+            .filter_map(|line| line.split_once(": ").map(|(_, typed)| typed))
+            .collect::<Vec<_>>();
+        assert_eq!(types, ["G = (table)", "G = (table)", "c = (table)"]);
+    }
 }
