@@ -517,7 +517,15 @@ impl Vfs {
             .get(&site.file_id)
             .and_then(|tree| top_level_statement(tree, site.value))
             .filter(|statement| statement.text_range() == site.value)
-            .map(|statement| (site, statement.kind(), statement.text().to_string()));
+            .and_then(|statement| {
+                let content = &self
+                    .file_data
+                    .get(site.file_id.id as usize)?
+                    .as_ref()?
+                    .content;
+                let text = content.get(std::ops::Range::<usize>::from(site.value))?;
+                Some((site, statement.kind(), text))
+            });
         crate::db_index::derivation::fingerprint_opt(statement.as_ref())
     }
 
