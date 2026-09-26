@@ -1320,4 +1320,61 @@ RadioNum = 0
             u_members.keys().collect::<Vec<_>>()
         );
     }
+
+    /// Writing a loop's own value back (`T[k] = v` inside `for k, v in
+    /// pairs(T)`) puts back an element `T` already holds, so its value is
+    /// feedback like its key: an element type a later file settles must not
+    /// stay mixed with what the write-back carried before.
+    #[test]
+    fn a_loop_value_written_back_keeps_no_earlier_element_type() {
+        const CONFIGURATION: (&str, &str) = (
+            "gamemodes/cityrp/gamemode/core/sh_configuration.lua",
+            r#"cityrp = cityrp or {}
+cityrp.configuration = cityrp.configuration or {}
+cityrp.configuration.passes = {
+    green = {
+        name = "Visitor",
+        color = MakeColor(),
+    },
+    custom = {
+        title = "Custom",
+        color = MakeColor(),
+        presOnly = true,
+    },
+}
+for key, data in pairs(cityrp.configuration.passes) do
+    if not data.title and data.name then
+        data.title = data.name
+        cityrp.configuration.passes[key] = data
+    end
+end
+"#,
+        );
+        // `MakeColor` resolves to the first of its declarations by path, so a
+        // file created later but sorting first changes what the literal holds.
+        const LATER_MAKER: (&str, &str) = (
+            "gamemodes/cityrp/gamemode/core/a_color.lua",
+            "---@return string\nfunction MakeColor() end\n",
+        );
+        const EARLIER_MAKER: (&str, &str) = (
+            "gamemodes/cityrp/gamemode/core/z_color.lua",
+            "---@return integer\nfunction MakeColor() end\n",
+        );
+        const CONSUMER: (&str, &str) = (
+            "gamemodes/cityrp/plugins/contextmenu/contexts/sh_government.lua",
+            "for _, pass in pairs(cityrp.configuration.passes) do\n    passColor = pass.color\nend\n",
+        );
+        let pass_color = |batches: &[&[(&str, &str)]]| {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            for batch in batches {
+                ws.def_files(batch.to_vec());
+            }
+            let ty = ws.expr_ty("passColor");
+            ws.humanize_type(ty)
+        };
+        assert_eq!(
+            pass_color(&[&[EARLIER_MAKER, CONFIGURATION, CONSUMER], &[LATER_MAKER]]),
+            pass_color(&[&[EARLIER_MAKER, LATER_MAKER, CONFIGURATION, CONSUMER]])
+        );
+    }
 }

@@ -1,5 +1,6 @@
 use glua_parser::{
-    LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaIndexExpr, LuaIndexKey, PathTrait,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaIndexExpr, LuaIndexKey,
+    LuaNameExpr, PathTrait,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -534,16 +535,25 @@ fn try_infer_pairs_iter_types_from_table_members(
             keys.push(key_type);
         }
 
-        // The value half of a self-write is still evidence about what the
-        // table holds; only its key-domain contribution is circular.
-        let value_type = match member_infos.as_slice() {
-            [] => LuaType::Any,
+        // Writing a loop's own value back (`T[k] = v` inside `for k, v in
+        // pairs(T)`) puts back an element the table already holds, so that
+        // value is feedback too: it carries whatever the element type was when
+        // the write-back last ran. Any other value written is evidence.
+        let evidence = member_infos
+            .iter()
+            .filter(|member| {
+                !matches!(
+                    &member.property_owner_id,
+                    Some(LuaSemanticDeclId::Member(member_id)) if writes_back_loop_value(db, member_id)
+                )
+            })
+            .collect::<Vec<_>>();
+        let value_type = match evidence.as_slice() {
+            [] if member_infos.is_empty() => LuaType::Any,
+            [] => continue,
             [member] => member.typ.clone(),
             _ => LuaType::from_inferred_vec(
-                member_infos
-                    .iter()
-                    .map(|member| member.typ.clone())
-                    .collect(),
+                evidence.iter().map(|member| member.typ.clone()).collect(),
             ),
         };
         values.push(value_type);
@@ -564,20 +574,53 @@ fn try_infer_pairs_iter_types_from_table_members(
 /// Whether `member_id` writes a table back through the key variable of a
 /// `pairs` loop over that same table, unreassigned before the write.
 fn is_pairs_write_back(db: &DbIndex, member_id: &LuaMemberId) -> bool {
-    let file_id = member_id.file_id;
-    let syntax_id = member_id.get_syntax_id();
-    let Some(index_expr) = db
-        .get_vfs()
-        .syntax_tree_around(&file_id, syntax_id.get_range())
-        .and_then(|tree| syntax_id.to_node_from_root(&tree.get_red_root()))
-        .and_then(LuaIndexExpr::cast)
-    else {
+    let Some(index_expr) = written_index_expr(db, member_id) else {
         return false;
     };
     let Some(LuaIndexKey::Expr(LuaExpr::NameExpr(key_name))) = index_expr.get_index_key() else {
         return false;
     };
-    let Some(source) = for_range_pairs_source_for_var(db, file_id, &key_name, 0) else {
+    is_unreassigned_loop_var_over(db, member_id.file_id, &key_name, 0, &index_expr)
+}
+
+/// Whether `member_id` writes the value variable of a `pairs` loop over the
+/// same table back into it, unreassigned before the write.
+fn writes_back_loop_value(db: &DbIndex, member_id: &LuaMemberId) -> bool {
+    let Some(index_expr) = written_index_expr(db, member_id) else {
+        return false;
+    };
+    let Some(assign_stat) = index_expr.get_parent::<LuaAssignStat>() else {
+        return false;
+    };
+    let (vars, exprs) = assign_stat.get_var_and_expr_list();
+    let written_value = vars
+        .iter()
+        .position(|var| var.syntax() == index_expr.syntax())
+        .and_then(|at| exprs.get(at));
+    let Some(LuaExpr::NameExpr(value_name)) = written_value else {
+        return false;
+    };
+    is_unreassigned_loop_var_over(db, member_id.file_id, value_name, 1, &index_expr)
+}
+
+fn written_index_expr(db: &DbIndex, member_id: &LuaMemberId) -> Option<LuaIndexExpr> {
+    let syntax_id = member_id.get_syntax_id();
+    db.get_vfs()
+        .syntax_tree_around(&member_id.file_id, syntax_id.get_range())
+        .and_then(|tree| syntax_id.to_node_from_root(&tree.get_red_root()))
+        .and_then(LuaIndexExpr::cast)
+}
+
+/// Whether `name` is variable `var_index` of a `pairs` loop over the table
+/// `index_expr` writes into, and not reassigned before the write.
+fn is_unreassigned_loop_var_over(
+    db: &DbIndex,
+    file_id: FileId,
+    name: &LuaNameExpr,
+    var_index: usize,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    let Some(source) = for_range_pairs_source_for_var(db, file_id, name, var_index) else {
         return false;
     };
     let written_table = index_expr
