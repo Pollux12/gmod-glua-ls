@@ -73,6 +73,13 @@ end
         fn evaluations(&self, kind: DerivationKind) -> usize {
             self.ws.analysis.compilation.last_stats().evaluations(kind)
         }
+
+        fn fingerprint(
+            &self,
+            key: crate::db_index::derivation::FactKey,
+        ) -> crate::db_index::derivation::Fingerprint {
+            self.ws.analysis.compilation.get_db().fact_fingerprint(&key)
+        }
     }
 
     const PER_FILE_GMOD_PASSES: [DerivationKind; 4] = [
@@ -165,6 +172,68 @@ end
         workspace.edit_configuration(default_money, &format!("  {default_money}"));
 
         assert_eq!(workspace.evaluated_files(), vec![workspace.configuration]);
+    }
+
+    /// A call into another file's net helper reads the statement that defines
+    /// the helper, so a statement added elsewhere in that file leaves the
+    /// caller standing.
+    #[test]
+    fn a_statement_added_after_a_helper_another_file_calls_re_runs_nothing_in_the_caller() {
+        let mut workspace = cityrp_workspace();
+        workspace.ws.def_file(
+            "gamemodes/cityrp/gamemode/core/cl_config_menu.lua",
+            "cityrp.SendConfig(\"cityrp_config\")\n",
+        );
+
+        workspace.ws.def_file(
+            CONFIGURATION,
+            &format!("{CONFIGURATION_TEXT}local unused = 1\n"),
+        );
+
+        assert_eq!(workspace.evaluated_files(), vec![workspace.configuration]);
+    }
+
+    /// A caller in another file whose stored call target the shift moved is
+    /// re-run once the edited file settles, so it names the helper's new place
+    /// as a caller analysed after the shift does.
+    #[test]
+    fn a_shift_above_a_helper_moves_the_call_target_another_file_stored() {
+        const CALLER: &str = "gamemodes/cityrp/gamemode/core/cl_config_menu.lua";
+        const CALLER_TEXT: &str = "cityrp.SendConfig(\"cityrp_config\")\n";
+        let shifted = format!("\n{CONFIGURATION_TEXT}");
+        let mut edited = cityrp_workspace();
+        let caller = edited.ws.def_file(CALLER, CALLER_TEXT);
+        edited.ws.def_file(CONFIGURATION, &shifted);
+        let mut analysed_after = cityrp_workspace();
+        analysed_after.ws.def_file(CONFIGURATION, &shifted);
+        analysed_after.ws.def_file(CALLER, CALLER_TEXT);
+
+        let key = crate::db_index::derivation::FactKey::NetHelpers(caller);
+        assert_eq!(
+            edited.fingerprint(key.clone()),
+            analysed_after.fingerprint(key)
+        );
+    }
+
+    /// Whether a table literal is array-shaped is read off the statement that
+    /// holds it, so a statement added elsewhere in its file leaves the files
+    /// that index it standing.
+    #[test]
+    fn a_statement_added_after_a_shaped_table_another_file_indexes_re_runs_nothing_in_it() {
+        const PALETTE: &str = "gamemodes/cityrp/gamemode/core/sh_palette.lua";
+        const PALETTE_TEXT: &str = "Palette = { { 255, 0, 0 }, { 0, 255, 0 } }\n";
+        let mut workspace = cityrp_workspace();
+        let palette = workspace.ws.def_file(PALETTE, PALETTE_TEXT);
+        workspace.ws.def_file(
+            "gamemodes/cityrp/gamemode/core/cl_paint.lua",
+            "for i = 1, 2 do local color = Palette[i] end\n",
+        );
+
+        workspace
+            .ws
+            .def_file(PALETTE, &format!("{PALETTE_TEXT}local unused = 1\n"));
+
+        assert_eq!(workspace.evaluated_files(), vec![palette]);
     }
 
     #[test]

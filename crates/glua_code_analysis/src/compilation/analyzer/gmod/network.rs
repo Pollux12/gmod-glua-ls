@@ -607,14 +607,12 @@ fn resolve_registry_entry(
     file_id: &FileId,
     syntax_id: &LuaSyntaxId,
 ) -> Option<HelperId> {
-    let chunk = match roots.get(file_id) {
-        Some(chunk) => chunk.clone(),
-        None => {
-            let chunk = db.get_vfs().get_syntax_tree(file_id)?.get_chunk_node();
-            roots.insert(*file_id, chunk.clone());
-            chunk
-        }
-    };
+    let tree = db
+        .get_vfs()
+        .syntax_tree_around(file_id, syntax_id.get_range())?;
+    let chunk = roots
+        .entry(*file_id)
+        .or_insert_with(|| tree.get_chunk_node());
     let block = LuaBlock::cast(syntax_id.to_node_from_root(chunk.syntax())?)?;
     Some(InFiled::new(*file_id, block.syntax().text_range()))
 }

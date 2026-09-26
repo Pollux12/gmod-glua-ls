@@ -794,10 +794,10 @@ impl From<LuaTupleType> for LuaType {
 /// each value is itself a table literal) receive array-like `TableConst`
 /// treatment.
 ///
-/// Uses the existing syntax lookup path: `db.get_vfs().get_syntax_tree()` →
+/// Reads only the statement holding the literal: `syntax_tree_around()` →
 /// `get_red_root()` → `covering_element()` → walk up to `LuaTableExpr`.
 pub fn is_table_const_shaped_array(db: &DbIndex, range: &InFiled<TextRange>) -> bool {
-    let Some(tree) = db.get_vfs().get_syntax_tree(&range.file_id) else {
+    let Some(tree) = db.get_vfs().syntax_tree_around(&range.file_id, range.value) else {
         return false;
     };
     let root = tree.get_red_root();

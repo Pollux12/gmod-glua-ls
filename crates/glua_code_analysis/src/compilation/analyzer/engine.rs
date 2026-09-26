@@ -528,7 +528,9 @@ impl Engine {
             if reader.kind == DerivationKind::Source {
                 self.stale_sources.insert(reader.file_id);
             } else {
-                self.worklist.insert(reader, Reason::Read);
+                // Checking rebased its reads onto the values as they stand, so
+                // it is queued as changed rather than checked again.
+                self.worklist.insert(reader, Reason::Changed);
                 queued += 1;
             }
         }
