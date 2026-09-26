@@ -166,7 +166,6 @@ pub(crate) fn evaluate_load(db: &mut DbIndex) {
     if !db.get_emmyrc().gmod.enabled {
         return;
     }
-    let roles = call_roles(db);
     let file_ids = db.get_vfs().get_all_local_file_ids();
     let mut branch_realm_ranges = HashMap::default();
     let mut annotation_realms = HashMap::default();
@@ -179,8 +178,8 @@ pub(crate) fn evaluate_load(db: &mut DbIndex) {
             annotation_realms.insert(*file_id, realm);
         }
     }
-    update_compilefile_execution_environments(db, &file_ids, &roles.roles);
-    rebuild_gmod_load_index(db, &branch_realm_ranges, &file_ids, &roles.roles);
+    rebuild_compilefile_execution_environments(db);
+    rebuild_gmod_load_index(db, &branch_realm_ranges, &file_ids);
     rebuild_realm_metadata(db, branch_realm_ranges, annotation_realms, &file_ids);
 }
 

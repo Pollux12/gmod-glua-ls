@@ -101,6 +101,10 @@ pub struct DbIndex {
     helper_scans: FxHashMap<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
     /// The set of files in `helper_scans`.
     helper_scan_files: derivation::SetFingerprint,
+    /// Each file's own contribution to the gmod load graph.
+    load_scans: FxHashMap<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
+    /// The set of files in `load_scans`.
+    load_scan_files: derivation::SetFingerprint,
     /// Each file's net helper summaries with their fingerprint when stored.
     net_helpers: FxHashMap<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
     /// Each file's function-body summaries with their fingerprint when stored.
@@ -186,6 +190,8 @@ impl DbIndex {
             emmyrc: Arc::new(Emmyrc::default()),
             helper_scans: FxHashMap::default(),
             helper_scan_files: derivation::SetFingerprint::default(),
+            load_scans: FxHashMap::default(),
+            load_scan_files: derivation::SetFingerprint::default(),
             net_helpers: FxHashMap::default(),
             function_summaries: FxHashMap::default(),
             analysis_stage: derivation::AnalysisStage::default(),
@@ -209,6 +215,7 @@ impl DbIndex {
         match key {
             K::TypeCache(owner) => self.get_type_index_mut().reset_type_cache(owner),
             K::HelperScan(file_id) => self.remove_helper_scan(*file_id),
+            K::LoadScan(file_id) => self.remove_load_scan(*file_id),
             K::NetHelpers(file_id) => self.remove_net_helpers(*file_id),
             K::DeclClaim(decl_id) => self.get_type_index_mut().reset_decl_claim(decl_id),
             K::DefinitionFact(definition) => {
@@ -361,6 +368,11 @@ impl DbIndex {
                 .get(file_id)
                 .map_or(derivation::ABSENT, stored_fact_fingerprint),
             K::HelperScanFiles => self.helper_scan_files.get(),
+            K::LoadScan(file_id) => self
+                .load_scans
+                .get(file_id)
+                .map_or(derivation::ABSENT, stored_fact_fingerprint),
+            K::LoadScanFiles => self.load_scan_files.get(),
             K::NetHelpers(file_id) => self
                 .net_helpers
                 .get(file_id)
@@ -438,6 +450,46 @@ impl DbIndex {
         }
     }
 
+    pub(crate) fn set_load_scan<T: derivation::DerivedFact>(
+        &mut self,
+        file_id: FileId,
+        scan: Arc<T>,
+    ) {
+        derivation::note_write(|| derivation::FactKey::LoadScan(file_id));
+        let fingerprint = derivation::in_file(Some(file_id), || scan.fingerprint()).max(1);
+        if self
+            .load_scans
+            .insert(file_id, (scan, fingerprint))
+            .is_none()
+        {
+            self.load_scan_files.insert(&file_id);
+            derivation::note_write(|| derivation::FactKey::LoadScanFiles);
+        }
+    }
+
+    pub(crate) fn remove_load_scan(&mut self, file_id: FileId) {
+        if self.load_scans.remove(&file_id).is_some() {
+            self.load_scan_files.remove(&file_id);
+            derivation::note_write(|| derivation::FactKey::LoadScan(file_id));
+            derivation::note_write(|| derivation::FactKey::LoadScanFiles);
+        }
+    }
+
+    /// Every file's load scan, in file order.
+    pub(crate) fn load_scans<T: derivation::DerivedFact>(&self) -> Vec<(FileId, Arc<T>)> {
+        derivation::note_read(|| derivation::FactKey::LoadScanFiles);
+        let mut scans = self
+            .load_scans
+            .iter()
+            .filter_map(|(file_id, (scan, _))| {
+                derivation::note_read(|| derivation::FactKey::LoadScan(*file_id));
+                Some((*file_id, downcast_fact(scan)?))
+            })
+            .collect::<Vec<_>>();
+        scans.sort_unstable_by_key(|(file_id, _)| *file_id);
+        scans
+    }
+
     pub(crate) fn get_net_helpers<T: derivation::DerivedFact>(
         &self,
         file_id: FileId,
@@ -503,6 +555,7 @@ impl DbIndex {
         let _profile = Profile::cond_new("remove indexes", file_ids.len() > 1);
         for &file_id in &file_ids {
             self.remove_helper_scan(file_id);
+            self.remove_load_scan(file_id);
             self.remove_net_helpers(file_id);
             if self.function_summaries.remove(&file_id).is_some() {
                 derivation::note_write(|| derivation::FactKey::FunctionSummaries(file_id));
@@ -885,6 +938,8 @@ impl DbIndex {
             emmyrc: Arc::clone(&self.emmyrc),
             helper_scans: self.helper_scans.clone(),
             helper_scan_files: self.helper_scan_files,
+            load_scans: self.load_scans.clone(),
+            load_scan_files: self.load_scan_files,
             net_helpers: self.net_helpers.clone(),
             function_summaries: self.function_summaries.clone(),
             analysis_stage: self.analysis_stage,
@@ -1038,6 +1093,8 @@ impl LuaIndex for DbIndex {
         Arc::make_mut(&mut self.json_schema_index).clear();
         self.helper_scans.clear();
         self.helper_scan_files = derivation::SetFingerprint::default();
+        self.load_scans.clear();
+        self.load_scan_files = derivation::SetFingerprint::default();
         self.net_helpers.clear();
         self.function_summaries.clear();
         self.derivations = Arc::default();

@@ -240,6 +240,11 @@ pub enum FactKey {
     GmodInferScan,
     /// A file's load edges, roots and execution environment.
     GmodLoadFile(FileId),
+    /// A file's own contribution to the load graph: its execution-environment
+    /// flow and dynamic loaders.
+    LoadScan(FileId),
+    /// Which files have a load scan.
+    LoadScanFiles,
     /// A file's network flows.
     NetworkFile(FileId),
     /// Network flows by message name (whole-map).
@@ -404,6 +409,7 @@ impl FactKey {
                 | K::GmodInferFile(_)
                 | K::GmodRealm(_)
                 | K::GmodLoadFile(_)
+                | K::LoadScan(_)
                 | K::NetworkFile(_)
                 | K::HelperRegistry
                 | K::HelperScan(_)
@@ -538,6 +544,7 @@ impl FactKey {
             | K::GmodInferFile(file_id)
             | K::GmodRealm(file_id)
             | K::GmodLoadFile(file_id)
+            | K::LoadScan(file_id)
             | K::NetworkFile(file_id)
             | K::HelperScan(file_id)
             | K::NetHelpers(file_id)
@@ -578,6 +585,7 @@ impl FactKey {
             | K::NetworkScan
             | K::HelperRegistry
             | K::HelperScanFiles
+            | K::LoadScanFiles
             | K::FileSet
             | K::StageRule(_)
             | K::ValidGuardFiles

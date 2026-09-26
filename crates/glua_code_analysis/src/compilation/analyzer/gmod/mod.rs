@@ -194,6 +194,31 @@ pub(crate) enum PendingCallSite {
     DeferredVguiParent,
     ScriptedClass(GmodScriptedClassCallKind, GmodScriptedClassCallMetadata),
     Dependency(LuaDependencySite),
+    LoadScan(GmodFileLoadScan),
+}
+
+/// A file's own contribution to the load graph, scanned once from its text:
+/// its `CompileFile` execution-environment flow and its dynamic loaders. The
+/// GmodLoad fold resolves them against the workspace.
+#[derive(Default)]
+pub(crate) struct GmodFileLoadScan {
+    flow: GmodExecutionEnvironmentFileFlow,
+    dynamic_loaders: Vec<DynamicLoadCandidate>,
+}
+
+impl GmodFileLoadScan {
+    fn is_empty(&self) -> bool {
+        self.flow.is_empty() && self.dynamic_loaders.is_empty()
+    }
+}
+
+impl crate::db_index::derivation::DerivedFact for GmodFileLoadScan {
+    fn fingerprint(&self) -> crate::db_index::derivation::Fingerprint {
+        crate::db_index::derivation::fingerprint_of(&(
+            self.flow.fingerprint(),
+            &self.dynamic_loaders,
+        ))
+    }
 }
 
 /// Scripted-class registration (and, when `include_load`, `load`-style
@@ -257,6 +282,17 @@ fn file_annotated_call_sites(
     include_load: bool,
     include_class_calls: bool,
 ) -> Vec<PendingCallSite> {
+    let mut pending = Vec::new();
+    if include_load {
+        pending.push(PendingCallSite::LoadScan(GmodFileLoadScan {
+            flow: collect_compilefile_execution_environment_flow(
+                db,
+                file_id,
+                annotated_global_call_roles,
+            ),
+            dynamic_loaders: collect_file_dynamic_loaders(db, file_id, annotated_global_call_roles),
+        }));
+    }
     let keywords = db
         .get_vfs()
         .get_file_content(&file_id)
@@ -271,19 +307,18 @@ fn file_annotated_call_sites(
     let scan_load = include_load && keywords.has_load_call;
     let scan_class_calls = include_class_calls && keywords.has_scripted_class_call;
     if !scan_class_calls && !scan_load {
-        return Vec::new();
+        return pending;
     }
     let Some(root) = db
         .get_vfs()
         .get_syntax_tree(&file_id)
         .map(|tree| tree.get_chunk_node())
     else {
-        return Vec::new();
+        return pending;
     };
 
     let annotated_call_roles =
         AnnotatedGmodCallRoleMap::build(db, file_id, &root, annotated_global_call_roles);
-    let mut pending = Vec::new();
     for call_expr in root.syntax().descendants().filter_map(LuaCallExpr::cast) {
         if scan_class_calls {
             collect_annotated_scripted_class_call_metadata(
@@ -326,6 +361,8 @@ pub(crate) fn apply_annotated_call_sites(
             PendingCallSite::Dependency(site) => db
                 .get_file_dependencies_index_mut()
                 .add_dependency_site(site),
+            PendingCallSite::LoadScan(scan) if scan.is_empty() => db.remove_load_scan(file_id),
+            PendingCallSite::LoadScan(scan) => db.set_load_scan(file_id, Arc::new(scan)),
         }
     }
 }
@@ -7783,10 +7820,6 @@ impl AnnotatedGmodGlobalCallRoleMap {
                 .strip_prefix("_G.")
                 .is_some_and(|global_path| self.roles_by_path.contains_key(global_path))
     }
-
-    fn environment_role_source_files(&self) -> &HashSet<FileId> {
-        &self.environment_role_source_files
-    }
 }
 
 impl<'a> AnnotatedGmodCallRoleMap<'a> {
@@ -9795,38 +9828,6 @@ enum CompilefileTargetState {
     Ambiguous,
 }
 
-fn update_compilefile_execution_environments(
-    db: &mut DbIndex,
-    files_to_update: &[FileId],
-    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
-) {
-    let flow_updates = files_to_update
-        .iter()
-        .map(|file_id| {
-            (
-                *file_id,
-                collect_compilefile_execution_environment_flow(
-                    db,
-                    *file_id,
-                    annotated_global_call_roles,
-                ),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    let load_index = db.get_gmod_load_index_mut();
-    for (file_id, flow) in flow_updates {
-        load_index.set_execution_environment_file_flow(file_id, flow);
-    }
-    load_index.set_execution_environment_role_sources(
-        annotated_global_call_roles
-            .environment_role_source_files()
-            .clone(),
-    );
-
-    rebuild_compilefile_execution_environments(db, files_to_update.len(), true);
-}
-
 fn collect_compilefile_execution_environment_flow(
     db: &DbIndex,
     file_id: FileId,
@@ -9970,20 +9971,19 @@ fn collect_compilefile_execution_environment_flow(
     flow
 }
 
-fn rebuild_compilefile_execution_environments(
-    db: &mut DbIndex,
-    updated_source_files: usize,
-    roles_changed: bool,
-) {
+/// Every `CompileFile` target's execution environment, resolved from the
+/// files' load scans.
+pub(super) fn rebuild_compilefile_execution_environments(db: &mut DbIndex) {
     let mut environments = HashMap::<FileId, HashMap<FileId, HashSet<String>>>::default();
     let mut cached_source_files = 0usize;
     let mut edge_count = 0usize;
     let mut seed_count = 0usize;
     let mut site_count = 0usize;
-    for (source_file_id, flow) in db
-        .get_gmod_load_index()
-        .iter_execution_environment_file_flows()
-    {
+    for (source_file_id, scan) in db.load_scans::<GmodFileLoadScan>() {
+        let flow = &scan.flow;
+        if flow.is_empty() {
+            continue;
+        }
         cached_source_files += 1;
         edge_count += flow.edges.values().map(Vec::len).sum::<usize>();
         seed_count += flow.seeds.len();
@@ -10039,7 +10039,7 @@ fn rebuild_compilefile_execution_environments(
 
     if std::env::var_os("GLUALS_PROFILE").is_some() {
         eprintln!(
-            "[profile] compilefile_environments updated_source_files={updated_source_files} roles_changed={roles_changed} cached_source_files={cached_source_files} edges={edge_count} seeds={seed_count} sites={site_count} sources={} targets={}",
+            "[profile] compilefile_environments source_files={cached_source_files} edges={edge_count} seeds={seed_count} sites={site_count} sources={} targets={}",
             environments.len(),
             environments.values().map(HashMap::len).sum::<usize>(),
         );
@@ -10308,7 +10308,6 @@ fn rebuild_gmod_load_index(
     db: &mut DbIndex,
     branch_realm_ranges: &HashMap<FileId, Vec<GmodRealmRange>>,
     analyzed_file_ids: &[FileId],
-    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
 ) {
     let _p_prep = crate::profile::PhaseGuard::new("gmodload/prep");
     let file_ids = db.get_vfs().get_all_local_file_ids();
@@ -10367,7 +10366,7 @@ fn rebuild_gmod_load_index(
     dependency_sites.sort_by_cached_key(|site| load_site_sort_key(db, site));
     drop(_p_sites);
     let _p_dyn = crate::profile::PhaseGuard::new("gmodload/dynamic_loaders");
-    let dynamic_loaders = collect_dynamic_loaders(db, &file_ids, annotated_global_call_roles);
+    let dynamic_loaders = resolve_dynamic_loaders(db, &file_ids);
     drop(_p_dyn);
 
     let _p_fix = crate::profile::PhaseGuard::new("gmodload/fixpoint");
@@ -10543,7 +10542,7 @@ struct DynamicFileFindBindings {
     directories: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum DynamicFileFindResultKind {
     Files,
     Directories,
@@ -10563,7 +10562,7 @@ struct DynamicBindingWrite {
     range: TextRange,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Hash)]
 struct DynamicLoadGlob {
     base: String,
     file_prefix: Option<String>,
@@ -10575,7 +10574,7 @@ struct DynamicLoadWrapper {
     block: LuaBlock,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 struct DynamicLoadDispatch {
     prefix: bool,
     folder: bool,
@@ -10590,7 +10589,7 @@ impl DynamicLoadDispatch {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum DynamicLoadOperationKind {
     Include,
     AddCSLuaFile,
@@ -10603,7 +10602,20 @@ struct DynamicLoadOperation {
     path_hints: Vec<DynamicLoadPathHint>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+impl std::hash::Hash for DynamicLoadOperation {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let Self {
+            kind,
+            ranges,
+            path_hints,
+        } = self;
+        kind.hash(state);
+        crate::db_index::derivation::hash_local(ranges, state);
+        path_hints.hash(state);
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct DynamicLoadPathHint {
     suffix_after_result: String,
 }
@@ -10675,7 +10687,7 @@ impl DynamicLoadAlias {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Hash)]
 struct DynamicLoadUsage {
     dispatch: DynamicLoadDispatch,
     operations: Vec<DynamicLoadOperation>,
@@ -10698,11 +10710,90 @@ impl DynamicLoadUsage {
     }
 }
 
-fn collect_dynamic_loaders(
+/// A `file.Find` result the file loads, before it is resolved against the
+/// workspace's files.
+struct DynamicLoadCandidate {
+    result_kind: DynamicFileFindResultKind,
+    glob: DynamicLoadGlob,
+    usage: DynamicLoadUsage,
+    range: TextRange,
+}
+
+impl std::hash::Hash for DynamicLoadCandidate {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let Self {
+            result_kind,
+            glob,
+            usage,
+            range,
+        } = self;
+        result_kind.hash(state);
+        glob.hash(state);
+        usage.hash(state);
+        crate::db_index::derivation::hash_local(range, state);
+    }
+}
+
+/// The dynamic loaders one file's text contains.
+fn collect_file_dynamic_loaders(
     db: &DbIndex,
-    file_ids: &[FileId],
+    source_file_id: FileId,
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
-) -> Vec<DynamicLoadPattern> {
+) -> Vec<DynamicLoadCandidate> {
+    let mut candidates = Vec::new();
+    let Some(tree) = db.get_vfs().get_syntax_tree(&source_file_id) else {
+        return candidates;
+    };
+    let Some(content) = db.get_vfs().get_file_content(&source_file_id) else {
+        return candidates;
+    };
+    let annotated_candidates = annotated_global_call_roles.candidate_call_paths_in_content(content);
+    if !content.contains("gmod.file_find") && !annotated_candidates.has_file_find {
+        return candidates;
+    }
+
+    let root = tree.get_chunk_node();
+    let annotated_call_roles =
+        AnnotatedGmodCallRoleMap::build(db, source_file_id, &root, annotated_global_call_roles);
+    let bindings = collect_static_string_bindings(&root);
+    let wrappers = collect_dynamic_load_wrappers(&root);
+
+    let file_find_patterns = collect_dynamic_file_find_patterns(
+        db,
+        source_file_id,
+        &root,
+        &bindings,
+        &annotated_call_roles,
+    );
+    if file_find_patterns.is_empty() {
+        return candidates;
+    }
+
+    let usages = collect_dynamic_load_usages(
+        db,
+        source_file_id,
+        &root,
+        &file_find_patterns,
+        &wrappers,
+        &annotated_call_roles,
+    );
+    for (file_find_pattern, usages) in file_find_patterns.into_iter().zip(usages) {
+        for (result_kind, usage) in usages {
+            if usage.has_load_call() {
+                candidates.push(DynamicLoadCandidate {
+                    result_kind,
+                    glob: file_find_pattern.glob.clone(),
+                    usage,
+                    range: file_find_pattern.range,
+                });
+            }
+        }
+    }
+    candidates
+}
+
+/// Every local file's dynamic loaders, resolved against the files they find.
+fn resolve_dynamic_loaders(db: &DbIndex, file_ids: &[FileId]) -> Vec<DynamicLoadPattern> {
     let mut relative_paths_by_parent: HashMap<String, Vec<(FileId, String)>> = HashMap::default();
     for file_id in file_ids {
         let Some(path) = gmod_relative_path(db, *file_id) else {
@@ -10717,87 +10808,42 @@ fn collect_dynamic_loaders(
             .or_default()
             .push((*file_id, path));
     }
+    let local_files = file_ids.iter().copied().collect::<HashSet<_>>();
 
-    // Every file is content-scanned for a `file_find` candidate before almost
-    // all of them bail out, and the whole walk is read-only against `&DbIndex`,
-    // so it runs across files in parallel. Results stay index-aligned and are
-    // flattened in file order, so the pattern list is identical to the previous
-    // sequential build.
-    let per_file = super::parallel::map_files_collect(db, file_ids, |db, source_file_id| {
-        let mut patterns = Vec::new();
-        let Some(tree) = db.get_vfs().get_syntax_tree(&source_file_id) else {
-            return patterns;
-        };
-        let Some(content) = db.get_vfs().get_file_content(&source_file_id) else {
-            return patterns;
-        };
-        let annotated_candidates =
-            annotated_global_call_roles.candidate_call_paths_in_content(content);
-        if !content.contains("gmod.file_find") && !annotated_candidates.has_file_find {
-            return patterns;
+    let mut patterns = Vec::new();
+    for (source_file_id, scan) in db.load_scans::<GmodFileLoadScan>() {
+        if !local_files.contains(&source_file_id) {
+            continue;
         }
-
-        let root = tree.get_chunk_node();
-        let annotated_call_roles =
-            AnnotatedGmodCallRoleMap::build(db, source_file_id, &root, annotated_global_call_roles);
-        let bindings = collect_static_string_bindings(&root);
-        let wrappers = collect_dynamic_load_wrappers(&root);
-
-        let file_find_patterns = collect_dynamic_file_find_patterns(
-            db,
-            source_file_id,
-            &root,
-            &bindings,
-            &annotated_call_roles,
-        );
-        if file_find_patterns.is_empty() {
-            return patterns;
-        }
-
-        let usages = collect_dynamic_load_usages(
-            db,
-            source_file_id,
-            &root,
-            &file_find_patterns,
-            &wrappers,
-            &annotated_call_roles,
-        );
-        for (file_find_pattern, usages) in file_find_patterns.into_iter().zip(usages) {
-            for (result_kind, usage) in usages {
-                if !usage.has_load_call() {
-                    continue;
-                }
-                let targets = dynamic_file_find_targets(
-                    &file_find_pattern.glob,
-                    result_kind,
-                    &usage,
-                    &relative_paths_by_parent,
-                );
-                if targets.is_empty() {
-                    continue;
-                }
-                let mut dispatch = usage.dispatch;
-                dispatch.prefix |= file_find_pattern
-                    .glob
-                    .file_prefix
-                    .as_deref()
-                    .is_some_and(is_realm_file_prefix);
-
-                patterns.push(DynamicLoadPattern {
-                    source_file_id,
-                    result_kind,
-                    glob: file_find_pattern.glob.clone(),
-                    dispatch,
-                    operations: usage.operations,
-                    range: file_find_pattern.range,
-                    targets,
-                });
+        for candidate in &scan.dynamic_loaders {
+            let targets = dynamic_file_find_targets(
+                &candidate.glob,
+                candidate.result_kind,
+                &candidate.usage,
+                &relative_paths_by_parent,
+            );
+            if targets.is_empty() {
+                continue;
             }
-        }
-        patterns
-    });
+            let mut dispatch = candidate.usage.dispatch;
+            dispatch.prefix |= candidate
+                .glob
+                .file_prefix
+                .as_deref()
+                .is_some_and(is_realm_file_prefix);
 
-    per_file.into_iter().flatten().collect()
+            patterns.push(DynamicLoadPattern {
+                source_file_id,
+                result_kind: candidate.result_kind,
+                glob: candidate.glob.clone(),
+                dispatch,
+                operations: candidate.usage.operations.clone(),
+                range: candidate.range,
+                targets,
+            });
+        }
+    }
+    patterns
 }
 
 fn collect_dynamic_file_find_patterns(

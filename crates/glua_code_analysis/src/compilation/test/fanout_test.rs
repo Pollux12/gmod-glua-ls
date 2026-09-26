@@ -111,6 +111,23 @@ end
         }
     }
 
+    /// The load graph is folded from each file's load sites and load scan,
+    /// which the file's own pass takes; the fold reads no file's text.
+    #[test]
+    fn the_load_graph_reads_no_file_text() {
+        let workspace = cityrp_workspace();
+        let graph = workspace.ws.analysis.compilation.get_db().reader_graph();
+
+        let text_reads = graph
+            .reads_of(crate::db_index::derivation::DerivationId::workspace(
+                DerivationKind::GmodLoad,
+            ))
+            .filter(|key| matches!(key.key(), crate::db_index::derivation::FactKey::FileText(_)))
+            .count();
+
+        assert_eq!(text_reads, 0);
+    }
+
     #[test]
     fn adding_a_parameter_re_runs_no_gmod_pass_in_files_that_never_mention_the_function() {
         let mut workspace = cityrp_workspace();

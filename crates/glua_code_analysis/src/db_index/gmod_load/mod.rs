@@ -300,7 +300,7 @@ impl GmodExecutionEnvironmentFileFlow {
 
     /// Content fingerprint; `edges` and each site's `fields` are hashed
     /// independently of their hash order.
-    fn fingerprint(&self) -> Fingerprint {
+    pub(crate) fn fingerprint(&self) -> Fingerprint {
         let edges = self
             .edges
             .iter()
@@ -342,9 +342,6 @@ pub struct GmodLoadIndex {
     unresolved_edges: Vec<GmodLoadEdge>,
     execution_environments: HashMap<FileId, HashSet<String>>,
     execution_environment_sites: HashMap<FileId, HashMap<FileId, HashSet<String>>>,
-    execution_environment_file_flows: HashMap<FileId, GmodExecutionEnvironmentFileFlow>,
-    execution_environment_role_sources: HashSet<FileId>,
-    execution_environment_roles_dirty: bool,
 }
 
 impl GmodLoadIndex {
@@ -354,9 +351,6 @@ impl GmodLoadIndex {
             unresolved_edges: Vec::new(),
             execution_environments: HashMap::default(),
             execution_environment_sites: HashMap::default(),
-            execution_environment_file_flows: HashMap::default(),
-            execution_environment_role_sources: HashSet::default(),
-            execution_environment_roles_dirty: false,
         }
     }
 
@@ -371,14 +365,10 @@ impl GmodLoadIndex {
             fields.sort_unstable();
             fields
         });
-        let flow = self
-            .execution_environment_file_flows
-            .get(file_id)
-            .map(GmodExecutionEnvironmentFileFlow::fingerprint);
-        if info.is_none() && environment.is_none() && flow.is_none() {
+        if info.is_none() && environment.is_none() {
             return derivation::ABSENT;
         }
-        derivation::fingerprint_of(&(info, environment, flow))
+        derivation::fingerprint_of(&(info, environment))
     }
 
     /// Notes a write of every file key this index currently holds.
@@ -390,7 +380,6 @@ impl GmodLoadIndex {
             .file_infos
             .keys()
             .chain(self.execution_environments.keys())
-            .chain(self.execution_environment_file_flows.keys())
         {
             derivation::note_write(|| FactKey::GmodLoadFile(*file_id));
         }
@@ -429,35 +418,6 @@ impl GmodLoadIndex {
         self.execution_environment_sites = execution_environment_sites;
         self.rebuild_execution_environments();
         self.note_all_file_writes();
-    }
-
-    pub(crate) fn set_execution_environment_file_flow(
-        &mut self,
-        file_id: FileId,
-        flow: GmodExecutionEnvironmentFileFlow,
-    ) {
-        derivation::note_write(|| FactKey::GmodLoadFile(file_id));
-        if flow.is_empty() {
-            self.execution_environment_file_flows.remove(&file_id);
-        } else {
-            self.execution_environment_file_flows.insert(file_id, flow);
-        }
-    }
-
-    pub(crate) fn iter_execution_environment_file_flows(
-        &self,
-    ) -> impl Iterator<Item = (FileId, &GmodExecutionEnvironmentFileFlow)> {
-        self.execution_environment_file_flows
-            .iter()
-            .map(|(file_id, flow)| {
-                derivation::note_read(|| FactKey::GmodLoadFile(*file_id));
-                (*file_id, flow)
-            })
-    }
-
-    pub(crate) fn set_execution_environment_role_sources(&mut self, role_sources: HashSet<FileId>) {
-        self.execution_environment_role_sources = role_sources;
-        self.execution_environment_roles_dirty = false;
     }
 
     fn rebuild_execution_environments(&mut self) {
@@ -642,13 +602,6 @@ impl LuaIndex for GmodLoadIndex {
         derivation::note_write(|| FactKey::GmodLoadFile(file_id));
         self.note_all_file_writes();
         self.file_infos.remove(&file_id);
-        self.execution_environment_file_flows.remove(&file_id);
-        if self.execution_environment_role_sources.remove(&file_id) {
-            self.execution_environment_roles_dirty = true;
-            self.execution_environment_file_flows.clear();
-            self.execution_environment_sites.clear();
-            self.execution_environments.clear();
-        }
         self.execution_environments.remove(&file_id);
         self.execution_environment_sites.remove(&file_id);
         for targets in self.execution_environment_sites.values_mut() {
@@ -675,19 +628,6 @@ impl LuaIndex for GmodLoadIndex {
         let removed_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
         self.file_infos
             .retain(|file_id, _| !removed_file_ids.contains(file_id));
-        self.execution_environment_file_flows
-            .retain(|file_id, _| !removed_file_ids.contains(file_id));
-        let previous_role_source_count = self.execution_environment_role_sources.len();
-        self.execution_environment_role_sources
-            .retain(|file_id| !removed_file_ids.contains(file_id));
-        let removed_role_source =
-            previous_role_source_count != self.execution_environment_role_sources.len();
-        self.execution_environment_roles_dirty |= removed_role_source;
-        if removed_role_source {
-            self.execution_environment_file_flows.clear();
-            self.execution_environment_sites.clear();
-            self.execution_environments.clear();
-        }
         self.execution_environments
             .retain(|file_id, _| !removed_file_ids.contains(file_id));
         self.execution_environment_sites
@@ -724,9 +664,6 @@ impl LuaIndex for GmodLoadIndex {
         self.unresolved_edges.clear();
         self.execution_environments.clear();
         self.execution_environment_sites.clear();
-        self.execution_environment_file_flows.clear();
-        self.execution_environment_role_sources.clear();
-        self.execution_environment_roles_dirty = false;
     }
 }
 
