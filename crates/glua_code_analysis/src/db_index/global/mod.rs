@@ -2,6 +2,7 @@ mod global_id;
 
 use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub use global_id::GlobalId;
 
@@ -14,6 +15,9 @@ use super::{LuaDeclId, LuaIndex, LuaModuleIndex, WorkspaceId};
 #[derive(Debug, Clone)]
 pub struct LuaGlobalIndex {
     global_decl: FxHashMap<GlobalId, Vec<LuaDeclId>>,
+    /// Each declaring file's `Vfs::file_order_key`, which orders its
+    /// declarations among the other files'.
+    file_order: FxHashMap<FileId, Arc<str>>,
     /// Multiset fingerprint of every `(name, decl id)`, for `GlobalScan`.
     scan_fingerprint: Fingerprint,
 }
@@ -27,11 +31,17 @@ fn note_global_write(name: &str) {
     derivation::note_write(|| FactKey::GlobalScan);
 }
 
-/// Canonical order for a global's declarations: source position, with the file
-/// as the outer key. `FileId`s are handed out in workspace-collection order and
-/// never reused within a session, so this is stable for as long as the index is.
-fn decl_sort_key(decl_id: LuaDeclId) -> (u32, u32) {
-    (decl_id.file_id.id, u32::from(decl_id.position))
+/// Canonical order for a global's declarations: source position, with the
+/// file's path as the outer key. File ids follow load history (a file created
+/// mid-session, or a workspace loaded in batches, numbers differently from a
+/// cold load), and the first declaration in this order is the one a global
+/// resolves to, so the path decides.
+fn decl_sort_key(file_order: &FxHashMap<FileId, Arc<str>>, decl_id: LuaDeclId) -> (&str, u32, u32) {
+    (
+        file_order.get(&decl_id.file_id).map_or("", |key| key),
+        u32::from(decl_id.position),
+        decl_id.file_id.id,
+    )
 }
 
 impl Default for LuaGlobalIndex {
@@ -44,18 +54,24 @@ impl LuaGlobalIndex {
     pub fn new() -> Self {
         Self {
             global_decl: FxHashMap::default(),
+            file_order: FxHashMap::default(),
             scan_fingerprint: derivation::ABSENT,
         }
     }
 
     /// Registers a declaration of `name`, keeping the global's declaration
-    /// list in canonical source order.
-    pub fn add_global_decl(&mut self, name: &str, decl_id: LuaDeclId) {
+    /// list in canonical source order. `file_order_key` is the declaring
+    /// file's `Vfs::file_order_key`.
+    pub fn add_global_decl(&mut self, name: &str, decl_id: LuaDeclId, file_order_key: Arc<str>) {
         let id = GlobalId::new(name);
+        self.file_order
+            .entry(decl_id.file_id)
+            .or_insert(file_order_key);
+        let file_order = &self.file_order;
         let decl_ids = self.global_decl.entry(id).or_default();
-        if let Err(insert_at) = decl_ids
-            .binary_search_by_key(&decl_sort_key(decl_id), |existing| decl_sort_key(*existing))
-        {
+        if let Err(insert_at) = decl_ids.binary_search_by(|existing| {
+            decl_sort_key(file_order, *existing).cmp(&decl_sort_key(file_order, decl_id))
+        }) {
             decl_ids.insert(insert_at, decl_id);
             self.scan_fingerprint = self
                 .scan_fingerprint
@@ -94,7 +110,9 @@ impl LuaGlobalIndex {
             .flatten()
             .copied()
             .collect::<Vec<_>>();
-        decls.sort_unstable_by_key(|decl_id| decl_sort_key(*decl_id));
+        decls.sort_unstable_by(|a, b| {
+            decl_sort_key(&self.file_order, *a).cmp(&decl_sort_key(&self.file_order, *b))
+        });
         decls
     }
 
@@ -199,6 +217,7 @@ impl LuaGlobalIndex {
             }
             !decl_ids.is_empty()
         });
+        self.file_order.retain(|file_id, _| !removed(*file_id));
         self.scan_fingerprint = scan_fingerprint;
     }
 }
@@ -230,6 +249,7 @@ impl LuaIndex for LuaGlobalIndex {
             note_global_write(global_id.get_name());
         }
         self.global_decl.clear();
+        self.file_order.clear();
         self.scan_fingerprint = derivation::ABSENT;
     }
 }
@@ -245,6 +265,10 @@ mod order_tests {
         LuaDeclId::new(FileId::new(file), TextSize::new(position))
     }
 
+    fn path_key(decl_id: LuaDeclId) -> Arc<str> {
+        Arc::from(format!("f{}.lua", decl_id.file_id.id))
+    }
+
     /// Re-indexing one file must not reorder a global's declaration list: the
     /// list is what `resolve_global_decl_id` picks the canonical declaration
     /// from, and that identity keys flow narrowing for the whole global path.
@@ -252,15 +276,15 @@ mod order_tests {
     fn declaration_order_survives_reindexing_a_file() {
         let mut cold = LuaGlobalIndex::new();
         for decl_id in [decl(1, 0), decl(2, 10), decl(3, 20)] {
-            cold.add_global_decl("cityrp", decl_id);
+            cold.add_global_decl("cityrp", decl_id, path_key(decl_id));
         }
 
         let mut reindexed = LuaGlobalIndex::new();
         for decl_id in [decl(1, 0), decl(2, 10), decl(3, 20)] {
-            reindexed.add_global_decl("cityrp", decl_id);
+            reindexed.add_global_decl("cityrp", decl_id, path_key(decl_id));
         }
         reindexed.remove(FileId::new(1));
-        reindexed.add_global_decl("cityrp", decl(1, 0));
+        reindexed.add_global_decl("cityrp", decl(1, 0), path_key(decl(1, 0)));
 
         assert_eq!(
             cold.get_global_decl_ids("cityrp"),
@@ -268,24 +292,33 @@ mod order_tests {
         );
     }
 
+    /// A file created later gets a later id wherever its path sorts; the
+    /// declaration order follows the path, as a cold load would number it.
     #[test]
-    fn declarations_are_ordered_by_file_then_position() {
+    fn declarations_are_ordered_by_path_then_position() {
         let mut index = LuaGlobalIndex::new();
+        let key = |decl_id: LuaDeclId| {
+            Arc::from(if decl_id.file_id.id == 3 {
+                "a.lua"
+            } else {
+                "b.lua"
+            })
+        };
         for decl_id in [decl(3, 5), decl(1, 40), decl(1, 2)] {
-            index.add_global_decl("cityrp", decl_id);
+            index.add_global_decl("cityrp", decl_id, key(decl_id));
         }
 
         assert_eq!(
             index.get_global_decl_ids("cityrp"),
-            Some(&vec![decl(1, 2), decl(1, 40), decl(3, 5)]),
+            Some(&vec![decl(3, 5), decl(1, 2), decl(1, 40)]),
         );
     }
 
     #[test]
     fn adding_the_same_declaration_twice_does_not_duplicate_it() {
         let mut index = LuaGlobalIndex::new();
-        index.add_global_decl("cityrp", decl(1, 0));
-        index.add_global_decl("cityrp", decl(1, 0));
+        index.add_global_decl("cityrp", decl(1, 0), path_key(decl(1, 0)));
+        index.add_global_decl("cityrp", decl(1, 0), path_key(decl(1, 0)));
 
         assert_eq!(index.get_global_decl_ids("cityrp"), Some(&vec![decl(1, 0)]));
     }
@@ -315,8 +348,16 @@ mod tests {
         let mut global_index = LuaGlobalIndex::new();
         let removed_decl = LuaDeclId::new(removed, TextSize::new(0));
         let surviving_decl = LuaDeclId::new(surviving, TextSize::new(1));
-        global_index.add_global_decl("SharedGlobal", removed_decl);
-        global_index.add_global_decl("SharedGlobal", surviving_decl);
+        global_index.add_global_decl(
+            "SharedGlobal",
+            removed_decl,
+            Arc::from(format!("f{}.lua", removed_decl.file_id.id)),
+        );
+        global_index.add_global_decl(
+            "SharedGlobal",
+            surviving_decl,
+            Arc::from(format!("f{}.lua", surviving_decl.file_id.id)),
+        );
 
         global_index.remove_files(&[other_removed, removed, other_removed]);
 
@@ -355,12 +396,20 @@ mod tests {
         let file_a = FileId { id: 1 };
         module_index.add_module_by_path(file_a, "C:/Users/username/ProjectA/shared.lua");
         let decl_a = LuaDeclId::new(file_a, TextSize::new(0));
-        global_index.add_global_decl("SharedGlobal", decl_a);
+        global_index.add_global_decl(
+            "SharedGlobal",
+            decl_a,
+            Arc::from(format!("f{}.lua", decl_a.file_id.id)),
+        );
 
         let file_b = FileId { id: 2 };
         module_index.add_module_by_path(file_b, "C:/Users/username/ProjectB/shared.lua");
         let decl_b = LuaDeclId::new(file_b, TextSize::new(0));
-        global_index.add_global_decl("SharedGlobal", decl_b);
+        global_index.add_global_decl(
+            "SharedGlobal",
+            decl_b,
+            Arc::from(format!("f{}.lua", decl_b.file_id.id)),
+        );
 
         let scoped_a = global_index
             .get_global_decl_ids_in_workspace("SharedGlobal", &module_index, workspace_a)
@@ -406,7 +455,11 @@ mod tests {
             "C:/Users/username/ProjectB/lua/lib/shared_lib.lua",
         );
         let lib_decl = LuaDeclId::new(lib_file, TextSize::new(0));
-        global_index.add_global_decl("FromLibrary", lib_decl);
+        global_index.add_global_decl(
+            "FromLibrary",
+            lib_decl,
+            Arc::from(format!("f{}.lua", lib_decl.file_id.id)),
+        );
 
         let visible_from_a = global_index
             .get_global_decl_ids_in_workspace("FromLibrary", &module_index, workspace_a)
@@ -447,12 +500,20 @@ mod tests {
         let file_a = FileId { id: 40 };
         module_index.add_module_by_path(file_a, "C:/Users/username/ProjectA/shared.lua");
         let decl_a = LuaDeclId::new(file_a, TextSize::new(0));
-        global_index.add_global_decl("SharedGlobal", decl_a);
+        global_index.add_global_decl(
+            "SharedGlobal",
+            decl_a,
+            Arc::from(format!("f{}.lua", decl_a.file_id.id)),
+        );
 
         let file_b = FileId { id: 41 };
         module_index.add_module_by_path(file_b, "C:/Users/username/ProjectB/shared.lua");
         let decl_b = LuaDeclId::new(file_b, TextSize::new(0));
-        global_index.add_global_decl("SharedGlobal", decl_b);
+        global_index.add_global_decl(
+            "SharedGlobal",
+            decl_b,
+            Arc::from(format!("f{}.lua", decl_b.file_id.id)),
+        );
 
         let scoped_a = global_index
             .get_global_decl_ids_in_workspace("SharedGlobal", &module_index, workspace_a)

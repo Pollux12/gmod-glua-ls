@@ -2641,21 +2641,12 @@ fn infer_global_type_from_decl_ids(db: &DbIndex, decl_ids: Vec<LuaDeclId>) -> In
         };
     }
 
+    // Within a tier the order *is* the answer: `def_or_ref_type` keeps the
+    // first declaration that names one and the table merge folds in the rest
+    // in order. The tiers keep the global index's canonical order; the
+    // standard library's declarations go first.
     let mut sorted_decl_ids = decl_ids;
-    sorted_decl_ids.sort_by(|a, b| {
-        let a_is_std = db.get_module_index().is_std(&a.file_id);
-        let b_is_std = db.get_module_index().is_std(&b.file_id);
-        b_is_std.cmp(&a_is_std).then_with(|| {
-            // Within a tier the order *is* the answer: `def_or_ref_type` keeps
-            // the first declaration that names one and the table merge folds in
-            // the rest in order. The declaration list is built in analysis
-            // order, so a cold build and a re-index line the same tier up
-            // differently and the same name infers to a different one of its
-            // declarations. Source order decides instead -- the first
-            // declaration in the first file -- so both runs pick the same.
-            (a.file_id, a.position).cmp(&(b.file_id, b.position))
-        })
-    });
+    sorted_decl_ids.sort_by_key(|decl_id| !db.get_module_index().is_std(&decl_id.file_id));
 
     let mut callable_type: Option<LuaType> = None;
     let mut def_or_ref_type: Option<LuaType> = None;

@@ -237,6 +237,48 @@ end
         );
     }
 
+    /// A global declared in two files answers the same whichever file was
+    /// loaded first: the declarations are ordered by where they are, not by
+    /// the order the workspace happened to number their files in.
+    #[test]
+    fn a_global_declared_in_two_files_answers_the_same_in_either_load_order() {
+        const TYPES: (&str, &str) = (
+            "gamemodes/cityrp/gamemode/core/sh_types.lua",
+            "---@class Alpha
+---@class Beta
+",
+        );
+        const FIRST_BY_PATH: (&str, &str) = (
+            "gamemodes/cityrp/gamemode/core/a_config.lua",
+            "---@type Alpha
+Config = {}
+",
+        );
+        const LAST_BY_PATH: (&str, &str) = (
+            "gamemodes/cityrp/gamemode/core/z_config.lua",
+            "---@type Beta
+Config = {}
+",
+        );
+        let config_type = |files: &[(&str, &str)]| {
+            let mut ws = VirtualWorkspace::new();
+            ws.def_file(TYPES.0, TYPES.1);
+            for (path, text) in files {
+                ws.def_file(path, text);
+            }
+            ws.def_file(
+                "gamemodes/cityrp/gamemode/core/m_uses.lua",
+                "usedConfig = Config
+",
+            );
+            let ty = ws.expr_ty("usedConfig");
+            ws.humanize_type(ty)
+        };
+
+        assert_eq!(config_type(&[FIRST_BY_PATH, LAST_BY_PATH]), "Alpha");
+        assert_eq!(config_type(&[LAST_BY_PATH, FIRST_BY_PATH]), "Alpha");
+    }
+
     fn assert_schedule_independent(files: &[(&str, &str)]) {
         let canonical = settled(Schedule::Canonical, files).expect("canonical order settles");
         let reversed = settled(Schedule::Reversed, files).expect("reversed order settles");

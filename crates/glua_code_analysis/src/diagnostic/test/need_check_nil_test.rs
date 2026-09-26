@@ -11996,15 +11996,17 @@ mod test {
             )
             .map(|(id, _)| id);
 
+        // The nil declaration is first by path, so reads resolve through it
+        // and fall back to the tier's merge.
         ws.def_file(
-            "main_nil.lua",
+            "main_a_nil.lua",
             r#"
                 g_Mixed = nil
             "#,
         );
 
         ws.def_file(
-            "main_int.lua",
+            "main_b_int.lua",
             r#"
                 g_Mixed = 123
             "#,

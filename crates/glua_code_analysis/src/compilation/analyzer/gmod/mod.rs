@@ -5746,7 +5746,9 @@ fn ensure_register_file_panel_decls(db: &mut DbIndex, file_id: FileId) -> Option
     let decl_id = panel_decl.get_id();
 
     db.get_decl_index_mut().add_derived_decl(panel_decl);
-    db.get_global_index_mut().add_global_decl("PANEL", decl_id);
+    let file_order_key = db.get_vfs().file_order_key(&decl_id.file_id);
+    db.get_global_index_mut()
+        .add_global_decl("PANEL", decl_id, file_order_key);
 
     Some(vec![decl_id])
 }
@@ -5839,8 +5841,9 @@ fn register_global_panel(
     db.get_decl_index_mut().add_derived_decl(global_decl);
 
     // Register the global in the global index
+    let file_order_key = db.get_vfs().file_order_key(&decl_id.file_id);
     db.get_global_index_mut()
-        .add_global_decl(panel_name, decl_id);
+        .add_global_decl(panel_name, decl_id, file_order_key);
 
     // Bind the panel class type to the global declaration
     write_type_cache(

@@ -28,6 +28,9 @@ use crate::{Emmyrc, PositionMap};
 pub struct Vfs {
     file_id_map: FxHashMap<PathBuf, u32>,
     file_path_map: FxHashMap<u32, PathBuf>,
+    /// Each file's [`Vfs::file_order_key`], normalized once when the file is
+    /// first named.
+    file_order_keys: FxHashMap<u32, Arc<str>>,
     remote_file_id_map: FxHashMap<Uri, FileId>,
     file_data: Vec<Option<FileContent>>,
     line_index_map: FxHashMap<FileId, LineIndex>,
@@ -115,6 +118,7 @@ impl Clone for Vfs {
         Vfs {
             file_id_map: self.file_id_map.clone(),
             file_path_map: self.file_path_map.clone(),
+            file_order_keys: self.file_order_keys.clone(),
             remote_file_id_map: self.remote_file_id_map.clone(),
             file_data: self.file_data.clone(),
             line_index_map: self.line_index_map.clone(),
@@ -132,6 +136,7 @@ impl Vfs {
         Vfs {
             file_id_map: FxHashMap::default(),
             file_path_map: FxHashMap::default(),
+            file_order_keys: FxHashMap::default(),
             remote_file_id_map: FxHashMap::default(),
             file_data: Vec::new(),
             line_index_map: FxHashMap::default(),
@@ -163,6 +168,10 @@ impl Vfs {
         } else {
             let id = self.file_data.len() as u32;
             self.file_id_map.insert(path.clone(), id);
+            self.file_order_keys.insert(
+                id,
+                Arc::from(normalize_path_for_ordering(&path.to_string_lossy())),
+            );
             self.file_path_map.insert(id, path);
             self.file_data.push(None);
             FileId { id }
@@ -202,8 +211,9 @@ impl Vfs {
     /// documentation, table writers, load sites — orders on this instead. A file
     /// the VFS does not know sorts last.
     pub fn file_order_key(&self, id: &FileId) -> Arc<str> {
-        self.get_file_path(id)
-            .map(|path| Arc::from(normalize_path_for_ordering(&path.to_string_lossy())))
+        self.file_order_keys
+            .get(&id.id)
+            .cloned()
             .unwrap_or_else(|| Arc::from(""))
     }
 
@@ -415,6 +425,7 @@ impl Vfs {
         if let Some(path) = self.file_path_map.remove(&fid.id) {
             self.file_id_map.remove(&path);
         }
+        self.file_order_keys.remove(&fid.id);
         self.note_edit_base(fid);
         if let Some(data) = self.file_data.get_mut(fid.id as usize) {
             data.take();
