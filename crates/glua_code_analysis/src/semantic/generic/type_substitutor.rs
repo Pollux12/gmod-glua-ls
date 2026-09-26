@@ -99,6 +99,45 @@ impl TypeSubstitutor {
             .insert(tpl_id, SubstitutorValue::Type(value));
     }
 
+    /// Takes the bindings each union arm made in its own copy of `self`: a
+    /// template the arms bind alike takes that binding, a type they bind
+    /// differently takes the union of those types, and parameter or result
+    /// lists they bind differently stay unbound, since no one instantiation
+    /// stands for every arm.
+    pub fn merge_union_arm_bindings(&mut self, arms: Vec<TypeSubstitutor>) {
+        let mut bound: HashMap<GenericTplId, Vec<SubstitutorValue>> = HashMap::default();
+        for arm in arms {
+            for (tpl_id, value) in arm.tpl_replace_map {
+                if !value.is_none() && self.can_insert_type(tpl_id) {
+                    bound.entry(tpl_id).or_default().push(value);
+                }
+            }
+        }
+        for (tpl_id, values) in bound {
+            let first = &values[0];
+            if values.iter().all(|value| value == first) {
+                self.tpl_replace_map.insert(tpl_id, first.clone());
+                continue;
+            }
+            let types = values
+                .iter()
+                .map(|value| match value {
+                    SubstitutorValue::Type(value) => Some(value),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(types) = types {
+                let raw = LuaType::from_vec(types.iter().map(|value| value.raw.clone()).collect());
+                let default =
+                    LuaType::from_vec(types.iter().map(|value| value.default.clone()).collect());
+                self.tpl_replace_map.insert(
+                    tpl_id,
+                    SubstitutorValue::Type(SubstitutorTypeValue { raw, default }),
+                );
+            }
+        }
+    }
+
     fn can_insert_type(&self, tpl_id: GenericTplId) -> bool {
         if let Some(value) = self.tpl_replace_map.get(&tpl_id) {
             return value.is_none();
@@ -163,7 +202,7 @@ impl TypeSubstitutor {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SubstitutorTypeValue {
     raw: LuaType,
     default: LuaType,
@@ -189,7 +228,7 @@ impl SubstitutorTypeValue {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SubstitutorValue {
     None,
     Type(SubstitutorTypeValue),

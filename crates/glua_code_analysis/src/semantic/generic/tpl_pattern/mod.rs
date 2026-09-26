@@ -249,12 +249,27 @@ pub fn tpl_pattern_match(
         let arm_count = arms.len();
         let mut error_count = 0;
         let mut last_error = InferFailReason::None;
+        let mut arm_substitutors = Vec::with_capacity(arm_count);
         for arm in &arms {
-            if let Err(reason) = tpl_pattern_match(context, pattern, arm) {
-                error_count += 1;
-                last_error = reason;
+            let mut arm_substitutor = context.substitutor.clone();
+            let mut arm_context = TplContext {
+                db: context.db,
+                cache: &mut *context.cache,
+                substitutor: &mut arm_substitutor,
+                call_expr: context.call_expr.clone(),
+                source_range: context.source_range,
+            };
+            match tpl_pattern_match(&mut arm_context, pattern, arm) {
+                Ok(()) => arm_substitutors.push(arm_substitutor),
+                Err(reason) => {
+                    error_count += 1;
+                    last_error = reason;
+                }
             }
         }
+        context
+            .substitutor
+            .merge_union_arm_bindings(arm_substitutors);
         return if error_count == arm_count && arm_count > 0 {
             Err(last_error)
         } else {

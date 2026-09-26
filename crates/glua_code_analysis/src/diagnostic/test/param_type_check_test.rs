@@ -3313,6 +3313,25 @@ mod test {
     }
 
     #[test]
+    fn pcall_accepts_a_union_of_functions() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class MyPlug
+            local Plug = {}
+
+            ---@param cache table<MyPlug, (fun(self: MyPlug, value: any, global: boolean?))|(fun(self: MyPlug): string)|(fun(self: MyPlug): integer)>
+            local function SafeRun(cache, ...)
+                for k, v in pairs(cache) do
+                    local ok = pcall(v, k, ...)
+                end
+            end
+            "#
+        ));
+    }
+
+    #[test]
     fn test_closure_param_from_function_call() {
         let mut ws = VirtualWorkspace::new();
 
