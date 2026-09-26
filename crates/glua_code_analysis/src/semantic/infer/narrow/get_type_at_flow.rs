@@ -2061,11 +2061,13 @@ fn get_type_at_assign_stat(
                     }
                     Err(err) => return Err(err),
                 };
-                // An `any` value keeps the kind of value the variable held, not
-                // the `nil`/`false` of the old value it replaces (e.g. the
+                // An `any` value takes the type the variable is annotated with,
+                // or else keeps the kind of value the variable held, not the
+                // `nil`/`false` of the old value it replaces (e.g. the
                 // `if not x then` branch it is assigned in).
                 if expr_type.is_any() {
-                    without_falsy_values(antecedent_type)
+                    annotated_var_type(db, var_ref_id)
+                        .or_else(|| without_falsy_values(antecedent_type))
                 } else {
                     Some(antecedent_type)
                 }
@@ -2098,6 +2100,16 @@ fn get_type_at_assign_stat(
     }
 
     Ok(ResultTypeOrContinue::Continue)
+}
+
+/// The type `var_ref_id`'s declaration is annotated with: a local's
+/// `---@type` or a parameter's `---@param`.
+fn annotated_var_type(db: &DbIndex, var_ref_id: &VarRefId) -> Option<LuaType> {
+    let decl_id = var_ref_id.get_decl_id_ref()?;
+    db.get_type_index()
+        .get_type_cache(&decl_id.into())
+        .filter(|type_cache| type_cache.is_doc())
+        .map(|type_cache| type_cache.as_type().clone())
 }
 
 /// `typ` without its `nil` and `false` members, or `None` when nothing else is

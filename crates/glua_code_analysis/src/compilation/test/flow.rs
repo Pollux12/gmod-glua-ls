@@ -8828,4 +8828,45 @@ _2 = a[1]
             ws.humanize_type(assigned.clone())
         );
     }
+
+    /// The declared type is the local's, found at its declaration rather
+    /// than at the assignment.
+    #[test]
+    fn assigning_an_any_value_keeps_a_nullable_doc_declared_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            ---@param x any
+            local function Resolve(x)
+                ---@type string?
+                local label = "default"
+                label = x
+                local assigned = label
+            end
+            "#,
+        );
+
+        let assigned = nth_name_expr_type_from_end(&mut ws, file_id, "label", 0);
+        assert_eq!(ws.humanize_type(assigned), "string?");
+    }
+
+    #[test]
+    fn assigning_an_any_value_keeps_a_nullable_doc_declared_param_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            ---@param count number?
+            ---@param x any
+            local function Resolve(count, x)
+                count = x
+                local assigned = count
+            end
+            "#,
+        );
+
+        let assigned = nth_name_expr_type_from_end(&mut ws, file_id, "count", 0);
+        assert_eq!(ws.humanize_type(assigned), "number?");
+    }
 }
