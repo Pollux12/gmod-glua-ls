@@ -375,4 +375,47 @@ function Carry(bag) local weight = bag.weight end
 
         assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![bag]);
     }
+
+    /// A class named by string is declared by the calls that name it, once
+    /// every registration has run. Re-indexing one such file rebuilds its
+    /// declaration before any other file is re-checked, so the class other
+    /// files read never looks half-declared to them.
+    #[test]
+    fn re_indexing_a_file_that_names_a_class_by_string_re_runs_only_that_file() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let files = ws.def_files(vec![
+            (
+                "lua/includes/ents.lua",
+                "---@class Entity
+ents = {}
+---@generic T: Entity
+---@param class `T`
+---@return T[]
+function ents.FindByClass(class) end
+",
+            ),
+            (
+                "lua/glide/sh_lighting_api.lua",
+                "for _, controller in ipairs(ents.FindByClass(\"photon_controller\")) do end
+",
+            ),
+            (
+                "lua/glide/client/lighting_photon.lua",
+                "local controllers = ents.FindByClass(\"photon_controller\")
+local first = controllers[1]
+",
+            ),
+        ]);
+        let lighting = files[1];
+
+        ws.analysis.reindex_files(vec![lighting]);
+
+        assert_eq!(
+            ws.analysis.compilation.last_evaluated_files(),
+            vec![lighting]
+        );
+    }
 }

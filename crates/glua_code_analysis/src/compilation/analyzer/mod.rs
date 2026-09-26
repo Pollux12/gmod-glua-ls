@@ -127,6 +127,7 @@ pub(crate) fn reanalyze(
         }
         let scopes = crate::profile::phase("reanalyze: scopes", || ScriptedScopes::new(db));
         engine.note_rebuilt(&pending);
+        engine.focus_on(&pending);
         crate::profile::memory::checkpoint("before the source layer");
         let touched = crate::profile::phase("reanalyze: replace files", || {
             replace_files(db, &mut engine, &pending, &scopes)

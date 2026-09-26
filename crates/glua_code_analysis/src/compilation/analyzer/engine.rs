@@ -19,6 +19,12 @@
 //! before the derivation that queued it (a back edge) waits for the next
 //! round, which re-checks it once however many later producers moved it.
 //!
+//! A re-analysis settles the re-analysed files first. Until their derivations
+//! settle through every stage, a reader in another file only waits: what it
+//! would re-check is still being rebuilt, and most of it comes back as it was.
+//! Once they settle, the readers whose reads still moved run from the first
+//! stage again, like any other work.
+//!
 //! A run settles in stages (see [`derivation::AnalysisStage`]). Some reads
 //! only have a final answer once nothing can add a fact any more: a field no
 //! writer declared yet, a member slot one of whose writers is still untyped.
@@ -167,6 +173,11 @@ pub(crate) struct Engine {
     stale_sources: BTreeSet<crate::FileId>,
     /// Every key whose value may have changed during this engine's runs.
     touched: FxHashSet<HashedKey>,
+    /// The files being re-analysed, while their derivations settle.
+    focus: FxHashSet<crate::FileId>,
+    /// Readers in other files, and their source layers, queued while the
+    /// focus settles.
+    waiting: BTreeSet<DerivationId>,
     /// The files whose derivations this engine evaluated.
     evaluated: FxHashSet<crate::FileId>,
     /// Where the edits being re-analysed moved positions: a read of a fact
@@ -298,6 +309,9 @@ impl Engine {
                 self.stats.requeued(key, self.cursor, reader);
                 match reader.kind {
                     DerivationKind::Diagnostics => {}
+                    _ if self.waits(reader) => {
+                        self.waiting.insert(reader);
+                    }
                     DerivationKind::Source => {
                         self.stale_sources.insert(reader.file_id);
                     }
@@ -305,6 +319,18 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Settles `file_ids` before any reader in another file is re-checked.
+    pub(crate) fn focus_on(&mut self, file_ids: &[crate::FileId]) {
+        self.focus = file_ids.iter().copied().collect();
+    }
+
+    /// Whether `reader` waits for the focus to settle.
+    fn waits(&self, reader: DerivationId) -> bool {
+        !self.focus.is_empty()
+            && reader.file_id != crate::FileId::VIRTUAL
+            && !self.focus.contains(&reader.file_id)
     }
 
     /// Marks `file_id`'s source layer as needing a rebuild.
@@ -343,7 +369,7 @@ impl Engine {
         loop {
             let Some((id, reason)) = self.worklist.pop_first() else {
                 if self.next_round.is_empty() {
-                    if self.advance_stage(db) {
+                    if self.advance_stage(db) || self.release_waiting(db) {
                         continue;
                     }
                     break;
@@ -487,6 +513,32 @@ impl Engine {
             }
         }
         false
+    }
+
+    /// Once the focus settled, queues the waiting readers whose reads still
+    /// moved and restarts the stages for them, and marks the source layers
+    /// that still read a moved fact. Returns whether it queued any.
+    fn release_waiting(&mut self, db: &mut DbIndex) -> bool {
+        self.focus.clear();
+        let mut queued = 0;
+        for reader in std::mem::take(&mut self.waiting) {
+            if !self.needs_evaluation(db, reader, Reason::Read) {
+                continue;
+            }
+            if reader.kind == DerivationKind::Source {
+                self.stale_sources.insert(reader.file_id);
+            } else {
+                self.worklist.insert(reader, Reason::Read);
+                queued += 1;
+            }
+        }
+        self.stats.focus_settled(queued);
+        if queued == 0 {
+            return false;
+        }
+        self.enter_stage(db, AnalysisStage::Open);
+        self.cursor = None;
+        true
     }
 
     /// Whether `id`, queued for `reason`, has to run: a reader runs only if a
@@ -794,6 +846,17 @@ impl EngineStats {
         if self.profiling() {
             eprintln!(
                 "[engine] stage {stage:?} queues {queued} after {} evaluations",
+                self.total_evaluations()
+            );
+        }
+    }
+
+    /// Under `GLUALS_PROFILE`, prints how many waiting readers the settled
+    /// focus released.
+    fn focus_settled(&self, queued: usize) {
+        if self.profiling() {
+            eprintln!(
+                "[engine] focus settled after {} evaluations, releasing {queued}",
                 self.total_evaluations()
             );
         }
