@@ -112,9 +112,12 @@ pub enum FactKey {
     TypeCache(LuaTypeOwner),
     /// A definition-anchored inferred fact.
     DefinitionFact(LuaDefinitionId),
-    /// A `---` type declaration: its object, supertypes, generic parameters
-    /// and alias sources.
+    /// A `---` type declaration: its object, alias origin included.
     TypeDecl(LuaTypeDeclId),
+    /// A type declaration's supertypes.
+    TypeSupers(LuaTypeDeclId),
+    /// A type declaration's generic parameters.
+    TypeGenericParams(LuaTypeDeclId),
     /// A type declaration as the source layer declares it: its source
     /// locations, kind and attribute type.
     SourceTypeDecl(LuaTypeDeclId),
@@ -552,6 +555,8 @@ impl FactKey {
             | K::DynamicFieldFinite(DynamicFieldOwner::Table(site)) => Some(site.file_id),
             K::OperatorOwner(LuaOperatorOwner::Table(site)) => Some(site.file_id),
             K::TypeDecl(_)
+            | K::TypeSupers(_)
+            | K::TypeGenericParams(_)
             | K::SourceTypeDecl(_)
             | K::SubTypes(_)
             | K::TypeDeclScan
@@ -1098,6 +1103,22 @@ pub fn note_type_decl_read(decl_id: &LuaTypeDeclId) {
     note_read_by((u8::MAX, u128::from(decl_id.interned_address())), || {
         FactKey::TypeDecl(decl_id.clone())
     });
+}
+
+/// Records a read of `decl_id`'s supertypes.
+pub fn note_type_supers_read(decl_id: &LuaTypeDeclId) {
+    note_read_by(
+        (u8::MAX - 7, u128::from(decl_id.interned_address())),
+        || FactKey::TypeSupers(decl_id.clone()),
+    );
+}
+
+/// Records a read of `decl_id`'s generic parameters.
+pub fn note_type_generic_params_read(decl_id: &LuaTypeDeclId) {
+    note_read_by(
+        (u8::MAX - 8, u128::from(decl_id.interned_address())),
+        || FactKey::TypeGenericParams(decl_id.clone()),
+    );
 }
 
 /// An exact identity for a position in a file.

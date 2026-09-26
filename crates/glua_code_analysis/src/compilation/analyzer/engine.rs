@@ -331,6 +331,7 @@ impl Engine {
 
     /// The files whose source layer must be rebuilt, emptied.
     pub(crate) fn take_stale_sources(&mut self) -> BTreeSet<crate::FileId> {
+        self.stats.rebuilt_sources += self.stale_sources.len();
         std::mem::take(&mut self.stale_sources)
     }
 
@@ -702,6 +703,8 @@ pub(crate) struct EngineStats {
     evaluations: BTreeMap<DerivationKind, usize>,
     /// Rounds after the first.
     pub(crate) rounds: usize,
+    /// Source layers rebuilt because a fact they read moved.
+    pub(crate) rebuilt_sources: usize,
     /// Under `GLUALS_PROFILE`: time per kind, the part of it spent
     /// re-evaluating derivations already evaluated, and how often a key's move
     /// queued a reader, by key variant and the writer's and reader's kinds.
@@ -812,9 +815,10 @@ impl EngineStats {
             .map(|(kind, count)| format!("{kind:?}={count}"))
             .collect::<Vec<_>>();
         eprintln!(
-            "[engine] evaluations={} rounds={} files={files} {}",
+            "[engine] evaluations={} rounds={} rebuilt sources={} files={files} {}",
             self.total_evaluations(),
             self.rounds,
+            self.rebuilt_sources,
             kinds.join(" ")
         );
         let mut distinct = BTreeMap::<DerivationKind, usize>::new();

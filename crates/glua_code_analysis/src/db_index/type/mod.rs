@@ -1522,7 +1522,9 @@ impl LuaTypeIndex {
         if emptied {
             self.full_name_type_map.remove(decl_id);
             self.remove_from_decl_scan(decl_id);
-            self.generic_params.remove(decl_id);
+            if self.generic_params.remove(decl_id).is_some() {
+                derivation::note_write(|| FactKey::TypeGenericParams(decl_id.clone()));
+            }
             self.alias_sources.remove(decl_id);
         }
     }
@@ -1556,7 +1558,7 @@ impl LuaTypeIndex {
         if supers.is_empty() {
             self.supers.remove(decl_id);
         }
-        derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
+        derivation::note_write(|| FactKey::TypeSupers(decl_id.clone()));
         if let LuaType::Ref(base_id) = &entry.value.typ {
             let still_derives = self.supers.get(decl_id).is_some_and(|supers| {
                 supers
@@ -1801,12 +1803,12 @@ impl LuaTypeIndex {
     }
 
     pub fn add_generic_params(&mut self, decl_id: LuaTypeDeclId, params: Vec<GenericParam>) {
-        derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
+        derivation::note_write(|| FactKey::TypeGenericParams(decl_id.clone()));
         self.generic_params.insert(decl_id.clone(), params);
     }
 
     pub fn get_generic_params(&self, decl_id: &LuaTypeDeclId) -> Option<&Vec<GenericParam>> {
-        derivation::note_type_decl_read(&decl_id);
+        derivation::note_type_generic_params_read(decl_id);
         self.generic_params.get(decl_id)
     }
 
@@ -1899,8 +1901,11 @@ impl LuaTypeIndex {
             None
         };
 
-        if origin_changed || params_changed {
+        if origin_changed {
             derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
+        }
+        if params_changed {
+            derivation::note_write(|| FactKey::TypeGenericParams(decl_id.clone()));
         }
         if origin_changed {
             if let Some(decl) = self.full_name_type_map.get_mut(decl_id) {
@@ -1968,7 +1973,7 @@ impl LuaTypeIndex {
         if holders.len() > 1 {
             return false;
         }
-        derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
+        derivation::note_write(|| FactKey::TypeSupers(decl_id.clone()));
         let supers = self.supers.entry(decl_id.clone()).or_default();
         let at = supers.partition_point(|existing| {
             super_entry_sort_key(existing) <= super_entry_sort_key(&entry)
@@ -1993,7 +1998,7 @@ impl LuaTypeIndex {
         &self,
         decl_id: &LuaTypeDeclId,
     ) -> Option<impl Iterator<Item = &LuaType> + '_> {
-        derivation::note_type_decl_read(&decl_id);
+        derivation::note_type_supers_read(decl_id);
         self.supers.get(decl_id).map(|supers| {
             supers
                 .iter()
@@ -2011,7 +2016,7 @@ impl LuaTypeIndex {
         &self,
         decl_id: &LuaTypeDeclId,
     ) -> Option<&[InFiled<LuaSuperType>]> {
-        derivation::note_type_decl_read(&decl_id);
+        derivation::note_type_supers_read(decl_id);
         self.supers.get(decl_id).map(Vec::as_slice)
     }
 
@@ -2901,13 +2906,11 @@ impl LuaTypeIndex {
                 derivation::fingerprint_opt(self.definition_facts.get(definition))
             }
             FactKey::TypeDecl(decl_id) => {
-                let decl = self.full_name_type_map.get(decl_id);
-                let supers = self.supers.get(decl_id);
-                let generic_params = self.generic_params.get(decl_id);
-                if decl.is_none() && supers.is_none() && generic_params.is_none() {
-                    return derivation::ABSENT;
-                }
-                derivation::fingerprint_of(&(decl, supers, generic_params))
+                derivation::fingerprint_opt(self.full_name_type_map.get(decl_id))
+            }
+            FactKey::TypeSupers(decl_id) => derivation::fingerprint_opt(self.supers.get(decl_id)),
+            FactKey::TypeGenericParams(decl_id) => {
+                derivation::fingerprint_opt(self.generic_params.get(decl_id))
             }
             FactKey::SubTypes(decl_id) => {
                 let Some(children) = self.sub_types.get(decl_id) else {
@@ -3209,7 +3212,7 @@ impl LuaIndex for LuaTypeIndex {
                 if let Some(at) = supers.iter().position(|existing| existing == &entry) {
                     supers.remove(at);
                     pruned_edges += 1;
-                    derivation::note_write(|| FactKey::TypeDecl(child_id.clone()));
+                    derivation::note_write(|| FactKey::TypeSupers(child_id.clone()));
                 }
                 if supers.is_empty() {
                     self.supers.remove(&child_id);
@@ -3358,7 +3361,9 @@ impl LuaTypeIndex {
                     }
                 }
                 if remove_type {
-                    self.generic_params.remove(&id);
+                    if self.generic_params.remove(&id).is_some() {
+                        derivation::note_write(|| FactKey::TypeGenericParams(id.clone()));
+                    }
                     self.alias_sources.remove(&id);
                 } else if self.alias_sources.contains_key(&id) {
                     // The decl survives on other files' locations; drop this
@@ -3413,13 +3418,14 @@ impl LuaTypeIndex {
         {
             derivation::note_write(|| FactKey::TypeFile(*file_id));
         }
-        for decl_id in self
-            .full_name_type_map
-            .keys()
-            .chain(self.supers.keys())
-            .chain(self.generic_params.keys())
-        {
+        for decl_id in self.full_name_type_map.keys() {
             derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
+        }
+        for decl_id in self.supers.keys() {
+            derivation::note_write(|| FactKey::TypeSupers(decl_id.clone()));
+        }
+        for decl_id in self.generic_params.keys() {
+            derivation::note_write(|| FactKey::TypeGenericParams(decl_id.clone()));
         }
         for decl_id in self.sub_types.keys() {
             derivation::note_write(|| FactKey::SubTypes(decl_id.clone()));

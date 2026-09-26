@@ -175,4 +175,29 @@ function WriteCityName(value) end
 
         assert_eq!(workspace.evaluated_files(), vec![plugin]);
     }
+
+    /// A file documented early reads a class that a later file's `---@class`
+    /// gives a supertype. Resolving the name only needs the declaration, so
+    /// the supertype landing afterwards leaves the early file's source layer
+    /// standing.
+    #[test]
+    fn a_supertype_documented_later_rebuilds_no_source_layer() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_files(vec![
+            ("lua/includes/entity.lua", "---@class Entity\n"),
+            (
+                "gamemodes/cityrp/gamemode/core/a_uses_player.lua",
+                "---@param ply? Player\nfunction UsePlayer(ply) end\n",
+            ),
+            (
+                "gamemodes/cityrp/gamemode/core/z_player.lua",
+                "---@class Player : Entity\n",
+            ),
+        ]);
+
+        assert_eq!(ws.analysis.compilation.last_stats().rebuilt_sources, 0);
+    }
 }
