@@ -1,7 +1,6 @@
 mod cache;
 mod collection;
 
-pub(in crate::compilation::analyzer::lua) use crate::widen_related_assignment_type;
 pub(in crate::compilation::analyzer::lua) use cache::{
     DynamicKeyCollectionWideningKey, MemberAssignmentWideningCacheKey, MemberWideningCache,
     WideningCacheLookup, lookup_widening_cache, member_assignment_state_mask,

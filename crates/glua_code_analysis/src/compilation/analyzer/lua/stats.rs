@@ -37,7 +37,6 @@ use super::{
         get_widened_member_assignment_collection_type, is_collection_append_write,
         record_member_collection_assignment_widening_cache,
         resolve_index_expr_member_owner_for_file, widen_existing_member_collection_type,
-        widen_related_assignment_type,
     },
 };
 
@@ -2911,16 +2910,16 @@ fn special_assign_pattern(
     }
 
     let guarded_table_expr = matches!(&right, LuaExpr::TableExpr(_));
-    let expr_type = if guarded_table_expr {
-        infer_guarded_table_assignment_type(
-            analyzer,
-            &LuaExpr::BinaryExpr(binary_expr),
-            &left,
-            &right,
-        )
-    } else {
+    let expr_type = if !guarded_table_expr {
         set_index_expr_owner(analyzer, var.clone());
         analyzer.infer_expr(&right)
+    } else if defines_own_slot(analyzer, &left) {
+        // The left read is the slot this statement defines, which cannot
+        // inform its own definition: whatever it holds is written back
+        // unchanged, so the statement contributes only its right arm.
+        analyzer.infer_expr(&right)
+    } else {
+        analyzer.infer_expr(&LuaExpr::BinaryExpr(binary_expr.clone()))
     };
 
     match expr_type {
@@ -2973,6 +2972,24 @@ fn special_assign_pattern(
     Some(())
 }
 
+/// Whether `left`, the read of `x = x or {…}`, is the shared slot the
+/// statement defines: a field or a global. A local or parameter makes the
+/// statement a default over the value it already holds.
+fn defines_own_slot(analyzer: &LuaAnalyzer, left: &LuaExpr) -> bool {
+    match left {
+        LuaExpr::IndexExpr(_) => true,
+        LuaExpr::NameExpr(name) => name.get_name_text().is_some_and(|text| {
+            analyzer
+                .db
+                .get_decl_index()
+                .get_decl_tree(&analyzer.file_id)
+                .and_then(|tree| tree.find_local_decl(&text, name.get_position()))
+                .is_none_or(|decl| !(decl.is_local() || decl.is_param()))
+        }),
+        _ => false,
+    }
+}
+
 fn set_guarded_table_assignment_index_owner(
     analyzer: &mut LuaAnalyzer,
     var: LuaVarExpr,
@@ -2994,86 +3011,6 @@ fn set_guarded_table_assignment_index_owner(
             }
         }
         other => set_index_expr_owner(analyzer, other),
-    }
-}
-
-fn infer_guarded_table_assignment_type(
-    analyzer: &mut LuaAnalyzer,
-    binary_expr: &LuaExpr,
-    left: &LuaExpr,
-    right: &LuaExpr,
-) -> Result<LuaType, InferFailReason> {
-    let right_type = analyzer.infer_expr(right)?;
-    let cache_key = guarded_table_assignment_cache_key(analyzer, left);
-    if let Some(cached_left_type) = cache_key
-        .as_ref()
-        .and_then(|key| analyzer.guarded_table_assignment_type_cache.get(key))
-        .cloned()
-    {
-        if matches!(cached_left_type, LuaType::Table) && is_empty_table_expr(right) {
-            return Ok(LuaType::Table);
-        }
-        return merge_guarded_table_assignment_type(
-            analyzer,
-            binary_expr,
-            left,
-            cached_left_type,
-            right_type,
-        );
-    }
-
-    let left_type = match analyzer.infer_expr(left) {
-        Ok(left_type) => left_type,
-        Err(reason) if reason.is_need_resolve() => LuaType::Nil,
-        Err(reason) => return Err(reason),
-    };
-
-    let result =
-        merge_guarded_table_assignment_type(analyzer, binary_expr, left, left_type, right_type)?;
-    if let Some(cache_key) = cache_key
-        && (result.is_any() || result.is_table())
-    {
-        analyzer
-            .guarded_table_assignment_type_cache
-            .insert(cache_key, widen_related_assignment_type(&result, true));
-    }
-
-    Ok(result)
-}
-
-fn is_empty_table_expr(expr: &LuaExpr) -> bool {
-    matches!(expr, LuaExpr::TableExpr(table_expr) if table_expr.get_fields().next().is_none())
-}
-
-fn merge_guarded_table_assignment_type(
-    analyzer: &mut LuaAnalyzer,
-    binary_expr: &LuaExpr,
-    left: &LuaExpr,
-    left_type: LuaType,
-    right_type: LuaType,
-) -> Result<LuaType, InferFailReason> {
-    let left_type = remove_false_or_nil(left_type);
-    if left_type.is_nil() || left_type.is_unknown() || left_type.is_never() {
-        return Ok(right_type);
-    }
-    if should_prefer_guarded_dynamic_index_rhs(analyzer, left, &left_type) {
-        return Ok(right_type);
-    }
-    if !is_any_or_table(&left_type) {
-        return analyzer.infer_expr(binary_expr);
-    }
-
-    Ok(TypeOps::Union.apply(analyzer.db, &left_type, &right_type))
-}
-
-/// Whether every value `typ` may hold is a table (or `any`). A guarded
-/// bootstrap's literal then joins what it reads, whether that is one table or
-/// several: dropping it for a union would depend on whether the literal's own
-/// earlier contribution was already part of what it reads.
-fn is_any_or_table(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Union(union) => union.into_vec().iter().all(is_any_or_table),
-        typ => typ.is_any() || typ.is_table(),
     }
 }
 
@@ -3106,24 +3043,6 @@ fn guarded_table_assignment_info(
         MemberAssignmentWideningCacheKey { owner, key },
         set_owner_only,
     ))
-}
-
-fn guarded_table_assignment_cache_key(
-    analyzer: &mut LuaAnalyzer,
-    left: &LuaExpr,
-) -> Option<MemberAssignmentWideningCacheKey> {
-    guarded_table_assignment_info(analyzer, left).map(|(cache_key, _)| cache_key)
-}
-
-fn should_prefer_guarded_dynamic_index_rhs(
-    analyzer: &LuaAnalyzer,
-    left: &LuaExpr,
-    left_type: &LuaType,
-) -> bool {
-    analyzer.gmod_enabled
-        && analyzer.db.get_emmyrc().gmod.infer_dynamic_fields
-        && left_type.is_any()
-        && matches!(left, LuaExpr::IndexExpr(index_expr) if matches!(index_expr.get_index_key(), Some(LuaIndexKey::Expr(_))))
 }
 
 fn has_delayed_definition_attribute(analyzer: &LuaAnalyzer, decl_id: LuaDeclId) -> bool {

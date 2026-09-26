@@ -135,7 +135,6 @@ struct LuaAnalyzer<'a> {
     member_collection_assignment_widening_cache:
         FxHashMap<MemberAssignmentWideningCacheKey, MemberWideningCache<LuaType>>,
     pending_dynamic_key_collection_widenings: FxHashMap<DynamicKeyCollectionWideningKey, LuaType>,
-    guarded_table_assignment_type_cache: FxHashMap<MemberAssignmentWideningCacheKey, LuaType>,
     /// Whether each member is a guarded `x.y = x.y or {}` self-assignment.
     ///
     /// The answer derives from the member's own statement syntax alone, which
@@ -175,7 +174,6 @@ impl LuaAnalyzer<'_> {
             special_call_direct_matcher,
             member_collection_assignment_widening_cache: FxHashMap::default(),
             pending_dynamic_key_collection_widenings: FxHashMap::default(),
-            guarded_table_assignment_type_cache: FxHashMap::default(),
             guarded_table_assignment_member_check_cache: FxHashMap::default(),
             guarded_table_assignment_slot_cache: FxHashMap::default(),
             direct_local_table_member_owner_cache: FxHashMap::default(),

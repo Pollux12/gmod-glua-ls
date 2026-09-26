@@ -829,28 +829,6 @@ pub(crate) fn widen_literal_type_for_assignment(typ: &LuaType) -> LuaType {
     }
 }
 
-pub(crate) fn widen_related_assignment_type(typ: &LuaType, widen_table_literals: bool) -> LuaType {
-    if widen_table_literals {
-        return widen_table_literals_for_assignment(typ);
-    }
-
-    widen_literal_type_for_assignment(typ)
-}
-
-fn widen_table_literals_for_assignment(typ: &LuaType) -> LuaType {
-    match typ {
-        LuaType::TableConst(_) => LuaType::Table,
-        LuaType::Union(union) => LuaType::from_vec(
-            union
-                .into_vec()
-                .into_iter()
-                .map(|sub_type| widen_table_literals_for_assignment(&sub_type))
-                .collect(),
-        ),
-        _ => widen_literal_type_for_assignment(typ),
-    }
-}
-
 pub(crate) fn is_table_assignment_merge_type(typ: &LuaType) -> bool {
     match typ {
         LuaType::Table

@@ -292,6 +292,85 @@ vgui.Register(\"cityrp_guides\", PANEL, \"Panel\")
     assert_eq!(declaration(&ws), cold);
 }
 
+/// Deleting a file retracts what it contributed to other files' facts: a
+/// class member read through its subclasses' writes loses the deleted
+/// subclass's table, as a cold build without that file never had it.
+#[test]
+fn deleting_a_subclass_file_leaves_what_a_cold_build_without_it_does() {
+    const BASE: (&str, &str) = (
+        "lua/entities/base_car/shared.lua",
+        "ENT.Type = \"anim\"
+ENT.Base = \"base_anim\"
+ENT.FuelDefaults = ENT.FuelDefaults or { capacity = 60 }
+",
+    );
+    const MOTORCYCLE: (&str, &str) = (
+        "lua/entities/base_motorcycle/shared.lua",
+        "ENT.Type = \"anim\"
+ENT.Base = \"base_car\"
+ENT.FuelDefaults = ENT.FuelDefaults or { capacity = 10 }
+",
+    );
+    const DELETED: (&str, &str) = (
+        "lua/entities/car_deleted.lua",
+        "ENT.Type = \"anim\"
+ENT.Base = \"base_car\"
+ENT.FuelDefaults = { capacity = 50, fillPort = 1 }
+",
+    );
+    fn gmod_workspace(files: &[(&str, &str)]) -> VirtualWorkspace {
+        let mut ws = workspace();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        for (path, text) in files {
+            let uri = ws.virtual_url_generator.new_uri(path);
+            write(&mut ws, &uri, text);
+        }
+        ws
+    }
+    fn settled(ws: &VirtualWorkspace) -> Vec<String> {
+        let db = ws.analysis.compilation.get_db();
+        let mut settled = db
+            .get_type_index()
+            .iter_type_caches()
+            .map(|(owner, cache)| format!("{owner:?} = {:?}", cache.as_type()))
+            .chain(
+                db.get_dynamic_field_index()
+                    .iter_all_field_definitions()
+                    .flat_map(|(owner, fields)| {
+                        fields
+                            .keys()
+                            .map(move |field| format!("{owner:?} has {field}"))
+                    }),
+            )
+            .collect::<Vec<_>>();
+        settled.sort();
+        settled
+    }
+
+    let mut warm = gmod_workspace(&[BASE, MOTORCYCLE, DELETED]);
+    let deleted = warm.virtual_url_generator.new_uri(DELETED.0);
+    warm.analysis.update_file_by_uri(&deleted, None);
+    let cold = gmod_workspace(&[BASE, MOTORCYCLE]);
+
+    let warm = settled(&warm);
+    let cold = settled(&cold);
+    let only_warm = warm
+        .iter()
+        .filter(|line| !cold.contains(line))
+        .collect::<Vec<_>>();
+    let only_cold = cold
+        .iter()
+        .filter(|line| !warm.contains(line))
+        .collect::<Vec<_>>();
+    assert!(
+        only_warm.is_empty() && only_cold.is_empty(),
+        "warm only: {only_warm:#?}
+cold only: {only_cold:#?}"
+    );
+}
+
 /// A shift-only edit through the production edit path (`update_file_text_only`
 /// + `reindex_files`) must report only the edited file: a diagnosed reader of
 /// its exports reads nothing that moved.
