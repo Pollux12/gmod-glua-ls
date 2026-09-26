@@ -2931,12 +2931,11 @@ impl LuaTypeIndex {
                     .into_iter()
                     .flatten()
                     .filter(|decl_id| decl_id.file_id == *file_id)
-                    .map(|decl_id| u32::from(decl_id.position))
                     .collect::<Vec<_>>();
                 if decls.is_empty() {
                     return derivation::ABSENT;
                 }
-                decls.sort_unstable();
+                decls.sort_unstable_by_key(|decl_id| decl_id.position);
                 derivation::fingerprint_of(&decls)
             }
             FactKey::DeclClaim(decl_id) => {
@@ -2950,9 +2949,9 @@ impl LuaTypeIndex {
                 let sites = self.declaration_sites.get(file_id).map(|sites| {
                     let mut sites = sites
                         .iter()
-                        .map(|(range, decl_id)| ((range.start(), range.end()), decl_id))
+                        .map(|(range, decl_id)| (InFiled::new(*file_id, *range), decl_id))
                         .collect::<Vec<_>>();
-                    sites.sort_unstable_by_key(|(range, _)| *range);
+                    sites.sort_unstable_by_key(|(site, _)| (site.value.start(), site.value.end()));
                     sites
                 });
                 if namespace.is_none() && using.is_none() && types.is_none() && sites.is_none() {

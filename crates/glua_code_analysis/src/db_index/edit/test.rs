@@ -1221,7 +1221,7 @@ fn an_identity_remap_leaves_every_owner_alone() {
     );
 }
 
-const SHIFT_FIXTURE: [(&str, &str); 7] = [
+const SHIFT_FIXTURE: [(&str, &str); 8] = [
     (
         "lua/autorun/sh_shift_lib.lua",
         r#"---@class ShiftLib
@@ -1283,6 +1283,10 @@ print(ent:GetSpeed(), ent.Speed, ent.IsShiftVehicle, ent:GetDriver())
 ---@type ShiftTrace
 local trace
 print(trace.Entity)
+---@type ShiftBag
+local bag
+print(bag.size, bag.weight)
+local ns = require("lua.shiftns")
 "#,
     ),
     (
@@ -1312,6 +1316,9 @@ ShiftMode = mode
 function ShiftSwap(trace)
     trace.Entity = trace.Entity.Owner
 end
+---@class ShiftBag
+local ShiftBag = {}
+ShiftBag.size = 1
 "#,
     ),
     (
@@ -1335,6 +1342,18 @@ function ENT:GetSpeed() return self.Speed end
         r#"module("shiftmod", package.seeall)
 value = 1
 function get() return value end
+"#,
+    ),
+    (
+        "lua/shiftns.lua",
+        r#"---@namespace ShiftNs
+
+---@class ShiftNs.Thing
+local Thing = {}
+
+---@export namespace
+local M = { Thing = Thing }
+return M
 "#,
     ),
 ];
