@@ -11,7 +11,9 @@
 //! - `burst`: three edits of every target before one re-analysis, ending on
 //!   the edited text, so a single target shares the edit oracle.
 //! - `typing`: the edit typed one character at a time, each keystroke settled,
-//!   through every invalid text in between; shares the edit oracle.
+//!   through every invalid text in between; shares the edit oracle. Its reach
+//!   line is the union over keystrokes, followed by the largest reach of any
+//!   one keystroke.
 //! - `watch`: watched delete of each target (oracle: the file never existed),
 //!   then watched re-creation (oracle: cold build with the same new file ids).
 //! - `noop`: re-index each target with unchanged text; the oracle is the base.
@@ -2229,9 +2231,16 @@ impl Harness {
             let changed = edited(&original, find, replace);
             let mut warm = self.warm();
             let mut reach = Reach::default();
+            let (mut most_evaluated, mut most_affected) = (0, 0);
             for (version, text) in (1..).zip(typed_texts(&original, find, replace)) {
-                reach.extend(settle(&mut warm, &uri, file_id, text, version));
+                let step = settle(&mut warm, &uri, file_id, text, version);
+                most_evaluated = most_evaluated.max(step.evaluated.len());
+                most_affected = most_affected.max(step.affected.len());
+                reach.extend(step);
             }
+            println!(
+                "[reach typing[{relative}] per keystroke] evaluated<={most_evaluated} affected<={most_affected}"
+            );
             let input = ColdInput {
                 overrides: vec![(path, changed)],
                 ..ColdInput::default()
