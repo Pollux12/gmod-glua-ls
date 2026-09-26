@@ -415,7 +415,21 @@ pub fn bind_decl_write(
         }
         return Some(());
     }
-    let seeded = widen_mutable_decl_literal(db, &type_owner, type_cache.clone());
+    // Only a local's own initializer claims its empty slot: a later write that
+    // reached it first would hold it just until the initializer answered.
+    if db.get_type_index().get_type_cache(&type_owner).is_none()
+        && db
+            .get_decl_index()
+            .get_decl(&decl_id)
+            .and_then(|decl| decl.get_value_syntax_id())
+            .is_some_and(|initializer| initializer.get_range().start() < position)
+    {
+        return Some(());
+    }
+    // A local assigned after its declaration holds whatever it is assigned, so
+    // no single write's literal is its type, whichever route the write takes.
+    let type_cache = widen_mutable_decl_literal(db, &type_owner, type_cache);
+    let seeded = type_cache.clone();
     let seeds = match db.get_type_index().get_type_cache(&type_owner) {
         None => true,
         Some(existing) => {
@@ -453,17 +467,7 @@ pub fn bind_decl_write(
                     // whatever is in it was not put there by an ordered write.
                     None => false,
                     Some((claimed, claim_may_narrow)) => {
-                        // Source position arbitrates between two answers, not
-                        // between an answer and none. An earlier write that came
-                        // back undetermined -- an unresolve retry that still
-                        // cannot see through its initializer -- must not take the
-                        // slot from a later one that resolved, or the
-                        // declaration is left needing its type guessed from how
-                        // it is used.
-                        let displaces_an_answer = is_undetermined_type(seeded.as_type())
-                            && is_informative_type(existing.as_type());
                         position < claimed
-                            && !displaces_an_answer
                             && !claiming_write_would_have_won(
                                 &type_owner,
                                 &seeded,

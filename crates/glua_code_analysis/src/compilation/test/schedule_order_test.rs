@@ -116,6 +116,54 @@ end
         );
     }
 
+    #[test]
+    fn a_local_reassigned_after_reading_a_plain_table_field_settles_the_same_in_either_order() {
+        assert_schedule_independent(&[
+            (
+                "lua/aaa_annotations/physenv.lua",
+                "physenv = {}
+---@return table
+function physenv.GetPerformanceSettings() end
+",
+            ),
+            (
+                "lua/glide/server/util.lua",
+                "local maxVelocity = physenv.GetPerformanceSettings().MaxVelocity
+maxVelocity = 4000
+",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_local_whose_initializer_gives_up_and_a_later_assignment_answers_settles_the_same_in_either_order()
+     {
+        assert_schedule_independent(&[
+            (
+                "lua/glide/sh_repair.lua",
+                "Glide = Glide or {}
+",
+            ),
+            (
+                "lua/glide/sh_utils.lua",
+                "function Glide.ExpDecay(a, b, decay, dt)
+    return b + (a - b) * Exp(-decay * dt)
+end
+",
+            ),
+            (
+                "lua/entities/base_glide_car/cl_init.lua",
+                r#"local ExpDecay = Glide.ExpDecay
+local inertia = ExpDecay(lastInertia, self:GetEngineThrottle(), 1, dt)
+if inertia < lastInertia and inertia > 0.6 and self.rpmFraction > 0.5 then
+    inertia = 0
+end
+self.turboInertia = inertia
+"#,
+            ),
+        ]);
+    }
+
     fn assert_schedule_independent(files: &[(&str, &str)]) {
         let canonical = settled(Schedule::Canonical, files).expect("canonical order settles");
         let reversed = settled(Schedule::Reversed, files).expect("reversed order settles");
