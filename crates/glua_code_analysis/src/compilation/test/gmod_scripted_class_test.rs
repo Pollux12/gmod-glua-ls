@@ -2169,6 +2169,65 @@ end
         );
     }
 
+    /// A registered class is named by its id's last segment, like a doc class,
+    /// whichever site created its declaration.
+    #[gtest]
+    fn test_registered_namespaced_panel_class_is_named_by_its_last_segment() {
+        const REGISTER_PATH: &str = "plugins/contextmenu/derma/cl_singlestringentry.lua";
+        const REGISTER: &str = "local PANEL = {}
+function PANEL:SetText(text) end
+vgui.Register(\"FL.SingleStringEntry\", PANEL, \"EditablePanel\")
+";
+        let class_name = |ws: &mut VirtualWorkspace| {
+            ws.get_db_mut()
+                .get_type_index()
+                .get_type_decl(&LuaTypeDeclId::global("FL.SingleStringEntry"))
+                .expect("registered class")
+                .get_name()
+                .to_string()
+        };
+        for create_sites in [false, true] {
+            let mut ws = VirtualWorkspace::new();
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+            let mut files = vec![
+                (
+                    "lua/includes/builtins.lua",
+                    crate::GMOD_CALL_ARG_BUILTINS_FIXTURE,
+                ),
+                (
+                    "lua/includes/panels.lua",
+                    "---@class Panel
+---@class EditablePanel: Panel
+",
+                ),
+                (REGISTER_PATH, REGISTER),
+            ];
+            if create_sites {
+                files.push((
+                    "plugins/contextmenu/contexts/sh_admin.lua",
+                    "if CLIENT then
+    first_reason = vgui.Create(\"FL.SingleStringEntry\")
+    second_reason = vgui.Create(\"FL.SingleStringEntry\")
+end
+",
+                ));
+            }
+            ws.def_files(files);
+            assert_eq!(class_name(&mut ws), "SingleStringEntry", "{create_sites}");
+
+            ws.def_file(
+                REGISTER_PATH,
+                &format!(
+                    "{REGISTER}
+"
+                ),
+            );
+            assert_eq!(class_name(&mut ws), "SingleStringEntry", "{create_sites}");
+        }
+    }
+
     /// Verifies that `SWEP.Type = "nextbot"` does NOT inject `NextBot` as a
     /// super-type. The `Type` field on non-entity scripted classes has
     /// different semantics and should not trigger entity framework injection.
