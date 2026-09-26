@@ -134,10 +134,7 @@ struct LuaAnalyzer<'a> {
     special_call_direct_matcher: &'a call::SpecialCallDirectMatcher,
     member_collection_assignment_widening_cache:
         FxHashMap<MemberAssignmentWideningCacheKey, MemberWideningCache<LuaType>>,
-    /// Per dynamic-key slot, what this evaluation's writes add to its
-    /// collections, each with the member it was written through.
-    pending_dynamic_key_collection_widenings:
-        FxHashMap<DynamicKeyCollectionWideningKey, Vec<(Option<LuaMemberId>, LuaType)>>,
+    pending_dynamic_key_collection_widenings: FxHashMap<DynamicKeyCollectionWideningKey, LuaType>,
     guarded_table_assignment_type_cache: FxHashMap<MemberAssignmentWideningCacheKey, LuaType>,
     /// Whether each member is a guarded `x.y = x.y or {}` self-assignment.
     ///

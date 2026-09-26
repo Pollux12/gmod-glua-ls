@@ -2124,6 +2124,31 @@ return t
     }
 
     #[test]
+    fn rows_of_two_shapes_written_through_a_dynamic_key_keep_their_positions() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                local reports = {}
+
+                local function open(id)
+                    reports[id] = { "reporter", 1 }
+                end
+
+                local function claim(id)
+                    reports[id] = { "reporter", 1, true }
+                end
+
+                local function read(id)
+                    local report = reports[id]
+                    ---@type string
+                    local reporter = report[1]
+                end
+            "#
+        ));
+    }
+
+    #[test]
     fn test_annotated_tuple_member_collection_remains_strict() {
         let mut ws = VirtualWorkspace::new();
         assert!(!ws.check_code_for(
