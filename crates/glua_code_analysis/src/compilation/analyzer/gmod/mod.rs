@@ -6414,16 +6414,11 @@ fn find_decl_initializer_table_range(
 /// the original `local PANEL`. Used to keep the single-panel decl-binding
 /// compatibility path from contaminating reused locals.
 fn decl_has_reassignment(db: &DbIndex, file_id: FileId, decl_id: LuaDeclId) -> bool {
-    let decl_position = decl_id.position;
     db.get_reference_index()
         .get_decl_references(&file_id, &decl_id)
-        .map(|decl_references| {
-            decl_references
-                .cells
-                .iter()
-                .any(|cell| cell.is_write && cell.range.start() != decl_position)
+        .is_some_and(|decl_references| {
+            decl_references.is_written_after_declaration(decl_id.position)
         })
-        .unwrap_or(false)
 }
 
 /// Check if a member at the given position was defined using a specific

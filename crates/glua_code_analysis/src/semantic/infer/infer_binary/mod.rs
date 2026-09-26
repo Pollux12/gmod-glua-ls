@@ -1,13 +1,13 @@
 mod infer_binary_and;
 mod infer_binary_or;
 
-use glua_parser::{BinaryOperator, LuaBinaryExpr, LuaExpr, LuaIndexKey};
+use glua_parser::{BinaryOperator, LuaAstNode, LuaBinaryExpr, LuaExpr, LuaIndexKey, LuaNameExpr};
 use infer_binary_and::{infer_binary_expr_and, special_and_rule};
 use infer_binary_or::{infer_binary_expr_or, special_or_rule};
 use smol_str::SmolStr;
 
 use crate::{
-    LuaInferCache, TypeOps, check_type_compact,
+    FileId, LuaInferCache, TypeOps, check_type_compact,
     db_index::{DbIndex, LuaOperatorMetaMethod, LuaType},
     get_real_type,
 };
@@ -72,6 +72,17 @@ pub fn infer_binary_expr(
         }
     };
     let right_type = infer_expr(db, cache, right.clone())?;
+    let (left_type, right_type) = if folds_constants(op)
+        && !(is_constant_expr(db, cache.get_file_id(), &left)
+            && is_constant_expr(db, cache.get_file_id(), &right))
+    {
+        (
+            crate::db_index::widen_literal_type_for_assignment(&left_type),
+            crate::db_index::widen_literal_type_for_assignment(&right_type),
+        )
+    } else {
+        (left_type, right_type)
+    };
     let real_left_type = get_real_type(db, &left_type);
     let real_right_type = get_real_type(db, &right_type);
     let left_type_ref = real_left_type.unwrap_or(&left_type);
@@ -105,6 +116,69 @@ pub fn infer_binary_expr(
         (false, false) => (left_type, right_type),
     };
     infer_binary_expr_type(db, left_ty, right_ty, op)
+}
+
+fn folds_constants(op: BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::OpAdd
+            | BinaryOperator::OpSub
+            | BinaryOperator::OpMul
+            | BinaryOperator::OpDiv
+            | BinaryOperator::OpIDiv
+            | BinaryOperator::OpMod
+            | BinaryOperator::OpPow
+            | BinaryOperator::OpConcat
+    )
+}
+
+/// Whether `expr` has the same value every time it runs: literals and
+/// operators over them, read directly or through a local only its initializer
+/// assigns. Only such operands fold to a constant. A constant read from a
+/// variable or field is the value one run left there, and folding it would let
+/// a value computed from its own previous value count up without end.
+fn is_constant_expr(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::LiteralExpr(_) => true,
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .is_some_and(|inner| is_constant_expr(db, file_id, &inner)),
+        LuaExpr::UnaryExpr(unary) => unary
+            .get_expr()
+            .is_some_and(|inner| is_constant_expr(db, file_id, &inner)),
+        LuaExpr::BinaryExpr(binary) => binary.get_exprs().is_some_and(|(left, right)| {
+            is_constant_expr(db, file_id, &left) && is_constant_expr(db, file_id, &right)
+        }),
+        LuaExpr::NameExpr(name) => constant_local_initializer(db, file_id, name)
+            .is_some_and(|initializer| is_constant_expr(db, file_id, &initializer)),
+        _ => false,
+    }
+}
+
+/// The initializer of the local `name` reads, when nothing else assigns it.
+fn constant_local_initializer(
+    db: &DbIndex,
+    file_id: FileId,
+    name: &LuaNameExpr,
+) -> Option<LuaExpr> {
+    let decl = db
+        .get_decl_index()
+        .get_decl_tree(&file_id)?
+        .find_local_decl(&name.get_name_text()?, name.get_position())?;
+    if !decl.is_local()
+        || db
+            .get_reference_index()
+            .get_decl_references(&file_id, &decl.get_id())
+            .is_some_and(|references| references.is_written_after_declaration(decl.get_position()))
+    {
+        return None;
+    }
+    let root = name.syntax().ancestors().last()?;
+    LuaExpr::cast(
+        decl.get_initializer()?
+            .get_expr_syntax_id()
+            .to_node_from_root(&root)?,
+    )
 }
 
 fn infer_union_binary_expr(

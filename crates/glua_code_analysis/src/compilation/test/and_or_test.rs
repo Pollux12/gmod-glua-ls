@@ -292,4 +292,36 @@ mod test {
         let a = ws.expr_ty("a");
         assert_eq!(ws.humanize_type(a), "string");
     }
+
+    #[test]
+    fn arithmetic_over_constants_folds_and_over_a_field_read_does_not() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            local SIZE = 4
+            local PREFIX = "gm_"
+            area = SIZE * SIZE
+            menu = PREFIX .. "menu"
+            local counts = {}
+            counts.total = 1
+            next_total = counts.total + 1
+            "#,
+        );
+
+        let area = ws.expr_ty("area");
+        let menu = ws.expr_ty("menu");
+        let next_total = ws.expr_ty("next_total");
+        assert_eq!(
+            (
+                ws.humanize_type(area),
+                ws.humanize_type(menu),
+                ws.humanize_type(next_total)
+            ),
+            (
+                "16".to_string(),
+                "\"gm_menu\"".to_string(),
+                "integer".to_string()
+            )
+        );
+    }
 }

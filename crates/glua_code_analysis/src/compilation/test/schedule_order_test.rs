@@ -215,6 +215,28 @@ LeyHitreg = LeyHitreg or {}
         ]);
     }
 
+    #[test]
+    fn a_table_element_counted_up_through_a_local_settles() {
+        assert!(
+            settled(
+                Schedule::Canonical,
+                &[(
+                    "gamemodes/helix/gamemode/core/derma/cl_business.lua",
+                    r#"local Shop = {}
+function Shop:Init()
+    self.cart = {}
+end
+function Shop:BuyItem(uniqueID)
+    local currentCount = self.cart[uniqueID] or 0
+    self.cart[uniqueID] = currentCount + 1
+end
+"#,
+                )],
+            )
+            .is_some()
+        );
+    }
+
     fn assert_schedule_independent(files: &[(&str, &str)]) {
         let canonical = settled(Schedule::Canonical, files).expect("canonical order settles");
         let reversed = settled(Schedule::Reversed, files).expect("reversed order settles");

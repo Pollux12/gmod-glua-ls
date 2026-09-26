@@ -1,4 +1,4 @@
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::db_index::LuaDeclId;
@@ -94,5 +94,13 @@ impl DeclReference {
         }
 
         self.cells.push(cell);
+    }
+
+    /// Whether anything but its declaration at `decl_position` writes the
+    /// variable.
+    pub fn is_written_after_declaration(&self, decl_position: TextSize) -> bool {
+        self.cells
+            .iter()
+            .any(|cell| cell.is_write && cell.range.start() != decl_position)
     }
 }
