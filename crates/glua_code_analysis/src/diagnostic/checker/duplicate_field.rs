@@ -202,7 +202,7 @@ fn check_decl_duplicate_field(
         // 2. 检查 ---@field 成员
         let field_decls = member_infos
             .iter()
-            .filter(|info| info.feature.is_field_decl())
+            .filter(|info| info.feature.is_field_decl() && is_doc_field_tag(info.member))
             .collect::<Vec<_>>();
         // 如果 field_decls 数量大于1，则进一步检查
         if field_decls.len() > 1 {
@@ -232,6 +232,16 @@ fn check_decl_duplicate_field(
     }
 
     Some(())
+}
+
+/// Whether `member` is a field a doc tag declares. Members the analysis
+/// synthesizes (a registered panel's `BaseClass`, module and global-path
+/// members) share the field-declaration feature but no author wrote them.
+fn is_doc_field_tag(member: &LuaMember) -> bool {
+    matches!(
+        member.get_syntax_id().get_kind(),
+        LuaSyntaxKind::DocTagField | LuaSyntaxKind::DocEnumField
+    )
 }
 
 /// 特殊处理: require("a").fun = function() end
