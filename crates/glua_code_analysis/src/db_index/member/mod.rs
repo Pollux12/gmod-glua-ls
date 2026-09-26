@@ -1422,11 +1422,15 @@ impl LuaMemberIndex {
         id: LuaMemberId,
     ) -> Option<()> {
         self.note_derived_owner(id, &owner);
-        let owner = self
-            .effective_path_member_owner(id, &owner)
-            .unwrap_or(owner);
-        self.note_member_path_provenance(id, &owner);
-        self.record_member_owner(owner, file_id, id)
+        // Where the member is filed is the index's own placement, as in
+        // `file_member`: a later class binding or site registration re-homes it.
+        derivation::untracked(|| {
+            let owner = self
+                .effective_path_member_owner(id, &owner)
+                .unwrap_or(owner);
+            self.note_member_path_provenance(id, &owner);
+            self.record_member_owner(owner, file_id, id)
+        })
     }
 
     /// The filing half of [`Self::set_member_owner`], without the provenance
@@ -1859,7 +1863,9 @@ impl LuaMemberIndex {
         }
         Self::note_canonical_write(path, None, &[old.as_ref(), winner.as_ref()]);
         self.bump_homing_revision();
-        match winner {
+        // Moving the members is the index's own placement: whichever write
+        // changed the candidates did not read where they lived.
+        derivation::untracked(|| match winner {
             Some(winner) => {
                 self.global_path_class_owner
                     .insert(path.clone(), LuaMemberOwner::Type(winner.clone()));
@@ -1873,7 +1879,7 @@ impl LuaMemberIndex {
                     &LuaMemberOwner::GlobalPath(path.clone()),
                 );
             }
-        }
+        })
     }
 
     /// Moves the members of `path` between its two homes: from the path slot

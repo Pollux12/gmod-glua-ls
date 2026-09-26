@@ -200,4 +200,19 @@ function WriteCityName(value) end
 
         assert_eq!(ws.analysis.compilation.last_stats().rebuilt_sources, 0);
     }
+
+    /// The standard library, loaded before the workspace, binds `string` to
+    /// its class; a workspace file initialising `string` again adds a
+    /// definition site. Where the path's members live is the member index's
+    /// own placement, so the library's source layer stands.
+    #[test]
+    fn a_workspace_file_initialising_a_library_global_rebuilds_no_library_source() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "gamemodes/cityrp/gamemode/core/sh_string.lua",
+            "string = {}\nfunction string.Explode(separator, str) end\n",
+        );
+
+        assert_eq!(ws.analysis.compilation.last_stats().rebuilt_sources, 0);
+    }
 }
