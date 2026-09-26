@@ -1155,6 +1155,50 @@ mod test {
         assert_domain(&mut ws);
     }
 
+    /// A write-back through any loop over the same table is feedback, not
+    /// just one through the loop deriving the domain: two files each writing
+    /// `radios[k] = …` inside their own `for k in pairs(radios)` must not feed
+    /// each other's key domain.
+    #[test]
+    fn pairs_self_writes_in_two_files_keep_the_key_domain_they_write_back() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let set_radio = |name: &str| {
+            format!(
+                "function {name}(radio, station)
+    for k, v in pairs(radios) do
+        if radio == v.RadioEnt then
+            radios[k] = {{ station = station, RadioEnt = radio }}
+        end
+    end
+    radios[RadioNum] = {{ station = station, RadioEnt = radio }}
+    RadioNum = RadioNum + 1
+end
+"
+            )
+        };
+        let admin = format!(
+            "radios = {{}}
+RadioNum = 0
+{}",
+            set_radio("AdminRadioSet")
+        );
+        let plugin = set_radio("PluginRadioSet");
+        let file_ids = ws.def_files(vec![
+            ("lua/autorun/server/sv_radioadmin.lua", admin.as_str()),
+            ("lua/autorun/server/sv_radio.lua", plugin.as_str()),
+        ]);
+
+        let key_types = file_ids
+            .iter()
+            .map(|file_id| settled_assign_decl_cached_ty(&mut ws, *file_id, "k"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            key_types,
+            vec![Some(LuaType::Integer), Some(LuaType::Integer)]
+        );
+    }
+
     /// The same write is genuine evidence when the key is unknowable on its
     /// own: `k` reassigned from an untyped call result before `T[k] = v` must
     /// still file an `ExprType(Unknown)` member on `T`. Filtering

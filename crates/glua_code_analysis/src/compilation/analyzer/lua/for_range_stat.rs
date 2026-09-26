@@ -1,11 +1,13 @@
-use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaIndexExpr, LuaIndexKey};
+use glua_parser::{
+    LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaIndexExpr, LuaIndexKey, PathTrait,
+};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
     DbIndex, FileId, FuncGenericBinding, FuncGenericBindingState, GenericTplId, InferFailReason,
-    LuaAliasCallKind, LuaAliasCallType, LuaDeclId, LuaInferCache, LuaMemberInfo, LuaMemberKey,
-    LuaMemberOwner, LuaObjectType, LuaOperatorMetaMethod, LuaSemanticDeclId, LuaType, LuaTypeCache,
-    TplContext, TypeOps, TypeSubstitutor, VariadicType,
+    LuaAliasCallKind, LuaAliasCallType, LuaDeclId, LuaInferCache, LuaMemberId, LuaMemberInfo,
+    LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaOperatorMetaMethod, LuaSemanticDeclId, LuaType,
+    LuaTypeCache, TplContext, TypeOps, TypeSubstitutor, VariadicType,
     compilation::analyzer::{
         common::{TypeCacheWriteMode, write_type_cache},
         dynamic_field::for_range_pairs_source_for_var,
@@ -489,60 +491,22 @@ fn try_infer_pairs_iter_types_from_table_members(
     // the table's key domain. Which samples are in the map depends on how far
     // inference had progressed, so the keys are reported by kind.
     //
-    // A member filed by writing the iterated table back through this loop's
-    // own key variable (`T[k] = v` inside `for k in pairs(T)`) is feedback,
-    // not evidence: its key was minted from the loop variable's settling
-    // answer, so counting it would widen the very domain being derived. Such
-    // a member is excluded from the key domain — and from the sampling
-    // decision — only when every writer under the key is one of these
-    // self-writes and the key variable was not reassigned before the write;
-    // a reassigned key or an independent writer under the same key is real
-    // computed-key evidence.
-    let file_id = cache.get_file_id();
-    let key_decl_id = iter_expr
-        .syntax()
-        .ancestors()
-        .find_map(LuaForRangeStat::cast)
-        .and_then(|for_range| for_range.get_var_name_list().next())
-        .map(|name| LuaDeclId::new(file_id, name.get_position()));
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&file_id)
-        .map(|tree| tree.get_red_root());
+    // A member filed by writing an iterated table back through a loop's own
+    // key variable (`T[k] = v` inside `for k in pairs(T)`, in this loop or any
+    // other over `T`) is feedback, not evidence: its key was minted from that
+    // loop variable's settling answer, which is this very domain, so counting
+    // it would widen the domain being derived. Such a member is excluded from
+    // the key domain — and from the sampling decision — only when every
+    // writer under the key is one of these write-backs and its key variable
+    // was not reassigned before the write; a reassigned key or an independent
+    // writer under the same key is real computed-key evidence.
     let self_write_only = |member_infos: &[LuaMemberInfo]| {
-        let (Some(key_decl_id), Some(root)) = (key_decl_id, root.as_ref()) else {
-            return false;
-        };
         !member_infos.is_empty()
             && member_infos.iter().all(|member| {
-                let Some(LuaSemanticDeclId::Member(member_id)) = &member.property_owner_id else {
-                    return false;
-                };
-                if member_id.file_id != file_id {
-                    return false;
-                }
-                let Some(index_expr) = member_id
-                    .get_syntax_id()
-                    .to_node_from_root(root)
-                    .and_then(LuaIndexExpr::cast)
-                else {
-                    return false;
-                };
-                let Some(LuaIndexKey::Expr(LuaExpr::NameExpr(name_expr))) =
-                    index_expr.get_index_key()
-                else {
-                    return false;
-                };
-                let Some(source) = for_range_pairs_source_for_var(db, file_id, &name_expr, 0)
-                else {
-                    return false;
-                };
-                if source.iter_decl_id != key_decl_id {
-                    return false;
-                }
-                db.get_reference_index()
-                    .first_local_reassignment(file_id, &key_decl_id)
-                    .is_none_or(|position| position >= index_expr.get_position())
+                matches!(
+                    &member.property_owner_id,
+                    Some(LuaSemanticDeclId::Member(member_id)) if is_pairs_write_back(db, member_id)
+                )
             })
     };
     for (_, member_infos, self_feedback) in &mut member_entries {
@@ -595,6 +559,43 @@ fn try_infer_pairs_iter_types_from_table_members(
     ]);
 
     Ok(Some(iter_types))
+}
+
+/// Whether `member_id` writes a table back through the key variable of a
+/// `pairs` loop over that same table, unreassigned before the write.
+fn is_pairs_write_back(db: &DbIndex, member_id: &LuaMemberId) -> bool {
+    let file_id = member_id.file_id;
+    let syntax_id = member_id.get_syntax_id();
+    let Some(index_expr) = db
+        .get_vfs()
+        .syntax_tree_around(&file_id, syntax_id.get_range())
+        .and_then(|tree| syntax_id.to_node_from_root(&tree.get_red_root()))
+        .and_then(LuaIndexExpr::cast)
+    else {
+        return false;
+    };
+    let Some(LuaIndexKey::Expr(LuaExpr::NameExpr(key_name))) = index_expr.get_index_key() else {
+        return false;
+    };
+    let Some(source) = for_range_pairs_source_for_var(db, file_id, &key_name, 0) else {
+        return false;
+    };
+    let written_table = index_expr
+        .get_prefix_expr()
+        .and_then(|prefix| access_path(&prefix));
+    written_table.is_some_and(|path| access_path(&source.source_expr) == Some(path))
+        && db
+            .get_reference_index()
+            .first_local_reassignment(file_id, &source.iter_decl_id)
+            .is_none_or(|position| position >= index_expr.get_position())
+}
+
+fn access_path(expr: &LuaExpr) -> Option<smol_str::SmolStr> {
+    match expr {
+        LuaExpr::NameExpr(name) => name.get_access_path(),
+        LuaExpr::IndexExpr(index) => index.get_access_path(),
+        _ => None,
+    }
 }
 
 fn infer_table_projection_key_type(db: &DbIndex, inner: &LuaType) -> LuaType {
