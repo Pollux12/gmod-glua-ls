@@ -663,10 +663,11 @@ impl Engine {
         touched: &mut FxHashSet<HashedKey>,
         step: impl Fn() -> String,
     ) {
-        for key in touched
-            .iter()
-            .chain(evaluations.iter().flat_map(derivation::Evaluation::outputs))
-        {
+        for key in touched.iter().chain(
+            evaluations
+                .iter()
+                .flat_map(|evaluation| evaluation.outputs().chain(evaluation.moved())),
+        ) {
             db.reader_graph().forget_fingerprint(key);
             self.before_edits.borrow_mut().remove(key);
         }
@@ -676,6 +677,7 @@ impl Engine {
         let mut graph = std::mem::take(db.reader_graph_mut());
         let mut released = Vec::new();
         for evaluation in evaluations {
+            touched.extend(evaluation.moved().cloned());
             let (id, mut slots, reads, outputs) = evaluation.into_recorded();
             slots.extend(reads.into_iter().map(|key| graph.intern_read(key)));
             // A resumed evaluation read some keys both before and after the

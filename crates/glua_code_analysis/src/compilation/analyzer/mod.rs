@@ -204,7 +204,9 @@ fn replace_files(
         derivation::DerivationKind::Source,
     ));
     db.remove_index(file_ids.to_vec());
-    let (_, _, removed) = derivation::end().into_parts(|_| derivation::ABSENT);
+    let removal = derivation::end();
+    touched.extend(removal.moved().cloned());
+    let (_, _, removed) = removal.into_parts(|_| derivation::ABSENT);
     touched.extend(removed);
 
     let live = file_ids
@@ -380,7 +382,9 @@ fn document_source(
     local_inference::prepare_inferred_positive_guards(db, &context);
     run_analysis::<flow::FlowAnalysisPipeline>(db, &mut context);
     function_summary::index_function_summaries(db, file_id);
-    let (id, reads, outputs) = derivation::end().into_parts(|key| db.fact_fingerprint(key));
+    let evaluation = derivation::end();
+    let moved = evaluation.moved().cloned().collect::<Vec<_>>();
+    let (id, reads, outputs) = evaluation.into_parts(|key| db.fact_fingerprint(key));
     let reads = reads
         .into_iter()
         .map(|(key, seen)| (key, Some(seen)))
@@ -388,7 +392,7 @@ fn document_source(
     db.reader_graph_mut()
         .replace(id, reads, outputs.clone(), |_| derivation::ABSENT);
     (
-        outputs,
+        outputs.into_iter().chain(moved).collect(),
         std::mem::take(&mut context.inferred_guard_candidates),
     )
 }

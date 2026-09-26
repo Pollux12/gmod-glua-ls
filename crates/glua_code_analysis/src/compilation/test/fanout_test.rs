@@ -215,4 +215,35 @@ function WriteCityName(value) end
 
         assert_eq!(ws.analysis.compilation.last_stats().rebuilt_sources, 0);
     }
+
+    /// `---@class Glide` moves every `Glide.*` member onto the class,
+    /// including the ones another file writes. Re-indexing that other file
+    /// files its members onto the class again by itself, so the class's file
+    /// is not re-analysed.
+    #[test]
+    fn re_indexing_a_file_that_writes_a_class_bound_global_re_runs_only_that_file() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let files = ws.def_files(vec![
+            (
+                "lua/autorun/sh_glide.lua",
+                "---@class Glide\nGlide = Glide or {}\nGlide.VEHICLE_TYPE = {}\n",
+            ),
+            (
+                "lua/glide/sh_lighting_api.lua",
+                "Glide.Lighting = Glide.Lighting or {}\nlocal adapters = Glide.Lighting\n",
+            ),
+        ]);
+        let lighting = files[1];
+
+        ws.analysis.reindex_files(vec![lighting]);
+
+        assert_eq!(ws.analysis.compilation.last_stats().rebuilt_sources, 0);
+        assert_eq!(
+            ws.analysis.compilation.last_evaluated_files(),
+            vec![lighting]
+        );
+    }
 }

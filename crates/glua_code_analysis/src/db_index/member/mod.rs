@@ -1864,21 +1864,28 @@ impl LuaMemberIndex {
         Self::note_canonical_write(path, None, &[old.as_ref(), winner.as_ref()]);
         self.bump_homing_revision();
         // Moving the members is the index's own placement: whichever write
-        // changed the candidates did not read where they lived.
-        derivation::untracked(|| match winner {
-            Some(winner) => {
-                self.global_path_class_owner
-                    .insert(path.clone(), LuaMemberOwner::Type(winner.clone()));
-                self.rehome_global_path_class(path, old.as_ref(), &LuaMemberOwner::Type(winner));
-            }
-            None => {
-                self.global_path_class_owner.remove(path);
-                self.rehome_global_path_class(
-                    path,
-                    old.as_ref(),
-                    &LuaMemberOwner::GlobalPath(path.clone()),
-                );
-            }
+        // changed the candidates did not read where they lived, nor produce
+        // them.
+        derivation::untracked(|| {
+            derivation::rehoming(|| match winner {
+                Some(winner) => {
+                    self.global_path_class_owner
+                        .insert(path.clone(), LuaMemberOwner::Type(winner.clone()));
+                    self.rehome_global_path_class(
+                        path,
+                        old.as_ref(),
+                        &LuaMemberOwner::Type(winner),
+                    );
+                }
+                None => {
+                    self.global_path_class_owner.remove(path);
+                    self.rehome_global_path_class(
+                        path,
+                        old.as_ref(),
+                        &LuaMemberOwner::GlobalPath(path.clone()),
+                    );
+                }
+            })
         })
     }
 

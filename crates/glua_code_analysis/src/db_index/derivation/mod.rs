@@ -762,6 +762,8 @@ pub struct Evaluation {
     /// Cheap identities of keys already in `reads`, see [`note_read_by`].
     read_identities: rustc_hash::FxHashMap<(u8, u128), KeyIdx>,
     outputs: FxHashSet<HashedKey>,
+    /// Keys the evaluation re-filed without producing them, see [`rehoming`].
+    moved: FxHashSet<HashedKey>,
     /// Fingerprints taken when an earlier stage of a staged evaluation ended:
     /// other evaluations write between its stages.
     staged: rustc_hash::FxHashMap<HashedKey, Fingerprint>,
@@ -771,6 +773,12 @@ impl Evaluation {
     /// The keys the evaluation wrote.
     pub fn outputs(&self) -> impl Iterator<Item = &HashedKey> {
         self.outputs.iter()
+    }
+
+    /// The keys the evaluation re-filed without producing them: their readers
+    /// are re-checked, but the evaluation is not one of their producers.
+    pub fn moved(&self) -> impl Iterator<Item = &HashedKey> {
+        self.moved.iter()
     }
 
     /// Fingerprints the reads made so far, for an evaluation suspended while
@@ -874,6 +882,7 @@ thread_local! {
     /// Evaluations suspended on this thread by one begun inside them.
     static SUSPENDED: RefCell<Vec<Evaluation>> = const { RefCell::new(Vec::new()) };
     static UNTRACKED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static REHOMING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static WRITE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CAPTURED: RefCell<Option<FxHashSet<HashedKey>>> = const { RefCell::new(None) };
     static NOTED_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -909,6 +918,18 @@ pub fn untracked<T>(f: impl FnOnce() -> T) -> T {
     result
 }
 
+/// Runs `f` with its writes recorded as moves, not outputs. For an index
+/// re-filing facts other derivations produced, when the index keeps that
+/// placement consistent itself whatever the order of writes: the moved facts'
+/// readers are re-checked, but the current derivation does not become one of
+/// their producers.
+pub fn rehoming<T>(f: impl FnOnce() -> T) -> T {
+    REHOMING.with(|depth| depth.set(depth.get() + 1));
+    let result = f();
+    REHOMING.with(|depth| depth.set(depth.get() - 1));
+    result
+}
+
 /// Lends `table` to this thread: evaluations begun until [`take_keys`]
 /// intern their reads as they make them.
 pub fn lend_keys(table: KeyTable) {
@@ -939,6 +960,7 @@ pub fn begin(id: DerivationId) {
         reads: FxHashSet::default(),
         read_identities: rustc_hash::FxHashMap::default(),
         outputs: FxHashSet::default(),
+        moved: FxHashSet::default(),
         staged: rustc_hash::FxHashMap::default(),
     });
 }
@@ -1236,7 +1258,11 @@ pub fn note_write(key: impl FnOnce() -> FactKey) {
                     table.mark_written(&key, written);
                 }
             });
-            evaluation.outputs.insert(key);
+            if REHOMING.with(|depth| depth.get() > 0) {
+                evaluation.moved.insert(key);
+            } else {
+                evaluation.outputs.insert(key);
+            }
         } else {
             CAPTURED.with(|captured| {
                 if let Some(captured) = captured.borrow_mut().as_mut() {
