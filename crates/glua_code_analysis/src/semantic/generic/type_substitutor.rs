@@ -103,8 +103,9 @@ impl TypeSubstitutor {
     /// template the arms bind alike takes that binding, a type they bind
     /// differently takes the union of those types, and parameter or result
     /// lists they bind differently stay unbound, since no one instantiation
-    /// stands for every arm.
+    /// stands for every arm. An arm that leaves a list unbound bound it empty.
     pub fn merge_union_arm_bindings(&mut self, arms: Vec<TypeSubstitutor>) {
+        let arm_count = arms.len();
         let mut bound: HashMap<GenericTplId, Vec<SubstitutorValue>> = HashMap::default();
         for arm in arms {
             for (tpl_id, value) in arm.tpl_replace_map {
@@ -115,6 +116,10 @@ impl TypeSubstitutor {
         }
         for (tpl_id, values) in bound {
             let first = &values[0];
+            let is_list = !matches!(first, SubstitutorValue::Type(_));
+            if is_list && values.len() < arm_count {
+                continue;
+            }
             if values.iter().all(|value| value == first) {
                 self.tpl_replace_map.insert(tpl_id, first.clone());
                 continue;

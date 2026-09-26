@@ -3345,6 +3345,31 @@ mod test {
     }
 
     #[test]
+    fn pcall_accepts_functions_returning_different_numbers_of_values() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            local ops = {}
+
+            ---@param a number
+            ---@return boolean?, boolean, boolean
+            function ops.button(a) return nil, true, true end
+
+            ---@param a number
+            function ops.rect(a) end
+
+            ---@param op string
+            local function run(op)
+                local fn = ops[op]
+                if not fn then return end
+                local r, e = pcall(fn, 1)
+            end
+            "#
+        ));
+    }
+
+    #[test]
     fn pcall_accepts_a_union_of_functions() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(ws.check_code_for(
