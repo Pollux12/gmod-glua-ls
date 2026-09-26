@@ -364,7 +364,7 @@ impl LuaMemberIndex {
                 .map_or(ABSENT, |members| {
                     members
                         .values()
-                        .map(|id| fingerprint_of(id))
+                        .map(fingerprint_of)
                         .fold(ABSENT, Fingerprint::wrapping_add)
                 }),
             FactKey::MemberKey(key) => self.key_fingerprints.get(key).copied().unwrap_or(ABSENT),
