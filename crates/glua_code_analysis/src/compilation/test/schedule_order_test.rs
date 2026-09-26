@@ -5,7 +5,8 @@ mod test {
 
     use crate::{Emmyrc, GMOD_CALL_ARG_BUILTINS_FIXTURE, Schedule, VirtualWorkspace};
 
-    /// Every type cache, dynamic field, net flow and the semantic digest of `files`
+    /// Every type cache, type declaration, dynamic field, net flow and the semantic
+    /// digest of `files`
     /// cold-built in one batch under `schedule`, as sorted text; `None` when
     /// the build does not settle within a generous bound.
     fn settled(schedule: Schedule, files: &[(&str, &str)]) -> Option<Vec<String>> {
@@ -56,6 +57,15 @@ mod test {
                             }),
                     )
                     .collect::<Vec<_>>();
+                settled.extend(db.get_type_index().iter_type_decls().map(|decl| {
+                    let mut locations = decl
+                        .get_locations()
+                        .iter()
+                        .map(|location| format!("{location:?}"))
+                        .collect::<Vec<_>>();
+                    locations.sort();
+                    format!("{:?} at {locations:?}", decl.get_id())
+                }));
                 let network = db.get_gmod_network_index();
                 settled.extend(
                     network
@@ -160,6 +170,24 @@ if inertia < lastInertia and inertia > 0.6 and self.rpmFraction > 0.5 then
 end
 self.turboInertia = inertia
 "#,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_panel_class_two_plugins_register_keeps_both_sites_in_either_order() {
+        const REGISTER: &str = "local PANEL = {}
+vgui.Register(\"PlayerBanButton\", PANEL, \"DButton\")
+";
+        assert_schedule_independent(&[
+            ("lua/includes/builtins.lua", GMOD_CALL_ARG_BUILTINS_FIXTURE),
+            (
+                "gamemodes/cityrp/plugins/characterintroductions/ui/cl_admin_buttons.lua",
+                REGISTER,
+            ),
+            (
+                "gamemodes/cityrp/plugins/scoreboardplugin/ui/cl_admin_buttons.lua",
+                REGISTER,
             ),
         ]);
     }
