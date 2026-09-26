@@ -93,6 +93,10 @@ pub struct BranchLabelInfo {
     /// This lets the flow walk skip branch merges for variables unrelated to
     /// assignments and inner conditions in the branch.
     pub narrowing_capability: FileNarrowingCapability,
+    /// The part of `narrowing_capability` the branches write rather than only
+    /// test: a variable outside it keeps the value it had at
+    /// `common_predecessor` on every branch, narrowed at most.
+    pub written_capability: FileNarrowingCapability,
 }
 
 #[derive(Debug, Clone, Default, Hash)]

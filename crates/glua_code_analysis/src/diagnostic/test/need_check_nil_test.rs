@@ -15106,6 +15106,28 @@ mod test {
         assert_that!(need_check_nil_for_file(&mut ws, file_id), is_empty());
     }
 
+    /// The `if` only tests `state` (its body narrows it further but never
+    /// writes it), so past the `if` it is the unknown `wheel.state` it was.
+    #[gtest]
+    fn an_if_that_only_tests_an_unknown_value_does_not_make_it_nullable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            local function Update(wheel)
+                local state = wheel.state
+                if state then
+                    if state.groundAngularVelocity then
+                        print(state.groundAngularVelocity)
+                    end
+                end
+                return state.distributionFactor
+            end
+        "#;
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
+    }
+
     #[gtest]
     fn a_client_only_guard_leaves_the_server_path_with_a_nil_client() {
         let mut ws = gmod_ws();

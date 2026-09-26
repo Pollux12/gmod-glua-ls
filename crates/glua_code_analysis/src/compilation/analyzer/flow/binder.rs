@@ -23,11 +23,19 @@ pub struct ModificationSnapshot {
 }
 
 #[derive(Debug, Clone)]
-enum NarrowingEvent {
+enum NarrowingTarget {
     Name(ArcIntern<SmolStr>),
     IndexPath(ArcIntern<SmolStr>),
     OpaqueName,
     OpaqueIndex,
+}
+
+#[derive(Debug, Clone)]
+struct NarrowingEvent {
+    target: NarrowingTarget,
+    /// Recorded from a condition, which narrows its references without
+    /// writing them.
+    from_condition: bool,
 }
 
 #[derive(Debug)]
@@ -283,23 +291,38 @@ impl<'a> FlowBinder<'a> {
         &self,
         snap: ModificationSnapshot,
     ) -> FileNarrowingCapability {
+        self.capability_since(snap, true)
+    }
+
+    /// Names and index paths written (assigned, cast, or defined as a
+    /// function) since `snap`, leaving out the ones conditions only narrow.
+    pub fn written_capability_since(&self, snap: ModificationSnapshot) -> FileNarrowingCapability {
+        self.capability_since(snap, false)
+    }
+
+    fn capability_since(
+        &self,
+        snap: ModificationSnapshot,
+        include_conditions: bool,
+    ) -> FileNarrowingCapability {
         let mut capability = FileNarrowingCapability::default();
         for event in self
             .narrowing_events
             .iter()
             .skip(snap.narrowing_event_count)
+            .filter(|event| include_conditions || !event.from_condition)
         {
-            match event {
-                NarrowingEvent::Name(name) => {
+            match &event.target {
+                NarrowingTarget::Name(name) => {
                     capability.referenced_names.insert(name.clone());
                 }
-                NarrowingEvent::IndexPath(path) => {
+                NarrowingTarget::IndexPath(path) => {
                     capability.referenced_index_paths.insert(path.clone());
                 }
-                NarrowingEvent::OpaqueName => {
+                NarrowingTarget::OpaqueName => {
                     capability.has_opaque_name_target = true;
                 }
-                NarrowingEvent::OpaqueIndex => {
+                NarrowingTarget::OpaqueIndex => {
                     capability.has_opaque_index_target = true;
                 }
             }
@@ -327,53 +350,76 @@ impl<'a> FlowBinder<'a> {
     /// Record a bare name that can be narrowed at some site (assignment target,
     /// cast, or condition expression).
     pub fn record_narrowable_name(&mut self, name: &str) {
-        let name = crate::db_index::intern_smol_str(name);
-        self.narrowing_capability
-            .referenced_names
-            .insert(name.clone());
-        self.narrowing_events.push(NarrowingEvent::Name(name));
+        self.record_name(name, false);
     }
 
     /// Record an index access path that can be narrowed.
     pub fn record_narrowable_index_path(&mut self, path: &str) {
-        let path = crate::db_index::intern_smol_str(path);
-        self.narrowing_capability
-            .referenced_index_paths
-            .insert(path.clone());
-        self.narrowing_events.push(NarrowingEvent::IndexPath(path));
+        self.record_index_path(path, false);
     }
 
     pub fn mark_opaque_name_target(&mut self) {
-        self.narrowing_capability.has_opaque_name_target = true;
-        self.narrowing_events.push(NarrowingEvent::OpaqueName);
+        self.record_opaque_name(false);
     }
 
     pub fn mark_opaque_index_target(&mut self) {
-        self.narrowing_capability.has_opaque_index_target = true;
-        self.narrowing_events.push(NarrowingEvent::OpaqueIndex);
+        self.record_opaque_index(false);
     }
 
     /// Walk an expression subtree and record every name / index access path it
     /// references as narrowable. Used for cast expressions.
     pub fn record_narrowable_refs_in_expr(&mut self, expr: &LuaExpr) {
-        self.record_narrowable_refs(expr);
+        self.record_narrowable_refs(expr, false);
     }
 
     /// Record condition references separately from assignment and cast targets.
     pub fn record_condition_refs_in_expr(&mut self, expr: &LuaExpr) {
-        self.record_narrowable_refs(expr);
+        self.record_narrowable_refs(expr, true);
     }
 
-    fn record_narrowable_refs(&mut self, expr: &LuaExpr) {
+    fn record_name(&mut self, name: &str, from_condition: bool) {
+        let name = crate::db_index::intern_smol_str(name);
+        self.narrowing_capability
+            .referenced_names
+            .insert(name.clone());
+        self.push_narrowing_event(NarrowingTarget::Name(name), from_condition);
+    }
+
+    fn record_index_path(&mut self, path: &str, from_condition: bool) {
+        let path = crate::db_index::intern_smol_str(path);
+        self.narrowing_capability
+            .referenced_index_paths
+            .insert(path.clone());
+        self.push_narrowing_event(NarrowingTarget::IndexPath(path), from_condition);
+    }
+
+    fn record_opaque_name(&mut self, from_condition: bool) {
+        self.narrowing_capability.has_opaque_name_target = true;
+        self.push_narrowing_event(NarrowingTarget::OpaqueName, from_condition);
+    }
+
+    fn record_opaque_index(&mut self, from_condition: bool) {
+        self.narrowing_capability.has_opaque_index_target = true;
+        self.push_narrowing_event(NarrowingTarget::OpaqueIndex, from_condition);
+    }
+
+    fn push_narrowing_event(&mut self, target: NarrowingTarget, from_condition: bool) {
+        self.narrowing_events.push(NarrowingEvent {
+            target,
+            from_condition,
+        });
+    }
+
+    fn record_narrowable_refs(&mut self, expr: &LuaExpr, from_condition: bool) {
         use glua_parser::{LuaAstNode, LuaIndexExpr, LuaNameExpr, PathTrait};
         // Record the expr itself if it is a name or index, then recurse into
         // descendants to cover nested references (e.g. `a.b and c(d.e)`).
         for node in expr.syntax().descendants() {
             if let Some(name_expr) = LuaNameExpr::cast(node.clone()) {
                 if let Some(name) = name_expr.get_name_text() {
-                    self.record_narrowable_name(&name);
+                    self.record_name(&name, from_condition);
                 } else {
-                    self.mark_opaque_name_target();
+                    self.record_opaque_name(from_condition);
                 }
             } else if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
                 let dynamic = matches!(
@@ -382,10 +428,10 @@ impl<'a> FlowBinder<'a> {
                 );
                 match index_expr.get_access_path() {
                     Some(path) if !dynamic => {
-                        self.record_narrowable_index_path(&path);
+                        self.record_index_path(&path, from_condition);
                     }
                     _ => {
-                        self.mark_opaque_index_target();
+                        self.record_opaque_index(from_condition);
                     }
                 }
             }

@@ -1176,11 +1176,11 @@ fn merge_antecedent_types(
         }
     }
 
-    // The arms of a condition label are pieces of the value the condition
-    // started from: the falsy piece of an unknown value merged with the rest
-    // of it is that unknown value again, not `unknown|nil|false`.
+    // Arms that only narrow the value they split from are pieces of it: the
+    // falsy piece of an unknown value merged with the rest of it is that
+    // unknown value again, not `unknown|nil|false`.
     if branch_types.iter().any(LuaType::is_unknown)
-        && let Some(entry) = tree.get_condition_label_entry(flow_node.id)
+        && let Some(entry) = split_entry(db, tree, cache, root, flow_node, var_ref_id)
         && with_flow_query_realm(cache, target_realm, |cache| {
             get_merged_flow_type_or_nil(db, tree, cache, root, var_ref_id, entry, policy)
         })
@@ -1190,6 +1190,34 @@ fn merge_antecedent_types(
     }
 
     Ok(merge_flow_branch_types(db, var_ref_id, branch_types))
+}
+
+/// The node whose value every arm merged at `flow_node` narrows without
+/// writing `var_ref_id`: a condition label's entry, or the split of an `if`
+/// whose branches only test the variable.
+fn split_entry(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    flow_node: &FlowNode,
+    var_ref_id: &VarRefId,
+) -> Option<FlowId> {
+    if let Some(entry) = tree.get_condition_label_entry(flow_node.id) {
+        return Some(entry);
+    }
+    let info = tree.get_branch_label_info(flow_node.id)?;
+    (!branch_can_write_var_ref(db, info, var_ref_id)
+        && !branch_has_relevant_special_call_effects(
+            db,
+            tree,
+            cache,
+            root,
+            flow_node,
+            info.common_predecessor,
+            var_ref_id,
+        ))
+    .then_some(info.common_predecessor)
 }
 
 fn call_flow_node_returns_never(
@@ -1642,6 +1670,23 @@ fn branch_can_narrow_var_ref(
     info: &crate::BranchLabelInfo,
     var_ref_id: &VarRefId,
 ) -> bool {
+    branch_capability_reaches_var_ref(db, info, &info.narrowing_capability, var_ref_id)
+}
+
+fn branch_can_write_var_ref(
+    db: &DbIndex,
+    info: &crate::BranchLabelInfo,
+    var_ref_id: &VarRefId,
+) -> bool {
+    branch_capability_reaches_var_ref(db, info, &info.written_capability, var_ref_id)
+}
+
+fn branch_capability_reaches_var_ref(
+    db: &DbIndex,
+    info: &crate::BranchLabelInfo,
+    capability: &crate::FileNarrowingCapability,
+    var_ref_id: &VarRefId,
+) -> bool {
     if info.has_casts_or_implfunc {
         return true;
     }
@@ -1651,24 +1696,23 @@ fn branch_can_narrow_var_ref(
             let Some(decl) = db.get_decl_index().get_decl(decl_id) else {
                 return info.has_name_assigns;
             };
-            branch_name_can_be_narrowed(info, decl.get_name())
+            capability_reaches_name(capability, decl.get_name())
         }
-        VarRefId::SelfRef(_) => branch_name_can_be_narrowed(info, "self"),
-        VarRefId::GlobalName(name, _) => info.narrowing_capability.name_can_be_narrowed(name),
+        VarRefId::SelfRef(_) => capability_reaches_name(capability, "self"),
+        VarRefId::GlobalName(name, _) => capability.name_can_be_narrowed(name),
         VarRefId::IndexRef(root, path) => {
-            info.narrowing_capability.index_path_can_be_narrowed(path)
+            capability.index_path_can_be_narrowed(path)
                 || root
                     .as_decl_id()
                     .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
-                    .is_some_and(|decl| branch_name_can_be_narrowed(info, decl.get_name()))
+                    .is_some_and(|decl| capability_reaches_name(capability, decl.get_name()))
         }
     }
 }
 
-fn branch_name_can_be_narrowed(info: &crate::BranchLabelInfo, name: &str) -> bool {
-    info.narrowing_capability.has_opaque_name_target
-        || info
-            .narrowing_capability
+fn capability_reaches_name(capability: &crate::FileNarrowingCapability, name: &str) -> bool {
+    capability.has_opaque_name_target
+        || capability
             .referenced_names
             .iter()
             .any(|narrowable_name| narrowable_name.as_str() == name)
