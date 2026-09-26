@@ -112,6 +112,43 @@ fn a_hunk_boundary_never_splits_a_code_point() {
     );
 }
 
+/// A thread's fingerprint maps the edited positions back by its own edits,
+/// however another thread fingerprinting at the same time finishes.
+#[test]
+fn a_fingerprint_maps_positions_back_while_another_thread_finishes_its_own() {
+    use crate::db_index::derivation::{EditMaps, fingerprint_before_edits, fingerprint_of};
+    use std::sync::Barrier;
+
+    let file_id = FileId::new(7);
+    let edits = EditMaps::new([(
+        file_id,
+        PositionMap::new(
+            "abc", "
+abc",
+        ),
+    )]);
+    let before_edit = fingerprint_of(&crate::LuaDeclId::new(file_id, TextSize::new(0)));
+    let both_mapping = Barrier::new(2);
+    let other_finished = Barrier::new(2);
+
+    let mapped = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            fingerprint_before_edits(&edits, || {
+                both_mapping.wait();
+                1
+            });
+            other_finished.wait();
+        });
+        fingerprint_before_edits(&edits, || {
+            both_mapping.wait();
+            other_finished.wait();
+            fingerprint_of(&crate::LuaDeclId::new(file_id, TextSize::new(1)))
+        })
+    });
+
+    assert_eq!(mapped, before_edit);
+}
+
 // --- Export map ---
 
 fn workspace() -> VirtualWorkspace {

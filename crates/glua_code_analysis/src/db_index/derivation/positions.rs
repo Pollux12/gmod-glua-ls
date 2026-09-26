@@ -9,7 +9,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rowan::{TextRange, TextSize};
 use rustc_hash::FxHashMap;
@@ -188,9 +188,13 @@ impl EditMaps {
     }
 }
 
-/// Whether any thread is fingerprinting with edits mapped back: a cheap
-/// guard in front of the thread-local lookup every positional hash makes.
-static MAPPING_BACK: AtomicBool = AtomicBool::new(false);
+/// How many threads are fingerprinting with edits mapped back: a cheap guard
+/// in front of the thread-local lookup every positional hash makes.
+static MAPPING_BACK: AtomicUsize = AtomicUsize::new(0);
+
+fn any_thread_mapping_back() -> bool {
+    MAPPING_BACK.load(Ordering::Relaxed) != 0
+}
 
 thread_local! {
     static BACK_MAPS: RefCell<Option<EditMaps>> = const { RefCell::new(None) };
@@ -225,7 +229,7 @@ pub fn fingerprinting() -> bool {
 /// back. A fingerprint folded incrementally at write time cannot be mapped,
 /// so it is recomputed from its entries then.
 pub fn mapping_back() -> bool {
-    MAPPING_BACK.load(Ordering::Relaxed) && BACK_MAPS.with(|maps| maps.borrow().is_some())
+    any_thread_mapping_back() && BACK_MAPS.with(|maps| maps.borrow().is_some())
 }
 
 /// Runs `fingerprint` with the edited files' identities hashing as their
@@ -238,10 +242,10 @@ pub fn fingerprint_before_edits(
         return fingerprint();
     }
     BACK_MAPS.with(|maps| *maps.borrow_mut() = Some(edits.inverse()));
-    MAPPING_BACK.store(true, Ordering::Relaxed);
+    MAPPING_BACK.fetch_add(1, Ordering::Relaxed);
     let result = fingerprint();
+    MAPPING_BACK.fetch_sub(1, Ordering::Relaxed);
     BACK_MAPS.with(|maps| *maps.borrow_mut() = None);
-    MAPPING_BACK.store(false, Ordering::Relaxed);
     result
 }
 
@@ -250,8 +254,7 @@ pub fn fingerprint_before_edits(
 /// the fingerprint happen outside this and hash normally.
 pub(super) fn hash_value<T: Hash + ?Sized, H: Hasher>(value: &T, state: &mut H) {
     let outer = FINGERPRINTING.with(|flag| flag.replace(true));
-    let mapping =
-        MAPPING_BACK.load(Ordering::Relaxed) && BACK_MAPS.with(|maps| maps.borrow().is_some());
+    let mapping = mapping_back();
     if mapping {
         HASHING.with(|hashing| hashing.set(true));
     }
@@ -265,7 +268,7 @@ pub(super) fn hash_value<T: Hash + ?Sized, H: Hasher>(value: &T, state: &mut H) 
 /// What a positional identity in `file_id` hashes as right now: `None` to
 /// hash it as it is.
 fn mapped<T>(file_id: FileId, map: impl FnOnce(&EditMaps) -> Option<T>) -> Option<Option<T>> {
-    if !MAPPING_BACK.load(Ordering::Relaxed) || !HASHING.with(Cell::get) {
+    if !any_thread_mapping_back() || !HASHING.with(Cell::get) {
         return None;
     }
     BACK_MAPS.with(|maps| {
