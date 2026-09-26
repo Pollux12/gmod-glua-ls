@@ -10,9 +10,14 @@
 //! - `revert`: the edit, then the original text; the oracle is the base.
 //! - `burst`: three edits of every target before one re-analysis, ending on
 //!   the edited text, so a single target shares the edit oracle.
+//! - `typing`: the edit typed one character at a time, each keystroke settled,
+//!   through every invalid text in between; shares the edit oracle.
 //! - `watch`: watched delete of each target (oracle: the file never existed),
 //!   then watched re-creation (oracle: cold build with the same new file ids).
 //! - `noop`: re-index each target with unchanged text; the oracle is the base.
+//! - `reload`: the configuration applied again and every file submitted again
+//!   on the settled analysis, as a configuration reload does; the oracle is
+//!   the base.
 //! - `exact`: remove and re-add exactly the targets in one batch.
 //! - `split:N`: cold build in N batches, compared with the base.
 //! - `schedule`: cold build taking files in reverse order within each rank,
@@ -150,13 +155,8 @@ struct ColdInput {
     created: Vec<(PathBuf, String)>,
 }
 
-fn build_cold(
-    codebase: &Path,
-    annotations: &Path,
-    input: &ColdInput,
-    batches: usize,
-    schedule: Schedule,
-) -> EmmyLuaAnalysis {
+/// The codebase's configuration, as the server loads it.
+fn workspace_config(codebase: &Path) -> Emmyrc {
     let config_files = discover_config_files(codebase);
     let mut emmyrc = if config_files.is_empty() {
         Emmyrc::default()
@@ -165,11 +165,17 @@ fn build_cold(
     };
     emmyrc.gmod.enabled = true;
     emmyrc.pre_process_emmyrc(codebase);
+    emmyrc
+}
 
-    let mut analysis = EmmyLuaAnalysis::new();
-    analysis.compilation.set_schedule(schedule);
-    analysis.update_config(Arc::new(emmyrc.clone()));
-    analysis.init_std_lib();
+/// Adds the annotations, the codebase and the configured libraries as
+/// workspaces, and returns every file to index.
+fn add_workspaces(
+    analysis: &mut EmmyLuaAnalysis,
+    codebase: &Path,
+    annotations: &Path,
+    emmyrc: &Emmyrc,
+) -> Vec<(PathBuf, Option<String>)> {
     analysis.add_library_workspace(annotations.to_path_buf());
     analysis.add_main_workspace(codebase.to_path_buf());
 
@@ -185,11 +191,26 @@ fn build_cold(
         }
     }
 
-    let mut files = collect_workspace_files(&workspace_folders, &analysis.emmyrc, None, None)
+    collect_workspace_files(&workspace_folders, &analysis.emmyrc, None, None)
         .into_iter()
         .filter(|file| !file.path.ends_with(".editorconfig"))
         .map(|file| file.into_tuple())
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn build_cold(
+    codebase: &Path,
+    annotations: &Path,
+    input: &ColdInput,
+    batches: usize,
+    schedule: Schedule,
+) -> EmmyLuaAnalysis {
+    let emmyrc = workspace_config(codebase);
+    let mut analysis = EmmyLuaAnalysis::new();
+    analysis.compilation.set_schedule(schedule);
+    analysis.update_config(Arc::new(emmyrc.clone()));
+    analysis.init_std_lib();
+    let mut files = add_workspaces(&mut analysis, codebase, annotations, &emmyrc);
     for (path, content) in &input.overrides {
         let want = path_key(path);
         let mut matched = 0;
@@ -1807,6 +1828,45 @@ fn target(
     (path, uri, file_id, text)
 }
 
+/// The texts typing `find` into `replace` passes through: the part of `find`
+/// that differs deleted at once, then the part of `replace` that differs typed
+/// one character at a time. The last is [`edited`]'s text.
+fn typed_texts(text: &str, find: &str, replace: &str) -> Vec<String> {
+    let prefix: usize = find
+        .chars()
+        .zip(replace.chars())
+        .take_while(|(from, to)| from == to)
+        .map(|(from, _)| from.len_utf8())
+        .sum();
+    let suffix: usize = find[prefix..]
+        .chars()
+        .rev()
+        .zip(replace[prefix..].chars().rev())
+        .take_while(|(from, to)| from == to)
+        .map(|(from, _)| from.len_utf8())
+        .sum();
+    let head = &replace[..prefix];
+    let tail = &replace[replace.len() - suffix..];
+    let typed = &replace[prefix..replace.len() - suffix];
+    let mut texts = Vec::new();
+    if find.len() - suffix > prefix || typed.is_empty() {
+        texts.push(edited(text, find, &format!("{head}{tail}")));
+    }
+    let ends = typed
+        .char_indices()
+        .map(|(at, _)| at)
+        .skip(1)
+        .chain(std::iter::once(typed.len()));
+    for end in ends.filter(|end| *end > 0) {
+        texts.push(edited(
+            text,
+            find,
+            &format!("{head}{}{tail}", &typed[..end]),
+        ));
+    }
+    texts
+}
+
 fn edited(text: &str, find: &str, replace: &str) -> String {
     assert!(
         text.contains(find),
@@ -2145,6 +2205,48 @@ impl Harness {
         self.finish("burst", warm, &ids, &reach, false, &input);
     }
 
+    /// Reloads the workspace as the server does when its configuration
+    /// changes: the configuration applied again, the workspaces added again and
+    /// every file submitted again, on the settled analysis. The oracle is the
+    /// base.
+    fn reload(&mut self) {
+        let mut warm = self.warm();
+        let emmyrc = workspace_config(&self.codebase);
+        warm.update_config(Arc::new(emmyrc.clone()));
+        let files = add_workspaces(&mut warm, &self.codebase, &self.annotations, &emmyrc);
+        let affected = warm.update_files_by_path(files);
+        let mut reach = Reach::default();
+        reach.note(&warm, affected);
+        self.finish("reload", warm, &[], &reach, false, &ColdInput::default());
+    }
+
+    /// Types the edit into each target as an editor does, re-analysing after
+    /// every keystroke through each invalid text in between; the oracle is the
+    /// edited text's cold build.
+    fn typing(&mut self, targets: &[String], find: &str, replace: &str) {
+        for relative in targets {
+            let (path, uri, file_id, original) = target(&self.base, &self.codebase, relative);
+            let changed = edited(&original, find, replace);
+            let mut warm = self.warm();
+            let mut reach = Reach::default();
+            for (version, text) in (1..).zip(typed_texts(&original, find, replace)) {
+                reach.extend(settle(&mut warm, &uri, file_id, text, version));
+            }
+            let input = ColdInput {
+                overrides: vec![(path, changed)],
+                ..ColdInput::default()
+            };
+            self.finish(
+                &format!("typing[{relative}]"),
+                warm,
+                &[file_id],
+                &reach,
+                false,
+                &input,
+            );
+        }
+    }
+
     /// Applies watched-file event batches in order to a warm fork.
     fn watched(
         &mut self,
@@ -2416,8 +2518,10 @@ fn run() {
                     "edit"
                         | "revert"
                         | "burst"
+                        | "typing"
                         | "watch"
                         | "noop"
+                        | "reload"
                         | "exact"
                         | "touch"
                         | "shift"
@@ -2428,9 +2532,12 @@ fn run() {
             "unknown check: {stage}"
         );
     }
-    let needs_targets = stages
-        .iter()
-        .any(|s| matches!(*s, "edit" | "revert" | "burst" | "watch" | "noop" | "exact"));
+    let needs_targets = stages.iter().any(|s| {
+        matches!(
+            *s,
+            "edit" | "revert" | "burst" | "typing" | "watch" | "noop" | "exact"
+        )
+    });
     let targets: Vec<String> = if needs_targets {
         std::env::var("DET_TARGETS")
             .expect("DET_TARGETS is required")
@@ -2448,7 +2555,7 @@ fn run() {
     );
     let needs_edit = stages
         .iter()
-        .any(|s| matches!(*s, "edit" | "revert" | "burst"));
+        .any(|s| matches!(*s, "edit" | "revert" | "burst" | "typing"));
     let (find, replace) = if needs_edit {
         (
             std::env::var("DET_EDIT_FIND").expect("DET_EDIT_FIND is required"),
@@ -2496,8 +2603,10 @@ fn run() {
             "edit" => harness.edit(&targets, &find, &replace),
             "revert" => harness.revert(&targets, &find, &replace),
             "burst" => harness.burst(&targets, &find, &replace),
+            "typing" => harness.typing(&targets, &find, &replace),
             "watch" => harness.watch(&targets),
             "noop" => harness.noop(&targets),
+            "reload" => harness.reload(),
             "exact" => harness.exact(&targets),
             "touch" => harness.sweep_edit("touch", |text| format!("{text}\n-- touch\n")),
             "shift" => harness.sweep_edit("shift", |text| format!("\n{text}")),
