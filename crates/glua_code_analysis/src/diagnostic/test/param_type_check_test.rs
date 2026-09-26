@@ -3313,6 +3313,38 @@ mod test {
     }
 
     #[test]
+    fn a_table_whose_metatable_indexes_through_a_function_fills_a_class_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class SkinColours
+            ---@field Label table
+
+            ---@class Skin
+            ---@field Colours SkinColours?
+
+            ---@param skin Skin
+            local function DefineSkin(skin) end
+
+            local function makeProxy(o)
+                return setmetatable({}, {
+                    __index = function(t, key)
+                        local v = o[key]
+                        rawset(t, key, v)
+                        return v
+                    end,
+                })
+            end
+
+            local SKIN = {}
+            SKIN.Colours = makeProxy({})
+            DefineSkin(SKIN)
+            "#
+        ));
+    }
+
+    #[test]
     fn pcall_accepts_a_union_of_functions() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(ws.check_code_for(

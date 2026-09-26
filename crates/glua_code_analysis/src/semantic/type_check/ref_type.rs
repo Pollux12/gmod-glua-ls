@@ -364,6 +364,7 @@ fn check_ref_type_compact_table(
     };
 
     let mut checked_keys = HashSet::default();
+    let indexes_through_metatable = indexes_through_metatable(context.db, &table_owner);
 
     for source_member in source_type_members {
         let key = source_member.key;
@@ -423,11 +424,12 @@ fn check_ref_type_compact_table(
                     ));
                 }
             }
-            None if member_is_required(
-                context.db,
-                source_member.property_owner_id.as_ref(),
-                &source_member_type,
-            ) =>
+            None if !indexes_through_metatable
+                && member_is_required(
+                    context.db,
+                    source_member.property_owner_id.as_ref(),
+                    &source_member_type,
+                ) =>
             {
                 if !context.detail {
                     return Err(TypeCheckFailReason::TypeNotMatch);
@@ -442,6 +444,24 @@ fn check_ref_type_compact_table(
     }
 
     Ok(())
+}
+
+/// Whether a read of a field `table_owner` lacks goes through its metatable's
+/// `__index`, which answers it at runtime.
+fn indexes_through_metatable(db: &crate::DbIndex, table_owner: &LuaMemberOwner) -> bool {
+    let LuaMemberOwner::Element(table) = table_owner else {
+        return false;
+    };
+    db.get_metatable_index()
+        .get(table)
+        .is_some_and(|metatable| {
+            db.get_member_index()
+                .get_member_item(
+                    &LuaMemberOwner::Element(metatable.clone()),
+                    &LuaMemberKey::Name("__index".into()),
+                )
+                .is_some()
+        })
 }
 
 fn check_ref_type_compact_object(
