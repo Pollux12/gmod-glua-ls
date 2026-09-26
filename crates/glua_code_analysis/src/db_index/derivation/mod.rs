@@ -484,6 +484,25 @@ impl FactKey {
         )
     }
 
+    /// Whether removing the owning file keeps what other files' derivations
+    /// stored under the key: the member and dynamic-field indexes file each
+    /// contribution under its contributing file, and the edit remap re-homes
+    /// an owner that moved, or reports its contributors when it is gone.
+    pub fn keeps_foreign_contributions(&self) -> bool {
+        use FactKey as K;
+        matches!(
+            self,
+            K::MemberSlot(..)
+                | K::MemberOwnerMap(_)
+                | K::MemberOwnerExprKeys(_)
+                | K::MemberOwnerFields(_)
+                | K::MemberOwnerPresence(_)
+                | K::DynamicField(..)
+                | K::DynamicFieldWildcards(_)
+                | K::DynamicFieldFinite(_)
+        )
+    }
+
     /// Whether the key is a stage rule: only a stage barrier moves it, and the
     /// barrier queues the rule's readers itself.
     pub fn is_stage_rule(&self) -> bool {

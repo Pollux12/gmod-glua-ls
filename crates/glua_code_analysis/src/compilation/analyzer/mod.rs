@@ -175,8 +175,20 @@ fn replace_files(
         touched.insert(derivation::HashedKey::new(derivation::FactKey::FileText(
             *file_id,
         )));
+        let live = db.get_vfs().get_syntax_tree(file_id).is_some();
         for producer in db.reader_graph().foreign_producers(*file_id) {
             if file_ids.contains(&producer.file_id) {
+                continue;
+            }
+            // What it stored in a file that is re-indexed, not deleted, the
+            // indexes keep, and the edit remap carries to its new place.
+            if live
+                && db
+                    .reader_graph()
+                    .outputs_of(producer)
+                    .filter(|key| key.owning_file() == Some(*file_id))
+                    .all(|key| key.keeps_foreign_contributions())
+            {
                 continue;
             }
             match producer.kind {

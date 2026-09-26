@@ -487,4 +487,28 @@ local first = controllers[1]
             vec![lighting]
         );
     }
+
+    /// Another file's field written onto a table literal is kept by the member
+    /// index when the literal's file is re-indexed, and the edit carries it to
+    /// the literal's new position, so the writing file stands.
+    #[test]
+    fn a_shift_in_a_file_whose_table_another_file_writes_re_runs_nothing_in_it() {
+        const SHARED: &str = "lua/entities/shift_car/shared.lua";
+        const SHARED_TEXT: &str = "ENT.Type = \"anim\"\nENT.WaterBuoyancy = { depth = 1 }\n";
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_files(vec![
+            (SHARED, SHARED_TEXT),
+            (
+                "lua/weapons/gmod_tool/stools/amphibious.lua",
+                "---@param veh shift_car\nfunction MakeAmphibious(veh)\n    veh.WaterBuoyancy.speed = 2\nend\n",
+            ),
+        ]);
+
+        let shared = ws.def_file(SHARED, &format!("\n{SHARED_TEXT}"));
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![shared]);
+    }
 }
