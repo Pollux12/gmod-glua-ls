@@ -1221,7 +1221,7 @@ fn an_identity_remap_leaves_every_owner_alone() {
     );
 }
 
-const SHIFT_FIXTURE: [(&str, &str); 6] = [
+const SHIFT_FIXTURE: [(&str, &str); 7] = [
     (
         "lua/autorun/sh_shift_lib.lua",
         r#"---@class ShiftLib
@@ -1279,7 +1279,7 @@ local total = ShiftVec + ShiftVec
 print(total, ShiftVec(1), shiftmod.value)
 ---@type shift_ent
 local ent
-print(ent:GetSpeed(), ent.Speed)
+print(ent:GetSpeed(), ent.Speed, ent.IsShiftVehicle, ent:GetDriver())
 ---@type ShiftTrace
 local trace
 print(trace.Entity)
@@ -1315,9 +1315,17 @@ end
 "#,
     ),
     (
-        "lua/entities/shift_ent/shared.lua",
+        "lua/entities/shift_base/shared.lua",
         r#"ENT.Type = "anim"
 ENT.Base = "base_anim"
+ENT.IsShiftVehicle = true
+function ENT:GetDriver() return nil end
+"#,
+    ),
+    (
+        "lua/entities/shift_ent/shared.lua",
+        r#"ENT.Type = "anim"
+ENT.Base = "shift_base"
 ENT.Speed = 1
 function ENT:GetSpeed() return self.Speed end
 "#,
