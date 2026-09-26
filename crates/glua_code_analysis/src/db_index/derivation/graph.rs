@@ -575,7 +575,14 @@ impl ReaderGraph {
         };
         let mut moved = false;
         for ((key, seen), fingerprint) in record.reads.iter_mut().zip(fingerprints) {
-            if *seen != fingerprint {
+            // A stage rule a reader saw is the stage it ran at, which only a
+            // stage barrier re-runs it for.
+            if *seen != fingerprint
+                && !self.table.keys[*key as usize]
+                    .key
+                    .as_ref()
+                    .is_some_and(|key| key.is_stage_rule())
+            {
                 moved = true;
                 let readers = &mut self.table.keys[*key as usize].readers;
                 readers.remove(deriv, *seen);

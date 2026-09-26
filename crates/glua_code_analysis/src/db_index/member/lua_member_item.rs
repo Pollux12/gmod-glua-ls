@@ -688,6 +688,36 @@ fn member_is_placeholder_decl(db: &DbIndex, member: &crate::LuaMember) -> bool {
             .is_some_and(|cache| cache.is_infer() && !is_informative_type(cache.as_type()))
 }
 
+/// `members` with their type caches. A writer the analysis has not typed
+/// yet holds the read until the run skips untyped writers; from then on it
+/// is left out while another writer has a type.
+fn typed_members<'a>(
+    db: &'a DbIndex,
+    members: impl IntoIterator<Item = &'a crate::LuaMember>,
+) -> Result<Vec<(&'a crate::LuaMember, &'a crate::LuaTypeCache)>, InferFailReason> {
+    let mut typed = Vec::new();
+    let mut untyped = None;
+    for member in members {
+        match db.get_type_index().get_type_cache(&member.get_id().into()) {
+            Some(cache) => typed.push((member, cache)),
+            None => {
+                untyped.get_or_insert(member.get_id());
+            }
+        }
+    }
+    match untyped {
+        Some(member_id)
+            if typed.is_empty()
+                || !db.stage_rule_holds(
+                    crate::db_index::derivation::StageRule::SkipUntypedWriters,
+                ) =>
+        {
+            Err(InferFailReason::UnResolveMemberType(member_id))
+        }
+        _ => Ok(typed),
+    }
+}
+
 fn resolve_member_type(
     db: &DbIndex,
     member_item: &LuaMemberIndexItem,
@@ -754,11 +784,7 @@ fn resolve_member_type(
                     // merge; they only answer when nothing else does.
                     let mut deferred_placeholder_types = Vec::new();
                     let mut all_are_table_merges = true;
-                    for member in &members {
-                        let member_type_cache = db
-                            .get_type_index()
-                            .get_type_cache(&member.get_id().into())
-                            .ok_or(InferFailReason::UnResolveMemberType(member.get_id()))?;
+                    for (member, member_type_cache) in typed_members(db, members.iter().copied())? {
                         if should_prefer_doc_file_defines && !member_type_cache.is_doc() {
                             continue;
                         }
@@ -815,18 +841,12 @@ fn resolve_member_type(
                 }
                 MemberTypeResolveState::Meta => {
                     let mut typ = LuaType::Never;
-                    for member in &members {
-                        let feature = member.get_feature();
-                        if feature.is_meta_decl() {
-                            typ = TypeOps::Union.apply(
-                                db,
-                                &typ,
-                                db.get_type_index()
-                                    .get_type_cache(&member.get_id().into())
-                                    .ok_or(InferFailReason::UnResolveMemberType(member.get_id()))?
-                                    .as_type(),
-                            );
-                        }
+                    let meta_decls = members
+                        .iter()
+                        .copied()
+                        .filter(|member| member.get_feature().is_meta_decl());
+                    for (_, member_type_cache) in typed_members(db, meta_decls)? {
+                        typ = TypeOps::Union.apply(db, &typ, member_type_cache.as_type());
                     }
                     if let Some(adapters) =
                         build_generic_arity_adapters_for_overrides(db, &typ, &members)
@@ -839,18 +859,12 @@ fn resolve_member_type(
                 }
                 MemberTypeResolveState::FileDecl => {
                     let mut typ = LuaType::Never;
-                    for member in &members {
-                        let feature = member.get_feature();
-                        if feature.is_file_decl() && !member_is_placeholder_decl(db, member) {
-                            typ = TypeOps::Union.apply(
-                                db,
-                                &typ,
-                                db.get_type_index()
-                                    .get_type_cache(&member.get_id().into())
-                                    .ok_or(InferFailReason::UnResolveMemberType(member.get_id()))?
-                                    .as_type(),
-                            );
-                        }
+                    let file_decls = members.iter().copied().filter(|member| {
+                        member.get_feature().is_file_decl()
+                            && !member_is_placeholder_decl(db, member)
+                    });
+                    for (_, member_type_cache) in typed_members(db, file_decls)? {
+                        typ = TypeOps::Union.apply(db, &typ, member_type_cache.as_type());
                     }
                     if let Some(adapters) =
                         build_generic_arity_adapters_for_overrides(db, &typ, &members)

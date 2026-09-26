@@ -178,7 +178,9 @@ pub fn infer_index_expr(
         return run_fallback_narrow_raw(db, cache, index_expr, &var_ref_id, LuaType::Unknown);
     }
 
-    if pass_flow {
+    // Narrowing from a nil origin assumes no writer declares the field, which
+    // only holds once none can add it any more.
+    if pass_flow && db.stage_rule_holds(crate::db_index::derivation::StageRule::FloorUnsettled) {
         match infer_member_type_fallback_pass_flow(db, cache, index_expr) {
             Ok(member_type) => return Ok(member_type),
             Err(InferFailReason::FieldNotFound) | Err(InferFailReason::None) => {}
@@ -189,7 +191,7 @@ pub fn infer_index_expr(
     // Analysis reads a fact that has not landed as unknown, and nothing is
     // known about an unknown value's fields, including their absence.
     if prefix_is_unresolved_param
-        || (prefix_type.is_unknown() && cache.get_config().analysis_phase.is_force())
+        || (prefix_type.is_unknown() && crate::semantic::infer::floors_unsettled(db, cache))
     {
         return Ok(LuaType::Unknown);
     }
@@ -994,6 +996,11 @@ fn infer_table_member_owner(
                 // phases keep the hedge as the final answer.
                 if cache.get_config().analysis_phase.is_ordered() {
                     cache.record_missed_member_read(db, owner, key);
+                    return Err(InferFailReason::FieldNotFound);
+                }
+                if cache.get_config().analysis_phase.is_force()
+                    && !crate::semantic::infer::floors_unsettled(db, cache)
+                {
                     return Err(InferFailReason::FieldNotFound);
                 }
                 return Ok(empty_table_dynamic_access_type(

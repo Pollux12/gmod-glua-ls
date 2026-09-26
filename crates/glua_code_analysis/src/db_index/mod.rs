@@ -115,6 +115,9 @@ pub struct DbIndex {
     /// Values come from a process-global counter so they are unique across
     /// instances (the memos are thread-local and outlive any one `DbIndex`).
     type_structure_revision: u64,
+    /// The stage the engine run is at; [`derivation::AnalysisStage::Closed`]
+    /// outside a run.
+    analysis_stage: derivation::AnalysisStage,
 }
 
 /// See [`DbIndex::type_structure_revision`] — process-global so revision values
@@ -185,6 +188,7 @@ impl DbIndex {
             helper_scan_files: derivation::SetFingerprint::default(),
             net_helpers: FxHashMap::default(),
             function_summaries: FxHashMap::default(),
+            analysis_stage: derivation::AnalysisStage::default(),
         }
     }
 
@@ -379,7 +383,22 @@ impl DbIndex {
             K::FileText(file_id) => self.vfs.text_fingerprint(file_id),
             K::Syntax(site) => self.vfs.statement_fingerprint(site),
             K::FileSet => self.vfs.file_set_fingerprint(),
+            K::StageRule(rule) => derivation::fingerprint_of(&rule.holds_at(self.analysis_stage)),
         }
+    }
+
+    pub(crate) fn analysis_stage(&self) -> derivation::AnalysisStage {
+        self.analysis_stage
+    }
+
+    pub(crate) fn set_analysis_stage(&mut self, stage: derivation::AnalysisStage) {
+        self.analysis_stage = stage;
+    }
+
+    /// Whether `rule` holds at the stage the analysis is at; a recorded read.
+    pub(crate) fn stage_rule_holds(&self, rule: derivation::StageRule) -> bool {
+        derivation::note_read(|| derivation::FactKey::StageRule(rule));
+        rule.holds_at(self.analysis_stage)
     }
 
     pub(crate) fn get_helper_scan<T: derivation::DerivedFact>(
@@ -866,6 +885,7 @@ impl DbIndex {
             helper_scan_files: self.helper_scan_files,
             net_helpers: self.net_helpers.clone(),
             function_summaries: self.function_summaries.clone(),
+            analysis_stage: self.analysis_stage,
         }
     }
 

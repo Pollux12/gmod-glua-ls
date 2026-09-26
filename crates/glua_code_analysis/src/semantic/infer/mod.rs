@@ -58,6 +58,15 @@ use super::{CacheEntry, LuaInferCache, member::infer_raw_member_type_with_cache}
 pub type InferResult = Result<LuaType, InferFailReason>;
 pub use infer_call::InferCallFuncResult;
 
+/// Whether inference answers a read it cannot settle with a floor: under the
+/// force phase once the engine run has closed. Before that the read stays
+/// unanswered and is recorded, so its reader runs again when the fact lands
+/// or the run closes, and a floor never stands in for a fact still to come.
+pub(crate) fn floors_unsettled(db: &DbIndex, cache: &LuaInferCache) -> bool {
+    cache.get_config().analysis_phase.is_force()
+        && db.stage_rule_holds(crate::db_index::derivation::StageRule::FloorUnsettled)
+}
+
 pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> InferResult {
     let key = expr.get_syntax_id();
     if let Some(mark) = cache.expr_in_progress.get(&key) {
@@ -242,7 +251,8 @@ fn infer_expr_miss(
     // recomputation across diagnostic checkers. During analysis, unresolved errors are
     // removed so the unresolve phase can retry them.
     let is_diagnostics = cache.get_config().analysis_phase.is_diagnostics();
-    let is_force = cache.get_config().analysis_phase.is_force();
+    let floors = matches!(&result_type, Err(reason) if reason.is_need_resolve())
+        && floors_unsettled(db, cache);
 
     match result_type {
         Ok(result_type) => {
@@ -254,7 +264,7 @@ fn infer_expr_miss(
             Some(Some(CacheEntry::Cache(LuaType::Unknown))),
         ),
         Err(InferFailReason::FieldNotFound) => {
-            if is_force {
+            if floors {
                 (
                     Ok(LuaType::Nil),
                     Some(Some(CacheEntry::Cache(LuaType::Nil))),
@@ -268,7 +278,7 @@ fn infer_expr_miss(
                 (Err(InferFailReason::FieldNotFound), Some(None))
             }
         }
-        Err(reason) if reason.is_need_resolve() && is_force => {
+        Err(_) if floors => {
             // A fact that has not landed reads as unknown: the read is
             // recorded, so its reader is evaluated again once it lands.
             (

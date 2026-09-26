@@ -1163,7 +1163,11 @@ fn infer_param_inner(
         return Ok((call_arg_type, ParamInferenceSource::Concrete));
     }
 
-    if let Some(param_hint_type) = infer_param_type_from_gmod_name_hint(db, decl.get_name()) {
+    // A name is a guess for a param no evidence types, and call-site evidence
+    // is only complete once the engine run has closed.
+    if let Some(param_hint_type) = infer_param_type_from_gmod_name_hint(db, decl.get_name())
+        && db.stage_rule_holds(crate::db_index::derivation::StageRule::FloorUnsettled)
+    {
         if let Some(cache) = cache.as_mut()
             && let Some(arg_type) =
                 infer_unread_local_call_site_args(db, cache, signature_id, param_idx)?

@@ -97,6 +97,7 @@ use crate::{LuaFunctionType, LuaMemberId, LuaMemberKey, LuaTypeOwner};
 pub use generic::*;
 pub use guard::{InferGuard, InferGuardRef};
 pub use infer::InferFailReason;
+pub(crate) use infer::floors_unsettled;
 pub(crate) use infer::infer_authoritative_method_self_type;
 pub use infer::infer_call_expr_func;
 pub(crate) use infer::infer_enclosing_self_type;

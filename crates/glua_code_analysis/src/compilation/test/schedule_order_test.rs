@@ -9,6 +9,15 @@ mod test {
     /// cold-built in one batch under `schedule`, as sorted text; `None` when
     /// the build does not settle within a generous bound.
     fn settled(schedule: Schedule, files: &[(&str, &str)]) -> Option<Vec<String>> {
+        settled_in(schedule, files, false)
+    }
+
+    /// [`settled`], over the standard library as well when `std_lib` is set.
+    fn settled_in(
+        schedule: Schedule,
+        files: &[(&str, &str)],
+        std_lib: bool,
+    ) -> Option<Vec<String>> {
         let files = files
             .iter()
             .map(|(path, text)| (path.to_string(), text.to_string()))
@@ -17,7 +26,11 @@ mod test {
         std::thread::Builder::new()
             .stack_size(crate::ANALYSIS_STACK_SIZE)
             .spawn(move || {
-                let mut ws = VirtualWorkspace::new();
+                let mut ws = if std_lib {
+                    VirtualWorkspace::new_with_init_std_lib()
+                } else {
+                    VirtualWorkspace::new()
+                };
                 let mut emmyrc = Emmyrc::default();
                 emmyrc.gmod.enabled = true;
                 ws.update_emmyrc(emmyrc);
@@ -60,6 +73,47 @@ mod test {
             })
             .expect("analysis thread");
         rx.recv_timeout(Duration::from_secs(30)).ok()
+    }
+
+    #[test]
+    fn a_param_typed_only_by_its_name_while_its_call_sites_settle_converges() {
+        assert!(
+            settled_in(
+                Schedule::Canonical,
+                &[
+                    (
+                        "lua/aaa_annotations/entity.lua",
+                        "---@class Entity
+---@return tableof<self>
+function Entity:GetTable() end
+",
+                    ),
+                    (
+                        "gamemodes/cityrp/entities/weapons/gmod_tool/stools/advresizer.lua",
+                        r#"local function ForgetConstraint(ent, RConstraint)
+    for k, Constraint in pairs(Constraints) do
+        if Constraint ~= RConstraint then
+        end
+    end
+    ent.Constraints = NewTab
+end
+
+local function GetConstraintVals(ent, Constraint, Type)
+    for Arg, Val in pairs(Constraint:GetTable()) do
+        ForgetConstraint(Val, Constraint)
+        local Constraints = ent.Constraints
+        for Key, Constraint in pairs(Constraints) do
+            GetConstraintVals(ent, Constraint, Type)
+        end
+    end
+end
+"#,
+                    ),
+                ],
+                true,
+            )
+            .is_some()
+        );
     }
 
     fn assert_schedule_independent(files: &[(&str, &str)]) {
@@ -230,6 +284,35 @@ end
             (
                 "gamemodes/cityrp/plugins/scoreboard/ui/cl_player_frame.lua",
                 REGISTER,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_weapon_field_copied_back_from_its_saved_original_settles_the_same_in_either_order() {
+        assert_schedule_independent(&[
+            (
+                "lua/weapons/cw_base/shared.lua",
+                r#"SWEP.ZoomAmount = 15
+function SWEP:Initialize()
+    self.ZoomAmount_Orig = self.ZoomAmount
+end
+"#,
+            ),
+            (
+                "lua/weapons/cw_base/sh_attachments.lua",
+                r#"function SWEP:resetPostDetach(att, attCategory)
+    self.ZoomAmount = self.ZoomAmount_Orig
+end
+"#,
+            ),
+            (
+                "lua/weapons/cw_base/cl_playerbindpress.lua",
+                r#"function SWEP.PlayerBindPress(ply, b, p)
+    local wep = ply:GetActiveWeapon()
+    wep.ZoomAmount = math.Clamp(wep.ZoomAmount - 15, wep.MinZoom, wep.MaxZoom)
+end
+"#,
             ),
         ]);
     }

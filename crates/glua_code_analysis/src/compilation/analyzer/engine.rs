@@ -18,13 +18,24 @@
 //! work has run is checked once, not after each writer. A reader that ranks
 //! before the derivation that queued it (a back edge) waits for the next
 //! round, which re-checks it once however many later producers moved it.
+//!
+//! A run settles in stages (see [`derivation::AnalysisStage`]). Some reads
+//! only have a final answer once nothing can add a fact any more: a field no
+//! writer declared yet, a member slot one of whose writers is still untyped.
+//! Until the stage that answers them they read as not landed, and the reader
+//! records the rule it waited on. At quiescence the run moves to the next
+//! stage and re-evaluates exactly the readers of the rules that stage starts
+//! to hold, so what they conclude is no longer a question of which derivation
+//! happened to run first.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::DbIndex;
-use crate::db_index::derivation::{self, DerivationId, DerivationKind, FactKey, HashedKey};
+use crate::db_index::derivation::{
+    self, AnalysisStage, DerivationId, DerivationKind, FactKey, HashedKey, StageRule,
+};
 
 /// Why a derivation is on the worklist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -166,6 +177,9 @@ pub(crate) struct Engine {
     /// Fingerprints of keys with `edits` undone, taken once per value: the
     /// same moved key is checked for every reader it queued.
     before_edits: std::cell::RefCell<FxHashMap<HashedKey, derivation::Fingerprint>>,
+    /// Stage rules that moved since the key table was last lent: memos that
+    /// read them no longer hold.
+    moved_rules: std::cell::RefCell<Vec<HashedKey>>,
 }
 
 impl Engine {
@@ -320,13 +334,17 @@ impl Engine {
         std::mem::take(&mut self.stale_sources)
     }
 
-    /// Evaluates the worklist to quiescence.
+    /// Evaluates the worklist to quiescence, stage by stage.
     pub(crate) fn run(&mut self, db: &mut DbIndex, recipe: &dyn Recipe) {
         crate::semantic::keep_access_paths();
         let _paths = OnDrop(crate::semantic::stop_keeping_access_paths);
+        self.enter_stage(db, AnalysisStage::Open);
         loop {
             let Some((id, reason)) = self.worklist.pop_first() else {
                 if self.next_round.is_empty() {
+                    if self.advance_stage(db) {
+                        continue;
+                    }
                     break;
                 }
                 let schedule = self.next_round.schedule;
@@ -399,15 +417,67 @@ impl Engine {
         self.cursor = None;
     }
 
+    /// Moves the run to `stage`. Returns the keys of the rules that moved.
+    fn enter_stage(&mut self, db: &mut DbIndex, stage: AnalysisStage) -> Vec<HashedKey> {
+        let before = db.analysis_stage();
+        db.set_analysis_stage(stage);
+        let moved = StageRule::ALL
+            .into_iter()
+            .filter(|rule| rule.holds_at(before) != rule.holds_at(stage))
+            .map(|rule| HashedKey::new(FactKey::StageRule(rule)))
+            .collect::<Vec<_>>();
+        for key in &moved {
+            db.reader_graph().forget_fingerprint(key);
+        }
+        self.moved_rules.get_mut().extend(moved.iter().cloned());
+        moved
+    }
+
+    /// At quiescence, moves the run to its next stage and queues every
+    /// derivation that waited on a rule the stage starts to hold. Returns
+    /// whether it queued any; `false` once the run is closed.
+    fn advance_stage(&mut self, db: &mut DbIndex) -> bool {
+        while let Some(stage) = db.analysis_stage().next() {
+            let moved = self.enter_stage(db, stage);
+            let mut waited = BTreeSet::new();
+            for key in &moved {
+                let current = db.fact_fingerprint(key);
+                waited.extend(db.reader_graph().stale_readers(key, |seen| seen == current));
+            }
+            let mut queued = 0;
+            for reader in waited {
+                match reader.kind {
+                    DerivationKind::Diagnostics => {}
+                    DerivationKind::Source => {
+                        self.stale_sources.insert(reader.file_id);
+                    }
+                    _ => {
+                        self.worklist.insert(reader, Reason::Changed);
+                        queued += 1;
+                    }
+                }
+            }
+            self.stats.stage_started(stage, queued);
+            if queued > 0 {
+                self.cursor = None;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Whether `id`, queued for `reason`, has to run: a reader runs only if a
-    /// fact it read moved.
+    /// fact it read moved. A stage rule it saw holds: only a stage barrier
+    /// moves one, and the barrier queues the rule's readers itself.
     fn needs_evaluation(&mut self, db: &mut DbIndex, id: DerivationId, reason: Reason) -> bool {
         if reason == Reason::Changed
             || db.reader_graph().is_stale(
                 id,
                 |key| db.fact_fingerprint(key),
                 |key, seen| {
-                    !self.edits.is_empty() && seen == self.fingerprint_before_edits(db, key)
+                    key.is_stage_rule()
+                        || (!self.edits.is_empty()
+                            && seen == self.fingerprint_before_edits(db, key))
                 },
             )
         {
@@ -541,7 +611,12 @@ impl Engine {
     ) -> Vec<derivation::Evaluation> {
         derivation::lend_keys(db.reader_graph_mut().lend_keys());
         let lent = scopeguard_lent_keys();
-        derivation::note_written(touched.iter().cloned());
+        derivation::note_written(
+            touched
+                .iter()
+                .cloned()
+                .chain(self.moved_rules.borrow_mut().drain(..)),
+        );
         let evaluations = f(db);
         db.reader_graph_mut().restore_keys(derivation::take_keys());
         std::mem::forget(lent);
@@ -635,6 +710,8 @@ pub(crate) struct EngineStats {
     requeues: BTreeMap<(String, Option<DerivationKind>, DerivationKind), usize>,
     /// Recorded reads by key variant.
     reads: BTreeMap<String, usize>,
+    /// The derivations each stage barrier queued.
+    stages: Vec<(AnalysisStage, usize)>,
     /// Under `GLUALS_PROFILE`: every derivation evaluated, to count repeats.
     distinct: FxHashSet<DerivationId>,
 }
@@ -678,6 +755,18 @@ impl EngineStats {
             eprintln!(
                 "[engine] round {} starts with {queued} queued after {} evaluations",
                 self.rounds,
+                self.total_evaluations()
+            );
+        }
+    }
+
+    /// Notes a stage barrier that queued `queued` derivations; under
+    /// `GLUALS_PROFILE` prints it as it happens.
+    fn stage_started(&mut self, stage: AnalysisStage, queued: usize) {
+        self.stages.push((stage, queued));
+        if self.profiling() {
+            eprintln!(
+                "[engine] stage {stage:?} queues {queued} after {} evaluations",
                 self.total_evaluations()
             );
         }

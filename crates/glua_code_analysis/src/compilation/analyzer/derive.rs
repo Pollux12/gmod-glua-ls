@@ -127,9 +127,11 @@ impl super::engine::Recipe for Recipes {
             }
             DerivationKind::NetHelpers => Box::new(gmod::compute_net_helpers(db, id.file_id)),
             DerivationKind::Network => Box::new(gmod::compute_network_flows(db, id.file_id)),
-            DerivationKind::LocalFallbacks => {
-                Box::new(local_inference::scan_unguarded_children(db, id.file_id))
-            }
+            DerivationKind::LocalFallbacks => Box::new(
+                guesses_locals(db)
+                    .then(|| local_inference::scan_unguarded_children(db, id.file_id))
+                    .flatten(),
+            ),
             DerivationKind::GmodLoadCallSites => Box::new(gmod::compute_annotated_call_sites(
                 db, id.file_id, true, false,
             )),
@@ -170,6 +172,9 @@ impl super::engine::Recipe for Recipes {
                 let scan = *computed
                     .downcast::<Option<local_inference::UnguardedChildFileResult>>()
                     .expect("unguarded-child evidence");
+                if !guesses_locals(db) {
+                    return;
+                }
                 let mut context = AnalyzeContext::for_files(db, vec![id.file_id], &self.scopes);
                 if let Some(scan) = scan {
                     local_inference::publish_unguarded_children(db, &mut context, vec![scan]);
@@ -231,6 +236,13 @@ impl super::engine::Recipe for Recipes {
     }
 }
 
+/// Whether a file's locals are guessed from their uses: only once the run has
+/// closed, since a local still waiting on its initializer is not one the
+/// initializer left without a type.
+fn guesses_locals(db: &DbIndex) -> bool {
+    db.stage_rule_holds(crate::db_index::derivation::StageRule::FloorUnsettled)
+}
+
 impl Recipes {
     fn evaluate_file_derivation(
         &self,
@@ -275,8 +287,10 @@ impl Recipes {
                 call_site_params::CallSiteParamAnalysisPipeline::analyze(db, context)
             }
             DerivationKind::LocalFallbacks => {
-                local_inference::stabilize_unguarded_children(db, context);
-                local_inference::stabilize_unknown_locals(db, context);
+                if guesses_locals(db) {
+                    local_inference::stabilize_unguarded_children(db, context);
+                    local_inference::stabilize_unknown_locals(db, context);
+                }
             }
             DerivationKind::Network => gmod::evaluate_network(db, context),
             DerivationKind::Source

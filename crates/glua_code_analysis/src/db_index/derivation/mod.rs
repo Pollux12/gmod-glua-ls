@@ -50,6 +50,59 @@ use crate::{
     LuaTypeDeclId, LuaTypeOwner,
 };
 
+/// How far an engine run has settled. A read whose answer only holds once no
+/// derivation can add a fact any more waits for the stage that answers it,
+/// so the order derivations happen to run in cannot decide it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AnalysisStage {
+    /// Derivations still add facts: a read of one that has not landed, a
+    /// field no writer declares included, stays unanswered, and so does a
+    /// member slot some of whose writers are untyped.
+    Open,
+    /// A slot's untyped writers are left out while another has a type.
+    SkipUntyped,
+    /// Settled: what is still unanswered reads as a floor. Everything outside
+    /// an engine run reads at this stage.
+    #[default]
+    Closed,
+}
+
+impl AnalysisStage {
+    pub fn next(self) -> Option<Self> {
+        match self {
+            Self::Open => Some(Self::SkipUntyped),
+            Self::SkipUntyped => Some(Self::Closed),
+            Self::Closed => None,
+        }
+    }
+}
+
+/// A rule of reading that holds from one [`AnalysisStage`] on. A read that
+/// consults one records it, so the engine re-evaluates the reader when the
+/// rule starts to hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StageRule {
+    /// A member slot's untyped writers are left out while another writer has
+    /// a type.
+    SkipUntypedWriters,
+    /// A read of a fact that has not landed answers with a floor: unknown, or
+    /// nil for a field no writer declares.
+    FloorUnsettled,
+}
+
+impl StageRule {
+    pub const ALL: [Self; 2] = [Self::SkipUntypedWriters, Self::FloorUnsettled];
+
+    /// Whether the rule holds at `stage`.
+    pub fn holds_at(self, stage: AnalysisStage) -> bool {
+        stage
+            >= match self {
+                Self::SkipUntypedWriters => AnalysisStage::SkipUntyped,
+                Self::FloorUnsettled => AnalysisStage::Closed,
+            }
+    }
+}
+
 /// One readable fact. Every analysis read of an index lands on exactly one
 /// key, and [`crate::DbIndex::fact_fingerprint`] hashes exactly what a read
 /// of that key can observe.
@@ -232,6 +285,8 @@ pub enum FactKey {
     Syntax(InFiled<TextRange>),
     /// The set of files in the workspace.
     FileSet,
+    /// Whether a stage rule holds at the stage the engine run is in.
+    StageRule(StageRule),
 }
 
 /// A fact key with its hash taken once, so the sets and maps that record,
@@ -418,6 +473,12 @@ impl FactKey {
         )
     }
 
+    /// Whether the key is a stage rule: only a stage barrier moves it, and the
+    /// barrier queues the rule's readers itself.
+    pub fn is_stage_rule(&self) -> bool {
+        matches!(self, FactKey::StageRule(_))
+    }
+
     /// The file whose positions the key names, which an edit of that file
     /// renames: the owning file, or the file of a positional property owner.
     pub fn positional_file(&self) -> Option<FileId> {
@@ -511,6 +572,7 @@ impl FactKey {
             | K::HelperRegistry
             | K::HelperScanFiles
             | K::FileSet
+            | K::StageRule(_)
             | K::ValidGuardFiles
             | K::ValidGuardNames
             | K::NetHelperNames

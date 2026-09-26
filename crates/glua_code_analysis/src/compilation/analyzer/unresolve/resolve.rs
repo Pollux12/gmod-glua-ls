@@ -223,7 +223,7 @@ fn should_defer_guarded_index_alias_resolution(
         // is `local x = T.f or {}` where `T.f` is only written later in the
         // same file). Deferring here retires the declaration with no type and
         // lets usage-context inference fabricate one.
-        Ok(ty) => (ty.is_nil() || ty.is_unknown()) && !cache.get_config().analysis_phase.is_force(),
+        Ok(ty) => (ty.is_nil() || ty.is_unknown()) && !crate::semantic::floors_unsettled(db, cache),
         Err(reason) => reason.is_need_resolve(),
     }
 }
