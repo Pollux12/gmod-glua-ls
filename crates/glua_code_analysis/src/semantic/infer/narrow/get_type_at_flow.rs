@@ -1915,9 +1915,9 @@ fn get_type_at_assign_stat(
             Some(expr_type.clone())
         } else {
             let source_type = if let Some(explicit) = explicit_var_type.clone() {
-                explicit
+                Some(explicit)
             } else {
-                match get_antecedent_type_for_flow_node(
+                let antecedent_type = match get_antecedent_type_for_flow_node(
                     db, tree, cache, root, var_ref_id, flow_node, policy,
                 ) {
                     Ok(ty) => ty,
@@ -1927,20 +1927,29 @@ fn get_type_at_assign_stat(
                         LuaType::Nil
                     }
                     Err(err) => return Err(err),
+                };
+                // An `any` value keeps the kind of value the variable held, not
+                // the `nil`/`false` of the old value it replaces (e.g. the
+                // `if not x then` branch it is assigned in).
+                if expr_type.is_any() {
+                    without_falsy_values(antecedent_type)
+                } else {
+                    Some(antecedent_type)
                 }
             };
 
-            if source_type == LuaType::Nil {
-                None
-            } else {
-                let declared = get_var_ref_type(db, cache, var_ref_id)
-                    .ok()
-                    .and_then(|decl| match decl {
-                        LuaType::Def(_) | LuaType::Ref(_) => Some(decl),
-                        _ => None,
-                    });
+            match source_type {
+                Some(source_type) if source_type != LuaType::Nil => {
+                    let declared = get_var_ref_type(db, cache, var_ref_id)
+                        .ok()
+                        .and_then(|decl| match decl {
+                            LuaType::Def(_) | LuaType::Ref(_) => Some(decl),
+                            _ => None,
+                        });
 
-                narrow_down_type(db, source_type.clone(), expr_type.clone(), declared)
+                    narrow_down_type(db, source_type, expr_type.clone(), declared)
+                }
+                _ => None,
             }
         };
 
@@ -1956,6 +1965,28 @@ fn get_type_at_assign_stat(
     }
 
     Ok(ResultTypeOrContinue::Continue)
+}
+
+/// `typ` without its `nil` and `false` members, or `None` when nothing else is
+/// left.
+fn without_falsy_values(typ: LuaType) -> Option<LuaType> {
+    let is_falsy = |member: &LuaType| {
+        matches!(
+            member,
+            LuaType::Nil | LuaType::BooleanConst(false) | LuaType::DocBooleanConst(false)
+        )
+    };
+    match typ {
+        LuaType::Union(union) => {
+            let kept = union
+                .types()
+                .filter(|member| !is_falsy(member))
+                .cloned()
+                .collect::<Vec<_>>();
+            (!kept.is_empty()).then(|| LuaType::from_vec(kept))
+        }
+        typ => (!is_falsy(&typ)).then_some(typ),
+    }
 }
 
 fn try_get_numeric_range_table_arg_population_type(

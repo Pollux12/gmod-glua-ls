@@ -85,6 +85,47 @@ mod test {
         ));
     }
 
+    /// Each fallback assigns an `any` value, so past the `if` `amount` is that
+    /// value or the truthy original: never the `nil|false` the branch began with.
+    #[test]
+    fn a_fallback_assigned_from_an_any_value_is_not_nil_or_false() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param value number
+            ---@param decimals? number
+            ---@return number
+            function math.Round(value, decimals) end
+
+            ---@param x any
+            local function T1(x, amount)
+                if not amount then
+                    amount = x
+                end
+                return math.Round(amount)
+            end
+
+            ---@param x any
+            local function T2(x, amount)
+                if not amount then
+                    amount = x or 1
+                end
+                return math.Round(amount)
+            end
+
+            ---@param x any
+            local function T3(x, amount)
+                if not amount then
+                    amount = x and x or 1
+                end
+                return math.Round(amount)
+            end
+        "#
+        ));
+    }
+
     #[test]
     fn test_issue_216() {
         let mut ws = VirtualWorkspace::new();

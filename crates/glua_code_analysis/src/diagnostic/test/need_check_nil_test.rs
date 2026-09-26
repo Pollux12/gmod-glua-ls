@@ -14972,6 +14972,86 @@ mod test {
         );
     }
 
+    /// `amt` is proven non-nil before it is given an `any` value, so the nil
+    /// its `tonumber` initializer could hold does not come back.
+    #[gtest]
+    fn an_any_value_assigned_after_a_nil_check_stays_non_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            ---@param args string[]
+            ---@param gam any
+            local function BuyIn(args, gam)
+                local amt = tonumber(args[1])
+                if amt then
+                    amt = math.abs(amt)
+                    if amt < gam.minBuyIn then
+                        amt = gam.minBuyIn - gam.chips
+                    end
+                    return 10 + amt
+                end
+            end
+        "#;
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
+    }
+
+    /// `prone * 1` is an `any` value: `TargetPos` keeps holding a vector, but
+    /// not the nil the replaced `maybe` could have been.
+    #[gtest]
+    fn an_any_value_does_not_inherit_the_nil_of_the_value_it_replaces() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            ---@class Vector
+            ---@field x number
+
+            ---@param maybe Vector?
+            ---@param prone any
+            local function Model(maybe, prone)
+                local TargetPos = maybe
+                TargetPos = prone * 1
+                return TargetPos.x
+            end
+        "#;
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
+    }
+
+    /// `ArrestTime * 0.75` infers as `any`, which keeps `ArrestTime` a number,
+    /// but the path that skips the `if` still carries the field's nil.
+    #[gtest]
+    fn an_any_value_assigned_on_one_path_keeps_the_nil_of_the_other() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@class ArrestPlayer
+            ---@field _WarrantedTime number?
+
+            ---@param ply ArrestPlayer
+            ---@param supporter boolean
+            local function Arrest(ply, supporter)
+                local ArrestTime = ply._WarrantedTime
+                if supporter then
+                    ArrestTime = ArrestTime * 0.75
+                end
+                return 10 + ArrestTime
+            end
+            "#,
+        );
+
+        let diagnostics = need_check_nil_for_file(&mut ws, file_id);
+        assert_that!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.range.start.line == 11)
+                .count(),
+            eq(1)
+        );
+    }
+
     /// Past `if (!argument and !bOptional) then return end`, `argument` is
     /// whatever `given[i]` held: the guard splits the unknown value by
     /// truthiness, and the fall-through merges both pieces back into it.
