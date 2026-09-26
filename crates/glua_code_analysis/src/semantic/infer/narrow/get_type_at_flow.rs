@@ -19,7 +19,9 @@ use crate::{
     AssignVarHint, CacheEntry, DbIndex, FileId, FlowAntecedent, FlowId, FlowNode, FlowNodeKind,
     FlowTree, GlobalId, GmodRealm, InferFailReason, LuaArrayType, LuaDeclId, LuaInferCache,
     LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType,
-    LuaTypeCache, LuaTypeDeclId, LuaTypeOwner, LuaUnionType, TypeOps, infer_expr,
+    LuaTypeCache, LuaTypeDeclId, LuaTypeOwner, LuaUnionType, TypeOps,
+    compilation::analyzer::gmod::realm_from_condition,
+    infer_expr,
     semantic::cache::{FlowOrigin, VarRefCacheKey},
     semantic::gmod_call_effect::{GmodCallWriteEffect, gmod_call_write_effect},
     semantic::infer::{
@@ -776,8 +778,23 @@ fn get_type_at_flow_walk(
                 }
             }
             FlowNodeKind::TrueCondition(condition_ptr) => {
+                let condition = condition_ptr.to_node(root);
+                if let Some(realm_type) = get_type_under_condition_realm(
+                    db,
+                    tree,
+                    cache,
+                    root,
+                    var_ref_id,
+                    flow_node.id,
+                    condition.as_ref(),
+                    InferConditionFlow::TrueCondition,
+                    query_realm,
+                    policy,
+                ) {
+                    return realm_type;
+                }
                 if policy.is_closure_baseline() {
-                    if let Some(condition) = condition_ptr.to_node(root)
+                    if let Some(condition) = condition
                         && let Ok(Some(condition_type)) = get_type_at_immutable_closure_condition(
                             db,
                             tree,
@@ -801,7 +818,7 @@ fn get_type_at_flow_walk(
                     continue;
                 }
 
-                let condition = condition_ptr.to_node(root).ok_or(InferFailReason::None)?;
+                let condition = condition.ok_or(InferFailReason::None)?;
                 // Errors in condition evaluation (e.g. method not found) must not
                 // propagate and corrupt the type of unrelated variables.  Treat them
                 // as "condition cannot be used for narrowing" and fall through.
@@ -832,8 +849,23 @@ fn get_type_at_flow_walk(
                 }
             }
             FlowNodeKind::FalseCondition(condition_ptr) => {
+                let condition = condition_ptr.to_node(root);
+                if let Some(realm_type) = get_type_under_condition_realm(
+                    db,
+                    tree,
+                    cache,
+                    root,
+                    var_ref_id,
+                    flow_node.id,
+                    condition.as_ref(),
+                    InferConditionFlow::FalseCondition,
+                    query_realm,
+                    policy,
+                ) {
+                    return realm_type;
+                }
                 if policy.is_closure_baseline() {
-                    if let Some(condition) = condition_ptr.to_node(root)
+                    if let Some(condition) = condition
                         && let Ok(Some(condition_type)) = get_type_at_immutable_closure_condition(
                             db,
                             tree,
@@ -857,7 +889,7 @@ fn get_type_at_flow_walk(
                     continue;
                 }
 
-                let condition = condition_ptr.to_node(root).ok_or(InferFailReason::None)?;
+                let condition = condition.ok_or(InferFailReason::None)?;
                 // Same defensive handling as TrueCondition above.
                 let result_or_continue = match get_type_at_condition_flow(
                     db,
@@ -1476,6 +1508,63 @@ fn get_or_compute_flow_node_realm(
         frame,
     );
     realm
+}
+
+/// Walks on from a condition outcome that proves which realm runs the code.
+/// `CLIENT` and `SERVER` are never both true nor both false, so the rest of
+/// the path runs in the proven realm, and a path whose proven realm
+/// contradicts the realm already known on it is never taken.
+#[allow(clippy::too_many_arguments)]
+fn get_type_under_condition_realm(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_id: FlowId,
+    condition: Option<&LuaExpr>,
+    outcome: InferConditionFlow,
+    query_realm: GmodRealm,
+    policy: FlowWalkPolicy,
+) -> Option<InferResult> {
+    if !db.get_emmyrc().gmod.enabled {
+        return None;
+    }
+    let proven_realm = condition_outcome_realm(condition?, outcome)?;
+    match narrow_path_realm(query_realm, proven_realm) {
+        None => Some(Ok(LuaType::Never)),
+        Some(realm) if realm == query_realm => None,
+        Some(realm) => Some(with_flow_query_realm(cache, realm, |cache| {
+            get_type_at_flow_in_mode(db, tree, cache, root, var_ref_id, flow_id, policy)
+        })),
+    }
+}
+
+fn condition_outcome_realm(condition: &LuaExpr, outcome: InferConditionFlow) -> Option<GmodRealm> {
+    let realm = realm_from_condition(condition)?;
+    match outcome {
+        InferConditionFlow::TrueCondition => Some(realm),
+        InferConditionFlow::FalseCondition => match realm {
+            GmodRealm::Client => Some(GmodRealm::Server),
+            GmodRealm::Server => Some(GmodRealm::Client),
+            _ => None,
+        },
+    }
+}
+
+/// The realm a path runs in once a condition on it proves `proven`, or `None`
+/// when no realm satisfies both.
+fn narrow_path_realm(path_realm: GmodRealm, proven: GmodRealm) -> Option<GmodRealm> {
+    match (path_realm, proven) {
+        (GmodRealm::Unknown | GmodRealm::Shared, proven) => Some(proven),
+        (path_realm, GmodRealm::Unknown | GmodRealm::Shared) => Some(path_realm),
+        (path_realm, proven) if path_realm == proven => Some(path_realm),
+        // The menu state runs with `CLIENT` set.
+        (GmodRealm::Client, GmodRealm::Menu) | (GmodRealm::Menu, GmodRealm::Client) => {
+            Some(GmodRealm::Menu)
+        }
+        _ => None,
+    }
 }
 
 fn realms_can_reach(target: GmodRealm, source: GmodRealm) -> bool {

@@ -9744,7 +9744,7 @@ fn find_parent_block(node: &LuaSyntaxNode) -> Option<LuaBlock> {
 
 /// Match condition expressions to realms.
 /// Handles: `CLIENT`, `SERVER`, `not CLIENT`, `not SERVER`, `(CLIENT)`, `(SERVER)`
-fn realm_from_condition(expr: &LuaExpr) -> Option<GmodRealm> {
+pub(crate) fn realm_from_condition(expr: &LuaExpr) -> Option<GmodRealm> {
     match expr {
         // Handle parentheses: extract inner expression and recurse
         LuaExpr::ParenExpr(paren_expr) => paren_expr

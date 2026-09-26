@@ -15052,6 +15052,84 @@ mod test {
         );
     }
 
+    fn def_local_player_stubs(ws: &mut VirtualWorkspace) {
+        ws.def_file(
+            "lua/aaa_annotations/player.lua",
+            r#"
+            ---@class Player
+            local Player = {}
+
+            ---@return string
+            function Player:Nick() end
+
+            ---@return Player
+            function LocalPlayer() end
+            "#,
+        );
+    }
+
+    /// Exactly one of `CLIENT` and `SERVER` holds, so the fall-through with
+    /// `client` still falsy (both flags false) is never taken.
+    #[gtest]
+    fn client_and_server_guards_leave_no_realm_with_a_nil_client() {
+        let mut ws = gmod_ws();
+        def_local_player_stubs(&mut ws);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_can_buy.lua",
+            r#"
+            local M = {}
+
+            ---@param client Player?
+            function M.CanBuyItem(uniqueID, client)
+                if not client and CLIENT then
+                    client = LocalPlayer()
+                elseif not client and SERVER then
+                    return false
+                end
+                return client:Nick()
+            end
+
+            ---@param client Player?
+            function M.CanSellItem(uniqueID, client)
+                if not client and SERVER then
+                    return false
+                elseif not client and CLIENT then
+                    client = LocalPlayer()
+                end
+                return client:Nick()
+            end
+
+            return M
+            "#,
+        );
+
+        assert_that!(need_check_nil_for_file(&mut ws, file_id), is_empty());
+    }
+
+    #[gtest]
+    fn a_client_only_guard_leaves_the_server_path_with_a_nil_client() {
+        let mut ws = gmod_ws();
+        def_local_player_stubs(&mut ws);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_can_buy.lua",
+            r#"
+            local M = {}
+
+            ---@param client Player?
+            function M.CanBuyItem(uniqueID, client)
+                if not client and CLIENT then
+                    client = LocalPlayer()
+                end
+                return client:Nick()
+            end
+
+            return M
+            "#,
+        );
+
+        assert_that!(need_check_nil_for_file(&mut ws, file_id), len(eq(1)));
+    }
+
     /// Past `if (!argument and !bOptional) then return end`, `argument` is
     /// whatever `given[i]` held: the guard splits the unknown value by
     /// truthiness, and the fall-through merges both pieces back into it.
