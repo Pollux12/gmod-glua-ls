@@ -182,6 +182,30 @@ mod test {
     }
 
     #[test]
+    fn an_integer_index_on_a_known_class_or_an_unknown_value_is_not_nullable() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Angle
+            ---@field [1] number
+            ---@field [2] number
+            ---@return Angle
+            function Angle() end
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function think(u)
+                local a = Angle()
+                if u then a = u end
+                return a[2] + 1
+            end
+            "#
+        ));
+    }
+
+    #[test]
     fn test_issue_245() {
         let mut ws = VirtualWorkspace::new();
 

@@ -4616,10 +4616,10 @@ marauth.character = marauth.character or {}
         ws.analysis.reindex_files(vec![consumer]);
         let warm = local_name_type(&mut ws, consumer, "cost");
         // The member the read waits on holds an `unknown` value, so the sealed
-        // index answers `unknown|nil` for `stored[itemID]` and `.cost` floors
-        // to `nil` — the answer the read must also reach when it first runs
-        // before the deferred write lands.
-        assert_that!(warm, eq(&LuaType::Nil));
+        // index answers `unknown|nil` for `stored[itemID]` and `.cost` of its
+        // unknown arm is `unknown` — the answer the read must also reach when
+        // it first runs before the deferred write lands.
+        assert_that!(warm, eq(&LuaType::Unknown));
         assert_eq!(cold, warm, "re-index moved the dynamic-key read's answer");
     }
 

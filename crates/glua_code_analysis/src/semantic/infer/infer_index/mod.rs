@@ -2596,6 +2596,12 @@ fn infer_union_member(
     let mut missing_arm = false;
     let mut last_resolve_reason = None;
     for sub_type in union_type.types() {
+        // Nothing is known about an unknown arm's fields, including whether
+        // this one is missing.
+        if sub_type.is_unknown() {
+            member_types.push(LuaType::Unknown);
+            continue;
+        }
         if sub_type.is_string() {
             if meet_string {
                 continue;
