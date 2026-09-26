@@ -192,6 +192,29 @@ vgui.Register(\"PlayerBanButton\", PANEL, \"DButton\")
         ]);
     }
 
+    #[test]
+    fn a_global_bootstrapped_in_client_shared_and_server_files_settles_the_same_in_either_order() {
+        assert_schedule_independent(&[
+            (
+                "gamemodes/cityrp/plugins/hitreg/cl_init.lua",
+                "LeyHitreg = LeyHitreg or {}
+",
+            ),
+            (
+                "gamemodes/cityrp/plugins/hitreg/sh_config.lua",
+                "LeyHitreg = LeyHitreg or {}
+LeyHitreg.Name = \"x\"
+",
+            ),
+            (
+                "gamemodes/cityrp/plugins/hitreg/sv_init.lua",
+                "if CLIENT then return end
+LeyHitreg = LeyHitreg or {}
+",
+            ),
+        ]);
+    }
+
     fn assert_schedule_independent(files: &[(&str, &str)]) {
         let canonical = settled(Schedule::Canonical, files).expect("canonical order settles");
         let reversed = settled(Schedule::Reversed, files).expect("reversed order settles");

@@ -2724,10 +2724,16 @@ fn infer_global_type_from_decl_ids(db: &DbIndex, decl_ids: Vec<LuaDeclId>) -> In
     // the table merge pick a different winner, and `saw_nil` cannot know whether
     // the absent declaration was nil.
     //
-    // Defer instead. The unresolve pass retries once that declaration carries a
-    // type and floors it to `Unknown` if it never does, so this cannot stall.
+    // Defer instead, until the run skips untyped writers: from then on the
+    // merge is of the declarations that carry a type, and with none it reads as
+    // a global nothing declares yet. Each declaration landing only adds to it.
     if !matches!(last_resolve_reason, InferFailReason::None) {
-        return Err(last_resolve_reason);
+        if !db.stage_rule_holds(crate::db_index::derivation::StageRule::SkipUntypedWriters) {
+            return Err(last_resolve_reason);
+        }
+        if !saw_resolved_decl_type {
+            return Err(InferFailReason::None);
+        }
     }
 
     if let Some(callable_type) = callable_type {
