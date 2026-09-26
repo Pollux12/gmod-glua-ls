@@ -60,11 +60,40 @@ pub fn check_object_type_compact(
                 check_guard.next_level()?,
             );
         }
+        LuaType::TableGeneric(params) => {
+            return check_object_type_compact_table_generic(
+                context,
+                source_object,
+                params,
+                check_guard.next_level()?,
+            );
+        }
         LuaType::Table => return Ok(()),
         _ => {}
     }
 
     Err(TypeCheckFailReason::DonotCheck)
+}
+
+/// A `table<K, V>` holds `V` under every key it has, so each field and each
+/// indexed value of the object must accept `V`, and each index key must accept
+/// `K`.
+fn check_object_type_compact_table_generic(
+    context: &mut TypeCheckContext,
+    source_object: &LuaObjectType,
+    params: &[LuaType],
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    let key_type = params.first().unwrap_or(&LuaType::Any);
+    let value_type = params.get(1).unwrap_or(&LuaType::Any);
+    for field_type in source_object.get_fields().values() {
+        check_general_type_compact(context, field_type, value_type, check_guard.next_level()?)?;
+    }
+    for (index_key, index_value) in source_object.get_index_access() {
+        check_general_type_compact(context, index_key, key_type, check_guard.next_level()?)?;
+        check_general_type_compact(context, index_value, value_type, check_guard.next_level()?)?;
+    }
+    Ok(())
 }
 
 fn check_object_type_compact_object_type(

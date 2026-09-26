@@ -2149,6 +2149,77 @@ return t
     }
 
     #[test]
+    fn a_table_of_any_is_assignable_to_a_keyed_table_shape() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@param data table<any, any>
+            local function sync(data)
+                ---@type { [string]: { value: any, type: integer } }
+                local stored = {}
+                stored = data
+            end
+            "#
+        ));
+    }
+
+    #[test]
+    fn a_table_whose_values_do_not_fit_a_field_is_not_assignable_to_the_shape() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@param data table<string, number>
+            local function sync(data)
+                ---@type { name: string }
+                local stored = { name = "x" }
+                stored = data
+            end
+            "#
+        ));
+    }
+
+    #[test]
+    fn a_write_widens_an_inferred_member_read_through_a_nullable_class() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@class SnipInv
+            local META = {}
+            META.data = META.data or {}
+
+            ---@param key string
+            ---@param dataType? integer
+            function META:SetData(key, value, dataType)
+                dataType = dataType or 1
+                self.data = self.data or {}
+                self.data[key] = { value = value, type = dataType }
+            end
+
+            ---@return SnipInv?
+            local function GetInv(id) return nil end
+            ---@return SnipInv
+            local function CreateInv(id) return META end
+
+            ---@param data table<any, any>
+            local function sync(data)
+                local inv = GetInv(1)
+                if not inv then
+                    inv = CreateInv(1)
+                else
+                    inv.items = {}
+                end
+                if data then
+                    inv.data = data
+                end
+            end
+            "#
+        ));
+    }
+
+    #[test]
     fn test_annotated_tuple_member_collection_remains_strict() {
         let mut ws = VirtualWorkspace::new();
         assert!(!ws.check_code_for(
