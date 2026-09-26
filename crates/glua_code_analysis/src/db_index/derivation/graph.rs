@@ -593,6 +593,31 @@ impl ReaderGraph {
         moved
     }
 
+    /// Relabels the reads of `key` that saw `from` as having seen `to`: after
+    /// an edit that only moved the key's positions, what they read is the
+    /// value as it stands now, and the next edit maps back from here.
+    pub fn rebase_readers(&mut self, key: &HashedKey, from: Fingerprint, to: Fingerprint) {
+        let Some(&slot) = self.table.key_slots.get(key) else {
+            return;
+        };
+        let readers = &mut self.table.keys[slot as usize].readers;
+        let Some(at) = readers.0.iter().position(|(seen, _)| *seen == from) else {
+            return;
+        };
+        let (_, derivs) = readers.0.swap_remove(at);
+        for deriv in &derivs {
+            if let Some(record) = self.derivations[*deriv as usize].record.as_mut()
+                && let Ok(read) = record.reads.binary_search_by_key(&slot, |(read, _)| *read)
+            {
+                record.reads[read].1 = to;
+            }
+        }
+        let readers = &mut self.table.keys[slot as usize].readers;
+        for deriv in derivs {
+            readers.insert(deriv, to);
+        }
+    }
+
     /// Renames every recorded read of a key `edits` moved to the key's new
     /// position, keeping the fingerprint the reader saw. Returns the readers
     /// of keys the edits destroyed.

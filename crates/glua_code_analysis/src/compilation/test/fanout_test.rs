@@ -137,6 +137,19 @@ end
         assert_eq!(workspace.evaluated_files(), vec![workspace.configuration]);
     }
 
+    /// A read that held because the edit only moved positions reads the value
+    /// as it stands after the edit, so the next edit compares against that.
+    #[test]
+    fn a_second_shift_in_a_file_that_defines_a_helper_re_runs_nothing_in_other_files() {
+        let mut workspace = cityrp_workspace();
+        let default_money = "cityrp.configuration[\"Default Money\"]";
+        workspace.edit_configuration(default_money, &format!(" {default_money}"));
+
+        workspace.edit_configuration(default_money, &format!("  {default_money}"));
+
+        assert_eq!(workspace.evaluated_files(), vec![workspace.configuration]);
+    }
+
     #[test]
     fn a_shift_in_a_file_that_defines_a_net_payload_wrapper_re_runs_nothing_in_other_files() {
         const WRAPPER: &str = "gamemodes/cityrp/gamemode/core/sh_netwrap.lua";

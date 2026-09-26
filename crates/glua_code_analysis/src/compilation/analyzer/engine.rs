@@ -416,6 +416,28 @@ impl Engine {
             crate::profile::phase("engine: readers of", || self.readers_of(db, touched.iter()));
         }
         self.cursor = None;
+        self.rebase_moved_reads(db);
+    }
+
+    /// Re-records every read that held only with the edits mapped back as a
+    /// read of the value as it stands now, so the next edit of the same file
+    /// compares against it rather than against the text before this one.
+    fn rebase_moved_reads(&self, db: &mut DbIndex) {
+        if self.edits.is_empty() {
+            return;
+        }
+        let moved = self
+            .touched
+            .iter()
+            .filter_map(|key| {
+                let current = self.fingerprint(db, key);
+                let before = self.fingerprint_before_edits(db, key);
+                (before != current).then(|| (key.clone(), before, current))
+            })
+            .collect::<Vec<_>>();
+        for (key, before, current) in moved {
+            db.reader_graph_mut().rebase_readers(&key, before, current);
+        }
     }
 
     /// Moves the run to `stage`. Returns the keys of the rules that moved.
