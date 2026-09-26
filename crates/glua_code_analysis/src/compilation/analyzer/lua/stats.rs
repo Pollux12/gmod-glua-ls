@@ -1114,6 +1114,12 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
 
         let mut expr_type =
             member_assignment_or_source_type(analyzer, &type_owner, expr, expr_type);
+        if matches!(type_owner, LuaTypeOwner::Member(_)) && expr_reads_own_path(&var, expr) {
+            // `t.k = t.k + 1` holds a new value every time it runs: a literal
+            // would be one run's value, and writers reading each other's
+            // literal would count up without end.
+            expr_type = crate::db_index::widen_literal_type_for_assignment(&expr_type);
+        }
 
         widen_existing_member_collection_type(analyzer, &var, &expr_type);
         let guarded_bootstrap_canonical = assign_merge_type_owner_and_expr_type(
@@ -1710,6 +1716,27 @@ pub(crate) fn expr_fills_own_default(
 /// bit.bor(bit.lshift(width:byte(1), 24), ...)`). Depth does not change the
 /// self-contradiction — the value still cannot be the decl's lifetime type,
 /// because it was computed from a read that type would reject.
+/// Whether `expr`, outside the closures it holds, reads the path `var`
+/// writes.
+fn expr_reads_own_path(var: &LuaVarExpr, expr: &LuaExpr) -> bool {
+    let Some(path) = var.get_access_path() else {
+        return false;
+    };
+    let expr_range = expr.get_range();
+    std::iter::once(expr.syntax().clone())
+        .chain(expr.syntax().descendants())
+        .filter_map(LuaVarExpr::cast)
+        .filter(|read| {
+            !read
+                .ancestors::<LuaClosureExpr>()
+                .any(|closure| expr_range.contains_range(closure.get_range()))
+        })
+        .any(|read| {
+            read.get_access_path()
+                .is_some_and(|read_path| read_path == path)
+        })
+}
+
 pub(crate) fn expr_reads_out_of_decl(
     db: &DbIndex,
     file_id: crate::FileId,

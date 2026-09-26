@@ -86,4 +86,80 @@ mod test {
             ),
         ]);
     }
+
+    #[test]
+    #[ignore = "a member cycle keeps whichever seed it first saw, `nil` or an `unknown` from an input not analysed yet"]
+    fn a_field_written_only_with_its_own_value_settles_the_same_in_either_order() {
+        assert_schedule_independent(&[
+            (
+                "lua/aaa_annotations/entity.lua",
+                r#"---@class Entity
+---@return tableof<self>
+function Entity:GetTable() end
+
+---@generic T : table
+---@param metaName `T`
+---@return (definition) T
+function _G.FindMetaTable(metaName) end
+"#,
+            ),
+            (
+                "lua/entities/base_glide_car/init.lua",
+                r#"function ENT:OnPostThink(dt, selfTbl)
+    ---@type base_glide_car
+    selfTbl = selfTbl or getTable(self)
+    local isElectric = self:IsElectric()
+    selfTbl._isElectric = isElectric
+end
+"#,
+            ),
+            (
+                "lua/entities/base_glide_car/shared.lua",
+                r#"local getTable = FindMetaTable("Entity").GetTable
+function ENT:IsElectric(selfTbl)
+    selfTbl = selfTbl or getTable(self)
+    local cached = selfTbl._isElectric
+    selfTbl._isElectric = cached
+    return cached
+end
+"#,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn two_entities_incrementing_a_player_counter_settle_in_either_order() {
+        assert_schedule_independent(&[
+            (
+                "lua/aaa_annotations/entity.lua",
+                r#"---@class Entity
+local Entity = {}
+
+---@param activator Entity
+function Entity:Use(activator, caller, useType, value) end
+"#,
+            ),
+            (
+                "lua/aaa_annotations/player.lua",
+                "---@class (partial) Player : Entity\n",
+            ),
+            (
+                "gamemodes/cityrp/gamemode/core/hooks/sv_hooks.lua",
+                "function GM:PlayerInitialSpawn(player)\n    player.cityrp = {}\nend\n",
+            ),
+            (
+                "gamemodes/cityrp/plugins/farming/entities/entities/cityrp_plant_base/init.lua",
+                PLANT_USE,
+            ),
+            (
+                "gamemodes/cityrp/plugins/farming/entities/entities/cityrp_plant_ground_base/init.lua",
+                PLANT_USE,
+            ),
+        ]);
+    }
+
+    const PLANT_USE: &str = r#"function ENT:Use(activator, caller)
+    activator.cityrp._PlantsHarvested = activator.cityrp._PlantsHarvested + 1
+end
+"#;
 }
