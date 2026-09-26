@@ -120,4 +120,49 @@ mod tests {
         assert!(index.contributors.is_empty());
         assert!(index.inferred_params.is_empty());
     }
+
+    /// Evidence for a function in a file an edit shifted moves with the
+    /// function's signature.
+    #[test]
+    fn a_shift_carries_evidence_to_the_moved_signature() {
+        let caller = FileId::new(1);
+        let callee_file = FileId::new(10);
+        let before = signature_id(callee_file, 2);
+        let mut index = CallSiteParamIndex::new();
+        set(&mut index, caller, vec![(before, 0, LuaType::Integer)]);
+
+        let dirty = index.remap_file_identities(&FileRemap::unvalidated(
+            callee_file,
+            crate::PositionMap::new("abcdef", "\nabcdef"),
+        ));
+
+        assert!(dirty.is_empty());
+        assert_eq!(
+            index.get_inferred_param(&signature_id(callee_file, 3), 0),
+            Some(&LuaType::Integer)
+        );
+        assert_eq!(index.get_inferred_param(&before, 0), None);
+    }
+
+    /// Evidence for a function the edit destroyed stays as it was, and its
+    /// file is reported so it is analysed again.
+    #[test]
+    fn evidence_for_a_signature_an_edit_destroyed_leaves_its_file_dirty() {
+        let caller = FileId::new(1);
+        let callee_file = FileId::new(10);
+        let destroyed = signature_id(callee_file, 3);
+        let mut index = CallSiteParamIndex::new();
+        set(&mut index, caller, vec![(destroyed, 0, LuaType::Integer)]);
+
+        let dirty = index.remap_file_identities(&FileRemap::unvalidated(
+            callee_file,
+            crate::PositionMap::new("abcdef", "abXYef"),
+        ));
+
+        assert_eq!(dirty.into_iter().collect::<Vec<_>>(), vec![caller]);
+        assert_eq!(
+            index.get_inferred_param(&destroyed, 0),
+            Some(&LuaType::Integer)
+        );
+    }
 }

@@ -707,6 +707,39 @@ pub fn remap_identities_in_type(typ: &LuaType, remap: &crate::FileRemap) -> Type
     }
 }
 
+/// `fact` with every identity of the edited file it names moved: its payload
+/// type and its provenance. `None` when it names none; `lost` is set when one
+/// did not survive.
+pub(crate) fn remap_type_fact(
+    fact: &LuaTypeFact,
+    remap: &crate::FileRemap,
+    lost: &mut bool,
+) -> Option<LuaTypeFact> {
+    let remapped = remap_identities_in_type(fact.typ(), remap);
+    if remapped.lost {
+        *lost = true;
+    }
+    let provenance = remap_provenance(fact.provenance(), remap, lost);
+    (remapped.typ.is_some() || provenance.is_some()).then(|| {
+        LuaTypeFact::from_normalized_parts(
+            remapped.typ.unwrap_or_else(|| fact.typ().clone()),
+            fact.confidence(),
+            fact.base_provenance_kind(),
+            provenance.unwrap_or_else(|| fact.provenance().into()),
+        )
+    })
+}
+
+/// The files `fact` names: its payload type on top of its provenance.
+/// Exactly the files [`remap_type_fact`] consults, so a fact whose set skips a
+/// file remaps to itself there.
+pub(crate) fn type_fact_referenced_files(fact: &LuaTypeFact) -> HashSet<FileId> {
+    let mut files = HashSet::default();
+    collect_type_files(fact.typ(), &mut files);
+    collect_provenance_files(fact.provenance().iter(), &mut files);
+    files
+}
+
 /// Rewrites the nodes, source sites and types one fact's provenance names.
 ///
 /// Returns `None` when nothing in it belonged to the edited file. `lost` is set
@@ -2519,14 +2552,6 @@ impl LuaTypeIndex {
         files
     }
 
-    /// The files `fact` names: its payload type on top of its provenance.
-    fn definition_fact_referenced_files(fact: &LuaTypeFact) -> HashSet<FileId> {
-        let mut files = HashSet::default();
-        collect_type_files(fact.typ(), &mut files);
-        collect_provenance_files(fact.provenance().iter(), &mut files);
-        files
-    }
-
     /// Re-points the reverse edges of `owner`'s fact at what the stored
     /// metadata now names. Call on every metadata write; the remap only moves
     /// identities within one file, so it never changes the file set and skips
@@ -2553,7 +2578,7 @@ impl LuaTypeIndex {
         let files = self
             .definition_facts
             .get(definition)
-            .map(Self::definition_fact_referenced_files)
+            .map(type_fact_referenced_files)
             .unwrap_or_default();
         replace_reverse_edges(
             &mut self.definition_fact_refs_by_file,
@@ -2833,21 +2858,8 @@ impl LuaTypeIndex {
                 continue;
             };
             let mut lost = false;
-            let remapped = remap_identities_in_type(fact.typ(), remap);
-            if remapped.lost {
-                lost = true;
-            }
-            let provenance = remap_provenance(fact.provenance(), remap, &mut lost);
-            if remapped.typ.is_some() || provenance.is_some() {
-                fact_updates.push((
-                    definition,
-                    LuaTypeFact::from_normalized_parts(
-                        remapped.typ.unwrap_or_else(|| fact.typ().clone()),
-                        fact.confidence(),
-                        fact.base_provenance_kind(),
-                        provenance.unwrap_or_else(|| fact.provenance().into()),
-                    ),
-                ));
+            if let Some(fact) = remap_type_fact(fact, remap, &mut lost) {
+                fact_updates.push((definition, fact));
             }
             if lost {
                 dirty.insert(definition.file_id());
@@ -3999,7 +4011,7 @@ mod batch_removal_tests {
         assert_eq!(index.fact_refs_by_file, expected_by_file);
 
         for (definition, fact) in &index.definition_facts {
-            let expected = LuaTypeIndex::definition_fact_referenced_files(fact);
+            let expected = type_fact_referenced_files(fact);
             assert_eq!(
                 index
                     .definition_fact_ref_files

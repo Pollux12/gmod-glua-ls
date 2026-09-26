@@ -215,6 +215,28 @@ end
         );
     }
 
+    /// The call-site index keeps the evidence other files give a re-indexed
+    /// file's parameters, so the callers do not gather it again.
+    #[test]
+    fn a_statement_added_to_a_file_whose_function_another_file_calls_re_runs_nothing_in_the_caller()
+    {
+        const TRACK: &str = "gamemodes/cityrp/gamemode/core/sv_track.lua";
+        const TRACK_TEXT: &str =
+            "function cityrp.TrackVehicle(vehicle)\n    return vehicle.speed\nend\n";
+        let mut workspace = cityrp_workspace();
+        let track = workspace.ws.def_file(TRACK, TRACK_TEXT);
+        workspace.ws.def_file(
+            "gamemodes/cityrp/gamemode/core/sv_vehicle.lua",
+            "---@class CityVehicle\n---@field speed number\nlocal Vehicle = {}\nfunction Vehicle:Spawn()\n    cityrp.TrackVehicle(self)\nend\n",
+        );
+
+        workspace
+            .ws
+            .def_file(TRACK, &format!("{TRACK_TEXT}local unused = 1\n"));
+
+        assert_eq!(workspace.evaluated_files(), vec![track]);
+    }
+
     /// Whether a table literal is array-shaped is read off the statement that
     /// holds it, so a statement added elsewhere in its file leaves the files
     /// that index it standing.

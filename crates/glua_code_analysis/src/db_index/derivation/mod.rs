@@ -481,13 +481,16 @@ impl FactKey {
                 | K::MemberOwnerMap(_)
                 | K::MemberOwnerExprKeys(_)
                 | K::MemberOwnerFields(_)
+                | K::Contrib(..)
+                | K::CallSiteFile(_)
         )
     }
 
     /// Whether removing the owning file keeps what other files' derivations
-    /// stored under the key: the member and dynamic-field indexes file each
-    /// contribution under its contributing file, and the edit remap re-homes
-    /// an owner that moved, or reports its contributors when it is gone.
+    /// stored under the key: the member, dynamic-field and call-site indexes
+    /// file each contribution under its contributing file, and the edit remap
+    /// re-homes an owner or signature that moved, or reports its contributors
+    /// when it is gone.
     pub fn keeps_foreign_contributions(&self) -> bool {
         use FactKey as K;
         matches!(
@@ -500,6 +503,7 @@ impl FactKey {
                 | K::DynamicField(..)
                 | K::DynamicFieldWildcards(_)
                 | K::DynamicFieldFinite(_)
+                | K::Contrib(..)
         )
     }
 

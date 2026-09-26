@@ -5,9 +5,10 @@ use std::collections::BTreeSet;
 
 use super::traits::LuaIndex;
 use crate::db_index::derivation::{self, FactKey, Fingerprint};
+use crate::db_index::r#type::{remap_type_fact, type_fact_referenced_files};
 use crate::{
-    FileId, LuaInferenceConfidence, LuaInferenceDiagnosticEvent, LuaInferenceStep, LuaSignatureId,
-    LuaType, LuaTypeFact,
+    FileId, FileRemap, LuaInferenceConfidence, LuaInferenceDiagnosticEvent, LuaInferenceStep,
+    LuaSignatureId, LuaType, LuaTypeFact, Remap,
 };
 
 #[derive(Debug, Clone, PartialEq, Hash)]
@@ -75,6 +76,10 @@ pub struct CallSiteParamIndex {
     contributors: HashMap<ParamSlot, BTreeSet<FileId>>,
     /// signature → param index → the folded fact.
     inferred_params: HashMap<LuaSignatureId, HashMap<usize, LuaTypeFact>>,
+    /// file → the other files whose evidence names one of its identities: a
+    /// callee signature, or a table, signature or node its types and
+    /// provenance name.
+    referencing: HashMap<FileId, BTreeSet<FileId>>,
 }
 
 impl CallSiteParamIndex {
@@ -105,6 +110,9 @@ impl CallSiteParamIndex {
             self.contributors.entry(slot).or_default().insert(file_id);
             slots.insert(slot);
         }
+        for named in referenced_files(file_id, &contributions) {
+            self.referencing.entry(named).or_default().insert(file_id);
+        }
         if !contributions.is_empty() {
             self.file_contributions.insert(file_id, contributions);
         }
@@ -122,6 +130,14 @@ impl CallSiteParamIndex {
             return HashSet::default();
         };
         derivation::note_write(|| FactKey::CallSiteFile(file_id));
+        for named in referenced_files(file_id, &contributions) {
+            if let Some(files) = self.referencing.get_mut(&named) {
+                files.remove(&file_id);
+                if files.is_empty() {
+                    self.referencing.remove(&named);
+                }
+            }
+        }
         let mut slots = HashSet::default();
         for contribution in contributions {
             let slot = (contribution.signature_id, contribution.param_idx);
@@ -180,6 +196,52 @@ impl CallSiteParamIndex {
                 }
             }
         }
+    }
+
+    /// Carries the evidence other files contributed through the edited file's
+    /// moved identities: a callee signature, and whatever its types and
+    /// provenance name. Returns the files whose evidence named an identity the
+    /// edit destroyed; theirs stays as it is until they are analysed again.
+    pub fn remap_file_identities(&mut self, remap: &FileRemap) -> HashSet<FileId> {
+        let mut dirty = HashSet::default();
+        let contributing = self
+            .referencing
+            .get(&remap.file_id)
+            .map(|files| files.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for file_id in contributing {
+            let Some(contributions) = self.file_contributions.get(&file_id) else {
+                continue;
+            };
+            let mut lost = false;
+            let mut moved = false;
+            let remapped = contributions
+                .iter()
+                .map(|contribution| {
+                    let signature_id = match remap.signature_id(contribution.signature_id) {
+                        Remap::Moved(signature_id) => {
+                            moved |= signature_id != contribution.signature_id;
+                            signature_id
+                        }
+                        Remap::Unrelated => contribution.signature_id,
+                        Remap::Lost => {
+                            lost = true;
+                            contribution.signature_id
+                        }
+                    };
+                    let param_fact = remap_type_fact(&contribution.param_fact, remap, &mut lost)
+                        .inspect(|_| moved = true)
+                        .unwrap_or_else(|| contribution.param_fact.clone());
+                    (signature_id, contribution.param_idx, param_fact)
+                })
+                .collect::<Vec<_>>();
+            if lost {
+                dirty.insert(file_id);
+            } else if moved {
+                self.set_file_contributions(file_id, remapped);
+            }
+        }
+        dirty
     }
 
     /// Every call-site-inferred parameter type currently indexed.
@@ -304,5 +366,20 @@ impl LuaIndex for CallSiteParamIndex {
         self.file_contributions.clear();
         self.contributors.clear();
         self.inferred_params.clear();
+        self.referencing.clear();
     }
+}
+
+/// The files other than `file_id` that its evidence names.
+fn referenced_files(
+    file_id: FileId,
+    contributions: &[CallSiteParamContribution],
+) -> HashSet<FileId> {
+    let mut files = HashSet::default();
+    for contribution in contributions {
+        files.insert(contribution.signature_id.get_file_id());
+        files.extend(type_fact_referenced_files(&contribution.param_fact));
+    }
+    files.remove(&file_id);
+    files
 }
