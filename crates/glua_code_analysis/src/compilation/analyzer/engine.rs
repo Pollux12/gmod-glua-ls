@@ -569,14 +569,15 @@ impl Engine {
             .map(|key| self.fingerprint(db, key))
             .collect();
         // A read that held only with the edit mapped back saw positions the
-        // edit moved; outputs made from them are right only if the edit's
-        // remap rewrites them too.
+        // edit moved. An output made from them is still right if the edit's
+        // remap rewrote it, or if it names none of the positions the edit
+        // moved: with the edit mapped back it fingerprints as it does now.
         let moved = db.reader_graph_mut().set_fingerprints(id, fingerprints);
         moved
-            && !db
-                .reader_graph()
-                .outputs_of(id)
-                .all(|key| key.follows_edits())
+            && !db.reader_graph().outputs_of(id).all(|key| {
+                key.follows_edits()
+                    || self.fingerprint(db, key) == self.fingerprint_before_edits(db, key)
+            })
     }
 
     /// Evaluates `first` with every derivation of its kind queued right after

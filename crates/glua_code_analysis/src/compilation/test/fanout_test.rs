@@ -340,6 +340,24 @@ end
         assert_eq!(workspace.evaluated_files(), vec![track]);
     }
 
+    /// A write into a table another file bootstraps reads positions a shift
+    /// there moves, but what it writes names none of them, so it stands.
+    #[test]
+    fn a_shift_in_a_file_that_bootstraps_a_table_re_runs_nothing_in_a_panel_writing_into_it() {
+        const MENU: &str = "gamemodes/cityrp/gamemode/core/derma/cl_menu.lua";
+        const MENU_TEXT: &str = "cityrp.menu = cityrp.menu or {}\n";
+        let mut workspace = cityrp_workspace();
+        let menu = workspace.ws.def_file(MENU, MENU_TEXT);
+        workspace.ws.def_file(
+            "gamemodes/cityrp/gamemode/core/derma/cl_interaction.lua",
+            "local PANEL = {}\nfunction PANEL:Init()\n    cityrp.menu.interaction = self\nend\nvgui.Register(\"cityrp_interaction\", PANEL, \"DPanel\")\n",
+        );
+
+        workspace.ws.def_file(MENU, &format!("\n{MENU_TEXT}"));
+
+        assert_eq!(workspace.evaluated_files(), vec![menu]);
+    }
+
     /// Whether a table literal is array-shaped is read off the statement that
     /// holds it, so a statement added elsewhere in its file leaves the files
     /// that index it standing.
