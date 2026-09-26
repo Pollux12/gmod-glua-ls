@@ -52,6 +52,7 @@ pub struct FlowBinder<'a> {
     goto_stats: Vec<GotoCache>,
     bindings: FxHashMap<LuaSyntaxId, FlowId>,
     branch_label_info: FxHashMap<FlowId, BranchLabelInfo>,
+    condition_label_entries: FxHashMap<FlowId, FlowId>,
     assignment_flow_info: Vec<AssignmentFlowInfo>,
     // Counters for tracking modifications inside branch blocks.
     name_assign_count: u32,
@@ -82,6 +83,7 @@ impl<'a> FlowBinder<'a> {
             true_target: FlowId::default(),
             false_target: FlowId::default(),
             branch_label_info: FxHashMap::default(),
+            condition_label_entries: FxHashMap::default(),
             assignment_flow_info: Vec::new(),
             name_assign_count: 0,
             index_assign_count: 0,
@@ -135,6 +137,15 @@ impl<'a> FlowBinder<'a> {
 
     pub fn create_branch_label(&mut self) -> FlowId {
         self.create_node(FlowNodeKind::BranchLabel)
+    }
+
+    /// A branch label reached only by the outcomes of a condition evaluated
+    /// from `entry`, so every arm it merges is a refinement of the values at
+    /// `entry`.
+    pub fn create_condition_label(&mut self, entry: FlowId) -> FlowId {
+        let label = self.create_branch_label();
+        self.condition_label_entries.insert(label, entry);
+        label
     }
 
     pub fn create_loop_label(&mut self) -> FlowId {
@@ -389,6 +400,7 @@ impl<'a> FlowBinder<'a> {
             // self.labels,
             self.bindings,
             self.branch_label_info,
+            self.condition_label_entries,
             self.assignment_flow_info,
             self.narrowing_capability,
         );

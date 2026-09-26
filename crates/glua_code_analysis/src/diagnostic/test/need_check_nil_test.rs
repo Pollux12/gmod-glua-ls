@@ -14971,4 +14971,37 @@ mod test {
             eq(false)
         );
     }
+
+    /// Past `if (!argument and !bOptional) then return end`, `argument` is
+    /// whatever `given[i]` held: the guard splits the unknown value by
+    /// truthiness, and the fall-through merges both pieces back into it.
+    #[gtest]
+    fn compound_guard_on_an_unknown_value_does_not_make_it_nullable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            local function Stub(command, given)
+                local arguments = command.arguments
+                for i = 1, #arguments do
+                    local bOptional = arguments[i] > 100
+                    local argument = given[i]
+                    if (!argument and !bOptional) then
+                        return "invalid"
+                    end
+                    local value = argument
+                    if (value:match("STEAM_(%d+)")) then
+                        value = argument
+                    end
+                end
+            end
+
+            local function ExpandCamelCase(input, bNoUpperFirst)
+                input = bNoUpperFirst and input or input:upper()
+                return input
+            end
+        "#;
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
+    }
 }

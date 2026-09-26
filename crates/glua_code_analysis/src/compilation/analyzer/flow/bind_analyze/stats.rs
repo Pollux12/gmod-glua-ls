@@ -285,7 +285,7 @@ fn bind_assert_stat(binder: &mut FlowBinder, arg_list: LuaCallArgList, current: 
 
     let mut pre_arg = current;
     for arg in arg_list.get_args() {
-        let pre_next_arg = binder.create_branch_label();
+        let pre_next_arg = binder.create_condition_label(pre_arg);
         bind_condition_expr(binder, arg, pre_arg, pre_next_arg, false_target);
         pre_arg = finish_flow_label(binder, pre_next_arg, pre_arg);
     }
@@ -430,7 +430,7 @@ pub fn bind_while_stat(
 ) -> FlowId {
     let pre_while_label = binder.create_loop_label();
     let post_while_label = binder.create_branch_label();
-    let pre_block_label = binder.create_branch_label();
+    let pre_block_label = binder.create_condition_label(current);
     binder.add_antecedent(pre_while_label, current);
     let Some(condition_expr) = while_stat.get_condition_expr() else {
         return current;
@@ -495,8 +495,8 @@ pub fn bind_repeat_stat(
 
 pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId) -> FlowId {
     let post_if_label = binder.create_branch_label();
-    let mut else_label = binder.create_branch_label();
-    let then_label = binder.create_branch_label();
+    let mut else_label = binder.create_condition_label(current);
+    let then_label = binder.create_condition_label(current);
 
     if let Some(condition_expr) = if_stat.get_condition_expr() {
         bind_condition_expr(binder, condition_expr, current, then_label, else_label);
@@ -526,8 +526,8 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
 
     for elseif_clause in if_stat.get_else_if_clause_list() {
         let pre_elseif_label = finish_flow_label(binder, else_label, current);
-        let post_elseif_label = binder.create_branch_label();
-        let elseif_then_label = binder.create_branch_label();
+        let post_elseif_label = binder.create_condition_label(pre_elseif_label);
+        let elseif_then_label = binder.create_condition_label(pre_elseif_label);
         if let Some(condition_expr) = elseif_clause.get_condition_expr() {
             bind_condition_expr(
                 binder,

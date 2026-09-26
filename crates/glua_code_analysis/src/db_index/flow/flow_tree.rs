@@ -137,6 +137,7 @@ mod tests {
             branches,
             HashMap::default(),
             HashMap::default(),
+            HashMap::default(),
             infos,
             FileNarrowingCapability::default(),
         )
@@ -383,6 +384,9 @@ pub struct FlowTree {
     bindings: HashMap<LuaSyntaxId, FlowId>,
     /// Per-BranchLabel metadata used to skip redundant merges.
     branch_label_info: HashMap<FlowId, BranchLabelInfo>,
+    /// Branch labels reached only by one condition's outcomes, mapped to the
+    /// node the condition is evaluated from.
+    condition_label_entries: HashMap<FlowId, FlowId>,
     assignment_flow_info: Vec<AssignmentFlowInfo>,
     narrowing_capability: FileNarrowingCapability,
 }
@@ -395,6 +399,7 @@ impl FlowTree {
         // labels: HashMap<LuaClosureId, HashMap<SmolStr, FlowId>>,
         bindings: HashMap<LuaSyntaxId, FlowId>,
         branch_label_info: HashMap<FlowId, BranchLabelInfo>,
+        condition_label_entries: HashMap<FlowId, FlowId>,
         assignment_flow_info: Vec<AssignmentFlowInfo>,
         narrowing_capability: FileNarrowingCapability,
     ) -> Self {
@@ -404,6 +409,7 @@ impl FlowTree {
             multiple_antecedents,
             bindings,
             branch_label_info,
+            condition_label_entries,
             assignment_flow_info,
             narrowing_capability,
         }
@@ -417,6 +423,7 @@ impl FlowTree {
             &self.multiple_antecedents,
             unordered_fingerprint(&self.bindings),
             unordered_fingerprint(&self.branch_label_info),
+            unordered_fingerprint(&self.condition_label_entries),
             &self.assignment_flow_info,
             &self.narrowing_capability,
         ))
@@ -446,6 +453,10 @@ impl FlowTree {
 
     pub fn get_branch_label_info(&self, flow_id: FlowId) -> Option<&BranchLabelInfo> {
         self.branch_label_info.get(&flow_id)
+    }
+
+    pub fn get_condition_label_entry(&self, flow_id: FlowId) -> Option<FlowId> {
+        self.condition_label_entries.get(&flow_id).copied()
     }
 
     pub fn get_assignment_flow_info(&self, flow_id: FlowId) -> Option<&AssignmentFlowInfo> {

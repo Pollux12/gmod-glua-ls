@@ -53,6 +53,38 @@ mod test {
         ));
     }
 
+    /// `icon` reaches the call either truthy or through the `anywayicon` arm,
+    /// where it is still the whole unknown parameter: never a proven `nil`.
+    #[test]
+    fn a_compound_condition_on_an_unknown_argument_leaves_it_unknown() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class IMaterial
+            ---@class ConVar
+            ---@return integer
+            function ConVar:GetInt() end
+
+            ---@param name string
+            ---@return ConVar
+            function GetConVar(name) end
+
+            ---@param name string
+            ---@return IMaterial
+            function Material(name) end
+
+            local M = {}
+            function M.DrawBar(icon, anywayicon)
+                if (icon and GetConVar("cl_icons"):GetInt() == 1 or anywayicon == true) then
+                    local material = Material(icon)
+                end
+            end
+        "#
+        ));
+    }
+
     #[test]
     fn test_issue_216() {
         let mut ws = VirtualWorkspace::new();

@@ -8629,4 +8629,129 @@ _2 = a[1]
             ws.humanize_type(merged)
         );
     }
+
+    /// `input:upper()` runs when `bNoUpperFirst` is falsy or `input` is: the
+    /// two paths are pieces of the same unknown `input`, which merge back to
+    /// `unknown`.
+    #[test]
+    fn and_or_split_of_an_unknown_value_merges_back_to_unknown() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            local function ExpandCamelCase(input, bNoUpperFirst)
+                input = bNoUpperFirst and input or input:upper()
+                return input
+            end
+            "#,
+        );
+
+        let receiver = nth_name_expr_type_from_end(&mut ws, file_id, "input", 1);
+        assert_eq!(
+            receiver,
+            LuaType::Unknown,
+            "got: {}",
+            ws.humanize_type(receiver.clone())
+        );
+    }
+
+    #[test]
+    fn if_condition_split_of_an_unknown_value_merges_back_to_unknown() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            local function DrawBar(icon, anywayicon, enabled)
+                if (icon and enabled == 1 or anywayicon == true) then
+                    local material = icon
+                end
+            end
+            "#,
+        );
+
+        let icon = nth_name_expr_type_from_end(&mut ws, file_id, "icon", 0);
+        assert_eq!(
+            icon,
+            LuaType::Unknown,
+            "got: {}",
+            ws.humanize_type(icon.clone())
+        );
+    }
+
+    #[test]
+    fn fall_through_of_a_compound_guard_on_an_unknown_value_is_unknown() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            local function Stub(given, bOptional)
+                local argument = given[1]
+                if not argument and not bOptional then
+                    return
+                end
+                local value = argument
+            end
+            "#,
+        );
+
+        let argument = nth_name_expr_type_from_end(&mut ws, file_id, "argument", 0);
+        assert_eq!(
+            argument,
+            LuaType::Unknown,
+            "got: {}",
+            ws.humanize_type(argument.clone())
+        );
+    }
+
+    /// Only a merge restores the rest of an unknown value: the branch that
+    /// took the falsy operand still knows it is `nil` or `false`.
+    #[test]
+    fn falsy_operand_of_an_and_condition_stays_nil_or_false() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            local function Check(x, y)
+                if not x and y then
+                    local narrowed = x
+                end
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "x", 0);
+        assert_eq!(
+            ws.humanize_type(narrowed),
+            ws.humanize_type(LuaType::from_vec(vec![
+                LuaType::Nil,
+                LuaType::BooleanConst(false)
+            ]))
+        );
+    }
+
+    /// The value entering the condition is `unknown|nil`, not `unknown`: its
+    /// pieces merge back to a nullable type.
+    #[test]
+    fn condition_split_of_a_nullable_value_keeps_the_nil_arm() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            local function ModifyColor(color, mode, other)
+                if mode == "bad" then color = nil end
+                if color or other then
+                    local merged = color
+                    return merged
+                end
+            end
+            "#,
+        );
+
+        let merged = nth_name_expr_type_from_end(&mut ws, file_id, "merged", 0);
+        assert!(
+            merged.is_nullable(),
+            "merge must keep the nil arm, got: {}",
+            ws.humanize_type(merged)
+        );
+    }
 }

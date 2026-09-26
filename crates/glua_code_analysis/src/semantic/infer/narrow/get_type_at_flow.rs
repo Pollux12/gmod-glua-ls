@@ -1121,29 +1121,40 @@ fn merge_antecedent_types(
         branch_types.push(branch_type);
     }
 
-    if accepted_any {
-        return Ok(merge_flow_branch_types(db, var_ref_id, branch_types));
+    if !accepted_any {
+        // Nothing was pushed above: `branch_types` is still an empty buffer
+        // with capacity, reused for the realm-unfiltered fallback instead of
+        // allocating a second vector.
+        for &flow_id in antecedents {
+            let Some(antecedent_node) = tree.get_flow_node(flow_id) else {
+                continue;
+            };
+            if matches!(
+                antecedent_node.kind,
+                FlowNodeKind::Unreachable | FlowNodeKind::Return | FlowNodeKind::Break
+            ) || call_flow_node_returns_never(db, cache, root, antecedent_node)
+            {
+                continue;
+            }
+
+            let branch_type = with_flow_query_realm(cache, target_realm, |cache| {
+                get_merged_flow_type_or_nil(db, tree, cache, root, var_ref_id, flow_id, policy)
+            })?;
+            branch_types.push(branch_type);
+        }
     }
 
-    // `accepted_any` is false, so nothing was pushed above: `branch_types` is
-    // still an empty buffer with capacity, reused for the realm-unfiltered
-    // fallback instead of allocating a second vector.
-    for &flow_id in antecedents {
-        let Some(antecedent_node) = tree.get_flow_node(flow_id) else {
-            continue;
-        };
-        if matches!(
-            antecedent_node.kind,
-            FlowNodeKind::Unreachable | FlowNodeKind::Return | FlowNodeKind::Break
-        ) || call_flow_node_returns_never(db, cache, root, antecedent_node)
-        {
-            continue;
-        }
-
-        let branch_type = with_flow_query_realm(cache, target_realm, |cache| {
-            get_merged_flow_type_or_nil(db, tree, cache, root, var_ref_id, flow_id, policy)
-        })?;
-        branch_types.push(branch_type);
+    // The arms of a condition label are pieces of the value the condition
+    // started from: the falsy piece of an unknown value merged with the rest
+    // of it is that unknown value again, not `unknown|nil|false`.
+    if branch_types.iter().any(LuaType::is_unknown)
+        && let Some(entry) = tree.get_condition_label_entry(flow_node.id)
+        && with_flow_query_realm(cache, target_realm, |cache| {
+            get_merged_flow_type_or_nil(db, tree, cache, root, var_ref_id, entry, policy)
+        })
+        .is_ok_and(|entry_type| entry_type.is_unknown())
+    {
+        return Ok(LuaType::Unknown);
     }
 
     Ok(merge_flow_branch_types(db, var_ref_id, branch_types))
@@ -4098,6 +4109,7 @@ mod tests {
             vec![vec![FlowId(0), FlowId(1)]],
             HashMap::default(),
             HashMap::default(),
+            HashMap::default(),
             vec![AssignmentFlowInfo::default(); 3],
             FileNarrowingCapability::default(),
         );
@@ -4192,6 +4204,7 @@ mod tests {
                 },
             ],
             Vec::new(),
+            HashMap::default(),
             HashMap::default(),
             HashMap::default(),
             vec![AssignmentFlowInfo::default(); 2],
