@@ -3,7 +3,7 @@ mod test {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use crate::{Emmyrc, Schedule, VirtualWorkspace};
+    use crate::{Emmyrc, GMOD_CALL_ARG_BUILTINS_FIXTURE, Schedule, VirtualWorkspace};
 
     /// Every type cache, dynamic field and the semantic digest of `files`
     /// cold-built in one batch under `schedule`, as sorted text; `None` when
@@ -202,6 +202,23 @@ function ENT:IsElectric(selfTbl)
     return cached
 end
 "#,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_panel_two_files_register_settles_the_same_in_either_order() {
+        const REGISTER: &str =
+            "local PANEL = {}\nvgui.Register(\"PlayerFrame\", PANEL, \"Panel\")\n";
+        assert_schedule_independent(&[
+            ("lua/includes/builtins.lua", GMOD_CALL_ARG_BUILTINS_FIXTURE),
+            (
+                "gamemodes/cityrp/plugins/characters/ui/cl_player_frame.lua",
+                REGISTER,
+            ),
+            (
+                "gamemodes/cityrp/plugins/scoreboard/ui/cl_player_frame.lua",
+                REGISTER,
             ),
         ]);
     }

@@ -6440,20 +6440,6 @@ fn synthesize_panel_baseclass_member(
     call_kind: GmodScriptedClassCallKind,
     call: &GmodScriptedClassCallMetadata,
 ) {
-    let owner = LuaMemberOwner::Type(class_decl_id.clone());
-    let member_key = LuaMemberKey::Name("BaseClass".into());
-    if let Some(item) = db.get_member_index().get_member_item(&owner, &member_key)
-        && !item
-            .visible_member_ids_with_realm_at_offset(
-                db,
-                &file_id,
-                call.syntax_id.get_range().start(),
-            )
-            .is_empty()
-    {
-        return;
-    }
-
     let base_arg_source = match call_kind {
         GmodScriptedClassCallKind::VguiRegister => call.vgui_panel_base_arg_source(Some(2)),
         GmodScriptedClassCallKind::VguiRegisterTable => call.vgui_panel_base_arg_source(Some(1)),
@@ -6488,22 +6474,12 @@ fn synthesize_baseclass_member(
         return;
     }
 
+    // Every site that names the base declares `BaseClass` itself: skipping one
+    // that an earlier site's member already covers would let whichever file
+    // analysed first own the record, and its realm or position then decide
+    // which readers see the base.
     let owner = LuaMemberOwner::Type(class_decl_id.clone());
     let member_key = LuaMemberKey::Name("BaseClass".into());
-    // The same derive runs once per realm entry file (`init.lua` server-side,
-    // `cl_init.lua` client-side). A bare existence check lets whichever file
-    // analyzes first own the only `BaseClass` record, and that record's realm
-    // then hides the base edge from the other realm's readers — which reader
-    // loses depends on analysis order. Skip only when a member already
-    // visible at this write's position covers the same audience.
-    if let Some(item) = db.get_member_index().get_member_item(&owner, &member_key)
-        && !item
-            .visible_member_ids_with_realm_at_offset(db, &file_id, syntax_id.get_range().start())
-            .is_empty()
-    {
-        return;
-    }
-
     let member_id = LuaMemberId::new(syntax_id, file_id);
     let member = LuaMember::new(member_id, member_key, LuaMemberFeature::FileFieldDecl, None);
     db.get_member_index_mut().add_member(owner, member);
