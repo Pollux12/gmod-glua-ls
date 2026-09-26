@@ -169,11 +169,13 @@ debug = true
 
 # Fast rebuild loop for measuring analyzer changes: our crates at opt-level 1,
 # dependencies fully optimized. Build with `cargo build --profile iter`.
+# Not incremental: on a Dev Drive the incremental cache can go stale after a
+# revert and link old code without an error.
 [profile.iter]
 inherits = "dev"
 opt-level = 1
 debug = "line-tables-only"
-incremental = true
+incremental = false
 
 [profile.iter.package."*"]
 opt-level = 3
