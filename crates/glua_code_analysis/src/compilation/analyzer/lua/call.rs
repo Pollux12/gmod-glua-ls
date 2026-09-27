@@ -127,18 +127,33 @@ pub(in crate::compilation::analyzer) fn build_special_call_direct_matcher(
         ..Default::default()
     };
 
-    for (file_id, root) in roots {
-        for closure in root.descendants::<LuaClosureExpr>() {
-            let signature_id = LuaSignatureId::from_closure(*file_id, &closure);
-            if !matcher.has_special_signature(&signature_id) {
-                continue;
-            }
-
-            collect_direct_special_call_binding(db, *file_id, &closure, &mut matcher);
-        }
+    let special_signatures = matcher
+        .special_signatures
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    for signature_id in special_signatures {
+        let file_id = signature_id.get_file_id();
+        let Some(closure) = roots
+            .get(&file_id)
+            .and_then(|root| closure_at(root, signature_id.get_position()))
+        else {
+            continue;
+        };
+        collect_direct_special_call_binding(db, file_id, &closure, &mut matcher);
     }
 
     matcher
+}
+
+/// The closure whose signature sits at `position`.
+fn closure_at(root: &glua_parser::LuaChunk, position: TextSize) -> Option<LuaClosureExpr> {
+    root.syntax()
+        .token_at_offset(position)
+        .right_biased()?
+        .parent_ancestors()
+        .filter_map(LuaClosureExpr::cast)
+        .find(|closure| closure.get_position() == position)
 }
 
 fn collect_direct_special_call_binding(
