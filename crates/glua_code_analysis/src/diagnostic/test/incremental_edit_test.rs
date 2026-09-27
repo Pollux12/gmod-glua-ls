@@ -806,6 +806,36 @@ mod tests {
         );
     }
 
+    /// The language server diagnoses against shared data it computes outside
+    /// any file's recording, so a file's own reads have to cover what the
+    /// shared data decided for it: deprecating a function elsewhere reports its
+    /// caller affected.
+    #[gtest]
+    fn deprecating_a_function_elsewhere_reports_its_caller_affected() {
+        let mut ws = workspace_with(vec![DiagnosticCode::Deprecated]);
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/deprprovider.lua");
+        write(&mut ws, &provider_uri, "function OldApi() end\n");
+        let caller_uri = ws.virtual_url_generator.new_uri("lua/deprcaller.lua");
+        let caller_id = write(&mut ws, &caller_uri, "OldApi()\n");
+        let shared = ws
+            .analysis
+            .diagnostic
+            .precompute_shared_data(&ws.analysis.compilation);
+        ws.analysis
+            .diagnose_file_with_shared(caller_id, CancellationToken::new(), shared);
+
+        let affected = ws.analysis.apply_file_system_changes(vec![(
+            provider_uri,
+            Some("---@deprecated\nfunction OldApi() end\n".to_string()),
+        )]);
+
+        expect_that!(affected, contains(eq(&caller_id)));
+        expect_that!(
+            codes_in(&ws, caller_id),
+            contains(eq(DiagnosticCode::Deprecated.get_name()))
+        );
+    }
+
     /// A watched-file delete/create pair in one batch settles to the create.
     ///
     /// The watcher can deliver `DELETED` for a file the editor immediately

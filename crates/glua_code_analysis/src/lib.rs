@@ -604,7 +604,7 @@ impl EmmyLuaAnalysis {
         file_id: FileId,
         cancel_token: CancellationToken,
     ) -> Option<Vec<lsp_types::Diagnostic>> {
-        self.compilation.record_diagnostic_reads(Some(file_id), || {
+        self.compilation.record_diagnostic_reads(file_id, || {
             self.diagnostic
                 .diagnose_file(&self.compilation, file_id, cancel_token)
         })
@@ -616,7 +616,7 @@ impl EmmyLuaAnalysis {
         cancel_token: CancellationToken,
         shared_data: std::sync::Arc<diagnostic::SharedDiagnosticData>,
     ) -> Option<Vec<lsp_types::Diagnostic>> {
-        self.compilation.record_diagnostic_reads(Some(file_id), || {
+        self.compilation.record_diagnostic_reads(file_id, || {
             self.diagnostic.diagnose_file_with_shared(
                 &self.compilation,
                 file_id,
@@ -626,12 +626,12 @@ impl EmmyLuaAnalysis {
         })
     }
 
+    /// The data every file's diagnostics share, computed outside any file's
+    /// recorded reads, as the language server computes it.
     pub fn precompute_diagnostic_shared_data(
         &self,
     ) -> std::sync::Arc<diagnostic::SharedDiagnosticData> {
-        self.compilation.record_diagnostic_reads(None, || {
-            self.diagnostic.precompute_shared_data(&self.compilation)
-        })
+        self.diagnostic.precompute_shared_data(&self.compilation)
     }
 
     /// Return main-workspace files in an order that keeps parallel diagnostic

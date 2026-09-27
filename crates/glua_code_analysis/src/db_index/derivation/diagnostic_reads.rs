@@ -17,8 +17,6 @@ pub struct DiagnosticReads {
     /// The files that read each key, sorted.
     readers: Vec<Vec<FileId>>,
     files: FxHashMap<FileId, Box<[(ReadKey, Fingerprint)]>>,
-    /// The reads of the workspace-wide data every file's diagnostics share.
-    shared: Box<[(ReadKey, Fingerprint)]>,
 }
 
 impl DiagnosticReads {
@@ -45,10 +43,9 @@ impl DiagnosticReads {
                 .map(|files| files.capacity() * size_of::<FileId>())
                 .sum::<usize>();
         format!(
-            "files {}, reads {reads}, distinct keys {}, reader edges {reader_edges}, shared {}; MB: per-file reads {}, keys {}, readers {}",
+            "files {}, reads {reads}, distinct keys {}, reader edges {reader_edges}; MB: per-file reads {}, keys {}, readers {}",
             self.files.len(),
             self.keys.len(),
-            self.shared.len(),
             megabytes(file_bytes),
             megabytes(key_bytes),
             megabytes(reader_bytes)
@@ -68,18 +65,12 @@ impl DiagnosticReads {
         self.files.insert(file_id, reads);
     }
 
-    /// Every key some file's diagnostics or the shared data read.
+    /// Every key some file's diagnostics read.
     #[cfg(test)]
     pub fn read_keys(&self) -> impl Iterator<Item = &FactKey> {
-        self.keys.iter().filter_map(|(key, index)| {
-            (!self.readers[*index as usize].is_empty() || seen_in(&self.shared, *index).is_some())
-                .then_some(key)
-        })
-    }
-
-    /// Replaces the shared data's reads.
-    pub fn record_shared(&mut self, reads: Vec<(FactKey, Fingerprint)>) {
-        self.shared = self.intern_all(reads);
+        self.keys
+            .iter()
+            .filter_map(|(key, index)| (!self.readers[*index as usize].is_empty()).then_some(key))
     }
 
     pub fn forget(&mut self, file_id: FileId) {
@@ -108,9 +99,7 @@ impl DiagnosticReads {
         let mut renamed = Self::default();
         let mut index_of = vec![None; self.readers.len()];
         for (key, index) in std::mem::take(&mut self.keys) {
-            let still_read =
-                !self.readers[index as usize].is_empty() || seen_in(&self.shared, index).is_some();
-            if !still_read {
+            if self.readers[index as usize].is_empty() {
                 continue;
             }
             let key = if moves(&key) {
@@ -131,7 +120,6 @@ impl DiagnosticReads {
             reads.dedup_by_key(|(key, _)| *key);
             reads.into_boxed_slice()
         };
-        renamed.shared = reindex(&self.shared);
         for (file_id, reads) in &self.files {
             let reads = reindex(reads);
             for (key, _) in reads.iter() {
@@ -147,10 +135,9 @@ impl DiagnosticReads {
 
     /// The files whose recorded read of one of `touched` no longer holds: it
     /// saw neither the key's `current` fingerprint nor, when edits moved the
-    /// key, its fingerprint `before_edits`. Every recorded file is stale when
-    /// the shared data's reads moved. A read that held only through the edits
-    /// is recorded again at the current fingerprint, so the next edit of the
-    /// same file compares against it.
+    /// key, its fingerprint `before_edits`. A read that held only through the
+    /// edits is recorded again at the current fingerprint, so the next edit of
+    /// the same file compares against it.
     pub fn stale_files<'a>(
         &mut self,
         touched: impl IntoIterator<Item = &'a FactKey>,
@@ -158,30 +145,23 @@ impl DiagnosticReads {
         before_edits: impl Fn(&FactKey) -> Option<Fingerprint>,
     ) -> Vec<FileId> {
         let mut stale = FxHashSet::default();
-        let mut shared_stale = false;
         let mut moved = Vec::new();
         for key in touched {
             let Some(&index) = self.keys.get(key) else {
                 continue;
             };
-            let shared = seen_in(&self.shared, index);
             let readers = &self.readers[index as usize];
-            if shared.is_none() && readers.is_empty() {
+            if readers.is_empty() {
                 continue;
             }
             let now = current(key);
             let before = std::cell::OnceCell::new();
             let held_moved =
                 |seen: Fingerprint| *before.get_or_init(|| before_edits(key)) == Some(seen);
-            match shared {
-                Some(seen) if seen != now && held_moved(seen) => moved.push((None, index, now)),
-                Some(seen) if seen != now => shared_stale = true,
-                _ => {}
-            }
             for file_id in readers {
                 match seen_in(&self.files[file_id], index) {
                     Some(seen) if seen == now => {}
-                    Some(seen) if held_moved(seen) => moved.push((Some(*file_id), index, now)),
+                    Some(seen) if held_moved(seen) => moved.push((*file_id, index, now)),
                     _ => {
                         stale.insert(*file_id);
                     }
@@ -189,18 +169,11 @@ impl DiagnosticReads {
             }
         }
         for (file_id, index, now) in moved {
-            let reads = match file_id {
-                Some(file_id) => self.files.get_mut(&file_id),
-                None => Some(&mut self.shared),
-            };
-            if let Some(reads) = reads
+            if let Some(reads) = self.files.get_mut(&file_id)
                 && let Ok(at) = reads.binary_search_by_key(&index, |(read, _)| *read)
             {
                 reads[at].1 = now;
             }
-        }
-        if shared_stale {
-            stale.extend(self.files.keys().copied());
         }
         let mut stale = stale.into_iter().collect::<Vec<_>>();
         stale.sort_unstable();
@@ -325,15 +298,6 @@ local a = 1
         let stale = reads.stale_files([&decl_in_edited_file(22)], |_| SEEN + 2, |_| Some(SEEN + 1));
 
         assert_eq!(stale, Vec::<FileId>::new());
-    }
-
-    #[test]
-    fn a_key_only_the_shared_data_read_survives_an_edit() {
-        let mut reads = DiagnosticReads::default();
-        reads.record_shared(vec![(decl_in_edited_file(18), SEEN)]);
-        reads.record(reader(), vec![(FactKey::FileText(reader()), SEEN)]);
-
-        assert_eq!(stale_after_edit(&mut reads, SEEN + 1), vec![reader()]);
     }
 
     #[test]

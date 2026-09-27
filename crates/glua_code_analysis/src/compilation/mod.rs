@@ -143,40 +143,30 @@ impl LuaCompilation {
 
     pub(crate) fn record_diagnostic_reads<T>(
         &self,
-        file_id: Option<FileId>,
+        file_id: FileId,
         diagnose: impl FnOnce() -> T,
     ) -> T {
         if derivation::recording() {
             return diagnose();
         }
-        let id = match file_id {
-            Some(file_id) => {
-                let Some(tree) = self.db.get_vfs().get_syntax_tree(&file_id) else {
-                    return diagnose();
-                };
-                DerivationId::new(
-                    DerivationKind::Diagnostics,
-                    file_id,
-                    glua_parser::LuaSyntaxId::from_node(&tree.get_red_root()),
-                )
-            }
-            None => DerivationId::workspace(DerivationKind::Diagnostics),
+        let Some(tree) = self.db.get_vfs().get_syntax_tree(&file_id) else {
+            return diagnose();
         };
-        derivation::begin(id);
+        derivation::begin(DerivationId::new(
+            DerivationKind::Diagnostics,
+            file_id,
+            glua_parser::LuaSyntaxId::from_node(&tree.get_red_root()),
+        ));
         let result = diagnose();
         let (_, reads, _) = derivation::end().into_parts(|key| self.db.fact_fingerprint(key));
         let reads = reads
             .into_iter()
             .map(|(key, seen)| (key.into_key(), seen))
             .collect();
-        let mut store = self
-            .diagnostic_reads
+        self.diagnostic_reads
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match file_id {
-            Some(file_id) => store.record(file_id, reads),
-            None => store.record_shared(reads),
-        }
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(file_id, reads);
         result
     }
 
