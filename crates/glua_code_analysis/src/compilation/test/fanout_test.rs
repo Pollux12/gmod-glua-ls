@@ -181,6 +181,24 @@ end
         assert_eq!(workspace.evaluated_files(), vec![workspace.configuration]);
     }
 
+    /// A statement added inside a function's body changes neither its member,
+    /// its signature nor the functions after it, so its callers stand.
+    #[test]
+    fn a_statement_added_inside_a_called_function_re_runs_nothing_in_its_caller() {
+        let mut workspace = cityrp_workspace();
+        workspace.ws.def_file(
+            "gamemodes/cityrp/gamemode/core/sv_speed.lua",
+            "local speed = cityrp.GetConfig(\"Walk Speed\")\nlocal channel = cityrp.SendConfig(\"cityrp_speed\")\n",
+        );
+
+        workspace.edit_configuration(
+            "    return cityrp.configuration[key]",
+            "    local unused = 1\n    return cityrp.configuration[key]",
+        );
+
+        assert_eq!(workspace.evaluated_files(), vec![workspace.configuration]);
+    }
+
     /// Each entity's `include("shared.lua")` finds the module at its own full
     /// path, so removing one entity's `shared.lua` leaves another standing.
     #[test]

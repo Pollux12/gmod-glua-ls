@@ -396,8 +396,6 @@ fn build_file_net_helpers(
     let root = db.get_vfs().get_syntax_tree(&file_id)?.get_chunk_node();
     let functions = FileFunctionMap::build(&root);
     let mut net = NetCallResolver::new(file_id);
-    let mut roots = HashMap::default();
-    roots.insert(file_id, root.clone());
     let mut calls = HashMap::default();
     for call_expr in root.descendants::<LuaCallExpr>() {
         let role = net.role(db, &call_expr);
@@ -408,7 +406,6 @@ fn build_file_net_helpers(
             &functions,
             &mut net,
             db,
-            &mut roots,
         );
         let bits_param_idx = match role {
             Some(NetCallRole::Payload(_)) => net.bits_param_idx(db, &call_expr),
@@ -738,22 +735,10 @@ fn resolve_callback_block(
         .cloned()
 }
 
-/// The body block at a helper-registry entry, reusing the red roots of files
-/// already visited.
-fn resolve_registry_entry(
-    roots: &mut HashMap<FileId, LuaChunk>,
-    db: &DbIndex,
-    file_id: &FileId,
-    syntax_id: &LuaSyntaxId,
-) -> Option<HelperId> {
-    let tree = db
-        .get_vfs()
-        .syntax_tree_around(file_id, syntax_id.get_range())?;
-    let chunk = roots
-        .entry(*file_id)
-        .or_insert_with(|| tree.get_chunk_node());
-    let block = LuaBlock::cast(syntax_id.to_node_from_root(chunk.syntax())?)?;
-    Some(InFiled::new(*file_id, block.syntax().text_range()))
+/// The body block at a helper-registry entry: the registry files each body by
+/// its block, so the entry names it without reading the body.
+fn resolve_registry_entry(file_id: &FileId, syntax_id: &LuaSyntaxId) -> HelperId {
+    InFiled::new(*file_id, syntax_id.get_range())
 }
 
 /// The function body a call expands into.
@@ -764,7 +749,6 @@ fn resolve_call_to_function_block(
     functions: &FileFunctionMap,
     net: &mut NetCallResolver,
     db: &DbIndex,
-    roots: &mut HashMap<FileId, LuaChunk>,
 ) -> Option<HelperId> {
     // Direct global member calls have a stable symbol identity even when
     // duplicate declarations make the inferred signature winner dependent on
@@ -775,18 +759,15 @@ fn resolve_call_to_function_block(
     {
         let call_path = call_path.strip_prefix("_G.").unwrap_or(&call_path);
         let global_id = GlobalId::new(call_path);
-        if let Some((file_id, syntax_id)) = helper_registry.global(&global_id)
-            && let Some(helper) = resolve_registry_entry(roots, db, file_id, syntax_id)
-        {
-            return Some(helper);
+        if let Some((file_id, syntax_id)) = helper_registry.global(&global_id) {
+            return Some(resolve_registry_entry(file_id, syntax_id));
         }
     }
 
     if let Some(signature_id) = net.signature_id(db, call_expr)
         && let Some((file_id, syntax_id)) = helper_registry.signature(&signature_id)
-        && let Some(helper) = resolve_registry_entry(roots, db, file_id, syntax_id)
     {
-        return Some(helper);
+        return Some(resolve_registry_entry(file_id, syntax_id));
     }
 
     // Pre-analysis can run before every local/global callable type cache is
@@ -807,10 +788,8 @@ fn resolve_call_to_function_block(
         && let Some(LuaIndexKey::Name(method_token)) = index_expr.get_index_key()
     {
         let method_name = SmolStr::new(method_token.get_name_text());
-        if let Some((file_id, syntax_id)) = helper_registry.method(&method_name)
-            && let Some(helper) = resolve_registry_entry(roots, db, file_id, syntax_id)
-        {
-            return Some(helper);
+        if let Some((file_id, syntax_id)) = helper_registry.method(&method_name) {
+            return Some(resolve_registry_entry(file_id, syntax_id));
         }
     }
 
