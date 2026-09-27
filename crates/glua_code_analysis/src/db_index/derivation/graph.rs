@@ -656,9 +656,14 @@ impl ReaderGraph {
         for (key, slot) in &self.table.key_slots {
             let readers = &self.table.keys[*slot as usize].readers;
             if readers.is_empty()
-                || !key
+                || !(key
                     .positional_file()
                     .is_some_and(|file_id| files.contains(&file_id))
+                    || key.expr_key_type().is_some_and(|typ| {
+                        crate::db_index::r#type::type_referenced_files(typ)
+                            .iter()
+                            .any(|file_id| files.contains(file_id))
+                    }))
             {
                 continue;
             }

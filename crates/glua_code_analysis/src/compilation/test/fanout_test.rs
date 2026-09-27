@@ -1124,6 +1124,26 @@ end
         assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![init]);
     }
 
+    /// A member filed under a key naming another file's table literals is
+    /// re-keyed in place when that file shifts, so its writer stands.
+    #[test]
+    fn a_shift_in_a_file_whose_tables_another_file_keys_members_by_re_runs_nothing_in_it() {
+        const CONFIG: &str = "lua/cfg.lua";
+        const CONFIG_TEXT: &str = "cfg = {}\ncfg.models = { { model = \"a\", skin = 1, groups = { torso = 1 } }, { model = \"b\", skin = 2, groups = { torso = 2 } } }\n";
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_files(vec![
+            (CONFIG, CONFIG_TEXT),
+            (
+                "lua/user.lua",
+                "optimised = {}\nfor _, data in pairs(cfg.models) do\n    optimised[data.skin > 0 and data or data.model] = data\nend\n",
+            ),
+        ]);
+
+        let config = ws.def_file(CONFIG, &format!("\n{CONFIG_TEXT}"));
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![config]);
+    }
+
     /// A file's accessor members come from its own accessor calls, so a shift
     /// in another file calling an accessor function re-runs nothing here.
     #[test]

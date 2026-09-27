@@ -620,6 +620,16 @@ impl FactKey {
         }
     }
 
+    /// The type of the expression key a member slot or member-key entry is
+    /// filed under, which can name other files' table literals.
+    pub fn expr_key_type(&self) -> Option<&crate::LuaType> {
+        match self {
+            FactKey::MemberSlot(_, LuaMemberKey::ExprType(typ))
+            | FactKey::MemberKey(LuaMemberKey::ExprType(typ)) => Some(typ),
+            _ => None,
+        }
+    }
+
     /// The key this one is read out of: writing the base moves every key read
     /// out of it, so each reader re-checks its own part and re-runs only when
     /// that part changed.

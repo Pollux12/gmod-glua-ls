@@ -297,9 +297,9 @@ fn follow_edits(
             continue;
         };
         let remap = crate::FileRemap::validated(db, file_id, map);
-        // A key names the positions it was taken from, so it is taken again
-        // by the derivation that wrote the member.
-        for member_id in db.get_member_index().members_with_moved_expr_keys(&remap) {
+        // A key naming a position the edit destroyed is taken again by the
+        // derivation that wrote the member.
+        for member_id in db.get_member_index_mut().remap_expr_keys(&remap) {
             let key = derivation::HashedKey::new(derivation::FactKey::Member(member_id));
             for producer in db.reader_graph().producers(&key).collect::<Vec<_>>() {
                 rerun(engine, producer);

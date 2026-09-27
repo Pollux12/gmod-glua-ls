@@ -3148,10 +3148,30 @@ impl LuaMemberIndex {
         }
     }
 
+    /// Re-keys every member filed under an expression key naming a position of
+    /// `remap`'s file the edit moved. Returns the members whose key named a
+    /// position the edit destroyed: their writers have to take it again.
+    pub fn remap_expr_keys(&mut self, remap: &crate::FileRemap) -> Vec<LuaMemberId> {
+        let mut lost = Vec::new();
+        for member_id in self.members_with_moved_expr_keys(remap) {
+            let Some(LuaMemberKey::ExprType(typ)) =
+                self.members.get(&member_id).map(LuaMember::get_key)
+            else {
+                continue;
+            };
+            let result = crate::db_index::remap_identities_in_type(typ, remap);
+            if result.lost {
+                lost.push(member_id);
+            } else if let Some(moved) = result.typ {
+                self.rekey_member(member_id, LuaMemberKey::ExprType(moved));
+            }
+        }
+        lost
+    }
+
     /// The members filed under an expression key naming a position of
-    /// `remap`'s file that the edit moved or destroyed: their key has to be
-    /// taken again.
-    pub fn members_with_moved_expr_keys(&self, remap: &crate::FileRemap) -> Vec<LuaMemberId> {
+    /// `remap`'s file that the edit moved or destroyed.
+    fn members_with_moved_expr_keys(&self, remap: &crate::FileRemap) -> Vec<LuaMemberId> {
         let mut members = self
             .expr_key_members_by_file
             .get(&remap.file_id)

@@ -16,8 +16,8 @@ use rustc_hash::FxHashMap;
 
 use super::{FactKey, Fingerprint};
 use crate::{
-    DynamicFieldOwner, FileId, InFiled, LuaDeclId, LuaDefinitionId, LuaMemberId, LuaMemberOwner,
-    LuaOperatorOwner, LuaSemanticDeclId, LuaSignatureId, LuaTypeOwner, PositionMap,
+    DynamicFieldOwner, FileId, InFiled, LuaDeclId, LuaDefinitionId, LuaMemberId, LuaMemberKey,
+    LuaMemberOwner, LuaOperatorOwner, LuaSemanticDeclId, LuaSignatureId, LuaTypeOwner, PositionMap,
 };
 use glua_parser::LuaSyntaxId;
 
@@ -129,6 +129,28 @@ impl EditMaps {
         })
     }
 
+    /// A member key naming the edited files' table literals, in the
+    /// coordinates after the edits.
+    fn member_key(&self, key: &LuaMemberKey) -> Option<LuaMemberKey> {
+        let LuaMemberKey::ExprType(typ) = key else {
+            return Some(key.clone());
+        };
+        let mut typ = typ.clone();
+        for (file_id, map) in &self.maps {
+            let result = crate::db_index::remap_identities_in_type(
+                &typ,
+                &crate::FileRemap::unvalidated(*file_id, *map),
+            );
+            if result.lost {
+                return None;
+            }
+            if let Some(moved) = result.typ {
+                typ = moved;
+            }
+        }
+        Some(LuaMemberKey::ExprType(typ))
+    }
+
     /// `key` in the coordinates after the edits, or `None` when a position it
     /// names fell inside an edited hunk.
     pub fn map_key(&self, key: &FactKey) -> Option<FactKey> {
@@ -147,7 +169,10 @@ impl EditMaps {
             K::Decl(id) => K::Decl(self.decl_id(*id)?),
             K::DeclDefault(id) => K::DeclDefault(self.decl_id(*id)?),
             K::Member(id) => K::Member(self.member_id(*id)?),
-            K::MemberSlot(owner, key) => K::MemberSlot(self.member_owner(owner)?, key.clone()),
+            K::MemberSlot(owner, key) => {
+                K::MemberSlot(self.member_owner(owner)?, self.member_key(key)?)
+            }
+            K::MemberKey(key) => K::MemberKey(self.member_key(key)?),
             K::MemberOwnerMap(owner) => K::MemberOwnerMap(self.member_owner(owner)?),
             K::MemberOwnerExprKeys(owner) => K::MemberOwnerExprKeys(self.member_owner(owner)?),
             K::MemberOwnerFields(owner) => K::MemberOwnerFields(self.member_owner(owner)?),
