@@ -14,6 +14,13 @@
 //!   through every invalid text in between; shares the edit oracle. Its reach
 //!   line is the union over keystrokes, followed by the largest reach of any
 //!   one keystroke.
+//! - `sliced`: the edit settled in slices of `DET_SLICE` (default 16)
+//!   evaluations, every other slice on a fresh thread; shares the edit oracle.
+//! - `preempt`: the edit typed one character at a time, each keystroke taken
+//!   into the re-analysis of the one before after 16, 256 or 4096 of its
+//!   evaluations in turn, then settled in slices; shares the edit oracle.
+//! - `priority`: the edit settled in slices, each slice first prioritising the
+//!   next of the files that read the target; shares the edit oracle.
 //! - `watch`: watched delete of each target (oracle: the file never existed),
 //!   then watched re-creation (oracle: cold build with the same new file ids).
 //! - `noop`: re-index each target with unchanged text; the oracle is the base.
@@ -66,8 +73,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, FileId, Schedule, WorkspaceFolder, collect_workspace_files,
-    load_configs,
+    EmmyLuaAnalysis, Emmyrc, FileId, Schedule, Slice, UpdateProgress, WorkspaceFolder,
+    collect_workspace_files, load_configs,
 };
 use glua_parser::{LineIndex, LuaParser};
 use lsp_types::{DiagnosticSeverity, NumberOrString};
@@ -1971,6 +1978,43 @@ fn settle(
     Reach::of(analysis, affected)
 }
 
+/// Settles the re-analysis in progress in slices of `evaluations`, every
+/// other slice on a fresh thread, calling `between` after each slice that
+/// left work. Returns the files it reported affected.
+fn settle_in_slices(
+    analysis: &mut EmmyLuaAnalysis,
+    evaluations: usize,
+    mut between: impl FnMut(&mut EmmyLuaAnalysis),
+) -> Vec<FileId> {
+    for slice in 0.. {
+        let progress = if slice % 2 == 0 {
+            analysis.advance_reindex(Slice::Evaluations(evaluations))
+        } else {
+            std::thread::scope(|scope| {
+                std::thread::Builder::new()
+                    .stack_size(glua_code_analysis::ANALYSIS_STACK_SIZE)
+                    .spawn_scoped(scope, || {
+                        analysis.advance_reindex(Slice::Evaluations(evaluations))
+                    })
+                    .expect("slice thread should spawn")
+                    .join()
+                    .expect("slice thread should not panic")
+            })
+        };
+        match progress {
+            UpdateProgress::Settled(affected) => return affected,
+            UpdateProgress::Settling => between(analysis),
+            UpdateProgress::TextChanged => panic!("a slice found text it had not taken"),
+        }
+    }
+    unreachable!("slices go on until the re-analysis settles")
+}
+
+/// Evaluations per slice for the sliced stages (`DET_SLICE`).
+fn slice_evaluations() -> usize {
+    env_usize("DET_SLICE", 16).max(1)
+}
+
 /// Prints how far a warm run reached. With `strict`, any evaluated file
 /// outside `edited` is a locality divergence.
 fn report_reach(
@@ -2439,6 +2483,107 @@ impl Harness {
         }
     }
 
+    /// The edit settled in slices; see the module docs.
+    fn sliced(&mut self, targets: &[String], find: &str, replace: &str) {
+        for relative in targets {
+            let (path, uri, file_id, original) = target(&self.base, &self.codebase, relative);
+            let changed = edited(&original, find, replace);
+            let mut warm = self.warm();
+            apply_text(&mut warm, &uri, file_id, changed.clone(), 1);
+            warm.begin_reindex(vec![file_id]);
+            let mut affected = settle_in_slices(&mut warm, slice_evaluations(), |_| {});
+            affected.push(file_id);
+            let reach = Reach::of(&warm, affected);
+            let input = ColdInput {
+                overrides: vec![(path, changed)],
+                ..ColdInput::default()
+            };
+            self.finish(
+                &format!("sliced[{relative}]"),
+                warm,
+                &[file_id],
+                &reach,
+                false,
+                &input,
+            );
+        }
+    }
+
+    /// The edit typed with each keystroke pre-empting the re-analysis of the
+    /// one before; see the module docs.
+    fn preempt(&mut self, targets: &[String], find: &str, replace: &str) {
+        for relative in targets {
+            let (path, uri, file_id, original) = target(&self.base, &self.codebase, relative);
+            let changed = edited(&original, find, replace);
+            let mut warm = self.warm();
+            let mut reach = Reach::default();
+            let mut preempted = 0;
+            for (version, text) in (1..).zip(typed_texts(&original, find, replace)) {
+                apply_text(&mut warm, &uri, file_id, text, version);
+                warm.begin_reindex(vec![file_id]);
+                let evaluations = [16, 256, 4096][version as usize % 3];
+                match warm.advance_reindex(Slice::Evaluations(evaluations)) {
+                    UpdateProgress::Settled(mut affected) => {
+                        affected.push(file_id);
+                        reach.note(&warm, affected);
+                    }
+                    UpdateProgress::Settling => preempted += 1,
+                    UpdateProgress::TextChanged => panic!("a slice found text it had not taken"),
+                }
+            }
+            let mut affected = settle_in_slices(&mut warm, slice_evaluations(), |_| {});
+            affected.push(file_id);
+            reach.note(&warm, affected);
+            println!("[preempt[{relative}]] {preempted} keystroke(s) taken mid re-analysis");
+            let input = ColdInput {
+                overrides: vec![(path, changed)],
+                ..ColdInput::default()
+            };
+            self.finish(
+                &format!("preempt[{relative}]"),
+                warm,
+                &[file_id],
+                &reach,
+                false,
+                &input,
+            );
+        }
+    }
+
+    /// The edit settled in slices that each prioritise the next of the
+    /// target's readers; see the module docs.
+    fn priority(&mut self, targets: &[String], find: &str, replace: &str) {
+        let dependents = self.base.dependent_files();
+        for relative in targets {
+            let (path, uri, file_id, original) = target(&self.base, &self.codebase, relative);
+            let changed = edited(&original, find, replace);
+            let readers = dependents.get(&file_id).cloned().unwrap_or_default();
+            let mut warm = self.warm();
+            apply_text(&mut warm, &uri, file_id, changed.clone(), 1);
+            warm.begin_reindex(vec![file_id]);
+            let mut next = readers.iter().cycle();
+            let mut affected = settle_in_slices(&mut warm, slice_evaluations(), |warm| {
+                if let Some(reader) = next.next() {
+                    warm.compilation.prioritise_update(&[*reader]);
+                }
+            });
+            affected.push(file_id);
+            let reach = Reach::of(&warm, affected);
+            let input = ColdInput {
+                overrides: vec![(path, changed)],
+                ..ColdInput::default()
+            };
+            self.finish(
+                &format!("priority[{relative}]"),
+                warm,
+                &[file_id],
+                &reach,
+                false,
+                &input,
+            );
+        }
+    }
+
     /// Applies watched-file event batches in order to a warm fork.
     fn watched(
         &mut self,
@@ -2782,6 +2927,9 @@ fn run() {
                         | "revert"
                         | "burst"
                         | "typing"
+                        | "sliced"
+                        | "preempt"
+                        | "priority"
                         | "watch"
                         | "noop"
                         | "reload"
@@ -2798,7 +2946,16 @@ fn run() {
     let needs_targets = stages.iter().any(|s| {
         matches!(
             *s,
-            "edit" | "revert" | "burst" | "typing" | "watch" | "noop" | "exact"
+            "edit"
+                | "revert"
+                | "burst"
+                | "typing"
+                | "sliced"
+                | "preempt"
+                | "priority"
+                | "watch"
+                | "noop"
+                | "exact"
         )
     });
     let targets: Vec<String> = if needs_targets {
@@ -2816,9 +2973,12 @@ fn run() {
         !needs_targets || !targets.is_empty(),
         "DET_TARGETS must name indexed files"
     );
-    let needs_edit = stages
-        .iter()
-        .any(|s| matches!(*s, "edit" | "revert" | "burst" | "typing"));
+    let needs_edit = stages.iter().any(|s| {
+        matches!(
+            *s,
+            "edit" | "revert" | "burst" | "typing" | "sliced" | "preempt" | "priority"
+        )
+    });
     let (find, replace) = if needs_edit {
         (
             std::env::var("DET_EDIT_FIND").expect("DET_EDIT_FIND is required"),
@@ -2870,6 +3030,9 @@ fn run() {
             "revert" => harness.revert(&targets, &find, &replace),
             "burst" => harness.burst(&targets, &find, &replace),
             "typing" => harness.typing(&targets, &find, &replace),
+            "sliced" => harness.sliced(&targets, &find, &replace),
+            "preempt" => harness.preempt(&targets, &find, &replace),
+            "priority" => harness.priority(&targets, &find, &replace),
             "watch" => harness.watch(&targets),
             "noop" => harness.noop(&targets),
             "reload" => harness.reload(),
