@@ -102,6 +102,9 @@ function typedTexts(text, find, replace) {
 /** LSP `ServerCancelled`. */
 const SERVER_CANCELLED = -32802;
 
+/** Pulls sent for one request before its cancellations fail the run. */
+const PULL_ATTEMPTS = 10;
+
 /** Child processes still running, stopped before the scratch folder is removed. */
 const children = new Set();
 
@@ -236,15 +239,18 @@ async function main() {
         })(client.onNotification);
 
         // A diagnostic pull the server cancels with `retriggerRequest` is sent
-        // again, as VS Code does; any other error fails the run.
+        // again, as VS Code does. Any other error fails the run, and so does a
+        // pull cancelled every time, which is what a dead debounce loop answers.
         const pull = async (method, params) => {
-            for (;;) {
+            for (let attempt = 1; ; attempt++) {
                 const response = await client.request(method, params());
                 const error = response.message.error;
                 if (!error) return response.message.result;
-                if (error.code !== SERVER_CANCELLED || !(error.data && error.data.retriggerRequest)) {
-                    throw new Error(`${method} failed: ${JSON.stringify(error)}`);
+                const retrigger = error.code === SERVER_CANCELLED && error.data && error.data.retriggerRequest;
+                if (!retrigger || attempt === PULL_ATTEMPTS) {
+                    throw new Error(`${method} failed after ${attempt} attempt(s): ${JSON.stringify(error)}`);
                 }
+                await sleep(200);
             }
         };
 
