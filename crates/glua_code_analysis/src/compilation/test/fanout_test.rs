@@ -1039,6 +1039,26 @@ end
         assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![ranks]);
     }
 
+    /// A file's accessor members come from its own accessor calls, so a shift
+    /// in another file calling an accessor function re-runs nothing here.
+    #[test]
+    fn a_shift_in_a_file_that_calls_an_accessor_function_re_runs_nothing_in_other_callers() {
+        const OTHER: &str = "lua/items/other_item.lua";
+        const OTHER_TEXT: &str = "---@class other_item\nlocal OTHER = {}\n\n---@accessorfunc\nfunction OTHER:AutoFunction(name, key)\nend\n\nOTHER:AutoFunction(\"Colour\", \"colour\")\n";
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(vec![
+            (
+                "lua/items/base_item.lua",
+                "---@class base_item\nlocal ITEM = {}\n\n---@accessorfunc\nfunction ITEM:AutoFunction(name, key)\nend\n\nITEM:AutoFunction(\"SpecialValue\", \"internal_flag\")\n",
+            ),
+            (OTHER, OTHER_TEXT),
+        ]);
+
+        let other = ws.def_file(OTHER, &format!("\n{OTHER_TEXT}"));
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![other]);
+    }
+
     /// Another file's field written onto a table literal is kept by the member
     /// index when the literal's file is re-indexed, and the edit carries it to
     /// the literal's new position, so the writing file stands.

@@ -158,6 +158,12 @@ impl AccessorFuncCallIndex {
         })
     }
 
+    /// The accessor calls found in `file_id`.
+    pub fn calls_in(&self, file_id: FileId) -> &[AccessorFuncCallMetadata] {
+        derivation::note_read(|| FactKey::AccessorCalls(file_id));
+        self.calls.get(&file_id).map_or(&[], Vec::as_slice)
+    }
+
     pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
         match key {
             FactKey::AccessorCalls(file_id) => derivation::fingerprint_opt(self.calls.get(file_id)),

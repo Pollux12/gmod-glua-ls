@@ -521,15 +521,8 @@ fn type_is_uninformative(typ: &LuaType) -> bool {
 }
 
 fn synthesize_accessorfunc_members(db: &mut DbIndex, file_ids: &[FileId]) {
-    let workspace_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
-    let all_calls = db
-        .get_accessor_func_call_index()
-        .iter()
-        .filter(|(file_id, _)| workspace_file_ids.contains(file_id))
-        .map(|(file_id, calls)| (*file_id, calls.clone()))
-        .collect::<Vec<_>>();
-
-    for (file_id, file_calls) in all_calls {
+    for &file_id in file_ids {
+        let file_calls = db.get_accessor_func_call_index().calls_in(file_id).to_vec();
         for call in file_calls {
             if call.accessor_name.is_empty() {
                 continue;
