@@ -452,6 +452,7 @@ impl DbIndex {
             K::Module(_)
             | K::ModuleMeta(_)
             | K::ModuleName(_)
+            | K::ModulePath(_)
             | K::ModuleNamespace(_)
             | K::ModuleFiles => self.modules_index.fact_fingerprint(key),
             K::SpecialCall(..) | K::SpecialCallFile(_) | K::FlowTree(_) => {

@@ -250,6 +250,8 @@ pub enum FactKey {
     /// The modules whose name (last path segment) is this: every module
     /// lookup of a path ending in it.
     ModuleName(SmolStr),
+    /// The modules filed at one full module path.
+    ModulePath(SmolStr),
     /// The legacy `module()` namespaces under this first path segment.
     ModuleNamespace(SmolStr),
     /// The set of modules: their files, paths and workspaces.
@@ -528,6 +530,7 @@ impl FactKey {
                 | K::Module(_)
                 | K::ModuleMeta(_)
                 | K::ModuleName(_)
+                | K::ModulePath(_)
                 | K::DynamicFieldFile(_)
                 | K::TypeCache(_)
                 | K::DefinitionFact(_)
@@ -681,6 +684,7 @@ impl FactKey {
             | K::GlobalPath(_)
             | K::ReceiverOutParam(_)
             | K::ModuleName(_)
+            | K::ModulePath(_)
             | K::ModuleNamespace(_)
             | K::ModuleFiles
             | K::DynamicField(..)

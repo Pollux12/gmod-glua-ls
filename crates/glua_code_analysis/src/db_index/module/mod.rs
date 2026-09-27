@@ -348,6 +348,7 @@ impl LuaModuleIndex {
         note_module_fact_write(file_id);
         if let Some(info) = self.file_module_map.get(&file_id) {
             derivation::note_write(|| FactKey::ModuleName(SmolStr::new(&info.name)));
+            derivation::note_write(|| FactKey::ModulePath(SmolStr::new(&info.full_module_name)));
         }
         for env in self.legacy_module_envs.get(&file_id).into_iter().flatten() {
             derivation::note_write(|| FactKey::ModuleNamespace(namespace_root(&env.module_path)));
@@ -400,26 +401,11 @@ impl LuaModuleIndex {
                     legacy_envs,
                 ))
             }
-            FactKey::ModuleName(name) => {
-                let Some(file_ids) = self.module_name_to_file_ids.get(name.as_str()) else {
-                    return derivation::ABSENT;
-                };
-                let mut modules = file_ids
-                    .iter()
-                    .filter_map(|file_id| self.file_module_map.get(file_id))
-                    .map(|info| {
-                        (
-                            info.file_id,
-                            info.full_module_name.as_str(),
-                            info.visible,
-                            info.workspace_id,
-                            &info.version_conds,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                modules.sort_by_key(|module| module.0);
-                derivation::fingerprint_of(&modules)
-            }
+            FactKey::ModuleName(name) => self.named_modules_fingerprint(name, |_| true),
+            FactKey::ModulePath(path) => self
+                .named_modules_fingerprint(&lookup_name(path), |info| {
+                    info.full_module_name == path.as_str()
+                }),
             FactKey::ModuleFiles => self.module_files.get(),
             FactKey::ModuleNamespace(root) => {
                 let mut envs = self
@@ -440,6 +426,43 @@ impl LuaModuleIndex {
                 derivation::ABSENT
             }
         }
+    }
+
+    /// The fingerprint of the modules named `name` that `filter` keeps.
+    fn named_modules_fingerprint(
+        &self,
+        name: &str,
+        filter: impl Fn(&ModuleInfo) -> bool,
+    ) -> Fingerprint {
+        let Some(file_ids) = self.module_name_to_file_ids.get(name) else {
+            return derivation::ABSENT;
+        };
+        let mut modules = file_ids
+            .iter()
+            .filter_map(|file_id| self.file_module_map.get(file_id))
+            .filter(|info| filter(info))
+            .map(|info| {
+                (
+                    info.file_id,
+                    info.full_module_name.as_str(),
+                    info.visible,
+                    info.workspace_id,
+                    &info.version_conds,
+                )
+            })
+            .collect::<Vec<_>>();
+        if modules.is_empty() {
+            return derivation::ABSENT;
+        }
+        modules.sort_by_key(|module| module.0);
+        derivation::fingerprint_of(&modules)
+    }
+
+    /// Notes an exact module lookup: the modules at its path and the module it
+    /// returned.
+    fn note_exact_lookup(module_path: &str, module: &ModuleInfo) {
+        derivation::note_read(|| FactKey::ModulePath(SmolStr::new(module_path)));
+        derivation::note_read(|| FactKey::Module(module.file_id));
     }
 
     /// Notes a module lookup: the scan it walked and the module it returned.
@@ -535,13 +558,15 @@ impl LuaModuleIndex {
             return None;
         }
 
-        let result = self.exact_find_module(&module_parts).or_else(|| {
-            if self.fuzzy_search {
-                self.fuzzy_find_module(&module_path, module_parts.last()?)
-            } else {
-                None
-            }
-        });
+        if let Some(module) = self.exact_find_module(&module_parts) {
+            Self::note_exact_lookup(&module_path, module);
+            return Some(module);
+        }
+        let result = if self.fuzzy_search {
+            self.fuzzy_find_module(&module_path, module_parts.last()?)
+        } else {
+            None
+        };
         Self::note_lookup(&module_path, result);
         result
     }
@@ -557,19 +582,15 @@ impl LuaModuleIndex {
             return None;
         }
 
-        let result = self
-            .exact_find_module_in_workspace(&module_parts, workspace_id)
-            .or_else(|| {
-                if self.fuzzy_search {
-                    self.fuzzy_find_module_in_workspace(
-                        &module_path,
-                        module_parts.last()?,
-                        workspace_id,
-                    )
-                } else {
-                    None
-                }
-            });
+        if let Some(module) = self.exact_find_module_in_workspace(&module_parts, workspace_id) {
+            Self::note_exact_lookup(&module_path, module);
+            return Some(module);
+        }
+        let result = if self.fuzzy_search {
+            self.fuzzy_find_module_in_workspace(&module_path, module_parts.last()?, workspace_id)
+        } else {
+            None
+        };
         Self::note_lookup(&module_path, result);
         result
     }

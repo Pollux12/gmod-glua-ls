@@ -181,6 +181,33 @@ end
         assert_eq!(workspace.evaluated_files(), vec![workspace.configuration]);
     }
 
+    /// Each entity's `include("shared.lua")` finds the module at its own full
+    /// path, so removing one entity's `shared.lua` leaves another standing.
+    #[test]
+    fn deleting_one_entitys_shared_file_re_runs_nothing_in_another_entity() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let files = ws.def_files(vec![
+            ("lua/entities/alpha/shared.lua", "ENT.Type = \"anim\"\n"),
+            ("lua/entities/alpha/init.lua", "include(\"shared.lua\")\n"),
+            ("lua/entities/beta/shared.lua", "ENT.Type = \"anim\"\n"),
+            ("lua/entities/beta/init.lua", "include(\"shared.lua\")\n"),
+        ]);
+        let alpha_shared = ws
+            .virtual_url_generator
+            .new_uri("lua/entities/alpha/shared.lua");
+
+        ws.analysis.remove_file_by_uri(&alpha_shared);
+
+        let evaluated = ws.analysis.compilation.last_evaluated_files();
+        assert!(
+            !evaluated.contains(&files[2]) && !evaluated.contains(&files[3]),
+            "{evaluated:?}"
+        );
+    }
+
     /// A helper's summary keeps the parameters its message and argument
     /// templates read, so a parameter nothing reads leaves its callers' network
     /// flows standing.
