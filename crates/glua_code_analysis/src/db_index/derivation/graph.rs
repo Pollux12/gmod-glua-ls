@@ -277,8 +277,31 @@ impl ReaderGraph {
             + producer_bytes
             + records
             + derivation_maps;
+        let mut by_variant =
+            FxHashMap::<std::mem::Discriminant<FactKey>, (usize, &FactKey)>::default();
+        for key in table.keys.iter().filter_map(|slot| slot.key.as_deref()) {
+            by_variant
+                .entry(std::mem::discriminant(key))
+                .or_insert((0, key))
+                .0 += 1;
+        }
+        let mut by_variant = by_variant
+            .into_values()
+            .map(|(count, sample)| {
+                let name = format!("{sample:?}");
+                let name = name.split(['(', ' ']).next().unwrap_or_default().to_owned();
+                (count, name)
+            })
+            .collect::<Vec<_>>();
+        by_variant.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let top = by_variant
+            .iter()
+            .take(12)
+            .map(|(count, variant)| format!("{variant} {count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
-            "keys {} (live {live}), reader groups {groups}, edges {edges}, derivations {}, record reads {reads}, outputs {outputs}; MB: key map {}, key slots {}, reader groups {}, reader sets {}, producers {}, records {}, derivation maps {}, total ~{}",
+            "keys {} (live {live}; {top}), reader groups {groups}, edges {edges}, derivations {}, record reads {reads}, outputs {outputs}; MB: key map {}, key slots {}, reader groups {}, reader sets {}, producers {}, records {}, derivation maps {}, total ~{}",
             table.keys.len(),
             self.derivations.len(),
             megabytes(key_map),
