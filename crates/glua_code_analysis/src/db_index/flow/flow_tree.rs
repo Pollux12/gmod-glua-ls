@@ -42,10 +42,13 @@ pub struct FileNarrowingCapability {
     pub has_opaque_index_target: bool,
 }
 
+/// Names hash by their text: an interned name hashes its pointer, which a name
+/// freed and interned again does not keep.
 impl Hash for FileNarrowingCapability {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        unordered_fingerprint(&self.referenced_names).hash(state);
-        unordered_fingerprint(&self.referenced_index_paths).hash(state);
+        unordered_fingerprint(self.referenced_names.iter().map(|name| name.as_str())).hash(state);
+        unordered_fingerprint(self.referenced_index_paths.iter().map(|path| path.as_str()))
+            .hash(state);
         self.has_opaque_name_target.hash(state);
         self.has_opaque_index_target.hash(state);
     }
@@ -99,11 +102,23 @@ pub struct BranchLabelInfo {
     pub written_capability: FileNarrowingCapability,
 }
 
-#[derive(Debug, Clone, Default, Hash)]
+#[derive(Debug, Clone, Default)]
 pub struct AssignmentFlowInfo {
     pub name_targets: Vec<AssignmentNameTarget>,
     pub index_paths: Vec<ArcIntern<SmolStr>>,
     pub has_unknown_index_target: bool,
+}
+
+/// Paths hash by their text, as in [`FileNarrowingCapability`].
+impl Hash for AssignmentFlowInfo {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name_targets.hash(state);
+        self.index_paths.len().hash(state);
+        for path in &self.index_paths {
+            path.as_str().hash(state);
+        }
+        self.has_unknown_index_target.hash(state);
+    }
 }
 
 #[cfg(test)]

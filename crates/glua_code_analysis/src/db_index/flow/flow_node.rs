@@ -2,7 +2,6 @@ use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstPtr, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaDocTagCast,
     LuaExpr, LuaForStat, LuaFuncStat, LuaSyntaxKind, LuaSyntaxNode,
 };
-use internment::ArcIntern;
 use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 
@@ -51,7 +50,7 @@ pub enum FlowNodeKind {
     /// Label for loops (while, for, repeat)
     LoopLabel,
     /// Named label (goto target)
-    NamedLabel(ArcIntern<SmolStr>),
+    NamedLabel(SmolStr),
     /// Declaration position
     DeclPosition(TextSize),
     /// Entry to a deferred closure body. Its antecedent preserves persistent
