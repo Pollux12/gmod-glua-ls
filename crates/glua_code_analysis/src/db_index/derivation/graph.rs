@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use hashbrown::HashTable;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use super::paged::Paged;
 use super::{DerivationId, EditMaps, FactKey, Fingerprint, HashedKey};
 use crate::FileId;
 
@@ -127,69 +128,10 @@ pub struct KeyTable {
     /// Each live slot, found by its key's hash: the key itself is kept only
     /// in its slot.
     key_slots: HashTable<KeyIdx>,
-    keys: KeySlots,
+    keys: Paged<KeySlot>,
     free_keys: Vec<KeyIdx>,
     /// The keys read out of each base key ([`FactKey::base`]).
     derived: FxHashMap<KeyIdx, DerivedKeys>,
-}
-
-/// Key slots in fixed-size pages, so the table grows a page at a time rather
-/// than doubling and copying every slot.
-#[derive(Debug, Clone, Default)]
-struct KeySlots {
-    pages: Vec<Box<[KeySlot]>>,
-    len: usize,
-}
-
-const KEY_PAGE: usize = 1 << 16;
-
-impl KeySlots {
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    fn capacity(&self) -> usize {
-        self.pages.len() * KEY_PAGE
-    }
-
-    /// Appends an empty slot, returning its index.
-    fn push(&mut self) -> usize {
-        if self.len == self.capacity() {
-            self.pages
-                .push((0..KEY_PAGE).map(|_| KeySlot::default()).collect());
-        }
-        self.len += 1;
-        self.len - 1
-    }
-
-    fn get(&self, index: usize) -> Option<&KeySlot> {
-        (index < self.len).then(|| &self[index])
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &KeySlot> {
-        self.pages
-            .iter()
-            .flat_map(|page| page.iter())
-            .take(self.len)
-    }
-}
-
-impl std::ops::Index<usize> for KeySlots {
-    type Output = KeySlot;
-
-    fn index(&self, index: usize) -> &KeySlot {
-        &self.pages[index / KEY_PAGE][index % KEY_PAGE]
-    }
-}
-
-impl std::ops::IndexMut<usize> for KeySlots {
-    fn index_mut(&mut self, index: usize) -> &mut KeySlot {
-        &mut self.pages[index / KEY_PAGE][index % KEY_PAGE]
-    }
 }
 
 /// The keys read out of one base key, and the base's fingerprint when their
@@ -245,7 +187,8 @@ impl KeyTable {
         }
         let slot = match self.free_keys.pop() {
             Some(slot) => slot,
-            None => KeyIdx::try_from(self.keys.push()).expect("fewer than 2^32 fact keys"),
+            None => KeyIdx::try_from(self.keys.push(KeySlot::default()))
+                .expect("fewer than 2^32 fact keys"),
         };
         let base = key.base();
         let hash = key.hash;

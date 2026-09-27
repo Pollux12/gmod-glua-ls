@@ -1,6 +1,8 @@
+use hashbrown::HashTable;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{EditMaps, FactKey, Fingerprint};
+use super::paged::Paged;
+use super::{EditMaps, FactKey, Fingerprint, HashedKey};
 use crate::FileId;
 
 /// An interned read key: its index into [`DiagnosticReads::readers`].
@@ -13,12 +15,15 @@ type ReadKey = u32;
 /// with the fingerprints seen, sorted by index.
 #[derive(Debug, Clone, Default)]
 pub struct DiagnosticReads {
-    keys: FxHashMap<FactKey, ReadKey>,
+    /// Each read key, found by its hash: the key itself is kept only in
+    /// `key_values`.
+    keys: HashTable<ReadKey>,
+    key_values: Paged<HashedKey>,
     /// The files that read each key, sorted.
-    readers: Vec<Vec<FileId>>,
+    readers: Paged<Vec<FileId>>,
     files: FxHashMap<FileId, Box<[(ReadKey, Fingerprint)]>>,
     /// The keys read out of each base key ([`FactKey::base`]).
-    derived: FxHashMap<ReadKey, Vec<(ReadKey, FactKey)>>,
+    derived: FxHashMap<ReadKey, Vec<ReadKey>>,
 }
 
 impl DiagnosticReads {
@@ -33,10 +38,8 @@ impl DiagnosticReads {
             self.files.capacity(),
             size_of::<FileId>() + size_of::<Box<[(ReadKey, Fingerprint)]>>(),
         ) + reads * read_entry;
-        let key_bytes = hash_table_bytes(
-            self.keys.capacity(),
-            size_of::<FactKey>() + size_of::<ReadKey>(),
-        );
+        let key_bytes = hash_table_bytes(self.keys.capacity(), size_of::<ReadKey>())
+            + self.key_values.capacity() * size_of::<HashedKey>();
         let reader_edges: usize = self.readers.iter().map(Vec::len).sum();
         let reader_bytes = self.readers.capacity() * size_of::<Vec<FileId>>()
             + self
@@ -47,7 +50,7 @@ impl DiagnosticReads {
         format!(
             "files {}, reads {reads}, distinct keys {}, reader edges {reader_edges}; MB: per-file reads {}, keys {}, readers {}",
             self.files.len(),
-            self.keys.len(),
+            self.key_values.len(),
             megabytes(file_bytes),
             megabytes(key_bytes),
             megabytes(reader_bytes)
@@ -70,9 +73,10 @@ impl DiagnosticReads {
     /// Every key some file's diagnostics read.
     #[cfg(test)]
     pub fn read_keys(&self) -> impl Iterator<Item = &FactKey> {
-        self.keys
+        self.key_values
             .iter()
-            .filter_map(|(key, index)| (!self.readers[*index as usize].is_empty()).then_some(key))
+            .zip(self.readers.iter())
+            .filter_map(|(key, readers)| (!readers.is_empty()).then_some(key.key()))
     }
 
     pub fn forget(&mut self, file_id: FileId) {
@@ -95,23 +99,23 @@ impl DiagnosticReads {
             key.positional_file()
                 .is_some_and(|file_id| edited.contains(&file_id))
         };
-        if !self.keys.keys().any(moves) {
+        if !self.key_values.iter().any(|key| moves(key.key())) {
             return;
         }
         let mut renamed = Self::default();
         let mut index_of = vec![None; self.readers.len()];
-        for (key, index) in std::mem::take(&mut self.keys) {
-            if self.readers[index as usize].is_empty() {
+        for (index, key) in self.key_values.iter().enumerate() {
+            if self.readers[index].is_empty() {
                 continue;
             }
-            let key = if moves(&key) {
+            let key = if moves(key.key()) {
                 edits
-                    .map_key(&key)
+                    .map_key(key.key())
                     .unwrap_or(FactKey::FileText(FileId::VIRTUAL))
             } else {
-                key
+                key.key().clone()
             };
-            index_of[index as usize] = Some(renamed.intern(key));
+            index_of[index] = Some(renamed.intern(key));
         }
         let reindex = |reads: &[(ReadKey, Fingerprint)]| {
             let mut reads = reads
@@ -129,8 +133,8 @@ impl DiagnosticReads {
             }
             renamed.files.insert(*file_id, reads);
         }
-        for readers in &mut renamed.readers {
-            readers.sort_unstable();
+        for index in 0..renamed.readers.len() {
+            renamed.readers[index].sort_unstable();
         }
         *self = renamed;
     }
@@ -149,14 +153,14 @@ impl DiagnosticReads {
         let mut stale = FxHashSet::default();
         let mut moved = Vec::new();
         for key in touched {
-            let Some(&index) = self.keys.get(key) else {
+            let Some(index) = self.find(key) else {
                 continue;
             };
             self.check_reads(index, key, &current, &before_edits, &mut stale, &mut moved);
-            for (derived, derived_key) in self.derived.get(&index).into_iter().flatten() {
+            for derived in self.derived.get(&index).into_iter().flatten() {
                 self.check_reads(
                     *derived,
-                    derived_key,
+                    self.key_values[*derived as usize].key(),
                     &current,
                     &before_edits,
                     &mut stale,
@@ -208,20 +212,32 @@ impl DiagnosticReads {
         }
     }
 
+    /// The index `key` is interned to.
+    fn find(&self, key: &FactKey) -> Option<ReadKey> {
+        use std::hash::BuildHasher;
+        let hash = rustc_hash::FxBuildHasher.hash_one(key);
+        self.keys
+            .find(hash, |index| self.key_values[*index as usize].key() == key)
+            .copied()
+    }
+
     fn intern(&mut self, key: FactKey) -> ReadKey {
-        if let Some(&index) = self.keys.get(&key) {
+        if let Some(index) = self.find(&key) {
             return index;
         }
-        let index = self.readers.len() as ReadKey;
+        let base = key.base();
+        let key = HashedKey::new(key);
+        let hash = key.hash;
+        let index =
+            ReadKey::try_from(self.key_values.push(key)).expect("fewer than 2^32 read keys");
         self.readers.push(Vec::new());
-        if let Some(base) = key.base() {
+        let key_values = &self.key_values;
+        self.keys
+            .insert_unique(hash, index, |filed| key_values[*filed as usize].hash);
+        if let Some(base) = base {
             let base = self.intern(base);
-            self.derived
-                .entry(base)
-                .or_default()
-                .push((index, key.clone()));
+            self.derived.entry(base).or_default().push(index);
         }
-        self.keys.insert(key, index);
         index
     }
 

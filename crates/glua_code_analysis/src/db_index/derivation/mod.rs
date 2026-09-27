@@ -17,6 +17,7 @@ use rowan::{TextRange, TextSize};
 use rustc_hash::FxHashSet;
 
 pub use diagnostic_reads::DiagnosticReads;
+mod paged;
 pub use frames::{
     Gates, OpenFrame, Provenance, ScopeMark, check_tsc, close_frame, consult_absorbed,
     consult_cycle, consult_gates, consult_realm, consult_scope, describe_reads, frame_depth,
