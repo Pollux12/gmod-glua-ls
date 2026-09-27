@@ -899,14 +899,16 @@ pub(super) fn net_producing_function_names(
 ///
 fn expand_sites(db: &DbIndex, file_id: FileId, sites: &[LuaSyntaxId]) -> NetNameExpansion {
     let mut expansion = NetNameExpansion::default();
-    let Some(root) = db
-        .get_vfs()
-        .get_syntax_tree(&file_id)
-        .map(|tree| tree.get_red_root())
-    else {
-        return expansion;
-    };
     for syntax_id in sites {
+        // The site's closure and the statement naming it lie within the
+        // top-level statement around the site.
+        let Some(root) = db
+            .get_vfs()
+            .syntax_tree_around(&file_id, syntax_id.get_range())
+            .map(|tree| tree.get_red_root())
+        else {
+            continue;
+        };
         let Some(node) = syntax_id.to_node_from_root(&root) else {
             continue;
         };

@@ -116,6 +116,18 @@ end
         );
     }
 
+    /// The workspace's net helper names come from the statements around the
+    /// net calls and their callers, so a config value written elsewhere in
+    /// the same file does not re-run them.
+    #[test]
+    fn a_config_value_change_does_not_re_run_the_net_helper_names() {
+        let mut workspace = cityrp_workspace();
+
+        workspace.edit_configuration("= 10000", "= 20000");
+
+        assert_eq!(workspace.evaluations(DerivationKind::NetHelperNames), 0);
+    }
+
     /// A realm branch added to a shared file changes the realm only inside the
     /// branch, so a file whose reads fall outside it stands.
     #[test]
