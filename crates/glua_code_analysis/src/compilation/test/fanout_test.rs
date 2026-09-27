@@ -954,6 +954,80 @@ local first = controllers[1]
         assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![shared]);
     }
 
+    const RANKS: &str = "gamemodes/cityrp/gamemode/core/sh_configuration.lua";
+    /// A table literal of CityRP's ranks with a method that reads its fields.
+    const RANKS_TEXT: &str = r#"cityrp = cityrp or {}
+cityrp.configuration = cityrp.configuration or {}
+cityrp.configuration.ranks = {
+    remap = { mod = "admin" },
+    user = { name = "User" },
+    admin = { name = "Admin" },
+}
+
+function cityrp.configuration.ranks:Get(rank)
+    rank = self.remap[rank] or rank
+    return self[rank] or { noset = true }
+end
+"#;
+    const RANK_READER_TEXT: &str = r#"local PLAYER = FindMetaTable("Player")
+function PLAYER:GetRankData()
+    local r = "user"
+    if self:IsAdmin() then
+        r = "admin"
+    end
+    return cityrp.configuration.ranks:Get(r) or cityrp.configuration.ranks:Get("streaming")
+end
+"#;
+
+    /// The ranks file, a plugin that also bootstraps the configuration table,
+    /// and a file calling a ranks method, which is returned.
+    fn ranks_workspace() -> (VirtualWorkspace, FileId) {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(RANKS, RANKS_TEXT);
+        ws.def_file(
+            "gamemodes/cityrp/plugins/farming/sh_configuration.lua",
+            "cityrp.configuration = cityrp.configuration or {}\ncityrp.configuration.farmTime = 60\n",
+        );
+        let reader = ws.def_file(
+            "gamemodes/cityrp/gamemode/core/metatables/sh_player.lua",
+            RANK_READER_TEXT,
+        );
+        (ws, reader)
+    }
+
+    /// Whether a same-file write of a table is visible inside a method of that
+    /// file turns on the statement that wrote it, so a caller inferring the
+    /// method's receiver reads that statement, not the whole file.
+    #[test]
+    fn a_caller_inferring_another_files_table_method_reads_no_file_text() {
+        let (ws, reader) = ranks_workspace();
+        let db = ws.analysis.compilation.get_db();
+        let graph = db.reader_graph();
+
+        let text_reads = graph
+            .derivations_of_file(reader)
+            .flat_map(|id| graph.reads_of(id))
+            .filter(|key| matches!(key.key(), crate::db_index::derivation::FactKey::FileText(_)))
+            .count();
+
+        assert_eq!(text_reads, 0);
+    }
+
+    /// A comment appended to the ranks file leaves every statement the caller
+    /// read as it was.
+    #[test]
+    fn a_comment_appended_to_a_file_whose_table_method_another_file_calls_re_runs_nothing_in_it() {
+        let (mut ws, _) = ranks_workspace();
+
+        let ranks = ws.def_file(RANKS, &format!("{RANKS_TEXT}\n-- touch\n"));
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![ranks]);
+    }
+
     /// Another file's field written onto a table literal is kept by the member
     /// index when the literal's file is re-indexed, and the edit carries it to
     /// the literal's new position, so the writing file stands.

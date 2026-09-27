@@ -431,15 +431,17 @@ impl<'a> OffsetVisibilityQuery<'a> {
     }
 
     /// The caller file's red root, fetched at most once per query. Only
-    /// same-file members reach the enclosing-assignment probe that needs it.
+    /// same-file members reach the enclosing-assignment probe that needs it,
+    /// and the probe reads the statement it inspects.
     fn caller_root(&mut self) -> Option<&LuaSyntaxNode> {
         if !self.caller_root_fetched {
             self.caller_root_fetched = true;
-            self.caller_root = self
-                .db
-                .get_vfs()
-                .get_syntax_tree(&self.caller_file_id)
-                .map(|tree| tree.get_red_root());
+            self.caller_root = crate::db_index::derivation::untracked(|| {
+                self.db
+                    .get_vfs()
+                    .get_syntax_tree(&self.caller_file_id)
+                    .map(|tree| tree.get_red_root())
+            });
         }
         self.caller_root.as_ref()
     }
@@ -545,25 +547,25 @@ fn member_hidden_by_enclosing_assignment_with_root(
     caller_position: TextSize,
     caller_root: Option<&LuaSyntaxNode>,
 ) -> bool {
-    // The caller file's root, shared across every member one query probes.
-    // `None` fetches it fresh, preserving the old call shape for the paths
-    // that probe a single member. The probe below only runs for same-file
-    // members (see `member_visible_at_offset_with_root`), so a caller-file
-    // root passed by the query always covers the member it is asked about.
-    let fetched_root = if caller_root.is_none() {
-        db.get_vfs()
-            .get_syntax_tree(&member_id.file_id)
-            .map(|tree| tree.get_red_root())
-    } else {
-        None
-    };
-    let Some(root) = caller_root.or(fetched_root.as_ref()) else {
-        return false;
-    };
     let Some(member) = db.get_member_index().get_member(&member_id) else {
         return false;
     };
     let member_range = member.get_range();
+    // The assignment enclosing the member lies in the member's top-level
+    // statement, which is all the probe reads.
+    let Some(tree) = db
+        .get_vfs()
+        .syntax_tree_around(&member_id.file_id, member_range)
+    else {
+        return false;
+    };
+    // The caller file's root, shared across every member one query probes:
+    // the probe only runs for same-file members (see
+    // `member_visible_at_offset_with_root`), so it covers this member.
+    let fetched_root = caller_root.is_none().then(|| tree.get_red_root());
+    let Some(root) = caller_root.or(fetched_root.as_ref()) else {
+        return false;
+    };
     // By syntax id, not by offset: `token_at_offset` rescans the siblings at
     // every level it descends, and this lookup is memoised.
     let Some(member_node) = member_id.get_syntax_id().to_node_from_root(root) else {
