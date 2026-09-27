@@ -869,6 +869,33 @@ mod tests {
         expect_that!(affected, contains(eq(&reader)));
     }
 
+    /// A field check asks whether a table literal is empty only for a numeric
+    /// key, so a member added to a global table elsewhere leaves a reader of
+    /// one of its named fields unaffected.
+    #[gtest]
+    fn a_member_added_to_a_global_table_leaves_a_reader_of_another_field_unaffected() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.diagnostics.enables = vec![DiagnosticCode::UndefinedField];
+        ws.update_emmyrc(emmyrc);
+        let config_uri = ws.virtual_url_generator.new_uri("lua/sh_config.lua");
+        let config_text = "cityrp = cityrp or {}\ncityrp.Name = \"x\"\n";
+        write(&mut ws, &config_uri, config_text);
+        let plugin_uri = ws.virtual_url_generator.new_uri("lua/sh_plugin.lua");
+        write(&mut ws, &plugin_uri, "cityrp = cityrp or {}\n");
+        let reader_uri = ws.virtual_url_generator.new_uri("lua/cl_name.lua");
+        let reader = write(&mut ws, &reader_uri, "local name = cityrp.Name\n");
+        codes_in(&ws, reader);
+
+        let affected = ws.analysis.apply_file_system_changes(vec![(
+            config_uri,
+            Some(format!("{config_text}cityrp.Other = 1\n")),
+        )]);
+
+        expect_that!(affected, not(contains(eq(&reader))));
+    }
+
     /// A watched-file delete/create pair in one batch settles to the create.
     ///
     /// The watcher can deliver `DELETED` for a file the editor immediately

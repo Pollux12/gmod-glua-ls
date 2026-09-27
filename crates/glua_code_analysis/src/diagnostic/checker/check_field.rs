@@ -1072,9 +1072,9 @@ fn check_table_const_member(
     id: &crate::InFiled<rowan::TextRange>,
 ) -> TableConstMemberCheck {
     if code == DiagnosticCode::UndefinedField
+        && index_key_is_numeric(semantic_model, index_key)
         && !is_table_const_from_doc_tag(semantic_model, id)
         && table_const_is_empty(semantic_model.get_db(), id)
-        && index_key_is_numeric(semantic_model, index_key)
     {
         return TableConstMemberCheck::Valid;
     }
