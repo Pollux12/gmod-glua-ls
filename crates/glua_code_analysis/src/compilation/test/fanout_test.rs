@@ -181,6 +181,26 @@ end
         assert_eq!(workspace.evaluated_files(), vec![workspace.configuration]);
     }
 
+    /// A helper's summary keeps the parameters its message and argument
+    /// templates read, so a parameter nothing reads leaves its callers' network
+    /// flows standing.
+    #[test]
+    fn adding_an_unread_parameter_to_a_net_helper_re_runs_no_callers_network_flows() {
+        let mut workspace = cityrp_workspace();
+        workspace.ws.def_file(SCORE, SCORE_TEXT);
+        workspace.ws.def_file(SCORE_CALLER, SCORE_CALLER_TEXT);
+
+        workspace.ws.def_file(
+            SCORE,
+            &SCORE_TEXT.replace(
+                "function cityrp.SendScore(score)",
+                "function cityrp.SendScore(score, extra)",
+            ),
+        );
+
+        assert_eq!(workspace.evaluations(DerivationKind::Network), 1);
+    }
+
     #[test]
     fn a_shift_in_a_file_that_defines_a_helper_re_runs_nothing_in_other_files() {
         let mut workspace = cityrp_workspace();

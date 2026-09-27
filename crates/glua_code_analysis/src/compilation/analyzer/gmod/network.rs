@@ -63,6 +63,14 @@ impl StringTemplate {
         Some(Self(parts))
     }
 
+    /// The names the template reads.
+    fn names(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().filter_map(|part| match part {
+            TemplatePart::Name(name) => Some(name.as_str()),
+            TemplatePart::Literal(_) => None,
+        })
+    }
+
     fn resolve(&self, bindings: &HashMap<String, String>) -> Option<String> {
         let mut value = String::new();
         for part in &self.0 {
@@ -117,14 +125,14 @@ fn resolve_arg(
 /// The helper's parameters bound to the call's arguments that resolve to a
 /// string under the caller's own bindings.
 fn helper_bindings(
-    params: &[String],
+    params: &[Option<String>],
     args: &[Option<StringTemplate>],
     caller_bindings: &HashMap<String, String>,
 ) -> HashMap<String, String> {
     params
         .iter()
         .zip(args)
-        .filter_map(|(param, arg)| Some((param.clone(), arg.as_ref()?.resolve(caller_bindings)?)))
+        .filter_map(|(param, arg)| Some((param.clone()?, arg.as_ref()?.resolve(caller_bindings)?)))
         .collect()
 }
 
@@ -205,7 +213,9 @@ impl Hash for HelperSend {
 /// What a function body contributes to net flows, without its callers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 struct NetHelper {
-    params: Vec<String>,
+    /// Each parameter, by position, named when the body's message or argument
+    /// templates read it: a parameter nothing reads binds nothing.
+    params: Vec<Option<String>>,
     /// Every call in the body, in document order.
     calls: Vec<HelperCall>,
     /// The payload walk of the whole body.
@@ -470,15 +480,39 @@ fn summarize_helper(
         .descendants()
         .filter_map(LuaCallExpr::cast)
         .map(|call_expr| summarize_helper_call(site, block, &call_expr))
-        .collect();
+        .collect::<Vec<_>>();
     let mut ops = Vec::new();
     op_items(site, block, block.syntax(), &mut ops);
+    let sends = helper_sends(site, block);
     NetHelper {
-        params: get_closure_param_names(closure),
+        params: read_params(closure, &calls, &sends),
         calls,
         ops,
-        sends: helper_sends(site, block),
+        sends,
     }
+}
+
+/// `closure`'s parameters by position, named where `calls` and `sends` read
+/// them, without the unread ones at the end.
+fn read_params(
+    closure: &LuaClosureExpr,
+    calls: &[HelperCall],
+    sends: &[HelperSend],
+) -> Vec<Option<String>> {
+    let read = calls
+        .iter()
+        .flat_map(|call| call.args.iter().flatten())
+        .chain(sends.iter().map(|send| &send.message))
+        .flat_map(StringTemplate::names)
+        .collect::<HashSet<_>>();
+    let mut params = get_closure_param_names(closure)
+        .into_iter()
+        .map(|param| read.contains(param.as_str()).then_some(param))
+        .collect::<Vec<_>>();
+    while params.last().is_some_and(Option::is_none) {
+        params.pop();
+    }
+    params
 }
 
 fn summarize_helper_call(
