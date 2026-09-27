@@ -357,25 +357,28 @@ fn index_expr_has_flow_node(
         .is_some_and(|flow_tree| flow_tree.get_flow_id(index_expr.get_syntax_id()).is_some())
 }
 
-type AccessPaths = rustc_hash::FxHashMap<
+pub(crate) type AccessPaths = rustc_hash::FxHashMap<
     (crate::FileId, glua_parser::LuaSyntaxId),
     Option<internment::ArcIntern<smol_str::SmolStr>>,
 >;
 
 thread_local! {
-    /// Set only while an engine run on this thread keeps paths: every file's
-    /// text is fixed for the run.
+    /// Set only while a slice of an engine run on this thread keeps paths:
+    /// every file's text is fixed for the run's pass.
     static ACCESS_PATHS: std::cell::RefCell<Option<AccessPaths>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Keeps the access paths [`interned_access_path`] builds on this thread
-/// until [`stop_keeping_access_paths`].
-pub(crate) fn keep_access_paths() {
-    ACCESS_PATHS.with(|paths| *paths.borrow_mut() = Some(AccessPaths::default()));
+/// Keeps the access paths [`interned_access_path`] builds on this thread in
+/// `paths` until [`stop_keeping_access_paths`].
+pub(crate) fn keep_access_paths(paths: AccessPaths) {
+    ACCESS_PATHS.with(|kept| *kept.borrow_mut() = Some(paths));
 }
 
-pub(crate) fn stop_keeping_access_paths() {
-    ACCESS_PATHS.with(|paths| *paths.borrow_mut() = None);
+/// Stops keeping access paths on this thread and hands back what it kept.
+pub(crate) fn stop_keeping_access_paths() -> AccessPaths {
+    ACCESS_PATHS
+        .with(|kept| kept.borrow_mut().take())
+        .unwrap_or_default()
 }
 
 /// `index_expr`'s interned access path. During an engine run a path is built

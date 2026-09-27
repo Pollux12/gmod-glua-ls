@@ -1,7 +1,6 @@
 pub(crate) mod analyzer;
 mod test;
 
-pub use analyzer::Schedule;
 pub use analyzer::gmod::get_scripted_class_info_for_file;
 pub(crate) use analyzer::gmod::get_scripted_class_type_decl_id;
 pub use analyzer::is_member_assignment_in_conditional_branch;
@@ -9,6 +8,7 @@ pub use analyzer::parallel::set_analysis_threads;
 pub use analyzer::unresolve::extract_hook_name;
 pub use analyzer::unresolve::resolve_gmod_hook_add_callback_doc_function;
 pub use analyzer::unresolve::resolve_gmod_hook_callback_doc_function;
+pub use analyzer::{Schedule, Slice};
 
 use std::sync::{Arc, Mutex};
 
@@ -35,6 +35,24 @@ pub struct LuaCompilation {
     last_evaluated_files: Vec<FileId>,
     last_stats: analyzer::EngineStats,
     schedule: Schedule,
+    /// The re-analysis in progress, between its slices. Only `&mut` access
+    /// advances it; readers sharing the compilation only ask what it has left.
+    reanalysis: Mutex<Option<analyzer::Reanalysis>>,
+    /// The VFS content revision the re-analysis in progress took its text at.
+    taken_revision: u64,
+}
+
+/// Where the re-analysis in progress stands after
+/// [`LuaCompilation::advance_update`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateProgress {
+    /// It has work left.
+    Settling,
+    /// It settled: these files' last diagnostics read a fact that moved.
+    Settled(Vec<FileId>),
+    /// A file's text changed after it took its files: it evaluates nothing
+    /// until it takes that file in ([`LuaCompilation::begin_update`]).
+    TextChanged,
 }
 
 impl LuaCompilation {
@@ -47,6 +65,8 @@ impl LuaCompilation {
             last_evaluated_files: Vec::new(),
             last_stats: analyzer::EngineStats::default(),
             schedule: Schedule::default(),
+            reanalysis: Mutex::default(),
+            taken_revision: 0,
         };
 
         compilation.db.update_config(emmyrc.clone());
@@ -65,20 +85,26 @@ impl LuaCompilation {
         ))
     }
 
-    /// Re-analyses `file_ids` from their current text; see
-    /// [`analyzer::reanalyze`]. Returns the files whose last diagnostics read
-    /// a fact that moved.
+    /// Re-analyses `file_ids` from their current text, settling any
+    /// re-analysis in progress with them; see [`Self::begin_update`]. Returns
+    /// the files whose last diagnostics read a fact that moved.
     pub fn update_index(&mut self, file_ids: Vec<FileId>) -> Vec<FileId> {
+        self.begin_update(file_ids);
+        match self.advance_update(Slice::Whole) {
+            UpdateProgress::Settled(stale) => stale,
+            progress => unreachable!("a whole slice settles, not {progress:?}"),
+        }
+    }
+
+    /// Starts re-analysing `file_ids` from their current text, and whatever
+    /// read a fact that moved; see [`analyzer::Reanalysis`]. A re-analysis in
+    /// progress takes them in and settles them first. Advance it with
+    /// [`Self::advance_update`].
+    pub fn begin_update(&mut self, file_ids: Vec<FileId>) {
         if let Some(log) = &mut self.batch_log {
             log.push(file_ids.clone());
         }
-        let edits = crate::db_index::derivation::EditMaps::new(
-            self.db.get_vfs_mut().take_edit_maps(&file_ids),
-        );
-        let reanalysis =
-            analyzer::reanalyze(&mut self.db, file_ids.clone(), edits.clone(), self.schedule);
-        self.last_evaluated_files = reanalysis.evaluated_files;
-        self.last_stats = reanalysis.stats;
+        let edits = derivation::EditMaps::new(self.db.get_vfs_mut().take_edit_maps(&file_ids));
         let reads = self
             .diagnostic_reads
             .get_mut()
@@ -88,19 +114,93 @@ impl LuaCompilation {
                 reads.forget(*file_id);
             }
         }
+        // Diagnostics recorded from here on read the new positions.
         reads.apply_edits(&edits);
-        let db = &self.db;
-        reads.stale_files(
-            reanalysis.touched.iter().map(|key| key.key()),
-            |key| db.fact_fingerprint(key),
-            |key| {
-                (!edits.is_empty()).then(|| {
-                    crate::db_index::derivation::fingerprint_before_edits(&edits, || {
-                        db.fact_fingerprint(key)
-                    })
-                })
-            },
-        )
+        let reanalysis = self
+            .reanalysis
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match reanalysis {
+            Some(reanalysis) => reanalysis.take(&mut self.db, file_ids, edits),
+            None => {
+                *reanalysis = Some(analyzer::Reanalysis::begin(
+                    &mut self.db,
+                    file_ids,
+                    edits,
+                    self.schedule,
+                ));
+            }
+        }
+        self.taken_revision = self.db.get_vfs().content_revision();
+    }
+
+    /// Advances the re-analysis in progress by `slice`.
+    pub fn advance_update(&mut self, slice: Slice) -> UpdateProgress {
+        let session = self
+            .reanalysis
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(reanalysis) = session else {
+            return UpdateProgress::Settled(Vec::new());
+        };
+        if self.db.get_vfs().content_revision() != self.taken_revision {
+            return UpdateProgress::TextChanged;
+        }
+        if !reanalysis.run(&mut self.db, slice) {
+            return UpdateProgress::Settling;
+        }
+        let reanalysis = session.take().expect("a re-analysis in progress");
+        let edits = reanalysis.edits().clone();
+        let reanalysed = reanalysis.finish(&mut self.db);
+        self.last_evaluated_files = reanalysed.evaluated_files;
+        self.last_stats = reanalysed.stats;
+        let reads = self
+            .diagnostic_reads
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        UpdateProgress::Settled(stale_diagnostic_files(
+            reads,
+            &self.db,
+            &reanalysed.touched,
+            &edits,
+        ))
+    }
+
+    /// Whether a re-analysis is in progress.
+    pub fn is_updating(&self) -> bool {
+        self.session().is_some()
+    }
+
+    /// Settles `file_ids` before the rest of the re-analysis in progress.
+    pub fn prioritise_update(&mut self, file_ids: &[FileId]) {
+        if let Some(reanalysis) = self
+            .reanalysis
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            reanalysis.prioritise(file_ids);
+        }
+    }
+
+    /// Whether the re-analysis in progress still has work in `file_id`.
+    pub fn is_settling(&self, file_id: FileId) -> bool {
+        self.session()
+            .as_ref()
+            .is_some_and(|reanalysis| reanalysis.is_settling(file_id))
+    }
+
+    /// Whether `file_id` still settles ahead of the rest of the re-analysis
+    /// in progress.
+    pub fn settles_first(&self, file_id: FileId) -> bool {
+        self.session()
+            .as_ref()
+            .is_some_and(|reanalysis| reanalysis.in_focus(file_id))
+    }
+
+    fn session(&self) -> std::sync::MutexGuard<'_, Option<analyzer::Reanalysis>> {
+        self.reanalysis
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Sets the order re-analyses take files in; see [`Schedule`].
@@ -108,13 +208,13 @@ impl LuaCompilation {
         self.schedule = schedule;
     }
 
-    /// The files the last [`Self::update_index`] re-analysed: those whose
-    /// source layer was rebuilt or whose derivations were evaluated.
+    /// The files the last re-analysis re-analysed: those whose source layer
+    /// was rebuilt or whose derivations were evaluated.
     pub fn last_evaluated_files(&self) -> &[FileId] {
         &self.last_evaluated_files
     }
 
-    /// What the last [`Self::update_index`] evaluated.
+    /// What the last re-analysis evaluated.
     #[cfg(test)]
     pub(crate) fn last_stats(&self) -> &analyzer::EngineStats {
         &self.last_stats
@@ -177,6 +277,7 @@ impl LuaCompilation {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        debug_assert!(self.session().is_none(), "forking mid re-analysis");
         Self {
             db: self.db.fork_independent(),
             emmyrc: self.emmyrc.clone(),
@@ -185,6 +286,8 @@ impl LuaCompilation {
             last_evaluated_files: Vec::new(),
             last_stats: analyzer::EngineStats::default(),
             schedule: self.schedule,
+            reanalysis: Mutex::default(),
+            taken_revision: self.taken_revision,
         }
     }
 
@@ -204,6 +307,10 @@ impl LuaCompilation {
     }
 
     pub fn clear_index(&mut self) {
+        *self
+            .reanalysis
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.db.clear();
         *self
             .diagnostic_reads
@@ -236,4 +343,23 @@ impl LuaCompilation {
         self.emmyrc = config.clone();
         self.db.update_config(config);
     }
+}
+
+/// The files whose last diagnostics read one of `touched` and no longer hold,
+/// even with `edits` mapped back. Reads that held only through the edits are
+/// re-recorded as reads of the value as it stands.
+fn stale_diagnostic_files(
+    reads: &mut DiagnosticReads,
+    db: &DbIndex,
+    touched: &rustc_hash::FxHashSet<derivation::HashedKey>,
+    edits: &derivation::EditMaps,
+) -> Vec<FileId> {
+    reads.stale_files(
+        touched.iter().map(|key| key.key()),
+        |key| db.fact_fingerprint(key),
+        |key| {
+            (!edits.is_empty())
+                .then(|| derivation::fingerprint_before_edits(edits, || db.fact_fingerprint(key)))
+        },
+    )
 }

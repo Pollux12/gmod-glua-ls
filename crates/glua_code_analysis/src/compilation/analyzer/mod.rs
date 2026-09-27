@@ -19,7 +19,7 @@ pub(crate) use common::{union_widens_cached_type, widen_mutable_decl_literal};
 pub(crate) use dynamic_field::for_range_pairs_source_for_var;
 pub(crate) use dynamic_field::is_provably_builtin_iterator_call;
 pub(crate) use engine::EngineStats;
-pub use engine::Schedule;
+pub use engine::{Schedule, Slice};
 pub use lua::is_member_assignment_in_conditional_branch;
 pub(crate) use lua::{
     dominating_guarded_table_bootstrap_range, infer_for_range_iter_expr_func,
@@ -95,12 +95,8 @@ impl ScriptedScopes {
     }
 }
 
-/// Re-analyses `file_ids` from their current text: forgets what their previous
-/// analysis produced, rebuilds each live file's source layer, and evaluates
-/// every derivation that is new or read a fact that changed until nothing is
-/// stale. A file without a syntax tree is treated as deleted.
-/// What one [`reanalyze`] did.
-pub(crate) struct Reanalysis {
+/// What a finished [`Reanalysis`] did.
+pub(crate) struct Reanalysed {
     /// Every key whose value may have changed.
     pub touched: HashSet<derivation::HashedKey>,
     /// The files whose source layer was rebuilt or whose derivations were
@@ -109,55 +105,186 @@ pub(crate) struct Reanalysis {
     pub(crate) stats: engine::EngineStats,
 }
 
-/// Re-analyses `file_ids` from their current text, and whatever read a fact
-/// that moved.
-pub(crate) fn reanalyze(
-    db: &mut DbIndex,
-    file_ids: Vec<FileId>,
-    edits: derivation::EditMaps,
-    schedule: engine::Schedule,
-) -> Reanalysis {
-    let mut engine = engine::Engine::new(edits, schedule);
-    let mut pending: Vec<FileId> = file_ids;
-    loop {
-        pending.sort();
-        pending.dedup();
-        if pending.is_empty() {
-            break;
+/// A re-analysis in progress. It re-analyses files from their current text:
+/// forgets what their previous analysis produced, rebuilds each live file's
+/// source layer, and evaluates every derivation that is new or read a fact
+/// that changed until nothing is stale. A file without a syntax tree is
+/// treated as deleted.
+///
+/// It advances in slices ([`Self::run`]). Between two, no evaluation is open
+/// and the index reads as it does outside any run, so readers can use it.
+pub(crate) struct Reanalysis {
+    engine: engine::Engine,
+    /// The current pass's recipes; `None` once no pass is left.
+    recipes: Option<derive::Recipes>,
+    /// The access paths the current pass built: text is fixed for a pass.
+    access_paths: crate::semantic::AccessPaths,
+    /// The stage the run is at while it waits for its next slice.
+    stage: derivation::AnalysisStage,
+}
+
+impl Reanalysis {
+    /// Starts re-analysing `file_ids`: rebuilds their source layers and
+    /// queues their derivations and whatever read a fact that moved.
+    pub(crate) fn begin(
+        db: &mut DbIndex,
+        file_ids: Vec<FileId>,
+        edits: derivation::EditMaps,
+        schedule: engine::Schedule,
+    ) -> Self {
+        let mut engine = engine::Engine::new(edits, schedule);
+        let recipes = start_pass(db, &mut engine, file_ids);
+        let mut reanalysis = Self {
+            engine,
+            recipes,
+            access_paths: crate::semantic::AccessPaths::default(),
+            stage: derivation::AnalysisStage::Closed,
+        };
+        reanalysis.pause(db);
+        reanalysis
+    }
+
+    /// Takes `file_ids`' new text in, `edits` saying where it moved their
+    /// positions since this re-analysis took them last: they settle before
+    /// the work still queued.
+    pub(crate) fn take(
+        &mut self,
+        db: &mut DbIndex,
+        file_ids: Vec<FileId>,
+        edits: derivation::EditMaps,
+    ) {
+        refresh_payload_refs(db, self.engine.touched());
+        self.engine.take_edits(edits);
+        if let Some(recipes) = start_pass(db, &mut self.engine, file_ids) {
+            self.recipes = Some(recipes);
+            self.access_paths = crate::semantic::AccessPaths::default();
         }
-        let scopes = crate::profile::phase("reanalyze: scopes", || ScriptedScopes::new(db));
-        engine.note_rebuilt(&pending);
-        engine.focus_on(&pending);
-        crate::profile::memory::checkpoint("before the source layer");
-        let touched = crate::profile::phase("reanalyze: replace files", || {
-            replace_files(db, &mut engine, &pending, &scopes)
-        });
-        crate::profile::memory::checkpoint("after the source layer");
-        db.reader_graph_mut().forget_fingerprints();
-        crate::profile::phase("reanalyze: readers of touched", || {
-            engine.readers_of(db, touched.iter())
-        });
-        let recipes =
-            crate::profile::phase("reanalyze: recipes", || derive::Recipes::new(db, scopes));
-        crate::profile::phase("reanalyze: engine run", || engine.run(db, &recipes));
-        crate::profile::memory::checkpoint("after the engine run");
-        pending = engine.take_stale_sources().into_iter().collect();
+        self.pause(db);
     }
-    crate::profile::phase("reanalyze: flush", || db.flush_inference_derived_state());
-    let touched = engine.take_touched();
-    crate::profile::phase("reanalyze: payload refs", || {
-        refresh_payload_refs(db, &touched)
+
+    /// Evaluates until the re-analysis settles or `slice` is over. Returns
+    /// whether it settled.
+    pub(crate) fn run(&mut self, db: &mut DbIndex, slice: engine::Slice) -> bool {
+        db.set_analysis_stage(self.stage);
+        crate::semantic::keep_access_paths(std::mem::take(&mut self.access_paths));
+        let unwinding = Unwinding;
+        let evaluated = self.engine.stats().total_evaluations();
+        let settled = loop {
+            let Some(recipes) = &self.recipes else {
+                break true;
+            };
+            let slice = slice.remaining(self.engine.stats().total_evaluations() - evaluated);
+            let settled = crate::profile::phase("reanalyze: engine run", || {
+                self.engine.run(db, recipes, slice)
+            });
+            if !settled {
+                break false;
+            }
+            crate::profile::memory::checkpoint("after the engine run");
+            let stale = self.engine.take_stale_sources();
+            crate::semantic::stop_keeping_access_paths();
+            self.recipes = start_pass(db, &mut self.engine, stale.into_iter().collect());
+            crate::semantic::keep_access_paths(crate::semantic::AccessPaths::default());
+        };
+        std::mem::forget(unwinding);
+        self.access_paths = crate::semantic::stop_keeping_access_paths();
+        self.pause(db);
+        settled
+    }
+
+    /// Leaves the index as it reads outside any run until the next slice.
+    fn pause(&mut self, db: &mut DbIndex) {
+        self.stage = db.analysis_stage();
+        db.set_analysis_stage(derivation::AnalysisStage::Closed);
+        crate::profile::phase("reanalyze: flush", || db.flush_inference_derived_state());
+    }
+
+    /// Settles `file_ids` before the other work still queued.
+    pub(crate) fn prioritise(&mut self, file_ids: &[FileId]) {
+        self.engine.prioritise(file_ids);
+    }
+
+    /// Whether `file_id` has work still to settle.
+    pub(crate) fn is_settling(&self, file_id: FileId) -> bool {
+        self.engine.is_settling(file_id)
+    }
+
+    /// Whether `file_id` still settles ahead of the rest.
+    pub(crate) fn in_focus(&self, file_id: FileId) -> bool {
+        self.engine.in_focus(file_id)
+    }
+
+    /// The edits reads may hold through.
+    pub(crate) fn edits(&self) -> &derivation::EditMaps {
+        self.engine.edits()
+    }
+
+    /// Wraps up a settled re-analysis.
+    pub(crate) fn finish(mut self, db: &mut DbIndex) -> Reanalysed {
+        debug_assert!(self.recipes.is_none(), "finishing an unsettled re-analysis");
+        let touched = self.engine.take_touched();
+        crate::profile::phase("reanalyze: payload refs", || {
+            refresh_payload_refs(db, &touched)
+        });
+        crate::profile::phase_report("reanalyze");
+        let stats = self.engine.stats().clone();
+        let evaluated_files = self.engine.evaluated_files();
+        stats.report(evaluated_files.len());
+        crate::profile::memory::checkpoint("end of re-analysis");
+        Reanalysed {
+            touched,
+            evaluated_files,
+            stats,
+        }
+    }
+}
+
+impl std::fmt::Debug for Reanalysis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reanalysis")
+            .field("stage", &self.stage)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Stops keeping access paths if a slice unwinds.
+struct Unwinding;
+
+impl Drop for Unwinding {
+    fn drop(&mut self) {
+        crate::semantic::stop_keeping_access_paths();
+    }
+}
+
+/// Rebuilds `file_ids`' source layers and queues their derivations ahead of
+/// the work already queued, then opens the run. Returns the pass's recipes;
+/// `None` when there is nothing to re-analyse.
+fn start_pass(
+    db: &mut DbIndex,
+    engine: &mut engine::Engine,
+    mut file_ids: Vec<FileId>,
+) -> Option<derive::Recipes> {
+    file_ids.sort();
+    file_ids.dedup();
+    if file_ids.is_empty() {
+        return None;
+    }
+    let scopes = crate::profile::phase("reanalyze: scopes", || ScriptedScopes::new(db));
+    engine.replacing(&file_ids);
+    engine.note_rebuilt(&file_ids);
+    engine.focus_on(&file_ids);
+    crate::profile::memory::checkpoint("before the source layer");
+    let touched = crate::profile::phase("reanalyze: replace files", || {
+        replace_files(db, engine, &file_ids, &scopes)
     });
-    crate::profile::phase_report("reanalyze");
-    let stats = engine.stats().clone();
-    let evaluated_files = engine.evaluated_files();
-    stats.report(evaluated_files.len());
-    crate::profile::memory::checkpoint("end of re-analysis");
-    Reanalysis {
-        touched,
-        evaluated_files,
-        stats,
-    }
+    crate::profile::memory::checkpoint("after the source layer");
+    db.reader_graph_mut().forget_fingerprints();
+    crate::profile::phase("reanalyze: readers of touched", || {
+        engine.readers_of(db, touched.iter())
+    });
+    let recipes = crate::profile::phase("reanalyze: recipes", || derive::Recipes::new(db, scopes));
+    engine.open(db);
+    Some(recipes)
 }
 
 /// Forgets `file_ids`' derivations and facts, rebuilds the live ones' source

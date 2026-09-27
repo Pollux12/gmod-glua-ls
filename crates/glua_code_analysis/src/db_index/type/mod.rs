@@ -2600,15 +2600,15 @@ impl LuaTypeIndex {
     ///
     /// The rebuild reads every fact in the index, so it is deferred to
     /// [`flush_inference_derived_state`](Self::flush_inference_derived_state)
-    /// rather than run once per binding. No reader runs inside an analysis
-    /// batch: the events are read by the inference-trust diagnostic and the
-    /// support dependents by reindex expansion, both after `analyze` returns.
+    /// rather than run once per binding. No reader runs inside a slice of an
+    /// engine run, and each slice ends with a flush: the events are read by
+    /// the inference-trust diagnostic and the support dependents by reindex
+    /// expansion.
     pub(crate) fn mark_inference_derived_state_dirty(&mut self) {
         self.derived_state_dirty = true;
     }
 
     /// Whether a binding left the inference-derived state for a flush.
-    #[cfg(test)]
     pub(crate) fn inference_derived_state_is_stale(&self) -> bool {
         self.derived_state_dirty
     }

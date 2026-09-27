@@ -25,6 +25,9 @@
 //! Once they settle, the readers whose reads still moved run from the first
 //! stage again, like any other work.
 //!
+//! A run can advance in slices: it stops between two evaluations and picks up
+//! where it stopped, so readers can use the index in between.
+//!
 //! A run settles in stages (see [`derivation::AnalysisStage`]). Some reads
 //! only have a final answer once nothing can add a fact any more: a field no
 //! writer declared yet, a member slot one of whose writers is still untyped.
@@ -75,6 +78,36 @@ impl Schedule {
                 use std::hash::BuildHasher;
                 rustc_hash::FxBuildHasher.hash_one((seed, file_id.id))
             }
+        }
+    }
+}
+
+/// How far one call of [`Engine::run`] goes before it stops, settled or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slice {
+    /// Until the run settles.
+    Whole,
+    /// Until this many more derivations were evaluated.
+    Evaluations(usize),
+    /// Until this instant.
+    Until(std::time::Instant),
+}
+
+impl Slice {
+    /// What is left of the slice after `evaluated` evaluations in it.
+    pub(crate) fn remaining(self, evaluated: usize) -> Self {
+        match self {
+            Self::Evaluations(limit) => Self::Evaluations(limit.saturating_sub(evaluated)),
+            _ => self,
+        }
+    }
+
+    /// Whether the slice is over after `evaluated` evaluations in it.
+    fn over(self, evaluated: usize) -> bool {
+        match self {
+            Self::Whole => false,
+            Self::Evaluations(limit) => evaluated >= limit,
+            Self::Until(deadline) => std::time::Instant::now() >= deadline,
         }
     }
 }
@@ -142,6 +175,27 @@ impl Queue {
     fn is_empty(&self) -> bool {
         self.order.is_empty()
     }
+
+    /// Takes out every entry `take` accepts.
+    fn take_where(
+        &mut self,
+        mut take: impl FnMut(DerivationId) -> bool,
+    ) -> Vec<(DerivationId, Reason)> {
+        let taken = self
+            .reasons
+            .iter()
+            .filter(|(id, _)| take(**id))
+            .map(|(id, reason)| (*id, *reason))
+            .collect::<Vec<_>>();
+        for (id, _) in &taken {
+            self.remove(*id);
+        }
+        taken
+    }
+
+    fn files(&self) -> impl Iterator<Item = crate::FileId> + '_ {
+        self.reasons.keys().map(|id| id.file_id)
+    }
 }
 
 /// How the engine evaluates a derivation.
@@ -173,18 +227,19 @@ pub(crate) struct Engine {
     stale_sources: BTreeSet<crate::FileId>,
     /// Every key whose value may have changed during this engine's runs.
     touched: FxHashSet<HashedKey>,
-    /// The files being re-analysed, while their derivations settle.
+    /// The files that settle first, until they do: the files being
+    /// re-analysed, and any prioritised.
     focus: FxHashSet<crate::FileId>,
-    /// Readers in other files, and their source layers, queued while the
-    /// focus settles.
-    waiting: BTreeSet<DerivationId>,
+    /// Work in other files queued while the focus settles, with why it was
+    /// queued.
+    waiting: BTreeMap<DerivationId, Reason>,
     /// The files whose derivations this engine evaluated.
     evaluated: FxHashSet<crate::FileId>,
     /// Where the edits being re-analysed moved positions: a read of a fact
     /// whose value only moved still holds.
     edits: derivation::EditMaps,
-    /// Whether other files' references still have to follow `edits`.
-    edits_pending: bool,
+    /// The edits other files' references have yet to follow.
+    to_follow: derivation::EditMaps,
     /// Fingerprints of keys with `edits` undone, taken once per value: the
     /// same moved key is checked for every reader it queued.
     before_edits: std::cell::RefCell<FxHashMap<HashedKey, derivation::Fingerprint>>,
@@ -201,7 +256,7 @@ impl Engine {
         Self {
             worklist: Queue::new(schedule),
             next_round: Queue::new(schedule),
-            edits_pending: !edits.is_empty(),
+            to_follow: edits.clone(),
             edits,
             ..Self::default()
         }
@@ -209,7 +264,31 @@ impl Engine {
 
     /// The edits other files' references have yet to follow, once.
     pub(crate) fn edits_to_apply(&mut self) -> Option<derivation::EditMaps> {
-        std::mem::take(&mut self.edits_pending).then(|| self.edits.clone())
+        (!self.to_follow.is_empty()).then(|| std::mem::take(&mut self.to_follow))
+    }
+
+    /// The edits a read may hold through.
+    pub(crate) fn edits(&self) -> &derivation::EditMaps {
+        &self.edits
+    }
+
+    /// Takes in `later`, edits of the text the edits so far produced: a read
+    /// holds if it saw a value from before any of them, and what other files
+    /// reference follows `later` alone.
+    pub(crate) fn take_edits(&mut self, later: derivation::EditMaps) {
+        self.edits = self.edits.then(&later);
+        self.touched = std::mem::take(&mut self.touched)
+            .into_iter()
+            .flat_map(|key| {
+                let moved = later
+                    .map_key(&key)
+                    .filter(|moved| moved != key.key())
+                    .map(HashedKey::new);
+                std::iter::once(key).chain(moved)
+            })
+            .collect();
+        self.to_follow = later;
+        self.before_edits.get_mut().clear();
     }
 
     /// Whether reads of `key` that saw a fingerprint still hold: the value is
@@ -336,7 +415,7 @@ impl Engine {
             match reader.kind {
                 DerivationKind::Diagnostics => {}
                 _ if self.waits(reader) => {
-                    self.waiting.insert(reader);
+                    self.wait(reader, Reason::Read);
                 }
                 DerivationKind::Source => {
                     if crate::profile::tracing_evaluations() {
@@ -349,9 +428,86 @@ impl Engine {
         }
     }
 
-    /// Settles `file_ids` before any reader in another file is re-checked.
+    /// Settles `file_ids` before any other work: what is queued in other
+    /// files waits for them, and so does every reader in another file queued
+    /// until they settle.
     pub(crate) fn focus_on(&mut self, file_ids: &[crate::FileId]) {
         self.focus = file_ids.iter().copied().collect();
+        self.park_outside_focus();
+    }
+
+    /// Adds `file_ids` to what settles first, starting a focus if none is
+    /// settling: their waiting work is queued again and other files' queued
+    /// work waits.
+    pub(crate) fn prioritise(&mut self, file_ids: &[crate::FileId]) {
+        let added = file_ids
+            .iter()
+            .filter(|file_id| **file_id != crate::FileId::VIRTUAL)
+            .filter(|file_id| self.focus.insert(**file_id))
+            .count();
+        if added == 0 {
+            return;
+        }
+        let resumed = self
+            .waiting
+            .extract_if(.., |id, _| self.focus.contains(&id.file_id))
+            .collect::<Vec<_>>();
+        for (id, reason) in resumed {
+            self.queue(id, reason);
+        }
+        self.park_outside_focus();
+    }
+
+    /// Moves queued work outside the focus to the waiting set.
+    fn park_outside_focus(&mut self) {
+        if self.focus.is_empty() {
+            return;
+        }
+        let focus = &self.focus;
+        let mut parked = Vec::new();
+        for queue in [&mut self.worklist, &mut self.next_round] {
+            parked.extend(queue.take_where(|id| {
+                id.file_id != crate::FileId::VIRTUAL && !focus.contains(&id.file_id)
+            }));
+        }
+        for (id, reason) in parked {
+            self.wait(id, reason);
+        }
+    }
+
+    /// Parks `id` until the focus settles; a changed entry stays changed.
+    fn wait(&mut self, id: DerivationId, reason: Reason) {
+        let parked = self.waiting.entry(id).or_insert(reason);
+        *parked = (*parked).min(reason);
+    }
+
+    /// Forgets the queued work of `file_ids`, whose derivations are about to
+    /// be replaced and queued again.
+    pub(crate) fn replacing(&mut self, file_ids: &[crate::FileId]) {
+        let replaced = |id: DerivationId| file_ids.contains(&id.file_id);
+        self.worklist.take_where(replaced);
+        self.next_round.take_where(replaced);
+        self.waiting.retain(|id, _| !replaced(*id));
+        self.stale_sources
+            .retain(|file_id| !file_ids.contains(file_id));
+    }
+
+    /// Whether `file_id` has work still to settle: queued, waiting, in the
+    /// focus or a source layer to rebuild.
+    pub(crate) fn is_settling(&self, file_id: crate::FileId) -> bool {
+        self.focus.contains(&file_id)
+            || self.stale_sources.contains(&file_id)
+            || self
+                .worklist
+                .files()
+                .chain(self.next_round.files())
+                .chain(self.waiting.keys().map(|id| id.file_id))
+                .any(|queued| queued == file_id)
+    }
+
+    /// Whether `file_id` is in the focus that is still settling.
+    pub(crate) fn in_focus(&self, file_id: crate::FileId) -> bool {
+        self.focus.contains(&file_id)
     }
 
     /// Whether `reader` waits for the focus to settle.
@@ -364,6 +520,11 @@ impl Engine {
     /// Marks `file_id`'s source layer as needing a rebuild.
     pub(crate) fn source_stale(&mut self, file_id: crate::FileId) {
         self.stale_sources.insert(file_id);
+    }
+
+    /// Every key whose value may have changed so far.
+    pub(crate) fn touched(&self) -> &FxHashSet<HashedKey> {
+        &self.touched
     }
 
     /// Every key whose value may have changed, emptied.
@@ -389,12 +550,20 @@ impl Engine {
         std::mem::take(&mut self.stale_sources)
     }
 
-    /// Evaluates the worklist to quiescence, stage by stage.
-    pub(crate) fn run(&mut self, db: &mut DbIndex, recipe: &dyn Recipe) {
-        crate::semantic::keep_access_paths();
-        let _paths = OnDrop(crate::semantic::stop_keeping_access_paths);
+    /// Starts the run over from the first stage.
+    pub(crate) fn open(&mut self, db: &mut DbIndex) {
         self.enter_stage(db, AnalysisStage::Open);
+    }
+
+    /// Evaluates the worklist stage by stage until it settles or `slice` is
+    /// over. Returns whether it settled; one that did not stopped between two
+    /// evaluations and goes on from there.
+    pub(crate) fn run(&mut self, db: &mut DbIndex, recipe: &dyn Recipe, slice: Slice) -> bool {
+        let started = self.stats.total_evaluations();
         loop {
+            if slice.over(self.stats.total_evaluations() - started) {
+                return false;
+            }
             let Some((id, reason)) = self.worklist.pop_first() else {
                 if self.next_round.is_empty() {
                     if self.advance_stage(db) || self.release_waiting(db) {
@@ -472,6 +641,7 @@ impl Engine {
         }
         self.cursor = None;
         self.rebase_moved_reads(db);
+        true
     }
 
     /// Re-records every read that held only with the edits mapped back as a
@@ -553,7 +723,12 @@ impl Engine {
     fn release_waiting(&mut self, db: &mut DbIndex) -> bool {
         self.focus.clear();
         let mut queued = 0;
-        for reader in std::mem::take(&mut self.waiting) {
+        for (reader, reason) in std::mem::take(&mut self.waiting) {
+            if reason == Reason::Changed {
+                self.worklist.insert(reader, Reason::Changed);
+                queued += 1;
+                continue;
+            }
             let moved = if crate::profile::tracing_evaluations() {
                 self.moved_reads(db, reader)
             } else {

@@ -45,9 +45,9 @@ pub use infer::narrow::{
 };
 pub(crate) use infer::pairs_iter_value_registry_path;
 pub(crate) use infer::resolve_decl_backed_global_path_member_type;
+pub(crate) use infer::{AccessPaths, keep_access_paths, stop_keeping_access_paths};
 use infer::{infer_call_arg_expr_list_types, infer_expr_list_types, infer_expr_list_value_type_at};
 pub use infer::{infer_table_field_value_should_be, infer_table_should_be};
-pub(crate) use infer::{keep_access_paths, stop_keeping_access_paths};
 use lsp_types::Uri;
 pub use member::LuaMemberInfo;
 pub use member::find_index_operations;

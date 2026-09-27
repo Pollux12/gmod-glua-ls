@@ -941,6 +941,28 @@ impl VirtualWorkspace {
         stale
     }
 
+    /// The derivations of a file that name no node of its current text.
+    #[cfg(test)]
+    pub fn phantom_derivations(&self) -> Vec<crate::db_index::derivation::DerivationId> {
+        let db = self.analysis.compilation.get_db();
+        let mut phantoms = db
+            .reader_graph()
+            .derivations()
+            .filter(|id| id.file_id != FileId::VIRTUAL)
+            .filter(|id| {
+                db.get_vfs()
+                    .get_syntax_tree(&id.file_id)
+                    .is_none_or(|tree| {
+                        id.syntax_id()
+                            .to_node_from_root(&tree.get_red_root())
+                            .is_none()
+                    })
+            })
+            .collect::<Vec<_>>();
+        phantoms.sort();
+        phantoms
+    }
+
     /// Every type cache, type declaration, dynamic field, net flow and the
     /// semantic digest, as sorted text.
     #[cfg(test)]

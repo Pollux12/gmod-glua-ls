@@ -3,21 +3,32 @@ mod test {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use crate::{Emmyrc, GMOD_CALL_ARG_BUILTINS_FIXTURE, Schedule, VirtualWorkspace};
+    use crate::{
+        Emmyrc, GMOD_CALL_ARG_BUILTINS_FIXTURE, Schedule, Slice, UpdateProgress, VirtualWorkspace,
+    };
+
+    /// How a cold build settles.
+    #[derive(Debug, Clone, Copy)]
+    enum Build {
+        Whole,
+        OneEvaluationAtATime,
+    }
 
     /// Every type cache, type declaration, dynamic field, net flow and the semantic
     /// digest of `files`
     /// cold-built in one batch under `schedule`, as sorted text; `None` when
     /// the build does not settle within a generous bound.
     fn settled(schedule: Schedule, files: &[(&str, &str)]) -> Option<Vec<String>> {
-        settled_in(schedule, files, false)
+        settled_in(schedule, files, false, Build::Whole)
     }
 
-    /// [`settled`], over the standard library as well when `std_lib` is set.
+    /// [`settled`], over the standard library as well when `std_lib` is set,
+    /// settling as `build` says.
     fn settled_in(
         schedule: Schedule,
         files: &[(&str, &str)],
         std_lib: bool,
+        build: Build,
     ) -> Option<Vec<String>> {
         let files = files
             .iter()
@@ -36,12 +47,36 @@ mod test {
                 emmyrc.gmod.enabled = true;
                 ws.update_emmyrc(emmyrc);
                 ws.analysis.compilation.set_schedule(schedule);
-                ws.def_files(
-                    files
-                        .iter()
-                        .map(|(path, text)| (path.as_str(), text.as_str()))
-                        .collect(),
-                );
+                match build {
+                    Build::Whole => {
+                        ws.def_files(
+                            files
+                                .iter()
+                                .map(|(path, text)| (path.as_str(), text.as_str()))
+                                .collect(),
+                        );
+                    }
+                    Build::OneEvaluationAtATime => {
+                        let mut texts = files
+                            .iter()
+                            .map(|(path, text)| (ws.virtual_url_generator.new_uri(path), text))
+                            .collect::<Vec<_>>();
+                        texts.sort_by_cached_key(|(uri, _)| crate::uri_sort_key(uri));
+                        let file_ids = texts
+                            .into_iter()
+                            .map(|(uri, text)| {
+                                ws.analysis
+                                    .update_file_text_only(&uri, text.clone())
+                                    .expect("a file id")
+                            })
+                            .collect();
+                        ws.analysis.begin_reindex(file_ids);
+                        while !matches!(
+                            ws.analysis.advance_reindex(Slice::Evaluations(1)),
+                            UpdateProgress::Settled(_)
+                        ) {}
+                    }
+                }
                 let _ = tx.send(ws.settled_digest());
             })
             .expect("analysis thread");
@@ -84,6 +119,7 @@ end
                     ),
                 ],
                 true,
+                Build::Whole,
             )
             .is_some()
         );
@@ -242,21 +278,40 @@ Config = {}
         assert_eq!(config_type(&[LAST_BY_PATH, FIRST_BY_PATH]), "Alpha");
     }
 
+    /// Asserts `files` settle the same cold-built in canonical order, in
+    /// reversed order, and in canonical order one evaluation at a time.
     fn assert_schedule_independent(files: &[(&str, &str)]) {
         let canonical = settled(Schedule::Canonical, files).expect("canonical order settles");
-        let reversed = settled(Schedule::Reversed, files).expect("reversed order settles");
-        let only_canonical = canonical
-            .iter()
-            .filter(|line| !reversed.contains(line))
-            .collect::<Vec<_>>();
-        let only_reversed = reversed
-            .iter()
-            .filter(|line| !canonical.contains(line))
-            .collect::<Vec<_>>();
-        assert!(
-            only_canonical.is_empty() && only_reversed.is_empty(),
-            "canonical only: {only_canonical:#?}\nreversed only: {only_reversed:#?}"
-        );
+        let others = [
+            (
+                "reversed",
+                settled(Schedule::Reversed, files).expect("reversed order settles"),
+            ),
+            (
+                "sliced",
+                settled_in(
+                    Schedule::Canonical,
+                    files,
+                    false,
+                    Build::OneEvaluationAtATime,
+                )
+                .expect("slices settle"),
+            ),
+        ];
+        for (name, other) in others {
+            let only_canonical = canonical
+                .iter()
+                .filter(|line| !other.contains(line))
+                .collect::<Vec<_>>();
+            let only_other = other
+                .iter()
+                .filter(|line| !canonical.contains(line))
+                .collect::<Vec<_>>();
+            assert!(
+                only_canonical.is_empty() && only_other.is_empty(),
+                "canonical only: {only_canonical:#?}\n{name} only: {only_other:#?}"
+            );
+        }
     }
 
     #[test]

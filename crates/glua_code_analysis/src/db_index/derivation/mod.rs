@@ -1162,6 +1162,12 @@ pub fn end() -> Evaluation {
     evaluation
 }
 
+/// Whether a key table is lent to this thread.
+#[cfg(test)]
+pub fn keys_lent() -> bool {
+    KEYS.with(|keys| keys.borrow().is_some())
+}
+
 /// Whether an evaluation is recording on this thread. Callers building a
 /// costly key check this first.
 #[inline]

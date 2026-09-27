@@ -816,7 +816,9 @@ impl DbIndex {
     /// Rebuilds the inference-derived state left stale by a batch of fact
     /// bindings. See [`LuaTypeIndex::flush_inference_derived_state`].
     pub fn flush_inference_derived_state(&mut self) {
-        Arc::make_mut(&mut self.types_index).flush_inference_derived_state();
+        if self.types_index.inference_derived_state_is_stale() {
+            Arc::make_mut(&mut self.types_index).flush_inference_derived_state();
+        }
     }
 
     pub fn get_type_index_mut(&mut self) -> &mut LuaTypeIndex {

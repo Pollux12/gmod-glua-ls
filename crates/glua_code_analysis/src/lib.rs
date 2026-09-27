@@ -433,9 +433,30 @@ impl EmmyLuaAnalysis {
         )
     }
 
-    /// Re-analyses `file_ids` from the text the VFS holds for them. Returns
-    /// every live file whose diagnostics may have changed: the files
-    /// themselves and every file whose diagnostics read a fact that moved.
+    /// Starts re-analysing `file_ids` from the text the VFS holds for them, or
+    /// takes them into the re-analysis in progress, which settles them first.
+    /// Advance it with [`Self::advance_reindex`].
+    pub fn begin_reindex(&mut self, file_ids: Vec<FileId>) {
+        self.compilation.begin_update(file_ids);
+    }
+
+    /// Advances the re-analysis in progress by `slice`. Once it settles,
+    /// returns every live file whose diagnostics read a fact that moved.
+    pub fn advance_reindex(&mut self, slice: Slice) -> UpdateProgress {
+        match self.compilation.advance_update(slice) {
+            UpdateProgress::Settled(mut affected) => {
+                let vfs = self.compilation.get_db().get_vfs();
+                affected.retain(|file_id| vfs.get_syntax_tree(file_id).is_some());
+                UpdateProgress::Settled(affected)
+            }
+            progress => progress,
+        }
+    }
+
+    /// Re-analyses `file_ids` from the text the VFS holds for them, settling
+    /// any re-analysis in progress with them. Returns every live file whose
+    /// diagnostics may have changed: the files themselves and every file whose
+    /// diagnostics read a fact that moved.
     pub fn reindex_files(&mut self, file_ids: Vec<FileId>) -> Vec<FileId> {
         let mut affected = self.compilation.update_index(file_ids.clone());
         affected.extend(file_ids);
