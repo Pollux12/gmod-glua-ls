@@ -229,6 +229,16 @@ pub fn hash_local<P: FilePosition + ?Sized, H: Hasher>(position: &P, state: &mut
     position.hash_in_file(file_id, state);
 }
 
+/// A position of the file whose fact is being fingerprinted, hashed as
+/// [`hash_local`] hashes it.
+pub struct Local<'a, P: ?Sized>(pub &'a P);
+
+impl<P: FilePosition + ?Sized> Hash for Local<'_, P> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        hash_local(self.0, state);
+    }
+}
+
 /// Whether a fact value is being fingerprinted on this thread: types whose
 /// ordinary hash is a cheap bucketing summary hash their whole content then.
 pub fn fingerprinting() -> bool {

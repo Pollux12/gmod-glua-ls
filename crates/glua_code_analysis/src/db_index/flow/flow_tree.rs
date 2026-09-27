@@ -5,7 +5,7 @@ use glua_parser::{LuaAstPtr, LuaExpr, LuaSyntaxId};
 use internment::ArcIntern;
 use smol_str::SmolStr;
 
-use crate::db_index::derivation::{self, Fingerprint};
+use crate::db_index::derivation::{self, Fingerprint, Local};
 use crate::{FlowId, FlowNode, FlowNodeKind, LuaDeclId, LuaDefinitionId};
 
 /// Order-independent hash of a set's elements.
@@ -14,15 +14,6 @@ fn unordered_fingerprint<T: Hash>(items: impl IntoIterator<Item = T>) -> Fingerp
         .into_iter()
         .map(|item| derivation::fingerprint_of(&item))
         .fold(0, u64::wrapping_add)
-}
-
-/// A position of the file being fingerprinted (see [`derivation::hash_local`]).
-struct Local<'a, P>(&'a P);
-
-impl<P: derivation::FilePosition> Hash for Local<'_, P> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        derivation::hash_local(self.0, state);
-    }
 }
 
 /// File-wide summary of which variables/paths can possibly be narrowed by the

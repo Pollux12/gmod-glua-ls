@@ -228,17 +228,26 @@ impl PartialEq for VarRefId {
 
 impl Eq for VarRefId {}
 
+/// An interned name hashes its pointer, which a name freed and interned
+/// again does not keep, so a fingerprint hashes its text.
 impl Hash for VarRefId {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        let hash_name = |name: &ArcIntern<SmolStr>, state: &mut H| {
+            if crate::db_index::derivation::fingerprinting() {
+                name.as_str().hash(state);
+            } else {
+                name.hash(state);
+            }
+        };
         std::mem::discriminant(self).hash(state);
         match self {
             VarRefId::VarRef(decl_id) => decl_id.hash(state),
             VarRefId::SelfRef(self_ref_id) => self_ref_id.hash(state),
             VarRefId::IndexRef(root, path) => {
                 root.hash(state);
-                path.hash(state);
+                hash_name(path, state);
             }
-            VarRefId::GlobalName(name, _) => name.hash(state),
+            VarRefId::GlobalName(name, _) => hash_name(name, state),
         }
     }
 }

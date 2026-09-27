@@ -258,7 +258,9 @@ impl LuaFlowIndex {
                     .map_or(derivation::ABSENT, |effects| {
                         effects
                             .iter()
-                            .map(|entry| derivation::fingerprint_of(&entry))
+                            .map(|(position, entries)| {
+                                derivation::fingerprint_of(&(derivation::Local(position), entries))
+                            })
                             .fold(0u64, u64::wrapping_add)
                             .max(1)
                     })
@@ -531,6 +533,40 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// A file's effects that only moved fingerprint as they did before the
+    /// move once it is mapped back, so a reader in another file holds.
+    #[test]
+    fn a_shifted_files_special_call_effects_hold_with_the_shift_mapped_back() {
+        let file_id = FileId::new(1);
+        let text = "0123456789abcdefghijklmnopqrstuv";
+        let key = FactKey::SpecialCallFile(file_id);
+        let mut before = LuaFlowIndex::new();
+        before.add_special_call_effect(
+            file_id,
+            TextSize::new(16),
+            VarRefId::VarRef(crate::LuaDeclId::new(file_id, TextSize::new(4))),
+            LuaType::String,
+        );
+        let mut after = LuaFlowIndex::new();
+        after.add_special_call_effect(
+            file_id,
+            TextSize::new(17),
+            VarRefId::VarRef(crate::LuaDeclId::new(file_id, TextSize::new(5))),
+            LuaType::String,
+        );
+        let edits = derivation::EditMaps::new([(
+            file_id,
+            crate::PositionMap::new(text, &format!("\n{text}")),
+        )]);
+
+        let seen = derivation::in_file(Some(file_id), || before.fact_fingerprint(&key));
+        let held = derivation::fingerprint_before_edits(&edits, || {
+            derivation::in_file(Some(file_id), || after.fact_fingerprint(&key))
+        });
+
+        assert_eq!(held, seen);
     }
 
     fn str_tpl_decl_fact(site: (FileId, TextSize)) -> SpecialCallFact {
