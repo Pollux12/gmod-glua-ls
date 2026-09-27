@@ -578,13 +578,16 @@ impl FactKey {
     /// stored under the key: the member, dynamic-field and call-site indexes
     /// file each contribution under its contributing file, and the edit remap
     /// re-homes an owner or signature that moved, or reports its contributors
-    /// when it is gone. The call-role fold keeps its entries until it runs
-    /// again, which the re-indexed file's helper scan decides.
+    /// when it is gone. A file's member fingerprint keeps the share of each
+    /// owner another file's members still hold. The call-role fold keeps its
+    /// entries until it runs again, which the re-indexed file's helper scan
+    /// decides.
     pub fn keeps_foreign_contributions(&self) -> bool {
         use FactKey as K;
         matches!(
             self,
             K::MemberSlot(..)
+                | K::MemberFile(_)
                 | K::MemberOwnerMap(_)
                 | K::MemberOwnerExprKeys(_)
                 | K::MemberOwnerFields(_)

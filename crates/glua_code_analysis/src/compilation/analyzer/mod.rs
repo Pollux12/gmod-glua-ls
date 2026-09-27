@@ -192,7 +192,15 @@ fn replace_files(
                 continue;
             }
             if crate::profile::tracing_evaluations() {
-                eprintln!("[trace] foreign producer {producer:?} of {file_id:?}");
+                let kept = db
+                    .reader_graph()
+                    .outputs_of(producer)
+                    .filter(|key| {
+                        key.owning_file() == Some(*file_id) && !key.keeps_foreign_contributions()
+                    })
+                    .map(|key| format!("{:?}", key.key()))
+                    .collect::<Vec<_>>();
+                eprintln!("[trace] foreign producer {producer:?} of {file_id:?} for {kept:?}");
             }
             match producer.kind {
                 derivation::DerivationKind::Source => engine.source_stale(producer.file_id),
