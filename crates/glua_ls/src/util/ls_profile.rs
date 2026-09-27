@@ -326,6 +326,30 @@ pub fn emit_ls_reindex(cycle: u64, debounce: Duration, write_wait: Duration, wri
     );
 }
 
+/// One slice of a re-analysis: how long it waited for the write lock and held
+/// it, where it left the re-analysis, and how many edited files had settled
+/// ahead of the rest by its end.
+pub fn emit_ls_slice(
+    wait: Duration,
+    hold: Duration,
+    progress: &glua_code_analysis::UpdateProgress,
+    settled_first: usize,
+) {
+    if !ls_profile_enabled() {
+        return;
+    }
+    let progress = match progress {
+        glua_code_analysis::UpdateProgress::Settling => "settling",
+        glua_code_analysis::UpdateProgress::Settled(_) => "settled",
+        glua_code_analysis::UpdateProgress::TextChanged => "text_changed",
+    };
+    eprintln!(
+        "[profile] ls_slice wait_us={} hold_us={} progress={progress} settled_first={settled_first}",
+        wait.as_micros(),
+        hold.as_micros()
+    );
+}
+
 /// A re-analysis cycle settled after its slices, reporting `affected` files.
 pub fn emit_ls_settled(cycle: u64, affected: usize) {
     if !ls_profile_enabled() {

@@ -704,7 +704,9 @@ impl DebouncedAnalysis {
         tokio::select! {
             _ = self.shutdown.cancelled() => None,
             result = tokio::task::spawn_blocking(move || {
+                let wait_start = crate::util::ls_profile::profile_instant();
                 let mut guard = analysis.blocking_write();
+                let hold_start = crate::util::ls_profile::profile_instant();
                 guard.compilation.prioritise_update(&prioritised);
                 let progress = guard.advance_reindex(Slice::Until(Instant::now() + SLICE));
                 cache.invalidate();
@@ -712,6 +714,14 @@ impl DebouncedAnalysis {
                     .into_iter()
                     .filter(|file_id| !guard.compilation.settles_first(*file_id))
                     .collect::<Vec<_>>();
+                if let (Some(wait_start), Some(hold_start)) = (wait_start, hold_start) {
+                    crate::util::ls_profile::emit_ls_slice(
+                        hold_start - wait_start,
+                        hold_start.elapsed(),
+                        &progress,
+                        settled_first.len(),
+                    );
+                }
                 (progress, settled_first)
             }) => match result {
                 Ok(outcome) => Some(outcome),
