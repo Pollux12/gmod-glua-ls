@@ -1248,8 +1248,20 @@ end
             .derivations_of_file(unrelated_file)
             .find(|id| id.kind == DerivationKind::ValidGuardScan)
             .expect("the file has a valid-guard scan");
-        let reads = db.reader_graph().reads_of(scan).count();
-        assert!(reads < 20, "the scan read {reads} facts");
+        let reads = db
+            .reader_graph()
+            .reads_of(scan)
+            .filter(|key| {
+                !matches!(
+                    key.key(),
+                    crate::db_index::derivation::FactKey::ValidGuardName(_)
+                )
+            })
+            .count();
+        assert!(
+            reads < 20,
+            "the scan read {reads} facts besides guard names"
+        );
     }
 
     /// Removing the file that shadows a valid-guard annotation drops its

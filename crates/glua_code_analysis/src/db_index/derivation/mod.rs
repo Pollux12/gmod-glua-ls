@@ -232,8 +232,8 @@ pub enum FactKey {
     ValidGuardFile(FileId),
     /// The files that have valid-guard signatures.
     ValidGuardFiles,
-    /// The names of the definitions marked `valid_guard`.
-    ValidGuardNames,
+    /// Whether a definition of this name is marked `valid_guard`.
+    ValidGuardName(SmolStr),
     /// A file's signatures and receiver out-param names.
     SignatureFile(FileId),
     /// Out-param member names a receiver type is known to carry.
@@ -739,7 +739,7 @@ impl FactKey {
             | K::FileSet
             | K::StageRule(_)
             | K::ValidGuardFiles
-            | K::ValidGuardNames
+            | K::ValidGuardName(_)
             | K::NetHelperName(_)
             | K::Property(_)
             | K::Global(_)

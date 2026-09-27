@@ -444,7 +444,7 @@ impl DbIndex {
             | K::ValidGuard(_)
             | K::ValidGuardFile(_)
             | K::ValidGuardFiles
-            | K::ValidGuardNames
+            | K::ValidGuardName(_)
             | K::InferredGuard(_)
             | K::SignatureFile(_)
             | K::ReceiverOutParam(_) => self.signature_index.fact_fingerprint(key),

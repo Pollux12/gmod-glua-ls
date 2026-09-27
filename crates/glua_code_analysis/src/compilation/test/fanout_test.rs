@@ -558,6 +558,34 @@ end
         assert_eq!(workspace.evaluated_files(), vec![ping, caller]);
     }
 
+    /// Each file's valid-guard scan asks about the names of its own globals,
+    /// so a function becoming a valid guard re-runs nothing in a file that
+    /// declares none of that name.
+    #[test]
+    fn a_function_becoming_a_valid_guard_re_runs_nothing_in_files_without_that_global() {
+        const GUARD: &str = "gamemodes/cityrp/gamemode/core/sh_guard.lua";
+        const GUARD_TEXT: &str =
+            "---@param value any\n---@return TypeGuard<any>\nfunction IsValidThing(value) end\n";
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_files(vec![
+            (GUARD, GUARD_TEXT),
+            (
+                "gamemodes/cityrp/gamemode/core/sh_other.lua",
+                "function IsOtherThing(value) return value ~= nil end\n",
+            ),
+        ]);
+
+        let guard = ws.def_file(
+            GUARD,
+            &GUARD_TEXT.replace("function", "---@[valid_guard]\nfunction"),
+        );
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![guard]);
+    }
+
     /// Per-file passes look call roles up by path; only the workspace folds
     /// read the whole registry.
     #[test]
