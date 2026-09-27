@@ -47,7 +47,6 @@ use crate::{
     semantic::find_latest_decl_write_before_position,
 };
 use rowan::{TextRange, TextSize};
-use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
 mod derive;
@@ -962,49 +961,64 @@ fn closure_local_decl_id(file_id: FileId, closure: &LuaClosureExpr) -> Option<Lu
     ))
 }
 
-/// The call sites that can expand into a helper able to reach a `net.Start`.
+/// A file's call sites that can expand into a helper able to reach a
+/// `net.Start`.
 ///
 /// Every reference to a name is recorded in the reference index while the
 /// workspace is indexed, so these call sites are a direct lookup rather than a
-/// walk that resolves every call expression in every file.
-#[derive(Default)]
-struct NetHelperCallSites {
-    /// Syntax id of the callee reference node, per file.
-    by_file: FxHashMap<FileId, Vec<LuaSyntaxId>>,
-    /// The helper names themselves, needed per file to pick up locals: a
-    /// `local function send()` never enters the global reference table, so its
-    /// call sites are only reachable through its declaration's own references.
-    names: HashSet<SmolStr>,
+/// walk that resolves every call expression.
+struct NetHelperCallSites<'a> {
+    /// Syntax ids of the file's references to the helper names it calls
+    /// through.
+    sites: Vec<LuaSyntaxId>,
+    /// The names the file's calls go through, sorted: a helper name only
+    /// matters where the file calls it.
+    callee_names: &'a [SmolStr],
+    network: &'a crate::db_index::GmodNetworkIndex,
 }
 
-/// `by_file` is filled for `collected_files` only: it is read through
-/// [`net_candidate_call_exprs`], and every site that reaches it belongs to the
-/// file currently being collected. `names` stays workspace-wide.
-fn net_helper_call_sites(
-    db: &DbIndex,
-    names: HashSet<SmolStr>,
-    collected_files: &FxHashSet<FileId>,
-) -> NetHelperCallSites {
-    let reference_index = db.get_reference_index();
-    let mut by_file: FxHashMap<FileId, Vec<LuaSyntaxId>> = FxHashMap::default();
-    for file_id in collected_files {
-        let sites = reference_index.name_sites_in_file(&names, *file_id);
-        if !sites.is_empty() {
-            by_file.insert(*file_id, sites);
-        }
+impl NetHelperCallSites<'_> {
+    /// Whether `name` is a net-helper name, read as that name.
+    fn is_helper_name(&self, name: &str) -> bool {
+        self.network.is_helper_name(name)
     }
+
+    /// Whether one of the file's calls goes through `name`.
+    fn is_called(&self, name: &str) -> bool {
+        self.callee_names
+            .binary_search_by(|callee| callee.as_str().cmp(name))
+            .is_ok()
+    }
+}
+
+/// `file_id`'s references to the helper names among `callee_names`, the
+/// sorted names its calls go through.
+fn net_helper_call_sites<'a>(
+    db: &'a DbIndex,
+    file_id: FileId,
+    callee_names: &'a [SmolStr],
+) -> NetHelperCallSites<'a> {
+    let network = db.get_gmod_network_index();
+    let helper_names = callee_names
+        .iter()
+        .filter(|name| network.is_helper_name(name));
+    let mut sites = db
+        .get_reference_index()
+        .name_sites_in_file(helper_names, file_id);
     // Source order, so a file's flows are collected in the same order the walk
     // produced them. The key is the whole identity rather than just the start
     // offset: sites arrive in hash order, and sorting on a partial key leaves
     // equal ids non-adjacent, which silently defeats the dedup.
-    for sites in by_file.values_mut() {
-        sites.sort_by_key(|syntax_id| {
-            let range = syntax_id.get_range();
-            (range.start(), range.end(), syntax_id.get_kind())
-        });
-        sites.dedup();
+    sites.sort_by_key(|syntax_id| {
+        let range = syntax_id.get_range();
+        (range.start(), range.end(), syntax_id.get_kind())
+    });
+    sites.dedup();
+    NetHelperCallSites {
+        sites,
+        callee_names,
+        network,
     }
-    NetHelperCallSites { by_file, names }
 }
 
 /// Per-file function definition lookup. Built once and reused for all
@@ -1028,10 +1042,11 @@ impl FileFunctionMap {
         scan.finish_map()
     }
 
-    /// N3: one `descendants` pass per file yields both the helper-lookup map
-    /// and every block in the file. The direct and wrapped send scans iterate
-    /// the shared block list instead of each running their own walk.
-    fn scan(root: &LuaChunk) -> (Self, Vec<LuaBlock>) {
+    /// N3: one `descendants` pass per file yields the helper-lookup map, every
+    /// block in the file and the sorted names its calls go through. The direct
+    /// and wrapped send scans iterate the shared block list instead of each
+    /// running their own walk.
+    fn scan(root: &LuaChunk) -> (Self, Vec<LuaBlock>, Vec<SmolStr>) {
         let mut scan = FileTreeScan::default();
         for node in root.syntax().descendants() {
             scan.visit(&node);
@@ -1050,10 +1065,21 @@ struct FileTreeScan {
     duplicate_bare: HashSet<String>,
     all_blocks: Vec<LuaBlock>,
     blocks: Vec<LuaBlock>,
+    callee_names: Vec<SmolStr>,
 }
 
 impl FileTreeScan {
     fn visit(&mut self, node: &LuaSyntaxNode) {
+        if let Some(call_expr) = LuaCallExpr::cast(node.clone()) {
+            if let Some(name) = call_expr
+                .get_prefix_expr()
+                .as_ref()
+                .and_then(expr_written_name)
+            {
+                self.callee_names.push(name);
+            }
+            return;
+        }
         if let Some(block) = LuaBlock::cast(node.clone()) {
             self.blocks.push(block);
         }
@@ -1155,9 +1181,12 @@ impl FileTreeScan {
         }
     }
 
-    fn finish(mut self) -> (FileFunctionMap, Vec<LuaBlock>) {
+    fn finish(mut self) -> (FileFunctionMap, Vec<LuaBlock>, Vec<SmolStr>) {
         let blocks = std::mem::take(&mut self.blocks);
-        (self.finish_map(), blocks)
+        let mut callee_names = std::mem::take(&mut self.callee_names);
+        callee_names.sort_unstable();
+        callee_names.dedup();
+        (self.finish_map(), blocks, callee_names)
     }
 }
 

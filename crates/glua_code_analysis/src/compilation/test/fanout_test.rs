@@ -378,6 +378,30 @@ end
         assert_eq!(workspace.evaluated_files(), vec![wrapper, caller]);
     }
 
+    /// A new net helper name reaches only the files that call a function by
+    /// that name.
+    #[test]
+    fn a_function_becoming_a_net_helper_re_runs_only_files_that_call_it() {
+        const PING: &str = "gamemodes/cityrp/gamemode/core/sh_ping.lua";
+        const PING_TEXT: &str = "function cityrp.Ping()\nend\n";
+        let mut workspace = cityrp_workspace();
+        workspace.ws.def_file(PING, PING_TEXT);
+        let caller = workspace.ws.def_file(
+            "gamemodes/cityrp/gamemode/core/cl_ping.lua",
+            "cityrp.Ping()\n",
+        );
+
+        let ping = workspace.ws.def_file(
+            PING,
+            &PING_TEXT.replace(
+                "\nend",
+                "\n    net.Start(\"cityrp_ping\")\n    net.SendToServer()\nend",
+            ),
+        );
+
+        assert_eq!(workspace.evaluated_files(), vec![ping, caller]);
+    }
+
     /// Per-file passes look call roles up by path; only the workspace folds
     /// read the whole registry.
     #[test]

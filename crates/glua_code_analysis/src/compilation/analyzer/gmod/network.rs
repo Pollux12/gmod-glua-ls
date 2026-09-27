@@ -922,10 +922,7 @@ pub(crate) fn compute_network_flows(
     if !db.get_emmyrc().gmod.enabled {
         return crate::db_index::FileNetworkData::default();
     }
-    let names = db.get_gmod_network_index().helper_names();
-    let helper_call_sites =
-        net_helper_call_sites(db, (*names).clone(), &FxHashSet::from_iter([file_id]));
-    collect_file_network_flows(db, file_id, &helper_call_sites)
+    collect_file_network_flows(db, file_id)
 }
 
 pub(crate) fn apply_network_flows(
@@ -940,11 +937,7 @@ pub(crate) fn apply_network_flows(
         .add_file_data(file_id, network_data);
 }
 
-fn collect_file_network_flows(
-    db: &DbIndex,
-    file_id: FileId,
-    helper_call_sites: &NetHelperCallSites,
-) -> crate::db_index::FileNetworkData {
+fn collect_file_network_flows(db: &DbIndex, file_id: FileId) -> crate::db_index::FileNetworkData {
     let Some(calls) = db.get_net_helpers::<FileNetHelpers>(file_id) else {
         return crate::db_index::FileNetworkData::default();
     };
@@ -956,8 +949,9 @@ fn collect_file_network_flows(
         return crate::db_index::FileNetworkData::default();
     };
 
-    let (functions, file_blocks) =
+    let (functions, file_blocks, callee_names) =
         crate::profile::phase("gmodnet/file_scan", || FileFunctionMap::scan(&root));
+    let helper_call_sites = net_helper_call_sites(db, file_id, &callee_names);
     let mut ctx = NetCollectCtx {
         db,
         site: NetFileSite {
@@ -968,7 +962,7 @@ fn collect_file_network_flows(
         memo: HelperMemo::default(),
     };
     let net_candidates = crate::profile::phase("gmodnet/net_candidates", || {
-        net_candidate_call_exprs(db, file_id, &root, helper_call_sites)
+        net_candidate_call_exprs(db, file_id, &root, &helper_call_sites)
     });
 
     let mut receive_flows = Vec::new();
@@ -1462,7 +1456,7 @@ fn net_candidate_call_exprs(
     db: &DbIndex,
     file_id: FileId,
     root: &LuaChunk,
-    helper_call_sites: &NetHelperCallSites,
+    helper_call_sites: &NetHelperCallSites<'_>,
 ) -> Vec<LuaCallExpr> {
     let root_syntax = root.syntax().clone();
     // Locals never enter the global reference table, so a helper declared
@@ -1470,7 +1464,6 @@ fn net_candidate_call_exprs(
     // references instead.
     let mut local_sites: Vec<LuaSyntaxId> = Vec::new();
     if let Some(decl_tree) = db.get_decl_index().get_decl_tree(&file_id) {
-        let names = &helper_call_sites.names;
         // `local sendString = MyLib.SendString` calls the helper under a name
         // the reference index files under the local binding rather than under
         // the helper, so this file's own bindings of a helper name count as
@@ -1493,8 +1486,8 @@ fn net_candidate_call_exprs(
         loop {
             let mut added = false;
             for (bound, source) in &bindings {
-                if (names.contains(source) || aliases.contains(source))
-                    && !names.contains(bound)
+                if (helper_call_sites.is_helper_name(source) || aliases.contains(source))
+                    && !helper_call_sites.is_helper_name(bound)
                     && aliases.insert(bound.clone())
                 {
                     added = true;
@@ -1506,8 +1499,10 @@ fn net_candidate_call_exprs(
         }
 
         for decl in decl_tree.get_decls().values() {
+            let name = decl.get_name();
             if !decl.is_local()
-                || !(names.contains(decl.get_name()) || aliases.contains(decl.get_name()))
+                || !helper_call_sites.is_called(name)
+                || !(helper_call_sites.is_helper_name(name) || aliases.contains(name))
             {
                 continue;
             }
@@ -1529,10 +1524,7 @@ fn net_candidate_call_exprs(
         }
     }
     let mut calls = helper_call_sites
-        .by_file
-        .get(&file_id)
-        .map(|syntax_ids| syntax_ids.as_slice())
-        .unwrap_or_default()
+        .sites
         .iter()
         .chain(local_sites.iter())
         .filter_map(|syntax_id| syntax_id.to_node_from_root(&root_syntax))

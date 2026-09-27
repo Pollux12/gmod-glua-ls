@@ -355,7 +355,6 @@ pub struct GmodNetworkIndex {
     /// The names of functions that can produce a net operation, directly or
     /// through other such functions.
     helper_names: Arc<FxHashSet<SmolStr>>,
-    helper_names_fingerprint: Fingerprint,
     /// Incremental multiset fingerprint of every live file's network data.
     flows_fingerprint: Fingerprint,
     /// Fingerprint of `canonical_ops`, taken when the table is replaced.
@@ -473,7 +472,6 @@ impl GmodNetworkIndex {
             referencing: FxHashMap::default(),
             canonical_ops: FxHashMap::default(),
             helper_names: Arc::default(),
-            helper_names_fingerprint: derivation::ABSENT,
             flows_fingerprint: 0,
             canonical_ops_fingerprint: 0,
         }
@@ -484,7 +482,13 @@ impl GmodNetworkIndex {
             FactKey::NetworkFile(file_id) => {
                 derivation::fingerprint_opt(self.file_data.get(file_id))
             }
-            FactKey::NetHelperNames => self.helper_names_fingerprint,
+            FactKey::NetHelperName(name) => {
+                if self.helper_names.contains(name) {
+                    derivation::fingerprint_of(name)
+                } else {
+                    derivation::ABSENT
+                }
+            }
             FactKey::NetworkScan if derivation::mapping_back() => self
                 .file_data
                 .iter()
@@ -502,19 +506,20 @@ impl GmodNetworkIndex {
         }
     }
 
-    /// Replaces the net-helper names.
+    /// Replaces the net-helper names, writing each name that joined or left.
     pub(crate) fn set_helper_names(&mut self, names: FxHashSet<SmolStr>) {
-        let mut sorted = names.iter().collect::<Vec<_>>();
-        sorted.sort_unstable();
-        let fingerprint = derivation::fingerprint_of(&sorted);
-        derivation::note_write(|| FactKey::NetHelperNames);
-        self.helper_names_fingerprint = fingerprint;
+        if derivation::recording() {
+            for name in names.symmetric_difference(&self.helper_names) {
+                derivation::note_write(|| FactKey::NetHelperName(name.clone()));
+            }
+        }
         self.helper_names = Arc::new(names);
     }
 
-    pub(crate) fn helper_names(&self) -> Arc<FxHashSet<SmolStr>> {
-        derivation::note_read(|| FactKey::NetHelperNames);
-        self.helper_names.clone()
+    /// Whether `name` is a net-helper name, read as that name.
+    pub(crate) fn is_helper_name(&self, name: &str) -> bool {
+        derivation::note_read(|| FactKey::NetHelperName(SmolStr::new(name)));
+        self.helper_names.contains(name)
     }
 
     /// Replaces the canonical op table. Called once per analyze pass with
@@ -725,9 +730,12 @@ impl GmodNetworkIndex {
         self.materialized_definition_counts.clear();
         self.referencing.clear();
         self.canonical_ops.clear();
-        derivation::note_write(|| FactKey::NetHelperNames);
+        if derivation::recording() {
+            for name in self.helper_names.iter() {
+                derivation::note_write(|| FactKey::NetHelperName(name.clone()));
+            }
+        }
         self.helper_names = Arc::default();
-        self.helper_names_fingerprint = derivation::ABSENT;
     }
 
     fn index_file_data(&mut self, file_id: FileId, data: &FileNetworkData) {

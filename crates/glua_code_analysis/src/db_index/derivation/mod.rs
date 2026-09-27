@@ -304,8 +304,8 @@ pub enum FactKey {
     HelperScan(FileId),
     /// The set of files that have a gmod helper scan.
     HelperScanFiles,
-    /// The names of functions that can produce a net operation.
-    NetHelperNames,
+    /// Whether a name names a function that can produce a net operation.
+    NetHelperName(SmolStr),
     /// One file's net call roles and function-body net summaries.
     NetHelpers(FileId),
     /// A file's function-body summaries, from its syntax and local references.
@@ -687,7 +687,7 @@ impl FactKey {
             | K::StageRule(_)
             | K::ValidGuardFiles
             | K::ValidGuardNames
-            | K::NetHelperNames
+            | K::NetHelperName(_)
             | K::Property(_)
             | K::Global(_)
             | K::GlobalScan

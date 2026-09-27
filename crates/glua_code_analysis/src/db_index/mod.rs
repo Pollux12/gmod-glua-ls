@@ -445,7 +445,7 @@ impl DbIndex {
                 self.gmod_infer_index.fact_fingerprint(key)
             }
             K::GmodLoadFile(_) => self.gmod_load_index.fact_fingerprint(key),
-            K::NetworkFile(_) | K::NetworkScan | K::NetHelperNames => {
+            K::NetworkFile(_) | K::NetworkScan | K::NetHelperName(_) => {
                 self.gmod_network_index.fact_fingerprint(key)
             }
             K::HelperRegistry => {
