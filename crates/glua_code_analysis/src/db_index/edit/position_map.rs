@@ -1,4 +1,4 @@
-use glua_parser::{LuaAstNode, LuaKind, LuaSyntaxId, LuaSyntaxKind, LuaTableExpr};
+use glua_parser::{LuaAstNode, LuaExpr, LuaKind, LuaSyntaxId, LuaSyntaxKind};
 use rowan::{TextRange, TextSize};
 use rustc_hash::FxHashSet;
 
@@ -178,12 +178,12 @@ pub struct FileFacts {
     decl_positions: FxHashSet<TextSize>,
     member_ids: FxHashSet<LuaSyntaxId>,
     syntax_ids: FxHashSet<LuaSyntaxId>,
-    /// The ranges something can still own members on: a table literal in the
-    /// new tree, or a range the re-indexed file registers an `Element` owner
-    /// at. An owner is keyed by whatever expression the write was made on - a
-    /// literal, but also a `vgui.Create(..)` call - so "is there still an
-    /// owner here" is not a question the tree alone answers. Answers "did the
-    /// mapped range land on something that still holds members".
+    /// The ranges an identity keyed on an expression can still name: every
+    /// expression in the new tree, and every range the re-indexed file
+    /// registers an `Element` owner at. Owners and instances are keyed by
+    /// whatever expression they were made on - a table literal, but also a
+    /// `vgui.Create(..)` or `ents.Create(..)` call - so the mapped range has to
+    /// land on an expression that still exists.
     owner_ranges: FxHashSet<TextRange>,
     /// Same-file type-decl locations with their kinds, backing the
     /// unique-covering-decl admission for synthesized `DocTagClass` ids in
@@ -220,6 +220,9 @@ impl FileFacts {
             for element in tree.get_red_root().descendants_with_tokens() {
                 match element {
                     rowan::NodeOrToken::Node(node) => {
+                        if LuaExpr::can_cast(node.kind().into()) {
+                            owner_ranges.insert(node.text_range());
+                        }
                         syntax_ids.insert(LuaSyntaxId::from_node(&node));
                     }
                     rowan::NodeOrToken::Token(token) => {
@@ -227,11 +230,6 @@ impl FileFacts {
                     }
                 }
             }
-            owner_ranges.extend(
-                tree.get_chunk_node()
-                    .descendants::<LuaTableExpr>()
-                    .map(|table| table.get_range()),
-            );
         }
         // `contextual_type_support` synthesizes `DocTagClass` ids from a type
         // decl's name-token ranges (`local_inference/mod.rs`), and those nodes

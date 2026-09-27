@@ -1039,6 +1039,41 @@ end
         assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![ranks]);
     }
 
+    /// A type naming the entity a call creates names the call's expression,
+    /// which a shift above it carries to its new place, so a file holding that
+    /// type stands.
+    #[test]
+    fn a_shift_above_a_call_whose_instance_another_file_holds_re_runs_nothing_in_it() {
+        const INIT: &str = "lua/entities/shift_car/init.lua";
+        const INIT_TEXT: &str = r#"include("sv_seats.lua")
+
+function ENT:CreateSeat()
+    self.seat = ents.Create("prop_vehicle_prisoner_pod")
+end
+"#;
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![
+            (
+                "lua/includes/extensions/ents.lua",
+                "---@class Entity\nlocal Entity = {}\n---@class prop_vehicle_prisoner_pod : Entity\nents = {}\n---@generic T : Entity\n---@param class `T`\n---@return (instance) T\nfunction ents.Create(class) end\n",
+            ),
+            ("lua/entities/shift_car/shared.lua", "ENT.Type = \"anim\"\n"),
+            (INIT, INIT_TEXT),
+            (
+                "lua/entities/shift_car/sv_seats.lua",
+                "function ENT:KeepSeat()\n    self.backupSeat = self.seat\nend\n",
+            ),
+        ]);
+
+        let init = ws.def_file(INIT, &format!("\n{INIT_TEXT}"));
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![init]);
+    }
+
     /// A file's accessor members come from its own accessor calls, so a shift
     /// in another file calling an accessor function re-runs nothing here.
     #[test]
