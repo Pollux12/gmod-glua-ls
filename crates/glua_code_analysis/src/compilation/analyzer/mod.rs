@@ -115,8 +115,8 @@ pub(crate) struct Reanalysed {
 /// and the index reads as it does outside any run, so readers can use it.
 pub(crate) struct Reanalysis {
     engine: engine::Engine,
-    /// The current pass's recipes; `None` once no pass is left.
-    recipes: Option<derive::Recipes>,
+    /// The current pass; `None` once no pass is left.
+    pass: Option<Pass>,
     /// The access paths the current pass built: text is fixed for a pass.
     access_paths: crate::semantic::AccessPaths,
     /// The stage the run is at while it waits for its next slice.
@@ -133,10 +133,10 @@ impl Reanalysis {
         schedule: engine::Schedule,
     ) -> Self {
         let mut engine = engine::Engine::new(edits, schedule);
-        let recipes = start_pass(db, &mut engine, file_ids);
+        let pass = start_pass(db, &mut engine, file_ids);
         let mut reanalysis = Self {
             engine,
-            recipes,
+            pass,
             access_paths: crate::semantic::AccessPaths::default(),
             stage: derivation::AnalysisStage::Closed,
         };
@@ -153,10 +153,14 @@ impl Reanalysis {
         file_ids: Vec<FileId>,
         edits: derivation::EditMaps,
     ) {
+        // What a pending pass's rebuild moved is queued under the edits it
+        // was taken with; source layers are rebuilt at the stage outside a run.
+        self.open_pass(db);
+        db.set_analysis_stage(derivation::AnalysisStage::Closed);
         refresh_payload_refs(db, self.engine.touched());
         self.engine.take_edits(edits);
-        if let Some(recipes) = start_pass(db, &mut self.engine, file_ids) {
-            self.recipes = Some(recipes);
+        if let Some(pass) = start_pass(db, &mut self.engine, file_ids) {
+            self.pass = Some(pass);
             self.access_paths = crate::semantic::AccessPaths::default();
         }
         self.pause(db);
@@ -170,7 +174,8 @@ impl Reanalysis {
         let unwinding = Unwinding;
         let evaluated = self.engine.stats().total_evaluations();
         let settled = loop {
-            let Some(recipes) = &self.recipes else {
+            self.open_pass(db);
+            let Some(Pass::Open(recipes)) = &self.pass else {
                 break true;
             };
             let slice = slice.remaining(self.engine.stats().total_evaluations() - evaluated);
@@ -183,13 +188,31 @@ impl Reanalysis {
             crate::profile::memory::checkpoint("after the engine run");
             let stale = self.engine.take_stale_sources();
             crate::semantic::stop_keeping_access_paths();
-            self.recipes = start_pass(db, &mut self.engine, stale.into_iter().collect());
+            self.pass = start_pass(db, &mut self.engine, stale.into_iter().collect());
             crate::semantic::keep_access_paths(crate::semantic::AccessPaths::default());
         };
         std::mem::forget(unwinding);
         self.access_paths = crate::semantic::stop_keeping_access_paths();
         self.pause(db);
         settled
+    }
+
+    /// Queues the readers of what the pass's rebuild moved and opens the run.
+    fn open_pass(&mut self, db: &mut DbIndex) {
+        let (touched, scopes) = match self.pass.take() {
+            Some(Pass::Replaced { touched, scopes }) => (touched, scopes),
+            pass => {
+                self.pass = pass;
+                return;
+            }
+        };
+        crate::profile::phase("reanalyze: readers of touched", || {
+            self.engine.readers_of(db, touched.iter())
+        });
+        let recipes =
+            crate::profile::phase("reanalyze: recipes", || derive::Recipes::new(db, scopes));
+        self.engine.open(db);
+        self.pass = Some(Pass::Open(recipes));
     }
 
     /// Leaves the index as it reads outside any run until the next slice.
@@ -221,7 +244,7 @@ impl Reanalysis {
 
     /// Wraps up a settled re-analysis.
     pub(crate) fn finish(mut self, db: &mut DbIndex) -> Reanalysed {
-        debug_assert!(self.recipes.is_none(), "finishing an unsettled re-analysis");
+        debug_assert!(self.pass.is_none(), "finishing an unsettled re-analysis");
         let touched = self.engine.take_touched();
         crate::profile::phase("reanalyze: payload refs", || {
             refresh_payload_refs(db, &touched)
@@ -247,6 +270,18 @@ impl std::fmt::Debug for Reanalysis {
     }
 }
 
+/// A pass of a re-analysis: some files' source layers rebuilt, then their
+/// derivations and whatever read what the rebuild moved evaluated.
+enum Pass {
+    /// The source layers are rebuilt; the readers of `touched` are queued
+    /// when the pass opens, at its first slice.
+    Replaced {
+        touched: HashSet<derivation::HashedKey>,
+        scopes: ScriptedScopes,
+    },
+    Open(derive::Recipes),
+}
+
 /// Stops keeping access paths if a slice unwinds.
 struct Unwinding;
 
@@ -257,13 +292,12 @@ impl Drop for Unwinding {
 }
 
 /// Rebuilds `file_ids`' source layers and queues their derivations ahead of
-/// the work already queued, then opens the run. Returns the pass's recipes;
-/// `None` when there is nothing to re-analyse.
+/// the work already queued; `None` when there is nothing to re-analyse.
 fn start_pass(
     db: &mut DbIndex,
     engine: &mut engine::Engine,
     mut file_ids: Vec<FileId>,
-) -> Option<derive::Recipes> {
+) -> Option<Pass> {
     file_ids.sort();
     file_ids.dedup();
     if file_ids.is_empty() {
@@ -279,12 +313,7 @@ fn start_pass(
     });
     crate::profile::memory::checkpoint("after the source layer");
     db.reader_graph_mut().forget_fingerprints();
-    crate::profile::phase("reanalyze: readers of touched", || {
-        engine.readers_of(db, touched.iter())
-    });
-    let recipes = crate::profile::phase("reanalyze: recipes", || derive::Recipes::new(db, scopes));
-    engine.open(db);
-    Some(recipes)
+    Some(Pass::Replaced { touched, scopes })
 }
 
 /// Forgets `file_ids`' derivations and facts, rebuilds the live ones' source
