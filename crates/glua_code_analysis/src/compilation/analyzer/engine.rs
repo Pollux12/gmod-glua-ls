@@ -566,7 +566,9 @@ impl Engine {
             }
             let Some((id, reason)) = self.worklist.pop_first() else {
                 if self.next_round.is_empty() {
-                    if self.advance_stage(db) || self.release_waiting(db) {
+                    if crate::profile::phase("engine: stage and release", || {
+                        self.advance_stage(db) || self.release_waiting(db)
+                    }) {
                         continue;
                     }
                     break;
@@ -588,7 +590,7 @@ impl Engine {
             self.trace_evaluation(db, id, reason);
             let group = crate::profile::phase("engine: co-producers", || co_producers(db, id));
             if group.len() == 1 && recipe.splits(id.kind) {
-                self.run_batch(db, id, recipe);
+                crate::profile::phase("engine: batch", || self.run_batch(db, id, recipe));
                 continue;
             }
             let rerun = self.stats.profiling()
@@ -640,7 +642,7 @@ impl Engine {
             crate::profile::phase("engine: readers of", || self.readers_of(db, touched.iter()));
         }
         self.cursor = None;
-        self.rebase_moved_reads(db);
+        crate::profile::phase("engine: rebase moved reads", || self.rebase_moved_reads(db));
         true
     }
 

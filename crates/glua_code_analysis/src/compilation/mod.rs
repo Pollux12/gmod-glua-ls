@@ -158,11 +158,9 @@ impl LuaCompilation {
             .diagnostic_reads
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        UpdateProgress::Settled(stale_diagnostic_files(
-            reads,
-            &self.db,
-            &reanalysed.touched,
-            &edits,
+        UpdateProgress::Settled(crate::profile::phase(
+            "reanalyze: stale diagnostics",
+            || stale_diagnostic_files(reads, &self.db, &reanalysed.touched, &edits),
         ))
     }
 
