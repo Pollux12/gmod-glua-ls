@@ -1099,6 +1099,31 @@ end
         assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![init]);
     }
 
+    /// The edit remap carries another file's owner share of a shifted file's
+    /// member fingerprint to the literal's new place, so the writing file
+    /// stands.
+    #[test]
+    fn a_shift_in_a_file_whose_table_another_file_fills_re_runs_nothing_in_it() {
+        const INIT: &str = "lua/entities/shift_car/init.lua";
+        const INIT_TEXT: &str = "include(\"sv_input.lua\")\n\nfunction ENT:Initialize()\n    self.holdInputActions = {}\nend\n";
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_files(vec![
+            ("lua/entities/shift_car/shared.lua", "ENT.Type = \"anim\"\n"),
+            (INIT, INIT_TEXT),
+            (
+                "lua/entities/shift_car/sv_input.lua",
+                "function ENT:RegisterHoldAction(action, data)\n    self.holdInputActions[action] = data\nend\n",
+            ),
+        ]);
+
+        let init = ws.def_file(INIT, &format!("\n{INIT_TEXT}"));
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![init]);
+    }
+
     /// A file's accessor members come from its own accessor calls, so a shift
     /// in another file calling an accessor function re-runs nothing here.
     #[test]

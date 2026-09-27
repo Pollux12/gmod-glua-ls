@@ -525,12 +525,15 @@ impl FactKey {
     /// edited file that this key's value names. A decl claim, module metadata,
     /// module names, an owner's presence and a member-key entry name no
     /// position outside the writer's own file, so they never name an edited
-    /// file's position for a writer that did not run.
+    /// file's position for a writer that did not run. A writer's share of an
+    /// edited file's member fingerprint is an owner there, which the member
+    /// remap re-homes.
     pub fn follows_edits(&self) -> bool {
         use FactKey as K;
         matches!(
             self,
             K::DeclClaim(_)
+                | K::MemberFile(_)
                 | K::MemberOwnerPresence(_)
                 | K::MemberKey(_)
                 | K::Module(_)
