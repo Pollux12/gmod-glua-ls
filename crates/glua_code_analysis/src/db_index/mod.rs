@@ -149,6 +149,34 @@ fn stored_fact_fingerprint(
     }
 }
 
+/// Records a write of each of `file_id`'s net helper summaries that differs
+/// between `previous` and `next`.
+fn note_net_helper_writes(
+    file_id: FileId,
+    previous: Option<&Arc<dyn derivation::DerivedFact>>,
+    next: Option<&Arc<dyn derivation::DerivedFact>>,
+) {
+    let fingerprint = |helpers: Option<&Arc<dyn derivation::DerivedFact>>, range| {
+        helpers.map_or(derivation::ABSENT, |helpers| {
+            helpers.part_fingerprint(range)
+        })
+    };
+    derivation::in_file(Some(file_id), || {
+        let ranges = previous
+            .into_iter()
+            .chain(next)
+            .flat_map(|helpers| helpers.part_ranges())
+            .collect::<rustc_hash::FxHashSet<_>>();
+        for range in ranges {
+            if fingerprint(previous, range) != fingerprint(next, range) {
+                derivation::note_write(|| {
+                    derivation::FactKey::NetHelper(crate::InFiled::new(file_id, range))
+                });
+            }
+        }
+    });
+}
+
 fn downcast_fact<T: derivation::DerivedFact>(
     fact: &Arc<dyn derivation::DerivedFact>,
 ) -> Option<Arc<T>> {
@@ -484,6 +512,12 @@ impl DbIndex {
                 .net_helpers
                 .get(file_id)
                 .map_or(derivation::ABSENT, stored_fact_fingerprint),
+            K::NetHelper(site) => self
+                .net_helpers
+                .get(&site.file_id)
+                .map_or(derivation::ABSENT, |(helpers, _)| {
+                    helpers.part_fingerprint(site.value)
+                }),
             K::FunctionSummaries(file_id) => self
                 .function_summaries
                 .get(file_id)
@@ -607,6 +641,18 @@ impl DbIndex {
             .and_then(|(helpers, _)| downcast_fact(helpers))
     }
 
+    /// `site`'s file's net helpers, read as the one summary of the body at
+    /// `site`.
+    pub(crate) fn get_net_helper<T: derivation::DerivedFact>(
+        &self,
+        site: &crate::InFiled<rowan::TextRange>,
+    ) -> Option<Arc<T>> {
+        derivation::note_read(|| derivation::FactKey::NetHelper(site.clone()));
+        self.net_helpers
+            .get(&site.file_id)
+            .and_then(|(helpers, _)| downcast_fact(helpers))
+    }
+
     pub(crate) fn set_net_helpers<T: derivation::DerivedFact>(
         &mut self,
         file_id: FileId,
@@ -617,6 +663,10 @@ impl DbIndex {
 
     fn store_net_helpers(&mut self, file_id: FileId, helpers: Arc<dyn derivation::DerivedFact>) {
         derivation::note_write(|| derivation::FactKey::NetHelpers(file_id));
+        if derivation::recording() {
+            let previous = self.net_helpers.get(&file_id).map(|(previous, _)| previous);
+            note_net_helper_writes(file_id, previous, Some(&helpers));
+        }
         self.forget_net_helper_refs(file_id);
         for named in helpers.named_files(file_id) {
             self.net_helper_refs
@@ -630,8 +680,11 @@ impl DbIndex {
 
     fn remove_net_helpers(&mut self, file_id: FileId) {
         self.forget_net_helper_refs(file_id);
-        if self.net_helpers.remove(&file_id).is_some() {
+        if let Some((helpers, _)) = self.net_helpers.remove(&file_id) {
             derivation::note_write(|| derivation::FactKey::NetHelpers(file_id));
+            if derivation::recording() {
+                note_net_helper_writes(file_id, Some(&helpers), None);
+            }
         }
     }
 

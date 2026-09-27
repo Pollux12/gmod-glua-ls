@@ -584,7 +584,13 @@ end
             .reads_of(network)
             .map(|key| key.key().clone())
             .collect::<Vec<_>>();
-        expect_that!(reads.contains(&FactKey::NetHelpers(helpers)), eq(true));
+        expect_that!(
+            reads
+                .iter()
+                .any(|key| matches!(key, FactKey::NetHelper(site) if site.file_id == helpers)),
+            eq(true)
+        );
+        expect_that!(reads.contains(&FactKey::NetHelpers(helpers)), eq(false));
         expect_that!(reads.contains(&FactKey::FileText(helpers)), eq(false));
     }
 

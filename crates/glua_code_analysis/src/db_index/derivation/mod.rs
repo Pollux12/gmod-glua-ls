@@ -40,6 +40,17 @@ pub trait DerivedFact: std::any::Any + Send + Sync {
     fn remap(&self, _remap: &crate::FileRemap) -> crate::Remap<std::sync::Arc<dyn DerivedFact>> {
         crate::Remap::Unrelated
     }
+
+    /// The ranges of the parts other files read one at a time, as
+    /// [`FactKey::NetHelper`].
+    fn part_ranges(&self) -> Vec<TextRange> {
+        Vec::new()
+    }
+
+    /// One part's fingerprint, [`ABSENT`] when there is none.
+    fn part_fingerprint(&self, _range: TextRange) -> Fingerprint {
+        ABSENT
+    }
 }
 
 /// The workspace call roles and net-helper registry: the folds read it whole,
@@ -308,6 +319,8 @@ pub enum FactKey {
     NetHelperName(SmolStr),
     /// One file's net call roles and function-body net summaries.
     NetHelpers(FileId),
+    /// One function body's net summary, by the body's block.
+    NetHelper(InFiled<TextRange>),
     /// A file's function-body summaries, from its syntax and local references.
     FunctionSummaries(FileId),
     /// A property (docs, attributes, visibility) of a semantic declaration.
@@ -532,6 +545,7 @@ impl FactKey {
                 | K::Contrib(..)
                 | K::CallSiteFile(_)
                 | K::NetHelpers(_)
+                | K::NetHelper(_)
                 | K::NetworkFile(_)
                 | K::NetworkScan
         )
@@ -604,6 +618,7 @@ impl FactKey {
                 Some(decl_id.file_id)
             }
             K::Member(member_id) => Some(member_id.file_id),
+            K::NetHelper(site) => Some(site.file_id),
             K::MemberSlot(owner, _)
             | K::MemberOwnerMap(owner)
             | K::MemberOwnerExprKeys(owner)

@@ -162,6 +162,25 @@ end
         }
     }
 
+    /// A caller's network flows read the summaries of the helpers they
+    /// expand, so a change to another function beside the helper leaves the
+    /// caller standing.
+    #[test]
+    fn adding_a_parameter_beside_a_helper_re_runs_nothing_in_the_helpers_caller() {
+        let mut workspace = cityrp_workspace();
+        workspace.ws.def_file(
+            "gamemodes/cityrp/gamemode/core/cl_config.lua",
+            "cityrp.SendConfig(\"cityrp_config\")\n",
+        );
+
+        workspace.edit_configuration(
+            "function cityrp.GetConfig(key)",
+            "function cityrp.GetConfig(key, fallback)",
+        );
+
+        assert_eq!(workspace.evaluated_files(), vec![workspace.configuration]);
+    }
+
     #[test]
     fn a_shift_in_a_file_that_defines_a_helper_re_runs_nothing_in_other_files() {
         let mut workspace = cityrp_workspace();

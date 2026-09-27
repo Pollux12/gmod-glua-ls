@@ -282,6 +282,16 @@ impl crate::db_index::derivation::DerivedFact for FileNetHelpers {
         crate::db_index::derivation::fingerprint_of(self)
     }
 
+    fn part_ranges(&self) -> Vec<TextRange> {
+        self.helpers.keys().copied().collect()
+    }
+
+    fn part_fingerprint(&self, range: TextRange) -> crate::db_index::derivation::Fingerprint {
+        crate::db_index::derivation::fingerprint_opt(
+            self.helpers.get(&range).map(|helper| &**helper),
+        )
+    }
+
     /// Every helper a summary calls into is some call's target.
     fn named_files(&self, own: FileId) -> rustc_hash::FxHashSet<FileId> {
         self.calls
@@ -1007,10 +1017,11 @@ struct NetCollectCtx<'a> {
 }
 
 impl NetCollectCtx<'_> {
-    /// A helper's summary; a body without one contributes nothing.
+    /// A helper's summary, read as that summary alone; a body without one
+    /// contributes nothing.
     fn helper(&self, id: &HelperId) -> Arc<NetHelper> {
         self.db
-            .get_net_helpers::<FileNetHelpers>(id.file_id)
+            .get_net_helper::<FileNetHelpers>(id)
             .and_then(|file| file.helpers.get(&id.value).cloned())
             .unwrap_or_default()
     }
