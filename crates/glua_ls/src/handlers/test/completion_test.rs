@@ -10,7 +10,7 @@ mod tests {
     };
     use std::{
         fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
     use tokio_util::sync::CancellationToken;
@@ -5330,7 +5330,7 @@ mod tests {
         fs::create_dir_all(root.join("lua/includes")).or_fail()?;
         fs::write(root.join("lua/includes/init.lua"), "").or_fail()?;
         fs::write(root.join("lua/includes/icon.png"), "").or_fail()?;
-        ws.analysis.add_main_workspace(root.clone());
+        ws.analysis.add_main_workspace(root.to_path_buf());
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
@@ -5363,7 +5363,7 @@ mod tests {
         fs::create_dir_all(root.join("materials/icons")).or_fail()?;
         fs::write(root.join("materials/icons/icon.png"), "").or_fail()?;
         fs::write(root.join("materials/icons/cl_init.lua"), "").or_fail()?;
-        ws.analysis.add_main_workspace(root.clone());
+        ws.analysis.add_main_workspace(root.to_path_buf());
         ws.def(
             r#"
             ---@class Loader
@@ -5400,13 +5400,30 @@ mod tests {
         )
     }
 
-    fn create_path_completion_root(name: &str) -> Result<PathBuf> {
+    /// A directory under the system temp dir, removed when dropped.
+    struct TempRoot(PathBuf);
+
+    impl std::ops::Deref for TempRoot {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn create_path_completion_root(name: &str) -> Result<TempRoot> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .or_fail()?
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("glua_ls_{name}_{nonce}"));
-        fs::create_dir_all(&root).or_fail()?;
+        let root = TempRoot(std::env::temp_dir().join(format!("glua_ls_{name}_{nonce}")));
+        fs::create_dir_all(&*root).or_fail()?;
         Ok(root)
     }
 
