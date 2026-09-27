@@ -80,6 +80,23 @@ impl PositionMap {
         }
     }
 
+    /// This edit followed by `later`, an edit of the text this one produced:
+    /// one hunk covering both.
+    pub fn then(&self, later: &Self) -> Self {
+        if self.is_identity() {
+            return *later;
+        }
+        if later.is_identity() {
+            return *self;
+        }
+        let end = self.new_hunk_end.max(later.old_hunk_end);
+        Self {
+            hunk_start: self.hunk_start.min(later.hunk_start),
+            old_hunk_end: end - self.new_hunk_end + self.old_hunk_end,
+            new_hunk_end: end - later.old_hunk_end + later.new_hunk_end,
+        }
+    }
+
     /// The map from the new text back to the old one.
     pub fn inverse(&self) -> Self {
         Self {

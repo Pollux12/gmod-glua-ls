@@ -49,6 +49,16 @@ impl EditMaps {
         self.maps.get(&file_id).copied()
     }
 
+    /// These edits followed by `later`, edits of the text these produced.
+    pub fn then(&self, later: &Self) -> Self {
+        let mut maps = self.maps.clone();
+        for (file_id, map) in &later.maps {
+            let composed = maps.get(file_id).map_or(*map, |earlier| earlier.then(map));
+            maps.insert(*file_id, composed);
+        }
+        Self::new(maps)
+    }
+
     fn inverse(&self) -> Self {
         Self {
             maps: self

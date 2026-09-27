@@ -29,6 +29,43 @@ fn an_insertion_shifts_everything_after_it_and_loses_nothing() {
 }
 
 #[gtest]
+fn two_edits_in_a_row_compose_to_one_map_of_every_offset_both_keep() {
+    let texts = [
+        ("abcdef", "XXabcdef", "XXYYabcdef"),
+        ("abcdef", "abcXXdef", "abcXXdeYf"),
+        ("abcdefgh", "abgh", "aZZbgh"),
+        ("abcdef", "abcXXdef", "abcdef"),
+    ];
+    for (first, second, third) in texts {
+        let earlier = PositionMap::new(first, second);
+        let later = PositionMap::new(second, third);
+        let both = earlier.then(&later);
+        for offset in 0..=first.len() as u32 {
+            let offset = TextSize::new(offset);
+            if let Some(composed) = both.map(offset) {
+                expect_that!(
+                    earlier.map(offset).and_then(|moved| later.map(moved)),
+                    some(eq(composed)),
+                    "{first:?} -> {second:?} -> {third:?} at {offset:?}"
+                );
+            }
+        }
+    }
+    expect_that!(
+        PositionMap::new("abcdef", "XXabcdef")
+            .then(&PositionMap::new("XXabcdef", "XXYYabcdef"))
+            .hunk(),
+        eq(PositionMap::new("abcdef", "XXYYabcdef").hunk())
+    );
+    expect_that!(
+        PositionMap::identity()
+            .then(&PositionMap::new("abc", "aXbc"))
+            .hunk(),
+        eq((1, 1, 2))
+    );
+}
+
+#[gtest]
 fn a_deletion_loses_only_what_was_inside_it() {
     let map = PositionMap::new("abcXXdef", "abcdef");
     expect_that!(map.hunk(), eq((3, 5, 3)));
