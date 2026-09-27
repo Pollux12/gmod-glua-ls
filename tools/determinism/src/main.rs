@@ -1,63 +1,73 @@
 //! Determinism of settled language-server workspace updates.
 //!
 //! Every stage runs production update paths on a copy-on-write fork of one
-//! cold base build and compares the settled index and diagnostics with a cold
-//! build of the same final input (the oracle). Each distinct oracle is built
-//! once per run and kept only as its snapshot.
+//! cold base build and compares the settled index, and the diagnostics the
+//! language server shows, with a cold build of the same final input (the
+//! oracle, or answer key). The base is the oracle of every stage that ends on
+//! the text it started from.
 //!
-//! Stages (`DET_STAGES`, comma list; default `edit,revert,burst,watch`):
-//! - `edit`: apply `DET_EDIT_FIND` -> `DET_EDIT_REPLACE` to each target, settle.
+//! Shown diagnostics: a warm run starts from the base's diagnostics and, after
+//! each settled re-analysis, re-diagnoses the files it reported affected, as
+//! the server does; a deleted file's are dropped. A file whose diagnostics
+//! changed but were never re-diagnosed therefore differs from the oracle; the
+//! `STALE` line names those files.
+//!
+//! Answer keys are built ahead of the stages by worker threads. `DET_JOBS`
+//! (default 2) caps the analyses alive at once, the kept base included, which
+//! bounds memory: about 2.7 GB each on CityRP. Each is kept as its snapshot
+//! until its last use.
+//!
+//! Stages (`DET_STAGES`, comma list; default `schedule,edit,revert,noop`):
+//! - `edit`: each target's edit, settled at once.
 //! - `revert`: the edit, then the original text; the oracle is the base.
-//! - `burst`: three edits of every target before one re-analysis, ending on
-//!   the edited text, so a single target shares the edit oracle.
 //! - `typing`: the edit typed one character at a time as the language server
 //!   takes it, through every invalid text in between: each keystroke is
 //!   taken into the re-analysis still settling from the one before, after 16
 //!   or 256 of its evaluations, and every third keystroke and the last settle
 //!   first, as after a pause. Slices alternate threads, and each first puts
 //!   the next of the target's readers ahead, as a waiting diagnostics pull
-//!   does. Shares the edit oracle. Its reach line is the union over
-//!   keystrokes, followed by the largest reach of any one settle.
-//! - `watch`: watched delete of each target (oracle: the file never existed),
-//!   then watched re-creation (oracle: cold build with the same new file ids).
+//!   does. Shares the edit's oracle.
+//! - `burst`: three edits of every target before one re-analysis, ending on
+//!   the edited text.
 //! - `noop`: re-index each target with unchanged text; the oracle is the base.
+//!   Any evaluated file outside the targets is a locality divergence.
 //! - `reload`: the configuration applied again and every file submitted again
-//!   on the settled analysis, as a configuration reload does; the oracle is
-//!   the base.
-//! - `exact`: remove and re-add exactly the targets in one batch.
-//! - `split:N`: cold build in N batches, compared with the base.
+//!   on the settled analysis, as a configuration reload does.
+//! - `exact`: remove and re-add exactly the targets in one batch (a bisect
+//!   aid).
 //! - `schedule`: cold build taking files in reverse order within each rank,
 //!   compared with the base; `schedule:SEED` takes them in an order fixed by
 //!   the seed. The settled result must not depend on the order files run in.
-//! - `touch`, `shift`, `delete`, `recreate`, `rename`: sweeps over every
-//!   `DET_STRIDE`-th (default 25) main file from `DET_STRIDE_OFFSET` (default
-//!   0), or the `DET_HUBS` main files the most other files read from together
-//!   with the files named in `DET_ONLY`. Touch appends a comment, shift
-//!   prepends a newline, rename moves each file to `<stem>_rn.lua`. With
-//!   `DET_HUBS` or `DET_EACH=1` each file is its own run and oracle, labelled
-//!   `stage[path]`; otherwise one batch holds every sweep file.
+//! - `split:N`: cold build in N batches, compared with the base.
+//! - `touch`, `shift`, `delete`, `recreate`, `rename`: sweeps through
+//!   watched-file events (delete, recreate, rename) or document edits (touch
+//!   appends a comment, shift prepends a newline; any evaluated file outside
+//!   the swept files is a locality divergence). The swept files are the
+//!   `DET_HUBS` main files the most other files read from, with the files
+//!   named in `DET_ONLY`, or else every `DET_STRIDE`-th (default 25) main file
+//!   from `DET_STRIDE_OFFSET`. They form one batch with one oracle; with
+//!   `DET_EACH=1` each file is its own run and oracle, labelled
+//!   `stage[path]`, which a batch cannot mask by re-indexing a reader another
+//!   file left stale.
 //!
-//! Locality: every stage prints how many files the re-analysis evaluated and
-//! how many files' diagnostics it reported affected. For `noop`, `touch` and
-//! `shift` any evaluated file outside the edited files is a divergence.
+//! Targets: `DET_EDITS` names a file of `path<TAB>find<TAB>replace` lines
+//! (`\n`, `\t` and `\` escaped), one edit per target; or `DET_TARGETS`
+//! lists paths relative to `DET_CODEBASE`, each edited `DET_EDIT_FIND` ->
+//! `DET_EDIT_REPLACE`.
 //!
-//! Reach: every warm stage compares the base with its oracle. A file whose
-//! diagnostics changed but that the run neither edited nor reported affected
-//! is a divergence (`STALE`): the language server re-diagnoses only affected
-//! files. The `[waste]` line counts the files whose diagnostics or stored
-//! types changed (needed) against those the run evaluated and reported
-//! affected; whatever it reached beyond the needed files was wasted.
+//! Every warm stage prints its reach (files evaluated and reported affected)
+//! and a `[waste]` line counting the files whose diagnostics or stored types
+//! changed (needed) against those it evaluated and reported affected.
 //!
 //! `DET_REPLAY=1` also replays the warm run's `update_index` batch log onto a
 //! fork of the oracle and compares again: drift that disappears depends on
 //! batch composition, drift that survives is an incremental-path bug.
 //!
-//! Environment: `DET_CODEBASE`, `DET_ANNOTATIONS` (required); `DET_TARGETS`
-//! (files relative to `DET_CODEBASE`, for target stages); `DET_EDIT_FIND`,
-//! `DET_EDIT_REPLACE`; `DET_DUMP_INDEX_DETAIL` (index names or `all`, keeps
-//! entry text for per-entry diffs); `DET_DUMP_INDEX` (directory for full
-//! snapshots); `DET_DUMP` (cold diagnostics file); `DET_FILTER`, `DET_LIMIT`.
-//! Any divergence exits 1.
+//! Environment: `DET_CODEBASE`, `DET_ANNOTATIONS` (required);
+//! `DET_DUMP_INDEX_DETAIL` (index names or `all`, keeps entry text for
+//! per-entry diffs); `DET_DUMP_INDEX` (directory for full snapshots);
+//! `DET_DUMP` (base diagnostics file); `DET_FILTER`, `DET_LIMIT`. Any
+//! divergence exits 1. The run prints its peak memory.
 
 use mimalloc::MiMalloc;
 
@@ -279,9 +289,25 @@ fn build_cold(
 
 fn collect(analysis: &EmmyLuaAnalysis, label: &str) -> BTreeSet<Snapshot> {
     let t = Instant::now();
+    let out = diagnose(
+        analysis,
+        analysis.get_main_workspace_file_ids_for_diagnostics(),
+    )
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let (errors, warnings) = counts(&out);
+    eprintln!(
+        "[{label}] total={} errors={errors} warnings={warnings} ({:.2}s)",
+        out.len(),
+        t.elapsed().as_secs_f64()
+    );
+    out
+}
+
+/// The diagnostics of `file_ids`, as the language server reports them.
+fn diagnose(analysis: &EmmyLuaAnalysis, file_ids: Vec<FileId>) -> Vec<Snapshot> {
     let shared = analysis.precompute_diagnostic_shared_data();
-    let file_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
-    let out = file_ids
+    file_ids
         .into_par_iter()
         .flat_map_iter(|file_id| {
             let diagnostics = analysis
@@ -308,15 +334,7 @@ fn collect(analysis: &EmmyLuaAnalysis, label: &str) -> BTreeSet<Snapshot> {
                 message: diagnostic.message,
             })
         })
-        .collect::<Vec<_>>();
-    let out = out.into_iter().collect::<BTreeSet<_>>();
-    let (errors, warnings) = counts(&out);
-    eprintln!(
-        "[{label}] total={} errors={errors} warnings={warnings} ({:.2}s)",
-        out.len(),
-        t.elapsed().as_secs_f64()
-    );
-    out
+        .collect()
 }
 
 /// Snapshot of the derived index state that diagnostics read from.
@@ -1949,30 +1967,83 @@ impl Reach {
         self.affected.extend(other.affected);
     }
 
-    /// Records one re-analysis that reported `affected`.
-    fn note(&mut self, analysis: &EmmyLuaAnalysis, affected: Vec<FileId>) {
-        self.evaluated
-            .extend_from_slice(analysis.compilation.last_evaluated_files());
-        self.affected.extend(affected);
+    fn of(analysis: &EmmyLuaAnalysis, affected: Vec<FileId>) -> Self {
+        Self {
+            evaluated: analysis.compilation.last_evaluated_files().to_vec(),
+            affected,
+        }
+    }
+}
+
+/// A fork of the base updated as the language server updates it, with the
+/// diagnostics the server shows: the base's, a file's replaced each time a
+/// settled re-analysis reports it affected, and a deleted file's dropped.
+struct Warm {
+    analysis: EmmyLuaAnalysis,
+    shown: BTreeMap<String, Vec<Snapshot>>,
+}
+
+impl std::ops::Deref for Warm {
+    type Target = EmmyLuaAnalysis;
+
+    fn deref(&self) -> &EmmyLuaAnalysis {
+        &self.analysis
+    }
+}
+
+impl std::ops::DerefMut for Warm {
+    fn deref_mut(&mut self) -> &mut EmmyLuaAnalysis {
+        &mut self.analysis
+    }
+}
+
+impl Warm {
+    /// Takes in a settled re-analysis that reported `affected` as the server
+    /// does, and returns its reach.
+    fn settled(&mut self, affected: Vec<FileId>) -> Reach {
+        let live = self
+            .analysis
+            .get_main_workspace_file_ids_for_diagnostics()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let live_files = live
+            .iter()
+            .map(|file_id| file_label(&self.analysis, *file_id))
+            .collect::<BTreeSet<_>>();
+        self.shown.retain(|file, _| live_files.contains(file));
+        let rediagnosed = affected
+            .iter()
+            .filter(|file_id| live.contains(file_id))
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for file_id in &rediagnosed {
+            self.shown.remove(&file_label(&self.analysis, *file_id));
+        }
+        for diagnostic in diagnose(&self.analysis, rediagnosed.into_iter().collect()) {
+            self.shown
+                .entry(diagnostic.file.clone())
+                .or_default()
+                .push(diagnostic);
+        }
+        Reach::of(&self.analysis, affected)
     }
 
-    fn of(analysis: &EmmyLuaAnalysis, affected: Vec<FileId>) -> Self {
-        let mut reach = Self::default();
-        reach.note(analysis, affected);
-        reach
+    /// The diagnostics the server shows now.
+    fn shown(&self) -> BTreeSet<Snapshot> {
+        self.shown.values().flatten().cloned().collect()
     }
 }
 
 fn settle(
-    analysis: &mut EmmyLuaAnalysis,
+    warm: &mut Warm,
     uri: &lsp_types::Uri,
     file_id: FileId,
     text: String,
     version: i32,
 ) -> Reach {
-    apply_text(analysis, uri, file_id, text, version);
-    let affected = analysis.reindex_files(vec![file_id]);
-    Reach::of(analysis, affected)
+    apply_text(warm, uri, file_id, text, version);
+    let affected = warm.reindex_files(vec![file_id]);
+    warm.settled(affected)
 }
 
 /// Settles the re-analysis in progress in slices of `evaluations`, every
@@ -2081,11 +2152,12 @@ impl Reached {
 }
 
 /// Checks a warm run's reach against what its edit changed between the base
-/// and the oracle. A file whose diagnostics changed must have been edited or
-/// reported affected, or the language server leaves its diagnostics stale.
-/// Also reports the files evaluated or reported affected with nothing of
-/// theirs changing, and the files whose facts changed without being
-/// evaluated.
+/// and the oracle, and names the files the language server would leave
+/// stale: their diagnostics changed, but the run neither edited them nor
+/// reported them affected. The diagnostics comparison already counts those
+/// files as differing; this says why. Also reports the files evaluated or
+/// reported affected with nothing of theirs changing, and the files whose
+/// facts changed without being evaluated.
 fn check_reach(label: &str, base: &Snap, expected: &Snap, reached: &Reached) {
     let diagnostics_changed =
         files_with_changed_diagnostics(&base.diagnostics, &expected.diagnostics);
@@ -2117,7 +2189,6 @@ fn check_reach(label: &str, base: &Snap, expected: &Snap, reached: &Reached) {
         affected.difference(&diagnostics_changed).count(),
     );
     if !stale.is_empty() {
-        record_divergence();
         println!(
             "STALE {label}: {} file(s) whose diagnostics changed were not reported affected",
             stale.len()
@@ -2232,37 +2303,328 @@ type WatchEvents = Vec<(lsp_types::Uri, Option<String>)>;
 /// A sweep file: its path, URI, id and base text.
 type SweepFile = (PathBuf, lsp_types::Uri, FileId, String);
 
-struct Harness {
+/// A target file and the edit the edit stages make to it.
+struct Target {
+    relative: String,
+    edit: Option<Edit>,
+}
+
+/// Replaces `find`, which must occur, with `replace`.
+struct Edit {
+    find: String,
+    replace: String,
+}
+
+impl Target {
+    fn edit(&self) -> &Edit {
+        self.edit
+            .as_ref()
+            .unwrap_or_else(|| panic!("no edit is given for {}", self.relative))
+    }
+}
+
+/// The targets and their edits: each line of the `DET_EDITS` file is
+/// `path<TAB>find<TAB>replace`, with `\n`, `\t` and `\\` escaped; or the
+/// `DET_TARGETS` files, each with the `DET_EDIT_FIND` -> `DET_EDIT_REPLACE`
+/// edit when both are set.
+fn targets_from_env() -> Vec<Target> {
+    let unescape = |text: &str| {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            match (c, c == '\\') {
+                (_, true) => match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some(other) => out.push(other),
+                    None => out.push('\\'),
+                },
+                (c, false) => out.push(c),
+            }
+        }
+        out
+    };
+    if let Ok(path) = std::env::var("DET_EDITS") {
+        let text = std::fs::read_to_string(&path).expect("DET_EDITS should be readable");
+        return text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let mut fields = line.split('\t');
+                let (Some(relative), Some(find), Some(replace)) =
+                    (fields.next(), fields.next(), fields.next())
+                else {
+                    panic!("DET_EDITS line is not path<TAB>find<TAB>replace: {line}");
+                };
+                Target {
+                    relative: relative.trim().to_string(),
+                    edit: Some(Edit {
+                        find: unescape(find),
+                        replace: unescape(replace),
+                    }),
+                }
+            })
+            .collect();
+    }
+    let edit = match (
+        std::env::var("DET_EDIT_FIND"),
+        std::env::var("DET_EDIT_REPLACE"),
+    ) {
+        (Ok(find), Ok(replace)) => Some((find, replace)),
+        _ => None,
+    };
+    std::env::var("DET_TARGETS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|relative| !relative.is_empty())
+        .map(|relative| Target {
+            relative: relative.to_string(),
+            edit: edit.as_ref().map(|(find, replace)| Edit {
+                find: find.clone(),
+                replace: replace.clone(),
+            }),
+        })
+        .collect()
+}
+
+/// The order a cold build takes files in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Order {
+    Canonical,
+    Reversed,
+    Shuffled(u64),
+}
+
+impl Order {
+    fn schedule(self) -> Schedule {
+        match self {
+            Self::Canonical => Schedule::Canonical,
+            Self::Reversed => Schedule::Reversed,
+            Self::Shuffled(seed) => Schedule::Shuffled(seed),
+        }
+    }
+}
+
+/// A cold build to compare with: its final input, how many batches it is
+/// fed in, and the order it takes files in.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ColdKey {
+    input: ColdInput,
+    batches: usize,
+    order: Order,
+}
+
+impl ColdKey {
+    /// The cold build of `input`, as the oracle of a warm run.
+    fn oracle(input: ColdInput) -> Self {
+        Self {
+            input,
+            batches: 1,
+            order: Order::Canonical,
+        }
+    }
+
+    fn label(&self) -> String {
+        match (self.order, self.batches) {
+            (Order::Canonical, 1) => "oracle".into(),
+            (Order::Canonical, batches) => format!("split:{batches}"),
+            (Order::Reversed, _) => "schedule".into(),
+            (Order::Shuffled(seed), _) => format!("schedule:{seed}"),
+        }
+    }
+}
+
+/// A built answer key, or why its build failed.
+type Built = Result<Arc<Snap>, String>;
+
+/// Cold builds to compare with, made by worker threads ahead of the stages
+/// that need them. At most `limit` analyses are alive at once, the kept base
+/// included, which bounds memory. Each build is kept as its snapshot until
+/// its last planned use.
+struct AnswerKeys {
+    state: std::sync::Mutex<Keys>,
+    changed: std::sync::Condvar,
+    limit: usize,
+}
+
+#[derive(Default)]
+struct Keys {
+    queued: std::collections::VecDeque<ColdKey>,
+    building: std::collections::HashSet<ColdKey>,
+    /// Analyses alive: builds in progress and the kept base.
+    builds: usize,
+    built: HashMap<ColdKey, Built>,
+    /// Planned uses still to come.
+    uses: HashMap<ColdKey, usize>,
+    closed: bool,
+}
+
+impl AnswerKeys {
+    fn new(limit: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::default(),
+            changed: std::sync::Condvar::new(),
+            limit,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Keys> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn wait<'a>(&self, state: std::sync::MutexGuard<'a, Keys>) -> std::sync::MutexGuard<'a, Keys> {
+        self.changed
+            .wait(state)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Queues `keys` in the order the stages use them, counting each use.
+    fn plan(&self, keys: impl IntoIterator<Item = ColdKey>) {
+        let mut state = self.lock();
+        for key in keys {
+            let uses = state.uses.entry(key.clone()).or_default();
+            *uses += 1;
+            if *uses == 1 {
+                state.queued.push_back(key);
+            }
+        }
+        self.changed.notify_all();
+    }
+
+    /// Runs `build`, a cold build made outside the workers, counted against
+    /// the limit while it runs.
+    fn building<T>(&self, build: impl FnOnce() -> T) -> T {
+        let built = self.keeping(build);
+        self.lock().builds -= 1;
+        self.changed.notify_all();
+        built
+    }
+
+    /// Runs `build` for an analysis kept alive from then on, the base,
+    /// counted against the limit for as long as the workers run.
+    fn keeping<T>(&self, build: impl FnOnce() -> T) -> T {
+        let mut state = self.lock();
+        while state.builds >= self.limit {
+            state = self.wait(state);
+        }
+        state.builds += 1;
+        drop(state);
+        build()
+    }
+
+    /// Builds queued keys until the plan is closed and none is left.
+    fn work(&self, build: &(dyn Fn(&ColdKey) -> Snap + Sync)) {
+        let mut state = self.lock();
+        loop {
+            if state.builds < self.limit
+                && let Some(key) = state.queued.pop_front()
+            {
+                state.builds += 1;
+                state.building.insert(key.clone());
+                drop(state);
+                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(&key)))
+                    .map(Arc::new)
+                    .map_err(|panic| {
+                        panic
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+                            .unwrap_or_else(|| "build panicked".to_owned())
+                    });
+                state = self.lock();
+                state.builds -= 1;
+                state.building.remove(&key);
+                state.built.insert(key, built);
+                self.changed.notify_all();
+                continue;
+            }
+            if state.closed && state.queued.is_empty() {
+                return;
+            }
+            state = self.wait(state);
+        }
+    }
+
+    /// Waits for `key`'s snapshot, queuing it first if it was not planned,
+    /// and lets it go after its last planned use.
+    fn take(&self, key: &ColdKey) -> Arc<Snap> {
+        let mut state = self.lock();
+        let planned = state.uses.contains_key(key);
+        if !planned && !state.building.contains(key) && !state.built.contains_key(key) {
+            state.queued.push_front(key.clone());
+            self.changed.notify_all();
+        }
+        loop {
+            if let Some(built) = state.built.get(key) {
+                let built = built.clone();
+                let left = state.uses.get_mut(key).map(|uses| {
+                    *uses -= 1;
+                    *uses
+                });
+                if left.unwrap_or(0) == 0 {
+                    state.built.remove(key);
+                    state.uses.remove(key);
+                }
+                return built
+                    .unwrap_or_else(|reason| panic!("{} build failed: {reason}", key.label()));
+            }
+            state = self.wait(state);
+        }
+    }
+
+    /// Drops the builds not yet started and lets the workers finish.
+    fn close(&self) {
+        let mut state = self.lock();
+        state.closed = true;
+        state.queued.clear();
+        drop(state);
+        self.changed.notify_all();
+    }
+}
+
+/// Closes the answer keys when dropped, a stage's panic included, so the
+/// workers stop instead of waiting for work.
+struct CloseOnDrop<'a>(&'a AnswerKeys);
+
+impl Drop for CloseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+struct Harness<'k> {
     codebase: PathBuf,
     annotations: PathBuf,
     replay: bool,
     /// Cold build of the unmodified workspace; every warm run starts as a
     /// fork of it.
     base: EmmyLuaAnalysis,
-    /// Each oracle's snapshot, collected once.
-    snapshots: HashMap<ColdInput, Arc<Snap>>,
+    /// The base's snapshot, the oracle of every run that ends on the text it
+    /// started from.
+    base_snap: Arc<Snap>,
+    /// The base's diagnostics by file, where every warm run's shown
+    /// diagnostics start.
+    base_shown: BTreeMap<String, Vec<Snapshot>>,
+    keys: &'k AnswerKeys,
     /// The most recent non-base oracle, kept only for replay.
     oracle: Option<(ColdInput, EmmyLuaAnalysis)>,
+    sweep: std::cell::OnceCell<Vec<SweepFile>>,
     warm_started: Instant,
 }
 
-impl Harness {
-    fn cold(&self, input: &ColdInput, batches: usize) -> EmmyLuaAnalysis {
-        build_cold(
-            &self.codebase,
-            &self.annotations,
-            input,
-            batches,
-            Schedule::Canonical,
-        )
-    }
-
+impl Harness<'_> {
     /// A fork of the base that records its `update_index` batches.
-    fn warm(&mut self) -> EmmyLuaAnalysis {
+    fn warm(&mut self) -> Warm {
         self.warm_started = Instant::now();
-        let mut warm = self.base.fork();
-        warm.compilation.start_batch_log();
-        warm
+        let mut analysis = self.base.fork();
+        analysis.compilation.start_batch_log();
+        Warm {
+            analysis,
+            shown: self.base_shown.clone(),
+        }
     }
 
     fn oracle_analysis(&mut self, input: &ColdInput) -> &EmmyLuaAnalysis {
@@ -2271,31 +2633,32 @@ impl Harness {
         }
         if self.oracle.as_ref().is_none_or(|(kept, _)| kept != input) {
             self.oracle = None;
-            self.oracle = Some((input.clone(), self.cold(input, 1)));
+            let built = self.keys.building(|| {
+                build_cold(
+                    &self.codebase,
+                    &self.annotations,
+                    input,
+                    1,
+                    Schedule::Canonical,
+                )
+            });
+            self.oracle = Some((input.clone(), built));
         }
         &self.oracle.as_ref().expect("oracle was just built").1
     }
 
-    fn expected(&mut self, input: &ColdInput) -> Arc<Snap> {
-        if let Some(snap) = self.snapshots.get(input) {
-            return Arc::clone(snap);
+    fn expected(&self, input: &ColdInput) -> Arc<Snap> {
+        if *input == ColdInput::default() {
+            return Arc::clone(&self.base_snap);
         }
-        let snap = Arc::new(if *input == ColdInput::default() {
-            snapshot(&self.base, "base")
-        } else if self.replay {
-            snapshot(self.oracle_analysis(input), "oracle")
-        } else {
-            snapshot(&self.cold(input, 1), "oracle")
-        });
-        self.snapshots.insert(input.clone(), Arc::clone(&snap));
-        snap
+        self.keys.take(&ColdKey::oracle(input.clone()))
     }
 
     /// Reports how far the warm run reached and returns its batch log.
     fn observe(
         &self,
         label: &str,
-        warm: &mut EmmyLuaAnalysis,
+        warm: &mut Warm,
         edited: &[FileId],
         reach: &Reach,
         strict: bool,
@@ -2309,25 +2672,28 @@ impl Harness {
         log
     }
 
-    /// Compares the warm run with the cold oracle of `input` and, with
-    /// replay, with that oracle after replaying the warm run's batch log. The
-    /// oracle is built while the warm run is snapshotted. Then checks the
-    /// run's reach against what the edit changed; see [`check_reach`].
+    /// Compares the warm run, its index and the diagnostics the server shows,
+    /// with the cold oracle of `input` and, with replay, with that oracle
+    /// after replaying the warm run's batch log. Then checks the run's reach
+    /// against what the edit changed; see [`check_reach`].
     fn check(
         &mut self,
         label: &str,
-        warm: EmmyLuaAnalysis,
+        warm: Warm,
         log: &[Vec<FileId>],
         input: &ColdInput,
         edited: &[FileId],
         reach: &Reach,
     ) {
         let reached = Reached::of(&self.base, &warm, edited, reach);
-        let (actual, expected) = rayon::join(|| snapshot(&warm, label), || self.expected(input));
+        let actual = Snap {
+            index: collect_index(&warm, label),
+            diagnostics: warm.shown(),
+        };
         drop(warm);
+        let expected = self.expected(input);
         compare("expected", &expected, label, &actual);
-        let base = self.expected(&ColdInput::default());
-        check_reach(label, &base, &expected, &reached);
+        check_reach(label, &self.base_snap, &expected, &reached);
         if self.replay {
             let mut replayed = self.oracle_analysis(input).fork();
             replay(&mut replayed, log);
@@ -2342,7 +2708,7 @@ impl Harness {
     fn finish(
         &mut self,
         label: &str,
-        mut warm: EmmyLuaAnalysis,
+        mut warm: Warm,
         edited: &[FileId],
         reach: &Reach,
         strict: bool,
@@ -2352,16 +2718,54 @@ impl Harness {
         self.check(label, warm, &log, input, edited, reach);
     }
 
-    fn edit(&mut self, targets: &[String], find: &str, replace: &str) {
-        for relative in targets {
-            let (path, uri, file_id, original) = target(&self.base, &self.codebase, relative);
-            let changed = edited(&original, find, replace);
+    /// The cold input with each of `targets` edited.
+    fn edit_input(&self, targets: &[Target]) -> ColdInput {
+        ColdInput {
+            overrides: targets
+                .iter()
+                .map(|target_file| {
+                    let (path, _, _, original) =
+                        target(&self.base, &self.codebase, &target_file.relative);
+                    let edit = target_file.edit();
+                    (path, edited(&original, &edit.find, &edit.replace))
+                })
+                .collect(),
+            ..ColdInput::default()
+        }
+    }
+
+    /// The oracles the stages compare with, other than the base, in the
+    /// order they use them. Orders and splits are planned before the base.
+    fn plan(&self, stages: &[&str], targets: &[Target]) -> Vec<ColdKey> {
+        let mut inputs = Vec::new();
+        for stage in stages {
+            match *stage {
+                "edit" | "typing" => inputs.extend(
+                    targets
+                        .iter()
+                        .map(|target_file| self.edit_input(std::slice::from_ref(target_file))),
+                ),
+                "burst" => inputs.push(self.edit_input(targets)),
+                "touch" | "shift" | "delete" | "recreate" | "rename" => inputs.extend(
+                    self.sweep_batches(stage)
+                        .iter()
+                        .map(|(_, files)| sweep_input(stage, files)),
+                ),
+                _ => {}
+            }
+        }
+        inputs.into_iter().map(ColdKey::oracle).collect()
+    }
+
+    fn edit(&mut self, targets: &[Target]) {
+        for target_file in targets {
+            let relative = &target_file.relative;
+            let edit = target_file.edit();
+            let (_, uri, file_id, original) = target(&self.base, &self.codebase, relative);
             let mut warm = self.warm();
-            let reach = settle(&mut warm, &uri, file_id, changed.clone(), 1);
-            let input = ColdInput {
-                overrides: vec![(path, changed)],
-                ..ColdInput::default()
-            };
+            let changed = edited(&original, &edit.find, &edit.replace);
+            let reach = settle(&mut warm, &uri, file_id, changed, 1);
+            let input = self.edit_input(std::slice::from_ref(target_file));
             self.finish(
                 &format!("edit[{relative}]"),
                 warm,
@@ -2373,17 +2777,14 @@ impl Harness {
         }
     }
 
-    fn revert(&mut self, targets: &[String], find: &str, replace: &str) {
-        for relative in targets {
+    fn revert(&mut self, targets: &[Target]) {
+        for target_file in targets {
+            let relative = &target_file.relative;
+            let edit = target_file.edit();
             let (_, uri, file_id, original) = target(&self.base, &self.codebase, relative);
             let mut warm = self.warm();
-            let mut reach = settle(
-                &mut warm,
-                &uri,
-                file_id,
-                edited(&original, find, replace),
-                1,
-            );
+            let changed = edited(&original, &edit.find, &edit.replace);
+            let mut reach = settle(&mut warm, &uri, file_id, changed, 1);
             reach.extend(settle(&mut warm, &uri, file_id, original, 2));
             self.finish(
                 &format!("revert[{relative}]"),
@@ -2396,36 +2797,34 @@ impl Harness {
         }
     }
 
-    fn burst(&mut self, targets: &[String], find: &str, replace: &str) {
+    fn burst(&mut self, targets: &[Target]) {
         let resolved = targets
             .iter()
-            .map(|relative| target(&self.base, &self.codebase, relative))
+            .map(|target_file| {
+                (
+                    target(&self.base, &self.codebase, &target_file.relative),
+                    target_file.edit(),
+                )
+            })
             .collect::<Vec<_>>();
         let mut warm = self.warm();
-        let mut reach = Reach::default();
         for step in 0..3 {
-            for (_, uri, file_id, original) in &resolved {
+            for ((_, uri, file_id, original), edit) in &resolved {
                 let text = match step {
-                    0 => original.replace(find, ""),
-                    1 => format!("\n{}", edited(original, find, replace)),
-                    _ => edited(original, find, replace),
+                    0 => original.replace(&edit.find, ""),
+                    1 => format!("\n{}", edited(original, &edit.find, &edit.replace)),
+                    _ => edited(original, &edit.find, &edit.replace),
                 };
                 apply_text(&mut warm, uri, *file_id, text, step + 1);
             }
         }
-        let ids = resolved.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
+        let ids = resolved
+            .iter()
+            .map(|((_, _, id, _), _)| *id)
+            .collect::<Vec<_>>();
         let affected = warm.reindex_files(ids.clone());
-        reach.note(&warm, affected);
-        let input = ColdInput {
-            overrides: resolved
-                .into_iter()
-                .map(|(path, _, _, original)| {
-                    let changed = edited(&original, find, replace);
-                    (path, changed)
-                })
-                .collect(),
-            ..ColdInput::default()
-        };
+        let reach = warm.settled(affected);
+        let input = self.edit_input(targets);
         self.finish("burst", warm, &ids, &reach, false, &input);
     }
 
@@ -2439,24 +2838,24 @@ impl Harness {
         warm.update_config(Arc::new(emmyrc.clone()));
         let files = add_workspaces(&mut warm, &self.codebase, &self.annotations, &emmyrc);
         let affected = warm.update_files_by_path(files);
-        let mut reach = Reach::default();
-        reach.note(&warm, affected);
+        let reach = warm.settled(affected);
         self.finish("reload", warm, &[], &reach, false, &ColdInput::default());
     }
 
     /// Types the edit into each target as the language server takes it; see
     /// the module docs.
-    fn typing(&mut self, targets: &[String], find: &str, replace: &str) {
+    fn typing(&mut self, targets: &[Target]) {
         let dependents = self.base.dependent_files();
-        for relative in targets {
-            let (path, uri, file_id, original) = target(&self.base, &self.codebase, relative);
-            let changed = edited(&original, find, replace);
+        for target_file in targets {
+            let relative = &target_file.relative;
+            let edit = target_file.edit();
+            let (_, uri, file_id, original) = target(&self.base, &self.codebase, relative);
             let readers = dependents.get(&file_id).cloned().unwrap_or_default();
             let mut next_reader = readers.iter().cycle();
             let mut warm = self.warm();
             let mut reach = Reach::default();
             let (mut most_evaluated, mut most_affected, mut taken_mid) = (0, 0, 0);
-            let texts = typed_texts(&original, find, replace);
+            let texts = typed_texts(&original, &edit.find, &edit.replace);
             let keystrokes = texts.len();
             for (version, text) in (1..).zip(texts) {
                 apply_text(&mut warm, &uri, file_id, text, version);
@@ -2483,7 +2882,7 @@ impl Harness {
                 };
                 if let Some(mut affected) = affected {
                     affected.push(file_id);
-                    let step = Reach::of(&warm, affected);
+                    let step = warm.settled(affected);
                     most_evaluated = most_evaluated.max(step.evaluated.len());
                     most_affected = most_affected.max(step.affected.len());
                     reach.extend(step);
@@ -2492,10 +2891,7 @@ impl Harness {
             println!(
                 "[reach typing[{relative}] per settle] evaluated<={most_evaluated} affected<={most_affected}; {taken_mid} keystroke(s) taken mid re-analysis"
             );
-            let input = ColdInput {
-                overrides: vec![(path, changed)],
-                ..ColdInput::default()
-            };
+            let input = self.edit_input(std::slice::from_ref(target_file));
             self.finish(
                 &format!("typing[{relative}]"),
                 warm,
@@ -2519,47 +2915,17 @@ impl Harness {
         let mut reach = Reach::default();
         for events in steps {
             let affected = warm.apply_file_system_changes(events);
-            reach.note(&warm, affected);
+            reach.extend(warm.settled(affected));
         }
         self.finish(label, warm, edited, &reach, false, input);
     }
 
-    fn watch(&mut self, targets: &[String]) {
-        for relative in targets {
-            let (path, uri, file_id, original) = target(&self.base, &self.codebase, relative);
-            let mut warm = self.warm();
-            let affected = warm.apply_file_system_changes(vec![(uri.clone(), None)]);
-            let reach = Reach::of(&warm, affected);
-            let label = format!("watch_deleted[{relative}]");
-            let mut log = self.observe(&label, &mut warm, &[file_id], &reach, false);
-            let removed = ColdInput {
-                removed: vec![path.clone()],
-                ..ColdInput::default()
-            };
-            self.check(&label, warm.fork(), &log, &removed, &[file_id], &reach);
-
-            self.warm_started = Instant::now();
-            warm.compilation.start_batch_log();
-            let affected =
-                warm.apply_file_system_changes(vec![(uri.clone(), Some(original.clone()))]);
-            let reach = Reach::of(&warm, affected);
-            let created_id = warm.get_file_id(&uri).expect("re-created target has an id");
-            let label = format!("watch_created[{relative}]");
-            log.extend(self.observe(&label, &mut warm, &[created_id], &reach, false));
-            let recreated = ColdInput {
-                created: vec![(path, original)],
-                ..removed
-            };
-            self.check(&label, warm, &log, &recreated, &[created_id], &reach);
-        }
-    }
-
-    fn noop(&mut self, targets: &[String]) {
-        for relative in targets {
+    fn noop(&mut self, targets: &[Target]) {
+        for relative in targets.iter().map(|target_file| &target_file.relative) {
             let (_, _, file_id, _) = target(&self.base, &self.codebase, relative);
             let mut warm = self.warm();
             let affected = warm.reindex_files(vec![file_id]);
-            let reach = Reach::of(&warm, affected);
+            let reach = warm.settled(affected);
             self.finish(
                 &format!("noop[{relative}]"),
                 warm,
@@ -2571,46 +2937,26 @@ impl Harness {
         }
     }
 
-    fn exact(&mut self, targets: &[String]) {
+    fn exact(&mut self, targets: &[Target]) {
         let ids = targets
             .iter()
-            .map(|relative| target(&self.base, &self.codebase, relative).2)
+            .map(|target_file| target(&self.base, &self.codebase, &target_file.relative).2)
             .collect::<Vec<_>>();
         let mut warm = self.warm();
         let affected = warm.reindex_files(ids.clone());
-        let reach = Reach::of(&warm, affected);
+        let reach = warm.settled(affected);
         self.finish("exact", warm, &ids, &reach, false, &ColdInput::default());
     }
 
-    fn schedule(&mut self, label: &str, schedule: Schedule) {
-        let scheduled = build_cold(
-            &self.codebase,
-            &self.annotations,
-            &ColdInput::default(),
-            1,
-            schedule,
-        );
-        let actual = snapshot(&scheduled, label);
-        drop(scheduled);
-        compare(
-            "base",
-            &self.expected(&ColdInput::default()),
-            label,
-            &actual,
-        );
-    }
-
-    fn split(&mut self, batches: usize) {
-        let label = format!("split:{batches}");
-        let split = self.cold(&ColdInput::default(), batches);
-        let actual = snapshot(&split, &label);
-        drop(split);
-        compare(
-            "base",
-            &self.expected(&ColdInput::default()),
-            &label,
-            &actual,
-        );
+    /// Compares the cold build of the unmodified workspace taken in `order`
+    /// or fed in `batches` with the base.
+    fn cold_order(&mut self, label: &str, batches: usize, order: Order) {
+        let actual = self.keys.take(&ColdKey {
+            input: ColdInput::default(),
+            batches,
+            order,
+        });
+        compare("base", &self.base_snap, label, &actual);
     }
 
     /// `path` relative to the codebase, with forward slashes.
@@ -2654,52 +3000,52 @@ impl Harness {
     /// The sweep's files: every `DET_STRIDE`-th main file from
     /// `DET_STRIDE_OFFSET`, or the `DET_HUBS` hubs together with the files
     /// whose path ends with an entry of `DET_ONLY`.
-    fn sweep_files(&self) -> Vec<SweepFile> {
-        let stride = env_usize("DET_STRIDE", 25);
-        let offset = env_usize("DET_STRIDE_OFFSET", 0);
-        let only = std::env::var("DET_ONLY").ok().map(|value| {
-            value
-                .split(',')
-                .map(|entry| entry.trim().replace('\\', "/").to_lowercase())
-                .filter(|entry| !entry.is_empty())
-                .collect::<Vec<_>>()
-        });
-        let hubs = self.hubs();
-        let vfs = self.base.compilation.get_db().get_vfs();
-        let mut ids = self.base.get_main_workspace_file_ids_for_diagnostics();
-        ids.sort_unstable();
-        let files = ids
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, file_id)| {
-                let path = vfs.get_file_path(&file_id)?;
-                let selected = if only.is_none() && hubs.is_empty() {
-                    i % stride == offset
-                } else {
-                    hubs.contains(&file_id)
-                        || only
-                            .iter()
-                            .flatten()
-                            .any(|entry| path_key(path).ends_with(entry.as_str()))
-                };
-                selected.then(|| {
-                    let text = vfs.get_file_content(&file_id)?.clone();
-                    Some((path.clone(), file_uri(path), file_id, text))
-                })?
-            })
-            .collect::<Vec<_>>();
-        eprintln!("[sweep] {} file(s)", files.len());
-        files
+    fn sweep_files(&self) -> &[SweepFile] {
+        self.sweep.get_or_init(|| {
+            let stride = env_usize("DET_STRIDE", 25);
+            let offset = env_usize("DET_STRIDE_OFFSET", 0);
+            let only = std::env::var("DET_ONLY").ok().map(|value| {
+                value
+                    .split(',')
+                    .map(|entry| entry.trim().replace('\\', "/").to_lowercase())
+                    .filter(|entry| !entry.is_empty())
+                    .collect::<Vec<_>>()
+            });
+            let hubs = self.hubs();
+            let vfs = self.base.compilation.get_db().get_vfs();
+            let mut ids = self.base.get_main_workspace_file_ids_for_diagnostics();
+            ids.sort_unstable();
+            let files = ids
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, file_id)| {
+                    let path = vfs.get_file_path(&file_id)?;
+                    let selected = if only.is_none() && hubs.is_empty() {
+                        i % stride == offset
+                    } else {
+                        hubs.contains(&file_id)
+                            || only
+                                .iter()
+                                .flatten()
+                                .any(|entry| path_key(path).ends_with(entry.as_str()))
+                    };
+                    selected.then(|| {
+                        let text = vfs.get_file_content(&file_id)?.clone();
+                        Some((path.clone(), file_uri(path), file_id, text))
+                    })?
+                })
+                .collect::<Vec<_>>();
+            eprintln!("[sweep] {} file(s)", files.len());
+            files
+        })
     }
 
-    /// The sweep's batches with their labels: each file alone when
-    /// `DET_HUBS` picks files or `DET_EACH=1`, so no edited file re-indexes
-    /// the readers another edited file left stale; otherwise one batch.
+    /// The sweep's batches with their labels: one batch of every sweep file,
+    /// or each file alone with `DET_EACH=1`, so no edited file re-indexes the
+    /// readers another edited file left stale.
     fn sweep_batches(&self, stage: &str) -> Vec<(String, Vec<SweepFile>)> {
-        let files = self.sweep_files();
-        let each = env_usize("DET_HUBS", 0) > 0
-            || std::env::var("DET_EACH").is_ok_and(|value| value == "1");
-        if !each {
+        let files = self.sweep_files().to_vec();
+        if !std::env::var("DET_EACH").is_ok_and(|value| value == "1") {
             return vec![(stage.to_owned(), files)];
         }
         files
@@ -2708,34 +3054,31 @@ impl Harness {
             .collect()
     }
 
-    /// Edits each batch's files with `edit` and settles them together.
-    fn sweep_edit(&mut self, stage: &str, edit: impl Fn(&str) -> String) {
+    /// Edits each batch's files as `stage` does and settles them together.
+    fn sweep_edit(&mut self, stage: &str) {
         for (label, files) in self.sweep_batches(stage) {
             let mut warm = self.warm();
             for (_, uri, file_id, text) in &files {
-                apply_text(&mut warm, uri, *file_id, edit(text), 1);
+                apply_text(&mut warm, uri, *file_id, sweep_edited(stage, text), 1);
             }
             let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
             let affected = warm.reindex_files(ids.clone());
-            let reach = Reach::of(&warm, affected);
-            let input = ColdInput {
-                overrides: files
-                    .iter()
-                    .map(|(path, _, _, text)| (path.clone(), edit(text)))
-                    .collect(),
-                ..ColdInput::default()
-            };
-            self.finish(&label, warm, &ids, &reach, true, &input);
+            let reach = warm.settled(affected);
+            self.finish(
+                &label,
+                warm,
+                &ids,
+                &reach,
+                true,
+                &sweep_input(stage, &files),
+            );
         }
     }
 
     fn sweep_delete(&mut self) {
         for (label, files) in self.sweep_batches("delete") {
             let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
-            let input = ColdInput {
-                removed: files.iter().map(|(path, ..)| path.clone()).collect(),
-                ..ColdInput::default()
-            };
+            let input = sweep_input("delete", &files);
             let events = files.into_iter().map(|(_, uri, ..)| (uri, None)).collect();
             self.watched(&label, vec![events], &ids, &input);
         }
@@ -2743,64 +3086,86 @@ impl Harness {
 
     fn sweep_recreate(&mut self) {
         for (label, files) in self.sweep_batches("recreate") {
-            self.recreate_batch(&label, files);
+            let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
+            let input = sweep_input("recreate", &files);
+            let deletes = files
+                .iter()
+                .map(|(_, uri, ..)| (uri.clone(), None))
+                .collect();
+            let creates = files
+                .into_iter()
+                .map(|(_, uri, _, text)| (uri, Some(text)))
+                .collect();
+            self.watched(&label, vec![deletes, creates], &ids, &input);
         }
     }
 
-    fn recreate_batch(&mut self, label: &str, files: Vec<SweepFile>) {
-        let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
-        let input = ColdInput {
-            removed: files.iter().map(|(path, ..)| path.clone()).collect(),
+    fn sweep_rename(&mut self) {
+        for (label, files) in self.sweep_batches("rename") {
+            let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
+            let input = sweep_input("rename", &files);
+            let mut events = files
+                .iter()
+                .map(|(_, uri, ..)| (uri.clone(), None))
+                .collect::<Vec<_>>();
+            events.extend(
+                input
+                    .created
+                    .iter()
+                    .map(|(path, text)| (file_uri(path), Some(text.clone()))),
+            );
+            self.watched(&label, vec![events], &ids, &input);
+        }
+    }
+}
+
+/// A sweep file's text after the `touch` or `shift` edit.
+fn sweep_edited(stage: &str, text: &str) -> String {
+    match stage {
+        "touch" => format!("{text}\n-- touch\n"),
+        "shift" => format!("\n{text}"),
+        _ => unreachable!("{stage} edits no text"),
+    }
+}
+
+/// The cold input a sweep `stage` ends on for `files`.
+fn sweep_input(stage: &str, files: &[SweepFile]) -> ColdInput {
+    let removed = || files.iter().map(|(path, ..)| path.clone()).collect();
+    match stage {
+        "touch" | "shift" => ColdInput {
+            overrides: files
+                .iter()
+                .map(|(path, _, _, text)| (path.clone(), sweep_edited(stage, text)))
+                .collect(),
+            ..ColdInput::default()
+        },
+        "delete" => ColdInput {
+            removed: removed(),
+            ..ColdInput::default()
+        },
+        "recreate" => ColdInput {
+            removed: removed(),
             created: files
                 .iter()
                 .map(|(path, _, _, text)| (path.clone(), text.clone()))
                 .collect(),
             ..ColdInput::default()
-        };
-        let deletes = files
-            .iter()
-            .map(|(_, uri, ..)| (uri.clone(), None))
-            .collect();
-        let creates = files
-            .into_iter()
-            .map(|(_, uri, _, text)| (uri, Some(text)))
-            .collect();
-        self.watched(label, vec![deletes, creates], &ids, &input);
-    }
-
-    fn sweep_rename(&mut self) {
-        for (label, files) in self.sweep_batches("rename") {
-            self.rename_batch(&label, files);
-        }
-    }
-
-    fn rename_batch(&mut self, label: &str, files: Vec<SweepFile>) {
-        let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
-        let renamed = files
-            .iter()
-            .map(|(path, _, _, text)| {
-                let stem = path
-                    .file_stem()
-                    .expect("workspace file has a name")
-                    .to_string_lossy();
-                (path.with_file_name(format!("{stem}_rn.lua")), text.clone())
-            })
-            .collect::<Vec<_>>();
-        let mut events = files
-            .iter()
-            .map(|(_, uri, ..)| (uri.clone(), None))
-            .collect::<Vec<_>>();
-        events.extend(
-            renamed
+        },
+        "rename" => ColdInput {
+            removed: removed(),
+            created: files
                 .iter()
-                .map(|(path, text)| (file_uri(path), Some(text.clone()))),
-        );
-        let input = ColdInput {
-            removed: files.into_iter().map(|(path, ..)| path).collect(),
-            created: renamed,
+                .map(|(path, _, _, text)| {
+                    let stem = path
+                        .file_stem()
+                        .expect("workspace file has a name")
+                        .to_string_lossy();
+                    (path.with_file_name(format!("{stem}_rn.lua")), text.clone())
+                })
+                .collect(),
             ..ColdInput::default()
-        };
-        self.watched(label, vec![events], &ids, &input);
+        },
+        _ => unreachable!("{stage} is not a sweep"),
     }
 }
 
@@ -2817,7 +3182,7 @@ fn run() {
     let codebase = PathBuf::from(std::env::var("DET_CODEBASE").expect("DET_CODEBASE is required"));
     let annotations =
         PathBuf::from(std::env::var("DET_ANNOTATIONS").expect("DET_ANNOTATIONS is required"));
-    let stages = std::env::var("DET_STAGES").unwrap_or_else(|_| "edit,revert,burst,watch".into());
+    let stages = std::env::var("DET_STAGES").unwrap_or_else(|_| "schedule,edit,revert,noop".into());
     let stages: Vec<_> = stages
         .split(',')
         .map(str::trim)
@@ -2827,30 +3192,31 @@ fn run() {
         !stages.is_empty(),
         "DET_STAGES must select at least one check"
     );
-    let split_batches = |stage: &str| {
-        stage
+    let order_of = |stage: &str| -> Option<(usize, Order)> {
+        if let Some(batches) = stage
             .strip_prefix("split:")
             .and_then(|n| n.parse::<usize>().ok())
             .filter(|n| *n > 0)
-    };
-    let schedule_of = |stage: &str| match stage {
-        "schedule" => Some(Schedule::Reversed),
-        _ => stage
-            .strip_prefix("schedule:")
-            .and_then(|seed| seed.parse::<u64>().ok())
-            .map(Schedule::Shuffled),
+        {
+            return Some((batches, Order::Canonical));
+        }
+        match stage {
+            "schedule" => Some((1, Order::Reversed)),
+            _ => stage
+                .strip_prefix("schedule:")
+                .and_then(|seed| seed.parse::<u64>().ok())
+                .map(|seed| (1, Order::Shuffled(seed))),
+        }
     };
     for stage in &stages {
         assert!(
-            split_batches(stage).is_some()
-                || schedule_of(stage).is_some()
+            order_of(stage).is_some()
                 || matches!(
                     *stage,
                     "edit"
                         | "revert"
                         | "burst"
                         | "typing"
-                        | "watch"
                         | "noop"
                         | "reload"
                         | "exact"
@@ -2866,96 +3232,122 @@ fn run() {
     let needs_targets = stages.iter().any(|s| {
         matches!(
             *s,
-            "edit" | "revert" | "burst" | "typing" | "watch" | "noop" | "exact"
+            "edit" | "revert" | "burst" | "typing" | "noop" | "exact"
         )
     });
-    let targets: Vec<String> = if needs_targets {
-        std::env::var("DET_TARGETS")
-            .expect("DET_TARGETS is required")
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let targets = targets_from_env();
     assert!(
         !needs_targets || !targets.is_empty(),
-        "DET_TARGETS must name indexed files"
+        "DET_TARGETS or DET_EDITS must name indexed files"
     );
     let needs_edit = stages
         .iter()
         .any(|s| matches!(*s, "edit" | "revert" | "burst" | "typing"));
-    let (find, replace) = if needs_edit {
-        (
-            std::env::var("DET_EDIT_FIND").expect("DET_EDIT_FIND is required"),
-            std::env::var("DET_EDIT_REPLACE").expect("DET_EDIT_REPLACE is required"),
-        )
-    } else {
-        (String::new(), String::new())
-    };
     assert!(
-        !needs_edit || !find.is_empty(),
-        "DET_EDIT_FIND must be nonempty"
+        !needs_edit
+            || targets.iter().all(|target_file| target_file
+                .edit
+                .as_ref()
+                .is_some_and(|edit| !edit.find.is_empty())),
+        "the edit stages need a nonempty edit for every target (DET_EDIT_FIND/DET_EDIT_REPLACE or DET_EDITS)"
     );
 
     let started = Instant::now();
-    let base = build_cold(
-        &codebase,
-        &annotations,
-        &ColdInput::default(),
-        1,
-        Schedule::Canonical,
-    );
-    let mut harness = Harness {
-        replay: std::env::var("DET_REPLAY").is_ok_and(|value| value == "1"),
-        codebase,
-        annotations,
-        base,
-        snapshots: HashMap::new(),
-        oracle: None,
-        warm_started: Instant::now(),
+    let keys = AnswerKeys::new(env_usize("DET_JOBS", 2).max(1));
+    let build_key = |key: &ColdKey| {
+        let built = build_cold(
+            &codebase,
+            &annotations,
+            &key.input,
+            key.batches,
+            key.order.schedule(),
+        );
+        snapshot(&built, &key.label())
     };
-    // Diagnosing the base records what each file's diagnostics read, so every
-    // warm run reports affected files from the same starting point.
-    harness.expected(&ColdInput::default());
-    println!("[time] setup {:.1}s", started.elapsed().as_secs_f64());
-    if let Ok(dump_path) = std::env::var("DET_DUMP") {
-        let rendered = harness
-            .expected(&ColdInput::default())
-            .diagnostics
-            .iter()
-            .map(Snapshot::render)
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(dump_path, rendered).expect("diagnostic dump should succeed");
-    }
-    for stage in stages {
-        let t = Instant::now();
-        match stage {
-            "edit" => harness.edit(&targets, &find, &replace),
-            "revert" => harness.revert(&targets, &find, &replace),
-            "burst" => harness.burst(&targets, &find, &replace),
-            "typing" => harness.typing(&targets, &find, &replace),
-            "watch" => harness.watch(&targets),
-            "noop" => harness.noop(&targets),
-            "reload" => harness.reload(),
-            "exact" => harness.exact(&targets),
-            "touch" => harness.sweep_edit("touch", |text| format!("{text}\n-- touch\n")),
-            "shift" => harness.sweep_edit("shift", |text| format!("\n{text}")),
-            "delete" => harness.sweep_delete(),
-            "recreate" => harness.sweep_recreate(),
-            "rename" => harness.sweep_rename(),
-            _ => match schedule_of(stage) {
-                Some(schedule) => harness.schedule(stage, schedule),
-                None => harness.split(split_batches(stage).expect("validated above")),
-            },
+    let divergences = std::thread::scope(|scope| {
+        let _close = CloseOnDrop(&keys);
+        for _ in 0..keys.limit {
+            std::thread::Builder::new()
+                .stack_size(glua_code_analysis::ANALYSIS_STACK_SIZE)
+                .spawn_scoped(scope, || keys.work(&build_key))
+                .expect("answer key worker should spawn");
         }
-        println!("[time] {stage} {:.1}s", t.elapsed().as_secs_f64());
-    }
+        keys.plan(stages.iter().filter_map(|stage| {
+            let (batches, order) = order_of(stage)?;
+            Some(ColdKey {
+                input: ColdInput::default(),
+                batches,
+                order,
+            })
+        }));
+        let base = keys.keeping(|| {
+            build_cold(
+                &codebase,
+                &annotations,
+                &ColdInput::default(),
+                1,
+                Schedule::Canonical,
+            )
+        });
+        // Diagnosing the base records what each file's diagnostics read, so
+        // every warm run reports affected files from the same starting point.
+        let base_snap = Arc::new(snapshot(&base, "base"));
+        let mut base_shown = BTreeMap::<String, Vec<Snapshot>>::new();
+        for diagnostic in &base_snap.diagnostics {
+            base_shown
+                .entry(diagnostic.file.clone())
+                .or_default()
+                .push(diagnostic.clone());
+        }
+        let mut harness = Harness {
+            replay: std::env::var("DET_REPLAY").is_ok_and(|value| value == "1"),
+            codebase: codebase.clone(),
+            annotations: annotations.clone(),
+            base,
+            base_snap,
+            base_shown,
+            keys: &keys,
+            oracle: None,
+            sweep: std::cell::OnceCell::new(),
+            warm_started: Instant::now(),
+        };
+        keys.plan(harness.plan(&stages, &targets));
+        println!("[time] setup {:.1}s", started.elapsed().as_secs_f64());
+        if let Ok(dump_path) = std::env::var("DET_DUMP") {
+            let rendered = harness
+                .base_snap
+                .diagnostics
+                .iter()
+                .map(Snapshot::render)
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(dump_path, rendered).expect("diagnostic dump should succeed");
+        }
+        for stage in &stages {
+            let t = Instant::now();
+            match *stage {
+                "edit" => harness.edit(&targets),
+                "revert" => harness.revert(&targets),
+                "burst" => harness.burst(&targets),
+                "typing" => harness.typing(&targets),
+                "noop" => harness.noop(&targets),
+                "reload" => harness.reload(),
+                "exact" => harness.exact(&targets),
+                "touch" | "shift" => harness.sweep_edit(stage),
+                "delete" => harness.sweep_delete(),
+                "recreate" => harness.sweep_recreate(),
+                "rename" => harness.sweep_rename(),
+                _ => {
+                    let (batches, order) = order_of(stage).expect("validated above");
+                    harness.cold_order(stage, batches, order);
+                }
+            }
+            println!("[time] {stage} {:.1}s", t.elapsed().as_secs_f64());
+        }
+        DIVERGENCES.load(Ordering::Relaxed)
+    });
     println!("[time] total {:.1}s", started.elapsed().as_secs_f64());
-    let divergences = DIVERGENCES.load(Ordering::Relaxed);
+    glua_code_analysis::profile::memory::report_peak();
     if divergences != 0 {
         eprintln!("[determinism] {divergences} comparison(s) differed");
         std::process::exit(1);
