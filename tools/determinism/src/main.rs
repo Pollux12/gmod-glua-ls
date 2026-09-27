@@ -750,8 +750,13 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
 
     let flow = db.get_flow_index();
     let mut flow_trees = BTreeMap::new();
+    // Compared by content: the trees hold hash sets whose printed order
+    // differs between two builds of the same text.
     for (file_id, tree) in flow.flow_trees() {
-        flow_trees.insert(file_label(analysis, *file_id), format!("{tree:?}"));
+        flow_trees.insert(
+            file_label(analysis, *file_id),
+            format!("{:016x}", tree.content_fingerprint()),
+        );
     }
     let mut signature_casts = BTreeMap::new();
     for (signature_id, signature) in db.get_signature_index().iter() {

@@ -435,7 +435,7 @@ impl FlowTree {
     }
 
     /// Content hash of everything the tree's accessors can observe.
-    pub(crate) fn content_fingerprint(&self) -> Fingerprint {
+    pub fn content_fingerprint(&self) -> Fingerprint {
         derivation::fingerprint_of(&(
             unordered_fingerprint(&self.decl_bind_expr_ref),
             &self.flow_nodes,
