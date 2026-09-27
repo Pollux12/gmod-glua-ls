@@ -936,11 +936,10 @@ fn maybe_field_literal_eq_narrow(
     };
 
     if maybe_var_ref_id != *var_ref_id {
-        if cache
-            .narrow_by_literal_stop_position_cache
-            .contains(&syntax_id)
+        if let Some(mark) = cache.field_literal_narrowing.get(&syntax_id).copied()
             && var_ref_id.start_with(&maybe_var_ref_id)
         {
+            crate::db_index::derivation::consult_scope(mark);
             return Ok(ResultTypeOrContinue::Result(get_var_ref_type(
                 db, cache, var_ref_id,
             )?));
@@ -955,12 +954,16 @@ fn maybe_field_literal_eq_narrow(
         return Ok(ResultTypeOrContinue::Continue);
     };
 
-    cache
-        .narrow_by_literal_stop_position_cache
-        .insert(syntax_id);
-
     let right_type = infer_expr(db, cache, LuaExpr::LiteralExpr(literal_expr))?;
     let index = LuaIndexMemberExpr::IndexExpr(index_expr);
+    // While the arms' fields are inferred, a walk of a path under the owner
+    // stops at this comparison instead of narrowing through it again.
+    let began = !cache.field_literal_narrowing.contains_key(&syntax_id);
+    if began {
+        cache
+            .field_literal_narrowing
+            .insert(syntax_id, crate::db_index::derivation::scope_mark());
+    }
     let mut opt_result = None;
     let mut union_types = union_type.into_vec();
     for (i, sub_type) in union_types.iter().enumerate() {
@@ -978,6 +981,9 @@ fn maybe_field_literal_eq_narrow(
             // If the right type matches the member type, we can narrow it
             opt_result = Some(i);
         }
+    }
+    if began {
+        cache.field_literal_narrowing.remove(&syntax_id);
     }
 
     match condition_flow {

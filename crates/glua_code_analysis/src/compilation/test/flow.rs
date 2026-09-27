@@ -8869,4 +8869,57 @@ _2 = a[1]
         let assigned = nth_name_expr_type_from_end(&mut ws, file_id, "count", 0);
         assert_eq!(ws.humanize_type(assigned), "number?");
     }
+
+    /// Narrowing the union that owns a field by that field's comparison with
+    /// a literal must not stop the field's own walk at the comparison.
+    #[test]
+    fn a_field_guarded_by_a_nil_comparison_is_not_nil_inside_the_guard() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/steering.lua",
+            r#"
+            ---@class SteeringA
+            ---@field steer fun(self: SteeringA): number
+            ---@class SteeringB
+            ---@field steer? fun(self: SteeringB): number
+            ---@type SteeringA|SteeringB
+            local veh = make()
+            if veh.steer ~= nil then
+                local steer = veh.steer
+            end
+            "#,
+        );
+
+        let steer = ws.local_ty(file_id, "steer");
+        assert!(!steer.is_nullable(), "{steer:?}");
+    }
+
+    /// A field read after its owner was narrowed by a comparison with a
+    /// literal walks past that comparison to the value assigned before it.
+    #[test]
+    fn a_field_read_past_a_literal_comparison_of_its_owner_keeps_its_assigned_value() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/literal_narrowing.lua",
+            r#"
+            ---@class LiteralA
+            ---@field kind "a"
+            ---@field value string?
+            ---@class LiteralB
+            ---@field kind "b"
+            ---@field value string?
+            ---@type LiteralA|LiteralB
+            local x = make()
+            x.value = "set"
+            if x.kind == "a" then
+                local value = x.value
+            end
+            "#,
+        );
+
+        assert_eq!(
+            ws.local_ty(file_id, "value"),
+            LuaType::StringConst(smol_str::SmolStr::new("set").into())
+        );
+    }
 }

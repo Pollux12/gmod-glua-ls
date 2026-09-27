@@ -720,6 +720,30 @@ impl VirtualWorkspace {
         info.display_typ().clone()
     }
 
+    /// The type of the local `name` declared in `file_id`.
+    pub fn local_ty(&self, file_id: FileId, name: &str) -> LuaType {
+        let semantic_model = self
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Model must exist");
+        let local_name = semantic_model
+            .get_root()
+            .descendants::<LuaLocalName>()
+            .find(|local_name| {
+                local_name
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == name)
+            })
+            .expect("Local must exist");
+        let token = local_name.get_name_token().expect("Name token must exist");
+        semantic_model
+            .get_semantic_info(token.syntax().clone().into())
+            .expect("Semantic info must exist")
+            .display_typ()
+            .clone()
+    }
+
     pub fn check_type(&self, source: &LuaType, compact_type: &LuaType) -> bool {
         let db = &self.analysis.compilation.get_db();
         check_type_compact(db, source, compact_type).is_ok()

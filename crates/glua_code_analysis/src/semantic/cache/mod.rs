@@ -7,7 +7,7 @@ use internment::ArcIntern;
 use rowan::{TextRange, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 pub use tracked::{Lookup, TrackedMap, Untracked};
 
 use crate::db_index::derivation::{self, Gates, OpenFrame, Provenance};
@@ -215,7 +215,10 @@ pub struct LuaInferCache {
     pub(crate) param_type_source_cache:
         Untracked<FxHashMap<LuaDeclId, CacheEntry<ParamInferenceSource>>>,
     pub expr_var_ref_id_cache: TrackedMap<LuaSyntaxId, VarRefId>,
-    pub narrow_by_literal_stop_position_cache: Untracked<HashSet<LuaSyntaxId>>,
+    /// Field comparisons with a literal whose owner is being narrowed by them,
+    /// and where each narrowing began: a walk of a path under the owner stops
+    /// there.
+    pub(crate) field_literal_narrowing: FxHashMap<LuaSyntaxId, derivation::ScopeMark>,
     pub scripted_global_singleton_type_cache: Option<FxHashMap<String, LuaTypeDeclId>>,
     /// Cache for `self` type per enclosing method (keyed by LuaFuncStat syntax_id).
     /// Avoids repeated ancestor walks and type resolution for each `self` reference
@@ -339,7 +342,7 @@ impl LuaInferCache {
             param_type_cache: Default::default(),
             param_type_source_cache: Default::default(),
             expr_var_ref_id_cache: Default::default(),
-            narrow_by_literal_stop_position_cache: Default::default(),
+            field_literal_narrowing: Default::default(),
             scripted_global_singleton_type_cache: None,
             self_type_cache: Default::default(),
             self_base_seed: None,
@@ -599,7 +602,7 @@ impl LuaInferCache {
         empty(&mut self.index_ref_origin_type_cache);
         empty(&mut self.param_type_cache.0);
         empty(&mut self.param_type_source_cache.0);
-        empty(&mut self.narrow_by_literal_stop_position_cache.0);
+        empty(&mut self.field_literal_narrowing);
         self.scripted_global_singleton_type_cache = None;
         self.self_type_cache.clear_local();
         self.self_base_seed = None;
@@ -679,7 +682,7 @@ impl LuaInferCache {
         // materialize, so discard only those semantic entries.
         self.expr_var_ref_id_cache
             .retain(|syntax_id, var_ref_id| var_ref_is_phase_stable(db, syntax_id, var_ref_id));
-        self.narrow_by_literal_stop_position_cache.clear();
+        self.field_literal_narrowing.clear();
         self.self_type_cache.clear();
         self.self_base_seed = None;
         self.decl_cache.clear();
@@ -1064,8 +1067,8 @@ mod tests {
             .flow_node_realm_cache
             .insert(FlowId(1), GmodRealm::Server, None);
         cache
-            .narrow_by_literal_stop_position_cache
-            .insert(syntax_id);
+            .field_literal_narrowing
+            .insert(syntax_id, crate::db_index::derivation::ScopeMark::default());
 
         cache.clear_for_unresolve(&DbIndex::new());
 
@@ -1075,7 +1078,7 @@ mod tests {
             cache.flow_node_realm_cache.peek(&FlowId(1)),
             Some(&GmodRealm::Server)
         );
-        assert!(cache.narrow_by_literal_stop_position_cache.is_empty());
+        assert!(cache.field_literal_narrowing.is_empty());
     }
 
     #[test]
@@ -1087,12 +1090,12 @@ mod tests {
         );
         let mut cache = LuaInferCache::new(file_id, Default::default());
         cache
-            .narrow_by_literal_stop_position_cache
-            .insert(syntax_id);
+            .field_literal_narrowing
+            .insert(syntax_id, crate::db_index::derivation::ScopeMark::default());
 
         cache.clear();
 
-        assert!(cache.narrow_by_literal_stop_position_cache.is_empty());
+        assert!(cache.field_literal_narrowing.is_empty());
     }
 
     #[test]
