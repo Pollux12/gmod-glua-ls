@@ -172,6 +172,13 @@ pub fn profiling() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("GLUALS_PROFILE").is_some())
 }
 
+/// When `GLUALS_TRACE_EVALUATIONS` is set, the engine prints every derivation
+/// it evaluates with the key that queued it and the reads that moved.
+pub fn tracing_evaluations() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("GLUALS_TRACE_EVALUATIONS").is_some())
+}
+
 #[allow(unused)]
 impl<'a> Profile<'a> {
     pub fn new(name: &'a str) -> Self {

@@ -191,6 +191,9 @@ fn replace_files(
             {
                 continue;
             }
+            if crate::profile::tracing_evaluations() {
+                eprintln!("[trace] foreign producer {producer:?} of {file_id:?}");
+            }
             match producer.kind {
                 derivation::DerivationKind::Source => engine.source_stale(producer.file_id),
                 _ => engine.changed(producer),
@@ -298,6 +301,9 @@ fn follow_edits(
             .into_iter()
             .collect::<Vec<_>>();
         lost.sort();
+        if crate::profile::tracing_evaluations() {
+            eprintln!("[trace] remap of {file_id:?} lost positions in {lost:?}");
+        }
         for lost_file in lost {
             let ids = db
                 .reader_graph()
@@ -309,6 +315,9 @@ fn follow_edits(
         }
     }
     for reader in db.reader_graph_mut().apply_edits(edits) {
+        if crate::profile::tracing_evaluations() {
+            eprintln!("[trace] a read of {reader:?} names a destroyed position");
+        }
         rerun(engine, reader);
     }
     touched

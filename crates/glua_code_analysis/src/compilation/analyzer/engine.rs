@@ -191,6 +191,9 @@ pub(crate) struct Engine {
     /// Stage rules that moved since the key table was last lent: memos that
     /// read them no longer hold.
     moved_rules: std::cell::RefCell<Vec<HashedKey>>,
+    /// Under `GLUALS_TRACE_EVALUATIONS`: the key that first queued each
+    /// reader, and the derivation that moved it.
+    queued_by: FxHashMap<DerivationId, (HashedKey, Option<DerivationId>)>,
 }
 
 impl Engine {
@@ -321,12 +324,20 @@ impl Engine {
             .collect::<Vec<_>>();
         for reader in readers {
             self.stats.requeued(key, self.cursor, reader);
+            if crate::profile::tracing_evaluations() {
+                self.queued_by
+                    .entry(reader)
+                    .or_insert_with(|| (key.clone(), self.cursor));
+            }
             match reader.kind {
                 DerivationKind::Diagnostics => {}
                 _ if self.waits(reader) => {
                     self.waiting.insert(reader);
                 }
                 DerivationKind::Source => {
+                    if crate::profile::tracing_evaluations() {
+                        self.trace(db, reader, "source stale", &[]);
+                    }
                     self.stale_sources.insert(reader.file_id);
                 }
                 _ => self.queue(reader, Reason::Read),
@@ -401,6 +412,7 @@ impl Engine {
             if !stale {
                 continue;
             }
+            self.trace_evaluation(db, id, reason);
             let group = crate::profile::phase("engine: co-producers", || co_producers(db, id));
             if group.len() == 1 && recipe.splits(id.kind) {
                 self.run_batch(db, id, recipe);
@@ -508,6 +520,9 @@ impl Engine {
             }
             let mut queued = 0;
             for reader in waited {
+                if crate::profile::tracing_evaluations() {
+                    self.trace(db, reader, "stage barrier queues", &[]);
+                }
                 match reader.kind {
                     DerivationKind::Diagnostics => {}
                     DerivationKind::Source => {
@@ -535,8 +550,16 @@ impl Engine {
         self.focus.clear();
         let mut queued = 0;
         for reader in std::mem::take(&mut self.waiting) {
+            let moved = if crate::profile::tracing_evaluations() {
+                self.moved_reads(db, reader)
+            } else {
+                Vec::new()
+            };
             if !self.needs_evaluation(db, reader, Reason::Read) {
                 continue;
+            }
+            if crate::profile::tracing_evaluations() {
+                self.trace(db, reader, "released", &moved);
             }
             if reader.kind == DerivationKind::Source {
                 self.stale_sources.insert(reader.file_id);
@@ -601,6 +624,56 @@ impl Engine {
         })
     }
 
+    /// Under `GLUALS_TRACE_EVALUATIONS`, prints `id`'s file, why it was queued
+    /// and which of its recorded reads no longer hold.
+    fn trace_evaluation(&self, db: &DbIndex, id: DerivationId, reason: Reason) {
+        if crate::profile::tracing_evaluations() {
+            self.trace(
+                db,
+                id,
+                &format!("evaluate reason={reason:?}"),
+                &self.moved_reads(db, id),
+            );
+        }
+    }
+
+    /// `id`'s recorded reads that hold neither as they are nor with the edits
+    /// mapped back, for the trace.
+    fn moved_reads(&self, db: &DbIndex, id: DerivationId) -> Vec<String> {
+        let graph = db.reader_graph();
+        graph
+            .reads_of(id)
+            .zip(graph.recorded_slots(id))
+            .filter(|(key, (_, seen))| {
+                !key.is_stage_rule()
+                    && *seen != self.fingerprint(db, key)
+                    && (self.edits.is_empty() || *seen != self.fingerprint_before_edits(db, key))
+            })
+            .map(|(key, _)| format!("{:?}", key.key()))
+            .collect()
+    }
+
+    /// Prints one traced event of a derivation outside the files being
+    /// re-analysed.
+    fn trace(&self, db: &DbIndex, id: DerivationId, event: &str, moved: &[String]) {
+        if self.focus.contains(&id.file_id) {
+            return;
+        }
+        let path = db
+            .get_vfs()
+            .get_file_path(&id.file_id)
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        let queued_by = self
+            .queued_by
+            .get(&id)
+            .map(|(key, writer)| format!("{:?} by {writer:?}", key.key()));
+        eprintln!(
+            "[trace] {event} {id:?} {path} stage={:?} queued_by={queued_by:?} moved={moved:?}",
+            db.analysis_stage()
+        );
+    }
+
     /// Evaluates `first` with every derivation of its kind queued right after
     /// it that has to run, computing them concurrently: none reads what
     /// another writes, so each sees what it would have run alone.
@@ -611,6 +684,7 @@ impl Engine {
             if !self.needs_evaluation(db, id, reason) {
                 continue;
             }
+            self.trace_evaluation(db, id, reason);
             if co_producers(db, id).len() == 1 {
                 batch.push(id);
             } else {
