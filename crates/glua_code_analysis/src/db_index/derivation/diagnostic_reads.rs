@@ -8,6 +8,14 @@ use crate::FileId;
 /// An interned read key: its index into [`DiagnosticReads::readers`].
 type ReadKey = u32;
 
+/// The keys read out of one base key, and the base's fingerprint when they
+/// were last checked: none of them moved while the base did not.
+#[derive(Debug, Clone, Default)]
+struct Derived {
+    keys: Vec<ReadKey>,
+    checked_at: Option<Fingerprint>,
+}
+
 /// What each file's last diagnostics read, so an analysis run knows which
 /// files to diagnose again: those whose recorded reads moved.
 ///
@@ -24,7 +32,7 @@ pub struct DiagnosticReads {
     readers: Paged<Vec<FileId>>,
     files: FxHashMap<FileId, Box<[(ReadKey, Fingerprint)]>>,
     /// The keys read out of each base key ([`FactKey::base`]).
-    derived: FxHashMap<ReadKey, Vec<ReadKey>>,
+    derived: FxHashMap<ReadKey, Derived>,
     /// The keys naming positions in each file, which an edit of it renames.
     positional: FxHashMap<FileId, FxHashSet<ReadKey>>,
     /// Released slots.
@@ -151,7 +159,7 @@ impl DiagnosticReads {
             || self
                 .derived
                 .get(&key)
-                .is_some_and(|derived| !derived.is_empty())
+                .is_some_and(|derived| !derived.keys.is_empty())
         {
             return;
         }
@@ -168,7 +176,7 @@ impl DiagnosticReads {
     /// nothing reads it or out of it.
     fn leave_base(&mut self, key: ReadKey, base: ReadKey) {
         if let Some(derived) = self.derived.get_mut(&base) {
-            derived.retain(|derived| *derived != key);
+            derived.keys.retain(|derived| *derived != key);
         }
         self.release_if_unread(base);
     }
@@ -201,7 +209,7 @@ impl DiagnosticReads {
             }
             if let Some(base) = base {
                 let base = self.intern(base);
-                self.derived.entry(base).or_default().push(index);
+                self.derived.entry(base).or_default().keys.push(index);
             }
         }
     }
@@ -227,7 +235,9 @@ impl DiagnosticReads {
             }
         }
         if let Some(derived) = self.derived.remove(&from) {
-            self.derived.entry(into).or_default().extend(derived);
+            let into = self.derived.entry(into).or_default();
+            into.keys.extend(derived.keys);
+            into.checked_at = None;
         }
         let base = self.key_values[from as usize].key().base();
         self.free.push(from);
@@ -254,26 +264,44 @@ impl DiagnosticReads {
     /// the same file compares against it.
     pub fn stale_files<'a>(
         &mut self,
-        touched: impl IntoIterator<Item = &'a FactKey>,
-        current: impl Fn(&FactKey) -> Fingerprint,
-        before_edits: impl Fn(&FactKey) -> Option<Fingerprint>,
+        touched: impl IntoIterator<Item = &'a HashedKey>,
+        current: impl Fn(&HashedKey) -> Fingerprint,
+        before_edits: impl Fn(&HashedKey) -> Option<Fingerprint>,
     ) -> Vec<FileId> {
         let mut stale = FxHashSet::default();
         let mut moved = Vec::new();
+        let mut checked = Vec::new();
         for key in touched {
-            let Some(index) = self.find(key) else {
+            let Some(index) = self.find_hashed(key) else {
                 continue;
             };
             self.check_reads(index, key, &current, &before_edits, &mut stale, &mut moved);
-            for derived in self.derived.get(&index).into_iter().flatten() {
+            let Some(derived) = self
+                .derived
+                .get(&index)
+                .filter(|derived| !derived.keys.is_empty())
+            else {
+                continue;
+            };
+            let now = current(key);
+            if derived.checked_at == Some(now) {
+                continue;
+            }
+            for derived in &derived.keys {
                 self.check_reads(
                     *derived,
-                    self.key_values[*derived as usize].key(),
+                    &self.key_values[*derived as usize],
                     &current,
                     &before_edits,
                     &mut stale,
                     &mut moved,
                 );
+            }
+            checked.push((index, now));
+        }
+        for (index, now) in checked {
+            if let Some(derived) = self.derived.get_mut(&index) {
+                derived.checked_at = Some(now);
             }
         }
         for (file_id, index, now) in moved {
@@ -293,9 +321,9 @@ impl DiagnosticReads {
     fn check_reads(
         &self,
         index: ReadKey,
-        key: &FactKey,
-        current: &dyn Fn(&FactKey) -> Fingerprint,
-        before_edits: &dyn Fn(&FactKey) -> Option<Fingerprint>,
+        key: &HashedKey,
+        current: &dyn Fn(&HashedKey) -> Fingerprint,
+        before_edits: &dyn Fn(&HashedKey) -> Option<Fingerprint>,
         stale: &mut FxHashSet<FileId>,
         moved: &mut Vec<(FileId, ReadKey, Fingerprint)>,
     ) {
@@ -313,11 +341,21 @@ impl DiagnosticReads {
                 Some(seen) if held_moved(seen) => moved.push((*file_id, index, now)),
                 _ => {
                     if stale.insert(*file_id) && crate::profile::tracing_evaluations() {
-                        eprintln!("[trace] diagnostics of {file_id:?} stale by {key:?}");
+                        eprintln!(
+                            "[trace] diagnostics of {file_id:?} stale by {:?}",
+                            key.key()
+                        );
                     }
                 }
             }
         }
+    }
+
+    /// The index `key` is interned to, by the hash it carries.
+    fn find_hashed(&self, key: &HashedKey) -> Option<ReadKey> {
+        self.keys
+            .find(key.hash, |index| self.key_values[*index as usize] == *key)
+            .copied()
     }
 
     /// The index `key` is interned to.
@@ -348,7 +386,7 @@ impl DiagnosticReads {
         self.file(index);
         if let Some(base) = base {
             let base = self.intern(base);
-            self.derived.entry(base).or_default().push(index);
+            self.derived.entry(base).or_default().keys.push(index);
         }
         index
     }
@@ -425,7 +463,11 @@ local a = 1
 
     fn stale_after_edit(reads: &mut DiagnosticReads, now: Fingerprint) -> Vec<FileId> {
         reads.apply_edits(&lengthen_first_line());
-        reads.stale_files([&decl_in_edited_file(20)], |_| now, |_| None)
+        reads.stale_files(
+            [&HashedKey::new(decl_in_edited_file(20))],
+            |_| now,
+            |_| None,
+        )
     }
 
     #[test]
@@ -455,10 +497,18 @@ local a = 1
         let mut reads = DiagnosticReads::default();
         reads.record(reader(), vec![(decl_in_edited_file(18), SEEN)]);
         reads.apply_edits(&lengthen_first_line());
-        reads.stale_files([&decl_in_edited_file(20)], |_| SEEN + 1, |_| Some(SEEN));
+        reads.stale_files(
+            [&HashedKey::new(decl_in_edited_file(20))],
+            |_| SEEN + 1,
+            |_| Some(SEEN),
+        );
 
         reads.apply_edits(&lengthen_first_line_again());
-        let stale = reads.stale_files([&decl_in_edited_file(22)], |_| SEEN + 2, |_| Some(SEEN + 1));
+        let stale = reads.stale_files(
+            [&HashedKey::new(decl_in_edited_file(22))],
+            |_| SEEN + 2,
+            |_| Some(SEEN + 1),
+        );
 
         assert_eq!(stale, Vec::<FileId>::new());
     }
@@ -472,8 +522,16 @@ local a = 1
         reads.record(other_reader(), vec![(decl_in_edited_file(20), SEEN + 5)]);
         reads.apply_edits(&lengthen_first_line());
 
-        let moved_first = reads.stale_files([&decl_in_edited_file(20)], |_| SEEN, |_| None);
-        let moved_second = reads.stale_files([&decl_in_edited_file(22)], |_| SEEN + 5, |_| None);
+        let moved_first = reads.stale_files(
+            [&HashedKey::new(decl_in_edited_file(20))],
+            |_| SEEN,
+            |_| None,
+        );
+        let moved_second = reads.stale_files(
+            [&HashedKey::new(decl_in_edited_file(22))],
+            |_| SEEN + 5,
+            |_| None,
+        );
 
         assert_eq!((moved_first, moved_second), (Vec::new(), Vec::new()));
     }
@@ -526,6 +584,34 @@ local a = 1
             "{}",
             reads.census()
         );
+    }
+
+    /// A base whose value did not move since its derived keys were last
+    /// checked moved none of them either.
+    #[test]
+    fn a_base_touched_at_the_value_it_was_checked_at_checks_no_derived_key() {
+        let mut reads = DiagnosticReads::default();
+        let base = FactKey::GmodRealm(edited());
+        let derived = (0..10)
+            .map(|offset| (FactKey::GmodRealmAt(edited(), TextSize::new(offset)), SEEN))
+            .collect::<Vec<_>>();
+        reads.record(reader(), derived);
+        let checks = std::cell::Cell::new(0);
+        let mut check = || {
+            reads.stale_files(
+                [&HashedKey::new(base.clone())],
+                |_| {
+                    checks.set(checks.get() + 1);
+                    SEEN
+                },
+                |_| None,
+            )
+        };
+        check();
+        let first = checks.replace(0);
+        check();
+
+        assert_eq!((first, checks.get()), (11, 1));
     }
 
     #[test]

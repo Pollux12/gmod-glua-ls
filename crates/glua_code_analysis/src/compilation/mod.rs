@@ -355,8 +355,11 @@ fn stale_diagnostic_files(
     edits: &derivation::EditMaps,
 ) -> Vec<FileId> {
     reads.stale_files(
-        touched.iter().map(|key| key.key()),
-        |key| db.fact_fingerprint(key),
+        touched,
+        |key| {
+            db.reader_graph()
+                .current_fingerprint(key, |key| db.fact_fingerprint(key))
+        },
         |key| {
             (!edits.is_empty())
                 .then(|| derivation::fingerprint_before_edits(edits, || db.fact_fingerprint(key)))
