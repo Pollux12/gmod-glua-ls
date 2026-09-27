@@ -141,16 +141,16 @@ pub fn get_type_at_flow_with_origin(
     }
     // Reuse one allocation across queries; nested walks (through merge
     // points) get a throwaway buffer while this one is checked out.
-    crate::profile::work::computed(
-        crate::profile::work::Work::Flow,
+    crate::profile::work::computed(crate::profile::work::Work::Flow, || {
         (
             cache.get_file_id(),
             flow_id,
             &cache_key,
             query_realm,
             policy.origin,
-        ),
-    );
+            cache.keyed_origin(&cache_key),
+        )
+    });
     let (mut visited_flow_ids, scratch_owned) = cache.take_flow_walk_scratch();
     let frame = crate::db_index::derivation::open_frame_absorbing(LuaInferCache::flow_context_key(
         &cache_key,

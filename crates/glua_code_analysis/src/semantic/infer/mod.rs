@@ -176,10 +176,9 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
         }
     }
 
-    crate::profile::work::computed(
-        crate::profile::work::Work::Infer,
-        (cache.get_file_id(), key),
-    );
+    crate::profile::work::computed(crate::profile::work::Work::Infer, || {
+        (cache.get_file_id(), key)
+    });
     let frame = crate::db_index::derivation::open_frame();
     let (result, stored) = infer_expr_miss(db, cache, expr, key);
     let provenance = cache.close_frame(frame);

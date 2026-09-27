@@ -64,11 +64,11 @@ fn counting() -> bool {
 
 /// Counts one `work` computed for `key`, under the current derivation's kind.
 #[inline]
-pub(crate) fn computed(work: Work, key: impl Hash) {
+pub(crate) fn computed<K: Hash>(work: Work, key: impl FnOnce() -> K) {
     if !counting() {
         return;
     }
-    let hash = FxBuildHasher.hash_one(key);
+    let hash = FxBuildHasher.hash_one(key());
     let kind = derivation::current().map(|id| id.kind);
     TABLE.with(|table| {
         let mut table = lock(table);

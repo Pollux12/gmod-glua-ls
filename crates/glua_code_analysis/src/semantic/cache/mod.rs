@@ -929,6 +929,20 @@ impl LuaInferCache {
         }
     }
 
+    /// The origin walks of `cache_key` start from, when they are keyed by one:
+    /// an index ref's member type or a `self` seed.
+    pub(crate) fn keyed_origin(&self, cache_key: &VarRefCacheKey) -> Option<&LuaType> {
+        if let Some((CacheEntry::Cache(origin), _)) =
+            self.index_ref_origin_type_cache.get(cache_key)
+        {
+            return Some(origin);
+        }
+        self.self_base_seed
+            .as_ref()
+            .filter(|(seed_ref, _)| VarRefCacheKey::from(seed_ref) == *cache_key)
+            .map(|(_, seed)| seed)
+    }
+
     /// The context key flow walks of `cache_key` absorb reads of.
     pub(crate) fn flow_context_key(cache_key: &VarRefCacheKey) -> u64 {
         use std::hash::BuildHasher;
