@@ -200,7 +200,9 @@ impl DiagnosticReads {
                 Some(seen) if seen == now => {}
                 Some(seen) if held_moved(seen) => moved.push((*file_id, index, now)),
                 _ => {
-                    stale.insert(*file_id);
+                    if stale.insert(*file_id) && crate::profile::tracing_evaluations() {
+                        eprintln!("[trace] diagnostics of {file_id:?} stale by {key:?}");
+                    }
                 }
             }
         }
