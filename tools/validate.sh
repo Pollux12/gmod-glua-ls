@@ -57,10 +57,9 @@ cache_check() { # name dir: GLUALS_CHECK_TSC mismatches must be 0
   [ "$n" -eq 0 ]
 }
 
-gate() { # dir file find replace; the gate checks its own copy cold: results
-  # depend on where the workspace sits relative to the annotations
+gate() { # dir file find replace reference: the corpus step's glua_check of the same build
   LSP_SERVER="$REL/glua_ls$X" GLUA_CHECK="$REL/glua_check$X" LSP_CODEBASE="$1" LSP_ANNOTATIONS="$ANN" node tools/lsp_drift.js --file "$2" \
-    --edit-find "$3" --edit-replace "$4"
+    --edit-find "$3" --edit-replace "$4" --reference "$5"
 }
 
 # Target edits: path<TAB>find<TAB>replace, \n escaped.
@@ -97,7 +96,7 @@ if [ "$TIER" = change ] || [ "$TIER" = phase ]; then
   fi
   step vb_corpus corpus vb "$VB"
   step vb_det det "$VB" 4 DET_EDITS="$OUT/vb.edits" DET_ONLY="$VB_FILE" DET_STAGES=split:2,shift,$TARGET_STAGES
-  step vb_gate gate "$VB" "$VB_FILE" "$VB_FIND" "$VB_REPLACE"
+  step vb_gate gate "$VB" "$VB_FILE" "$VB_FIND" "$VB_REPLACE" "$OUT/vb.json"
   [ -n "${CHECK_CACHE:-}" ] && step vb_cache cache_check vb "$VB"
 fi
 
@@ -105,7 +104,7 @@ if [ "$TIER" = step ]; then
   CR=${GLUALS_CITYRP:?GLUALS_CITYRP is required}
   step cityrp_corpus corpus cityrp "$CR"
   step cityrp_det det "$CR" 2 DET_EDITS="$OUT/cityrp.edits" DET_ONLY="$CR_FILE" DET_STAGES=$TARGET_STAGES
-  step cityrp_gate gate "$CR" "$CR_FILE" "$CR_FIND" "$CR_REPLACE"
+  step cityrp_gate gate "$CR" "$CR_FILE" "$CR_FIND" "$CR_REPLACE" "$OUT/cityrp.json"
   [ -n "${CHECK_CACHE:-}" ] && step cityrp_cache cache_check cityrp "$CR"
 fi
 
@@ -120,7 +119,7 @@ if [ "$TIER" = phase ]; then
   step cityrp_corpus corpus cityrp "$CR"
   step cityrp_det det "$CR" 2 DET_EDITS="$OUT/cityrp.edits" DET_HUBS=5 DET_ONLY="$CR_CORE" \
     DET_STAGES=$TARGET_STAGES,shift,rename
-  step cityrp_gate gate "$CR" "$CR_FILE" "$CR_FIND" "$CR_REPLACE"
+  step cityrp_gate gate "$CR" "$CR_FILE" "$CR_FIND" "$CR_REPLACE" "$OUT/cityrp.json"
   [ -n "${CHECK_CACHE:-}" ] && step cityrp_cache cache_check cityrp "$CR"
   wait $SUITES || FAILED=1
   echo "== suites:"; grep -hE "test result|FAILED|panicked" "$OUT/suite_fingerprints.log" "$OUT/suite_ls.log" | head
