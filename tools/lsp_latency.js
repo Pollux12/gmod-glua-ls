@@ -13,6 +13,7 @@
 //                             [--edit code|comment]
 //                             [--edit-find TEXT --edit-replace TEXT]
 //                             [--completion-find TEXT]
+//                             [--other relative/path.lua]
 //
 // --edit-find/--edit-replace swap one snippet back and forth on every edit, so
 // a specific real change to real code can be reproduced. --completion-find puts
@@ -24,6 +25,10 @@
 // --edit comment inserts a comment line instead: cheaper, and useful for
 // isolating offset-shift cost, but an optimisation that only helps this case
 // has not made real typing any faster.
+//
+// --other opens a second document and hovers it every 25 ms while each edit
+// of the target settles, keeping the slowest answer: no request should wait
+// long on an edit to another file, however far that edit's ripple goes.
 //
 // LSP_SERVER overrides the binary (default: target/dist/glua_ls[.exe] if built,
 // else target/release/glua_ls[.exe] — see defaultServerPath, and prefer `dist`).
@@ -49,7 +54,7 @@ const CONTENT_MODIFIED = -32801;
 function parseArgs(argv) {
     const opts = {
         json: false, runs: 5, file: null, edit: 'code',
-        editFind: null, editReplace: null, completionFind: null,
+        editFind: null, editReplace: null, completionFind: null, other: null,
     };
     for (let i = 2; i < argv.length; i++) {
         const a = argv[i];
@@ -60,6 +65,7 @@ function parseArgs(argv) {
         else if (a === '--edit-find') opts.editFind = argv[++i];
         else if (a === '--edit-replace') opts.editReplace = argv[++i];
         else if (a === '--completion-find') opts.completionFind = argv[++i];
+        else if (a === '--other') opts.other = argv[++i];
         else throw new Error(`unknown argument: ${a}`);
     }
     if (opts.edit !== 'code' && opts.edit !== 'comment') {
@@ -366,6 +372,18 @@ async function main() {
     client.notify('textDocument/didOpen', {
         textDocument: { uri, languageId: 'lua', version, text },
     });
+
+    let other = null;
+    if (opts.other !== null) {
+        const otherPath = path.resolve(codebase, opts.other);
+        if (!fs.existsSync(otherPath)) throw new Error(`--other file not found: ${otherPath}`);
+        const otherText = fs.readFileSync(otherPath, 'utf8');
+        other = { uri: fileUri(otherPath), position: memberAccessPosition(otherText) };
+        client.notify('textDocument/didOpen', {
+            textDocument: { uri: other.uri, languageId: 'lua', version: 1, text: otherText },
+        });
+        report.otherFile = path.relative(codebase, otherPath);
+    }
     await sleep(1500);
 
     // `--completion-find` puts the cursor immediately after a given snippet, so
@@ -392,6 +410,7 @@ async function main() {
     const editToFresh = [];
     const cancelledPulls = [];
     const completionDrift = [];
+    const otherHoverWhileSettling = [];
     let previousResultId;
 
     const labelsOf = (items) =>
@@ -520,6 +539,28 @@ async function main() {
         highlightAfterEdit.push(Date.now() - highlightStarted);
         highlightRetries.push(highlightRetried);
 
+        // Another document while an edit settles: hover it every 25 ms from
+        // the keystroke until every request the edit owes is answered, and
+        // keep the slowest.
+        if (other) {
+            await waitUntilQuiet();
+            editDocument();
+            const settled = client.request('workspace/diagnostic', { previousResultIds: [] });
+            let done = false;
+            settled.then(() => { done = true; });
+            let worst = 0;
+            const until = Date.now() + 5000;
+            while (!done && Date.now() < until) {
+                const hovered = await client.request('textDocument/hover', {
+                    textDocument: { uri: other.uri }, position: other.position,
+                });
+                worst = Math.max(worst, hovered.ms);
+                await sleep(25);
+            }
+            await settled;
+            otherHoverWhileSettling.push(worst);
+        }
+
         // Keystroke to the first answer any index-reading handler can give.
         editDocument();
         const fresh = await client.request('textDocument/diagnostic', {
@@ -607,6 +648,9 @@ async function main() {
     report.measurements.highlightAfterEdit = summarise(highlightAfterEdit);
     report.checks.highlightRetries = highlightRetries.reduce((a, b) => a + b, 0);
     report.measurements.editToFreshAnswer = summarise(editToFresh);
+    if (otherHoverWhileSettling.length > 0) {
+        report.measurements.otherHoverWhileSettling = summarise(otherHoverWhileSettling);
+    }
     report.checks.thinReportsOnCancel =
         cancelledPulls.filter((p) => p.thinFullReport).length;
     // A mid-edit completion that differs from the settled one is a correctness
@@ -637,6 +681,7 @@ async function main() {
         ['completion (concurrent)', report.measurements.completionWhileTypingConcurrent],
         ['highlight after edit', report.measurements.highlightAfterEdit],
         ['edit -> fresh answer', report.measurements.editToFreshAnswer],
+        ['other doc hover (worst)', report.measurements.otherHoverWhileSettling],
         ['edit -> all work done', report.measurements.editToAllWorkDone],
         ['workspace sweep', report.measurements.workspaceSweep],
     ];
