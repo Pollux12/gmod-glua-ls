@@ -96,8 +96,8 @@ pub fn open_frame() -> Option<OpenFrame> {
 /// Opens a frame whose memo is keyed by the context `absorbs` names: a read
 /// of that context inside it taints only the frames nested in it.
 pub fn open_frame_absorbing(absorbs: u64) -> Option<OpenFrame> {
-    let stamp = next_stamp();
     with_evaluation(|evaluation, _| {
+        let stamp = next_stamp();
         let depth = evaluation.frames.len() as u32;
         evaluation.frames.push(Frame {
             start: u32::try_from(evaluation.log.len()).expect("fewer than 2^32 reads"),

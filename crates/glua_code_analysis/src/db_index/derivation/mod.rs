@@ -1040,7 +1040,6 @@ pub(crate) fn records_read(
 
 thread_local! {
     static KEYS: RefCell<Option<KeyTable>> = const { RefCell::new(None) };
-    static STAMP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static LAST_WRITE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CURRENT: RefCell<Option<Evaluation>> = const { RefCell::new(None) };
     /// Evaluations suspended on this thread by one begun inside them.
@@ -1143,8 +1142,8 @@ fn start(evaluation: Evaluation) {
 /// Continues recording an evaluation that [`end`] handed back, for a
 /// derivation evaluated in stages.
 pub fn resume(mut evaluation: Evaluation) {
-    // Stamps are per thread: one taken on another thread can name an
-    // evaluation this thread already ran.
+    // Slots other evaluations logged since it began would read as logged by
+    // it.
     evaluation.stamp = next_stamp();
     // Identities noted without this thread's key table name no slot in it.
     evaluation.read_identities.clear();
@@ -1184,12 +1183,13 @@ pub fn note_read(key: impl FnOnce() -> FactKey) {
     });
 }
 
+/// Orders every evaluation, frame and write on every thread: a key table keeps
+/// the stamps its slots were logged and written at from one re-analysis to the
+/// next, and the next may run on another thread.
+static STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn next_stamp() -> u64 {
-    STAMP.with(|stamp| {
-        let next = stamp.get() + 1;
-        stamp.set(next);
-        next
-    })
+    STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
 /// The stamp of the latest write an evaluation made on this thread.
@@ -1198,7 +1198,7 @@ fn last_write() -> u64 {
 }
 
 fn latest_stamp() -> u64 {
-    STAMP.with(std::cell::Cell::get)
+    STAMP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Evaluation {

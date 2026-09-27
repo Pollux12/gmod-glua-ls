@@ -1493,6 +1493,62 @@ mod tests {
         );
     }
 
+    /// The editor re-analyses on whichever pool thread is free: a reader
+    /// re-evaluated on a thread that never ran an evaluation keeps what it
+    /// read, so the next edit still reaches it.
+    #[test]
+    fn a_reader_re_evaluated_on_a_fresh_thread_still_follows_the_next_edit() {
+        const MIDDLE: &str = "Relayed = Chain.value";
+        const CONSUMER: &str = "local observed = Relayed";
+        const FINAL_PROVIDER: &str = "Chain = { value = true }";
+
+        let mut warm = VirtualWorkspace::new_with_init_std_lib();
+        let provider_uri = warm.virtual_url_generator.new_uri("lua/a_provider.lua");
+        let middle_uri = warm.virtual_url_generator.new_uri("lua/b_middle.lua");
+        let consumer_uri = warm.virtual_url_generator.new_uri("lua/c_consumer.lua");
+        warm.analysis.update_files_by_uri(vec![
+            (
+                provider_uri.clone(),
+                Some("Chain = { value = 1 }".to_string()),
+            ),
+            (middle_uri, Some(MIDDLE.to_string())),
+            (consumer_uri.clone(), Some(CONSUMER.to_string())),
+        ]);
+        let consumer = warm
+            .analysis
+            .get_file_id(&consumer_uri)
+            .expect("consumer file id");
+        for text in ["Chain = { value = \"text\" }", FINAL_PROVIDER] {
+            std::thread::scope(|scope| {
+                std::thread::Builder::new()
+                    .stack_size(64 << 20)
+                    .spawn_scoped(scope, || write_deferred(&mut warm, &provider_uri, text))
+                    .expect("edit thread")
+                    .join()
+                    .expect("edit on a fresh thread");
+            });
+        }
+
+        let mut fresh = VirtualWorkspace::new_with_init_std_lib();
+        let fresh_provider_uri = fresh.virtual_url_generator.new_uri("lua/a_provider.lua");
+        let fresh_middle_uri = fresh.virtual_url_generator.new_uri("lua/b_middle.lua");
+        let fresh_consumer_uri = fresh.virtual_url_generator.new_uri("lua/c_consumer.lua");
+        fresh.analysis.update_files_by_uri(vec![
+            (fresh_provider_uri, Some(FINAL_PROVIDER.to_string())),
+            (fresh_middle_uri, Some(MIDDLE.to_string())),
+            (fresh_consumer_uri.clone(), Some(CONSUMER.to_string())),
+        ]);
+        let fresh_consumer = fresh
+            .analysis
+            .get_file_id(&fresh_consumer_uri)
+            .expect("fresh consumer file id");
+
+        assert_eq!(
+            decl_type(&warm, consumer, "observed"),
+            decl_type(&fresh, fresh_consumer, "observed")
+        );
+    }
+
     #[test]
     fn member_addition_refreshes_cross_file_failed_lookup_consumers() {
         const CONSUMER: &str = "local observed = Provider.value";
