@@ -1184,6 +1184,11 @@ impl LuaModuleIndex {
         candidate
     }
 
+    /// Every workspace root, with its id and kind.
+    pub fn workspaces(&self) -> &[Workspace] {
+        &self.workspaces
+    }
+
     #[allow(unused)]
     pub fn remove_workspace_root(&mut self, root: &Path) {
         self.workspaces.retain(|r| r.root != root);

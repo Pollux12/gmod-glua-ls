@@ -143,28 +143,6 @@ fn path_key(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
-/// Ordering key `update_files_by_uri` sorts on before assigning file ids:
-/// the path round-tripped through its URI, normalized like
-/// `normalize_path_for_ordering` (which is crate-private). The reservation
-/// pass in `build_cold` has to allocate ids in exactly this order or every
-/// file's id shifts.
-fn uri_order_key(path: &Path) -> String {
-    let Some(uri) = glua_code_analysis::file_path_to_uri(&path.to_path_buf()) else {
-        return String::new();
-    };
-    let mut normalized = glua_code_analysis::uri_to_file_path(&uri)
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|| uri.as_str().to_string());
-    while normalized.ends_with('/') {
-        normalized.pop();
-    }
-    #[cfg(target_os = "windows")]
-    {
-        normalized = normalized.to_lowercase();
-    }
-    normalized
-}
-
 fn file_uri(path: &Path) -> lsp_types::Uri {
     glua_code_analysis::file_path_to_uri(&path.to_path_buf())
         .unwrap_or_else(|| panic!("cannot build URI for {}", path.display()))
@@ -249,7 +227,8 @@ fn build_cold(
         assert_eq!(matched, 1, "override did not match one workspace file");
     }
     if !input.removed.is_empty() || !input.created.is_empty() {
-        files.sort_by_cached_key(|(path, _)| uri_order_key(path));
+        let vfs = analysis.compilation.get_db().get_vfs();
+        files.sort_by_cached_key(|(path, _)| vfs.order_key_for_path(path));
         let vfs = analysis.compilation.get_db_mut().get_vfs_mut();
         for (path, _) in &files {
             vfs.set_file_content(&file_uri(path), None);
@@ -270,7 +249,7 @@ fn build_cold(
             vfs.remove_file(&file_uri(path));
         }
         let mut created = input.created.clone();
-        created.sort_by_cached_key(|(path, _)| uri_order_key(path));
+        created.sort_by_cached_key(|(path, _)| vfs.order_key_for_path(path));
         for (path, text) in created {
             vfs.set_file_content(&file_uri(&path), None);
             files.push((path, Some(text)));

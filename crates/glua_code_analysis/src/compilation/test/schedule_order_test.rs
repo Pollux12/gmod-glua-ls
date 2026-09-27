@@ -61,7 +61,8 @@ mod test {
                             .iter()
                             .map(|(path, text)| (ws.virtual_url_generator.new_uri(path), text))
                             .collect::<Vec<_>>();
-                        texts.sort_by_cached_key(|(uri, _)| crate::uri_sort_key(uri));
+                        let vfs = ws.analysis.compilation.get_db().get_vfs();
+                        texts.sort_by_cached_key(|(uri, _)| vfs.order_key_for_uri(uri));
                         let file_ids = texts
                             .into_iter()
                             .map(|(uri, text)| {

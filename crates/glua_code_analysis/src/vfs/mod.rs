@@ -18,19 +18,22 @@ use lsp_types::Uri;
 use rowan::NodeCache;
 use rowan::TextRange;
 use rustc_hash::FxHashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 pub use virtual_url::VirtualUrlGenerator;
 
-use crate::{Emmyrc, PositionMap};
+use crate::{Emmyrc, PositionMap, WorkspaceKind};
 
 #[derive(Debug)]
 pub struct Vfs {
     file_id_map: FxHashMap<PathBuf, u32>,
     file_path_map: FxHashMap<u32, PathBuf>,
-    /// Each file's [`Vfs::file_order_key`], normalized once when the file is
-    /// first named.
+    /// Each file's [`Vfs::file_order_key`], made when the file is first named
+    /// and again whenever the workspace roots change.
     file_order_keys: FxHashMap<u32, Arc<str>>,
+    /// Normalized workspace roots with their load tier, longest first; see
+    /// [`Vfs::order_key_for_path`].
+    order_roots: Vec<(String, u8)>,
     remote_file_id_map: FxHashMap<Uri, FileId>,
     file_data: Vec<Option<FileContent>>,
     line_index_map: FxHashMap<FileId, LineIndex>,
@@ -119,6 +122,7 @@ impl Clone for Vfs {
             file_id_map: self.file_id_map.clone(),
             file_path_map: self.file_path_map.clone(),
             file_order_keys: self.file_order_keys.clone(),
+            order_roots: self.order_roots.clone(),
             remote_file_id_map: self.remote_file_id_map.clone(),
             file_data: self.file_data.clone(),
             line_index_map: self.line_index_map.clone(),
@@ -137,6 +141,7 @@ impl Vfs {
             file_id_map: FxHashMap::default(),
             file_path_map: FxHashMap::default(),
             file_order_keys: FxHashMap::default(),
+            order_roots: Vec::new(),
             remote_file_id_map: FxHashMap::default(),
             file_data: Vec::new(),
             line_index_map: FxHashMap::default(),
@@ -168,10 +173,8 @@ impl Vfs {
         } else {
             let id = self.file_data.len() as u32;
             self.file_id_map.insert(path.clone(), id);
-            self.file_order_keys.insert(
-                id,
-                Arc::from(normalize_path_for_ordering(&path.to_string_lossy())),
-            );
+            self.file_order_keys
+                .insert(id, Arc::from(self.order_key_for_path(&path)));
             self.file_path_map.insert(id, path);
             self.file_data.push(None);
             FileId { id }
@@ -203,7 +206,8 @@ impl Vfs {
         self.file_path_map.get(&id.id)
     }
 
-    /// The file's place in a stable cross-file ordering.
+    /// The file's place in a stable cross-file ordering; see
+    /// [`Vfs::order_key_for_path`].
     ///
     /// File ids are handed out in whatever order a batch reached the files, so
     /// they are not the same between a cold build and an incremental session.
@@ -215,6 +219,57 @@ impl Vfs {
             .get(&id.id)
             .cloned()
             .unwrap_or_else(|| Arc::from(""))
+    }
+
+    /// Sets the workspace roots with their load tier and re-keys every file.
+    pub fn set_order_roots(&mut self, roots: impl IntoIterator<Item = (PathBuf, u8)>) {
+        let mut roots = roots
+            .into_iter()
+            .map(|(root, tier)| (normalize_path_for_ordering(&root.to_string_lossy()), tier))
+            .collect::<Vec<_>>();
+        roots.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.cmp(b)));
+        self.order_roots = roots;
+        let keys = self
+            .file_path_map
+            .iter()
+            .map(|(id, path)| (*id, Arc::from(self.order_key_for_path(path))))
+            .collect::<Vec<_>>();
+        self.file_order_keys.extend(keys);
+    }
+
+    /// Where a file at `path` goes in the order files load and elect writes:
+    /// by the load tier of the workspace it belongs to (the std lib, then
+    /// annotations and other libraries, then main workspaces), then by that
+    /// workspace's root, then by its path within the root. Where the
+    /// workspaces sit on disk decides nothing but the order of two roots of
+    /// one tier.
+    pub fn order_key_for_path(&self, path: &Path) -> String {
+        let normalized = normalize_path_for_ordering(&path.to_string_lossy());
+        let (root, tier) = self
+            .order_roots
+            .iter()
+            .find(|(root, _)| {
+                normalized.len() > root.len()
+                    && normalized.starts_with(root.as_str())
+                    && normalized.as_bytes()[root.len()] == b'/'
+            })
+            .map_or(("", WorkspaceKind::MERGE_RANK_NONE), |(root, tier)| {
+                (root.as_str(), *tier)
+            });
+        format!("{tier}\u{1}{root}\u{1}{}", &normalized[root.len()..])
+    }
+
+    /// [`Vfs::order_key_for_path`] for a URI; one that names no path sorts by
+    /// its text, after every file.
+    pub fn order_key_for_uri(&self, uri: &Uri) -> String {
+        match uri_to_file_path(uri) {
+            Some(path) => self.order_key_for_path(&path),
+            None => format!(
+                "{}\u{1}{}",
+                WorkspaceKind::MERGE_RANK_NONE + 1,
+                uri.as_str()
+            ),
+        }
     }
 
     /// Whether `data` parses to the same significant token stream (kind,

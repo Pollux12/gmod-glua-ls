@@ -45,17 +45,6 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 pub use vfs::*;
 
-/// Ordering key for a file that has no id yet.
-///
-/// The batch entry points sort their input before anything is added to the VFS,
-/// so they cannot use [`Vfs::file_order_key`]; a URI that does not name a path
-/// falls back to its own text.
-fn uri_sort_key(uri: &Uri) -> String {
-    uri_to_file_path(uri)
-        .map(|path| crate::vfs::normalize_path_for_ordering(&path.to_string_lossy()))
-        .unwrap_or_else(|| uri.as_str().to_string())
-}
-
 /// Stack size for any thread that runs analysis.
 ///
 /// Inference and the type-graph walks recurse to the depth of the source, which
@@ -275,6 +264,19 @@ impl EmmyLuaAnalysis {
         self.init_std_lib_from_files(std_root, files);
     }
 
+    /// Hands the workspace roots and their load tiers to the VFS, which orders
+    /// files by them.
+    fn sync_file_order(&mut self) {
+        let db = self.compilation.get_db_mut();
+        let roots = db
+            .get_module_index()
+            .workspaces()
+            .iter()
+            .map(|workspace| (workspace.root.clone(), workspace.kind.merge_rank()))
+            .collect::<Vec<_>>();
+        db.get_vfs_mut().set_order_roots(roots);
+    }
+
     /// Register a pre-built set of embedded std files directly into the analysis
     /// workspace without going through the resource-loading pipeline.
     pub(crate) fn init_std_lib_from_files(&mut self, std_root: PathBuf, files: Vec<LuaFileInfo>) {
@@ -282,6 +284,7 @@ impl EmmyLuaAnalysis {
             .get_db_mut()
             .get_module_index_mut()
             .add_workspace_root_with_kind(std_root, WorkspaceId::STD, WorkspaceKind::Std);
+        self.sync_file_order();
 
         let files = files
             .into_iter()
@@ -311,6 +314,7 @@ impl EmmyLuaAnalysis {
             id: module_index.next_main_workspace_id(),
         };
         module_index.add_workspace_root_with_kind(root, id, WorkspaceKind::Main);
+        self.sync_file_order();
     }
 
     pub fn add_library_workspace(&mut self, root: PathBuf) {
@@ -320,6 +324,7 @@ impl EmmyLuaAnalysis {
             id: module_index.next_library_workspace_id(),
         };
         module_index.add_workspace_root_with_kind(root, id, WorkspaceKind::Library);
+        self.sync_file_order();
     }
 
     /// Sets `uri`'s text (`None` removes it) and re-analyses. Returns the file
@@ -497,7 +502,8 @@ impl EmmyLuaAnalysis {
     /// winning, and re-analyses what changed.
     pub fn apply_file_system_changes(&mut self, files: Vec<(Uri, Option<String>)>) -> Vec<FileId> {
         let mut files = files;
-        files.sort_by_cached_key(|(uri, _)| uri_sort_key(uri));
+        let vfs = self.compilation.get_db().get_vfs();
+        files.sort_by_cached_key(|(uri, _)| vfs.order_key_for_uri(uri));
         let mut latest: Vec<(Uri, Option<String>)> = Vec::with_capacity(files.len());
         for (uri, text) in files {
             match latest.last_mut() {

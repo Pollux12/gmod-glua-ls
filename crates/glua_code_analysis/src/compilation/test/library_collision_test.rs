@@ -527,4 +527,35 @@ mod tests {
             "Choice<integer> must violate the earlier library's `T: string` constraint"
         );
     }
+
+    /// Annotations load, and elect writes, ahead of the workspace, as the std
+    /// lib does, wherever the two sit on disk: here the library's path sorts
+    /// after the workspace's files.
+    #[test]
+    fn an_annotation_file_orders_before_every_workspace_file_wherever_it_lives() {
+        let mut ws = VirtualWorkspace::new();
+        let library_root = ws.virtual_url_generator.new_path("zz_annotations");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("gm.lua")).unwrap();
+        let (library_file, _) = ws
+            .analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    "---@class GM
+"
+                    .to_string(),
+                ),
+            )
+            .expect("the library file is indexed");
+        let workspace_file = ws.def_file(
+            "gamemode/core/sv_hooks.lua",
+            "local hooks = {}
+",
+        );
+
+        let vfs = ws.analysis.compilation.get_db().get_vfs();
+        assert!(vfs.file_order_key(&library_file) < vfs.file_order_key(&workspace_file));
+    }
 }
