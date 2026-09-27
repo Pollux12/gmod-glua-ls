@@ -288,9 +288,10 @@ impl Reanalysis {
         self.engine.prioritise(file_ids);
     }
 
-    /// Whether `file_id` has work still to settle.
+    /// Whether `file_id` has work still to settle. Until a pass opens, what
+    /// its rebuild moved has not queued its readers, so every file may.
     pub(crate) fn is_settling(&self, file_id: FileId) -> bool {
-        self.engine.is_settling(file_id)
+        matches!(self.pass, Some(Pass::Replaced { .. })) || self.engine.is_settling(file_id)
     }
 
     /// Whether `file_id` still settles ahead of the rest.
