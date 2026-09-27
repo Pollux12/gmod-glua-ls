@@ -115,7 +115,9 @@ impl LuaCompilation {
             }
         }
         // Diagnostics recorded from here on read the new positions.
-        reads.apply_edits(&edits);
+        crate::profile::phase("reanalyze: diagnostic reads follow edits", || {
+            reads.apply_edits(&edits)
+        });
         let reanalysis = self
             .reanalysis
             .get_mut()
