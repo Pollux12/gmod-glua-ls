@@ -50,6 +50,29 @@ mod test {
         );
     }
 
+    /// `include` takes a path relative to the including file before one
+    /// relative to `lua/`, so every entity's `include("shared.lua")` reaches
+    /// its own `shared.lua`.
+    #[gtest]
+    fn a_relative_include_resolves_next_to_the_including_file() {
+        let mut ws = VirtualWorkspace::new();
+        let alpha_shared = ws.def_file("lua/entities/alpha/shared.lua", "return {}");
+        let beta_shared = ws.def_file("lua/entities/beta/shared.lua", "return {}");
+        ws.def_file("lua/entities/alpha/init.lua", "include(\"shared.lua\")\n");
+        let beta_init = ws.def_file("lua/entities/beta/init.lua", "include(\"shared.lua\")\n");
+
+        let dependency_index = ws.get_db_mut().get_file_dependencies_index();
+
+        expect_that!(
+            dependency_index.get_dependency_kinds(&beta_init, &beta_shared),
+            some(unordered_elements_are![eq(&LuaDependencyKind::Include)])
+        );
+        expect_that!(
+            dependency_index.get_dependency_kinds(&beta_init, &alpha_shared),
+            none()
+        );
+    }
+
     #[gtest]
     fn test_annotated_load_call_adds_dependency_edge() {
         let mut ws = VirtualWorkspace::new();

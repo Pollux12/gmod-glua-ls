@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use glua_parser::{
     LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaCallExprStat, LuaClosureExpr,
     LuaDocTagCast, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLiteralExpr,
@@ -413,7 +411,12 @@ pub fn analyze_call_expr(analyzer: &mut DeclAnalyzer, expr: LuaCallExpr) -> Opti
     let file_id = analyzer.get_file_id();
 
     let dependency_file_id = if let Some(ref path) = dependency_path {
-        resolve_dependency_file_id(analyzer, file_id, dependency_kind, path)
+        crate::compilation::analyzer::gmod::resolve_load_dependency_target(
+            analyzer.db,
+            file_id,
+            dependency_kind,
+            path,
+        )
     } else if dependency_kind == LuaDependencyKind::AddCSLuaFile
         && dependency_call_has_no_args(&expr)
     {
@@ -681,60 +684,4 @@ fn get_static_string_arg(expr: &LuaCallExpr) -> Option<String> {
         return None;
     };
     Some(string_token.get_value())
-}
-
-fn resolve_dependency_file_id(
-    analyzer: &DeclAnalyzer,
-    file_id: FileId,
-    dependency_kind: LuaDependencyKind,
-    dependency_path: &str,
-) -> Option<FileId> {
-    let module_index = analyzer.db.get_module_index();
-    match dependency_kind {
-        LuaDependencyKind::Require => module_index
-            .find_module_for_file(dependency_path, file_id)
-            .map(|it| it.file_id),
-        LuaDependencyKind::Include
-        | LuaDependencyKind::CompileFile
-        | LuaDependencyKind::AddCSLuaFile
-        | LuaDependencyKind::IncludeCS => {
-            resolve_gmod_include_file_id(analyzer, file_id, dependency_path).or_else(|| {
-                module_index
-                    .find_module_for_file(dependency_path, file_id)
-                    .map(|it| it.file_id)
-            })
-        }
-    }
-}
-
-fn resolve_gmod_include_file_id(
-    analyzer: &DeclAnalyzer,
-    file_id: FileId,
-    dependency_path: &str,
-) -> Option<FileId> {
-    let normalized_path = dependency_path.replace('\\', "/");
-    let normalized_path = normalized_path.trim_start_matches("./");
-    let normalized_no_ext = normalized_path
-        .strip_suffix(".lua")
-        .unwrap_or(normalized_path);
-
-    let module_index = analyzer.db.get_module_index();
-    let root_module_path = normalized_no_ext.replace('/', ".");
-    if let Some(module_info) = module_index.find_module_for_file(&root_module_path, file_id) {
-        return Some(module_info.file_id);
-    }
-
-    if let Some(path_without_lua_prefix) = normalized_no_ext.strip_prefix("lua/") {
-        let module_path = path_without_lua_prefix.replace('/', ".");
-        if let Some(module_info) = module_index.find_module_for_file(&module_path, file_id) {
-            return Some(module_info.file_id);
-        }
-    }
-
-    let current_file_path = analyzer.db.get_vfs().get_file_path(&file_id)?;
-    let parent_dir = current_file_path.parent()?;
-    let include_file_path = parent_dir.join(Path::new(normalized_path));
-    module_index
-        .find_module_by_path_for_file(&include_file_path, file_id)
-        .map(|it| it.file_id)
 }

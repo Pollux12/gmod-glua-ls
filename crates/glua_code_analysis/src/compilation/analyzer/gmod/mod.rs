@@ -12433,7 +12433,9 @@ fn resolve_load_dependency_site(db: &DbIndex, mut site: LuaDependencySite) -> Lu
     site
 }
 
-fn resolve_load_dependency_target(
+/// The file a `require`, `include`, `AddCSLuaFile`, `CompileFile` or
+/// `IncludeCS` of `dependency_path` in `source_file_id` loads.
+pub(crate) fn resolve_load_dependency_target(
     db: &DbIndex,
     source_file_id: FileId,
     dependency_kind: LuaDependencyKind,
@@ -12457,6 +12459,8 @@ fn resolve_load_dependency_target(
     }
 }
 
+/// Garry's Mod looks a loaded path up next to the including file first, then
+/// under the `lua/` roots.
 fn resolve_load_include_target(
     db: &DbIndex,
     source_file_id: FileId,
@@ -12469,25 +12473,30 @@ fn resolve_load_include_target(
         .unwrap_or(normalized_path);
 
     let module_index = db.get_module_index();
+    if let Some(module_info) = db
+        .get_vfs()
+        .get_file_path(&source_file_id)
+        .and_then(|path| path.parent())
+        .and_then(|parent_dir| {
+            module_index.find_module_by_path_for_file(
+                &parent_dir.join(Path::new(normalized_path)),
+                source_file_id,
+            )
+        })
+    {
+        return Some(module_info.file_id);
+    }
+
     let root_module_path = normalized_no_ext.replace('/', ".");
     if let Some(module_info) = module_index.find_module_for_file(&root_module_path, source_file_id)
     {
         return Some(module_info.file_id);
     }
 
-    if let Some(path_without_lua_prefix) = normalized_no_ext.strip_prefix("lua/") {
-        let module_path = path_without_lua_prefix.replace('/', ".");
-        if let Some(module_info) = module_index.find_module_for_file(&module_path, source_file_id) {
-            return Some(module_info.file_id);
-        }
-    }
-
-    let current_file_path = db.get_vfs().get_file_path(&source_file_id)?;
-    let parent_dir = current_file_path.parent()?;
-    let include_file_path = parent_dir.join(Path::new(normalized_path));
+    let path_without_lua_prefix = normalized_no_ext.strip_prefix("lua/")?;
     module_index
-        .find_module_by_path_for_file(&include_file_path, source_file_id)
-        .map(|module| module.file_id)
+        .find_module_for_file(&path_without_lua_prefix.replace('/', "."), source_file_id)
+        .map(|module_info| module_info.file_id)
 }
 
 fn mark_load_root(
