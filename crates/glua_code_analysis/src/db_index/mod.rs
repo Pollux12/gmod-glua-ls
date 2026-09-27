@@ -470,9 +470,12 @@ impl DbIndex {
             K::GmodMeta(_) | K::GmodClassFile(_) | K::VguiChain(_) | K::VguiParentCallFiles => {
                 self.gmod_class_index.fact_fingerprint(key)
             }
-            K::GmodInferFile(_) | K::GmodRealm(_) | K::GmodInferScan | K::GmodSystem(..) => {
-                self.gmod_infer_index.fact_fingerprint(key)
-            }
+            K::GmodInferFile(_)
+            | K::GmodRealm(_)
+            | K::GmodRealmAt(..)
+            | K::GmodMemberRealmAt(..)
+            | K::GmodInferScan
+            | K::GmodSystem(..) => self.gmod_infer_index.fact_fingerprint(key),
             K::GmodLoadFile(_) => self.gmod_load_index.fact_fingerprint(key),
             K::NetworkFile(_) | K::NetworkScan | K::NetHelperName(_) => {
                 self.gmod_network_index.fact_fingerprint(key)

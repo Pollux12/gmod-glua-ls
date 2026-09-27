@@ -17,6 +17,8 @@ pub struct DiagnosticReads {
     /// The files that read each key, sorted.
     readers: Vec<Vec<FileId>>,
     files: FxHashMap<FileId, Box<[(ReadKey, Fingerprint)]>>,
+    /// The keys read out of each base key ([`FactKey::base`]).
+    derived: FxHashMap<ReadKey, Vec<(ReadKey, FactKey)>>,
 }
 
 impl DiagnosticReads {
@@ -150,22 +152,16 @@ impl DiagnosticReads {
             let Some(&index) = self.keys.get(key) else {
                 continue;
             };
-            let readers = &self.readers[index as usize];
-            if readers.is_empty() {
-                continue;
-            }
-            let now = current(key);
-            let before = std::cell::OnceCell::new();
-            let held_moved =
-                |seen: Fingerprint| *before.get_or_init(|| before_edits(key)) == Some(seen);
-            for file_id in readers {
-                match seen_in(&self.files[file_id], index) {
-                    Some(seen) if seen == now => {}
-                    Some(seen) if held_moved(seen) => moved.push((*file_id, index, now)),
-                    _ => {
-                        stale.insert(*file_id);
-                    }
-                }
+            self.check_reads(index, key, &current, &before_edits, &mut stale, &mut moved);
+            for (derived, derived_key) in self.derived.get(&index).into_iter().flatten() {
+                self.check_reads(
+                    *derived,
+                    derived_key,
+                    &current,
+                    &before_edits,
+                    &mut stale,
+                    &mut moved,
+                );
             }
         }
         for (file_id, index, now) in moved {
@@ -180,12 +176,49 @@ impl DiagnosticReads {
         stale
     }
 
+    /// Adds to `stale` the files whose read of `key`, interned as `index`, no
+    /// longer holds, and to `moved` the reads that held only through the edits.
+    fn check_reads(
+        &self,
+        index: ReadKey,
+        key: &FactKey,
+        current: &dyn Fn(&FactKey) -> Fingerprint,
+        before_edits: &dyn Fn(&FactKey) -> Option<Fingerprint>,
+        stale: &mut FxHashSet<FileId>,
+        moved: &mut Vec<(FileId, ReadKey, Fingerprint)>,
+    ) {
+        let readers = &self.readers[index as usize];
+        if readers.is_empty() {
+            return;
+        }
+        let now = current(key);
+        let before = std::cell::OnceCell::new();
+        let held_moved =
+            |seen: Fingerprint| *before.get_or_init(|| before_edits(key)) == Some(seen);
+        for file_id in readers {
+            match seen_in(&self.files[file_id], index) {
+                Some(seen) if seen == now => {}
+                Some(seen) if held_moved(seen) => moved.push((*file_id, index, now)),
+                _ => {
+                    stale.insert(*file_id);
+                }
+            }
+        }
+    }
+
     fn intern(&mut self, key: FactKey) -> ReadKey {
         if let Some(&index) = self.keys.get(&key) {
             return index;
         }
         let index = self.readers.len() as ReadKey;
         self.readers.push(Vec::new());
+        if let Some(base) = key.base() {
+            let base = self.intern(base);
+            self.derived
+                .entry(base)
+                .or_default()
+                .push((index, key.clone()));
+        }
         self.keys.insert(key, index);
         index
     }

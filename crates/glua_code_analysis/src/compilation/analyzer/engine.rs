@@ -257,8 +257,12 @@ impl Engine {
             return;
         }
         for (key, cached) in db.reader_graph().cached_fingerprints() {
+            let excepted = except.contains(key)
+                || key
+                    .base()
+                    .is_some_and(|base| except.contains(&HashedKey::new(base)));
             assert!(
-                except.contains(key) || cached == db.fact_fingerprint(key),
+                excepted || cached == db.fact_fingerprint(key),
                 "{key:?} moved without being written while {}",
                 step()
             );
@@ -291,32 +295,41 @@ impl Engine {
         &self.stats
     }
 
-    /// Queues the readers of `keys` whose recorded fingerprint differs from
-    /// the current value.
+    /// Queues the readers of `keys`, and of every key read out of them, whose
+    /// recorded fingerprint differs from the current value.
     pub(crate) fn readers_of<'a>(
         &mut self,
         db: &DbIndex,
         keys: impl IntoIterator<Item = &'a HashedKey>,
     ) {
         for key in keys {
-            self.before_edits.get_mut().remove(key);
-            self.touched.insert(key.clone());
-            let readers = db
-                .reader_graph()
-                .stale_readers(key, self.key_holds(db, key))
-                .collect::<Vec<_>>();
-            for reader in readers {
-                self.stats.requeued(key, self.cursor, reader);
-                match reader.kind {
-                    DerivationKind::Diagnostics => {}
-                    _ if self.waits(reader) => {
-                        self.waiting.insert(reader);
-                    }
-                    DerivationKind::Source => {
-                        self.stale_sources.insert(reader.file_id);
-                    }
-                    _ => self.queue(reader, Reason::Read),
+            self.queue_readers(db, key);
+            for derived in db.reader_graph().derived_keys(key) {
+                self.queue_readers(db, &derived);
+            }
+        }
+    }
+
+    /// Queues the readers of `key` whose recorded fingerprint differs from its
+    /// current value.
+    fn queue_readers(&mut self, db: &DbIndex, key: &HashedKey) {
+        self.before_edits.get_mut().remove(key);
+        self.touched.insert(key.clone());
+        let readers = db
+            .reader_graph()
+            .stale_readers(key, self.key_holds(db, key))
+            .collect::<Vec<_>>();
+        for reader in readers {
+            self.stats.requeued(key, self.cursor, reader);
+            match reader.kind {
+                DerivationKind::Diagnostics => {}
+                _ if self.waits(reader) => {
+                    self.waiting.insert(reader);
                 }
+                DerivationKind::Source => {
+                    self.stale_sources.insert(reader.file_id);
+                }
+                _ => self.queue(reader, Reason::Read),
             }
         }
     }
@@ -754,7 +767,11 @@ impl Engine {
                 .flat_map(|evaluation| evaluation.outputs().chain(evaluation.moved())),
         ) {
             db.reader_graph().forget_fingerprint(key);
-            self.before_edits.borrow_mut().remove(key);
+            let mut before_edits = self.before_edits.borrow_mut();
+            before_edits.remove(key);
+            for derived in db.reader_graph().derived_keys(key) {
+                before_edits.remove(&derived);
+            }
         }
         self.verify_fingerprints(db, touched, step);
         // Out of the index while its records are replaced, so the reads can be

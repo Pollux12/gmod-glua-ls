@@ -292,6 +292,12 @@ pub enum FactKey {
     GmodInferFile(FileId),
     /// A file's realm as the workspace load graph decided it.
     GmodRealm(FileId),
+    /// The realm and state mask at one offset of a file, read out of its
+    /// [`FactKey::GmodRealm`].
+    GmodRealmAt(FileId, TextSize),
+    /// The `---@realm` annotation covering one offset of a file, read out of
+    /// its [`FactKey::GmodInferFile`].
+    GmodMemberRealmAt(FileId, TextSize),
     /// The gmod realm and hook aggregates across files.
     GmodInferScan,
     /// The gmod system registrations of one kind under one name, across files.
@@ -608,6 +614,17 @@ impl FactKey {
         }
     }
 
+    /// The key this one is read out of: writing the base moves every key read
+    /// out of it, so each reader re-checks its own part and re-runs only when
+    /// that part changed.
+    pub fn base(&self) -> Option<FactKey> {
+        match self {
+            FactKey::GmodRealmAt(file_id, _) => Some(FactKey::GmodRealm(*file_id)),
+            FactKey::GmodMemberRealmAt(file_id, _) => Some(FactKey::GmodInferFile(*file_id)),
+            _ => None,
+        }
+    }
+
     /// The file whose slot the key names, or `None` for a workspace-wide key.
     /// Removing that file's facts removes whatever any derivation stored under
     /// the key.
@@ -622,6 +639,7 @@ impl FactKey {
             }
             K::Member(member_id) => Some(member_id.file_id),
             K::NetHelper(site) => Some(site.file_id),
+            K::GmodRealmAt(file_id, _) | K::GmodMemberRealmAt(file_id, _) => Some(*file_id),
             K::MemberSlot(owner, _)
             | K::MemberOwnerMap(owner)
             | K::MemberOwnerExprKeys(owner)
@@ -1270,6 +1288,21 @@ pub fn note_type_generic_params_read(decl_id: &LuaTypeDeclId) {
 /// An exact identity for a position in a file.
 fn file_position(file_id: FileId, position: TextSize) -> u128 {
     u128::from(file_id.id) << 32 | u128::from(u32::from(position))
+}
+
+/// Records a read of the realm at `offset` in `file_id`.
+pub fn note_realm_at_read(file_id: FileId, offset: TextSize) {
+    note_read_by((u8::MAX - 9, file_position(file_id, offset)), || {
+        FactKey::GmodRealmAt(file_id, offset)
+    });
+}
+
+/// Records a read of the `---@realm` annotation covering `offset` in
+/// `file_id`.
+pub fn note_member_realm_at_read(file_id: FileId, offset: TextSize) {
+    note_read_by((u8::MAX - 10, file_position(file_id, offset)), || {
+        FactKey::GmodMemberRealmAt(file_id, offset)
+    });
 }
 
 /// An exact identity for a member.

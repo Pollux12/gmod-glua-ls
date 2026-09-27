@@ -167,6 +167,12 @@ impl EditMaps {
             K::SpecialCall(file_id, position) => {
                 K::SpecialCall(*file_id, self.position(*file_id, *position)?)
             }
+            K::GmodRealmAt(file_id, offset) => {
+                K::GmodRealmAt(*file_id, self.position(*file_id, *offset)?)
+            }
+            K::GmodMemberRealmAt(file_id, offset) => {
+                K::GmodMemberRealmAt(*file_id, self.position(*file_id, *offset)?)
+            }
             K::DynamicFieldWildcards(DynamicFieldOwner::Table(site)) => {
                 K::DynamicFieldWildcards(DynamicFieldOwner::Table(self.site(site)?))
             }

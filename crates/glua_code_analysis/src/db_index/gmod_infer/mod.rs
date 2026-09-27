@@ -536,6 +536,16 @@ impl GmodInferIndex {
             FactKey::GmodRealm(file_id) => {
                 derivation::fingerprint_opt(self.realm_file_metadata.get(file_id))
             }
+            FactKey::GmodMemberRealmAt(file_id, offset) => derivation::fingerprint_of(
+                &member_realm_at(self.member_realm_ranges.get(file_id), *offset),
+            ),
+            FactKey::GmodRealmAt(file_id, offset) => {
+                let metadata = self.realm_file_metadata.get(file_id);
+                derivation::fingerprint_of(&(
+                    realm_at(metadata, *offset),
+                    state_mask_at(metadata, *offset),
+                ))
+            }
             FactKey::GmodInferScan if derivation::mapping_back() => {
                 self.recomputed_scan_fingerprint()
             }
@@ -823,22 +833,8 @@ impl GmodInferIndex {
     /// If the offset is inside a branch-narrowed block, returns that block's realm.
     /// Otherwise returns the file-level inferred realm, or annotation realm if inferred is Unknown.
     pub fn get_realm_at_offset(&self, file_id: &FileId, offset: rowan::TextSize) -> GmodRealm {
-        derivation::note_file_fact_read(derivation::FileFact::GmodRealm, *file_id);
-        let Some(metadata) = self.realm_file_metadata.get(file_id) else {
-            return GmodRealm::Unknown;
-        };
-        // Check branch ranges (most specific first)
-        for range in &metadata.branch_realm_ranges {
-            if range.range.contains(offset) {
-                return range.realm;
-            }
-        }
-        // If inferred realm is known, use it
-        if metadata.inferred_realm != GmodRealm::Unknown {
-            return metadata.inferred_realm;
-        }
-        // Fall back to annotation realm (for meta/annotation files)
-        metadata.annotation_realm.unwrap_or(GmodRealm::Unknown)
+        derivation::note_realm_at_read(*file_id, offset);
+        realm_at(self.realm_file_metadata.get(file_id), offset)
     }
 
     pub fn get_state_mask_at_offset(
@@ -846,24 +842,8 @@ impl GmodInferIndex {
         file_id: &FileId,
         offset: rowan::TextSize,
     ) -> GmodStateMask {
-        derivation::note_file_fact_read(derivation::FileFact::GmodRealm, *file_id);
-        let Some(metadata) = self.realm_file_metadata.get(file_id) else {
-            return GmodStateMask::empty();
-        };
-        let file_mask = file_state_mask(metadata);
-
-        for range in &metadata.branch_realm_ranges {
-            if range.range.contains(offset) {
-                let branch_mask = range.realm.state_mask();
-                if file_mask.is_empty() {
-                    return branch_mask;
-                }
-
-                return branch_mask.intersection(file_mask);
-            }
-        }
-
-        file_mask
+        derivation::note_realm_at_read(*file_id, offset);
+        state_mask_at(self.realm_file_metadata.get(file_id), offset)
     }
 
     pub fn are_state_masks_compatible(left: GmodStateMask, right: GmodStateMask) -> bool {
@@ -968,20 +948,8 @@ impl GmodInferIndex {
         file_id: &FileId,
         offset: rowan::TextSize,
     ) -> Option<GmodRealm> {
-        derivation::note_file_fact_read(derivation::FileFact::GmodInferFile, *file_id);
-        let ranges = self.member_realm_ranges.get(file_id)?;
-        let idx = match ranges.binary_search_by_key(&offset, |r| r.range.start()) {
-            Ok(i) => i,
-            Err(i) => i.saturating_sub(1),
-        };
-        for i in [idx, idx.saturating_sub(1)] {
-            if let Some(r) = ranges.get(i)
-                && r.range.contains(offset)
-            {
-                return Some(r.realm);
-            }
-        }
-        None
+        derivation::note_member_realm_at_read(*file_id, offset);
+        member_realm_at(self.member_realm_ranges.get(file_id), offset)
     }
 
     pub fn set_file_params(&mut self, file_id: FileId, params: Vec<(String, String)>) {
@@ -1151,6 +1119,66 @@ fn gm_method_scan_fingerprint(
     method_realms: &[(String, GmodRealm)],
 ) -> Fingerprint {
     scan_elements(GM_METHOD_REALM, file_id, method_realms)
+}
+
+/// The `---@realm` among a file's sorted member realm `ranges` covering
+/// `offset`.
+fn member_realm_at(
+    ranges: Option<&Vec<GmodRealmRange>>,
+    offset: rowan::TextSize,
+) -> Option<GmodRealm> {
+    let ranges = ranges?;
+    let idx = match ranges.binary_search_by_key(&offset, |r| r.range.start()) {
+        Ok(i) => i,
+        Err(i) => i.saturating_sub(1),
+    };
+    [idx, idx.saturating_sub(1)]
+        .into_iter()
+        .filter_map(|i| ranges.get(i))
+        .find(|r| r.range.contains(offset))
+        .map(|r| r.realm)
+}
+
+/// The realm at `offset` of a file with realm `metadata`: its branch's when
+/// the offset sits in a branch-narrowed block, else the file's inferred realm,
+/// else its annotation realm.
+fn realm_at(metadata: Option<&GmodRealmFileMetadata>, offset: rowan::TextSize) -> GmodRealm {
+    let Some(metadata) = metadata else {
+        return GmodRealm::Unknown;
+    };
+    if let Some(range) = metadata
+        .branch_realm_ranges
+        .iter()
+        .find(|range| range.range.contains(offset))
+    {
+        return range.realm;
+    }
+    if metadata.inferred_realm != GmodRealm::Unknown {
+        return metadata.inferred_realm;
+    }
+    metadata.annotation_realm.unwrap_or(GmodRealm::Unknown)
+}
+
+/// The state mask at `offset` of a file with realm `metadata`: its branch's
+/// realm within the file's states when the offset sits in a branch-narrowed
+/// block, else the file's.
+fn state_mask_at(
+    metadata: Option<&GmodRealmFileMetadata>,
+    offset: rowan::TextSize,
+) -> GmodStateMask {
+    let Some(metadata) = metadata else {
+        return GmodStateMask::empty();
+    };
+    let file_mask = file_state_mask(metadata);
+    match metadata
+        .branch_realm_ranges
+        .iter()
+        .find(|range| range.range.contains(offset))
+    {
+        Some(range) if file_mask.is_empty() => range.realm.state_mask(),
+        Some(range) => range.realm.state_mask().intersection(file_mask),
+        None => file_mask,
+    }
 }
 
 fn normalize_system_name(name: Option<&str>) -> Option<&str> {

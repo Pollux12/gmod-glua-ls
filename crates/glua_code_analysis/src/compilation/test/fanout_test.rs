@@ -116,6 +116,78 @@ end
         );
     }
 
+    /// A realm branch added to a shared file changes the realm only inside the
+    /// branch, so a file whose reads fall outside it stands.
+    #[test]
+    fn a_realm_branch_added_to_a_shared_file_re_runs_nothing_in_its_readers() {
+        let mut workspace = cityrp_workspace();
+
+        workspace.edit_configuration(
+            "cityrp.configuration[\"Walk Speed\"] = 100\n",
+            "cityrp.configuration[\"Walk Speed\"] = 100\n\nif SERVER then\n    cityrp.realmProbe = 1\nend\n",
+        );
+
+        assert_eq!(workspace.evaluated_files(), vec![workspace.configuration]);
+    }
+
+    /// Wrapping a value in a realm branch moves the realm its readers see, so
+    /// they run again.
+    #[test]
+    fn wrapping_a_value_in_a_realm_branch_re_runs_its_reader() {
+        let mut workspace = cityrp_workspace();
+        let movement = workspace
+            .ws
+            .analysis
+            .get_file_id(&workspace.ws.virtual_url_generator.new_uri(MOVEMENT));
+
+        workspace.edit_configuration(
+            "cityrp.configuration[\"Walk Speed\"] = 100
+",
+            "if SERVER then
+    cityrp.configuration[\"Walk Speed\"] = 100
+end
+",
+        );
+
+        assert!(
+            workspace
+                .evaluated_files()
+                .contains(&movement.expect("movement file"))
+        );
+    }
+
+    /// The realm read at one offset follows the load graph: another file
+    /// starting to send a server file to clients re-runs a client file that
+    /// uses it, though neither of the two was edited.
+    #[test]
+    fn a_realm_the_load_graph_changes_re_runs_a_reader_at_that_offset() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/utils.lua",
+            "Utils = Utils or {}\nfunction Utils.Ping() return 1 end\n",
+        );
+        ws.def_file("lua/sv_init.lua", "include(\"utils.lua\")\n");
+        let reader = ws.def_file(
+            "lua/autorun/client/cl_use.lua",
+            "local pinged = Utils.Ping()\n",
+        );
+
+        ws.def_file(
+            "lua/sv_init.lua",
+            "include(\"utils.lua\")\nAddCSLuaFile(\"utils.lua\")\n",
+        );
+
+        assert!(
+            ws.analysis
+                .compilation
+                .last_evaluated_files()
+                .contains(&reader)
+        );
+    }
+
     #[test]
     fn a_config_type_change_re_runs_only_its_readers() {
         let mut workspace = cityrp_workspace();

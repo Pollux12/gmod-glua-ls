@@ -122,6 +122,8 @@ pub struct KeyTable {
     key_slots: FxHashMap<HashedKey, KeyIdx>,
     keys: Vec<KeySlot>,
     free_keys: Vec<KeyIdx>,
+    /// The keys read out of each base key ([`FactKey::base`]).
+    derived: FxHashMap<KeyIdx, Vec<KeyIdx>>,
 }
 
 impl KeyTable {
@@ -138,6 +140,7 @@ impl KeyTable {
                 KeyIdx::try_from(self.keys.len() - 1).expect("fewer than 2^32 fact keys")
             }
         };
+        let base = key.base();
         let entry = &mut self.keys[slot as usize];
         entry.key = Some(key.clone());
         entry.stamp = 0;
@@ -146,6 +149,10 @@ impl KeyTable {
             .current_generation
             .store(NO_GENERATION, Ordering::Relaxed);
         self.key_slots.insert(key, slot);
+        if let Some(base) = base {
+            let base = self.intern(HashedKey::new(base), now);
+            self.derived.entry(base).or_default().push(slot);
+        }
         slot
     }
 
@@ -166,10 +173,14 @@ impl KeyTable {
         (entry.key.clone(), entry.written)
     }
 
-    /// Marks `key` written at stamp `now`, if anything ever read it.
+    /// Marks `key` written at stamp `now`, if anything ever read it, and every
+    /// key read out of it.
     pub(super) fn mark_written(&mut self, key: &HashedKey, now: u64) {
-        if let Some(slot) = self.key_slots.get(key) {
-            self.keys[*slot as usize].written = now;
+        if let Some(&slot) = self.key_slots.get(key) {
+            self.keys[slot as usize].written = now;
+            for derived in self.derived.get(&slot).into_iter().flatten() {
+                self.keys[*derived as usize].written = now;
+            }
         }
     }
 
@@ -322,13 +333,30 @@ impl ReaderGraph {
         current
     }
 
-    /// Forgets `key`'s cached fingerprint: its value may have moved.
+    /// Forgets the cached fingerprints of `key` and of every key read out of
+    /// it: their values may have moved.
     pub fn forget_fingerprint(&self, key: &HashedKey) {
         if let Some(slot) = self.table.key_slots.get(key) {
-            self.table.keys[*slot as usize]
-                .current_generation
-                .store(NO_GENERATION, Ordering::Relaxed);
+            for slot in
+                std::iter::once(slot).chain(self.table.derived.get(slot).into_iter().flatten())
+            {
+                self.table.keys[*slot as usize]
+                    .current_generation
+                    .store(NO_GENERATION, Ordering::Relaxed);
+            }
         }
+    }
+
+    /// The keys read out of `key` ([`FactKey::base`]) that something reads.
+    pub fn derived_keys(&self, key: &HashedKey) -> Vec<HashedKey> {
+        self.table
+            .key_slots
+            .get(key)
+            .and_then(|slot| self.table.derived.get(slot))
+            .into_iter()
+            .flatten()
+            .map(|slot| self.key(*slot).clone())
+            .collect()
     }
 
     /// Forgets every cached fingerprint.
@@ -776,13 +804,30 @@ impl ReaderGraph {
     /// written after every memo, so none replays it.
     fn release_key(&mut self, slot: KeyIdx) {
         let entry = &mut self.table.keys[slot as usize];
-        if !entry.readers.is_empty() || !entry.producers.is_empty() {
+        if !entry.readers.is_empty()
+            || !entry.producers.is_empty()
+            || self.table.derived.contains_key(&slot)
+        {
             return;
         }
-        if let Some(key) = entry.key.take() {
-            entry.written = u64::MAX;
-            self.table.key_slots.remove(&key);
-            self.table.free_keys.push(slot);
+        let Some(key) = entry.key.take() else {
+            return;
+        };
+        entry.written = u64::MAX;
+        self.table.key_slots.remove(&key);
+        self.table.free_keys.push(slot);
+        let Some(base) = key
+            .base()
+            .and_then(|base| self.table.key_slots.get(&HashedKey::new(base)).copied())
+        else {
+            return;
+        };
+        if let Some(derived) = self.table.derived.get_mut(&base) {
+            derived.retain(|derived| *derived != slot);
+            if derived.is_empty() {
+                self.table.derived.remove(&base);
+                self.release_key(base);
+            }
         }
     }
 

@@ -836,6 +836,39 @@ mod tests {
         );
     }
 
+    /// A diagnosed file that reads the realm at one offset of another file is
+    /// reported affected when the load graph changes that realm, though
+    /// neither file was edited.
+    #[gtest]
+    fn a_realm_the_load_graph_changes_reports_its_diagnosed_reader_affected() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.diagnostics.enables = vec![DiagnosticCode::GmodRealmMismatch];
+        ws.update_emmyrc(emmyrc);
+        let utils_uri = ws.virtual_url_generator.new_uri("lua/utils.lua");
+        write(
+            &mut ws,
+            &utils_uri,
+            "Utils = Utils or {}\nfunction Utils.Ping() return 1 end\n",
+        );
+        let init_uri = ws.virtual_url_generator.new_uri("lua/sv_init.lua");
+        write(&mut ws, &init_uri, "include(\"utils.lua\")\n");
+        let reader_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/client/cl_use.lua");
+        let reader = write(&mut ws, &reader_uri, "local pinged = Utils.Ping()\n");
+        let before = codes_in(&ws, reader);
+
+        let affected = ws.analysis.apply_file_system_changes(vec![(
+            init_uri,
+            Some("include(\"utils.lua\")\nAddCSLuaFile(\"utils.lua\")\n".to_string()),
+        )]);
+
+        expect_that!(codes_in(&ws, reader), not(eq(&before)));
+        expect_that!(affected, contains(eq(&reader)));
+    }
+
     /// A watched-file delete/create pair in one batch settles to the create.
     ///
     /// The watcher can deliver `DELETED` for a file the editor immediately
