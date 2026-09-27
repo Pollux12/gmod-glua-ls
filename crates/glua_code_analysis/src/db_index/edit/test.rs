@@ -1425,3 +1425,42 @@ fn every_fact_fingerprints_as_before_a_shift_or_an_appended_comment() {
     }
     expect_that!(unstable, is_empty());
 }
+
+/// A member filed under a key whose inferred type names another file's table
+/// literals keeps naming them when that file shifts, as a cold build of the
+/// shifted text does.
+#[gtest]
+fn a_member_keyed_by_another_files_tables_follows_that_file_shifting() {
+    const CONFIG: &str = "lua/cfg.lua";
+    const CONFIG_TEXT: &str = "cfg = {}\ncfg.models = { { model = \"a\", skin = 1, groups = { torso = 1 } }, { model = \"b\", skin = 2, groups = { torso = 2 } } }\n";
+    const USER: &str = "lua/user.lua";
+    const USER_TEXT: &str = "optimised = {}\nfor _, data in pairs(cfg.models) do\n    optimised[data.skin > 0 and data or data.model] = data\nend\n";
+    let member_keys = |ws: &VirtualWorkspace, file_id: FileId| {
+        let mut keys = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_member_index()
+            .get_file_members(file_id)
+            .into_iter()
+            .map(|member| format!("{:?}", member.get_key()))
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    };
+    let shifted = format!("\n{CONFIG_TEXT}");
+    let mut warm = workspace();
+    let config_uri = warm.virtual_url_generator.new_uri(CONFIG);
+    write(&mut warm, &config_uri, CONFIG_TEXT);
+    let user_uri = warm.virtual_url_generator.new_uri(USER);
+    let user = write(&mut warm, &user_uri, USER_TEXT);
+    let mut cold = workspace();
+    let cold_config = cold.virtual_url_generator.new_uri(CONFIG);
+    write(&mut cold, &cold_config, &shifted);
+    let cold_user_uri = cold.virtual_url_generator.new_uri(USER);
+    let cold_user = write(&mut cold, &cold_user_uri, USER_TEXT);
+
+    write(&mut warm, &config_uri, &shifted);
+
+    expect_that!(member_keys(&warm, user), eq(&member_keys(&cold, cold_user)));
+}

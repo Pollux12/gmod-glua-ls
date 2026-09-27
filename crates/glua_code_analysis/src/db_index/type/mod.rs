@@ -3484,6 +3484,14 @@ fn collect_provenance_files<'a>(
 /// The files one stored type points at through a positioned identity: the
 /// arms `remap_identities_in_type` rewrites. Named references (`Ref`, `Def`)
 /// and module links carry no position and never move under a remap.
+/// The files whose positions `typ` names, exactly those
+/// [`remap_identities_in_type`] consults.
+pub(crate) fn type_referenced_files(typ: &LuaType) -> HashSet<FileId> {
+    let mut files = HashSet::default();
+    collect_type_files(typ, &mut files);
+    files
+}
+
 fn collect_type_files(typ: &LuaType, files: &mut HashSet<FileId>) {
     typ.visit_type_identities(&mut |inner| match inner {
         LuaType::TableConst(range) => {

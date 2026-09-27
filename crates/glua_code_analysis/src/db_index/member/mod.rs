@@ -176,6 +176,9 @@ pub struct LuaMemberIndex {
     current_owner_member_history:
         HashMap<LuaMemberOwner, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
     current_members_by_key: HashMap<LuaMemberKey, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
+    /// The members filed under an expression key that names another file's
+    /// positions, by that file.
+    expr_key_members_by_file: HashMap<FileId, HashSet<LuaMemberId>>,
     non_overwriting_assignment_members: HashSet<LuaMemberId>,
     /// `(owner, key)` slots whose last co-writer readmission merged nothing.
     ///
@@ -306,6 +309,7 @@ impl LuaMemberIndex {
             owner_key_index_owners_by_file: HashMap::default(),
             current_owner_member_history: HashMap::default(),
             current_members_by_key: HashMap::default(),
+            expr_key_members_by_file: HashMap::default(),
             non_overwriting_assignment_members: HashSet::default(),
             preserved_co_writer_reconciled: HashSet::default(),
             homing_revision: 0,
@@ -2699,6 +2703,12 @@ impl LuaMemberIndex {
         else {
             return;
         };
+        for file_id in expr_key_files(&key, member_id) {
+            self.expr_key_members_by_file
+                .entry(file_id)
+                .or_default()
+                .insert(member_id);
+        }
         if self
             .current_members_by_key
             .entry(key.clone())
@@ -2723,6 +2733,14 @@ impl LuaMemberIndex {
         else {
             return;
         };
+        for file_id in expr_key_files(&key, member_id) {
+            if let Some(members) = self.expr_key_members_by_file.get_mut(&file_id) {
+                members.remove(&member_id);
+                if members.is_empty() {
+                    self.expr_key_members_by_file.remove(&file_id);
+                }
+            }
+        }
         let removed = {
             let Some(members) = self.current_members_by_key.get_mut(&key) else {
                 return;
@@ -2786,6 +2804,18 @@ fn site_sort_key(site: &crate::InFiled<TextRange>) -> (u32, u32, u32) {
 
 // The owner-level sorted member-id cache depends on these file id, position,
 // range end, and kind components remaining immutable for a member's lifetime.
+/// The files other than `member_id`'s own whose positions `key`'s expression
+/// type names.
+fn expr_key_files(key: &LuaMemberKey, member_id: LuaMemberId) -> Vec<FileId> {
+    let LuaMemberKey::ExprType(typ) = key else {
+        return Vec::new();
+    };
+    crate::db_index::r#type::type_referenced_files(typ)
+        .into_iter()
+        .filter(|file_id| *file_id != member_id.file_id)
+        .collect()
+}
+
 pub(crate) fn member_id_sort_key(member_id: LuaMemberId) -> (u32, u32, u32, u16) {
     let syntax_id = member_id.get_syntax_id();
     (
@@ -3118,6 +3148,30 @@ impl LuaMemberIndex {
         }
     }
 
+    /// The members filed under an expression key naming a position of
+    /// `remap`'s file that the edit moved or destroyed: their key has to be
+    /// taken again.
+    pub fn members_with_moved_expr_keys(&self, remap: &crate::FileRemap) -> Vec<LuaMemberId> {
+        let mut members = self
+            .expr_key_members_by_file
+            .get(&remap.file_id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(
+                |member_id| match self.members.get(member_id).map(LuaMember::get_key) {
+                    Some(LuaMemberKey::ExprType(typ)) => {
+                        let result = crate::db_index::remap_identities_in_type(typ, remap);
+                        result.lost || result.typ.is_some()
+                    }
+                    _ => false,
+                },
+            )
+            .collect::<Vec<_>>();
+        members.sort_unstable_by_key(|member_id| member_id_sort_key(*member_id));
+        members
+    }
+
     /// Re-keys the definition sites an edit moved.
     fn remap_definition_sites(
         &mut self,
@@ -3223,6 +3277,7 @@ impl LuaIndex for LuaMemberIndex {
         self.owner_key_index_owners_by_file.clear();
         self.current_owner_member_history.clear();
         self.current_members_by_key.clear();
+        self.expr_key_members_by_file.clear();
         self.non_overwriting_assignment_members.clear();
         self.preserved_co_writer_reconciled.clear();
         self.homing_revision = 0;
