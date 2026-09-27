@@ -40,6 +40,8 @@ pub struct LuaCompilation {
     reanalysis: Mutex<Option<analyzer::Reanalysis>>,
     /// The VFS content revision the re-analysis in progress took its text at.
     taken_revision: u64,
+    /// The scripted scopes, lent to each re-analysis.
+    scopes: analyzer::ScopesCache,
 }
 
 /// Where the re-analysis in progress stands after
@@ -67,6 +69,7 @@ impl LuaCompilation {
             schedule: Schedule::default(),
             reanalysis: Mutex::default(),
             taken_revision: 0,
+            scopes: analyzer::ScopesCache::default(),
         };
 
         compilation.db.update_config(emmyrc.clone());
@@ -130,6 +133,7 @@ impl LuaCompilation {
                     file_ids,
                     edits,
                     self.schedule,
+                    std::mem::take(&mut self.scopes),
                 ));
             }
         }
@@ -154,6 +158,7 @@ impl LuaCompilation {
         let reanalysis = session.take().expect("a re-analysis in progress");
         let edits = reanalysis.edits().clone();
         let reanalysed = reanalysis.finish(&mut self.db);
+        self.scopes = reanalysed.scopes;
         self.last_evaluated_files = reanalysed.evaluated_files;
         self.last_stats = reanalysed.stats;
         let reads = self
@@ -288,6 +293,7 @@ impl LuaCompilation {
             schedule: self.schedule,
             reanalysis: Mutex::default(),
             taken_revision: self.taken_revision,
+            scopes: analyzer::ScopesCache::default(),
         }
     }
 
@@ -340,6 +346,7 @@ impl LuaCompilation {
     }
 
     pub fn update_config(&mut self, config: Arc<Emmyrc>) {
+        self.scopes = analyzer::ScopesCache::default();
         self.emmyrc = config.clone();
         self.db.update_config(config);
     }

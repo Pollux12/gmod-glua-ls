@@ -73,7 +73,7 @@ pub(crate) fn infer_closure_body_function_type(
 }
 
 /// Which files are scripted-class scopes, and their class info: a function of
-/// file paths and the config, computed once per re-analysis.
+/// the live files' paths, the main workspaces and the config.
 #[derive(Clone)]
 pub(crate) struct ScriptedScopes {
     files: Arc<HashSet<FileId>>,
@@ -95,6 +95,57 @@ impl ScriptedScopes {
     }
 }
 
+/// What [`ScriptedScopes`] are computed from, besides the config.
+#[derive(PartialEq, Eq)]
+struct ScopesKey {
+    files: Vec<FileId>,
+    workspaces: Vec<(WorkspaceId, Option<std::path::PathBuf>)>,
+}
+
+impl ScopesKey {
+    fn of(db: &DbIndex) -> Self {
+        let vfs = db.get_vfs();
+        let mut files = vfs.get_all_local_file_ids();
+        files.retain(|file_id| vfs.get_syntax_tree(file_id).is_some());
+        files.sort_unstable();
+        let module_index = db.get_module_index();
+        let mut workspaces = module_index
+            .get_main_workspace_ids()
+            .into_iter()
+            .map(|id| (id, module_index.get_workspace_root(id).map(Into::into)))
+            .collect::<Vec<_>>();
+        workspaces.sort_by_key(|(id, _)| id.id);
+        Self { files, workspaces }
+    }
+}
+
+/// The last [`ScriptedScopes`], reused while what they were computed from
+/// stands. A new config clears it.
+#[derive(Default)]
+pub(crate) struct ScopesCache(Option<(ScopesKey, ScriptedScopes)>);
+
+impl std::fmt::Debug for ScopesCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopesCache")
+            .field("filled", &self.0.is_some())
+            .finish()
+    }
+}
+
+impl ScopesCache {
+    fn get(&mut self, db: &DbIndex) -> ScriptedScopes {
+        let key = ScopesKey::of(db);
+        if let Some((cached, scopes)) = &self.0
+            && *cached == key
+        {
+            return scopes.clone();
+        }
+        let scopes = ScriptedScopes::new(db);
+        self.0 = Some((key, scopes.clone()));
+        scopes
+    }
+}
+
 /// What a finished [`Reanalysis`] did.
 pub(crate) struct Reanalysed {
     /// Every key whose value may have changed.
@@ -103,6 +154,8 @@ pub(crate) struct Reanalysed {
     /// evaluated, sorted.
     pub evaluated_files: Vec<FileId>,
     pub(crate) stats: engine::EngineStats,
+    /// The scripted scopes, to lend the next re-analysis.
+    pub(crate) scopes: ScopesCache,
 }
 
 /// A re-analysis in progress. It re-analyses files from their current text:
@@ -121,6 +174,7 @@ pub(crate) struct Reanalysis {
     access_paths: crate::semantic::AccessPaths,
     /// The stage the run is at while it waits for its next slice.
     stage: derivation::AnalysisStage,
+    scopes: ScopesCache,
 }
 
 impl Reanalysis {
@@ -131,14 +185,16 @@ impl Reanalysis {
         file_ids: Vec<FileId>,
         edits: derivation::EditMaps,
         schedule: engine::Schedule,
+        mut scopes: ScopesCache,
     ) -> Self {
         let mut engine = engine::Engine::new(edits, schedule);
-        let pass = start_pass(db, &mut engine, file_ids);
+        let pass = start_pass(db, &mut engine, file_ids, &mut scopes);
         let mut reanalysis = Self {
             engine,
             pass,
             access_paths: crate::semantic::AccessPaths::default(),
             stage: derivation::AnalysisStage::Closed,
+            scopes,
         };
         reanalysis.pause(db);
         reanalysis
@@ -159,7 +215,7 @@ impl Reanalysis {
         db.set_analysis_stage(derivation::AnalysisStage::Closed);
         refresh_payload_refs(db, self.engine.touched());
         self.engine.take_edits(edits);
-        if let Some(pass) = start_pass(db, &mut self.engine, file_ids) {
+        if let Some(pass) = start_pass(db, &mut self.engine, file_ids, &mut self.scopes) {
             self.pass = Some(pass);
             self.access_paths = crate::semantic::AccessPaths::default();
         }
@@ -188,7 +244,12 @@ impl Reanalysis {
             crate::profile::memory::checkpoint("after the engine run");
             let stale = self.engine.take_stale_sources();
             crate::semantic::stop_keeping_access_paths();
-            self.pass = start_pass(db, &mut self.engine, stale.into_iter().collect());
+            self.pass = start_pass(
+                db,
+                &mut self.engine,
+                stale.into_iter().collect(),
+                &mut self.scopes,
+            );
             crate::semantic::keep_access_paths(crate::semantic::AccessPaths::default());
         };
         std::mem::forget(unwinding);
@@ -258,6 +319,7 @@ impl Reanalysis {
             touched,
             evaluated_files,
             stats,
+            scopes: self.scopes,
         }
     }
 }
@@ -297,13 +359,14 @@ fn start_pass(
     db: &mut DbIndex,
     engine: &mut engine::Engine,
     mut file_ids: Vec<FileId>,
+    scopes: &mut ScopesCache,
 ) -> Option<Pass> {
     file_ids.sort();
     file_ids.dedup();
     if file_ids.is_empty() {
         return None;
     }
-    let scopes = crate::profile::phase("reanalyze: scopes", || ScriptedScopes::new(db));
+    let scopes = crate::profile::phase("reanalyze: scopes", || scopes.get(db));
     engine.replacing(&file_ids);
     engine.note_rebuilt(&file_ids);
     engine.focus_on(&file_ids);

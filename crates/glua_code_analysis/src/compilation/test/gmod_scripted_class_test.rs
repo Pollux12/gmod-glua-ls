@@ -798,6 +798,37 @@ end
         );
     }
 
+    /// Which files are scripted scopes is worked out again when a file joins
+    /// the workspace after it loaded.
+    #[gtest]
+    fn an_entity_file_created_after_the_workspace_loaded_binds_its_ent() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "lua/entities/first_entity/shared.lua",
+            "ENT.Type = \"anim\"
+",
+        );
+
+        let file_id = ws.def_file(
+            "lua/entities/second_entity/shared.lua",
+            "ENT.Type = \"anim\"
+",
+        );
+
+        assert_eq!(
+            index_expr_prefix_type(&mut ws, file_id, "ENT.Type"),
+            LuaType::Def(LuaTypeDeclId::global("second_entity"))
+        );
+    }
+
     #[gtest]
     fn test_entity_scope_ent_decl_is_local_and_not_indexed_globally() {
         let mut ws = VirtualWorkspace::new();
