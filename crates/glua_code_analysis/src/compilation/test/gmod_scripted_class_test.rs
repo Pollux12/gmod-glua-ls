@@ -2200,6 +2200,41 @@ end
         );
     }
 
+    /// A `Base` assigned before `scripted_ents.Register` wins over the base the
+    /// table's `Type` would select.
+    #[gtest]
+    fn test_register_with_an_assigned_base_ignores_the_type_fallback() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/weapons/gmod_tool/stools/resizer.lua",
+            r#"
+            local ENT = {}
+            ENT.Type = "anim"
+            ENT.Base = "base_gmodentity"
+
+            scripted_ents.Register(ENT, "size_handler")
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let super_types: Vec<_> = db
+            .get_type_index()
+            .get_super_types_iter(&LuaTypeDeclId::global("size_handler"))
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+
+        assert_eq!(
+            super_types,
+            vec![LuaType::Ref(LuaTypeDeclId::global("base_gmodentity"))]
+        );
+    }
+
     /// A registered class is named by its id's last segment, like a doc class,
     /// whichever site created its declaration.
     #[gtest]
