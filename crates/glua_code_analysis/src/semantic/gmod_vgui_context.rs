@@ -2,7 +2,7 @@ use crate::{DbIndex, FileId, LuaDeclId, LuaSignatureId, db_index::GmodScriptedCl
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaNameExpr, LuaVarExpr,
 };
-use rowan::TextSize;
+use rowan::{TextRange, TextSize};
 
 use super::LuaInferCache;
 
@@ -131,10 +131,11 @@ pub(crate) fn find_latest_decl_write_before_position(
     decl_id: LuaDeclId,
     position: TextSize,
 ) -> Option<TextSize> {
-    // All RHS expressions read the values from before the enclosing assignment.
+    // All RHS expressions read the values from before the enclosing assignment,
+    // which lies in the top-level statement around `position`.
     let position = db
         .get_vfs()
-        .get_syntax_tree(&file_id)
+        .syntax_tree_around(&file_id, TextRange::at(position, TextSize::new(1)))
         .and_then(|tree| {
             tree.get_chunk_node()
                 .syntax()

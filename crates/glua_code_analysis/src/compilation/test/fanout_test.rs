@@ -514,6 +514,46 @@ end
         assert_eq!(workspace.evaluated_files(), vec![menu]);
     }
 
+    /// A caller infers a registered panel method's receiver from the panel
+    /// table's last write before the registration, which the assignment
+    /// around the registration decides; a comment appended to the panel's
+    /// file leaves the caller standing.
+    #[test]
+    fn a_comment_appended_to_a_panel_whose_method_another_file_calls_re_runs_nothing_in_it() {
+        const CARD: &str = "gamemodes/cityrp/gamemode/core/derma/cl_card.lua";
+        const CARD_TEXT: &str = "local PANEL = {}\nfunction PANEL:SetTitle(title)\n    self.title = title\nend\nvgui.Register(\"cityrp_card\", PANEL, \"DPanel\")\n";
+        let mut workspace = cityrp_workspace();
+        workspace.ws.def_file(CARD, CARD_TEXT);
+        workspace.ws.def_file(
+            "gamemodes/cityrp/gamemode/core/derma/cl_hud.lua",
+            "local card = vgui.Create(\"cityrp_card\")\ncard:SetTitle(\"x\")\n",
+        );
+
+        let card = workspace
+            .ws
+            .def_file(CARD, &format!("{CARD_TEXT}\n-- touch\n"));
+
+        assert_eq!(workspace.evaluated_files(), vec![card]);
+    }
+
+    /// The panel table's writes a caller consults compare equal with a shift
+    /// in the panel's file mapped back, so the caller stands.
+    #[test]
+    fn a_shift_in_a_panel_whose_method_another_file_calls_re_runs_nothing_in_it() {
+        const CARD: &str = "gamemodes/cityrp/gamemode/core/derma/cl_card.lua";
+        const CARD_TEXT: &str = "local PANEL = {}\nfunction PANEL:SetTitle(title)\n    self.title = title\nend\nvgui.Register(\"cityrp_card\", PANEL, \"DPanel\")\n";
+        let mut workspace = cityrp_workspace();
+        workspace.ws.def_file(CARD, CARD_TEXT);
+        workspace.ws.def_file(
+            "gamemodes/cityrp/gamemode/core/derma/cl_hud.lua",
+            "local card = vgui.Create(\"cityrp_card\")\ncard:SetTitle(\"x\")\n",
+        );
+
+        let card = workspace.ws.def_file(CARD, &format!("\n{CARD_TEXT}"));
+
+        assert_eq!(workspace.evaluated_files(), vec![card]);
+    }
+
     /// A new call role reaches only the files whose syntax names its path.
     #[test]
     fn annotating_a_net_payload_helper_re_runs_only_files_that_call_it() {
