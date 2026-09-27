@@ -1,22 +1,7 @@
 #[cfg(test)]
 mod test {
-    use crate::db_index::derivation::{DerivationId, DerivationKind, FactKey};
+    use crate::db_index::derivation::{DerivationKind, FactKey};
     use crate::{Emmyrc, Schedule, VirtualWorkspace};
-
-    /// The derivations a read of which no longer holds: after an update the
-    /// engine must leave none.
-    fn stale_derivations(ws: &VirtualWorkspace) -> Vec<DerivationId> {
-        let db = ws.analysis.compilation.get_db();
-        let mut graph = db.reader_graph().clone();
-        graph.forget_fingerprints();
-        let mut stale = graph
-            .derivations()
-            .filter(|id| id.kind != DerivationKind::Diagnostics)
-            .filter(|id| graph.is_stale(*id, |key| db.fact_fingerprint(key), |_, _| false))
-            .collect::<Vec<_>>();
-        stale.sort();
-        stale
-    }
 
     /// A reader ordered before its producer, cold-built under `schedule`:
     /// how often its statement ran, and what the workspace settled to.
@@ -162,7 +147,7 @@ mod test {
 ",
         );
 
-        assert_eq!(stale_derivations(&ws), Vec::new());
+        assert_eq!(ws.stale_derivations(), Vec::new());
     }
 
     fn helper_workspace() -> VirtualWorkspace {

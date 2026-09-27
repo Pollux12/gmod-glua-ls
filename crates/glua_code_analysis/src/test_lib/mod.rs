@@ -924,6 +924,67 @@ impl VirtualWorkspace {
         digest
     }
 
+    /// The derivations a read of which no longer holds: after an update the
+    /// engine must leave none.
+    #[cfg(test)]
+    pub fn stale_derivations(&self) -> Vec<crate::db_index::derivation::DerivationId> {
+        use crate::db_index::derivation::DerivationKind;
+        let db = self.analysis.compilation.get_db();
+        let mut graph = db.reader_graph().clone();
+        graph.forget_fingerprints();
+        let mut stale = graph
+            .derivations()
+            .filter(|id| id.kind != DerivationKind::Diagnostics)
+            .filter(|id| graph.is_stale(*id, |key| db.fact_fingerprint(key), |_, _| false))
+            .collect::<Vec<_>>();
+        stale.sort();
+        stale
+    }
+
+    /// Every type cache, type declaration, dynamic field, net flow and the
+    /// semantic digest, as sorted text.
+    #[cfg(test)]
+    pub fn settled_digest(&self) -> Vec<String> {
+        let db = self.analysis.compilation.get_db();
+        let mut settled = db
+            .get_type_index()
+            .iter_type_caches()
+            .map(|(owner, cache)| format!("{owner:?} = {:?}", cache.as_type()))
+            .chain(
+                db.get_dynamic_field_index()
+                    .iter_all_field_definitions()
+                    .flat_map(|(owner, fields)| {
+                        fields
+                            .keys()
+                            .map(move |field| format!("{owner:?} has {field}"))
+                    }),
+            )
+            .collect::<Vec<_>>();
+        settled.extend(db.get_type_index().iter_type_decls().map(|decl| {
+            let mut locations = decl
+                .get_locations()
+                .iter()
+                .map(|location| format!("{location:?}"))
+                .collect::<Vec<_>>();
+            locations.sort();
+            format!("{:?} at {locations:?}", decl.get_id())
+        }));
+        let network = db.get_gmod_network_index();
+        settled.extend(
+            network
+                .iter_send_flows()
+                .map(|(file_id, _, flow)| format!("{file_id:?} sends {flow:?}")),
+        );
+        settled.extend(
+            network
+                .iter_receive_flows()
+                .map(|(file_id, flow)| format!("{file_id:?} receives {flow:?}")),
+        );
+        settled.extend(self.semantic_digest());
+        settled.sort();
+        settled
+    }
+
     /// Applies `edits` one at a time to a workspace holding `files`, builds a
     /// fresh workspace from the final texts, and asserts both digests match.
     /// `setup` configures each workspace before any file is added. Returns

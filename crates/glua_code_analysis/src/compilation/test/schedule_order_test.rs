@@ -42,44 +42,7 @@ mod test {
                         .map(|(path, text)| (path.as_str(), text.as_str()))
                         .collect(),
                 );
-                let db = ws.analysis.compilation.get_db();
-                let mut settled = db
-                    .get_type_index()
-                    .iter_type_caches()
-                    .map(|(owner, cache)| format!("{owner:?} = {:?}", cache.as_type()))
-                    .chain(
-                        db.get_dynamic_field_index()
-                            .iter_all_field_definitions()
-                            .flat_map(|(owner, fields)| {
-                                fields
-                                    .keys()
-                                    .map(move |field| format!("{owner:?} has {field}"))
-                            }),
-                    )
-                    .collect::<Vec<_>>();
-                settled.extend(db.get_type_index().iter_type_decls().map(|decl| {
-                    let mut locations = decl
-                        .get_locations()
-                        .iter()
-                        .map(|location| format!("{location:?}"))
-                        .collect::<Vec<_>>();
-                    locations.sort();
-                    format!("{:?} at {locations:?}", decl.get_id())
-                }));
-                let network = db.get_gmod_network_index();
-                settled.extend(
-                    network
-                        .iter_send_flows()
-                        .map(|(file_id, _, flow)| format!("{file_id:?} sends {flow:?}")),
-                );
-                settled.extend(
-                    network
-                        .iter_receive_flows()
-                        .map(|(file_id, flow)| format!("{file_id:?} receives {flow:?}")),
-                );
-                settled.extend(ws.semantic_digest());
-                settled.sort();
-                let _ = tx.send(settled);
+                let _ = tx.send(ws.settled_digest());
             })
             .expect("analysis thread");
         rx.recv_timeout(Duration::from_secs(30)).ok()
