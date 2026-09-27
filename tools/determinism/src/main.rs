@@ -27,8 +27,11 @@
 //!   the seed. The settled result must not depend on the order files run in.
 //! - `touch`, `shift`, `delete`, `recreate`, `rename`: sweeps over every
 //!   `DET_STRIDE`-th (default 25) main file from `DET_STRIDE_OFFSET` (default
-//!   0), or the files named in `DET_ONLY`. Touch appends a comment, shift
-//!   prepends a newline, rename moves each file to `<stem>_rn.lua`.
+//!   0), or the `DET_HUBS` main files the most other files read from together
+//!   with the files named in `DET_ONLY`. Touch appends a comment, shift
+//!   prepends a newline, rename moves each file to `<stem>_rn.lua`. With
+//!   `DET_HUBS` or `DET_EACH=1` each file is its own run and oracle, labelled
+//!   `stage[path]`; otherwise one batch holds every sweep file.
 //!
 //! Locality: every stage prints how many files the re-analysis evaluated and
 //! how many files' diagnostics it reported affected. For `noop`, `touch` and
@@ -2187,6 +2190,9 @@ fn env_usize(name: &str, default: usize) -> usize {
 /// `None` for a deletion.
 type WatchEvents = Vec<(lsp_types::Uri, Option<String>)>;
 
+/// A sweep file: its path, URI, id and base text.
+type SweepFile = (PathBuf, lsp_types::Uri, FileId, String);
+
 struct Harness {
     codebase: PathBuf,
     annotations: PathBuf,
@@ -2539,18 +2545,58 @@ impl Harness {
         );
     }
 
+    /// `path` relative to the codebase, with forward slashes.
+    fn relative(&self, path: &Path) -> String {
+        path.strip_prefix(&self.codebase)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    /// The `DET_HUBS` main files the most other files read from, printed with
+    /// their dependent counts.
+    fn hubs(&self) -> Vec<FileId> {
+        let count = env_usize("DET_HUBS", 0);
+        if count == 0 {
+            return Vec::new();
+        }
+        let dependents = self.base.dependent_files();
+        let vfs = self.base.compilation.get_db().get_vfs();
+        let mut ranked = self
+            .base
+            .get_main_workspace_file_ids_for_diagnostics()
+            .into_iter()
+            .filter_map(|file_id| {
+                let relative = self.relative(vfs.get_file_path(&file_id)?);
+                Some((
+                    dependents.get(&file_id).map_or(0, Vec::len),
+                    relative,
+                    file_id,
+                ))
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        ranked.truncate(count);
+        for (dependents, relative, _) in &ranked {
+            eprintln!("[hubs] {dependents:5} dependents  {relative}");
+        }
+        ranked.into_iter().map(|(.., file_id)| file_id).collect()
+    }
+
     /// The sweep's files: every `DET_STRIDE`-th main file from
-    /// `DET_STRIDE_OFFSET`, or the files whose path ends with an entry of
-    /// `DET_ONLY`.
-    fn stride_files(&self) -> Vec<(PathBuf, lsp_types::Uri, FileId, String)> {
+    /// `DET_STRIDE_OFFSET`, or the `DET_HUBS` hubs together with the files
+    /// whose path ends with an entry of `DET_ONLY`.
+    fn sweep_files(&self) -> Vec<SweepFile> {
         let stride = env_usize("DET_STRIDE", 25);
         let offset = env_usize("DET_STRIDE_OFFSET", 0);
         let only = std::env::var("DET_ONLY").ok().map(|value| {
             value
                 .split(',')
                 .map(|entry| entry.trim().replace('\\', "/").to_lowercase())
+                .filter(|entry| !entry.is_empty())
                 .collect::<Vec<_>>()
         });
+        let hubs = self.hubs();
         let vfs = self.base.compilation.get_db().get_vfs();
         let mut ids = self.base.get_main_workspace_file_ids_for_diagnostics();
         ids.sort_unstable();
@@ -2559,11 +2605,14 @@ impl Harness {
             .enumerate()
             .filter_map(|(i, file_id)| {
                 let path = vfs.get_file_path(&file_id)?;
-                let selected = match &only {
-                    Some(only) => only
-                        .iter()
-                        .any(|entry| path_key(path).ends_with(entry.as_str())),
-                    None => i % stride == offset,
+                let selected = if only.is_none() && hubs.is_empty() {
+                    i % stride == offset
+                } else {
+                    hubs.contains(&file_id)
+                        || only
+                            .iter()
+                            .flatten()
+                            .any(|entry| path_key(path).ends_with(entry.as_str()))
                 };
                 selected.then(|| {
                     let text = vfs.get_file_content(&file_id)?.clone();
@@ -2575,39 +2624,62 @@ impl Harness {
         files
     }
 
-    /// Edits every sweep file with `edit` and settles them in one batch.
-    fn sweep_edit(&mut self, label: &str, edit: impl Fn(&str) -> String) {
-        let files = self.stride_files();
-        let mut warm = self.warm();
-        for (_, uri, file_id, text) in &files {
-            apply_text(&mut warm, uri, *file_id, edit(text), 1);
+    /// The sweep's batches with their labels: each file alone when
+    /// `DET_HUBS` picks files or `DET_EACH=1`, so no edited file re-indexes
+    /// the readers another edited file left stale; otherwise one batch.
+    fn sweep_batches(&self, stage: &str) -> Vec<(String, Vec<SweepFile>)> {
+        let files = self.sweep_files();
+        let each = env_usize("DET_HUBS", 0) > 0
+            || std::env::var("DET_EACH").is_ok_and(|value| value == "1");
+        if !each {
+            return vec![(stage.to_owned(), files)];
         }
-        let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
-        let affected = warm.reindex_files(ids.clone());
-        let reach = Reach::of(&warm, affected);
-        let input = ColdInput {
-            overrides: files
-                .iter()
-                .map(|(path, _, _, text)| (path.clone(), edit(text)))
-                .collect(),
-            ..ColdInput::default()
-        };
-        self.finish(label, warm, &ids, &reach, true, &input);
+        files
+            .into_iter()
+            .map(|file| (format!("{stage}[{}]", self.relative(&file.0)), vec![file]))
+            .collect()
+    }
+
+    /// Edits each batch's files with `edit` and settles them together.
+    fn sweep_edit(&mut self, stage: &str, edit: impl Fn(&str) -> String) {
+        for (label, files) in self.sweep_batches(stage) {
+            let mut warm = self.warm();
+            for (_, uri, file_id, text) in &files {
+                apply_text(&mut warm, uri, *file_id, edit(text), 1);
+            }
+            let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
+            let affected = warm.reindex_files(ids.clone());
+            let reach = Reach::of(&warm, affected);
+            let input = ColdInput {
+                overrides: files
+                    .iter()
+                    .map(|(path, _, _, text)| (path.clone(), edit(text)))
+                    .collect(),
+                ..ColdInput::default()
+            };
+            self.finish(&label, warm, &ids, &reach, true, &input);
+        }
     }
 
     fn sweep_delete(&mut self) {
-        let files = self.stride_files();
-        let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
-        let input = ColdInput {
-            removed: files.iter().map(|(path, ..)| path.clone()).collect(),
-            ..ColdInput::default()
-        };
-        let events = files.into_iter().map(|(_, uri, ..)| (uri, None)).collect();
-        self.watched("delete", vec![events], &ids, &input);
+        for (label, files) in self.sweep_batches("delete") {
+            let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
+            let input = ColdInput {
+                removed: files.iter().map(|(path, ..)| path.clone()).collect(),
+                ..ColdInput::default()
+            };
+            let events = files.into_iter().map(|(_, uri, ..)| (uri, None)).collect();
+            self.watched(&label, vec![events], &ids, &input);
+        }
     }
 
     fn sweep_recreate(&mut self) {
-        let files = self.stride_files();
+        for (label, files) in self.sweep_batches("recreate") {
+            self.recreate_batch(&label, files);
+        }
+    }
+
+    fn recreate_batch(&mut self, label: &str, files: Vec<SweepFile>) {
         let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
         let input = ColdInput {
             removed: files.iter().map(|(path, ..)| path.clone()).collect(),
@@ -2625,11 +2697,16 @@ impl Harness {
             .into_iter()
             .map(|(_, uri, _, text)| (uri, Some(text)))
             .collect();
-        self.watched("recreate", vec![deletes, creates], &ids, &input);
+        self.watched(label, vec![deletes, creates], &ids, &input);
     }
 
     fn sweep_rename(&mut self) {
-        let files = self.stride_files();
+        for (label, files) in self.sweep_batches("rename") {
+            self.rename_batch(&label, files);
+        }
+    }
+
+    fn rename_batch(&mut self, label: &str, files: Vec<SweepFile>) {
         let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
         let renamed = files
             .iter()
@@ -2655,7 +2732,7 @@ impl Harness {
             created: renamed,
             ..ColdInput::default()
         };
-        self.watched("rename", vec![events], &ids, &input);
+        self.watched(label, vec![events], &ids, &input);
     }
 }
 
