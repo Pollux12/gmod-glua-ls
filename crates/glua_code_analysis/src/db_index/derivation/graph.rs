@@ -123,7 +123,35 @@ pub struct KeyTable {
     keys: Vec<KeySlot>,
     free_keys: Vec<KeyIdx>,
     /// The keys read out of each base key ([`FactKey::base`]).
-    derived: FxHashMap<KeyIdx, Vec<KeyIdx>>,
+    derived: FxHashMap<KeyIdx, DerivedKeys>,
+}
+
+/// The keys read out of one base key, and the base's fingerprint when their
+/// readers were last checked ([`UNCHECKED`]: never).
+#[derive(Debug)]
+struct DerivedKeys {
+    slots: Vec<KeyIdx>,
+    checked_at: AtomicU64,
+}
+
+const UNCHECKED: Fingerprint = Fingerprint::MAX;
+
+impl Default for DerivedKeys {
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            checked_at: AtomicU64::new(UNCHECKED),
+        }
+    }
+}
+
+impl Clone for DerivedKeys {
+    fn clone(&self) -> Self {
+        Self {
+            slots: self.slots.clone(),
+            checked_at: AtomicU64::new(self.checked_at.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl KeyTable {
@@ -151,7 +179,7 @@ impl KeyTable {
         self.key_slots.insert(key, slot);
         if let Some(base) = base {
             let base = self.intern(HashedKey::new(base), now);
-            self.derived.entry(base).or_default().push(slot);
+            self.derived.entry(base).or_default().slots.push(slot);
         }
         slot
     }
@@ -178,7 +206,7 @@ impl KeyTable {
     pub(super) fn mark_written(&mut self, key: &HashedKey, now: u64) {
         if let Some(&slot) = self.key_slots.get(key) {
             self.keys[slot as usize].written = now;
-            for derived in self.derived.get(&slot).into_iter().flatten() {
+            for derived in self.derived.get(&slot).into_iter().flat_map(|d| &d.slots) {
                 self.keys[*derived as usize].written = now;
             }
         }
@@ -360,9 +388,13 @@ impl ReaderGraph {
     /// it: their values may have moved.
     pub fn forget_fingerprint(&self, key: &HashedKey) {
         if let Some(slot) = self.table.key_slots.get(key) {
-            for slot in
-                std::iter::once(slot).chain(self.table.derived.get(slot).into_iter().flatten())
-            {
+            for slot in std::iter::once(slot).chain(
+                self.table
+                    .derived
+                    .get(slot)
+                    .into_iter()
+                    .flat_map(|derived| &derived.slots),
+            ) {
                 self.table.keys[*slot as usize]
                     .current_generation
                     .store(NO_GENERATION, Ordering::Relaxed);
@@ -377,7 +409,29 @@ impl ReaderGraph {
             .get(key)
             .and_then(|slot| self.table.derived.get(slot))
             .into_iter()
-            .flatten()
+            .flat_map(|derived| &derived.slots)
+            .map(|slot| self.key(*slot).clone())
+            .collect()
+    }
+
+    /// The keys read out of `key` whose readers have to be checked now that
+    /// `key` fingerprints as `now`: none when they were last checked at that
+    /// value, since each is a function of it.
+    pub fn derived_keys_to_check(&self, key: &HashedKey, now: Fingerprint) -> Vec<HashedKey> {
+        let Some(derived) = self
+            .table
+            .key_slots
+            .get(key)
+            .and_then(|slot| self.table.derived.get(slot))
+        else {
+            return Vec::new();
+        };
+        if derived.checked_at.swap(now, Ordering::Relaxed) == now {
+            return Vec::new();
+        }
+        derived
+            .slots
+            .iter()
             .map(|slot| self.key(*slot).clone())
             .collect()
     }
@@ -851,8 +905,8 @@ impl ReaderGraph {
             return;
         };
         if let Some(derived) = self.table.derived.get_mut(&base) {
-            derived.retain(|derived| *derived != slot);
-            if derived.is_empty() {
+            derived.slots.retain(|derived| *derived != slot);
+            if derived.slots.is_empty() {
                 self.table.derived.remove(&base);
                 self.release_key(base);
             }

@@ -307,7 +307,11 @@ impl Engine {
     ) {
         for key in keys {
             self.queue_readers(db, key);
-            for derived in db.reader_graph().derived_keys(key) {
+            if !key.is_base() {
+                continue;
+            }
+            let now = self.fingerprint(db, key);
+            for derived in db.reader_graph().derived_keys_to_check(key, now) {
                 self.queue_readers(db, &derived);
             }
         }

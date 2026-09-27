@@ -630,6 +630,11 @@ impl FactKey {
         }
     }
 
+    /// Whether keys are read out of this one ([`Self::base`]).
+    pub fn is_base(&self) -> bool {
+        matches!(self, FactKey::GmodRealm(_) | FactKey::GmodInferFile(_))
+    }
+
     /// The key this one is read out of: writing the base moves every key read
     /// out of it, so each reader re-checks its own part and re-runs only when
     /// that part changed.
