@@ -428,17 +428,10 @@ impl Engine {
         }
     }
 
-    /// Settles `file_ids` before any other work: what is queued in other
-    /// files waits for them, and so does every reader in another file queued
-    /// until they settle.
-    pub(crate) fn focus_on(&mut self, file_ids: &[crate::FileId]) {
-        self.focus = file_ids.iter().copied().collect();
-        self.park_outside_focus();
-    }
-
     /// Adds `file_ids` to what settles first, starting a focus if none is
-    /// settling: their waiting work is queued again and other files' queued
-    /// work waits.
+    /// settling: their waiting work is queued again, other files' queued work
+    /// waits, and so does every reader in another file queued until the focus
+    /// settles.
     pub(crate) fn prioritise(&mut self, file_ids: &[crate::FileId]) {
         let added = file_ids
             .iter()

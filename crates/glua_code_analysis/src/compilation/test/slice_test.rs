@@ -223,6 +223,22 @@ local recorded = Ledger.back
         );
     }
 
+    /// A file still settling ahead of the rest keeps doing so when another
+    /// file's edit is taken in: its document must not answer half evaluated.
+    #[test]
+    fn a_file_settling_first_keeps_settling_first_when_another_edit_is_taken_in() {
+        let mut ws = workspace();
+        let config = stage_text(&mut ws, CONFIG, EDITED_CONFIG);
+        ws.analysis.begin_reindex(vec![config]);
+        ws.analysis.advance_reindex(Slice::Evaluations(1));
+        assert!(ws.analysis.compilation.settles_first(config));
+
+        let label = stage_text(&mut ws, LABEL, EDITED_LABEL);
+        ws.analysis.begin_reindex(vec![label]);
+
+        assert!(ws.analysis.compilation.settles_first(config));
+    }
+
     #[test]
     fn taking_no_files_mid_reanalysis_still_settles_the_work_queued() {
         let mut ws = workspace();

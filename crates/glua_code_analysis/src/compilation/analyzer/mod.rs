@@ -355,7 +355,8 @@ impl Drop for Unwinding {
 }
 
 /// Rebuilds `file_ids`' source layers and queues their derivations ahead of
-/// the work already queued; `None` when there is nothing to re-analyse.
+/// the work already queued, alongside any files still settling first; `None`
+/// when there is nothing to re-analyse.
 fn start_pass(
     db: &mut DbIndex,
     engine: &mut engine::Engine,
@@ -370,7 +371,7 @@ fn start_pass(
     let scopes = crate::profile::phase("reanalyze: scopes", || scopes.get(db));
     engine.replacing(&file_ids);
     engine.note_rebuilt(&file_ids);
-    engine.focus_on(&file_ids);
+    engine.prioritise(&file_ids);
     crate::profile::memory::checkpoint("before the source layer");
     let touched = crate::profile::phase("reanalyze: replace files", || {
         replace_files(db, engine, &file_ids, &scopes)
