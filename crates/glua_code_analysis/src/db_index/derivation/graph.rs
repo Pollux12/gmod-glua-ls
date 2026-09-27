@@ -721,6 +721,20 @@ impl ReaderGraph {
         moved
     }
 
+    /// Whether some reader of `key` saw a value other than the one
+    /// `current` fingerprints, taken only if something reads `key`.
+    pub fn read_other_than(&self, key: &HashedKey, current: impl FnOnce() -> Fingerprint) -> bool {
+        let Some(slot) = self.table.find(key) else {
+            return false;
+        };
+        let readers = &self.table.keys[slot as usize].readers;
+        if readers.is_empty() {
+            return false;
+        }
+        let current = current();
+        readers.0.iter().any(|(seen, _)| *seen != current)
+    }
+
     /// Relabels the reads of `key` that saw `from` as having seen `to`: after
     /// an edit that only moved the key's positions, what they read is the
     /// value as it stands now, and the next edit maps back from here.

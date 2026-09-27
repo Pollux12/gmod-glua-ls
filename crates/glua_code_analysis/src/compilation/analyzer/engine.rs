@@ -651,9 +651,13 @@ impl Engine {
         if self.edits.is_empty() {
             return;
         }
+        // Only a reader that saw another value can have seen it before the
+        // edits; the others read the value as it stands.
+        let graph = db.reader_graph();
         let moved = self
             .touched
             .iter()
+            .filter(|key| graph.read_other_than(key, || self.fingerprint(db, key)))
             .filter_map(|key| {
                 let current = self.fingerprint(db, key);
                 let before = self.fingerprint_before_edits(db, key);
