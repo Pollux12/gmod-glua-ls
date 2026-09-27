@@ -8,8 +8,8 @@ mod test {
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        DiagnosticCode, Emmyrc, GmodRealm, LuaSignatureId, LuaType, LuaTypeDeclId, LuaUnionType,
-        VirtualWorkspace,
+        DiagnosticCode, Emmyrc, GMOD_CALL_ARG_BUILTINS_FIXTURE, GmodRealm, LuaSignatureId, LuaType,
+        LuaTypeDeclId, LuaUnionType, Schedule, VirtualWorkspace,
     };
     use smol_str::SmolStr;
 
@@ -2554,5 +2554,121 @@ mod test {
             "reindexed supertype edge must keep the string argument range, got {:?} (arg_range={arg_range:?}, call_range={call_range:?})",
             edges_after[0],
         );
+    }
+
+    const PANEL_CLASSES: &str = "---@class Panel
+---@class EditablePanel: Panel
+---@class DButton: Panel
+";
+
+    /// `class_name`'s super types, whether it reads as auto-generated, and the
+    /// generic-constraint-mismatch messages of each file, after cold-building
+    /// `files` in one batch under `schedule`.
+    fn registered_panel_class(
+        schedule: Schedule,
+        files: &[(&str, &str)],
+        class_name: &str,
+    ) -> (Vec<LuaType>, bool, Vec<String>) {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis.compilation.set_schedule(schedule);
+        ws.enable_check(DiagnosticCode::GenericConstraintMismatch);
+        let mut batch = vec![
+            ("lua/includes/builtins.lua", GMOD_CALL_ARG_BUILTINS_FIXTURE),
+            ("lua/includes/panels.lua", PANEL_CLASSES),
+        ];
+        batch.extend_from_slice(files);
+        let file_ids = ws.def_files(batch);
+        let messages = file_ids
+            .into_iter()
+            .flat_map(|file_id| {
+                ws.analysis
+                    .diagnose_file(file_id, CancellationToken::new())
+                    .unwrap_or_default()
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        let db = ws.analysis.compilation.get_db();
+        let class_id = LuaTypeDeclId::global(class_name);
+        let supers = db
+            .get_type_index()
+            .get_super_types_iter(&class_id)
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        let auto_generated = db
+            .get_type_index()
+            .get_type_decl(&class_id)
+            .expect("registered class")
+            .is_auto_generated();
+        (supers, auto_generated, messages)
+    }
+
+    #[gtest]
+    fn a_created_panel_class_keeps_only_the_base_its_registration_names() {
+        let files = [
+            (
+                "gamemodes/cityrp/gamemode/core/derma/cl_new_fl_derma_elements.lua",
+                "local PANEL = {}
+function PANEL:AddSheet(label, panel) end
+derma.DefineControl(\"FLMenu\", \"\", PANEL, \"EditablePanel\")
+",
+            ),
+            (
+                "gamemodes/cityrp/gamemode/core/derma/cl_menu.lua",
+                "cityrp_menu_panel = vgui.Create(\"FLMenu\")\n",
+            ),
+        ];
+        for schedule in [Schedule::Canonical, Schedule::Reversed] {
+            let (supers, auto_generated, _) = registered_panel_class(schedule, &files, "FLMenu");
+            assert_eq!(
+                supers,
+                vec![LuaType::Ref(LuaTypeDeclId::global("EditablePanel"))],
+                "{schedule:?}"
+            );
+            assert!(!auto_generated, "{schedule:?}");
+        }
+    }
+
+    #[gtest]
+    fn a_panel_class_created_from_two_sites_keeps_only_the_base_its_registration_names() {
+        let files = [
+            (
+                "gamemodes/cityrp/gamemode/core/derma/cl_new_fl_derma_elements.lua",
+                "local PANEL = {}
+function PANEL:SetModelName(model) end
+vgui.Register(\"MModelIcon\", PANEL, \"DButton\")
+",
+            ),
+            (
+                "gamemodes/cityrp/plugins/deco/derma/cl_store.lua",
+                "local PANEL = {}
+function PANEL:SetItem()
+    self.spawnIcon = vgui.Create(\"MModelIcon\", self)
+end
+function PANEL:SetDeco()
+    self.spawnIcon = vgui.Create(\"MModelIcon\", self)
+end
+vgui.Register(\"cityrpStoreItem\", PANEL, \"EditablePanel\")
+",
+            ),
+        ];
+        for schedule in [Schedule::Canonical, Schedule::Reversed] {
+            let (supers, auto_generated, messages) =
+                registered_panel_class(schedule, &files, "MModelIcon");
+            assert_eq!(
+                supers,
+                vec![LuaType::Ref(LuaTypeDeclId::global("DButton"))],
+                "{schedule:?}"
+            );
+            assert!(!auto_generated, "{schedule:?}");
+            assert!(
+                !messages
+                    .iter()
+                    .any(|message| message.contains("is not explicitly defined")),
+                "{schedule:?}: {messages:?}"
+            );
+        }
     }
 }
