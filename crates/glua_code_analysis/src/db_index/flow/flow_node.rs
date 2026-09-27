@@ -4,6 +4,9 @@ use glua_parser::{
 };
 use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
+use std::hash::{Hash, Hasher};
+
+use crate::db_index::derivation::hash_local;
 
 /// Unique identifier for flow nodes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -39,7 +42,7 @@ pub enum AssignVarHint {
 }
 
 /// Different types of flow nodes in the control flow graph
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlowNodeKind {
     /// Entry point of the flow
     Start,
@@ -74,6 +77,37 @@ pub enum FlowNodeKind {
     Break,
     /// Return statement
     Return,
+}
+
+/// Positions hash as positions of the tree's file, so a tree fingerprinted
+/// with an edit mapped back compares equal when it only moved.
+impl Hash for FlowNodeKind {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            FlowNodeKind::Start
+            | FlowNodeKind::Unreachable
+            | FlowNodeKind::BranchLabel
+            | FlowNodeKind::LoopLabel
+            | FlowNodeKind::Break
+            | FlowNodeKind::Return => {}
+            FlowNodeKind::NamedLabel(name) => name.hash(state),
+            FlowNodeKind::DeclPosition(position) | FlowNodeKind::ClosureEntry(position) => {
+                hash_local(position, state)
+            }
+            FlowNodeKind::Assignment(ptr, hint) => {
+                hash_local(&ptr.syntax_id, state);
+                hint.hash(state);
+            }
+            FlowNodeKind::Call(ptr) => hash_local(&ptr.syntax_id, state),
+            FlowNodeKind::TrueCondition(ptr) | FlowNodeKind::FalseCondition(ptr) => {
+                hash_local(&ptr.syntax_id, state)
+            }
+            FlowNodeKind::ImplFunc(ptr) => hash_local(&ptr.syntax_id, state),
+            FlowNodeKind::ForIStat(ptr) => hash_local(&ptr.syntax_id, state),
+            FlowNodeKind::TagCast(ptr) => hash_local(&ptr.syntax_id, state),
+        }
+    }
 }
 
 #[allow(unused)]

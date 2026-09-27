@@ -1028,6 +1028,17 @@ end
         assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![ranks]);
     }
 
+    /// The caller infers the method through the flow of the file defining it;
+    /// that flow compares equal with the shift mapped back.
+    #[test]
+    fn a_shift_in_a_file_whose_table_method_another_file_calls_re_runs_nothing_in_it() {
+        let (mut ws, _) = ranks_workspace();
+
+        let ranks = ws.def_file(RANKS, &format!("\n{RANKS_TEXT}"));
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![ranks]);
+    }
+
     /// Another file's field written onto a table literal is kept by the member
     /// index when the literal's file is re-indexed, and the edit carries it to
     /// the literal's new position, so the writing file stands.

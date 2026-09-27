@@ -16,6 +16,15 @@ fn unordered_fingerprint<T: Hash>(items: impl IntoIterator<Item = T>) -> Fingerp
         .fold(0, u64::wrapping_add)
 }
 
+/// A position of the file being fingerprinted (see [`derivation::hash_local`]).
+struct Local<'a, P>(&'a P);
+
+impl<P: derivation::FilePosition> Hash for Local<'_, P> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        derivation::hash_local(self.0, state);
+    }
+}
+
 /// File-wide summary of which variables/paths can possibly be narrowed by the
 /// backward flow walk. Used to skip the (expensive) walk entirely for variable
 /// references that provably reach no narrowing site — measured at ~95% of
@@ -434,13 +443,22 @@ impl FlowTree {
         }
     }
 
-    /// Content hash of everything the tree's accessors can observe.
+    /// Content hash of everything the tree's accessors can observe, with its
+    /// positions hashed as positions of the file being fingerprinted.
     pub fn content_fingerprint(&self) -> Fingerprint {
         derivation::fingerprint_of(&(
-            unordered_fingerprint(&self.decl_bind_expr_ref),
+            unordered_fingerprint(
+                self.decl_bind_expr_ref
+                    .iter()
+                    .map(|(decl_id, ptr)| (decl_id, Local(&ptr.syntax_id))),
+            ),
             &self.flow_nodes,
             &self.multiple_antecedents,
-            unordered_fingerprint(&self.bindings),
+            unordered_fingerprint(
+                self.bindings
+                    .iter()
+                    .map(|(syntax_id, flow_id)| (Local(syntax_id), flow_id)),
+            ),
             unordered_fingerprint(&self.branch_label_info),
             unordered_fingerprint(&self.condition_label_entries),
             &self.assignment_flow_info,

@@ -241,6 +241,14 @@ impl LuaFlowIndex {
 
     pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
         match key {
+            FactKey::FlowTree(file_id) if derivation::mapping_back() => {
+                derivation::fingerprint_opt(
+                    self.file_flow_tree
+                        .get(file_id)
+                        .map(FlowTree::content_fingerprint)
+                        .as_ref(),
+                )
+            }
             FactKey::FlowTree(file_id) => {
                 derivation::fingerprint_opt(self.flow_tree_fingerprints.get(file_id))
             }
