@@ -56,10 +56,11 @@ pub async fn on_pull_document_diagnostic(
     let previous_result_id = params.previous_result_id;
 
     // Correctness, not latency: the index stays stale between didChange and
-    // the debounced reindex, and diagnostics computed then are wrong.
+    // the debounced reindex, and diagnostics computed then are wrong. What
+    // settles after this document is reported affected and re-pulled.
     if context
         .debounced_analysis()
-        .wait_until_fresh_for(&token, "textDocument/diagnostic")
+        .wait_until_file_settled_for(&token, "textDocument/diagnostic", &uri)
         .await
         != Freshness::Fresh
     {

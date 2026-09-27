@@ -326,6 +326,14 @@ pub fn emit_ls_reindex(cycle: u64, debounce: Duration, write_wait: Duration, wri
     );
 }
 
+/// A re-analysis cycle settled after its slices, reporting `affected` files.
+pub fn emit_ls_settled(cycle: u64, affected: usize) {
+    if !ls_profile_enabled() {
+        return;
+    }
+    eprintln!("[profile] ls_settled cycle={cycle} affected={affected}");
+}
+
 /// One workspace diagnostic pull's sweep size and wall time, plus whether it
 /// ran edit-scoped: the last piece of work an edit owes, so its completion
 /// marks the burst's "all related work done" point.

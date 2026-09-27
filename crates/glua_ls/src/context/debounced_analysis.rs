@@ -1,4 +1,4 @@
-use glua_code_analysis::{EmmyLuaAnalysis, FileId};
+use glua_code_analysis::{EmmyLuaAnalysis, FileId, Slice, UpdateProgress};
 use lsp_types::Uri;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -10,6 +10,10 @@ use tokio_util::sync::CancellationToken;
 use super::{ClientProxy, FileDiagnostic, file_diagnostic::SharedDiagnosticDataCache};
 
 const FRESHNESS_STUCK_WARN_AFTER: Duration = Duration::from_secs(5);
+
+/// How long one slice of a re-analysis holds the analysis write lock. A
+/// request waits for at most about one slice.
+const SLICE: Duration = Duration::from_millis(10);
 
 /// How long the user must stay idle after a reindex before the whole workspace
 /// is re-diagnosed.
@@ -42,7 +46,9 @@ pub enum Freshness {
     LoopDead,
 }
 
-/// Debounced analysis: accumulates file IDs from rapid edits and runs `reindex_files` once the user pauses typing.
+/// Debounced analysis: accumulates file IDs from rapid edits, takes them into
+/// the re-analysis once the user pauses typing, and settles it in slices that
+/// release the analysis lock between them.
 pub struct DebouncedAnalysis {
     pending_files: Mutex<HashSet<FileId>>,
     reindexing_files: Mutex<HashSet<FileId>>,
@@ -62,6 +68,11 @@ pub struct DebouncedAnalysis {
     /// notification handler, before the didChange task is spawned) so that any
     /// request handler dispatched afterwards sees the flag immediately.
     has_pending_changes: AtomicBool,
+    /// True while a re-analysis is settling in slices.
+    settling: AtomicBool,
+    /// Files whose diagnostics wait for them to settle: the next slice settles
+    /// them first.
+    prioritised: std::sync::Mutex<Vec<FileId>>,
     /// False once the supervisor has given up restarting the debounce loop
     /// (see `LS_DEBOUNCE_LOOP_DEAD`). Freshness can then never arrive, so
     /// waiters fail fast instead of parking until their request is cancelled.
@@ -101,6 +112,8 @@ impl DebouncedAnalysis {
             reindexing_files: Mutex::new(HashSet::new()),
             blocked_documents: Mutex::new(HashMap::new()),
             has_pending_changes: AtomicBool::new(false),
+            settling: AtomicBool::new(false),
+            prioritised: std::sync::Mutex::default(),
             debounce_loop_alive: AtomicBool::new(true),
             in_flight_changes: AtomicUsize::new(0),
             notify: Notify::new(),
@@ -307,6 +320,74 @@ impl DebouncedAnalysis {
         }
     }
 
+    /// Wait until the document at `uri` has nothing left to settle: its own
+    /// entries match its text and the re-analysis in progress has no work
+    /// left in it. While it waits, its work goes first.
+    ///
+    /// Diagnostics need this and no more: the rest of the re-analysis can
+    /// still move what they read, and reports those files affected when it
+    /// settles.
+    pub async fn wait_until_file_settled_for(
+        &self,
+        cancel_token: &CancellationToken,
+        request_method: &'static str,
+        uri: &Uri,
+    ) -> Freshness {
+        #[cfg(test)]
+        self.freshness_waits.fetch_add(1, Ordering::AcqRel);
+
+        let started_at = Instant::now();
+        let mut warned_stuck = false;
+
+        loop {
+            let notified = self.reindex_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if self.file_is_answerable(uri).await && !self.file_is_settling(uri).await {
+                return Freshness::Fresh;
+            }
+
+            if !self.debounce_loop_alive() {
+                return Freshness::LoopDead;
+            }
+
+            let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
+
+            tokio::select! {
+                _ = notified => {}
+                _ = cancel_token.cancelled() => return Freshness::Cancelled,
+                _ = tokio::time::sleep(remaining), if !warned_stuck => {
+                    self.log_freshness_stuck(request_method, started_at).await;
+                    warned_stuck = true;
+                }
+            }
+        }
+    }
+
+    /// Whether the re-analysis in progress still has work in the document at
+    /// `uri`; if it has, the next slice settles that work first.
+    async fn file_is_settling(&self, uri: &Uri) -> bool {
+        if !self.settling.load(Ordering::Acquire) {
+            return false;
+        }
+        let analysis = self.analysis.read().await;
+        let Some(file_id) = analysis.get_file_id(uri) else {
+            return false;
+        };
+        self.file_id_is_settling(&analysis, file_id)
+    }
+
+    /// Whether `analysis`'s re-analysis in progress still has work in
+    /// `file_id`; if it has, the next slice settles that work first.
+    fn file_id_is_settling(&self, analysis: &EmmyLuaAnalysis, file_id: FileId) -> bool {
+        let settling = analysis.compilation.is_settling(file_id);
+        if settling && let Ok(mut prioritised) = self.prioritised.lock() {
+            prioritised.push(file_id);
+        }
+        settling
+    }
+
     /// Profiled form of [`Self::wait_until_fresh_for`]: identical wake-up
     /// behavior, plus time accumulated by observed state.
     pub async fn wait_until_fresh_for_profiled(
@@ -495,9 +576,11 @@ impl DebouncedAnalysis {
         );
     }
 
-    /// Wait until the given file is no longer pending reindex. Returns
-    /// `LoopDead` without diagnosing when the debounce loop is dead (freshness
-    /// can never arrive); callers must abort rather than diagnose stale data.
+    /// Wait until the given file is no longer pending reindex and the
+    /// re-analysis in progress has no work left in it, which it then settles
+    /// first. Returns `LoopDead` without diagnosing when the debounce loop is
+    /// dead (freshness can never arrive); callers must abort rather than
+    /// diagnose stale data.
     pub async fn wait_for_reindex(
         &self,
         file_id: FileId,
@@ -512,7 +595,8 @@ impl DebouncedAnalysis {
                 let pending = self.pending_files.lock().await;
                 let reindexing = self.reindexing_files.lock().await;
                 pending.contains(&file_id) || reindexing.contains(&file_id)
-            };
+            } || (self.settling.load(Ordering::Acquire)
+                && self.file_id_is_settling(&*self.analysis.read().await, file_id));
             if !is_pending {
                 return Freshness::Fresh;
             }
@@ -562,69 +646,134 @@ impl DebouncedAnalysis {
         });
     }
 
-    /// Re-analyses the edited files under the write lock, on a blocking
-    /// thread so neither the wait for the lock nor the work stalls the Tokio
-    /// workers. Returns the files whose diagnostics may have changed.
-    async fn reindex_without_queuing(
+    /// Takes the edited files into the re-analysis under the write lock, on
+    /// a blocking thread so neither the wait for the lock nor the work stalls
+    /// the Tokio workers; the re-analysis then settles in slices. Returns
+    /// whether it took them.
+    async fn take_edits(
         &self,
         file_ids: Vec<FileId>,
         timing: Option<&mut crate::util::ls_profile::WriteTimings>,
-    ) -> Option<Vec<FileId>> {
+    ) -> bool {
         let profile = timing.is_some();
+        let analysis = self.analysis.clone();
+        let cache = self.shared_diagnostic_data_cache.clone();
+
+        tokio::select! {
+            _ = self.shutdown.cancelled() => false,
+            result = tokio::task::spawn_blocking(move || {
+                let wait_start = profile.then(Instant::now);
+                let mut guard = analysis.blocking_write();
+                let wait = wait_start.map(|start| start.elapsed()).unwrap_or_default();
+                let hold_start = profile.then(Instant::now);
+                guard.begin_reindex(file_ids);
+                // Under the write lock, so no reader sees the new index next
+                // to stale shared diagnostic data.
+                cache.invalidate();
+                let hold = hold_start.map(|start| start.elapsed()).unwrap_or_default();
+                (wait, hold)
+            }) => match result {
+                Ok((wait, hold)) => {
+                    if let Some(timing) = timing {
+                        timing.wait = wait;
+                        timing.hold = hold;
+                    }
+                    self.settling.store(true, Ordering::Release);
+                    true
+                }
+                Err(err) => {
+                    log::error!("reindex task failed: {}", err);
+                    false
+                }
+            }
+        }
+    }
+
+    /// Advances the re-analysis by one slice under the write lock, the
+    /// prioritised files first. Returns where it stands and which of
+    /// `edited` settled ahead of the rest; `None` on shutdown or failure.
+    async fn advance_slice(&self, edited: Vec<FileId>) -> Option<(UpdateProgress, Vec<FileId>)> {
+        let prioritised = self
+            .prioritised
+            .lock()
+            .map(|mut prioritised| std::mem::take(&mut *prioritised))
+            .unwrap_or_default();
         let analysis = self.analysis.clone();
         let cache = self.shared_diagnostic_data_cache.clone();
 
         tokio::select! {
             _ = self.shutdown.cancelled() => None,
             result = tokio::task::spawn_blocking(move || {
-                let wait_start = profile.then(Instant::now);
                 let mut guard = analysis.blocking_write();
-                let wait = wait_start.map(|start| start.elapsed()).unwrap_or_default();
-                let hold_start = profile.then(Instant::now);
-                let affected = guard.reindex_files(file_ids);
-                // Under the write lock, so no reader sees the new index next
-                // to stale shared diagnostic data.
+                guard.compilation.prioritise_update(&prioritised);
+                let progress = guard.advance_reindex(Slice::Until(Instant::now() + SLICE));
                 cache.invalidate();
-                let hold = hold_start.map(|start| start.elapsed()).unwrap_or_default();
-                (affected, wait, hold)
+                let settled_first = edited
+                    .into_iter()
+                    .filter(|file_id| !guard.compilation.settles_first(*file_id))
+                    .collect::<Vec<_>>();
+                (progress, settled_first)
             }) => match result {
-                Ok((affected, wait, hold)) => {
-                    if let Some(timing) = timing {
-                        timing.wait = wait;
-                        timing.hold = hold;
-                    }
-                    Some(affected)
-                }
+                Ok(outcome) => Some(outcome),
                 Err(err) => {
-                    log::error!("reindex task failed: {}", err);
+                    log::error!("reindex slice failed: {}", err);
                     None
                 }
             }
         }
     }
 
-    /// Re-diagnoses the files an edit affected besides the edited documents,
-    /// whose diagnostics the client pulls itself, and refreshes the client's
-    /// derived views when the edit reached other files.
+    /// Takes in the files whose text changed without a schedule reaching the
+    /// loop, so a re-analysis never waits on text it has not taken.
+    async fn take_unscheduled_text(&self) -> Vec<FileId> {
+        let file_ids = self
+            .analysis
+            .read()
+            .await
+            .compilation
+            .get_db()
+            .get_vfs()
+            .files_changed_since_taken();
+        if !file_ids.is_empty() && !self.take_edits(file_ids.clone(), None).await {
+            return Vec::new();
+        }
+        file_ids
+    }
+
+    /// Lets requests aimed at `file_ids` through: their own entries match
+    /// their text.
+    async fn release_documents(&self, file_ids: &[FileId]) {
+        if file_ids.is_empty() {
+            return;
+        }
+        let mut reindexing = self.reindexing_files.lock().await;
+        let mut blocked = self.blocked_documents.lock().await;
+        for id in file_ids {
+            reindexing.remove(id);
+            blocked.remove(id);
+        }
+    }
+
+    /// Re-diagnoses the files a re-analysis reported affected, the edited
+    /// documents among them when what their diagnostics read moved after the
+    /// client pulled them, and refreshes the client's derived views when the
+    /// edit reached other files.
     async fn refresh_affected(
         &self,
         edited: &[FileId],
         affected: Vec<FileId>,
         idle_workspace_diagnostic_token: &mut Option<CancellationToken>,
     ) {
-        let others = affected
-            .iter()
-            .copied()
-            .filter(|file_id| !edited.contains(file_id))
-            .collect::<Vec<_>>();
-        if others.is_empty() {
+        if affected.is_empty() {
             return;
         }
-        if self.lsp_features.supports_semantic_tokens_refresh() {
-            self.client.refresh_semantic_tokens();
-        }
-        if self.lsp_features.supports_inlay_hint_refresh() {
-            self.client.refresh_inlay_hints();
+        if affected.iter().any(|file_id| !edited.contains(file_id)) {
+            if self.lsp_features.supports_semantic_tokens_refresh() {
+                self.client.refresh_semantic_tokens();
+            }
+            if self.lsp_features.supports_inlay_hint_refresh() {
+                self.client.refresh_inlay_hints();
+            }
         }
         let interval = self
             .analysis
@@ -638,15 +787,21 @@ impl DebouncedAnalysis {
             .note_scoped_sweep_files(affected.iter().copied())
             .await;
         self.file_diagnostic
-            .add_files_diagnostic_task(others, interval, None)
+            .add_files_diagnostic_task(affected, interval, None)
             .await;
         self.arm_idle_workspace_diagnostic(idle_workspace_diagnostic_token);
     }
 
-    /// Background loop: waits for edits, debounces, then re-analyses them.
-    /// Spawn this once at server startup.
+    /// Background loop: waits for edits, debounces them, takes them into the
+    /// re-analysis, then settles it in slices that release the analysis lock,
+    /// so requests run between them. New edits pre-empt the slices and are
+    /// taken in, settling first. Spawn this once at server startup.
     pub async fn run(&self) {
         let mut idle_workspace_diagnostic_token: Option<CancellationToken> = None;
+        // The edited files of the re-analysis in progress.
+        let mut edited: Vec<FileId> = Vec::new();
+        let mut cycle = None;
+        let mut text_changed = false;
         loop {
             // Register before testing the condition: `notify_waiters()` stores
             // no permit, so a signal landing in between would be lost.
@@ -654,89 +809,124 @@ impl DebouncedAnalysis {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            let needs_work = !self.pending_files.lock().await.is_empty()
-                || self.has_pending_changes.load(Ordering::Acquire);
-            if !needs_work {
-                tokio::select! {
-                    _ = notified => {}
-                    _ = self.shutdown.cancelled() => return,
+            let scheduled = !self.pending_files.lock().await.is_empty();
+            let settling = self.settling.load(Ordering::Acquire);
+            if !scheduled && (!settling || text_changed) {
+                let needs_work = self.has_pending_changes.load(Ordering::Acquire) && !settling;
+                if !needs_work {
+                    tokio::select! {
+                        _ = notified => {}
+                        _ = self.shutdown.cancelled() => return,
+                        // Text that changed without a schedule reaching the
+                        // loop is taken in rather than left blocking slices.
+                        _ = tokio::time::sleep(self.debounce_duration), if text_changed => {
+                            let taken = self.take_unscheduled_text().await;
+                            edited.extend(taken);
+                        }
+                    }
+                    text_changed = false;
+                    continue;
                 }
             }
 
-            // Debounce: keep resetting the timer while new events arrive.
-            let cycle_id = crate::util::ls_profile::ls_profile_enabled()
-                .then(crate::util::ls_profile::next_reindex_cycle);
-            let debounce_start = crate::util::ls_profile::profile_instant();
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = self.shutdown.cancelled() => return,
-                    _ = self.notify.notified() => continue,
-                    _ = tokio::time::sleep(self.debounce_duration) => break,
+            if scheduled || !settling {
+                // Debounce: keep resetting the timer while new events arrive.
+                cycle = crate::util::ls_profile::ls_profile_enabled()
+                    .then(crate::util::ls_profile::next_reindex_cycle);
+                let debounce_start = crate::util::ls_profile::profile_instant();
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = self.shutdown.cancelled() => return,
+                        _ = self.notify.notified() => continue,
+                        _ = tokio::time::sleep(self.debounce_duration) => break,
+                    }
                 }
-            }
-            let debounce_elapsed = debounce_start
-                .map(|start| start.elapsed())
-                .unwrap_or_default();
+                let debounce_elapsed = debounce_start
+                    .map(|start| start.elapsed())
+                    .unwrap_or_default();
 
-            let file_ids: Vec<FileId> = {
-                let mut pending = self.pending_files.lock().await;
-                let mut reindexing = self.reindexing_files.lock().await;
-                let mut ids: Vec<FileId> = pending.drain().collect();
-                ids.sort();
-                reindexing.extend(ids.iter().copied());
-                ids
-            };
-
-            if !file_ids.is_empty() {
-                log::info!(
-                    "debounced reindex: {} file(s) after {}ms quiet",
-                    file_ids.len(),
-                    self.debounce_duration.as_millis()
-                );
-                let mut timings = crate::util::ls_profile::WriteTimings::default();
-                let affected = self
-                    .reindex_without_queuing(file_ids.clone(), cycle_id.map(|_| &mut timings))
-                    .await;
-                {
+                let file_ids: Vec<FileId> = {
+                    let mut pending = self.pending_files.lock().await;
                     let mut reindexing = self.reindexing_files.lock().await;
-                    let mut blocked = self.blocked_documents.lock().await;
-                    for id in &file_ids {
-                        reindexing.remove(id);
-                        blocked.remove(id);
-                    }
-                }
-                if let Some(cycle) = cycle_id {
-                    crate::util::ls_profile::emit_ls_reindex(
-                        cycle,
-                        debounce_elapsed,
-                        timings.wait,
-                        timings.hold,
+                    let mut ids: Vec<FileId> = pending.drain().collect();
+                    ids.sort();
+                    reindexing.extend(ids.iter().copied());
+                    ids
+                };
+
+                if !file_ids.is_empty() {
+                    log::info!(
+                        "debounced reindex: {} file(s) after {}ms quiet",
+                        file_ids.len(),
+                        self.debounce_duration.as_millis()
                     );
-                }
-                match affected {
-                    Some(affected) => {
-                        self.refresh_affected(
-                            &file_ids,
-                            affected,
-                            &mut idle_workspace_diagnostic_token,
-                        )
+                    let mut timings = crate::util::ls_profile::WriteTimings::default();
+                    let taken = self
+                        .take_edits(file_ids.clone(), cycle.map(|_| &mut timings))
                         .await;
+                    if let Some(cycle) = cycle {
+                        crate::util::ls_profile::emit_ls_reindex(
+                            cycle,
+                            debounce_elapsed,
+                            timings.wait,
+                            timings.hold,
+                        );
                     }
-                    // Only shutdown stops the loop; a failed reindex falls
-                    // through so freshness waiters are released.
-                    None if self.shutdown.is_cancelled() => return,
-                    None => log::error!(
-                        "LS_REINDEX_FAILED reindex of {} file(s) did not complete; continuing so freshness waiters are released",
-                        file_ids.len()
-                    ),
+                    if taken {
+                        edited.extend(file_ids);
+                    } else if self.shutdown.is_cancelled() {
+                        return;
+                    } else {
+                        // Freshness waiters are released rather than parked on
+                        // files that will not be re-analysed.
+                        log::error!(
+                            "LS_REINDEX_FAILED reindex of {} file(s) did not start; continuing so freshness waiters are released",
+                            file_ids.len()
+                        );
+                        self.release_documents(&file_ids).await;
+                    }
                 }
+                text_changed = false;
+                self.refresh_dirty_state().await;
+                self.reindex_notify.notify_waiters();
+                continue;
             }
 
-            self.refresh_dirty_state().await;
-            // Waiters re-check their condition even when nothing was pending:
-            // clearing the dirty flag lets them proceed.
+            let Some((progress, settled_first)) = self.advance_slice(edited.clone()).await else {
+                if self.shutdown.is_cancelled() {
+                    return;
+                }
+                log::error!(
+                    "LS_REINDEX_FAILED a re-analysis slice did not complete; continuing so freshness waiters are released"
+                );
+                self.settling.store(false, Ordering::Release);
+                self.release_documents(&std::mem::take(&mut edited)).await;
+                self.refresh_dirty_state().await;
+                self.reindex_notify.notify_waiters();
+                continue;
+            };
+            self.release_documents(&settled_first).await;
+            match progress {
+                UpdateProgress::Settling => {}
+                UpdateProgress::Settled(affected) => {
+                    self.settling.store(false, Ordering::Release);
+                    let settled = std::mem::take(&mut edited);
+                    self.release_documents(&settled).await;
+                    if let Some(cycle) = cycle.take() {
+                        crate::util::ls_profile::emit_ls_settled(cycle, affected.len());
+                    }
+                    self.refresh_affected(&settled, affected, &mut idle_workspace_diagnostic_token)
+                        .await;
+                    self.refresh_dirty_state().await;
+                }
+                // A didChange applied its text; its schedule pre-empts.
+                UpdateProgress::TextChanged => text_changed = true,
+            }
+            // Waiters re-check their condition after every slice: the edited
+            // documents or a waited-on file may have settled.
             self.reindex_notify.notify_waiters();
+            tokio::task::yield_now().await;
         }
     }
 
@@ -746,7 +936,8 @@ impl DebouncedAnalysis {
         let pending = self.pending_files.lock().await;
         let reindexing = self.reindexing_files.lock().await;
 
-        let has_pending_file_work = !pending.is_empty() || !reindexing.is_empty();
+        let has_pending_file_work =
+            !pending.is_empty() || !reindexing.is_empty() || self.settling.load(Ordering::Acquire);
         let has_in_flight_changes = self.in_flight_changes.load(Ordering::Acquire) > 0;
 
         self.has_pending_changes.store(
@@ -857,6 +1048,21 @@ mod tests {
             Arc::new(AtomicU8::new(0)),
             test_lsp_features(),
         ))
+    }
+
+    /// Takes `file_ids` in and settles the re-analysis slice by slice, as the
+    /// loop does. Returns the files it reported affected.
+    async fn settle(debounced_analysis: &DebouncedAnalysis, file_ids: Vec<FileId>) -> Vec<FileId> {
+        assert!(debounced_analysis.take_edits(file_ids, None).await);
+        loop {
+            let (progress, _) = debounced_analysis
+                .advance_slice(Vec::new())
+                .await
+                .expect("a slice completes");
+            if let glua_code_analysis::UpdateProgress::Settled(affected) = progress {
+                return affected;
+            }
+        }
     }
 
     fn has_diagnostic_code(diagnostics: &[Diagnostic], code: DiagnosticCode) -> bool {
@@ -1150,10 +1356,7 @@ mod tests {
                 Arc::new(AtomicU8::new(0)),
                 test_lsp_features(),
             );
-            let affected = debounced_analysis
-                .reindex_without_queuing(vec![api_file_id], None)
-                .await;
-            verify_that!(affected.is_some(), eq(true))?;
+            settle(&debounced_analysis, vec![api_file_id]).await;
 
             let updated_diagnostics = file_diagnostic
                 .pull_file_diagnostics(user_uri, CancellationToken::new())
@@ -1395,6 +1598,142 @@ mod tests {
 
             let revision_after = reference_revision(&analysis, consumer_id).await;
             verify_that!(revision_after, eq(revision_before))?;
+            Ok(())
+        })
+    }
+
+    /// A diagnostics pull for a file the re-analysis still has work in waits
+    /// for that work, which the next slice settles first, then answers.
+    #[gtest]
+    fn a_diagnostics_wait_for_a_file_still_settling_puts_it_first() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let mut analysis = EmmyLuaAnalysis::new();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_settled_wait");
+            analysis.add_main_workspace(workspace.clone());
+            let provider_uri = file_path_to_uri(&workspace.join("lua/settle/provider.lua"))
+                .expect("provider URI should parse");
+            let consumer_uri = file_path_to_uri(&workspace.join("lua/settle/consumer.lua"))
+                .expect("consumer URI should parse");
+            analysis
+                .update_file_by_uri(&provider_uri, Some("Shared = { Value = 1 }\n".to_string()));
+            analysis.update_file_by_uri(
+                &consumer_uri,
+                Some("local got = Shared.Value\n".to_string()),
+            );
+            let consumer_id = analysis
+                .get_file_id(&consumer_uri)
+                .expect("consumer file id");
+            let provider_id = analysis
+                .update_file_text_only(&provider_uri, "Shared = { Value = \"text\" }\n".to_string())
+                .expect("provider file id");
+            let analysis = Arc::new(RwLock::new(analysis));
+            let (debounced_analysis, _peer) = loop_test_debounced_analysis(analysis.clone());
+            assert!(debounced_analysis.take_edits(vec![provider_id], None).await);
+            verify_that!(
+                analysis.read().await.compilation.is_settling(consumer_id),
+                eq(true)
+            )?;
+
+            let waiter = tokio::spawn({
+                let debounced_analysis = debounced_analysis.clone();
+                let consumer_uri = consumer_uri.clone();
+                async move {
+                    debounced_analysis
+                        .wait_until_file_settled_for(
+                            &CancellationToken::new(),
+                            "textDocument/diagnostic",
+                            &consumer_uri,
+                        )
+                        .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !debounced_analysis
+                    .prioritised
+                    .lock()
+                    .expect("prioritised files")
+                    .contains(&consumer_id)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the pull should put its file first");
+            verify_that!(waiter.is_finished(), eq(false))?;
+
+            while analysis.read().await.compilation.is_settling(consumer_id) {
+                debounced_analysis.reindex_notify.notify_waiters();
+                debounced_analysis
+                    .advance_slice(Vec::new())
+                    .await
+                    .expect("a slice completes");
+                debounced_analysis.reindex_notify.notify_waiters();
+            }
+            debounced_analysis.reindex_notify.notify_waiters();
+            let freshness = tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("the pull should be released once its file settled")
+                .expect("waiter task must not panic");
+            verify_that!(freshness, eq(Freshness::Fresh))?;
+            Ok(())
+        })
+    }
+
+    /// An edit scheduled while the previous one is still settling in slices
+    /// is taken into the same re-analysis, and the workspace settles to the
+    /// last text.
+    #[gtest]
+    fn an_edit_made_while_the_last_one_settles_is_taken_in() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let mut analysis = EmmyLuaAnalysis::new();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_preempt");
+            analysis.add_main_workspace(workspace.clone());
+            analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::UndefinedGlobal);
+            let provider_uri = file_path_to_uri(&workspace.join("lua/preempt/provider.lua"))
+                .expect("provider URI should parse");
+            let consumer_uri = file_path_to_uri(&workspace.join("lua/preempt/consumer.lua"))
+                .expect("consumer URI should parse");
+            analysis
+                .update_file_by_uri(&provider_uri, Some("function OldName() end\n".to_string()));
+            analysis.update_file_by_uri(&consumer_uri, Some("OldName()\n".to_string()));
+            let consumer_id = analysis
+                .get_file_id(&consumer_uri)
+                .expect("consumer file id");
+            let provider_id = analysis
+                .update_file_text_only(&provider_uri, "function NewName() end\n".to_string())
+                .expect("provider file id");
+            let analysis = Arc::new(RwLock::new(analysis));
+            let (debounced_analysis, _peer) = loop_test_debounced_analysis(analysis.clone());
+            assert!(debounced_analysis.take_edits(vec![provider_id], None).await);
+
+            // The second edit lands before the first settled.
+            analysis
+                .write()
+                .await
+                .update_file_text_only(&provider_uri, "function OldName() end\n".to_string());
+            let (progress, _) = debounced_analysis
+                .advance_slice(Vec::new())
+                .await
+                .expect("a slice completes");
+            verify_that!(
+                progress,
+                eq(&glua_code_analysis::UpdateProgress::TextChanged)
+            )?;
+            settle(&debounced_analysis, vec![provider_id]).await;
+
+            let diagnostics = analysis
+                .read()
+                .await
+                .diagnose_file(consumer_id, CancellationToken::new())
+                .unwrap_or_default();
+            verify_that!(
+                has_diagnostic_code(&diagnostics, DiagnosticCode::UndefinedGlobal),
+                eq(false)
+            )?;
             Ok(())
         })
     }

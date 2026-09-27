@@ -21,12 +21,12 @@ pub async fn on_emmy_annotator_handler(
 
     let uri = Uri::from_str(&params.uri).ok()?;
 
-    // Wait for any pending reindex to finish so we compute against
-    // consistent tree + index data. Cancel-aware: bails out when a
+    // Wait until this document's entries match its text so we compute
+    // against a consistent tree and index. Cancel-aware: bails out when a
     // new didChange fires cancel_all_requests().
     if context
         .debounced_analysis()
-        .wait_until_fresh_for(&cancel_token, "gluals/emmyAnnotator")
+        .wait_until_file_fresh_for(&cancel_token, "gluals/emmyAnnotator", &uri)
         .await
         != Freshness::Fresh
     {

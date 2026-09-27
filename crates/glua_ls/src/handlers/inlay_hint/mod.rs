@@ -30,11 +30,11 @@ pub async fn on_inlay_hint_handler(
         return None;
     }
 
-    // Wait for any pending reindex to finish so we serve fresh hints
-    // computed against consistent tree + index data.
+    // Wait until this document's entries match its text so the hints are
+    // computed against a consistent tree and index.
     if context
         .debounced_analysis()
-        .wait_until_fresh_for(&cancel_token, "textDocument/inlayHint")
+        .wait_until_file_fresh_for(&cancel_token, "textDocument/inlayHint", &uri)
         .await
         != Freshness::Fresh
     {

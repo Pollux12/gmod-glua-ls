@@ -446,6 +446,14 @@ impl Vfs {
         }
     }
 
+    /// The files whose text changed since a re-analysis last took them,
+    /// sorted.
+    pub fn files_changed_since_taken(&self) -> Vec<FileId> {
+        let mut files = self.edit_bases.keys().copied().collect::<Vec<_>>();
+        files.sort_unstable();
+        files
+    }
+
     /// Where the edits since `file_ids` were last indexed moved their
     /// positions, for the files that had text then and still have it; the
     /// edits are forgotten.
