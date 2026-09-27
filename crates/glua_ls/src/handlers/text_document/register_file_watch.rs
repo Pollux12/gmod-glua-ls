@@ -146,7 +146,9 @@ async fn register_files_watch_use_fsnotify(context: ServerContextSnapshot) -> Op
                     let params = DidChangeWatchedFilesParams {
                         changes: file_events,
                     };
+                    let in_flight = context.debounced_analysis_arc().begin_in_flight_change();
                     on_did_change_watched_files(context.clone(), params).await;
+                    in_flight.finish().await;
                 }
                 Err(e) => {
                     warn!("watch files notify error: {:?}", e);

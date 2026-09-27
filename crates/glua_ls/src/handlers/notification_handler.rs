@@ -165,13 +165,39 @@ pub async fn on_notification_handler(
         return Ok(());
     }
 
+    if notification.method == <DidChangeWatchedFiles as LspNotification>::METHOD {
+        if let Ok(params) = notification
+            .extract::<<DidChangeWatchedFiles as LspNotification>::Params>(
+                DidChangeWatchedFiles::METHOD,
+            )
+        {
+            let snapshot = server_context.snapshot();
+            // Pending from the moment it arrives: a diagnostics pull answered
+            // before the handler applies it would report the files as they were.
+            let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
+            tokio::spawn(async move {
+                let handler_snapshot = snapshot.clone();
+                let handle = tokio::spawn(async move {
+                    on_did_change_watched_files(handler_snapshot, params).await;
+                });
+                if let Err(err) = handle.await {
+                    log::error!(
+                        "LS_WATCHED_FILES_PANIC didChangeWatchedFiles handler failed: {}",
+                        err
+                    );
+                }
+                in_flight.finish().await;
+            });
+        }
+        return Ok(());
+    }
+
     dispatch_notification!(notification, server_context, {
         sync: {
             // Intentionally empty - async to keep the message for $/cancelRequest processing.
         }
         async: {
             DidSaveTextDocument => on_did_save_text_document,
-            DidChangeWatchedFiles => on_did_change_watched_files,
             SetTrace => on_set_trace,
             DidChangeConfiguration => on_did_change_configuration,
             DidChangeWorkspaceFolders => on_did_change_workspace_folders,
@@ -189,4 +215,46 @@ async fn handle_cancel(server_context: &mut ServerContext, params: CancelParams)
     };
 
     server_context.cancel(req_id).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use lsp_server::Connection;
+    use lsp_types::{
+        ClientCapabilities, DidChangeWatchedFilesParams, FileChangeType, FileEvent, Uri,
+    };
+
+    use super::*;
+
+    /// A watched-file change is pending from the moment it arrives, so a
+    /// diagnostics pull waits for it instead of reporting the files as they
+    /// were before it.
+    #[test]
+    fn a_watched_file_change_is_pending_once_received() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, _peer) = Connection::memory();
+        runtime.block_on(async {
+            let mut context = ServerContext::new(connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            let params = DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Uri::from_str("file:///workspace/gone.lua").unwrap(),
+                    typ: FileChangeType::DELETED,
+                }],
+            };
+            let notification = Notification::new(DidChangeWatchedFiles::METHOD.to_string(), params);
+
+            // Held, so the handler cannot apply the change before the check.
+            let held = snapshot.analysis().write().await;
+            on_notification_handler(notification, &mut context)
+                .await
+                .expect("the notification is handled");
+            let pending = snapshot.debounced_analysis().is_dirty();
+            drop(held);
+
+            assert!(pending);
+        });
+    }
 }
