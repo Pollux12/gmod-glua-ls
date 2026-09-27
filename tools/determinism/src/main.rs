@@ -34,6 +34,13 @@
 //! how many files' diagnostics it reported affected. For `noop`, `touch` and
 //! `shift` any evaluated file outside the edited files is a divergence.
 //!
+//! Reach: every warm stage compares the base with its oracle. A file whose
+//! diagnostics changed but that the run neither edited nor reported affected
+//! is a divergence (`STALE`): the language server re-diagnoses only affected
+//! files. The `[waste]` line counts the files whose diagnostics or stored
+//! types changed (needed) against those the run evaluated and reported
+//! affected; whatever it reached beyond the needed files was wasted.
+//!
 //! `DET_REPLAY=1` also replays the warm run's `update_index` batch log onto a
 //! fork of the oracle and compares again: drift that disappears depends on
 //! batch composition, drift that survives is an incremental-path bug.
@@ -1989,6 +1996,146 @@ fn report_reach(
     }
 }
 
+/// A warm run's reach by file label: the files it edited, evaluated and
+/// reported affected.
+struct Reached {
+    edited: BTreeSet<String>,
+    evaluated: BTreeSet<String>,
+    affected: BTreeSet<String>,
+}
+
+impl Reached {
+    /// Labels each file by the base, or by the warm run for a file it created.
+    fn of(
+        base: &EmmyLuaAnalysis,
+        warm: &EmmyLuaAnalysis,
+        edited: &[FileId],
+        reach: &Reach,
+    ) -> Self {
+        let label = |file_id: &FileId| {
+            [base, warm]
+                .into_iter()
+                .find_map(|analysis| {
+                    analysis
+                        .compilation
+                        .get_db()
+                        .get_vfs()
+                        .get_file_path(file_id)
+                        .map(|path| path.display().to_string().replace('\\', "/"))
+                })
+                .unwrap_or_else(|| format!("{file_id:?}"))
+        };
+        Self {
+            edited: edited.iter().map(label).collect(),
+            evaluated: reach.evaluated.iter().map(label).collect(),
+            affected: reach.affected.iter().map(label).collect(),
+        }
+    }
+}
+
+/// Checks a warm run's reach against what its edit changed between the base
+/// and the oracle. A file whose diagnostics changed must have been edited or
+/// reported affected, or the language server leaves its diagnostics stale.
+/// Also reports the files evaluated or reported affected with nothing of
+/// theirs changing, and the files whose facts changed without being
+/// evaluated.
+fn check_reach(label: &str, base: &Snap, expected: &Snap, reached: &Reached) {
+    let diagnostics_changed =
+        files_with_changed_diagnostics(&base.diagnostics, &expected.diagnostics);
+    let stale = diagnostics_changed
+        .iter()
+        .filter(|file| !reached.edited.contains(*file) && !reached.affected.contains(*file))
+        .collect::<Vec<_>>();
+    let beyond_edited = |files: &BTreeSet<String>| {
+        files
+            .iter()
+            .filter(|file| !reached.edited.contains(*file))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    };
+    let mut needed = files_with_changed_types(&base.index, &expected.index);
+    needed.extend(diagnostics_changed.iter().cloned());
+    let needed = beyond_edited(&needed);
+    let evaluated = beyond_edited(&reached.evaluated);
+    let diagnostics_changed = beyond_edited(&diagnostics_changed);
+    let affected = beyond_edited(&reached.affected);
+    println!(
+        "[waste {label}] needed={} evaluated={} wasted={} missed={}; diagnostics changed={} affected={} wasted={}",
+        needed.len(),
+        evaluated.len(),
+        evaluated.difference(&needed).count(),
+        needed.difference(&evaluated).count(),
+        diagnostics_changed.len(),
+        affected.len(),
+        affected.difference(&diagnostics_changed).count(),
+    );
+    if !stale.is_empty() {
+        record_divergence();
+        println!(
+            "STALE {label}: {} file(s) whose diagnostics changed were not reported affected",
+            stale.len()
+        );
+        for file in stale.iter().take(diff_limit()) {
+            println!("  STALE {file}");
+        }
+    }
+}
+
+/// The files whose diagnostics differ between `before` and `after`.
+fn files_with_changed_diagnostics(
+    before: &BTreeSet<Snapshot>,
+    after: &BTreeSet<Snapshot>,
+) -> BTreeSet<String> {
+    let by_file = |diagnostics: &BTreeSet<Snapshot>| {
+        let mut by_file = BTreeMap::<String, Vec<Snapshot>>::new();
+        for diagnostic in diagnostics {
+            by_file
+                .entry(diagnostic.file.clone())
+                .or_default()
+                .push(diagnostic.clone());
+        }
+        by_file
+    };
+    let (before, after) = (by_file(before), by_file(after));
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|file| before.get(*file) != after.get(*file))
+        .cloned()
+        .collect()
+}
+
+/// The files whose stored types differ between `before` and `after`, from
+/// the type caches and type facts keyed `file|owner`. A type fact's trailing
+/// `/wN` counts the writers sharing the member's slot across the workspace,
+/// which is no fact of the file itself.
+fn files_with_changed_types(before: &IndexSnapshot, after: &IndexSnapshot) -> BTreeSet<String> {
+    let mut files = BTreeSet::new();
+    for (before, after, counts_writers) in [
+        (&before.type_caches, &after.type_caches, false),
+        (&before.type_facts, &after.type_facts, true),
+    ] {
+        let own = |value: &String| {
+            if counts_writers {
+                value
+                    .rsplit_once("/w")
+                    .map_or(value.as_str(), |(fact, _)| fact)
+            } else {
+                value.as_str()
+            }
+            .to_string()
+        };
+        for key in before.keys().chain(after.keys()) {
+            if before.get(key).map(own) != after.get(key).map(own)
+                && let Some((file, _)) = key.split_once('|')
+            {
+                files.insert(file.to_string());
+            }
+        }
+    }
+    files
+}
+
 fn replay(analysis: &mut EmmyLuaAnalysis, log: &[Vec<FileId>]) {
     for batch in log {
         analysis.compilation.remove_index(batch.clone());
@@ -2114,17 +2261,23 @@ impl Harness {
 
     /// Compares the warm run with the cold oracle of `input` and, with
     /// replay, with that oracle after replaying the warm run's batch log. The
-    /// oracle is built while the warm run is snapshotted.
+    /// oracle is built while the warm run is snapshotted. Then checks the
+    /// run's reach against what the edit changed; see [`check_reach`].
     fn check(
         &mut self,
         label: &str,
         warm: EmmyLuaAnalysis,
         log: &[Vec<FileId>],
         input: &ColdInput,
+        edited: &[FileId],
+        reach: &Reach,
     ) {
+        let reached = Reached::of(&self.base, &warm, edited, reach);
         let (actual, expected) = rayon::join(|| snapshot(&warm, label), || self.expected(input));
         drop(warm);
         compare("expected", &expected, label, &actual);
+        let base = self.expected(&ColdInput::default());
+        check_reach(label, &base, &expected, &reached);
         if self.replay {
             let mut replayed = self.oracle_analysis(input).fork();
             replay(&mut replayed, log);
@@ -2146,7 +2299,7 @@ impl Harness {
         input: &ColdInput,
     ) {
         let log = self.observe(label, &mut warm, edited, reach, strict);
-        self.check(label, warm, &log, input);
+        self.check(label, warm, &log, input, edited, reach);
     }
 
     fn edit(&mut self, targets: &[String], find: &str, replace: &str) {
@@ -2304,7 +2457,7 @@ impl Harness {
                 removed: vec![path.clone()],
                 ..ColdInput::default()
             };
-            self.check(&label, warm.fork(), &log, &removed);
+            self.check(&label, warm.fork(), &log, &removed, &[file_id], &reach);
 
             self.warm_started = Instant::now();
             warm.compilation.start_batch_log();
@@ -2318,7 +2471,7 @@ impl Harness {
                 created: vec![(path, original)],
                 ..removed
             };
-            self.check(&label, warm, &log, &recreated);
+            self.check(&label, warm, &log, &recreated, &[created_id], &reach);
         }
     }
 
@@ -2614,6 +2767,9 @@ fn run() {
         oracle: None,
         warm_started: Instant::now(),
     };
+    // Diagnosing the base records what each file's diagnostics read, so every
+    // warm run reports affected files from the same starting point.
+    harness.expected(&ColdInput::default());
     println!("[time] setup {:.1}s", started.elapsed().as_secs_f64());
     if let Ok(dump_path) = std::env::var("DET_DUMP") {
         let rendered = harness
