@@ -99,11 +99,25 @@ function typedTexts(text, find, replace) {
     return texts;
 }
 
+/** LSP `ServerCancelled`. */
+const SERVER_CANCELLED = -32802;
+
+/** Child processes still running, stopped before the scratch folder is removed. */
+const children = new Set();
+
+/** Resolves once `proc` has exited. */
+function exited(proc) {
+    if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
+    return new Promise((resolve) => proc.once('exit', resolve));
+}
+
 /** Runs `glua_check` on `dir` and returns its diagnostics by file. */
 function coldCheck(glua, dir, annotations, output) {
     return new Promise((resolve, reject) => {
         const proc = spawn(glua, [dir, '-f', 'json', '--output', output, '--gmod-annotations', annotations],
             { stdio: ['ignore', 'ignore', 'pipe'] });
+        children.add(proc);
+        proc.once('exit', () => children.delete(proc));
         let stderr = '';
         proc.stderr.on('data', (chunk) => { stderr += chunk; });
         proc.on('exit', () => {
@@ -180,7 +194,6 @@ async function main() {
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'glua_drift_'));
     const work = path.join(scratch, 'work');
     const edited = path.join(scratch, 'edited');
-    let serverProc = null;
     try {
         copyWorkspace(codebase, work);
         copyWorkspace(codebase, edited);
@@ -201,7 +214,7 @@ async function main() {
                 .then((output) => loadCold(edited, output)));
 
         const { proc, client, loadMs } = await startServer(server, work, annotations);
-        serverProc = proc;
+        children.add(proc);
         console.log(`[load] workspace loaded in ${(loadMs / 1000).toFixed(1)}s`);
 
         // What the client shows: the latest report per file, as VS Code keeps
@@ -222,25 +235,35 @@ async function main() {
             if (previous) previous(message);
         })(client.onNotification);
 
+        // A diagnostic pull the server cancels with `retriggerRequest` is sent
+        // again, as VS Code does; any other error fails the run.
+        const pull = async (method, params) => {
+            for (;;) {
+                const response = await client.request(method, params());
+                const error = response.message.error;
+                if (!error) return response.message.result;
+                if (error.code !== SERVER_CANCELLED || !(error.data && error.data.retriggerRequest)) {
+                    throw new Error(`${method} failed: ${JSON.stringify(error)}`);
+                }
+            }
+        };
+
         const open = new Set();
         // Settled once a workspace pull, which waits for fresh analysis, is
         // followed by no refresh request for --quiet-ms; then one more pull
         // picks up anything a missed refresh armed.
         const settle = async () => {
             for (const uri of open) {
-                const pull = await client.request('textDocument/diagnostic', {
+                const result = await pull('textDocument/diagnostic', () => ({
                     textDocument: { uri }, previousResultId: resultIds.get(uri),
-                });
-                apply(uri, pull.message.result);
+                }));
+                apply(uri, result);
             }
             const pullWorkspace = async () => {
-                const pull = await client.request('workspace/diagnostic', {
+                const result = await pull('workspace/diagnostic', () => ({
                     previousResultIds: [...resultIds].map(([uri, value]) => ({ uri, value })),
-                });
-                if (pull.message.error) {
-                    throw new Error(`workspace/diagnostic failed: ${JSON.stringify(pull.message.error)}`);
-                }
-                for (const item of (pull.message.result && pull.message.result.items) || []) {
+                }));
+                for (const item of (result && result.items) || []) {
                     apply(item.uri, item);
                 }
             };
@@ -297,9 +320,16 @@ async function main() {
         console.log(`[time] total ${((Date.now() - started) / 1000).toFixed(1)}s`);
         return differences;
     } finally {
-        if (serverProc) serverProc.kill();
-        await sleep(500);
-        fs.rmSync(scratch, { recursive: true, force: true });
+        // Windows keeps a folder until every process holding files in it has
+        // exited; a failed removal is reported without hiding the run's result.
+        const running = [...children];
+        for (const proc of running) proc.kill();
+        await Promise.all(running.map(exited));
+        try {
+            fs.rmSync(scratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+        } catch (error) {
+            console.error(`warning: could not remove ${scratch}: ${error.message}`);
+        }
     }
 }
 
