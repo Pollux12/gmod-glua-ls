@@ -2,13 +2,13 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
 
 use crate::{
-    DbIndex, FileId, InFiled, LuaDeclExtra, LuaDeclId, LuaDependencyKind, LuaInferCache,
-    LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId, LuaInferenceProvenanceKind,
-    LuaInferenceStep, LuaMemberId, LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaObjectType,
-    LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId, LuaTypeFact, WorkspaceId,
-    find_signature_attribute_use, get_member_map, get_member_value_expr,
-    get_prefix_expr_signature_id, infer_authoritative_method_self_type, infer_expr,
-    infer_expr_semantic_decl,
+    DbIndex, FileCallTargets, FileId, InFiled, LuaCallTarget, LuaDeclExtra, LuaDeclId,
+    LuaDependencyKind, LuaInferCache, LuaInferenceConfidence, LuaInferenceEventId,
+    LuaInferenceNodeId, LuaInferenceProvenanceKind, LuaInferenceStep, LuaMemberId,
+    LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaSemanticDeclId,
+    LuaSignatureId, LuaType, LuaTypeDeclId, LuaTypeFact, WorkspaceId, find_signature_attribute_use,
+    get_member_map, get_member_value_expr, get_prefix_expr_signature_id,
+    infer_authoritative_method_self_type, infer_expr, infer_expr_semantic_decl,
 };
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat,
@@ -55,6 +55,8 @@ struct FileScope {
     exact_receiver_candidates: HashMap<LuaMemberKey, bool>,
     authoritative_receivers: HashMap<LuaSignatureId, bool>,
     closures: HashMap<LuaSignatureId, Option<LuaClosureExpr>>,
+    /// What the file's calls target.
+    targets: Option<Arc<FileCallTargets>>,
 }
 
 impl FileScope {
@@ -68,7 +70,18 @@ impl FileScope {
             ),
             authoritative_receivers: HashMap::default(),
             closures: HashMap::default(),
+            targets: db.get_call_target_index().file(file_id),
         }
+    }
+
+    /// What `call_expr`, one of the file's calls, targets.
+    fn call_target(
+        &self,
+        db: &DbIndex,
+        cache: &mut LuaInferCache,
+        call_expr: &LuaCallExpr,
+    ) -> LuaCallTarget {
+        super::call_target::call_target(db, self.targets.as_deref(), cache, call_expr)
     }
 
     /// The closure `signature_id` was declared by, found once per signature.
@@ -131,14 +144,7 @@ pub(super) fn collect_file_contributions(db: &DbIndex, file_id: FileId) -> Vec<C
         return Vec::new();
     };
     let mut scope = FileScope::new(db, file_id, &root);
-    let mut cache = LuaInferCache::new(
-        file_id,
-        crate::CacheOptions {
-            analysis_phase: crate::LuaAnalysisPhase::Force,
-            dynamic_fields_visible: true,
-            call_site_params_visible: false,
-        },
-    );
+    let mut cache = LuaInferCache::new(file_id, super::call_target::pass_view());
     let mut contributions = Vec::new();
     for call_expr in root.syntax().descendants().filter_map(LuaCallExpr::cast) {
         collect_call_site_param_types(
@@ -647,28 +653,18 @@ fn collect_call_site_param_types(
         .filter(|(_, arg)| is_supported_call_site_arg_shape(db, file_id, arg))
         .collect::<Vec<_>>();
     let colon_call_arg_shift = usize::from(call_expr.is_colon_call());
-    let (mut signature_ids, lookup_kind) = signature_ids_from_call_prefix(
-        db,
-        cache,
-        scope,
-        file_id,
-        &prefix_expr,
-        call_expr.get_position(),
-    );
+    let (mut signature_ids, lookup_kind) =
+        signature_ids_from_call_prefix(db, cache, scope, file_id, &call_expr, &prefix_expr);
     if signature_ids.is_empty()
         && call_args
             .iter()
             .any(|arg| matches!(arg, LuaExpr::ClosureExpr(_)))
     {
-        if let Some(signature_id) = get_prefix_expr_signature_id(db, cache, &call_expr) {
-            signature_ids.push(signature_id);
-        } else if let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) {
-            collect_signature_ids(&prefix_type, &mut signature_ids);
+        let target = scope.call_target(db, cache, &call_expr);
+        match target.declared {
+            Some(signature_id) => signature_ids.push(signature_id),
+            None => signature_ids = target.inferred,
         }
-        signature_ids.sort_unstable_by_key(|signature_id| {
-            (signature_id.get_file_id().id, signature_id.get_position())
-        });
-        signature_ids.dedup();
     }
     for signature_id in signature_ids.iter().copied() {
         if is_call_site_realm_compatible(db, file_id, call_expr.get_position(), signature_id) {
@@ -982,7 +978,7 @@ fn collect_exact_colon_receiver_type(
         return None;
     }
     let receiver_expr = index_expr.get_prefix_expr()?;
-    let signature_id = get_prefix_expr_signature_id(db, cache, call_expr)?;
+    let signature_id = scope.call_target(db, cache, call_expr).declared?;
     if !is_call_site_realm_compatible(db, file_id, call_expr.get_position(), signature_id) {
         return None;
     }
@@ -1225,14 +1221,7 @@ fn signature_has_authoritative_receiver(db: &DbIndex, signature_id: LuaSignature
     else {
         return false;
     };
-    let mut cache = LuaInferCache::new(
-        signature_id.get_file_id(),
-        crate::CacheOptions {
-            analysis_phase: crate::LuaAnalysisPhase::Force,
-            dynamic_fields_visible: true,
-            call_site_params_visible: false,
-        },
-    );
+    let mut cache = LuaInferCache::new(signature_id.get_file_id(), super::call_target::pass_view());
     infer_authoritative_method_self_type(db, &mut cache, &func_stat).is_some()
 }
 
@@ -1281,9 +1270,10 @@ fn signature_ids_from_call_prefix(
     cache: &mut LuaInferCache,
     scope: &mut FileScope,
     file_id: FileId,
+    call_expr: &LuaCallExpr,
     prefix_expr: &LuaExpr,
-    call_position: TextSize,
 ) -> (Vec<LuaSignatureId>, SignatureLookupKind) {
+    let call_position = call_expr.get_position();
     let direct = match prefix_expr {
         LuaExpr::NameExpr(name_expr) => {
             signature_id_from_name_expr(db, scope, file_id, name_expr, call_position)
@@ -1297,10 +1287,7 @@ fn signature_ids_from_call_prefix(
         return (vec![signature_id], SignatureLookupKind::Direct);
     }
 
-    let mut signature_ids = Vec::new();
-    if let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) {
-        collect_signature_ids(&prefix_type, &mut signature_ids);
-    }
+    let mut signature_ids = scope.call_target(db, cache, call_expr).inferred;
     let mut lookup_kind = SignatureLookupKind::InferredCallable;
     if let LuaExpr::NameExpr(name_expr) = prefix_expr {
         let include_signature_ids = signature_ids_from_include_returned_table_member(
@@ -1970,24 +1957,6 @@ fn returned_local_table_owner(db: &DbIndex, file_id: FileId) -> Option<LuaMember
 
 fn is_self_name_expr(expr: &LuaExpr) -> bool {
     matches!(expr, LuaExpr::NameExpr(name) if name.get_name_text().as_deref() == Some("self"))
-}
-
-fn collect_signature_ids(typ: &LuaType, signature_ids: &mut Vec<LuaSignatureId>) {
-    match typ {
-        LuaType::Signature(signature_id) => signature_ids.push(*signature_id),
-        LuaType::Instance(instance) => collect_signature_ids(instance.get_base(), signature_ids),
-        LuaType::Union(union) => {
-            for typ in union.types() {
-                collect_signature_ids(typ, signature_ids);
-            }
-        }
-        LuaType::MultiLineUnion(union) => {
-            for (typ, _) in union.get_unions() {
-                collect_signature_ids(typ, signature_ids);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn signature_id_from_name_expr(

@@ -55,6 +55,24 @@ mod test {
         assert_eq!((inferred, flows), (0, 1));
     }
 
+    /// The call-site parameter pass reads a callee another file declares from
+    /// the file's call targets instead of inferring the call's prefix again.
+    #[test]
+    fn call_site_params_read_the_files_call_targets() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/sh_greet.lua",
+            "function Greet(name)\n    return name\nend\n",
+        );
+        let (_, counts) =
+            counted(|| ws.def_file("lua/autorun/sh_caller.lua", "Greet()\nGreet()\n"));
+        let inferred = counts
+            .get(&(Work::Infer, Some(DerivationKind::CallSiteParams)))
+            .map_or(0, |(computed, _)| *computed);
+
+        assert_eq!(inferred, 0);
+    }
+
     /// A stored target naming a function in another file moves with it when
     /// that file shifts, as resolving it again would find.
     #[test]
