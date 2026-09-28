@@ -2167,6 +2167,9 @@ fn check_reach(label: &str, base: &Snap, expected: &Snap, reached: &Reached) {
         affected.len(),
         affected.difference(&diagnostics_changed).count(),
     );
+    for file in needed.difference(&evaluated).take(diff_limit()) {
+        println!("  missed {file}");
+    }
     if !stale.is_empty() {
         println!(
             "STALE {label}: {} file(s) whose diagnostics changed were not reported affected",
