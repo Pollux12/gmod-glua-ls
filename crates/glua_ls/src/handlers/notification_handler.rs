@@ -11,7 +11,7 @@ use lsp_types::{
     },
 };
 
-use crate::context::{ServerContext, WorkspaceDiagnosticLevel};
+use crate::context::{ServerContext, ServerContextSnapshot, WorkspaceDiagnosticLevel};
 
 use super::{
     configuration::on_did_change_configuration,
@@ -171,22 +171,19 @@ pub async fn on_notification_handler(
                 DidChangeWatchedFiles::METHOD,
             )
         {
-            let snapshot = server_context.snapshot();
-            // Pending from the moment it arrives: a diagnostics pull answered
-            // before the handler applies it would report the files as they were.
-            let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
-            tokio::spawn(async move {
-                let handler_snapshot = snapshot.clone();
-                let handle = tokio::spawn(async move {
-                    on_did_change_watched_files(handler_snapshot, params).await;
-                });
-                if let Err(err) = handle.await {
-                    log::error!(
-                        "LS_WATCHED_FILES_PANIC didChangeWatchedFiles handler failed: {}",
-                        err
-                    );
-                }
-                in_flight.finish().await;
+            spawn_pending_file_change(server_context, DidChangeWatchedFiles::METHOD, |snapshot| {
+                on_did_change_watched_files(snapshot, params)
+            });
+        }
+        return Ok(());
+    }
+
+    if notification.method == <DidRenameFiles as LspNotification>::METHOD {
+        if let Ok(params) = notification
+            .extract::<<DidRenameFiles as LspNotification>::Params>(DidRenameFiles::METHOD)
+        {
+            spawn_pending_file_change(server_context, DidRenameFiles::METHOD, |snapshot| {
+                on_did_rename_files_handler(snapshot, params)
             });
         }
         return Ok(());
@@ -201,11 +198,32 @@ pub async fn on_notification_handler(
             SetTrace => on_set_trace,
             DidChangeConfiguration => on_did_change_configuration,
             DidChangeWorkspaceFolders => on_did_change_workspace_folders,
-            DidRenameFiles => on_did_rename_files_handler,
         }
     });
 
     Ok(())
+}
+
+/// Runs the handler of a change to files on disk with the change pending
+/// from the moment it arrives: a diagnostics pull answered before the handler
+/// applies it would report the files as they were.
+fn spawn_pending_file_change<F>(
+    server_context: &ServerContext,
+    method: &'static str,
+    handler: impl FnOnce(ServerContextSnapshot) -> F + Send + 'static,
+) where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let snapshot = server_context.snapshot();
+    let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
+    tokio::spawn(async move {
+        let handle = tokio::spawn(handler(snapshot));
+        if let Err(err) = handle.await {
+            log::error!("LS_FILE_CHANGE_PANIC {method} handler failed: {err}");
+        }
+        in_flight.finish().await;
+    });
 }
 
 async fn handle_cancel(server_context: &mut ServerContext, params: CancelParams) {
@@ -223,7 +241,8 @@ mod tests {
 
     use lsp_server::Connection;
     use lsp_types::{
-        ClientCapabilities, DidChangeWatchedFilesParams, FileChangeType, FileEvent, Uri,
+        ClientCapabilities, DidChangeWatchedFilesParams, FileChangeType, FileEvent, FileRename,
+        RenameFilesParams, Uri, WorkspaceClientCapabilities,
     };
 
     use super::*;
@@ -247,6 +266,42 @@ mod tests {
             let notification = Notification::new(DidChangeWatchedFiles::METHOD.to_string(), params);
 
             // Held, so the handler cannot apply the change before the check.
+            let held = snapshot.analysis().write().await;
+            on_notification_handler(notification, &mut context)
+                .await
+                .expect("the notification is handled");
+            let pending = snapshot.debounced_analysis().is_dirty();
+            drop(held);
+
+            assert!(pending);
+        });
+    }
+
+    /// A file rename is pending from the moment it arrives, as a watched-file
+    /// change is.
+    #[test]
+    fn a_file_rename_is_pending_once_received() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, _peer) = Connection::memory();
+        runtime.block_on(async {
+            let capabilities = ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    apply_edit: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut context = ServerContext::new(connection, capabilities);
+            let snapshot = context.snapshot();
+            let params = RenameFilesParams {
+                files: vec![FileRename {
+                    old_uri: "file:///workspace/old.lua".to_string(),
+                    new_uri: "file:///workspace/new.lua".to_string(),
+                }],
+            };
+            let notification = Notification::new(DidRenameFiles::METHOD.to_string(), params);
+
+            // Held, so the handler cannot apply the rename before the check.
             let held = snapshot.analysis().write().await;
             on_notification_handler(notification, &mut context)
                 .await
