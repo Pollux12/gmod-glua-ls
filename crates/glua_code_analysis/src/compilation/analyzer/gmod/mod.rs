@@ -10244,15 +10244,16 @@ fn resolve_compilefile_target(
     let source_workspace = module_index.get_workspace_id(source_file_id);
     let module_paths = [format!("lua.{root_module_path}"), root_module_path];
     for module_path in module_paths {
-        if let Some(module) = module_index.find_module_for_file(&module_path, source_file_id)
+        if let Some(module_file_id) =
+            module_index.find_module_file_for_file(&module_path, source_file_id)
             && compilefile_target_path_matches(
                 db,
-                module.file_id,
+                module_file_id,
                 &requested_path,
                 normalized_path == normalized_no_ext,
             )
         {
-            return Some(module.file_id);
+            return Some(module_file_id);
         }
 
         let target = module_index
@@ -12427,18 +12428,15 @@ pub(crate) fn resolve_load_dependency_target(
 ) -> Option<FileId> {
     let module_index = db.get_module_index();
     match dependency_kind {
-        LuaDependencyKind::Require => module_index
-            .find_module_for_file(dependency_path, source_file_id)
-            .map(|module| module.file_id),
+        LuaDependencyKind::Require => {
+            module_index.find_module_file_for_file(dependency_path, source_file_id)
+        }
         LuaDependencyKind::Include
         | LuaDependencyKind::CompileFile
         | LuaDependencyKind::AddCSLuaFile
         | LuaDependencyKind::IncludeCS => {
-            resolve_load_include_target(db, source_file_id, dependency_path).or_else(|| {
-                module_index
-                    .find_module_for_file(dependency_path, source_file_id)
-                    .map(|module| module.file_id)
-            })
+            resolve_load_include_target(db, source_file_id, dependency_path)
+                .or_else(|| module_index.find_module_file_for_file(dependency_path, source_file_id))
         }
     }
 }
@@ -12457,30 +12455,30 @@ fn resolve_load_include_target(
         .unwrap_or(normalized_path);
 
     let module_index = db.get_module_index();
-    if let Some(module_info) = db
+    if let Some(module_file_id) = db
         .get_vfs()
         .get_file_path(&source_file_id)
         .and_then(|path| path.parent())
         .and_then(|parent_dir| {
-            module_index.find_module_by_path_for_file(
+            module_index.find_module_file_by_path_for_file(
                 &parent_dir.join(Path::new(normalized_path)),
                 source_file_id,
             )
         })
     {
-        return Some(module_info.file_id);
+        return Some(module_file_id);
     }
 
     let root_module_path = normalized_no_ext.replace('/', ".");
-    if let Some(module_info) = module_index.find_module_for_file(&root_module_path, source_file_id)
+    if let Some(module_file_id) =
+        module_index.find_module_file_for_file(&root_module_path, source_file_id)
     {
-        return Some(module_info.file_id);
+        return Some(module_file_id);
     }
 
     let path_without_lua_prefix = normalized_no_ext.strip_prefix("lua/")?;
     module_index
-        .find_module_for_file(&path_without_lua_prefix.replace('/', "."), source_file_id)
-        .map(|module_info| module_info.file_id)
+        .find_module_file_for_file(&path_without_lua_prefix.replace('/', "."), source_file_id)
 }
 
 fn mark_load_root(

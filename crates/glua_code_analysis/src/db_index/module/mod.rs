@@ -458,21 +458,6 @@ impl LuaModuleIndex {
         derivation::fingerprint_of(&modules)
     }
 
-    /// Notes an exact module lookup: the modules at its path and the module it
-    /// returned.
-    fn note_exact_lookup(module_path: &str, module: &ModuleInfo) {
-        derivation::note_read(|| FactKey::ModulePath(SmolStr::new(module_path)));
-        derivation::note_read(|| FactKey::Module(module.file_id));
-    }
-
-    /// Notes a module lookup: the scan it walked and the module it returned.
-    fn note_lookup(module_path: &str, module: Option<&ModuleInfo>) {
-        derivation::note_read(|| FactKey::ModuleName(lookup_name(module_path)));
-        if let Some(module) = module {
-            derivation::note_read(|| FactKey::Module(module.file_id));
-        }
-    }
-
     pub fn set_legacy_module_env(&mut self, file_id: FileId, env: LegacyModuleEnv) {
         let envs = self.legacy_module_envs.entry(file_id).or_default();
         envs.push(env);
@@ -552,23 +537,7 @@ impl LuaModuleIndex {
     }
 
     pub fn find_module(&self, module_path: &str) -> Option<&ModuleInfo> {
-        let module_path = module_path.replace(['\\', '/'], ".");
-        let module_parts: Vec<&str> = module_path.split('.').collect();
-        if module_parts.is_empty() {
-            return None;
-        }
-
-        if let Some(module) = self.exact_find_module(&module_parts) {
-            Self::note_exact_lookup(&module_path, module);
-            return Some(module);
-        }
-        let result = if self.fuzzy_search {
-            self.fuzzy_find_module(&module_path, module_parts.last()?)
-        } else {
-            None
-        };
-        Self::note_lookup(&module_path, result);
-        result
+        self.lookup(module_path, None, true)
     }
 
     pub fn find_module_in_workspace(
@@ -576,22 +545,68 @@ impl LuaModuleIndex {
         module_path: &str,
         workspace_id: WorkspaceId,
     ) -> Option<&ModuleInfo> {
+        self.lookup(module_path, Some(workspace_id), true)
+    }
+
+    /// The file of the module [`Self::find_module_for_file`] finds, for a
+    /// reader that needs only which file it is: records the lookup, not the
+    /// module's contents.
+    pub fn find_module_file_for_file(&self, module_path: &str, file_id: FileId) -> Option<FileId> {
+        self.lookup(module_path, self.get_workspace_id(file_id), false)
+            .map(|module| module.file_id)
+    }
+
+    /// [`Self::find_module_file_for_file`] by a file path.
+    pub fn find_module_file_by_path_for_file(
+        &self,
+        path: &Path,
+        file_id: FileId,
+    ) -> Option<FileId> {
+        let (module_path, _) = self.extract_module_path(path.to_str()?)?;
+        self.find_module_file_for_file(&module_path, file_id)
+    }
+
+    /// Looks `module_path` up, within `workspace_id` when given, recording the
+    /// modules at its path or name and, when `contents` is set, the module
+    /// found.
+    fn lookup(
+        &self,
+        module_path: &str,
+        workspace_id: Option<WorkspaceId>,
+        contents: bool,
+    ) -> Option<&ModuleInfo> {
         let module_path = module_path.replace(['\\', '/'], ".");
         let module_parts: Vec<&str> = module_path.split('.').collect();
         if module_parts.is_empty() {
             return None;
         }
 
-        if let Some(module) = self.exact_find_module_in_workspace(&module_parts, workspace_id) {
-            Self::note_exact_lookup(&module_path, module);
+        let exact = match workspace_id {
+            Some(workspace_id) => self.exact_find_module_in_workspace(&module_parts, workspace_id),
+            None => self.exact_find_module(&module_parts),
+        };
+        if let Some(module) = exact {
+            derivation::note_read(|| FactKey::ModulePath(SmolStr::new(&module_path)));
+            if contents {
+                derivation::note_read(|| FactKey::Module(module.file_id));
+            }
             return Some(module);
         }
         let result = if self.fuzzy_search {
-            self.fuzzy_find_module_in_workspace(&module_path, module_parts.last()?, workspace_id)
+            let name = module_parts.last()?;
+            match workspace_id {
+                Some(workspace_id) => {
+                    self.fuzzy_find_module_in_workspace(&module_path, name, workspace_id)
+                }
+                None => self.fuzzy_find_module(&module_path, name),
+            }
         } else {
             None
         };
-        Self::note_lookup(&module_path, result);
+        derivation::note_read(|| FactKey::ModuleName(lookup_name(&module_path)));
+        if contents && let Some(module) = result {
+            derivation::note_read(|| FactKey::Module(module.file_id));
+        }
         result
     }
 

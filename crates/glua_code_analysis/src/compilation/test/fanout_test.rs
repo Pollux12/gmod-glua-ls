@@ -1405,4 +1405,33 @@ Foo = {}
         let stats = ws.analysis.compilation.last_stats();
         assert_eq!(stats.evaluations(DerivationKind::GmodLoad), 0);
     }
+
+    /// The load fold resolves an included file by path, not by what it
+    /// exports, so the export landing later does not run it again.
+    #[test]
+    fn a_module_export_landing_does_not_re_run_the_load_fold() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_files(vec![
+            (
+                "lua/autorun/sh_loader.lua",
+                "include(\"sh_lib.lua\")
+",
+            ),
+            (
+                "lua/autorun/sh_lib.lua",
+                "local M = {}
+function M.Value() return 1 end
+return M
+",
+            ),
+        ]);
+
+        let stats = ws.analysis.compilation.last_stats();
+        assert_eq!(stats.evaluations(DerivationKind::GmodLoad), 1);
+    }
 }
