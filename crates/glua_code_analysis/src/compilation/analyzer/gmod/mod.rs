@@ -6958,6 +6958,10 @@ struct AnnotatedGmodCallRoleMap<'a> {
     local_roles_by_decl: HashMap<LuaDeclId, AnnotatedGmodCallRoles>,
     local_roles_by_path: HashMap<(LuaDeclId, String), AnnotatedGmodCallRoles>,
     local_candidate_names: HashSet<String>,
+    /// The method each call's inferred receiver resolves to: every role kind
+    /// asks for the same call, so it is inferred once, with one cache.
+    receiver_methods: std::cell::RefCell<HashMap<LuaSyntaxId, Option<LuaSignatureId>>>,
+    receiver_cache: std::cell::RefCell<LuaInferCache>,
 }
 
 #[derive(Clone, Default, Hash)]
@@ -7937,6 +7941,11 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
             local_roles_by_decl: HashMap::default(),
             local_roles_by_path: HashMap::default(),
             local_candidate_names: HashSet::default(),
+            receiver_methods: std::cell::RefCell::default(),
+            receiver_cache: std::cell::RefCell::new(LuaInferCache::new(
+                file_id,
+                Default::default(),
+            )),
         };
 
         for func_stat in root.descendants::<LuaFuncStat>() {
@@ -8214,7 +8223,7 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
                 .get_decl_references(&file_id, &decl_id)
                 .is_some_and(|references| references.mutable)
         }) {
-            return roles_from_inferred_receiver_method(db, file_id, call_expr, call_path);
+            return self.roles_from_inferred_receiver_method(db, call_expr, call_path);
         }
 
         if let Some(Some(local_path_roles)) =
@@ -8234,7 +8243,7 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
             }
 
             if call_expr_has_shadowing_local_root(db, file_id, call_expr) {
-                return roles_from_inferred_receiver_method(db, file_id, call_expr, call_path);
+                return self.roles_from_inferred_receiver_method(db, call_expr, call_path);
             }
 
             return self
@@ -8254,7 +8263,30 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
             return local_roles.select_for_call(call_expr);
         }
 
-        roles_from_inferred_receiver_method(db, file_id, call_expr, call_path)
+        self.roles_from_inferred_receiver_method(db, call_expr, call_path)
+    }
+
+    fn roles_from_inferred_receiver_method(
+        &self,
+        db: &DbIndex,
+        call_expr: &LuaCallExpr,
+        call_path: &str,
+    ) -> Option<AnnotatedGmodCallRoles> {
+        if !inferred_receiver_method_candidate(call_expr, call_path) {
+            return None;
+        }
+        let signature_id = *self
+            .receiver_methods
+            .borrow_mut()
+            .entry(call_expr.get_syntax_id())
+            .or_insert_with(|| {
+                crate::semantic::get_prefix_expr_signature_id(
+                    db,
+                    &mut self.receiver_cache.borrow_mut(),
+                    call_expr,
+                )
+            });
+        roles_from_signature(db, signature_id?)?.select_for_call(call_expr)
     }
 }
 
@@ -8300,20 +8332,6 @@ fn receiver_type_undetermined(db: &DbIndex, file_id: FileId, call_expr: &LuaCall
         Ok(typ) => super::type_is_uninformative(&typ),
         Err(_) => true,
     }
-}
-
-fn roles_from_inferred_receiver_method(
-    db: &DbIndex,
-    file_id: FileId,
-    call_expr: &LuaCallExpr,
-    call_path: &str,
-) -> Option<AnnotatedGmodCallRoles> {
-    if !inferred_receiver_method_candidate(call_expr, call_path) {
-        return None;
-    }
-    let mut cache = LuaInferCache::new(file_id, Default::default());
-    let signature_id = crate::semantic::get_prefix_expr_signature_id(db, &mut cache, call_expr)?;
-    roles_from_signature(db, signature_id)?.select_for_call(call_expr)
 }
 
 fn roles_from_signature(
