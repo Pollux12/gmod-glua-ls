@@ -12,47 +12,13 @@ pub type KeyIdx = u32;
 /// A derivation's slot in [`ReaderGraph::derivations`].
 type DerivIdx = u32;
 
-/// What one derivation's last evaluation read, with the fingerprint each read
-/// saw, and wrote, as sorted key slots.
+/// What one derivation's last evaluation read and wrote, as sorted key slots.
+/// The fingerprint a read saw is the reader group the derivation sits in on
+/// the key ([`Readers`]).
 #[derive(Debug, Clone, Default)]
 struct Record {
-    reads: Reads,
+    reads: Box<[KeyIdx]>,
     outputs: Box<[KeyIdx]>,
-}
-
-/// A record's reads by key slot, sorted, each with the fingerprint it saw.
-/// Two arrays: a slot and a fingerprint side by side would pad to 16 bytes.
-#[derive(Debug, Clone, Default)]
-struct Reads {
-    keys: Box<[KeyIdx]>,
-    seen: Box<[Fingerprint]>,
-}
-
-impl Reads {
-    fn from_sorted(reads: Vec<(KeyIdx, Fingerprint)>) -> Self {
-        let (keys, seen): (Vec<_>, Vec<_>) = reads.into_iter().unzip();
-        Self {
-            keys: keys.into_boxed_slice(),
-            seen: seen.into_boxed_slice(),
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.keys.len()
-    }
-
-    fn iter(&self) -> impl Iterator<Item = (KeyIdx, Fingerprint)> + '_ {
-        self.keys.iter().copied().zip(self.seen.iter().copied())
-    }
-
-    fn iter_mut(&mut self) -> impl Iterator<Item = (KeyIdx, &mut Fingerprint)> + '_ {
-        self.keys.iter().copied().zip(self.seen.iter_mut())
-    }
-
-    /// Where `slot` is among the reads.
-    fn position(&self, slot: KeyIdx) -> Option<usize> {
-        self.keys.binary_search(&slot).ok()
-    }
 }
 
 /// A fact key and the derivations that read or produced it. `key` is `None`
@@ -109,13 +75,22 @@ impl Default for KeySlot {
 const NO_GENERATION: u32 = u32::MAX;
 
 /// A key's readers, grouped by the fingerprint each saw, each group sorted.
-/// Nearly every key has one group, so checking its readers against a new
-/// value is one comparison per group rather than one per reader.
+/// A derivation reads a key at one value, so it is in one group. Nearly every
+/// key has one group, so checking its readers against a new value is one
+/// comparison per group rather than one per reader.
 #[derive(Debug, Clone, Default)]
 struct Readers(Vec<(Fingerprint, Vec<DerivIdx>)>);
 
 impl Readers {
+    /// Files `deriv` as having seen `seen`, out of the group it was in.
     fn insert(&mut self, deriv: DerivIdx, seen: Fingerprint) {
+        if let Some(at) = self
+            .0
+            .iter()
+            .position(|(group, derivs)| *group != seen && derivs.binary_search(&deriv).is_ok())
+        {
+            self.take(at, deriv);
+        }
         match self.0.iter_mut().find(|(group, _)| *group == seen) {
             Some((_, derivs)) => {
                 if let Err(at) = derivs.binary_search(&deriv) {
@@ -130,14 +105,58 @@ impl Readers {
         }
     }
 
-    fn remove(&mut self, deriv: DerivIdx, seen: Fingerprint) {
-        if let Some(at) = self.0.iter().position(|(group, _)| *group == seen) {
-            if let Ok(index) = self.0[at].1.binary_search(&deriv) {
-                self.0[at].1.remove(index);
+    fn remove(&mut self, deriv: DerivIdx) {
+        if let Some(at) = self
+            .0
+            .iter()
+            .position(|(_, derivs)| derivs.binary_search(&deriv).is_ok())
+        {
+            self.take(at, deriv);
+        }
+    }
+
+    /// Removes `deriv` from the group at `at`, which holds it, and the group
+    /// if that empties it.
+    fn take(&mut self, at: usize, deriv: DerivIdx) {
+        let derivs = &mut self.0[at].1;
+        if let Ok(index) = derivs.binary_search(&deriv) {
+            derivs.remove(index);
+        }
+        if derivs.is_empty() {
+            self.0.swap_remove(at);
+        }
+    }
+
+    /// The fingerprint `deriv`, one of the readers, saw.
+    fn seen_by(&self, deriv: DerivIdx) -> Fingerprint {
+        match self.0.as_slice() {
+            [(seen, derivs)] => {
+                debug_assert!(derivs.binary_search(&deriv).is_ok());
+                *seen
             }
-            if self.0[at].1.is_empty() {
-                self.0.swap_remove(at);
+            groups => groups
+                .iter()
+                .find(|(_, derivs)| derivs.binary_search(&deriv).is_ok())
+                .map(|(seen, _)| *seen)
+                .expect("a recorded read is filed among the key's readers"),
+        }
+    }
+
+    /// Relabels the readers that saw `from` as having seen `to`.
+    fn relabel(&mut self, from: Fingerprint, to: Fingerprint) {
+        if from == to {
+            return;
+        }
+        let Some(at) = self.0.iter().position(|(seen, _)| *seen == from) else {
+            return;
+        };
+        let (_, derivs) = self.0.swap_remove(at);
+        match self.0.iter_mut().find(|(seen, _)| *seen == to) {
+            Some((_, into)) => {
+                into.extend(derivs);
+                into.sort_unstable();
             }
+            None => self.0.push((to, derivs)),
         }
     }
 
@@ -438,8 +457,7 @@ impl ReaderGraph {
             });
         let key_map = hash_table_bytes(table.key_slots.capacity(), size_of::<KeyIdx>());
         let key_slots = table.keys.capacity() * size_of::<KeySlot>();
-        let records = reads * (size_of::<KeyIdx>() + size_of::<Fingerprint>())
-            + outputs * size_of::<KeyIdx>();
+        let records = (reads + outputs) * size_of::<KeyIdx>();
         let derivation_maps = hash_table_bytes(
             self.deriv_slots.capacity(),
             size_of::<DerivationId>() + size_of::<DerivIdx>(),
@@ -660,26 +678,21 @@ impl ReaderGraph {
 
         let mut unread = Vec::new();
         let (mut old_reads, mut new_reads) = (
-            old.reads.iter().peekable(),
+            old.reads.iter().copied().peekable(),
             reads.iter().copied().peekable(),
         );
         loop {
             match (old_reads.peek().copied(), new_reads.peek().copied()) {
-                (Some((old_key, old_seen)), Some((new_key, new_seen))) if old_key == new_key => {
-                    if old_seen != new_seen {
-                        let readers = &mut self.table.keys[new_key as usize].readers;
-                        readers.remove(deriv, old_seen);
+                (Some(old_key), Some((new_key, new_seen))) if old_key == new_key => {
+                    let readers = &mut self.table.keys[new_key as usize].readers;
+                    if readers.seen_by(deriv) != new_seen {
                         readers.insert(deriv, new_seen);
                     }
                     old_reads.next();
                     new_reads.next();
                 }
-                (Some((old_key, old_seen)), next)
-                    if next.is_none_or(|(new_key, _)| old_key < new_key) =>
-                {
-                    self.table.keys[old_key as usize]
-                        .readers
-                        .remove(deriv, old_seen);
+                (Some(old_key), next) if next.is_none_or(|(new_key, _)| old_key < new_key) => {
+                    self.table.keys[old_key as usize].readers.remove(deriv);
                     unread.push(old_key);
                     old_reads.next();
                 }
@@ -729,7 +742,7 @@ impl ReaderGraph {
 
         self.by_file.entry(id.file_id).or_default().insert(deriv);
         self.derivations[deriv as usize].record = Some(Record {
-            reads: Reads::from_sorted(reads),
+            reads: reads.into_iter().map(|(key, _)| key).collect(),
             outputs: outputs.into_boxed_slice(),
         });
         dropped
@@ -791,18 +804,26 @@ impl ReaderGraph {
         fingerprint: impl Fn(&HashedKey) -> Fingerprint,
         holds_moved: impl Fn(&HashedKey, Fingerprint) -> bool,
     ) -> bool {
-        let Some((_, record)) = self.record(id) else {
+        let Some((deriv, record)) = self.record(id) else {
             return true;
         };
-        record.reads.iter().any(|(slot, seen)| {
-            seen != self.slot_fingerprint(slot, &fingerprint) && !holds_moved(self.key(slot), seen)
+        record.reads.iter().any(|slot| {
+            let seen = self.seen(*slot, deriv);
+            seen != self.slot_fingerprint(*slot, &fingerprint)
+                && !holds_moved(self.key(*slot), seen)
         })
     }
 
     /// For `GLUALS_CHECK_CACHE`: `id`'s recorded reads by slot.
     pub fn recorded_slots(&self, id: DerivationId) -> Vec<(KeyIdx, Fingerprint)> {
         self.record(id)
-            .map(|(_, record)| record.reads.iter().collect())
+            .map(|(deriv, record)| {
+                record
+                    .reads
+                    .iter()
+                    .map(|slot| (*slot, self.seen(*slot, deriv)))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -811,7 +832,7 @@ impl ReaderGraph {
         self.record(id)
             .into_iter()
             .flat_map(|(_, record)| record.reads.iter())
-            .map(|(key, _)| self.key(key))
+            .map(|key| self.key(*key))
     }
 
     /// Replaces `id`'s recorded fingerprints, in [`Self::reads_of`] order.
@@ -820,24 +841,19 @@ impl ReaderGraph {
         let Some(deriv) = self.deriv_slots.get(&id).copied() else {
             return false;
         };
-        let Some(record) = self.derivations[deriv as usize].record.as_mut() else {
+        let Some(record) = self.derivations[deriv as usize].record.as_ref() else {
             return false;
         };
         let mut moved = false;
-        for ((key, seen), fingerprint) in record.reads.iter_mut().zip(fingerprints) {
+        for (key, fingerprint) in record.reads.iter().zip(fingerprints) {
+            let entry = &mut self.table.keys[*key as usize];
             // A stage rule a reader saw is the stage it ran at, which only a
             // stage barrier re-runs it for.
-            if *seen != fingerprint
-                && !self.table.keys[key as usize]
-                    .key
-                    .as_ref()
-                    .is_some_and(|key| key.is_stage_rule())
+            if entry.readers.seen_by(deriv) != fingerprint
+                && !entry.key.as_ref().is_some_and(|key| key.is_stage_rule())
             {
                 moved = true;
-                let readers = &mut self.table.keys[key as usize].readers;
-                readers.remove(deriv, *seen);
-                readers.insert(deriv, fingerprint);
-                *seen = fingerprint;
+                entry.readers.insert(deriv, fingerprint);
             }
         }
         moved
@@ -861,24 +877,8 @@ impl ReaderGraph {
     /// an edit that only moved the key's positions, what they read is the
     /// value as it stands now, and the next edit maps back from here.
     pub fn rebase_readers(&mut self, key: &HashedKey, from: Fingerprint, to: Fingerprint) {
-        let Some(slot) = self.table.find(key) else {
-            return;
-        };
-        let readers = &mut self.table.keys[slot as usize].readers;
-        let Some(at) = readers.0.iter().position(|(seen, _)| *seen == from) else {
-            return;
-        };
-        let (_, derivs) = readers.0.swap_remove(at);
-        for deriv in &derivs {
-            if let Some(record) = self.derivations[*deriv as usize].record.as_mut()
-                && let Some(read) = record.reads.position(slot)
-            {
-                record.reads.seen[read] = to;
-            }
-        }
-        let readers = &mut self.table.keys[slot as usize].readers;
-        for deriv in derivs {
-            readers.insert(deriv, to);
+        if let Some(slot) = self.table.find(key) {
+            self.table.keys[slot as usize].readers.relabel(from, to);
         }
     }
 
@@ -942,11 +942,11 @@ impl ReaderGraph {
                 let mut reads = record
                     .reads
                     .iter()
-                    .map(|(key, seen)| (rewrite.get(&key).copied().unwrap_or(key), seen))
+                    .map(|key| rewrite.get(key).copied().unwrap_or(*key))
                     .collect::<Vec<_>>();
-                reads.sort_by_key(|(key, _)| *key);
-                reads.dedup_by_key(|(key, _)| *key);
-                record.reads = Reads::from_sorted(reads);
+                reads.sort_unstable();
+                reads.dedup();
+                record.reads = reads.into_boxed_slice();
             }
         }
         for slot in vacated {
@@ -1025,6 +1025,11 @@ impl ReaderGraph {
     fn record(&self, id: DerivationId) -> Option<(DerivIdx, &Record)> {
         let deriv = *self.deriv_slots.get(&id)?;
         Some((deriv, self.derivations[deriv as usize].record.as_ref()?))
+    }
+
+    /// The fingerprint `deriv`'s recorded read of `slot` saw.
+    fn seen(&self, slot: KeyIdx, deriv: DerivIdx) -> Fingerprint {
+        self.table.keys[slot as usize].readers.seen_by(deriv)
     }
 
     fn key(&self, slot: KeyIdx) -> &HashedKey {
@@ -1125,9 +1130,9 @@ impl ReaderGraph {
             .record
             .take()
             .unwrap_or_default();
-        for (key, seen) in record.reads.iter() {
-            self.table.keys[key as usize].readers.remove(deriv, seen);
-            self.release_key(key);
+        for key in record.reads.iter() {
+            self.table.keys[*key as usize].readers.remove(deriv);
+            self.release_key(*key);
         }
         let outputs = record
             .outputs
@@ -1364,6 +1369,36 @@ mod tests {
 
         assert_eq!(end().id, id(2, 0));
         assert_eq!(end().id, id(1, 0));
+    }
+
+    /// Deleting text moves a key after the deletion onto the place of one
+    /// inside it: a derivation that read both reads one key, at one value.
+    #[test]
+    fn a_reader_of_two_keys_an_edit_merges_leaves_no_reader_behind() {
+        use crate::{LuaDeclId, PositionMap};
+        let decl = |position: u32| {
+            HashedKey::new(FactKey::Decl(LuaDeclId::new(
+                FileId::new(1),
+                TextSize::new(position),
+            )))
+        };
+        let mut graph = ReaderGraph::default();
+        graph.replace(
+            id(2, 0),
+            vec![(decl(20), Some(5)), (decl(30), Some(6))],
+            vec![],
+            |_| 0,
+        );
+        let old_text = format!("{}{}{}", "a".repeat(20), "b".repeat(10), "c".repeat(10));
+        let new_text = format!("{}{}", "a".repeat(20), "c".repeat(10));
+        graph.apply_edits(&EditMaps::new([(
+            FileId::new(1),
+            PositionMap::new(&old_text, &new_text),
+        )]));
+
+        graph.remove_file(FileId::new(2));
+
+        assert_eq!(graph.stale_readers(&decl(20), |_| false).count(), 0);
     }
 
     #[test]
