@@ -87,7 +87,11 @@ impl Readers {
                     derivs.insert(at, deriv);
                 }
             }
-            None => self.0.push((seen, vec![deriv])),
+            None => {
+                // Most keys have one group: a growing vector would reserve four.
+                self.0.reserve_exact(1);
+                self.0.push((seen, vec![deriv]));
+            }
         }
     }
 
