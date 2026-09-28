@@ -74,8 +74,36 @@ impl LuaTypeDecl {
         }
     }
 
+    /// Where the type is declared, each location with its flags.
     pub fn get_locations(&self) -> &[LuaDeclLocation] {
+        crate::db_index::derivation::note_type_decl_locations_read(&self.id);
         &self.locations
+    }
+
+    /// [`Self::get_locations`] for the type index's own bookkeeping: records
+    /// no read.
+    pub(super) fn locations(&self) -> &[LuaDeclLocation] {
+        &self.locations
+    }
+
+    /// What a read of the declaration observes apart from where it is
+    /// declared: its name, kind and extra, and the flags any location carries.
+    pub(super) fn declaration(&self) -> impl Hash + '_ {
+        let flags = self
+            .locations
+            .iter()
+            .fold(0u8, |flags, location| flags | location.flag.bits());
+        (&self.simple_name, &self.id, &self.extra, flags)
+    }
+
+    /// The declaration's kind.
+    pub fn kind(&self) -> LuaDeclTypeKind {
+        match &self.extra {
+            LuaTypeExtra::Enum { .. } => LuaDeclTypeKind::Enum,
+            LuaTypeExtra::Class => LuaDeclTypeKind::Class,
+            LuaTypeExtra::Alias { .. } => LuaDeclTypeKind::Alias,
+            LuaTypeExtra::Attribute { .. } => LuaDeclTypeKind::Attribute,
+        }
     }
 
     pub fn get_mut_locations(&mut self) -> &mut Vec<LuaDeclLocation> {
@@ -109,14 +137,9 @@ impl LuaTypeDecl {
     /// a member on this type, and `(partial)`/`(private)` gate diagnostics that
     /// other files report.
     pub fn kind_and_flags(&self) -> (LuaDeclTypeKind, Vec<(FileId, u8)>) {
-        let kind = match &self.extra {
-            LuaTypeExtra::Enum { .. } => LuaDeclTypeKind::Enum,
-            LuaTypeExtra::Class => LuaDeclTypeKind::Class,
-            LuaTypeExtra::Alias { .. } => LuaDeclTypeKind::Alias,
-            LuaTypeExtra::Attribute { .. } => LuaDeclTypeKind::Attribute,
-        };
+        let kind = self.kind();
         let mut flags: Vec<(FileId, u8)> = self
-            .locations
+            .get_locations()
             .iter()
             .map(|location| (location.file_id, location.flag.bits()))
             .collect();

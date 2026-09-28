@@ -1545,13 +1545,13 @@ impl LuaTypeIndex {
         if let Some(flag) = remaining {
             if locations[at].flag != flag {
                 locations[at].flag = flag;
-                derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
+                note_decl_written(decl_id);
             }
             return;
         }
         locations.remove(at);
         let emptied = locations.is_empty();
-        derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
+        note_decl_written(decl_id);
         if emptied {
             self.full_name_type_map.remove(decl_id);
             self.remove_from_decl_scan(decl_id);
@@ -1610,18 +1610,18 @@ impl LuaTypeIndex {
 
     pub fn add_type_decl(&mut self, file_id: FileId, type_decl: LuaTypeDecl) {
         let id = type_decl.get_id();
-        derivation::note_write(|| FactKey::TypeDecl(id.clone()));
+        note_decl_written(&id);
         let holder = current_holder();
-        for location in type_decl.get_locations() {
+        for location in type_decl.locations() {
             self.hold_location(&id, location, holder);
         }
         if derivation::writes_source() {
-            for location in type_decl.get_locations() {
+            for location in type_decl.locations() {
                 self.add_source_location(&id, location.clone());
             }
-            self.add_source_site(file_id, &id, type_decl.get_locations());
+            self.add_source_site(file_id, &id, type_decl.locations());
         } else {
-            for location in type_decl.get_locations() {
+            for location in type_decl.locations() {
                 self.record_contribution(TypeContribution::Location {
                     decl_id: id.clone(),
                     location: location.clone(),
@@ -1630,7 +1630,7 @@ impl LuaTypeIndex {
         }
 
         if let Some(old_decl) = self.full_name_type_map.get_mut(&id) {
-            for location in type_decl.get_locations() {
+            for location in type_decl.locations() {
                 old_decl.add_location(location.clone());
             }
         } else {
@@ -1660,7 +1660,7 @@ impl LuaTypeIndex {
         }
         self.hold_location(decl_id, &location, holder);
         if let Some(decl) = self.full_name_type_map.get_mut(decl_id) {
-            derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
+            note_decl_written(decl_id);
             decl.add_location(location);
         }
     }
@@ -2900,14 +2900,17 @@ impl LuaTypeIndex {
             return derivation::fingerprint_opt(self.derived_contributions.get(id));
         }
         if let FactKey::SourceTypeDecl(id) = key {
-            let Some(locations) = self.source_decl_locations.get(id) else {
+            if self
+                .source_decl_locations
+                .get(id)
+                .is_none_or(|locations| locations.is_empty())
+            {
                 return derivation::ABSENT;
-            };
+            }
             let decl = self.full_name_type_map.get(id);
-            return derivation::fingerprint_of(&(
-                locations,
-                decl.map(|decl| decl.get_attribute_type()),
-            ));
+            return derivation::fingerprint_of(
+                &decl.map(|decl| (decl.kind(), decl.get_attribute_type())),
+            );
         }
         match key {
             FactKey::TypeCache(owner) => match self.types.get(owner) {
@@ -2917,9 +2920,18 @@ impl LuaTypeIndex {
             FactKey::DefinitionFact(definition) => {
                 derivation::fingerprint_opt(self.definition_facts.get(definition))
             }
-            FactKey::TypeDecl(decl_id) => {
-                derivation::fingerprint_opt(self.full_name_type_map.get(decl_id))
-            }
+            FactKey::TypeDecl(decl_id) => self
+                .full_name_type_map
+                .get(decl_id)
+                .map_or(derivation::ABSENT, |decl| {
+                    derivation::fingerprint_of(&decl.declaration())
+                }),
+            FactKey::TypeDeclLocations(decl_id) => self
+                .full_name_type_map
+                .get(decl_id)
+                .map_or(derivation::ABSENT, |decl| {
+                    derivation::fingerprint_of(decl.locations())
+                }),
             FactKey::TypeSupers(decl_id) => derivation::fingerprint_opt(self.supers.get(decl_id)),
             FactKey::TypeGenericParams(decl_id) => {
                 derivation::fingerprint_opt(self.generic_params.get(decl_id))
@@ -3010,7 +3022,7 @@ impl LuaTypeIndex {
                 let Some(decl) = self.full_name_type_map.get(decl_id) else {
                     continue;
                 };
-                let locations = decl.get_locations();
+                let locations = decl.locations();
                 if !locations
                     .iter()
                     .any(|location| file_ids.contains(&location.file_id))
@@ -3123,7 +3135,7 @@ impl LuaTypeIndex {
                 // badly (measured: 300 removed / 332 added on CityRP).
                 LuaType::Ref(type_id) | LuaType::Def(type_id) => {
                     self.get_type_decl(type_id).is_some_and(|decl| {
-                        let locations = decl.get_locations();
+                        let locations = decl.locations();
                         !locations
                             .iter()
                             .any(|location| location.file_id == owner_file_id)
@@ -3164,7 +3176,7 @@ impl LuaTypeIndex {
                 LuaType::ModuleRef(file_id) => references_changed_file(*file_id),
                 LuaType::Ref(type_id) | LuaType::Def(type_id) => {
                     self.get_type_decl(type_id).is_some_and(|decl| {
-                        let locations = decl.get_locations();
+                        let locations = decl.locations();
                         !locations
                             .iter()
                             .any(|location| location.file_id == owner_file_id)
@@ -3315,6 +3327,12 @@ impl LuaIndex for LuaTypeIndex {
     }
 }
 
+/// Notes a write of a type declaration that may move where it is declared.
+fn note_decl_written(decl_id: &LuaTypeDeclId) {
+    derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
+    derivation::note_write(|| FactKey::TypeDeclLocations(decl_id.clone()));
+}
+
 impl LuaTypeIndex {
     fn remove_file_raw(&mut self, file_id: FileId) {
         self.file_namespace.remove(&file_id);
@@ -3323,7 +3341,7 @@ impl LuaTypeIndex {
         self.declaration_sites.remove(&file_id);
         if let Some(type_id_list) = self.file_types.remove(&file_id) {
             for id in type_id_list {
-                derivation::note_write(|| FactKey::TypeDecl(id.clone()));
+                note_decl_written(&id);
                 if let Some(locations) = self.source_decl_locations.get_mut(&id) {
                     derivation::note_write(|| FactKey::SourceTypeDecl(id.clone()));
                     locations.retain(|loc| loc.file_id != file_id);
@@ -3430,7 +3448,7 @@ impl LuaTypeIndex {
             derivation::note_write(|| FactKey::TypeFile(*file_id));
         }
         for decl_id in self.full_name_type_map.keys() {
-            derivation::note_write(|| FactKey::TypeDecl(decl_id.clone()));
+            note_decl_written(decl_id);
         }
         for decl_id in self.supers.keys() {
             derivation::note_write(|| FactKey::TypeSupers(decl_id.clone()));

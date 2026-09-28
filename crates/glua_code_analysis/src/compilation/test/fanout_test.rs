@@ -1305,4 +1305,78 @@ end
 
         assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![shared]);
     }
+
+    const FOO: &str = "lua/autorun/sh_foo.lua";
+    const MORE_FOO: &str = "lua/autorun/sh_more_foo.lua";
+
+    /// Declaring a class again in another file moves where it is declared,
+    /// not what it is: a file that only names the class is not re-analysed.
+    #[test]
+    fn a_partial_class_in_another_file_re_analyses_no_file_that_only_names_the_class() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(vec![
+            (
+                FOO,
+                "---@class Foo
+Foo = {}
+",
+            ),
+            (
+                "lua/autorun/sh_reader.lua",
+                "---@param foo Foo
+function UseFoo(foo) end
+",
+            ),
+        ]);
+
+        let more = ws.def_file(
+            MORE_FOO,
+            "---@class Foo
+local FOO = {}
+",
+        );
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![more]);
+    }
+
+    /// Where a class is declared is a fact of its own: a reader of the
+    /// declaring files re-runs when they move, though the declaration does
+    /// not.
+    #[test]
+    fn reading_where_a_class_is_declared_records_the_locations() {
+        use crate::db_index::derivation::{self, DerivationId, FactKey};
+
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            FOO,
+            "---@class Foo
+Foo = {}
+",
+        );
+        let db = ws.analysis.compilation.get_db();
+        let root = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("the file is parsed")
+            .get_red_root();
+        let foo = crate::LuaTypeDeclId::global("Foo");
+
+        derivation::begin(DerivationId::new(
+            DerivationKind::Diagnostics,
+            file_id,
+            glua_parser::LuaSyntaxId::from_node(&root),
+        ));
+        let declared_in = db
+            .get_type_index()
+            .get_type_decl(&foo)
+            .map(|decl| decl.get_locations().len());
+        let (_, reads, _) = derivation::end().into_parts(|key| db.fact_fingerprint(key));
+
+        assert_eq!(declared_in, Some(1));
+        assert!(
+            reads
+                .into_iter()
+                .any(|(key, _)| key.into_key() == FactKey::TypeDeclLocations(foo.clone()))
+        );
+    }
 }

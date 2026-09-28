@@ -426,6 +426,7 @@ impl DbIndex {
             K::TypeCache(_)
             | K::DefinitionFact(_)
             | K::TypeDecl(_)
+            | K::TypeDeclLocations(_)
             | K::TypeSupers(_)
             | K::TypeGenericParams(_)
             | K::SourceTypeDecl(_)

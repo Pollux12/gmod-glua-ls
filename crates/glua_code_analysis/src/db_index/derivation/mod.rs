@@ -171,14 +171,17 @@ pub enum FactKey {
     TypeCache(LuaTypeOwner),
     /// A definition-anchored inferred fact.
     DefinitionFact(LuaDefinitionId),
-    /// A `---` type declaration: its object, alias origin included.
+    /// A `---` type declaration: its object, alias origin included, and the
+    /// flags any of its locations carries, but not where it is declared.
     TypeDecl(LuaTypeDeclId),
+    /// Where a type declaration is declared: its locations and their flags.
+    TypeDeclLocations(LuaTypeDeclId),
     /// A type declaration's supertypes.
     TypeSupers(LuaTypeDeclId),
     /// A type declaration's generic parameters.
     TypeGenericParams(LuaTypeDeclId),
-    /// A type declaration as the source layer declares it: its source
-    /// locations, kind and attribute type.
+    /// A type declaration as the source layer declares it: whether it does,
+    /// its kind and attribute type.
     SourceTypeDecl(LuaTypeDeclId),
     /// The type declaration locations and super edges one derivation added.
     TypeContrib(DerivationId),
@@ -580,7 +583,9 @@ impl FactKey {
     pub fn writer_share(&self, writer: DerivationId) -> Option<FactKey> {
         use FactKey as K;
         match self {
-            K::TypeDecl(_) | K::TypeSupers(_) => Some(K::TypeContrib(writer)),
+            K::TypeDecl(_) | K::TypeDeclLocations(_) | K::TypeSupers(_) => {
+                Some(K::TypeContrib(writer))
+            }
             K::GmodInferScan | K::GmodSystem(..) => Some(K::GmodInferFile(writer.file_id)),
             _ => None,
         }
@@ -724,6 +729,7 @@ impl FactKey {
             | K::DynamicFieldFinite(DynamicFieldOwner::Table(site)) => Some(site.file_id),
             K::OperatorOwner(LuaOperatorOwner::Table(site)) => Some(site.file_id),
             K::TypeDecl(_)
+            | K::TypeDeclLocations(_)
             | K::TypeSupers(_)
             | K::TypeGenericParams(_)
             | K::SourceTypeDecl(_)
@@ -1337,6 +1343,14 @@ pub fn note_type_decl_read(decl_id: &LuaTypeDeclId) {
     note_read_by((u8::MAX, u128::from(decl_id.interned_address())), || {
         FactKey::TypeDecl(decl_id.clone())
     });
+}
+
+/// Records a read of where `decl_id` is declared.
+pub fn note_type_decl_locations_read(decl_id: &LuaTypeDeclId) {
+    note_read_by(
+        (u8::MAX - 11, u128::from(decl_id.interned_address())),
+        || FactKey::TypeDeclLocations(decl_id.clone()),
+    );
 }
 
 /// Records a read of `decl_id`'s supertypes.
