@@ -96,4 +96,42 @@ mod test {
         assert!(fresh.declared.is_some(), "the call resolves to Greet");
         assert_eq!(stored, fresh);
     }
+
+    /// The gmod call-site pass takes a panel method call's receiver from the
+    /// file's call targets instead of inferring it before the statements, and
+    /// still records the parent call.
+    #[test]
+    fn gmod_call_sites_read_a_receiver_method_from_the_call_targets() {
+        let mut ws = gmod_workspace();
+        ws.def_file(
+            "lua/vgui/panel.lua",
+            "---@class Panel
+Panel = {}
+",
+        );
+        let (menu, counts) = counted(|| {
+            ws.def_file(
+                "lua/vgui/cl_menu.lua",
+                "---@class MyMenu: Panel
+local PANEL = {}
+function PANEL:Init()
+    self.Btn = self:Add(\"DButton\")
+end
+vgui.Register(\"MyMenu\", PANEL, \"Panel\")
+",
+            )
+        });
+        let inferred = counts
+            .get(&(Work::Infer, Some(DerivationKind::GmodClassCallSites)))
+            .map_or(0, |(computed, _)| *computed);
+        let parent_calls = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_gmod_class_metadata_index()
+            .get_vgui_parent_calls(&menu)
+            .len();
+
+        assert_eq!((inferred, parent_calls), (0, 1));
+    }
 }

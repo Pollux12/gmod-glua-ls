@@ -190,9 +190,6 @@ fn formatted_hook_prefixes(db: &DbIndex) -> Vec<String> {
 /// applied afterwards in the original file-then-call order.
 pub(crate) enum PendingCallSite {
     VguiParent(GmodVguiParentCallMetadata),
-    /// A parent call whose receiver the index could not type yet. See
-    /// [`resolve_deferred_vgui_parent_calls`].
-    DeferredVguiParent,
     ScriptedClass(GmodScriptedClassCallKind, GmodScriptedClassCallMetadata),
     Dependency(LuaDependencySite),
     LoadScan(GmodFileLoadScan),
@@ -355,9 +352,6 @@ pub(crate) fn apply_annotated_call_sites(
             PendingCallSite::VguiParent(call) => db
                 .get_gmod_class_metadata_index_mut()
                 .add_vgui_parent_call(file_id, call),
-            // Its receiver has no type yet; the site is collected once
-            // the receiver's type lands and this derivation re-runs.
-            PendingCallSite::DeferredVguiParent => {}
             PendingCallSite::ScriptedClass(kind, call) => db
                 .get_gmod_class_metadata_index_mut()
                 .add_call(file_id, kind, call),
@@ -6958,10 +6952,10 @@ struct AnnotatedGmodCallRoleMap<'a> {
     local_roles_by_decl: HashMap<LuaDeclId, AnnotatedGmodCallRoles>,
     local_roles_by_path: HashMap<(LuaDeclId, String), AnnotatedGmodCallRoles>,
     local_candidate_names: HashSet<String>,
-    /// The method each call's inferred receiver resolves to: every role kind
-    /// asks for the same call, so it is inferred once, with one cache.
-    receiver_methods: std::cell::RefCell<HashMap<LuaSyntaxId, Option<LuaSignatureId>>>,
-    receiver_cache: std::cell::RefCell<LuaInferCache>,
+    file_id: FileId,
+    /// The file's call targets, read the first time a call's roles come
+    /// from its receiver.
+    targets: std::cell::OnceCell<std::sync::Arc<crate::FileCallTargets>>,
 }
 
 #[derive(Clone, Default, Hash)]
@@ -7941,11 +7935,8 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
             local_roles_by_decl: HashMap::default(),
             local_roles_by_path: HashMap::default(),
             local_candidate_names: HashSet::default(),
-            receiver_methods: std::cell::RefCell::default(),
-            receiver_cache: std::cell::RefCell::new(LuaInferCache::new(
-                file_id,
-                Default::default(),
-            )),
+            file_id,
+            targets: std::cell::OnceCell::new(),
         };
 
         for func_stat in root.descendants::<LuaFuncStat>() {
@@ -8223,7 +8214,7 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
                 .get_decl_references(&file_id, &decl_id)
                 .is_some_and(|references| references.mutable)
         }) {
-            return self.roles_from_inferred_receiver_method(db, call_expr, call_path);
+            return self.roles_from_receiver_target(db, call_expr, call_path);
         }
 
         if let Some(Some(local_path_roles)) =
@@ -8243,7 +8234,7 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
             }
 
             if call_expr_has_shadowing_local_root(db, file_id, call_expr) {
-                return self.roles_from_inferred_receiver_method(db, call_expr, call_path);
+                return self.roles_from_receiver_target(db, call_expr, call_path);
             }
 
             return self
@@ -8263,10 +8254,13 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
             return local_roles.select_for_call(call_expr);
         }
 
-        self.roles_from_inferred_receiver_method(db, call_expr, call_path)
+        self.roles_from_receiver_target(db, call_expr, call_path)
     }
 
-    fn roles_from_inferred_receiver_method(
+    /// The roles of the method `call_expr`'s receiver resolves to, from the
+    /// file's call targets. Those resolve after the statements, so a pass
+    /// that runs before them finds none and runs again once they land.
+    fn roles_from_receiver_target(
         &self,
         db: &DbIndex,
         call_expr: &LuaCallExpr,
@@ -8275,18 +8269,13 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
         if !inferred_receiver_method_candidate(call_expr, call_path) {
             return None;
         }
-        let signature_id = *self
-            .receiver_methods
-            .borrow_mut()
-            .entry(call_expr.get_syntax_id())
-            .or_insert_with(|| {
-                crate::semantic::get_prefix_expr_signature_id(
-                    db,
-                    &mut self.receiver_cache.borrow_mut(),
-                    call_expr,
-                )
-            });
-        roles_from_signature(db, signature_id?)?.select_for_call(call_expr)
+        let targets = self.targets.get_or_init(|| {
+            db.get_call_target_index()
+                .file(self.file_id)
+                .unwrap_or_default()
+        });
+        let signature_id = targets.get(&call_expr.get_range())?.declared?;
+        roles_from_signature(db, signature_id)?.select_for_call(call_expr)
     }
 }
 
@@ -8308,30 +8297,14 @@ fn call_expr_local_root_decl_id(
 ///
 /// A local access path such as self.tabContainer:AddPanel cannot match the
 /// annotated DHorizontalScroller.AddPanel path, but its member signature can.
-/// Most calls have no VGUI parent role, so semantic inference is reserved for
-/// the method names that carry one.
+/// Most calls have no VGUI parent role, so only the method names that carry
+/// one consult the receiver's call target.
 fn inferred_receiver_method_candidate(call_expr: &LuaCallExpr, call_path: &str) -> bool {
     matches!(call_expr.get_prefix_expr(), Some(LuaExpr::IndexExpr(_)))
         && matches!(
             call_path.rsplit('.').next(),
             Some("Add" | "AddPanel" | "SetParent")
         )
-}
-
-/// Whether the receiver of a method call has no type yet, as opposed to a type
-/// that carries no parent role.
-fn receiver_type_undetermined(db: &DbIndex, file_id: FileId, call_expr: &LuaCallExpr) -> bool {
-    let Some(LuaExpr::IndexExpr(method_index)) = call_expr.get_prefix_expr() else {
-        return false;
-    };
-    let Some(receiver) = method_index.get_prefix_expr() else {
-        return false;
-    };
-    let mut cache = LuaInferCache::new(file_id, Default::default());
-    match infer_expr(db, &mut cache, receiver) {
-        Ok(typ) => super::type_is_uninformative(&typ),
-        Err(_) => true,
-    }
 }
 
 fn roles_from_signature(
@@ -8748,15 +8721,6 @@ fn collect_annotated_scripted_class_call_metadata(
                 parent,
             }));
         }
-    } else if inferred_receiver_method_candidate(&call_expr, &call_path)
-        && receiver_type_undetermined(db, file_id, &call_expr)
-    {
-        // `self.panel:Add(child)` is a parent call only if `self.panel` is a
-        // panel, and on a cold build that member is typed after this scan: the
-        // walk defers it until the dynamic-field index seals. Retried once the
-        // index has settled, so the relation does not depend on whether a
-        // retained cache happened to answer.
-        pending.push(PendingCallSite::DeferredVguiParent);
     }
 
     if let Some((kind, inheritance_roles)) =
