@@ -1,3 +1,6 @@
+/// What inference may see. Statements see everything; a pass sees nothing it
+/// produces or feeds: dynamic fields for the dynamic-field pass, call-site
+/// parameters for the call-target, call-site-parameter and net-helper passes.
 #[derive(Debug, Clone)]
 pub struct CacheOptions {
     pub analysis_phase: LuaAnalysisPhase,
