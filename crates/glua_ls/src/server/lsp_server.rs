@@ -1,4 +1,4 @@
-use lsp_server::{Message, Response};
+use lsp_server::Message;
 use lsp_types::InitializeParams;
 use std::error::Error;
 use tokio::sync::oneshot;
@@ -148,11 +148,9 @@ impl LspServer {
                                     // of queueing them behind full workspace initialization.
                                     // Clients will re-request after initialization and avoid
                                     // perceived 10-20s startup request stalls.
-                                    let response = Response::new_err(
-                                        request.id,
-                                        lsp_server::ErrorCode::ContentModified as i32,
-                                        "server initializing".to_owned(),
-                                    );
+                                    let response = self
+                                        .server_context
+                                        .refused_during_init(request.id, &request.method);
                                     self.connection.send(response.into())?;
                                 } else {
                                     // Preserve one-shot/critical request semantics by

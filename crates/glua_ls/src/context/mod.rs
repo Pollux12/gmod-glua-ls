@@ -106,6 +106,26 @@ fn cancel_error(features: &LspFeatures, method: &str) -> (ErrorCode, Option<serd
     }
 }
 
+/// The answer to `id`, a `method` request the server gave up on, in the form
+/// the client re-sends it on.
+pub(crate) fn cancelled_response(
+    features: &LspFeatures,
+    id: RequestId,
+    method: &str,
+    message: &str,
+) -> Response {
+    let (code, data) = cancel_error(features, method);
+    Response {
+        id,
+        result: None,
+        error: Some(lsp_server::ResponseError {
+            code: code as i32,
+            message: message.to_string(),
+            data,
+        }),
+    }
+}
+
 fn should_send_stale_response_on_cancel(method: &str, response: &Response) -> bool {
     let Some(result) = response.result.as_ref() else {
         return false;
@@ -241,6 +261,11 @@ impl ServerContext {
         }
     }
 
+    /// The answer to a request refused while the workspace initializes.
+    pub fn refused_during_init(&self, id: RequestId, method: &str) -> Response {
+        cancelled_response(&self.inner.lsp_features, id, method, "server initializing")
+    }
+
     pub fn snapshot(&self) -> ServerContextSnapshot {
         ServerContextSnapshot::new(self.inner.clone())
     }
@@ -297,16 +322,12 @@ impl ServerContext {
                 {
                     let _ = sender.send(Message::Response(response.clone()));
                 } else {
-                    let (code, data) = cancel_error(&lsp_features, &request_method);
-                    let response = Response {
-                        id: req_id.clone(),
-                        result: None,
-                        error: Some(lsp_server::ResponseError {
-                            code: code as i32,
-                            message: "cancel".to_string(),
-                            data,
-                        }),
-                    };
+                    let response = cancelled_response(
+                        &lsp_features,
+                        req_id.clone(),
+                        &request_method,
+                        "cancel",
+                    );
                     let _ = sender.send(Message::Response(response));
                 }
             } else if res.is_none() {
@@ -537,6 +558,29 @@ mod tests {
             verify_that!(data, eq(&Some(json!({ "retriggerRequest": true }))))?;
         }
         Ok(())
+    }
+
+    /// A pull the server refuses while the workspace still initializes asks
+    /// the client to pull again, as VS Code re-sends a diagnostic pull only
+    /// then.
+    #[gtest]
+    fn a_diagnostic_pull_refused_during_init_asks_the_client_to_pull_again() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let (conn, _peer) = lsp_server::Connection::memory();
+            let context = ServerContext::new(conn, ClientCapabilities::default());
+
+            let response = context.refused_during_init(1.into(), "workspace/diagnostic");
+
+            let error = response.error.expect("the pull is refused");
+            verify_that!(
+                (error.code, error.data),
+                eq(&(
+                    ErrorCode::ServerCancelled as i32,
+                    Some(json!({ "retriggerRequest": true }))
+                ))
+            )
+        })
     }
 
     #[gtest]
