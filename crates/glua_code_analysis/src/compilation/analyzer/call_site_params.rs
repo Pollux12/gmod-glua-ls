@@ -56,7 +56,7 @@ struct FileScope {
     authoritative_receivers: HashMap<LuaSignatureId, bool>,
     closures: HashMap<LuaSignatureId, Option<LuaClosureExpr>>,
     /// What the file's calls target.
-    targets: Option<Arc<FileCallTargets>>,
+    targets: Arc<FileCallTargets>,
 }
 
 impl FileScope {
@@ -70,18 +70,13 @@ impl FileScope {
             ),
             authoritative_receivers: HashMap::default(),
             closures: HashMap::default(),
-            targets: db.get_call_target_index().file(file_id),
+            targets: super::call_target::file_call_targets(db, file_id),
         }
     }
 
     /// What `call_expr`, one of the file's calls, targets.
-    fn call_target(
-        &self,
-        db: &DbIndex,
-        cache: &mut LuaInferCache,
-        call_expr: &LuaCallExpr,
-    ) -> LuaCallTarget {
-        super::call_target::call_target(db, self.targets.as_deref(), cache, call_expr)
+    fn call_target(&self, call_expr: &LuaCallExpr) -> Option<&LuaCallTarget> {
+        self.targets.get(&call_expr.get_range())
     }
 
     /// The closure `signature_id` was declared by, found once per signature.
@@ -660,10 +655,13 @@ fn collect_call_site_param_types(
             .iter()
             .any(|arg| matches!(arg, LuaExpr::ClosureExpr(_)))
     {
-        let target = scope.call_target(db, cache, &call_expr);
-        match target.declared {
-            Some(signature_id) => signature_ids.push(signature_id),
-            None => signature_ids = target.inferred,
+        match scope.call_target(&call_expr) {
+            Some(LuaCallTarget {
+                declared: Some(signature_id),
+                ..
+            }) => signature_ids.push(*signature_id),
+            Some(target) => signature_ids.clone_from(&target.inferred),
+            None => {}
         }
     }
     for signature_id in signature_ids.iter().copied() {
@@ -978,7 +976,7 @@ fn collect_exact_colon_receiver_type(
         return None;
     }
     let receiver_expr = index_expr.get_prefix_expr()?;
-    let signature_id = scope.call_target(db, cache, call_expr).declared?;
+    let signature_id = scope.call_target(call_expr)?.declared?;
     if !is_call_site_realm_compatible(db, file_id, call_expr.get_position(), signature_id) {
         return None;
     }
@@ -1287,7 +1285,10 @@ fn signature_ids_from_call_prefix(
         return (vec![signature_id], SignatureLookupKind::Direct);
     }
 
-    let mut signature_ids = scope.call_target(db, cache, call_expr).inferred;
+    let mut signature_ids = scope
+        .call_target(call_expr)
+        .map(|target| target.inferred.clone())
+        .unwrap_or_default();
     let mut lookup_kind = SignatureLookupKind::InferredCallable;
     if let LuaExpr::NameExpr(name_expr) = prefix_expr {
         let include_signature_ids = signature_ids_from_include_returned_table_member(

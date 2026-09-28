@@ -395,20 +395,26 @@ fn build_file_net_helpers(
 ) -> Option<FileNetHelpers> {
     let root = db.get_vfs().get_syntax_tree(&file_id)?.get_chunk_node();
     let functions = FileFunctionMap::build(&root);
-    let mut net = NetCallResolver::new(db, file_id);
+    let targets = super::super::call_target::file_call_targets(db, file_id);
     let mut calls = HashMap::default();
     for call_expr in root.descendants::<LuaCallExpr>() {
-        let role = net.role(db, &call_expr);
+        let signature_id = targets
+            .get(&call_expr.get_range())
+            .and_then(crate::LuaCallTarget::signature_id);
+        let role =
+            signature_id.and_then(|signature_id| net_call_role(db, &call_expr, signature_id));
         let target = resolve_call_to_function_block(
             file_id,
             &call_expr,
             helper_registry,
             &functions,
-            &mut net,
+            signature_id,
             db,
         );
-        let bits_param_idx = match role {
-            Some(NetCallRole::Payload(_)) => net.bits_param_idx(db, &call_expr),
+        let bits_param_idx = match (&role, signature_id) {
+            (Some(NetCallRole::Payload(_)), Some(signature_id)) => {
+                bits_param_idx(db, &call_expr, signature_id)
+            }
             _ => None,
         };
         calls.insert(
@@ -747,7 +753,7 @@ fn resolve_call_to_function_block(
     call_expr: &LuaCallExpr,
     helper_registry: &HelperRegistry,
     functions: &FileFunctionMap,
-    net: &mut NetCallResolver,
+    signature_id: Option<LuaSignatureId>,
     db: &DbIndex,
 ) -> Option<HelperId> {
     // Direct global member calls have a stable symbol identity even when
@@ -764,7 +770,7 @@ fn resolve_call_to_function_block(
         }
     }
 
-    if let Some(signature_id) = net.signature_id(db, call_expr)
+    if let Some(signature_id) = signature_id
         && let Some((file_id, syntax_id)) = helper_registry.signature(&signature_id)
     {
         return Some(resolve_registry_entry(file_id, syntax_id));
@@ -796,102 +802,66 @@ fn resolve_call_to_function_block(
     None
 }
 
-/// Resolves [`NetCallRole`]s of one file's calls from signature metadata.
-struct NetCallResolver {
-    cache: LuaInferCache,
-    /// What the file's calls target.
-    targets: Option<Arc<crate::FileCallTargets>>,
-    /// The role, the helper resolution and the bit-width lookup all need a
-    /// call's signature, so it is looked up once.
-    signature_memo: HashMap<TextRange, Option<LuaSignatureId>>,
-}
-
-impl NetCallResolver {
-    fn new(db: &DbIndex, file_id: FileId) -> Self {
-        NetCallResolver {
-            cache: LuaInferCache::new(file_id, super::super::call_target::pass_view()),
-            targets: db.get_call_target_index().file(file_id),
-            signature_memo: HashMap::default(),
-        }
-    }
-
-    fn role(&mut self, db: &DbIndex, call_expr: &LuaCallExpr) -> Option<NetCallRole> {
-        let signature_id = self.signature_id(db, call_expr)?;
-        let signature = db.get_signature_index().get(&signature_id)?;
-        let call_arg_idx = |param_idx| {
-            param_idx_to_call_arg_idx(
-                param_idx,
-                call_expr.is_colon_call(),
-                signature.is_colon_define,
-            )
-        };
-
-        if let Some(mut send_kind) = crate::db_index::signature_net_send(db, signature_id) {
-            send_kind.target_arg_idx = send_kind.target_arg_idx.and_then(call_arg_idx);
-            return Some(NetCallRole::Send(send_kind));
-        }
-        if let Some(descriptor) = crate::db_index::signature_net_payload(db, signature_id) {
-            return Some(NetCallRole::Payload(descriptor));
-        }
-
-        for param_idx in 0..signature.params.len() {
-            let Some(role) = crate::db_index::find_best_call_arg_role_for_param(
-                signature,
-                param_idx,
-                crate::db_index::GMOD_DOMAIN_NET_MESSAGE,
-                &["start", "receive"],
-            ) else {
-                continue;
-            };
-            return match role.role.as_str() {
-                "start" => Some(NetCallRole::Start {
-                    message_idx: call_arg_idx(param_idx)?,
-                }),
-                "receive" => Some(NetCallRole::Receive {
-                    message_idx: call_arg_idx(param_idx)?,
-                    callback_idx: crate::db_index::signature_net_callback_param_idx(signature)
-                        .and_then(call_arg_idx),
-                }),
-                _ => None,
-            };
-        }
-        None
-    }
-
-    /// Index of the bit-width parameter, from the `gmod.net_payload`/`bits` role.
-    fn bits_param_idx(&mut self, db: &DbIndex, call_expr: &LuaCallExpr) -> Option<usize> {
-        let signature_id = self.signature_id(db, call_expr)?;
-        let signature = db.get_signature_index().get(&signature_id)?;
-        let param_idx = crate::db_index::signature_net_bits_param_idx(db, signature_id)?;
+/// The net role of `call_expr`, which targets `signature_id`, from signature metadata.
+fn net_call_role(
+    db: &DbIndex,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+) -> Option<NetCallRole> {
+    let signature = db.get_signature_index().get(&signature_id)?;
+    let call_arg_idx = |param_idx| {
         param_idx_to_call_arg_idx(
             param_idx,
             call_expr.is_colon_call(),
             signature.is_colon_define,
         )
+    };
+
+    if let Some(mut send_kind) = crate::db_index::signature_net_send(db, signature_id) {
+        send_kind.target_arg_idx = send_kind.target_arg_idx.and_then(call_arg_idx);
+        return Some(NetCallRole::Send(send_kind));
+    }
+    if let Some(descriptor) = crate::db_index::signature_net_payload(db, signature_id) {
+        return Some(NetCallRole::Payload(descriptor));
     }
 
-    fn signature_id(&mut self, db: &DbIndex, call_expr: &LuaCallExpr) -> Option<LuaSignatureId> {
-        if let Some(cached) = self.signature_memo.get(&call_expr.get_range()) {
-            return *cached;
-        }
-        let resolved = self.signature_id_uncached(db, call_expr);
-        self.signature_memo.insert(call_expr.get_range(), resolved);
-        resolved
+    for param_idx in 0..signature.params.len() {
+        let Some(role) = crate::db_index::find_best_call_arg_role_for_param(
+            signature,
+            param_idx,
+            crate::db_index::GMOD_DOMAIN_NET_MESSAGE,
+            &["start", "receive"],
+        ) else {
+            continue;
+        };
+        return match role.role.as_str() {
+            "start" => Some(NetCallRole::Start {
+                message_idx: call_arg_idx(param_idx)?,
+            }),
+            "receive" => Some(NetCallRole::Receive {
+                message_idx: call_arg_idx(param_idx)?,
+                callback_idx: crate::db_index::signature_net_callback_param_idx(signature)
+                    .and_then(call_arg_idx),
+            }),
+            _ => None,
+        };
     }
+    None
+}
 
-    fn signature_id_uncached(
-        &mut self,
-        db: &DbIndex,
-        call_expr: &LuaCallExpr,
-    ) -> Option<LuaSignatureId> {
-        let target = super::super::call_target::call_target(
-            db,
-            self.targets.as_deref(),
-            &mut self.cache,
-            call_expr,
-        );
-        target.declared.or(target.unique)
-    }
+/// Index of the bit-width parameter, from the `gmod.net_payload`/`bits` role.
+fn bits_param_idx(
+    db: &DbIndex,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+) -> Option<usize> {
+    let signature = db.get_signature_index().get(&signature_id)?;
+    let param_idx = crate::db_index::signature_net_bits_param_idx(db, signature_id)?;
+    param_idx_to_call_arg_idx(
+        param_idx,
+        call_expr.is_colon_call(),
+        signature.is_colon_define,
+    )
 }
 
 /// Collects the net message flows of the context's files.

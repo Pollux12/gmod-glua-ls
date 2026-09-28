@@ -42,6 +42,12 @@ impl LuaCallTarget {
         }
     }
 
+    /// The one signature the call targets: the declared one, else the one
+    /// every callable member of its inferred type names.
+    pub fn signature_id(&self) -> Option<LuaSignatureId> {
+        self.declared.or(self.unique)
+    }
+
     fn signature_ids_mut(&mut self) -> impl Iterator<Item = &mut LuaSignatureId> {
         self.declared
             .iter_mut()
