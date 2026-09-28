@@ -853,12 +853,20 @@ impl DerivationKind {
         }
     }
 
-    /// The first stage at which a derivation of this kind produces anything.
-    /// Before it, evaluating one would only take back what it produced last.
+    /// The first stage a derivation of this kind runs at: work of the kind
+    /// queued before it waits until the run reaches it.
     pub fn first_stage(self) -> AnalysisStage {
         match self {
             // Locals are guessed only once unsettled reads floor.
             Self::LocalFallbacks => StageRule::FloorUnsettled.holds_from(),
+            // The passes that infer across a whole file run once the
+            // statements settled: run earlier, a file's pass runs again whole
+            // for each read that settles after it.
+            Self::DynamicFields
+            | Self::CallTargets
+            | Self::CallSiteParams
+            | Self::NetHelpers
+            | Self::Network => AnalysisStage::Closed,
             _ => AnalysisStage::Open,
         }
     }

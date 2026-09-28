@@ -233,8 +233,8 @@ pub(crate) struct Engine {
     /// Work in other files queued while the focus settles, with why it was
     /// queued.
     waiting: BTreeMap<DerivationId, Reason>,
-    /// Work queued before the stage its kind first produces at, held until
-    /// the run reaches that stage.
+    /// Work queued before its kind's first stage, held until the run
+    /// reaches it.
     held: BTreeMap<DerivationId, Reason>,
     /// The files whose derivations this engine evaluated.
     evaluated: FxHashSet<crate::FileId>,
@@ -696,8 +696,8 @@ impl Engine {
 
     /// At quiescence, moves the run to its next stage and queues every
     /// derivation that waited on a rule the stage starts to hold, and the work
-    /// held until the stage its kind first produces at. Returns
-    /// whether it queued any; `false` once the run is closed.
+    /// held until its kind's first stage. Returns whether it queued any;
+    /// `false` once the run is closed.
     fn advance_stage(&mut self, db: &mut DbIndex) -> bool {
         while let Some(stage) = db.analysis_stage().next() {
             let moved = self.enter_stage(db, stage);

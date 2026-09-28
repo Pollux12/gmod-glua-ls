@@ -32,6 +32,45 @@ mod test {
         assert_eq!((canonical_evaluations, reversed_evaluations), (2, 1));
     }
 
+    /// The passes that infer across a whole file.
+    const WHOLE_FILE_PASSES: [DerivationKind; 6] = [
+        DerivationKind::DynamicFields,
+        DerivationKind::CallTargets,
+        DerivationKind::CallSiteParams,
+        DerivationKind::LocalFallbacks,
+        DerivationKind::NetHelpers,
+        DerivationKind::Network,
+    ];
+
+    /// The whole-file passes run once the statements have settled, so a read
+    /// that settles only at the last stage runs none of them again.
+    #[test]
+    fn whole_file_passes_run_once_when_a_read_settles_at_the_last_stage() {
+        let mut ws = gmod_workspace();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "addons/probe/lua/autorun/server/sv_probe.lua",
+            r#"Lib = {}
+Lib.Undeclared()
+local function greet(name) return name end
+greet(Lib.Missing)
+local handler = Lib.Handler or greet
+handler("x")
+local ent = Lib.Other
+ent.health = 1
+local count = ent.health
+net.Start(Lib.Message)
+net.Broadcast()
+"#,
+        );
+
+        let stats = ws.analysis.compilation.last_stats();
+        let evaluations = WHOLE_FILE_PASSES.map(|kind| (kind, stats.evaluations(kind)));
+        assert_eq!(evaluations, WHOLE_FILE_PASSES.map(|kind| (kind, 1)));
+    }
+
     fn gmod_workspace() -> VirtualWorkspace {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
