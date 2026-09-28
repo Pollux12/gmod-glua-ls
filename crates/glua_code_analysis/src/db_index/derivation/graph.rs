@@ -77,97 +77,196 @@ const NO_GENERATION: u32 = u32::MAX;
 /// A key's readers, grouped by the fingerprint each saw, each group sorted.
 /// A derivation reads a key at one value, so it is in one group. Nearly every
 /// key has one group, so checking its readers against a new value is one
-/// comparison per group rather than one per reader.
+/// comparison per group rather than one per reader, and one group is kept in
+/// the slot.
 #[derive(Debug, Clone, Default)]
-struct Readers(Vec<(Fingerprint, Vec<DerivIdx>)>);
+enum Readers {
+    #[default]
+    None,
+    One(Fingerprint, DerivIdx),
+    /// Two or more readers.
+    Group(Fingerprint, Vec<DerivIdx>),
+    /// Two or more groups.
+    Groups(Vec<(Fingerprint, Vec<DerivIdx>)>),
+}
+
+const _: () = assert!(std::mem::size_of::<Readers>() <= 32);
 
 impl Readers {
     /// Files `deriv` as having seen `seen`, out of the group it was in.
     fn insert(&mut self, deriv: DerivIdx, seen: Fingerprint) {
-        if let Some(at) = self
-            .0
-            .iter()
-            .position(|(group, derivs)| *group != seen && derivs.binary_search(&deriv).is_ok())
-        {
-            self.take(at, deriv);
-        }
-        match self.0.iter_mut().find(|(group, _)| *group == seen) {
-            Some((_, derivs)) => {
+        match self {
+            Self::None => *self = Self::One(seen, deriv),
+            Self::One(group, reader) if *reader == deriv => *group = seen,
+            Self::One(group, reader) if *group == seen => {
+                let pair = if *reader < deriv {
+                    vec![*reader, deriv]
+                } else {
+                    vec![deriv, *reader]
+                };
+                *self = Self::Group(seen, pair);
+            }
+            Self::Group(group, derivs) if *group == seen => {
                 if let Err(at) = derivs.binary_search(&deriv) {
                     derivs.insert(at, deriv);
                 }
             }
-            None => {
-                // Most keys have one group: a growing vector would reserve four.
-                self.0.reserve_exact(1);
-                self.0.push((seen, vec![deriv]));
+            Self::Groups(groups) => {
+                for (group, derivs) in groups.iter_mut() {
+                    if *group == seen {
+                        if let Err(at) = derivs.binary_search(&deriv) {
+                            derivs.insert(at, deriv);
+                        }
+                    } else {
+                        take_from(derivs, deriv);
+                    }
+                }
+                if !groups.iter().any(|(group, _)| *group == seen) {
+                    groups.push((seen, vec![deriv]));
+                }
+                self.collapse();
+            }
+            Self::One(group, reader) => {
+                *self = Self::Groups(vec![(*group, vec![*reader]), (seen, vec![deriv])]);
+            }
+            Self::Group(group, derivs) => {
+                take_from(derivs, deriv);
+                let derivs = std::mem::take(derivs);
+                *self = Self::Groups(vec![(*group, derivs), (seen, vec![deriv])]);
+                self.collapse();
             }
         }
     }
 
     fn remove(&mut self, deriv: DerivIdx) {
-        if let Some(at) = self
-            .0
-            .iter()
-            .position(|(_, derivs)| derivs.binary_search(&deriv).is_ok())
-        {
-            self.take(at, deriv);
-        }
-    }
-
-    /// Removes `deriv` from the group at `at`, which holds it, and the group
-    /// if that empties it.
-    fn take(&mut self, at: usize, deriv: DerivIdx) {
-        let derivs = &mut self.0[at].1;
-        if let Ok(index) = derivs.binary_search(&deriv) {
-            derivs.remove(index);
-        }
-        if derivs.is_empty() {
-            self.0.swap_remove(at);
+        match self {
+            Self::None => {}
+            Self::One(_, reader) => {
+                if *reader == deriv {
+                    *self = Self::None;
+                }
+            }
+            Self::Group(seen, derivs) => {
+                take_from(derivs, deriv);
+                if let [reader] = derivs.as_slice() {
+                    *self = Self::One(*seen, *reader);
+                }
+            }
+            Self::Groups(groups) => {
+                for (_, derivs) in groups.iter_mut() {
+                    take_from(derivs, deriv);
+                }
+                self.collapse();
+            }
         }
     }
 
     /// The fingerprint `deriv`, one of the readers, saw.
     fn seen_by(&self, deriv: DerivIdx) -> Fingerprint {
-        match self.0.as_slice() {
-            [(seen, derivs)] => {
+        match self {
+            Self::One(seen, reader) => {
+                debug_assert_eq!(*reader, deriv);
+                *seen
+            }
+            Self::Group(seen, derivs) => {
                 debug_assert!(derivs.binary_search(&deriv).is_ok());
                 *seen
             }
-            groups => groups
-                .iter()
+            _ => self
+                .groups()
                 .find(|(_, derivs)| derivs.binary_search(&deriv).is_ok())
-                .map(|(seen, _)| *seen)
+                .map(|(seen, _)| seen)
                 .expect("a recorded read is filed among the key's readers"),
         }
     }
 
     /// Relabels the readers that saw `from` as having seen `to`.
     fn relabel(&mut self, from: Fingerprint, to: Fingerprint) {
-        if from == to {
-            return;
-        }
-        let Some(at) = self.0.iter().position(|(seen, _)| *seen == from) else {
-            return;
-        };
-        let (_, derivs) = self.0.swap_remove(at);
-        match self.0.iter_mut().find(|(seen, _)| *seen == to) {
-            Some((_, into)) => {
-                into.extend(derivs);
-                into.sort_unstable();
+        match self {
+            Self::None => {}
+            Self::One(seen, _) | Self::Group(seen, _) => {
+                if *seen == from {
+                    *seen = to;
+                }
             }
-            None => self.0.push((to, derivs)),
+            Self::Groups(groups) => {
+                if from == to {
+                    return;
+                }
+                let Some(at) = groups.iter().position(|(seen, _)| *seen == from) else {
+                    return;
+                };
+                let (_, derivs) = groups.swap_remove(at);
+                match groups.iter_mut().find(|(seen, _)| *seen == to) {
+                    Some((_, into)) => {
+                        into.extend(derivs);
+                        into.sort_unstable();
+                    }
+                    None => groups.push((to, derivs)),
+                }
+                self.collapse();
+            }
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        matches!(self, Self::None)
+    }
+
+    /// Each group's fingerprint and its readers.
+    fn groups(&self) -> impl Iterator<Item = (Fingerprint, &[DerivIdx])> {
+        let (single, many) = match self {
+            Self::None => (None, &[][..]),
+            Self::One(seen, reader) => (Some((*seen, std::slice::from_ref(reader))), &[][..]),
+            Self::Group(seen, derivs) => (Some((*seen, derivs.as_slice())), &[][..]),
+            Self::Groups(groups) => (None, &groups[..]),
+        };
+        single
+            .into_iter()
+            .chain(many.iter().map(|(seen, derivs)| (*seen, derivs.as_slice())))
     }
 
     fn iter(&self) -> impl Iterator<Item = (Fingerprint, DerivIdx)> + '_ {
-        self.0
-            .iter()
-            .flat_map(|(seen, derivs)| derivs.iter().map(move |deriv| (*seen, *deriv)))
+        self.groups()
+            .flat_map(|(seen, derivs)| derivs.iter().map(move |deriv| (seen, *deriv)))
+    }
+
+    /// The heap bytes of the group list and of the reader lists.
+    fn heap_bytes(&self) -> (usize, usize) {
+        let list = |derivs: &Vec<DerivIdx>| derivs.capacity() * std::mem::size_of::<DerivIdx>();
+        match self {
+            Self::None | Self::One(..) => (0, 0),
+            Self::Group(_, derivs) => (0, list(derivs)),
+            Self::Groups(groups) => (
+                groups.capacity() * std::mem::size_of::<(Fingerprint, Vec<DerivIdx>)>(),
+                groups.iter().map(|(_, derivs)| list(derivs)).sum(),
+            ),
+        }
+    }
+
+    /// Drops emptied groups, and keeps what is left in the smallest form.
+    fn collapse(&mut self) {
+        let Self::Groups(groups) = self else {
+            return;
+        };
+        groups.retain(|(_, derivs)| !derivs.is_empty());
+        if groups.len() > 1 {
+            return;
+        }
+        *self = match groups.pop() {
+            None => Self::None,
+            Some((seen, derivs)) => match derivs.as_slice() {
+                [reader] => Self::One(seen, *reader),
+                _ => Self::Group(seen, derivs),
+            },
+        };
+    }
+}
+
+/// Removes `deriv` from the sorted `derivs`, if there.
+fn take_from(derivs: &mut Vec<DerivIdx>, deriv: DerivIdx) {
+    if let Ok(index) = derivs.binary_search(&deriv) {
+        derivs.remove(index);
     }
 }
 
@@ -423,25 +522,23 @@ impl ReaderGraph {
         use std::mem::size_of;
         let table = &self.table;
         let live = table.keys.iter().filter(|slot| slot.key.is_some()).count();
-        let groups: usize = table.keys.iter().map(|slot| slot.readers.0.len()).sum();
-        let group_bytes: usize = table
+        let groups: usize = table
             .keys
             .iter()
-            .map(|slot| slot.readers.0.capacity())
-            .sum::<usize>()
-            * size_of::<(Fingerprint, Vec<DerivIdx>)>();
+            .map(|slot| slot.readers.groups().count())
+            .sum();
         let edges: usize = table
             .keys
             .iter()
-            .flat_map(|slot| slot.readers.0.iter())
-            .map(|(_, readers)| readers.len())
+            .map(|slot| slot.readers.iter().count())
             .sum();
-        let set_bytes: usize = table
+        let (group_bytes, set_bytes) = table
             .keys
             .iter()
-            .flat_map(|slot| slot.readers.0.iter())
-            .map(|(_, readers)| readers.capacity() * size_of::<DerivIdx>())
-            .sum();
+            .map(|slot| slot.readers.heap_bytes())
+            .fold((0, 0), |(groups, sets), (group, set)| {
+                (groups + group, sets + set)
+            });
         let producer_bytes: usize = table
             .keys
             .iter()
@@ -787,7 +884,7 @@ impl ReaderGraph {
     ) -> impl Iterator<Item = DerivationId> + 'a {
         self.table
             .find(key)
-            .map(|slot| &self.table.keys[slot as usize].readers.0)
+            .map(|slot| self.table.keys[slot as usize].readers.groups())
             .into_iter()
             .flatten()
             .filter(move |(seen, _)| !holds(*seen))
@@ -870,7 +967,7 @@ impl ReaderGraph {
             return false;
         }
         let current = current();
-        readers.0.iter().any(|(seen, _)| *seen != current)
+        readers.groups().any(|(seen, _)| seen != current)
     }
 
     /// Relabels the reads of `key` that saw `from` as having seen `to`: after
@@ -1369,6 +1466,52 @@ mod tests {
 
         assert_eq!(end().id, id(2, 0));
         assert_eq!(end().id, id(1, 0));
+    }
+
+    fn groups(readers: &Readers) -> Vec<(Fingerprint, Vec<DerivIdx>)> {
+        readers
+            .groups()
+            .map(|(seen, derivs)| (seen, derivs.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn a_reader_that_sees_the_value_the_others_saw_rejoins_their_group() {
+        let mut readers = Readers::default();
+        readers.insert(1, 5);
+        readers.insert(2, 5);
+        readers.insert(3, 6);
+
+        readers.insert(3, 5);
+
+        assert_eq!(groups(&readers), vec![(5, vec![1, 2, 3])]);
+    }
+
+    #[test]
+    fn relabelling_one_group_as_another_merges_them() {
+        let mut readers = Readers::default();
+        readers.insert(1, 5);
+        readers.insert(2, 6);
+        readers.insert(3, 6);
+
+        readers.relabel(6, 5);
+
+        assert_eq!(groups(&readers), vec![(5, vec![1, 2, 3])]);
+    }
+
+    #[test]
+    fn removing_the_only_reader_of_a_value_leaves_the_others_group() {
+        let mut readers = Readers::default();
+        readers.insert(1, 5);
+        readers.insert(2, 5);
+        readers.insert(3, 6);
+
+        readers.remove(3);
+
+        assert_eq!(
+            (groups(&readers), readers.seen_by(2)),
+            (vec![(5, vec![1, 2])], 5)
+        );
     }
 
     /// Deleting text moves a key after the deletion onto the place of one
