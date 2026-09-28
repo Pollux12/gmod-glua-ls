@@ -452,6 +452,7 @@ impl DbIndex {
             | K::PathClassContrib(_)
             | K::DefinitionSite(_) => self.members_index.fact_fingerprint(key),
             K::Signature(_)
+            | K::SignatureDecl(_)
             | K::ValidGuard(_)
             | K::ValidGuardFile(_)
             | K::ValidGuardFiles

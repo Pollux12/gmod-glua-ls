@@ -71,6 +71,26 @@ net.Broadcast()
         assert_eq!(evaluations, WHOLE_FILE_PASSES.map(|kind| (kind, 1)));
     }
 
+    /// The helper scan reads what a file's signatures declare, so a return
+    /// that inference resolves after the scan does not run it again.
+    #[test]
+    fn a_resolved_return_does_not_re_run_the_helper_scan() {
+        let mut ws = gmod_workspace();
+        ws.def_file(
+            "addons/probe/lua/autorun/sh_helpers.lua",
+            "function SendScore(score)
+    net.Start(\"Score\")
+    net.WriteInt(score, 16)
+    net.Broadcast()
+    return score + 1
+end
+",
+        );
+
+        let stats = ws.analysis.compilation.last_stats();
+        assert_eq!(stats.evaluations(DerivationKind::GmodHelperScan), 1);
+    }
+
     fn gmod_workspace() -> VirtualWorkspace {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

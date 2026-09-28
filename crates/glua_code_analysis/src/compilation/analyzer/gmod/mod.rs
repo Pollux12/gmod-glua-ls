@@ -7761,7 +7761,7 @@ impl AnnotatedGmodGlobalCallRoleMap {
             builder.add_signature(db, *signature_id);
             role_map.add_signature_net_op(db, *signature_id);
 
-            let Some(signature) = db.get_signature_index().get(signature_id) else {
+            let Some(signature) = db.get_signature_index().get_declared(signature_id) else {
                 continue;
             };
             if !signature.has_call_arg_roles() {
@@ -8311,7 +8311,7 @@ fn roles_from_signature(
     db: &DbIndex,
     signature_id: LuaSignatureId,
 ) -> Option<AnnotatedGmodCallRoles> {
-    let signature = db.get_signature_index().get(&signature_id)?;
+    let signature = db.get_signature_index().get_declared(&signature_id)?;
     if !signature.has_call_arg_roles() {
         return None;
     }

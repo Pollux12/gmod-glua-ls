@@ -228,6 +228,15 @@ impl LuaSignatureIndex {
         self.signatures.get(signature_id)
     }
 
+    /// `signature_id`'s signature for a reader of what it declares only: its
+    /// params with their docs, overloads, generic params and colon and vararg
+    /// flags. Records a read of those alone, so what inference later resolves
+    /// for the signature leaves the reader standing.
+    pub fn get_declared(&self, signature_id: &LuaSignatureId) -> Option<&LuaSignature> {
+        derivation::note_signature_decl_read(*signature_id);
+        self.signatures.get(signature_id)
+    }
+
     pub fn get_mut(&mut self, signature_id: &LuaSignatureId) -> Option<&mut LuaSignature> {
         self.snapshot_source(*signature_id);
         derivation::note_write(|| FactKey::Signature(*signature_id));
@@ -836,6 +845,12 @@ impl LuaSignatureIndex {
                 }
                 derivation::fingerprint_of(&(signature, local_func_decl))
             }
+            FactKey::SignatureDecl(signature_id) => self
+                .signatures
+                .get(signature_id)
+                .map_or(derivation::ABSENT, |signature| {
+                    derivation::fingerprint_of(&signature.declaration())
+                }),
             FactKey::ValidGuardFile(file_id) => {
                 derivation::fingerprint_opt(self.valid_guard_file_contributions.get(file_id))
             }

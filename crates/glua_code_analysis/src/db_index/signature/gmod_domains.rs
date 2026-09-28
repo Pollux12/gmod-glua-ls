@@ -413,7 +413,7 @@ pub fn signature_net_send(db: &DbIndex, signature_id: LuaSignatureId) -> Option<
         _ => return None,
     };
 
-    let signature = db.get_signature_index().get(&signature_id)?;
+    let signature = db.get_signature_index().get_declared(&signature_id)?;
     Some(NetSendKind {
         receiver_realm,
         target_arg_idx: find_param_idx_with_role(
@@ -460,7 +460,7 @@ fn signature_has_net_message_role(
     signature_id: LuaSignatureId,
     roles: &[&str],
 ) -> bool {
-    let Some(signature) = db.get_signature_index().get(&signature_id) else {
+    let Some(signature) = db.get_signature_index().get_declared(&signature_id) else {
         return false;
     };
     (0..signature.params.len()).any(|param_idx| {
@@ -484,7 +484,7 @@ pub fn type_is_net_read_op(db: &DbIndex, typ: &LuaType) -> bool {
 /// Index of the bit-width parameter of a net payload op, when one is annotated.
 /// Replaces the old per-op-kind hardcoded argument index.
 pub fn signature_net_bits_param_idx(db: &DbIndex, signature_id: LuaSignatureId) -> Option<usize> {
-    let signature = db.get_signature_index().get(&signature_id)?;
+    let signature = db.get_signature_index().get_declared(&signature_id)?;
     find_param_idx_with_role(signature, GMOD_DOMAIN_NET_PAYLOAD, GMOD_ROLE_NET_BITS)
 }
 

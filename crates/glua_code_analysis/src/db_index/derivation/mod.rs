@@ -305,6 +305,10 @@ pub enum FactKey {
     /// The realm and state mask at one offset of a file, read out of its
     /// [`FactKey::GmodRealm`].
     GmodRealmAt(FileId, TextSize),
+    /// A signature as declared: its params with their docs and attributes,
+    /// overloads, generic params and colon and vararg flags. Read out of its
+    /// [`FactKey::Signature`], which also holds what inference resolved.
+    SignatureDecl(LuaSignatureId),
     /// The `---@realm` annotation covering one offset of a file, read out of
     /// its [`FactKey::GmodInferFile`].
     GmodMemberRealmAt(FileId, TextSize),
@@ -555,6 +559,7 @@ impl FactKey {
                 | K::TypeCache(_)
                 | K::DefinitionFact(_)
                 | K::Signature(_)
+                | K::SignatureDecl(_)
                 | K::DynamicField(..)
                 | K::DynamicFieldWildcards(_)
                 | K::DynamicFieldFinite(_)
@@ -646,7 +651,10 @@ impl FactKey {
 
     /// Whether keys are read out of this one ([`Self::base`]).
     pub fn is_base(&self) -> bool {
-        matches!(self, FactKey::GmodRealm(_) | FactKey::GmodInferFile(_))
+        matches!(
+            self,
+            FactKey::GmodRealm(_) | FactKey::GmodInferFile(_) | FactKey::Signature(_)
+        )
     }
 
     /// The key this one is read out of: writing the base moves every key read
@@ -656,6 +664,7 @@ impl FactKey {
         match self {
             FactKey::GmodRealmAt(file_id, _) => Some(FactKey::GmodRealm(*file_id)),
             FactKey::GmodMemberRealmAt(file_id, _) => Some(FactKey::GmodInferFile(*file_id)),
+            FactKey::SignatureDecl(signature_id) => Some(FactKey::Signature(*signature_id)),
             _ => None,
         }
     }
@@ -688,6 +697,7 @@ impl FactKey {
             | K::TableClass(site)
             | K::Syntax(site) => Some(site.file_id),
             K::Signature(signature_id)
+            | K::SignatureDecl(signature_id)
             | K::ValidGuard(signature_id)
             | K::InferredGuard(signature_id)
             | K::Contrib(signature_id, _)
@@ -1417,6 +1427,17 @@ pub fn note_special_call_read(file_id: FileId, position: TextSize) {
     note_read_by((u8::MAX - 3, file_position(file_id, position)), || {
         FactKey::SpecialCall(file_id, position)
     });
+}
+
+/// Records a read of the signature `id` as declared.
+pub fn note_signature_decl_read(id: LuaSignatureId) {
+    note_read_by(
+        (
+            u8::MAX - 12,
+            file_position(id.get_file_id(), id.get_position()),
+        ),
+        || FactKey::SignatureDecl(id),
+    );
 }
 
 /// Records a read of the signature object `id`.

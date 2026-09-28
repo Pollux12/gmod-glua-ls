@@ -96,6 +96,25 @@ pub enum LuaNoDiscard {
     NoDiscardWithMessage(Box<String>),
 }
 
+impl LuaSignature {
+    /// What a read of the signature as declared observes; see
+    /// [`crate::db_index::derivation::FactKey::SignatureDecl`].
+    pub(crate) fn declaration(&self) -> impl Hash + '_ {
+        let mut param_docs: Vec<_> = self.param_docs.iter().collect();
+        param_docs.sort_unstable_by_key(|(idx, _)| **idx);
+        (
+            &self.generic_params,
+            &self.overloads,
+            param_docs,
+            &self.out_params,
+            &self.params,
+            self.is_colon_define,
+            self.is_vararg,
+            self.params_filled_from_slot,
+        )
+    }
+}
+
 /// Content hash; `param_docs` is hashed in param-index order.
 impl Hash for LuaSignature {
     fn hash<H: Hasher>(&self, state: &mut H) {
