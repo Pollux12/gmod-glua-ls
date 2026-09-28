@@ -74,14 +74,14 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
         return Err(InferFailReason::RecursiveInfer);
     }
     let lookup = cache.lookup();
-    if crate::db_index::derivation::check_tsc() {
+    if crate::db_index::derivation::check_cache() {
         crate::db_index::derivation::take_reused_across();
     }
     if let Some(cache_entry) = cache.expr_cache.get(&key, lookup, &cache.keyed) {
         match cache_entry {
             CacheEntry::Cache(ty) => {
                 let ty = ty.clone();
-                if crate::db_index::derivation::check_tsc()
+                if crate::db_index::derivation::check_cache()
                     && crate::db_index::derivation::take_reused_across()
                 {
                     let shared_reads = cache
@@ -125,21 +125,21 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
                                         (*then != now).then(|| format!("{:?}", &**hashed))
                                     })
                                     .collect::<Vec<_>>();
-                                eprintln!("[tsc] origin {origin:?} moved-unmarked={moved:?}");
+                                eprintln!("[cache] origin {origin:?} moved-unmarked={moved:?}");
                             }
                         }
                         let gmod_class = shared_reads
                             .iter()
                             .filter(|(key, _)| key.contains("GmodClass"))
                             .collect::<Vec<_>>();
-                        eprintln!("[tsc] gmod-class reads {gmod_class:?}");
+                        eprintln!("[cache] gmod-class reads {gmod_class:?}");
                         eprintln!(
-                            "[tsc] reads shared={} fresh={} only_fresh={only_fresh:?} written={written:?}",
+                            "[cache] reads shared={} fresh={} only_fresh={only_fresh:?} written={written:?}",
                             shared_reads.len(),
                             fresh_reads.len(),
                         );
                         eprintln!(
-                            "[tsc] mismatch {:?} {:?} {:?} `{}` shared={ty:?} fresh={recomputed:?}",
+                            "[cache] mismatch {:?} {:?} {:?} `{}` shared={ty:?} fresh={recomputed:?}",
                             db.get_vfs()
                                 .get_uri(&cache.get_file_id())
                                 .map(|uri| uri.to_string()),

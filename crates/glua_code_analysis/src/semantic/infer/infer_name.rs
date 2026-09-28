@@ -813,18 +813,18 @@ fn infer_implicit_method_self_type(
     // Cache the unified result (including a negative result) for subsequent
     // `self` references in the same method body. A result that consulted the
     // call-site gate is only reused under the same view.
-    if crate::db_index::derivation::check_tsc() {
+    if crate::db_index::derivation::check_cache() {
         crate::db_index::derivation::take_reused_across();
     }
     if let Some(cached) = cache.tracked_get(|cache| &mut cache.self_type_cache, &func_syntax_id) {
-        if crate::db_index::derivation::check_tsc()
+        if crate::db_index::derivation::check_cache()
             && crate::db_index::derivation::take_reused_across()
         {
             let mut fresh = cache.fork_fresh();
             let recomputed = infer_implicit_method_self_type_inner(db, &mut fresh, name_expr);
             if recomputed != cached {
                 eprintln!(
-                    "[tsc] self mismatch {:?} {:?} {:?} shared={cached:?} fresh={recomputed:?}",
+                    "[cache] self mismatch {:?} {:?} {:?} shared={cached:?} fresh={recomputed:?}",
                     cache.get_file_id(),
                     func_syntax_id,
                     crate::db_index::derivation::current(),

@@ -49,10 +49,12 @@ corpus() { # name dir: glua_check JSON, diffed against VALIDATE_REF/<name>.json 
   fi
 }
 
-cache_check() { # name dir: GLUALS_CHECK_TSC mismatches must be 0
+cache_check() { # name dir: GLUALS_CHECK_CACHE mismatches must be 0
   local name=$1 dir=$2
-  GLUALS_CHECK_TSC=1 "$REL/glua_check$X" "$dir" -f json --output "$OUT/$name.tsc.json" --gmod-annotations "$ANN" > "$OUT/$name.tsc.txt" 2>&1
-  local n; n=$(grep -cE '\[tsc\] (flow )?mismatch' "$OUT/$name.tsc.txt")
+  : > "$OUT/$name.cache.json"
+  GLUALS_CHECK_CACHE=1 timeout 1800 "$REL/glua_check$X" "$dir" -f json --output "$OUT/$name.cache.json" --gmod-annotations "$ANN" > "$OUT/$name.cache.txt" 2>&1
+  [ -s "$OUT/$name.cache.json" ] || { echo "glua_check wrote nothing (timed out or crashed)"; return 1; }
+  local n; n=$(grep -cE '^\[cache\] .*mismatch' "$OUT/$name.cache.txt")
   echo "$n mismatches"
   [ "$n" -eq 0 ]
 }

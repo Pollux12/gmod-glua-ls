@@ -313,6 +313,11 @@ impl KeyTable {
         self.last_written > stamp
     }
 
+    /// The stamp of the latest write or release of a live slot.
+    pub(super) fn last_written(&self) -> u64 {
+        self.last_written
+    }
+
     /// Whether any of `slots` was written after stamp `since`.
     pub(super) fn written_since(&self, slots: &[KeyIdx], since: u64) -> Freshness {
         let mut freshness = Freshness::Unwritten;
@@ -758,7 +763,7 @@ impl ReaderGraph {
         })
     }
 
-    /// For `GLUALS_CHECK_TSC`: `id`'s recorded reads by slot.
+    /// For `GLUALS_CHECK_CACHE`: `id`'s recorded reads by slot.
     pub fn recorded_slots(&self, id: DerivationId) -> Vec<(KeyIdx, Fingerprint)> {
         self.record(id)
             .map(|(_, record)| record.reads.to_vec())

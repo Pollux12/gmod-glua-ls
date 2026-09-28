@@ -474,7 +474,13 @@ pub fn reuse(
                     return Reuse::Stale;
                 }
             }
-            REUSED_ACROSS.with(|flag| flag.set(true));
+            if check_cache()
+                && evaluation
+                    .checks
+                    .insert(check_identity(provenance, table, view, keyed, realm))
+            {
+                REUSED_ACROSS.with(|flag| flag.set(true));
+            }
             let replays = provenance.replays_into(evaluation.frame_stamp());
             count(|stats| {
                 stats.reused += 1;
@@ -516,7 +522,7 @@ fn replay_unkeyed(evaluation: &mut Evaluation, provenance: &Provenance) {
     }
 }
 
-/// For `GLUALS_CHECK_TSC`: the keys `provenance` recorded, each with whether
+/// For `GLUALS_CHECK_CACHE`: the keys `provenance` recorded, each with whether
 /// it was written after the value was computed.
 pub fn describe_reads(provenance: &Provenance) -> Vec<(String, bool)> {
     with_evaluation(|evaluation, table| {
@@ -550,7 +556,7 @@ pub fn describe_reads(provenance: &Provenance) -> Vec<(String, bool)> {
     .unwrap_or_default()
 }
 
-/// For `GLUALS_CHECK_TSC`: the derivation that computed `provenance`, and
+/// For `GLUALS_CHECK_CACHE`: the derivation that computed `provenance`, and
 /// each key it recorded.
 pub fn provenance_keys(
     provenance: &Provenance,
@@ -648,16 +654,36 @@ thread_local! {
 }
 
 /// Whether a reuse since the last call took a value another evaluation
-/// computed; clears the flag. For `GLUALS_CHECK_TSC`.
+/// computed; clears the flag. For `GLUALS_CHECK_CACHE`.
 pub fn take_reused_across() -> bool {
     REUSED_ACROSS.with(|flag| flag.replace(false))
 }
 
-/// Under `GLUALS_CHECK_TSC`, values reused across evaluations are recomputed
+/// What a check of reusing `provenance` depends on: the value, the state of
+/// the key table and the context of the lookup. The same ones give the same
+/// fresh answer, so each is checked once per evaluation.
+fn check_identity(
+    provenance: &Provenance,
+    table: &KeyTable,
+    view: Gates,
+    keyed: &[u64],
+    realm: Option<(GmodRealm, u32)>,
+) -> u64 {
+    use std::hash::BuildHasher;
+    rustc_hash::FxBuildHasher.hash_one((
+        Arc::as_ptr(&provenance.0),
+        table.last_written(),
+        view,
+        keyed,
+        realm.map(|(realm, _)| realm),
+    ))
+}
+
+/// Under `GLUALS_CHECK_CACHE`, values reused across evaluations are recomputed
 /// fresh and compared.
-pub fn check_tsc() -> bool {
+pub fn check_cache() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("GLUALS_CHECK_TSC").is_some())
+    *ENABLED.get_or_init(|| std::env::var_os("GLUALS_CHECK_CACHE").is_some())
 }
 
 fn profiling() -> bool {

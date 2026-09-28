@@ -19,7 +19,7 @@ use rustc_hash::FxHashSet;
 pub use diagnostic_reads::DiagnosticReads;
 mod paged;
 pub use frames::{
-    Gates, OpenFrame, Provenance, Reuse, ScopeMark, check_tsc, close_frame, consult_absorbed,
+    Gates, OpenFrame, Provenance, Reuse, ScopeMark, check_cache, close_frame, consult_absorbed,
     consult_cycle, consult_gates, consult_realm, consult_scope, consult_unkeyed, describe_reads,
     frame_depth, new_stamp, note_recomputed, note_recomputing, note_written, open_frame,
     open_frame_absorbing, provenance_keys, report_frames, reuse, scope_mark, taint,
@@ -935,6 +935,8 @@ pub struct Evaluation {
     /// References the open frames read as walking from no keyed origin, once
     /// per frame; see [`frames::consult_unkeyed`].
     unkeyed: Vec<u64>,
+    /// Under `GLUALS_CHECK_CACHE`, the reuses already checked.
+    checks: FxHashSet<u64>,
     /// The log as memos outliving the evaluation see it.
     log_handle: std::sync::Arc<frames::LogHandle>,
     /// The stamp the evaluation began under.
@@ -1137,6 +1139,7 @@ pub fn begin(id: DerivationId) {
         log: Vec::new(),
         frames: Vec::new(),
         unkeyed: Vec::new(),
+        checks: FxHashSet::default(),
         log_handle: std::sync::Arc::new(frames::LogHandle(Default::default(), Some(id))),
         stamp,
         reads: FxHashSet::default(),
