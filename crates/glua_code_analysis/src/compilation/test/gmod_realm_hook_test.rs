@@ -1678,6 +1678,35 @@ mod test {
         );
     }
 
+    /// Code appended after an early-return guard is in the guard's realm,
+    /// though the edit re-runs no load fold.
+    #[gtest]
+    fn test_code_appended_after_an_early_return_guard_takes_its_realm() {
+        const PATH: &str = "lua/sh_append_after_guard.lua";
+        const TEXT: &str = "print(\"shared\")
+if CLIENT then return end
+print(\"server-only\")
+";
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(PATH, TEXT);
+
+        let file_id = ws.def_file(
+            PATH,
+            &format!(
+                "{TEXT}print(\"appended\")
+"
+            ),
+        );
+
+        let appended = rowan::TextSize::from((TEXT.len() + 1) as u32);
+        let realm = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_realm_at_offset(&file_id, appended);
+        expect_that!(realm, eq(GmodRealm::Server));
+    }
+
     #[gtest]
     fn test_early_return_realm_narrowing_nested_blocks() {
         let mut ws = VirtualWorkspace::new();

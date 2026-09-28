@@ -597,66 +597,46 @@ fn is_base_gamemode_path(path_sort_key: &str) -> bool {
     path_sort_key.starts_with("gamemodes/base/gamemode/")
 }
 
-impl LuaIndex for GmodLoadIndex {
-    fn remove(&mut self, file_id: FileId) {
-        derivation::note_write(|| FactKey::GmodLoadFile(file_id));
-        self.note_all_file_writes();
-        self.file_infos.remove(&file_id);
-        self.execution_environments.remove(&file_id);
-        self.execution_environment_sites.remove(&file_id);
-        for targets in self.execution_environment_sites.values_mut() {
-            targets.remove(&file_id);
-        }
-        self.rebuild_execution_environments();
-        self.unresolved_edges
-            .retain(|edge| edge.source_file_id != file_id && edge.target_file_id != Some(file_id));
-        for info in self.file_infos.values_mut() {
-            info.incoming_edges.retain(|edge| {
-                edge.source_file_id != file_id && edge.target_file_id != Some(file_id)
-            });
-            if info.shadowed_by == Some(file_id) {
-                info.shadowed_by = None;
+impl GmodLoadIndex {
+    /// Moves the call sites of the load edges `remap`'s file holds to their
+    /// new place. A call the edit destroyed changes the file's load scan, so
+    /// the load fold runs again and replaces the edges.
+    pub(crate) fn remap_edge_positions(&mut self, remap: &crate::FileRemap) {
+        let remap_edge = |edge: &mut GmodLoadEdge| {
+            if edge.source_file_id != remap.file_id {
+                return false;
+            }
+            let Some(range) = edge.range else {
+                return false;
+            };
+            let moved = remap.map.map_range(range);
+            let changed = moved != Some(range);
+            edge.range = moved;
+            changed
+        };
+        let mut changed = Vec::new();
+        for (file_id, info) in &mut self.file_infos {
+            let mut moved = false;
+            for edge in &mut info.incoming_edges {
+                moved |= remap_edge(edge);
+            }
+            if moved {
+                changed.push(*file_id);
             }
         }
+        for edge in &mut self.unresolved_edges {
+            remap_edge(edge);
+        }
+        for file_id in changed {
+            derivation::note_write(|| FactKey::GmodLoadFile(file_id));
+        }
     }
+}
 
-    fn remove_files(&mut self, file_ids: &[FileId]) {
-        for file_id in file_ids {
-            derivation::note_write(|| FactKey::GmodLoadFile(*file_id));
-        }
-        self.note_all_file_writes();
-        let removed_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
-        self.file_infos
-            .retain(|file_id, _| !removed_file_ids.contains(file_id));
-        self.execution_environments
-            .retain(|file_id, _| !removed_file_ids.contains(file_id));
-        self.execution_environment_sites
-            .retain(|source, _| !removed_file_ids.contains(source));
-        for targets in self.execution_environment_sites.values_mut() {
-            targets.retain(|target, _| !removed_file_ids.contains(target));
-        }
-        self.rebuild_execution_environments();
-        self.unresolved_edges.retain(|edge| {
-            !removed_file_ids.contains(&edge.source_file_id)
-                && !edge
-                    .target_file_id
-                    .is_some_and(|target_file_id| removed_file_ids.contains(&target_file_id))
-        });
-        for info in self.file_infos.values_mut() {
-            info.incoming_edges.retain(|edge| {
-                !removed_file_ids.contains(&edge.source_file_id)
-                    && !edge
-                        .target_file_id
-                        .is_some_and(|target_file_id| removed_file_ids.contains(&target_file_id))
-            });
-            if info
-                .shadowed_by
-                .is_some_and(|file_id| removed_file_ids.contains(&file_id))
-            {
-                info.shadowed_by = None;
-            }
-        }
-    }
+/// The load fold's output only: it replaces all of it when it runs, so a
+/// removed file's entries stay until then.
+impl LuaIndex for GmodLoadIndex {
+    fn remove(&mut self, _file_id: FileId) {}
 
     fn clear(&mut self) {
         self.note_all_file_writes();
@@ -681,56 +661,65 @@ fn status_rank(status: GmodLoadStatus) -> u8 {
 mod tests {
     use std::collections::{HashMap, HashSet};
 
-    use super::{GmodFileLoadInfo, GmodLoadEdge, GmodLoadEdgeKind, GmodLoadIndex, GmodStateMask};
-    use crate::{FileId, db_index::LuaIndex};
+    use rowan::TextRange;
 
-    #[test]
-    fn batch_removal_keeps_only_surviving_load_edges() {
-        let removed = FileId::new(1);
-        let other_removed = FileId::new(2);
-        let surviving = FileId::new(3);
-        let external = FileId::new(4);
-        let edge = |source_file_id, target_file_id| GmodLoadEdge {
+    use super::{GmodFileLoadInfo, GmodLoadEdge, GmodLoadEdgeKind, GmodLoadIndex, GmodStateMask};
+    use crate::{FileId, FileRemap, PositionMap, db_index::LuaIndex};
+
+    fn include_edge(source_file_id: FileId, target_file_id: FileId) -> GmodLoadEdge {
+        GmodLoadEdge {
             source_file_id,
-            target_file_id,
+            target_file_id: Some(target_file_id),
             kind: GmodLoadEdgeKind::Include,
             states: GmodStateMask::SHARED,
             path: None,
             original_expr: None,
-            range: None,
-        };
-        let mut index = GmodLoadIndex::new();
-        let mut info = GmodFileLoadInfo::fallback_shared();
-        info.incoming_edges.push(edge(external, Some(surviving)));
-        info.incoming_edges.push(edge(removed, Some(surviving)));
-        info.shadowed_by = Some(removed);
-        index.file_infos.insert(surviving, info);
-        index.unresolved_edges.extend([
-            edge(surviving, Some(external)),
-            edge(surviving, Some(removed)),
-        ]);
-
-        index.remove_files(&[other_removed, removed, other_removed]);
-
-        let info = index.get_file_info(&surviving).unwrap();
-        assert_eq!(info.incoming_edges, vec![edge(external, Some(surviving))]);
-        assert_eq!(info.shadowed_by, None);
-        assert_eq!(index.unresolved_edges(), &[edge(surviving, Some(external))]);
+            range: Some(TextRange::new(2.into(), 6.into())),
+        }
     }
 
+    /// The load fold replaces this index whole when it runs, so a re-indexed
+    /// file's edges stay for it to keep or replace.
     #[test]
-    fn removing_environment_source_drops_its_target_fields() {
-        let source = FileId::new(1);
-        let target = FileId::new(2);
+    fn removing_a_file_keeps_its_load_edges_for_the_fold() {
+        let (source, target) = (FileId::new(1), FileId::new(2));
         let mut index = GmodLoadIndex::new();
-        index.set_execution_environment_sites(HashMap::from_iter([(
-            source,
-            HashMap::from_iter([(target, HashSet::from_iter(["simple".to_string()]))]),
-        )]));
+        let mut info = GmodFileLoadInfo::fallback_shared();
+        info.incoming_edges.push(include_edge(source, target));
+        index.file_infos.insert(target, info);
 
         index.remove(source);
 
-        assert!(!index.execution_environment_contains(target, "simple"));
+        let info = index
+            .get_file_info(&target)
+            .expect("the target's info is kept");
+        assert_eq!(info.incoming_edges, vec![include_edge(source, target)]);
+    }
+
+    /// An edit above a kept edge's call moves the call's range with it.
+    #[test]
+    fn an_edit_moves_a_kept_edge_to_its_call() {
+        let (source, target) = (FileId::new(1), FileId::new(2));
+        let mut index = GmodLoadIndex::new();
+        let mut info = GmodFileLoadInfo::fallback_shared();
+        info.incoming_edges.push(include_edge(source, target));
+        index.file_infos.insert(target, info);
+
+        index.remap_edge_positions(&FileRemap::unvalidated(
+            source,
+            PositionMap::new(
+                "abcdefgh",
+                "
+abcdefgh",
+            ),
+        ));
+
+        let range = index
+            .get_file_info(&target)
+            .expect("the target's info is kept")
+            .incoming_edges[0]
+            .range;
+        assert_eq!(range, Some(TextRange::new(3.into(), 7.into())));
     }
 
     #[test]

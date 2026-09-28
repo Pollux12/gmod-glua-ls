@@ -1379,4 +1379,30 @@ Foo = {}
                 .any(|(key, _)| key.into_key() == FactKey::TypeDeclLocations(foo.clone()))
         );
     }
+
+    /// A file's hook registrations are not its realm evidence: renaming the
+    /// hook a file adds to re-runs no load-graph fold.
+    #[test]
+    fn renaming_a_hook_re_runs_no_load_fold() {
+        const HOOKS: &str = "lua/autorun/server/sv_hooks.lua";
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            HOOKS,
+            "hook.Add(\"Think\", \"probe\", function() end)
+",
+        );
+
+        ws.def_file(
+            HOOKS,
+            "hook.Add(\"Tick\", \"probe\", function() end)
+",
+        );
+
+        let stats = ws.analysis.compilation.last_stats();
+        assert_eq!(stats.evaluations(DerivationKind::GmodLoad), 0);
+    }
 }

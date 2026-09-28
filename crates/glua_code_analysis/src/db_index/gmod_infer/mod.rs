@@ -536,6 +536,9 @@ impl GmodInferIndex {
             FactKey::GmodRealm(file_id) => {
                 derivation::fingerprint_opt(self.realm_file_metadata.get(file_id))
             }
+            FactKey::GmodRealmInputs(file_id) => {
+                derivation::fingerprint_opt(self.realm_inputs.get(file_id))
+            }
             FactKey::GmodMemberRealmAt(file_id, offset) => derivation::fingerprint_of(
                 &member_realm_at(self.member_realm_ranges.get(file_id), *offset),
             ),
@@ -879,13 +882,30 @@ impl GmodInferIndex {
         self.realm_file_metadata = metadata;
     }
 
-    pub fn set_realm_inputs(&mut self, file_id: FileId, inputs: GmodRealmInputs) {
+    /// Stores `file_id`'s realm evidence. The load fold copies it into the
+    /// file's realm metadata (none for a `meta` file), which a re-indexed file
+    /// keeps until the fold runs again, so the kept copy is refreshed here.
+    pub fn set_realm_inputs(&mut self, file_id: FileId, inputs: GmodRealmInputs, meta: bool) {
         derivation::note_write(|| FactKey::GmodInferFile(file_id));
+        if let Some(metadata) = self.realm_file_metadata.get_mut(&file_id) {
+            let branch_realm_ranges = if meta {
+                Vec::new()
+            } else {
+                inputs.branch_realm_ranges.clone()
+            };
+            if metadata.branch_realm_ranges != branch_realm_ranges
+                || metadata.annotation_realm != inputs.annotation_realm
+            {
+                metadata.branch_realm_ranges = branch_realm_ranges;
+                metadata.annotation_realm = inputs.annotation_realm;
+                derivation::rehoming(|| derivation::note_write(|| FactKey::GmodRealm(file_id)));
+            }
+        }
         self.realm_inputs.insert(file_id, inputs);
     }
 
     pub fn get_realm_inputs(&self, file_id: &FileId) -> Option<&GmodRealmInputs> {
-        derivation::note_file_fact_read(derivation::FileFact::GmodInferFile, *file_id);
+        derivation::note_realm_inputs_read(*file_id);
         self.realm_inputs.get(file_id)
     }
 
@@ -1013,10 +1033,10 @@ impl GmodInferIndex {
 }
 
 impl LuaIndex for GmodInferIndex {
+    /// Keeps the load fold's realm metadata of `file_id`: the fold replaces
+    /// it whole when it runs again.
     fn remove(&mut self, file_id: FileId) {
         self.reset_file_metadata(file_id);
-        derivation::note_write(|| FactKey::GmodRealm(file_id));
-        self.realm_file_metadata.remove(&file_id);
         self.scoped_class_info.remove(&file_id);
     }
 

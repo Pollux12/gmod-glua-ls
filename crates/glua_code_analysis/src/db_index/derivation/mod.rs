@@ -312,6 +312,9 @@ pub enum FactKey {
     /// The `---@realm` annotation covering one offset of a file, read out of
     /// its [`FactKey::GmodInferFile`].
     GmodMemberRealmAt(FileId, TextSize),
+    /// A file's own realm evidence (its realm branches and `---@realm`
+    /// annotation), read out of its [`FactKey::GmodInferFile`].
+    GmodRealmInputs(FileId),
     /// The gmod realm and hook aggregates across files.
     GmodInferScan,
     /// The gmod system registrations of one kind under one name, across files.
@@ -603,7 +606,8 @@ impl FactKey {
     /// when it is gone. A file's member fingerprint keeps the share of each
     /// owner another file's members still hold. The call-role fold keeps its
     /// entries until it runs again, which the re-indexed file's helper scan
-    /// decides.
+    /// decides, and the load fold its realm and load facts, which the file's
+    /// realm inputs and load scan decide.
     pub fn keeps_foreign_contributions(&self) -> bool {
         use FactKey as K;
         matches!(
@@ -619,6 +623,8 @@ impl FactKey {
                 | K::DynamicFieldFinite(_)
                 | K::Contrib(..)
                 | K::CallRole(_)
+                | K::GmodRealm(_)
+                | K::GmodLoadFile(_)
         )
     }
 
@@ -663,7 +669,9 @@ impl FactKey {
     pub fn base(&self) -> Option<FactKey> {
         match self {
             FactKey::GmodRealmAt(file_id, _) => Some(FactKey::GmodRealm(*file_id)),
-            FactKey::GmodMemberRealmAt(file_id, _) => Some(FactKey::GmodInferFile(*file_id)),
+            FactKey::GmodMemberRealmAt(file_id, _) | FactKey::GmodRealmInputs(file_id) => {
+                Some(FactKey::GmodInferFile(*file_id))
+            }
             FactKey::SignatureDecl(signature_id) => Some(FactKey::Signature(*signature_id)),
             _ => None,
         }
@@ -683,7 +691,9 @@ impl FactKey {
             }
             K::Member(member_id) => Some(member_id.file_id),
             K::NetHelper(site) => Some(site.file_id),
-            K::GmodRealmAt(file_id, _) | K::GmodMemberRealmAt(file_id, _) => Some(*file_id),
+            K::GmodRealmAt(file_id, _)
+            | K::GmodMemberRealmAt(file_id, _)
+            | K::GmodRealmInputs(file_id) => Some(*file_id),
             K::MemberSlot(owner, _)
             | K::MemberOwnerMap(owner)
             | K::MemberOwnerExprKeys(owner)
@@ -1388,6 +1398,13 @@ fn file_position(file_id: FileId, position: TextSize) -> u128 {
 pub fn note_realm_at_read(file_id: FileId, offset: TextSize) {
     note_read_by((u8::MAX - 9, file_position(file_id, offset)), || {
         FactKey::GmodRealmAt(file_id, offset)
+    });
+}
+
+/// Records a read of `file_id`'s own realm evidence.
+pub fn note_realm_inputs_read(file_id: FileId) {
+    note_read_by((u8::MAX - 13, u128::from(file_id.id)), || {
+        FactKey::GmodRealmInputs(file_id)
     });
 }
 

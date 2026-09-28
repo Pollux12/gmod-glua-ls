@@ -215,6 +215,7 @@ pub(crate) fn evaluate_pre(db: &mut DbIndex, context: &mut AnalyzeContext) {
                 branch_realm_ranges: branch_ranges,
                 annotation_realm,
             },
+            context.metas.contains(&file_id),
         );
         db.get_gmod_infer_index_mut()
             .set_member_realm_ranges(file_id, member_ranges);
