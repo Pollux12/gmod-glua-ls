@@ -36,6 +36,9 @@ struct KeySlot {
     stamp: u64,
     /// The stamp current when the key was last written.
     written: u64,
+    /// Whether an evaluation took the value away to compute it again; see
+    /// [`KeyTable::open_window`].
+    windowed: bool,
 }
 
 impl Clone for KeySlot {
@@ -48,6 +51,7 @@ impl Clone for KeySlot {
             current_generation: AtomicU32::new(self.current_generation.load(Ordering::Relaxed)),
             stamp: self.stamp,
             written: self.written,
+            windowed: self.windowed,
         }
     }
 }
@@ -62,6 +66,7 @@ impl Default for KeySlot {
             current_generation: AtomicU32::new(NO_GENERATION),
             stamp: 0,
             written: 0,
+            windowed: false,
         }
     }
 }
@@ -134,6 +139,19 @@ pub struct KeyTable {
     derived: FxHashMap<KeyIdx, DerivedKeys>,
     /// The stamp of the latest write or release of a live slot.
     last_written: u64,
+    /// The keys an evaluation took away to compute again, each with the stamp
+    /// it was written at before; see [`Self::open_window`].
+    windows: FxHashMap<KeyIdx, u64>,
+}
+
+/// Whether what a memo read still holds; see [`KeyTable::written_since`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Freshness {
+    Unwritten,
+    /// Only keys an evaluation is computing again were written since: the
+    /// memo holds again if they come back as they were.
+    Recomputing,
+    Written,
 }
 
 /// The keys read out of one base key, and the base's fingerprint when their
@@ -244,18 +262,73 @@ impl KeyTable {
         }
     }
 
+    /// Marks `key`, and every key read out of it, written at stamp `now` by an
+    /// evaluation that computes it again: a memo that read it before then
+    /// holds again if [`Self::close_windows`] finds it came back unchanged,
+    /// and nothing read from it until then is shared.
+    pub(super) fn open_window(&mut self, key: &HashedKey, now: u64) {
+        let Some(slot) = self.find(key) else {
+            return;
+        };
+        self.last_written = self.last_written.max(now);
+        let derived = self.derived.get(&slot).into_iter().flat_map(|d| &d.slots);
+        for slot in std::iter::once(&slot).chain(derived) {
+            let entry = &mut self.keys[*slot as usize];
+            self.windows.entry(*slot).or_insert(entry.written);
+            entry.written = now;
+            entry.windowed = true;
+        }
+    }
+
+    /// Closes every window: a key `unchanged` accepts, and each key read out
+    /// of it, is written as it was before its window opened.
+    pub(super) fn close_windows(&mut self, unchanged: impl Fn(&HashedKey) -> bool) {
+        let windows = std::mem::take(&mut self.windows);
+        for (slot, before) in &windows {
+            let entry = &mut self.keys[*slot as usize];
+            entry.windowed = false;
+            let Some(key) = entry.key.as_ref() else {
+                continue;
+            };
+            if key.base().is_some() || !unchanged(key) {
+                continue;
+            }
+            entry.written = *before;
+            let derived = self.derived.get(slot).into_iter().flat_map(|d| &d.slots);
+            for derived in derived {
+                if let Some(before) = windows.get(derived) {
+                    self.keys[*derived as usize].written = *before;
+                }
+            }
+        }
+    }
+
+    /// Whether `slot`'s value is being computed again.
+    pub(super) fn windowed(&self, slot: KeyIdx) -> bool {
+        self.keys[slot as usize].windowed
+    }
+
     /// Whether a slot was written or released after stamp `stamp`.
     pub(super) fn written_after(&self, stamp: u64) -> bool {
         self.last_written > stamp
     }
 
-    /// Whether none of `slots` was written after stamp `since`.
-    pub(super) fn unwritten_since(&self, slots: &[KeyIdx], since: u64) -> bool {
-        slots.iter().all(|slot| {
-            self.keys
-                .get(*slot as usize)
-                .is_some_and(|entry| entry.written <= since)
-        })
+    /// Whether any of `slots` was written after stamp `since`.
+    pub(super) fn written_since(&self, slots: &[KeyIdx], since: u64) -> Freshness {
+        let mut freshness = Freshness::Unwritten;
+        for slot in slots {
+            let Some(entry) = self.keys.get(*slot as usize) else {
+                return Freshness::Written;
+            };
+            if entry.written <= since {
+                continue;
+            }
+            match self.windows.get(slot) {
+                Some(before) if *before <= since => freshness = Freshness::Recomputing,
+                _ => return Freshness::Written,
+            }
+        }
+        freshness
     }
 
     /// Whether a read of `slot` goes into a log whose innermost open frame

@@ -249,6 +249,9 @@ pub(crate) struct Engine {
     /// Stage rules that moved since the key table was last lent: memos that
     /// read them no longer hold.
     moved_rules: std::cell::RefCell<Vec<HashedKey>>,
+    /// The outputs reset for the group about to run, with their fingerprints
+    /// before: memos that read one hold again if it comes back unchanged.
+    recomputing: std::cell::RefCell<FxHashMap<HashedKey, derivation::Fingerprint>>,
     /// Under `GLUALS_TRACE_EVALUATIONS`: the key that first queued each
     /// reader, and the derivation that moved it.
     queued_by: FxHashMap<DerivationId, (HashedKey, Option<DerivationId>)>,
@@ -961,6 +964,10 @@ impl Engine {
         for member in members {
             touched.extend(db.reader_graph().outputs_of(*member).cloned());
         }
+        *self.recomputing.borrow_mut() = touched
+            .iter()
+            .map(|key| (key.clone(), self.fingerprint(db, key)))
+            .collect();
         let reset = derivation::capture_writes(|| {
             for key in touched.iter().filter(|key| key.is_primary()) {
                 db.reset_fact(key);
@@ -973,7 +980,8 @@ impl Engine {
 
     /// Runs `f` with the reader graph's key table lent to this thread.
     /// `touched` moved before the table was lent: memos that read them are
-    /// stale from here on.
+    /// stale from here on, except that a reset output which comes back
+    /// unchanged reads as it did before.
     fn with_lent_keys(
         &self,
         db: &mut DbIndex,
@@ -982,13 +990,17 @@ impl Engine {
     ) -> Vec<derivation::Evaluation> {
         derivation::lend_keys(db.reader_graph_mut().lend_keys());
         let lent = scopeguard_lent_keys();
+        let recomputing = std::mem::take(&mut *self.recomputing.borrow_mut());
+        derivation::note_recomputing(recomputing.keys().cloned());
         derivation::note_written(
             touched
                 .iter()
+                .filter(|key| !recomputing.contains_key(*key))
                 .cloned()
                 .chain(self.moved_rules.borrow_mut().drain(..)),
         );
         let evaluations = f(db);
+        derivation::note_recomputed(|key| recomputing.get(key) == Some(&db.fact_fingerprint(key)));
         db.reader_graph_mut().restore_keys(derivation::take_keys());
         std::mem::forget(lent);
         evaluations

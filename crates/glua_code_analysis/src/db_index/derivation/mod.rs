@@ -21,8 +21,9 @@ mod paged;
 pub use frames::{
     Gates, OpenFrame, Provenance, Reuse, ScopeMark, check_tsc, close_frame, consult_absorbed,
     consult_cycle, consult_gates, consult_realm, consult_scope, consult_unkeyed, describe_reads,
-    frame_depth, new_stamp, note_written, open_frame, open_frame_absorbing, provenance_keys,
-    report_frames, reuse, scope_mark, taint, take_reused_across,
+    frame_depth, new_stamp, note_recomputed, note_recomputing, note_written, open_frame,
+    open_frame_absorbing, provenance_keys, report_frames, reuse, scope_mark, taint,
+    take_reused_across,
 };
 
 /// A value an analyzer derivation stores on the index without the index
@@ -1244,6 +1245,9 @@ fn record_read(evaluation: &mut Evaluation, key: HashedKey) -> Option<KeyIdx> {
         Some(table) => {
             let slot = table.intern_read(key, evaluation.stamp);
             evaluation.log_slot(table, slot);
+            if table.windowed(slot) {
+                frames::taint_evaluation(evaluation);
+            }
             Some(slot)
         }
         None => {
@@ -1268,6 +1272,9 @@ fn note_read_by(identity: (u8, u128), key: impl FnOnce() -> FactKey) {
                 Some(slot) => KEYS.with(|keys| {
                     if let Some(table) = keys.borrow_mut().as_mut() {
                         evaluation.log_slot(table, slot);
+                        if table.windowed(slot) {
+                            frames::taint_evaluation(evaluation);
+                        }
                     }
                 }),
                 None => {

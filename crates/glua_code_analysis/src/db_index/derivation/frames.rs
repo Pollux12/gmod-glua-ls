@@ -16,6 +16,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::graph::Freshness;
 use super::{CURRENT, Evaluation, KEYS, KeyIdx, KeyTable, latest_stamp, next_stamp};
 use crate::GmodRealm;
 
@@ -99,17 +100,17 @@ pub enum Reuse {
 }
 
 impl Provenance {
-    /// Whether none of `reads`, this value's, was written after it was
+    /// Whether any of `reads`, this value's, was written after it was
     /// computed.
-    fn holds(&self, table: &KeyTable, reads: &[KeyIdx]) -> bool {
+    fn freshness(&self, table: &KeyTable, reads: &[KeyIdx]) -> Freshness {
         if !table.written_after(self.0.checked.load(Ordering::Relaxed)) {
-            return true;
+            return Freshness::Unwritten;
         }
-        if !table.unwritten_since(reads, self.0.since) {
-            return false;
+        let freshness = table.written_since(reads, self.0.since);
+        if freshness == Freshness::Unwritten {
+            self.0.checked.store(latest_stamp(), Ordering::Relaxed);
         }
-        self.0.checked.store(latest_stamp(), Ordering::Relaxed);
-        true
+        freshness
     }
 
     /// Whether its reads still need replaying into the frame stamped
@@ -435,11 +436,15 @@ pub fn reuse(
         if Arc::ptr_eq(&provenance.0.log, &evaluation.log_handle) {
             // Computed by this evaluation: its reads are in the log already,
             // within the innermost frame if it opened before them.
-            if provenance.0.since <= super::last_write()
-                && !provenance.holds(table, &evaluation.log[range.clone()])
-            {
-                count(|stats| stats.stale += 1);
-                return Reuse::Stale;
+            if provenance.0.since <= super::last_write() {
+                match provenance.freshness(table, &evaluation.log[range.clone()]) {
+                    Freshness::Unwritten => {}
+                    Freshness::Recomputing => return Reuse::Elsewhere,
+                    Freshness::Written => {
+                        count(|stats| stats.stale += 1);
+                        return Reuse::Stale;
+                    }
+                }
             }
             if provenance.0.since < evaluation.frame_stamp()
                 && provenance.replays_into(evaluation.frame_stamp())
@@ -461,9 +466,13 @@ pub fn reuse(
             let Some(reads) = provenance.0.log.0.get().and_then(|log| log.get(range)) else {
                 return Reuse::Elsewhere;
             };
-            if !provenance.holds(table, reads) {
-                count(|stats| stats.stale += 1);
-                return Reuse::Stale;
+            match provenance.freshness(table, reads) {
+                Freshness::Unwritten => {}
+                Freshness::Recomputing => return Reuse::Elsewhere,
+                Freshness::Written => {
+                    count(|stats| stats.stale += 1);
+                    return Reuse::Stale;
+                }
             }
             REUSED_ACROSS.with(|flag| flag.set(true));
             let replays = provenance.replays_into(evaluation.frame_stamp());
@@ -586,6 +595,37 @@ pub fn note_written(keys: impl IntoIterator<Item = super::HashedKey>) {
     });
 }
 
+/// Marks keys an evaluation is about to compute again as written, now that
+/// the table is lent; see [`KeyTable::open_window`].
+pub fn note_recomputing(keys: impl IntoIterator<Item = super::HashedKey>) {
+    let now = next_stamp();
+    KEYS.with(|table| {
+        if let Some(table) = table.borrow_mut().as_mut() {
+            for key in keys {
+                table.open_window(&key, now);
+            }
+        }
+    });
+}
+
+/// Ends [`note_recomputing`]: a key `unchanged` accepts reads as written
+/// when it was before.
+pub fn note_recomputed(unchanged: impl Fn(&super::HashedKey) -> bool) {
+    KEYS.with(|table| {
+        if let Some(table) = table.borrow_mut().as_mut() {
+            table.close_windows(unchanged);
+        }
+    });
+}
+
+/// Taints the open frames of `evaluation`: it read a value being computed
+/// again, which only this evaluation sees.
+pub(super) fn taint_evaluation(evaluation: &mut Evaluation) {
+    if let Some(frame) = evaluation.frames.last_mut() {
+        frame.taint = Some(0);
+    }
+}
+
 /// Under `GLUALS_PROFILE`: how frames closed and memos were reused.
 #[derive(Debug, Default)]
 struct FrameStats {
@@ -664,7 +704,7 @@ pub fn report_frames() {
 mod tests {
     use super::*;
     use crate::FileId;
-    use crate::db_index::derivation::{self, DerivationId, DerivationKind, FactKey};
+    use crate::db_index::derivation::{self, DerivationId, DerivationKind, FactKey, HashedKey};
 
     /// A value reused inside a frame nested in one it was already replayed
     /// into is recorded by the nested frame too: that frame's value is stale
@@ -698,6 +738,67 @@ mod tests {
             (reused_outside, reused_inside, nested_holds),
             (Reuse::Held, Reuse::Held, Reuse::Stale)
         );
+    }
+
+    /// Computes a value that reads `read` in its own evaluation.
+    fn value_reading(read: fn() -> FactKey) -> Provenance {
+        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let frame = open_frame().expect("a table is lent");
+        derivation::note_read(read);
+        let value = close_frame(frame, 0).expect("the frame saw no taint");
+        derivation::end();
+        value
+    }
+
+    /// Whether `value` holds in a new evaluation.
+    fn reused(value: &Provenance) -> Reuse {
+        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let _frame = open_frame().expect("a table is lent");
+        let reuse = reuse(value, 0, &[], None);
+        derivation::end();
+        reuse
+    }
+
+    /// A value that read a fact an evaluation computes again waits while it
+    /// runs, holds again if the fact comes back as it was, and is stale if it
+    /// changed.
+    #[test]
+    fn a_value_that_read_a_recomputed_fact_holds_again_only_if_it_came_back_unchanged() {
+        let read = || FactKey::GmodRealm(FileId::new(1));
+        derivation::lend_keys(KeyTable::default());
+        let value = value_reading(read);
+        note_recomputing([HashedKey::new(read())]);
+        let while_recomputing = reused(&value);
+        note_recomputed(|_| true);
+        let after_unchanged = reused(&value);
+        note_recomputing([HashedKey::new(read())]);
+        note_recomputed(|_| false);
+        let after_changed = reused(&value);
+        derivation::take_keys();
+
+        assert_eq!(
+            (while_recomputing, after_unchanged, after_changed),
+            (Reuse::Elsewhere, Reuse::Held, Reuse::Stale)
+        );
+    }
+
+    /// A value computed from a fact while an evaluation computes it again saw
+    /// what only that evaluation sees, so it is not shared.
+    #[test]
+    fn a_value_computed_from_a_fact_being_recomputed_is_not_shared() {
+        let read = || FactKey::GmodRealm(FileId::new(1));
+        derivation::lend_keys(KeyTable::default());
+        let _ = value_reading(read);
+        note_recomputing([HashedKey::new(read())]);
+        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let frame = open_frame().expect("a table is lent");
+        derivation::note_read(read);
+        let shared = close_frame(frame, 0).is_some();
+        derivation::end();
+        note_recomputed(|_| true);
+        derivation::take_keys();
+
+        assert!(!shared);
     }
 
     /// A value that read a reference as unkeyed holds wherever that reference
