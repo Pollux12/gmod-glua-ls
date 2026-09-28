@@ -2982,6 +2982,47 @@ print(\"server-only\")
         );
     }
 
+    /// An annotated load wrapper one file defines and another calls loads the
+    /// file it is given, and the load fold settles in one run: the wrapper's
+    /// role comes from what its signature declares, not from what inference
+    /// resolves for it.
+    #[gtest]
+    fn test_load_wrapper_from_another_file_loads_its_target_in_one_fold_run() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_gmod_call_arg_builtins();
+        let target = ws.def_file("lua/myaddon/sv_store.lua", "return true");
+        ws.def_files(vec![
+            (
+                "lua/autorun/sh_lib.lua",
+                "MyLib = {}
+---@[call_arg(\"gmod.load\", \"include\")]
+---@param path string
+function MyLib.Include(path)
+    include(path)
+end
+",
+            ),
+            (
+                "lua/autorun/server/sv_loader.lua",
+                "MyLib.Include(\"myaddon/sv_store.lua\")
+",
+            ),
+        ]);
+
+        let runs = ws
+            .analysis
+            .compilation
+            .last_stats()
+            .evaluations(crate::db_index::derivation::DerivationKind::GmodLoad);
+        let loaded = ws
+            .get_db_mut()
+            .get_gmod_load_index()
+            .get_file_info(&target)
+            .is_some_and(|info| info.state_mask == GmodStateMask::SERVER);
+        expect_that!((runs, loaded), eq((1, true)));
+    }
+
     #[gtest]
     fn test_load_index_dynamic_file_find_prefix_dispatch_wrapper_loader() {
         let mut ws = VirtualWorkspace::new();
