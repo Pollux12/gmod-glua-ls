@@ -265,6 +265,8 @@ pub enum FactKey {
     SpecialCall(FileId, TextSize),
     /// Every special-call effect of one file.
     SpecialCallFile(FileId),
+    /// What the callee of each of a file's calls resolves to.
+    CallTargets(FileId),
     /// A file's flow tree and casts.
     FlowTree(FileId),
     /// One dynamic field (`None`: the owner's named fields as a whole).
@@ -478,6 +480,7 @@ impl FactKey {
                 | K::InferredGuard(_)
                 | K::Module(_)
                 | K::SpecialCall(..)
+                | K::CallTargets(_)
                 | K::FlowTree(_)
                 | K::Metatable(_)
                 | K::VguiChain(_)
@@ -565,6 +568,7 @@ impl FactKey {
                 | K::NetHelper(_)
                 | K::NetworkFile(_)
                 | K::NetworkScan
+                | K::CallTargets(_)
         )
     }
 
@@ -685,6 +689,7 @@ impl FactKey {
             | K::CallRole(CallRoleKey::Signature(signature_id)) => Some(signature_id.get_file_id()),
             K::SpecialCall(file_id, _)
             | K::SpecialCallFile(file_id)
+            | K::CallTargets(file_id)
             | K::ValidGuardFile(file_id)
             | K::TypeFile(file_id)
             | K::DeclTree(file_id)
@@ -818,6 +823,8 @@ pub enum DerivationKind {
     DynamicFields,
     /// A file's setmetatable factory members.
     SetmetatableFactory,
+    /// What the callee of each of a file's calls resolves to.
+    CallTargets,
     /// A file's call-site parameter contributions and return consumers.
     CallSiteParams,
     /// A file's local types guessed from their uses.

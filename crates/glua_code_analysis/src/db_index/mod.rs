@@ -1,5 +1,6 @@
 mod accessor_func;
 mod call_site_param;
+mod call_target;
 mod declaration;
 mod dependency;
 pub(crate) mod derivation;
@@ -33,6 +34,7 @@ use std::{path::PathBuf, sync::Arc};
 use crate::{Emmyrc, FileId, Vfs, profile::Profile};
 pub use accessor_func::*;
 pub use call_site_param::{CallSiteParamContribution, CallSiteParamIndex};
+pub use call_target::{FileCallTargets, LuaCallTarget, LuaCallTargetIndex};
 pub use declaration::*;
 pub use dependency::{LuaDependencyIndex, LuaDependencyKind, LuaDependencySite};
 pub use diagnostic::{AnalyzeError, DiagnosticAction, DiagnosticActionKind, DiagnosticIndex};
@@ -78,6 +80,7 @@ pub struct DbIndex {
     diagnostic_index: Arc<DiagnosticIndex>,
     operator_index: Arc<LuaOperatorIndex>,
     flow_index: Arc<LuaFlowIndex>,
+    call_target_index: Arc<LuaCallTargetIndex>,
     accessor_func_index: Arc<AccessorFuncAnnotationIndex>,
     accessor_func_call_index: Arc<AccessorFuncCallIndex>,
     call_site_param_index: Arc<CallSiteParamIndex>,
@@ -205,6 +208,7 @@ impl DbIndex {
             diagnostic_index: Arc::new(DiagnosticIndex::new()),
             operator_index: Arc::new(LuaOperatorIndex::new()),
             flow_index: Arc::new(LuaFlowIndex::new()),
+            call_target_index: Arc::new(LuaCallTargetIndex::new()),
             accessor_func_index: Arc::new(AccessorFuncAnnotationIndex::new()),
             accessor_func_call_index: Arc::new(AccessorFuncCallIndex::new()),
             call_site_param_index: Arc::new(CallSiteParamIndex::new()),
@@ -284,6 +288,7 @@ impl DbIndex {
             K::SpecialCall(file_id, position) => self
                 .get_flow_index_mut()
                 .reset_special_call(*file_id, *position),
+            K::CallTargets(file_id) => self.get_call_target_index_mut().reset_file(*file_id),
             K::DynamicFieldFile(file_id) => {
                 self.get_dynamic_field_index_mut().remove_files(&[*file_id])
             }
@@ -336,6 +341,11 @@ impl DbIndex {
                     derivation::fingerprint_of(mentions),
                 )
             }))
+            .chain(
+                self.call_target_index
+                    .file_fingerprints()
+                    .map(|(file_id, fingerprint)| ("call_targets", file_id, fingerprint)),
+            )
             .collect::<Vec<_>>();
         facts.sort_unstable();
         facts
@@ -458,6 +468,7 @@ impl DbIndex {
             K::SpecialCall(..) | K::SpecialCallFile(_) | K::FlowTree(_) => {
                 self.flow_index.fact_fingerprint(key)
             }
+            K::CallTargets(_) => self.call_target_index.fact_fingerprint(key),
             K::DynamicField(..)
             | K::DynamicFieldWildcards(_)
             | K::DynamicFieldFinite(_)
@@ -992,6 +1003,14 @@ impl DbIndex {
         self.flow_index.as_ref()
     }
 
+    pub fn get_call_target_index(&self) -> &LuaCallTargetIndex {
+        self.call_target_index.as_ref()
+    }
+
+    pub fn get_call_target_index_mut(&mut self) -> &mut LuaCallTargetIndex {
+        Arc::make_mut(&mut self.call_target_index)
+    }
+
     pub fn get_accessor_func_index(&self) -> &AccessorFuncAnnotationIndex {
         self.accessor_func_index.as_ref()
     }
@@ -1141,6 +1160,7 @@ impl DbIndex {
             diagnostic_index: Arc::clone(&self.diagnostic_index),
             operator_index: Arc::clone(&self.operator_index),
             flow_index: Arc::clone(&self.flow_index),
+            call_target_index: Arc::clone(&self.call_target_index),
             accessor_func_index: Arc::clone(&self.accessor_func_index),
             accessor_func_call_index: Arc::clone(&self.accessor_func_call_index),
             call_site_param_index: Arc::clone(&self.call_site_param_index),
@@ -1195,6 +1215,7 @@ impl LuaIndex for DbIndex {
         Arc::make_mut(&mut self.diagnostic_index).remove(file_id);
         Arc::make_mut(&mut self.operator_index).remove(file_id);
         Arc::make_mut(&mut self.flow_index).remove(file_id);
+        Arc::make_mut(&mut self.call_target_index).remove(file_id);
         Arc::make_mut(&mut self.accessor_func_index).remove(file_id);
         Arc::make_mut(&mut self.accessor_func_call_index).remove(file_id);
         Arc::make_mut(&mut self.call_site_param_index).remove(file_id);
@@ -1247,6 +1268,9 @@ impl LuaIndex for DbIndex {
         });
         phase("remove/flow", || {
             Arc::make_mut(&mut self.flow_index).remove_files(file_ids)
+        });
+        phase("remove/call_target", || {
+            Arc::make_mut(&mut self.call_target_index).remove_files(file_ids)
         });
         phase("remove/accessor_func", || {
             Arc::make_mut(&mut self.accessor_func_index).remove_files(file_ids)
@@ -1303,6 +1327,7 @@ impl LuaIndex for DbIndex {
         Arc::make_mut(&mut self.diagnostic_index).clear();
         Arc::make_mut(&mut self.operator_index).clear();
         Arc::make_mut(&mut self.flow_index).clear();
+        Arc::make_mut(&mut self.call_target_index).clear();
         Arc::make_mut(&mut self.accessor_func_index).clear();
         Arc::make_mut(&mut self.accessor_func_call_index).clear();
         Arc::make_mut(&mut self.call_site_param_index).clear();

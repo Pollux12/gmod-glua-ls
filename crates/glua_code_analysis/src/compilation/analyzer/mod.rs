@@ -1,4 +1,5 @@
 mod call_site_params;
+pub(crate) mod call_target;
 mod common;
 mod decl;
 mod derive;
@@ -311,6 +312,7 @@ impl Reanalysis {
         crate::profile::phase("reanalyze: payload refs", || {
             refresh_payload_refs(db, &touched)
         });
+        call_target::check_settled_call_targets(db);
         crate::profile::phase_report("reanalyze");
         let stats = self.engine.stats().clone();
         let evaluated_files = self.engine.evaluated_files();

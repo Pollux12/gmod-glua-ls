@@ -46,6 +46,8 @@ pub fn remap_into_file(db: &mut DbIndex, remap: &FileRemap) -> HashSet<FileId> {
         .get_flow_index_mut()
         .remap_special_call_effect_types(remap);
     dirty.extend(pass);
+    let pass = db.get_call_target_index_mut().remap_file_identities(remap);
+    dirty.extend(pass);
     let pass = db
         .get_call_site_param_index_mut()
         .remap_file_identities(remap);

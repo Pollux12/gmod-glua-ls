@@ -395,7 +395,7 @@ fn build_file_net_helpers(
 ) -> Option<FileNetHelpers> {
     let root = db.get_vfs().get_syntax_tree(&file_id)?.get_chunk_node();
     let functions = FileFunctionMap::build(&root);
-    let mut net = NetCallResolver::new(file_id);
+    let mut net = NetCallResolver::new(db, file_id);
     let mut calls = HashMap::default();
     for call_expr in root.descendants::<LuaCallExpr>() {
         let role = net.role(db, &call_expr);
@@ -799,15 +799,18 @@ fn resolve_call_to_function_block(
 /// Resolves [`NetCallRole`]s of one file's calls from signature metadata.
 struct NetCallResolver {
     cache: LuaInferCache,
+    /// What the file's calls target.
+    targets: Option<Arc<crate::FileCallTargets>>,
     /// The role, the helper resolution and the bit-width lookup all need a
-    /// call's signature, the most expensive step, so it is resolved once.
+    /// call's signature, so it is looked up once.
     signature_memo: HashMap<TextRange, Option<LuaSignatureId>>,
 }
 
 impl NetCallResolver {
-    fn new(file_id: FileId) -> Self {
+    fn new(db: &DbIndex, file_id: FileId) -> Self {
         NetCallResolver {
-            cache: LuaInferCache::new(file_id, Default::default()),
+            cache: LuaInferCache::new(file_id, super::super::call_target::pass_view()),
+            targets: db.get_call_target_index().file(file_id),
             signature_memo: HashMap::default(),
         }
     }
@@ -881,42 +884,13 @@ impl NetCallResolver {
         db: &DbIndex,
         call_expr: &LuaCallExpr,
     ) -> Option<LuaSignatureId> {
-        if let Some(signature_id) =
-            crate::semantic::get_prefix_expr_signature_id(db, &mut self.cache, call_expr)
-        {
-            return Some(signature_id);
-        }
-
-        // Some same-file member declarations do not yet have a semantic owner
-        // edge at this pre-analysis phase, while their inferred callable type
-        // is already available. Read that type instead of falling back to the
-        // source spelling of the member. Ambiguous callable unions are left
-        // unresolved rather than choosing an arbitrary body.
-        let prefix = call_expr.get_prefix_expr()?;
-        let typ = crate::semantic::infer_expr(db, &mut self.cache, prefix).ok()?;
-        unique_signature_id_from_type(&typ)
-    }
-}
-
-fn unique_signature_id_from_type(typ: &LuaType) -> Option<LuaSignatureId> {
-    match typ {
-        LuaType::Signature(signature_id) => Some(*signature_id),
-        LuaType::TypeGuard(inner) => unique_signature_id_from_type(inner),
-        LuaType::TableOf(inner) => unique_signature_id_from_type(inner),
-        LuaType::Union(union) => {
-            let mut signature = None;
-            for member in union.types() {
-                let Some(candidate) = unique_signature_id_from_type(member) else {
-                    continue;
-                };
-                if signature.is_some_and(|existing| existing != candidate) {
-                    return None;
-                }
-                signature = Some(candidate);
-            }
-            signature
-        }
-        _ => None,
+        let target = super::super::call_target::call_target(
+            db,
+            self.targets.as_deref(),
+            &mut self.cache,
+            call_expr,
+        );
+        target.declared.or(target.unique)
     }
 }
 

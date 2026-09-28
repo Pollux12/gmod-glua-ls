@@ -5,8 +5,8 @@ use glua_parser::{LuaAst, LuaAstNode, LuaChunk, LuaSyntaxId};
 use rustc_hash::FxHashMap;
 
 use super::{
-    AnalysisPipeline, AnalyzeContext, ScriptedScopes, call_site_params, dynamic_field, gmod,
-    local_inference, lua, setmetatable_factory, synthesize_accessorfunc_members, unresolve,
+    AnalysisPipeline, AnalyzeContext, ScriptedScopes, call_site_params, call_target, dynamic_field,
+    gmod, local_inference, lua, setmetatable_factory, synthesize_accessorfunc_members, unresolve,
 };
 use crate::db_index::derivation::{DerivationId, DerivationKind};
 use crate::{DbIndex, FileId, InFiled};
@@ -55,6 +55,7 @@ pub(super) fn file_derivations(
         DerivationKind::AccessorFunc,
         DerivationKind::DynamicFields,
         DerivationKind::SetmetatableFactory,
+        DerivationKind::CallTargets,
         DerivationKind::CallSiteParams,
         DerivationKind::LocalFallbacks,
         DerivationKind::NetHelpers,
@@ -110,7 +111,8 @@ impl super::engine::Recipe for Recipes {
         // Dynamic fields are collected with dynamic fields invisible.
         matches!(
             kind,
-            DerivationKind::CallSiteParams
+            DerivationKind::CallTargets
+                | DerivationKind::CallSiteParams
                 | DerivationKind::NetHelpers
                 | DerivationKind::Network
                 | DerivationKind::DynamicFields
@@ -122,6 +124,9 @@ impl super::engine::Recipe for Recipes {
 
     fn compute(&self, db: &DbIndex, id: DerivationId) -> Box<dyn std::any::Any + Send> {
         match id.kind {
+            DerivationKind::CallTargets => {
+                Box::new(call_target::compute_file_call_targets(db, id.file_id))
+            }
             DerivationKind::CallSiteParams => {
                 Box::new(call_site_params::collect_file_contributions(db, id.file_id))
             }
@@ -149,6 +154,12 @@ impl super::engine::Recipe for Recipes {
 
     fn apply(&self, db: &mut DbIndex, id: DerivationId, computed: Box<dyn std::any::Any + Send>) {
         match id.kind {
+            DerivationKind::CallTargets => {
+                let targets = *computed
+                    .downcast::<crate::FileCallTargets>()
+                    .expect("call targets");
+                call_target::apply_file_call_targets(db, id.file_id, targets);
+            }
             DerivationKind::CallSiteParams => {
                 let contributions = *computed
                     .downcast::<Vec<call_site_params::Contribution>>()
@@ -282,6 +293,10 @@ impl Recipes {
             }
             DerivationKind::SetmetatableFactory => {
                 setmetatable_factory::synthesize_setmetatable_factory_members(db, &file_ids)
+            }
+            DerivationKind::CallTargets => {
+                let targets = call_target::compute_file_call_targets(db, id.file_id);
+                call_target::apply_file_call_targets(db, id.file_id, targets);
             }
             DerivationKind::CallSiteParams => {
                 call_site_params::CallSiteParamAnalysisPipeline::analyze(db, context)
