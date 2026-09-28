@@ -62,34 +62,45 @@ pub async fn on_did_rename_files_handler(
             .diagnostics
             .diagnostic_interval
             .unwrap_or(500);
-        // Every live file the renames may have moved, accumulated across the
-        // whole batch: what each removal settled and what each re-open widened.
-        let mut affected: Vec<FileId> = Vec::new();
+        // The renames land as one batch of file-system events: each old path
+        // deleted and each new one read from disk. Only the text changes here;
+        // the debounced loop re-analyses them and whatever read what moved.
+        let mut events = Vec::new();
         for rename in all_renames.iter() {
-            let (_, removed_affected) = analysis.remove_file_by_uri(&rename.old_uri);
-            affected.extend(removed_affected);
+            events.push((rename.old_uri.clone(), None));
             if let Some(new_path) = uri_to_file_path(&rename.new_uri)
                 && let Some(text) = read_file_with_encoding(&new_path, encoding)
-                && let Some((_, widened)) = analysis.update_file_by_uri(&rename.new_uri, Some(text))
             {
-                affected.extend(widened);
+                events.push((rename.new_uri.clone(), Some(text)));
             }
         }
+        let staged = analysis
+            .stage_file_system_changes(events)
+            .into_iter()
+            .filter_map(|file_id| Some((file_id, analysis.get_uri(file_id)?)))
+            .collect::<Vec<_>>();
         context
             .file_diagnostic()
             .invalidate_shared_diagnostic_data();
         drop(analysis);
 
-        affected.sort_unstable();
-        affected.dedup();
-        if !affected.is_empty() {
+        let debounced_analysis = context.debounced_analysis_arc();
+        for (file_id, uri) in &staged {
+            debounced_analysis.schedule(*file_id, uri.clone()).await;
+        }
+        let renamed = staged
+            .into_iter()
+            .filter(|(_, uri)| all_renames.iter().any(|rename| rename.new_uri == *uri))
+            .map(|(file_id, _)| file_id)
+            .collect::<Vec<_>>();
+        if !renamed.is_empty() {
             context
                 .file_diagnostic()
-                .note_scoped_sweep_files(affected.iter().copied())
+                .note_scoped_sweep_files(renamed.iter().copied())
                 .await;
             context
                 .file_diagnostic()
-                .add_files_diagnostic_task(affected, interval, None)
+                .add_files_diagnostic_task(renamed, interval, Some(debounced_analysis))
                 .await;
             context
                 .workspace_manager()

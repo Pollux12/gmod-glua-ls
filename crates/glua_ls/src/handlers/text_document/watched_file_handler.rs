@@ -80,33 +80,36 @@ pub async fn on_did_change_watched_files(
         }
     } // workspace read lock released here, before any write lock
 
-    // Apply mutations under the write lock. Changes and deletions settle in one
-    // batch: the analyser derives its facts over a whole batch, and a branch
-    // switch that deletes several files would otherwise pay one ripple each.
+    // Only the text changes under the write lock: the analyser sorts the batch
+    // and keeps the last event per URI, so a delete/create pair lands as the
+    // final state on disk. The re-analysis settles in the debounced loop's
+    // slices, as an edit does, so requests are answered while it runs.
     let final_deleted = finally_deleted_uris(&lua_batch);
-    let file_ids = {
+    let staged = {
         let mut analysis = context.analysis().write().await;
-
-        // Deletions and changes arrive as one order-preserving batch; the
-        // analyser sorts, keeps only the last event per URI and settles in one
-        // pass, so a delete/create pair lands as the final state on disk.
-        let batch = lua_batch;
-
-        // The files the settle touched, which is what still needs diagnosing.
-        // It is not every file whose diagnostics could differ — a reader that
-        // resolves a changed fact only when it is diagnosed caches nothing the
-        // export diff can name — but that is already true of every keystroke:
-        // the edit path publishes for the edited file and leaves the rest to a
-        // pull. Paying a full dependency expansion here bought a refresh the
-        // dominant path never performed.
-        let file_ids = analysis.apply_file_system_changes(batch);
-        if !file_ids.is_empty() || !final_deleted.is_empty() {
+        let staged = analysis
+            .stage_file_system_changes(lua_batch)
+            .into_iter()
+            .filter_map(|file_id| Some((file_id, analysis.get_uri(file_id)?)))
+            .collect::<Vec<_>>();
+        if !staged.is_empty() {
             context
                 .file_diagnostic()
                 .invalidate_shared_diagnostic_data();
         }
-        file_ids
+        staged
     };
+    let debounced_analysis = context.debounced_analysis_arc();
+    for (file_id, uri) in &staged {
+        debounced_analysis.schedule(*file_id, uri.clone()).await;
+    }
+    // The files whose text changed, which is what still needs diagnosing; the
+    // loop re-diagnoses the other files the re-analysis moves.
+    let file_ids = staged
+        .into_iter()
+        .filter(|(_, uri)| !final_deleted.contains(uri))
+        .map(|(file_id, _)| file_id)
+        .collect::<Vec<_>>();
 
     // Schedule diagnostics and config reloads (no locks needed). A URI whose
     // final batch event leaves the file present is skipped in both branches:
@@ -129,8 +132,8 @@ pub async fn on_did_change_watched_files(
         }
     }
 
-    // The same touched set scopes the armed pull's sweep below: it covers the
-    // files the settle moved, not the whole workspace.
+    // The changed files scope the armed pull's sweep below; the loop adds the
+    // files the re-analysis moves, so it never covers the whole workspace.
     context
         .file_diagnostic()
         .note_scoped_sweep_files(file_ids.iter().copied())
@@ -250,6 +253,60 @@ mod tests {
 
     fn uri(s: &str) -> Uri {
         Uri::from_str(s).expect("uri should parse")
+    }
+
+    /// A watched deletion only takes the file's text away under the write
+    /// lock; the debounced loop re-analyses it in slices, so requests are
+    /// answered while it settles.
+    #[test]
+    fn a_watched_deletion_is_left_to_the_debounced_loop() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, _peer) = lsp_server::Connection::memory();
+        runtime.block_on(async {
+            let context = crate::context::ServerContext::new(
+                connection,
+                lsp_types::ClientCapabilities::default(),
+            );
+            let snapshot = context.snapshot();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_watched_deletion");
+            let data_uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/sh_data.lua"))
+                .expect("data URI should parse");
+            let data = {
+                let mut analysis = snapshot.analysis().write().await;
+                analysis.add_main_workspace(workspace.clone());
+                analysis
+                    .update_file_by_uri(
+                        &data_uri,
+                        Some(
+                            "Data = {}
+"
+                            .to_string(),
+                        ),
+                    )
+                    .expect("data file is added")
+                    .0
+            };
+
+            super::on_did_change_watched_files(
+                snapshot.clone(),
+                lsp_types::DidChangeWatchedFilesParams {
+                    changes: vec![lsp_types::FileEvent {
+                        uri: data_uri,
+                        typ: lsp_types::FileChangeType::DELETED,
+                    }],
+                },
+            )
+            .await;
+
+            let still_indexed = snapshot
+                .analysis()
+                .read()
+                .await
+                .compilation
+                .is_indexed(data);
+            assert!(still_indexed);
+            assert!(snapshot.debounced_analysis().is_dirty());
+        });
     }
 
     #[test]

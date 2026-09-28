@@ -17,7 +17,7 @@ pub use loader::{LuaFileInfo, load_workspace_files, read_file_with_encoding};
 use lsp_types::Uri;
 use rowan::NodeCache;
 use rowan::TextRange;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 pub use virtual_url::VirtualUrlGenerator;
@@ -49,6 +49,9 @@ pub struct Vfs {
     /// The text each changed file had when it was last indexed (`None` for a
     /// file that had none), until the next index takes its edit.
     edit_bases: FxHashMap<FileId, Option<String>>,
+    /// Files deleted from disk, kept until a re-analysis has taken the
+    /// deletion; see [`Vfs::forget_taken_deletions`].
+    deleted: FxHashSet<FileId>,
 }
 
 /// The child of `tree`'s top-level block that contains `range`.
@@ -131,6 +134,7 @@ impl Clone for Vfs {
             node_cache: NodeCache::default(),
             content_revision: self.content_revision,
             edit_bases: self.edit_bases.clone(),
+            deleted: self.deleted.clone(),
         }
     }
 }
@@ -150,6 +154,7 @@ impl Vfs {
             node_cache: NodeCache::default(),
             content_revision: 0,
             edit_bases: FxHashMap::default(),
+            deleted: FxHashSet::default(),
         }
     }
 
@@ -474,6 +479,39 @@ impl Vfs {
         fid
     }
 
+    /// Takes `uri`'s text away as its deletion from disk. The file keeps its
+    /// entry until a re-analysis has taken the deletion, which re-analyses
+    /// what the file held.
+    pub fn delete_file_content(&mut self, uri: &Uri) -> Option<FileId> {
+        let fid = self.get_file_id(uri)?;
+        self.set_file_content(uri, None);
+        self.deleted.insert(fid);
+        Some(fid)
+    }
+
+    /// Forgets the deleted files whose deletion a re-analysis has taken and
+    /// whose text did not come back.
+    pub fn forget_taken_deletions(&mut self) {
+        let taken = self
+            .deleted
+            .iter()
+            .filter(|fid| !self.edit_bases.contains_key(fid))
+            .copied()
+            .collect::<Vec<_>>();
+        for fid in taken {
+            self.deleted.remove(&fid);
+            if self
+                .file_data
+                .get(fid.id as usize)
+                .is_some_and(Option::is_none)
+                && let Some(path) = self.file_path_map.remove(&fid.id)
+            {
+                self.file_id_map.remove(&path);
+                self.file_order_keys.remove(&fid.id);
+            }
+        }
+    }
+
     pub fn remove_file(&mut self, uri: &Uri) -> Option<FileId> {
         let fid = self.get_file_id(uri)?;
         self.content_revision += 1;
@@ -499,6 +537,11 @@ impl Vfs {
                     .map(|content| content.content.clone()),
             );
         }
+    }
+
+    /// Whether `file_id`'s text changed since a re-analysis last took it.
+    pub fn has_untaken_edit(&self, file_id: &FileId) -> bool {
+        self.edit_bases.contains_key(file_id)
     }
 
     /// The files whose text changed since a re-analysis last took them,
@@ -696,6 +739,7 @@ impl Vfs {
         self.line_index_map.clear();
         self.tree_map.clear();
         self.edit_bases.clear();
+        self.deleted.clear();
         self.emmyrc = None;
         self.node_cache = NodeCache::default();
     }

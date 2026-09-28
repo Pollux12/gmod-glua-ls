@@ -438,6 +438,14 @@ impl EmmyLuaAnalysis {
         )
     }
 
+    /// Whether `file_id` holds text no re-analysis has taken yet.
+    pub fn has_untaken_text(&self, file_id: FileId) -> bool {
+        self.compilation
+            .get_db()
+            .get_vfs()
+            .has_untaken_edit(&file_id)
+    }
+
     /// Starts re-analysing `file_ids` from the text the VFS holds for them, or
     /// takes them into the re-analysis in progress, which settles them first.
     /// Advance it with [`Self::advance_reindex`].
@@ -450,7 +458,8 @@ impl EmmyLuaAnalysis {
     pub fn advance_reindex(&mut self, slice: Slice) -> UpdateProgress {
         match self.compilation.advance_update(slice) {
             UpdateProgress::Settled(mut affected) => {
-                let vfs = self.compilation.get_db().get_vfs();
+                let vfs = self.compilation.get_db_mut().get_vfs_mut();
+                vfs.forget_taken_deletions();
                 affected.retain(|file_id| vfs.get_syntax_tree(file_id).is_some());
                 UpdateProgress::Settled(affected)
             }
@@ -501,6 +510,22 @@ impl EmmyLuaAnalysis {
     /// Applies a batch of file-system events, the last event per file
     /// winning, and re-analyses what changed.
     pub fn apply_file_system_changes(&mut self, files: Vec<(Uri, Option<String>)>) -> Vec<FileId> {
+        let changed = self.stage_file_system_changes(files);
+        if changed.is_empty() {
+            return Vec::new();
+        }
+        let affected = self.reindex_files(changed);
+        self.compilation
+            .get_db_mut()
+            .get_vfs_mut()
+            .forget_taken_deletions();
+        affected
+    }
+
+    /// Sets the text of a batch of file-system events, the last event per
+    /// file winning, without re-analysing. Returns the files whose text
+    /// changed, deleted ones included, for [`Self::begin_reindex`].
+    pub fn stage_file_system_changes(&mut self, files: Vec<(Uri, Option<String>)>) -> Vec<FileId> {
         let mut files = files;
         let vfs = self.compilation.get_db().get_vfs();
         files.sort_by_cached_key(|(uri, _)| vfs.order_key_for_uri(uri));
@@ -513,7 +538,6 @@ impl EmmyLuaAnalysis {
         }
 
         let mut changed = Vec::new();
-        let mut removed_uris = Vec::new();
         for (uri, text) in latest {
             let existing = self.compilation.get_db().get_vfs().get_file_id(&uri);
             if let Some(file_id) = existing
@@ -521,27 +545,14 @@ impl EmmyLuaAnalysis {
             {
                 continue;
             }
-            if existing.is_none() && text.is_none() {
-                continue;
-            }
-            if text.is_none() {
-                removed_uris.push(uri.clone());
-            }
-            let file_id = self
-                .compilation
-                .get_db_mut()
-                .get_vfs_mut()
-                .set_file_content(&uri, text);
-            changed.push(file_id);
+            let vfs = self.compilation.get_db_mut().get_vfs_mut();
+            let file_id = match text {
+                Some(text) => Some(vfs.set_file_content(&uri, Some(text))),
+                None => vfs.delete_file_content(&uri),
+            };
+            changed.extend(file_id);
         }
-        if changed.is_empty() {
-            return Vec::new();
-        }
-        let affected = self.reindex_files(changed);
-        for uri in &removed_uris {
-            self.compilation.get_db_mut().get_vfs_mut().remove_file(uri);
-        }
-        affected
+        changed
     }
 
     /// For every file, the other files whose analysis read a fact it owns,

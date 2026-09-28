@@ -37,8 +37,7 @@ async fn apply_document_update_without_queuing(
     text: String,
     version: i32,
     mut preparsed: Option<PreparsedDocument>,
-    trigger_reindex: bool,
-) -> Option<(FileId, Vec<FileId>)> {
+) -> Option<FileId> {
     if should_drop_stale_version(context, uri, version) {
         return None;
     }
@@ -70,54 +69,28 @@ async fn apply_document_update_without_queuing(
         return None;
     }
 
-    let mut outcome: Option<(FileId, Vec<FileId>)> = None;
+    // Only the text is stored; the debounced loop re-analyses it and
+    // invalidates the shared diagnostic data under its own write lock.
     let mut deferred_drop = None;
-    if let Some(preparsed) = preparsed.take() {
-        if trigger_reindex {
-            if let Some((file_id, widened)) = analysis.update_file_preparsed(
-                uri.clone(),
-                Some(text),
-                preparsed.tree,
-                preparsed.line_index,
-                Some(version),
-                true,
-            ) {
-                outcome = Some((file_id, widened));
+    let outcome = if let Some(preparsed) = preparsed.take() {
+        let Some((file_id, drop)) = analysis.update_file_preparsed_deferred(
+            uri.clone(),
+            Some(text),
+            preparsed.tree,
+            preparsed.line_index,
+            Some(version),
+        ) else {
+            drop(analysis);
+            if let Some(start) = hold_start {
+                crate::util::ls_profile::record_did_change_write_hold(start.elapsed());
             }
-        } else {
-            let Some((file_id, drop)) = analysis.update_file_preparsed_deferred(
-                uri.clone(),
-                Some(text),
-                preparsed.tree,
-                preparsed.line_index,
-                Some(version),
-            ) else {
-                drop(analysis);
-                if let Some(start) = hold_start {
-                    crate::util::ls_profile::record_did_change_write_hold(start.elapsed());
-                }
-                return None;
-            };
-            outcome = Some((file_id, Vec::new()));
-            deferred_drop = Some(drop);
-        }
-    } else if trigger_reindex {
-        if let Some((file_id, widened)) = analysis.update_file_by_uri(uri, Some(text)) {
-            outcome = Some((file_id, widened));
-        }
+            return None;
+        };
+        deferred_drop = Some(drop);
+        Some(file_id)
     } else {
-        outcome = analysis
-            .update_file_text_only(uri, text)
-            .map(|file_id| (file_id, Vec::new()));
-    }
-
-    // Text-only updates leave the index alone; the debounced reindex
-    // invalidates under its own write lock.
-    if outcome.is_some() && trigger_reindex {
-        context
-            .file_diagnostic()
-            .invalidate_shared_diagnostic_data();
-    }
+        analysis.update_file_text_only(uri, text)
+    };
     drop(analysis);
     if let Some(start) = hold_start {
         crate::util::ls_profile::record_did_change_write_hold(start.elapsed());
@@ -240,46 +213,6 @@ fn parse_error_range_to_lsp_range(
     }
 }
 
-/// Fan the widen list an immediate edit path returned out to diagnostics.
-///
-/// `widened` is every file the edit may have moved beyond the one it was
-/// applied to. Files beyond the edited one get a diagnostic-only task (no
-/// debounce slot), and when anything beyond the edited file moved the
-/// workspace level is raised to `Fast` — never lowered — with a refresh
-/// request so pull clients re-poll. The widen list (plus the edited file)
-/// also scopes that pull's sweep, so it re-diagnoses the touched set rather
-/// than the whole workspace.
-async fn handle_widened_refresh(
-    context: &ServerContextSnapshot,
-    file_id: Option<FileId>,
-    widened: Vec<FileId>,
-    interval: u64,
-) {
-    let mut widened = widened;
-    if let Some(file_id) = file_id {
-        widened.retain(|id| *id != file_id);
-    }
-    if widened.is_empty() {
-        return;
-    }
-    context
-        .file_diagnostic()
-        .note_scoped_sweep_files(widened.iter().copied().chain(file_id))
-        .await;
-    context
-        .file_diagnostic()
-        .add_files_diagnostic_task(widened, interval, None)
-        .await;
-    context
-        .workspace_manager()
-        .read()
-        .await
-        .update_workspace_version(WorkspaceDiagnosticLevel::Fast, false);
-    if context.lsp_features().supports_refresh_diagnostic() {
-        context.client().refresh_workspace_diagnostics();
-    }
-}
-
 pub async fn on_did_open_text_document(
     context: ServerContextSnapshot,
     params: DidOpenTextDocumentParams,
@@ -326,16 +259,21 @@ pub async fn on_did_open_text_document(
         .as_ref()
         .map_or_else(Vec::new, |parsed| parsed.syntax_diagnostics.clone());
 
-    let (file_id, widened) =
-        apply_document_update_without_queuing(&context, &uri, text, version, preparsed, true)
-            .await
-            .map_or((None, Vec::new()), |(file_id, widened)| {
-                (Some(file_id), widened)
-            });
-    if file_id.is_some() {
+    let file_id =
+        apply_document_update_without_queuing(&context, &uri, text, version, preparsed).await;
+    if let Some(file_id) = file_id {
         context.note_document_applied_version(&uri, version);
         if context.lsp_features().supports_semantic_tokens_refresh() {
             context.client().refresh_semantic_tokens();
+        }
+        // Text that differs from what is indexed settles through the
+        // debounced loop, as an edit does.
+        let untaken = context.analysis().read().await.has_untaken_text(file_id);
+        if untaken {
+            context
+                .debounced_analysis()
+                .schedule(file_id, uri.clone())
+                .await;
         }
     }
 
@@ -358,9 +296,6 @@ pub async fn on_did_open_text_document(
                 .await;
         }
     }
-
-    // Files beyond the opened one whose diagnostics the open may have moved.
-    handle_widened_refresh(&context, file_id, widened, interval).await;
 
     Some(())
 }
@@ -465,12 +400,8 @@ pub async fn on_did_change_text_document(
         return Some(());
     }
 
-    let (file_id, _widened) =
-        apply_document_update_without_queuing(&context, &uri, text, version, preparsed, false)
-            .await
-            .map_or((None, Vec::new()), |(file_id, widened)| {
-                (Some(file_id), widened)
-            });
+    let file_id =
+        apply_document_update_without_queuing(&context, &uri, text, version, preparsed).await;
     if file_id.is_some() {
         context.note_document_applied_version(&uri, version);
     }
@@ -562,76 +493,57 @@ pub async fn on_did_close_document(
     // including library/annotation files opened via "Go to Definition" —
     // must stay in the index, but their in-memory contents need to revert
     // to the on-disk state once the editor buffer closes.
-    if let Some(file_path) = uri_to_file_path(uri) {
-        if file_path.exists() {
-            if let Some(text) = read_file_with_encoding(&file_path, &encoding) {
-                if !context.is_document_closed(uri) {
-                    return Some(());
-                }
+    let Some(file_path) = uri_to_file_path(uri) else {
+        return Some(());
+    };
+    let text = if file_path.exists() {
+        Some(read_file_with_encoding(&file_path, &encoding)?)
+    } else {
+        None
+    };
+    if !context.is_document_closed(uri) {
+        return Some(());
+    }
 
-                let (file_id, widened) = {
-                    let mut analysis = context.analysis().write().await;
-                    if !context.is_document_closed(uri) {
-                        return Some(());
-                    }
-                    let (file_id, widened) = analysis
-                        .update_file_by_uri(uri, Some(text))
-                        .map_or((None, Vec::new()), |(file_id, widened)| {
-                            (Some(file_id), widened)
-                        });
-                    if file_id.is_some() {
-                        context
-                            .file_diagnostic()
-                            .invalidate_shared_diagnostic_data();
-                    }
-                    (file_id, widened)
-                };
+    // Only the text changes under the write lock; the debounced loop
+    // re-analyses the file and whatever read what moved.
+    let deleted = text.is_none();
+    let (staged, file_id) = {
+        let mut analysis = context.analysis().write().await;
+        if !context.is_document_closed(uri) {
+            return Some(());
+        }
+        let staged = analysis
+            .stage_file_system_changes(vec![(uri.clone(), text)])
+            .into_iter()
+            .next();
+        if staged.is_some() {
+            context
+                .file_diagnostic()
+                .invalidate_shared_diagnostic_data();
+        }
+        (staged, analysis.get_file_id(uri))
+    };
+    if let Some(staged) = staged {
+        context
+            .debounced_analysis()
+            .schedule(staged, uri.clone())
+            .await;
+    }
 
-                if !lsp_features.supports_pull_diagnostic()
-                    && let Some(file_id) = file_id
-                {
-                    if !context.is_document_closed(uri) {
-                        return Some(());
-                    }
-                    context
-                        .file_diagnostic()
-                        .add_diagnostic_task(
-                            file_id,
-                            interval,
-                            Some(context.debounced_analysis_arc()),
-                        )
-                        .await;
-                }
-
-                // Files beyond the reverted one whose diagnostics the revert
-                // may have moved.
-                handle_widened_refresh(&context, file_id, widened, interval).await;
-            }
-        } else {
-            if !context.is_document_closed(uri) {
-                return Some(());
-            }
-            let (removed, widened) = {
-                let mut mut_analysis = context.analysis().write().await;
-                if !context.is_document_closed(uri) {
-                    return Some(());
-                }
-                let (removed, widened) = mut_analysis.remove_file_by_uri(uri);
-                context
-                    .file_diagnostic()
-                    .invalidate_shared_diagnostic_data();
-                (removed, widened)
-            };
-
-            if !lsp_features.supports_pull_diagnostic() {
-                context
-                    .file_diagnostic()
-                    .clear_push_file_diagnostics(uri.clone())
-                    .await;
-            }
-
-            // Files whose diagnostics the deletion may have moved.
-            handle_widened_refresh(&context, removed, widened, interval).await;
+    if !lsp_features.supports_pull_diagnostic() {
+        if deleted {
+            context
+                .file_diagnostic()
+                .clear_push_file_diagnostics(uri.clone())
+                .await;
+        } else if let Some(file_id) = file_id
+            && context.is_document_closed(uri)
+        {
+            context
+                .file_diagnostic()
+                .add_diagnostic_task(file_id, interval, Some(context.debounced_analysis_arc()))
+                .await;
         }
     }
 
