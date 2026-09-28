@@ -13,8 +13,9 @@
 //! caller-supplied seed) is tainted, and its value stays with the evaluation.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{CURRENT, Evaluation, KEYS, KeyIdx, KeyTable, next_stamp};
+use super::{CURRENT, Evaluation, KEYS, KeyIdx, KeyTable, latest_stamp, next_stamp};
 use crate::GmodRealm;
 
 /// Bits of a cache's view that inference can consult.
@@ -56,9 +57,13 @@ impl LogHandle {
 }
 
 /// What a memoised value was computed from: a range of the log of the
-/// evaluation that computed it.
+/// evaluation that computed it. Its clones share it, so a walk stored at
+/// every flow node it visited is one value.
 #[derive(Debug, Clone)]
-pub struct Provenance {
+pub struct Provenance(Arc<Computed>);
+
+#[derive(Debug)]
+struct Computed {
     log: Arc<LogHandle>,
     start: u32,
     end: u32,
@@ -67,6 +72,33 @@ pub struct Provenance {
     view: Gates,
     /// The inherited realm consulted, if any was.
     realm: Option<Option<GmodRealm>>,
+    /// The stamp its reads were last found unwritten at: they still are
+    /// while the key table has not been written since.
+    checked: AtomicU64,
+    /// The stamp of the frame its reads were last replayed into: a frame
+    /// holds them from then on.
+    replayed_into: AtomicU64,
+}
+
+impl Provenance {
+    /// Whether none of `reads`, this value's, was written after it was
+    /// computed.
+    fn holds(&self, table: &KeyTable, reads: &[KeyIdx]) -> bool {
+        if !table.written_after(self.0.checked.load(Ordering::Relaxed)) {
+            return true;
+        }
+        if !table.unwritten_since(reads, self.0.since) {
+            return false;
+        }
+        self.0.checked.store(latest_stamp(), Ordering::Relaxed);
+        true
+    }
+
+    /// Whether its reads still need replaying into the frame stamped
+    /// `frame`, marking them replayed there.
+    fn replays_into(&self, frame: u64) -> bool {
+        self.0.replayed_into.swap(frame, Ordering::Relaxed) != frame
+    }
 }
 
 fn with_evaluation<T>(f: impl FnOnce(&mut Evaluation, &mut KeyTable) -> T) -> Option<T> {
@@ -151,7 +183,7 @@ pub fn close_frame(frame: OpenFrame, view: Gates) -> Option<Provenance> {
             stats.shared += 1;
             stats.sites.entry(caller).or_default()[1] += 1;
         });
-        Some(Provenance {
+        Some(Provenance(Arc::new(Computed {
             log: Arc::clone(&evaluation.log_handle),
             start: closed.start,
             end: u32::try_from(evaluation.log.len()).expect("fewer than 2^32 reads"),
@@ -159,7 +191,9 @@ pub fn close_frame(frame: OpenFrame, view: Gates) -> Option<Provenance> {
             gates: closed.gates,
             view: view & closed.gates,
             realm: closed.realm.map(|(realm, _)| realm),
-        })
+            checked: AtomicU64::new(0),
+            replayed_into: AtomicU64::new(0),
+        })))
     })
 }
 
@@ -324,8 +358,9 @@ pub fn consult_realm(realm: Option<GmodRealm>, base: u32) {
 pub fn reuse(provenance: &Provenance, view: Gates, realm: Option<(GmodRealm, u32)>) -> bool {
     let caller = std::panic::Location::caller();
     let inherited = realm.map(|(realm, _)| realm);
-    if view & provenance.gates != provenance.view
+    if view & provenance.0.gates != provenance.0.view
         || provenance
+            .0
             .realm
             .is_some_and(|consulted| consulted != inherited)
     {
@@ -333,17 +368,19 @@ pub fn reuse(provenance: &Provenance, view: Gates, realm: Option<(GmodRealm, u32
         return false;
     }
     with_evaluation(|evaluation, table| {
-        let range = provenance.start as usize..provenance.end as usize;
-        if Arc::ptr_eq(&provenance.log, &evaluation.log_handle) {
+        let range = provenance.0.start as usize..provenance.0.end as usize;
+        if Arc::ptr_eq(&provenance.0.log, &evaluation.log_handle) {
             // Computed by this evaluation: its reads are in the log already,
             // within the innermost frame if it opened before them.
-            if provenance.since <= super::last_write() {
-                if !table.unwritten_since(&evaluation.log[range.clone()], provenance.since) {
-                    count(|stats| stats.stale += 1);
-                    return false;
-                }
+            if provenance.0.since <= super::last_write()
+                && !provenance.holds(table, &evaluation.log[range.clone()])
+            {
+                count(|stats| stats.stale += 1);
+                return false;
             }
-            if provenance.since < evaluation.frame_stamp() {
+            if provenance.0.since < evaluation.frame_stamp()
+                && provenance.replays_into(evaluation.frame_stamp())
+            {
                 count(|stats| {
                     stats.replayed += range.len() as u64;
                 });
@@ -357,30 +394,35 @@ pub fn reuse(provenance: &Provenance, view: Gates, realm: Option<(GmodRealm, u32
                 stats.sites.entry(caller).or_default()[2] += 1;
             });
         } else {
-            let Some(reads) = provenance.log.0.get().and_then(|log| log.get(range)) else {
+            let Some(reads) = provenance.0.log.0.get().and_then(|log| log.get(range)) else {
                 return false;
             };
-            if !table.unwritten_since(reads, provenance.since) {
+            if !provenance.holds(table, reads) {
                 count(|stats| stats.stale += 1);
                 return false;
             }
             REUSED_ACROSS.with(|flag| flag.set(true));
+            let replays = provenance.replays_into(evaluation.frame_stamp());
             count(|stats| {
                 stats.reused += 1;
-                stats.replayed += reads.len() as u64;
                 let site = stats.sites.entry(caller).or_default();
                 site[3] += 1;
-                site[4] += reads.len() as u64;
+                if replays {
+                    stats.replayed += reads.len() as u64;
+                    site[4] += reads.len() as u64;
+                }
             });
-            for slot in reads {
-                evaluation.log_slot(table, *slot);
+            if replays {
+                for slot in reads {
+                    evaluation.log_slot(table, *slot);
+                }
             }
         }
         let depth = evaluation.frames.len() as u32;
         if let Some(frame) = evaluation.frames.last_mut() {
-            frame.gates |= provenance.gates;
+            frame.gates |= provenance.0.gates;
             let base = realm.map_or(0, |(_, base)| base);
-            if provenance.realm.is_some() && base < depth {
+            if provenance.0.realm.is_some() && base < depth {
                 frame.realm = Some((inherited, base));
             }
         }
@@ -393,11 +435,12 @@ pub fn reuse(provenance: &Provenance, view: Gates, realm: Option<(GmodRealm, u32
 /// it was written after the value was computed.
 pub fn describe_reads(provenance: &Provenance) -> Vec<(String, bool)> {
     with_evaluation(|evaluation, table| {
-        let range = provenance.start as usize..provenance.end as usize;
-        let slots: Vec<KeyIdx> = if Arc::ptr_eq(&provenance.log, &evaluation.log_handle) {
+        let range = provenance.0.start as usize..provenance.0.end as usize;
+        let slots: Vec<KeyIdx> = if Arc::ptr_eq(&provenance.0.log, &evaluation.log_handle) {
             evaluation.log[range].to_vec()
         } else {
             provenance
+                .0
                 .log
                 .0
                 .get()
@@ -412,9 +455,9 @@ pub fn describe_reads(provenance: &Provenance) -> Vec<(String, bool)> {
                 (
                     format!(
                         "{key:?} written={written} since={} origin={:?}",
-                        provenance.since, provenance.log.1
+                        provenance.0.since, provenance.0.log.1
                     ),
-                    written > provenance.since,
+                    written > provenance.0.since,
                 )
             })
             .collect()
@@ -428,11 +471,12 @@ pub fn provenance_keys(
     provenance: &Provenance,
 ) -> (Option<super::DerivationId>, Vec<(KeyIdx, super::HashedKey)>) {
     let keys = with_evaluation(|evaluation, table| {
-        let range = provenance.start as usize..provenance.end as usize;
-        let slots: Vec<KeyIdx> = if Arc::ptr_eq(&provenance.log, &evaluation.log_handle) {
+        let range = provenance.0.start as usize..provenance.0.end as usize;
+        let slots: Vec<KeyIdx> = if Arc::ptr_eq(&provenance.0.log, &evaluation.log_handle) {
             evaluation.log[range].to_vec()
         } else {
             provenance
+                .0
                 .log
                 .0
                 .get()
@@ -446,7 +490,7 @@ pub fn provenance_keys(
             .collect()
     })
     .unwrap_or_default();
-    (provenance.log.1, keys)
+    (provenance.0.log.1, keys)
 }
 
 /// A stamp newer than every value memoised so far.
@@ -536,6 +580,47 @@ pub fn report_frames() {
     for (caller, [tainted, shared, here, across, replayed]) in sites {
         eprintln!(
             "[frames] site {caller} tainted={tainted} shared={shared} here={here} across={across} replayed={replayed}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::FileId;
+    use crate::db_index::derivation::{self, DerivationId, DerivationKind, FactKey};
+
+    /// A value reused inside a frame nested in one it was already replayed
+    /// into is recorded by the nested frame too: that frame's value is stale
+    /// once what the reused value read is written.
+    #[test]
+    fn a_value_reused_again_in_a_nested_frame_is_recorded_by_it() {
+        let read = || FactKey::GmodRealm(FileId::new(1));
+        derivation::lend_keys(KeyTable::default());
+        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let frame = open_frame().expect("a table is lent");
+        derivation::note_read(read);
+        let value = close_frame(frame, 0).expect("the frame saw no taint");
+        derivation::end();
+
+        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let outer = open_frame().expect("a table is lent");
+        let reused_outside = reuse(&value, 0, None);
+        let inner = open_frame().expect("a table is lent");
+        let reused_inside = reuse(&value, 0, None);
+        let nested = close_frame(inner, 0).expect("the frame saw no taint");
+        let _ = close_frame(outer, 0);
+        derivation::end();
+
+        derivation::begin(DerivationId::workspace(DerivationKind::NetHelperNames));
+        derivation::note_write(read);
+        let nested_holds = reuse(&nested, 0, None);
+        derivation::end();
+        derivation::take_keys();
+
+        assert_eq!(
+            (reused_outside, reused_inside, nested_holds),
+            (true, true, false)
         );
     }
 }

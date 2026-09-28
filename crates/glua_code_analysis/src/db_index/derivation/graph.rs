@@ -132,6 +132,8 @@ pub struct KeyTable {
     free_keys: Vec<KeyIdx>,
     /// The keys read out of each base key ([`FactKey::base`]).
     derived: FxHashMap<KeyIdx, DerivedKeys>,
+    /// The stamp of the latest write or release of a live slot.
+    last_written: u64,
 }
 
 /// The keys read out of one base key, and the base's fingerprint when their
@@ -234,11 +236,17 @@ impl KeyTable {
     /// key read out of it.
     pub(super) fn mark_written(&mut self, key: &HashedKey, now: u64) {
         if let Some(slot) = self.find(key) {
+            self.last_written = self.last_written.max(now);
             self.keys[slot as usize].written = now;
             for derived in self.derived.get(&slot).into_iter().flat_map(|d| &d.slots) {
                 self.keys[*derived as usize].written = now;
             }
         }
+    }
+
+    /// Whether a slot was written or released after stamp `stamp`.
+    pub(super) fn written_after(&self, stamp: u64) -> bool {
+        self.last_written > stamp
     }
 
     /// Whether none of `slots` was written after stamp `since`.
@@ -936,6 +944,7 @@ impl ReaderGraph {
             return;
         };
         entry.written = u64::MAX;
+        self.table.last_written = super::new_stamp();
         self.table.unfile(&key, slot);
         self.table.free_keys.push(slot);
         let Some(base) = key
