@@ -20,10 +20,9 @@ pub use diagnostic_reads::DiagnosticReads;
 mod paged;
 pub use frames::{
     Gates, OpenFrame, Provenance, Reuse, ScopeMark, check_cache, close_frame, consult_absorbed,
-    consult_cycle, consult_gates, consult_realm, consult_scope, consult_unkeyed, describe_reads,
-    frame_depth, new_stamp, note_recomputed, note_recomputing, note_written, open_frame,
-    open_frame_absorbing, provenance_keys, report_frames, reuse, scope_mark, taint,
-    take_reused_across,
+    consult_cycle, consult_gates, consult_realm, consult_scope, consult_unkeyed, frame_depth,
+    new_stamp, note_recomputed, note_recomputing, note_written, open_frame, open_frame_absorbing,
+    report_frames, reuse, scope_mark, taint, take_reused_across,
 };
 
 /// A value an analyzer derivation stores on the index without the index
@@ -1140,7 +1139,7 @@ pub fn begin(id: DerivationId) {
         frames: Vec::new(),
         unkeyed: Vec::new(),
         checks: FxHashSet::default(),
-        log_handle: std::sync::Arc::new(frames::LogHandle(Default::default(), Some(id))),
+        log_handle: std::sync::Arc::new(frames::LogHandle::default()),
         stamp,
         reads: FxHashSet::default(),
         read_identities: rustc_hash::FxHashMap::default(),

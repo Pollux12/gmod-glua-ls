@@ -420,6 +420,36 @@ impl LuaInferCache {
         derivation::close_frame(frame?, self.view_gates())
     }
 
+    /// Under `GLUALS_CHECK_CACHE`, starts watching lookups for a value another
+    /// evaluation computed; see [`Self::check_reuse`].
+    pub(crate) fn watch_reuse(&self) {
+        if derivation::check_cache() {
+            derivation::take_reused_across();
+        }
+    }
+
+    /// Under `GLUALS_CHECK_CACHE`, when a lookup since [`Self::watch_reuse`]
+    /// took a value another evaluation computed, computes it again in a fresh
+    /// cache and reports any difference.
+    pub(crate) fn check_reuse<T: PartialEq + std::fmt::Debug>(
+        &self,
+        site: impl std::fmt::Debug,
+        shared: &T,
+        recompute: impl FnOnce(&mut Self) -> Option<T>,
+    ) {
+        if !(derivation::check_cache() && derivation::take_reused_across()) {
+            return;
+        }
+        let fresh = recompute(&mut self.fork_fresh());
+        if fresh.as_ref() != Some(shared) {
+            eprintln!(
+                "[cache] mismatch {:?} {site:?} {:?} shared={shared:?} fresh={fresh:?}",
+                self.get_file_id(),
+                derivation::current(),
+            );
+        }
+    }
+
     /// The realm flow queries inherit, if one is set.
     pub fn query_realm(&self) -> Option<GmodRealm> {
         match self.flow_query_realm {

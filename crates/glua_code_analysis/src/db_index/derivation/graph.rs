@@ -244,12 +244,6 @@ impl KeyTable {
         self.intern(key, now)
     }
 
-    /// The key in `slot` and the stamp it was last written, for diagnostics.
-    pub(super) fn describe(&self, slot: KeyIdx) -> (Option<HashedKey>, u64) {
-        let entry = &self.keys[slot as usize];
-        (entry.key.clone(), entry.written)
-    }
-
     /// Marks `key` written at stamp `now`, if anything ever read it, and every
     /// key read out of it.
     pub(super) fn mark_written(&mut self, key: &HashedKey, now: u64) {

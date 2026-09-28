@@ -103,35 +103,24 @@ pub fn get_type_at_flow_with_origin(
     });
     // Build once per query: the walk below touches the cache at every node.
     let cache_key = VarRefCacheKey::from(var_ref_id);
-    if crate::db_index::derivation::check_cache() {
-        crate::db_index::derivation::take_reused_across();
-    }
+    cache.watch_reuse();
     // Check cache for both success and error results. The shared entries
     // only bump a refcount here; the owned type is cloned once on return.
     match cache.get_flow_cache_with_origin_by_key(&cache_key, flow_id, query_realm, policy.origin) {
         Some(CacheEntry::Cache(narrow_type)) => {
             let narrow_type = narrow_type.as_ref().clone();
-            if crate::db_index::derivation::check_cache()
-                && crate::db_index::derivation::take_reused_across()
-            {
-                let mut fresh = cache.fork_fresh();
-                let recomputed = get_type_at_flow_with_origin(
+            cache.check_reuse((var_ref_id, flow_id), &narrow_type, |fresh| {
+                get_type_at_flow_with_origin(
                     db,
                     tree,
-                    &mut fresh,
+                    fresh,
                     root,
                     var_ref_id,
                     flow_id,
                     flow_origin,
-                );
-                if recomputed.as_ref().ok() != Some(&narrow_type) {
-                    eprintln!(
-                        "[cache] flow mismatch {:?} {var_ref_id:?} {flow_id:?} {:?} shared={narrow_type:?} fresh={recomputed:?}",
-                        cache.get_file_id(),
-                        crate::db_index::derivation::current(),
-                    );
-                }
-            }
+                )
+                .ok()
+            });
             return Ok(narrow_type);
         }
         Some(CacheEntry::Error(reason)) => {

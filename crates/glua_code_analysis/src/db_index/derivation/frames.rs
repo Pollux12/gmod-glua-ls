@@ -49,11 +49,7 @@ pub struct OpenFrame(u32);
 /// An evaluation's read log, kept once the evaluation ends for the memos
 /// that point into it.
 #[derive(Debug, Default)]
-pub(super) struct LogHandle(
-    pub(super) std::sync::OnceLock<Box<[KeyIdx]>>,
-    /// The derivation whose evaluation this log is.
-    pub(super) Option<super::DerivationId>,
-);
+pub(super) struct LogHandle(pub(super) std::sync::OnceLock<Box<[KeyIdx]>>);
 
 impl LogHandle {
     pub(super) fn freeze(&self, log: &[KeyIdx]) {
@@ -520,68 +516,6 @@ fn replay_unkeyed(evaluation: &mut Evaluation, provenance: &Provenance) {
     {
         note_unkeyed(evaluation, *key);
     }
-}
-
-/// For `GLUALS_CHECK_CACHE`: the keys `provenance` recorded, each with whether
-/// it was written after the value was computed.
-pub fn describe_reads(provenance: &Provenance) -> Vec<(String, bool)> {
-    with_evaluation(|evaluation, table| {
-        let range = provenance.0.start as usize..provenance.0.end as usize;
-        let slots: Vec<KeyIdx> = if Arc::ptr_eq(&provenance.0.log, &evaluation.log_handle) {
-            evaluation.log[range].to_vec()
-        } else {
-            provenance
-                .0
-                .log
-                .0
-                .get()
-                .and_then(|log| log.get(range))
-                .map(<[KeyIdx]>::to_vec)
-                .unwrap_or_default()
-        };
-        slots
-            .into_iter()
-            .map(|slot| {
-                let (key, written) = table.describe(slot);
-                (
-                    format!(
-                        "{key:?} written={written} since={} origin={:?}",
-                        provenance.0.since, provenance.0.log.1
-                    ),
-                    written > provenance.0.since,
-                )
-            })
-            .collect()
-    })
-    .unwrap_or_default()
-}
-
-/// For `GLUALS_CHECK_CACHE`: the derivation that computed `provenance`, and
-/// each key it recorded.
-pub fn provenance_keys(
-    provenance: &Provenance,
-) -> (Option<super::DerivationId>, Vec<(KeyIdx, super::HashedKey)>) {
-    let keys = with_evaluation(|evaluation, table| {
-        let range = provenance.0.start as usize..provenance.0.end as usize;
-        let slots: Vec<KeyIdx> = if Arc::ptr_eq(&provenance.0.log, &evaluation.log_handle) {
-            evaluation.log[range].to_vec()
-        } else {
-            provenance
-                .0
-                .log
-                .0
-                .get()
-                .and_then(|log| log.get(range))
-                .map(<[KeyIdx]>::to_vec)
-                .unwrap_or_default()
-        };
-        slots
-            .into_iter()
-            .filter_map(|slot| Some((slot, table.describe(slot).0?)))
-            .collect()
-    })
-    .unwrap_or_default();
-    (provenance.0.log.1, keys)
 }
 
 /// A stamp newer than every value memoised so far.

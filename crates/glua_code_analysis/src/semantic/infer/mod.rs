@@ -74,81 +74,12 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
         return Err(InferFailReason::RecursiveInfer);
     }
     let lookup = cache.lookup();
-    if crate::db_index::derivation::check_cache() {
-        crate::db_index::derivation::take_reused_across();
-    }
+    cache.watch_reuse();
     if let Some(cache_entry) = cache.expr_cache.get(&key, lookup, &cache.keyed) {
         match cache_entry {
             CacheEntry::Cache(ty) => {
                 let ty = ty.clone();
-                if crate::db_index::derivation::check_cache()
-                    && crate::db_index::derivation::take_reused_across()
-                {
-                    let shared_reads = cache
-                        .expr_cache
-                        .provenance(&key)
-                        .map(crate::db_index::derivation::describe_reads)
-                        .unwrap_or_default();
-                    let mut fresh = cache.fork_fresh();
-                    let frame = crate::db_index::derivation::open_frame();
-                    let recomputed = infer_expr(db, &mut fresh, expr.clone());
-                    let fresh_reads = fresh
-                        .close_frame(frame)
-                        .map(|provenance| crate::db_index::derivation::describe_reads(&provenance))
-                        .unwrap_or_default();
-                    if recomputed.as_ref().ok() != Some(&ty) {
-                        let shared_keys = shared_reads
-                            .iter()
-                            .map(|(key, _)| key.as_str())
-                            .collect::<std::collections::HashSet<_>>();
-                        let only_fresh = fresh_reads
-                            .iter()
-                            .filter(|(key, _)| !shared_keys.contains(key.as_str()))
-                            .map(|(key, _)| key.as_str())
-                            .collect::<Vec<_>>();
-                        let written = shared_reads
-                            .iter()
-                            .filter(|(_, written)| *written)
-                            .map(|(key, _)| key.as_str())
-                            .collect::<Vec<_>>();
-                        if let Some(provenance) = cache.expr_cache.provenance(&key) {
-                            let (origin, keys) =
-                                crate::db_index::derivation::provenance_keys(provenance);
-                            if let Some(origin) = origin {
-                                let seen = db.reader_graph().recorded_slots(origin);
-                                let moved = keys
-                                    .iter()
-                                    .filter_map(|(slot, hashed)| {
-                                        let (_, then) =
-                                            seen.iter().find(|(read, _)| read == slot)?;
-                                        let now = db.fact_fingerprint(hashed);
-                                        (*then != now).then(|| format!("{:?}", &**hashed))
-                                    })
-                                    .collect::<Vec<_>>();
-                                eprintln!("[cache] origin {origin:?} moved-unmarked={moved:?}");
-                            }
-                        }
-                        let gmod_class = shared_reads
-                            .iter()
-                            .filter(|(key, _)| key.contains("GmodClass"))
-                            .collect::<Vec<_>>();
-                        eprintln!("[cache] gmod-class reads {gmod_class:?}");
-                        eprintln!(
-                            "[cache] reads shared={} fresh={} only_fresh={only_fresh:?} written={written:?}",
-                            shared_reads.len(),
-                            fresh_reads.len(),
-                        );
-                        eprintln!(
-                            "[cache] mismatch {:?} {:?} {:?} `{}` shared={ty:?} fresh={recomputed:?}",
-                            db.get_vfs()
-                                .get_uri(&cache.get_file_id())
-                                .map(|uri| uri.to_string()),
-                            expr.get_range(),
-                            crate::db_index::derivation::current(),
-                            expr.syntax().text(),
-                        );
-                    }
-                }
+                cache.check_reuse(key, &ty, |fresh| infer_expr(db, fresh, expr.clone()).ok());
                 return Ok(ty);
             }
             CacheEntry::Error(reason) => {
