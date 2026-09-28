@@ -111,8 +111,7 @@ impl super::engine::Recipe for Recipes {
         // Dynamic fields are collected with dynamic fields invisible.
         matches!(
             kind,
-            DerivationKind::CallTargets
-                | DerivationKind::CallSiteParams
+            DerivationKind::CallSiteParams
                 | DerivationKind::NetHelpers
                 | DerivationKind::Network
                 | DerivationKind::DynamicFields
@@ -124,9 +123,6 @@ impl super::engine::Recipe for Recipes {
 
     fn compute(&self, db: &DbIndex, id: DerivationId) -> Box<dyn std::any::Any + Send> {
         match id.kind {
-            DerivationKind::CallTargets => {
-                Box::new(call_target::compute_file_call_targets(db, id.file_id))
-            }
             DerivationKind::CallSiteParams => {
                 Box::new(call_site_params::collect_file_contributions(db, id.file_id))
             }
@@ -154,12 +150,6 @@ impl super::engine::Recipe for Recipes {
 
     fn apply(&self, db: &mut DbIndex, id: DerivationId, computed: Box<dyn std::any::Any + Send>) {
         match id.kind {
-            DerivationKind::CallTargets => {
-                let targets = *computed
-                    .downcast::<crate::FileCallTargets>()
-                    .expect("call targets");
-                call_target::apply_file_call_targets(db, id.file_id, targets);
-            }
             DerivationKind::CallSiteParams => {
                 let contributions = *computed
                     .downcast::<Vec<call_site_params::Contribution>>()
@@ -295,7 +285,10 @@ impl Recipes {
                 setmetatable_factory::synthesize_setmetatable_factory_members(db, &file_ids)
             }
             DerivationKind::CallTargets => {
-                let targets = call_target::compute_file_call_targets(db, id.file_id);
+                let cache = context.infer_manager.get_infer_cache(id.file_id);
+                cache.config_mut().call_site_params_visible = false;
+                let targets = call_target::compute_file_call_targets_with(db, cache);
+                cache.config_mut().call_site_params_visible = true;
                 call_target::apply_file_call_targets(db, id.file_id, targets);
             }
             DerivationKind::CallSiteParams => {

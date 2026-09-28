@@ -23,17 +23,24 @@ pub(crate) fn pass_view() -> CacheOptions {
 
 /// What each call of `file_id` targets.
 pub(super) fn compute_file_call_targets(db: &DbIndex, file_id: FileId) -> FileCallTargets {
+    compute_file_call_targets_with(db, &mut LuaInferCache::new(file_id, pass_view()))
+}
+
+/// What each call of `cache`'s file targets, inferred with `cache`.
+pub(super) fn compute_file_call_targets_with(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+) -> FileCallTargets {
     let Some(root) = db
         .get_vfs()
-        .get_syntax_tree(&file_id)
+        .get_syntax_tree(&cache.get_file_id())
         .map(|tree| tree.get_chunk_node())
     else {
         return FileCallTargets::default();
     };
-    let mut cache = LuaInferCache::new(file_id, pass_view());
     root.descendants::<LuaCallExpr>()
         .map(|call_expr| {
-            let target = resolve_call_target(db, &mut cache, &call_expr);
+            let target = resolve_call_target(db, cache, &call_expr);
             (call_expr.get_range(), target)
         })
         .collect()
