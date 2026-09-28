@@ -8,9 +8,10 @@
 //!
 //! A value is reusable wherever it would be computed the same: its reads hold
 //! their values, and every context it consulted — a gate of the cache's view,
-//! the inherited query realm — reads the same. A frame that saw something its
-//! reads cannot vouch for (a memo hit without reads, a recursion cut, a
-//! caller-supplied seed) is tainted, and its value stays with the evaluation.
+//! the inherited query realm, whether a reference walks from a keyed origin —
+//! reads the same. A frame that saw something its reads cannot vouch for (a
+//! memo hit without reads, a recursion cut, a caller-supplied seed) is
+//! tainted, and its value stays with the evaluation.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,6 +35,9 @@ pub(super) struct Frame {
     /// A context this frame's memo is keyed by, so a read of it stops here;
     /// see [`consult_absorbed`].
     absorbs: u64,
+    /// Where the frame's references read as unkeyed begin in the
+    /// evaluation's log of them; see [`consult_unkeyed`].
+    unkeyed: u32,
 }
 
 /// An open frame, to hand back to [`close_frame`].
@@ -78,6 +82,20 @@ struct Computed {
     /// The stamp of the frame its reads were last replayed into: a frame
     /// holds them from then on.
     replayed_into: AtomicU64,
+    /// The references it read as walking from no keyed origin: it holds
+    /// only while none of them does.
+    unkeyed: Option<Box<[u64]>>,
+}
+
+/// What a lookup of a memoised value found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reuse {
+    /// It holds; its reads and context are recorded into the open frames.
+    Held,
+    /// Something it read was written since: it holds nowhere.
+    Stale,
+    /// It was computed under other context, where it may still hold.
+    Elsewhere,
 }
 
 impl Provenance {
@@ -138,6 +156,8 @@ pub fn open_frame_absorbing(absorbs: u64) -> Option<OpenFrame> {
             gates: 0,
             realm: None,
             absorbs,
+            unkeyed: u32::try_from(evaluation.unkeyed.len())
+                .expect("fewer than 2^32 context reads"),
         });
         OpenFrame(depth)
     })
@@ -158,6 +178,10 @@ pub fn close_frame(frame: OpenFrame, view: Gates) -> Option<Provenance> {
             "frames close in order"
         );
         let closed = evaluation.frames.pop()?;
+        let unkeyed = unkeyed_since(&evaluation.unkeyed, closed.unkeyed);
+        if evaluation.frames.is_empty() {
+            evaluation.unkeyed.clear();
+        }
         if let Some(parent) = evaluation.frames.last_mut() {
             let parent_depth = depth - 1;
             if let Some(reach) = closed.taint
@@ -193,8 +217,36 @@ pub fn close_frame(frame: OpenFrame, view: Gates) -> Option<Provenance> {
             realm: closed.realm.map(|(realm, _)| realm),
             checked: AtomicU64::new(0),
             replayed_into: AtomicU64::new(0),
+            unkeyed,
         })))
     })
+}
+
+/// The distinct references `log` holds from `start` on.
+fn unkeyed_since(log: &[u64], start: u32) -> Option<Box<[u64]>> {
+    let read = log.get(start as usize..).filter(|read| !read.is_empty())?;
+    let mut read = read.to_vec();
+    read.sort_unstable();
+    read.dedup();
+    Some(read.into())
+}
+
+/// Notes that the open frames read the reference `key` as walking from no
+/// keyed origin: their values hold only while it does not.
+pub fn consult_unkeyed(key: u64) {
+    CURRENT.with(|current| {
+        if let Some(evaluation) = current.borrow_mut().as_mut() {
+            note_unkeyed(evaluation, key);
+        }
+    });
+}
+
+fn note_unkeyed(evaluation: &mut Evaluation, key: u64) {
+    if let Some(frame) = evaluation.frames.last()
+        && !evaluation.unkeyed[frame.unkeyed as usize..].contains(&key)
+    {
+        evaluation.unkeyed.push(key);
+    }
 }
 
 /// The number of open frames: where a scope set now begins.
@@ -351,21 +403,32 @@ pub fn consult_realm(realm: Option<GmodRealm>, base: u32) {
     });
 }
 
-/// Whether a value computed as `provenance` records still holds under `view`
-/// and the inherited `realm` (with the frame index its scope began at); if so
-/// records its reads and consulted context into the open frames.
+/// Whether a value computed as `provenance` records still holds under `view`,
+/// the references `keyed` that walk from a keyed origin now, and the
+/// inherited `realm` (with the frame index its scope began at); if so records
+/// its reads and consulted context into the open frames.
 #[track_caller]
-pub fn reuse(provenance: &Provenance, view: Gates, realm: Option<(GmodRealm, u32)>) -> bool {
+pub fn reuse(
+    provenance: &Provenance,
+    view: Gates,
+    keyed: &[u64],
+    realm: Option<(GmodRealm, u32)>,
+) -> Reuse {
     let caller = std::panic::Location::caller();
     let inherited = realm.map(|(realm, _)| realm);
     if view & provenance.0.gates != provenance.0.view
+        || provenance
+            .0
+            .unkeyed
+            .as_ref()
+            .is_some_and(|unkeyed| unkeyed.iter().any(|key| keyed.contains(key)))
         || provenance
             .0
             .realm
             .is_some_and(|consulted| consulted != inherited)
     {
         count(|stats| stats.other_context += 1);
-        return false;
+        return Reuse::Elsewhere;
     }
     with_evaluation(|evaluation, table| {
         let range = provenance.0.start as usize..provenance.0.end as usize;
@@ -376,7 +439,7 @@ pub fn reuse(provenance: &Provenance, view: Gates, realm: Option<(GmodRealm, u32
                 && !provenance.holds(table, &evaluation.log[range.clone()])
             {
                 count(|stats| stats.stale += 1);
-                return false;
+                return Reuse::Stale;
             }
             if provenance.0.since < evaluation.frame_stamp()
                 && provenance.replays_into(evaluation.frame_stamp())
@@ -388,6 +451,7 @@ pub fn reuse(provenance: &Provenance, view: Gates, realm: Option<(GmodRealm, u32
                     let slot = evaluation.log[at];
                     evaluation.log_slot(table, slot);
                 }
+                replay_unkeyed(evaluation, provenance);
             }
             count(|stats| {
                 stats.reused_here += 1;
@@ -395,11 +459,11 @@ pub fn reuse(provenance: &Provenance, view: Gates, realm: Option<(GmodRealm, u32
             });
         } else {
             let Some(reads) = provenance.0.log.0.get().and_then(|log| log.get(range)) else {
-                return false;
+                return Reuse::Elsewhere;
             };
             if !provenance.holds(table, reads) {
                 count(|stats| stats.stale += 1);
-                return false;
+                return Reuse::Stale;
             }
             REUSED_ACROSS.with(|flag| flag.set(true));
             let replays = provenance.replays_into(evaluation.frame_stamp());
@@ -416,6 +480,7 @@ pub fn reuse(provenance: &Provenance, view: Gates, realm: Option<(GmodRealm, u32
                 for slot in reads {
                     evaluation.log_slot(table, *slot);
                 }
+                replay_unkeyed(evaluation, provenance);
             }
         }
         let depth = evaluation.frames.len() as u32;
@@ -426,9 +491,20 @@ pub fn reuse(provenance: &Provenance, view: Gates, realm: Option<(GmodRealm, u32
                 frame.realm = Some((inherited, base));
             }
         }
-        true
+        Reuse::Held
     })
-    .unwrap_or(false)
+    .unwrap_or(Reuse::Elsewhere)
+}
+
+fn replay_unkeyed(evaluation: &mut Evaluation, provenance: &Provenance) {
+    for key in provenance
+        .0
+        .unkeyed
+        .iter()
+        .flat_map(|unkeyed| unkeyed.iter())
+    {
+        note_unkeyed(evaluation, *key);
+    }
 }
 
 /// For `GLUALS_CHECK_TSC`: the keys `provenance` recorded, each with whether
@@ -605,22 +681,41 @@ mod tests {
 
         derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
         let outer = open_frame().expect("a table is lent");
-        let reused_outside = reuse(&value, 0, None);
+        let reused_outside = reuse(&value, 0, &[], None);
         let inner = open_frame().expect("a table is lent");
-        let reused_inside = reuse(&value, 0, None);
+        let reused_inside = reuse(&value, 0, &[], None);
         let nested = close_frame(inner, 0).expect("the frame saw no taint");
         let _ = close_frame(outer, 0);
         derivation::end();
 
         derivation::begin(DerivationId::workspace(DerivationKind::NetHelperNames));
         derivation::note_write(read);
-        let nested_holds = reuse(&nested, 0, None);
+        let nested_holds = reuse(&nested, 0, &[], None);
         derivation::end();
         derivation::take_keys();
 
         assert_eq!(
             (reused_outside, reused_inside, nested_holds),
-            (true, true, false)
+            (Reuse::Held, Reuse::Held, Reuse::Stale)
         );
+    }
+
+    /// A value that read a reference as unkeyed holds wherever that reference
+    /// is still unkeyed, whichever others are keyed, and nowhere it is.
+    #[test]
+    fn a_value_that_read_a_reference_as_unkeyed_holds_while_it_stays_unkeyed() {
+        const READ: u64 = 3;
+        const OTHER: u64 = 5;
+        derivation::lend_keys(KeyTable::default());
+        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let frame = open_frame().expect("a table is lent");
+        consult_unkeyed(READ);
+        let value = close_frame(frame, 0).expect("the frame saw no taint");
+        let under_other = reuse(&value, 0, &[OTHER], None);
+        let under_read = reuse(&value, 0, &[OTHER, READ], None);
+        derivation::end();
+        derivation::take_keys();
+
+        assert_eq!((under_other, under_read), (Reuse::Held, Reuse::Elsewhere));
     }
 }

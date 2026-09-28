@@ -12,7 +12,7 @@ use std::ops::{Deref, DerefMut};
 use rustc_hash::FxHashMap;
 
 use crate::GmodRealm;
-use crate::db_index::derivation::{self, Gates, Provenance};
+use crate::db_index::derivation::{self, Gates, Provenance, Reuse};
 
 /// What a lookup is made under: the view's gates, and the inherited query
 /// realm with the frame depth its scope began at.
@@ -38,20 +38,24 @@ impl<K, V> Default for TrackedMap<K, V> {
 }
 
 impl<K: Hash + Eq, V> TrackedMap<K, V> {
-    /// The value for `key` if it holds under `lookup`, recording what it was
-    /// computed from into the open frames.
+    /// The value for `key` if it holds under `lookup` with the references
+    /// `keyed` walking from a keyed origin, recording what it was computed
+    /// from into the open frames. A value computed under other context stays
+    /// for where it holds.
     #[track_caller]
-    pub fn get(&mut self, key: &K, lookup: Lookup) -> Option<&V> {
+    pub fn get(&mut self, key: &K, lookup: Lookup, keyed: &[u64]) -> Option<&V> {
         if self.local.contains_key(key) {
             derivation::taint();
             return self.local.get(key);
         }
         let (_, provenance) = self.shared.get(key)?;
-        if derivation::reuse(provenance, lookup.gates, lookup.realm) {
-            self.shared.get(key).map(|(value, _)| value)
-        } else {
-            self.shared.remove(key);
-            None
+        match derivation::reuse(provenance, lookup.gates, keyed, lookup.realm) {
+            Reuse::Held => self.shared.get(key).map(|(value, _)| value),
+            Reuse::Stale => {
+                self.shared.remove(key);
+                None
+            }
+            Reuse::Elsewhere => None,
         }
     }
 

@@ -77,7 +77,7 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
     if crate::db_index::derivation::check_tsc() {
         crate::db_index::derivation::take_reused_across();
     }
-    if let Some(cache_entry) = cache.expr_cache.get(&key, lookup) {
+    if let Some(cache_entry) = cache.expr_cache.get(&key, lookup, &cache.keyed) {
         match cache_entry {
             CacheEntry::Cache(ty) => {
                 let ty = ty.clone();

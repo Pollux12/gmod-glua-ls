@@ -10,7 +10,7 @@ use smol_str::SmolStr;
 use std::sync::Arc;
 pub use tracked::{Lookup, TrackedMap, Untracked};
 
-use crate::db_index::derivation::{self, Gates, OpenFrame, Provenance};
+use crate::db_index::derivation::{self, Gates, OpenFrame, Provenance, Reuse};
 use crate::{
     DbIndex, FileId, FlowId, GmodRealm, InFiled, LuaDeclId, LuaFunctionType, LuaMemberId,
     LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, VarRefId, VarRefRootId,
@@ -23,10 +23,6 @@ use crate::{
 
 const DYNAMIC_FIELDS_GATE: Gates = 1;
 const CALL_SITE_PARAMS_GATE: Gates = 2;
-/// Whether a region-aware `self` seed is in effect.
-const SELF_SEED_GATE: Gates = 4;
-/// Whether some index ref's walk has an origin set.
-const INDEX_ORIGIN_GATE: Gates = 8;
 
 pub type FlowCacheInnerKey = (FlowId, GmodRealm, FlowOrigin);
 
@@ -108,6 +104,14 @@ pub enum CacheEntry<T> {
     /// Cached error result — used during diagnostics to prevent recomputation
     /// of expressions whose type couldn't be resolved.
     Error(InferFailReason),
+}
+
+/// A `self` seed replaced by [`LuaInferCache::seed_self`], and where its
+/// scope began.
+#[derive(Debug)]
+pub(crate) struct SelfSeed {
+    seed: Option<(VarRefId, LuaType)>,
+    mark: derivation::ScopeMark,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,8 +213,12 @@ pub struct LuaInferCache {
     pub(crate) flow_walk_scratch_in_use: bool,
     /// The origin type flow walks of an index ref start from, and where the
     /// caller that set it began.
-    pub index_ref_origin_type_cache:
+    index_ref_origin_type_cache:
         FxHashMap<VarRefCacheKey, (CacheEntry<LuaType>, derivation::ScopeMark)>,
+    /// The context keys of the references whose walks start from a keyed
+    /// origin now: index refs with an origin, and a seeded `self` by
+    /// reference and by declaration.
+    pub(crate) keyed: Vec<u64>,
     pub param_type_cache: Untracked<FxHashMap<LuaDeclId, CacheEntry<LuaType>>>,
     pub(crate) param_type_source_cache:
         Untracked<FxHashMap<LuaDeclId, CacheEntry<ParamInferenceSource>>>,
@@ -339,6 +347,7 @@ impl LuaInferCache {
             flow_walk_scratch: Vec::new(),
             flow_walk_scratch_in_use: false,
             index_ref_origin_type_cache: Default::default(),
+            keyed: Vec::new(),
             param_type_cache: Default::default(),
             param_type_source_cache: Default::default(),
             expr_var_ref_id_cache: Default::default(),
@@ -386,6 +395,7 @@ impl LuaInferCache {
         fresh.self_base_seed = self.self_base_seed.clone();
         fresh.self_base_seed_mark = self.self_base_seed_mark;
         fresh.index_ref_origin_type_cache = self.index_ref_origin_type_cache.clone();
+        fresh.keyed = self.keyed.clone();
         fresh
     }
 
@@ -393,8 +403,6 @@ impl LuaInferCache {
     fn view_gates(&self) -> Gates {
         (u8::from(self.config.dynamic_fields_visible) * DYNAMIC_FIELDS_GATE)
             | (u8::from(self.config.call_site_params_visible) * CALL_SITE_PARAMS_GATE)
-            | (u8::from(self.self_base_seed.is_some()) * SELF_SEED_GATE)
-            | (u8::from(!self.index_ref_origin_type_cache.is_empty()) * INDEX_ORIGIN_GATE)
     }
 
     /// What a tracked lookup is made under now.
@@ -440,10 +448,52 @@ impl LuaInferCache {
         self.flow_query_realm = previous;
     }
 
-    /// Notes that an implicit `self` was resolved, which reads whether a
-    /// region-aware seed is in effect.
-    pub fn consult_self_seed(&self) {
-        derivation::consult_gates(SELF_SEED_GATE);
+    /// Seeds the walks of the implicit `self` `var_ref_id` with `seed`; hand
+    /// the result back to [`Self::restore_self_seed`].
+    pub(crate) fn seed_self(&mut self, var_ref_id: VarRefId, seed: LuaType) -> SelfSeed {
+        let previous = SelfSeed {
+            seed: self.self_base_seed.take(),
+            mark: std::mem::replace(&mut self.self_base_seed_mark, derivation::scope_mark()),
+        };
+        if let Some((seeded, _)) = &previous.seed {
+            self.unkey(Self::seed_keys(seeded));
+        }
+        self.key(Self::seed_keys(&var_ref_id));
+        self.self_base_seed = Some((var_ref_id, seed));
+        previous
+    }
+
+    pub(crate) fn restore_self_seed(&mut self, previous: SelfSeed) {
+        if let Some((seeded, _)) = self.self_base_seed.take() {
+            self.unkey(Self::seed_keys(&seeded));
+        }
+        if let Some((seeded, _)) = &previous.seed {
+            self.key(Self::seed_keys(seeded));
+        }
+        self.self_base_seed = previous.seed;
+        self.self_base_seed_mark = previous.mark;
+    }
+
+    /// The context keys a seed for `var_ref_id` answers: the reference, and
+    /// its declaration.
+    fn seed_keys(var_ref_id: &VarRefId) -> impl Iterator<Item = u64> {
+        std::iter::once(Self::flow_context_key(&VarRefCacheKey::from(var_ref_id))).chain(
+            var_ref_id
+                .get_decl_id_ref()
+                .map(Self::self_decl_context_key),
+        )
+    }
+
+    fn key(&mut self, keys: impl Iterator<Item = u64>) {
+        self.keyed.extend(keys);
+    }
+
+    fn unkey(&mut self, keys: impl Iterator<Item = u64>) {
+        for key in keys {
+            if let Some(at) = self.keyed.iter().position(|keyed| *keyed == key) {
+                self.keyed.swap_remove(at);
+            }
+        }
     }
 
     /// Whether dynamic fields are visible, noting the gate consulted.
@@ -490,7 +540,10 @@ impl LuaInferCache {
         key: &K,
     ) -> Option<V> {
         let lookup = self.lookup();
-        map(self).get(key, lookup).cloned()
+        let keyed = std::mem::take(&mut self.keyed);
+        let value = map(self).get(key, lookup, &keyed).cloned();
+        self.keyed = keyed;
+        value
     }
 
     /// Closes `frame` and stores the value computed in it.
@@ -600,6 +653,7 @@ impl LuaInferCache {
         self.flow_walk_scratch.clear();
         self.flow_walk_scratch_in_use = false;
         empty(&mut self.index_ref_origin_type_cache);
+        self.keyed.clear();
         empty(&mut self.param_type_cache.0);
         empty(&mut self.param_type_source_cache.0);
         empty(&mut self.field_literal_narrowing);
@@ -670,6 +724,7 @@ impl LuaInferCache {
         self.baseline_flow_memo.clear();
         self.baseline_flow_depth = 0;
         self.index_ref_origin_type_cache.clear();
+        self.keyed.clear();
         self.param_type_cache.clear();
         self.param_type_source_cache.clear();
         self.call_returns_never_cache.clear();
@@ -755,9 +810,11 @@ impl LuaInferCache {
         origin: FlowOrigin,
     ) -> Option<&CacheEntry<Arc<LuaType>>> {
         let lookup = self.lookup();
-        self.flow_node_cache
-            .get_mut(cache_key)?
-            .get(&(flow_id, query_realm, origin), lookup)
+        self.flow_node_cache.get_mut(cache_key)?.get(
+            &(flow_id, query_realm, origin),
+            lookup,
+            &self.keyed,
+        )
     }
 
     pub fn set_flow_cache_with_origin_by_key(
@@ -841,11 +898,14 @@ impl LuaInferCache {
         let lookup = self.lookup();
         let bucket = self.call_cache.get_mut(&key)?;
         let at = bucket.iter().position(|(ty, _, _)| ty == call_expr_type)?;
-        if !derivation::reuse(&bucket[at].2, lookup.gates, lookup.realm) {
-            bucket.swap_remove(at);
-            return None;
+        match derivation::reuse(&bucket[at].2, lookup.gates, &self.keyed, lookup.realm) {
+            Reuse::Held => Some(bucket[at].1.clone()),
+            Reuse::Stale => {
+                bucket.swap_remove(at);
+                None
+            }
+            Reuse::Elsewhere => None,
         }
-        Some(bucket[at].1.clone())
     }
 
     pub fn insert_call_func_cache(
@@ -949,6 +1009,13 @@ impl LuaInferCache {
         rustc_hash::FxBuildHasher.hash_one(cache_key) | 1
     }
 
+    /// The context key of whether an implicit `self` declared at `decl_id`
+    /// is seeded.
+    pub(crate) fn self_decl_context_key(decl_id: LuaDeclId) -> u64 {
+        use std::hash::BuildHasher;
+        rustc_hash::FxBuildHasher.hash_one((u8::MAX, decl_id)) | 1
+    }
+
     pub fn take_flow_cache_for_var_ref(&mut self, var_ref_id: &VarRefId) -> Option<FlowEntries> {
         let cache_key = VarRefCacheKey::from(var_ref_id);
         self.flow_node_cache.remove(&cache_key)
@@ -976,10 +1043,11 @@ impl LuaInferCache {
         let Some((entry, mark)) = self.index_ref_origin_type_cache.get(&cache_key) else {
             // No origin is itself an answer: a walk from inside a setter's
             // scope would have found one.
-            derivation::consult_gates(INDEX_ORIGIN_GATE);
+            derivation::consult_unkeyed(Self::flow_context_key(&cache_key));
             return None;
         };
-        derivation::consult_scope(*mark);
+        // The walks of this reference are keyed by its origin.
+        derivation::consult_absorbed(Self::flow_context_key(&cache_key), *mark);
         Some(entry)
     }
 
@@ -989,8 +1057,14 @@ impl LuaInferCache {
         entry: CacheEntry<LuaType>,
     ) {
         let cache_key = VarRefCacheKey::from(var_ref_id);
-        self.index_ref_origin_type_cache
-            .insert(cache_key, (entry, derivation::scope_mark()));
+        let key = Self::flow_context_key(&cache_key);
+        if self
+            .index_ref_origin_type_cache
+            .insert(cache_key, (entry, derivation::scope_mark()))
+            .is_none()
+        {
+            self.keyed.push(key);
+        }
     }
 
     pub fn replace_index_ref_origin_type_cache(
@@ -999,8 +1073,14 @@ impl LuaInferCache {
         entry: CacheEntry<LuaType>,
     ) -> Option<(CacheEntry<LuaType>, derivation::ScopeMark)> {
         let cache_key = VarRefCacheKey::from(var_ref_id);
-        self.index_ref_origin_type_cache
-            .insert(cache_key, (entry, derivation::scope_mark()))
+        let key = Self::flow_context_key(&cache_key);
+        let previous = self
+            .index_ref_origin_type_cache
+            .insert(cache_key, (entry, derivation::scope_mark()));
+        if previous.is_none() {
+            self.keyed.push(key);
+        }
+        previous
     }
 
     pub fn restore_index_ref_origin_type_cache(
@@ -1011,8 +1091,12 @@ impl LuaInferCache {
         let cache_key = VarRefCacheKey::from(var_ref_id);
         if let Some(previous) = previous {
             self.index_ref_origin_type_cache.insert(cache_key, previous);
-        } else {
-            self.index_ref_origin_type_cache.remove(&cache_key);
+        } else if self
+            .index_ref_origin_type_cache
+            .remove(&cache_key)
+            .is_some()
+        {
+            self.unkey(std::iter::once(Self::flow_context_key(&cache_key)));
         }
     }
 

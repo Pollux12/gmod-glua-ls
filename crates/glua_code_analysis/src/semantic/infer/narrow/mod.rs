@@ -265,20 +265,13 @@ pub fn infer_expr_narrow_type_with_self_base(
     };
 
     let previous_flow_cache = cache.key_flow_cache(&var_ref_id, &self_base);
-    let previous_seed = cache
-        .self_base_seed
-        .replace((var_ref_id.clone(), self_base.clone()));
-    let previous_mark = std::mem::replace(
-        &mut cache.self_base_seed_mark,
-        crate::db_index::derivation::scope_mark(),
-    );
+    let previous_seed = cache.seed_self(var_ref_id.clone(), self_base.clone());
     // The seed changes what every flow node of this reference holds: walks
     // made without it, or with another region's seed, answer for a different
     // origin, so the reference walks its entries for this seed.
     let result = infer_expr_narrow_type(db, cache, expr, var_ref_id.clone());
     cache.unkey_flow_cache(&var_ref_id, self_base, previous_flow_cache);
-    cache.self_base_seed = previous_seed;
-    cache.self_base_seed_mark = previous_mark;
+    cache.restore_self_seed(previous_seed);
     result
 }
 
@@ -292,19 +285,16 @@ pub fn get_var_ref_type(
     // (position-insensitive) receiver decl/member cache. See
     // `infer_expr_narrow_type_with_self_base`.
     if var_ref_id.is_self_ref() {
-        cache.consult_self_seed();
-    }
-    if var_ref_id.is_self_ref()
-        && let Some((seed_ref, seed_type)) = cache.self_base_seed.as_ref()
-        && seed_ref == var_ref_id
-    {
-        crate::db_index::derivation::consult_absorbed(
-            LuaInferCache::flow_context_key(&crate::semantic::cache::VarRefCacheKey::from(
-                var_ref_id,
-            )),
-            cache.self_base_seed_mark,
-        );
-        return Ok(seed_type.clone());
+        let key = LuaInferCache::flow_context_key(&crate::semantic::cache::VarRefCacheKey::from(
+            var_ref_id,
+        ));
+        if let Some((seed_ref, seed_type)) = cache.self_base_seed.as_ref()
+            && seed_ref == var_ref_id
+        {
+            crate::db_index::derivation::consult_absorbed(key, cache.self_base_seed_mark);
+            return Ok(seed_type.clone());
+        }
+        crate::db_index::derivation::consult_unkeyed(key);
     }
 
     if let Some(decl_id) = var_ref_id.get_decl_id_ref() {
@@ -314,19 +304,20 @@ pub fn get_var_ref_type(
             .ok_or(InferFailReason::None)?;
 
         if decl.is_implicit_self() {
-            cache.consult_self_seed();
-        }
-        if decl.is_implicit_self()
-            && let Some((seed_ref, seed_type)) = cache.self_base_seed.as_ref()
-            && seed_ref.get_decl_id_ref() == Some(decl.get_id())
-        {
-            crate::db_index::derivation::consult_absorbed(
-                LuaInferCache::flow_context_key(&crate::semantic::cache::VarRefCacheKey::from(
-                    seed_ref,
-                )),
-                cache.self_base_seed_mark,
-            );
-            return Ok(seed_type.clone());
+            if let Some((seed_ref, seed_type)) = cache.self_base_seed.as_ref()
+                && seed_ref.get_decl_id_ref() == Some(decl.get_id())
+            {
+                crate::db_index::derivation::consult_absorbed(
+                    LuaInferCache::flow_context_key(&crate::semantic::cache::VarRefCacheKey::from(
+                        seed_ref,
+                    )),
+                    cache.self_base_seed_mark,
+                );
+                return Ok(seed_type.clone());
+            }
+            crate::db_index::derivation::consult_unkeyed(LuaInferCache::self_decl_context_key(
+                decl.get_id(),
+            ));
         }
 
         // Parameter declarations carry their canonical type in signature metadata.
