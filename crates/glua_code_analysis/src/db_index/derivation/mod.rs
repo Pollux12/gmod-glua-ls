@@ -133,13 +133,17 @@ pub enum StageRule {
 impl StageRule {
     pub const ALL: [Self; 2] = [Self::SkipUntypedWriters, Self::FloorUnsettled];
 
+    /// The first stage the rule holds at.
+    pub fn holds_from(self) -> AnalysisStage {
+        match self {
+            Self::SkipUntypedWriters => AnalysisStage::SkipUntyped,
+            Self::FloorUnsettled => AnalysisStage::Closed,
+        }
+    }
+
     /// Whether the rule holds at `stage`.
     pub fn holds_at(self, stage: AnalysisStage) -> bool {
-        stage
-            >= match self {
-                Self::SkipUntypedWriters => AnalysisStage::SkipUntyped,
-                Self::FloorUnsettled => AnalysisStage::Closed,
-            }
+        stage >= self.holds_from()
     }
 }
 
@@ -839,6 +843,16 @@ impl DerivationKind {
             | Self::Call
             | Self::Setmetatable => Self::LocalStat as u8,
             kind => kind as u8,
+        }
+    }
+
+    /// The first stage at which a derivation of this kind produces anything.
+    /// Before it, evaluating one would only take back what it produced last.
+    pub fn first_stage(self) -> AnalysisStage {
+        match self {
+            // Locals are guessed only once unsettled reads floor.
+            Self::LocalFallbacks => StageRule::FloorUnsettled.holds_from(),
+            _ => AnalysisStage::Open,
         }
     }
 }

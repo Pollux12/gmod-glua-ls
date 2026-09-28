@@ -233,6 +233,9 @@ pub(crate) struct Engine {
     /// Work in other files queued while the focus settles, with why it was
     /// queued.
     waiting: BTreeMap<DerivationId, Reason>,
+    /// Work queued before the stage its kind first produces at, held until
+    /// the run reaches that stage.
+    held: BTreeMap<DerivationId, Reason>,
     /// The files whose derivations this engine evaluated.
     evaluated: FxHashSet<crate::FileId>,
     /// Where the edits being re-analysed moved positions: a read of a fact
@@ -371,6 +374,7 @@ impl Engine {
     fn unqueue(&mut self, id: DerivationId) {
         self.worklist.remove(id);
         self.next_round.remove(id);
+        self.held.remove(&id);
     }
 
     pub(crate) fn stats(&self) -> &EngineStats {
@@ -481,6 +485,7 @@ impl Engine {
         self.worklist.take_where(replaced);
         self.next_round.take_where(replaced);
         self.waiting.retain(|id, _| !replaced(*id));
+        self.held.retain(|id, _| !replaced(*id));
         self.stale_sources
             .retain(|file_id| !file_ids.contains(file_id));
     }
@@ -495,6 +500,7 @@ impl Engine {
                 .files()
                 .chain(self.next_round.files())
                 .chain(self.waiting.keys().map(|id| id.file_id))
+                .chain(self.held.keys().map(|id| id.file_id))
                 .any(|queued| queued == file_id)
     }
 
@@ -573,6 +579,11 @@ impl Engine {
                 self.stats.round_started(self.worklist.order.len());
                 continue;
             };
+            if db.analysis_stage() < id.kind.first_stage() {
+                let held = self.held.entry(id).or_insert(reason);
+                *held = (*held).min(reason);
+                continue;
+            }
             self.cursor = Some(id);
             let stale = crate::profile::phase("engine: stale check", || {
                 self.needs_evaluation(db, id, reason)
@@ -681,7 +692,8 @@ impl Engine {
     }
 
     /// At quiescence, moves the run to its next stage and queues every
-    /// derivation that waited on a rule the stage starts to hold. Returns
+    /// derivation that waited on a rule the stage starts to hold, and the work
+    /// held until the stage its kind first produces at. Returns
     /// whether it queued any; `false` once the run is closed.
     fn advance_stage(&mut self, db: &mut DbIndex) -> bool {
         while let Some(stage) = db.analysis_stage().next() {
@@ -692,6 +704,14 @@ impl Engine {
                 waited.extend(db.reader_graph().stale_readers(key, |seen| seen == current));
             }
             let mut queued = 0;
+            let reached = self
+                .held
+                .extract_if(.., |id, _| id.kind.first_stage() <= stage)
+                .collect::<Vec<_>>();
+            for (id, reason) in reached {
+                self.worklist.insert(id, reason);
+                queued += 1;
+            }
             for reader in waited {
                 if crate::profile::tracing_evaluations() {
                     self.trace(db, reader, "stage barrier queues", &[]);

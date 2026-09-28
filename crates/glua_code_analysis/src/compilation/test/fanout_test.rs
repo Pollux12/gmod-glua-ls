@@ -310,6 +310,44 @@ end
         );
     }
 
+    /// Deleting the library a local's initializer calls re-runs the file's
+    /// guessed locals, and a guess that settles as it was reaches no reader:
+    /// the guesses are made once the run closes, not taken back before it.
+    #[test]
+    fn deleting_a_library_leaves_the_readers_of_an_unchanged_guess_alone() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let files = ws.def_files(vec![
+            (
+                "gamemodes/cityrp/gamemode/core/sh_classes.lua",
+                "---@class Vector\n---@class Entity\n---@class Player: Entity\n---@field GetShootPos fun(self: Player): Vector\n",
+            ),
+            (
+                "gamemodes/cityrp/gamemode/core/sh_data.lua",
+                "cityrp = cityrp or {}\ncityrp.data = {}\nfunction cityrp.data.Get(key)\n    return {}\nend\n",
+            ),
+            (
+                "gamemodes/cityrp/gamemode/core/sh_plugin.lua",
+                "local unloaded = cityrp.data.Get(\"unloaded\")\nunloaded.first = true\n\n---@type Entity\nlocal owner\nlocal position = owner:GetShootPos()\nPluginOwner = owner\n",
+            ),
+            (
+                "gamemodes/cityrp/gamemode/core/sv_reader.lua",
+                "local owner = PluginOwner\n",
+            ),
+        ]);
+        let data = ws
+            .virtual_url_generator
+            .new_uri("gamemodes/cityrp/gamemode/core/sh_data.lua");
+
+        ws.analysis.remove_file_by_uri(&data);
+
+        let evaluated = ws.analysis.compilation.last_evaluated_files();
+        assert!(evaluated.contains(&files[2]), "{evaluated:?}");
+        assert!(!evaluated.contains(&files[3]), "{evaluated:?}");
+    }
+
     /// A helper's summary keeps the parameters its message and argument
     /// templates read, so a parameter nothing reads leaves its callers' network
     /// flows standing.
