@@ -845,4 +845,22 @@ mod tests {
 
         assert_eq!(reads.len(), 4);
     }
+
+    /// Reads noted by owner identity and name stay apart for distinct keys:
+    /// one owner's two names and two owners' one name are two reads each,
+    /// while a name read twice is one.
+    #[test]
+    fn reads_noted_by_owner_and_name_keep_distinct_keys_apart() {
+        use crate::{GlobalId, LuaMemberKey, LuaMemberOwner};
+        let owner = |path: &str| LuaMemberOwner::GlobalPath(GlobalId::new(path));
+        let name = |name: &str| LuaMemberKey::Name(name.into());
+        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        derivation::note_member_slot_read(&owner("named_test.a"), &name("x"));
+        derivation::note_member_slot_read(&owner("named_test.a"), &name("y"));
+        derivation::note_member_slot_read(&owner("named_test.b"), &name("x"));
+        derivation::note_member_slot_read(&owner("named_test.a"), &name("x"));
+        let (_, reads, _) = derivation::end().into_parts(|_| 0);
+
+        assert_eq!(reads.len(), 3);
+    }
 }

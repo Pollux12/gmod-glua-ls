@@ -130,7 +130,7 @@ fn note_owner_presence_read(owner: &LuaMemberOwner) {
 }
 
 fn note_slot_read(owner: &LuaMemberOwner, key: &LuaMemberKey) {
-    derivation::note_read(|| FactKey::MemberSlot(owner.clone(), key.clone()));
+    derivation::note_member_slot_read(owner, key);
 }
 
 fn note_owner_map_read(owner: &LuaMemberOwner) {

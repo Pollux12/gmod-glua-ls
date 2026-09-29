@@ -986,6 +986,9 @@ pub struct Evaluation {
     /// Slots of the viewed graph whose keys are in `reads` already; see
     /// [`view_graph`].
     viewed: FxHashSet<KeyIdx>,
+    /// Keys already read that an owner identity and a name name, see
+    /// [`note_named_read`].
+    named_reads: hashbrown::HashTable<NamedRead>,
     /// Cheap identities of keys already in `reads`, see [`note_read_by`].
     read_identities: rustc_hash::FxHashMap<(u8, u128), KeyIdx>,
     outputs: FxHashSet<HashedKey>,
@@ -1217,6 +1220,7 @@ pub fn begin(id: DerivationId) {
         reads: FxHashSet::default(),
         viewed: FxHashSet::default(),
         read_identities: rustc_hash::FxHashMap::default(),
+        named_reads: hashbrown::HashTable::new(),
         outputs: FxHashSet::default(),
         moved: FxHashSet::default(),
         staged: rustc_hash::FxHashMap::default(),
@@ -1242,6 +1246,7 @@ pub fn resume(mut evaluation: Evaluation) {
     evaluation.stamp = next_stamp();
     // Identities noted without this thread's key table name no slot in it.
     evaluation.read_identities.clear();
+    evaluation.named_reads.clear();
     start(evaluation);
 }
 
@@ -1362,6 +1367,115 @@ fn note_read_by(identity: (u8, u128), key: impl FnOnce() -> FactKey) {
                 }
             }
         }
+    });
+}
+
+/// A read [`note_named_read`] recorded: the owner identity and name that
+/// name the key, and its slot ([`KeyIdx::MAX`]: none, no table lent).
+#[derive(Debug)]
+struct NamedRead {
+    tag: u8,
+    owner: u128,
+    name: Option<SmolStr>,
+    slot: KeyIdx,
+}
+
+fn named_read_hash(tag: u8, owner: u128, name: Option<&str>) -> u64 {
+    use std::hash::BuildHasher;
+    rustc_hash::FxBuildHasher.hash_one((tag, owner, name))
+}
+
+/// Records a read of the key `key` builds, which the owner identity `owner`
+/// and `name` name exactly under `tag`: a repeat within the evaluation is one
+/// probe of a small table, without building the key or its name.
+fn note_named_read(tag: u8, owner: u128, name: Option<&str>, key: impl FnOnce() -> FactKey) {
+    if UNTRACKED.with(|depth| depth.get() > 0) {
+        return;
+    }
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        let Some(evaluation) = current.as_mut() else {
+            return;
+        };
+        NOTED_READS.with(|count| count.set(count.get() + 1));
+        let hash = named_read_hash(tag, owner, name);
+        let found = evaluation
+            .named_reads
+            .find(hash, |read| {
+                read.tag == tag && read.owner == owner && read.name.as_deref() == name
+            })
+            .map(|read| read.slot);
+        match found {
+            Some(slot) => KEYS.with(|keys| {
+                if let Some(table) = keys.borrow_mut().as_mut() {
+                    evaluation.log_slot(table, slot);
+                    if table.windowed(slot) {
+                        frames::taint_evaluation(evaluation);
+                    }
+                }
+            }),
+            None => {
+                let slot = record_read(evaluation, HashedKey::new(key())).unwrap_or(KeyIdx::MAX);
+                evaluation.named_reads.insert_unique(
+                    hash,
+                    NamedRead {
+                        tag,
+                        owner,
+                        name: name.map(SmolStr::new),
+                        slot,
+                    },
+                    |read| named_read_hash(read.tag, read.owner, read.name.as_deref()),
+                );
+            }
+        }
+    });
+}
+
+/// A member or dynamic-field owner's identity for [`note_named_read`]:
+/// interned ids by address, table literals by position, each variant tagged.
+fn owner_identity(kind: u128, address_or_site: u128) -> u128 {
+    kind << 120 | address_or_site
+}
+
+fn site_identity(site: &InFiled<TextRange>) -> u128 {
+    u128::from(site.file_id.id) << 64
+        | u128::from(u32::from(site.value.start())) << 32
+        | u128::from(u32::from(site.value.end()))
+}
+
+/// Records a read of the members of `owner` under `key`.
+pub fn note_member_slot_read(owner: &LuaMemberOwner, key: &LuaMemberKey) {
+    let name = match key {
+        LuaMemberKey::Name(name) => Some(name.as_str()),
+        LuaMemberKey::None => None,
+        LuaMemberKey::Integer(_) | LuaMemberKey::ExprType(_) => {
+            note_read(|| FactKey::MemberSlot(owner.clone(), key.clone()));
+            return;
+        }
+    };
+    let owner_id = match owner {
+        LuaMemberOwner::Type(id) => owner_identity(1, u128::from(id.interned_address())),
+        LuaMemberOwner::GlobalPath(path) => owner_identity(2, u128::from(path.interned_address())),
+        LuaMemberOwner::Element(site) => owner_identity(3, site_identity(site)),
+        LuaMemberOwner::LocalUnresolve => owner_identity(4, 0),
+    };
+    note_named_read(u8::MAX - 17, owner_id, name, || {
+        FactKey::MemberSlot(owner.clone(), key.clone())
+    });
+}
+
+/// Records a read of `owner`'s dynamic field `name` (`None`: its named
+/// fields as a whole).
+pub fn note_dynamic_field_read(owner: &DynamicFieldOwner, name: Option<&str>) {
+    let owner_id = match owner {
+        DynamicFieldOwner::Type(id) => owner_identity(1, u128::from(id.interned_address())),
+        DynamicFieldOwner::GlobalPath(path) => {
+            owner_identity(2, u128::from(path.interned_address()))
+        }
+        DynamicFieldOwner::Table(site) => owner_identity(3, site_identity(site)),
+    };
+    note_named_read(u8::MAX - 18, owner_id, name, || {
+        FactKey::DynamicField(owner.clone(), name.map(SmolStr::new))
     });
 }
 

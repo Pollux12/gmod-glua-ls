@@ -808,7 +808,7 @@ impl DynamicFieldIndex {
     }
 
     pub fn has_field(&self, owner: &DynamicFieldOwner, field_name: &str) -> bool {
-        derivation::note_read(|| FactKey::DynamicField(owner.clone(), Some(field_name.into())));
+        derivation::note_dynamic_field_read(owner, Some(field_name));
         self.owner_fields
             .get(owner)
             .is_some_and(|fields| fields.contains_key(field_name))
@@ -820,7 +820,7 @@ impl DynamicFieldIndex {
         field_name: &str,
         file_id: FileId,
     ) -> bool {
-        derivation::note_read(|| FactKey::DynamicField(owner.clone(), Some(field_name.into())));
+        derivation::note_dynamic_field_read(owner, Some(field_name));
         self.owner_fields
             .get(owner)
             .and_then(|fields| fields.get(field_name))
@@ -831,14 +831,14 @@ impl DynamicFieldIndex {
         &self,
         owner: &DynamicFieldOwner,
     ) -> Option<&HashMap<SmolStr, HashSet<FileId>>> {
-        derivation::note_read(|| FactKey::DynamicField(owner.clone(), None));
+        derivation::note_dynamic_field_read(owner, None);
         self.owner_fields.get(owner)
     }
 
     /// Whether `owner` has a direct definition of `field_name`: read as that
     /// field alone, not the owner's whole field set.
     pub fn has_direct_field(&self, owner: &DynamicFieldOwner, field_name: &str) -> bool {
-        derivation::note_read(|| FactKey::DynamicField(owner.clone(), Some(field_name.into())));
+        derivation::note_dynamic_field_read(owner, Some(field_name));
         self.direct_field_definitions
             .get(owner)
             .is_some_and(|fields| fields.contains_key(field_name))
@@ -848,7 +848,7 @@ impl DynamicFieldIndex {
         &self,
         owner: &DynamicFieldOwner,
     ) -> Option<&HashMap<SmolStr, Vec<InFiled<TextRange>>>> {
-        derivation::note_read(|| FactKey::DynamicField(owner.clone(), None));
+        derivation::note_dynamic_field_read(owner, None);
         self.direct_field_definitions.get(owner)
     }
 
@@ -919,7 +919,7 @@ impl DynamicFieldIndex {
     }
 
     pub fn get_fields_in_file(&self, owner: &DynamicFieldOwner, file_id: FileId) -> Vec<&SmolStr> {
-        derivation::note_read(|| FactKey::DynamicField(owner.clone(), None));
+        derivation::note_dynamic_field_read(owner, None);
         self.owner_fields
             .get(owner)
             .map(|fields| {
@@ -937,7 +937,7 @@ impl DynamicFieldIndex {
         owner: &DynamicFieldOwner,
         field_name: &str,
     ) -> &[InFiled<TextRange>] {
-        derivation::note_read(|| FactKey::DynamicField(owner.clone(), Some(field_name.into())));
+        derivation::note_dynamic_field_read(owner, Some(field_name));
         self.field_definitions
             .get(owner)
             .and_then(|fields| fields.get(field_name))
