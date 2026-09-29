@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="320" height="320" viewBox="-20 -40 320 320" fill="none">
     <!-- Main background circle -->
     <circle cx="128" cy="128" r="128" fill="#1890D5" stroke="white" stroke-width="12" />
-    
+
     <!-- Small top-right dot mathematically positioned to touch borders -->
     <circle cx="252" cy="4" r="36" fill="#1890D5" stroke="white" stroke-width="12" />
 
