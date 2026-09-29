@@ -305,7 +305,10 @@ impl LuaCompilation {
         let viewed = derivation::view_graph(self.db.reader_graph_shared());
         let result = diagnose();
         drop(viewed);
-        let (_, reads, _) = derivation::end().into_parts(|key| self.db.fact_fingerprint(key));
+        // Fingerprints the engine took stand while nothing writes.
+        let graph = self.db.reader_graph();
+        let (_, reads, _) = derivation::end()
+            .into_parts(|key| graph.current_fingerprint(key, |key| self.db.fact_fingerprint(key)));
         let reads = reads
             .into_iter()
             .map(|(key, seen)| (key.into_key(), seen))
