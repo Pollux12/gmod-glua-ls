@@ -37,7 +37,9 @@
 //!   aid).
 //! - `schedule`: cold build taking files in reverse order within each rank,
 //!   compared with the base; `schedule:SEED` takes them in an order fixed by
-//!   the seed. The settled result must not depend on the order files run in.
+//!   the seed; `schedule:deferred` takes them in order but makes every reader
+//!   an evaluation queues wait for the next round. The settled result must
+//!   not depend on the order derivations run in.
 //! - `split:N`: cold build in N batches, compared with the base.
 //! - `touch`, `shift`, `delete`, `recreate`, `rename`: sweeps through
 //!   watched-file events (delete, recreate, rename) or document edits (touch
@@ -2376,6 +2378,7 @@ enum Order {
     Canonical,
     Reversed,
     Shuffled(u64),
+    Deferred,
 }
 
 impl Order {
@@ -2384,6 +2387,7 @@ impl Order {
             Self::Canonical => Schedule::Canonical,
             Self::Reversed => Schedule::Reversed,
             Self::Shuffled(seed) => Schedule::Shuffled(seed),
+            Self::Deferred => Schedule::Deferred,
         }
     }
 }
@@ -2413,6 +2417,7 @@ impl ColdKey {
             (Order::Canonical, batches) => format!("split:{batches}"),
             (Order::Reversed, _) => "schedule".into(),
             (Order::Shuffled(seed), _) => format!("schedule:{seed}"),
+            (Order::Deferred, _) => "schedule:deferred".into(),
         }
     }
 }
@@ -3184,6 +3189,7 @@ fn run() {
         }
         match stage {
             "schedule" => Some((1, Order::Reversed)),
+            "schedule:deferred" => Some((1, Order::Deferred)),
             _ => stage
                 .strip_prefix("schedule:")
                 .and_then(|seed| seed.parse::<u64>().ok())

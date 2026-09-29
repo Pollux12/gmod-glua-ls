@@ -67,12 +67,15 @@ pub enum Schedule {
     Reversed,
     /// Files in an order fixed by the seed.
     Shuffled(u64),
+    /// Files in file-id order, and a reader queued by an evaluation waits for
+    /// the next round instead of running again in this one.
+    Deferred,
 }
 
 impl Schedule {
     fn file_key(self, file_id: crate::FileId) -> u64 {
         match self {
-            Self::Canonical => u64::from(file_id.id),
+            Self::Canonical | Self::Deferred => u64::from(file_id.id),
             Self::Reversed => u64::MAX - u64::from(file_id.id),
             Self::Shuffled(seed) => {
                 use std::hash::BuildHasher;
@@ -364,10 +367,9 @@ impl Engine {
     /// Queues `id` in this round unless it ranks before the derivation being
     /// evaluated, else in the next. A changed entry stays changed.
     fn queue(&mut self, id: DerivationId, reason: Reason) {
-        if self
-            .cursor
-            .is_some_and(|cursor| id.kind.rank() < cursor.kind.rank())
-        {
+        if self.cursor.is_some_and(|cursor| {
+            self.worklist.schedule == Schedule::Deferred || id.kind.rank() < cursor.kind.rank()
+        }) {
             self.next_round.insert(id, reason);
         } else {
             self.worklist.insert(id, reason);
