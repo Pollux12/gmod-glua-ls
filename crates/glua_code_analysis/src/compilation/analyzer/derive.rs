@@ -305,8 +305,18 @@ impl Recipes {
             }
             DerivationKind::LocalFallbacks => {
                 if guesses_locals(db) {
-                    local_inference::stabilize_unguarded_children(db, context);
+                    // What the split evaluation does, on the cache its scan
+                    // infers with: which way the engine runs the pass must not
+                    // change what it reads. The file's memo waits aside.
+                    let memo = context.infer_manager.take_file(id.file_id);
+                    if let Some(scan) = local_inference::scan_unguarded_children(db, id.file_id) {
+                        local_inference::publish_unguarded_children(db, context, vec![scan]);
+                    }
                     local_inference::stabilize_unknown_locals(db, context);
+                    context.infer_manager.take_file(id.file_id);
+                    if let Some(memo) = memo {
+                        context.infer_manager.restore_file(id.file_id, memo);
+                    }
                 }
             }
             DerivationKind::Network => gmod::evaluate_network(db, context),

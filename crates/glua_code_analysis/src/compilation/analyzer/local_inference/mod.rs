@@ -424,46 +424,6 @@ pub(crate) struct UnguardedChildFileResult {
     profile: Option<UnguardedChildProfile>,
 }
 
-pub(super) fn stabilize_unguarded_children(
-    db: &mut crate::DbIndex,
-    context: &mut AnalyzeContext,
-) -> Vec<InFiled<glua_parser::LuaSyntaxId>> {
-    let _profile =
-        crate::profile::Profile::cond_new("unguarded child inference", context.tree_list.len() > 1);
-    if !db.get_emmyrc().gmod.enabled {
-        return Vec::new();
-    }
-    let mut seen_file_ids = FxHashSet::default();
-    let file_ids = context
-        .tree_list
-        .iter()
-        .map(|tree| tree.file_id)
-        .filter(|file_id| seen_file_ids.insert(*file_id))
-        .collect::<Vec<_>>();
-    let cache_options = crate::CacheOptions {
-        analysis_phase: context.infer_manager.current_phase(),
-        dynamic_fields_visible: context.infer_manager.dynamic_fields_visible(),
-        call_site_params_visible: context.infer_manager.call_site_params_visible(),
-    };
-    let results = file_ids
-        .into_iter()
-        .map(|file_id| {
-            let infer_cache = context
-                .infer_manager
-                .take_file(file_id)
-                .unwrap_or_else(|| crate::LuaInferCache::new(file_id, cache_options.clone()));
-            collect_unguarded_child_file(
-                db,
-                file_id,
-                infer_cache,
-                context.workspace_id,
-                crate::profile::phase_enabled(),
-            )
-        })
-        .collect::<Vec<_>>();
-    publish_unguarded_children(db, context, results)
-}
-
 /// One file's unguarded-child evidence, read off the index under the view a
 /// file derivation infers with; [`publish_unguarded_children`] settles it.
 pub(crate) fn scan_unguarded_children(

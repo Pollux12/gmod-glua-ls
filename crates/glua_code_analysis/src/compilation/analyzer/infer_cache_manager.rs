@@ -54,14 +54,6 @@ impl InferCacheManager {
         }
     }
 
-    pub fn current_phase(&self) -> LuaAnalysisPhase {
-        self.current_phase
-    }
-
-    pub fn dynamic_fields_visible(&self) -> bool {
-        self.dynamic_fields_visible
-    }
-
     /// Called once the call-site parameter index has been populated for this batch.
     /// Until then early syntactic and body passes must not read it.
     pub fn set_call_site_params_visible(&mut self) {
@@ -70,10 +62,6 @@ impl InferCacheManager {
             infer_cache.config_mut().call_site_params_visible = true;
             infer_cache.clear();
         }
-    }
-
-    pub fn call_site_params_visible(&self) -> bool {
-        self.call_site_params_visible
     }
 
     pub fn set_force(&mut self) {
@@ -118,9 +106,9 @@ mod tests {
     #[test]
     fn dynamic_field_visibility_defaults_are_opposite() {
         assert!(crate::CacheOptions::default().dynamic_fields_visible);
-        assert!(!InferCacheManager::new().dynamic_fields_visible());
+        assert!(!InferCacheManager::new().dynamic_fields_visible);
         assert!(crate::CacheOptions::default().call_site_params_visible);
-        assert!(!InferCacheManager::new().call_site_params_visible());
+        assert!(!InferCacheManager::new().call_site_params_visible);
     }
 
     #[test]
