@@ -1634,6 +1634,13 @@ fn branch_has_relevant_special_call_effects(
     let Some(antecedents) = tree.get_multi_antecedents(*idx) else {
         return false;
     };
+    // Without a special-call effect in the file, no region of it holds one.
+    if !db
+        .get_flow_index()
+        .has_any_special_call_effect(&cache.get_file_id())
+    {
+        return false;
+    }
 
     // One key per query: the walk below re-enters this for every branch label
     // on the path, and each re-entry used to re-walk the whole region.
@@ -3306,6 +3313,12 @@ fn antecedent_has_relevant_special_call_effect_before_node(
     flow_node: &FlowNode,
     var_ref_id: &VarRefId,
 ) -> bool {
+    if !db
+        .get_flow_index()
+        .has_any_special_call_effect(&cache.get_file_id())
+    {
+        return false;
+    }
     let var_key = VarRefCacheKey::from(var_ref_id);
     let mut visited = HashSet::default();
     match flow_node.antecedent {

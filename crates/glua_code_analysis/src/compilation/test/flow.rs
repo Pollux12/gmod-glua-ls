@@ -8922,4 +8922,40 @@ _2 = a[1]
             LuaType::StringConst(smol_str::SmolStr::new("set").into())
         );
     }
+
+    /// A file without special-call effects passes a branch that cannot
+    /// narrow a variable without walking the branch for one.
+    #[gtest]
+    fn a_branch_in_a_file_without_special_calls_is_passed_without_a_walk() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local x = 1
+            local y = 0
+            if y > 0 then
+                y = 2
+            else
+                y = 3
+            end
+            print(x)
+            "#,
+        );
+        let db = ws.analysis.compilation.get_db();
+        let chunk = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("the file is parsed")
+            .get_chunk_node();
+        let x = chunk
+            .descendants::<LuaNameExpr>()
+            .filter(|name| name.get_name_text().as_deref() == Some("x"))
+            .last()
+            .expect("the read of x");
+        let mut cache = crate::LuaInferCache::new(file_id, Default::default());
+        let typ = crate::semantic::infer_expr(db, &mut cache, glua_parser::LuaExpr::NameExpr(x))
+            .expect("x infers");
+
+        expect_that!(ws.humanize_type(typ), eq("1"));
+        verify_that!(cache.branch_special_call_effect_cache.is_empty(), eq(true))
+    }
 }
