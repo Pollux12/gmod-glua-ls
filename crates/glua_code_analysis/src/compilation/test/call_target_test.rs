@@ -134,4 +134,33 @@ vgui.Register(\"MyMenu\", PANEL, \"Panel\")
 
         assert_eq!((inferred, parent_calls), (0, 1));
     }
+
+    /// The call-site parameter pass infers a callee file's callback
+    /// arguments once for every call into it, not once per call.
+    #[test]
+    fn call_site_params_infer_a_callee_files_callback_arguments_once() {
+        let mut ws = gmod_workspace();
+        ws.def_file(
+            "addons/probe/lua/autorun/sh_runner.lua",
+            "function RunWith(cb)
+    cb({ ready = true })
+end
+",
+        );
+        let (_, counts) = counted(|| {
+            ws.def_file(
+                "addons/probe/lua/autorun/sh_caller.lua",
+                "RunWith(function(a) end)
+RunWith(function(b) end)
+",
+            )
+        });
+        let (computed, distinct) = counts
+            .get(&(Work::Infer, Some(DerivationKind::CallSiteParams)))
+            .copied()
+            .unwrap_or_default();
+
+        assert!(distinct > 0, "the pass inferred no callback argument");
+        assert_eq!(computed, distinct as u64);
+    }
 }

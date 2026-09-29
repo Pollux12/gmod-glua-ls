@@ -55,6 +55,9 @@ struct FileScope {
     exact_receiver_candidates: HashMap<LuaMemberKey, bool>,
     authoritative_receivers: HashMap<LuaSignatureId, bool>,
     closures: HashMap<LuaSignatureId, Option<LuaClosureExpr>>,
+    /// An inference cache per callee file whose callback arguments the
+    /// file's calls infer.
+    callee_caches: HashMap<FileId, LuaInferCache>,
     /// What the file's calls target.
     targets: Arc<FileCallTargets>,
 }
@@ -70,6 +73,7 @@ impl FileScope {
             ),
             authoritative_receivers: HashMap::default(),
             closures: HashMap::default(),
+            callee_caches: HashMap::default(),
             targets: super::call_target::file_call_targets(db, file_id),
         }
     }
@@ -826,7 +830,10 @@ fn collect_direct_callback_param_types(
     else {
         return;
     };
-    let mut source_cache = LuaInferCache::new(source_file_id, caller_cache.get_config().clone());
+    let mut source_cache = scope
+        .callee_caches
+        .remove(&source_file_id)
+        .unwrap_or_else(|| LuaInferCache::new(source_file_id, caller_cache.get_config().clone()));
 
     for (arg_idx, arg) in call_args.iter().enumerate() {
         let LuaExpr::ClosureExpr(target_closure) = arg else {
@@ -921,6 +928,7 @@ fn collect_direct_callback_param_types(
             }
         }
     }
+    scope.callee_caches.insert(source_file_id, source_cache);
 }
 
 fn snapshot_callback_table_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
