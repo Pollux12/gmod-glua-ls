@@ -905,7 +905,7 @@ impl Engine {
         self.evaluated
             .extend(batch.iter().map(|member| member.file_id));
         let started = self.stats.profiling().then(std::time::Instant::now);
-        let mut touched = self.reset_outputs(db, &batch);
+        let mut touched = self.reset_outputs(db, &batch, &FxHashSet::default(), None);
         let computed = {
             let db: &DbIndex = db;
             let files = batch
@@ -929,11 +929,11 @@ impl Engine {
                 .map(|(member, (evaluation, computed))| {
                     derivation::resume(evaluation);
                     recipe.apply(db, *member, computed);
-                    derivation::end()
+                    (derivation::end(), None)
                 })
                 .collect()
         });
-        self.record(db, evaluations, &mut touched, || {
+        self.record(db, evaluations, &mut touched, &FxHashSet::default(), || {
             format!("evaluating {batch:?}")
         });
         if let Some(started) = started {
@@ -961,7 +961,16 @@ impl Engine {
 
     /// Resets the primary outputs of `members` to the source layer. Returns
     /// every key that moved or may move: their previous outputs.
-    fn reset_outputs(&self, db: &mut DbIndex, members: &[DerivationId]) -> FxHashSet<HashedKey> {
+    /// Resets `members`' primary outputs but `deferred`, and takes the
+    /// fingerprints every output had before. Returns their outputs and what
+    /// the reset wrote, which `written` also takes.
+    fn reset_outputs(
+        &self,
+        db: &mut DbIndex,
+        members: &[DerivationId],
+        deferred: &FxHashSet<HashedKey>,
+        written: Option<&mut FxHashSet<HashedKey>>,
+    ) -> FxHashSet<HashedKey> {
         let mut touched = FxHashSet::default();
         for member in members {
             touched.extend(db.reader_graph().outputs_of(*member).cloned());
@@ -971,10 +980,16 @@ impl Engine {
             .map(|key| (key.clone(), self.fingerprint(db, key)))
             .collect();
         let reset = derivation::capture_writes(|| {
-            for key in touched.iter().filter(|key| key.is_primary()) {
+            for key in touched
+                .iter()
+                .filter(|key| key.is_primary() && !deferred.contains(*key))
+            {
                 db.reset_fact(key);
             }
         });
+        if let Some(written) = written {
+            written.extend(reset.iter().cloned());
+        }
         touched.extend(reset);
         self.verify_fingerprints(db, &touched, || format!("resetting {members:?}"));
         touched
@@ -984,12 +999,12 @@ impl Engine {
     /// `touched` moved before the table was lent: memos that read them are
     /// stale from here on, except that a reset output which comes back
     /// unchanged reads as it did before.
-    fn with_lent_keys(
+    fn with_lent_keys<T>(
         &self,
         db: &mut DbIndex,
         touched: &FxHashSet<HashedKey>,
-        f: impl FnOnce(&mut DbIndex) -> Vec<derivation::Evaluation>,
-    ) -> Vec<derivation::Evaluation> {
+        f: impl FnOnce(&mut DbIndex) -> T,
+    ) -> T {
         derivation::lend_keys(db.reader_graph_mut().lend_keys());
         let lent = scopeguard_lent_keys();
         let recomputing = std::mem::take(&mut *self.recomputing.borrow_mut());
@@ -1010,28 +1025,91 @@ impl Engine {
 
     /// Resets the group's primary outputs and re-runs it. Returns every key the
     /// group touched: its previous outputs and its new ones.
+    ///
+    /// A key two members produce is reset before any of them runs, and read
+    /// inside the group as the group leaves it: the group re-runs as a unit,
+    /// so what a member read of it is internal to the group, not a stale
+    /// input. A key one later member produces alone is reset only when that
+    /// member runs, so an earlier member reads it as that member last left it
+    /// and is recorded as having seen that: members settle as they would one
+    /// by one, whatever grouped them.
     fn evaluate_group(
         &self,
         db: &mut DbIndex,
         group: &[DerivationId],
         recipe: &dyn Recipe,
     ) -> FxHashSet<HashedKey> {
-        let mut touched = self.reset_outputs(db, group);
-        // Fingerprints are taken once the whole group has run: the group always
-        // re-runs as a unit, so a member's read of what a later member writes is
-        // internal to it, not a stale input.
+        let graph = db.reader_graph();
+        let own = group
+            .iter()
+            .enumerate()
+            .map(|(position, member)| {
+                if position == 0 {
+                    return Vec::new();
+                }
+                graph
+                    .outputs_of(*member)
+                    .filter(|key| {
+                        key.is_primary()
+                            && graph.producers(key).all(|producer| {
+                                producer == *member || producer.kind == DerivationKind::Source
+                            })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let deferred = own.iter().flatten().cloned().collect::<FxHashSet<_>>();
+        // What a member reads of these is internal to the group.
+        let mut reset = FxHashSet::default();
+        let grouped = group.len() > 1;
+        if grouped {
+            reset.extend(
+                group
+                    .iter()
+                    .flat_map(|member| graph.outputs_of(*member))
+                    .filter(|key| key.is_primary() && !deferred.contains(*key))
+                    .cloned(),
+            );
+        }
+        let mut touched = self.reset_outputs(db, group, &deferred, grouped.then_some(&mut reset));
+        let mut cleared = FxHashSet::default();
         let evaluations = self.with_lent_keys(db, &touched, |db| {
+            let mut written = FxHashSet::default();
             group
                 .iter()
-                .map(|member| {
+                .zip(own)
+                .enumerate()
+                .map(|(position, (member, own))| {
+                    // A key an earlier member wrote this time is no longer
+                    // this member's alone.
+                    let own = own
+                        .into_iter()
+                        .filter(|key| !written.contains(key))
+                        .collect::<Vec<_>>();
+                    if !own.is_empty() {
+                        let moved = derivation::capture_writes(|| {
+                            for key in &own {
+                                db.reset_fact(key);
+                            }
+                        });
+                        derivation::note_written(moved.iter().cloned());
+                        cleared.extend(moved);
+                    }
                     derivation::begin(*member);
                     recipe.evaluate(db, *member);
-                    derivation::end()
+                    let evaluation = derivation::end();
+                    if position + 1 == group.len() {
+                        return (evaluation, None);
+                    }
+                    written.extend(evaluation.outputs().chain(evaluation.moved()).cloned());
+                    (evaluation, Some(derivation::new_stamp()))
                 })
                 .collect()
         });
+        touched.extend(cleared);
         crate::profile::phase("engine: record", || {
-            self.record(db, evaluations, &mut touched, || {
+            self.record(db, evaluations, &mut touched, &reset, || {
                 format!("evaluating {group:?}")
             })
         });
@@ -1040,17 +1118,23 @@ impl Engine {
 
     /// Replaces the records of `evaluations`, fingerprinting their reads as
     /// they stand now, and adds their outputs to `touched`.
+    ///
+    /// A group member others ran after carries the stamp it ended at: a read
+    /// of what they moved since is recorded as unseen (see
+    /// [`derivation::ReaderGraph::seen_by_member`]), `reset` holding the keys
+    /// reset before the group ran.
     fn record(
         &self,
         db: &mut DbIndex,
-        evaluations: Vec<derivation::Evaluation>,
+        evaluations: Vec<(derivation::Evaluation, Option<u64>)>,
         touched: &mut FxHashSet<HashedKey>,
+        reset: &FxHashSet<HashedKey>,
         step: impl Fn() -> String,
     ) {
         for key in touched.iter().chain(
             evaluations
                 .iter()
-                .flat_map(|evaluation| evaluation.outputs().chain(evaluation.moved())),
+                .flat_map(|(evaluation, _)| evaluation.outputs().chain(evaluation.moved())),
         ) {
             db.reader_graph().forget_fingerprint(key);
             let mut before_edits = self.before_edits.borrow_mut();
@@ -1064,7 +1148,7 @@ impl Engine {
         // fingerprinted against it.
         let mut graph = std::mem::take(db.reader_graph_mut());
         let mut released = Vec::new();
-        for evaluation in evaluations {
+        for (evaluation, ended) in evaluations {
             touched.extend(evaluation.moved().cloned());
             let (id, mut slots, reads, outputs) = evaluation.into_recorded();
             slots.extend(reads.into_iter().map(|key| graph.intern_read(key)));
@@ -1073,9 +1157,13 @@ impl Engine {
             slots.sort_unstable();
             slots.dedup();
             touched.extend(outputs.iter().cloned());
+            let slots = match ended {
+                Some(ended) => graph.seen_by_member(slots, ended, reset),
+                None => slots.into_iter().map(|slot| (slot, None)).collect(),
+            };
             graph.replace_slots(
                 id,
-                slots.into_iter().map(|slot| (slot, None)).collect(),
+                slots,
                 outputs,
                 |key| db.fact_fingerprint(key),
                 &mut released,
@@ -1310,4 +1398,125 @@ fn scopeguard_lent_keys() -> OnDrop {
 fn check_fingerprints() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("GLUALS_CHECK_FINGERPRINTS").is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
+    use rowan::{TextRange, TextSize};
+
+    use super::*;
+    use crate::{FileId, LuaDeclId, LuaType, LuaTypeCache, LuaTypeOwner, VirtualWorkspace};
+
+    const FILE: u32 = 90_000;
+    const COPIED: u32 = 1;
+    const SHARED: u32 = 2;
+    const WRITTEN: u32 = 3;
+
+    fn statement(start: u32) -> DerivationId {
+        DerivationId::new(
+            DerivationKind::LocalStat,
+            FileId::new(FILE),
+            LuaSyntaxId::new(
+                LuaSyntaxKind::LocalStat.into(),
+                TextRange::at(TextSize::new(start), TextSize::new(1)),
+            ),
+        )
+    }
+
+    fn owner(position: u32) -> LuaTypeOwner {
+        LuaTypeOwner::Decl(LuaDeclId::new(FileId::new(FILE), TextSize::new(position)))
+    }
+
+    fn bind(db: &mut DbIndex, position: u32, typ: LuaType) {
+        db.get_type_index_mut()
+            .force_bind_type(owner(position), LuaTypeCache::InferType(typ));
+    }
+
+    /// Two statements that both write `SHARED`, so they run as one group. The
+    /// first copies `WRITTEN`, which only the second writes, and only once it
+    /// has a value to write.
+    struct Pair {
+        written: Mutex<Option<LuaType>>,
+    }
+
+    impl Pair {
+        const READER: u32 = 0;
+        const WRITER: u32 = 10;
+
+        fn settle(&self, db: &mut DbIndex, engine: &mut Engine, changed: &[u32]) -> bool {
+            for start in changed {
+                engine.changed(statement(*start));
+            }
+            engine.open(db);
+            engine.run(db, self, Slice::Evaluations(100))
+        }
+    }
+
+    impl Recipe for Pair {
+        fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
+            if id == statement(Self::READER) {
+                let seen = db
+                    .get_type_index()
+                    .get_type_cache(&owner(WRITTEN))
+                    .map_or(LuaType::Unknown, |cache| cache.as_type().clone());
+                bind(db, COPIED, seen);
+            } else if let Some(written) = self.written.lock().unwrap().clone() {
+                bind(db, WRITTEN, written);
+            }
+            bind(db, SHARED, LuaType::Nil);
+        }
+
+        fn splits(&self, _: DerivationKind) -> bool {
+            false
+        }
+
+        fn compute(&self, _: &DbIndex, _: DerivationId) -> Box<dyn std::any::Any + Send> {
+            unreachable!("a pair does not split")
+        }
+
+        fn apply(&self, _: &mut DbIndex, _: DerivationId, _: Box<dyn std::any::Any + Send>) {
+            unreachable!("a pair does not split")
+        }
+    }
+
+    fn copied(db: &DbIndex) -> Option<LuaType> {
+        db.get_type_index()
+            .get_type_cache(&owner(COPIED))
+            .map(|cache| cache.as_type().clone())
+    }
+
+    #[test]
+    fn a_group_member_reads_a_later_members_own_fact_as_that_member_leaves_it() {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+        let pair = Pair {
+            written: Mutex::new(Some(LuaType::Integer)),
+        };
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        pair.settle(db, &mut engine, &[Pair::READER, Pair::WRITER]);
+
+        *pair.written.lock().unwrap() = Some(LuaType::String);
+        let settled = pair.settle(db, &mut engine, &[Pair::WRITER]);
+
+        assert_eq!((settled, copied(db)), (true, Some(LuaType::String)));
+    }
+
+    #[test]
+    fn a_group_member_reads_again_a_fact_a_later_member_writes_for_the_first_time() {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+        let pair = Pair {
+            written: Mutex::new(None),
+        };
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        pair.settle(db, &mut engine, &[Pair::READER, Pair::WRITER]);
+
+        *pair.written.lock().unwrap() = Some(LuaType::String);
+        let settled = pair.settle(db, &mut engine, &[Pair::WRITER]);
+
+        assert_eq!((settled, copied(db)), (true, Some(LuaType::String)));
+    }
 }

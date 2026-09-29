@@ -436,6 +436,10 @@ impl std::ops::Deref for HashedKey {
 pub type Fingerprint = u64;
 pub const ABSENT: Fingerprint = 0;
 
+/// What a read is recorded as having seen when the value it saw is not
+/// known: no value fingerprints to it, so the read never holds.
+pub const UNSEEN: Fingerprint = Fingerprint::MAX;
+
 /// The fingerprint of a present value; never [`ABSENT`].
 pub fn fingerprint_of<T: std::hash::Hash + ?Sized>(value: &T) -> Fingerprint {
     use std::hash::Hasher;
