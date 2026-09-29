@@ -228,6 +228,9 @@ pub(crate) struct Engine {
     /// Files whose source passes read a fact that moved. A file's source
     /// layer is only ever rebuilt whole, so the caller re-analyses them.
     stale_sources: BTreeSet<crate::FileId>,
+    /// Files whose diagnostics read a fact that moved: checked once the run
+    /// settles, since the fact can move back before then.
+    diagnostics: BTreeSet<crate::FileId>,
     /// Every key whose value may have changed during this engine's runs.
     touched: FxHashSet<HashedKey>,
     /// The files that settle first, until they do: the files being
@@ -274,11 +277,6 @@ impl Engine {
     /// The edits other files' references have yet to follow, once.
     pub(crate) fn edits_to_apply(&mut self) -> Option<derivation::EditMaps> {
         (!self.to_follow.is_empty()).then(|| std::mem::take(&mut self.to_follow))
-    }
-
-    /// The edits a read may hold through.
-    pub(crate) fn edits(&self) -> &derivation::EditMaps {
-        &self.edits
     }
 
     /// Takes in `later`, edits of the text the edits so far produced: a read
@@ -422,7 +420,9 @@ impl Engine {
                     .or_insert_with(|| (key.clone(), self.cursor));
             }
             match reader.kind {
-                DerivationKind::Diagnostics => {}
+                DerivationKind::Diagnostics => {
+                    self.diagnostics.insert(reader.file_id);
+                }
                 _ if self.waits(reader) => {
                     self.wait(reader, Reason::Read);
                 }
@@ -524,6 +524,28 @@ impl Engine {
     /// Marks `file_id`'s source layer as needing a rebuild.
     pub(crate) fn source_stale(&mut self, file_id: crate::FileId) {
         self.stale_sources.insert(file_id);
+    }
+
+    /// Checks `file_id`'s diagnostics once the run settles.
+    pub(crate) fn check_diagnostics(&mut self, file_id: crate::FileId) {
+        self.diagnostics.insert(file_id);
+    }
+
+    /// The files whose diagnostics read a fact that moved and holds neither
+    /// as it is nor with the edits mapped back, sorted.
+    pub(crate) fn stale_diagnostics(&self, db: &DbIndex) -> Vec<crate::FileId> {
+        let graph = db.reader_graph();
+        self.diagnostics
+            .iter()
+            .copied()
+            .filter(|file_id| {
+                graph.is_stale(
+                    DerivationId::diagnostics(*file_id),
+                    |key| db.fact_fingerprint(key),
+                    |_, _| false,
+                )
+            })
+            .collect()
     }
 
     /// Every key whose value may have changed so far.
@@ -722,7 +744,9 @@ impl Engine {
                     self.trace(db, reader, "stage barrier queues", &[]);
                 }
                 match reader.kind {
-                    DerivationKind::Diagnostics => {}
+                    DerivationKind::Diagnostics => {
+                        self.diagnostics.insert(reader.file_id);
+                    }
                     DerivationKind::Source => {
                         self.stale_sources.insert(reader.file_id);
                     }

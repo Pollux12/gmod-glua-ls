@@ -4,7 +4,7 @@ use hashbrown::HashTable;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::paged::Paged;
-use super::{DerivationId, EditMaps, FactKey, Fingerprint, HashedKey};
+use super::{DerivationId, DerivationKind, EditMaps, FactKey, Fingerprint, HashedKey};
 use crate::FileId;
 
 /// A fact key's slot in a [`KeyTable`].
@@ -700,7 +700,7 @@ impl ReaderGraph {
         }
     }
 
-    fn slot_fingerprint(
+    pub(super) fn slot_fingerprint(
         &self,
         slot: KeyIdx,
         fingerprint: impl FnOnce(&HashedKey) -> Fingerprint,
@@ -798,6 +798,30 @@ impl ReaderGraph {
         let dropped = self.replace_slots(id, slots, outputs, fingerprint, &mut released);
         self.release_keys(released);
         dropped
+    }
+
+    /// Files `reads`, made viewing this graph as it stands, as `id`'s record.
+    /// The slots of reads its previous record no longer keeps go to
+    /// `released`, to free with [`Self::release_keys`] once every record
+    /// viewed alongside is filed: another may hold the same slot.
+    pub fn file_viewed(
+        &mut self,
+        id: DerivationId,
+        reads: super::ViewedReads,
+        released: &mut Vec<KeyIdx>,
+    ) {
+        let mut slots = reads
+            .slots
+            .into_iter()
+            .map(|(slot, seen)| (slot, Some(seen)))
+            .collect::<Vec<_>>();
+        slots.extend(
+            reads
+                .keys
+                .into_iter()
+                .map(|(key, seen)| (self.intern_key(key), Some(seen))),
+        );
+        self.replace_slots(id, slots, Vec::new(), |_| super::UNSEEN, released);
     }
 
     /// Frees each slot of `slots` nothing refers to any more.
@@ -1181,9 +1205,12 @@ impl ReaderGraph {
                 continue;
             };
             for (_, deriv) in slot.readers.iter() {
-                let reader = self.derivations[deriv as usize].id.file_id;
-                if reader != owner && reader != FileId::VIRTUAL {
-                    dependents.entry(owner).or_default().insert(reader);
+                let reader = self.derivations[deriv as usize].id;
+                if reader.kind != DerivationKind::Diagnostics
+                    && reader.file_id != owner
+                    && reader.file_id != FileId::VIRTUAL
+                {
+                    dependents.entry(owner).or_default().insert(reader.file_id);
                 }
             }
         }
@@ -1198,6 +1225,11 @@ impl ReaderGraph {
     /// The fingerprint `deriv`'s recorded read of `slot` saw.
     fn seen(&self, slot: KeyIdx, deriv: DerivIdx) -> Fingerprint {
         self.table.keys[slot as usize].readers.seen_by(deriv)
+    }
+
+    /// The slot `key` is interned to.
+    pub(super) fn find_slot(&self, key: &HashedKey) -> Option<KeyIdx> {
+        self.table.find(key)
     }
 
     /// The key table, for checking memoised values against it.

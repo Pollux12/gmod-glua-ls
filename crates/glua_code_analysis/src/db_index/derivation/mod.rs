@@ -6,7 +6,6 @@
 //! the result in the [`ReaderGraph`] and re-evaluates exactly the readers of
 //! facts whose fingerprint changed.
 
-mod diagnostic_reads;
 mod frames;
 mod graph;
 mod positions;
@@ -16,7 +15,6 @@ use std::cell::RefCell;
 use rowan::{TextRange, TextSize};
 use rustc_hash::FxHashSet;
 
-pub use diagnostic_reads::DiagnosticReads;
 mod paged;
 pub use frames::{
     Gates, OpenFrame, Provenance, Reuse, ScopeMark, check_cache, close_frame, consult_absorbed,
@@ -403,10 +401,6 @@ impl HashedKey {
 
     pub fn key(&self) -> &FactKey {
         &self.key
-    }
-
-    pub fn into_key(self) -> FactKey {
-        self.key
     }
 }
 
@@ -935,6 +929,17 @@ impl DerivationId {
         }
     }
 
+    /// `file_id`'s diagnostics, whatever its text.
+    pub fn diagnostics(file_id: FileId) -> Self {
+        Self {
+            kind: DerivationKind::Diagnostics,
+            file_id,
+            syntax_kind: LuaSyntaxKind::None,
+            start: 0,
+            end: 0,
+        }
+    }
+
     pub fn syntax_id(&self) -> LuaSyntaxId {
         LuaSyntaxId::new(
             self.syntax_kind.into(),
@@ -987,10 +992,10 @@ pub struct Evaluation {
     log_handle: std::sync::Arc<frames::LogHandle>,
     /// The stamp the evaluation began under.
     stamp: u64,
-    /// Reads made while no key table is lent.
+    /// Reads made while no key table is lent, of keys the viewed graph (see
+    /// [`view_graph`]) has no slot for.
     reads: FxHashSet<HashedKey>,
-    /// Slots of the viewed graph whose keys are in `reads` already; see
-    /// [`view_graph`].
+    /// Reads made while viewing a graph, of keys it has a slot for.
     viewed: FxHashSet<KeyIdx>,
     /// Keys already read that an owner identity and a name name, see
     /// [`note_named_read`].
@@ -1073,6 +1078,33 @@ impl Evaluation {
         )
     }
 
+    /// The reads of an evaluation that viewed `graph` (see [`view_graph`]),
+    /// each fingerprinted as it stands.
+    pub fn into_viewed_reads(
+        self,
+        graph: &ReaderGraph,
+        fingerprint: impl Fn(&HashedKey) -> Fingerprint,
+    ) -> ViewedReads {
+        let id = self.id;
+        let mut slots = self
+            .viewed
+            .into_iter()
+            .filter(|slot| records_read(id, graph.key(*slot), |_| false))
+            .map(|slot| (slot, graph.slot_fingerprint(slot, &fingerprint)))
+            .collect::<Vec<_>>();
+        slots.sort_unstable_by_key(|(slot, _)| *slot);
+        let keys = self
+            .reads
+            .into_iter()
+            .filter(|key| records_read(id, key, |_| false))
+            .map(|key| {
+                let seen = fingerprint(&key);
+                (key, seen)
+            })
+            .collect();
+        ViewedReads { slots, keys }
+    }
+
     /// [`Self::into_parts`] with each read's fingerprint left to the caller,
     /// except those an earlier stage already took.
     #[allow(clippy::type_complexity)]
@@ -1100,6 +1132,26 @@ impl Evaluation {
             })
             .collect();
         (self.id, reads, outputs.into_iter().collect())
+    }
+}
+
+/// What an evaluation that viewed the reader graph read, with the
+/// fingerprints it saw: slots of the graph as it stood, which hold only until
+/// the graph next changes, and the keys it had no slot for.
+#[derive(Debug, Clone, Default)]
+pub struct ViewedReads {
+    slots: Vec<(KeyIdx, Fingerprint)>,
+    keys: Vec<(HashedKey, Fingerprint)>,
+}
+
+impl ViewedReads {
+    /// Every key read, for tests.
+    #[cfg(test)]
+    pub fn keys<'a>(&'a self, graph: &'a ReaderGraph) -> impl Iterator<Item = &'a FactKey> {
+        self.slots
+            .iter()
+            .map(|(slot, _)| graph.key(*slot).key())
+            .chain(self.keys.iter().map(|(key, _)| key.key()))
     }
 }
 
@@ -1337,7 +1389,8 @@ impl Evaluation {
     }
 }
 
-/// Records a read of `key`, interned if a key table is lent. Returns its slot.
+/// Records a read of `key`, interned if a key table is lent, else as its
+/// slot in the viewed graph if it has one. Returns its slot in the lent table.
 fn record_read(evaluation: &mut Evaluation, key: HashedKey) -> Option<KeyIdx> {
     KEYS.with(|keys| match keys.borrow_mut().as_mut() {
         Some(table) => {
@@ -1349,7 +1402,19 @@ fn record_read(evaluation: &mut Evaluation, key: HashedKey) -> Option<KeyIdx> {
             Some(slot)
         }
         None => {
-            evaluation.reads.insert(key);
+            let viewed = VIEW.with(|view| {
+                view.borrow()
+                    .as_deref()
+                    .and_then(|graph| graph.find_slot(&key))
+            });
+            match viewed {
+                Some(slot) => {
+                    evaluation.viewed.insert(slot);
+                }
+                None => {
+                    evaluation.reads.insert(key);
+                }
+            }
             None
         }
     })

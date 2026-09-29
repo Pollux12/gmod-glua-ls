@@ -537,7 +537,7 @@ pub fn note_written(keys: impl IntoIterator<Item = super::HashedKey>) {
 }
 
 /// [`reuse`] for an evaluation that views the reader graph without a lent
-/// table: a value that holds adds the keys it was computed from to the
+/// table: a value that holds adds the slots it was computed from to the
 /// evaluation's reads.
 fn reuse_viewed(
     provenance: &Provenance,
@@ -568,11 +568,7 @@ fn reuse_viewed(
             REUSED_ACROSS.with(|flag| flag.set(true));
         }
         if provenance.replays_into(evaluation.frame_stamp()) {
-            for slot in reads {
-                if evaluation.viewed.insert(*slot) {
-                    evaluation.reads.insert(graph.key(*slot).clone());
-                }
-            }
+            evaluation.viewed.extend(reads.iter().copied());
         }
         count(|stats| {
             stats.reused += 1;

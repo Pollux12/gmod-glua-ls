@@ -522,6 +522,47 @@ mod tests {
         expect_that!(affected, eq(&vec![file_id]));
     }
 
+    /// Each shift is judged against the text the last one left: a reader
+    /// diagnosed before both still reads what the second shift only moved.
+    #[gtest]
+    fn a_reader_stays_settled_through_two_shifts_of_the_file_it_reads() {
+        let body = |note: &str| {
+            format!(
+                r#"
+            -- {note}
+            MYLIB = MYLIB or {{}}
+            MYLIB.Config = {{ enabled = true }}
+            function MYLIB.Run() end
+            "#
+            )
+        };
+
+        let mut ws = workspace_with(vec![
+            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedGlobal,
+        ]);
+        let uri = ws.virtual_url_generator.new_uri("lua/autorun/mylib.lua");
+        let file_id = write(&mut ws, &uri, &body("note"));
+        let reader_uri = ws.virtual_url_generator.new_uri("lua/autorun/reader.lua");
+        let reader_id = write(
+            &mut ws,
+            &reader_uri,
+            r#"
+            MYLIB.Run()
+            print(MYLIB.Config.enabled)
+            "#,
+        );
+        expect_that!(codes_in(&ws, reader_id), is_empty());
+
+        let mut affected = Vec::new();
+        for note in ["a longer note", "a note longer than the last one was"] {
+            ws.analysis.update_file_text_only(&uri, body(note));
+            affected.push(ws.analysis.reindex_files(vec![file_id]));
+        }
+
+        expect_that!(affected, eq(&vec![vec![file_id], vec![file_id]]));
+    }
+
     /// The same sequence, for an edit that does change an export: the file
     /// that reads it has to be reported and see the new value.
     #[gtest]

@@ -193,6 +193,32 @@ local recorded = Ledger.back
         }
     }
 
+    /// Diagnostics taken between two slices read the index as it stood then:
+    /// a fact they read that a later slice moves reports the file.
+    #[test]
+    fn a_file_diagnosed_between_slices_is_reported_when_a_later_slice_moves_its_reads() {
+        let mut ws = workspace();
+        let label = {
+            let uri = ws.virtual_url_generator.new_uri(LABEL);
+            ws.analysis.get_file_id(&uri).expect("a workspace file")
+        };
+        let config = stage_text(&mut ws, CONFIG, EDITED_CONFIG);
+        ws.analysis.begin_reindex(vec![config]);
+        ws.analysis.advance_reindex(Slice::Evaluations(1));
+
+        ws.analysis
+            .diagnose_file(label, tokio_util::sync::CancellationToken::new());
+        let affected = loop {
+            if let UpdateProgress::Settled(affected) =
+                ws.analysis.advance_reindex(Slice::Evaluations(1))
+            {
+                break affected;
+            }
+        };
+
+        assert!(affected.contains(&label), "{affected:?}");
+    }
+
     #[test]
     fn tmp_baseline_two_comments() {
         let config_text = files()[0].1;

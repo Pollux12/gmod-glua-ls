@@ -16,7 +16,7 @@ use crate::{
     Emmyrc, FileId, LuaIndex, LuaInferCache,
     db_index::{
         DbIndex,
-        derivation::{self, DerivationId, DerivationKind, DiagnosticReads},
+        derivation::{self, DerivationId, DerivationKind},
     },
     semantic::SemanticModel,
 };
@@ -28,9 +28,10 @@ pub struct LuaCompilation {
     /// Every `update_index` batch since [`Self::start_batch_log`], for the
     /// determinism harness's replay.
     batch_log: Option<Vec<Vec<FileId>>>,
-    /// What each file's last diagnostics read. Diagnostics run behind a
-    /// shared borrow, possibly on several threads.
-    diagnostic_reads: Mutex<DiagnosticReads>,
+    /// What each file's diagnostics read since the reader graph last changed,
+    /// to file as their `Diagnostics` records before it next does.
+    /// Diagnostics run behind a shared borrow, possibly on several threads.
+    diagnosed: Mutex<rustc_hash::FxHashMap<FileId, derivation::ViewedReads>>,
     /// The files the last `update_index` re-analysed, for locality checks.
     last_evaluated_files: Vec<FileId>,
     last_stats: analyzer::EngineStats,
@@ -66,7 +67,7 @@ impl LuaCompilation {
             db: DbIndex::new(),
             emmyrc: emmyrc.clone(),
             batch_log: None,
-            diagnostic_reads: Mutex::default(),
+            diagnosed: Mutex::default(),
             last_evaluated_files: Vec::new(),
             last_stats: analyzer::EngineStats::default(),
             schedule: Schedule::default(),
@@ -136,6 +137,7 @@ impl LuaCompilation {
     /// progress takes them in and settles them first. Advance it with
     /// [`Self::advance_update`].
     pub fn begin_update(&mut self, file_ids: Vec<FileId>) {
+        self.file_diagnostic_reads();
         if let Some(log) = &mut self.batch_log {
             log.push(file_ids.clone());
         }
@@ -144,19 +146,6 @@ impl LuaCompilation {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
         let edits = derivation::EditMaps::new(self.db.get_vfs_mut().take_edit_maps(&file_ids));
-        let reads = self
-            .diagnostic_reads
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for file_id in &file_ids {
-            if self.db.get_vfs().get_syntax_tree(file_id).is_none() {
-                reads.forget(*file_id);
-            }
-        }
-        // Diagnostics recorded from here on read the new positions.
-        crate::profile::phase("reanalyze: diagnostic reads follow edits", || {
-            reads.apply_edits(&edits)
-        });
         let reanalysis = self
             .reanalysis
             .get_mut()
@@ -178,6 +167,7 @@ impl LuaCompilation {
 
     /// Advances the re-analysis in progress by `slice`.
     pub fn advance_update(&mut self, slice: Slice) -> UpdateProgress {
+        self.file_diagnostic_reads();
         let session = self
             .reanalysis
             .get_mut()
@@ -192,7 +182,6 @@ impl LuaCompilation {
             return UpdateProgress::Settling;
         }
         let reanalysis = session.take().expect("a re-analysis in progress");
-        let edits = reanalysis.edits().clone();
         let reanalysed = reanalysis.finish(&mut self.db);
         self.scopes = reanalysed.scopes;
         *self
@@ -201,14 +190,7 @@ impl LuaCompilation {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = reanalysed.memos;
         self.last_evaluated_files = reanalysed.evaluated_files;
         self.last_stats = reanalysed.stats;
-        let reads = self
-            .diagnostic_reads
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        UpdateProgress::Settled(crate::profile::phase(
-            "reanalyze: stale diagnostics",
-            || stale_diagnostic_files(reads, &self.db, &reanalysed.touched, &edits),
-        ))
+        UpdateProgress::Settled(reanalysed.stale_diagnostics)
     }
 
     /// Whether a re-analysis is in progress.
@@ -270,20 +252,26 @@ impl LuaCompilation {
         self.db
             .reader_graph()
             .derivations_of_file(file_id)
-            .next()
-            .is_some()
+            .any(|id| id.kind != DerivationKind::Diagnostics)
     }
 
-    /// Runs `diagnose` recording what it reads as `file_id`'s diagnostics
-    /// (`None`: the data every file's diagnostics share).
+    /// Every key some file's diagnostics read, filed or not.
     #[cfg(test)]
     pub(crate) fn diagnostic_read_keys(&self) -> Vec<derivation::FactKey> {
-        self.diagnostic_reads
+        let graph = self.db.reader_graph();
+        let mut keys = graph
+            .derivations()
+            .filter(|id| id.kind == DerivationKind::Diagnostics)
+            .flat_map(|id| graph.reads_of(id).map(|key| key.key().clone()))
+            .collect::<Vec<_>>();
+        let diagnosed = self
+            .diagnosed
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .read_keys()
-            .cloned()
-            .collect()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for reads in diagnosed.values() {
+            keys.extend(reads.keys(graph).cloned());
+        }
+        keys
     }
 
     pub(crate) fn record_diagnostic_reads<T>(
@@ -294,36 +282,48 @@ impl LuaCompilation {
         if derivation::recording() {
             return diagnose();
         }
-        let Some(tree) = self.db.get_vfs().get_syntax_tree(&file_id) else {
+        if self.db.get_vfs().get_syntax_tree(&file_id).is_none() {
             return diagnose();
-        };
-        derivation::begin(DerivationId::new(
-            DerivationKind::Diagnostics,
-            file_id,
-            glua_parser::LuaSyntaxId::from_node(&tree.get_red_root()),
-        ));
+        }
+        derivation::begin(DerivationId::diagnostics(file_id));
         let viewed = derivation::view_graph(self.db.reader_graph_shared());
         let result = diagnose();
         drop(viewed);
         // Fingerprints the engine took stand while nothing writes.
-        let graph = self.db.reader_graph();
-        let (_, reads, _) = derivation::end()
-            .into_parts(|key| graph.current_fingerprint(key, |key| self.db.fact_fingerprint(key)));
-        let reads = reads
-            .into_iter()
-            .map(|(key, seen)| (key.into_key(), seen))
-            .collect();
-        self.diagnostic_reads
+        let reads = derivation::end()
+            .into_viewed_reads(self.db.reader_graph(), |key| self.db.fact_fingerprint(key));
+        self.diagnosed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .record(file_id, reads);
+            .insert(file_id, reads);
         result
+    }
+
+    /// Files what diagnostics read since the reader graph last changed, which
+    /// names its slots as they stood, before anything changes it.
+    fn file_diagnostic_reads(&mut self) {
+        let diagnosed = std::mem::take(
+            self.diagnosed
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        if diagnosed.is_empty() {
+            return;
+        }
+        let mut diagnosed = diagnosed.into_iter().collect::<Vec<_>>();
+        diagnosed.sort_unstable_by_key(|(file_id, _)| *file_id);
+        let graph = self.db.reader_graph_mut();
+        let mut released = Vec::new();
+        for (file_id, reads) in diagnosed {
+            graph.file_viewed(DerivationId::diagnostics(file_id), reads, &mut released);
+        }
+        graph.release_keys(released);
     }
 
     /// An independent copy-on-write copy; see [`DbIndex::fork_independent`].
     pub fn fork(&self) -> Self {
-        let reads = self
-            .diagnostic_reads
+        let diagnosed = self
+            .diagnosed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
@@ -332,7 +332,7 @@ impl LuaCompilation {
             db: self.db.fork_independent(),
             emmyrc: self.emmyrc.clone(),
             batch_log: None,
-            diagnostic_reads: Mutex::new(reads),
+            diagnosed: Mutex::new(diagnosed),
             last_evaluated_files: Vec::new(),
             last_stats: analyzer::EngineStats::default(),
             schedule: self.schedule,
@@ -355,6 +355,7 @@ impl LuaCompilation {
     }
 
     pub fn remove_index(&mut self, file_ids: Vec<FileId>) {
+        self.file_diagnostic_reads();
         self.db.remove_index(file_ids);
     }
 
@@ -364,27 +365,19 @@ impl LuaCompilation {
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.db.clear();
-        *self
-            .diagnostic_reads
+        self.diagnosed
             .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = DiagnosticReads::default();
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.memos
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
     }
 
-    /// The reader graph's and the diagnostic reads' census, for the profile.
+    /// The reader graph's census, for the profile.
     pub fn memory_census(&self) -> String {
-        let reads = self
-            .diagnostic_reads
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .census();
-        format!(
-            "reader graph: {}\ndiagnostic reads: {reads}",
-            self.db.reader_graph().census()
-        )
+        format!("reader graph: {}", self.db.reader_graph().census())
     }
 
     pub fn get_db(&self) -> &DbIndex {
@@ -392,34 +385,14 @@ impl LuaCompilation {
     }
 
     pub fn get_db_mut(&mut self) -> &mut DbIndex {
+        self.file_diagnostic_reads();
         &mut self.db
     }
 
     pub fn update_config(&mut self, config: Arc<Emmyrc>) {
+        self.file_diagnostic_reads();
         self.scopes = analyzer::ScopesCache::default();
         self.emmyrc = config.clone();
         self.db.update_config(config);
     }
-}
-
-/// The files whose last diagnostics read one of `touched` and no longer hold,
-/// even with `edits` mapped back. Reads that held only through the edits are
-/// re-recorded as reads of the value as it stands.
-fn stale_diagnostic_files(
-    reads: &mut DiagnosticReads,
-    db: &DbIndex,
-    touched: &rustc_hash::FxHashSet<derivation::HashedKey>,
-    edits: &derivation::EditMaps,
-) -> Vec<FileId> {
-    reads.stale_files(
-        touched,
-        |key| {
-            db.reader_graph()
-                .current_fingerprint(key, |key| db.fact_fingerprint(key))
-        },
-        |key| {
-            (!edits.is_empty())
-                .then(|| derivation::fingerprint_before_edits(edits, || db.fact_fingerprint(key)))
-        },
-    )
 }

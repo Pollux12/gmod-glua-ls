@@ -1375,8 +1375,8 @@ Foo = {}
         assert_eq!(declared_in, Some(1));
         assert!(
             reads
-                .into_iter()
-                .any(|(key, _)| key.into_key() == FactKey::TypeDeclLocations(foo.clone()))
+                .iter()
+                .any(|(key, _)| *key.key() == FactKey::TypeDeclLocations(foo.clone()))
         );
     }
 

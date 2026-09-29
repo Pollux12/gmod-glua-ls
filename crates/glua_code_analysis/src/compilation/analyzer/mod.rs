@@ -149,8 +149,8 @@ impl ScopesCache {
 
 /// What a finished [`Reanalysis`] did.
 pub(crate) struct Reanalysed {
-    /// Every key whose value may have changed.
-    pub touched: HashSet<derivation::HashedKey>,
+    /// The files whose diagnostics read a fact that moved, sorted.
+    pub stale_diagnostics: Vec<FileId>,
     /// The files whose source layer was rebuilt or whose derivations were
     /// evaluated, sorted.
     pub evaluated_files: Vec<FileId>,
@@ -309,11 +309,6 @@ impl Reanalysis {
         self.engine.in_focus(file_id)
     }
 
-    /// The edits reads may hold through.
-    pub(crate) fn edits(&self) -> &derivation::EditMaps {
-        self.engine.edits()
-    }
-
     /// Wraps up a settled re-analysis.
     pub(crate) fn finish(mut self, db: &mut DbIndex) -> Reanalysed {
         debug_assert!(self.pass.is_none(), "finishing an unsettled re-analysis");
@@ -327,8 +322,11 @@ impl Reanalysis {
         let evaluated_files = self.engine.evaluated_files();
         stats.report(evaluated_files.len());
         crate::profile::memory::checkpoint("end of re-analysis");
+        let stale_diagnostics = crate::profile::phase("reanalyze: stale diagnostics", || {
+            self.engine.stale_diagnostics(db)
+        });
         Reanalysed {
-            touched,
+            stale_diagnostics,
             evaluated_files,
             stats,
             scopes: self.scopes,
@@ -594,7 +592,7 @@ fn refresh_payload_refs(db: &mut DbIndex, touched: &HashSet<derivation::HashedKe
 fn rerun(engine: &mut engine::Engine, id: derivation::DerivationId) {
     match id.kind {
         derivation::DerivationKind::Source => engine.source_stale(id.file_id),
-        derivation::DerivationKind::Diagnostics => {}
+        derivation::DerivationKind::Diagnostics => engine.check_diagnostics(id.file_id),
         _ => engine.changed(id),
     }
 }

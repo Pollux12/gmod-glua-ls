@@ -968,11 +968,12 @@ impl VirtualWorkspace {
     /// The derivations of a file that name no node of its current text.
     #[cfg(test)]
     pub fn phantom_derivations(&self) -> Vec<crate::db_index::derivation::DerivationId> {
+        use crate::db_index::derivation::DerivationKind;
         let db = self.analysis.compilation.get_db();
         let mut phantoms = db
             .reader_graph()
             .derivations()
-            .filter(|id| id.file_id != FileId::VIRTUAL)
+            .filter(|id| id.file_id != FileId::VIRTUAL && id.kind != DerivationKind::Diagnostics)
             .filter(|id| {
                 db.get_vfs()
                     .get_syntax_tree(&id.file_id)
