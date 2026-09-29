@@ -6373,6 +6373,29 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn an_equality_with_a_subclass_value_narrows_a_base_class_variable() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Animal
+            ---@class Dog: Animal
+
+            ---@return Dog
+            local function get_dog() end
+
+            ---@param animal Animal
+            local function test(animal)
+                if animal == get_dog() then
+                    narrowed = animal
+                end
+            end
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("narrowed"), ws.ty("Dog"));
+    }
+
+    #[gtest]
     fn test_type_guard_class_name_not_equals_early_return_narrows_afterward() {
         let mut ws = VirtualWorkspace::new();
         let code = r#"
