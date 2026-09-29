@@ -550,15 +550,23 @@ impl KeyTable {
     }
 
     /// Whether a read of `slot` goes into a log whose innermost open frame
-    /// began at stamp `frame`: not if it was logged since. Marks it logged at
-    /// `latest`, the newest stamp handed out.
-    pub(super) fn log(&mut self, slot: KeyIdx, frame: u64, latest: u64) -> bool {
+    /// began at stamp `frame`: not if it was logged since, else whether this
+    /// is its first log since the evaluation began at stamp `evaluation`.
+    /// Marks it logged at `latest`, the newest stamp handed out.
+    pub(super) fn log(
+        &mut self,
+        slot: KeyIdx,
+        frame: u64,
+        evaluation: u64,
+        latest: u64,
+    ) -> Option<bool> {
         let entry = &mut self.keys[slot as usize];
         if entry.stamp >= frame {
-            return false;
+            return None;
         }
+        let first = entry.stamp < evaluation;
         entry.stamp = latest;
-        true
+        Some(first)
     }
 }
 
@@ -1496,9 +1504,9 @@ mod tests {
         let mut graph = ReaderGraph::default();
         let mut table = graph.lend_keys();
         let slot = table.intern_read(key(9), 0);
-        assert!(table.log(slot, 1, 1));
+        assert!(table.log(slot, 1, 1, 1).is_some());
         assert_eq!(table.intern_read(key(9), 0), slot);
-        assert!(table.log(slot, 2, 2));
+        assert!(table.log(slot, 2, 2, 2).is_some());
         graph.restore_keys(table);
         let producer = DerivationId::new(
             DerivationKind::LocalStat,

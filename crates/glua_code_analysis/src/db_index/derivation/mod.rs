@@ -974,6 +974,8 @@ pub struct Evaluation {
     /// Reads interned in the lent [`KeyTable`], in order, once per open
     /// frame: a frame's reads are the log from where it opened.
     log: Vec<KeyIdx>,
+    /// The slots of the log, each once.
+    read: Vec<KeyIdx>,
     /// The open frames, innermost last; see [`frames`].
     frames: Vec<frames::Frame>,
     /// References the open frames read as walking from no keyed origin, once
@@ -1053,9 +1055,16 @@ impl Evaluation {
     /// was lent, and its outputs.
     #[allow(clippy::type_complexity)]
     pub fn into_recorded(self) -> (DerivationId, Vec<KeyIdx>, Vec<HashedKey>, Vec<HashedKey>) {
-        let mut slots = self.log;
+        // A resumed evaluation logs again what it read before it resumed.
+        let mut slots = self.read;
         slots.sort_unstable();
         slots.dedup();
+        debug_assert!({
+            let mut logged = self.log.clone();
+            logged.sort_unstable();
+            logged.dedup();
+            logged == slots
+        });
         (
             self.id,
             slots,
@@ -1216,6 +1225,7 @@ pub fn begin(id: DerivationId) {
     start(Evaluation {
         id,
         log: Vec::new(),
+        read: Vec::new(),
         frames: Vec::new(),
         unkeyed: Vec::new(),
         checks: FxHashSet::default(),
@@ -1318,8 +1328,11 @@ impl Evaluation {
     }
 
     fn log_slot(&mut self, table: &mut KeyTable, slot: KeyIdx) {
-        if table.log(slot, self.frame_stamp(), latest_stamp()) {
+        if let Some(first) = table.log(slot, self.frame_stamp(), self.stamp, latest_stamp()) {
             self.log.push(slot);
+            if first {
+                self.read.push(slot);
+            }
         }
     }
 }
