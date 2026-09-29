@@ -1,5 +1,6 @@
 use super::*;
 use crate::semantic::gmod_call_effect::{GmodCallWriteEffect, gmod_call_write_effect};
+use glua_parser::LuaSyntaxNodeExt;
 
 pub(super) fn collect_numeric_range_table_populations_for_file(
     db: &DbIndex,
@@ -381,7 +382,7 @@ fn call_name_shadowed_in_closure_before_call(
     };
     let call_start = call_expr.syntax().text_range().start();
 
-    for local_stat in block.syntax().descendants().filter_map(LuaLocalStat::cast) {
+    for local_stat in block.descendants::<LuaLocalStat>() {
         if is_node_in_nested_closure(local_stat.syntax(), block.syntax())
             || !node_ends_before(local_stat.syntax(), call_start)
         {
@@ -395,11 +396,7 @@ fn call_name_shadowed_in_closure_before_call(
         }
     }
 
-    for local_func in block
-        .syntax()
-        .descendants()
-        .filter_map(LuaLocalFuncStat::cast)
-    {
+    for local_func in block.descendants::<LuaLocalFuncStat>() {
         if is_node_in_nested_closure(local_func.syntax(), block.syntax())
             || !node_ends_before(local_func.syntax(), call_start)
         {
@@ -758,7 +755,7 @@ fn pre_loop_helper_body_is_safe(
         return false;
     };
 
-    for assign_stat in block.syntax().descendants().filter_map(LuaAssignStat::cast) {
+    for assign_stat in block.descendants::<LuaAssignStat>() {
         if is_node_in_nested_closure(assign_stat.syntax(), block.syntax()) {
             continue;
         }
@@ -782,7 +779,7 @@ fn pre_loop_helper_body_is_safe(
         }
     }
 
-    for call_expr in block.syntax().descendants().filter_map(LuaCallExpr::cast) {
+    for call_expr in block.descendants::<LuaCallExpr>() {
         if is_node_in_nested_closure(call_expr.syntax(), block.syntax()) {
             continue;
         }
@@ -806,7 +803,7 @@ fn pre_loop_helper_body_is_safe(
 }
 
 fn loop_contains_rejected_control_flow(for_block: &LuaBlock) -> bool {
-    for stat in for_block.syntax().descendants().filter_map(LuaStat::cast) {
+    for stat in for_block.descendants::<LuaStat>() {
         if is_node_in_nested_closure(stat.syntax(), for_block.syntax()) {
             continue;
         }
@@ -1283,11 +1280,7 @@ fn infer_tracked_safe_helper_call_return_type(
         return None;
     }
     let mut return_types = Vec::new();
-    for return_stat in block
-        .syntax()
-        .descendants()
-        .filter_map(glua_parser::LuaReturnStat::cast)
-    {
+    for return_stat in block.descendants::<glua_parser::LuaReturnStat>() {
         if is_node_in_nested_closure(return_stat.syntax(), block.syntax()) {
             continue;
         }
@@ -1318,7 +1311,7 @@ fn helper_body_mutates_or_shadows_params(
         return false;
     }
 
-    for assign_stat in block.descendants().filter_map(LuaAssignStat::cast) {
+    for assign_stat in block.descendants_of::<LuaAssignStat>() {
         if is_node_in_nested_closure(assign_stat.syntax(), block) {
             continue;
         }
@@ -1332,7 +1325,7 @@ fn helper_body_mutates_or_shadows_params(
         }
     }
 
-    for local_stat in block.descendants().filter_map(LuaLocalStat::cast) {
+    for local_stat in block.descendants_of::<LuaLocalStat>() {
         if is_node_in_nested_closure(local_stat.syntax(), block) {
             continue;
         }
@@ -1572,7 +1565,7 @@ fn rhs_helper_body_is_safe(
         return false;
     };
 
-    for call_expr in block.syntax().descendants().filter_map(LuaCallExpr::cast) {
+    for call_expr in block.descendants::<LuaCallExpr>() {
         if is_node_in_nested_closure(call_expr.syntax(), block.syntax()) {
             continue;
         }
@@ -1596,7 +1589,7 @@ fn rhs_helper_body_is_safe(
         .map(String::as_str)
         .collect::<HashSet<_>>();
 
-    for assign_stat in block.syntax().descendants().filter_map(LuaAssignStat::cast) {
+    for assign_stat in block.descendants::<LuaAssignStat>() {
         if is_node_in_nested_closure(assign_stat.syntax(), block.syntax()) {
             continue;
         }
@@ -1616,7 +1609,7 @@ fn rhs_helper_body_is_safe(
         }
     }
 
-    for local_stat in block.syntax().descendants().filter_map(LuaLocalStat::cast) {
+    for local_stat in block.descendants::<LuaLocalStat>() {
         if is_node_in_nested_closure(local_stat.syntax(), block.syntax()) {
             continue;
         }
@@ -1707,7 +1700,7 @@ fn collect_closure_bounded_write_roots(
     let Some(block) = closure.get_block() else {
         return;
     };
-    for call_expr in block.syntax().descendants().filter_map(LuaCallExpr::cast) {
+    for call_expr in block.descendants::<LuaCallExpr>() {
         if is_node_in_nested_closure(call_expr.syntax(), block.syntax()) {
             continue;
         }

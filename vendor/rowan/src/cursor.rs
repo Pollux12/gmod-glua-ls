@@ -861,6 +861,26 @@ impl SyntaxNode {
         })
     }
 
+    /// The descendants whose kind `matcher` accepts, this node included, in
+    /// preorder. The walk runs over the green tree: only the nodes it yields
+    /// and their ancestors are materialised. GLuaLS vendor change.
+    pub fn descendants_matching<F: Fn(SyntaxKind) -> bool>(
+        &self,
+        matcher: F,
+    ) -> DescendantsMatching<F> {
+        DescendantsMatching {
+            matcher,
+            stack: vec![MatchFrame {
+                green: ptr::NonNull::from(self.green_ref()),
+                offset: self.offset(),
+                index: self.data().index(),
+                next: 0,
+                red: Some(self.clone()),
+            }],
+            started: false,
+        }
+    }
+
     #[inline]
     pub fn descendants_with_tokens(&self) -> impl Iterator<Item = SyntaxElement> {
         self.preorder_with_tokens().filter_map(|event| match event {
@@ -1533,6 +1553,88 @@ impl Iterator for Preorder {
             })
         });
         next
+    }
+}
+
+/// See [`SyntaxNode::descendants_matching`].
+pub struct DescendantsMatching<F> {
+    matcher: F,
+    /// The path from the start node to the node being walked. The start
+    /// node's red node, at the bottom, keeps every green node above alive.
+    stack: Vec<MatchFrame>,
+    /// Whether the start node itself was offered to the matcher.
+    started: bool,
+}
+
+struct MatchFrame {
+    green: ptr::NonNull<GreenNodeData>,
+    offset: TextSize,
+    /// The node's index among its parent's children.
+    index: u32,
+    /// The next child to walk.
+    next: usize,
+    red: Option<SyntaxNode>,
+}
+
+impl<F> DescendantsMatching<F> {
+    /// The red node of the frame at `at`, materialising it and its ancestors.
+    fn materialize(&mut self, at: usize) -> SyntaxNode {
+        if let Some(red) = &self.stack[at].red {
+            return red.clone();
+        }
+        let parent = self.materialize(at - 1);
+        let frame = &self.stack[at];
+        // SAFETY: the start node's red node, kept at the bottom of the stack,
+        // keeps its green tree and so this green node alive.
+        let green = unsafe { frame.green.as_ref() };
+        let red = SyntaxNode::new_child(green, parent, frame.index, frame.offset);
+        self.stack[at].red = Some(red.clone());
+        red
+    }
+}
+
+impl<F: Fn(SyntaxKind) -> bool> Iterator for DescendantsMatching<F> {
+    type Item = SyntaxNode;
+
+    fn next(&mut self) -> Option<SyntaxNode> {
+        if !self.started {
+            self.started = true;
+            let start = self.stack.last()?;
+            // SAFETY: see `materialize`.
+            if (self.matcher)(unsafe { start.green.as_ref() }.kind()) {
+                return start.red.clone();
+            }
+        }
+        loop {
+            let top = self.stack.last_mut()?;
+            // SAFETY: see `materialize`.
+            let children = unsafe { top.green.as_ref() }.children().raw.as_slice();
+            let mut child = None;
+            while top.next < children.len() {
+                let index = top.next;
+                top.next += 1;
+                if let NodeOrToken::Node(green) = children[index].as_ref() {
+                    child = Some(MatchFrame {
+                        green: ptr::NonNull::from(green),
+                        offset: top.offset + children[index].rel_offset(),
+                        index: index as u32,
+                        next: 0,
+                        red: None,
+                    });
+                    break;
+                }
+            }
+            let Some(child) = child else {
+                self.stack.pop();
+                continue;
+            };
+            // SAFETY: see `materialize`.
+            let matches = (self.matcher)(unsafe { child.green.as_ref() }.kind());
+            self.stack.push(child);
+            if matches {
+                return Some(self.materialize(self.stack.len() - 1));
+            }
+        }
     }
 }
 

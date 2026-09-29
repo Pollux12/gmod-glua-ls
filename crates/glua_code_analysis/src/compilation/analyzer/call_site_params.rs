@@ -1,3 +1,4 @@
+use glua_parser::LuaSyntaxNodeExt;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
 
@@ -145,7 +146,7 @@ pub(super) fn collect_file_contributions(db: &DbIndex, file_id: FileId) -> Vec<C
     let mut scope = FileScope::new(db, file_id, &root);
     let mut cache = LuaInferCache::new(file_id, super::call_target::pass_view());
     let mut contributions = Vec::new();
-    for call_expr in root.syntax().descendants().filter_map(LuaCallExpr::cast) {
+    for call_expr in root.descendants::<LuaCallExpr>() {
         collect_call_site_param_types(
             db,
             &mut cache,
@@ -186,7 +187,7 @@ fn collect_vgui_named_callback_receiver_types(
     let mut candidates: HashMap<LuaDeclId, Option<VguiNamedCallbackCandidate>> = HashMap::default();
     let mut candidate_names = HashSet::default();
 
-    for field in root.syntax().descendants().filter_map(LuaTableField::cast) {
+    for field in root.descendants::<LuaTableField>() {
         let Some(LuaExpr::NameExpr(name_expr)) = field.get_value_expr() else {
             continue;
         };
@@ -239,7 +240,7 @@ fn collect_vgui_named_callback_receiver_types(
     }
 
     let mut references_by_decl: HashMap<LuaDeclId, Vec<LuaNameExpr>> = HashMap::default();
-    for name_expr in root.syntax().descendants().filter_map(LuaNameExpr::cast) {
+    for name_expr in root.descendants::<LuaNameExpr>() {
         if !name_expr
             .get_name_text()
             .is_some_and(|name| candidate_names.contains(&name))
@@ -357,8 +358,7 @@ fn named_callback_signature_id(
         };
         closure
     } else {
-        root.descendants()
-            .filter_map(LuaLocalFuncStat::cast)
+        root.descendants_of::<LuaLocalFuncStat>()
             .find(|stat| {
                 stat.get_local_name()
                     .is_some_and(|name| name.get_range() == decl.get_range())
@@ -1926,8 +1926,7 @@ fn returned_table_info(
 fn returned_local_table_owner(db: &DbIndex, file_id: FileId) -> Option<LuaMemberOwner> {
     let root = db.get_vfs().get_syntax_tree(&file_id)?.get_red_root();
     let mut return_stats = root
-        .descendants()
-        .filter_map(LuaReturnStat::cast)
+        .descendants_of::<LuaReturnStat>()
         .filter(|return_stat| return_stat.ancestors::<LuaClosureExpr>().next().is_none());
     let return_stat = return_stats.next()?;
     if return_stats.next().is_some() {

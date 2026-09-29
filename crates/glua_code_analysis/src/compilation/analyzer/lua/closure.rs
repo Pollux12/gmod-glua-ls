@@ -1,3 +1,4 @@
+use glua_parser::LuaSyntaxNodeExt;
 use std::ops::Deref;
 
 use glua_parser::{
@@ -1415,8 +1416,7 @@ fn predicate_call_proves_index_exists(
     };
 
     let matching_predicates = root
-        .descendants()
-        .filter_map(LuaFuncStat::cast)
+        .descendants_of::<LuaFuncStat>()
         .filter(|func_stat| func_stat.ancestors::<LuaClosureExpr>().next().is_none())
         .filter(|func_stat| !func_stat_is_colon_defined(func_stat))
         .filter(|func_stat| {

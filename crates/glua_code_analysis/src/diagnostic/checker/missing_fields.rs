@@ -1,3 +1,4 @@
+use glua_parser::LuaSyntaxNodeExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -244,8 +245,7 @@ fn remove_fields_completed_after(
         // Anything else touching the target consumes it while it is still
         // incomplete, so later writes no longer make the literal complete.
         let escaping_vars = node
-            .descendants()
-            .filter_map(LuaVarExpr::cast)
+            .descendants_of::<LuaVarExpr>()
             .filter(|var| {
                 var.get_access_path().as_deref() == Some(target.as_str())
                     && !written_prefixes.contains(var.syntax())

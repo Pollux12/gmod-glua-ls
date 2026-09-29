@@ -2368,15 +2368,11 @@ fn cond_text_contains_field_exact(cond_text: &str, field_text: &str) -> bool {
 /// Whether a condition reads the named variable. Only a name reference counts:
 /// `cfg.mode` reads `cfg`, not a local called `mode`.
 fn condition_references_var(condition: &LuaExpr, var_name: &str) -> bool {
-    condition
-        .syntax()
-        .descendants()
-        .filter_map(LuaNameExpr::cast)
-        .any(|name_expr| {
-            name_expr
-                .get_name_text()
-                .is_some_and(|name| name == var_name)
-        })
+    condition.descendants::<LuaNameExpr>().any(|name_expr| {
+        name_expr
+            .get_name_text()
+            .is_some_and(|name| name == var_name)
+    })
 }
 
 /// Check if the body of an if-statement contains a return statement.

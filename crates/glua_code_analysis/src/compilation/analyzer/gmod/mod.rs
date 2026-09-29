@@ -1,3 +1,4 @@
+use glua_parser::LuaSyntaxNodeExt;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{
     collections::VecDeque,
@@ -319,7 +320,7 @@ fn file_annotated_call_sites(
 
     let annotated_call_roles =
         AnnotatedGmodCallRoleMap::build(db, file_id, &root, annotated_global_call_roles);
-    for call_expr in root.syntax().descendants().filter_map(LuaCallExpr::cast) {
+    for call_expr in root.descendants::<LuaCallExpr>() {
         if scan_class_calls {
             collect_annotated_scripted_class_call_metadata(
                 db,
@@ -510,9 +511,9 @@ pub(crate) fn evaluate_helper_scan(db: &mut DbIndex, file_id: FileId) {
     signature_ids.sort_unstable_by_key(|signature_id| signature_id.get_position());
     let has_calls = db.get_vfs().get_syntax_tree(&file_id).is_some_and(|tree| {
         tree.get_chunk_node()
-            .syntax()
-            .descendants()
-            .any(|node| LuaCallExpr::can_cast(node.kind().into()))
+            .descendants::<LuaCallExpr>()
+            .next()
+            .is_some()
     });
     let scan = AnnotatedGmodGlobalCallRoleMap::build_for_file(db, &signature_ids, has_calls);
     db.set_helper_scan(file_id, Arc::new(scan));
@@ -2194,7 +2195,7 @@ fn collect_vgui_forwarding_parent_calls(
             .collect::<HashSet<_>>();
         let cache = context.infer_manager.get_infer_cache(file_id);
         let mut calls = Vec::new();
-        for call_expr in root.descendants().filter_map(LuaCallExpr::cast) {
+        for call_expr in root.descendants_of::<LuaCallExpr>() {
             if existing_call_syntax_ids.contains(&call_expr.get_syntax_id()) {
                 continue;
             }
@@ -3016,7 +3017,7 @@ fn index_vgui_field_assignment_parents(
     root: &LuaSyntaxNode,
 ) -> HashMap<String, Vec<VguiFieldAssignmentParent>> {
     let mut assignments = HashMap::default();
-    for assign in root.descendants().filter_map(LuaAssignStat::cast) {
+    for assign in root.descendants_of::<LuaAssignStat>() {
         let (vars, exprs) = assign.get_var_and_expr_list();
         for (target, value) in vars.iter().zip(exprs) {
             let LuaVarExpr::IndexExpr(target) = target else {
@@ -3445,7 +3446,7 @@ fn find_and_resolve_getmember_delegations(
     }
 
     // Also check direct calls: scripted_ents.GetMember("class", "method")(self)
-    for node in chunk.syntax().descendants().filter_map(LuaCallExpr::cast) {
+    for node in chunk.descendants::<LuaCallExpr>() {
         let Some(LuaExpr::CallExpr(inner_call)) = node.get_prefix_expr() else {
             continue;
         };
@@ -4848,7 +4849,7 @@ fn find_networkvar_in_closure(
 ) -> Option<NetworkVarWrapper> {
     let block = closure.get_block()?;
 
-    for call_expr in block.syntax().descendants().filter_map(LuaCallExpr::cast) {
+    for call_expr in block.descendants::<LuaCallExpr>() {
         let Some(LuaExpr::IndexExpr(inner_index)) = call_expr.get_prefix_expr() else {
             continue;
         };
@@ -11918,14 +11919,11 @@ fn expr_references_name(expr: &LuaExpr, expected_name: &str) -> bool {
         return true;
     }
 
-    expr.syntax()
-        .descendants()
-        .filter_map(LuaNameExpr::cast)
-        .any(|name_expr| {
-            name_expr
-                .get_name_text()
-                .is_some_and(|name| name.as_str() == expected_name)
-        })
+    expr.descendants::<LuaNameExpr>().any(|name_expr| {
+        name_expr
+            .get_name_text()
+            .is_some_and(|name| name.as_str() == expected_name)
+    })
 }
 
 fn collect_static_string_bindings(root: &LuaChunk) -> HashMap<String, String> {

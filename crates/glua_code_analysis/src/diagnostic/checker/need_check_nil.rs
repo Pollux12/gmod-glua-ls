@@ -1,3 +1,4 @@
+use glua_parser::LuaSyntaxNodeExt;
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaBinaryExpr, LuaBlock, LuaCallExpr,
     LuaCallExprStat, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexExpr, LuaIndexKey,
@@ -1087,21 +1088,10 @@ fn prior_assignment_value_for_expr(
         {
             return None;
         }
-        if node
-            .descendants()
-            .filter_map(LuaAssignStat::cast)
-            .any(|assign_stat| {
-                assign_stat_reassigns_guarded_receiver_value(
-                    semantic_model,
-                    &assign_stat,
-                    guarded_expr,
-                ) || assign_stat_reassigns_guarded_expr(
-                    semantic_model,
-                    &assign_stat,
-                    &assigned_expr,
-                )
-            })
-        {
+        if node.descendants_of::<LuaAssignStat>().any(|assign_stat| {
+            assign_stat_reassigns_guarded_receiver_value(semantic_model, &assign_stat, guarded_expr)
+                || assign_stat_reassigns_guarded_expr(semantic_model, &assign_stat, &assigned_expr)
+        }) {
             return None;
         }
 
@@ -1128,17 +1118,9 @@ fn guarded_block_reassigns_guarded_expr_before_access(
             continue;
         }
 
-        if node
-            .descendants()
-            .filter_map(LuaAssignStat::cast)
-            .any(|assign_stat| {
-                assign_stat_reassigns_guarded_receiver_value(
-                    semantic_model,
-                    &assign_stat,
-                    guarded_expr,
-                )
-            })
-        {
+        if node.descendants_of::<LuaAssignStat>().any(|assign_stat| {
+            assign_stat_reassigns_guarded_receiver_value(semantic_model, &assign_stat, guarded_expr)
+        }) {
             return true;
         }
 
@@ -1194,8 +1176,7 @@ fn following_siblings_reassign_guarded_receiver(
         }
 
         if sibling
-            .descendants()
-            .filter_map(LuaAssignStat::cast)
+            .descendants_of::<LuaAssignStat>()
             .any(|assign_stat| {
                 assign_stat_reassigns_guarded_receiver_value(
                     semantic_model,
@@ -1303,9 +1284,7 @@ fn index_expr_key_reassigned_by_lhs(
     drop(cache);
 
     key_expr
-        .syntax()
-        .descendants()
-        .filter_map(LuaExpr::cast)
+        .descendants::<LuaExpr>()
         .filter(|descendant_expr| {
             matches!(
                 descendant_expr,
@@ -2681,9 +2660,7 @@ fn assigned_var_referenced_in_expr(
     // Walk all descendant expressions that can reference a variable:
     // both NameExpr (local/global refs) and IndexExpr (field/table refs).
     // Comparing only NameExpr would miss `self.Key` inside `self.Objects[self.Key + 1]`.
-    expr.syntax()
-        .descendants()
-        .filter_map(LuaExpr::cast)
+    expr.descendants::<LuaExpr>()
         .filter(|descendant_expr| {
             matches!(
                 descendant_expr,

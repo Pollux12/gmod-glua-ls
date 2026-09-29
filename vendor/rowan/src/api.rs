@@ -234,6 +234,17 @@ impl<L: Language> SyntaxNode<L> {
         self.raw.descendants().map(SyntaxNode::from)
     }
 
+    /// The descendants whose kind `matcher` accepts, this node included, in
+    /// preorder: only they and their ancestors are materialised.
+    pub fn descendants_matching(
+        &self,
+        matcher: impl Fn(L::Kind) -> bool,
+    ) -> impl Iterator<Item = SyntaxNode<L>> {
+        self.raw
+            .descendants_matching(move |raw_kind| matcher(L::kind_from_raw(raw_kind)))
+            .map(SyntaxNode::from)
+    }
+
     pub fn descendants_with_tokens(&self) -> impl Iterator<Item = SyntaxElement<L>> {
         self.raw.descendants_with_tokens().map(NodeOrToken::from)
     }

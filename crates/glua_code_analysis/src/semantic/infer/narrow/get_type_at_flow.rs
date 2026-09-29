@@ -2303,7 +2303,7 @@ fn closure_may_write_numeric_population_identity(
         return false;
     };
 
-    for assign_stat in block.syntax().descendants().filter_map(LuaAssignStat::cast) {
+    for assign_stat in block.descendants::<LuaAssignStat>() {
         if node_is_inside_nested_closure(assign_stat.syntax(), block.syntax()) {
             continue;
         }
@@ -2317,7 +2317,7 @@ fn closure_may_write_numeric_population_identity(
         }
     }
 
-    for nested_call in block.syntax().descendants().filter_map(LuaCallExpr::cast) {
+    for nested_call in block.descendants::<LuaCallExpr>() {
         if node_is_inside_nested_closure(nested_call.syntax(), block.syntax()) {
             continue;
         }
@@ -2707,7 +2707,7 @@ fn closure_effect_overlaps_mutation_roots(
         return true;
     };
 
-    for assign_stat in block.syntax().descendants().filter_map(LuaAssignStat::cast) {
+    for assign_stat in block.descendants::<LuaAssignStat>() {
         if node_is_inside_nested_closure(assign_stat.syntax(), block.syntax()) {
             continue;
         }
@@ -2720,7 +2720,7 @@ fn closure_effect_overlaps_mutation_roots(
         }
     }
 
-    for nested_call in block.syntax().descendants().filter_map(LuaCallExpr::cast) {
+    for nested_call in block.descendants::<LuaCallExpr>() {
         if node_is_inside_nested_closure(nested_call.syntax(), block.syntax()) {
             continue;
         }

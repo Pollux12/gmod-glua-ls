@@ -1,3 +1,4 @@
+use glua_parser::LuaSyntaxNodeExt;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use glua_parser::{
@@ -273,7 +274,7 @@ fn module_source_declares_exported_key(
     let mut local_table_init_keys: HashMap<String, HashSet<String>> = HashMap::default();
     let mut local_assigned_keys: HashMap<String, HashSet<String>> = HashMap::default();
 
-    for node in module_root.descendants().filter_map(LuaAst::cast) {
+    for node in module_root.descendants_of::<LuaAst>() {
         match node {
             LuaAst::LuaReturnStat(return_stat) => {
                 if return_stat

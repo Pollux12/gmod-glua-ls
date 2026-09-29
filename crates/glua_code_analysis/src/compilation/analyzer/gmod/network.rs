@@ -479,9 +479,7 @@ fn summarize_helper(
     block: &LuaBlock,
 ) -> NetHelper {
     let calls = block
-        .syntax()
-        .descendants()
-        .filter_map(LuaCallExpr::cast)
+        .descendants::<LuaCallExpr>()
         .map(|call_expr| summarize_helper_call(site, block, &call_expr))
         .collect::<Vec<_>>();
     let mut ops = Vec::new();
@@ -562,11 +560,7 @@ fn summarize_helper_call(
 /// The start-to-send transactions written in `helper_block`'s own blocks.
 fn helper_sends(site: &NetFileSite<'_>, helper_block: &LuaBlock) -> Vec<HelperSend> {
     let mut sends = Vec::new();
-    for block in helper_block
-        .syntax()
-        .descendants()
-        .filter_map(LuaBlock::cast)
-    {
+    for block in helper_block.descendants::<LuaBlock>() {
         if block.syntax() != helper_block.syntax()
             && is_block_in_nested_closure(helper_block, &block)
         {

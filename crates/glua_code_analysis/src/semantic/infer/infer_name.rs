@@ -487,7 +487,7 @@ fn is_global_ipairs_call(
 /// numeric range population analyzer: nested closures are transparent, since
 /// their control flow never escapes the enclosing loop.
 fn loop_body_has_partial_coverage_risk(body: &LuaBlock) -> bool {
-    for stat in body.syntax().descendants().filter_map(LuaStat::cast) {
+    for stat in body.descendants::<LuaStat>() {
         if is_node_in_nested_closure(stat.syntax(), body.syntax()) {
             continue;
         }
