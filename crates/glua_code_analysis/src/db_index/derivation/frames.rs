@@ -826,4 +826,23 @@ mod tests {
 
         assert_eq!((under_other, under_read), (Reuse::Held, Reuse::Elsewhere));
     }
+
+    /// Reads noted by identity stay apart for distinct keys: two table
+    /// literals that start together are two reads, as are two global paths,
+    /// while one path read twice is one.
+    #[test]
+    fn reads_noted_by_identity_keep_distinct_keys_apart() {
+        use crate::{FileId, GlobalId, InFiled};
+        let file = FileId::new(3);
+        let site = |end: u32| InFiled::new(file, rowan::TextRange::new(4.into(), end.into()));
+        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        derivation::note_definition_site_read(&site(9));
+        derivation::note_definition_site_read(&site(12));
+        derivation::note_global_path_read(&GlobalId::new("identity_test.a"));
+        derivation::note_global_path_read(&GlobalId::new("identity_test.b"));
+        derivation::note_global_path_read(&GlobalId::new("identity_test.a"));
+        let (_, reads, _) = derivation::end().into_parts(|_| 0);
+
+        assert_eq!(reads.len(), 4);
+    }
 }

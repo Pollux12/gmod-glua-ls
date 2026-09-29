@@ -1390,6 +1390,23 @@ pub fn note_file_fact_read(fact: FileFact, file_id: FileId) {
     });
 }
 
+/// Records a read of the global path `path`; see [`note_type_decl_read`].
+pub fn note_global_path_read(path: &GlobalId) {
+    note_read_by((u8::MAX - 14, u128::from(path.interned_address())), || {
+        FactKey::GlobalPath(path.clone())
+    });
+}
+
+/// Records a read of the owner the table literal `site` initialises.
+pub fn note_definition_site_read(site: &InFiled<TextRange>) {
+    let identity = u128::from(site.file_id.id) << 64
+        | u128::from(u32::from(site.value.start())) << 32
+        | u128::from(u32::from(site.value.end()));
+    note_read_by((u8::MAX - 15, identity), || {
+        FactKey::DefinitionSite(site.clone())
+    });
+}
+
 /// Records a read of the type declaration `decl_id`. Interned ids compare by
 /// address, which the recorded key keeps alive for the evaluation.
 pub fn note_type_decl_read(decl_id: &LuaTypeDeclId) {
@@ -1511,7 +1528,16 @@ pub fn note_type_cache_read(owner: &LuaTypeOwner) {
         LuaTypeOwner::Member(id) => note_read_by((u8::MAX - 6, member_identity(id)), || {
             FactKey::TypeCache(owner.clone())
         }),
-        LuaTypeOwner::SyntaxId(_) => note_read(|| FactKey::TypeCache(owner.clone())),
+        LuaTypeOwner::SyntaxId(id) => {
+            let range = id.value.get_range();
+            let identity = u128::from(id.file_id.id) << 80
+                | u128::from(id.value.get_kind() as u16) << 64
+                | u128::from(u32::from(range.start())) << 32
+                | u128::from(u32::from(range.end()));
+            note_read_by((u8::MAX - 16, identity), || {
+                FactKey::TypeCache(owner.clone())
+            });
+        }
     }
 }
 

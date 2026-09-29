@@ -1576,7 +1576,7 @@ impl LuaMemberIndex {
     /// The global path the table literal `site` initialises, if one is
     /// registered for it.
     pub fn definition_site_path(&self, site: &crate::InFiled<TextRange>) -> Option<GlobalId> {
-        derivation::note_read(|| FactKey::DefinitionSite(site.clone()));
+        derivation::note_definition_site_read(site);
         self.definition_site_owner.get(site)?.get_path().cloned()
     }
 
@@ -1585,7 +1585,7 @@ impl LuaMemberIndex {
     /// A path with no candidates can never flip, so provenance on it is inert
     /// and must not exempt a member from settled owner re-derivation.
     pub fn global_path_has_class_candidates(&self, path: &GlobalId) -> bool {
-        derivation::note_read(|| FactKey::GlobalPath(path.clone()));
+        derivation::note_global_path_read(path);
         self.global_path_class_candidates.contains_key(path)
     }
 
@@ -1598,7 +1598,7 @@ impl LuaMemberIndex {
     /// records the owner map read as well, which member-map-armed scopes
     /// compare through `read_version`.
     pub fn is_known_global_path(&self, path: &GlobalId) -> bool {
-        derivation::note_read(|| FactKey::GlobalPath(path.clone()));
+        derivation::note_global_path_read(path);
         note_owner_presence_read(&LuaMemberOwner::GlobalPath(path.clone()));
         self.owner_members
             .contains_key(&LuaMemberOwner::GlobalPath(path.clone()))
@@ -1633,7 +1633,7 @@ impl LuaMemberIndex {
 
     /// The literals initialising `path`, sorted by `(file id, range)`.
     pub fn definition_sites(&self, path: &GlobalId) -> &[crate::InFiled<TextRange>] {
-        derivation::note_read(|| FactKey::GlobalPath(path.clone()));
+        derivation::note_global_path_read(path);
         self.path_definition_sites
             .get(path)
             .map_or(&[], |sites| sites.as_slice())
@@ -1656,14 +1656,14 @@ impl LuaMemberIndex {
     fn canonical<'a>(&'a self, owner: &'a LuaMemberOwner) -> &'a LuaMemberOwner {
         let owner = match owner {
             LuaMemberOwner::Element(range) => {
-                derivation::note_read(|| FactKey::DefinitionSite(range.clone()));
+                derivation::note_definition_site_read(range);
                 self.definition_site_owner.get(range).unwrap_or(owner)
             }
             _ => owner,
         };
         match owner {
             LuaMemberOwner::GlobalPath(path) => {
-                derivation::note_read(|| FactKey::GlobalPath(path.clone()));
+                derivation::note_global_path_read(path);
                 self.global_path_class_owner.get(path).unwrap_or(owner)
             }
             _ => owner,
@@ -1746,7 +1746,7 @@ impl LuaMemberIndex {
         let class = owner.get_type_id()?;
         derivation::note_member_read(id);
         let provenance = self.member_path_provenance.get(&id)?;
-        derivation::note_read(|| FactKey::GlobalPath(provenance.clone()));
+        derivation::note_global_path_read(provenance);
         let candidates = self.global_path_class_candidates.get(provenance)?;
         let winner = candidates.iter().next()?.class.clone();
         if *class == winner {

@@ -57,6 +57,11 @@ mod global_id_intern {
 }
 
 impl GlobalId {
+    /// The interned name's address: equal for equal ids while either lives.
+    pub(crate) fn interned_address(&self) -> u64 {
+        std::ptr::from_ref::<SmolStr>(&*self.0) as usize as u64
+    }
+
     pub fn new(name: &str) -> Self {
         global_id_intern::intern(name)
     }
