@@ -219,36 +219,6 @@ local recorded = Ledger.back
         assert!(affected.contains(&label), "{affected:?}");
     }
 
-    #[test]
-    fn tmp_baseline_two_comments() {
-        let config_text = files()[0].1;
-        let mut ws = workspace();
-        let config = stage_text(
-            &mut ws,
-            CONFIG,
-            &format!(
-                "-- one
-{config_text}"
-            ),
-        );
-        ws.analysis.reindex_files(vec![config]);
-        eprintln!("FIRST {:?}", ws.analysis.compilation.last_evaluated_files());
-        stage_text(
-            &mut ws,
-            CONFIG,
-            &format!(
-                "-- one
--- two
-{config_text}"
-            ),
-        );
-        ws.analysis.reindex_files(vec![config]);
-        eprintln!(
-            "SECOND {:?}",
-            ws.analysis.compilation.last_evaluated_files()
-        );
-    }
-
     /// A file still settling ahead of the rest keeps doing so when another
     /// file's edit is taken in: its document must not answer half evaluated.
     #[test]
