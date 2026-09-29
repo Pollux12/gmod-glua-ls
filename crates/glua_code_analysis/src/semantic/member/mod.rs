@@ -311,8 +311,37 @@ mod tests {
     };
 
     use super::{
-        cached_local_class_table_member_ids, local_class_table_member_ids, merge_open_table_types,
+        cached_local_class_table_member_ids, local_class_table_member_ids, member_key_as_type,
+        member_key_matches_type, merge_open_table_types,
     };
+
+    /// A primitive access decides literal keys without the type check, and
+    /// answers as the check would.
+    #[test]
+    fn a_primitive_access_matches_literal_keys_as_the_type_check_does() {
+        let db = DbIndex::new();
+        let accesses = [
+            LuaType::Any,
+            LuaType::Unknown,
+            LuaType::Integer,
+            LuaType::Number,
+            LuaType::String,
+            LuaType::Boolean,
+        ];
+        let keys = [LuaMemberKey::Integer(3), LuaMemberKey::Name("name".into())];
+        for access in &accesses {
+            for key in &keys {
+                let key_type = member_key_as_type(key).expect("a literal key has a type");
+                let checked = crate::check_type_compact(&db, access, &key_type).is_ok()
+                    || crate::check_type_compact(&db, &key_type, access).is_ok();
+                assert_eq!(
+                    member_key_matches_type(&db, access, key),
+                    checked,
+                    "{access:?} against {key:?}",
+                );
+            }
+        }
+    }
 
     #[test]
     fn merge_open_table_types_keeps_tableof_as_table_component() {
@@ -1243,7 +1272,7 @@ pub(crate) fn member_key_matches_type(
     let Some(member_key_type) = member_key_as_type(member_key) else {
         return false;
     };
-    if let Some(is_match) = exact_literal_member_key_match(access_key_type, &member_key_type) {
+    if let Some(is_match) = literal_member_key_match(access_key_type, &member_key_type) {
         return is_match;
     }
 
@@ -1251,10 +1280,10 @@ pub(crate) fn member_key_matches_type(
         || check_type_compact(db, &member_key_type, access_key_type).is_ok()
 }
 
-fn exact_literal_member_key_match(
-    access_key_type: &LuaType,
-    member_key_type: &LuaType,
-) -> Option<bool> {
+/// Whether an access typed `access_key_type` reaches a member keyed by
+/// `member_key_type` when a literal decides it: a literal matches only its
+/// equal, and a primitive access reaches every literal key of its kind.
+fn literal_member_key_match(access_key_type: &LuaType, member_key_type: &LuaType) -> Option<bool> {
     match (access_key_type, member_key_type) {
         (LuaType::StringConst(left), LuaType::StringConst(right))
         | (LuaType::StringConst(left), LuaType::DocStringConst(right))
@@ -1268,6 +1297,9 @@ fn exact_literal_member_key_match(
         | (LuaType::BooleanConst(left), LuaType::DocBooleanConst(right))
         | (LuaType::DocBooleanConst(left), LuaType::BooleanConst(right))
         | (LuaType::DocBooleanConst(left), LuaType::DocBooleanConst(right)) => Some(left == right),
+        (LuaType::Any | LuaType::Unknown, LuaType::StringConst(_) | LuaType::IntegerConst(_))
+        | (LuaType::Integer | LuaType::Number, LuaType::IntegerConst(_))
+        | (LuaType::String, LuaType::StringConst(_)) => Some(true),
         _ => None,
     }
 }
