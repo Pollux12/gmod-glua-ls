@@ -584,6 +584,7 @@ impl Engine {
                 self.stats.round_started(self.worklist.order.len());
                 continue;
             };
+            let (id, reason) = self.producers_first(db, recipe, id, reason);
             if db.analysis_stage() < id.kind.first_stage() {
                 let held = self.held.entry(id).or_insert(reason);
                 *held = (*held).min(reason);
@@ -653,6 +654,61 @@ impl Engine {
         self.cursor = None;
         crate::profile::phase("engine: rebase moved reads", || self.rebase_moved_reads(db));
         true
+    }
+
+    /// What to evaluate in place of `id`: a derivation of its rank still queued
+    /// that wrote something `id` last read, followed back as far as it goes,
+    /// with `id` and the others passed on returned to the worklist. Evaluated
+    /// before its readers, a producer settles what they read, so each reader
+    /// runs once after it rather than once before and again after.
+    fn producers_first(
+        &mut self,
+        db: &DbIndex,
+        recipe: &dyn Recipe,
+        mut id: DerivationId,
+        mut reason: Reason,
+    ) -> (DerivationId, Reason) {
+        let mut followed = Vec::new();
+        while let Some((producer, producer_reason)) =
+            self.queued_producer(db, recipe, id, &followed)
+        {
+            self.worklist.remove(producer);
+            self.worklist.insert(id, reason);
+            followed.push(id);
+            (id, reason) = (producer, producer_reason);
+        }
+        (id, reason)
+    }
+
+    /// A derivation queued in this round, of `id`'s rank and not in
+    /// `followed`, that produced a key `id` last read.
+    fn queued_producer(
+        &self,
+        db: &DbIndex,
+        recipe: &dyn Recipe,
+        id: DerivationId,
+        followed: &[DerivationId],
+    ) -> Option<(DerivationId, Reason)> {
+        let graph = db.reader_graph();
+        let rank = id.kind.rank();
+        let stage = db.analysis_stage();
+        graph
+            .reads_of(id)
+            .flat_map(|key| graph.producers(key))
+            .find_map(|producer| {
+                if producer == id
+                    || producer.kind.rank() != rank
+                    || producer.kind.first_stage() > stage
+                    || recipe.splits(producer.kind)
+                    || followed.contains(&producer)
+                {
+                    return None;
+                }
+                self.worklist
+                    .reasons
+                    .get(&producer)
+                    .map(|reason| (producer, *reason))
+            })
     }
 
     /// Re-records every read that held only with the edits mapped back as a
@@ -1632,6 +1688,69 @@ mod tests {
         let edited = pushed_after(&[text("old"), text("mid"), text("new")]);
 
         assert_eq!(edited, pushed_after(&[text("new")]));
+    }
+
+    const SOURCED: u32 = 4;
+    const MIDDLE: u32 = 5;
+    const SOURCE: u32 = 20;
+    const MIDDLE_STAT: u32 = 10;
+
+    /// A reader of what a middle statement makes of a source, and of the
+    /// source itself; the source statement comes last in the file.
+    struct Chain {
+        value: Mutex<LuaType>,
+    }
+
+    impl Recipe for Chain {
+        fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
+            let read = |db: &DbIndex, position| {
+                db.get_type_index()
+                    .get_type_cache(&owner(position))
+                    .map_or(LuaType::Unknown, |cache| cache.as_type().clone())
+            };
+            if id == statement(READER) {
+                let seen = TypeOps::Union.apply(db, &read(db, MIDDLE), &read(db, SOURCED));
+                bind(db, COPIED, seen);
+            } else if id == statement(MIDDLE_STAT) {
+                let seen = read(db, SOURCED);
+                bind(db, MIDDLE, seen);
+            } else {
+                let value = self.value.lock().unwrap().clone();
+                bind(db, SOURCED, value);
+            }
+        }
+
+        fn splits(&self, _: DerivationKind) -> bool {
+            false
+        }
+
+        fn compute(&self, _: &DbIndex, _: DerivationId) -> Box<dyn std::any::Any + Send> {
+            unreachable!("a chain does not split")
+        }
+
+        fn apply(&self, _: &mut DbIndex, _: DerivationId, _: Box<dyn std::any::Any + Send>) {
+            unreachable!("a chain does not split")
+        }
+    }
+
+    #[test]
+    fn a_reader_queued_with_its_producer_runs_after_it() {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+        let chain = Chain {
+            value: Mutex::new(LuaType::Integer),
+        };
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        settle(db, &mut engine, &chain, &[READER, MIDDLE_STAT, SOURCE]);
+        let before = engine.stats().evaluations(DerivationKind::LocalStat);
+
+        *chain.value.lock().unwrap() = LuaType::String;
+        settle(db, &mut engine, &chain, &[SOURCE]);
+
+        assert_eq!(
+            engine.stats().evaluations(DerivationKind::LocalStat) - before,
+            3
+        );
     }
 
     fn copied(db: &DbIndex) -> Option<LuaType> {
