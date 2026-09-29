@@ -231,8 +231,11 @@ pub(crate) struct Engine {
     /// Files whose diagnostics read a fact that moved: checked once the run
     /// settles, since the fact can move back before then.
     diagnostics: BTreeSet<crate::FileId>,
-    /// Every key whose value may have changed during this engine's runs.
+    /// Every key whose value may have changed while the runs had edits: a
+    /// read of one may hold only with the edits mapped back.
     touched: FxHashSet<HashedKey>,
+    /// The files whose signatures or inferred guards may have changed.
+    payload_holders: BTreeSet<crate::FileId>,
     /// The files that settle first, until they do: the files being
     /// re-analysed, and any prioritised.
     focus: FxHashSet<crate::FileId>,
@@ -406,8 +409,13 @@ impl Engine {
     /// Queues the readers of `key` whose recorded fingerprint differs from its
     /// current value.
     fn queue_readers(&mut self, db: &DbIndex, key: &HashedKey) {
-        self.before_edits.get_mut().remove(key);
-        self.touched.insert(key.clone());
+        if !self.edits.is_empty() {
+            self.before_edits.get_mut().remove(key);
+            self.touched.insert(key.clone());
+        }
+        if let FactKey::Signature(signature_id) | FactKey::InferredGuard(signature_id) = key.key() {
+            self.payload_holders.insert(signature_id.get_file_id());
+        }
         let readers = db
             .reader_graph()
             .stale_readers(key, self.key_holds(db, key))
@@ -548,14 +556,9 @@ impl Engine {
             .collect()
     }
 
-    /// Every key whose value may have changed so far.
-    pub(crate) fn touched(&self) -> &FxHashSet<HashedKey> {
-        &self.touched
-    }
-
-    /// Every key whose value may have changed, emptied.
-    pub(crate) fn take_touched(&mut self) -> FxHashSet<HashedKey> {
-        std::mem::take(&mut self.touched)
+    /// The files whose signatures or inferred guards may have changed so far.
+    pub(crate) fn payload_holders(&self) -> impl Iterator<Item = crate::FileId> + '_ {
+        self.payload_holders.iter().copied()
     }
 
     /// Notes that `file_ids`' source layers were rebuilt.

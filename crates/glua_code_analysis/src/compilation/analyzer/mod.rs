@@ -220,7 +220,7 @@ impl Reanalysis {
         // was taken with; source layers are rebuilt at the stage outside a run.
         self.open_pass(db);
         db.set_analysis_stage(derivation::AnalysisStage::Closed);
-        refresh_payload_refs(db, self.engine.touched());
+        refresh_payload_refs(db, self.engine.payload_holders());
         self.engine.take_edits(edits);
         if let Some(pass) = start_pass(db, &mut self.engine, file_ids, &mut self.scopes) {
             self.pass = Some(pass);
@@ -310,11 +310,10 @@ impl Reanalysis {
     }
 
     /// Wraps up a settled re-analysis.
-    pub(crate) fn finish(mut self, db: &mut DbIndex) -> Reanalysed {
+    pub(crate) fn finish(self, db: &mut DbIndex) -> Reanalysed {
         debug_assert!(self.pass.is_none(), "finishing an unsettled re-analysis");
-        let touched = self.engine.take_touched();
         crate::profile::phase("reanalyze: payload refs", || {
-            refresh_payload_refs(db, &touched)
+            refresh_payload_refs(db, self.engine.payload_holders())
         });
         call_target::check_settled_call_targets(db);
         crate::profile::phase_report("reanalyze");
@@ -573,17 +572,7 @@ fn follow_edits(
 
 /// Re-takes which files the signatures of every file whose signatures moved
 /// name, so the next edit's remap finds them.
-fn refresh_payload_refs(db: &mut DbIndex, touched: &HashSet<derivation::HashedKey>) {
-    let mut holders = touched
-        .iter()
-        .filter_map(|key| match key.key() {
-            derivation::FactKey::Signature(signature_id)
-            | derivation::FactKey::InferredGuard(signature_id) => Some(signature_id.get_file_id()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    holders.sort();
-    holders.dedup();
+fn refresh_payload_refs(db: &mut DbIndex, holders: impl Iterator<Item = FileId>) {
     for holder in holders {
         db.get_signature_index_mut().snapshot_payload_refs(holder);
     }
