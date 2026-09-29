@@ -18,6 +18,7 @@ use crate::{FileId, GlobalId, db_index::member::lua_owner_members::LuaOwnerMembe
 
 pub use lua_member::{LuaMember, LuaMemberId, LuaMemberKey};
 pub use lua_member_feature::LuaMemberFeature;
+pub(crate) use lua_member_item::CallerSite;
 pub use lua_member_item::LuaMemberIndexItem;
 pub use lua_member_owner::LuaMemberOwner;
 

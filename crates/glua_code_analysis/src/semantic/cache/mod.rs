@@ -270,11 +270,11 @@ pub struct LuaInferCache {
         Option<(LuaType, Option<LuaSemanticDeclId>)>,
     >,
     /// Memo for `infer_owner_raw_member_type_with_realm`, keyed by owner, key,
-    /// caller file, caller position and table-generation cutoff. The union fold
-    /// over writers is identical for every read of the same member from the
-    /// same place, so repeated reads share one answer. Position sensitivity
-    /// comes only from offset visibility, which the position and cutoff in the
-    /// key capture. Derived from member/type/realm index state, so it is
+    /// caller file, where in the file the answer holds and table-generation
+    /// cutoff. The union fold over writers is identical for every read of the
+    /// same member from the same place, so repeated reads share one answer.
+    /// Position sensitivity comes only from offset visibility, which the read
+    /// site and cutoff in the key capture. Derived from member/type/realm index state, so it is
     /// dropped wherever expression inference results are dropped.
     pub owner_raw_member_type_cache: Untracked<
         FxHashMap<
@@ -282,7 +282,7 @@ pub struct LuaInferCache {
                 LuaMemberOwner,
                 LuaMemberKey,
                 FileId,
-                Option<TextSize>,
+                crate::semantic::member::MemberReadSite,
                 Option<InFiled<TextSize>>,
             ),
             Result<LuaType, InferFailReason>,

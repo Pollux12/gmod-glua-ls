@@ -31,8 +31,9 @@ use glua_parser::{
 };
 use glua_parser::{LuaAstNode, LuaIndexExpr};
 pub(crate) use infer_raw_member::{
-    infer_owner_raw_member_type_with_realm, infer_owner_raw_member_type_with_realm_cached,
-    resolve_member_item_with_realm, source_survives_table_generation_cutoff,
+    MemberReadSite, infer_owner_raw_member_type_with_realm,
+    infer_owner_raw_member_type_with_realm_cached, resolve_member_item_with_realm,
+    source_survives_table_generation_cutoff,
 };
 pub use infer_raw_member::{infer_raw_member_type, infer_raw_member_type_with_cache};
 use rowan::{TextRange, TextSize};
@@ -310,10 +311,103 @@ mod tests {
         VirtualWorkspace,
     };
 
+    use rowan::{TextRange, TextSize};
+
+    use crate::{FileId, InFiled, LuaMemberOwner};
+
     use super::{
-        cached_local_class_table_member_ids, local_class_table_member_ids, member_key_as_type,
-        member_key_matches_type, merge_open_table_types,
+        cached_local_class_table_member_ids, infer_owner_raw_member_type_with_realm_cached,
+        local_class_table_member_ids, member_key_as_type, member_key_matches_type,
+        merge_open_table_types,
     };
+
+    fn table_owner(file_id: FileId, content: &str) -> LuaMemberOwner {
+        let start = content.find('{').expect("a table literal") as u32;
+        let end = content.find('}').expect("a table literal") as u32 + 1;
+        LuaMemberOwner::Element(InFiled::new(
+            file_id,
+            TextRange::new(start.into(), end.into()),
+        ))
+    }
+
+    /// A read before a same-file write and one after it each take the answer
+    /// at their own offset, though they share one cache.
+    #[test]
+    fn a_same_file_member_is_read_at_each_offset_through_one_cache() {
+        const CONTENT: &str = r#"
+            local t = {}
+            local before = t.x
+            t.x = 1
+            local after = t.x
+        "#;
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file("lua/autorun/shared/order.lua", CONTENT);
+        let db = ws.analysis.compilation.get_db();
+        let owner = table_owner(file_id, CONTENT);
+        let key = LuaMemberKey::Name("x".into());
+        let before = TextSize::from(CONTENT.find("t.x").expect("the read before") as u32);
+        let after = TextSize::from(CONTENT.rfind("t.x").expect("the read after") as u32);
+        let read = |cache: &mut LuaInferCache, position| {
+            infer_owner_raw_member_type_with_realm_cached(
+                db,
+                cache,
+                owner.clone(),
+                &key,
+                file_id,
+                Some(position),
+                None,
+            )
+        };
+
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+        let shared = [read(&mut cache, before), read(&mut cache, after)];
+        let fresh = [before, after].map(|position| {
+            read(
+                &mut LuaInferCache::new(file_id, Default::default()),
+                position,
+            )
+        });
+
+        assert_ne!(fresh[0], fresh[1], "the write lands between the reads");
+        assert_eq!(shared, fresh);
+    }
+
+    /// A member another file writes reads the same at every offset in one
+    /// realm, so one answer serves them all.
+    #[test]
+    fn a_member_another_file_writes_is_resolved_once_per_realm() {
+        const LIBRARY: &str = r#"
+            Config = { size = 1 }
+        "#;
+        const CALLER: &str = r#"
+            local a = Config.size
+            local b = Config.size
+        "#;
+        let mut ws = VirtualWorkspace::new();
+        let library = ws.def_file("lua/autorun/shared/config.lua", LIBRARY);
+        let caller = ws.def_file("lua/autorun/shared/use.lua", CALLER);
+        let db = ws.analysis.compilation.get_db();
+        let owner = table_owner(library, LIBRARY);
+        let key = LuaMemberKey::Name("size".into());
+        let mut cache = LuaInferCache::new(caller, Default::default());
+
+        let reads = [CALLER.find("Config"), CALLER.rfind("Config")].map(|offset| {
+            let position = TextSize::from(offset.expect("a read") as u32);
+            infer_owner_raw_member_type_with_realm_cached(
+                db,
+                &mut cache,
+                owner.clone(),
+                &key,
+                caller,
+                Some(position),
+                None,
+            )
+        });
+
+        assert!(reads[0].is_ok(), "the member resolves: {:?}", reads[0]);
+        assert_eq!(reads[0], reads[1]);
+        assert_eq!(cache.owner_raw_member_type_cache.len(), 1);
+    }
 
     /// A primitive access decides literal keys without the type check, and
     /// answers as the check would.

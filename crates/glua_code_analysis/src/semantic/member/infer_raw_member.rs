@@ -4,9 +4,10 @@ use rowan::TextSize;
 use smol_str::SmolStr;
 
 use crate::{
-    DbIndex, FileId, GlobalId, InFiled, InferFailReason, InferGuard, InferGuardRef, LuaGenericType,
-    LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaMergedTableType, LuaObjectType,
-    LuaTupleType, LuaType, LuaTypeDeclId, TypeOps, check_type_compact,
+    CallerSite, DbIndex, FileId, GlobalId, GmodRealm, InFiled, InferFailReason, InferGuard,
+    InferGuardRef, LuaGenericType, LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner,
+    LuaMergedTableType, LuaObjectType, LuaTupleType, LuaType, LuaTypeDeclId, TypeOps,
+    check_type_compact,
     semantic::{
         LuaInferCache,
         generic::{TypeSubstitutor, instantiate_type_generic},
@@ -216,19 +217,34 @@ pub(crate) fn infer_owner_raw_member_type_with_realm(
     caller_position: Option<TextSize>,
     source_min_position: Option<InFiled<TextSize>>,
 ) -> RawGetMemberTypeResult {
+    let site = caller_position.map(|position| CallerSite::new(caller_file_id, position));
     infer_owner_raw_member_type_with_realm_uncached(
         db,
         &member_owner,
         member_key,
         caller_file_id,
-        caller_position,
+        site.as_ref(),
         source_min_position.as_ref(),
     )
 }
 
+/// Where a memoised raw member read holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemberReadSite {
+    /// Anywhere in the caller file: the read named no offset.
+    File,
+    /// Anywhere in the caller file with this realm: visibility never took the
+    /// offset.
+    Realm(GmodRealm),
+    /// Only at this offset.
+    At(TextSize),
+}
+
 /// Memoised entry point for hot read paths. The union fold over writers is
 /// identical for every read of the same member from the same place, so
-/// repeated reads share one answer instead of re-resolving every writer.
+/// repeated reads share one answer instead of re-resolving every writer; a
+/// read whose visibility never took the offset shares it with every read
+/// in the realm.
 pub(crate) fn infer_owner_raw_member_type_with_realm_cached(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -238,24 +254,37 @@ pub(crate) fn infer_owner_raw_member_type_with_realm_cached(
     caller_position: Option<TextSize>,
     source_min_position: Option<InFiled<TextSize>>,
 ) -> RawGetMemberTypeResult {
-    let cache_key = (
-        member_owner.clone(),
+    let site = caller_position.map(|position| CallerSite::new(caller_file_id, position));
+    let shared = site.as_ref().map_or(MemberReadSite::File, |site| {
+        MemberReadSite::Realm(site.realm(db))
+    });
+    let mut cache_key = (
+        member_owner,
         member_key.clone(),
         caller_file_id,
-        caller_position,
-        source_min_position.clone(),
+        shared,
+        source_min_position,
     );
     if let Some(cached) = cache.owner_raw_member_type_cache.get(&cache_key) {
         return cached.clone();
     }
+    if let Some(position) = caller_position {
+        cache_key.3 = MemberReadSite::At(position);
+        if let Some(cached) = cache.owner_raw_member_type_cache.get(&cache_key) {
+            return cached.clone();
+        }
+    }
     let result = infer_owner_raw_member_type_with_realm_uncached(
         db,
-        &member_owner,
+        &cache_key.0,
         member_key,
         caller_file_id,
-        caller_position,
-        source_min_position.as_ref(),
+        site.as_ref(),
+        cache_key.4.as_ref(),
     );
+    if !site.as_ref().is_some_and(CallerSite::position_read) {
+        cache_key.3 = shared;
+    }
     cache
         .owner_raw_member_type_cache
         .insert(cache_key, result.clone());
@@ -267,7 +296,7 @@ fn infer_owner_raw_member_type_with_realm_uncached(
     member_owner: &LuaMemberOwner,
     member_key: &LuaMemberKey,
     caller_file_id: FileId,
-    caller_position: Option<TextSize>,
+    site: Option<&CallerSite>,
     source_min_position: Option<&InFiled<TextSize>>,
 ) -> RawGetMemberTypeResult {
     let member_index = db.get_member_index();
@@ -280,13 +309,8 @@ fn infer_owner_raw_member_type_with_realm_uncached(
             db.get_dynamic_field_index()
                 .field_definitions(&dynamic_owner, name.as_str());
         }
-        let exact_type = resolve_member_item_with_realm(
-            db,
-            member_item,
-            caller_file_id,
-            caller_position,
-            source_min_position,
-        )?;
+        let exact_type =
+            resolve_member_item_at(db, member_item, caller_file_id, site, source_min_position)?;
         // A dynamic write answers a dynamic read, but it is not evidence that
         // the integer entries beside it are absent: `t[n]` on a table filled
         // by both `t[1] = "a"` and `t[k] = 5` holds either, since a literal
@@ -311,14 +335,7 @@ fn infer_owner_raw_member_type_with_realm_uncached(
                 .into_iter()
                 .filter_map(|key| member_index.get_member_item(member_owner, key))
                 .filter_map(|item| {
-                    resolve_member_item_with_realm(
-                        db,
-                        item,
-                        caller_file_id,
-                        caller_position,
-                        source_min_position,
-                    )
-                    .ok()
+                    resolve_member_item_at(db, item, caller_file_id, site, source_min_position).ok()
                 }),
         );
         let result_type = TypeOps::union_all(db, member_types);
@@ -352,13 +369,7 @@ fn infer_owner_raw_member_type_with_realm_uncached(
         }
 
         let member_item = LuaMemberIndexItem::One(member.get_id());
-        match resolve_member_item_with_realm(
-            db,
-            &member_item,
-            caller_file_id,
-            caller_position,
-            source_min_position,
-        ) {
+        match resolve_member_item_at(db, &member_item, caller_file_id, site, source_min_position) {
             Ok(member_type) => {
                 saw_match = true;
                 member_types.push(member_type);
@@ -400,6 +411,23 @@ pub(crate) fn resolve_member_item_with_realm(
     caller_position: Option<TextSize>,
     source_min_position: Option<&InFiled<TextSize>>,
 ) -> RawGetMemberTypeResult {
+    let site = caller_position.map(|position| CallerSite::new(caller_file_id, position));
+    resolve_member_item_at(
+        db,
+        member_item,
+        caller_file_id,
+        site.as_ref(),
+        source_min_position,
+    )
+}
+
+fn resolve_member_item_at(
+    db: &DbIndex,
+    member_item: &LuaMemberIndexItem,
+    caller_file_id: FileId,
+    site: Option<&CallerSite>,
+    source_min_position: Option<&InFiled<TextSize>>,
+) -> RawGetMemberTypeResult {
     if let Some(source_min_position) = source_min_position {
         // The generation cutoff decides which writers belong to this table
         // generation at all; position and realm decide which of those this
@@ -429,14 +457,10 @@ pub(crate) fn resolve_member_item_with_realm(
             [member_id] => LuaMemberIndexItem::One(*member_id),
             _ => LuaMemberIndexItem::Many(surviving_ids),
         };
-        return if let Some(pos) = caller_position {
-            let visible_ids =
-                item.visible_member_ids_with_realm_at_offset(db, &caller_file_id, pos);
+        return if let Some(site) = site {
+            let visible_ids = item.visible_member_ids_at_site(db, site);
             if visible_ids.is_empty() {
-                return if item
-                    .visible_member_ids_at_position(db, &caller_file_id, pos)
-                    .is_empty()
-                {
+                return if item.visible_member_ids_at_position(db, site).is_empty() {
                     Ok(LuaType::Unknown)
                 } else {
                     Err(InferFailReason::FieldNotFound)
@@ -452,8 +476,8 @@ pub(crate) fn resolve_member_item_with_realm(
         };
     }
 
-    if let Some(pos) = caller_position {
-        member_item.resolve_type_with_realm_at_offset(db, &caller_file_id, pos)
+    if let Some(site) = site {
+        member_item.resolve_type_at_site(db, site)
     } else {
         member_item.resolve_type_with_realm(db, &caller_file_id)
     }

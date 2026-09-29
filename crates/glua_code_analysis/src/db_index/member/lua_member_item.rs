@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::{BTreeMap, HashSet},
     sync::Arc,
 };
@@ -17,6 +18,42 @@ use super::{LuaMemberId, LuaMemberOwner};
 pub enum LuaMemberIndexItem {
     One(LuaMemberId),
     Many(Vec<LuaMemberId>),
+}
+
+/// Where a member is read from. Visibility takes the offset only through
+/// [`Self::position`], which notes it: an answer that never took it holds at
+/// every offset of the file with the same realm.
+#[derive(Debug)]
+pub(crate) struct CallerSite {
+    file_id: FileId,
+    position: TextSize,
+    position_read: Cell<bool>,
+}
+
+impl CallerSite {
+    pub(crate) fn new(file_id: FileId, position: TextSize) -> Self {
+        Self {
+            file_id,
+            position,
+            position_read: Cell::new(false),
+        }
+    }
+
+    fn position(&self) -> TextSize {
+        self.position_read.set(true);
+        self.position
+    }
+
+    /// The realm at the site, which does not count as taking the offset.
+    pub(crate) fn realm(&self, db: &DbIndex) -> GmodRealm {
+        db.get_gmod_infer_index()
+            .get_realm_at_offset(&self.file_id, self.position)
+    }
+
+    /// Whether visibility took the offset itself.
+    pub(crate) fn position_read(&self) -> bool {
+        self.position_read.get()
+    }
 }
 
 impl LuaMemberIndexItem {
@@ -38,7 +75,15 @@ impl LuaMemberIndexItem {
         caller_file_id: &FileId,
         caller_position: TextSize,
     ) -> Result<LuaType, InferFailReason> {
-        resolve_member_type_with_realm_at_offset(db, self, caller_file_id, caller_position)
+        self.resolve_type_at_site(db, &CallerSite::new(*caller_file_id, caller_position))
+    }
+
+    pub(crate) fn resolve_type_at_site(
+        &self,
+        db: &DbIndex,
+        site: &CallerSite,
+    ) -> Result<LuaType, InferFailReason> {
+        resolve_member_type_at_site(db, self, site)
     }
 
     pub fn resolve_semantic_decl(&self, db: &DbIndex) -> Option<LuaSemanticDeclId> {
@@ -59,7 +104,11 @@ impl LuaMemberIndexItem {
         caller_file_id: &FileId,
         caller_position: TextSize,
     ) -> Option<LuaSemanticDeclId> {
-        resolve_member_semantic_id_with_realm_at_offset(db, self, caller_file_id, caller_position)
+        resolve_member_semantic_id_at_site(
+            db,
+            self,
+            &CallerSite::new(*caller_file_id, caller_position),
+        )
     }
 
     pub fn resolve_type_owner_member_id(&self, db: &DbIndex) -> Option<LuaMemberId> {
@@ -91,13 +140,17 @@ impl LuaMemberIndexItem {
         caller_file_id: &FileId,
         caller_position: TextSize,
     ) -> Vec<LuaMemberId> {
+        self.visible_member_ids_at_site(db, &CallerSite::new(*caller_file_id, caller_position))
+    }
+
+    pub(crate) fn visible_member_ids_at_site(
+        &self,
+        db: &DbIndex,
+        site: &CallerSite,
+    ) -> Vec<LuaMemberId> {
         if let LuaMemberIndexItem::One(member_id) = self {
-            if let Some(visible_member_id) = visible_single_member_id_with_realm_at_offset(
-                db,
-                *member_id,
-                caller_file_id,
-                caller_position,
-            ) {
+            if let Some(visible_member_id) = visible_single_member_id_at_site(db, *member_id, site)
+            {
                 return vec![visible_member_id];
             }
         }
@@ -106,10 +159,9 @@ impl LuaMemberIndexItem {
         // selects indices into it, so the ids are materialised once, in the
         // output, instead of once per stage.
         let member_ids = self.member_ids_slice();
-        let caller_realm = db
-            .get_gmod_infer_index()
-            .get_realm_at_offset(caller_file_id, caller_position);
-        let mut query = OffsetVisibilityQuery::new(db, *caller_file_id, caller_position);
+        let caller_realm = site.realm(db);
+        let caller_file_id = &site.file_id;
+        let mut query = OffsetVisibilityQuery::new(db, site);
         let mut visible = query.visible_indices(member_ids);
         // `expanded` owns the history-expanded set only when the branch below
         // takes it; `base` borrows whichever candidate set is current.
@@ -140,17 +192,11 @@ impl LuaMemberIndexItem {
         caller_file_id: &FileId,
         caller_position: TextSize,
     ) -> Vec<LuaMemberId> {
+        let site = CallerSite::new(*caller_file_id, caller_position);
         let member_ids = self.get_member_ids();
-        let visible_member_ids =
-            visible_member_ids_at_offset(db, &member_ids, caller_file_id, caller_position);
+        let visible_member_ids = visible_member_ids_at_offset(db, &member_ids, &site);
         let priority_tiers = get_member_id_priority_tiers(db, caller_file_id, &visible_member_ids);
-        select_member_ids_by_workspace_and_realm(
-            db,
-            caller_file_id,
-            priority_tiers,
-            db.get_gmod_infer_index()
-                .get_realm_at_offset(caller_file_id, caller_position),
-        )
+        select_member_ids_by_workspace_and_realm(db, caller_file_id, priority_tiers, site.realm(db))
     }
 
     /// Position-only visibility: the read offset and overwrite rules apply,
@@ -160,10 +206,9 @@ impl LuaMemberIndexItem {
     pub(crate) fn visible_member_ids_at_position(
         &self,
         db: &DbIndex,
-        caller_file_id: &FileId,
-        caller_position: TextSize,
+        site: &CallerSite,
     ) -> Vec<LuaMemberId> {
-        visible_member_ids_at_offset(db, self.member_ids_slice(), caller_file_id, caller_position)
+        visible_member_ids_at_offset(db, self.member_ids_slice(), site)
     }
 
     pub fn get_member_ids(&self) -> Vec<LuaMemberId> {
@@ -183,25 +228,19 @@ impl LuaMemberIndexItem {
     }
 }
 
-fn visible_single_member_id_with_realm_at_offset(
+fn visible_single_member_id_at_site(
     db: &DbIndex,
     member_id: LuaMemberId,
-    caller_file_id: &FileId,
-    caller_position: TextSize,
+    site: &CallerSite,
 ) -> Option<LuaMemberId> {
-    if !member_visible_at_offset(db, member_id, caller_file_id, caller_position)
-        || should_expand_function_assignment_history(
-            db,
-            &[member_id],
-            caller_file_id,
-            caller_position,
-        )
+    if !member_visible_at_offset(db, member_id, site)
+        || should_expand_function_assignment_history(db, &[member_id], site)
     {
         return None;
     }
 
     let module_index = db.get_module_index();
-    if let Some(caller_workspace_id) = module_index.get_workspace_id(*caller_file_id) {
+    if let Some(caller_workspace_id) = module_index.get_workspace_id(site.file_id) {
         let candidate_workspace_id = module_index
             .get_workspace_id(member_id.file_id)
             .unwrap_or(crate::WorkspaceId::MAIN);
@@ -212,9 +251,7 @@ fn visible_single_member_id_with_realm_at_offset(
         return Some(member_id);
     }
 
-    let caller_realm = db
-        .get_gmod_infer_index()
-        .get_realm_at_offset(caller_file_id, caller_position);
+    let caller_realm = site.realm(db);
     let member_realm = member_effective_realm(db.get_gmod_infer_index(), &member_id);
     if is_realm_compatible(caller_realm, member_realm) {
         Some(member_id)
@@ -226,17 +263,11 @@ fn visible_single_member_id_with_realm_at_offset(
 fn should_expand_function_assignment_history(
     db: &DbIndex,
     member_ids: &[LuaMemberId],
-    caller_file_id: &FileId,
-    caller_position: TextSize,
+    site: &CallerSite,
 ) -> bool {
     member_ids.iter().copied().any(|member_id| {
         is_function_scoped_assignment_file_define(db, member_id)
-            && !member_assignment_shares_enclosing_function(
-                db,
-                member_id,
-                caller_file_id,
-                caller_position,
-            )
+            && !member_assignment_shares_enclosing_function(db, member_id, site)
     })
 }
 
@@ -255,17 +286,16 @@ fn is_function_scoped_assignment_file_define(db: &DbIndex, member_id: LuaMemberI
 fn member_assignment_shares_enclosing_function(
     db: &DbIndex,
     member_id: LuaMemberId,
-    caller_file_id: &FileId,
-    caller_position: TextSize,
+    site: &CallerSite,
 ) -> bool {
-    if member_id.file_id != *caller_file_id {
+    if member_id.file_id != site.file_id {
         return false;
     }
 
     let member_function = db.get_member_index().member_function_scope_range(member_id);
     let caller_function = db
         .get_member_index()
-        .enclosing_function_scope_range(*caller_file_id, caller_position);
+        .enclosing_function_scope_range(site.file_id, site.position());
 
     member_function.is_some() && member_function == caller_function
 }
@@ -273,15 +303,12 @@ fn member_assignment_shares_enclosing_function(
 fn visible_member_ids_at_offset(
     db: &DbIndex,
     member_ids: &[LuaMemberId],
-    caller_file_id: &FileId,
-    caller_position: TextSize,
+    site: &CallerSite,
 ) -> Vec<LuaMemberId> {
     let visible = member_ids
         .iter()
         .copied()
-        .filter(|member_id| {
-            member_visible_at_offset(db, *member_id, caller_file_id, caller_position)
-        })
+        .filter(|member_id| member_visible_at_offset(db, *member_id, site))
         .collect();
     drop_overwritten_writers(db, visible)
 }
@@ -364,23 +391,21 @@ fn push_unique_member_id(
     }
 }
 
-/// Per-query state for the offset visibility filter: the caller position plus
+/// Per-query state for the offset visibility filter: the caller site plus
 /// the caller file's red root, fetched at most once and shared by every
 /// member the filter probes instead of rebuilt per member.
 struct OffsetVisibilityQuery<'a> {
     db: &'a DbIndex,
-    caller_file_id: FileId,
-    caller_position: TextSize,
+    site: &'a CallerSite,
     caller_root: Option<LuaSyntaxNode>,
     caller_root_fetched: bool,
 }
 
 impl<'a> OffsetVisibilityQuery<'a> {
-    fn new(db: &'a DbIndex, caller_file_id: FileId, caller_position: TextSize) -> Self {
+    fn new(db: &'a DbIndex, site: &'a CallerSite) -> Self {
         Self {
             db,
-            caller_file_id,
-            caller_position,
+            site,
             caller_root: None,
             caller_root_fetched: false,
         }
@@ -391,18 +416,11 @@ impl<'a> OffsetVisibilityQuery<'a> {
     /// never materialises an id vector of its own.
     fn visible_indices(&mut self, member_ids: &[LuaMemberId]) -> Vec<usize> {
         let db = self.db;
-        let caller_file_id = self.caller_file_id;
-        let caller_position = self.caller_position;
+        let site = self.site;
         let mut visible = Vec::new();
         for (index, member_id) in member_ids.iter().enumerate() {
             let caller_root = self.caller_root();
-            if member_visible_at_offset_with_root(
-                db,
-                *member_id,
-                &caller_file_id,
-                caller_position,
-                caller_root,
-            ) {
+            if member_visible_at_offset_with_root(db, *member_id, site, caller_root) {
                 visible.push(index);
             }
         }
@@ -421,12 +439,7 @@ impl<'a> OffsetVisibilityQuery<'a> {
             .map(|&index| member_ids[index])
             .any(|member_id| {
                 is_function_scoped_assignment_file_define(db, member_id)
-                    && !member_assignment_shares_enclosing_function(
-                        db,
-                        member_id,
-                        &self.caller_file_id,
-                        self.caller_position,
-                    )
+                    && !member_assignment_shares_enclosing_function(db, member_id, self.site)
             })
     }
 
@@ -439,7 +452,7 @@ impl<'a> OffsetVisibilityQuery<'a> {
             self.caller_root = crate::db_index::derivation::untracked(|| {
                 self.db
                     .get_vfs()
-                    .get_syntax_tree(&self.caller_file_id)
+                    .get_syntax_tree(&self.site.file_id)
                     .map(|tree| tree.get_red_root())
             });
         }
@@ -477,32 +490,27 @@ fn drop_overwritten_writer_indices(
     });
 }
 
-fn member_visible_at_offset(
-    db: &DbIndex,
-    member_id: LuaMemberId,
-    caller_file_id: &FileId,
-    caller_position: TextSize,
-) -> bool {
-    member_visible_at_offset_with_root(db, member_id, caller_file_id, caller_position, None)
+fn member_visible_at_offset(db: &DbIndex, member_id: LuaMemberId, site: &CallerSite) -> bool {
+    member_visible_at_offset_with_root(db, member_id, site, None)
 }
 
 fn member_visible_at_offset_with_root(
     db: &DbIndex,
     member_id: LuaMemberId,
-    caller_file_id: &FileId,
-    caller_position: TextSize,
+    site: &CallerSite,
     caller_root: Option<&LuaSyntaxNode>,
 ) -> bool {
     let Some(member) = db.get_member_index().get_member(&member_id) else {
         return false;
     };
-    if member_id.file_id != *caller_file_id || !member.get_feature().is_file_define() {
+    if member_id.file_id != site.file_id || !member.get_feature().is_file_define() {
         return true;
     }
     if !member.get_key().is_name() {
         return true;
     }
 
+    let caller_position = site.position();
     let member_range = member.get_range();
     if member_range.contains(caller_position) {
         return true;
@@ -511,7 +519,7 @@ fn member_visible_at_offset_with_root(
         return !same_file_define_shares_execution_region(
             db,
             member_id,
-            caller_file_id,
+            &site.file_id,
             caller_position,
         );
     }
@@ -1117,14 +1125,12 @@ fn resolve_member_type_with_realm(
     resolve_member_type(db, &member_item_from_ids(visible_member_ids))
 }
 
-fn resolve_member_type_with_realm_at_offset(
+fn resolve_member_type_at_site(
     db: &DbIndex,
     member_item: &LuaMemberIndexItem,
-    caller_file_id: &FileId,
-    caller_position: TextSize,
+    site: &CallerSite,
 ) -> Result<LuaType, InferFailReason> {
-    let visible_member_ids =
-        member_item.visible_member_ids_with_realm_at_offset(db, caller_file_id, caller_position);
+    let visible_member_ids = member_item.visible_member_ids_at_site(db, site);
     if visible_member_ids.is_empty() {
         return resolve_member_type(db, &LuaMemberIndexItem::Many(vec![]));
     }
@@ -1142,14 +1148,12 @@ fn resolve_member_semantic_id_with_realm(
     resolve_member_semantic_id(db, &member_item_from_ids(visible_member_ids))
 }
 
-fn resolve_member_semantic_id_with_realm_at_offset(
+fn resolve_member_semantic_id_at_site(
     db: &DbIndex,
     member_item: &LuaMemberIndexItem,
-    caller_file_id: &FileId,
-    caller_position: TextSize,
+    site: &CallerSite,
 ) -> Option<LuaSemanticDeclId> {
-    let visible_member_ids =
-        member_item.visible_member_ids_with_realm_at_offset(db, caller_file_id, caller_position);
+    let visible_member_ids = member_item.visible_member_ids_at_site(db, site);
 
     resolve_member_semantic_id(db, &member_item_from_ids(visible_member_ids))
 }
