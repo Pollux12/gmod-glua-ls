@@ -1393,21 +1393,37 @@ impl PartialEq for LuaUnionType {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (LuaUnionType::Nullable(a), LuaUnionType::Nullable(b)) => a == b,
-            (LuaUnionType::Multi(a), LuaUnionType::Multi(b)) => {
-                if a.len() != b.len() {
-                    return false;
-                }
-                let mut a_set: HashSet<_> = a.iter().collect();
-                for item in b {
-                    if !a_set.remove(item) {
-                        return false;
-                    }
-                }
-                a_set.is_empty()
-            }
+            (LuaUnionType::Multi(a), LuaUnionType::Multi(b)) => same_members(a, b),
             _ => false,
         }
     }
+}
+
+/// The most members [`same_members`] compares pairwise, without a set.
+const PAIRWISE_MEMBERS: usize = 16;
+
+/// Whether `b` takes out each distinct member of `a` exactly once, as many
+/// members as `a` has: `a`'s members as a set, `b`'s as a list.
+fn same_members(a: &[LuaType], b: &[LuaType]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    if a.len() > PAIRWISE_MEMBERS {
+        let mut a_set: rustc_hash::FxHashSet<_> = a.iter().collect();
+        return b.iter().all(|item| a_set.remove(item)) && a_set.is_empty();
+    }
+    // A member of `a` stands for itself and every later equal one.
+    let mut taken = 0u32;
+    for item in b {
+        let Some(at) = a.iter().position(|member| member == item) else {
+            return false;
+        };
+        if taken & (1 << at) != 0 {
+            return false;
+        }
+        taken |= 1 << at;
+    }
+    (0..a.len()).all(|at| taken & (1 << at) != 0 || a[..at].contains(&a[at]))
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -2311,6 +2327,32 @@ mod tests {
         let mut hasher = DefaultHasher::new();
         ty.hash(&mut hasher);
         hasher.finish()
+    }
+
+    fn union_of(members: impl IntoIterator<Item = LuaType>) -> LuaUnionType {
+        LuaUnionType::from_multi_unchecked(members.into_iter().collect())
+    }
+
+    fn integers(values: impl IntoIterator<Item = i64>) -> LuaUnionType {
+        union_of(values.into_iter().map(LuaType::IntegerConst))
+    }
+
+    #[test]
+    fn unions_with_the_same_members_in_another_order_are_equal() {
+        let union = union_of([LuaType::String, LuaType::Integer, LuaType::Boolean]);
+        let reordered = union_of([LuaType::Boolean, LuaType::String, LuaType::Integer]);
+        let other = union_of([LuaType::String, LuaType::Integer, LuaType::Nil]);
+
+        assert_eq!((union == reordered, union == other), (true, false));
+    }
+
+    #[test]
+    fn large_unions_with_the_same_members_in_another_order_are_equal() {
+        let union = integers(0..40);
+        let reordered = integers((0..40).rev());
+        let other = integers(1..41);
+
+        assert_eq!((union == reordered, union == other), (true, false));
     }
 
     #[test]
