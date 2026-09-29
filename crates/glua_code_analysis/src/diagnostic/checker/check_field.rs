@@ -77,8 +77,7 @@ impl Checker for CheckFieldChecker {
                                 context,
                                 semantic_model,
                                 index_expr,
-                                DiagnosticCode::InjectField,
-                                false,
+                                Access::Inject,
                                 &mut state,
                                 profile.as_mut(),
                             );
@@ -95,8 +94,7 @@ impl Checker for CheckFieldChecker {
                             context,
                             semantic_model,
                             &index_expr,
-                            DiagnosticCode::InjectField,
-                            false,
+                            Access::Inject,
                             &mut state,
                             profile.as_mut(),
                         );
@@ -118,20 +116,11 @@ impl Checker for CheckFieldChecker {
                         }
                         continue;
                     }
-                    let weak_receiver = index_expr
-                        .get_prefix_expr()
-                        .is_some_and(|prefix| is_weak_receiver(semantic_model, &prefix));
-                    let code = if is_colon_method_call(&index_expr) && !weak_receiver {
-                        DiagnosticCode::UndefinedMethod
-                    } else {
-                        DiagnosticCode::UndefinedField
-                    };
                     check_index_expr(
                         context,
                         semantic_model,
                         &index_expr,
-                        code,
-                        weak_receiver,
+                        Access::Read,
                         &mut state,
                         profile.as_mut(),
                     );
@@ -143,6 +132,12 @@ impl Checker for CheckFieldChecker {
             profile.log(semantic_model.get_file_id(), state.member_infer_cache.len());
         }
     }
+}
+
+fn receiver_is_weak(semantic_model: &SemanticModel, index_expr: &LuaIndexExpr) -> bool {
+    index_expr
+        .get_prefix_expr()
+        .is_some_and(|prefix| is_weak_receiver(semantic_model, &prefix))
 }
 
 fn is_weak_receiver(semantic_model: &SemanticModel, prefix_expr: &LuaExpr) -> bool {
@@ -255,12 +250,21 @@ impl CheckFieldProfile {
     }
 }
 
+/// How an index expression uses the member it names.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// Assigned or defined: a missing member is injected.
+    Inject,
+    /// Read: a colon call on a receiver whose type is certain reads as a
+    /// method, anything else as a field.
+    Read,
+}
+
 fn check_index_expr(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     index_expr: &LuaIndexExpr,
-    code: DiagnosticCode,
-    weak_receiver: bool,
+    access: Access,
     state: &mut CheckFieldState,
     mut profile: Option<&mut CheckFieldProfile>,
 ) -> Option<()> {
@@ -289,17 +293,41 @@ fn check_index_expr(
 
     let index_key = index_expr.get_index_key()?;
 
+    // A member valid as a method is valid as a field too, so a colon read
+    // asks how sure its receiver is only when it is missing as a method.
+    let colon = access == Access::Read && is_colon_method_call(index_expr);
+    let first_code = match access {
+        Access::Inject => DiagnosticCode::InjectField,
+        Access::Read if colon => DiagnosticCode::UndefinedMethod,
+        Access::Read => DiagnosticCode::UndefinedField,
+    };
     let valid_member_start = profile.is_some().then(std::time::Instant::now);
-    let valid_member = is_valid_member_with_state(
+    let mut valid_member = is_valid_member_with_state(
         context,
         semantic_model,
         &prefix_typ,
         index_expr,
         &index_key,
-        code,
+        first_code,
         state,
     )
     .is_some();
+    let mut weak_receiver = None;
+    if !valid_member && colon {
+        let weak = receiver_is_weak(semantic_model, index_expr);
+        weak_receiver = Some(weak);
+        valid_member = weak
+            && is_valid_member_with_state(
+                context,
+                semantic_model,
+                &prefix_typ,
+                index_expr,
+                &index_key,
+                DiagnosticCode::UndefinedField,
+                state,
+            )
+            .is_some();
+    }
     if let (Some(profile), Some(valid_member_start)) = (profile.as_mut(), valid_member_start) {
         profile.valid_member_time += valid_member_start.elapsed();
     }
@@ -324,6 +352,17 @@ fn check_index_expr(
         return Some(());
     }
 
+    let weak_receiver = match access {
+        Access::Inject => false,
+        Access::Read => {
+            weak_receiver.unwrap_or_else(|| receiver_is_weak(semantic_model, index_expr))
+        }
+    };
+    let code = match access {
+        Access::Inject => DiagnosticCode::InjectField,
+        Access::Read if colon && !weak_receiver => DiagnosticCode::UndefinedMethod,
+        Access::Read => DiagnosticCode::UndefinedField,
+    };
     let field_name = SmolStr::new(index_key.get_path_part());
 
     if code == DiagnosticCode::UndefinedField
