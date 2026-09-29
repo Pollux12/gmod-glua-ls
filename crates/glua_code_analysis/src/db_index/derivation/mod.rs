@@ -1182,6 +1182,8 @@ thread_local! {
     static NOTED_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// The reader graph evaluations on this thread read without a lent table.
     static VIEW: RefCell<Option<std::sync::Arc<ReaderGraph>>> = const { RefCell::new(None) };
+    /// The lookups of evaluations that ended, for the next ones to begin with.
+    static SPARE: RefCell<Vec<Spare>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Lets evaluations on this thread reuse memoised values against `graph`
@@ -1274,23 +1276,66 @@ pub fn forget_lent_keys() {
 /// Starts recording the evaluation of `id` on this thread.
 pub fn begin(id: DerivationId) {
     let stamp = next_stamp();
+    let spare = SPARE
+        .with(|spare| spare.borrow_mut().pop())
+        .unwrap_or_default();
     start(Evaluation {
         id,
         log: Vec::new(),
         read: Vec::new(),
-        frames: Vec::new(),
-        unkeyed: Vec::new(),
+        frames: spare.frames,
+        unkeyed: spare.unkeyed,
         checks: FxHashSet::default(),
         log_handle: std::sync::Arc::new(frames::LogHandle::default()),
         stamp,
         reads: FxHashSet::default(),
         viewed: FxHashSet::default(),
-        read_identities: rustc_hash::FxHashMap::default(),
-        named_reads: hashbrown::HashTable::new(),
+        read_identities: spare.read_identities,
+        named_reads: spare.named_reads,
         outputs: FxHashSet::default(),
         moved: FxHashSet::default(),
         staged: rustc_hash::FxHashMap::default(),
     });
+}
+
+/// The lookups an evaluation needs only while it records, kept emptied for
+/// the next evaluation on the thread to begin with.
+#[derive(Default)]
+struct Spare {
+    read_identities: rustc_hash::FxHashMap<(u8, u128), KeyIdx>,
+    named_reads: hashbrown::HashTable<NamedRead>,
+    frames: Vec<frames::Frame>,
+    unkeyed: Vec<u64>,
+}
+
+/// The most entries a kept lookup may have room for: emptying one costs its
+/// room, which a rare large evaluation must not make every later one pay.
+const SPARE_ROOM: usize = 1 << 12;
+
+/// How many kept lookups a thread holds: as many as evaluations nest.
+const SPARE_DEPTH: usize = 8;
+
+impl Spare {
+    /// Takes `evaluation`'s lookups, emptied, if they are small enough to keep.
+    fn take(evaluation: &mut Evaluation) -> Self {
+        let mut spare = Self {
+            read_identities: std::mem::take(&mut evaluation.read_identities),
+            named_reads: std::mem::take(&mut evaluation.named_reads),
+            frames: std::mem::take(&mut evaluation.frames),
+            unkeyed: std::mem::take(&mut evaluation.unkeyed),
+        };
+        if spare.read_identities.capacity() > SPARE_ROOM {
+            spare.read_identities = Default::default();
+        }
+        if spare.named_reads.capacity() > SPARE_ROOM {
+            spare.named_reads = Default::default();
+        }
+        spare.read_identities.clear();
+        spare.named_reads.clear();
+        spare.frames.clear();
+        spare.unkeyed.clear();
+        spare
+    }
 }
 
 /// Makes `evaluation` the one recording on this thread. One already recording
@@ -1318,13 +1363,21 @@ pub fn resume(mut evaluation: Evaluation) {
 
 /// Stops recording and hands back what the evaluation read and wrote.
 pub fn end() -> Evaluation {
-    let evaluation = CURRENT.with(|current| {
+    let mut evaluation = CURRENT.with(|current| {
         let mut current = current.borrow_mut();
         let evaluation = current.take().expect("derivation::end without begin");
         *current = SUSPENDED.with(|suspended| suspended.borrow_mut().pop());
         evaluation
     });
     evaluation.log_handle.freeze(&evaluation.log);
+    let spare = Spare::take(&mut evaluation);
+    SPARE.with(|kept| {
+        // A resumed evaluation ends without having begun on this thread.
+        let mut kept = kept.borrow_mut();
+        if kept.len() < SPARE_DEPTH {
+            kept.push(spare);
+        }
+    });
     evaluation
 }
 
