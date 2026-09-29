@@ -85,9 +85,38 @@ impl LuaSyntaxResolver {
             return hit.clone();
         }
 
-        let resolved = id.walk_from_root(&self.root);
+        let resolved = if id.range.is_empty() {
+            id.walk_from_root(&self.root)
+        } else {
+            self.walk(id)
+        };
         self.entries.insert(id, resolved.clone());
         resolved
+    }
+
+    /// [`LuaSyntaxId::walk_from_root`], taking each node on the way down that
+    /// this resolver already holds and keeping each one it creates: nodes
+    /// resolved under one parent share it rather than each creating a copy.
+    fn walk(&mut self, id: LuaSyntaxId) -> Option<LuaSyntaxNode> {
+        let mut node = self.root.clone();
+        loop {
+            if node.text_range() == id.range && node.kind() == id.kind {
+                return Some(node);
+            }
+            let (kind, range, is_node) = node.child_at_range_info(id.range)?;
+            if !is_node {
+                return None;
+            }
+            let child_id = LuaSyntaxId { kind, range };
+            node = match self.entries.get(&child_id) {
+                Some(Some(child)) => child.clone(),
+                _ => {
+                    let child = node.child_or_token_at_range(id.range)?.into_node()?;
+                    self.entries.insert(child_id, Some(child.clone()));
+                    child
+                }
+            };
+        }
     }
 }
 
@@ -201,6 +230,38 @@ mod tests {
             assert!(id.to_node_from_root(&root).is_some());
             assert_eq!(memo_entries(&root), Some(1));
         });
+    }
+
+    /// Every node resolves, from a fresh resolver and from one that already
+    /// holds its ancestors, to the node a walk from the root finds.
+    #[test]
+    fn a_resolver_reusing_resolved_ancestors_finds_what_a_walk_from_the_root_finds() {
+        let root = parsed_root(
+            "local shop = { items = { 1, 2 } }
+function shop:Buy(count)
+    if count > 0 then
+        return self.items[count] + helper(count, { a = 1 })
+    end
+end
+",
+        );
+        let ids = root
+            .descendants()
+            .map(|node| LuaSyntaxId::from_node(&node))
+            .collect::<Vec<_>>();
+        let mut resolver = LuaSyntaxResolver::new(root.clone());
+
+        for pass in 0..2 {
+            for id in &ids {
+                let expected = id.walk_from_root(&root);
+                assert_eq!(resolver.resolve(*id), expected, "pass {pass}, {id:?}");
+                assert_eq!(
+                    resolver.resolve(*id).and_then(|node| node.parent()),
+                    expected.and_then(|node| node.parent()),
+                    "pass {pass}, parent of {id:?}"
+                );
+            }
+        }
     }
 
     #[test]

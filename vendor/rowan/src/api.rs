@@ -280,6 +280,14 @@ impl<L: Language> SyntaxNode<L> {
     ///
     /// The method uses binary search internally, so it's complexity is
     /// `O(log(N))` where `N = self.children_with_tokens().count()`.
+    /// The kind and range of the child [`Self::child_or_token_at_range`]
+    /// returns, and whether it is a node, without materialising it.
+    pub fn child_at_range_info(&self, range: TextRange) -> Option<(L::Kind, TextRange, bool)> {
+        self.raw
+            .child_at_range_info(range)
+            .map(|(kind, range, is_node)| (L::kind_from_raw(kind), range, is_node))
+    }
+
     pub fn child_or_token_at_range(&self, range: TextRange) -> Option<SyntaxElement<L>> {
         self.raw.child_or_token_at_range(range).map(SyntaxElement::from)
     }

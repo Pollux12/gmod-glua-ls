@@ -955,6 +955,17 @@ impl SyntaxNode {
         }
     }
 
+    /// The kind and range of the child [`Self::child_or_token_at_range`]
+    /// returns, and whether it is a node, without materialising it. GLuaLS
+    /// vendor change.
+    pub fn child_at_range_info(&self, range: TextRange) -> Option<(SyntaxKind, TextRange, bool)> {
+        let rel_range = range - self.offset();
+        self.green_ref().child_at_range(rel_range).map(|(_, rel_offset, green)| {
+            let range = TextRange::at(self.offset() + rel_offset, green.text_len());
+            (green.kind(), range, matches!(green, NodeOrToken::Node(_)))
+        })
+    }
+
     pub fn child_or_token_at_range(&self, range: TextRange) -> Option<SyntaxElement> {
         let rel_range = range - self.offset();
         self.green_ref().child_at_range(rel_range).map(|(index, rel_offset, green)| {
