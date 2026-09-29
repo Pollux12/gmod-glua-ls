@@ -14,7 +14,7 @@ use crate::{
             infer_index::infer_member_by_member_key,
             infer_param_with_cache,
             narrow::{
-                ResultTypeOrContinue,
+                ResultTypeOrContinue, call_var_ref_root,
                 condition_flow::{InferConditionFlow, get_condition_antecedent_type},
                 get_type_at_cast_flow::apply_cast,
                 get_type_at_flow::FlowWalkPolicy,
@@ -42,6 +42,9 @@ pub fn get_type_at_call_expr(
     let Some(prefix_expr) = call_expr.get_prefix_expr() else {
         return Ok(ResultTypeOrContinue::Continue);
     };
+    if !call_names_var(db, cache, &call_expr, &prefix_expr, var_ref_id) {
+        return Ok(ResultTypeOrContinue::Continue);
+    }
 
     // Keep references for predicate fallbacks that need the original call shape.
     let call_expr_ref = call_expr.clone();
@@ -258,6 +261,58 @@ pub fn get_type_at_call_expr(
     }
 
     result
+}
+
+/// Whether `call_expr`, called through `prefix_expr`, names the variable
+/// `var_ref_id`: every narrowing a callee declares applies to an argument,
+/// the object it is called on, the object whose member the first argument
+/// reads, or the call itself, so a call naming none of them leaves the
+/// variable as it was whatever its callee is.
+fn call_names_var(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    prefix_expr: &LuaExpr,
+    var_ref_id: &VarRefId,
+) -> bool {
+    // A call names at most an entry of its first argument, and finding which
+    // takes inferring its callee, so only an entry is looked for in one.
+    let names_entry = matches!(var_ref_id, VarRefId::IndexRef(..));
+    let var_ref_of = |cache: &mut LuaInferCache, expr: LuaExpr| {
+        if !names_entry && matches!(expr, LuaExpr::CallExpr(_)) {
+            return None;
+        }
+        get_var_expr_var_ref_id(db, cache, expr)
+    };
+    let names_var = |cache: &mut LuaInferCache, expr: LuaExpr| {
+        var_ref_of(cache, expr).is_some_and(|id| id == *var_ref_id)
+    };
+    let object_of = |expr: &LuaExpr| match expr {
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_prefix_expr(),
+        _ => None,
+    };
+    let args = call_expr
+        .get_args_list()
+        .map(|args| args.get_args().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let first_arg_ref = args.first().and_then(|arg| var_ref_of(cache, arg.clone()));
+    if first_arg_ref.as_ref() == Some(var_ref_id) {
+        return true;
+    }
+    if let VarRefId::IndexRef(root, _) = var_ref_id
+        && first_arg_ref
+            .and_then(call_var_ref_root)
+            .is_some_and(|first_arg_root| first_arg_root == *root)
+        && names_var(cache, LuaExpr::CallExpr(call_expr.clone()))
+    {
+        return true;
+    }
+    let first_arg_object = args.first().and_then(object_of);
+    object_of(prefix_expr)
+        .into_iter()
+        .chain(first_arg_object)
+        .chain(args.into_iter().skip(1))
+        .any(|target| names_var(cache, target))
 }
 
 #[allow(clippy::too_many_arguments)]

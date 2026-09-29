@@ -1343,6 +1343,34 @@ end
         );
     }
 
+    /// A return cast names its parameter, whichever argument that is.
+    #[test]
+    fn a_return_cast_narrows_a_later_argument() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+
+            ---@param kind string
+            ---@param value Entity
+            ---@return boolean
+            ---@return_cast value Player
+            local function isKind(kind, value) end
+
+            ---@param ent Entity
+            local function make(ent)
+                if isKind("player", ent) then
+                    later_argument_return_cast = ent
+                end
+            end
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("later_argument_return_cast"), ws.ty("Player"));
+    }
+
     #[test]
     fn deferred_closure_retains_immutable_return_cast_false_branch() {
         let mut ws = VirtualWorkspace::new();

@@ -1434,4 +1434,60 @@ return M
         let stats = ws.analysis.compilation.last_stats();
         assert_eq!(stats.evaluations(DerivationKind::GmodLoad), 1);
     }
+
+    /// A condition calling a function on one variable cannot narrow another,
+    /// so a reader of the other does not run again when the function changes.
+    #[test]
+    fn a_guard_call_on_one_variable_leaves_readers_of_another_alone() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/shared/check.lua",
+            "function Check(value) return value ~= nil end",
+        );
+        ws.def_file(
+            "lua/autorun/shared/use.lua",
+            r#"
+                local a, b = 1, 2
+                if Check(a) then
+                    local c = b
+                end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/autorun/shared/check.lua",
+            "function Check(value) return value ~= nil, 1 end",
+        );
+
+        let stats = ws.analysis.compilation.last_stats();
+        assert_eq!(stats.evaluations(DerivationKind::LocalStat), 0);
+    }
+
+    /// A call passed to a guard names no local, so a reader of a local does
+    /// not run again when that call's callee changes.
+    #[test]
+    fn a_guard_on_a_call_result_leaves_readers_of_a_local_alone() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/shared/pick.lua",
+            "function Pick() return 1 end",
+        );
+        ws.def_file(
+            "lua/autorun/shared/use.lua",
+            r#"
+                local b = 2
+                if Check(Pick()) then
+                    local c = b
+                end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/autorun/shared/pick.lua",
+            "function Pick() return 1, 2 end",
+        );
+
+        let stats = ws.analysis.compilation.last_stats();
+        assert_eq!(stats.evaluations(DerivationKind::LocalStat), 0);
+    }
 }

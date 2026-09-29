@@ -304,6 +304,16 @@ impl VarRefId {
     }
 }
 
+/// The root of a call's own reference, given its first argument's: a call
+/// names an entry of the variable it is passed first (`rawget(obj, key)`).
+pub(crate) fn call_var_ref_root(first_arg_ref: VarRefId) -> Option<VarRefRootId> {
+    match first_arg_ref {
+        VarRefId::SelfRef(self_ref_id) => Some(VarRefRootId::SelfRef(self_ref_id)),
+        VarRefId::VarRef(decl_id) => Some(VarRefRootId::Decl(decl_id)),
+        _ => None,
+    }
+}
+
 fn get_call_expr_var_ref_id(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -330,11 +340,7 @@ fn get_call_expr_var_ref_id(
             let mut args_iter = args_list.get_args();
 
             let obj_expr = args_iter.next()?;
-            let root = match get_var_expr_var_ref_id(db, cache, obj_expr.clone()) {
-                Some(VarRefId::SelfRef(self_ref_id)) => VarRefRootId::SelfRef(self_ref_id),
-                Some(VarRefId::VarRef(decl_id)) => VarRefRootId::Decl(decl_id),
-                _ => return None,
-            };
+            let root = call_var_ref_root(get_var_expr_var_ref_id(db, cache, obj_expr.clone())?)?;
             // 开始构建 access_path
             let mut access_path = String::new();
             access_path.push_str(obj_expr.syntax().text().to_string().as_str()); // 这里不需要精确的文本
