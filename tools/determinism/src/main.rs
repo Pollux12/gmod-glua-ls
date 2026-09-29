@@ -3241,7 +3241,12 @@ fn run() {
     );
 
     let started = Instant::now();
-    let keys = AnswerKeys::new(env_usize("DET_JOBS", 2).max(1));
+    let jobs = env_usize("DET_JOBS", 2).max(1);
+    assert!(
+        jobs >= 2 || !stages.iter().any(|stage| order_of(stage).is_some()),
+        "a cold-build comparison stage needs DET_JOBS of at least 2: its cold build waits for a slot the live base holds"
+    );
+    let keys = AnswerKeys::new(jobs);
     let build_key = |key: &ColdKey| {
         let built = build_cold(
             &codebase,
