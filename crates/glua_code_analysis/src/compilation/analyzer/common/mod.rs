@@ -430,8 +430,12 @@ pub fn bind_decl_write(
     // no single write's literal is its type, whichever route the write takes.
     let type_cache = widen_mutable_decl_literal(db, &type_owner, type_cache);
     let seeded = type_cache.clone();
+    // A contextual fallback holds the slot only until something is assigned:
+    // the pass that published it derives it again from what the slot holds.
+    let contextual = db.get_type_index().holds_contextual_fallback(&type_owner);
     let seeds = match db.get_type_index().get_type_cache(&type_owner) {
         None => true,
+        Some(_) if contextual => true,
         Some(existing) => {
             let both_inferred = existing.is_infer() && type_cache.is_infer();
             let comparable = both_inferred && !reads_out_of_decl;

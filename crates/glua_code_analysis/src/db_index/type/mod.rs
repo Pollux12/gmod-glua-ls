@@ -2313,6 +2313,16 @@ impl LuaTypeIndex {
         self.mark_inference_derived_state_dirty();
     }
 
+    /// Whether `owner`'s type is a contextual fallback: read off the slots its
+    /// uses feed rather than off anything assigned to it.
+    pub fn holds_contextual_fallback(&self, owner: &LuaTypeOwner) -> bool {
+        self.get_type_fact(owner).is_some_and(|fact| {
+            fact.provenance()
+                .iter()
+                .any(|step| step.event.kind == LuaInferenceProvenanceKind::ContextualUnknown)
+        })
+    }
+
     pub fn get_type_fact(&self, owner: &LuaTypeOwner) -> Option<LuaTypeFact> {
         let cache = self.read_type_cache(owner)?;
         let fact = match self.fact_metadata.get(owner) {

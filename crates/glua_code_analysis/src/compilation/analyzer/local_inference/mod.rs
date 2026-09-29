@@ -64,12 +64,7 @@ pub(super) fn stabilize_unknown_locals(
             let contextual = !uninformative
                 && db
                     .get_type_index()
-                    .get_type_fact(&(*decl_id).into())
-                    .is_some_and(|fact| {
-                        fact.provenance().iter().any(|step| {
-                            step.event.kind == crate::LuaInferenceProvenanceKind::ContextualUnknown
-                        })
-                    });
+                    .holds_contextual_fallback(&(*decl_id).into());
             if !uninformative && !contextual {
                 continue;
             }

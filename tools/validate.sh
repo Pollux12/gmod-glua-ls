@@ -97,7 +97,7 @@ if [ "$TIER" = change ] || [ "$TIER" = phase ]; then
     step suite cargo test -p glua_code_analysis --lib
   fi
   step vb_corpus corpus vb "$VB"
-  step vb_det det "$VB" 4 DET_EDITS="$OUT/vb.edits" DET_ONLY="$VB_FILE" DET_STAGES=split:2,shift,$TARGET_STAGES
+  step vb_det det "$VB" 4 DET_EDITS="$OUT/vb.edits" DET_ONLY="$VB_FILE" DET_STAGES=split:2,schedule:deferred,shift,$TARGET_STAGES
   step vb_gate gate "$VB" "$VB_FILE" "$VB_FIND" "$VB_REPLACE" "$OUT/vb.json"
   [ -n "${CHECK_CACHE:-}" ] && step vb_cache cache_check vb "$VB"
 fi
