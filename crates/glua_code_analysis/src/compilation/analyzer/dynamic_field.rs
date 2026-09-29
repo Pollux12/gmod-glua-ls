@@ -202,7 +202,13 @@ fn collect_dynamic_fields_for_file(
     let cache = &mut cache;
     let mut prefix_type_cache: FxHashMap<PrefixCacheKey, Option<LuaType>> = FxHashMap::default();
     let mut local_reassignment_positions = None;
-    for node in root.syntax().descendants() {
+    let defines_fields = |kind: glua_parser::LuaKind| {
+        matches!(
+            kind.into(),
+            LuaSyntaxKind::AssignStat | LuaSyntaxKind::FuncStat
+        )
+    };
+    for node in root.syntax().descendants_matching(defines_fields) {
         for (index_expr, value_expr) in field_definition_sites(db, file_id, &node) {
             let value_expr = value_expr.as_ref();
             let Some(prefix_expr) = index_expr.get_prefix_expr() else {
