@@ -1002,7 +1002,19 @@ fn find_global_members(
     filter: &FindMemberFilter,
 ) -> FindMembersResult {
     let mut members = Vec::new();
-    let global_decls = db.get_global_index().get_all_global_decl_ids();
+    let global_index = db.get_global_index();
+    // A keyed read names one global: its declarations are the scan's matches,
+    // kept in the same canonical order.
+    let global_decls = match filter {
+        FindMemberFilter::ByKey {
+            member_key: LuaMemberKey::Name(name),
+            ..
+        } => global_index
+            .get_global_decl_ids(name)
+            .cloned()
+            .unwrap_or_default(),
+        _ => global_index.get_all_global_decl_ids(),
+    };
     for decl_id in global_decls {
         if let Some(current_workspace_id) = ctx.workspace_id {
             let candidate_workspace_id = db

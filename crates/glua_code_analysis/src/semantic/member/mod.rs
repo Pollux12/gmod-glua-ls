@@ -409,6 +409,34 @@ mod tests {
         assert_eq!(cache.owner_raw_member_type_cache.len(), 1);
     }
 
+    /// A keyed read of `_G` finds the declarations of that global the full
+    /// scan finds, in the same order.
+    #[test]
+    fn a_keyed_global_read_finds_what_the_global_scan_finds() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/shared/b.lua",
+            r#"
+                Shared = 2
+                Other = true
+            "#,
+        );
+        ws.def_file("lua/autorun/shared/a.lua", "Shared = 1");
+        let db = ws.analysis.compilation.get_db();
+        let key = LuaMemberKey::Name("Shared".into());
+
+        let scanned = crate::find_members(db, &LuaType::Global)
+            .expect("globals are found")
+            .into_iter()
+            .filter(|member| member.key == key)
+            .collect::<Vec<_>>();
+        let keyed = crate::find_members_with_key(db, &LuaType::Global, key.clone(), true)
+            .expect("the global is found");
+
+        assert_eq!(scanned.len(), 2, "both declarations of the global");
+        assert_eq!(keyed, scanned);
+    }
+
     /// A primitive access decides literal keys without the type check, and
     /// answers as the check would.
     #[test]
