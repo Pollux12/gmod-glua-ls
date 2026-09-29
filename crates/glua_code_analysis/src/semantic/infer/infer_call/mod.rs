@@ -372,34 +372,26 @@ fn refine_known_vgui_parent_return(
     for child_id in &child_ids {
         if !metadata.vgui_panel_parent_chain_is_complete(child_id) {
             if is_broad_panel_type(&return_type) {
-                cache
-                    .vgui_parent_fallback_calls
-                    .insert(call_expr.get_syntax_id());
+                cache.mark_vgui_parent_fallback(call_expr.get_syntax_id());
             }
             return return_type;
         }
         let Some(chain) = metadata.get_vgui_panel_parent_chain(child_id) else {
             if is_broad_panel_type(&return_type) {
-                cache
-                    .vgui_parent_fallback_calls
-                    .insert(call_expr.get_syntax_id());
+                cache.mark_vgui_parent_fallback(call_expr.get_syntax_id());
             }
             return return_type;
         };
         let Some(candidate) = chain.get(depth - 1) else {
             if is_broad_panel_type(&return_type) {
-                cache
-                    .vgui_parent_fallback_calls
-                    .insert(call_expr.get_syntax_id());
+                cache.mark_vgui_parent_fallback(call_expr.get_syntax_id());
             }
             return return_type;
         };
         match &parent_id {
             Some(existing) if existing != candidate => {
                 if is_broad_panel_type(&return_type) {
-                    cache
-                        .vgui_parent_fallback_calls
-                        .insert(call_expr.get_syntax_id());
+                    cache.mark_vgui_parent_fallback(call_expr.get_syntax_id());
                 }
                 return return_type;
             }
@@ -411,16 +403,12 @@ fn refine_known_vgui_parent_return(
         Some(parent_id) => {
             // A chain answer taken mid-analysis can be one the final chain
             // state contradicts; the settled pass re-derives these reads.
-            cache
-                .vgui_parent_chain_calls
-                .insert(call_expr.get_syntax_id());
+            cache.mark_vgui_parent_chain(call_expr.get_syntax_id());
             LuaType::Ref(parent_id)
         }
         None => {
             if is_broad_panel_type(&return_type) {
-                cache
-                    .vgui_parent_fallback_calls
-                    .insert(call_expr.get_syntax_id());
+                cache.mark_vgui_parent_fallback(call_expr.get_syntax_id());
             }
             return_type
         }

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::graph::Freshness;
-use super::{CURRENT, Evaluation, KEYS, KeyIdx, KeyTable, latest_stamp, next_stamp};
+use super::{CURRENT, Evaluation, KEYS, KeyIdx, KeyTable, latest_stamp, next_stamp, with_viewed};
 use crate::GmodRealm;
 
 /// Bits of a cache's view that inference can consult.
@@ -504,6 +504,7 @@ pub fn reuse(
         }
         Reuse::Held
     })
+    .or_else(|| reuse_viewed(provenance, view, keyed, realm, caller))
     .unwrap_or(Reuse::Elsewhere)
 }
 
@@ -533,6 +534,52 @@ pub fn note_written(keys: impl IntoIterator<Item = super::HashedKey>) {
             }
         }
     });
+}
+
+/// [`reuse`] for an evaluation that views the reader graph without a lent
+/// table: a value that holds adds the keys it was computed from to the
+/// evaluation's reads.
+fn reuse_viewed(
+    provenance: &Provenance,
+    view: Gates,
+    keyed: &[u64],
+    realm: Option<(GmodRealm, u32)>,
+    caller: &'static std::panic::Location<'static>,
+) -> Option<Reuse> {
+    with_viewed(|evaluation, graph| {
+        let table = graph.keys();
+        let range = provenance.0.start as usize..provenance.0.end as usize;
+        let Some(reads) = provenance.0.log.0.get().and_then(|log| log.get(range)) else {
+            return Reuse::Elsewhere;
+        };
+        match provenance.freshness(table, reads) {
+            Freshness::Unwritten => {}
+            Freshness::Recomputing => return Reuse::Elsewhere,
+            Freshness::Written => {
+                count(|stats| stats.stale += 1);
+                return Reuse::Stale;
+            }
+        }
+        if check_cache()
+            && evaluation
+                .checks
+                .insert(check_identity(provenance, table, view, keyed, realm))
+        {
+            REUSED_ACROSS.with(|flag| flag.set(true));
+        }
+        if provenance.replays_into(evaluation.frame_stamp()) {
+            for slot in reads {
+                if evaluation.viewed.insert(*slot) {
+                    evaluation.reads.insert(graph.key(*slot).clone());
+                }
+            }
+        }
+        count(|stats| {
+            stats.reused += 1;
+            stats.sites.entry(caller).or_default()[3] += 1;
+        });
+        Reuse::Held
+    })
 }
 
 /// Marks keys an evaluation is about to compute again as written, now that

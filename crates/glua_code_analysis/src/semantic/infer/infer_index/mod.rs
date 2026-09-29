@@ -172,7 +172,7 @@ pub fn infer_index_expr(
     // Keep analysis retries unresolved; diagnostics narrow unknown fields from unknown, not nil.
     if pass_flow
         && prefix_type.is_unknown()
-        && cache.get_config().analysis_phase.is_diagnostics()
+        && cache.phase_is_diagnostics()
         && let Some(var_ref_id) = get_index_expr_var_ref_id(db, cache, &index_expr)
     {
         return run_fallback_narrow_raw(db, cache, index_expr, &var_ref_id, LuaType::Unknown);
@@ -997,13 +997,11 @@ fn infer_table_member_owner(
                 // the miss is recorded and the read defers. Unresolve retries
                 // it once later members land; the force and diagnostics
                 // phases keep the hedge as the final answer.
-                if cache.get_config().analysis_phase.is_ordered() {
+                if cache.phase_is_ordered() {
                     cache.record_missed_member_read(db, owner, key);
                     return Err(InferFailReason::FieldNotFound);
                 }
-                if cache.get_config().analysis_phase.is_force()
-                    && !crate::semantic::infer::floors_unsettled(db, cache)
-                {
+                if cache.phase_is_force() && !crate::semantic::infer::floors_unsettled(db, cache) {
                     return Err(InferFailReason::FieldNotFound);
                 }
                 return Ok(empty_table_dynamic_access_type(

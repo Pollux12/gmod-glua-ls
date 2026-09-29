@@ -42,6 +42,9 @@ pub struct LuaCompilation {
     taken_revision: u64,
     /// The scripted scopes, lent to each re-analysis.
     scopes: analyzer::ScopesCache,
+    /// Each file's inference memo from the last settled re-analysis, which
+    /// the file's next diagnostics take; the next re-analysis drops the rest.
+    memos: Mutex<rustc_hash::FxHashMap<FileId, LuaInferCache>>,
 }
 
 /// Where the re-analysis in progress stands after
@@ -70,6 +73,7 @@ impl LuaCompilation {
             reanalysis: Mutex::default(),
             taken_revision: 0,
             scopes: analyzer::ScopesCache::default(),
+            memos: Mutex::default(),
         };
 
         compilation.db.update_config(emmyrc.clone());
@@ -78,6 +82,34 @@ impl LuaCompilation {
 
     pub fn get_semantic_model(&'_ self, file_id: FileId) -> Option<SemanticModel<'_>> {
         let cache = LuaInferCache::new(file_id, Default::default());
+        let tree = self.db.get_vfs().get_syntax_tree(&file_id)?;
+        Some(SemanticModel::new(
+            file_id,
+            &self.db,
+            cache,
+            self.emmyrc.clone(),
+            tree.get_chunk_node(),
+        ))
+    }
+
+    /// [`Self::get_semantic_model`] for `file_id`'s diagnostics, starting from
+    /// the memo the last settled re-analysis left for the file.
+    pub(crate) fn get_diagnostic_semantic_model(
+        &'_ self,
+        file_id: FileId,
+    ) -> Option<SemanticModel<'_>> {
+        let memo = self
+            .memos
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&file_id);
+        let cache = match memo {
+            Some(mut cache) => {
+                *cache.config_mut() = Default::default();
+                cache
+            }
+            None => LuaInferCache::new(file_id, Default::default()),
+        };
         let tree = self.db.get_vfs().get_syntax_tree(&file_id)?;
         Some(SemanticModel::new(
             file_id,
@@ -107,6 +139,10 @@ impl LuaCompilation {
         if let Some(log) = &mut self.batch_log {
             log.push(file_ids.clone());
         }
+        self.memos
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         let edits = derivation::EditMaps::new(self.db.get_vfs_mut().take_edit_maps(&file_ids));
         let reads = self
             .diagnostic_reads
@@ -159,6 +195,10 @@ impl LuaCompilation {
         let edits = reanalysis.edits().clone();
         let reanalysed = reanalysis.finish(&mut self.db);
         self.scopes = reanalysed.scopes;
+        *self
+            .memos
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = reanalysed.memos;
         self.last_evaluated_files = reanalysed.evaluated_files;
         self.last_stats = reanalysed.stats;
         let reads = self
@@ -262,7 +302,9 @@ impl LuaCompilation {
             file_id,
             glua_parser::LuaSyntaxId::from_node(&tree.get_red_root()),
         ));
+        let viewed = derivation::view_graph(self.db.reader_graph_shared());
         let result = diagnose();
+        drop(viewed);
         let (_, reads, _) = derivation::end().into_parts(|key| self.db.fact_fingerprint(key));
         let reads = reads
             .into_iter()
@@ -294,6 +336,7 @@ impl LuaCompilation {
             reanalysis: Mutex::default(),
             taken_revision: self.taken_revision,
             scopes: analyzer::ScopesCache::default(),
+            memos: Mutex::default(),
         }
     }
 
@@ -322,6 +365,10 @@ impl LuaCompilation {
             .diagnostic_reads
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = DiagnosticReads::default();
+        self.memos
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     /// The reader graph's and the diagnostic reads' census, for the profile.

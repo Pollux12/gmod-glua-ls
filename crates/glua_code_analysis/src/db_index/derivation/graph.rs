@@ -1185,7 +1185,12 @@ impl ReaderGraph {
         self.table.keys[slot as usize].readers.seen_by(deriv)
     }
 
-    fn key(&self, slot: KeyIdx) -> &HashedKey {
+    /// The key table, for checking memoised values against it.
+    pub(super) fn keys(&self) -> &KeyTable {
+        &self.table
+    }
+
+    pub(super) fn key(&self, slot: KeyIdx) -> &HashedKey {
         self.table.keys[slot as usize]
             .key
             .as_ref()

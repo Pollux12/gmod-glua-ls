@@ -36,4 +36,75 @@ mod test {
             "a walk from the field's member type was computed again by another statement"
         );
     }
+
+    /// A file's diagnostics start from the memo its analysis left, so they
+    /// infer less than diagnostics of the same file from scratch.
+    #[test]
+    fn diagnostics_start_from_the_memo_the_analysis_left() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/diagnosed.lua",
+            "local cfg = { value = 1 }
+local read = cfg.value
+if read > 0 then
+    print(read + cfg.value)
+end
+",
+        );
+        let inferred = |ws: &VirtualWorkspace| {
+            let (_, counts) = counted(|| {
+                ws.analysis
+                    .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+            });
+            counts
+                .get(&(Work::Infer, Some(DerivationKind::Diagnostics)))
+                .map_or(0, |(computed, _)| *computed)
+        };
+
+        let first = inferred(&ws);
+        let again = inferred(&ws);
+
+        assert!(
+            first < again,
+            "diagnostics inferred {first} with the analysis memo and {again} without"
+        );
+    }
+
+    /// Diagnostics that take values from the analysis memo record every key
+    /// those values were computed from: they read at least what diagnostics
+    /// of the same file from scratch read.
+    #[test]
+    fn diagnostics_from_the_memo_read_what_diagnostics_from_scratch_read() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/config.lua",
+            "Config = { value = 1 }
+",
+        );
+        let reader = ws.def_file(
+            "lua/autorun/reader.lua",
+            "local v = Config.value
+local s = v + 1
+print(s)
+",
+        );
+        let read_keys = |ws: &VirtualWorkspace| {
+            ws.analysis
+                .diagnose_file(reader, tokio_util::sync::CancellationToken::new());
+            ws.analysis
+                .compilation
+                .diagnostic_read_keys()
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+        };
+
+        let from_memo = read_keys(&ws);
+        let from_scratch = read_keys(&ws);
+
+        let missing = from_scratch.difference(&from_memo).collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "reads missing with the memo: {missing:?}"
+        );
+    }
 }

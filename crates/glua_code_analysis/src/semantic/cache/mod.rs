@@ -23,6 +23,10 @@ use crate::{
 
 const DYNAMIC_FIELDS_GATE: Gates = 1;
 const CALL_SITE_PARAMS_GATE: Gates = 2;
+/// One gate per analysis phase that inference answers differently under.
+const ORDERED_PHASE_GATE: Gates = 4;
+const FORCE_PHASE_GATE: Gates = 8;
+const DIAGNOSTICS_PHASE_GATE: Gates = 16;
 
 pub type FlowCacheInnerKey = (FlowId, GmodRealm, FlowOrigin);
 
@@ -401,8 +405,15 @@ impl LuaInferCache {
 
     /// The view gates this cache infers under.
     fn view_gates(&self) -> Gates {
+        let phase = match self.config.analysis_phase {
+            LuaAnalysisPhase::Ordered => ORDERED_PHASE_GATE,
+            LuaAnalysisPhase::Force => FORCE_PHASE_GATE,
+            LuaAnalysisPhase::Diagnostics => DIAGNOSTICS_PHASE_GATE,
+            LuaAnalysisPhase::Unordered => 0,
+        };
         (u8::from(self.config.dynamic_fields_visible) * DYNAMIC_FIELDS_GATE)
             | (u8::from(self.config.call_site_params_visible) * CALL_SITE_PARAMS_GATE)
+            | phase
     }
 
     /// What a tracked lookup is made under now.
@@ -530,6 +541,39 @@ impl LuaInferCache {
     pub fn dynamic_fields_visible(&self) -> bool {
         derivation::consult_gates(DYNAMIC_FIELDS_GATE);
         self.config.dynamic_fields_visible
+    }
+
+    /// Marks `call` as a `GetParent` read the vgui parent fallback answered.
+    /// Readers of the call learn it from here, not from the value, so the
+    /// value stays with this evaluation.
+    pub(crate) fn mark_vgui_parent_fallback(&mut self, call: LuaSyntaxId) {
+        derivation::taint();
+        self.vgui_parent_fallback_calls.insert(call);
+    }
+
+    /// Marks `call` as a `GetParent` read answered through a resolved vgui
+    /// parent chain; see [`Self::mark_vgui_parent_fallback`].
+    pub(crate) fn mark_vgui_parent_chain(&mut self, call: LuaSyntaxId) {
+        derivation::taint();
+        self.vgui_parent_chain_calls.insert(call);
+    }
+
+    /// Whether inference runs in the ordered phase, noting the gate consulted.
+    pub fn phase_is_ordered(&self) -> bool {
+        derivation::consult_gates(ORDERED_PHASE_GATE);
+        self.config.analysis_phase.is_ordered()
+    }
+
+    /// Whether inference runs in the force phase, noting the gate consulted.
+    pub fn phase_is_force(&self) -> bool {
+        derivation::consult_gates(FORCE_PHASE_GATE);
+        self.config.analysis_phase.is_force()
+    }
+
+    /// Whether inference runs for diagnostics, noting the gate consulted.
+    pub fn phase_is_diagnostics(&self) -> bool {
+        derivation::consult_gates(DIAGNOSTICS_PHASE_GATE);
+        self.config.analysis_phase.is_diagnostics()
     }
 
     /// Whether call-site parameter facts are visible, noting the gate

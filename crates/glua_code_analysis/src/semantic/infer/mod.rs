@@ -63,7 +63,7 @@ pub use infer_call::InferCallFuncResult;
 /// unanswered and is recorded, so its reader runs again when the fact lands
 /// or the run closes, and a floor never stands in for a fact still to come.
 pub(crate) fn floors_unsettled(db: &DbIndex, cache: &LuaInferCache) -> bool {
-    cache.get_config().analysis_phase.is_force()
+    cache.phase_is_force()
         && db.stage_rule_holds(crate::db_index::derivation::StageRule::FloorUnsettled)
 }
 

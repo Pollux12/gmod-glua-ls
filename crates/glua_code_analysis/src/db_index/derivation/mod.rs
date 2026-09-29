@@ -983,6 +983,9 @@ pub struct Evaluation {
     stamp: u64,
     /// Reads made while no key table is lent.
     reads: FxHashSet<HashedKey>,
+    /// Slots of the viewed graph whose keys are in `reads` already; see
+    /// [`view_graph`].
+    viewed: FxHashSet<KeyIdx>,
     /// Cheap identities of keys already in `reads`, see [`note_read_by`].
     read_identities: rustc_hash::FxHashMap<(u8, u128), KeyIdx>,
     outputs: FxHashSet<HashedKey>,
@@ -1109,6 +1112,35 @@ thread_local! {
     static WRITE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CAPTURED: RefCell<Option<FxHashSet<HashedKey>>> = const { RefCell::new(None) };
     static NOTED_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The reader graph evaluations on this thread read without a lent table.
+    static VIEW: RefCell<Option<std::sync::Arc<ReaderGraph>>> = const { RefCell::new(None) };
+}
+
+/// Lets evaluations on this thread reuse memoised values against `graph`
+/// without a lent table, until the returned guard drops.
+pub fn view_graph(graph: std::sync::Arc<ReaderGraph>) -> ViewedGraph {
+    VIEW.with(|view| *view.borrow_mut() = Some(graph));
+    ViewedGraph
+}
+
+/// Ends [`view_graph`] when dropped, unwinding included.
+#[must_use]
+pub struct ViewedGraph;
+
+impl Drop for ViewedGraph {
+    fn drop(&mut self) {
+        VIEW.with(|view| view.borrow_mut().take());
+    }
+}
+
+/// Runs `f` on the evaluation recording on this thread and the graph it
+/// views, if there are both.
+fn with_viewed<T>(f: impl FnOnce(&mut Evaluation, &ReaderGraph) -> T) -> Option<T> {
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        let evaluation = current.as_mut()?;
+        VIEW.with(|view| view.borrow().as_deref().map(|graph| f(evaluation, graph)))
+    })
 }
 
 /// Runs `f` outside any evaluation and returns every key it wrote: a reset
@@ -1183,6 +1215,7 @@ pub fn begin(id: DerivationId) {
         log_handle: std::sync::Arc::new(frames::LogHandle::default()),
         stamp,
         reads: FxHashSet::default(),
+        viewed: FxHashSet::default(),
         read_identities: rustc_hash::FxHashMap::default(),
         outputs: FxHashSet::default(),
         moved: FxHashSet::default(),

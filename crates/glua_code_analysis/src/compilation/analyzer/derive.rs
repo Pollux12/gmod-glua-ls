@@ -103,6 +103,15 @@ impl Recipes {
     }
 }
 
+impl Recipes {
+    /// Each file's inference memo.
+    pub(super) fn into_memos(self) -> FxHashMap<FileId, crate::LuaInferCache> {
+        self.caches
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 impl super::engine::Recipe for Recipes {
     fn splits(&self, kind: DerivationKind) -> bool {
         // Call-site contributions are collected with call-site facts invisible;

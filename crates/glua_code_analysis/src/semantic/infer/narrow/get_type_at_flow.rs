@@ -2014,7 +2014,7 @@ fn get_type_at_assign_stat(
         if explicit_var_type.is_none()
             && expr_type.is_nil()
             && is_untyped_param_rooted_index(db, &maybe_ref_id)
-            && !cache.get_config().analysis_phase.is_diagnostics()
+            && !cache.phase_is_diagnostics()
         {
             return Ok(ResultTypeOrContinue::Continue);
         }

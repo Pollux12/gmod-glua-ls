@@ -157,6 +157,8 @@ pub(crate) struct Reanalysed {
     pub(crate) stats: engine::EngineStats,
     /// The scripted scopes, to lend the next re-analysis.
     pub(crate) scopes: ScopesCache,
+    /// Each evaluated file's inference memo, for its diagnostics.
+    pub(crate) memos: HashMap<FileId, crate::LuaInferCache>,
 }
 
 /// A re-analysis in progress. It re-analyses files from their current text:
@@ -176,6 +178,9 @@ pub(crate) struct Reanalysis {
     /// The stage the run is at while it waits for its next slice.
     stage: derivation::AnalysisStage,
     scopes: ScopesCache,
+    /// The inference memos of the passes that settled; a later pass's
+    /// replaces an earlier one's.
+    memos: HashMap<FileId, crate::LuaInferCache>,
 }
 
 impl Reanalysis {
@@ -196,6 +201,7 @@ impl Reanalysis {
             access_paths: crate::semantic::AccessPaths::default(),
             stage: derivation::AnalysisStage::Closed,
             scopes,
+            memos: HashMap::default(),
         };
         reanalysis.pause(db);
         reanalysis
@@ -243,6 +249,9 @@ impl Reanalysis {
                 break false;
             }
             crate::profile::memory::checkpoint("after the engine run");
+            if let Some(Pass::Open(recipes)) = self.pass.take() {
+                self.memos.extend(recipes.into_memos());
+            }
             let stale = self.engine.take_stale_sources();
             crate::semantic::stop_keeping_access_paths();
             self.pass = start_pass(
@@ -323,6 +332,7 @@ impl Reanalysis {
             evaluated_files,
             stats,
             scopes: self.scopes,
+            memos: self.memos,
         }
     }
 }

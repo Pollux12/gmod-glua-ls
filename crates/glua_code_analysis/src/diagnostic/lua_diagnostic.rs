@@ -531,7 +531,7 @@ impl LuaDiagnostic {
 
         let slow_log_enabled = log::log_enabled!(log::Level::Info);
         let sem_start = slow_log_enabled.then(Instant::now);
-        let semantic_model = compilation.get_semantic_model(file_id)?;
+        let semantic_model = compilation.get_diagnostic_semantic_model(file_id)?;
         // Set diagnostics phase so error results are cached (types are final,
         // no subsequent unresolve pass will change them). This prevents expensive
         // recomputation across diagnostic checkers.

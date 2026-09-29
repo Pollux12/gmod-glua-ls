@@ -243,6 +243,12 @@ impl DbIndex {
         &self.derivations
     }
 
+    /// The reader graph, shared, for evaluations that view it; see
+    /// [`derivation::view_graph`].
+    pub(crate) fn reader_graph_shared(&self) -> Arc<derivation::ReaderGraph> {
+        Arc::clone(&self.derivations)
+    }
+
     pub(crate) fn reader_graph_mut(&mut self) -> &mut derivation::ReaderGraph {
         Arc::make_mut(&mut self.derivations)
     }
