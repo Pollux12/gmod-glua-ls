@@ -1642,6 +1642,12 @@ fn file_position(file_id: FileId, position: TextSize) -> u128 {
 
 /// Records a read of the realm at `offset` in `file_id`.
 pub fn note_realm_at_read(file_id: FileId, offset: TextSize) {
+    // A derivation's own file's realm moves as a whole for it: an edit of the
+    // file replaces its derivations, and the load graph moves every offset.
+    if current().is_some_and(|id| id.file_id == file_id) {
+        note_file_fact_read(FileFact::GmodRealm, file_id);
+        return;
+    }
     note_read_by((u8::MAX - 9, file_position(file_id, offset)), || {
         FactKey::GmodRealmAt(file_id, offset)
     });
