@@ -13,7 +13,7 @@ use std::{ops::Deref, sync::Arc};
 
 use glua_parser::{
     LuaAst, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaLiteralExpr, LuaLiteralToken,
-    LuaTableExpr, LuaVarExpr, NumberResult,
+    LuaNameExpr, LuaSyntaxKind, LuaTableExpr, LuaVarExpr, NumberResult,
 };
 use infer_binary::infer_binary_expr;
 pub(crate) use infer_call::get_prefix_expr_signature_id;
@@ -488,6 +488,32 @@ where
 }
 
 /// 推断值已经绑定的类型(不是推断值的类型). 例如从右值推断左值类型, 从调用参数推断函数参数类型参数类型
+/// Whether the local `target` names was declared as a copy of the variable
+/// `expr` reads (`local value = argument` ... `value = argument`): what it holds
+/// then came from that variable, so storing the variable back into it is the
+/// variable deriving itself, not evidence of its type.
+fn declared_as_copy_of(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    target: &LuaNameExpr,
+    expr: &LuaExpr,
+) -> bool {
+    let LuaExpr::NameExpr(source) = expr else {
+        return false;
+    };
+    let references = db.get_reference_index();
+    let Some(source_decl) = references.get_var_reference_decl(&file_id, source.get_range()) else {
+        return false;
+    };
+    references
+        .get_var_reference_decl(&file_id, target.get_range())
+        .and_then(|target_decl| db.get_decl_index().get_decl(&target_decl))
+        .and_then(|decl| decl.get_value_syntax_id())
+        .filter(|value| value.get_kind() == LuaSyntaxKind::NameExpr)
+        .and_then(|value| references.get_var_reference_decl(&file_id, value.get_range()))
+        == Some(source_decl)
+}
+
 pub fn infer_bind_value_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -516,6 +542,11 @@ pub fn infer_bind_value_type(
                 if expr == *assign_expr {
                     let var = vars.get(idx);
                     if let Some(var) = var {
+                        if let LuaVarExpr::NameExpr(target) = var
+                            && declared_as_copy_of(db, cache.get_file_id(), target, &expr)
+                        {
+                            return None;
+                        }
                         if let LuaVarExpr::IndexExpr(index_expr) = var {
                             let prefix_expr = index_expr.get_prefix_expr()?;
                             let prefix_type = infer_expr(db, cache, prefix_expr).ok()?;

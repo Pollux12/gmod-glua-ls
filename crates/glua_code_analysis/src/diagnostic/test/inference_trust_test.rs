@@ -433,6 +433,32 @@ mod tests {
     }
 
     #[test]
+    fn a_local_assigned_back_into_its_own_copy_gains_no_usage_context() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "copy_context.lua",
+            r#"
+            ---@class Target
+            ---@return Target
+            local function find() end
+            ---@return unknown
+            local function unknown_source() end
+
+            local argument = unknown_source()
+            local value = argument
+            if value then
+                value = find()
+            end
+            value = argument
+            "#,
+        );
+
+        let found = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnknown);
+
+        assert_eq!(found, Vec::new());
+    }
+
+    #[test]
     fn declared_overload_return_does_not_infer_from_usage_context() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def_file(
