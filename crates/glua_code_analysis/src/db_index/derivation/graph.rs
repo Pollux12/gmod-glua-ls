@@ -27,7 +27,9 @@ struct Record {
 struct KeySlot {
     key: Option<HashedKey>,
     readers: Readers,
-    producers: Vec<DerivIdx>,
+    /// The key's first producer ([`NO_PRODUCER`]: none); the rest are in
+    /// [`KeyTable::more_producers`].
+    producer: DerivIdx,
     /// The key's fingerprint as last taken, and the generation it was taken in
     /// ([`NO_GENERATION`]: none); see [`ReaderGraph::current_fingerprint`].
     /// Only the analysis thread takes fingerprints, so relaxed order suffices.
@@ -40,6 +42,8 @@ struct KeySlot {
     /// Whether an evaluation took the value away to compute it again; see
     /// [`KeyTable::open_window`].
     windowed: bool,
+    /// Whether [`KeyTable::more_producers`] holds producers of the key.
+    more_producers: bool,
 }
 
 impl Clone for KeySlot {
@@ -47,12 +51,13 @@ impl Clone for KeySlot {
         Self {
             key: self.key.clone(),
             readers: self.readers.clone(),
-            producers: self.producers.clone(),
+            producer: self.producer,
             current: AtomicU64::new(self.current.load(Ordering::Relaxed)),
             current_generation: AtomicU32::new(self.current_generation.load(Ordering::Relaxed)),
             stamp: self.stamp,
             written: self.written,
             windowed: self.windowed,
+            more_producers: self.more_producers,
         }
     }
 }
@@ -62,17 +67,19 @@ impl Default for KeySlot {
         Self {
             key: None,
             readers: Readers::default(),
-            producers: Vec::new(),
+            producer: NO_PRODUCER,
             current: AtomicU64::new(0),
             current_generation: AtomicU32::new(NO_GENERATION),
             stamp: 0,
             written: 0,
             windowed: false,
+            more_producers: false,
         }
     }
 }
 
 const NO_GENERATION: u32 = u32::MAX;
+const NO_PRODUCER: DerivIdx = DerivIdx::MAX;
 
 /// A key's readers, grouped by the fingerprint each saw, each group sorted.
 /// A derivation reads a key at one value, so it is in one group. Nearly every
@@ -294,6 +301,9 @@ pub struct KeyTable {
     free_keys: Vec<KeyIdx>,
     /// The keys read out of each base key ([`FactKey::base`]).
     derived: FxHashMap<KeyIdx, DerivedKeys>,
+    /// The producers of a key past the one its slot keeps: few keys have more
+    /// than one.
+    more_producers: FxHashMap<KeyIdx, Vec<DerivIdx>>,
     /// The stamp of the latest write or release of a live slot.
     last_written: u64,
     /// The keys an evaluation took away to compute again, each with the stamp
@@ -454,6 +464,51 @@ impl KeyTable {
         }
     }
 
+    fn add_producer(&mut self, slot: KeyIdx, deriv: DerivIdx) {
+        let entry = &mut self.keys[slot as usize];
+        if entry.producer == NO_PRODUCER {
+            entry.producer = deriv;
+        } else {
+            entry.more_producers = true;
+            self.more_producers.entry(slot).or_default().push(deriv);
+        }
+    }
+
+    fn remove_producer(&mut self, slot: KeyIdx, deriv: DerivIdx) {
+        let entry = &mut self.keys[slot as usize];
+        if !entry.more_producers {
+            if entry.producer == deriv {
+                entry.producer = NO_PRODUCER;
+            }
+            return;
+        }
+        let more = self
+            .more_producers
+            .get_mut(&slot)
+            .expect("a slot marked with more producers has them");
+        if entry.producer == deriv {
+            entry.producer = more.pop().expect("more producers are never empty");
+        } else if let Some(at) = more.iter().position(|producer| *producer == deriv) {
+            more.swap_remove(at);
+        }
+        if more.is_empty() {
+            entry.more_producers = false;
+            self.more_producers.remove(&slot);
+        }
+    }
+
+    fn producers(&self, slot: KeyIdx) -> impl Iterator<Item = DerivIdx> + '_ {
+        let entry = &self.keys[slot as usize];
+        let more = entry
+            .more_producers
+            .then(|| self.more_producers.get(&slot))
+            .flatten();
+        (entry.producer != NO_PRODUCER)
+            .then_some(entry.producer)
+            .into_iter()
+            .chain(more.into_iter().flatten().copied())
+    }
+
     /// Whether `slot`'s value is being computed again.
     pub(super) fn windowed(&self, slot: KeyIdx) -> bool {
         self.keys[slot as usize].windowed
@@ -539,12 +594,14 @@ impl ReaderGraph {
             .fold((0, 0), |(groups, sets), (group, set)| {
                 (groups + group, sets + set)
             });
-        let producer_bytes: usize = table
-            .keys
-            .iter()
-            .map(|slot| slot.producers.capacity())
-            .sum::<usize>()
-            * size_of::<DerivIdx>();
+        let producer_bytes = hash_table_bytes(
+            table.more_producers.capacity(),
+            size_of::<(KeyIdx, Vec<DerivIdx>)>(),
+        ) + table
+            .more_producers
+            .values()
+            .map(|more| more.capacity() * size_of::<DerivIdx>())
+            .sum::<usize>();
         let (reads, outputs) = self
             .derivations
             .iter()
@@ -813,7 +870,7 @@ impl ReaderGraph {
             |key| added.push(key),
         );
         for key in added {
-            self.table.keys[key as usize].producers.push(deriv);
+            self.table.add_producer(key, deriv);
             if let Some(owner) = self.key(key).owning_file()
                 && owner != id.file_id
             {
@@ -1087,10 +1144,9 @@ impl ReaderGraph {
     pub fn producers(&self, key: &HashedKey) -> impl Iterator<Item = DerivationId> + '_ {
         self.table
             .find(key)
-            .map(|slot| &self.table.keys[slot as usize].producers)
             .into_iter()
-            .flatten()
-            .map(|deriv| self.derivations[*deriv as usize].id)
+            .flat_map(|slot| self.table.producers(slot))
+            .map(|deriv| self.derivations[deriv as usize].id)
     }
 
     pub fn derivations_of_file(&self, file_id: FileId) -> impl Iterator<Item = DerivationId> + '_ {
@@ -1151,7 +1207,7 @@ impl ReaderGraph {
     fn release_key(&mut self, slot: KeyIdx) {
         let entry = &mut self.table.keys[slot as usize];
         if !entry.readers.is_empty()
-            || !entry.producers.is_empty()
+            || entry.producer != NO_PRODUCER
             || self.table.derived.contains_key(&slot)
         {
             return;
@@ -1204,10 +1260,7 @@ impl ReaderGraph {
 
     /// Removes `deriv` from `key`'s producers, leaving the slot allocated.
     fn unproduce(&mut self, key: KeyIdx, deriv: DerivIdx, file_id: FileId) {
-        let producers = &mut self.table.keys[key as usize].producers;
-        if let Some(at) = producers.iter().position(|producer| *producer == deriv) {
-            producers.swap_remove(at);
-        }
+        self.table.remove_producer(key, deriv);
         if let Some(owner) = self.key(key).owning_file()
             && owner != file_id
             && let Some(derivs) = self.foreign_producers.get_mut(&owner)
@@ -1542,6 +1595,20 @@ mod tests {
         graph.remove_file(FileId::new(2));
 
         assert_eq!(graph.stale_readers(&decl(20), |_| false).count(), 0);
+    }
+
+    #[test]
+    fn a_key_keeps_its_other_producers_when_its_first_stops() {
+        let mut graph = ReaderGraph::default();
+        graph.replace(id(1, 0), vec![], vec![key(9)], |_| 0);
+        graph.replace(id(2, 0), vec![], vec![key(9)], |_| 0);
+        graph.replace(id(3, 0), vec![], vec![key(9)], |_| 0);
+
+        graph.replace(id(1, 0), vec![], vec![], |_| 0);
+
+        let mut producers = graph.producers(&key(9)).collect::<Vec<_>>();
+        producers.sort();
+        assert_eq!(producers, vec![id(2, 0), id(3, 0)]);
     }
 
     #[test]
