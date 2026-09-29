@@ -83,7 +83,7 @@ if [ -z "${SKIP_BUILD:-}" ] && [ -z "${VALIDATE_BIN:-}" ]; then
   cargo build --release -p determinism -p glua_check -p glua_ls 2>&1 | grep -E "^error|Finished" || exit 1
 fi
 
-TARGET_STAGES=schedule,edit,revert,noop,reload,delete,recreate
+TARGET_STAGES=schedule,schedule:deferred,edit,revert,noop,reload,delete,recreate
 
 if [ "$TIER" = change ] || [ "$TIER" = phase ]; then
   VB=${GLUALS_VB:?GLUALS_VB is required}
@@ -97,7 +97,7 @@ if [ "$TIER" = change ] || [ "$TIER" = phase ]; then
     step suite cargo test -p glua_code_analysis --lib
   fi
   step vb_corpus corpus vb "$VB"
-  step vb_det det "$VB" 4 DET_EDITS="$OUT/vb.edits" DET_ONLY="$VB_FILE" DET_STAGES=split:2,schedule:deferred,shift,$TARGET_STAGES
+  step vb_det det "$VB" 4 DET_EDITS="$OUT/vb.edits" DET_ONLY="$VB_FILE" DET_STAGES=split:2,shift,$TARGET_STAGES
   step vb_gate gate "$VB" "$VB_FILE" "$VB_FIND" "$VB_REPLACE" "$OUT/vb.json"
   [ -n "${CHECK_CACHE:-}" ] && step vb_cache cache_check vb "$VB"
 fi
@@ -116,7 +116,7 @@ if [ "$TIER" = phase ]; then
   step vb_hubs det "$VB" 4 DET_HUBS=6 DET_EACH=1 DET_STAGES=touch,shift,delete,recreate,rename
   step vb_stride det "$VB" 4 DET_STRIDE=10 DET_STAGES=touch,shift
   for g in "$GM"/*/; do
-    step "gm_$(basename "$g")" det "$g" 4 DET_STAGES=schedule
+    step "gm_$(basename "$g")" det "$g" 4 DET_STAGES=schedule,schedule:deferred
   done
   step cityrp_corpus corpus cityrp "$CR"
   step cityrp_det det "$CR" 2 DET_EDITS="$OUT/cityrp.edits" DET_HUBS=5 DET_ONLY="$CR_CORE" \
