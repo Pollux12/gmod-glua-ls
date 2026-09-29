@@ -112,31 +112,27 @@ impl LuaReferenceIndex {
         self.file_revision.get(&file_id).copied().unwrap_or(0)
     }
 
-    /// Reserves capacity for one file's worth of reference writes.
+    /// Reserves capacity in the workspace-wide maps for one file's worth of
+    /// reference writes, and creates the file's own entries.
     ///
     /// `entries` is a cheap upper-bound hint (see
     /// `crate::compilation::analyzer::common::estimate_file_index_entries`),
     /// not a count the index trusts: maps keep their exact contents, so the
     /// hint only changes rehashing, never facts. Distinct member keys are a
     /// fraction of reference writes, hence the scaled outer-map reservations.
+    /// The file's own maps grow to what they hold: sized from an upper bound,
+    /// they would keep the slack for as long as the file is indexed.
     /// `file_revision` is intentionally untouched: a revision is minted on the
     /// first real write, and reserving must not consume one.
     pub fn reserve_for_file(&mut self, file_id: FileId, entries: usize) {
         derivation::note_write(|| FactKey::References(file_id));
-        self.file_references
-            .entry(file_id)
-            .or_default()
-            .reserve(entries);
+        self.file_references.entry(file_id).or_default();
         self.index_reference.reserve(entries / 4 + 1);
         self.global_references.reserve(entries / 4 + 1);
         self.string_references
             .entry(file_id)
-            .or_insert_with(StringReference::new)
-            .reserve(entries / 8 + 1);
-        self.type_references
-            .entry(file_id)
-            .or_default()
-            .reserve(entries / 8 + 1);
+            .or_insert_with(StringReference::new);
+        self.type_references.entry(file_id).or_default();
     }
 
     fn bump_file_revision(&mut self, file_id: FileId) {

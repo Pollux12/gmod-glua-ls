@@ -654,7 +654,9 @@ impl LuaMemberIndex {
         self.homing_revision
     }
 
-    /// Reserves capacity for one file's worth of member writes.
+    /// Reserves capacity in the workspace-wide maps for one file's worth of
+    /// member writes; the file's own maps grow to what they hold, since an
+    /// upper-bound size would stay as slack for as long as the file is indexed.
     ///
     /// `members` is a cheap upper-bound hint (see
     /// `crate::compilation::analyzer::common::estimate_file_index_entries`),
@@ -674,19 +676,11 @@ impl LuaMemberIndex {
         self.member_owner_key_history_index.reserve(members / 4 + 1);
         self.current_owner_member_history.reserve(members / 4 + 1);
         self.current_members_by_key.reserve(members / 4 + 1);
-        self.in_filed
-            .entry(file_id)
-            .or_default()
-            .reserve(members + members / 2 + 2);
+        self.in_filed.entry(file_id).or_default();
         self.owner_key_index_owners_by_file
             .entry(file_id)
-            .or_default()
-            .reserve(members / 4 + 2);
-        let scopes = (members / 32).clamp(2, 64);
-        self.function_scope_ranges
-            .entry(file_id)
-            .or_default()
-            .reserve(scopes);
+            .or_default();
+        self.function_scope_ranges.entry(file_id).or_default();
     }
 
     fn bump_homing_revision(&mut self) {
