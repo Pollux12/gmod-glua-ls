@@ -695,7 +695,9 @@ fn collect_call_site_param_types(
             && *scope
                 .authoritative_receivers
                 .entry(signature_id)
-                .or_insert_with(|| signature_has_authoritative_receiver(db, signature_id));
+                .or_insert_with(|| {
+                    signature_has_authoritative_receiver(db, &mut scope.callee_caches, signature_id)
+                });
         for (arg_idx, arg) in &useful_args {
             let is_implicit_receiver =
                 signature.is_colon_define && !call_expr.is_colon_call() && *arg_idx == 0;
@@ -1221,14 +1223,24 @@ fn exact_signature_closure(db: &DbIndex, signature_id: LuaSignatureId) -> Option
         })
 }
 
-fn signature_has_authoritative_receiver(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+/// Whether the method `signature_id` declares has an authoritative receiver,
+/// inferred in its file's cache among `callee_caches`, which the file's other
+/// methods share.
+fn signature_has_authoritative_receiver(
+    db: &DbIndex,
+    callee_caches: &mut HashMap<FileId, LuaInferCache>,
+    signature_id: LuaSignatureId,
+) -> bool {
     let Some(func_stat) = exact_signature_closure(db, signature_id)
         .and_then(|closure| closure.get_parent::<LuaFuncStat>())
     else {
         return false;
     };
-    let mut cache = LuaInferCache::new(signature_id.get_file_id(), super::call_target::pass_view());
-    infer_authoritative_method_self_type(db, &mut cache, &func_stat).is_some()
+    let file_id = signature_id.get_file_id();
+    let cache = callee_caches
+        .entry(file_id)
+        .or_insert_with(|| LuaInferCache::new(file_id, super::call_target::pass_view()));
+    infer_authoritative_method_self_type(db, cache, &func_stat).is_some()
 }
 
 fn var_writes_param(var: &LuaVarExpr, param_name: &str) -> bool {
