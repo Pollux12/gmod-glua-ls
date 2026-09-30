@@ -1791,6 +1791,27 @@ fn normalize_call_operator_doc_function(func: &LuaFunctionType) -> Arc<LuaFuncti
     )
 }
 
+/// Orders a union callee's arms by what they are: a signature by its file's
+/// path and position, a function type by its rendering.
+fn callee_arm_order_key(db: &DbIndex, arm: &LuaType) -> (u8, String, u32) {
+    match arm {
+        LuaType::Signature(signature_id) => (
+            0,
+            db.get_vfs()
+                .get_file_path(&signature_id.get_file_id())
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            u32::from(signature_id.get_position()),
+        ),
+        LuaType::DocFunction(_) => (
+            1,
+            crate::humanize_type(db, arm, crate::RenderLevel::Detailed),
+            0,
+        ),
+        _ => (2, String::new(), 0),
+    }
+}
+
 fn infer_union(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -1802,7 +1823,11 @@ fn infer_union(
     let mut all_overloads = Vec::new();
     let mut base_signatures = Vec::new();
 
-    for ty in union.into_vec() {
+    // A union's arms are a set, but overload resolution prefers earlier
+    // candidates on a tie: take them in an order the set alone decides.
+    let mut arms = union.into_vec();
+    arms.sort_by_cached_key(|arm| callee_arm_order_key(db, arm));
+    for ty in arms {
         match ty {
             LuaType::Signature(signature_id) => {
                 if let Some(signature) = db.get_signature_index().get(&signature_id) {
