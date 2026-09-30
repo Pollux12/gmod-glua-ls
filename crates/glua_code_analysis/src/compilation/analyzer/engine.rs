@@ -362,6 +362,8 @@ impl Engine {
     }
 
     pub(crate) fn changed(&mut self, id: DerivationId) {
+        self.stats
+            .requeue_cause(id, "changed: its file re-analysed or a producer removed");
         self.queue(id, Reason::Changed);
     }
 
@@ -642,6 +644,10 @@ impl Engine {
                     .iter()
                     .all(|member| self.stats.distinct.contains(member));
             for member in &group {
+                if *member != id {
+                    self.stats
+                        .requeue_cause(*member, "run with a queued co-producer");
+                }
                 self.unqueue(*member);
                 self.stats.evaluated(*member);
             }
@@ -685,6 +691,7 @@ impl Engine {
             });
             if widened.is_some() {
                 // Again in this round: nothing ran after it yet.
+                self.stats.requeue_cause(id, "group widened");
                 self.worklist.insert(id, Reason::Changed);
             }
             crate::profile::phase("engine: readers of", || self.readers_of(db, touched.iter()));
@@ -788,6 +795,7 @@ impl Engine {
         let mut queued = 0;
         for (reader, reason) in std::mem::take(&mut self.waiting) {
             if reason == Reason::Changed {
+                self.stats.requeue_cause(reader, "released after the focus");
                 self.worklist.insert(reader, Reason::Changed);
                 queued += 1;
                 continue;
@@ -808,6 +816,7 @@ impl Engine {
             } else {
                 // Checking rebased its reads onto the values as they stand, so
                 // it is queued as changed rather than checked again.
+                self.stats.requeue_cause(reader, "released after the focus");
                 self.worklist.insert(reader, Reason::Changed);
                 queued += 1;
             }
@@ -1005,11 +1014,14 @@ impl Engine {
                     })
             });
             if widened {
+                self.stats.requeue_cause(*member, "batch member widened");
                 self.worklist.insert(*member, Reason::Changed);
             }
         }
         self.readers_of(db, touched.iter());
         for id in alone {
+            self.stats
+                .requeue_cause(id, "co-producers left out of a batch");
             self.worklist.insert(id, Reason::Changed);
         }
     }
@@ -1298,10 +1310,15 @@ impl EngineStats {
             return;
         }
         let variant = variant_name(key);
+        let across = match writer {
+            Some(writer) if writer.file_id == reader.file_id => "in its file",
+            Some(_) => "from another file",
+            None => "outside an evaluation",
+        };
         let writer = writer.map(|writer| writer.kind);
         self.causes
             .entry(reader)
-            .or_insert_with(|| (variant.clone(), writer));
+            .or_insert_with(|| (format!("{variant} {across}"), writer));
         *self
             .requeues
             .entry((variant, writer, reader.kind))
@@ -1310,10 +1327,16 @@ impl EngineStats {
 
     /// Under `GLUALS_PROFILE`, notes that a stage barrier queued `reader`.
     fn stage_requeued(&mut self, reader: DerivationId) {
+        self.requeue_cause(reader, "stage barrier");
+    }
+
+    /// Under `GLUALS_PROFILE`, notes what queued `id` again when no moved
+    /// key did.
+    fn requeue_cause(&mut self, id: DerivationId, cause: &'static str) {
         if self.profiling() {
             self.causes
-                .entry(reader)
-                .or_insert_with(|| ("stage barrier".to_string(), None));
+                .entry(id)
+                .or_insert_with(|| (cause.to_string(), None));
         }
     }
 
@@ -1327,7 +1350,7 @@ impl EngineStats {
         let cause = self
             .causes
             .remove(&id)
-            .unwrap_or_else(|| ("re-queued".to_string(), None));
+            .unwrap_or_else(|| ("unattributed".to_string(), None));
         if let Some(previous) = self.last_times.insert(id, elapsed) {
             let entry = self
                 .superseded
@@ -1431,6 +1454,17 @@ impl EngineStats {
         eprintln!(
             "[engine] superseded {superseded:?} over {count} evaluations; last evaluations {last:?}"
         );
+        let mut by_cause = BTreeMap::<&str, (std::time::Duration, usize)>::new();
+        for ((cause, _, _), (time, count)) in &self.superseded {
+            let entry = by_cause.entry(cause.as_str()).or_default();
+            entry.0 += *time;
+            entry.1 += count;
+        }
+        let mut by_cause = by_cause.into_iter().collect::<Vec<_>>();
+        by_cause.sort_by_key(|(_, (time, _))| std::cmp::Reverse(*time));
+        for (cause, (time, count)) in by_cause {
+            eprintln!("[engine] superseded by cause {time:?} over {count}: {cause}");
+        }
         let mut rows = self.superseded.iter().collect::<Vec<_>>();
         rows.sort_by_key(|(_, (time, _))| std::cmp::Reverse(*time));
         for ((cause, writer, reader), (time, count)) in rows.into_iter().take(40) {
