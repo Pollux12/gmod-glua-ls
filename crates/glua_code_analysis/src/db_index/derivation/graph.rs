@@ -978,14 +978,23 @@ impl ReaderGraph {
         key: &HashedKey,
         holds: impl Fn(Fingerprint) -> bool + 'a,
     ) -> impl Iterator<Item = DerivationId> + 'a {
+        self.stale_readers_seen(key, holds).map(|(id, _)| id)
+    }
+
+    /// [`Self::stale_readers`], each with the fingerprint it saw.
+    pub fn stale_readers_seen<'a>(
+        &'a self,
+        key: &HashedKey,
+        holds: impl Fn(Fingerprint) -> bool + 'a,
+    ) -> impl Iterator<Item = (DerivationId, Fingerprint)> + 'a {
         self.table
             .find(key)
             .map(|slot| self.table.keys[slot as usize].readers.groups())
             .into_iter()
             .flatten()
             .filter(move |(seen, _)| !holds(*seen))
-            .flat_map(|(_, derivs)| derivs.iter())
-            .map(|deriv| self.derivations[*deriv as usize].id)
+            .flat_map(|(seen, derivs)| derivs.iter().map(move |deriv| (deriv, seen)))
+            .map(|(deriv, seen)| (self.derivations[*deriv as usize].id, seen))
     }
 
     /// Whether any read `id` last made no longer holds: it saw another

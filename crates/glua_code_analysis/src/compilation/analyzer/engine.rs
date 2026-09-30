@@ -420,10 +420,11 @@ impl Engine {
         }
         let readers = db
             .reader_graph()
-            .stale_readers(key, self.key_holds(db, key))
+            .stale_readers_seen(key, self.key_holds(db, key))
             .collect::<Vec<_>>();
-        for reader in readers {
-            self.stats.requeued(key, self.cursor, reader);
+        for (reader, seen) in readers {
+            self.stats
+                .requeued(key, self.cursor, reader, seen == derivation::ABSENT);
             if reader.kind.is_query() {
                 db.queries().set_stale(reader, true);
             }
@@ -1305,15 +1306,23 @@ impl EngineStats {
         }
     }
 
-    fn requeued(&mut self, key: &FactKey, writer: Option<DerivationId>, reader: DerivationId) {
+    fn requeued(
+        &mut self,
+        key: &FactKey,
+        writer: Option<DerivationId>,
+        reader: DerivationId,
+        unproduced: bool,
+    ) {
         if !self.profiling() {
             return;
         }
         let variant = variant_name(key);
-        let across = match writer {
-            Some(writer) if writer.file_id == reader.file_id => "in its file",
-            Some(_) => "from another file",
-            None => "outside an evaluation",
+        let across = match (writer, unproduced) {
+            (Some(writer), false) if writer.file_id == reader.file_id => "in its file",
+            (Some(writer), true) if writer.file_id == reader.file_id => "in its file, unproduced",
+            (Some(_), false) => "from another file",
+            (Some(_), true) => "from another file, unproduced",
+            (None, _) => "outside an evaluation",
         };
         let writer = writer.map(|writer| writer.kind);
         self.causes
