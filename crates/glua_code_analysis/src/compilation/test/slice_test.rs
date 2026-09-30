@@ -193,6 +193,139 @@ local recorded = Ledger.back
         }
     }
 
+    const ADAPTER: &str = "lua/autorun/sh_adapter.lua";
+    const USER: &str = "lua/autorun/client/cl_user.lua";
+
+    /// A class whose method returns a shape a reader in another file indexes
+    /// past, so the reader's diagnostics follow the class file.
+    fn adapter_files() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                ADAPTER,
+                r#"---@class AdapterState
+---@field warning string
+
+---@class Adapter
+Adapter = {}
+
+---@return AdapterState
+function Adapter.GetState()
+    return { warning = "off" }
+end
+"#,
+            ),
+            (
+                USER,
+                r#"local state = Adapter.GetState()
+local warning = state.warning
+local directional = state.directional
+"#,
+            ),
+        ]
+    }
+
+    /// The diagnostics of each file at `paths` that exists, by path, as a
+    /// client shows them.
+    fn diagnose_paths(ws: &VirtualWorkspace, paths: &[&str]) -> Vec<(String, Vec<String>)> {
+        paths
+            .iter()
+            .filter_map(|path| {
+                let uri = ws.virtual_url_generator.new_uri(path);
+                let file_id = ws.analysis.get_file_id(&uri)?;
+                ws.analysis
+                    .compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_syntax_tree(&file_id)?;
+                Some((path.to_string(), diagnose(ws, file_id)))
+            })
+            .collect()
+    }
+
+    fn diagnose(ws: &VirtualWorkspace, file_id: FileId) -> Vec<String> {
+        let mut shown = ws
+            .analysis
+            .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|diagnostic| {
+                format!(
+                    "{:?} {:?} {}",
+                    diagnostic.code, diagnostic.range, diagnostic.message
+                )
+            })
+            .collect::<Vec<_>>();
+        shown.sort();
+        shown
+    }
+
+    /// A class file deleted and created again through watched-file events,
+    /// settled in slices while a client diagnoses every file once the first
+    /// slice is in and each reported one once it settles, leaves the client
+    /// showing what a cold build reports.
+    #[test]
+    fn diagnostics_pulled_between_slices_of_a_delete_and_recreate_match_a_cold_build() {
+        let paths = [ADAPTER, USER];
+        let slices = [
+            (Slice::Evaluations(1), Slice::Whole),
+            (Slice::Evaluations(2), Slice::Whole),
+            (Slice::Whole, Slice::Evaluations(1)),
+            (Slice::Evaluations(1), Slice::Evaluations(1)),
+            (Slice::Evaluations(3), Slice::Evaluations(2)),
+        ];
+        for (delete_slice, recreate_slice) in slices {
+            let mut ws = VirtualWorkspace::new();
+            ws.def_files(adapter_files());
+            let mut expected = diagnose_paths(&ws, &paths);
+            expected.sort();
+            let mut shown = expected
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let uri = ws.virtual_url_generator.new_uri(ADAPTER);
+            for (text, slice) in [
+                (None, delete_slice),
+                (Some(adapter_files()[0].1.to_string()), recreate_slice),
+            ] {
+                let staged = ws
+                    .analysis
+                    .stage_file_system_changes(vec![(uri.clone(), text)]);
+                ws.analysis.begin_reindex(staged.clone());
+                let mut pulled = false;
+                loop {
+                    match ws.analysis.advance_reindex(slice) {
+                        UpdateProgress::Settled(affected) => {
+                            for file_id in affected.into_iter().chain(staged.iter().copied()) {
+                                let Some(path) = paths.iter().find(|path| {
+                                    ws.analysis
+                                        .get_file_id(&ws.virtual_url_generator.new_uri(path))
+                                        == Some(file_id)
+                                }) else {
+                                    continue;
+                                };
+                                shown.remove(*path);
+                                shown.extend(diagnose_paths(&ws, &[path]));
+                            }
+                            break;
+                        }
+                        UpdateProgress::Settling if !pulled => {
+                            pulled = true;
+                            shown = diagnose_paths(&ws, &paths).into_iter().collect();
+                        }
+                        UpdateProgress::Settling => {}
+                        UpdateProgress::TextChanged => panic!("no text changed"),
+                    }
+                }
+            }
+
+            assert_eq!(
+                shown.into_iter().collect::<Vec<_>>(),
+                expected,
+                "deleted in {delete_slice:?}, recreated in {recreate_slice:?}"
+            );
+        }
+    }
+
     /// Diagnostics taken between two slices read the index as it stood then:
     /// a fact they read that a later slice moves reports the file.
     #[test]
