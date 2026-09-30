@@ -190,7 +190,6 @@ impl super::engine::Recipe for Recipes {
                     local_inference::publish_unguarded_children(db, &mut context, vec![scan]);
                 }
                 local_inference::stabilize_unknown_locals(db, &mut context);
-                unresolve::resolve_inline(db, &mut context);
             }
             DerivationKind::GmodLoadCallSites | DerivationKind::GmodClassCallSites => {
                 let sites = *computed
@@ -230,6 +229,10 @@ impl super::engine::Recipe for Recipes {
             kind if kind.is_query() => {
                 let db: &DbIndex = db;
                 db.queries().recompute(db, id);
+            }
+            DerivationKind::LocalFallbacks => {
+                let computed = super::engine::Recipe::compute(self, db, id);
+                super::engine::Recipe::apply(self, db, id, computed);
             }
             _ => {
                 let mut context = AnalyzeContext::for_files(db, vec![id.file_id], &self.scopes);
@@ -342,24 +345,9 @@ impl Recipes {
             DerivationKind::CallSiteParams => {
                 call_site_params::CallSiteParamAnalysisPipeline::analyze(db, context)
             }
-            DerivationKind::LocalFallbacks => {
-                if guesses_locals(db) {
-                    // What the split evaluation does, on the cache its scan
-                    // infers with: which way the engine runs the pass must not
-                    // change what it reads. The file's memo waits aside.
-                    let memo = context.infer_manager.take_file(id.file_id);
-                    if let Some(scan) = local_inference::scan_unguarded_children(db, id.file_id) {
-                        local_inference::publish_unguarded_children(db, context, vec![scan]);
-                    }
-                    local_inference::stabilize_unknown_locals(db, context);
-                    context.infer_manager.take_file(id.file_id);
-                    if let Some(memo) = memo {
-                        context.infer_manager.restore_file(id.file_id, memo);
-                    }
-                }
-            }
             DerivationKind::Network => gmod::evaluate_network(db, context),
             DerivationKind::Source
+            | DerivationKind::LocalFallbacks
             | DerivationKind::GmodHelperScan
             | DerivationKind::NetHelpers
             | DerivationKind::ValidGuardScan

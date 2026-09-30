@@ -167,6 +167,9 @@ pub enum CallRoleKey {
 pub enum FactKey {
     /// A stored type and its fact metadata.
     TypeCache(LuaTypeOwner),
+    /// The types a file's local fallbacks published over what its statements
+    /// left (see [`writes_fallback_of`]).
+    TypeFallbacks(FileId),
     /// A definition-anchored inferred fact.
     DefinitionFact(LuaDefinitionId),
     /// A `---` type declaration: its object, alias origin included, and the
@@ -483,6 +486,7 @@ impl FactKey {
         matches!(
             self,
             K::TypeCache(_)
+                | K::TypeFallbacks(_)
                 | K::DefinitionFact(_)
                 | K::DeclClaim(_)
                 | K::Decl(_)
@@ -562,6 +566,7 @@ impl FactKey {
                 | K::ModulePath(_)
                 | K::DynamicFieldFile(_)
                 | K::TypeCache(_)
+                | K::TypeFallbacks(_)
                 | K::DefinitionFact(_)
                 | K::Signature(_)
                 | K::SignatureDecl(_)
@@ -748,6 +753,7 @@ impl FactKey {
             | K::LoadSites(file_id)
             | K::DiagnosticFile(file_id)
             | K::CallSiteFile(file_id)
+            | K::TypeFallbacks(file_id)
             | K::DerivedReferences(file_id)
             | K::FileText(file_id) => Some(*file_id),
             K::DynamicField(DynamicFieldOwner::Table(site), _)
@@ -1212,6 +1218,8 @@ thread_local! {
     static VIEW: RefCell<Option<std::sync::Arc<ReaderGraph>>> = const { RefCell::new(None) };
     /// The lookups of evaluations that ended, for the next ones to begin with.
     static SPARE: RefCell<Vec<Spare>> = const { RefCell::new(Vec::new()) };
+    /// The evaluations to run again; see [`rerun_current`].
+    static RERUNS: RefCell<Vec<DerivationId>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Lets evaluations on this thread reuse memoised values against `graph`
@@ -1930,6 +1938,43 @@ pub fn writes_source() -> bool {
             .as_ref()
             .is_none_or(|evaluation| evaluation.id.kind == DerivationKind::Source)
     })
+}
+
+/// Whether a write of a type `file_id` owns belongs to that file's local
+/// fallbacks: the types it guesses for what its statements left untyped or
+/// only as a base class, which readers see over what the statements left.
+pub fn writes_fallback_of(file_id: FileId) -> bool {
+    CURRENT.with(|current| {
+        current.borrow().as_ref().is_some_and(|evaluation| {
+            evaluation.id.kind == DerivationKind::LocalFallbacks && evaluation.id.file_id == file_id
+        })
+    })
+}
+
+/// Whether the evaluation recording on this thread computes `key` again: it
+/// produced it before, and the engine reset it for this run.
+pub fn recomputes(key: FactKey) -> bool {
+    KEYS.with(|keys| {
+        keys.borrow().as_ref().is_some_and(|table| {
+            table
+                .find(&HashedKey::new(key))
+                .is_some_and(|slot| table.windowed(slot))
+        })
+    })
+}
+
+/// Marks the evaluation recording on this thread to run again: it wrote a
+/// fact that, the first time it produced it, it may have read with another
+/// layer over it.
+pub fn rerun_current() {
+    if let Some(id) = current() {
+        RERUNS.with(|reruns| reruns.borrow_mut().push(id));
+    }
+}
+
+/// The evaluations [`rerun_current`] marked on this thread, emptied.
+pub fn take_reruns() -> Vec<DerivationId> {
+    RERUNS.with(|reruns| std::mem::take(&mut *reruns.borrow_mut()))
 }
 
 /// Whether member listings on this thread include dynamic fields: everywhere

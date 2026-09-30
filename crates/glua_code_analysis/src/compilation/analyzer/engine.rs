@@ -638,6 +638,7 @@ impl Engine {
             let group = crate::profile::phase("engine: co-producers", || co_producers(db, id));
             if group.len() == 1 && recipe.splits(id.kind) {
                 crate::profile::phase("engine: batch", || self.run_batch(db, id, recipe));
+                self.queue_reruns();
                 continue;
             }
             let rerun = self.stats.profiling()
@@ -695,11 +696,22 @@ impl Engine {
                 self.stats.requeue_cause(id, "group widened");
                 self.worklist.insert(id, Reason::Changed);
             }
+            self.queue_reruns();
             crate::profile::phase("engine: readers of", || self.readers_of(db, touched.iter()));
         }
         self.cursor = None;
         crate::profile::phase("engine: rebase moved reads", || self.rebase_moved_reads(db));
         true
+    }
+
+    /// Queues again, in this round, the evaluations that asked to run again
+    /// (see [`derivation::rerun_current`]).
+    fn queue_reruns(&mut self) {
+        for id in derivation::take_reruns() {
+            self.stats
+                .requeue_cause(id, "wrote a type under a fallback it may have read");
+            self.worklist.insert(id, Reason::Changed);
+        }
     }
 
     /// Re-records every read that held only with the edits mapped back as a

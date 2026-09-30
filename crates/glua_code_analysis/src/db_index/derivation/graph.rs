@@ -351,7 +351,7 @@ impl Clone for DerivedKeys {
 
 impl KeyTable {
     /// The slot `key` is interned to.
-    fn find(&self, key: &HashedKey) -> Option<KeyIdx> {
+    pub(super) fn find(&self, key: &HashedKey) -> Option<KeyIdx> {
         self.key_slots
             .find(key.hash, |slot| {
                 self.keys[*slot as usize].key.as_ref() == Some(key)

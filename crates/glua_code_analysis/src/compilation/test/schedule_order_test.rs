@@ -471,6 +471,76 @@ end
         assert_eq!(warm.settled_digest(), cold.settled_digest());
     }
 
+    /// A local typed from its uses before an assignment types it.
+    const RETYPED_TARGET: [(&str, &str); 3] = [
+        (
+            "lua/aaa_annotations/player.lua",
+            "---@class Player
+---@param ply Player
+function Kick(ply) end
+",
+        ),
+        (
+            "addons/admin/lua/autorun/sh_lib.lua",
+            "Lib = {}
+function Lib.Make() return Mystery end
+Lib.Current = Lib.Make()
+",
+        ),
+        (
+            "addons/admin/lua/autorun/server/sv_kick.lua",
+            "local target
+Kick(target)
+target = Lib.Current
+",
+        ),
+    ];
+
+    #[test]
+    fn a_local_typed_from_its_uses_before_an_assignment_settles_the_same_in_either_order() {
+        assert_schedule_independent(&RETYPED_TARGET);
+    }
+
+    /// [`RETYPED_TARGET`] with its library holding `from`, rewritten to `to`:
+    /// the same whether the workspace analyses the new library again or cold.
+    fn assert_retyped_target_settles_after(from: &str, to: &str) {
+        let gmod = |ws: &mut VirtualWorkspace| {
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+        };
+        let (path, _) = RETYPED_TARGET[1];
+        let mut files = RETYPED_TARGET.to_vec();
+        files[1].1 = from;
+        let mut warm = VirtualWorkspace::new();
+        gmod(&mut warm);
+        warm.def_files(files.clone());
+        warm.def_file(path, to);
+
+        let mut cold = VirtualWorkspace::new();
+        gmod(&mut cold);
+        files[1].1 = to;
+        cold.def_files(files);
+
+        assert_eq!(warm.settled_digest(), cold.settled_digest());
+    }
+
+    const TYPED_LIB: &str = "Lib = {}
+function Lib.Make() return Mystery end
+---@type Player
+Lib.Current = Lib.Make()
+";
+
+    #[test]
+    fn a_local_typed_from_its_uses_settles_the_same_when_its_assignment_gains_a_type() {
+        assert_retyped_target_settles_after(RETYPED_TARGET[1].1, TYPED_LIB);
+    }
+
+    #[test]
+    fn a_local_typed_by_its_assignment_settles_the_same_when_the_assignment_loses_its_type() {
+        assert_retyped_target_settles_after(TYPED_LIB, RETYPED_TARGET[1].1);
+    }
+
     const PLANT_USE: &str = r#"function ENT:Use(activator, caller)
     activator.cityrp._PlantsHarvested = activator.cityrp._PlantsHarvested + 1
 end

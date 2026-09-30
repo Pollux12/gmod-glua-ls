@@ -91,6 +91,37 @@ end
         assert_eq!(stats.evaluations(DerivationKind::GmodHelperScan), 1);
     }
 
+    /// A local typed from its uses, whose statement runs again and keeps its
+    /// value when another file's function changes shape: the fallback typing
+    /// the local stands, and only the edited file's pass runs.
+    #[test]
+    fn a_statement_that_keeps_its_value_does_not_run_its_files_local_fallbacks_again() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(vec![
+            (
+                "player.lua",
+                "---@class Player\n---@param ply Player\nfunction Kick(ply) end\n",
+            ),
+            (
+                "lib.lua",
+                "Lib = {}\nfunction Lib.Get(a) return Mystery end\n",
+            ),
+            ("user.lua", "local target = Lib.Get(1)\nKick(target)\n"),
+        ]);
+        ws.def_file(
+            "lib.lua",
+            "Lib = {}\nfunction Lib.Get(a, b) return Mystery end\n",
+        );
+
+        let stats = ws.analysis.compilation.last_stats();
+        assert!(
+            ws.settled_digest()
+                .iter()
+                .any(|line| line.ends_with("target = Player"))
+        );
+        assert_eq!(stats.evaluations(DerivationKind::LocalFallbacks), 1);
+    }
+
     fn gmod_workspace() -> VirtualWorkspace {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

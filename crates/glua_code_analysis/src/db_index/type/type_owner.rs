@@ -87,7 +87,7 @@ fn syntax_id_cmp(left: &LuaSyntaxId, right: &LuaSyntaxId) -> Ordering {
         .then_with(|| (left.get_kind() as u16).cmp(&(right.get_kind() as u16)))
 }
 
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum LuaTypeCache {
     DocType(LuaType),
     InferType(LuaType),

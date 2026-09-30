@@ -268,6 +268,7 @@ impl DbIndex {
         use derivation::FactKey as K;
         match key {
             K::TypeCache(owner) => self.get_type_index_mut().reset_type_cache(owner),
+            K::TypeFallbacks(file_id) => self.get_type_index_mut().retract_fallbacks(*file_id),
             K::HelperScan(file_id) => self.remove_helper_scan(*file_id),
             K::RoleMentions(file_id) => self.remove_role_mentions(*file_id),
             K::LoadScan(file_id) => self.remove_load_scan(*file_id),
@@ -437,6 +438,7 @@ impl DbIndex {
         use derivation::FactKey as K;
         match key {
             K::TypeCache(_)
+            | K::TypeFallbacks(_)
             | K::DefinitionFact(_)
             | K::TypeDecl(_)
             | K::TypeDeclLocations(_)
