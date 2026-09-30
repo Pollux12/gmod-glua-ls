@@ -318,6 +318,7 @@ macro_rules! dispatch_request {
                             }
 
                             if stale().await {
+                                debounced.request_refused().await;
                                 return content_modified(id);
                             }
 

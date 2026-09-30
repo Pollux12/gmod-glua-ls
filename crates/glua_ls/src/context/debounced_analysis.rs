@@ -83,6 +83,9 @@ pub struct DebouncedAnalysis {
     /// waits, a debounce ends at once: the request needs the re-analysis now,
     /// and only background propagation is worth coalescing.
     waiting_requests: AtomicUsize,
+    /// A request was refused as stale while edits were pending: the client
+    /// re-sends it, so the next debounce ends at once, as for a waiting one.
+    refused_request: AtomicBool,
     notify: Notify,
     reindex_notify: Notify,
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
@@ -134,6 +137,7 @@ impl DebouncedAnalysis {
             debounce_loop_alive: AtomicBool::new(true),
             in_flight_changes: AtomicUsize::new(0),
             waiting_requests: AtomicUsize::new(0),
+            refused_request: AtomicBool::new(false),
             notify: Notify::new(),
             reindex_notify: Notify::new(),
             analysis,
@@ -149,6 +153,16 @@ impl DebouncedAnalysis {
             #[cfg(test)]
             expedited_debounces: AtomicUsize::new(0),
         }
+    }
+
+    /// Notes a request refused because its document is mid-edit, which the
+    /// client re-sends: a debounce of the pending edits ends at once.
+    pub async fn request_refused(&self) {
+        if self.pending_files.lock().await.is_empty() {
+            return;
+        }
+        self.refused_request.store(true, Ordering::Release);
+        self.notify.notify_waiters();
     }
 
     /// Counts a request as waiting for an edited document and wakes a
@@ -879,7 +893,9 @@ impl DebouncedAnalysis {
                     let notified = self.notify.notified();
                     tokio::pin!(notified);
                     notified.as_mut().enable();
-                    if self.waiting_requests.load(Ordering::Acquire) > 0 {
+                    if self.waiting_requests.load(Ordering::Acquire) > 0
+                        || self.refused_request.swap(false, Ordering::AcqRel)
+                    {
                         #[cfg(test)]
                         self.expedited_debounces.fetch_add(1, Ordering::AcqRel);
                         break;
@@ -1621,6 +1637,76 @@ mod tests {
             .await
             .expect("the request is answered well before the debounce elapses");
             verify_that!(fresh, eq(Freshness::Fresh))?;
+            verify_that!(
+                debounced_analysis
+                    .expedited_debounces
+                    .load(Ordering::Acquire),
+                eq(1)
+            )?;
+
+            debounced_analysis.shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(5), loop_task)
+                .await
+                .expect("the loop should stop on shutdown")
+                .expect("the loop task must not panic");
+            Ok(())
+        })
+    }
+
+    /// A request refused as stale, which the client re-sends, ends the
+    /// debounce of the pending edits at once.
+    #[gtest]
+    fn a_request_refused_as_stale_skips_the_debounce() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let mut analysis = EmmyLuaAnalysis::new();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_refused");
+            analysis.add_main_workspace(workspace.clone());
+            let uri = file_path_to_uri(&workspace.join("lua/autorun/shared/edited.lua"))
+                .expect("URI should parse");
+            analysis
+                .update_file_by_uri(&uri, Some("Value = 1\n".to_string()))
+                .map(|(id, _)| id);
+            let analysis = Arc::new(RwLock::new(analysis));
+            let (connection, _peer) = Connection::memory();
+            let client = Arc::new(ClientProxy::new(connection));
+            let status_bar = Arc::new(StatusBar::new(client.clone(), true));
+            let file_diagnostic = Arc::new(FileDiagnostic::new(
+                analysis.clone(),
+                status_bar,
+                client.clone(),
+                false,
+            ));
+            let shared_diagnostic_data_cache = file_diagnostic.shared_diagnostic_data_cache();
+            let debounced_analysis = Arc::new(DebouncedAnalysis::new(
+                analysis.clone(),
+                60_000,
+                CancellationToken::new(),
+                client,
+                file_diagnostic,
+                shared_diagnostic_data_cache,
+                Arc::new(AtomicU8::new(0)),
+                test_lsp_features(),
+            ));
+            let loop_task = tokio::spawn({
+                let debounced_analysis = debounced_analysis.clone();
+                async move { debounced_analysis.run().await }
+            });
+
+            let file_id = analysis
+                .write()
+                .await
+                .update_file_text_only(&uri, "Value = 2\n".to_string())
+                .expect("the file should still exist");
+            debounced_analysis.schedule(file_id, uri.clone()).await;
+            debounced_analysis.request_refused().await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !debounced_analysis.file_is_answerable(&uri).await {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the document is answerable well before the debounce elapses");
             verify_that!(
                 debounced_analysis
                     .expedited_debounces
