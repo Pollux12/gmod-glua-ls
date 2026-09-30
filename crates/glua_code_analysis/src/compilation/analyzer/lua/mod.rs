@@ -56,7 +56,19 @@ pub(in crate::compilation::analyzer) fn defers_writes(
     kind: crate::db_index::derivation::DerivationKind,
 ) -> bool {
     use crate::db_index::derivation::DerivationKind as K;
-    matches!(kind, K::TableField | K::LocalStat)
+    matches!(
+        kind,
+        K::TableField
+            | K::LocalStat
+            | K::AssignStat
+            | K::ForRangeStat
+            | K::FuncStat
+            | K::LocalFuncStat
+            | K::Closure
+            | K::Call
+            | K::Setmetatable
+            | K::ChunkReturn
+    )
 }
 
 /// Evaluates one walk derivation of `file_id`: the statement or expression at
@@ -71,24 +83,30 @@ pub(in crate::compilation::analyzer) fn evaluate_node(
 ) -> Vec<StatementWrite> {
     analyze_walk_node(
         DbAccess::Inline(db),
+        AssignmentStage::Whole,
         context,
         special_call_direct_matcher,
         file_id,
         syntax_id,
     )
+    .0
 }
 
 /// Analyses one walk derivation against `db` without writing it, and returns
-/// the writes to apply with [`StatementWrite::apply`], in order.
+/// the writes to apply with [`StatementWrite::apply`], in order. An assignment
+/// is analysed in `stage`; its homing stage also returns what its values stage
+/// continues from.
 pub(in crate::compilation::analyzer) fn compute_node(
     db: &DbIndex,
+    stage: AssignmentStage,
     context: &mut AnalyzeContext,
     special_call_direct_matcher: &call::SpecialCallDirectMatcher,
     file_id: FileId,
     syntax_id: LuaSyntaxId,
-) -> Vec<StatementWrite> {
+) -> (Vec<StatementWrite>, AssignmentHoming) {
     analyze_walk_node(
         DbAccess::Deferred(db),
+        stage,
         context,
         special_call_direct_matcher,
         file_id,
@@ -98,20 +116,21 @@ pub(in crate::compilation::analyzer) fn compute_node(
 
 fn analyze_walk_node(
     db: DbAccess<'_>,
+    stage: AssignmentStage,
     context: &mut AnalyzeContext,
     special_call_direct_matcher: &call::SpecialCallDirectMatcher,
     file_id: FileId,
     syntax_id: LuaSyntaxId,
-) -> Vec<StatementWrite> {
+) -> (Vec<StatementWrite>, AssignmentHoming) {
     let Some(root) = db
         .get_vfs()
         .get_syntax_tree(&file_id)
         .map(|tree| tree.get_chunk_node())
     else {
-        return Vec::new();
+        return Default::default();
     };
     let Some(node) = syntax_id.to_node_from_root(root.syntax()) else {
-        return Vec::new();
+        return Default::default();
     };
     let gmod_enabled = db.get_emmyrc().gmod.enabled;
     let is_scripted_class_scope = gmod_enabled
@@ -126,6 +145,10 @@ fn analyze_walk_node(
         is_scripted_class_scope,
         special_call_direct_matcher,
     );
+    if let AssignmentStage::Values(homing) = &stage {
+        analyzer.homed_members = homing.homed.clone();
+    }
+    analyzer.assignment_stage = stage;
     with_syntax_resolver(root.syntax(), || {
         if let Some(chunk) = LuaChunk::cast(node.clone()) {
             analyze_chunk_return(&mut analyzer, chunk);
@@ -134,7 +157,39 @@ fn analyze_walk_node(
         }
         flush_pending_dynamic_key_collection_widenings(&mut analyzer);
     });
-    analyzer.log
+    let homing = match analyzer.assignment_stage {
+        AssignmentStage::Homing(homing) => homing,
+        _ => AssignmentHoming::default(),
+    };
+    (analyzer.log, homing)
+}
+
+/// Which part of an assignment an analysis makes.
+///
+/// An assignment homes the members it writes before it infers the values it
+/// assigns them, and the inference reads those members. Deferred, the homing
+/// runs as a stage of its own, which applies before the values stage infers.
+#[derive(Debug)]
+pub(in crate::compilation::analyzer) enum AssignmentStage {
+    /// The whole analysis in one go.
+    Whole,
+    /// Only the homing of the members the values are inferred after.
+    Homing(AssignmentHoming),
+    /// The rest, after the homing stage applied.
+    Values(AssignmentHoming),
+}
+
+/// What an assignment's homing stage read before it homed its members, for
+/// the values stage to decide from.
+#[derive(Debug, Default)]
+pub(in crate::compilation::analyzer) struct AssignmentHoming {
+    /// Per assigned value: whether the assignment skips it.
+    skipped: Vec<bool>,
+    /// Per assigned value on the general path: the declared type of the empty
+    /// table it assigns, as read before its member was homed.
+    declared_empty_table_types: Vec<Option<Option<LuaType>>>,
+    /// The members homed.
+    homed: rustc_hash::FxHashSet<LuaMemberId>,
 }
 
 fn analyze_node(analyzer: &mut LuaAnalyzer, node: LuaAst) {
@@ -177,6 +232,10 @@ struct LuaAnalyzer<'a> {
     db: DbAccess<'a>,
     /// The writes made through [`LuaAnalyzer::write`], in order.
     log: Vec<StatementWrite>,
+    /// The part of an assignment this analysis makes.
+    assignment_stage: AssignmentStage,
+    /// The members this analysis homed, each homed once.
+    homed_members: rustc_hash::FxHashSet<LuaMemberId>,
     context: &'a mut AnalyzeContext,
     gmod_enabled: bool,
     is_scripted_class_scope: bool,
@@ -215,6 +274,8 @@ impl LuaAnalyzer<'_> {
             file_id,
             db,
             log: Vec::new(),
+            assignment_stage: AssignmentStage::Whole,
+            homed_members: rustc_hash::FxHashSet::default(),
             context,
             gmod_enabled,
             is_scripted_class_scope,

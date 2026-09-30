@@ -290,18 +290,29 @@ fn guesses_locals(db: &DbIndex) -> bool {
 }
 
 impl Recipes {
-    /// Analyses a statement without writing, then applies what it wrote.
-    /// Under `GLUALS_CHECK_PURE` it also analyses it inline, which is what
-    /// takes effect, and reports where the two wrote differently.
+    /// Analyses a statement without writing, then applies what it wrote; an
+    /// assignment in two stages, its homing applied before its values are
+    /// analysed. Under `GLUALS_CHECK_PURE` any other statement is also analysed
+    /// inline, which is what takes effect, and the two are compared.
     fn evaluate_deferred(&self, db: &mut DbIndex, context: &mut AnalyzeContext, id: DerivationId) {
-        if !check_pure() {
-            let writes = lua::compute_node(
+        if id.kind == DerivationKind::AssignStat {
+            let (homing_writes, homing) = self.compute(
                 db,
+                lua::AssignmentStage::Homing(lua::AssignmentHoming::default()),
                 context,
-                &self.special_call_direct_matcher,
-                id.file_id,
-                id.syntax_id(),
+                id,
             );
+            for write in &homing_writes {
+                write.apply(db);
+            }
+            let (writes, _) = self.compute(db, lua::AssignmentStage::Values(homing), context, id);
+            for write in &writes {
+                write.apply(db);
+            }
+            return;
+        }
+        if !check_pure() {
+            let (writes, _) = self.compute(db, lua::AssignmentStage::Whole, context, id);
             for write in &writes {
                 write.apply(db);
             }
@@ -312,13 +323,8 @@ impl Recipes {
         deferred_context
             .infer_manager
             .restore_file(id.file_id, memo);
-        let deferred = lua::compute_node(
-            db,
-            &mut deferred_context,
-            &self.special_call_direct_matcher,
-            id.file_id,
-            id.syntax_id(),
-        );
+        let (deferred, _) =
+            self.compute(db, lua::AssignmentStage::Whole, &mut deferred_context, id);
         let inline = lua::evaluate_node(
             db,
             context,
@@ -360,6 +366,23 @@ impl Recipes {
                 );
             }
         }
+    }
+
+    fn compute(
+        &self,
+        db: &DbIndex,
+        stage: lua::AssignmentStage,
+        context: &mut AnalyzeContext,
+        id: DerivationId,
+    ) -> (Vec<lua::StatementWrite>, lua::AssignmentHoming) {
+        lua::compute_node(
+            db,
+            stage,
+            context,
+            &self.special_call_direct_matcher,
+            id.file_id,
+            id.syntax_id(),
+        )
     }
 
     fn evaluate_file_derivation(

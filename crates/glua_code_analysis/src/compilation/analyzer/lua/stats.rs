@@ -28,7 +28,7 @@ use rustc_hash::FxHashMap;
 use crate::LuaArrayType;
 
 use super::{
-    LuaAnalyzer, MemberHoming, StatementWrite,
+    AssignmentHoming, AssignmentStage, LuaAnalyzer, MemberHoming, StatementWrite,
     member_write_policy::{
         alias_target_global_path, direct_local_prefix_has_declared_type,
         direct_local_table_prefix_member_owner,
@@ -508,6 +508,12 @@ fn prefix_path_has_computed_segment(prefix_expr: &LuaExpr) -> bool {
 
 fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Option<()> {
     let index_expr = LuaIndexExpr::cast(var_expr.syntax().clone())?;
+    if !analyzer.homed_members.insert(LuaMemberId::new(
+        index_expr.get_syntax_id(),
+        analyzer.file_id,
+    )) {
+        return Some(());
+    }
     let prefix_expr = index_expr.get_prefix_expr()?;
     if prefix_path_has_computed_segment(&prefix_expr) {
         let member_id = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
@@ -853,6 +859,9 @@ fn publish_initializer_fact(analyzer: &mut LuaAnalyzer, decl_id: LuaDeclId, expr
 }
 
 pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignStat) -> Option<()> {
+    if let AssignmentStage::Homing(_) = analyzer.assignment_stage {
+        return home_assignment_targets(analyzer, assign_stat);
+    }
     let (var_list, expr_list) = assign_stat.get_var_and_expr_list();
     let expr_count = expr_list.len();
     let var_count = var_list.len();
@@ -865,10 +874,11 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         }
         let expr = expr?;
 
-        if should_skip_nil_table_shape_assignment(analyzer, &var, expr) {
-            continue;
-        }
-        if should_skip_nullable_collection_append_shape_assignment(analyzer, &var, expr) {
+        let skipped = match &analyzer.assignment_stage {
+            AssignmentStage::Values(homing) => homing.skipped.get(i).copied().unwrap_or(false),
+            _ => skips_assignment(analyzer, &var, expr),
+        };
+        if skipped {
             continue;
         }
 
@@ -887,7 +897,16 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             continue;
         }
 
-        let declared_empty_table_type = declared_empty_table_assignment_type(analyzer, &var, expr);
+        let read_before_homing = match &analyzer.assignment_stage {
+            AssignmentStage::Values(homing) => {
+                homing.declared_empty_table_types.get(i).cloned().flatten()
+            }
+            _ => None,
+        };
+        let declared_empty_table_type = match read_before_homing {
+            Some(declared) => declared,
+            None => declared_empty_table_assignment_type(analyzer, &var, expr),
+        };
         set_index_expr_owner(analyzer, var.clone());
 
         let expr_type = match declared_empty_table_type
@@ -1136,6 +1155,62 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
     }
 
     Some(())
+}
+
+/// Whether an assignment leaves a value's target alone: a `nil` that only
+/// clears a table's shape, or a nullable append to a collection.
+fn skips_assignment(analyzer: &mut LuaAnalyzer, var: &LuaVarExpr, expr: &LuaExpr) -> bool {
+    should_skip_nil_table_shape_assignment(analyzer, var, expr)
+        || should_skip_nullable_collection_append_shape_assignment(analyzer, var, expr)
+}
+
+/// The homing stage of an assignment: homes the members whose values are
+/// inferred after their homing, recording what the values stage reads from
+/// before it. A guarded `x = x or {}` homes only once its value is inferred,
+/// in the values stage.
+fn home_assignment_targets(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignStat) -> Option<()> {
+    let (var_list, expr_list) = assign_stat.get_var_and_expr_list();
+    let mut homing = AssignmentHoming::default();
+    for (i, expr) in expr_list.iter().enumerate() {
+        let Some(var) = var_list.get(i) else {
+            break;
+        };
+        let skipped = skips_assignment(analyzer, var, expr);
+        homing.skipped.push(skipped);
+        let declared_empty_table_type = match self_default_arms(var, expr) {
+            _ if skipped => None,
+            Some((_, LuaExpr::TableExpr(_))) => None,
+            Some(_) => {
+                set_index_expr_owner(analyzer, var.clone());
+                None
+            }
+            None => {
+                let declared = declared_empty_table_assignment_type(analyzer, var, expr);
+                set_index_expr_owner(analyzer, var.clone());
+                Some(declared)
+            }
+        };
+        homing
+            .declared_empty_table_types
+            .push(declared_empty_table_type);
+    }
+    homing.homed = analyzer.homed_members.clone();
+    analyzer.assignment_stage = AssignmentStage::Homing(homing);
+    Some(())
+}
+
+/// The two arms of `x = x or <default>`, when `expr` is one for `var`.
+fn self_default_arms(var: &LuaVarExpr, expr: &LuaExpr) -> Option<(LuaExpr, LuaExpr)> {
+    let access_path = var.get_access_path()?;
+    let LuaExpr::BinaryExpr(binary_expr) = expr else {
+        return None;
+    };
+    if binary_expr.get_op_token()?.get_op() != BinaryOperator::OpOr {
+        return None;
+    }
+    let (left, right) = binary_expr.get_exprs()?;
+    let left_var = LuaVarExpr::cast(left.syntax().clone())?;
+    (access_path == left_var.get_access_path()?).then_some((left, right))
 }
 
 fn declared_empty_table_assignment_type(
@@ -2650,23 +2725,10 @@ fn special_assign_pattern(
     expr: LuaExpr,
     assign_stat_range: rowan::TextRange,
 ) -> Option<()> {
-    let access_path = var.get_access_path()?;
-    let binary_expr = if let LuaExpr::BinaryExpr(binary_expr) = expr {
-        binary_expr
-    } else {
+    let (left, right) = self_default_arms(&var, &expr)?;
+    let LuaExpr::BinaryExpr(binary_expr) = expr else {
         return None;
     };
-
-    if binary_expr.get_op_token()?.get_op() != BinaryOperator::OpOr {
-        return None;
-    }
-
-    let (left, right) = binary_expr.get_exprs()?;
-    let left_var = LuaVarExpr::cast(left.syntax().clone())?;
-    let left_access_path = left_var.get_access_path()?;
-    if access_path != left_access_path {
-        return None;
-    }
 
     let guarded_table_expr = matches!(&right, LuaExpr::TableExpr(_));
     let expr_type = if !guarded_table_expr {
