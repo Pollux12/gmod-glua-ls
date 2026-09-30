@@ -909,6 +909,25 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         };
         set_index_expr_owner(analyzer, var.clone());
 
+        if copies_table_into_itself(analyzer, &var, expr) {
+            assign_merge_type_owner_and_expr_type(
+                analyzer,
+                type_owner.clone(),
+                &LuaType::Never,
+                0,
+                false,
+                DeclWrite {
+                    position: expr.get_position(),
+                    may_improve_after_resolve: false,
+                    reads_out_of_decl: false,
+                    may_narrow_uninformative: false,
+                    resolved_initializer: false,
+                    fills_own_default: false,
+                },
+            );
+            continue;
+        }
+
         let expr_type = match declared_empty_table_type
             .map(Ok)
             .unwrap_or_else(|| analyzer.infer_expr(expr))
@@ -1155,6 +1174,19 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
     }
 
     Some(())
+}
+
+/// Whether `var = expr` is a `pairs` copy of a table into itself, which gives
+/// no field a value: see [`crate::compilation::analyzer::copies_table_into_itself`].
+fn copies_table_into_itself(analyzer: &mut LuaAnalyzer, var: &LuaVarExpr, expr: &LuaExpr) -> bool {
+    let LuaVarExpr::IndexExpr(index_expr) = var else {
+        return false;
+    };
+    let cache = analyzer
+        .context
+        .infer_manager
+        .get_infer_cache(analyzer.file_id);
+    crate::compilation::analyzer::copies_table_into_itself(&analyzer.db, cache, index_expr, expr)
 }
 
 /// Whether an assignment leaves a value's target alone: a `nil` that only

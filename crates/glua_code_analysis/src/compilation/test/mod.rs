@@ -35,6 +35,7 @@ mod multi_return;
 mod out_of_order;
 mod overload_field;
 mod overload_test;
+mod pairs_copy_test;
 mod pcall_test;
 mod query_test;
 mod retraction_test;

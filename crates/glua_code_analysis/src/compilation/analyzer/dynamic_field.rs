@@ -220,6 +220,11 @@ fn collect_dynamic_fields_for_file(
                 continue;
             };
 
+            if value_expr.is_some_and(|value_expr| {
+                copies_table_into_itself(db, cache, &index_expr, value_expr)
+            }) {
+                continue;
+            }
             let field_names = get_field_names(
                 db,
                 cache,
@@ -1414,6 +1419,61 @@ pub(crate) fn for_range_pairs_source_for_var(
         iter_decl_id,
         source_expr,
     })
+}
+
+/// Whether a write `t[k] = v` copies `t` into itself: `k` and `v` are the key
+/// and value variables of one builtin `pairs` loop, neither reassigned before
+/// the write, and every table that loop can iterate is `t`. Each field is
+/// written back onto itself, so the copy gives no field a value it does not
+/// already hold.
+pub(crate) fn copies_table_into_itself(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    index_expr: &glua_parser::LuaIndexExpr,
+    value_expr: &LuaExpr,
+) -> bool {
+    let file_id = cache.get_file_id();
+    let Some(LuaIndexKey::Expr(LuaExpr::NameExpr(key_name))) = index_expr.get_index_key() else {
+        return false;
+    };
+    let LuaExpr::NameExpr(value_name) = value_expr else {
+        return false;
+    };
+    let (Some(key), Some(value)) = (
+        for_range_pairs_source_for_var(db, file_id, &key_name, 0),
+        for_range_pairs_source_for_var(db, file_id, value_name, 1),
+    ) else {
+        return false;
+    };
+    let references = db.get_reference_index();
+    let unreassigned = |decl_id: &LuaDeclId| {
+        references
+            .first_local_reassignment(file_id, decl_id)
+            .is_none_or(|position| position >= index_expr.get_position())
+    };
+    if key.source_expr.get_range() != value.source_expr.get_range()
+        || !unreassigned(&key.iter_decl_id)
+        || !unreassigned(&value.iter_decl_id)
+    {
+        return false;
+    }
+    let member_index = db.get_member_index();
+    let Some(target) = member_index
+        .get_member_owner(&LuaMemberId::new(index_expr.get_syntax_id(), file_id))
+        .cloned()
+    else {
+        return false;
+    };
+    let target = member_index.canonical_owner(target);
+    let Ok(source_type) = infer_expr(db, cache, key.source_expr) else {
+        return false;
+    };
+    let mut sources = Vec::new();
+    collect_pairs_source_owners(&source_type, &mut sources)
+        && !sources.is_empty()
+        && sources
+            .into_iter()
+            .all(|source| member_index.canonical_owner(source) == target)
 }
 
 fn field_names_from_for_range_pairs_key(

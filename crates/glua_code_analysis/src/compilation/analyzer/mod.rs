@@ -18,8 +18,8 @@ pub(crate) mod unresolve;
 
 pub(crate) use call_site_params::{CallbackArg, CallbackParamsQuery, ReceiverAuthorityQuery};
 pub(crate) use common::{union_widens_cached_type, widen_mutable_decl_literal};
-pub(crate) use dynamic_field::for_range_pairs_source_for_var;
 pub(crate) use dynamic_field::is_provably_builtin_iterator_call;
+pub(crate) use dynamic_field::{copies_table_into_itself, for_range_pairs_source_for_var};
 pub(crate) use engine::EngineStats;
 pub use engine::{Schedule, Slice};
 pub use lua::is_member_assignment_in_conditional_branch;

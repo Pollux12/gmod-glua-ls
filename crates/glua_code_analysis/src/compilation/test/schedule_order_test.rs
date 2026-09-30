@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod test {
+pub(super) mod test {
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -282,7 +282,7 @@ Config = {}
     /// Asserts `files` settle the same cold-built in canonical order, in
     /// reversed order, deferred, and in canonical order one evaluation at a
     /// time.
-    fn assert_schedule_independent(files: &[(&str, &str)]) {
+    pub(crate) fn assert_schedule_independent(files: &[(&str, &str)]) {
         let canonical = settled(Schedule::Canonical, files).expect("canonical order settles");
         let others = [
             (
