@@ -46,51 +46,7 @@ use crate::{
 };
 
 use super::AnalyzeContext;
-pub(in crate::compilation::analyzer) use store::{
-    DbAccess, MemberHoming, SignatureChange, StatementWrite,
-};
-
-/// Whether a derivation of `kind` analyses without writing, its writes
-/// applying afterwards.
-pub(in crate::compilation::analyzer) fn defers_writes(
-    kind: crate::db_index::derivation::DerivationKind,
-) -> bool {
-    use crate::db_index::derivation::DerivationKind as K;
-    matches!(
-        kind,
-        K::TableField
-            | K::LocalStat
-            | K::AssignStat
-            | K::ForRangeStat
-            | K::FuncStat
-            | K::LocalFuncStat
-            | K::Closure
-            | K::Call
-            | K::Setmetatable
-            | K::ChunkReturn
-    )
-}
-
-/// Evaluates one walk derivation of `file_id`: the statement or expression at
-/// `syntax_id`, or the file's module export when `syntax_id` is the chunk.
-/// Returns the logged writes, which have already applied.
-pub(in crate::compilation::analyzer) fn evaluate_node(
-    db: &mut DbIndex,
-    context: &mut AnalyzeContext,
-    special_call_direct_matcher: &call::SpecialCallDirectMatcher,
-    file_id: FileId,
-    syntax_id: LuaSyntaxId,
-) -> Vec<StatementWrite> {
-    analyze_walk_node(
-        DbAccess::Inline(db),
-        AssignmentStage::Whole,
-        context,
-        special_call_direct_matcher,
-        file_id,
-        syntax_id,
-    )
-    .0
-}
+pub(in crate::compilation::analyzer) use store::{MemberHoming, SignatureChange, StatementWrite};
 
 /// Analyses one walk derivation against `db` without writing it, and returns
 /// the writes to apply with [`StatementWrite::apply`], in order. An assignment
@@ -105,7 +61,7 @@ pub(in crate::compilation::analyzer) fn compute_node(
     syntax_id: LuaSyntaxId,
 ) -> (Vec<StatementWrite>, AssignmentHoming) {
     analyze_walk_node(
-        DbAccess::Deferred(db),
+        db,
         stage,
         context,
         special_call_direct_matcher,
@@ -115,7 +71,7 @@ pub(in crate::compilation::analyzer) fn compute_node(
 }
 
 fn analyze_walk_node(
-    db: DbAccess<'_>,
+    db: &DbIndex,
     stage: AssignmentStage,
     context: &mut AnalyzeContext,
     special_call_direct_matcher: &call::SpecialCallDirectMatcher,
@@ -135,7 +91,7 @@ fn analyze_walk_node(
     let gmod_enabled = db.get_emmyrc().gmod.enabled;
     let is_scripted_class_scope = gmod_enabled
         && context
-            .get_or_compute_scripted_scope_files(&db)
+            .get_or_compute_scripted_scope_files(db)
             .contains(&file_id);
     let mut analyzer = LuaAnalyzer::new(
         db,
@@ -167,8 +123,8 @@ fn analyze_walk_node(
 /// Which part of an assignment an analysis makes.
 ///
 /// An assignment homes the members it writes before it infers the values it
-/// assigns them, and the inference reads those members. Deferred, the homing
-/// runs as a stage of its own, which applies before the values stage infers.
+/// assigns them, and the inference reads those members, so the homing runs as
+/// a stage of its own, which applies before the values stage infers.
 #[derive(Debug)]
 pub(in crate::compilation::analyzer) enum AssignmentStage {
     /// The whole analysis in one go.
@@ -229,7 +185,7 @@ fn analyze_node(analyzer: &mut LuaAnalyzer, node: LuaAst) {
 #[derive(Debug)]
 struct LuaAnalyzer<'a> {
     file_id: FileId,
-    db: DbAccess<'a>,
+    db: &'a DbIndex,
     /// The writes made through [`LuaAnalyzer::write`], in order.
     log: Vec<StatementWrite>,
     /// The part of an assignment this analysis makes.
@@ -263,7 +219,7 @@ struct LuaAnalyzer<'a> {
 
 impl LuaAnalyzer<'_> {
     pub fn new<'a>(
-        db: DbAccess<'a>,
+        db: &'a DbIndex,
         file_id: FileId,
         context: &'a mut AnalyzeContext,
         gmod_enabled: bool,
@@ -297,15 +253,11 @@ impl LuaAnalyzer<'_> {
 impl LuaAnalyzer<'_> {
     pub fn infer_expr(&mut self, expr: &LuaExpr) -> Result<LuaType, InferFailReason> {
         let cache = self.context.infer_manager.get_infer_cache(self.file_id);
-        infer_expr(&self.db, cache, expr.clone())
+        infer_expr(self.db, cache, expr.clone())
     }
 
-    /// Makes `write`: at once when the analysis runs inline, after it when
-    /// deferred.
+    /// Logs `write`, which applies after the analysis.
     fn write(&mut self, write: StatementWrite) {
-        if let DbAccess::Inline(db) = &mut self.db {
-            write.apply(db);
-        }
         self.log.push(write);
     }
 }

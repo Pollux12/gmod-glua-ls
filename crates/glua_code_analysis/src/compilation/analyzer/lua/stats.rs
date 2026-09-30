@@ -3006,19 +3006,19 @@ mod tests {
         );
     }
 
-    fn with_analyzer<T>(db: &mut DbIndex, run: impl FnOnce(&mut LuaAnalyzer<'_>) -> T) -> T {
+    fn with_analyzer<T>(db: &DbIndex, run: impl FnOnce(&mut LuaAnalyzer<'_>) -> T) -> T {
         with_analyzer_config(db, false, run)
     }
 
     fn with_analyzer_config<T>(
-        db: &mut DbIndex,
+        db: &DbIndex,
         gmod_enabled: bool,
         run: impl FnOnce(&mut LuaAnalyzer<'_>) -> T,
     ) -> T {
         let mut context = crate::compilation::analyzer::AnalyzeContext::new();
         let matcher = super::super::call::SpecialCallDirectMatcher::default();
         let mut analyzer = LuaAnalyzer::new(
-            super::super::DbAccess::Inline(db),
+            db,
             FileId::new(0),
             &mut context,
             gmod_enabled,
@@ -3071,7 +3071,7 @@ mod tests {
                 initial_array,
             );
 
-            with_analyzer(&mut db, |analyzer| {
+            let writes = with_analyzer(&db, |analyzer| {
                 for additional_base in order {
                     record_pending_dynamic_key_collection_widening(
                         analyzer,
@@ -3081,15 +3081,17 @@ mod tests {
                     );
                 }
                 flush_pending_dynamic_key_collection_widenings(analyzer);
+                std::mem::take(&mut analyzer.log)
+            });
+            for write in &writes {
+                write.apply(&mut db);
+            }
 
-                analyzer
-                    .db
-                    .get_type_index()
-                    .get_type_cache(&LuaTypeOwner::Member(member_id))
-                    .expect("flushed member type")
-                    .as_type()
-                    .clone()
-            })
+            db.get_type_index()
+                .get_type_cache(&LuaTypeOwner::Member(member_id))
+                .expect("flushed member type")
+                .as_type()
+                .clone()
         }
 
         let string_then_boolean = flushed_type_for(&[LuaType::String, LuaType::Boolean]);

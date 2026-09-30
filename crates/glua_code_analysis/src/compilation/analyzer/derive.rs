@@ -250,38 +250,6 @@ impl super::engine::Recipe for Recipes {
     }
 }
 
-/// `GLUALS_CHECK_PURE`: analyse each statement that defers its writes both
-/// ways and report where the deferred analysis wrote differently.
-fn check_pure() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("GLUALS_CHECK_PURE").is_some())
-}
-
-/// Per kind, the statements checked and how many of them wrote differently
-/// deferred.
-static PURE_CHECKS: std::sync::Mutex<std::collections::BTreeMap<DerivationKind, (usize, usize)>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
-
-/// Under `GLUALS_CHECK_PURE`, prints per kind how many statements were checked
-/// and how many wrote differently deferred, then the totals.
-pub(super) fn report_pure_check() {
-    if !check_pure() {
-        return;
-    }
-    let checks = PURE_CHECKS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for (kind, (checked, mismatched)) in checks.iter() {
-        eprintln!("[pure] {kind:?} checked {checked} mismatched {mismatched}");
-    }
-    let (checked, mismatched) = checks
-        .values()
-        .fold((0, 0), |(c, m), (checked, mismatched)| {
-            (c + checked, m + mismatched)
-        });
-    eprintln!("[pure] checked {checked} mismatched {mismatched}");
-}
-
 /// Whether a file's locals are guessed from their uses: only once the run has
 /// closed, since a local still waiting on its initializer is not one the
 /// initializer left without a type.
@@ -292,79 +260,25 @@ fn guesses_locals(db: &DbIndex) -> bool {
 impl Recipes {
     /// Analyses a statement without writing, then applies what it wrote; an
     /// assignment in two stages, its homing applied before its values are
-    /// analysed. Under `GLUALS_CHECK_PURE` any other statement is also analysed
-    /// inline, which is what takes effect, and the two are compared.
-    fn evaluate_deferred(&self, db: &mut DbIndex, context: &mut AnalyzeContext, id: DerivationId) {
-        if id.kind == DerivationKind::AssignStat {
-            let (homing_writes, homing) = self.compute(
+    /// analysed.
+    fn evaluate_statement(&self, db: &mut DbIndex, context: &mut AnalyzeContext, id: DerivationId) {
+        let stage = if id.kind == DerivationKind::AssignStat {
+            let (writes, homing) = self.compute(
                 db,
                 lua::AssignmentStage::Homing(lua::AssignmentHoming::default()),
                 context,
                 id,
             );
-            for write in &homing_writes {
-                write.apply(db);
-            }
-            let (writes, _) = self.compute(db, lua::AssignmentStage::Values(homing), context, id);
             for write in &writes {
                 write.apply(db);
             }
-            return;
-        }
-        if !check_pure() {
-            let (writes, _) = self.compute(db, lua::AssignmentStage::Whole, context, id);
-            for write in &writes {
-                write.apply(db);
-            }
-            return;
-        }
-        let mut deferred_context = AnalyzeContext::for_files(db, vec![id.file_id], &self.scopes);
-        let memo = context.infer_manager.get_infer_cache(id.file_id).clone();
-        deferred_context
-            .infer_manager
-            .restore_file(id.file_id, memo);
-        let (deferred, _) =
-            self.compute(db, lua::AssignmentStage::Whole, &mut deferred_context, id);
-        let inline = lua::evaluate_node(
-            db,
-            context,
-            &self.special_call_direct_matcher,
-            id.file_id,
-            id.syntax_id(),
-        );
-        let deferred = (
-            format!("{deferred:?}"),
-            format!("{:?}", deferred_context.unresolves),
-        );
-        let inline = (format!("{inline:?}"), format!("{:?}", context.unresolves));
-        let mut checks = PURE_CHECKS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (checked, mismatched) = checks.entry(id.kind).or_default();
-        *checked += 1;
-        if deferred != inline {
-            *mismatched += 1;
-            if *mismatched <= 5 {
-                let text = db
-                    .get_vfs()
-                    .get_syntax_tree(&id.file_id)
-                    .and_then(|tree| {
-                        id.syntax_id()
-                            .to_node_from_root(tree.get_chunk_node().syntax())
-                    })
-                    .map(|node| node.text().to_string())
-                    .unwrap_or_default();
-                let path = db
-                    .get_vfs()
-                    .get_file_path(&id.file_id)
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_default();
-                eprintln!(
-                    "[pure] {id:?} {path}: {text:?}
-[pure] {id:?} deferred {deferred:?}
-[pure] {id:?} inline   {inline:?}"
-                );
-            }
+            lua::AssignmentStage::Values(homing)
+        } else {
+            lua::AssignmentStage::Whole
+        };
+        let (writes, _) = self.compute(db, stage, context, id);
+        for write in &writes {
+            write.apply(db);
         }
     }
 
@@ -406,19 +320,7 @@ impl Recipes {
             | DerivationKind::Closure
             | DerivationKind::Call
             | DerivationKind::Setmetatable
-            | DerivationKind::ChunkReturn => {
-                if lua::defers_writes(id.kind) {
-                    self.evaluate_deferred(db, context, id);
-                } else {
-                    lua::evaluate_node(
-                        db,
-                        context,
-                        &self.special_call_direct_matcher,
-                        id.file_id,
-                        id.syntax_id(),
-                    );
-                }
-            }
+            | DerivationKind::ChunkReturn => self.evaluate_statement(db, context, id),
             DerivationKind::GmodLoadCallSites => gmod::evaluate_load_call_sites(db, context),
             DerivationKind::GmodPre => gmod::evaluate_pre(db, context),
             DerivationKind::GmodClassCallSites => gmod::evaluate_class_call_sites(db, context),

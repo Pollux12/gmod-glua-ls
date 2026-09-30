@@ -1,8 +1,6 @@
-//! How a statement's analysis reaches the index: inline, writing as it goes,
-//! or deferred, reading a shared index and logging its writes for the engine
-//! to apply afterwards.
+//! The writes a statement's analysis makes: computed against the shared index,
+//! logged, and applied by the engine afterwards.
 
-use std::ops::Deref;
 use std::sync::Arc;
 
 use rowan::{TextRange, TextSize};
@@ -35,34 +33,6 @@ use super::{
         is_guarded_table_assignment_member,
     },
 };
-
-/// The index as a statement's analysis sees it.
-pub(in crate::compilation::analyzer) enum DbAccess<'a> {
-    /// Writes apply as they are made.
-    Inline(&'a mut DbIndex),
-    /// Writes are logged and apply after the analysis.
-    Deferred(&'a DbIndex),
-}
-
-impl Deref for DbAccess<'_> {
-    type Target = DbIndex;
-
-    fn deref(&self) -> &DbIndex {
-        match self {
-            DbAccess::Inline(db) => db,
-            DbAccess::Deferred(db) => db,
-        }
-    }
-}
-
-impl std::fmt::Debug for DbAccess<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            DbAccess::Inline(_) => "Inline",
-            DbAccess::Deferred(_) => "Deferred",
-        })
-    }
-}
 
 /// An index expression's member filed under its owner.
 #[derive(Debug)]
