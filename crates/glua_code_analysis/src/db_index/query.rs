@@ -244,6 +244,11 @@ impl<F: QueryFamily> QueryTable<F> {
             .is_some_and(|previous| previous.fingerprint != fingerprint)
             .then(|| HashedKey::new(F::output(key)));
         drop(memos);
+        if moved.is_some() {
+            // The evaluation that demanded it moved the output, as a write
+            // would: its readers are checked once it is recorded.
+            derivation::rehoming(|| derivation::note_write(|| F::output(key)));
+        }
         Counters::bump(&self.counters.computed);
         self.pending().push(Filing { id, reads, moved });
         Counters::bump(&self.pending_count);
@@ -267,16 +272,23 @@ impl<F: QueryFamily> QueryTable<F> {
         }
     }
 
-    /// The fingerprint of the query's output, computing it if it has no
-    /// current memo. Not a read.
+    /// The fingerprint of the query's output: its memo's, stale or not, as a
+    /// stored fact's holds until it is written; computed only when there is
+    /// no memo. Not a read.
     pub(crate) fn fingerprint(&self, db: &DbIndex, key: LuaSignatureId) -> Fingerprint {
-        let value = self.value(db, key);
+        let memo = self.memos().get(&key).cloned();
+        let (value, fingerprint) = match memo {
+            Some(memo) => (memo.value, memo.fingerprint),
+            None => {
+                let value = self.value(db, key);
+                let fingerprint = Self::fingerprint_of(&value);
+                (value, fingerprint)
+            }
+        };
         if derivation::mapping_back() {
             return Self::fingerprint_of(&value);
         }
-        self.memos()
-            .get(&key)
-            .map_or_else(|| Self::fingerprint_of(&value), |memo| memo.fingerprint)
+        fingerprint
     }
 
     /// Computes the query again inside the engine's evaluation of it, which
