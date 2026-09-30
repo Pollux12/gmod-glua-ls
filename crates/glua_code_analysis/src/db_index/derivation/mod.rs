@@ -1932,6 +1932,12 @@ pub fn writes_source() -> bool {
     })
 }
 
+/// Whether member listings on this thread include dynamic fields: everywhere
+/// but in the pass that collects them, which must not read what it builds.
+pub fn dynamic_fields_visible() -> bool {
+    current().is_none_or(|id| id.kind != DerivationKind::DynamicFields)
+}
+
 /// The derivation being evaluated on this thread, if any.
 pub fn current() -> Option<DerivationId> {
     CURRENT.with(|current| current.borrow().as_ref().map(|evaluation| evaluation.id))

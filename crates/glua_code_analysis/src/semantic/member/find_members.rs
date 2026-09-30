@@ -1158,7 +1158,7 @@ fn append_dynamic_fields_for_type(
     members: &mut Vec<LuaMemberInfo>,
     filter: &FindMemberFilter,
 ) -> bool {
-    if !ctx.dynamic_fields {
+    if !ctx.dynamic_fields || !crate::db_index::derivation::dynamic_fields_visible() {
         return false;
     }
     let emmyrc = db.get_emmyrc();
@@ -1252,7 +1252,7 @@ fn append_dynamic_fields_for_table(
     members: &mut Vec<LuaMemberInfo>,
     filter: &FindMemberFilter,
 ) -> bool {
-    if !ctx.dynamic_fields {
+    if !ctx.dynamic_fields || !crate::db_index::derivation::dynamic_fields_visible() {
         return false;
     }
     let emmyrc = db.get_emmyrc();

@@ -280,13 +280,18 @@ Config = {}
     }
 
     /// Asserts `files` settle the same cold-built in canonical order, in
-    /// reversed order, and in canonical order one evaluation at a time.
+    /// reversed order, deferred, and in canonical order one evaluation at a
+    /// time.
     fn assert_schedule_independent(files: &[(&str, &str)]) {
         let canonical = settled(Schedule::Canonical, files).expect("canonical order settles");
         let others = [
             (
                 "reversed",
                 settled(Schedule::Reversed, files).expect("reversed order settles"),
+            ),
+            (
+                "deferred",
+                settled(Schedule::Deferred, files).expect("deferred order settles"),
             ),
             (
                 "sliced",
@@ -402,6 +407,68 @@ function Entity:Use(activator, caller, useType, value) end
                 PLANT_USE,
             ),
         ]);
+    }
+
+    const PUSHED_PLAYER: [(&str, &str); 3] = [
+        (
+            "lua/aaa_annotations/player.lua",
+            "---@class Player
+",
+        ),
+        (
+            "gamemodes/terrortown/entities/weapons/weapon_ttt_push.lua",
+            r#"---@param ply Player
+function SWEP:PushPlayer(ply)
+    ply.was_pushed = {att = ply, t = CurTime(), wep = self:GetClass()}
+end
+"#,
+        ),
+        (
+            "gamemodes/terrortown/gamemode/player.lua",
+            r#"---@param ent Player
+function GM:EntityTakeDamage(ent, owner)
+    local push = ent.was_pushed or {}
+    if push.att ~= owner then
+        push.att = owner
+        push.t = CurTime()
+        ent.was_pushed = push
+    end
+end
+"#,
+        ),
+    ];
+
+    #[test]
+    fn a_table_assigned_to_a_player_field_other_files_rewrite_keeps_its_own_fields_in_either_order()
+    {
+        assert_schedule_independent(&PUSHED_PLAYER);
+    }
+
+    #[test]
+    fn a_table_assigned_to_a_player_field_other_files_rewrite_keeps_its_own_fields_when_its_file_is_analysed_again()
+     {
+        let gmod = |ws: &mut VirtualWorkspace| {
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+        };
+        let (weapon, text) = PUSHED_PLAYER[1];
+        let touched = format!(
+            "{text}-- touched
+"
+        );
+        let mut warm = VirtualWorkspace::new();
+        gmod(&mut warm);
+        warm.def_files(PUSHED_PLAYER.to_vec());
+        warm.def_file(weapon, &touched);
+
+        let mut cold = VirtualWorkspace::new();
+        gmod(&mut cold);
+        let mut files = PUSHED_PLAYER.to_vec();
+        files[1].1 = &touched;
+        cold.def_files(files);
+
+        assert_eq!(warm.settled_digest(), cold.settled_digest());
     }
 
     const PLANT_USE: &str = r#"function ENT:Use(activator, caller)
