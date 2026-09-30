@@ -975,6 +975,11 @@ impl VirtualWorkspace {
             .derivations()
             .filter(|id| id.file_id != FileId::VIRTUAL && id.kind != DerivationKind::Diagnostics)
             .filter(|id| {
+                if id.kind.is_query() {
+                    let signature_id =
+                        crate::LuaSignatureId::new(id.file_id, id.syntax_id().get_range().start());
+                    return db.get_signature_index().get(&signature_id).is_none();
+                }
                 db.get_vfs()
                     .get_syntax_tree(&id.file_id)
                     .is_none_or(|tree| {

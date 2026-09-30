@@ -36,6 +36,7 @@ mod out_of_order;
 mod overload_field;
 mod overload_test;
 mod pcall_test;
+mod query_test;
 mod retraction_test;
 mod return_unwrap_test;
 mod schedule_order_test;

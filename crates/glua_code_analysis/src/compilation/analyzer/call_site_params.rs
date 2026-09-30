@@ -18,6 +18,10 @@ use glua_parser::{
 };
 use rowan::{TextRange, TextSize};
 
+use crate::db_index::QueryFamily;
+use crate::db_index::derivation::{DerivationKind, FactKey};
+use glua_parser::LuaSyntaxId;
+
 use super::{
     AnalysisPipeline, AnalyzeContext,
     function_summary::function_summaries,
@@ -54,11 +58,6 @@ struct FileScope {
     source_signatures: HashMap<String, Vec<LuaSignatureId>>,
     returned_tables: HashMap<FileId, Option<Arc<ReturnedTableInfo>>>,
     exact_receiver_candidates: HashMap<LuaMemberKey, bool>,
-    authoritative_receivers: HashMap<LuaSignatureId, bool>,
-    closures: HashMap<LuaSignatureId, Option<LuaClosureExpr>>,
-    /// An inference cache per callee file whose callback arguments the
-    /// file's calls infer.
-    callee_caches: HashMap<FileId, LuaInferCache>,
     /// What the file's calls target.
     targets: Arc<FileCallTargets>,
 }
@@ -72,9 +71,6 @@ impl FileScope {
                 db,
                 exact_receiver_member_keys_in_file(root),
             ),
-            authoritative_receivers: HashMap::default(),
-            closures: HashMap::default(),
-            callee_caches: HashMap::default(),
             targets: super::call_target::file_call_targets(db, file_id),
         }
     }
@@ -82,18 +78,6 @@ impl FileScope {
     /// What `call_expr`, one of the file's calls, targets.
     fn call_target(&self, call_expr: &LuaCallExpr) -> Option<&LuaCallTarget> {
         self.targets.get(&call_expr.get_range())
-    }
-
-    /// The closure `signature_id` was declared by, found once per signature.
-    fn signature_closure(
-        &mut self,
-        db: &DbIndex,
-        signature_id: LuaSignatureId,
-    ) -> Option<LuaClosureExpr> {
-        self.closures
-            .entry(signature_id)
-            .or_insert_with(|| exact_signature_closure(db, signature_id))
-            .clone()
     }
 
     /// The last function statement at or before `position` declaring `path`.
@@ -672,8 +656,7 @@ fn collect_call_site_param_types(
         if is_call_site_realm_compatible(db, file_id, call_expr.get_position(), signature_id) {
             collect_direct_callback_param_types(
                 db,
-                cache,
-                scope,
+                file_id,
                 signature_id,
                 &call_expr,
                 &call_args,
@@ -691,13 +674,8 @@ fn collect_call_site_param_types(
         let Some(signature) = db.get_signature_index().get(&signature_id) else {
             continue;
         };
-        let has_authoritative_receiver = signature.is_colon_define
-            && *scope
-                .authoritative_receivers
-                .entry(signature_id)
-                .or_insert_with(|| {
-                    signature_has_authoritative_receiver(db, &mut scope.callee_caches, signature_id)
-                });
+        let has_authoritative_receiver =
+            signature.is_colon_define && db.receiver_authority(signature_id);
         for (arg_idx, arg) in &useful_args {
             let is_implicit_receiver =
                 signature.is_colon_define && !call_expr.is_colon_call() && *arg_idx == 0;
@@ -795,8 +773,7 @@ fn collect_call_site_param_types(
 
 fn collect_direct_callback_param_types(
     db: &DbIndex,
-    caller_cache: &LuaInferCache,
-    scope: &mut FileScope,
+    file_id: FileId,
     callee_signature_id: LuaSignatureId,
     call_expr: &LuaCallExpr,
     call_args: &[LuaExpr],
@@ -811,32 +788,7 @@ fn collect_direct_callback_param_types(
     let Some(callee_signature) = db.get_signature_index().get(&callee_signature_id) else {
         return;
     };
-    let Some(callee_closure) = scope.signature_closure(db, callee_signature_id) else {
-        return;
-    };
-    let Some(callee_params) = callee_closure.get_params_list() else {
-        return;
-    };
-    let callee_params = callee_params.get_params().collect::<Vec<_>>();
-    let source_file_id = callee_signature_id.get_file_id();
-    let Some(source_root) = db
-        .get_vfs()
-        .get_syntax_tree(&source_file_id)
-        .map(|tree| tree.get_red_root())
-    else {
-        return;
-    };
-    let Some(source_refs) = db
-        .get_reference_index()
-        .get_local_reference(&source_file_id)
-    else {
-        return;
-    };
-    let mut source_cache = scope
-        .callee_caches
-        .remove(&source_file_id)
-        .unwrap_or_else(|| LuaInferCache::new(source_file_id, caller_cache.get_config().clone()));
-
+    let callback_args = db.callback_params(callee_signature_id);
     for (arg_idx, arg) in call_args.iter().enumerate() {
         let LuaExpr::ClosureExpr(target_closure) = arg else {
             continue;
@@ -846,24 +798,123 @@ fn collect_direct_callback_param_types(
         else {
             continue;
         };
-        if callee_signature.param_docs.contains_key(&callee_param_idx)
-            || is_param_mutated(db, callee_signature_id, callee_param_idx)
+        let target_signature_id = LuaSignatureId::from_closure(file_id, target_closure);
+        let Some(target_signature) = db.get_signature_index().get(&target_signature_id) else {
+            continue;
+        };
+        for callback_arg in callback_args
+            .iter()
+            .filter(|callback_arg| callback_arg.param_idx == callee_param_idx)
+        {
+            let target_param_idx = callback_arg.arg_idx;
+            if target_param_idx >= target_signature.params.len()
+                || target_signature.param_docs.contains_key(&target_param_idx)
+                || is_param_mutated(db, target_signature_id, target_param_idx)
+            {
+                continue;
+            }
+            let Ok(param_idx) = u16::try_from(target_param_idx) else {
+                continue;
+            };
+            let node = LuaInferenceNodeId::SignatureParam {
+                signature_id: target_signature_id,
+                param_idx,
+            };
+            let event = LuaInferenceEventId {
+                node,
+                kind: LuaInferenceProvenanceKind::ConcreteValue,
+                source: callback_arg.source.clone(),
+            };
+            contributions.push((
+                target_signature_id,
+                target_param_idx,
+                LuaTypeFact::new(
+                    callback_arg.typ.clone(),
+                    LuaInferenceConfidence::Certain,
+                    Arc::from([LuaInferenceStep {
+                        event,
+                        support: Arc::from([]),
+                        inferred_type: None,
+                        found_type: None,
+                    }]),
+                ),
+            ));
+        }
+    }
+}
+
+/// What a function passes to the callback parameters it calls: a table
+/// literal argument of a call of one, as the type a callback receives.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CallbackArg {
+    /// The callee's parameter the call calls.
+    param_idx: usize,
+    /// The argument's position in that call.
+    arg_idx: usize,
+    source: InFiled<LuaSyntaxId>,
+    typ: LuaType,
+}
+
+/// The callback arguments of a function, owned by the function: every caller
+/// passing it a closure reads the same answer.
+#[derive(Debug)]
+pub(crate) struct CallbackParamsQuery;
+
+impl QueryFamily for CallbackParamsQuery {
+    type Value = Vec<CallbackArg>;
+    const KIND: DerivationKind = DerivationKind::CallbackParams;
+
+    fn output(key: LuaSignatureId) -> FactKey {
+        FactKey::CallbackParams(key)
+    }
+
+    fn compute(db: &DbIndex, key: LuaSignatureId) -> Self::Value {
+        callback_args(db, key)
+    }
+
+    fn floor() -> Self::Value {
+        Vec::new()
+    }
+}
+
+/// The table literals `callee_signature_id`'s function passes to the
+/// parameters it calls, other than annotated or reassigned ones, in source
+/// order.
+fn callback_args(db: &DbIndex, callee_signature_id: LuaSignatureId) -> Vec<CallbackArg> {
+    let mut args = Vec::new();
+    let Some(callee_signature) = db.get_signature_index().get(&callee_signature_id) else {
+        return args;
+    };
+    let Some(callee_params) = exact_signature_closure(db, callee_signature_id)
+        .and_then(|closure| closure.get_params_list())
+    else {
+        return args;
+    };
+    let source_file_id = callee_signature_id.get_file_id();
+    let Some(source_root) = db
+        .get_vfs()
+        .get_syntax_tree(&source_file_id)
+        .map(|tree| tree.get_red_root())
+    else {
+        return args;
+    };
+    let Some(source_refs) = db
+        .get_reference_index()
+        .get_local_reference(&source_file_id)
+    else {
+        return args;
+    };
+    let mut cache = LuaInferCache::new(source_file_id, super::call_target::pass_view());
+    for (param_idx, callee_param) in callee_params.get_params().enumerate() {
+        if callee_signature.param_docs.contains_key(&param_idx)
+            || is_param_mutated(db, callee_signature_id, param_idx)
         {
             continue;
         }
-        let Some(callee_param) = callee_params.get(callee_param_idx) else {
-            continue;
-        };
         let callee_param_decl_id = LuaDeclId::new(source_file_id, callee_param.get_position());
         let Some(references) = source_refs.get_decl_references(&callee_param_decl_id) else {
             continue;
         };
-        let target_signature_id =
-            LuaSignatureId::from_closure(caller_cache.get_file_id(), target_closure);
-        let Some(target_signature) = db.get_signature_index().get(&target_signature_id) else {
-            continue;
-        };
-
         for cell in references.cells.iter().filter(|cell| !cell.is_write) {
             let Some(name_expr) = source_root
                 .covering_element(cell.range)
@@ -884,53 +935,27 @@ fn collect_direct_callback_param_types(
             else {
                 continue;
             };
-            let Some(callback_args) = callback_call.get_args_list() else {
+            let Some(callback_call_args) = callback_call.get_args_list() else {
                 continue;
             };
-            for (target_param_idx, callback_arg) in callback_args.get_args().enumerate() {
-                if target_param_idx >= target_signature.params.len()
-                    || target_signature.param_docs.contains_key(&target_param_idx)
-                    || is_param_mutated(db, target_signature_id, target_param_idx)
-                {
-                    continue;
-                }
-                let source_syntax_id = callback_arg.get_syntax_id();
-                let Ok(param_idx) = u16::try_from(target_param_idx) else {
+            for (arg_idx, callback_arg) in callback_call_args.get_args().enumerate() {
+                let source = InFiled::new(source_file_id, callback_arg.get_syntax_id());
+                let Ok(arg_type) = infer_expr(db, &mut cache, callback_arg) else {
                     continue;
                 };
-                let Ok(arg_type) = infer_expr(db, &mut source_cache, callback_arg) else {
+                let Some(typ) = snapshot_callback_table_type(db, &arg_type) else {
                     continue;
                 };
-                let Some(arg_type) = snapshot_callback_table_type(db, &arg_type) else {
-                    continue;
-                };
-                let node = LuaInferenceNodeId::SignatureParam {
-                    signature_id: target_signature_id,
+                args.push(CallbackArg {
                     param_idx,
-                };
-                let event = LuaInferenceEventId {
-                    node,
-                    kind: LuaInferenceProvenanceKind::ConcreteValue,
-                    source: InFiled::new(source_file_id, source_syntax_id),
-                };
-                contributions.push((
-                    target_signature_id,
-                    target_param_idx,
-                    LuaTypeFact::new(
-                        arg_type,
-                        LuaInferenceConfidence::Certain,
-                        Arc::from([LuaInferenceStep {
-                            event,
-                            support: Arc::from([]),
-                            inferred_type: None,
-                            found_type: None,
-                        }]),
-                    ),
-                ));
+                    arg_idx,
+                    source,
+                    typ,
+                });
             }
         }
     }
-    scope.callee_caches.insert(source_file_id, source_cache);
+    args
 }
 
 fn snapshot_callback_table_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
@@ -1223,24 +1248,37 @@ fn exact_signature_closure(db: &DbIndex, signature_id: LuaSignatureId) -> Option
         })
 }
 
-/// Whether the method `signature_id` declares has an authoritative receiver,
-/// inferred in its file's cache among `callee_caches`, which the file's other
-/// methods share.
-fn signature_has_authoritative_receiver(
-    db: &DbIndex,
-    callee_caches: &mut HashMap<FileId, LuaInferCache>,
-    signature_id: LuaSignatureId,
-) -> bool {
+/// Whether a method's receiver is authoritative, owned by the method: every
+/// caller passing it a receiver reads the same answer.
+#[derive(Debug)]
+pub(crate) struct ReceiverAuthorityQuery;
+
+impl QueryFamily for ReceiverAuthorityQuery {
+    type Value = bool;
+    const KIND: DerivationKind = DerivationKind::ReceiverAuthority;
+
+    fn output(key: LuaSignatureId) -> FactKey {
+        FactKey::ReceiverAuthority(key)
+    }
+
+    fn compute(db: &DbIndex, key: LuaSignatureId) -> Self::Value {
+        signature_has_authoritative_receiver(db, key)
+    }
+
+    fn floor() -> Self::Value {
+        false
+    }
+}
+
+/// Whether the method `signature_id` declares has an authoritative receiver.
+fn signature_has_authoritative_receiver(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
     let Some(func_stat) = exact_signature_closure(db, signature_id)
         .and_then(|closure| closure.get_parent::<LuaFuncStat>())
     else {
         return false;
     };
-    let file_id = signature_id.get_file_id();
-    let cache = callee_caches
-        .entry(file_id)
-        .or_insert_with(|| LuaInferCache::new(file_id, super::call_target::pass_view()));
-    infer_authoritative_method_self_type(db, cache, &func_stat).is_some()
+    let mut cache = LuaInferCache::new(signature_id.get_file_id(), super::call_target::pass_view());
+    infer_authoritative_method_self_type(db, &mut cache, &func_stat).is_some()
 }
 
 fn var_writes_param(var: &LuaVarExpr, param_name: &str) -> bool {

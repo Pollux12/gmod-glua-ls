@@ -227,6 +227,10 @@ impl super::engine::Recipe for Recipes {
             DerivationKind::Source | DerivationKind::Diagnostics => {
                 unreachable!("{:?} derivations are not evaluated by recipe", id.kind)
             }
+            kind if kind.is_query() => {
+                let db: &DbIndex = db;
+                db.queries().recompute(db, id);
+            }
             _ => {
                 let mut context = AnalyzeContext::for_files(db, vec![id.file_id], &self.scopes);
                 if let Some(cache) = self.caches.lock().expect("cache store").remove(&id.file_id) {
@@ -329,6 +333,8 @@ impl Recipes {
             | DerivationKind::GmodLoad
             | DerivationKind::ValidGuards
             | DerivationKind::VguiChains
+            | DerivationKind::ReceiverAuthority
+            | DerivationKind::CallbackParams
             | DerivationKind::Diagnostics => unreachable!(),
         }
     }

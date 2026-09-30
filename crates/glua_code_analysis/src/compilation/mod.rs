@@ -8,6 +8,7 @@ pub use analyzer::parallel::set_analysis_threads;
 pub use analyzer::unresolve::extract_hook_name;
 pub use analyzer::unresolve::resolve_gmod_hook_add_callback_doc_function;
 pub use analyzer::unresolve::resolve_gmod_hook_callback_doc_function;
+pub(crate) use analyzer::{CallbackArg, CallbackParamsQuery, ReceiverAuthorityQuery};
 pub use analyzer::{Schedule, Slice};
 
 use std::sync::{Arc, Mutex};

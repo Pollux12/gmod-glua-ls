@@ -76,7 +76,7 @@ impl std::fmt::Debug for dyn DerivedFact {
 pub use graph::{KeyIdx, KeyTable, ReaderGraph};
 pub use positions::{
     EditMaps, FilePosition, Local, fingerprint_before_edits, fingerprinting, hash_local, in_file,
-    mapping_back,
+    mapping_back, unmapped,
 };
 
 use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
@@ -380,6 +380,10 @@ pub enum FactKey {
     FileSet,
     /// Whether a stage rule holds at the stage the engine run is in.
     StageRule(StageRule),
+    /// Whether a method's receiver is authoritative, as its body infers it.
+    ReceiverAuthority(LuaSignatureId),
+    /// What a function passes to each callback parameter it calls.
+    CallbackParams(LuaSignatureId),
 }
 
 /// A fact key with its hash taken once, so the sets and maps that record,
@@ -578,6 +582,8 @@ impl FactKey {
                 | K::NetworkFile(_)
                 | K::NetworkScan
                 | K::CallTargets(_)
+                | K::ReceiverAuthority(_)
+                | K::CallbackParams(_)
         )
     }
 
@@ -709,6 +715,8 @@ impl FactKey {
             | K::ValidGuard(signature_id)
             | K::InferredGuard(signature_id)
             | K::Contrib(signature_id, _)
+            | K::ReceiverAuthority(signature_id)
+            | K::CallbackParams(signature_id)
             | K::CallRole(CallRoleKey::Signature(signature_id)) => Some(signature_id.get_file_id()),
             K::SpecialCall(file_id, _)
             | K::SpecialCallFile(file_id)
@@ -849,6 +857,10 @@ pub enum DerivationKind {
     SetmetatableFactory,
     /// What the callee of each of a file's calls resolves to.
     CallTargets,
+    /// A query: whether a method's receiver is authoritative.
+    ReceiverAuthority,
+    /// A query: what a function passes to each callback parameter it calls.
+    CallbackParams,
     /// A file's call-site parameter contributions and return consumers.
     CallSiteParams,
     /// A file's local types guessed from their uses.
@@ -888,11 +900,19 @@ impl DerivationKind {
             // for each read that settles after it.
             Self::DynamicFields
             | Self::CallTargets
+            | Self::ReceiverAuthority
+            | Self::CallbackParams
             | Self::CallSiteParams
             | Self::NetHelpers
             | Self::Network => AnalysisStage::Closed,
             _ => AnalysisStage::Open,
         }
+    }
+
+    /// Whether derivations of this kind are queries: computed when first
+    /// read rather than scheduled, and re-computed when a read of theirs moves.
+    pub fn is_query(self) -> bool {
+        matches!(self, Self::ReceiverAuthority | Self::CallbackParams)
     }
 }
 
@@ -1145,6 +1165,14 @@ pub struct ViewedReads {
 }
 
 impl ViewedReads {
+    /// Reads made with no graph viewed, each with the fingerprint it saw.
+    pub fn from_keys(keys: Vec<(HashedKey, Fingerprint)>) -> Self {
+        Self {
+            slots: Vec::new(),
+            keys,
+        }
+    }
+
     /// Every key read, for tests.
     #[cfg(test)]
     pub fn keys<'a>(&'a self, graph: &'a ReaderGraph) -> impl Iterator<Item = &'a FactKey> {
@@ -1347,6 +1375,26 @@ fn start(evaluation: Evaluation) {
             SUSPENDED.with(|suspended| suspended.borrow_mut().push(previous));
         }
     });
+}
+
+/// Runs `f` as the evaluation of `id`, nested in whatever this thread is
+/// recording, and returns what it read, as keys. Its reads are its own: the
+/// suspended evaluation's key table, view and untracked or re-homing regions
+/// do not apply to it, so what it read can be filed whatever it ran inside.
+pub fn detached<T>(id: DerivationId, f: impl FnOnce() -> T) -> (T, Vec<HashedKey>) {
+    let keys = KEYS.with(|keys| keys.borrow_mut().take());
+    let view = VIEW.with(|view| view.borrow_mut().take());
+    let untracked = UNTRACKED.with(|depth| depth.replace(0));
+    let rehoming = REHOMING.with(|depth| depth.replace(0));
+    begin(id);
+    let result = f();
+    let evaluation = end();
+    KEYS.with(|slot| *slot.borrow_mut() = keys);
+    VIEW.with(|slot| *slot.borrow_mut() = view);
+    UNTRACKED.with(|depth| depth.set(untracked));
+    REHOMING.with(|depth| depth.set(rehoming));
+    let (_, reads, _) = evaluation.into_unfingerprinted_parts();
+    (result, reads.into_iter().map(|(key, _)| key).collect())
 }
 
 /// Continues recording an evaluation that [`end`] handed back, for a

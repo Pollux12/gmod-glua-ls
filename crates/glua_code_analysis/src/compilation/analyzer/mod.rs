@@ -16,6 +16,7 @@ pub(crate) mod parallel;
 mod setmetatable_factory;
 pub(crate) mod unresolve;
 
+pub(crate) use call_site_params::{CallbackArg, CallbackParamsQuery, ReceiverAuthorityQuery};
 pub(crate) use common::{union_widens_cached_type, widen_mutable_decl_literal};
 pub(crate) use dynamic_field::for_range_pairs_source_for_var;
 pub(crate) use dynamic_field::is_provably_builtin_iterator_call;
@@ -320,6 +321,11 @@ impl Reanalysis {
         let stats = self.engine.stats().clone();
         let evaluated_files = self.engine.evaluated_files();
         stats.report(evaluated_files.len());
+        if crate::profile::profiling() {
+            for (kind, query_stats) in db.queries().stats() {
+                eprintln!("[query] {kind:?} {query_stats:?}");
+            }
+        }
         crate::profile::memory::checkpoint("end of re-analysis");
         let stale_diagnostics = crate::profile::phase("reanalyze: stale diagnostics", || {
             self.engine.stale_diagnostics(db)
@@ -378,13 +384,17 @@ fn start_pass(
         return None;
     }
     let scopes = crate::profile::phase("reanalyze: scopes", || scopes.get(db));
+    // Queries computed since the last run read the index as it stood before
+    // the rebuild moves it.
+    let moved = engine::file_queries(db);
     engine.replacing(&file_ids);
     engine.note_rebuilt(&file_ids);
     engine.prioritise(&file_ids);
     crate::profile::memory::checkpoint("before the source layer");
-    let touched = crate::profile::phase("reanalyze: replace files", || {
+    let mut touched = crate::profile::phase("reanalyze: replace files", || {
         replace_files(db, engine, &file_ids, &scopes)
     });
+    touched.extend(moved);
     crate::profile::memory::checkpoint("after the source layer");
     db.reader_graph_mut().forget_fingerprints();
     Some(Pass::Replaced { touched, scopes })

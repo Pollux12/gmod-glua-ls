@@ -20,6 +20,7 @@ mod module;
 mod numeric_range_population;
 mod operators;
 mod property;
+mod query;
 mod reference;
 mod schema;
 mod semantic_decl;
@@ -27,6 +28,9 @@ mod signature;
 mod traits;
 mod r#type;
 pub(crate) use intern::intern_smol_str;
+pub(crate) use query::QueryFamily;
+#[cfg(test)]
+pub(crate) use query::QueryStats;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{path::PathBuf, sync::Arc};
@@ -131,6 +135,8 @@ pub struct DbIndex {
     /// The stage the engine run is at; [`derivation::AnalysisStage::Closed`]
     /// outside a run.
     analysis_stage: derivation::AnalysisStage,
+    /// The memos of the facts computed when first read; see [`query`].
+    queries: query::Queries,
 }
 
 /// See [`DbIndex::type_structure_revision`] — process-global so revision values
@@ -236,6 +242,7 @@ impl DbIndex {
             net_helper_refs: FxHashMap::default(),
             function_summaries: FxHashMap::default(),
             analysis_stage: derivation::AnalysisStage::default(),
+            queries: query::Queries::default(),
         }
     }
 
@@ -563,7 +570,27 @@ impl DbIndex {
             K::Syntax(site) => self.vfs.statement_fingerprint(site),
             K::FileSet => self.vfs.file_set_fingerprint(),
             K::StageRule(rule) => derivation::fingerprint_of(&rule.holds_at(self.analysis_stage)),
+            K::ReceiverAuthority(_) | K::CallbackParams(_) => self.queries.fingerprint(self, key),
         }
+    }
+
+    pub(crate) fn queries(&self) -> &query::Queries {
+        &self.queries
+    }
+
+    /// Whether the method `signature_id` declares has an authoritative
+    /// receiver.
+    pub(crate) fn receiver_authority(&self, signature_id: LuaSignatureId) -> bool {
+        *self.queries.receiver_authority.get(self, signature_id)
+    }
+
+    /// What the function `signature_id` passes to each callback parameter it
+    /// calls.
+    pub(crate) fn callback_params(
+        &self,
+        signature_id: LuaSignatureId,
+    ) -> Arc<Vec<crate::compilation::CallbackArg>> {
+        self.queries.callback_params.get(self, signature_id)
     }
 
     pub(crate) fn analysis_stage(&self) -> derivation::AnalysisStage {
@@ -810,6 +837,7 @@ impl DbIndex {
             if self.function_summaries.remove(&file_id).is_some() {
                 derivation::note_write(|| derivation::FactKey::FunctionSummaries(file_id));
             }
+            self.queries.remove_file(file_id);
         }
         for &file_id in &file_ids {
             if let Some(path) = self.get_vfs().get_file_path(&file_id) {
@@ -1207,6 +1235,7 @@ impl DbIndex {
             net_helper_refs: self.net_helper_refs.clone(),
             function_summaries: self.function_summaries.clone(),
             analysis_stage: self.analysis_stage,
+            queries: self.queries.clone(),
         }
     }
 

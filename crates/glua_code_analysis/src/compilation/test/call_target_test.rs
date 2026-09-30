@@ -135,8 +135,8 @@ vgui.Register(\"MyMenu\", PANEL, \"Panel\")
         assert_eq!((inferred, parent_calls), (0, 1));
     }
 
-    /// The call-site parameter pass infers a callee file's callback
-    /// arguments once for every call into it, not once per call.
+    /// A callee's callback arguments are inferred once for every call into
+    /// it, not once per call: by the callee's query.
     #[test]
     fn call_site_params_infer_a_callee_files_callback_arguments_once() {
         let mut ws = gmod_workspace();
@@ -156,7 +156,7 @@ RunWith(function(b) end)
             )
         });
         let (computed, distinct) = counts
-            .get(&(Work::Infer, Some(DerivationKind::CallSiteParams)))
+            .get(&(Work::Infer, Some(DerivationKind::CallbackParams)))
             .copied()
             .unwrap_or_default();
 

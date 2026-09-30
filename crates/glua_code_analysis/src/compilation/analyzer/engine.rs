@@ -422,6 +422,9 @@ impl Engine {
             .collect::<Vec<_>>();
         for reader in readers {
             self.stats.requeued(key, self.cursor, reader);
+            if reader.kind.is_query() {
+                db.queries().set_stale(reader, true);
+            }
             if crate::profile::tracing_evaluations() {
                 self.queued_by
                     .entry(reader)
@@ -590,6 +593,10 @@ impl Engine {
     pub(crate) fn run(&mut self, db: &mut DbIndex, recipe: &dyn Recipe, slice: Slice) -> bool {
         let started = self.stats.total_evaluations();
         loop {
+            let moved = file_queries(db);
+            if !moved.is_empty() {
+                self.readers_of(db, moved.iter());
+            }
             if slice.over(self.stats.total_evaluations() - started) {
                 return false;
             }
@@ -619,6 +626,9 @@ impl Engine {
                 self.needs_evaluation(db, id, reason)
             });
             if !stale {
+                if id.kind.is_query() {
+                    db.queries().set_stale(id, false);
+                }
                 continue;
             }
             self.trace_evaluation(db, id, reason);
@@ -1125,6 +1135,7 @@ impl Engine {
         reset: &FxHashSet<HashedKey>,
         step: impl Fn() -> String,
     ) {
+        touched.extend(file_queries(db));
         for key in touched.iter().chain(
             evaluations
                 .iter()
@@ -1458,6 +1469,31 @@ fn run_group(
         }
     }
     (evaluations, FxHashSet::default())
+}
+
+/// Files the reads of the queries computed since this last ran, which makes
+/// each a reader of what it read. Returns the outputs their computation moved.
+pub(super) fn file_queries(db: &mut DbIndex) -> Vec<HashedKey> {
+    if !db.queries().has_pending() {
+        return Vec::new();
+    }
+    let filings = db.queries().take_pending();
+    let graph = db.reader_graph_mut();
+    let mut moved = Vec::new();
+    let mut released = Vec::new();
+    for filing in filings {
+        if let Some(key) = filing.moved {
+            graph.forget_fingerprint(&key);
+            moved.push(key);
+        }
+        graph.file_viewed(
+            filing.id,
+            derivation::ViewedReads::from_keys(filing.reads),
+            &mut released,
+        );
+    }
+    graph.release_keys(released);
+    moved
 }
 
 fn co_producers(db: &DbIndex, id: DerivationId) -> Vec<DerivationId> {

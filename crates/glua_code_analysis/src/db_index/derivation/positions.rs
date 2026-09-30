@@ -197,6 +197,8 @@ impl EditMaps {
             K::ValidGuard(id) => K::ValidGuard(self.signature_id(*id)?),
             K::InferredGuard(id) => K::InferredGuard(self.signature_id(*id)?),
             K::Contrib(id, idx) => K::Contrib(self.signature_id(*id)?, *idx),
+            K::ReceiverAuthority(id) => K::ReceiverAuthority(self.signature_id(*id)?),
+            K::CallbackParams(id) => K::CallbackParams(self.signature_id(*id)?),
             K::CallRole(super::CallRoleKey::Signature(id)) => {
                 K::CallRole(super::CallRoleKey::Signature(self.signature_id(*id)?))
             }
@@ -302,6 +304,15 @@ pub fn fingerprint_before_edits(
     let result = fingerprint();
     MAPPING_BACK.fetch_sub(1, Ordering::Relaxed);
     BACK_MAPS.with(|maps| *maps.borrow_mut() = None);
+    result
+}
+
+/// Runs `f` with fingerprints taken as they stand, even inside
+/// [`fingerprint_before_edits`]: for a value stored while one is taken.
+pub fn unmapped<T>(f: impl FnOnce() -> T) -> T {
+    let maps = BACK_MAPS.with(|maps| maps.borrow_mut().take());
+    let result = f();
+    BACK_MAPS.with(|slot| *slot.borrow_mut() = maps);
     result
 }
 
