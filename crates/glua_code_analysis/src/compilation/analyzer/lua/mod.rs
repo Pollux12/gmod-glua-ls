@@ -6,6 +6,7 @@ mod member_write_policy;
 mod metatable;
 mod module;
 mod stats;
+mod store;
 
 use rustc_hash::FxHashMap;
 
@@ -47,30 +48,75 @@ use crate::{
 };
 
 use super::AnalyzeContext;
+pub(in crate::compilation::analyzer) use store::{DbAccess, StatementWrite};
+
+/// Whether a derivation of `kind` analyses without writing, its writes
+/// applying afterwards.
+pub(in crate::compilation::analyzer) fn defers_writes(
+    kind: crate::db_index::derivation::DerivationKind,
+) -> bool {
+    use crate::db_index::derivation::DerivationKind as K;
+    matches!(kind, K::TableField | K::LocalStat)
+}
 
 /// Evaluates one walk derivation of `file_id`: the statement or expression at
 /// `syntax_id`, or the file's module export when `syntax_id` is the chunk.
+/// Returns the logged writes, which have already applied.
 pub(in crate::compilation::analyzer) fn evaluate_node(
     db: &mut DbIndex,
     context: &mut AnalyzeContext,
     special_call_direct_matcher: &call::SpecialCallDirectMatcher,
     file_id: FileId,
     syntax_id: LuaSyntaxId,
-) {
+) -> Vec<StatementWrite> {
+    analyze_walk_node(
+        DbAccess::Inline(db),
+        context,
+        special_call_direct_matcher,
+        file_id,
+        syntax_id,
+    )
+}
+
+/// Analyses one walk derivation against `db` without writing it, and returns
+/// the writes to apply with [`StatementWrite::apply`], in order.
+pub(in crate::compilation::analyzer) fn compute_node(
+    db: &DbIndex,
+    context: &mut AnalyzeContext,
+    special_call_direct_matcher: &call::SpecialCallDirectMatcher,
+    file_id: FileId,
+    syntax_id: LuaSyntaxId,
+) -> Vec<StatementWrite> {
+    analyze_walk_node(
+        DbAccess::Deferred(db),
+        context,
+        special_call_direct_matcher,
+        file_id,
+        syntax_id,
+    )
+}
+
+fn analyze_walk_node(
+    db: DbAccess<'_>,
+    context: &mut AnalyzeContext,
+    special_call_direct_matcher: &call::SpecialCallDirectMatcher,
+    file_id: FileId,
+    syntax_id: LuaSyntaxId,
+) -> Vec<StatementWrite> {
     let Some(root) = db
         .get_vfs()
         .get_syntax_tree(&file_id)
         .map(|tree| tree.get_chunk_node())
     else {
-        return;
+        return Vec::new();
     };
     let Some(node) = syntax_id.to_node_from_root(root.syntax()) else {
-        return;
+        return Vec::new();
     };
     let gmod_enabled = db.get_emmyrc().gmod.enabled;
     let is_scripted_class_scope = gmod_enabled
         && context
-            .get_or_compute_scripted_scope_files(db)
+            .get_or_compute_scripted_scope_files(&db)
             .contains(&file_id);
     let mut analyzer = LuaAnalyzer::new(
         db,
@@ -88,6 +134,7 @@ pub(in crate::compilation::analyzer) fn evaluate_node(
         }
         flush_pending_dynamic_key_collection_widenings(&mut analyzer);
     });
+    analyzer.log
 }
 
 fn analyze_node(analyzer: &mut LuaAnalyzer, node: LuaAst) {
@@ -127,7 +174,9 @@ fn analyze_node(analyzer: &mut LuaAnalyzer, node: LuaAst) {
 #[derive(Debug)]
 struct LuaAnalyzer<'a> {
     file_id: FileId,
-    db: &'a mut DbIndex,
+    db: DbAccess<'a>,
+    /// The writes made through [`LuaAnalyzer::write`], in order.
+    log: Vec<StatementWrite>,
     context: &'a mut AnalyzeContext,
     gmod_enabled: bool,
     is_scripted_class_scope: bool,
@@ -158,7 +207,7 @@ struct LuaAnalyzer<'a> {
 
 impl LuaAnalyzer<'_> {
     pub fn new<'a>(
-        db: &'a mut DbIndex,
+        db: DbAccess<'a>,
         file_id: FileId,
         context: &'a mut AnalyzeContext,
         gmod_enabled: bool,
@@ -168,6 +217,7 @@ impl LuaAnalyzer<'_> {
         LuaAnalyzer {
             file_id,
             db,
+            log: Vec::new(),
             context,
             gmod_enabled,
             is_scripted_class_scope,
@@ -191,6 +241,15 @@ impl LuaAnalyzer<'_> {
 impl LuaAnalyzer<'_> {
     pub fn infer_expr(&mut self, expr: &LuaExpr) -> Result<LuaType, InferFailReason> {
         let cache = self.context.infer_manager.get_infer_cache(self.file_id);
-        infer_expr(self.db, cache, expr.clone())
+        infer_expr(&self.db, cache, expr.clone())
+    }
+
+    /// Makes `write`: at once when the analysis runs inline, after it when
+    /// deferred.
+    fn write(&mut self, write: StatementWrite) {
+        if let DbAccess::Inline(db) = &mut self.db {
+            write.apply(db);
+        }
+        self.log.push(write);
     }
 }

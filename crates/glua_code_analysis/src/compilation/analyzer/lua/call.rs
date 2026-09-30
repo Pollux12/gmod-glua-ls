@@ -289,7 +289,7 @@ fn get_generic_expr_special_call_reason(
     let typ = analyzer.infer_expr(expr).ok()?;
     if type_has_special_call_signature(analyzer.special_call_direct_matcher, &typ)
         || type_has_special_call_operator_signature(
-            analyzer.db,
+            &analyzer.db,
             analyzer.special_call_direct_matcher,
             analyzer.file_id,
             expr.get_position(),
@@ -314,7 +314,7 @@ fn get_name_expr_special_call_reason(
         }
         Ok(Some(typ))
             if type_has_special_call_operator_signature(
-                analyzer.db,
+                &analyzer.db,
                 analyzer.special_call_direct_matcher,
                 analyzer.file_id,
                 name_expr.get_position(),
@@ -335,7 +335,7 @@ fn get_name_expr_special_call_reason(
             analyzer
                 .special_call_direct_matcher
                 .matches_name(
-                    analyzer.db,
+                    &analyzer.db,
                     analyzer.file_id,
                     name_expr.get_position(),
                     &name,
@@ -368,14 +368,14 @@ fn index_expr_has_receiver_special_call_signature(
     let Ok(receiver_type) = analyzer.infer_expr(&prefix_expr) else {
         return false;
     };
-    find_members_with_key(analyzer.db, &receiver_type, member_key, true).is_some_and(|members| {
+    find_members_with_key(&analyzer.db, &receiver_type, member_key, true).is_some_and(|members| {
         members.into_iter().any(|member_info| {
             type_has_special_call_signature(analyzer.special_call_direct_matcher, &member_info.typ)
                 || member_info
                     .property_owner_id
                     .as_ref()
                     .and_then(|semantic_decl| {
-                        type_cache_for_semantic_decl(analyzer.db, semantic_decl)
+                        type_cache_for_semantic_decl(&analyzer.db, semantic_decl)
                     })
                     .is_some_and(|typ| {
                         type_has_special_call_signature(analyzer.special_call_direct_matcher, &typ)
@@ -437,7 +437,7 @@ fn get_index_expr_special_call_reason(
         }
         Ok(Some(typ))
             if type_has_special_call_operator_signature(
-                analyzer.db,
+                &analyzer.db,
                 analyzer.special_call_direct_matcher,
                 analyzer.file_id,
                 index_expr.get_position(),
@@ -451,7 +451,7 @@ fn get_index_expr_special_call_reason(
             .get_access_path()
             .filter(|access_path| {
                 analyzer.special_call_direct_matcher.matches_access_path(
-                    analyzer.db,
+                    &analyzer.db,
                     analyzer.file_id,
                     index_expr.get_position(),
                     access_path,
@@ -462,7 +462,7 @@ fn get_index_expr_special_call_reason(
             .get_access_path()
             .filter(|access_path| {
                 analyzer.special_call_direct_matcher.matches_access_path(
-                    analyzer.db,
+                    &analyzer.db,
                     analyzer.file_id,
                     index_expr.get_position(),
                     access_path,
@@ -485,7 +485,7 @@ fn unresolved_name_expr_special_call_reason(
 
     let name = name_expr.get_name_text()?;
     if analyzer.special_call_direct_matcher.matches_name(
-        analyzer.db,
+        &analyzer.db,
         analyzer.file_id,
         name_expr.get_position(),
         &name,
@@ -574,7 +574,7 @@ fn expr_matches_direct_special_call(
         }
 
         return analyzer.special_call_direct_matcher.matches_name(
-            analyzer.db,
+            &analyzer.db,
             analyzer.file_id,
             caller_position,
             &name,
@@ -613,7 +613,7 @@ fn index_expr_matches_direct_special_call(
 ) -> bool {
     if let Some(access_path) = index_expr.get_access_path()
         && analyzer.special_call_direct_matcher.matches_access_path(
-            analyzer.db,
+            &analyzer.db,
             analyzer.file_id,
             caller_position,
             &access_path,
@@ -683,7 +683,7 @@ fn expr_matches_direct_special_call_with_member_chain(
             };
 
             analyzer.special_call_direct_matcher.matches_access_path(
-                analyzer.db,
+                &analyzer.db,
                 analyzer.file_id,
                 caller_position,
                 &access_path,
@@ -694,7 +694,7 @@ fn expr_matches_direct_special_call_with_member_chain(
                 && let Some(access_path) =
                     append_member_chain_to_access_path(&base_path, member_chain)
                 && analyzer.special_call_direct_matcher.matches_access_path(
-                    analyzer.db,
+                    &analyzer.db,
                     analyzer.file_id,
                     caller_position,
                     &access_path,
@@ -801,7 +801,7 @@ fn table_expr_member_chain_matches_direct_special_call(
         .get_members_for_owner_key(&owner, member_key);
 
     members.into_iter().any(|member| {
-        let Some(value_expr) = get_member_value_expr(analyzer.db, member.get_id()) else {
+        let Some(value_expr) = get_member_value_expr(&analyzer.db, member.get_id()) else {
             return false;
         };
         expr_matches_direct_special_call_with_member_chain(
@@ -929,7 +929,7 @@ fn resolve_cached_name_expr_type(
                 Ok(Some(typ)) => {
                     if type_has_special_call_signature(analyzer.special_call_direct_matcher, &typ)
                         || type_has_special_call_operator_signature(
-                            analyzer.db,
+                            &analyzer.db,
                             analyzer.special_call_direct_matcher,
                             analyzer.file_id,
                             name_expr.get_position(),
@@ -972,7 +972,7 @@ fn resolve_cached_decl_type(
         return Ok(None);
     };
     if !is_realm_compatible(
-        analyzer.db,
+        &analyzer.db,
         analyzer.file_id,
         caller_position,
         decl.get_file_id(),
@@ -1016,7 +1016,7 @@ fn resolve_cached_index_expr_type(
     {
         return member_item
             .resolve_type_with_realm_at_offset(
-                analyzer.db,
+                &analyzer.db,
                 &analyzer.file_id,
                 index_expr.get_position(),
             )
@@ -1032,7 +1032,7 @@ fn resolve_cached_index_expr_type(
         {
             return member_item
                 .resolve_type_with_realm_at_offset(
-                    analyzer.db,
+                    &analyzer.db,
                     &analyzer.file_id,
                     index_expr.get_position(),
                 )

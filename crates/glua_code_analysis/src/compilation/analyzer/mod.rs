@@ -326,6 +326,7 @@ impl Reanalysis {
                 eprintln!("[query] {kind:?} {query_stats:?}");
             }
         }
+        derive::report_pure_check();
         crate::profile::memory::checkpoint("end of re-analysis");
         let stale_diagnostics = crate::profile::phase("reanalyze: stale diagnostics", || {
             self.engine.stale_diagnostics(db)

@@ -328,7 +328,7 @@ pub(crate) fn widen_mutable_local_name_copy(
 }
 
 /// Where a write to a declaration came from, for [`bind_decl_write`].
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct DeclWrite {
     /// Source position of the writing statement.
     pub position: TextSize,

@@ -28,7 +28,7 @@ pub(in crate::compilation::analyzer::lua) fn get_widened_member_assignment_colle
     let LuaTypeOwner::Member(member_id) = type_owner else {
         return None;
     };
-    let incoming_array = normalize_infer_collection_type(analyzer.db, incoming_type)?;
+    let incoming_array = normalize_infer_collection_type(&analyzer.db, incoming_type)?;
     let (owner, key) = {
         let member_index = analyzer.db.get_member_index();
         (
@@ -59,7 +59,7 @@ pub(in crate::compilation::analyzer::lua) fn get_widened_member_assignment_colle
         if related_member_id == *member_id {
             continue;
         }
-        if !is_member_realm_compatible(analyzer.db, *member_id, related_member_id) {
+        if !is_member_realm_compatible(&analyzer.db, *member_id, related_member_id) {
             continue;
         }
 
@@ -76,12 +76,12 @@ pub(in crate::compilation::analyzer::lua) fn get_widened_member_assignment_colle
         }
 
         let Some(existing_array) =
-            normalize_infer_collection_type(analyzer.db, existing_cache.as_type())
+            normalize_infer_collection_type(&analyzer.db, existing_cache.as_type())
         else {
             continue;
         };
         saw_related_collection = true;
-        widened_base = TypeOps::Union.apply(analyzer.db, existing_array.get_base(), &widened_base);
+        widened_base = TypeOps::Union.apply(&analyzer.db, existing_array.get_base(), &widened_base);
     }
 
     if !saw_related_collection {
@@ -126,7 +126,7 @@ pub(in crate::compilation::analyzer::lua) fn get_cached_widened_member_collectio
             continue;
         }
         saw_related_collection = true;
-        widened_base = TypeOps::Union.apply(analyzer.db, &widened_base, base_type);
+        widened_base = TypeOps::Union.apply(&analyzer.db, &widened_base, base_type);
     }
 
     Some(
@@ -140,14 +140,14 @@ pub(in crate::compilation::analyzer::lua) fn record_member_collection_assignment
     type_owner: &LuaTypeOwner,
     assigned_type: &LuaType,
 ) {
-    let Some(assigned_array) = normalize_infer_collection_type(analyzer.db, assigned_type) else {
+    let Some(assigned_array) = normalize_infer_collection_type(&analyzer.db, assigned_type) else {
         return;
     };
 
     let LuaTypeOwner::Member(member_id) = type_owner else {
         return;
     };
-    if !is_assignment_file_define_member(analyzer.db, *member_id) {
+    if !is_assignment_file_define_member(&analyzer.db, *member_id) {
         return;
     }
 
@@ -207,7 +207,8 @@ pub(in crate::compilation::analyzer::lua) fn widen_existing_member_collection_ty
     };
 
     let is_collection_append = is_collection_append_write(index_expr).unwrap_or(false);
-    let incoming_is_collection = normalize_infer_collection_type(analyzer.db, value_type).is_some();
+    let incoming_is_collection =
+        normalize_infer_collection_type(&analyzer.db, value_type).is_some();
 
     if !incoming_is_collection && !is_collection_append {
         return Some(());
@@ -262,7 +263,7 @@ pub(in crate::compilation::analyzer::lua) fn dynamic_key_owner_and_member_key(
     let prefix_expr = index_expr.get_prefix_expr()?;
     let owner = direct_local_table_prefix_member_owner(analyzer, &prefix_expr).or_else(|| {
         let prefix_type = analyzer.infer_expr(&prefix_expr).ok()?;
-        get_member_owner_for_prefix_type(analyzer.db, prefix_type)
+        get_member_owner_for_prefix_type(&analyzer.db, prefix_type)
     })?;
     let index_key = index_expr.get_index_key()?;
     let cache = analyzer
@@ -270,7 +271,7 @@ pub(in crate::compilation::analyzer::lua) fn dynamic_key_owner_and_member_key(
         .infer_manager
         .get_infer_cache(analyzer.file_id);
     let member_key =
-        LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key).ok()?;
+        LuaMemberKey::from_index_key_or_unknown(&analyzer.db, cache, &index_key).ok()?;
     member_key.is_expr().then_some((owner, member_key))
 }
 
@@ -363,7 +364,7 @@ pub(in crate::compilation::analyzer::lua) fn record_pending_dynamic_key_collecti
         .pending_dynamic_key_collection_widenings
         .remove(&cache_key)
     {
-        Some(current) => TypeOps::Union.apply(analyzer.db, &current, &additional_base),
+        Some(current) => TypeOps::Union.apply(&analyzer.db, &current, &additional_base),
         None => additional_base,
     };
     analyzer
@@ -377,14 +378,14 @@ pub(in crate::compilation::analyzer::lua) fn find_related_member_ids(
 ) -> Option<Vec<LuaMemberId>> {
     let prefix_expr = index_expr.get_prefix_expr()?;
     let prefix_type = analyzer.infer_expr(&prefix_expr).ok()?;
-    let owner = get_member_owner_for_prefix_type(analyzer.db, prefix_type)?;
+    let owner = get_member_owner_for_prefix_type(&analyzer.db, prefix_type)?;
     let index_key = index_expr.get_index_key()?;
     let cache = analyzer
         .context
         .infer_manager
         .get_infer_cache(analyzer.file_id);
     let member_key =
-        LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key).ok()?;
+        LuaMemberKey::from_index_key_or_unknown(&analyzer.db, cache, &index_key).ok()?;
     let members = if member_key.is_expr() {
         let access_key_type = member_key_as_expr_type(&member_key)?;
         analyzer
@@ -394,7 +395,7 @@ pub(in crate::compilation::analyzer::lua) fn find_related_member_ids(
             .unwrap_or_default()
             .into_iter()
             .filter(|member| {
-                member_key_matches_type(analyzer.db, access_key_type, member.get_key())
+                member_key_matches_type(&analyzer.db, access_key_type, member.get_key())
             })
             .collect::<Vec<_>>()
     } else {
@@ -674,7 +675,7 @@ pub(in crate::compilation::analyzer::lua) fn widen_member_collections_with_colle
     member_ids: &[LuaMemberId],
     incoming_type: &LuaType,
 ) -> Option<()> {
-    let incoming_array = normalize_infer_collection_type(analyzer.db, incoming_type)?;
+    let incoming_array = normalize_infer_collection_type(&analyzer.db, incoming_type)?;
 
     for member_id in member_ids {
         let existing_cache = analyzer
@@ -687,18 +688,18 @@ pub(in crate::compilation::analyzer::lua) fn widen_member_collections_with_colle
         }
 
         let Some(existing_array) =
-            normalize_infer_collection_type(analyzer.db, existing_cache.as_type())
+            normalize_infer_collection_type(&analyzer.db, existing_cache.as_type())
         else {
             continue;
         };
 
         let widened_base = TypeOps::Union.apply(
-            analyzer.db,
+            &analyzer.db,
             existing_array.get_base(),
             incoming_array.get_base(),
         );
         write_type_cache(
-            analyzer.db,
+            &mut analyzer.db,
             (*member_id).into(),
             LuaTypeCache::InferType(LuaType::Array(
                 LuaArrayType::from_base_type(widened_base).into(),
@@ -726,15 +727,15 @@ pub(in crate::compilation::analyzer::lua) fn widen_member_collections_with_eleme
         }
 
         let Some(existing_array) =
-            normalize_infer_collection_type(analyzer.db, existing_cache.as_type())
+            normalize_infer_collection_type(&analyzer.db, existing_cache.as_type())
         else {
             continue;
         };
 
         let widened_base =
-            TypeOps::Union.apply(analyzer.db, existing_array.get_base(), element_type);
+            TypeOps::Union.apply(&analyzer.db, existing_array.get_base(), element_type);
         write_type_cache(
-            analyzer.db,
+            &mut analyzer.db,
             (*member_id).into(),
             LuaTypeCache::InferType(LuaType::Array(
                 LuaArrayType::from_base_type(widened_base).into(),
@@ -805,7 +806,7 @@ pub(in crate::compilation::analyzer::lua) fn flush_pending_dynamic_key_collectio
             let Some(access_key_type) = member_key_as_expr_type(member_key) else {
                 continue;
             };
-            if member_key_matches_type(analyzer.db, access_key_type, member.get_key()) {
+            if member_key_matches_type(&analyzer.db, access_key_type, member.get_key()) {
                 member_ids_by_pending_key[index].push(member.get_id());
             }
         }

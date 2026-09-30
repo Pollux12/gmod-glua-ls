@@ -30,9 +30,9 @@ pub fn analyze_for_range_stat(
         .context
         .infer_manager
         .get_infer_cache(analyzer.file_id);
-    let iter_var_types = infer_for_range_iter_expr_func(analyzer.db, cache, &iter_exprs);
+    let iter_var_types = infer_for_range_iter_expr_func(&analyzer.db, cache, &iter_exprs);
     let enumerates_member_map =
-        iterates_table_member_map(analyzer.db, analyzer.file_id, &for_range_stat);
+        iterates_table_member_map(&analyzer.db, analyzer.file_id, &for_range_stat);
 
     match iter_var_types {
         Ok(iter_var_types) => {
@@ -43,9 +43,9 @@ pub fn analyze_for_range_stat(
                     .get_type(idx)
                     .cloned()
                     .unwrap_or(LuaType::Unknown);
-                let ret_type = TypeOps::Remove.apply(analyzer.db, &ret_type, &LuaType::Nil);
+                let ret_type = TypeOps::Remove.apply(&analyzer.db, &ret_type, &LuaType::Nil);
                 write_type_cache(
-                    analyzer.db,
+                    &mut analyzer.db,
                     decl_id.into(),
                     LuaTypeCache::InferType(ret_type),
                     TypeCacheWriteMode::InsertOnly,
@@ -63,12 +63,12 @@ pub fn analyze_for_range_stat(
                     .map(LuaAstToken::get_position)
                     .collect::<Vec<_>>();
                 for update in iter_var_updates(
-                    analyzer.db,
+                    &analyzer.db,
                     analyzer.file_id,
                     &iter_var_types,
                     &var_positions,
                 ) {
-                    write_type_cache(analyzer.db, update.owner, update.cache, update.mode);
+                    write_type_cache(&mut analyzer.db, update.owner, update.cache, update.mode);
                 }
             }
         }
@@ -77,7 +77,7 @@ pub fn analyze_for_range_stat(
                 let position = var_name.get_position();
                 let decl_id = LuaDeclId::new(analyzer.file_id, position);
                 write_type_cache(
-                    analyzer.db,
+                    &mut analyzer.db,
                     decl_id.into(),
                     LuaTypeCache::InferType(LuaType::Unknown),
                     TypeCacheWriteMode::InsertOnly,

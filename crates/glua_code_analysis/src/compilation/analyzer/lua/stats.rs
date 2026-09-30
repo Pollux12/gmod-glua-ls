@@ -29,7 +29,7 @@ use rustc_hash::FxHashMap;
 use crate::{GmodStateMask, LuaArrayType};
 
 use super::{
-    LuaAnalyzer,
+    LuaAnalyzer, StatementWrite,
     member_write_policy::{
         MemberAssignmentWideningCacheKey, alias_target_global_path,
         direct_local_prefix_has_declared_type, direct_local_table_prefix_member_owner,
@@ -65,12 +65,11 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
             if is_local_mutable(analyzer, decl_id) {
                 continue;
             }
-            write_type_cache(
-                analyzer.db,
-                decl_id.into(),
-                LuaTypeCache::InferType(LuaType::Nil),
-                TypeCacheWriteMode::InsertOnly,
-            );
+            analyzer.write(StatementWrite::WriteTypeCache {
+                owner: decl_id.into(),
+                cache: LuaTypeCache::InferType(LuaType::Nil),
+                mode: TypeCacheWriteMode::InsertOnly,
+            });
         }
 
         return Some(());
@@ -114,8 +113,8 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
                     continue;
                 }
-                if holds_unbound_iter_template(analyzer.db, analyzer.file_id, &expr, &expr_type)
-                    || reads_settling_iter_var(analyzer.db, analyzer.file_id, &expr)
+                if holds_unbound_iter_template(&analyzer.db, analyzer.file_id, &expr, &expr_type)
+                    || reads_settling_iter_var(&analyzer.db, analyzer.file_id, &expr)
                 {
                     let unresolve = UnResolveDecl {
                         file_id: analyzer.file_id,
@@ -190,12 +189,12 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                 }
 
                 let retry_uninformative = should_retry_uninformative_initializer(&expr, &expr_type);
-                bind_decl_write(
-                    analyzer.db,
+                let write = initializer_decl_write(analyzer, decl_id, &expr);
+                analyzer.write(StatementWrite::BindDeclWrite {
                     decl_id,
-                    LuaTypeCache::InferType(expr_type),
-                    initializer_decl_write(analyzer, decl_id, &expr),
-                );
+                    cache: LuaTypeCache::InferType(expr_type),
+                    write,
+                });
                 publish_initializer_fact(analyzer, decl_id, &expr);
                 if retry_uninformative {
                     let unresolve = UnResolveDecl {
@@ -221,12 +220,11 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         .context
                         .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
                 } else {
-                    write_type_cache(
-                        analyzer.db,
-                        decl_id.into(),
-                        LuaTypeCache::InferType(LuaType::Nil),
-                        TypeCacheWriteMode::InsertOnly,
-                    );
+                    analyzer.write(StatementWrite::WriteTypeCache {
+                        owner: decl_id.into(),
+                        cache: LuaTypeCache::InferType(LuaType::Nil),
+                        mode: TypeCacheWriteMode::InsertOnly,
+                    });
                 }
             }
             Err(reason) => {
@@ -257,12 +255,11 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                             let ret_type = variadic.get_type(i - expr_count + 1);
                             let ret_type = ret_type.cloned().unwrap_or(LuaType::Nil);
                             let write = initializer_decl_write(analyzer, decl_id, last_expr);
-                            bind_decl_write(
-                                analyzer.db,
+                            analyzer.write(StatementWrite::BindDeclWrite {
                                 decl_id,
-                                LuaTypeCache::InferType(ret_type),
+                                cache: LuaTypeCache::InferType(ret_type),
                                 write,
-                            );
+                            });
                         }
                         return Some(());
                     } else {
@@ -278,12 +275,11 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                                 LuaType::Any
                             };
                             let write = initializer_decl_write(analyzer, decl_id, last_expr);
-                            bind_decl_write(
-                                analyzer.db,
+                            analyzer.write(StatementWrite::BindDeclWrite {
                                 decl_id,
-                                LuaTypeCache::InferType(typ),
+                                cache: LuaTypeCache::InferType(typ),
                                 write,
-                            );
+                            });
                         }
                         return Some(());
                     }
@@ -295,12 +291,11 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         let decl_id = LuaDeclId::new(analyzer.file_id, position);
                         if last_expr_is_call {
                             let write = initializer_decl_write(analyzer, decl_id, last_expr);
-                            bind_decl_write(
-                                analyzer.db,
+                            analyzer.write(StatementWrite::BindDeclWrite {
                                 decl_id,
-                                LuaTypeCache::InferType(LuaType::Unknown),
+                                cache: LuaTypeCache::InferType(LuaType::Unknown),
                                 write,
-                            );
+                            });
                         }
                         let unresolve = UnResolveDecl {
                             file_id: analyzer.file_id,
@@ -320,12 +315,11 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                 let name = name_list.get(i)?;
                 let position = name.get_position();
                 let decl_id = LuaDeclId::new(analyzer.file_id, position);
-                write_type_cache(
-                    analyzer.db,
-                    decl_id.into(),
-                    LuaTypeCache::InferType(LuaType::Nil),
-                    TypeCacheWriteMode::InsertOnly,
-                );
+                analyzer.write(StatementWrite::WriteTypeCache {
+                    owner: decl_id.into(),
+                    cache: LuaTypeCache::InferType(LuaType::Nil),
+                    mode: TypeCacheWriteMode::InsertOnly,
+                });
             }
         }
     }
@@ -545,7 +539,7 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
     // A write through the value variable of `for _, v in pairs(REG)` states a
     // field on *every* value of `REG`, so it belongs on the registry's wildcard
     // segment rather than on whichever entry the prefix type had settled to.
-    if let Some(path) = pairs_iter_value_registry_path(analyzer.db, analyzer.file_id, &prefix_expr)
+    if let Some(path) = pairs_iter_value_registry_path(&analyzer.db, analyzer.file_id, &prefix_expr)
     {
         let member_owner = LuaMemberOwner::GlobalPath(GlobalId::new(&path));
         apply_index_expr_member_owner(analyzer, index_expr, member_owner, false);
@@ -563,7 +557,7 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
                 return Some(());
             }
             let (member_owner, set_owner_only) = resolve_index_expr_member_owner_for_file(
-                analyzer.db,
+                &analyzer.db,
                 &prefix_type,
                 Some(analyzer.file_id),
             )?;
@@ -604,7 +598,7 @@ fn should_skip_ambiguous_unknown_key_table_owner(
         .context
         .infer_manager
         .get_infer_cache(analyzer.file_id);
-    let Ok(member_key) = LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key)
+    let Ok(member_key) = LuaMemberKey::from_index_key_or_unknown(&analyzer.db, cache, &index_key)
     else {
         return false;
     };
@@ -722,7 +716,7 @@ fn try_resolve_scoped_class_prefix_member_owner(
     analyzer: &LuaAnalyzer,
     prefix_expr: &LuaExpr,
 ) -> Option<(LuaMemberOwner, bool)> {
-    scoped_class_prefix_member_owner(analyzer.db, analyzer.file_id, prefix_expr)
+    scoped_class_prefix_member_owner(&analyzer.db, analyzer.file_id, prefix_expr)
 }
 
 /// The walk's scoped-class fast path, shared with the owner-settle pass: a
@@ -822,7 +816,7 @@ fn apply_index_expr_member_owner_with_guarded(
             .infer_manager
             .get_infer_cache(analyzer.file_id);
         let Ok(member_key) =
-            LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key)
+            LuaMemberKey::from_index_key_or_unknown(&analyzer.db, cache, &index_key)
         else {
             return Some(());
         };
@@ -905,7 +899,7 @@ fn apply_index_expr_member_owner_with_guarded(
         .db
         .get_member_index()
         .enclosing_function_scope_range(analyzer.file_id, member_id.get_position());
-    add_member(analyzer.db, member_owner, member_id);
+    add_member(&mut analyzer.db, member_owner, member_id);
     analyzer
         .db
         .get_member_index_mut()
@@ -925,7 +919,7 @@ fn publish_initializer_fact(analyzer: &mut LuaAnalyzer, decl_id: LuaDeclId, expr
         .context
         .infer_manager
         .get_infer_cache(analyzer.file_id);
-    let fact = crate::semantic::infer_expr_fact_with_cache(analyzer.db, cache, expr.clone());
+    let fact = crate::semantic::infer_expr_fact_with_cache(&analyzer.db, cache, expr.clone());
     let fact = match fact.typ() {
         LuaType::Variadic(multi) => match multi.get_type(0) {
             Some(first) => fact.with_runtime_type(first.clone()),
@@ -933,17 +927,7 @@ fn publish_initializer_fact(analyzer: &mut LuaAnalyzer, decl_id: LuaDeclId, expr
         },
         _ => fact,
     };
-    let owner = LuaTypeOwner::Decl(decl_id);
-    if analyzer
-        .db
-        .get_type_index()
-        .get_type_cache(&owner)
-        .is_some_and(|cache| cache.as_type() == fact.typ())
-    {
-        analyzer
-            .db
-            .publish_inference_facts(vec![(crate::LuaInferenceNodeId::TypeOwner(owner), fact)]);
-    }
+    analyzer.write(StatementWrite::PublishInitializerFact { decl_id, fact });
 }
 
 pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignStat) -> Option<()> {
@@ -1003,8 +987,8 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                     );
                     continue;
                 }
-                if holds_unbound_iter_template(analyzer.db, analyzer.file_id, expr, &expr_type)
-                    || reads_settling_iter_var(analyzer.db, analyzer.file_id, expr)
+                if holds_unbound_iter_template(&analyzer.db, analyzer.file_id, expr, &expr_type)
+                    || reads_settling_iter_var(&analyzer.db, analyzer.file_id, expr)
                 {
                     add_unresolve_for_assignment(
                         analyzer,
@@ -1104,7 +1088,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         if let LuaVarExpr::NameExpr(name_expr) = var {
             if let Some(decl_id) = get_delayed_definition_decl_id(analyzer, name_expr) {
                 bind_type(
-                    analyzer.db,
+                    &mut analyzer.db,
                     decl_id.into(),
                     LuaTypeCache::InferType(expr_type.clone()),
                 );
@@ -1131,11 +1115,11 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                 position: expr.get_position(),
                 may_improve_after_resolve: may_improve_after_resolve(expr),
                 reads_out_of_decl: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
-                    if expr_reads_out_of_decl(analyzer.db, analyzer.file_id, *decl_id, expr)),
+                    if expr_reads_out_of_decl(&analyzer.db, analyzer.file_id, *decl_id, expr)),
                 may_narrow_uninformative: is_call_or_index_expr(expr),
                 resolved_initializer: false,
                 fills_own_default: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
-                    if expr_fills_own_default(analyzer.db, analyzer.file_id, *decl_id, expr)),
+                    if expr_fills_own_default(&analyzer.db, analyzer.file_id, *decl_id, expr)),
             },
         );
         // The member is only homed onto its owner above, so the sibling guards
@@ -1145,7 +1129,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         // recording a candidate and marking writers touch neither the history
         // index nor owners nor keys — so that answer is reused, not rederived.
         if let LuaTypeOwner::Member(member_id) = &type_owner
-            && is_guarded_table_assignment_member(analyzer.db, *member_id)
+            && is_guarded_table_assignment_member(&analyzer.db, *member_id)
             && let Some(canonical) = guarded_bootstrap_canonical
         {
             expr_type = canonical;
@@ -1175,7 +1159,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                                 may_improve_after_resolve: may_improve_after_resolve(last_expr),
                                 reads_out_of_decl: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
                                 if expr_reads_out_of_decl(
-                                    analyzer.db,
+                                    &analyzer.db,
                                     analyzer.file_id,
                                     *decl_id,
                                     last_expr,
@@ -1184,7 +1168,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                                 resolved_initializer: false,
                                 fills_own_default: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
                                 if expr_fills_own_default(
-                                    analyzer.db,
+                                    &analyzer.db,
                                     analyzer.file_id,
                                     *decl_id,
                                     last_expr,
@@ -1208,7 +1192,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                                 may_improve_after_resolve: may_improve_after_resolve(last_expr),
                                 reads_out_of_decl: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
                                 if expr_reads_out_of_decl(
-                                    analyzer.db,
+                                    &analyzer.db,
                                     analyzer.file_id,
                                     *decl_id,
                                     last_expr,
@@ -1217,7 +1201,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                                 resolved_initializer: false,
                                 fills_own_default: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
                                 if expr_fills_own_default(
-                                    analyzer.db,
+                                    &analyzer.db,
                                     analyzer.file_id,
                                     *decl_id,
                                     last_expr,
@@ -1271,11 +1255,11 @@ fn declared_empty_table_assignment_type(
         .infer_manager
         .get_infer_cache(analyzer.file_id);
     let declared_type =
-        crate::infer_index_expr(analyzer.db, cache, index_expr.clone(), false).ok()?;
-    let table_value_type = declared_table_assignment_type(analyzer.db, &declared_type)?;
+        crate::infer_index_expr(&analyzer.db, cache, index_expr.clone(), false).ok()?;
+    let table_value_type = declared_table_assignment_type(&analyzer.db, &declared_type)?;
 
     write_type_cache(
-        analyzer.db,
+        &mut analyzer.db,
         LuaTypeOwner::SyntaxId(InFiled::new(analyzer.file_id, table_expr.get_syntax_id())),
         LuaTypeCache::InferType(table_value_type.clone()),
         TypeCacheWriteMode::InsertOnly,
@@ -1412,7 +1396,8 @@ fn should_skip_nil_table_shape_assignment(
         .context
         .infer_manager
         .get_infer_cache(analyzer.file_id);
-    let member_key = match LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key) {
+    let member_key = match LuaMemberKey::from_index_key_or_unknown(&analyzer.db, cache, &index_key)
+    {
         Ok(member_key) => member_key,
         Err(_) => return index_key.is_expr(),
     };
@@ -1445,9 +1430,11 @@ fn should_skip_nil_table_shape_assignment(
         return true;
     }
 
-    let Some((owner, _)) =
-        resolve_index_expr_member_owner_for_file(analyzer.db, &prefix_type, Some(analyzer.file_id))
-    else {
+    let Some((owner, _)) = resolve_index_expr_member_owner_for_file(
+        &analyzer.db,
+        &prefix_type,
+        Some(analyzer.file_id),
+    ) else {
         return false;
     };
 
@@ -1567,10 +1554,10 @@ fn initializer_decl_write(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &Lua
     DeclWrite {
         position: expr.get_position(),
         may_improve_after_resolve: may_improve,
-        reads_out_of_decl: expr_reads_out_of_decl(analyzer.db, analyzer.file_id, decl_id, expr),
+        reads_out_of_decl: expr_reads_out_of_decl(&analyzer.db, analyzer.file_id, decl_id, expr),
         may_narrow_uninformative: may_improve,
         resolved_initializer: false,
-        fills_own_default: expr_fills_own_default(analyzer.db, analyzer.file_id, decl_id, expr),
+        fills_own_default: expr_fills_own_default(&analyzer.db, analyzer.file_id, decl_id, expr),
     }
 }
 
@@ -1798,7 +1785,7 @@ fn seeds_empty_decl_from_own_read(
         .get_type_index()
         .get_type_cache(type_owner)
         .is_none()
-        && expr_reads_out_of_decl(analyzer.db, analyzer.file_id, *decl_id, expr)
+        && expr_reads_out_of_decl(&analyzer.db, analyzer.file_id, *decl_id, expr)
 }
 
 fn add_unresolve_for_assignment(
@@ -1815,7 +1802,7 @@ fn add_unresolve_for_assignment(
             // slot is empty until one of the file's deferred writes
             // resolves, and `bind_type` has no acceptance rule for an empty
             // slot, so whichever lands first owns the decl's lifetime type.
-            if expr_reads_out_of_decl(analyzer.db, analyzer.file_id, decl_id, &expr) {
+            if expr_reads_out_of_decl(&analyzer.db, analyzer.file_id, decl_id, &expr) {
                 return;
             }
 
@@ -1877,7 +1864,7 @@ fn assign_merge_type_owner_and_expr_type(
     // analysed first.
     if let LuaTypeOwner::Member(member_id) = &type_owner
         && let Some(bootstrap_type) =
-            guarded_table_bootstrap_member_type(analyzer.db, *member_id, true)
+            guarded_table_bootstrap_member_type(&analyzer.db, *member_id, true)
     {
         expr_type = bootstrap_type;
     }
@@ -1889,10 +1876,10 @@ fn assign_merge_type_owner_and_expr_type(
     // `table`, which drops the members another file attached to the namespace.
     let canonical_guarded_bootstrap = match &type_owner {
         LuaTypeOwner::Member(member_id)
-            if is_guarded_table_assignment_member(analyzer.db, *member_id) =>
+            if is_guarded_table_assignment_member(&analyzer.db, *member_id) =>
         {
             canonical_guarded_table_bootstrap_type(
-                analyzer.db,
+                &analyzer.db,
                 *member_id,
                 Some(GuardedTableAssignmentCaches {
                     member_check: &mut analyzer.guarded_table_assignment_member_check_cache,
@@ -1910,7 +1897,7 @@ fn assign_merge_type_owner_and_expr_type(
     // way the contribution record below already reads it.
     let preserve_table_literals = preserve_table_literals
         || matches!(&type_owner, LuaTypeOwner::Member(member_id)
-            if is_guarded_table_assignment_member(analyzer.db, *member_id));
+            if is_guarded_table_assignment_member(&analyzer.db, *member_id));
 
     let dynamic_expr_key_member = is_dynamic_expr_key_member_assignment(analyzer, &type_owner);
     // Returned for the post-merge re-derivation at the assign site, which
@@ -1926,13 +1913,13 @@ fn assign_merge_type_owner_and_expr_type(
     }
 
     if is_global_decl_owner(analyzer, &type_owner) {
-        expr_type = merge_open_table_types(analyzer.db, vec![expr_type]);
+        expr_type = merge_open_table_types(&analyzer.db, vec![expr_type]);
     }
 
     match &type_owner {
         LuaTypeOwner::Decl(decl_id) => {
             bind_decl_write(
-                analyzer.db,
+                &mut analyzer.db,
                 *decl_id,
                 LuaTypeCache::InferType(expr_type.clone()),
                 write,
@@ -1940,7 +1927,7 @@ fn assign_merge_type_owner_and_expr_type(
         }
         _ => {
             bind_type(
-                analyzer.db,
+                &mut analyzer.db,
                 type_owner.clone(),
                 LuaTypeCache::InferType(expr_type.clone()),
             );
@@ -1948,13 +1935,13 @@ fn assign_merge_type_owner_and_expr_type(
     }
 
     if let LuaTypeOwner::Member(member_id) = &type_owner
-        && is_assignment_file_define_member(analyzer.db, *member_id)
+        && is_assignment_file_define_member(&analyzer.db, *member_id)
     {
         // `preserve_table_literals` already folds this member's guarded check
         // in, and that answer reads only the immutable syntax tree.
         let guarded_table_assignment = preserve_table_literals;
         if guarded_table_assignment
-            || is_member_assignment_in_conditional_branch(analyzer.db, *member_id)
+            || is_member_assignment_in_conditional_branch(&analyzer.db, *member_id)
         {
             analyzer
                 .db
@@ -1981,7 +1968,7 @@ fn member_assignment_or_source_type(
         .infer_manager
         .get_infer_cache(analyzer.file_id);
     member_assignment_or_source_type_with_cache(
-        analyzer.db,
+        &analyzer.db,
         cache,
         analyzer.file_id,
         type_owner,
@@ -2079,7 +2066,7 @@ fn is_dynamic_expr_key_member_assignment(
     let LuaTypeOwner::Member(member_id) = type_owner else {
         return false;
     };
-    member_write_node(analyzer.db, *member_id)
+    member_write_node(&analyzer.db, *member_id)
         .and_then(LuaIndexExpr::cast)
         .and_then(|index_expr| index_expr.get_index_key())
         .is_some_and(|key| matches!(key, LuaIndexKey::Expr(_)))
@@ -2711,7 +2698,7 @@ pub fn analyze_func_stat(analyzer: &mut LuaAnalyzer, func_stat: LuaFuncStat) -> 
     let type_owner = get_var_owner(analyzer, func_name.clone());
     set_index_expr_owner(analyzer, func_name.clone());
     write_type_cache(
-        analyzer.db,
+        &mut analyzer.db,
         type_owner,
         LuaTypeCache::InferType(signature_type.clone()),
         TypeCacheWriteMode::InsertOnly,
@@ -2731,7 +2718,7 @@ pub fn analyze_local_func_stat(
     let position = func_name.get_position();
     let decl_id = LuaDeclId::new(analyzer.file_id, position);
     write_type_cache(
-        analyzer.db,
+        &mut analyzer.db,
         decl_id.into(),
         LuaTypeCache::InferType(signature_type.clone()),
         TypeCacheWriteMode::InsertOnly,
@@ -2762,7 +2749,7 @@ fn register_expr_key_member(analyzer: &mut LuaAnalyzer, field: &LuaTableField) {
         .context
         .infer_manager
         .get_infer_cache(analyzer.file_id);
-    let Ok(member_key) = LuaMemberKey::from_index_key(analyzer.db, cache, &field_key) else {
+    let Ok(member_key) = LuaMemberKey::from_index_key(&analyzer.db, cache, &field_key) else {
         return;
     };
     if matches!(member_key, LuaMemberKey::ExprType(ref typ) if typ.is_unknown()) {
@@ -2778,10 +2765,10 @@ fn register_expr_key_member(analyzer: &mut LuaAnalyzer, field: &LuaTableField) {
         LuaMemberFeature::FileDefine
     };
     let member = LuaMember::new(member_id, member_key, decl_feature, None);
-    analyzer
-        .db
-        .get_member_index_mut()
-        .add_member(owner_id, member);
+    analyzer.write(StatementWrite::AddMember {
+        owner: owner_id,
+        member,
+    });
 }
 
 /// Whether this value-field (positional `{ expr }`) belongs to a shaped
@@ -2837,9 +2824,9 @@ pub fn analyze_table_field(analyzer: &mut LuaAnalyzer, field: LuaTableField) -> 
         // Binding the field literal instead leaves whichever file re-walked
         // last in the cache, and reads taken between the writes disagree with
         // the settled answer.
-        let value_type = if is_guarded_table_assignment_member(analyzer.db, member_id) {
+        let value_type = if is_guarded_table_assignment_member(&analyzer.db, member_id) {
             canonical_guarded_table_bootstrap_type(
-                analyzer.db,
+                &analyzer.db,
                 member_id,
                 Some(GuardedTableAssignmentCaches {
                     member_check: &mut analyzer.guarded_table_assignment_member_check_cache,
@@ -2850,11 +2837,10 @@ pub fn analyze_table_field(analyzer: &mut LuaAnalyzer, field: LuaTableField) -> 
         } else {
             value_type
         };
-        bind_type(
-            analyzer.db,
-            member_id.into(),
-            LuaTypeCache::InferType(value_type),
-        );
+        analyzer.write(StatementWrite::BindType {
+            owner: member_id.into(),
+            cache: LuaTypeCache::InferType(value_type),
+        });
     }
     Some(())
 }
@@ -3014,7 +3000,7 @@ fn guarded_table_assignment_info(
         .or_else(|| {
             let prefix_type = analyzer.infer_expr(&prefix_expr).ok()?;
             resolve_index_expr_member_owner_for_file(
-                analyzer.db,
+                &analyzer.db,
                 &prefix_type,
                 Some(analyzer.file_id),
             )
@@ -3024,7 +3010,7 @@ fn guarded_table_assignment_info(
         .context
         .infer_manager
         .get_infer_cache(analyzer.file_id);
-    let key = LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key).ok()?;
+    let key = LuaMemberKey::from_index_key_or_unknown(&analyzer.db, cache, &index_key).ok()?;
     (!key.is_expr()).then_some((
         MemberAssignmentWideningCacheKey { owner, key },
         set_owner_only,
@@ -3190,7 +3176,7 @@ mod tests {
         let mut context = crate::compilation::analyzer::AnalyzeContext::new();
         let matcher = super::super::call::SpecialCallDirectMatcher::default();
         let mut analyzer = LuaAnalyzer::new(
-            db,
+            super::super::DbAccess::Inline(db),
             FileId::new(0),
             &mut context,
             gmod_enabled,
@@ -3251,7 +3237,7 @@ mod tests {
                 &first_array,
             );
             add_typed_file_define_member(
-                analyzer.db,
+                &mut analyzer.db,
                 owner,
                 second_member,
                 key,
@@ -3286,7 +3272,7 @@ mod tests {
                 widened,
                 LuaType::Array(
                     LuaArrayType::from_base_type(TypeOps::Union.apply(
-                        analyzer.db,
+                        &analyzer.db,
                         &LuaType::String,
                         &LuaType::Integer,
                     ))
@@ -3324,7 +3310,7 @@ mod tests {
                 &first_array,
             );
             add_typed_file_define_member(
-                analyzer.db,
+                &mut analyzer.db,
                 cached_owner.clone(),
                 second_member,
                 key.clone(),
@@ -3361,14 +3347,14 @@ mod tests {
                 &first_array,
             );
             add_typed_file_define_member(
-                analyzer.db,
+                &mut analyzer.db,
                 fallback_owner.clone(),
                 second_member,
                 key.clone(),
                 second_array.clone(),
             );
             add_typed_file_define_member(
-                analyzer.db,
+                &mut analyzer.db,
                 fallback_owner,
                 third_member,
                 key,
@@ -3564,7 +3550,7 @@ mod tests {
                 &first_array,
             );
             add_typed_file_define_member(
-                analyzer.db,
+                &mut analyzer.db,
                 owner.clone(),
                 second_member,
                 key.clone(),
@@ -3602,7 +3588,7 @@ mod tests {
             for i in 0..512 {
                 let member_id = member_id_at(i * 2 + 1);
                 add_typed_file_define_member(
-                    analyzer.db,
+                    &mut analyzer.db,
                     owner.clone(),
                     member_id,
                     key.clone(),

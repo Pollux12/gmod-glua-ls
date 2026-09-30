@@ -482,7 +482,7 @@ fn return_call_is_nil_free_when_param_falsy(
         return false;
     };
     let typ_dbg = infer_expr(
-        analyzer.db,
+        &analyzer.db,
         analyzer
             .context
             .infer_manager
@@ -847,7 +847,7 @@ fn expr_is_proven_non_nil(analyzer: &mut LuaAnalyzer, expr: &LuaExpr) -> bool {
         return expr_is_syntactically_non_nil(expr);
     }
     infer_expr(
-        analyzer.db,
+        &analyzer.db,
         analyzer
             .context
             .infer_manager
@@ -874,7 +874,7 @@ fn call_expr_is_known_nil_free_for_falsy_args(
         return false;
     };
     let Ok(LuaType::Signature(signature_id)) = infer_expr(
-        analyzer.db,
+        &analyzer.db,
         analyzer
             .context
             .infer_manager
@@ -898,7 +898,7 @@ fn call_expr_is_known_nil_free_for_falsy_args(
             && call_arg_for_param_signature(call_expr, is_colon_define, &args, fact.param_idx)
                 .map(|arg| {
                     infer_expr(
-                        analyzer.db,
+                        &analyzer.db,
                         analyzer
                             .context
                             .infer_manager
@@ -1040,7 +1040,7 @@ fn non_guard_returns_are_proven_non_nil(
         }
 
         let Ok(ret_type) = infer_expr(
-            analyzer.db,
+            &analyzer.db,
             analyzer
                 .context
                 .infer_manager
@@ -2088,7 +2088,7 @@ fn analyze_return(
 
     let return_points = analyze_func_body_returns(block.clone());
     let (return_correlations, returns) = derive_inferred_return_with_reads(
-        analyzer.db,
+        &analyzer.db,
         analyzer
             .context
             .infer_manager
