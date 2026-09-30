@@ -110,7 +110,10 @@ function summarise(samples) {
     if (samples.length === 0) return null;
     const sorted = [...samples].sort((a, b) => a - b);
     const at = (q) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
-    return { runs: sorted.length, min: sorted[0], median: at(0.5), max: sorted[sorted.length - 1] };
+    const nearestRank = (q) => sorted[Math.max(0, Math.ceil(q * sorted.length) - 1)];
+    return {
+        runs: sorted.length, min: sorted[0], median: at(0.5), p95: nearestRank(0.95), max: sorted[sorted.length - 1],
+    };
 }
 
 function describeReport(result) {
@@ -198,7 +201,7 @@ async function main() {
         proc.kill();
         throw new Error('workspace never finished loading (5 minute timeout)');
     }
-    report.measurements.workspaceLoad = { runs: 1, min: workspaceLoadedAt - startedAt, median: workspaceLoadedAt - startedAt, max: workspaceLoadedAt - startedAt };
+    report.measurements.workspaceLoad = summarise([workspaceLoadedAt - startedAt]);
 
     const uri = fileUri(target);
     const original = fs.readFileSync(target, 'utf8');
@@ -524,11 +527,11 @@ async function main() {
     console.log(`file      : ${report.file}`);
     console.log(`server    : ${report.server}`);
     console.log(`runs      : ${report.runs}\n`);
-    console.log('                             min      median       max');
+    console.log('                             min      median       p95       max');
     for (const [label, stats] of rows) {
         if (!stats) continue;
         const fmt = (n) => `${n}ms`.padStart(10);
-        console.log(`${label.padEnd(28)}${fmt(stats.min)}${fmt(stats.median)}${fmt(stats.max)}`);
+        console.log(`${label.padEnd(28)}${fmt(stats.min)}${fmt(stats.median)}${fmt(stats.p95)}${fmt(stats.max)}`);
     }
     console.log(`\ncompletion items          : ${report.checks.completionItemCount}`);
     console.log(`diagnostics               : ${report.checks.diagnosticCount}`);
