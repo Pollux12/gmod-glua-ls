@@ -104,6 +104,10 @@ pub struct DebouncedAnalysis {
     /// Debounces a waiting request ended early, so a test can tell one did.
     #[cfg(test)]
     expedited_debounces: AtomicUsize,
+    /// Wake-ups that restarted a debounce's timer, so a test can tell a
+    /// request that did not wait left the debounce alone.
+    #[cfg(test)]
+    debounce_wakes: AtomicUsize,
 }
 
 /// Counts a request among [`DebouncedAnalysis::waiting_requests`] until
@@ -152,6 +156,8 @@ impl DebouncedAnalysis {
             freshness_waits: AtomicUsize::new(0),
             #[cfg(test)]
             expedited_debounces: AtomicUsize::new(0),
+            #[cfg(test)]
+            debounce_wakes: AtomicUsize::new(0),
         }
     }
 
@@ -335,7 +341,7 @@ impl DebouncedAnalysis {
 
         let started_at = Instant::now();
         let mut warned_stuck = false;
-        let _waiting = self.request_waiting();
+        let mut waiting = None;
 
         loop {
             let notified = self.reindex_notify.notified();
@@ -350,6 +356,8 @@ impl DebouncedAnalysis {
                 return Freshness::LoopDead;
             }
 
+            // Only a request that has to wait needs the re-analysis now.
+            waiting.get_or_insert_with(|| self.request_waiting());
             let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
 
             tokio::select! {
@@ -381,7 +389,7 @@ impl DebouncedAnalysis {
 
         let started_at = Instant::now();
         let mut warned_stuck = false;
-        let _waiting = self.request_waiting();
+        let mut waiting = None;
 
         loop {
             let notified = self.reindex_notify.notified();
@@ -396,6 +404,8 @@ impl DebouncedAnalysis {
                 return Freshness::LoopDead;
             }
 
+            // Only a request that has to wait needs the re-analysis now.
+            waiting.get_or_insert_with(|| self.request_waiting());
             let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
 
             tokio::select! {
@@ -521,7 +531,7 @@ impl DebouncedAnalysis {
         let mut warned_stuck = false;
         let mut in_flight = Duration::ZERO;
         let mut blocked = Duration::ZERO;
-        let _waiting = self.request_waiting();
+        let mut waiting = None;
 
         loop {
             let notified = self.reindex_notify.notified();
@@ -550,6 +560,8 @@ impl DebouncedAnalysis {
                 );
             }
 
+            // Only a request that has to wait needs the re-analysis now.
+            waiting.get_or_insert_with(|| self.request_waiting());
             let iter_start = Instant::now();
             let observed_in_flight = self.in_flight_changes.load(Ordering::Acquire) > 0;
             let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
@@ -903,7 +915,11 @@ impl DebouncedAnalysis {
                     tokio::select! {
                         biased;
                         _ = self.shutdown.cancelled() => return,
-                        _ = notified => continue,
+                        _ = notified => {
+                            #[cfg(test)]
+                            self.debounce_wakes.fetch_add(1, Ordering::AcqRel);
+                            continue;
+                        }
                         _ = tokio::time::sleep(self.debounce_duration) => break,
                     }
                 }
@@ -1642,6 +1658,110 @@ mod tests {
                     .expedited_debounces
                     .load(Ordering::Acquire),
                 eq(1)
+            )?;
+
+            debounced_analysis.shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(5), loop_task)
+                .await
+                .expect("the loop should stop on shutdown")
+                .expect("the loop task must not panic");
+            Ok(())
+        })
+    }
+
+    /// A request to a document with no pending edit is answered without
+    /// touching the debounce of another document's edit.
+    #[gtest]
+    fn a_request_to_an_untouched_document_leaves_the_debounce_alone() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let mut analysis = EmmyLuaAnalysis::new();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_untouched");
+            analysis.add_main_workspace(workspace.clone());
+            let edited = file_path_to_uri(&workspace.join("lua/autorun/shared/edited.lua"))
+                .expect("URI should parse");
+            let untouched = file_path_to_uri(&workspace.join("lua/autorun/shared/untouched.lua"))
+                .expect("URI should parse");
+            analysis
+                .update_file_by_uri(
+                    &edited,
+                    Some(
+                        "Value = 1
+"
+                        .to_string(),
+                    ),
+                )
+                .map(|(id, _)| id);
+            analysis
+                .update_file_by_uri(
+                    &untouched,
+                    Some(
+                        "Other = 1
+"
+                        .to_string(),
+                    ),
+                )
+                .map(|(id, _)| id);
+            let analysis = Arc::new(RwLock::new(analysis));
+            let (connection, _peer) = Connection::memory();
+            let client = Arc::new(ClientProxy::new(connection));
+            let status_bar = Arc::new(StatusBar::new(client.clone(), true));
+            let file_diagnostic = Arc::new(FileDiagnostic::new(
+                analysis.clone(),
+                status_bar,
+                client.clone(),
+                false,
+            ));
+            let shared_diagnostic_data_cache = file_diagnostic.shared_diagnostic_data_cache();
+            let debounced_analysis = Arc::new(DebouncedAnalysis::new(
+                analysis.clone(),
+                60_000,
+                CancellationToken::new(),
+                client,
+                file_diagnostic,
+                shared_diagnostic_data_cache,
+                Arc::new(AtomicU8::new(0)),
+                test_lsp_features(),
+            ));
+            let loop_task = tokio::spawn({
+                let debounced_analysis = debounced_analysis.clone();
+                async move { debounced_analysis.run().await }
+            });
+
+            let file_id = analysis
+                .write()
+                .await
+                .update_file_text_only(
+                    &edited,
+                    "Value = 2
+"
+                    .to_string(),
+                )
+                .expect("the file should still exist");
+            debounced_analysis.schedule(file_id, edited.clone()).await;
+            // The loop takes the schedule and sits in the debounce.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let wakes_before = debounced_analysis.debounce_wakes.load(Ordering::Acquire);
+            for _ in 0..10 {
+                let fresh = debounced_analysis
+                    .wait_until_file_fresh_for(
+                        &CancellationToken::new(),
+                        "textDocument/hover",
+                        &untouched,
+                    )
+                    .await;
+                verify_that!(fresh, eq(Freshness::Fresh))?;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            verify_that!(
+                debounced_analysis.debounce_wakes.load(Ordering::Acquire),
+                eq(wakes_before)
+            )?;
+            verify_that!(
+                debounced_analysis
+                    .expedited_debounces
+                    .load(Ordering::Acquire),
+                eq(0)
             )?;
 
             debounced_analysis.shutdown.cancel();
