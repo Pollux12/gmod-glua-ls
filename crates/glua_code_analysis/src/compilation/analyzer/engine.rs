@@ -656,8 +656,12 @@ impl Engine {
                 self.evaluate_group(db, &group, recipe)
             });
             if let Some(started) = started {
-                self.stats
-                    .timed(id.kind, started.elapsed(), usize::from(rerun), 1);
+                let elapsed = started.elapsed();
+                for member in &group {
+                    self.stats
+                        .timed_evaluation(*member, elapsed / group.len() as u32);
+                }
+                self.stats.timed(id.kind, elapsed, usize::from(rerun), 1);
                 for member in &group {
                     for key in db.reader_graph().reads_of(*member) {
                         *self.stats.reads.entry(variant_name(key)).or_default() += 1;
@@ -750,6 +754,7 @@ impl Engine {
                 queued += 1;
             }
             for reader in waited {
+                self.stats.stage_requeued(reader);
                 if crate::profile::tracing_evaluations() {
                     self.trace(db, reader, "stage barrier queues", &[]);
                 }
@@ -946,6 +951,7 @@ impl Engine {
             &FxHashSet::default(),
             None,
         );
+        let profiling = self.stats.profiling();
         let computed = {
             let db: &DbIndex = db;
             let files = batch
@@ -958,21 +964,30 @@ impl Engine {
                     .find(|member| member.file_id == file_id)
                     .expect("one batch member per file");
                 derivation::begin(id);
+                let started = profiling.then(std::time::Instant::now);
                 let computed = recipe.compute(db, id);
-                (derivation::end(), computed)
+                let elapsed = started.map(|started| started.elapsed()).unwrap_or_default();
+                (derivation::end(), computed, elapsed)
             })
         };
+        let mut times = Vec::with_capacity(batch.len());
         let evaluations = self.with_lent_keys(db, &touched, |db| {
             batch
                 .iter()
                 .zip(computed)
-                .map(|(member, (evaluation, computed))| {
+                .map(|(member, (evaluation, computed, computing))| {
                     derivation::resume(evaluation);
+                    let started = profiling.then(std::time::Instant::now);
                     recipe.apply(db, *member, computed);
+                    let applying = started.map(|started| started.elapsed()).unwrap_or_default();
+                    times.push((*member, computing + applying));
                     (derivation::end(), None)
                 })
                 .collect()
         });
+        for (member, elapsed) in times {
+            self.stats.timed_evaluation(member, elapsed);
+        }
         self.record(db, evaluations, &mut touched, &FxHashSet::default(), || {
             format!("evaluating {batch:?}")
         });
@@ -1200,6 +1215,15 @@ pub(crate) struct EngineStats {
     stages: Vec<(AnalysisStage, usize)>,
     /// Under `GLUALS_PROFILE`: every derivation evaluated, to count repeats.
     distinct: FxHashSet<DerivationId>,
+    /// Under `GLUALS_PROFILE`: each derivation's last evaluation time, and
+    /// why it was queued again since.
+    last_times: FxHashMap<DerivationId, std::time::Duration>,
+    causes: FxHashMap<DerivationId, (String, Option<DerivationKind>)>,
+    /// Under `GLUALS_PROFILE`: the time of evaluations a later evaluation of
+    /// the same derivation superseded, by what queued the later one (the
+    /// moved key's variant and its writer's kind) and the reader's kind.
+    superseded:
+        BTreeMap<(String, Option<DerivationKind>, DerivationKind), (std::time::Duration, usize)>,
 }
 
 fn variant_name(key: &FactKey) -> String {
@@ -1274,10 +1298,44 @@ impl EngineStats {
             return;
         }
         let variant = variant_name(key);
+        let writer = writer.map(|writer| writer.kind);
+        self.causes
+            .entry(reader)
+            .or_insert_with(|| (variant.clone(), writer));
         *self
             .requeues
-            .entry((variant, writer.map(|writer| writer.kind), reader.kind))
+            .entry((variant, writer, reader.kind))
             .or_default() += 1;
+    }
+
+    /// Under `GLUALS_PROFILE`, notes that a stage barrier queued `reader`.
+    fn stage_requeued(&mut self, reader: DerivationId) {
+        if self.profiling() {
+            self.causes
+                .entry(reader)
+                .or_insert_with(|| ("stage barrier".to_string(), None));
+        }
+    }
+
+    /// Under `GLUALS_PROFILE`, notes that `id` was evaluated in `elapsed`:
+    /// its previous evaluation, if any, was superseded, and is charged to
+    /// what queued it again.
+    fn timed_evaluation(&mut self, id: DerivationId, elapsed: std::time::Duration) {
+        if !self.profiling() {
+            return;
+        }
+        let cause = self
+            .causes
+            .remove(&id)
+            .unwrap_or_else(|| ("re-queued".to_string(), None));
+        if let Some(previous) = self.last_times.insert(id, elapsed) {
+            let entry = self
+                .superseded
+                .entry((cause.0, cause.1, id.kind))
+                .or_default();
+            entry.0 += previous;
+            entry.1 += 1;
+        }
     }
 
     fn evaluated(&mut self, id: DerivationId) {
@@ -1358,6 +1416,27 @@ impl EngineStats {
                 ""
             };
             eprintln!("[engine] queued {count} {variant} {writer:?} -> {reader:?}{back}");
+        }
+        let superseded = self
+            .superseded
+            .values()
+            .map(|(time, _)| *time)
+            .sum::<std::time::Duration>();
+        let count = self
+            .superseded
+            .values()
+            .map(|(_, count)| count)
+            .sum::<usize>();
+        let last = self.last_times.values().sum::<std::time::Duration>();
+        eprintln!(
+            "[engine] superseded {superseded:?} over {count} evaluations; last evaluations {last:?}"
+        );
+        let mut rows = self.superseded.iter().collect::<Vec<_>>();
+        rows.sort_by_key(|(_, (time, _))| std::cmp::Reverse(*time));
+        for ((cause, writer, reader), (time, count)) in rows.into_iter().take(40) {
+            eprintln!(
+                "[engine] superseded {time:?} over {count}: {cause} by {writer:?} -> {reader:?}"
+            );
         }
     }
 }
