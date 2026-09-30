@@ -30,7 +30,8 @@
 //! - `gate`: on one fork, the `typing` stage's keystrokes, the original text
 //!   back, then the file deleted and re-created through watched-file events,
 //!   each settled in slices, as the language-server drift gate drives the
-//!   server (the revert, delete and re-create in slices of `DET_SLICE`,
+//!   server; between slices the file is put ahead while it settles, then
+//!   diagnosed once mid re-analysis, as its diagnostics task does (the revert, delete and re-create in slices of `DET_SLICE`,
 //!   default 16); its oracle is the `recreate` stage's kind.
 //! - `burst`: three edits of every target before one re-analysis, ending on
 //!   the edited text.
@@ -2071,6 +2072,29 @@ fn settle_in_slices(
 /// Evaluations per slice when a stage settles a re-analysis in slices.
 const SLICE_EVALUATIONS: usize = 16;
 
+/// Between two slices, what a diagnostics task waiting on `file_ids` does:
+/// puts them ahead while they settle, then diagnoses the live ones once,
+/// recording their reads mid re-analysis.
+fn pull_when_settled(analysis: &mut EmmyLuaAnalysis, file_ids: &[FileId], pulled: &mut bool) {
+    if *pulled {
+        return;
+    }
+    if file_ids
+        .iter()
+        .any(|file_id| analysis.compilation.is_settling(*file_id))
+    {
+        analysis.compilation.prioritise_update(file_ids);
+        return;
+    }
+    *pulled = true;
+    let live = file_ids
+        .iter()
+        .copied()
+        .filter(|file_id| analysis.get_uri(*file_id).is_some())
+        .collect::<Vec<_>>();
+    diagnose(analysis, live);
+}
+
 /// What typing an edit into a warm fork reached.
 struct Typed {
     reach: Reach,
@@ -2979,13 +3003,19 @@ impl Harness<'_> {
                 typed.version + 1,
             );
             warm.begin_reindex(vec![file_id]);
-            let mut affected = settle_in_slices(&mut warm, slice, |_| {});
+            let mut pulled = false;
+            let mut affected = settle_in_slices(&mut warm, slice, |analysis| {
+                pull_when_settled(analysis, &[file_id], &mut pulled)
+            });
             affected.push(file_id);
             reach.extend(warm.settled(affected));
             for text in [None, Some(original.clone())] {
                 let changed = warm.stage_file_system_changes(vec![(uri.clone(), text)]);
                 warm.begin_reindex(changed.clone());
-                let mut affected = settle_in_slices(&mut warm, slice, |_| {});
+                let mut pulled = false;
+                let mut affected = settle_in_slices(&mut warm, slice, |analysis| {
+                    pull_when_settled(analysis, &changed, &mut pulled)
+                });
                 affected.extend(changed);
                 reach.extend(warm.settled(affected));
             }
