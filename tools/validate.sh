@@ -7,7 +7,8 @@
 # Env: GLUALS_ANNOTATIONS, GLUALS_VB (change, phase), GLUALS_CITYRP (step, phase),
 #      GLUALS_GAMEMODES (phase: a folder of gamemodes), VALIDATE_REF (optional
 #      folder with vb.json / cityrp.json glua_check references to diff against),
-#      CHECK_CACHE=1 (adds cache check mode), SKIP_BUILD=1, VALIDATE_OUT,
+#      CHECK_CACHE=1 (adds cache check mode), CHECK_QUERY=1 (adds query check
+#      mode), SKIP_BUILD=1, VALIDATE_OUT,
 #      VALIDATE_BIN (folder of prebuilt binaries; implies SKIP_BUILD).
 # Exits 1 if any step failed; logs go to VALIDATE_OUT (default target/validate/<tier>).
 set -u
@@ -59,6 +60,16 @@ cache_check() { # name dir: GLUALS_CHECK_CACHE mismatches must be 0
   [ "$n" -eq 0 ]
 }
 
+query_check() { # name dir: GLUALS_CHECK_QUERY mismatches must be 0
+  local name=$1 dir=$2
+  : > "$OUT/$name.query.json"
+  GLUALS_CHECK_QUERY=1 timeout 1800 "$REL/glua_check$X" "$dir" -f json --output "$OUT/$name.query.json" --gmod-annotations "$ANN" > "$OUT/$name.query.txt" 2>&1
+  [ -s "$OUT/$name.query.json" ] || { echo "glua_check wrote nothing (timed out or crashed)"; return 1; }
+  local n; n=$(grep -cE '^\[query\] .*mismatch' "$OUT/$name.query.txt")
+  echo "$n mismatches"
+  [ "$n" -eq 0 ]
+}
+
 gate() { # dir file find replace reference: the corpus step's glua_check of the same build
   LSP_SERVER="$REL/glua_ls$X" GLUA_CHECK="$REL/glua_check$X" LSP_CODEBASE="$1" LSP_ANNOTATIONS="$ANN" node tools/lsp_drift.js --file "$2" \
     --edit-find "$3" --edit-replace "$4" --reference "$5"
@@ -100,6 +111,7 @@ if [ "$TIER" = change ] || [ "$TIER" = phase ]; then
   step vb_det det "$VB" 4 DET_EDITS="$OUT/vb.edits" DET_ONLY="$VB_FILE" DET_STAGES=split:2,shift,$TARGET_STAGES
   step vb_gate gate "$VB" "$VB_FILE" "$VB_FIND" "$VB_REPLACE" "$OUT/vb.json"
   [ -n "${CHECK_CACHE:-}" ] && step vb_cache cache_check vb "$VB"
+  [ -n "${CHECK_QUERY:-}" ] && step vb_query query_check vb "$VB"
 fi
 
 if [ "$TIER" = step ]; then
@@ -108,6 +120,7 @@ if [ "$TIER" = step ]; then
   step cityrp_det det "$CR" 2 DET_EDITS="$OUT/cityrp.edits" DET_ONLY="$CR_FILE" DET_STAGES=$TARGET_STAGES
   step cityrp_gate gate "$CR" "$CR_FILE" "$CR_FIND" "$CR_REPLACE" "$OUT/cityrp.json"
   [ -n "${CHECK_CACHE:-}" ] && step cityrp_cache cache_check cityrp "$CR"
+  [ -n "${CHECK_QUERY:-}" ] && step cityrp_query query_check cityrp "$CR"
 fi
 
 if [ "$TIER" = phase ]; then
@@ -123,6 +136,7 @@ if [ "$TIER" = phase ]; then
     DET_STAGES=$TARGET_STAGES,shift,rename
   step cityrp_gate gate "$CR" "$CR_FILE" "$CR_FIND" "$CR_REPLACE" "$OUT/cityrp.json"
   [ -n "${CHECK_CACHE:-}" ] && step cityrp_cache cache_check cityrp "$CR"
+  [ -n "${CHECK_QUERY:-}" ] && step cityrp_query query_check cityrp "$CR"
   wait $SUITES || FAILED=1
   echo "== suites:"; grep -hE "test result|FAILED|panicked" "$OUT/suite_fingerprints.log" "$OUT/suite_ls.log" | head
 fi
