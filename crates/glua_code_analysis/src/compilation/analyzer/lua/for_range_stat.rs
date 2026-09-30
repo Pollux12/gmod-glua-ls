@@ -1,3 +1,4 @@
+use super::StatementWrite;
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaIndexExpr, LuaIndexKey,
     LuaNameExpr, PathTrait,
@@ -10,10 +11,8 @@ use crate::{
     LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaOperatorMetaMethod, LuaSemanticDeclId, LuaType,
     LuaTypeCache, TplContext, TypeOps, TypeSubstitutor, VariadicType,
     compilation::analyzer::{
-        common::{TypeCacheWriteMode, write_type_cache},
-        dynamic_field::for_range_pairs_source_for_var,
+        common::TypeCacheWriteMode, dynamic_field::for_range_pairs_source_for_var,
         is_provably_builtin_iterator_call,
-        unresolve::iter_var_updates,
     },
     get_member_map, infer_expr, instantiate_doc_function, tpl_pattern_match_args,
 };
@@ -44,12 +43,11 @@ pub fn analyze_for_range_stat(
                     .cloned()
                     .unwrap_or(LuaType::Unknown);
                 let ret_type = TypeOps::Remove.apply(&analyzer.db, &ret_type, &LuaType::Nil);
-                write_type_cache(
-                    &mut analyzer.db,
-                    decl_id.into(),
-                    LuaTypeCache::InferType(ret_type),
-                    TypeCacheWriteMode::InsertOnly,
-                );
+                analyzer.write(StatementWrite::WriteTypeCache {
+                    owner: decl_id.into(),
+                    cache: LuaTypeCache::InferType(ret_type),
+                    mode: TypeCacheWriteMode::InsertOnly,
+                });
             }
 
             if iter_var_types.degraded_unbound_tpl || enumerates_member_map {
@@ -62,26 +60,22 @@ pub fn analyze_for_range_stat(
                     .iter()
                     .map(LuaAstToken::get_position)
                     .collect::<Vec<_>>();
-                for update in iter_var_updates(
-                    &analyzer.db,
-                    analyzer.file_id,
-                    &iter_var_types,
-                    &var_positions,
-                ) {
-                    write_type_cache(&mut analyzer.db, update.owner, update.cache, update.mode);
-                }
+                analyzer.write(StatementWrite::IterVarUpdates {
+                    file_id: analyzer.file_id,
+                    iter_var_types: iter_var_types.clone(),
+                    var_positions,
+                });
             }
         }
         Err(InferFailReason::None) => {
             for var_name in var_name_list {
                 let position = var_name.get_position();
                 let decl_id = LuaDeclId::new(analyzer.file_id, position);
-                write_type_cache(
-                    &mut analyzer.db,
-                    decl_id.into(),
-                    LuaTypeCache::InferType(LuaType::Unknown),
-                    TypeCacheWriteMode::InsertOnly,
-                );
+                analyzer.write(StatementWrite::WriteTypeCache {
+                    owner: decl_id.into(),
+                    cache: LuaTypeCache::InferType(LuaType::Unknown),
+                    mode: TypeCacheWriteMode::InsertOnly,
+                });
             }
         }
         // Nothing to write: the statement runs again once a fact the iterator

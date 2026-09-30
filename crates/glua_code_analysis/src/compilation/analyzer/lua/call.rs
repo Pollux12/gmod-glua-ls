@@ -1,5 +1,6 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use super::StatementWrite;
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
     LuaIndexKey, LuaLiteralToken, LuaNameExpr, LuaTableExpr, LuaVarExpr, NumberResult, PathTrait,
@@ -1312,15 +1313,15 @@ fn collect_accessorfunc_annotated_call(
         return None;
     };
 
-    analyzer.db.get_accessor_func_call_index_mut().add_call(
-        analyzer.file_id,
-        AccessorFuncCallMetadata {
+    analyzer.write(StatementWrite::AddAccessorFuncCall {
+        file_id: analyzer.file_id,
+        metadata: AccessorFuncCallMetadata {
             syntax_id: call_syntax_id,
             owner_type_id,
             accessor_name,
             name_arg_syntax_id,
         },
-    );
+    });
 
     Some(())
 }
@@ -1430,10 +1431,10 @@ fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaC
 
     let (literal_args, args) = extract_call_args(call_expr);
 
-    analyzer.db.get_gmod_class_metadata_index_mut().add_call(
-        analyzer.file_id,
+    analyzer.write(StatementWrite::AddGmodClassCall {
+        file_id: analyzer.file_id,
         kind,
-        GmodScriptedClassCallMetadata {
+        metadata: GmodScriptedClassCallMetadata {
             syntax_id: call_expr.get_syntax_id(),
             literal_args,
             args,
@@ -1443,7 +1444,7 @@ fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaC
             vgui_panel_roles: None,
             derma_skin_roles: None,
         },
-    );
+    });
 }
 
 fn extract_call_args(

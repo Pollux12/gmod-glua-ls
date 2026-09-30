@@ -1,6 +1,6 @@
+use crate::compilation::analyzer::lua::StatementWrite;
 use crate::{
-    DbIndex, FileId, GlobalId, InFiled, LuaArrayType, LuaMemberKey, LuaTypeCache, LuaTypeOwner,
-    TypeOps,
+    DbIndex, FileId, GlobalId, InFiled, LuaArrayType, LuaMemberKey, LuaTypeCache, TypeOps,
     compilation::analyzer::common::{TypeCacheWriteMode, write_type_cache},
     db_index::{LuaDeclId, LuaMemberId, LuaMemberOwner, LuaType},
     semantic::member_key_matches_type,
@@ -10,61 +10,29 @@ use glua_parser::{
     LuaVarExpr, NumberResult, PathTrait, UnaryOperator,
 };
 
-use super::super::{
-    LuaAnalyzer,
-    stats::{is_assignment_file_define_member, is_local_mutable},
-};
-use super::{
-    DynamicKeyCollectionWideningKey, MemberAssignmentWideningCacheKey, WideningCacheLookup,
-    lookup_widening_cache, member_assignment_state_mask, member_assignment_state_masks_compatible,
-    record_widening_cache,
-};
+use super::super::{LuaAnalyzer, stats::is_local_mutable};
 
-pub(in crate::compilation::analyzer::lua) fn get_widened_member_assignment_collection_type(
-    analyzer: &mut LuaAnalyzer,
-    type_owner: &LuaTypeOwner,
-    incoming_type: &LuaType,
+/// The collection type `member_id` holds once `incoming` joins the collections
+/// the other members of its slot hold, when any of them holds one.
+pub(in crate::compilation::analyzer) fn widened_member_assignment_collection_type(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+    incoming: &LuaType,
 ) -> Option<LuaType> {
-    let LuaTypeOwner::Member(member_id) = type_owner else {
-        return None;
-    };
-    let incoming_array = normalize_infer_collection_type(&analyzer.db, incoming_type)?;
-    let (owner, key) = {
-        let member_index = analyzer.db.get_member_index();
-        (
-            member_index.get_member_owner(member_id)?.clone(),
-            member_index.get_member(member_id)?.get_key().clone(),
-        )
-    };
-    match get_cached_widened_member_collection_assignment_type(
-        analyzer,
-        &owner,
-        &key,
-        *member_id,
-        incoming_array.get_base(),
-    ) {
-        Some(Some(widened_type)) => return Some(widened_type),
-        Some(None) => return None,
-        None => {}
-    }
-    let related_members = analyzer
-        .db
-        .get_member_index()
-        .get_members_for_owner_key(&owner, &key);
+    let incoming_array = normalize_infer_collection_type(db, incoming)?;
+    let member_index = db.get_member_index();
+    let owner = member_index.get_member_owner(&member_id)?.clone();
+    let key = member_index.get_member(&member_id)?.get_key().clone();
     let mut widened_base = incoming_array.get_base().clone();
     let mut saw_related_collection = false;
-
-    for related_member in related_members {
+    for related_member in member_index.get_members_for_owner_key(&owner, &key) {
         let related_member_id = related_member.get_id();
-        if related_member_id == *member_id {
+        if related_member_id == member_id
+            || !is_member_realm_compatible(db, member_id, related_member_id)
+        {
             continue;
         }
-        if !is_member_realm_compatible(&analyzer.db, *member_id, related_member_id) {
-            continue;
-        }
-
-        let Some(existing_cache) = analyzer
-            .db
+        let Some(existing_cache) = db
             .get_type_index()
             .get_type_cache(&related_member_id.into())
             .cloned()
@@ -74,109 +42,16 @@ pub(in crate::compilation::analyzer::lua) fn get_widened_member_assignment_colle
         if !existing_cache.is_infer() {
             continue;
         }
-
-        let Some(existing_array) =
-            normalize_infer_collection_type(&analyzer.db, existing_cache.as_type())
+        let Some(existing_array) = normalize_infer_collection_type(db, existing_cache.as_type())
         else {
             continue;
         };
         saw_related_collection = true;
-        widened_base = TypeOps::Union.apply(&analyzer.db, existing_array.get_base(), &widened_base);
+        widened_base = TypeOps::Union.apply(db, existing_array.get_base(), &widened_base);
     }
 
-    if !saw_related_collection {
-        return None;
-    }
-
-    Some(LuaType::Array(
-        LuaArrayType::from_base_type(widened_base).into(),
-    ))
-}
-
-pub(in crate::compilation::analyzer::lua) fn get_cached_widened_member_collection_assignment_type(
-    analyzer: &mut LuaAnalyzer,
-    owner: &LuaMemberOwner,
-    key: &LuaMemberKey,
-    member_id: LuaMemberId,
-    incoming_base: &LuaType,
-) -> Option<Option<LuaType>> {
-    let incoming_base = crate::widen_literal_type_for_assignment(incoming_base);
-    let member_index = analyzer.db.get_member_index();
-    let visible_count = member_index.visible_member_count_for_owner_key(owner, key);
-    let cache_key = MemberAssignmentWideningCacheKey {
-        owner: owner.clone(),
-        key: key.clone(),
-    };
-
-    let cache = match lookup_widening_cache(
-        &analyzer.member_collection_assignment_widening_cache,
-        &cache_key,
-        visible_count,
-    ) {
-        WideningCacheLookup::FirstSighting => return Some(None),
-        WideningCacheLookup::Fallback => return None,
-        WideningCacheLookup::Hit(cache) => cache,
-    };
-
-    let current_state_mask = member_assignment_state_mask(analyzer, member_id);
-    let mut widened_base = incoming_base;
-    let mut saw_related_collection = false;
-    for (state_mask, base_type) in &cache.by_state_mask {
-        if !member_assignment_state_masks_compatible(analyzer, current_state_mask, *state_mask) {
-            continue;
-        }
-        saw_related_collection = true;
-        widened_base = TypeOps::Union.apply(&analyzer.db, &widened_base, base_type);
-    }
-
-    Some(
-        saw_related_collection
-            .then(|| LuaType::Array(LuaArrayType::from_base_type(widened_base).into())),
-    )
-}
-
-pub(in crate::compilation::analyzer::lua) fn record_member_collection_assignment_widening_cache(
-    analyzer: &mut LuaAnalyzer,
-    type_owner: &LuaTypeOwner,
-    assigned_type: &LuaType,
-) {
-    let Some(assigned_array) = normalize_infer_collection_type(&analyzer.db, assigned_type) else {
-        return;
-    };
-
-    let LuaTypeOwner::Member(member_id) = type_owner else {
-        return;
-    };
-    if !is_assignment_file_define_member(&analyzer.db, *member_id) {
-        return;
-    }
-
-    let member_index = analyzer.db.get_member_index();
-    let Some(owner) = member_index.get_member_owner(member_id).cloned() else {
-        return;
-    };
-    let Some(key) = member_index
-        .get_member(member_id)
-        .map(|member| member.get_key().clone())
-    else {
-        return;
-    };
-    let visible_count = member_index.visible_member_count_for_owner_key(&owner, &key);
-    let state_mask = member_assignment_state_mask(analyzer, *member_id);
-    let cache_key = MemberAssignmentWideningCacheKey { owner, key };
-
-    let assigned_base = crate::widen_literal_type_for_assignment(assigned_array.get_base());
-    let db = &*analyzer.db;
-    record_widening_cache(
-        &mut analyzer.member_collection_assignment_widening_cache,
-        cache_key,
-        visible_count,
-        state_mask,
-        assigned_base,
-        |base_type, assigned_base| {
-            *base_type = TypeOps::Union.apply(db, base_type, &assigned_base);
-        },
-    );
+    saw_related_collection
+        .then(|| LuaType::Array(LuaArrayType::from_base_type(widened_base).into()))
 }
 
 fn is_member_realm_compatible(
@@ -195,6 +70,14 @@ fn is_member_realm_compatible(
         &related_member_id.file_id,
         related_member_id.get_position(),
     )
+}
+
+/// A slot whose dynamic-key element writes widen its collection once, when
+/// the analysis ends.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(in crate::compilation::analyzer::lua) struct DynamicKeyCollectionWideningKey {
+    pub(in crate::compilation::analyzer::lua) owner: LuaMemberOwner,
+    pub(in crate::compilation::analyzer::lua) key: LuaMemberKey,
 }
 
 pub(in crate::compilation::analyzer::lua) fn widen_existing_member_collection_type(
@@ -675,39 +558,13 @@ pub(in crate::compilation::analyzer::lua) fn widen_member_collections_with_colle
     member_ids: &[LuaMemberId],
     incoming_type: &LuaType,
 ) -> Option<()> {
-    let incoming_array = normalize_infer_collection_type(&analyzer.db, incoming_type)?;
-
-    for member_id in member_ids {
-        let existing_cache = analyzer
-            .db
-            .get_type_index()
-            .get_type_cache(&(*member_id).into())
-            .cloned()?;
-        if !existing_cache.is_infer() {
-            continue;
-        }
-
-        let Some(existing_array) =
-            normalize_infer_collection_type(&analyzer.db, existing_cache.as_type())
-        else {
-            continue;
-        };
-
-        let widened_base = TypeOps::Union.apply(
-            &analyzer.db,
-            existing_array.get_base(),
-            incoming_array.get_base(),
-        );
-        write_type_cache(
-            &mut analyzer.db,
-            (*member_id).into(),
-            LuaTypeCache::InferType(LuaType::Array(
-                LuaArrayType::from_base_type(widened_base).into(),
-            )),
-            TypeCacheWriteMode::ForceOverwrite,
-        );
+    if member_ids.is_empty() {
+        return Some(());
     }
-
+    analyzer.write(StatementWrite::WidenCollections {
+        member_ids: member_ids.to_vec(),
+        incoming: CollectionWidening::Collection(incoming_type.clone()),
+    });
     Some(())
 }
 
@@ -716,9 +573,42 @@ pub(in crate::compilation::analyzer::lua) fn widen_member_collections_with_eleme
     member_ids: &[LuaMemberId],
     element_type: &LuaType,
 ) -> Option<()> {
+    if member_ids.is_empty() {
+        return Some(());
+    }
+    analyzer.write(StatementWrite::WidenCollections {
+        member_ids: member_ids.to_vec(),
+        incoming: CollectionWidening::Element(element_type.clone()),
+    });
+    Some(())
+}
+
+/// What widens the members' collection types.
+#[derive(Debug, Clone)]
+pub(in crate::compilation::analyzer) enum CollectionWidening {
+    /// Another collection, whose element type joins theirs.
+    Collection(LuaType),
+    /// One more element.
+    Element(LuaType),
+}
+
+/// Widens each member's inferred collection type with `incoming`, against the
+/// types the members hold now; stops at the first member holding none.
+pub(in crate::compilation::analyzer) fn widen_member_collections(
+    db: &mut DbIndex,
+    member_ids: &[LuaMemberId],
+    incoming: &CollectionWidening,
+) -> Option<()> {
+    let incoming_base = match incoming {
+        CollectionWidening::Collection(incoming_type) => {
+            normalize_infer_collection_type(db, incoming_type)?
+                .get_base()
+                .clone()
+        }
+        CollectionWidening::Element(element_type) => element_type.clone(),
+    };
     for member_id in member_ids {
-        let existing_cache = analyzer
-            .db
+        let existing_cache = db
             .get_type_index()
             .get_type_cache(&(*member_id).into())
             .cloned()?;
@@ -726,16 +616,14 @@ pub(in crate::compilation::analyzer::lua) fn widen_member_collections_with_eleme
             continue;
         }
 
-        let Some(existing_array) =
-            normalize_infer_collection_type(&analyzer.db, existing_cache.as_type())
+        let Some(existing_array) = normalize_infer_collection_type(db, existing_cache.as_type())
         else {
             continue;
         };
 
-        let widened_base =
-            TypeOps::Union.apply(&analyzer.db, existing_array.get_base(), element_type);
+        let widened_base = TypeOps::Union.apply(db, existing_array.get_base(), &incoming_base);
         write_type_cache(
-            &mut analyzer.db,
+            db,
             (*member_id).into(),
             LuaTypeCache::InferType(LuaType::Array(
                 LuaArrayType::from_base_type(widened_base).into(),

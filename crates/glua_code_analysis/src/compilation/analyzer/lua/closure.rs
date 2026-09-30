@@ -1,3 +1,4 @@
+use super::{SignatureChange, StatementWrite};
 use glua_parser::LuaSyntaxNodeExt;
 use std::ops::Deref;
 
@@ -124,11 +125,10 @@ fn analyze_direct_param_return_alias(
         return Some(());
     }
 
-    analyzer
-        .db
-        .get_signature_index_mut()
-        .get_or_create(*signature_id)
-        .set_direct_param_return_alias(param_idx);
+    analyzer.write(StatementWrite::Signature {
+        signature_id: *signature_id,
+        change: SignatureChange::DirectParamReturnAlias(param_idx),
+    });
     Some(())
 }
 
@@ -192,11 +192,10 @@ fn analyze_class_name_param_return_alias(
         return Some(());
     }
 
-    analyzer
-        .db
-        .get_signature_index_mut()
-        .get_or_create(*signature_id)
-        .set_class_name_param_return_alias(param_idx);
+    analyzer.write(StatementWrite::Signature {
+        signature_id: *signature_id,
+        change: SignatureChange::ClassNameParamReturnAlias(param_idx),
+    });
     Some(())
 }
 
@@ -419,11 +418,14 @@ fn analyze_falsy_param_nil_free_return_slots(
         if let Some((falsy_param_idx, aliased_param_idx, return_slot)) =
             falsy_param_return_alias(&params, &block, &if_stat)
         {
-            analyzer
-                .db
-                .get_signature_index_mut()
-                .get_or_create(*signature_id)
-                .add_falsy_param_return_alias(falsy_param_idx, aliased_param_idx, return_slot);
+            analyzer.write(StatementWrite::Signature {
+                signature_id: *signature_id,
+                change: SignatureChange::FalsyParamReturnAlias {
+                    falsy_param_idx,
+                    aliased_param_idx,
+                    return_slot,
+                },
+            });
         }
         let Some(condition) = if_stat.get_condition_expr() else {
             continue;
@@ -437,11 +439,13 @@ fn analyze_falsy_param_nil_free_return_slots(
         if let Some(return_slot) =
             falsy_param_nil_free_return_slot(analyzer, closure, &block, &if_stat, &param_name)
         {
-            analyzer
-                .db
-                .get_signature_index_mut()
-                .get_or_create(*signature_id)
-                .add_falsy_param_nil_free_return_slot(param_idx, return_slot);
+            analyzer.write(StatementWrite::Signature {
+                signature_id: *signature_id,
+                change: SignatureChange::FalsyParamNilFreeReturnSlot {
+                    param_idx,
+                    return_slot,
+                },
+            });
         }
     }
 
@@ -449,11 +453,13 @@ fn analyze_falsy_param_nil_free_return_slots(
         if return_call_is_nil_free_when_param_falsy(
             analyzer, &params, &block, param_idx, param_name,
         ) {
-            analyzer
-                .db
-                .get_signature_index_mut()
-                .get_or_create(*signature_id)
-                .add_falsy_param_nil_free_return_slot(param_idx, 0);
+            analyzer.write(StatementWrite::Signature {
+                signature_id: *signature_id,
+                change: SignatureChange::FalsyParamNilFreeReturnSlot {
+                    param_idx,
+                    return_slot: 0,
+                },
+            });
         }
     }
 
@@ -952,11 +958,10 @@ fn analyze_nil_return_guard_params(
     }
 
     for param_idx in guard_param_indices {
-        analyzer
-            .db
-            .get_signature_index_mut()
-            .get_or_create(*signature_id)
-            .add_nil_return_guard_param(param_idx);
+        analyzer.write(StatementWrite::Signature {
+            signature_id: *signature_id,
+            change: SignatureChange::NilReturnGuardParam(param_idx),
+        });
     }
 
     Some(())
@@ -1758,11 +1763,10 @@ fn analyze_require_guard_param(
         .map(|candidate| candidate.param_idx);
 
     if let Some(param_idx) = param_idx {
-        let signature = analyzer
-            .db
-            .get_signature_index_mut()
-            .get_or_create(*signature_id);
-        signature.set_require_guard_param(param_idx);
+        analyzer.write(StatementWrite::Signature {
+            signature_id: *signature_id,
+            change: SignatureChange::RequireGuardParam(param_idx),
+        });
     }
 
     Some(())
@@ -2076,12 +2080,10 @@ fn analyze_return(
     let block = match closure.get_block() {
         Some(block) => block,
         None => {
-            let signature = analyzer
-                .db
-                .get_signature_index_mut()
-                .get_or_create(*signature_id);
-            signature.resolve_return = SignatureReturnStatus::InferResolve;
-            signature.set_return_correlations(Vec::new());
+            analyzer.write(StatementWrite::Signature {
+                signature_id: *signature_id,
+                change: SignatureChange::BodilessReturn,
+            });
             return Some(());
         }
     };
@@ -2118,18 +2120,13 @@ fn analyze_return(
             return None;
         }
     };
-    let signature = analyzer
-        .db
-        .get_signature_index_mut()
-        .get_or_create(*signature_id);
-
-    signature.resolve_return = SignatureReturnStatus::InferResolve;
-    signature.return_docs = returns;
-    signature.set_return_correlations(return_correlations);
-    analyzer
-        .db
-        .get_signature_index_mut()
-        .note_return_write(*signature_id);
+    analyzer.write(StatementWrite::Signature {
+        signature_id: *signature_id,
+        change: SignatureChange::InferredReturns {
+            returns,
+            correlations: return_correlations,
+        },
+    });
 
     Some(())
 }

@@ -18,11 +18,9 @@ pub use for_range_stat::{
 };
 pub use func_body::LuaReturnPoint;
 use glua_parser::{LuaAst, LuaAstNode, LuaChunk, LuaExpr, LuaSyntaxId, with_syntax_resolver};
+use member_write_policy::DynamicKeyCollectionWideningKey;
 pub(in crate::compilation::analyzer) use member_write_policy::alias_target_global_path;
 pub(in crate::compilation::analyzer) use member_write_policy::resolve_index_expr_member_owner_for_file;
-use member_write_policy::{
-    DynamicKeyCollectionWideningKey, MemberAssignmentWideningCacheKey, MemberWideningCache,
-};
 use metatable::analyze_setmetatable;
 use module::analyze_chunk_return;
 pub use module::compute_module_semantic_id;
@@ -48,7 +46,9 @@ use crate::{
 };
 
 use super::AnalyzeContext;
-pub(in crate::compilation::analyzer) use store::{DbAccess, StatementWrite};
+pub(in crate::compilation::analyzer) use store::{
+    DbAccess, MemberHoming, SignatureChange, StatementWrite,
+};
 
 /// Whether a derivation of `kind` analyses without writing, its writes
 /// applying afterwards.
@@ -181,8 +181,6 @@ struct LuaAnalyzer<'a> {
     gmod_enabled: bool,
     is_scripted_class_scope: bool,
     special_call_direct_matcher: &'a call::SpecialCallDirectMatcher,
-    member_collection_assignment_widening_cache:
-        FxHashMap<MemberAssignmentWideningCacheKey, MemberWideningCache<LuaType>>,
     pending_dynamic_key_collection_widenings: FxHashMap<DynamicKeyCollectionWideningKey, LuaType>,
     /// Whether each member is a guarded `x.y = x.y or {}` self-assignment.
     ///
@@ -199,7 +197,6 @@ struct LuaAnalyzer<'a> {
     /// so the pass costs O(N) total for identical answers.
     guarded_table_assignment_slot_cache: FxHashMap<(LuaMemberOwner, LuaMemberKey), GuardedSlotMemo>,
     direct_local_table_member_owner_cache: FxHashMap<LuaDeclId, Option<LuaMemberOwner>>,
-    literal_index_member_owner_cache: FxHashMap<smol_str::SmolStr, LuaMemberOwner>,
     /// A closure's own `return` statements (excluding nested closures').
     closure_own_returns_cache:
         FxHashMap<glua_parser::LuaSyntaxId, std::rc::Rc<Vec<glua_parser::LuaReturnStat>>>,
@@ -222,12 +219,10 @@ impl LuaAnalyzer<'_> {
             gmod_enabled,
             is_scripted_class_scope,
             special_call_direct_matcher,
-            member_collection_assignment_widening_cache: FxHashMap::default(),
             pending_dynamic_key_collection_widenings: FxHashMap::default(),
             guarded_table_assignment_member_check_cache: FxHashMap::default(),
             guarded_table_assignment_slot_cache: FxHashMap::default(),
             direct_local_table_member_owner_cache: FxHashMap::default(),
-            literal_index_member_owner_cache: FxHashMap::default(),
             closure_own_returns_cache: FxHashMap::default(),
         }
     }

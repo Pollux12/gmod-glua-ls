@@ -257,19 +257,29 @@ fn check_pure() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("GLUALS_CHECK_PURE").is_some())
 }
 
-static PURE_CHECKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static PURE_MISMATCHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Per kind, the statements checked and how many of them wrote differently
+/// deferred.
+static PURE_CHECKS: std::sync::Mutex<std::collections::BTreeMap<DerivationKind, (usize, usize)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// Under `GLUALS_CHECK_PURE`, prints how many statements were checked and how
-/// many wrote differently deferred.
+/// Under `GLUALS_CHECK_PURE`, prints per kind how many statements were checked
+/// and how many wrote differently deferred, then the totals.
 pub(super) fn report_pure_check() {
-    if check_pure() {
-        eprintln!(
-            "[pure] checked {} mismatched {}",
-            PURE_CHECKED.load(std::sync::atomic::Ordering::Relaxed),
-            PURE_MISMATCHED.load(std::sync::atomic::Ordering::Relaxed)
-        );
+    if !check_pure() {
+        return;
     }
+    let checks = PURE_CHECKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (kind, (checked, mismatched)) in checks.iter() {
+        eprintln!("[pure] {kind:?} checked {checked} mismatched {mismatched}");
+    }
+    let (checked, mismatched) = checks
+        .values()
+        .fold((0, 0), |(c, m), (checked, mismatched)| {
+            (c + checked, m + mismatched)
+        });
+    eprintln!("[pure] checked {checked} mismatched {mismatched}");
 }
 
 /// Whether a file's locals are guessed from their uses: only once the run has
@@ -321,12 +331,31 @@ impl Recipes {
             format!("{:?}", deferred_context.unresolves),
         );
         let inline = (format!("{inline:?}"), format!("{:?}", context.unresolves));
-        PURE_CHECKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut checks = PURE_CHECKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (checked, mismatched) = checks.entry(id.kind).or_default();
+        *checked += 1;
         if deferred != inline {
-            let mismatches = PURE_MISMATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if mismatches < 20 {
+            *mismatched += 1;
+            if *mismatched <= 5 {
+                let text = db
+                    .get_vfs()
+                    .get_syntax_tree(&id.file_id)
+                    .and_then(|tree| {
+                        id.syntax_id()
+                            .to_node_from_root(tree.get_chunk_node().syntax())
+                    })
+                    .map(|node| node.text().to_string())
+                    .unwrap_or_default();
+                let path = db
+                    .get_vfs()
+                    .get_file_path(&id.file_id)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
                 eprintln!(
-                    "[pure] {id:?} deferred {deferred:?}
+                    "[pure] {id:?} {path}: {text:?}
+[pure] {id:?} deferred {deferred:?}
 [pure] {id:?} inline   {inline:?}"
                 );
             }

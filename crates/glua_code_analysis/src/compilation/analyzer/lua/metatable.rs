@@ -3,6 +3,7 @@ use glua_parser::{
     LuaNameExpr, LuaTableExpr, LuaTableField, LuaVarExpr,
 };
 
+use super::StatementWrite;
 use crate::{
     InFiled, LuaDeclExtra, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignatureId,
     OperatorFunction, SetmetatableFactoryBinding,
@@ -27,12 +28,12 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
     };
     let writer_sort_key = writer_sort_key(analyzer);
 
-    analyzer.db.get_metatable_index_mut().add(
-        InFiled::new(file_id, table.get_range()),
-        metatable_range.clone(),
+    analyzer.write(StatementWrite::AddMetatable {
+        table: InFiled::new(file_id, table.get_range()),
+        metatable: metatable_range.clone(),
         file_id,
-        writer_sort_key.clone(),
-    );
+        sort_key: writer_sort_key.clone(),
+    });
 
     if let Some(binding) = setmetatable_factory_binding(
         analyzer,
@@ -41,19 +42,16 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
         &metatable,
         metatable_range.clone(),
     ) {
-        analyzer
-            .db
-            .get_metatable_index_mut()
-            .add_factory_binding(binding);
+        analyzer.write(StatementWrite::AddFactoryBinding(binding));
     }
 
     if let Some(backing_table) = resolve_metatable_backing_table(analyzer, &table) {
-        analyzer.db.get_metatable_index_mut().add(
-            backing_table,
-            metatable_range.clone(),
+        analyzer.write(StatementWrite::AddMetatable {
+            table: backing_table,
+            metatable: metatable_range.clone(),
             file_id,
-            writer_sort_key,
-        );
+            sort_key: writer_sort_key,
+        });
     }
 
     let metatable_table = match metatable {
@@ -293,7 +291,7 @@ fn analyze_metable_field(
                 field.get_range(),
                 operator_func,
             );
-            analyzer.db.get_operator_index_mut().add_operator(operator);
+            analyzer.write(StatementWrite::AddOperator(operator));
             return Some(());
         }
     };
@@ -305,7 +303,7 @@ fn analyze_metable_field(
         field.get_range(),
         OperatorFunction::Signature(signature_id),
     );
-    analyzer.db.get_operator_index_mut().add_operator(operator);
+    analyzer.write(StatementWrite::AddOperator(operator));
 
     Some(())
 }

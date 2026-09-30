@@ -5,7 +5,7 @@ use crate::{
     compilation::analyzer::unresolve::UnResolveModule, db_index::LuaType,
 };
 
-use super::{LuaAnalyzer, LuaReturnPoint, func_body::analyze_func_body_returns};
+use super::{LuaAnalyzer, LuaReturnPoint, StatementWrite, func_body::analyze_func_body_returns};
 
 pub fn analyze_chunk_return(analyzer: &mut LuaAnalyzer, chunk: LuaChunk) -> Option<()> {
     let block = chunk.get_block()?;
@@ -27,20 +27,15 @@ pub fn analyze_chunk_return(analyzer: &mut LuaAnalyzer, chunk: LuaChunk) -> Opti
 
             let semantic_id = compute_module_semantic_id(&analyzer.db, analyzer.file_id, &expr);
 
-            let module_info = analyzer
-                .db
-                .get_module_index_mut()
-                .get_module_mut(analyzer.file_id)?;
-            match expr_type {
-                LuaType::Variadic(multi) => {
-                    let ty = multi.get_type(0)?;
-                    module_info.export_type = Some(ty.clone());
-                }
-                _ => {
-                    module_info.export_type = Some(expr_type);
-                }
-            }
-            module_info.semantic_id = semantic_id;
+            let export_type = match expr_type {
+                LuaType::Variadic(multi) => multi.get_type(0)?.clone(),
+                expr_type => expr_type,
+            };
+            analyzer.write(StatementWrite::SetModuleExport {
+                file_id: analyzer.file_id,
+                export_type,
+                semantic_id,
+            });
             break;
         }
     }
