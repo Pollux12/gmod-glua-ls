@@ -27,6 +27,11 @@
 //!   first, as after a pause. Slices alternate threads, and each first puts
 //!   the next of the target's readers ahead, as a waiting diagnostics pull
 //!   does. Shares the edit's oracle.
+//! - `gate`: on one fork, the `typing` stage's keystrokes, the original text
+//!   back, then the file deleted and re-created through watched-file events,
+//!   each settled in slices, as the language-server drift gate drives the
+//!   server (the revert, delete and re-create in slices of `DET_SLICE`,
+//!   default 16); its oracle is the `recreate` stage's kind.
 //! - `burst`: three edits of every target before one re-analysis, ending on
 //!   the edited text.
 //! - `noop`: re-index each target with unchanged text; the oracle is the base.
@@ -50,7 +55,11 @@
 //!   from `DET_STRIDE_OFFSET`. They form one batch with one oracle; with
 //!   `DET_EACH=1` each file is its own run and oracle, labelled
 //!   `stage[path]`, which a batch cannot mask by re-indexing a reader another
-//!   file left stale.
+//!   file left stale. `DET_SLICE=N` settles each watched-file batch in slices
+//!   of N evaluations, every other slice on a fresh thread, as the language
+//!   server settles one; with `DET_FOCUS_AFTER=K` each boundary from the K-th
+//!   on puts the batch's files ahead, as a diagnostics task waiting on them
+//!   does.
 //!
 //! Targets: `DET_EDITS` names a file of `path<TAB>find<TAB>replace` lines
 //! (`\n`, `\t` and `\` escaped), one edit per target; or `DET_TARGETS`
@@ -2062,6 +2071,70 @@ fn settle_in_slices(
 /// Evaluations per slice when a stage settles a re-analysis in slices.
 const SLICE_EVALUATIONS: usize = 16;
 
+/// What typing an edit into a warm fork reached.
+struct Typed {
+    reach: Reach,
+    most_evaluated: usize,
+    most_affected: usize,
+    taken_mid: usize,
+    /// The document version the last keystroke took.
+    version: i32,
+}
+
+/// Types `edit` into `file_id` one character at a time as the language server
+/// takes it, every keystroke into the re-analysis still settling from the one
+/// before; see the module docs.
+fn type_edit(
+    warm: &mut Warm,
+    uri: &lsp_types::Uri,
+    file_id: FileId,
+    original: &str,
+    edit: &Edit,
+    readers: &[FileId],
+) -> Typed {
+    let mut next_reader = readers.iter().cycle();
+    let mut typed = Typed {
+        reach: Reach::default(),
+        most_evaluated: 0,
+        most_affected: 0,
+        taken_mid: 0,
+        version: 0,
+    };
+    let texts = typed_texts(original, &edit.find, &edit.replace);
+    let keystrokes = texts.len();
+    for (version, text) in (1..).zip(texts) {
+        typed.version = version;
+        apply_text(warm, uri, file_id, text, version);
+        warm.begin_reindex(vec![file_id]);
+        let pause = version % 3 == 0 || version as usize == keystrokes;
+        let affected = if pause {
+            Some(settle_in_slices(warm, SLICE_EVALUATIONS, |warm| {
+                if let Some(reader) = next_reader.next() {
+                    warm.compilation.prioritise_update(&[*reader]);
+                }
+            }))
+        } else {
+            let evaluations = if version % 3 == 1 { 16 } else { 256 };
+            match warm.advance_reindex(Slice::Evaluations(evaluations)) {
+                UpdateProgress::Settled(affected) => Some(affected),
+                UpdateProgress::Settling => {
+                    typed.taken_mid += 1;
+                    None
+                }
+                UpdateProgress::TextChanged => panic!("a slice found text it had not taken"),
+            }
+        };
+        if let Some(mut affected) = affected {
+            affected.push(file_id);
+            let step = warm.settled(affected);
+            typed.most_evaluated = typed.most_evaluated.max(step.evaluated.len());
+            typed.most_affected = typed.most_affected.max(step.affected.len());
+            typed.reach.extend(step);
+        }
+    }
+    typed
+}
+
 /// Prints how far a warm run reached. With `strict`, any evaluated file
 /// outside `edited` is a locality divergence.
 fn report_reach(
@@ -2706,6 +2779,17 @@ impl Harness<'_> {
     }
 
     /// The cold input with each of `targets` edited.
+    /// The cold input a `gate` run of `target_file` ends on: the file removed
+    /// and created again with its original text.
+    fn recreated_input(&self, target_file: &Target) -> ColdInput {
+        let (path, _, _, original) = target(&self.base, &self.codebase, &target_file.relative);
+        ColdInput {
+            removed: vec![path.clone()],
+            created: vec![(path, original)],
+            ..ColdInput::default()
+        }
+    }
+
     fn edit_input(&self, targets: &[Target]) -> ColdInput {
         ColdInput {
             overrides: targets
@@ -2733,6 +2817,11 @@ impl Harness<'_> {
                         .map(|target_file| self.edit_input(std::slice::from_ref(target_file))),
                 ),
                 "burst" => inputs.push(self.edit_input(targets)),
+                "gate" => inputs.extend(
+                    targets
+                        .iter()
+                        .map(|target_file| self.recreated_input(target_file)),
+                ),
                 "touch" | "shift" | "delete" | "recreate" | "rename" => inputs.extend(
                     self.sweep_batches(stage)
                         .iter()
@@ -2835,52 +2924,74 @@ impl Harness<'_> {
         let dependents = self.base.dependent_files();
         for target_file in targets {
             let relative = &target_file.relative;
-            let edit = target_file.edit();
             let (_, uri, file_id, original) = target(&self.base, &self.codebase, relative);
             let readers = dependents.get(&file_id).cloned().unwrap_or_default();
-            let mut next_reader = readers.iter().cycle();
             let mut warm = self.warm();
-            let mut reach = Reach::default();
-            let (mut most_evaluated, mut most_affected, mut taken_mid) = (0, 0, 0);
-            let texts = typed_texts(&original, &edit.find, &edit.replace);
-            let keystrokes = texts.len();
-            for (version, text) in (1..).zip(texts) {
-                apply_text(&mut warm, &uri, file_id, text, version);
-                warm.begin_reindex(vec![file_id]);
-                let pause = version % 3 == 0 || version as usize == keystrokes;
-                let affected = if pause {
-                    Some(settle_in_slices(&mut warm, SLICE_EVALUATIONS, |warm| {
-                        if let Some(reader) = next_reader.next() {
-                            warm.compilation.prioritise_update(&[*reader]);
-                        }
-                    }))
-                } else {
-                    let evaluations = if version % 3 == 1 { 16 } else { 256 };
-                    match warm.advance_reindex(Slice::Evaluations(evaluations)) {
-                        UpdateProgress::Settled(affected) => Some(affected),
-                        UpdateProgress::Settling => {
-                            taken_mid += 1;
-                            None
-                        }
-                        UpdateProgress::TextChanged => {
-                            panic!("a slice found text it had not taken")
-                        }
-                    }
-                };
-                if let Some(mut affected) = affected {
-                    affected.push(file_id);
-                    let step = warm.settled(affected);
-                    most_evaluated = most_evaluated.max(step.evaluated.len());
-                    most_affected = most_affected.max(step.affected.len());
-                    reach.extend(step);
-                }
-            }
+            let typed = type_edit(
+                &mut warm,
+                &uri,
+                file_id,
+                &original,
+                target_file.edit(),
+                &readers,
+            );
             println!(
-                "[reach typing[{relative}] per settle] evaluated<={most_evaluated} affected<={most_affected}; {taken_mid} keystroke(s) taken mid re-analysis"
+                "[reach typing[{relative}] per settle] evaluated<={} affected<={}; {} keystroke(s) taken mid re-analysis",
+                typed.most_evaluated, typed.most_affected, typed.taken_mid
             );
             let input = self.edit_input(std::slice::from_ref(target_file));
             self.finish(
                 &format!("typing[{relative}]"),
+                warm,
+                &[file_id],
+                &typed.reach,
+                false,
+                &input,
+            );
+        }
+    }
+
+    /// Drives each target as the language-server drift gate does, on one
+    /// fork: the edit typed, the original text back, then the file deleted
+    /// and re-created through watched-file events, each settled in slices.
+    fn gate(&mut self, targets: &[Target]) {
+        let dependents = self.base.dependent_files();
+        let slice = env_usize("DET_SLICE", SLICE_EVALUATIONS);
+        for target_file in targets {
+            let relative = &target_file.relative;
+            let (_, uri, file_id, original) = target(&self.base, &self.codebase, relative);
+            let readers = dependents.get(&file_id).cloned().unwrap_or_default();
+            let mut warm = self.warm();
+            let typed = type_edit(
+                &mut warm,
+                &uri,
+                file_id,
+                &original,
+                target_file.edit(),
+                &readers,
+            );
+            let mut reach = typed.reach;
+            apply_text(
+                &mut warm,
+                &uri,
+                file_id,
+                original.clone(),
+                typed.version + 1,
+            );
+            warm.begin_reindex(vec![file_id]);
+            let mut affected = settle_in_slices(&mut warm, slice, |_| {});
+            affected.push(file_id);
+            reach.extend(warm.settled(affected));
+            for text in [None, Some(original.clone())] {
+                let changed = warm.stage_file_system_changes(vec![(uri.clone(), text)]);
+                warm.begin_reindex(changed.clone());
+                let mut affected = settle_in_slices(&mut warm, slice, |_| {});
+                affected.extend(changed);
+                reach.extend(warm.settled(affected));
+            }
+            let input = self.recreated_input(target_file);
+            self.finish(
+                &format!("gate[{relative}]"),
                 warm,
                 &[file_id],
                 &reach,
@@ -2900,8 +3011,30 @@ impl Harness<'_> {
     ) {
         let mut warm = self.warm();
         let mut reach = Reach::default();
+        let slice = env_usize("DET_SLICE", 0);
         for events in steps {
-            let affected = warm.apply_file_system_changes(events);
+            let affected = if slice == 0 {
+                warm.apply_file_system_changes(events)
+            } else {
+                let changed = warm.stage_file_system_changes(events);
+                if changed.is_empty() {
+                    Vec::new()
+                } else {
+                    warm.begin_reindex(changed.clone());
+                    let focus_after = std::env::var("DET_FOCUS_AFTER")
+                        .ok()
+                        .and_then(|value| value.parse::<usize>().ok());
+                    let mut boundaries = 0;
+                    let mut affected = settle_in_slices(&mut warm, slice, |analysis| {
+                        if focus_after.is_some_and(|after| boundaries >= after) {
+                            analysis.compilation.prioritise_update(&changed);
+                        }
+                        boundaries += 1;
+                    });
+                    affected.extend(changed);
+                    affected
+                }
+            };
             reach.extend(warm.settled(affected));
         }
         self.finish(label, warm, edited, &reach, false, input);
@@ -3205,6 +3338,7 @@ fn run() {
                         | "revert"
                         | "burst"
                         | "typing"
+                        | "gate"
                         | "noop"
                         | "reload"
                         | "exact"
@@ -3220,7 +3354,7 @@ fn run() {
     let needs_targets = stages.iter().any(|s| {
         matches!(
             *s,
-            "edit" | "revert" | "burst" | "typing" | "noop" | "exact"
+            "edit" | "revert" | "burst" | "typing" | "gate" | "noop" | "exact"
         )
     });
     let targets = targets_from_env();
@@ -3323,6 +3457,7 @@ fn run() {
                 "revert" => harness.revert(&targets),
                 "burst" => harness.burst(&targets),
                 "typing" => harness.typing(&targets),
+                "gate" => harness.gate(&targets),
                 "noop" => harness.noop(&targets),
                 "reload" => harness.reload(),
                 "exact" => harness.exact(&targets),

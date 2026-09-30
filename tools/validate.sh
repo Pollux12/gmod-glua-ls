@@ -83,7 +83,7 @@ if [ -z "${SKIP_BUILD:-}" ] && [ -z "${VALIDATE_BIN:-}" ]; then
   cargo build --release -p determinism -p glua_check -p glua_ls 2>&1 | grep -E "^error|Finished" || exit 1
 fi
 
-TARGET_STAGES=schedule,schedule:deferred,edit,revert,noop,reload,delete,recreate
+TARGET_STAGES=schedule,schedule:deferred,edit,revert,noop,reload,delete,recreate,gate
 
 if [ "$TIER" = change ] || [ "$TIER" = phase ]; then
   VB=${GLUALS_VB:?GLUALS_VB is required}
