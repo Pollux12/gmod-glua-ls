@@ -570,8 +570,18 @@ impl DbIndex {
         self.analysis_stage
     }
 
+    /// Moves the analysis to `stage`, forgetting the cached fingerprints of the
+    /// stage rules whose value that moves.
     pub(crate) fn set_analysis_stage(&mut self, stage: derivation::AnalysisStage) {
-        self.analysis_stage = stage;
+        let before = std::mem::replace(&mut self.analysis_stage, stage);
+        for rule in derivation::StageRule::ALL {
+            if rule.holds_at(before) != rule.holds_at(stage) {
+                self.derivations
+                    .forget_fingerprint(&derivation::HashedKey::new(
+                        derivation::FactKey::StageRule(rule),
+                    ));
+            }
+        }
     }
 
     /// Whether `rule` holds at the stage the analysis is at; a recorded read.
@@ -1361,5 +1371,32 @@ impl LuaIndex for DbIndex {
         self.gmod_call_roles = None;
         self.call_role_fingerprints.clear();
         self.role_mentions.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DbIndex;
+    use crate::db_index::derivation::{AnalysisStage, FactKey, HashedKey, StageRule};
+
+    /// A stage rule's value follows the stage, so a fingerprint cached under
+    /// one stage is not what a read under the next is answered with.
+    #[test]
+    fn a_stage_change_forgets_the_rule_fingerprints_it_moves() {
+        let mut db = DbIndex::new();
+        let rule = HashedKey::new(FactKey::StageRule(StageRule::FloorUnsettled));
+        db.set_analysis_stage(AnalysisStage::Open);
+        db.reader_graph_mut().intern_read(rule.clone());
+        let at_open = db
+            .reader_graph()
+            .current_fingerprint(&rule, |key| db.fact_fingerprint(key.key()));
+
+        db.set_analysis_stage(AnalysisStage::Closed);
+        let at_closed = db
+            .reader_graph()
+            .current_fingerprint(&rule, |key| db.fact_fingerprint(key.key()));
+
+        assert_ne!(at_open, db.fact_fingerprint(rule.key()), "the rule moves");
+        assert_eq!(at_closed, db.fact_fingerprint(rule.key()));
     }
 }

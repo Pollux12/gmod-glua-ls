@@ -714,9 +714,6 @@ impl Engine {
             .filter(|rule| rule.holds_at(before) != rule.holds_at(stage))
             .map(|rule| HashedKey::new(FactKey::StageRule(rule)))
             .collect::<Vec<_>>();
-        for key in &moved {
-            db.reader_graph().forget_fingerprint(key);
-        }
         self.moved_rules.get_mut().extend(moved.iter().cloned());
         moved
     }
