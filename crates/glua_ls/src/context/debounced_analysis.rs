@@ -79,6 +79,10 @@ pub struct DebouncedAnalysis {
     /// Set once, never re-armed: a dead loop stays dead for process lifetime.
     debounce_loop_alive: AtomicBool,
     in_flight_changes: AtomicUsize,
+    /// Requests waiting for an edited document to be answerable. While any
+    /// waits, a debounce ends at once: the request needs the re-analysis now,
+    /// and only background propagation is worth coalescing.
+    waiting_requests: AtomicUsize,
     notify: Notify,
     reindex_notify: Notify,
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
@@ -94,6 +98,19 @@ pub struct DebouncedAnalysis {
     /// on a handler having reached the wait instead of on a deadline.
     #[cfg(test)]
     freshness_waits: AtomicUsize,
+    /// Debounces a waiting request ended early, so a test can tell one did.
+    #[cfg(test)]
+    expedited_debounces: AtomicUsize,
+}
+
+/// Counts a request among [`DebouncedAnalysis::waiting_requests`] until
+/// dropped.
+struct WaitingRequest<'a>(&'a DebouncedAnalysis);
+
+impl Drop for WaitingRequest<'_> {
+    fn drop(&mut self) {
+        self.0.waiting_requests.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl DebouncedAnalysis {
@@ -116,6 +133,7 @@ impl DebouncedAnalysis {
             prioritised: std::sync::Mutex::default(),
             debounce_loop_alive: AtomicBool::new(true),
             in_flight_changes: AtomicUsize::new(0),
+            waiting_requests: AtomicUsize::new(0),
             notify: Notify::new(),
             reindex_notify: Notify::new(),
             analysis,
@@ -128,7 +146,17 @@ impl DebouncedAnalysis {
             lsp_features,
             #[cfg(test)]
             freshness_waits: AtomicUsize::new(0),
+            #[cfg(test)]
+            expedited_debounces: AtomicUsize::new(0),
         }
+    }
+
+    /// Counts a request as waiting for an edited document and wakes a
+    /// debounce in progress, which then ends at once.
+    fn request_waiting(&self) -> WaitingRequest<'_> {
+        self.waiting_requests.fetch_add(1, Ordering::AcqRel);
+        self.notify.notify_waiters();
+        WaitingRequest(self)
     }
 
     /// Add a file to the pending reindex set and reset the debounce timer.
@@ -293,6 +321,7 @@ impl DebouncedAnalysis {
 
         let started_at = Instant::now();
         let mut warned_stuck = false;
+        let _waiting = self.request_waiting();
 
         loop {
             let notified = self.reindex_notify.notified();
@@ -338,6 +367,7 @@ impl DebouncedAnalysis {
 
         let started_at = Instant::now();
         let mut warned_stuck = false;
+        let _waiting = self.request_waiting();
 
         loop {
             let notified = self.reindex_notify.notified();
@@ -477,6 +507,7 @@ impl DebouncedAnalysis {
         let mut warned_stuck = false;
         let mut in_flight = Duration::ZERO;
         let mut blocked = Duration::ZERO;
+        let _waiting = self.request_waiting();
 
         loop {
             let notified = self.reindex_notify.notified();
@@ -845,10 +876,18 @@ impl DebouncedAnalysis {
                     .then(crate::util::ls_profile::next_reindex_cycle);
                 let debounce_start = crate::util::ls_profile::profile_instant();
                 loop {
+                    let notified = self.notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if self.waiting_requests.load(Ordering::Acquire) > 0 {
+                        #[cfg(test)]
+                        self.expedited_debounces.fetch_add(1, Ordering::AcqRel);
+                        break;
+                    }
                     tokio::select! {
                         biased;
                         _ = self.shutdown.cancelled() => return,
-                        _ = self.notify.notified() => continue,
+                        _ = notified => continue,
                         _ = tokio::time::sleep(self.debounce_duration) => break,
                     }
                 }
@@ -1521,6 +1560,79 @@ mod tests {
             // must not have been rebuilt on the way to its refresh.
             let revision_after = reference_revision(&analysis, consumer_id).await;
             verify_that!(revision_after, eq(revision_before))?;
+            Ok(())
+        })
+    }
+
+    /// A request waiting for an edited document ends the debounce at once
+    /// instead of waiting it out.
+    #[gtest]
+    fn a_request_waiting_on_an_edited_document_skips_the_debounce() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let mut analysis = EmmyLuaAnalysis::new();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_expedite");
+            analysis.add_main_workspace(workspace.clone());
+            let uri = file_path_to_uri(&workspace.join("lua/autorun/shared/edited.lua"))
+                .expect("URI should parse");
+            analysis
+                .update_file_by_uri(&uri, Some("Value = 1\n".to_string()))
+                .map(|(id, _)| id);
+            let analysis = Arc::new(RwLock::new(analysis));
+            let (connection, _peer) = Connection::memory();
+            let client = Arc::new(ClientProxy::new(connection));
+            let status_bar = Arc::new(StatusBar::new(client.clone(), true));
+            let file_diagnostic = Arc::new(FileDiagnostic::new(
+                analysis.clone(),
+                status_bar,
+                client.clone(),
+                false,
+            ));
+            let shared_diagnostic_data_cache = file_diagnostic.shared_diagnostic_data_cache();
+            let debounced_analysis = Arc::new(DebouncedAnalysis::new(
+                analysis.clone(),
+                60_000,
+                CancellationToken::new(),
+                client,
+                file_diagnostic,
+                shared_diagnostic_data_cache,
+                Arc::new(AtomicU8::new(0)),
+                test_lsp_features(),
+            ));
+            let loop_task = tokio::spawn({
+                let debounced_analysis = debounced_analysis.clone();
+                async move { debounced_analysis.run().await }
+            });
+
+            let file_id = analysis
+                .write()
+                .await
+                .update_file_text_only(&uri, "Value = 2\n".to_string())
+                .expect("the file should still exist");
+            debounced_analysis.schedule(file_id, uri.clone()).await;
+            let fresh = tokio::time::timeout(
+                Duration::from_secs(10),
+                debounced_analysis.wait_until_file_fresh_for(
+                    &CancellationToken::new(),
+                    "textDocument/hover",
+                    &uri,
+                ),
+            )
+            .await
+            .expect("the request is answered well before the debounce elapses");
+            verify_that!(fresh, eq(Freshness::Fresh))?;
+            verify_that!(
+                debounced_analysis
+                    .expedited_debounces
+                    .load(Ordering::Acquire),
+                eq(1)
+            )?;
+
+            debounced_analysis.shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(5), loop_task)
+                .await
+                .expect("the loop should stop on shutdown")
+                .expect("the loop task must not panic");
             Ok(())
         })
     }
