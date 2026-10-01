@@ -36,7 +36,7 @@ step() { # name command...: runs, logs, prints a summary line
 
 det() { # corpus jobs env...
   local corpus=$1 jobs=$2; shift 2
-  env DET_CODEBASE="$corpus" DET_ANNOTATIONS="$ANN" DET_JOBS="$jobs" "$@" "$REL/determinism$X"
+  env GLUALS_CHECK_CONVERGENCE=1 DET_CODEBASE="$corpus" DET_ANNOTATIONS="$ANN" DET_JOBS="$jobs" "$@" "$REL/determinism$X"
 }
 
 corpus() { # name dir: glua_check JSON, diffed against VALIDATE_REF/<name>.json when present
@@ -131,6 +131,14 @@ if [ "$TIER" = phase ]; then
   for g in "$GM"/*/; do
     step "gm_$(basename "$g")" det "$g" 4 DET_STAGES=schedule,schedule:deferred
   done
+  # Helix's item registry and config: loops of statements across its item files.
+  [ -d "$GM/helix" ] && step gm_helix_sweep det "$GM/helix" 4 DET_HUBS=4 DET_EACH=1 \
+    DET_ONLY=gamemode/core/libs/sh_item.lua,gamemode/core/meta/sh_item.lua,gamemode/core/sh_config.lua \
+    DET_STAGES=touch,shift,delete,recreate,rename
+  # Typed into while cleared loops settle, with other files put ahead between slices.
+  [ -d "$GM/helix" ] && step gm_helix_typing det "$GM/helix" 4 DET_TARGETS=gamemode/core/libs/sh_item.lua \
+    DET_EDIT_FIND='function ix.item.Get(identifier)' DET_EDIT_REPLACE='function ix.item.Get(identifier, extra)' \
+    DET_STAGES=typing,gate
   step cityrp_corpus corpus cityrp "$CR"
   step cityrp_det det "$CR" 2 DET_EDITS="$OUT/cityrp.edits" DET_HUBS=5 DET_ONLY="$CR_CORE" \
     DET_STAGES=$TARGET_STAGES,shift,rename
