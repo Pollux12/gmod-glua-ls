@@ -55,6 +55,33 @@ mod test {
         assert_eq!(ws.expr_ty("result"), LuaType::Integer);
     }
 
+    /// A branch returning `any` sits beside the others as one more arm, the
+    /// same whether or not another branch may be nil: a branch that learns it
+    /// can be nil must not take the rest of the return with it.
+    #[test]
+    fn an_any_branch_keeps_a_nullable_branch_beside_it() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@type string?
+            local name
+
+            ---@return any
+            local function anything() end
+
+            function Pick(flag)
+                if flag then
+                    return name
+                end
+                return anything()
+            end
+            "#,
+        );
+
+        let picked = ws.expr_ty("Pick(true)");
+        assert_eq!(ws.humanize_type(picked), "(any|string)?");
+    }
+
     #[test]
     fn test_flow() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();

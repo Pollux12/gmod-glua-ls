@@ -2484,7 +2484,7 @@ fn should_union_any_as_unknown(typ: &LuaType) -> bool {
             | LuaType::Nil
             | LuaType::BooleanConst(_)
             | LuaType::DocBooleanConst(_)
-    ) && !typ.is_nullable()
+    )
 }
 
 #[cfg(test)]
