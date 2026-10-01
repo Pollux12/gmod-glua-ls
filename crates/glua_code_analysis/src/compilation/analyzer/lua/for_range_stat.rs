@@ -12,7 +12,7 @@ use crate::{
     LuaTypeCache, TplContext, TypeOps, TypeSubstitutor, VariadicType,
     compilation::analyzer::{
         common::TypeCacheWriteMode, dynamic_field::for_range_pairs_source_for_var,
-        is_provably_builtin_iterator_call,
+        is_provably_builtin_iterator_call, writes_own_pairs_key,
     },
     get_member_map, infer_expr, instantiate_doc_function, tpl_pattern_match_args,
 };
@@ -488,19 +488,20 @@ fn try_infer_pairs_iter_types_from_table_members(
     //
     // A member filed by writing an iterated table back through a loop's own
     // key variable (`T[k] = v` inside `for k in pairs(T)`, in this loop or any
-    // other over `T`) is feedback, not evidence: its key was minted from that
-    // loop variable's settling answer, which is this very domain, so counting
-    // it would widen the domain being derived. Such a member is excluded from
-    // the key domain — and from the sampling decision — only when every
-    // writer under the key is one of these write-backs and its key variable
-    // was not reassigned before the write; a reassigned key or an independent
-    // writer under the same key is real computed-key evidence.
-    let self_write_only = |member_infos: &[LuaMemberInfo]| {
+    // other over `T`; see `is_pairs_write_back` for how `T` is matched) is feedback,
+    // not evidence: its key was minted from that loop variable's settling
+    // answer, which is this very domain, so counting it would widen the domain
+    // being derived. Such a member is excluded from the key domain — and from
+    // the sampling decision — only when every writer under the key is one of
+    // these write-backs and its key variable was not reassigned before the
+    // write; a reassigned key or an independent writer under the same key is
+    // real computed-key evidence.
+    let mut self_write_only = |member_infos: &[LuaMemberInfo]| {
         !member_infos.is_empty()
             && member_infos.iter().all(|member| {
                 matches!(
                     &member.property_owner_id,
-                    Some(LuaSemanticDeclId::Member(member_id)) if is_pairs_write_back(db, member_id)
+                    Some(LuaSemanticDeclId::Member(member_id)) if is_pairs_write_back(db, cache, member_id)
                 )
             })
     };
@@ -566,15 +567,23 @@ fn try_infer_pairs_iter_types_from_table_members(
 }
 
 /// Whether `member_id` writes a table back through the key variable of a
-/// `pairs` loop over that same table, unreassigned before the write.
-fn is_pairs_write_back(db: &DbIndex, member_id: &LuaMemberId) -> bool {
+/// `pairs` loop over that same table, unreassigned before the write: a loop
+/// over the table as the write spells it, or, in the file being analysed, one
+/// every table of which is the table written. A write in another file is
+/// judged by its spelling alone: inferring what its loop iterates would read
+/// that file's text, so every edit of it would reach this file.
+fn is_pairs_write_back(db: &DbIndex, cache: &mut LuaInferCache, member_id: &LuaMemberId) -> bool {
     let Some(index_expr) = written_index_expr(db, member_id) else {
         return false;
     };
     let Some(LuaIndexKey::Expr(LuaExpr::NameExpr(key_name))) = index_expr.get_index_key() else {
         return false;
     };
-    is_unreassigned_loop_var_over(db, member_id.file_id, &key_name, 0, &index_expr)
+    if is_unreassigned_loop_var_over(db, member_id.file_id, &key_name, 0, &index_expr) {
+        return true;
+    }
+    member_id.file_id == cache.get_file_id()
+        && writes_own_pairs_key(db, cache, &index_expr).is_some()
 }
 
 /// Whether `member_id` writes the value variable of a `pairs` loop over the

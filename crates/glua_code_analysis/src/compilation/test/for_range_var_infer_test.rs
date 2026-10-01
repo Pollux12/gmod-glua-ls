@@ -1199,6 +1199,38 @@ RadioNum = 0
         );
     }
 
+    /// The same feedback written through another name for the iterated table:
+    /// `A` is `T`, so `A[k] = v` mints its key from the very domain the loop
+    /// derives, and the domain stays exactly the member names.
+    #[test]
+    fn pairs_write_back_through_an_alias_keeps_exact_key_domain() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_ids = ws.def_files(vec![(
+            "lua/autorun/a_pairs_alias_write.lua",
+            r#"
+            local T = { a = "x", b = "y" }
+            local A = T
+            for k, v in pairs(T) do
+                A[k] = v
+                local observed_key = k
+            end
+            "#,
+        )]);
+
+        let key_ty = settled_assign_decl_cached_ty(&mut ws, file_ids[0], "observed_key")
+            .expect("observed_key cache");
+        let expected_keys: HashSet<_> = vec![
+            LuaType::StringConst(SmolStr::new("a").into()),
+            LuaType::StringConst(SmolStr::new("b").into()),
+        ]
+        .into_iter()
+        .collect();
+        let LuaType::Union(key_union) = &key_ty else {
+            panic!("expected exact key domain union, got {key_ty:?}");
+        };
+        assert_eq!(key_union.into_set(), expected_keys);
+    }
+
     /// The same write is genuine evidence when the key is unknowable on its
     /// own: `k` reassigned from an untyped call result before `T[k] = v` must
     /// still file an `ExprType(Unknown)` member on `T`. Filtering
