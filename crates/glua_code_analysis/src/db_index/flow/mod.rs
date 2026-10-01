@@ -4,8 +4,10 @@ mod flow_tree;
 use rowan::{TextRange, TextSize};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
+use std::hash::{Hash, Hasher};
+
 use crate::{
-    FileId, LuaSignatureId, LuaType, VarRefId,
+    FileId, InFiled, LuaSignatureId, LuaType, VarRefId,
     db_index::{
         LuaOperatorId, LuaOperatorOwner, LuaTypeDeclId,
         derivation::{self, FactKey, Fingerprint},
@@ -270,11 +272,20 @@ impl LuaFlowIndex {
                     .special_call_effects
                     .get(file_id)
                     .and_then(|effects| effects.get(position));
-                let facts = self
-                    .special_call_fact_fingerprints
-                    .get(&(*file_id, *position))
-                    .copied()
-                    .unwrap_or(0);
+                // The sums are folded as the facts were installed; mapped
+                // back, each fact hashes as it stood before the edits.
+                let facts = if derivation::mapping_back() {
+                    self.settled_special_call_facts
+                        .iter()
+                        .filter(|fact| fact.site() == (*file_id, *position))
+                        .map(derivation::fingerprint_of)
+                        .fold(0, Fingerprint::wrapping_add)
+                } else {
+                    self.special_call_fact_fingerprints
+                        .get(&(*file_id, *position))
+                        .copied()
+                        .unwrap_or(0)
+                };
                 if effects.is_none() && facts == 0 {
                     return derivation::ABSENT;
                 }
@@ -349,7 +360,7 @@ pub struct LuaSpecialCallEffect {
 /// prefix-derived callable details as applicable). Two settlements that
 /// install the same fact build the same key however far apart the pass visits
 /// them, so the second is always recognised as a replay.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpecialCallFact {
     /// A `---@param x \`T\`` class synthesized for a call-site argument.
     StrTplDecl {
@@ -388,6 +399,71 @@ pub enum SpecialCallFact {
         target: VarRefId,
         type_ref: LuaType,
     },
+}
+
+/// Positions hash as [`InFiled`] ones, so a fingerprint taken with edits mapped
+/// back sees them where they stood before the edits.
+impl Hash for SpecialCallFact {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::StrTplDecl {
+                site_file,
+                site_position,
+                class,
+                constraint,
+                param_idx,
+                is_colon_define,
+                is_colon_call,
+            } => {
+                InFiled::new(*site_file, *site_position).hash(state);
+                class.hash(state);
+                constraint.hash(state);
+                param_idx.hash(state);
+                is_colon_define.hash(state);
+                is_colon_call.hash(state);
+            }
+            Self::SuperEdge {
+                site_file,
+                site_position,
+                child,
+                super_type,
+                source_file,
+                source_range,
+            } => {
+                InFiled::new(*site_file, *site_position).hash(state);
+                child.hash(state);
+                super_type.hash(state);
+                InFiled::new(*source_file, *source_range).hash(state);
+            }
+            Self::CallOperator {
+                site_file,
+                site_position,
+                operator,
+                owner,
+                signature,
+                strip_self,
+                return_self,
+            } => {
+                InFiled::new(*site_file, *site_position).hash(state);
+                InFiled::new(operator.file_id, operator.position).hash(state);
+                owner.hash(state);
+                signature.hash(state);
+                strip_self.hash(state);
+                return_self.hash(state);
+            }
+            Self::FlowEffect {
+                site_file,
+                site_position,
+                target,
+                type_ref,
+            } => {
+                InFiled::new(*site_file, *site_position).hash(state);
+                target.hash(state);
+                type_ref.hash(state);
+            }
+        }
+    }
 }
 
 impl SpecialCallFact {
@@ -564,6 +640,48 @@ mod tests {
         let seen = derivation::in_file(Some(file_id), || before.fact_fingerprint(&key));
         let held = derivation::fingerprint_before_edits(&edits, || {
             derivation::in_file(Some(file_id), || after.fact_fingerprint(&key))
+        });
+
+        assert_eq!(held, seen);
+    }
+
+    /// A call site's installed facts that only moved fingerprint as they did
+    /// before the move once it is mapped back, so a reader in another file
+    /// holds.
+    #[test]
+    fn a_shifted_call_sites_special_call_facts_hold_with_the_shift_mapped_back() {
+        let file_id = FileId::new(1);
+        let text = "0123456789abcdefghijklmnopqrstuv";
+        let mut before = LuaFlowIndex::new();
+        before.install_special_call_facts(
+            file_id,
+            TextSize::new(16),
+            [super_edge_fact((file_id, TextSize::new(16)), 4)],
+        );
+        let mut after = LuaFlowIndex::new();
+        after.install_special_call_facts(
+            file_id,
+            TextSize::new(17),
+            [super_edge_fact((file_id, TextSize::new(17)), 5)],
+        );
+        let edits = derivation::EditMaps::new([(
+            file_id,
+            crate::PositionMap::new(
+                text,
+                &format!(
+                    "
+{text}"
+                ),
+            ),
+        )]);
+
+        let seen = derivation::in_file(Some(file_id), || {
+            before.fact_fingerprint(&FactKey::SpecialCall(file_id, TextSize::new(16)))
+        });
+        let held = derivation::fingerprint_before_edits(&edits, || {
+            derivation::in_file(Some(file_id), || {
+                after.fact_fingerprint(&FactKey::SpecialCall(file_id, TextSize::new(17)))
+            })
         });
 
         assert_eq!(held, seen);
