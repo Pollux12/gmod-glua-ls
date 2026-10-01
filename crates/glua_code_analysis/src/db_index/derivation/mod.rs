@@ -1012,6 +1012,11 @@ pub struct Evaluation {
     log: Vec<KeyIdx>,
     /// The slots of the log, each once.
     read: Vec<KeyIdx>,
+    /// The keys read since the evaluation began or last resumed, each once:
+    /// where each was last logged and whether reading it taints.
+    local: Vec<LocalRead>,
+    /// The entry of `local` each slot of the lent table read has.
+    by_slot: rustc_hash::FxHashMap<KeyIdx, u32>,
     /// The open frames, innermost last; see [`frames`].
     frames: Vec<frames::Frame>,
     /// References the open frames read as walking from no keyed origin, once
@@ -1031,8 +1036,12 @@ pub struct Evaluation {
     /// Keys already read that an owner identity and a name name, see
     /// [`note_named_read`].
     named_reads: hashbrown::HashTable<NamedRead>,
-    /// Cheap identities of keys already in `reads`, see [`note_read_by`].
-    read_identities: rustc_hash::FxHashMap<(u8, u128), KeyIdx>,
+    /// Cheap identities of keys already read, each with its entry of
+    /// `local`; see [`note_read_by`].
+    read_identities: rustc_hash::FxHashMap<(u8, u128), u32>,
+    /// Keys already read that no identity names, each with its entry of
+    /// `local`.
+    plain_reads: hashbrown::HashTable<(HashedKey, u32)>,
     outputs: FxHashSet<HashedKey>,
     /// Keys the evaluation re-filed without producing them, see [`rehoming`].
     moved: FxHashSet<HashedKey>,
@@ -1208,19 +1217,39 @@ pub(crate) fn records_read(
         && !(own && (key.is_file_source() || id.kind == DerivationKind::Source))
 }
 
+/// What this thread records into, kept in one thread-local so a read looks it
+/// up once.
+struct Recorder {
+    /// The evaluation recording.
+    current: Option<Evaluation>,
+    /// The key table lent to this thread; see [`lend_keys`].
+    keys: Option<KeyTable>,
+    /// The reader graph evaluations read without a lent table.
+    view: Option<std::sync::Arc<ReaderGraph>>,
+    /// How deep [`untracked`] regions nest.
+    untracked: u32,
+    /// How deep [`rehoming`] regions nest.
+    rehoming: u32,
+    /// The reads noted, duplicates included; see [`take_noted_reads`].
+    noted: u64,
+}
+
 thread_local! {
-    static KEYS: RefCell<Option<KeyTable>> = const { RefCell::new(None) };
+    static RECORDER: RefCell<Recorder> = const {
+        RefCell::new(Recorder {
+            current: None,
+            keys: None,
+            view: None,
+            untracked: 0,
+            rehoming: 0,
+            noted: 0,
+        })
+    };
     static LAST_WRITE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static CURRENT: RefCell<Option<Evaluation>> = const { RefCell::new(None) };
     /// Evaluations suspended on this thread by one begun inside them.
     static SUSPENDED: RefCell<Vec<Evaluation>> = const { RefCell::new(Vec::new()) };
-    static UNTRACKED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    static REHOMING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static WRITE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CAPTURED: RefCell<Option<FxHashSet<HashedKey>>> = const { RefCell::new(None) };
-    static NOTED_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// The reader graph evaluations on this thread read without a lent table.
-    static VIEW: RefCell<Option<std::sync::Arc<ReaderGraph>>> = const { RefCell::new(None) };
     /// The lookups of evaluations that ended, for the next ones to begin with.
     static SPARE: RefCell<Vec<Spare>> = const { RefCell::new(Vec::new()) };
     /// The evaluations to run again; see [`rerun_current`].
@@ -1230,7 +1259,7 @@ thread_local! {
 /// Lets evaluations on this thread reuse memoised values against `graph`
 /// without a lent table, until the returned guard drops.
 pub fn view_graph(graph: std::sync::Arc<ReaderGraph>) -> ViewedGraph {
-    VIEW.with(|view| *view.borrow_mut() = Some(graph));
+    RECORDER.with_borrow_mut(|recorder| recorder.view = Some(graph));
     ViewedGraph
 }
 
@@ -1240,17 +1269,23 @@ pub struct ViewedGraph;
 
 impl Drop for ViewedGraph {
     fn drop(&mut self) {
-        VIEW.with(|view| view.borrow_mut().take());
+        RECORDER.with_borrow_mut(|recorder| recorder.view = None);
     }
 }
 
 /// Runs `f` on the evaluation recording on this thread and the graph it
 /// views, if there are both.
 fn with_viewed<T>(f: impl FnOnce(&mut Evaluation, &ReaderGraph) -> T) -> Option<T> {
-    CURRENT.with(|current| {
-        let mut current = current.borrow_mut();
-        let evaluation = current.as_mut()?;
-        VIEW.with(|view| view.borrow().as_deref().map(|graph| f(evaluation, graph)))
+    RECORDER.with_borrow_mut(|recorder| {
+        let Recorder {
+            current: Some(evaluation),
+            view: Some(graph),
+            ..
+        } = recorder
+        else {
+            return None;
+        };
+        Some(f(evaluation, graph))
     })
 }
 
@@ -1258,7 +1293,7 @@ fn with_viewed<T>(f: impl FnOnce(&mut Evaluation, &ReaderGraph) -> T) -> Option<
 /// moves facts other derivations produced, whose readers must be re-checked.
 pub fn capture_writes(f: impl FnOnce()) -> FxHashSet<HashedKey> {
     debug_assert!(
-        CURRENT.with(|current| current.borrow().is_none()),
+        RECORDER.with_borrow(|recorder| recorder.current.is_none()),
         "writes captured inside an evaluation"
     );
     let previous = CAPTURED.with(|captured| captured.replace(Some(FxHashSet::default())));
@@ -1278,9 +1313,9 @@ pub fn write_generation() -> u64 {
 /// lookup that only decides where a write is stored, when the index keeps
 /// that placement consistent itself whatever the order of writes.
 pub fn untracked<T>(f: impl FnOnce() -> T) -> T {
-    UNTRACKED.with(|depth| depth.set(depth.get() + 1));
+    RECORDER.with_borrow_mut(|recorder| recorder.untracked += 1);
     let result = f();
-    UNTRACKED.with(|depth| depth.set(depth.get() - 1));
+    RECORDER.with_borrow_mut(|recorder| recorder.untracked -= 1);
     result
 }
 
@@ -1290,28 +1325,29 @@ pub fn untracked<T>(f: impl FnOnce() -> T) -> T {
 /// readers are re-checked, but the current derivation does not become one of
 /// their producers.
 pub fn rehoming<T>(f: impl FnOnce() -> T) -> T {
-    REHOMING.with(|depth| depth.set(depth.get() + 1));
+    RECORDER.with_borrow_mut(|recorder| recorder.rehoming += 1);
     let result = f();
-    REHOMING.with(|depth| depth.set(depth.get() - 1));
+    RECORDER.with_borrow_mut(|recorder| recorder.rehoming -= 1);
     result
 }
 
 /// Lends `table` to this thread: evaluations begun until [`take_keys`]
 /// intern their reads as they make them.
 pub fn lend_keys(table: KeyTable) {
-    KEYS.with(|keys| *keys.borrow_mut() = Some(table));
+    RECORDER.with_borrow_mut(|recorder| recorder.keys = Some(table));
 }
 
 /// Takes back the table [`lend_keys`] lent.
 pub fn take_keys() -> KeyTable {
-    KEYS.with(|keys| keys.borrow_mut().take())
+    RECORDER
+        .with_borrow_mut(|recorder| recorder.keys.take())
         .expect("take_keys without lend_keys")
 }
 
 /// Drops a lent table left behind by an evaluation that unwound, so later
 /// evaluations on this thread do not intern into it.
 pub fn forget_lent_keys() {
-    KEYS.with(|keys| keys.borrow_mut().take());
+    RECORDER.with_borrow_mut(|recorder| recorder.keys = None);
 }
 
 /// Starts recording the evaluation of `id` on this thread.
@@ -1324,6 +1360,8 @@ pub fn begin(id: DerivationId) {
         id,
         log: Vec::new(),
         read: Vec::new(),
+        local: spare.local,
+        by_slot: spare.by_slot,
         frames: spare.frames,
         unkeyed: spare.unkeyed,
         checks: FxHashSet::default(),
@@ -1333,6 +1371,7 @@ pub fn begin(id: DerivationId) {
         viewed: FxHashSet::default(),
         read_identities: spare.read_identities,
         named_reads: spare.named_reads,
+        plain_reads: spare.plain_reads,
         outputs: FxHashSet::default(),
         moved: FxHashSet::default(),
         staged: rustc_hash::FxHashMap::default(),
@@ -1343,8 +1382,11 @@ pub fn begin(id: DerivationId) {
 /// the next evaluation on the thread to begin with.
 #[derive(Default)]
 struct Spare {
-    read_identities: rustc_hash::FxHashMap<(u8, u128), KeyIdx>,
+    local: Vec<LocalRead>,
+    by_slot: rustc_hash::FxHashMap<KeyIdx, u32>,
+    read_identities: rustc_hash::FxHashMap<(u8, u128), u32>,
     named_reads: hashbrown::HashTable<NamedRead>,
+    plain_reads: hashbrown::HashTable<(HashedKey, u32)>,
     frames: Vec<frames::Frame>,
     unkeyed: Vec<u64>,
 }
@@ -1359,20 +1401,28 @@ const SPARE_DEPTH: usize = 8;
 impl Spare {
     /// Takes `evaluation`'s lookups, emptied, if they are small enough to keep.
     fn take(evaluation: &mut Evaluation) -> Self {
+        fn kept<T: Default>(lookup: &mut T, capacity: impl Fn(&T) -> usize) -> T {
+            let lookup = std::mem::take(lookup);
+            if capacity(&lookup) > SPARE_ROOM {
+                T::default()
+            } else {
+                lookup
+            }
+        }
         let mut spare = Self {
-            read_identities: std::mem::take(&mut evaluation.read_identities),
-            named_reads: std::mem::take(&mut evaluation.named_reads),
+            local: kept(&mut evaluation.local, Vec::capacity),
+            by_slot: kept(&mut evaluation.by_slot, |map| map.capacity()),
+            read_identities: kept(&mut evaluation.read_identities, |map| map.capacity()),
+            named_reads: kept(&mut evaluation.named_reads, hashbrown::HashTable::capacity),
+            plain_reads: kept(&mut evaluation.plain_reads, hashbrown::HashTable::capacity),
             frames: std::mem::take(&mut evaluation.frames),
             unkeyed: std::mem::take(&mut evaluation.unkeyed),
         };
-        if spare.read_identities.capacity() > SPARE_ROOM {
-            spare.read_identities = Default::default();
-        }
-        if spare.named_reads.capacity() > SPARE_ROOM {
-            spare.named_reads = Default::default();
-        }
+        spare.local.clear();
+        spare.by_slot.clear();
         spare.read_identities.clear();
         spare.named_reads.clear();
+        spare.plain_reads.clear();
         spare.frames.clear();
         spare.unkeyed.clear();
         spare
@@ -1383,11 +1433,11 @@ impl Spare {
 /// is suspended until `evaluation` ends: a thread waiting in the pool runs
 /// other work, which may record its own evaluation.
 fn start(evaluation: Evaluation) {
-    CURRENT.with(|current| {
-        if let Some(previous) = current.borrow_mut().replace(evaluation) {
-            SUSPENDED.with(|suspended| suspended.borrow_mut().push(previous));
-        }
-    });
+    if let Some(previous) =
+        RECORDER.with_borrow_mut(|recorder| recorder.current.replace(evaluation))
+    {
+        SUSPENDED.with(|suspended| suspended.borrow_mut().push(previous));
+    }
 }
 
 /// Runs `f` as the evaluation of `id`, nested in whatever this thread is
@@ -1395,17 +1445,23 @@ fn start(evaluation: Evaluation) {
 /// suspended evaluation's key table, view and untracked or re-homing regions
 /// do not apply to it, so what it read can be filed whatever it ran inside.
 pub fn detached<T>(id: DerivationId, f: impl FnOnce() -> T) -> (T, Vec<HashedKey>) {
-    let keys = KEYS.with(|keys| keys.borrow_mut().take());
-    let view = VIEW.with(|view| view.borrow_mut().take());
-    let untracked = UNTRACKED.with(|depth| depth.replace(0));
-    let rehoming = REHOMING.with(|depth| depth.replace(0));
+    let (keys, view, untracked, rehoming) = RECORDER.with_borrow_mut(|recorder| {
+        (
+            recorder.keys.take(),
+            recorder.view.take(),
+            std::mem::replace(&mut recorder.untracked, 0),
+            std::mem::replace(&mut recorder.rehoming, 0),
+        )
+    });
     begin(id);
     let result = f();
     let evaluation = end();
-    KEYS.with(|slot| *slot.borrow_mut() = keys);
-    VIEW.with(|slot| *slot.borrow_mut() = view);
-    UNTRACKED.with(|depth| depth.set(untracked));
-    REHOMING.with(|depth| depth.set(rehoming));
+    RECORDER.with_borrow_mut(|recorder| {
+        recorder.keys = keys;
+        recorder.view = view;
+        recorder.untracked = untracked;
+        recorder.rehoming = rehoming;
+    });
     let (_, reads, _) = evaluation.into_unfingerprinted_parts();
     (result, reads.into_iter().map(|(key, _)| key).collect())
 }
@@ -1413,21 +1469,20 @@ pub fn detached<T>(id: DerivationId, f: impl FnOnce() -> T) -> (T, Vec<HashedKey
 /// Continues recording an evaluation that [`end`] handed back, for a
 /// derivation evaluated in stages.
 pub fn resume(mut evaluation: Evaluation) {
-    // Slots other evaluations logged since it began would read as logged by
-    // it.
+    // Its lookups went back to the thread when it ended, so it notes its
+    // reads afresh, and memos it reused before replay into it again.
     evaluation.stamp = next_stamp();
-    // Identities noted without this thread's key table name no slot in it.
-    evaluation.read_identities.clear();
-    evaluation.named_reads.clear();
     start(evaluation);
 }
 
 /// Stops recording and hands back what the evaluation read and wrote.
 pub fn end() -> Evaluation {
-    let mut evaluation = CURRENT.with(|current| {
-        let mut current = current.borrow_mut();
-        let evaluation = current.take().expect("derivation::end without begin");
-        *current = SUSPENDED.with(|suspended| suspended.borrow_mut().pop());
+    let mut evaluation = RECORDER.with_borrow_mut(|recorder| {
+        let evaluation = recorder
+            .current
+            .take()
+            .expect("derivation::end without begin");
+        recorder.current = SUSPENDED.with(|suspended| suspended.borrow_mut().pop());
         evaluation
     });
     evaluation.log_handle.freeze(&evaluation.log);
@@ -1445,28 +1500,43 @@ pub fn end() -> Evaluation {
 /// Whether a key table is lent to this thread.
 #[cfg(test)]
 pub fn keys_lent() -> bool {
-    KEYS.with(|keys| keys.borrow().is_some())
+    RECORDER.with_borrow(|recorder| recorder.keys.is_some())
 }
 
 /// Whether an evaluation is recording on this thread. Callers building a
 /// costly key check this first.
 #[inline]
 pub fn recording() -> bool {
-    CURRENT.with(|current| current.borrow().is_some())
+    RECORDER.with_borrow(|recorder| recorder.current.is_some())
         || CAPTURED.with(|captured| captured.borrow().is_some())
+}
+
+/// The evaluation recording on this thread, outside untracked regions, with
+/// the table lent to it and the graph it views; counts the read noted.
+#[inline]
+fn noting<T>(
+    f: impl FnOnce(&mut Evaluation, Option<&mut KeyTable>, Option<&ReaderGraph>) -> T,
+) -> Option<T> {
+    RECORDER.with_borrow_mut(|recorder| {
+        let Recorder {
+            current: Some(evaluation),
+            keys,
+            view,
+            untracked: 0,
+            noted,
+            ..
+        } = recorder
+        else {
+            return None;
+        };
+        *noted += 1;
+        Some(f(evaluation, keys.as_mut(), view.as_deref()))
+    })
 }
 
 /// Records a read of `key` by the current evaluation.
 pub fn note_read(key: impl FnOnce() -> FactKey) {
-    if UNTRACKED.with(|depth| depth.get() > 0) {
-        return;
-    }
-    CURRENT.with(|current| {
-        if let Some(evaluation) = current.borrow_mut().as_mut() {
-            NOTED_READS.with(|count| count.set(count.get() + 1));
-            record_read(evaluation, HashedKey::new(key()));
-        }
-    });
+    noting(|evaluation, table, view| evaluation.note_key(table, view, HashedKey::new(key())));
 }
 
 /// Orders every evaluation, frame and write on every thread: a key table keeps
@@ -1487,51 +1557,123 @@ fn latest_stamp() -> u64 {
     STAMP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A key an evaluation read, as it keeps it while it records.
+#[derive(Debug, Clone, Copy)]
+struct LocalRead {
+    /// Its slot in the lent table.
+    slot: KeyIdx,
+    /// One past where the log last took it (0: nowhere).
+    logged: u32,
+    /// Whether reading it taints the open frames (see [`KeyTable::taints`]),
+    /// which does not change while the evaluation records.
+    taints: bool,
+}
+
+/// The entry of a read made without a lent table: nothing logs it.
+const UNLOGGED: u32 = u32::MAX;
+
 impl Evaluation {
     /// The stamp of the innermost open frame, or of the evaluation.
     fn frame_stamp(&self) -> u64 {
         self.frames.last().map_or(self.stamp, |frame| frame.stamp)
     }
 
-    fn log_slot(&mut self, table: &mut KeyTable, slot: KeyIdx) {
-        if let Some(first) = table.log(slot, self.frame_stamp(), self.stamp, latest_stamp()) {
-            self.log.push(slot);
-            if first {
-                self.read.push(slot);
-            }
+    /// Where the reads of the innermost open frame begin in the log, 0 with
+    /// none open.
+    fn frame_start(&self) -> u32 {
+        self.frames.last().map_or(0, |frame| frame.start)
+    }
+
+    /// Logs the read `local` into the innermost open frame, unless the
+    /// frame holds it already.
+    #[inline]
+    fn log_local(&mut self, local: u32) {
+        let start = self.frame_start();
+        let entry = &mut self.local[local as usize];
+        if entry.logged > start {
+            return;
+        }
+        entry.logged = u32::try_from(self.log.len() + 1).expect("fewer than 2^32 reads");
+        self.log.push(entry.slot);
+    }
+
+    /// The entry of `local` for `slot` of the lent table, made on its first
+    /// read.
+    fn local_of(&mut self, table: &KeyTable, slot: KeyIdx) -> u32 {
+        let local = &mut self.local;
+        let read = &mut self.read;
+        *self.by_slot.entry(slot).or_insert_with(|| {
+            read.push(slot);
+            local.push(LocalRead {
+                slot,
+                logged: 0,
+                taints: table.taints(slot),
+            });
+            u32::try_from(local.len() - 1).expect("fewer than 2^32 reads")
+        })
+    }
+
+    /// Records again the read the entry `local` keeps.
+    #[inline]
+    fn reread(&mut self, local: u32) {
+        if local == UNLOGGED {
+            return;
+        }
+        self.log_local(local);
+        if self.local[local as usize].taints {
+            frames::taint_evaluation(self);
         }
     }
-}
 
-/// Records a read of `key`, interned if a key table is lent, else as its
-/// slot in the viewed graph if it has one. Returns its slot in the lent table.
-fn record_read(evaluation: &mut Evaluation, key: HashedKey) -> Option<KeyIdx> {
-    KEYS.with(|keys| match keys.borrow_mut().as_mut() {
-        Some(table) => {
-            let slot = table.intern_read(key, evaluation.stamp);
-            evaluation.log_slot(table, slot);
-            if table.taints(slot) {
-                frames::taint_evaluation(evaluation);
-            }
-            Some(slot)
-        }
-        None => {
-            let viewed = VIEW.with(|view| {
-                view.borrow()
-                    .as_deref()
-                    .and_then(|graph| graph.find_slot(&key))
-            });
-            match viewed {
+    /// Records the first read of `key` since the evaluation began or resumed:
+    /// interned and logged if a key table is lent, else as its slot in the
+    /// viewed graph if it has one. Returns its entry of `local`, or
+    /// [`UNLOGGED`].
+    fn first_read(
+        &mut self,
+        table: Option<&mut KeyTable>,
+        view: Option<&ReaderGraph>,
+        key: &HashedKey,
+    ) -> u32 {
+        let Some(table) = table else {
+            match view.and_then(|graph| graph.find_slot(key)) {
                 Some(slot) => {
-                    evaluation.viewed.insert(slot);
+                    self.viewed.insert(slot);
                 }
                 None => {
-                    evaluation.reads.insert(key);
+                    self.reads.insert(key.clone());
                 }
             }
-            None
+            return UNLOGGED;
+        };
+        let slot = table.intern_read(key, self.stamp);
+        let local = self.local_of(table, slot);
+        self.reread(local);
+        local
+    }
+
+    /// Records a read of `key`, which no identity names.
+    fn note_key(
+        &mut self,
+        table: Option<&mut KeyTable>,
+        view: Option<&ReaderGraph>,
+        key: HashedKey,
+    ) {
+        if let Some((_, local)) = self.plain_reads.find(key.hash, |(read, _)| *read == key) {
+            let local = *local;
+            self.reread(local);
+            return;
         }
-    })
+        let local = self.first_read(table, view, &key);
+        self.plain_reads
+            .insert_unique(key.hash, (key, local), |(read, _)| read.hash);
+    }
+
+    /// Records a read of `slot` of the lent table that a reused value made.
+    fn replay(&mut self, table: &KeyTable, slot: KeyIdx) {
+        let local = self.local_of(table, slot);
+        self.log_local(local);
+    }
 }
 
 /// Records a read of `key`, which `identity` names exactly: a repeat within
@@ -1539,41 +1681,28 @@ fn record_read(evaluation: &mut Evaluation, key: HashedKey) -> Option<KeyIdx> {
 /// key. The identity must be unique to the key for as long as the recorded
 /// key lives.
 fn note_read_by(identity: (u8, u128), key: impl FnOnce() -> FactKey) {
-    if UNTRACKED.with(|depth| depth.get() > 0) {
-        return;
-    }
-    CURRENT.with(|current| {
-        if let Some(evaluation) = current.borrow_mut().as_mut() {
-            NOTED_READS.with(|count| count.set(count.get() + 1));
-            match evaluation.read_identities.get(&identity).copied() {
-                Some(slot) => KEYS.with(|keys| {
-                    if let Some(table) = keys.borrow_mut().as_mut() {
-                        evaluation.log_slot(table, slot);
-                        if table.taints(slot) {
-                            frames::taint_evaluation(evaluation);
-                        }
-                    }
-                }),
-                None => {
-                    if let Some(slot) = record_read(evaluation, HashedKey::new(key())) {
-                        evaluation.read_identities.insert(identity, slot);
-                    } else {
-                        evaluation.read_identities.insert(identity, KeyIdx::MAX);
-                    }
-                }
+    noting(
+        |evaluation, table, view| match evaluation.read_identities.get(&identity) {
+            Some(local) => {
+                let local = *local;
+                evaluation.reread(local);
             }
-        }
-    });
+            None => {
+                let local = evaluation.first_read(table, view, &HashedKey::new(key()));
+                evaluation.read_identities.insert(identity, local);
+            }
+        },
+    );
 }
 
 /// A read [`note_named_read`] recorded: the owner identity and name that
-/// name the key, and its slot ([`KeyIdx::MAX`]: none, no table lent).
+/// name the key, and its entry of [`Evaluation::local`].
 #[derive(Debug)]
 struct NamedRead {
     tag: u8,
     owner: u128,
     name: Option<SmolStr>,
-    slot: KeyIdx,
+    local: u32,
 }
 
 fn named_read_hash(tag: u8, owner: u128, name: Option<&str>) -> u64 {
@@ -1585,40 +1714,25 @@ fn named_read_hash(tag: u8, owner: u128, name: Option<&str>) -> u64 {
 /// and `name` name exactly under `tag`: a repeat within the evaluation is one
 /// probe of a small table, without building the key or its name.
 fn note_named_read(tag: u8, owner: u128, name: Option<&str>, key: impl FnOnce() -> FactKey) {
-    if UNTRACKED.with(|depth| depth.get() > 0) {
-        return;
-    }
-    CURRENT.with(|current| {
-        let mut current = current.borrow_mut();
-        let Some(evaluation) = current.as_mut() else {
-            return;
-        };
-        NOTED_READS.with(|count| count.set(count.get() + 1));
+    noting(|evaluation, table, view| {
         let hash = named_read_hash(tag, owner, name);
         let found = evaluation
             .named_reads
             .find(hash, |read| {
                 read.tag == tag && read.owner == owner && read.name.as_deref() == name
             })
-            .map(|read| read.slot);
+            .map(|read| read.local);
         match found {
-            Some(slot) => KEYS.with(|keys| {
-                if let Some(table) = keys.borrow_mut().as_mut() {
-                    evaluation.log_slot(table, slot);
-                    if table.taints(slot) {
-                        frames::taint_evaluation(evaluation);
-                    }
-                }
-            }),
+            Some(local) => evaluation.reread(local),
             None => {
-                let slot = record_read(evaluation, HashedKey::new(key())).unwrap_or(KeyIdx::MAX);
+                let local = evaluation.first_read(table, view, &HashedKey::new(key()));
                 evaluation.named_reads.insert_unique(
                     hash,
                     NamedRead {
                         tag,
                         owner,
                         name: name.map(SmolStr::new),
-                        slot,
+                        local,
                     },
                     |read| named_read_hash(read.tag, read.owner, read.name.as_deref()),
                 );
@@ -1860,23 +1974,16 @@ pub fn note_type_cache_read(owner: &LuaTypeOwner) {
 /// How many reads evaluations on this thread noted, duplicates included,
 /// since the last call.
 pub fn take_noted_reads() -> u64 {
-    NOTED_READS.with(|count| count.replace(0))
+    RECORDER.with_borrow_mut(|recorder| std::mem::take(&mut recorder.noted))
 }
 
 /// Records a read of the top-level statement `statement` of `file_id`. A
 /// derivation's own file is not a read, as for [`note_file_read`].
 pub fn note_syntax_read(file_id: FileId, statement: TextRange) {
-    if UNTRACKED.with(|depth| depth.get() > 0) {
-        return;
-    }
-    CURRENT.with(|current| {
-        if let Some(evaluation) = current.borrow_mut().as_mut()
-            && evaluation.id.file_id != file_id
-        {
-            record_read(
-                evaluation,
-                HashedKey::new(FactKey::Syntax(InFiled::new(file_id, statement))),
-            );
+    noting(|evaluation, table, view| {
+        if evaluation.id.file_id != file_id {
+            let key = HashedKey::new(FactKey::Syntax(InFiled::new(file_id, statement)));
+            evaluation.note_key(table, view, key);
         }
     });
 }
@@ -1884,51 +1991,52 @@ pub fn note_syntax_read(file_id: FileId, statement: TextRange) {
 /// Records a read of `file_id`'s text. A derivation's own file is not a
 /// read: its derivations are replaced whenever that text changes.
 pub fn note_file_read(file_id: FileId) {
-    if UNTRACKED.with(|depth| depth.get() > 0) {
-        return;
-    }
-    CURRENT.with(|current| {
-        if let Some(evaluation) = current.borrow_mut().as_mut()
-            && evaluation.id.file_id != file_id
-        {
-            record_read(evaluation, HashedKey::new(FactKey::FileText(file_id)));
+    noting(|evaluation, table, view| {
+        if evaluation.id.file_id != file_id {
+            evaluation.note_key(table, view, HashedKey::new(FactKey::FileText(file_id)));
         }
     });
 }
 
 /// Records that the current evaluation produced `key`.
 pub fn note_write(key: impl FnOnce() -> FactKey) {
-    CURRENT.with(|current| {
-        if let Some(evaluation) = current.borrow_mut().as_mut() {
-            let key = HashedKey::new(key());
-            // Inference memoised during an evaluation read only keys the
-            // evaluation recorded, so a write it did not read leaves it valid.
-            let read_here = KEYS.with(|keys| {
-                keys.borrow()
-                    .as_ref()
-                    .is_none_or(|table| table.logged_since(&key, evaluation.stamp))
-            });
-            if read_here {
-                WRITE_GENERATION.with(|generation| generation.set(generation.get() + 1));
-            }
-            let written = next_stamp();
-            LAST_WRITE.with(|last| last.set(written));
-            KEYS.with(|keys| {
-                if let Some(table) = keys.borrow_mut().as_mut() {
-                    table.mark_written(&key, written);
-                }
-            });
-            if REHOMING.with(|depth| depth.get() > 0) {
-                evaluation.moved.insert(key);
-            } else {
-                evaluation.outputs.insert(key);
-            }
-        } else {
+    RECORDER.with_borrow_mut(|recorder| {
+        let Recorder {
+            current,
+            keys,
+            rehoming,
+            ..
+        } = recorder;
+        let Some(evaluation) = current.as_mut() else {
             CAPTURED.with(|captured| {
                 if let Some(captured) = captured.borrow_mut().as_mut() {
                     captured.insert(HashedKey::new(key()));
                 }
             });
+            return;
+        };
+        let key = HashedKey::new(key());
+        let written = next_stamp();
+        LAST_WRITE.with(|last| last.set(written));
+        // Inference memoised during an evaluation read only keys the
+        // evaluation recorded, so a write it did not read leaves it valid.
+        let read_here = match keys.as_mut() {
+            None => true,
+            Some(table) => {
+                let slot = table.find(&key);
+                if let Some(slot) = slot {
+                    table.mark_slot_written(slot, written);
+                }
+                slot.is_some_and(|slot| evaluation.by_slot.contains_key(&slot))
+            }
+        };
+        if read_here {
+            WRITE_GENERATION.with(|generation| generation.set(generation.get() + 1));
+        }
+        if *rehoming > 0 {
+            evaluation.moved.insert(key);
+        } else {
+            evaluation.outputs.insert(key);
         }
     });
 }
@@ -1937,9 +2045,9 @@ pub fn note_write(key: impl FnOnce() -> FactKey) {
 /// evaluation, or inside a file's [`DerivationKind::Source`] derivation.
 /// Indexes keep a source write so a reset can restore it.
 pub fn writes_source() -> bool {
-    CURRENT.with(|current| {
-        current
-            .borrow()
+    RECORDER.with_borrow(|recorder| {
+        recorder
+            .current
             .as_ref()
             .is_none_or(|evaluation| evaluation.id.kind == DerivationKind::Source)
     })
@@ -1949,8 +2057,8 @@ pub fn writes_source() -> bool {
 /// fallbacks: the types it guesses for what its statements left untyped or
 /// only as a base class, which readers see over what the statements left.
 pub fn writes_fallback_of(file_id: FileId) -> bool {
-    CURRENT.with(|current| {
-        current.borrow().as_ref().is_some_and(|evaluation| {
+    RECORDER.with_borrow(|recorder| {
+        recorder.current.as_ref().is_some_and(|evaluation| {
             evaluation.id.kind == DerivationKind::LocalFallbacks && evaluation.id.file_id == file_id
         })
     })
@@ -1959,8 +2067,8 @@ pub fn writes_fallback_of(file_id: FileId) -> bool {
 /// Whether the evaluation recording on this thread computes `key` again: it
 /// produced it before, and the engine reset it for this run.
 pub fn recomputes(key: FactKey) -> bool {
-    KEYS.with(|keys| {
-        keys.borrow().as_ref().is_some_and(|table| {
+    RECORDER.with_borrow(|recorder| {
+        recorder.keys.as_ref().is_some_and(|table| {
             table
                 .find(&HashedKey::new(key))
                 .is_some_and(|slot| table.windowed(slot))
@@ -1990,5 +2098,5 @@ pub fn dynamic_fields_visible() -> bool {
 
 /// The derivation being evaluated on this thread, if any.
 pub fn current() -> Option<DerivationId> {
-    CURRENT.with(|current| current.borrow().as_ref().map(|evaluation| evaluation.id))
+    RECORDER.with_borrow(|recorder| recorder.current.as_ref().map(|evaluation| evaluation.id))
 }
