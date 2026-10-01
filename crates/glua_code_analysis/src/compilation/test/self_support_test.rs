@@ -321,6 +321,112 @@ end
         );
     }
 
+    const CONFIG_PANEL: (&str, &str) = (
+        "gamemodes/helix/gamemode/core/derma/cl_config.lua",
+        "function PANEL:Populate()
+	for k, v in SortedPairsByMemberValue(ix.plugin.list, \"name\") do
+		local row = self:AddRow(ix.type.bool, self.loadedCategory)
+		row.id = k
+	end
+end
+
+function PANEL:UpdateUnloaded(bNoSizeToContents)
+	for k, v in SortedPairs(ix.plugin.unloaded) do
+		local row = self:AddRow(ix.type.bool, self.unloadedCategory)
+		row.id = k
+		row:SetText(k)
+	end
+end
+",
+    );
+
+    const PLUGIN_LIST: (&str, &str) = (
+        "gamemodes/helix/gamemode/core/libs/sh_plugin.lua",
+        "ix.plugin = ix.plugin or {}
+ix.plugin.unloaded = ix.plugin.unloaded or {}",
+    );
+
+    const UNLOADED_LIST: (&str, &str) = (
+        "gamemodes/helix/gamemode/core/sh_config.lua",
+        "if (value) then
+	ix.plugin.unloaded = net.ReadTable()
+end
+",
+    );
+
+    const SETTINGS_PANEL: (&str, &str) = (
+        "gamemodes/helix/gamemode/core/derma/cl_settings.lua",
+        "PANEL = {}
+
+function PANEL:Init()
+	self.canvas = self:Add(\"DScrollPanel\")
+end
+
+function PANEL:AddRow(type, category)
+	local panel = (IsValid(category) and category or self.canvas):Add(id)
+	return panel
+end
+
+vgui.Register(\"ixSettings\", PANEL, \"Panel\")
+",
+    );
+
+    const GAMEMODE_INIT: (&str, &str) = (
+        "gamemodes/helix/gamemode/init.lua",
+        "ix = ix or {util = {}, meta = {}}",
+    );
+
+    const GLOBAL_ANNOTATIONS: (&str, &str) = (
+        "lua/aaa_annotations/global.lua",
+        "---@generic K, V
+---@param table table<K, V> | V[] | {[K]: V} # The table to sort
+---@return fun(tbl: any, key: K?): K, V # Iterator function
+function _G.SortedPairs(table, desc) end",
+    );
+
+    const PANEL_ANNOTATIONS: (&str, &str) = (
+        "lua/aaa_annotations/panel.lua",
+        "---@class Panel
+Panel = Panel or {}
+---@generic T : Panel
+---@param className `T` The panel class name to create and add.
+---@return (instance) T # The created panel.
+function Panel:Add(className) end
+---@param text string The text value to set.
+function Panel:SetText(text) end",
+    );
+
+    const VGUI_ANNOTATIONS: (&str, &str) = (
+        "lua/aaa_annotations/vgui.lua",
+        "---@[call_arg(\"gmod.vgui_panel\", \"define\")]
+---@param classname string Classname of the panel to register.
+function vgui.Register(classname, panelTable, baseName) end",
+    );
+
+    /// Both loops store their key into `row.id`, the field's only writers, and
+    /// each key is guessed from its uses: the one read back from `row.id` is
+    /// the other key's guess, so the guesses supported each other after the
+    /// unknown keys that started them were deleted.
+    #[test]
+    fn locals_stored_into_one_field_keep_no_guess_they_gave_each_other_once_their_keys_go() {
+        settles_as_cold(
+            &[
+                CONFIG_PANEL,
+                PLUGIN_LIST,
+                UNLOADED_LIST,
+                SETTINGS_PANEL,
+                GAMEMODE_INIT,
+                GLOBAL_ANNOTATIONS,
+                PANEL_ANNOTATIONS,
+                VGUI_ANNOTATIONS,
+            ],
+            &[
+                Step::Delete(UNLOADED_LIST.0),
+                Step::Write(UNLOADED_LIST.0, UNLOADED_LIST.1),
+            ],
+        );
+    }
+
     const ITEM_REGISTRY: &str = "ix.item.list = ix.item.list or {}
 ix.item.base = ix.item.base or {}
 

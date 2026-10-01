@@ -41,34 +41,9 @@ pub(super) fn stabilize_unknown_locals(
             continue;
         };
         for (decl_id, decl_references) in references {
-            let is_local = db
-                .get_decl_index()
-                .get_decl(decl_id)
-                .is_some_and(|decl| matches!(decl.extra, crate::LuaDeclExtra::Local { .. }));
-            if !is_local {
-                continue;
+            if guesses(db, decl_id) {
+                candidates.push((file_id, *decl_id, decl_references.clone()));
             }
-            // `never` is the bottom of the same uninformative band as
-            // `unknown` (see `LuaTypeCache::supersedes`), and it is what an
-            // initialiser resolves to when the member it reads is not in the
-            // index *yet*.
-            let uninformative = db
-                .get_type_index()
-                .get_type_cache(&(*decl_id).into())
-                .is_none_or(|cache| {
-                    cache.is_infer() && matches!(cache.as_type(), LuaType::Unknown | LuaType::Never)
-                });
-            // A fact this pass published earlier was read off whatever the
-            // slots its uses feed held at the time; a later run re-derives it
-            // against what they hold now.
-            let contextual = !uninformative
-                && db
-                    .get_type_index()
-                    .holds_contextual_fallback(&(*decl_id).into());
-            if !uninformative && !contextual {
-                continue;
-            }
-            candidates.push((file_id, *decl_id, decl_references.clone()));
         }
     }
     candidates.sort_by_key(|(_, decl_id, _)| (decl_id.file_id, decl_id.position));
@@ -127,6 +102,11 @@ pub(super) fn stabilize_unknown_locals(
                 infer_bind_value_type(db, context.infer_manager.get_infer_cache(file_id), expr)
             else {
                 continue;
+            };
+            let candidate = match guessed_slot_evidence(db, file_id, &name_expr) {
+                Some(Some(evidence)) => evidence,
+                Some(None) => continue,
+                None => candidate,
             };
             let candidate = if proven_non_nil {
                 TypeOps::Remove.apply(db, &candidate, &LuaType::Nil)
@@ -187,6 +167,121 @@ pub(super) fn stabilize_unknown_locals(
         context.infer_manager.clear();
     }
     changed_any
+}
+
+/// Whether this pass guesses `decl_id`'s type from its uses: a local the
+/// statements left without a type, or one holding a guess it published before.
+fn guesses(db: &crate::DbIndex, decl_id: &crate::LuaDeclId) -> bool {
+    let is_local = db
+        .get_decl_index()
+        .get_decl(decl_id)
+        .is_some_and(|decl| matches!(decl.extra, crate::LuaDeclExtra::Local { .. }));
+    if !is_local {
+        return false;
+    }
+    // `never` is the bottom of the same uninformative band as `unknown` (see
+    // `LuaTypeCache::supersedes`), and it is what an initialiser resolves to
+    // when the member it reads is not in the index *yet*.
+    let uninformative = db
+        .get_type_index()
+        .get_type_cache(&(*decl_id).into())
+        .is_none_or(|cache| {
+            cache.is_infer() && matches!(cache.as_type(), LuaType::Unknown | LuaType::Never)
+        });
+    // A fact this pass published earlier was read off whatever the slots its
+    // uses feed held at the time; a later run re-derives it against what they
+    // hold now.
+    uninformative
+        || db
+            .get_type_index()
+            .holds_contextual_fallback(&(*decl_id).into())
+}
+
+/// What a store `t.k = local` says of the local when some writer of `t.k` in
+/// the same file stores a local this pass guesses: the type the slot's other
+/// writers give it, or nothing when there are none. The slot holds those
+/// guesses, the stored local's own included, so reading it back would derive
+/// each guess from the guesses. A writer in another file is taken as it
+/// stands: telling what it stores would read that file's text, so every edit
+/// of it would reach this file. `None` when the read is no such store.
+fn guessed_slot_evidence(
+    db: &crate::DbIndex,
+    file_id: crate::FileId,
+    name_expr: &LuaNameExpr,
+) -> Option<Option<LuaType>> {
+    let assign = name_expr.get_parent::<LuaAssignStat>()?;
+    let (vars, exprs) = assign.get_var_and_expr_list();
+    let at = exprs
+        .iter()
+        .position(|expr| expr.syntax() == name_expr.syntax())?;
+    let LuaVarExpr::IndexExpr(target) = vars.get(at)? else {
+        return None;
+    };
+    let member_index = db.get_member_index();
+    let member_id = crate::LuaMemberId::new(target.get_syntax_id(), file_id);
+    let key = member_index.get_member(&member_id)?.get_key().clone();
+    let owner = member_index.get_current_owner(&member_id)?.clone();
+    let (guessed, others): (Vec<_>, Vec<_>) = member_index
+        .get_member_item(&owner, &key)?
+        .get_member_ids()
+        .into_iter()
+        .partition(|writer| writer.file_id == file_id && stores_guessed_local(db, *writer));
+    if guessed.is_empty() {
+        return None;
+    }
+    let others = match others.as_slice() {
+        [] => return Some(None),
+        [writer] => crate::LuaMemberIndexItem::One(*writer),
+        _ => crate::LuaMemberIndexItem::Many(others),
+    };
+    Some(
+        others
+            .resolve_type_with_realm_at_offset(db, &file_id, name_expr.get_position())
+            .ok(),
+    )
+}
+
+/// Whether member `writer` is a store `t.k = local` of the value a local this
+/// pass guesses was declared with: only its declaration reaches the store.
+fn stores_guessed_local(db: &crate::DbIndex, writer: crate::LuaMemberId) -> bool {
+    let syntax_id = writer.get_syntax_id();
+    let Some(index_expr) = db
+        .get_vfs()
+        .syntax_tree_around(&writer.file_id, syntax_id.get_range())
+        .and_then(|tree| syntax_id.to_node_from_root(&tree.get_red_root()))
+        .and_then(LuaIndexExpr::cast)
+    else {
+        return false;
+    };
+    let Some(assign) = index_expr.get_parent::<LuaAssignStat>() else {
+        return false;
+    };
+    let (vars, exprs) = assign.get_var_and_expr_list();
+    let value = vars
+        .iter()
+        .position(|var| var.syntax() == index_expr.syntax())
+        .and_then(|at| exprs.get(at));
+    let Some(LuaExpr::NameExpr(value)) = value else {
+        return false;
+    };
+    let Some(decl_id) = db
+        .get_reference_index()
+        .get_local_reference(&writer.file_id)
+        .and_then(|references| references.get_decl_id(&value.get_range()))
+    else {
+        return false;
+    };
+    guesses(db, &decl_id)
+        && db
+            .get_flow_index()
+            .get_flow_tree(&writer.file_id)
+            .and_then(|tree| {
+                let flow = tree.get_flow_id(value.get_syntax_id())?;
+                Some(tree.reaching_definitions(decl_id, flow))
+            })
+            .is_some_and(|definitions| {
+                definitions.as_ref() == [crate::LuaDefinitionId::Declaration(decl_id)]
+            })
 }
 
 /// Whether reaching this read with a nil value would be a runtime error.
