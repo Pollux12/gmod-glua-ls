@@ -2201,10 +2201,6 @@ impl LuaMemberIndex {
         Some(item)
     }
 
-    pub fn get_sorted_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
-        self.get_members(owner)
-    }
-
     pub fn get_member_item(
         &self,
         owner: &LuaMemberOwner,

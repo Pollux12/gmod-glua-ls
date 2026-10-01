@@ -1012,14 +1012,16 @@ mod test {
         let raw_expr_display = ws.humanize_type_detailed(raw_expr_ty.clone());
         assert_that!(
             raw_expr_display.as_str(),
-            all!(
-                not(eq("any?")),
-                contains_substring("Name"),
-                contains_substring("Icon"),
-                contains_substring("?")
-            ),
+            all!(not(eq("any?")), contains_substring("?")),
             "raw index expr should preserve registry value shape in the real-style fixture: {}",
             raw_expr_display
+        );
+        let raw_fields = registry_value_fields(&ws, &raw_expr_ty);
+        assert!(
+            ["Name", "Icon"]
+                .iter()
+                .all(|name| raw_fields.iter().any(|field| field == name)),
+            "raw index expr should keep the registry value's fields, got {raw_fields:?}"
         );
 
         let class_ty = local_name_type(&mut ws, file_id, "class");
@@ -1031,16 +1033,30 @@ mod test {
             class_display,
             raw_expr_display
         );
-        assert_that!(
-            class_display.as_str(),
-            all!(
-                not(eq("any?")),
-                contains_substring("Name"),
-                contains_substring("Icon")
-            ),
-            "local binding for `class` should not degrade beyond the paired raw index expr: {}",
-            class_display
+        assert_ne!(
+            class_display, "any?",
+            "local binding for `class` should not degrade beyond the paired raw index expr"
         );
+        let class_fields = registry_value_fields(&ws, &class_ty);
+        assert!(
+            ["Name", "Icon"]
+                .iter()
+                .all(|name| class_fields.iter().any(|field| field == name)),
+            "local binding for `class` should keep the registry value's fields, got {class_fields:?}"
+        );
+    }
+
+    /// The named fields of a registry value `T?`.
+    fn registry_value_fields(ws: &VirtualWorkspace, typ: &LuaType) -> Vec<String> {
+        let value = match typ {
+            LuaType::Union(union) => union.nullable_inner().unwrap_or(typ),
+            _ => typ,
+        };
+        crate::get_member_map(ws.analysis.compilation.get_db(), value)
+            .into_iter()
+            .flat_map(|members| members.into_keys())
+            .filter_map(|key| key.get_name().map(str::to_string))
+            .collect()
     }
 
     #[gtest]

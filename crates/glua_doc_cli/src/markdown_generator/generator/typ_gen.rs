@@ -81,7 +81,7 @@ fn generate_class_type_markdown(
     }
 
     let member_owner = LuaMemberOwner::Type(typ_id);
-    let members = db.get_member_index().get_sorted_members(&member_owner);
+    let members = db.sorted_members(&member_owner);
     let mut method_members: Vec<MemberDoc> = Vec::new();
     let mut field_members: Vec<MemberDoc> = Vec::new();
     if let Some(members) = members {
@@ -191,7 +191,7 @@ fn generate_enum_type_markdown(
     doc.property = collect_property(db, LuaSemanticDeclId::TypeDecl(typ_id.clone()));
 
     let member_owner = LuaMemberOwner::Type(typ_id);
-    let members = db.get_member_index().get_sorted_members(&member_owner);
+    let members = db.sorted_members(&member_owner);
     let mut field_members: Vec<MemberDoc> = Vec::new();
     if let Some(members) = members {
         for member in members {

@@ -1029,6 +1029,21 @@ impl DbIndex {
         self.members_index.as_ref()
     }
 
+    /// `owner`'s members in an order every session agrees on: by their file's
+    /// place in [`Vfs::file_order_key`], then by where each sits in its file.
+    pub fn sorted_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
+        let mut members = self.get_member_index().get_members(owner)?;
+        let vfs = self.get_vfs();
+        members.sort_by_cached_key(|member| {
+            let id = member.get_id();
+            (
+                vfs.file_order_key(&id.file_id),
+                member::member_id_sort_key(id),
+            )
+        });
+        Some(members)
+    }
+
     pub fn get_property_index(&self) -> &LuaPropertyIndex {
         self.property_index.as_ref()
     }

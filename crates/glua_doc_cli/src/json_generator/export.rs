@@ -253,10 +253,9 @@ fn export_generics(db: &DbIndex, type_decl_id: &LuaTypeDeclId) -> Vec<TypeVar> {
 }
 
 fn export_members(db: &DbIndex, member_owner: LuaMemberOwner) -> Vec<Member> {
-    let member_index = db.get_member_index();
     let type_index = db.get_type_index();
     let vfs = db.get_vfs();
-    let members = member_index.get_sorted_members(&member_owner);
+    let members = db.sorted_members(&member_owner);
     if let Some(members) = members {
         members
             .into_iter()
