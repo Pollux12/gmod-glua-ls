@@ -1510,7 +1510,7 @@ fn record_read(evaluation: &mut Evaluation, key: HashedKey) -> Option<KeyIdx> {
         Some(table) => {
             let slot = table.intern_read(key, evaluation.stamp);
             evaluation.log_slot(table, slot);
-            if table.windowed(slot) {
+            if table.taints(slot) {
                 frames::taint_evaluation(evaluation);
             }
             Some(slot)
@@ -1549,7 +1549,7 @@ fn note_read_by(identity: (u8, u128), key: impl FnOnce() -> FactKey) {
                 Some(slot) => KEYS.with(|keys| {
                     if let Some(table) = keys.borrow_mut().as_mut() {
                         evaluation.log_slot(table, slot);
-                        if table.windowed(slot) {
+                        if table.taints(slot) {
                             frames::taint_evaluation(evaluation);
                         }
                     }
@@ -1605,7 +1605,7 @@ fn note_named_read(tag: u8, owner: u128, name: Option<&str>, key: impl FnOnce() 
             Some(slot) => KEYS.with(|keys| {
                 if let Some(table) = keys.borrow_mut().as_mut() {
                     evaluation.log_slot(table, slot);
-                    if table.windowed(slot) {
+                    if table.taints(slot) {
                         frames::taint_evaluation(evaluation);
                     }
                 }

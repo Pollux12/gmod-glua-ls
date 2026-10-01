@@ -42,6 +42,9 @@ struct KeySlot {
     /// Whether an evaluation took the value away to compute it again; see
     /// [`KeyTable::open_window`].
     windowed: bool,
+    /// Whether a loop the engine cleared took the value away until it settles
+    /// again; see [`KeyTable::hold_window`].
+    held: bool,
     /// Whether [`KeyTable::more_producers`] holds producers of the key.
     more_producers: bool,
 }
@@ -57,6 +60,7 @@ impl Clone for KeySlot {
             stamp: self.stamp,
             written: self.written,
             windowed: self.windowed,
+            held: self.held,
             more_producers: self.more_producers,
         }
     }
@@ -73,6 +77,7 @@ impl Default for KeySlot {
             stamp: 0,
             written: 0,
             windowed: false,
+            held: false,
             more_producers: false,
         }
     }
@@ -309,6 +314,9 @@ pub struct KeyTable {
     /// The keys an evaluation took away to compute again, each with the stamp
     /// it was written at before; see [`Self::open_window`].
     windows: FxHashMap<KeyIdx, u64>,
+    /// The keys a cleared loop took away until it settles again, each with the
+    /// stamp it was written at before; see [`Self::hold_window`].
+    held: FxHashMap<KeyIdx, u64>,
 }
 
 /// Whether what a memo read still holds; see [`KeyTable::written_since`].
@@ -471,6 +479,46 @@ impl KeyTable {
         }
     }
 
+    /// [`Self::open_window`] for a loop of statements cleared to settle again
+    /// from nothing: the window stays open across the evaluations that settle
+    /// it, until [`Self::release_held`].
+    pub(super) fn hold_window(&mut self, key: &HashedKey, now: u64) {
+        let Some(slot) = self.find(key) else {
+            return;
+        };
+        self.last_written = self.last_written.max(now);
+        let derived = self.derived.get(&slot).into_iter().flat_map(|d| &d.slots);
+        for slot in std::iter::once(&slot).chain(derived) {
+            let entry = &mut self.keys[*slot as usize];
+            self.held.entry(*slot).or_insert(entry.written);
+            entry.written = now;
+            entry.held = true;
+        }
+    }
+
+    /// Closes every held window: a key `unchanged` accepts, and each key read
+    /// out of it, is written as it was before its window opened.
+    pub(super) fn release_held(&mut self, unchanged: impl Fn(&HashedKey) -> bool) {
+        let held = std::mem::take(&mut self.held);
+        for (slot, before) in &held {
+            let entry = &mut self.keys[*slot as usize];
+            entry.held = false;
+            let Some(key) = entry.key.as_ref() else {
+                continue;
+            };
+            if key.base().is_some() || !unchanged(key) {
+                continue;
+            }
+            entry.written = *before;
+            let derived = self.derived.get(slot).into_iter().flat_map(|d| &d.slots);
+            for derived in derived {
+                if let Some(before) = held.get(derived) {
+                    self.keys[*derived as usize].written = *before;
+                }
+            }
+        }
+    }
+
     fn add_producer(&mut self, slot: KeyIdx, deriv: DerivIdx) {
         let entry = &mut self.keys[slot as usize];
         if entry.producer == NO_PRODUCER {
@@ -521,6 +569,14 @@ impl KeyTable {
         self.keys[slot as usize].windowed
     }
 
+    /// Whether a read of `slot` sees a value only the evaluation reading it
+    /// can rely on: one being computed again, or one a cleared loop holds
+    /// until it settles.
+    pub(super) fn taints(&self, slot: KeyIdx) -> bool {
+        let entry = &self.keys[slot as usize];
+        entry.windowed || entry.held
+    }
+
     /// Whether a slot was written or released after stamp `stamp`.
     pub(super) fn written_after(&self, stamp: u64) -> bool {
         self.last_written > stamp
@@ -541,7 +597,7 @@ impl KeyTable {
             if entry.written <= since {
                 continue;
             }
-            match self.windows.get(slot) {
+            match self.held.get(slot).or_else(|| self.windows.get(slot)) {
                 Some(before) if *before <= since => freshness = Freshness::Recomputing,
                 _ => return Freshness::Written,
             }
@@ -684,6 +740,20 @@ impl ReaderGraph {
     pub fn restore_keys(&mut self, table: KeyTable) {
         debug_assert!(self.table.keys.is_empty(), "keys restored twice");
         self.table = table;
+    }
+
+    /// Holds `keys` written until [`Self::release_held`]; see
+    /// [`KeyTable::hold_window`].
+    pub fn hold_windows<'a>(&mut self, keys: impl IntoIterator<Item = &'a HashedKey>) {
+        let now = super::new_stamp();
+        for key in keys {
+            self.table.hold_window(key, now);
+        }
+    }
+
+    /// See [`KeyTable::release_held`].
+    pub fn release_held(&mut self, unchanged: impl Fn(&HashedKey) -> bool) {
+        self.table.release_held(unchanged);
     }
 
     /// `key`'s fingerprint, taken by `fingerprint` once per value: a read
@@ -1535,6 +1605,8 @@ impl ReaderGraph {
             return;
         };
         entry.written = u64::MAX;
+        entry.held = false;
+        self.table.held.remove(&slot);
         self.table.last_written = super::new_stamp();
         self.table.unfile(&key, slot);
         self.table.free_keys.push(slot);

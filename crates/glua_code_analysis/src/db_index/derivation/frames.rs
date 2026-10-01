@@ -804,6 +804,82 @@ mod tests {
         assert!(!shared);
     }
 
+    /// Holds `key` in the lent table as a cleared loop does.
+    fn hold(key: FactKey) {
+        KEYS.with(|keys| {
+            keys.borrow_mut()
+                .as_mut()
+                .expect("a table is lent")
+                .hold_window(&HashedKey::new(key), new_stamp());
+        });
+    }
+
+    /// Releases every held key, `unchanged` deciding which came back.
+    fn release(unchanged: bool) {
+        KEYS.with(|keys| {
+            keys.borrow_mut()
+                .as_mut()
+                .expect("a table is lent")
+                .release_held(|_| unchanged);
+        });
+    }
+
+    /// A value that read a fact a cleared loop holds waits until the loop
+    /// settles, whatever the loop's own evaluations compute again meanwhile,
+    /// then holds again if the fact settled back as it was, and is stale if
+    /// it changed.
+    #[test]
+    fn a_value_that_read_a_held_fact_holds_again_only_if_the_loop_settles_it_back() {
+        let read = || FactKey::GmodRealm(FileId::new(1));
+        derivation::lend_keys(KeyTable::default());
+        let value = value_reading(read);
+        hold(read());
+        let while_held = reused(&value);
+        note_recomputing([HashedKey::new(read())]);
+        note_recomputed(|_| true);
+        let after_an_evaluation_in_the_loop = reused(&value);
+        release(true);
+        let after_unchanged = reused(&value);
+        hold(read());
+        release(false);
+        let after_changed = reused(&value);
+        derivation::take_keys();
+
+        assert_eq!(
+            (
+                while_held,
+                after_an_evaluation_in_the_loop,
+                after_unchanged,
+                after_changed
+            ),
+            (
+                Reuse::Elsewhere,
+                Reuse::Elsewhere,
+                Reuse::Held,
+                Reuse::Stale
+            )
+        );
+    }
+
+    /// A value computed from a fact a cleared loop holds saw a value the loop
+    /// may still move and come back from, so it is not shared.
+    #[test]
+    fn a_value_computed_from_a_held_fact_is_not_shared() {
+        let read = || FactKey::GmodRealm(FileId::new(1));
+        derivation::lend_keys(KeyTable::default());
+        let _ = value_reading(read);
+        hold(read());
+        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let frame = open_frame().expect("a table is lent");
+        derivation::note_read(read);
+        let shared = close_frame(frame, 0).is_some();
+        derivation::end();
+        release(true);
+        derivation::take_keys();
+
+        assert!(!shared);
+    }
+
     /// A value that read a reference as unkeyed holds wherever that reference
     /// is still unkeyed, whichever others are keyed, and nowhere it is.
     #[test]

@@ -311,6 +311,9 @@ pub(crate) struct Engine {
     /// The files prioritised while the loops being cleared settle, put ahead
     /// once they have.
     after_loops: Vec<crate::FileId>,
+    /// What the outputs of the loops being cleared held before: a memo that
+    /// read one holds again once the loops settle if it settles back to it.
+    loop_before: FxHashMap<HashedKey, derivation::Fingerprint>,
     /// Under `GLUALS_CHECK_CONVERGENCE` or debug assertions: how often each
     /// derivation was evaluated since the run last entered a stage.
     stage_evaluations: FxHashMap<DerivationId, u32>,
@@ -969,17 +972,20 @@ impl Engine {
         for member in &members {
             touched.extend(db.reader_graph().outputs_of(*member).cloned());
         }
+        self.loop_before = touched
+            .iter()
+            .map(|key| (key.clone(), self.fingerprint(db, key)))
+            .collect();
         let reset = derivation::capture_writes(|| {
             for key in touched.iter().filter(|key| key.is_primary()) {
                 db.reset_fact(key);
             }
         });
         touched.extend(reset);
-        // Written now, in a window of their own: a member that comes back to
-        // the value the reset left must not revive what read the value before.
-        derivation::lend_keys(db.reader_graph_mut().lend_keys());
-        derivation::note_written(touched.iter().cloned());
-        db.reader_graph_mut().restore_keys(derivation::take_keys());
+        // Held until the loops settle: what reads them meanwhile is not
+        // shared, and a memo that read them before holds again if they settle
+        // back to what they were.
+        db.reader_graph_mut().hold_windows(touched.iter());
         for key in &touched {
             db.reader_graph().forget_fingerprint(key);
             let before_edits = self.before_edits.get_mut();
@@ -1127,6 +1133,13 @@ impl Engine {
         self.focus.clear();
         if !self.loop_focus.is_empty() {
             self.loop_focus.clear();
+            let unchanged = std::mem::take(&mut self.loop_before)
+                .into_iter()
+                .filter(|(key, before)| db.fact_fingerprint(key) == *before)
+                .map(|(key, _)| key)
+                .collect::<FxHashSet<_>>();
+            db.reader_graph_mut()
+                .release_held(|key| unchanged.contains(key));
             debug_assert!(self.worklist.is_empty() && self.next_round.is_empty());
             self.worklist = Queue::new(self.schedule);
             self.next_round = Queue::new(self.schedule);
