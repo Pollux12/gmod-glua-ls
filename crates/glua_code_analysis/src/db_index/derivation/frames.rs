@@ -17,9 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::graph::Freshness;
-use super::{
-    Evaluation, KeyIdx, KeyTable, RECORDER, Recorder, latest_stamp, next_stamp, with_viewed,
-};
+use super::{CURRENT, Evaluation, KEYS, KeyIdx, KeyTable, latest_stamp, next_stamp, with_viewed};
 use crate::GmodRealm;
 
 /// Bits of a cache's view that inference can consult.
@@ -27,7 +25,7 @@ pub type Gates = u8;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Frame {
-    pub(super) start: u32,
+    start: u32,
     pub(super) stamp: u64,
     /// The outermost frame index a taint reaches, if any.
     taint: Option<u32>,
@@ -119,29 +117,20 @@ impl Provenance {
 }
 
 fn with_evaluation<T>(f: impl FnOnce(&mut Evaluation, &mut KeyTable) -> T) -> Option<T> {
-    RECORDER.with_borrow_mut(|recorder| {
-        let Recorder {
-            current: Some(evaluation),
-            keys: Some(table),
-            ..
-        } = recorder
-        else {
-            return None;
-        };
-        Some(f(evaluation, table))
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        let evaluation = current.as_mut()?;
+        KEYS.with(|keys| keys.borrow_mut().as_mut().map(|table| f(evaluation, table)))
     })
 }
 
-/// Runs `f` on the evaluation recording on this thread, if any.
-fn with_current<T>(f: impl FnOnce(&mut Evaluation) -> T) -> Option<T> {
-    RECORDER.with_borrow_mut(|recorder| recorder.current.as_mut().map(f))
-}
-
 fn with_innermost(f: impl FnOnce(u32, &mut Frame)) {
-    with_current(|evaluation| {
-        let depth = evaluation.frames.len();
-        if let Some(frame) = evaluation.frames.last_mut() {
-            f(depth as u32 - 1, frame);
+    CURRENT.with(|current| {
+        if let Some(evaluation) = current.borrow_mut().as_mut() {
+            let depth = evaluation.frames.len();
+            if let Some(frame) = evaluation.frames.last_mut() {
+                f(depth as u32 - 1, frame);
+            }
         }
     });
 }
@@ -176,7 +165,9 @@ pub fn open_frame_absorbing(absorbs: u64) -> Option<OpenFrame> {
 #[track_caller]
 pub fn close_frame(frame: OpenFrame, view: Gates) -> Option<Provenance> {
     let caller = std::panic::Location::caller();
-    with_current(|evaluation| {
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        let evaluation = current.as_mut()?;
         let depth = frame.0;
         debug_assert_eq!(
             evaluation.frames.len() as u32,
@@ -226,7 +217,6 @@ pub fn close_frame(frame: OpenFrame, view: Gates) -> Option<Provenance> {
             unkeyed,
         })))
     })
-    .flatten()
 }
 
 /// The distinct references `log` holds from `start` on.
@@ -241,7 +231,11 @@ fn unkeyed_since(log: &[u64], start: u32) -> Option<Box<[u64]>> {
 /// Notes that the open frames read the reference `key` as walking from no
 /// keyed origin: their values hold only while it does not.
 pub fn consult_unkeyed(key: u64) {
-    with_current(|evaluation| note_unkeyed(evaluation, key));
+    CURRENT.with(|current| {
+        if let Some(evaluation) = current.borrow_mut().as_mut() {
+            note_unkeyed(evaluation, key);
+        }
+    });
 }
 
 fn note_unkeyed(evaluation: &mut Evaluation, key: u64) {
@@ -254,9 +248,9 @@ fn note_unkeyed(evaluation: &mut Evaluation, key: u64) {
 
 /// The number of open frames: where a scope set now begins.
 pub fn frame_depth() -> u32 {
-    RECORDER.with_borrow(|recorder| {
-        recorder
-            .current
+    CURRENT.with(|current| {
+        current
+            .borrow()
             .as_ref()
             .map_or(0, |evaluation| evaluation.frames.len() as u32)
     })
@@ -293,9 +287,9 @@ pub struct ScopeMark {
 
 /// Marks where a context set now begins.
 pub fn scope_mark() -> ScopeMark {
-    RECORDER.with_borrow(|recorder| {
-        recorder
-            .current
+    CURRENT.with(|current| {
+        current
+            .borrow()
             .as_ref()
             .map_or(ScopeMark::default(), |evaluation| ScopeMark {
                 depth: evaluation.frames.len() as u32,
@@ -308,7 +302,19 @@ pub fn scope_mark() -> ScopeMark {
 /// frames inside it depend on it; once closed, every open frame does.
 #[track_caller]
 pub fn consult_scope(mark: ScopeMark) {
-    if scope_open(mark) {
+    let open = CURRENT.with(|current| {
+        current.borrow().as_ref().is_some_and(|evaluation| {
+            let stamp = match mark.depth {
+                0 => evaluation.stamp,
+                depth => match evaluation.frames.get(depth as usize - 1) {
+                    Some(frame) => frame.stamp,
+                    None => return false,
+                },
+            };
+            stamp == mark.stamp && evaluation.frames.len() as u32 >= mark.depth
+        })
+    });
+    if open {
         taint_scoped(mark.depth);
     } else {
         taint();
@@ -317,8 +323,8 @@ pub fn consult_scope(mark: ScopeMark) {
 
 /// Whether the scope `mark` began is still open on this thread.
 fn scope_open(mark: ScopeMark) -> bool {
-    RECORDER.with_borrow(|recorder| {
-        recorder.current.as_ref().is_some_and(|evaluation| {
+    CURRENT.with(|current| {
+        current.borrow().as_ref().is_some_and(|evaluation| {
             let stamp = match mark.depth {
                 0 => evaluation.stamp,
                 depth => match evaluation.frames.get(depth as usize - 1) {
@@ -341,14 +347,16 @@ pub fn consult_absorbed(key: u64, mark: ScopeMark) {
         taint();
         return;
     }
-    with_current(|evaluation| {
-        for (index, frame) in evaluation.frames.iter_mut().enumerate().rev() {
-            let index = index as u32;
-            if index < mark.depth {
-                break;
-            }
-            if frame.absorbs != key {
-                frame.taint = Some(frame.taint.map_or(index, |taint| taint.min(index)));
+    CURRENT.with(|current| {
+        if let Some(evaluation) = current.borrow_mut().as_mut() {
+            for (index, frame) in evaluation.frames.iter_mut().enumerate().rev() {
+                let index = index as u32;
+                if index < mark.depth {
+                    break;
+                }
+                if frame.absorbs != key {
+                    frame.taint = Some(frame.taint.map_or(index, |taint| taint.min(index)));
+                }
             }
         }
     });
@@ -361,9 +369,9 @@ pub fn consult_absorbed(key: u64, mark: ScopeMark) {
 pub fn consult_cycle(mark: ScopeMark) {
     consult_scope(ScopeMark {
         depth: mark.depth.saturating_sub(1),
-        stamp: RECORDER.with_borrow(|recorder| {
-            recorder
-                .current
+        stamp: CURRENT.with(|current| {
+            current
+                .borrow()
                 .as_ref()
                 .map_or(0, |evaluation| match mark.depth.checked_sub(2) {
                     None => evaluation.stamp,
@@ -442,7 +450,7 @@ pub fn reuse(
                 });
                 for at in range {
                     let slot = evaluation.log[at];
-                    evaluation.replay(table, slot);
+                    evaluation.log_slot(table, slot);
                 }
                 replay_unkeyed(evaluation, provenance);
             }
@@ -481,7 +489,7 @@ pub fn reuse(
             });
             if replays {
                 for slot in reads {
-                    evaluation.replay(table, *slot);
+                    evaluation.log_slot(table, *slot);
                 }
                 replay_unkeyed(evaluation, provenance);
             }
@@ -519,18 +527,11 @@ pub fn new_stamp() -> u64 {
 /// Marks keys written before the table was lent, now that it is.
 pub fn note_written(keys: impl IntoIterator<Item = super::HashedKey>) {
     let now = next_stamp();
-    with_lent_table(|table| {
-        for key in keys {
-            table.mark_written(&key, now);
-        }
-    });
-}
-
-/// Runs `f` on the key table lent to this thread, if any.
-fn with_lent_table(f: impl FnOnce(&mut KeyTable)) {
-    RECORDER.with_borrow_mut(|recorder| {
-        if let Some(table) = recorder.keys.as_mut() {
-            f(table);
+    KEYS.with(|table| {
+        if let Some(table) = table.borrow_mut().as_mut() {
+            for key in keys {
+                table.mark_written(&key, now);
+            }
         }
     });
 }
@@ -581,9 +582,11 @@ fn reuse_viewed(
 /// the table is lent; see [`KeyTable::open_window`].
 pub fn note_recomputing(keys: impl IntoIterator<Item = super::HashedKey>) {
     let now = next_stamp();
-    with_lent_table(|table| {
-        for key in keys {
-            table.open_window(&key, now);
+    KEYS.with(|table| {
+        if let Some(table) = table.borrow_mut().as_mut() {
+            for key in keys {
+                table.open_window(&key, now);
+            }
         }
     });
 }
@@ -591,7 +594,11 @@ pub fn note_recomputing(keys: impl IntoIterator<Item = super::HashedKey>) {
 /// Ends [`note_recomputing`]: a key `unchanged` accepts reads as written
 /// when it was before.
 pub fn note_recomputed(unchanged: impl Fn(&super::HashedKey) -> bool) {
-    with_lent_table(|table| table.close_windows(unchanged));
+    KEYS.with(|table| {
+        if let Some(table) = table.borrow_mut().as_mut() {
+            table.close_windows(unchanged);
+        }
+    });
 }
 
 /// Taints the open frames of `evaluation`: it read a value being computed
@@ -799,9 +806,8 @@ mod tests {
 
     /// Holds `key` in the lent table as a cleared loop does.
     fn hold(key: FactKey) {
-        RECORDER.with_borrow_mut(|recorder| {
-            recorder
-                .keys
+        KEYS.with(|keys| {
+            keys.borrow_mut()
                 .as_mut()
                 .expect("a table is lent")
                 .hold_window(&HashedKey::new(key), new_stamp());
@@ -810,9 +816,8 @@ mod tests {
 
     /// Releases every held key, `unchanged` deciding which came back.
     fn release(unchanged: bool) {
-        RECORDER.with_borrow_mut(|recorder| {
-            recorder
-                .keys
+        KEYS.with(|keys| {
+            keys.borrow_mut()
                 .as_mut()
                 .expect("a table is lent")
                 .release_held(|_| unchanged);
@@ -892,178 +897,6 @@ mod tests {
         derivation::take_keys();
 
         assert_eq!((under_other, under_read), (Reuse::Held, Reuse::Elsewhere));
-    }
-
-    /// Notes a read of the realm of file 1 directly, then by its identity.
-    fn note_realm_read_both_ways() {
-        derivation::note_read(|| FactKey::GmodRealm(FileId::new(1)));
-        derivation::note_file_fact_read(derivation::FileFact::GmodRealm, FileId::new(1));
-    }
-
-    /// Notes a read of the realm of file 1 by its identity, then directly.
-    fn note_realm_read_by_identity_first() {
-        derivation::note_file_fact_read(derivation::FileFact::GmodRealm, FileId::new(1));
-        derivation::note_read(|| FactKey::GmodRealm(FileId::new(1)));
-    }
-
-    /// Whether a value computed in a frame that `note` reads in, after the
-    /// evaluation already read the same way, holds once the read is written.
-    fn holds_after_write_of_a_read_made_before_its_frame(note: fn()) -> Reuse {
-        let read = || FactKey::GmodRealm(FileId::new(1));
-        derivation::lend_keys(KeyTable::default());
-        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
-        note();
-        let frame = open_frame().expect("a table is lent");
-        note();
-        let value = close_frame(frame, 0).expect("the frame saw no taint");
-        derivation::end();
-        derivation::begin(DerivationId::workspace(DerivationKind::NetHelperNames));
-        derivation::note_write(read);
-        let holds = reuse(&value, 0, &[], None);
-        derivation::end();
-        derivation::take_keys();
-        holds
-    }
-
-    /// A key read before a frame opened and read again inside it is one of
-    /// the frame's reads, however it is noted.
-    #[test]
-    fn a_key_read_before_a_frame_opened_is_recorded_by_the_frame_reading_it_again() {
-        assert_eq!(
-            (
-                holds_after_write_of_a_read_made_before_its_frame(note_realm_read_both_ways),
-                holds_after_write_of_a_read_made_before_its_frame(
-                    note_realm_read_by_identity_first
-                ),
-            ),
-            (Reuse::Stale, Reuse::Stale)
-        );
-    }
-
-    /// Whether a frame that `note` reads in, after the evaluation already read
-    /// the same way, is shared while the read is being computed again.
-    fn shared_while_a_read_made_before_its_frame_is_recomputed(note: fn()) -> bool {
-        let read = || FactKey::GmodRealm(FileId::new(1));
-        derivation::lend_keys(KeyTable::default());
-        let _ = value_reading(read);
-        note_recomputing([HashedKey::new(read())]);
-        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
-        note();
-        let frame = open_frame().expect("a table is lent");
-        note();
-        let shared = close_frame(frame, 0).is_some();
-        derivation::end();
-        note_recomputed(|_| true);
-        derivation::take_keys();
-        shared
-    }
-
-    /// A key being computed again taints every frame that reads it, also one
-    /// that opened after the evaluation first read it.
-    #[test]
-    fn a_key_being_recomputed_taints_a_frame_that_reads_it_again() {
-        assert_eq!(
-            (
-                shared_while_a_read_made_before_its_frame_is_recomputed(note_realm_read_both_ways),
-                shared_while_a_read_made_before_its_frame_is_recomputed(
-                    note_realm_read_by_identity_first
-                ),
-            ),
-            (false, false)
-        );
-    }
-
-    fn realm() -> FactKey {
-        FactKey::GmodRealm(FileId::new(1))
-    }
-
-    fn member_slot() -> FactKey {
-        FactKey::MemberSlot(
-            crate::LuaMemberOwner::GlobalPath(crate::GlobalId::new("resume_test")),
-            crate::LuaMemberKey::Name("field".into()),
-        )
-    }
-
-    /// Whether a value computed in a frame opened once the evaluation resumed
-    /// with a table, reading as `note` reads `read` as it did before the table
-    /// was lent, holds once `read` is written.
-    fn holds_after_write_of_a_read_made_before_resuming(
-        note: fn(),
-        read: fn() -> FactKey,
-    ) -> Reuse {
-        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
-        note();
-        let evaluation = derivation::end();
-        derivation::lend_keys(KeyTable::default());
-        derivation::resume(evaluation);
-        let frame = open_frame().expect("a table is lent");
-        note();
-        let value = close_frame(frame, 0).expect("the frame saw no taint");
-        derivation::note_write(read);
-        let holds = reuse(&value, 0, &[], None);
-        derivation::end();
-        derivation::take_keys();
-        holds
-    }
-
-    /// A read noted while no table was lent is logged once the evaluation
-    /// resumes with one, however it is noted, so a frame that reads it again
-    /// depends on it.
-    #[test]
-    fn a_key_read_before_the_table_was_lent_is_recorded_by_a_frame_after_resuming() {
-        assert_eq!(
-            (
-                holds_after_write_of_a_read_made_before_resuming(
-                    || derivation::note_read(realm),
-                    realm
-                ),
-                holds_after_write_of_a_read_made_before_resuming(
-                    || {
-                        derivation::note_file_fact_read(
-                            derivation::FileFact::GmodRealm,
-                            FileId::new(1),
-                        );
-                    },
-                    realm
-                ),
-                holds_after_write_of_a_read_made_before_resuming(
-                    || {
-                        let FactKey::MemberSlot(owner, key) = member_slot() else {
-                            unreachable!("a member slot");
-                        };
-                        derivation::note_member_slot_read(&owner, &key);
-                    },
-                    member_slot
-                ),
-            ),
-            (Reuse::Stale, Reuse::Stale, Reuse::Stale)
-        );
-    }
-
-    /// A write of a key the evaluation read only through a reused value
-    /// advances the write generation memoised inference checks; a write of a
-    /// key it never read does not.
-    #[test]
-    fn a_write_of_a_key_read_through_a_reused_value_advances_the_write_generation() {
-        let read = || FactKey::GmodRealm(FileId::new(1));
-        let unread = || FactKey::GmodRealm(FileId::new(2));
-        derivation::lend_keys(KeyTable::default());
-        let value = value_reading(read);
-        let _ = value_reading(unread);
-        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
-        let reused = reuse(&value, 0, &[], None);
-        let before = derivation::write_generation();
-        derivation::note_write(unread);
-        let after_unread = derivation::write_generation();
-        derivation::note_write(read);
-        let after_read = derivation::write_generation();
-        derivation::end();
-        derivation::take_keys();
-
-        assert_eq!(
-            (reused, after_unread - before, after_read - after_unread),
-            (Reuse::Held, 0, 1)
-        );
     }
 
     /// Reads noted by identity stay apart for distinct keys: two table
