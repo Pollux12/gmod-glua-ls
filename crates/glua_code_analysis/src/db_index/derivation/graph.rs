@@ -1178,6 +1178,245 @@ impl ReaderGraph {
             .map(|slot| slot.id)
     }
 
+    /// The derivations of the kinds `follows` accepts that read one of `keys`,
+    /// or read, through what such derivations write, what one of them writes.
+    pub fn readers_downstream<'a>(
+        &self,
+        keys: impl IntoIterator<Item = &'a HashedKey>,
+        follows: impl Fn(DerivationKind) -> bool,
+    ) -> FxHashSet<DerivationId> {
+        let mut marked = vec![false; self.derivations.len()];
+        let mut pending = Vec::new();
+        for slot in keys.into_iter().filter_map(|key| self.table.find(key)) {
+            self.mark_readers(slot, &mut marked, &mut pending, &follows);
+        }
+        self.mark_downstream(&mut marked, pending, &follows);
+        marked
+            .iter()
+            .enumerate()
+            .filter(|(_, marked)| **marked)
+            .map(|(deriv, _)| self.derivations[deriv].id)
+            .collect()
+    }
+
+    /// Marks, from the marked derivations in `pending`, every derivation of
+    /// the kinds `follows` accepts that reads what a marked one writes.
+    fn mark_downstream(
+        &self,
+        marked: &mut [bool],
+        mut pending: Vec<DerivIdx>,
+        follows: &impl Fn(DerivationKind) -> bool,
+    ) {
+        while let Some(deriv) = pending.pop() {
+            let Some(record) = self.derivations[deriv as usize].record.as_ref() else {
+                continue;
+            };
+            for output in record.outputs.iter() {
+                self.mark_readers(*output, marked, &mut pending, follows);
+            }
+        }
+    }
+
+    /// Marks the unmarked readers of `slot`, and of the keys read out of it,
+    /// of the kinds `follows` accepts, and adds them to `pending`.
+    fn mark_readers(
+        &self,
+        slot: KeyIdx,
+        marked: &mut [bool],
+        pending: &mut Vec<DerivIdx>,
+        follows: &impl Fn(DerivationKind) -> bool,
+    ) {
+        let derived = self
+            .table
+            .derived
+            .get(&slot)
+            .map_or(&[][..], |derived| derived.slots.as_slice());
+        for slot in std::iter::once(&slot).chain(derived) {
+            for (_, readers) in self.table.keys[*slot as usize].readers.groups() {
+                for reader in readers {
+                    if !marked[*reader as usize]
+                        && follows(self.derivations[*reader as usize].id.kind)
+                    {
+                        marked[*reader as usize] = true;
+                        pending.push(*reader);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The loops through `roots` among the derivations of the kinds `follows`
+    /// accepts that `selects`, and that read, through what they read, from no
+    /// other loop it selects: each set of two or more of them that read,
+    /// through one another, what each writes, members sorted.
+    pub fn read_loops(
+        &self,
+        roots: impl IntoIterator<Item = DerivationId>,
+        follows: impl Fn(DerivationKind) -> bool,
+        mut selects: impl FnMut(&[DerivationId]) -> bool,
+    ) -> Vec<Vec<DerivationId>> {
+        // Tarjan's algorithm along reads, from each root not yet visited:
+        // `order` holds each visited derivation's index and lowest reachable
+        // index.
+        struct Visit {
+            deriv: DerivIdx,
+            producers: Vec<DerivIdx>,
+            next: usize,
+        }
+        // Each key slot's base slot, found once per search: `NO_BASE` for a
+        // key without one, `UNSEEN` until looked up.
+        const UNSEEN: KeyIdx = KeyIdx::MAX;
+        const NO_BASE: KeyIdx = KeyIdx::MAX - 1;
+        let mut base_slots = vec![UNSEEN; self.table.keys.len()];
+        const UNVISITED: u32 = u32::MAX;
+        let count = self.derivations.len();
+        let roots = roots
+            .into_iter()
+            .filter_map(|root| self.deriv_slots.get(&root).copied())
+            .collect::<Vec<_>>();
+        // A loop through a root, and whatever lies between two such loops,
+        // is downstream of a root: the search keeps to what is.
+        let mut downstream_of_roots = vec![false; count];
+        let mut pending = Vec::new();
+        for root in &roots {
+            if !std::mem::replace(&mut downstream_of_roots[*root as usize], true) {
+                pending.push(*root);
+            }
+        }
+        self.mark_downstream(&mut downstream_of_roots, pending, &follows);
+        let mut producers_read_by = |deriv: DerivIdx| {
+            let mut producers = Vec::new();
+            let Some(record) = self.derivations[deriv as usize].record.as_ref() else {
+                return producers;
+            };
+            for slot in record.reads.iter() {
+                let base_slot = &mut base_slots[*slot as usize];
+                if *base_slot == UNSEEN {
+                    *base_slot = self
+                        .table
+                        .key(*slot)
+                        .base()
+                        .and_then(|base| self.table.find(&HashedKey::new(base)))
+                        .unwrap_or(NO_BASE);
+                }
+                let base = (*base_slot != NO_BASE).then_some(*base_slot);
+                for slot in std::iter::once(*slot).chain(base) {
+                    producers.extend(self.table.producers(slot).filter(|producer| {
+                        *producer != deriv && downstream_of_roots[*producer as usize]
+                    }));
+                }
+            }
+            producers.sort_unstable();
+            producers.dedup();
+            producers
+        };
+        // Each visited derivation's index and lowest reachable index.
+        let mut order = vec![(UNVISITED, UNVISITED); count];
+        let mut next_index = 0;
+        let mut stack = Vec::new();
+        let mut on_stack = vec![false; count];
+        let mut loops = Vec::new();
+        // Each finished derivation's component, and whether a selected loop
+        // is in or upstream of it. A component finishes after every one it
+        // reads from, so theirs are known by then: a derivation that reads
+        // from a finished component one is in or below is marked when it
+        // does.
+        let mut component_of = vec![usize::MAX; count];
+        let mut downstream = Vec::<bool>::new();
+        let mut reads_selected = vec![false; count];
+        for root in roots {
+            if order[root as usize].0 != UNVISITED {
+                continue;
+            }
+            let mut visit = |deriv: DerivIdx,
+                             order: &mut [(u32, u32)],
+                             next_index: &mut u32,
+                             stack: &mut Vec<DerivIdx>,
+                             on_stack: &mut [bool]| {
+                order[deriv as usize] = (*next_index, *next_index);
+                *next_index += 1;
+                stack.push(deriv);
+                on_stack[deriv as usize] = true;
+                Visit {
+                    deriv,
+                    producers: producers_read_by(deriv),
+                    next: 0,
+                }
+            };
+            let mut calls = vec![visit(
+                root,
+                &mut order,
+                &mut next_index,
+                &mut stack,
+                &mut on_stack,
+            )];
+            while let Some(top) = calls.last_mut() {
+                if let Some(producer) = top.producers.get(top.next).copied() {
+                    top.next += 1;
+                    let reader = top.deriv as usize;
+                    let producer_index = producer as usize;
+                    if order[producer_index].0 == UNVISITED {
+                        let call = visit(
+                            producer,
+                            &mut order,
+                            &mut next_index,
+                            &mut stack,
+                            &mut on_stack,
+                        );
+                        calls.push(call);
+                    } else if on_stack[producer_index] {
+                        order[reader].1 = order[reader].1.min(order[producer_index].0);
+                    } else if downstream[component_of[producer_index]] {
+                        reads_selected[reader] = true;
+                    }
+                    continue;
+                }
+                let finished = calls.pop().expect("a call");
+                let (index, low) = order[finished.deriv as usize];
+                if let Some(parent) = calls.last() {
+                    let parent_low = &mut order[parent.deriv as usize].1;
+                    *parent_low = (*parent_low).min(low);
+                }
+                if index != low {
+                    continue;
+                }
+                let mut members = Vec::new();
+                loop {
+                    let member = stack.pop().expect("on the stack");
+                    on_stack[member as usize] = false;
+                    members.push(member);
+                    if member == finished.deriv {
+                        break;
+                    }
+                }
+                let component_index = downstream.len();
+                for member in &members {
+                    component_of[*member as usize] = component_index;
+                }
+                let upstream_selected = members
+                    .iter()
+                    .any(|member| reads_selected[*member as usize]);
+                let mut component = members
+                    .iter()
+                    .map(|member| self.derivations[*member as usize].id)
+                    .collect::<Vec<_>>();
+                component.sort_unstable();
+                let selected = component.len() > 1 && selects(&component);
+                downstream.push(upstream_selected || selected);
+                if selected && !upstream_selected {
+                    loops.push(component);
+                }
+                if (upstream_selected || selected)
+                    && let Some(parent) = calls.last()
+                {
+                    reads_selected[parent.deriv as usize] = true;
+                }
+            }
+        }
+        loops.sort_unstable();
+        loops
+    }
+
     pub fn contains(&self, id: DerivationId) -> bool {
         self.record(id).is_some()
     }

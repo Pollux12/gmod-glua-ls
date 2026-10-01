@@ -915,6 +915,11 @@ impl DerivationKind {
         }
     }
 
+    /// Whether derivations of this kind are statements.
+    pub fn is_statement(self) -> bool {
+        self.rank() == Self::LocalStat.rank()
+    }
+
     /// Whether derivations of this kind are queries: computed when first
     /// read rather than scheduled, and re-computed when a read of theirs moves.
     pub fn is_query(self) -> bool {

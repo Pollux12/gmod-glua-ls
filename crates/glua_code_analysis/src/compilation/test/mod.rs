@@ -42,6 +42,7 @@ mod retraction_test;
 mod return_unwrap_test;
 mod schedule_order_test;
 mod self_nesting_cycle_test;
+mod self_support_test;
 mod shared_cache_test;
 mod slice_test;
 mod stack_exhaustion_test;

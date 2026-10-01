@@ -1,0 +1,451 @@
+//! A value derivations on a cycle hold only for each other goes when the
+//! support that brought it in goes: after every update, the index is what a
+//! cold build of the same texts leaves.
+#[cfg(test)]
+mod test {
+    use crate::{Emmyrc, Slice, UpdateProgress, VirtualWorkspace};
+
+    #[derive(Clone, Copy)]
+    enum Step<'a> {
+        Write(&'a str, &'a str),
+        /// A write settled one evaluation at a time, a different file put
+        /// ahead after each, as diagnostics pulls do while the server types.
+        WriteInSlices(&'a str, &'a str),
+        Delete(&'a str),
+    }
+
+    fn workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws
+    }
+
+    /// The settled index and semantic digest, every file id spelled as its
+    /// path so workspaces holding different files compare.
+    fn digest(ws: &VirtualWorkspace) -> Vec<String> {
+        let db = ws.analysis.compilation.get_db();
+        let vfs = db.get_vfs();
+        let mut paths = vfs
+            .get_all_file_ids()
+            .into_iter()
+            .filter_map(|file_id| {
+                let path = vfs.get_file_path(&file_id)?;
+                Some((
+                    format!("FileId {{ id: {} }}", file_id.id),
+                    path.to_string_lossy().replace('\\', "/"),
+                ))
+            })
+            .collect::<Vec<_>>();
+        // Longer ids first, so `id: 1 }` never rewrites inside `id: 12 }`.
+        paths.sort_by_key(|(id, _)| std::cmp::Reverse(id.len()));
+        let mut digest = ws
+            .settled_digest()
+            .into_iter()
+            .filter(|line| !line.starts_with("LuaTypeDeclId"))
+            .collect::<Vec<_>>();
+        digest.extend(db.get_type_index().iter_type_decls().map(|decl| {
+            let mut locations = decl
+                .get_locations()
+                .iter()
+                .map(|location| {
+                    let path = vfs
+                        .get_file_path(&location.file_id)
+                        .map(|path| path.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_default();
+                    format!("{path}@{:?}", location.range)
+                })
+                .collect::<Vec<_>>();
+            locations.sort();
+            format!("{:?} at {locations:?}", decl.get_id())
+        }));
+        digest.extend(
+            db.get_member_index()
+                .iter_current_owner_keys()
+                .map(|(owner, key)| format!("{owner:?} owns {key:?}")),
+        );
+        let mut digest = digest
+            .into_iter()
+            .map(|line| {
+                paths
+                    .iter()
+                    .fold(line, |line, (id, path)| line.replace(id.as_str(), path))
+            })
+            .collect::<Vec<_>>();
+        digest.sort();
+        digest
+    }
+
+    /// Applies `steps` to a workspace holding `files` and, after each, asserts
+    /// it matches a cold build of the texts as they stand.
+    fn settles_as_cold(files: &[(&str, &str)], steps: &[Step]) {
+        let mut warm = workspace();
+        warm.def_files(files.to_vec());
+        let mut texts = files.to_vec();
+        for (number, step) in steps.iter().enumerate() {
+            match *step {
+                Step::Write(path, text) => {
+                    warm.def_file(path, text);
+                    match texts.iter_mut().find(|(existing, _)| *existing == path) {
+                        Some(entry) => entry.1 = text,
+                        None => texts.push((path, text)),
+                    }
+                }
+                Step::WriteInSlices(path, text) => {
+                    let uri = warm.virtual_url_generator.new_uri(path);
+                    let file_id = warm
+                        .analysis
+                        .update_file_text_only(&uri, text.to_string())
+                        .expect("a workspace file");
+                    let ahead = texts
+                        .iter()
+                        .filter_map(|(path, _)| {
+                            let uri = warm.virtual_url_generator.new_uri(path);
+                            warm.analysis.get_file_id(&uri)
+                        })
+                        .collect::<Vec<_>>();
+                    warm.analysis.begin_reindex(vec![file_id]);
+                    for next in ahead.iter().cycle() {
+                        match warm.analysis.advance_reindex(Slice::Evaluations(1)) {
+                            UpdateProgress::Settled(_) => break,
+                            UpdateProgress::Settling => {
+                                warm.analysis.compilation.prioritise_update(&[*next]);
+                            }
+                            UpdateProgress::TextChanged => panic!("no text changed"),
+                        }
+                    }
+                    if let Some(entry) = texts.iter_mut().find(|(existing, _)| *existing == path) {
+                        entry.1 = text;
+                    }
+                }
+                Step::Delete(path) => {
+                    let uri = warm.virtual_url_generator.new_uri(path);
+                    warm.analysis.remove_file_by_uri(&uri);
+                    texts.retain(|(existing, _)| *existing != path);
+                }
+            }
+            let mut cold = workspace();
+            cold.def_files(texts.clone());
+            let (warm, cold) = (digest(&warm), digest(&cold));
+            let only_warm = warm
+                .iter()
+                .filter(|line| !cold.contains(line))
+                .collect::<Vec<_>>();
+            let only_cold = cold
+                .iter()
+                .filter(|line| !warm.contains(line))
+                .collect::<Vec<_>>();
+            assert!(
+                only_warm.is_empty() && only_cold.is_empty(),
+                "step {number}: only warm {only_warm:#?}\nonly cold {only_cold:#?}"
+            );
+        }
+    }
+
+    const ANNOTATIONS: (&str, &str) = (
+        "lua/aaa_annotations/player.lua",
+        "---@class Entity
+---@class Weapon : Entity
+---@class Player : Entity
+---@return Weapon[]
+function Player:GetWeapons() end
+---@param class string
+---@return Weapon
+function Player:Give(class) end
+",
+    );
+
+    const SHARED: (&str, &str) = (
+        "gamemodes/helix/gamemode/shared.lua",
+        "ix = ix or {meta = {}}
+ix.item = ix.item or {}
+",
+    );
+
+    const ITEM_META: (&str, &str) = (
+        "gamemodes/helix/gamemode/core/meta/sh_item.lua",
+        "local ITEM = ix.meta.item or {}
+ITEM.__index = ITEM
+ITEM.name = \"Undefined\"
+
+function ITEM:GetName()
+    return self.name
+end
+
+ix.meta.item = ITEM
+",
+    );
+
+    const ITEM_LIB: &str = "gamemodes/helix/gamemode/core/libs/sh_item.lua";
+
+    const ITEM_REGISTER: &str = "function ix.item.Register(uniqueID)
+    local meta = ix.meta.item
+    ITEM = setmetatable({}, meta)
+    ITEM.uniqueID = uniqueID
+end
+";
+
+    const WEAPON_BASE: (&str, &str) = (
+        "gamemodes/helix/gamemode/items/base/sh_weapons.lua",
+        "---@param weapon Weapon
+function ITEM:Equip(weapon)
+    weapon.ixItem = self
+end
+
+---@param weapon Weapon
+function ITEM:Unequip(weapon)
+    weapon.ixItem = nil
+end
+",
+    );
+
+    const RESTRICT: (&str, &str) = (
+        "gamemodes/helix/gamemode/core/meta/sh_player.lua",
+        "---@param client Player
+function ix_Restrict(client)
+    client.ixRestrictWeps = client.ixRestrictWeps or {}
+
+    for _, v in ipairs(client:GetWeapons()) do
+        client.ixRestrictWeps[#client.ixRestrictWeps + 1] = {
+            class = \"weapon\",
+            item = v.ixItem,
+        }
+    end
+end
+
+---@param client Player
+function ix_Unrestrict(client)
+    if (client.ixRestrictWeps) then
+        for _, v in ipairs(client.ixRestrictWeps) do
+            local weapon = client:Give(v.class)
+
+            if (v.item) then
+                weapon.ixItem = v.item
+            end
+        end
+
+        client.ixRestrictWeps = nil
+    end
+end
+",
+    );
+
+    #[test]
+    fn a_saved_and_restored_field_loses_a_type_whose_only_supplier_is_deleted() {
+        settles_as_cold(
+            &[
+                ANNOTATIONS,
+                SHARED,
+                ITEM_META,
+                (ITEM_LIB, ITEM_REGISTER),
+                WEAPON_BASE,
+                RESTRICT,
+            ],
+            &[Step::Delete(ITEM_LIB), Step::Write(ITEM_LIB, ITEM_REGISTER)],
+        );
+    }
+
+    const NET: (&str, &str) = (
+        "lua/aaa_annotations/net.lua",
+        "---@meta
+net = {}
+
+---@param name string
+---@param callback fun(len: integer)
+function net.Receive(name, callback) end
+
+---@return table<any, any>
+function net.ReadTable() end
+
+---@return string
+function net.ReadString() end
+
+---@return boolean
+function net.ReadBool() end
+",
+    );
+
+    const PLUGIN_LIB: (&str, &str) = (
+        "gamemodes/helix/gamemode/core/libs/sh_plugin.lua",
+        "ix.plugin = ix.plugin or {}
+ix.plugin.unloaded = ix.plugin.unloaded or {}
+
+---@return string|any
+function ix_LoadUnloaded() end
+
+function ix.plugin.Initialize()
+    if SERVER then
+        ix.plugin.unloaded = ix_LoadUnloaded()
+    end
+end
+
+function ix.plugin.SetUnloaded(uniqueID, state)
+    if (state) then
+        ix.plugin.unloaded[uniqueID] = true
+    elseif (ix.plugin.unloaded[uniqueID]) then
+        ix.plugin.unloaded[uniqueID] = false
+    end
+end
+",
+    );
+
+    const PLUGIN_CONFIG: (&str, &str) = (
+        "gamemodes/helix/gamemode/core/sh_config.lua",
+        "if CLIENT then
+    net.Receive(\"ixConfigUnloadedList\", function()
+        ix.plugin.unloaded = net.ReadTable()
+    end)
+
+    net.Receive(\"ixConfigPluginToggle\", function()
+        local uniqueID = net.ReadString()
+
+        if (net.ReadBool()) then
+            ix.plugin.unloaded[uniqueID] = false
+        else
+            ix.plugin.unloaded[uniqueID] = true
+        end
+    end)
+end
+",
+    );
+
+    #[test]
+    fn writes_through_a_guarded_bootstrap_stop_homing_on_it_when_its_other_writer_is_deleted() {
+        settles_as_cold(
+            &[NET, SHARED, PLUGIN_LIB, PLUGIN_CONFIG],
+            &[
+                Step::Delete(PLUGIN_CONFIG.0),
+                Step::Write(PLUGIN_CONFIG.0, PLUGIN_CONFIG.1),
+            ],
+        );
+    }
+
+    const ITEM_REGISTRY: &str = "ix.item.list = ix.item.list or {}
+ix.item.base = ix.item.base or {}
+
+function ix.item.Register(uniqueID, baseID, isBaseItem)
+    local meta = ix.meta.item
+
+    ITEM = (isBaseItem and ix.item.base or ix.item.list)[uniqueID] or setmetatable({}, meta)
+    ITEM.uniqueID = uniqueID;
+
+    (isBaseItem and ix.item.base or ix.item.list)[ITEM.uniqueID] = ITEM
+end
+";
+
+    #[test]
+    fn a_registered_item_keeps_no_fallback_table_once_its_metatable_returns() {
+        settles_as_cold(
+            &[SHARED, ITEM_META, (ITEM_LIB, ITEM_REGISTRY)],
+            &[
+                Step::Delete(ITEM_META.0),
+                Step::Write(ITEM_META.0, ITEM_META.1),
+            ],
+        );
+    }
+
+    const EQUIP_AND_SAVE: (&str, &str) = (
+        "gamemodes/helix/gamemode/items/base/sh_weapons.lua",
+        "---@param weapon Weapon
+function ITEM:Equip(weapon)
+    weapon.ixItem = self
+end
+
+---@param client Player
+function ix_Restrict(client)
+    client.ixRestrictWeps = client.ixRestrictWeps or {}
+
+    for _, v in ipairs(client:GetWeapons()) do
+        client.ixRestrictWeps[#client.ixRestrictWeps + 1] = {
+            class = \"weapon\",
+            item = v.ixItem,
+        }
+    end
+end
+",
+    );
+
+    const UNRESTRICT: (&str, &str) = (
+        "gamemodes/helix/gamemode/core/meta/sh_player.lua",
+        "---@param client Player
+function ix_Unrestrict(client)
+    if (client.ixRestrictWeps) then
+        for _, v in ipairs(client.ixRestrictWeps) do
+            local weapon = client:Give(v.class)
+
+            if (v.item) then
+                weapon.ixItem = v.item
+            end
+        end
+
+        client.ixRestrictWeps = nil
+    end
+end
+",
+    );
+
+    #[test]
+    fn a_saved_field_loses_a_type_when_the_file_that_saves_it_stops_supplying_it() {
+        let without_supplier = EQUIP_AND_SAVE.1.replace(
+            "    weapon.ixItem = self
+",
+            "",
+        );
+        settles_as_cold(
+            &[
+                ANNOTATIONS,
+                SHARED,
+                ITEM_META,
+                (ITEM_LIB, ITEM_REGISTER),
+                EQUIP_AND_SAVE,
+                UNRESTRICT,
+            ],
+            &[
+                Step::Write(EQUIP_AND_SAVE.0, &without_supplier),
+                Step::Write(EQUIP_AND_SAVE.0, EQUIP_AND_SAVE.1),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_saved_and_restored_field_settles_as_cold_while_files_are_put_ahead_mid_reanalysis() {
+        settles_as_cold(
+            &[
+                ANNOTATIONS,
+                SHARED,
+                ITEM_META,
+                (ITEM_LIB, ITEM_REGISTER),
+                WEAPON_BASE,
+                RESTRICT,
+            ],
+            &[
+                Step::WriteInSlices(ITEM_LIB, ""),
+                Step::WriteInSlices(ITEM_LIB, ITEM_REGISTER),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_saved_field_settles_as_cold_while_files_are_put_ahead_mid_reanalysis() {
+        let without_supplier = EQUIP_AND_SAVE.1.replace(
+            "    weapon.ixItem = self
+",
+            "",
+        );
+        settles_as_cold(
+            &[
+                ANNOTATIONS,
+                SHARED,
+                ITEM_META,
+                (ITEM_LIB, ITEM_REGISTER),
+                EQUIP_AND_SAVE,
+                UNRESTRICT,
+            ],
+            &[
+                Step::WriteInSlices(EQUIP_AND_SAVE.0, &without_supplier),
+                Step::WriteInSlices(EQUIP_AND_SAVE.0, EQUIP_AND_SAVE.1),
+            ],
+        );
+    }
+}

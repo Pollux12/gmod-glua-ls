@@ -28,6 +28,16 @@
 //! A run can advance in slices: it stops between two evaluations and picks up
 //! where it stopped, so readers can use the index in between.
 //!
+//! Statements on a loop read, through one another, what each writes. Settled
+//! from nothing, a loop holds what the facts it reads from outside support.
+//! Once it holds values, a member that runs again reads them back from the
+//! others, so a value an outside fact stops supporting stays: a loop that
+//! settled before some outside fact it read did, in a cold build as in an
+//! update, keeps what that fact supported on the way. Before the run ends,
+//! each loop a fact from outside moved under since it last settled is
+//! cleared and settles again from the first stage, until none is: what a loop
+//! holds is a function of what it reads, not of the order it read it in.
+//!
 //! A run settles in stages (see [`derivation::AnalysisStage`]). Some reads
 //! only have a final answer once nothing can add a fact any more: a field no
 //! writer declared yet, a member slot one of whose writers is still untyped.
@@ -218,6 +228,8 @@ pub(crate) trait Recipe: Sync {
 
 #[derive(Default)]
 pub(crate) struct Engine {
+    /// The order the run takes files in.
+    schedule: Schedule,
     /// This round's work.
     worklist: Queue,
     /// Back edges: readers ranked before the derivation that queued them.
@@ -264,11 +276,59 @@ pub(crate) struct Engine {
     /// Under `GLUALS_TRACE_EVALUATIONS`: the key that first queued each
     /// reader, and the derivation that moved it.
     queued_by: FxHashMap<DerivationId, (HashedKey, Option<DerivationId>)>,
+    /// The statements this run evaluated, and of them those that had a
+    /// record from before the run: what they hold, a run that settled before
+    /// left.
+    ran: FxHashSet<DerivationId>,
+    from_before: FxHashSet<DerivationId>,
+    /// Statements queued because facts they read moved, with what each had
+    /// seen of them before they first moved.
+    moved_from: FxHashMap<DerivationId, Vec<Moved>>,
+    /// The statements evaluated since the last loop check, with the facts
+    /// that moved under them and what they had settled on of each.
+    settled_on: FxHashMap<DerivationId, Vec<Moved>>,
+    /// What the derivations of the files re-analysed wrote, as it stood
+    /// before they were removed: what a reader settled on of it, whatever it
+    /// saw while the files were rebuilt.
+    removed_outputs: FxHashMap<HashedKey, derivation::Fingerprint>,
+    /// The statements of the loops this run cleared. A loop is cleared once
+    /// per run: settled again from nothing, it holds nothing from before the
+    /// run, and what moves under it later it follows as any reader does. A
+    /// loop that runs through a whole-file pass, which a loop of statements
+    /// leaves out, could otherwise be cleared without end, each time from
+    /// what the pass made of the last.
+    cleared: FxHashSet<DerivationId>,
+    /// Since the last loop check cleared loops: every key whose readers were
+    /// checked. A loop the next check can clear lies downstream of one; `None`
+    /// has the next check search every statement that settled on a moved fact.
+    since_search: Option<FxHashSet<HashedKey>>,
+    /// The files whose derivations this run removed and builds again.
+    rebuilt: FxHashSet<crate::FileId>,
+    /// The derivations of the loops being cleared, which settle before any
+    /// other work: a reader outside them waits, and runs only if what they
+    /// settle to moved a fact it read.
+    loop_focus: FxHashSet<DerivationId>,
+    /// The files prioritised while the loops being cleared settle, put ahead
+    /// once they have.
+    after_loops: Vec<crate::FileId>,
+    /// Under `GLUALS_CHECK_CONVERGENCE` or debug assertions: how often each
+    /// derivation was evaluated since the run last entered a stage.
+    stage_evaluations: FxHashMap<DerivationId, u32>,
+}
+
+/// A fact that moved under a statement: what the statement had seen of it,
+/// and whether it moved once the run was settled, at the last stage.
+#[derive(Debug, Clone)]
+struct Moved {
+    key: HashedKey,
+    seen: derivation::Fingerprint,
+    settled: bool,
 }
 
 impl Engine {
     pub(crate) fn new(edits: derivation::EditMaps, schedule: Schedule) -> Self {
         Self {
+            schedule,
             worklist: Queue::new(schedule),
             next_round: Queue::new(schedule),
             to_follow: edits.clone(),
@@ -299,6 +359,7 @@ impl Engine {
             .collect();
         self.to_follow = later;
         self.before_edits.get_mut().clear();
+        self.since_search = None;
     }
 
     /// Whether reads of `key` that saw a fingerprint still hold: the value is
@@ -361,6 +422,30 @@ impl Engine {
         }
     }
 
+    /// Notes what `key` held before the derivation that wrote it was removed,
+    /// unless an earlier removal in this run noted it.
+    pub(crate) fn note_removed_output(
+        &mut self,
+        key: HashedKey,
+        fingerprint: derivation::Fingerprint,
+    ) {
+        self.removed_outputs.entry(key).or_insert(fingerprint);
+    }
+
+    /// Carries the removed outputs noted so far to where `edits` moved them.
+    pub(crate) fn follow_removed_outputs(&mut self, edits: &derivation::EditMaps) {
+        self.removed_outputs = std::mem::take(&mut self.removed_outputs)
+            .into_iter()
+            .map(|(key, fingerprint)| {
+                let key = edits
+                    .map_key(&key)
+                    .filter(|moved| moved != key.key())
+                    .map_or(key, HashedKey::new);
+                (key, fingerprint)
+            })
+            .collect();
+    }
+
     pub(crate) fn changed(&mut self, id: DerivationId) {
         self.stats
             .requeue_cause(id, "changed: its file re-analysed or a producer removed");
@@ -411,6 +496,9 @@ impl Engine {
     /// Queues the readers of `key` whose recorded fingerprint differs from its
     /// current value.
     fn queue_readers(&mut self, db: &DbIndex, key: &HashedKey) {
+        if let Some(keys) = &mut self.since_search {
+            keys.insert(key.clone());
+        }
         if !self.edits.is_empty() {
             self.before_edits.get_mut().remove(key);
             self.touched.insert(key.clone());
@@ -425,6 +513,17 @@ impl Engine {
         for (reader, seen) in readers {
             self.stats
                 .requeued(key, self.cursor, reader, seen == derivation::ABSENT);
+            if reader.kind.is_statement() {
+                let settled = db.analysis_stage() == AnalysisStage::Closed;
+                let moved = self.moved_from.entry(reader).or_default();
+                if moved.iter().all(|moved| moved.key != *key) {
+                    moved.push(Moved {
+                        key: key.clone(),
+                        seen,
+                        settled,
+                    });
+                }
+            }
             if reader.kind.is_query() {
                 db.queries().set_stale(reader, true);
             }
@@ -454,8 +553,13 @@ impl Engine {
     /// Adds `file_ids` to what settles first, starting a focus if none is
     /// settling: their waiting work is queued again, other files' queued work
     /// waits, and so does every reader in another file queued until the focus
-    /// settles.
+    /// settles. While cleared loops settle, which comes before any other work,
+    /// they are put ahead once the loops have settled.
     pub(crate) fn prioritise(&mut self, file_ids: &[crate::FileId]) {
+        if !self.loop_focus.is_empty() {
+            self.after_loops.extend_from_slice(file_ids);
+            return;
+        }
         let added = file_ids
             .iter()
             .filter(|file_id| **file_id != crate::FileId::VIRTUAL)
@@ -500,6 +604,7 @@ impl Engine {
     /// Forgets the queued work of `file_ids`, whose derivations are about to
     /// be replaced and queued again.
     pub(crate) fn replacing(&mut self, file_ids: &[crate::FileId]) {
+        self.since_search = None;
         let replaced = |id: DerivationId| file_ids.contains(&id.file_id);
         self.worklist.take_where(replaced);
         self.next_round.take_where(replaced);
@@ -507,6 +612,11 @@ impl Engine {
         self.held.retain(|id, _| !replaced(*id));
         self.stale_sources
             .retain(|file_id| !file_ids.contains(file_id));
+    }
+
+    /// Notes that `file_id`'s derivations are removed and built again.
+    pub(crate) fn rebuilding(&mut self, file_id: crate::FileId) {
+        self.rebuilt.insert(file_id);
     }
 
     /// Whether `file_id` has work still to settle: queued, waiting, in the
@@ -530,6 +640,9 @@ impl Engine {
 
     /// Whether `reader` waits for the focus to settle.
     fn waits(&self, reader: DerivationId) -> bool {
+        if !self.loop_focus.is_empty() {
+            return !self.loop_focus.contains(&reader);
+        }
         !self.focus.is_empty()
             && reader.file_id != crate::FileId::VIRTUAL
             && !self.focus.contains(&reader.file_id)
@@ -607,7 +720,8 @@ impl Engine {
                 if self.next_round.is_empty() {
                     if crate::profile::phase("engine: stage and release", || {
                         self.advance_stage(db) || self.release_waiting(db)
-                    }) {
+                    }) || crate::profile::phase("engine: loops", || self.clear_loops(db))
+                    {
                         continue;
                     }
                     break;
@@ -629,12 +743,14 @@ impl Engine {
                 self.needs_evaluation(db, id, reason)
             });
             if !stale {
+                self.moved_from.remove(&id);
                 if id.kind.is_query() {
                     db.queries().set_stale(id, false);
                 }
                 continue;
             }
             self.trace_evaluation(db, id, reason);
+            self.check_convergence(id);
             let group = crate::profile::phase("engine: co-producers", || co_producers(db, id));
             if group.len() == 1 && recipe.splits(id.kind) {
                 crate::profile::phase("engine: batch", || self.run_batch(db, id, recipe));
@@ -652,6 +768,16 @@ impl Engine {
                 }
                 self.unqueue(*member);
                 self.stats.evaluated(*member);
+                if member.kind.is_statement()
+                    && self.ran.insert(*member)
+                    && db.reader_graph().contains(*member)
+                {
+                    self.from_before.insert(*member);
+                }
+                let moved = self.moved_from.remove(member).unwrap_or_default();
+                if member.kind.is_statement() {
+                    self.settled_on(*member, moved);
+                }
             }
             self.evaluated.extend(
                 group
@@ -659,6 +785,13 @@ impl Engine {
                     .map(|member| member.file_id)
                     .filter(|file_id| *file_id != crate::FileId::VIRTUAL),
             );
+            let rebuilt = group
+                .iter()
+                .copied()
+                .filter(|member| {
+                    member.kind.is_statement() && self.rebuilt.contains(&member.file_id)
+                })
+                .collect::<Vec<_>>();
             let started = self.stats.profiling().then(std::time::Instant::now);
             let touched = crate::profile::phase("engine: evaluate", || {
                 self.evaluate_group(db, &group, recipe)
@@ -698,9 +831,180 @@ impl Engine {
             }
             self.queue_reruns();
             crate::profile::phase("engine: readers of", || self.readers_of(db, touched.iter()));
+            // A statement of a rebuilt file settled, before the run, on what
+            // the removed derivations wrote.
+            for member in rebuilt {
+                let removed = db
+                    .reader_graph()
+                    .reads_of(member)
+                    .filter_map(|key| {
+                        Some(Moved {
+                            key: key.clone(),
+                            seen: *self.removed_outputs.get(key)?,
+                            settled: true,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                self.settled_on(member, removed);
+            }
         }
         self.cursor = None;
         crate::profile::phase("engine: rebase moved reads", || self.rebase_moved_reads(db));
+        true
+    }
+
+    /// Notes that statement `member` settled on what it saw of each fact in
+    /// `moved`, keeping the earliest sight of a fact it already settled on.
+    fn settled_on(&mut self, member: DerivationId, moved: Vec<Moved>) {
+        if moved.is_empty() {
+            return;
+        }
+        let settled_on = self.settled_on.entry(member).or_default();
+        for moved in moved {
+            if settled_on.iter().all(|settled| settled.key != moved.key) {
+                settled_on.push(moved);
+            }
+        }
+    }
+
+    /// Whether the fact `moved` names, read by `member`, now holds another
+    /// value than the one `member` had settled on. A statement settling for
+    /// the first time counts only a fact it read while nothing held it that
+    /// lands at the last stage, where the floor answer it took from the absent
+    /// fact, or from one only a whole-file pass adds there, is replaced; while
+    /// the run settles, facts otherwise land and grow under their readers. A
+    /// removed derivation's output counts against what it held before the
+    /// removal.
+    fn net_moved(&self, db: &DbIndex, member: DerivationId, moved: &Moved) -> bool {
+        let removed = self.removed_outputs.get(&moved.key).copied();
+        ((moved.settled && moved.seen == derivation::ABSENT)
+            || removed.is_some()
+            || self.from_before.contains(&member))
+            && !self.key_holds(db, &moved.key)(removed.unwrap_or(moved.seen))
+    }
+
+    /// Whether a fact `member` of `lp` reads from outside the loop now holds
+    /// another value than the one `member` had settled on.
+    fn moved_from_outside(&self, db: &DbIndex, lp: &[DerivationId], member: DerivationId) -> bool {
+        let graph = db.reader_graph();
+        self.settled_on.get(&member).is_some_and(|moved| {
+            moved.iter().any(|moved| {
+                // A fact a removed derivation wrote is read from outside the
+                // loop: what the removed writer supplied, nothing in the loop
+                // supplies any more.
+                self.net_moved(db, member, moved)
+                    && (self.removed_outputs.contains_key(&moved.key) || {
+                        let mut producers = graph.producers(&moved.key).peekable();
+                        producers.peek().is_none()
+                            || producers.any(|producer| !lp.contains(&producer))
+                    })
+            })
+        })
+    }
+
+    /// At quiescence, clears every loop of statements one of whose members
+    /// reads from outside the loop a fact that moved since it settled on it:
+    /// each member's primary outputs, and those of whatever shares them, go
+    /// back to the source layer, they run again, and the run starts over from
+    /// the first stage, as a cold build settles a loop through them. Returns
+    /// whether it cleared any.
+    fn clear_loops(&mut self, db: &mut DbIndex) -> bool {
+        // After a check that cleared loops, what a loop's members read and
+        // write, and what their facts hold, moved only through the keys
+        // checked since: a loop it left that the next one clears is
+        // downstream of one.
+        let since = self.since_search.take().map(|keys| {
+            db.reader_graph()
+                .readers_downstream(keys.iter(), DerivationKind::is_statement)
+        });
+        // A loop is cleared for a member that read a fact that net-moved, so
+        // only such members can be roots of one.
+        let roots = self
+            .settled_on
+            .iter()
+            .filter(|(member, _)| since.as_ref().is_none_or(|since| since.contains(*member)))
+            .filter(|(member, moved)| {
+                moved
+                    .iter()
+                    .any(|moved| self.net_moved(db, **member, moved))
+            })
+            .map(|(member, _)| *member)
+            .collect::<BTreeSet<_>>();
+        if roots.is_empty() {
+            self.settled_on.clear();
+            return false;
+        }
+        // A loop downstream of another that is cleared waits for it to
+        // settle: cleared together, it would settle from what the other held
+        // on the way, not from what the other settles to.
+        let loops = db.reader_graph().read_loops(
+            roots.iter().copied(),
+            DerivationKind::is_statement,
+            |lp| {
+                lp.iter().any(|member| !self.cleared.contains(member))
+                    && lp
+                        .iter()
+                        .any(|member| self.moved_from_outside(db, lp, *member))
+            },
+        );
+        if loops.is_empty() {
+            self.settled_on.clear();
+            return false;
+        }
+        self.stats.loops_cleared += loops.len();
+        self.since_search = Some(FxHashSet::default());
+        self.cleared.extend(loops.iter().flatten().copied());
+        let mut members = BTreeSet::new();
+        for statement in loops.iter().flatten() {
+            members.extend(co_producers(db, *statement));
+        }
+
+        if crate::profile::tracing_evaluations() {
+            for member in &members {
+                self.trace(db, *member, "loop cleared", &[]);
+            }
+        }
+        self.stats.loop_members_cleared += members.len();
+        let mut touched = FxHashSet::default();
+        for member in &members {
+            touched.extend(db.reader_graph().outputs_of(*member).cloned());
+        }
+        let reset = derivation::capture_writes(|| {
+            for key in touched.iter().filter(|key| key.is_primary()) {
+                db.reset_fact(key);
+            }
+        });
+        touched.extend(reset);
+        // Written now, in a window of their own: a member that comes back to
+        // the value the reset left must not revive what read the value before.
+        derivation::lend_keys(db.reader_graph_mut().lend_keys());
+        derivation::note_written(touched.iter().cloned());
+        db.reader_graph_mut().restore_keys(derivation::take_keys());
+        for key in &touched {
+            db.reader_graph().forget_fingerprint(key);
+            let before_edits = self.before_edits.get_mut();
+            before_edits.remove(key);
+            for derived in db.reader_graph().derived_keys(key) {
+                before_edits.remove(&derived);
+            }
+        }
+        self.loop_focus = members.iter().copied().collect();
+        // Settled from nothing, a loop whose rules leave it more than one
+        // fixed point lands on the one the order it runs in reaches, so it
+        // settles in file-id order whatever order the run takes files in.
+        debug_assert!(self.worklist.is_empty() && self.next_round.is_empty());
+        self.worklist = Queue::new(Schedule::Canonical);
+        self.next_round = Queue::new(Schedule::Canonical);
+        self.readers_of(db, touched.iter());
+        for member in members {
+            // The loop's own reset is not a fact from outside it.
+            self.moved_from.remove(&member);
+            self.settled_on.remove(&member);
+            self.stats.requeue_cause(member, "loop cleared");
+            self.queue(member, Reason::Changed);
+        }
+        self.enter_stage(db, AnalysisStage::Open);
+        self.cursor = None;
         true
     }
 
@@ -739,8 +1043,24 @@ impl Engine {
         }
     }
 
+    /// Under `GLUALS_CHECK_CONVERGENCE` or debug assertions, panics once `id`
+    /// was evaluated more often within one stage than settling can need: the
+    /// facts it reads keep moving, so some rule among them does not converge.
+    fn check_convergence(&mut self, id: DerivationId) {
+        if !(cfg!(debug_assertions) || check_convergence()) {
+            return;
+        }
+        let evaluations = self.stage_evaluations.entry(id).or_default();
+        *evaluations += 1;
+        assert!(
+            *evaluations <= MAX_STAGE_EVALUATIONS,
+            "{id:?} evaluated {evaluations} times without the run moving to another stage"
+        );
+    }
+
     /// Moves the run to `stage`. Returns the keys of the rules that moved.
     fn enter_stage(&mut self, db: &mut DbIndex, stage: AnalysisStage) -> Vec<HashedKey> {
+        self.stage_evaluations.clear();
         let before = db.analysis_stage();
         db.set_analysis_stage(stage);
         let moved = StageRule::ALL
@@ -805,6 +1125,12 @@ impl Engine {
     /// that still read a moved fact. Returns whether it queued any.
     fn release_waiting(&mut self, db: &mut DbIndex) -> bool {
         self.focus.clear();
+        if !self.loop_focus.is_empty() {
+            self.loop_focus.clear();
+            debug_assert!(self.worklist.is_empty() && self.next_round.is_empty());
+            self.worklist = Queue::new(self.schedule);
+            self.next_round = Queue::new(self.schedule);
+        }
         let mut queued = 0;
         for (reader, reason) in std::mem::take(&mut self.waiting) {
             if reason == Reason::Changed {
@@ -819,6 +1145,7 @@ impl Engine {
                 Vec::new()
             };
             if !self.needs_evaluation(db, reader, Reason::Read) {
+                self.moved_from.remove(&reader);
                 continue;
             }
             if crate::profile::tracing_evaluations() {
@@ -835,8 +1162,12 @@ impl Engine {
             }
         }
         self.stats.focus_settled(queued);
+        let after_loops = std::mem::take(&mut self.after_loops);
         if queued == 0 {
             return false;
+        }
+        if !after_loops.is_empty() {
+            self.prioritise(&after_loops);
         }
         self.enter_stage(db, AnalysisStage::Open);
         self.cursor = None;
@@ -1226,6 +1557,9 @@ pub(crate) struct EngineStats {
     evaluations: BTreeMap<DerivationKind, usize>,
     /// Rounds after the first.
     pub(crate) rounds: usize,
+    /// Loops of statements cleared, and the derivations they ran again.
+    pub(crate) loops_cleared: usize,
+    pub(crate) loop_members_cleared: usize,
     /// Source layers rebuilt because a fact they read moved.
     pub(crate) rebuilt_sources: usize,
     /// Under `GLUALS_PROFILE`: time per kind, the part of it spent
@@ -1411,10 +1745,12 @@ impl EngineStats {
             .map(|(kind, count)| format!("{kind:?}={count}"))
             .collect::<Vec<_>>();
         eprintln!(
-            "[engine] evaluations={} rounds={} rebuilt sources={} files={files} {}",
+            "[engine] evaluations={} rounds={} rebuilt sources={} loops cleared={} ({} derivations) files={files} {}",
             self.total_evaluations(),
             self.rounds,
             self.rebuilt_sources,
+            self.loops_cleared,
+            self.loop_members_cleared,
             kinds.join(" ")
         );
         let mut distinct = BTreeMap::<DerivationKind, usize>::new();
@@ -1666,6 +2002,15 @@ fn scopeguard_lent_keys() -> OnDrop {
 
 /// `GLUALS_CHECK_FINGERPRINTS`: recompute every cached fingerprint and panic on
 /// a key that moved without being written.
+/// How often one derivation may be evaluated within one stage before
+/// [`Engine::check_convergence`] reports that the facts it reads do not settle.
+const MAX_STAGE_EVALUATIONS: u32 = 1000;
+
+fn check_convergence() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("GLUALS_CHECK_CONVERGENCE").is_some())
+}
+
 fn check_fingerprints() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("GLUALS_CHECK_FINGERPRINTS").is_some())

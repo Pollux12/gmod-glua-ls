@@ -449,6 +449,28 @@ fn replace_files(
                 _ => engine.changed(producer),
             }
         }
+        if db
+            .reader_graph()
+            .derivations_of_file(*file_id)
+            .next()
+            .is_some()
+        {
+            engine.rebuilding(*file_id);
+        }
+        let outputs = db
+            .reader_graph()
+            .derivations_of_file(*file_id)
+            .flat_map(|id| {
+                db.reader_graph()
+                    .outputs_of(id)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<HashSet<_>>();
+        for key in outputs {
+            let fingerprint = db.fact_fingerprint(&key);
+            engine.note_removed_output(key, fingerprint);
+        }
         let removed = db.reader_graph_mut().remove_file(*file_id);
         for (_, outputs) in removed {
             for key in outputs.iter() {
@@ -511,6 +533,7 @@ fn replace_files(
         }
     }
     if let Some(edits) = engine.edits_to_apply() {
+        engine.follow_removed_outputs(&edits);
         touched = follow_edits(db, engine, &edits, touched);
     }
     for kind in derive::WORKSPACE_DERIVATIONS {
