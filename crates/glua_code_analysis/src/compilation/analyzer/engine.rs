@@ -317,6 +317,8 @@ pub(crate) struct Engine {
     /// Under `GLUALS_CHECK_CONVERGENCE` or debug assertions: how often each
     /// derivation was evaluated since the run last entered a stage.
     stage_evaluations: FxHashMap<DerivationId, u32>,
+    batch_slot_notifications: bool,
+    pending_slot_notifications: FxHashSet<HashedKey>,
 }
 
 /// A fact that moved under a statement: what the statement had seen of it,
@@ -328,10 +330,20 @@ struct Moved {
     settled: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_SLOT_BATCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 impl Engine {
     pub(crate) fn new(edits: derivation::EditMaps, schedule: Schedule) -> Self {
+        let batch_slot_notifications = true;
+        #[cfg(test)]
+        let batch_slot_notifications =
+            TEST_SLOT_BATCH.with(|value| value.get().unwrap_or(batch_slot_notifications));
         Self {
             schedule,
+            batch_slot_notifications,
             worklist: Queue::new(schedule),
             next_round: Queue::new(schedule),
             to_follow: edits.clone(),
@@ -351,6 +363,16 @@ impl Engine {
     pub(crate) fn take_edits(&mut self, later: derivation::EditMaps) {
         self.edits = self.edits.then(&later);
         self.touched = std::mem::take(&mut self.touched)
+            .into_iter()
+            .flat_map(|key| {
+                let moved = later
+                    .map_key(&key)
+                    .filter(|moved| moved != key.key())
+                    .map(HashedKey::new);
+                std::iter::once(key).chain(moved)
+            })
+            .collect();
+        self.pending_slot_notifications = std::mem::take(&mut self.pending_slot_notifications)
             .into_iter()
             .flat_map(|key| {
                 let moved = later
@@ -499,6 +521,69 @@ impl Engine {
     /// Queues the readers of `key` whose recorded fingerprint differs from its
     /// current value.
     fn queue_readers(&mut self, db: &DbIndex, key: &HashedKey) {
+        if self.batch_slot_notifications
+            && self.loop_focus.is_empty()
+            && matches!(
+                key.key(),
+                FactKey::MemberSlot(..) | FactKey::MemberOwnerMap(_)
+            )
+        {
+            if let Some(keys) = &mut self.since_search {
+                keys.insert(key.clone());
+            }
+            if !self.edits.is_empty() {
+                self.before_edits.get_mut().remove(key);
+                self.touched.insert(key.clone());
+            }
+            let readers = db
+                .reader_graph()
+                .stale_readers_seen(key, self.key_holds(db, key))
+                .collect::<Vec<_>>();
+            for (reader, seen) in readers {
+                self.remember_moved_read(db, key, reader, seen);
+                if reader.kind.is_query() {
+                    db.queries().set_stale(reader, true);
+                }
+            }
+            self.pending_slot_notifications.insert(key.clone());
+            return;
+        }
+        self.queue_readers_now(db, key);
+    }
+
+    pub(crate) fn flush_slot_notifications(&mut self, db: &DbIndex) {
+        let mut pending = std::mem::take(&mut self.pending_slot_notifications)
+            .into_iter()
+            .collect::<Vec<_>>();
+        crate::profile::phase("engine: sort slot notifications", || {
+            pending.sort_by_cached_key(|key| format!("{:?}", key.key()));
+        });
+        for key in pending {
+            self.queue_readers_now(db, &key);
+        }
+    }
+
+    fn remember_moved_read(
+        &mut self,
+        db: &DbIndex,
+        key: &HashedKey,
+        reader: DerivationId,
+        seen: derivation::Fingerprint,
+    ) {
+        if reader.kind.is_statement() {
+            let settled = db.analysis_stage() == AnalysisStage::Closed;
+            let moved = self.moved_from.entry(reader).or_default();
+            if moved.iter().all(|moved| moved.key != *key) {
+                moved.push(Moved {
+                    key: key.clone(),
+                    seen,
+                    settled,
+                });
+            }
+        }
+    }
+
+    fn queue_readers_now(&mut self, db: &DbIndex, key: &HashedKey) {
         if let Some(keys) = &mut self.since_search {
             keys.insert(key.clone());
         }
@@ -516,17 +601,7 @@ impl Engine {
         for (reader, seen) in readers {
             self.stats
                 .requeued(key, self.cursor, reader, seen == derivation::ABSENT);
-            if reader.kind.is_statement() {
-                let settled = db.analysis_stage() == AnalysisStage::Closed;
-                let moved = self.moved_from.entry(reader).or_default();
-                if moved.iter().all(|moved| moved.key != *key) {
-                    moved.push(Moved {
-                        key: key.clone(),
-                        seen,
-                        settled,
-                    });
-                }
-            }
+            self.remember_moved_read(db, key, reader, seen);
             if reader.kind.is_query() {
                 db.queries().set_stale(reader, true);
             }
@@ -717,9 +792,14 @@ impl Engine {
                 self.readers_of(db, moved.iter());
             }
             if slice.over(self.stats.total_evaluations() - started) {
+                self.flush_slot_notifications(db);
                 return false;
             }
             let Some((id, reason)) = self.worklist.pop_first() else {
+                self.flush_slot_notifications(db);
+                if !self.worklist.is_empty() {
+                    continue;
+                }
                 if self.next_round.is_empty() {
                     if crate::profile::phase("engine: stage and release", || {
                         self.advance_stage(db) || self.release_waiting(db)
@@ -2222,5 +2302,255 @@ mod tests {
         let settled = settle(db, &mut engine, &pair, &[WRITER]);
 
         assert_eq!((settled, copied(db)), (true, Some(LuaType::String)));
+    }
+    struct SlotContributors {
+        second: Mutex<bool>,
+    }
+
+    fn joined_owner() -> crate::LuaMemberOwner {
+        crate::LuaMemberOwner::Type(crate::LuaTypeDeclId::global("RoundJoined"))
+    }
+
+    impl Recipe for SlotContributors {
+        fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
+            let joined = joined_owner();
+            if id == statement(READER) {
+                let key = crate::LuaMemberKey::Name("value".into());
+                let slot = db
+                    .get_member_index()
+                    .get_members_for_owner_key(&joined, &key)
+                    .len();
+                let members = db
+                    .get_member_index()
+                    .get_members(&joined)
+                    .map_or(0, |members| members.len());
+                bind(db, COPIED, LuaType::IntegerConst((slot + members) as i64));
+            } else {
+                let count = db
+                    .get_type_index()
+                    .get_type_cache(&owner(100 + u32::from(id.syntax_id().get_range().start())))
+                    .and_then(|cache| match cache.as_type() {
+                        LuaType::IntegerConst(count) => Some(*count),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                if id != statement(WRITER) && !*self.second.lock().unwrap() {
+                    return;
+                }
+                for offset in 0..count {
+                    let syntax = LuaSyntaxId::new(
+                        LuaSyntaxKind::NameExpr.into(),
+                        TextRange::at(
+                            id.syntax_id().get_range().start()
+                                + TextSize::new(offset as u32 * 1000),
+                            TextSize::new(1),
+                        ),
+                    );
+                    let member = crate::LuaMember::new(
+                        crate::LuaMemberId::new(syntax, id.file_id),
+                        crate::LuaMemberKey::Name("value".into()),
+                        crate::LuaMemberFeature::FileFieldDecl,
+                        None,
+                    );
+                    db.get_member_index_mut().add_member(joined.clone(), member);
+                }
+            }
+        }
+
+        fn splits(&self, _: DerivationKind) -> bool {
+            false
+        }
+        fn compute(&self, _: &DbIndex, _: DerivationId) -> Box<dyn std::any::Any + Send> {
+            unreachable!()
+        }
+        fn apply(&self, _: &mut DbIndex, _: DerivationId, _: Box<dyn std::any::Any + Send>) {
+            unreachable!()
+        }
+    }
+
+    fn slot_round_counts(batch: bool) -> (Option<LuaType>, usize) {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+        let recipe = SlotContributors {
+            second: Mutex::new(true),
+        };
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        engine.batch_slot_notifications = batch;
+        bind(db, 110, LuaType::IntegerConst(1));
+        bind(db, 120, LuaType::IntegerConst(1));
+        assert!(settle(db, &mut engine, &recipe, &[READER, WRITER, 20]));
+        let answer = copied(db);
+        let before = engine.stats.evaluations(DerivationKind::LocalStat);
+        bind(db, 110, LuaType::IntegerConst(2));
+        bind(db, 120, LuaType::IntegerConst(2));
+        let inputs = [
+            HashedKey::new(FactKey::TypeCache(owner(110))),
+            HashedKey::new(FactKey::TypeCache(owner(120))),
+        ];
+        for input in &inputs {
+            db.reader_graph().forget_fingerprint(input);
+        }
+        engine.readers_of(db, inputs.iter());
+        engine.open(db);
+        assert!(engine.run(db, &recipe, Slice::Evaluations(100)));
+        assert_eq!(copied(db), Some(LuaType::IntegerConst(8)));
+        let count = engine.stats.evaluations(DerivationKind::LocalStat) - before;
+        bind(db, 110, LuaType::IntegerConst(1));
+        bind(db, 120, LuaType::IntegerConst(1));
+        assert!(settle(db, &mut engine, &recipe, &[WRITER, 20]));
+        for present in [false, true, false, true] {
+            *recipe.second.lock().unwrap() = present;
+            assert!(settle(db, &mut engine, &recipe, &[20]));
+            assert_eq!(
+                copied(db),
+                Some(LuaType::IntegerConst(if present { 4 } else { 2 }))
+            );
+        }
+        (answer, count)
+    }
+
+    #[test]
+    fn member_round_notifications_coalesce_two_contributors_and_survive_retraction() {
+        let (baseline, eager_count) = slot_round_counts(false);
+        let (batched, batched_count) = slot_round_counts(true);
+        assert_eq!(baseline, Some(LuaType::IntegerConst(4)));
+        assert_eq!(batched, baseline);
+        assert!(
+            batched_count < eager_count,
+            "batch {batched_count}, eager {eager_count}"
+        );
+        eprintln!("slot round fixture: eager={eager_count}, batched={batched_count}");
+    }
+    #[test]
+    fn member_round_notifications_preserve_first_absent_sighting_before_flush() {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+        let recipe = SlotContributors {
+            second: Mutex::new(true),
+        };
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        engine.batch_slot_notifications = true;
+        bind(db, 110, LuaType::IntegerConst(1));
+        engine.changed(statement(READER));
+        engine.open(db);
+        assert!(!engine.run(db, &recipe, Slice::Evaluations(1)));
+        derivation::begin(statement(WRITER));
+        recipe.evaluate(db, statement(WRITER));
+        let evaluation = derivation::end();
+        let mut touched = evaluation.outputs().cloned().collect::<FxHashSet<_>>();
+        engine.record(
+            db,
+            vec![(evaluation, None)],
+            &mut touched,
+            &FxHashSet::default(),
+            || "slot publication fixture".into(),
+        );
+        engine.readers_of(db, touched.iter());
+        assert!(!engine.pending_slot_notifications.is_empty());
+        assert!(
+            engine
+                .moved_from
+                .get(&statement(READER))
+                .is_some_and(|moved| moved.iter().any(|entry| matches!(
+                    entry.key.key(),
+                    FactKey::MemberOwnerMap(_)
+                ) && entry.seen
+                    == derivation::ABSENT))
+        );
+        assert!(engine.run(db, &recipe, Slice::Whole));
+        assert_eq!(copied(db), Some(LuaType::IntegerConst(2)));
+    }
+
+    #[test]
+    fn member_round_notifications_preserve_date_self_normalization_cycle() {
+        let digest = |batch| {
+            TEST_SLOT_BATCH.with(|value| value.set(Some(batch)));
+            let _restore = OnDrop(|| TEST_SLOT_BATCH.with(|value| value.set(None)));
+            let mut ws = VirtualWorkspace::new();
+            ws.analysis.init_std_lib();
+            ws.def_file(
+                "lua/autorun/sh_date.lua",
+                include_str!("../test/fixtures/member_round_date.lua"),
+            );
+            ws.settled_digest()
+        };
+        let eager = digest(false);
+        let batched = digest(true);
+        let eager_set = eager.iter().collect::<BTreeSet<_>>();
+        let batched_set = batched.iter().collect::<BTreeSet<_>>();
+        let differences = eager_set
+            .symmetric_difference(&batched_set)
+            .collect::<Vec<_>>();
+        assert!(eager == batched, "{differences:#?}");
+    }
+    #[test]
+    fn member_round_notifications_are_flushed_before_a_slice_returns() {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+        let recipe = SlotContributors {
+            second: Mutex::new(true),
+        };
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        engine.batch_slot_notifications = true;
+        bind(db, 110, LuaType::IntegerConst(1));
+        engine.changed(statement(READER));
+        engine.changed(statement(WRITER));
+        engine.open(db);
+        assert!(!engine.run(db, &recipe, Slice::Evaluations(1)));
+        assert!(!engine.run(db, &recipe, Slice::Evaluations(1)));
+        assert!(engine.pending_slot_notifications.is_empty());
+        assert!(engine.is_settling(FileId::new(FILE)));
+        assert!(engine.run(db, &recipe, Slice::Whole));
+        assert_eq!(copied(db), Some(LuaType::IntegerConst(2)));
+    }
+    #[test]
+    fn member_round_notifications_mark_receiver_query_stale_before_flush() {
+        use glua_parser::{LuaAstNode, LuaClosureExpr};
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_receiver_query.lua",
+            r#"
+---@class BatchReceiver
+local typed = {}
+local holder = { receiver = typed }
+function holder.receiver:Use() end
+"#,
+        );
+        let db = ws.get_db_mut();
+        let closure = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .unwrap()
+            .get_chunk_node()
+            .descendants::<LuaClosureExpr>()
+            .next()
+            .unwrap();
+        let signature = crate::LuaSignatureId::new(file_id, closure.get_position());
+        assert!(*db.queries().receiver_authority.get(db, signature));
+        file_queries(db);
+        let key = crate::LuaMemberKey::Name("receiver".into());
+        let member = db
+            .get_member_index()
+            .get_current_members_for_key(&key)
+            .into_iter()
+            .find(|member| member.get_file_id() == file_id)
+            .unwrap()
+            .get_id();
+        let owner = db
+            .get_member_index()
+            .get_member_owner(&member)
+            .unwrap()
+            .clone();
+        db.get_member_index_mut()
+            .rekey_member(member, crate::LuaMemberKey::Name("renamed".into()))
+            .unwrap();
+        let slot = HashedKey::new(FactKey::MemberSlot(owner.clone(), key));
+        let map = HashedKey::new(FactKey::MemberOwnerMap(owner));
+        db.reader_graph().forget_fingerprint(&slot);
+        db.reader_graph().forget_fingerprint(&map);
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        engine.readers_of(db, [&slot, &map]);
+        assert!(!engine.pending_slot_notifications.is_empty());
+        assert!(!*db.queries().receiver_authority.get(db, signature));
     }
 }

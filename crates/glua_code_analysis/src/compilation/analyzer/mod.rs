@@ -291,6 +291,7 @@ impl Reanalysis {
 
     /// Leaves the index as it reads outside any run until the next slice.
     fn pause(&mut self, db: &mut DbIndex) {
+        self.engine.flush_slot_notifications(db);
         self.stage = db.analysis_stage();
         db.set_analysis_stage(derivation::AnalysisStage::Closed);
         crate::profile::phase("reanalyze: flush", || db.flush_inference_derived_state());
