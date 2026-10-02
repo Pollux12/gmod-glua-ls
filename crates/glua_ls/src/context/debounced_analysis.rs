@@ -879,21 +879,16 @@ impl DebouncedAnalysis {
             let scheduled = !self.pending_files.lock().await.is_empty();
             let settling = self.settling.load(Ordering::Acquire);
             if !scheduled && (!settling || text_changed) {
-                let needs_work = self.has_pending_changes.load(Ordering::Acquire) && !settling;
-                if !needs_work {
-                    tokio::select! {
-                        _ = notified => {}
-                        _ = self.shutdown.cancelled() => return,
-                        // Text that changed without a schedule reaching the
-                        // loop is taken in rather than left blocking slices.
-                        _ = tokio::time::sleep(self.debounce_duration), if text_changed => {
-                            let taken = self.take_unscheduled_text().await;
-                            edited.extend(taken);
-                        }
+                tokio::select! {
+                    _ = notified => {}
+                    _ = self.shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(self.debounce_duration), if text_changed => {
+                        let taken = self.take_unscheduled_text().await;
+                        edited.extend(taken);
                     }
-                    text_changed = false;
-                    continue;
                 }
+                text_changed = false;
+                continue;
             }
 
             if scheduled || !settling {
@@ -1149,6 +1144,110 @@ mod tests {
     fn has_diagnostic_code(diagnostics: &[Diagnostic], code: DiagnosticCode) -> bool {
         let code = Some(NumberOrString::String(code.get_name().to_string()));
         diagnostics.iter().any(|diagnostic| diagnostic.code == code)
+    }
+
+    #[gtest]
+    fn idle_debounce_shutdown_with_unscheduled_change_and_waiting_request() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounced_analysis = test_debounced_analysis();
+            let in_flight = debounced_analysis.begin_in_flight_change();
+            let waiting = debounced_analysis.request_waiting();
+            let loop_task = tokio::spawn({
+                let debounced_analysis = debounced_analysis.clone();
+                async move { debounced_analysis.run().await }
+            });
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let expedited = debounced_analysis
+                .expedited_debounces
+                .load(Ordering::Acquire);
+            debounced_analysis.shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(5), loop_task)
+                .await
+                .expect("idle loop must observe shutdown")
+                .expect("idle loop must not panic");
+            assert_eq!(expedited, 0);
+            assert!(
+                debounced_analysis
+                    .has_pending_changes
+                    .load(Ordering::Acquire)
+            );
+            drop(waiting);
+            in_flight.finish().await;
+            Ok(())
+        })
+    }
+
+    #[gtest]
+    fn idle_debounce_schedule_wakes_without_releasing_in_flight_freshness() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let mut analysis = EmmyLuaAnalysis::new();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_idle_debounce_schedule");
+            analysis.add_main_workspace(workspace.clone());
+            let uri = file_path_to_uri(&workspace.join("lua/autorun/shared/edited.lua"))
+                .expect("URI should parse");
+            analysis.update_file_by_uri(
+                &uri,
+                Some(
+                    "Value = 1
+"
+                    .to_string(),
+                ),
+            );
+            let analysis = Arc::new(RwLock::new(analysis));
+            let (debounced_analysis, _peer) = loop_test_debounced_analysis(analysis.clone());
+            let in_flight = debounced_analysis.begin_in_flight_change();
+            let loop_task = tokio::spawn({
+                let debounced_analysis = debounced_analysis.clone();
+                async move { debounced_analysis.run().await }
+            });
+            let wait_task = tokio::spawn({
+                let debounced_analysis = debounced_analysis.clone();
+                let uri = uri.clone();
+                async move {
+                    debounced_analysis
+                        .wait_until_file_fresh_for(
+                            &CancellationToken::new(),
+                            "textDocument/hover",
+                            &uri,
+                        )
+                        .await
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert!(!wait_task.is_finished());
+            assert_eq!(
+                debounced_analysis
+                    .expedited_debounces
+                    .load(Ordering::Acquire),
+                0
+            );
+            let file_id = analysis
+                .write()
+                .await
+                .update_file_text_only(
+                    &uri,
+                    "Value = 2
+"
+                    .to_string(),
+                )
+                .expect("file must exist");
+            debounced_analysis.schedule(file_id, uri.clone()).await;
+            in_flight.finish().await;
+            let fresh = tokio::time::timeout(Duration::from_secs(10), wait_task)
+                .await
+                .expect("scheduled work must wake the parked loop")
+                .expect("freshness waiter must not panic");
+            assert_eq!(fresh, Freshness::Fresh);
+            assert!(debounced_analysis.file_is_answerable(&uri).await);
+            debounced_analysis.shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(5), loop_task)
+                .await
+                .expect("scheduled loop must observe shutdown")
+                .expect("scheduled loop must not panic");
+            Ok(())
+        })
     }
 
     #[gtest]
