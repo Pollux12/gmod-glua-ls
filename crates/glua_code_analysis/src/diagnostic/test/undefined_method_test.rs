@@ -1125,6 +1125,141 @@ mod tests {
     }
 
     #[test]
+    fn vgui_forwarding_uses_indexed_callers_across_edits_delete_and_reopen() {
+        use crate::db_index::derivation::{DerivationId, DerivationKind, FactKey};
+
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "annotations/vgui.lua",
+            "---@class Panel
+---@class DTileLayout: Panel
+---@class Child: Panel
+---@class OtherChild: Panel",
+        );
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/cl_container.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:Init()
+                self.Body = vgui.Create("DTileLayout")
+            end
+            function PANEL:Relay(pnl)
+                self.Body:Add(pnl)
+            end
+            vgui.Register("Container", PANEL, "Panel")
+            "#,
+        );
+        let unrelated = ws.def_file(
+            "gamemodes/sandbox/gamemode/cl_unrelated.lua",
+            "local marker = 'Relay'",
+        );
+        let caller_path = "gamemodes/sandbox/gamemode/cl_caller.lua";
+        let caller = r#"
+            local container = vgui.Create("Container")
+            local child = vgui.Create("Child")
+            local second = vgui.Create("OtherChild")
+            container : Relay(child)
+        "#;
+        let child_id = crate::LuaTypeDeclId::global("Child");
+        let chain = |ws: &VirtualWorkspace| {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_gmod_class_metadata_index()
+                .get_vgui_panel_parent_chain(&child_id)
+                .map(|chain| chain.to_vec())
+        };
+        assert_eq!(chain(&ws), None);
+        ws.def_file(caller_path, caller);
+        assert_eq!(
+            chain(&ws),
+            Some(vec![crate::LuaTypeDeclId::global("DTileLayout")])
+        );
+        let reads = ws
+            .analysis
+            .compilation
+            .get_db()
+            .reader_graph()
+            .reads_of(DerivationId::workspace(DerivationKind::VguiChains))
+            .map(|key| key.key())
+            .collect::<Vec<_>>();
+        assert!(
+            !reads
+                .iter()
+                .any(|key| matches!(key, FactKey::FileText(file_id) if *file_id == unrelated))
+        );
+        assert!(reads.contains(&&FactKey::IndexReferenceFiles("Relay".into())));
+        assert!(!reads.contains(&&FactKey::ReferencesByName("Relay".into())));
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/cl_unrelated.lua",
+            "local marker = 'Other'",
+        );
+        assert_eq!(
+            chain(&ws),
+            Some(vec![crate::LuaTypeDeclId::global("DTileLayout")])
+        );
+        assert_eq!(
+            ws.analysis
+                .compilation
+                .last_stats()
+                .evaluations(DerivationKind::VguiChains),
+            0
+        );
+        let reference_files_key = FactKey::IndexReferenceFiles("Relay".into());
+        let membership = ws
+            .analysis
+            .compilation
+            .get_db()
+            .fact_fingerprint(&reference_files_key);
+        ws.def_file(
+            caller_path,
+            &caller.replace("Relay(child)", "Relay(second)"),
+        );
+        assert_eq!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .fact_fingerprint(&reference_files_key),
+            membership
+        );
+        assert!(
+            ws.analysis
+                .compilation
+                .last_stats()
+                .evaluations(DerivationKind::VguiChains)
+                > 0
+        );
+        assert_eq!(chain(&ws), None);
+        assert_eq!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_gmod_class_metadata_index()
+                .get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("OtherChild")),
+            Some([crate::LuaTypeDeclId::global("DTileLayout")].as_slice())
+        );
+        ws.def_file(caller_path, "local marker = 'Relay'");
+        assert_eq!(chain(&ws), None);
+        ws.def_file(caller_path, caller);
+        assert_eq!(
+            chain(&ws),
+            Some(vec![crate::LuaTypeDeclId::global("DTileLayout")])
+        );
+        let uri = ws.virtual_url_generator.new_uri(caller_path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        assert_eq!(chain(&ws), None);
+        ws.def_file(caller_path, caller);
+        let reopened = chain(&ws);
+        assert_eq!(
+            reopened,
+            Some(vec![crate::LuaTypeDeclId::global("DTileLayout")])
+        );
+        ws.analysis.reindex();
+        assert_eq!(chain(&ws), reopened);
+    }
+
+    #[test]
     fn vgui_parent_chain_resolves_create_parent_field_assignment() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

@@ -219,8 +219,7 @@ impl super::engine::Recipe for Recipes {
             DerivationKind::GmodLoad => gmod::evaluate_load(db),
             DerivationKind::ValidGuards => gmod::evaluate_valid_guards(db),
             DerivationKind::VguiChains => {
-                let file_ids = db.get_vfs().get_all_local_file_ids();
-                let mut context = AnalyzeContext::for_files(db, file_ids, &self.scopes);
+                let mut context = AnalyzeContext::for_files(db, Vec::new(), &self.scopes);
                 gmod::evaluate_vgui_chains(db, &mut context);
             }
             DerivationKind::Source | DerivationKind::Diagnostics => {

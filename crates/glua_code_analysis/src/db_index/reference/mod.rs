@@ -341,6 +341,9 @@ impl LuaReferenceIndex {
                 .get(name)
                 .copied()
                 .unwrap_or(derivation::ABSENT),
+            FactKey::IndexReferenceFiles(name) => {
+                derivation::fingerprint_of(&self.collect_index_reference_files(name))
+            }
             FactKey::DerivedReferences(file_id) if derivation::mapping_back() => {
                 self.recomputed_derived_file_fingerprint(*file_id)
             }
@@ -357,6 +360,33 @@ impl LuaReferenceIndex {
                 derivation::ABSENT
             }
         }
+    }
+
+    pub(crate) fn files_with_index_references(&self, name: &SmolStr) -> Vec<FileId> {
+        derivation::note_read(|| FactKey::IndexReferenceFiles(name.clone()));
+        self.collect_index_reference_files(name)
+    }
+
+    fn collect_index_reference_files(&self, name: &SmolStr) -> Vec<FileId> {
+        let member_key = LuaMemberKey::Name(name.clone());
+        let mut files = self
+            .index_reference
+            .get(&member_key)
+            .into_iter()
+            .flatten()
+            .chain(self.global_references.get(name).into_iter().flatten())
+            .map(|(file_id, _)| *file_id)
+            .chain(
+                self.derived_index_reference
+                    .get(&member_key)
+                    .into_iter()
+                    .flat_map(|sites| sites.keys())
+                    .map(|(file_id, _)| *file_id),
+            )
+            .collect::<Vec<_>>();
+        files.sort_unstable();
+        files.dedup();
+        files
     }
 
     /// Every file that references `name`, from both name-keyed tables. The sites
@@ -1015,6 +1045,43 @@ mod tests {
 
     use super::{LuaIndex, LuaReferenceIndex};
     use crate::{FileId, LuaMemberKey, db_index::LuaTypeDeclId};
+
+    #[test]
+    fn index_reference_files_ignore_strings_types_and_site_positions() {
+        use crate::LuaTypeDeclId;
+        use crate::db_index::derivation::FactKey;
+
+        let mut index = LuaReferenceIndex::new();
+        let file = FileId::new(1);
+        let other = FileId::new(2);
+        let name = smol_str::SmolStr::new("Relay");
+        let key = FactKey::IndexReferenceFiles(name.clone());
+        let range = TextRange::new(TextSize::new(0), TextSize::new(1));
+        let later = TextRange::new(TextSize::new(4), TextSize::new(5));
+        let site = LuaSyntaxId::new(LuaSyntaxKind::IndexExpr.into(), range);
+        let empty = index.fact_fingerprint(&key);
+        index.add_string_reference(file, "Relay", range);
+        index.add_type_reference(file, LuaTypeDeclId::global("Relay"), range);
+        assert_eq!(index.fact_fingerprint(&key), empty);
+        assert!(index.files_with_index_references(&name).is_empty());
+        index.add_index_reference(LuaMemberKey::Name(name.clone()), file, site);
+        let present = index.fact_fingerprint(&key);
+        assert_ne!(present, empty);
+        index.add_global_reference(&name, file, site);
+        index.add_index_reference(
+            LuaMemberKey::Name(name.clone()),
+            file,
+            LuaSyntaxId::new(LuaSyntaxKind::IndexExpr.into(), later),
+        );
+        assert_eq!(index.fact_fingerprint(&key), present);
+        assert_eq!(index.files_with_index_references(&name), vec![file]);
+        index.add_global_reference(&name, other, site);
+        assert_eq!(index.files_with_index_references(&name), vec![file, other]);
+        index.remove(file);
+        assert_eq!(index.files_with_index_references(&name), vec![other]);
+        index.remove(other);
+        assert_eq!(index.fact_fingerprint(&key), empty);
+    }
 
     #[test]
     fn name_lookups_union_both_tables_and_a_write_moves_the_file_revision() {

@@ -7,7 +7,6 @@ use std::{
     sync::Arc,
 };
 
-use aho_corasick::AhoCorasick;
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaBreakStat,
     LuaCallExpr, LuaChunk, LuaClosureExpr, LuaComment, LuaCommentOwner, LuaDocDescriptionOwner,
@@ -1918,7 +1917,6 @@ fn resolve_vgui_parent_relations(db: &mut DbIndex, context: &mut AnalyzeContext)
     drop(_p_cand);
     let forwarding_parents =
         finalize_vgui_forwarding_parent_candidates(forwarding_parent_candidates);
-    let forwarding_scan_file_ids = db.get_vfs().get_all_file_ids();
     let mut calls_by_file = file_ids
         .iter()
         .map(|file_id| {
@@ -1929,12 +1927,9 @@ fn resolve_vgui_parent_relations(db: &mut DbIndex, context: &mut AnalyzeContext)
             (*file_id, calls)
         })
         .collect::<HashMap<_, _>>();
-    for (file_id, forwarded) in collect_vgui_forwarding_parent_calls(
-        db,
-        context,
-        &forwarding_parents,
-        &forwarding_scan_file_ids,
-    ) {
+    for (file_id, forwarded) in
+        collect_vgui_forwarding_parent_calls(db, context, &forwarding_parents)
+    {
         calls_by_file.entry(file_id).or_default().extend(forwarded);
     }
     let mut calls_by_file = calls_by_file.into_iter().collect::<Vec<_>>();
@@ -2155,34 +2150,29 @@ fn collect_vgui_forwarding_parent_calls(
     db: &mut DbIndex,
     context: &mut AnalyzeContext,
     forwarding_parents: &HashMap<(LuaTypeDeclId, String), Vec<LuaTypeDeclId>>,
-    file_ids: &[FileId],
 ) -> Vec<(FileId, Vec<GmodVguiParentCallMetadata>)> {
     if forwarding_parents.is_empty() {
         return Vec::new();
     }
-    // Source overrides are not reverse-indexed, so only inspect files that
-    // mention a method proven to forward its panel argument to a VGUI parent.
     let forwarding_method_names = forwarding_parents
         .keys()
         .map(|(_, method_name)| method_name.as_str())
         .collect::<HashSet<_>>();
-    let mut forwarding_patterns = forwarding_method_names.iter().copied().collect::<Vec<_>>();
-    forwarding_patterns.sort_unstable();
-    let forwarding_matcher = AhoCorasick::new(&forwarding_patterns).ok();
+    let mut file_ids = HashSet::default();
+    for method_name in &forwarding_method_names {
+        file_ids.extend(
+            db.get_reference_index()
+                .files_with_index_references(&SmolStr::new(method_name)),
+        );
+    }
+    let mut file_ids = file_ids.into_iter().collect::<Vec<_>>();
+    file_ids.sort_unstable();
     let files = file_ids
-        .iter()
+        .into_iter()
         .filter_map(|file_id| {
             db.get_vfs()
-                .get_file_content(file_id)
-                .filter(|content| match &forwarding_matcher {
-                    Some(matcher) => matcher.is_match(content),
-                    None => true,
-                })
-                .and_then(|_| {
-                    db.get_vfs()
-                        .get_syntax_tree(file_id)
-                        .map(|tree| (*file_id, tree.get_red_root()))
-                })
+                .get_syntax_tree(&file_id)
+                .map(|tree| (file_id, tree.get_red_root()))
         })
         .collect::<Vec<_>>();
     let mut forwarded = Vec::new();

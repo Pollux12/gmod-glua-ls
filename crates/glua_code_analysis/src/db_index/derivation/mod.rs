@@ -361,6 +361,7 @@ pub enum FactKey {
     References(FileId),
     /// Name-keyed references across files.
     ReferencesByName(SmolStr),
+    IndexReferenceFiles(SmolStr),
     /// The member-key references derivations resolved in one file.
     DerivedReferences(FileId),
     /// Numeric-range populations of one global table.
@@ -668,7 +669,10 @@ impl FactKey {
     pub fn is_base(&self) -> bool {
         matches!(
             self,
-            FactKey::GmodRealm(_) | FactKey::GmodInferFile(_) | FactKey::Signature(_)
+            FactKey::GmodRealm(_)
+                | FactKey::GmodInferFile(_)
+                | FactKey::Signature(_)
+                | FactKey::ReferencesByName(_)
         )
     }
 
@@ -682,6 +686,7 @@ impl FactKey {
                 Some(FactKey::GmodInferFile(*file_id))
             }
             FactKey::SignatureDecl(signature_id) => Some(FactKey::Signature(*signature_id)),
+            FactKey::IndexReferenceFiles(name) => Some(FactKey::ReferencesByName(name.clone())),
             _ => None,
         }
     }
@@ -798,6 +803,7 @@ impl FactKey {
             | K::Global(_)
             | K::GlobalScan
             | K::ReferencesByName(_)
+            | K::IndexReferenceFiles(_)
             | K::NumericPopulation(_)
             | K::AccessorFunc(_)
             | K::TypeContrib(_)

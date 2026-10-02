@@ -559,6 +559,7 @@ impl DbIndex {
             K::Global(_) | K::GlobalScan => self.global_index.fact_fingerprint(key),
             K::References(_)
             | K::ReferencesByName(_)
+            | K::IndexReferenceFiles(_)
             | K::DerivedReferences(_)
             | K::ReferenceContrib(_) => self.references_index.fact_fingerprint(key),
             K::NumericPopulation(_) => self.numeric_range_population_index.fact_fingerprint(key),
