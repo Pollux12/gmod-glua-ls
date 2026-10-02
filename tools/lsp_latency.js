@@ -113,6 +113,7 @@ function summarise(samples) {
     const nearestRank = (q) => sorted[Math.max(0, Math.ceil(q * sorted.length) - 1)];
     return {
         runs: sorted.length, min: sorted[0], median: at(0.5), p95: nearestRank(0.95), max: sorted[sorted.length - 1],
+        samples: [...samples],
     };
 }
 
