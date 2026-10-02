@@ -46,7 +46,7 @@ case "${1:-help}" in
         mkdir "$run/raw"
         build_identity > "$run/build.identity"
         CARGO_ENCODED_RUSTFLAGS="-Cprofile-generate=$native_run/raw" \
-            cargo build --profile "$profile" --target "$host" "${packages[@]}"
+            cargo build --profile "$profile" --target "$host" "${packages[@]}" --bin benchmark
         mkdir -p "$run/bin"
         cp "$run/target/$host/$profile/benchmark$suffix" "$binary"
         sha256sum "$binary"
