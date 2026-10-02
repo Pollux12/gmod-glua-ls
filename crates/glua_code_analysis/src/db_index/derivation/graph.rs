@@ -358,6 +358,19 @@ impl Clone for DerivedKeys {
 }
 
 impl KeyTable {
+    pub(super) fn matching_slot(
+        &self,
+        slot: KeyIdx,
+        matches: impl FnOnce(&FactKey) -> bool,
+    ) -> Option<KeyIdx> {
+        let entry = self.keys.get(slot as usize)?;
+        entry
+            .key
+            .as_ref()
+            .filter(|key| matches(key.key()))
+            .map(|_| slot)
+    }
+
     /// The slot `key` is interned to.
     pub(super) fn find(&self, key: &HashedKey) -> Option<KeyIdx> {
         self.key_slots
@@ -1750,6 +1763,23 @@ mod tests {
 
     fn key(file: u32) -> HashedKey {
         HashedKey::new(FactKey::DeclTree(FileId::new(file)))
+    }
+
+    #[test]
+    fn stored_fact_handles_reject_reused_slots_and_diverged_forks() {
+        let mut graph = ReaderGraph::default();
+        let slot = graph.intern_key(key(1));
+        let mut fork = graph.clone();
+        graph.release_key(slot);
+        fork.release_key(slot);
+        let original = |fact: &FactKey| fact == key(1).key();
+        assert_eq!(graph.keys().matching_slot(slot, original), None);
+        assert_eq!(graph.intern_key(key(2)), slot);
+        assert_eq!(fork.intern_key(key(3)), slot);
+        assert_eq!(graph.keys().matching_slot(slot, original), None);
+        let fork_key = |fact: &FactKey| fact == key(3).key();
+        assert_eq!(graph.keys().matching_slot(slot, fork_key), None);
+        assert_eq!(fork.keys().matching_slot(slot, fork_key), Some(slot));
     }
 
     #[test]

@@ -709,6 +709,81 @@ mod tests {
     use crate::FileId;
     use crate::db_index::derivation::{self, DerivationId, DerivationKind, FactKey, HashedKey};
 
+    #[test]
+    fn stored_fact_handle_leaves_unlent_reads_to_the_identity_recorder() {
+        let handle = derivation::FactRead::default();
+        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        assert!(!handle.note(|| panic!("the legacy path owns this read"), |_| false));
+        let (_, reads, _) = derivation::end().into_parts(|_| 1);
+        assert!(reads.is_empty());
+    }
+
+    #[test]
+    fn stored_fact_handle_records_new_evaluations_without_rebuilding_the_key() {
+        let handle = derivation::FactRead::default();
+        let key = || FactKey::GmodRealm(FileId::new(1));
+        derivation::lend_keys(KeyTable::default());
+        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        assert!(handle.note(key, |fact| fact == &key()));
+        let first = derivation::end().into_recorded().1;
+        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        assert!(handle.note(
+            || panic!("a cached handle must not build a key"),
+            |fact| fact == &key()
+        ));
+        let second = derivation::end().into_recorded().1;
+        derivation::take_keys();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 1);
+    }
+
+    #[test]
+    fn stored_fact_handle_records_nested_frames_and_detects_writes() {
+        let handle = derivation::FactRead::default();
+        let key = || FactKey::GmodRealm(FileId::new(1));
+        derivation::lend_keys(KeyTable::default());
+        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        assert!(handle.note(key, |fact| fact == &key()));
+        let frame = open_frame().expect("a table is lent");
+        assert!(handle.note(
+            || panic!("a nested read must use the handle"),
+            |fact| fact == &key()
+        ));
+        let value = close_frame(frame, 0).expect("the frame saw no taint");
+        derivation::end();
+        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        derivation::note_write(key);
+        let result = reuse(&value, 0, &[], None);
+        derivation::end();
+        derivation::take_keys();
+        assert_eq!(result, Reuse::Stale);
+    }
+
+    #[test]
+    fn stored_fact_handle_records_diagnostic_reads_in_a_viewed_graph() {
+        let handle = derivation::FactRead::default();
+        derivation::lend_keys(KeyTable::default());
+        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        assert!(handle.note(
+            || FactKey::GmodRealm(FileId::new(1)),
+            |fact| matches!(fact, FactKey::GmodRealm(file) if *file == FileId::new(1))
+        ));
+        derivation::end();
+        let table = derivation::take_keys();
+        let mut graph = super::super::ReaderGraph::default();
+        graph.restore_keys(table);
+        let graph = Arc::new(graph);
+        derivation::begin(DerivationId::diagnostics(FileId::new(1)));
+        let viewed = derivation::view_graph(Arc::clone(&graph));
+        assert!(handle.note(
+            || panic!("viewed reads must use the cached handle"),
+            |fact| matches!(fact, FactKey::GmodRealm(file) if *file == FileId::new(1))
+        ));
+        drop(viewed);
+        let reads = derivation::end().into_viewed_reads(&graph, |_| 1);
+        assert_eq!(reads.keys(&graph).count(), 1);
+    }
+
     /// A value reused inside a frame nested in one it was already replayed
     /// into is recorded by the nested frame too: that frame's value is stale
     /// once what the reused value read is written.

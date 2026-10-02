@@ -1255,6 +1255,26 @@ fn collect_type_cache_refs(typ: &LuaType) -> HashSet<TypeCacheRef> {
 }
 
 #[derive(Debug, Clone)]
+struct TypeFact {
+    cache: LuaTypeCache,
+    read: derivation::FactRead,
+}
+
+impl std::ops::Deref for TypeFact {
+    type Target = LuaTypeCache;
+
+    fn deref(&self) -> &Self::Target {
+        &self.cache
+    }
+}
+
+impl std::hash::Hash for TypeFact {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.cache, state);
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct LuaTypeIndex {
     file_namespace: HashMap<FileId, String>,
     file_using_namespace: HashMap<FileId, Vec<String>>,
@@ -1292,7 +1312,7 @@ pub struct LuaTypeIndex {
     /// type-cache write and file removal alongside the caches themselves.
     decl_type_binds: HashMap<LuaDeclId, LuaTypeDeclId>,
     type_bound_decls: HashMap<LuaTypeDeclId, HashSet<LuaDeclId>>,
-    types: HashMap<LuaTypeOwner, LuaTypeCache>,
+    types: HashMap<LuaTypeOwner, TypeFact>,
     cache_refs: TypeCacheRefIndex,
     in_filed_type_owner: HashMap<FileId, HashSet<LuaTypeOwner>>,
     fact_metadata: HashMap<LuaTypeOwner, LuaTypeFactMetadata>,
@@ -2482,13 +2502,28 @@ impl LuaTypeIndex {
         &self,
         owner: &LuaTypeOwner,
     ) -> (Option<&LuaTypeCache>, Option<&LuaTypeFactMetadata>) {
-        derivation::note_type_cache_read(owner);
-        match self
-            .statement_type(owner)
-            .filter(|_| derivation::recomputes(FactKey::TypeCache(owner.clone())))
-        {
+        let stored = self.types.get(owner);
+        if let Some(stored) = stored {
+            if !stored.read.note(
+                || FactKey::TypeCache(owner.clone()),
+                |key| matches!(key, FactKey::TypeCache(stored) if stored == owner),
+            ) {
+                derivation::note_type_cache_read(owner);
+            }
+        } else {
+            derivation::note_type_cache_read(owner);
+        }
+        match self.statement_type(owner).filter(|_| {
+            stored.map_or_else(
+                || derivation::recomputes(FactKey::TypeCache(owner.clone())),
+                |stored| stored.read.recomputes(owner),
+            )
+        }) {
             Some(statement) => (statement.cache.as_ref(), statement.metadata.as_ref()),
-            None => (self.types.get(owner), self.fact_metadata.get(owner)),
+            None => (
+                stored.map(|stored| &stored.cache),
+                self.fact_metadata.get(owner),
+            ),
         }
     }
 
@@ -2544,7 +2579,7 @@ impl LuaTypeIndex {
             return;
         }
         let statement = StatementType {
-            cache: self.types.get(owner).cloned(),
+            cache: self.types.get(owner).map(|stored| stored.cache.clone()),
             metadata: self.fact_metadata.get(owner).cloned(),
         };
         if let Some(cache) = &statement.cache {
@@ -2644,8 +2679,17 @@ impl LuaTypeIndex {
         }
         let file_id = owner.get_file_id();
         self.cache_refs.add(file_id, cache.as_type());
-        let Some(previous) = self.types.insert(owner, cache) else {
-            return false;
+        let previous = match self.types.entry(owner) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                std::mem::replace(&mut entry.get_mut().cache, cache)
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(TypeFact {
+                    cache,
+                    read: derivation::FactRead::default(),
+                });
+                return false;
+            }
         };
         self.cache_refs.remove(file_id, previous.as_type());
         true
@@ -2687,7 +2731,7 @@ impl LuaTypeIndex {
             Some(cache) => {
                 let metadata = self.fact_metadata.get(owner).cloned();
                 self.source_types
-                    .insert(owner.clone(), (cache.clone(), metadata));
+                    .insert(owner.clone(), (cache.cache.clone(), metadata));
             }
             None => {
                 self.source_types.remove(owner);
@@ -2915,7 +2959,7 @@ impl LuaTypeIndex {
     }
 
     pub fn iter_type_caches(&self) -> impl Iterator<Item = (&LuaTypeOwner, &LuaTypeCache)> {
-        self.types.iter()
+        self.types.iter().map(|(owner, fact)| (owner, &fact.cache))
     }
 
     /// Registers the class a table literal became. Stored types that name
@@ -3045,7 +3089,7 @@ impl LuaTypeIndex {
                 // re-analysed instead of being rewritten to a guessed value.
                 dirty.insert(owner.get_file_id());
             } else if let Some(new_type) = result.typ {
-                let new_cache = match cache {
+                let new_cache = match &cache.cache {
                     LuaTypeCache::DocType(_) => LuaTypeCache::DocType(new_type),
                     LuaTypeCache::InferType(_) => LuaTypeCache::InferType(new_type),
                 };
@@ -3208,7 +3252,7 @@ impl LuaTypeIndex {
                 // What the statements left under a fallback moves the key
                 // too: the fallback was guessed from it.
                 match self.statement_type(owner).filter(|statement| {
-                    statement.cache.as_ref() != Some(cache)
+                    statement.cache.as_ref() != Some(&cache.cache)
                         || statement.metadata.as_ref() != metadata
                 }) {
                     Some(statement) => derivation::fingerprint_of(&(cache, metadata, statement)),
@@ -3994,6 +4038,40 @@ mod super_type_tests {
 
     /// A superseding write replaces the type, so the metadata derived from the
     /// discarded type must not survive to be reported against the new one.
+    #[test]
+    fn type_fact_reads_survive_absence_value_changes_and_removal() {
+        let mut index = LuaTypeIndex::new();
+        let owner = LuaTypeOwner::Decl(LuaDeclId::new(FileId::new(1), 0.into()));
+        let id = DerivationId::workspace(derivation::DerivationKind::GmodLoad);
+        derivation::lend_keys(derivation::KeyTable::default());
+        derivation::begin(id);
+        assert!(index.get_type_cache(&owner).is_none());
+        let absent = derivation::end().into_recorded().1;
+        index.force_bind_type(owner.clone(), LuaTypeCache::InferType(LuaType::String));
+        derivation::begin(id);
+        assert_eq!(
+            index.get_type_cache(&owner).map(LuaTypeCache::as_type),
+            Some(&LuaType::String)
+        );
+        let present = derivation::end().into_recorded().1;
+        index.force_bind_type(owner.clone(), LuaTypeCache::InferType(LuaType::Number));
+        derivation::begin(id);
+        assert_eq!(
+            index.get_type_cache(&owner).map(LuaTypeCache::as_type),
+            Some(&LuaType::Number)
+        );
+        let changed = derivation::end().into_recorded().1;
+        index.remove_files(&[FileId::new(1)]);
+        derivation::begin(id);
+        assert!(index.get_type_cache(&owner).is_none());
+        let removed = derivation::end().into_recorded().1;
+        derivation::take_keys();
+        assert_eq!(absent, present);
+        assert_eq!(present, changed);
+        assert_eq!(changed, removed);
+        assert_eq!(absent.len(), 1);
+    }
+
     #[test]
     fn superseding_write_does_not_keep_the_discarded_types_metadata() {
         use crate::db_index::LuaDeclId;

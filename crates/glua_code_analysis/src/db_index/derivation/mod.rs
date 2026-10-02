@@ -1834,6 +1834,93 @@ pub fn note_signature_read(id: LuaSignatureId) {
     );
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct FactRead(std::sync::atomic::AtomicU32);
+
+impl Clone for FactRead {
+    fn clone(&self) -> Self {
+        Self(std::sync::atomic::AtomicU32::new(
+            self.0.load(std::sync::atomic::Ordering::Relaxed),
+        ))
+    }
+}
+
+impl FactRead {
+    pub(crate) fn recomputes(&self, owner: &LuaTypeOwner) -> bool {
+        use std::sync::atomic::Ordering;
+        KEYS.with(|keys| {
+            keys.borrow().as_ref().is_some_and(|table| {
+                table
+                    .matching_slot(
+                        self.0.load(Ordering::Relaxed),
+                        |fact| matches!(fact, FactKey::TypeCache(stored) if stored == owner),
+                    )
+                    .or_else(|| table.find(&HashedKey::new(FactKey::TypeCache(owner.clone()))))
+                    .is_some_and(|slot| table.windowed(slot))
+            })
+        })
+    }
+
+    pub(crate) fn note(
+        &self,
+        key: impl FnOnce() -> FactKey,
+        matches: impl Fn(&FactKey) -> bool,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        if UNTRACKED.with(|depth| depth.get() > 0) {
+            return true;
+        }
+        CURRENT.with(|current| {
+            let mut current = current.borrow_mut();
+            let Some(evaluation) = current.as_mut() else {
+                return true;
+            };
+            if KEYS.with(|keys| keys.borrow().is_none())
+                && VIEW.with(|view| view.borrow().is_none())
+            {
+                return false;
+            }
+            NOTED_READS.with(|count| count.set(count.get() + 1));
+            let slot = self.0.load(Ordering::Relaxed);
+            KEYS.with(|keys| {
+                let mut keys = keys.borrow_mut();
+                if let Some(table) = keys.as_mut() {
+                    let slot = table.matching_slot(slot, &matches).unwrap_or_else(|| {
+                        let slot = table.intern_read(HashedKey::new(key()), evaluation.stamp);
+                        self.0.store(slot, Ordering::Relaxed);
+                        slot
+                    });
+                    evaluation.log_slot(table, slot);
+                    if table.taints(slot) {
+                        frames::taint_evaluation(evaluation);
+                    }
+                } else {
+                    VIEW.with(|view| {
+                        let view = view.borrow();
+                        let slot = view
+                            .as_ref()
+                            .and_then(|graph| graph.keys().matching_slot(slot, &matches));
+                        if let Some(slot) = slot {
+                            evaluation.viewed.insert(slot);
+                        } else {
+                            let key = HashedKey::new(key());
+                            if let Some(graph) = view.as_ref()
+                                && let Some(slot) = graph.find_slot(&key)
+                            {
+                                self.0.store(slot, Ordering::Relaxed);
+                                evaluation.viewed.insert(slot);
+                            } else {
+                                evaluation.reads.insert(key);
+                            }
+                        }
+                    });
+                }
+            });
+            true
+        })
+    }
+}
+
 /// Records a read of `owner`'s stored type.
 pub fn note_type_cache_read(owner: &LuaTypeOwner) {
     match owner {
