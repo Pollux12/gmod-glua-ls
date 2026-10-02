@@ -5,8 +5,8 @@ use glua_parser::{
 use rowan::TextSize;
 
 use crate::{
-    DbIndex, FlowNode, FlowTree, InferFailReason, InferGuard, LuaArrayLen, LuaArrayType,
-    LuaInferCache, LuaMemberKey, LuaType, TypeOps, infer_expr,
+    DbIndex, FlowNode, FlowTree, InferFailReason, LuaArrayLen, LuaArrayType, LuaInferCache,
+    LuaMemberKey, LuaType, TypeOps, infer_expr,
     semantic::type_check::is_sub_type_of,
     semantic::{
         infer::{
@@ -967,13 +967,7 @@ fn maybe_field_literal_eq_narrow(
     let mut opt_result = None;
     let mut union_types = union_type.into_vec();
     for (i, sub_type) in union_types.iter().enumerate() {
-        let member_type = match infer_member_by_member_key(
-            db,
-            cache,
-            sub_type,
-            index.clone(),
-            &InferGuard::new(),
-        ) {
+        let member_type = match infer_member_by_member_key(db, cache, sub_type, index.clone()) {
             Ok(member_type) => member_type,
             Err(_) => continue, // If we cannot infer the member type, skip this type
         };

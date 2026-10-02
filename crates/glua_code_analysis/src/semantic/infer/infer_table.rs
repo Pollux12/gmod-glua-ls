@@ -250,13 +250,8 @@ pub fn infer_table_field_value_should_be(
         .ok_or(InferFailReason::None)?;
     let parent_table_expr_type = infer_table_should_be(db, cache, parnet_table_expr)?;
     let index = LuaIndexMemberExpr::TableField(table_field.clone());
-    let reason = match infer_member_by_member_key(
-        db,
-        cache,
-        &parent_table_expr_type,
-        index.clone(),
-        &InferGuard::new(),
-    ) {
+    let reason = match infer_member_by_member_key(db, cache, &parent_table_expr_type, index.clone())
+    {
         Ok(member_type) => return Ok(member_type),
         Err(InferFailReason::FieldNotFound) => InferFailReason::FieldNotFound,
         Err(err) => return Err(err),
@@ -395,13 +390,8 @@ fn infer_table_field_type_by_parent(
     let parent_table_expr_type = infer_table_should_be(db, cache, parnet_table_expr)?;
 
     let index = LuaIndexMemberExpr::TableField(field);
-    let reason = match infer_member_by_member_key(
-        db,
-        cache,
-        &parent_table_expr_type,
-        index.clone(),
-        &InferGuard::new(),
-    ) {
+    let reason = match infer_member_by_member_key(db, cache, &parent_table_expr_type, index.clone())
+    {
         Ok(member_type) => return Ok(member_type),
         Err(InferFailReason::FieldNotFound) => InferFailReason::FieldNotFound,
         Err(err) => return Err(err),
@@ -630,7 +620,6 @@ fn infer_declared_index_assignment_type(
         cache,
         &prefix_type,
         LuaIndexMemberExpr::IndexExpr(index_expr),
-        &InferGuard::new(),
     )
     .ok()?;
     match declared_type {

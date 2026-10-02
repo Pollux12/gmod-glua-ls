@@ -135,22 +135,17 @@ pub fn infer_index_expr(
         Err(err) => return Err(err),
     };
     let index_member_expr = LuaIndexMemberExpr::IndexExpr(index_expr.clone());
-    let reason = match infer_member_by_member_key(
-        db,
-        cache,
-        &prefix_type,
-        index_member_expr.clone(),
-        &InferGuard::new(),
-    ) {
-        Ok(member_type) => {
-            if pass_flow {
-                return infer_member_type_pass_flow(db, cache, index_expr, member_type);
+    let reason =
+        match infer_member_by_member_key(db, cache, &prefix_type, index_member_expr.clone()) {
+            Ok(member_type) => {
+                if pass_flow {
+                    return infer_member_type_pass_flow(db, cache, index_expr, member_type);
+                }
+                return Ok(member_type);
             }
-            return Ok(member_type);
-        }
-        Err(InferFailReason::FieldNotFound) => InferFailReason::FieldNotFound,
-        Err(err) => return Err(err),
-    };
+            Err(InferFailReason::FieldNotFound) => InferFailReason::FieldNotFound,
+            Err(err) => return Err(err),
+        };
 
     match infer_member_by_operator(
         db,
@@ -463,7 +458,57 @@ pub fn infer_member_by_member_key(
     cache: &mut LuaInferCache,
     prefix_type: &LuaType,
     index_expr: LuaIndexMemberExpr,
-    infer_guard: &InferGuardRef,
+) -> InferResult {
+    let key = (index_expr.get_syntax_id(), prefix_type.clone());
+    let local_key = cache.member_query_local_key(index_expr.get_syntax_id(), prefix_type);
+    if let Some(value) = local_key
+        .as_ref()
+        .and_then(|key| cache.member_query_local_cache.get(key))
+    {
+        let value = value.clone();
+        crate::db_index::derivation::taint();
+        return value;
+    }
+    if cache.member_query_in_progress.contains(&key) {
+        return infer_member_query_uncached(db, cache, prefix_type, index_expr);
+    }
+    cache.watch_reuse();
+    if let Some(value) = cache.tracked_get(|cache| &mut cache.member_query_cache, &key) {
+        cache.check_reuse(&key, &value, |fresh| {
+            Some(infer_member_query_uncached(
+                db,
+                fresh,
+                prefix_type,
+                index_expr.clone(),
+            ))
+        });
+        return value;
+    }
+    cache.member_query_in_progress.insert(key.clone());
+    let frame = crate::db_index::derivation::open_frame();
+    let result = infer_member_query_uncached(db, cache, prefix_type, index_expr);
+    cache.member_query_in_progress.remove(&key);
+    let provenance = cache.close_frame(frame);
+    if !matches!(result, Err(InferFailReason::RecursiveInfer))
+        && let Some(key) = local_key
+    {
+        cache.member_query_local_cache.insert(key, result.clone());
+    }
+    if !matches!(result, Err(InferFailReason::RecursiveInfer))
+        && let Some(provenance) = provenance
+    {
+        cache
+            .member_query_cache
+            .insert(key, result.clone(), Some(provenance));
+    }
+    result
+}
+
+fn infer_member_query_uncached(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    prefix_type: &LuaType,
+    index_expr: LuaIndexMemberExpr,
 ) -> InferResult {
     let mut table_member_lookup_guard = TableMemberLookupGuard::default();
     let member_type = infer_member_by_member_key_with_table_guard(
@@ -471,7 +516,7 @@ pub fn infer_member_by_member_key(
         cache,
         prefix_type,
         index_expr,
-        infer_guard,
+        &InferGuard::new(),
         &mut table_member_lookup_guard,
     )?;
     Ok(substitute_member_self_type(db, member_type, prefix_type))
@@ -1878,13 +1923,8 @@ fn infer_gmod_plain_table_dynamic_field(
     let index_key = index_expr.get_index_key()?;
     let member_key = LuaMemberKey::from_index_key(db, cache, &index_key).ok()?;
     let class_type = LuaType::Ref(get_scripted_class_type_decl_id(&global_name, &class_name));
-    if let Ok(member_type) = infer_member_by_member_key(
-        db,
-        cache,
-        &class_type,
-        index_expr.clone(),
-        &InferGuard::new(),
-    ) {
+    if let Ok(member_type) = infer_member_by_member_key(db, cache, &class_type, index_expr.clone())
+    {
         return Some(member_type);
     }
 
@@ -3920,5 +3960,245 @@ mod union_member_tests {
                 .get_return_type(),
             LuaType::Boolean
         );
+    }
+}
+
+#[cfg(test)]
+mod member_query_memo_tests {
+    use super::*;
+    use crate::CacheOptions;
+    use crate::db_index::derivation::{self, DerivationId, DerivationKind, KeyTable};
+    use crate::db_index::{LuaIndex, WorkspaceId};
+    use glua_parser::{LuaParser, ParserConfig};
+
+    fn expression() -> LuaIndexMemberExpr {
+        LuaParser::parse("local value = object.field", ParserConfig::default())
+            .get_chunk_node()
+            .descendants::<LuaIndexExpr>()
+            .next()
+            .map(LuaIndexMemberExpr::IndexExpr)
+            .unwrap()
+    }
+
+    fn begin() {
+        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+    }
+
+    #[test]
+    fn member_query_memo_replays_absence_and_invalidates_on_export_edit_delete_reopen() {
+        let mut db = DbIndex::new();
+        let mut cache = LuaInferCache::new(FileId::new(1), CacheOptions::default());
+        let module = FileId::new(2);
+        let prefix = LuaType::ModuleRef(module);
+        let expr = expression();
+        let key = (expr.get_syntax_id(), prefix.clone());
+        derivation::lend_keys(KeyTable::default());
+        begin();
+        assert_eq!(
+            infer_member_by_member_key(&db, &mut cache, &prefix, expr.clone()),
+            Err(InferFailReason::FieldNotFound)
+        );
+        assert!(cache.member_query_cache.provenance(&key).is_some());
+        derivation::end();
+        cache.clear();
+        begin();
+        let frame = derivation::open_frame().unwrap();
+        assert_eq!(
+            infer_member_by_member_key(&db, &mut cache, &prefix, expr.clone()),
+            Err(InferFailReason::FieldNotFound)
+        );
+        let _replay = cache.close_frame(Some(frame)).unwrap();
+        let reads = derivation::end().into_recorded().1;
+        assert_eq!(reads.len(), 1);
+        begin();
+        db.get_module_index_mut().add_module_by_module_path(
+            module,
+            "memo".into(),
+            WorkspaceId { id: 0 },
+        );
+        assert_eq!(
+            infer_member_by_member_key(&db, &mut cache, &prefix, expr.clone()),
+            Err(InferFailReason::UnResolveModuleExport(module))
+        );
+        db.get_module_index_mut()
+            .get_module_mut(module)
+            .unwrap()
+            .export_type = Some(LuaType::Any);
+        db.get_module_index_mut().note_module_write(module);
+        assert_eq!(
+            infer_member_by_member_key(&db, &mut cache, &prefix, expr.clone()),
+            Ok(LuaType::Any)
+        );
+        db.get_module_index_mut()
+            .get_module_mut(module)
+            .unwrap()
+            .export_type = Some(LuaType::Nil);
+        db.get_module_index_mut().note_module_write(module);
+        assert_eq!(
+            infer_member_by_member_key(&db, &mut cache, &prefix, expr.clone()),
+            Ok(LuaType::Never)
+        );
+        db.get_module_index_mut().remove(module);
+        assert_eq!(
+            infer_member_by_member_key(&db, &mut cache, &prefix, expr.clone()),
+            Err(InferFailReason::FieldNotFound)
+        );
+        db.get_module_index_mut().add_module_by_module_path(
+            module,
+            "memo".into(),
+            WorkspaceId { id: 0 },
+        );
+        db.get_module_index_mut()
+            .get_module_mut(module)
+            .unwrap()
+            .export_type = Some(LuaType::Any);
+        db.get_module_index_mut().note_module_write(module);
+        assert_eq!(
+            infer_member_by_member_key(&db, &mut cache, &prefix, expr),
+            Ok(LuaType::Any)
+        );
+        derivation::end();
+        derivation::take_keys();
+    }
+
+    #[test]
+    fn member_query_memo_separates_prefixes_and_does_not_retain_recursive_errors() {
+        let mut db = DbIndex::new();
+        let mut cache = LuaInferCache::new(FileId::new(1), CacheOptions::default());
+        let expr = expression();
+        let module = FileId::new(2);
+        db.get_module_index_mut().add_module_by_module_path(
+            module,
+            "memo".into(),
+            WorkspaceId { id: 0 },
+        );
+        db.get_module_index_mut()
+            .get_module_mut(module)
+            .unwrap()
+            .export_type = Some(LuaType::ModuleRef(module));
+        derivation::lend_keys(KeyTable::default());
+        begin();
+        assert_eq!(
+            infer_member_by_member_key(&db, &mut cache, &LuaType::Any, expr.clone()),
+            Ok(LuaType::Any)
+        );
+        assert_eq!(
+            infer_member_by_member_key(&db, &mut cache, &LuaType::Nil, expr.clone()),
+            Ok(LuaType::Never)
+        );
+        assert_eq!(
+            infer_member_by_member_key(&db, &mut cache, &LuaType::ModuleRef(module), expr.clone()),
+            Err(InferFailReason::RecursiveInfer)
+        );
+        assert!(
+            cache
+                .member_query_cache
+                .peek(&(expr.get_syntax_id(), LuaType::ModuleRef(module)))
+                .is_none()
+        );
+        assert!(cache.member_query_in_progress.is_empty());
+        derivation::end();
+        derivation::take_keys();
+        cache.clear_deferred_inference_results();
+        assert!(cache.member_query_cache.is_empty());
+    }
+
+    #[test]
+    fn member_query_memo_preserves_call_site_realm_override_fallback() {
+        let mut ws = crate::VirtualWorkspace::new();
+        ws.def_file(
+            "annotations/memo.lua",
+            r#"
+            ---@meta
+            ---@class MemoBase
+            local MemoBase = {}
+            ---@return boolean
+            function MemoBase:field() end
+            ---@class MemoDerived: MemoBase
+            local MemoDerived = {}
+            ---@realm server
+            ---@return string
+            function MemoDerived:field() end
+        "#,
+        );
+        let file = ws.def_file("lua/autorun/client/memo.lua", "local value = object.field");
+        let model = ws.analysis.compilation.get_semantic_model(file).unwrap();
+        let expr: LuaIndexMemberExpr = model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .next()
+            .map(LuaIndexMemberExpr::IndexExpr)
+            .unwrap();
+        let db = model.get_db();
+        let mut cache = LuaInferCache::new(file, CacheOptions::default());
+        let prefix = LuaType::Ref(LuaTypeDeclId::global("MemoDerived"));
+        derivation::lend_keys(KeyTable::default());
+        begin();
+        for (realm, expected) in [
+            (crate::GmodRealm::Client, LuaType::Boolean),
+            (crate::GmodRealm::Server, LuaType::Boolean),
+            (crate::GmodRealm::Client, LuaType::Boolean),
+        ] {
+            let previous = cache.set_query_realm(Some(realm));
+            let result = infer_member_by_member_key(db, &mut cache, &prefix, expr.clone()).unwrap();
+            let LuaType::Signature(id) = result else {
+                panic!("expected member signature: {result:?}")
+            };
+            assert_eq!(
+                db.get_signature_index().get(&id).unwrap().get_return_type(),
+                expected
+            );
+            cache.restore_query_realm(previous);
+        }
+        derivation::end();
+        derivation::take_keys();
+    }
+
+    #[test]
+    fn member_query_diagnostic_local_reuse_is_confined_to_fresh_root_and_evaluation() {
+        let db = DbIndex::new();
+        let file = FileId::new(1);
+        let mut options = CacheOptions::default();
+        options.analysis_phase = crate::LuaAnalysisPhase::Diagnostics;
+        let mut cache = LuaInferCache::new(file, options);
+        let expr = expression();
+        let syntax = expr.get_syntax_id();
+        let prefix = LuaType::ModuleRef(FileId::new(2));
+        let graph = std::sync::Arc::new(derivation::ReaderGraph::default());
+        derivation::begin(DerivationId::diagnostics(file));
+        let view = derivation::view_graph(graph.clone());
+        let expected = Err(InferFailReason::FieldNotFound);
+        assert_eq!(
+            infer_member_by_member_key(&db, &mut cache, &prefix, expr.clone()),
+            expected
+        );
+        assert_eq!(cache.member_query_local_cache.len(), 1);
+        assert_eq!(
+            infer_member_by_member_key(&db, &mut cache, &prefix, expr.clone()),
+            expected
+        );
+        cache
+            .expr_in_progress
+            .insert(syntax, derivation::scope_mark());
+        assert!(cache.member_query_local_key(syntax, &prefix).is_none());
+        cache.expr_in_progress.clear();
+        let previous = cache.set_query_realm(Some(crate::GmodRealm::Server));
+        let realm_key = cache.member_query_local_key(syntax, &prefix).unwrap();
+        assert!(!cache.member_query_local_cache.contains_key(&realm_key));
+        cache.restore_query_realm(previous);
+        drop(view);
+        let reads = derivation::end().into_viewed_reads(&graph, |_| 1);
+        assert_eq!(reads.keys(&graph).count(), 1);
+        derivation::begin(DerivationId::diagnostics(file));
+        let view = derivation::view_graph(graph.clone());
+        assert!(cache.member_query_local_key(syntax, &prefix).is_some());
+        assert!(cache.member_query_local_cache.is_empty());
+        assert_eq!(
+            infer_member_by_member_key(&db, &mut cache, &prefix, expr),
+            expected
+        );
+        drop(view);
+        let reads = derivation::end().into_viewed_reads(&graph, |_| 1);
+        assert_eq!(reads.keys(&graph).count(), 1);
     }
 }

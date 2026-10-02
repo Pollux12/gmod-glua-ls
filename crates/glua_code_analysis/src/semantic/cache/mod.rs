@@ -28,6 +28,8 @@ const ORDERED_PHASE_GATE: Gates = 4;
 const FORCE_PHASE_GATE: Gates = 8;
 const DIAGNOSTICS_PHASE_GATE: Gates = 16;
 
+pub type MemberQueryLocalKey = (LuaSyntaxId, LuaType, Option<GmodRealm>, Gates);
+
 pub type FlowCacheInnerKey = (FlowId, GmodRealm, FlowOrigin);
 
 trait IsEmpty {
@@ -142,6 +144,10 @@ pub struct LuaInferCache {
     file_id: FileId,
     config: CacheOptions,
     pub expr_cache: TrackedMap<LuaSyntaxId, CacheEntry<LuaType>>,
+    pub member_query_cache: TrackedMap<(LuaSyntaxId, LuaType), Result<LuaType, InferFailReason>>,
+    pub member_query_in_progress: FxHashSet<(LuaSyntaxId, LuaType)>,
+    pub member_query_local_cache: FxHashMap<MemberQueryLocalKey, Result<LuaType, InferFailReason>>,
+    member_query_local_scope: derivation::ScopeMark,
     /// Expressions being inferred, and where each began: reaching one again
     /// is a recursion cut.
     pub(crate) expr_in_progress: FxHashMap<LuaSyntaxId, derivation::ScopeMark>,
@@ -333,6 +339,10 @@ impl LuaInferCache {
             file_id,
             config,
             expr_cache: Default::default(),
+            member_query_cache: Default::default(),
+            member_query_in_progress: Default::default(),
+            member_query_local_cache: Default::default(),
+            member_query_local_scope: Default::default(),
             expr_in_progress: Default::default(),
             call_cache: Default::default(),
             call_cache_local: Default::default(),
@@ -378,6 +388,34 @@ impl LuaInferCache {
             signature_is_generic_cache: Default::default(),
             generic_call_bindings: Default::default(),
         }
+    }
+
+    pub fn member_query_local_key(
+        &mut self,
+        syntax: LuaSyntaxId,
+        prefix: &LuaType,
+    ) -> Option<MemberQueryLocalKey> {
+        if !self.config.analysis_phase.is_diagnostics()
+            || derivation::current() != Some(derivation::DerivationId::diagnostics(self.file_id))
+            || !self.expr_in_progress.is_empty()
+            || !self.member_query_in_progress.is_empty()
+            || !self.keyed.is_empty()
+            || self.self_base_seed.is_some()
+            || self.baseline_flow_depth != 0
+        {
+            return None;
+        }
+        let scope = derivation::scope_mark();
+        if scope != self.member_query_local_scope {
+            self.member_query_local_cache.clear();
+            self.member_query_local_scope = scope;
+        }
+        Some((
+            syntax,
+            prefix.clone(),
+            self.flow_query_realm.map(|(realm, _)| realm),
+            self.view_gates(),
+        ))
     }
 
     pub fn get_config(&self) -> &CacheOptions {
@@ -703,6 +741,9 @@ impl LuaInferCache {
             }
         }
         self.expr_cache.clear_local();
+        self.member_query_cache.clear_local();
+        self.member_query_in_progress.clear();
+        self.member_query_local_cache.clear();
         empty(&mut self.expr_in_progress);
         self.expr_var_ref_id_cache.clear_local();
         self.call_returns_never_cache.clear_local();
@@ -753,6 +794,9 @@ impl LuaInferCache {
     /// invalidated.
     pub fn clear_deferred_inference_results(&mut self) {
         self.expr_cache.clear();
+        self.member_query_cache.clear();
+        self.member_query_in_progress.clear();
+        self.member_query_local_cache.clear();
         self.call_cache.clear();
         self.call_cache_local.clear();
         self.call_arg_types_cache.clear();
@@ -788,6 +832,9 @@ impl LuaInferCache {
     /// phase transition so unresolve does not rebuild them for every expression.
     pub fn clear_for_unresolve(&mut self, db: &DbIndex) {
         self.expr_cache.clear();
+        self.member_query_cache.clear();
+        self.member_query_in_progress.clear();
+        self.member_query_local_cache.clear();
         self.call_cache.clear();
         self.call_cache_local.clear();
         self.call_arg_types_cache.clear();

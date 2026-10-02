@@ -3,8 +3,8 @@ use rustc_hash::FxHashSet;
 use glua_parser::{LuaAstNode, LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexMemberExpr};
 
 use crate::{
-    DbIndex, FlowNode, FlowTree, GmodRealm, InferFailReason, InferGuard, LuaInferCache,
-    LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId,
+    DbIndex, FlowNode, FlowTree, GmodRealm, InferFailReason, LuaInferCache, LuaMemberKey,
+    LuaMemberOwner, LuaType, LuaTypeDeclId,
     semantic::{
         infer::{
             VarRefId,
@@ -169,13 +169,7 @@ fn maybe_field_exist_narrow(
 
     let mut result = vec![];
     for sub_type in &candidates {
-        let member_type = match infer_member_by_member_key(
-            db,
-            cache,
-            sub_type,
-            index.clone(),
-            &InferGuard::new(),
-        ) {
+        let member_type = match infer_member_by_member_key(db, cache, sub_type, index.clone()) {
             Ok(member_type) => member_type,
             Err(_) => continue, // If we cannot infer the member type, skip this type
         };
@@ -467,7 +461,7 @@ fn expand_surviving_subtypes_for_falsy_overrides(
             if !is_strict_sub_type_of(db, owner, candidate) {
                 return false;
             }
-            match infer_member_by_member_key(db, cache, owner, index.clone(), &InferGuard::new()) {
+            match infer_member_by_member_key(db, cache, owner, index.clone()) {
                 Ok(member_type) => member_type.is_always_falsy() || member_type.is_never(),
                 Err(_) => false,
             }
@@ -509,8 +503,7 @@ fn expand_surviving_subtypes_for_falsy_overrides(
             if !seen.insert(sub_ty.clone()) {
                 continue;
             }
-            match infer_member_by_member_key(db, cache, &sub_ty, index.clone(), &InferGuard::new())
-            {
+            match infer_member_by_member_key(db, cache, &sub_ty, index.clone()) {
                 Ok(member_type) if !member_type.is_always_falsy() && !member_type.is_never() => {
                     expanded.push(sub_ty);
                     added_subtype = true;

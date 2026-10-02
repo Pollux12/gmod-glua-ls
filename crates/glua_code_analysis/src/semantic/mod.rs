@@ -776,7 +776,6 @@ impl<'a> SemanticModel<'a> {
             &mut self.infer_cache.borrow_mut(),
             prefix_type,
             LuaIndexMemberExpr::IndexExpr(index_expr.clone()),
-            &InferGuard::new(),
         )
     }
 

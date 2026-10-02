@@ -533,16 +533,11 @@ fn try_narrow_member_guard(
     let index_member = LuaIndexMemberExpr::IndexExpr(index_expr);
     let mut callable_candidates = Vec::new();
     for candidate in &candidates {
-        let member_type = match infer_member_by_member_key(
-            db,
-            cache,
-            candidate,
-            index_member.clone(),
-            &InferGuard::new(),
-        ) {
-            Ok(member_type) => member_type,
-            Err(_) => continue,
-        };
+        let member_type =
+            match infer_member_by_member_key(db, cache, candidate, index_member.clone()) {
+                Ok(member_type) => member_type,
+                Err(_) => continue,
+            };
 
         if contains_callable_member_type(&member_type) {
             callable_candidates.push(candidate.clone());
