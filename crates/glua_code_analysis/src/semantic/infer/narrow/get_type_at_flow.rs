@@ -67,6 +67,10 @@ impl FlowWalkPolicy {
         Self { mode, ..self }
     }
 
+    pub(super) fn memo_policy(self) -> (FlowOrigin, bool) {
+        (self.origin, self.is_closure_baseline())
+    }
+
     fn is_normal(self) -> bool {
         self.mode == FlowWalkMode::Normal
     }

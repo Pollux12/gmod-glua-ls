@@ -432,7 +432,7 @@ fn get_single_antecedent(tree: &FlowTree, flow: &FlowNode) -> Result<FlowId, Inf
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ResultTypeOrContinue {
     Result(LuaType),
     Continue,

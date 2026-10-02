@@ -103,6 +103,20 @@ impl From<&VarRefId> for VarRefCacheKey {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FlowConditionKey {
+    pub var_ref: VarRefId,
+    pub flow: FlowId,
+    pub antecedent: Option<crate::FlowAntecedent>,
+    pub view: (u8, bool, bool),
+    pub syntax: LuaSyntaxId,
+    pub outcome: bool,
+    pub realm: Option<GmodRealm>,
+    pub origin: FlowOrigin,
+    pub baseline: bool,
+    pub keyed_origin: Option<LuaType>,
+}
+
 #[derive(Debug, Clone)]
 pub enum CacheEntry<T> {
     Ready,
@@ -174,6 +188,8 @@ pub struct LuaInferCache {
         TrackedMap<(LuaSyntaxId, Option<usize>), Arc<Vec<(LuaType, TextRange)>>>,
     pub generic_call_bindings: Untracked<FxHashMap<LuaSyntaxId, GenericCallBindings>>,
     pub flow_node_cache: FxHashMap<VarRefCacheKey, FlowEntries>,
+    pub(crate) condition_flow_cache:
+        TrackedMap<FlowConditionKey, Arc<crate::semantic::infer::narrow::ResultTypeOrContinue>>,
     /// Var refs whose flow entries include some only this evaluation may use.
     flow_local_keys: Vec<VarRefCacheKey>,
     /// The realm flow queries inherit, and the frame depth its scope began at.
@@ -348,6 +364,7 @@ impl LuaInferCache {
             call_cache_local: Default::default(),
             call_arg_types_cache: Default::default(),
             flow_node_cache: Default::default(),
+            condition_flow_cache: Default::default(),
             flow_local_keys: Vec::new(),
             flow_query_realm: None,
             baseline_flow_memo: Default::default(),
@@ -741,6 +758,7 @@ impl LuaInferCache {
             }
         }
         self.expr_cache.clear_local();
+        self.condition_flow_cache.clear_local();
         self.member_query_cache.clear_local();
         self.member_query_in_progress.clear();
         self.member_query_local_cache.clear();
@@ -794,6 +812,7 @@ impl LuaInferCache {
     /// invalidated.
     pub fn clear_deferred_inference_results(&mut self) {
         self.expr_cache.clear();
+        self.condition_flow_cache.clear();
         self.member_query_cache.clear();
         self.member_query_in_progress.clear();
         self.member_query_local_cache.clear();
@@ -832,6 +851,7 @@ impl LuaInferCache {
     /// phase transition so unresolve does not rebuild them for every expression.
     pub fn clear_for_unresolve(&mut self, db: &DbIndex) {
         self.expr_cache.clear();
+        self.condition_flow_cache.clear();
         self.member_query_cache.clear();
         self.member_query_in_progress.clear();
         self.member_query_local_cache.clear();
