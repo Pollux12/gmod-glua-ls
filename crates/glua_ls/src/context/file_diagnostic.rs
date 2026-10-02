@@ -26,24 +26,19 @@ pub(crate) struct SharedDiagnosticDataCache {
 
 impl SharedDiagnosticDataCache {
     fn get_or_precompute(&self, analysis: &EmmyLuaAnalysis) -> Arc<SharedDiagnosticData> {
-        // Fast path: the assembled bundle is reused whole while every
-        // component is still fresh for the current index revisions.
-        let cached = self.cached.lock().ok().and_then(|cache| cache.clone());
-        if let Some(cached) = cached
+        let mut cached = self.cached.lock().ok();
+        if let Some(cache) = cached.as_ref()
+            && let Some(shared_data) = cache.as_ref()
             && self.components.is_fresh(analysis.compilation.get_db())
         {
-            return cached;
+            return shared_data.clone();
         }
 
-        self.force_precompute(analysis)
-    }
-
-    fn force_precompute(&self, analysis: &EmmyLuaAnalysis) -> Arc<SharedDiagnosticData> {
         let shared_data = analysis
             .diagnostic
             .precompute_shared_data_with_cache(&analysis.compilation, &self.components);
-        if let Ok(mut cache) = self.cached.lock() {
-            *cache = Some(shared_data.clone());
+        if let Some(cache) = cached.as_mut() {
+            **cache = Some(shared_data.clone());
         }
         shared_data
     }
@@ -135,13 +130,6 @@ impl FileDiagnostic {
     ) -> Arc<SharedDiagnosticData> {
         self.shared_diagnostic_data_cache
             .get_or_precompute(analysis)
-    }
-
-    fn force_precompute_shared_diagnostic_data(
-        &self,
-        analysis: &EmmyLuaAnalysis,
-    ) -> Arc<SharedDiagnosticData> {
-        self.shared_diagnostic_data_cache.force_precompute(analysis)
     }
 
     fn diagnose_file_with_shared_data(
@@ -518,7 +506,7 @@ impl FileDiagnostic {
                 "precomputing shared diagnostic data for {} workspace files",
                 file_ids.len()
             );
-            let shared_data = self.force_precompute_shared_diagnostic_data(&analysis);
+            let shared_data = self.get_or_precompute_shared_diagnostic_data(&analysis);
             (file_ids, shared_data)
         };
         let valid_file_count = main_workspace_file_ids.len();
@@ -660,7 +648,7 @@ impl FileDiagnostic {
                 "precomputing shared diagnostic data for {} workspace files",
                 file_ids.len()
             );
-            let shared_data = self.force_precompute_shared_diagnostic_data(&analysis);
+            let shared_data = self.get_or_precompute_shared_diagnostic_data(&analysis);
             (file_ids, shared_data)
         };
 
@@ -991,7 +979,7 @@ async fn push_workspace_diagnostic(
             "precomputing shared diagnostic data for {} workspace files",
             file_ids.len()
         );
-        let shared_data = file_diagnostic.force_precompute_shared_diagnostic_data(&read_analysis);
+        let shared_data = file_diagnostic.get_or_precompute_shared_diagnostic_data(&read_analysis);
         (file_ids, shared_data)
     };
     let valid_file_count = main_workspace_file_ids.len();
@@ -1100,6 +1088,49 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{FileDiagnostic, claim_next_diagnostic_file};
+
+    #[gtest]
+    fn concurrent_diagnostic_pulls_share_the_first_precompute() {
+        let mut analysis = EmmyLuaAnalysis::new();
+        let workspace = std::env::temp_dir().join("gmod_glua_ls_concurrent_shared_diagnostics");
+        analysis.add_main_workspace(workspace.clone());
+        for i in 0..8 {
+            let uri = file_path_to_uri(&workspace.join(format!("lua/autorun/shared_{i}.lua")))
+                .expect("workspace URI should parse");
+            analysis.update_file_by_uri(
+                &uri,
+                Some(format!(
+                    "function SharedApi{i}() return true end SharedApi{i}()"
+                )),
+            );
+        }
+        let analysis = RwLock::new(analysis);
+        let cache = super::SharedDiagnosticDataCache::default();
+        let barrier = std::sync::Barrier::new(8);
+        for _ in 0..2 {
+            let bundles = std::thread::scope(|scope| {
+                let workers = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let guard = analysis.blocking_read();
+                            barrier.wait();
+                            cache.get_or_precompute(&guard)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().expect("diagnostic worker should finish"))
+                    .collect::<Vec<_>>()
+            });
+            assert!(
+                bundles
+                    .iter()
+                    .all(|bundle| Arc::ptr_eq(bundle, &bundles[0]))
+            );
+            cache.invalidate();
+        }
+    }
 
     #[gtest]
     fn workspace_diagnostic_workers_claim_the_shared_priority_queue_in_order() -> Result<()> {
