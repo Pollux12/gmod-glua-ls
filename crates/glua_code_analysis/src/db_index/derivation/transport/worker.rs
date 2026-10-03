@@ -103,8 +103,8 @@ impl WorkerContext {
     }
 
     pub(in super::super) fn observe_ready(&mut self, local: u32) {
-        let key = self.key(local);
-        if query_key(key.key()) {
+        if self.keys.is_query(local) {
+            let key = self.key(local);
             let seen = self.snapshot.queries[key];
             self.observe(local, seen);
         }
@@ -296,7 +296,7 @@ impl ComputeInputs {
         &self,
         keys: &WorkerKeys,
         table: &KeyTable,
-        fingerprint: impl Fn(&FactKey) -> Option<Fingerprint>,
+        fingerprint: impl Fn(&HashedKey) -> Option<Fingerprint>,
     ) -> bool {
         self.complete
             && self.flags.iter().all(|input| {
@@ -321,7 +321,7 @@ impl ComputeInputs {
                     super::WorkerKey::Known(slot) => table.live_key(slot),
                     super::WorkerKey::New(index) => Some(&keys.new_keys[index as usize]),
                 };
-                key.is_some_and(|key| fingerprint(key.key()) == Some(*seen))
+                key.is_some_and(|key| fingerprint(key) == Some(*seen))
             })
     }
 }
@@ -334,10 +334,10 @@ pub(crate) struct WorkerEvaluation {
 }
 
 impl WorkerEvaluation {
-    pub(crate) fn validate_graph(
+    pub(crate) fn validate(
         &self,
         graph: &ReaderGraph,
-        fingerprint: impl Fn(&FactKey) -> Option<Fingerprint>,
+        fingerprint: impl Fn(&HashedKey) -> Option<Fingerprint>,
     ) -> bool {
         self.validate_table(graph.keys(), fingerprint)
     }
@@ -358,22 +358,10 @@ impl WorkerEvaluation {
     fn validate_table(
         &self,
         table: &KeyTable,
-        fingerprint: impl Fn(&FactKey) -> Option<Fingerprint>,
+        fingerprint: impl Fn(&HashedKey) -> Option<Fingerprint>,
     ) -> bool {
         table.quarantine_started() == Some(self.started)
             && self.inputs.validate(&self.keys, table, fingerprint)
-    }
-
-    pub(crate) fn validate(
-        &self,
-        graph: &ReaderGraph,
-        fingerprint: impl Fn(&FactKey) -> Option<Fingerprint>,
-    ) -> bool {
-        self.validate_graph(graph, fingerprint)
-    }
-
-    pub(crate) fn reads<'a>(&'a self, graph: &'a ReaderGraph) -> impl Iterator<Item = &'a FactKey> {
-        self.read_keys(graph)
     }
 
     pub(crate) fn canonicalise(self, table: &mut KeyTable) -> Option<Evaluation> {
@@ -702,7 +690,7 @@ mod tests {
                 &snapshot,
                 id(),
                 || {
-                    derivation::open_frame().unwrap();
+                    let _ = derivation::open_frame().unwrap();
                     derivation::note_read(|| key(3).key().clone());
                     panic!("abort worker");
                 },

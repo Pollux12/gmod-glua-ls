@@ -84,6 +84,11 @@ pub(super) struct Recipes {
     caches: std::sync::Mutex<FxHashMap<FileId, crate::LuaInferCache>>,
 }
 
+struct ComputedCallTargets {
+    targets: crate::FileCallTargets,
+    cache: crate::LuaInferCache,
+}
+
 impl Recipes {
     pub(super) fn new(db: &DbIndex, scopes: ScriptedScopes) -> Self {
         let roots = db
@@ -121,6 +126,7 @@ impl super::engine::Recipe for Recipes {
         matches!(
             kind,
             DerivationKind::CallSiteParams
+                | DerivationKind::CallTargets
                 | DerivationKind::NetHelpers
                 | DerivationKind::Network
                 | DerivationKind::DynamicFields
@@ -132,6 +138,23 @@ impl super::engine::Recipe for Recipes {
 
     fn compute(&self, db: &DbIndex, id: DerivationId) -> Box<dyn std::any::Any + Send> {
         match id.kind {
+            DerivationKind::CallTargets => {
+                let mut context = AnalyzeContext::for_files(db, vec![id.file_id], &self.scopes);
+                if let Some(cache) = self.caches.lock().expect("cache store").remove(&id.file_id) {
+                    context.infer_manager.restore_file(id.file_id, cache);
+                }
+                let cache = context.infer_manager.get_infer_cache(id.file_id);
+                let transaction = cache.begin_transaction();
+                cache.config_mut().call_site_params_visible = false;
+                let targets = call_target::compute_file_call_targets_with(db, cache);
+                cache.config_mut().call_site_params_visible = true;
+                drop(transaction);
+                let cache = context
+                    .infer_manager
+                    .take_file(id.file_id)
+                    .expect("call-target cache");
+                Box::new(ComputedCallTargets { targets, cache })
+            }
             DerivationKind::CallSiteParams => {
                 Box::new(call_site_params::collect_file_contributions(db, id.file_id))
             }
@@ -159,6 +182,25 @@ impl super::engine::Recipe for Recipes {
 
     fn apply(&self, db: &mut DbIndex, id: DerivationId, computed: Box<dyn std::any::Any + Send>) {
         match id.kind {
+            DerivationKind::CallTargets => {
+                let ComputedCallTargets { targets, cache } = *computed
+                    .downcast::<ComputedCallTargets>()
+                    .expect("call targets");
+                let mut context = AnalyzeContext::for_files(db, vec![id.file_id], &self.scopes);
+                context.infer_manager.restore_file(id.file_id, cache);
+                call_target::apply_file_call_targets(db, id.file_id, targets);
+                unresolve::resolve_inline(db, &mut context);
+                let mut cache = context
+                    .infer_manager
+                    .take_file(id.file_id)
+                    .expect("call-target cache");
+                cache.commit_transaction();
+                cache.clear();
+                self.caches
+                    .lock()
+                    .expect("cache store")
+                    .insert(id.file_id, cache);
+            }
             DerivationKind::CallSiteParams => {
                 let contributions = *computed
                     .downcast::<Vec<call_site_params::Contribution>>()
@@ -205,6 +247,17 @@ impl super::engine::Recipe for Recipes {
             }
             kind => unreachable!("{kind:?} does not split"),
         }
+    }
+
+    fn discard(&self, id: DerivationId, computed: Box<dyn std::any::Any + Send>) {
+        let ComputedCallTargets { mut cache, .. } = *computed
+            .downcast::<ComputedCallTargets>()
+            .expect("call targets");
+        cache.rollback_transaction();
+        self.caches
+            .lock()
+            .expect("cache store")
+            .insert(id.file_id, cache);
     }
 
     fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {

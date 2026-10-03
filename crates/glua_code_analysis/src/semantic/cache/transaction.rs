@@ -47,6 +47,7 @@ pub(crate) fn detach_transaction() -> CacheTransaction {
     }
 }
 
+#[inline]
 pub(super) fn current() -> Option<u64> {
     if ACTIVE.load(Ordering::Relaxed) == 0 {
         return None;

@@ -357,27 +357,94 @@ pub(crate) type AccessPaths = rustc_hash::FxHashMap<
     Option<internment::ArcIntern<smol_str::SmolStr>>,
 >;
 
+struct KeptAccessPaths {
+    paths: AccessPaths,
+    snapshot: Option<Arc<AccessPaths>>,
+}
+
 thread_local! {
-    /// Set only while a slice of an engine run on this thread keeps paths:
-    /// every file's text is fixed for the run's pass.
-    static ACCESS_PATHS: std::cell::RefCell<Option<AccessPaths>> = const { std::cell::RefCell::new(None) };
+    static ACCESS_PATHS: std::cell::RefCell<Option<KeptAccessPaths>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Keeps the access paths [`interned_access_path`] builds on this thread in
-/// `paths` until [`stop_keeping_access_paths`].
 pub(crate) fn keep_access_paths(paths: AccessPaths) {
-    ACCESS_PATHS.with(|kept| *kept.borrow_mut() = Some(paths));
+    ACCESS_PATHS.with(|kept| {
+        *kept.borrow_mut() = Some(KeptAccessPaths {
+            paths,
+            snapshot: None,
+        });
+    });
 }
 
-/// Stops keeping access paths on this thread and hands back what it kept.
 pub(crate) fn stop_keeping_access_paths() -> AccessPaths {
     ACCESS_PATHS
         .with(|kept| kept.borrow_mut().take())
+        .map(|kept| kept.paths)
         .unwrap_or_default()
 }
 
-/// `index_expr`'s interned access path. During an engine run a path is built
-/// once per expression: it depends on the syntax alone.
+pub(crate) fn take_access_path_snapshot() -> Option<Arc<AccessPaths>> {
+    ACCESS_PATHS.with(|kept| {
+        kept.borrow_mut().take().map(|kept| {
+            debug_assert!(kept.snapshot.is_none());
+            Arc::new(kept.paths)
+        })
+    })
+}
+
+pub(crate) fn restore_access_path_snapshot(
+    snapshot: Option<Arc<AccessPaths>>,
+    additions: impl IntoIterator<Item = AccessPaths>,
+) {
+    if let Some(snapshot) = snapshot {
+        let mut paths = Arc::try_unwrap(snapshot).expect("finished access-path workers");
+        for additions in additions {
+            paths.extend(additions);
+        }
+        keep_access_paths(paths);
+    }
+}
+
+struct AccessPathScope {
+    previous: Option<Option<KeptAccessPaths>>,
+}
+
+impl AccessPathScope {
+    fn new(snapshot: Option<&Arc<AccessPaths>>) -> Self {
+        let scoped = snapshot.map(|snapshot| KeptAccessPaths {
+            paths: AccessPaths::default(),
+            snapshot: Some(Arc::clone(snapshot)),
+        });
+        let previous = ACCESS_PATHS.with(|kept| kept.replace(scoped));
+        Self {
+            previous: Some(previous),
+        }
+    }
+
+    fn finish(mut self) -> AccessPaths {
+        ACCESS_PATHS
+            .with(|kept| kept.replace(self.previous.take().flatten()))
+            .map(|kept| kept.paths)
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for AccessPathScope {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            ACCESS_PATHS.with(|kept| *kept.borrow_mut() = previous);
+        }
+    }
+}
+
+pub(crate) fn with_access_paths<T>(
+    snapshot: Option<&Arc<AccessPaths>>,
+    compute: impl FnOnce() -> T,
+) -> (T, AccessPaths) {
+    let scope = AccessPathScope::new(snapshot);
+    let value = compute();
+    (value, scope.finish())
+}
+
 fn interned_access_path(
     file_id: crate::FileId,
     syntax_id: glua_parser::LuaSyntaxId,
@@ -389,10 +456,13 @@ fn interned_access_path(
             .map(|path| crate::db_index::intern_smol_str(&path))
     };
     ACCESS_PATHS.with(|paths| match paths.borrow_mut().as_mut() {
-        Some(paths) => paths
-            .entry((file_id, syntax_id))
-            .or_insert_with(build)
-            .clone(),
+        Some(kept) => {
+            let key = (file_id, syntax_id);
+            if let Some(path) = kept.snapshot.as_ref().and_then(|paths| paths.get(&key)) {
+                return path.clone();
+            }
+            kept.paths.entry(key).or_insert_with(build).clone()
+        }
         None => build(),
     })
 }
@@ -4200,5 +4270,106 @@ mod member_query_memo_tests {
         drop(view);
         let reads = derivation::end().into_viewed_reads(&graph, |_| 1);
         assert_eq!(reads.keys(&graph).count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod access_path_tests {
+    use glua_parser::{LuaAstNode, LuaIndexExpr, LuaParser, ParserConfig};
+
+    use super::*;
+
+    fn index(text: &str) -> LuaIndexExpr {
+        LuaParser::parse(text, ParserConfig::default())
+            .get_chunk_node()
+            .descendants::<LuaIndexExpr>()
+            .next()
+            .expect("index expression")
+    }
+
+    fn path(file_id: crate::FileId, index: &LuaIndexExpr) -> String {
+        interned_access_path(file_id, index.get_syntax_id(), index)
+            .expect("access path")
+            .as_ref()
+            .to_string()
+    }
+
+    #[test]
+    fn access_path_snapshot_reuses_foreign_and_negative_entries_and_returns_only_additions() {
+        let first = crate::FileId::new(1);
+        let second = crate::FileId::new(2);
+        let third = crate::FileId::new(3);
+        let a = index("local x = a.x");
+        let b = index("local x = b.y");
+        assert_eq!(a.get_syntax_id(), b.get_syntax_id());
+        keep_access_paths(AccessPaths::default());
+        assert_eq!(path(first, &a), "a.x");
+        ACCESS_PATHS.with(|kept| {
+            kept.borrow_mut()
+                .as_mut()
+                .expect("cache")
+                .paths
+                .insert((second, b.get_syntax_id()), None);
+        });
+        let snapshot = take_access_path_snapshot().expect("snapshot");
+        let ((), additions) = with_access_paths(Some(&snapshot), || {
+            assert_eq!(path(first, &a), "a.x");
+            assert_eq!(interned_access_path(second, b.get_syntax_id(), &b), None);
+            assert_eq!(path(third, &b), "b.y");
+        });
+        assert_eq!(additions.len(), 1);
+        assert!(additions.contains_key(&(third, b.get_syntax_id())));
+        assert_eq!(Arc::strong_count(&snapshot), 1);
+        restore_access_path_snapshot(Some(snapshot), [additions]);
+        let kept = stop_keeping_access_paths();
+        assert_eq!(kept.len(), 3);
+        assert_eq!(kept[&(second, b.get_syntax_id())], None);
+        let changed = index("local x = a.y");
+        keep_access_paths(AccessPaths::default());
+        assert_eq!(path(first, &changed), "a.y");
+        stop_keeping_access_paths();
+    }
+
+    #[test]
+    fn access_path_scope_restores_in_place_caller_and_preserves_disabled_cache() {
+        let file_id = crate::FileId::new(1);
+        let a = index("local x = a.x");
+        let b = index("local x = b.y");
+        keep_access_paths(AccessPaths::default());
+        assert_eq!(path(file_id, &a), "a.x");
+        let snapshot = Arc::new(AccessPaths::default());
+        let (_, additions) = with_access_paths(Some(&snapshot), || path(file_id, &b));
+        assert_eq!(additions.len(), 1);
+        assert_eq!(path(file_id, &a), "a.x");
+        let (computed, additions) = with_access_paths(None, || path(file_id, &b));
+        assert_eq!(computed, "b.y");
+        assert!(additions.is_empty());
+        assert_eq!(path(file_id, &a), "a.x");
+        stop_keeping_access_paths();
+        assert!(take_access_path_snapshot().is_none());
+        let (_, additions) = with_access_paths(None, || path(file_id, &b));
+        restore_access_path_snapshot(None, [additions]);
+        ACCESS_PATHS.with(|kept| assert!(kept.borrow().is_none()));
+    }
+
+    #[test]
+    fn access_path_worker_unwind_restores_caller_and_releases_snapshot() {
+        let file_id = crate::FileId::new(1);
+        let a = index("local x = a.x");
+        keep_access_paths(AccessPaths::default());
+        assert_eq!(path(file_id, &a), "a.x");
+        let snapshot = Arc::new(AccessPaths::default());
+        let result = std::panic::catch_unwind(|| {
+            with_access_paths(Some(&snapshot), || panic!("worker unwound"));
+        });
+        assert!(result.is_err());
+        assert_eq!(Arc::strong_count(&snapshot), 1);
+        assert_eq!(stop_keeping_access_paths().len(), 1);
+        let result = std::panic::catch_unwind(|| {
+            with_access_paths(Some(&snapshot), || panic!("worker unwound"));
+        });
+        assert!(result.is_err());
+        ACCESS_PATHS.with(|kept| assert!(kept.borrow().is_none()));
+        assert_eq!(Arc::strong_count(&snapshot), 1);
     }
 }

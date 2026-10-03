@@ -198,12 +198,9 @@ impl<F: QueryFamily> QueryTable<F> {
     /// The query's value, a recorded read of its output.
     pub(crate) fn get(&self, db: &DbIndex, key: LuaSignatureId) -> Arc<F::Value> {
         derivation::note_read(|| F::output(key));
-        self.value(db, key)
-    }
-
-    /// The query's value, computed if it has no current memo.
-    fn value(&self, db: &DbIndex, key: LuaSignatureId) -> Arc<F::Value> {
-        self.value_with_fingerprint(db, key).value
+        let observed = self.value_with_fingerprint(db, key);
+        derivation::note_observed_query_read(F::output(key), observed.fingerprint);
+        observed.value
     }
 
     fn value_with_fingerprint(&self, db: &DbIndex, key: LuaSignatureId) -> QueryValue<F::Value> {
@@ -211,6 +208,25 @@ impl<F: QueryFamily> QueryTable<F> {
     }
 
     fn value_unmapped(&self, db: &DbIndex, key: LuaSignatureId) -> QueryValue<F::Value> {
+        if let Some(ready) = derivation::worker_query_readiness(&F::output(key)) {
+            let memo = self.memos().get(&key).filter(|memo| !memo.stale).cloned();
+            if let Some(memo) = memo.filter(|memo| ready == Some(memo.fingerprint)) {
+                Counters::bump(&self.counters.hits);
+                if check_mode() {
+                    self.check(db, key, &memo);
+                }
+                return QueryValue {
+                    value: memo.value,
+                    fingerprint: memo.fingerprint,
+                };
+            }
+            derivation::require_canonical_query();
+            let value = Arc::new(F::floor());
+            return QueryValue {
+                fingerprint: Self::fingerprint_of(&value),
+                value,
+            };
+        }
         let id = Self::id(key);
         if let Some(memo) = self.memos().get(&key).filter(|memo| !memo.stale).cloned() {
             Counters::bump(&self.counters.hits);
@@ -238,7 +254,10 @@ impl<F: QueryFamily> QueryTable<F> {
                 },
             );
         }
-        let (value, reads) = computing(id, || derivation::detached(id, || F::compute(db, key)));
+        let (value, reads) = computing(id, || {
+            let _transaction = crate::semantic::detach_transaction();
+            derivation::detached(id, || F::compute(db, key))
+        });
         let value = Arc::new(value);
         let fingerprint = Self::fingerprint_of(&value);
         let reads = reads
@@ -284,7 +303,13 @@ impl<F: QueryFamily> QueryTable<F> {
         if is_computing(id) {
             return;
         }
-        let (fresh, _) = computing(id, || derivation::detached(id, || F::compute(db, key)));
+        let (fresh, _) = computing(id, || {
+            let _transaction = crate::semantic::detach_transaction();
+            derivation::detached(id, || F::compute(db, key))
+        });
+        if derivation::worker_requires_canonical() {
+            return;
+        }
         if Self::fingerprint_of(&fresh) != memo.fingerprint {
             Counters::bump(&self.counters.mismatches);
             eprintln!(
@@ -299,6 +324,18 @@ impl<F: QueryFamily> QueryTable<F> {
     /// stored fact's holds until it is written; computed only when there is
     /// no memo. Not a read.
     pub(crate) fn fingerprint(&self, db: &DbIndex, key: LuaSignatureId) -> Fingerprint {
+        if let Some(ready) = derivation::worker_query_readiness(&F::output(key)) {
+            let memo = self.memos().get(&key).filter(|memo| !memo.stale).cloned();
+            if let Some(memo) = memo.filter(|memo| ready == Some(memo.fingerprint)) {
+                return if derivation::mapping_back() {
+                    Self::fingerprint_of(&memo.value)
+                } else {
+                    memo.fingerprint
+                };
+            }
+            derivation::require_canonical_query();
+            return derivation::ABSENT;
+        }
         let memo = self.memos().get(&key).cloned();
         let (value, fingerprint) = match memo {
             Some(memo) => (memo.value, memo.fingerprint),
@@ -341,6 +378,10 @@ impl<F: QueryFamily> QueryTable<F> {
     /// records its reads, and writes its output.
     pub(crate) fn recompute(&self, db: &DbIndex, id: DerivationId) {
         let key = Self::key(id);
+        if derivation::worker_query_readiness(&F::output(key)).is_some() {
+            derivation::require_canonical_query();
+            return;
+        }
         let value = Arc::new(computing(id, || F::compute(db, key)));
         let fingerprint = Self::fingerprint_of(&value);
         let previous = self.memos().insert(
@@ -489,7 +530,7 @@ impl Queries {
 #[cfg(test)]
 mod transport_tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::sync::Barrier;
     use std::sync::atomic::AtomicBool;
 
@@ -501,6 +542,7 @@ mod transport_tests {
 
     thread_local! {
         static RACING: RefCell<Option<RacingCompute>> = const { RefCell::new(None) };
+        static COMPUTE_CHILD: Cell<bool> = const { Cell::new(false) };
     }
 
     struct TestQuery;
@@ -513,7 +555,12 @@ mod transport_tests {
             FactKey::ReceiverAuthority(key)
         }
 
-        fn compute(_: &DbIndex, _: LuaSignatureId) -> u64 {
+        fn compute(db: &DbIndex, _: LuaSignatureId) -> u64 {
+            if COMPUTE_CHILD.with(Cell::get) {
+                db.queries()
+                    .receiver_authority
+                    .get(db, LuaSignatureId::new(FileId::new(8), 3.into()));
+            }
             RACING.with(|context| {
                 let context = context.borrow();
                 let Some(context) = context.as_ref() else {
@@ -536,6 +583,121 @@ mod transport_tests {
 
     fn key() -> LuaSignatureId {
         LuaSignatureId::new(FileId::new(1), 2.into())
+    }
+
+    fn snapshot(
+        outputs: FxHashMap<HashedKey, Fingerprint>,
+    ) -> (
+        derivation::RecordingSnapshot,
+        Arc<derivation::ReaderGraph>,
+        derivation::ReleaseQuarantine,
+    ) {
+        let mut graph = derivation::ReaderGraph::default();
+        let quarantine = graph.quarantine_releases();
+        let graph = Arc::new(graph);
+        (
+            derivation::RecordingSnapshot::new(Arc::clone(&graph), quarantine.started(), outputs),
+            graph,
+            quarantine,
+        )
+    }
+
+    fn memo(table: &QueryTable<TestQuery>, stale: bool) -> Fingerprint {
+        let fingerprint = derivation::fingerprint_of(&13u64);
+        table.memos().insert(
+            key(),
+            Memo {
+                value: Arc::new(13),
+                fingerprint,
+                stale,
+            },
+        );
+        fingerprint
+    }
+
+    #[test]
+    fn parallel_query_worker_hit_records_actual_value_and_requires_fresh_publication() {
+        let table = QueryTable::<TestQuery>::default();
+        let fingerprint = memo(&table, false);
+        let (snapshot, graph, _quarantine) = snapshot(FxHashMap::from_iter([(
+            HashedKey::new(TestQuery::output(key())),
+            fingerprint,
+        )]));
+        let db = DbIndex::new();
+        let result = derivation::compute_recorded(
+            &snapshot,
+            QueryTable::<TestQuery>::id(key()),
+            || table.get(&db, key()),
+            |_| unreachable!("query fingerprints use observed values"),
+        );
+        assert_eq!(*result.value, 13);
+        assert!(
+            result
+                .evaluation
+                .validate(&graph, |_| table.ready_fingerprint(key()))
+        );
+        table.set_stale(QueryTable::<TestQuery>::id(key()), true);
+        assert!(
+            !result
+                .evaluation
+                .validate(&graph, |_| table.ready_fingerprint(key()))
+        );
+        assert_eq!(table.stats().computed, 0);
+        assert!(!table.has_pending());
+    }
+
+    #[test]
+    fn parallel_query_worker_blocks_stale_fingerprints_and_missing_values_without_filling() {
+        for state in [None, Some(true), Some(false)] {
+            let table = QueryTable::<TestQuery>::default();
+            if let Some(stale) = state {
+                memo(&table, stale);
+            }
+            let (snapshot, graph, _quarantine) = snapshot(FxHashMap::default());
+            let db = DbIndex::new();
+            let result = derivation::compute_recorded(
+                &snapshot,
+                QueryTable::<TestQuery>::id(key()),
+                || (table.fingerprint(&db, key()), table.get(&db, key())),
+                |_| unreachable!("query fingerprints use observed values"),
+            );
+            assert_eq!(result.value.0, derivation::ABSENT);
+            assert_eq!(*result.value.1, 7);
+            assert!(
+                !result
+                    .evaluation
+                    .validate(&graph, |_| table.ready_fingerprint(key()))
+            );
+            assert_eq!(table.stats().computed, 0);
+            assert!(!table.has_pending());
+            assert_eq!(table.memos().len(), usize::from(state.is_some()));
+        }
+    }
+
+    #[test]
+    fn parallel_query_check_defers_comparison_after_a_blocked_detached_child() {
+        let table = QueryTable::<TestQuery>::default();
+        let fingerprint = memo(&table, false);
+        let (snapshot, graph, _quarantine) = snapshot(FxHashMap::from_iter([(
+            HashedKey::new(TestQuery::output(key())),
+            fingerprint,
+        )]));
+        let db = DbIndex::new();
+        let result = derivation::compute_recorded(
+            &snapshot,
+            QueryTable::<TestQuery>::id(key()),
+            || {
+                COMPUTE_CHILD.with(|child| child.set(true));
+                table.check(&db, key(), &table.memos().get(&key()).unwrap().clone());
+                COMPUTE_CHILD.with(|child| child.set(false));
+                assert!(derivation::worker_requires_canonical());
+            },
+            |_| unreachable!("no query read remains in the parent"),
+        );
+        assert!(!result.evaluation.validate(&graph, |_| None));
+        assert_eq!(table.stats().mismatches, 0);
+        assert_eq!(db.queries().receiver_authority.stats().computed, 0);
+        assert!(!db.queries().has_pending());
     }
 
     #[test]

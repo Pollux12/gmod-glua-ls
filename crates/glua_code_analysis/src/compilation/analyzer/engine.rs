@@ -224,6 +224,8 @@ pub(crate) trait Recipe: Sync {
     fn compute(&self, db: &DbIndex, id: DerivationId) -> Box<dyn std::any::Any + Send>;
 
     fn apply(&self, db: &mut DbIndex, id: DerivationId, computed: Box<dyn std::any::Any + Send>);
+
+    fn discard(&self, _id: DerivationId, _computed: Box<dyn std::any::Any + Send>) {}
 }
 
 #[derive(Default)]
@@ -835,8 +837,18 @@ impl Engine {
             self.trace_evaluation(db, id, reason);
             self.check_convergence(id);
             let group = crate::profile::phase("engine: co-producers", || co_producers(db, id));
-            if group.len() == 1 && recipe.splits(id.kind) {
-                crate::profile::phase("engine: batch", || self.run_batch(db, id, recipe));
+            if group.len() == 1
+                && recipe.splits(id.kind)
+                && (id.kind != DerivationKind::CallTargets
+                    || (matches!(slice, Slice::Whole) && super::parallel::analysis_threads() > 1))
+            {
+                crate::profile::phase("engine: batch", || {
+                    if id.kind == DerivationKind::CallTargets {
+                        self.run_recorded_batch(db, id, recipe);
+                    } else {
+                        self.run_batch(db, id, recipe);
+                    }
+                });
                 self.queue_reruns();
                 continue;
             }
@@ -1463,6 +1475,180 @@ impl Engine {
         }
     }
 
+    fn run_recorded_batch(&mut self, db: &mut DbIndex, first: DerivationId, recipe: &dyn Recipe) {
+        let limit = super::parallel::analysis_threads()
+            .saturating_mul(2)
+            .saturating_mul(recorded_window_multiplier());
+        let mut batch = vec![first];
+        let mut alone = Vec::new();
+        while batch.len() < limit {
+            let Some((id, reason)) = self.worklist.pop_first_of(first.kind) else {
+                break;
+            };
+            if !self.needs_evaluation(db, id, reason) {
+                continue;
+            }
+            self.trace_evaluation(db, id, reason);
+            if co_producers(db, id).len() == 1 {
+                batch.push(id);
+            } else {
+                alone.push(id);
+            }
+        }
+        let expected_output = |id: DerivationId, key: &FactKey| matches!(key, FactKey::CallTargets(file_id) if *file_id == id.file_id);
+        if batch.iter().any(|id| {
+            db.reader_graph()
+                .outputs_of(*id)
+                .any(|key| !expected_output(*id, key))
+        }) {
+            let touched = self.evaluate_group(db, &[first], recipe);
+            self.stats.evaluated(first);
+            self.evaluated.insert(first.file_id);
+            self.readers_of(db, touched.iter());
+            for id in batch.into_iter().skip(1).chain(alone) {
+                self.worklist.insert(id, Reason::Changed);
+            }
+            return;
+        }
+        let profiling = self.stats.profiling();
+        let started = profiling.then(std::time::Instant::now);
+        let reruns = batch
+            .iter()
+            .filter(|id| self.stats.distinct.contains(id))
+            .count();
+        for id in &batch {
+            self.unqueue(*id);
+            self.stats.evaluated(*id);
+            self.evaluated.insert(id.file_id);
+        }
+        let mut touched = self.reset_outputs(
+            db,
+            &batch,
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            None,
+        );
+        let recomputing = self.lend_evaluation_keys(db, &touched);
+        db.reader_graph_mut().restore_keys(derivation::take_keys());
+        touched.extend(file_queries(db));
+        for key in &touched {
+            db.reader_graph().forget_fingerprint(key);
+        }
+        let quarantine = db.reader_graph_mut().quarantine_releases();
+        let paths = crate::semantic::take_access_path_snapshot();
+        let computed = {
+            let snapshot = derivation::RecordingSnapshot::new(
+                db.reader_graph_shared(),
+                quarantine.started(),
+                db.queries().ready_outputs(),
+            );
+            let files = batch.iter().map(|id| id.file_id).collect::<Vec<_>>();
+            super::parallel::map_files_collect(db, &files, |db, file_id| {
+                let id = *batch
+                    .iter()
+                    .find(|id| id.file_id == file_id)
+                    .expect("one task per file");
+                let started = profiling.then(std::time::Instant::now);
+                let (result, additions) =
+                    crate::semantic::with_access_paths(paths.as_ref(), || {
+                        derivation::compute_recorded(
+                            &snapshot,
+                            id,
+                            || recipe.compute(db, id),
+                            |key| {
+                                db.reader_graph()
+                                    .current_fingerprint(key, |key| db.fact_fingerprint(key))
+                            },
+                        )
+                    });
+                (
+                    (
+                        result,
+                        started.map(|started| started.elapsed()).unwrap_or_default(),
+                    ),
+                    additions,
+                )
+            })
+        };
+        let (computed, additions): (Vec<_>, Vec<_>) = computed.into_iter().unzip();
+        crate::semantic::restore_access_path_snapshot(paths, additions);
+        for (id, (result, computing)) in batch.iter().zip(computed) {
+            let started = profiling.then(std::time::Instant::now);
+            let valid = result.evaluation.validate(db.reader_graph(), |key| {
+                if matches!(
+                    key.key(),
+                    FactKey::ReceiverAuthority(_) | FactKey::CallbackParams(_)
+                ) {
+                    db.queries().ready_fingerprint(key)
+                } else {
+                    Some(self.fingerprint(db, key))
+                }
+            }) && result
+                .evaluation
+                .read_keys(db.reader_graph())
+                .all(|key| !matches!(key, FactKey::CallTargets(_)));
+            if profiling {
+                self.stats.parallel_attempts += 1;
+            }
+            let mut table = db.reader_graph_mut().lend_keys();
+            let evaluation = if valid {
+                let evaluation = result
+                    .evaluation
+                    .canonicalise(&mut table)
+                    .expect("validated worker slots");
+                derivation::lend_keys(table);
+                let lent = scopeguard_lent_keys();
+                derivation::resume(evaluation);
+                recipe.apply(db, *id, result.value);
+                let evaluation = derivation::end();
+                db.reader_graph_mut().restore_keys(derivation::take_keys());
+                std::mem::forget(lent);
+                evaluation
+            } else {
+                if profiling {
+                    self.stats.parallel_fallbacks += 1;
+                }
+                recipe.discard(*id, result.value);
+                derivation::lend_keys(table);
+                let lent = scopeguard_lent_keys();
+                derivation::begin(*id);
+                recipe.evaluate(db, *id);
+                let evaluation = derivation::end();
+                db.reader_graph_mut().restore_keys(derivation::take_keys());
+                std::mem::forget(lent);
+                evaluation
+            };
+            let mut published = FxHashSet::default();
+            self.record(
+                db,
+                vec![(evaluation, None)],
+                &mut published,
+                &FxHashSet::default(),
+                || format!("publishing {id:?}"),
+            );
+            touched.extend(published);
+            self.stats.timed_evaluation(
+                *id,
+                computing + started.map(|started| started.elapsed()).unwrap_or_default(),
+            );
+        }
+        derivation::lend_keys(db.reader_graph_mut().lend_keys());
+        let lent = scopeguard_lent_keys();
+        derivation::note_recomputed(|key| recomputing.get(key) == Some(&db.fact_fingerprint(key)));
+        let mut table = derivation::take_keys();
+        std::mem::forget(lent);
+        quarantine.finish(&mut table);
+        db.reader_graph_mut().restore_keys(table);
+        if let Some(started) = started {
+            self.stats
+                .timed(first.kind, started.elapsed(), reruns, batch.len());
+        }
+        self.readers_of(db, touched.iter());
+        for id in alone {
+            self.worklist.insert(id, Reason::Changed);
+        }
+    }
+
     /// Resets the primary outputs of `members` to the source layer. Returns
     /// every key that moved or may move: their previous outputs.
     /// Resets `members`' primary outputs and the primary keys in `also`, but
@@ -1510,8 +1696,21 @@ impl Engine {
         touched: &FxHashSet<HashedKey>,
         f: impl FnOnce(&mut DbIndex) -> T,
     ) -> T {
-        derivation::lend_keys(db.reader_graph_mut().lend_keys());
+        let recomputing = self.lend_evaluation_keys(db, touched);
         let lent = scopeguard_lent_keys();
+        let evaluations = f(db);
+        derivation::note_recomputed(|key| recomputing.get(key) == Some(&db.fact_fingerprint(key)));
+        db.reader_graph_mut().restore_keys(derivation::take_keys());
+        std::mem::forget(lent);
+        evaluations
+    }
+
+    fn lend_evaluation_keys(
+        &self,
+        db: &mut DbIndex,
+        touched: &FxHashSet<HashedKey>,
+    ) -> FxHashMap<HashedKey, derivation::Fingerprint> {
+        derivation::lend_keys(db.reader_graph_mut().lend_keys());
         let recomputing = std::mem::take(&mut *self.recomputing.borrow_mut());
         derivation::note_recomputing(recomputing.keys().cloned());
         derivation::note_written(
@@ -1521,11 +1720,7 @@ impl Engine {
                 .cloned()
                 .chain(self.moved_rules.borrow_mut().drain(..)),
         );
-        let evaluations = f(db);
-        derivation::note_recomputed(|key| recomputing.get(key) == Some(&db.fact_fingerprint(key)));
-        db.reader_graph_mut().restore_keys(derivation::take_keys());
-        std::mem::forget(lent);
-        evaluations
+        recomputing
     }
 
     /// Resets the group's primary outputs and re-runs it. Returns every key the
@@ -1647,6 +1842,8 @@ impl Engine {
 /// work an operation costs.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EngineStats {
+    parallel_attempts: usize,
+    parallel_fallbacks: usize,
     evaluations: BTreeMap<DerivationKind, usize>,
     /// Rounds after the first.
     pub(crate) rounds: usize,
@@ -1845,6 +2042,10 @@ impl EngineStats {
             self.loops_cleared,
             self.loop_members_cleared,
             kinds.join(" ")
+        );
+        eprintln!(
+            "[engine] parallel attempts={} fallbacks={}",
+            self.parallel_attempts, self.parallel_fallbacks
         );
         let mut distinct = BTreeMap::<DerivationKind, usize>::new();
         for id in &self.distinct {
@@ -2099,6 +2300,19 @@ fn scopeguard_lent_keys() -> OnDrop {
 /// [`Engine::check_convergence`] reports that the facts it reads do not settle.
 const MAX_STAGE_EVALUATIONS: u32 = 1000;
 
+fn recorded_window_multiplier() -> usize {
+    static MULTIPLIER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MULTIPLIER.get_or_init(|| {
+        match std::env::var("GLUALS_RECORDED_WINDOW")
+            .ok()
+            .and_then(|value| value.parse().ok())
+        {
+            Some(value @ (1 | 2 | 4 | 8)) => value,
+            _ => 1,
+        }
+    })
+}
+
 fn check_convergence() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("GLUALS_CHECK_CONVERGENCE").is_some())
@@ -2128,6 +2342,124 @@ mod tests {
     const COPIED: u32 = 1;
     const SHARED: u32 = 2;
     const WRITTEN: u32 = 3;
+
+    struct RecordedTargets {
+        blocked: FileId,
+        applied: Mutex<Vec<(FileId, bool)>>,
+        discarded: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Recipe for RecordedTargets {
+        fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
+            self.applied.lock().unwrap().push((id.file_id, false));
+            db.get_call_target_index_mut()
+                .set_file(id.file_id, Default::default());
+        }
+
+        fn splits(&self, kind: DerivationKind) -> bool {
+            kind == DerivationKind::CallTargets
+        }
+
+        fn compute(&self, _: &DbIndex, id: DerivationId) -> Box<dyn std::any::Any + Send> {
+            if id.file_id == self.blocked {
+                derivation::require_canonical_query();
+            }
+            Box::new(id.file_id)
+        }
+
+        fn apply(&self, db: &mut DbIndex, id: DerivationId, value: Box<dyn std::any::Any + Send>) {
+            assert_eq!(*value.downcast::<FileId>().unwrap(), id.file_id);
+            self.applied.lock().unwrap().push((id.file_id, true));
+            db.get_call_target_index_mut()
+                .set_file(id.file_id, Default::default());
+        }
+
+        fn discard(&self, _: DerivationId, _: Box<dyn std::any::Any + Send>) {
+            self.discarded
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn parallel_recorded_targets_retry_and_restore_unchanged_reset_proofs() {
+        use glua_parser::LuaAstNode;
+
+        let mut ws = VirtualWorkspace::new();
+        let files = (0..8)
+            .map(|index| {
+                ws.def_file(
+                    &format!("lua/autorun/recorded_targets_{index}.lua"),
+                    "local value = 1",
+                )
+            })
+            .collect::<Vec<_>>();
+        let db = ws.get_db_mut();
+        let ids = files
+            .iter()
+            .map(|file_id| {
+                let root = db
+                    .get_vfs()
+                    .get_syntax_tree(file_id)
+                    .unwrap()
+                    .get_chunk_node();
+                DerivationId::new(
+                    DerivationKind::CallTargets,
+                    *file_id,
+                    LuaSyntaxId::from_node(root.syntax()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let proof = {
+            derivation::lend_keys(db.reader_graph_mut().lend_keys());
+            let lent = scopeguard_lent_keys();
+            derivation::begin(statement(0));
+            let frame = derivation::open_frame().unwrap();
+            derivation::note_read(|| FactKey::CallTargets(files[0]));
+            let proof = derivation::close_frame(frame, 0).unwrap();
+            derivation::end();
+            db.reader_graph_mut().restore_keys(derivation::take_keys());
+            std::mem::forget(lent);
+            proof
+        };
+        let recipe = RecordedTargets {
+            blocked: files[3],
+            applied: Mutex::new(Vec::new()),
+            discarded: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        for id in &ids {
+            engine.worklist.insert(*id, Reason::Changed);
+        }
+        while let Some((first, _)) = engine.worklist.pop_first_of(DerivationKind::CallTargets) {
+            engine.run_recorded_batch(db, first, &recipe);
+        }
+        assert_eq!(
+            recipe.discarded.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let applied = recipe.applied.lock().unwrap();
+        assert_eq!(applied.len(), files.len());
+        assert_eq!(
+            applied.iter().filter(|(_, worker)| *worker).count(),
+            files.len() - 1
+        );
+        assert!(applied.contains(&(files[3], false)));
+        assert!(
+            files
+                .iter()
+                .all(|file| db.get_call_target_index().file(*file).is_some())
+        );
+        derivation::lend_keys(db.reader_graph_mut().lend_keys());
+        let lent = scopeguard_lent_keys();
+        derivation::begin(statement(0));
+        assert_eq!(
+            derivation::reuse(&proof, 0, &[], None),
+            derivation::Reuse::Held
+        );
+        derivation::end();
+        db.reader_graph_mut().restore_keys(derivation::take_keys());
+        std::mem::forget(lent);
+    }
 
     fn statement(start: u32) -> DerivationId {
         DerivationId::new(

@@ -2,7 +2,7 @@ mod cache_options;
 mod tracked;
 mod transaction;
 
-pub(crate) use transaction::{CacheTransaction, detach_transaction};
+pub(crate) use transaction::detach_transaction;
 
 pub use cache_options::{CacheOptions, LuaAnalysisPhase};
 use glua_parser::LuaSyntaxId;

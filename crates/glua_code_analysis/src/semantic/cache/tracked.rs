@@ -178,8 +178,15 @@ impl<K: Hash + Eq + Clone, V> TrackedMap<K, V> {
         assert_eq!(undo.transaction, transaction);
     }
 
+    #[inline]
     fn capture_shared(&mut self, key: &K) -> Option<K> {
         let transaction = super::transaction::current()?;
+        self.capture_shared_active(key, transaction)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn capture_shared_active(&mut self, key: &K, transaction: u64) -> Option<K> {
         self.prepare_undo(transaction);
         let undo = &mut self.undo.as_mut().unwrap().entries;
         if undo.contains_key(key) {

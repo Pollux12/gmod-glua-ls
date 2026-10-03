@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 #[cfg(test)]
 pub(crate) use infer::narrow::get_type_at_flow::BASELINE_FLOW_WALKS;
 
+pub(crate) use cache::detach_transaction;
 pub use cache::{
     CacheEntry, CacheOptions, DynamicFieldDefinitionSyntax, LuaAnalysisPhase, LuaInferCache,
     VarRefCacheRootKey,
@@ -45,7 +46,10 @@ pub use infer::narrow::{
 };
 pub(crate) use infer::pairs_iter_value_registry_path;
 pub(crate) use infer::resolve_decl_backed_global_path_member_type;
-pub(crate) use infer::{AccessPaths, keep_access_paths, stop_keeping_access_paths};
+pub(crate) use infer::{
+    AccessPaths, keep_access_paths, restore_access_path_snapshot, stop_keeping_access_paths,
+    take_access_path_snapshot, with_access_paths,
+};
 use infer::{infer_call_arg_expr_list_types, infer_expr_list_types, infer_expr_list_value_type_at};
 pub use infer::{infer_table_field_value_should_be, infer_table_should_be};
 use lsp_types::Uri;

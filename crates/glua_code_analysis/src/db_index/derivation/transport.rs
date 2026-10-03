@@ -8,9 +8,8 @@ use super::{Evaluation, HashedKey, KeyIdx, KeyTable, ReaderGraph, frames, latest
 
 mod worker;
 pub(crate) use worker::{
-    ComputeInputs, RecordingSnapshot, WorkerEvaluation, WorkerResult, compute_recorded,
-    note_observed_query_read, query_requires_canonical, require_canonical_query,
-    worker_query_readiness,
+    RecordingSnapshot, compute_recorded, note_observed_query_read, query_requires_canonical,
+    require_canonical_query, worker_query_readiness,
 };
 pub(super) use worker::{SavedRecording, active, with_keys, with_snapshot};
 
@@ -53,28 +52,38 @@ pub(crate) struct WorkerKeys {
     known: FxHashMap<KeyIdx, u32>,
     new_lookup: HashTable<u32>,
     visitation: Vec<u64>,
+    flags: Vec<u8>,
 }
 
 impl WorkerKeys {
-    fn push(&mut self, key: WorkerKey) -> u32 {
+    fn push(&mut self, key: WorkerKey, snapshot: &ReaderGraph) -> u32 {
         let local = u32::try_from(self.entries.len()).expect("fewer than 2^32 fact keys");
         self.entries.push(key);
         self.visitation.push(0);
+        let query = match key {
+            WorkerKey::Known(slot) => snapshot.keys().is_query(slot),
+            WorkerKey::New(index) => matches!(
+                self.new_keys[index as usize].key(),
+                super::FactKey::ReceiverAuthority(_) | super::FactKey::CallbackParams(_)
+            ),
+        };
+        let flags = u8::from(self.snapshot_taints(local, snapshot)) | (u8::from(query) << 1);
+        self.flags.push(flags);
         local
     }
 
-    fn known(&mut self, slot: KeyIdx) -> u32 {
+    fn known(&mut self, slot: KeyIdx, snapshot: &ReaderGraph) -> u32 {
         if let Some(local) = self.known.get(&slot) {
             return *local;
         }
-        let local = self.push(WorkerKey::Known(slot));
+        let local = self.push(WorkerKey::Known(slot), snapshot);
         self.known.insert(slot, local);
         local
     }
 
     fn intern(&mut self, key: HashedKey, snapshot: &ReaderGraph) -> u32 {
         if let Some(slot) = snapshot.find_slot(&key) {
-            return self.known(slot);
+            return self.known(slot, snapshot);
         }
         if let Some(local) = self.new_lookup.find(key.hash, |local| {
             let WorkerKey::New(index) = self.entries[*local as usize] else {
@@ -87,7 +96,7 @@ impl WorkerKeys {
         let index = u32::try_from(self.new_keys.len()).expect("fewer than 2^32 fact keys");
         let hash = key.hash;
         self.new_keys.push(key);
-        let local = self.push(WorkerKey::New(index));
+        let local = self.push(WorkerKey::New(index), snapshot);
         let entries = &self.entries;
         let new_keys = &self.new_keys;
         self.new_lookup.insert_unique(hash, local, |local| {
@@ -106,7 +115,7 @@ impl WorkerKeys {
         }
     }
 
-    fn taints(&self, local: u32, snapshot: &ReaderGraph) -> bool {
+    fn snapshot_taints(&self, local: u32, snapshot: &ReaderGraph) -> bool {
         let key = self.key(local, snapshot);
         if let WorkerKey::Known(slot) = self.entries[local as usize]
             && snapshot.keys().taints(slot)
@@ -127,7 +136,12 @@ impl WorkerKeys {
         false
     }
 
-    fn log(&mut self, evaluation: &mut Evaluation, local: u32, snapshot: &ReaderGraph) {
+    fn log(&mut self, evaluation: &mut Evaluation, local: u32, _snapshot: &ReaderGraph) {
+        if self.is_query(local)
+            && let Some(frame) = evaluation.frames.last_mut()
+        {
+            frame.has_query = true;
+        }
         let stamp = &mut self.visitation[local as usize];
         if *stamp < evaluation.frame_stamp() {
             let first = *stamp < evaluation.stamp;
@@ -137,9 +151,13 @@ impl WorkerKeys {
                 evaluation.read.push(local);
             }
         }
-        if self.taints(local, snapshot) {
+        if self.flags[local as usize] & 1 != 0 {
             frames::taint_evaluation(evaluation);
         }
+    }
+
+    fn is_query(&self, local: u32) -> bool {
+        self.flags[local as usize] & 2 != 0
     }
 
     pub(crate) fn record(
@@ -160,7 +178,7 @@ impl WorkerKeys {
         snapshot: &ReaderGraph,
     ) -> Option<u32> {
         snapshot.keys().live_key(slot)?;
-        let local = self.known(slot);
+        let local = self.known(slot, snapshot);
         self.log(evaluation, local, snapshot);
         Some(local)
     }
@@ -327,6 +345,68 @@ mod tests {
             derivation::end();
             derivation::take_keys();
         }
+    }
+
+    #[test]
+    fn parallel_transport_cached_taint_covers_known_new_and_inherited_flags() {
+        for held in [false, true] {
+            for known in [false, true] {
+                for inherited in [false, true] {
+                    let mut graph = ReaderGraph::default();
+                    let child =
+                        HashedKey::new(FactKey::GmodRealmAt(FileId::new(1), TextSize::new(5)));
+                    let flagged = if inherited { key(1) } else { child.clone() };
+                    graph.intern_read(flagged.clone());
+                    if held {
+                        graph.hold_windows([&flagged]);
+                    } else {
+                        let mut table = graph.lend_keys();
+                        table.open_window(&flagged, new_stamp());
+                        graph.restore_keys(table);
+                    }
+                    if known {
+                        graph.intern_read(child.clone());
+                    }
+                    let guard = graph.quarantine_releases();
+                    derivation::lend_keys(KeyTable::default());
+                    derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+                    let mut keys = WorkerKeys::default();
+                    let frame = derivation::open_frame().unwrap();
+                    let local = derivation::CURRENT.with(|current| {
+                        keys.record(
+                            current.borrow_mut().as_mut().unwrap(),
+                            child.clone(),
+                            &graph,
+                        )
+                    });
+                    assert_eq!(keys.flags, vec![1]);
+                    assert!(derivation::close_frame(frame, 0).is_none());
+                    let frame = derivation::open_frame().unwrap();
+                    derivation::CURRENT.with(|current| {
+                        let mut current = current.borrow_mut();
+                        let evaluation = current.as_mut().unwrap();
+                        keys.log(evaluation, local, &graph);
+                        assert_eq!(keys.record(evaluation, child.clone(), &graph), local);
+                    });
+                    assert!(derivation::close_frame(frame, 0).is_none());
+                    assert_eq!(keys.entries.len(), 1);
+                    assert_eq!(keys.flags, vec![1]);
+                    let evaluation = derivation::suspend();
+                    assert_eq!(evaluation.log, vec![local, local]);
+                    derivation::take_keys();
+                    let mut table = graph.lend_keys();
+                    guard.finish(&mut table);
+                    graph.restore_keys(table);
+                }
+            }
+        }
+        let graph = ReaderGraph::default();
+        let mut evaluation = evaluation();
+        let mut keys = WorkerKeys::default();
+        let local = keys.record(&mut evaluation, key(1), &graph);
+        keys.log(&mut evaluation, local, &graph);
+        assert_eq!(keys.flags, vec![0]);
+        assert_eq!(evaluation.log, vec![local]);
     }
 
     #[test]

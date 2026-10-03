@@ -42,7 +42,7 @@ pub fn set_analysis_threads(threads: usize) {
 }
 
 /// The requested thread count, else the machine's parallelism capped at 16.
-fn analysis_threads() -> usize {
+pub(crate) fn analysis_threads() -> usize {
     match REQUESTED_THREADS.load(Ordering::Relaxed) {
         0 => std::thread::available_parallelism()
             .map(|n| n.get())

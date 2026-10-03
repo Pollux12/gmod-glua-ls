@@ -33,7 +33,6 @@ struct KeySlot {
     producer: DerivIdx,
     /// The key's fingerprint as last taken, and the generation it was taken in
     /// ([`NO_GENERATION`]: none); see [`ReaderGraph::current_fingerprint`].
-    /// Only the analysis thread takes fingerprints, so relaxed order suffices.
     current: AtomicU64,
     current_generation: AtomicU32,
     /// The stamp the key was last logged under; see [`KeyTable::log`].
@@ -48,21 +47,24 @@ struct KeySlot {
     held: bool,
     /// Whether [`KeyTable::more_producers`] holds producers of the key.
     more_producers: bool,
+    is_query: bool,
 }
 
 impl Clone for KeySlot {
     fn clone(&self) -> Self {
+        let generation = self.current_generation.load(Ordering::Acquire);
         Self {
             key: self.key.clone(),
             readers: self.readers.clone(),
             producer: self.producer,
             current: AtomicU64::new(self.current.load(Ordering::Relaxed)),
-            current_generation: AtomicU32::new(self.current_generation.load(Ordering::Relaxed)),
+            current_generation: AtomicU32::new(generation),
             stamp: self.stamp,
             written: self.written,
             windowed: self.windowed,
             held: self.held,
             more_producers: self.more_producers,
+            is_query: self.is_query,
         }
     }
 }
@@ -80,12 +82,39 @@ impl Default for KeySlot {
             windowed: false,
             held: false,
             more_producers: false,
+            is_query: false,
         }
     }
 }
 
 const NO_GENERATION: u32 = u32::MAX;
 const NO_PRODUCER: DerivIdx = DerivIdx::MAX;
+
+#[cfg(test)]
+mod query_presence_tests {
+    use super::*;
+    use crate::{FileId, LuaSignatureId};
+    use rowan::TextSize;
+
+    #[test]
+    fn parallel_transport_query_slot_width_clone_and_recycle() {
+        assert_eq!(std::mem::size_of::<KeySlot>(), 128);
+        let mut graph = ReaderGraph::default();
+        let query = HashedKey::new(FactKey::CallbackParams(LuaSignatureId::new(
+            FileId::new(1),
+            TextSize::new(5),
+        )));
+        let slot = graph.intern_read(query);
+        assert!(graph.keys().is_query(slot));
+        let clone = graph.keys().clone();
+        assert!(clone.is_query(slot));
+        graph.release_keys(vec![slot]);
+        let ordinary = graph.intern_read(HashedKey::new(FactKey::GmodRealm(FileId::new(2))));
+        assert_eq!(ordinary, slot);
+        assert!(!graph.keys().is_query(slot));
+        assert!(clone.is_query(slot));
+    }
+}
 
 /// A key's readers, grouped by the fingerprint each saw, each group sorted.
 /// A derivation reads a key at one value, so it is in one group. Nearly every
@@ -465,6 +494,10 @@ impl KeyTable {
         let base = key.base();
         let hash = key.hash;
         let entry = &mut self.keys[slot as usize];
+        entry.is_query = matches!(
+            key.key(),
+            FactKey::ReceiverAuthority(_) | FactKey::CallbackParams(_)
+        );
         entry.key = Some(key);
         entry.stamp = 0;
         entry.written = now;
@@ -491,6 +524,10 @@ impl KeyTable {
             .key
             .as_ref()
             .expect("a referenced key slot is live")
+    }
+
+    pub(super) fn is_query(&self, slot: KeyIdx) -> bool {
+        self.keys[slot as usize].is_query
     }
 
     /// Whether `key` was logged at or after stamp `since`.
@@ -884,14 +921,14 @@ impl ReaderGraph {
         fingerprint: impl FnOnce(&HashedKey) -> Fingerprint,
     ) -> Fingerprint {
         let entry = &self.table.keys[slot as usize];
-        if entry.current_generation.load(Ordering::Relaxed) == self.generation {
+        if entry.current_generation.load(Ordering::Acquire) == self.generation {
             return entry.current.load(Ordering::Relaxed);
         }
         let current = fingerprint(self.key(slot));
         entry.current.store(current, Ordering::Relaxed);
         entry
             .current_generation
-            .store(self.generation, Ordering::Relaxed);
+            .store(self.generation, Ordering::Release);
         current
     }
 
@@ -953,7 +990,7 @@ impl ReaderGraph {
     /// Every key whose fingerprint is cached, with it.
     pub fn cached_fingerprints(&self) -> impl Iterator<Item = (&HashedKey, Fingerprint)> {
         self.table.keys.iter().filter_map(|slot| {
-            (slot.current_generation.load(Ordering::Relaxed) == self.generation)
+            (slot.current_generation.load(Ordering::Acquire) == self.generation)
                 .then(|| Some((slot.key.as_ref()?, slot.current.load(Ordering::Relaxed))))?
         })
     }

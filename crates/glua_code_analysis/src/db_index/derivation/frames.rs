@@ -39,6 +39,7 @@ pub(super) struct Frame {
     /// Where the frame's references read as unkeyed begin in the
     /// evaluation's log of them; see [`consult_unkeyed`].
     unkeyed: u32,
+    pub(super) has_query: bool,
 }
 
 /// An open frame, to hand back to [`close_frame`].
@@ -82,6 +83,194 @@ struct Computed {
     /// The references it read as walking from no keyed origin: it holds
     /// only while none of them does.
     unkeyed: Option<Box<[u64]>>,
+    has_query: bool,
+}
+
+#[cfg(test)]
+mod query_presence_tests {
+    use super::*;
+    use crate::db_index::derivation::{
+        self as derivation, DerivationId, DerivationKind, FactKey, FactRead, HashedKey,
+        ReaderGraph, RecordingSnapshot,
+    };
+    use crate::{FileId, LuaSignatureId};
+    use rowan::TextSize;
+    use rustc_hash::FxHashMap;
+
+    fn id() -> DerivationId {
+        DerivationId::workspace(DerivationKind::ValidGuards)
+    }
+
+    fn query() -> FactKey {
+        FactKey::CallbackParams(LuaSignatureId::new(FileId::new(1), TextSize::new(5)))
+    }
+
+    #[test]
+    fn parallel_transport_query_presence_keeps_proof_and_frame_widths() {
+        assert_eq!(std::mem::size_of::<Computed>(), 64);
+        assert_eq!(std::mem::size_of::<Frame>(), 48);
+        assert_eq!(std::mem::size_of::<LogHandle>(), 24);
+    }
+
+    #[test]
+    fn parallel_transport_query_presence_covers_direct_hint_identity_and_named_hits() {
+        derivation::lend_keys(KeyTable::default());
+        derivation::begin(id());
+        let outer = open_frame().unwrap();
+        derivation::note_read(query);
+        let inner = open_frame().unwrap();
+        let handle = FactRead::default();
+        handle.note(query, |key| key == &query());
+        assert!(close_frame(inner, 0).unwrap().0.has_query);
+        derivation::note_read_by((9, 9), query);
+        let inner = open_frame().unwrap();
+        derivation::note_read_by((9, 9), || panic!("identity hit must not rebuild its key"));
+        assert!(close_frame(inner, 0).unwrap().0.has_query);
+        derivation::note_named_read(9, 9, Some("query"), query);
+        let inner = open_frame().unwrap();
+        derivation::note_named_read(9, 9, Some("query"), || {
+            panic!("named hit must not rebuild its key")
+        });
+        assert!(close_frame(inner, 0).unwrap().0.has_query);
+        assert!(close_frame(outer, 0).unwrap().0.has_query);
+        let empty = open_frame().unwrap();
+        assert!(!close_frame(empty, 0).unwrap().0.has_query);
+        let ordinary = open_frame().unwrap();
+        derivation::note_read(|| FactKey::FileText(FileId::new(1)));
+        assert!(!close_frame(ordinary, 0).unwrap().0.has_query);
+        derivation::end();
+        derivation::take_keys();
+    }
+
+    #[test]
+    fn parallel_transport_query_presence_propagates_tainted_children() {
+        derivation::lend_keys(KeyTable::default());
+        derivation::begin(id());
+        let outer = open_frame().unwrap();
+        let inner = open_frame().unwrap();
+        derivation::note_read(query);
+        taint();
+        assert!(close_frame(inner, 0).is_none());
+        CURRENT.with(|current| {
+            assert!(
+                current
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .frames
+                    .last()
+                    .unwrap()
+                    .has_query
+            )
+        });
+        assert!(close_frame(outer, 0).is_none());
+        derivation::end();
+        derivation::take_keys();
+    }
+
+    #[test]
+    fn parallel_transport_query_presence_frozen_worker_replay_and_remap_require_readiness() {
+        let mut graph = ReaderGraph::default();
+        graph.intern_read(HashedKey::new(FactKey::FileText(FileId::new(99))));
+        derivation::lend_keys(graph.lend_keys());
+        derivation::begin(id());
+        let frame = open_frame().unwrap();
+        derivation::note_read(query);
+        let proof = close_frame(frame, 0).unwrap();
+        assert!(proof.0.has_query);
+        derivation::end();
+        graph.restore_keys(derivation::take_keys());
+        let guard = graph.quarantine_releases();
+        let graph = Arc::new(graph);
+        let unready =
+            RecordingSnapshot::new(Arc::clone(&graph), guard.started(), FxHashMap::default());
+        let rejected = derivation::compute_recorded(
+            &unready,
+            id(),
+            || {
+                assert_eq!(reuse(&proof, 0, &[], None), Reuse::Elsewhere);
+            },
+            |_| 17,
+        );
+        drop(rejected);
+        drop(unready);
+        let ready = RecordingSnapshot::new(
+            Arc::clone(&graph),
+            guard.started(),
+            [(HashedKey::new(query()), 17)].into_iter().collect(),
+        );
+        let recorded = derivation::compute_recorded(
+            &ready,
+            id(),
+            || {
+                let outer = open_frame().unwrap();
+                let inner = open_frame().unwrap();
+                assert_eq!(reuse(&proof, 0, &[], None), Reuse::Held);
+                assert_eq!(reuse(&proof, 0, &[], None), Reuse::Held);
+                let inner_proof = close_frame(inner, 0).unwrap();
+                assert!(inner_proof.0.has_query);
+                let local = open_frame().unwrap();
+                assert_eq!(reuse(&inner_proof, 0, &[], None), Reuse::Held);
+                assert_eq!(reuse(&inner_proof, 0, &[], None), Reuse::Held);
+                assert!(close_frame(local, 0).unwrap().0.has_query);
+                let outer_proof = close_frame(outer, 0).unwrap();
+                assert!(outer_proof.0.has_query);
+                let empty = open_frame().unwrap();
+                assert!(!close_frame(empty, 0).unwrap().0.has_query);
+                outer_proof
+            },
+            |_| panic!("query witness must come from ready output"),
+        );
+        assert!(recorded.value.0.has_query);
+        assert!(recorded.evaluation.validate(&graph, |_| Some(17)));
+        drop(ready);
+        let mut graph = Arc::try_unwrap(graph).ok().unwrap();
+        let mut table = graph.lend_keys();
+        let evaluation = recorded.evaluation.canonicalise(&mut table).unwrap();
+        derivation::lend_keys(table);
+        derivation::resume(evaluation);
+        derivation::end();
+        derivation::begin(id());
+        let frame = open_frame().unwrap();
+        assert_eq!(reuse(&recorded.value, 0, &[], None), Reuse::Held);
+        assert!(close_frame(frame, 0).unwrap().0.has_query);
+        derivation::end();
+        let mut table = derivation::take_keys();
+        guard.finish(&mut table);
+        graph.restore_keys(table);
+    }
+
+    #[test]
+    fn parallel_transport_query_presence_new_local_memo_without_winner_cannot_reuse() {
+        let mut graph = ReaderGraph::default();
+        let guard = graph.quarantine_releases();
+        let graph = Arc::new(graph);
+        let snapshot = RecordingSnapshot::new(
+            Arc::clone(&graph),
+            guard.started(),
+            [(HashedKey::new(query()), 17)].into_iter().collect(),
+        );
+        let recorded = derivation::compute_recorded(
+            &snapshot,
+            id(),
+            || {
+                let frame = open_frame().unwrap();
+                derivation::note_read(query);
+                let proof = close_frame(frame, 0).unwrap();
+                assert!(proof.0.has_query);
+                assert_eq!(reuse(&proof, 0, &[], None), Reuse::Elsewhere);
+                proof
+            },
+            |_| panic!("unobserved query must not be fingerprinted lazily"),
+        );
+        assert!(!recorded.evaluation.validate(&graph, |_| Some(17)));
+        drop(recorded);
+        drop(snapshot);
+        let mut graph = Arc::try_unwrap(graph).ok().unwrap();
+        let mut table = graph.lend_keys();
+        guard.finish(&mut table);
+        graph.restore_keys(table);
+    }
 }
 
 /// What a lookup of a memoised value found.
@@ -160,6 +349,7 @@ pub fn open_frame_absorbing(absorbs: u64) -> Option<OpenFrame> {
             absorbs,
             unkeyed: u32::try_from(evaluation.unkeyed.len())
                 .expect("fewer than 2^32 context reads"),
+            has_query: false,
         });
         Some(OpenFrame(depth))
     })
@@ -192,6 +382,7 @@ pub fn close_frame(frame: OpenFrame, view: Gates) -> Option<Provenance> {
                 parent.taint = Some(parent.taint.map_or(reach, |taint| taint.min(reach)));
             }
             parent.gates |= closed.gates;
+            parent.has_query |= closed.has_query;
             if let Some((realm, base)) = closed.realm
                 && base <= parent_depth
             {
@@ -220,6 +411,7 @@ pub fn close_frame(frame: OpenFrame, view: Gates) -> Option<Provenance> {
             checked: AtomicU64::new(0),
             replayed_into: AtomicU64::new(0),
             unkeyed,
+            has_query: closed.has_query,
         })))
     })
 }
@@ -505,6 +697,7 @@ pub fn reuse(
                 let depth = evaluation.frames.len() as u32;
                 if let Some(frame) = evaluation.frames.last_mut() {
                     frame.gates |= provenance.0.gates;
+                    frame.has_query |= provenance.0.has_query;
                     let base = realm.map_or(0, |(_, base)| base);
                     if provenance.0.realm.is_some() && base < depth {
                         frame.realm = Some((inherited, base));
@@ -533,7 +726,9 @@ fn reuse_worker(
         super::transport::with_keys(|worker| {
             let range = provenance.0.start as usize..provenance.0.end as usize;
             if Arc::ptr_eq(&provenance.0.log, &evaluation.log_handle) {
-                if !worker.local_queries_hold(&evaluation.log[range.clone()]) {
+                if provenance.0.has_query
+                    && !worker.local_queries_hold(&evaluation.log[range.clone()])
+                {
                     return Reuse::Elsewhere;
                 }
                 if provenance.0.since < evaluation.frame_stamp()
@@ -542,7 +737,9 @@ fn reuse_worker(
                     for at in range {
                         let local = evaluation.log[at];
                         worker.log(evaluation, local);
-                        worker.observe_ready(local);
+                        if provenance.0.has_query {
+                            worker.observe_ready(local);
+                        }
                     }
                     replay_unkeyed(evaluation, provenance);
                 }
@@ -554,7 +751,7 @@ fn reuse_worker(
                 let Some(reads) = provenance.0.log.0.get().and_then(|log| log.get(range)) else {
                     return Reuse::Elsewhere;
                 };
-                if !worker.canonical_queries_hold(reads) {
+                if provenance.0.has_query && !worker.canonical_queries_hold(reads) {
                     return Reuse::Elsewhere;
                 }
                 match provenance.freshness(worker.graph().keys(), reads) {
@@ -578,7 +775,9 @@ fn reuse_worker(
                         let local = worker
                             .record_known(evaluation, *slot)
                             .expect("qualified snapshot read is live");
-                        worker.observe_ready(local);
+                        if provenance.0.has_query {
+                            worker.observe_ready(local);
+                        }
                     }
                     replay_unkeyed(evaluation, provenance);
                 }
@@ -590,6 +789,7 @@ fn reuse_worker(
             let depth = evaluation.frames.len() as u32;
             if let Some(frame) = evaluation.frames.last_mut() {
                 frame.gates |= provenance.0.gates;
+                frame.has_query |= provenance.0.has_query;
                 let base = realm.map_or(0, |(_, base)| base);
                 if provenance.0.realm.is_some() && base < depth {
                     frame.realm = Some((realm.map(|(realm, _)| realm), base));
@@ -661,6 +861,9 @@ fn reuse_viewed(
         }
         if provenance.replays_into(evaluation.frame_stamp()) {
             evaluation.viewed.extend(reads.iter().copied());
+        }
+        if let Some(frame) = evaluation.frames.last_mut() {
+            frame.has_query |= provenance.0.has_query;
         }
         count(|stats| {
             stats.reused += 1;

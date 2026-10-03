@@ -13,8 +13,8 @@ mod transport;
 
 pub(crate) use transport::query_requires_canonical as worker_requires_canonical;
 pub(crate) use transport::{
-    RecordingSnapshot, ReleaseQuarantine, WorkerEvaluation, WorkerKey, WorkerKeys, WorkerResult,
-    compute_recorded, note_observed_query_read, require_canonical_query, worker_query_readiness,
+    RecordingSnapshot, ReleaseQuarantine, compute_recorded, note_observed_query_read,
+    require_canonical_query, worker_query_readiness,
 };
 
 use std::cell::RefCell;
@@ -1505,6 +1505,11 @@ impl Evaluation {
     }
 
     fn log_slot(&mut self, table: &mut KeyTable, slot: KeyIdx) {
+        if table.is_query(slot)
+            && let Some(frame) = self.frames.last_mut()
+        {
+            frame.has_query = true;
+        }
         if let Some(first) = table.log(slot, self.frame_stamp(), self.stamp, latest_stamp()) {
             self.log.push(slot);
             if first {
