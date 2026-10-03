@@ -1496,9 +1496,7 @@ impl Engine {
         first: DerivationId,
         recipe: &dyn Recipe,
     ) -> bool {
-        let limit = super::parallel::analysis_threads()
-            .saturating_mul(2)
-            .saturating_mul(recorded_window_multiplier());
+        let limit = super::parallel::analysis_threads().saturating_mul(RECORDED_BATCH_PER_THREAD);
         let mut batch = vec![first];
         let mut popped = Vec::new();
         while batch.len() < limit {
@@ -2335,16 +2333,9 @@ thread_local! {
     static WORKER_PUBLISHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn recorded_window_multiplier() -> usize {
-    static MULTIPLIER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MULTIPLIER.get_or_init(|| {
-        std::env::var("GLUALS_RECORDED_WINDOW")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|value| matches!(value, 1 | 2 | 4 | 8))
-            .unwrap_or(1)
-    })
-}
+/// How many derivations [`Engine::run_recorded_batch`] takes per analysis
+/// thread: enough that one fork-join covers most of a round's queue of a kind.
+const RECORDED_BATCH_PER_THREAD: usize = 16;
 
 fn check_convergence() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
