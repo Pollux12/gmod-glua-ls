@@ -1416,23 +1416,49 @@ impl Engine {
                 (derivation::end(), computed, elapsed)
             })
         };
-        let mut times = Vec::with_capacity(batch.len());
-        let evaluations = self.with_lent_keys(db, &touched, |db| {
-            batch
+        let mut computed_reads = check_batch_reads().then(|| {
+            computed
                 .iter()
-                .zip(computed)
-                .map(|(member, (evaluation, computed, computing))| {
-                    derivation::resume(evaluation);
-                    let started = profiling.then(std::time::Instant::now);
-                    recipe.apply(db, *member, computed);
-                    let applying = started.map(|started| started.elapsed()).unwrap_or_default();
-                    times.push((*member, computing + applying));
-                    (derivation::end(), None)
+                .map(|(evaluation, _, _)| {
+                    evaluation
+                        .unlent_reads()
+                        .map(|key| (key.clone(), db.fact_fingerprint(key)))
+                        .collect::<Vec<_>>()
                 })
-                .collect()
+                .collect::<Vec<_>>()
         });
+        let mut times = Vec::with_capacity(batch.len());
+        let evaluations: Vec<(derivation::Evaluation, Option<u64>)> =
+            self.with_lent_keys(db, &touched, |db| {
+                batch
+                    .iter()
+                    .zip(computed)
+                    .enumerate()
+                    .map(|(position, (member, (evaluation, computed, computing)))| {
+                        let reads = computed_reads.as_mut().map(|reads| &mut reads[position]);
+                        if let Some(reads) = &reads {
+                            assert_batch_reads_held(db, *member, reads);
+                        }
+                        derivation::resume(evaluation);
+                        let started = profiling.then(std::time::Instant::now);
+                        recipe.apply(db, *member, computed);
+                        let applying = started.map(|started| started.elapsed()).unwrap_or_default();
+                        times.push((*member, computing + applying));
+                        let evaluation = derivation::end();
+                        if let Some(reads) = reads {
+                            for (key, seen) in reads.iter_mut() {
+                                *seen = db.fact_fingerprint(key);
+                            }
+                        }
+                        (evaluation, None)
+                    })
+                    .collect()
+            });
         for (member, elapsed) in times {
             self.stats.timed_evaluation(member, elapsed);
+        }
+        for (member, reads) in batch.iter().zip(computed_reads.iter().flatten()) {
+            assert_batch_reads_held(db, *member, reads);
         }
         self.record(db, evaluations, &mut touched, &FxHashSet::default(), || {
             format!("evaluating {batch:?}")
@@ -2059,6 +2085,23 @@ pub(super) fn file_queries(db: &mut DbIndex) -> Vec<HashedKey> {
     moved
 }
 
+/// Panics when `member` computed from a fact that moved since `reads` were
+/// fingerprinted, which only another member's apply writes: the record
+/// fingerprints reads once every member applied, so the member would hold a
+/// result computed from a value it never saw.
+fn assert_batch_reads_held(
+    db: &DbIndex,
+    member: DerivationId,
+    reads: &[(HashedKey, derivation::Fingerprint)],
+) {
+    for (key, seen) in reads {
+        assert!(
+            db.fact_fingerprint(key) == *seen,
+            "{member:?} computed from {key:?}, which another member of its batch moved"
+        );
+    }
+}
+
 fn co_producers(db: &DbIndex, id: DerivationId) -> Vec<DerivationId> {
     let graph = db.reader_graph();
     let mut group = BTreeSet::from([id]);
@@ -2107,6 +2150,12 @@ fn check_convergence() -> bool {
 fn check_fingerprints() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("GLUALS_CHECK_FINGERPRINTS").is_some())
+}
+
+/// Under debug assertions or `GLUALS_CHECK_FINGERPRINTS`: whether a batch
+/// checks that no member computed from a fact another member moved.
+fn check_batch_reads() -> bool {
+    cfg!(debug_assertions) || check_fingerprints()
 }
 
 #[cfg(test)]
@@ -2303,6 +2352,69 @@ mod tests {
 
         assert_eq!((settled, copied(db)), (true, Some(LuaType::String)));
     }
+    fn in_file(file: u32) -> DerivationId {
+        DerivationId::new(
+            DerivationKind::LocalStat,
+            FileId::new(file),
+            LuaSyntaxId::new(
+                LuaSyntaxKind::LocalStat.into(),
+                TextRange::at(TextSize::new(0), TextSize::new(1)),
+            ),
+        )
+    }
+
+    /// A split kind whose reader in `FILE` computes from `WRITTEN`, which its
+    /// writer in the next file applies.
+    struct PeerRead;
+
+    impl Recipe for PeerRead {
+        fn evaluate(&self, _: &mut DbIndex, _: DerivationId) {
+            unreachable!("peer reads run batched")
+        }
+
+        fn splits(&self, _: DerivationKind) -> bool {
+            true
+        }
+
+        fn compute(&self, db: &DbIndex, id: DerivationId) -> Box<dyn std::any::Any + Send> {
+            if id == in_file(FILE) {
+                Box::new(
+                    db.get_type_index()
+                        .get_type_cache(&owner(WRITTEN))
+                        .map_or(LuaType::Unknown, |cache| cache.as_type().clone()),
+                )
+            } else {
+                Box::new(LuaType::String)
+            }
+        }
+
+        fn apply(
+            &self,
+            db: &mut DbIndex,
+            id: DerivationId,
+            computed: Box<dyn std::any::Any + Send>,
+        ) {
+            let value = *computed.downcast::<LuaType>().expect("a type");
+            bind(
+                db,
+                if id == in_file(FILE) { COPIED } else { WRITTEN },
+                value,
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "which another member of its batch moved")]
+    fn a_batch_member_computing_from_what_another_applies_is_caught() {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        engine.changed(in_file(FILE));
+        engine.changed(in_file(FILE + 1));
+        engine.open(db);
+        engine.run(db, &PeerRead, Slice::Evaluations(100));
+    }
+
     struct SlotContributors {
         second: Mutex<bool>,
     }

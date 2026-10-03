@@ -1053,6 +1053,11 @@ impl Evaluation {
         self.outputs.iter()
     }
 
+    /// The keys the evaluation read while no key table was lent.
+    pub fn unlent_reads(&self) -> impl Iterator<Item = &HashedKey> {
+        self.reads.iter()
+    }
+
     /// The keys the evaluation re-filed without producing them: their readers
     /// are re-checked, but the evaluation is not one of their producers.
     pub fn moved(&self) -> impl Iterator<Item = &HashedKey> {
