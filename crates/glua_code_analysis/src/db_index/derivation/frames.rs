@@ -84,6 +84,10 @@ struct Computed {
     /// only while none of them does.
     unkeyed: Option<Box<[u64]>>,
     has_query: bool,
+    /// Computed without a lent table or a recording worker, by an evaluation
+    /// viewing the reader graph: it holds only within that evaluation, whose
+    /// reads hold its own.
+    viewed: bool,
 }
 
 #[cfg(test)]
@@ -271,6 +275,50 @@ mod query_presence_tests {
         guard.finish(&mut table);
         graph.restore_keys(table);
     }
+
+    #[test]
+    fn viewed_frames_hold_within_their_evaluation_and_stay_ordinary_on_workers() {
+        let graph = Arc::new(ReaderGraph::default());
+        derivation::begin(DerivationId::diagnostics(FileId::new(1)));
+        let view = derivation::view_graph(Arc::clone(&graph));
+        assert!(open_frame().is_none());
+        let frame = open_frame_viewed().unwrap();
+        let proof = close_frame(frame, 0).unwrap();
+        assert!(proof.0.viewed);
+        assert_eq!(reuse(&proof, 0, &[], None), Reuse::Held);
+        drop(view);
+        derivation::end();
+        derivation::begin(DerivationId::diagnostics(FileId::new(1)));
+        let view = derivation::view_graph(Arc::clone(&graph));
+        assert_eq!(reuse(&proof, 0, &[], None), Reuse::Stale);
+        drop(view);
+        derivation::end();
+
+        let mut graph = ReaderGraph::default();
+        let guard = graph.quarantine_releases();
+        let graph = Arc::new(graph);
+        let snapshot =
+            RecordingSnapshot::new(Arc::clone(&graph), guard.started(), FxHashMap::default());
+        let recorded = derivation::compute_recorded(
+            &snapshot,
+            id(),
+            || {
+                let frame = open_frame_viewed().unwrap();
+                derivation::note_read(|| FactKey::FileText(FileId::new(1)));
+                let proof = close_frame(frame, 0).unwrap();
+                assert!(!proof.0.viewed);
+                proof
+            },
+            |_| 1,
+        );
+        assert!(!recorded.value.0.viewed);
+        drop(recorded);
+        drop(snapshot);
+        let mut graph = Arc::try_unwrap(graph).ok().unwrap();
+        let mut table = graph.lend_keys();
+        guard.finish(&mut table);
+        graph.restore_keys(table);
+    }
 }
 
 /// What a lookup of a memoised value found.
@@ -341,22 +389,31 @@ pub fn open_frame_absorbing(absorbs: u64) -> Option<OpenFrame> {
     }
     CURRENT.with(|current| {
         let mut current = current.borrow_mut();
-        let evaluation = current.as_mut()?;
-        let stamp = next_stamp();
-        let depth = evaluation.frames.len() as u32;
-        evaluation.frames.push(Frame {
-            start: u32::try_from(evaluation.log.len()).expect("fewer than 2^32 reads"),
-            stamp,
-            taint: None,
-            gates: 0,
-            realm: None,
-            absorbs,
-            unkeyed: u32::try_from(evaluation.unkeyed.len())
-                .expect("fewer than 2^32 context reads"),
-            has_query: false,
-        });
-        Some(OpenFrame(depth))
+        Some(push_frame(current.as_mut()?, absorbs))
     })
+}
+
+/// Opens a frame as [`open_frame`] does, and also in an evaluation viewing the
+/// reader graph without a lent table (see [`super::view_graph`]). A value such
+/// a frame vouches for holds only within that evaluation.
+pub fn open_frame_viewed() -> Option<OpenFrame> {
+    open_frame().or_else(|| with_viewed(|evaluation, _| push_frame(evaluation, 0)))
+}
+
+fn push_frame(evaluation: &mut Evaluation, absorbs: u64) -> OpenFrame {
+    let stamp = next_stamp();
+    let depth = evaluation.frames.len() as u32;
+    evaluation.frames.push(Frame {
+        start: u32::try_from(evaluation.log.len()).expect("fewer than 2^32 reads"),
+        stamp,
+        taint: None,
+        gates: 0,
+        realm: None,
+        absorbs,
+        unkeyed: u32::try_from(evaluation.unkeyed.len()).expect("fewer than 2^32 context reads"),
+        has_query: false,
+    });
+    OpenFrame(depth)
 }
 
 /// Closes `frame` and returns what its value was computed from under `view`,
@@ -416,6 +473,7 @@ pub fn close_frame(frame: OpenFrame, view: Gates) -> Option<Provenance> {
             replayed_into: AtomicU64::new(0),
             unkeyed,
             has_query: closed.has_query,
+            viewed: !super::transport::active() && KEYS.with(|keys| keys.borrow().is_none()),
         })))
     })
 }
@@ -628,6 +686,9 @@ pub fn reuse(
         count(|stats| stats.other_context += 1);
         return Reuse::Elsewhere;
     }
+    if provenance.0.viewed {
+        return reuse_in_evaluation(provenance, realm);
+    }
     reuse_worker(provenance, view, keyed, realm, caller)
         .or_else(|| {
             with_evaluation(|evaluation, table| {
@@ -698,20 +759,48 @@ pub fn reuse(
                         replay_unkeyed(evaluation, provenance);
                     }
                 }
-                let depth = evaluation.frames.len() as u32;
-                if let Some(frame) = evaluation.frames.last_mut() {
-                    frame.gates |= provenance.0.gates;
-                    frame.has_query |= provenance.0.has_query;
-                    let base = realm.map_or(0, |(_, base)| base);
-                    if provenance.0.realm.is_some() && base < depth {
-                        frame.realm = Some((inherited, base));
-                    }
-                }
+                record_context(evaluation, provenance, realm);
                 Reuse::Held
             })
         })
         .or_else(|| reuse_viewed(provenance, view, keyed, realm, caller))
         .unwrap_or(Reuse::Elsewhere)
+}
+
+/// Records into the innermost open frame the context `provenance` consulted,
+/// as reused under the inherited `realm`.
+fn record_context(
+    evaluation: &mut Evaluation,
+    provenance: &Provenance,
+    realm: Option<(GmodRealm, u32)>,
+) {
+    let depth = evaluation.frames.len() as u32;
+    if let Some(frame) = evaluation.frames.last_mut() {
+        frame.gates |= provenance.0.gates;
+        frame.has_query |= provenance.0.has_query;
+        let base = realm.map_or(0, |(_, base)| base);
+        if provenance.0.realm.is_some() && base < depth {
+            frame.realm = Some((realm.map(|(realm, _)| realm), base));
+        }
+    }
+}
+
+/// [`reuse`] of a value computed by an evaluation viewing the reader graph:
+/// it holds within that evaluation, whose reads already hold its own, and
+/// nowhere else.
+fn reuse_in_evaluation(provenance: &Provenance, realm: Option<(GmodRealm, u32)>) -> Reuse {
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        match current.as_mut() {
+            Some(evaluation) if Arc::ptr_eq(&provenance.0.log, &evaluation.log_handle) => {
+                replay_unkeyed(evaluation, provenance);
+                record_context(evaluation, provenance, realm);
+                count(|stats| stats.reused_here += 1);
+                Reuse::Held
+            }
+            _ => Reuse::Stale,
+        }
+    })
 }
 
 fn reuse_worker(
@@ -790,15 +879,7 @@ fn reuse_worker(
                     stats.sites.entry(caller).or_default()[3] += 1;
                 });
             }
-            let depth = evaluation.frames.len() as u32;
-            if let Some(frame) = evaluation.frames.last_mut() {
-                frame.gates |= provenance.0.gates;
-                frame.has_query |= provenance.0.has_query;
-                let base = realm.map_or(0, |(_, base)| base);
-                if provenance.0.realm.is_some() && base < depth {
-                    frame.realm = Some((realm.map(|(realm, _)| realm), base));
-                }
-            }
+            record_context(evaluation, provenance, realm);
             Reuse::Held
         })
     })
@@ -863,12 +944,11 @@ fn reuse_viewed(
         {
             REUSED_ACROSS.with(|flag| flag.set(true));
         }
-        if provenance.replays_into(evaluation.frame_stamp()) {
+        if provenance.replays_into(evaluation.stamp) {
             evaluation.viewed.extend(reads.iter().copied());
         }
-        if let Some(frame) = evaluation.frames.last_mut() {
-            frame.has_query |= provenance.0.has_query;
-        }
+        replay_unkeyed(evaluation, provenance);
+        record_context(evaluation, provenance, realm);
         count(|stats| {
             stats.reused += 1;
             stats.sites.entry(caller).or_default()[3] += 1;

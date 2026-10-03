@@ -555,7 +555,7 @@ pub fn infer_member_by_member_key(
         return value;
     }
     cache.member_query_in_progress.insert(key.clone());
-    let frame = crate::db_index::derivation::open_frame();
+    let frame = crate::db_index::derivation::open_frame_viewed();
     let result = infer_member_query_uncached(db, cache, prefix_type, index_expr);
     cache.member_query_in_progress.remove(&key);
     let provenance = cache.close_frame(frame);
@@ -4272,6 +4272,44 @@ mod member_query_memo_tests {
         drop(view);
         let reads = derivation::end().into_viewed_reads(&graph, |_| 1);
         assert_eq!(reads.keys(&graph).count(), 1);
+    }
+
+    #[test]
+    fn member_query_nested_diagnostic_memo_holds_only_within_its_evaluation() {
+        let db = DbIndex::new();
+        let file = FileId::new(1);
+        let options = CacheOptions {
+            analysis_phase: crate::LuaAnalysisPhase::Diagnostics,
+            ..Default::default()
+        };
+        let mut cache = LuaInferCache::new(file, options);
+        let expr = expression();
+        let syntax = expr.get_syntax_id();
+        let prefix = LuaType::ModuleRef(FileId::new(2));
+        let key = (syntax, prefix.clone());
+        let graph = std::sync::Arc::new(derivation::ReaderGraph::default());
+        let expected = Err(InferFailReason::FieldNotFound);
+        for _ in 0..2 {
+            derivation::begin(DerivationId::diagnostics(file));
+            let view = derivation::view_graph(graph.clone());
+            cache
+                .expr_in_progress
+                .insert(syntax, derivation::scope_mark());
+            assert!(cache.member_query_local_key(syntax, &prefix).is_none());
+            assert_eq!(
+                infer_member_by_member_key(&db, &mut cache, &prefix, expr.clone()),
+                expected
+            );
+            assert!(cache.member_query_cache.provenance(&key).is_some());
+            assert_eq!(
+                infer_member_by_member_key(&db, &mut cache, &prefix, expr.clone()),
+                expected
+            );
+            cache.expr_in_progress.clear();
+            drop(view);
+            let reads = derivation::end().into_viewed_reads(&graph, |_| 1);
+            assert_eq!(reads.keys(&graph).count(), 1);
+        }
     }
 }
 

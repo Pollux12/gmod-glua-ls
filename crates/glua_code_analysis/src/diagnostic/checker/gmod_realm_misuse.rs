@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 use std::collections::HashMap;
@@ -16,45 +17,31 @@ use crate::{
 use super::{Checker, DiagnosticContext};
 
 /// Immutable, workspace-scoped callee realm map keyed by semantic declaration.
-pub type PrecomputedCalleeRealmMap = HashMap<LuaSemanticDeclId, Vec<ResolvedRealm>>;
+pub type PrecomputedCalleeRealmMap = FxHashMap<LuaSemanticDeclId, Vec<ResolvedRealm>>;
 
 #[derive(Debug, Default)]
 pub struct PrecomputedRealmCallCandidates {
-    realms_by_name: FxHashMap<String, Vec<ResolvedRealm>>,
     realms_by_access_path: FxHashMap<String, Vec<ResolvedRealm>>,
 }
 
 impl PrecomputedRealmCallCandidates {
-    pub fn insert_realm(&mut self, name: &str, realm: ResolvedRealm) {
-        let realms = self.realms_by_name.entry(name.to_string()).or_default();
-        push_unique_realm(realms, realm);
-    }
-
     pub fn insert_access_path(&mut self, access_path: &str, realm: ResolvedRealm) {
-        let realms = self
-            .realms_by_access_path
-            .entry(access_path.to_string())
-            .or_default();
-        push_unique_realm(realms, realm);
+        match self.realms_by_access_path.get_mut(access_path) {
+            Some(realms) => push_unique_realm(realms, realm),
+            None => {
+                self.realms_by_access_path
+                    .insert(access_path.to_string(), vec![realm]);
+            }
+        }
     }
 
     pub fn insert_gm_method_realms(&mut self, gm_method_realms: &GmMethodRealmMap) {
         for (method_name, realms) in gm_method_realms {
             for realm in realms {
-                self.insert_realm(method_name, *realm);
                 self.insert_access_path(&format!("GM.{method_name}"), *realm);
                 self.insert_access_path(&format!("GAMEMODE.{method_name}"), *realm);
             }
         }
-    }
-
-    #[cfg(test)]
-    fn should_check_call(&self, call_realm: ResolvedRealm, name: &str) -> bool {
-        let Some(realms) = self.realms_by_name.get(name) else {
-            return true;
-        };
-
-        should_check_candidate_realms(call_realm, realms)
     }
 
     fn should_check_access_path(
@@ -1529,60 +1516,46 @@ pub fn precompute_callee_realm_data_for_workspace(
                 .is_some()
         })
         .collect();
+    // Each resolved declaration carries the global access path a call can
+    // name it by, looked up on the worker that resolved it.
     let resolved_by_file = crate::compilation::analyzer::parallel::map_files_collect(
         db,
         &resolve_files,
-        |db, file_id| {
+        |_, file_id| {
             let mut resolved = Vec::new();
             if let Some(decl_tree) = db.get_decl_index().get_decl_tree(&file_id) {
-                let mut decl_ids: Vec<_> = decl_tree.get_decls().keys().copied().collect();
-                decl_ids.sort_unstable_by_key(|decl_id| decl_id.position);
-                for decl_id in decl_ids {
-                    let semantic_decl = LuaSemanticDeclId::LuaDecl(decl_id);
+                let mut decls: Vec<_> = decl_tree.get_decls().values().collect();
+                decls.sort_unstable_by_key(|decl| decl.get_id().position);
+                for decl in decls {
+                    let semantic_decl = LuaSemanticDeclId::LuaDecl(decl.get_id());
                     if let Some(realm) = resolve_precomputed_decl_realm(db, &semantic_decl) {
-                        resolved.push((semantic_decl, realm));
+                        let access_path = decl.is_global().then(|| decl.get_name());
+                        resolved.push((semantic_decl, realm, access_path));
                     }
                 }
             }
 
-            let mut member_ids: Vec<_> = db
-                .get_member_index()
-                .get_file_members(file_id)
-                .into_iter()
-                .map(|member| member.get_id())
-                .collect();
-            member_ids.sort_unstable_by_key(|member_id| member_id.get_position());
-            for member_id in member_ids {
-                let semantic_decl = LuaSemanticDeclId::Member(member_id);
+            let mut members = db.get_member_index().get_file_members(file_id);
+            members.sort_unstable_by_key(|member| member.get_id().get_position());
+            for member in members {
+                let semantic_decl = LuaSemanticDeclId::Member(member.get_id());
                 if let Some(realm) = resolve_precomputed_decl_realm(db, &semantic_decl) {
-                    resolved.push((semantic_decl, realm));
+                    let access_path = member
+                        .get_key()
+                        .get_name()
+                        .and(member.get_global_id())
+                        .map(|global_id| global_id.get_name());
+                    resolved.push((semantic_decl, realm, access_path));
                 }
             }
             resolved
         },
     );
 
-    for (semantic_decl, resolved) in resolved_by_file.into_iter().flatten() {
-        match semantic_decl {
-            LuaSemanticDeclId::LuaDecl(decl_id) => {
-                if let Some(decl) = db.get_decl_index().get_decl(&decl_id) {
-                    realm_call_candidates.insert_realm(decl.get_name(), resolved);
-                    if decl.is_global() {
-                        realm_call_candidates.insert_access_path(decl.get_name(), resolved);
-                    }
-                }
-            }
-            LuaSemanticDeclId::Member(member_id) => {
-                if let Some(member) = db.get_member_index().get_member(&member_id)
-                    && let Some(name) = member.get_key().get_name()
-                {
-                    realm_call_candidates.insert_realm(name, resolved);
-                    if let Some(global_id) = member.get_global_id() {
-                        realm_call_candidates.insert_access_path(global_id.get_name(), resolved);
-                    }
-                }
-            }
-            _ => {}
+    callee_realms.reserve(resolved_by_file.iter().map(Vec::len).sum());
+    for (semantic_decl, resolved, access_path) in resolved_by_file.into_iter().flatten() {
+        if let Some(access_path) = access_path {
+            realm_call_candidates.insert_access_path(access_path, resolved);
         }
         callee_realms.insert(semantic_decl, vec![resolved]);
     }
@@ -1603,12 +1576,15 @@ pub fn precompute_callee_realm_data_for_workspace(
     signature_ids.sort_unstable_by_key(|signature_id| {
         (signature_id.get_file_id(), signature_id.get_position())
     });
-    for signature_id in signature_ids {
-        let semantic_decl = LuaSemanticDeclId::Signature(signature_id);
-        if let Some(resolved) = resolve_precomputed_decl_realm(db, &semantic_decl) {
-            callee_realms.insert(semantic_decl, vec![resolved]);
-        }
-    }
+    let resolved_signatures: Vec<_> = signature_ids
+        .into_par_iter()
+        .filter_map(|signature_id| {
+            let semantic_decl = LuaSemanticDeclId::Signature(signature_id);
+            resolve_precomputed_decl_realm(db, &semantic_decl)
+                .map(|resolved| (semantic_decl, vec![resolved]))
+        })
+        .collect();
+    callee_realms.extend(resolved_signatures);
 
     PrecomputedCalleeRealmData {
         callee_realms,
@@ -1712,29 +1688,29 @@ mod tests {
     }
 
     #[gtest]
-    fn precomputed_realm_call_candidates_skip_only_known_compatible_static_names() {
+    fn precomputed_realm_call_candidates_skip_only_known_compatible_access_paths() {
         let mut candidates = PrecomputedRealmCallCandidates::default();
-        candidates.insert_realm(
+        candidates.insert_access_path(
             "SharedOnly",
             ResolvedRealm::new(GmodRealm::Shared, RealmEvidence::InferredDependency),
         );
-        candidates.insert_realm(
+        candidates.insert_access_path(
             "ClientOnly",
             ResolvedRealm::new(GmodRealm::Client, RealmEvidence::InferredFilename),
         );
         let server_call = ResolvedRealm::new(GmodRealm::Server, RealmEvidence::InferredFilename);
 
         assert_that!(
-            candidates.should_check_call(server_call, "SharedOnly"),
-            eq(false)
+            candidates.should_check_access_path(server_call, "SharedOnly"),
+            some(eq(false))
         );
         assert_that!(
-            candidates.should_check_call(server_call, "ClientOnly"),
-            eq(true)
+            candidates.should_check_access_path(server_call, "ClientOnly"),
+            some(eq(true))
         );
         assert_that!(
-            candidates.should_check_call(server_call, "Missing"),
-            eq(true)
+            candidates.should_check_access_path(server_call, "Missing"),
+            none()
         );
     }
 }
