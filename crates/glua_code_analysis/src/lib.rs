@@ -690,17 +690,26 @@ impl EmmyLuaAnalysis {
     }
 
     /// Return main-workspace files in an order that keeps parallel diagnostic
-    /// workers busy. Source size is a cheap proxy for diagnostic cost, so
-    /// processing larger files first avoids leaving one expensive file on the
-    /// critical path after the other workers have gone idle.
+    /// workers busy: files with the most name and index expressions first, since
+    /// those are where inference and flow narrowing spend their time, which raw
+    /// source size misses (large data files are cheap, mid-size code files are
+    /// not). Dispatching the expensive files first keeps one of them from being
+    /// left alone on the critical path after the other workers have gone idle.
     pub fn get_main_workspace_file_ids_for_diagnostics(&self) -> Vec<FileId> {
         let db = self.compilation.get_db();
         let vfs = db.get_vfs();
+        let flow_index = db.get_flow_index();
         let mut file_ids = db.get_module_index().get_main_workspace_file_ids();
-        file_ids.sort_unstable_by(|left, right| {
-            let left_len = vfs.get_file_content(left).map_or(0, String::len);
-            let right_len = vfs.get_file_content(right).map_or(0, String::len);
-            right_len.cmp(&left_len).then_with(|| left.cmp(right))
+        file_ids.sort_by_cached_key(|file_id| {
+            let bindings = flow_index
+                .get_flow_tree(file_id)
+                .map_or(0, |flow_tree| flow_tree.binding_count());
+            let len = vfs.get_file_content(file_id).map_or(0, String::len);
+            (
+                std::cmp::Reverse(bindings),
+                std::cmp::Reverse(len),
+                *file_id,
+            )
         });
         file_ids
     }
