@@ -660,8 +660,8 @@ mod tests {
                     |_| 17,
                 )
             };
-            let first = scope.spawn(&compute);
-            let second = scope.spawn(&compute);
+            let first = scope.spawn(compute);
+            let second = scope.spawn(compute);
             [first.join().unwrap(), second.join().unwrap()]
         });
         for result in results {
