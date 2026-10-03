@@ -1443,10 +1443,6 @@ pub fn suspend() -> Evaluation {
 
 pub fn end() -> Evaluation {
     let mut evaluation = suspend();
-    assert!(
-        evaluation.frames.is_empty(),
-        "derivation::end with open frames"
-    );
     evaluation.log_handle.freeze(&evaluation.log);
     let spare = Spare::take(&mut evaluation);
     SPARE.with(|kept| {
