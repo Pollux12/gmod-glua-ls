@@ -89,6 +89,11 @@ struct ComputedCallTargets {
     cache: crate::LuaInferCache,
 }
 
+struct ComputedDynamicFields {
+    fields: dynamic_field::FileDynamicFields,
+    cache: crate::LuaInferCache,
+}
+
 impl Recipes {
     pub(super) fn new(db: &DbIndex, scopes: ScriptedScopes) -> Self {
         let roots = db
@@ -109,6 +114,28 @@ impl Recipes {
 }
 
 impl Recipes {
+    /// The file's inference memo, taken out of the store for one computation,
+    /// or a new one under the view a file derivation infers with.
+    fn take_cache(&self, db: &DbIndex, file_id: FileId) -> crate::LuaInferCache {
+        let mut context = AnalyzeContext::for_files(db, vec![file_id], &self.scopes);
+        if let Some(cache) = self.caches.lock().expect("cache store").remove(&file_id) {
+            context.infer_manager.restore_file(file_id, cache);
+        }
+        context.infer_manager.get_infer_cache(file_id);
+        context
+            .infer_manager
+            .take_file(file_id)
+            .expect("file cache")
+    }
+
+    /// Returns the file's inference memo to the store.
+    fn store_cache(&self, file_id: FileId, cache: crate::LuaInferCache) {
+        self.caches
+            .lock()
+            .expect("cache store")
+            .insert(file_id, cache);
+    }
+
     /// Each file's inference memo.
     pub(super) fn into_memos(self) -> FxHashMap<FileId, crate::LuaInferCache> {
         self.caches
@@ -183,11 +210,17 @@ impl super::engine::Recipe for Recipes {
             DerivationKind::GmodClassCallSites => Box::new(gmod::compute_annotated_call_sites(
                 db, id.file_id, false, true,
             )),
-            DerivationKind::DynamicFields => Box::new(dynamic_field::compute_file_dynamic_fields(
-                db,
-                id.file_id,
-                dynamic_field::DynamicFieldAnalysisMode::Full,
-            )),
+            DerivationKind::DynamicFields => {
+                let mut cache = self.take_cache(db, id.file_id);
+                let transaction = cache.begin_transaction();
+                let fields = dynamic_field::compute_file_dynamic_fields(
+                    db,
+                    &mut cache,
+                    dynamic_field::DynamicFieldAnalysisMode::Full,
+                );
+                drop(transaction);
+                Box::new(ComputedDynamicFields { fields, cache })
+            }
             DerivationKind::GmodHelperScan => Box::new(gmod::compute_helper_scan(db, id.file_id)),
             DerivationKind::ValidGuardScan => Box::new(
                 crate::db_index::compute_valid_guard_signatures(db, id.file_id),
@@ -257,10 +290,13 @@ impl super::engine::Recipe for Recipes {
                 gmod::apply_annotated_call_sites(db, id.file_id, sites);
             }
             DerivationKind::DynamicFields => {
-                let fields = *computed
-                    .downcast::<dynamic_field::FileDynamicFields>()
+                let ComputedDynamicFields { fields, mut cache } = *computed
+                    .downcast::<ComputedDynamicFields>()
                     .expect("dynamic fields");
                 dynamic_field::apply_dynamic_fields(db, [(fields, id.file_id)]);
+                cache.commit_transaction();
+                cache.clear();
+                self.store_cache(id.file_id, cache);
             }
             DerivationKind::GmodHelperScan => {
                 let scan = *computed
@@ -287,16 +323,23 @@ impl super::engine::Recipe for Recipes {
     }
 
     fn discard(&self, id: DerivationId, computed: Box<dyn std::any::Any + Send>) {
-        if id.kind == DerivationKind::CallTargets {
-            let ComputedCallTargets { mut cache, .. } = *computed
-                .downcast::<ComputedCallTargets>()
-                .expect("call targets");
-            cache.rollback_transaction();
-            self.caches
-                .lock()
-                .expect("cache store")
-                .insert(id.file_id, cache);
-        }
+        let mut cache = match id.kind {
+            DerivationKind::CallTargets => {
+                computed
+                    .downcast::<ComputedCallTargets>()
+                    .expect("call targets")
+                    .cache
+            }
+            DerivationKind::DynamicFields => {
+                computed
+                    .downcast::<ComputedDynamicFields>()
+                    .expect("dynamic fields")
+                    .cache
+            }
+            _ => return,
+        };
+        cache.rollback_transaction();
+        self.store_cache(id.file_id, cache);
     }
 
     fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
