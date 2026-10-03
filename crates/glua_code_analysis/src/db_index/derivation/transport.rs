@@ -1,0 +1,395 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use hashbrown::HashTable;
+use rustc_hash::FxHashMap;
+
+use super::{Evaluation, HashedKey, KeyIdx, KeyTable, ReaderGraph, frames, latest_stamp};
+
+#[must_use]
+pub(crate) struct ReleaseQuarantine {
+    active: Arc<AtomicBool>,
+    started: u64,
+}
+
+impl ReleaseQuarantine {
+    pub(super) fn new(active: Arc<AtomicBool>, started: u64) -> Self {
+        Self { active, started }
+    }
+
+    pub(crate) fn started(&self) -> u64 {
+        self.started
+    }
+
+    pub(crate) fn finish(self, table: &mut KeyTable) {
+        table.finish_quarantine(&self.active);
+    }
+}
+
+impl Drop for ReleaseQuarantine {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerKey {
+    Known(KeyIdx),
+    New(u32),
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct WorkerKeys {
+    entries: Vec<WorkerKey>,
+    new_keys: Vec<HashedKey>,
+    known: FxHashMap<KeyIdx, u32>,
+    new_lookup: HashTable<u32>,
+    visitation: Vec<u64>,
+}
+
+impl WorkerKeys {
+    fn push(&mut self, key: WorkerKey) -> u32 {
+        let local = u32::try_from(self.entries.len()).expect("fewer than 2^32 fact keys");
+        self.entries.push(key);
+        self.visitation.push(0);
+        local
+    }
+
+    fn known(&mut self, slot: KeyIdx) -> u32 {
+        if let Some(local) = self.known.get(&slot) {
+            return *local;
+        }
+        let local = self.push(WorkerKey::Known(slot));
+        self.known.insert(slot, local);
+        local
+    }
+
+    fn intern(&mut self, key: HashedKey, snapshot: &ReaderGraph) -> u32 {
+        if let Some(slot) = snapshot.find_slot(&key) {
+            return self.known(slot);
+        }
+        if let Some(local) = self.new_lookup.find(key.hash, |local| {
+            let WorkerKey::New(index) = self.entries[*local as usize] else {
+                unreachable!()
+            };
+            self.new_keys[index as usize] == key
+        }) {
+            return *local;
+        }
+        let index = u32::try_from(self.new_keys.len()).expect("fewer than 2^32 fact keys");
+        let hash = key.hash;
+        self.new_keys.push(key);
+        let local = self.push(WorkerKey::New(index));
+        let entries = &self.entries;
+        let new_keys = &self.new_keys;
+        self.new_lookup.insert_unique(hash, local, |local| {
+            let WorkerKey::New(index) = entries[*local as usize] else {
+                unreachable!()
+            };
+            new_keys[index as usize].hash
+        });
+        local
+    }
+
+    pub(crate) fn key<'a>(&'a self, local: u32, snapshot: &'a ReaderGraph) -> &'a HashedKey {
+        match self.entries[local as usize] {
+            WorkerKey::Known(slot) => snapshot.key(slot),
+            WorkerKey::New(index) => &self.new_keys[index as usize],
+        }
+    }
+
+    fn taints(&self, local: u32, snapshot: &ReaderGraph) -> bool {
+        let key = self.key(local, snapshot);
+        if let WorkerKey::Known(slot) = self.entries[local as usize]
+            && snapshot.keys().taints(slot)
+        {
+            return true;
+        }
+        let mut base = key.base();
+        while let Some(key) = base {
+            let key = HashedKey::new(key);
+            if snapshot
+                .find_slot(&key)
+                .is_some_and(|slot| snapshot.keys().taints(slot))
+            {
+                return true;
+            }
+            base = key.base();
+        }
+        false
+    }
+
+    fn log(&mut self, evaluation: &mut Evaluation, local: u32, snapshot: &ReaderGraph) {
+        let stamp = &mut self.visitation[local as usize];
+        if *stamp < evaluation.frame_stamp() {
+            let first = *stamp < evaluation.stamp;
+            *stamp = latest_stamp();
+            evaluation.log.push(local);
+            if first {
+                evaluation.read.push(local);
+            }
+        }
+        if self.taints(local, snapshot) {
+            frames::taint_evaluation(evaluation);
+        }
+    }
+
+    pub(crate) fn record(
+        &mut self,
+        evaluation: &mut Evaluation,
+        key: HashedKey,
+        snapshot: &ReaderGraph,
+    ) -> u32 {
+        let local = self.intern(key, snapshot);
+        self.log(evaluation, local, snapshot);
+        local
+    }
+
+    pub(crate) fn record_known(
+        &mut self,
+        evaluation: &mut Evaluation,
+        slot: KeyIdx,
+        snapshot: &ReaderGraph,
+    ) -> Option<u32> {
+        snapshot.keys().live_key(slot)?;
+        let local = self.known(slot);
+        self.log(evaluation, local, snapshot);
+        Some(local)
+    }
+
+    pub(crate) fn canonical_slots(self, table: &mut KeyTable, stamp: u64) -> Option<Vec<KeyIdx>> {
+        assert!(
+            table.quarantines(stamp),
+            "worker publication outside its release epoch"
+        );
+        if self
+            .entries
+            .iter()
+            .any(|key| matches!(key, WorkerKey::Known(slot) if table.live_key(*slot).is_none()))
+        {
+            return None;
+        }
+        let new_slots = self
+            .new_keys
+            .into_iter()
+            .map(|key| table.intern_read(key, stamp))
+            .collect::<Vec<_>>();
+        Some(
+            self.entries
+                .into_iter()
+                .map(|key| match key {
+                    WorkerKey::Known(slot) => slot,
+                    WorkerKey::New(index) => new_slots[index as usize],
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn canonicalise(
+        self,
+        mut evaluation: Evaluation,
+        table: &mut KeyTable,
+    ) -> Option<Evaluation> {
+        assert!(
+            evaluation.frames.is_empty(),
+            "worker publication with open frames"
+        );
+        assert!(
+            evaluation.reads.is_empty() && evaluation.viewed.is_empty(),
+            "worker reads bypassed its registry"
+        );
+        let slots = self.canonical_slots(table, evaluation.stamp)?;
+        for slot in &mut evaluation.log {
+            *slot = slots[*slot as usize];
+        }
+        for slot in &mut evaluation.read {
+            *slot = slots[*slot as usize];
+        }
+        for slot in evaluation.read_identities.values_mut() {
+            *slot = slots[*slot as usize];
+        }
+        for read in evaluation.named_reads.iter_mut() {
+            read.slot = slots[read.slot as usize];
+        }
+        Some(evaluation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{self as derivation, DerivationId, DerivationKind, FactKey, new_stamp};
+    use super::*;
+    use crate::FileId;
+    use rowan::TextSize;
+
+    fn key(file: u32) -> HashedKey {
+        HashedKey::new(FactKey::GmodRealm(FileId::new(file)))
+    }
+
+    fn evaluation() -> Evaluation {
+        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        derivation::suspend()
+    }
+
+    #[test]
+    fn parallel_transport_quarantine_preserves_old_free_slots_and_retirement_stamps() {
+        let mut graph = ReaderGraph::default();
+        let old = graph.intern_read(key(1));
+        let available = graph.intern_read(key(2));
+        graph.release_keys(vec![available]);
+        let guard = graph.quarantine_releases();
+        let worker_stamp = new_stamp();
+        assert!(worker_stamp > guard.started());
+        graph.release_keys(vec![old]);
+        assert!(graph.keys().live_key(old).is_none());
+        assert_eq!(graph.intern_read(key(3)), available);
+        assert_ne!(graph.intern_read(key(4)), old);
+        let mut table = graph.lend_keys();
+        guard.finish(&mut table);
+        let reused = table.intern_read(key(5), new_stamp());
+        assert_eq!(reused, old);
+        assert!(table.written_after(worker_stamp));
+        graph.restore_keys(table);
+    }
+
+    #[test]
+    fn parallel_transport_quarantine_releases_on_unwind_after_table_lending() {
+        let mut graph = ReaderGraph::default();
+        let slot = graph.intern_read(key(1));
+        let guard = graph.quarantine_releases();
+        graph.release_keys(vec![slot]);
+        let mut table = graph.lend_keys();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = guard;
+            panic!("abort epoch");
+        }));
+        assert!(result.is_err());
+        assert_eq!(table.intern_read(key(2), new_stamp()), slot);
+        graph.restore_keys(table);
+    }
+
+    #[test]
+    fn parallel_transport_registry_is_sparse_and_retired_known_reads_fail() {
+        assert_eq!(size_of::<WorkerKey>(), 8);
+        let mut graph = ReaderGraph::default();
+        let global = graph.intern_read(key(1));
+        let guard = graph.quarantine_releases();
+        let mut evaluation = evaluation();
+        let mut keys = WorkerKeys::default();
+        let known = keys.record(&mut evaluation, key(1), &graph);
+        let new = keys.record(&mut evaluation, key(9), &graph);
+        assert_eq!(keys.record(&mut evaluation, key(9), &graph), new);
+        assert_eq!(keys.entries.len(), 2);
+        assert_eq!(keys.new_keys.len(), 1);
+        assert_eq!(keys.visitation.len(), 2);
+        assert_eq!(keys.entries[known as usize], WorkerKey::Known(global));
+        assert_eq!(evaluation.log, vec![known, new]);
+        graph.release_keys(vec![global]);
+        assert_ne!(graph.intern_read(key(2)), global);
+        let mut table = graph.lend_keys();
+        assert!(keys.canonicalise(evaluation, &mut table).is_none());
+        guard.finish(&mut table);
+        graph.restore_keys(table);
+    }
+
+    #[test]
+    fn parallel_transport_new_projected_reads_taint_for_held_and_windowed_bases() {
+        for held in [false, true] {
+            let mut graph = ReaderGraph::default();
+            graph.intern_read(key(1));
+            if held {
+                graph.hold_windows([&key(1)]);
+            } else {
+                let mut table = graph.lend_keys();
+                table.open_window(&key(1), new_stamp());
+                graph.restore_keys(table);
+            }
+            derivation::lend_keys(KeyTable::default());
+            derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+            let frame = derivation::open_frame().unwrap();
+            let mut evaluation = derivation::suspend();
+            let table = derivation::take_keys();
+            let mut keys = WorkerKeys::default();
+            let child = HashedKey::new(FactKey::GmodRealmAt(FileId::new(1), TextSize::new(5)));
+            keys.record(&mut evaluation, child, &graph);
+            assert_eq!(keys.new_keys.len(), 1);
+            derivation::lend_keys(table);
+            derivation::resume(evaluation);
+            assert!(derivation::close_frame(frame, 0).is_none());
+            derivation::end();
+            derivation::take_keys();
+        }
+    }
+
+    #[test]
+    fn parallel_transport_canonicalisation_preserves_nested_ranges_and_late_apply_reads() {
+        let mut graph = ReaderGraph::default();
+        graph.intern_read(key(99));
+        let global = graph.intern_read(key(1));
+        let guard = graph.quarantine_releases();
+        derivation::lend_keys(KeyTable::default());
+        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let outer = derivation::open_frame().unwrap();
+        let mut keys = WorkerKeys::default();
+        let known = derivation::CURRENT
+            .with(|current| keys.record(current.borrow_mut().as_mut().unwrap(), key(1), &graph));
+        let inner = derivation::open_frame().unwrap();
+        let new = derivation::CURRENT.with(|current| {
+            let mut current = current.borrow_mut();
+            let evaluation = current.as_mut().unwrap();
+            keys.record_known(evaluation, global, &graph).unwrap();
+            keys.record(evaluation, key(2), &graph)
+        });
+        let inner_proof = derivation::close_frame(inner, 0).unwrap();
+        let outer_proof = derivation::close_frame(outer, 0).unwrap();
+        let mut evaluation = derivation::suspend();
+        assert_eq!(evaluation.log, vec![known, known, new]);
+        evaluation.read_identities.insert((1, 7), known);
+        evaluation.named_reads.insert_unique(
+            0,
+            derivation::NamedRead {
+                tag: 1,
+                owner: 7,
+                name: None,
+                slot: new,
+            },
+            |_| 0,
+        );
+        derivation::take_keys();
+        let mut table = graph.lend_keys();
+        let evaluation = keys.canonicalise(evaluation, &mut table).unwrap();
+        let new_global = table.find(&key(2)).unwrap();
+        assert_ne!(known, global);
+        assert_eq!(evaluation.log, vec![global, global, new_global]);
+        assert_eq!(evaluation.read_identities[&(1, 7)], global);
+        assert_eq!(
+            evaluation.named_reads.iter().next().unwrap().slot,
+            new_global
+        );
+        derivation::lend_keys(table);
+        derivation::resume(evaluation);
+        assert_eq!(
+            derivation::reuse(&inner_proof, 0, &[], None),
+            derivation::Reuse::Held
+        );
+        let late = derivation::open_frame().unwrap();
+        derivation::note_read(|| key(3).key().clone());
+        let late_proof = derivation::close_frame(late, 0).unwrap();
+        derivation::end();
+        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        assert_eq!(
+            derivation::reuse(&outer_proof, 0, &[], None),
+            derivation::Reuse::Held
+        );
+        assert_eq!(
+            derivation::reuse(&late_proof, 0, &[], None),
+            derivation::Reuse::Held
+        );
+        let reads = derivation::end().into_recorded().1;
+        let mut table = derivation::take_keys();
+        let late_global = table.find(&key(3)).unwrap();
+        assert_eq!(reads, vec![global, new_global, late_global]);
+        guard.finish(&mut table);
+        graph.restore_keys(table);
+    }
+}

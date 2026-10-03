@@ -710,6 +710,51 @@ mod tests {
     use crate::db_index::derivation::{self, DerivationId, DerivationKind, FactKey, HashedKey};
 
     #[test]
+    fn parallel_transport_suspend_defers_freezing_and_restores_nested_parent() {
+        derivation::lend_keys(KeyTable::default());
+        let parent = DerivationId::workspace(DerivationKind::GmodLoad);
+        derivation::begin(parent);
+        derivation::note_read(|| FactKey::GmodRealm(FileId::new(1)));
+        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let frame = open_frame().unwrap();
+        derivation::note_read(|| FactKey::GmodRealm(FileId::new(2)));
+        let proof = close_frame(frame, 0).unwrap();
+        let suspended = derivation::suspend();
+        assert!(proof.0.log.0.get().is_none());
+        assert_eq!(derivation::current(), Some(parent));
+        derivation::end();
+        derivation::resume(suspended);
+        derivation::note_read(|| FactKey::GmodRealm(FileId::new(3)));
+        derivation::end();
+        assert_eq!(proof.0.log.0.get().unwrap().len(), 2);
+        assert_eq!(proof.0.end, 1);
+        derivation::take_keys();
+    }
+
+    #[test]
+    fn parallel_transport_suspend_preserves_open_frame_context_in_place() {
+        derivation::lend_keys(KeyTable::default());
+        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let frame = open_frame().unwrap();
+        consult_gates(1);
+        consult_unkeyed(7);
+        derivation::note_read(|| FactKey::GmodRealm(FileId::new(1)));
+        let mark = scope_mark();
+        let suspended = derivation::suspend();
+        assert_eq!(suspended.frames.len(), 1);
+        derivation::resume(suspended);
+        assert!(scope_open(mark));
+        let proof = close_frame(frame, 1).unwrap();
+        assert!(proof.0.log.0.get().is_none());
+        derivation::end();
+        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        assert_eq!(reuse(&proof, 1, &[], None), Reuse::Held);
+        assert_eq!(reuse(&proof, 1, &[7], None), Reuse::Elsewhere);
+        derivation::end();
+        derivation::take_keys();
+    }
+
+    #[test]
     fn stored_fact_handle_leaves_unlent_reads_to_the_identity_recorder() {
         let handle = derivation::FactRead::default();
         derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));

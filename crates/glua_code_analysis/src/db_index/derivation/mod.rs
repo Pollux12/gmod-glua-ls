@@ -9,6 +9,9 @@
 mod frames;
 mod graph;
 mod positions;
+mod transport;
+
+pub(crate) use transport::{ReleaseQuarantine, WorkerKey, WorkerKeys};
 
 use std::cell::RefCell;
 
@@ -1429,13 +1432,21 @@ pub fn resume(mut evaluation: Evaluation) {
 }
 
 /// Stops recording and hands back what the evaluation read and wrote.
-pub fn end() -> Evaluation {
-    let mut evaluation = CURRENT.with(|current| {
+pub fn suspend() -> Evaluation {
+    CURRENT.with(|current| {
         let mut current = current.borrow_mut();
-        let evaluation = current.take().expect("derivation::end without begin");
+        let evaluation = current.take().expect("derivation::suspend without begin");
         *current = SUSPENDED.with(|suspended| suspended.borrow_mut().pop());
         evaluation
-    });
+    })
+}
+
+pub fn end() -> Evaluation {
+    let mut evaluation = suspend();
+    assert!(
+        evaluation.frames.is_empty(),
+        "derivation::end with open frames"
+    );
     evaluation.log_handle.freeze(&evaluation.log);
     let spare = Spare::take(&mut evaluation);
     SPARE.with(|kept| {

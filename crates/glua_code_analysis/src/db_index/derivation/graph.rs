@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use hashbrown::HashTable;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -304,6 +305,9 @@ pub struct KeyTable {
     key_slots: HashTable<KeyIdx>,
     keys: Paged<KeySlot>,
     free_keys: Vec<KeyIdx>,
+    retirement: Option<Arc<AtomicBool>>,
+    retirement_started: u64,
+    retired: Vec<KeyIdx>,
     /// The keys read out of each base key ([`FactKey::base`]).
     derived: FxHashMap<KeyIdx, DerivedKeys>,
     /// The producers of a key past the one its slot keeps: few keys have more
@@ -358,6 +362,58 @@ impl Clone for DerivedKeys {
 }
 
 impl KeyTable {
+    pub(crate) fn quarantine_releases(&mut self) -> super::ReleaseQuarantine {
+        self.collect_retired();
+        assert!(self.retirement.is_none(), "overlapping release quarantines");
+        let active = Arc::new(AtomicBool::new(true));
+        self.retirement = Some(Arc::clone(&active));
+        self.retirement_started = super::new_stamp();
+        super::ReleaseQuarantine::new(active, self.retirement_started)
+    }
+
+    pub(super) fn finish_quarantine(&mut self, active: &Arc<AtomicBool>) {
+        assert!(
+            self.retirement
+                .as_ref()
+                .is_some_and(|owned| Arc::ptr_eq(owned, active))
+        );
+        active.store(false, Ordering::Release);
+        self.collect_retired();
+    }
+
+    pub(super) fn quarantines(&self, stamp: u64) -> bool {
+        stamp > self.retirement_started
+            && self
+                .retirement
+                .as_ref()
+                .is_some_and(|active| active.load(Ordering::Acquire))
+    }
+
+    fn collect_retired(&mut self) {
+        if self
+            .retirement
+            .as_ref()
+            .is_some_and(|active| !active.load(Ordering::Acquire))
+        {
+            self.retirement = None;
+            self.retirement_started = 0;
+            self.free_keys.append(&mut self.retired);
+        }
+    }
+
+    fn retire(&mut self, slot: KeyIdx) {
+        self.collect_retired();
+        if self.retirement.is_some() {
+            self.retired.push(slot);
+        } else {
+            self.free_keys.push(slot);
+        }
+    }
+
+    pub(super) fn live_key(&self, slot: KeyIdx) -> Option<&HashedKey> {
+        self.keys.get(slot as usize)?.key.as_ref()
+    }
+
     pub(super) fn matching_slot(
         &self,
         slot: KeyIdx,
@@ -390,6 +446,7 @@ impl KeyTable {
     /// Interns `key`. A new slot counts as written at stamp `now`: older
     /// memos cannot have read the key it now names.
     fn intern(&mut self, key: HashedKey, now: u64) -> KeyIdx {
+        self.collect_retired();
         if let Some(slot) = self.find(&key) {
             return slot;
         }
@@ -655,6 +712,10 @@ pub struct ReaderGraph {
 }
 
 impl ReaderGraph {
+    pub(crate) fn quarantine_releases(&mut self) -> super::ReleaseQuarantine {
+        self.table.quarantine_releases()
+    }
+
     /// Counts and estimated heap sizes of the graph's parts, for the profile.
     pub fn census(&self) -> String {
         use crate::profile::{hash_table_bytes, megabytes};
@@ -1622,7 +1683,7 @@ impl ReaderGraph {
         self.table.held.remove(&slot);
         self.table.last_written = super::new_stamp();
         self.table.unfile(&key, slot);
-        self.table.free_keys.push(slot);
+        self.table.retire(slot);
         let Some(base) = key
             .base()
             .and_then(|base| self.table.find(&HashedKey::new(base)))
