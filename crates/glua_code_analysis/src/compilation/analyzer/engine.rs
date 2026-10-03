@@ -2987,6 +2987,9 @@ mod tests {
         let count = engine.stats.evaluations(DerivationKind::LocalStat) - before;
         bind(db, 110, LuaType::IntegerConst(1));
         bind(db, 120, LuaType::IntegerConst(1));
+        for input in &inputs {
+            db.reader_graph().forget_fingerprint(input);
+        }
         assert!(settle(db, &mut engine, &recipe, &[WRITER, 20]));
         for present in [false, true, false, true] {
             *recipe.second.lock().unwrap() = present;
