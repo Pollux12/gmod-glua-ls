@@ -2573,15 +2573,19 @@ mod tests {
                 .map(|(path, text)| (path.as_str(), text.as_str())),
         );
         let edits = [("lua/autorun/sh_inventory.lua", edited.as_str())];
+        let published = || WORKER_PUBLISHED.with(std::cell::Cell::get);
         let analyse = |threads: usize| {
             parallel::set_analysis_threads(threads);
-            WORKER_PUBLISHED.with(|published| published.set(0));
-            let mut cold = VirtualWorkspace::new();
-            cold.def_files(files.clone());
-            let cold = recorded_digest(&mut cold);
-            let mut warm = VirtualWorkspace::assert_warm_matches_cold(|_| {}, &files, &edits);
-            let warm = recorded_digest(&mut warm);
-            (cold, warm, WORKER_PUBLISHED.with(std::cell::Cell::get))
+            let start = published();
+            let mut ws = VirtualWorkspace::new();
+            ws.def_files(files.clone());
+            let cold = recorded_digest(&mut ws);
+            let edit = published();
+            for (path, text) in edits {
+                ws.def_file(path, text);
+            }
+            let warm = recorded_digest(&mut ws);
+            (cold, warm, edit - start, published() - edit)
         };
         let threads = parallel::THREADS
             .lock()
@@ -2590,10 +2594,14 @@ mod tests {
         let recorded = analyse(4);
         parallel::set_analysis_threads(0);
         drop(threads);
-        assert_eq!(serial.2, 0);
+        assert_eq!((serial.2, serial.3), (0, 0));
         assert!(
             recorded.2 > 0,
-            "no call targets were published from workers"
+            "no cold call targets were published from workers"
+        );
+        assert!(
+            recorded.3 > 0,
+            "no call targets were republished from workers after the edit"
         );
         assert_eq!(serial.0, recorded.0);
         assert_eq!(serial.1, recorded.1);
