@@ -12,13 +12,10 @@ use crate::{
     InFiled, LuaDeclId, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType, LuaTypeOwner, VarRefId,
     db_index::{DbIndex, DynamicFieldOwner, LuaMemberOwner, LuaSemanticDeclId, WorkspaceKind},
     find_signature_attribute_use,
-    profile::Profile,
     semantic::{
         find_members_with_key, get_var_expr_var_ref_id, infer_expr, unwrap_paren_to_name_expr,
     },
 };
-
-use super::{AnalysisPipeline, AnalyzeContext};
 
 /// Cache key for prefix type inference in dynamic field analysis.
 /// Uses VarRefId when available (same variable at different positions hits cache),
@@ -35,14 +32,6 @@ impl PrefixCacheKey {
             Some(var_ref_id) => PrefixCacheKey::Var(var_ref_id),
             None => PrefixCacheKey::Range(expr.syntax().text_range()),
         }
-    }
-}
-
-pub struct DynamicFieldAnalysisPipeline;
-
-impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
-    fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
-        analyze_dynamic_fields(db, context, DynamicFieldAnalysisMode::Full);
     }
 }
 
@@ -381,22 +370,6 @@ pub(super) type FileDynamicFields = (
     Vec<FiniteNamedMemberEvidence>,
     Vec<(SmolStr, rowan::TextRange)>,
 );
-
-fn analyze_dynamic_fields(
-    db: &mut DbIndex,
-    context: &mut AnalyzeContext,
-    mode: DynamicFieldAnalysisMode,
-) {
-    let _p = Profile::cond_new("dynamic field analyze", context.tree_list.len() > 1);
-    // Collection is read-only against an immutable `&DbIndex` and writes only to
-    // per-file local buffers, so it runs concurrently across files. Results are
-    // merged into the db in deterministic file order.
-    let file_ids: Vec<crate::FileId> = context.tree_list.iter().map(|t| t.file_id).collect();
-    let per_file = super::parallel::map_files_collect(&*db, &file_ids, |db, file_id| {
-        compute_file_dynamic_fields(db, file_id, mode)
-    });
-    apply_dynamic_fields(db, per_file.into_iter().zip(file_ids));
-}
 
 /// A file's dynamic fields, read off the index; [`apply_dynamic_fields`]
 /// stores them.
