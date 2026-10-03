@@ -45,6 +45,7 @@ mod self_nesting_cycle_test;
 mod self_support_test;
 mod shared_cache_test;
 mod slice_test;
+mod source_tail_test;
 mod stack_exhaustion_test;
 mod static_cal_cmp;
 mod syntax_error_test;
