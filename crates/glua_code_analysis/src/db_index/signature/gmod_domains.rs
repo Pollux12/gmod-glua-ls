@@ -580,17 +580,29 @@ pub fn rebuild_effective_valid_guard_signatures(db: &mut DbIndex) {
 /// Source functions can shadow metadata-bearing annotation declarations of the
 /// same global or member identity, so the identity is resolved once here and
 /// call narrowing stays an O(1) signature lookup.
-pub fn scan_valid_guard_signatures(db: &mut DbIndex, file_id: FileId) {
+pub fn compute_valid_guard_signatures(
+    db: &DbIndex,
+    file_id: FileId,
+) -> Vec<(LuaSignatureId, GmodStateMask)> {
     if !db.get_emmyrc().gmod.enabled {
-        return;
+        return Vec::new();
     }
     let mut found = valid_guard_globals_in_file(db, file_id);
     found.extend(valid_guard_contributions_for_file(db, file_id));
+    found
+        .sort_by_key(|(signature_id, _)| (signature_id.get_file_id(), signature_id.get_position()));
+    found
+}
+
+/// Stores one file's valid-guard signatures, when it has any.
+pub fn store_valid_guard_signatures(
+    db: &mut DbIndex,
+    file_id: FileId,
+    found: Vec<(LuaSignatureId, GmodStateMask)>,
+) {
     if found.is_empty() {
         return;
     }
-    found
-        .sort_by_key(|(signature_id, _)| (signature_id.get_file_id(), signature_id.get_position()));
     db.get_signature_index_mut()
         .store_valid_guard_file_contributions(file_id, found);
 }

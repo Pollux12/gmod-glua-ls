@@ -54,8 +54,8 @@ mod network;
 mod numeric_range_population;
 
 pub(crate) use derive::{
-    evaluate_call_roles, evaluate_class_call_sites, evaluate_load, evaluate_load_call_sites,
-    evaluate_net_helper_names, evaluate_network, evaluate_post, evaluate_pre,
+    apply_pre, compute_pre, evaluate_call_roles, evaluate_class_call_sites, evaluate_load,
+    evaluate_load_call_sites, evaluate_net_helper_names, evaluate_network, evaluate_post,
     evaluate_valid_guards, evaluate_vgui_chains,
 };
 pub(crate) use network::{
@@ -494,10 +494,11 @@ impl crate::db_index::derivation::DerivedFact for FileHelperScan {
     }
 }
 
-/// Scans one file's signatures for call roles and net-helper definitions.
-pub(crate) fn evaluate_helper_scan(db: &mut DbIndex, file_id: FileId) {
+/// Scans one file's signatures for call roles and net-helper definitions;
+/// [`apply_helper_scan`] stores the scan. A file without signatures has none.
+pub(crate) fn compute_helper_scan(db: &DbIndex, file_id: FileId) -> Option<FileHelperScan> {
     if !db.get_emmyrc().gmod.enabled {
-        return;
+        return None;
     }
     let mut signature_ids = db
         .get_signature_index()
@@ -505,7 +506,7 @@ pub(crate) fn evaluate_helper_scan(db: &mut DbIndex, file_id: FileId) {
         .map(|ids| ids.iter().copied().collect::<Vec<_>>())
         .unwrap_or_default();
     if signature_ids.is_empty() {
-        return;
+        return None;
     }
     signature_ids.sort_unstable_by_key(|signature_id| signature_id.get_position());
     let has_calls = db.get_vfs().get_syntax_tree(&file_id).is_some_and(|tree| {
@@ -514,8 +515,17 @@ pub(crate) fn evaluate_helper_scan(db: &mut DbIndex, file_id: FileId) {
             .next()
             .is_some()
     });
-    let scan = AnnotatedGmodGlobalCallRoleMap::build_for_file(db, &signature_ids, has_calls);
-    db.set_helper_scan(file_id, Arc::new(scan));
+    Some(AnnotatedGmodGlobalCallRoleMap::build_for_file(
+        db,
+        &signature_ids,
+        has_calls,
+    ))
+}
+
+pub(crate) fn apply_helper_scan(db: &mut DbIndex, file_id: FileId, scan: Option<FileHelperScan>) {
+    if let Some(scan) = scan {
+        db.set_helper_scan(file_id, Arc::new(scan));
+    }
 }
 
 /// Records the global paths `file_id`'s syntax names, which its gmod passes
@@ -1188,8 +1198,8 @@ impl FileTreeScan {
 
 /// All per-file gmod pre-analysis metadata collected off-thread for one file.
 /// Produced by [`collect_file_gmod_metadata`] (read-only against `&DbIndex`) and
-/// merged into the db sequentially by the pipeline in file order.
-struct GmodFileMetadataResult {
+/// merged into the db by [`apply_pre`].
+pub(crate) struct GmodFileMetadataResult {
     /// `Some` when hook metadata was collected (file had hook-relevant
     /// keywords): (hook sites, system metadata, gm-method realm annotations).
     /// `None` means the hook walk was skipped for this file.
@@ -4671,64 +4681,53 @@ struct NetworkVarWrapper {
 
 /// Detect wrapper functions that internally call NetworkVar/NetworkVarElement
 /// and synthesize Get/Set members from their call sites.
-fn synthesize_network_var_wrappers(
-    db: &mut DbIndex,
-    scripted_scope_files: &HashSet<FileId>,
-    tree_map: &HashMap<FileId, LuaChunk>,
-) {
-    // Sort by FileId for deterministic iteration order
-    let mut sorted_entries: Vec<_> = tree_map.iter().collect();
-    sorted_entries.sort_by_key(|(fid, _)| fid.id);
-    for (file_id, root) in sorted_entries {
-        if !scripted_scope_files.contains(file_id) {
-            continue;
-        }
+/// Synthesizes the members a scripted-scope file's network-var wrapper calls
+/// define.
+fn synthesize_network_var_wrappers(db: &mut DbIndex, file_id: FileId, root: &LuaChunk) {
+    // Use cached scoped class info (computed earlier in gmod_pre)
+    let Some(scope_match) = db
+        .get_gmod_infer_index()
+        .get_scoped_class_info(&file_id)
+        .cloned()
+    else {
+        return;
+    };
 
-        // Use cached scoped class info (computed earlier in gmod_pre per-file loop)
-        let Some(scope_match) = db
-            .get_gmod_infer_index()
-            .get_scoped_class_info(file_id)
-            .cloned()
+    let class_decl_id =
+        get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name);
+
+    // Step 1: Collect wrapper definitions from method definitions
+    let wrappers = collect_network_var_wrappers(root, &scope_match.global_name);
+    if wrappers.is_empty() {
+        return;
+    }
+
+    // Step 2: Find calls to these wrappers and synthesize members
+    for call_expr in root.descendants::<LuaCallExpr>() {
+        let (method_name, is_local_call) = match call_expr.get_prefix_expr() {
+            Some(LuaExpr::IndexExpr(index_expr)) => {
+                let Some(LuaIndexKey::Name(name_token)) = index_expr.get_index_key() else {
+                    continue;
+                };
+                (name_token.get_name_text().to_string(), false)
+            }
+            Some(LuaExpr::NameExpr(name_expr)) => {
+                let Some(name_text) = name_expr.get_name_text() else {
+                    continue;
+                };
+                (name_text.to_string(), true)
+            }
+            _ => continue,
+        };
+
+        let Some(wrapper) = wrappers
+            .iter()
+            .find(|w| w.method_name == method_name && w.is_local == is_local_call)
         else {
             continue;
         };
 
-        let class_decl_id =
-            get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name);
-
-        // Step 1: Collect wrapper definitions from method definitions
-        let wrappers = collect_network_var_wrappers(root, &scope_match.global_name);
-        if wrappers.is_empty() {
-            continue;
-        }
-
-        // Step 2: Find calls to these wrappers and synthesize members
-        for call_expr in root.descendants::<LuaCallExpr>() {
-            let (method_name, is_local_call) = match call_expr.get_prefix_expr() {
-                Some(LuaExpr::IndexExpr(index_expr)) => {
-                    let Some(LuaIndexKey::Name(name_token)) = index_expr.get_index_key() else {
-                        continue;
-                    };
-                    (name_token.get_name_text().to_string(), false)
-                }
-                Some(LuaExpr::NameExpr(name_expr)) => {
-                    let Some(name_text) = name_expr.get_name_text() else {
-                        continue;
-                    };
-                    (name_text.to_string(), true)
-                }
-                _ => continue,
-            };
-
-            let Some(wrapper) = wrappers
-                .iter()
-                .find(|w| w.method_name == method_name && w.is_local == is_local_call)
-            else {
-                continue;
-            };
-
-            synthesize_from_wrapper_call(db, *file_id, &class_decl_id, wrapper, &call_expr);
-        }
+        synthesize_from_wrapper_call(db, file_id, &class_decl_id, wrapper, &call_expr);
     }
 }
 
