@@ -146,16 +146,16 @@ fn field_definition_sites(
 }
 
 /// Per-file dynamic-field collection. Reads only immutable `&DbIndex` state
-/// (lua/unresolve analysis is complete) plus the file's own AST, and writes
-/// nothing to the db — all results are returned for sequential merge. Uses a
-/// fresh per-file infer cache (the db is immutable during this pass, so a cold
-/// cache yields identical inference results). This makes the collection safe
-/// to run concurrently across files.
+/// plus the file's own AST, and writes nothing to the db — all results are
+/// returned for sequential merge. Infers through `cache` under
+/// [`collecting_view`]; memos it holds from other views are reused only where
+/// they consulted none of that view's gates.
 fn collect_dynamic_fields_for_file(
     db: &DbIndex,
     file_id: crate::FileId,
     root: &glua_parser::LuaChunk,
     mode: DynamicFieldAnalysisMode,
+    cache: &mut crate::LuaInferCache,
 ) -> (
     Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
     Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
@@ -180,15 +180,6 @@ fn collect_dynamic_fields_for_file(
     // re-indexed files' contributions removed: a partial record that names a
     // different table than the complete one will. Neither is read here, so
     // both builds decide the same way.
-    let mut cache = crate::LuaInferCache::new(
-        file_id,
-        crate::CacheOptions {
-            analysis_phase: crate::LuaAnalysisPhase::Force,
-            dynamic_fields_visible: false,
-            call_site_params_visible: false,
-        },
-    );
-    let cache = &mut cache;
     let mut prefix_type_cache: FxHashMap<PrefixCacheKey, Option<LuaType>> = FxHashMap::default();
     let mut local_reassignment_positions = None;
     let defines_fields = |kind: glua_parser::LuaKind| {
@@ -373,11 +364,24 @@ pub(super) type FileDynamicFields = (
 
 /// A file's dynamic fields, read off the index; [`apply_dynamic_fields`]
 /// stores them.
+/// The view dynamic fields are collected under: the records this pass builds
+/// are not read while building them.
+fn collecting_view() -> crate::CacheOptions {
+    crate::CacheOptions {
+        analysis_phase: crate::LuaAnalysisPhase::Force,
+        dynamic_fields_visible: false,
+        call_site_params_visible: false,
+    }
+}
+
+/// The file's dynamic fields, inferred through `cache` (its memo) under
+/// [`collecting_view`]; the cache's own view is restored afterwards.
 pub(super) fn compute_file_dynamic_fields(
     db: &DbIndex,
-    file_id: crate::FileId,
+    cache: &mut crate::LuaInferCache,
     mode: DynamicFieldAnalysisMode,
 ) -> FileDynamicFields {
+    let file_id = cache.get_file_id();
     let Some(root) = db
         .get_vfs()
         .get_syntax_tree(&file_id)
@@ -385,7 +389,10 @@ pub(super) fn compute_file_dynamic_fields(
     else {
         return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     };
-    collect_dynamic_fields_for_file(db, file_id, &root, mode)
+    let view = std::mem::replace(cache.config_mut(), collecting_view());
+    let fields = collect_dynamic_fields_for_file(db, file_id, &root, mode, cache);
+    *cache.config_mut() = view;
+    fields
 }
 
 /// Stores the dynamic fields files' collections found, in file order.
