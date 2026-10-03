@@ -286,14 +286,8 @@ mod test {
             ws.def_files(texts.clone());
             let check = |ws: &VirtualWorkspace, texts: &[(&str, &str)], step: &str| {
                 let warm = tail_digest(ws);
-                assert!(
-                    ws.stale_derivations().is_empty(),
-                    "{step}: stale derivations"
-                );
-                assert!(
-                    ws.phantom_derivations().is_empty(),
-                    "{step}: phantom derivations"
-                );
+                assert_eq!(ws.stale_derivations(), Vec::new(), "{step}: stale");
+                assert_eq!(ws.phantom_derivations(), Vec::new(), "{step}: phantom");
                 let cold = cold_digest(ws, texts);
                 parallel::set_analysis_threads(4);
                 assert_eq!(warm, cold, "{step}");
@@ -341,7 +335,21 @@ mod test {
             texts.extend(deleted);
             check(&ws, &texts, "recreate");
 
-            ws.def_files(texts.clone());
+            let reopened = ws.analysis.update_files_by_uri(
+                texts
+                    .iter()
+                    .map(|(path, text)| {
+                        (
+                            ws.virtual_url_generator.new_uri(path),
+                            Some(text.to_string()),
+                        )
+                    })
+                    .collect(),
+            );
+            assert!(
+                reopened.is_empty(),
+                "reopening unchanged texts re-analyses nothing"
+            );
             check(&ws, &texts, "reopen");
         });
     }
