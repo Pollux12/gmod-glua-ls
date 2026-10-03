@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use hashbrown::HashTable;
 use rustc_hash::FxHashMap;
 
-use super::{Evaluation, HashedKey, KeyIdx, KeyTable, ReaderGraph, frames, latest_stamp};
+use super::{Evaluation, HashedKey, KeyIdx, KeyTable, ReaderGraph, frames};
 
 mod worker;
 pub(crate) use worker::{
@@ -145,7 +145,7 @@ impl WorkerKeys {
         let stamp = &mut self.visitation[local as usize];
         if *stamp < evaluation.frame_stamp() {
             let first = *stamp < evaluation.stamp;
-            *stamp = latest_stamp();
+            *stamp = evaluation.frame_stamp();
             evaluation.log.push(local);
             if first {
                 evaluation.read.push(local);
@@ -255,6 +255,73 @@ mod tests {
     fn evaluation() -> Evaluation {
         derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
         derivation::suspend()
+    }
+
+    #[test]
+    fn parallel_transport_frame_visitation_matches_canonical_logging_with_unrelated_stamps() {
+        let mut graph = ReaderGraph::default();
+        for file in 1..=3 {
+            graph.intern_read(key(file));
+        }
+        let mut reference = graph.keys().clone();
+        let mut keys = WorkerKeys::default();
+        let mut reference_log = Vec::new();
+        let mut reference_reads = Vec::new();
+        derivation::lend_keys(KeyTable::default());
+        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let mut read = |file| {
+            derivation::CURRENT.with(|current| {
+                let mut current = current.borrow_mut();
+                let evaluation = current.as_mut().unwrap();
+                let local = keys.record(evaluation, key(file), &graph);
+                let slot = reference.find(&key(file)).unwrap();
+                if let Some(first) = reference.log(
+                    slot,
+                    evaluation.frame_stamp(),
+                    evaluation.stamp,
+                    derivation::latest_stamp(),
+                ) {
+                    reference_log.push(local);
+                    if first {
+                        reference_reads.push(local);
+                    }
+                }
+            });
+        };
+        read(1);
+        read(1);
+        let outer = derivation::open_frame().unwrap();
+        read(1);
+        std::thread::spawn(|| {
+            for _ in 0..32 {
+                new_stamp();
+            }
+        })
+        .join()
+        .unwrap();
+        read(1);
+        let child = derivation::open_frame().unwrap();
+        read(1);
+        read(2);
+        read(2);
+        derivation::close_frame(child, 0).unwrap();
+        read(1);
+        read(2);
+        let sibling = derivation::open_frame().unwrap();
+        read(1);
+        read(2);
+        derivation::close_frame(sibling, 0).unwrap();
+        derivation::close_frame(outer, 0).unwrap();
+        read(1);
+        read(2);
+        read(3);
+        read(3);
+        let evaluation = derivation::end();
+        derivation::take_keys();
+        assert_eq!(evaluation.log, reference_log);
+        assert_eq!(evaluation.read, reference_reads);
+        assert_eq!(evaluation.log, vec![0, 0, 0, 1, 0, 1, 2]);
+        assert_eq!(evaluation.read, vec![0, 1, 2]);
     }
 
     #[test]
