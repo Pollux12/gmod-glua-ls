@@ -1,21 +1,16 @@
 mod docs;
 mod exprs;
 mod members;
+mod ops;
 mod stats;
 
 use rustc_hash::FxHashSet;
 
-use crate::{
-    compilation::analyzer::AnalysisPipeline,
-    db_index::{DbIndex, GmodScopedClassInfo, LegacyModuleEnv, LuaScopeKind},
-    profile::Profile,
+use crate::db_index::{
+    DbIndex, FileReference, FileReferenceBatch, GmodScopedClassInfo, LegacyModuleEnv, LuaScopeKind,
 };
 
-use super::{
-    AnalyzeContext,
-    common::{TypeCacheWriteMode, estimate_file_index_entries, write_type_cache},
-    gmod::ensure_scoped_class_type_decl_for_file,
-};
+use super::{ScriptedScopes, common::estimate_file_index_entries};
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaChunk, LuaFuncStat, LuaNameExpr, LuaSyntaxKind,
     LuaVarExpr,
@@ -32,75 +27,50 @@ use crate::{
 };
 use smol_str::SmolStr;
 
-pub struct DeclAnalysisPipeline;
+pub(super) use ops::DeclWalk;
+use ops::{ContextDelta, DeclOp};
 
-impl AnalysisPipeline for DeclAnalysisPipeline {
-    fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
-        let _p = Profile::cond_new("decl analyze", context.tree_list.len() > 1);
-        let tree_list = context.tree_list.clone();
-
-        let scripted_scope_infos = if db.get_emmyrc().gmod.enabled {
-            Some(context.get_or_compute_scripted_scope_infos(db).clone())
-        } else {
-            None
-        };
-
-        for in_filed_tree in tree_list.iter() {
-            // Detect scoped class once here and cache in GmodInferIndex for gmod_pre reuse.
-            let scoped_class_info = if let Some(scripted_scope_infos) =
-                scripted_scope_infos.as_ref()
-                && let Some(info) = scripted_scope_infos.get(&in_filed_tree.file_id)
-            {
-                db.get_gmod_infer_index_mut()
-                    .set_scoped_class_info(in_filed_tree.file_id, info.clone());
-                Some(info.clone())
-            } else {
-                None
-            };
-
-            db.get_reference_index_mut()
-                .create_local_reference(in_filed_tree.file_id);
-
-            // Pre-size the member and reference tables for this file's writes
-            // from its text length, without walking the tree: the walk below
-            // inserts one entry per member/reference, which otherwise rehashes
-            // the workspace-wide maps once per growth step for every file.
-            let estimate = estimate_file_index_entries(usize::from(
-                in_filed_tree.value.syntax().text_range().len(),
-            ));
-            db.get_member_index_mut()
-                .reserve_for_file(in_filed_tree.file_id, estimate);
-            db.get_reference_index_mut()
-                .reserve_for_file(in_filed_tree.file_id, estimate);
-
-            let mut analyzer = DeclAnalyzer::new(
-                db,
-                in_filed_tree.file_id,
-                in_filed_tree.value.clone(),
-                context,
-                scoped_class_info,
-            );
-            analyzer.analyze();
-            let assignment_sites = analyzer.take_assignment_sites();
-            let decl_tree = analyzer.get_decl_tree();
-            // Register the scoped class type (must happen during decl, before doc/flow phases)
-            if let Some(scripted_scope_infos) = scripted_scope_infos.as_ref()
-                && scripted_scope_infos.contains_key(&in_filed_tree.file_id)
-            {
-                ensure_scoped_class_type_decl_for_file(
-                    db,
-                    in_filed_tree.file_id,
-                    in_filed_tree.value.syntax().text_range(),
-                );
-            }
-
-            db.get_decl_index_mut().add_decl_tree(decl_tree);
-
-            let reassignments =
-                collect_local_reassignments(db, in_filed_tree.file_id, &assignment_sites);
-            db.get_reference_index_mut()
-                .set_local_reassignments(in_filed_tree.file_id, reassignments);
-        }
+/// Walks `file_id`'s declarations. Reads only the file's own syntax tree and
+/// facts of its own that no other file's declarations write, so files walk
+/// concurrently; [`DeclWalk::apply`] writes what the walk found to the index.
+pub(super) fn walk_file(db: &DbIndex, file_id: FileId, scopes: &ScriptedScopes) -> DeclWalk {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .expect("a live file has a syntax tree")
+        .get_chunk_node();
+    let scoped_class_info = if db.get_emmyrc().gmod.enabled {
+        scopes.infos.get(&file_id).cloned()
+    } else {
+        None
+    };
+    let range = root.syntax().text_range();
+    let mut analyzer = DeclAnalyzer::new(db, file_id, root, scoped_class_info.clone());
+    analyzer.analyze();
+    let assignment_sites = analyzer.take_assignment_sites();
+    let DeclAnalyzer {
+        decl,
+        references,
+        ops,
+        delta,
+        ..
+    } = analyzer;
+    let reassignments = collect_local_reassignments(
+        references.file_reference(),
+        Some(&decl),
+        &assignment_sites,
+        file_id,
+    );
+    DeclWalk {
+        file_id,
+        scoped_class_info,
+        chunk_range: range,
+        estimate: estimate_file_index_entries(usize::from(range.len())),
+        references,
+        ops,
+        decl_tree: decl,
+        reassignments,
+        delta,
     }
 }
 
@@ -108,13 +78,12 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
 /// sites are collected during the declaration walk and resolved after the
 /// file's references and declaration tree are complete.
 fn collect_local_reassignments(
-    db: &DbIndex,
-    file_id: FileId,
+    references: &FileReference,
+    decl_tree: Option<&LuaDeclarationTree>,
     assignment_sites: &[LuaAssignStat],
+    file_id: FileId,
 ) -> rustc_hash::FxHashMap<LuaDeclId, TextSize> {
     let mut positions = rustc_hash::FxHashMap::default();
-    let references = db.get_reference_index().get_local_reference(&file_id);
-    let decl_tree = db.get_decl_index().get_decl_tree(&file_id);
     for assign_stat in assignment_sites {
         let position = assign_stat.get_position();
 
@@ -125,7 +94,7 @@ fn collect_local_reassignments(
             };
 
             let assigned_decl_id = references
-                .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))
+                .get_decl_id(&name_expr.get_range())
                 .or_else(|| assignment_name_decl_id(decl_tree, &name_expr));
             let Some(assigned_decl_id) = assigned_decl_id else {
                 continue;
@@ -191,20 +160,16 @@ fn walk_node_enter(analyzer: &mut DeclAnalyzer, node: LuaAst) {
             } else {
                 analyzer.create_scope(stat.get_range(), LuaScopeKind::FuncStat);
             }
-            let file_id = analyzer.get_file_id();
             analyzer
-                .db
-                .get_member_index_mut()
-                .add_function_scope_range(file_id, stat.get_range());
+                .ops
+                .push(DeclOp::FunctionScopeRange(stat.get_range()));
             stats::analyze_func_stat(analyzer, stat);
         }
         LuaAst::LuaLocalFuncStat(stat) => {
             analyzer.create_scope(stat.get_range(), LuaScopeKind::FuncStat);
-            let file_id = analyzer.get_file_id();
             analyzer
-                .db
-                .get_member_index_mut()
-                .add_function_scope_range(file_id, stat.get_range());
+                .ops
+                .push(DeclOp::FunctionScopeRange(stat.get_range()));
             stats::analyze_local_func_stat(analyzer, stat);
         }
         LuaAst::LuaRepeatStat(stat) => {
@@ -218,11 +183,9 @@ fn walk_node_enter(analyzer: &mut DeclAnalyzer, node: LuaAst) {
         }
         LuaAst::LuaClosureExpr(expr) => {
             analyzer.create_scope(expr.get_range(), LuaScopeKind::Normal);
-            let file_id = analyzer.get_file_id();
             analyzer
-                .db
-                .get_member_index_mut()
-                .add_function_scope_range(file_id, expr.get_range());
+                .ops
+                .push(DeclOp::FunctionScopeRange(expr.get_range()));
             exprs::analyze_closure_expr(analyzer, expr);
         }
         LuaAst::LuaTableExpr(expr) => {
@@ -281,9 +244,8 @@ fn is_scope_owner(node: &LuaAst) -> bool {
     )
 }
 
-#[derive(Debug)]
 pub struct DeclAnalyzer<'a> {
-    db: &'a mut DbIndex,
+    db: &'a DbIndex,
     root: LuaChunk,
     decl: LuaDeclarationTree,
     scoped_class_info: Option<GmodScopedClassInfo>,
@@ -293,15 +255,17 @@ pub struct DeclAnalyzer<'a> {
     assignment_sites: Vec<LuaAssignStat>,
     scopes: Vec<LuaScopeId>,
     is_meta: bool,
-    context: &'a mut AnalyzeContext,
+    file_namespace: Option<String>,
+    references: FileReferenceBatch,
+    ops: Vec<DeclOp>,
+    delta: ContextDelta,
 }
 
 impl<'a> DeclAnalyzer<'a> {
     pub fn new(
-        db: &'a mut DbIndex,
+        db: &'a DbIndex,
         file_id: FileId,
         root: LuaChunk,
-        context: &'a mut AnalyzeContext,
         scoped_class_info: Option<GmodScopedClassInfo>,
     ) -> DeclAnalyzer<'a> {
         let scoped_class_global_names = scoped_class_info.as_ref().map(|info| {
@@ -322,7 +286,10 @@ impl<'a> DeclAnalyzer<'a> {
             assignment_sites: Vec::new(),
             scopes: Vec::new(),
             is_meta: false,
-            context,
+            file_namespace: db.get_type_index().get_file_namespace(&file_id).cloned(),
+            references: FileReferenceBatch::new(file_id),
+            ops: Vec::new(),
+            delta: ContextDelta::default(),
         }
     }
 
@@ -341,11 +308,9 @@ impl<'a> DeclAnalyzer<'a> {
     }
 
     fn add_member(&mut self, owner: LuaMemberOwner, member: LuaMember) -> LuaMemberId {
-        self.db.get_member_index_mut().add_member(owner, member)
-    }
-
-    pub fn get_decl_tree(self) -> LuaDeclarationTree {
-        self.decl
+        let id = member.get_id();
+        self.ops.push(DeclOp::AddMember { owner, member });
+        id
     }
 
     fn take_assignment_sites(&mut self) -> Vec<LuaAssignStat> {
@@ -401,14 +366,12 @@ impl<'a> DeclAnalyzer<'a> {
         self.add_decl_to_current_scope(id);
 
         if is_global {
-            let file_order_key = self.db.get_vfs().file_order_key(&file_id);
-            self.db
-                .get_global_index_mut()
-                .add_global_decl(&name, id, file_order_key);
-
-            self.db
-                .get_reference_index_mut()
-                .add_global_reference(&name, file_id, syntax_id);
+            self.references.add_global_reference(&name, syntax_id);
+            self.ops.push(DeclOp::GlobalDecl {
+                name: name.clone(),
+                decl_id: id,
+                file_order_key: self.db.get_vfs().file_order_key(&file_id),
+            });
         }
 
         if let Some(owner) = module_member_owner {
@@ -423,11 +386,10 @@ impl<'a> DeclAnalyzer<'a> {
             // Link the member's property to the same property as the decl so that
             // description/annotations stored on the decl (or its signature) are visible
             // when looking up the member (e.g. hover over a legacy-module member).
-            self.db.get_property_index_mut().add_owner_map(
-                crate::LuaSemanticDeclId::LuaDecl(id),
-                crate::LuaSemanticDeclId::Member(member_id),
-                file_id,
-            );
+            self.ops.push(DeclOp::OwnerMap {
+                source: crate::LuaSemanticDeclId::LuaDecl(id),
+                same: crate::LuaSemanticDeclId::Member(member_id),
+            });
         }
 
         id
@@ -513,10 +475,8 @@ impl<'a> DeclAnalyzer<'a> {
 
     pub fn set_legacy_module_env(&mut self, legacy_module_env: LegacyModuleEnv) {
         self.project_legacy_module_chain_members(&legacy_module_env);
-        let file_id = self.decl.file_id();
-        self.db
-            .get_module_index_mut()
-            .set_legacy_module_env(file_id, legacy_module_env.clone());
+        self.ops
+            .push(DeclOp::LegacyModuleEnv(legacy_module_env.clone()));
         self.legacy_module_envs.push(legacy_module_env);
         self.legacy_module_envs
             .sort_by_key(|env| env.activation_position);
@@ -571,12 +531,12 @@ impl<'a> DeclAnalyzer<'a> {
                 Some(GlobalId::new(&child_path)),
             );
             self.add_member(owner, member);
-            write_type_cache(
-                self.db,
-                member_id.into(),
-                LuaTypeCache::InferType(LuaType::Namespace(SmolStr::new(&child_path).into())),
-                TypeCacheWriteMode::InsertOnly,
-            );
+            self.ops.push(DeclOp::WriteTypeCache {
+                owner: member_id.into(),
+                cache: LuaTypeCache::InferType(LuaType::Namespace(
+                    SmolStr::new(&child_path).into(),
+                )),
+            });
         }
     }
 }

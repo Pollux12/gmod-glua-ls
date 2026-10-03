@@ -1,8 +1,10 @@
+mod batch;
 mod file_reference;
 mod string_reference;
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
+pub use batch::FileReferenceBatch;
 pub use file_reference::{DeclReference, DeclReferenceCell, FileReference};
 use glua_parser::LuaSyntaxId;
 use rowan::{TextRange, TextSize};
@@ -477,6 +479,51 @@ impl LuaReferenceIndex {
                     .map(move |(_, syntax_id)| index_reference_fingerprint(file_id, key, syntax_id))
             })
             .fold(derivation::ABSENT, Fingerprint::wrapping_add)
+    }
+
+    /// Files the references `batch` collected for a file that has none yet.
+    pub fn file_batch(&mut self, batch: FileReferenceBatch) {
+        let file_id = batch.file_id();
+        derivation::note_write(|| FactKey::References(file_id));
+        *self.file_references.entry(file_id).or_default() = batch.file_reference;
+        for entry in batch.globals.entries {
+            derivation::note_write(|| FactKey::ReferencesByName(entry.name.clone()));
+            let slot = self
+                .global_references
+                .entry(entry.name.clone())
+                .or_default()
+                .entry(file_id)
+                .or_default();
+            slot.extend(entry.sites);
+            self.add_name_fingerprint(entry.name, entry.fingerprint);
+        }
+        for entry in batch.indexes.entries {
+            let name = member_key_name(&entry.name);
+            derivation::note_write(|| FactKey::ReferencesByName(name.clone()));
+            let slot = self
+                .index_reference
+                .entry(entry.name)
+                .or_default()
+                .entry(file_id)
+                .or_default();
+            slot.extend(entry.sites);
+            self.add_name_fingerprint(name, entry.fingerprint);
+        }
+        for (string, fingerprint) in batch.string_fingerprints {
+            derivation::note_write(|| FactKey::ReferencesByName(string.clone()));
+            self.add_name_fingerprint(string, fingerprint);
+        }
+        *self
+            .string_references
+            .entry(file_id)
+            .or_insert_with(StringReference::new) = batch.strings;
+        if batch.fingerprinted {
+            self.add_file_fingerprint(file_id, batch.fingerprint);
+        }
+        if batch.revisions > 0 {
+            self.next_revision += batch.revisions - 1;
+            self.bump_file_revision(file_id);
+        }
     }
 
     pub fn add_decl_reference(

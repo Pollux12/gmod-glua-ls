@@ -515,13 +515,36 @@ fn replace_files(
         .iter()
         .map(|file_id| (*file_id, register_source(db, *file_id)))
         .collect::<Vec<_>>();
-    let declared = registered
-        .into_iter()
-        .map(|(file_id, evaluation)| (file_id, declare_source(db, file_id, evaluation, scopes)))
-        .collect::<Vec<_>>();
+    // Each batch's declarations are walked together on the pool, outside
+    // every recording evaluation, then written file by file in canonical
+    // order, each inside its file's source evaluation.
+    let batch = parallel::analysis_threads().saturating_mul(SOURCE_TAILS_PER_THREAD);
+    let mut declared = Vec::with_capacity(registered.len());
+    let mut registered = registered.into_iter();
+    loop {
+        let declaring = registered.by_ref().take(batch).collect::<Vec<_>>();
+        if declaring.is_empty() {
+            break;
+        }
+        let file_ids = declaring
+            .iter()
+            .map(|(file_id, _)| *file_id)
+            .collect::<Vec<_>>();
+        debug_assert!(!derivation::recording(), "declarations walk unrecorded");
+        let walks = crate::profile::phase("declaration walks", || {
+            parallel::map_files_collect(db, &file_ids, |db, file_id| {
+                decl::walk_file(db, file_id, scopes)
+            })
+        });
+        for ((file_id, evaluation), walk) in declaring.into_iter().zip(walks) {
+            declared.push((
+                file_id,
+                declare_source(db, file_id, evaluation, scopes, walk),
+            ));
+        }
+    }
     // Each batch's tails are computed together on the pool, outside every
     // recording evaluation, then published file by file in canonical order.
-    let batch = parallel::analysis_threads().saturating_mul(SOURCE_TAILS_PER_THREAD);
     let mut declared = declared.into_iter();
     loop {
         let documented = declared.by_ref().take(batch).collect::<Vec<_>>();
@@ -672,18 +695,20 @@ fn declare_source(
     file_id: FileId,
     evaluation: derivation::Evaluation,
     scopes: &ScriptedScopes,
+    walk: decl::DeclWalk,
 ) -> (derivation::Evaluation, AnalyzeContext) {
     derivation::resume(evaluation);
     let mut context = AnalyzeContext::for_files(db, vec![file_id], scopes);
-    run_analysis::<decl::DeclAnalysisPipeline>(db, &mut context);
+    crate::profile::phase("declaration writes", || walk.apply(db, &mut context));
     let mut evaluation = derivation::end();
     evaluation.fingerprint_stage(|key| db.fact_fingerprint(key));
     (evaluation, context)
 }
 
-/// How many files' source tails [`replace_files`] computes per analysis
-/// thread at once: enough to keep the pool busy, few enough that the batch's
-/// flow trees are published before the next batch's are built.
+/// How many files' declaration walks and source tails [`replace_files`]
+/// computes per analysis thread at once: enough to keep the pool busy, few
+/// enough that the batch's results are published before the next batch's are
+/// built.
 const SOURCE_TAILS_PER_THREAD: usize = 16;
 
 /// The part of a file's source layer that its syntax and its own references

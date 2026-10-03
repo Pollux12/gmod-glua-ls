@@ -7,13 +7,13 @@ use glua_parser::{
 use crate::{
     GlobalId, InFiled, LuaDeclExtra, LuaMemberFeature, LuaMemberId, LuaSemanticDeclId,
     LuaSignatureId, LuaType, LuaTypeCache,
-    compilation::analyzer::common::{bind_type, expr_expands_to_fill_slots, is_nil_literal_expr},
+    compilation::analyzer::common::{expr_expands_to_fill_slots, is_nil_literal_expr},
     db_index::{
         LocalAttribute, LuaDecl, LuaDeclInitializer, LuaMember, LuaMemberKey, LuaMemberOwner,
     },
 };
 
-use super::{DeclAnalyzer, members::find_index_owner};
+use super::{DeclAnalyzer, DeclOp, members::find_index_owner};
 
 pub fn analyze_local_stat(analyzer: &mut DeclAnalyzer, stat: LuaLocalStat) -> Option<()> {
     let local_name_list = stat.get_local_name_list().collect::<Vec<_>>();
@@ -96,12 +96,15 @@ fn initializer_table_expr(expr: &LuaExpr) -> Option<LuaTableExpr> {
 /// a re-index resolves the prefix to, and a write through the path, which is
 /// what a cold walk files it under, would be two owners for one slot.
 fn set_definition_sites(
-    member_index: &mut crate::LuaMemberIndex,
+    ops: &mut Vec<DeclOp>,
     path: GlobalId,
     table_expr: &LuaTableExpr,
     file_id: crate::FileId,
 ) {
-    member_index.set_definition_site(path.clone(), InFiled::new(file_id, table_expr.get_range()));
+    ops.push(DeclOp::DefinitionSite {
+        path: path.clone(),
+        site: InFiled::new(file_id, table_expr.get_range()),
+    });
     for field in table_expr.get_fields() {
         let name = match field.get_field_key() {
             Some(LuaIndexKey::Name(name)) => name.get_name_text().to_string(),
@@ -116,7 +119,7 @@ fn set_definition_sites(
             continue;
         };
         let nested_path = GlobalId::new(&format!("{}.{name}", path.get_name()));
-        set_definition_sites(member_index, nested_path, &nested, file_id);
+        set_definition_sites(ops, nested_path, &nested, file_id);
     }
 }
 
@@ -160,10 +163,7 @@ pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> 
                         && decl.get_file_id() == file_id;
                     if is_local_decl || is_same_file_global_like {
                         let decl_id = decl.get_id();
-                        analyzer
-                            .db
-                            .get_reference_index_mut()
-                            .add_decl_reference(decl_id, file_id, range, true);
+                        analyzer.references.add_decl_reference(decl_id, range, true);
                         continue;
                     }
                 }
@@ -185,7 +185,7 @@ pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> 
                 // path, and the path owns the literal's members.
                 if let Some(table_expr) = value_exprs.get(idx).and_then(initializer_table_expr) {
                     set_definition_sites(
-                        analyzer.db.get_member_index_mut(),
+                        &mut analyzer.ops,
                         GlobalId::new(name),
                         &table_expr,
                         file_id,
@@ -229,7 +229,7 @@ pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> 
                     && let Some(table_expr) = value_exprs.get(idx).and_then(initializer_table_expr)
                 {
                     set_definition_sites(
-                        analyzer.db.get_member_index_mut(),
+                        &mut analyzer.ops,
                         global_id.clone(),
                         &table_expr,
                         file_id,
@@ -306,10 +306,7 @@ fn analyze_maybe_global_index_expr(
         && decl.is_global()
     {
         let decl_id = decl.get_id();
-        analyzer
-            .db
-            .get_reference_index_mut()
-            .add_decl_reference(decl_id, file_id, range, true);
+        analyzer.references.add_decl_reference(decl_id, range, true);
         return Some(decl_id);
     }
     let decl = LuaDecl::new(
@@ -341,11 +338,10 @@ pub fn analyze_for_stat(analyzer: &mut DeclAnalyzer, stat: LuaForStat) -> Option
     );
     let decl_id = decl.get_id();
     analyzer.add_decl(decl);
-    bind_type(
-        analyzer.db,
-        decl_id.into(),
-        LuaTypeCache::DocType(LuaType::Integer),
-    );
+    analyzer.ops.push(DeclOp::BindType {
+        owner: decl_id.into(),
+        cache: LuaTypeCache::DocType(LuaType::Integer),
+    });
 
     Some(())
 }
@@ -385,10 +381,7 @@ pub fn analyze_func_stat(analyzer: &mut DeclAnalyzer, stat: LuaFuncStat) -> Opti
                 if let Some(decl) = analyzer.find_decl(name, position) {
                     if !decl.is_global() {
                         let decl_id = decl.get_id();
-                        analyzer
-                            .db
-                            .get_reference_index_mut()
-                            .add_decl_reference(decl_id, file_id, range, true);
+                        analyzer.references.add_decl_reference(decl_id, range, true);
                         decl_id
                     } else {
                         let decl = LuaDecl::new(
@@ -479,8 +472,9 @@ pub fn analyze_func_stat(analyzer: &mut DeclAnalyzer, stat: LuaFuncStat) -> Opti
 
             if let Some(decl_id) = early_owner_decl {
                 analyzer
-                    .context
-                    .add_early_member_owner_candidate(member_id, decl_id);
+                    .delta
+                    .early_member_owner_candidates
+                    .push((member_id, decl_id));
             }
 
             // `function _G.name()` declares the global `name` as well as the
@@ -491,10 +485,10 @@ pub fn analyze_func_stat(analyzer: &mut DeclAnalyzer, stat: LuaFuncStat) -> Opti
                     analyze_maybe_global_index_expr(analyzer, &index_expr, name, None)
                 && let Some(closure) = stat.get_closure()
             {
-                analyzer.context.add_early_callable_signature(
+                analyzer.delta.early_callable_signatures.push((
                     global_decl_id.into(),
                     LuaSignatureId::from_closure(analyzer.get_file_id(), &closure),
-                );
+                ));
             }
             LuaSemanticDeclId::Member(member_id)
         }
@@ -504,19 +498,19 @@ pub fn analyze_func_stat(analyzer: &mut DeclAnalyzer, stat: LuaFuncStat) -> Opti
     let file_id = analyzer.get_file_id();
     let closure_owner_id =
         LuaSemanticDeclId::Signature(LuaSignatureId::from_closure(file_id, &closure));
-    analyzer.db.get_property_index_mut().add_owner_map(
-        property_owner_id.clone(),
-        closure_owner_id,
-        file_id,
-    );
+    analyzer.ops.push(DeclOp::OwnerMap {
+        source: property_owner_id.clone(),
+        same: closure_owner_id,
+    });
     let type_owner = match property_owner_id {
         LuaSemanticDeclId::LuaDecl(decl_id) => decl_id.into(),
         LuaSemanticDeclId::Member(member_id) => member_id.into(),
         _ => return Some(()),
     };
     analyzer
-        .context
-        .add_early_callable_signature(type_owner, LuaSignatureId::from_closure(file_id, &closure));
+        .delta
+        .early_callable_signatures
+        .push((type_owner, LuaSignatureId::from_closure(file_id, &closure)));
 
     Some(())
 }
@@ -543,17 +537,18 @@ pub fn analyze_local_func_stat(analyzer: &mut DeclAnalyzer, stat: LuaLocalFuncSt
     let signature_id = LuaSignatureId::from_closure(file_id, &closure);
     let closure_owner_id = LuaSemanticDeclId::Signature(signature_id);
     let property_decl_id = LuaSemanticDeclId::LuaDecl(decl_id);
+    analyzer.ops.push(DeclOp::OwnerMap {
+        source: property_decl_id,
+        same: closure_owner_id,
+    });
+    analyzer.ops.push(DeclOp::BindLocalFuncDecl {
+        signature_id,
+        decl_id,
+    });
     analyzer
-        .db
-        .get_property_index_mut()
-        .add_owner_map(property_decl_id, closure_owner_id, file_id);
-    analyzer
-        .db
-        .get_signature_index_mut()
-        .bind_local_func_decl(signature_id, decl_id);
-    analyzer
-        .context
-        .add_early_callable_signature(decl_id.into(), signature_id);
+        .delta
+        .early_callable_signatures
+        .push((decl_id.into(), signature_id));
 
     Some(())
 }

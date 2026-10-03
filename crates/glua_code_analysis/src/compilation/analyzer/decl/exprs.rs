@@ -7,13 +7,10 @@ use glua_parser::{
 use crate::{
     EmmyrcLuaVersion, FileId, InFiled, InferFailReason, LegacyModuleEnv, LuaDeclExtra, LuaDeclId,
     LuaMemberFeature, LuaMemberId, LuaSignatureId,
-    compilation::analyzer::unresolve::UnResolveTableField,
-    db_index::{
-        LuaDecl, LuaDependencyKind, LuaDependencySite, LuaMember, LuaMemberKey, LuaMemberOwner,
-    },
+    db_index::{LuaDecl, LuaDependencyKind, LuaMember, LuaMemberKey, LuaMemberOwner},
 };
 
-use super::DeclAnalyzer;
+use super::{DeclAnalyzer, DeclOp, ops::TableFieldSite};
 
 pub fn analyze_name_expr(analyzer: &mut DeclAnalyzer, expr: LuaNameExpr) -> Option<()> {
     let name_token = expr.get_name_token()?;
@@ -40,14 +37,15 @@ pub fn analyze_name_expr(analyzer: &mut DeclAnalyzer, expr: LuaNameExpr) -> Opti
     };
 
     let is_scoped_class_global_name = analyzer.is_scoped_class_global_name(name);
-    let reference_index = analyzer.db.get_reference_index_mut();
 
     if let Some(id) = decl_id {
-        reference_index.add_decl_reference(id, file_id, range, false);
+        analyzer.references.add_decl_reference(id, range, false);
     }
 
     if !is_local && !is_scoped_class_global_name {
-        reference_index.add_global_reference(name, file_id, expr.get_syntax_id());
+        analyzer
+            .references
+            .add_global_reference(name, expr.get_syntax_id());
     }
 
     Some(())
@@ -72,7 +70,6 @@ pub fn analyze_index_expr(analyzer: &mut DeclAnalyzer, index_expr: LuaIndexExpr)
         LuaIndexKey::Idx(i) => LuaMemberKey::Integer(i as i64),
     };
 
-    let file_id = analyzer.get_file_id();
     let syntax_id = index_expr.get_syntax_id();
     let prefix = index_expr.get_prefix_expr()?;
     if let LuaExpr::NameExpr(name_expr) = prefix {
@@ -80,20 +77,14 @@ pub fn analyze_index_expr(analyzer: &mut DeclAnalyzer, index_expr: LuaIndexExpr)
         let name_token_text = name_token.get_name_text();
         if name_token_text == "_G" || name_token_text == "_ENV" {
             if let LuaMemberKey::Name(name) = &key {
-                analyzer
-                    .db
-                    .get_reference_index_mut()
-                    .add_global_reference(name, file_id, syntax_id);
+                analyzer.references.add_global_reference(name, syntax_id);
             }
 
             return Some(());
         }
     }
 
-    analyzer
-        .db
-        .get_reference_index_mut()
-        .add_index_reference(key, file_id, syntax_id);
+    analyzer.references.add_index_reference(key, syntax_id);
 
     Some(())
 }
@@ -107,8 +98,9 @@ pub fn analyze_closure_expr(analyzer: &mut DeclAnalyzer, expr: LuaClosureExpr) -
         && let Some(member_id) = member_id
     {
         analyzer
-            .context
-            .add_early_callable_signature(member_id.into(), signature_id);
+            .delta
+            .early_callable_signatures
+            .push((member_id.into(), signature_id));
     }
     try_add_self_param(analyzer, &expr);
 
@@ -144,8 +136,9 @@ pub fn analyze_closure_expr(analyzer: &mut DeclAnalyzer, expr: LuaClosureExpr) -
 
     if is_structural_inferred_guard_candidate(&expr) {
         analyzer
-            .context
-            .add_inferred_guard_candidate(InFiled::new(file_id, expr.get_syntax_id()));
+            .delta
+            .inferred_guard_candidates
+            .push(InFiled::new(file_id, expr.get_syntax_id()));
     }
 
     Some(())
@@ -246,11 +239,7 @@ fn analyze_closure_params(
     signature_id: &LuaSignatureId,
     closure: &LuaClosureExpr,
 ) -> Option<()> {
-    let signature = analyzer
-        .db
-        .get_signature_index_mut()
-        .get_or_create(*signature_id);
-    signature.is_colon_define = closure
+    let is_colon_define = closure
         .get_parent::<LuaFuncStat>()
         .and_then(|func_stat| func_stat.get_func_name())
         .is_some_and(|name| match name {
@@ -259,11 +248,28 @@ fn analyze_closure_params(
                 .is_some_and(|token| token.is_colon()),
             _ => false,
         });
-    let params = closure.get_params_list()?.get_params();
-    let mut is_vararg = false;
-    for param in params {
+    let mut signature = DeclOp::Signature {
+        id: *signature_id,
+        is_colon_define,
+        params: Vec::new(),
+        is_vararg: None,
+    };
+    let finished = closure_params(closure, &mut signature);
+    analyzer.ops.push(signature);
+    finished
+}
+
+fn closure_params(closure: &LuaClosureExpr, signature: &mut DeclOp) -> Option<()> {
+    let DeclOp::Signature {
+        params, is_vararg, ..
+    } = signature
+    else {
+        return None;
+    };
+    let mut has_dots = false;
+    for param in closure.get_params_list()?.get_params() {
         if param.is_dots() {
-            is_vararg = true;
+            has_dots = true;
         }
 
         let name = if let Some(name_token) = param.get_name_token() {
@@ -274,10 +280,10 @@ fn analyze_closure_params(
             return None;
         };
 
-        signature.params.push(name);
+        params.push(name);
     }
 
-    signature.is_vararg = is_vararg;
+    *is_vararg = Some(has_dots);
 
     Some(())
 }
@@ -316,28 +322,22 @@ pub fn analyze_table_expr(analyzer: &mut DeclAnalyzer, table_expr: LuaTableExpr)
                     }
                     LuaIndexKey::Idx(idx) => LuaMemberKey::Integer(idx as i64),
                     LuaIndexKey::Expr(field_expr) => {
-                        let unresolve_member = UnResolveTableField {
-                            file_id: analyzer.get_file_id(),
-                            table_expr: table_expr.clone(),
-                            field: field.clone(),
+                        analyzer.delta.table_fields.push(TableFieldSite {
+                            table_expr: table_expr.get_syntax_id(),
+                            field: field.get_syntax_id(),
                             decl_feature,
-                        };
-                        analyzer.context.add_unresolve(
-                            unresolve_member.into(),
-                            InferFailReason::UnResolveExpr(InFiled::new(
+                            reason: InferFailReason::UnResolveExpr(InFiled::new(
                                 analyzer.get_file_id(),
                                 field_expr.get_syntax_id(),
                             )),
-                        );
+                        });
                         continue;
                     }
                 };
 
-                analyzer.db.get_reference_index_mut().add_index_reference(
-                    key.clone(),
-                    file_id,
-                    field.get_syntax_id(),
-                );
+                analyzer
+                    .references
+                    .add_index_reference(key.clone(), field.get_syntax_id());
 
                 let member_id = LuaMemberId::new(field.get_syntax_id(), file_id);
                 let member = match &owner_id {
@@ -366,11 +366,9 @@ pub fn analyze_literal_expr(analyzer: &mut DeclAnalyzer, expr: LuaLiteralExpr) -
 
             let value = string_token.get_value();
             if value.len() <= 64 {
-                analyzer.db.get_reference_index_mut().add_string_reference(
-                    file_id,
-                    &value,
-                    string_token.get_range(),
-                );
+                analyzer
+                    .references
+                    .add_string_reference(&value, string_token.get_range());
             }
         }
         LuaLiteralToken::Dots(dots_token) => {
@@ -389,10 +387,7 @@ pub fn analyze_literal_expr(analyzer: &mut DeclAnalyzer, expr: LuaLiteralExpr) -
                 });
 
             if let Some(id) = decl_id {
-                analyzer
-                    .db
-                    .get_reference_index_mut()
-                    .add_decl_reference(id, file_id, range, false);
+                analyzer.references.add_decl_reference(id, range, false);
             }
         }
         _ => {}
@@ -410,39 +405,23 @@ pub fn analyze_call_expr(analyzer: &mut DeclAnalyzer, expr: LuaCallExpr) -> Opti
 
     let file_id = analyzer.get_file_id();
 
-    let dependency_file_id = if let Some(ref path) = dependency_path {
-        crate::compilation::analyzer::gmod::resolve_load_dependency_target(
-            analyzer.db,
-            file_id,
-            dependency_kind,
-            path,
-        )
-    } else if dependency_kind == LuaDependencyKind::AddCSLuaFile
-        && dependency_call_has_no_args(&expr)
-    {
-        // No-arg AddCSLuaFile() means "send self to client" — self-reference
-        Some(file_id)
-    } else {
-        None
-    };
+    // No-arg AddCSLuaFile() means "send self to client": a self-reference.
+    let self_reference = dependency_path.is_none()
+        && dependency_kind == LuaDependencyKind::AddCSLuaFile
+        && dependency_call_has_no_args(&expr);
     let dependency_path_keys = dependency_path
         .as_deref()
         .map(|path| crate::dependency_site_path_keys(analyzer.db, file_id, path))
         .unwrap_or_default();
 
-    analyzer
-        .db
-        .get_file_dependencies_index_mut()
-        .add_dependency_site(LuaDependencySite {
-            source_file_id: file_id,
-            target_file_id: dependency_file_id,
-            kind: dependency_kind,
-            path: dependency_path,
-            path_keys: dependency_path_keys,
-            original_expr: expr.syntax().text().to_string(),
-            call_range: expr.get_range(),
-            range: expr.get_range(),
-        });
+    analyzer.ops.push(DeclOp::Dependency {
+        kind: dependency_kind,
+        path: dependency_path,
+        self_reference,
+        path_keys: dependency_path_keys,
+        original_expr: expr.syntax().text().to_string(),
+        call_range: expr.get_range(),
+    });
 
     Some(())
 }
@@ -484,7 +463,12 @@ fn try_analyze_legacy_module_call(analyzer: &mut DeclAnalyzer, expr: &LuaCallExp
     };
 
     let remaining_args: Vec<_> = args_iter.collect();
-    let seeall = detect_seeall_from_option_args(analyzer, &remaining_args);
+    let seeall = !remaining_args.is_empty();
+    analyzer
+        .ops
+        .push(DeclOp::SeeallProbe(seeall_alias_candidates(
+            &remaining_args,
+        )));
     let call_range = expr.get_range();
     let activation_position = call_range.end();
 
@@ -527,55 +511,28 @@ fn try_analyze_legacy_module_call(analyzer: &mut DeclAnalyzer, expr: &LuaCallExp
     Some(())
 }
 
-/// Checks if any option arg to `module()` is or resolves to `package.seeall`.
-/// Defaults to true when args are present but unresolvable (safe: avoids global corruption).
-fn detect_seeall_from_option_args(analyzer: &DeclAnalyzer, args: &[LuaExpr]) -> bool {
-    if args.is_empty() {
-        return false;
-    }
-
+/// The globals among a `module()` call's option arguments that may alias
+/// `package.seeall`: the names before the first argument that is it. Any
+/// option argument makes the module see all globals, whether or not it
+/// resolves, so the check is for the reads it makes.
+fn seeall_alias_candidates(args: &[LuaExpr]) -> Vec<String> {
+    let mut names = Vec::new();
     for arg in args {
         if is_package_seeall_expr(arg) {
-            return true;
+            break;
         }
-
-        if let LuaExpr::NameExpr(name_expr) = arg {
-            if is_name_alias_of_package_seeall(analyzer, name_expr) {
-                return true;
-            }
-        }
-    }
-
-    true
-}
-
-/// Checks if a NameExpr resolves to a global assigned `package.seeall`.
-fn is_name_alias_of_package_seeall(analyzer: &DeclAnalyzer, name_expr: &LuaNameExpr) -> bool {
-    let name = name_expr.get_name_text().unwrap_or_default();
-    if name.is_empty() {
-        return false;
-    }
-
-    if let Some(decl_ids) = analyzer.db.get_global_index().get_global_decl_ids(&name) {
-        for decl_id in decl_ids {
-            if let Some(tree_item) = analyzer
-                .context
-                .tree_list
-                .iter()
-                .find(|t| t.file_id == decl_id.file_id)
-            {
-                if check_assign_value_is_package_seeall(&tree_item.value, decl_id.position) {
-                    return true;
-                }
-            }
+        if let LuaExpr::NameExpr(name_expr) = arg
+            && let Some(name) = name_expr.get_name_text()
+            && !name.is_empty()
+        {
+            names.push(name.to_string());
         }
     }
-
-    false
+    names
 }
 
 /// Finds the assignment/local statement at `position` and checks if its value is `package.seeall`.
-fn check_assign_value_is_package_seeall(
+pub(super) fn check_assign_value_is_package_seeall(
     tree: &glua_parser::LuaChunk,
     position: rowan::TextSize,
 ) -> bool {
