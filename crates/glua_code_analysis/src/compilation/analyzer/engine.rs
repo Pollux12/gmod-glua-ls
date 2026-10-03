@@ -2577,9 +2577,7 @@ mod tests {
         digest
     }
 
-    #[test]
-    fn recorded_call_targets_match_serial_evaluation_cold_and_after_an_edit() {
-        let library = r#"
+    const INVENTORY: &str = r#"
             Inventory = Inventory or {}
             local META = {}
             META.__index = META
@@ -2593,12 +2591,10 @@ mod tests {
             end
             function Inventory.Format(value) return tostring(value) end
         "#;
-        let edited = library.replace(
-            "function Inventory.Format(value) return tostring(value) end",
-            "function Inventory.Format(value) return value * 2 end
-            function Inventory.Clear(inv) inv.items = {} end",
-        );
-        let shops = (0..10)
+
+    /// Shops that fill an [`INVENTORY`] and print from it, by path.
+    fn inventory_shops() -> Vec<(String, String)> {
+        (0..10)
             .map(|index| {
                 (
                     format!("lua/autorun/server/sv_shop_{index}.lua"),
@@ -2614,13 +2610,29 @@ mod tests {
                     ),
                 )
             })
-            .collect::<Vec<_>>();
-        let mut files = vec![("lua/autorun/sh_inventory.lua", library)];
-        files.extend(
-            shops
-                .iter()
-                .map(|(path, text)| (path.as_str(), text.as_str())),
+            .collect()
+    }
+
+    /// The inventory library with `shops`, by path.
+    fn inventory_files(shops: &[(String, String)]) -> Vec<(&str, &str)> {
+        std::iter::once(("lua/autorun/sh_inventory.lua", INVENTORY))
+            .chain(
+                shops
+                    .iter()
+                    .map(|(path, text)| (path.as_str(), text.as_str())),
+            )
+            .collect()
+    }
+
+    #[test]
+    fn recorded_call_targets_match_serial_evaluation_cold_and_after_an_edit() {
+        let edited = INVENTORY.replace(
+            "function Inventory.Format(value) return tostring(value) end",
+            "function Inventory.Format(value) return value * 2 end
+            function Inventory.Clear(inv) inv.items = {} end",
         );
+        let shops = inventory_shops();
+        let files = inventory_files(&shops);
         let edits = [("lua/autorun/sh_inventory.lua", edited.as_str())];
         let published = || WORKER_PUBLISHED.with(std::cell::Cell::get);
         let analyse = |threads: usize| {
@@ -2654,6 +2666,35 @@ mod tests {
         );
         assert_eq!(serial.0, recorded.0);
         assert_eq!(serial.1, recorded.1);
+    }
+
+    /// Each shop's dynamic fields infer `print` first, under the collecting
+    /// view that reads no dynamic field; its call targets, which see dynamic
+    /// fields, must still read the missing global's.
+    #[test]
+    fn call_targets_read_a_missing_globals_dynamic_field_after_the_collecting_pass() {
+        let shops = inventory_shops();
+        let threads = parallel::THREADS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        parallel::set_analysis_threads(1);
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(inventory_files(&shops));
+        parallel::set_analysis_threads(0);
+        drop(threads);
+        let read = FactKey::DynamicField(
+            crate::DynamicFieldOwner::GlobalPath(crate::GlobalId::new("print")),
+            Some("print".into()),
+        );
+        let graph = ws.get_db_mut().reader_graph();
+        let readers = graph
+            .derivations()
+            .filter(|id| {
+                id.kind == DerivationKind::CallTargets
+                    && graph.reads_of(*id).any(|key| *key.key() == read)
+            })
+            .count();
+        assert_eq!(readers, shops.len());
     }
 
     /// Readers of `REGISTRY[...]` on both sides of the file whose dynamic

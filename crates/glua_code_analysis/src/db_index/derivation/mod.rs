@@ -24,10 +24,12 @@ use rustc_hash::FxHashSet;
 
 mod paged;
 pub use frames::{
-    Gates, OpenFrame, Provenance, Reuse, ScopeMark, check_cache, close_frame, consult_absorbed,
-    consult_cycle, consult_gates, consult_realm, consult_scope, consult_unkeyed, frame_depth,
-    new_stamp, note_recomputed, note_recomputing, note_written, open_frame, open_frame_absorbing,
-    open_frame_viewed, report_frames, reuse, scope_mark, taint, take_reused_across,
+    CALL_SITE_PARAMS_GATE, DIAGNOSTICS_PHASE_GATE, DYNAMIC_FIELDS_GATE, FORCE_PHASE_GATE, Gates,
+    ORDERED_PHASE_GATE, OpenFrame, Provenance, Reuse, ScopeMark, check_cache, close_frame,
+    consult_absorbed, consult_cycle, consult_gates, consult_realm, consult_scope, consult_unkeyed,
+    frame_depth, new_stamp, note_recomputed, note_recomputing, note_written, open_frame,
+    open_frame_absorbing, open_frame_viewed, report_frames, reuse, scope_mark, taint,
+    take_reused_across,
 };
 
 /// A value an analyzer derivation stores on the index without the index
@@ -2156,7 +2158,10 @@ pub fn take_reruns() -> Vec<DerivationId> {
 
 /// Whether member listings on this thread include dynamic fields: everywhere
 /// but in the pass that collects them, which must not read what it builds.
+/// The open frames consult the view's dynamic-field gate, so a memo answered
+/// either way holds only under a view that answers the same.
 pub fn dynamic_fields_visible() -> bool {
+    consult_gates(DYNAMIC_FIELDS_GATE);
     current().is_none_or(|id| id.kind != DerivationKind::DynamicFields)
 }
 

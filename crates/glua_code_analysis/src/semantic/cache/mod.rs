@@ -13,7 +13,10 @@ use smol_str::SmolStr;
 use std::sync::Arc;
 pub use tracked::{Lookup, TrackedMap, Untracked};
 
-use crate::db_index::derivation::{self, Gates, OpenFrame, Provenance, Reuse};
+use crate::db_index::derivation::{
+    self, CALL_SITE_PARAMS_GATE, DIAGNOSTICS_PHASE_GATE, DYNAMIC_FIELDS_GATE, FORCE_PHASE_GATE,
+    Gates, ORDERED_PHASE_GATE, OpenFrame, Provenance, Reuse,
+};
 use crate::{
     DbIndex, FileId, FlowId, GmodRealm, InFiled, LuaDeclId, LuaFunctionType, LuaMemberId,
     LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, VarRefId, VarRefRootId,
@@ -23,13 +26,6 @@ use crate::{
         infer::{InferFailReason, ParamInferenceSource},
     },
 };
-
-const DYNAMIC_FIELDS_GATE: Gates = 1;
-const CALL_SITE_PARAMS_GATE: Gates = 2;
-/// One gate per analysis phase that inference answers differently under.
-const ORDERED_PHASE_GATE: Gates = 4;
-const FORCE_PHASE_GATE: Gates = 8;
-const DIAGNOSTICS_PHASE_GATE: Gates = 16;
 
 pub type MemberQueryLocalKey = (LuaSyntaxId, LuaType, Option<GmodRealm>, Gates);
 

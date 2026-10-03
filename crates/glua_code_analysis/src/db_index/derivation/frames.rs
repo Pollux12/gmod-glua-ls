@@ -23,6 +23,13 @@ use crate::GmodRealm;
 /// Bits of a cache's view that inference can consult.
 pub type Gates = u8;
 
+pub const DYNAMIC_FIELDS_GATE: Gates = 1;
+pub const CALL_SITE_PARAMS_GATE: Gates = 2;
+/// One gate per analysis phase that inference answers differently under.
+pub const ORDERED_PHASE_GATE: Gates = 4;
+pub const FORCE_PHASE_GATE: Gates = 8;
+pub const DIAGNOSTICS_PHASE_GATE: Gates = 16;
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Frame {
     start: u32,
