@@ -11,7 +11,7 @@ use crate::{
     db_index::{LuaDeclTypeKind, LuaTypeFlag},
 };
 
-use super::DeclAnalyzer;
+use super::{DeclAnalyzer, DeclOp};
 
 pub fn analyze_doc_tag_class(analyzer: &mut DeclAnalyzer, class: LuaDocTagClass) -> Option<()> {
     let name_token = class.get_name_token()?;
@@ -102,11 +102,8 @@ pub fn analyze_doc_tag_namespace(
 ) -> Option<()> {
     let name = namespace.get_name_token()?.get_name_text().to_string();
 
-    let file_id = analyzer.get_file_id();
-    analyzer
-        .db
-        .get_type_index_mut()
-        .add_file_namespace(file_id, name);
+    analyzer.file_namespace = Some(name.clone());
+    analyzer.ops.push(DeclOp::FileNamespace(name));
 
     Some(())
 }
@@ -114,29 +111,22 @@ pub fn analyze_doc_tag_namespace(
 pub fn analyze_doc_tag_using(analyzer: &mut DeclAnalyzer, using: LuaDocTagUsing) -> Option<()> {
     let name = using.get_name_token()?.get_name_text().to_string();
 
-    let file_id = analyzer.get_file_id();
-    analyzer
-        .db
-        .get_type_index_mut()
-        .add_file_using_namespace(file_id, name);
+    analyzer.ops.push(DeclOp::FileUsingNamespace(name));
 
     Some(())
 }
 
 pub fn analyze_doc_tag_meta(analyzer: &mut DeclAnalyzer, tag: LuaDocTagMeta) -> Option<()> {
     let file_id = analyzer.get_file_id();
-    analyzer.db.get_module_index_mut().set_meta(file_id);
+    analyzer.ops.push(DeclOp::ModuleMeta);
     analyzer.is_meta = true;
-    analyzer.context.add_meta(file_id);
+    analyzer.delta.meta = true;
 
     if let Some(name_token) = tag.get_name_token() {
         let text = name_token.get_name_text();
         // compact luals
         if text == "no-require" || text == "_" {
-            analyzer
-                .db
-                .get_module_index_mut()
-                .set_module_visibility(file_id, false);
+            analyzer.ops.push(DeclOp::ModuleHidden);
         } else {
             let workspace_id = analyzer
                 .db
@@ -144,11 +134,10 @@ pub fn analyze_doc_tag_meta(analyzer: &mut DeclAnalyzer, tag: LuaDocTagMeta) -> 
                 .get_module(file_id)?
                 .workspace_id;
 
-            analyzer
-                .db
-                .get_module_index_mut()
-                .add_module_by_module_path(file_id, text.to_string(), workspace_id);
-            analyzer.db.get_module_index_mut().set_meta(file_id);
+            analyzer.ops.push(DeclOp::ModuleName {
+                name: text.to_string(),
+                workspace_id,
+            });
         }
     }
 
@@ -167,10 +156,7 @@ pub fn analyze_doc_tag_meta(analyzer: &mut DeclAnalyzer, tag: LuaDocTagMeta) -> 
         version_conds.push(version_condition);
     }
 
-    analyzer
-        .db
-        .get_module_index_mut()
-        .set_module_version_conds(file_id, version_conds);
+    analyzer.ops.push(DeclOp::ModuleVersions(version_conds));
 
     Some(())
 }
@@ -183,11 +169,10 @@ fn add_type_decl(
     flag: FlagSet<LuaTypeFlag>,
 ) {
     let file_id = analyzer.get_file_id();
-    let type_index = analyzer.db.get_type_index_mut();
-
     let basic_name = name;
-    let option_namespace = type_index.get_file_namespace(&file_id);
-    let full_name = option_namespace
+    let full_name = analyzer
+        .file_namespace
+        .as_ref()
         .map(|ns| format!("{}.{}", ns, basic_name))
         .unwrap_or(basic_name.to_string());
     let id = if flag.contains(LuaTypeFlag::Private) {
@@ -196,8 +181,12 @@ fn add_type_decl(
         LuaTypeDeclId::global(&full_name)
     };
     let simple_name = id.get_simple_name();
-    type_index.add_type_decl(
+    analyzer.ops.push(DeclOp::TypeDecl(LuaTypeDecl::new(
         file_id,
-        LuaTypeDecl::new(file_id, range, simple_name.to_string(), kind, flag, id),
-    );
+        range,
+        simple_name.to_string(),
+        kind,
+        flag,
+        id,
+    )));
 }
