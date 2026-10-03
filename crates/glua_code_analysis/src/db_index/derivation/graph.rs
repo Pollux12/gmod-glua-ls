@@ -767,6 +767,16 @@ impl KeyTable {
     }
 }
 
+/// What [`ReaderGraph::apply_edits`] did to the recorded reads.
+#[derive(Debug, Default)]
+pub struct AppliedEdits {
+    /// The readers of keys the edits destroyed.
+    pub lost: Vec<DerivationId>,
+    /// The keys whose reads moved, each read still holding the fingerprint
+    /// it saw before the edits.
+    pub moved: Vec<HashedKey>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ReaderGraph {
     table: KeyTable,
@@ -1300,9 +1310,8 @@ impl ReaderGraph {
     }
 
     /// Renames every recorded read of a key `edits` moved to the key's new
-    /// position, keeping the fingerprint the reader saw. Returns the readers
-    /// of keys the edits destroyed.
-    pub fn apply_edits(&mut self, edits: &EditMaps) -> Vec<DerivationId> {
+    /// position, keeping the fingerprint the reader saw.
+    pub fn apply_edits(&mut self, edits: &EditMaps) -> AppliedEdits {
         let files: FxHashSet<FileId> = edits.files().collect();
         let mut renames = Vec::new();
         let mut lost = Vec::new();
@@ -1346,7 +1355,9 @@ impl ReaderGraph {
             .collect::<Vec<_>>();
         let mut rewrites: FxHashMap<DerivIdx, FxHashMap<KeyIdx, KeyIdx>> = FxHashMap::default();
         let mut vacated = Vec::with_capacity(moved.len());
+        let mut moved_to = Vec::with_capacity(moved.len());
         for (slot, new_key, readers) in moved {
+            moved_to.push(new_key.clone());
             let target = self.intern_key(new_key);
             for (seen, deriv) in readers.iter() {
                 self.table.keys[target as usize].readers.insert(deriv, seen);
@@ -1371,7 +1382,10 @@ impl ReaderGraph {
         }
         lost.sort();
         lost.dedup();
-        lost
+        AppliedEdits {
+            lost,
+            moved: moved_to,
+        }
     }
 
     /// Every key some derivation read.
