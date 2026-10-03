@@ -634,6 +634,38 @@ mod tests {
         graph.restore_keys(table);
     }
 
+    /// Two evaluations of one epoch read a key the snapshot lacks, and the one
+    /// that began later publishes first: the earlier one's memo still holds.
+    #[test]
+    fn parallel_transport_a_key_new_to_the_snapshot_dates_from_the_epoch() {
+        let mut graph = ReaderGraph::default();
+        graph.intern_read(key(99));
+        let (snapshot, guard) = snapshot(graph);
+        let read = || {
+            let frame = derivation::open_frame().unwrap();
+            derivation::note_read(|| key(1).key().clone());
+            derivation::close_frame(frame, 0).unwrap()
+        };
+        let early = compute_recorded(&snapshot, id(), read, |_| 17);
+        let late = compute_recorded(&snapshot, id(), read, |_| 17);
+        let mut graph = recover(snapshot);
+        let mut table = graph.lend_keys();
+        let late = late.evaluation.canonicalise(&mut table).unwrap();
+        let early_evaluation = early.evaluation.canonicalise(&mut table).unwrap();
+        derivation::lend_keys(table);
+        for evaluation in [late, early_evaluation] {
+            derivation::resume(evaluation);
+            derivation::end();
+        }
+        derivation::note_written([key(99)]);
+        derivation::begin(id());
+        assert_eq!(derivation::reuse(&early.value, 0, &[], None), Reuse::Held);
+        derivation::end();
+        let mut table = derivation::take_keys();
+        guard.finish(&mut table);
+        graph.restore_keys(table);
+    }
+
     #[test]
     fn parallel_transport_worker_replay_visitation_is_independent_for_concurrent_clones() {
         let (graph, proof) = canonical_proof();

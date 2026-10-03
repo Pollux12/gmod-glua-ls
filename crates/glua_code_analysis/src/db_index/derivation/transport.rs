@@ -198,7 +198,7 @@ impl WorkerKeys {
         let new_slots = self
             .new_keys
             .into_iter()
-            .map(|key| table.intern_worker_read(key, stamp))
+            .map(|key| table.intern_worker_read(key))
             .collect::<Vec<_>>();
         Some(
             self.entries

@@ -540,8 +540,10 @@ impl KeyTable {
         self.intern(key, now)
     }
 
-    pub(super) fn intern_worker_read(&mut self, key: HashedKey, now: u64) -> KeyIdx {
-        let slot = self.intern(key, now);
+    /// Interns a key a worker read that its snapshot lacked: created when the
+    /// release epoch began, whichever evaluation of the epoch publishes it first.
+    pub(super) fn intern_worker_read(&mut self, key: HashedKey) -> KeyIdx {
+        let slot = self.intern(key, self.retirement_started);
         let mut base = self.key(slot).base();
         while let Some(key) = base {
             let key = HashedKey::new(key);
