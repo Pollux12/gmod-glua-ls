@@ -2656,6 +2656,71 @@ mod tests {
         assert_eq!(serial.1, recorded.1);
     }
 
+    /// Readers of `REGISTRY[...]` on both sides of the file whose dynamic
+    /// fields make `REGISTRY` a wildcard owner: each reader's dynamic fields
+    /// infer the entry through that wildcard state, which the registry file's
+    /// dynamic fields write in the same batch.
+    #[test]
+    fn dynamic_fields_reading_a_peers_wildcard_owner_match_serial_and_warm_analysis() {
+        let registry = r#"
+            REGISTRY = REGISTRY or {}
+            function Register(name)
+                REGISTRY[name] = { damage = 1 }
+            end
+            Register("pistol")
+        "#;
+        let readers = (0..10)
+            .map(|index| {
+                (
+                    format!("lua/autorun/sh_reader_{index}.lua"),
+                    format!(
+                        "local entry = REGISTRY[\"pistol\"]
+entry.extra{index} = {index}
+print(entry.extra{index}, entry.damage)"
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut files = readers
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .chain([("lua/autorun/sh_reader_4_registry.lua", registry)])
+            .collect::<Vec<_>>();
+        files.sort();
+        let published = || WORKER_PUBLISHED.with(std::cell::Cell::get);
+        let analyse = |threads: usize| {
+            parallel::set_analysis_threads(threads);
+            let start = published();
+            let mut ws = VirtualWorkspace::new();
+            ws.def_files(files.clone());
+            (
+                ws.settled_digest(),
+                recorded_digest(&mut ws),
+                published() - start,
+            )
+        };
+        let threads = parallel::THREADS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let serial = analyse(1);
+        let recorded = analyse(4);
+        parallel::set_analysis_threads(1);
+        let mut warm = VirtualWorkspace::new();
+        for (path, text) in &files {
+            warm.def_file(path, text);
+        }
+        let warm = warm.settled_digest();
+        parallel::set_analysis_threads(0);
+        drop(threads);
+        assert_eq!(serial.2, 0);
+        assert!(
+            recorded.2 > 0,
+            "no dynamic fields were published from workers"
+        );
+        assert_eq!(serial.1, recorded.1);
+        assert_eq!(recorded.0, warm);
+    }
+
     fn statement(start: u32) -> DerivationId {
         DerivationId::new(
             DerivationKind::LocalStat,

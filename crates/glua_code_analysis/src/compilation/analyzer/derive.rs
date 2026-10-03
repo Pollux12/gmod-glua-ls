@@ -122,8 +122,7 @@ impl super::engine::Recipe for Recipes {
         // Call-site contributions are collected with call-site facts invisible;
         // net helpers read other files' helper scans, and net flows their net
         // helpers: no file's computation reads what another's of its kind writes.
-        // Dynamic fields are collected with dynamic fields invisible. Helper
-        // and valid-guard scans read source facts and the folds over other
+        // Helper and valid-guard scans read source facts and the folds over other
         // kinds; gmod metadata reads the source layer, call targets and call
         // roles, which no gmod pre pass writes.
         matches!(
@@ -131,7 +130,6 @@ impl super::engine::Recipe for Recipes {
             DerivationKind::CallSiteParams
                 | DerivationKind::NetHelpers
                 | DerivationKind::Network
-                | DerivationKind::DynamicFields
                 | DerivationKind::GmodLoadCallSites
                 | DerivationKind::GmodClassCallSites
                 | DerivationKind::LocalFallbacks
@@ -142,7 +140,12 @@ impl super::engine::Recipe for Recipes {
     }
 
     fn records_on_workers(&self, kind: DerivationKind) -> bool {
-        kind == DerivationKind::CallTargets
+        // A file's dynamic fields infer through owners whose wildcard and
+        // finite-name state another file's dynamic fields write.
+        matches!(
+            kind,
+            DerivationKind::CallTargets | DerivationKind::DynamicFields
+        )
     }
 
     fn compute(&self, db: &DbIndex, id: DerivationId) -> Box<dyn std::any::Any + Send> {
@@ -315,6 +318,7 @@ impl super::engine::Recipe for Recipes {
                 db.queries().recompute(db, id);
             }
             DerivationKind::LocalFallbacks
+            | DerivationKind::DynamicFields
             | DerivationKind::GmodHelperScan
             | DerivationKind::ValidGuardScan
             | DerivationKind::GmodPre => {
@@ -426,9 +430,6 @@ impl Recipes {
             DerivationKind::GmodClassCallSites => gmod::evaluate_class_call_sites(db, context),
             DerivationKind::GmodPost => gmod::evaluate_post(db, context),
             DerivationKind::AccessorFunc => synthesize_accessorfunc_members(db, &file_ids),
-            DerivationKind::DynamicFields => {
-                dynamic_field::DynamicFieldAnalysisPipeline::analyze(db, context)
-            }
             DerivationKind::SetmetatableFactory => {
                 setmetatable_factory::synthesize_setmetatable_factory_members(db, &file_ids)
             }
@@ -445,6 +446,7 @@ impl Recipes {
             DerivationKind::Network => gmod::evaluate_network(db, context),
             DerivationKind::Source
             | DerivationKind::LocalFallbacks
+            | DerivationKind::DynamicFields
             | DerivationKind::GmodPre
             | DerivationKind::GmodHelperScan
             | DerivationKind::NetHelpers
