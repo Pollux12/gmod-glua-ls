@@ -306,6 +306,12 @@ pub enum FactKey {
     GmodMeta(SmolStr),
     /// A file's gmod class call metadata.
     GmodClassFile(FileId),
+    /// The base class a file's `DEFINE_BASECLASS` calls name, read out of its
+    /// [`FactKey::GmodClassFile`].
+    GmodBaseClass(FileId),
+    /// A file's `vgui.Register` and `derma.DefineControl` calls, read out of
+    /// its [`FactKey::GmodClassFile`].
+    GmodVguiRegistrations(FileId),
     /// The set of files that have vgui parent calls.
     VguiParentCallFiles,
     /// A vgui panel's parent chain.
@@ -685,6 +691,7 @@ impl FactKey {
                 | FactKey::Signature(_)
                 | FactKey::ReferencesByName(_)
                 | FactKey::SpecialCallFile(_)
+                | FactKey::GmodClassFile(_)
         )
     }
 
@@ -700,6 +707,9 @@ impl FactKey {
             FactKey::SignatureDecl(signature_id) => Some(FactKey::Signature(*signature_id)),
             FactKey::IndexReferenceFiles(name) => Some(FactKey::ReferencesByName(name.clone())),
             FactKey::SpecialCallFor(file_id, _) => Some(FactKey::SpecialCallFile(*file_id)),
+            FactKey::GmodBaseClass(file_id) | FactKey::GmodVguiRegistrations(file_id) => {
+                Some(FactKey::GmodClassFile(*file_id))
+            }
             _ => None,
         }
     }
@@ -757,6 +767,8 @@ impl FactKey {
             | K::OperatorFile(file_id)
             | K::MetatableFactory(file_id)
             | K::GmodClassFile(file_id)
+            | K::GmodBaseClass(file_id)
+            | K::GmodVguiRegistrations(file_id)
             | K::GmodInferFile(file_id)
             | K::GmodRealm(file_id)
             | K::GmodLoadFile(file_id)

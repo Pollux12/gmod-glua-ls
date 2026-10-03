@@ -538,6 +538,16 @@ impl GmodClassMetadataIndex {
             FactKey::GmodClassFile(file_id) => {
                 derivation::fingerprint_opt(self.file_metadata.get(file_id))
             }
+            FactKey::GmodBaseClass(file_id) => self
+                .define_baseclass_name(file_id)
+                .map_or(derivation::ABSENT, derivation::fingerprint_of),
+            FactKey::GmodVguiRegistrations(file_id) => {
+                let mut calls = self.vgui_registrations(file_id).peekable();
+                if calls.peek().is_none() {
+                    return derivation::ABSENT;
+                }
+                derivation::fingerprint_of(&calls.collect::<Vec<_>>())
+            }
             FactKey::VguiParentCallFiles => self.vgui_parent_call_files.get(),
             FactKey::VguiChain(type_id) => {
                 let chain = self.vgui_panel_parent_chains.get(type_id);
@@ -944,7 +954,36 @@ impl GmodClassMetadataIndex {
     }
 
     pub fn get_define_baseclass_name(&self, file_id: &FileId) -> Option<&str> {
-        self.get_file_metadata(file_id)?.get_define_baseclass_name()
+        derivation::note_read(|| FactKey::GmodBaseClass(*file_id));
+        self.define_baseclass_name(file_id)
+    }
+
+    fn define_baseclass_name(&self, file_id: &FileId) -> Option<&str> {
+        self.file_metadata.get(file_id)?.get_define_baseclass_name()
+    }
+
+    /// A file's `derma.DefineControl` calls, then its `vgui.Register` calls.
+    pub fn get_vgui_registrations(
+        &self,
+        file_id: &FileId,
+    ) -> impl Iterator<Item = &GmodScriptedClassCallMetadata> {
+        derivation::note_read(|| FactKey::GmodVguiRegistrations(*file_id));
+        self.vgui_registrations(file_id)
+    }
+
+    fn vgui_registrations(
+        &self,
+        file_id: &FileId,
+    ) -> impl Iterator<Item = &GmodScriptedClassCallMetadata> {
+        self.file_metadata
+            .get(file_id)
+            .into_iter()
+            .flat_map(|metadata| {
+                metadata
+                    .derma_define_control_calls
+                    .iter()
+                    .chain(&metadata.vgui_register_calls)
+            })
     }
 
     /// Every file's metadata, unordered and unrecorded: for editor requests,
@@ -1284,5 +1323,68 @@ mod tests {
         assert_eq!(index.file_metadata, expected.file_metadata);
         assert_eq!(index.vgui_panels, expected.vgui_panels);
         assert_eq!(index.derma_skins, expected.derma_skins);
+    }
+
+    /// Readers of a file's base class and of its panel registrations record
+    /// those, read out of the file's class calls: another kind of call landing
+    /// holds both, and each moves with its own calls.
+    #[test]
+    fn a_class_call_of_another_kind_holds_readers_of_the_base_class_and_registrations() {
+        use crate::db_index::derivation::{self, FactKey};
+
+        let mut index = GmodClassMetadataIndex::new();
+        let file = FileId::new(1);
+        derivation::begin(derivation::DerivationId::workspace(
+            derivation::DerivationKind::GmodLoad,
+        ));
+        assert!(index.get_define_baseclass_name(&file).is_none());
+        assert!(index.get_vgui_registrations(&file).next().is_none());
+        let reads = derivation::end().into_recorded().2;
+        let file_calls = FactKey::GmodClassFile(file);
+        assert!(file_calls.is_base());
+        assert_eq!(reads.len(), 2);
+        assert!(
+            reads
+                .iter()
+                .all(|read| read.base() == Some(file_calls.clone()))
+        );
+        let fingerprints = |index: &GmodClassMetadataIndex| {
+            reads
+                .iter()
+                .map(|read| derivation::in_file(Some(file), || index.fact_fingerprint(read)))
+                .collect::<Vec<_>>()
+        };
+        let seen = fingerprints(&index);
+
+        index.add_call(
+            file,
+            GmodScriptedClassCallKind::AccessorFunc,
+            vgui_register_call("GetValue", "Value", 10),
+        );
+        assert_ne!(
+            derivation::in_file(Some(file), || index.fact_fingerprint(&file_calls)),
+            derivation::ABSENT
+        );
+        assert_eq!(fingerprints(&index), seen);
+
+        index.add_call(
+            file,
+            GmodScriptedClassCallKind::DefineBaseClass,
+            vgui_register_call("base_anim", "", 20),
+        );
+        let moved = |before: &[u64], after: &[u64]| {
+            before.iter().zip(after).filter(|(b, a)| b != a).count()
+        };
+        let based = fingerprints(&index);
+        assert_eq!(moved(&seen, &based), 1);
+
+        index.add_call(
+            file,
+            GmodScriptedClassCallKind::VguiRegister,
+            vgui_register_call("Panel", "DFrame", 30),
+        );
+        assert_eq!(moved(&based, &fingerprints(&index)), 1);
+        assert_eq!(index.get_define_baseclass_name(&file), Some("base_anim"));
+        assert_eq!(index.get_vgui_registrations(&file).count(), 1);
     }
 }

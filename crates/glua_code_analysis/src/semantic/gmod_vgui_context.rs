@@ -33,21 +33,15 @@ pub(crate) fn resolve_registered_vgui_method_context_for_func(
     file_id: FileId,
     func_stat: &LuaFuncStat,
 ) -> Option<RegisteredVguiMethodContext> {
-    let metadata = db.get_gmod_class_metadata_index();
-    let file_metadata = metadata.get_file_metadata(&file_id)?;
-    if file_metadata.derma_define_control_calls.is_empty()
-        && file_metadata.vgui_register_calls.is_empty()
-    {
-        return None;
-    }
+    let mut registrations = db
+        .get_gmod_class_metadata_index()
+        .get_vgui_registrations(&file_id)
+        .peekable();
+    registrations.peek()?;
     let (receiver_decl_id, receiver_position, receiver_signature_id) =
         panel_receiver_context_for_func(db, file_id, func_stat)?;
 
-    for call in file_metadata
-        .derma_define_control_calls
-        .iter()
-        .chain(file_metadata.vgui_register_calls.iter())
-    {
+    for call in registrations {
         let Some((table_decl_id, region_start, register_position)) =
             resolve_call_table_registration_region(db, file_id, call)
         else {

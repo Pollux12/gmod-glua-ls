@@ -495,9 +495,12 @@ impl DbIndex {
                 self.operator_index.fact_fingerprint(key)
             }
             K::Metatable(_) | K::MetatableFactory(_) => self.metatable_index.fact_fingerprint(key),
-            K::GmodMeta(_) | K::GmodClassFile(_) | K::VguiChain(_) | K::VguiParentCallFiles => {
-                self.gmod_class_index.fact_fingerprint(key)
-            }
+            K::GmodMeta(_)
+            | K::GmodClassFile(_)
+            | K::GmodBaseClass(_)
+            | K::GmodVguiRegistrations(_)
+            | K::VguiChain(_)
+            | K::VguiParentCallFiles => self.gmod_class_index.fact_fingerprint(key),
             K::GmodInferFile(_)
             | K::GmodRealm(_)
             | K::GmodRealmAt(..)
