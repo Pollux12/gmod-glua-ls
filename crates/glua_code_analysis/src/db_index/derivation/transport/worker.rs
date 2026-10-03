@@ -583,6 +583,7 @@ mod tests {
                 let frame = derivation::open_frame().unwrap();
                 let handle = FactRead::default();
                 assert!(handle.recomputes(&owner));
+                assert!(derivation::recomputes(fact.key().clone()));
                 handle.note(|| fact.key().clone(), |key| key == fact.key());
                 assert!(derivation::close_frame(frame, 0).is_none());
             },

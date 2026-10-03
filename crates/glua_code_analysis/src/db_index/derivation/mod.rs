@@ -2095,6 +2095,13 @@ pub fn writes_fallback_of(file_id: FileId) -> bool {
 /// Whether the evaluation recording on this thread computes `key` again: it
 /// produced it before, and the engine reset it for this run.
 pub fn recomputes(key: FactKey) -> bool {
+    if let Some(windowed) = transport::with_snapshot(|graph| {
+        graph
+            .find_slot(&HashedKey::new(key.clone()))
+            .is_some_and(|slot| graph.keys().windowed(slot))
+    }) {
+        return windowed;
+    }
     KEYS.with(|keys| {
         keys.borrow().as_ref().is_some_and(|table| {
             table
