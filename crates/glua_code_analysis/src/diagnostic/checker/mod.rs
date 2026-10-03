@@ -339,9 +339,13 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Under `GLUALS_PROFILE_PHASE`: prints one file's diagnose time and its three
-/// slowest checkers, then clears this thread's checker times.
-pub fn report_file_profile(path: &str, elapsed: std::time::Duration) {
+/// Under `GLUALS_PROFILE_PHASE`: prints one file's diagnose wall and CPU time
+/// and its three slowest checkers, then clears this thread's checker times.
+pub fn report_file_profile(
+    path: &str,
+    elapsed: std::time::Duration,
+    cpu: Option<std::time::Duration>,
+) {
     let mut times = FILE_CHECKER_TIMES.with_borrow_mut(std::mem::take);
     times.sort_unstable_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(right.0)));
     let top = times
@@ -353,8 +357,12 @@ pub fn report_file_profile(path: &str, elapsed: std::time::Duration) {
         })
         .collect::<Vec<_>>()
         .join(" ");
+    let cpu = cpu.map_or_else(
+        || "-".to_string(),
+        |cpu| format!("{:.3}", cpu.as_secs_f64() * 1000.0),
+    );
     eprintln!(
-        "[diagfile] {:>9.3}ms {path} | {top}",
+        "[diagfile] {:>9.3}ms cpu={cpu}ms {path} | {top}",
         elapsed.as_secs_f64() * 1000.0
     );
 }

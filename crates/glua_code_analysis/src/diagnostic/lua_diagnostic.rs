@@ -526,7 +526,8 @@ impl LuaDiagnostic {
         {
             return None;
         }
-        let profile_start = crate::profile::phase_enabled().then(Instant::now);
+        let profile_start = crate::profile::phase_enabled()
+            .then(|| (Instant::now(), crate::profile::cpu::thread_cpu_time()));
 
         let config = self.get_config_for_file(compilation, file_id);
 
@@ -560,14 +561,17 @@ impl LuaDiagnostic {
         }
 
         let diagnostics = context.get_diagnostics();
-        if let Some(profile_start) = profile_start {
+        if let Some((wall_start, cpu_start)) = profile_start {
             drop(semantic_model);
             let path = db
                 .get_vfs()
                 .get_file_path(&file_id)
                 .map(|path| path.to_string_lossy().to_string())
                 .unwrap_or_else(|| format!("{file_id:?}"));
-            super::checker::report_file_profile(&path, profile_start.elapsed());
+            let cpu = cpu_start
+                .zip(crate::profile::cpu::thread_cpu_time())
+                .map(|(start, end)| end.saturating_sub(start));
+            super::checker::report_file_profile(&path, wall_start.elapsed(), cpu);
         }
         Some(diagnostics)
     }
