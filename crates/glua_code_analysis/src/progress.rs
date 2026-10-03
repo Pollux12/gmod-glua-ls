@@ -103,7 +103,6 @@ pub fn phase_label(pipeline_type_name: &str) -> &str {
     match pipeline_type_name {
         "DeclAnalysisPipeline" => "Collecting declarations",
         "DocAnalysisPipeline" => "Reading annotations",
-        "FlowAnalysisPipeline" => "Building control flow",
         "GmodPreAnalysisPipeline" => "Resolving GMod metadata",
         "LuaAnalysisPipeline" => "Inferring types",
         "EarlyDynamicFieldAnalysisPipeline" | "DynamicFieldAnalysisPipeline" => {

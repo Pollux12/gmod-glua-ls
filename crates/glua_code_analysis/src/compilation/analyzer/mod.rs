@@ -35,9 +35,9 @@ use std::sync::Arc;
 
 use crate::db_index::derivation;
 use crate::{
-    AsyncState, FileId, GmodScopedClassInfo, InFiled, InferFailReason, LuaDeclId, LuaFunctionType,
-    LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType, LuaTypeCache,
-    WorkspaceId,
+    AnalyzeError, AsyncState, FileId, FlowTree, GmodScopedClassInfo, InFiled, InferFailReason,
+    LuaDeclId, LuaFunctionType, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey,
+    LuaSignatureId, LuaType, LuaTypeCache, WorkspaceId,
     compilation::analyzer::common::{TypeCacheWriteMode, write_type_cache},
     db_index::{DbIndex, LuaMemberOwner},
 };
@@ -519,18 +519,35 @@ fn replace_files(
         .into_iter()
         .map(|(file_id, evaluation)| (file_id, declare_source(db, file_id, evaluation, scopes)))
         .collect::<Vec<_>>();
-    for (file_id, (evaluation, context)) in declared {
-        let (outputs, guard_candidates) = document_source(db, file_id, evaluation, context);
-        touched.extend(outputs);
-        let Some(root) = db
-            .get_vfs()
-            .get_syntax_tree(&file_id)
-            .map(|tree| tree.get_chunk_node())
-        else {
-            continue;
-        };
-        for id in derive::file_derivations(file_id, &root, &guard_candidates) {
-            engine.changed(id);
+    // Each batch's tails are computed together on the pool, outside every
+    // recording evaluation, then published file by file in canonical order.
+    let batch = parallel::analysis_threads().saturating_mul(SOURCE_TAILS_PER_THREAD);
+    let mut declared = declared.into_iter();
+    loop {
+        let documented = declared.by_ref().take(batch).collect::<Vec<_>>();
+        if documented.is_empty() {
+            break;
+        }
+        let file_ids = documented
+            .iter()
+            .map(|(file_id, _)| *file_id)
+            .collect::<Vec<_>>();
+        debug_assert!(!derivation::recording(), "source tails compute unrecorded");
+        let tails = crate::profile::phase("source tails", || {
+            parallel::map_files_collect(db, &file_ids, source_tail)
+        });
+        for ((file_id, (evaluation, context)), tail) in documented.into_iter().zip(tails) {
+            let (outputs, guard_candidates) =
+                document_source(db, file_id, evaluation, context, tail);
+            touched.extend(outputs);
+            let root = db
+                .get_vfs()
+                .get_syntax_tree(&file_id)
+                .expect("a live file has a syntax tree")
+                .get_chunk_node();
+            for id in derive::file_derivations(file_id, &root, &guard_candidates) {
+                engine.changed(id);
+            }
         }
     }
     if let Some(edits) = engine.edits_to_apply() {
@@ -659,24 +676,67 @@ fn declare_source(
     (evaluation, context)
 }
 
+/// How many files' source tails [`replace_files`] computes per analysis
+/// thread at once: enough to keep the pool busy, few enough that the batch's
+/// flow trees are published before the next batch's are built.
+const SOURCE_TAILS_PER_THREAD: usize = 16;
+
+/// The part of a file's source layer that its syntax and its own references
+/// and declarations decide, which docs leave as they are: computed for many
+/// files at once off the canonical thread, published by [`document_source`].
+struct SourceTail {
+    flow_tree: FlowTree,
+    errors: Vec<AnalyzeError>,
+    summaries: Option<Arc<function_summary::FileFunctionSummaries>>,
+    role_mentions: Option<Arc<[smol_str::SmolStr]>>,
+}
+
+/// `file_id`'s source tail, once every file has declared. Reads only facts of
+/// `file_id`'s own source layer, which its source evaluation does not record.
+fn source_tail(db: &DbIndex, file_id: FileId) -> SourceTail {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .expect("a live file has a syntax tree")
+        .get_chunk_node();
+    let (flow_tree, errors) = flow::bind_flow_tree_for_file(db, file_id, root.clone());
+    SourceTail {
+        flow_tree,
+        errors,
+        summaries: function_summary::collect_function_summaries(db, file_id, &root),
+        role_mentions: gmod::collect_role_mentions(db, file_id, &root),
+    }
+}
+
 /// The last stage of a file's source layer: docs, callable signatures,
-/// early member owners, guard candidates, flow and function summaries.
-/// Returns what the whole source layer wrote and the closures that are
-/// guard candidates.
+/// early member owners, guard candidates, then its source tail. Returns what
+/// the whole source layer wrote and the closures that are guard candidates.
 fn document_source(
     db: &mut DbIndex,
     file_id: FileId,
     evaluation: derivation::Evaluation,
     mut context: AnalyzeContext,
+    tail: SourceTail,
 ) -> (Vec<derivation::HashedKey>, Vec<InFiled<LuaSyntaxId>>) {
     derivation::resume(evaluation);
     run_analysis::<doc::DocAnalysisPipeline>(db, &mut context);
     publish_callable_signatures(db, &context);
     resolve_early_member_owners(db, &mut context);
     local_inference::prepare_inferred_positive_guards(db, &context);
-    run_analysis::<flow::FlowAnalysisPipeline>(db, &mut context);
-    function_summary::index_function_summaries(db, file_id);
-    gmod::index_role_mentions(db, file_id);
+    db.get_flow_index_mut()
+        .add_flow_tree(file_id, tail.flow_tree);
+    if !tail.errors.is_empty() {
+        let diagnostic_index = db.get_diagnostic_index_mut();
+        for error in tail.errors {
+            diagnostic_index.add_diagnostic(file_id, error);
+        }
+    }
+    if let Some(summaries) = tail.summaries {
+        db.set_function_summaries(file_id, summaries);
+    }
+    if let Some(mentions) = tail.role_mentions {
+        db.set_role_mentions(file_id, mentions);
+    }
     let evaluation = derivation::end();
     let moved = evaluation.moved().cloned().collect::<Vec<_>>();
     let (id, reads, outputs) = evaluation.into_parts(|key| db.fact_fingerprint(key));
