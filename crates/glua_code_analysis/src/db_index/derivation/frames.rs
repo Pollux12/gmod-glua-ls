@@ -82,6 +82,9 @@ struct Computed {
     /// The references it read as walking from no keyed origin: it holds
     /// only while none of them does.
     unkeyed: Option<Box<[u64]>>,
+    /// Computed without a lent table, by an evaluation viewing the reader
+    /// graph: it holds only within that evaluation, whose reads hold its own.
+    viewed: bool,
 }
 
 /// What a lookup of a memoised value found.
@@ -143,21 +146,29 @@ pub fn open_frame() -> Option<OpenFrame> {
 /// Opens a frame whose memo is keyed by the context `absorbs` names: a read
 /// of that context inside it taints only the frames nested in it.
 pub fn open_frame_absorbing(absorbs: u64) -> Option<OpenFrame> {
-    with_evaluation(|evaluation, _| {
-        let stamp = next_stamp();
-        let depth = evaluation.frames.len() as u32;
-        evaluation.frames.push(Frame {
-            start: u32::try_from(evaluation.log.len()).expect("fewer than 2^32 reads"),
-            stamp,
-            taint: None,
-            gates: 0,
-            realm: None,
-            absorbs,
-            unkeyed: u32::try_from(evaluation.unkeyed.len())
-                .expect("fewer than 2^32 context reads"),
-        });
-        OpenFrame(depth)
-    })
+    with_evaluation(|evaluation, _| push_frame(evaluation, absorbs))
+}
+
+/// Opens a frame as [`open_frame`] does, and also in an evaluation viewing the
+/// reader graph without a lent table (see [`super::view_graph`]). A value such
+/// a frame vouches for holds only within that evaluation.
+pub fn open_frame_viewed() -> Option<OpenFrame> {
+    open_frame().or_else(|| with_viewed(|evaluation, _| push_frame(evaluation, 0)))
+}
+
+fn push_frame(evaluation: &mut Evaluation, absorbs: u64) -> OpenFrame {
+    let stamp = next_stamp();
+    let depth = evaluation.frames.len() as u32;
+    evaluation.frames.push(Frame {
+        start: u32::try_from(evaluation.log.len()).expect("fewer than 2^32 reads"),
+        stamp,
+        taint: None,
+        gates: 0,
+        realm: None,
+        absorbs,
+        unkeyed: u32::try_from(evaluation.unkeyed.len()).expect("fewer than 2^32 context reads"),
+    });
+    OpenFrame(depth)
 }
 
 /// Closes `frame` and returns what its value was computed from under `view`,
@@ -215,6 +226,7 @@ pub fn close_frame(frame: OpenFrame, view: Gates) -> Option<Provenance> {
             checked: AtomicU64::new(0),
             replayed_into: AtomicU64::new(0),
             unkeyed,
+            viewed: KEYS.with(|keys| keys.borrow().is_none()),
         })))
     })
 }
@@ -427,6 +439,9 @@ pub fn reuse(
         count(|stats| stats.other_context += 1);
         return Reuse::Elsewhere;
     }
+    if provenance.0.viewed {
+        return reuse_in_evaluation(provenance, realm);
+    }
     with_evaluation(|evaluation, table| {
         let range = provenance.0.start as usize..provenance.0.end as usize;
         if Arc::ptr_eq(&provenance.0.log, &evaluation.log_handle) {
@@ -494,18 +509,46 @@ pub fn reuse(
                 replay_unkeyed(evaluation, provenance);
             }
         }
-        let depth = evaluation.frames.len() as u32;
-        if let Some(frame) = evaluation.frames.last_mut() {
-            frame.gates |= provenance.0.gates;
-            let base = realm.map_or(0, |(_, base)| base);
-            if provenance.0.realm.is_some() && base < depth {
-                frame.realm = Some((inherited, base));
-            }
-        }
+        record_context(evaluation, provenance, realm);
         Reuse::Held
     })
     .or_else(|| reuse_viewed(provenance, view, keyed, realm, caller))
     .unwrap_or(Reuse::Elsewhere)
+}
+
+/// Records into the innermost open frame the context `provenance` consulted,
+/// as reused under the inherited `realm`.
+fn record_context(
+    evaluation: &mut Evaluation,
+    provenance: &Provenance,
+    realm: Option<(GmodRealm, u32)>,
+) {
+    let depth = evaluation.frames.len() as u32;
+    if let Some(frame) = evaluation.frames.last_mut() {
+        frame.gates |= provenance.0.gates;
+        let base = realm.map_or(0, |(_, base)| base);
+        if provenance.0.realm.is_some() && base < depth {
+            frame.realm = Some((realm.map(|(realm, _)| realm), base));
+        }
+    }
+}
+
+/// [`reuse`] of a value computed by an evaluation viewing the reader graph:
+/// it holds within that evaluation, whose reads already hold its own, and
+/// nowhere else.
+fn reuse_in_evaluation(provenance: &Provenance, realm: Option<(GmodRealm, u32)>) -> Reuse {
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        match current.as_mut() {
+            Some(evaluation) if Arc::ptr_eq(&provenance.0.log, &evaluation.log_handle) => {
+                replay_unkeyed(evaluation, provenance);
+                record_context(evaluation, provenance, realm);
+                count(|stats| stats.reused_here += 1);
+                Reuse::Held
+            }
+            _ => Reuse::Stale,
+        }
+    })
 }
 
 fn replay_unkeyed(evaluation: &mut Evaluation, provenance: &Provenance) {
@@ -567,9 +610,11 @@ fn reuse_viewed(
         {
             REUSED_ACROSS.with(|flag| flag.set(true));
         }
-        if provenance.replays_into(evaluation.frame_stamp()) {
+        if provenance.replays_into(evaluation.stamp) {
             evaluation.viewed.extend(reads.iter().copied());
         }
+        replay_unkeyed(evaluation, provenance);
+        record_context(evaluation, provenance, realm);
         count(|stats| {
             stats.reused += 1;
             stats.sites.entry(caller).or_default()[3] += 1;
