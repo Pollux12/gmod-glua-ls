@@ -1,5 +1,8 @@
 mod cache_options;
 mod tracked;
+mod transaction;
+
+pub(crate) use transaction::{CacheTransaction, detach_transaction};
 
 pub use cache_options::{CacheOptions, LuaAnalysisPhase};
 use glua_parser::LuaSyntaxId;
@@ -157,6 +160,7 @@ impl GenericCallBindings {
 pub struct LuaInferCache {
     file_id: FileId,
     config: CacheOptions,
+    transaction: Option<Box<transaction::CacheUndo>>,
     pub expr_cache: TrackedMap<LuaSyntaxId, CacheEntry<LuaType>>,
     pub member_query_cache: TrackedMap<(LuaSyntaxId, LuaType), Result<LuaType, InferFailReason>>,
     pub member_query_in_progress: FxHashSet<(LuaSyntaxId, LuaType)>,
@@ -353,6 +357,7 @@ impl LuaInferCache {
     pub fn new(file_id: FileId, config: CacheOptions) -> Self {
         Self {
             file_id,
+            transaction: None,
             config,
             expr_cache: Default::default(),
             member_query_cache: Default::default(),
@@ -663,7 +668,7 @@ impl LuaInferCache {
     /// The value `map` holds for `key` if it holds now, recording what it was
     /// computed from.
     #[track_caller]
-    pub fn tracked_get<K: std::hash::Hash + Eq, V: Clone>(
+    pub fn tracked_get<K: std::hash::Hash + Eq + Clone, V: Clone>(
         &mut self,
         map: fn(&mut Self) -> &mut TrackedMap<K, V>,
         key: &K,
@@ -677,7 +682,7 @@ impl LuaInferCache {
 
     /// Closes `frame` and stores the value computed in it.
     #[track_caller]
-    pub fn tracked_insert<K: std::hash::Hash + Eq, V>(
+    pub fn tracked_insert<K: std::hash::Hash + Eq + Clone, V>(
         &mut self,
         map: fn(&mut Self) -> &mut TrackedMap<K, V>,
         key: K,
@@ -816,7 +821,7 @@ impl LuaInferCache {
         self.member_query_cache.clear();
         self.member_query_in_progress.clear();
         self.member_query_local_cache.clear();
-        self.call_cache.clear();
+        self.clear_call_cache();
         self.call_cache_local.clear();
         self.call_arg_types_cache.clear();
         self.numeric_table_index_query_cache.clear();
@@ -828,10 +833,25 @@ impl LuaInferCache {
         self.signature_is_generic_cache.clear();
         self.generic_call_bindings.clear();
         self.owner_raw_member_type_cache.clear();
-        self.flow_node_cache.retain(|_, inner| {
-            inner.retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
-            !inner.is_empty()
-        });
+        if self.active_transaction() {
+            let removed = self
+                .flow_node_cache
+                .iter_mut()
+                .filter_map(|(key, inner)| {
+                    inner.retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
+                    inner.is_empty().then(|| key.clone())
+                })
+                .collect::<Vec<_>>();
+            for key in removed {
+                self.capture_flow(&key);
+                self.flow_node_cache.remove(&key);
+            }
+        } else {
+            self.flow_node_cache.retain(|_, inner| {
+                inner.retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
+                !inner.is_empty()
+            });
+        }
         self.param_type_cache
             .retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
         self.param_type_source_cache
@@ -855,12 +875,12 @@ impl LuaInferCache {
         self.member_query_cache.clear();
         self.member_query_in_progress.clear();
         self.member_query_local_cache.clear();
-        self.call_cache.clear();
+        self.clear_call_cache();
         self.call_cache_local.clear();
         self.call_arg_types_cache.clear();
         self.numeric_table_index_query_cache.clear();
         self.unambiguous_int_const_cache.clear();
-        self.flow_node_cache.clear();
+        self.clear_flow_cache();
         self.flow_query_realm = None;
         self.baseline_flow_memo.clear();
         self.baseline_flow_depth = 0;
@@ -970,6 +990,7 @@ impl LuaInferCache {
         if provenance.is_none() {
             self.flow_local_keys.push(cache_key.clone());
         }
+        self.capture_new_flow(cache_key);
         self.flow_node_cache
             .entry(cache_key.clone())
             .or_default()
@@ -989,6 +1010,7 @@ impl LuaInferCache {
         if provenance.is_none() {
             self.flow_local_keys.push(cache_key.clone());
         }
+        self.capture_new_flow(cache_key);
         let by_flow = self.flow_node_cache.entry(cache_key.clone()).or_default();
         for visited_flow_id in visited_flow_ids {
             by_flow.insert(
@@ -1042,7 +1064,8 @@ impl LuaInferCache {
         match derivation::reuse(&bucket[at].2, lookup.gates, &self.keyed, lookup.realm) {
             Reuse::Held => Some(bucket[at].1.clone()),
             Reuse::Stale => {
-                bucket.swap_remove(at);
+                self.capture_call(&key);
+                self.call_cache.get_mut(&key).unwrap().swap_remove(at);
                 None
             }
             Reuse::Elsewhere => None,
@@ -1069,6 +1092,7 @@ impl LuaInferCache {
         if let Some(bucket) = self.call_cache_local.get_mut(&key) {
             bucket.retain(|(ty, _)| *ty != call_expr_type);
         }
+        self.capture_call(&key);
         let bucket = self.call_cache.entry(key).or_default();
         match bucket.iter_mut().find(|(ty, _, _)| *ty == call_expr_type) {
             Some(slot) => *slot = (call_expr_type, entry, provenance),
@@ -1086,6 +1110,7 @@ impl LuaInferCache {
         if let Some(bucket) = self.call_cache_local.get_mut(&key) {
             bucket.retain(|(ty, _)| ty != call_expr_type);
         }
+        self.capture_call(&key);
         if let Some(bucket) = self.call_cache.get_mut(&key) {
             bucket.retain(|(ty, _, _)| ty != call_expr_type);
             if bucket.is_empty() {
@@ -1102,9 +1127,10 @@ impl LuaInferCache {
         origin: &LuaType,
     ) -> Option<FlowEntries> {
         let cache_key = VarRefCacheKey::from(var_ref_id);
-        let keyed = self
-            .keyed_flow_node_cache
-            .remove(&(cache_key.clone(), origin.clone()));
+        let keyed_key = (cache_key.clone(), origin.clone());
+        self.capture_keyed_flow(&keyed_key);
+        self.capture_flow(&cache_key);
+        let keyed = self.keyed_flow_node_cache.remove(&keyed_key);
         match keyed {
             Some(keyed) => self.flow_node_cache.insert(cache_key, keyed),
             None => self.flow_node_cache.remove(&cache_key),
@@ -1120,10 +1146,12 @@ impl LuaInferCache {
         previous: Option<FlowEntries>,
     ) {
         let cache_key = VarRefCacheKey::from(var_ref_id);
+        self.capture_flow(&cache_key);
+        let keyed_key = (cache_key.clone(), origin);
+        self.capture_keyed_flow(&keyed_key);
         if let Some(mut keyed) = self.flow_node_cache.remove(&cache_key) {
             keyed.clear_local();
-            self.keyed_flow_node_cache
-                .insert((cache_key.clone(), origin), keyed);
+            self.keyed_flow_node_cache.insert(keyed_key, keyed);
         }
         if let Some(previous) = previous {
             self.flow_node_cache.insert(cache_key, previous);
@@ -1159,6 +1187,7 @@ impl LuaInferCache {
 
     pub fn take_flow_cache_for_var_ref(&mut self, var_ref_id: &VarRefId) -> Option<FlowEntries> {
         let cache_key = VarRefCacheKey::from(var_ref_id);
+        self.capture_flow(&cache_key);
         self.flow_node_cache.remove(&cache_key)
     }
 
@@ -1168,6 +1197,7 @@ impl LuaInferCache {
         previous: Option<FlowEntries>,
     ) {
         let cache_key = VarRefCacheKey::from(var_ref_id);
+        self.capture_flow(&cache_key);
         if let Some(previous) = previous {
             self.flow_node_cache.insert(cache_key, previous);
         } else {

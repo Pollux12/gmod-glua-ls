@@ -26,6 +26,13 @@ pub struct Lookup {
 pub struct TrackedMap<K, V> {
     shared: FxHashMap<K, (V, Provenance)>,
     local: FxHashMap<K, V>,
+    undo: Option<Box<SharedUndo<K, V>>>,
+}
+
+#[derive(Debug, Clone)]
+struct SharedUndo<K, V> {
+    transaction: u64,
+    entries: FxHashMap<K, Option<(V, Provenance)>>,
 }
 
 impl<K, V> Default for TrackedMap<K, V> {
@@ -33,11 +40,12 @@ impl<K, V> Default for TrackedMap<K, V> {
         Self {
             shared: FxHashMap::default(),
             local: FxHashMap::default(),
+            undo: None,
         }
     }
 }
 
-impl<K: Hash + Eq, V> TrackedMap<K, V> {
+impl<K: Hash + Eq + Clone, V> TrackedMap<K, V> {
     /// The value for `key` if it holds under `lookup` with the references
     /// `keyed` walking from a keyed origin, recording what it was computed
     /// from into the open frames. A value computed under other context stays
@@ -52,7 +60,7 @@ impl<K: Hash + Eq, V> TrackedMap<K, V> {
         match derivation::reuse(provenance, lookup.gates, keyed, lookup.realm) {
             Reuse::Held => self.shared.get(key).map(|(value, _)| value),
             Reuse::Stale => {
-                self.shared.remove(key);
+                self.remove_shared(key);
                 None
             }
             Reuse::Elsewhere => None,
@@ -77,6 +85,7 @@ impl<K: Hash + Eq, V> TrackedMap<K, V> {
         match provenance {
             Some(provenance) => {
                 self.local.remove(&key);
+                let key = self.capture_shared(&key).unwrap_or(key);
                 self.shared.insert(key, (value, provenance));
             }
             None => {
@@ -92,7 +101,7 @@ impl<K: Hash + Eq, V> TrackedMap<K, V> {
 
     pub fn remove(&mut self, key: &K) {
         self.local.remove(key);
-        self.shared.remove(key);
+        self.remove_shared(key);
     }
 
     /// Drops what only this evaluation may use.
@@ -104,13 +113,94 @@ impl<K: Hash + Eq, V> TrackedMap<K, V> {
 
     pub fn clear(&mut self) {
         self.local.clear();
-        self.shared.clear();
+        if self.shared.is_empty() {
+            return;
+        }
+        if let Some(transaction) = super::transaction::current() {
+            self.prepare_undo(transaction);
+            let undo = &mut self.undo.as_mut().unwrap().entries;
+            for (key, value) in self.shared.drain() {
+                undo.entry(key).or_insert(Some(value));
+            }
+        } else {
+            self.shared.clear();
+        }
     }
 
     /// Keeps the entries `keep` accepts.
     pub fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
         self.local.retain(|key, value| keep(key, value));
-        self.shared.retain(|key, (value, _)| keep(key, value));
+        if self.shared.is_empty() {
+            return;
+        }
+        if let Some(transaction) = super::transaction::current() {
+            let undo = &mut self.undo;
+            for (key, value) in self.shared.extract_if(|key, (value, _)| !keep(key, value)) {
+                let undo = undo.get_or_insert_with(|| {
+                    Box::new(SharedUndo {
+                        transaction,
+                        entries: FxHashMap::default(),
+                    })
+                });
+                assert_eq!(undo.transaction, transaction);
+                undo.entries.entry(key).or_insert(Some(value));
+            }
+        } else {
+            self.shared.retain(|key, (value, _)| keep(key, value));
+        }
+    }
+
+    fn prepare_undo(&mut self, transaction: u64) {
+        let undo = self.undo.get_or_insert_with(|| {
+            Box::new(SharedUndo {
+                transaction,
+                entries: FxHashMap::default(),
+            })
+        });
+        assert_eq!(undo.transaction, transaction);
+    }
+
+    fn capture_shared(&mut self, key: &K) -> Option<K> {
+        let transaction = super::transaction::current()?;
+        self.prepare_undo(transaction);
+        let undo = &mut self.undo.as_mut().unwrap().entries;
+        if undo.contains_key(key) {
+            return None;
+        }
+        match self.shared.remove_entry(key) {
+            Some((original, value)) => {
+                let replacement = original.clone();
+                undo.insert(original, Some(value));
+                Some(replacement)
+            }
+            None => {
+                undo.insert(key.clone(), None);
+                None
+            }
+        }
+    }
+
+    fn remove_shared(&mut self, key: &K) {
+        if super::transaction::current().is_some() && self.shared.contains_key(key) {
+            self.capture_shared(key);
+        }
+        self.shared.remove(key);
+    }
+
+    pub(super) fn commit_transaction(&mut self) {
+        self.undo = None;
+    }
+
+    pub(super) fn rollback_transaction(&mut self) {
+        if let Some(undo) = self.undo.take() {
+            for (key, original) in undo.entries {
+                self.shared.remove(&key);
+                if let Some(value) = original {
+                    self.shared.insert(key, value);
+                }
+            }
+        }
+        self.local.clear();
     }
 
     pub fn is_empty(&self) -> bool {
