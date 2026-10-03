@@ -528,21 +528,17 @@ pub(crate) fn apply_helper_scan(db: &mut DbIndex, file_id: FileId, scan: Option<
     }
 }
 
-/// Records the global paths `file_id`'s syntax names, which its gmod passes
-/// look their call roles up by.
-pub(crate) fn index_role_mentions(db: &mut DbIndex, file_id: FileId) {
-    if !db.get_emmyrc().gmod.enabled {
-        return;
-    }
-    let Some(root) = db
-        .get_vfs()
-        .get_syntax_tree(&file_id)
-        .map(|tree| tree.get_chunk_node())
-    else {
-        return;
-    };
-    let mentions = global_path_mentions(db, file_id, &root);
-    db.set_role_mentions(file_id, mentions);
+/// The global paths `file_id`'s syntax names, absent with gmod disabled:
+/// part of its source layer, after its references are complete.
+pub(crate) fn collect_role_mentions(
+    db: &DbIndex,
+    file_id: FileId,
+    root: &LuaChunk,
+) -> Option<Arc<[SmolStr]>> {
+    db.get_emmyrc()
+        .gmod
+        .enabled
+        .then(|| global_path_mentions(db, file_id, root))
 }
 
 /// The global paths `root`'s syntax names, sorted: every path a call-role

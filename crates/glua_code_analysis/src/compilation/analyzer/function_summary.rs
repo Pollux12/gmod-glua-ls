@@ -5,6 +5,7 @@
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use glua_parser::LuaChunk;
 use rowan::TextSize;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -60,26 +61,21 @@ impl DerivedFact for FileFunctionSummaries {
     }
 }
 
-/// Stores `file_id`'s function summaries: part of its source layer, after its
-/// references are complete.
-pub(super) fn index_function_summaries(db: &mut DbIndex, file_id: FileId) {
-    let Some(root) = db
-        .get_vfs()
-        .get_syntax_tree(&file_id)
-        .map(|tree| tree.get_chunk_node())
-    else {
-        return;
-    };
+/// `file_id`'s function summaries, absent when it has none: part of its
+/// source layer, after its references are complete.
+pub(super) fn collect_function_summaries(
+    db: &DbIndex,
+    file_id: FileId,
+    root: &LuaChunk,
+) -> Option<Arc<FileFunctionSummaries>> {
     let (mutated_params, returns_explicit_self) =
-        call_site_params::collect_param_summaries(db, file_id, &root);
+        call_site_params::collect_param_summaries(db, file_id, root);
     let summaries = FileFunctionSummaries {
-        field_setter_helpers: dynamic_field::collect_field_setter_helpers(&root),
+        field_setter_helpers: dynamic_field::collect_field_setter_helpers(root),
         mutated_params,
         returns_explicit_self,
     };
-    if !summaries.is_empty() {
-        db.set_function_summaries(file_id, Arc::new(summaries));
-    }
+    (!summaries.is_empty()).then(|| Arc::new(summaries))
 }
 
 /// `file_id`'s function summaries, recorded as a read.
