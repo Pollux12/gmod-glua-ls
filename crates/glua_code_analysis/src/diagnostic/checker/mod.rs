@@ -333,6 +333,32 @@ fn checker_file_label(context: &DiagnosticContext, semantic_model: &SemanticMode
         .unwrap_or_else(|| format!("{file_id:?}"))
 }
 
+thread_local! {
+    /// Under `GLUALS_PROFILE_PHASE`: each checker's time on the file being diagnosed.
+    static FILE_CHECKER_TIMES: std::cell::RefCell<Vec<(&'static str, std::time::Duration)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Under `GLUALS_PROFILE_PHASE`: prints one file's diagnose time and its three
+/// slowest checkers, then clears this thread's checker times.
+pub fn report_file_profile(path: &str, elapsed: std::time::Duration) {
+    let mut times = FILE_CHECKER_TIMES.with_borrow_mut(std::mem::take);
+    times.sort_unstable_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(right.0)));
+    let top = times
+        .iter()
+        .take(3)
+        .map(|(name, time)| {
+            let name = name.rsplit("::").next().unwrap_or(name);
+            format!("{name}={:.1}", time.as_secs_f64() * 1000.0)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!(
+        "[diagfile] {:>9.3}ms {path} | {top}",
+        elapsed.as_secs_f64() * 1000.0
+    );
+}
+
 fn run_check<T: Checker>(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
@@ -355,7 +381,8 @@ fn run_check<T: Checker>(
             );
         }
 
-        if !log::log_enabled!(log::Level::Info) {
+        let profiling = crate::profile::phase_enabled();
+        if !profiling && !log::log_enabled!(log::Level::Info) {
             T::check(context, semantic_model);
             return;
         }
@@ -363,7 +390,12 @@ fn run_check<T: Checker>(
         let start = std::time::Instant::now();
         T::check(context, semantic_model);
         let elapsed = start.elapsed();
-        if elapsed.as_millis() > 5 {
+        if profiling {
+            FILE_CHECKER_TIMES.with_borrow_mut(|times| {
+                times.push((std::any::type_name::<T>(), elapsed));
+            });
+        }
+        if log::log_enabled!(log::Level::Info) && elapsed.as_millis() > 5 {
             let name = T::CODES
                 .iter()
                 .map(|c| c.get_name())
