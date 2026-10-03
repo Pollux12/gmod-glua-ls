@@ -117,7 +117,10 @@ impl super::engine::Recipe for Recipes {
         // Call-site contributions are collected with call-site facts invisible;
         // net helpers read other files' helper scans, and net flows their net
         // helpers: no file's computation reads what another's of its kind writes.
-        // Dynamic fields are collected with dynamic fields invisible.
+        // Dynamic fields are collected with dynamic fields invisible. Helper
+        // and valid-guard scans read source facts and the folds over other
+        // kinds; gmod metadata reads the source layer, call targets and call
+        // roles, which no gmod pre pass writes.
         matches!(
             kind,
             DerivationKind::CallSiteParams
@@ -127,6 +130,9 @@ impl super::engine::Recipe for Recipes {
                 | DerivationKind::GmodLoadCallSites
                 | DerivationKind::GmodClassCallSites
                 | DerivationKind::LocalFallbacks
+                | DerivationKind::GmodHelperScan
+                | DerivationKind::ValidGuardScan
+                | DerivationKind::GmodPre
         )
     }
 
@@ -153,6 +159,11 @@ impl super::engine::Recipe for Recipes {
                 id.file_id,
                 dynamic_field::DynamicFieldAnalysisMode::Full,
             )),
+            DerivationKind::GmodHelperScan => Box::new(gmod::compute_helper_scan(db, id.file_id)),
+            DerivationKind::ValidGuardScan => Box::new(
+                crate::db_index::compute_valid_guard_signatures(db, id.file_id),
+            ),
+            DerivationKind::GmodPre => Box::new(gmod::compute_pre(db, id.file_id)),
             kind => unreachable!("{kind:?} does not split"),
         }
     }
@@ -203,17 +214,33 @@ impl super::engine::Recipe for Recipes {
                     .expect("dynamic fields");
                 dynamic_field::apply_dynamic_fields(db, [(fields, id.file_id)]);
             }
+            DerivationKind::GmodHelperScan => {
+                let scan = *computed
+                    .downcast::<Option<gmod::FileHelperScan>>()
+                    .expect("helper scan");
+                gmod::apply_helper_scan(db, id.file_id, scan);
+            }
+            DerivationKind::ValidGuardScan => {
+                let found = *computed
+                    .downcast::<Vec<(crate::LuaSignatureId, crate::GmodStateMask)>>()
+                    .expect("valid-guard signatures");
+                crate::db_index::store_valid_guard_signatures(db, id.file_id, found);
+            }
+            DerivationKind::GmodPre => {
+                let metadata = *computed
+                    .downcast::<Option<gmod::GmodFileMetadataResult>>()
+                    .expect("gmod metadata");
+                self.with_file_context(db, id.file_id, |db, context| {
+                    gmod::apply_pre(db, context, metadata);
+                });
+            }
             kind => unreachable!("{kind:?} does not split"),
         }
     }
 
     fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
         match id.kind {
-            DerivationKind::GmodHelperScan => gmod::evaluate_helper_scan(db, id.file_id),
             DerivationKind::NetHelpers => gmod::evaluate_net_helpers(db, id.file_id),
-            DerivationKind::ValidGuardScan => {
-                crate::db_index::scan_valid_guard_signatures(db, id.file_id)
-            }
             DerivationKind::GmodCallRoles => gmod::evaluate_call_roles(db),
             DerivationKind::NetHelperNames => gmod::evaluate_net_helper_names(db),
             DerivationKind::GmodLoad => gmod::evaluate_load(db),
@@ -229,25 +256,16 @@ impl super::engine::Recipe for Recipes {
                 let db: &DbIndex = db;
                 db.queries().recompute(db, id);
             }
-            DerivationKind::LocalFallbacks => {
+            DerivationKind::LocalFallbacks
+            | DerivationKind::GmodHelperScan
+            | DerivationKind::ValidGuardScan
+            | DerivationKind::GmodPre => {
                 let computed = super::engine::Recipe::compute(self, db, id);
                 super::engine::Recipe::apply(self, db, id, computed);
             }
-            _ => {
-                let mut context = AnalyzeContext::for_files(db, vec![id.file_id], &self.scopes);
-                if let Some(cache) = self.caches.lock().expect("cache store").remove(&id.file_id) {
-                    context.infer_manager.restore_file(id.file_id, cache);
-                }
-                self.evaluate_file_derivation(db, &mut context, id);
-                unresolve::resolve_inline(db, &mut context);
-                if let Some(mut cache) = context.infer_manager.take_file(id.file_id) {
-                    cache.clear();
-                    self.caches
-                        .lock()
-                        .expect("cache store")
-                        .insert(id.file_id, cache);
-                }
-            }
+            _ => self.with_file_context(db, id.file_id, |db, context| {
+                self.evaluate_file_derivation(db, context, id);
+            }),
         }
     }
 }
@@ -260,6 +278,29 @@ fn guesses_locals(db: &DbIndex) -> bool {
 }
 
 impl Recipes {
+    /// Runs `f` with a context for `file_id` that reuses the file's inference
+    /// memo, then resolves what it left unresolved.
+    fn with_file_context(
+        &self,
+        db: &mut DbIndex,
+        file_id: FileId,
+        f: impl FnOnce(&mut DbIndex, &mut AnalyzeContext),
+    ) {
+        let mut context = AnalyzeContext::for_files(db, vec![file_id], &self.scopes);
+        if let Some(cache) = self.caches.lock().expect("cache store").remove(&file_id) {
+            context.infer_manager.restore_file(file_id, cache);
+        }
+        f(db, &mut context);
+        unresolve::resolve_inline(db, &mut context);
+        if let Some(mut cache) = context.infer_manager.take_file(file_id) {
+            cache.clear();
+            self.caches
+                .lock()
+                .expect("cache store")
+                .insert(file_id, cache);
+        }
+    }
+
     /// Analyses a statement without writing, then applies what it wrote; an
     /// assignment in two stages, its homing applied before its values are
     /// analysed.
@@ -324,7 +365,6 @@ impl Recipes {
             | DerivationKind::Setmetatable
             | DerivationKind::ChunkReturn => self.evaluate_statement(db, context, id),
             DerivationKind::GmodLoadCallSites => gmod::evaluate_load_call_sites(db, context),
-            DerivationKind::GmodPre => gmod::evaluate_pre(db, context),
             DerivationKind::GmodClassCallSites => gmod::evaluate_class_call_sites(db, context),
             DerivationKind::GmodPost => gmod::evaluate_post(db, context),
             DerivationKind::AccessorFunc => synthesize_accessorfunc_members(db, &file_ids),
@@ -347,6 +387,7 @@ impl Recipes {
             DerivationKind::Network => gmod::evaluate_network(db, context),
             DerivationKind::Source
             | DerivationKind::LocalFallbacks
+            | DerivationKind::GmodPre
             | DerivationKind::GmodHelperScan
             | DerivationKind::NetHelpers
             | DerivationKind::ValidGuardScan
