@@ -787,4 +787,49 @@ mod tests {
         guard.finish(&mut table);
         graph.restore_keys(table);
     }
+
+    #[test]
+    fn parallel_transport_worker_named_repeats_and_missing_handles_keep_global_hints() {
+        use crate::{LuaMemberKey, LuaMemberOwner};
+        let (snapshot, guard) = snapshot(ReaderGraph::default());
+        let owner = LuaTypeOwner::Decl(LuaDeclId::new(FileId::new(1), TextSize::new(8)));
+        let fact = FactKey::TypeCache(owner);
+        let handle = FactRead::default();
+        handle.0.store(123, Ordering::Relaxed);
+        let result = compute_recorded(
+            &snapshot,
+            id(),
+            || {
+                let frame = derivation::open_frame().unwrap();
+                assert!(handle.note(|| fact.clone(), |key| key == &fact));
+                assert_eq!(handle.0.load(Ordering::Relaxed), 123);
+                let owner = LuaMemberOwner::LocalUnresolve;
+                let name = LuaMemberKey::Name("field".into());
+                derivation::note_member_slot_read(&owner, &name);
+                derivation::note_member_slot_read(&owner, &name);
+                let proof = derivation::close_frame(frame, 0).unwrap();
+                let frame = derivation::open_frame().unwrap();
+                derivation::note_member_slot_read(&owner, &name);
+                let replay = derivation::close_frame(frame, 0).unwrap();
+                (proof, replay)
+            },
+            |_| 17,
+        );
+        assert_eq!(result.evaluation.evaluation.log, vec![0, 1, 1]);
+        assert_eq!(result.evaluation.evaluation.named_reads.len(), 1);
+        let mut graph = recover(snapshot);
+        let mut table = graph.lend_keys();
+        assert!(result.evaluation.validate_table(&table, |_| Some(17)));
+        let evaluation = result.evaluation.canonicalise(&mut table).unwrap();
+        assert_eq!(
+            evaluation.named_reads.iter().next().unwrap().slot,
+            evaluation.log[1]
+        );
+        derivation::lend_keys(table);
+        derivation::resume(evaluation);
+        derivation::end();
+        let mut table = derivation::take_keys();
+        guard.finish(&mut table);
+        graph.restore_keys(table);
+    }
 }
