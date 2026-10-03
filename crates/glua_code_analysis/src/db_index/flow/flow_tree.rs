@@ -457,6 +457,11 @@ impl FlowTree {
         ))
     }
 
+    /// How many name and index expressions the file's flow analysis bound.
+    pub fn binding_count(&self) -> usize {
+        self.bindings.len()
+    }
+
     pub fn get_narrowing_capability(&self) -> &FileNarrowingCapability {
         &self.narrowing_capability
     }

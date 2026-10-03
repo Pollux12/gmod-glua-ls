@@ -629,7 +629,7 @@ impl FileDiagnostic {
         // An armed idle sweep after an edit is scoped to the files the burst
         // touched; the other Fast arms (open, reindex, config) leave the slot
         // empty and sweep everything. Scoped ids are a subset of the main
-        // workspace list, so retaining keeps its size-ordered dispatch.
+        // workspace list, so retaining keeps its cost-ordered dispatch.
         let scoped = self.take_scoped_sweep_files().await;
         let was_scoped = scoped.is_some();
         let (main_workspace_file_ids, shared_data) = {
