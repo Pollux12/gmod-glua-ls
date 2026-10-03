@@ -1,7 +1,8 @@
 //! A file's source tail (flow tree and its errors, function summaries, role
 //! mentions) is computed for a batch of files at once on the analysis pool.
 //! Whatever the thread count, and across edits, deletes, re-creates and
-//! reopens, every fact it publishes must match a cold build on one thread.
+//! reopens and shifts, every fact it publishes must match a cold build on
+//! one thread.
 #[cfg(test)]
 mod test {
     use crate::compilation::analyzer::parallel;
@@ -278,7 +279,7 @@ mod test {
     }
 
     #[test]
-    fn source_tails_match_cold_across_edit_delete_recreate_and_reopen() {
+    fn source_tails_match_cold_across_edit_delete_recreate_reopen_and_shift() {
         with_threads(|| {
             let mut texts = files();
             parallel::set_analysis_threads(4);
@@ -351,6 +352,27 @@ mod test {
                 "reopening unchanged texts re-analyses nothing"
             );
             check(&ws, &texts, "reopen");
+
+            // Every file's positions move at once, so every tail is rebuilt in
+            // one batch behind an edit remap.
+            let shifted = texts
+                .iter()
+                .map(|(path, text)| {
+                    (
+                        *path,
+                        format!(
+                            "
+{text}"
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let shifted = shifted
+                .iter()
+                .map(|(path, text)| (*path, text.as_str()))
+                .collect::<Vec<_>>();
+            ws.def_files(shifted.clone());
+            check(&ws, &shifted, "shift");
         });
     }
 }

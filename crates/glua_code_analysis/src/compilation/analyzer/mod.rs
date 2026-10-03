@@ -605,12 +605,16 @@ fn follow_edits(
             }
         }
     }
-    for reader in db.reader_graph_mut().apply_edits(edits) {
+    let applied = db.reader_graph_mut().apply_edits(edits);
+    for reader in applied.lost {
         if crate::profile::tracing_evaluations() {
             eprintln!("[trace] a read of {reader:?} names a destroyed position");
         }
         rerun(engine, reader);
     }
+    // A moved read holds what it saw only with the edits mapped back; as a
+    // touched key the run checks it and re-records it as the value now. No
+    // derivation writes some of them, such as a statement's syntax.
     touched
         .into_iter()
         .flat_map(|key| {
@@ -620,6 +624,7 @@ fn follow_edits(
                 .map(derivation::HashedKey::new);
             std::iter::once(key).chain(moved)
         })
+        .chain(applied.moved)
         .collect()
 }
 
