@@ -301,14 +301,7 @@ fn infer_owner_raw_member_type_with_realm_uncached(
 ) -> RawGetMemberTypeResult {
     let member_index = db.get_member_index();
     if let Some(member_item) = member_index.get_member_item(member_owner, member_key) {
-        // These reads register the slot and dynamic-field derivation dependencies.
-        member_index.get_member_count_for_owner_key(member_owner, member_key);
-        if let LuaMemberKey::Name(name) = member_key
-            && let Some(dynamic_owner) = crate::dynamic_field_owner_of(db, member_owner)
-        {
-            db.get_dynamic_field_index()
-                .field_definitions(&dynamic_owner, name.as_str());
-        }
+        super::record_member_slot_read(db, member_owner, member_key);
         let exact_type =
             resolve_member_item_at(db, member_item, caller_file_id, site, source_min_position)?;
         // A dynamic write answers a dynamic read, but it is not evidence that

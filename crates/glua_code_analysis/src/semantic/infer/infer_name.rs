@@ -2415,12 +2415,7 @@ pub fn infer_global_type(
 fn record_missing_global_read(db: &DbIndex, name: &str) {
     let owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new(name));
     let key = LuaMemberKey::Name(name.into());
-    db.get_member_index()
-        .get_member_count_for_owner_key(&owner, &key);
-    if let Some(dynamic_owner) = crate::dynamic_field_owner_of(db, &owner) {
-        db.get_dynamic_field_index()
-            .field_definitions(&dynamic_owner, name);
-    }
+    crate::semantic::member::record_member_slot_read(db, &owner, &key);
 }
 
 fn infer_global_type_impl(

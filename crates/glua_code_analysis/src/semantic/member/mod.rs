@@ -1102,6 +1102,21 @@ fn dynamic_field_definitions(
         _ => Vec::new(),
     }
 }
+/// Reads `owner`'s `key` slot and its dynamic field, which register a lookup
+/// as their reader; the pass collecting dynamic fields never sees them, so it
+/// reads only the slot.
+pub(crate) fn record_member_slot_read(db: &DbIndex, owner: &LuaMemberOwner, key: &LuaMemberKey) {
+    db.get_member_index()
+        .get_member_count_for_owner_key(owner, key);
+    if let LuaMemberKey::Name(name) = key
+        && crate::db_index::derivation::dynamic_fields_visible()
+        && let Some(dynamic_owner) = crate::dynamic_field_owner_of(db, owner)
+    {
+        db.get_dynamic_field_index()
+            .field_definitions(&dynamic_owner, name.as_str());
+    }
+}
+
 /// Records the masked `(owner, field)` read a visible pass re-derives from;
 /// the pass collecting dynamic fields never sees them, so it records none.
 fn record_dynamic_field_read_for_prefix(db: &DbIndex, prefix_type: &LuaType, field_name: &str) {

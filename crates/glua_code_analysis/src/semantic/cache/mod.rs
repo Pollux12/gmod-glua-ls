@@ -746,16 +746,7 @@ impl LuaInferCache {
         owner: crate::LuaMemberOwner,
         key: LuaMemberKey,
     ) {
-        // These reads register the slot and dynamic-field derivation dependencies.
-        db.get_member_index()
-            .get_member_count_for_owner_key(&owner, &key);
-        if let LuaMemberKey::Name(name) = &key
-            && crate::db_index::derivation::dynamic_fields_visible()
-            && let Some(dynamic_owner) = crate::dynamic_field_owner_of(db, &owner)
-        {
-            db.get_dynamic_field_index()
-                .field_definitions(&dynamic_owner, name.as_str());
-        }
+        crate::semantic::member::record_member_slot_read(db, &owner, &key);
     }
 
     /// Drops every memo a write may have made stale. Tracked entries stay:
