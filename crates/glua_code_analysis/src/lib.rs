@@ -537,17 +537,34 @@ impl EmmyLuaAnalysis {
             }
         }
 
+        let pending: Vec<(Uri, Option<String>)> = latest
+            .into_iter()
+            .filter(|(uri, text)| {
+                let existing = self.compilation.get_db().get_vfs().get_file_id(uri);
+                !existing.is_some_and(|file_id| self.text_is_indexed(file_id, text.as_deref()))
+            })
+            .collect();
+        let texts: Vec<&str> = pending
+            .iter()
+            .filter_map(|(_, text)| text.as_deref())
+            .collect();
+        let mut parsed = self
+            .compilation
+            .get_db()
+            .get_vfs()
+            .parse_concurrently(&texts)
+            .map(Vec::into_iter);
+
+        let vfs = self.compilation.get_db_mut().get_vfs_mut();
         let mut changed = Vec::new();
-        for (uri, text) in latest {
-            let existing = self.compilation.get_db().get_vfs().get_file_id(&uri);
-            if let Some(file_id) = existing
-                && self.text_is_indexed(file_id, text.as_deref())
-            {
-                continue;
-            }
-            let vfs = self.compilation.get_db_mut().get_vfs_mut();
+        for (uri, text) in pending {
             let file_id = match text {
-                Some(text) => Some(vfs.set_file_content(&uri, Some(text))),
+                Some(text) => match parsed.as_mut().and_then(Iterator::next) {
+                    Some((tree, line_index)) => {
+                        vfs.set_file_content_preparsed(&uri, Some(text), tree, line_index, None)
+                    }
+                    None => Some(vfs.set_file_content(&uri, Some(text))),
+                },
                 None => vfs.delete_file_content(&uri),
             };
             changed.extend(file_id);

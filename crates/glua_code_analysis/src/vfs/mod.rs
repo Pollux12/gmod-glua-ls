@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 pub use virtual_url::VirtualUrlGenerator;
 
+use crate::compilation::analyzer::parallel::map_items_init;
 use crate::{Emmyrc, PositionMap, WorkspaceKind};
 
 #[derive(Debug)]
@@ -294,6 +295,17 @@ impl Vfs {
         let new_tree = LuaParser::parse(data, parse_config);
         let old_tree = &self.tree_map[&file_id];
         trees_semantically_equal(old_tree, &new_tree)
+    }
+
+    /// Parses `texts` on the analysis pool, each tree with its line index,
+    /// aligned with `texts`. `None` when the batch is too small to be worth
+    /// the pool; callers then go through [`Vfs::set_file_content`].
+    pub fn parse_concurrently(&self, texts: &[&str]) -> Option<Vec<(LuaSyntaxTree, LineIndex)>> {
+        let emmyrc = self.emmyrc.as_ref()?;
+        map_items_init(texts, NodeCache::default, |node_cache, text| {
+            let tree = LuaParser::parse(text, emmyrc.get_parse_config(node_cache));
+            (tree, LineIndex::parse(text))
+        })
     }
 
     pub fn set_file_content(&mut self, uri: &Uri, data: Option<String>) -> FileId {
@@ -990,6 +1002,73 @@ mod tests {
     /// red, the cleared trees, the dropped `NodeCache`, and the destroyed VFS
     /// below are all safe on this 2 MB stack; join-based like the existing
     /// 2 MB test.
+    #[test]
+    fn concurrent_parsing_matches_serial_parsing_and_keeps_id_order() {
+        let uris: Vec<Uri> = (0..40)
+            .map(|index| {
+                format!("file:///workspace/lua/f{index}.lua")
+                    .parse()
+                    .expect("valid test uri")
+            })
+            .collect();
+        let texts: Vec<String> = (0..uris.len())
+            .map(|index| match index % 5 {
+                0 => format!("local a{index} = {index}\nreturn a{index}"),
+                1 => format!("---@class C{index}\nlocal C = {{}}\nfunction C:run() end"),
+                2 => format!("if x{index} then\n  print(\"é{index}\")\n"),
+                3 => String::new(),
+                _ => format!("for i = 1, {index} do local t = {{ i, {index} }} end\r\nreturn"),
+            })
+            .collect();
+
+        let mut serial = new_vfs();
+        let serial_ids: Vec<_> = uris
+            .iter()
+            .zip(&texts)
+            .map(|(uri, text)| serial.set_file_content(uri, Some(text.clone())))
+            .collect();
+
+        let _threads = crate::compilation::analyzer::parallel::THREADS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::compilation::analyzer::parallel::set_analysis_threads(4);
+        let mut concurrent = new_vfs();
+        let borrowed: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let parsed = concurrent.parse_concurrently(&borrowed);
+        crate::compilation::analyzer::parallel::set_analysis_threads(0);
+        let parsed = parsed.expect("a batch this size parses on the pool");
+
+        let concurrent_ids: Vec<_> = uris
+            .iter()
+            .zip(texts.iter().zip(parsed))
+            .map(|(uri, (text, (tree, line_index)))| {
+                concurrent
+                    .set_file_content_preparsed(uri, Some(text.clone()), tree, line_index, None)
+                    .expect("text is set")
+            })
+            .collect();
+
+        assert_eq!(serial_ids, concurrent_ids);
+        for id in serial_ids {
+            let (expected, actual) = (
+                serial.get_syntax_tree(&id).expect("serial tree"),
+                concurrent.get_syntax_tree(&id).expect("concurrent tree"),
+            );
+            assert_eq!(
+                expected.get_red_root().green(),
+                actual.get_red_root().green()
+            );
+            assert_eq!(
+                format!("{:?}", expected.get_errors()),
+                format!("{:?}", actual.get_errors())
+            );
+            assert_eq!(
+                format!("{:?}", serial.get_document(&id)),
+                format!("{:?}", concurrent.get_document(&id))
+            );
+        }
+    }
+
     #[test]
     fn deep_tree_vfs_clear_and_destroy_drop_safely_on_small_stack() {
         fn deep_blocks(depth: usize) -> String {

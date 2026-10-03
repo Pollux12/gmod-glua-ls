@@ -153,6 +153,35 @@ where
     computed.into_iter().map(|(_, value)| value).collect()
 }
 
+/// Run `f` for every item concurrently and collect the results into a `Vec`
+/// aligned with `items`. Each rayon task builds its own scratch state with
+/// `init` and reuses it across the items it runs. `None` when the batch is
+/// better run on the caller's thread, see [`runs_inline`].
+pub fn map_items_init<T, S, R>(
+    items: &[T],
+    init: impl Fn() -> S + Sync + Send,
+    f: impl Fn(&mut S, &T) -> R + Sync + Send,
+) -> Option<Vec<R>>
+where
+    T: Sync,
+    R: Send,
+{
+    if runs_inline(items.len()) {
+        return None;
+    }
+
+    let _p = Profile::cond_new("parallel map_items", items.len() > 1);
+    init_pool();
+    let mut results = Vec::new();
+    rayon::in_place_scope(|_| {
+        results = items
+            .par_iter()
+            .map_init(&init, |state, item| f(state, item))
+            .collect();
+    });
+    Some(results)
+}
+
 /// Indices into `file_ids`, ordered largest source first so the long poles are
 /// started before the short ones. Ties break on the index, keeping the order a
 /// pure function of the input.
