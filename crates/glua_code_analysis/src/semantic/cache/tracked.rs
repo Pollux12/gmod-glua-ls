@@ -52,18 +52,30 @@ impl<K: Hash + Eq + Clone, V> TrackedMap<K, V> {
     /// for where it holds.
     #[track_caller]
     pub fn get(&mut self, key: &K, lookup: Lookup, keyed: &[u64]) -> Option<&V> {
+        self.get_with_changes(key, lookup, keyed).0
+    }
+
+    #[track_caller]
+    pub(super) fn get_with_changes(
+        &mut self,
+        key: &K,
+        lookup: Lookup,
+        keyed: &[u64],
+    ) -> (Option<&V>, bool) {
         if self.local.contains_key(key) {
             derivation::taint();
-            return self.local.get(key);
+            return (self.local.get(key), false);
         }
-        let (_, provenance) = self.shared.get(key)?;
+        let Some((_, provenance)) = self.shared.get(key) else {
+            return (None, false);
+        };
         match derivation::reuse(provenance, lookup.gates, keyed, lookup.realm) {
-            Reuse::Held => self.shared.get(key).map(|(value, _)| value),
+            Reuse::Held => (self.shared.get(key).map(|(value, _)| value), false),
             Reuse::Stale => {
                 self.remove_shared(key);
-                None
+                (None, true)
             }
-            Reuse::Elsewhere => None,
+            Reuse::Elsewhere => (None, false),
         }
     }
 
@@ -128,10 +140,15 @@ impl<K: Hash + Eq + Clone, V> TrackedMap<K, V> {
     }
 
     /// Keeps the entries `keep` accepts.
-    pub fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
+    pub fn retain(&mut self, keep: impl FnMut(&K, &V) -> bool) {
+        self.retain_with_changes(keep);
+    }
+
+    pub(super) fn retain_with_changes(&mut self, mut keep: impl FnMut(&K, &V) -> bool) -> bool {
+        let before = self.shared.len();
         self.local.retain(|key, value| keep(key, value));
         if self.shared.is_empty() {
-            return;
+            return false;
         }
         if let Some(transaction) = super::transaction::current() {
             let undo = &mut self.undo;
@@ -148,6 +165,7 @@ impl<K: Hash + Eq + Clone, V> TrackedMap<K, V> {
         } else {
             self.shared.retain(|key, (value, _)| keep(key, value));
         }
+        self.shared.len() != before
     }
 
     fn prepare_undo(&mut self, transaction: u64) {

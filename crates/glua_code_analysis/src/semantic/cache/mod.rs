@@ -837,11 +837,15 @@ impl LuaInferCache {
         self.generic_call_bindings.clear();
         self.owner_raw_member_type_cache.clear();
         if self.active_transaction() {
+            let undo = self.transaction.as_mut().unwrap();
             let removed = self
                 .flow_node_cache
                 .iter_mut()
                 .filter_map(|(key, inner)| {
-                    inner.retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
+                    if inner.retain_with_changes(|_, entry| !matches!(entry, CacheEntry::Error(_)))
+                    {
+                        undo.touch_flow(key);
+                    }
                     inner.is_empty().then(|| key.clone())
                 })
                 .collect::<Vec<_>>();
@@ -974,11 +978,15 @@ impl LuaInferCache {
         origin: FlowOrigin,
     ) -> Option<&CacheEntry<Arc<LuaType>>> {
         let lookup = self.lookup();
-        self.flow_node_cache.get_mut(cache_key)?.get(
+        let (value, changed) = self.flow_node_cache.get_mut(cache_key)?.get_with_changes(
             &(flow_id, query_realm, origin),
             lookup,
             &self.keyed,
-        )
+        );
+        if changed && let Some(undo) = &mut self.transaction {
+            undo.touch_flow(cache_key);
+        }
+        value
     }
 
     pub fn set_flow_cache_with_origin_by_key(
@@ -992,6 +1000,9 @@ impl LuaInferCache {
     ) {
         if provenance.is_none() {
             self.flow_local_keys.push(cache_key.clone());
+        }
+        if provenance.is_some() {
+            self.touch_flow(cache_key);
         }
         self.capture_new_flow(cache_key);
         self.flow_node_cache
@@ -1012,6 +1023,9 @@ impl LuaInferCache {
     ) {
         if provenance.is_none() {
             self.flow_local_keys.push(cache_key.clone());
+        }
+        if provenance.is_some() {
+            self.touch_flow(cache_key);
         }
         self.capture_new_flow(cache_key);
         let by_flow = self.flow_node_cache.entry(cache_key.clone()).or_default();

@@ -6,7 +6,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
     CacheEntry, FlowEntries, LuaFunctionType, LuaInferCache, LuaSyntaxId, LuaType, Provenance,
@@ -50,6 +50,15 @@ pub(super) struct CacheUndo {
     calls: FxHashMap<CallKey, Option<CallBucket>>,
     flows: FxHashMap<VarRefCacheKey, Option<FlowEntries>>,
     keyed_flows: FxHashMap<KeyedFlowKey, Option<FlowEntries>>,
+    touched_flows: FxHashSet<VarRefCacheKey>,
+}
+
+impl CacheUndo {
+    pub(super) fn touch_flow(&mut self, key: &VarRefCacheKey) {
+        if Some(self.id) == current() {
+            self.touched_flows.insert(key.clone());
+        }
+    }
 }
 
 fn capture<K: Eq + Hash + Clone, V: Clone>(
@@ -93,6 +102,7 @@ impl LuaInferCache {
             calls: FxHashMap::default(),
             flows: FxHashMap::default(),
             keyed_flows: FxHashMap::default(),
+            touched_flows: FxHashSet::default(),
         }));
         CacheTransaction {
             previous: CURRENT.with(|current| current.replace(Some(id))),
@@ -134,6 +144,12 @@ impl LuaInferCache {
                 key,
                 FlowEntries::rollback_transaction,
             );
+        }
+    }
+
+    pub(super) fn touch_flow(&mut self, key: &VarRefCacheKey) {
+        if let Some(undo) = &mut self.transaction {
+            undo.touch_flow(key);
         }
     }
 
@@ -189,15 +205,24 @@ impl LuaInferCache {
             dynamic_field_definition_syntax_cache,
             call_returns_never_cache
         );
-        for entries in self
-            .flow_node_cache
-            .values_mut()
-            .chain(self.keyed_flow_node_cache.values_mut())
-        {
-            if rollback {
-                entries.rollback_transaction();
-            } else {
-                entries.commit_transaction();
+        if let Some(undo) = &self.transaction {
+            for key in undo.touched_flows.iter().chain(undo.flows.keys()) {
+                if let Some(entries) = self.flow_node_cache.get_mut(key) {
+                    if rollback {
+                        entries.rollback_transaction();
+                    } else {
+                        entries.commit_transaction();
+                    }
+                }
+            }
+            for key in undo.keyed_flows.keys() {
+                if let Some(entries) = self.keyed_flow_node_cache.get_mut(key) {
+                    if rollback {
+                        entries.rollback_transaction();
+                    } else {
+                        entries.commit_transaction();
+                    }
+                }
             }
         }
     }

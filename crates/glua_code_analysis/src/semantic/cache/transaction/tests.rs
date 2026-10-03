@@ -355,3 +355,236 @@ fn parallel_cache_replacement_preserves_equal_keys_and_rolls_back_collisions() {
     assert_eq!(map.peek(&EqualKey(2, "lookup")), Some(&20));
     finish();
 }
+
+fn flow_key(at: u32) -> VarRefCacheKey {
+    VarRefCacheKey::VarRef(LuaDeclId::new(FileId::new(1), TextSize::from(at)))
+}
+
+fn put_flow(
+    cache: &mut LuaInferCache,
+    key: &VarRefCacheKey,
+    flow: u32,
+    entry: CacheEntry<Arc<LuaType>>,
+    provenance: Provenance,
+) {
+    cache.set_flow_cache_with_origin_by_key(
+        key,
+        FlowId(flow),
+        GmodRealm::Server,
+        super::super::FlowOrigin::Real,
+        entry,
+        Some(provenance),
+    );
+}
+
+#[test]
+fn parallel_cache_flow_hits_and_elsewhere_misses_do_not_queue_finish() {
+    begin();
+    let mut cache = cache();
+    let old = proof(&cache);
+    for at in 1..=32 {
+        put_flow(
+            &mut cache,
+            &flow_key(at),
+            1,
+            CacheEntry::Cache(Arc::new(LuaType::Integer)),
+            old.clone(),
+        );
+    }
+    derivation::end();
+    next();
+    let transaction = cache.begin_transaction();
+    for at in 1..=32 {
+        assert!(
+            cache
+                .get_flow_cache_with_origin_by_key(
+                    &flow_key(at),
+                    FlowId(1),
+                    GmodRealm::Server,
+                    super::super::FlowOrigin::Real
+                )
+                .is_some()
+        );
+        assert!(
+            cache
+                .get_flow_cache_with_origin_by_key(
+                    &flow_key(at),
+                    FlowId(2),
+                    GmodRealm::Server,
+                    super::super::FlowOrigin::Real
+                )
+                .is_none()
+        );
+    }
+    cache.config.analysis_phase = super::super::LuaAnalysisPhase::Force;
+    assert!(
+        cache
+            .get_flow_cache_with_origin_by_key(
+                &flow_key(1),
+                FlowId(1),
+                GmodRealm::Server,
+                super::super::FlowOrigin::Real
+            )
+            .is_none()
+    );
+    cache.config.analysis_phase = super::super::LuaAnalysisPhase::Ordered;
+    let undo = cache.transaction.as_ref().unwrap();
+    assert!(undo.touched_flows.is_empty());
+    assert!(undo.flows.is_empty());
+    assert!(undo.keyed_flows.is_empty());
+    drop(transaction);
+    cache.commit_transaction();
+    assert_eq!(cache.flow_node_cache.len(), 32);
+    finish();
+}
+
+#[test]
+fn parallel_cache_sparse_finish_restores_flow_stale_removal() {
+    begin();
+    let mut cache = cache();
+    let old = proof(&cache);
+    put_flow(
+        &mut cache,
+        &flow_key(1),
+        1,
+        CacheEntry::Cache(Arc::new(LuaType::Integer)),
+        old.clone(),
+    );
+    put_flow(
+        &mut cache,
+        &flow_key(2),
+        1,
+        CacheEntry::Cache(Arc::new(LuaType::String)),
+        old,
+    );
+    derivation::end();
+    next();
+    let transaction = cache.begin_transaction();
+    derivation::note_write(|| FactKey::GmodRealm(FileId::new(7)));
+    assert!(
+        cache
+            .get_flow_cache_with_origin_by_key(
+                &flow_key(1),
+                FlowId(1),
+                GmodRealm::Server,
+                super::super::FlowOrigin::Real
+            )
+            .is_none()
+    );
+    let undo = cache.transaction.as_ref().unwrap();
+    assert_eq!(undo.touched_flows.len(), 1);
+    assert!(undo.touched_flows.contains(&flow_key(1)));
+    assert!(undo.flows.is_empty());
+    drop(transaction);
+    cache.rollback_transaction();
+    let inner = (FlowId(1), GmodRealm::Server, super::super::FlowOrigin::Real);
+    assert!(
+        matches!(cache.flow_node_cache[&flow_key(1)].peek(&inner), Some(CacheEntry::Cache(value)) if value.as_ref() == &LuaType::Integer)
+    );
+    assert!(
+        matches!(cache.flow_node_cache[&flow_key(2)].peek(&inner), Some(CacheEntry::Cache(value)) if value.as_ref() == &LuaType::String)
+    );
+    finish();
+}
+
+#[test]
+fn parallel_cache_sparse_finish_restores_partial_flow_retain() {
+    begin();
+    let mut cache = cache();
+    let old = proof(&cache);
+    put_flow(
+        &mut cache,
+        &flow_key(1),
+        1,
+        CacheEntry::Cache(Arc::new(LuaType::Integer)),
+        old.clone(),
+    );
+    put_flow(
+        &mut cache,
+        &flow_key(1),
+        2,
+        CacheEntry::Error(super::super::InferFailReason::FieldNotFound),
+        old.clone(),
+    );
+    put_flow(
+        &mut cache,
+        &flow_key(2),
+        1,
+        CacheEntry::Cache(Arc::new(LuaType::String)),
+        old,
+    );
+    derivation::end();
+    next();
+    let transaction = cache.begin_transaction();
+    cache.clear_deferred_inference_results();
+    let undo = cache.transaction.as_ref().unwrap();
+    assert_eq!(undo.touched_flows.len(), 1);
+    assert!(undo.touched_flows.contains(&flow_key(1)));
+    assert!(undo.flows.is_empty());
+    drop(transaction);
+    cache.rollback_transaction();
+    assert!(matches!(
+        cache.flow_node_cache[&flow_key(1)].peek(&(
+            FlowId(2),
+            GmodRealm::Server,
+            super::super::FlowOrigin::Real
+        )),
+        Some(CacheEntry::Error(_))
+    ));
+    assert_eq!(cache.flow_node_cache[&flow_key(2)].len(), 1);
+    finish();
+}
+
+#[test]
+fn parallel_cache_sparse_commit_finishes_moved_flow_before_next_epoch() {
+    begin();
+    let mut cache = cache();
+    let reference = VarRefId::VarRef(LuaDeclId::new(FileId::new(1), TextSize::from(1)));
+    let key = flow_key(1);
+    let old = proof(&cache);
+    put_flow(
+        &mut cache,
+        &key,
+        1,
+        CacheEntry::Cache(Arc::new(LuaType::Integer)),
+        old,
+    );
+    derivation::end();
+    next();
+    let transaction = cache.begin_transaction();
+    let previous = cache.key_flow_cache(&reference, &LuaType::String);
+    let provisional = proof(&cache);
+    put_flow(
+        &mut cache,
+        &key,
+        1,
+        CacheEntry::Cache(Arc::new(LuaType::String)),
+        provisional,
+    );
+    cache.unkey_flow_cache(&reference, LuaType::String, previous);
+    drop(transaction);
+    derivation::end();
+    cache.commit_transaction();
+    next();
+    let transaction = cache.begin_transaction();
+    let previous = cache.key_flow_cache(&reference, &LuaType::String);
+    let provisional = proof(&cache);
+    put_flow(
+        &mut cache,
+        &key,
+        1,
+        CacheEntry::Cache(Arc::new(LuaType::Boolean)),
+        provisional,
+    );
+    cache.unkey_flow_cache(&reference, LuaType::String, previous);
+    drop(transaction);
+    cache.rollback_transaction();
+    let inner = (FlowId(1), GmodRealm::Server, super::super::FlowOrigin::Real);
+    assert!(
+        matches!(cache.keyed_flow_node_cache[&(key.clone(), LuaType::String)].peek(&inner), Some(CacheEntry::Cache(value)) if value.as_ref() == &LuaType::String)
+    );
+    assert!(
+        matches!(cache.flow_node_cache[&key].peek(&inner), Some(CacheEntry::Cache(value)) if value.as_ref() == &LuaType::Integer)
+    );
+    finish();
+}
