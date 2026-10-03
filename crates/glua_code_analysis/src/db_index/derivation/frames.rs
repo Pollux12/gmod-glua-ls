@@ -143,7 +143,12 @@ pub fn open_frame() -> Option<OpenFrame> {
 /// Opens a frame whose memo is keyed by the context `absorbs` names: a read
 /// of that context inside it taints only the frames nested in it.
 pub fn open_frame_absorbing(absorbs: u64) -> Option<OpenFrame> {
-    with_evaluation(|evaluation, _| {
+    if !super::transport::active() && super::KEYS.with(|keys| keys.borrow().is_none()) {
+        return None;
+    }
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        let evaluation = current.as_mut()?;
         let stamp = next_stamp();
         let depth = evaluation.frames.len() as u32;
         evaluation.frames.push(Frame {
@@ -156,7 +161,7 @@ pub fn open_frame_absorbing(absorbs: u64) -> Option<OpenFrame> {
             unkeyed: u32::try_from(evaluation.unkeyed.len())
                 .expect("fewer than 2^32 context reads"),
         });
-        OpenFrame(depth)
+        Some(OpenFrame(depth))
     })
 }
 
@@ -427,85 +432,172 @@ pub fn reuse(
         count(|stats| stats.other_context += 1);
         return Reuse::Elsewhere;
     }
-    with_evaluation(|evaluation, table| {
-        let range = provenance.0.start as usize..provenance.0.end as usize;
-        if Arc::ptr_eq(&provenance.0.log, &evaluation.log_handle) {
-            // Computed by this evaluation: its reads are in the log already,
-            // within the innermost frame if it opened before them.
-            if provenance.0.since <= super::last_write() {
-                match provenance.freshness(table, &evaluation.log[range.clone()]) {
-                    Freshness::Unwritten => {}
-                    Freshness::Recomputing => return Reuse::Elsewhere,
-                    Freshness::Written => {
-                        count(|stats| stats.stale += 1);
-                        return Reuse::Stale;
+    reuse_worker(provenance, view, keyed, realm, caller)
+        .or_else(|| {
+            with_evaluation(|evaluation, table| {
+                let range = provenance.0.start as usize..provenance.0.end as usize;
+                if Arc::ptr_eq(&provenance.0.log, &evaluation.log_handle) {
+                    // Computed by this evaluation: its reads are in the log already,
+                    // within the innermost frame if it opened before them.
+                    if provenance.0.since <= super::last_write() {
+                        match provenance.freshness(table, &evaluation.log[range.clone()]) {
+                            Freshness::Unwritten => {}
+                            Freshness::Recomputing => return Reuse::Elsewhere,
+                            Freshness::Written => {
+                                count(|stats| stats.stale += 1);
+                                return Reuse::Stale;
+                            }
+                        }
+                    }
+                    if provenance.0.since < evaluation.frame_stamp()
+                        && provenance.replays_into(evaluation.frame_stamp())
+                    {
+                        count(|stats| {
+                            stats.replayed += range.len() as u64;
+                        });
+                        for at in range {
+                            let slot = evaluation.log[at];
+                            evaluation.log_slot(table, slot);
+                        }
+                        replay_unkeyed(evaluation, provenance);
+                    }
+                    count(|stats| {
+                        stats.reused_here += 1;
+                        stats.sites.entry(caller).or_default()[2] += 1;
+                    });
+                } else {
+                    let Some(reads) = provenance.0.log.0.get().and_then(|log| log.get(range))
+                    else {
+                        return Reuse::Elsewhere;
+                    };
+                    match provenance.freshness(table, reads) {
+                        Freshness::Unwritten => {}
+                        Freshness::Recomputing => return Reuse::Elsewhere,
+                        Freshness::Written => {
+                            count(|stats| stats.stale += 1);
+                            return Reuse::Stale;
+                        }
+                    }
+                    if check_cache()
+                        && evaluation
+                            .checks
+                            .insert(check_identity(provenance, table, view, keyed, realm))
+                    {
+                        REUSED_ACROSS.with(|flag| flag.set(true));
+                    }
+                    let replays = provenance.replays_into(evaluation.frame_stamp());
+                    count(|stats| {
+                        stats.reused += 1;
+                        let site = stats.sites.entry(caller).or_default();
+                        site[3] += 1;
+                        if replays {
+                            stats.replayed += reads.len() as u64;
+                            site[4] += reads.len() as u64;
+                        }
+                    });
+                    if replays {
+                        for slot in reads {
+                            evaluation.log_slot(table, *slot);
+                        }
+                        replay_unkeyed(evaluation, provenance);
                     }
                 }
-            }
-            if provenance.0.since < evaluation.frame_stamp()
-                && provenance.replays_into(evaluation.frame_stamp())
-            {
+                let depth = evaluation.frames.len() as u32;
+                if let Some(frame) = evaluation.frames.last_mut() {
+                    frame.gates |= provenance.0.gates;
+                    let base = realm.map_or(0, |(_, base)| base);
+                    if provenance.0.realm.is_some() && base < depth {
+                        frame.realm = Some((inherited, base));
+                    }
+                }
+                Reuse::Held
+            })
+        })
+        .or_else(|| reuse_viewed(provenance, view, keyed, realm, caller))
+        .unwrap_or(Reuse::Elsewhere)
+}
+
+fn reuse_worker(
+    provenance: &Provenance,
+    view: Gates,
+    keyed: &[u64],
+    realm: Option<(GmodRealm, u32)>,
+    caller: &'static std::panic::Location<'static>,
+) -> Option<Reuse> {
+    if !super::transport::active() {
+        return None;
+    }
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        let evaluation = current.as_mut()?;
+        super::transport::with_keys(|worker| {
+            let range = provenance.0.start as usize..provenance.0.end as usize;
+            if Arc::ptr_eq(&provenance.0.log, &evaluation.log_handle) {
+                if !worker.local_queries_hold(&evaluation.log[range.clone()]) {
+                    return Reuse::Elsewhere;
+                }
+                if provenance.0.since < evaluation.frame_stamp()
+                    && provenance.replays_into(evaluation.frame_stamp())
+                {
+                    for at in range {
+                        let local = evaluation.log[at];
+                        worker.log(evaluation, local);
+                        worker.observe_ready(local);
+                    }
+                    replay_unkeyed(evaluation, provenance);
+                }
                 count(|stats| {
-                    stats.replayed += range.len() as u64;
+                    stats.reused_here += 1;
+                    stats.sites.entry(caller).or_default()[2] += 1;
                 });
-                for at in range {
-                    let slot = evaluation.log[at];
-                    evaluation.log_slot(table, slot);
+            } else {
+                let Some(reads) = provenance.0.log.0.get().and_then(|log| log.get(range)) else {
+                    return Reuse::Elsewhere;
+                };
+                if !worker.canonical_queries_hold(reads) {
+                    return Reuse::Elsewhere;
                 }
-                replay_unkeyed(evaluation, provenance);
+                match provenance.freshness(worker.graph().keys(), reads) {
+                    Freshness::Unwritten => {}
+                    Freshness::Recomputing => return Reuse::Elsewhere,
+                    Freshness::Written => return Reuse::Stale,
+                }
+                if check_cache()
+                    && evaluation.checks.insert(check_identity(
+                        provenance,
+                        worker.graph().keys(),
+                        view,
+                        keyed,
+                        realm,
+                    ))
+                {
+                    REUSED_ACROSS.with(|flag| flag.set(true));
+                }
+                if provenance.replays_into(evaluation.frame_stamp()) {
+                    for slot in reads {
+                        let local = worker
+                            .record_known(evaluation, *slot)
+                            .expect("qualified snapshot read is live");
+                        worker.observe_ready(local);
+                    }
+                    replay_unkeyed(evaluation, provenance);
+                }
+                count(|stats| {
+                    stats.reused += 1;
+                    stats.sites.entry(caller).or_default()[3] += 1;
+                });
             }
-            count(|stats| {
-                stats.reused_here += 1;
-                stats.sites.entry(caller).or_default()[2] += 1;
-            });
-        } else {
-            let Some(reads) = provenance.0.log.0.get().and_then(|log| log.get(range)) else {
-                return Reuse::Elsewhere;
-            };
-            match provenance.freshness(table, reads) {
-                Freshness::Unwritten => {}
-                Freshness::Recomputing => return Reuse::Elsewhere,
-                Freshness::Written => {
-                    count(|stats| stats.stale += 1);
-                    return Reuse::Stale;
+            let depth = evaluation.frames.len() as u32;
+            if let Some(frame) = evaluation.frames.last_mut() {
+                frame.gates |= provenance.0.gates;
+                let base = realm.map_or(0, |(_, base)| base);
+                if provenance.0.realm.is_some() && base < depth {
+                    frame.realm = Some((realm.map(|(realm, _)| realm), base));
                 }
             }
-            if check_cache()
-                && evaluation
-                    .checks
-                    .insert(check_identity(provenance, table, view, keyed, realm))
-            {
-                REUSED_ACROSS.with(|flag| flag.set(true));
-            }
-            let replays = provenance.replays_into(evaluation.frame_stamp());
-            count(|stats| {
-                stats.reused += 1;
-                let site = stats.sites.entry(caller).or_default();
-                site[3] += 1;
-                if replays {
-                    stats.replayed += reads.len() as u64;
-                    site[4] += reads.len() as u64;
-                }
-            });
-            if replays {
-                for slot in reads {
-                    evaluation.log_slot(table, *slot);
-                }
-                replay_unkeyed(evaluation, provenance);
-            }
-        }
-        let depth = evaluation.frames.len() as u32;
-        if let Some(frame) = evaluation.frames.last_mut() {
-            frame.gates |= provenance.0.gates;
-            let base = realm.map_or(0, |(_, base)| base);
-            if provenance.0.realm.is_some() && base < depth {
-                frame.realm = Some((inherited, base));
-            }
-        }
-        Reuse::Held
+            Reuse::Held
+        })
     })
-    .or_else(|| reuse_viewed(provenance, view, keyed, realm, caller))
-    .unwrap_or(Reuse::Elsewhere)
 }
 
 fn replay_unkeyed(evaluation: &mut Evaluation, provenance: &Provenance) {

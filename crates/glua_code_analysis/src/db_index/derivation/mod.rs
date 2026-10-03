@@ -11,7 +11,11 @@ mod graph;
 mod positions;
 mod transport;
 
-pub(crate) use transport::{ReleaseQuarantine, WorkerKey, WorkerKeys};
+pub(crate) use transport::query_requires_canonical as worker_requires_canonical;
+pub(crate) use transport::{
+    RecordingSnapshot, ReleaseQuarantine, WorkerEvaluation, WorkerKey, WorkerKeys, WorkerResult,
+    compute_recorded, note_observed_query_read, require_canonical_query, worker_query_readiness,
+};
 
 use std::cell::RefCell;
 
@@ -1404,17 +1408,11 @@ fn start(evaluation: Evaluation) {
 /// suspended evaluation's key table, view and untracked or re-homing regions
 /// do not apply to it, so what it read can be filed whatever it ran inside.
 pub fn detached<T>(id: DerivationId, f: impl FnOnce() -> T) -> (T, Vec<HashedKey>) {
-    let keys = KEYS.with(|keys| keys.borrow_mut().take());
-    let view = VIEW.with(|view| view.borrow_mut().take());
-    let untracked = UNTRACKED.with(|depth| depth.replace(0));
-    let rehoming = REHOMING.with(|depth| depth.replace(0));
+    let saved = transport::SavedRecording::take();
     begin(id);
     let result = f();
     let evaluation = end();
-    KEYS.with(|slot| *slot.borrow_mut() = keys);
-    VIEW.with(|slot| *slot.borrow_mut() = view);
-    UNTRACKED.with(|depth| depth.set(untracked));
-    REHOMING.with(|depth| depth.set(rehoming));
+    drop(saved);
     let (_, reads, _) = evaluation.into_unfingerprinted_parts();
     (result, reads.into_iter().map(|(key, _)| key).collect())
 }
@@ -1519,6 +1517,9 @@ impl Evaluation {
 /// Records a read of `key`, interned if a key table is lent, else as its
 /// slot in the viewed graph if it has one. Returns its slot in the lent table.
 fn record_read(evaluation: &mut Evaluation, key: HashedKey) -> Option<KeyIdx> {
+    if transport::active() {
+        return transport::with_keys(|worker| worker.record(evaluation, key));
+    }
     KEYS.with(|keys| match keys.borrow_mut().as_mut() {
         Some(table) => {
             let slot = table.intern_read(key, evaluation.stamp);
@@ -1547,6 +1548,21 @@ fn record_read(evaluation: &mut Evaluation, key: HashedKey) -> Option<KeyIdx> {
     })
 }
 
+fn log_recorded(evaluation: &mut Evaluation, slot: KeyIdx) {
+    if transport::active() {
+        transport::with_keys(|worker| worker.log(evaluation, slot));
+    } else {
+        KEYS.with(|keys| {
+            if let Some(table) = keys.borrow_mut().as_mut() {
+                evaluation.log_slot(table, slot);
+                if table.taints(slot) {
+                    frames::taint_evaluation(evaluation);
+                }
+            }
+        });
+    }
+}
+
 /// Records a read of `key`, which `identity` names exactly: a repeat within
 /// the evaluation is one small-set probe instead of building and hashing the
 /// key. The identity must be unique to the key for as long as the recorded
@@ -1559,14 +1575,7 @@ fn note_read_by(identity: (u8, u128), key: impl FnOnce() -> FactKey) {
         if let Some(evaluation) = current.borrow_mut().as_mut() {
             NOTED_READS.with(|count| count.set(count.get() + 1));
             match evaluation.read_identities.get(&identity).copied() {
-                Some(slot) => KEYS.with(|keys| {
-                    if let Some(table) = keys.borrow_mut().as_mut() {
-                        evaluation.log_slot(table, slot);
-                        if table.taints(slot) {
-                            frames::taint_evaluation(evaluation);
-                        }
-                    }
-                }),
+                Some(slot) => log_recorded(evaluation, slot),
                 None => {
                     if let Some(slot) = record_read(evaluation, HashedKey::new(key())) {
                         evaluation.read_identities.insert(identity, slot);
@@ -1615,14 +1624,7 @@ fn note_named_read(tag: u8, owner: u128, name: Option<&str>, key: impl FnOnce() 
             })
             .map(|read| read.slot);
         match found {
-            Some(slot) => KEYS.with(|keys| {
-                if let Some(table) = keys.borrow_mut().as_mut() {
-                    evaluation.log_slot(table, slot);
-                    if table.taints(slot) {
-                        frames::taint_evaluation(evaluation);
-                    }
-                }
-            }),
+            Some(slot) => log_recorded(evaluation, slot),
             None => {
                 let slot = record_read(evaluation, HashedKey::new(key())).unwrap_or(KeyIdx::MAX);
                 evaluation.named_reads.insert_unique(
@@ -1861,6 +1863,18 @@ impl Clone for FactRead {
 impl FactRead {
     pub(crate) fn recomputes(&self, owner: &LuaTypeOwner) -> bool {
         use std::sync::atomic::Ordering;
+        if let Some(windowed) = transport::with_snapshot(|graph| {
+            graph
+                .keys()
+                .matching_slot(
+                    self.0.load(Ordering::Relaxed),
+                    |fact| matches!(fact, FactKey::TypeCache(stored) if stored == owner),
+                )
+                .or_else(|| graph.find_slot(&HashedKey::new(FactKey::TypeCache(owner.clone()))))
+                .is_some_and(|slot| graph.keys().windowed(slot))
+        }) {
+            return windowed;
+        }
         KEYS.with(|keys| {
             keys.borrow().as_ref().is_some_and(|table| {
                 table
@@ -1888,6 +1902,28 @@ impl FactRead {
             let Some(evaluation) = current.as_mut() else {
                 return true;
             };
+            if transport::active() {
+                NOTED_READS.with(|count| count.set(count.get() + 1));
+                transport::with_keys(|worker| {
+                    let hint = self.0.load(Ordering::Relaxed);
+                    if let Some(global) = worker.graph().keys().matching_slot(hint, &matches) {
+                        worker
+                            .record_known(evaluation, global)
+                            .expect("snapshot hint is live");
+                    } else {
+                        let key = HashedKey::new(key());
+                        if let Some(global) = worker.graph().find_slot(&key) {
+                            self.0.store(global, Ordering::Relaxed);
+                            worker
+                                .record_known(evaluation, global)
+                                .expect("snapshot key is live");
+                        } else {
+                            worker.record(evaluation, key);
+                        }
+                    }
+                });
+                return true;
+            }
             if KEYS.with(|keys| keys.borrow().is_none())
                 && VIEW.with(|view| view.borrow().is_none())
             {

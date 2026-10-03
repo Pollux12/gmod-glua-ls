@@ -389,6 +389,13 @@ impl KeyTable {
                 .is_some_and(|active| active.load(Ordering::Acquire))
     }
 
+    pub(super) fn quarantine_started(&self) -> Option<u64> {
+        self.retirement
+            .as_ref()
+            .filter(|active| active.load(Ordering::Acquire))
+            .map(|_| self.retirement_started)
+    }
+
     fn collect_retired(&mut self) {
         if self
             .retirement
@@ -494,6 +501,29 @@ impl KeyTable {
 
     pub(super) fn intern_read(&mut self, key: HashedKey, now: u64) -> KeyIdx {
         self.intern(key, now)
+    }
+
+    pub(super) fn intern_worker_read(&mut self, key: HashedKey, now: u64) -> KeyIdx {
+        let slot = self.intern(key, now);
+        let mut base = self.key(slot).base();
+        while let Some(key) = base {
+            let key = HashedKey::new(key);
+            if let Some(base_slot) = self.find(&key) {
+                let windowed = self.windowed(base_slot);
+                let held = self.held(base_slot);
+                let entry = &mut self.keys[slot as usize];
+                if windowed {
+                    self.windows.entry(slot).or_insert(entry.written);
+                    entry.windowed = true;
+                }
+                if held {
+                    self.held.entry(slot).or_insert(entry.written);
+                    entry.held = true;
+                }
+            }
+            base = key.base();
+        }
+        slot
     }
 
     /// Marks `key` written at stamp `now`, if anything ever read it, and every
@@ -637,6 +667,10 @@ impl KeyTable {
     /// Whether `slot`'s value is being computed again.
     pub(super) fn windowed(&self, slot: KeyIdx) -> bool {
         self.keys[slot as usize].windowed
+    }
+
+    pub(super) fn held(&self, slot: KeyIdx) -> bool {
+        self.keys[slot as usize].held
     }
 
     /// Whether a read of `slot` sees a value only the evaluation reading it

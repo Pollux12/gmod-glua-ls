@@ -6,6 +6,14 @@ use rustc_hash::FxHashMap;
 
 use super::{Evaluation, HashedKey, KeyIdx, KeyTable, ReaderGraph, frames, latest_stamp};
 
+mod worker;
+pub(crate) use worker::{
+    ComputeInputs, RecordingSnapshot, WorkerEvaluation, WorkerResult, compute_recorded,
+    note_observed_query_read, query_requires_canonical, require_canonical_query,
+    worker_query_readiness,
+};
+pub(super) use worker::{SavedRecording, active, with_keys, with_snapshot};
+
 #[must_use]
 pub(crate) struct ReleaseQuarantine {
     active: Arc<AtomicBool>,
@@ -172,7 +180,7 @@ impl WorkerKeys {
         let new_slots = self
             .new_keys
             .into_iter()
-            .map(|key| table.intern_read(key, stamp))
+            .map(|key| table.intern_worker_read(key, stamp))
             .collect::<Vec<_>>();
         Some(
             self.entries
