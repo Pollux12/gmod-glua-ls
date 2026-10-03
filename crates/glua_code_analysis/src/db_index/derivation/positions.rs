@@ -16,8 +16,9 @@ use rustc_hash::FxHashMap;
 
 use super::{FactKey, Fingerprint};
 use crate::{
-    DynamicFieldOwner, FileId, InFiled, LuaDeclId, LuaDefinitionId, LuaMemberId, LuaMemberKey,
-    LuaMemberOwner, LuaOperatorOwner, LuaSemanticDeclId, LuaSignatureId, LuaTypeOwner, PositionMap,
+    DynamicFieldOwner, FileId, InFiled, LuaDeclId, LuaDeclOrMemberId, LuaDefinitionId, LuaMemberId,
+    LuaMemberKey, LuaMemberOwner, LuaOperatorOwner, LuaSemanticDeclId, LuaSignatureId,
+    LuaTypeOwner, PositionMap, SelfRefId, VarRefId, VarRefRootId,
 };
 use glua_parser::LuaSyntaxId;
 
@@ -132,6 +133,40 @@ impl EditMaps {
         })
     }
 
+    fn decl_or_member_id(&self, id: &LuaDeclOrMemberId) -> Option<LuaDeclOrMemberId> {
+        Some(match id {
+            LuaDeclOrMemberId::Decl(id) => LuaDeclOrMemberId::Decl(self.decl_id(*id)?),
+            LuaDeclOrMemberId::Member(id) => LuaDeclOrMemberId::Member(self.member_id(*id)?),
+        })
+    }
+
+    fn self_ref_id(&self, id: &SelfRefId) -> Option<SelfRefId> {
+        Some(SelfRefId {
+            self_decl_id: self.decl_id(id.self_decl_id)?,
+            receiver: self.decl_or_member_id(&id.receiver)?,
+        })
+    }
+
+    /// A variable reference in the coordinates after the edits. A global
+    /// name's position is not part of its identity, so it stays.
+    fn var_ref_id(&self, id: &VarRefId) -> Option<VarRefId> {
+        Some(match id {
+            VarRefId::VarRef(decl_id) => VarRefId::VarRef(self.decl_id(*decl_id)?),
+            VarRefId::SelfRef(self_ref) => VarRefId::SelfRef(self.self_ref_id(self_ref)?),
+            VarRefId::IndexRef(root, path) => VarRefId::IndexRef(
+                match root {
+                    VarRefRootId::Decl(id) => VarRefRootId::Decl(self.decl_id(*id)?),
+                    VarRefRootId::Member(id) => VarRefRootId::Member(self.member_id(*id)?),
+                    VarRefRootId::SelfRef(self_ref) => {
+                        VarRefRootId::SelfRef(self.self_ref_id(self_ref)?)
+                    }
+                },
+                path.clone(),
+            ),
+            VarRefId::GlobalName(..) => id.clone(),
+        })
+    }
+
     fn member_owner(&self, owner: &LuaMemberOwner) -> Option<LuaMemberOwner> {
         Some(match owner {
             LuaMemberOwner::Element(site) => LuaMemberOwner::Element(self.site(site)?),
@@ -204,6 +239,9 @@ impl EditMaps {
             }
             K::SpecialCall(file_id, position) => {
                 K::SpecialCall(*file_id, self.position(*file_id, *position)?)
+            }
+            K::SpecialCallFor(file_id, var_ref_id) => {
+                K::SpecialCallFor(*file_id, self.var_ref_id(var_ref_id)?)
             }
             K::GmodRealmAt(file_id, offset) => {
                 K::GmodRealmAt(*file_id, self.position(*file_id, *offset)?)

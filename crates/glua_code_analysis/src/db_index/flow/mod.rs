@@ -212,14 +212,27 @@ impl LuaFlowIndex {
         self.settled_special_call_facts.iter()
     }
 
-    /// Whether the file has ANY special-call effect. Used by the flow-walk skip
-    /// fast-path: special calls can narrow arbitrary var-refs at runtime, so a
-    /// file with any such effect must not skip narrowing walks.
-    pub fn has_any_special_call_effect(&self, file_id: &FileId) -> bool {
-        derivation::note_read(|| FactKey::SpecialCallFile(*file_id));
+    /// The special-call effects of `file_id`, with their positions.
+    fn effects_in(
+        &self,
+        file_id: &FileId,
+    ) -> impl Iterator<Item = (&TextSize, &LuaSpecialCallEffect)> {
         self.special_call_effects
             .get(file_id)
-            .is_some_and(|by_pos| !by_pos.is_empty())
+            .into_iter()
+            .flat_map(|effects| {
+                effects.iter().flat_map(|(position, effects)| {
+                    effects.iter().map(move |effect| (position, effect))
+                })
+            })
+    }
+
+    /// Whether a special-call effect of `file_id` narrows `var_ref_id`: the
+    /// flow walk's special calls change nothing else about it.
+    pub fn has_special_call_effect_for(&self, file_id: &FileId, var_ref_id: &VarRefId) -> bool {
+        derivation::note_read(|| FactKey::SpecialCallFor(*file_id, var_ref_id.clone()));
+        self.effects_in(file_id)
+            .any(|(_, effect)| effect.narrows(var_ref_id))
     }
 
     pub fn has_special_call_effect_before(
@@ -228,17 +241,10 @@ impl LuaFlowIndex {
         position: TextSize,
         target: &VarRefId,
     ) -> bool {
-        derivation::note_read(|| FactKey::SpecialCallFile(*file_id));
-        self.special_call_effects
-            .get(file_id)
-            .is_some_and(|effects_by_position| {
-                effects_by_position
-                    .iter()
-                    .any(|(effect_position, effects)| {
-                        *effect_position < position
-                            && effects.iter().any(|effect| &effect.target == target)
-                    })
-            })
+        derivation::note_read(|| FactKey::SpecialCallFor(*file_id, target.clone()));
+        self.effects_in(file_id).any(|(effect_position, effect)| {
+            *effect_position < position && &effect.target == target
+        })
     }
 
     pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
@@ -266,6 +272,21 @@ impl LuaFlowIndex {
                             .fold(0u64, u64::wrapping_add)
                             .max(1)
                     })
+            }
+            FactKey::SpecialCallFor(file_id, var_ref_id) => {
+                let mut effects = self
+                    .effects_in(file_id)
+                    .filter(|(_, effect)| effect.may_narrow(var_ref_id))
+                    .peekable();
+                if effects.peek().is_none() {
+                    return derivation::ABSENT;
+                }
+                effects
+                    .map(|(position, effect)| {
+                        derivation::fingerprint_of(&(derivation::Local(position), &effect.target))
+                    })
+                    .fold(0, Fingerprint::wrapping_add)
+                    .max(1)
             }
             FactKey::SpecialCall(file_id, position) => {
                 let effects = self
@@ -351,6 +372,33 @@ impl LuaIndex for LuaFlowIndex {
 pub struct LuaSpecialCallEffect {
     pub target: VarRefId,
     pub type_ref: LuaType,
+}
+
+impl LuaSpecialCallEffect {
+    /// Whether the effect narrows `var_ref_id`: its target, or a field of the
+    /// receiver a `self` target names.
+    pub fn narrows(&self, var_ref_id: &VarRefId) -> bool {
+        &self.target == var_ref_id
+            || matches!(
+                (&self.target, var_ref_id),
+                (VarRefId::SelfRef(effect_self), VarRefId::IndexRef(root, _))
+                    if root.receiver_eq(&effect_self.receiver)
+            )
+    }
+
+    /// Whether the effect narrows `var_ref_id` under any receiver: a `self`
+    /// root's receiver is inferred and not part of the reference's identity,
+    /// so [`FactKey::SpecialCallFor`] covers every `self` target for it.
+    fn may_narrow(&self, var_ref_id: &VarRefId) -> bool {
+        self.narrows(var_ref_id)
+            || matches!(
+                (&self.target, var_ref_id),
+                (
+                    VarRefId::SelfRef(_),
+                    VarRefId::IndexRef(crate::VarRefRootId::SelfRef(_), _)
+                )
+            )
+    }
 }
 
 /// One materialized special-call fact, keyed canonically.
@@ -609,6 +657,119 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// A reader of whether a file's special calls narrow one reference records
+    /// that reference's effects, read out of the file's: the file's first
+    /// effect on another reference holds it, one on its own moves it.
+    #[test]
+    fn a_special_call_effect_on_another_reference_holds_a_reader_of_one() {
+        let mut index = LuaFlowIndex::new();
+        let file_id = FileId::new(1);
+        let read_ref = effect_target(file_id);
+        let other_ref = VarRefId::VarRef(crate::LuaDeclId::new(file_id, TextSize::new(8)));
+        derivation::begin(derivation::DerivationId::workspace(
+            derivation::DerivationKind::GmodLoad,
+        ));
+        assert!(!index.has_special_call_effect_for(&file_id, &read_ref));
+        assert!(!index.has_special_call_effect_before(&file_id, TextSize::new(32), &read_ref));
+        let reads = derivation::end().into_recorded().2;
+        let [read] = reads.as_slice() else {
+            panic!("expected one read, got {reads:?}");
+        };
+        let file_effects = FactKey::SpecialCallFile(file_id);
+        assert!(file_effects.is_base());
+        assert_eq!(read.base(), Some(file_effects.clone()));
+        let fingerprint = |index: &LuaFlowIndex, key: &FactKey| {
+            derivation::in_file(Some(file_id), || index.fact_fingerprint(key))
+        };
+        let seen = fingerprint(&index, read);
+
+        index.add_special_call_effect(file_id, TextSize::new(16), other_ref, LuaType::String);
+        assert_ne!(fingerprint(&index, &file_effects), derivation::ABSENT);
+        assert_eq!(fingerprint(&index, read), seen);
+
+        index.add_special_call_effect(
+            file_id,
+            TextSize::new(24),
+            read_ref.clone(),
+            LuaType::String,
+        );
+        assert_ne!(fingerprint(&index, read), seen);
+        assert!(index.has_special_call_effect_for(&file_id, &read_ref));
+        assert!(index.has_special_call_effect_before(&file_id, TextSize::new(32), &read_ref));
+    }
+
+    /// A `self` field's key names its root by the method's `self` alone, so
+    /// it covers a `self` effect under any receiver: one the reader's
+    /// receiver would match moves it whatever receiver the key was made with.
+    #[test]
+    fn a_self_field_reference_key_covers_self_effects_under_any_receiver() {
+        let file_id = FileId::new(1);
+        let decl = |position: u32| crate::LuaDeclId::new(file_id, TextSize::new(position));
+        let self_ref = |receiver: u32| crate::SelfRefId {
+            self_decl_id: decl(4),
+            receiver: crate::LuaDeclOrMemberId::Decl(decl(receiver)),
+        };
+        let field = |receiver: u32| {
+            VarRefId::IndexRef(
+                crate::VarRefRootId::SelfRef(self_ref(receiver)),
+                internment::ArcIntern::new("x".into()),
+            )
+        };
+        let mut index = LuaFlowIndex::new();
+        let key = FactKey::SpecialCallFor(file_id, field(0));
+        let seen = derivation::in_file(Some(file_id), || index.fact_fingerprint(&key));
+        assert_eq!(seen, derivation::ABSENT);
+
+        let effect_self = crate::SelfRefId {
+            self_decl_id: decl(12),
+            receiver: crate::LuaDeclOrMemberId::Decl(decl(8)),
+        };
+        index.add_special_call_effect(
+            file_id,
+            TextSize::new(16),
+            VarRefId::SelfRef(effect_self),
+            LuaType::String,
+        );
+
+        assert!(!index.has_special_call_effect_for(&file_id, &field(0)));
+        assert!(index.has_special_call_effect_for(&file_id, &field(8)));
+        assert_ne!(
+            derivation::in_file(Some(file_id), || index.fact_fingerprint(&key)),
+            seen
+        );
+    }
+
+    /// A reader's key follows a shift of the file its reference is in, and
+    /// the effects it covers fingerprint as before once the shift is mapped
+    /// back.
+    #[test]
+    fn a_special_call_reference_key_follows_a_shift_of_its_file() {
+        let file_id = FileId::new(1);
+        let text = "0123456789abcdefghijklmnopqrstuv";
+        let target = |position: u32| {
+            VarRefId::VarRef(crate::LuaDeclId::new(file_id, TextSize::new(position)))
+        };
+        let mut before = LuaFlowIndex::new();
+        before.add_special_call_effect(file_id, TextSize::new(16), target(4), LuaType::String);
+        let mut after = LuaFlowIndex::new();
+        after.add_special_call_effect(file_id, TextSize::new(17), target(5), LuaType::String);
+        let edits = derivation::EditMaps::new([(
+            file_id,
+            crate::PositionMap::new(text, &format!("\n{text}")),
+        )]);
+        let key = FactKey::SpecialCallFor(file_id, target(4));
+        let moved = edits.map_key(&key).expect("the shift loses no position");
+        assert_eq!(moved, FactKey::SpecialCallFor(file_id, target(5)));
+
+        let seen = derivation::in_file(Some(file_id), || before.fact_fingerprint(&key));
+        let held = derivation::fingerprint_before_edits(&edits, || {
+            derivation::in_file(Some(file_id), || after.fact_fingerprint(&moved))
+        });
+
+        assert_ne!(seen, derivation::ABSENT);
+        assert_eq!(held, seen);
     }
 
     /// A file's effects that only moved fingerprint as they did before the

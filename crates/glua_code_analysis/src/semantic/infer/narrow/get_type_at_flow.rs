@@ -667,7 +667,7 @@ fn get_type_at_flow_walk(
                 {
                     let mut effect_type = None;
                     for effect in effects {
-                        if special_call_effect_matches_var_ref(&effect.target, var_ref_id) {
+                        if effect.narrows(var_ref_id) {
                             effect_type = Some(match effect_type {
                                 Some(current_type) => {
                                     TypeOps::Union.apply(db, &current_type, &effect.type_ref)
@@ -1638,10 +1638,11 @@ fn branch_has_relevant_special_call_effects(
     let Some(antecedents) = tree.get_multi_antecedents(*idx) else {
         return false;
     };
-    // Without a special-call effect in the file, no region of it holds one.
+    // Without a special-call effect on the reference in the file, no region
+    // of it holds one.
     if !db
         .get_flow_index()
-        .has_any_special_call_effect(&cache.get_file_id())
+        .has_special_call_effect_for(&cache.get_file_id(), var_ref_id)
     {
         return false;
     }
@@ -1787,9 +1788,7 @@ fn branch_special_call_effect_uncached(
         && let Some(effects) = db
             .get_flow_index()
             .get_special_call_effects(&cache.get_file_id(), call_expr_stat.get_position())
-        && effects
-            .iter()
-            .any(|effect| special_call_effect_matches_var_ref(&effect.target, var_ref_id))
+        && effects.iter().any(|effect| effect.narrows(var_ref_id))
     {
         return true;
     }
@@ -1809,15 +1808,6 @@ fn branch_special_call_effect_uncached(
         }
         None => false,
     }
-}
-
-fn special_call_effect_matches_var_ref(effect_target: &VarRefId, var_ref_id: &VarRefId) -> bool {
-    effect_target == var_ref_id
-        || matches!(
-            (effect_target, var_ref_id),
-            (VarRefId::SelfRef(effect_self), VarRefId::IndexRef(root, _))
-                if root.receiver_eq(&effect_self.receiver)
-        )
 }
 
 /// The type an assignment writes, with a read of an undefined global counted as
@@ -3319,7 +3309,7 @@ fn antecedent_has_relevant_special_call_effect_before_node(
 ) -> bool {
     if !db
         .get_flow_index()
-        .has_any_special_call_effect(&cache.get_file_id())
+        .has_special_call_effect_for(&cache.get_file_id(), var_ref_id)
     {
         return false;
     }

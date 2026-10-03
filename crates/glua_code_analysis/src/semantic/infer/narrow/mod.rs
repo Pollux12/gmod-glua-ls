@@ -84,9 +84,12 @@ pub(crate) fn contains_gmod_null_type(db: &DbIndex, typ: &LuaType) -> bool {
 /// its declared/origin type, given the file-wide narrowing capability. When this
 /// returns `false`, the walk is guaranteed to be a no-op and can be skipped.
 fn var_ref_can_be_narrowed(db: &DbIndex, file_id: &crate::FileId, var_ref_id: &VarRefId) -> bool {
-    // Special-call effects can narrow arbitrary var-refs at runtime positions and
-    // are populated after flow binding, so any file with them must not skip.
-    if db.get_flow_index().has_any_special_call_effect(file_id) {
+    // Special-call effects are populated after flow binding, so the file-wide
+    // capability misses them: a reference one narrows must not skip.
+    if db
+        .get_flow_index()
+        .has_special_call_effect_for(file_id, var_ref_id)
+    {
         return true;
     }
 

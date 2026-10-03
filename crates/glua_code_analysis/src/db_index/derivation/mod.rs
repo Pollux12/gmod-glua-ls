@@ -276,6 +276,10 @@ pub enum FactKey {
     SpecialCall(FileId, TextSize),
     /// Every special-call effect of one file.
     SpecialCallFile(FileId),
+    /// The special-call effects of one file that narrow one variable
+    /// reference: their positions and targets, read out of its
+    /// [`FactKey::SpecialCallFile`].
+    SpecialCallFor(FileId, crate::VarRefId),
     /// What the callee of each of a file's calls resolves to.
     CallTargets(FileId),
     /// A file's flow tree and casts.
@@ -680,6 +684,7 @@ impl FactKey {
                 | FactKey::GmodInferFile(_)
                 | FactKey::Signature(_)
                 | FactKey::ReferencesByName(_)
+                | FactKey::SpecialCallFile(_)
         )
     }
 
@@ -694,6 +699,7 @@ impl FactKey {
             }
             FactKey::SignatureDecl(signature_id) => Some(FactKey::Signature(*signature_id)),
             FactKey::IndexReferenceFiles(name) => Some(FactKey::ReferencesByName(name.clone())),
+            FactKey::SpecialCallFor(file_id, _) => Some(FactKey::SpecialCallFile(*file_id)),
             _ => None,
         }
     }
@@ -737,6 +743,7 @@ impl FactKey {
             | K::CallRole(CallRoleKey::Signature(signature_id)) => Some(signature_id.get_file_id()),
             K::SpecialCall(file_id, _)
             | K::SpecialCallFile(file_id)
+            | K::SpecialCallFor(file_id, _)
             | K::CallTargets(file_id)
             | K::ValidGuardFile(file_id)
             | K::TypeFile(file_id)
