@@ -1102,7 +1102,12 @@ fn dynamic_field_definitions(
         _ => Vec::new(),
     }
 }
+/// Records the masked `(owner, field)` read a visible pass re-derives from;
+/// the pass collecting dynamic fields never sees them, so it records none.
 fn record_dynamic_field_read_for_prefix(db: &DbIndex, prefix_type: &LuaType, field_name: &str) {
+    if !crate::db_index::derivation::dynamic_fields_visible() {
+        return;
+    }
     // `field_definitions` records the `(owner, field)` read itself.
     fn flag_masked_if_present(db: &DbIndex, owner: &crate::DynamicFieldOwner, field_name: &str) {
         db.get_dynamic_field_index()
