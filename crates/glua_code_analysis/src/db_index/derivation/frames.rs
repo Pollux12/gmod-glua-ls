@@ -298,6 +298,10 @@ impl Provenance {
         freshness
     }
 
+    pub(super) fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
     /// Whether its reads still need replaying into the frame stamped
     /// `frame`, marking them replayed there.
     fn replays_into(&self, frame: u64) -> bool {
@@ -732,7 +736,7 @@ fn reuse_worker(
                     return Reuse::Elsewhere;
                 }
                 if provenance.0.since < evaluation.frame_stamp()
-                    && provenance.replays_into(evaluation.frame_stamp())
+                    && worker.replays_into(provenance, evaluation.frame_stamp(), range.len())
                 {
                     for at in range {
                         let local = evaluation.log[at];
@@ -770,7 +774,7 @@ fn reuse_worker(
                 {
                     REUSED_ACROSS.with(|flag| flag.set(true));
                 }
-                if provenance.replays_into(evaluation.frame_stamp()) {
+                if worker.replays_into(provenance, evaluation.frame_stamp(), reads.len()) {
                     for slot in reads {
                         let local = worker
                             .record_known(evaluation, *slot)
@@ -973,6 +977,7 @@ pub fn report_frames() {
     if !profiling() {
         return;
     }
+    super::transport::report_worker_replays();
     let stats = STATS.with(|stats| std::mem::take(&mut *stats.borrow_mut()));
     eprintln!(
         "[frames] closed shared={} tainted={} reused={} reused_here={} replayed={} stale={} other_context={}",

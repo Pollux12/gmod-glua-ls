@@ -11,7 +11,7 @@ pub(crate) use worker::{
     RecordingSnapshot, compute_recorded, note_observed_query_read, query_requires_canonical,
     require_canonical_query, worker_query_readiness,
 };
-pub(super) use worker::{SavedRecording, active, with_keys, with_snapshot};
+pub(super) use worker::{SavedRecording, active, report_worker_replays, with_keys, with_snapshot};
 
 #[must_use]
 pub(crate) struct ReleaseQuarantine {

@@ -2,13 +2,13 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::{
     self as derivation, DerivationId, Evaluation, FactKey, Fingerprint, HashedKey, KeyIdx,
-    KeyTable, ReaderGraph,
+    KeyTable, Provenance, ReaderGraph,
 };
 use super::WorkerKeys;
 
@@ -35,6 +35,40 @@ impl RecordingSnapshot {
     }
 }
 
+#[derive(Default)]
+struct ReplayCounts {
+    checks: u64,
+    already: u64,
+    performed: u64,
+    avoided_reads: u64,
+    performed_reads: u64,
+}
+
+static REPLAY_TOTALS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+impl ReplayCounts {
+    fn publish(&self) {
+        for (total, count) in REPLAY_TOTALS.iter().zip([
+            self.checks,
+            self.already,
+            self.performed,
+            self.avoided_reads,
+            self.performed_reads,
+        ]) {
+            total.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+}
+
+pub(in super::super) fn report_worker_replays() {
+    let [checks, already, performed, avoided_reads, performed_reads] = REPLAY_TOTALS
+        .each_ref()
+        .map(|total| total.swap(0, Ordering::Relaxed));
+    eprintln!(
+        "[worker-replay] checks={checks} already={already} performed={performed} avoided_reads={avoided_reads} performed_reads={performed_reads}"
+    );
+}
+
 #[derive(Clone, Copy)]
 struct QueryWitness {
     seen: Fingerprint,
@@ -45,10 +79,37 @@ pub(in super::super) struct WorkerContext {
     snapshot: Arc<SnapshotData>,
     keys: WorkerKeys,
     queries: FxHashMap<u32, QueryWitness>,
+    replayed: FxHashMap<usize, (Provenance, u64)>,
+    replay_counts: ReplayCounts,
     requires_canonical: Arc<AtomicBool>,
 }
 
 impl WorkerContext {
+    pub(in super::super) fn replays_into(
+        &mut self,
+        provenance: &Provenance,
+        frame: u64,
+        reads: usize,
+    ) -> bool {
+        let replayed = self
+            .replayed
+            .entry(provenance.identity())
+            .or_insert_with(|| (provenance.clone(), 0));
+        let performs = replayed.1 != frame;
+        replayed.1 = frame;
+        if cfg!(test) || crate::profile::profiling() {
+            self.replay_counts.checks += 1;
+            if performs {
+                self.replay_counts.performed += 1;
+                self.replay_counts.performed_reads += reads as u64;
+            } else {
+                self.replay_counts.already += 1;
+                self.replay_counts.avoided_reads += reads as u64;
+            }
+        }
+        performs
+    }
+
     pub(in super::super) fn graph(&self) -> &ReaderGraph {
         &self.snapshot.graph
     }
@@ -444,6 +505,8 @@ pub(crate) fn compute_recorded<T>(
             snapshot: Arc::clone(&snapshot.0),
             keys: WorkerKeys::default(),
             queries: FxHashMap::default(),
+            replayed: FxHashMap::default(),
+            replay_counts: ReplayCounts::default(),
             requires_canonical,
         })
     });
@@ -460,6 +523,9 @@ pub(crate) fn compute_recorded<T>(
     );
     assert!(evaluation.stamp > snapshot.0.started);
     let worker = WORKER.with(|worker| worker.borrow_mut().take()).unwrap();
+    if crate::profile::profiling() {
+        worker.replay_counts.publish();
+    }
     let mut inputs = ComputeInputs::capture(&worker, fingerprint);
     inputs.complete &= !worker.requires_canonical.load(Ordering::Relaxed);
     let evaluation = WorkerEvaluation {
@@ -499,6 +565,114 @@ mod tests {
     fn recover(snapshot: RecordingSnapshot) -> ReaderGraph {
         let data = Arc::try_unwrap(snapshot.0).ok().unwrap();
         Arc::try_unwrap(data.graph).ok().unwrap()
+    }
+
+    fn canonical_proof() -> (ReaderGraph, Provenance) {
+        let mut graph = ReaderGraph::default();
+        derivation::lend_keys(graph.lend_keys());
+        derivation::begin(id());
+        let frame = derivation::open_frame().unwrap();
+        derivation::note_read(|| key(1).key().clone());
+        let proof = derivation::close_frame(frame, 0).unwrap();
+        derivation::end();
+        graph.restore_keys(derivation::take_keys());
+        (graph, proof)
+    }
+
+    #[test]
+    fn parallel_transport_worker_replay_visitation_preserves_nested_and_sibling_reads() {
+        let (graph, proof) = canonical_proof();
+        let (snapshot, guard) = snapshot(graph);
+        let result = compute_recorded(
+            &snapshot,
+            id(),
+            || {
+                let outer = derivation::open_frame().unwrap();
+                assert_eq!(derivation::reuse(&proof, 0, &[], None), Reuse::Held);
+                assert_eq!(derivation::reuse(&proof.clone(), 0, &[], None), Reuse::Held);
+                let inner = derivation::open_frame().unwrap();
+                assert_eq!(derivation::reuse(&proof, 0, &[], None), Reuse::Held);
+                assert_eq!(derivation::reuse(&proof, 0, &[], None), Reuse::Held);
+                let inner = derivation::close_frame(inner, 0).unwrap();
+                assert_eq!(derivation::reuse(&proof, 0, &[], None), Reuse::Held);
+                let sibling = derivation::open_frame().unwrap();
+                assert_eq!(derivation::reuse(&proof, 0, &[], None), Reuse::Held);
+                assert_eq!(derivation::reuse(&proof, 0, &[], None), Reuse::Held);
+                let sibling = derivation::close_frame(sibling, 0).unwrap();
+                let outer = derivation::close_frame(outer, 0).unwrap();
+                let counts = with_keys(|worker| {
+                    (
+                        worker.replay_counts.checks,
+                        worker.replay_counts.already,
+                        worker.replay_counts.performed,
+                    )
+                })
+                .unwrap();
+                assert_eq!(counts, (7, 3, 4));
+                (outer, inner, sibling)
+            },
+            |_| 17,
+        );
+        assert_eq!(result.evaluation.evaluation.log, vec![0, 0, 0]);
+        assert_eq!(result.evaluation.evaluation.read, vec![0]);
+        let mut graph = recover(snapshot);
+        let mut table = graph.lend_keys();
+        let slot = table.find(&key(1)).unwrap();
+        let evaluation = result.evaluation.canonicalise(&mut table).unwrap();
+        derivation::lend_keys(table);
+        derivation::resume(evaluation);
+        derivation::end();
+        for proof in [result.value.0, result.value.1, result.value.2] {
+            derivation::begin(id());
+            assert_eq!(derivation::reuse(&proof, 0, &[], None), Reuse::Held);
+            assert_eq!(derivation::end().into_recorded().1, vec![slot]);
+        }
+        let mut table = derivation::take_keys();
+        guard.finish(&mut table);
+        graph.restore_keys(table);
+    }
+
+    #[test]
+    fn parallel_transport_worker_replay_visitation_is_independent_for_concurrent_clones() {
+        let (graph, proof) = canonical_proof();
+        let (snapshot, guard) = snapshot(graph);
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let compute = || {
+                compute_recorded(
+                    &snapshot,
+                    id(),
+                    || {
+                        let frame = derivation::open_frame().unwrap();
+                        assert_eq!(derivation::reuse(&proof.clone(), 0, &[], None), Reuse::Held);
+                        barrier.wait();
+                        assert_eq!(derivation::reuse(&proof, 0, &[], None), Reuse::Held);
+                        derivation::close_frame(frame, 0).unwrap();
+                        with_keys(|worker| {
+                            (
+                                worker.replay_counts.checks,
+                                worker.replay_counts.already,
+                                worker.replay_counts.performed,
+                            )
+                        })
+                        .unwrap()
+                    },
+                    |_| 17,
+                )
+            };
+            let first = scope.spawn(&compute);
+            let second = scope.spawn(&compute);
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        for result in results {
+            assert_eq!(result.value, (2, 1, 1));
+            assert_eq!(result.evaluation.evaluation.log, vec![0]);
+            assert_eq!(result.evaluation.evaluation.read, vec![0]);
+        }
+        let mut graph = recover(snapshot);
+        let mut table = graph.lend_keys();
+        guard.finish(&mut table);
+        graph.restore_keys(table);
     }
 
     #[test]
