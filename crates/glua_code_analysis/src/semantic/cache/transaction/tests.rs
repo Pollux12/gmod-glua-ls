@@ -588,3 +588,34 @@ fn parallel_cache_sparse_commit_finishes_moved_flow_before_next_epoch() {
     );
     finish();
 }
+
+#[test]
+fn parallel_cache_transaction_guard_tracks_nested_roots_and_detached_scopes() {
+    let mut parent = cache();
+    let parent_guard = parent.begin_transaction();
+    let parent_id = current().unwrap();
+    assert!(parent_guard.counted);
+    assert!(ACTIVE.load(Ordering::Relaxed) >= 1);
+    let detached = detach_transaction();
+    assert!(!detached.counted);
+    assert!(current().is_none());
+    let mut child = cache();
+    let child_guard = child.begin_transaction();
+    let child_id = current().unwrap();
+    assert!(child_guard.counted);
+    assert_ne!(parent_id, child_id);
+    assert!(ACTIVE.load(Ordering::Relaxed) >= 2);
+    drop(child_guard);
+    assert!(current().is_none());
+    child.commit_transaction();
+    drop(detached);
+    assert_eq!(current(), Some(parent_id));
+    drop(parent_guard);
+    assert!(current().is_none());
+    parent.rollback_transaction();
+    let again = parent.begin_transaction();
+    assert!(current().is_some());
+    drop(again);
+    parent.commit_transaction();
+    assert!(current().is_none());
+}

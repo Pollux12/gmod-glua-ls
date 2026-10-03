@@ -3,7 +3,7 @@ use std::{
     hash::Hash,
     marker::PhantomData,
     rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -18,29 +18,39 @@ type CallKey = (LuaSyntaxId, Option<usize>);
 type CallBucket = Vec<(LuaType, CacheEntry<Arc<LuaFunctionType>>, Provenance)>;
 type KeyedFlowKey = (VarRefCacheKey, LuaType);
 
+static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
 thread_local! {
     static CURRENT: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 pub(crate) struct CacheTransaction {
     previous: Option<u64>,
+    counted: bool,
     marker: PhantomData<Rc<()>>,
 }
 
 impl Drop for CacheTransaction {
     fn drop(&mut self) {
         CURRENT.with(|current| current.set(self.previous));
+        if self.counted {
+            ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
 pub(crate) fn detach_transaction() -> CacheTransaction {
     CacheTransaction {
         previous: CURRENT.with(|current| current.replace(None)),
+        counted: false,
         marker: PhantomData,
     }
 }
 
 pub(super) fn current() -> Option<u64> {
+    if ACTIVE.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
     CURRENT.with(Cell::get)
 }
 
@@ -104,8 +114,10 @@ impl LuaInferCache {
             keyed_flows: FxHashMap::default(),
             touched_flows: FxHashSet::default(),
         }));
+        ACTIVE.fetch_add(1, Ordering::Relaxed);
         CacheTransaction {
             previous: CURRENT.with(|current| current.replace(Some(id))),
+            counted: true,
             marker: PhantomData,
         }
     }
