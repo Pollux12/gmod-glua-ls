@@ -381,7 +381,14 @@ fn put_flow(
 fn parallel_cache_flow_hits_and_elsewhere_misses_do_not_queue_finish() {
     begin();
     let mut cache = cache();
-    let old = proof(&cache);
+    let outer = derivation::open_frame().unwrap();
+    let previous_realm = cache.set_query_realm(Some(GmodRealm::Server));
+    let inner = derivation::open_frame().unwrap();
+    assert_eq!(cache.query_realm(), Some(GmodRealm::Server));
+    derivation::note_read(|| FactKey::GmodRealm(FileId::new(7)));
+    let old = cache.close_frame(Some(inner)).unwrap();
+    cache.restore_query_realm(previous_realm);
+    cache.close_frame(Some(outer));
     for at in 1..=32 {
         put_flow(
             &mut cache,
@@ -393,6 +400,7 @@ fn parallel_cache_flow_hits_and_elsewhere_misses_do_not_queue_finish() {
     }
     derivation::end();
     next();
+    let previous_realm = cache.set_query_realm(Some(GmodRealm::Server));
     let transaction = cache.begin_transaction();
     for at in 1..=32 {
         assert!(
@@ -416,7 +424,7 @@ fn parallel_cache_flow_hits_and_elsewhere_misses_do_not_queue_finish() {
                 .is_none()
         );
     }
-    cache.config.analysis_phase = super::super::LuaAnalysisPhase::Force;
+    cache.set_query_realm(Some(GmodRealm::Client));
     assert!(
         cache
             .get_flow_cache_with_origin_by_key(
@@ -427,13 +435,24 @@ fn parallel_cache_flow_hits_and_elsewhere_misses_do_not_queue_finish() {
             )
             .is_none()
     );
-    cache.config.analysis_phase = super::super::LuaAnalysisPhase::Ordered;
+    cache.set_query_realm(Some(GmodRealm::Server));
+    assert!(
+        cache
+            .get_flow_cache_with_origin_by_key(
+                &flow_key(1),
+                FlowId(1),
+                GmodRealm::Server,
+                super::super::FlowOrigin::Real,
+            )
+            .is_some()
+    );
     let undo = cache.transaction.as_ref().unwrap();
     assert!(undo.touched_flows.is_empty());
     assert!(undo.flows.is_empty());
     assert!(undo.keyed_flows.is_empty());
     drop(transaction);
     cache.commit_transaction();
+    cache.restore_query_realm(previous_realm);
     assert_eq!(cache.flow_node_cache.len(), 32);
     finish();
 }
