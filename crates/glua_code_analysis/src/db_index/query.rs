@@ -83,6 +83,11 @@ struct Memo<V> {
     stale: bool,
 }
 
+struct QueryValue<V> {
+    value: Arc<V>,
+    fingerprint: Fingerprint,
+}
+
 impl<V> Clone for Memo<V> {
     fn clone(&self) -> Self {
         Self {
@@ -198,25 +203,40 @@ impl<F: QueryFamily> QueryTable<F> {
 
     /// The query's value, computed if it has no current memo.
     fn value(&self, db: &DbIndex, key: LuaSignatureId) -> Arc<F::Value> {
+        self.value_with_fingerprint(db, key).value
+    }
+
+    fn value_with_fingerprint(&self, db: &DbIndex, key: LuaSignatureId) -> QueryValue<F::Value> {
         derivation::unmapped(|| self.value_unmapped(db, key))
     }
 
-    fn value_unmapped(&self, db: &DbIndex, key: LuaSignatureId) -> Arc<F::Value> {
+    fn value_unmapped(&self, db: &DbIndex, key: LuaSignatureId) -> QueryValue<F::Value> {
         let id = Self::id(key);
         if let Some(memo) = self.memos().get(&key).filter(|memo| !memo.stale).cloned() {
             Counters::bump(&self.counters.hits);
             if check_mode() {
                 self.check(db, key, &memo);
             }
-            return memo.value;
+            return QueryValue {
+                value: memo.value,
+                fingerprint: memo.fingerprint,
+            };
         }
         if is_computing(id) {
             Counters::bump(&self.counters.cycles);
-            return self
-                .memos()
-                .get(&key)
-                .map(|memo| Arc::clone(&memo.value))
-                .unwrap_or_else(|| Arc::new(F::floor()));
+            return self.memos().get(&key).map_or_else(
+                || {
+                    let value = Arc::new(F::floor());
+                    QueryValue {
+                        fingerprint: Self::fingerprint_of(&value),
+                        value,
+                    }
+                },
+                |memo| QueryValue {
+                    value: Arc::clone(&memo.value),
+                    fingerprint: memo.fingerprint,
+                },
+            );
         }
         let (value, reads) = computing(id, || derivation::detached(id, || F::compute(db, key)));
         let value = Arc::new(value);
@@ -230,7 +250,10 @@ impl<F: QueryFamily> QueryTable<F> {
             .collect();
         let mut memos = self.memos();
         if let Some(memo) = memos.get(&key).filter(|memo| !memo.stale) {
-            return Arc::clone(&memo.value);
+            return QueryValue {
+                value: Arc::clone(&memo.value),
+                fingerprint: memo.fingerprint,
+            };
         }
         let moved = memos
             .insert(
@@ -252,7 +275,7 @@ impl<F: QueryFamily> QueryTable<F> {
         Counters::bump(&self.counters.computed);
         self.pending().push(Filing { id, reads, moved });
         Counters::bump(&self.pending_count);
-        value
+        QueryValue { value, fingerprint }
     }
 
     /// Recomputes a memo hit fresh and reports a disagreement.
@@ -280,15 +303,38 @@ impl<F: QueryFamily> QueryTable<F> {
         let (value, fingerprint) = match memo {
             Some(memo) => (memo.value, memo.fingerprint),
             None => {
-                let value = self.value(db, key);
-                let fingerprint = Self::fingerprint_of(&value);
-                (value, fingerprint)
+                let observed = self.value_with_fingerprint(db, key);
+                (observed.value, observed.fingerprint)
             }
         };
         if derivation::mapping_back() {
             return Self::fingerprint_of(&value);
         }
         fingerprint
+    }
+
+    fn ready_fingerprint(&self, key: LuaSignatureId) -> Option<Fingerprint> {
+        self.memos()
+            .get(&key)
+            .filter(|memo| !memo.stale)
+            .map(|memo| {
+                if derivation::mapping_back() {
+                    Self::fingerprint_of(&memo.value)
+                } else {
+                    memo.fingerprint
+                }
+            })
+    }
+
+    fn ready_outputs(&self, outputs: &mut FxHashMap<HashedKey, Fingerprint>) {
+        for (key, memo) in self.memos().iter().filter(|(_, memo)| !memo.stale) {
+            let fingerprint = if derivation::mapping_back() {
+                Self::fingerprint_of(&memo.value)
+            } else {
+                memo.fingerprint
+            };
+            outputs.insert(HashedKey::new(F::output(*key)), fingerprint);
+        }
     }
 
     /// Computes the query again inside the engine's evaluation of it, which
@@ -361,6 +407,25 @@ pub(crate) struct Queries {
 }
 
 impl Queries {
+    pub(crate) fn ready_outputs(&self) -> FxHashMap<HashedKey, Fingerprint> {
+        let mut outputs = FxHashMap::default();
+        self.receiver_authority.ready_outputs(&mut outputs);
+        self.callback_params.ready_outputs(&mut outputs);
+        outputs
+    }
+
+    pub(crate) fn ready_fingerprint(&self, key: &FactKey) -> Option<Fingerprint> {
+        match key {
+            FactKey::ReceiverAuthority(signature_id) => {
+                self.receiver_authority.ready_fingerprint(*signature_id)
+            }
+            FactKey::CallbackParams(signature_id) => {
+                self.callback_params.ready_fingerprint(*signature_id)
+            }
+            _ => unreachable!("{key:?} is not a query output"),
+        }
+    }
+
     /// The fingerprint of query output `key`, computing it if needed.
     pub(crate) fn fingerprint(&self, db: &DbIndex, key: &FactKey) -> Fingerprint {
         match key {
@@ -418,5 +483,160 @@ impl Queries {
             ),
             (DerivationKind::CallbackParams, self.callback_params.stats()),
         ]
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::sync::Barrier;
+    use std::sync::atomic::AtomicBool;
+
+    struct RacingCompute {
+        value: u64,
+        barrier: Arc<Barrier>,
+        published: Arc<AtomicBool>,
+    }
+
+    thread_local! {
+        static RACING: RefCell<Option<RacingCompute>> = const { RefCell::new(None) };
+    }
+
+    struct TestQuery;
+
+    impl QueryFamily for TestQuery {
+        type Value = u64;
+        const KIND: DerivationKind = DerivationKind::ReceiverAuthority;
+
+        fn output(key: LuaSignatureId) -> FactKey {
+            FactKey::ReceiverAuthority(key)
+        }
+
+        fn compute(_: &DbIndex, _: LuaSignatureId) -> u64 {
+            RACING.with(|context| {
+                let context = context.borrow();
+                let Some(context) = context.as_ref() else {
+                    return 23;
+                };
+                context.barrier.wait();
+                if context.value == 2 {
+                    while !context.published.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                }
+                context.value
+            })
+        }
+
+        fn floor() -> u64 {
+            7
+        }
+    }
+
+    fn key() -> LuaSignatureId {
+        LuaSignatureId::new(FileId::new(1), 2.into())
+    }
+
+    #[test]
+    fn parallel_query_readiness_excludes_stale_and_missing_memos_without_computing() {
+        let table = QueryTable::<TestQuery>::default();
+        assert_eq!(table.ready_fingerprint(key()), None);
+        let mut outputs = FxHashMap::default();
+        table.ready_outputs(&mut outputs);
+        assert!(outputs.is_empty());
+        let value = Arc::new(13);
+        let fingerprint = QueryTable::<TestQuery>::fingerprint_of(&value);
+        table.memos().insert(
+            key(),
+            Memo {
+                value,
+                fingerprint,
+                stale: false,
+            },
+        );
+        assert_eq!(table.ready_fingerprint(key()), Some(fingerprint));
+        table.ready_outputs(&mut outputs);
+        assert_eq!(
+            outputs[&HashedKey::new(TestQuery::output(key()))],
+            fingerprint
+        );
+        table.set_stale(QueryTable::<TestQuery>::id(key()), true);
+        assert_eq!(table.ready_fingerprint(key()), None);
+        outputs.clear();
+        table.ready_outputs(&mut outputs);
+        assert!(outputs.is_empty());
+        assert_eq!(table.stats().computed, 0);
+        let queries = Queries::default();
+        assert!(queries.ready_outputs().is_empty());
+        assert_eq!(queries.ready_fingerprint(&TestQuery::output(key())), None);
+    }
+
+    #[test]
+    fn parallel_query_recursive_returns_preserve_their_actual_value_fingerprint() {
+        let table = QueryTable::<TestQuery>::default();
+        let db = DbIndex::new();
+        let observed = computing(QueryTable::<TestQuery>::id(key()), || {
+            table.value_with_fingerprint(&db, key())
+        });
+        assert_eq!(*observed.value, 7);
+        assert_eq!(observed.fingerprint, derivation::fingerprint_of(&7u64));
+        table.memos().insert(
+            key(),
+            Memo {
+                value: Arc::new(13),
+                fingerprint: derivation::fingerprint_of(&13u64),
+                stale: true,
+            },
+        );
+        let observed = computing(QueryTable::<TestQuery>::id(key()), || {
+            table.value_with_fingerprint(&db, key())
+        });
+        assert_eq!(*observed.value, 13);
+        assert_eq!(observed.fingerprint, derivation::fingerprint_of(&13u64));
+        assert_eq!(table.stats().computed, 0);
+    }
+
+    #[test]
+    fn parallel_query_losing_first_fill_observes_the_published_winner() {
+        let db = DbIndex::new();
+        let table = QueryTable::<TestQuery>::default();
+        let barrier = Arc::new(Barrier::new(2));
+        let published = Arc::new(AtomicBool::new(false));
+        let results = std::thread::scope(|scope| {
+            let handles = (1..=2)
+                .map(|value| {
+                    let db = &db;
+                    let table = &table;
+                    let barrier = Arc::clone(&barrier);
+                    let published = Arc::clone(&published);
+                    scope.spawn(move || {
+                        RACING.with(|context| {
+                            *context.borrow_mut() = Some(RacingCompute {
+                                value,
+                                barrier,
+                                published: Arc::clone(&published),
+                            })
+                        });
+                        let observed = table.value_with_fingerprint(db, key());
+                        if value == 1 {
+                            published.store(true, Ordering::Release);
+                        }
+                        RACING.with(|context| context.borrow_mut().take());
+                        (*observed.value, observed.fingerprint)
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results, vec![(1, derivation::fingerprint_of(&1u64)); 2]);
+        assert_eq!(table.stats().computed, 1);
+        assert_eq!(
+            table.ready_fingerprint(key()),
+            Some(derivation::fingerprint_of(&1u64))
+        );
     }
 }
