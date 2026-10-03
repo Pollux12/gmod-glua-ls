@@ -225,6 +225,14 @@ pub(crate) trait Recipe: Sync {
 
     fn apply(&self, db: &mut DbIndex, id: DerivationId, computed: Box<dyn std::any::Any + Send>);
 
+    /// Whether a derivation of `kind` computes on a pool worker with its reads
+    /// recorded, through [`Self::compute`] and [`Self::apply`], its result
+    /// published only if those reads still hold.
+    fn records_on_workers(&self, _kind: DerivationKind) -> bool {
+        false
+    }
+
+    /// Drops a worker result [`Self::apply`] will not publish.
     fn discard(&self, _id: DerivationId, _computed: Box<dyn std::any::Any + Send>) {}
 }
 
@@ -838,17 +846,18 @@ impl Engine {
             self.check_convergence(id);
             let group = crate::profile::phase("engine: co-producers", || co_producers(db, id));
             if group.len() == 1
-                && recipe.splits(id.kind)
-                && (id.kind != DerivationKind::CallTargets
-                    || (matches!(slice, Slice::Whole) && super::parallel::analysis_threads() > 1))
+                && recipe.records_on_workers(id.kind)
+                && matches!(slice, Slice::Whole)
+                && super::parallel::records_on_workers()
+                && crate::profile::phase("engine: recorded batch", || {
+                    self.run_recorded_batch(db, id, recipe)
+                })
             {
-                crate::profile::phase("engine: batch", || {
-                    if id.kind == DerivationKind::CallTargets {
-                        self.run_recorded_batch(db, id, recipe);
-                    } else {
-                        self.run_batch(db, id, recipe);
-                    }
-                });
+                self.queue_reruns();
+                continue;
+            }
+            if group.len() == 1 && recipe.splits(id.kind) {
+                crate::profile::phase("engine: batch", || self.run_batch(db, id, recipe));
                 self.queue_reruns();
                 continue;
             }
@@ -1475,12 +1484,23 @@ impl Engine {
         }
     }
 
-    fn run_recorded_batch(&mut self, db: &mut DbIndex, first: DerivationId, recipe: &dyn Recipe) {
+    /// Evaluates `first` with the queued derivations of its kind that have to
+    /// run, computing each on a pool worker against the canonical index and
+    /// publishing them in queue order on this thread. A result whose reads no
+    /// longer hold, or that read another member's reset output, is discarded
+    /// and evaluated here instead. Returns false, with the queue restored, when
+    /// too few run to pay for the workers: `first` then runs as usual.
+    fn run_recorded_batch(
+        &mut self,
+        db: &mut DbIndex,
+        first: DerivationId,
+        recipe: &dyn Recipe,
+    ) -> bool {
         let limit = super::parallel::analysis_threads()
             .saturating_mul(2)
             .saturating_mul(recorded_window_multiplier());
         let mut batch = vec![first];
-        let mut alone = Vec::new();
+        let mut popped = Vec::new();
         while batch.len() < limit {
             let Some((id, reason)) = self.worklist.pop_first_of(first.kind) else {
                 break;
@@ -1488,28 +1508,32 @@ impl Engine {
             if !self.needs_evaluation(db, id, reason) {
                 continue;
             }
-            self.trace_evaluation(db, id, reason);
             if co_producers(db, id).len() == 1 {
                 batch.push(id);
-            } else {
+            }
+            popped.push((id, reason));
+        }
+        if super::parallel::runs_inline(batch.len()) {
+            for (id, reason) in popped {
+                self.worklist.insert(id, reason);
+            }
+            return false;
+        }
+        let mut alone = Vec::new();
+        for (id, reason) in popped {
+            self.trace_evaluation(db, id, reason);
+            if !batch.contains(&id) {
                 alone.push(id);
             }
         }
-        let expected_output = |id: DerivationId, key: &FactKey| matches!(key, FactKey::CallTargets(file_id) if *file_id == id.file_id);
-        if batch.iter().any(|id| {
-            db.reader_graph()
-                .outputs_of(*id)
-                .any(|key| !expected_output(*id, key))
-        }) {
-            let touched = self.evaluate_group(db, &[first], recipe);
-            self.stats.evaluated(first);
-            self.evaluated.insert(first.file_id);
-            self.readers_of(db, touched.iter());
-            for id in batch.into_iter().skip(1).chain(alone) {
-                self.worklist.insert(id, Reason::Changed);
-            }
-            return;
-        }
+        let owners = batch
+            .iter()
+            .flat_map(|id| {
+                db.reader_graph()
+                    .outputs_of(*id)
+                    .map(|key| (key.clone(), *id))
+            })
+            .collect::<FxHashMap<_, _>>();
         let profiling = self.stats.profiling();
         let started = profiling.then(std::time::Instant::now);
         let reruns = batch
@@ -1521,13 +1545,14 @@ impl Engine {
             self.stats.evaluated(*id);
             self.evaluated.insert(id.file_id);
         }
-        let mut touched = self.reset_outputs(
+        let reset = self.reset_outputs(
             db,
             &batch,
             &FxHashSet::default(),
             &FxHashSet::default(),
             None,
         );
+        let mut touched = reset.clone();
         let recomputing = self.lend_evaluation_keys(db, &touched);
         db.reader_graph_mut().restore_keys(derivation::take_keys());
         touched.extend(file_queries(db));
@@ -1586,12 +1611,14 @@ impl Engine {
             }) && result
                 .evaluation
                 .read_keys(db.reader_graph())
-                .all(|key| !matches!(key, FactKey::CallTargets(_)));
+                .all(|key| !reset.contains(key) || owners.get(key) == Some(id));
             if profiling {
                 self.stats.parallel_attempts += 1;
             }
             let mut table = db.reader_graph_mut().lend_keys();
             let evaluation = if valid {
+                #[cfg(test)]
+                WORKER_PUBLISHED.with(|published| published.set(published.get() + 1));
                 let evaluation = result
                     .evaluation
                     .canonicalise(&mut table)
@@ -1647,6 +1674,7 @@ impl Engine {
         for id in alone {
             self.worklist.insert(id, Reason::Changed);
         }
+        true
     }
 
     /// Resets the primary outputs of `members` to the source layer. Returns
@@ -2300,16 +2328,21 @@ fn scopeguard_lent_keys() -> OnDrop {
 /// [`Engine::check_convergence`] reports that the facts it reads do not settle.
 const MAX_STAGE_EVALUATIONS: u32 = 1000;
 
+#[cfg(test)]
+thread_local! {
+    /// Worker results this thread published, for tests that must see
+    /// [`Engine::run_recorded_batch`] publish.
+    static WORKER_PUBLISHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn recorded_window_multiplier() -> usize {
     static MULTIPLIER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MULTIPLIER.get_or_init(|| {
-        match std::env::var("GLUALS_RECORDED_WINDOW")
+        std::env::var("GLUALS_RECORDED_WINDOW")
             .ok()
             .and_then(|value| value.parse().ok())
-        {
-            Some(value @ (1 | 2 | 4 | 8)) => value,
-            _ => 1,
-        }
+            .filter(|value| matches!(value, 1 | 2 | 4 | 8))
+            .unwrap_or(1)
     })
 }
 
@@ -2333,6 +2366,7 @@ mod tests {
     use internment::ArcIntern;
     use smol_str::SmolStr;
 
+    use super::super::parallel;
     use super::*;
     use crate::{
         FileId, LuaDeclId, LuaType, LuaTypeCache, LuaTypeOwner, TypeOps, VirtualWorkspace,
@@ -2356,7 +2390,11 @@ mod tests {
                 .set_file(id.file_id, Default::default());
         }
 
-        fn splits(&self, kind: DerivationKind) -> bool {
+        fn splits(&self, _: DerivationKind) -> bool {
+            false
+        }
+
+        fn records_on_workers(&self, kind: DerivationKind) -> bool {
             kind == DerivationKind::CallTargets
         }
 
@@ -2430,9 +2468,15 @@ mod tests {
         for id in &ids {
             engine.worklist.insert(*id, Reason::Changed);
         }
+        let threads = parallel::THREADS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        parallel::set_analysis_threads(4);
         while let Some((first, _)) = engine.worklist.pop_first_of(DerivationKind::CallTargets) {
-            engine.run_recorded_batch(db, first, &recipe);
+            assert!(engine.run_recorded_batch(db, first, &recipe));
         }
+        parallel::set_analysis_threads(0);
+        drop(threads);
         assert_eq!(
             recipe.discarded.load(std::sync::atomic::Ordering::Relaxed),
             1
@@ -2459,6 +2503,109 @@ mod tests {
         derivation::end();
         db.reader_graph_mut().restore_keys(derivation::take_keys());
         std::mem::forget(lent);
+    }
+
+    /// Every recorded derivation with its reads, their fingerprints and its
+    /// outputs, each file's call targets, and [`VirtualWorkspace::settled_digest`].
+    fn recorded_digest(ws: &mut VirtualWorkspace) -> Vec<String> {
+        let mut digest = ws.settled_digest();
+        let db = ws.get_db_mut();
+        let graph = db.reader_graph();
+        let mut ids = graph.derivations().collect::<Vec<_>>();
+        ids.sort();
+        for id in ids {
+            let mut reads = graph
+                .reads_of(id)
+                .zip(graph.recorded_slots(id))
+                .map(|(key, (_, seen))| format!("{:?}={seen:?}", key.key()))
+                .collect::<Vec<_>>();
+            reads.sort();
+            let mut outputs = graph
+                .outputs_of(id)
+                .map(|key| format!("{:?}", key.key()))
+                .collect::<Vec<_>>();
+            outputs.sort();
+            digest.push(format!("{id:?} reads {reads:?} writes {outputs:?}"));
+        }
+        let mut targets = db
+            .get_call_target_index()
+            .file_fingerprints()
+            .map(|targets| format!("{targets:?}"))
+            .collect::<Vec<_>>();
+        targets.sort();
+        digest.extend(targets);
+        digest
+    }
+
+    #[test]
+    fn recorded_call_targets_match_serial_evaluation_cold_and_after_an_edit() {
+        let library = r#"
+            Inventory = Inventory or {}
+            local META = {}
+            META.__index = META
+            function META:Add(item, count)
+                self.items[item] = (self.items[item] or 0) + count
+                return self
+            end
+            function META:Count(item) return self.items[item] or 0 end
+            function Inventory.New(owner)
+                return setmetatable({ owner = owner, items = {} }, META)
+            end
+            function Inventory.Format(value) return tostring(value) end
+        "#;
+        let edited = library.replace(
+            "function Inventory.Format(value) return tostring(value) end",
+            "function Inventory.Format(value) return value * 2 end
+            function Inventory.Clear(inv) inv.items = {} end",
+        );
+        let shops = (0..10)
+            .map(|index| {
+                (
+                    format!("lua/autorun/server/sv_shop_{index}.lua"),
+                    format!(
+                        r#"
+                        local inv = Inventory.New("shop{index}")
+                        inv:Add("apple", {index}):Add("pear", 1)
+                        local total = inv:Count("apple")
+                        local label = Inventory.Format(total)
+                        local function describe(value) return Inventory.Format(value + {index}) end
+                        print(describe(total), label, Inventory.Clear)
+                        "#
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut files = vec![("lua/autorun/sh_inventory.lua", library)];
+        files.extend(
+            shops
+                .iter()
+                .map(|(path, text)| (path.as_str(), text.as_str())),
+        );
+        let edits = [("lua/autorun/sh_inventory.lua", edited.as_str())];
+        let analyse = |threads: usize| {
+            parallel::set_analysis_threads(threads);
+            WORKER_PUBLISHED.with(|published| published.set(0));
+            let mut cold = VirtualWorkspace::new();
+            cold.def_files(files.clone());
+            let cold = recorded_digest(&mut cold);
+            let mut warm = VirtualWorkspace::assert_warm_matches_cold(|_| {}, &files, &edits);
+            let warm = recorded_digest(&mut warm);
+            (cold, warm, WORKER_PUBLISHED.with(std::cell::Cell::get))
+        };
+        let threads = parallel::THREADS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let serial = analyse(1);
+        let recorded = analyse(4);
+        parallel::set_analysis_threads(0);
+        drop(threads);
+        assert_eq!(serial.2, 0);
+        assert!(
+            recorded.2 > 0,
+            "no call targets were published from workers"
+        );
+        assert_eq!(serial.0, recorded.0);
+        assert_eq!(serial.1, recorded.1);
     }
 
     fn statement(start: u32) -> DerivationId {

@@ -52,6 +52,20 @@ pub(crate) fn analysis_threads() -> usize {
     }
 }
 
+/// Whether derivations that compute on workers with recorded reads do so:
+/// with more than one analysis thread, unless `GLUALS_RECORDED_WORKERS=0`.
+pub(crate) fn records_on_workers() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    analysis_threads() > 1
+        && !*DISABLED.get_or_init(|| {
+            std::env::var_os("GLUALS_RECORDED_WORKERS").is_some_and(|value| value == "0")
+        })
+}
+
+/// Held by tests that set [`set_analysis_threads`] or rely on its value.
+#[cfg(test)]
+pub(crate) static THREADS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Whether this batch is better run on the caller's thread than handed to the
 /// pool: too few files to pay the dispatch, or nothing to run in parallel on.
 ///
@@ -165,6 +179,9 @@ mod tests {
             .map(|index| ws.def_file(&format!("lua/autorun/f{index}.lua"), "local a = 1"))
             .collect::<Vec<_>>();
         let caller = std::thread::current().id();
+        let _threads = THREADS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         set_analysis_threads(1);
         let threads = map_files_collect(ws.get_db_mut(), &file_ids, |_, _| {
             std::thread::current().id()

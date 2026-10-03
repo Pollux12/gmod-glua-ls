@@ -406,13 +406,13 @@ impl WorkerEvaluation {
     pub(crate) fn read_keys<'a>(
         &'a self,
         graph: &'a ReaderGraph,
-    ) -> impl Iterator<Item = &'a FactKey> {
+    ) -> impl Iterator<Item = &'a HashedKey> {
         self.keys
             .entries
             .iter()
             .filter_map(move |entry| match *entry {
-                super::WorkerKey::Known(slot) => graph.keys().live_key(slot).map(HashedKey::key),
-                super::WorkerKey::New(index) => Some(self.keys.new_keys[index as usize].key()),
+                super::WorkerKey::Known(slot) => graph.keys().live_key(slot),
+                super::WorkerKey::New(index) => Some(&self.keys.new_keys[index as usize]),
             })
     }
 
@@ -522,7 +522,9 @@ pub(crate) fn compute_recorded<T>(
         "worker computation wrote domain facts"
     );
     assert!(evaluation.stamp > snapshot.0.started);
-    let worker = WORKER.with(|worker| worker.borrow_mut().take()).unwrap();
+    let worker = WORKER
+        .with(|worker| worker.borrow_mut().take())
+        .expect("compute_recorded installed the worker context");
     if crate::profile::profiling() {
         worker.replay_counts.publish();
     }

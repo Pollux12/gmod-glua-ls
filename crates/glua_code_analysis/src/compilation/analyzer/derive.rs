@@ -126,7 +126,6 @@ impl super::engine::Recipe for Recipes {
         matches!(
             kind,
             DerivationKind::CallSiteParams
-                | DerivationKind::CallTargets
                 | DerivationKind::NetHelpers
                 | DerivationKind::Network
                 | DerivationKind::DynamicFields
@@ -134,6 +133,10 @@ impl super::engine::Recipe for Recipes {
                 | DerivationKind::GmodClassCallSites
                 | DerivationKind::LocalFallbacks
         )
+    }
+
+    fn records_on_workers(&self, kind: DerivationKind) -> bool {
+        kind == DerivationKind::CallTargets
     }
 
     fn compute(&self, db: &DbIndex, id: DerivationId) -> Box<dyn std::any::Any + Send> {
@@ -250,14 +253,16 @@ impl super::engine::Recipe for Recipes {
     }
 
     fn discard(&self, id: DerivationId, computed: Box<dyn std::any::Any + Send>) {
-        let ComputedCallTargets { mut cache, .. } = *computed
-            .downcast::<ComputedCallTargets>()
-            .expect("call targets");
-        cache.rollback_transaction();
-        self.caches
-            .lock()
-            .expect("cache store")
-            .insert(id.file_id, cache);
+        if id.kind == DerivationKind::CallTargets {
+            let ComputedCallTargets { mut cache, .. } = *computed
+                .downcast::<ComputedCallTargets>()
+                .expect("call targets");
+            cache.rollback_transaction();
+            self.caches
+                .lock()
+                .expect("cache store")
+                .insert(id.file_id, cache);
+        }
     }
 
     fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
