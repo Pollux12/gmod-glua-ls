@@ -129,8 +129,7 @@ impl<K: Hash + Eq + Clone, V> TrackedMap<K, V> {
             return;
         }
         if let Some(transaction) = super::transaction::current() {
-            self.prepare_undo(transaction);
-            let undo = &mut self.undo.as_mut().unwrap().entries;
+            let undo = Self::prepare_undo(&mut self.undo, transaction);
             for (key, value) in self.shared.drain() {
                 undo.entry(key).or_insert(Some(value));
             }
@@ -168,14 +167,18 @@ impl<K: Hash + Eq + Clone, V> TrackedMap<K, V> {
         self.shared.len() != before
     }
 
-    fn prepare_undo(&mut self, transaction: u64) {
-        let undo = self.undo.get_or_insert_with(|| {
+    fn prepare_undo(
+        undo: &mut Option<Box<SharedUndo<K, V>>>,
+        transaction: u64,
+    ) -> &mut FxHashMap<K, Option<(V, Provenance)>> {
+        let undo = undo.get_or_insert_with(|| {
             Box::new(SharedUndo {
                 transaction,
                 entries: FxHashMap::default(),
             })
         });
         assert_eq!(undo.transaction, transaction);
+        &mut undo.entries
     }
 
     #[inline]
@@ -187,8 +190,7 @@ impl<K: Hash + Eq + Clone, V> TrackedMap<K, V> {
     #[cold]
     #[inline(never)]
     fn capture_shared_active(&mut self, key: &K, transaction: u64) -> Option<K> {
-        self.prepare_undo(transaction);
-        let undo = &mut self.undo.as_mut().unwrap().entries;
+        let undo = Self::prepare_undo(&mut self.undo, transaction);
         if undo.contains_key(key) {
             return None;
         }

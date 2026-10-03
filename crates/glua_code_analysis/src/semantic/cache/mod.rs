@@ -836,8 +836,7 @@ impl LuaInferCache {
         self.signature_is_generic_cache.clear();
         self.generic_call_bindings.clear();
         self.owner_raw_member_type_cache.clear();
-        if self.active_transaction() {
-            let undo = self.transaction.as_mut().unwrap();
+        if let Some(undo) = Self::active_undo(&mut self.transaction) {
             let removed = self
                 .flow_node_cache
                 .iter_mut()
@@ -1082,7 +1081,9 @@ impl LuaInferCache {
             Reuse::Held => Some(bucket[at].1.clone()),
             Reuse::Stale => {
                 self.capture_call(&key);
-                self.call_cache.get_mut(&key).unwrap().swap_remove(at);
+                if let Some(bucket) = self.call_cache.get_mut(&key) {
+                    bucket.swap_remove(at);
+                }
                 None
             }
             Reuse::Elsewhere => None,

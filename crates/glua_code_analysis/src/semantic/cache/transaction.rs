@@ -129,14 +129,16 @@ impl LuaInferCache {
             .is_some_and(|undo| Some(undo.id) == current())
     }
 
+    /// The undo of the transaction open on this thread, if it is this cache's.
+    pub(super) fn active_undo(transaction: &mut Option<Box<CacheUndo>>) -> Option<&mut CacheUndo> {
+        transaction
+            .as_deref_mut()
+            .filter(|undo| Some(undo.id) == current())
+    }
+
     pub(super) fn capture_call(&mut self, key: &CallKey) {
-        if self.active_transaction() {
-            capture(
-                &mut self.call_cache,
-                &mut self.transaction.as_mut().unwrap().calls,
-                key,
-                |_| {},
-            );
+        if let Some(undo) = Self::active_undo(&mut self.transaction) {
+            capture(&mut self.call_cache, &mut undo.calls, key, |_| {});
         }
     }
 
@@ -150,10 +152,10 @@ impl LuaInferCache {
     }
 
     pub(super) fn capture_flow(&mut self, key: &VarRefCacheKey) {
-        if self.active_transaction() {
+        if let Some(undo) = Self::active_undo(&mut self.transaction) {
             capture(
                 &mut self.flow_node_cache,
-                &mut self.transaction.as_mut().unwrap().flows,
+                &mut undo.flows,
                 key,
                 FlowEntries::rollback_transaction,
             );
@@ -173,10 +175,10 @@ impl LuaInferCache {
     }
 
     pub(super) fn capture_keyed_flow(&mut self, key: &KeyedFlowKey) {
-        if self.active_transaction() {
+        if let Some(undo) = Self::active_undo(&mut self.transaction) {
             capture(
                 &mut self.keyed_flow_node_cache,
-                &mut self.transaction.as_mut().unwrap().keyed_flows,
+                &mut undo.keyed_flows,
                 key,
                 FlowEntries::rollback_transaction,
             );

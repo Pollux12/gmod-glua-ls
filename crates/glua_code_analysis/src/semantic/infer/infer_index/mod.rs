@@ -4228,8 +4228,10 @@ mod member_query_memo_tests {
     fn member_query_diagnostic_local_reuse_is_confined_to_fresh_root_and_evaluation() {
         let db = DbIndex::new();
         let file = FileId::new(1);
-        let mut options = CacheOptions::default();
-        options.analysis_phase = crate::LuaAnalysisPhase::Diagnostics;
+        let options = CacheOptions {
+            analysis_phase: crate::LuaAnalysisPhase::Diagnostics,
+            ..CacheOptions::default()
+        };
         let mut cache = LuaInferCache::new(file, options);
         let expr = expression();
         let syntax = expr.get_syntax_id();
