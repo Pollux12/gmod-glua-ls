@@ -512,6 +512,9 @@ impl LuaInferCache {
             return;
         }
         let fresh = recompute(&mut self.fork_fresh());
+        if derivation::worker_requires_canonical() {
+            return;
+        }
         if fresh.as_ref() != Some(shared) {
             eprintln!(
                 "[cache] mismatch {:?} {site:?} {:?} shared={shared:?} fresh={fresh:?}",
