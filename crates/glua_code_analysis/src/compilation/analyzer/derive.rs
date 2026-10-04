@@ -233,23 +233,13 @@ impl super::engine::Recipe for Recipes {
     fn apply(&self, db: &mut DbIndex, id: DerivationId, computed: Box<dyn std::any::Any + Send>) {
         match id.kind {
             DerivationKind::CallTargets => {
-                let ComputedCallTargets { targets, cache } = *computed
+                let ComputedCallTargets { targets, mut cache } = *computed
                     .downcast::<ComputedCallTargets>()
                     .expect("call targets");
-                let mut context = AnalyzeContext::for_files(db, vec![id.file_id], &self.scopes);
-                context.infer_manager.restore_file(id.file_id, cache);
                 call_target::apply_file_call_targets(db, id.file_id, targets);
-                unresolve::resolve_inline(db, &mut context);
-                let mut cache = context
-                    .infer_manager
-                    .take_file(id.file_id)
-                    .expect("call-target cache");
                 cache.commit_transaction();
                 cache.clear();
-                self.caches
-                    .lock()
-                    .expect("cache store")
-                    .insert(id.file_id, cache);
+                self.store_cache(id.file_id, cache);
             }
             DerivationKind::CallSiteParams => {
                 let contributions = *computed
