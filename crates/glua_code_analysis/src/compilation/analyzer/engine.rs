@@ -1417,6 +1417,7 @@ impl Engine {
             &FxHashSet::default(),
             &FxHashSet::default(),
             None,
+            None,
         );
         let profiling = self.stats.profiling();
         let computed = {
@@ -1518,8 +1519,8 @@ impl Engine {
     /// Evaluates `first` with the queued derivations of its kind that have to
     /// run, computing each on a pool worker against the canonical index and
     /// publishing them in queue order on this thread. A result whose reads no
-    /// longer hold, or that read another member's reset output, is discarded
-    /// and evaluated here instead. Returns false, with the queue restored, when
+    /// longer hold, or that read a key another member's reset moved, is
+    /// discarded and evaluated here instead. Returns false, with the queue restored, when
     /// too few run to pay for the workers: `first` then runs as usual.
     fn run_recorded_batch(
         &mut self,
@@ -1552,14 +1553,12 @@ impl Engine {
                 alone.push(id);
             }
         }
-        let owners = batch
-            .iter()
-            .flat_map(|id| {
-                db.reader_graph()
-                    .outputs_of(*id)
-                    .map(|key| (key.clone(), *id))
-            })
-            .collect::<FxHashMap<_, _>>();
+        let mut owners = ResetOwners::default();
+        for id in &batch {
+            for key in db.reader_graph().outputs_of(*id) {
+                owners.note(key.clone(), Some(*id));
+            }
+        }
         let profiling = self.stats.profiling();
         let started = profiling.then(std::time::Instant::now);
         let reruns = batch
@@ -1577,6 +1576,7 @@ impl Engine {
             &FxHashSet::default(),
             &FxHashSet::default(),
             None,
+            Some(&mut owners),
         );
         let mut touched = reset.clone();
         let recomputing = self.lend_evaluation_keys(db, &touched);
@@ -1643,7 +1643,7 @@ impl Engine {
             }) && result
                 .evaluation
                 .read_keys(db.reader_graph())
-                .all(|key| !reset.contains(key) || owners.get(key) == Some(id));
+                .all(|key| !reset.contains(key) || owners.owner(key) == Some(*id));
             if profiling {
                 self.stats.parallel_attempts += 1;
             }
@@ -1664,6 +1664,8 @@ impl Engine {
                 std::mem::forget(lent);
                 evaluation
             } else {
+                #[cfg(test)]
+                WORKER_FELL_BACK.with(|fell_back| fell_back.set(fell_back.get() + 1));
                 if profiling {
                     self.stats.parallel_fallbacks += 1;
                 }
@@ -1714,7 +1716,9 @@ impl Engine {
     /// every key that moved or may move: their previous outputs.
     /// Resets `members`' primary outputs and the primary keys in `also`, but
     /// `deferred`, and takes the fingerprints each of them had before. Returns
-    /// them with what the reset wrote, which `written` also takes.
+    /// them with what the reset wrote, which `written` also takes. `owners`,
+    /// holding each output's producer, also takes for every key the reset
+    /// wrote the producer of the output whose reset wrote it.
     fn reset_outputs(
         &self,
         db: &mut DbIndex,
@@ -1722,6 +1726,7 @@ impl Engine {
         also: &FxHashSet<HashedKey>,
         deferred: &FxHashSet<HashedKey>,
         written: Option<&mut FxHashSet<HashedKey>>,
+        owners: Option<&mut ResetOwners>,
     ) -> FxHashSet<HashedKey> {
         let mut touched = also.clone();
         for member in members {
@@ -1731,14 +1736,32 @@ impl Engine {
             .iter()
             .map(|key| (key.clone(), self.fingerprint(db, key)))
             .collect();
-        let reset = derivation::capture_writes(|| {
-            for key in touched
-                .iter()
-                .filter(|key| key.is_primary() && !deferred.contains(*key))
-            {
-                db.reset_fact(key);
+        let resets = touched
+            .iter()
+            .filter(|key| key.is_primary() && !deferred.contains(*key));
+        let reset = match owners {
+            None => derivation::capture_writes(|| {
+                for key in resets {
+                    db.reset_fact(key);
+                }
+            }),
+            Some(owners) => {
+                let wrote = resets
+                    .map(|key| {
+                        let producer = owners.owner(key);
+                        (producer, derivation::capture_writes(|| db.reset_fact(key)))
+                    })
+                    .collect::<Vec<_>>();
+                let mut reset = FxHashSet::default();
+                for (producer, keys) in wrote {
+                    for key in keys {
+                        owners.note(key.clone(), producer);
+                        reset.insert(key);
+                    }
+                }
+                reset
             }
-        });
+        };
         if let Some(written) = written {
             written.extend(reset.iter().cloned());
         }
@@ -1818,6 +1841,7 @@ impl Engine {
                 &discarded,
                 &deferred,
                 grouped.then_some(&mut reset),
+                None,
             ));
             let mut cleared = FxHashSet::default();
             let (evaluations, found) = self.with_lent_keys(db, &touched, |db| {
@@ -2351,6 +2375,26 @@ fn assert_batch_reads_held(
     }
 }
 
+/// The batch member each key a batch reset moved belongs to: the producer of
+/// the output whose reset wrote it, or of the output itself. A key two
+/// members' outputs or resets share, or that a reset outside the members
+/// wrote, belongs to none.
+#[derive(Default)]
+struct ResetOwners(FxHashMap<HashedKey, Option<DerivationId>>);
+
+impl ResetOwners {
+    fn note(&mut self, key: HashedKey, producer: Option<DerivationId>) {
+        let owner = self.0.entry(key).or_insert(producer);
+        if *owner != producer {
+            *owner = None;
+        }
+    }
+
+    fn owner(&self, key: &HashedKey) -> Option<DerivationId> {
+        self.0.get(key).copied().flatten()
+    }
+}
+
 fn co_producers(db: &DbIndex, id: DerivationId) -> Vec<DerivationId> {
     let graph = db.reader_graph();
     let mut group = BTreeSet::from([id]);
@@ -2396,6 +2440,8 @@ thread_local! {
     /// Worker results this thread published, for tests that must see
     /// [`Engine::run_recorded_batch`] publish.
     static WORKER_PUBLISHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Worker results this thread discarded and evaluated itself instead.
+    static WORKER_FELL_BACK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn check_convergence() -> bool {
@@ -2778,6 +2824,263 @@ print(entry.extra{index}, entry.damage)"
         );
         assert_eq!(serial.1, recorded.1);
         assert_eq!(recorded.0, warm);
+    }
+
+    /// Local fallbacks re-run together after their classes change: each file's
+    /// scan reads the declared types its own reset restored from under its
+    /// fallbacks, which no other member's reset touches.
+    #[test]
+    fn local_fallbacks_reading_their_own_reset_publish_from_workers_and_match_cold() {
+        let classes = r#"
+            ---@class Entity
+            ---@class Radio: Entity
+            ---@field Tune fun(self: Radio)
+        "#;
+        let edited = r#"
+            ---@class Entity
+            ---@class Radio: Entity
+            ---@field Tune fun(self: Radio)
+            ---@field Mute fun(self: Radio)
+        "#;
+        let tuners = (0..10)
+            .map(|index| {
+                (
+                    format!("lua/autorun/client/cl_tuner_{index}.lua"),
+                    format!(
+                        "---@type Entity
+local tuned{index}
+tuned{index}:Tune()
+print(tuned{index})"
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let classes_path = "lua/autorun/sh_radio_classes.lua";
+        let mut files = vec![(classes_path, classes)];
+        files.extend(
+            tuners
+                .iter()
+                .map(|(path, text)| (path.as_str(), text.as_str())),
+        );
+        let counts = || {
+            (
+                WORKER_PUBLISHED.with(std::cell::Cell::get),
+                WORKER_FELL_BACK.with(std::cell::Cell::get),
+            )
+        };
+        let analyse = |threads: usize| {
+            parallel::set_analysis_threads(threads);
+            let mut ws = VirtualWorkspace::new();
+            ws.def_files(files.clone());
+            let uri = ws.virtual_url_generator.new_uri(classes_path);
+            let (published, fell_back) = counts();
+            ws.def_file(classes_path, edited);
+            ws.analysis.remove_file_by_uri(&uri);
+            ws.def_file(classes_path, edited);
+            let (now_published, now_fell_back) = counts();
+            (
+                recorded_digest(&mut ws),
+                ws.semantic_digest(),
+                now_published - published,
+                now_fell_back - fell_back,
+            )
+        };
+        let threads = parallel::THREADS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let serial = analyse(1);
+        let recorded = analyse(4);
+        let mut final_files = files.clone();
+        final_files[0].1 = edited;
+        let mut cold = VirtualWorkspace::new();
+        cold.def_files(final_files);
+        let cold = cold.semantic_digest();
+        parallel::set_analysis_threads(0);
+        drop(threads);
+        let differ = |left: &[String], right: &[String]| {
+            let left_set = left.iter().collect::<std::collections::BTreeSet<_>>();
+            let right_set = right.iter().collect::<std::collections::BTreeSet<_>>();
+            let mut lines = left_set
+                .difference(&right_set)
+                .map(|line| format!("- {line}"))
+                .chain(
+                    right_set
+                        .difference(&left_set)
+                        .map(|line| format!("+ {line}")),
+                )
+                .collect::<Vec<_>>();
+            lines.truncate(20);
+            lines.join("\n")
+        };
+        eprintln!(
+            "[own-reset] published={} fell_back={}",
+            recorded.2, recorded.3
+        );
+        assert!(
+            recorded.2 > 0,
+            "published: no fallbacks were published from workers"
+        );
+        assert_eq!(
+            recorded.3, 0,
+            "fell_back: a worker result was evaluated again"
+        );
+        assert!(
+            serial.0 == recorded.0,
+            "serial vs recorded records:\n{}",
+            differ(&serial.0, &recorded.0)
+        );
+        assert!(
+            recorded.1 == cold,
+            "warm vs cold settled:\n{}",
+            differ(&recorded.1, &cold)
+        );
+    }
+
+    /// Recorded call targets that each file a member under one shared owner,
+    /// and read how many that owner has.
+    struct SharedOwnerTargets {
+        adds: std::sync::atomic::AtomicBool,
+        /// Each publication: the file, whether a worker computed it, and the
+        /// member count it computed from.
+        applied: Mutex<Vec<(FileId, bool, usize)>>,
+    }
+
+    fn joined_count(db: &DbIndex) -> usize {
+        db.get_member_index()
+            .get_members(&joined_owner())
+            .map_or(0, |members| members.len())
+    }
+
+    impl SharedOwnerTargets {
+        fn file_member(&self, db: &mut DbIndex, id: DerivationId) {
+            if !self.adds.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let member = crate::LuaMember::new(
+                crate::LuaMemberId::new(id.syntax_id(), id.file_id),
+                crate::LuaMemberKey::Name(format!("member{}", id.file_id.id).into()),
+                crate::LuaMemberFeature::FileFieldDecl,
+                None,
+            );
+            db.get_member_index_mut().add_member(joined_owner(), member);
+        }
+    }
+
+    impl Recipe for SharedOwnerTargets {
+        fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
+            let count = joined_count(db);
+            self.applied
+                .lock()
+                .unwrap()
+                .push((id.file_id, false, count));
+            self.file_member(db, id);
+        }
+
+        fn splits(&self, _: DerivationKind) -> bool {
+            false
+        }
+
+        fn records_on_workers(&self, kind: DerivationKind) -> bool {
+            kind == DerivationKind::CallTargets
+        }
+
+        fn compute(&self, db: &DbIndex, _: DerivationId) -> Box<dyn std::any::Any + Send> {
+            Box::new(joined_count(db))
+        }
+
+        fn apply(
+            &self,
+            db: &mut DbIndex,
+            id: DerivationId,
+            computed: Box<dyn std::any::Any + Send>,
+        ) {
+            let count = *computed.downcast::<usize>().expect("a count");
+            self.applied.lock().unwrap().push((id.file_id, true, count));
+            self.file_member(db, id);
+        }
+    }
+
+    /// A key every member's reset moves belongs to none of them: the first
+    /// member computed from the owner the later members' resets emptied, which
+    /// it would see filled evaluated alone.
+    #[test]
+    fn a_member_reading_what_several_members_resets_moved_is_evaluated_again() {
+        use glua_parser::LuaAstNode;
+
+        let mut ws = VirtualWorkspace::new();
+        let files = (0..8)
+            .map(|index| {
+                ws.def_file(
+                    &format!("lua/autorun/shared_owner_{index}.lua"),
+                    "local value = 1",
+                )
+            })
+            .collect::<Vec<_>>();
+        let db = ws.get_db_mut();
+        let ids = files
+            .iter()
+            .map(|file_id| {
+                let root = db
+                    .get_vfs()
+                    .get_syntax_tree(file_id)
+                    .unwrap()
+                    .get_chunk_node();
+                DerivationId::new(
+                    DerivationKind::CallTargets,
+                    *file_id,
+                    LuaSyntaxId::from_node(root.syntax()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let recipe = SharedOwnerTargets {
+            adds: std::sync::atomic::AtomicBool::new(true),
+            applied: Mutex::new(Vec::new()),
+        };
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        let threads = parallel::THREADS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        parallel::set_analysis_threads(4);
+        for adds in [true, false] {
+            recipe
+                .adds
+                .store(adds, std::sync::atomic::Ordering::Relaxed);
+            recipe.applied.lock().unwrap().clear();
+            engine.worklist = Queue::new(Schedule::Canonical);
+            for id in &ids {
+                engine.worklist.insert(*id, Reason::Changed);
+            }
+            while let Some((first, _)) = engine.worklist.pop_first_of(DerivationKind::CallTargets) {
+                assert!(engine.run_recorded_batch(db, first, &recipe));
+            }
+            eprintln!(
+                "[shared-owner] adds={adds} published {:?} left {}",
+                recipe.applied.lock().unwrap(),
+                joined_count(db)
+            );
+        }
+        parallel::set_analysis_threads(0);
+        drop(threads);
+        // Evaluated alone at its turn, member `k` sees the members of the
+        // later members, which have not run yet: `7 - k` of them.
+        let applied = recipe.applied.lock().unwrap().clone();
+        for (file, worker, count) in &applied {
+            let turn = files.iter().position(|each| each == file).unwrap();
+            if *worker {
+                assert_eq!(
+                    *count,
+                    files.len() - 1 - turn,
+                    "member {turn} published a count serial evaluation would not see: {applied:?}"
+                );
+            }
+        }
+        assert!(
+            applied
+                .iter()
+                .any(|(file, worker, _)| *file == files[0] && !worker),
+            "the first member did not run again: {applied:?}"
+        );
+        assert_eq!(joined_count(db), 0);
     }
 
     fn statement(start: u32) -> DerivationId {
