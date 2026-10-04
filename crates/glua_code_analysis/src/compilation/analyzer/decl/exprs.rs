@@ -5,12 +5,12 @@ use glua_parser::{
 };
 
 use crate::{
-    EmmyrcLuaVersion, FileId, InFiled, InferFailReason, LegacyModuleEnv, LuaDeclExtra, LuaDeclId,
-    LuaMemberFeature, LuaMemberId, LuaSignatureId,
+    EmmyrcLuaVersion, FileId, InFiled, LegacyModuleEnv, LuaDeclExtra, LuaDeclId, LuaMemberFeature,
+    LuaMemberId, LuaSignatureId,
     db_index::{LuaDecl, LuaDependencyKind, LuaMember, LuaMemberKey, LuaMemberOwner},
 };
 
-use super::{DeclAnalyzer, DeclOp, ops::TableFieldSite};
+use super::{DeclAnalyzer, DeclOp};
 
 pub fn analyze_name_expr(analyzer: &mut DeclAnalyzer, expr: LuaNameExpr) -> Option<()> {
     let name_token = expr.get_name_token()?;
@@ -321,18 +321,7 @@ pub fn analyze_table_expr(analyzer: &mut DeclAnalyzer, table_expr: LuaTableExpr)
                         }
                     }
                     LuaIndexKey::Idx(idx) => LuaMemberKey::Integer(idx as i64),
-                    LuaIndexKey::Expr(field_expr) => {
-                        analyzer.delta.table_fields.push(TableFieldSite {
-                            table_expr: table_expr.get_syntax_id(),
-                            field: field.get_syntax_id(),
-                            decl_feature,
-                            reason: InferFailReason::UnResolveExpr(InFiled::new(
-                                analyzer.get_file_id(),
-                                field_expr.get_syntax_id(),
-                            )),
-                        });
-                        continue;
-                    }
+                    LuaIndexKey::Expr(_) => continue,
                 };
 
                 analyzer

@@ -1,17 +1,15 @@
 use std::sync::Arc;
 
-use glua_parser::{LuaAstNode, LuaSyntaxId, LuaTableExpr, LuaTableField, LuaVersionCondition};
+use glua_parser::{LuaSyntaxId, LuaVersionCondition};
 use rowan::{TextRange, TextSize};
 use rustc_hash::FxHashMap;
 
 use crate::{
-    FileId, InFiled, InferFailReason, LuaMemberFeature, LuaMemberId, LuaSemanticDeclId,
-    LuaSignatureId, LuaTypeOwner, WorkspaceId,
+    FileId, InFiled, LuaMemberId, LuaSemanticDeclId, LuaSignatureId, LuaTypeOwner, WorkspaceId,
     compilation::analyzer::{
         AnalyzeContext,
         common::{TypeCacheWriteMode, bind_type, write_type_cache},
         gmod::{ensure_scoped_class_type_decl_for_file, resolve_load_dependency_target},
-        unresolve::UnResolveTableField,
     },
     db_index::{
         DbIndex, FileReferenceBatch, GlobalId, GmodScopedClassInfo, LegacyModuleEnv, LuaDeclId,
@@ -89,14 +87,6 @@ pub(super) enum DeclOp {
     SeeallProbe(Vec<String>),
 }
 
-/// A table field whose key expression is not yet inferred, by position.
-pub(super) struct TableFieldSite {
-    pub(super) table_expr: LuaSyntaxId,
-    pub(super) field: LuaSyntaxId,
-    pub(super) decl_feature: LuaMemberFeature,
-    pub(super) reason: InferFailReason,
-}
-
 /// What the walk adds to the file's [`AnalyzeContext`].
 #[derive(Default)]
 pub(super) struct ContextDelta {
@@ -104,7 +94,6 @@ pub(super) struct ContextDelta {
     pub(super) early_callable_signatures: Vec<(LuaTypeOwner, LuaSignatureId)>,
     pub(super) early_member_owner_candidates: Vec<(LuaMemberId, LuaDeclId)>,
     pub(super) inferred_guard_candidates: Vec<InFiled<LuaSyntaxId>>,
-    pub(super) table_fields: Vec<TableFieldSite>,
 }
 
 /// What walking one file's declarations found.
@@ -162,38 +151,6 @@ impl DeclWalk {
         }
         for candidate in delta.inferred_guard_candidates {
             context.add_inferred_guard_candidate(candidate);
-        }
-        if !delta.table_fields.is_empty() {
-            let root = context
-                .tree_list
-                .iter()
-                .find(|tree| tree.file_id == file_id)
-                .expect("a file's context holds its tree")
-                .value
-                .syntax()
-                .clone();
-            for site in delta.table_fields {
-                let table_expr = site
-                    .table_expr
-                    .to_node_from_root(&root)
-                    .and_then(LuaTableExpr::cast)
-                    .expect("a table expression walked is in its tree");
-                let field = site
-                    .field
-                    .to_node_from_root(&root)
-                    .and_then(LuaTableField::cast)
-                    .expect("a table field walked is in its tree");
-                context.add_unresolve(
-                    UnResolveTableField {
-                        file_id,
-                        table_expr,
-                        field,
-                        decl_feature: site.decl_feature,
-                    }
-                    .into(),
-                    site.reason,
-                );
-            }
         }
     }
 }

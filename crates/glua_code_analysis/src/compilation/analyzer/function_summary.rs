@@ -10,7 +10,7 @@ use rowan::TextSize;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{call_site_params, dynamic_field};
-use crate::db_index::derivation::{DerivedFact, Fingerprint, fingerprint_of, hash_local};
+use crate::db_index::derivation::{DerivedFact, Fingerprint, fingerprint_of, hash_local, in_file};
 use crate::{DbIndex, FileId};
 
 /// A file's function summaries, each keyed by its closure's position.
@@ -61,13 +61,13 @@ impl DerivedFact for FileFunctionSummaries {
     }
 }
 
-/// `file_id`'s function summaries, absent when it has none: part of its
-/// source layer, after its references are complete.
+/// `file_id`'s function summaries and their fingerprint, absent when it has
+/// none: part of its source layer, after its references are complete.
 pub(super) fn collect_function_summaries(
     db: &DbIndex,
     file_id: FileId,
     root: &LuaChunk,
-) -> Option<Arc<FileFunctionSummaries>> {
+) -> Option<(Arc<FileFunctionSummaries>, Fingerprint)> {
     let (mutated_params, returns_explicit_self) =
         call_site_params::collect_param_summaries(db, file_id, root);
     let summaries = FileFunctionSummaries {
@@ -75,7 +75,12 @@ pub(super) fn collect_function_summaries(
         mutated_params,
         returns_explicit_self,
     };
-    (!summaries.is_empty()).then(|| Arc::new(summaries))
+    if summaries.is_empty() {
+        return None;
+    }
+    let summaries = Arc::new(summaries);
+    let fingerprint = in_file(Some(file_id), || summaries.fingerprint()).max(1);
+    Some((summaries, fingerprint))
 }
 
 /// `file_id`'s function summaries, recorded as a read.

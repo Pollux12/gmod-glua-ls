@@ -560,15 +560,9 @@ fn replace_files(
             parallel::map_files_collect(db, &file_ids, source_tail)
         });
         for ((file_id, (evaluation, context)), tail) in documented.into_iter().zip(tails) {
-            let (outputs, guard_candidates) =
-                document_source(db, file_id, evaluation, context, tail);
+            let (outputs, derivations) = document_source(db, file_id, evaluation, context, tail);
             touched.extend(outputs);
-            let root = db
-                .get_vfs()
-                .get_syntax_tree(&file_id)
-                .expect("a live file has a syntax tree")
-                .get_chunk_node();
-            for id in derive::file_derivations(file_id, &root, &guard_candidates) {
+            for id in derivations {
                 engine.changed(id);
             }
         }
@@ -717,8 +711,12 @@ const SOURCE_TAILS_PER_THREAD: usize = 16;
 struct SourceTail {
     flow_tree: FlowTree,
     errors: Vec<AnalyzeError>,
-    summaries: Option<Arc<function_summary::FileFunctionSummaries>>,
+    summaries: Option<(
+        Arc<function_summary::FileFunctionSummaries>,
+        derivation::Fingerprint,
+    )>,
     role_mentions: Option<Arc<[smol_str::SmolStr]>>,
+    syntax_derivations: Vec<derivation::DerivationId>,
 }
 
 /// `file_id`'s source tail, once every file has declared. Reads only facts of
@@ -735,19 +733,20 @@ fn source_tail(db: &DbIndex, file_id: FileId) -> SourceTail {
         errors,
         summaries: function_summary::collect_function_summaries(db, file_id, &root),
         role_mentions: gmod::collect_role_mentions(db, file_id, &root),
+        syntax_derivations: derive::syntax_derivations(file_id, &root),
     }
 }
 
 /// The last stage of a file's source layer: docs, callable signatures,
 /// early member owners, guard candidates, then its source tail. Returns what
-/// the whole source layer wrote and the closures that are guard candidates.
+/// the whole source layer wrote and the file's other derivations.
 fn document_source(
     db: &mut DbIndex,
     file_id: FileId,
     evaluation: derivation::Evaluation,
     mut context: AnalyzeContext,
     tail: SourceTail,
-) -> (Vec<derivation::HashedKey>, Vec<InFiled<LuaSyntaxId>>) {
+) -> (Vec<derivation::HashedKey>, Vec<derivation::DerivationId>) {
     derivation::resume(evaluation);
     run_analysis::<doc::DocAnalysisPipeline>(db, &mut context);
     publish_callable_signatures(db, &context);
@@ -761,8 +760,8 @@ fn document_source(
             diagnostic_index.add_diagnostic(file_id, error);
         }
     }
-    if let Some(summaries) = tail.summaries {
-        db.set_function_summaries(file_id, summaries);
+    if let Some((summaries, fingerprint)) = tail.summaries {
+        db.set_function_summaries(file_id, summaries, fingerprint);
     }
     if let Some(mentions) = tail.role_mentions {
         db.set_role_mentions(file_id, mentions);
@@ -776,10 +775,18 @@ fn document_source(
         .collect();
     db.reader_graph_mut()
         .replace(id, reads, outputs.clone(), |_| derivation::ABSENT);
-    (
-        outputs.into_iter().chain(moved).collect(),
-        std::mem::take(&mut context.inferred_guard_candidates),
-    )
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .expect("a live file has a syntax tree")
+        .get_chunk_node();
+    let derivations = derive::file_derivations(
+        file_id,
+        &root,
+        tail.syntax_derivations,
+        &context.inferred_guard_candidates,
+    );
+    (outputs.into_iter().chain(moved).collect(), derivations)
 }
 
 fn assert_send<T: Send>() {}

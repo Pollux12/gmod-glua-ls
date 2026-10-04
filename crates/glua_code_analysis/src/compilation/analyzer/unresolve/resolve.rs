@@ -5,21 +5,21 @@ use std::{
 };
 
 use glua_parser::{
-    BinaryOperator, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaLocalStat,
-    LuaTableExpr, LuaTableField, PathTrait,
+    BinaryOperator, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaTableExpr,
+    LuaTableField, PathTrait,
 };
 use rowan::TextSize;
 
 use crate::{
-    DbIndex, FileId, GlobalId, InFiled, InferFailReason, LuaDeclId, LuaDeclOrMemberId,
-    LuaDeclTypeKind, LuaDocReturnInfo, LuaMember, LuaMemberId, LuaMemberInfo, LuaMemberKey,
-    LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeCache,
-    LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, OperatorFunction, RenderLevel,
-    ReturnTypeKind, SemanticDeclLevel, SignatureReturnStatus, TypeOps, VariadicType,
+    DbIndex, FileId, GlobalId, InferFailReason, LuaDeclId, LuaDeclOrMemberId, LuaDeclTypeKind,
+    LuaDocReturnInfo, LuaMember, LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaOperator,
+    LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDecl,
+    LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, OperatorFunction, RenderLevel, ReturnTypeKind,
+    SemanticDeclLevel, SignatureReturnStatus, TypeOps, VariadicType,
     compilation::analyzer::{
         common::{
             DeclWrite, TypeCacheWriteMode, add_member, bind_decl_write, bind_resolved_type,
-            holds_unbound_iter_template, write_type_cache,
+            holds_unbound_iter_template,
         },
         lua::{
             IterVarInference, alias_target_global_path, compute_module_semantic_id,
@@ -43,8 +43,7 @@ use crate::{
 
 use super::{
     ResolveResult, UnResolveDecl, UnResolveMember, UnResolveModule, UnResolveReturn,
-    UnResolveTableField, resolve_closure::inferred_return_tail_matching_documented_first,
-    writes::ResolveWrites,
+    resolve_closure::inferred_return_tail_matching_documented_first, writes::ResolveWrites,
 };
 
 pub fn try_resolve_decl(
@@ -504,96 +503,6 @@ fn local_cached_type_is_informative(typ: &LuaType) -> bool {
             .any(|(typ, _)| local_cached_type_is_informative(typ)),
         _ => true,
     }
-}
-
-pub fn try_resolve_table_field(
-    db: &mut DbIndex,
-    cache: &mut LuaInferCache,
-    unresolve_table_field: &mut UnResolveTableField,
-) -> ResolveResult {
-    let field = unresolve_table_field.field.clone();
-    let field_key = field.get_field_key().ok_or(InferFailReason::None)?;
-    let field_expr = field_key.get_expr().ok_or(InferFailReason::None)?;
-    let field_type = infer_expr(db, cache, field_expr.clone())?;
-    // The same mapping the immediate path uses. Re-deriving it here used to
-    // drop the member for every key type that is neither a literal nor a table,
-    // so a table field whose key type was known straight away got a member while
-    // an identical one that had to wait for inference got none — the analysis
-    // disagreed with itself depending on the order files happened to be
-    // analysed in.
-    let member_key = LuaMemberKey::from_expr_type(field_type);
-    if matches!(member_key, LuaMemberKey::ExprType(ref typ) if typ.is_unknown()) {
-        return Err(InferFailReason::None);
-    }
-    let file_id = unresolve_table_field.file_id;
-    let table_expr = unresolve_table_field.table_expr.clone();
-    let owner_id = LuaMemberOwner::Element(InFiled {
-        file_id,
-        value: table_expr.get_range(),
-    });
-
-    db.get_reference_index_mut().add_index_reference(
-        member_key.clone(),
-        file_id,
-        field.get_syntax_id(),
-    );
-
-    let decl_type = match field.get_value_expr() {
-        Some(expr) => infer_expr(db, cache, expr)?,
-        None => return Err(InferFailReason::None),
-    };
-
-    let member_id = LuaMemberId::new(field.get_syntax_id(), file_id);
-    let member = LuaMember::new(
-        member_id,
-        member_key,
-        unresolve_table_field.decl_feature,
-        None,
-    );
-    db.get_member_index_mut().add_member(owner_id, member);
-    write_type_cache(
-        db,
-        member_id.into(),
-        LuaTypeCache::InferType(decl_type.clone()),
-        TypeCacheWriteMode::InsertOnly,
-    );
-
-    merge_table_field_to_def(db, cache, table_expr, member_id);
-    Ok(())
-}
-
-fn merge_table_field_to_def(
-    db: &mut DbIndex,
-    cache: &mut LuaInferCache,
-    table_expr: LuaTableExpr,
-    member_id: LuaMemberId,
-) -> Option<()> {
-    let file_id = cache.get_file_id();
-    let local_name = table_expr
-        .get_parent::<LuaLocalStat>()?
-        .get_local_name_by_value(LuaExpr::TableExpr(table_expr.clone()))?;
-    let decl_id = LuaDeclId::new(file_id, local_name.get_position());
-    let type_cache = db.get_type_index().get_type_cache(&decl_id.into())?;
-    if let LuaType::Def(id) = type_cache.deref() {
-        let owner = LuaMemberOwner::Type(id.clone());
-        db.get_member_index_mut()
-            .set_member_owner(owner.clone(), member_id.file_id, member_id);
-        db.get_member_index_mut()
-            .add_member_to_owner(owner.clone(), member_id);
-        // A literal that initialises a global path keeps the member following
-        // the path's `---@class` flips even though it now also lives on the
-        // def. The homing note above may have dropped that evidence when the
-        // def is not the path's current canonical owner, so re-stamp here.
-        if let Some(path) = db
-            .get_member_index()
-            .definition_site_path(&InFiled::new(file_id, table_expr.get_range()))
-        {
-            db.get_member_index_mut()
-                .stamp_path_provenance_if_absent([member_id], &path);
-        }
-    }
-
-    Some(())
 }
 
 pub fn try_resolve_module(

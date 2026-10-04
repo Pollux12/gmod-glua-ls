@@ -808,13 +808,16 @@ impl DbIndex {
             .and_then(|(helpers, _)| downcast_fact(helpers))
     }
 
+    /// Files `helpers` under `fingerprint`, computed by the caller as
+    /// `helpers`' [`derivation::DerivedFact::fingerprint`] under
+    /// [`derivation::in_file`]`(Some(file_id), ..)`.
     pub(crate) fn set_function_summaries<T: derivation::DerivedFact>(
         &mut self,
         file_id: FileId,
         helpers: Arc<T>,
+        fingerprint: derivation::Fingerprint,
     ) {
         derivation::note_write(|| derivation::FactKey::FunctionSummaries(file_id));
-        let fingerprint = derivation::in_file(Some(file_id), || helpers.fingerprint()).max(1);
         self.function_summaries
             .insert(file_id, (helpers, fingerprint));
     }

@@ -11,13 +11,9 @@ use super::{
 use crate::db_index::derivation::{DerivationId, DerivationKind};
 use crate::{DbIndex, FileId, InFiled};
 
-/// Every derivation of one file except its source layer, in canonical order.
-pub(super) fn file_derivations(
-    file_id: FileId,
-    root: &LuaChunk,
-    guard_candidates: &[InFiled<LuaSyntaxId>],
-) -> Vec<DerivationId> {
-    let chunk = LuaSyntaxId::from_node(root.syntax());
+/// The derivations of one file's statements, closures, calls and table
+/// fields, in tree order.
+pub(super) fn syntax_derivations(file_id: FileId, root: &LuaChunk) -> Vec<DerivationId> {
     let mut ids = Vec::new();
     for node in root.descendants::<LuaAst>() {
         let kind = match &node {
@@ -38,6 +34,18 @@ pub(super) fn file_derivations(
             LuaSyntaxId::from_node(node.syntax()),
         ));
     }
+    ids
+}
+
+/// Every derivation of one file except its source layer, in canonical order:
+/// the `syntax` ones, then the guards, then the file-wide kinds.
+pub(super) fn file_derivations(
+    file_id: FileId,
+    root: &LuaChunk,
+    mut ids: Vec<DerivationId>,
+    guard_candidates: &[InFiled<LuaSyntaxId>],
+) -> Vec<DerivationId> {
+    let chunk = LuaSyntaxId::from_node(root.syntax());
     ids.extend(
         guard_candidates
             .iter()

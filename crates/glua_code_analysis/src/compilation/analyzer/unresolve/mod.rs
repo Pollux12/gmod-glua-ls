@@ -6,14 +6,12 @@ mod writes;
 use std::cmp::Ordering;
 
 use crate::{
-    FileId, InferFailReason, LuaInferCache, LuaMemberFeature, LuaType,
+    FileId, InferFailReason, LuaInferCache, LuaType,
     compilation::analyzer::unresolve::resolve::try_resolve_special_call,
     db_index::{DbIndex, LuaDeclId, LuaMemberId, LuaSignatureId},
 };
-use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaCallExpr, LuaExpr, LuaFuncStat, LuaTableExpr, LuaTableField,
-};
-use resolve::{try_resolve_decl, try_resolve_module, try_resolve_table_field};
+use glua_parser::{LuaAssignStat, LuaAstNode, LuaCallExpr, LuaExpr, LuaFuncStat, LuaTableField};
+use resolve::{try_resolve_decl, try_resolve_module};
 use resolve_closure::{try_resolve_call_closure_params, try_resolve_closure_return};
 
 pub(crate) use resolve::get_wrapped_callable_target_expr;
@@ -106,10 +104,6 @@ fn attempt_resolve(
                 try_resolve_closure_parent_params(db, writes, cache, un_resolve_closure_params)
             })
         }
-        UnResolve::TableField(un_resolve_table_field) => {
-            let cache = infer_manager.get_infer_cache(file_id);
-            try_resolve_table_field(db, cache, un_resolve_table_field)
-        }
         UnResolve::SpecialCall(un_resolve_special_call) => {
             let cache = infer_manager.get_infer_cache(file_id);
             try_resolve_special_call(db, cache, un_resolve_special_call)
@@ -126,8 +120,7 @@ fn unresolve_kind_rank(unresolve: &UnResolve) -> u8 {
         UnResolve::ClosureParams(_) => 5,
         UnResolve::ClosureReturn(_) => 6,
         UnResolve::ClosureParentParams(_) => 7,
-        UnResolve::TableField(_) => 8,
-        UnResolve::SpecialCall(_) => 9,
+        UnResolve::SpecialCall(_) => 8,
     }
 }
 
@@ -146,7 +139,6 @@ pub enum UnResolve {
     ClosureParams(Box<UnResolveCallClosureParams>),
     ClosureReturn(Box<UnResolveClosureReturn>),
     ClosureParentParams(Box<UnResolveParentClosureParams>),
-    TableField(Box<UnResolveTableField>),
     SpecialCall(Box<UnResolveSpecialCall>),
 }
 
@@ -167,7 +159,6 @@ impl UnResolve {
             UnResolve::ClosureParentParams(un_resolve_closure_params) => {
                 Some(un_resolve_closure_params.file_id)
             }
-            UnResolve::TableField(un_resolve_table_field) => Some(un_resolve_table_field.file_id),
             UnResolve::SpecialCall(un_resolve_special_call) => {
                 Some(un_resolve_special_call.file_id)
             }
@@ -234,10 +225,6 @@ impl UnResolve {
             UnResolve::ClosureParentParams(d) => {
                 (d.file_id.id, u32::from(d.signature_id.get_position()))
             }
-            UnResolve::TableField(d) => (
-                d.file_id.id,
-                u32::from(d.field.syntax().text_range().start()),
-            ),
             UnResolve::SpecialCall(d) => (
                 d.file_id.id,
                 u32::from(d.call_expr.syntax().text_range().start()),
@@ -358,20 +345,6 @@ pub struct UnResolveParentClosureParams {
 impl From<UnResolveParentClosureParams> for UnResolve {
     fn from(un_resolve_closure_params: UnResolveParentClosureParams) -> Self {
         UnResolve::ClosureParentParams(Box::new(un_resolve_closure_params))
-    }
-}
-
-#[derive(Debug)]
-pub struct UnResolveTableField {
-    pub file_id: FileId,
-    pub table_expr: LuaTableExpr,
-    pub field: LuaTableField,
-    pub decl_feature: LuaMemberFeature,
-}
-
-impl From<UnResolveTableField> for UnResolve {
-    fn from(un_resolve_table_field: UnResolveTableField) -> Self {
-        UnResolve::TableField(Box::new(un_resolve_table_field))
     }
 }
 
