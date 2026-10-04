@@ -43,7 +43,9 @@ mod test {
     ];
 
     /// The whole-file passes run once the statements have settled, so a read
-    /// that settles only at the last stage runs none of them again.
+    /// that settles only at the last stage runs none of them again, except
+    /// the dynamic fields, which run first at that stage and again for the
+    /// locals the waiting statements then settle.
     #[test]
     fn whole_file_passes_run_once_when_a_read_settles_at_the_last_stage() {
         let mut ws = gmod_workspace();
@@ -68,7 +70,15 @@ net.Broadcast()
 
         let stats = ws.analysis.compilation.last_stats();
         let evaluations = WHOLE_FILE_PASSES.map(|kind| (kind, stats.evaluations(kind)));
-        assert_eq!(evaluations, WHOLE_FILE_PASSES.map(|kind| (kind, 1)));
+        let expected = WHOLE_FILE_PASSES.map(|kind| {
+            let runs = if kind == DerivationKind::DynamicFields {
+                2
+            } else {
+                1
+            };
+            (kind, runs)
+        });
+        assert_eq!(evaluations, expected);
     }
 
     /// The helper scan reads what a file's signatures declare, so a return

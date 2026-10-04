@@ -925,6 +925,7 @@ impl DerivationKind {
             | Self::Closure
             | Self::Call
             | Self::Setmetatable => Self::LocalStat as u8,
+            Self::LocalFallbacks => Self::AccessorFunc as u8,
             kind => kind as u8,
         }
     }

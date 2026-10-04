@@ -1196,8 +1196,15 @@ impl Engine {
                 .held
                 .extract_if(.., |id, _| id.kind.first_stage() <= stage)
                 .collect::<Vec<_>>();
+            // At the closing stage the held dynamic fields run first, so the
+            // statements waiting on the floor run once with their output.
+            let dynamic_fields_first = stage == AnalysisStage::Closed;
             for (id, reason) in reached {
-                self.worklist.insert(id, reason);
+                if !dynamic_fields_first || id.kind == DerivationKind::DynamicFields {
+                    self.worklist.insert(id, reason);
+                } else {
+                    self.next_round.insert(id, reason);
+                }
                 queued += 1;
             }
             for reader in waited {
@@ -1212,11 +1219,19 @@ impl Engine {
                     DerivationKind::Source => {
                         self.stale_sources.insert(reader.file_id);
                     }
+                    _ if dynamic_fields_first => {
+                        self.next_round.insert(reader, Reason::Changed);
+                        queued += 1;
+                    }
                     _ => {
                         self.worklist.insert(reader, Reason::Changed);
                         queued += 1;
                     }
                 }
+            }
+            if dynamic_fields_first && self.worklist.is_empty() && !self.next_round.is_empty() {
+                let schedule = self.next_round.schedule;
+                self.worklist = std::mem::replace(&mut self.next_round, Queue::new(schedule));
             }
             self.stats.stage_started(stage, queued);
             if queued > 0 {
