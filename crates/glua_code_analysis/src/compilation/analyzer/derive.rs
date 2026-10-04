@@ -237,11 +237,11 @@ impl super::engine::Recipe for Recipes {
             }
             DerivationKind::NetHelpers => Box::new(gmod::compute_net_helpers(db, id.file_id)),
             DerivationKind::Network => Box::new(gmod::compute_network_flows(db, id.file_id)),
-            DerivationKind::LocalFallbacks => Box::new(
-                guesses_locals(db)
-                    .then(|| local_inference::scan_unguarded_children(db, id.file_id))
-                    .flatten(),
-            ),
+            DerivationKind::LocalFallbacks => Box::new(if guesses_locals(db) {
+                local_inference::scan_file(db, id.file_id)
+            } else {
+                local_inference::FileScan::skipped()
+            }),
             DerivationKind::GmodLoadCallSites => Box::new(gmod::compute_annotated_call_sites(
                 db, id.file_id, true, false,
             )),
@@ -300,11 +300,12 @@ impl super::engine::Recipe for Recipes {
             }
             DerivationKind::LocalFallbacks => {
                 let scan = *computed
-                    .downcast::<Option<local_inference::UnguardedChildFileResult>>()
-                    .expect("unguarded-child evidence");
-                if !guesses_locals(db) {
+                    .downcast::<local_inference::FileScan>()
+                    .expect("local fallback scan");
+                if scan.is_idle() || !guesses_locals(db) {
                     return;
                 }
+                let scan = scan.into_evidence();
                 self.with_file_context(db, id.file_id, |db, context| {
                     if let Some(scan) = scan {
                         local_inference::publish_unguarded_children(db, context, vec![scan]);

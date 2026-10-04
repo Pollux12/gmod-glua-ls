@@ -922,10 +922,6 @@ impl DbIndex {
         &mut self,
         mut updates: Vec<(LuaInferenceNodeId, LuaTypeFact)>,
     ) -> FxHashSet<FileId> {
-        // Writes into `types_index` below go direct rather than through
-        // `get_type_index_mut`, so bump the revision and note the touch here
-        // too.
-        self.type_structure_revision = next_type_structure_revision();
         updates.sort_by(|(left_node, _), (right_node, _)| left_node.stable_cmp(right_node));
 
         let mut conflicting_nodes = FxHashSet::default();
@@ -978,6 +974,8 @@ impl DbIndex {
         }
 
         if !changed_files.is_empty() {
+            // The writes above go direct rather than through `get_type_index_mut`.
+            self.type_structure_revision = next_type_structure_revision();
             Arc::make_mut(&mut self.types_index).mark_inference_derived_state_dirty();
         }
         changed_files

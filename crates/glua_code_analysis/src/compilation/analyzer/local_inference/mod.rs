@@ -32,19 +32,13 @@ pub(super) fn stabilize_unknown_locals(
 ) -> bool {
     let _profile =
         crate::profile::Profile::cond_new("local inference stabilize", context.tree_list.len() > 1);
-    // Two index lookups decide this, so they run before the reference list is
-    // cloned.
     let mut candidates = Vec::new();
     for tree in &context.tree_list {
         let file_id = tree.file_id;
-        let Some(references) = db.get_reference_index().get_decl_references_map(&file_id) else {
-            continue;
-        };
-        for (decl_id, decl_references) in references {
-            if guesses(db, decl_id) {
-                candidates.push((file_id, *decl_id, decl_references.clone()));
-            }
-        }
+        candidates.extend(
+            guessed_decls(db, file_id)
+                .map(|(decl_id, references)| (file_id, *decl_id, references.clone())),
+        );
     }
     candidates.sort_by_key(|(_, decl_id, _)| (decl_id.file_id, decl_id.position));
     rederive_settled_initializers(db, context, &mut candidates);
@@ -167,6 +161,18 @@ pub(super) fn stabilize_unknown_locals(
         context.infer_manager.clear();
     }
     changed_any
+}
+
+/// The declarations of `file_id` this pass guesses, with their references.
+fn guessed_decls(
+    db: &crate::DbIndex,
+    file_id: crate::FileId,
+) -> impl Iterator<Item = (&crate::LuaDeclId, &crate::DeclReference)> {
+    db.get_reference_index()
+        .get_decl_references_map(&file_id)
+        .into_iter()
+        .flatten()
+        .filter(|(decl_id, _)| guesses(db, decl_id))
 }
 
 /// Whether this pass guesses `decl_id`'s type from its uses: a local the
@@ -517,9 +523,45 @@ pub(crate) struct UnguardedChildFileResult {
     profile: Option<UnguardedChildProfile>,
 }
 
+/// What one file's local-fallback derivation settles.
+pub(crate) struct FileScan {
+    evidence: Option<UnguardedChildFileResult>,
+    idle: bool,
+}
+
+impl FileScan {
+    /// A scan of a run that does not guess locals yet.
+    pub(crate) fn skipped() -> Self {
+        Self {
+            evidence: None,
+            idle: false,
+        }
+    }
+
+    /// Whether the file has no evidence to publish and no local to guess, so
+    /// settling it writes nothing.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.idle
+    }
+
+    pub(crate) fn into_evidence(self) -> Option<UnguardedChildFileResult> {
+        self.evidence
+    }
+}
+
+/// Scans one file, noting whether settling it would write nothing.
+pub(crate) fn scan_file(db: &crate::DbIndex, file_id: crate::FileId) -> FileScan {
+    let evidence = scan_unguarded_children(db, file_id);
+    let idle = evidence
+        .as_ref()
+        .is_some_and(UnguardedChildFileResult::is_empty)
+        && guessed_decls(db, file_id).next().is_none();
+    FileScan { evidence, idle }
+}
+
 /// One file's unguarded-child evidence, read off the index under the view a
 /// file derivation infers with; [`publish_unguarded_children`] settles it.
-pub(crate) fn scan_unguarded_children(
+fn scan_unguarded_children(
     db: &crate::DbIndex,
     file_id: crate::FileId,
 ) -> Option<UnguardedChildFileResult> {
@@ -541,6 +583,15 @@ pub(crate) fn scan_unguarded_children(
         db.get_module_index().get_workspace_id(file_id),
         crate::profile::phase_enabled(),
     ))
+}
+
+impl UnguardedChildFileResult {
+    fn is_empty(&self) -> bool {
+        self.scores.is_empty()
+            && self.deferred_definitions.is_empty()
+            && self.nested_scores.is_empty()
+            && self.initializer_refinements.is_empty()
+    }
 }
 
 /// Settles files' unguarded-child evidence into published facts. Returns the
