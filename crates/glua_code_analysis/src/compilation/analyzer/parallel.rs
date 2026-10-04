@@ -182,17 +182,21 @@ where
     Some(results)
 }
 
-/// Indices into `file_ids`, ordered largest source first so the long poles are
-/// started before the short ones. Ties break on the index, keeping the order a
-/// pure function of the input.
+/// Indices into `file_ids`, the long poles first: most name and index
+/// expressions bound, where whole-file inference spends its time, then largest
+/// source, for files not bound yet. Ties break on the index, keeping the order
+/// a pure function of the input.
 pub(crate) fn dispatch_order(db: &DbIndex, file_ids: &[FileId]) -> Vec<usize> {
     let vfs = db.get_vfs();
+    let flow_index = db.get_flow_index();
     let mut order: Vec<usize> = (0..file_ids.len()).collect();
-    order.sort_unstable_by_key(|&idx| {
-        let size = vfs
-            .get_file_content(&file_ids[idx])
-            .map_or(0, |text| text.len());
-        (std::cmp::Reverse(size), idx)
+    order.sort_by_cached_key(|&idx| {
+        let file_id = &file_ids[idx];
+        let bindings = flow_index
+            .get_flow_tree(file_id)
+            .map_or(0, |flow_tree| flow_tree.binding_count());
+        let size = vfs.get_file_content(file_id).map_or(0, |text| text.len());
+        (std::cmp::Reverse(bindings), std::cmp::Reverse(size), idx)
     });
     order
 }
