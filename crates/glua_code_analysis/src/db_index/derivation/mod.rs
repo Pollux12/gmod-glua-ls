@@ -1506,6 +1506,14 @@ pub fn note_read(key: impl FnOnce() -> FactKey) {
     });
 }
 
+/// Records reads of `keys`, made elsewhere for the evaluation recording on
+/// this thread, as that evaluation's own.
+pub fn note_reads(keys: impl IntoIterator<Item = HashedKey>) {
+    for key in keys {
+        note_read(|| key.key().clone());
+    }
+}
+
 /// Orders every evaluation, frame and write on every thread: a key table keeps
 /// the stamps its slots were logged and written at from one re-analysis to the
 /// next, and the next may run on another thread.

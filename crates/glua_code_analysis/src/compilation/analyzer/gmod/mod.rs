@@ -847,28 +847,34 @@ pub(super) fn net_producing_function_names(
     let mut pending_names: Vec<SmolStr> = op_names.iter().cloned().collect();
     let mut pending_decls: Vec<LuaDeclId> = Vec::new();
 
-    loop {
-        let expansions = if let Some(name) = pending_names.pop() {
-            reference_index
+    while !pending_names.is_empty() || !pending_decls.is_empty() {
+        // Every pending name and declaration is one level of the closure; the
+        // set it settles on does not depend on the order they are expanded in.
+        pending_names.sort_unstable();
+        pending_decls
+            .sort_unstable_by_key(|decl_id| (decl_id.file_id.id, u32::from(decl_id.position)));
+        let mut sites: Vec<(FileId, Vec<LuaSyntaxId>)> = Vec::new();
+        for name in pending_names.drain(..) {
+            let mut files = reference_index
                 .files_referencing_name(&name)
                 .into_iter()
-                .map(|file_id| {
-                    expand_sites(
-                        db,
-                        file_id,
-                        &reference_index.name_references_in_file(&name, file_id),
-                    )
-                })
-                .collect::<Vec<_>>()
-        } else if let Some(decl_id) = pending_decls.pop() {
-            vec![expand_sites(
-                db,
-                decl_id.file_id,
-                &decl_read_sites(db, decl_id),
-            )]
-        } else {
-            break;
-        };
+                .collect::<Vec<_>>();
+            files.sort_unstable();
+            sites.extend(files.into_iter().map(|file_id| {
+                (
+                    file_id,
+                    reference_index.name_references_in_file(&name, file_id),
+                )
+            }));
+        }
+        sites.extend(
+            pending_decls
+                .drain(..)
+                .map(|decl_id| (decl_id.file_id, decl_read_sites(db, decl_id))),
+        );
+        let expansions = super::parallel::map_items_recorded(&sites, |(file_id, sites)| {
+            expand_sites(db, *file_id, sites)
+        });
 
         for expansion in expansions {
             // A local enters neither name-keyed reference table, so a chain
