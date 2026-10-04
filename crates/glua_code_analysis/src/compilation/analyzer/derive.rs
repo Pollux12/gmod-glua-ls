@@ -1,6 +1,8 @@
 //! Which derivations a file has, and how each kind is evaluated.
 
-use glua_parser::{LuaAst, LuaAstNode, LuaChunk, LuaSyntaxId};
+use glua_parser::{
+    LuaAst, LuaAstNode, LuaChunk, LuaExpr, LuaSyntaxId, LuaTableExpr, LuaTableField,
+};
 
 use rustc_hash::FxHashMap;
 
@@ -11,10 +13,33 @@ use super::{
 use crate::db_index::derivation::{DerivationId, DerivationKind};
 use crate::{DbIndex, FileId, InFiled};
 
+/// Whether a table field is a positional value of a table that is not a
+/// shaped array literal, which analysis never reads or writes.
+fn is_inert_value_field(
+    field: &LuaTableField,
+    shaped_tables: &mut FxHashMap<LuaSyntaxId, bool>,
+) -> bool {
+    if !field.is_value_field() {
+        return false;
+    }
+    if !matches!(field.get_value_expr(), Some(LuaExpr::TableExpr(_))) {
+        return true;
+    }
+    let Some(table) = field.get_parent::<LuaTableExpr>() else {
+        return true;
+    };
+    let shaped = *shaped_tables
+        .entry(LuaSyntaxId::from_node(table.syntax()))
+        .or_insert_with(|| table.is_shaped_array_literal());
+    !shaped
+}
+
 /// The derivations of one file's statements, closures, calls and table
-/// fields, in tree order.
+/// fields, in tree order; positional fields of tables that are not shaped
+/// array literals have none.
 pub(super) fn syntax_derivations(file_id: FileId, root: &LuaChunk) -> Vec<DerivationId> {
     let mut ids = Vec::new();
+    let mut shaped_tables = FxHashMap::default();
     for node in root.descendants::<LuaAst>() {
         let kind = match &node {
             LuaAst::LuaLocalStat(_) => DerivationKind::LocalStat,
@@ -22,7 +47,12 @@ pub(super) fn syntax_derivations(file_id: FileId, root: &LuaChunk) -> Vec<Deriva
             LuaAst::LuaForRangeStat(_) => DerivationKind::ForRangeStat,
             LuaAst::LuaFuncStat(_) => DerivationKind::FuncStat,
             LuaAst::LuaLocalFuncStat(_) => DerivationKind::LocalFuncStat,
-            LuaAst::LuaTableField(_) => DerivationKind::TableField,
+            LuaAst::LuaTableField(field) => {
+                if is_inert_value_field(field, &mut shaped_tables) {
+                    continue;
+                }
+                DerivationKind::TableField
+            }
             LuaAst::LuaClosureExpr(_) => DerivationKind::Closure,
             LuaAst::LuaCallExpr(call) if call.is_setmetatable() => DerivationKind::Setmetatable,
             LuaAst::LuaCallExpr(_) => DerivationKind::Call,
