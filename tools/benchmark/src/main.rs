@@ -393,10 +393,30 @@ fn discover_config_files(root: &Path) -> Vec<PathBuf> {
     .collect()
 }
 
+/// Sets each `KEY=VALUE` line of a `bench.env` file next to the executable
+/// that the environment does not already set, so a launcher that cannot pass
+/// environment variables (the elevated samply bridge) can still configure a run.
+fn load_env_file_beside_exe() {
+    let Some(text) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| std::fs::read_to_string(exe.with_file_name("bench.env")).ok())
+    else {
+        return;
+    };
+    for (key, value) in text.lines().filter_map(|line| line.trim().split_once('=')) {
+        let key = key.trim();
+        if !key.is_empty() && std::env::var_os(key).is_none() {
+            // SAFETY: runs first thing in `main`, before any other thread exists.
+            unsafe { std::env::set_var(key, value.trim()) };
+        }
+    }
+}
+
 /// Analysis recurses over deeply nested syntax. The server does that work on
 /// spawned threads, which get a far larger stack than a process main thread does
 /// on Windows, so the tools have to ask for one explicitly.
 fn main() {
+    load_env_file_beside_exe();
     std::thread::Builder::new()
         .stack_size(glua_code_analysis::ANALYSIS_STACK_SIZE)
         .spawn(|| {
