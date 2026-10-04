@@ -1068,7 +1068,8 @@ pub struct Evaluation {
     named_reads: hashbrown::HashTable<NamedRead>,
     /// Cheap identities of keys already in `reads`, see [`note_read_by`].
     read_identities: rustc_hash::FxHashMap<(u8, u128), KeyIdx>,
-    outputs: FxHashSet<HashedKey>,
+    /// The keys the evaluation wrote, pushed once per write.
+    outputs: Vec<HashedKey>,
     /// Keys the evaluation re-filed without producing them, see [`rehoming`].
     moved: FxHashSet<HashedKey>,
     /// Fingerprints taken when an earlier stage of a staged evaluation ended:
@@ -1077,7 +1078,7 @@ pub struct Evaluation {
 }
 
 impl Evaluation {
-    /// The keys the evaluation wrote.
+    /// The keys the evaluation wrote, once per write.
     pub fn outputs(&self) -> impl Iterator<Item = &HashedKey> {
         self.outputs.iter()
     }
@@ -1114,12 +1115,20 @@ impl Evaluation {
 
     /// Fingerprints the reads made so far, for an evaluation suspended while
     /// other evaluations run: what it read is compared with what it saw, not
-    /// with what they wrote afterwards.
+    /// with what they wrote afterwards. Reads [`records_read`] drops are not
+    /// fingerprinted: they are dropped either way.
     pub fn fingerprint_stage(&mut self, fingerprint: impl Fn(&FactKey) -> Fingerprint) {
+        let id = self.id;
+        self.outputs.sort_unstable_by_key(|key| key.hash);
+        self.outputs.dedup();
         for key in &self.reads {
-            if !self.staged.contains_key(key) {
-                self.staged.insert(key.clone(), fingerprint(key));
+            if self.staged.contains_key(key) {
+                continue;
             }
+            if !records_read(id, key, |key| contains_hashed(&self.outputs, key)) {
+                continue;
+            }
+            self.staged.insert(key.clone(), fingerprint(key));
         }
     }
 
@@ -1160,12 +1169,10 @@ impl Evaluation {
             logged.dedup();
             logged == slots
         });
-        (
-            self.id,
-            slots,
-            self.reads.into_iter().collect(),
-            self.outputs.into_iter().collect(),
-        )
+        let mut outputs = self.outputs;
+        outputs.sort_unstable_by_key(|key| key.hash);
+        outputs.dedup();
+        (self.id, slots, self.reads.into_iter().collect(), outputs)
     }
 
     /// The reads of an evaluation that viewed `graph` (see [`view_graph`]),
@@ -1206,22 +1213,24 @@ impl Evaluation {
         Vec<HashedKey>,
     ) {
         debug_assert!(self.log.is_empty(), "interned reads need the key table");
-        let outputs = self.outputs;
+        let mut outputs = self.outputs;
+        outputs.sort_unstable_by_key(|key| key.hash);
+        outputs.dedup();
         let id = self.id;
         let reads = self
             .reads
             .into_iter()
-            .filter(|key| records_read(id, key, |key| outputs.contains(key)))
+            .filter(|key| records_read(id, key, |key| contains_hashed(&outputs, key)))
             .map(|key| {
                 let seen = self
                     .staged
                     .get(&key)
-                    .filter(|_| !outputs.contains(&key))
+                    .filter(|_| !contains_hashed(&outputs, &key))
                     .copied();
                 (key, seen)
             })
             .collect();
-        (self.id, reads, outputs.into_iter().collect())
+        (self.id, reads, outputs)
     }
 }
 
@@ -1265,6 +1274,16 @@ pub(crate) fn records_read(
     let own = key.owning_file() == Some(id.file_id);
     !(key.is_primary() && is_output(key))
         && !(own && (key.is_file_source() || id.kind == DerivationKind::Source))
+}
+
+/// Whether `key` is one of `sorted`, a vec sorted by [`HashedKey`]'s stored
+/// hash and deduplicated.
+fn contains_hashed(sorted: &[HashedKey], key: &HashedKey) -> bool {
+    let start = sorted.partition_point(|probe| probe.hash < key.hash);
+    sorted[start..]
+        .iter()
+        .take_while(|probe| probe.hash == key.hash)
+        .any(|probe| probe == key)
 }
 
 thread_local! {
@@ -1392,7 +1411,7 @@ pub fn begin(id: DerivationId) {
         viewed: FxHashSet::default(),
         read_identities: spare.read_identities,
         named_reads: spare.named_reads,
-        outputs: FxHashSet::default(),
+        outputs: Vec::new(),
         moved: FxHashSet::default(),
         staged: rustc_hash::FxHashMap::default(),
     });
@@ -2116,7 +2135,7 @@ pub fn note_write(key: impl FnOnce() -> FactKey) {
             if REHOMING.with(|depth| depth.get() > 0) {
                 evaluation.moved.insert(key);
             } else {
-                evaluation.outputs.insert(key);
+                evaluation.outputs.push(key);
             }
         } else {
             CAPTURED.with(|captured| {

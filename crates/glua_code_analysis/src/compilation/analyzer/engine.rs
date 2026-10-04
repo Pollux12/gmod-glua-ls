@@ -1866,7 +1866,8 @@ impl Engine {
         for (evaluation, ended) in evaluations {
             touched.extend(evaluation.moved().cloned());
             let (id, mut slots, reads, outputs) = evaluation.into_recorded();
-            slots.extend(reads.into_iter().map(|key| graph.intern_read(key)));
+            let now = derivation::new_stamp();
+            slots.extend(reads.into_iter().map(|key| graph.intern_read_at(key, now)));
             // A resumed evaluation read some keys both before and after the
             // table was lent.
             slots.sort_unstable();
@@ -1882,6 +1883,7 @@ impl Engine {
                 outputs,
                 |key| db.fact_fingerprint(key),
                 &mut released,
+                now,
             );
         }
         graph.release_keys(released);

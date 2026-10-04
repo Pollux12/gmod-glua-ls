@@ -1043,12 +1043,13 @@ impl ReaderGraph {
         outputs: Vec<HashedKey>,
         fingerprint: impl Fn(&HashedKey) -> Fingerprint,
     ) -> Vec<HashedKey> {
+        let now = super::new_stamp();
         let slots = reads
             .into_iter()
-            .map(|(key, seen)| (self.intern_key(key), seen))
+            .map(|(key, seen)| (self.intern_key(key, now), seen))
             .collect();
         let mut released = Vec::new();
-        let dropped = self.replace_slots(id, slots, outputs, fingerprint, &mut released);
+        let dropped = self.replace_slots(id, slots, outputs, fingerprint, &mut released, now);
         self.release_keys(released);
         dropped
     }
@@ -1063,6 +1064,7 @@ impl ReaderGraph {
         reads: super::ViewedReads,
         released: &mut Vec<KeyIdx>,
     ) {
+        let now = super::new_stamp();
         let mut slots = reads
             .slots
             .into_iter()
@@ -1072,9 +1074,9 @@ impl ReaderGraph {
             reads
                 .keys
                 .into_iter()
-                .map(|(key, seen)| (self.intern_key(key), Some(seen))),
+                .map(|(key, seen)| (self.intern_key(key, now), Some(seen))),
         );
-        self.replace_slots(id, slots, Vec::new(), |_| super::UNSEEN, released);
+        self.replace_slots(id, slots, Vec::new(), |_| super::UNSEEN, released, now);
     }
 
     /// Frees each slot of `slots` nothing refers to any more.
@@ -1084,8 +1086,8 @@ impl ReaderGraph {
         }
     }
 
-    /// [`Self::replace`] with the reads already interned. The slots of reads
-    /// the record no longer keeps (see [`super::records_read`]) go to
+    /// [`Self::replace`] with the reads already interned at `now`. The slots
+    /// of reads the record no longer keeps (see [`super::records_read`]) go to
     /// `released`, to free with [`Self::release_keys`] once every record of
     /// the group sharing the lent table is replaced: another member may hold
     /// the same slot.
@@ -1096,6 +1098,7 @@ impl ReaderGraph {
         outputs: Vec<HashedKey>,
         fingerprint: impl Fn(&HashedKey) -> Fingerprint,
         released: &mut Vec<KeyIdx>,
+        now: u64,
     ) -> Vec<HashedKey> {
         let deriv = self.intern_derivation(id);
         let output_set = outputs.iter().collect::<FxHashSet<_>>();
@@ -1113,7 +1116,7 @@ impl ReaderGraph {
         reads.sort_unstable_by_key(|(key, _)| *key);
         let mut outputs = outputs
             .into_iter()
-            .map(|key| self.intern_key(key))
+            .map(|key| self.intern_key(key, now))
             .collect::<Vec<_>>();
         outputs.sort_unstable();
         outputs.dedup();
@@ -1384,9 +1387,10 @@ impl ReaderGraph {
         let mut rewrites: FxHashMap<DerivIdx, FxHashMap<KeyIdx, KeyIdx>> = FxHashMap::default();
         let mut vacated = Vec::with_capacity(moved.len());
         let mut moved_to = Vec::with_capacity(moved.len());
+        let now = super::new_stamp();
         for (slot, new_key, readers) in moved {
             moved_to.push(new_key.clone());
-            let target = self.intern_key(new_key);
+            let target = self.intern_key(new_key, now);
             for (seen, deriv) in readers.iter() {
                 self.table.keys[target as usize].readers.insert(deriv, seen);
                 rewrites.entry(deriv).or_default().insert(slot, target);
@@ -1768,13 +1772,21 @@ impl ReaderGraph {
             .collect()
     }
 
-    fn intern_key(&mut self, key: HashedKey) -> KeyIdx {
+    /// Interns `key` as `now`-stamped: a record's interns share one stamp,
+    /// since a new slot only has to count as written after every live stamp.
+    fn intern_key(&mut self, key: HashedKey, now: u64) -> KeyIdx {
+        self.table.intern(key, now)
+    }
+
+    #[cfg(test)]
+    pub fn intern_read(&mut self, key: HashedKey) -> KeyIdx {
         self.table.intern(key, super::new_stamp())
     }
 
-    /// Interns a read made while no key table was lent.
-    pub fn intern_read(&mut self, key: HashedKey) -> KeyIdx {
-        self.table.intern(key, super::new_stamp())
+    /// Interns a read made while no key table was lent, stamped `now` so a
+    /// batch of interns shares one stamp.
+    pub fn intern_read_at(&mut self, key: HashedKey, now: u64) -> KeyIdx {
+        self.table.intern(key, now)
     }
 
     /// Frees `slot` once no derivation reads or produces its key.
@@ -1942,14 +1954,14 @@ mod tests {
     #[test]
     fn stored_fact_handles_reject_reused_slots_and_diverged_forks() {
         let mut graph = ReaderGraph::default();
-        let slot = graph.intern_key(key(1));
+        let slot = graph.intern_read(key(1));
         let mut fork = graph.clone();
         graph.release_key(slot);
         fork.release_key(slot);
         let original = |fact: &FactKey| fact == key(1).key();
         assert_eq!(graph.keys().matching_slot(slot, original), None);
-        assert_eq!(graph.intern_key(key(2)), slot);
-        assert_eq!(fork.intern_key(key(3)), slot);
+        assert_eq!(graph.intern_read(key(2)), slot);
+        assert_eq!(fork.intern_read(key(3)), slot);
         assert_eq!(graph.keys().matching_slot(slot, original), None);
         let fork_key = |fact: &FactKey| fact == key(3).key();
         assert_eq!(graph.keys().matching_slot(slot, fork_key), None);
@@ -2080,8 +2092,16 @@ mod tests {
             vec![key(9)],
             |_| 0,
             &mut released,
+            super::super::new_stamp(),
         );
-        graph.replace_slots(id(2, 0), vec![(slot, None)], vec![], |_| 5, &mut released);
+        graph.replace_slots(
+            id(2, 0),
+            vec![(slot, None)],
+            vec![],
+            |_| 5,
+            &mut released,
+            super::super::new_stamp(),
+        );
         graph.release_keys(released);
 
         assert_eq!(graph.reads_of(id(2, 0)).collect::<Vec<_>>(), vec![&key(9)]);
@@ -2097,8 +2117,22 @@ mod tests {
         graph.restore_keys(table);
 
         let mut released = Vec::new();
-        graph.replace_slots(id(1, 0), vec![], vec![], |_| 0, &mut released);
-        graph.replace_slots(id(2, 0), vec![(slot, None)], vec![], |_| 5, &mut released);
+        graph.replace_slots(
+            id(1, 0),
+            vec![],
+            vec![],
+            |_| 0,
+            &mut released,
+            super::super::new_stamp(),
+        );
+        graph.replace_slots(
+            id(2, 0),
+            vec![(slot, None)],
+            vec![],
+            |_| 5,
+            &mut released,
+            super::super::new_stamp(),
+        );
         graph.release_keys(released);
 
         assert_eq!(graph.reads_of(id(2, 0)).collect::<Vec<_>>(), vec![&key(9)]);
