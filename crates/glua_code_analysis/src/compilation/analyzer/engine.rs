@@ -1089,11 +1089,7 @@ impl Engine {
         db.reader_graph_mut().hold_windows(touched.iter());
         for key in &touched {
             db.reader_graph().forget_fingerprint(key);
-            let before_edits = self.before_edits.get_mut();
-            before_edits.remove(key);
-            for derived in db.reader_graph().derived_keys(key) {
-                before_edits.remove(&derived);
-            }
+            forget_before_edits(self.before_edits.get_mut(), db.reader_graph(), key);
         }
         self.loop_focus = members.iter().copied().collect();
         // Settled from nothing, a loop whose rules leave it more than one
@@ -1860,11 +1856,7 @@ impl Engine {
                 .flat_map(|(evaluation, _)| evaluation.outputs().chain(evaluation.moved())),
         ) {
             db.reader_graph().forget_fingerprint(key);
-            let mut before_edits = self.before_edits.borrow_mut();
-            before_edits.remove(key);
-            for derived in db.reader_graph().derived_keys(key) {
-                before_edits.remove(&derived);
-            }
+            forget_before_edits(&mut self.before_edits.borrow_mut(), db.reader_graph(), key);
         }
         self.verify_fingerprints(db, touched, step);
         // Out of the index while its records are replaced, so the reads can be
@@ -2296,6 +2288,21 @@ fn run_group(
 
 /// Files the reads of the queries computed since this last ran, which makes
 /// each a reader of what it read. Returns the outputs their computation moved.
+/// Drops what `key` and every key read out of it held before the edits.
+fn forget_before_edits(
+    before_edits: &mut FxHashMap<HashedKey, derivation::Fingerprint>,
+    graph: &derivation::ReaderGraph,
+    key: &HashedKey,
+) {
+    if before_edits.is_empty() {
+        return;
+    }
+    before_edits.remove(key);
+    for derived in graph.derived_keys(key) {
+        before_edits.remove(&derived);
+    }
+}
+
 pub(super) fn file_queries(db: &mut DbIndex) -> Vec<HashedKey> {
     if !db.queries().has_pending() {
         return Vec::new();
