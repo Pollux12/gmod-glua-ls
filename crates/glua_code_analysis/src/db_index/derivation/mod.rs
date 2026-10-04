@@ -1068,6 +1068,9 @@ pub struct Evaluation {
     named_reads: hashbrown::HashTable<NamedRead>,
     /// Cheap identities of keys already in `reads`, see [`note_read_by`].
     read_identities: rustc_hash::FxHashMap<(u8, u128), KeyIdx>,
+    /// The slots this evaluation already interned, by key hash: a repeat
+    /// read probes them instead of the key table's index.
+    seen_slots: hashbrown::HashTable<(u64, KeyIdx)>,
     /// The keys the evaluation wrote, pushed once per write.
     outputs: Vec<HashedKey>,
     /// Keys the evaluation re-filed without producing them, see [`rehoming`].
@@ -1158,9 +1161,9 @@ impl Evaluation {
     /// The evaluation's interned reads, its reads made while no key table
     /// was lent, and its outputs.
     #[allow(clippy::type_complexity)]
-    pub fn into_recorded(self) -> (DerivationId, Vec<KeyIdx>, Vec<HashedKey>, Vec<HashedKey>) {
+    pub fn into_recorded(mut self) -> (DerivationId, Vec<KeyIdx>, Vec<HashedKey>, Vec<HashedKey>) {
         // A resumed evaluation logs again what it read before it resumed.
-        let mut slots = self.read;
+        let mut slots = std::mem::take(&mut self.read);
         slots.sort_unstable();
         slots.dedup();
         debug_assert!({
@@ -1169,36 +1172,40 @@ impl Evaluation {
             logged.dedup();
             logged == slots
         });
-        let mut outputs = self.outputs;
-        outputs.sort_unstable_by_key(|key| key.hash);
-        outputs.dedup();
-        (self.id, slots, self.reads.into_iter().collect(), outputs)
+        self.outputs.sort_unstable_by_key(|key| key.hash);
+        self.outputs.dedup();
+        let id = self.id;
+        let reads = self.reads.drain().collect();
+        let outputs = std::mem::take(&mut self.outputs);
+        Spare::park(&mut self);
+        (id, slots, reads, outputs)
     }
 
     /// The reads of an evaluation that viewed `graph` (see [`view_graph`]),
     /// each fingerprinted as it stands.
     pub fn into_viewed_reads(
-        self,
+        mut self,
         graph: &ReaderGraph,
         fingerprint: impl Fn(&HashedKey) -> Fingerprint,
     ) -> ViewedReads {
         let id = self.id;
         let mut slots = self
             .viewed
-            .into_iter()
+            .drain()
             .filter(|slot| records_read(id, graph.key(*slot), |_| false))
             .map(|slot| (slot, graph.slot_fingerprint(slot, &fingerprint)))
             .collect::<Vec<_>>();
         slots.sort_unstable_by_key(|(slot, _)| *slot);
         let keys = self
             .reads
-            .into_iter()
+            .drain()
             .filter(|key| records_read(id, key, |_| false))
             .map(|key| {
                 let seen = fingerprint(&key);
                 (key, seen)
             })
             .collect();
+        Spare::park(&mut self);
         ViewedReads { slots, keys }
     }
 
@@ -1206,31 +1213,32 @@ impl Evaluation {
     /// except those an earlier stage already took.
     #[allow(clippy::type_complexity)]
     pub fn into_unfingerprinted_parts(
-        self,
+        mut self,
     ) -> (
         DerivationId,
         Vec<(HashedKey, Option<Fingerprint>)>,
         Vec<HashedKey>,
     ) {
         debug_assert!(self.log.is_empty(), "interned reads need the key table");
-        let mut outputs = self.outputs;
-        outputs.sort_unstable_by_key(|key| key.hash);
-        outputs.dedup();
+        self.outputs.sort_unstable_by_key(|key| key.hash);
+        self.outputs.dedup();
         let id = self.id;
         let reads = self
             .reads
-            .into_iter()
-            .filter(|key| records_read(id, key, |key| contains_hashed(&outputs, key)))
+            .drain()
+            .filter(|key| records_read(id, key, |key| contains_hashed(&self.outputs, key)))
             .map(|key| {
                 let seen = self
                     .staged
                     .get(&key)
-                    .filter(|_| !contains_hashed(&outputs, &key))
+                    .filter(|_| !contains_hashed(&self.outputs, &key))
                     .copied();
                 (key, seen)
             })
             .collect();
-        (self.id, reads, outputs)
+        let outputs = std::mem::take(&mut self.outputs);
+        Spare::park(&mut self);
+        (id, reads, outputs)
     }
 }
 
@@ -1400,60 +1408,139 @@ pub fn begin(id: DerivationId) {
         .unwrap_or_default();
     start(Evaluation {
         id,
-        log: Vec::new(),
-        read: Vec::new(),
+        log: spare.log,
+        read: spare.read,
         frames: spare.frames,
         unkeyed: spare.unkeyed,
-        checks: FxHashSet::default(),
+        checks: spare.checks,
         log_handle: std::sync::Arc::new(frames::LogHandle::default()),
         stamp,
-        reads: FxHashSet::default(),
-        viewed: FxHashSet::default(),
+        reads: spare.reads,
+        viewed: spare.viewed,
         read_identities: spare.read_identities,
         named_reads: spare.named_reads,
-        outputs: Vec::new(),
-        moved: FxHashSet::default(),
-        staged: rustc_hash::FxHashMap::default(),
+        seen_slots: spare.seen_slots,
+        outputs: spare.outputs,
+        moved: spare.moved,
+        staged: spare.staged,
     });
 }
 
-/// The lookups an evaluation needs only while it records, kept emptied for
-/// the next evaluation on the thread to begin with.
+/// The lookups an evaluation needs only while it records, and the buffers it
+/// collects its results in, kept emptied for the next evaluation on the
+/// thread to begin with.
 #[derive(Default)]
 struct Spare {
     read_identities: rustc_hash::FxHashMap<(u8, u128), KeyIdx>,
     named_reads: hashbrown::HashTable<NamedRead>,
+    seen_slots: hashbrown::HashTable<(u64, KeyIdx)>,
     frames: Vec<frames::Frame>,
     unkeyed: Vec<u64>,
+    checks: FxHashSet<u64>,
+    log: Vec<KeyIdx>,
+    read: Vec<KeyIdx>,
+    reads: FxHashSet<HashedKey>,
+    viewed: FxHashSet<KeyIdx>,
+    outputs: Vec<HashedKey>,
+    moved: FxHashSet<HashedKey>,
+    staged: rustc_hash::FxHashMap<HashedKey, Fingerprint>,
 }
 
-/// The most entries a kept lookup may have room for: emptying one costs its
+/// The most entries a kept buffer may have room for: emptying one costs its
 /// room, which a rare large evaluation must not make every later one pay.
 const SPARE_ROOM: usize = 1 << 12;
 
-/// How many kept lookups a thread holds: as many as evaluations nest.
-const SPARE_DEPTH: usize = 8;
-
 impl Spare {
-    /// Takes `evaluation`'s lookups, emptied, if they are small enough to keep.
+    /// Takes the lookups `evaluation` needed only while it recorded.
     fn take(evaluation: &mut Evaluation) -> Self {
         let mut spare = Self {
             read_identities: std::mem::take(&mut evaluation.read_identities),
             named_reads: std::mem::take(&mut evaluation.named_reads),
+            seen_slots: std::mem::take(&mut evaluation.seen_slots),
             frames: std::mem::take(&mut evaluation.frames),
             unkeyed: std::mem::take(&mut evaluation.unkeyed),
+            ..Self::default()
         };
-        if spare.read_identities.capacity() > SPARE_ROOM {
-            spare.read_identities = Default::default();
-        }
-        if spare.named_reads.capacity() > SPARE_ROOM {
-            spare.named_reads = Default::default();
-        }
-        spare.read_identities.clear();
-        spare.named_reads.clear();
-        spare.frames.clear();
-        spare.unkeyed.clear();
+        spare.settle();
         spare
+    }
+
+    /// Takes `evaluation`'s spent result buffers and keeps them like its
+    /// lookups.
+    fn park(evaluation: &mut Evaluation) {
+        let mut spare = Self {
+            checks: std::mem::take(&mut evaluation.checks),
+            log: std::mem::take(&mut evaluation.log),
+            read: std::mem::take(&mut evaluation.read),
+            reads: std::mem::take(&mut evaluation.reads),
+            viewed: std::mem::take(&mut evaluation.viewed),
+            outputs: std::mem::take(&mut evaluation.outputs),
+            moved: std::mem::take(&mut evaluation.moved),
+            staged: std::mem::take(&mut evaluation.staged),
+            ..Self::default()
+        };
+        spare.settle();
+        SPARE.with(|kept| {
+            let mut kept = kept.borrow_mut();
+            match kept.last_mut() {
+                Some(last) => last.absorb(spare),
+                None => kept.push(spare),
+            }
+        });
+    }
+
+    /// Empties every kept buffer, dropping the ones that outgrew
+    /// [`SPARE_ROOM`].
+    fn settle(&mut self) {
+        macro_rules! settle {
+            ($($field:ident),*) => {$(
+                if self.$field.capacity() > SPARE_ROOM {
+                    self.$field = Default::default();
+                }
+                self.$field.clear();
+            )*};
+        }
+        settle!(
+            read_identities,
+            named_reads,
+            seen_slots,
+            frames,
+            unkeyed,
+            checks,
+            log,
+            read,
+            reads,
+            viewed,
+            outputs,
+            moved,
+            staged
+        );
+    }
+
+    /// Keeps the roomier of each buffer.
+    fn absorb(&mut self, other: Self) {
+        macro_rules! absorb {
+            ($($field:ident),*) => {$(
+                if other.$field.capacity() > self.$field.capacity() {
+                    self.$field = other.$field;
+                }
+            )*};
+        }
+        absorb!(
+            read_identities,
+            named_reads,
+            seen_slots,
+            frames,
+            unkeyed,
+            checks,
+            log,
+            read,
+            reads,
+            viewed,
+            outputs,
+            moved,
+            staged
+        );
     }
 }
 
@@ -1491,6 +1578,7 @@ pub fn resume(mut evaluation: Evaluation) {
     // Identities noted without this thread's key table name no slot in it.
     evaluation.read_identities.clear();
     evaluation.named_reads.clear();
+    evaluation.seen_slots.clear();
     start(evaluation);
 }
 
@@ -1511,8 +1599,9 @@ pub fn end() -> Evaluation {
     SPARE.with(|kept| {
         // A resumed evaluation ends without having begun on this thread.
         let mut kept = kept.borrow_mut();
-        if kept.len() < SPARE_DEPTH {
-            kept.push(spare);
+        match kept.last_mut() {
+            Some(last) => last.absorb(spare),
+            None => kept.push(spare),
         }
     });
     evaluation
@@ -1548,9 +1637,17 @@ pub fn note_read(key: impl FnOnce() -> FactKey) {
 /// Records reads of `keys`, made elsewhere for the evaluation recording on
 /// this thread, as that evaluation's own.
 pub fn note_reads(keys: impl IntoIterator<Item = HashedKey>) {
-    for key in keys {
-        note_read(|| key.key().clone());
+    if UNTRACKED.with(|depth| depth.get() > 0) {
+        return;
     }
+    CURRENT.with(|current| {
+        if let Some(evaluation) = current.borrow_mut().as_mut() {
+            for key in keys {
+                NOTED_READS.with(|count| count.set(count.get() + 1));
+                record_read(evaluation, key);
+            }
+        }
+    });
 }
 
 /// Orders every evaluation, frame and write on every thread: a key table keeps
@@ -1578,12 +1675,11 @@ impl Evaluation {
     }
 
     fn log_slot(&mut self, table: &mut KeyTable, slot: KeyIdx) {
-        if table.is_query(slot)
-            && let Some(frame) = self.frames.last_mut()
-        {
+        let (first, is_query) = table.log(slot, self.frame_stamp(), self.stamp);
+        if is_query && let Some(frame) = self.frames.last_mut() {
             frame.has_query = true;
         }
-        if let Some(first) = table.log(slot, self.frame_stamp(), self.stamp, latest_stamp()) {
+        if let Some(first) = first {
             self.log.push(slot);
             if first {
                 self.read.push(slot);
@@ -1600,7 +1696,23 @@ fn record_read(evaluation: &mut Evaluation, key: HashedKey) -> Option<KeyIdx> {
     }
     KEYS.with(|keys| match keys.borrow_mut().as_mut() {
         Some(table) => {
-            let slot = table.intern_read(key, evaluation.stamp);
+            // A slot the evaluation interned stays live while it records, so
+            // its key hash names it again without probing the table's index.
+            let seen = evaluation
+                .seen_slots
+                .find(key.hash, |entry| table.live_key(entry.1) == Some(&key))
+                .map(|entry| entry.1);
+            let slot = match seen {
+                Some(slot) => slot,
+                None => {
+                    let hash = key.hash;
+                    let slot = table.intern_read(key, evaluation.stamp);
+                    evaluation
+                        .seen_slots
+                        .insert_unique(hash, (hash, slot), |entry| entry.0);
+                    slot
+                }
+            };
             evaluation.log_slot(table, slot);
             if table.taints(slot) {
                 frames::taint_evaluation(evaluation);
@@ -2115,23 +2227,18 @@ pub fn note_write(key: impl FnOnce() -> FactKey) {
     CURRENT.with(|current| {
         if let Some(evaluation) = current.borrow_mut().as_mut() {
             let key = HashedKey::new(key());
+            let written = next_stamp();
+            LAST_WRITE.with(|last| last.set(written));
             // Inference memoised during an evaluation read only keys the
             // evaluation recorded, so a write it did not read leaves it valid.
             let read_here = KEYS.with(|keys| {
-                keys.borrow()
-                    .as_ref()
-                    .is_none_or(|table| table.logged_since(&key, evaluation.stamp))
+                keys.borrow_mut()
+                    .as_mut()
+                    .is_none_or(|table| table.mark_written_logged(&key, evaluation.stamp, written))
             });
             if read_here {
                 WRITE_GENERATION.with(|generation| generation.set(generation.get() + 1));
             }
-            let written = next_stamp();
-            LAST_WRITE.with(|last| last.set(written));
-            KEYS.with(|keys| {
-                if let Some(table) = keys.borrow_mut().as_mut() {
-                    table.mark_written(&key, written);
-                }
-            });
             if REHOMING.with(|depth| depth.get() > 0) {
                 evaluation.moved.insert(key);
             } else {

@@ -275,12 +275,9 @@ mod tests {
                 let evaluation = current.as_mut().unwrap();
                 let local = keys.record(evaluation, key(file), &graph);
                 let slot = reference.find(&key(file)).unwrap();
-                if let Some(first) = reference.log(
-                    slot,
-                    evaluation.frame_stamp(),
-                    evaluation.stamp,
-                    derivation::latest_stamp(),
-                ) {
+                if let (Some(first), _) =
+                    reference.log(slot, evaluation.frame_stamp(), evaluation.stamp)
+                {
                     reference_log.push(local);
                     if first {
                         reference_reads.push(local);

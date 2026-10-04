@@ -554,12 +554,6 @@ impl KeyTable {
         self.keys[slot as usize].is_query
     }
 
-    /// Whether `key` was logged at or after stamp `since`.
-    pub(super) fn logged_since(&self, key: &HashedKey, since: u64) -> bool {
-        self.find(key)
-            .is_some_and(|slot| self.keys[slot as usize].stamp >= since)
-    }
-
     pub(super) fn intern_read(&mut self, key: HashedKey, now: u64) -> KeyIdx {
         self.intern(key, now)
     }
@@ -599,6 +593,21 @@ impl KeyTable {
                 self.keys[*derived as usize].written = now;
             }
         }
+    }
+
+    /// Whether `key` was logged at or after stamp `since`, marking it —
+    /// and every key read out of it — written at `now` as [`Self::mark_written`].
+    pub(super) fn mark_written_logged(&mut self, key: &HashedKey, since: u64, now: u64) -> bool {
+        let Some(slot) = self.find(key) else {
+            return false;
+        };
+        let logged = self.keys[slot as usize].stamp >= since;
+        self.last_written = self.last_written.max(now);
+        self.keys[slot as usize].written = now;
+        for derived in self.derived.get(&slot).into_iter().flat_map(|d| &d.slots) {
+            self.keys[*derived as usize].written = now;
+        }
+        logged
     }
 
     /// Marks `key`, and every key read out of it, written at stamp `now` by an
@@ -773,23 +782,24 @@ impl KeyTable {
     }
 
     /// Whether a read of `slot` goes into a log whose innermost open frame
-    /// began at stamp `frame`: not if it was logged since, else whether this
-    /// is its first log since the evaluation began at stamp `evaluation`.
-    /// Marks it logged at `latest`, the newest stamp handed out.
+    /// began at stamp `frame`: `None` if it was logged since, else whether
+    /// this is its first log since the evaluation began at stamp
+    /// `evaluation`. Marks it logged at `frame`, and answers whether the key
+    /// is a query.
     pub(super) fn log(
         &mut self,
         slot: KeyIdx,
         frame: u64,
         evaluation: u64,
-        latest: u64,
-    ) -> Option<bool> {
+    ) -> (Option<bool>, bool) {
         let entry = &mut self.keys[slot as usize];
+        let is_query = entry.is_query;
         if entry.stamp >= frame {
-            return None;
+            return (None, is_query);
         }
         let first = entry.stamp < evaluation;
-        entry.stamp = latest;
-        Some(first)
+        entry.stamp = frame;
+        (Some(first), is_query)
     }
 }
 
@@ -1190,8 +1200,13 @@ impl ReaderGraph {
         released.extend(dropped_reads);
 
         self.by_file.entry(id.file_id).or_default().insert(deriv);
+        // The old record's reads were diffed above; its buffer holds the new
+        // record's.
+        let mut record_reads = Vec::from(old.reads);
+        record_reads.clear();
+        record_reads.extend(reads.iter().map(|(key, _)| *key));
         self.derivations[deriv as usize].record = Some(Record {
-            reads: reads.into_iter().map(|(key, _)| key).collect(),
+            reads: record_reads.into_boxed_slice(),
             outputs: outputs.into_boxed_slice(),
         });
         dropped
@@ -2072,9 +2087,9 @@ mod tests {
         let mut graph = ReaderGraph::default();
         let mut table = graph.lend_keys();
         let slot = table.intern_read(key(9), 0);
-        assert!(table.log(slot, 1, 1, 1).is_some());
+        assert!(table.log(slot, 1, 1).0.is_some());
         assert_eq!(table.intern_read(key(9), 0), slot);
-        assert!(table.log(slot, 2, 2, 2).is_some());
+        assert!(table.log(slot, 2, 2).0.is_some());
         graph.restore_keys(table);
         let producer = DerivationId::new(
             DerivationKind::LocalStat,
