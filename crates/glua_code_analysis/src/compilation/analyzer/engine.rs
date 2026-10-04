@@ -1421,15 +1421,16 @@ impl Engine {
         let profiling = self.stats.profiling();
         let computed = {
             let db: &DbIndex = db;
+            let by_file = batch
+                .iter()
+                .map(|member| (member.file_id, *member))
+                .collect::<FxHashMap<_, _>>();
             let files = batch
                 .iter()
                 .map(|member| member.file_id)
                 .collect::<Vec<_>>();
             super::parallel::map_files_collect(db, &files, |db, file_id| {
-                let id = *batch
-                    .iter()
-                    .find(|member| member.file_id == file_id)
-                    .expect("one batch member per file");
+                let id = by_file[&file_id];
                 derivation::begin(id);
                 let started = profiling.then(std::time::Instant::now);
                 let computed = recipe.compute(db, id);
@@ -1522,31 +1523,28 @@ impl Engine {
         first: DerivationId,
         recipe: &dyn Recipe,
     ) -> bool {
-        let limit = super::parallel::analysis_threads().saturating_mul(RECORDED_BATCH_PER_THREAD);
         let mut batch = vec![first];
         let mut popped = Vec::new();
-        while batch.len() < limit {
-            let Some((id, reason)) = self.worklist.pop_first_of(first.kind) else {
-                break;
-            };
+        while let Some((id, reason)) = self.worklist.pop_first_of(first.kind) {
             if !self.needs_evaluation(db, id, reason) {
                 continue;
             }
-            if co_producers(db, id).len() == 1 {
+            let batched = co_producers(db, id).len() == 1;
+            if batched {
                 batch.push(id);
             }
-            popped.push((id, reason));
+            popped.push((id, reason, batched));
         }
         if super::parallel::runs_inline(batch.len()) {
-            for (id, reason) in popped {
+            for (id, reason, _) in popped {
                 self.worklist.insert(id, reason);
             }
             return false;
         }
         let mut alone = Vec::new();
-        for (id, reason) in popped {
+        for (id, reason, batched) in popped {
             self.trace_evaluation(db, id, reason);
-            if !batch.contains(&id) {
+            if !batched {
                 alone.push(id);
             }
         }
@@ -1591,12 +1589,13 @@ impl Engine {
                 quarantine.started(),
                 db.queries().ready_outputs(),
             );
+            let by_file = batch
+                .iter()
+                .map(|id| (id.file_id, *id))
+                .collect::<FxHashMap<_, _>>();
             let files = batch.iter().map(|id| id.file_id).collect::<Vec<_>>();
             super::parallel::map_files_collect(db, &files, |db, file_id| {
-                let id = *batch
-                    .iter()
-                    .find(|id| id.file_id == file_id)
-                    .expect("one task per file");
+                let id = by_file[&file_id];
                 let started = profiling.then(std::time::Instant::now);
                 let (result, additions) =
                     crate::semantic::with_access_paths(paths.as_ref(), || {
@@ -2375,10 +2374,6 @@ thread_local! {
     /// [`Engine::run_recorded_batch`] publish.
     static WORKER_PUBLISHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
-
-/// How many derivations [`Engine::run_recorded_batch`] takes per analysis
-/// thread: enough that one fork-join covers most of a round's queue of a kind.
-const RECORDED_BATCH_PER_THREAD: usize = 16;
 
 fn check_convergence() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
