@@ -634,13 +634,13 @@ mod transport_tests {
         assert!(
             result
                 .evaluation
-                .validate(&graph, |_| table.ready_fingerprint(key()))
+                .validate(&graph, |_, _| table.ready_fingerprint(key()))
         );
         table.set_stale(QueryTable::<TestQuery>::id(key()), true);
         assert!(
             !result
                 .evaluation
-                .validate(&graph, |_| table.ready_fingerprint(key()))
+                .validate(&graph, |_, _| table.ready_fingerprint(key()))
         );
         assert_eq!(table.stats().computed, 0);
         assert!(!table.has_pending());
@@ -666,7 +666,7 @@ mod transport_tests {
             assert!(
                 !result
                     .evaluation
-                    .validate(&graph, |_| table.ready_fingerprint(key()))
+                    .validate(&graph, |_, _| table.ready_fingerprint(key()))
             );
             assert_eq!(table.stats().computed, 0);
             assert!(!table.has_pending());
@@ -694,7 +694,7 @@ mod transport_tests {
             },
             |_| unreachable!("no query read remains in the parent"),
         );
-        assert!(!result.evaluation.validate(&graph, |_| None));
+        assert!(!result.evaluation.validate(&graph, |_, _| None));
         assert_eq!(table.stats().mismatches, 0);
         assert_eq!(db.queries().receiver_authority.stats().computed, 0);
         assert!(!db.queries().has_pending());

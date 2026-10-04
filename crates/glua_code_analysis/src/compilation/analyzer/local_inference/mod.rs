@@ -509,8 +509,6 @@ struct MemberPathEvidence<'a> {
 }
 
 pub(crate) struct UnguardedChildFileResult {
-    file_id: crate::FileId,
-    infer_cache: crate::LuaInferCache,
     scores: HashMap<LuaDefinitionId, UnguardedChildCandidates>,
     deferred_definitions: FxHashSet<LuaDefinitionId>,
     nested_scores: HashMap<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>,
@@ -563,9 +561,6 @@ pub(crate) fn publish_unguarded_children(
     let mut initializer_refinements = HashMap::<crate::LuaDeclId, LuaType>::default();
 
     for result in results {
-        context
-            .infer_manager
-            .restore_file(result.file_id, result.infer_cache);
         deferred_definitions.extend(result.deferred_definitions);
         for (definition, candidates) in result.scores {
             let entry = scores
@@ -836,8 +831,6 @@ fn collect_unguarded_child_file(
         .map(|tree| tree.get_red_root());
     let (Some(references), Some(root)) = (references, root) else {
         return UnguardedChildFileResult {
-            file_id,
-            infer_cache,
             scores,
             deferred_definitions,
             nested_scores,
@@ -1071,8 +1064,6 @@ fn collect_unguarded_child_file(
     }
 
     UnguardedChildFileResult {
-        file_id,
-        infer_cache,
         scores,
         deferred_definitions,
         nested_scores,

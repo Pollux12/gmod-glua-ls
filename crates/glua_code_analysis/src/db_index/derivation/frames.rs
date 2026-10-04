@@ -233,7 +233,7 @@ mod query_presence_tests {
             |_| panic!("query witness must come from ready output"),
         );
         assert!(recorded.value.0.has_query);
-        assert!(recorded.evaluation.validate(&graph, |_| Some(17)));
+        assert!(recorded.evaluation.validate(&graph, |_, _| Some(17)));
         drop(ready);
         let mut graph = Arc::try_unwrap(graph).ok().unwrap();
         let mut table = graph.lend_keys();
@@ -274,7 +274,7 @@ mod query_presence_tests {
             },
             |_| panic!("unobserved query must not be fingerprinted lazily"),
         );
-        assert!(!recorded.evaluation.validate(&graph, |_| Some(17)));
+        assert!(!recorded.evaluation.validate(&graph, |_, _| Some(17)));
         drop(recorded);
         drop(snapshot);
         let mut graph = Arc::try_unwrap(graph).ok().unwrap();

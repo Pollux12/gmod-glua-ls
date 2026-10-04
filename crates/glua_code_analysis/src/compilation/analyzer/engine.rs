@@ -1089,11 +1089,7 @@ impl Engine {
         db.reader_graph_mut().hold_windows(touched.iter());
         for key in &touched {
             db.reader_graph().forget_fingerprint(key);
-            let before_edits = self.before_edits.get_mut();
-            before_edits.remove(key);
-            for derived in db.reader_graph().derived_keys(key) {
-                before_edits.remove(&derived);
-            }
+            forget_before_edits(self.before_edits.get_mut(), db.reader_graph(), key);
         }
         self.loop_focus = members.iter().copied().collect();
         // Settled from nothing, a loop whose rules leave it more than one
@@ -1421,20 +1417,24 @@ impl Engine {
         let profiling = self.stats.profiling();
         let computed = {
             let db: &DbIndex = db;
+            let by_file = batch
+                .iter()
+                .map(|member| (member.file_id, *member))
+                .collect::<FxHashMap<_, _>>();
             let files = batch
                 .iter()
                 .map(|member| member.file_id)
                 .collect::<Vec<_>>();
             super::parallel::map_files_collect(db, &files, |db, file_id| {
-                let id = *batch
-                    .iter()
-                    .find(|member| member.file_id == file_id)
-                    .expect("one batch member per file");
+                let id = by_file[&file_id];
                 derivation::begin(id);
                 let started = profiling.then(std::time::Instant::now);
                 let computed = recipe.compute(db, id);
                 let elapsed = started.map(|started| started.elapsed()).unwrap_or_default();
-                (derivation::end(), computed, elapsed)
+                let evaluation = derivation::end();
+                evaluation
+                    .fingerprint_unlent_reads(db.reader_graph(), |key| db.fact_fingerprint(key));
+                (evaluation, computed, elapsed)
             })
         };
         let mut computed_reads = check_batch_reads().then(|| {
@@ -1522,31 +1522,28 @@ impl Engine {
         first: DerivationId,
         recipe: &dyn Recipe,
     ) -> bool {
-        let limit = super::parallel::analysis_threads().saturating_mul(RECORDED_BATCH_PER_THREAD);
         let mut batch = vec![first];
         let mut popped = Vec::new();
-        while batch.len() < limit {
-            let Some((id, reason)) = self.worklist.pop_first_of(first.kind) else {
-                break;
-            };
+        while let Some((id, reason)) = self.worklist.pop_first_of(first.kind) {
             if !self.needs_evaluation(db, id, reason) {
                 continue;
             }
-            if co_producers(db, id).len() == 1 {
+            let batched = co_producers(db, id).len() == 1;
+            if batched {
                 batch.push(id);
             }
-            popped.push((id, reason));
+            popped.push((id, reason, batched));
         }
         if super::parallel::runs_inline(batch.len()) {
-            for (id, reason) in popped {
+            for (id, reason, _) in popped {
                 self.worklist.insert(id, reason);
             }
             return false;
         }
         let mut alone = Vec::new();
-        for (id, reason) in popped {
+        for (id, reason, batched) in popped {
             self.trace_evaluation(db, id, reason);
-            if !batch.contains(&id) {
+            if !batched {
                 alone.push(id);
             }
         }
@@ -1591,12 +1588,13 @@ impl Engine {
                 quarantine.started(),
                 db.queries().ready_outputs(),
             );
+            let by_file = batch
+                .iter()
+                .map(|id| (id.file_id, *id))
+                .collect::<FxHashMap<_, _>>();
             let files = batch.iter().map(|id| id.file_id).collect::<Vec<_>>();
             super::parallel::map_files_collect(db, &files, |db, file_id| {
-                let id = *batch
-                    .iter()
-                    .find(|id| id.file_id == file_id)
-                    .expect("one task per file");
+                let id = by_file[&file_id];
                 let started = profiling.then(std::time::Instant::now);
                 let (result, additions) =
                     crate::semantic::with_access_paths(paths.as_ref(), || {
@@ -1623,12 +1621,17 @@ impl Engine {
         crate::semantic::restore_access_path_snapshot(paths, additions);
         for (id, (result, computing)) in batch.iter().zip(computed) {
             let started = profiling.then(std::time::Instant::now);
-            let valid = result.evaluation.validate(db.reader_graph(), |key| {
+            let valid = result.evaluation.validate(db.reader_graph(), |key, slot| {
                 if matches!(
                     key.key(),
                     FactKey::ReceiverAuthority(_) | FactKey::CallbackParams(_)
                 ) {
                     db.queries().ready_fingerprint(key)
+                } else if let Some(slot) = slot {
+                    Some(
+                        db.reader_graph()
+                            .slot_fingerprint(slot, |key| db.fact_fingerprint(key)),
+                    )
                 } else {
                     Some(self.fingerprint(db, key))
                 }
@@ -1853,11 +1856,7 @@ impl Engine {
                 .flat_map(|(evaluation, _)| evaluation.outputs().chain(evaluation.moved())),
         ) {
             db.reader_graph().forget_fingerprint(key);
-            let mut before_edits = self.before_edits.borrow_mut();
-            before_edits.remove(key);
-            for derived in db.reader_graph().derived_keys(key) {
-                before_edits.remove(&derived);
-            }
+            forget_before_edits(&mut self.before_edits.borrow_mut(), db.reader_graph(), key);
         }
         self.verify_fingerprints(db, touched, step);
         // Out of the index while its records are replaced, so the reads can be
@@ -2289,6 +2288,21 @@ fn run_group(
 
 /// Files the reads of the queries computed since this last ran, which makes
 /// each a reader of what it read. Returns the outputs their computation moved.
+/// Drops what `key` and every key read out of it held before the edits.
+fn forget_before_edits(
+    before_edits: &mut FxHashMap<HashedKey, derivation::Fingerprint>,
+    graph: &derivation::ReaderGraph,
+    key: &HashedKey,
+) {
+    if before_edits.is_empty() {
+        return;
+    }
+    before_edits.remove(key);
+    for derived in graph.derived_keys(key) {
+        before_edits.remove(&derived);
+    }
+}
+
 pub(super) fn file_queries(db: &mut DbIndex) -> Vec<HashedKey> {
     if !db.queries().has_pending() {
         return Vec::new();
@@ -2375,10 +2389,6 @@ thread_local! {
     /// [`Engine::run_recorded_batch`] publish.
     static WORKER_PUBLISHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
-
-/// How many derivations [`Engine::run_recorded_batch`] takes per analysis
-/// thread: enough that one fork-join covers most of a round's queue of a kind.
-const RECORDED_BATCH_PER_THREAD: usize = 16;
 
 fn check_convergence() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
