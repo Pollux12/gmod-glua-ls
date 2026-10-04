@@ -83,7 +83,11 @@ pub(crate) fn contains_gmod_null_type(db: &DbIndex, typ: &LuaType) -> bool {
 /// Whether the backward flow walk could possibly change `var_ref_id`'s type from
 /// its declared/origin type, given the file-wide narrowing capability. When this
 /// returns `false`, the walk is guaranteed to be a no-op and can be skipped.
-fn var_ref_can_be_narrowed(db: &DbIndex, file_id: &crate::FileId, var_ref_id: &VarRefId) -> bool {
+pub(crate) fn var_ref_can_be_narrowed(
+    db: &DbIndex,
+    file_id: &crate::FileId,
+    var_ref_id: &VarRefId,
+) -> bool {
     // Special-call effects are populated after flow binding, so the file-wide
     // capability misses them: a reference one narrows must not skip.
     if db

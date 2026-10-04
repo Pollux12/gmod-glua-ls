@@ -37,7 +37,8 @@ use crate::{
             infer_name::get_name_expr_var_ref_id,
             narrow::{
                 get_type_at_flow::try_get_cross_file_numeric_range_population_type_for_index,
-                infer_expr_narrow_type, infer_expr_narrow_type_with_flow_origin,
+                get_var_ref_type, infer_expr_narrow_type, infer_expr_narrow_type_with_flow_origin,
+                var_ref_can_be_narrowed,
             },
         },
         is_doc_tag_table_const,
@@ -217,17 +218,28 @@ fn infer_member_type_pass_flow(
 
     // The origin is this expression's member type: a walk of the same path
     // from elsewhere starts from its own.
-    let previous_flow_cache = cache.key_flow_cache(&var_ref_id, &member_type);
+    let can_narrow = var_ref_can_be_narrowed(db, &cache.get_file_id(), &var_ref_id);
+    let previous_flow_cache = if can_narrow {
+        cache.key_flow_cache(&var_ref_id, &member_type)
+    } else {
+        None
+    };
     let previous_origin = cache
         .replace_index_ref_origin_type_cache(&var_ref_id, CacheEntry::Cache(member_type.clone()));
-    let result = infer_expr_narrow_type(
-        db,
-        cache,
-        LuaExpr::IndexExpr(index_expr),
-        var_ref_id.clone(),
-    );
+    let result = if can_narrow {
+        infer_expr_narrow_type(
+            db,
+            cache,
+            LuaExpr::IndexExpr(index_expr),
+            var_ref_id.clone(),
+        )
+    } else {
+        get_var_ref_type(db, cache, &var_ref_id)
+    };
     cache.restore_index_ref_origin_type_cache(&var_ref_id, previous_origin);
-    cache.unkey_flow_cache(&var_ref_id, member_type.clone(), previous_flow_cache);
+    if can_narrow {
+        cache.unkey_flow_cache(&var_ref_id, member_type.clone(), previous_flow_cache);
+    }
     match &result {
         Err(InferFailReason::None) => Ok(member_type.clone()),
         _ => result,
@@ -293,15 +305,21 @@ fn run_fallback_narrow_raw(
 ) -> InferResult {
     let previous_origin =
         cache.replace_index_ref_origin_type_cache(var_ref_id, CacheEntry::Cache(origin_type));
-    let previous_flow_cache = cache.take_flow_cache_for_var_ref(var_ref_id);
-    let result = infer_expr_narrow_type_with_flow_origin(
-        db,
-        cache,
-        LuaExpr::IndexExpr(index_expr),
-        var_ref_id.clone(),
-        FlowOrigin::Real,
-    );
-    cache.restore_flow_cache_for_var_ref(var_ref_id, previous_flow_cache);
+    let can_narrow = var_ref_can_be_narrowed(db, &cache.get_file_id(), var_ref_id);
+    let result = if can_narrow {
+        let previous_flow_cache = cache.take_flow_cache_for_var_ref(var_ref_id);
+        let result = infer_expr_narrow_type_with_flow_origin(
+            db,
+            cache,
+            LuaExpr::IndexExpr(index_expr),
+            var_ref_id.clone(),
+            FlowOrigin::Real,
+        );
+        cache.restore_flow_cache_for_var_ref(var_ref_id, previous_flow_cache);
+        result
+    } else {
+        get_var_ref_type(db, cache, var_ref_id)
+    };
     cache.restore_index_ref_origin_type_cache(var_ref_id, previous_origin);
     result
 }
