@@ -114,6 +114,30 @@ mod query_presence_tests {
         assert!(!graph.keys().is_query(slot));
         assert!(clone.is_query(slot));
     }
+
+    #[test]
+    fn unlent_read_warming_leaves_query_outputs_to_the_root() {
+        let query = HashedKey::new(FactKey::CallbackParams(LuaSignatureId::new(
+            FileId::new(1),
+            TextSize::new(5),
+        )));
+        let fact = HashedKey::new(FactKey::GmodRealm(FileId::new(2)));
+        let mut graph = ReaderGraph::default();
+        let fact_slot = graph.intern_read(fact.clone());
+        graph.intern_read(query.clone());
+        super::super::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        super::super::note_read(|| query.key().clone());
+        super::super::note_read(|| fact.key().clone());
+        let evaluation = super::super::end();
+        evaluation.fingerprint_unlent_reads(&graph, |key| {
+            assert_ne!(key, &query, "a query output was fingerprinted off the root");
+            17
+        });
+        assert_eq!(
+            graph.slot_fingerprint(fact_slot, |_| panic!("the read was not warmed")),
+            17
+        );
+    }
 }
 
 /// A key's readers, grouped by the fingerprint each saw, each group sorted.

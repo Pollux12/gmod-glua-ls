@@ -1086,6 +1086,25 @@ impl Evaluation {
         self.reads.iter()
     }
 
+    /// Takes the fingerprint of each read made while no key table was lent
+    /// into its slot's cache in `graph`, where it has one: an evaluation
+    /// computed off the root's thread fingerprints its reads where it ran.
+    /// Query outputs are left to the root, where fingerprinting may compute
+    /// them.
+    pub fn fingerprint_unlent_reads(
+        &self,
+        graph: &ReaderGraph,
+        fingerprint: impl Fn(&HashedKey) -> Fingerprint,
+    ) {
+        for key in &self.reads {
+            if let Some(slot) = graph.find_slot(key)
+                && !graph.keys().is_query(slot)
+            {
+                graph.slot_fingerprint(slot, &fingerprint);
+            }
+        }
+    }
+
     /// The keys the evaluation re-filed without producing them: their readers
     /// are re-checked, but the evaluation is not one of their producers.
     pub fn moved(&self) -> impl Iterator<Item = &HashedKey> {

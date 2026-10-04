@@ -1435,7 +1435,10 @@ impl Engine {
                 let started = profiling.then(std::time::Instant::now);
                 let computed = recipe.compute(db, id);
                 let elapsed = started.map(|started| started.elapsed()).unwrap_or_default();
-                (derivation::end(), computed, elapsed)
+                let evaluation = derivation::end();
+                evaluation
+                    .fingerprint_unlent_reads(db.reader_graph(), |key| db.fact_fingerprint(key));
+                (evaluation, computed, elapsed)
             })
         };
         let mut computed_reads = check_batch_reads().then(|| {
