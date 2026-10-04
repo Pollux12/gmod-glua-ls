@@ -1281,6 +1281,7 @@ fn infer_table_dynamic_key_member_type(
     let members = db.get_member_index().get_expr_key_members(owner)?;
     let mut member_types = Vec::with_capacity(members.len());
 
+    let matcher = crate::semantic::member::AccessKeyMatcher::new(&access_key_type);
     for member in members {
         let dynamic_key = member.get_key();
         if dynamic_key == key {
@@ -1293,7 +1294,7 @@ fn infer_table_dynamic_key_member_type(
         }
 
         let dynamic_key_matches = matches!(dynamic_key, LuaMemberKey::ExprType(typ) if typ.is_unknown())
-            || member_key_matches_type(db, &access_key_type, dynamic_key);
+            || matcher.matches(db, dynamic_key);
         if !dynamic_key_matches {
             continue;
         }
@@ -1375,6 +1376,7 @@ fn infer_gmod_same_file_expr_key_member_type(
     let mut saw_match = false;
 
     let mut matched_covered_numeric_for_write = false;
+    let matcher = crate::semantic::member::AccessKeyMatcher::new(&access_key_type);
     for member in members {
         if member.get_file_id() != access_file_id {
             continue;
@@ -1388,7 +1390,7 @@ fn infer_gmod_same_file_expr_key_member_type(
         let key_match = if member_key_is_unknown_expr(member.get_key()) {
             expr_dynamic_access_matches_unknown_member(&access_key_type)
         } else {
-            member_key_matches_type(db, &access_key_type, member.get_key())
+            matcher.matches(db, member.get_key())
         };
         if !key_match {
             continue;
@@ -1574,12 +1576,13 @@ fn infer_owner_expr_key_member_type(
     let mut saw_match = false;
     let mut pending_reason = None;
 
+    let matcher = crate::semantic::member::AccessKeyMatcher::new(&access_key_type);
     for member in members {
         let member_key = member.get_key();
         let key_match = if member_key_is_unknown_expr(member_key) {
             expr_dynamic_access_matches_unknown_member(&access_key_type)
         } else {
-            member_key_matches_type(db, &access_key_type, member_key)
+            matcher.matches(db, member_key)
         };
         if !key_match {
             continue;

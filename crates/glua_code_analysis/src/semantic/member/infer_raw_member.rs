@@ -16,8 +16,7 @@ use crate::{
 
 use super::{
     RawGetMemberTypeResult, cached_local_class_table_member_ids, get_buildin_type_map_type_id,
-    local_class_table_member_ids, member_key_as_type, member_key_matches_type,
-    merge_open_table_types,
+    local_class_table_member_ids, member_key_as_type, merge_open_table_types,
 };
 
 pub fn infer_raw_member_type(
@@ -181,9 +180,10 @@ fn infer_owner_raw_member_type(
         return Err(InferFailReason::FieldNotFound);
     };
 
+    let matcher = super::AccessKeyMatcher::new(&access_key_type);
     let mut result_type = LuaType::Never;
     for member in owner_members {
-        if !member_key_matches_type(db, &access_key_type, member.get_key()) {
+        if !matcher.matches(db, member.get_key()) {
             continue;
         }
 
@@ -313,12 +313,10 @@ fn infer_owner_raw_member_type_with_realm_uncached(
         let LuaMemberKey::ExprType(access_key_type) = member_key else {
             return Ok(exact_type);
         };
+        let matcher = super::AccessKeyMatcher::new(access_key_type);
         let mut integer_keys = member_index
             .get_member_keys(member_owner)
-            .filter(|key| {
-                matches!(key, LuaMemberKey::Integer(_))
-                    && member_key_matches_type(db, access_key_type, key)
-            })
+            .filter(|key| matches!(key, LuaMemberKey::Integer(_)) && matcher.matches(db, key))
             .collect::<Vec<_>>();
         integer_keys.sort();
         let mut member_types = Vec::with_capacity(1 + integer_keys.len());
@@ -356,8 +354,9 @@ fn infer_owner_raw_member_type_with_realm_uncached(
     // anything match" is tracked separately from the accumulated type.
     let mut saw_match = false;
     let mut pending_reason = None;
+    let matcher = super::AccessKeyMatcher::new(&access_key_type);
     for member in owner_members {
-        if !member_key_matches_type(db, &access_key_type, member.get_key()) {
+        if !matcher.matches(db, member.get_key()) {
             continue;
         }
 

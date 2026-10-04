@@ -448,6 +448,81 @@ mod tests {
         }
     }
 
+    /// A union access matches member keys as the two-direction type check does.
+    #[test]
+    fn union_access_matches_member_keys_as_the_type_check_does() {
+        use crate::{LuaUnionType, VirtualWorkspace};
+
+        let mut ws = VirtualWorkspace::new();
+        ws.def("---@class UnionKeyFoo");
+        let db = ws.analysis.compilation.get_db();
+        let int = |value| LuaType::IntegerConst(value);
+        let doc_int = |value| LuaType::DocIntegerConst(value);
+        let text = |value: &str| LuaType::StringConst(smol_str::SmolStr::new(value).into());
+        let doc_text = |value: &str| LuaType::DocStringConst(smol_str::SmolStr::new(value).into());
+        let foo = LuaType::Ref(LuaTypeDeclId::global("UnionKeyFoo"));
+        let union = |types: Vec<LuaType>| LuaType::Union(LuaUnionType::from_vec(types).into());
+        let accesses = [
+            union(vec![]),
+            union(vec![int(1)]),
+            union(vec![int(1), int(2)]),
+            union(vec![doc_int(3), doc_int(4)]),
+            union(vec![doc_int(3), int(4)]),
+            union(vec![text("a")]),
+            union(vec![text("a"), text("b")]),
+            union(vec![doc_text("a"), text("b")]),
+            union(vec![doc_int(1), LuaType::Integer]),
+            union(vec![doc_int(1), LuaType::Number]),
+            union(vec![doc_int(1), LuaType::String]),
+            union(vec![doc_int(1), text("a")]),
+            union(vec![doc_int(1), LuaType::Nil]),
+            union(vec![doc_int(1), foo.clone()]),
+            union(vec![doc_int(1), LuaType::FloatConst(1.5)]),
+            union(vec![text("a"), LuaType::Integer]),
+            union(vec![text("a"), LuaType::String]),
+            union(vec![text("a"), foo.clone()]),
+            union(vec![text("a"), LuaType::Nil]),
+        ];
+        let keys = [
+            LuaMemberKey::Integer(1),
+            LuaMemberKey::Integer(9),
+            LuaMemberKey::Name("a".into()),
+            LuaMemberKey::Name("zz".into()),
+            LuaMemberKey::ExprType(int(5)),
+            LuaMemberKey::ExprType(doc_int(2)),
+            LuaMemberKey::ExprType(LuaType::Integer),
+            LuaMemberKey::ExprType(LuaType::String),
+            LuaMemberKey::ExprType(doc_text("a")),
+            LuaMemberKey::ExprType(LuaType::Unknown),
+            LuaMemberKey::ExprType(foo.clone()),
+            LuaMemberKey::ExprType(LuaType::Nil),
+            LuaMemberKey::None,
+        ];
+        for access in &accesses {
+            for key in &keys {
+                let expected = match (key, member_key_as_type(key)) {
+                    (LuaMemberKey::ExprType(typ), _) if typ.is_unknown() => {
+                        super::unknown_index_key_matches_access(access)
+                    }
+                    (_, None) => false,
+                    (_, Some(key_type)) => match super::literal_member_key_match(access, &key_type)
+                    {
+                        Some(is_match) => is_match,
+                        None => {
+                            crate::check_type_compact(db, access, &key_type).is_ok()
+                                || crate::check_type_compact(db, &key_type, access).is_ok()
+                        }
+                    },
+                };
+                assert_eq!(
+                    member_key_matches_type(db, access, key),
+                    expected,
+                    "{access:?} against {key:?}",
+                );
+            }
+        }
+    }
+
     #[test]
     fn merge_open_table_types_keeps_tableof_as_table_component() {
         let db = DbIndex::new();
@@ -1516,21 +1591,49 @@ pub(crate) fn member_key_matches_type(
     access_key_type: &LuaType,
     member_key: &LuaMemberKey,
 ) -> bool {
-    if let LuaMemberKey::ExprType(member_key_type) = member_key
-        && member_key_type.is_unknown()
-    {
-        return unknown_index_key_matches_access(access_key_type);
+    AccessKeyMatcher::new(access_key_type).matches(db, member_key)
+}
+
+/// An access key prepared once for matching against many member keys.
+pub(crate) struct AccessKeyMatcher<'a> {
+    access_key_type: &'a LuaType,
+    integer_literal_union: bool,
+}
+
+impl<'a> AccessKeyMatcher<'a> {
+    pub(crate) fn new(access_key_type: &'a LuaType) -> Self {
+        let integer_literal_union = matches!(access_key_type, LuaType::Union(union)
+        if !union.is_empty()
+            && union.types().all(|typ| {
+                matches!(typ, LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_))
+            }));
+        Self {
+            access_key_type,
+            integer_literal_union,
+        }
     }
 
-    let Some(member_key_type) = member_key_as_type(member_key) else {
-        return false;
-    };
-    if let Some(is_match) = literal_member_key_match(access_key_type, &member_key_type) {
-        return is_match;
-    }
+    pub(crate) fn matches(&self, db: &DbIndex, member_key: &LuaMemberKey) -> bool {
+        let access_key_type = self.access_key_type;
+        if let LuaMemberKey::ExprType(member_key_type) = member_key
+            && member_key_type.is_unknown()
+        {
+            return unknown_index_key_matches_access(access_key_type);
+        }
 
-    check_type_compact(db, access_key_type, &member_key_type).is_ok()
-        || check_type_compact(db, &member_key_type, access_key_type).is_ok()
+        let Some(member_key_type) = member_key_as_type(member_key) else {
+            return false;
+        };
+        if let Some(is_match) = literal_member_key_match(access_key_type, &member_key_type) {
+            return is_match;
+        }
+        // An integer literal is accepted by every integer literal arm in the reverse check.
+        if self.integer_literal_union && matches!(member_key_type, LuaType::IntegerConst(_)) {
+            return true;
+        }
+        check_type_compact(db, access_key_type, &member_key_type).is_ok()
+            || check_type_compact(db, &member_key_type, access_key_type).is_ok()
+    }
 }
 
 /// Whether an access typed `access_key_type` reaches a member keyed by
