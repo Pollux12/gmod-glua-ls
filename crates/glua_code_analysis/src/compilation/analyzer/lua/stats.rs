@@ -1233,7 +1233,6 @@ fn home_assignment_targets(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
 
 /// The two arms of `x = x or <default>`, when `expr` is one for `var`.
 fn self_default_arms(var: &LuaVarExpr, expr: &LuaExpr) -> Option<(LuaExpr, LuaExpr)> {
-    let access_path = var.get_access_path()?;
     let LuaExpr::BinaryExpr(binary_expr) = expr else {
         return None;
     };
@@ -1242,7 +1241,7 @@ fn self_default_arms(var: &LuaVarExpr, expr: &LuaExpr) -> Option<(LuaExpr, LuaEx
     }
     let (left, right) = binary_expr.get_exprs()?;
     let left_var = LuaVarExpr::cast(left.syntax().clone())?;
-    (access_path == left_var.get_access_path()?).then_some((left, right))
+    (var.get_access_path()? == left_var.get_access_path()?).then_some((left, right))
 }
 
 fn declared_empty_table_assignment_type(
