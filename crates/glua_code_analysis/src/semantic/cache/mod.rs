@@ -786,7 +786,6 @@ impl LuaInferCache {
         empty(&mut self.param_type_cache.0);
         empty(&mut self.param_type_source_cache.0);
         empty(&mut self.field_literal_narrowing);
-        self.scripted_global_singleton_type_cache = None;
         self.self_type_cache.clear_local();
         self.self_base_seed = None;
 
