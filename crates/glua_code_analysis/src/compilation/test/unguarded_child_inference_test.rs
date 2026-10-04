@@ -2230,4 +2230,46 @@ mod test {
              {child_diagnostics:?}"
         );
     }
+
+    #[test]
+    fn local_fallback_reads_a_class_binding_another_files_local_fallback_writes() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_files(vec![
+            (
+                "lua/autorun/radio_tuner.lua",
+                r#"
+                ---@class Entity
+                ---@class Radio: Entity
+                ---@field Tune fun(self: Radio)
+
+                ---@type Entity
+                local tuned
+                tuned:Tune()
+                "#,
+            ),
+            (
+                "lua/autorun/radio_muter.lua",
+                r#"
+                ---@class Radio
+
+                ---@type Entity
+                local muted
+                muted:Mute()
+                "#,
+            ),
+        ]);
+        let tuner_file_id = ws
+            .analysis
+            .get_file_id(
+                &ws.virtual_url_generator
+                    .new_uri("lua/autorun/radio_tuner.lua"),
+            )
+            .expect("tuner file id");
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, tuner_file_id, "tuned")),
+            "Radio"
+        );
+    }
 }

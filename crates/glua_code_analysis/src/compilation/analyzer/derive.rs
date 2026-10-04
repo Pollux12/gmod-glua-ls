@@ -197,7 +197,6 @@ impl super::engine::Recipe for Recipes {
                 | DerivationKind::Network
                 | DerivationKind::GmodLoadCallSites
                 | DerivationKind::GmodClassCallSites
-                | DerivationKind::LocalFallbacks
                 | DerivationKind::GmodHelperScan
                 | DerivationKind::ValidGuardScan
                 | DerivationKind::GmodPre
@@ -206,10 +205,14 @@ impl super::engine::Recipe for Recipes {
 
     fn records_on_workers(&self, kind: DerivationKind) -> bool {
         // A file's dynamic fields infer through owners whose wildcard and
-        // finite-name state another file's dynamic fields write.
+        // finite-name state another file's dynamic fields write; a file's local
+        // fallbacks read the class bindings another file's local fallbacks
+        // settle.
         matches!(
             kind,
-            DerivationKind::CallTargets | DerivationKind::DynamicFields
+            DerivationKind::CallTargets
+                | DerivationKind::DynamicFields
+                | DerivationKind::LocalFallbacks
         )
     }
 
