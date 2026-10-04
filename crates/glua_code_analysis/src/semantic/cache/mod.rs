@@ -230,13 +230,10 @@ pub struct LuaInferCache {
     /// Pure syntax plus the immutable flow index, so it survives deferred and
     /// unresolve clearing like the other structural caches.
     pub branch_special_call_effect_cache: TrackedMap<(FlowId, FlowId, VarRefCacheKey), bool>,
-    /// Scratch `visited_flow_ids` buffer for the flow walk. Taken at the top
-    /// of a walk and returned afterwards so repeated walks reuse one
-    /// allocation. Walks nest (a merge point re-enters through
-    /// `get_type_at_flow_with_origin`), so while `flow_walk_scratch_in_use`
-    /// is set a nested walk uses a throwaway buffer instead.
-    pub flow_walk_scratch: Vec<FlowId>,
-    pub(crate) flow_walk_scratch_in_use: bool,
+    /// Empty `visited_flow_ids` buffers for the flow walk. A walk takes one
+    /// and returns it afterwards, so repeated and nested walks (a merge point
+    /// re-enters through `get_type_at_flow_with_origin`) reuse allocations.
+    flow_walk_scratch: Vec<Vec<FlowId>>,
     /// The origin type flow walks of an index ref start from, and where the
     /// caller that set it began.
     index_ref_origin_type_cache:
@@ -377,7 +374,6 @@ impl LuaInferCache {
             decl_name_index: None,
             branch_special_call_effect_cache: Default::default(),
             flow_walk_scratch: Vec::new(),
-            flow_walk_scratch_in_use: false,
             index_ref_origin_type_cache: Default::default(),
             keyed: Vec::new(),
             param_type_cache: Default::default(),
@@ -779,8 +775,6 @@ impl LuaInferCache {
         self.baseline_flow_depth = 0;
         empty(&mut self.unambiguous_int_const_cache.0);
         self.decl_name_index = None;
-        self.flow_walk_scratch.clear();
-        self.flow_walk_scratch_in_use = false;
         empty(&mut self.index_ref_origin_type_cache);
         self.keyed.clear();
         empty(&mut self.param_type_cache.0);
@@ -1025,24 +1019,14 @@ impl LuaInferCache {
         by_flow.insert((flow_id, query_realm, origin), entry, provenance);
     }
 
-    /// Takes the reusable flow-walk scratch buffer. Walks nest through merge
-    /// points, so when a walk is already in progress the nested walk gets a
-    /// throwaway buffer (`owned == false`) that is simply dropped on return.
-    pub(crate) fn take_flow_walk_scratch(&mut self) -> (Vec<FlowId>, bool) {
-        if self.flow_walk_scratch_in_use {
-            (Vec::new(), false)
-        } else {
-            self.flow_walk_scratch_in_use = true;
-            (std::mem::take(&mut self.flow_walk_scratch), true)
-        }
+    /// Takes an empty flow-walk scratch buffer.
+    pub(crate) fn take_flow_walk_scratch(&mut self) -> Vec<FlowId> {
+        self.flow_walk_scratch.pop().unwrap_or_default()
     }
 
-    pub(crate) fn return_flow_walk_scratch(&mut self, mut scratch: Vec<FlowId>, owned: bool) {
-        if owned {
-            scratch.clear();
-            self.flow_walk_scratch = scratch;
-            self.flow_walk_scratch_in_use = false;
-        }
+    pub(crate) fn return_flow_walk_scratch(&mut self, mut scratch: Vec<FlowId>) {
+        scratch.clear();
+        self.flow_walk_scratch.push(scratch);
     }
 
     #[track_caller]
