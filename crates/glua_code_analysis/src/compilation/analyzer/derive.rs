@@ -277,11 +277,12 @@ impl super::engine::Recipe for Recipes {
                 if !guesses_locals(db) {
                     return;
                 }
-                let mut context = AnalyzeContext::for_files(db, vec![id.file_id], &self.scopes);
-                if let Some(scan) = scan {
-                    local_inference::publish_unguarded_children(db, &mut context, vec![scan]);
-                }
-                local_inference::stabilize_unknown_locals(db, &mut context);
+                self.with_file_context(db, id.file_id, |db, context| {
+                    if let Some(scan) = scan {
+                        local_inference::publish_unguarded_children(db, context, vec![scan]);
+                    }
+                    local_inference::stabilize_unknown_locals(db, context);
+                });
             }
             DerivationKind::GmodLoadCallSites | DerivationKind::GmodClassCallSites => {
                 let sites = *computed
