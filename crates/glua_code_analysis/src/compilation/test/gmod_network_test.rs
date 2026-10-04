@@ -534,6 +534,93 @@ end
         expect_that!(network_reads(40), eq(network_reads(5)));
     }
 
+    #[gtest]
+    fn net_helper_names_expanded_on_workers_match_a_serial_expansion_cold_and_after_an_edit() {
+        use crate::compilation::analyzer::parallel;
+        use crate::db_index::derivation::{DerivationId, DerivationKind};
+
+        let count = 12;
+        let mut files = vec![(
+            "addons/mytest/lua/autorun/server/helpers.lua".to_string(),
+            "function SendPing()
+ net.Start(\"Ping\")
+ net.SendToServer()
+end
+"
+            .to_string(),
+        )];
+        for i in 0..count {
+            files.push((
+                format!("addons/mytest/lua/autorun/server/wrap{i}.lua"),
+                format!(
+                    "function Wrap{i}()
+ SendPing()
+end
+"
+                ),
+            ));
+            files.push((
+                format!("addons/mytest/lua/autorun/server/outer{i}.lua"),
+                format!(
+                    "function Outer{i}()
+ Wrap{i}()
+end
+"
+                ),
+            ));
+        }
+        let files = files
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect::<Vec<_>>();
+        let snapshot = |ws: &mut VirtualWorkspace| {
+            let db = ws.get_db_mut();
+            let id = DerivationId::workspace(DerivationKind::NetHelperNames);
+            let mut reads = db
+                .reader_graph()
+                .reads_of(id)
+                .map(|key| format!("{:?}", key.key()))
+                .collect::<Vec<_>>();
+            reads.sort();
+            let network = db.get_gmod_network_index();
+            let names = (0..count)
+                .flat_map(|i| [format!("Wrap{i}"), format!("Outer{i}")])
+                .map(|name| network.is_helper_name(&name))
+                .collect::<Vec<_>>();
+            (reads, names)
+        };
+        let analyse = |threads: usize| {
+            parallel::set_analysis_threads(threads);
+            let mut ws = VirtualWorkspace::new();
+            set_gmod_enabled(&mut ws);
+            ws.def_files(files.clone());
+            let cold = snapshot(&mut ws);
+            ws.def_file(
+                "addons/mytest/lua/autorun/server/wrap3.lua",
+                "function Wrap3()
+end
+",
+            );
+            let warm = snapshot(&mut ws);
+            (cold, warm)
+        };
+        let threads = parallel::THREADS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let serial = analyse(1);
+        let parallel_run = analyse(4);
+        parallel::set_analysis_threads(0);
+        drop(threads);
+
+        expect_that!(serial.0.1.iter().all(|named| *named), eq(true));
+        expect_that!(serial.1.1[6], eq(false));
+        expect_that!(
+            serial.0.0.iter().any(|key| key.starts_with("Syntax(")),
+            eq(true)
+        );
+        expect_that!(&parallel_run, eq(&serial));
+    }
+
     fn define_send_ping_helper(ws: &mut VirtualWorkspace) -> crate::FileId {
         ws.def_file(
             "addons/mytest/lua/autorun/server/helpers.lua",

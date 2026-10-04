@@ -182,6 +182,45 @@ where
     Some(results)
 }
 
+/// Run `f` for every item concurrently and collect the results into a `Vec`
+/// aligned with `items`, as part of the evaluation recording on this thread:
+/// each chunk of items records its reads on its own, and they are filed with
+/// the evaluation in item order. Runs on the caller's thread when no
+/// evaluation records or the batch is too small to pay the dispatch.
+pub(crate) fn map_items_recorded<T, R>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+{
+    let Some(id) = crate::db_index::derivation::current() else {
+        return items.iter().map(f).collect();
+    };
+    if items.len() < MIN_PARALLEL_FILES || analysis_threads() <= 1 {
+        return items.iter().map(f).collect();
+    }
+
+    let _p = Profile::cond_new("parallel map_items_recorded", items.len() > 1);
+    init_pool();
+    let chunk_len = items.len().div_ceil(analysis_threads() * 4);
+    let mut chunks = Vec::new();
+    rayon::in_place_scope(|_| {
+        chunks = items
+            .par_chunks(chunk_len)
+            .map(|chunk| {
+                crate::db_index::derivation::detached(id, || {
+                    chunk.iter().map(&f).collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+    });
+    let mut results = Vec::with_capacity(items.len());
+    for (chunk, reads) in chunks {
+        crate::db_index::derivation::note_reads(reads);
+        results.extend(chunk);
+    }
+    results
+}
+
 /// Indices into `file_ids`, ordered largest source first so the long poles are
 /// started before the short ones. Ties break on the index, keeping the order a
 /// pure function of the input.
