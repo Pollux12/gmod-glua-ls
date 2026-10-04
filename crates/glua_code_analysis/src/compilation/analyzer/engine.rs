@@ -2454,10 +2454,10 @@ fn check_fingerprints() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("GLUALS_CHECK_FINGERPRINTS").is_some())
 }
 
-/// Under debug assertions or `GLUALS_CHECK_FINGERPRINTS`: whether a batch
-/// checks that no member computed from a fact another member moved.
+/// Under tests, debug assertions or `GLUALS_CHECK_FINGERPRINTS`: whether a
+/// batch checks that no member computed from a fact another member moved.
 fn check_batch_reads() -> bool {
-    cfg!(debug_assertions) || check_fingerprints()
+    cfg!(any(test, debug_assertions)) || check_fingerprints()
 }
 
 #[cfg(test)]
