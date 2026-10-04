@@ -12,9 +12,9 @@ use crate::{
         gmod::{ensure_scoped_class_type_decl_for_file, resolve_load_dependency_target},
     },
     db_index::{
-        DbIndex, FileReferenceBatch, GlobalId, GmodScopedClassInfo, LegacyModuleEnv, LuaDeclId,
-        LuaDeclarationTree, LuaDependencyKind, LuaDependencySite, LuaMember, LuaMemberOwner,
-        LuaTypeCache, LuaTypeDecl,
+        DbIndex, FileReferenceBatch, GlobalId, GmodScopedClassInfo, LegacyModuleEnv, LuaDecl,
+        LuaDeclId, LuaDeclarationTree, LuaDependencyKind, LuaDependencySite, LuaMember,
+        LuaMemberOwner, LuaTypeCache, LuaTypeDecl,
     },
 };
 
@@ -129,6 +129,15 @@ impl DeclWalk {
         let references = db.get_reference_index_mut();
         references.reserve_for_file(file_id, self.estimate);
         references.file_batch(self.references);
+        let table_literal_decls = self
+            .decl_tree
+            .get_decls()
+            .values()
+            .filter(|decl| decl.table_literal_initializer().is_some())
+            .map(LuaDecl::get_id)
+            .collect();
+        db.get_type_index_mut()
+            .set_table_literal_decls(file_id, table_literal_decls);
         for op in self.ops {
             op.apply(db, file_id, context);
         }

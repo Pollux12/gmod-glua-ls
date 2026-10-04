@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use crate::FileId;
 use crate::db_index::derivation::FilePosition;
 use crate::{LuaMemberId, LuaSignatureId};
-use glua_parser::{LuaKind, LuaSyntaxId, LuaSyntaxKind};
+use glua_parser::{LuaAstNode, LuaKind, LuaSyntaxId, LuaSyntaxKind, LuaTableExpr};
 use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 
@@ -141,6 +141,13 @@ impl LuaDecl {
 
     pub fn has_initializer(&self) -> bool {
         self.initializer.is_some()
+    }
+
+    /// The table literal the declaration takes as its first value, if any.
+    pub fn table_literal_initializer(&self) -> Option<LuaSyntaxId> {
+        let initializer = self.initializer?;
+        (initializer.ret_idx == 0 && LuaTableExpr::can_cast(initializer.expr_id.get_kind()))
+            .then_some(initializer.expr_id)
     }
 
     pub fn set_initializer(&mut self, initializer: Option<LuaDeclInitializer>) {

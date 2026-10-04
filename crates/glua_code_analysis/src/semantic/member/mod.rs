@@ -182,15 +182,6 @@ pub(crate) fn local_class_table_member_ids(
             let Some(decl) = db.get_decl_index().get_decl(decl_id) else {
                 continue;
             };
-            // `local_table_decl_member_owner` opens with these two conditions
-            // and they are field reads, so they run before the index lookups.
-            // Keep them in step with it.
-            if decl
-                .get_initializer()
-                .is_none_or(|initializer| initializer.get_ret_idx() != 0)
-            {
-                continue;
-            }
             let Some(owner) = local_table_decl_member_owner(decl) else {
                 continue;
             };
@@ -260,15 +251,7 @@ pub(crate) fn cached_local_class_table_member_ids(
 }
 
 fn local_table_decl_member_owner(decl: &LuaDecl) -> Option<LuaMemberOwner> {
-    let initializer = decl.get_initializer()?;
-    if initializer.get_ret_idx() != 0 {
-        return None;
-    }
-
-    let expr_id = initializer.get_expr_syntax_id();
-    if !LuaTableExpr::can_cast(expr_id.get_kind()) {
-        return None;
-    }
+    let expr_id = decl.table_literal_initializer()?;
     Some(LuaMemberOwner::Element(InFiled::new(
         decl.get_id().file_id,
         expr_id.get_range(),
@@ -495,6 +478,134 @@ mod tests {
         let mixed = LuaType::from_vec_structural(vec![left, right, LuaType::BooleanConst(false)]);
 
         assert_eq!(merge_open_table_types(&db, vec![mixed.clone()]), mixed);
+    }
+
+    /// A table literal bound to a class backs it while its file is open, stops
+    /// when the file is deleted, and backs it again once the file reopens, as
+    /// a cold build of the reopened workspace does.
+    #[test]
+    fn local_class_table_lookup_follows_delete_and_reopen() {
+        use crate::VirtualWorkspace;
+
+        use super::local_class_table_member_ids;
+
+        const BOUND: &str = r#"
+            ---@class BoundClass
+
+            ---@type BoundClass
+            local instance = { speed = 10 }
+        "#;
+        let path = "lua/autorun/shared/bound.lua";
+        let bound = LuaTypeDeclId::global("BoundClass");
+        let speed = LuaMemberKey::Name("speed".into());
+        let mut ws = VirtualWorkspace::new();
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.def_file(path, BOUND);
+        let db = ws.analysis.compilation.get_db();
+        assert_eq!(local_class_table_member_ids(db, &bound, &speed).len(), 1);
+
+        ws.analysis.remove_file_by_uri(&uri);
+        let db = ws.analysis.compilation.get_db();
+        assert!(local_class_table_member_ids(db, &bound, &speed).is_empty());
+
+        ws.def_file(path, BOUND);
+        let mut cold = VirtualWorkspace::new();
+        cold.def_file(path, BOUND);
+        let reopened =
+            local_class_table_member_ids(ws.analysis.compilation.get_db(), &bound, &speed);
+        let built =
+            local_class_table_member_ids(cold.analysis.compilation.get_db(), &bound, &speed);
+        assert_eq!(reopened.len(), 1, "reopened {reopened:?}, cold {built:?}");
+        fn sites(ids: &[crate::LuaMemberId]) -> Vec<glua_parser::LuaSyntaxId> {
+            ids.iter().map(|id| *id.get_syntax_id()).collect()
+        }
+        assert_eq!(sites(&reopened), sites(&built));
+        assert_eq!(ws.semantic_digest(), cold.semantic_digest());
+    }
+
+    /// A field of a class's table literal in one of the class's files types a
+    /// read through the class in another file.
+    #[test]
+    fn local_class_table_member_types_a_read_in_another_file() {
+        use crate::VirtualWorkspace;
+
+        use super::local_class_table_member_ids;
+
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(vec![
+            (
+                "lua/autorun/shared/sh_radio.lua",
+                r#"
+                ---@class RadioPreset
+                "#,
+            ),
+            (
+                "lua/autorun/shared/sh_radio_presets.lua",
+                r#"
+                ---@class RadioPreset
+
+                ---@type RadioPreset
+                local preset = { volume = 1 }
+                "#,
+            ),
+        ]);
+        let reader = ws.def_file(
+            "lua/autorun/client/cl_radio.lua",
+            r#"
+            ---@param preset RadioPreset
+            local function apply(preset)
+                local volume = preset.volume
+                print(volume)
+            end
+            "#,
+        );
+        let preset = LuaTypeDeclId::global("RadioPreset");
+        let volume = LuaMemberKey::Name("volume".into());
+        assert_eq!(
+            local_class_table_member_ids(ws.analysis.compilation.get_db(), &preset, &volume).len(),
+            1
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(reader, "volume")), "1");
+    }
+
+    /// A local without a table literal settled to a class by its uses is not
+    /// a table backing the class: the class's bindings do not move.
+    #[test]
+    fn a_local_settled_to_a_class_without_a_table_literal_binds_nothing() {
+        use crate::db_index::derivation::{ABSENT, FactKey};
+        use crate::{Emmyrc, VirtualWorkspace};
+
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def_file(
+            "lua/autorun/client/cl_tuner.lua",
+            r#"
+            ---@class Entity
+            ---@class Radio: Entity
+            ---@field Tune fun(self: Radio)
+
+            ---@type Entity
+            local tuned
+            tuned:Tune()
+            print(tuned)
+            "#,
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "tuned")), "Radio");
+        let db = ws.analysis.compilation.get_db();
+        let radio = LuaTypeDeclId::global("Radio");
+        let files = rustc_hash::FxHashSet::from_iter([file_id]);
+        assert_eq!(
+            db.get_type_index()
+                .decls_bound_to_type(&radio, &files)
+                .count(),
+            0
+        );
+        assert_eq!(
+            db.fact_fingerprint(&FactKey::BoundDecls(radio, file_id)),
+            ABSENT
+        );
     }
 
     /// The class→table-owner lookup answers the live decl bindings: editing
