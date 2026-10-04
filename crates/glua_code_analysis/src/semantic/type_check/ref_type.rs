@@ -134,6 +134,22 @@ fn check_ref_enum(
         return Ok(());
     }
 
+    if let Some(enum_base @ (LuaType::Number | LuaType::Integer)) = type_decl.get_enum_base()
+        && matches!(
+            compact_type,
+            LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_) | LuaType::Integer
+        )
+        && context
+            .db
+            .get_member_index()
+            .get_member_len(&LuaMemberOwner::Type(source_id.clone()))
+            > 0
+        && check_general_type_compact(context, enum_base, compact_type, check_guard.next_level()?)
+            .is_ok()
+    {
+        return Ok(());
+    }
+
     let enum_fields = type_decl
         .get_enum_field_type(context.db)
         .ok_or(TypeCheckFailReason::TypeNotMatch)?;

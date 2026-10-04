@@ -648,4 +648,104 @@ mod test {
 
         assert!(ws.check_type(&target_ty, &table_ty));
     }
+
+    /// An enum check answers as the check against its built field union does.
+    #[test]
+    fn enum_checks_match_the_built_field_union() {
+        use crate::LuaTypeDeclId;
+
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            FLAT_A = 1
+            FLAT_B = 2
+            FLAT_STR = "x"
+            ---@enum FlatNumber : number
+            ---| FLAT_A
+            ---| FLAT_B
+
+            ---@enum FlatInteger : integer
+            ---| FLAT_A
+            ---| FLAT_B
+
+            ---@enum FlatNoBase
+            ---| FLAT_A
+            ---| FLAT_B
+
+            ---@enum FlatMixed : number
+            ---| FLAT_A
+            ---| FLAT_STR
+
+            ---@enum FlatStringBase : string
+            ---| FLAT_STR
+
+            ---@enum (key) KeyEnum
+            local KeyEnum = { first = 1, second = 2 }
+
+            ---@enum TableEnum
+            local TableEnum = { Low = 1, High = 5 }
+
+            ---@enum TableNumberEnum : number
+            local TableNumberEnum = { Low = 1, High = 5 }
+
+            ---@enum EmptyNumber : number
+            local EmptyNumber = {}
+            "#,
+        );
+        let db = ws.analysis.compilation.get_db();
+        let compacts = [
+            LuaType::IntegerConst(1),
+            LuaType::IntegerConst(3),
+            LuaType::IntegerConst(-7),
+            LuaType::DocIntegerConst(2),
+            LuaType::Integer,
+            LuaType::Number,
+            LuaType::FloatConst(1.5),
+            LuaType::String,
+            LuaType::StringConst(smol_str::SmolStr::new("x").into()),
+            LuaType::Nil,
+            LuaType::Boolean,
+        ];
+        for name in [
+            "FlatNumber",
+            "FlatInteger",
+            "FlatNoBase",
+            "FlatMixed",
+            "FlatStringBase",
+            "KeyEnum",
+            "TableEnum",
+            "TableNumberEnum",
+            "EmptyNumber",
+            "MissingEnum",
+        ] {
+            let id = LuaTypeDeclId::global(name);
+            let fields = db
+                .get_type_index()
+                .get_type_decl(&id)
+                .and_then(|decl| decl.get_enum_field_type(db));
+            for compact in &compacts {
+                let built = match &fields {
+                    Some(LuaType::Union(union))
+                        if union.types().all(|t| {
+                            matches!(t, LuaType::DocIntegerConst(_) | LuaType::IntegerConst(_))
+                        }) && matches!(
+                            compact,
+                            LuaType::Integer
+                                | LuaType::DocIntegerConst(_)
+                                | LuaType::IntegerConst(_)
+                        ) =>
+                    {
+                        true
+                    }
+                    Some(fields) => check_type_compact(db, fields, compact).is_ok(),
+                    None => false,
+                };
+                assert_eq!(
+                    check_type_compact(db, &LuaType::Ref(id.clone()), compact).is_ok(),
+                    built,
+                    "{name} against {compact:?}"
+                );
+            }
+        }
+    }
 }
