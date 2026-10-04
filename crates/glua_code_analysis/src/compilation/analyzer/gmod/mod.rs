@@ -1212,6 +1212,30 @@ pub(crate) struct GmodFileMetadataResult {
     annotation_realm: Option<GmodRealm>,
     /// `@fileparam` annotations, when the file content mentions `@fileparam`.
     file_params: Option<Vec<(String, String)>>,
+    /// What the file's scripted-class scope binds, read off its syntax.
+    scope: Option<ScopedFilePlan>,
+}
+
+/// The syntax-derived inputs of binding a scripted-scope file's class.
+struct ScopedFilePlan {
+    /// The scope the file's cached class info, else its path, names.
+    scope_match: Option<GmodScopedClassMatch>,
+    /// The `<global>.Base` and `ENT.Type` assignments, in source order.
+    base_assignments: Vec<ScopedBaseAssignment>,
+    /// The network-var wrappers the file defines, when its class info is cached.
+    wrappers: Vec<NetworkVarWrapper>,
+}
+
+enum ScopedBaseAssignment {
+    Base {
+        name: String,
+        range: TextRange,
+        syntax_id: LuaSyntaxId,
+    },
+    EntityType {
+        super_name: &'static str,
+        range: TextRange,
+    },
 }
 
 /// Collect all per-file gmod pre-analysis metadata for `file_id`. Read-only
@@ -1251,6 +1275,7 @@ fn collect_file_gmod_metadata(
             branch_ranges: Vec::new(),
             annotation_realm: None,
             file_params: None,
+            scope: None,
         };
     };
 
@@ -1288,7 +1313,46 @@ fn collect_file_gmod_metadata(
         branch_ranges,
         annotation_realm,
         file_params,
+        scope: None,
     }
+}
+
+/// The scope inputs of `file_id` when it is a scripted-scope file.
+fn collect_scoped_file_plan(
+    db: &DbIndex,
+    file_id: FileId,
+    scripted_scope_files: &HashSet<FileId>,
+) -> Option<ScopedFilePlan> {
+    if !scripted_scope_files.contains(&file_id) {
+        return None;
+    }
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .map(|tree| tree.get_chunk_node())?;
+    let cached = db.get_gmod_infer_index().get_scoped_class_info(&file_id);
+    let wrappers = cached
+        .map(|info| collect_network_var_wrappers(&root, &info.global_name))
+        .unwrap_or_default();
+    let scope_match = cached
+        .map(|info| GmodScopedClassMatch {
+            class_name: info.class_name.clone(),
+            global_name: info.global_name.clone(),
+            is_global_singleton: info.is_global_singleton,
+            aliases: info.aliases.clone(),
+            super_types: info.super_types.clone(),
+            class_name_prefix: info.class_name_prefix.clone(),
+        })
+        .or_else(|| detect_scoped_class_from_path(db, file_id));
+    let base_assignments = scope_match
+        .as_ref()
+        .map(|scope_match| collect_scoped_base_assignments(&root, &scope_match.global_name))
+        .unwrap_or_default();
+    Some(ScopedFilePlan {
+        scope_match,
+        base_assignments,
+        wrappers,
+    })
 }
 
 fn collect_hook_metadata(
@@ -4533,8 +4597,9 @@ fn cached_decl_has_reassignment(
 fn synthesize_scoped_base_assignments_with(
     db: &mut DbIndex,
     file_id: FileId,
-    root: LuaChunk,
+    root_range: TextRange,
     scope_match: &GmodScopedClassMatch,
+    assignments: &[ScopedBaseAssignment],
 ) {
     let class_decl_id = ensure_scoped_class_type_decl(
         db,
@@ -4542,19 +4607,39 @@ fn synthesize_scoped_base_assignments_with(
         &scope_match.class_name,
         &scope_match.global_name,
         &scope_match.super_types,
-        root.syntax().text_range(),
+        root_range,
     );
-    let expected_base_path = format!("{}.Base", scope_match.global_name);
+    for assignment in assignments {
+        match assignment {
+            ScopedBaseAssignment::Base {
+                name,
+                range,
+                syntax_id,
+            } => {
+                add_scoped_super_type_if_missing(db, &class_decl_id, file_id, *range, name);
+                synthesize_baseclass_member(db, file_id, &class_decl_id, name, *syntax_id);
+            }
+            ScopedBaseAssignment::EntityType { super_name, range } => {
+                add_scoped_super_type_if_missing(db, &class_decl_id, file_id, *range, super_name);
+            }
+        }
+    }
+}
+
+/// The `<global>.Base` assignments of a scripted-scope file, and for `ENT` its
+/// `ENT.Type` assignments, in source order.
+fn collect_scoped_base_assignments(
+    root: &LuaChunk,
+    global_name: &str,
+) -> Vec<ScopedBaseAssignment> {
+    let expected_base_path = format!("{global_name}.Base");
 
     // ENT.Type selects the engine-side entity framework (e.g. "nextbot"
-    // provides NextBot methods). Only entities use this field — SWEP, TOOL,
+    // provides NextBot methods). Only entities use this field - SWEP, TOOL,
     // PLAYER, etc. have their own Type field with different semantics.
-    let expected_type_path = if scope_match.global_name == "ENT" {
-        Some(format!("{}.Type", scope_match.global_name))
-    } else {
-        None
-    };
+    let expected_type_path = (global_name == "ENT").then(|| format!("{global_name}.Type"));
 
+    let mut assignments = Vec::new();
     for assign_stat in root.descendants::<LuaAssignStat>() {
         let (vars, exprs) = assign_stat.get_var_and_expr_list();
         for (idx, var) in vars.into_iter().enumerate() {
@@ -4567,27 +4652,18 @@ fn synthesize_scoped_base_assignments_with(
             };
 
             if access_path.eq_ignore_ascii_case(&expected_base_path) {
-                let Some(base_name) = extract_scoped_base_name(value_expr) else {
+                let Some(name) = extract_scoped_base_name(value_expr) else {
                     continue;
                 };
-                add_scoped_super_type_if_missing(
-                    db,
-                    &class_decl_id,
-                    file_id,
-                    value_expr.get_range(),
-                    &base_name,
-                );
-                synthesize_baseclass_member(
-                    db,
-                    file_id,
-                    &class_decl_id,
-                    &base_name,
-                    value_expr.get_syntax_id(),
-                );
+                assignments.push(ScopedBaseAssignment::Base {
+                    name,
+                    range: value_expr.get_range(),
+                    syntax_id: value_expr.get_syntax_id(),
+                });
             } else if let Some(ref type_path) = expected_type_path
                 && access_path.eq_ignore_ascii_case(type_path)
             {
-                // ENT.Type = "nextbot" → inject NextBot as a super-type so
+                // ENT.Type = "nextbot" injects NextBot as a super-type so
                 // engine-side framework methods (StartActivity, loco, etc.)
                 // are visible on the synthesized class.
                 let Some(type_name) = extract_scoped_base_name(value_expr) else {
@@ -4596,16 +4672,14 @@ fn synthesize_scoped_base_assignments_with(
                 let Some(super_name) = super_type_for_entity_type(&type_name) else {
                     continue;
                 };
-                add_scoped_super_type_if_missing(
-                    db,
-                    &class_decl_id,
-                    file_id,
-                    value_expr.get_range(),
+                assignments.push(ScopedBaseAssignment::EntityType {
                     super_name,
-                );
+                    range: value_expr.get_range(),
+                });
             }
         }
     }
+    assignments
 }
 
 /// Adds `super_name` as a global super-type of `class_decl_id` if it is not
@@ -4679,7 +4753,15 @@ struct NetworkVarWrapper {
 /// and synthesize Get/Set members from their call sites.
 /// Synthesizes the members a scripted-scope file's network-var wrapper calls
 /// define.
-fn synthesize_network_var_wrappers(db: &mut DbIndex, file_id: FileId, root: &LuaChunk) {
+fn synthesize_network_var_wrappers(
+    db: &mut DbIndex,
+    file_id: FileId,
+    root: &LuaChunk,
+    wrappers: &[NetworkVarWrapper],
+) {
+    if wrappers.is_empty() {
+        return;
+    }
     // Use cached scoped class info (computed earlier in gmod_pre)
     let Some(scope_match) = db
         .get_gmod_infer_index()
@@ -4692,13 +4774,7 @@ fn synthesize_network_var_wrappers(db: &mut DbIndex, file_id: FileId, root: &Lua
     let class_decl_id =
         get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name);
 
-    // Step 1: Collect wrapper definitions from method definitions
-    let wrappers = collect_network_var_wrappers(root, &scope_match.global_name);
-    if wrappers.is_empty() {
-        return;
-    }
-
-    // Step 2: Find calls to these wrappers and synthesize members
+    // Find calls to these wrappers and synthesize members
     for call_expr in root.descendants::<LuaCallExpr>() {
         let (method_name, is_local_call) = match call_expr.get_prefix_expr() {
             Some(LuaExpr::IndexExpr(index_expr)) => {

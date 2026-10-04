@@ -147,19 +147,21 @@ pub(crate) fn evaluate_load_call_sites(db: &mut DbIndex, context: &mut AnalyzeCo
 }
 
 /// One file's hook, system and realm metadata, read off the index; `None`
-/// with gmod disabled. [`apply_pre`] stores it.
-pub(crate) fn compute_pre(db: &DbIndex, file_id: FileId) -> Option<GmodFileMetadataResult> {
+/// with gmod disabled, with what its scripted-class scope binds. [`apply_pre`]
+/// stores it.
+pub(crate) fn compute_pre(
+    db: &DbIndex,
+    file_id: FileId,
+    scopes: &super::super::ScriptedScopes,
+) -> Option<GmodFileMetadataResult> {
     if !db.get_emmyrc().gmod.enabled {
         return None;
     }
     let roles = call_role_entries(db);
     let prefixes = formatted_hook_prefixes(db);
-    Some(collect_file_gmod_metadata(
-        db,
-        file_id,
-        &prefixes,
-        &roles.roles,
-    ))
+    let mut metadata = collect_file_gmod_metadata(db, file_id, &prefixes, &roles.roles);
+    metadata.scope = collect_scoped_file_plan(db, file_id, &scopes.files);
+    Some(metadata)
 }
 
 /// Stores the metadata of `context`'s one file with its scoped-class
@@ -176,11 +178,11 @@ pub(crate) fn apply_pre(
         branch_ranges,
         annotation_realm,
         file_params,
+        scope,
     }) = metadata
     else {
         return;
     };
-    let scripted_scope_files = context.get_or_compute_scripted_scope_files(db);
     let Some(in_filed_tree) = context.tree_list.first().cloned() else {
         return;
     };
@@ -197,37 +199,34 @@ pub(crate) fn apply_pre(
                 .set_gm_method_realm_annotations(file_id, gm_method_realms);
         }
     }
-    if scripted_scope_files.contains(&file_id) {
-        let scope_match = db
-            .get_gmod_infer_index()
-            .get_scoped_class_info(&file_id)
-            .map(|info| GmodScopedClassMatch {
-                class_name: info.class_name.clone(),
-                global_name: info.global_name.clone(),
-                is_global_singleton: info.is_global_singleton,
-                aliases: info.aliases.clone(),
-                super_types: info.super_types.clone(),
-                class_name_prefix: info.class_name_prefix.clone(),
-            })
-            .or_else(|| detect_scoped_class_from_path(db, file_id));
-        if let Some(scope_match) = scope_match {
-            ensure_scoped_class_type_decl(
-                db,
-                file_id,
-                &scope_match.class_name,
-                &scope_match.global_name,
-                &scope_match.super_types,
-                in_filed_tree.value.syntax().text_range(),
-            );
-            collect_scripted_scope_type_bindings_with(db, file_id, &scope_match);
-            synthesize_scoped_base_assignments_with(
-                db,
-                file_id,
-                in_filed_tree.value.clone(),
-                &scope_match,
-            );
+    let wrappers = match scope {
+        Some(ScopedFilePlan {
+            scope_match,
+            base_assignments,
+            wrappers,
+        }) => {
+            if let Some(scope_match) = scope_match {
+                ensure_scoped_class_type_decl(
+                    db,
+                    file_id,
+                    &scope_match.class_name,
+                    &scope_match.global_name,
+                    &scope_match.super_types,
+                    in_filed_tree.value.syntax().text_range(),
+                );
+                collect_scripted_scope_type_bindings_with(db, file_id, &scope_match);
+                synthesize_scoped_base_assignments_with(
+                    db,
+                    file_id,
+                    in_filed_tree.value.syntax().text_range(),
+                    &scope_match,
+                    &base_assignments,
+                );
+            }
+            wrappers
         }
-    }
+        None => Vec::new(),
+    };
     db.get_gmod_infer_index_mut().set_realm_inputs(
         file_id,
         GmodRealmInputs {
@@ -245,9 +244,7 @@ pub(crate) fn apply_pre(
             .set_file_params(file_id, file_params);
     }
 
-    if scripted_scope_files.contains(&file_id) {
-        synthesize_network_var_wrappers(db, file_id, &in_filed_tree.value);
-    }
+    synthesize_network_var_wrappers(db, file_id, &in_filed_tree.value, &wrappers);
 }
 
 /// The workspace load graph, execution environments and file realms.

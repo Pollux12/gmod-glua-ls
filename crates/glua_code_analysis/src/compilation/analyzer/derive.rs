@@ -225,7 +225,7 @@ impl super::engine::Recipe for Recipes {
             DerivationKind::ValidGuardScan => Box::new(
                 crate::db_index::compute_valid_guard_signatures(db, id.file_id),
             ),
-            DerivationKind::GmodPre => Box::new(gmod::compute_pre(db, id.file_id)),
+            DerivationKind::GmodPre => Box::new(gmod::compute_pre(db, id.file_id, &self.scopes)),
             kind => unreachable!("{kind:?} does not split"),
         }
     }
