@@ -232,6 +232,10 @@ pub(crate) trait Recipe: Sync {
         false
     }
 
+    /// Finishes what the applies since the last call left to settle off the
+    /// ordered publish.
+    fn settle(&self) {}
+
     /// Drops a worker result [`Self::apply`] will not publish.
     fn discard(&self, _id: DerivationId, _computed: Box<dyn std::any::Any + Send>) {}
 }
@@ -1475,6 +1479,7 @@ impl Engine {
                     })
                     .collect()
             });
+        recipe.settle();
         for (member, elapsed) in times {
             self.stats.timed_evaluation(member, elapsed);
         }
@@ -1686,6 +1691,7 @@ impl Engine {
                 computing + started.map(|started| started.elapsed()).unwrap_or_default(),
             );
         }
+        recipe.settle();
         derivation::lend_keys(db.reader_graph_mut().lend_keys());
         let lent = scopeguard_lent_keys();
         derivation::note_recomputed(|key| recomputing.get(key) == Some(&db.fact_fingerprint(key)));

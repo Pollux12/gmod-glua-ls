@@ -427,16 +427,19 @@ pub(super) fn apply_dynamic_fields(
     for (field_name, file_id, range) in collected_unattributed {
         index.add_unattributed_field(field_name, file_id, range);
     }
-    for (owner, field_name, file_id, range) in &collected {
-        index.add_field(owner.clone(), field_name.clone(), *file_id, *range);
+    for (owner, field_name, file_id, range) in collected {
+        index.add_field(owner, field_name, file_id, range);
     }
-    for (owner, field_name, file_id, range) in &collected_propagated {
-        index.add_propagated_field(owner.clone(), field_name.clone(), *file_id, *range);
+    for (owner, field_name, file_id, range) in collected_propagated {
+        index.add_propagated_field(owner, field_name, file_id, range);
     }
-    for (owner, file_id, range) in &collected_wildcards {
-        index.add_wildcard_definition(owner.clone(), *file_id, *range);
+    let wildcard_definitions = collected_wildcards
+        .iter()
+        .cloned()
+        .collect::<FxHashSet<_>>();
+    for (owner, file_id, range) in collected_wildcards {
+        index.add_wildcard_definition(owner, file_id, range);
     }
-    let wildcard_definitions = collected_wildcards.into_iter().collect::<FxHashSet<_>>();
     for (owner, member_id, file_id, range, has_finite_domain) in collected_finite_members {
         if has_finite_domain && !wildcard_definitions.contains(&(owner.clone(), file_id, range)) {
             index.add_finite_named_member(owner, member_id);

@@ -4,6 +4,7 @@ use glua_parser::{
     LuaAst, LuaAstNode, LuaChunk, LuaExpr, LuaSyntaxId, LuaTableExpr, LuaTableField,
 };
 
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -120,6 +121,8 @@ pub(super) struct Recipes {
     /// Each file's inference memo, reused across its evaluations: an entry
     /// holds for as long as the reads it was computed from do.
     caches: std::sync::Mutex<FxHashMap<FileId, crate::LuaInferCache>>,
+    /// Memos of applied results, committed and stored by [`Self::settle_caches`].
+    unsettled: std::sync::Mutex<Vec<(FileId, crate::LuaInferCache)>>,
 }
 
 struct ComputedCallTargets {
@@ -147,6 +150,7 @@ impl Recipes {
             special_call_direct_matcher: lua::call::build_special_call_direct_matcher(db, &roots),
             scopes,
             caches: std::sync::Mutex::default(),
+            unsettled: std::sync::Mutex::default(),
         }
     }
 }
@@ -172,6 +176,25 @@ impl Recipes {
             .lock()
             .expect("cache store")
             .insert(file_id, cache);
+    }
+
+    /// Holds the memo of a result just applied until [`Self::settle_caches`].
+    fn settle_later(&self, file_id: FileId, cache: crate::LuaInferCache) {
+        self.unsettled
+            .lock()
+            .expect("unsettled memos")
+            .push((file_id, cache));
+    }
+
+    /// Commits the transaction and clears the local state of every memo held
+    /// by [`Self::settle_later`], concurrently, and returns it to the store.
+    fn settle_caches(&self) {
+        let unsettled = std::mem::take(&mut *self.unsettled.lock().expect("unsettled memos"));
+        unsettled.into_par_iter().for_each(|(file_id, mut cache)| {
+            cache.commit_transaction();
+            cache.clear();
+            self.store_cache(file_id, cache);
+        });
     }
 
     /// Each file's inference memo.
@@ -274,13 +297,11 @@ impl super::engine::Recipe for Recipes {
     fn apply(&self, db: &mut DbIndex, id: DerivationId, computed: Box<dyn std::any::Any + Send>) {
         match id.kind {
             DerivationKind::CallTargets => {
-                let ComputedCallTargets { targets, mut cache } = *computed
+                let ComputedCallTargets { targets, cache } = *computed
                     .downcast::<ComputedCallTargets>()
                     .expect("call targets");
                 call_target::apply_file_call_targets(db, id.file_id, targets);
-                cache.commit_transaction();
-                cache.clear();
-                self.store_cache(id.file_id, cache);
+                self.settle_later(id.file_id, cache);
             }
             DerivationKind::CallSiteParams => {
                 let contributions = *computed
@@ -323,13 +344,11 @@ impl super::engine::Recipe for Recipes {
                 gmod::apply_annotated_call_sites(db, id.file_id, sites);
             }
             DerivationKind::DynamicFields => {
-                let ComputedDynamicFields { fields, mut cache } = *computed
+                let ComputedDynamicFields { fields, cache } = *computed
                     .downcast::<ComputedDynamicFields>()
                     .expect("dynamic fields");
                 dynamic_field::apply_dynamic_fields(db, [(fields, id.file_id)]);
-                cache.commit_transaction();
-                cache.clear();
-                self.store_cache(id.file_id, cache);
+                self.settle_later(id.file_id, cache);
             }
             DerivationKind::GmodHelperScan => {
                 let scan = *computed
@@ -353,6 +372,10 @@ impl super::engine::Recipe for Recipes {
             }
             kind => unreachable!("{kind:?} does not split"),
         }
+    }
+
+    fn settle(&self) {
+        self.settle_caches();
     }
 
     fn discard(&self, id: DerivationId, computed: Box<dyn std::any::Any + Send>) {
@@ -400,6 +423,7 @@ impl super::engine::Recipe for Recipes {
             | DerivationKind::GmodPre => {
                 let computed = super::engine::Recipe::compute(self, db, id);
                 super::engine::Recipe::apply(self, db, id, computed);
+                self.settle_caches();
             }
             _ => self.with_file_context(db, id.file_id, |db, context| {
                 self.evaluate_file_derivation(db, context, id);
