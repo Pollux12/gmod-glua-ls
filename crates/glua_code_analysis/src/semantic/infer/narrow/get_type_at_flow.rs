@@ -159,6 +159,7 @@ pub fn get_type_at_flow_with_origin(
         flow_id,
         &mut visited_flow_ids,
         policy,
+        true,
     );
     let provenance = cache.close_frame(frame);
     // RecursiveInfer errors are transient (cycle detection) and must NOT be
@@ -266,6 +267,7 @@ pub(super) fn get_type_at_flow_in_mode(
                 flow_id,
                 &mut visited_flow_ids,
                 policy,
+                false,
             );
             if let Ok(narrow_type) = &result {
                 cache
@@ -435,14 +437,17 @@ fn get_type_at_flow_walk(
     initial_flow_id: FlowId,
     visited_flow_ids: &mut Vec<FlowId>,
     policy: FlowWalkPolicy,
+    initial_missed: bool,
 ) -> InferResult {
     let mut antecedent_flow_id = initial_flow_id;
+    let mut skip_lookup = initial_missed;
     let numeric_index_query = OnceCell::new();
     loop {
         // Check cache for intermediate flow nodes (both success and error).
         // This is critical for performance in large files where many walks
-        // share overlapping flow chains.
-        if policy.is_normal() {
+        // share overlapping flow chains. The caller has already missed on the
+        // initial node when `initial_missed` is set.
+        if policy.is_normal() && !std::mem::take(&mut skip_lookup) {
             match cache.get_flow_cache_with_origin_by_key(
                 cache_key,
                 antecedent_flow_id,
