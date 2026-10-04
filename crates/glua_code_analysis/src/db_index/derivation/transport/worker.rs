@@ -357,7 +357,7 @@ impl ComputeInputs {
         &self,
         keys: &WorkerKeys,
         table: &KeyTable,
-        fingerprint: impl Fn(&HashedKey) -> Option<Fingerprint>,
+        fingerprint: impl Fn(&HashedKey, Option<KeyIdx>) -> Option<Fingerprint>,
     ) -> bool {
         self.complete
             && self.flags.iter().all(|input| {
@@ -378,11 +378,11 @@ impl ComputeInputs {
                 .iter()
                 .all(|key| table.find(key).is_none_or(|slot| !table.taints(slot)))
             && self.reads.iter().all(|(local, seen)| {
-                let key = match keys.entries[*local as usize] {
-                    super::WorkerKey::Known(slot) => table.live_key(slot),
-                    super::WorkerKey::New(index) => Some(&keys.new_keys[index as usize]),
+                let (key, slot) = match keys.entries[*local as usize] {
+                    super::WorkerKey::Known(slot) => (table.live_key(slot), Some(slot)),
+                    super::WorkerKey::New(index) => (Some(&keys.new_keys[index as usize]), None),
                 };
-                key.is_some_and(|key| fingerprint(key) == Some(*seen))
+                key.is_some_and(|key| fingerprint(key, slot) == Some(*seen))
             })
     }
 }
@@ -395,10 +395,12 @@ pub(crate) struct WorkerEvaluation {
 }
 
 impl WorkerEvaluation {
+    /// Whether the computation's reads still hold. `fingerprint` takes a read
+    /// key, with its slot when the snapshot had one.
     pub(crate) fn validate(
         &self,
         graph: &ReaderGraph,
-        fingerprint: impl Fn(&HashedKey) -> Option<Fingerprint>,
+        fingerprint: impl Fn(&HashedKey, Option<KeyIdx>) -> Option<Fingerprint>,
     ) -> bool {
         self.validate_table(graph.keys(), fingerprint)
     }
@@ -419,7 +421,7 @@ impl WorkerEvaluation {
     fn validate_table(
         &self,
         table: &KeyTable,
-        fingerprint: impl Fn(&HashedKey) -> Option<Fingerprint>,
+        fingerprint: impl Fn(&HashedKey, Option<KeyIdx>) -> Option<Fingerprint>,
     ) -> bool {
         table.quarantine_started() == Some(self.started)
             && self.inputs.validate(&self.keys, table, fingerprint)
@@ -740,7 +742,7 @@ mod tests {
         assert_eq!(Arc::strong_count(&snapshot.0.graph), 1);
         let mut graph = recover(snapshot);
         let mut table = graph.lend_keys();
-        assert!(result.evaluation.validate_table(&table, |_| Some(17)));
+        assert!(result.evaluation.validate_table(&table, |_, _| Some(17)));
         let evaluation = result.evaluation.canonicalise(&mut table).unwrap();
         let other = table.find(&key(1)).unwrap();
         assert_eq!(evaluation.log, vec![global, other, global, other]);
@@ -787,9 +789,9 @@ mod tests {
         );
         let mut graph = recover(snapshot);
         let mut table = graph.lend_keys();
-        assert!(result.evaluation.validate_table(&table, |_| Some(17)));
+        assert!(result.evaluation.validate_table(&table, |_, _| Some(17)));
         table.close_windows(|_| true);
-        assert!(!result.evaluation.validate_table(&table, |_| Some(17)));
+        assert!(!result.evaluation.validate_table(&table, |_, _| Some(17)));
         guard.finish(&mut table);
         graph.restore_keys(table);
     }
@@ -813,10 +815,10 @@ mod tests {
         assert_eq!(result.evaluation.inputs.absent_base_flags, vec![key(1)]);
         let mut graph = recover(snapshot);
         let mut table = graph.lend_keys();
-        assert!(result.evaluation.validate_table(&table, |_| Some(17)));
+        assert!(result.evaluation.validate_table(&table, |_, _| Some(17)));
         table.intern_read(key(1), derivation::new_stamp());
         table.hold_window(&key(1), derivation::new_stamp());
-        assert!(!result.evaluation.validate_table(&table, |_| Some(17)));
+        assert!(!result.evaluation.validate_table(&table, |_, _| Some(17)));
         guard.finish(&mut table);
         graph.restore_keys(table);
     }
@@ -849,9 +851,9 @@ mod tests {
         );
         let mut graph = recover(snapshot);
         let mut table = graph.lend_keys();
-        assert!(result.evaluation.validate_table(&table, |_| Some(17)));
-        assert!(!result.evaluation.validate_table(&table, |_| None));
-        assert!(!result.evaluation.validate_table(&table, |_| Some(18)));
+        assert!(result.evaluation.validate_table(&table, |_, _| Some(17)));
+        assert!(!result.evaluation.validate_table(&table, |_, _| None));
+        assert!(!result.evaluation.validate_table(&table, |_, _| Some(18)));
         guard.finish(&mut table);
         graph.restore_keys(table);
     }
@@ -881,7 +883,7 @@ mod tests {
         assert_eq!(worker_query_readiness(&query), None);
         let mut graph = recover(snapshot);
         let mut table = graph.lend_keys();
-        assert!(!result.evaluation.validate_table(&table, |_| Some(17)));
+        assert!(!result.evaluation.validate_table(&table, |_, _| Some(17)));
         guard.finish(&mut table);
         graph.restore_keys(table);
     }
@@ -947,8 +949,8 @@ mod tests {
         assert_eq!(result.evaluation.inputs.reads.len(), 1);
         let mut graph = recover(snapshot);
         let mut table = graph.lend_keys();
-        assert!(result.evaluation.validate_table(&table, |_| Some(17)));
-        assert!(!result.evaluation.validate_table(&table, |_| Some(18)));
+        assert!(result.evaluation.validate_table(&table, |_, _| Some(17)));
+        assert!(!result.evaluation.validate_table(&table, |_, _| Some(18)));
         guard.finish(&mut table);
         graph.restore_keys(table);
     }
@@ -980,7 +982,7 @@ mod tests {
         );
         let mut graph = recover(snapshot);
         let mut table = graph.lend_keys();
-        assert!(!result.evaluation.validate_table(&table, |_| Some(17)));
+        assert!(!result.evaluation.validate_table(&table, |_, _| Some(17)));
         guard.finish(&mut table);
         graph.restore_keys(table);
     }
@@ -1016,7 +1018,7 @@ mod tests {
         assert_eq!(result.evaluation.evaluation.named_reads.len(), 1);
         let mut graph = recover(snapshot);
         let mut table = graph.lend_keys();
-        assert!(result.evaluation.validate_table(&table, |_| Some(17)));
+        assert!(result.evaluation.validate_table(&table, |_, _| Some(17)));
         let evaluation = result.evaluation.canonicalise(&mut table).unwrap();
         assert_eq!(
             evaluation.named_reads.iter().next().unwrap().slot,

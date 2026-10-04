@@ -927,7 +927,9 @@ impl ReaderGraph {
         }
     }
 
-    pub(super) fn slot_fingerprint(
+    /// The fingerprint of the key in `slot`, cached as
+    /// [`Self::current_fingerprint`] caches it.
+    pub(crate) fn slot_fingerprint(
         &self,
         slot: KeyIdx,
         fingerprint: impl FnOnce(&HashedKey) -> Fingerprint,

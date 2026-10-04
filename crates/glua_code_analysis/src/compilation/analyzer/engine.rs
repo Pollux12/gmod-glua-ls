@@ -1622,12 +1622,17 @@ impl Engine {
         crate::semantic::restore_access_path_snapshot(paths, additions);
         for (id, (result, computing)) in batch.iter().zip(computed) {
             let started = profiling.then(std::time::Instant::now);
-            let valid = result.evaluation.validate(db.reader_graph(), |key| {
+            let valid = result.evaluation.validate(db.reader_graph(), |key, slot| {
                 if matches!(
                     key.key(),
                     FactKey::ReceiverAuthority(_) | FactKey::CallbackParams(_)
                 ) {
                     db.queries().ready_fingerprint(key)
+                } else if let Some(slot) = slot {
+                    Some(
+                        db.reader_graph()
+                            .slot_fingerprint(slot, |key| db.fact_fingerprint(key)),
+                    )
                 } else {
                     Some(self.fingerprint(db, key))
                 }
