@@ -300,12 +300,12 @@ impl LuaTypeDecl {
     /// site, the name or the payload apart, or removing the declaration,
     /// conflict.
     pub(crate) fn merge(
-        current: Option<&Self>,
+        merged: &mut Option<Self>,
         frozen: Option<&Self>,
         fork: Option<&Self>,
-    ) -> crate::db_index::cow_shards::Merged<Self> {
+    ) -> crate::db_index::cow_shards::Merged {
         use crate::db_index::cow_shards::{Conflict, merge_map, refuse};
-        let (Some(current), Some(fork)) = (current, fork) else {
+        let (Some(current), Some(fork)) = (merged.as_ref(), fork) else {
             return Err(Conflict);
         };
         fn pick<'a, T: PartialEq>(
@@ -334,16 +334,15 @@ impl LuaTypeDecl {
                 })
                 .collect::<std::collections::BTreeMap<_, _>>()
         };
-        let locations = merge_map(
-            Some(&sites(current)),
+        let mut locations = Some(sites(current));
+        merge_map(
+            &mut locations,
             frozen.map(sites).as_ref(),
             Some(&sites(fork)),
             refuse,
-        )?
-        .ok_or(Conflict)?
-        .into_values()
-        .collect();
-        Ok(Some(Self {
+        )?;
+        let locations = locations.ok_or(Conflict)?.into_values().collect();
+        let decl = Self {
             simple_name: pick(
                 &current.simple_name,
                 frozen.map(|decl| &decl.simple_name),
@@ -353,7 +352,9 @@ impl LuaTypeDecl {
             locations,
             id: pick(&current.id, frozen.map(|decl| &decl.id), &fork.id)?.clone(),
             extra: pick(&current.extra, frozen.map(|decl| &decl.extra), &fork.extra)?.clone(),
-        }))
+        };
+        *merged = Some(decl);
+        Ok(())
     }
 
     pub fn merge_decl(&mut self, other: LuaTypeDecl) {

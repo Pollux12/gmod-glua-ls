@@ -1439,6 +1439,55 @@ impl DbIndex {
         conflicts
     }
 
+    /// Folds what the installs of a superstep kept apart while the frozen
+    /// index shared their storage back into it, once the frozen index and
+    /// the forks are gone.
+    pub(crate) fn flatten_installs(&mut self) {
+        macro_rules! flatten {
+            ($($domain:ident),*; $($field:ident),*) => {
+                $(if let Some(domain) = Arc::get_mut(&mut self.$domain) {
+                    cow_shards::TaskFork::flatten(domain);
+                })*
+                $(cow_shards::TaskFork::flatten(&mut self.$field);)*
+            };
+        }
+        flatten!(
+            decl_index,
+            references_index,
+            types_index,
+            modules_index,
+            members_index,
+            property_index,
+            signature_index,
+            diagnostic_index,
+            operator_index,
+            flow_index,
+            call_target_index,
+            accessor_func_index,
+            accessor_func_call_index,
+            call_site_param_index,
+            gmod_class_index,
+            gmod_infer_index,
+            gmod_load_index,
+            gmod_network_index,
+            dynamic_field_index,
+            file_dependencies_index,
+            numeric_range_population_index,
+            metatable_index,
+            global_index,
+            json_schema_index;
+            call_role_fingerprints,
+            role_mentions,
+            helper_scans,
+            helper_scan_files,
+            load_scans,
+            load_scan_files,
+            net_helpers,
+            net_helper_refs,
+            function_summaries
+        );
+    }
+
     /// Takes in what `fork`, a task fork of `frozen`, changed of the fields
     /// the index holds itself.
     fn install_task_fields(

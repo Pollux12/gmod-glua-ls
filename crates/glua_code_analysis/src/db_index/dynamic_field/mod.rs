@@ -128,6 +128,10 @@ pub struct DynamicFieldIndex {
 }
 
 /// One named slot's contribution to its owner's multiset fingerprint.
+/// An owner whose named fingerprint an install rebuilds, with the names it
+/// rebuilds and their slot fingerprints before the install.
+type OwnerSlotsToRebuild = (DynamicFieldOwner, Vec<(SmolStr, Fingerprint)>);
+
 fn named_entry(field_name: &str, slot: Fingerprint) -> Fingerprint {
     if slot == derivation::ABSENT {
         0
@@ -177,10 +181,10 @@ fn insert_definition(into: &mut Vec<InFiled<TextRange>>, definition: InFiled<Tex
 /// Merges two tasks' changes to one list of definition sites, which stays in
 /// canonical order.
 fn merge_definitions(
-    current: Option<&Vec<InFiled<TextRange>>>,
+    current: &mut Option<Vec<InFiled<TextRange>>>,
     frozen: Option<&Vec<InFiled<TextRange>>>,
     fork: Option<&Vec<InFiled<TextRange>>>,
-) -> crate::db_index::cow_shards::Merged<Vec<InFiled<TextRange>>> {
+) -> crate::db_index::cow_shards::Merged {
     crate::db_index::cow_shards::merge_sorted_by(current, frozen, fork, definition_sort_key)
 }
 
@@ -1116,17 +1120,76 @@ impl DynamicFieldIndex {
     }
 
     /// The owners whose named fingerprint both `self` and `fork`, a task fork
-    /// of `frozen`, changed: the merged slots rebuild it.
-    fn owners_to_rebuild(&self, frozen: &Self, fork: &Self) -> Vec<DynamicFieldOwner> {
-        self.owner_named_fingerprints.both_changed_keys(
-            &frozen.owner_named_fingerprints,
-            &fork.owner_named_fingerprints,
-        )
+    /// of `frozen`, changed, each with the names the fork changed and their
+    /// slot fingerprints in `self`: the merge changes only those slots.
+    fn owners_to_rebuild(&self, frozen: &Self, fork: &Self) -> Vec<OwnerSlotsToRebuild> {
+        fn changed_names<'a, V: PartialEq>(
+            frozen: Option<&'a HashMap<SmolStr, V>>,
+            fork: Option<&'a HashMap<SmolStr, V>>,
+            names: &mut HashSet<&'a SmolStr>,
+        ) {
+            let value = |map: Option<&'a HashMap<SmolStr, V>>, name: &SmolStr| {
+                map.and_then(|map| map.get(name))
+            };
+            for name in frozen.into_iter().chain(fork).flat_map(HashMap::keys) {
+                if value(frozen, name) != value(fork, name) {
+                    names.insert(name);
+                }
+            }
+        }
+        self.owner_named_fingerprints
+            .both_changed_keys(
+                &frozen.owner_named_fingerprints,
+                &fork.owner_named_fingerprints,
+            )
+            .into_iter()
+            .map(|owner| {
+                let mut names = HashSet::default();
+                changed_names(
+                    frozen.owner_fields.get(&owner),
+                    fork.owner_fields.get(&owner),
+                    &mut names,
+                );
+                changed_names(
+                    frozen.field_definitions.get(&owner),
+                    fork.field_definitions.get(&owner),
+                    &mut names,
+                );
+                changed_names(
+                    frozen.direct_field_definitions.get(&owner),
+                    fork.direct_field_definitions.get(&owner),
+                    &mut names,
+                );
+                let slots = names
+                    .into_iter()
+                    .map(|name| (name.clone(), self.named_slot_fingerprint(&owner, name)))
+                    .collect();
+                (owner, slots)
+            })
+            .collect()
     }
 
-    fn rebuild_owner_named(&mut self, owners: Vec<DynamicFieldOwner>) {
-        for owner in owners {
-            self.recompute_owner_named(&owner);
+    /// Folds the merged slots into each owner's fingerprint, in place of the
+    /// slots the index held before the merge.
+    fn rebuild_owner_named(&mut self, owners: Vec<OwnerSlotsToRebuild>) {
+        for (owner, slots) in owners {
+            let digest = slots.iter().fold(
+                self.owner_named_fingerprints
+                    .get(&owner)
+                    .copied()
+                    .unwrap_or_default(),
+                |digest, (name, old_slot)| {
+                    let new_slot = self.named_slot_fingerprint(&owner, name);
+                    digest
+                        .wrapping_sub(named_entry(name, *old_slot))
+                        .wrapping_add(named_entry(name, new_slot))
+                },
+            );
+            if digest == 0 {
+                self.owner_named_fingerprints.remove(&owner);
+            } else {
+                self.owner_named_fingerprints.insert(owner, digest);
+            }
         }
     }
 

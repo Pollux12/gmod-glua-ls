@@ -1272,10 +1272,10 @@ fn super_entry_sort_key(entry: &InFiled<LuaSuperType>) -> (FileId, TextSize, Tex
 /// Merges two tasks' changes to one declaration's super edges, which stay in
 /// source order.
 fn merge_super_entries(
-    current: Option<&Vec<InFiled<LuaSuperType>>>,
+    current: &mut Option<Vec<InFiled<LuaSuperType>>>,
     frozen: Option<&Vec<InFiled<LuaSuperType>>>,
     fork: Option<&Vec<InFiled<LuaSuperType>>>,
-) -> crate::db_index::cow_shards::Merged<Vec<InFiled<LuaSuperType>>> {
+) -> crate::db_index::cow_shards::Merged {
     crate::db_index::cow_shards::merge_sorted_by(current, frozen, fork, super_entry_sort_key)
 }
 

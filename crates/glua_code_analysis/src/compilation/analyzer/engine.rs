@@ -1015,6 +1015,7 @@ impl Engine {
             }
         }
         drop(frozen);
+        db.flatten_installs();
         self.forget_view(db);
         let touched = self.superstep_touched.take().unwrap_or_default();
         db.reader_graph().uncheck_derived(&touched);
@@ -1232,6 +1233,7 @@ impl Engine {
             ));
         }
         drop(frozen);
+        db.flatten_installs();
         drop(installing);
         let filing = crate::profile::PhaseGuard::new("superstep: file records");
         let written = recordings

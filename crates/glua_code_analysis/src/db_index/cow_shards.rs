@@ -188,7 +188,9 @@ type Shard<K, V> = FxHashMap<K, V>;
 /// each shard in its own table order; callers that need a stable order sort.
 ///
 /// A fork records each shard it writes in `dirty`, so [`Self::install`] takes
-/// its writes back in time proportional to the shards it touched.
+/// its writes back in time proportional to the shards it touched. An install
+/// into a map whose slot table is shared keeps its shards in `dirty` too,
+/// until [`TaskFork::flatten`] folds them into the table.
 pub(crate) struct CowShards<K, V> {
     slots: Arc<[Option<Arc<Shard<K, V>>>]>,
     dirty: FxHashMap<u32, Arc<Shard<K, V>>>,
@@ -334,41 +336,55 @@ impl<K: ShardKey + Clone, V: Clone + PartialEq> CowShards<K, V> {
     }
 
     /// [`Self::install`], merging with `merge` each key both `self` and
-    /// `fork` changed; only a key `merge` refuses conflicts.
-    fn install_with(&mut self, frozen: &Self, fork: Self, merge: Option<Merge<V>>) -> bool {
+    /// `fork` changed; only a key `merge` refuses conflicts. The fork's
+    /// shards are taken, not copied.
+    fn install_with(&mut self, frozen: &Self, mut fork: Self, merge: Option<Merge<V>>) -> bool {
         let mut conflicted = false;
         for at in Self::forked_slots(frozen, &fork) {
             let was = frozen.held_shard(at);
-            let forked = fork.held_shard(at);
-            if same_shard(was, forked) {
+            if same_shard(was, fork.held_shard(at)) {
                 continue;
             }
+            let forked = fork.take_held_shard(at);
             if same_shard(was, self.held_shard(at)) {
-                let forked = forked.cloned();
-                if self.forked {
-                    self.dirty.insert(at as u32, forked.unwrap_or_default());
-                } else {
-                    self.slots_mut(at)[at] = forked;
-                }
+                self.place_shard(at, forked);
                 continue;
             }
-            let changes = changed_entries(was, forked)
-                .map(|(key, value)| (key.clone(), value.cloned()))
+            let was = was.map(|was| &**was);
+            let mut forked = forked.map(Arc::unwrap_or_clone).unwrap_or_default();
+            let changed = forked
+                .iter()
+                .filter(|(key, value)| was.and_then(|was| was.get(*key)) != Some(*value))
+                .map(|(key, _)| key.clone())
+                .chain(
+                    was.into_iter()
+                        .flat_map(|was| was.keys())
+                        .filter(|key| !forked.contains_key(*key))
+                        .cloned(),
+                )
                 .collect::<Vec<_>>();
-            let target = self.shard_mut(at);
-            for (key, value) in changes {
+            let target = self.install_shard_mut(at);
+            for key in changed {
                 let before = was.and_then(|was| was.get(&key));
+                let value = forked.remove(&key);
                 let now = target.get(&key);
-                let value = if now == before || now == value.as_ref() {
+                if now == value.as_ref() {
+                    continue;
+                }
+                let value = if now == before {
                     value
-                } else {
-                    match merge.map(|merge| merge(now, before, value.as_ref())) {
-                        Some(Ok(merged)) => merged,
-                        Some(Err(Conflict)) | None => {
+                } else if let Some(merge) = merge {
+                    let mut merged = target.remove(&key);
+                    match merge(&mut merged, before, value.as_ref()) {
+                        Ok(()) => merged,
+                        Err(Conflict) => {
                             conflicted = true;
                             value
                         }
                     }
+                } else {
+                    conflicted = true;
+                    value
                 };
                 match value {
                     Some(value) => target.insert(key, value),
@@ -377,6 +393,42 @@ impl<K: ShardKey + Clone, V: Clone + PartialEq> CowShards<K, V> {
             }
         }
         conflicted
+    }
+
+    /// Takes the shard at `at` out of a fork that is being installed.
+    fn take_held_shard(&mut self, at: usize) -> Option<Arc<Shard<K, V>>> {
+        self.dirty
+            .remove(&(at as u32))
+            .or_else(|| self.slots.get(at).cloned().flatten())
+    }
+
+    /// Whether writes go to `dirty`: a fork's always, and an installing
+    /// map's while its slot table is shared, so the table is not copied.
+    fn writes_apart(&self) -> bool {
+        self.forked || Arc::strong_count(&self.slots) > 1
+    }
+
+    /// Puts `shard` at `at` for an install.
+    fn place_shard(&mut self, at: usize, shard: Option<Arc<Shard<K, V>>>) {
+        if self.writes_apart() {
+            self.dirty.insert(at as u32, shard.unwrap_or_default());
+        } else {
+            self.dirty.remove(&(at as u32));
+            self.slots_mut(at)[at] = shard;
+        }
+    }
+
+    /// The shard at `at` for an install to write.
+    fn install_shard_mut(&mut self, at: usize) -> &mut Shard<K, V> {
+        if !self.writes_apart() {
+            return self.shard_mut(at);
+        }
+        let slots = &self.slots;
+        let shard = self
+            .dirty
+            .entry(at as u32)
+            .or_insert_with(|| slots.get(at).cloned().flatten().unwrap_or_default());
+        Arc::make_mut(shard)
     }
 }
 
@@ -434,7 +486,7 @@ fn changed_entries<'a, K: Eq + Hash, V: PartialEq>(
 
 impl<K: Clone, V: Clone> CowShards<K, V> {
     fn shard_mut(&mut self, at: usize) -> &mut Shard<K, V> {
-        if !self.forked {
+        if !self.forked && !self.dirty.contains_key(&(at as u32)) {
             return Arc::make_mut(self.slots_mut(at)[at].get_or_insert_with(Default::default));
         }
         let slots = &self.slots;
@@ -445,8 +497,20 @@ impl<K: Clone, V: Clone> CowShards<K, V> {
         Arc::make_mut(shard)
     }
 
+    /// Folds the shards an install kept in `dirty` into the slot table.
+    fn flatten_shards(&mut self) {
+        if self.forked || self.dirty.is_empty() {
+            return;
+        }
+        for (at, shard) in std::mem::take(&mut self.dirty) {
+            let at = at as usize;
+            self.slots_mut(at)[at] = (!shard.is_empty()).then_some(shard);
+        }
+    }
+
     /// Makes every non-empty shard writable and returns their slots in order.
     fn writable_shards(&mut self) -> Vec<&mut Shard<K, V>> {
+        self.flatten_shards();
         let populated: Vec<usize> = (0..self.end())
             .filter(|at| self.shard(*at).is_some_and(|shard| !shard.is_empty()))
             .collect();
@@ -704,6 +768,10 @@ impl<K: ShardKey + Clone> TaskFork for CowShardSet<K> {
     fn install_task(&mut self, frozen: &Self, fork: Self) -> bool {
         self.0.install_task(&frozen.0, fork.0)
     }
+
+    fn flatten(&mut self) {
+        self.0.flatten();
+    }
 }
 
 impl<'a, K> IntoIterator for &'a CowShardSet<K> {
@@ -800,6 +868,10 @@ pub(crate) trait TaskFork: Sized {
     /// two: the fork's value replaces it.
     #[must_use]
     fn install_task(&mut self, frozen: &Self, fork: Self) -> bool;
+
+    /// Folds what installs kept apart while storage was shared back into
+    /// it, once nothing else shares it.
+    fn flatten(&mut self) {}
 }
 
 impl<K: ShardKey + Clone, V: Clone + PartialEq> TaskFork for CowShards<K, V> {
@@ -808,11 +880,21 @@ impl<K: ShardKey + Clone, V: Clone + PartialEq> TaskFork for CowShards<K, V> {
     }
 
     fn wrote(&self, frozen: &Self) -> bool {
-        !self.dirty.is_empty() || !Arc::ptr_eq(&self.slots, &frozen.slots)
+        !Arc::ptr_eq(&self.slots, &frozen.slots)
+            || self.dirty.iter().any(|(at, shard)| {
+                !frozen
+                    .dirty
+                    .get(at)
+                    .is_some_and(|held| Arc::ptr_eq(held, shard))
+            })
     }
 
     fn install_task(&mut self, frozen: &Self, fork: Self) -> bool {
         self.install(frozen, fork)
+    }
+
+    fn flatten(&mut self) {
+        self.flatten_shards();
     }
 }
 
@@ -892,13 +974,14 @@ macro_rules! task_fork_scalars {
 task_fork_scalars!(u32, u64, usize, bool, crate::db_index::ModuleNodeId);
 
 /// How a field takes in a value that both the index and a task fork changed
-/// since the fork was taken: from the index's value, the value the fork found
-/// and the value it left, the value both changes leave, or [`Conflict`] when
-/// they do not compose. `None` is an absent entry, or a scalar's default.
-pub(crate) type Merge<V> = fn(Option<&V>, Option<&V>, Option<&V>) -> Merged<V>;
+/// since the fork was taken: it turns the index's value, in place, into the
+/// value both changes leave, from the value the fork found and the value it
+/// left, or reports [`Conflict`] when they do not compose, and the fork's
+/// value replaces it. `None` is an absent entry, or a scalar's default.
+pub(crate) type Merge<V> = fn(&mut Option<V>, Option<&V>, Option<&V>) -> Merged;
 
-/// A merged value, `None` when absent.
-pub(crate) type Merged<V> = Result<Option<V>, Conflict>;
+/// Whether a merge composed both changes.
+pub(crate) type Merged = Result<(), Conflict>;
 
 /// Two tasks changed a value in ways no merge composes.
 #[derive(Debug, PartialEq, Eq)]
@@ -934,8 +1017,9 @@ impl<T: Clone + Default + PartialEq> MergeFork for CowCell<T> {
             *self = fork;
             return false;
         }
-        match merge(Some(&**self), Some(&**frozen), Some(&*fork)) {
-            Ok(merged) => {
+        let mut merged = Some(std::mem::take(&mut **self));
+        match merge(&mut merged, Some(&**frozen), Some(&*fork)) {
+            Ok(()) => {
                 *self = merged.unwrap_or_default().into();
                 false
             }
@@ -960,8 +1044,9 @@ macro_rules! merge_fork_scalars {
                     *self = fork;
                     return false;
                 }
-                match merge(Some(&*self), Some(frozen), Some(&fork)) {
-                    Ok(merged) => {
+                let mut merged = Some(*self);
+                match merge(&mut merged, Some(frozen), Some(&fork)) {
+                    Ok(()) => {
                         *self = merged.unwrap_or_default();
                         false
                     }
@@ -981,13 +1066,21 @@ merge_fork_scalars!(u32, u64);
 /// terms from, so two tasks' changes add up: the index's value plus what the
 /// fork added since. Zero is absent.
 pub(crate) fn merge_sum<T: Summand>(
-    current: Option<&T>,
+    current: &mut Option<T>,
     frozen: Option<&T>,
     fork: Option<&T>,
-) -> Merged<T> {
+) -> Merged {
     let value = |value: Option<&T>| value.copied().unwrap_or_default();
-    let sum = value(current).add(value(fork).sub(value(frozen)));
-    Ok((sum != T::default()).then_some(sum))
+    let sum = value(current.as_ref()).add(value(fork).sub(value(frozen)));
+    *current = (sum != T::default()).then_some(sum);
+    Ok(())
+}
+
+/// Makes an emptied value absent, as its owners prune it.
+fn prune<T>(merged: &mut Option<T>, is_empty: impl Fn(&T) -> bool) {
+    if merged.as_ref().is_some_and(is_empty) {
+        *merged = None;
+    }
 }
 
 /// A value [`merge_sum`] adds up.
@@ -1016,12 +1109,12 @@ summands!(u32, u64, usize);
 /// index's elements, less those the fork dropped, plus those it added. An
 /// emptied set is absent, as its owners prune it.
 pub(crate) fn merge_set<S: SetOf>(
-    current: Option<&S>,
+    current: &mut Option<S>,
     frozen: Option<&S>,
     fork: Option<&S>,
-) -> Merged<S> {
-    let mut merged = current.cloned().unwrap_or_default();
+) -> Merged {
     let had = |set: Option<&S>, element: &S::Element| set.is_some_and(|set| set.has(element));
+    let merged = current.get_or_insert_with(S::default);
     for element in fork.into_iter().flat_map(SetOf::elements) {
         if !had(frozen, element) {
             merged.put(element.clone());
@@ -1032,7 +1125,8 @@ pub(crate) fn merge_set<S: SetOf>(
             merged.drop_element(element);
         }
     }
-    Ok((!merged.is_empty()).then_some(merged))
+    prune(current, S::is_empty);
+    Ok(())
 }
 
 /// A set [`merge_set`] merges element by element.
@@ -1100,67 +1194,69 @@ impl<T: Ord + Clone> SetOf for std::collections::BTreeSet<T> {
 /// appended in the fork's order. An emptied list is absent, as its owners
 /// prune it.
 pub(crate) fn merge_list<T: Clone + Eq + Hash>(
-    current: Option<&Vec<T>>,
+    current: &mut Option<Vec<T>>,
     frozen: Option<&Vec<T>>,
     fork: Option<&Vec<T>>,
-) -> Merged<Vec<T>> {
+) -> Merged {
     let frozen = frozen
         .into_iter()
         .flatten()
         .collect::<rustc_hash::FxHashSet<_>>();
     let fork = fork.map_or(&[][..], Vec::as_slice);
     let kept = fork.iter().collect::<rustc_hash::FxHashSet<_>>();
-    let mut merged = current.cloned().unwrap_or_default();
+    let merged = current.get_or_insert_with(Vec::new);
     merged.retain(|element| !frozen.contains(element) || kept.contains(element));
-    let mut present = merged.iter().cloned().collect::<rustc_hash::FxHashSet<_>>();
-    for element in fork {
-        if !frozen.contains(element) && present.insert(element.clone()) {
-            merged.push(element.clone());
-        }
-    }
-    Ok((!merged.is_empty()).then_some(merged))
+    let added = {
+        let mut present = merged.iter().collect::<rustc_hash::FxHashSet<_>>();
+        fork.iter()
+            .filter(|element| !frozen.contains(element) && present.insert(element))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    merged.extend(added);
+    prune(current, Vec::is_empty);
+    Ok(())
 }
 
 /// [`merge_list`] for a list its owners keep sorted by `key` without
 /// duplicates: the merged list is sorted the same way.
 pub(crate) fn merge_sorted_by<T: Clone + Eq + Hash, K: Ord>(
-    current: Option<&Vec<T>>,
+    current: &mut Option<Vec<T>>,
     frozen: Option<&Vec<T>>,
     fork: Option<&Vec<T>>,
     key: impl Fn(&T) -> K,
-) -> Merged<Vec<T>> {
-    let mut merged = merge_list(current, frozen, fork)?;
-    if let Some(merged) = &mut merged {
+) -> Merged {
+    merge_list(current, frozen, fork)?;
+    if let Some(merged) = current {
         merged.sort_by_key(key);
     }
-    Ok(merged)
+    Ok(())
 }
 
 /// No merge: for a value only one task of a superstep should change, so two
 /// tasks changing it apart conflict.
-pub(crate) fn refuse<V>(_: Option<&V>, _: Option<&V>, _: Option<&V>) -> Merged<V> {
+pub(crate) fn refuse<V>(_: &mut Option<V>, _: Option<&V>, _: Option<&V>) -> Merged {
     Err(Conflict)
 }
 
 /// The index's value, for a value the domain's `prepare … then …` hook
 /// rebuilds from the merged state after the install.
-pub(crate) fn rebuilt<V: Clone>(current: Option<&V>, _: Option<&V>, _: Option<&V>) -> Merged<V> {
-    Ok(current.cloned())
+pub(crate) fn rebuilt<V>(_: &mut Option<V>, _: Option<&V>, _: Option<&V>) -> Merged {
+    Ok(())
 }
 
 /// A map whose keys each task changes apart: the index's entries with each
 /// entry the fork changed taken in, merged by `inner` where the index changed
 /// it too. An emptied map is absent, as its owners prune it.
 pub(crate) fn merge_map<M: MapOf>(
-    current: Option<&M>,
+    current: &mut Option<M>,
     frozen: Option<&M>,
     fork: Option<&M>,
     inner: Merge<M::Value>,
-) -> Merged<M> {
+) -> Merged {
     fn entry<'a, M: MapOf>(map: Option<&'a M>, key: &M::Key) -> Option<&'a M::Value> {
         map.and_then(|map| map.entry_of(key))
     }
-    let mut merged = current.cloned().unwrap_or_default();
     let changed = fork
         .into_iter()
         .flat_map(MapOf::keys_of)
@@ -1170,23 +1266,29 @@ pub(crate) fn merge_map<M: MapOf>(
                 .into_iter()
                 .flat_map(MapOf::keys_of)
                 .filter(|key| entry(fork, key).is_none()),
-        )
-        .cloned()
-        .collect::<Vec<_>>();
+        );
+    let merged = current.get_or_insert_with(M::default);
     for key in changed {
-        let (before, value) = (entry(frozen, &key), entry(fork, &key));
-        let now = merged.entry_of(&key);
-        let value = if now == before || now == value {
-            value.cloned()
-        } else {
-            inner(now, before, value)?
-        };
-        match value {
-            Some(value) => merged.put_entry(key, value),
-            None => merged.drop_entry(&key),
+        let (before, value) = (entry(frozen, key), entry(fork, key));
+        let now = merged.entry_of(key);
+        if now == value {
+            continue;
+        }
+        if now == before {
+            match value {
+                Some(value) => merged.put_entry(key.clone(), value.clone()),
+                None => merged.drop_entry(key),
+            }
+            continue;
+        }
+        let mut slot = merged.take_entry(key);
+        inner(&mut slot, before, value)?;
+        if let Some(slot) = slot {
+            merged.put_entry(key.clone(), slot);
         }
     }
-    Ok((!merged.is_empty()).then_some(merged))
+    prune(current, M::is_empty);
+    Ok(())
 }
 
 /// A map [`merge_map`] merges key by key.
@@ -1196,6 +1298,7 @@ pub(crate) trait MapOf: Clone + Default {
     fn keys_of(&self) -> impl Iterator<Item = &Self::Key>;
     fn entry_of(&self, key: &Self::Key) -> Option<&Self::Value>;
     fn put_entry(&mut self, key: Self::Key, value: Self::Value);
+    fn take_entry(&mut self, key: &Self::Key) -> Option<Self::Value>;
     fn drop_entry(&mut self, key: &Self::Key);
     fn is_empty(&self) -> bool;
 }
@@ -1216,6 +1319,10 @@ impl<K: Eq + Hash + Clone, V: Clone + PartialEq, S: BuildHasher + Default + Clon
 
     fn put_entry(&mut self, key: K, value: V) {
         self.insert(key, value);
+    }
+
+    fn take_entry(&mut self, key: &K) -> Option<V> {
+        self.remove(key)
     }
 
     fn drop_entry(&mut self, key: &K) {
@@ -1241,6 +1348,10 @@ impl<K: Ord + Clone, V: Clone + PartialEq> MapOf for std::collections::BTreeMap<
 
     fn put_entry(&mut self, key: K, value: V) {
         self.insert(key, value);
+    }
+
+    fn take_entry(&mut self, key: &K) -> Option<V> {
+        self.remove(key)
     }
 
     fn drop_entry(&mut self, key: &K) {
@@ -1319,6 +1430,10 @@ macro_rules! task_fork_fields {
                 let mut conflicts = Vec::new();
                 self.install_task_reporting(frozen, fork, &mut conflicts);
                 !conflicts.is_empty()
+            }
+
+            fn flatten(&mut self) {
+                $($(#[$attr])* $crate::db_index::cow_shards::TaskFork::flatten(&mut self.$field);)*
             }
         }
 
@@ -1571,27 +1686,45 @@ mod tests {
         entries.iter().copied().collect()
     }
 
+    /// What `merge` makes of `current`, or its conflict.
+    fn merged<V: Clone>(
+        merge: Merge<V>,
+        current: Option<&V>,
+        frozen: Option<&V>,
+        fork: Option<&V>,
+    ) -> Result<Option<V>, Conflict> {
+        let mut value = current.cloned();
+        merge(&mut value, frozen, fork).map(|()| value)
+    }
+
     #[test]
     fn sums_take_in_both_tasks_changes() {
-        assert_eq!(merge_sum(Some(&15u64), Some(&10), Some(&13)), Ok(Some(18)));
+        assert_eq!(
+            merged(merge_sum, Some(&15u64), Some(&10), Some(&13)),
+            Ok(Some(18))
+        );
     }
 
     #[test]
     fn sums_that_cancel_out_are_absent() {
-        assert_eq!(merge_sum(Some(&7u64), Some(&10), Some(&3)), Ok(None));
+        assert_eq!(
+            merged(merge_sum, Some(&7u64), Some(&10), Some(&3)),
+            Ok(None)
+        );
     }
 
     #[test]
     fn sums_wrap_like_the_fingerprints_they_merge() {
         assert_eq!(
-            merge_sum(Some(&1u64), Some(&u64::MAX), Some(&0)),
+            merged(merge_sum, Some(&1u64), Some(&u64::MAX), Some(&0)),
             Ok(Some(2))
         );
     }
 
     #[test]
     fn sets_keep_the_index_additions_and_take_the_fork_removals_and_additions() {
-        let merged = merge_set(
+        let merged = merged(
+            merge_set,
             Some(&set(&[1, 2, 4])),
             Some(&set(&[1, 2])),
             Some(&set(&[2, 5])),
@@ -1602,7 +1735,12 @@ mod tests {
     #[test]
     fn sets_both_tasks_emptied_are_absent() {
         assert_eq!(
-            merge_set(Some(&set(&[2])), Some(&set(&[1, 2])), Some(&set(&[1]))),
+            merged(
+                merge_set,
+                Some(&set(&[2])),
+                Some(&set(&[1, 2])),
+                Some(&set(&[1]))
+            ),
             Ok(None)
         );
     }
@@ -1610,47 +1748,48 @@ mod tests {
     #[test]
     fn sets_both_tasks_created_are_their_union() {
         assert_eq!(
-            merge_set(Some(&set(&[1])), None, Some(&set(&[2]))),
+            merged(merge_set, Some(&set(&[1])), None, Some(&set(&[2]))),
             Ok(Some(set(&[1, 2])))
         );
     }
 
     #[test]
     fn maps_merge_a_key_both_tasks_changed_once() {
-        let merged = merge_map(
+        let merged = merged(
+            |current, frozen, fork| merge_map(current, frozen, fork, merge_sum),
             Some(&map(&[(1, 12), (2, 2)])),
             Some(&map(&[(1, 10), (2, 2)])),
             Some(&map(&[(1, 11), (2, 2), (3, 3)])),
-            merge_sum,
         );
         assert_eq!(merged, Ok(Some(map(&[(1, 13), (2, 2), (3, 3)]))));
     }
 
     #[test]
     fn maps_take_a_removal_only_the_fork_made() {
-        let merged = merge_map(
+        let merged = merged(
+            |current, frozen, fork| merge_map(current, frozen, fork, refuse),
             Some(&map(&[(1, 1), (2, 2), (4, 4)])),
             Some(&map(&[(1, 1), (2, 2)])),
             Some(&map(&[(1, 1)])),
-            refuse,
         );
         assert_eq!(merged, Ok(Some(map(&[(1, 1), (4, 4)]))));
     }
 
     #[test]
     fn maps_conflict_where_their_values_conflict() {
-        let merged = merge_map(
+        let merged = merged(
+            |current, frozen, fork| merge_map(current, frozen, fork, refuse),
             Some(&map(&[(1, 2)])),
             Some(&map(&[(1, 1)])),
             Some(&map(&[(1, 3)])),
-            refuse,
         );
         assert_eq!(merged, Err(Conflict));
     }
 
     #[test]
     fn lists_keep_the_index_order_and_append_the_fork_additions() {
-        let merged = merge_list(
+        let merged = merged(
+            merge_list,
             Some(&vec![3, 1, 7]),
             Some(&vec![3, 1]),
             Some(&vec![9, 3, 8]),
@@ -1660,7 +1799,14 @@ mod tests {
 
     #[test]
     fn sorted_lists_stay_sorted() {
-        let merged = merge_sorted_by(Some(&vec![1, 5]), Some(&vec![1]), Some(&vec![1, 3]), |e| *e);
+        let merged = merged(
+            |current, frozen, fork| {
+                merge_sorted_by(current, frozen, fork, |element: &u32| *element)
+            },
+            Some(&vec![1, 5]),
+            Some(&vec![1]),
+            Some(&vec![1, 3]),
+        );
         assert_eq!(merged, Ok(Some(vec![1, 3, 5])));
     }
 
@@ -1677,6 +1823,32 @@ mod tests {
         assert!(!base.install_merging(&frozen, first, merge_sum));
         assert!(!base.install_merging(&frozen, second, merge_sum));
         assert_eq!(base.get(&path_key("a")), Some(&15));
+    }
+
+    #[test]
+    fn an_install_into_a_shared_table_reads_back_takes_writes_and_flattens() {
+        let mut base: CowShards<LuaTypeOwner, u32> = CowShards::default();
+        base.insert(owner(1, 0), 10);
+        let frozen = base.fork();
+        let mut fork = frozen.fork();
+        fork.insert(owner(2, 0), 20);
+
+        assert!(!base.install(&frozen, fork));
+        *base.get_mut(&owner(2, 0)).unwrap() += 1;
+        base.insert(owner(1, 5), 15);
+        drop(frozen);
+        base.flatten_shards();
+        assert_eq!(
+            (base.dirty.is_empty(), sorted(&base)),
+            (
+                true,
+                rendered(vec![
+                    (owner(1, 0), 10),
+                    (owner(1, 5), 15),
+                    (owner(2, 0), 21)
+                ])
+            )
+        );
     }
 
     #[test]

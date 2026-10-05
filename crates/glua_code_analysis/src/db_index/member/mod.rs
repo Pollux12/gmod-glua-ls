@@ -53,10 +53,10 @@ fn push_owner_key_id_unique(
 /// Merges two tasks' changes to one owner-key slot, which stays sorted by
 /// [`member_id_sort_key`].
 fn merge_member_ids(
-    current: Option<&Vec<LuaMemberId>>,
+    current: &mut Option<Vec<LuaMemberId>>,
     frozen: Option<&Vec<LuaMemberId>>,
     fork: Option<&Vec<LuaMemberId>>,
-) -> crate::db_index::cow_shards::Merged<Vec<LuaMemberId>> {
+) -> crate::db_index::cow_shards::Merged {
     crate::db_index::cow_shards::merge_sorted_by(current, frozen, fork, |id| {
         member_id_sort_key(*id)
     })
