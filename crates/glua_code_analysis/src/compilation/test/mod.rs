@@ -52,5 +52,6 @@ mod syntax_error_test;
 mod tuple_test;
 mod type_check_test;
 mod unguarded_child_inference_test;
+mod union_member_memo_test;
 mod unpack_test;
 mod workspace_fold_shift_test;

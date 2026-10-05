@@ -12,8 +12,9 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::{
-    CacheEntry, FileId, GenericTpl, GlobalId, InFiled, InferGuardRef, LuaAliasCallKind, LuaDeclId,
-    LuaInferCache, LuaInstanceType, LuaMemberOwner, LuaOperatorOwner, TypeOps,
+    CacheEntry, CallerSite, FileId, GenericTpl, GlobalId, GmodRealm, InFiled, InferGuardRef,
+    LuaAliasCallKind, LuaDeclId, LuaInferCache, LuaInstanceType, LuaMemberOwner, LuaOperatorOwner,
+    TypeOps,
     compilation::{
         analyzer::{
             dominating_guarded_table_bootstrap_range, for_range_pairs_source_for_var,
@@ -24,7 +25,7 @@ use crate::{
     db_index::{
         DbIndex, LuaGenericType, LuaIntersectionType, LuaMember, LuaMemberIndexItem, LuaMemberKey,
         LuaMergedTableType, LuaObjectType, LuaOperatorMetaMethod, LuaTupleType, LuaType,
-        LuaTypeDeclId, LuaUnionType,
+        LuaTypeDeclId, LuaUnionType, derivation,
     },
     enum_variable_is_param, get_keyof_members, get_tpl_ref_extend_type,
     semantic::{
@@ -42,6 +43,7 @@ use crate::{
             },
         },
         is_doc_tag_table_const,
+        member::MemberReadSite,
         member::cached_local_class_table_member_ids,
         member::find_members_with_key,
         member::get_buildin_type_map_type_id,
@@ -775,6 +777,90 @@ fn infer_member_by_member_key_with_table_guard(
     }
 }
 
+/// The table's own member for `key` visible at `site`, resolved. `None` when
+/// no writer is visible.
+fn exact_member_type(
+    db: &DbIndex,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+    caller_file_id: FileId,
+    site: &CallerSite,
+    source_min_position: Option<&InFiled<TextSize>>,
+) -> Option<InferResult> {
+    let item = db.get_member_index().get_member_item(owner, key)?;
+    let mut member_ids = item.visible_member_ids_at_site(db, site);
+    if let Some(source_min_position) = source_min_position {
+        // Definition sites share a global-path bucket; a fresh table cannot
+        // inherit members written to an earlier same-file table generation.
+        member_ids.retain(|member_id| {
+            source_survives_table_generation_cutoff(
+                db,
+                member_id.file_id,
+                member_id.get_position(),
+                source_min_position,
+            )
+        });
+    }
+    if matches!(key, LuaMemberKey::ExprType(_))
+        && !member_ids
+            .iter()
+            .any(|member_id| member_id.file_id == caller_file_id)
+    {
+        return None;
+    }
+    let item = match member_ids.as_slice() {
+        [] => return None,
+        [member_id] => LuaMemberIndexItem::One(*member_id),
+        _ => LuaMemberIndexItem::Many(member_ids),
+    };
+    Some(item.resolve_type(db))
+}
+
+type ExactMemberMemoKey = (
+    InFiled<TextRange>,
+    LuaMemberKey,
+    FileId,
+    Option<InFiled<TextSize>>,
+);
+
+fn exact_member_memo_get(
+    cache: &mut LuaInferCache,
+    key: &ExactMemberMemoKey,
+    realm: GmodRealm,
+    position: TextSize,
+) -> Option<LuaType> {
+    let mut full_key = (key.clone(), MemberReadSite::Realm(realm));
+    if let Some(cached) = cache.tracked_get(|c| &mut c.exact_table_member_cache, &full_key) {
+        return Some(cached);
+    }
+    full_key.1 = MemberReadSite::At(position);
+    cache.tracked_get(|c| &mut c.exact_table_member_cache, &full_key)
+}
+
+/// Stores a read that never took the offset for the whole realm, any other
+/// for its offset alone.
+fn exact_member_memo_insert(
+    cache: &mut LuaInferCache,
+    key: ExactMemberMemoKey,
+    site: &CallerSite,
+    realm: GmodRealm,
+    position: TextSize,
+    member_type: LuaType,
+    frame: Option<derivation::OpenFrame>,
+) {
+    let shared = if site.position_read() {
+        MemberReadSite::At(position)
+    } else {
+        MemberReadSite::Realm(realm)
+    };
+    cache.tracked_insert(
+        |c| &mut c.exact_table_member_cache,
+        (key, shared),
+        member_type,
+        frame,
+    );
+}
+
 fn infer_table_member(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -856,41 +942,55 @@ fn infer_table_member_owner(
     // bypass them. Only a same-file write states the value at this branch --
     // which is all this lookup could ever find before one owner per global
     // path brought every file's writes into one bucket.
-    let exact_item = member_index.get_member_item(&owner, &key).and_then(|item| {
-        let mut member_ids = item.visible_member_ids_with_realm_at_offset(
-            db,
-            &cache.get_file_id(),
-            index_expr.get_position(),
-        );
-        if let Some(source_min_position) = &source_min_position {
-            // Definition sites share a global-path bucket; a fresh table cannot
-            // inherit members written to an earlier same-file table generation.
-            member_ids.retain(|member_id| {
-                source_survives_table_generation_cutoff(
-                    db,
-                    member_id.file_id,
-                    member_id.get_position(),
-                    source_min_position,
-                )
-            });
+    let access_position = index_expr.get_position();
+    let site = CallerSite::new(cache.get_file_id(), access_position);
+    let site_realm = site.realm(db);
+    let memo_key = (
+        inst.clone(),
+        key.clone(),
+        cache.get_file_id(),
+        source_min_position.clone(),
+    );
+    let literal_key = !matches!(key, LuaMemberKey::ExprType(_));
+    if literal_key
+        && let Some(member_type) =
+            exact_member_memo_get(cache, &memo_key, site_realm, access_position)
+    {
+        return Ok(member_type);
+    }
+    let frame = derivation::open_frame();
+    let exact_type = exact_member_type(
+        db,
+        &owner,
+        &key,
+        cache.get_file_id(),
+        &site,
+        source_min_position.as_ref(),
+    );
+    if let Some(exact_type) = exact_type {
+        let member_type = match exact_type {
+            Ok(member_type) => member_type,
+            Err(reason) => {
+                cache.close_frame(frame);
+                return Err(reason);
+            }
+        };
+        let finite_named_dynamic = is_literal_table_field_access(&index_key)
+            && owner_has_finite_named_dynamic_assignment(db, &owner);
+        if literal_key && !finite_named_dynamic && !type_is_uninformative(&member_type) {
+            exact_member_memo_insert(
+                cache,
+                memo_key,
+                &site,
+                site_realm,
+                access_position,
+                member_type.clone(),
+                frame,
+            );
+            return Ok(member_type);
         }
-        if matches!(key, LuaMemberKey::ExprType(_))
-            && !member_ids
-                .iter()
-                .any(|member_id| member_id.file_id == cache.get_file_id())
-        {
-            return None;
-        }
-        match member_ids.as_slice() {
-            [] => None,
-            [member_id] => Some(LuaMemberIndexItem::One(*member_id)),
-            _ => Some(LuaMemberIndexItem::Many(member_ids)),
-        }
-    });
-    if let Some(member_item) = exact_item {
-        let member_type = member_item.resolve_type(db)?;
-        if is_literal_table_field_access(&index_key)
-            && owner_has_finite_named_dynamic_assignment(db, &owner)
+        cache.close_frame(frame);
+        if finite_named_dynamic
             && let Some(dynamic_field) = resolve_dynamic_field_member(
                 db,
                 cache,
@@ -922,6 +1022,7 @@ fn infer_table_member_owner(
 
         return Ok(member_type);
     }
+    cache.close_frame(frame);
 
     // Dynamic numeric index (e.g. `t[i]` where `i` is an `integer`) on a shaped
     // sequential literal: no exact `[n]` member matches, so fall back to the

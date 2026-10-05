@@ -288,6 +288,20 @@ pub struct LuaInferCache {
         (LuaType, LuaMemberKey, Option<TextSize>),
         Option<(LuaType, Option<LuaSemanticDeclId>)>,
     >,
+    /// A table literal's own informative answer for a literal key, by where
+    /// in the caller file it holds. Union reads repeat it for every arm.
+    pub exact_table_member_cache: TrackedMap<
+        (
+            (
+                InFiled<TextRange>,
+                LuaMemberKey,
+                FileId,
+                Option<InFiled<rowan::TextSize>>,
+            ),
+            crate::semantic::member::MemberReadSite,
+        ),
+        LuaType,
+    >,
     /// Memo for `infer_owner_raw_member_type_with_realm`, keyed by owner, key,
     /// caller file, where in the file the answer holds and table-generation
     /// cutoff. The union fold over writers is identical for every read of the
@@ -390,6 +404,7 @@ impl LuaInferCache {
             in_place_ipairs_transform_cache: Default::default(),
             dynamic_field_scope_metatable_cache: Default::default(),
             dynamic_field_resolution_cache: Default::default(),
+            exact_table_member_cache: Default::default(),
             owner_raw_member_type_cache: Default::default(),
             local_class_table_member_ids_cache: Default::default(),
             dynamic_field_type_cache: Default::default(),
@@ -759,6 +774,7 @@ impl LuaInferCache {
         self.call_returns_never_cache.clear_local();
         self.local_class_table_member_ids_cache.clear_local();
         self.dynamic_field_resolution_cache.clear_local();
+        self.exact_table_member_cache.clear_local();
         self.flow_node_realm_cache.clear_local();
         self.numeric_table_index_query_cache.clear_local();
         self.branch_special_call_effect_cache.clear_local();
@@ -849,6 +865,7 @@ impl LuaInferCache {
         // right-hand side, which a resolved signature return can change.
         self.in_place_ipairs_transform_cache.clear();
         self.dynamic_field_resolution_cache.clear();
+        self.exact_table_member_cache.clear();
         self.dynamic_field_type_cache.clear();
     }
 
@@ -893,6 +910,7 @@ impl LuaInferCache {
         self.in_place_ipairs_transform_cache.clear();
         self.dynamic_field_scope_metatable_cache.clear();
         self.dynamic_field_resolution_cache.clear();
+        self.exact_table_member_cache.clear();
         self.dynamic_field_type_cache.clear();
         self.dynamic_field_definition_syntax_cache.clear();
         self.dynamic_field_resolving.clear();
