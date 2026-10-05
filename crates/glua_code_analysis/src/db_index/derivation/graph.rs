@@ -386,6 +386,17 @@ pub(super) enum Freshness {
     Written,
 }
 
+impl Freshness {
+    /// What two sets of reads say together.
+    pub(super) fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Written, _) | (_, Self::Written) => Self::Written,
+            (Self::Recomputing, _) | (_, Self::Recomputing) => Self::Recomputing,
+            _ => Self::Unwritten,
+        }
+    }
+}
+
 /// The keys read out of one base key, and the base's fingerprint when their
 /// readers were last checked ([`UNCHECKED`]: never).
 #[derive(Debug)]

@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use super::super::graph::Freshness;
 use super::super::{
     self as derivation, DerivationId, Evaluation, FactKey, Fingerprint, HashedKey, KeyIdx,
     KeyTable, Provenance, ReaderGraph,
@@ -82,6 +83,16 @@ pub(in super::super) struct WorkerContext {
     replayed: FxHashMap<usize, (Provenance, u64)>,
     replay_counts: ReplayCounts,
     requires_canonical: Arc<AtomicBool>,
+    /// Under a [`TaskRecorder`], the evaluations the task ended.
+    task: Option<TaskLogs>,
+}
+
+/// The evaluations a task ended, each with whether it read a query the
+/// snapshot had no answer for, and each found by its log's handle.
+#[derive(Default)]
+struct TaskLogs {
+    evaluations: Vec<(Evaluation, bool)>,
+    by_log: FxHashMap<usize, usize>,
 }
 
 impl WorkerContext {
@@ -163,6 +174,59 @@ impl WorkerContext {
         })
     }
 
+    /// Marks `key` written at `now` by an evaluation that began at `since`;
+    /// whether it logged the key.
+    pub(in super::super) fn note_write(&mut self, key: &HashedKey, since: u64, now: u64) -> bool {
+        self.keys
+            .mark_written_logged(key, since, now, &self.snapshot.graph)
+    }
+
+    pub(in super::super) fn note_written(&mut self, keys: impl IntoIterator<Item = HashedKey>) {
+        let now = derivation::next_stamp();
+        for key in keys {
+            self.keys.mark_written(&key, now, &self.snapshot.graph);
+        }
+    }
+
+    pub(in super::super) fn open_windows(&mut self, keys: impl IntoIterator<Item = HashedKey>) {
+        let now = derivation::next_stamp();
+        for key in keys {
+            self.keys.open_window(&key, now, &self.snapshot.graph);
+        }
+    }
+
+    pub(in super::super) fn close_windows(&mut self, unchanged: impl Fn(&HashedKey) -> bool) {
+        self.keys.close_windows(&self.snapshot.graph, unchanged);
+    }
+
+    /// Whether `key` is being computed again, here or in the snapshot.
+    pub(in super::super) fn windowed(&self, key: &HashedKey) -> bool {
+        self.keys.windowed(key, &self.snapshot.graph)
+            || self
+                .graph()
+                .find_slot(key)
+                .is_some_and(|slot| self.graph().keys().windowed(slot))
+    }
+
+    /// Whether any of the entries `locals` was written here after `since`.
+    pub(in super::super) fn local_freshness(&self, locals: &[u32], since: u64) -> Freshness {
+        self.keys.freshness(locals, since, &self.snapshot.graph)
+    }
+
+    /// Whether any of the snapshot's `slots` was written here after `since`.
+    pub(in super::super) fn snapshot_freshness(&self, slots: &[KeyIdx], since: u64) -> Freshness {
+        self.keys
+            .snapshot_freshness(slots, since, &self.snapshot.graph)
+    }
+
+    /// The log, in entries, of the ended evaluation of this task `log` is the
+    /// handle of.
+    pub(in super::super) fn task_log(&self, log: usize) -> Option<&[u32]> {
+        let task = self.task.as_ref()?;
+        let at = *task.by_log.get(&log)?;
+        Some(&task.evaluations[at].0.log)
+    }
+
     pub(in super::super) fn observe_ready(&mut self, local: u32) {
         if self.keys.is_query(local) {
             let key = self.key(local);
@@ -240,13 +304,6 @@ pub(in super::super) fn with_keys<T>(f: impl FnOnce(&mut WorkerContext) -> T) ->
         return None;
     }
     WORKER.with(|worker| worker.borrow_mut().as_mut().map(f))
-}
-
-pub(in super::super) fn with_snapshot<T>(f: impl FnOnce(&ReaderGraph) -> T) -> Option<T> {
-    if RECORDING_SCOPES.load(Ordering::Relaxed) == 0 {
-        return None;
-    }
-    WORKER.with(|worker| worker.borrow().as_ref().map(|worker| f(worker.graph())))
 }
 
 pub(in super::super) fn active() -> bool {
@@ -510,6 +567,7 @@ pub(crate) fn compute_recorded<T>(
             replayed: FxHashMap::default(),
             replay_counts: ReplayCounts::default(),
             requires_canonical,
+            task: None,
         })
     });
     derivation::begin(id);
@@ -541,6 +599,159 @@ pub(crate) fn compute_recorded<T>(
     drop(query_scope);
     drop(saved);
     WorkerResult { evaluation, value }
+}
+
+/// Records the evaluations of one superstep task against a snapshot of the
+/// reader graph: reads and writes go to the task's own entries, a memo one
+/// evaluation of the task made holds for a later one while what it read was
+/// not written since, and nothing touches the snapshot until the barrier
+/// files the task's evaluations with [`TaskRecording::canonicalise`].
+pub(crate) struct TaskRecorder {
+    query_scope: Option<QueryScope>,
+    saved: Option<SavedRecording>,
+    started: u64,
+    /// A stamp the task took inside the snapshot's release epoch.
+    stamp: u64,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "superstep tasks record through it")
+)]
+impl TaskRecorder {
+    pub(crate) fn start(snapshot: &RecordingSnapshot) -> Self {
+        let saved = SavedRecording::worker();
+        let requires_canonical = Arc::new(AtomicBool::new(false));
+        let query_scope = QueryScope(QUERY_VIEW.with(|view| {
+            view.replace(Some(QueryView {
+                snapshot: Arc::clone(&snapshot.0),
+                requires_canonical: Arc::clone(&requires_canonical),
+            }))
+        }));
+        RECORDING_SCOPES.fetch_add(1, Ordering::Relaxed);
+        WORKER.with(|worker| {
+            *worker.borrow_mut() = Some(WorkerContext {
+                snapshot: Arc::clone(&snapshot.0),
+                keys: WorkerKeys::default(),
+                queries: FxHashMap::default(),
+                replayed: FxHashMap::default(),
+                replay_counts: ReplayCounts::default(),
+                requires_canonical,
+                task: Some(TaskLogs::default()),
+            })
+        });
+        Self {
+            query_scope: Some(query_scope),
+            saved: Some(saved),
+            started: snapshot.0.started,
+            stamp: derivation::new_stamp(),
+        }
+    }
+
+    /// Starts recording the evaluation of `id`.
+    pub(crate) fn begin(&self, id: DerivationId) {
+        with_keys(|worker| worker.requires_canonical.store(false, Ordering::Relaxed));
+        derivation::begin(id);
+    }
+
+    /// Ends the evaluation [`Self::begin`] started and keeps it with the
+    /// task's; returns its index among them.
+    pub(crate) fn end(&self) -> usize {
+        let evaluation = derivation::end_unfrozen();
+        assert!(evaluation.stamp > self.started);
+        with_keys(|worker| {
+            let requires_canonical = worker.requires_canonical.load(Ordering::Relaxed);
+            let task = worker.task.as_mut().expect("a task records into its logs");
+            let at = task.evaluations.len();
+            task.by_log
+                .insert(Arc::as_ptr(&evaluation.log_handle) as usize, at);
+            task.evaluations.push((evaluation, requires_canonical));
+            at
+        })
+        .expect("the task recorder is installed")
+    }
+
+    /// Runs `f` on the evaluation the task ended at `at` and whether it read
+    /// a query the snapshot had no answer for.
+    pub(crate) fn with_ended<T>(&self, at: usize, f: impl FnOnce(&Evaluation, bool) -> T) -> T {
+        with_keys(|worker| {
+            let (evaluation, requires_canonical) = &worker
+                .task
+                .as_ref()
+                .expect("a task records into its logs")
+                .evaluations[at];
+            f(evaluation, *requires_canonical)
+        })
+        .expect("the task recorder is installed")
+    }
+
+    /// Stops recording and hands back what the task recorded.
+    pub(crate) fn finish(mut self) -> TaskRecording {
+        let worker = WORKER
+            .with(|worker| worker.borrow_mut().take())
+            .expect("the task recorder is installed");
+        if crate::profile::profiling() {
+            worker.replay_counts.publish();
+        }
+        let task = worker.task.expect("a task records into its logs");
+        let written = worker
+            .keys
+            .written_keys(&worker.snapshot.graph)
+            .cloned()
+            .collect();
+        self.query_scope.take();
+        self.saved.take();
+        TaskRecording {
+            keys: worker.keys,
+            evaluations: task.evaluations,
+            written,
+            stamp: self.stamp,
+        }
+    }
+}
+
+impl Drop for TaskRecorder {
+    fn drop(&mut self) {
+        if self.saved.is_some() {
+            WORKER.with(|worker| worker.borrow_mut().take());
+        }
+    }
+}
+
+/// What a task recorded: its evaluations, in the order they ended, with the
+/// entries their logs name, and every key it wrote.
+pub(crate) struct TaskRecording {
+    keys: WorkerKeys,
+    evaluations: Vec<(Evaluation, bool)>,
+    written: Vec<HashedKey>,
+    stamp: u64,
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "superstep barriers file it"))]
+impl TaskRecording {
+    /// Every key the task wrote, each once.
+    pub(crate) fn written(&self) -> &[HashedKey] {
+        &self.written
+    }
+
+    /// The task's evaluations with their reads as slots of `table`, the keys
+    /// new to it interned in the order the task first read them, and their
+    /// logs frozen for the memos that point into them; each with whether it
+    /// read a query the snapshot had no answer for. `None` when a slot the
+    /// task read was released since.
+    pub(crate) fn canonicalise(self, table: &mut KeyTable) -> Option<Vec<(Evaluation, bool)>> {
+        let slots = self.keys.canonical_slots(table, self.stamp)?;
+        Some(
+            self.evaluations
+                .into_iter()
+                .map(|(mut evaluation, requires_canonical)| {
+                    super::remap(&mut evaluation, &slots);
+                    evaluation.log_handle.freeze(&evaluation.log);
+                    (evaluation, requires_canonical)
+                })
+                .collect(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -581,6 +792,155 @@ mod tests {
         derivation::end();
         graph.restore_keys(derivation::take_keys());
         (graph, proof)
+    }
+
+    /// The memo of reading `key` in a frame.
+    fn memo_of(key: &HashedKey) -> Provenance {
+        let frame = derivation::open_frame().unwrap();
+        derivation::note_read(|| key.key().clone());
+        derivation::close_frame(frame, 0).unwrap()
+    }
+
+    fn write(key: &HashedKey) {
+        derivation::note_write(|| key.key().clone());
+    }
+
+    /// Runs `f` as one evaluation of the task `recorder` records.
+    fn evaluate<T>(recorder: &TaskRecorder, f: impl FnOnce() -> T) -> (T, usize) {
+        recorder.begin(id());
+        let value = f();
+        (value, recorder.end())
+    }
+
+    #[test]
+    fn a_task_reuses_the_memo_an_earlier_evaluation_of_it_made_and_files_it_canonically() {
+        let mut graph = ReaderGraph::default();
+        graph.intern_read(key(99));
+        let (snapshot, guard) = snapshot(graph);
+        let recorder = TaskRecorder::start(&snapshot);
+        let (proof, _) = evaluate(&recorder, || memo_of(&key(1)));
+        let (_, second) = evaluate(&recorder, || {
+            let frame = derivation::open_frame().unwrap();
+            assert_eq!(derivation::reuse(&proof, 0, &[], None), Reuse::Held);
+            derivation::close_frame(frame, 0).unwrap();
+        });
+        recorder.with_ended(second, |evaluation, requires_canonical| {
+            assert_eq!(evaluation.log, vec![0]);
+            assert!(!requires_canonical);
+        });
+        let recording = recorder.finish();
+        assert!(recording.written().is_empty());
+        let mut graph = recover(snapshot);
+        let mut table = graph.lend_keys();
+        let evaluations = recording.canonicalise(&mut table).unwrap();
+        let slot = table.find(&key(1)).unwrap();
+        assert!(
+            evaluations
+                .iter()
+                .all(|(evaluation, _)| evaluation.log == vec![slot])
+        );
+        derivation::lend_keys(table);
+        derivation::begin(id());
+        assert_eq!(derivation::reuse(&proof, 0, &[], None), Reuse::Held);
+        assert_eq!(derivation::end().into_recorded().1, vec![slot]);
+        let mut table = derivation::take_keys();
+        guard.finish(&mut table);
+        graph.restore_keys(table);
+    }
+
+    #[test]
+    fn a_task_memo_goes_stale_when_a_later_evaluation_writes_what_it_read() {
+        let (snapshot, guard) = snapshot(ReaderGraph::default());
+        let recorder = TaskRecorder::start(&snapshot);
+        let (read_one, _) = evaluate(&recorder, || memo_of(&key(1)));
+        let (read_two, _) = evaluate(&recorder, || memo_of(&key(2)));
+        evaluate(&recorder, || write(&key(1)));
+        evaluate(&recorder, || {
+            assert_eq!(derivation::reuse(&read_one, 0, &[], None), Reuse::Stale);
+            assert_eq!(derivation::reuse(&read_two, 0, &[], None), Reuse::Held);
+        });
+        let recording = recorder.finish();
+        assert_eq!(recording.written(), &[key(1)]);
+        let mut graph = recover(snapshot);
+        let mut table = graph.lend_keys();
+        guard.finish(&mut table);
+        graph.restore_keys(table);
+    }
+
+    #[test]
+    fn a_task_write_makes_a_memo_from_before_the_task_stale_through_its_base() {
+        let child = HashedKey::new(FactKey::GmodRealmAt(FileId::new(1), TextSize::new(5)));
+        let mut graph = ReaderGraph::default();
+        derivation::lend_keys(graph.lend_keys());
+        derivation::begin(id());
+        let read_child = memo_of(&child);
+        let read_other = memo_of(&key(2));
+        derivation::end();
+        graph.restore_keys(derivation::take_keys());
+        let (snapshot, guard) = snapshot(graph);
+        let recorder = TaskRecorder::start(&snapshot);
+        evaluate(&recorder, || {
+            assert_eq!(derivation::reuse(&read_child, 0, &[], None), Reuse::Held);
+        });
+        evaluate(&recorder, || write(&key(1)));
+        evaluate(&recorder, || {
+            assert_eq!(derivation::reuse(&read_child, 0, &[], None), Reuse::Stale);
+            assert_eq!(derivation::reuse(&read_other, 0, &[], None), Reuse::Held);
+        });
+        drop(recorder.finish());
+        let mut graph = recover(snapshot);
+        let mut table = graph.lend_keys();
+        guard.finish(&mut table);
+        graph.restore_keys(table);
+    }
+
+    #[test]
+    fn a_task_memo_holds_again_when_what_it_read_is_computed_back_unchanged() {
+        for unchanged in [true, false] {
+            let (snapshot, guard) = snapshot(ReaderGraph::default());
+            let recorder = TaskRecorder::start(&snapshot);
+            let (proof, _) = evaluate(&recorder, || memo_of(&key(1)));
+            derivation::note_recomputing([key(1)]);
+            evaluate(&recorder, || {
+                assert!(derivation::recomputes(key(1).key().clone()));
+                write(&key(1));
+            });
+            derivation::note_recomputed(|_| unchanged);
+            evaluate(&recorder, || {
+                assert!(!derivation::recomputes(key(1).key().clone()));
+                let expected = if unchanged { Reuse::Held } else { Reuse::Stale };
+                assert_eq!(derivation::reuse(&proof, 0, &[], None), expected);
+            });
+            drop(recorder.finish());
+            let mut graph = recover(snapshot);
+            let mut table = graph.lend_keys();
+            guard.finish(&mut table);
+            graph.restore_keys(table);
+        }
+    }
+
+    #[test]
+    fn a_task_write_moves_the_write_generation_only_when_the_evaluation_read_it() {
+        let mut graph = ReaderGraph::default();
+        graph.intern_read(key(3));
+        let (snapshot, guard) = snapshot(graph);
+        let recorder = TaskRecorder::start(&snapshot);
+        evaluate(&recorder, || derivation::note_read(|| key(2).key().clone()));
+        evaluate(&recorder, || {
+            derivation::note_read(|| key(1).key().clone());
+            let before = derivation::write_generation();
+            write(&key(2));
+            write(&key(3));
+            write(&key(4));
+            assert_eq!(derivation::write_generation(), before);
+            write(&key(1));
+            assert_eq!(derivation::write_generation(), before + 1);
+        });
+        drop(recorder.finish());
+        let mut graph = recover(snapshot);
+        let mut table = graph.lend_keys();
+        guard.finish(&mut table);
+        graph.restore_keys(table);
     }
 
     #[test]

@@ -831,6 +831,14 @@ fn reuse_worker(
                 {
                     return Reuse::Elsewhere;
                 }
+                match worker.local_freshness(&evaluation.log[range.clone()], provenance.0.since) {
+                    Freshness::Unwritten => {}
+                    Freshness::Recomputing => return Reuse::Elsewhere,
+                    Freshness::Written => {
+                        count(|stats| stats.stale += 1);
+                        return Reuse::Stale;
+                    }
+                }
                 if provenance.0.since < evaluation.frame_stamp()
                     && worker.replays_into(provenance, evaluation.frame_stamp(), range.len())
                 {
@@ -847,6 +855,35 @@ fn reuse_worker(
                     stats.reused_here += 1;
                     stats.sites.entry(caller).or_default()[2] += 1;
                 });
+            } else if let Some(log) = worker.task_log(Arc::as_ptr(&provenance.0.log) as usize) {
+                let Some(reads) = log.get(range) else {
+                    return Reuse::Elsewhere;
+                };
+                let reads = reads.to_vec();
+                if provenance.0.has_query && !worker.local_queries_hold(&reads) {
+                    return Reuse::Elsewhere;
+                }
+                match worker.local_freshness(&reads, provenance.0.since) {
+                    Freshness::Unwritten => {}
+                    Freshness::Recomputing => return Reuse::Elsewhere,
+                    Freshness::Written => {
+                        count(|stats| stats.stale += 1);
+                        return Reuse::Stale;
+                    }
+                }
+                if worker.replays_into(provenance, evaluation.frame_stamp(), reads.len()) {
+                    for local in reads {
+                        worker.log(evaluation, local);
+                        if provenance.0.has_query {
+                            worker.observe_ready(local);
+                        }
+                    }
+                    replay_unkeyed(evaluation, provenance);
+                }
+                count(|stats| {
+                    stats.reused += 1;
+                    stats.sites.entry(caller).or_default()[3] += 1;
+                });
             } else {
                 let Some(reads) = provenance.0.log.0.get().and_then(|log| log.get(range)) else {
                     return Reuse::Elsewhere;
@@ -854,7 +891,10 @@ fn reuse_worker(
                 if provenance.0.has_query && !worker.canonical_queries_hold(reads) {
                     return Reuse::Elsewhere;
                 }
-                match provenance.freshness(worker.graph().keys(), reads) {
+                match provenance
+                    .freshness(worker.graph().keys(), reads)
+                    .and(worker.snapshot_freshness(reads, provenance.0.since))
+                {
                     Freshness::Unwritten => {}
                     Freshness::Recomputing => return Reuse::Elsewhere,
                     Freshness::Written => return Reuse::Stale,
@@ -910,6 +950,13 @@ pub fn new_stamp() -> u64 {
 
 /// Marks keys written before the table was lent, now that it is.
 pub fn note_written(keys: impl IntoIterator<Item = super::HashedKey>) {
+    let mut keys = Some(keys);
+    if super::transport::with_keys(|worker| worker.note_written(keys.take().into_iter().flatten()))
+        .is_some()
+    {
+        return;
+    }
+    let keys = keys.into_iter().flatten();
     let now = next_stamp();
     KEYS.with(|table| {
         if let Some(table) = table.borrow_mut().as_mut() {
@@ -967,6 +1014,13 @@ fn reuse_viewed(
 /// Marks keys an evaluation is about to compute again as written, now that
 /// the table is lent; see [`KeyTable::open_window`].
 pub fn note_recomputing(keys: impl IntoIterator<Item = super::HashedKey>) {
+    let mut keys = Some(keys);
+    if super::transport::with_keys(|worker| worker.open_windows(keys.take().into_iter().flatten()))
+        .is_some()
+    {
+        return;
+    }
+    let keys = keys.into_iter().flatten();
     let now = next_stamp();
     KEYS.with(|table| {
         if let Some(table) = table.borrow_mut().as_mut() {
@@ -980,6 +1034,9 @@ pub fn note_recomputing(keys: impl IntoIterator<Item = super::HashedKey>) {
 /// Ends [`note_recomputing`]: a key `unchanged` accepts reads as written
 /// when it was before.
 pub fn note_recomputed(unchanged: impl Fn(&super::HashedKey) -> bool) {
+    if super::transport::with_keys(|worker| worker.close_windows(&unchanged)).is_some() {
+        return;
+    }
     KEYS.with(|table| {
         if let Some(table) = table.borrow_mut().as_mut() {
             table.close_windows(unchanged);

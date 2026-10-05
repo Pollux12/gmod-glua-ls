@@ -1644,8 +1644,15 @@ pub fn suspend() -> Evaluation {
 }
 
 pub fn end() -> Evaluation {
-    let mut evaluation = suspend();
+    let evaluation = end_unfrozen();
     evaluation.log_handle.freeze(&evaluation.log);
+    evaluation
+}
+
+/// [`end`] with the log left unfrozen: a task's evaluation logs entries of
+/// its own until the barrier canonicalises them.
+pub(super) fn end_unfrozen() -> Evaluation {
+    let mut evaluation = suspend();
     let spare = Spare::take(&mut evaluation);
     SPARE.with(|kept| {
         // A resumed evaluation ends without having begun on this thread.
@@ -2123,15 +2130,8 @@ impl PartialEq for FactRead {
 impl FactRead {
     pub(crate) fn recomputes(&self, owner: &LuaTypeOwner) -> bool {
         use std::sync::atomic::Ordering;
-        if let Some(windowed) = transport::with_snapshot(|graph| {
-            graph
-                .keys()
-                .matching_slot(
-                    self.0.load(Ordering::Relaxed),
-                    |fact| matches!(fact, FactKey::TypeCache(stored) if stored == owner),
-                )
-                .or_else(|| graph.find_slot(&HashedKey::new(FactKey::TypeCache(owner.clone()))))
-                .is_some_and(|slot| graph.keys().windowed(slot))
+        if let Some(windowed) = transport::with_keys(|worker| {
+            worker.windowed(&HashedKey::new(FactKey::TypeCache(owner.clone())))
         }) {
             return windowed;
         }
@@ -2301,11 +2301,15 @@ pub fn note_write(key: impl FnOnce() -> FactKey) {
             LAST_WRITE.with(|last| last.set(written));
             // Inference memoised during an evaluation read only keys the
             // evaluation recorded, so a write it did not read leaves it valid.
-            let read_here = KEYS.with(|keys| {
-                keys.borrow_mut()
-                    .as_mut()
-                    .is_none_or(|table| table.mark_written_logged(&key, evaluation.stamp, written))
-            });
+            let read_here =
+                transport::with_keys(|worker| worker.note_write(&key, evaluation.stamp, written))
+                    .unwrap_or_else(|| {
+                        KEYS.with(|keys| {
+                            keys.borrow_mut().as_mut().is_none_or(|table| {
+                                table.mark_written_logged(&key, evaluation.stamp, written)
+                            })
+                        })
+                    });
             if read_here {
                 WRITE_GENERATION.with(|generation| generation.set(generation.get() + 1));
             }
@@ -2350,11 +2354,9 @@ pub fn writes_fallback_of(file_id: FileId) -> bool {
 /// Whether the evaluation recording on this thread computes `key` again: it
 /// produced it before, and the engine reset it for this run.
 pub fn recomputes(key: FactKey) -> bool {
-    if let Some(windowed) = transport::with_snapshot(|graph| {
-        graph
-            .find_slot(&HashedKey::new(key.clone()))
-            .is_some_and(|slot| graph.keys().windowed(slot))
-    }) {
+    if let Some(windowed) =
+        transport::with_keys(|worker| worker.windowed(&HashedKey::new(key.clone())))
+    {
         return windowed;
     }
     KEYS.with(|keys| {

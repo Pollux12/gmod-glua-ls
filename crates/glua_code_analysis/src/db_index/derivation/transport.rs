@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use hashbrown::HashTable;
 use rustc_hash::FxHashMap;
 
+use super::graph::Freshness;
 use super::{Evaluation, HashedKey, KeyIdx, KeyTable, ReaderGraph, frames};
 
 mod worker;
@@ -11,7 +12,7 @@ pub(crate) use worker::{
     RecordingSnapshot, compute_recorded, note_observed_query_read, query_requires_canonical,
     require_canonical_query, worker_query_readiness,
 };
-pub(super) use worker::{SavedRecording, active, report_worker_replays, with_keys, with_snapshot};
+pub(super) use worker::{SavedRecording, active, report_worker_replays, with_keys};
 
 #[must_use]
 pub(crate) struct ReleaseQuarantine {
@@ -53,6 +54,14 @@ pub(crate) struct WorkerKeys {
     new_lookup: HashTable<u32>,
     visitation: Vec<u64>,
     flags: Vec<u8>,
+    /// The stamp each entry was last written at here (0: not written here,
+    /// as the snapshot holds it), as [`KeyTable`] keeps them for its slots.
+    written: Vec<u64>,
+    /// The entries an evaluation here computes again, each with the stamp it
+    /// was written at before; see [`KeyTable::open_window`].
+    windows: FxHashMap<u32, u64>,
+    /// The stamp of the latest write here.
+    last_written: u64,
 }
 
 impl WorkerKeys {
@@ -60,6 +69,7 @@ impl WorkerKeys {
         let local = u32::try_from(self.entries.len()).expect("fewer than 2^32 fact keys");
         self.entries.push(key);
         self.visitation.push(0);
+        self.written.push(0);
         let query = match key {
             WorkerKey::Known(slot) => snapshot.keys().is_query(slot),
             WorkerKey::New(index) => matches!(
@@ -108,6 +118,175 @@ impl WorkerKeys {
         local
     }
 
+    /// The entry `key` has here, without adding one.
+    fn find(&self, key: &HashedKey, snapshot: &ReaderGraph) -> Option<u32> {
+        if let Some(slot) = snapshot.find_slot(key) {
+            return self.known.get(&slot).copied();
+        }
+        self.new_lookup
+            .find(key.hash, |local| {
+                let WorkerKey::New(index) = self.entries[*local as usize] else {
+                    unreachable!()
+                };
+                self.new_keys[index as usize] == *key
+            })
+            .copied()
+    }
+
+    /// The entry a write of `key` marks: one if anything read the key, here
+    /// or in the snapshot, as [`KeyTable::mark_written`] marks only slots.
+    fn written_entry(&mut self, key: &HashedKey, snapshot: &ReaderGraph) -> Option<u32> {
+        match snapshot.find_slot(key) {
+            Some(slot) => Some(self.known(slot, snapshot)),
+            None => self.find(key, snapshot),
+        }
+    }
+
+    /// Marks `key` written at stamp `now`; whether an evaluation that began
+    /// at stamp `since` logged it, as [`KeyTable::mark_written_logged`].
+    pub(crate) fn mark_written_logged(
+        &mut self,
+        key: &HashedKey,
+        since: u64,
+        now: u64,
+        snapshot: &ReaderGraph,
+    ) -> bool {
+        let Some(local) = self.written_entry(key, snapshot) else {
+            return false;
+        };
+        self.last_written = self.last_written.max(now);
+        self.written[local as usize] = now;
+        self.visitation[local as usize] >= since
+    }
+
+    /// Marks `key` written at stamp `now`, as [`KeyTable::mark_written`].
+    pub(crate) fn mark_written(&mut self, key: &HashedKey, now: u64, snapshot: &ReaderGraph) {
+        if let Some(local) = self.written_entry(key, snapshot) {
+            self.last_written = self.last_written.max(now);
+            self.written[local as usize] = now;
+        }
+    }
+
+    /// Marks `key` written at `now` by an evaluation that computes it again,
+    /// as [`KeyTable::open_window`].
+    pub(crate) fn open_window(&mut self, key: &HashedKey, now: u64, snapshot: &ReaderGraph) {
+        let Some(local) = self.written_entry(key, snapshot) else {
+            return;
+        };
+        self.last_written = self.last_written.max(now);
+        let written = &mut self.written[local as usize];
+        self.windows.entry(local).or_insert(*written);
+        *written = now;
+    }
+
+    /// Closes every window: a key `unchanged` accepts is written as it was
+    /// before its window opened, as [`KeyTable::close_windows`].
+    pub(crate) fn close_windows(
+        &mut self,
+        snapshot: &ReaderGraph,
+        unchanged: impl Fn(&HashedKey) -> bool,
+    ) {
+        for (local, before) in std::mem::take(&mut self.windows) {
+            let key = self.key(local, snapshot);
+            if key.base().is_none() && unchanged(key) {
+                self.written[local as usize] = before;
+            }
+        }
+    }
+
+    /// Whether `key`, or a key it is read out of, is computed again here.
+    pub(crate) fn windowed(&self, key: &HashedKey, snapshot: &ReaderGraph) -> bool {
+        !self.windows.is_empty() && self.chain_windowed(key.clone(), snapshot)
+    }
+
+    fn chain_windowed(&self, key: HashedKey, snapshot: &ReaderGraph) -> bool {
+        let mut key = Some(key);
+        while let Some(at) = key {
+            if self
+                .find(&at, snapshot)
+                .is_some_and(|local| self.windows.contains_key(&local))
+            {
+                return true;
+            }
+            key = at.base().map(HashedKey::new);
+        }
+        false
+    }
+
+    /// How a read of `key`, or of a key it is read out of, was written here
+    /// after stamp `since`: as [`KeyTable::written_since`] answers for a slot.
+    fn chain_freshness(&self, key: &HashedKey, since: u64, snapshot: &ReaderGraph) -> Freshness {
+        let mut freshness = Freshness::Unwritten;
+        let mut at = Some(key.clone());
+        while let Some(key) = at {
+            if let Some(local) = self.find(&key, snapshot)
+                && self.written[local as usize] > since
+            {
+                match self.windows.get(&local) {
+                    Some(before) if *before <= since => freshness = Freshness::Recomputing,
+                    _ => return Freshness::Written,
+                }
+            }
+            at = key.base().map(HashedKey::new);
+        }
+        freshness
+    }
+
+    /// Whether any of the entries `locals` was written here after `since`.
+    pub(crate) fn freshness(
+        &self,
+        locals: &[u32],
+        since: u64,
+        snapshot: &ReaderGraph,
+    ) -> Freshness {
+        if self.last_written <= since {
+            return Freshness::Unwritten;
+        }
+        let mut freshness = Freshness::Unwritten;
+        for local in locals {
+            match self.chain_freshness(self.key(*local, snapshot), since, snapshot) {
+                Freshness::Unwritten => {}
+                Freshness::Recomputing => freshness = Freshness::Recomputing,
+                Freshness::Written => return Freshness::Written,
+            }
+        }
+        freshness
+    }
+
+    /// Whether any of the snapshot's `slots` was written here after `since`.
+    pub(crate) fn snapshot_freshness(
+        &self,
+        slots: &[KeyIdx],
+        since: u64,
+        snapshot: &ReaderGraph,
+    ) -> Freshness {
+        if self.last_written <= since {
+            return Freshness::Unwritten;
+        }
+        let mut freshness = Freshness::Unwritten;
+        for slot in slots {
+            let Some(key) = snapshot.keys().live_key(*slot) else {
+                return Freshness::Written;
+            };
+            match self.chain_freshness(key, since, snapshot) {
+                Freshness::Unwritten => {}
+                Freshness::Recomputing => freshness = Freshness::Recomputing,
+                Freshness::Written => return Freshness::Written,
+            }
+        }
+        freshness
+    }
+
+    /// Every key written here.
+    pub(crate) fn written_keys<'a>(
+        &'a self,
+        snapshot: &'a ReaderGraph,
+    ) -> impl Iterator<Item = &'a HashedKey> {
+        (0..self.entries.len() as u32)
+            .filter(|local| self.written[*local as usize] != 0)
+            .map(|local| self.key(local, snapshot))
+    }
+
     pub(crate) fn key<'a>(&'a self, local: u32, snapshot: &'a ReaderGraph) -> &'a HashedKey {
         match self.entries[local as usize] {
             WorkerKey::Known(slot) => snapshot.key(slot),
@@ -136,7 +315,7 @@ impl WorkerKeys {
         false
     }
 
-    fn log(&mut self, evaluation: &mut Evaluation, local: u32, _snapshot: &ReaderGraph) {
+    fn log(&mut self, evaluation: &mut Evaluation, local: u32, snapshot: &ReaderGraph) {
         if self.is_query(local)
             && let Some(frame) = evaluation.frames.last_mut()
         {
@@ -151,7 +330,10 @@ impl WorkerKeys {
                 evaluation.read.push(local);
             }
         }
-        if self.flags[local as usize] & 1 != 0 {
+        if self.flags[local as usize] & 1 != 0
+            || (!self.windows.is_empty()
+                && self.chain_windowed(self.key(local, snapshot).clone(), snapshot))
+        {
             frames::taint_evaluation(evaluation);
         }
     }
@@ -216,28 +398,34 @@ impl WorkerKeys {
         mut evaluation: Evaluation,
         table: &mut KeyTable,
     ) -> Option<Evaluation> {
-        assert!(
-            evaluation.frames.is_empty(),
-            "worker publication with open frames"
-        );
-        assert!(
-            evaluation.reads.is_empty() && evaluation.viewed.is_empty(),
-            "worker reads bypassed its registry"
-        );
         let slots = self.canonical_slots(table, evaluation.stamp)?;
-        for slot in &mut evaluation.log {
-            *slot = slots[*slot as usize];
-        }
-        for slot in &mut evaluation.read {
-            *slot = slots[*slot as usize];
-        }
-        for slot in evaluation.read_identities.values_mut() {
-            *slot = slots[*slot as usize];
-        }
-        for read in evaluation.named_reads.iter_mut() {
-            read.slot = slots[read.slot as usize];
-        }
+        remap(&mut evaluation, &slots);
         Some(evaluation)
+    }
+}
+
+/// Rewrites the entries `evaluation` recorded as the slots they canonicalise
+/// to.
+fn remap(evaluation: &mut Evaluation, slots: &[KeyIdx]) {
+    assert!(
+        evaluation.frames.is_empty(),
+        "worker publication with open frames"
+    );
+    assert!(
+        evaluation.reads.is_empty() && evaluation.viewed.is_empty(),
+        "worker reads bypassed its registry"
+    );
+    for slot in &mut evaluation.log {
+        *slot = slots[*slot as usize];
+    }
+    for slot in &mut evaluation.read {
+        *slot = slots[*slot as usize];
+    }
+    for slot in evaluation.read_identities.values_mut() {
+        *slot = slots[*slot as usize];
+    }
+    for read in evaluation.named_reads.iter_mut() {
+        read.slot = slots[read.slot as usize];
     }
 }
 
