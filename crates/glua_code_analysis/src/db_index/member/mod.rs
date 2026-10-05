@@ -10,6 +10,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::cow_shards::CowShards;
 use super::traits::LuaIndex;
 use crate::db_index::derivation::{
     self, ABSENT, DerivationId, FactKey, Fingerprint, fingerprint_of,
@@ -28,7 +29,7 @@ pub use lua_member_owner::LuaMemberOwner;
 /// Two of these are kept. The visible one answers lookups; the history one also
 /// keeps members a later write displaced, so a removal can still find where they
 /// were filed.
-type OwnerKeyMap = HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>;
+type OwnerKeyMap = CowShards<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>;
 
 /// Files `id` in its slot unless the slot already holds it.
 fn push_owner_key_id_unique(
@@ -162,10 +163,10 @@ struct SourceMemberState {
 
 #[derive(Debug, Clone)]
 pub struct LuaMemberIndex {
-    members: HashMap<LuaMemberId, LuaMember>,
-    source_members: HashMap<LuaMemberId, SourceMember>,
+    members: CowShards<LuaMemberId, LuaMember>,
+    source_members: CowShards<LuaMemberId, SourceMember>,
     in_filed: HashMap<FileId, HashSet<MemberOrOwner>>,
-    owner_members: HashMap<LuaMemberOwner, LuaOwnerMembers>,
+    owner_members: CowShards<LuaMemberOwner, LuaOwnerMembers>,
     member_current_owner: HashMap<LuaMemberId, LuaMemberOwner>,
     member_owner_key_index: OwnerKeyMap,
     member_owner_key_history_index: OwnerKeyMap,
@@ -175,8 +176,8 @@ pub struct LuaMemberIndex {
     /// caused them; a sweep of an owner that holds none is a no-op.
     owner_key_index_owners_by_file: HashMap<FileId, HashSet<LuaMemberOwner>>,
     current_owner_member_history:
-        HashMap<LuaMemberOwner, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
-    current_members_by_key: HashMap<LuaMemberKey, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
+        CowShards<LuaMemberOwner, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
+    current_members_by_key: CowShards<LuaMemberKey, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
     /// The members filed under an expression key that names another file's
     /// positions, by that file.
     expr_key_members_by_file: HashMap<FileId, HashSet<LuaMemberId>>,
@@ -300,16 +301,16 @@ impl Default for LuaMemberIndex {
 impl LuaMemberIndex {
     pub fn new() -> Self {
         Self {
-            members: HashMap::default(),
-            source_members: HashMap::default(),
+            members: CowShards::default(),
+            source_members: CowShards::default(),
             in_filed: HashMap::default(),
-            owner_members: HashMap::default(),
+            owner_members: CowShards::default(),
             member_current_owner: HashMap::default(),
-            member_owner_key_index: HashMap::default(),
-            member_owner_key_history_index: HashMap::default(),
+            member_owner_key_index: CowShards::default(),
+            member_owner_key_history_index: CowShards::default(),
             owner_key_index_owners_by_file: HashMap::default(),
-            current_owner_member_history: HashMap::default(),
-            current_members_by_key: HashMap::default(),
+            current_owner_member_history: CowShards::default(),
+            current_members_by_key: CowShards::default(),
             expr_key_members_by_file: HashMap::default(),
             non_overwriting_assignment_members: HashSet::default(),
             preserved_co_writer_reconciled: HashSet::default(),
@@ -565,12 +566,13 @@ impl LuaMemberIndex {
             .into_iter()
             .flatten()
             .map(|range| file_scope_element(file_id, *range));
-        let element_owners = self.owner_members.keys().filter_map(|owner| match owner {
-            LuaMemberOwner::Element(site) if site.file_id == file_id => {
-                Some(file_element_owner_element(site))
-            }
-            _ => None,
-        });
+        let element_owners = self
+            .owner_members
+            .file_entries(file_id)
+            .filter_map(|(owner, _)| match owner {
+                LuaMemberOwner::Element(site) => Some(file_element_owner_element(site)),
+                _ => None,
+            });
         members
             .chain(scopes)
             .chain(element_owners)
@@ -663,20 +665,14 @@ impl LuaMemberIndex {
     /// `crate::compilation::analyzer::common::estimate_file_index_entries`),
     /// not a count the index trusts: every map keeps its exact length and
     /// contents, so over- or under-estimating only changes how often the
-    /// tables rehash, never what they hold. Distinct owners and keys are a
-    /// fraction of member writes, hence the scaled outer-map reservations.
+    /// tables rehash, never what they hold. Provenance and scope entries are
+    /// a fraction of member writes, hence their scaled reservations.
     /// Per-file entries are created when absent; an empty file keeps empty
     /// per-file entries, which all readers treat exactly like absent ones.
     pub fn reserve_for_file(&mut self, file_id: FileId, members: usize) {
-        self.members.reserve(members);
         self.member_current_owner.reserve(members);
         self.member_path_provenance.reserve(members / 4 + 1);
         self.member_function_scope_ranges.reserve(members / 4 + 1);
-        self.owner_members.reserve(members / 4 + 1);
-        self.member_owner_key_index.reserve(members / 4 + 1);
-        self.member_owner_key_history_index.reserve(members / 4 + 1);
-        self.current_owner_member_history.reserve(members / 4 + 1);
-        self.current_members_by_key.reserve(members / 4 + 1);
         self.in_filed.entry(file_id).or_default();
         self.owner_key_index_owners_by_file
             .entry(file_id)
@@ -1357,7 +1353,7 @@ impl LuaMemberIndex {
     }
 
     fn remove_files_members_from_owner_key_map(
-        owner_key_index: &mut HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>,
+        owner_key_index: &mut OwnerKeyMap,
         removed: &HashSet<FileId>,
         owners: &HashSet<LuaMemberOwner>,
         affected: &mut HashSet<LuaMemberOwner>,
@@ -2047,9 +2043,9 @@ impl LuaMemberIndex {
         derivation::note_read(|| FactKey::MemberFile(file_id));
         let mut ranges: Vec<crate::InFiled<TextRange>> = self
             .owner_members
-            .keys()
-            .filter_map(|owner| match owner {
-                LuaMemberOwner::Element(range) if range.file_id == file_id => Some(range.clone()),
+            .file_entries(file_id)
+            .filter_map(|(owner, _)| match owner {
+                LuaMemberOwner::Element(range) => Some(range.clone()),
                 _ => None,
             })
             .collect();

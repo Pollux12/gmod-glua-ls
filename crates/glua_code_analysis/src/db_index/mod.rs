@@ -1,6 +1,7 @@
 mod accessor_func;
 mod call_site_param;
 mod call_target;
+mod cow_shards;
 mod declaration;
 mod dependency;
 pub(crate) mod derivation;

@@ -10,6 +10,7 @@ mod type_owner;
 mod type_visit_trait;
 mod types;
 
+use super::cow_shards::CowShards;
 use super::traits::LuaIndex;
 use crate::db_index::derivation::{self, DerivationId, FactKey, Fingerprint};
 use crate::{
@@ -1315,10 +1316,10 @@ pub struct LuaTypeIndex {
     /// Each file's declarations initialised with a table literal, the only
     /// ones a class binding is kept for; a source fact of the file.
     table_literal_decls: HashMap<FileId, HashSet<LuaDeclId>>,
-    types: HashMap<LuaTypeOwner, TypeFact>,
+    types: CowShards<LuaTypeOwner, TypeFact>,
     cache_refs: TypeCacheRefIndex,
     in_filed_type_owner: HashMap<FileId, HashSet<LuaTypeOwner>>,
-    fact_metadata: HashMap<LuaTypeOwner, LuaTypeFactMetadata>,
+    fact_metadata: CowShards<LuaTypeOwner, LuaTypeFactMetadata>,
     /// The files one fact's provenance and step types name, per fact owner,
     /// with the reverse map beside it. [`Self::remap_inference_facts`] visits
     /// only the facts that name the edited file instead of every fact in the
@@ -1450,14 +1451,14 @@ impl LuaTypeIndex {
             decl_type_binds: HashMap::default(),
             type_bound_decls: HashMap::default(),
             table_literal_decls: HashMap::default(),
-            types: HashMap::default(),
+            types: CowShards::default(),
             cache_refs: TypeCacheRefIndex::default(),
             in_filed_type_owner: HashMap::default(),
             fact_ref_files: HashMap::default(),
             fact_refs_by_file: HashMap::default(),
             definition_fact_ref_files: HashMap::default(),
             definition_fact_refs_by_file: HashMap::default(),
-            fact_metadata: HashMap::default(),
+            fact_metadata: CowShards::default(),
             decl_write_claims: HashMap::default(),
             definition_facts: HashMap::default(),
             inference_events_by_file: HashMap::default(),
