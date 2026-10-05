@@ -2930,8 +2930,7 @@ impl LuaTypeIndex {
         }
         self.derived_state_dirty = false;
 
-        let mut events_by_file: HashMap<FileId, Vec<LuaInferenceDiagnosticEvent>> =
-            HashMap::default();
+        let mut events_by_file: HashMap<FileId, Vec<OwnedEvent>> = HashMap::default();
         let mut support_dependents: HashMap<LuaInferenceNodeId, HashSet<FileId>> =
             HashMap::default();
 
@@ -2947,6 +2946,7 @@ impl LuaTypeIndex {
             );
             collect_fact_derived_state(
                 owner.get_file_id(),
+                Some(owner),
                 &fact,
                 &mut events_by_file,
                 &mut support_dependents,
@@ -2956,6 +2956,7 @@ impl LuaTypeIndex {
         for (definition, fact) in &self.definition_facts {
             collect_fact_derived_state(
                 definition.file_id(),
+                None,
                 fact,
                 &mut events_by_file,
                 &mut support_dependents,
@@ -2965,9 +2966,21 @@ impl LuaTypeIndex {
         self.inference_events_by_file = events_by_file
             .into_iter()
             .map(|(file_id, mut events)| {
-                events.sort_by(|left, right| left.event.stable_cmp(&right.event));
-                events.dedup_by(|left, right| left.event == right.event);
-                (file_id, events.into())
+                events.sort_by(|left, right| {
+                    left.0.event.stable_cmp(&right.0.event).then_with(|| {
+                        match (&left.1, &right.1) {
+                            (Some(left), Some(right)) => left.stable_cmp(right),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        }
+                    })
+                });
+                events.dedup_by(|left, right| left.0.event == right.0.event);
+                (
+                    file_id,
+                    events.into_iter().map(|(event, _)| event).collect(),
+                )
             })
             .collect();
         self.support_file_dependents = HashMap::default();
@@ -3962,20 +3975,28 @@ fn remove_reverse_edges<K>(
     }
 }
 
+/// An inference event with the type owner whose fact carried it, `None` for a
+/// definition fact; duplicates of one event keep the first in owner order.
+type OwnedEvent = (LuaInferenceDiagnosticEvent, Option<LuaTypeOwner>);
+
 fn collect_fact_derived_state(
     owner_file_id: FileId,
+    owner: Option<&LuaTypeOwner>,
     fact: &LuaTypeFact,
-    events_by_file: &mut HashMap<FileId, Vec<LuaInferenceDiagnosticEvent>>,
+    events_by_file: &mut HashMap<FileId, Vec<OwnedEvent>>,
     support_dependents: &mut HashMap<LuaInferenceNodeId, HashSet<FileId>>,
 ) {
     for step in fact.provenance() {
         events_by_file
             .entry(step.event.source.file_id)
             .or_default()
-            .push(LuaInferenceDiagnosticEvent {
-                event: step.event.clone(),
-                fact: fact.clone(),
-            });
+            .push((
+                LuaInferenceDiagnosticEvent {
+                    event: step.event.clone(),
+                    fact: fact.clone(),
+                },
+                owner.cloned(),
+            ));
         for support in step.support.iter() {
             support_dependents
                 .entry(support.clone())
