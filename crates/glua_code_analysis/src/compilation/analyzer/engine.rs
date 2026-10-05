@@ -587,21 +587,58 @@ impl Engine {
         db: &DbIndex,
         keys: impl IntoIterator<Item = &'a HashedKey>,
     ) {
-        for key in keys {
-            self.queue_readers(db, key);
+        let keys = keys.into_iter().collect::<Vec<_>>();
+        let found = self.stale_readers_of(db, &keys);
+        for (key, readers) in keys.into_iter().zip(found) {
+            self.queue_readers(db, key, readers);
             if !key.is_base() {
                 continue;
             }
             let now = self.fingerprint(db, key);
             for derived in db.reader_graph().derived_keys_to_check(key, now) {
-                self.queue_readers(db, &derived);
+                self.queue_readers(db, &derived, None);
             }
         }
     }
 
+    /// The readers of each of `keys` whose recorded fingerprint differs from
+    /// the key's current one, found on worker threads while nothing is being
+    /// edited or recorded; `None` for a query output, whose fingerprint may
+    /// compute it.
+    fn stale_readers_of(
+        &self,
+        db: &DbIndex,
+        keys: &[&HashedKey],
+    ) -> Vec<Option<Vec<(DerivationId, derivation::Fingerprint)>>> {
+        if !self.edits.is_empty() || derivation::recording() {
+            return vec![None; keys.len()];
+        }
+        let graph = db.reader_graph();
+        keys.par_iter()
+            .map(|key| {
+                (!matches!(
+                    key.key(),
+                    FactKey::ReceiverAuthority(_) | FactKey::CallbackParams(_)
+                ))
+                .then(|| {
+                    graph
+                        .stale_readers_seen(key, |seen| {
+                            seen == graph.current_fingerprint(key, |key| db.fact_fingerprint(key))
+                        })
+                        .collect()
+                })
+            })
+            .collect()
+    }
+
     /// Queues the readers of `key` whose recorded fingerprint differs from its
-    /// current value.
-    fn queue_readers(&mut self, db: &DbIndex, key: &HashedKey) {
+    /// current value: `readers`, when they were found already.
+    fn queue_readers(
+        &mut self,
+        db: &DbIndex,
+        key: &HashedKey,
+        readers: Option<Vec<(DerivationId, derivation::Fingerprint)>>,
+    ) {
         if self.batch_slot_notifications
             && self.loop_focus.is_empty()
             && matches!(
@@ -616,10 +653,7 @@ impl Engine {
                 self.before_edits.get_mut().remove(key);
                 self.touched.insert(key.clone());
             }
-            let readers = db
-                .reader_graph()
-                .stale_readers_seen(key, self.key_holds(db, key))
-                .collect::<Vec<_>>();
+            let readers = readers.unwrap_or_else(|| self.stale_readers(db, key));
             for (reader, seen) in readers {
                 self.remember_moved_read(db, key, reader, seen);
                 if reader.kind.is_query() {
@@ -629,7 +663,17 @@ impl Engine {
             self.pending_slot_notifications.insert(key.clone());
             return;
         }
-        self.queue_readers_now(db, key);
+        self.queue_readers_now(db, key, readers);
+    }
+
+    fn stale_readers(
+        &self,
+        db: &DbIndex,
+        key: &HashedKey,
+    ) -> Vec<(DerivationId, derivation::Fingerprint)> {
+        db.reader_graph()
+            .stale_readers_seen(key, self.key_holds(db, key))
+            .collect()
     }
 
     pub(crate) fn flush_slot_notifications(&mut self, db: &DbIndex) {
@@ -640,7 +684,7 @@ impl Engine {
             pending.sort_by_cached_key(|key| format!("{:?}", key.key()));
         });
         for key in pending {
-            self.queue_readers_now(db, &key);
+            self.queue_readers_now(db, &key, None);
         }
     }
 
@@ -664,7 +708,12 @@ impl Engine {
         }
     }
 
-    fn queue_readers_now(&mut self, db: &DbIndex, key: &HashedKey) {
+    fn queue_readers_now(
+        &mut self,
+        db: &DbIndex,
+        key: &HashedKey,
+        readers: Option<Vec<(DerivationId, derivation::Fingerprint)>>,
+    ) {
         if let Some(keys) = &mut self.since_search {
             keys.insert(key.clone());
         }
@@ -675,10 +724,7 @@ impl Engine {
         if let FactKey::Signature(signature_id) | FactKey::InferredGuard(signature_id) = key.key() {
             self.payload_holders.insert(signature_id.get_file_id());
         }
-        let readers = db
-            .reader_graph()
-            .stale_readers_seen(key, self.key_holds(db, key))
-            .collect::<Vec<_>>();
+        let readers = readers.unwrap_or_else(|| self.stale_readers(db, key));
         for (reader, seen) in readers {
             self.stats
                 .requeued(key, self.cursor, reader, seen == derivation::ABSENT);
