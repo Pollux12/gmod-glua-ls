@@ -6,6 +6,7 @@ mod test {
     /// A reader ordered before its producer, cold-built under `schedule`:
     /// how often its statement ran, and what the workspace settled to.
     fn scheduled(schedule: Schedule) -> (usize, Vec<String>) {
+        let _serial = crate::compilation::analyzer::serial_engine();
         let mut ws = VirtualWorkspace::new();
         ws.analysis.compilation.set_schedule(schedule);
         ws.def_files(vec![

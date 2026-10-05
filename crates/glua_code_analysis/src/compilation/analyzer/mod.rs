@@ -23,6 +23,8 @@ pub(crate) use dynamic_field::{
     copies_table_into_itself, for_range_pairs_source_for_var, writes_own_pairs_key,
 };
 pub(crate) use engine::EngineStats;
+#[cfg(test)]
+pub(crate) use engine::serial_engine;
 pub use engine::{Schedule, Slice};
 pub use lua::is_member_assignment_in_conditional_branch;
 pub(crate) use lua::{

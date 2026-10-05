@@ -382,11 +382,13 @@ pub(crate) struct Engine {
     /// derivation was evaluated since the run last entered a stage.
     stage_evaluations: FxHashMap<DerivationId, u32>,
     batch_slot_notifications: bool,
+    /// How cold builds are driven; see [`superstep_mode`].
+    superstep: SuperstepMode,
     pending_slot_notifications: FxHashSet<HashedKey>,
-    /// Under `GLUALS_SUPERSTEP`, the file whose superstep task is running:
+    /// In a superstep, the file whose superstep task is running:
     /// its batches take no other file's work.
     task: Option<crate::FileId>,
-    /// Under `GLUALS_SUPERSTEP=workers`, how often each derivation ran in a
+    /// In worker supersteps, how often each derivation ran in a
     /// task since the run entered its stage; the files whose work settles on
     /// the index, each to quiescence, since one of their derivations ran so
     /// often; and whether the stage settles on the serial loop instead.
@@ -396,7 +398,7 @@ pub(crate) struct Engine {
     /// the queries it read to be computed since the run entered its stage.
     query_deferrals: FxHashMap<DerivationId, u8>,
     serial_stage: bool,
-    /// Under `GLUALS_SUPERSTEP`, every key the superstep's tasks touched, and
+    /// In a superstep, every key the superstep's tasks touched, and
     /// those the running task touched.
     superstep_touched: Option<FxHashSet<HashedKey>>,
     task_touched: FxHashSet<HashedKey>,
@@ -414,6 +416,14 @@ struct Moved {
 #[cfg(test)]
 thread_local! {
     static TEST_SLOT_BATCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_SUPERSTEP: std::cell::Cell<Option<SuperstepMode>> = const { std::cell::Cell::new(None) };
+}
+
+/// Until the guard drops, engines this thread creates run the serial engine.
+#[cfg(test)]
+pub(crate) fn serial_engine() -> impl Drop {
+    TEST_SUPERSTEP.with(|mode| mode.set(Some(SuperstepMode::Off)));
+    OnDrop(|| TEST_SUPERSTEP.with(|mode| mode.set(None)))
 }
 
 impl Engine {
@@ -422,9 +432,13 @@ impl Engine {
         #[cfg(test)]
         let batch_slot_notifications =
             TEST_SLOT_BATCH.with(|value| value.get().unwrap_or(batch_slot_notifications));
+        let superstep = superstep_mode();
+        #[cfg(test)]
+        let superstep = TEST_SUPERSTEP.with(|mode| mode.get().unwrap_or(superstep));
         Self {
             schedule,
             batch_slot_notifications,
+            superstep,
             worklist: Queue::new(schedule),
             next_round: Queue::new(schedule),
             to_follow: edits.clone(),
@@ -925,12 +939,12 @@ impl Engine {
                 self.flush_slot_notifications(db);
                 return false;
             }
-            if superstep_mode() != SuperstepMode::Off
+            if self.superstep != SuperstepMode::Off
                 && matches!(slice, Slice::Whole)
                 && self.loop_focus.is_empty()
                 && !self.worklist.is_empty()
             {
-                if superstep_mode() == SuperstepMode::Workers {
+                if self.superstep == SuperstepMode::Workers {
                     if self.edits.is_empty() && self.rebuilt.is_empty() && !self.serial_stage {
                         self.superstep_on_workers(db, recipe, slice);
                         continue;
@@ -999,7 +1013,7 @@ impl Engine {
         }
     }
 
-    /// Under `GLUALS_SUPERSTEP`: evaluates every entry queued at the first
+    /// In supersteps: evaluates every entry queued at the first
     /// rank, one file at a time, each file's to quiescence on its own fork
     /// of the index as the superstep found it. Work an evaluation queues for
     /// another file at the same rank waits for the next superstep. The
@@ -1078,7 +1092,7 @@ impl Engine {
         }
     }
 
-    /// Under `GLUALS_SUPERSTEP=workers`: [`Self::superstep`] with each file's
+    /// In worker supersteps: [`Self::superstep`] with each file's
     /// task run on a worker thread. The root decides what each task runs, as
     /// [`Self::step`] does before it evaluates a group; a group that reaches
     /// another file, a query and workspace derivations run on the index after
@@ -2653,7 +2667,7 @@ pub(crate) struct EngineStats {
     evaluations: BTreeMap<DerivationKind, usize>,
     /// Rounds after the first.
     pub(crate) rounds: usize,
-    /// Under `GLUALS_SUPERSTEP`: supersteps run, and file tasks across them.
+    /// Supersteps run, and file tasks across them.
     supersteps: usize,
     superstep_tasks: usize,
     /// Tasks run again on the index, by the first value they conflicted on.
@@ -3453,23 +3467,29 @@ const SUPERSTEP_RUN_LIMIT: u32 = 64;
 /// on the index instead.
 const QUERY_DEFERRALS: u8 = 2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum SuperstepMode {
+    /// The serial engine, one derivation at a time.
     Off,
     /// Each file's task on a fork of the index, one after another.
     Serial,
     /// Each file's task on a worker thread.
+    #[default]
     Workers,
 }
 
-/// `GLUALS_SUPERSTEP`: runs cold builds a superstep at a time, the tasks on
-/// worker threads when it is `workers`.
+/// `GLUALS_SUPERSTEP`: unset or `workers` runs cold builds a superstep at a
+/// time with the tasks on worker threads, `serial` (or any other value but
+/// `off`) with the tasks one after another, and `off` on the serial engine.
 fn superstep_mode() -> SuperstepMode {
     static MODE: std::sync::OnceLock<SuperstepMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("GLUALS_SUPERSTEP") {
-        Err(_) => SuperstepMode::Off,
-        Ok(mode) if mode == "workers" => SuperstepMode::Workers,
-        Ok(_) => SuperstepMode::Serial,
+        Err(_) => SuperstepMode::Workers,
+        Ok(mode) => match mode.as_str() {
+            "workers" => SuperstepMode::Workers,
+            "off" => SuperstepMode::Off,
+            _ => SuperstepMode::Serial,
+        },
     })
 }
 
@@ -3732,6 +3752,7 @@ mod tests {
         let shops = inventory_shops();
         let files = inventory_files(&shops);
         let edits = [("lua/autorun/sh_inventory.lua", edited.as_str())];
+        let _serial = serial_engine();
         let published = || WORKER_PUBLISHED.with(std::cell::Cell::get);
         let analyse = |threads: usize| {
             parallel::set_analysis_threads(threads);
@@ -3826,6 +3847,7 @@ print(entry.extra{index}, entry.damage)"
             .chain([("lua/autorun/sh_reader_4_registry.lua", registry)])
             .collect::<Vec<_>>();
         files.sort();
+        let _serial = serial_engine();
         let published = || WORKER_PUBLISHED.with(std::cell::Cell::get);
         let analyse = |threads: usize| {
             parallel::set_analysis_threads(threads);
