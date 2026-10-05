@@ -150,12 +150,15 @@ function clientCapabilities() {
 /**
  * Prefers the `dist` profile, which is what ships. `release` lacks its thin LTO
  * and single codegen unit, so measuring it reports numbers no user experiences.
+ * A `dist` build older than the `release` one predates the code under test, so
+ * the newer of the two is used.
  */
 function defaultServerPath() {
     const exe = process.platform === 'win32' ? 'glua_ls.exe' : 'glua_ls';
     const dist = path.resolve(__dirname, '..', 'target', 'dist', exe);
-    if (fs.existsSync(dist)) return dist;
-    return path.resolve(__dirname, '..', 'target', 'release', exe);
+    const release = path.resolve(__dirname, '..', 'target', 'release', exe);
+    const builtAt = (file) => (fs.existsSync(file) ? fs.statSync(file).mtimeMs : -Infinity);
+    return builtAt(dist) >= builtAt(release) ? dist : release;
 }
 
 function requireDir(value, name) {
