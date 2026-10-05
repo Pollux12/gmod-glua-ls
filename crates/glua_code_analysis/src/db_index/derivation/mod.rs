@@ -1369,6 +1369,9 @@ thread_local! {
     static REHOMING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static WRITE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CAPTURED: RefCell<Option<FxHashSet<HashedKey>>> = const { RefCell::new(None) };
+    /// The positions among the current evaluation's outputs of the writes
+    /// noted since [`noting_writes_once`] began, with the evaluation's stamp.
+    static NOTED_ONCE: RefCell<Option<(u64, Vec<usize>)>> = const { RefCell::new(None) };
     static NOTED_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// The reader graph evaluations on this thread read without a lent table.
     static VIEW: RefCell<Option<std::sync::Arc<ReaderGraph>>> = const { RefCell::new(None) };
@@ -1439,6 +1442,29 @@ pub fn untracked<T>(f: impl FnOnce() -> T) -> T {
     let result = f();
     UNTRACKED.with(|depth| depth.set(depth.get() - 1));
     result
+}
+
+/// Runs `f` noting each output it writes once: a write of a key `f` already
+/// noted as an output adds nothing to the evaluation's outputs, which are a
+/// set, and is skipped.
+pub fn noting_writes_once<T>(f: impl FnOnce() -> T) -> T {
+    struct Scope;
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            NOTED_ONCE.with(|noted| noted.borrow_mut().take());
+        }
+    }
+    if NOTED_ONCE.with(|noted| noted.borrow().is_some()) {
+        return f();
+    }
+    let stamp =
+        CURRENT.with(|current| current.borrow().as_ref().map(|evaluation| evaluation.stamp));
+    let Some(stamp) = stamp else {
+        return f();
+    };
+    NOTED_ONCE.with(|noted| *noted.borrow_mut() = Some((stamp, Vec::new())));
+    let _scope = Scope;
+    f()
 }
 
 /// Runs `f` with its writes recorded as moves, not outputs. For an index
@@ -2317,6 +2343,19 @@ pub fn note_write(key: impl FnOnce() -> FactKey) {
     CURRENT.with(|current| {
         if let Some(evaluation) = current.borrow_mut().as_mut() {
             let key = HashedKey::new(key());
+            let rehoming = REHOMING.with(|depth| depth.get() > 0);
+            let noted = !rehoming
+                && NOTED_ONCE.with(|noted| {
+                    noted.borrow().as_ref().is_some_and(|(stamp, at)| {
+                        *stamp == evaluation.stamp
+                            && at
+                                .iter()
+                                .any(|at| evaluation.outputs.get(*at) == Some(&key))
+                    })
+                });
+            if noted {
+                return;
+            }
             let written = next_stamp();
             LAST_WRITE.with(|last| last.set(written));
             // Inference memoised during an evaluation read only keys the
@@ -2333,9 +2372,16 @@ pub fn note_write(key: impl FnOnce() -> FactKey) {
             if read_here {
                 WRITE_GENERATION.with(|generation| generation.set(generation.get() + 1));
             }
-            if REHOMING.with(|depth| depth.get() > 0) {
+            if rehoming {
                 evaluation.moved.insert(key);
             } else {
+                NOTED_ONCE.with(|noted| {
+                    if let Some((stamp, at)) = noted.borrow_mut().as_mut()
+                        && *stamp == evaluation.stamp
+                    {
+                        at.push(evaluation.outputs.len());
+                    }
+                });
                 evaluation.outputs.push(key);
             }
         } else {
@@ -2414,4 +2460,38 @@ pub fn dynamic_fields_visible() -> bool {
 /// The derivation being evaluated on this thread, if any.
 pub fn current() -> Option<DerivationId> {
     CURRENT.with(|current| current.borrow().as_ref().map(|evaluation| evaluation.id))
+}
+
+#[cfg(test)]
+mod noting_tests {
+    use super::*;
+
+    fn noted(evaluation: &Evaluation, key: &FactKey) -> usize {
+        evaluation
+            .outputs
+            .iter()
+            .filter(|output| output.key() == key)
+            .count()
+    }
+
+    #[test]
+    fn a_scope_notes_each_output_once_and_leaves_writes_outside_it_alone() {
+        let file = FileId::new(1);
+        begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        noting_writes_once(|| {
+            note_write(|| FactKey::MemberFile(file));
+            note_write(|| FactKey::NetworkScan);
+            note_write(|| FactKey::MemberFile(file));
+        });
+        note_write(|| FactKey::NetworkScan);
+        let evaluation = end();
+
+        assert_eq!(
+            (
+                noted(&evaluation, &FactKey::MemberFile(file)),
+                noted(&evaluation, &FactKey::NetworkScan)
+            ),
+            (1, 2)
+        );
+    }
 }

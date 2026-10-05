@@ -905,19 +905,21 @@ impl LuaMemberIndex {
         member: LuaMember,
         is_owner_only: bool,
     ) -> LuaMemberId {
-        if !owner.is_unknown() {
-            self.note_derived_owner(member.get_id(), &owner);
-        } else {
-            self.snapshot_member(member.get_id());
-        }
-        // Where the member is filed is the index's own placement: a later
-        // class binding or site registration re-homes it, so what the writer
-        // produced does not depend on the placement state it saw.
-        if !owner.is_unknown() {
-            note_slot_write(&owner, member.get_key());
-            note_owner_map_write(&owner);
-        }
-        derivation::untracked(|| self.file_member(owner, member, is_owner_only))
+        derivation::noting_writes_once(|| {
+            if !owner.is_unknown() {
+                self.note_derived_owner(member.get_id(), &owner);
+            } else {
+                self.snapshot_member(member.get_id());
+            }
+            // Where the member is filed is the index's own placement: a later
+            // class binding or site registration re-homes it, so what the
+            // writer produced does not depend on the placement state it saw.
+            if !owner.is_unknown() {
+                note_slot_write(&owner, member.get_key());
+                note_owner_map_write(&owner);
+            }
+            derivation::untracked(|| self.file_member(owner, member, is_owner_only))
+        })
     }
 
     fn file_member(
