@@ -677,14 +677,20 @@ impl Engine {
     }
 
     pub(crate) fn flush_slot_notifications(&mut self, db: &DbIndex) {
-        let mut pending = std::mem::take(&mut self.pending_slot_notifications)
+        let pending = std::mem::take(&mut self.pending_slot_notifications)
             .into_iter()
             .collect::<Vec<_>>();
-        crate::profile::phase("engine: sort slot notifications", || {
-            pending.sort_by_cached_key(|key| format!("{:?}", key.key()));
+        let pending = crate::profile::phase("engine: sort slot notifications", || {
+            let mut named = pending
+                .into_par_iter()
+                .map(|key| (format!("{:?}", key.key()), key))
+                .collect::<Vec<_>>();
+            named.sort_by(|(left, _), (right, _)| left.cmp(right));
+            named.into_iter().map(|(_, key)| key).collect::<Vec<_>>()
         });
-        for key in pending {
-            self.queue_readers_now(db, &key, None);
+        let found = self.stale_readers_of(db, &pending.iter().collect::<Vec<_>>());
+        for (key, readers) in pending.iter().zip(found) {
+            self.queue_readers_now(db, key, readers);
         }
     }
 
