@@ -1003,6 +1003,17 @@ impl DerivationId {
         }
     }
 
+    /// The derivation every other one orders at or after.
+    pub(crate) fn floor() -> Self {
+        Self {
+            kind: DerivationKind::Source,
+            file_id: FileId::new(0),
+            syntax_kind: LuaSyntaxKind::None,
+            start: 0,
+            end: 0,
+        }
+    }
+
     /// `file_id`'s diagnostics, whatever its text.
     pub fn diagnostics(file_id: FileId) -> Self {
         Self {

@@ -189,6 +189,55 @@ impl Queue {
         self.order.is_empty()
     }
 
+    /// The rank of the first queued entry.
+    fn first_rank(&self) -> Option<u8> {
+        self.order.first().map(|(rank, ..)| *rank)
+    }
+
+    /// The entries queued at `rank` with reason `reason`, in order.
+    fn at(
+        &self,
+        rank: u8,
+        reason: Reason,
+        file_key: u64,
+    ) -> impl Iterator<Item = &(u8, Reason, u64, DerivationId)> {
+        self.order
+            .range((rank, reason, file_key, DerivationId::floor())..)
+            .take_while(move |(entry_rank, entry_reason, ..)| {
+                *entry_rank == rank && *entry_reason == reason
+            })
+    }
+
+    /// The files with entries at `rank`, in the order a round takes them.
+    fn files_at(&self, rank: u8) -> Vec<crate::FileId> {
+        let mut files = BTreeMap::new();
+        for reason in [Reason::Changed, Reason::Read] {
+            for (_, _, file_key, id) in self.at(rank, reason, 0) {
+                files.entry((*file_key, id.file_id)).or_insert(());
+            }
+        }
+        files.into_keys().map(|(_, file_id)| file_id).collect()
+    }
+
+    /// Takes out every entry of `file_id` at `rank`.
+    fn take_file_at(&mut self, rank: u8, file_id: crate::FileId) -> Vec<(DerivationId, Reason)> {
+        let file_key = self.schedule.file_key(file_id);
+        let mut taken = Vec::new();
+        for reason in [Reason::Changed, Reason::Read] {
+            let ids = self
+                .at(rank, reason, file_key)
+                .take_while(|(_, _, key, _)| *key == file_key)
+                .filter(|(.., id)| id.file_id == file_id)
+                .map(|(.., id)| *id)
+                .collect::<Vec<_>>();
+            for id in ids {
+                self.remove(id);
+                taken.push((id, reason));
+            }
+        }
+        taken
+    }
+
     /// Takes out every entry `take` accepts.
     fn take_where(
         &mut self,
@@ -333,6 +382,9 @@ pub(crate) struct Engine {
     stage_evaluations: FxHashMap<DerivationId, u32>,
     batch_slot_notifications: bool,
     pending_slot_notifications: FxHashSet<HashedKey>,
+    /// Under `GLUALS_SUPERSTEP`, the file whose superstep task is running:
+    /// its batches take no other file's work.
+    task: Option<crate::FileId>,
 }
 
 /// A fact that moved under a statement: what the statement had seen of it,
@@ -801,13 +853,18 @@ impl Engine {
     pub(crate) fn run(&mut self, db: &mut DbIndex, recipe: &dyn Recipe, slice: Slice) -> bool {
         let started = self.stats.total_evaluations();
         loop {
-            let moved = file_queries(db);
-            if !moved.is_empty() {
-                self.readers_of(db, moved.iter());
-            }
+            self.file_queries(db);
             if slice.over(self.stats.total_evaluations() - started) {
                 self.flush_slot_notifications(db);
                 return false;
+            }
+            if supersteps()
+                && matches!(slice, Slice::Whole)
+                && self.loop_focus.is_empty()
+                && !self.worklist.is_empty()
+            {
+                self.superstep(db, recipe, slice);
+                continue;
             }
             let Some((id, reason)) = self.worklist.pop_first() else {
                 self.flush_slot_notifications(db);
@@ -830,135 +887,200 @@ impl Engine {
                 self.stats.round_started(self.worklist.order.len());
                 continue;
             };
-            if db.analysis_stage() < id.kind.first_stage() {
-                let held = self.held.entry(id).or_insert(reason);
-                *held = (*held).min(reason);
-                continue;
-            }
-            self.cursor = Some(id);
-            let stale = crate::profile::phase("engine: stale check", || {
-                self.needs_evaluation(db, id, reason)
-            });
-            if !stale {
-                self.moved_from.remove(&id);
-                if id.kind.is_query() {
-                    db.queries().set_stale(id, false);
-                }
-                continue;
-            }
-            self.trace_evaluation(db, id, reason);
-            self.check_convergence(id);
-            let group = crate::profile::phase("engine: co-producers", || co_producers(db, id));
-            if group.len() == 1
-                && recipe.records_on_workers(id.kind)
-                && matches!(slice, Slice::Whole)
-                && super::parallel::records_on_workers()
-                && crate::profile::phase("engine: recorded batch", || {
-                    self.run_recorded_batch(db, id, recipe)
-                })
-            {
-                self.queue_reruns();
-                continue;
-            }
-            if group.len() == 1 && recipe.splits(id.kind) {
-                crate::profile::phase("engine: batch", || self.run_batch(db, id, recipe));
-                self.queue_reruns();
-                continue;
-            }
-            let rerun = self.stats.profiling()
-                && group
-                    .iter()
-                    .all(|member| self.stats.distinct.contains(member));
-            for member in &group {
-                if *member != id {
-                    self.stats
-                        .requeue_cause(*member, "run with a queued co-producer");
-                }
-                self.unqueue(*member);
-                self.stats.evaluated(*member);
-                if member.kind.is_statement()
-                    && self.ran.insert(*member)
-                    && db.reader_graph().contains(*member)
-                {
-                    self.from_before.insert(*member);
-                }
-                let moved = self.moved_from.remove(member).unwrap_or_default();
-                if member.kind.is_statement() {
-                    self.settled_on(*member, moved);
-                }
-            }
-            self.evaluated.extend(
-                group
-                    .iter()
-                    .map(|member| member.file_id)
-                    .filter(|file_id| *file_id != crate::FileId::VIRTUAL),
-            );
-            let rebuilt = group
-                .iter()
-                .copied()
-                .filter(|member| {
-                    member.kind.is_statement() && self.rebuilt.contains(&member.file_id)
-                })
-                .collect::<Vec<_>>();
-            let started = self.stats.profiling().then(std::time::Instant::now);
-            let touched = crate::profile::phase("engine: evaluate", || {
-                self.evaluate_group(db, &group, recipe)
-            });
-            if let Some(started) = started {
-                let elapsed = started.elapsed();
-                for member in &group {
-                    self.stats
-                        .timed_evaluation(*member, elapsed / group.len() as u32);
-                }
-                self.stats.timed(id.kind, elapsed, usize::from(rerun), 1);
-                for member in &group {
-                    for key in db.reader_graph().reads_of(*member) {
-                        *self.stats.reads.entry(variant_name(key)).or_default() += 1;
-                    }
-                }
-            }
-            // A member that now shares a key with a derivation outside the
-            // group ran without it; the next evaluation takes both.
-            let widened = group.iter().find_map(|member| {
-                db.reader_graph().outputs_of(*member).find_map(|key| {
-                    if !key.is_primary() {
-                        return None;
-                    }
-                    db.reader_graph()
-                        .producers(key)
-                        .find(|producer| {
-                            producer.kind != DerivationKind::Source && !group.contains(producer)
-                        })
-                        .map(|producer| (key.clone(), producer))
-                })
-            });
-            if widened.is_some() {
-                // Again in this round: nothing ran after it yet.
-                self.stats.requeue_cause(id, "group widened");
-                self.worklist.insert(id, Reason::Changed);
-            }
-            self.queue_reruns();
-            crate::profile::phase("engine: readers of", || self.readers_of(db, touched.iter()));
-            // A statement of a rebuilt file settled, before the run, on what
-            // the removed derivations wrote.
-            for member in rebuilt {
-                let removed = db
-                    .reader_graph()
-                    .reads_of(member)
-                    .filter_map(|key| {
-                        Some(Moved {
-                            key: key.clone(),
-                            seen: *self.removed_outputs.get(key)?,
-                            settled: true,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                self.settled_on(member, removed);
-            }
+            self.step(db, recipe, slice, id, reason);
         }
         self.cursor = None;
         crate::profile::phase("engine: rebase moved reads", || self.rebase_moved_reads(db));
         true
+    }
+
+    /// Files the queries filed since the last call and queues the readers of
+    /// those that moved.
+    fn file_queries(&mut self, db: &mut DbIndex) {
+        let moved = file_queries(db);
+        if !moved.is_empty() {
+            self.readers_of(db, moved.iter());
+        }
+    }
+
+    /// Under `GLUALS_SUPERSTEP`: evaluates every entry queued at the first
+    /// rank, one file at a time, each file's to quiescence. Work an
+    /// evaluation queues for another file at the same rank waits for the next
+    /// superstep; workspace derivations run after the files.
+    fn superstep(&mut self, db: &mut DbIndex, recipe: &dyn Recipe, slice: Slice) {
+        let Some(rank) = self.worklist.first_rank() else {
+            return;
+        };
+        let tasks = self
+            .worklist
+            .files_at(rank)
+            .into_iter()
+            .map(|file_id| (file_id, self.worklist.take_file_at(rank, file_id)))
+            .collect::<Vec<_>>();
+        self.stats.supersteps += 1;
+        self.stats.superstep_tasks += tasks.len();
+        for (file_id, entries) in tasks {
+            if file_id == crate::FileId::VIRTUAL {
+                for (id, reason) in entries {
+                    self.file_queries(db);
+                    self.step(db, recipe, slice, id, reason);
+                }
+                continue;
+            }
+            let deferred = self.worklist.take_file_at(rank, file_id);
+            let mut local = Queue::new(self.worklist.schedule);
+            for (id, reason) in entries {
+                local.insert(id, reason);
+            }
+            self.task = Some(file_id);
+            while let Some((id, reason)) = local.pop_first() {
+                self.file_queries(db);
+                self.step(db, recipe, slice, id, reason);
+                for (id, reason) in self.worklist.take_file_at(rank, file_id) {
+                    local.insert(id, reason);
+                }
+            }
+            self.task = None;
+            for (id, reason) in deferred {
+                self.worklist.insert(id, reason);
+            }
+        }
+    }
+
+    /// Evaluates the queued `id` if it is due and stale: the work of one pop of
+    /// [`Self::run`].
+    fn step(
+        &mut self,
+        db: &mut DbIndex,
+        recipe: &dyn Recipe,
+        slice: Slice,
+        id: DerivationId,
+        reason: Reason,
+    ) {
+        if db.analysis_stage() < id.kind.first_stage() {
+            let held = self.held.entry(id).or_insert(reason);
+            *held = (*held).min(reason);
+            return;
+        }
+        self.cursor = Some(id);
+        let stale = crate::profile::phase("engine: stale check", || {
+            self.needs_evaluation(db, id, reason)
+        });
+        if !stale {
+            self.moved_from.remove(&id);
+            if id.kind.is_query() {
+                db.queries().set_stale(id, false);
+            }
+            return;
+        }
+        self.trace_evaluation(db, id, reason);
+        self.check_convergence(id);
+        let group = crate::profile::phase("engine: co-producers", || co_producers(db, id));
+        if group.len() == 1
+            && self.task.is_none()
+            && recipe.records_on_workers(id.kind)
+            && matches!(slice, Slice::Whole)
+            && super::parallel::records_on_workers()
+            && crate::profile::phase("engine: recorded batch", || {
+                self.run_recorded_batch(db, id, recipe)
+            })
+        {
+            self.queue_reruns();
+            return;
+        }
+        if group.len() == 1 && self.task.is_none() && recipe.splits(id.kind) {
+            crate::profile::phase("engine: batch", || self.run_batch(db, id, recipe));
+            self.queue_reruns();
+            return;
+        }
+        let rerun = self.stats.profiling()
+            && group
+                .iter()
+                .all(|member| self.stats.distinct.contains(member));
+        for member in &group {
+            if *member != id {
+                self.stats
+                    .requeue_cause(*member, "run with a queued co-producer");
+            }
+            self.unqueue(*member);
+            self.stats.evaluated(*member);
+            if member.kind.is_statement()
+                && self.ran.insert(*member)
+                && db.reader_graph().contains(*member)
+            {
+                self.from_before.insert(*member);
+            }
+            let moved = self.moved_from.remove(member).unwrap_or_default();
+            if member.kind.is_statement() {
+                self.settled_on(*member, moved);
+            }
+        }
+        self.evaluated.extend(
+            group
+                .iter()
+                .map(|member| member.file_id)
+                .filter(|file_id| *file_id != crate::FileId::VIRTUAL),
+        );
+        let rebuilt = group
+            .iter()
+            .copied()
+            .filter(|member| member.kind.is_statement() && self.rebuilt.contains(&member.file_id))
+            .collect::<Vec<_>>();
+        let started = self.stats.profiling().then(std::time::Instant::now);
+        let touched = crate::profile::phase("engine: evaluate", || {
+            self.evaluate_group(db, &group, recipe)
+        });
+        if let Some(started) = started {
+            let elapsed = started.elapsed();
+            for member in &group {
+                self.stats
+                    .timed_evaluation(*member, elapsed / group.len() as u32);
+            }
+            self.stats.timed(id.kind, elapsed, usize::from(rerun), 1);
+            for member in &group {
+                for key in db.reader_graph().reads_of(*member) {
+                    *self.stats.reads.entry(variant_name(key)).or_default() += 1;
+                }
+            }
+        }
+        // A member that now shares a key with a derivation outside the
+        // group ran without it; the next evaluation takes both.
+        let widened = group.iter().find_map(|member| {
+            db.reader_graph().outputs_of(*member).find_map(|key| {
+                if !key.is_primary() {
+                    return None;
+                }
+                db.reader_graph()
+                    .producers(key)
+                    .find(|producer| {
+                        producer.kind != DerivationKind::Source && !group.contains(producer)
+                    })
+                    .map(|producer| (key.clone(), producer))
+            })
+        });
+        if widened.is_some() {
+            // Again in this round: nothing ran after it yet.
+            self.stats.requeue_cause(id, "group widened");
+            self.worklist.insert(id, Reason::Changed);
+        }
+        self.queue_reruns();
+        crate::profile::phase("engine: readers of", || self.readers_of(db, touched.iter()));
+        // A statement of a rebuilt file settled, before the run, on what
+        // the removed derivations wrote.
+        for member in rebuilt {
+            let removed = db
+                .reader_graph()
+                .reads_of(member)
+                .filter_map(|key| {
+                    Some(Moved {
+                        key: key.clone(),
+                        seen: *self.removed_outputs.get(key)?,
+                        settled: true,
+                    })
+                })
+                .collect::<Vec<_>>();
+            self.settled_on(member, removed);
+        }
     }
 
     /// Notes that statement `member` settled on what it saw of each fact in
@@ -1930,6 +2052,9 @@ pub(crate) struct EngineStats {
     evaluations: BTreeMap<DerivationKind, usize>,
     /// Rounds after the first.
     pub(crate) rounds: usize,
+    /// Under `GLUALS_SUPERSTEP`: supersteps run, and file tasks across them.
+    supersteps: usize,
+    superstep_tasks: usize,
     /// Loops of statements cleared, and the derivations they ran again.
     pub(crate) loops_cleared: usize,
     pub(crate) loop_members_cleared: usize,
@@ -2130,6 +2255,12 @@ impl EngineStats {
             "[engine] parallel attempts={} fallbacks={}",
             self.parallel_attempts, self.parallel_fallbacks
         );
+        if self.supersteps > 0 {
+            eprintln!(
+                "[engine] supersteps={} tasks={}",
+                self.supersteps, self.superstep_tasks
+            );
+        }
         let mut distinct = BTreeMap::<DerivationKind, usize>::new();
         for id in &self.distinct {
             *distinct.entry(id.kind).or_default() += 1;
@@ -2442,6 +2573,12 @@ thread_local! {
     static WORKER_PUBLISHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Worker results this thread discarded and evaluated itself instead.
     static WORKER_FELL_BACK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `GLUALS_SUPERSTEP`: runs cold builds a superstep at a time.
+fn supersteps() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("GLUALS_SUPERSTEP").is_some())
 }
 
 fn check_convergence() -> bool {
