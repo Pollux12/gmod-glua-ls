@@ -238,6 +238,16 @@ impl LuaSignatureIndex {
         self.signatures.get(signature_id)
     }
 
+    /// Whether `signature_id` takes special-call params. Records a read of
+    /// that alone, so what inference later resolves for the signature leaves
+    /// the reader standing.
+    pub fn has_special_call_params(&self, signature_id: &LuaSignatureId) -> bool {
+        derivation::note_special_call_signature_read(*signature_id);
+        self.signatures
+            .get(signature_id)
+            .is_some_and(LuaSignature::has_special_call_params)
+    }
+
     pub fn get_mut(&mut self, signature_id: &LuaSignatureId) -> Option<&mut LuaSignature> {
         self.snapshot_source(*signature_id);
         derivation::note_write(|| FactKey::Signature(*signature_id));
@@ -846,6 +856,12 @@ impl LuaSignatureIndex {
                 }
                 derivation::fingerprint_of(&(signature, local_func_decl))
             }
+            FactKey::SpecialCallSignature(signature_id) => self
+                .signatures
+                .get(signature_id)
+                .map_or(derivation::ABSENT, |signature| {
+                    derivation::fingerprint_of(&signature.has_special_call_params())
+                }),
             FactKey::SignatureDecl(signature_id) => self
                 .signatures
                 .get(signature_id)

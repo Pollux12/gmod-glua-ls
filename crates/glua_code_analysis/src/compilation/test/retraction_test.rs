@@ -299,6 +299,69 @@ print(early, late, untouched)
     }
 
     #[test]
+    fn an_outparam_appearing_reaches_a_caller_in_another_file() {
+        let layout = "lua/autorun/sh_layout.lua";
+        let hud = "lua/autorun/client/cl_hud.lua";
+        let warm = VirtualWorkspace::assert_warm_matches_cold(
+            gmod,
+            &[
+                (layout, &stack_layout_text("")),
+                (
+                    hud,
+                    "local layout = {}
+local early = layout.rowHeight
+glide.GetHUDStackLayout(layout)
+local late = layout.rowHeight
+print(early, late)
+",
+                ),
+            ],
+            &[(
+                layout,
+                &stack_layout_text(
+                    "---@outparam out HUDStackLayout
+",
+                ),
+            )],
+        );
+
+        assert_eq!(last_name_type(&warm, hud, "late"), "integer");
+        assert_ne!(last_name_type(&warm, hud, "early"), "integer");
+    }
+
+    #[test]
+    fn an_outparam_appearing_on_another_variable_leaves_a_reader_unnarrowed() {
+        let layout = "lua/autorun/sh_layout.lua";
+        let hud = "lua/autorun/client/cl_hud.lua";
+        let warm = VirtualWorkspace::assert_warm_matches_cold(
+            gmod,
+            &[
+                (layout, &stack_layout_text("")),
+                (
+                    hud,
+                    "local layout = {}
+local other = {}
+glide.GetHUDStackLayout(other)
+local mine = layout.rowHeight
+local theirs = other.rowHeight
+print(mine, theirs)
+",
+                ),
+            ],
+            &[(
+                layout,
+                &stack_layout_text(
+                    "---@outparam out HUDStackLayout
+",
+                ),
+            )],
+        );
+
+        assert_eq!(last_name_type(&warm, hud, "theirs"), "integer");
+        assert_ne!(last_name_type(&warm, hud, "mine"), "integer");
+    }
+
+    #[test]
     fn default_constructor_operator_is_retracted_when_the_constructor_attribute_goes() {
         let meta = "lua/autorun/sh_class_meta.lua";
         let class = "lua/autorun/sh_myclass.lua";
