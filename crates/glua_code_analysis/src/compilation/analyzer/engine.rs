@@ -3068,7 +3068,7 @@ fn run_task_on_worker(
             .map(|(group, rerun)| {
                 let started = profiling.then(std::time::Instant::now);
                 let (records, group_touched) =
-                    evaluate_on_worker(&mut db, &recorder, group, recipe);
+                    evaluate_on_worker(&mut db, frozen, &recorder, group, recipe);
                 touched.extend(group_touched);
                 GroupRun {
                     members: group.clone(),
@@ -3100,6 +3100,7 @@ fn run_task_on_worker(
 #[allow(clippy::type_complexity)]
 fn evaluate_on_worker(
     db: &mut DbIndex,
+    frozen: &DbIndex,
     recorder: &derivation::TaskRecorder,
     group: &[DerivationId],
     recipe: &dyn Recipe,
@@ -3171,7 +3172,7 @@ fn evaluate_on_worker(
                             derivation::ReadState::Snapshot(slot) => db
                                 .reader_graph()
                                 .slot_fingerprint(slot, |key| db.fact_fingerprint(key)),
-                            derivation::ReadState::Fact(key) => db.fact_fingerprint(&key),
+                            derivation::ReadState::Fact(key) => closed_read_seen(db, frozen, &key),
                         })
                         .collect();
                     (at, id, seen)
@@ -3187,6 +3188,21 @@ fn evaluate_on_worker(
         touched.extend(discarded.iter().cloned());
         shared.extend(found);
     }
+}
+
+/// What a task's read of `key` saw, which the task wrote: in the closed stage,
+/// a key the superstep began without is recorded as seen absent, as a read
+/// the serial loop makes before the key's producer runs again sees it, so a
+/// loop that read it settles canonically as there.
+fn closed_read_seen(db: &DbIndex, frozen: &DbIndex, key: &HashedKey) -> derivation::Fingerprint {
+    let seen = db.fact_fingerprint(key);
+    if seen != derivation::ABSENT
+        && db.analysis_stage() == AnalysisStage::Closed
+        && frozen.fact_fingerprint(key) == derivation::ABSENT
+    {
+        return derivation::ABSENT;
+    }
+    seen
 }
 
 /// `key`'s fingerprint as a task's fork holds it: through the reader graph's
