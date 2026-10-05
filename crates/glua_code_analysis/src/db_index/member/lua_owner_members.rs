@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use rustc_hash::FxHashMap as HashMap;
 
 use super::member_id_sort_key;
-use crate::db_index::cow_shards::{Conflict, Merged, merge_list, merge_map, refuse};
+use crate::db_index::cow_shards::{Conflict, Merged, merge_list, merge_map};
 use crate::db_index::derivation::{Fingerprint, fingerprint_of, mapping_back};
 use crate::{LuaMemberId, LuaMemberIndexItem, LuaMemberKey};
 
@@ -38,6 +38,36 @@ impl PartialEq for LuaOwnerMembers {
             && self.expr_keys == other.expr_keys
             && self.members == other.members
     }
+}
+
+/// The ids listed under one key, which the index keeps as a set: the
+/// index's, less those the fork unlisted, with those it listed.
+fn merge_item(
+    current: Option<&LuaMemberIndexItem>,
+    frozen: Option<&LuaMemberIndexItem>,
+    fork: Option<&LuaMemberIndexItem>,
+) -> Merged<LuaMemberIndexItem> {
+    fn ids(item: Option<&LuaMemberIndexItem>) -> Vec<LuaMemberId> {
+        match item {
+            None => Vec::new(),
+            Some(LuaMemberIndexItem::One(id)) => vec![*id],
+            Some(LuaMemberIndexItem::Many(ids)) => ids.clone(),
+        }
+    }
+    let (frozen, fork) = (ids(frozen), ids(fork));
+    let mut merged = ids(current);
+    merged.retain(|id| !frozen.contains(id) || fork.contains(id));
+    for id in fork {
+        if !frozen.contains(&id) && !merged.contains(&id) {
+            merged.push(id);
+        }
+    }
+    merged.sort_by_key(|id| member_id_sort_key(*id));
+    Ok(match merged.as_slice() {
+        [] => None,
+        [id] => Some(LuaMemberIndexItem::One(*id)),
+        _ => Some(LuaMemberIndexItem::Many(merged)),
+    })
 }
 
 fn listed_id_fingerprint(key: &LuaMemberKey, id: LuaMemberId) -> Fingerprint {
@@ -95,7 +125,7 @@ impl LuaOwnerMembers {
             Some(&current.members),
             Some(&frozen.members),
             Some(&fork.members),
-            refuse,
+            merge_item,
         )?
         else {
             return Err(Conflict);
@@ -324,15 +354,40 @@ mod tests {
     }
 
     #[test]
-    fn tasks_changing_one_key_conflict() {
-        let frozen = owner_with(&[("a", member_id(1, 1))]);
-        let current = owner_with(&[("a", member_id(2, 2))]);
-        let fork = owner_with(&[("a", member_id(3, 3))]);
+    fn tasks_changing_one_key_merge_the_ids_listed_under_it() {
+        let key = LuaMemberKey::Name("a".into());
+        let item = |ids: &[LuaMemberId]| {
+            let mut ids = ids.to_vec();
+            ids.sort_by_key(|id| member_id_sort_key(*id));
+            match ids.as_slice() {
+                [id] => LuaMemberIndexItem::One(*id),
+                _ => LuaMemberIndexItem::Many(ids),
+            }
+        };
+        let owner = |ids: &[LuaMemberId]| {
+            let mut members = LuaOwnerMembers::new();
+            members.add_member(key.clone(), item(ids));
+            members
+        };
+        let (one, two, three) = (member_id(1, 1), member_id(2, 2), member_id(3, 3));
 
-        assert_eq!(
-            LuaOwnerMembers::merge(Some(&current), Some(&frozen), Some(&fork)),
-            Err(Conflict)
-        );
+        let merged = LuaOwnerMembers::merge(
+            Some(&owner(&[one, two])),
+            Some(&owner(&[one])),
+            Some(&owner(&[one, three])),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(merged.get_member(&key), Some(&item(&[one, two, three])));
+
+        let merged = LuaOwnerMembers::merge(
+            Some(&owner(&[one, two])),
+            Some(&owner(&[one])),
+            Some(&owner(&[three])),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(merged.get_member(&key), Some(&item(&[two, three])));
     }
 
     #[test]

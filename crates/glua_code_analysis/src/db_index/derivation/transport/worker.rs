@@ -210,13 +210,12 @@ impl WorkerContext {
 
     /// Whether any of the entries `locals` was written here after `since`.
     pub(in super::super) fn local_freshness(&self, locals: &[u32], since: u64) -> Freshness {
-        self.keys.freshness(locals, since, &self.snapshot.graph)
+        self.keys.freshness(locals, since)
     }
 
     /// Whether any of the snapshot's `slots` was written here after `since`.
     pub(in super::super) fn snapshot_freshness(&self, slots: &[KeyIdx], since: u64) -> Freshness {
-        self.keys
-            .snapshot_freshness(slots, since, &self.snapshot.graph)
+        self.keys.snapshot_freshness(slots, since)
     }
 
     /// The log, in entries, of the ended evaluation of this task `log` is the
@@ -710,9 +709,9 @@ impl TaskRecorder {
                 .iter()
                 .map(|local| {
                     let key = worker.keys.key(*local, &snapshot.graph);
-                    let state = if ended.is_some_and(|ended| {
-                        worker.keys.written_after(*local, ended, &snapshot.graph)
-                    }) && !reset.contains(key)
+                    let state = if ended
+                        .is_some_and(|ended| worker.keys.written_after(*local, ended))
+                        && !reset.contains(key)
                     {
                         ReadState::Unseen
                     } else if query_key(key.key()) {

@@ -1033,6 +1033,7 @@ impl Engine {
             return;
         };
         self.stats.supersteps += 1;
+        let dispatching = crate::profile::PhaseGuard::new("superstep: dispatch");
         let mut plans = Vec::new();
         let mut root = Vec::new();
         let mut workspace = Vec::new();
@@ -1062,9 +1063,11 @@ impl Engine {
             }
         }
         self.stats.superstep_tasks += plans.len();
+        drop(dispatching);
         if !plans.is_empty() {
-            self.run_on_workers(db, recipe, slice, rank, plans);
+            self.run_on_workers(db, recipe, slice, plans);
         }
+        let _root = crate::profile::PhaseGuard::new("superstep: root list");
         for (id, reason) in root.into_iter().chain(workspace) {
             self.file_queries(db);
             self.step(db, recipe, slice, id, reason);
@@ -1145,7 +1148,6 @@ impl Engine {
         db: &mut DbIndex,
         recipe: &dyn Recipe,
         slice: Slice,
-        rank: u8,
         plans: Vec<TaskPlan>,
     ) {
         let profiling = self.stats.profiling();
@@ -1164,10 +1166,13 @@ impl Engine {
             .iter()
             .map(|plan| (plan.file_id, plan))
             .collect::<FxHashMap<_, _>>();
+        let running = crate::profile::PhaseGuard::new("superstep: tasks");
         let outcomes = super::parallel::map_files_collect(db, &files, |_, file_id| {
             run_task_on_worker(&frozen, &snapshot, by_file[&file_id], recipe, profiling)
         });
         drop(snapshot);
+        drop(running);
+        let installing = crate::profile::PhaseGuard::new("superstep: install");
         let mut touched = FxHashSet::default();
         let mut tasks = Vec::with_capacity(outcomes.len());
         let mut recordings = Vec::with_capacity(outcomes.len());
@@ -1190,6 +1195,8 @@ impl Engine {
             ));
         }
         drop(frozen);
+        drop(installing);
+        let filing = crate::profile::PhaseGuard::new("superstep: file records");
         let mut table = db.reader_graph_mut().lend_keys();
         let mut written = Vec::new();
         let mut evaluations = Vec::with_capacity(recordings.len());
@@ -1248,9 +1255,12 @@ impl Engine {
         quarantine.finish(&mut table);
         db.reader_graph_mut().restore_keys(table);
         db.reader_graph_mut().mark_written(written.iter());
+        drop(filing);
+        let checking = crate::profile::PhaseGuard::new("superstep: readers of");
         self.forget_view(db);
         db.reader_graph().uncheck_derived(&touched);
         self.readers_of(db, touched.iter());
+        drop(checking);
         for (_, groups, _, reruns, _) in &tasks {
             for group in groups {
                 if self.widened(db, &group.members) {
@@ -1270,32 +1280,36 @@ impl Engine {
             self.file_queries(db);
             self.step(db, recipe, slice, id, Reason::Changed);
         }
-        // A task installed over an earlier task's change runs again on the
-        // index, with every earlier task that touched what it did, in file
-        // order, as in a serial superstep.
-        let mut installed: Vec<(crate::FileId, Vec<DerivationId>, FxHashSet<HashedKey>)> =
-            Vec::new();
-        for (file_id, groups, touched, _, conflicted) in tasks {
-            let ran = groups
-                .into_iter()
-                .flat_map(|group| group.members)
-                .collect::<Vec<_>>();
-            if !conflicted {
-                installed.push((file_id, ran, touched));
+        // A task installed over an earlier task's change left a value that
+        // lacks what one of them wrote: every producer of a primary key both
+        // touched runs again here, which resets the key and computes it from
+        // all its producers.
+        let _repairing = crate::profile::PhaseGuard::new("superstep: conflict repair");
+        let mut touched_before = FxHashSet::default();
+        let mut again = BTreeSet::new();
+        for (_, _, touched, _, conflicted) in &tasks {
+            if *conflicted {
+                for key in touched
+                    .intersection(&touched_before)
+                    .filter(|key| key.is_primary())
+                {
+                    again.extend(
+                        db.reader_graph()
+                            .producers(key)
+                            .filter(|producer| producer.kind != DerivationKind::Source),
+                    );
+                }
+            }
+            touched_before.extend(touched.iter().cloned());
+        }
+        let mut ran = FxHashSet::default();
+        for id in again {
+            if ran.contains(&id) {
                 continue;
             }
-            let mut again = installed
-                .extract_if(.., |(_, _, earlier)| !earlier.is_disjoint(&touched))
-                .collect::<Vec<_>>();
-            again.push((file_id, ran, touched));
-            for (file_id, ran, _) in again {
-                let entries = ran.into_iter().map(|id| (id, Reason::Changed)).collect();
-                self.superstep_touched = Some(FxHashSet::default());
-                let ran = self.run_task(db, recipe, slice, rank, file_id, entries);
-                let touched = self.take_task_touched();
-                self.superstep_touched = None;
-                installed.push((file_id, ran, touched));
-            }
+            ran.extend(co_producers(db, id));
+            self.file_queries(db);
+            self.step(db, recipe, slice, id, Reason::Changed);
         }
     }
 
@@ -3198,7 +3212,7 @@ thread_local! {
 
 /// How often a worker superstep runs one derivation within a stage before the
 /// stage settles on the serial loop.
-const SUPERSTEP_RUN_LIMIT: u32 = 16;
+const SUPERSTEP_RUN_LIMIT: u32 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SuperstepMode {

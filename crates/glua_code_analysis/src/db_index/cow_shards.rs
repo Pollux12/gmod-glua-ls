@@ -1099,19 +1099,22 @@ impl<T: Ord + Clone> SetOf for std::collections::BTreeSet<T> {
 /// index's elements, less those the fork dropped, with those it added
 /// appended in the fork's order. An emptied list is absent, as its owners
 /// prune it.
-pub(crate) fn merge_list<T: Clone + PartialEq>(
+pub(crate) fn merge_list<T: Clone + Eq + Hash>(
     current: Option<&Vec<T>>,
     frozen: Option<&Vec<T>>,
     fork: Option<&Vec<T>>,
 ) -> Merged<Vec<T>> {
-    let (frozen, fork) = (
-        frozen.map_or(&[][..], Vec::as_slice),
-        fork.map_or(&[][..], Vec::as_slice),
-    );
+    let frozen = frozen
+        .into_iter()
+        .flatten()
+        .collect::<rustc_hash::FxHashSet<_>>();
+    let fork = fork.map_or(&[][..], Vec::as_slice);
+    let kept = fork.iter().collect::<rustc_hash::FxHashSet<_>>();
     let mut merged = current.cloned().unwrap_or_default();
-    merged.retain(|element| !frozen.contains(element) || fork.contains(element));
+    merged.retain(|element| !frozen.contains(element) || kept.contains(element));
+    let mut present = merged.iter().cloned().collect::<rustc_hash::FxHashSet<_>>();
     for element in fork {
-        if !frozen.contains(element) && !merged.contains(element) {
+        if !frozen.contains(element) && present.insert(element.clone()) {
             merged.push(element.clone());
         }
     }
@@ -1120,7 +1123,7 @@ pub(crate) fn merge_list<T: Clone + PartialEq>(
 
 /// [`merge_list`] for a list its owners keep sorted by `key` without
 /// duplicates: the merged list is sorted the same way.
-pub(crate) fn merge_sorted_by<T: Clone + PartialEq, K: Ord>(
+pub(crate) fn merge_sorted_by<T: Clone + Eq + Hash, K: Ord>(
     current: Option<&Vec<T>>,
     frozen: Option<&Vec<T>>,
     fork: Option<&Vec<T>>,

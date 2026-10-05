@@ -58,9 +58,15 @@ pub(crate) struct WorkerKeys {
     /// The stamp each entry was last written at here (0: not written here,
     /// as the snapshot holds it), as [`KeyTable`] keeps them for its slots.
     written: Vec<u64>,
+    /// Whether each entry is being computed again here.
+    windowed: Vec<bool>,
     /// The entries an evaluation here computes again, each with the stamp it
     /// was written at before; see [`KeyTable::open_window`].
     windows: FxHashMap<u32, u64>,
+    /// The entries of the keys read out of each entry's key, and those whose
+    /// base has no entry yet, by the base.
+    derived: FxHashMap<u32, Vec<u32>>,
+    awaiting_base: FxHashMap<HashedKey, Vec<u32>>,
     /// The stamp of the latest write here.
     last_written: u64,
     /// Keys written here that nothing had read, here or in the snapshot: a
@@ -74,6 +80,7 @@ impl WorkerKeys {
         self.entries.push(key);
         self.visitation.push(0);
         self.written.push(0);
+        self.windowed.push(false);
         let query = match key {
             WorkerKey::Known(slot) => snapshot.keys().is_query(slot),
             WorkerKey::New(index) => matches!(
@@ -83,6 +90,23 @@ impl WorkerKeys {
         };
         let flags = u8::from(self.snapshot_taints(local, snapshot)) | (u8::from(query) << 1);
         self.flags.push(flags);
+        let key = self.key(local, snapshot).clone();
+        if let Some(children) = self.awaiting_base.remove(&key) {
+            self.derived.entry(local).or_default().extend(children);
+        }
+        if let Some(base) = key.base() {
+            let base = HashedKey::new(base);
+            match self.find(&base, snapshot) {
+                Some(base) => {
+                    self.derived.entry(base).or_default().push(local);
+                    if self.windowed[base as usize] {
+                        self.windowed[local as usize] = true;
+                        self.windows.entry(local).or_insert(0);
+                    }
+                }
+                None => self.awaiting_base.entry(base).or_default().push(local),
+            }
+        }
         local
     }
 
@@ -139,10 +163,33 @@ impl WorkerKeys {
 
     /// The entry a write of `key` marks: one if anything read the key, here
     /// or in the snapshot, as [`KeyTable::mark_written`] marks only slots.
+    /// Its derived keys the snapshot has slots for get entries too, so they
+    /// are marked with it.
     fn written_entry(&mut self, key: &HashedKey, snapshot: &ReaderGraph) -> Option<u32> {
-        match snapshot.find_slot(key) {
-            Some(slot) => Some(self.known(slot, snapshot)),
-            None => self.find(key, snapshot),
+        let local = match snapshot.find_slot(key) {
+            Some(slot) => {
+                let local = self.known(slot, snapshot);
+                for derived in snapshot.keys().derived_slots(slot) {
+                    self.known(*derived, snapshot);
+                }
+                local
+            }
+            None => self.find(key, snapshot)?,
+        };
+        Some(local)
+    }
+
+    /// The entry `local` and the entries of the keys read out of it.
+    fn with_derived(&self, local: u32) -> Vec<u32> {
+        std::iter::once(local)
+            .chain(self.derived.get(&local).into_iter().flatten().copied())
+            .collect()
+    }
+
+    fn stamp(&mut self, local: u32, now: u64) {
+        self.last_written = self.last_written.max(now);
+        for local in self.with_derived(local) {
+            self.written[local as usize] = now;
         }
     }
 
@@ -159,18 +206,14 @@ impl WorkerKeys {
             self.unread_writes.insert(key.clone());
             return false;
         };
-        self.last_written = self.last_written.max(now);
-        self.written[local as usize] = now;
+        self.stamp(local, now);
         self.visitation[local as usize] >= since
     }
 
     /// Marks `key` written at stamp `now`, as [`KeyTable::mark_written`].
     pub(crate) fn mark_written(&mut self, key: &HashedKey, now: u64, snapshot: &ReaderGraph) {
         match self.written_entry(key, snapshot) {
-            Some(local) => {
-                self.last_written = self.last_written.max(now);
-                self.written[local as usize] = now;
-            }
+            Some(local) => self.stamp(local, now),
             None => {
                 self.unread_writes.insert(key.clone());
             }
@@ -185,120 +228,94 @@ impl WorkerKeys {
             return;
         };
         self.last_written = self.last_written.max(now);
-        let written = &mut self.written[local as usize];
-        self.windows.entry(local).or_insert(*written);
-        *written = now;
+        for local in self.with_derived(local) {
+            let written = &mut self.written[local as usize];
+            self.windows.entry(local).or_insert(*written);
+            *written = now;
+            self.windowed[local as usize] = true;
+        }
     }
 
-    /// Closes every window: a key `unchanged` accepts is written as it was
-    /// before its window opened, as [`KeyTable::close_windows`].
+    /// Closes every window: a key `unchanged` accepts, and each key read out
+    /// of it, is written as it was before its window opened, as
+    /// [`KeyTable::close_windows`].
     pub(crate) fn close_windows(
         &mut self,
         snapshot: &ReaderGraph,
         unchanged: impl Fn(&HashedKey) -> bool,
     ) {
-        for (local, before) in std::mem::take(&mut self.windows) {
-            let key = self.key(local, snapshot);
-            if key.base().is_none() && unchanged(key) {
-                self.written[local as usize] = before;
+        let windows = std::mem::take(&mut self.windows);
+        for (local, before) in &windows {
+            self.windowed[*local as usize] = false;
+            let key = self.key(*local, snapshot);
+            if key.base().is_some() || !unchanged(key) {
+                continue;
             }
-        }
-    }
-
-    /// Whether `key`, or a key it is read out of, is computed again here.
-    pub(crate) fn windowed(&self, key: &HashedKey, snapshot: &ReaderGraph) -> bool {
-        !self.windows.is_empty() && self.chain_windowed(key.clone(), snapshot)
-    }
-
-    fn chain_windowed(&self, key: HashedKey, snapshot: &ReaderGraph) -> bool {
-        let mut key = Some(key);
-        while let Some(at) = key {
-            if self
-                .find(&at, snapshot)
-                .is_some_and(|local| self.windows.contains_key(&local))
-            {
-                return true;
-            }
-            key = at.base().map(HashedKey::new);
-        }
-        false
-    }
-
-    /// How a read of `key`, or of a key it is read out of, was written here
-    /// after stamp `since`: as [`KeyTable::written_since`] answers for a slot.
-    fn chain_freshness(&self, key: &HashedKey, since: u64, snapshot: &ReaderGraph) -> Freshness {
-        let mut freshness = Freshness::Unwritten;
-        let mut at = Some(key.clone());
-        while let Some(key) = at {
-            if let Some(local) = self.find(&key, snapshot)
-                && self.written[local as usize] > since
-            {
-                match self.windows.get(&local) {
-                    Some(before) if *before <= since => freshness = Freshness::Recomputing,
-                    _ => return Freshness::Written,
+            self.written[*local as usize] = *before;
+            for derived in self.derived.get(local).into_iter().flatten() {
+                if let Some(before) = windows.get(derived) {
+                    self.written[*derived as usize] = *before;
                 }
             }
-            at = key.base().map(HashedKey::new);
         }
-        freshness
+    }
+
+    /// Whether `key` is computed again here.
+    pub(crate) fn windowed(&self, key: &HashedKey, snapshot: &ReaderGraph) -> bool {
+        !self.windows.is_empty()
+            && self
+                .find(key, snapshot)
+                .is_some_and(|local| self.windowed[local as usize])
+    }
+
+    /// How the entry `local` was written here after stamp `since`, as
+    /// [`KeyTable::written_since`] answers for a slot.
+    fn entry_freshness(&self, local: u32, since: u64) -> Freshness {
+        if self.written[local as usize] <= since {
+            return Freshness::Unwritten;
+        }
+        match self.windows.get(&local) {
+            Some(before) if *before <= since => Freshness::Recomputing,
+            _ => Freshness::Written,
+        }
     }
 
     /// Whether any of the entries `locals` was written here after `since`.
-    pub(crate) fn freshness(
-        &self,
-        locals: &[u32],
-        since: u64,
-        snapshot: &ReaderGraph,
-    ) -> Freshness {
+    pub(crate) fn freshness(&self, locals: &[u32], since: u64) -> Freshness {
         if self.last_written <= since {
             return Freshness::Unwritten;
         }
-        let mut freshness = Freshness::Unwritten;
-        for local in locals {
-            match self.chain_freshness(self.key(*local, snapshot), since, snapshot) {
-                Freshness::Unwritten => {}
-                Freshness::Recomputing => freshness = Freshness::Recomputing,
-                Freshness::Written => return Freshness::Written,
-            }
-        }
-        freshness
+        locals
+            .iter()
+            .fold(Freshness::Unwritten, |freshness, local| {
+                freshness.and(self.entry_freshness(*local, since))
+            })
     }
 
     /// Whether any of the snapshot's `slots` was written here after `since`.
-    pub(crate) fn snapshot_freshness(
-        &self,
-        slots: &[KeyIdx],
-        since: u64,
-        snapshot: &ReaderGraph,
-    ) -> Freshness {
+    pub(crate) fn snapshot_freshness(&self, slots: &[KeyIdx], since: u64) -> Freshness {
         if self.last_written <= since {
             return Freshness::Unwritten;
         }
-        let mut freshness = Freshness::Unwritten;
-        for slot in slots {
-            let Some(key) = snapshot.keys().live_key(*slot) else {
-                return Freshness::Written;
-            };
-            match self.chain_freshness(key, since, snapshot) {
-                Freshness::Unwritten => {}
-                Freshness::Recomputing => freshness = Freshness::Recomputing,
-                Freshness::Written => return Freshness::Written,
+        slots.iter().fold(Freshness::Unwritten, |freshness, slot| {
+            match self.known.get(slot) {
+                Some(local) => freshness.and(self.entry_freshness(*local, since)),
+                None => freshness,
             }
-        }
-        freshness
+        })
     }
 
-    /// Whether `key`, or a key it is read out of, was written here.
+    /// Whether `key` was written here.
     pub(crate) fn written_here(&self, key: &HashedKey, snapshot: &ReaderGraph) -> bool {
-        self.last_written != 0 && self.chain_freshness(key, 0, snapshot) != Freshness::Unwritten
+        self.last_written != 0
+            && self
+                .find(key, snapshot)
+                .is_some_and(|local| self.written[local as usize] != 0)
     }
 
-    /// Whether the entry `local`, or a key it is read out of, was written
-    /// here after stamp `stamp`.
-    pub(crate) fn written_after(&self, local: u32, stamp: u64, snapshot: &ReaderGraph) -> bool {
-        self.last_written > stamp
-            && self.chain_freshness(self.key(local, snapshot), stamp, snapshot)
-                != Freshness::Unwritten
+    /// Whether the entry `local` was written here after stamp `stamp`.
+    pub(crate) fn written_after(&self, local: u32, stamp: u64) -> bool {
+        self.written[local as usize] > stamp
     }
 
     /// Every key written here.
@@ -340,7 +357,7 @@ impl WorkerKeys {
         false
     }
 
-    fn log(&mut self, evaluation: &mut Evaluation, local: u32, snapshot: &ReaderGraph) {
+    fn log(&mut self, evaluation: &mut Evaluation, local: u32, _snapshot: &ReaderGraph) {
         if self.is_query(local)
             && let Some(frame) = evaluation.frames.last_mut()
         {
@@ -355,10 +372,7 @@ impl WorkerKeys {
                 evaluation.read.push(local);
             }
         }
-        if self.flags[local as usize] & 1 != 0
-            || (!self.windows.is_empty()
-                && self.chain_windowed(self.key(local, snapshot).clone(), snapshot))
-        {
+        if self.flags[local as usize] & 1 != 0 || self.windowed[local as usize] {
             frames::taint_evaluation(evaluation);
         }
     }

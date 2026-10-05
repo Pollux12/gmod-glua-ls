@@ -399,7 +399,7 @@ pub struct GmodClassMetadataIndex {
     meta_fingerprints: CowShards<SmolStr, Fingerprint>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct VguiPanelDefinition {
     file_id: FileId,
     range_start: TextSize,

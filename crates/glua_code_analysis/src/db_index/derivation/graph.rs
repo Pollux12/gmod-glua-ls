@@ -747,6 +747,13 @@ impl KeyTable {
             .chain(more.into_iter().flatten().copied())
     }
 
+    /// The slots of the keys read out of `slot`'s key.
+    pub(super) fn derived_slots(&self, slot: KeyIdx) -> &[KeyIdx] {
+        self.derived
+            .get(&slot)
+            .map_or(&[], |derived| &derived.slots)
+    }
+
     /// Whether `slot`'s value is being computed again.
     pub(super) fn windowed(&self, slot: KeyIdx) -> bool {
         self.keys[slot as usize].windowed

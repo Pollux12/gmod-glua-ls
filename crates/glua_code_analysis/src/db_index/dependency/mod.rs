@@ -63,7 +63,7 @@ impl Hash for LuaDependencySite {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct DependencySiteLocation {
     source_file_id: FileId,
     site_index: usize,
