@@ -13,8 +13,8 @@ mod transport;
 
 pub(crate) use transport::query_requires_canonical as worker_requires_canonical;
 pub(crate) use transport::{
-    RecordingSnapshot, ReleaseQuarantine, compute_recorded, note_observed_query_read,
-    require_canonical_query, worker_query_readiness,
+    ReadState, RecordingSnapshot, ReleaseQuarantine, TaskRecorder, TaskRecording, compute_recorded,
+    note_observed_query_read, require_canonical_query, worker_query_readiness,
 };
 
 use std::cell::RefCell;
@@ -1201,6 +1201,29 @@ impl Evaluation {
             })
             .collect();
         (id, reads, outputs)
+    }
+
+    /// The evaluation's interned reads, each with the fingerprint in `seen`
+    /// at its position among them, and its outputs: a task's evaluation,
+    /// whose reads were fingerprinted where it ran.
+    pub fn into_recorded_seen(
+        mut self,
+        seen: Vec<Fingerprint>,
+    ) -> (DerivationId, Vec<(KeyIdx, Fingerprint)>, Vec<HashedKey>) {
+        debug_assert_eq!(self.read.len(), seen.len());
+        debug_assert!(self.reads.is_empty(), "a task reads through its entries");
+        let mut slots = std::mem::take(&mut self.read)
+            .into_iter()
+            .zip(seen)
+            .collect::<Vec<_>>();
+        slots.sort_unstable_by_key(|(slot, _)| *slot);
+        slots.dedup_by_key(|(slot, _)| *slot);
+        self.outputs.sort_unstable_by_key(|key| key.hash);
+        self.outputs.dedup();
+        let id = self.id;
+        let outputs = std::mem::take(&mut self.outputs);
+        Spare::park(&mut self);
+        (id, slots, outputs)
     }
 
     /// The evaluation's interned reads, its reads made while no key table

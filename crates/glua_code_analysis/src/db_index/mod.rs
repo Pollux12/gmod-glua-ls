@@ -137,8 +137,9 @@ pub struct DbIndex {
     /// The stage the engine run is at; [`derivation::AnalysisStage::Closed`]
     /// outside a run.
     analysis_stage: derivation::AnalysisStage,
-    /// The memos of the facts computed when first read; see [`query`].
-    queries: query::Queries,
+    /// The memos of the facts computed when first read; see [`query`]. A
+    /// fork shares them: a task reads them as a worker does, never writing.
+    queries: Arc<query::Queries>,
 }
 
 /// See [`DbIndex::type_structure_revision`] — process-global so revision values
@@ -244,7 +245,7 @@ impl DbIndex {
             net_helper_refs: Default::default(),
             function_summaries: Default::default(),
             analysis_stage: derivation::AnalysisStage::default(),
-            queries: query::Queries::default(),
+            queries: Arc::default(),
         }
     }
 
@@ -1260,7 +1261,7 @@ impl DbIndex {
             net_helper_refs: self.net_helper_refs.clone(),
             function_summaries: self.function_summaries.clone(),
             analysis_stage: self.analysis_stage,
-            queries: self.queries.clone(),
+            queries: Arc::clone(&self.queries),
         }
     }
 
@@ -1270,6 +1271,7 @@ impl DbIndex {
     pub(crate) fn fork_independent(&self) -> Self {
         Self {
             type_structure_revision: next_type_structure_revision(),
+            queries: Arc::new(query::Queries::clone(&self.queries)),
             ..self.fork()
         }
     }
@@ -1280,7 +1282,7 @@ impl DbIndex {
     pub(crate) fn superstep_base(&self) -> Self {
         Self {
             derivations: Arc::default(),
-            queries: query::Queries::default(),
+            queries: Arc::default(),
             ..self.fork()
         }
     }
@@ -1299,7 +1301,7 @@ impl DbIndex {
                     gmod_call_roles: self.gmod_call_roles.clone(),
                     type_structure_revision: self.type_structure_revision,
                     analysis_stage: self.analysis_stage,
-                    queries: query::Queries::default(),
+                    queries: Arc::clone(&self.queries),
                 }
             };
         }

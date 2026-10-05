@@ -9,8 +9,9 @@ use super::{Evaluation, HashedKey, KeyIdx, KeyTable, ReaderGraph, frames};
 
 mod worker;
 pub(crate) use worker::{
-    RecordingSnapshot, compute_recorded, note_observed_query_read, query_requires_canonical,
-    require_canonical_query, worker_query_readiness,
+    ReadState, RecordingSnapshot, TaskRecorder, TaskRecording, compute_recorded,
+    note_observed_query_read, query_requires_canonical, require_canonical_query,
+    worker_query_readiness,
 };
 pub(super) use worker::{SavedRecording, active, report_worker_replays, with_keys};
 
@@ -62,6 +63,9 @@ pub(crate) struct WorkerKeys {
     windows: FxHashMap<u32, u64>,
     /// The stamp of the latest write here.
     last_written: u64,
+    /// Keys written here that nothing had read, here or in the snapshot: a
+    /// task that read one meanwhile has it stamped at the barrier.
+    unread_writes: rustc_hash::FxHashSet<HashedKey>,
 }
 
 impl WorkerKeys {
@@ -152,6 +156,7 @@ impl WorkerKeys {
         snapshot: &ReaderGraph,
     ) -> bool {
         let Some(local) = self.written_entry(key, snapshot) else {
+            self.unread_writes.insert(key.clone());
             return false;
         };
         self.last_written = self.last_written.max(now);
@@ -161,9 +166,14 @@ impl WorkerKeys {
 
     /// Marks `key` written at stamp `now`, as [`KeyTable::mark_written`].
     pub(crate) fn mark_written(&mut self, key: &HashedKey, now: u64, snapshot: &ReaderGraph) {
-        if let Some(local) = self.written_entry(key, snapshot) {
-            self.last_written = self.last_written.max(now);
-            self.written[local as usize] = now;
+        match self.written_entry(key, snapshot) {
+            Some(local) => {
+                self.last_written = self.last_written.max(now);
+                self.written[local as usize] = now;
+            }
+            None => {
+                self.unread_writes.insert(key.clone());
+            }
         }
     }
 
@@ -171,6 +181,7 @@ impl WorkerKeys {
     /// as [`KeyTable::open_window`].
     pub(crate) fn open_window(&mut self, key: &HashedKey, now: u64, snapshot: &ReaderGraph) {
         let Some(local) = self.written_entry(key, snapshot) else {
+            self.unread_writes.insert(key.clone());
             return;
         };
         self.last_written = self.last_written.max(now);
@@ -277,6 +288,19 @@ impl WorkerKeys {
         freshness
     }
 
+    /// Whether `key`, or a key it is read out of, was written here.
+    pub(crate) fn written_here(&self, key: &HashedKey, snapshot: &ReaderGraph) -> bool {
+        self.last_written != 0 && self.chain_freshness(key, 0, snapshot) != Freshness::Unwritten
+    }
+
+    /// Whether the entry `local`, or a key it is read out of, was written
+    /// here after stamp `stamp`.
+    pub(crate) fn written_after(&self, local: u32, stamp: u64, snapshot: &ReaderGraph) -> bool {
+        self.last_written > stamp
+            && self.chain_freshness(self.key(local, snapshot), stamp, snapshot)
+                != Freshness::Unwritten
+    }
+
     /// Every key written here.
     pub(crate) fn written_keys<'a>(
         &'a self,
@@ -285,6 +309,7 @@ impl WorkerKeys {
         (0..self.entries.len() as u32)
             .filter(|local| self.written[*local as usize] != 0)
             .map(|local| self.key(local, snapshot))
+            .chain(&self.unread_writes)
     }
 
     pub(crate) fn key<'a>(&'a self, local: u32, snapshot: &'a ReaderGraph) -> &'a HashedKey {

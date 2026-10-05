@@ -601,6 +601,17 @@ pub(crate) fn compute_recorded<T>(
     WorkerResult { evaluation, value }
 }
 
+/// What a task's evaluation saw of one of its reads, short of fingerprinting
+/// it: whether another evaluation of its group moved it since it ended, the
+/// answer it took from the snapshot if it is a query output, and whether the
+/// task wrote it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ReadState {
+    Unseen,
+    Query(Fingerprint),
+    Fact { written_here: bool },
+}
+
 /// Records the evaluations of one superstep task against a snapshot of the
 /// reader graph: reads and writes go to the task's own entries, a memo one
 /// evaluation of the task made holds for a later one while what it read was
@@ -614,10 +625,6 @@ pub(crate) struct TaskRecorder {
     stamp: u64,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "superstep tasks record through it")
-)]
 impl TaskRecorder {
     pub(crate) fn start(snapshot: &RecordingSnapshot) -> Self {
         let saved = SavedRecording::worker();
@@ -685,6 +692,56 @@ impl TaskRecorder {
         .expect("the task recorder is installed")
     }
 
+    /// What the evaluation the task ended at `at` saw of each of its reads,
+    /// in order: a read of a key another member of its group wrote after it
+    /// ended at stamp `ended`, unless `reset` holds the key, is unseen.
+    pub(crate) fn read_states(
+        &self,
+        at: usize,
+        ended: Option<u64>,
+        reset: &FxHashSet<HashedKey>,
+    ) -> Vec<(HashedKey, ReadState)> {
+        with_keys(|worker| {
+            let task = worker.task.as_ref().expect("a task records into its logs");
+            let snapshot = &worker.snapshot;
+            task.evaluations[at]
+                .0
+                .read
+                .iter()
+                .map(|local| {
+                    let key = worker.keys.key(*local, &snapshot.graph);
+                    let state = if ended.is_some_and(|ended| {
+                        worker.keys.written_after(*local, ended, &snapshot.graph)
+                    }) && !reset.contains(key)
+                    {
+                        ReadState::Unseen
+                    } else if query_key(key.key()) {
+                        ReadState::Query(
+                            worker
+                                .queries
+                                .get(local)
+                                .map(|witness| witness.seen)
+                                .or_else(|| snapshot.queries.get(key).copied())
+                                .unwrap_or(derivation::UNSEEN),
+                        )
+                    } else {
+                        ReadState::Fact {
+                            written_here: worker.keys.written_here(key, &snapshot.graph),
+                        }
+                    };
+                    (key.clone(), state)
+                })
+                .collect()
+        })
+        .expect("the task recorder is installed")
+    }
+
+    /// Whether the task wrote `key`, or a key it is read out of.
+    pub(crate) fn written_here(&self, key: &HashedKey) -> bool {
+        with_keys(|worker| worker.keys.written_here(key, &worker.snapshot.graph))
+            .expect("the task recorder is installed")
+    }
+
     /// Stops recording and hands back what the task recorded.
     pub(crate) fn finish(mut self) -> TaskRecording {
         let worker = WORKER
@@ -727,7 +784,6 @@ pub(crate) struct TaskRecording {
     stamp: u64,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "superstep barriers file it"))]
 impl TaskRecording {
     /// Every key the task wrote, each once.
     pub(crate) fn written(&self) -> &[HashedKey] {

@@ -385,6 +385,11 @@ pub(crate) struct Engine {
     /// Under `GLUALS_SUPERSTEP`, the file whose superstep task is running:
     /// its batches take no other file's work.
     task: Option<crate::FileId>,
+    /// Under `GLUALS_SUPERSTEP=workers`, how often each derivation ran in a
+    /// task since the run entered its stage, and whether one ran so often
+    /// that the stage settles on the serial loop instead.
+    task_runs: FxHashMap<DerivationId, u32>,
+    serial_stage: bool,
     /// Under `GLUALS_SUPERSTEP`, every key the superstep's tasks touched, and
     /// those the running task touched.
     superstep_touched: Option<FxHashSet<HashedKey>>,
@@ -862,13 +867,20 @@ impl Engine {
                 self.flush_slot_notifications(db);
                 return false;
             }
-            if supersteps()
+            if superstep_mode() != SuperstepMode::Off
                 && matches!(slice, Slice::Whole)
                 && self.loop_focus.is_empty()
                 && !self.worklist.is_empty()
             {
-                self.superstep(db, recipe, slice);
-                continue;
+                if superstep_mode() == SuperstepMode::Workers {
+                    if self.edits.is_empty() && self.rebuilt.is_empty() && !self.serial_stage {
+                        self.superstep_on_workers(db, recipe, slice);
+                        continue;
+                    }
+                } else {
+                    self.superstep(db, recipe, slice);
+                    continue;
+                }
             }
             let Some((id, reason)) = self.worklist.pop_first() else {
                 self.flush_slot_notifications(db);
@@ -1004,6 +1016,297 @@ impl Engine {
             self.file_queries(db);
             self.step(db, recipe, slice, id, reason);
         }
+    }
+
+    /// Under `GLUALS_SUPERSTEP=workers`: [`Self::superstep`] with each file's
+    /// task run on a worker thread. The root decides what each task runs, as
+    /// [`Self::step`] does before it evaluates a group; a group that reaches
+    /// another file, a query and workspace derivations run on the index after
+    /// the barrier. A task evaluates its groups in order on its own fork of
+    /// the index, recording against the reader graph as the superstep found
+    /// it, and runs nothing more: what its writes move is found at the
+    /// barrier, which installs the forks and files the records in file
+    /// order before checking the readers of everything the tasks touched.
+    fn superstep_on_workers(&mut self, db: &mut DbIndex, recipe: &dyn Recipe, slice: Slice) {
+        let Some(rank) = self.worklist.first_rank() else {
+            return;
+        };
+        self.stats.supersteps += 1;
+        let mut plans = Vec::new();
+        let mut root = Vec::new();
+        let mut workspace = Vec::new();
+        for file_id in self.worklist.files_at(rank) {
+            let entries = self.worklist.take_file_at(rank, file_id);
+            if file_id == crate::FileId::VIRTUAL {
+                workspace = entries;
+                continue;
+            }
+            let mut groups = Vec::new();
+            let mut grouped = FxHashSet::default();
+            for (id, reason) in entries {
+                if grouped.contains(&id) {
+                    continue;
+                }
+                match self.dispatch(db, file_id, id, reason) {
+                    Dispatched::Settled => {}
+                    Dispatched::Root => root.push((id, reason)),
+                    Dispatched::Task(group, rerun) => {
+                        grouped.extend(group.iter().copied());
+                        groups.push((group, rerun));
+                    }
+                }
+            }
+            if !groups.is_empty() {
+                plans.push(TaskPlan { file_id, groups });
+            }
+        }
+        self.stats.superstep_tasks += plans.len();
+        if !plans.is_empty() {
+            self.run_on_workers(db, recipe, slice, rank, plans);
+        }
+        for (id, reason) in root.into_iter().chain(workspace) {
+            self.file_queries(db);
+            self.step(db, recipe, slice, id, reason);
+        }
+    }
+
+    /// Decides what queued `id` of `file_id` comes to in a worker superstep,
+    /// doing for a group its file's task runs what [`Self::step`] does before
+    /// it evaluates one.
+    fn dispatch(
+        &mut self,
+        db: &mut DbIndex,
+        file_id: crate::FileId,
+        id: DerivationId,
+        reason: Reason,
+    ) -> Dispatched {
+        if db.analysis_stage() < id.kind.first_stage() {
+            let held = self.held.entry(id).or_insert(reason);
+            *held = (*held).min(reason);
+            return Dispatched::Settled;
+        }
+        self.cursor = Some(id);
+        if id.kind.is_query() {
+            return Dispatched::Root;
+        }
+        if !self.needs_evaluation(db, id, reason) {
+            self.moved_from.remove(&id);
+            return Dispatched::Settled;
+        }
+        let group = co_producers(db, id);
+        if group.iter().any(|member| member.file_id != file_id) {
+            return Dispatched::Root;
+        }
+        self.trace_evaluation(db, id, reason);
+        self.check_convergence(id);
+        let rerun = self.stats.profiling()
+            && group
+                .iter()
+                .all(|member| self.stats.distinct.contains(member));
+        for member in &group {
+            if *member != id {
+                self.stats
+                    .requeue_cause(*member, "run with a queued co-producer");
+            }
+            self.unqueue(*member);
+            self.stats.evaluated(*member);
+            if member.kind.is_statement()
+                && self.ran.insert(*member)
+                && db.reader_graph().contains(*member)
+            {
+                self.from_before.insert(*member);
+            }
+            let moved = self.moved_from.remove(member).unwrap_or_default();
+            if member.kind.is_statement() {
+                self.settled_on(*member, moved);
+            }
+        }
+        self.evaluated.insert(file_id);
+        for member in &group {
+            let runs = self.task_runs.entry(*member).or_default();
+            *runs += 1;
+            // A loop that keeps moving under supersteps, where each task sees
+            // only what the others wrote before it, settles as the serial
+            // loop settles it.
+            if *runs > SUPERSTEP_RUN_LIMIT && !self.serial_stage {
+                self.serial_stage = true;
+                self.stats.serial_stages += 1;
+            }
+        }
+        Dispatched::Task(group, rerun)
+    }
+
+    /// Runs `plans` on worker threads against the index and reader graph as
+    /// they stand, then installs the tasks' forks and files what they
+    /// recorded, in file order.
+    fn run_on_workers(
+        &mut self,
+        db: &mut DbIndex,
+        recipe: &dyn Recipe,
+        slice: Slice,
+        rank: u8,
+        plans: Vec<TaskPlan>,
+    ) {
+        let profiling = self.stats.profiling();
+        // Tasks lend no table, so stage rules that moved are marked here.
+        let moved_rules = std::mem::take(self.moved_rules.get_mut());
+        db.reader_graph_mut().mark_written(moved_rules.iter());
+        let quarantine = db.reader_graph_mut().quarantine_releases();
+        let snapshot = derivation::RecordingSnapshot::new(
+            db.reader_graph_shared(),
+            quarantine.started(),
+            db.queries().ready_outputs(),
+        );
+        let frozen = db.fork();
+        let files = plans.iter().map(|plan| plan.file_id).collect::<Vec<_>>();
+        let by_file = plans
+            .iter()
+            .map(|plan| (plan.file_id, plan))
+            .collect::<FxHashMap<_, _>>();
+        let outcomes = super::parallel::map_files_collect(db, &files, |_, file_id| {
+            run_task_on_worker(&frozen, &snapshot, by_file[&file_id], recipe, profiling)
+        });
+        drop(snapshot);
+        let mut touched = FxHashSet::default();
+        let mut tasks = Vec::with_capacity(outcomes.len());
+        let mut recordings = Vec::with_capacity(outcomes.len());
+        for (plan, outcome) in plans.iter().zip(outcomes) {
+            let conflict = db.task_conflict(&frozen, &outcome.fork);
+            db.install_task(&frozen, outcome.fork);
+            if let Some(field) = conflict {
+                *self.stats.task_conflicts.entry(field).or_default() += 1;
+            }
+            touched.extend(outcome.touched.iter().cloned());
+            recordings.push(outcome.recording);
+            tasks.push((
+                plan.file_id,
+                outcome.groups,
+                outcome.touched,
+                outcome.reruns,
+                conflict.is_some(),
+            ));
+        }
+        drop(frozen);
+        let mut table = db.reader_graph_mut().lend_keys();
+        let mut written = Vec::new();
+        let mut evaluations = Vec::with_capacity(recordings.len());
+        for recording in recordings {
+            written.extend(recording.written().iter().cloned());
+            evaluations.push(
+                recording
+                    .canonicalise(&mut table)
+                    .expect("no slot is released while tasks run"),
+            );
+        }
+        db.reader_graph_mut().restore_keys(table);
+        let mut released = Vec::new();
+        let mut on_root = Vec::new();
+        for ((_, groups, ..), evaluations) in tasks.iter().zip(evaluations) {
+            let mut evaluations = evaluations.into_iter().map(Some).collect::<Vec<_>>();
+            for group in groups {
+                if group.records.iter().any(|(at, _)| {
+                    evaluations[*at]
+                        .as_ref()
+                        .is_some_and(|(_, canonical)| *canonical)
+                }) {
+                    on_root.extend(group.members.iter().copied());
+                    continue;
+                }
+                for (at, seen) in &group.records {
+                    let (evaluation, _) = evaluations[*at].take().expect("a record is filed once");
+                    touched.extend(evaluation.moved().cloned());
+                    let (id, reads, outputs) = evaluation.into_recorded_seen(seen.clone());
+                    touched.extend(outputs.iter().cloned());
+                    let graph = db.reader_graph_mut();
+                    graph.replace_slots(
+                        id,
+                        reads
+                            .into_iter()
+                            .map(|(slot, seen)| (slot, Some(seen)))
+                            .collect(),
+                        outputs,
+                        |_| unreachable!("a task fingerprints its reads"),
+                        &mut released,
+                        derivation::new_stamp(),
+                    );
+                }
+                if let Some(started) = group.elapsed.filter(|_| profiling) {
+                    for member in &group.members {
+                        self.stats
+                            .timed_evaluation(*member, started / group.members.len() as u32);
+                    }
+                    self.stats
+                        .timed(group.members[0].kind, started, usize::from(group.rerun), 1);
+                }
+            }
+        }
+        db.reader_graph_mut().release_keys(released);
+        let mut table = db.reader_graph_mut().lend_keys();
+        quarantine.finish(&mut table);
+        db.reader_graph_mut().restore_keys(table);
+        db.reader_graph_mut().mark_written(written.iter());
+        self.forget_view(db);
+        db.reader_graph().uncheck_derived(&touched);
+        self.readers_of(db, touched.iter());
+        for (_, groups, _, reruns, _) in &tasks {
+            for group in groups {
+                if self.widened(db, &group.members) {
+                    self.stats.requeue_cause(group.members[0], "group widened");
+                    self.worklist.insert(group.members[0], Reason::Changed);
+                }
+            }
+            for id in reruns {
+                self.stats
+                    .requeue_cause(*id, "wrote a type under a fallback it may have read");
+                self.worklist.insert(*id, Reason::Changed);
+            }
+        }
+        // A group that read a query the snapshot had no answer for runs again
+        // here, where the query is computed.
+        for id in on_root {
+            self.file_queries(db);
+            self.step(db, recipe, slice, id, Reason::Changed);
+        }
+        // A task installed over an earlier task's change runs again on the
+        // index, with every earlier task that touched what it did, in file
+        // order, as in a serial superstep.
+        let mut installed: Vec<(crate::FileId, Vec<DerivationId>, FxHashSet<HashedKey>)> =
+            Vec::new();
+        for (file_id, groups, touched, _, conflicted) in tasks {
+            let ran = groups
+                .into_iter()
+                .flat_map(|group| group.members)
+                .collect::<Vec<_>>();
+            if !conflicted {
+                installed.push((file_id, ran, touched));
+                continue;
+            }
+            let mut again = installed
+                .extract_if(.., |(_, _, earlier)| !earlier.is_disjoint(&touched))
+                .collect::<Vec<_>>();
+            again.push((file_id, ran, touched));
+            for (file_id, ran, _) in again {
+                let entries = ran.into_iter().map(|id| (id, Reason::Changed)).collect();
+                self.superstep_touched = Some(FxHashSet::default());
+                let ran = self.run_task(db, recipe, slice, rank, file_id, entries);
+                let touched = self.take_task_touched();
+                self.superstep_touched = None;
+                installed.push((file_id, ran, touched));
+            }
+        }
+    }
+
+    /// Whether a member of `group` now shares a primary output with a
+    /// derivation outside it, which it ran without.
+    fn widened(&self, db: &DbIndex, group: &[DerivationId]) -> bool {
+        group.iter().any(|member| {
+            db.reader_graph().outputs_of(*member).any(|key| {
+                key.is_primary()
+                    && db.reader_graph().producers(key).any(|producer| {
+                        producer.kind != DerivationKind::Source && !group.contains(&producer)
+                    })
+            })
+        })
     }
 
     /// Takes what the task that just ran touched, adding it to what the
@@ -1158,20 +1461,7 @@ impl Engine {
         }
         // A member that now shares a key with a derivation outside the
         // group ran without it; the next evaluation takes both.
-        let widened = group.iter().find_map(|member| {
-            db.reader_graph().outputs_of(*member).find_map(|key| {
-                if !key.is_primary() {
-                    return None;
-                }
-                db.reader_graph()
-                    .producers(key)
-                    .find(|producer| {
-                        producer.kind != DerivationKind::Source && !group.contains(producer)
-                    })
-                    .map(|producer| (key.clone(), producer))
-            })
-        });
-        if widened.is_some() {
+        if self.widened(db, &group) {
             // Again in this round: nothing ran after it yet.
             self.stats.requeue_cause(id, "group widened");
             self.worklist.insert(id, Reason::Changed);
@@ -1406,6 +1696,8 @@ impl Engine {
     /// Moves the run to `stage`. Returns the keys of the rules that moved.
     fn enter_stage(&mut self, db: &mut DbIndex, stage: AnalysisStage) -> Vec<HashedKey> {
         self.stage_evaluations.clear();
+        self.task_runs.clear();
+        self.serial_stage = false;
         let before = db.analysis_stage();
         db.set_analysis_stage(stage);
         let moved = StageRule::ALL
@@ -2083,7 +2375,13 @@ impl Engine {
             ));
             let mut cleared = FxHashSet::default();
             let (evaluations, found) = self.with_lent_keys(db, &touched, |db| {
-                run_group(db, group, own, &reset, recipe, &mut cleared)
+                run_group(db, group, own, &reset, &mut cleared, |db, member| {
+                    derivation::begin(member);
+                    recipe.evaluate(db, member);
+                    let evaluation = derivation::end();
+                    let outputs = evaluation.outputs().cloned().collect();
+                    (evaluation, outputs)
+                })
             });
             touched.extend(cleared);
             if found.is_empty() {
@@ -2173,6 +2471,8 @@ pub(crate) struct EngineStats {
     superstep_tasks: usize,
     /// Tasks run again on the index, by the first value they conflicted on.
     task_conflicts: BTreeMap<&'static str, usize>,
+    /// Stages a worker run settled on the serial loop.
+    serial_stages: usize,
     /// Loops of statements cleared, and the derivations they ran again.
     pub(crate) loops_cleared: usize,
     pub(crate) loop_members_cleared: usize,
@@ -2375,8 +2675,8 @@ impl EngineStats {
         );
         if self.supersteps > 0 {
             eprintln!(
-                "[engine] supersteps={} tasks={} conflicts={:?}",
-                self.supersteps, self.superstep_tasks, self.task_conflicts
+                "[engine] supersteps={} tasks={} serial stages={} conflicts={:?}",
+                self.supersteps, self.superstep_tasks, self.serial_stages, self.task_conflicts
             );
         }
         let mut distinct = BTreeMap::<DerivationKind, usize>::new();
@@ -2464,6 +2764,206 @@ impl EngineStats {
 /// outputs no other member writes (by the records, and not in `shared`), reset
 /// when it runs; and, for a group of several, the keys reset before any member
 /// runs, the rest of their primary outputs and those in `discarded`.
+/// The groups one file's task runs in a worker superstep, in order.
+struct TaskPlan {
+    file_id: crate::FileId,
+    /// Each group with whether every member ran before.
+    groups: Vec<(Vec<DerivationId>, bool)>,
+}
+
+/// What dispatching a queued entry to a worker superstep decided.
+enum Dispatched {
+    /// Nothing runs: it waits for its stage, or what it read holds.
+    Settled,
+    /// Its file's task runs the group; whether every member ran before.
+    Task(Vec<DerivationId>, bool),
+    /// It runs on the index after the barrier.
+    Root,
+}
+
+/// What a task ran for one group: each evaluation it files, by its index
+/// among the task's, with what it saw of each of its reads.
+struct GroupRun {
+    members: Vec<DerivationId>,
+    records: Vec<(usize, Vec<derivation::Fingerprint>)>,
+    rerun: bool,
+    elapsed: Option<std::time::Duration>,
+}
+
+/// What a task left for the barrier.
+struct TaskOutcome {
+    fork: DbIndex,
+    recording: derivation::TaskRecording,
+    groups: Vec<GroupRun>,
+    touched: FxHashSet<HashedKey>,
+    reruns: Vec<DerivationId>,
+}
+
+/// Runs `plan`'s groups on a fork of `frozen`, recording against `snapshot`.
+fn run_task_on_worker(
+    frozen: &DbIndex,
+    snapshot: &derivation::RecordingSnapshot,
+    plan: &TaskPlan,
+    recipe: &dyn Recipe,
+    profiling: bool,
+) -> TaskOutcome {
+    let mut db = frozen.task_fork();
+    let recorder = derivation::TaskRecorder::start(snapshot);
+    let mut touched = FxHashSet::default();
+    let groups = super::parallel::in_task(plan.file_id, || {
+        plan.groups
+            .iter()
+            .map(|(group, rerun)| {
+                let started = profiling.then(std::time::Instant::now);
+                let (records, group_touched) =
+                    evaluate_on_worker(&mut db, &recorder, group, recipe);
+                touched.extend(group_touched);
+                GroupRun {
+                    members: group.clone(),
+                    records: records
+                        .into_iter()
+                        .map(|(at, _, seen)| (at, seen.into_iter().map(|(_, seen)| seen).collect()))
+                        .collect(),
+                    rerun: *rerun,
+                    elapsed: started.map(|started| started.elapsed()),
+                }
+            })
+            .collect()
+    });
+    let reruns = derivation::take_reruns();
+    TaskOutcome {
+        fork: db,
+        recording: recorder.finish(),
+        groups,
+        touched,
+        reruns,
+    }
+}
+
+/// [`Engine::evaluate_group`] in a task: resets the group's outputs on the
+/// task's fork and runs it with the task's recorder, then fingerprints what
+/// each evaluation read as the fork holds it. Returns the evaluations to file
+/// with what each saw of its reads, and adds every key the group touched to
+/// `touched`.
+#[allow(clippy::type_complexity)]
+fn evaluate_on_worker(
+    db: &mut DbIndex,
+    recorder: &derivation::TaskRecorder,
+    group: &[DerivationId],
+    recipe: &dyn Recipe,
+) -> (
+    Vec<(
+        usize,
+        DerivationId,
+        Vec<(HashedKey, derivation::Fingerprint)>,
+    )>,
+    FxHashSet<HashedKey>,
+) {
+    let mut touched = FxHashSet::default();
+    let mut shared = FxHashSet::default();
+    let mut discarded = FxHashSet::default();
+    loop {
+        let (own, mut reset) = group_resets(db, group, &shared, &discarded);
+        let deferred = own.iter().flatten().cloned().collect::<FxHashSet<_>>();
+        let mut outputs = discarded.clone();
+        for member in group {
+            outputs.extend(db.reader_graph().outputs_of(*member).cloned());
+        }
+        let recomputing = outputs
+            .iter()
+            .map(|key| (key.clone(), task_fingerprint(db, recorder, key)))
+            .collect::<FxHashMap<_, _>>();
+        let resets = derivation::capture_writes(|| {
+            for key in outputs
+                .iter()
+                .filter(|key| key.is_primary() && !deferred.contains(*key))
+            {
+                db.reset_fact(key);
+            }
+        });
+        if group.len() > 1 {
+            reset.extend(resets.iter().cloned());
+        }
+        touched.extend(outputs);
+        touched.extend(resets);
+        derivation::note_recomputing(recomputing.keys().cloned());
+        derivation::note_written(
+            touched
+                .iter()
+                .filter(|key| !recomputing.contains_key(*key))
+                .cloned(),
+        );
+        let mut cleared = FxHashSet::default();
+        let (evaluations, found) = run_group(db, group, own, &reset, &mut cleared, |db, member| {
+            recorder.begin(member);
+            recipe.evaluate(db, member);
+            let at = recorder.end();
+            let outputs =
+                recorder.with_ended(at, |evaluation, _| evaluation.outputs().cloned().collect());
+            (at, outputs)
+        });
+        derivation::note_recomputed(|key| recomputing.get(key) == Some(&db.fact_fingerprint(key)));
+        touched.extend(cleared);
+        for (at, _) in &evaluations {
+            recorder.with_ended(*at, |evaluation, _| {
+                touched.extend(evaluation.outputs().chain(evaluation.moved()).cloned());
+            });
+        }
+        if found.is_empty() {
+            let records = evaluations
+                .into_iter()
+                .map(|(at, ended)| {
+                    let id = recorder.with_ended(at, |evaluation, _| evaluation.id);
+                    let seen = recorder
+                        .read_states(at, ended, &reset)
+                        .into_iter()
+                        .map(|(key, state)| {
+                            let seen = match state {
+                                derivation::ReadState::Unseen => derivation::UNSEEN,
+                                derivation::ReadState::Query(seen) => seen,
+                                derivation::ReadState::Fact { written_here: true } => {
+                                    db.fact_fingerprint(&key)
+                                }
+                                derivation::ReadState::Fact {
+                                    written_here: false,
+                                } => db
+                                    .reader_graph()
+                                    .current_fingerprint(&key, |key| db.fact_fingerprint(key)),
+                            };
+                            (key, seen)
+                        })
+                        .collect();
+                    (at, id, seen)
+                })
+                .collect();
+            return (records, touched);
+        }
+        for (at, _) in &evaluations {
+            recorder.with_ended(*at, |evaluation, _| {
+                discarded.extend(evaluation.outputs().chain(evaluation.moved()).cloned());
+            });
+        }
+        touched.extend(discarded.iter().cloned());
+        shared.extend(found);
+    }
+}
+
+/// `key`'s fingerprint as a task's fork holds it: through the reader graph's
+/// cache when the task wrote neither it nor a key it is read out of, which
+/// leaves it as the superstep found it.
+fn task_fingerprint(
+    db: &DbIndex,
+    recorder: &derivation::TaskRecorder,
+    key: &HashedKey,
+) -> derivation::Fingerprint {
+    if recorder.written_here(key) {
+        db.fact_fingerprint(key)
+    } else {
+        db.reader_graph()
+            .current_fingerprint(key, |key| db.fact_fingerprint(key))
+    }
+}
+
 fn group_resets(
     db: &DbIndex,
     group: &[DerivationId],
@@ -2512,17 +3012,14 @@ fn group_resets(
 /// either ran: a member's own key an earlier one wrote, or a key two members
 /// wrote. Returns the evaluations, each but the last with the stamp it ended
 /// at, and the keys that stopped it (none if it ran through).
-fn run_group(
+fn run_group<E>(
     db: &mut DbIndex,
     group: &[DerivationId],
     own: Vec<Vec<HashedKey>>,
     reset: &FxHashSet<HashedKey>,
-    recipe: &dyn Recipe,
     cleared: &mut FxHashSet<HashedKey>,
-) -> (
-    Vec<(derivation::Evaluation, Option<u64>)>,
-    FxHashSet<HashedKey>,
-) {
+    mut evaluate: impl FnMut(&mut DbIndex, DerivationId) -> (E, Vec<HashedKey>),
+) -> (Vec<(E, Option<u64>)>, FxHashSet<HashedKey>) {
     let mut evaluations = Vec::with_capacity(group.len());
     // Each primary key written that was not reset before the group, with the
     // position of the member that wrote it first.
@@ -2545,12 +3042,10 @@ fn run_group(
             derivation::note_written(moved.iter().cloned());
             cleared.extend(moved);
         }
-        derivation::begin(*member);
-        recipe.evaluate(db, *member);
-        let evaluation = derivation::end();
+        let (evaluation, outputs) = evaluate(db, *member);
         let mut found = FxHashSet::default();
-        for key in evaluation
-            .outputs()
+        for key in outputs
+            .iter()
             .filter(|key| key.is_primary() && !reset.contains(*key))
         {
             let first = *writers.entry(key.clone()).or_insert(position);
@@ -2693,10 +3188,28 @@ thread_local! {
     static WORKER_FELL_BACK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// `GLUALS_SUPERSTEP`: runs cold builds a superstep at a time.
-fn supersteps() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("GLUALS_SUPERSTEP").is_some())
+/// How often a worker superstep runs one derivation within a stage before the
+/// stage settles on the serial loop.
+const SUPERSTEP_RUN_LIMIT: u32 = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuperstepMode {
+    Off,
+    /// Each file's task on a fork of the index, one after another.
+    Serial,
+    /// Each file's task on a worker thread.
+    Workers,
+}
+
+/// `GLUALS_SUPERSTEP`: runs cold builds a superstep at a time, the tasks on
+/// worker threads when it is `workers`.
+fn superstep_mode() -> SuperstepMode {
+    static MODE: std::sync::OnceLock<SuperstepMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("GLUALS_SUPERSTEP") {
+        Err(_) => SuperstepMode::Off,
+        Ok(mode) if mode == "workers" => SuperstepMode::Workers,
+        Ok(_) => SuperstepMode::Serial,
+    })
 }
 
 fn check_settled() -> bool {
