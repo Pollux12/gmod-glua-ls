@@ -1353,42 +1353,56 @@ impl DbIndex {
     /// field `self` had changed since `frozen` that `fork` changed too, to
     /// another value, with no merge of the two: the fork's value replaces it.
     pub(crate) fn install_task(&mut self, frozen: &Self, fork: Self) -> Vec<&'static str> {
-        debug_assert!(
-            Arc::ptr_eq(&fork.vfs, &frozen.vfs) && Arc::ptr_eq(&fork.emmyrc, &frozen.emmyrc)
-        );
-        debug_assert_eq!(fork.analysis_stage, frozen.analysis_stage);
-        let mut conflicts = Vec::new();
-        let roles = |index: &Self| {
-            index
-                .gmod_call_roles
-                .as_ref()
-                .map(|(_, fingerprint)| *fingerprint)
-        };
-        let (now, was, forked) = (roles(self), roles(frozen), roles(&fork));
-        if forked != was {
-            if now != was && now != forked {
-                conflicts.push("DbIndex.gmod_call_roles");
-            }
-            self.gmod_call_roles = fork.gmod_call_roles.clone();
-        }
-        if fork.type_structure_revision != frozen.type_structure_revision {
-            self.type_structure_revision = next_type_structure_revision();
-        }
-        macro_rules! install {
-            ($($domain:ident),*; $($field:ident $(=> $merge:expr)?),*) => {
-                $(if cow_shards::TaskFork::wrote(&*fork.$domain, &frozen.$domain) {
-                    Arc::make_mut(&mut self.$domain).install_task_reporting(
-                        &frozen.$domain,
-                        Arc::unwrap_or_clone(fork.$domain),
-                        &mut conflicts,
-                    );
-                })*
-                $(if cow_shards::install_field!(self.$field, frozen.$field, fork.$field $(, $merge)?) {
-                    conflicts.push(concat!("DbIndex.", stringify!($field)));
-                })*
+        self.install_tasks(frozen, vec![fork])
+            .pop()
+            .expect("one fork, one report")
+    }
+
+    /// Takes in what each of `forks`, task forks of `frozen`, changed, in
+    /// order, as [`Self::install_task`] one after another does. Domains
+    /// install on the thread pool, each taking every fork in order. Returns
+    /// each fork's conflicts.
+    pub(crate) fn install_tasks(
+        &mut self,
+        frozen: &Self,
+        mut forks: Vec<Self>,
+    ) -> Vec<Vec<&'static str>> {
+        let mut conflicts = vec![Vec::new(); forks.len()];
+        macro_rules! domains {
+            ($forks:ident, $reports:ident; $($domain:ident),*) => {
+                let mut $reports = Vec::new();
+                $(
+                    let _ = stringify!($domain);
+                    $reports.push(vec![Vec::new(); $forks.len()]);
+                )*
+                rayon::scope(|scope| {
+                    let mut out = $reports.iter_mut();
+                    $({
+                        let target = &mut self.$domain;
+                        let base = &frozen.$domain;
+                        let installed = $forks
+                            .iter_mut()
+                            .map(|fork| std::mem::replace(&mut fork.$domain, Arc::clone(base)))
+                            .collect::<Vec<_>>();
+                        let out = out.next().expect("a report per domain");
+                        scope.spawn(move |_| {
+                            for (at, fork) in installed.into_iter().enumerate() {
+                                if cow_shards::TaskFork::wrote(&*fork, base) {
+                                    Arc::make_mut(target).install_task_reporting(
+                                        base,
+                                        Arc::unwrap_or_clone(fork),
+                                        &mut out[at],
+                                    );
+                                }
+                            }
+                        });
+                    })*
+                });
             };
         }
-        install!(
+        domains!(
+            forks,
+            reports;
             decl_index,
             references_index,
             types_index,
@@ -1412,7 +1426,55 @@ impl DbIndex {
             numeric_range_population_index,
             metatable_index,
             global_index,
-            json_schema_index;
+            json_schema_index
+        );
+        for reported in reports {
+            for (at, fields) in reported.into_iter().enumerate() {
+                conflicts[at].extend(fields);
+            }
+        }
+        for (fork, conflicts) in forks.into_iter().zip(&mut conflicts) {
+            self.install_task_fields(frozen, fork, conflicts);
+        }
+        conflicts
+    }
+
+    /// Takes in what `fork`, a task fork of `frozen`, changed of the fields
+    /// the index holds itself.
+    fn install_task_fields(
+        &mut self,
+        frozen: &Self,
+        fork: Self,
+        conflicts: &mut Vec<&'static str>,
+    ) {
+        debug_assert!(
+            Arc::ptr_eq(&fork.vfs, &frozen.vfs) && Arc::ptr_eq(&fork.emmyrc, &frozen.emmyrc)
+        );
+        debug_assert_eq!(fork.analysis_stage, frozen.analysis_stage);
+        let roles = |index: &Self| {
+            index
+                .gmod_call_roles
+                .as_ref()
+                .map(|(_, fingerprint)| *fingerprint)
+        };
+        let (now, was, forked) = (roles(self), roles(frozen), roles(&fork));
+        if forked != was {
+            if now != was && now != forked {
+                conflicts.push("DbIndex.gmod_call_roles");
+            }
+            self.gmod_call_roles = fork.gmod_call_roles.clone();
+        }
+        if fork.type_structure_revision != frozen.type_structure_revision {
+            self.type_structure_revision = next_type_structure_revision();
+        }
+        macro_rules! fields {
+            ($($field:ident $(=> $merge:expr)?),*) => {
+                $(if cow_shards::install_field!(self.$field, frozen.$field, fork.$field $(, $merge)?) {
+                    conflicts.push(concat!("DbIndex.", stringify!($field)));
+                })*
+            };
+        }
+        fields!(
             call_role_fingerprints,
             role_mentions,
             helper_scans,
@@ -1423,7 +1485,6 @@ impl DbIndex {
             net_helper_refs => cow_shards::merge_set,
             function_summaries
         );
-        conflicts
     }
 }
 

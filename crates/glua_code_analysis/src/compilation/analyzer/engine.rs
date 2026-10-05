@@ -1194,21 +1194,36 @@ impl Engine {
         let mut touched = FxHashSet::default();
         let mut tasks = Vec::with_capacity(outcomes.len());
         let mut recordings = Vec::with_capacity(outcomes.len());
-        for (plan, outcome) in plans.iter().zip(outcomes) {
-            let conflicts = db.install_task(&frozen, outcome.fork);
+        let (forks, outcomes): (Vec<_>, Vec<_>) = outcomes
+            .into_iter()
+            .map(|outcome| {
+                let TaskOutcome {
+                    fork,
+                    recording,
+                    groups,
+                    touched,
+                    reruns,
+                } = outcome;
+                (fork, (recording, groups, touched, reruns))
+            })
+            .unzip();
+        let installed = db.install_tasks(&frozen, forks);
+        for ((plan, (recording, groups, task_touched, reruns)), conflicts) in
+            plans.iter().zip(outcomes).zip(installed)
+        {
             if !conflicts.is_empty() {
                 self.stats.conflicting_tasks += 1;
             }
             for field in &conflicts {
                 *self.stats.task_conflicts.entry(field).or_default() += 1;
             }
-            touched.extend(outcome.touched.iter().cloned());
-            recordings.push(outcome.recording);
+            touched.extend(task_touched.iter().cloned());
+            recordings.push(recording);
             tasks.push((
                 plan.file_id,
-                outcome.groups,
-                outcome.touched,
-                outcome.reruns,
+                groups,
+                task_touched,
+                reruns,
                 !conflicts.is_empty(),
             ));
         }
