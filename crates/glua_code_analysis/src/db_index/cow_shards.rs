@@ -317,7 +317,52 @@ impl<K, V> CowShards<K, V> {
     }
 }
 
-impl<K: ShardKey + Clone, V: Clone + PartialEq> CowShards<K, V> {
+/// What an install replaced or left over: the shards and values a superstep
+/// no longer holds, freed on the drop thread.
+struct Replaced<K, V> {
+    shards: Vec<Arc<Shard<K, V>>>,
+    left: Vec<Shard<K, V>>,
+    values: Vec<V>,
+}
+
+impl<K, V> Replaced<K, V> {
+    fn is_empty(&self) -> bool {
+        self.shards.is_empty() && self.left.is_empty() && self.values.is_empty()
+    }
+}
+
+impl<K, V> Default for Replaced<K, V> {
+    fn default() -> Self {
+        Self {
+            shards: Vec::new(),
+            left: Vec::new(),
+            values: Vec::new(),
+        }
+    }
+}
+
+/// Drops `garbage` on a thread kept for it, off the path of the barrier
+/// that let go of it.
+pub(crate) fn drop_apart<T: Send + 'static>(garbage: T) {
+    type Garbage = Box<dyn Send>;
+    static DROPS: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Garbage>>> =
+        std::sync::OnceLock::new();
+    let drops = DROPS.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<Garbage>();
+        std::thread::Builder::new()
+            .name("index-drops".into())
+            .spawn(move || receiver.into_iter().for_each(drop))
+            .ok()
+            .map(|_| sender)
+    });
+    if let Some(drops) = drops {
+        let _ = drops.send(Box::new(garbage));
+    }
+}
+
+impl<K: ShardKey + Clone + Send + Sync + 'static, V: Clone + PartialEq + Send + Sync + 'static>
+    CowShards<K, V>
+{
     /// The slots `fork`, a fork of `frozen`, may have changed: the shards it
     /// wrote, or every slot when it was replaced or cleared whole.
     fn forked_slots(frozen: &Self, fork: &Self) -> Vec<usize> {
@@ -340,6 +385,7 @@ impl<K: ShardKey + Clone, V: Clone + PartialEq> CowShards<K, V> {
     /// shards are taken, not copied.
     fn install_with(&mut self, frozen: &Self, mut fork: Self, merge: Option<Merge<V>>) -> bool {
         let mut conflicted = false;
+        let mut replaced = Replaced::default();
         for at in Self::forked_slots(frozen, &fork) {
             let was = frozen.held_shard(at);
             if same_shard(was, fork.held_shard(at)) {
@@ -347,7 +393,7 @@ impl<K: ShardKey + Clone, V: Clone + PartialEq> CowShards<K, V> {
             }
             let forked = fork.take_held_shard(at);
             if same_shard(was, self.held_shard(at)) {
-                self.place_shard(at, forked);
+                replaced.shards.extend(self.place_shard(at, forked));
                 continue;
             }
             let was = was.map(|was| &**was);
@@ -379,6 +425,7 @@ impl<K: ShardKey + Clone, V: Clone + PartialEq> CowShards<K, V> {
                         Ok(()) => merged,
                         Err(Conflict) => {
                             conflicted = true;
+                            replaced.values.extend(merged);
                             value
                         }
                     }
@@ -386,11 +433,15 @@ impl<K: ShardKey + Clone, V: Clone + PartialEq> CowShards<K, V> {
                     conflicted = true;
                     value
                 };
-                match value {
+                replaced.values.extend(match value {
                     Some(value) => target.insert(key, value),
                     None => target.remove(&key),
-                };
+                });
             }
+            replaced.left.push(forked);
+        }
+        if !replaced.is_empty() {
+            drop_apart(replaced);
         }
         conflicted
     }
@@ -408,13 +459,17 @@ impl<K: ShardKey + Clone, V: Clone + PartialEq> CowShards<K, V> {
         self.forked || Arc::strong_count(&self.slots) > 1
     }
 
-    /// Puts `shard` at `at` for an install.
-    fn place_shard(&mut self, at: usize, shard: Option<Arc<Shard<K, V>>>) {
+    /// Puts `shard` at `at` for an install, returning the shard it replaces.
+    fn place_shard(
+        &mut self,
+        at: usize,
+        shard: Option<Arc<Shard<K, V>>>,
+    ) -> Option<Arc<Shard<K, V>>> {
         if self.writes_apart() {
-            self.dirty.insert(at as u32, shard.unwrap_or_default());
+            self.dirty.insert(at as u32, shard.unwrap_or_default())
         } else {
-            self.dirty.remove(&(at as u32));
-            self.slots_mut(at)[at] = shard;
+            let kept = self.dirty.remove(&(at as u32));
+            std::mem::replace(&mut self.slots_mut(at)[at], shard).or(kept)
         }
     }
 
@@ -432,7 +487,9 @@ impl<K: ShardKey + Clone, V: Clone + PartialEq> CowShards<K, V> {
     }
 }
 
-impl<K: ShardKey + Clone, V: Clone + PartialEq> CowShards<K, V> {
+impl<K: ShardKey + Clone + Send + Sync + 'static, V: Clone + PartialEq + Send + Sync + 'static>
+    CowShards<K, V>
+{
     /// The keys `fork`, a fork of `frozen`, changed.
     pub(crate) fn changed_keys(frozen: &Self, fork: &Self) -> Vec<K> {
         Self::forked_slots(frozen, fork)
@@ -497,20 +554,24 @@ impl<K: Clone, V: Clone> CowShards<K, V> {
         Arc::make_mut(shard)
     }
 
-    /// Folds the shards an install kept in `dirty` into the slot table.
-    fn flatten_shards(&mut self) {
+    /// Folds the shards an install kept in `dirty` into the slot table,
+    /// returning the shards they replace.
+    fn fold_dirty(&mut self) -> Vec<Arc<Shard<K, V>>> {
         if self.forked || self.dirty.is_empty() {
-            return;
+            return Vec::new();
         }
+        let mut replaced = Vec::with_capacity(self.dirty.len());
         for (at, shard) in std::mem::take(&mut self.dirty) {
             let at = at as usize;
-            self.slots_mut(at)[at] = (!shard.is_empty()).then_some(shard);
+            let shard = (!shard.is_empty()).then_some(shard);
+            replaced.extend(std::mem::replace(&mut self.slots_mut(at)[at], shard));
         }
+        replaced
     }
 
     /// Makes every non-empty shard writable and returns their slots in order.
     fn writable_shards(&mut self) -> Vec<&mut Shard<K, V>> {
-        self.flatten_shards();
+        drop(self.fold_dirty());
         let populated: Vec<usize> = (0..self.end())
             .filter(|at| self.shard(*at).is_some_and(|shard| !shard.is_empty()))
             .collect();
@@ -756,7 +817,7 @@ impl<K: ShardKey + Clone> Extend<K> for CowShardSet<K> {
     }
 }
 
-impl<K: ShardKey + Clone> TaskFork for CowShardSet<K> {
+impl<K: ShardKey + Clone + Send + Sync + 'static> TaskFork for CowShardSet<K> {
     fn task_fork(&self) -> Self {
         Self(self.0.task_fork())
     }
@@ -874,7 +935,9 @@ pub(crate) trait TaskFork: Sized {
     fn flatten(&mut self) {}
 }
 
-impl<K: ShardKey + Clone, V: Clone + PartialEq> TaskFork for CowShards<K, V> {
+impl<K: ShardKey + Clone + Send + Sync + 'static, V: Clone + PartialEq + Send + Sync + 'static>
+    TaskFork for CowShards<K, V>
+{
     fn task_fork(&self) -> Self {
         self.fork()
     }
@@ -894,7 +957,10 @@ impl<K: ShardKey + Clone, V: Clone + PartialEq> TaskFork for CowShards<K, V> {
     }
 
     fn flatten(&mut self) {
-        self.flatten_shards();
+        let replaced = self.fold_dirty();
+        if !replaced.is_empty() {
+            drop_apart(replaced);
+        }
     }
 }
 
@@ -998,7 +1064,9 @@ pub(crate) trait MergeFork: TaskFork {
     fn install_merging(&mut self, frozen: &Self, fork: Self, merge: Merge<Self::Value>) -> bool;
 }
 
-impl<K: ShardKey + Clone, V: Clone + PartialEq> MergeFork for CowShards<K, V> {
+impl<K: ShardKey + Clone + Send + Sync + 'static, V: Clone + PartialEq + Send + Sync + 'static>
+    MergeFork for CowShards<K, V>
+{
     type Value = V;
 
     fn install_merging(&mut self, frozen: &Self, fork: Self, merge: Merge<V>) -> bool {
@@ -1410,8 +1478,11 @@ pub(crate) use finish_install;
 /// new field has to say how a task forks it; `field => merge` names the
 /// [`Merge`] for values two tasks change apart. `then` runs after an install,
 /// with what `prepare` took from the index and the fork before it.
+/// `by_field plan => settle` installs a superstep's forks field by field in
+/// parallel instead: `plan` installs the fields the hooks read in fork order
+/// first, and `settle` runs once every fork is in.
 macro_rules! task_fork_fields {
-    ($ty:ty { $($(#[$attr:meta])* $field:ident $(=> $merge:expr)?),* $(,)? } $(prepare $before:ident)? $(then $after:ident)?) => {
+    ($ty:ty { $($(#[$attr:meta])* $field:ident $(=> $merge:expr)?),* $(,)? } $(prepare $before:ident)? $(then $after:ident)? $(by_field $plan:ident => $settle:ident)?) => {
         impl $crate::db_index::cow_shards::TaskFork for $ty {
             fn task_fork(&self) -> Self {
                 Self {
@@ -1453,10 +1524,70 @@ macro_rules! task_fork_fields {
                 })*
                 $crate::db_index::cow_shards::finish_install!(self, plan, [$($before)?], [$($after)?]);
             }
+
+            /// Installs a superstep's `forks`, each with its place, adding to
+            /// `conflicts` at that place every field that conflicted.
+            #[allow(dead_code, reason = "an index nested in another installs through it")]
+            pub(crate) fn install_tasks_reporting(
+                &mut self,
+                frozen: &Self,
+                forks: Vec<(usize, Self)>,
+                conflicts: &mut [Vec<&'static str>],
+            ) {
+                $crate::db_index::cow_shards::install_tasks_body!(
+                    $ty, self, frozen, forks, conflicts,
+                    [$($plan => $settle)?],
+                    { $($(#[$attr])* $field $(=> $merge)?),* }
+                );
+            }
         }
     };
 }
 pub(crate) use task_fork_fields;
+
+/// The body of a domain's superstep install: fork by fork, or field by field
+/// in parallel under `by_field`.
+macro_rules! install_tasks_body {
+    ($ty:ty, $index:ident, $frozen:ident, $forks:ident, $conflicts:ident, [], { $($(#[$attr:meta])* $field:ident $(=> $merge:expr)?),* }) => {
+        for (at, fork) in $forks {
+            $index.install_task_reporting($frozen, fork, &mut $conflicts[at]);
+        }
+    };
+    ($ty:ty, $index:ident, $frozen:ident, $forks:ident, $conflicts:ident, [$plan:ident => $settle:ident], { $($(#[$attr:meta])* $field:ident $(=> $merge:expr)?),* }) => {{
+        let mut forks = $forks;
+        let plan = $index.$plan($frozen, &mut forks);
+        let mut reported: Vec<Vec<usize>> = Vec::new();
+        $($(#[$attr])* {
+            let _ = stringify!($field);
+            reported.push(Vec::new());
+        })*
+        rayon::scope(|scope| {
+            let mut out = reported.iter_mut();
+            $($(#[$attr])* {
+                let target = &mut $index.$field;
+                let base = &$frozen.$field;
+                let column = forks
+                    .iter_mut()
+                    .map(|(at, fork)| (*at, std::mem::take(&mut fork.$field)))
+                    .collect::<Vec<_>>();
+                let out = out.next().expect("a report per field");
+                scope.spawn(move |_| {
+                    for (at, value) in column {
+                        if $crate::db_index::cow_shards::install_field!(*target, *base, value $(, $merge)?) {
+                            out.push(at);
+                        }
+                    }
+                });
+            })*
+        });
+        let mut reported = reported.into_iter();
+        $($(#[$attr])* for at in reported.next().expect("a report per field") {
+            $conflicts[at].push(concat!(stringify!($ty), ".", stringify!($field)));
+        })*
+        $index.$settle(plan);
+    }};
+}
+pub(crate) use install_tasks_body;
 
 #[cfg(test)]
 mod tests {
@@ -1837,7 +1968,7 @@ mod tests {
         *base.get_mut(&owner(2, 0)).unwrap() += 1;
         base.insert(owner(1, 5), 15);
         drop(frozen);
-        base.flatten_shards();
+        TaskFork::flatten(&mut base);
         assert_eq!(
             (base.dirty.is_empty(), sorted(&base)),
             (

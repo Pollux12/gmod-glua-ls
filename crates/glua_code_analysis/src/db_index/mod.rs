@@ -1386,14 +1386,14 @@ impl DbIndex {
                             .collect::<Vec<_>>();
                         let out = out.next().expect("a report per domain");
                         scope.spawn(move |_| {
-                            for (at, fork) in installed.into_iter().enumerate() {
-                                if cow_shards::TaskFork::wrote(&*fork, base) {
-                                    Arc::make_mut(target).install_task_reporting(
-                                        base,
-                                        Arc::unwrap_or_clone(fork),
-                                        &mut out[at],
-                                    );
-                                }
+                            let wrote = installed
+                                .into_iter()
+                                .enumerate()
+                                .filter(|(_, fork)| cow_shards::TaskFork::wrote(&**fork, base))
+                                .map(|(at, fork)| (at, Arc::unwrap_or_clone(fork)))
+                                .collect::<Vec<_>>();
+                            if !wrote.is_empty() {
+                                Arc::make_mut(target).install_tasks_reporting(base, wrote, out);
                             }
                         });
                     })*

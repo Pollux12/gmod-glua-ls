@@ -63,6 +63,7 @@ fn merge_member_ids(
 }
 
 /// The member fingerprints a task install rebuilds.
+#[derive(Default)]
 pub(crate) struct FingerprintsToRebuild {
     owners: Vec<LuaMemberOwner>,
     keys: Vec<LuaMemberKey>,
@@ -632,6 +633,56 @@ impl LuaMemberIndex {
         }
     }
 
+    /// Installs the fingerprints of a superstep's `forks` in fork order,
+    /// leaving each fork the frozen ones, and returns every fingerprint both
+    /// the index and a fork changed. Summed afresh once every fork is in,
+    /// each holds what summing it afresh after each such fork leaves: once
+    /// summed afresh it differs from `frozen`, so the last fork that changes
+    /// it sums it afresh too, and later forks change no slot it sums.
+    fn install_fingerprints(
+        &mut self,
+        frozen: &Self,
+        forks: &mut [(usize, Self)],
+    ) -> FingerprintsToRebuild {
+        fn take_in<K: ShardKey + Clone + Send + Sync + 'static>(
+            installed: &mut CowShards<K, Fingerprint>,
+            frozen: &CowShards<K, Fingerprint>,
+            forked: &mut CowShards<K, Fingerprint>,
+        ) {
+            let forked = std::mem::replace(forked, frozen.clone());
+            let conflicted = crate::db_index::cow_shards::MergeFork::install_merging(
+                installed,
+                frozen,
+                forked,
+                crate::db_index::cow_shards::rebuilt,
+            );
+            debug_assert!(!conflicted, "a rebuilt fingerprint never conflicts");
+        }
+        let mut rebuild = FingerprintsToRebuild::default();
+        for (_, fork) in forks {
+            let planned = self.fingerprints_to_rebuild(frozen, fork);
+            rebuild.owners.extend(planned.owners);
+            rebuild.keys.extend(planned.keys);
+            rebuild.files.extend(planned.files);
+            take_in(
+                &mut self.owner_history_fingerprints,
+                &frozen.owner_history_fingerprints,
+                &mut fork.owner_history_fingerprints,
+            );
+            take_in(
+                &mut self.key_fingerprints,
+                &frozen.key_fingerprints,
+                &mut fork.key_fingerprints,
+            );
+            take_in(
+                &mut self.file_fingerprints,
+                &frozen.file_fingerprints,
+                &mut fork.file_fingerprints,
+            );
+        }
+        rebuild
+    }
+
     fn rebuild_fingerprints(&mut self, rebuild: FingerprintsToRebuild) {
         fn store<K: ShardKey + Clone>(
             sums: &mut CowShards<K, Fingerprint>,
@@ -644,15 +695,15 @@ impl LuaMemberIndex {
                 sums.insert(key, sum);
             }
         }
-        for owner in rebuild.owners {
+        for owner in rebuild.owners.into_iter().collect::<HashSet<_>>() {
             let sum = self.recomputed_owner_history_fingerprint(&owner);
             store(&mut self.owner_history_fingerprints, owner, sum);
         }
-        for key in rebuild.keys {
+        for key in rebuild.keys.into_iter().collect::<HashSet<_>>() {
             let sum = self.recomputed_key_fingerprint(&key);
             store(&mut self.key_fingerprints, key, sum);
         }
-        for file_id in rebuild.files {
+        for file_id in rebuild.files.into_iter().collect::<HashSet<_>>() {
             let sum = self.recomputed_file_fingerprint(file_id);
             store(&mut self.file_fingerprints, file_id, sum);
         }
@@ -3416,4 +3467,5 @@ crate::db_index::cow_shards::task_fork_fields!(LuaMemberIndex {
     owner_history_fingerprints => crate::db_index::cow_shards::rebuilt,
     key_fingerprints => crate::db_index::cow_shards::rebuilt,
     file_fingerprints => crate::db_index::cow_shards::rebuilt,
-} prepare fingerprints_to_rebuild then rebuild_fingerprints);
+} prepare fingerprints_to_rebuild then rebuild_fingerprints
+  by_field install_fingerprints => rebuild_fingerprints);

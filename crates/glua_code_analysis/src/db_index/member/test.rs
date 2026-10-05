@@ -1268,4 +1268,91 @@ mod tests {
         assert_eq!(index.owner_key_history_len(&owner, &first_key), 1);
         assert_eq!(owner_member_ids(&index, &owner), vec![member_id]);
     }
+    /// The installed state a batch install has to reproduce, in a stable order.
+    fn installed_state(index: &LuaMemberIndex) -> Vec<String> {
+        let mut state = Vec::new();
+        state.extend(
+            index
+                .owner_history_fingerprints
+                .iter()
+                .map(|entry| format!("history {entry:?}")),
+        );
+        state.extend(
+            index
+                .key_fingerprints
+                .iter()
+                .map(|entry| format!("key {entry:?}")),
+        );
+        state.extend(
+            index
+                .file_fingerprints
+                .iter()
+                .map(|entry| format!("file {entry:?}")),
+        );
+        state.extend(
+            index
+                .current_members_by_key
+                .iter()
+                .map(|entry| format!("current {entry:?}")),
+        );
+        state.extend(index.owner_members.iter().map(|(owner, members)| {
+            format!(
+                "owner {owner:?} {:?} {}",
+                members.sorted_member_ids(),
+                members.fingerprint()
+            )
+        }));
+        state.extend(
+            index
+                .member_owner_key_history_index
+                .iter()
+                .flat_map(|(owner, slots)| {
+                    slots
+                        .iter()
+                        .map(move |(key, ids)| format!("slot {owner:?} {key:?} {ids:?}"))
+                }),
+        );
+        state.sort();
+        state
+    }
+
+    #[test]
+    fn installing_forks_field_by_field_matches_installing_them_one_by_one() {
+        use crate::db_index::cow_shards::TaskFork;
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Shared"));
+        let mut base = LuaMemberIndex::new();
+        base.add_member(
+            owner.clone(),
+            make_member(make_member_id(FileId::new(1), 1), "a"),
+        );
+        let frozen = base.task_fork();
+        let forks = (2..6)
+            .map(|file| {
+                let mut fork = frozen.task_fork();
+                let key = if file % 2 == 0 { "a" } else { "b" };
+                fork.add_member(
+                    owner.clone(),
+                    make_member(make_member_id(FileId::new(file), file * 10), key),
+                );
+                fork
+            })
+            .collect::<Vec<_>>();
+        let mut one_by_one = base.clone();
+        let mut one_by_one_conflicts = vec![Vec::new(); forks.len()];
+        for (at, fork) in forks.iter().cloned().enumerate() {
+            one_by_one.install_task_reporting(&frozen, fork, &mut one_by_one_conflicts[at]);
+        }
+        let mut by_field = base.clone();
+        let mut by_field_conflicts = vec![Vec::new(); forks.len()];
+        by_field.install_tasks_reporting(
+            &frozen,
+            forks.into_iter().enumerate().collect(),
+            &mut by_field_conflicts,
+        );
+
+        assert_eq!(
+            (installed_state(&by_field), by_field_conflicts),
+            (installed_state(&one_by_one), one_by_one_conflicts)
+        );
+    }
 }
