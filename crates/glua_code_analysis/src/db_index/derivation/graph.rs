@@ -1199,8 +1199,8 @@ impl ReaderGraph {
         released: &mut Vec<KeyIdx>,
         now: u64,
     ) -> Vec<HashedKey> {
-        let mut ops = Vec::new();
-        let dropped = self.file_kept(record, released, now, &mut ops);
+        let diffed = self.prepare_kept(record, now).diff();
+        let (dropped, ops) = self.finish_kept(diffed, released);
         for (slot, op) in ops {
             op.apply(&mut self.table.keys[slot as usize].readers);
         }
@@ -1208,30 +1208,44 @@ impl ReaderGraph {
     }
 
     /// [`Self::replace_kept`] for each of `records` in order, at the stamp
-    /// `stamp` gives each; the readers of the keys they read are updated a
-    /// page of slots at a time on worker threads.
+    /// `stamp` gives each. Each record is diffed against the one it replaces
+    /// on worker threads, unless the batch files one derivation twice, and
+    /// the readers of the keys they read are updated a page of slots at a
+    /// time on worker threads.
     pub fn replace_all_kept(
         &mut self,
         records: Vec<KeptRecord>,
         released: &mut Vec<KeyIdx>,
         mut stamp: impl FnMut() -> u64,
     ) {
-        let mut ops = Vec::with_capacity(records.iter().map(|record| record.reads.len()).sum());
-        for record in records {
-            self.file_kept(record, released, stamp(), &mut ops);
+        use rayon::prelude::*;
+        let mut ids = FxHashSet::default();
+        let distinct = records.iter().all(|record| ids.insert(record.id));
+        let mut ops = Vec::with_capacity(records.len());
+        if distinct {
+            let prepared = records
+                .into_iter()
+                .map(|record| self.prepare_kept(record, stamp()))
+                .collect::<Vec<_>>();
+            let diffed = prepared
+                .into_par_iter()
+                .map(PreparedRecord::diff)
+                .collect::<Vec<_>>();
+            for diffed in diffed {
+                ops.push(self.finish_kept(diffed, released).1);
+            }
+        } else {
+            for record in records {
+                let diffed = self.prepare_kept(record, stamp()).diff();
+                ops.push(self.finish_kept(diffed, released).1);
+            }
         }
-        self.table.apply_reader_ops(ops);
+        self.table.apply_reader_ops(ops.into_iter().flatten());
     }
 
-    /// Files `record` but for the changes to its reads' readers, which go to
-    /// `ops` in the order they apply.
-    fn file_kept(
-        &mut self,
-        record: KeptRecord,
-        released: &mut Vec<KeyIdx>,
-        now: u64,
-        ops: &mut Vec<(KeyIdx, ReaderOp)>,
-    ) -> Vec<HashedKey> {
+    /// Interns `record`'s derivation and outputs at `now` and takes out the
+    /// record it replaces.
+    fn prepare_kept(&mut self, record: KeptRecord, now: u64) -> PreparedRecord {
         let KeptRecord {
             id,
             reads,
@@ -1251,41 +1265,34 @@ impl ReaderGraph {
             .record
             .take()
             .unwrap_or_default();
-
-        let mut unread = Vec::new();
-        let (mut old_reads, mut new_reads) = (
-            old.reads.iter().copied().peekable(),
-            reads.iter().copied().peekable(),
-        );
-        loop {
-            match (old_reads.peek().copied(), new_reads.peek().copied()) {
-                (Some(old_key), Some((new_key, new_seen))) if old_key == new_key => {
-                    ops.push((new_key, ReaderOp::Seen(deriv, new_seen)));
-                    old_reads.next();
-                    new_reads.next();
-                }
-                (Some(old_key), next) if next.is_none_or(|(new_key, _)| old_key < new_key) => {
-                    ops.push((old_key, ReaderOp::Remove(deriv)));
-                    unread.push(old_key);
-                    old_reads.next();
-                }
-                (_, Some((new_key, new_seen))) => {
-                    ops.push((new_key, ReaderOp::Insert(deriv, new_seen)));
-                    new_reads.next();
-                }
-                (None, None) => break,
-                (Some(_), None) => unreachable!("handled above"),
-            }
+        PreparedRecord {
+            id,
+            deriv,
+            reads,
+            dropped_reads,
+            outputs,
+            old,
         }
+    }
 
-        let mut dropped = Vec::new();
-        let mut added = Vec::new();
-        merge_sorted(
-            old.outputs.iter().copied(),
-            outputs.iter().copied(),
-            |key| dropped.push(key),
-            |key| added.push(key),
-        );
+    /// Files what diffing a record found but for the changes to its reads'
+    /// readers, which it returns in the order they apply, with the facts the
+    /// record no longer produces.
+    fn finish_kept(
+        &mut self,
+        diffed: DiffedRecord,
+        released: &mut Vec<KeyIdx>,
+    ) -> (Vec<HashedKey>, Vec<(KeyIdx, ReaderOp)>) {
+        let DiffedRecord {
+            id,
+            deriv,
+            ops,
+            unread,
+            dropped_reads,
+            added,
+            dropped,
+            record,
+        } = diffed;
         for key in added {
             self.table.add_producer(key, deriv);
             if let Some(owner) = self.key(key).owning_file()
@@ -1310,18 +1317,9 @@ impl ReaderGraph {
         // started producing.
         released.extend(unread);
         released.extend(dropped_reads);
-
         self.by_file.entry(id.file_id).or_default().insert(deriv);
-        // The old record's reads were diffed above; its buffer holds the new
-        // record's.
-        let mut record_reads = Vec::from(old.reads);
-        record_reads.clear();
-        record_reads.extend(reads.iter().map(|(key, _)| *key));
-        self.derivations[deriv as usize].record = Some(Record {
-            reads: record_reads.into_boxed_slice(),
-            outputs: outputs.into_boxed_slice(),
-        });
-        dropped
+        self.derivations[deriv as usize].record = Some(record);
+        (dropped, ops)
     }
 
     /// Forgets every derivation of `file_id`, returning each with the facts
@@ -2061,6 +2059,96 @@ impl ReaderGraph {
     }
 }
 
+/// A record whose derivation and outputs are interned, with the record it
+/// replaces taken out, to diff against it.
+struct PreparedRecord {
+    id: DerivationId,
+    deriv: DerivIdx,
+    reads: Vec<(KeyIdx, Fingerprint)>,
+    dropped_reads: Vec<KeyIdx>,
+    outputs: Vec<KeyIdx>,
+    old: Record,
+}
+
+/// What a record changes of the one it replaces: its reads' readers, the
+/// reads it stopped making, the outputs it added and dropped, and the
+/// record to keep.
+struct DiffedRecord {
+    id: DerivationId,
+    deriv: DerivIdx,
+    ops: Vec<(KeyIdx, ReaderOp)>,
+    unread: Vec<KeyIdx>,
+    dropped_reads: Vec<KeyIdx>,
+    added: Vec<KeyIdx>,
+    dropped: Vec<KeyIdx>,
+    record: Record,
+}
+
+impl PreparedRecord {
+    fn diff(self) -> DiffedRecord {
+        let Self {
+            id,
+            deriv,
+            reads,
+            dropped_reads,
+            outputs,
+            old,
+        } = self;
+        let mut ops = Vec::with_capacity(reads.len());
+        let mut unread = Vec::new();
+        let (mut old_reads, mut new_reads) = (
+            old.reads.iter().copied().peekable(),
+            reads.iter().copied().peekable(),
+        );
+        loop {
+            match (old_reads.peek().copied(), new_reads.peek().copied()) {
+                (Some(old_key), Some((new_key, new_seen))) if old_key == new_key => {
+                    ops.push((new_key, ReaderOp::Seen(deriv, new_seen)));
+                    old_reads.next();
+                    new_reads.next();
+                }
+                (Some(old_key), next) if next.is_none_or(|(new_key, _)| old_key < new_key) => {
+                    ops.push((old_key, ReaderOp::Remove(deriv)));
+                    unread.push(old_key);
+                    old_reads.next();
+                }
+                (_, Some((new_key, new_seen))) => {
+                    ops.push((new_key, ReaderOp::Insert(deriv, new_seen)));
+                    new_reads.next();
+                }
+                (None, None) => break,
+                (Some(_), None) => unreachable!("handled above"),
+            }
+        }
+        let mut dropped = Vec::new();
+        let mut added = Vec::new();
+        merge_sorted(
+            old.outputs.iter().copied(),
+            outputs.iter().copied(),
+            |key| dropped.push(key),
+            |key| added.push(key),
+        );
+        // The old record's reads were diffed above; its buffer holds the new
+        // record's.
+        let mut record_reads = Vec::from(old.reads);
+        record_reads.clear();
+        record_reads.extend(reads.iter().map(|(key, _)| *key));
+        DiffedRecord {
+            id,
+            deriv,
+            ops,
+            unread,
+            dropped_reads,
+            added,
+            dropped,
+            record: Record {
+                reads: record_reads.into_boxed_slice(),
+                outputs: outputs.into_boxed_slice(),
+            },
+        }
+    }
+}
+
 /// A change a record makes to the readers of one of its reads.
 #[derive(Debug, Clone, Copy)]
 enum ReaderOp {
@@ -2086,21 +2174,18 @@ impl ReaderOp {
 
 impl KeyTable {
     /// Applies `ops`, each slot's in order, a page of slots per worker.
-    fn apply_reader_ops(&mut self, ops: Vec<(KeyIdx, ReaderOp)>) {
+    fn apply_reader_ops(&mut self, ops: impl IntoIterator<Item = (KeyIdx, ReaderOp)>) {
         use rayon::prelude::*;
         let pages = self.keys.pages_mut();
         let mut by_page = vec![Vec::new(); pages.len()];
         for (slot, op) in ops {
             by_page[slot as usize / PAGE].push((slot as usize % PAGE, op));
         }
-        pages
-            .par_iter_mut()
-            .zip(by_page)
-            .for_each(|(page, ops)| {
-                for (at, op) in ops {
-                    op.apply(&mut page[at].readers);
-                }
-            });
+        pages.par_iter_mut().zip(by_page).for_each(|(page, ops)| {
+            for (at, op) in ops {
+                op.apply(&mut page[at].readers);
+            }
+        });
     }
 }
 

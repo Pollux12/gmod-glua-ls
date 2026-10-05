@@ -17,8 +17,8 @@
 //! - Results are written back to the db on the caller's thread in deterministic
 //!   file order, preserving identical behavior to the sequential version.
 
-use std::sync::{Mutex, Once};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, Once};
 
 use rayon::prelude::*;
 
