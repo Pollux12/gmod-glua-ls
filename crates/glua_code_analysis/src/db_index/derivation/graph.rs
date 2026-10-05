@@ -1261,7 +1261,7 @@ impl ReaderGraph {
                 ops.push(self.finish_kept(diffed, released).1);
             }
         }
-        self.table.apply_reader_ops(ops.into_iter().flatten());
+        self.table.apply_reader_ops(ops);
     }
 
     /// Interns `record`'s derivation and outputs at `now` and takes out the
@@ -2185,16 +2185,29 @@ impl ReaderOp {
 
 impl KeyTable {
     /// Applies `ops`, each slot's in order, a page of slots per worker.
-    fn apply_reader_ops(&mut self, ops: impl IntoIterator<Item = (KeyIdx, ReaderOp)>) {
+    /// Applies each record's `ops`, each slot's in record order: runs of
+    /// records are sorted into pages on worker threads, then each page takes
+    /// its share of every run in order.
+    fn apply_reader_ops(&mut self, ops: Vec<Vec<(KeyIdx, ReaderOp)>>) {
         use rayon::prelude::*;
         let pages = self.keys.pages_mut();
-        let mut by_page = vec![Vec::new(); pages.len()];
-        for (slot, op) in ops {
-            by_page[slot as usize / PAGE].push((slot as usize % PAGE, op));
-        }
-        pages.par_iter_mut().zip(by_page).for_each(|(page, ops)| {
-            for (at, op) in ops {
-                op.apply(&mut page[at].readers);
+        let page_count = pages.len();
+        let run = ops.len().div_ceil(rayon::current_num_threads() * 4).max(1);
+        let runs = ops
+            .par_chunks(run)
+            .map(|records| {
+                let mut by_page = vec![Vec::new(); page_count];
+                for (slot, op) in records.iter().flatten() {
+                    by_page[*slot as usize / PAGE].push((*slot as usize % PAGE, *op));
+                }
+                by_page
+            })
+            .collect::<Vec<_>>();
+        pages.par_iter_mut().enumerate().for_each(|(index, page)| {
+            for by_page in &runs {
+                for (at, op) in &by_page[index] {
+                    op.apply(&mut page[*at].readers);
+                }
             }
         });
     }
