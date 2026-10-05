@@ -49,6 +49,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::DbIndex;
@@ -1230,49 +1231,36 @@ impl Engine {
         drop(frozen);
         drop(installing);
         let filing = crate::profile::PhaseGuard::new("superstep: file records");
+        let written = recordings
+            .iter()
+            .flat_map(|recording| recording.written().iter().cloned())
+            .collect::<Vec<_>>();
         let mut table = db.reader_graph_mut().lend_keys();
-        let mut written = Vec::new();
-        let mut evaluations = Vec::with_capacity(recordings.len());
-        for recording in recordings {
-            written.extend(recording.written().iter().cloned());
-            evaluations.push(
-                recording
-                    .canonicalise(&mut table)
-                    .expect("no slot is released while tasks run"),
-            );
-        }
+        let new_slots = recordings
+            .iter_mut()
+            .map(|recording| recording.intern(&mut table))
+            .collect::<Vec<_>>();
+        let filed = recordings
+            .into_par_iter()
+            .zip(new_slots)
+            .zip(tasks.par_iter_mut())
+            .map(|((recording, new_slots), (_, groups, ..))| {
+                file_task(&table, recording, &new_slots, groups)
+            })
+            .collect::<Vec<_>>();
         db.reader_graph_mut().restore_keys(table);
         let mut released = Vec::new();
         let mut on_root = Vec::new();
-        for ((_, groups, ..), evaluations) in tasks.iter().zip(evaluations) {
-            let mut evaluations = evaluations.into_iter().map(Some).collect::<Vec<_>>();
+        for task in filed {
+            touched.extend(task.touched);
+            on_root.extend(task.on_root);
+            let graph = db.reader_graph_mut();
+            for record in task.records {
+                graph.replace_kept(record, &mut released, derivation::new_stamp());
+            }
+        }
+        for (_, groups, ..) in &tasks {
             for group in groups {
-                if group.records.iter().any(|(at, _)| {
-                    evaluations[*at]
-                        .as_ref()
-                        .is_some_and(|(_, canonical)| *canonical)
-                }) {
-                    on_root.extend(group.members.iter().copied());
-                    continue;
-                }
-                for (at, seen) in &group.records {
-                    let (evaluation, _) = evaluations[*at].take().expect("a record is filed once");
-                    touched.extend(evaluation.moved().cloned());
-                    let (id, reads, outputs) = evaluation.into_recorded_seen(seen.clone());
-                    touched.extend(outputs.iter().cloned());
-                    let graph = db.reader_graph_mut();
-                    graph.replace_slots(
-                        id,
-                        reads
-                            .into_iter()
-                            .map(|(slot, seen)| (slot, Some(seen)))
-                            .collect(),
-                        outputs,
-                        |_| unreachable!("a task fingerprints its reads"),
-                        &mut released,
-                        derivation::new_stamp(),
-                    );
-                }
                 if let Some(started) = group.elapsed.filter(|_| profiling) {
                     for member in &group.members {
                         self.stats
@@ -2846,6 +2834,52 @@ struct GroupRun {
     records: Vec<(usize, Vec<derivation::Fingerprint>)>,
     rerun: bool,
     elapsed: Option<std::time::Duration>,
+}
+
+/// What filing a task's recording leaves for the root: the records to
+/// replace, in order, the members of groups that read a query the snapshot
+/// had no answer for, and the keys its records moved or produce.
+struct FiledTask {
+    records: Vec<derivation::KeptRecord>,
+    on_root: Vec<DerivationId>,
+    touched: Vec<HashedKey>,
+}
+
+/// Canonicalises a task's `recording` into `table`, its new keys interned at
+/// `new_slots`, and prepares the record of each evaluation `groups` file.
+fn file_task(
+    table: &derivation::KeyTable,
+    recording: derivation::TaskRecording,
+    new_slots: &[derivation::KeyIdx],
+    groups: &mut [GroupRun],
+) -> FiledTask {
+    let evaluations = recording
+        .canonicalise_interned(new_slots, table)
+        .expect("no slot is released while tasks run");
+    let mut evaluations = evaluations.into_iter().map(Some).collect::<Vec<_>>();
+    let mut filed = FiledTask {
+        records: Vec::new(),
+        on_root: Vec::new(),
+        touched: Vec::new(),
+    };
+    for group in groups {
+        if group.records.iter().any(|(at, _)| {
+            evaluations[*at]
+                .as_ref()
+                .is_some_and(|(_, canonical)| *canonical)
+        }) {
+            filed.on_root.extend(group.members.iter().copied());
+            continue;
+        }
+        for (at, seen) in &mut group.records {
+            let (evaluation, _) = evaluations[*at].take().expect("a record is filed once");
+            filed.touched.extend(evaluation.moved().cloned());
+            let record = table.keep_record(evaluation, std::mem::take(seen));
+            filed.touched.extend(record.outputs().iter().cloned());
+            filed.records.push(record);
+        }
+    }
+    filed
 }
 
 /// What a task left for the barrier.

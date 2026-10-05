@@ -1163,20 +1163,48 @@ impl ReaderGraph {
         released: &mut Vec<KeyIdx>,
         now: u64,
     ) -> Vec<HashedKey> {
-        let deriv = self.intern_derivation(id);
         let output_set = outputs.iter().collect::<FxHashSet<_>>();
-        let mut dropped_reads = Vec::new();
-        let mut reads = Vec::with_capacity(slots.len());
-        for (slot, seen) in slots {
-            if !super::records_read(id, self.key(slot), |key| output_set.contains(key)) {
-                dropped_reads.push(slot);
-                continue;
-            }
-            let seen = seen.unwrap_or_else(|| self.slot_fingerprint(slot, &fingerprint));
-            reads.push((slot, seen));
-        }
+        let (reads, dropped_reads) = kept_reads(
+            id,
+            slots,
+            |slot| self.key(slot),
+            |key| output_set.contains(key),
+        );
         drop(output_set);
-        reads.sort_unstable_by_key(|(key, _)| *key);
+        let reads = reads
+            .into_iter()
+            .map(|(slot, seen)| {
+                let seen = seen.unwrap_or_else(|| self.slot_fingerprint(slot, &fingerprint));
+                (slot, seen)
+            })
+            .collect();
+        self.replace_kept(
+            KeptRecord {
+                id,
+                reads,
+                dropped_reads,
+                outputs,
+            },
+            released,
+            now,
+        )
+    }
+
+    /// [`Self::replace_slots`] with a record [`KeyTable::keep_record`]
+    /// prepared.
+    pub fn replace_kept(
+        &mut self,
+        record: KeptRecord,
+        released: &mut Vec<KeyIdx>,
+        now: u64,
+    ) -> Vec<HashedKey> {
+        let KeptRecord {
+            id,
+            reads,
+            dropped_reads,
+            outputs,
+        } = record;
+        let deriv = self.intern_derivation(id);
         let mut outputs = outputs
             .into_iter()
             .map(|key| self.intern_key(key, now))
@@ -1961,6 +1989,62 @@ impl ReaderGraph {
         self.free_derivations.push(deriv);
         outputs
     }
+}
+
+/// A task evaluation's record with the reads it keeps sorted and those it
+/// drops set apart, for [`ReaderGraph::replace_kept`].
+pub struct KeptRecord {
+    id: DerivationId,
+    reads: Vec<(KeyIdx, Fingerprint)>,
+    dropped_reads: Vec<KeyIdx>,
+    outputs: Vec<HashedKey>,
+}
+
+impl KeptRecord {
+    pub fn outputs(&self) -> &[HashedKey] {
+        &self.outputs
+    }
+}
+
+impl KeyTable {
+    /// The record of a task's `evaluation`, whose reads were canonicalised
+    /// into this table, each with the fingerprint in `seen` at its position.
+    pub fn keep_record(&self, evaluation: super::Evaluation, seen: Vec<Fingerprint>) -> KeptRecord {
+        let (id, slots, outputs) = evaluation.into_recorded_seen(seen);
+        let (reads, dropped_reads) = kept_reads(
+            id,
+            slots,
+            |slot| self.key(slot),
+            |key| super::contains_hashed(&outputs, key),
+        );
+        KeptRecord {
+            id,
+            reads,
+            dropped_reads,
+            outputs,
+        }
+    }
+}
+
+/// The reads of `slots` a record of `id` keeps, sorted by slot, and the
+/// slots of those it drops; see [`super::records_read`].
+fn kept_reads<'a, T>(
+    id: DerivationId,
+    slots: Vec<(KeyIdx, T)>,
+    key: impl Fn(KeyIdx) -> &'a HashedKey,
+    is_output: impl Fn(&HashedKey) -> bool,
+) -> (Vec<(KeyIdx, T)>, Vec<KeyIdx>) {
+    let mut dropped = Vec::new();
+    let mut reads = Vec::with_capacity(slots.len());
+    for (slot, seen) in slots {
+        if super::records_read(id, key(slot), &is_output) {
+            reads.push((slot, seen));
+        } else {
+            dropped.push(slot);
+        }
+    }
+    reads.sort_unstable_by_key(|(slot, _)| *slot);
+    (reads, dropped)
 }
 
 /// Walks two sorted slot lists, calling `only_old` for each slot only `old`

@@ -389,32 +389,47 @@ impl WorkerKeys {
         Some(local)
     }
 
-    pub(crate) fn canonical_slots(self, table: &mut KeyTable, stamp: u64) -> Option<Vec<KeyIdx>> {
+    pub(crate) fn canonical_slots(
+        mut self,
+        table: &mut KeyTable,
+        stamp: u64,
+    ) -> Option<Vec<KeyIdx>> {
+        if !self.known_live(table) {
+            return None;
+        }
+        let new_slots = self.intern_new(table, stamp);
+        Some(self.slots(&new_slots))
+    }
+
+    /// Whether every snapshot slot named here is still live in `table`.
+    pub(crate) fn known_live(&self, table: &KeyTable) -> bool {
+        self.entries
+            .iter()
+            .all(|key| !matches!(key, WorkerKey::Known(slot) if table.live_key(*slot).is_none()))
+    }
+
+    /// Interns the keys new here in `table`, in the order they were first
+    /// read, and returns their slots.
+    pub(crate) fn intern_new(&mut self, table: &mut KeyTable, stamp: u64) -> Vec<KeyIdx> {
         assert!(
             table.quarantines(stamp),
             "worker publication outside its release epoch"
         );
-        if self
-            .entries
-            .iter()
-            .any(|key| matches!(key, WorkerKey::Known(slot) if table.live_key(*slot).is_none()))
-        {
-            return None;
-        }
-        let new_slots = self
-            .new_keys
+        std::mem::take(&mut self.new_keys)
             .into_iter()
             .map(|key| table.intern_worker_read(key))
-            .collect::<Vec<_>>();
-        Some(
-            self.entries
-                .into_iter()
-                .map(|key| match key {
-                    WorkerKey::Known(slot) => slot,
-                    WorkerKey::New(index) => new_slots[index as usize],
-                })
-                .collect(),
-        )
+            .collect()
+    }
+
+    /// Each entry's slot, the new keys at `new_slots`.
+    pub(crate) fn slots(&self, new_slots: &[KeyIdx]) -> Vec<KeyIdx> {
+        self.entries
+            .iter()
+            .map(|key| match key {
+                WorkerKey::Known(slot) => *slot,
+                WorkerKey::New(index) => new_slots[*index as usize],
+            })
+            .collect()
     }
 
     pub(crate) fn canonicalise(

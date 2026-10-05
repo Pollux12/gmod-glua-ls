@@ -794,8 +794,29 @@ impl TaskRecording {
     /// logs frozen for the memos that point into them; each with whether it
     /// read a query the snapshot had no answer for. `None` when a slot the
     /// task read was released since.
-    pub(crate) fn canonicalise(self, table: &mut KeyTable) -> Option<Vec<(Evaluation, bool)>> {
-        let slots = self.keys.canonical_slots(table, self.stamp)?;
+    #[cfg(test)]
+    pub(crate) fn canonicalise(mut self, table: &mut KeyTable) -> Option<Vec<(Evaluation, bool)>> {
+        let new_slots = self.intern(table);
+        self.canonicalise_interned(&new_slots, table)
+    }
+
+    /// Interns the keys new to `table` in the order the task first read
+    /// them: the part of [`Self::canonicalise`] that changes the table.
+    pub(crate) fn intern(&mut self, table: &mut KeyTable) -> Vec<KeyIdx> {
+        self.keys.intern_new(table, self.stamp)
+    }
+
+    /// [`Self::canonicalise`] once [`Self::intern`] put the new keys at
+    /// `new_slots`.
+    pub(crate) fn canonicalise_interned(
+        self,
+        new_slots: &[KeyIdx],
+        table: &KeyTable,
+    ) -> Option<Vec<(Evaluation, bool)>> {
+        if !self.keys.known_live(table) {
+            return None;
+        }
+        let slots = self.keys.slots(new_slots);
         Some(
             self.evaluations
                 .into_iter()
