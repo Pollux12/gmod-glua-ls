@@ -17,7 +17,7 @@
 //! - Results are written back to the db on the caller's thread in deterministic
 //!   file order, preserving identical behavior to the sequential version.
 
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
@@ -154,24 +154,36 @@ where
     };
     let done = AtomicUsize::new(0);
 
-    // `in_place_scope` turns the calling thread into a worker for the
-    // duration: a bare `par_iter` would park it on the job latch while the
-    // pool alone drained the work.
-    let mut computed: Vec<(usize, T)> = Vec::new();
-    rayon::in_place_scope(|_| {
-        computed = dispatch
-            .par_iter()
-            .map(|&idx| {
-                if report_step != 0 {
-                    let seq = done.fetch_add(1, Ordering::Relaxed);
-                    if seq.is_multiple_of(report_step) {
-                        crate::progress::advance_current_phase(seq, n, "files");
-                    }
-                }
-                (idx, f(db, file_ids[idx]))
-            })
-            .collect();
+    // Every worker, the calling thread among them, takes the next file in
+    // dispatch order as it frees up, so the largest files start first: a
+    // splitting `par_iter` would hand each worker a contiguous run of them.
+    let computed = Mutex::new(Vec::with_capacity(n));
+    let drain = || {
+        let mut local = Vec::new();
+        loop {
+            let seq = done.fetch_add(1, Ordering::Relaxed);
+            let Some(&idx) = dispatch.get(seq) else {
+                break;
+            };
+            if report_step != 0 && seq.is_multiple_of(report_step) {
+                crate::progress::advance_current_phase(seq, n, "files");
+            }
+            local.push((idx, f(db, file_ids[idx])));
+        }
+        computed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .append(&mut local);
+    };
+    rayon::in_place_scope(|scope| {
+        for _ in 1..analysis_threads().min(n) {
+            scope.spawn(|_| drain());
+        }
+        drain();
     });
+    let mut computed = computed
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     // Each result carries the index it was computed for, so putting them back in
     // input order is a sort rather than a scatter into pre-filled slots.
