@@ -496,12 +496,9 @@ impl crate::db_index::cow_shards::TaskFork for SetFingerprint {
         self.0 != frozen.0
     }
 
-    fn conflicts(&self, _frozen: &Self, _fork: &Self) -> bool {
-        false
-    }
-
-    fn install_task(&mut self, frozen: &Self, fork: Self) {
+    fn install_task(&mut self, frozen: &Self, fork: Self) -> bool {
         self.0 = self.0.wrapping_add(fork.0.wrapping_sub(frozen.0));
+        false
     }
 }
 

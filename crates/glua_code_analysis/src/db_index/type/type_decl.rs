@@ -295,6 +295,67 @@ impl LuaTypeDecl {
         }
     }
 
+    /// Merges two tasks' changes to one declaration: each task's own
+    /// declaration sites, keyed by `(file, range)`. Two tasks changing one
+    /// site, the name or the payload apart, or removing the declaration,
+    /// conflict.
+    pub(crate) fn merge(
+        current: Option<&Self>,
+        frozen: Option<&Self>,
+        fork: Option<&Self>,
+    ) -> crate::db_index::cow_shards::Merged<Self> {
+        use crate::db_index::cow_shards::{Conflict, merge_map, refuse};
+        let (Some(current), Some(fork)) = (current, fork) else {
+            return Err(Conflict);
+        };
+        fn pick<'a, T: PartialEq>(
+            current: &'a T,
+            frozen: Option<&T>,
+            fork: &'a T,
+        ) -> Result<&'a T, Conflict> {
+            if Some(fork) == frozen || current == fork {
+                Ok(current)
+            } else if Some(current) == frozen {
+                Ok(fork)
+            } else {
+                Err(Conflict)
+            }
+        }
+        let sites = |decl: &Self| {
+            decl.locations
+                .iter()
+                .map(|location| {
+                    let key = (
+                        location.file_id,
+                        location.range.start(),
+                        location.range.end(),
+                    );
+                    (key, location.clone())
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let locations = merge_map(
+            Some(&sites(current)),
+            frozen.map(sites).as_ref(),
+            Some(&sites(fork)),
+            refuse,
+        )?
+        .ok_or(Conflict)?
+        .into_values()
+        .collect();
+        Ok(Some(Self {
+            simple_name: pick(
+                &current.simple_name,
+                frozen.map(|decl| &decl.simple_name),
+                &fork.simple_name,
+            )?
+            .clone(),
+            locations,
+            id: pick(&current.id, frozen.map(|decl| &decl.id), &fork.id)?.clone(),
+            extra: pick(&current.extra, frozen.map(|decl| &decl.extra), &fork.extra)?.clone(),
+        }))
+    }
+
     pub fn merge_decl(&mut self, other: LuaTypeDecl) {
         for location in other.locations {
             self.add_location(location);

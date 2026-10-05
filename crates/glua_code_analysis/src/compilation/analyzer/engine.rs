@@ -980,27 +980,28 @@ impl Engine {
             let ran = self.run_task(&mut fork, recipe, slice, rank, file_id, entries);
             db.swap_engine_state(&mut fork);
             let touched = self.take_task_touched();
-            let conflict = db.task_conflict(&frozen, &fork);
-            db.install_task(&frozen, fork);
-            match conflict {
-                None => installed.push((file_id, ran, touched)),
-                Some(field) => {
+            let conflicts = db.install_task(&frozen, fork);
+            if conflicts.is_empty() {
+                installed.push((file_id, ran, touched));
+            } else {
+                self.stats.conflicting_tasks += 1;
+                for field in conflicts {
                     *self.stats.task_conflicts.entry(field).or_default() += 1;
-                    // Installed over an earlier task's change, a value lacks
-                    // what that task wrote: every task that touched what this
-                    // one did runs again on the index, in file order, each
-                    // after the writes of the others.
-                    let mut again = installed
-                        .extract_if(.., |(_, _, earlier)| !earlier.is_disjoint(&touched))
-                        .collect::<Vec<_>>();
-                    again.push((file_id, ran, touched));
-                    self.forget_view(db);
-                    for (file_id, ran, _) in again {
-                        let entries = ran.into_iter().map(|id| (id, Reason::Changed)).collect();
-                        let ran = self.run_task(db, recipe, slice, rank, file_id, entries);
-                        let touched = self.take_task_touched();
-                        installed.push((file_id, ran, touched));
-                    }
+                }
+                // Installed over an earlier task's change, a value lacks
+                // what that task wrote: every task that touched what this
+                // one did runs again on the index, in file order, each
+                // after the writes of the others.
+                let mut again = installed
+                    .extract_if(.., |(_, _, earlier)| !earlier.is_disjoint(&touched))
+                    .collect::<Vec<_>>();
+                again.push((file_id, ran, touched));
+                self.forget_view(db);
+                for (file_id, ran, _) in again {
+                    let entries = ran.into_iter().map(|id| (id, Reason::Changed)).collect();
+                    let ran = self.run_task(db, recipe, slice, rank, file_id, entries);
+                    let touched = self.take_task_touched();
+                    installed.push((file_id, ran, touched));
                 }
             }
             for (id, reason) in deferred {
@@ -1171,9 +1172,11 @@ impl Engine {
         let mut tasks = Vec::with_capacity(outcomes.len());
         let mut recordings = Vec::with_capacity(outcomes.len());
         for (plan, outcome) in plans.iter().zip(outcomes) {
-            let conflict = db.task_conflict(&frozen, &outcome.fork);
-            db.install_task(&frozen, outcome.fork);
-            if let Some(field) = conflict {
+            let conflicts = db.install_task(&frozen, outcome.fork);
+            if !conflicts.is_empty() {
+                self.stats.conflicting_tasks += 1;
+            }
+            for field in &conflicts {
                 *self.stats.task_conflicts.entry(field).or_default() += 1;
             }
             touched.extend(outcome.touched.iter().cloned());
@@ -1183,7 +1186,7 @@ impl Engine {
                 outcome.groups,
                 outcome.touched,
                 outcome.reruns,
-                conflict.is_some(),
+                !conflicts.is_empty(),
             ));
         }
         drop(frozen);
@@ -2470,6 +2473,7 @@ pub(crate) struct EngineStats {
     supersteps: usize,
     superstep_tasks: usize,
     /// Tasks run again on the index, by the first value they conflicted on.
+    conflicting_tasks: usize,
     task_conflicts: BTreeMap<&'static str, usize>,
     /// Stages a worker run settled on the serial loop.
     serial_stages: usize,
@@ -2675,8 +2679,12 @@ impl EngineStats {
         );
         if self.supersteps > 0 {
             eprintln!(
-                "[engine] supersteps={} tasks={} serial stages={} conflicts={:?}",
-                self.supersteps, self.superstep_tasks, self.serial_stages, self.task_conflicts
+                "[engine] supersteps={} tasks={} conflicting={} serial stages={} conflicts={:?}",
+                self.supersteps,
+                self.superstep_tasks,
+                self.conflicting_tasks,
+                self.serial_stages,
+                self.task_conflicts
             );
         }
         let mut distinct = BTreeMap::<DerivationKind, usize>::new();

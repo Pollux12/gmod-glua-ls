@@ -50,6 +50,25 @@ fn push_owner_key_id_unique(
     }
 }
 
+/// Merges two tasks' changes to one owner-key slot, which stays sorted by
+/// [`member_id_sort_key`].
+fn merge_member_ids(
+    current: Option<&Vec<LuaMemberId>>,
+    frozen: Option<&Vec<LuaMemberId>>,
+    fork: Option<&Vec<LuaMemberId>>,
+) -> crate::db_index::cow_shards::Merged<Vec<LuaMemberId>> {
+    crate::db_index::cow_shards::merge_sorted_by(current, frozen, fork, |id| {
+        member_id_sort_key(*id)
+    })
+}
+
+/// The member fingerprints a task install rebuilds.
+pub(crate) struct FingerprintsToRebuild {
+    owners: Vec<LuaMemberOwner>,
+    keys: Vec<LuaMemberKey>,
+    files: Vec<FileId>,
+}
+
 /// Drops `id` from its slot, and the slot and owner once they are empty.
 fn remove_owner_key_id(
     target: &mut OwnerKeyMap,
@@ -514,6 +533,12 @@ impl LuaMemberIndex {
                 .copied()
                 .unwrap_or(ABSENT);
         }
+        self.recomputed_owner_history_fingerprint(owner)
+    }
+
+    /// `owner`'s history fingerprint summed afresh, which is what the
+    /// incremental `owner_history_fingerprints` sum holds.
+    fn recomputed_owner_history_fingerprint(&self, owner: &LuaMemberOwner) -> Fingerprint {
         let keyed = self
             .member_owner_key_history_index
             .get(owner)
@@ -577,6 +602,60 @@ impl LuaMemberIndex {
             .chain(scopes)
             .chain(element_owners)
             .fold(ABSENT, Fingerprint::wrapping_add)
+    }
+
+    /// `key`'s fingerprint summed afresh, which is what the incremental
+    /// `key_fingerprints` sum holds.
+    fn recomputed_key_fingerprint(&self, key: &LuaMemberKey) -> Fingerprint {
+        self.current_members_by_key
+            .get(key)
+            .into_iter()
+            .flat_map(|members| members.values())
+            .map(fingerprint_of)
+            .fold(ABSENT, Fingerprint::wrapping_add)
+    }
+
+    /// The fingerprints both `self` and `fork`, a task fork of `frozen`,
+    /// changed: sums over what both changed, rebuilt from the merged state.
+    fn fingerprints_to_rebuild(&self, frozen: &Self, fork: &Self) -> FingerprintsToRebuild {
+        FingerprintsToRebuild {
+            owners: self.owner_history_fingerprints.both_changed_keys(
+                &frozen.owner_history_fingerprints,
+                &fork.owner_history_fingerprints,
+            ),
+            keys: self
+                .key_fingerprints
+                .both_changed_keys(&frozen.key_fingerprints, &fork.key_fingerprints),
+            files: self
+                .file_fingerprints
+                .both_changed_keys(&frozen.file_fingerprints, &fork.file_fingerprints),
+        }
+    }
+
+    fn rebuild_fingerprints(&mut self, rebuild: FingerprintsToRebuild) {
+        fn store<K: ShardKey + Clone>(
+            sums: &mut CowShards<K, Fingerprint>,
+            key: K,
+            sum: Fingerprint,
+        ) {
+            if sum == ABSENT {
+                sums.remove(&key);
+            } else {
+                sums.insert(key, sum);
+            }
+        }
+        for owner in rebuild.owners {
+            let sum = self.recomputed_owner_history_fingerprint(&owner);
+            store(&mut self.owner_history_fingerprints, owner, sum);
+        }
+        for key in rebuild.keys {
+            let sum = self.recomputed_key_fingerprint(&key);
+            store(&mut self.key_fingerprints, key, sum);
+        }
+        for file_id in rebuild.files {
+            let sum = self.recomputed_file_fingerprint(file_id);
+            store(&mut self.file_fingerprints, file_id, sum);
+        }
     }
 
     fn fold_file_fingerprint(&mut self, file_id: FileId, element: Fingerprint, add: bool) {
@@ -3301,21 +3380,29 @@ fn member_ids_from_item(item: &LuaMemberIndexItem) -> Vec<LuaMemberId> {
 crate::db_index::cow_shards::task_fork_fields!(LuaMemberIndex {
     members,
     source_members,
-    in_filed,
-    owner_members,
+    in_filed => crate::db_index::cow_shards::merge_set,
+    owner_members => LuaOwnerMembers::merge,
     member_current_owner,
-    member_owner_key_index,
-    member_owner_key_history_index,
-    owner_key_index_owners_by_file,
-    current_owner_member_history,
-    current_members_by_key,
-    expr_key_members_by_file,
+    member_owner_key_index => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, merge_member_ids)
+    },
+    member_owner_key_history_index => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, merge_member_ids)
+    },
+    owner_key_index_owners_by_file => crate::db_index::cow_shards::merge_set,
+    current_owner_member_history => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, crate::db_index::cow_shards::refuse)
+    },
+    current_members_by_key => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, crate::db_index::cow_shards::refuse)
+    },
+    expr_key_members_by_file => crate::db_index::cow_shards::merge_set,
     non_overwriting_assignment_members,
     preserved_co_writer_reconciled,
-    homing_revision,
+    homing_revision => crate::db_index::cow_shards::merge_sum,
     owner_only_members,
     synthesized_owner_members,
-    deferred_index_expr_members,
+    deferred_index_expr_members => crate::db_index::cow_shards::merge_set,
     function_scope_ranges,
     member_function_scope_ranges,
     definition_site_owner,
@@ -3326,7 +3413,7 @@ crate::db_index::cow_shards::task_fork_fields!(LuaMemberIndex {
     path_class_holders,
     derived_path_classes,
     member_path_provenance,
-    owner_history_fingerprints,
-    key_fingerprints,
-    file_fingerprints,
-});
+    owner_history_fingerprints => crate::db_index::cow_shards::rebuilt,
+    key_fingerprints => crate::db_index::cow_shards::rebuilt,
+    file_fingerprints => crate::db_index::cow_shards::rebuilt,
+} prepare fingerprints_to_rebuild then rebuild_fingerprints);

@@ -1192,6 +1192,57 @@ impl TypeCacheRefIndex {
         }
     }
 
+    /// The `(owner file, reference)` counts `fork`, a task fork of `frozen`,
+    /// changed: which owners hold a reference follows from the merged counts.
+    fn refs_to_rebuild(&self, frozen: &Self, fork: &Self) -> Vec<(FileId, TypeCacheRef)> {
+        CowShards::changed_keys(&frozen.owner_refs, &fork.owner_refs)
+            .into_iter()
+            .flat_map(|file_id| {
+                let was = frozen.owner_refs.get(&file_id);
+                let now = fork.owner_refs.get(&file_id);
+                let count = |refs: Option<&HashMap<TypeCacheRef, u32>>, type_ref: &TypeCacheRef| {
+                    refs.and_then(|refs| refs.get(type_ref)).copied()
+                };
+                was.into_iter()
+                    .chain(now)
+                    .flat_map(HashMap::keys)
+                    .filter(|type_ref| count(was, type_ref) != count(now, type_ref))
+                    .map(|type_ref| (file_id, type_ref.clone()))
+                    .collect::<HashSet<_>>()
+            })
+            .collect()
+    }
+
+    fn rebuild_refs(&mut self, refs: Vec<(FileId, TypeCacheRef)>) {
+        for (owner_file_id, type_ref) in refs {
+            let held = self
+                .owner_refs
+                .get(&owner_file_id)
+                .is_some_and(|refs| refs.contains_key(&type_ref));
+            if !held {
+                self.drop_owner(&type_ref, owner_file_id);
+                continue;
+            }
+            if self
+                .ref_owners
+                .get(&type_ref)
+                .is_some_and(|owners| owners.contains(&owner_file_id))
+            {
+                continue;
+            }
+            if let Some(file_id) = type_ref.file_id() {
+                self.refs_by_file
+                    .entry(file_id)
+                    .or_default()
+                    .insert(type_ref.clone());
+            }
+            self.ref_owners
+                .entry(type_ref)
+                .or_default()
+                .insert(owner_file_id);
+        }
+    }
+
     fn owners(&self, type_ref: &TypeCacheRef) -> Option<&HashSet<FileId>> {
         self.ref_owners.get(type_ref)
     }
@@ -1216,6 +1267,37 @@ fn super_entry_sort_key(entry: &InFiled<LuaSuperType>) -> (FileId, TextSize, Tex
         entry.value.source_range.start(),
         entry.value.source_range.end(),
     )
+}
+
+/// Merges two tasks' changes to one declaration's super edges, which stay in
+/// source order.
+fn merge_super_entries(
+    current: Option<&Vec<InFiled<LuaSuperType>>>,
+    frozen: Option<&Vec<InFiled<LuaSuperType>>>,
+    fork: Option<&Vec<InFiled<LuaSuperType>>>,
+) -> crate::db_index::cow_shards::Merged<Vec<InFiled<LuaSuperType>>> {
+    crate::db_index::cow_shards::merge_sorted_by(current, frozen, fork, super_entry_sort_key)
+}
+
+/// The bases `supers` names a direct subclass of.
+fn super_bases(
+    supers: Option<&Vec<InFiled<LuaSuperType>>>,
+) -> impl Iterator<Item = &LuaTypeDeclId> {
+    supers
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| match &entry.value.typ {
+            LuaType::Ref(base_id) => Some(base_id),
+            _ => None,
+        })
+}
+
+/// What a task install rebuilds of the type index from the merged state.
+pub(crate) struct DerivedToRebuild {
+    /// Each declaration whose super edges the fork changed, with every base
+    /// its edges named before or after.
+    subclasses: Vec<(LuaTypeDeclId, HashSet<LuaTypeDeclId>)>,
+    decl_scan: bool,
 }
 
 /// Orders subclass declarations by name, breaking ties by declaration id so
@@ -3241,6 +3323,65 @@ impl LuaTypeIndex {
         dirty
     }
 
+    /// What `fork`, a task fork of `frozen`, changed that the merged state
+    /// decides: subclass lists follow the merged super edges, and the
+    /// declaration scan the merged declarations when both changed it.
+    fn derived_to_rebuild(&self, frozen: &Self, fork: &Self) -> DerivedToRebuild {
+        let subclasses = CowShards::changed_keys(&frozen.supers, &fork.supers)
+            .into_iter()
+            .map(|decl_id| {
+                let bases = [self, frozen, fork]
+                    .into_iter()
+                    .flat_map(|index| super_bases(index.supers.get(&decl_id)))
+                    .cloned()
+                    .collect();
+                (decl_id, bases)
+            })
+            .collect();
+        let decl_scan = fork.decl_scan_fingerprint != frozen.decl_scan_fingerprint
+            && self.decl_scan_fingerprint != frozen.decl_scan_fingerprint
+            && self.decl_scan_fingerprint != fork.decl_scan_fingerprint;
+        DerivedToRebuild {
+            subclasses,
+            decl_scan,
+        }
+    }
+
+    fn rebuild_derived(&mut self, rebuild: DerivedToRebuild) {
+        for (decl_id, bases) in rebuild.subclasses {
+            let derives = super_bases(self.supers.get(&decl_id))
+                .cloned()
+                .collect::<HashSet<_>>();
+            for base_id in bases {
+                let listed = self
+                    .sub_types
+                    .get(&base_id)
+                    .is_some_and(|children| children.contains(&decl_id));
+                if derives.contains(&base_id) && !listed {
+                    self.sub_types
+                        .entry(base_id)
+                        .or_default()
+                        .push(decl_id.clone());
+                } else if !derives.contains(&base_id)
+                    && listed
+                    && let Some(children) = self.sub_types.get_mut(&base_id)
+                {
+                    children.retain(|child| *child != decl_id);
+                    if children.is_empty() {
+                        self.sub_types.remove(&base_id);
+                    }
+                }
+            }
+        }
+        if rebuild.decl_scan {
+            self.decl_scan_fingerprint = self
+                .full_name_type_map
+                .keys()
+                .map(|decl_id| derivation::fingerprint_of(decl_id.get_id()))
+                .fold(derivation::ABSENT, Fingerprint::wrapping_add);
+        }
+    }
+
     fn add_to_decl_scan(&mut self, decl_id: &LuaTypeDeclId) {
         self.decl_scan_fingerprint = self
             .decl_scan_fingerprint
@@ -4082,6 +4223,148 @@ mod super_type_tests {
     use rowan::TextRange;
 
     use super::*;
+    use crate::db_index::cow_shards::TaskFork;
+    use crate::db_index::traits::LuaIndex;
+
+    fn class_ref(name: &str) -> LuaType {
+        LuaType::Ref(LuaTypeDeclId::global(name))
+    }
+
+    fn derivation_in(file: u32) -> DerivationId {
+        DerivationId::new(
+            derivation::DerivationKind::GmodPre,
+            FileId::new(file),
+            glua_parser::LuaSyntaxId::new(
+                glua_parser::LuaSyntaxKind::Chunk.into(),
+                TextRange::default(),
+            ),
+        )
+    }
+
+    /// Adds `child : Base` declared in `file`, as that file's derivation.
+    fn derive_from_base(index: &mut LuaTypeIndex, child: &str, file: u32) {
+        derivation::begin(derivation_in(file));
+        index.add_super_type(
+            LuaTypeDeclId::global(child),
+            FileId::new(file),
+            TextRange::default(),
+            class_ref("Base"),
+        );
+        derivation::end();
+    }
+
+    fn install(
+        index: &mut LuaTypeIndex,
+        frozen: &LuaTypeIndex,
+        fork: LuaTypeIndex,
+    ) -> Vec<&'static str> {
+        let mut conflicts = Vec::new();
+        index.install_task_reporting(frozen, fork, &mut conflicts);
+        conflicts
+    }
+
+    #[test]
+    fn a_subclass_another_task_still_derives_stays_listed_after_the_install() {
+        let mut index = LuaTypeIndex::new();
+        derive_from_base(&mut index, "Child", 1);
+        let frozen = index.task_fork();
+        let mut dropping = frozen.task_fork();
+        dropping.retract_contributions(&derivation_in(1));
+        let mut adding = frozen.task_fork();
+        derive_from_base(&mut adding, "Child", 2);
+
+        let conflicts = [
+            install(&mut index, &frozen, dropping),
+            install(&mut index, &frozen, adding),
+        ]
+        .concat();
+        assert_eq!(
+            (
+                conflicts,
+                index.sub_types.get(&LuaTypeDeclId::global("Base"))
+            ),
+            (Vec::new(), Some(&vec![LuaTypeDeclId::global("Child")]))
+        );
+    }
+
+    #[test]
+    fn a_subclass_no_task_derives_any_more_is_dropped_after_the_install() {
+        let mut index = LuaTypeIndex::new();
+        derive_from_base(&mut index, "Child", 1);
+        let frozen = index.task_fork();
+        let mut dropping = frozen.task_fork();
+        dropping.retract_contributions(&derivation_in(1));
+        let mut other = frozen.task_fork();
+        derive_from_base(&mut other, "Other", 2);
+
+        let conflicts = [
+            install(&mut index, &frozen, other),
+            install(&mut index, &frozen, dropping),
+        ]
+        .concat();
+        assert_eq!(
+            (
+                conflicts,
+                index.sub_types.get(&LuaTypeDeclId::global("Base"))
+            ),
+            (Vec::new(), Some(&vec![LuaTypeDeclId::global("Other")]))
+        );
+    }
+
+    #[test]
+    fn a_reference_owner_follows_the_merged_counts() {
+        let signature = LuaSignatureId::new(FileId::new(9), 0.into());
+        let typ = LuaType::Signature(signature);
+        let type_ref = TypeCacheRef::Signature(signature);
+        let owner_file = FileId::new(1);
+        let mut refs = TypeCacheRefIndex::default();
+        refs.add(owner_file, &typ);
+        let frozen = refs.task_fork();
+        let mut dropping = frozen.task_fork();
+        dropping.remove(owner_file, &typ);
+        let mut adding = frozen.task_fork();
+        adding.add(owner_file, &typ);
+
+        assert!(!refs.install_task(&frozen, dropping));
+        assert!(!refs.install_task(&frozen, adding));
+        assert_eq!(
+            (
+                refs.owner_refs
+                    .get(&owner_file)
+                    .and_then(|counts| counts.get(&type_ref)),
+                refs.owners(&type_ref)
+                    .is_some_and(|owners| owners.contains(&owner_file)),
+                refs.refs_into_file(FileId::new(9))
+                    .any(|held| *held == type_ref),
+            ),
+            (Some(&1), true, true)
+        );
+    }
+
+    #[test]
+    fn a_reference_no_owner_holds_any_more_is_dropped() {
+        let signature = LuaSignatureId::new(FileId::new(9), 0.into());
+        let typ = LuaType::Signature(signature);
+        let type_ref = TypeCacheRef::Signature(signature);
+        let mut refs = TypeCacheRefIndex::default();
+        refs.add(FileId::new(1), &typ);
+        refs.add(FileId::new(2), &typ);
+        let frozen = refs.task_fork();
+        let mut first = frozen.task_fork();
+        first.remove(FileId::new(1), &typ);
+        let mut second = frozen.task_fork();
+        second.remove(FileId::new(2), &typ);
+
+        assert!(!refs.install_task(&frozen, first));
+        assert!(!refs.install_task(&frozen, second));
+        assert_eq!(
+            (
+                refs.owners(&type_ref),
+                refs.refs_into_file(FileId::new(9)).count()
+            ),
+            (None, 0)
+        );
+    }
 
     /// A superseding write replaces the type, so the metadata derived from the
     /// discarded type must not survive to be reported against the new one.
@@ -4774,31 +5057,35 @@ crate::db_index::cow_shards::task_fork_fields!(LuaTypeIndex {
     file_using_namespace,
     file_types,
     declaration_sites,
-    full_name_type_map,
-    generic_params,
-    alias_sources,
+    full_name_type_map => LuaTypeDecl::merge,
+    generic_params => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, crate::db_index::cow_shards::refuse)
+    },
+    alias_sources => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, crate::db_index::cow_shards::refuse)
+    },
     extra_sources,
-    supers,
+    supers => merge_super_entries,
     supers_by_file,
-    sub_types,
+    sub_types => crate::db_index::cow_shards::rebuilt,
     decl_type_binds,
-    type_bound_decls,
+    type_bound_decls => crate::db_index::cow_shards::merge_set,
     table_literal_decls,
     types,
     cache_refs,
     in_filed_type_owner,
     fact_metadata,
     fact_ref_files,
-    fact_refs_by_file,
+    fact_refs_by_file => crate::db_index::cow_shards::merge_set,
     definition_fact_ref_files,
-    definition_fact_refs_by_file,
+    definition_fact_refs_by_file => crate::db_index::cow_shards::merge_set,
     decl_write_claims,
     definition_facts,
     inference_events_by_file,
     support_dependents,
     support_file_dependents,
     derived_state_dirty,
-    decl_scan_fingerprint,
+    decl_scan_fingerprint => crate::db_index::cow_shards::rebuilt,
     source_types,
     source_decl_locations,
     derived_contributions,
@@ -4806,10 +5093,12 @@ crate::db_index::cow_shards::task_fork_fields!(LuaTypeIndex {
     super_holders,
     table_classes,
     fallbacks,
-});
+} prepare derived_to_rebuild then rebuild_derived);
 
 crate::db_index::cow_shards::task_fork_fields!(TypeCacheRefIndex {
-    owner_refs,
-    ref_owners,
-    refs_by_file,
-});
+    owner_refs => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, crate::db_index::cow_shards::merge_sum)
+    },
+    ref_owners => crate::db_index::cow_shards::rebuilt,
+    refs_by_file => crate::db_index::cow_shards::rebuilt,
+} prepare refs_to_rebuild then rebuild_refs);

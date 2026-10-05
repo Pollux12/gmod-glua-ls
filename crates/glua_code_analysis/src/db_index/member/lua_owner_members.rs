@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 use rustc_hash::FxHashMap as HashMap;
 
 use super::member_id_sort_key;
+use crate::db_index::cow_shards::{Conflict, Merged, merge_list, merge_map, refuse};
 use crate::db_index::derivation::{Fingerprint, fingerprint_of, mapping_back};
 use crate::{LuaMemberId, LuaMemberIndexItem, LuaMemberKey};
 
@@ -76,6 +77,51 @@ impl LuaOwnerMembers {
         }
         self.fingerprint = self.fingerprint.wrapping_add(item_fingerprint(&key, &item));
         self.members.insert(key, item);
+    }
+
+    /// Merges two tasks' changes to one owner's members key by key; two
+    /// tasks changing one key's item, or removing the owner, conflict.
+    pub(crate) fn merge(
+        current: Option<&Self>,
+        frozen: Option<&Self>,
+        fork: Option<&Self>,
+    ) -> Merged<Self> {
+        let (Some(current), Some(fork)) = (current, fork) else {
+            return Err(Conflict);
+        };
+        let empty = Self::new();
+        let frozen = frozen.unwrap_or(&empty);
+        let Some(members) = merge_map(
+            Some(&current.members),
+            Some(&frozen.members),
+            Some(&fork.members),
+            refuse,
+        )?
+        else {
+            return Err(Conflict);
+        };
+        let expr_keys = merge_list(
+            Some(&current.expr_keys),
+            Some(&frozen.expr_keys),
+            Some(&fork.expr_keys),
+        )?
+        .unwrap_or_default();
+        let resolve_state = if fork.resolve_state == frozen.resolve_state {
+            current.resolve_state.clone()
+        } else {
+            fork.resolve_state.clone()
+        };
+        let fingerprint = members.iter().fold(0, |sum: Fingerprint, (key, item)| {
+            sum.wrapping_add(item_fingerprint(key, item))
+        });
+        Ok(Some(Self {
+            members,
+            sorted_ids_cache: OnceLock::new(),
+            sorted_expr_ids_cache: OnceLock::new(),
+            expr_keys,
+            resolve_state,
+            fingerprint,
+        }))
     }
 
     /// The listed `(key, id)` pairs as an order-independent fingerprint.
@@ -247,6 +293,57 @@ mod tests {
             ),
             FileId::new(file_id),
         )
+    }
+
+    fn owner_with(entries: &[(&str, LuaMemberId)]) -> LuaOwnerMembers {
+        let mut members = LuaOwnerMembers::new();
+        for (name, id) in entries {
+            members.add_member(
+                LuaMemberKey::Name((*name).into()),
+                LuaMemberIndexItem::One(*id),
+            );
+        }
+        members
+    }
+
+    #[test]
+    fn tasks_adding_other_keys_merge_into_the_owner_a_serial_run_builds() {
+        let frozen = owner_with(&[("a", member_id(1, 1))]);
+        let current = owner_with(&[("a", member_id(1, 1)), ("b", member_id(2, 2))]);
+        let fork = owner_with(&[("a", member_id(1, 1)), ("c", member_id(3, 3))]);
+        let serial = owner_with(&[
+            ("a", member_id(1, 1)),
+            ("b", member_id(2, 2)),
+            ("c", member_id(3, 3)),
+        ]);
+
+        let merged = LuaOwnerMembers::merge(Some(&current), Some(&frozen), Some(&fork))
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged, serial);
+    }
+
+    #[test]
+    fn tasks_changing_one_key_conflict() {
+        let frozen = owner_with(&[("a", member_id(1, 1))]);
+        let current = owner_with(&[("a", member_id(2, 2))]);
+        let fork = owner_with(&[("a", member_id(3, 3))]);
+
+        assert_eq!(
+            LuaOwnerMembers::merge(Some(&current), Some(&frozen), Some(&fork)),
+            Err(Conflict)
+        );
+    }
+
+    #[test]
+    fn a_task_removing_the_owner_conflicts_with_one_changing_it() {
+        let frozen = owner_with(&[("a", member_id(1, 1))]);
+        let current = owner_with(&[("a", member_id(1, 1)), ("b", member_id(2, 2))]);
+
+        assert_eq!(
+            LuaOwnerMembers::merge(Some(&current), Some(&frozen), None),
+            Err(Conflict)
+        );
     }
 
     #[test]

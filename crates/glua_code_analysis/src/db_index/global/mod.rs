@@ -536,5 +536,5 @@ mod tests {
 crate::db_index::cow_shards::task_fork_fields!(LuaGlobalIndex {
     global_decl,
     file_order,
-    scan_fingerprint,
+    scan_fingerprint => crate::db_index::cow_shards::merge_sum,
 });

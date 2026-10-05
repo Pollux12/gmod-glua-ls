@@ -325,26 +325,18 @@ impl<K: ShardKey + Clone, V: Clone + PartialEq> CowShards<K, V> {
         (0..frozen.end().max(fork.end())).collect()
     }
 
-    /// Whether `self`, which held `frozen` when `fork` was forked from it,
-    /// changed since a key `fork` changed too, to another value.
-    pub(crate) fn conflicts(&self, frozen: &Self, fork: &Self) -> bool {
-        Self::forked_slots(frozen, fork).into_iter().any(|at| {
-            let was = frozen.held_shard(at);
-            let now = self.held_shard(at);
-            let forked = fork.held_shard(at);
-            !same_shard(was, forked)
-                && !same_shard(was, now)
-                && changed_entries(was, forked).any(|(key, value)| {
-                    let before = was.and_then(|was| was.get(key));
-                    let current = now.and_then(|now| now.get(key));
-                    current != before && current != value
-                })
-        })
+    /// Takes in what `fork`, a fork of `frozen`, changed: a shard nothing
+    /// else changed since is taken whole, any other key by key. Returns
+    /// whether `self` had changed a key since that `fork` changed too, to
+    /// another value; the fork's value replaces it.
+    pub(crate) fn install(&mut self, frozen: &Self, fork: Self) -> bool {
+        self.install_with(frozen, fork, None)
     }
 
-    /// Takes in what `fork`, a fork of `frozen`, changed: a shard nothing
-    /// else changed since is taken whole, any other key by key.
-    pub(crate) fn install(&mut self, frozen: &Self, fork: Self) {
+    /// [`Self::install`], merging with `merge` each key both `self` and
+    /// `fork` changed; only a key `merge` refuses conflicts.
+    fn install_with(&mut self, frozen: &Self, fork: Self, merge: Option<Merge<V>>) -> bool {
+        let mut conflicted = false;
         for at in Self::forked_slots(frozen, &fork) {
             let was = frozen.held_shard(at);
             let forked = fork.held_shard(at);
@@ -365,12 +357,51 @@ impl<K: ShardKey + Clone, V: Clone + PartialEq> CowShards<K, V> {
                 .collect::<Vec<_>>();
             let target = self.shard_mut(at);
             for (key, value) in changes {
+                let before = was.and_then(|was| was.get(&key));
+                let now = target.get(&key);
+                let value = if now == before || now == value.as_ref() {
+                    value
+                } else {
+                    match merge.map(|merge| merge(now, before, value.as_ref())) {
+                        Some(Ok(merged)) => merged,
+                        Some(Err(Conflict)) | None => {
+                            conflicted = true;
+                            value
+                        }
+                    }
+                };
                 match value {
                     Some(value) => target.insert(key, value),
                     None => target.remove(&key),
                 };
             }
         }
+        conflicted
+    }
+}
+
+impl<K: ShardKey + Clone, V: Clone + PartialEq> CowShards<K, V> {
+    /// The keys `fork`, a fork of `frozen`, changed.
+    pub(crate) fn changed_keys(frozen: &Self, fork: &Self) -> Vec<K> {
+        Self::forked_slots(frozen, fork)
+            .into_iter()
+            .flat_map(|at| {
+                changed_entries(frozen.held_shard(at), fork.held_shard(at))
+                    .map(|(key, _)| key.clone())
+            })
+            .collect()
+    }
+
+    /// The keys `fork`, a fork of `frozen`, changed that `self` changed too,
+    /// to another value.
+    pub(crate) fn both_changed_keys(&self, frozen: &Self, fork: &Self) -> Vec<K> {
+        Self::changed_keys(frozen, fork)
+            .into_iter()
+            .filter(|key| {
+                let now = self.get(key);
+                now != frozen.get(key) && now != fork.get(key)
+            })
+            .collect()
     }
 }
 
@@ -670,12 +701,8 @@ impl<K: ShardKey + Clone> TaskFork for CowShardSet<K> {
         self.0.wrote(&frozen.0)
     }
 
-    fn conflicts(&self, frozen: &Self, fork: &Self) -> bool {
-        TaskFork::conflicts(&self.0, &frozen.0, &fork.0)
-    }
-
-    fn install_task(&mut self, frozen: &Self, fork: Self) {
-        self.0.install_task(&frozen.0, fork.0);
+    fn install_task(&mut self, frozen: &Self, fork: Self) -> bool {
+        self.0.install_task(&frozen.0, fork.0)
     }
 }
 
@@ -767,13 +794,12 @@ pub(crate) trait TaskFork: Sized {
     /// Whether this fork of `frozen` wrote anything.
     fn wrote(&self, frozen: &Self) -> bool;
 
-    /// Whether `self`, which held `frozen` when `fork` was forked from it,
-    /// changed since a value `fork` changed too, to another value.
-    fn conflicts(&self, frozen: &Self, fork: &Self) -> bool;
-
-    /// Takes in what `fork` changed since `frozen`; `fork` does not conflict
-    /// with `self`.
-    fn install_task(&mut self, frozen: &Self, fork: Self);
+    /// Takes in what `fork` changed since `frozen`. Returns whether `self`,
+    /// which held `frozen` when `fork` was forked from it, had changed a value
+    /// since that `fork` changed too, to another value, with no merge of the
+    /// two: the fork's value replaces it.
+    #[must_use]
+    fn install_task(&mut self, frozen: &Self, fork: Self) -> bool;
 }
 
 impl<K: ShardKey + Clone, V: Clone + PartialEq> TaskFork for CowShards<K, V> {
@@ -785,25 +811,20 @@ impl<K: ShardKey + Clone, V: Clone + PartialEq> TaskFork for CowShards<K, V> {
         !self.dirty.is_empty() || !Arc::ptr_eq(&self.slots, &frozen.slots)
     }
 
-    fn conflicts(&self, frozen: &Self, fork: &Self) -> bool {
-        CowShards::conflicts(self, frozen, fork)
-    }
-
-    fn install_task(&mut self, frozen: &Self, fork: Self) {
-        self.install(frozen, fork);
+    fn install_task(&mut self, frozen: &Self, fork: Self) -> bool {
+        self.install(frozen, fork)
     }
 }
 
-/// Installs a value a task replaces whole.
-fn install_whole<T>(current: &mut T, frozen: &T, fork: T, same: impl Fn(&T, &T) -> bool) {
-    if !same(&fork, frozen) {
-        *current = fork;
+/// Installs a value a task replaces whole. Returns whether another task had
+/// replaced it with a different one.
+fn install_whole<T>(current: &mut T, frozen: &T, fork: T, same: impl Fn(&T, &T) -> bool) -> bool {
+    if same(&fork, frozen) {
+        return false;
     }
-}
-
-/// Whether two tasks replaced a whole value with different ones.
-fn conflicts_whole<T>(current: &T, frozen: &T, fork: &T, same: impl Fn(&T, &T) -> bool) -> bool {
-    !same(fork, frozen) && !same(current, frozen) && !same(current, fork)
+    let conflicted = !same(current, frozen) && !same(current, &fork);
+    *current = fork;
+    conflicted
 }
 
 impl<T: Clone> TaskFork for CowCell<T> {
@@ -815,12 +836,8 @@ impl<T: Clone> TaskFork for CowCell<T> {
         !Arc::ptr_eq(&self.0, &frozen.0)
     }
 
-    fn conflicts(&self, frozen: &Self, fork: &Self) -> bool {
-        conflicts_whole(self, frozen, fork, |a, b| Arc::ptr_eq(&a.0, &b.0))
-    }
-
-    fn install_task(&mut self, frozen: &Self, fork: Self) {
-        install_whole(self, frozen, fork, |a, b| Arc::ptr_eq(&a.0, &b.0));
+    fn install_task(&mut self, frozen: &Self, fork: Self) -> bool {
+        install_whole(self, frozen, fork, |a, b| Arc::ptr_eq(&a.0, &b.0))
     }
 }
 
@@ -833,12 +850,8 @@ impl<T: ?Sized> TaskFork for Arc<T> {
         !Arc::ptr_eq(self, frozen)
     }
 
-    fn conflicts(&self, frozen: &Self, fork: &Self) -> bool {
-        conflicts_whole(self, frozen, fork, Arc::ptr_eq)
-    }
-
-    fn install_task(&mut self, frozen: &Self, fork: Self) {
-        install_whole(self, frozen, fork, Arc::ptr_eq);
+    fn install_task(&mut self, frozen: &Self, fork: Self) -> bool {
+        install_whole(self, frozen, fork, Arc::ptr_eq)
     }
 }
 
@@ -853,11 +866,9 @@ impl<T> TaskFork for std::sync::OnceLock<Arc<T>> {
         false
     }
 
-    fn conflicts(&self, _frozen: &Self, _fork: &Self) -> bool {
+    fn install_task(&mut self, _frozen: &Self, _fork: Self) -> bool {
         false
     }
-
-    fn install_task(&mut self, _frozen: &Self, _fork: Self) {}
 }
 
 macro_rules! task_fork_scalars {
@@ -871,12 +882,8 @@ macro_rules! task_fork_scalars {
                 self != frozen
             }
 
-            fn conflicts(&self, frozen: &Self, fork: &Self) -> bool {
-                conflicts_whole(self, frozen, fork, |a, b| a == b)
-            }
-
-            fn install_task(&mut self, frozen: &Self, fork: Self) {
-                install_whole(self, frozen, fork, |a, b| a == b);
+            fn install_task(&mut self, frozen: &Self, fork: Self) -> bool {
+                install_whole(self, frozen, fork, |a, b| a == b)
             }
         })*
     };
@@ -884,10 +891,413 @@ macro_rules! task_fork_scalars {
 
 task_fork_scalars!(u32, u64, usize, bool, crate::db_index::ModuleNodeId);
 
+/// How a field takes in a value that both the index and a task fork changed
+/// since the fork was taken: from the index's value, the value the fork found
+/// and the value it left, the value both changes leave, or [`Conflict`] when
+/// they do not compose. `None` is an absent entry, or a scalar's default.
+pub(crate) type Merge<V> = fn(Option<&V>, Option<&V>, Option<&V>) -> Merged<V>;
+
+/// A merged value, `None` when absent.
+pub(crate) type Merged<V> = Result<Option<V>, Conflict>;
+
+/// Two tasks changed a value in ways no merge composes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Conflict;
+
+/// Storage whose fields name a [`Merge`] in [`task_fork_fields!`]: the
+/// values two tasks changed apart are merged instead of conflicting.
+pub(crate) trait MergeFork: TaskFork {
+    type Value;
+
+    /// [`TaskFork::install_task`], merging what `self` changed too; only a
+    /// value `merge` refuses conflicts.
+    #[must_use]
+    fn install_merging(&mut self, frozen: &Self, fork: Self, merge: Merge<Self::Value>) -> bool;
+}
+
+impl<K: ShardKey + Clone, V: Clone + PartialEq> MergeFork for CowShards<K, V> {
+    type Value = V;
+
+    fn install_merging(&mut self, frozen: &Self, fork: Self, merge: Merge<V>) -> bool {
+        self.install_with(frozen, fork, Some(merge))
+    }
+}
+
+impl<T: Clone + Default + PartialEq> MergeFork for CowCell<T> {
+    type Value = T;
+
+    fn install_merging(&mut self, frozen: &Self, fork: Self, merge: Merge<T>) -> bool {
+        if Arc::ptr_eq(&fork.0, &frozen.0) || fork == *frozen {
+            return false;
+        }
+        if Arc::ptr_eq(&self.0, &frozen.0) || *self == fork || *self == *frozen {
+            *self = fork;
+            return false;
+        }
+        match merge(Some(&**self), Some(&**frozen), Some(&*fork)) {
+            Ok(merged) => {
+                *self = merged.unwrap_or_default().into();
+                false
+            }
+            Err(Conflict) => {
+                *self = fork;
+                true
+            }
+        }
+    }
+}
+
+macro_rules! merge_fork_scalars {
+    ($($ty:ty),* $(,)?) => {
+        $(impl MergeFork for $ty {
+            type Value = $ty;
+
+            fn install_merging(&mut self, frozen: &Self, fork: Self, merge: Merge<$ty>) -> bool {
+                if fork == *frozen || *self == fork {
+                    return false;
+                }
+                if *self == *frozen {
+                    *self = fork;
+                    return false;
+                }
+                match merge(Some(&*self), Some(frozen), Some(&fork)) {
+                    Ok(merged) => {
+                        *self = merged.unwrap_or_default();
+                        false
+                    }
+                    Err(Conflict) => {
+                        *self = fork;
+                        true
+                    }
+                }
+            }
+        })*
+    };
+}
+
+merge_fork_scalars!(u32, u64);
+
+/// A wrapping sum that each task adds its own terms to and takes its own
+/// terms from, so two tasks' changes add up: the index's value plus what the
+/// fork added since. Zero is absent.
+pub(crate) fn merge_sum<T: Summand>(
+    current: Option<&T>,
+    frozen: Option<&T>,
+    fork: Option<&T>,
+) -> Merged<T> {
+    let value = |value: Option<&T>| value.copied().unwrap_or_default();
+    let sum = value(current).add(value(fork).sub(value(frozen)));
+    Ok((sum != T::default()).then_some(sum))
+}
+
+/// A value [`merge_sum`] adds up.
+pub(crate) trait Summand: Copy + Default + PartialEq {
+    fn add(self, other: Self) -> Self;
+    fn sub(self, other: Self) -> Self;
+}
+
+macro_rules! summands {
+    ($($ty:ty),* $(,)?) => {
+        $(impl Summand for $ty {
+            fn add(self, other: Self) -> Self {
+                self.wrapping_add(other)
+            }
+
+            fn sub(self, other: Self) -> Self {
+                self.wrapping_sub(other)
+            }
+        })*
+    };
+}
+
+summands!(u32, u64, usize);
+
+/// A set each task adds its own elements to and drops its own from: the
+/// index's elements, less those the fork dropped, plus those it added. An
+/// emptied set is absent, as its owners prune it.
+pub(crate) fn merge_set<S: SetOf>(
+    current: Option<&S>,
+    frozen: Option<&S>,
+    fork: Option<&S>,
+) -> Merged<S> {
+    let mut merged = current.cloned().unwrap_or_default();
+    let had = |set: Option<&S>, element: &S::Element| set.is_some_and(|set| set.has(element));
+    for element in fork.into_iter().flat_map(SetOf::elements) {
+        if !had(frozen, element) {
+            merged.put(element.clone());
+        }
+    }
+    for element in frozen.into_iter().flat_map(SetOf::elements) {
+        if !had(fork, element) {
+            merged.drop_element(element);
+        }
+    }
+    Ok((!merged.is_empty()).then_some(merged))
+}
+
+/// A set [`merge_set`] merges element by element.
+pub(crate) trait SetOf: Clone + Default {
+    type Element: Clone;
+    fn elements(&self) -> impl Iterator<Item = &Self::Element>;
+    fn has(&self, element: &Self::Element) -> bool;
+    fn put(&mut self, element: Self::Element);
+    fn drop_element(&mut self, element: &Self::Element);
+    fn is_empty(&self) -> bool;
+}
+
+impl<T: Eq + Hash + Clone, S: BuildHasher + Default + Clone> SetOf
+    for std::collections::HashSet<T, S>
+{
+    type Element = T;
+
+    fn elements(&self) -> impl Iterator<Item = &T> {
+        self.iter()
+    }
+
+    fn has(&self, element: &T) -> bool {
+        self.contains(element)
+    }
+
+    fn put(&mut self, element: T) {
+        self.insert(element);
+    }
+
+    fn drop_element(&mut self, element: &T) {
+        self.remove(element);
+    }
+
+    fn is_empty(&self) -> bool {
+        std::collections::HashSet::is_empty(self)
+    }
+}
+
+impl<T: Ord + Clone> SetOf for std::collections::BTreeSet<T> {
+    type Element = T;
+
+    fn elements(&self) -> impl Iterator<Item = &T> {
+        self.iter()
+    }
+
+    fn has(&self, element: &T) -> bool {
+        self.contains(element)
+    }
+
+    fn put(&mut self, element: T) {
+        self.insert(element);
+    }
+
+    fn drop_element(&mut self, element: &T) {
+        self.remove(element);
+    }
+
+    fn is_empty(&self) -> bool {
+        std::collections::BTreeSet::is_empty(self)
+    }
+}
+
+/// A list used as a set whose readers do not depend on its order: the
+/// index's elements, less those the fork dropped, with those it added
+/// appended in the fork's order. An emptied list is absent, as its owners
+/// prune it.
+pub(crate) fn merge_list<T: Clone + PartialEq>(
+    current: Option<&Vec<T>>,
+    frozen: Option<&Vec<T>>,
+    fork: Option<&Vec<T>>,
+) -> Merged<Vec<T>> {
+    let (frozen, fork) = (
+        frozen.map_or(&[][..], Vec::as_slice),
+        fork.map_or(&[][..], Vec::as_slice),
+    );
+    let mut merged = current.cloned().unwrap_or_default();
+    merged.retain(|element| !frozen.contains(element) || fork.contains(element));
+    for element in fork {
+        if !frozen.contains(element) && !merged.contains(element) {
+            merged.push(element.clone());
+        }
+    }
+    Ok((!merged.is_empty()).then_some(merged))
+}
+
+/// [`merge_list`] for a list its owners keep sorted by `key` without
+/// duplicates: the merged list is sorted the same way.
+pub(crate) fn merge_sorted_by<T: Clone + PartialEq, K: Ord>(
+    current: Option<&Vec<T>>,
+    frozen: Option<&Vec<T>>,
+    fork: Option<&Vec<T>>,
+    key: impl Fn(&T) -> K,
+) -> Merged<Vec<T>> {
+    let mut merged = merge_list(current, frozen, fork)?;
+    if let Some(merged) = &mut merged {
+        merged.sort_by_key(key);
+    }
+    Ok(merged)
+}
+
+/// No merge: for a value only one task of a superstep should change, so two
+/// tasks changing it apart conflict.
+pub(crate) fn refuse<V>(_: Option<&V>, _: Option<&V>, _: Option<&V>) -> Merged<V> {
+    Err(Conflict)
+}
+
+/// The index's value, for a value the domain's `prepare … then …` hook
+/// rebuilds from the merged state after the install.
+pub(crate) fn rebuilt<V: Clone>(current: Option<&V>, _: Option<&V>, _: Option<&V>) -> Merged<V> {
+    Ok(current.cloned())
+}
+
+/// A map whose keys each task changes apart: the index's entries with each
+/// entry the fork changed taken in, merged by `inner` where the index changed
+/// it too. An emptied map is absent, as its owners prune it.
+pub(crate) fn merge_map<M: MapOf>(
+    current: Option<&M>,
+    frozen: Option<&M>,
+    fork: Option<&M>,
+    inner: Merge<M::Value>,
+) -> Merged<M> {
+    fn entry<'a, M: MapOf>(map: Option<&'a M>, key: &M::Key) -> Option<&'a M::Value> {
+        map.and_then(|map| map.entry_of(key))
+    }
+    let mut merged = current.cloned().unwrap_or_default();
+    let changed = fork
+        .into_iter()
+        .flat_map(MapOf::keys_of)
+        .filter(|key| entry(fork, key) != entry(frozen, key))
+        .chain(
+            frozen
+                .into_iter()
+                .flat_map(MapOf::keys_of)
+                .filter(|key| entry(fork, key).is_none()),
+        )
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in changed {
+        let (before, value) = (entry(frozen, &key), entry(fork, &key));
+        let now = merged.entry_of(&key);
+        let value = if now == before || now == value {
+            value.cloned()
+        } else {
+            inner(now, before, value)?
+        };
+        match value {
+            Some(value) => merged.put_entry(key, value),
+            None => merged.drop_entry(&key),
+        }
+    }
+    Ok((!merged.is_empty()).then_some(merged))
+}
+
+/// A map [`merge_map`] merges key by key.
+pub(crate) trait MapOf: Clone + Default {
+    type Key: Clone;
+    type Value: Clone + PartialEq;
+    fn keys_of(&self) -> impl Iterator<Item = &Self::Key>;
+    fn entry_of(&self, key: &Self::Key) -> Option<&Self::Value>;
+    fn put_entry(&mut self, key: Self::Key, value: Self::Value);
+    fn drop_entry(&mut self, key: &Self::Key);
+    fn is_empty(&self) -> bool;
+}
+
+impl<K: Eq + Hash + Clone, V: Clone + PartialEq, S: BuildHasher + Default + Clone> MapOf
+    for std::collections::HashMap<K, V, S>
+{
+    type Key = K;
+    type Value = V;
+
+    fn keys_of(&self) -> impl Iterator<Item = &K> {
+        self.keys()
+    }
+
+    fn entry_of(&self, key: &K) -> Option<&V> {
+        self.get(key)
+    }
+
+    fn put_entry(&mut self, key: K, value: V) {
+        self.insert(key, value);
+    }
+
+    fn drop_entry(&mut self, key: &K) {
+        self.remove(key);
+    }
+
+    fn is_empty(&self) -> bool {
+        std::collections::HashMap::is_empty(self)
+    }
+}
+
+impl<K: Ord + Clone, V: Clone + PartialEq> MapOf for std::collections::BTreeMap<K, V> {
+    type Key = K;
+    type Value = V;
+
+    fn keys_of(&self) -> impl Iterator<Item = &K> {
+        self.keys()
+    }
+
+    fn entry_of(&self, key: &K) -> Option<&V> {
+        self.get(key)
+    }
+
+    fn put_entry(&mut self, key: K, value: V) {
+        self.insert(key, value);
+    }
+
+    fn drop_entry(&mut self, key: &K) {
+        self.remove(key);
+    }
+
+    fn is_empty(&self) -> bool {
+        std::collections::BTreeMap::is_empty(self)
+    }
+}
+
+/// Installs a field, merging by the field's [`Merge`] when it names one.
+/// Returns whether it conflicted.
+macro_rules! install_field {
+    ($current:expr, $frozen:expr, $fork:expr) => {
+        $crate::db_index::cow_shards::TaskFork::install_task(&mut $current, &$frozen, $fork)
+    };
+    ($current:expr, $frozen:expr, $fork:expr, $merge:expr) => {
+        $crate::db_index::cow_shards::MergeFork::install_merging(
+            &mut $current,
+            &$frozen,
+            $fork,
+            $merge,
+        )
+    };
+}
+pub(crate) use install_field;
+
+/// What a domain's `prepare` hook takes before its fields are installed.
+macro_rules! prepare_install {
+    ($index:ident, $frozen:ident, $fork:ident) => {
+        ()
+    };
+    ($index:ident, $frozen:ident, $fork:ident, $before:ident) => {
+        $index.$before($frozen, &$fork)
+    };
+}
+pub(crate) use prepare_install;
+
+/// Runs a domain's `then` hook, handing it what `prepare` took.
+macro_rules! finish_install {
+    ($index:ident, $plan:ident, [], []) => {
+        let () = $plan;
+    };
+    ($index:ident, $plan:ident, [], [$after:ident]) => {{
+        let () = $plan;
+        $index.$after();
+    }};
+    ($index:ident, $plan:ident, [$before:ident], [$after:ident]) => {
+        $index.$after($plan)
+    };
+}
+pub(crate) use finish_install;
+
 /// Forks and installs an index field by field. Every field is listed, so a
-/// new field has to say how a task forks it; `then` runs after an install.
+/// new field has to say how a task forks it; `field => merge` names the
+/// [`Merge`] for values two tasks change apart. `then` runs after an install,
+/// with what `prepare` took from the index and the fork before it.
 macro_rules! task_fork_fields {
-    ($ty:ty { $($(#[$attr:meta])* $field:ident),* $(,)? } $(then $after:ident)?) => {
+    ($ty:ty { $($(#[$attr:meta])* $field:ident $(=> $merge:expr)?),* $(,)? } $(prepare $before:ident)? $(then $after:ident)?) => {
         impl $crate::db_index::cow_shards::TaskFork for $ty {
             fn task_fork(&self) -> Self {
                 Self {
@@ -902,24 +1312,28 @@ macro_rules! task_fork_fields {
                 false
             }
 
-            fn conflicts(&self, frozen: &Self, fork: &Self) -> bool {
-                self.task_conflict(frozen, fork).is_some()
-            }
-
-            fn install_task(&mut self, frozen: &Self, fork: Self) {
-                let Self { $($(#[$attr])* $field),* } = fork;
-                $($(#[$attr])* $crate::db_index::cow_shards::TaskFork::install_task(&mut self.$field, &frozen.$field, $field);)*
-                $(self.$after();)?
+            fn install_task(&mut self, frozen: &Self, fork: Self) -> bool {
+                let mut conflicts = Vec::new();
+                self.install_task_reporting(frozen, fork, &mut conflicts);
+                !conflicts.is_empty()
             }
         }
 
         impl $ty {
-            /// The first field `self` changed that `fork` changed too.
-            pub(crate) fn task_conflict(&self, frozen: &Self, fork: &Self) -> Option<&'static str> {
-                $($(#[$attr])* if $crate::db_index::cow_shards::TaskFork::conflicts(&self.$field, &frozen.$field, &fork.$field) {
-                    return Some(concat!(stringify!($ty), ".", stringify!($field)));
+            /// [`TaskFork::install_task`](crate::db_index::cow_shards::TaskFork::install_task),
+            /// adding to `conflicts` every field that conflicted.
+            pub(crate) fn install_task_reporting(
+                &mut self,
+                frozen: &Self,
+                fork: Self,
+                conflicts: &mut Vec<&'static str>,
+            ) {
+                let plan = $crate::db_index::cow_shards::prepare_install!(self, frozen, fork $(, $before)?);
+                let Self { $($(#[$attr])* $field),* } = fork;
+                $($(#[$attr])* if $crate::db_index::cow_shards::install_field!(self.$field, frozen.$field, $field $(, $merge)?) {
+                    conflicts.push(concat!(stringify!($ty), ".", stringify!($field)));
                 })*
-                None
+                $crate::db_index::cow_shards::finish_install!(self, plan, [$($before)?], [$($after)?]);
             }
         }
     };
@@ -1016,9 +1430,8 @@ mod tests {
         let mut second = frozen.fork();
         second.insert(path_key("b"), 2);
 
-        base.install(&frozen, first);
-        assert!(!base.conflicts(&frozen, &second));
-        base.install(&frozen, second);
+        assert!(!base.install(&frozen, first));
+        assert!(!base.install(&frozen, second));
         assert_eq!(
             sorted(&base),
             rendered(vec![(path_key("a"), 1), (path_key("b"), 2)])
@@ -1037,9 +1450,9 @@ mod tests {
         let mut other = frozen.fork();
         other.insert(path_key("a"), 2);
 
-        base.install(&frozen, first);
-        assert!(!base.conflicts(&frozen, &agreeing));
-        assert!(base.conflicts(&frozen, &other));
+        assert!(!base.install(&frozen, first));
+        assert!(!base.clone().install(&frozen, agreeing));
+        assert!(base.install(&frozen, other));
     }
 
     #[test]
@@ -1142,5 +1555,172 @@ mod tests {
         let mut copy = base.clone();
         copy.push(2);
         assert_eq!((&*base, &*copy), (&vec![1], &vec![1, 2]));
+    }
+
+    type Set = std::collections::BTreeSet<u32>;
+    type Map = std::collections::BTreeMap<u32, u32>;
+
+    fn set(elements: &[u32]) -> Set {
+        elements.iter().copied().collect()
+    }
+
+    fn map(entries: &[(u32, u32)]) -> Map {
+        entries.iter().copied().collect()
+    }
+
+    #[test]
+    fn sums_take_in_both_tasks_changes() {
+        assert_eq!(merge_sum(Some(&15u64), Some(&10), Some(&13)), Ok(Some(18)));
+    }
+
+    #[test]
+    fn sums_that_cancel_out_are_absent() {
+        assert_eq!(merge_sum(Some(&7u64), Some(&10), Some(&3)), Ok(None));
+    }
+
+    #[test]
+    fn sums_wrap_like_the_fingerprints_they_merge() {
+        assert_eq!(
+            merge_sum(Some(&1u64), Some(&u64::MAX), Some(&0)),
+            Ok(Some(2))
+        );
+    }
+
+    #[test]
+    fn sets_keep_the_index_additions_and_take_the_fork_removals_and_additions() {
+        let merged = merge_set(
+            Some(&set(&[1, 2, 4])),
+            Some(&set(&[1, 2])),
+            Some(&set(&[2, 5])),
+        );
+        assert_eq!(merged, Ok(Some(set(&[2, 4, 5]))));
+    }
+
+    #[test]
+    fn sets_both_tasks_emptied_are_absent() {
+        assert_eq!(
+            merge_set(Some(&set(&[2])), Some(&set(&[1, 2])), Some(&set(&[1]))),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn sets_both_tasks_created_are_their_union() {
+        assert_eq!(
+            merge_set(Some(&set(&[1])), None, Some(&set(&[2]))),
+            Ok(Some(set(&[1, 2])))
+        );
+    }
+
+    #[test]
+    fn maps_merge_a_key_both_tasks_changed_once() {
+        let merged = merge_map(
+            Some(&map(&[(1, 12), (2, 2)])),
+            Some(&map(&[(1, 10), (2, 2)])),
+            Some(&map(&[(1, 11), (2, 2), (3, 3)])),
+            merge_sum,
+        );
+        assert_eq!(merged, Ok(Some(map(&[(1, 13), (2, 2), (3, 3)]))));
+    }
+
+    #[test]
+    fn maps_take_a_removal_only_the_fork_made() {
+        let merged = merge_map(
+            Some(&map(&[(1, 1), (2, 2), (4, 4)])),
+            Some(&map(&[(1, 1), (2, 2)])),
+            Some(&map(&[(1, 1)])),
+            refuse,
+        );
+        assert_eq!(merged, Ok(Some(map(&[(1, 1), (4, 4)]))));
+    }
+
+    #[test]
+    fn maps_conflict_where_their_values_conflict() {
+        let merged = merge_map(
+            Some(&map(&[(1, 2)])),
+            Some(&map(&[(1, 1)])),
+            Some(&map(&[(1, 3)])),
+            refuse,
+        );
+        assert_eq!(merged, Err(Conflict));
+    }
+
+    #[test]
+    fn lists_keep_the_index_order_and_append_the_fork_additions() {
+        let merged = merge_list(
+            Some(&vec![3, 1, 7]),
+            Some(&vec![3, 1]),
+            Some(&vec![9, 3, 8]),
+        );
+        assert_eq!(merged, Ok(Some(vec![3, 7, 9, 8])));
+    }
+
+    #[test]
+    fn sorted_lists_stay_sorted() {
+        let merged = merge_sorted_by(Some(&vec![1, 5]), Some(&vec![1]), Some(&vec![1, 3]), |e| *e);
+        assert_eq!(merged, Ok(Some(vec![1, 3, 5])));
+    }
+
+    #[test]
+    fn installing_with_a_merge_takes_in_both_tasks_changes_to_a_key() {
+        let mut base: CowShards<LuaMemberKey, u64> = CowShards::default();
+        base.insert(path_key("a"), 10);
+        let frozen = base.clone();
+        let mut first = frozen.fork();
+        *first.get_mut(&path_key("a")).unwrap() += 2;
+        let mut second = frozen.fork();
+        *second.get_mut(&path_key("a")).unwrap() += 3;
+
+        assert!(!base.install_merging(&frozen, first, merge_sum));
+        assert!(!base.install_merging(&frozen, second, merge_sum));
+        assert_eq!(base.get(&path_key("a")), Some(&15));
+    }
+
+    #[test]
+    fn a_refused_merge_conflicts_and_takes_the_fork_value() {
+        let mut base: CowShards<LuaMemberKey, u64> = CowShards::default();
+        base.insert(path_key("a"), 10);
+        let frozen = base.clone();
+        let mut first = frozen.fork();
+        first.insert(path_key("a"), 11);
+        let mut second = frozen.fork();
+        second.insert(path_key("a"), 12);
+
+        assert!(!base.install_merging(&frozen, first, refuse));
+        assert!(base.install_merging(&frozen, second, refuse));
+        assert_eq!(base.get(&path_key("a")), Some(&12));
+    }
+
+    #[test]
+    fn scalars_merge_by_their_rule() {
+        let (mut base, frozen) = (13u64, 10u64);
+        assert!(!base.install_merging(&frozen, 11, merge_sum));
+        assert_eq!(base, 14);
+    }
+
+    #[test]
+    fn a_cell_a_fork_copied_without_changing_leaves_the_index_value() {
+        let base_cell: CowCell<Set> = set(&[1]).into();
+        let frozen = base_cell.clone();
+        let mut base = base_cell;
+        base.insert(2);
+        let mut fork = frozen.clone();
+        fork.remove(&9);
+
+        assert!(!base.install_merging(&frozen, fork, merge_set));
+        assert_eq!(*base, set(&[1, 2]));
+    }
+
+    #[test]
+    fn a_cell_merges_what_both_tasks_changed() {
+        let frozen: CowCell<Set> = set(&[1]).into();
+        let mut base = frozen.clone();
+        base.insert(2);
+        let mut fork = frozen.clone();
+        fork.remove(&1);
+        fork.insert(3);
+
+        assert!(!base.install_merging(&frozen, fork, merge_set));
+        assert_eq!(*base, set(&[2, 3]));
     }
 }

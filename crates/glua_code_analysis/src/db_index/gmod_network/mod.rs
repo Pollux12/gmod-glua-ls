@@ -989,12 +989,12 @@ mod tests {
 
 crate::db_index::cow_shards::task_fork_fields!(GmodNetworkIndex {
     file_data,
-    send_flows_by_message,
-    receive_flows_by_message,
-    materialized_definition_counts,
-    referencing,
+    send_flows_by_message => crate::db_index::cow_shards::merge_list,
+    receive_flows_by_message => crate::db_index::cow_shards::merge_list,
+    materialized_definition_counts => crate::db_index::cow_shards::merge_sum,
+    referencing => crate::db_index::cow_shards::merge_set,
     canonical_ops,
     helper_names,
-    flows_fingerprint,
+    flows_fingerprint => crate::db_index::cow_shards::merge_sum,
     canonical_ops_fingerprint,
 });

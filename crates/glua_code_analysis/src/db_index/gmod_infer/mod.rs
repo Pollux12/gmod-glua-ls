@@ -1220,7 +1220,9 @@ crate::db_index::cow_shards::task_fork_fields!(GmodInferIndex {
     realm_inputs,
     gm_method_realm_annotations,
     member_realm_ranges,
-    fileparam_index,
+    fileparam_index => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, crate::db_index::cow_shards::refuse)
+    },
     scoped_class_info,
-    scan_fingerprint,
+    scan_fingerprint => crate::db_index::cow_shards::merge_sum,
 } then invalidate_system_aggregate_cache);

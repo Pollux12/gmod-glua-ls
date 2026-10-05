@@ -711,10 +711,12 @@ mod tests {
 crate::db_index::cow_shards::task_fork_fields!(LuaDependencyIndex {
     dependencies,
     dependency_kinds,
-    dependency_callers_by_target,
+    dependency_callers_by_target => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, crate::db_index::cow_shards::merge_set)
+    },
     dependency_sites,
-    resolved_sites_by_target,
-    unresolved_dependents_by_path_key,
+    resolved_sites_by_target => crate::db_index::cow_shards::merge_list,
+    unresolved_dependents_by_path_key => crate::db_index::cow_shards::merge_set,
     unresolved_by_removal,
     derived_sites,
     #[cfg(test)]

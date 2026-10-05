@@ -1393,9 +1393,9 @@ mod tests {
 crate::db_index::cow_shards::task_fork_fields!(GmodClassMetadataIndex {
     file_metadata,
     vgui_parent_call_files,
-    vgui_panels,
+    vgui_panels => crate::db_index::cow_shards::merge_list,
     derma_skins,
     vgui_panel_parent_chains,
     incomplete_vgui_panel_parent_chains,
-    meta_fingerprints,
+    meta_fingerprints => crate::db_index::cow_shards::merge_sum,
 });

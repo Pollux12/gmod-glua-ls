@@ -153,6 +153,23 @@ impl CallSiteParamIndex {
         slots
     }
 
+    /// The slots of each signature whose folded parameters both `self` and
+    /// `fork`, a task fork of `frozen`, changed: the merged contributors
+    /// re-fold them.
+    fn slots_to_refold(&self, frozen: &Self, fork: &Self) -> HashSet<ParamSlot> {
+        self.inferred_params
+            .both_changed_keys(&frozen.inferred_params, &fork.inferred_params)
+            .into_iter()
+            .flat_map(|signature_id| {
+                [self, frozen, fork]
+                    .into_iter()
+                    .filter_map(move |index| index.inferred_params.get(&signature_id))
+                    .flat_map(|params| params.keys().copied())
+                    .map(move |param_idx| (signature_id, param_idx))
+            })
+            .collect()
+    }
+
     /// Re-folds `slots` from their contributors' evidence, in file order.
     fn refold(&mut self, slots: HashSet<ParamSlot>) {
         for (signature_id, param_idx) in slots {
@@ -387,7 +404,7 @@ fn referenced_files(
 
 crate::db_index::cow_shards::task_fork_fields!(CallSiteParamIndex {
     file_contributions,
-    contributors,
-    inferred_params,
-    referencing,
-});
+    contributors => crate::db_index::cow_shards::merge_set,
+    inferred_params => crate::db_index::cow_shards::rebuilt,
+    referencing => crate::db_index::cow_shards::merge_set,
+} prepare slots_to_refold then refold);

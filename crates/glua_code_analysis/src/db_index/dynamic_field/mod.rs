@@ -174,6 +174,16 @@ fn insert_definition(into: &mut Vec<InFiled<TextRange>>, definition: InFiled<Tex
     true
 }
 
+/// Merges two tasks' changes to one list of definition sites, which stays in
+/// canonical order.
+fn merge_definitions(
+    current: Option<&Vec<InFiled<TextRange>>>,
+    frozen: Option<&Vec<InFiled<TextRange>>>,
+    fork: Option<&Vec<InFiled<TextRange>>>,
+) -> crate::db_index::cow_shards::Merged<Vec<InFiled<TextRange>>> {
+    crate::db_index::cow_shards::merge_sorted_by(current, frozen, fork, definition_sort_key)
+}
+
 fn merge_wildcard_definitions(into: &mut Vec<InFiled<TextRange>>, from: Vec<InFiled<TextRange>>) {
     for definition in from {
         insert_definition(into, definition);
@@ -1103,6 +1113,21 @@ impl DynamicFieldIndex {
                 named_entry(field_name, self.named_slot_fingerprint(owner, field_name))
             })
             .fold(0u64, u64::wrapping_add)
+    }
+
+    /// The owners whose named fingerprint both `self` and `fork`, a task fork
+    /// of `frozen`, changed: the merged slots rebuild it.
+    fn owners_to_rebuild(&self, frozen: &Self, fork: &Self) -> Vec<DynamicFieldOwner> {
+        self.owner_named_fingerprints.both_changed_keys(
+            &frozen.owner_named_fingerprints,
+            &fork.owner_named_fingerprints,
+        )
+    }
+
+    fn rebuild_owner_named(&mut self, owners: Vec<DynamicFieldOwner>) {
+        for owner in owners {
+            self.recompute_owner_named(&owner);
+        }
     }
 
     /// Rebuilds `owner`'s multiset fingerprint after a whole-owner rewrite.
@@ -2164,15 +2189,21 @@ mod tests {
 }
 
 crate::db_index::cow_shards::task_fork_fields!(DynamicFieldIndex {
-    owner_fields,
-    field_definitions,
-    direct_field_definitions,
-    finite_named_members,
+    owner_fields => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, crate::db_index::cow_shards::merge_set)
+    },
+    field_definitions => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, merge_definitions)
+    },
+    direct_field_definitions => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, merge_definitions)
+    },
+    finite_named_members => crate::db_index::cow_shards::merge_set,
     file_contributions,
     finite_named_file_contributions,
-    wildcard_definitions,
+    wildcard_definitions => merge_definitions,
     wildcard_file_contributions,
-    unattributed_fields,
+    unattributed_fields => crate::db_index::cow_shards::merge_set,
     unattributed_file_contributions,
-    owner_named_fingerprints,
-});
+    owner_named_fingerprints => crate::db_index::cow_shards::rebuilt,
+} prepare owners_to_rebuild then rebuild_owner_named);

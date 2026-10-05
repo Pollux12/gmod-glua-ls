@@ -1334,9 +1334,15 @@ crate::db_index::cow_shards::task_fork_fields!(LuaSignatureIndex {
     valid_guard_names,
     valid_guard_name_counts,
     inferred_positive_guards,
-    inferred_guard_owners,
-    inferred_guard_facts,
-    inferred_guard_owners_by_file,
+    inferred_guard_owners => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, crate::db_index::cow_shards::refuse)
+    },
+    inferred_guard_facts => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, crate::db_index::cow_shards::refuse)
+    },
+    inferred_guard_owners_by_file => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, crate::db_index::cow_shards::merge_set)
+    },
     inferred_guard_consumers,
     inferred_guard_dependencies,
     inferred_return_dependencies,
