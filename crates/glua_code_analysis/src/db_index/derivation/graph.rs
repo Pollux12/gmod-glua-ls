@@ -517,9 +517,15 @@ impl KeyTable {
     /// Interns `key`. A new slot counts as written at stamp `now`: older
     /// memos cannot have read the key it now names.
     fn intern(&mut self, key: HashedKey, now: u64) -> KeyIdx {
+        self.intern_created(key, now).0
+    }
+
+    /// [`Self::intern`], and for a slot it created, the slot of the key's
+    /// base.
+    fn intern_created(&mut self, key: HashedKey, now: u64) -> (KeyIdx, Option<Option<KeyIdx>>) {
         self.collect_retired();
         if let Some(slot) = self.find(&key) {
-            return slot;
+            return (slot, None);
         }
         let slot = match self.free_keys.pop() {
             Some(slot) => slot,
@@ -547,11 +553,12 @@ impl KeyTable {
                 .expect("a filed key slot is live")
                 .hash
         });
-        if let Some(base) = base {
+        let base = base.map(|base| {
             let base = self.intern(HashedKey::new(base), now);
             self.derived.entry(base).or_default().slots.push(slot);
-        }
-        slot
+            base
+        });
+        (slot, Some(base))
     }
 
     pub(super) fn key(&self, slot: KeyIdx) -> &HashedKey {
@@ -572,26 +579,40 @@ impl KeyTable {
     /// Interns a key a worker read that its snapshot lacked: created when the
     /// release epoch began, whichever evaluation of the epoch publishes it first.
     pub(super) fn intern_worker_read(&mut self, key: HashedKey) -> KeyIdx {
-        let slot = self.intern(key, self.retirement_started);
-        let mut base = self.key(slot).base();
-        while let Some(key) = base {
-            let key = HashedKey::new(key);
-            if let Some(base_slot) = self.find(&key) {
-                let windowed = self.windowed(base_slot);
-                let held = self.held(base_slot);
-                let entry = &mut self.keys[slot as usize];
-                if windowed {
-                    self.windows.entry(slot).or_insert(entry.written);
-                    entry.windowed = true;
-                }
-                if held {
-                    self.held.entry(slot).or_insert(entry.written);
-                    entry.held = true;
-                }
+        let (slot, created) = self.intern_created(key, self.retirement_started);
+        let mut base_slot = match created {
+            Some(None) => return slot,
+            Some(Some(base_slot)) => base_slot,
+            None => {
+                let Some(base_slot) = self
+                    .key(slot)
+                    .base()
+                    .and_then(|base| self.find(&HashedKey::new(base)))
+                else {
+                    return slot;
+                };
+                base_slot
             }
-            base = key.base();
+        };
+        loop {
+            let windowed = self.windowed(base_slot);
+            let held = self.held(base_slot);
+            let entry = &mut self.keys[slot as usize];
+            if windowed {
+                self.windows.entry(slot).or_insert(entry.written);
+                entry.windowed = true;
+            }
+            if held {
+                self.held.entry(slot).or_insert(entry.written);
+                entry.held = true;
+            }
+            let Some(base) = self.key(base_slot).base() else {
+                return slot;
+            };
+            base_slot = self
+                .find(&HashedKey::new(base))
+                .expect("interning a key interns its bases");
         }
-        slot
     }
 
     /// Marks `key` written at stamp `now`, if anything ever read it, and every
