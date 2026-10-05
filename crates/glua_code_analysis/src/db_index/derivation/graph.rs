@@ -1380,6 +1380,45 @@ impl ReaderGraph {
             .map(|(deriv, seen)| (self.derivations[*deriv as usize].id, seen))
     }
 
+    /// Takes, on worker threads, the fingerprint of every key the records of
+    /// `ids` read, so the checks that follow find each cached. Query outputs
+    /// are left to the checks, as taking one may compute the query.
+    pub fn warm_reads(
+        &self,
+        ids: impl Iterator<Item = DerivationId>,
+        fingerprint: impl Fn(&HashedKey) -> Fingerprint + Sync,
+    ) {
+        let slots = ids
+            .filter_map(|id| self.record(id))
+            .flat_map(|(_, record)| record.reads.iter().copied())
+            .collect();
+        self.warm_slots(slots, fingerprint);
+    }
+
+    /// [`Self::warm_reads`] for the fingerprints of `keys`.
+    pub fn warm_keys<'a>(
+        &self,
+        keys: impl Iterator<Item = &'a HashedKey>,
+        fingerprint: impl Fn(&HashedKey) -> Fingerprint + Sync,
+    ) {
+        let slots = keys.filter_map(|key| self.table.find(key)).collect();
+        self.warm_slots(slots, fingerprint);
+    }
+
+    fn warm_slots(
+        &self,
+        mut slots: Vec<KeyIdx>,
+        fingerprint: impl Fn(&HashedKey) -> Fingerprint + Sync,
+    ) {
+        use rayon::prelude::*;
+        slots.retain(|slot| !self.table.is_query(*slot));
+        slots.sort_unstable();
+        slots.dedup();
+        slots.par_iter().for_each(|slot| {
+            self.slot_fingerprint(*slot, &fingerprint);
+        });
+    }
+
     /// Whether any read `id` last made no longer holds: it saw another
     /// fingerprint than the key's current one, and `holds_moved` does not
     /// excuse the difference.
