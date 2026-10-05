@@ -1087,10 +1087,6 @@ impl Engine {
         };
         self.stats.supersteps += 1;
         let dispatching = crate::profile::PhaseGuard::new("superstep: dispatch");
-        db.reader_graph().warm_reads(
-            self.worklist.at(rank, Reason::Read, 0).map(|(.., id)| *id),
-            |key| db.fact_fingerprint(key),
-        );
         let mut plans = Vec::new();
         let mut root = Vec::new();
         let mut on_root = Vec::new();
@@ -1335,8 +1331,6 @@ impl Engine {
         let checking = crate::profile::PhaseGuard::new("superstep: readers of");
         self.forget_view(db);
         db.reader_graph().uncheck_derived(&touched);
-        db.reader_graph()
-            .warm_keys(touched.iter(), |key| db.fact_fingerprint(key));
         self.readers_of(db, touched.iter());
         drop(checking);
         for (_, groups, _, reruns, _) in &tasks {

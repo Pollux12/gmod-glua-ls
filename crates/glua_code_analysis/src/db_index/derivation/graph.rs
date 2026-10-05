@@ -1414,16 +1414,6 @@ impl ReaderGraph {
         self.warm_slots(slots, fingerprint);
     }
 
-    /// [`Self::warm_reads`] for the fingerprints of `keys`.
-    pub fn warm_keys<'a>(
-        &self,
-        keys: impl Iterator<Item = &'a HashedKey>,
-        fingerprint: impl Fn(&HashedKey) -> Fingerprint + Sync,
-    ) {
-        let slots = keys.filter_map(|key| self.table.find(key)).collect();
-        self.warm_slots(slots, fingerprint);
-    }
-
     fn warm_slots(
         &self,
         mut slots: Vec<KeyIdx>,
