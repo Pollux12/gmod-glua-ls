@@ -392,6 +392,9 @@ pub(crate) struct Engine {
     /// often; and whether the stage settles on the serial loop instead.
     task_runs: FxHashMap<DerivationId, u32>,
     serial_files: FxHashSet<crate::FileId>,
+    /// How often each group, by its first member, waited a superstep for
+    /// the queries it read to be computed since the run entered its stage.
+    query_deferrals: FxHashMap<DerivationId, u8>,
     serial_stage: bool,
     /// Under `GLUALS_SUPERSTEP`, every key the superstep's tasks touched, and
     /// those the running task touched.
@@ -1296,10 +1299,29 @@ impl Engine {
             }
         }
         // A group that read a query the snapshot had no answer for runs again
-        // here, where the query is computed.
-        for id in on_root {
-            self.file_queries(db);
-            self.step(db, recipe, slice, id, Reason::Changed);
+        // in the next superstep, once the queries it read are computed here;
+        // one still lacking an answer after that runs here, where queries are
+        // computed as they are read.
+        for (members, queries) in on_root {
+            let deferrals = self.query_deferrals.entry(members[0]).or_default();
+            if !queries.is_empty() && *deferrals < QUERY_DEFERRALS {
+                *deferrals += 1;
+                for key in &queries {
+                    if db.queries().ready_fingerprint(key.key()).is_none() {
+                        self.file_queries(db);
+                        let query = db.queries().id_of(key.key());
+                        self.step(db, recipe, slice, query, Reason::Changed);
+                    }
+                }
+                self.stats
+                    .requeue_cause(members[0], "read a query the snapshot had no answer for");
+                self.worklist.insert(members[0], Reason::Changed);
+                continue;
+            }
+            for id in members {
+                self.file_queries(db);
+                self.step(db, recipe, slice, id, Reason::Changed);
+            }
         }
         // A task installed over an earlier task's change left a value that
         // lacks what one of them wrote: every producer of a primary key both
@@ -1736,6 +1758,7 @@ impl Engine {
         self.stage_evaluations.clear();
         self.task_runs.clear();
         self.serial_files.clear();
+        self.query_deferrals.clear();
         self.serial_stage = false;
         let before = db.analysis_stage();
         db.set_analysis_stage(stage);
@@ -2837,11 +2860,12 @@ struct GroupRun {
 }
 
 /// What filing a task's recording leaves for the root: the records to
-/// replace, in order, the members of groups that read a query the snapshot
-/// had no answer for, and the keys its records moved or produce.
+/// replace, in order, the groups that read a query the snapshot had no answer
+/// for, each with the query outputs it read, and the keys its records moved
+/// or produce.
 struct FiledTask {
     records: Vec<derivation::KeptRecord>,
-    on_root: Vec<DerivationId>,
+    on_root: Vec<(Vec<DerivationId>, Vec<HashedKey>)>,
     touched: Vec<HashedKey>,
 }
 
@@ -2868,7 +2892,13 @@ fn file_task(
                 .as_ref()
                 .is_some_and(|(_, canonical)| *canonical)
         }) {
-            filed.on_root.extend(group.members.iter().copied());
+            let queries = group
+                .records
+                .iter()
+                .filter_map(|(at, _)| evaluations[*at].as_ref())
+                .flat_map(|(evaluation, _)| table.read_queries(evaluation))
+                .collect();
+            filed.on_root.push((group.members.clone(), queries));
             continue;
         }
         for (at, seen) in &mut group.records {
@@ -3272,6 +3302,10 @@ thread_local! {
 /// How often a worker superstep runs one derivation within a stage before the
 /// stage settles on the serial loop.
 const SUPERSTEP_RUN_LIMIT: u32 = 64;
+
+/// How many supersteps a group waits for the queries it read before it runs
+/// on the index instead.
+const QUERY_DEFERRALS: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SuperstepMode {

@@ -2007,6 +2007,16 @@ impl KeptRecord {
 }
 
 impl KeyTable {
+    /// The query outputs `evaluation`, canonicalised into this table, read.
+    pub fn read_queries(&self, evaluation: &super::Evaluation) -> Vec<HashedKey> {
+        evaluation
+            .read
+            .iter()
+            .filter(|slot| self.is_query(**slot))
+            .map(|slot| self.key(*slot).clone())
+            .collect()
+    }
+
     /// The record of a task's `evaluation`, whose reads were canonicalised
     /// into this table, each with the fingerprint in `seen` at its position.
     pub fn keep_record(&self, evaluation: super::Evaluation, seen: Vec<Fingerprint>) -> KeptRecord {

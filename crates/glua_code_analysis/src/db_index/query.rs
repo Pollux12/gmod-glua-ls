@@ -455,6 +455,19 @@ impl Queries {
         outputs
     }
 
+    /// The derivation that computes query output `key`.
+    pub(crate) fn id_of(&self, key: &FactKey) -> DerivationId {
+        match key {
+            FactKey::ReceiverAuthority(signature_id) => {
+                QueryTable::<ReceiverAuthorityQuery>::id(*signature_id)
+            }
+            FactKey::CallbackParams(signature_id) => {
+                QueryTable::<CallbackParamsQuery>::id(*signature_id)
+            }
+            _ => unreachable!("{key:?} is not a query output"),
+        }
+    }
+
     pub(crate) fn ready_fingerprint(&self, key: &FactKey) -> Option<Fingerprint> {
         match key {
             FactKey::ReceiverAuthority(signature_id) => {
