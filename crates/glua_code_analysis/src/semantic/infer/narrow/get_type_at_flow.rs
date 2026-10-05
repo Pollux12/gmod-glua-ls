@@ -442,6 +442,7 @@ fn get_type_at_flow_walk(
     let mut antecedent_flow_id = initial_flow_id;
     let mut skip_lookup = initial_missed;
     let numeric_index_query = OnceCell::new();
+    let has_special_call_effect = OnceCell::new();
     loop {
         // Check cache for intermediate flow nodes (both success and error).
         // This is critical for performance in large files where many walks
@@ -666,9 +667,13 @@ fn get_type_at_flow_walk(
                     return Ok(LuaType::Never);
                 }
 
-                if let Some(effects) = db
+                let file_id = cache.get_file_id();
+                if *has_special_call_effect.get_or_init(|| {
+                    db.get_flow_index()
+                        .has_special_call_effect_for(&file_id, var_ref_id)
+                }) && let Some(effects) = db
                     .get_flow_index()
-                    .get_special_call_effects(&cache.get_file_id(), call_expr.get_position())
+                    .get_special_call_effects(&file_id, call_expr.get_position())
                 {
                     let mut effect_type = None;
                     for effect in effects {

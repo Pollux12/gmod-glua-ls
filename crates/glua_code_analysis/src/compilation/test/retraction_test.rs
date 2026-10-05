@@ -243,13 +243,8 @@ mod test {
     fn special_call_effect_is_dropped_when_the_outparam_goes() {
         let layout = "lua/autorun/sh_layout.lua";
         let hud = "lua/autorun/client/cl_hud.lua";
-        let layout_text = |outparam: &str| {
-            format!(
-                "---@class HUDStackLayout\n---@field rowHeight integer\n\nglide = {{}}\n\n{outparam}---@param out table\nfunction glide.GetHUDStackLayout(out) end\n"
-            )
-        };
-        let before = layout_text("---@outparam out HUDStackLayout\n");
-        let after = layout_text("");
+        let before = stack_layout_text("---@outparam out HUDStackLayout\n");
+        let after = stack_layout_text("");
         let warm = VirtualWorkspace::assert_warm_matches_cold(
             gmod,
             &[
@@ -263,6 +258,44 @@ mod test {
         );
 
         assert_ne!(index_type(&warm, hud, "layout.rowHeight"), "integer");
+    }
+
+    fn stack_layout_text(outparam: &str) -> String {
+        format!(
+            "---@class HUDStackLayout\n---@field rowHeight integer\n\nglide = {{}}\n\n{outparam}---@param out table\nfunction glide.GetHUDStackLayout(out) end\n"
+        )
+    }
+
+    #[test]
+    fn an_outparam_narrows_only_its_own_variable_and_only_after_the_call() {
+        let layout = "lua/autorun/sh_layout.lua";
+        let hud = "lua/autorun/client/cl_hud.lua";
+        let mut ws = VirtualWorkspace::new();
+        gmod(&mut ws);
+        ws.def_files(vec![
+            (
+                layout,
+                &stack_layout_text(
+                    "---@outparam out HUDStackLayout
+",
+                ),
+            ),
+            (
+                hud,
+                "local layout = {}
+local other = {}
+local early = layout.rowHeight
+glide.GetHUDStackLayout(layout)
+local late = layout.rowHeight
+local untouched = other.rowHeight
+print(early, late, untouched)
+",
+            ),
+        ]);
+
+        assert_eq!(last_name_type(&ws, hud, "late"), "integer");
+        assert_ne!(last_name_type(&ws, hud, "early"), "integer");
+        assert_ne!(last_name_type(&ws, hud, "untouched"), "integer");
     }
 
     #[test]
