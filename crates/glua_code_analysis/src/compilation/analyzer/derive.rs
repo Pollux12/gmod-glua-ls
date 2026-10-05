@@ -188,13 +188,26 @@ impl Recipes {
 
     /// Commits the transaction and clears the local state of every memo held
     /// by [`Self::settle_later`], concurrently, and returns it to the store.
+    /// Inside a superstep task it settles that file's memos alone, in place.
     fn settle_caches(&self) {
-        let unsettled = std::mem::take(&mut *self.unsettled.lock().expect("unsettled memos"));
-        unsettled.into_par_iter().for_each(|(file_id, mut cache)| {
+        let settle = |(file_id, mut cache): (FileId, crate::LuaInferCache)| {
             cache.commit_transaction();
             cache.clear();
             self.store_cache(file_id, cache);
-        });
+        };
+        let mut held = self.unsettled.lock().expect("unsettled memos");
+        let Some(task) = super::parallel::task_file() else {
+            let unsettled = std::mem::take(&mut *held);
+            drop(held);
+            unsettled.into_par_iter().for_each(settle);
+            return;
+        };
+        let (own, others): (Vec<_>, Vec<_>) = std::mem::take(&mut *held)
+            .into_iter()
+            .partition(|(file_id, _)| *file_id == task);
+        *held = others;
+        drop(held);
+        own.into_iter().for_each(settle);
     }
 
     /// Each file's inference memo.
@@ -560,5 +573,44 @@ impl Recipes {
             | DerivationKind::CallbackParams
             | DerivationKind::Diagnostics => unreachable!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CacheOptions, LuaInferCache, VirtualWorkspace};
+
+    #[test]
+    fn a_task_settles_only_its_own_files_memos() {
+        let mut ws = VirtualWorkspace::new();
+        let own = ws.def_file("lua/autorun/own.lua", "local a = 1");
+        let peer = ws.def_file("lua/autorun/peer.lua", "local b = 1");
+        let db = ws.get_db_mut();
+        let recipes = Recipes::new(db, ScriptedScopes::new(db));
+        for file_id in [own, peer] {
+            recipes.settle_later(
+                file_id,
+                LuaInferCache::new(file_id, CacheOptions::default()),
+            );
+        }
+
+        super::super::parallel::in_task(own, || recipes.settle_caches());
+
+        let unsettled = recipes.unsettled.lock().expect("unsettled memos");
+        assert_eq!(
+            unsettled
+                .iter()
+                .map(|(file_id, _)| *file_id)
+                .collect::<Vec<_>>(),
+            [peer]
+        );
+        assert!(
+            recipes
+                .caches
+                .lock()
+                .expect("cache store")
+                .contains_key(&own)
+        );
     }
 }

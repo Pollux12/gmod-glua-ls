@@ -66,8 +66,33 @@ pub(crate) fn records_on_workers() -> bool {
 #[cfg(test)]
 pub(crate) static THREADS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+thread_local! {
+    /// The file whose superstep task runs on this thread.
+    static TASK_FILE: std::cell::Cell<Option<FileId>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` as the superstep task of `file_id`: batches it reaches run on this
+/// thread, so no other task's work interleaves with it on a worker blocked in
+/// a nested join.
+pub(crate) fn in_task<T>(file_id: FileId, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<FileId>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TASK_FILE.with(|task| task.set(self.0));
+        }
+    }
+    let _restore = Restore(TASK_FILE.with(|task| task.replace(Some(file_id))));
+    f()
+}
+
+/// The file whose superstep task runs on this thread, if any.
+pub(crate) fn task_file() -> Option<FileId> {
+    TASK_FILE.with(|task| task.get())
+}
+
 /// Whether this batch is better run on the caller's thread than handed to the
-/// pool: too few files to pay the dispatch, or nothing to run in parallel on.
+/// pool: too few files to pay the dispatch, a superstep task running, or
+/// nothing to run in parallel on.
 ///
 /// The pool's size is [`init_pool`]'s business; this only decides whether to
 /// reach for it at all.
@@ -76,6 +101,7 @@ pub(crate) fn runs_inline(file_count: usize) -> bool {
     // pool worker would read unrecorded.
     file_count < MIN_PARALLEL_FILES
         || crate::db_index::derivation::recording()
+        || task_file().is_some()
         || analysis_threads() <= 1
 }
 
@@ -186,7 +212,8 @@ where
 /// aligned with `items`, as part of the evaluation recording on this thread:
 /// each chunk of items records its reads on its own, and they are filed with
 /// the evaluation in item order. Runs on the caller's thread when no
-/// evaluation records or the batch is too small to pay the dispatch.
+/// evaluation records, a superstep task runs or the batch is too small to pay
+/// the dispatch.
 pub(crate) fn map_items_recorded<T, R>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>
 where
     T: Sync,
@@ -195,7 +222,7 @@ where
     let Some(id) = crate::db_index::derivation::current() else {
         return items.iter().map(f).collect();
     };
-    if items.len() < MIN_PARALLEL_FILES || analysis_threads() <= 1 {
+    if items.len() < MIN_PARALLEL_FILES || analysis_threads() <= 1 || task_file().is_some() {
         return items.iter().map(f).collect();
     }
 

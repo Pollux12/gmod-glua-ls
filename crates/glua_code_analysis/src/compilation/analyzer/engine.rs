@@ -1046,14 +1046,16 @@ impl Engine {
         }
         let mut ran = Vec::new();
         self.task = Some(file_id);
-        while let Some((id, reason)) = local.pop_first() {
-            ran.push(id);
-            self.file_queries(db);
-            self.step(db, recipe, slice, id, reason);
-            for (id, reason) in self.worklist.take_file_at(rank, file_id) {
-                local.insert(id, reason);
+        super::parallel::in_task(file_id, || {
+            while let Some((id, reason)) = local.pop_first() {
+                ran.push(id);
+                self.file_queries(db);
+                self.step(db, recipe, slice, id, reason);
+                for (id, reason) in self.worklist.take_file_at(rank, file_id) {
+                    local.insert(id, reason);
+                }
             }
-        }
+        });
         self.task = None;
         ran
     }
