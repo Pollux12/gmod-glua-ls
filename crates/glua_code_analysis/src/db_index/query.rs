@@ -392,9 +392,14 @@ impl<F: QueryFamily> QueryTable<F> {
                 stale: false,
             },
         );
-        Counters::bump(&self.counters.recomputed);
-        if previous.is_some_and(|previous| previous.fingerprint == fingerprint) {
-            Counters::bump(&self.counters.cut_off);
+        match previous {
+            None => Counters::bump(&self.counters.computed),
+            Some(previous) => {
+                Counters::bump(&self.counters.recomputed);
+                if previous.fingerprint == fingerprint {
+                    Counters::bump(&self.counters.cut_off);
+                }
+            }
         }
         derivation::note_write(|| F::output(key));
     }
