@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use hashbrown::HashTable;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::paged::Paged;
+use super::paged::{PAGE, Paged};
 use super::{DerivationId, DerivationKind, EditMaps, FactKey, Fingerprint, HashedKey};
 use crate::FileId;
 
@@ -1183,6 +1183,7 @@ impl ReaderGraph {
                 id,
                 reads,
                 dropped_reads,
+                output_slots: vec![None; outputs.len()],
                 outputs,
             },
             released,
@@ -1198,16 +1199,51 @@ impl ReaderGraph {
         released: &mut Vec<KeyIdx>,
         now: u64,
     ) -> Vec<HashedKey> {
+        let mut ops = Vec::new();
+        let dropped = self.file_kept(record, released, now, &mut ops);
+        for (slot, op) in ops {
+            op.apply(&mut self.table.keys[slot as usize].readers);
+        }
+        dropped
+    }
+
+    /// [`Self::replace_kept`] for each of `records` in order, at the stamp
+    /// `stamp` gives each; the readers of the keys they read are updated a
+    /// page of slots at a time on worker threads.
+    pub fn replace_all_kept(
+        &mut self,
+        records: Vec<KeptRecord>,
+        released: &mut Vec<KeyIdx>,
+        mut stamp: impl FnMut() -> u64,
+    ) {
+        let mut ops = Vec::with_capacity(records.iter().map(|record| record.reads.len()).sum());
+        for record in records {
+            self.file_kept(record, released, stamp(), &mut ops);
+        }
+        self.table.apply_reader_ops(ops);
+    }
+
+    /// Files `record` but for the changes to its reads' readers, which go to
+    /// `ops` in the order they apply.
+    fn file_kept(
+        &mut self,
+        record: KeptRecord,
+        released: &mut Vec<KeyIdx>,
+        now: u64,
+        ops: &mut Vec<(KeyIdx, ReaderOp)>,
+    ) -> Vec<HashedKey> {
         let KeptRecord {
             id,
             reads,
             dropped_reads,
             outputs,
+            output_slots,
         } = record;
         let deriv = self.intern_derivation(id);
         let mut outputs = outputs
             .into_iter()
-            .map(|key| self.intern_key(key, now))
+            .zip(output_slots)
+            .map(|(key, slot)| slot.unwrap_or_else(|| self.intern_key(key, now)))
             .collect::<Vec<_>>();
         outputs.sort_unstable();
         outputs.dedup();
@@ -1224,22 +1260,17 @@ impl ReaderGraph {
         loop {
             match (old_reads.peek().copied(), new_reads.peek().copied()) {
                 (Some(old_key), Some((new_key, new_seen))) if old_key == new_key => {
-                    let readers = &mut self.table.keys[new_key as usize].readers;
-                    if readers.seen_by(deriv) != new_seen {
-                        readers.insert(deriv, new_seen);
-                    }
+                    ops.push((new_key, ReaderOp::Seen(deriv, new_seen)));
                     old_reads.next();
                     new_reads.next();
                 }
                 (Some(old_key), next) if next.is_none_or(|(new_key, _)| old_key < new_key) => {
-                    self.table.keys[old_key as usize].readers.remove(deriv);
+                    ops.push((old_key, ReaderOp::Remove(deriv)));
                     unread.push(old_key);
                     old_reads.next();
                 }
                 (_, Some((new_key, new_seen))) => {
-                    self.table.keys[new_key as usize]
-                        .readers
-                        .insert(deriv, new_seen);
+                    ops.push((new_key, ReaderOp::Insert(deriv, new_seen)));
                     new_reads.next();
                 }
                 (None, None) => break,
@@ -1991,6 +2022,49 @@ impl ReaderGraph {
     }
 }
 
+/// A change a record makes to the readers of one of its reads.
+#[derive(Debug, Clone, Copy)]
+enum ReaderOp {
+    /// The reader now saw this, if it saw something else before.
+    Seen(DerivIdx, Fingerprint),
+    Insert(DerivIdx, Fingerprint),
+    Remove(DerivIdx),
+}
+
+impl ReaderOp {
+    fn apply(self, readers: &mut Readers) {
+        match self {
+            Self::Seen(deriv, seen) => {
+                if readers.seen_by(deriv) != seen {
+                    readers.insert(deriv, seen);
+                }
+            }
+            Self::Insert(deriv, seen) => readers.insert(deriv, seen),
+            Self::Remove(deriv) => readers.remove(deriv),
+        }
+    }
+}
+
+impl KeyTable {
+    /// Applies `ops`, each slot's in order, a page of slots per worker.
+    fn apply_reader_ops(&mut self, ops: Vec<(KeyIdx, ReaderOp)>) {
+        use rayon::prelude::*;
+        let pages = self.keys.pages_mut();
+        let mut by_page = vec![Vec::new(); pages.len()];
+        for (slot, op) in ops {
+            by_page[slot as usize / PAGE].push((slot as usize % PAGE, op));
+        }
+        pages
+            .par_iter_mut()
+            .zip(by_page)
+            .for_each(|(page, ops)| {
+                for (at, op) in ops {
+                    op.apply(&mut page[at].readers);
+                }
+            });
+    }
+}
+
 /// A task evaluation's record with the reads it keeps sorted and those it
 /// drops set apart, for [`ReaderGraph::replace_kept`].
 pub struct KeptRecord {
@@ -1998,6 +2072,8 @@ pub struct KeptRecord {
     reads: Vec<(KeyIdx, Fingerprint)>,
     dropped_reads: Vec<KeyIdx>,
     outputs: Vec<HashedKey>,
+    /// Each output's slot, where the table already had one.
+    output_slots: Vec<Option<KeyIdx>>,
 }
 
 impl KeptRecord {
@@ -2027,11 +2103,13 @@ impl KeyTable {
             |slot| self.key(slot),
             |key| super::contains_hashed(&outputs, key),
         );
+        let output_slots = outputs.iter().map(|key| self.find(key)).collect();
         KeptRecord {
             id,
             reads,
             dropped_reads,
             outputs,
+            output_slots,
         }
     }
 }

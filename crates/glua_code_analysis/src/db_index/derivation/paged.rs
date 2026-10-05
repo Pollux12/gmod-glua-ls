@@ -6,7 +6,7 @@ pub(super) struct Paged<T> {
     len: usize,
 }
 
-const PAGE: usize = 1 << 16;
+pub(super) const PAGE: usize = 1 << 16;
 
 impl<T> Default for Paged<T> {
     fn default() -> Self {
@@ -42,6 +42,11 @@ impl<T> Paged<T> {
 
     pub(super) fn get(&self, index: usize) -> Option<&T> {
         (index < self.len).then(|| &self[index])
+    }
+
+    /// The pages, each holding [`PAGE`] consecutive indices.
+    pub(super) fn pages_mut(&mut self) -> &mut [Vec<T>] {
+        &mut self.pages
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = &T> {

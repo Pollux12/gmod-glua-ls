@@ -1254,14 +1254,14 @@ impl Engine {
         db.reader_graph_mut().restore_keys(table);
         let mut released = Vec::new();
         let mut on_root = Vec::new();
+        let mut records = Vec::new();
         for task in filed {
             touched.extend(task.touched);
             on_root.extend(task.on_root);
-            let graph = db.reader_graph_mut();
-            for record in task.records {
-                graph.replace_kept(record, &mut released, derivation::new_stamp());
-            }
+            records.extend(task.records);
         }
+        db.reader_graph_mut()
+            .replace_all_kept(records, &mut released, derivation::new_stamp);
         for (_, groups, ..) in &tasks {
             for group in groups {
                 if let Some(started) = group.elapsed.filter(|_| profiling) {
