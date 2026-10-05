@@ -1445,9 +1445,11 @@ impl DbIndex {
     pub(crate) fn flatten_installs(&mut self) {
         macro_rules! flatten {
             ($($domain:ident),*; $($field:ident),*) => {
-                $(if let Some(domain) = Arc::get_mut(&mut self.$domain) {
-                    cow_shards::TaskFork::flatten(domain);
-                })*
+                rayon::scope(|scope| {
+                    $(if let Some(domain) = Arc::get_mut(&mut self.$domain) {
+                        scope.spawn(move |_| cow_shards::TaskFork::flatten(domain));
+                    })*
+                });
                 $(cow_shards::TaskFork::flatten(&mut self.$field);)*
             };
         }
