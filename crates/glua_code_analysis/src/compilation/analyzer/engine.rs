@@ -386,9 +386,11 @@ pub(crate) struct Engine {
     /// its batches take no other file's work.
     task: Option<crate::FileId>,
     /// Under `GLUALS_SUPERSTEP=workers`, how often each derivation ran in a
-    /// task since the run entered its stage, and whether one ran so often
-    /// that the stage settles on the serial loop instead.
+    /// task since the run entered its stage; the files whose work settles on
+    /// the index, each to quiescence, since one of their derivations ran so
+    /// often; and whether the stage settles on the serial loop instead.
     task_runs: FxHashMap<DerivationId, u32>,
+    serial_files: FxHashSet<crate::FileId>,
     serial_stage: bool,
     /// Under `GLUALS_SUPERSTEP`, every key the superstep's tasks touched, and
     /// those the running task touched.
@@ -1036,11 +1038,16 @@ impl Engine {
         let dispatching = crate::profile::PhaseGuard::new("superstep: dispatch");
         let mut plans = Vec::new();
         let mut root = Vec::new();
+        let mut on_root = Vec::new();
         let mut workspace = Vec::new();
         for file_id in self.worklist.files_at(rank) {
             let entries = self.worklist.take_file_at(rank, file_id);
             if file_id == crate::FileId::VIRTUAL {
                 workspace = entries;
+                continue;
+            }
+            if self.serial_files.contains(&file_id) {
+                on_root.push((file_id, entries));
                 continue;
             }
             let mut groups = Vec::new();
@@ -1068,6 +1075,13 @@ impl Engine {
             self.run_on_workers(db, recipe, slice, plans);
         }
         let _root = crate::profile::PhaseGuard::new("superstep: root list");
+        for (file_id, entries) in on_root {
+            let deferred = self.worklist.take_file_at(rank, file_id);
+            self.run_task(db, recipe, slice, rank, file_id, entries);
+            for (id, reason) in deferred {
+                self.worklist.insert(id, reason);
+            }
+        }
         for (id, reason) in root.into_iter().chain(workspace) {
             self.file_queries(db);
             self.step(db, recipe, slice, id, reason);
@@ -1129,10 +1143,14 @@ impl Engine {
         for member in &group {
             let runs = self.task_runs.entry(*member).or_default();
             *runs += 1;
-            // A loop that keeps moving under supersteps, where each task sees
-            // only what the others wrote before it, settles as the serial
-            // loop settles it.
-            if *runs > SUPERSTEP_RUN_LIMIT && !self.serial_stage {
+            // A loop that keeps moving under supersteps, where a task runs
+            // only what was queued before it began, settles as the serial
+            // loop settles it: its file's work runs to quiescence on the
+            // index, and if that does not settle it, the stage's work does.
+            if *runs > SUPERSTEP_RUN_LIMIT && self.serial_files.insert(member.file_id) {
+                self.stats.serial_files += 1;
+            }
+            if *runs > 4 * SUPERSTEP_RUN_LIMIT && !self.serial_stage {
                 self.serial_stage = true;
                 self.stats.serial_stages += 1;
             }
@@ -1714,6 +1732,7 @@ impl Engine {
     fn enter_stage(&mut self, db: &mut DbIndex, stage: AnalysisStage) -> Vec<HashedKey> {
         self.stage_evaluations.clear();
         self.task_runs.clear();
+        self.serial_files.clear();
         self.serial_stage = false;
         let before = db.analysis_stage();
         db.set_analysis_stage(stage);
@@ -2489,7 +2508,8 @@ pub(crate) struct EngineStats {
     /// Tasks run again on the index, by the first value they conflicted on.
     conflicting_tasks: usize,
     task_conflicts: BTreeMap<&'static str, usize>,
-    /// Stages a worker run settled on the serial loop.
+    /// Files and stages a worker run settled on the index.
+    serial_files: usize,
     serial_stages: usize,
     /// Loops of statements cleared, and the derivations they ran again.
     pub(crate) loops_cleared: usize,
@@ -2693,10 +2713,11 @@ impl EngineStats {
         );
         if self.supersteps > 0 {
             eprintln!(
-                "[engine] supersteps={} tasks={} conflicting={} serial stages={} conflicts={:?}",
+                "[engine] supersteps={} tasks={} conflicting={} serial files={} serial stages={} conflicts={:?}",
                 self.supersteps,
                 self.superstep_tasks,
                 self.conflicting_tasks,
+                self.serial_files,
                 self.serial_stages,
                 self.task_conflicts
             );
