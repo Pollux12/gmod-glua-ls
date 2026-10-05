@@ -1091,8 +1091,14 @@ impl Engine {
         let mut root = Vec::new();
         let mut on_root = Vec::new();
         let mut workspace = Vec::new();
-        for file_id in self.worklist.files_at(rank) {
-            let entries = self.worklist.take_file_at(rank, file_id);
+        let taken = self
+            .worklist
+            .files_at(rank)
+            .into_iter()
+            .map(|file_id| (file_id, self.worklist.take_file_at(rank, file_id)))
+            .collect::<Vec<_>>();
+        let checked = self.check_dispatch(db, &taken);
+        for ((file_id, entries), checked) in taken.into_iter().zip(checked) {
             if file_id == crate::FileId::VIRTUAL {
                 workspace = entries;
                 continue;
@@ -1103,11 +1109,11 @@ impl Engine {
             }
             let mut groups = Vec::new();
             let mut grouped = FxHashSet::default();
-            for (id, reason) in entries {
+            for ((id, reason), checked) in entries.into_iter().zip(checked) {
                 if grouped.contains(&id) {
                     continue;
                 }
-                match self.dispatch(db, file_id, id, reason) {
+                match self.dispatch(db, file_id, id, reason, checked) {
                     Dispatched::Settled => {}
                     Dispatched::Root => root.push((id, reason)),
                     Dispatched::Task(group, rerun) => {
@@ -1148,6 +1154,7 @@ impl Engine {
         file_id: crate::FileId,
         id: DerivationId,
         reason: Reason,
+        checked: Option<Checked>,
     ) -> Dispatched {
         if db.analysis_stage() < id.kind.first_stage() {
             let held = self.held.entry(id).or_insert(reason);
@@ -1158,11 +1165,17 @@ impl Engine {
         if id.kind.is_query() {
             return Dispatched::Root;
         }
-        if !self.needs_evaluation(db, id, reason) {
+        let group = match checked {
+            Some(Checked::Settled) => None,
+            Some(Checked::Stale(group)) => Some(group),
+            None => self
+                .needs_evaluation(db, id, reason)
+                .then(|| co_producers(db, id)),
+        };
+        let Some(group) = group else {
             self.moved_from.remove(&id);
             return Dispatched::Settled;
-        }
-        let group = co_producers(db, id);
+        };
         if group.iter().any(|member| member.file_id != file_id) {
             return Dispatched::Root;
         }
@@ -1207,6 +1220,50 @@ impl Engine {
             }
         }
         Dispatched::Task(group, rerun)
+    }
+
+    /// Whether each of the entries `taken` from files at a rank needs
+    /// evaluating, and the group it runs with if it does, found on worker
+    /// threads while nothing is being edited or recorded: [`Self::dispatch`]
+    /// asks the same of the index as it stands, which dispatching leaves as
+    /// it is. `None` for an entry dispatch decides otherwise.
+    fn check_dispatch(
+        &self,
+        db: &DbIndex,
+        taken: &[(crate::FileId, Vec<(DerivationId, Reason)>)],
+    ) -> Vec<Vec<Option<Checked>>> {
+        if !self.edits.is_empty() || derivation::recording() {
+            return taken
+                .iter()
+                .map(|(_, entries)| vec![None; entries.len()])
+                .collect();
+        }
+        let stage = db.analysis_stage();
+        let graph = db.reader_graph();
+        taken
+            .par_iter()
+            .map(|(_, entries)| {
+                entries
+                    .iter()
+                    .map(|(id, reason)| {
+                        if stage < id.kind.first_stage() || id.kind.is_query() {
+                            return None;
+                        }
+                        let stale = *reason == Reason::Changed
+                            || graph.is_stale(
+                                *id,
+                                |key| db.fact_fingerprint(key),
+                                |key, _| key.is_stage_rule(),
+                            );
+                        Some(if stale {
+                            Checked::Stale(co_producers(db, *id))
+                        } else {
+                            Checked::Settled
+                        })
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     /// Runs `plans` on worker threads against the index and reader graph as
@@ -2965,6 +3022,13 @@ fn file_task(
         }
     }
     filed
+}
+
+/// What [`Engine::check_dispatch`] found of a queued entry.
+#[derive(Clone)]
+enum Checked {
+    Settled,
+    Stale(Vec<DerivationId>),
 }
 
 /// What a task left for the barrier.
