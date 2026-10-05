@@ -2244,8 +2244,11 @@ impl LuaTypeIndex {
         })
     }
 
+    /// Every type declaration, ordered by [`LuaTypeDeclId::stable_cmp`].
     pub fn get_all_types(&self) -> Vec<&LuaTypeDecl> {
-        self.iter_type_decls().collect()
+        let mut types: Vec<&LuaTypeDecl> = self.iter_type_decls().collect();
+        types.sort_unstable_by(|left, right| left.get_id().stable_cmp(&right.get_id()));
+        types
     }
 
     /// [`get_all_types`](Self::get_all_types) without collecting, for the
