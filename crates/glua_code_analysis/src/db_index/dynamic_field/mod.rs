@@ -1,5 +1,6 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
+use crate::db_index::cow_shards::CowShards;
 use rowan::TextRange;
 use smol_str::SmolStr;
 
@@ -91,24 +92,25 @@ pub fn is_pure_wildcard_registry(db: &DbIndex, owner: &DynamicFieldOwner) -> boo
 #[derive(Debug, Default, Clone)]
 pub struct DynamicFieldIndex {
     /// owner → (field_name → set of files that assign this field)
-    owner_fields: HashMap<DynamicFieldOwner, HashMap<SmolStr, HashSet<FileId>>>,
+    owner_fields: CowShards<DynamicFieldOwner, HashMap<SmolStr, HashSet<FileId>>>,
     /// owner → (field_name → assignment locations)
-    field_definitions: HashMap<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
+    field_definitions: CowShards<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
     /// Exact fields collected on their original owner, excluding inherited propagation.
-    direct_field_definitions: HashMap<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
+    direct_field_definitions:
+        CowShards<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
     /// Expression-key members whose complete string domain was resolved to finite names.
-    finite_named_members: HashMap<DynamicFieldOwner, HashSet<LuaMemberId>>,
+    finite_named_members: CowShards<DynamicFieldOwner, HashSet<LuaMemberId>>,
     /// file → list of (owner, field_name) pairs contributed by this file
-    file_contributions: HashMap<FileId, Vec<(DynamicFieldOwner, SmolStr, TextRange)>>,
+    file_contributions: CowShards<FileId, Vec<(DynamicFieldOwner, SmolStr, TextRange)>>,
     /// file → finite-named members contributed by this file, so removal visits
     /// only the owners the removed files touched instead of retaining over
     /// every member in the workspace. Keyed by the member's own file, which is
     /// the file whose analysis recorded it.
-    finite_named_file_contributions: HashMap<FileId, Vec<(DynamicFieldOwner, LuaMemberId)>>,
+    finite_named_file_contributions: CowShards<FileId, Vec<(DynamicFieldOwner, LuaMemberId)>>,
     /// owner → assignment locations for writes through non-literal keys.
-    wildcard_definitions: HashMap<DynamicFieldOwner, Vec<InFiled<TextRange>>>,
+    wildcard_definitions: CowShards<DynamicFieldOwner, Vec<InFiled<TextRange>>>,
     /// file → wildcard assignments contributed by this file.
-    wildcard_file_contributions: HashMap<FileId, Vec<(DynamicFieldOwner, TextRange)>>,
+    wildcard_file_contributions: CowShards<FileId, Vec<(DynamicFieldOwner, TextRange)>>,
     /// field_name → write sites (`file`, index-key `range`) whose
     /// `X.field_name = ...` receiver could not be resolved to any owner, so
     /// the write landed nowhere. Names here are known to be assigned
@@ -116,13 +118,13 @@ pub struct DynamicFieldIndex {
     /// them. Keyed by site, not by file: the settled tail attributes each
     /// site independently, so two same-name sites in one file each own their
     /// record.
-    unattributed_fields: HashMap<SmolStr, HashSet<InFiled<TextRange>>>,
+    unattributed_fields: CowShards<SmolStr, HashSet<InFiled<TextRange>>>,
     /// file → unattributed (field_name, site range) pairs contributed by this
     /// file.
-    unattributed_file_contributions: HashMap<FileId, Vec<(SmolStr, TextRange)>>,
+    unattributed_file_contributions: CowShards<FileId, Vec<(SmolStr, TextRange)>>,
     /// Multiset fingerprint of each owner's named slots, maintained by
     /// [`DynamicFieldIndex::settle_named`].
-    owner_named_fingerprints: HashMap<DynamicFieldOwner, Fingerprint>,
+    owner_named_fingerprints: CowShards<DynamicFieldOwner, Fingerprint>,
 }
 
 /// One named slot's contribution to its owner's multiset fingerprint.
@@ -1172,7 +1174,7 @@ impl DynamicFieldIndex {
 /// Drops one definition entry filed under `(owner, field_name)`, pruning the
 /// emptied levels so no owner or field outlives its last definition.
 fn remove_field_definition(
-    definitions: &mut HashMap<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
+    definitions: &mut CowShards<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
     owner: &DynamicFieldOwner,
     field_name: &str,
     definition: &InFiled<TextRange>,
@@ -1194,7 +1196,7 @@ fn remove_field_definition(
 
 #[cfg(test)]
 fn normalize_file_contributions(
-    contributions: &HashMap<FileId, Vec<(DynamicFieldOwner, SmolStr, TextRange)>>,
+    contributions: &CowShards<FileId, Vec<(DynamicFieldOwner, SmolStr, TextRange)>>,
 ) -> HashMap<FileId, HashMap<(DynamicFieldOwner, SmolStr, TextRange), usize>> {
     contributions
         .iter()
@@ -1213,7 +1215,7 @@ fn normalize_file_contributions(
 
 #[cfg(test)]
 fn normalize_wildcard_file_contributions(
-    contributions: &HashMap<FileId, Vec<(DynamicFieldOwner, TextRange)>>,
+    contributions: &CowShards<FileId, Vec<(DynamicFieldOwner, TextRange)>>,
 ) -> HashMap<FileId, HashMap<(DynamicFieldOwner, TextRange), usize>> {
     contributions
         .iter()
@@ -1232,7 +1234,7 @@ fn normalize_wildcard_file_contributions(
 
 #[cfg(test)]
 fn normalize_field_definitions(
-    definitions: &HashMap<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
+    definitions: &CowShards<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
 ) -> HashMap<DynamicFieldOwner, HashMap<SmolStr, HashMap<InFiled<TextRange>, usize>>> {
     definitions
         .iter()

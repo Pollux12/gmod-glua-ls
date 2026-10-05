@@ -4,6 +4,7 @@ mod module_node;
 mod test;
 mod workspace;
 
+use crate::db_index::cow_shards::{CowCell, CowShards};
 use glua_parser::LuaVersionCondition;
 pub use legacy_module_env::LegacyModuleEnv;
 use log::{error, info};
@@ -27,20 +28,20 @@ use std::{
 
 #[derive(Debug, Clone)]
 pub struct LuaModuleIndex {
-    module_patterns: Vec<Regex>,
+    module_patterns: CowCell<Vec<Regex>>,
     module_root_id: ModuleNodeId,
-    module_nodes: FxHashMap<ModuleNodeId, ModuleNode>,
-    file_module_map: FxHashMap<FileId, ModuleInfo>,
+    module_nodes: CowCell<FxHashMap<ModuleNodeId, ModuleNode>>,
+    file_module_map: CowShards<FileId, ModuleInfo>,
     /// The `(file, module name, workspace)` of every module in `file_module_map`.
     module_files: derivation::SetFingerprint,
-    file_module_paths: FxHashMap<FileId, String>,
-    module_name_to_file_ids: FxHashMap<String, Vec<FileId>>,
-    legacy_module_envs: FxHashMap<FileId, Vec<LegacyModuleEnv>>,
-    workspaces: Vec<Workspace>,
-    workspace_kind_map: FxHashMap<WorkspaceId, WorkspaceKind>,
+    file_module_paths: CowCell<FxHashMap<FileId, String>>,
+    module_name_to_file_ids: CowCell<FxHashMap<String, Vec<FileId>>>,
+    legacy_module_envs: CowCell<FxHashMap<FileId, Vec<LegacyModuleEnv>>>,
+    workspaces: CowCell<Vec<Workspace>>,
+    workspace_kind_map: CowCell<FxHashMap<WorkspaceId, WorkspaceKind>>,
     id_counter: u32,
     fuzzy_search: bool,
-    module_replace_vec: Vec<(Regex, String)>,
+    module_replace_vec: CowCell<Vec<(Regex, String)>>,
     workspace_isolation_enabled: bool,
 }
 
@@ -108,19 +109,19 @@ fn module_files_entry(info: &ModuleInfo) -> (FileId, &str, WorkspaceId) {
 impl LuaModuleIndex {
     pub fn new() -> Self {
         let mut index = Self {
-            module_patterns: Vec::new(),
+            module_patterns: Default::default(),
             module_root_id: ModuleNodeId { id: 0 },
-            module_nodes: FxHashMap::default(),
-            file_module_map: FxHashMap::default(),
+            module_nodes: Default::default(),
+            file_module_map: Default::default(),
             module_files: derivation::SetFingerprint::default(),
-            file_module_paths: FxHashMap::default(),
-            module_name_to_file_ids: FxHashMap::default(),
-            legacy_module_envs: FxHashMap::default(),
-            workspaces: Vec::new(),
-            workspace_kind_map: FxHashMap::default(),
+            file_module_paths: Default::default(),
+            module_name_to_file_ids: Default::default(),
+            legacy_module_envs: Default::default(),
+            workspaces: Default::default(),
+            workspace_kind_map: Default::default(),
             id_counter: 1,
             fuzzy_search: false,
-            module_replace_vec: Vec::new(),
+            module_replace_vec: Default::default(),
             workspace_isolation_enabled: true,
         };
 

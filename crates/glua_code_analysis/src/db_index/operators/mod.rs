@@ -1,6 +1,7 @@
 mod lua_operator;
 mod lua_operator_meta_method;
 
+use crate::db_index::cow_shards::CowShards;
 use rustc_hash::FxHashMap;
 
 use crate::FileId;
@@ -12,15 +13,15 @@ pub use lua_operator_meta_method::LuaOperatorMetaMethod;
 
 #[derive(Debug, Clone)]
 pub struct LuaOperatorIndex {
-    operators: FxHashMap<LuaOperatorId, LuaOperator>,
+    operators: CowShards<LuaOperatorId, LuaOperator>,
     type_operators_map:
-        FxHashMap<LuaOperatorOwner, FxHashMap<LuaOperatorMetaMethod, Vec<LuaOperatorId>>>,
-    in_filed_operator_map: FxHashMap<FileId, Vec<LuaOperatorId>>,
+        CowShards<LuaOperatorOwner, FxHashMap<LuaOperatorMetaMethod, Vec<LuaOperatorId>>>,
+    in_filed_operator_map: CowShards<FileId, Vec<LuaOperatorId>>,
     /// Who installed each operator: `None` for the source layer, else the
     /// derivation. An operator leaves with its last holder.
-    holders: FxHashMap<LuaOperatorId, Vec<Option<DerivationId>>>,
+    holders: CowShards<LuaOperatorId, Vec<Option<DerivationId>>>,
     /// The operators each derivation installed, retracted before it re-runs.
-    derived: FxHashMap<DerivationId, Vec<LuaOperatorId>>,
+    derived: CowShards<DerivationId, Vec<LuaOperatorId>>,
 }
 
 impl Default for LuaOperatorIndex {
@@ -32,11 +33,11 @@ impl Default for LuaOperatorIndex {
 impl LuaOperatorIndex {
     pub fn new() -> Self {
         Self {
-            operators: FxHashMap::default(),
-            type_operators_map: FxHashMap::default(),
-            in_filed_operator_map: FxHashMap::default(),
-            holders: FxHashMap::default(),
-            derived: FxHashMap::default(),
+            operators: Default::default(),
+            type_operators_map: Default::default(),
+            in_filed_operator_map: Default::default(),
+            holders: Default::default(),
+            derived: Default::default(),
         }
     }
 

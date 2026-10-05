@@ -1,8 +1,9 @@
 mod flow_node;
 mod flow_tree;
 
+use crate::db_index::cow_shards::{CowCell, CowShardSet, CowShards};
 use rowan::{TextRange, TextSize};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 
 use std::hash::{Hash, Hasher};
 
@@ -22,19 +23,19 @@ use super::traits::LuaIndex;
 
 #[derive(Debug, Clone)]
 pub struct LuaFlowIndex {
-    file_flow_tree: HashMap<FileId, FlowTree>,
+    file_flow_tree: CowCell<HashMap<FileId, FlowTree>>,
     /// [`FlowTree::content_fingerprint`] of each stored tree.
-    flow_tree_fingerprints: HashMap<FileId, Fingerprint>,
-    special_call_effects: HashMap<FileId, HashMap<TextSize, Vec<LuaSpecialCallEffect>>>,
+    flow_tree_fingerprints: CowCell<HashMap<FileId, Fingerprint>>,
+    special_call_effects: CowShards<FileId, HashMap<TextSize, Vec<LuaSpecialCallEffect>>>,
     /// Every special-call fact installed, keyed canonically.
     /// One call-site can install several facts (a synthesized class plus its
     /// super edge, say), and several call-sites can install facts for the same
     /// class, so neither the call-site nor the installed identity alone tells
     /// a replay from a novel fact: the pair does. Re-settling an identical
     /// fact set hits this record in any visit order and adds nothing.
-    settled_special_call_facts: HashSet<SpecialCallFact>,
+    settled_special_call_facts: CowShardSet<SpecialCallFact>,
     /// Multiset fingerprint of `settled_special_call_facts` per site.
-    special_call_fact_fingerprints: HashMap<(FileId, TextSize), Fingerprint>,
+    special_call_fact_fingerprints: CowShards<(FileId, TextSize), Fingerprint>,
 }
 
 impl Default for LuaFlowIndex {
@@ -46,11 +47,11 @@ impl Default for LuaFlowIndex {
 impl LuaFlowIndex {
     pub fn new() -> Self {
         Self {
-            file_flow_tree: HashMap::default(),
-            flow_tree_fingerprints: HashMap::default(),
-            special_call_effects: HashMap::default(),
-            settled_special_call_facts: HashSet::default(),
-            special_call_fact_fingerprints: HashMap::default(),
+            file_flow_tree: Default::default(),
+            flow_tree_fingerprints: Default::default(),
+            special_call_effects: Default::default(),
+            settled_special_call_facts: Default::default(),
+            special_call_fact_fingerprints: Default::default(),
         }
     }
 
@@ -612,7 +613,7 @@ impl SpecialCallFact {
         }
     }
 
-    fn site_file(&self) -> FileId {
+    pub(crate) fn site_file(&self) -> FileId {
         match self {
             Self::StrTplDecl { site_file, .. }
             | Self::SuperEdge { site_file, .. }

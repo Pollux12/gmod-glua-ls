@@ -5,12 +5,12 @@ mod lua_member_owner;
 mod lua_owner_members;
 mod test;
 
+use crate::db_index::cow_shards::{CowCell, CowShardSet, CowShards, ShardKey};
 use rowan::{TextRange, TextSize};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::cow_shards::CowShards;
 use super::traits::LuaIndex;
 use crate::db_index::derivation::{
     self, ABSENT, DerivationId, FactKey, Fingerprint, fingerprint_of,
@@ -77,8 +77,8 @@ fn remove_owner_key_id(
 
 /// Adds (`add`) or subtracts one element's fingerprint from `key`'s wrapping
 /// multiset sum, dropping the entry once the sum is empty.
-fn fold_fingerprint<K: Eq + std::hash::Hash>(
-    sums: &mut HashMap<K, Fingerprint>,
+fn fold_fingerprint<K: ShardKey + Clone>(
+    sums: &mut CowShards<K, Fingerprint>,
     key: K,
     element: Fingerprint,
     add: bool,
@@ -165,23 +165,23 @@ struct SourceMemberState {
 pub struct LuaMemberIndex {
     members: CowShards<LuaMemberId, LuaMember>,
     source_members: CowShards<LuaMemberId, SourceMember>,
-    in_filed: HashMap<FileId, HashSet<MemberOrOwner>>,
+    in_filed: CowShards<FileId, HashSet<MemberOrOwner>>,
     owner_members: CowShards<LuaMemberOwner, LuaOwnerMembers>,
-    member_current_owner: HashMap<LuaMemberId, LuaMemberOwner>,
+    member_current_owner: CowShards<LuaMemberId, LuaMemberOwner>,
     member_owner_key_index: OwnerKeyMap,
     member_owner_key_history_index: OwnerKeyMap,
     /// The owners under which a file's members were filed in the two
     /// owner-key indexes. A file sweep only has to visit these owners, rather
     /// than every owner in the workspace. Entries may outlive the members that
     /// caused them; a sweep of an owner that holds none is a no-op.
-    owner_key_index_owners_by_file: HashMap<FileId, HashSet<LuaMemberOwner>>,
+    owner_key_index_owners_by_file: CowShards<FileId, HashSet<LuaMemberOwner>>,
     current_owner_member_history:
         CowShards<LuaMemberOwner, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
     current_members_by_key: CowShards<LuaMemberKey, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
     /// The members filed under an expression key that names another file's
     /// positions, by that file.
-    expr_key_members_by_file: HashMap<FileId, HashSet<LuaMemberId>>,
-    non_overwriting_assignment_members: HashSet<LuaMemberId>,
+    expr_key_members_by_file: CowShards<FileId, HashSet<LuaMemberId>>,
+    non_overwriting_assignment_members: CowShardSet<LuaMemberId>,
     /// `(owner, key)` slots whose last co-writer readmission merged nothing.
     ///
     /// See [`Self::readmit_preserved_assignment_co_writers`]: every later
@@ -189,7 +189,7 @@ pub struct LuaMemberIndex {
     /// `clear` drops entries, with the index they describe — every other
     /// mutation preserves the coverage they record, and any future history
     /// write without a paired item merge must clear its slot here.
-    preserved_co_writer_reconciled: HashSet<(LuaMemberOwner, LuaMemberKey)>,
+    preserved_co_writer_reconciled: CowShardSet<(LuaMemberOwner, LuaMemberKey)>,
     /// Monotonic homing generation for per-`(owner, key)` memos.
     ///
     /// The history index retains ids a later owner move left behind, so a raw
@@ -206,55 +206,55 @@ pub struct LuaMemberIndex {
     /// Members whose owner was recorded without adding them to the owner's
     /// member list: a write through an instance of a class, not the class.
     /// See [`Self::set_member_owner_only`].
-    owner_only_members: HashSet<LuaMemberId>,
+    owner_only_members: CowShardSet<LuaMemberId>,
     /// Members whose owner was decided by scripted-class synthesis rather
     /// than by name resolution.
-    synthesized_owner_members: HashSet<LuaMemberId>,
+    synthesized_owner_members: CowShardSet<LuaMemberId>,
     /// Members `try_resolve_member` had to create itself, from a prefix
     /// type read mid-fixpoint.
-    deferred_index_expr_members: HashSet<LuaMemberId>,
-    function_scope_ranges: HashMap<FileId, Vec<TextRange>>,
-    member_function_scope_ranges: HashMap<LuaMemberId, TextRange>,
+    deferred_index_expr_members: CowCell<HashSet<LuaMemberId>>,
+    function_scope_ranges: CowCell<HashMap<FileId, Vec<TextRange>>>,
+    member_function_scope_ranges: CowShards<LuaMemberId, TextRange>,
     /// The owner a table literal that initialises a global path resolves to:
     /// the `{}` of `X = {}` or of the GLua-idiomatic `X = X or {}`, at any
     /// depth. Held as the owner rather than the path so the normaliser can
     /// hand back a reference. See [`LuaMemberIndex::canonical_owner`].
-    definition_site_owner: HashMap<crate::InFiled<TextRange>, LuaMemberOwner>,
+    definition_site_owner: CowCell<HashMap<crate::InFiled<TextRange>, LuaMemberOwner>>,
     /// The reverse of [`Self::definition_site_owner`], each path's sites sorted
     /// by `(file id, range)`.
-    path_definition_sites: HashMap<GlobalId, Vec<crate::InFiled<TextRange>>>,
-    definition_sites_by_file: HashMap<FileId, Vec<crate::InFiled<TextRange>>>,
+    path_definition_sites: CowCell<HashMap<GlobalId, Vec<crate::InFiled<TextRange>>>>,
+    definition_sites_by_file: CowCell<HashMap<FileId, Vec<crate::InFiled<TextRange>>>>,
     /// The class a global path's declaration carries (`---@class oslib` on
     /// `os = {}`). Such a path's members belong to the class, which is where
     /// every reader of the annotated type looks for them.
-    global_path_class_owner: HashMap<GlobalId, LuaMemberOwner>,
+    global_path_class_owner: CowShards<GlobalId, LuaMemberOwner>,
     /// Every `---@class` proposal made for a global path's declaration, by
     /// path. The winner is the set minimum, so two files annotating one
     /// global settle on the same class regardless of analysis order, and a
     /// removed file's proposal can be dropped without losing the others.
-    global_path_class_candidates: HashMap<GlobalId, BTreeSet<GlobalPathClassCandidate>>,
+    global_path_class_candidates: CowShards<GlobalId, BTreeSet<GlobalPathClassCandidate>>,
     /// Who proposed each candidate: `None` for the source layer, else the
     /// derivation. A candidate leaves with its last holder.
-    path_class_holders: HashMap<(GlobalId, GlobalPathClassCandidate), Vec<Option<DerivationId>>>,
+    path_class_holders: CowShards<(GlobalId, GlobalPathClassCandidate), Vec<Option<DerivationId>>>,
     /// The candidates each derivation proposed, retracted before it re-runs.
-    derived_path_classes: HashMap<DerivationId, Vec<(GlobalId, GlobalPathClassCandidate)>>,
+    derived_path_classes: CowShards<DerivationId, Vec<(GlobalId, GlobalPathClassCandidate)>>,
     /// The global path a member's homing went through: its write named the
     /// path directly, or a table literal that initialises one. Such members
     /// follow the path when its winning `---@class` changes; members homed
     /// onto a class by any other route stay where they are.
-    member_path_provenance: HashMap<LuaMemberId, GlobalId>,
+    member_path_provenance: CowShards<LuaMemberId, GlobalId>,
     /// Member reads that found nothing, by the file that read. A file whose
     /// read failed cached no type and so left no dependency edge; when another
     /// file later defines that key, this is how the reader is found.
     /// Per-owner multiset fingerprint of its history-index entries and
     /// current-owner history, for [`FactKey::MemberOwnerMap`].
-    owner_history_fingerprints: HashMap<LuaMemberOwner, Fingerprint>,
+    owner_history_fingerprints: CowShards<LuaMemberOwner, Fingerprint>,
     /// Per-key multiset fingerprint of `current_members_by_key`, for
     /// [`FactKey::MemberKey`].
-    key_fingerprints: HashMap<LuaMemberKey, Fingerprint>,
+    key_fingerprints: CowShards<LuaMemberKey, Fingerprint>,
     /// Per-file multiset fingerprint of the file's members, function scopes
     /// and element owners, for [`FactKey::MemberFile`].
-    file_fingerprints: HashMap<FileId, Fingerprint>,
+    file_fingerprints: CowShards<FileId, Fingerprint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -271,7 +271,7 @@ enum MemberOrOwner {
 /// deterministically. Deriving [`Eq`] over all three fields makes re-proposing
 /// the same class from the same file a no-op.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct GlobalPathClassCandidate {
+pub(crate) struct GlobalPathClassCandidate {
     class_name: Box<str>,
     file_id: FileId,
     class: crate::LuaTypeDeclId,
@@ -303,34 +303,34 @@ impl LuaMemberIndex {
         Self {
             members: CowShards::default(),
             source_members: CowShards::default(),
-            in_filed: HashMap::default(),
+            in_filed: Default::default(),
             owner_members: CowShards::default(),
-            member_current_owner: HashMap::default(),
-            member_owner_key_index: CowShards::default(),
-            member_owner_key_history_index: CowShards::default(),
-            owner_key_index_owners_by_file: HashMap::default(),
+            member_current_owner: Default::default(),
+            member_owner_key_index: Default::default(),
+            member_owner_key_history_index: Default::default(),
+            owner_key_index_owners_by_file: Default::default(),
             current_owner_member_history: CowShards::default(),
             current_members_by_key: CowShards::default(),
-            expr_key_members_by_file: HashMap::default(),
-            non_overwriting_assignment_members: HashSet::default(),
-            preserved_co_writer_reconciled: HashSet::default(),
+            expr_key_members_by_file: Default::default(),
+            non_overwriting_assignment_members: Default::default(),
+            preserved_co_writer_reconciled: Default::default(),
             homing_revision: 0,
-            owner_only_members: HashSet::default(),
-            synthesized_owner_members: HashSet::default(),
-            deferred_index_expr_members: HashSet::default(),
-            function_scope_ranges: HashMap::default(),
-            member_function_scope_ranges: HashMap::default(),
-            definition_site_owner: HashMap::default(),
-            path_definition_sites: HashMap::default(),
-            definition_sites_by_file: HashMap::default(),
-            global_path_class_owner: HashMap::default(),
-            global_path_class_candidates: HashMap::default(),
-            path_class_holders: HashMap::default(),
-            derived_path_classes: HashMap::default(),
-            member_path_provenance: HashMap::default(),
-            owner_history_fingerprints: HashMap::default(),
-            key_fingerprints: HashMap::default(),
-            file_fingerprints: HashMap::default(),
+            owner_only_members: Default::default(),
+            synthesized_owner_members: Default::default(),
+            deferred_index_expr_members: Default::default(),
+            function_scope_ranges: Default::default(),
+            member_function_scope_ranges: Default::default(),
+            definition_site_owner: Default::default(),
+            path_definition_sites: Default::default(),
+            definition_sites_by_file: Default::default(),
+            global_path_class_owner: Default::default(),
+            global_path_class_candidates: Default::default(),
+            path_class_holders: Default::default(),
+            derived_path_classes: Default::default(),
+            member_path_provenance: Default::default(),
+            owner_history_fingerprints: Default::default(),
+            key_fingerprints: Default::default(),
+            file_fingerprints: Default::default(),
         }
     }
 
@@ -657,22 +657,9 @@ impl LuaMemberIndex {
         self.homing_revision
     }
 
-    /// Reserves capacity in the workspace-wide maps for one file's worth of
-    /// member writes; the file's own maps grow to what they hold, since an
-    /// upper-bound size would stay as slack for as long as the file is indexed.
-    ///
-    /// `members` is a cheap upper-bound hint (see
-    /// `crate::compilation::analyzer::common::estimate_file_index_entries`),
-    /// not a count the index trusts: every map keeps its exact length and
-    /// contents, so over- or under-estimating only changes how often the
-    /// tables rehash, never what they hold. Provenance and scope entries are
-    /// a fraction of member writes, hence their scaled reservations.
-    /// Per-file entries are created when absent; an empty file keeps empty
-    /// per-file entries, which all readers treat exactly like absent ones.
-    pub fn reserve_for_file(&mut self, file_id: FileId, members: usize) {
-        self.member_current_owner.reserve(members);
-        self.member_path_provenance.reserve(members / 4 + 1);
-        self.member_function_scope_ranges.reserve(members / 4 + 1);
+    /// Creates `file_id`'s per-file entries when absent. An empty file keeps
+    /// empty per-file entries, which all readers treat exactly like absent ones.
+    pub fn add_file_entries(&mut self, file_id: FileId) {
         self.in_filed.entry(file_id).or_default();
         self.owner_key_index_owners_by_file
             .entry(file_id)

@@ -1,6 +1,7 @@
 //! What each call's callee resolves to, one file at a time, so the per-file
 //! passes read it instead of resolving every callee again.
 
+use crate::db_index::cow_shards::CowShards;
 use std::sync::Arc;
 
 use rowan::TextRange;
@@ -101,7 +102,7 @@ pub type FileCallTargets = FxHashMap<TextRange, LuaCallTarget>;
 
 #[derive(Debug, Clone, Default)]
 pub struct LuaCallTargetIndex {
-    files: FxHashMap<FileId, Arc<FileCallTargets>>,
+    files: CowShards<FileId, Arc<FileCallTargets>>,
 }
 
 impl LuaCallTargetIndex {

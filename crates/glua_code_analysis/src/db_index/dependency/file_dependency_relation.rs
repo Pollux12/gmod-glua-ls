@@ -1,14 +1,15 @@
 use crate::FileId;
+use crate::db_index::cow_shards::CowShards;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::VecDeque;
 
 #[derive(Debug)]
 pub struct FileDependencyRelation<'a> {
-    dependencies: &'a HashMap<FileId, HashSet<FileId>>,
+    dependencies: &'a CowShards<FileId, HashSet<FileId>>,
 }
 
 impl<'a> FileDependencyRelation<'a> {
-    pub fn new(dependencies: &'a HashMap<FileId, HashSet<FileId>>) -> Self {
+    pub(crate) fn new(dependencies: &'a CowShards<FileId, HashSet<FileId>>) -> Self {
         Self { dependencies }
     }
 
@@ -164,6 +165,7 @@ mod tests {
         });
         // 文件2没有依赖
         map.insert(FileId::new(2), HashSet::default());
+        let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
         let result =
             rel.get_best_analysis_order(&[FileId::new(1), FileId::new(2)], &HashSet::default());
@@ -189,6 +191,7 @@ mod tests {
         });
         // 文件3没有依赖
         map.insert(3.into(), HashSet::default());
+        let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
         let result =
             rel.get_best_analysis_order(&[1.into(), 2.into(), 3.into()], &HashSet::default());
@@ -216,6 +219,7 @@ mod tests {
         // 文件4没有依赖
         map.insert(FileId::new(4), HashSet::default());
 
+        let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
         let result = rel.get_best_analysis_order(
             &[
@@ -243,6 +247,7 @@ mod tests {
         map.insert(3.into(), HashSet::default());
         map.insert(4.into(), [1.into()].into_iter().collect());
         map.insert(5.into(), HashSet::default());
+        let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
         let files: Vec<FileId> = (1..=5).map(FileId::new).collect();
         let metas = HashSet::from_iter([FileId::new(5)]);
@@ -273,6 +278,7 @@ mod tests {
         map.insert(3.into(), HashSet::default());
         map.insert(4.into(), [1.into()].into_iter().collect());
         map.insert(5.into(), HashSet::default());
+        let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
         let files: Vec<FileId> = (1..=5).map(FileId::new).collect();
 
@@ -295,6 +301,7 @@ mod tests {
         map.insert(1.into(), [2.into()].into_iter().collect());
         map.insert(2.into(), [1.into()].into_iter().collect());
         map.insert(3.into(), HashSet::default());
+        let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
         let files: Vec<FileId> = (1..=3).map(FileId::new).collect();
 
@@ -316,6 +323,7 @@ mod tests {
         deps.insert(FileId::new(3), HashSet::default());
         deps.insert(FileId::new(4), [FileId::new(3)].iter().cloned().collect());
 
+        let deps = CowShards::from(deps);
         let rel = FileDependencyRelation::new(&deps);
         let mut result = rel.collect_file_dependents(vec![FileId::new(3)]);
         result.sort();
@@ -331,6 +339,7 @@ mod tests {
         map.insert(FileId::new(3), HashSet::default());
         map.insert(FileId::new(4), HashSet::default());
 
+        let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
 
         // 文件2和4是meta文件
@@ -369,6 +378,7 @@ mod tests {
         // File 3 has no dependencies
         map.insert(FileId::new(3), HashSet::default());
 
+        let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
 
         let mut metas = HashSet::default();

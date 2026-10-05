@@ -3,6 +3,7 @@ mod decl_id;
 mod decl_tree;
 mod scope;
 
+use crate::db_index::cow_shards::{CowCell, CowShards};
 pub use decl::LuaDeclExtra;
 pub use decl::{LocalAttribute, LuaDecl, LuaDeclInitializer};
 pub use decl_id::LuaDeclId;
@@ -17,14 +18,14 @@ use super::traits::LuaIndex;
 
 #[derive(Debug, Clone)]
 pub struct LuaDeclIndex {
-    decl_trees: FxHashMap<FileId, LuaDeclarationTree>,
+    decl_trees: CowCell<FxHashMap<FileId, LuaDeclarationTree>>,
     /// Declarations derivations synthesize (the implicit `PANEL` of a vgui
     /// file, a registered panel's global), outside the trees the source
     /// layer builds, with the derivations holding each. A synthesized
     /// declaration leaves with its last holder.
-    derived_decls: FxHashMap<LuaDeclId, (LuaDecl, Vec<DerivationId>)>,
+    derived_decls: CowShards<LuaDeclId, (LuaDecl, Vec<DerivationId>)>,
     /// The synthesized declarations each derivation holds.
-    derived_decl_ids: FxHashMap<DerivationId, Vec<LuaDeclId>>,
+    derived_decl_ids: CowShards<DerivationId, Vec<LuaDeclId>>,
 }
 
 impl Default for LuaDeclIndex {
@@ -36,9 +37,9 @@ impl Default for LuaDeclIndex {
 impl LuaDeclIndex {
     pub fn new() -> Self {
         Self {
-            decl_trees: FxHashMap::default(),
-            derived_decls: FxHashMap::default(),
-            derived_decl_ids: FxHashMap::default(),
+            decl_trees: Default::default(),
+            derived_decls: Default::default(),
+            derived_decl_ids: Default::default(),
         }
     }
 

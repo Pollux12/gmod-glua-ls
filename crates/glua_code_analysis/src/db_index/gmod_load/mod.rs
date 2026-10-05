@@ -1,5 +1,6 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
+use crate::db_index::cow_shards::CowCell;
 use rowan::TextRange;
 
 use crate::{
@@ -338,19 +339,19 @@ pub(crate) enum GmodExecutionEnvironmentSource {
 
 #[derive(Debug, Default, Clone)]
 pub struct GmodLoadIndex {
-    file_infos: HashMap<FileId, GmodFileLoadInfo>,
-    unresolved_edges: Vec<GmodLoadEdge>,
-    execution_environments: HashMap<FileId, HashSet<String>>,
-    execution_environment_sites: HashMap<FileId, HashMap<FileId, HashSet<String>>>,
+    file_infos: CowCell<HashMap<FileId, GmodFileLoadInfo>>,
+    unresolved_edges: CowCell<Vec<GmodLoadEdge>>,
+    execution_environments: CowCell<HashMap<FileId, HashSet<String>>>,
+    execution_environment_sites: CowCell<HashMap<FileId, HashMap<FileId, HashSet<String>>>>,
 }
 
 impl GmodLoadIndex {
     pub fn new() -> Self {
         Self {
-            file_infos: HashMap::default(),
-            unresolved_edges: Vec::new(),
-            execution_environments: HashMap::default(),
-            execution_environment_sites: HashMap::default(),
+            file_infos: Default::default(),
+            unresolved_edges: Default::default(),
+            execution_environments: Default::default(),
+            execution_environment_sites: Default::default(),
         }
     }
 
@@ -415,7 +416,7 @@ impl GmodLoadIndex {
         execution_environment_sites: HashMap<FileId, HashMap<FileId, HashSet<String>>>,
     ) {
         self.note_all_file_writes();
-        self.execution_environment_sites = execution_environment_sites;
+        self.execution_environment_sites = execution_environment_sites.into();
         self.rebuild_execution_environments();
         self.note_all_file_writes();
     }
@@ -499,8 +500,8 @@ impl GmodLoadIndex {
         unresolved_edges: Vec<GmodLoadEdge>,
     ) {
         self.note_all_file_writes();
-        self.file_infos = file_infos;
-        self.unresolved_edges = unresolved_edges;
+        self.file_infos = file_infos.into();
+        self.unresolved_edges = unresolved_edges.into();
         self.note_all_file_writes();
     }
 }

@@ -1,5 +1,6 @@
 use rustc_hash::FxHashMap;
 
+use crate::db_index::cow_shards::{CowCell, CowShards};
 use rowan::TextRange;
 
 use smol_str::SmolStr;
@@ -23,8 +24,8 @@ pub struct TableNumericRangePopulation {
 
 #[derive(Debug, Default, Clone)]
 pub struct NumericRangePopulationIndex {
-    by_file: FxHashMap<FileId, Vec<TableNumericRangePopulation>>,
-    by_global: FxHashMap<String, Vec<TableNumericRangePopulation>>,
+    by_file: CowShards<FileId, Vec<TableNumericRangePopulation>>,
+    by_global: CowCell<FxHashMap<String, Vec<TableNumericRangePopulation>>>,
 }
 
 impl NumericRangePopulationIndex {

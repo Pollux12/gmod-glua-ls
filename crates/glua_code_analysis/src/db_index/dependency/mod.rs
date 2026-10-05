@@ -1,5 +1,6 @@
 mod file_dependency_relation;
 
+use crate::db_index::cow_shards::{CowCell, CowShards};
 use crate::db_index::derivation::FilePosition;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::hash::{Hash, Hasher};
@@ -70,20 +71,20 @@ struct DependencySiteLocation {
 
 #[derive(Debug, Clone)]
 pub struct LuaDependencyIndex {
-    dependencies: HashMap<FileId, HashSet<FileId>>,
-    dependency_kinds: HashMap<FileId, HashMap<FileId, HashSet<LuaDependencyKind>>>,
-    dependency_callers_by_target: HashMap<FileId, HashSet<FileId>>,
-    dependency_sites: HashMap<FileId, Vec<LuaDependencySite>>,
-    resolved_sites_by_target: HashMap<FileId, Vec<DependencySiteLocation>>,
+    dependencies: CowShards<FileId, HashSet<FileId>>,
+    dependency_kinds: CowShards<FileId, HashMap<FileId, HashSet<LuaDependencyKind>>>,
+    dependency_callers_by_target: CowCell<HashMap<FileId, HashSet<FileId>>>,
+    dependency_sites: CowShards<FileId, Vec<LuaDependencySite>>,
+    resolved_sites_by_target: CowShards<FileId, Vec<DependencySiteLocation>>,
     /// Normalized target path key -> unresolved callers.
-    unresolved_dependents_by_path_key: HashMap<String, HashSet<FileId>>,
+    unresolved_dependents_by_path_key: CowShards<String, HashSet<FileId>>,
     /// The sites a file's removal unresolved, so re-indexing it can put them
     /// back. Keyed by the removed target; each entry is the site's source file
     /// and the path it named.
-    unresolved_by_removal: HashMap<FileId, Vec<(FileId, Option<String>)>>,
+    unresolved_by_removal: CowCell<HashMap<FileId, Vec<(FileId, Option<String>)>>>,
     /// The sites derivations added, per source file, so a re-run can take
     /// them back without the source layer's.
-    derived_sites: HashMap<FileId, Vec<LuaDependencySite>>,
+    derived_sites: CowShards<FileId, Vec<LuaDependencySite>>,
     #[cfg(test)]
     target_transition_site_visits: usize,
 }
@@ -97,14 +98,14 @@ impl Default for LuaDependencyIndex {
 impl LuaDependencyIndex {
     pub fn new() -> Self {
         Self {
-            dependencies: HashMap::default(),
-            dependency_kinds: HashMap::default(),
-            dependency_callers_by_target: HashMap::default(),
-            dependency_sites: HashMap::default(),
-            resolved_sites_by_target: HashMap::default(),
-            unresolved_dependents_by_path_key: HashMap::default(),
-            unresolved_by_removal: HashMap::default(),
-            derived_sites: HashMap::default(),
+            dependencies: Default::default(),
+            dependency_kinds: Default::default(),
+            dependency_callers_by_target: Default::default(),
+            dependency_sites: Default::default(),
+            resolved_sites_by_target: Default::default(),
+            unresolved_dependents_by_path_key: Default::default(),
+            unresolved_by_removal: Default::default(),
+            derived_sites: Default::default(),
             #[cfg(test)]
             target_transition_site_visits: 0,
         }
@@ -236,7 +237,7 @@ impl LuaDependencyIndex {
     }
 
     fn index_unresolved_site(
-        reverse_index: &mut HashMap<String, HashSet<FileId>>,
+        reverse_index: &mut CowShards<String, HashSet<FileId>>,
         site: &LuaDependencySite,
     ) {
         for path_key in &site.path_keys {

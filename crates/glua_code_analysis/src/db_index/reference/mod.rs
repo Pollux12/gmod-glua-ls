@@ -2,6 +2,7 @@ mod batch;
 mod file_reference;
 mod string_reference;
 
+use crate::db_index::cow_shards::CowCell;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 pub use batch::FileReferenceBatch;
@@ -19,34 +20,34 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct LuaReferenceIndex {
-    file_references: HashMap<FileId, FileReference>,
-    index_reference: HashMap<LuaMemberKey, HashMap<FileId, HashSet<LuaSyntaxId>>>,
-    global_references: HashMap<SmolStr, HashMap<FileId, HashSet<LuaSyntaxId>>>,
-    string_references: HashMap<FileId, StringReference>,
-    type_references: HashMap<FileId, HashMap<LuaTypeDeclId, HashSet<TextRange>>>,
+    file_references: CowCell<HashMap<FileId, FileReference>>,
+    index_reference: CowCell<HashMap<LuaMemberKey, HashMap<FileId, HashSet<LuaSyntaxId>>>>,
+    global_references: CowCell<HashMap<SmolStr, HashMap<FileId, HashSet<LuaSyntaxId>>>>,
+    string_references: CowCell<HashMap<FileId, StringReference>>,
+    type_references: CowCell<HashMap<FileId, HashMap<LuaTypeDeclId, HashSet<TextRange>>>>,
     /// Where each of a file's locals is first reassigned, computed once when the
     /// file is indexed.
-    local_reassignments: HashMap<FileId, HashMap<LuaDeclId, TextSize>>,
+    local_reassignments: CowCell<HashMap<FileId, HashMap<LuaDeclId, TextSize>>>,
     /// Bumped whenever a file's references change, so a memo over facts derived
     /// from one file's references can tell a hit from a stale entry. Values come
     /// from a counter that never restarts, so a revision is never reused after a
     /// removal.
-    file_revision: HashMap<FileId, u64>,
+    file_revision: CowCell<HashMap<FileId, u64>>,
     next_revision: u64,
     /// Incremental multiset fingerprint of each file's reference entries.
-    file_fingerprints: HashMap<FileId, Fingerprint>,
+    file_fingerprints: CowCell<HashMap<FileId, Fingerprint>>,
     /// Incremental multiset fingerprint of the name-keyed entries (global,
     /// member-key, string and type references) under each name.
-    name_fingerprints: HashMap<SmolStr, Fingerprint>,
+    name_fingerprints: CowCell<HashMap<SmolStr, Fingerprint>>,
     /// Member-key references derivations found once a key was inferred, with
     /// how many derivations hold each; kept apart from what the source layer
     /// indexed so a re-run retracts exactly its own.
-    derived_index_reference: HashMap<LuaMemberKey, HashMap<(FileId, LuaSyntaxId), usize>>,
+    derived_index_reference: CowCell<HashMap<LuaMemberKey, HashMap<(FileId, LuaSyntaxId), usize>>>,
     /// Incremental multiset fingerprint of the derived references in each file.
-    derived_file_fingerprints: HashMap<FileId, Fingerprint>,
+    derived_file_fingerprints: CowCell<HashMap<FileId, Fingerprint>>,
     /// The member-key references each derivation added.
     derived_index_reference_holders:
-        HashMap<DerivationId, Vec<(LuaMemberKey, FileId, LuaSyntaxId)>>,
+        CowCell<HashMap<DerivationId, Vec<(LuaMemberKey, FileId, LuaSyntaxId)>>>,
 }
 
 impl Default for LuaReferenceIndex {
@@ -58,19 +59,19 @@ impl Default for LuaReferenceIndex {
 impl LuaReferenceIndex {
     pub fn new() -> Self {
         Self {
-            file_references: HashMap::default(),
-            index_reference: HashMap::default(),
-            global_references: HashMap::default(),
-            string_references: HashMap::default(),
-            type_references: HashMap::default(),
-            local_reassignments: HashMap::default(),
-            file_revision: HashMap::default(),
+            file_references: Default::default(),
+            index_reference: Default::default(),
+            global_references: Default::default(),
+            string_references: Default::default(),
+            type_references: Default::default(),
+            local_reassignments: Default::default(),
+            file_revision: Default::default(),
             next_revision: 1,
-            file_fingerprints: HashMap::default(),
-            name_fingerprints: HashMap::default(),
-            derived_index_reference: HashMap::default(),
-            derived_file_fingerprints: HashMap::default(),
-            derived_index_reference_holders: HashMap::default(),
+            file_fingerprints: Default::default(),
+            name_fingerprints: Default::default(),
+            derived_index_reference: Default::default(),
+            derived_file_fingerprints: Default::default(),
+            derived_index_reference_holders: Default::default(),
         }
     }
 

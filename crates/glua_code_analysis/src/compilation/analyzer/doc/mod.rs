@@ -71,7 +71,7 @@ impl AnalysisPipeline for DocAnalysisPipeline {
                 estimate_file_index_entries(usize::from(root.syntax().text_range().len()))
                     .max(decl_count.saturating_add(8).min(4096));
             db.get_member_index_mut()
-                .reserve_for_file(in_filed_tree.file_id, estimate);
+                .add_file_entries(in_filed_tree.file_id);
             db.get_reference_index_mut()
                 .reserve_for_file(in_filed_tree.file_id, estimate);
             let mut generic_index = FileGenericIndex::new();

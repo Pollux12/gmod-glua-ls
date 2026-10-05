@@ -1,6 +1,6 @@
 mod global_id;
 
-use rustc_hash::FxHashMap;
+use crate::db_index::cow_shards::CowShards;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -14,10 +14,10 @@ use super::{LuaDeclId, LuaIndex, LuaModuleIndex, WorkspaceId};
 
 #[derive(Debug, Clone)]
 pub struct LuaGlobalIndex {
-    global_decl: FxHashMap<GlobalId, Vec<LuaDeclId>>,
+    global_decl: CowShards<GlobalId, Vec<LuaDeclId>>,
     /// Each declaring file's `Vfs::file_order_key`, which orders its
     /// declarations among the other files'.
-    file_order: FxHashMap<FileId, Arc<str>>,
+    file_order: CowShards<FileId, Arc<str>>,
     /// Multiset fingerprint of every `(name, decl id)`, for `GlobalScan`.
     scan_fingerprint: Fingerprint,
 }
@@ -36,7 +36,7 @@ fn note_global_write(name: &str) {
 /// mid-session, or a workspace loaded in batches, numbers differently from a
 /// cold load), and the first declaration in this order is the one a global
 /// resolves to, so the path decides.
-fn decl_sort_key(file_order: &FxHashMap<FileId, Arc<str>>, decl_id: LuaDeclId) -> (&str, u32, u32) {
+fn decl_sort_key(file_order: &CowShards<FileId, Arc<str>>, decl_id: LuaDeclId) -> (&str, u32, u32) {
     (
         file_order.get(&decl_id.file_id).map_or("", |key| key),
         u32::from(decl_id.position),
@@ -53,8 +53,8 @@ impl Default for LuaGlobalIndex {
 impl LuaGlobalIndex {
     pub fn new() -> Self {
         Self {
-            global_decl: FxHashMap::default(),
-            file_order: FxHashMap::default(),
+            global_decl: Default::default(),
+            file_order: Default::default(),
             scan_fingerprint: derivation::ABSENT,
         }
     }

@@ -1,7 +1,8 @@
+use crate::db_index::cow_shards::{CowCell, CowShards};
 use crate::db_index::derivation::hash_local;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use glua_parser::LuaSyntaxId;
 use rowan::TextRange;
@@ -472,21 +473,21 @@ pub struct GmodScopedClassInfo {
 /// within their defining file, so the same-file lookup already covers them.
 #[derive(Debug, Default, Clone)]
 pub struct GmodInferIndex {
-    hook_file_metadata: HashMap<FileId, GmodHookFileMetadata>,
-    system_file_metadata: HashMap<FileId, GmodSystemFileMetadata>,
-    system_aggregate_cache: OnceLock<GmodSystemAggregate>,
-    realm_file_metadata: HashMap<FileId, GmodRealmFileMetadata>,
+    hook_file_metadata: CowShards<FileId, GmodHookFileMetadata>,
+    system_file_metadata: CowShards<FileId, GmodSystemFileMetadata>,
+    system_aggregate_cache: OnceLock<Arc<GmodSystemAggregate>>,
+    realm_file_metadata: CowShards<FileId, GmodRealmFileMetadata>,
     /// Each file's own realm evidence: `if CLIENT`/`if SERVER` block ranges
     /// and its `---@realm` annotation. The workspace realm derivation reads
     /// these to produce `realm_file_metadata`.
-    realm_inputs: HashMap<FileId, GmodRealmInputs>,
-    gm_method_realm_annotations: HashMap<FileId, Vec<(String, GmodRealm)>>,
+    realm_inputs: CowShards<FileId, GmodRealmInputs>,
+    gm_method_realm_annotations: CowShards<FileId, Vec<(String, GmodRealm)>>,
     /// Per-file `---@realm` ranges over function decls (sorted, O(log n) lookup).
-    member_realm_ranges: HashMap<FileId, Vec<GmodRealmRange>>,
+    member_realm_ranges: CowShards<FileId, Vec<GmodRealmRange>>,
     /// Pre-indexed @fileparam annotations per file: (param_name_lowercase, type_text)
-    fileparam_index: HashMap<FileId, Vec<(String, String)>>,
+    fileparam_index: CowCell<HashMap<FileId, Vec<(String, String)>>>,
     /// Cached scoped class detection results, computed once during gmod_pre.
-    scoped_class_info: HashMap<FileId, GmodScopedClassInfo>,
+    scoped_class_info: CowCell<HashMap<FileId, GmodScopedClassInfo>>,
     /// Incremental multiset fingerprint of the hook sites, system sites and
     /// gamemode-method realm annotations of every file.
     scan_fingerprint: Fingerprint,
@@ -495,15 +496,15 @@ pub struct GmodInferIndex {
 impl GmodInferIndex {
     pub fn new() -> Self {
         Self {
-            hook_file_metadata: HashMap::default(),
-            system_file_metadata: HashMap::default(),
-            system_aggregate_cache: OnceLock::new(),
-            realm_file_metadata: HashMap::default(),
-            realm_inputs: HashMap::default(),
-            gm_method_realm_annotations: HashMap::default(),
-            member_realm_ranges: HashMap::default(),
-            fileparam_index: HashMap::default(),
-            scoped_class_info: HashMap::default(),
+            hook_file_metadata: Default::default(),
+            system_file_metadata: Default::default(),
+            system_aggregate_cache: Default::default(),
+            realm_file_metadata: Default::default(),
+            realm_inputs: Default::default(),
+            gm_method_realm_annotations: Default::default(),
+            member_realm_ranges: Default::default(),
+            fileparam_index: Default::default(),
+            scoped_class_info: Default::default(),
             scan_fingerprint: 0,
         }
     }
@@ -798,7 +799,7 @@ impl GmodInferIndex {
     /// The system registrations across files, read by kind and name.
     pub fn get_system_aggregate(&self) -> &GmodSystemAggregate {
         self.system_aggregate_cache
-            .get_or_init(|| self.build_system_aggregate())
+            .get_or_init(|| Arc::new(self.build_system_aggregate()))
     }
 
     pub fn has_compatible_duplicate_registration(
@@ -879,7 +880,7 @@ impl GmodInferIndex {
                 derivation::note_write(|| FactKey::GmodRealm(*file_id));
             }
         }
-        self.realm_file_metadata = metadata;
+        self.realm_file_metadata = metadata.into();
     }
 
     /// Stores `file_id`'s realm evidence. The load fold copies it into the

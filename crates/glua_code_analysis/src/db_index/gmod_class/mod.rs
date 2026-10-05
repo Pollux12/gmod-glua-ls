@@ -1,3 +1,4 @@
+use crate::db_index::cow_shards::{CowCell, CowShards};
 use crate::db_index::derivation::hash_local;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::hash::{Hash, Hasher};
@@ -386,16 +387,16 @@ impl GmodScriptedClassFileMetadata {
 
 #[derive(Debug, Default, Clone)]
 pub struct GmodClassMetadataIndex {
-    file_metadata: HashMap<FileId, GmodScriptedClassFileMetadata>,
+    file_metadata: CowShards<FileId, GmodScriptedClassFileMetadata>,
     /// The set of files whose metadata has vgui parent calls.
     vgui_parent_call_files: derivation::SetFingerprint,
-    vgui_panels: HashMap<String, Vec<VguiPanelDefinition>>,
-    derma_skins: HashMap<String, Vec<DermaSkinDefinition>>,
-    vgui_panel_parent_chains: HashMap<LuaTypeDeclId, Vec<LuaTypeDeclId>>,
-    incomplete_vgui_panel_parent_chains: HashSet<LuaTypeDeclId>,
+    vgui_panels: CowShards<String, Vec<VguiPanelDefinition>>,
+    derma_skins: CowShards<String, Vec<DermaSkinDefinition>>,
+    vgui_panel_parent_chains: CowCell<HashMap<LuaTypeDeclId, Vec<LuaTypeDeclId>>>,
+    incomplete_vgui_panel_parent_chains: CowCell<HashSet<LuaTypeDeclId>>,
     /// Incremental multiset fingerprint, per panel/skin name, of the
     /// registration calls a name-keyed read can observe.
-    meta_fingerprints: HashMap<SmolStr, Fingerprint>,
+    meta_fingerprints: CowShards<SmolStr, Fingerprint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -414,13 +415,13 @@ struct DermaSkinDefinition {
 impl GmodClassMetadataIndex {
     pub fn new() -> Self {
         Self {
-            file_metadata: HashMap::default(),
+            file_metadata: Default::default(),
             vgui_parent_call_files: derivation::SetFingerprint::default(),
-            vgui_panels: HashMap::default(),
-            derma_skins: HashMap::default(),
-            vgui_panel_parent_chains: HashMap::default(),
-            incomplete_vgui_panel_parent_chains: HashSet::default(),
-            meta_fingerprints: HashMap::default(),
+            vgui_panels: Default::default(),
+            derma_skins: Default::default(),
+            vgui_panel_parent_chains: Default::default(),
+            incomplete_vgui_panel_parent_chains: Default::default(),
+            meta_fingerprints: Default::default(),
         }
     }
 
@@ -498,7 +499,7 @@ impl GmodClassMetadataIndex {
     /// Adds (`add`) or removes `call`'s contribution to the name-keyed
     /// fingerprints.
     fn update_meta_fingerprints(
-        meta_fingerprints: &mut HashMap<SmolStr, Fingerprint>,
+        meta_fingerprints: &mut CowShards<SmolStr, Fingerprint>,
         file_id: FileId,
         kind: GmodScriptedClassCallKind,
         call: &GmodScriptedClassCallMetadata,
@@ -613,7 +614,7 @@ impl GmodClassMetadataIndex {
     }
 
     fn insert_vgui_panel_from_call(
-        vgui_panels: &mut HashMap<String, Vec<VguiPanelDefinition>>,
+        vgui_panels: &mut CowShards<String, Vec<VguiPanelDefinition>>,
         file_id: FileId,
         kind: GmodScriptedClassCallKind,
         call_metadata: &GmodScriptedClassCallMetadata,
@@ -648,7 +649,7 @@ impl GmodClassMetadataIndex {
     }
 
     fn insert_derma_skin_from_call(
-        derma_skins: &mut HashMap<String, Vec<DermaSkinDefinition>>,
+        derma_skins: &mut CowShards<String, Vec<DermaSkinDefinition>>,
         file_id: FileId,
         call_metadata: &GmodScriptedClassCallMetadata,
     ) {
@@ -728,8 +729,8 @@ impl GmodClassMetadataIndex {
     /// matching on `(file_id, range_start)`. Touches only the one bucket, so
     /// the cost is bounded by the number of definitions sharing the name
     /// rather than the whole cache.
-    fn remove_cached_entry<T>(
-        cache: &mut HashMap<String, Vec<T>>,
+    fn remove_cached_entry<T: Clone>(
+        cache: &mut CowShards<String, Vec<T>>,
         name: &str,
         file_id: FileId,
         range_start: TextSize,
@@ -744,8 +745,8 @@ impl GmodClassMetadataIndex {
     }
 
     fn recompute_derived_caches(&mut self) {
-        let mut vgui_panels = HashMap::default();
-        let mut derma_skins = HashMap::default();
+        let mut vgui_panels = CowShards::default();
+        let mut derma_skins = CowShards::default();
 
         for (file_id, file_metadata) in &self.file_metadata {
             for call in &file_metadata.vgui_register_calls {
@@ -926,8 +927,8 @@ impl GmodClassMetadataIndex {
         for type_id in &incomplete {
             parent_chains.remove(type_id);
         }
-        if self.vgui_panel_parent_chains != parent_chains
-            || self.incomplete_vgui_panel_parent_chains != incomplete
+        if *self.vgui_panel_parent_chains != parent_chains
+            || *self.incomplete_vgui_panel_parent_chains != incomplete
         {
             // Stamp every child whose chain or completeness could have moved —
             // old and new keys both, so removed and gained chains stale their
@@ -942,8 +943,8 @@ impl GmodClassMetadataIndex {
                 derivation::note_write(|| FactKey::VguiChain(type_id.clone()));
             }
         }
-        self.vgui_panel_parent_chains = parent_chains;
-        self.incomplete_vgui_panel_parent_chains = incomplete;
+        self.vgui_panel_parent_chains = parent_chains.into();
+        self.incomplete_vgui_panel_parent_chains = incomplete.into();
     }
 
     /// The files whose removal is still holding their children's chains

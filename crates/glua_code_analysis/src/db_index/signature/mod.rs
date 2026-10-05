@@ -4,6 +4,7 @@ mod gmod_domains;
 mod signature;
 mod signature_cast;
 
+use crate::db_index::cow_shards::{CowCell, CowShards};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smol_str::SmolStr;
 
@@ -45,39 +46,39 @@ use super::traits::LuaIndex;
 
 #[derive(Debug, Clone)]
 pub struct LuaSignatureIndex {
-    signatures: HashMap<LuaSignatureId, LuaSignature>,
+    signatures: CowShards<LuaSignatureId, LuaSignature>,
     /// Each signature a derivation has changed since the last reset, as the
     /// source layer left it (`None`: the source layer has no such signature).
     /// A reset restores it.
-    source_signatures: HashMap<LuaSignatureId, Option<LuaSignature>>,
-    in_file_signatures: HashMap<FileId, HashSet<LuaSignatureId>>,
-    local_func_decls: HashMap<LuaSignatureId, LuaDeclId>,
-    effective_valid_guard_signatures: HashMap<LuaSignatureId, GmodStateMask>,
+    source_signatures: CowShards<LuaSignatureId, Option<LuaSignature>>,
+    in_file_signatures: CowShards<FileId, HashSet<LuaSignatureId>>,
+    local_func_decls: CowCell<HashMap<LuaSignatureId, LuaDeclId>>,
+    effective_valid_guard_signatures: CowCell<HashMap<LuaSignatureId, GmodStateMask>>,
     /// Per-file valid-guard contributions feeding the effective set: file →
     /// the `(signature, mask)` pairs derived from that file's members. A file
     /// can contribute to another file's signature (a source function shadowing
     /// a metadata-bearing annotation), so removal drops these entries
     /// explicitly instead of filtering the effective map by signature file.
-    valid_guard_file_contributions: HashMap<FileId, Vec<(LuaSignatureId, GmodStateMask)>>,
+    valid_guard_file_contributions: CowShards<FileId, Vec<(LuaSignatureId, GmodStateMask)>>,
     /// The set of files in `valid_guard_file_contributions`.
     valid_guard_files: derivation::SetFingerprint,
     /// The names of the definitions each file's docs mark `valid_guard`.
-    valid_guard_names: HashMap<FileId, Vec<SmolStr>>,
+    valid_guard_names: CowCell<HashMap<FileId, Vec<SmolStr>>>,
     /// How many marked definitions carry each name, over every file.
-    valid_guard_name_counts: HashMap<SmolStr, usize>,
-    inferred_positive_guards: HashMap<LuaSignatureId, LuaInferredPositiveGuard>,
-    inferred_guard_owners: HashMap<LuaSignatureId, LuaInferredGuardOwner>,
-    inferred_guard_facts: HashMap<LuaInferredGuardOwner, LuaInferredPositiveGuard>,
-    inferred_guard_owners_by_file: HashMap<FileId, HashSet<LuaInferredGuardOwner>>,
-    inferred_guard_consumers: HashMap<LuaInferredGuardOwner, HashSet<FileId>>,
-    inferred_guard_dependencies: HashMap<FileId, HashSet<LuaInferredGuardOwner>>,
-    inferred_return_dependencies: HashMap<LuaSignatureId, HashSet<FileId>>,
-    inferred_return_consumers: HashMap<FileId, HashSet<LuaSignatureId>>,
-    payload_sources_by_holder: HashMap<FileId, HashSet<FileId>>,
-    payload_holders_by_source: HashMap<FileId, HashSet<FileId>>,
+    valid_guard_name_counts: CowCell<HashMap<SmolStr, usize>>,
+    inferred_positive_guards: CowShards<LuaSignatureId, LuaInferredPositiveGuard>,
+    inferred_guard_owners: CowCell<HashMap<LuaSignatureId, LuaInferredGuardOwner>>,
+    inferred_guard_facts: CowCell<HashMap<LuaInferredGuardOwner, LuaInferredPositiveGuard>>,
+    inferred_guard_owners_by_file: CowCell<HashMap<FileId, HashSet<LuaInferredGuardOwner>>>,
+    inferred_guard_consumers: CowCell<HashMap<LuaInferredGuardOwner, HashSet<FileId>>>,
+    inferred_guard_dependencies: CowCell<HashMap<FileId, HashSet<LuaInferredGuardOwner>>>,
+    inferred_return_dependencies: CowCell<HashMap<LuaSignatureId, HashSet<FileId>>>,
+    inferred_return_consumers: CowCell<HashMap<FileId, HashSet<LuaSignatureId>>>,
+    payload_sources_by_holder: CowCell<HashMap<FileId, HashSet<FileId>>>,
+    payload_holders_by_source: CowCell<HashMap<FileId, HashSet<FileId>>>,
     inferred_positive_guards_changed: bool,
-    receiver_out_param_member_names: HashMap<String, usize>,
-    in_file_receiver_out_param_member_names: HashMap<FileId, HashSet<String>>,
+    receiver_out_param_member_names: CowCell<HashMap<String, usize>>,
+    in_file_receiver_out_param_member_names: CowCell<HashMap<FileId, HashSet<String>>>,
 }
 
 /// A conservative true-branch parameter narrowing derived from a function body.
@@ -153,29 +154,29 @@ impl LuaSignatureIndex {
 
     pub fn new() -> Self {
         Self {
-            signatures: HashMap::default(),
-            source_signatures: HashMap::default(),
-            in_file_signatures: HashMap::default(),
-            local_func_decls: HashMap::default(),
-            effective_valid_guard_signatures: HashMap::default(),
-            valid_guard_file_contributions: HashMap::default(),
+            signatures: Default::default(),
+            source_signatures: Default::default(),
+            in_file_signatures: Default::default(),
+            local_func_decls: Default::default(),
+            effective_valid_guard_signatures: Default::default(),
+            valid_guard_file_contributions: Default::default(),
             valid_guard_files: derivation::SetFingerprint::default(),
-            valid_guard_names: HashMap::default(),
-            valid_guard_name_counts: HashMap::default(),
+            valid_guard_names: Default::default(),
+            valid_guard_name_counts: Default::default(),
 
-            inferred_positive_guards: HashMap::default(),
-            inferred_guard_owners: HashMap::default(),
-            inferred_guard_facts: HashMap::default(),
-            inferred_guard_owners_by_file: HashMap::default(),
-            inferred_guard_consumers: HashMap::default(),
-            inferred_guard_dependencies: HashMap::default(),
-            inferred_return_dependencies: HashMap::default(),
-            inferred_return_consumers: HashMap::default(),
-            payload_sources_by_holder: HashMap::default(),
-            payload_holders_by_source: HashMap::default(),
+            inferred_positive_guards: Default::default(),
+            inferred_guard_owners: Default::default(),
+            inferred_guard_facts: Default::default(),
+            inferred_guard_owners_by_file: Default::default(),
+            inferred_guard_consumers: Default::default(),
+            inferred_guard_dependencies: Default::default(),
+            inferred_return_dependencies: Default::default(),
+            inferred_return_consumers: Default::default(),
+            payload_sources_by_holder: Default::default(),
+            payload_holders_by_source: Default::default(),
             inferred_positive_guards_changed: false,
-            receiver_out_param_member_names: HashMap::default(),
-            in_file_receiver_out_param_member_names: HashMap::default(),
+            receiver_out_param_member_names: Default::default(),
+            in_file_receiver_out_param_member_names: Default::default(),
         }
     }
 
@@ -402,7 +403,7 @@ impl LuaSignatureIndex {
                 }
             }
         }
-        self.effective_valid_guard_signatures = effective;
+        self.effective_valid_guard_signatures = effective.into();
     }
 
     pub(crate) fn clear_valid_guard_contributions(&mut self) {

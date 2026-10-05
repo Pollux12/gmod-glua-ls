@@ -1,3 +1,4 @@
+use crate::db_index::cow_shards::CowShards;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
 
@@ -23,9 +24,9 @@ pub struct LuaMetatableIndex {
     /// Table literal -> the bindings written for it, ordered by writer. Both the key and the
     /// metatable range can live in a file other than the one that wrote `setmetatable`, so a
     /// binding is owned by its writer and only the writer's removal drops it.
-    metatables: HashMap<InFiled<TextRange>, Vec<MetatableBinding>>,
-    by_writer: HashMap<FileId, Vec<InFiled<TextRange>>>,
-    factory_bindings: HashMap<FileId, Vec<SetmetatableFactoryBinding>>,
+    metatables: CowShards<InFiled<TextRange>, Vec<MetatableBinding>>,
+    by_writer: CowShards<FileId, Vec<InFiled<TextRange>>>,
+    factory_bindings: CowShards<FileId, Vec<SetmetatableFactoryBinding>>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,9 +63,9 @@ impl Default for LuaMetatableIndex {
 impl LuaMetatableIndex {
     pub fn new() -> Self {
         Self {
-            metatables: HashMap::default(),
-            by_writer: HashMap::default(),
-            factory_bindings: HashMap::default(),
+            metatables: Default::default(),
+            by_writer: Default::default(),
+            factory_bindings: Default::default(),
         }
     }
 
@@ -175,7 +176,7 @@ impl LuaMetatableIndex {
                     .push(table.clone());
             }
         }
-        self.metatables = rebuilt;
+        self.metatables = rebuilt.into();
 
         for (file_id, bindings) in &mut self.factory_bindings {
             derivation::note_write(|| FactKey::MetatableFactory(*file_id));

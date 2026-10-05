@@ -1,6 +1,7 @@
 mod analyze_error;
 mod diagnostic_action;
 
+use crate::db_index::cow_shards::CowCell;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 pub use analyze_error::AnalyzeError;
@@ -16,10 +17,10 @@ use super::traits::LuaIndex;
 
 #[derive(Debug, Clone)]
 pub struct DiagnosticIndex {
-    diagnostic_actions: HashMap<FileId, Vec<DiagnosticAction>>,
-    diagnostics: HashMap<FileId, Vec<AnalyzeError>>,
-    file_diagnostic_disabled: HashMap<FileId, HashSet<DiagnosticCode>>,
-    file_diagnostic_enabled: HashMap<FileId, HashSet<DiagnosticCode>>,
+    diagnostic_actions: CowCell<HashMap<FileId, Vec<DiagnosticAction>>>,
+    diagnostics: CowCell<HashMap<FileId, Vec<AnalyzeError>>>,
+    file_diagnostic_disabled: CowCell<HashMap<FileId, HashSet<DiagnosticCode>>>,
+    file_diagnostic_enabled: CowCell<HashMap<FileId, HashSet<DiagnosticCode>>>,
 }
 
 impl Default for DiagnosticIndex {
@@ -31,10 +32,10 @@ impl Default for DiagnosticIndex {
 impl DiagnosticIndex {
     pub fn new() -> Self {
         Self {
-            diagnostic_actions: HashMap::default(),
-            diagnostics: HashMap::default(),
-            file_diagnostic_disabled: HashMap::default(),
-            file_diagnostic_enabled: HashMap::default(),
+            diagnostic_actions: Default::default(),
+            diagnostics: Default::default(),
+            file_diagnostic_disabled: Default::default(),
+            file_diagnostic_enabled: Default::default(),
         }
     }
 

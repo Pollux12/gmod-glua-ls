@@ -2,6 +2,7 @@ mod decl_feature;
 #[allow(clippy::module_inception)]
 mod property;
 
+use crate::db_index::cow_shards::{CowCell, CowShards};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -62,27 +63,28 @@ pub struct LuaPropertyContribution<'a> {
 pub struct LuaPropertyIndex {
     /// Merged view, read by `get_property`. For the common single-contributor property this is
     /// the contribution itself and nothing else is stored.
-    properties: HashMap<LuaPropertyId, LuaCommonProperty>,
-    property_owners_map: HashMap<LuaSemanticDeclId, LuaPropertyId>,
+    properties: CowCell<HashMap<LuaPropertyId, LuaCommonProperty>>,
+    property_owners_map: CowCell<HashMap<LuaSemanticDeclId, LuaPropertyId>>,
     /// `property_owners_map` inverted: the owners sharing each property.
-    owners_by_property: HashMap<LuaPropertyId, Vec<LuaSemanticDeclId>>,
-    signature_owner_by_property: HashMap<LuaPropertyId, LuaSignatureId>,
+    owners_by_property: CowCell<HashMap<LuaPropertyId, Vec<LuaSemanticDeclId>>>,
+    signature_owner_by_property: CowCell<HashMap<LuaPropertyId, LuaSignatureId>>,
 
     /// `TypeDecl` properties are keyed by class name alone, so several files can document one
     /// class. Only those properties get per-file contributions; everything else stays sole.
-    sole_contributor: HashMap<LuaPropertyId, FileId>,
-    contributions: HashMap<LuaPropertyId, BTreeMap<PropertyContributorKey, LuaCommonProperty>>,
-    file_merge_order: HashMap<FileId, (u8, Arc<str>)>,
+    sole_contributor: CowCell<HashMap<LuaPropertyId, FileId>>,
+    contributions:
+        CowCell<HashMap<LuaPropertyId, BTreeMap<PropertyContributorKey, LuaCommonProperty>>>,
+    file_merge_order: CowCell<HashMap<FileId, (u8, Arc<str>)>>,
 
     id_count: u32,
-    in_filed_owner: HashMap<FileId, HashSet<LuaSemanticDeclId>>,
+    in_filed_owner: CowCell<HashMap<FileId, HashSet<LuaSemanticDeclId>>>,
 
     /// Inferred string defaults from `x = x or "literal"` patterns.
     /// Keyed by `LuaDeclId`; one decl can have multiple candidates (e.g.
     /// multiple self-coalescing assignments in different scopes of the same
     /// function).  File ownership is tracked for cleanup on reindex.
-    inferred_string_defaults: HashMap<LuaDeclId, Vec<LuaInferredStringDefault>>,
-    inferred_string_defaults_file_owners: HashMap<FileId, HashSet<LuaDeclId>>,
+    inferred_string_defaults: CowShards<LuaDeclId, Vec<LuaInferredStringDefault>>,
+    inferred_string_defaults_file_owners: CowShards<FileId, HashSet<LuaDeclId>>,
 }
 
 impl Default for LuaPropertyIndex {
@@ -95,16 +97,16 @@ impl LuaPropertyIndex {
     pub fn new() -> Self {
         Self {
             id_count: 0,
-            in_filed_owner: HashMap::default(),
-            properties: HashMap::default(),
-            property_owners_map: HashMap::default(),
-            owners_by_property: HashMap::default(),
-            signature_owner_by_property: HashMap::default(),
-            sole_contributor: HashMap::default(),
-            contributions: HashMap::default(),
-            file_merge_order: HashMap::default(),
-            inferred_string_defaults: HashMap::default(),
-            inferred_string_defaults_file_owners: HashMap::default(),
+            in_filed_owner: Default::default(),
+            properties: Default::default(),
+            property_owners_map: Default::default(),
+            owners_by_property: Default::default(),
+            signature_owner_by_property: Default::default(),
+            sole_contributor: Default::default(),
+            contributions: Default::default(),
+            file_merge_order: Default::default(),
+            inferred_string_defaults: Default::default(),
+            inferred_string_defaults_file_owners: Default::default(),
         }
     }
 

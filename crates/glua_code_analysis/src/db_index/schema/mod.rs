@@ -1,5 +1,6 @@
 mod schema_file;
 
+use crate::db_index::cow_shards::CowCell;
 use rustc_hash::FxHashMap;
 
 use url::Url;
@@ -9,13 +10,13 @@ pub use schema_file::*;
 
 #[derive(Debug, Clone)]
 pub struct JsonSchemaIndex {
-    schema_files: FxHashMap<Url, JsonSchemaFile>,
+    schema_files: CowCell<FxHashMap<Url, JsonSchemaFile>>,
 }
 
 impl JsonSchemaIndex {
     pub fn new() -> Self {
         Self {
-            schema_files: FxHashMap::default(),
+            schema_files: Default::default(),
         }
     }
 

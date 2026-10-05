@@ -1159,10 +1159,10 @@ mod tests {
     }
 
     #[test]
-    fn reserve_for_file_leaves_index_contents_unchanged() {
+    fn add_file_entries_leaves_index_contents_unchanged() {
         let mut index = LuaMemberIndex::new();
         let file_id = FileId::new(1);
-        index.reserve_for_file(file_id, 64);
+        index.add_file_entries(file_id);
         assert!(index.get_file_members(file_id).is_empty());
 
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("ReservedType"));

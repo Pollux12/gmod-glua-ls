@@ -40,6 +40,7 @@ use crate::{Emmyrc, FileId, Vfs, profile::Profile};
 pub use accessor_func::*;
 pub use call_site_param::{CallSiteParamContribution, CallSiteParamIndex};
 pub use call_target::{FileCallTargets, LuaCallTarget, LuaCallTargetIndex};
+use cow_shards::{CowCell, CowShards};
 pub use declaration::*;
 pub use dependency::{LuaDependencyIndex, LuaDependencyKind, LuaDependencySite};
 pub use diagnostic::{AnalyzeError, DiagnosticAction, DiagnosticActionKind, DiagnosticIndex};
@@ -105,25 +106,25 @@ pub struct DbIndex {
     /// The workspace gmod call roles with their fingerprint when stored.
     gmod_call_roles: Option<(Arc<dyn derivation::CallRoles>, derivation::Fingerprint)>,
     /// Each call-role entry's fingerprint when the call roles were stored.
-    call_role_fingerprints: FxHashMap<derivation::CallRoleKey, derivation::Fingerprint>,
+    call_role_fingerprints: CowCell<FxHashMap<derivation::CallRoleKey, derivation::Fingerprint>>,
     /// The global paths each file's syntax names.
-    role_mentions: FxHashMap<FileId, Arc<[smol_str::SmolStr]>>,
+    role_mentions: CowShards<FileId, Arc<[smol_str::SmolStr]>>,
     emmyrc: Arc<Emmyrc>,
     /// Each file's gmod helper scan with its fingerprint when stored.
-    helper_scans: FxHashMap<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
+    helper_scans: CowShards<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
     /// The set of files in `helper_scans`.
     helper_scan_files: derivation::SetFingerprint,
     /// Each file's own contribution to the gmod load graph.
-    load_scans: FxHashMap<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
+    load_scans: CowShards<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
     /// The set of files in `load_scans`.
     load_scan_files: derivation::SetFingerprint,
     /// Each file's net helper summaries with their fingerprint when stored.
-    net_helpers: FxHashMap<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
+    net_helpers: CowShards<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
     /// Each file with the files whose net helpers name its positions.
-    net_helper_refs: FxHashMap<FileId, FxHashSet<FileId>>,
+    net_helper_refs: CowShards<FileId, FxHashSet<FileId>>,
     /// Each file's function-body summaries with their fingerprint when stored.
     function_summaries:
-        FxHashMap<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
+        CowShards<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
     /// Bumped on every *mutable* handle to the type, member, signature or module
     /// index; memos over facts derived from those key on it. It covers those four
     /// and no others — the decl, global, dynamic-field and gmod-infer indexes all
@@ -232,16 +233,16 @@ impl DbIndex {
             json_schema_index: Arc::new(JsonSchemaIndex::new()),
             derivations: Arc::default(),
             gmod_call_roles: None,
-            call_role_fingerprints: FxHashMap::default(),
-            role_mentions: FxHashMap::default(),
+            call_role_fingerprints: Default::default(),
+            role_mentions: Default::default(),
             emmyrc: Arc::new(Emmyrc::default()),
-            helper_scans: FxHashMap::default(),
+            helper_scans: Default::default(),
             helper_scan_files: derivation::SetFingerprint::default(),
-            load_scans: FxHashMap::default(),
+            load_scans: Default::default(),
             load_scan_files: derivation::SetFingerprint::default(),
-            net_helpers: FxHashMap::default(),
-            net_helper_refs: FxHashMap::default(),
-            function_summaries: FxHashMap::default(),
+            net_helpers: Default::default(),
+            net_helper_refs: Default::default(),
+            function_summaries: Default::default(),
             analysis_stage: derivation::AnalysisStage::default(),
             queries: query::Queries::default(),
         }
@@ -401,7 +402,7 @@ impl DbIndex {
                 derivation::note_write(|| derivation::FactKey::CallRole(key.clone()));
             }
         }
-        self.call_role_fingerprints = entries;
+        self.call_role_fingerprints = entries.into();
         let fingerprint = roles.fingerprint().max(1);
         self.gmod_call_roles = Some((roles, fingerprint));
     }

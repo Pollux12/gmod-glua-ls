@@ -1,5 +1,6 @@
 mod test;
 
+use crate::db_index::cow_shards::CowShards;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::BTreeSet;
 
@@ -71,15 +72,15 @@ type ParamSlot = (LuaSignatureId, usize);
 #[derive(Debug, Default, Clone)]
 pub struct CallSiteParamIndex {
     /// file → the evidence its calls contributed. No empty entries.
-    file_contributions: HashMap<FileId, Vec<CallSiteParamContribution>>,
+    file_contributions: CowShards<FileId, Vec<CallSiteParamContribution>>,
     /// parameter → the files contributing evidence for it.
-    contributors: HashMap<ParamSlot, BTreeSet<FileId>>,
+    contributors: CowShards<ParamSlot, BTreeSet<FileId>>,
     /// signature → param index → the folded fact.
-    inferred_params: HashMap<LuaSignatureId, HashMap<usize, LuaTypeFact>>,
+    inferred_params: CowShards<LuaSignatureId, HashMap<usize, LuaTypeFact>>,
     /// file → the other files whose evidence names one of its identities: a
     /// callee signature, or a table, signature or node its types and
     /// provenance name.
-    referencing: HashMap<FileId, BTreeSet<FileId>>,
+    referencing: CowShards<FileId, BTreeSet<FileId>>,
 }
 
 impl CallSiteParamIndex {

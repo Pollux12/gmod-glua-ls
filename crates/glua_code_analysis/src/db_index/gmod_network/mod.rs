@@ -1,3 +1,4 @@
+use crate::db_index::cow_shards::{CowCell, CowShards};
 use crate::db_index::derivation::{FilePosition, hash_local};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
@@ -340,18 +341,18 @@ pub struct NetNameExpansion {
 
 #[derive(Debug, Default, Clone)]
 pub struct GmodNetworkIndex {
-    file_data: FxHashMap<FileId, FileNetworkData>,
-    send_flows_by_message: FxHashMap<String, Vec<(FileId, usize)>>,
-    receive_flows_by_message: FxHashMap<String, Vec<(FileId, usize)>>,
-    materialized_definition_counts: FxHashMap<(FileId, TextRange), usize>,
+    file_data: CowShards<FileId, FileNetworkData>,
+    send_flows_by_message: CowShards<String, Vec<(FileId, usize)>>,
+    receive_flows_by_message: CowShards<String, Vec<(FileId, usize)>>,
+    materialized_definition_counts: CowShards<(FileId, TextRange), usize>,
     /// Each file with the other files whose flows name its positions.
-    referencing: FxHashMap<FileId, FxHashSet<FileId>>,
+    referencing: CowShards<FileId, FxHashSet<FileId>>,
     /// Canonical function metadata per `(wire_format, direction)`, derived from
     /// annotated signatures during analysis. Features that must *emit* a net call
     /// — read completions, "expected `x`, got `y`" messages when one side has no
     /// call to name — resolve it here instead of from a hardcoded table.
     /// Workspace-global and rebuilt per analyze pass, so it is not per-file state.
-    canonical_ops: FxHashMap<(SmolStr, NetOpDirection), CanonicalNetOp>,
+    canonical_ops: CowCell<FxHashMap<(SmolStr, NetOpDirection), CanonicalNetOp>>,
     /// The names of functions that can produce a net operation, directly or
     /// through other such functions.
     helper_names: Arc<FxHashSet<SmolStr>>,
@@ -465,13 +466,13 @@ fn remap_file_data(data: &FileNetworkData, remap: &FileRemap) -> Remap<FileNetwo
 impl GmodNetworkIndex {
     pub fn new() -> Self {
         Self {
-            file_data: FxHashMap::default(),
-            send_flows_by_message: FxHashMap::default(),
-            receive_flows_by_message: FxHashMap::default(),
-            materialized_definition_counts: FxHashMap::default(),
-            referencing: FxHashMap::default(),
-            canonical_ops: FxHashMap::default(),
-            helper_names: Arc::default(),
+            file_data: Default::default(),
+            send_flows_by_message: Default::default(),
+            receive_flows_by_message: Default::default(),
+            materialized_definition_counts: Default::default(),
+            referencing: Default::default(),
+            canonical_ops: Default::default(),
+            helper_names: Default::default(),
             flows_fingerprint: 0,
             canonical_ops_fingerprint: 0,
         }
@@ -532,7 +533,7 @@ impl GmodNetworkIndex {
         self.canonical_ops_fingerprint = canonical_ops.iter().fold(0, |sum: Fingerprint, entry| {
             sum.wrapping_add(derivation::fingerprint_of(&entry))
         });
-        self.canonical_ops = canonical_ops;
+        self.canonical_ops = canonical_ops.into();
     }
 
     pub fn canonical_op(

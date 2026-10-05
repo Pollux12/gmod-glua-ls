@@ -1,5 +1,6 @@
 use rustc_hash::FxHashMap;
 
+use crate::db_index::cow_shards::{CowCell, CowShards};
 use glua_parser::LuaSyntaxId;
 use smol_str::SmolStr;
 
@@ -17,8 +18,8 @@ pub struct AccessorFuncAnnotation {
 
 #[derive(Debug, Default, Clone)]
 pub struct AccessorFuncAnnotationIndex {
-    by_name: FxHashMap<SmolStr, Vec<AccessorFuncAnnotation>>,
-    by_file: FxHashMap<FileId, Vec<SmolStr>>,
+    by_name: CowCell<FxHashMap<SmolStr, Vec<AccessorFuncAnnotation>>>,
+    by_file: CowCell<FxHashMap<FileId, Vec<SmolStr>>>,
 }
 
 impl AccessorFuncAnnotationIndex {
@@ -132,7 +133,7 @@ pub struct AccessorFuncCallMetadata {
 
 #[derive(Debug, Default, Clone)]
 pub struct AccessorFuncCallIndex {
-    calls: FxHashMap<FileId, Vec<AccessorFuncCallMetadata>>,
+    calls: CowShards<FileId, Vec<AccessorFuncCallMetadata>>,
 }
 
 impl AccessorFuncCallIndex {

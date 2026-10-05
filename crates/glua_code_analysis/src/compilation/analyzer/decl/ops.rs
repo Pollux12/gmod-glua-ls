@@ -124,8 +124,7 @@ impl DeclWalk {
                 .set_scoped_class_info(file_id, info.clone());
         }
         db.get_reference_index_mut().create_local_reference(file_id);
-        db.get_member_index_mut()
-            .reserve_for_file(file_id, self.estimate);
+        db.get_member_index_mut().add_file_entries(file_id);
         let references = db.get_reference_index_mut();
         references.reserve_for_file(file_id, self.estimate);
         references.file_batch(self.references);

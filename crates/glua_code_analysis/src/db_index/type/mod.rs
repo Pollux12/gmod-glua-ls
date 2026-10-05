@@ -10,8 +10,8 @@ mod type_owner;
 mod type_visit_trait;
 mod types;
 
-use super::cow_shards::CowShards;
 use super::traits::LuaIndex;
+use crate::db_index::cow_shards::{CowCell, CowShards, ShardKey};
 use crate::db_index::derivation::{self, DerivationId, FactKey, Fingerprint};
 use crate::{
     DbIndex, FileId, InFiled, LuaDeclId, LuaDeclSourceKey, LuaMemberOwner, LuaSignatureId,
@@ -1110,9 +1110,9 @@ impl TypeCacheRef {
 /// so incremental expansion is a lookup instead of a scan over every cache.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct TypeCacheRefIndex {
-    owner_refs: HashMap<FileId, HashMap<TypeCacheRef, u32>>,
-    ref_owners: HashMap<TypeCacheRef, HashSet<FileId>>,
-    refs_by_file: HashMap<FileId, HashSet<TypeCacheRef>>,
+    owner_refs: CowShards<FileId, HashMap<TypeCacheRef, u32>>,
+    ref_owners: CowShards<TypeCacheRef, HashSet<FileId>>,
+    refs_by_file: CowShards<FileId, HashSet<TypeCacheRef>>,
 }
 
 impl TypeCacheRefIndex {
@@ -1277,48 +1277,49 @@ impl std::hash::Hash for TypeFact {
 
 #[derive(Debug, Clone)]
 pub struct LuaTypeIndex {
-    file_namespace: HashMap<FileId, String>,
-    file_using_namespace: HashMap<FileId, Vec<String>>,
-    file_types: HashMap<FileId, Vec<LuaTypeDeclId>>,
-    declaration_sites: HashMap<FileId, HashMap<TextRange, LuaTypeDeclId>>,
-    full_name_type_map: HashMap<LuaTypeDeclId, LuaTypeDecl>,
-    generic_params: HashMap<LuaTypeDeclId, Vec<GenericParam>>,
+    file_namespace: CowCell<HashMap<FileId, String>>,
+    file_using_namespace: CowCell<HashMap<FileId, Vec<String>>>,
+    file_types: CowCell<HashMap<FileId, Vec<LuaTypeDeclId>>>,
+    declaration_sites: CowCell<HashMap<FileId, HashMap<TextRange, LuaTypeDeclId>>>,
+    full_name_type_map: CowShards<LuaTypeDeclId, LuaTypeDecl>,
+    generic_params: CowCell<HashMap<LuaTypeDeclId, Vec<GenericParam>>>,
     /// Per-site alias contributions: decl id → declaration site → payload.
     /// The effective `LuaTypeExtra::Alias::origin` and `generic_params` entry
     /// are the winning site's pair, re-selected on every publish/retract.
     /// Removal walks the removed file's `file_types` decls and drops the
     /// sites it owned — a contribution always lands on the decl the file's
     /// own declaration produced.
-    alias_sources: HashMap<LuaTypeDeclId, HashMap<InFiled<TextRange>, LuaAliasSource>>,
+    alias_sources: CowCell<HashMap<LuaTypeDeclId, HashMap<InFiled<TextRange>, LuaAliasSource>>>,
     /// Per-site `---@enum` and `---@attribute` payloads with their
     /// precedence; the decl carries the winning site's payload.
-    extra_sources:
+    extra_sources: CowCell<
         HashMap<LuaTypeDeclId, HashMap<InFiled<TextRange>, (LuaDeclSourceKey, LuaTypeExtra)>>,
-    supers: HashMap<LuaTypeDeclId, Vec<InFiled<LuaSuperType>>>,
+    >,
+    supers: CowShards<LuaTypeDeclId, Vec<InFiled<LuaSuperType>>>,
     /// Super-type edges by the file that declared them, so removing a file
     /// visits only its own edges instead of retaining over every edge in the
     /// workspace. One record per [`LuaTypeIndex::add_super_type`] write, kept
     /// in step with [`Self::supers`].
-    supers_by_file: HashMap<FileId, Vec<(LuaTypeDeclId, InFiled<LuaSuperType>)>>,
+    supers_by_file: CowCell<HashMap<FileId, Vec<(LuaTypeDeclId, InFiled<LuaSuperType>)>>>,
     /// Reverse super-type edges: base class id → direct subclass ids. Updated
     /// on every [`LuaTypeIndex::add_super_type`] write and pruned by declaring
     /// file when [`LuaIndex::remove_files`] drops super-type entries, so
     /// [`LuaTypeIndex::get_sub_types`] is a lookup instead of a scan over
     /// every inheritance edge in the workspace.
-    sub_types: HashMap<LuaTypeDeclId, Vec<LuaTypeDeclId>>,
+    sub_types: CowShards<LuaTypeDeclId, Vec<LuaTypeDeclId>>,
     /// Which class each table-literal declaration's stored type names. Backs
     /// `local_class_table_member_ids`: finding the table literals that back
     /// a class is a lookup of the declarations bound to it instead of a scan
     /// over every declaration in the class's files. Maintained on every
     /// type-cache write and file removal alongside the caches themselves.
-    decl_type_binds: HashMap<LuaDeclId, LuaTypeDeclId>,
-    type_bound_decls: HashMap<LuaTypeDeclId, HashSet<LuaDeclId>>,
+    decl_type_binds: CowShards<LuaDeclId, LuaTypeDeclId>,
+    type_bound_decls: CowShards<LuaTypeDeclId, HashSet<LuaDeclId>>,
     /// Each file's declarations initialised with a table literal, the only
     /// ones a class binding is kept for; a source fact of the file.
-    table_literal_decls: HashMap<FileId, HashSet<LuaDeclId>>,
+    table_literal_decls: CowCell<HashMap<FileId, HashSet<LuaDeclId>>>,
     types: CowShards<LuaTypeOwner, TypeFact>,
     cache_refs: TypeCacheRefIndex,
-    in_filed_type_owner: HashMap<FileId, HashSet<LuaTypeOwner>>,
+    in_filed_type_owner: CowShards<FileId, HashSet<LuaTypeOwner>>,
     fact_metadata: CowShards<LuaTypeOwner, LuaTypeFactMetadata>,
     /// The files one fact's provenance and step types name, per fact owner,
     /// with the reverse map beside it. [`Self::remap_inference_facts`] visits
@@ -1327,50 +1328,50 @@ pub struct LuaTypeIndex {
     /// and support files plus `TableConst`/`Instance`/`Signature` files in the
     /// step types), so a fact outside the edited file's bucket remaps to
     /// itself.
-    fact_ref_files: HashMap<LuaTypeOwner, HashSet<FileId>>,
-    fact_refs_by_file: HashMap<FileId, HashSet<LuaTypeOwner>>,
+    fact_ref_files: CowShards<LuaTypeOwner, HashSet<FileId>>,
+    fact_refs_by_file: CowShards<FileId, HashSet<LuaTypeOwner>>,
     /// The [`Self::fact_ref_files`] counterpart for definition facts, whose
     /// payload type can name another file's literal or signature on top of
     /// the provenance every fact carries.
-    definition_fact_ref_files: HashMap<LuaDefinitionId, HashSet<FileId>>,
-    definition_fact_refs_by_file: HashMap<FileId, HashSet<LuaDefinitionId>>,
+    definition_fact_ref_files: CowShards<LuaDefinitionId, HashSet<FileId>>,
+    definition_fact_refs_by_file: CowShards<FileId, HashSet<LuaDefinitionId>>,
     /// For each decl whose type a write has seeded: that write's source
     /// position, and whether its right-hand side was a call or index read. See
     /// `bind_decl_write`.
-    decl_write_claims: HashMap<LuaDeclId, (TextSize, bool)>,
-    definition_facts: HashMap<LuaDefinitionId, LuaTypeFact>,
-    inference_events_by_file: HashMap<FileId, Arc<[LuaInferenceDiagnosticEvent]>>,
-    support_dependents: HashMap<LuaInferenceNodeId, HashSet<FileId>>,
-    support_file_dependents: HashMap<FileId, HashSet<FileId>>,
+    decl_write_claims: CowShards<LuaDeclId, (TextSize, bool)>,
+    definition_facts: CowShards<LuaDefinitionId, LuaTypeFact>,
+    inference_events_by_file: CowCell<HashMap<FileId, Arc<[LuaInferenceDiagnosticEvent]>>>,
+    support_dependents: CowCell<HashMap<LuaInferenceNodeId, HashSet<FileId>>>,
+    support_file_dependents: CowCell<HashMap<FileId, HashSet<FileId>>>,
     derived_state_dirty: bool,
     /// Multiset fingerprint of every id in `full_name_type_map`, for
     /// `TypeDeclScan`.
     decl_scan_fingerprint: Fingerprint,
     /// Each owner's cache and metadata as the source layer left them; a reset
     /// restores these. See [`derivation::writes_source`].
-    source_types: HashMap<LuaTypeOwner, (LuaTypeCache, Option<LuaTypeFactMetadata>)>,
+    source_types: CowCell<HashMap<LuaTypeOwner, (LuaTypeCache, Option<LuaTypeFactMetadata>)>>,
     /// The locations the source layer declared each type decl at. Doc-time
     /// name resolution only sees these, so a class a derivation registers
     /// never changes how a file's annotations resolve.
-    source_decl_locations: HashMap<LuaTypeDeclId, Vec<LuaDeclLocation>>,
+    source_decl_locations: CowCell<HashMap<LuaTypeDeclId, Vec<LuaDeclLocation>>>,
     /// The declaration locations and super edges each derivation added, so
     /// they are retracted before it runs again.
-    derived_contributions: HashMap<DerivationId, Vec<TypeContribution>>,
+    derived_contributions: CowShards<DerivationId, Vec<TypeContribution>>,
     /// Who holds each declaration location, with the flags it gave. A
     /// location's flags are its holders' union; it leaves with its last one.
     location_holders:
-        HashMap<(LuaTypeDeclId, FileId, TextRange), Vec<(Holder, FlagSet<LuaTypeFlag>)>>,
+        CowShards<(LuaTypeDeclId, FileId, TextRange), Vec<(Holder, FlagSet<LuaTypeFlag>)>>,
     /// Who holds each super edge; an edge leaves with its last holder.
-    super_holders: HashMap<(LuaTypeDeclId, InFiled<LuaSuperType>), Vec<Holder>>,
+    super_holders: CowShards<(LuaTypeDeclId, InFiled<LuaSuperType>), Vec<Holder>>,
     /// Table literals a registration turned into a class (a vgui panel
     /// table, a scripted entity table), with the derivations registering
     /// each. A stored type that names the literal names the class instead.
-    table_classes: HashMap<InFiled<TextRange>, Vec<(DerivationId, LuaType)>>,
+    table_classes: CowShards<InFiled<TextRange>, Vec<(DerivationId, LuaType)>>,
     /// Per file, the owners its local fallbacks published a type over, with
     /// what the statements writing each left there: readers see the fallback,
     /// a statement's write lands underneath it, and a reset of the fallbacks
     /// restores it. See [`derivation::writes_fallback_of`].
-    fallbacks: HashMap<FileId, HashMap<LuaTypeOwner, StatementType>>,
+    fallbacks: CowShards<FileId, HashMap<LuaTypeOwner, StatementType>>,
 }
 
 /// What the statements writing an owner's type left there, under the type a
@@ -1437,42 +1438,42 @@ impl Default for LuaTypeIndex {
 impl LuaTypeIndex {
     pub fn new() -> Self {
         Self {
-            file_namespace: HashMap::default(),
-            file_using_namespace: HashMap::default(),
-            file_types: HashMap::default(),
-            declaration_sites: HashMap::default(),
-            full_name_type_map: HashMap::default(),
-            alias_sources: HashMap::default(),
-            extra_sources: HashMap::default(),
-            generic_params: HashMap::default(),
-            supers: HashMap::default(),
-            supers_by_file: HashMap::default(),
-            sub_types: HashMap::default(),
-            decl_type_binds: HashMap::default(),
-            type_bound_decls: HashMap::default(),
-            table_literal_decls: HashMap::default(),
+            file_namespace: Default::default(),
+            file_using_namespace: Default::default(),
+            file_types: Default::default(),
+            declaration_sites: Default::default(),
+            full_name_type_map: Default::default(),
+            alias_sources: Default::default(),
+            extra_sources: Default::default(),
+            generic_params: Default::default(),
+            supers: Default::default(),
+            supers_by_file: Default::default(),
+            sub_types: Default::default(),
+            decl_type_binds: Default::default(),
+            type_bound_decls: Default::default(),
+            table_literal_decls: Default::default(),
             types: CowShards::default(),
-            cache_refs: TypeCacheRefIndex::default(),
-            in_filed_type_owner: HashMap::default(),
-            fact_ref_files: HashMap::default(),
-            fact_refs_by_file: HashMap::default(),
-            definition_fact_ref_files: HashMap::default(),
-            definition_fact_refs_by_file: HashMap::default(),
+            cache_refs: Default::default(),
+            in_filed_type_owner: Default::default(),
+            fact_ref_files: Default::default(),
+            fact_refs_by_file: Default::default(),
+            definition_fact_ref_files: Default::default(),
+            definition_fact_refs_by_file: Default::default(),
             fact_metadata: CowShards::default(),
-            decl_write_claims: HashMap::default(),
-            definition_facts: HashMap::default(),
-            inference_events_by_file: HashMap::default(),
-            support_dependents: HashMap::default(),
-            support_file_dependents: HashMap::default(),
+            decl_write_claims: Default::default(),
+            definition_facts: Default::default(),
+            inference_events_by_file: Default::default(),
+            support_dependents: Default::default(),
+            support_file_dependents: Default::default(),
             derived_state_dirty: false,
             decl_scan_fingerprint: derivation::ABSENT,
-            source_types: HashMap::default(),
-            source_decl_locations: HashMap::default(),
-            derived_contributions: HashMap::default(),
-            location_holders: HashMap::default(),
-            super_holders: HashMap::default(),
-            table_classes: HashMap::default(),
-            fallbacks: HashMap::default(),
+            source_types: Default::default(),
+            source_decl_locations: Default::default(),
+            derived_contributions: Default::default(),
+            location_holders: Default::default(),
+            super_holders: Default::default(),
+            table_classes: Default::default(),
+            fallbacks: Default::default(),
         }
     }
 
@@ -2554,9 +2555,6 @@ impl LuaTypeIndex {
     /// What the statements left under the fallback covering `owner`, if one
     /// does.
     fn statement_type(&self, owner: &LuaTypeOwner) -> Option<&StatementType> {
-        if self.fallbacks.is_empty() {
-            return None;
-        }
         self.fallbacks.get(&owner.get_file_id())?.get(owner)
     }
 
@@ -2987,14 +2985,14 @@ impl LuaTypeIndex {
                 )
             })
             .collect();
-        self.support_file_dependents = HashMap::default();
+        self.support_file_dependents = Default::default();
         for (node, dependents) in &support_dependents {
             self.support_file_dependents
                 .entry(node.file_id())
                 .or_default()
                 .extend(dependents.iter().copied());
         }
-        self.support_dependents = support_dependents;
+        self.support_dependents = support_dependents.into();
     }
 
     pub fn iter_type_caches(&self) -> impl Iterator<Item = (&LuaTypeOwner, &LuaTypeCache)> {
@@ -3707,7 +3705,7 @@ impl LuaIndex for LuaTypeIndex {
         self.super_holders.clear();
         self.table_classes.clear();
         self.fallbacks.clear();
-        self.cache_refs = TypeCacheRefIndex::default();
+        self.cache_refs = Default::default();
         self.in_filed_type_owner.clear();
         self.fact_metadata.clear();
         self.fact_ref_files.clear();
@@ -3933,12 +3931,12 @@ fn collect_type_files(typ: &LuaType, files: &mut HashSet<FileId>) {
 
 /// Re-points `key`'s reverse edges at `files`, dropping the stale ones.
 fn replace_reverse_edges<K>(
-    by_file: &mut HashMap<FileId, HashSet<K>>,
-    forward: &mut HashMap<K, HashSet<FileId>>,
+    by_file: &mut CowShards<FileId, HashSet<K>>,
+    forward: &mut CowShards<K, HashSet<FileId>>,
     key: K,
     files: HashSet<FileId>,
 ) where
-    K: Eq + std::hash::Hash + Clone,
+    K: ShardKey + Clone,
 {
     if let Some(previous) = forward.insert(key.clone(), files.clone()) {
         for file_id in previous.difference(&files) {
@@ -3960,11 +3958,11 @@ fn replace_reverse_edges<K>(
 
 /// Drops `key`'s reverse edges entirely.
 fn remove_reverse_edges<K>(
-    by_file: &mut HashMap<FileId, HashSet<K>>,
-    forward: &mut HashMap<K, HashSet<FileId>>,
+    by_file: &mut CowShards<FileId, HashSet<K>>,
+    forward: &mut CowShards<K, HashSet<FileId>>,
     key: &K,
 ) where
-    K: Eq + std::hash::Hash + Clone,
+    K: ShardKey + Clone,
 {
     let Some(files) = forward.remove(key) else {
         return;
@@ -4482,7 +4480,7 @@ mod batch_removal_tests {
                     .insert(owner.clone());
             }
         }
-        assert_eq!(index.fact_refs_by_file, expected_by_file);
+        assert_eq!(index.fact_refs_by_file, CowShards::from(expected_by_file));
 
         for (definition, fact) in &index.definition_facts {
             let expected = type_fact_referenced_files(fact);
@@ -4506,7 +4504,10 @@ mod batch_removal_tests {
                     .insert(*definition);
             }
         }
-        assert_eq!(index.definition_fact_refs_by_file, expected_definitions);
+        assert_eq!(
+            index.definition_fact_refs_by_file,
+            CowShards::from(expected_definitions)
+        );
 
         let mut expected_edges: HashMap<FileId, Vec<(LuaTypeDeclId, InFiled<LuaSuperType>)>> =
             HashMap::default();
@@ -4533,7 +4534,7 @@ mod batch_removal_tests {
                 })
             });
         }
-        assert_eq!(actual_edges, expected_edges);
+        assert_eq!(*actual_edges, expected_edges);
     }
 
     /// Removing a file leaves exactly the state a fresh index built from the
