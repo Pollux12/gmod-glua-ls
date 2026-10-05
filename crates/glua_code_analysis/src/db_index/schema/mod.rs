@@ -74,3 +74,5 @@ impl LuaIndex for JsonSchemaIndex {
         // TODO clear all schema index
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(JsonSchemaIndex { schema_files });

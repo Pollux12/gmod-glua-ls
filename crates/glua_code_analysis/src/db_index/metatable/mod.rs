@@ -29,7 +29,7 @@ pub struct LuaMetatableIndex {
     factory_bindings: CowShards<FileId, Vec<SetmetatableFactoryBinding>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetatableBinding {
     pub metatable: InFiled<TextRange>,
     pub writer_file_id: FileId,
@@ -44,7 +44,7 @@ impl MetatableBinding {
     }
 }
 
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, Hash, PartialEq)]
 pub struct SetmetatableFactoryBinding {
     pub file_id: FileId,
     pub table_range: InFiled<TextRange>,
@@ -392,3 +392,9 @@ mod tests {
         assert_eq!(index.get(&table), Some(&InFiled::new(late_writer, range)));
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(LuaMetatableIndex {
+    metatables,
+    by_writer,
+    factory_bindings,
+});

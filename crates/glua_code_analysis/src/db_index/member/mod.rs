@@ -141,7 +141,7 @@ fn note_owner_map_read(owner: &LuaMemberOwner) {
 
 /// A member as the source layer left it, kept while a derivation has changed
 /// it so a reset can restore it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct SourceMember {
     /// `None` when the source layer has no such member.
     state: Option<SourceMemberState>,
@@ -149,7 +149,7 @@ struct SourceMember {
     derived_owners: Vec<LuaMemberOwner>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct SourceMemberState {
     member: LuaMember,
     owner: Option<LuaMemberOwner>,
@@ -3297,3 +3297,36 @@ fn member_ids_from_item(item: &LuaMemberIndexItem) -> Vec<LuaMemberId> {
         LuaMemberIndexItem::Many(ids) => ids.clone(),
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(LuaMemberIndex {
+    members,
+    source_members,
+    in_filed,
+    owner_members,
+    member_current_owner,
+    member_owner_key_index,
+    member_owner_key_history_index,
+    owner_key_index_owners_by_file,
+    current_owner_member_history,
+    current_members_by_key,
+    expr_key_members_by_file,
+    non_overwriting_assignment_members,
+    preserved_co_writer_reconciled,
+    homing_revision,
+    owner_only_members,
+    synthesized_owner_members,
+    deferred_index_expr_members,
+    function_scope_ranges,
+    member_function_scope_ranges,
+    definition_site_owner,
+    path_definition_sites,
+    definition_sites_by_file,
+    global_path_class_owner,
+    global_path_class_candidates,
+    path_class_holders,
+    derived_path_classes,
+    member_path_provenance,
+    owner_history_fingerprints,
+    key_fingerprints,
+    file_fingerprints,
+});

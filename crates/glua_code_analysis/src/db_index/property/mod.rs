@@ -23,7 +23,7 @@ use crate::{DbIndex, FileId, LuaDeclId, LuaMember, LuaSignatureId};
 use super::{LuaSemanticDeclId, traits::LuaIndex};
 
 /// An inferred string default from a self-coalescing `x = x or "literal"` pattern.
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, Hash, PartialEq)]
 pub struct LuaInferredStringDefault {
     /// The string value (e.g. "DScrollPanel").
     pub value: SmolStr,
@@ -731,3 +731,17 @@ mod tests {
         );
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(LuaPropertyIndex {
+    properties,
+    property_owners_map,
+    owners_by_property,
+    signature_owner_by_property,
+    sole_contributor,
+    contributions,
+    file_merge_order,
+    id_count,
+    in_filed_owner,
+    inferred_string_defaults,
+    inferred_string_defaults_file_owners,
+});

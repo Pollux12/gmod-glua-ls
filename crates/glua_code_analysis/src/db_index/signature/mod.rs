@@ -1322,3 +1322,28 @@ mod tests {
         assert!(index.payload_holders_by_source.is_empty());
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(LuaSignatureIndex {
+    signatures,
+    source_signatures,
+    in_file_signatures,
+    local_func_decls,
+    effective_valid_guard_signatures,
+    valid_guard_file_contributions,
+    valid_guard_files,
+    valid_guard_names,
+    valid_guard_name_counts,
+    inferred_positive_guards,
+    inferred_guard_owners,
+    inferred_guard_facts,
+    inferred_guard_owners_by_file,
+    inferred_guard_consumers,
+    inferred_guard_dependencies,
+    inferred_return_dependencies,
+    inferred_return_consumers,
+    payload_sources_by_holder,
+    payload_holders_by_source,
+    inferred_positive_guards_changed,
+    receiver_out_param_member_names,
+    in_file_receiver_out_param_member_names,
+});

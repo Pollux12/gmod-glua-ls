@@ -1244,3 +1244,19 @@ mod tests {
         assert_eq!(index.get_global_references("GLOBAL").unwrap().len(), 1);
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(LuaReferenceIndex {
+    file_references,
+    index_reference,
+    global_references,
+    string_references,
+    type_references,
+    local_reassignments,
+    file_revision,
+    next_revision,
+    file_fingerprints,
+    name_fingerprints,
+    derived_index_reference,
+    derived_file_fingerprints,
+    derived_index_reference_holders,
+});

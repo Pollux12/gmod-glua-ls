@@ -228,3 +228,11 @@ impl LuaIndex for LuaOperatorIndex {
         self.derived.clear();
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(LuaOperatorIndex {
+    operators,
+    type_operators_map,
+    in_filed_operator_map,
+    holders,
+    derived,
+});

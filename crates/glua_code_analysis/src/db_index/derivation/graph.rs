@@ -933,6 +933,15 @@ impl ReaderGraph {
         self.table = table;
     }
 
+    /// Marks `keys` written now: memos that read them no longer hold, and a
+    /// window opened on one later restores to this stamp, not an older one.
+    pub(crate) fn mark_written<'a>(&mut self, keys: impl IntoIterator<Item = &'a HashedKey>) {
+        let now = super::new_stamp();
+        for key in keys {
+            self.table.mark_written(key, now);
+        }
+    }
+
     /// Holds `keys` written until [`Self::release_held`]; see
     /// [`KeyTable::hold_window`].
     pub fn hold_windows<'a>(&mut self, keys: impl IntoIterator<Item = &'a HashedKey>) {
@@ -1028,6 +1037,32 @@ impl ReaderGraph {
             .iter()
             .map(|slot| self.key(*slot).clone())
             .collect()
+    }
+
+    /// Every derivation with a record, sorted.
+    pub(crate) fn recorded_derivations(&self) -> Vec<DerivationId> {
+        let mut ids = self
+            .deriv_slots
+            .iter()
+            .filter(|(_, deriv)| self.derivations[**deriv as usize].record.is_some())
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Has the next [`Self::derived_keys_to_check`] of each of `keys` check
+    /// its derived keys whatever the base's fingerprint.
+    pub(crate) fn uncheck_derived<'a>(&self, keys: impl IntoIterator<Item = &'a HashedKey>) {
+        for key in keys {
+            if let Some(derived) = self
+                .table
+                .find(key)
+                .and_then(|slot| self.table.derived.get(&slot))
+            {
+                derived.checked_at.store(UNCHECKED, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Forgets every cached fingerprint.

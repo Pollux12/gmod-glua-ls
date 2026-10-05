@@ -217,3 +217,5 @@ impl LuaIndex for LuaCallTargetIndex {
         self.files.clear();
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(LuaCallTargetIndex { files });

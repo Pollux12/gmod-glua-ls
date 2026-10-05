@@ -384,3 +384,10 @@ fn referenced_files(
     files.remove(&file_id);
     files
 }
+
+crate::db_index::cow_shards::task_fork_fields!(CallSiteParamIndex {
+    file_contributions,
+    contributors,
+    inferred_params,
+    referencing,
+});

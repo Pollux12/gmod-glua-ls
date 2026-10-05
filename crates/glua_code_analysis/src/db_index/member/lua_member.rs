@@ -8,7 +8,7 @@ use smol_str::SmolStr;
 use super::lua_member_feature::LuaMemberFeature;
 use crate::{DbIndex, FileId, GlobalId, InferFailReason, LuaInferCache, LuaType, infer_expr};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LuaMember {
     member_id: LuaMemberId,
     key: LuaMemberKey,

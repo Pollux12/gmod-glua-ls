@@ -738,3 +738,10 @@ abcdefgh",
         assert!(!index.execution_environment_contains(target, "simple"));
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(GmodLoadIndex {
+    file_infos,
+    unresolved_edges,
+    execution_environments,
+    execution_environment_sites,
+});

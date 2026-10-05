@@ -173,3 +173,9 @@ impl LuaIndex for LuaDeclIndex {
         self.derived_decl_ids.clear();
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(LuaDeclIndex {
+    decl_trees,
+    derived_decls,
+    derived_decl_ids,
+});

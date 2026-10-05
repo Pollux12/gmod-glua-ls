@@ -287,10 +287,6 @@ impl<K, V> CowShards<K, V> {
     }
 
     /// A copy that shares every shard and keeps its own writes in a dirty list.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "superstep tasks fork the index")
-    )]
     pub(crate) fn fork(&self) -> Self {
         Self {
             slots: self.slots.clone(),
@@ -299,19 +295,11 @@ impl<K, V> CowShards<K, V> {
         }
     }
 
-    /// Takes back the shards `fork` wrote. `fork` must come from
-    /// [`Self::fork`] on this map, with no write to the shards it touched since.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "superstep barriers install forks")
-    )]
-    pub(crate) fn install(&mut self, fork: Self) {
-        let Self { slots, dirty, .. } = fork;
-        drop(slots);
-        for (at, shard) in dirty {
-            let at = at as usize;
-            self.slots_mut(at)[at] = Some(shard);
-        }
+    /// The shard at `at` as it is held, behind its `Arc`.
+    fn held_shard(&self, at: usize) -> Option<&Arc<Shard<K, V>>> {
+        self.dirty
+            .get(&(at as u32))
+            .or_else(|| self.slots.get(at)?.as_ref())
     }
 
     /// The slot table, grown to hold `at` and owned by this map alone.
@@ -325,6 +313,92 @@ impl<K, V> CowShards<K, V> {
         }
         Arc::make_mut(&mut self.slots)
     }
+}
+
+impl<K: ShardKey + Clone, V: Clone + PartialEq> CowShards<K, V> {
+    /// The slots `fork`, a fork of `frozen`, may have changed: the shards it
+    /// wrote, or every slot when it was replaced or cleared whole.
+    fn forked_slots(frozen: &Self, fork: &Self) -> Vec<usize> {
+        if Arc::ptr_eq(&fork.slots, &frozen.slots) {
+            return fork.dirty.keys().map(|at| *at as usize).collect();
+        }
+        (0..frozen.end().max(fork.end())).collect()
+    }
+
+    /// Whether `self`, which held `frozen` when `fork` was forked from it,
+    /// changed since a key `fork` changed too, to another value.
+    pub(crate) fn conflicts(&self, frozen: &Self, fork: &Self) -> bool {
+        Self::forked_slots(frozen, fork).into_iter().any(|at| {
+            let was = frozen.held_shard(at);
+            let now = self.held_shard(at);
+            let forked = fork.held_shard(at);
+            !same_shard(was, forked)
+                && !same_shard(was, now)
+                && changed_entries(was, forked).any(|(key, value)| {
+                    let before = was.and_then(|was| was.get(key));
+                    let current = now.and_then(|now| now.get(key));
+                    current != before && current != value
+                })
+        })
+    }
+
+    /// Takes in what `fork`, a fork of `frozen`, changed: a shard nothing
+    /// else changed since is taken whole, any other key by key.
+    pub(crate) fn install(&mut self, frozen: &Self, fork: Self) {
+        for at in Self::forked_slots(frozen, &fork) {
+            let was = frozen.held_shard(at);
+            let forked = fork.held_shard(at);
+            if same_shard(was, forked) {
+                continue;
+            }
+            if same_shard(was, self.held_shard(at)) {
+                let forked = forked.cloned();
+                if self.forked {
+                    self.dirty.insert(at as u32, forked.unwrap_or_default());
+                } else {
+                    self.slots_mut(at)[at] = forked;
+                }
+                continue;
+            }
+            let changes = changed_entries(was, forked)
+                .map(|(key, value)| (key.clone(), value.cloned()))
+                .collect::<Vec<_>>();
+            let target = self.shard_mut(at);
+            for (key, value) in changes {
+                match value {
+                    Some(value) => target.insert(key, value),
+                    None => target.remove(&key),
+                };
+            }
+        }
+    }
+}
+
+fn same_shard<K, V>(a: Option<&Arc<Shard<K, V>>>, b: Option<&Arc<Shard<K, V>>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// The entries of `shard` that differ from `frozen`, with `None` for a key
+/// `shard` dropped.
+fn changed_entries<'a, K: Eq + Hash, V: PartialEq>(
+    frozen: Option<&'a Arc<Shard<K, V>>>,
+    shard: Option<&'a Arc<Shard<K, V>>>,
+) -> impl Iterator<Item = (&'a K, Option<&'a V>)> {
+    let changed = shard
+        .into_iter()
+        .flat_map(|shard| shard.iter())
+        .filter(move |(key, value)| frozen.and_then(|frozen| frozen.get(*key)) != Some(*value))
+        .map(|(key, value)| (key, Some(value)));
+    let dropped = frozen
+        .into_iter()
+        .flat_map(|frozen| frozen.keys())
+        .filter(move |key| !shard.is_some_and(|shard| shard.contains_key(*key)))
+        .map(|key| (key, None));
+    changed.chain(dropped)
 }
 
 impl<K: Clone, V: Clone> CowShards<K, V> {
@@ -587,6 +661,24 @@ impl<K: ShardKey + Clone> Extend<K> for CowShardSet<K> {
     }
 }
 
+impl<K: ShardKey + Clone> TaskFork for CowShardSet<K> {
+    fn task_fork(&self) -> Self {
+        Self(self.0.task_fork())
+    }
+
+    fn wrote(&self, frozen: &Self) -> bool {
+        self.0.wrote(&frozen.0)
+    }
+
+    fn conflicts(&self, frozen: &Self, fork: &Self) -> bool {
+        TaskFork::conflicts(&self.0, &frozen.0, &fork.0)
+    }
+
+    fn install_task(&mut self, frozen: &Self, fork: Self) {
+        self.0.install_task(&frozen.0, fork.0);
+    }
+}
+
 impl<'a, K> IntoIterator for &'a CowShardSet<K> {
     type Item = &'a K;
     type IntoIter = Box<dyn Iterator<Item = &'a K> + 'a>;
@@ -666,6 +758,174 @@ where
     }
 }
 
+/// Storage a superstep task forks: the task writes its fork apart from the
+/// index, and the barrier installs what it wrote.
+pub(crate) trait TaskFork: Sized {
+    /// A copy whose writes stay apart from `self`.
+    fn task_fork(&self) -> Self;
+
+    /// Whether this fork of `frozen` wrote anything.
+    fn wrote(&self, frozen: &Self) -> bool;
+
+    /// Whether `self`, which held `frozen` when `fork` was forked from it,
+    /// changed since a value `fork` changed too, to another value.
+    fn conflicts(&self, frozen: &Self, fork: &Self) -> bool;
+
+    /// Takes in what `fork` changed since `frozen`; `fork` does not conflict
+    /// with `self`.
+    fn install_task(&mut self, frozen: &Self, fork: Self);
+}
+
+impl<K: ShardKey + Clone, V: Clone + PartialEq> TaskFork for CowShards<K, V> {
+    fn task_fork(&self) -> Self {
+        self.fork()
+    }
+
+    fn wrote(&self, frozen: &Self) -> bool {
+        !self.dirty.is_empty() || !Arc::ptr_eq(&self.slots, &frozen.slots)
+    }
+
+    fn conflicts(&self, frozen: &Self, fork: &Self) -> bool {
+        CowShards::conflicts(self, frozen, fork)
+    }
+
+    fn install_task(&mut self, frozen: &Self, fork: Self) {
+        self.install(frozen, fork);
+    }
+}
+
+/// Installs a value a task replaces whole.
+fn install_whole<T>(current: &mut T, frozen: &T, fork: T, same: impl Fn(&T, &T) -> bool) {
+    if !same(&fork, frozen) {
+        *current = fork;
+    }
+}
+
+/// Whether two tasks replaced a whole value with different ones.
+fn conflicts_whole<T>(current: &T, frozen: &T, fork: &T, same: impl Fn(&T, &T) -> bool) -> bool {
+    !same(fork, frozen) && !same(current, frozen) && !same(current, fork)
+}
+
+impl<T: Clone> TaskFork for CowCell<T> {
+    fn task_fork(&self) -> Self {
+        self.clone()
+    }
+
+    fn wrote(&self, frozen: &Self) -> bool {
+        !Arc::ptr_eq(&self.0, &frozen.0)
+    }
+
+    fn conflicts(&self, frozen: &Self, fork: &Self) -> bool {
+        conflicts_whole(self, frozen, fork, |a, b| Arc::ptr_eq(&a.0, &b.0))
+    }
+
+    fn install_task(&mut self, frozen: &Self, fork: Self) {
+        install_whole(self, frozen, fork, |a, b| Arc::ptr_eq(&a.0, &b.0));
+    }
+}
+
+impl<T: ?Sized> TaskFork for Arc<T> {
+    fn task_fork(&self) -> Self {
+        Arc::clone(self)
+    }
+
+    fn wrote(&self, frozen: &Self) -> bool {
+        !Arc::ptr_eq(self, frozen)
+    }
+
+    fn conflicts(&self, frozen: &Self, fork: &Self) -> bool {
+        conflicts_whole(self, frozen, fork, Arc::ptr_eq)
+    }
+
+    fn install_task(&mut self, frozen: &Self, fork: Self) {
+        install_whole(self, frozen, fork, Arc::ptr_eq);
+    }
+}
+
+/// A cache a task may fill: the index keeps its own, which its owner clears
+/// when what it caches moves.
+impl<T> TaskFork for std::sync::OnceLock<Arc<T>> {
+    fn task_fork(&self) -> Self {
+        self.clone()
+    }
+
+    fn wrote(&self, _frozen: &Self) -> bool {
+        false
+    }
+
+    fn conflicts(&self, _frozen: &Self, _fork: &Self) -> bool {
+        false
+    }
+
+    fn install_task(&mut self, _frozen: &Self, _fork: Self) {}
+}
+
+macro_rules! task_fork_scalars {
+    ($($ty:ty),* $(,)?) => {
+        $(impl TaskFork for $ty {
+            fn task_fork(&self) -> Self {
+                *self
+            }
+
+            fn wrote(&self, frozen: &Self) -> bool {
+                self != frozen
+            }
+
+            fn conflicts(&self, frozen: &Self, fork: &Self) -> bool {
+                conflicts_whole(self, frozen, fork, |a, b| a == b)
+            }
+
+            fn install_task(&mut self, frozen: &Self, fork: Self) {
+                install_whole(self, frozen, fork, |a, b| a == b);
+            }
+        })*
+    };
+}
+
+task_fork_scalars!(u32, u64, usize, bool, crate::db_index::ModuleNodeId);
+
+/// Forks and installs an index field by field. Every field is listed, so a
+/// new field has to say how a task forks it; `then` runs after an install.
+macro_rules! task_fork_fields {
+    ($ty:ty { $($(#[$attr:meta])* $field:ident),* $(,)? } $(then $after:ident)?) => {
+        impl $crate::db_index::cow_shards::TaskFork for $ty {
+            fn task_fork(&self) -> Self {
+                Self {
+                    $($(#[$attr])* $field: $crate::db_index::cow_shards::TaskFork::task_fork(&self.$field),)*
+                }
+            }
+
+            fn wrote(&self, frozen: &Self) -> bool {
+                $($(#[$attr])* if $crate::db_index::cow_shards::TaskFork::wrote(&self.$field, &frozen.$field) {
+                    return true;
+                })*
+                false
+            }
+
+            fn conflicts(&self, frozen: &Self, fork: &Self) -> bool {
+                self.task_conflict(frozen, fork).is_some()
+            }
+
+            fn install_task(&mut self, frozen: &Self, fork: Self) {
+                let Self { $($(#[$attr])* $field),* } = fork;
+                $($(#[$attr])* $crate::db_index::cow_shards::TaskFork::install_task(&mut self.$field, &frozen.$field, $field);)*
+                $(self.$after();)?
+            }
+        }
+
+        impl $ty {
+            /// The first field `self` changed that `fork` changed too.
+            pub(crate) fn task_conflict(&self, frozen: &Self, fork: &Self) -> Option<&'static str> {
+                $($(#[$attr])* if $crate::db_index::cow_shards::TaskFork::conflicts(&self.$field, &frozen.$field, &fork.$field) {
+                    return Some(concat!(stringify!($ty), ".", stringify!($field)));
+                })*
+                None
+            }
+        }
+    };
+}
+pub(crate) use task_fork_fields;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,6 +960,7 @@ mod tests {
         base.insert(owner(1, 0), 10);
         base.insert(owner(2, 0), 20);
 
+        let frozen = base.clone();
         let mut fork = base.fork();
         fork.insert(owner(1, 4), 14);
         *fork.get_mut(&owner(2, 0)).unwrap() = 21;
@@ -722,7 +983,7 @@ mod tests {
             (Some(&14), Some(&21), Some(&90))
         );
 
-        base.install(fork);
+        base.install(&frozen, fork);
         assert_eq!(
             (
                 base.get(&owner(1, 4)),
@@ -731,6 +992,54 @@ mod tests {
             ),
             (Some(&14), Some(&21), Some(&90))
         );
+    }
+
+    #[test]
+    fn a_map_a_fork_replaces_whole_is_installed_whole() {
+        let mut base: CowShards<LuaTypeOwner, u32> = CowShards::default();
+        base.insert(owner(1, 0), 10);
+        base.insert(owner(2, 0), 20);
+        let frozen = base.clone();
+        let fork: CowShards<LuaTypeOwner, u32> = [(owner(3, 0), 30)].into_iter().collect();
+
+        assert!(TaskFork::wrote(&fork, &frozen));
+        base.install(&frozen, fork);
+        assert_eq!(sorted(&base), rendered(vec![(owner(3, 0), 30)]));
+    }
+
+    #[test]
+    fn forks_writing_other_keys_of_one_page_both_land() {
+        let mut base: CowShards<LuaMemberKey, u32> = CowShards::default();
+        let frozen = base.clone();
+        let mut first = frozen.fork();
+        first.insert(path_key("a"), 1);
+        let mut second = frozen.fork();
+        second.insert(path_key("b"), 2);
+
+        base.install(&frozen, first);
+        assert!(!base.conflicts(&frozen, &second));
+        base.install(&frozen, second);
+        assert_eq!(
+            sorted(&base),
+            rendered(vec![(path_key("a"), 1), (path_key("b"), 2)])
+        );
+    }
+
+    #[test]
+    fn forks_writing_one_key_apart_conflict_unless_they_agree() {
+        let mut base: CowShards<LuaMemberKey, u32> = CowShards::default();
+        base.insert(path_key("a"), 0);
+        let frozen = base.clone();
+        let mut first = frozen.fork();
+        first.insert(path_key("a"), 1);
+        let mut agreeing = frozen.fork();
+        agreeing.insert(path_key("a"), 1);
+        let mut other = frozen.fork();
+        other.insert(path_key("a"), 2);
+
+        base.install(&frozen, first);
+        assert!(!base.conflicts(&frozen, &agreeing));
+        assert!(base.conflicts(&frozen, &other));
     }
 
     #[test]

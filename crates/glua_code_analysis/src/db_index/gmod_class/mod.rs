@@ -1389,3 +1389,13 @@ mod tests {
         assert_eq!(index.get_vgui_registrations(&file).count(), 1);
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(GmodClassMetadataIndex {
+    file_metadata,
+    vgui_parent_call_files,
+    vgui_panels,
+    derma_skins,
+    vgui_panel_parent_chains,
+    incomplete_vgui_panel_parent_chains,
+    meta_fingerprints,
+});

@@ -1211,3 +1211,16 @@ fn normalize_system_name(name: Option<&str>) -> Option<&str> {
         Some(trimmed)
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(GmodInferIndex {
+    hook_file_metadata,
+    system_file_metadata,
+    system_aggregate_cache,
+    realm_file_metadata,
+    realm_inputs,
+    gm_method_realm_annotations,
+    member_realm_ranges,
+    fileparam_index,
+    scoped_class_info,
+    scan_fingerprint,
+} then invalidate_system_aggregate_cache);

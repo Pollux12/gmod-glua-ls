@@ -532,3 +532,9 @@ mod tests {
         assert!(scoped_a.contains(&decl_b));
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(LuaGlobalIndex {
+    global_decl,
+    file_order,
+    scan_fingerprint,
+});

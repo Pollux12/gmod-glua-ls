@@ -167,3 +167,10 @@ impl LuaIndex for DiagnosticIndex {
         self.file_diagnostic_enabled.clear();
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(DiagnosticIndex {
+    diagnostic_actions,
+    diagnostics,
+    file_diagnostic_disabled,
+    file_diagnostic_enabled,
+});

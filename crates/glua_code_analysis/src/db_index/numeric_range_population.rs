@@ -10,7 +10,7 @@ use crate::{
     db_index::derivation::{self, FactKey, Fingerprint},
 };
 
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, Hash, PartialEq)]
 pub struct TableNumericRangePopulation {
     pub table_global: String,
     pub start: i64,
@@ -124,3 +124,5 @@ impl NumericRangePopulationIndex {
         self.by_global.clear();
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(NumericRangePopulationIndex { by_file, by_global });

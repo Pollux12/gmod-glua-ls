@@ -28,6 +28,17 @@ pub struct LuaOwnerMembers {
     fingerprint: Fingerprint,
 }
 
+/// Two owners' members are equal when they list the same members, whatever
+/// each has cached of them.
+impl PartialEq for LuaOwnerMembers {
+    fn eq(&self, other: &Self) -> bool {
+        self.fingerprint == other.fingerprint
+            && self.resolve_state == other.resolve_state
+            && self.expr_keys == other.expr_keys
+            && self.members == other.members
+    }
+}
+
 fn listed_id_fingerprint(key: &LuaMemberKey, id: LuaMemberId) -> Fingerprint {
     fingerprint_of(&(key, id))
 }

@@ -123,7 +123,7 @@ impl LuaIndex for AccessorFuncAnnotationIndex {
     }
 }
 
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, Hash, PartialEq)]
 pub struct AccessorFuncCallMetadata {
     pub syntax_id: LuaSyntaxId,
     pub owner_type_id: LuaTypeDeclId,
@@ -191,3 +191,7 @@ impl LuaIndex for AccessorFuncCallIndex {
         self.calls.clear();
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(AccessorFuncAnnotationIndex { by_name, by_file });
+
+crate::db_index::cow_shards::task_fork_fields!(AccessorFuncCallIndex { calls });

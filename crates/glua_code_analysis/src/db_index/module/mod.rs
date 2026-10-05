@@ -1455,3 +1455,20 @@ impl LuaIndex for LuaModuleIndex {
         self.module_nodes.insert(self.module_root_id, root_node);
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(LuaModuleIndex {
+    module_patterns,
+    module_root_id,
+    module_nodes,
+    file_module_map,
+    module_files,
+    file_module_paths,
+    module_name_to_file_ids,
+    legacy_module_envs,
+    workspaces,
+    workspace_kind_map,
+    id_counter,
+    fuzzy_search,
+    module_replace_vec,
+    workspace_isolation_enabled,
+});

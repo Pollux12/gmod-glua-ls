@@ -385,6 +385,10 @@ pub(crate) struct Engine {
     /// Under `GLUALS_SUPERSTEP`, the file whose superstep task is running:
     /// its batches take no other file's work.
     task: Option<crate::FileId>,
+    /// Under `GLUALS_SUPERSTEP`, every key the superstep's tasks touched, and
+    /// those the running task touched.
+    superstep_touched: Option<FxHashSet<HashedKey>>,
+    task_touched: FxHashSet<HashedKey>,
 }
 
 /// A fact that moved under a statement: what the statement had seen of it,
@@ -891,7 +895,29 @@ impl Engine {
         }
         self.cursor = None;
         crate::profile::phase("engine: rebase moved reads", || self.rebase_moved_reads(db));
+        if check_settled() {
+            self.report_unsettled(db);
+        }
         true
+    }
+
+    /// Under `GLUALS_CHECK_SETTLED`, prints every derivation a settled run
+    /// left with a read that no longer holds: a reader the run failed to
+    /// queue.
+    fn report_unsettled(&mut self, db: &mut DbIndex) {
+        db.reader_graph_mut().forget_fingerprints();
+        for id in db.reader_graph().recorded_derivations() {
+            if matches!(
+                id.kind,
+                DerivationKind::Source | DerivationKind::Diagnostics
+            ) {
+                continue;
+            }
+            let moved = self.moved_reads(db, id);
+            if !moved.is_empty() {
+                eprintln!("[unsettled] {id:?} moved={moved:?}");
+            }
+        }
     }
 
     /// Files the queries filed since the last call and queues the readers of
@@ -904,9 +930,14 @@ impl Engine {
     }
 
     /// Under `GLUALS_SUPERSTEP`: evaluates every entry queued at the first
-    /// rank, one file at a time, each file's to quiescence. Work an
-    /// evaluation queues for another file at the same rank waits for the next
-    /// superstep; workspace derivations run after the files.
+    /// rank, one file at a time, each file's to quiescence on its own fork
+    /// of the index as the superstep found it. Work an evaluation queues for
+    /// another file at the same rank waits for the next superstep. The
+    /// barrier installs each fork in file order; a task that changed a value
+    /// an earlier task changed too runs again on the index itself, with every
+    /// earlier task that touched what it did. Readers of what the tasks
+    /// touched are then checked against what was installed, and workspace
+    /// derivations run last.
     fn superstep(&mut self, db: &mut DbIndex, recipe: &dyn Recipe, slice: Slice) {
         let Some(rank) = self.worklist.first_rank() else {
             return;
@@ -919,32 +950,112 @@ impl Engine {
             .collect::<Vec<_>>();
         self.stats.supersteps += 1;
         self.stats.superstep_tasks += tasks.len();
+        let frozen = db.superstep_base();
+        self.superstep_touched = Some(FxHashSet::default());
+        let mut workspace = Vec::new();
+        // Each task installed so far: its file, what it ran and what it touched.
+        let mut installed: Vec<(crate::FileId, Vec<DerivationId>, FxHashSet<HashedKey>)> =
+            Vec::new();
         for (file_id, entries) in tasks {
             if file_id == crate::FileId::VIRTUAL {
-                for (id, reason) in entries {
-                    self.file_queries(db);
-                    self.step(db, recipe, slice, id, reason);
-                }
+                workspace = entries;
                 continue;
             }
             let deferred = self.worklist.take_file_at(rank, file_id);
-            let mut local = Queue::new(self.worklist.schedule);
-            for (id, reason) in entries {
-                local.insert(id, reason);
-            }
-            self.task = Some(file_id);
-            while let Some((id, reason)) = local.pop_first() {
-                self.file_queries(db);
-                self.step(db, recipe, slice, id, reason);
-                for (id, reason) in self.worklist.take_file_at(rank, file_id) {
-                    local.insert(id, reason);
+            let mut fork = frozen.task_fork();
+            db.swap_engine_state(&mut fork);
+            self.forget_view(&mut fork);
+            let ran = self.run_task(&mut fork, recipe, slice, rank, file_id, entries);
+            db.swap_engine_state(&mut fork);
+            let touched = self.take_task_touched();
+            let conflict = db.task_conflict(&frozen, &fork);
+            db.install_task(&frozen, fork);
+            match conflict {
+                None => installed.push((file_id, ran, touched)),
+                Some(field) => {
+                    *self.stats.task_conflicts.entry(field).or_default() += 1;
+                    // Installed over an earlier task's change, a value lacks
+                    // what that task wrote: every task that touched what this
+                    // one did runs again on the index, in file order, each
+                    // after the writes of the others.
+                    let mut again = installed
+                        .extract_if(.., |(_, _, earlier)| !earlier.is_disjoint(&touched))
+                        .collect::<Vec<_>>();
+                    again.push((file_id, ran, touched));
+                    self.forget_view(db);
+                    for (file_id, ran, _) in again {
+                        let entries = ran.into_iter().map(|id| (id, Reason::Changed)).collect();
+                        let ran = self.run_task(db, recipe, slice, rank, file_id, entries);
+                        let touched = self.take_task_touched();
+                        installed.push((file_id, ran, touched));
+                    }
                 }
             }
-            self.task = None;
             for (id, reason) in deferred {
                 self.worklist.insert(id, reason);
             }
         }
+        drop(frozen);
+        self.forget_view(db);
+        let touched = self.superstep_touched.take().unwrap_or_default();
+        db.reader_graph().uncheck_derived(&touched);
+        self.readers_of(db, touched.iter());
+        for (id, reason) in workspace {
+            self.file_queries(db);
+            self.step(db, recipe, slice, id, reason);
+        }
+    }
+
+    /// Takes what the task that just ran touched, adding it to what the
+    /// superstep touched.
+    fn take_task_touched(&mut self) -> FxHashSet<HashedKey> {
+        let touched = std::mem::take(&mut self.task_touched);
+        if let Some(superstep) = &mut self.superstep_touched {
+            superstep.extend(touched.iter().cloned());
+        }
+        touched
+    }
+
+    /// Forgets what was taken of another view of the index than `db`'s:
+    /// cached fingerprints and inference, and memos that read a key a task of
+    /// the superstep touched, which this view may hold apart.
+    fn forget_view(&mut self, db: &mut DbIndex) {
+        let graph = db.reader_graph_mut();
+        graph.forget_fingerprints();
+        if let Some(touched) = &self.superstep_touched {
+            graph.mark_written(touched);
+        }
+        derivation::advance_write_generation();
+        self.before_edits.get_mut().clear();
+    }
+
+    /// Evaluates `entries` of `file_id` and what they queue in the file at
+    /// `rank`, to quiescence. Returns every derivation it took.
+    fn run_task(
+        &mut self,
+        db: &mut DbIndex,
+        recipe: &dyn Recipe,
+        slice: Slice,
+        rank: u8,
+        file_id: crate::FileId,
+        entries: Vec<(DerivationId, Reason)>,
+    ) -> Vec<DerivationId> {
+        let mut local = Queue::new(self.worklist.schedule);
+        for (id, reason) in entries {
+            local.insert(id, reason);
+        }
+        let mut ran = Vec::new();
+        self.task = Some(file_id);
+        while let Some((id, reason)) = local.pop_first() {
+            ran.push(id);
+            self.file_queries(db);
+            self.step(db, recipe, slice, id, reason);
+            for (id, reason) in self.worklist.take_file_at(rank, file_id) {
+                local.insert(id, reason);
+            }
+        }
+        self.task = None;
+        ran
     }
 
     /// Evaluates the queued `id` if it is due and stale: the work of one pop of
@@ -1064,6 +1175,9 @@ impl Engine {
             self.worklist.insert(id, Reason::Changed);
         }
         self.queue_reruns();
+        if self.superstep_touched.is_some() {
+            self.task_touched.extend(touched.iter().cloned());
+        }
         crate::profile::phase("engine: readers of", || self.readers_of(db, touched.iter()));
         // A statement of a rebuilt file settled, before the run, on what
         // the removed derivations wrote.
@@ -2055,6 +2169,8 @@ pub(crate) struct EngineStats {
     /// Under `GLUALS_SUPERSTEP`: supersteps run, and file tasks across them.
     supersteps: usize,
     superstep_tasks: usize,
+    /// Tasks run again on the index, by the first value they conflicted on.
+    task_conflicts: BTreeMap<&'static str, usize>,
     /// Loops of statements cleared, and the derivations they ran again.
     pub(crate) loops_cleared: usize,
     pub(crate) loop_members_cleared: usize,
@@ -2257,8 +2373,8 @@ impl EngineStats {
         );
         if self.supersteps > 0 {
             eprintln!(
-                "[engine] supersteps={} tasks={}",
-                self.supersteps, self.superstep_tasks
+                "[engine] supersteps={} tasks={} conflicts={:?}",
+                self.supersteps, self.superstep_tasks, self.task_conflicts
             );
         }
         let mut distinct = BTreeMap::<DerivationKind, usize>::new();
@@ -2579,6 +2695,11 @@ thread_local! {
 fn supersteps() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("GLUALS_SUPERSTEP").is_some())
+}
+
+fn check_settled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("GLUALS_CHECK_SETTLED").is_some())
 }
 
 fn check_convergence() -> bool {

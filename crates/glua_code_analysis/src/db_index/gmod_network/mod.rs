@@ -986,3 +986,15 @@ mod tests {
         assert_eq!(flows.len(), 2);
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(GmodNetworkIndex {
+    file_data,
+    send_flows_by_message,
+    receive_flows_by_message,
+    materialized_definition_counts,
+    referencing,
+    canonical_ops,
+    helper_names,
+    flows_fingerprint,
+    canonical_ops_fingerprint,
+});

@@ -972,3 +972,11 @@ mod tests {
         );
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(LuaFlowIndex {
+    file_flow_tree,
+    flow_tree_fingerprints,
+    special_call_effects,
+    settled_special_call_facts,
+    special_call_fact_fingerprints,
+});

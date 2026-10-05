@@ -63,6 +63,13 @@ pub trait DerivedFact: std::any::Any + Send + Sync {
 
 /// The workspace call roles and net-helper registry: the folds read it whole,
 /// a per-file pass entry by entry, as [`FactKey::CallRole`].
+/// Two stored facts are the same when they are one allocation.
+impl PartialEq for dyn DerivedFact {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::addr_eq(self, other)
+    }
+}
+
 pub trait CallRoles: DerivedFact {
     /// Every entry.
     fn entries(&self) -> Vec<CallRoleKey>;
@@ -478,6 +485,25 @@ pub fn fingerprint_of<T: std::hash::Hash + ?Sized>(value: &T) -> Fingerprint {
 /// come and go so reading it costs nothing however large the set grows.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SetFingerprint(Fingerprint);
+
+/// Tasks fold members in and out apart, so their changes add up.
+impl crate::db_index::cow_shards::TaskFork for SetFingerprint {
+    fn task_fork(&self) -> Self {
+        *self
+    }
+
+    fn wrote(&self, frozen: &Self) -> bool {
+        self.0 != frozen.0
+    }
+
+    fn conflicts(&self, _frozen: &Self, _fork: &Self) -> bool {
+        false
+    }
+
+    fn install_task(&mut self, frozen: &Self, fork: Self) {
+        self.0 = self.0.wrapping_add(fork.0.wrapping_sub(frozen.0));
+    }
+}
 
 impl SetFingerprint {
     pub fn insert<T: std::hash::Hash + ?Sized>(&mut self, member: &T) {
@@ -1379,6 +1405,12 @@ pub fn write_generation() -> u64 {
     WRITE_GENERATION.with(std::cell::Cell::get)
 }
 
+/// Advances the write generation for a change of the index made outside an
+/// evaluation, such as a switch to another view of it.
+pub(crate) fn advance_write_generation() {
+    WRITE_GENERATION.with(|generation| generation.set(generation.get() + 1));
+}
+
 /// Runs `f` without recording its reads. For an index's own bookkeeping: a
 /// lookup that only decides where a write is stored, when the index keeps
 /// that placement consistent itself whatever the order of writes.
@@ -2077,6 +2109,14 @@ impl Clone for FactRead {
         Self(std::sync::atomic::AtomicU32::new(
             self.0.load(std::sync::atomic::Ordering::Relaxed),
         ))
+    }
+}
+
+/// A read handle only caches where its key sits, so it never tells two
+/// values apart.
+impl PartialEq for FactRead {
+    fn eq(&self, _other: &Self) -> bool {
+        true
     }
 }
 

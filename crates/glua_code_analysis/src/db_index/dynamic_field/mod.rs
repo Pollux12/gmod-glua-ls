@@ -2162,3 +2162,17 @@ mod tests {
         ));
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(DynamicFieldIndex {
+    owner_fields,
+    field_definitions,
+    direct_field_definitions,
+    finite_named_members,
+    file_contributions,
+    finite_named_file_contributions,
+    wildcard_definitions,
+    wildcard_file_contributions,
+    unattributed_fields,
+    unattributed_file_contributions,
+    owner_named_fingerprints,
+});

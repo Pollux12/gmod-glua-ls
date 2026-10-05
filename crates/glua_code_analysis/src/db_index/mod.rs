@@ -1273,6 +1273,208 @@ impl DbIndex {
             ..self.fork()
         }
     }
+
+    /// The index as a superstep starts, which its tasks fork: it shares every
+    /// domain with `self` but holds no reader graph or queries, which the
+    /// tasks borrow from `self` in turn.
+    pub(crate) fn superstep_base(&self) -> Self {
+        Self {
+            derivations: Arc::default(),
+            queries: query::Queries::default(),
+            ..self.fork()
+        }
+    }
+
+    /// A fork of the superstep base for one task: it writes its own copies of
+    /// the shards and values it changes, for [`Self::install_task`].
+    pub(crate) fn task_fork(&self) -> Self {
+        macro_rules! fork {
+            ($($domain:ident),*; $($field:ident),*) => {
+                Self {
+                    $($domain: Arc::new(cow_shards::TaskFork::task_fork(&*self.$domain)),)*
+                    $($field: cow_shards::TaskFork::task_fork(&self.$field),)*
+                    vfs: Arc::clone(&self.vfs),
+                    emmyrc: Arc::clone(&self.emmyrc),
+                    derivations: Arc::clone(&self.derivations),
+                    gmod_call_roles: self.gmod_call_roles.clone(),
+                    type_structure_revision: self.type_structure_revision,
+                    analysis_stage: self.analysis_stage,
+                    queries: query::Queries::default(),
+                }
+            };
+        }
+        fork!(
+            decl_index,
+            references_index,
+            types_index,
+            modules_index,
+            members_index,
+            property_index,
+            signature_index,
+            diagnostic_index,
+            operator_index,
+            flow_index,
+            call_target_index,
+            accessor_func_index,
+            accessor_func_call_index,
+            call_site_param_index,
+            gmod_class_index,
+            gmod_infer_index,
+            gmod_load_index,
+            gmod_network_index,
+            dynamic_field_index,
+            file_dependencies_index,
+            numeric_range_population_index,
+            metatable_index,
+            global_index,
+            json_schema_index;
+            call_role_fingerprints,
+            role_mentions,
+            helper_scans,
+            helper_scan_files,
+            load_scans,
+            load_scan_files,
+            net_helpers,
+            net_helper_refs,
+            function_summaries
+        )
+    }
+
+    /// Swaps the reader graph and queries with `task`'s: lent to a task
+    /// before it runs, and taken back after.
+    pub(crate) fn swap_engine_state(&mut self, task: &mut Self) {
+        std::mem::swap(&mut self.derivations, &mut task.derivations);
+        std::mem::swap(&mut self.queries, &mut task.queries);
+    }
+
+    /// The first index state `self` changed since `frozen` that `fork`, a
+    /// task fork of `frozen`, changed too, to another value.
+    pub(crate) fn task_conflict(&self, frozen: &Self, fork: &Self) -> Option<&'static str> {
+        macro_rules! conflict {
+            ($($domain:ident),*; $($field:ident),*) => {
+                $(if !Arc::ptr_eq(&self.$domain, &frozen.$domain)
+                    && cow_shards::TaskFork::wrote(&*fork.$domain, &frozen.$domain)
+                    && let Some(field) = self.$domain.task_conflict(&frozen.$domain, &fork.$domain)
+                {
+                    return Some(field);
+                })*
+                $(if cow_shards::TaskFork::conflicts(&self.$field, &frozen.$field, &fork.$field) {
+                    return Some(concat!("DbIndex.", stringify!($field)));
+                })*
+            };
+        }
+        conflict!(
+            decl_index,
+            references_index,
+            types_index,
+            modules_index,
+            members_index,
+            property_index,
+            signature_index,
+            diagnostic_index,
+            operator_index,
+            flow_index,
+            call_target_index,
+            accessor_func_index,
+            accessor_func_call_index,
+            call_site_param_index,
+            gmod_class_index,
+            gmod_infer_index,
+            gmod_load_index,
+            gmod_network_index,
+            dynamic_field_index,
+            file_dependencies_index,
+            numeric_range_population_index,
+            metatable_index,
+            global_index,
+            json_schema_index;
+            call_role_fingerprints,
+            role_mentions,
+            helper_scans,
+            helper_scan_files,
+            load_scans,
+            load_scan_files,
+            net_helpers,
+            net_helper_refs,
+            function_summaries
+        );
+        let roles = |index: &Self| {
+            index
+                .gmod_call_roles
+                .as_ref()
+                .map(|(_, fingerprint)| *fingerprint)
+        };
+        let (now, was, forked) = (roles(self), roles(frozen), roles(fork));
+        (forked != was && now != was && now != forked).then_some("DbIndex.gmod_call_roles")
+    }
+
+    /// Takes in what `fork`, a task fork of `frozen`, changed; it must not
+    /// conflict with `self`.
+    pub(crate) fn install_task(&mut self, frozen: &Self, fork: Self) {
+        debug_assert!(
+            Arc::ptr_eq(&fork.vfs, &frozen.vfs) && Arc::ptr_eq(&fork.emmyrc, &frozen.emmyrc)
+        );
+        debug_assert_eq!(fork.analysis_stage, frozen.analysis_stage);
+        let roles = |index: &Self| {
+            index
+                .gmod_call_roles
+                .as_ref()
+                .map(|(_, fingerprint)| *fingerprint)
+        };
+        if roles(&fork) != roles(frozen) {
+            self.gmod_call_roles = fork.gmod_call_roles.clone();
+        }
+        if fork.type_structure_revision != frozen.type_structure_revision {
+            self.type_structure_revision = next_type_structure_revision();
+        }
+        macro_rules! install {
+            ($($domain:ident),*; $($field:ident),*) => {
+                $(if cow_shards::TaskFork::wrote(&*fork.$domain, &frozen.$domain) {
+                    cow_shards::TaskFork::install_task(
+                        Arc::make_mut(&mut self.$domain),
+                        &frozen.$domain,
+                        Arc::unwrap_or_clone(fork.$domain),
+                    );
+                })*
+                $(cow_shards::TaskFork::install_task(&mut self.$field, &frozen.$field, fork.$field);)*
+            };
+        }
+        install!(
+            decl_index,
+            references_index,
+            types_index,
+            modules_index,
+            members_index,
+            property_index,
+            signature_index,
+            diagnostic_index,
+            operator_index,
+            flow_index,
+            call_target_index,
+            accessor_func_index,
+            accessor_func_call_index,
+            call_site_param_index,
+            gmod_class_index,
+            gmod_infer_index,
+            gmod_load_index,
+            gmod_network_index,
+            dynamic_field_index,
+            file_dependencies_index,
+            numeric_range_population_index,
+            metatable_index,
+            global_index,
+            json_schema_index;
+            call_role_fingerprints,
+            role_mentions,
+            helper_scans,
+            helper_scan_files,
+            load_scans,
+            load_scan_files,
+            net_helpers,
+            net_helper_refs,
+            function_summaries
+        );
+    }
 }
 
 impl LuaIndex for DbIndex {

@@ -1255,7 +1255,7 @@ fn collect_type_cache_refs(typ: &LuaType) -> HashSet<TypeCacheRef> {
     refs
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct TypeFact {
     cache: LuaTypeCache,
     read: derivation::FactRead,
@@ -1414,7 +1414,7 @@ fn union_flags(holders: &[(Holder, FlagSet<LuaTypeFlag>)]) -> FlagSet<LuaTypeFla
 }
 
 /// A type-index entry a derivation added on top of the source layer.
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, Hash, PartialEq)]
 enum TypeContribution {
     Location {
         decl_id: LuaTypeDeclId,
@@ -4768,3 +4768,48 @@ mod remap_walker_tests {
         );
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(LuaTypeIndex {
+    file_namespace,
+    file_using_namespace,
+    file_types,
+    declaration_sites,
+    full_name_type_map,
+    generic_params,
+    alias_sources,
+    extra_sources,
+    supers,
+    supers_by_file,
+    sub_types,
+    decl_type_binds,
+    type_bound_decls,
+    table_literal_decls,
+    types,
+    cache_refs,
+    in_filed_type_owner,
+    fact_metadata,
+    fact_ref_files,
+    fact_refs_by_file,
+    definition_fact_ref_files,
+    definition_fact_refs_by_file,
+    decl_write_claims,
+    definition_facts,
+    inference_events_by_file,
+    support_dependents,
+    support_file_dependents,
+    derived_state_dirty,
+    decl_scan_fingerprint,
+    source_types,
+    source_decl_locations,
+    derived_contributions,
+    location_holders,
+    super_holders,
+    table_classes,
+    fallbacks,
+});
+
+crate::db_index::cow_shards::task_fork_fields!(TypeCacheRefIndex {
+    owner_refs,
+    ref_owners,
+    refs_by_file,
+});

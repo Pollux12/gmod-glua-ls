@@ -707,3 +707,16 @@ mod tests {
         );
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(LuaDependencyIndex {
+    dependencies,
+    dependency_kinds,
+    dependency_callers_by_target,
+    dependency_sites,
+    resolved_sites_by_target,
+    unresolved_dependents_by_path_key,
+    unresolved_by_removal,
+    derived_sites,
+    #[cfg(test)]
+    target_transition_site_visits,
+});
