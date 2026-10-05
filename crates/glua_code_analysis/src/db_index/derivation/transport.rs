@@ -52,7 +52,9 @@ pub(crate) struct WorkerKeys {
     entries: Vec<WorkerKey>,
     new_keys: Vec<HashedKey>,
     known: FxHashMap<KeyIdx, u32>,
-    new_lookup: HashTable<u32>,
+    /// Every entry by its key's hash, as `hashes` holds them.
+    lookup: HashTable<u32>,
+    hashes: Vec<u64>,
     visitation: Vec<u64>,
     flags: Vec<u8>,
     /// The stamp each entry was last written at here (0: not written here,
@@ -91,6 +93,10 @@ impl WorkerKeys {
         let flags = u8::from(self.snapshot_taints(local, snapshot)) | (u8::from(query) << 1);
         self.flags.push(flags);
         let key = self.key(local, snapshot).clone();
+        self.hashes.push(key.hash);
+        let hashes = &self.hashes;
+        self.lookup
+            .insert_unique(key.hash, local, |local| hashes[*local as usize]);
         if let Some(children) = self.awaiting_base.remove(&key) {
             self.derived.entry(local).or_default().extend(children);
         }
@@ -120,44 +126,21 @@ impl WorkerKeys {
     }
 
     fn intern(&mut self, key: HashedKey, snapshot: &ReaderGraph) -> u32 {
+        if let Some(local) = self.find(&key, snapshot) {
+            return local;
+        }
         if let Some(slot) = snapshot.find_slot(&key) {
             return self.known(slot, snapshot);
         }
-        if let Some(local) = self.new_lookup.find(key.hash, |local| {
-            let WorkerKey::New(index) = self.entries[*local as usize] else {
-                unreachable!()
-            };
-            self.new_keys[index as usize] == key
-        }) {
-            return *local;
-        }
         let index = u32::try_from(self.new_keys.len()).expect("fewer than 2^32 fact keys");
-        let hash = key.hash;
         self.new_keys.push(key);
-        let local = self.push(WorkerKey::New(index), snapshot);
-        let entries = &self.entries;
-        let new_keys = &self.new_keys;
-        self.new_lookup.insert_unique(hash, local, |local| {
-            let WorkerKey::New(index) = entries[*local as usize] else {
-                unreachable!()
-            };
-            new_keys[index as usize].hash
-        });
-        local
+        self.push(WorkerKey::New(index), snapshot)
     }
 
     /// The entry `key` has here, without adding one.
     fn find(&self, key: &HashedKey, snapshot: &ReaderGraph) -> Option<u32> {
-        if let Some(slot) = snapshot.find_slot(key) {
-            return self.known.get(&slot).copied();
-        }
-        self.new_lookup
-            .find(key.hash, |local| {
-                let WorkerKey::New(index) = self.entries[*local as usize] else {
-                    unreachable!()
-                };
-                self.new_keys[index as usize] == *key
-            })
+        self.lookup
+            .find(key.hash, |local| self.key(*local, snapshot) == key)
             .copied()
     }
 
@@ -166,16 +149,18 @@ impl WorkerKeys {
     /// Its derived keys the snapshot has slots for get entries too, so they
     /// are marked with it.
     fn written_entry(&mut self, key: &HashedKey, snapshot: &ReaderGraph) -> Option<u32> {
-        let local = match snapshot.find_slot(key) {
-            Some(slot) => {
-                let local = self.known(slot, snapshot);
-                for derived in snapshot.keys().derived_slots(slot) {
-                    self.known(*derived, snapshot);
-                }
-                local
-            }
-            None => self.find(key, snapshot)?,
+        let slot = match self.find(key, snapshot) {
+            Some(local) => match self.entries[local as usize] {
+                WorkerKey::Known(slot) => Some(slot),
+                WorkerKey::New(_) => return Some(local),
+            },
+            None => snapshot.find_slot(key),
         };
+        let slot = slot?;
+        let local = self.known(slot, snapshot);
+        for derived in snapshot.keys().derived_slots(slot) {
+            self.known(*derived, snapshot);
+        }
         Some(local)
     }
 
