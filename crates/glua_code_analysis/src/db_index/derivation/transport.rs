@@ -298,6 +298,19 @@ impl WorkerKeys {
                 .is_some_and(|local| self.written[local as usize] != 0)
     }
 
+    /// The snapshot slot of the entry `local`, unless its key is new here.
+    pub(crate) fn snapshot_slot(&self, local: u32) -> Option<KeyIdx> {
+        match self.entries[local as usize] {
+            WorkerKey::Known(slot) => Some(slot),
+            WorkerKey::New(_) => None,
+        }
+    }
+
+    /// Whether the entry `local` was written here.
+    pub(crate) fn written_here_local(&self, local: u32) -> bool {
+        self.written[local as usize] != 0
+    }
+
     /// Whether the entry `local` was written here after stamp `stamp`.
     pub(crate) fn written_after(&self, local: u32, stamp: u64) -> bool {
         self.written[local as usize] > stamp

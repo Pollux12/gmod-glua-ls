@@ -2914,7 +2914,7 @@ fn run_task_on_worker(
                     members: group.clone(),
                     records: records
                         .into_iter()
-                        .map(|(at, _, seen)| (at, seen.into_iter().map(|(_, seen)| seen).collect()))
+                        .map(|(at, _, seen)| (at, seen))
                         .collect(),
                     rerun: *rerun,
                     elapsed: started.map(|started| started.elapsed()),
@@ -2944,11 +2944,7 @@ fn evaluate_on_worker(
     group: &[DerivationId],
     recipe: &dyn Recipe,
 ) -> (
-    Vec<(
-        usize,
-        DerivationId,
-        Vec<(HashedKey, derivation::Fingerprint)>,
-    )>,
+    Vec<(usize, DerivationId, Vec<derivation::Fingerprint>)>,
     FxHashSet<HashedKey>,
 ) {
     let mut touched = FxHashSet::default();
@@ -3009,20 +3005,13 @@ fn evaluate_on_worker(
                     let seen = recorder
                         .read_states(at, ended, &reset)
                         .into_iter()
-                        .map(|(key, state)| {
-                            let seen = match state {
-                                derivation::ReadState::Unseen => derivation::UNSEEN,
-                                derivation::ReadState::Query(seen) => seen,
-                                derivation::ReadState::Fact { written_here: true } => {
-                                    db.fact_fingerprint(&key)
-                                }
-                                derivation::ReadState::Fact {
-                                    written_here: false,
-                                } => db
-                                    .reader_graph()
-                                    .current_fingerprint(&key, |key| db.fact_fingerprint(key)),
-                            };
-                            (key, seen)
+                        .map(|state| match state {
+                            derivation::ReadState::Unseen => derivation::UNSEEN,
+                            derivation::ReadState::Query(seen) => seen,
+                            derivation::ReadState::Snapshot(slot) => db
+                                .reader_graph()
+                                .slot_fingerprint(slot, |key| db.fact_fingerprint(key)),
+                            derivation::ReadState::Fact(key) => db.fact_fingerprint(&key),
                         })
                         .collect();
                     (at, id, seen)

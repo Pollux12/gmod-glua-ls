@@ -602,13 +602,15 @@ pub(crate) fn compute_recorded<T>(
 
 /// What a task's evaluation saw of one of its reads, short of fingerprinting
 /// it: whether another evaluation of its group moved it since it ended, the
-/// answer it took from the snapshot if it is a query output, and whether the
-/// task wrote it.
-#[derive(Debug, Clone, Copy)]
+/// answer it took from the snapshot if it is a query output, the snapshot
+/// slot of a fact the task left as the snapshot holds it, or the key of one
+/// it wrote or the snapshot has no slot for.
+#[derive(Debug, Clone)]
 pub(crate) enum ReadState {
     Unseen,
     Query(Fingerprint),
-    Fact { written_here: bool },
+    Snapshot(KeyIdx),
+    Fact(HashedKey),
 }
 
 /// Records the evaluations of one superstep task against a snapshot of the
@@ -699,7 +701,7 @@ impl TaskRecorder {
         at: usize,
         ended: Option<u64>,
         reset: &FxHashSet<HashedKey>,
-    ) -> Vec<(HashedKey, ReadState)> {
+    ) -> Vec<ReadState> {
         with_keys(|worker| {
             let task = worker.task.as_ref().expect("a task records into its logs");
             let snapshot = &worker.snapshot;
@@ -709,26 +711,27 @@ impl TaskRecorder {
                 .iter()
                 .map(|local| {
                     let key = worker.keys.key(*local, &snapshot.graph);
-                    let state = if ended
-                        .is_some_and(|ended| worker.keys.written_after(*local, ended))
+                    if ended.is_some_and(|ended| worker.keys.written_after(*local, ended))
                         && !reset.contains(key)
                     {
-                        ReadState::Unseen
-                    } else if query_key(key.key()) {
-                        ReadState::Query(
+                        return ReadState::Unseen;
+                    }
+                    if query_key(key.key()) {
+                        return ReadState::Query(
                             worker
                                 .queries
                                 .get(local)
                                 .map(|witness| witness.seen)
                                 .or_else(|| snapshot.queries.get(key).copied())
                                 .unwrap_or(derivation::UNSEEN),
-                        )
-                    } else {
-                        ReadState::Fact {
-                            written_here: worker.keys.written_here(key, &snapshot.graph),
+                        );
+                    }
+                    match worker.keys.snapshot_slot(*local) {
+                        Some(slot) if !worker.keys.written_here_local(*local) => {
+                            ReadState::Snapshot(slot)
                         }
-                    };
-                    (key.clone(), state)
+                        _ => ReadState::Fact(key.clone()),
+                    }
                 })
                 .collect()
         })
