@@ -873,6 +873,80 @@ mod tests {
         }
     }
 
+    /// The installed state a batch install has to reproduce, in a stable
+    /// order; message lists are read as sets, as their readers sort them.
+    fn installed_state(index: &GmodNetworkIndex) -> Vec<String> {
+        let as_set = |flows: &Vec<(FileId, usize)>| {
+            let mut flows = flows.clone();
+            flows.sort();
+            flows
+        };
+        let mut state = index
+            .send_flows_by_message
+            .iter()
+            .map(|(name, flows)| format!("send {name} {:?}", as_set(flows)))
+            .collect::<Vec<_>>();
+        state.extend(
+            index
+                .receive_flows_by_message
+                .iter()
+                .map(|(name, flows)| format!("receive {name} {:?}", as_set(flows))),
+        );
+        state.extend(
+            index
+                .file_data
+                .iter()
+                .map(|entry| format!("file {entry:?}")),
+        );
+        state.push(format!("flows {}", index.flows_fingerprint));
+        state.sort();
+        state
+    }
+
+    #[test]
+    fn installing_forks_field_by_field_matches_installing_them_one_by_one() {
+        use crate::db_index::cow_shards::TaskFork;
+        let mut base = GmodNetworkIndex::new();
+        base.add_file_data(
+            FileId::new(1),
+            FileNetworkData {
+                send_flows: vec![send_flow("Shared", 1)],
+                receive_flows: vec![receive_flow("Shared", 5)],
+            },
+        );
+        let frozen = base.task_fork();
+        let forks = (2..6)
+            .map(|file| {
+                let mut fork = frozen.task_fork();
+                fork.add_file_data(
+                    FileId::new(file),
+                    FileNetworkData {
+                        send_flows: vec![send_flow("Shared", file * 10)],
+                        receive_flows: vec![receive_flow("Other", file * 10 + 5)],
+                    },
+                );
+                fork
+            })
+            .collect::<Vec<_>>();
+        let mut one_by_one = base.clone();
+        let mut one_by_one_conflicts = vec![Vec::new(); forks.len()];
+        for (at, fork) in forks.iter().cloned().enumerate() {
+            one_by_one.install_task_reporting(&frozen, fork, &mut one_by_one_conflicts[at]);
+        }
+        let mut by_field = base.clone();
+        let mut by_field_conflicts = vec![Vec::new(); forks.len()];
+        by_field.install_tasks_reporting(
+            &frozen,
+            forks.into_iter().enumerate().collect(),
+            &mut by_field_conflicts,
+        );
+
+        assert_eq!(
+            (installed_state(&by_field), by_field_conflicts),
+            (installed_state(&one_by_one), one_by_one_conflicts)
+        );
+    }
+
     #[test]
     fn add_file_data_replaces_previous_message_indexes_for_same_file() {
         let file_id = FileId::new(1);
@@ -997,4 +1071,4 @@ crate::db_index::cow_shards::task_fork_fields!(GmodNetworkIndex {
     helper_names,
     flows_fingerprint => crate::db_index::cow_shards::merge_sum,
     canonical_ops_fingerprint,
-});
+} by_field);

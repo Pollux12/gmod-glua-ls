@@ -3347,6 +3347,48 @@ impl LuaTypeIndex {
         }
     }
 
+    /// Installs the declaration scan of a superstep's `forks` in fork order,
+    /// leaving each fork the frozen one, and returns what the merged state
+    /// rebuilds once every fork is in: every declaration a fork changed the
+    /// super edges of, with every base its edges named in the index, `frozen`
+    /// or a fork, and the scan when any fork changed it where the index had
+    /// too. Rebuilt once, each holds what rebuilding it after each such fork
+    /// leaves: a subclass list follows the final super edges, and once the
+    /// scan is summed afresh it differs from `frozen`, so the last fork that
+    /// changes it sums it afresh too.
+    fn install_decl_scan(
+        &mut self,
+        frozen: &Self,
+        forks: &mut [(usize, Self)],
+    ) -> DerivedToRebuild {
+        let mut subclasses: HashMap<LuaTypeDeclId, HashSet<LuaTypeDeclId>> = HashMap::default();
+        let mut decl_scan = false;
+        for (_, fork) in forks {
+            let planned = self.derived_to_rebuild(frozen, fork);
+            for (decl_id, bases) in planned.subclasses {
+                subclasses.entry(decl_id).or_default().extend(bases);
+            }
+            decl_scan |= planned.decl_scan;
+            let forked = std::mem::replace(
+                &mut fork.decl_scan_fingerprint,
+                frozen.decl_scan_fingerprint,
+            );
+            let conflicted = crate::db_index::cow_shards::MergeFork::install_merging(
+                &mut self.decl_scan_fingerprint,
+                &frozen.decl_scan_fingerprint,
+                forked,
+                crate::db_index::cow_shards::rebuilt,
+            );
+            debug_assert!(!conflicted, "a rebuilt scan never conflicts");
+        }
+        let mut subclasses = subclasses.into_iter().collect::<Vec<_>>();
+        subclasses.sort_by(|left, right| left.0.stable_cmp(&right.0));
+        DerivedToRebuild {
+            subclasses,
+            decl_scan,
+        }
+    }
+
     fn rebuild_derived(&mut self, rebuild: DerivedToRebuild) {
         for (decl_id, bases) in rebuild.subclasses {
             let derives = super_bases(self.supers.get(&decl_id))
@@ -4241,6 +4283,84 @@ mod super_type_tests {
         )
     }
 
+    /// Declares class `name` in `file`, as that file's derivation.
+    fn declare(index: &mut LuaTypeIndex, name: &str, file: u32) {
+        derivation::begin(derivation_in(file));
+        index.add_type_decl(
+            FileId::new(file),
+            LuaTypeDecl::new(
+                FileId::new(file),
+                TextRange::default(),
+                name.to_string(),
+                LuaDeclTypeKind::Class,
+                LuaTypeFlag::None.into(),
+                LuaTypeDeclId::global(name),
+            ),
+        );
+        derivation::end();
+    }
+
+    /// The installed state a batch install has to reproduce, in a stable
+    /// order; subclass lists are read as sets.
+    fn installed_state(index: &LuaTypeIndex) -> Vec<String> {
+        let mut state = index
+            .sub_types
+            .iter()
+            .map(|(base, children)| {
+                let mut children = children
+                    .iter()
+                    .map(|child| format!("{child:?}"))
+                    .collect::<Vec<_>>();
+                children.sort();
+                format!("sub {base:?} {children:?}")
+            })
+            .collect::<Vec<_>>();
+        state.extend(index.supers.iter().map(|entry| format!("supers {entry:?}")));
+        state.extend(
+            index
+                .full_name_type_map
+                .iter()
+                .map(|entry| format!("decl {entry:?}")),
+        );
+        state.push(format!("scan {}", index.decl_scan_fingerprint));
+        state.sort();
+        state
+    }
+
+    #[test]
+    fn installing_forks_field_by_field_matches_installing_them_one_by_one() {
+        let mut base = LuaTypeIndex::new();
+        derive_from_base(&mut base, "Child", 1);
+        declare(&mut base, "Shared", 1);
+        let frozen = base.task_fork();
+        let mut dropping = frozen.task_fork();
+        dropping.retract_contributions(&derivation_in(1));
+        let mut forks = vec![dropping];
+        for file in 2..5 {
+            let mut fork = frozen.task_fork();
+            derive_from_base(&mut fork, if file == 2 { "Child" } else { "Other" }, file);
+            declare(&mut fork, "Fresh", file);
+            forks.push(fork);
+        }
+        let mut one_by_one = base.clone();
+        let mut one_by_one_conflicts = vec![Vec::new(); forks.len()];
+        for (at, fork) in forks.iter().cloned().enumerate() {
+            one_by_one.install_task_reporting(&frozen, fork, &mut one_by_one_conflicts[at]);
+        }
+        let mut by_field = base.clone();
+        let mut by_field_conflicts = vec![Vec::new(); forks.len()];
+        by_field.install_tasks_reporting(
+            &frozen,
+            forks.into_iter().enumerate().collect(),
+            &mut by_field_conflicts,
+        );
+
+        assert_eq!(
+            (installed_state(&by_field), by_field_conflicts),
+            (installed_state(&one_by_one), one_by_one_conflicts)
+        );
+    }
+
     /// Adds `child : Base` declared in `file`, as that file's derivation.
     fn derive_from_base(index: &mut LuaTypeIndex, child: &str, file: u32) {
         derivation::begin(derivation_in(file));
@@ -5093,7 +5213,8 @@ crate::db_index::cow_shards::task_fork_fields!(LuaTypeIndex {
     super_holders,
     table_classes,
     fallbacks,
-} prepare derived_to_rebuild then rebuild_derived);
+} prepare derived_to_rebuild then rebuild_derived
+  by_field install_decl_scan => rebuild_derived);
 
 crate::db_index::cow_shards::task_fork_fields!(TypeCacheRefIndex {
     owner_refs => |current, frozen, fork| {

@@ -127,11 +127,15 @@ pub struct DynamicFieldIndex {
     owner_named_fingerprints: CowShards<DynamicFieldOwner, Fingerprint>,
 }
 
-/// One named slot's contribution to its owner's multiset fingerprint.
-/// An owner whose named fingerprint an install rebuilds, with the names it
-/// rebuilds and their slot fingerprints before the install.
-type OwnerSlotsToRebuild = (DynamicFieldOwner, Vec<(SmolStr, Fingerprint)>);
+/// An owner whose named fingerprint an install rebuilds: the fingerprint and
+/// the slot fingerprints of the names the install changes, before it.
+pub(crate) struct OwnerSlotsToRebuild {
+    owner: DynamicFieldOwner,
+    digest: Fingerprint,
+    slots: Vec<(SmolStr, Fingerprint)>,
+}
 
+/// One named slot's contribution to its owner's multiset fingerprint.
 fn named_entry(field_name: &str, slot: Fingerprint) -> Fingerprint {
     if slot == derivation::ABSENT {
         0
@@ -1119,11 +1123,15 @@ impl DynamicFieldIndex {
             .fold(0u64, u64::wrapping_add)
     }
 
-    /// The owners whose named fingerprint both `self` and `fork`, a task fork
-    /// of `frozen`, changed, each with the names the fork changed and their
-    /// slot fingerprints in `self`: the merge changes only those slots.
-    fn owners_to_rebuild(&self, frozen: &Self, fork: &Self) -> Vec<OwnerSlotsToRebuild> {
-        fn changed_names<'a, V: PartialEq>(
+    /// The names of `owner` whose slot `fork`, a task fork of `frozen`,
+    /// changed.
+    fn changed_names<'a>(
+        frozen: &'a Self,
+        fork: &'a Self,
+        owner: &DynamicFieldOwner,
+        names: &mut HashSet<&'a SmolStr>,
+    ) {
+        fn changed<'a, V: PartialEq>(
             frozen: Option<&'a HashMap<SmolStr, V>>,
             fork: Option<&'a HashMap<SmolStr, V>>,
             names: &mut HashSet<&'a SmolStr>,
@@ -1137,6 +1145,46 @@ impl DynamicFieldIndex {
                 }
             }
         }
+        changed(
+            frozen.owner_fields.get(owner),
+            fork.owner_fields.get(owner),
+            names,
+        );
+        changed(
+            frozen.field_definitions.get(owner),
+            fork.field_definitions.get(owner),
+            names,
+        );
+        changed(
+            frozen.direct_field_definitions.get(owner),
+            fork.direct_field_definitions.get(owner),
+            names,
+        );
+    }
+
+    /// `owner`'s fingerprint in `self` with the slot fingerprints of `names`,
+    /// for [`Self::rebuild_owner_named`].
+    fn owner_slots(
+        &self,
+        owner: DynamicFieldOwner,
+        digest: Fingerprint,
+        names: HashSet<&SmolStr>,
+    ) -> OwnerSlotsToRebuild {
+        let slots = names
+            .into_iter()
+            .map(|name| (name.clone(), self.named_slot_fingerprint(&owner, name)))
+            .collect();
+        OwnerSlotsToRebuild {
+            owner,
+            digest,
+            slots,
+        }
+    }
+
+    /// The owners whose named fingerprint both `self` and `fork`, a task fork
+    /// of `frozen`, changed, each with the names the fork changed: the merge
+    /// changes only those slots.
+    fn owners_to_rebuild(&self, frozen: &Self, fork: &Self) -> Vec<OwnerSlotsToRebuild> {
         self.owner_named_fingerprints
             .both_changed_keys(
                 &frozen.owner_named_fingerprints,
@@ -1145,46 +1193,89 @@ impl DynamicFieldIndex {
             .into_iter()
             .map(|owner| {
                 let mut names = HashSet::default();
-                changed_names(
-                    frozen.owner_fields.get(&owner),
-                    fork.owner_fields.get(&owner),
-                    &mut names,
-                );
-                changed_names(
-                    frozen.field_definitions.get(&owner),
-                    fork.field_definitions.get(&owner),
-                    &mut names,
-                );
-                changed_names(
-                    frozen.direct_field_definitions.get(&owner),
-                    fork.direct_field_definitions.get(&owner),
-                    &mut names,
-                );
-                let slots = names
-                    .into_iter()
-                    .map(|name| (name.clone(), self.named_slot_fingerprint(&owner, name)))
-                    .collect();
-                (owner, slots)
+                Self::changed_names(frozen, fork, &owner, &mut names);
+                let digest = self
+                    .owner_named_fingerprints
+                    .get(&owner)
+                    .copied()
+                    .unwrap_or_default();
+                self.owner_slots(owner, digest, names)
             })
             .collect()
     }
 
-    /// Folds the merged slots into each owner's fingerprint, in place of the
-    /// slots the index held before the merge.
-    fn rebuild_owner_named(&mut self, owners: Vec<OwnerSlotsToRebuild>) {
-        for (owner, slots) in owners {
-            let digest = slots.iter().fold(
-                self.owner_named_fingerprints
-                    .get(&owner)
-                    .copied()
-                    .unwrap_or_default(),
-                |digest, (name, old_slot)| {
-                    let new_slot = self.named_slot_fingerprint(&owner, name);
-                    digest
-                        .wrapping_sub(named_entry(name, *old_slot))
-                        .wrapping_add(named_entry(name, new_slot))
-                },
+    /// Installs the named fingerprints of a superstep's `forks` in fork
+    /// order, leaving each fork the frozen ones, and returns each owner whose
+    /// fingerprint any fork changed where the index had too, with its
+    /// fingerprint and the slots of every name a fork changed before the
+    /// first fork: those are the only slots the forks change, so folding
+    /// them in once every fork is in gives the owner's merged fingerprint.
+    fn install_owner_named(
+        &mut self,
+        frozen: &Self,
+        forks: &mut [(usize, Self)],
+    ) -> Vec<OwnerSlotsToRebuild> {
+        let mut changed_by: HashMap<DynamicFieldOwner, (Fingerprint, Vec<usize>)> =
+            HashMap::default();
+        let mut rebuilt = Vec::new();
+        for (at, (_, fork)) in forks.iter_mut().enumerate() {
+            for owner in CowShards::changed_keys(
+                &frozen.owner_named_fingerprints,
+                &fork.owner_named_fingerprints,
+            ) {
+                let digest = self.owner_named_fingerprints.get(&owner).copied();
+                changed_by
+                    .entry(owner)
+                    .or_insert_with(|| (digest.unwrap_or_default(), Vec::new()))
+                    .1
+                    .push(at);
+            }
+            rebuilt.extend(self.owner_named_fingerprints.both_changed_keys(
+                &frozen.owner_named_fingerprints,
+                &fork.owner_named_fingerprints,
+            ));
+            let forked = std::mem::replace(
+                &mut fork.owner_named_fingerprints,
+                frozen.owner_named_fingerprints.clone(),
             );
+            let conflicted = crate::db_index::cow_shards::MergeFork::install_merging(
+                &mut self.owner_named_fingerprints,
+                &frozen.owner_named_fingerprints,
+                forked,
+                crate::db_index::cow_shards::rebuilt,
+            );
+            debug_assert!(!conflicted, "a rebuilt fingerprint never conflicts");
+        }
+        rebuilt
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|owner| {
+                let (digest, changers) = &changed_by[&owner];
+                let mut names = HashSet::default();
+                for at in changers {
+                    Self::changed_names(frozen, &forks[*at].1, &owner, &mut names);
+                }
+                self.owner_slots(owner.clone(), *digest, names)
+            })
+            .collect()
+    }
+
+    /// Sets each owner's fingerprint to its fingerprint before the install
+    /// with the merged slots folded in, in place of those it held before.
+    fn rebuild_owner_named(&mut self, owners: Vec<OwnerSlotsToRebuild>) {
+        for OwnerSlotsToRebuild {
+            owner,
+            digest,
+            slots,
+        } in owners
+        {
+            let digest = slots.iter().fold(digest, |digest, (name, old_slot)| {
+                let new_slot = self.named_slot_fingerprint(&owner, name);
+                digest
+                    .wrapping_sub(named_entry(name, *old_slot))
+                    .wrapping_add(named_entry(name, new_slot))
+            });
             if digest == 0 {
                 self.owner_named_fingerprints.remove(&owner);
             } else {
@@ -1485,6 +1576,78 @@ mod tests {
         let mut map = rustc_hash::FxHashMap::default();
         map.insert(InFiled::new(file_id, from), InFiled::new(file_id, to));
         map
+    }
+
+    /// The installed state a batch install has to reproduce, in a stable
+    /// order, with each owner's fingerprint checked against its slots.
+    fn installed_state(index: &DynamicFieldIndex) -> Vec<String> {
+        let mut state = index
+            .owner_named_fingerprints
+            .iter()
+            .map(|(owner, digest)| {
+                assert_eq!(*digest, index.owner_named_digest(owner));
+                format!("digest {owner:?} {digest}")
+            })
+            .collect::<Vec<_>>();
+        state.extend(index.owner_fields.iter().flat_map(|(owner, fields)| {
+            fields.iter().map(move |(name, files)| {
+                let mut files = files.iter().copied().collect::<Vec<_>>();
+                files.sort_unstable();
+                format!("files {owner:?} {name} {files:?}")
+            })
+        }));
+        state.extend(index.field_definitions.iter().flat_map(|(owner, fields)| {
+            fields.iter().map(move |(name, definitions)| {
+                format!("definitions {owner:?} {name} {definitions:?}")
+            })
+        }));
+        state.sort();
+        state
+    }
+
+    #[test]
+    fn installing_forks_field_by_field_matches_installing_them_one_by_one() {
+        use crate::db_index::cow_shards::TaskFork;
+        let owner = DynamicFieldOwner::Type(LuaTypeDeclId::global("Player"));
+        let mut base = DynamicFieldIndex::new();
+        base.add_field(
+            owner.clone(),
+            SmolStr::new("a"),
+            FileId::new(1),
+            range(1, 2),
+        );
+        let frozen = base.task_fork();
+        let mut retracting = frozen.task_fork();
+        retracting.replace_site_contributions(FileId::new(1), range(1, 2), &[], &[], &[], &[]);
+        let mut forks = vec![retracting];
+        for file in 2..6 {
+            let mut fork = frozen.task_fork();
+            let name = if file % 2 == 0 { "a" } else { "b" };
+            fork.add_field(
+                owner.clone(),
+                SmolStr::new(name),
+                FileId::new(file),
+                range(file * 10, file * 10 + 1),
+            );
+            forks.push(fork);
+        }
+        let mut one_by_one = base.clone();
+        let mut one_by_one_conflicts = vec![Vec::new(); forks.len()];
+        for (at, fork) in forks.iter().cloned().enumerate() {
+            one_by_one.install_task_reporting(&frozen, fork, &mut one_by_one_conflicts[at]);
+        }
+        let mut by_field = base.clone();
+        let mut by_field_conflicts = vec![Vec::new(); forks.len()];
+        by_field.install_tasks_reporting(
+            &frozen,
+            forks.into_iter().enumerate().collect(),
+            &mut by_field_conflicts,
+        );
+
+        assert_eq!(
+            (installed_state(&by_field), by_field_conflicts),
+            (installed_state(&one_by_one), one_by_one_conflicts)
+        );
     }
 
     /// Every owner-keyed store has to move together. `owner_fields` backs
@@ -2269,4 +2432,5 @@ crate::db_index::cow_shards::task_fork_fields!(DynamicFieldIndex {
     unattributed_fields => crate::db_index::cow_shards::merge_set,
     unattributed_file_contributions,
     owner_named_fingerprints => crate::db_index::cow_shards::rebuilt,
-} prepare owners_to_rebuild then rebuild_owner_named);
+} prepare owners_to_rebuild then rebuild_owner_named
+  by_field install_owner_named => rebuild_owner_named);

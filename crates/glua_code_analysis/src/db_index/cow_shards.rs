@@ -1478,11 +1478,12 @@ pub(crate) use finish_install;
 /// new field has to say how a task forks it; `field => merge` names the
 /// [`Merge`] for values two tasks change apart. `then` runs after an install,
 /// with what `prepare` took from the index and the fork before it.
-/// `by_field plan => settle` installs a superstep's forks field by field in
-/// parallel instead: `plan` installs the fields the hooks read in fork order
-/// first, and `settle` runs once every fork is in.
+/// `by_field` installs a superstep's forks field by field in parallel
+/// instead, each field taking the forks in order; with `plan => settle`,
+/// `plan` first installs in fork order the fields the hooks read, and
+/// `settle` runs once every fork is in.
 macro_rules! task_fork_fields {
-    ($ty:ty { $($(#[$attr:meta])* $field:ident $(=> $merge:expr)?),* $(,)? } $(prepare $before:ident)? $(then $after:ident)? $(by_field $plan:ident => $settle:ident)?) => {
+    ($ty:ty { $($(#[$attr:meta])* $field:ident $(=> $merge:expr)?),* $(,)? } $(prepare $before:ident)? $(then $after:ident)? $(by_field $($plan:ident => $settle:ident)?)?) => {
         impl $crate::db_index::cow_shards::TaskFork for $ty {
             fn task_fork(&self) -> Self {
                 Self {
@@ -1536,7 +1537,7 @@ macro_rules! task_fork_fields {
             ) {
                 $crate::db_index::cow_shards::install_tasks_body!(
                     $ty, self, frozen, forks, conflicts,
-                    [$($plan => $settle)?],
+                    [$(by_field $($plan => $settle)?)?],
                     { $($(#[$attr])* $field $(=> $merge)?),* }
                 );
             }
@@ -1553,9 +1554,9 @@ macro_rules! install_tasks_body {
             $index.install_task_reporting($frozen, fork, &mut $conflicts[at]);
         }
     };
-    ($ty:ty, $index:ident, $frozen:ident, $forks:ident, $conflicts:ident, [$plan:ident => $settle:ident], { $($(#[$attr:meta])* $field:ident $(=> $merge:expr)?),* }) => {{
+    ($ty:ty, $index:ident, $frozen:ident, $forks:ident, $conflicts:ident, [by_field $($plan:ident => $settle:ident)?], { $($(#[$attr:meta])* $field:ident $(=> $merge:expr)?),* }) => {{
         let mut forks = $forks;
-        let plan = $index.$plan($frozen, &mut forks);
+        $(let plan = $index.$plan($frozen, &mut forks);)?
         let mut reported: Vec<Vec<usize>> = Vec::new();
         $($(#[$attr])* {
             let _ = stringify!($field);
@@ -1568,7 +1569,7 @@ macro_rules! install_tasks_body {
                 let base = &$frozen.$field;
                 let column = forks
                     .iter_mut()
-                    .map(|(at, fork)| (*at, std::mem::take(&mut fork.$field)))
+                    .map(|(at, fork)| (*at, std::mem::replace(&mut fork.$field, base.clone())))
                     .collect::<Vec<_>>();
                 let out = out.next().expect("a report per field");
                 scope.spawn(move |_| {
@@ -1584,7 +1585,7 @@ macro_rules! install_tasks_body {
         $($(#[$attr])* for at in reported.next().expect("a report per field") {
             $conflicts[at].push(concat!(stringify!($ty), ".", stringify!($field)));
         })*
-        $index.$settle(plan);
+        $($index.$settle(plan);)?
     }};
 }
 pub(crate) use install_tasks_body;
