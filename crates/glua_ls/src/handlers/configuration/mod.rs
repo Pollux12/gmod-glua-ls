@@ -6,10 +6,9 @@ use super::RegisterCapabilities;
 
 pub async fn on_did_change_configuration(
     context: ServerContextSnapshot,
-    params: DidChangeConfigurationParams,
+    _params: DidChangeConfigurationParams,
 ) -> Option<()> {
-    let pretty_json = serde_json::to_string_pretty(&params).ok()?;
-    log::info!("on_did_change_configuration: {}", pretty_json);
+    log::info!("on_did_change_configuration");
 
     // Check initialization status and get client config
     let (client_id, supports_config_request) = {

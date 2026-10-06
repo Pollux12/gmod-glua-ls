@@ -8,7 +8,7 @@ use vscode_config::get_client_config_vscode;
 use crate::context::{ClientId, ServerContextSnapshot};
 
 #[allow(unused)]
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct ClientConfig {
     pub client_id: ClientId,
     pub exclude: Vec<String>,
@@ -17,6 +17,25 @@ pub struct ClientConfig {
     pub partial_emmyrcs: Option<Vec<Value>>,
     pub gmod_annotations_path: Option<String>,
     pub gamemode_base_libraries: Vec<String>,
+}
+
+/// Leaves out the client's settings, which can hold secrets such as
+/// `gluals.gmod.mcp.authToken`.
+impl std::fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientConfig")
+            .field("client_id", &self.client_id)
+            .field("exclude", &self.exclude)
+            .field("extensions", &self.extensions)
+            .field("encoding", &self.encoding)
+            .field(
+                "partial_emmyrcs",
+                &self.partial_emmyrcs.as_ref().map(Vec::len),
+            )
+            .field("gmod_annotations_path", &self.gmod_annotations_path)
+            .field("gamemode_base_libraries", &self.gamemode_base_libraries)
+            .finish()
+    }
 }
 
 pub async fn get_client_config(
@@ -47,4 +66,21 @@ pub async fn get_client_config(
     };
 
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientConfig;
+
+    #[test]
+    fn debug_output_leaves_out_client_settings() {
+        let config = ClientConfig {
+            partial_emmyrcs: Some(vec![serde_json::json!({
+                "gmod": { "mcp": { "authToken": "secret-token" } }
+            })]),
+            ..Default::default()
+        };
+
+        assert!(!format!("{config:?}").contains("secret-token"));
+    }
 }

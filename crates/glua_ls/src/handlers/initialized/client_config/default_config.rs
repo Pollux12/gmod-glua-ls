@@ -64,12 +64,7 @@ pub async fn get_client_config_default(
     }
 
     if let Some(used_scope) = used_scope {
-        info!(
-            "using client config from scope {used_scope:?}: {}",
-            serde_json::to_string_pretty(&configs)
-                .as_deref()
-                .unwrap_or("<failed to serialize json>")
-        );
+        info!("using client config from scope {used_scope:?}");
     } else {
         info!("no client config found");
     }
