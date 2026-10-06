@@ -1110,6 +1110,13 @@ impl ReaderGraph {
             .collect()
     }
 
+    /// Whether any key read out of `key` was ever interned.
+    pub fn has_derived_keys(&self, key: &HashedKey) -> bool {
+        self.table
+            .find(key)
+            .is_some_and(|slot| self.table.derived.contains_key(&slot))
+    }
+
     /// The keys read out of `key` whose readers have to be checked now that
     /// `key` fingerprints as `now`: none when they were last checked at that
     /// value, since each is a function of it.

@@ -617,16 +617,41 @@ impl Engine {
     ) {
         let keys = keys.into_iter().collect::<Vec<_>>();
         let found = self.stale_readers_of(db, &keys);
+        let derived = self.derived_keys_to_check(db, &keys);
         for (key, readers) in keys.into_iter().zip(found) {
             self.queue_readers(db, key, readers);
-            if !key.is_base() {
-                continue;
-            }
-            let now = self.fingerprint(db, key);
-            for derived in db.reader_graph().derived_keys_to_check(key, now) {
-                self.queue_readers(db, &derived, None);
-            }
         }
+        let found = self.stale_readers_of(db, &derived.iter().collect::<Vec<_>>());
+        for (key, readers) in derived.iter().zip(found) {
+            self.queue_readers(db, key, readers);
+        }
+    }
+
+    /// The keys read out of each base among `keys` whose readers have to be
+    /// checked at the base's current fingerprint, taken on worker threads
+    /// while nothing is being edited or recorded.
+    fn derived_keys_to_check(&self, db: &DbIndex, keys: &[&HashedKey]) -> Vec<HashedKey> {
+        let graph = db.reader_graph();
+        let bases = keys
+            .iter()
+            .filter(|key| key.is_base() && graph.has_derived_keys(key))
+            .collect::<Vec<_>>();
+        let now = if !self.edits.is_empty() || derivation::recording() {
+            bases
+                .iter()
+                .map(|key| self.fingerprint(db, key))
+                .collect::<Vec<_>>()
+        } else {
+            bases
+                .par_iter()
+                .map(|key| graph.current_fingerprint(key, |key| db.fact_fingerprint(key)))
+                .collect()
+        };
+        bases
+            .into_iter()
+            .zip(now)
+            .flat_map(|(key, now)| graph.derived_keys_to_check(key, now))
+            .collect()
     }
 
     /// The readers of each of `keys` whose recorded fingerprint differs from
