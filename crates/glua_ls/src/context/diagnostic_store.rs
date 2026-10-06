@@ -194,6 +194,30 @@ impl DiagnosticStore {
         }
     }
 
+    /// Publishes the diagnostics held for `file_id` again with `version`, for
+    /// a document opened on the text they were computed on.
+    pub fn publish_opened(&self, file_id: FileId, version: i32) {
+        let stored = {
+            let state = self.state();
+            state
+                .is_valid(file_id)
+                .then(|| {
+                    state
+                        .entries
+                        .get(&file_id)
+                        .map(|entry| entry.stored.clone())
+                })
+                .flatten()
+        };
+        if let Some(stored) = stored {
+            self.client.publish_diagnostics(PublishDiagnosticsParams {
+                uri: stored.uri,
+                diagnostics: stored.diagnostics.to_vec(),
+                version: Some(version),
+            });
+        }
+    }
+
     /// The priority `file_id` waits at to be computed, if it is dirty.
     #[cfg(test)]
     pub(crate) fn dirty_priority(&self, file_id: FileId) -> Option<Priority> {
@@ -848,6 +872,43 @@ mod tests {
                 .map(|params| (params.uri, params.version))
                 .collect::<Vec<_>>();
             verify_that!(versions, eq(&vec![(open_uri, Some(7)), (closed_uri, None)]))
+        })
+    }
+
+    /// Diagnostics computed while a file was closed go out again with the
+    /// document version once it opens on the same text.
+    #[gtest]
+    fn a_file_opened_on_diagnosed_text_republishes_with_its_version() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, peer) = Connection::memory();
+        runtime.block_on(async {
+            let context = ServerContext::new(connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_diagnostic_store_reopen");
+            let uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/opened.lua"))
+                .expect("file URI should parse");
+            let file_id = {
+                let mut analysis = snapshot.analysis().write().await;
+                analysis.add_main_workspace(workspace);
+                analysis
+                    .update_file_by_uri(&uri, Some("local unused = UndefinedGlobal".to_string()))
+                    .expect("file id")
+                    .0
+            };
+            let store = snapshot.file_diagnostic().store();
+            store
+                .get(file_id, Priority::Closed, &CancellationToken::new())
+                .await
+                .expect("diagnostics");
+            store.set_open(file_id, true);
+
+            store.publish_opened(file_id, 3);
+
+            let versions = published(&peer)
+                .into_iter()
+                .map(|params| params.version)
+                .collect::<Vec<_>>();
+            verify_that!(versions, eq(&vec![None, Some(3)]))
         })
     }
 

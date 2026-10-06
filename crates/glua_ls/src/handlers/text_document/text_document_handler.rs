@@ -204,12 +204,15 @@ pub async fn on_did_open_text_document(
         // debounced loop, as an edit does.
         let store = context.file_diagnostic().store();
         store.set_open(file_id, true);
-        let untaken = context.analysis().read().await.has_untaken_text(file_id);
-        if untaken {
+        let analysis = context.analysis().read().await;
+        if analysis.has_untaken_text(file_id) {
+            drop(analysis);
             context
                 .debounced_analysis()
                 .schedule(file_id, uri.clone())
                 .await;
+        } else {
+            store.publish_opened(file_id, version);
         }
     }
 
