@@ -135,8 +135,9 @@ pub(crate) async fn apply_file_system_changes(
     for (file_id, uri) in &staged {
         debounced_analysis.schedule(*file_id, uri.clone()).await;
     }
-    // The files whose text changed still need diagnosing; the loop has the
-    // store diagnose the other files the re-analysis moves.
+    // The files whose text changed are diagnosed first, as soon as their own
+    // re-analysis settles; the loop has the store diagnose the other files the
+    // re-analysis moves.
     let (deleted, changed): (Vec<_>, Vec<_>) = staged
         .into_iter()
         .partition(|(_, uri)| final_deleted.contains(uri));
@@ -148,7 +149,7 @@ pub(crate) async fn apply_file_system_changes(
         .into_iter()
         .map(|(file_id, _)| file_id)
         .collect::<Vec<_>>();
-    store.invalidate(file_ids, &[]);
+    store.invalidate(file_ids.iter().copied(), &file_ids);
 }
 
 /// The batch without the watcher's events for a rename `didRenameFiles`
@@ -299,6 +300,44 @@ mod tests {
                 .is_indexed(data);
             assert!(still_indexed);
             assert!(snapshot.debounced_analysis().is_dirty());
+        });
+    }
+
+    /// A file changed on disk is diagnosed as soon as its own re-analysis
+    /// settles, ahead of the files its change ripples into.
+    #[test]
+    fn a_file_changed_on_disk_is_diagnosed_first() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, _peer) = lsp_server::Connection::memory();
+        runtime.block_on(async {
+            let context = crate::context::ServerContext::new(
+                connection,
+                lsp_types::ClientCapabilities::default(),
+            );
+            let snapshot = context.snapshot();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_changed_on_disk");
+            let data_uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/sh_data.lua"))
+                .expect("data URI should parse");
+            let data = {
+                let mut analysis = snapshot.analysis().write().await;
+                analysis.add_main_workspace(workspace.clone());
+                analysis
+                    .update_file_by_uri(&data_uri, Some("Data = {}\n".to_string()))
+                    .expect("data file is added")
+                    .0
+            };
+
+            super::apply_file_system_changes(
+                &snapshot,
+                vec![(data_uri, Some("Data = { count = 1 }\n".to_string()))],
+            )
+            .await;
+
+            let priority = snapshot.file_diagnostic().store().dirty_priority(data);
+            assert_eq!(
+                priority,
+                Some(crate::context::diagnostic_store::Priority::Edited)
+            );
         });
     }
 

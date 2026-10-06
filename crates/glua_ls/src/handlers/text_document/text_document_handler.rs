@@ -386,7 +386,7 @@ pub async fn on_did_close_document(
             store.remove(file_id, uri);
         }
     } else if let Some(staged) = staged {
-        store.invalidate([staged], &[]);
+        store.invalidate([staged], &[staged]);
     }
     if let Some(staged) = staged {
         context

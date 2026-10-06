@@ -194,6 +194,15 @@ impl DiagnosticStore {
         }
     }
 
+    /// The priority `file_id` waits at to be computed, if it is dirty.
+    #[cfg(test)]
+    pub(crate) fn dirty_priority(&self, file_id: FileId) -> Option<Priority> {
+        self.state()
+            .dirty
+            .get(&file_id)
+            .map(|&(priority, _)| priority)
+    }
+
     /// Whether any of `file_ids` outside `except` is open in the client.
     pub fn any_open(&self, file_ids: &[FileId], except: &[FileId]) -> bool {
         let state = self.state();
