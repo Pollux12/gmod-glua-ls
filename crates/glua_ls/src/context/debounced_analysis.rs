@@ -18,7 +18,7 @@ const SLICE: Duration = Duration::from_millis(10);
 /// How long a slice holds the write lock while an edited document still
 /// settles first: requests on it wait for that anyway, and fewer slices
 /// spend less of it waiting on requests elsewhere.
-const FOCUS_SLICE: Duration = Duration::from_millis(100);
+const FOCUS_SLICE: Duration = Duration::from_millis(500);
 
 /// Breakdown of a freshness wait by observed state, so one summary line
 /// can report where the wait went without per-iteration logging.
