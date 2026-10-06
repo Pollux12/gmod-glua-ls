@@ -517,12 +517,16 @@ impl DiagnosticStore {
                     None
                 }
                 Computed::Diagnostics {
-                    uri,
-                    diagnostics,
-                    version,
-                    ..
+                    uri, diagnostics, ..
                 } => {
-                    let version = version.filter(|_| state.open.contains(&job.file_id));
+                    // The revision check holds them to the taken text, whose
+                    // version a didOpen since they began may have set.
+                    let version = analysis
+                        .compilation
+                        .get_db()
+                        .get_vfs()
+                        .get_file_version(&job.file_id)
+                        .filter(|_| state.open.contains(&job.file_id));
                     let result_id = result_id(&diagnostics);
                     let changed = state
                         .entries
@@ -620,7 +624,6 @@ enum Computed {
         diagnostics: Vec<Diagnostic>,
         /// The text revision they were computed on.
         revision: u64,
-        version: Option<i32>,
     },
     /// The file left the workspace.
     Gone,
@@ -646,11 +649,12 @@ async fn compute(
         if !analysis.compilation.has_taken_text(file_id) {
             return Computed::Cancelled;
         }
-        let vfs = analysis.compilation.get_db().get_vfs();
-        let (Some(revision), version) = (
-            vfs.get_file_revision(&file_id),
-            vfs.get_file_version(&file_id),
-        ) else {
+        let Some(revision) = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_revision(&file_id)
+        else {
             return Computed::Gone;
         };
         let shared = shared.get_or_precompute(&analysis);
@@ -659,7 +663,6 @@ async fn compute(
                 uri,
                 diagnostics,
                 revision,
-                version,
             },
             None if token.is_cancelled() => Computed::Cancelled,
             None => Computed::Gone,
