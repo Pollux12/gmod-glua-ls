@@ -1,323 +1,248 @@
-use std::{collections::HashMap, path::Path, str::FromStr};
+use glua_code_analysis::{file_path_to_uri, read_file_with_encoding, uri_to_file_path};
+use lsp_types::RenameFilesParams;
 
-use glua_code_analysis::{
-    FileId, LuaCompilation, LuaModuleIndex, LuaType, SemanticModel, WorkspaceId, file_path_to_uri,
-    read_file_with_encoding, uri_to_file_path,
-};
-use glua_parser::{LuaAstNode, LuaCallExpr};
-use lsp_types::{
-    ApplyWorkspaceEditParams, FileRename, MessageActionItem, MessageType, RenameFilesParams,
-    ShowMessageRequestParams, TextEdit, Uri, WorkspaceEdit,
-};
-use tokio_util::sync::CancellationToken;
-use walkdir::WalkDir;
+use super::will_rename_files::file_renames;
+use crate::{context::ServerContextSnapshot, handlers::text_document::apply_file_system_changes};
 
-use crate::{context::ServerContextSnapshot, handlers::ClientConfig};
-
+/// Moves the renamed files in the server's state. The load paths naming them
+/// are rewritten by the client from `workspace/willRenameFiles`.
 pub async fn on_did_rename_files_handler(
     context: ServerContextSnapshot,
     params: RenameFilesParams,
 ) -> Option<()> {
-    if !context.lsp_features().supports_apply_edit() {
-        log::warn!("rename import update skipped: client does not support workspace/applyEdit");
-        return None;
-    }
-
-    let mut all_renames: Vec<RenameInfo> = vec![];
-    let mut renamed_directories = Vec::new();
-
-    let analysis = context.analysis().read().await;
-    let module_index = analysis.compilation.get_db().get_module_index();
-    for file_rename in params.files {
-        let FileRename { old_uri, new_uri } = file_rename;
-
-        let old_uri = Uri::from_str(&old_uri).ok()?;
-        let new_uri = Uri::from_str(&new_uri).ok()?;
-
-        let old_path = uri_to_file_path(&old_uri)?;
-        let new_path = uri_to_file_path(&new_uri)?;
-
-        // 提取重命名信息
-        if let Some(rename_info) = collect_rename_info(&old_uri, &new_uri, module_index) {
-            all_renames.push(rename_info);
-        } else {
-            // 有可能是目录重命名, 需要收集目录下所有 lua 文件
-            renamed_directories.push((old_path, new_path));
-        }
-    }
-    let encoding = analysis.get_emmyrc().workspace.encoding.clone();
-    drop(analysis);
-
-    if !renamed_directories.is_empty() {
-        let directory_files = tokio::task::spawn_blocking(move || {
-            renamed_directories
-                .iter()
-                .flat_map(|(old_path, new_path)| collect_directory_file_renames(old_path, new_path))
-                .collect::<Vec<_>>()
-        })
-        .await
-        .ok()?;
+    let renames = file_renames(&params.files);
+    let (encoding, moved) = {
         let analysis = context.analysis().read().await;
-        let module_index = analysis.compilation.get_db().get_module_index();
-        all_renames.extend(
-            directory_files.iter().filter_map(|(old_uri, new_uri)| {
-                collect_rename_info(old_uri, new_uri, module_index)
-            }),
-        );
-    }
-
-    // 如果有重命名的文件, 弹窗询问用户是否要修改require路径
-    if !all_renames.is_empty() {
-        let new_uris = all_renames
-            .iter()
-            .map(|rename| rename.new_uri.clone())
-            .collect::<Vec<_>>();
-        let new_texts = tokio::task::spawn_blocking(move || {
-            new_uris
-                .into_iter()
-                .map(|uri| {
-                    uri_to_file_path(&uri)
-                        .and_then(|path| read_file_with_encoding(&path, &encoding))
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        .ok()?;
-        // The renames land as one batch of file-system events: each old path
-        // deleted and each new one read from disk. Only the text changes here;
-        // the debounced loop re-analyses them and whatever read what moved.
-        let mut events = Vec::new();
-        for (rename, text) in all_renames.iter().zip(new_texts) {
-            events.push((rename.old_uri.clone(), None));
-            if let Some(text) = text {
-                events.push((rename.new_uri.clone(), Some(text)));
-            }
-        }
-        let mut analysis = context.analysis().write().await;
-        let staged = analysis
-            .stage_file_system_changes(events)
+        let vfs = analysis.compilation.get_db().get_vfs();
+        let moved = renames
+            .moved_files(vfs)
             .into_iter()
-            .filter_map(|file_id| Some((file_id, analysis.get_uri(file_id)?)))
+            .filter_map(|(file_id, new_path)| {
+                Some((vfs.get_uri(&file_id)?, file_path_to_uri(&new_path)?))
+            })
             .collect::<Vec<_>>();
-        drop(analysis);
-
-        let debounced_analysis = context.debounced_analysis_arc();
-        for (file_id, uri) in &staged {
-            debounced_analysis.schedule(*file_id, uri.clone()).await;
-        }
-        let renamed = staged
-            .into_iter()
-            .filter(|(_, uri)| all_renames.iter().any(|rename| rename.new_uri == *uri))
-            .map(|(file_id, _)| file_id)
-            .collect::<Vec<_>>();
-        if !renamed.is_empty() {
-            context
-                .file_diagnostic()
-                .store()
-                .invalidate(renamed.iter().copied(), &[]);
-        }
-
-        let analysis = context.analysis().read().await;
-        if let Some(changes) = try_modify_require_path(&analysis.compilation, &all_renames) {
-            drop(analysis);
-            if changes.is_empty() {
-                return Some(());
-            }
-
-            let client = context.client();
-
-            let show_message_params = ShowMessageRequestParams {
-                typ: MessageType::INFO,
-                message: "Do you want to modify the require path?".to_string(),
-                actions: Some(vec![MessageActionItem {
-                    title: "Modify".to_string(),
-                    properties: HashMap::new(),
-                }]),
-            };
-
-            // 发送弹窗请求
-            let cancel_token = CancellationToken::new();
-            if let Some(selected_action) = client
-                .show_message_request(show_message_params, cancel_token)
-                .await
-            {
-                let cancel_token = CancellationToken::new();
-                if selected_action.title == "Modify" {
-                    client
-                        .apply_edit(
-                            ApplyWorkspaceEditParams {
-                                edit: WorkspaceEdit {
-                                    changes: Some(changes),
-                                    document_changes: None,
-                                    change_annotations: None,
-                                },
-                                label: None,
-                            },
-                            cancel_token,
-                        )
-                        .await?;
-                }
-            }
-        }
-    }
-
-    Some(())
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-struct RenameInfo {
-    old_uri: Uri,
-    new_uri: Uri,
-    old_module_path: String,
-    new_module_path: String,
-    workspace_id: WorkspaceId,
-}
-
-fn collect_rename_info(
-    old_uri: &Uri,
-    new_uri: &Uri,
-    module_index: &LuaModuleIndex,
-) -> Option<RenameInfo> {
-    let (mut old_module_path, workspace_id) =
-        module_index.extract_module_path(uri_to_file_path(old_uri)?.to_str()?)?;
-    old_module_path = old_module_path.replace(['\\', '/'], ".");
-
-    let (mut new_module_path, _) =
-        module_index.extract_module_path(uri_to_file_path(new_uri)?.to_str()?)?;
-    new_module_path = new_module_path.replace(['\\', '/'], ".");
-
-    Some(RenameInfo {
-        old_uri: old_uri.clone(),
-        new_uri: new_uri.clone(),
-        old_module_path,
-        new_module_path,
-        workspace_id,
-    })
-}
-
-/// 收集目录重命名后所有的文件 (旧 URI, 新 URI)
-fn collect_directory_file_renames(old_path: &Path, new_path: &Path) -> Vec<(Uri, Uri)> {
-    // 检查新路径是否是目录（旧路径已经不存在了）
-    if !new_path.is_dir() {
-        return Vec::new();
-    }
-
-    // 遍历新目录下的所有文件
-    WalkDir::new(new_path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .filter_map(|entry| {
-            let new_file_path = entry.path();
-            // 根据目录重命名推算出对应的旧文件路径
-            let relative_path = new_file_path.strip_prefix(new_path).ok()?;
-            let old_file_path = old_path.join(relative_path);
-            Some((
-                file_path_to_uri(&old_file_path)?,
-                file_path_to_uri(&new_file_path.to_path_buf())?,
-            ))
-        })
-        .collect()
-}
-
-#[allow(unused)]
-/// 检查文件路径是否是Lua文件
-fn is_lua_file(file_path: &Path, client_config: &ClientConfig) -> bool {
-    let file_name = file_path.to_string_lossy();
-
-    if file_name.ends_with(".lua") {
-        return true;
-    }
-
-    // 检查客户端配置的扩展名
-    for extension in &client_config.extensions {
-        if file_name.ends_with(extension) {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn try_modify_require_path(
-    compilation: &LuaCompilation,
-    renames: &Vec<RenameInfo>,
-) -> Option<HashMap<Uri, Vec<TextEdit>>> {
-    #[allow(clippy::mutable_key_type)]
-    let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
-    for file_id in compilation.get_db().get_vfs().get_all_local_file_ids() {
-        if compilation.get_db().get_module_index().is_std(&file_id) {
-            continue;
-        }
-
-        if let Some(semantic_model) = compilation.get_semantic_model(file_id) {
-            for call_expr in semantic_model.get_root().descendants::<LuaCallExpr>() {
-                if call_expr.is_require() {
-                    try_convert(&semantic_model, call_expr, renames, &mut changes, file_id);
-                }
-            }
-        }
-    }
-    Some(changes)
-}
-
-#[allow(clippy::mutable_key_type)]
-fn try_convert(
-    semantic_model: &SemanticModel,
-    call_expr: LuaCallExpr,
-    renames: &Vec<RenameInfo>,
-    changes: &mut HashMap<Uri, Vec<TextEdit>>,
-    current_file_id: FileId, // 当前文件id
-) -> Option<()> {
-    // if let Some(_) = call_expr.get_parent::<LuaIndexExpr>() {
-    //     return None;
-    // }
-
-    let args_list = call_expr.get_args_list()?;
-    let arg_expr = args_list.get_args().next()?;
-    let ty = semantic_model
-        .infer_expr(arg_expr.clone())
-        .unwrap_or(LuaType::Any);
-    let name = if let LuaType::StringConst(s) = ty {
-        s
-    } else {
-        return None;
+        (analysis.get_emmyrc().workspace.encoding.clone(), moved)
     };
-    let emmyrc = semantic_model.get_emmyrc();
-    let separator = &emmyrc.completion.auto_require_separator;
-    let strict_require_path = emmyrc.strict.require_path;
-    // 转换为标准导入语法
-    let normalized_path = name.replace(separator, ".");
+    if moved.is_empty() {
+        return Some(());
+    }
+    let moved = {
+        let workspace = context.workspace_manager().read().await;
+        moved
+            .into_iter()
+            .map(|(old_uri, new_uri)| {
+                let new_uri = workspace.is_workspace_file(&new_uri).then_some(new_uri);
+                (old_uri, new_uri)
+            })
+            .collect::<Vec<_>>()
+    };
 
-    for rename in renames {
-        let is_matched = if strict_require_path {
-            rename.old_module_path == normalized_path
-        } else {
-            rename.old_module_path.ends_with(&normalized_path)
-        };
-
-        if is_matched {
-            let range = arg_expr.syntax().text_range();
-            let lsp_range = semantic_model.get_document().to_lsp_range(range)?;
-
-            let current_uri = semantic_model
-                .get_db()
-                .get_vfs()
-                .get_uri(&current_file_id)?;
-
-            let full_module_path = match separator.as_str() {
-                "." | "" => rename.new_module_path.clone(),
-                _ => rename.new_module_path.replace(".", separator),
+    let batch = tokio::task::spawn_blocking(move || {
+        let mut batch = Vec::with_capacity(moved.len() * 2);
+        for (old_uri, new_uri) in moved {
+            batch.push((old_uri, None));
+            let Some(new_uri) = new_uri else {
+                continue;
             };
+            if let Some(text) = uri_to_file_path(&new_uri)
+                .and_then(|path| read_file_with_encoding(&path, &encoding))
+            {
+                batch.push((new_uri, Some(text)));
+            }
+        }
+        batch
+    })
+    .await
+    .ok()?;
+    let renamed_uris = batch.iter().map(|(uri, _)| uri.clone()).collect::<Vec<_>>();
+    apply_file_system_changes(&context, batch).await;
+    context.note_renamed_uris(renamed_uris);
+    Some(())
+}
 
-            changes.entry(current_uri).or_default().push(TextEdit {
-                range: lsp_range,
-                new_text: format!("'{}'", full_module_path),
-            });
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
 
-            return Some(());
+    use glua_code_analysis::file_path_to_uri;
+    use lsp_server::{Connection, Message};
+    use lsp_types::{
+        ClientCapabilities, DidChangeWatchedFilesParams, FileChangeType, FileEvent, FileRename,
+        RenameFilesParams, Uri,
+    };
+
+    use crate::{
+        context::{ServerContext, ServerContextSnapshot},
+        handlers::text_document::on_did_change_watched_files,
+    };
+
+    const LOADER: &str = "include(\"sh_old.lua\")\n";
+    const RENAMED: &str = "SHARED_VALUE = 1\n";
+
+    struct RenamedWorkspace {
+        root: PathBuf,
+        snapshot: ServerContextSnapshot,
+        client: Connection,
+        old_uri: Uri,
+        new_uri: Uri,
+        _context: ServerContext,
+    }
+
+    impl Drop for RenamedWorkspace {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
-    Some(())
+    /// A workspace where `lua/autorun/sh_old.lua`, which another file
+    /// includes, was renamed on disk to `sh_new.lua` and `didRenameFiles` was
+    /// handled.
+    async fn renamed_workspace(name: &str) -> RenamedWorkspace {
+        let root = std::env::temp_dir().join(format!(
+            "gmod_glua_ls_did_rename_{name}_{}",
+            std::process::id()
+        ));
+        let autorun = root.join("lua/autorun");
+        std::fs::create_dir_all(&autorun).expect("workspace folder is created");
+        std::fs::write(autorun.join("sh_new.lua"), RENAMED).expect("renamed file is written");
+        let old_uri = file_path_to_uri(&autorun.join("sh_old.lua")).expect("old URI");
+        let new_uri = file_path_to_uri(&autorun.join("sh_new.lua")).expect("new URI");
+        let loader_uri = file_path_to_uri(&autorun.join("sh_loader.lua")).expect("loader URI");
+
+        let (connection, client) = Connection::memory();
+        let context = ServerContext::new(connection, ClientCapabilities::default());
+        let snapshot = context.snapshot();
+        {
+            let mut analysis = snapshot.analysis().write().await;
+            analysis.add_main_workspace(root.clone());
+            analysis.update_file_by_uri(&old_uri, Some(RENAMED.to_string()));
+            analysis.update_file_by_uri(&loader_uri, Some(LOADER.to_string()));
+        }
+        super::on_did_rename_files_handler(
+            snapshot.clone(),
+            RenameFilesParams {
+                files: vec![FileRename {
+                    old_uri: old_uri.to_string(),
+                    new_uri: new_uri.to_string(),
+                }],
+            },
+        )
+        .await;
+        RenamedWorkspace {
+            root,
+            snapshot,
+            client,
+            old_uri,
+            new_uri,
+            _context: context,
+        }
+    }
+
+    async fn content(snapshot: &ServerContextSnapshot, uri: &Uri) -> Option<String> {
+        let analysis = snapshot.analysis().read().await;
+        let vfs = analysis.compilation.get_db().get_vfs();
+        vfs.get_file_content(&vfs.get_file_id(uri)?).cloned()
+    }
+
+    async fn watch(snapshot: &ServerContextSnapshot, changes: Vec<(Uri, FileChangeType)>) {
+        on_did_change_watched_files(
+            snapshot.clone(),
+            DidChangeWatchedFilesParams {
+                changes: changes
+                    .into_iter()
+                    .map(|(uri, typ)| FileEvent { uri, typ })
+                    .collect(),
+            },
+        )
+        .await;
+    }
+
+    #[test]
+    fn a_handled_rename_moves_the_file_in_the_server() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let workspace = renamed_workspace("moves").await;
+
+            let old = content(&workspace.snapshot, &workspace.old_uri).await;
+            let new = content(&workspace.snapshot, &workspace.new_uri).await;
+
+            assert_eq!((old, new), (None, Some(RENAMED.to_string())));
+        });
+    }
+
+    /// The load paths are rewritten by the client from `willRenameFiles`, so
+    /// `didRenameFiles` neither prompts nor applies an edit.
+    #[test]
+    fn a_handled_rename_neither_prompts_nor_edits() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let workspace = renamed_workspace("no_prompt").await;
+
+            let requests = workspace
+                .client
+                .receiver
+                .try_iter()
+                .filter_map(|message| match message {
+                    Message::Request(request) => Some(request.method),
+                    _ => None,
+                })
+                .filter(|method| {
+                    method == "window/showMessageRequest" || method == "workspace/applyEdit"
+                })
+                .collect::<Vec<_>>();
+
+            assert!(requests.is_empty(), "{requests:?}");
+        });
+    }
+
+    /// The watcher's delete and create events for a rename `didRenameFiles`
+    /// already applied change nothing.
+    #[test]
+    fn the_watcher_events_of_a_handled_rename_are_not_applied_again() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let workspace = renamed_workspace("echo").await;
+            let revision = |analysis: &glua_code_analysis::EmmyLuaAnalysis| {
+                let vfs = analysis.compilation.get_db().get_vfs();
+                vfs.get_file_id(&workspace.new_uri)
+                    .and_then(|file_id| vfs.get_file_revision(&file_id))
+            };
+            let before = revision(&*workspace.snapshot.analysis().read().await);
+
+            watch(
+                &workspace.snapshot,
+                vec![
+                    (workspace.old_uri.clone(), FileChangeType::DELETED),
+                    (workspace.new_uri.clone(), FileChangeType::CREATED),
+                ],
+            )
+            .await;
+
+            let after = revision(&*workspace.snapshot.analysis().read().await);
+            assert_eq!(after, before);
+        });
+    }
+
+    /// Recognising a rename's watcher events is one-shot: a later deletion of
+    /// the renamed file is applied.
+    #[test]
+    fn a_later_deletion_of_a_renamed_file_is_applied() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let workspace = renamed_workspace("later_delete").await;
+            watch(
+                &workspace.snapshot,
+                vec![(workspace.new_uri.clone(), FileChangeType::CREATED)],
+            )
+            .await;
+
+            watch(
+                &workspace.snapshot,
+                vec![(workspace.new_uri.clone(), FileChangeType::DELETED)],
+            )
+            .await;
+
+            assert_eq!(content(&workspace.snapshot, &workspace.new_uri).await, None);
+        });
+    }
 }

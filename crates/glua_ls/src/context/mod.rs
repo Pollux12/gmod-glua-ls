@@ -36,7 +36,7 @@ use crate::context::snapshot::ServerContextInner;
 // 4. workspace_manager(read)  5. workspace_manager(write)  6. analysis(write)
 // Within `DebouncedAnalysis`: pending_files before reindexing_files, and both
 // are released before anything above is taken.
-// Leaves: document_versions, the diagnostic store's state and
+// Leaves: document_versions, renamed_uris, the diagnostic store's state and
 // `DebouncedAnalysis::in_flight_documents` — synchronous
 // locks, so they can never be held across an `.await`. Never upgrade read→write in place; avoid holding any lock across
 // `.await`. Atomics are exempt.
@@ -236,6 +236,7 @@ impl ServerContext {
             debounced_analysis,
             document_versions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             document_version_notify: Arc::new(Notify::new()),
+            renamed_uris: Default::default(),
         });
 
         // Create the didChange coalescer with a snapshot of the inner state

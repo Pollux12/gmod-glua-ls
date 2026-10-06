@@ -42,7 +42,9 @@ pub use call_site_param::{CallSiteParamContribution, CallSiteParamIndex};
 pub use call_target::{FileCallTargets, LuaCallTarget, LuaCallTargetIndex};
 use cow_shards::{CowCell, CowShards};
 pub use declaration::*;
-pub use dependency::{LuaDependencyIndex, LuaDependencyKind, LuaDependencySite};
+pub use dependency::{
+    LoadPathEdit, LuaDependencyIndex, LuaDependencyKind, LuaDependencySite, load_path_rename_edits,
+};
 pub use diagnostic::{AnalyzeError, DiagnosticAction, DiagnosticActionKind, DiagnosticIndex};
 pub use dynamic_field::{
     DynamicFieldIndex, DynamicFieldOwner, canonical_dynamic_field_owner, dynamic_field_owner_of,

@@ -12,7 +12,7 @@ use lsp_types::request::{
     GotoImplementation, HoverRequest, InlayHintRequest, InlayHintResolveRequest,
     InlineValueRequest, OnTypeFormatting, PrepareRenameRequest, RangeFormatting, References,
     Rename, Request as LspRequest, ResolveCompletionItem, SelectionRangeRequest,
-    SemanticTokensFullRequest, SignatureHelpRequest, WorkspaceSymbolRequest,
+    SemanticTokensFullRequest, SignatureHelpRequest, WillRenameFiles, WorkspaceSymbolRequest,
 };
 use serde::Serialize;
 
@@ -61,6 +61,7 @@ use super::{
     rename::{on_prepare_rename_handler, on_rename_handler},
     semantic_token::on_semantic_token_handler,
     signature_helper::on_signature_helper_handler,
+    workspace::on_will_rename_files_handler,
     workspace_symbol::on_workspace_symbol_handler,
 };
 
@@ -398,6 +399,7 @@ pub async fn on_request_handler(
         GmodScriptedClassesRequest => on_gmod_scripted_classes_handler,
         GmodScriptedClassesV2Request => on_gmod_scripted_classes_v2_handler,
         ExecuteCommand => on_execute_command_handler,
+        WillRenameFiles => on_will_rename_files_handler,
     }, content_modified_if_client_retries: {
         SemanticTokensFullRequest => on_semantic_token_handler,
     });

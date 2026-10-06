@@ -1,4 +1,5 @@
 mod file_dependency_relation;
+mod load_path_rename;
 
 use crate::db_index::cow_shards::{CowCell, CowShards};
 use crate::db_index::derivation::FilePosition;
@@ -6,6 +7,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::hash::{Hash, Hasher};
 
 use file_dependency_relation::FileDependencyRelation;
+pub use load_path_rename::{LoadPathEdit, load_path_rename_edits};
 use rowan::TextRange;
 
 use crate::{
@@ -218,6 +220,24 @@ impl LuaDependencyIndex {
     pub fn get_dependency_sites(&self, file_id: &FileId) -> Option<&[LuaDependencySite]> {
         derivation::note_read(|| FactKey::Dependency(*file_id));
         self.dependency_sites.get(file_id).map(Vec::as_slice)
+    }
+
+    /// The sites that resolve to `target_file_id`.
+    pub fn get_sites_loading(
+        &self,
+        target_file_id: FileId,
+    ) -> impl Iterator<Item = &LuaDependencySite> {
+        self.resolved_sites_by_target
+            .get(&target_file_id)
+            .into_iter()
+            .flatten()
+            .filter_map(move |location| {
+                derivation::note_read(|| FactKey::Dependency(location.source_file_id));
+                self.dependency_sites
+                    .get(&location.source_file_id)?
+                    .get(location.site_index)
+                    .filter(|site| site.target_file_id == Some(target_file_id))
+            })
     }
 
     pub fn collect_unresolved_path_dependents(

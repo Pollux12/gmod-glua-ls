@@ -237,7 +237,7 @@ mod tests {
     use lsp_server::Connection;
     use lsp_types::{
         ClientCapabilities, DidChangeWatchedFilesParams, FileChangeType, FileEvent, FileRename,
-        RenameFilesParams, Uri, WorkspaceClientCapabilities,
+        RenameFilesParams, Uri,
     };
 
     use super::*;
@@ -279,14 +279,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         let (connection, _peer) = Connection::memory();
         runtime.block_on(async {
-            let capabilities = ClientCapabilities {
-                workspace: Some(WorkspaceClientCapabilities {
-                    apply_edit: Some(true),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
-            let mut context = ServerContext::new(connection, capabilities);
+            let mut context = ServerContext::new(connection, ClientCapabilities::default());
             let snapshot = context.snapshot();
             let params = RenameFilesParams {
                 files: vec![FileRename {

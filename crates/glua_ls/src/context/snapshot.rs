@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex, MutexGuard},
 };
 use tokio::sync::{Notify, RwLock, RwLockReadGuard};
@@ -172,6 +172,28 @@ impl ServerContextSnapshot {
         self.inner.document_version_notify.notify_waiters();
     }
 
+    /// Remembers the URIs of a rename `didRenameFiles` applied, for the
+    /// watcher to recognise its own events for the same rename.
+    pub fn note_renamed_uris(&self, uris: impl IntoIterator<Item = Uri>) {
+        self.renamed_uris().extend(uris);
+    }
+
+    /// Takes the URIs among `uris` that an applied rename is waiting on.
+    pub fn take_renamed_uris<'a>(&self, uris: impl IntoIterator<Item = &'a Uri>) -> HashSet<Uri> {
+        let mut renamed = self.renamed_uris();
+        uris.into_iter()
+            .filter_map(|uri| renamed.take(uri))
+            .collect()
+    }
+
+    /// A leaf lock, as [`Self::document_versions`] is.
+    fn renamed_uris(&self) -> MutexGuard<'_, HashSet<Uri>> {
+        self.inner
+            .renamed_uris
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
     /// Acquire a read lock on the analysis, racing against a cancellation token.
     /// Returns `None` immediately if the token fires before the lock is acquired.
     /// This prevents handlers from blocking on a write-preferring RwLock when
@@ -229,6 +251,8 @@ pub struct ServerContextInner {
     /// Leaf lock: see [`ServerContextSnapshot::document_versions`].
     pub document_versions: Arc<Mutex<HashMap<Uri, DocumentVersionState>>>,
     pub document_version_notify: Arc<Notify>,
+    /// Leaf lock: see [`ServerContextSnapshot::renamed_uris`].
+    pub renamed_uris: Mutex<HashSet<Uri>>,
 }
 
 #[cfg(test)]

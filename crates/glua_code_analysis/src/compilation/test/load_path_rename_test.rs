@@ -1,0 +1,190 @@
+#[cfg(test)]
+mod test {
+    use googletest::prelude::*;
+
+    use crate::{FileRenames, VirtualWorkspace, load_path_rename_edits};
+
+    /// Each edit as (file, the text it replaces, its new text).
+    fn rename_edits(
+        ws: &VirtualWorkspace,
+        renames: &[(&str, &str)],
+    ) -> Vec<(String, String, String)> {
+        let base = &ws.virtual_url_generator.base;
+        let renames = FileRenames::new(
+            renames
+                .iter()
+                .map(|(old, new)| (base.join(old), base.join(new)))
+                .collect(),
+        );
+        let db = ws.analysis.compilation.get_db();
+        let vfs = db.get_vfs();
+        load_path_rename_edits(db, &renames)
+            .into_iter()
+            .map(|edit| {
+                let path = vfs
+                    .get_file_path(&edit.file_id)
+                    .expect("edited file has a path");
+                let text = vfs
+                    .get_file_content(&edit.file_id)
+                    .expect("edited file has text");
+                (
+                    path.strip_prefix(base)
+                        .expect("edited file is in the workspace")
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    text[edit.range].to_string(),
+                    edit.new_path,
+                )
+            })
+            .collect()
+    }
+
+    fn edit(file: &str, old: &str, new: &str) -> (String, String, String) {
+        (file.to_string(), old.to_string(), new.to_string())
+    }
+
+    /// Renaming a file rewrites the `include`, `AddCSLuaFile` and `require`
+    /// strings that load it, and no other load string.
+    #[gtest]
+    fn a_file_rename_rewrites_only_the_strings_loading_it() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(vec![
+            ("lua/myaddon/sh_config.lua", "return {}\n"),
+            ("lua/myaddon/sh_unrelated.lua", "return {}\n"),
+            ("lua/includes/modules/myutil.lua", "return {}\n"),
+            (
+                "lua/autorun/sh_loader.lua",
+                "AddCSLuaFile(\"myaddon/sh_config.lua\")\ninclude(\"myaddon/sh_config.lua\")\ninclude(\"myaddon/sh_unrelated.lua\")\nlocal util = require(\"myutil\")\n",
+            ),
+        ]);
+
+        let edits = rename_edits(
+            &ws,
+            &[(
+                "lua/myaddon/sh_config.lua",
+                "lua/myaddon/shared/sh_settings.lua",
+            )],
+        );
+
+        assert_that!(
+            edits,
+            elements_are![
+                eq(&edit(
+                    "lua/autorun/sh_loader.lua",
+                    "myaddon/sh_config.lua",
+                    "myaddon/shared/sh_settings.lua"
+                )),
+                eq(&edit(
+                    "lua/autorun/sh_loader.lua",
+                    "myaddon/sh_config.lua",
+                    "myaddon/shared/sh_settings.lua"
+                )),
+            ]
+        );
+    }
+
+    #[gtest]
+    fn a_module_rename_rewrites_its_require() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(vec![
+            ("lua/includes/modules/myutil.lua", "return {}\n"),
+            (
+                "lua/autorun/sh_loader.lua",
+                "local util = require(\"myutil\")\n",
+            ),
+        ]);
+
+        let edits = rename_edits(
+            &ws,
+            &[(
+                "lua/includes/modules/myutil.lua",
+                "lua/includes/modules/myhelpers.lua",
+            )],
+        );
+
+        assert_that!(
+            edits,
+            elements_are![eq(&edit(
+                "lua/autorun/sh_loader.lua",
+                "myutil",
+                "myhelpers"
+            ))]
+        );
+    }
+
+    /// Renaming a gamemode folder rewrites the paths into it from outside,
+    /// and leaves the relative paths between files inside it as they are.
+    #[gtest]
+    fn a_folder_rename_rewrites_the_paths_into_it() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(vec![
+            ("gamemodes/mygm/gamemode/shared.lua", "return {}\n"),
+            ("gamemodes/mygm/gamemode/modules/sh_round.lua", "return {}\n"),
+            (
+                "gamemodes/mygm/gamemode/modules/sv_round.lua",
+                "include(\"sh_round.lua\")\n",
+            ),
+            (
+                "gamemodes/mygm/gamemode/init.lua",
+                "AddCSLuaFile(\"modules/sh_round.lua\")\ninclude(\"modules/sh_round.lua\")\ninclude(\"modules/sv_round.lua\")\ninclude(\"shared.lua\")\n",
+            ),
+        ]);
+
+        let edits = rename_edits(
+            &ws,
+            &[(
+                "gamemodes/mygm/gamemode/modules",
+                "gamemodes/mygm/gamemode/systems",
+            )],
+        );
+
+        assert_that!(
+            edits,
+            elements_are![
+                eq(&edit(
+                    "gamemodes/mygm/gamemode/init.lua",
+                    "modules/sh_round.lua",
+                    "systems/sh_round.lua"
+                )),
+                eq(&edit(
+                    "gamemodes/mygm/gamemode/init.lua",
+                    "modules/sh_round.lua",
+                    "systems/sh_round.lua"
+                )),
+                eq(&edit(
+                    "gamemodes/mygm/gamemode/init.lua",
+                    "modules/sv_round.lua",
+                    "systems/sv_round.lua"
+                )),
+            ]
+        );
+    }
+
+    /// A path relative to the including file is rewritten from the `lua/`
+    /// root when that file moves out of reach of what it loads.
+    #[gtest]
+    fn moving_the_including_file_rewrites_its_relative_paths() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(vec![
+            ("lua/autorun/server/sv_helpers.lua", "return {}\n"),
+            (
+                "lua/autorun/server/sv_boot.lua",
+                "include(\"sv_helpers.lua\")\n",
+            ),
+        ]);
+
+        let edits = rename_edits(
+            &ws,
+            &[("lua/autorun/server/sv_boot.lua", "lua/myaddon/sv_boot.lua")],
+        );
+
+        assert_that!(
+            edits,
+            elements_are![eq(&edit(
+                "lua/autorun/server/sv_boot.lua",
+                "sv_helpers.lua",
+                "autorun/server/sv_helpers.lua"
+            ))]
+        );
+    }
+}

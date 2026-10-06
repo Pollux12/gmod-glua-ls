@@ -77,38 +77,8 @@ pub async fn on_did_change_watched_files(
         return None;
     };
 
-    // Only the text changes under the write lock: the analyser sorts the batch
-    // and keeps the last event per URI, so a delete/create pair lands as the
-    // final state on disk. The re-analysis settles in the debounced loop's
-    // slices, as an edit does, so requests are answered while it runs.
-    let final_deleted = finally_deleted_uris(&lua_batch);
-    let staged = {
-        let mut analysis = context.analysis().write().await;
-        let staged = analysis
-            .stage_file_system_changes(lua_batch)
-            .into_iter()
-            .filter_map(|file_id| Some((file_id, analysis.get_uri(file_id)?)))
-            .collect::<Vec<_>>();
-        staged
-    };
-    let debounced_analysis = context.debounced_analysis_arc();
-    for (file_id, uri) in &staged {
-        debounced_analysis.schedule(*file_id, uri.clone()).await;
-    }
-    // The files whose text changed still need diagnosing; the loop has the
-    // store diagnose the other files the re-analysis moves.
-    let (deleted, changed): (Vec<_>, Vec<_>) = staged
-        .into_iter()
-        .partition(|(_, uri)| final_deleted.contains(uri));
-    let store = context.file_diagnostic().store();
-    for (file_id, uri) in &deleted {
-        store.remove(*file_id, uri);
-    }
-    let file_ids = changed
-        .into_iter()
-        .map(|(file_id, _)| file_id)
-        .collect::<Vec<_>>();
-    store.invalidate(file_ids, &[]);
+    let lua_batch = without_applied_renames(&context, lua_batch).await;
+    apply_file_system_changes(&context, lua_batch).await;
 
     // Handle editorconfig / emmyrc updates
     if apply_editorconfig_updates {
@@ -136,6 +106,72 @@ pub async fn on_did_change_watched_files(
     }
 
     Some(())
+}
+
+/// Applies a batch of file-system changes: each URI's new text, or `None` for
+/// a deletion.
+pub(crate) async fn apply_file_system_changes(
+    context: &ServerContextSnapshot,
+    batch: Vec<(Uri, Option<String>)>,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    // Only the text changes under the write lock: the analyser sorts the batch
+    // and keeps the last event per URI, so a delete/create pair lands as the
+    // final state on disk. The re-analysis settles in the debounced loop's
+    // slices, as an edit does, so requests are answered while it runs.
+    let final_deleted = finally_deleted_uris(&batch);
+    let staged = {
+        let mut analysis = context.analysis().write().await;
+        let staged = analysis
+            .stage_file_system_changes(batch)
+            .into_iter()
+            .filter_map(|file_id| Some((file_id, analysis.get_uri(file_id)?)))
+            .collect::<Vec<_>>();
+        staged
+    };
+    let debounced_analysis = context.debounced_analysis_arc();
+    for (file_id, uri) in &staged {
+        debounced_analysis.schedule(*file_id, uri.clone()).await;
+    }
+    // The files whose text changed still need diagnosing; the loop has the
+    // store diagnose the other files the re-analysis moves.
+    let (deleted, changed): (Vec<_>, Vec<_>) = staged
+        .into_iter()
+        .partition(|(_, uri)| final_deleted.contains(uri));
+    let store = context.file_diagnostic().store();
+    for (file_id, uri) in &deleted {
+        store.remove(*file_id, uri);
+    }
+    let file_ids = changed
+        .into_iter()
+        .map(|(file_id, _)| file_id)
+        .collect::<Vec<_>>();
+    store.invalidate(file_ids, &[]);
+}
+
+/// The batch without the watcher's events for a rename `didRenameFiles`
+/// already applied: events for its URIs whose change the VFS already holds.
+async fn without_applied_renames(
+    context: &ServerContextSnapshot,
+    batch: Vec<(Uri, Option<String>)>,
+) -> Vec<(Uri, Option<String>)> {
+    let renamed = context.take_renamed_uris(batch.iter().map(|(uri, _)| uri));
+    if renamed.is_empty() {
+        return batch;
+    }
+    let analysis = context.analysis().read().await;
+    let vfs = analysis.compilation.get_db().get_vfs();
+    batch
+        .into_iter()
+        .filter(|(uri, text)| {
+            let current = vfs
+                .get_file_id(uri)
+                .and_then(|file_id| vfs.get_file_content(&file_id));
+            !renamed.contains(uri) || current.map(String::as_str) != text.as_deref()
+        })
+        .collect()
 }
 
 /// URIs whose final event in the batch is a deletion.

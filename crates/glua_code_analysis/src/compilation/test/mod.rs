@@ -27,6 +27,7 @@ mod infer_str_tpl_test;
 mod inherit_type;
 mod legacy_module_test;
 mod library_collision_test;
+mod load_path_rename_test;
 mod mathlib_test;
 mod member_infer_test;
 mod metatable_test;

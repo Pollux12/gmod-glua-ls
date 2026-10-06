@@ -1,6 +1,7 @@
 mod collect_workspace_files;
 mod document;
 mod file_id;
+mod file_renames;
 mod file_uri_handler;
 mod loader;
 mod virtual_url;
@@ -8,6 +9,7 @@ mod virtual_url;
 pub use collect_workspace_files::*;
 pub use document::LuaDocument;
 pub use file_id::{FileId, InFiled};
+pub use file_renames::FileRenames;
 pub use file_uri_handler::{file_path_to_uri, uri_to_file_path};
 use glua_parser::{
     LineIndex, LuaAstNode, LuaParseError, LuaParser, LuaSyntaxNode, LuaSyntaxTree, LuaTokenKind,
