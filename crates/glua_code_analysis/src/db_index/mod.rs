@@ -1303,19 +1303,8 @@ impl DbIndex {
         }
     }
 
-    /// The index as a superstep starts, which its tasks fork: it shares every
-    /// domain with `self` but holds no reader graph or queries, which the
-    /// tasks borrow from `self` in turn.
-    pub(crate) fn superstep_base(&self) -> Self {
-        Self {
-            derivations: Arc::default(),
-            queries: Arc::default(),
-            ..self.fork()
-        }
-    }
-
-    /// A fork of the superstep base for one task: it writes its own copies of
-    /// the shards and values it changes, for [`Self::install_task`].
+    /// A fork of the index for one task: it writes its own copies of the
+    /// shards and values it changes, for [`Self::install_tasks`].
     pub(crate) fn task_fork(&self) -> Self {
         macro_rules! fork {
             ($($domain:ident),*; $($field:ident),*) => {
@@ -1369,24 +1358,8 @@ impl DbIndex {
         )
     }
 
-    /// Swaps the reader graph and queries with `task`'s: lent to a task
-    /// before it runs, and taken back after.
-    pub(crate) fn swap_engine_state(&mut self, task: &mut Self) {
-        std::mem::swap(&mut self.derivations, &mut task.derivations);
-        std::mem::swap(&mut self.queries, &mut task.queries);
-    }
-
-    /// Takes in what `fork`, a task fork of `frozen`, changed. Returns every
-    /// field `self` had changed since `frozen` that `fork` changed too, to
-    /// another value, with no merge of the two: the fork's value replaces it.
-    pub(crate) fn install_task(&mut self, frozen: &Self, fork: Self) -> Vec<&'static str> {
-        self.install_tasks(frozen, vec![fork])
-            .pop()
-            .expect("one fork, one report")
-    }
-
     /// Takes in what each of `forks`, task forks of `frozen`, changed, in
-    /// order, as [`Self::install_task`] one after another does. Domains
+    /// order. Domains
     /// install on the thread pool, each taking every fork in order. Returns
     /// each fork's conflicts.
     pub(crate) fn install_tasks(

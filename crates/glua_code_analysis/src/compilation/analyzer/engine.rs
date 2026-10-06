@@ -450,10 +450,6 @@ pub(crate) struct Engine {
     /// the queries it read to be computed since the run entered its stage.
     query_deferrals: FxHashMap<DerivationId, u8>,
     serial_stage: bool,
-    /// In a superstep, every key the superstep's tasks touched, and
-    /// those the running task touched.
-    superstep_touched: Option<FxHashSet<HashedKey>>,
-    task_touched: FxHashSet<HashedKey>,
 }
 
 /// A fact that moved under a statement: what the statement had seen of it,
@@ -1035,22 +1031,16 @@ impl Engine {
                 self.flush_slot_notifications(db);
                 return false;
             }
-            if self.superstep != SuperstepMode::Off
+            if self.superstep == SuperstepMode::Workers
+                && !self.serial_stage
                 && self.loop_focus.is_empty()
                 && self
                     .worklist
                     .first_rank()
                     .is_some_and(|rank| self.worklist.spans_files(rank))
             {
-                if self.superstep == SuperstepMode::Workers {
-                    if !self.serial_stage {
-                        self.superstep_on_workers(db, recipe, slice);
-                        continue;
-                    }
-                } else {
-                    self.superstep(db, recipe, slice);
-                    continue;
-                }
+                self.superstep_on_workers(db, recipe, slice);
+                continue;
             }
             let Some((id, reason)) = self.worklist.pop_first() else {
                 self.flush_slot_notifications(db);
@@ -1128,82 +1118,10 @@ impl Engine {
         }
     }
 
-    /// In supersteps: evaluates every entry queued at the first
-    /// rank, one file at a time, each file's to quiescence on its own fork
-    /// of the index as the superstep found it. Work an evaluation queues for
-    /// another file at the same rank waits for the next superstep. The
-    /// barrier installs each fork in file order; a task that changed a value
-    /// an earlier task changed too runs again on the index itself, with every
-    /// earlier task that touched what it did. Readers of what the tasks
-    /// touched are then checked against what was installed, and workspace
-    /// derivations run last.
-    fn superstep(&mut self, db: &mut DbIndex, recipe: &dyn Recipe, slice: Slice) {
-        let Some(rank) = self.worklist.first_rank() else {
-            return;
-        };
-        let tasks = self.worklist.take_rank(rank);
-        self.stats.supersteps += 1;
-        self.stats.superstep_tasks += tasks.len();
-        let frozen = db.superstep_base();
-        self.superstep_touched = Some(FxHashSet::default());
-        let mut workspace = Vec::new();
-        // Each task installed so far: its file, what it ran and what it touched.
-        let mut installed: Vec<(crate::FileId, Vec<DerivationId>, FxHashSet<HashedKey>)> =
-            Vec::new();
-        for (file_id, entries) in tasks {
-            if file_id == crate::FileId::VIRTUAL {
-                workspace = entries;
-                continue;
-            }
-            let deferred = self.worklist.take_file_at(rank, file_id);
-            let mut fork = frozen.task_fork();
-            db.swap_engine_state(&mut fork);
-            self.forget_view(&mut fork);
-            let ran = self.run_task(&mut fork, recipe, slice, rank, file_id, entries);
-            db.swap_engine_state(&mut fork);
-            let touched = self.take_task_touched();
-            let conflicts = db.install_task(&frozen, fork);
-            if conflicts.is_empty() {
-                installed.push((file_id, ran, touched));
-            } else {
-                self.stats.conflicting_tasks += 1;
-                for field in conflicts {
-                    *self.stats.task_conflicts.entry(field).or_default() += 1;
-                }
-                // Installed over an earlier task's change, a value lacks
-                // what that task wrote: every task that touched what this
-                // one did runs again on the index, in file order, each
-                // after the writes of the others.
-                let mut again = installed
-                    .extract_if(.., |(_, _, earlier)| !earlier.is_disjoint(&touched))
-                    .collect::<Vec<_>>();
-                again.push((file_id, ran, touched));
-                self.forget_view(db);
-                for (file_id, ran, _) in again {
-                    let entries = ran.into_iter().map(|id| (id, Reason::Changed)).collect();
-                    let ran = self.run_task(db, recipe, slice, rank, file_id, entries);
-                    let touched = self.take_task_touched();
-                    installed.push((file_id, ran, touched));
-                }
-            }
-            for (id, reason) in deferred {
-                self.worklist.insert(id, reason);
-            }
-        }
-        drop(frozen);
-        db.flatten_installs();
-        self.forget_view(db);
-        let touched = self.superstep_touched.take().unwrap_or_default();
-        db.reader_graph().uncheck_derived(&touched);
-        self.readers_of(db, touched.iter());
-        for (id, reason) in workspace {
-            self.file_queries(db);
-            self.step(db, recipe, slice, id, reason);
-        }
-    }
-
-    /// In worker supersteps: [`Self::superstep`] with each file's
-    /// task run on a worker thread. The root decides what each task runs, as
+    /// In worker supersteps: evaluates every entry queued at the first rank,
+    /// each file's task on a worker thread on its own fork of the index as
+    /// the superstep found it; work an evaluation queues for another file at
+    /// the same rank waits for the next superstep. The root decides what each task runs, as
     /// [`Self::step`] does before it evaluates a group; a group that reaches
     /// another file, a query and workspace derivations run on the index after
     /// the barrier. A task evaluates its groups in order on its own fork of
@@ -1647,25 +1565,10 @@ impl Engine {
         })
     }
 
-    /// Takes what the task that just ran touched, adding it to what the
-    /// superstep touched.
-    fn take_task_touched(&mut self) -> FxHashSet<HashedKey> {
-        let touched = std::mem::take(&mut self.task_touched);
-        if let Some(superstep) = &mut self.superstep_touched {
-            superstep.extend(touched.iter().cloned());
-        }
-        touched
-    }
-
     /// Forgets what was taken of another view of the index than `db`'s:
-    /// cached fingerprints and inference, and memos that read a key a task of
-    /// the superstep touched, which this view may hold apart.
+    /// cached fingerprints and inference.
     fn forget_view(&mut self, db: &mut DbIndex) {
-        let graph = db.reader_graph_mut();
-        graph.forget_fingerprints();
-        if let Some(touched) = &self.superstep_touched {
-            graph.mark_written(touched);
-        }
+        db.reader_graph_mut().forget_fingerprints();
         derivation::advance_write_generation();
         self.before_edits_mut().clear();
     }
@@ -1805,9 +1708,6 @@ impl Engine {
             self.worklist.insert(id, Reason::Changed);
         }
         self.queue_reruns();
-        if self.superstep_touched.is_some() {
-            self.task_touched.extend(touched.iter().cloned());
-        }
         crate::profile::phase("engine: readers of", || self.readers_of(db, touched.iter()));
         // A statement of a rebuilt file settled, before the run, on what
         // the removed derivations wrote.
@@ -3772,26 +3672,19 @@ const QUERY_DEFERRALS: u8 = 2;
 enum SuperstepMode {
     /// The serial engine, one derivation at a time.
     Off,
-    /// Each file's task on a fork of the index, one after another.
-    Serial,
     /// Each file's task on a worker thread.
     #[default]
     Workers,
 }
 
-/// `GLUALS_SUPERSTEP`: unset or `workers` runs each rank whose work spans
-/// files a superstep at a time with the tasks on worker threads, `serial` (or
-/// any other value but `off`) with the tasks one after another, and `off` on
-/// the serial engine.
+/// `GLUALS_SUPERSTEP`: `off` runs the serial engine; unset or any other value
+/// runs each rank whose work spans files a superstep at a time with the
+/// tasks on worker threads.
 fn superstep_mode() -> SuperstepMode {
     static MODE: std::sync::OnceLock<SuperstepMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("GLUALS_SUPERSTEP") {
-        Err(_) => SuperstepMode::Workers,
-        Ok(mode) => match mode.as_str() {
-            "workers" => SuperstepMode::Workers,
-            "off" => SuperstepMode::Off,
-            _ => SuperstepMode::Serial,
-        },
+    *MODE.get_or_init(|| match std::env::var("GLUALS_SUPERSTEP").as_deref() {
+        Ok("off") => SuperstepMode::Off,
+        _ => SuperstepMode::Workers,
     })
 }
 
