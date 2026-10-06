@@ -4,7 +4,7 @@ use std::path::Path;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use super::{ClientProxy, FileDiagnostic, StatusBar};
-use crate::codestyle::{apply_editorconfig_file, apply_workspace_code_style};
+use crate::codestyle::apply_workspace_code_style;
 use crate::context::lsp_features::LspFeatures;
 use crate::handlers::{ClientConfig, init_analysis};
 use crate::util::{LongRunningWatchdogStatus, spawn_long_running_watchdog};
@@ -126,11 +126,6 @@ impl WorkspaceManager {
             let mut tokens = config_update_token.lock().await;
             tokens.take();
         });
-    }
-
-    pub fn update_editorconfig(&self, path: PathBuf) {
-        log::info!("update code style: {:?}", path);
-        let _ = apply_editorconfig_file(&path);
     }
 
     pub fn add_reload_workspace_task(

@@ -351,11 +351,15 @@ pub async fn on_did_close_document(
     let Some(file_path) = uri_to_file_path(uri) else {
         return Some(());
     };
-    let text = if file_path.exists() {
-        Some(read_file_with_encoding(&file_path, &encoding)?)
-    } else {
-        None
-    };
+    let text = tokio::task::spawn_blocking(move || {
+        if file_path.exists() {
+            read_file_with_encoding(&file_path, &encoding).map(Some)
+        } else {
+            Some(None)
+        }
+    })
+    .await
+    .ok()??;
     if !context.is_document_closed(uri) {
         return Some(());
     }

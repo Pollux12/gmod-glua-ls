@@ -24,9 +24,9 @@ pub async fn on_did_rename_files_handler(
     }
 
     let mut all_renames: Vec<RenameInfo> = vec![];
+    let mut renamed_directories = Vec::new();
 
     let analysis = context.analysis().read().await;
-
     let module_index = analysis.compilation.get_db().get_module_index();
     for file_rename in params.files {
         let FileRename { old_uri, new_uri } = file_rename;
@@ -38,37 +38,62 @@ pub async fn on_did_rename_files_handler(
         let new_path = uri_to_file_path(&new_uri)?;
 
         // 提取重命名信息
-        let rename_info = collect_rename_info(&old_uri, &new_uri, module_index);
-        if let Some(rename_info) = rename_info {
-            all_renames.push(rename_info.clone());
+        if let Some(rename_info) = collect_rename_info(&old_uri, &new_uri, module_index) {
+            all_renames.push(rename_info);
         } else {
             // 有可能是目录重命名, 需要收集目录下所有 lua 文件
-            if let Some(collected_renames) =
-                collect_directory_lua_files(&old_path, &new_path, module_index)
-            {
-                all_renames.extend(collected_renames);
-            }
+            renamed_directories.push((old_path, new_path));
         }
+    }
+    let encoding = analysis.get_emmyrc().workspace.encoding.clone();
+    drop(analysis);
+
+    if !renamed_directories.is_empty() {
+        let directory_files = tokio::task::spawn_blocking(move || {
+            renamed_directories
+                .iter()
+                .flat_map(|(old_path, new_path)| collect_directory_file_renames(old_path, new_path))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .ok()?;
+        let analysis = context.analysis().read().await;
+        let module_index = analysis.compilation.get_db().get_module_index();
+        all_renames.extend(
+            directory_files.iter().filter_map(|(old_uri, new_uri)| {
+                collect_rename_info(old_uri, new_uri, module_index)
+            }),
+        );
     }
 
     // 如果有重命名的文件, 弹窗询问用户是否要修改require路径
     if !all_renames.is_empty() {
-        drop(analysis);
-        // 更新
-        let mut analysis = context.analysis().write().await;
-        let encoding = &analysis.get_emmyrc().workspace.encoding;
+        let new_uris = all_renames
+            .iter()
+            .map(|rename| rename.new_uri.clone())
+            .collect::<Vec<_>>();
+        let new_texts = tokio::task::spawn_blocking(move || {
+            new_uris
+                .into_iter()
+                .map(|uri| {
+                    uri_to_file_path(&uri)
+                        .and_then(|path| read_file_with_encoding(&path, &encoding))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .ok()?;
         // The renames land as one batch of file-system events: each old path
         // deleted and each new one read from disk. Only the text changes here;
         // the debounced loop re-analyses them and whatever read what moved.
         let mut events = Vec::new();
-        for rename in all_renames.iter() {
+        for (rename, text) in all_renames.iter().zip(new_texts) {
             events.push((rename.old_uri.clone(), None));
-            if let Some(new_path) = uri_to_file_path(&rename.new_uri)
-                && let Some(text) = read_file_with_encoding(&new_path, encoding)
-            {
+            if let Some(text) = text {
                 events.push((rename.new_uri.clone(), Some(text)));
             }
         }
+        let mut analysis = context.analysis().write().await;
         let staged = analysis
             .stage_file_system_changes(events)
             .into_iter()
@@ -170,50 +195,29 @@ fn collect_rename_info(
     })
 }
 
-/// 收集目录重命名后所有的Lua文件
-fn collect_directory_lua_files(
-    old_path: &Path,
-    new_path: &Path,
-    module_index: &LuaModuleIndex,
-) -> Option<Vec<RenameInfo>> {
+/// 收集目录重命名后所有的文件 (旧 URI, 新 URI)
+fn collect_directory_file_renames(old_path: &Path, new_path: &Path) -> Vec<(Uri, Uri)> {
     // 检查新路径是否是目录（旧路径已经不存在了）
     if !new_path.is_dir() {
-        return None;
+        return Vec::new();
     }
 
-    let mut renames = vec![];
-
-    // 遍历新目录下的所有Lua文件
-    for entry in WalkDir::new(new_path)
+    // 遍历新目录下的所有文件
+    WalkDir::new(new_path)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
-    {
-        let new_file_path = entry.path();
-
-        // 计算在新目录中的相对路径
-        if let Ok(relative_path) = new_file_path.strip_prefix(new_path) {
+        .filter_map(|entry| {
+            let new_file_path = entry.path();
             // 根据目录重命名推算出对应的旧文件路径
+            let relative_path = new_file_path.strip_prefix(new_path).ok()?;
             let old_file_path = old_path.join(relative_path);
-
-            // 转换为URI
-            if let (Some(old_file_uri), Some(new_file_uri)) = (
-                file_path_to_uri(&old_file_path),
-                file_path_to_uri(&new_file_path.to_path_buf()),
-            ) {
-                let rename_info = collect_rename_info(&old_file_uri, &new_file_uri, module_index);
-                if let Some(rename_info) = rename_info {
-                    renames.push(rename_info);
-                }
-            }
-        }
-    }
-
-    if renames.is_empty() {
-        None
-    } else {
-        Some(renames)
-    }
+            Some((
+                file_path_to_uri(&old_file_path)?,
+                file_path_to_uri(&new_file_path.to_path_buf())?,
+            ))
+        })
+        .collect()
 }
 
 #[allow(unused)]

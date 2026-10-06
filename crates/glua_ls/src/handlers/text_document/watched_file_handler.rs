@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use glua_code_analysis::{read_file_with_encoding, uri_to_file_path};
 use lsp_types::{DidChangeWatchedFilesParams, FileChangeType, Uri};
 
-use crate::{codestyle::should_apply_editorconfig_updates, context::ServerContextSnapshot};
+use crate::{
+    codestyle::{apply_editorconfig_file, should_apply_editorconfig_updates},
+    context::ServerContextSnapshot,
+};
 
 pub async fn on_did_change_watched_files(
     context: ServerContextSnapshot,
@@ -22,7 +25,7 @@ pub async fn on_did_change_watched_files(
         )
     };
 
-    let mut lua_batch: Vec<(Uri, Option<String>)> = Vec::new();
+    let mut lua_events: Vec<(Uri, FileChangeType)> = Vec::new();
     let mut editorconfig_paths: Vec<PathBuf> = Vec::new();
     let mut emmyrc_dirs: Vec<PathBuf> = Vec::new();
 
@@ -39,7 +42,7 @@ pub async fn on_did_change_watched_files(
                         // receive spurious delete events and must not be
                         // purged from the index.
                         if workspace.is_workspace_file(&file_event.uri) {
-                            lua_batch.push((file_event.uri.clone(), None));
+                            lua_events.push((file_event.uri, FileChangeType::DELETED));
                         }
                         continue;
                     }
@@ -47,12 +50,7 @@ pub async fn on_did_change_watched_files(
                     if !workspace.current_open_files.contains(&file_event.uri)
                         && workspace.is_workspace_file(&file_event.uri)
                     {
-                        collect_lua_files(
-                            &mut lua_batch,
-                            file_event.uri,
-                            file_event.typ,
-                            &encoding,
-                        );
+                        lua_events.push((file_event.uri, file_event.typ));
                     }
                 }
                 Some(WatchedFileType::Editorconfig) => {
@@ -77,6 +75,12 @@ pub async fn on_did_change_watched_files(
             }
         }
     } // workspace read lock released here, before any write lock
+
+    let Ok(lua_batch) =
+        tokio::task::spawn_blocking(move || read_lua_events(lua_events, &encoding)).await
+    else {
+        return None;
+    };
 
     // Only the text changes under the write lock: the analyser sorts the batch
     // and keeps the last event per URI, so a delete/create pair lands as the
@@ -112,17 +116,23 @@ pub async fn on_did_change_watched_files(
     store.invalidate(file_ids, &[]);
 
     // Handle editorconfig / emmyrc updates
+    if apply_editorconfig_updates {
+        if !editorconfig_paths.is_empty() {
+            let _ = tokio::task::spawn_blocking(move || {
+                for path in &editorconfig_paths {
+                    log::info!("update code style: {:?}", path);
+                    let _ = apply_editorconfig_file(path);
+                }
+            })
+            .await;
+        }
+    } else if !editorconfig_paths.is_empty() {
+        log::info!(
+            "skipping .editorconfig watched-file update because format.configPrecedence=preferGluarc"
+        );
+    }
     {
         let workspace = context.workspace_manager().read().await;
-        if apply_editorconfig_updates {
-            for path in &editorconfig_paths {
-                workspace.update_editorconfig(path.clone());
-            }
-        } else if !editorconfig_paths.is_empty() {
-            log::info!(
-                "skipping .editorconfig watched-file update because format.configPrecedence=preferGluarc"
-            );
-        }
         for dir in emmyrc_dirs {
             workspace
                 .add_update_emmyrc_task(dir, context.workspace_manager_arc())
@@ -156,29 +166,26 @@ fn finally_deleted_uris(batch: &[(Uri, Option<String>)]) -> Vec<Uri> {
     deleted
 }
 
-fn collect_lua_files(
-    watched_lua_files: &mut Vec<(Uri, Option<String>)>,
-    uri: Uri,
-    file_change_event: FileChangeType,
+/// Reads the text of each created or changed file, in event order, for the batch.
+fn read_lua_events(
+    events: Vec<(Uri, FileChangeType)>,
     encoding: &str,
-) {
-    match file_change_event {
-        FileChangeType::CREATED | FileChangeType::CHANGED => {
-            let Some(path) = uri_to_file_path(&uri) else {
-                return;
-            };
-            // Only push the file if we can actually read it. A transient read
-            // failure (file locked by antivirus, editor mid-save, etc.) must NOT
-            // be treated as a deletion — just skip the update for this event.
-            if let Some(text) = read_file_with_encoding(&path, encoding) {
-                watched_lua_files.push((uri, Some(text)));
+) -> Vec<(Uri, Option<String>)> {
+    events
+        .into_iter()
+        .filter_map(|(uri, file_change_event)| match file_change_event {
+            FileChangeType::CREATED | FileChangeType::CHANGED => {
+                let path = uri_to_file_path(&uri)?;
+                // Only push the file if we can actually read it. A transient read
+                // failure (file locked by antivirus, editor mid-save, etc.) must NOT
+                // be treated as a deletion — just skip the update for this event.
+                let text = read_file_with_encoding(&path, encoding)?;
+                Some((uri, Some(text)))
             }
-        }
-        FileChangeType::DELETED => {
-            watched_lua_files.push((uri, None));
-        }
-        _ => {}
-    }
+            FileChangeType::DELETED => Some((uri, None)),
+            _ => None,
+        })
+        .collect()
 }
 
 enum WatchedFileType {
