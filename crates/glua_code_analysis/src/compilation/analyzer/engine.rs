@@ -981,7 +981,8 @@ impl Engine {
     /// as it is nor with the edits mapped back, sorted.
     pub(crate) fn stale_diagnostics(&self, db: &DbIndex) -> Vec<crate::FileId> {
         let graph = db.reader_graph();
-        self.diagnostics
+        let stale = self
+            .diagnostics
             .iter()
             .copied()
             .filter(|file_id| {
@@ -991,7 +992,36 @@ impl Engine {
                     |_, _| false,
                 )
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if self.stats.profiling() && !stale.is_empty() {
+            self.report_stale_diagnostics(db, &stale);
+        }
+        stale
+    }
+
+    /// Under `GLUALS_PROFILE`, prints which kinds of moved facts made
+    /// `stale` files' diagnostics stale, most common first.
+    fn report_stale_diagnostics(&self, db: &DbIndex, stale: &[crate::FileId]) {
+        let mut kinds = FxHashMap::<String, usize>::default();
+        for file_id in stale {
+            let moved = self.moved_reads(db, DerivationId::diagnostics(*file_id));
+            let file_kinds = moved
+                .iter()
+                .map(|key| key.split(['(', ' ']).next().unwrap_or_default().to_string())
+                .collect::<FxHashSet<_>>();
+            for kind in file_kinds {
+                *kinds.entry(kind).or_default() += 1;
+            }
+        }
+        let mut kinds = kinds.into_iter().collect::<Vec<_>>();
+        kinds.sort_unstable_by(|left, right| {
+            right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0))
+        });
+        kinds.truncate(12);
+        eprintln!(
+            "[engine] {} stale diagnostics, by moved fact kind (files): {kinds:?}",
+            stale.len()
+        );
     }
 
     /// The files whose signatures or inferred guards may have changed so far.
