@@ -364,6 +364,16 @@ pub struct GmodNetworkIndex {
     canonical_ops_fingerprint: Fingerprint,
 }
 
+fn note_message_write(name: &str) {
+    derivation::note_write(|| FactKey::NetMessage(SmolStr::new(name)));
+}
+
+fn note_definition_uses_write(file_id: FileId, start_range: TextRange) {
+    derivation::note_write(|| {
+        FactKey::NetDefinitionUses(crate::InFiled::new(file_id, start_range))
+    });
+}
+
 fn file_data_fingerprint(file_id: FileId, data: &FileNetworkData) -> Fingerprint {
     derivation::in_file(Some(file_id), || {
         derivation::fingerprint_of(&(file_id, data))
@@ -508,6 +518,17 @@ impl GmodNetworkIndex {
             FactKey::NetworkScan => self
                 .flows_fingerprint
                 .wrapping_add(self.canonical_ops_fingerprint),
+            FactKey::NetMessage(name) => self.message_fingerprint(name),
+            FactKey::NetDefinitionUses(site) => {
+                if self
+                    .materialized_definition_counts
+                    .contains_key(&(site.file_id, site.value))
+                {
+                    derivation::fingerprint_of(&true)
+                } else {
+                    derivation::ABSENT
+                }
+            }
             _ => {
                 debug_assert!(false, "{key:?} is not a gmod network fact");
                 derivation::ABSENT
@@ -648,8 +669,42 @@ impl GmodNetworkIndex {
             })
     }
 
+    /// Notes a read of the flows sent and received under `name`.
+    pub(crate) fn note_message_read(name: &str) {
+        derivation::note_read(|| FactKey::NetMessage(SmolStr::new(name)));
+    }
+
+    /// The fingerprint of the flows sent and received under `name`, each
+    /// hashed as its file's positions.
+    fn message_fingerprint(&self, name: &str) -> Fingerprint {
+        let sent = self
+            .send_flows_by_message
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter_map(|(file_id, flow_idx)| {
+                let flow = self.file_data.get(file_id)?.send_flows.get(*flow_idx)?;
+                Some(derivation::in_file(Some(*file_id), || {
+                    derivation::fingerprint_of(&(file_id, flow))
+                }))
+            });
+        let received = self
+            .receive_flows_by_message
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter_map(|(file_id, flow_idx)| {
+                let flow = self.file_data.get(file_id)?.receive_flows.get(*flow_idx)?;
+                Some(derivation::in_file(Some(*file_id), || {
+                    derivation::fingerprint_of(&(file_id, flow))
+                }))
+            });
+        sent.chain(received)
+            .fold(derivation::ABSENT, Fingerprint::wrapping_add)
+    }
+
     pub fn get_send_flows_for_message(&self, name: &str) -> Vec<(FileId, &NetSendFlow)> {
-        derivation::note_read(|| FactKey::NetworkScan);
+        Self::note_message_read(name);
         let mut flows: Vec<_> = self
             .send_flows_by_message
             .get(name)
@@ -679,7 +734,7 @@ impl GmodNetworkIndex {
     }
 
     pub fn get_receive_flows_for_message(&self, name: &str) -> Vec<(FileId, &NetReceiveFlow)> {
-        derivation::note_read(|| FactKey::NetworkScan);
+        Self::note_message_read(name);
         let mut flows: Vec<_> = self
             .receive_flows_by_message
             .get(name)
@@ -743,6 +798,16 @@ impl GmodNetworkIndex {
             for file_id in self.file_data.keys() {
                 derivation::note_write(|| FactKey::NetworkFile(*file_id));
             }
+            for name in self
+                .send_flows_by_message
+                .keys()
+                .chain(self.receive_flows_by_message.keys())
+            {
+                note_message_write(name);
+            }
+            for (file_id, start_range) in self.materialized_definition_counts.keys() {
+                note_definition_uses_write(*file_id, *start_range);
+            }
         }
         derivation::note_write(|| FactKey::NetworkScan);
         self.flows_fingerprint = 0;
@@ -774,19 +839,25 @@ impl GmodNetworkIndex {
             self.referencing.entry(named).or_default().insert(file_id);
         }
         for (flow_idx, send_flow) in data.send_flows.iter().enumerate() {
+            note_message_write(&send_flow.message_name);
             self.send_flows_by_message
                 .entry(send_flow.message_name.clone())
                 .or_default()
                 .push((file_id, flow_idx));
             if let Some(origin) = send_flow.materialized_from {
-                *self
+                let uses = self
                     .materialized_definition_counts
                     .entry((origin.file_id, origin.start_range))
-                    .or_default() += 1;
+                    .or_default();
+                if *uses == 0 {
+                    note_definition_uses_write(origin.file_id, origin.start_range);
+                }
+                *uses += 1;
             }
         }
 
         for (flow_idx, receive_flow) in data.receive_flows.iter().enumerate() {
+            note_message_write(&receive_flow.message_name);
             self.receive_flows_by_message
                 .entry(receive_flow.message_name.clone())
                 .or_default()
@@ -808,12 +879,14 @@ impl GmodNetworkIndex {
             }
         }
         for send_flow in &data.send_flows {
+            note_message_write(&send_flow.message_name);
             if let Some(origin) = send_flow.materialized_from {
                 let key = (origin.file_id, origin.start_range);
                 if let Some(count) = self.materialized_definition_counts.get_mut(&key) {
                     *count -= 1;
                     if *count == 0 {
                         self.materialized_definition_counts.remove(&key);
+                        note_definition_uses_write(origin.file_id, origin.start_range);
                     }
                 }
             }
@@ -829,6 +902,7 @@ impl GmodNetworkIndex {
         }
 
         for receive_flow in &data.receive_flows {
+            note_message_write(&receive_flow.message_name);
             let mut remove_message_entry = false;
             if let Some(indexed_flows) = self
                 .receive_flows_by_message
@@ -845,7 +919,9 @@ impl GmodNetworkIndex {
     }
 
     pub(crate) fn is_replaced_definition(&self, file_id: FileId, flow: &NetSendFlow) -> bool {
-        derivation::note_read(|| FactKey::NetworkScan);
+        derivation::note_read(|| {
+            FactKey::NetDefinitionUses(crate::InFiled::new(file_id, flow.start_range))
+        });
         flow.materialized_from.is_none()
             && self
                 .materialized_definition_counts

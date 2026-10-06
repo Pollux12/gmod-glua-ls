@@ -374,6 +374,11 @@ pub enum FactKey {
     NetworkFile(FileId),
     /// Network flows by message name (whole-map).
     NetworkScan,
+    /// The network flows sent and received under one message name.
+    NetMessage(SmolStr),
+    /// Whether flows elsewhere materialize the net send defined at a site,
+    /// which then stands for them.
+    NetDefinitionUses(InFiled<TextRange>),
     /// The workspace net-helper registry.
     HelperRegistry,
     /// One entry of the workspace call roles and net-helper registry.
@@ -678,6 +683,8 @@ impl FactKey {
                 | K::NetHelper(_)
                 | K::NetworkFile(_)
                 | K::NetworkScan
+                | K::NetMessage(_)
+                | K::NetDefinitionUses(_)
                 | K::GmodRealm(_)
                 | K::GmodLoadFile(_)
                 | K::CallTargets(_)
@@ -744,6 +751,7 @@ impl FactKey {
             FactKey::Property(LuaSemanticDeclId::Member(id)) => Some(id.file_id),
             FactKey::Property(LuaSemanticDeclId::LuaDecl(id)) => Some(id.file_id),
             FactKey::Property(LuaSemanticDeclId::Signature(id)) => Some(id.get_file_id()),
+            FactKey::NetDefinitionUses(site) => Some(site.file_id),
             _ => self.owning_file(),
         }
     }
@@ -909,6 +917,8 @@ impl FactKey {
             | K::GmodInferScan
             | K::GmodSystem(..)
             | K::NetworkScan
+            | K::NetMessage(_)
+            | K::NetDefinitionUses(_)
             | K::HelperRegistry
             | K::CallRole(CallRoleKey::Path(_) | CallRoleKey::Global(_) | CallRoleKey::Method(_))
             | K::HelperScanFiles

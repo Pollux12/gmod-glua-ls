@@ -539,9 +539,12 @@ impl DbIndex {
             | K::GmodInferScan
             | K::GmodSystem(..) => self.gmod_infer_index.fact_fingerprint(key),
             K::GmodLoadFile(_) => self.gmod_load_index.fact_fingerprint(key),
-            K::NetworkFile(_) | K::NetworkScan | K::NetHelperName(_) | K::NetOperationNames => {
-                self.gmod_network_index.fact_fingerprint(key)
-            }
+            K::NetworkFile(_)
+            | K::NetworkScan
+            | K::NetMessage(_)
+            | K::NetDefinitionUses(_)
+            | K::NetHelperName(_)
+            | K::NetOperationNames => self.gmod_network_index.fact_fingerprint(key),
             K::HelperRegistry => {
                 self.gmod_call_roles
                     .as_ref()

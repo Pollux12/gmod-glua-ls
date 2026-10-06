@@ -92,7 +92,8 @@ fn check_read_write_mismatch(
             continue;
         }
 
-        let Some(matching_send_flows) = sorted_send_flows.get(&receive_flow.message_name) else {
+        let Some(matching_send_flows) = sent_under(sorted_send_flows, &receive_flow.message_name)
+        else {
             continue;
         };
         let mut has_matching_candidate = false;
@@ -215,6 +216,15 @@ pub fn precompute_sorted_send_flows(
         flows.sort_by(|a, b| a.2.cmp(&b.2));
     }
     cache
+}
+
+/// The send flows sorted under `name`, read as that message's flows.
+fn sent_under<'a>(
+    sorted_send_flows: &'a SortedSendFlowCache,
+    name: &str,
+) -> Option<&'a Vec<(FileId, NetSendFlow, SenderSortKey)>> {
+    crate::GmodNetworkIndex::note_message_read(name);
+    sorted_send_flows.get(name)
 }
 
 fn sender_sort_key(
@@ -478,7 +488,8 @@ fn check_bits_mismatch(
             continue;
         }
 
-        let Some(matching_send_flows) = sorted_send_flows.get(&receive_flow.message_name) else {
+        let Some(matching_send_flows) = sent_under(sorted_send_flows, &receive_flow.message_name)
+        else {
             continue;
         };
 

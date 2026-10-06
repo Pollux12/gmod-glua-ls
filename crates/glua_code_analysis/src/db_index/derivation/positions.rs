@@ -230,6 +230,7 @@ impl EditMaps {
             K::Metatable(site) => K::Metatable(self.site(site)?),
             K::TableClass(site) => K::TableClass(self.site(site)?),
             K::NetHelper(site) => K::NetHelper(self.site(site)?),
+            K::NetDefinitionUses(site) => K::NetDefinitionUses(self.site(site)?),
             K::Syntax(site) => K::Syntax(self.site(site)?),
             K::Signature(id) => K::Signature(self.signature_id(*id)?),
             K::SignatureDecl(id) => K::SignatureDecl(self.signature_id(*id)?),

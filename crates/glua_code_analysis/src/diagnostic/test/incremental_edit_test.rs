@@ -962,6 +962,48 @@ mod tests {
         expect_that!(affected, contains(eq(&receiver)));
     }
 
+    /// A receiver's network checks read only the flows of the messages it
+    /// receives: another message's sender changing leaves it unaffected.
+    #[gtest]
+    fn another_messages_sender_leaves_a_receiver_unaffected() {
+        let mut ws = gmod_workspace_with(DiagnosticCode::GmodNetReadWriteBitsMismatch);
+        let sender = |name: &str, bits: u32| {
+            format!(
+                "util.AddNetworkString(\"{name}\")
+net.Start(\"{name}\")
+net.WriteUInt(1, {bits})
+net.Broadcast()
+"
+            )
+        };
+        let bits_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/sv_send.lua");
+        write(&mut ws, &bits_uri, &sender("Bits", 16));
+        let other_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/sv_other.lua");
+        write(&mut ws, &other_uri, &sender("Other", 8));
+        let receiver_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/client/cl_receive.lua");
+        let receiver = write(
+            &mut ws,
+            &receiver_uri,
+            "net.Receive(\"Bits\", function()
+    local value = net.ReadUInt(16)
+end)
+",
+        );
+        shared_diagnostics(&ws, receiver);
+
+        let affected = ws
+            .analysis
+            .apply_file_system_changes(vec![(other_uri, Some(sender("Other", 16)))]);
+
+        expect_that!(affected, not(contains(eq(&receiver))));
+    }
+
     /// Realm checks read the callee realms shared by every file: moving a
     /// server function into a shared file reports its client caller affected,
     /// though the caller was not edited.
