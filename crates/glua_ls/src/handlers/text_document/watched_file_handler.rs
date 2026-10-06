@@ -13,17 +13,15 @@ pub async fn on_did_change_watched_files(
     // Classify events and read files from disk WITHOUT
     // the analysis write lock so that slow disk I/O does not block
     // hover, completion, and diagnostic handlers.
-    let (encoding, interval, apply_editorconfig_updates) = {
+    let (encoding, apply_editorconfig_updates) = {
         let analysis = context.analysis().read().await;
         let emmyrc = analysis.get_emmyrc();
         (
             emmyrc.workspace.encoding.clone(),
-            emmyrc.diagnostics.diagnostic_interval.unwrap_or(500),
             should_apply_editorconfig_updates(&emmyrc),
         )
     };
 
-    let lsp_features = context.lsp_features();
     let mut lua_batch: Vec<(Uri, Option<String>)> = Vec::new();
     let mut editorconfig_paths: Vec<PathBuf> = Vec::new();
     let mut emmyrc_dirs: Vec<PathBuf> = Vec::new();
@@ -103,44 +101,26 @@ pub async fn on_did_change_watched_files(
     for (file_id, uri) in &staged {
         debounced_analysis.schedule(*file_id, uri.clone()).await;
     }
-    // The files whose text changed, which is what still needs diagnosing; the
-    // loop re-diagnoses the other files the re-analysis moves.
-    let file_ids = staged
+    // The files whose text changed still need diagnosing; the loop has the
+    // store diagnose the other files the re-analysis moves.
+    let (deleted, changed): (Vec<_>, Vec<_>) = staged
         .into_iter()
-        .filter(|(_, uri)| !final_deleted.contains(uri))
+        .partition(|(_, uri)| final_deleted.contains(uri));
+    let store = context.file_diagnostic().store();
+    for (file_id, uri) in &deleted {
+        store.remove(*file_id, uri);
+    }
+    let file_ids = changed
+        .into_iter()
         .map(|(file_id, _)| file_id)
         .collect::<Vec<_>>();
-
-    // Schedule diagnostics and config reloads (no locks needed). A URI whose
-    // final batch event leaves the file present is skipped in both branches:
-    // identical bytes stay valid in any cached report, and distinct bytes are
-    // re-diagnosed via the file_ids task below.
-    if !lsp_features.supports_pull_diagnostic() {
-        for uri in final_deleted {
-            context
-                .file_diagnostic()
-                .clear_push_file_diagnostics(uri.clone())
-                .await;
-        }
-    } else {
-        // Never replay a report for a file that no longer exists.
-        for uri in &final_deleted {
-            context
-                .file_diagnostic()
-                .forget_cached_file_diagnostics(uri)
-                .await;
-        }
-    }
+    store.invalidate(file_ids.iter().copied(), &[]);
 
     // The changed files scope the armed pull's sweep below; the loop adds the
     // files the re-analysis moves, so it never covers the whole workspace.
     context
         .file_diagnostic()
         .note_scoped_sweep_files(file_ids.iter().copied())
-        .await;
-    context
-        .file_diagnostic()
-        .add_files_diagnostic_task(file_ids, interval, Some(context.debounced_analysis_arc()))
         .await;
 
     // Those tasks update the server's report for each file; a client that

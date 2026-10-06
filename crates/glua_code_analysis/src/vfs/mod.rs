@@ -328,10 +328,12 @@ impl Vfs {
             self.tree_map.remove(&fid);
         }
         self.note_edit_base(fid);
+        let revision = self.content_revision;
         self.file_data[fid.id as usize] = data.map(|content| FileContent {
             content,
             is_remote: false,
             version: None,
+            revision,
         });
         fid
     }
@@ -365,6 +367,7 @@ impl Vfs {
 
         self.content_revision += 1;
         self.note_edit_base(fid);
+        let revision = self.content_revision;
 
         match text {
             Some(content) => {
@@ -374,6 +377,7 @@ impl Vfs {
                     content,
                     is_remote: false,
                     version,
+                    revision,
                 });
             }
             None => {
@@ -397,12 +401,14 @@ impl Vfs {
     ) {
         self.content_revision += 1;
         self.note_edit_base(fid);
+        let revision = self.content_revision;
         self.tree_map.insert(fid, tree);
         self.line_index_map.insert(fid, line_index);
         self.file_data[fid.id as usize] = Some(FileContent {
             content,
             is_remote: false,
             version: None,
+            revision,
         });
     }
 
@@ -439,6 +445,7 @@ impl Vfs {
 
         self.content_revision += 1;
         self.note_edit_base(fid);
+        let revision = self.content_revision;
 
         let mut deferred_drop = DeferredVfsDrop::default();
 
@@ -451,6 +458,7 @@ impl Vfs {
                         content,
                         is_remote: false,
                         version,
+                        revision,
                     });
             }
             None => {
@@ -483,10 +491,12 @@ impl Vfs {
             self.tree_map.remove(&fid);
         }
         self.note_edit_base(fid);
+        let revision = self.content_revision;
         self.file_data[fid.id as usize] = data.map(|content| FileContent {
             content,
             is_remote: true,
             version: None,
+            revision,
         });
         fid
     }
@@ -654,6 +664,15 @@ impl Vfs {
             .and_then(|content| content.version)
     }
 
+    /// The content revision `id`'s current text was set at; it changes only
+    /// when the text does.
+    pub fn get_file_revision(&self, id: &FileId) -> Option<u64> {
+        self.file_data
+            .get(id.id as usize)
+            .and_then(Option::as_ref)
+            .map(|content| content.revision)
+    }
+
     pub fn update_file_version(&mut self, id: &FileId, version: Option<i32>) {
         if let Some(Some(content)) = self.file_data.get_mut(id.id as usize) {
             content.version = version;
@@ -762,6 +781,8 @@ struct FileContent {
     content: String,
     is_remote: bool,
     version: Option<i32>,
+    /// The content revision this text was set at.
+    revision: u64,
 }
 
 #[cfg(test)]

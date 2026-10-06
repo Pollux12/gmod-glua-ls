@@ -85,15 +85,6 @@ pub async fn on_pull_document_diagnostic(
         return unchanged_report(result_id);
     }
 
-    // Cache for `keep_client_state` replay — but not for a closed document,
-    // whose final pull would re-insert the entry `didClose` just dropped.
-    if !context.is_document_closed(&uri) {
-        context
-            .file_diagnostic()
-            .cache_fresh_file_diagnostics(&uri, &diagnostics)
-            .await;
-    }
-
     full_report(Some(result_id), diagnostics)
 }
 
@@ -103,17 +94,8 @@ mod tests {
     use crate::context::ServerContext;
     use googletest::prelude::*;
     use lsp_server::Connection;
-    use lsp_types::{ClientCapabilities, DiagnosticSeverity, Range};
+    use lsp_types::ClientCapabilities;
     use std::str::FromStr;
-
-    fn diagnostic(message: &str) -> Diagnostic {
-        Diagnostic {
-            message: message.to_string(),
-            range: Range::default(),
-            severity: Some(DiagnosticSeverity::WARNING),
-            ..Default::default()
-        }
-    }
 
     fn as_empty_full_report(result: &DocumentDiagnosticReportResult) -> bool {
         let DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(report)) = result
@@ -131,23 +113,30 @@ mod tests {
         runtime.block_on(async {
             let context = ServerContext::new(connection, ClientCapabilities::default());
             let snapshot = context.snapshot();
-            let uri = Uri::from_str("file:///test.lua").unwrap();
-            let items = vec![diagnostic("undefined global")];
-
-            snapshot
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_document_replay");
+            let uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/replay.lua"))
+                .expect("file URI should parse");
+            {
+                let mut analysis = snapshot.analysis().write().await;
+                analysis.add_main_workspace(workspace);
+                analysis
+                    .update_file_by_uri(&uri, Some("local unused = UndefinedGlobal".to_string()));
+            }
+            let items = snapshot
                 .file_diagnostic()
-                .cache_fresh_file_diagnostics(&uri, &items)
-                .await;
+                .pull_file_diagnostics(uri.clone(), tokio_util::sync::CancellationToken::new())
+                .await
+                .expect("the file has diagnostics");
+            verify_that!(items.is_empty(), eq(false))?;
 
             let result = keep_client_state(&snapshot, &uri, None).await;
 
-            verify_that!(as_empty_full_report(&result), eq(false))?;
             let DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(report)) =
                 &result
             else {
-                return fail!("expected a full report replaying the cached diagnostics");
+                return fail!("expected a full report replaying the stored diagnostics");
             };
-            verify_that!(report.full_document_diagnostic_report.items.len(), eq(1))?;
+            verify_that!(&report.full_document_diagnostic_report.items, eq(&items))?;
             verify_that!(
                 report.full_document_diagnostic_report.result_id.is_some(),
                 eq(true)

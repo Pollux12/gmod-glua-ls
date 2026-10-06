@@ -1,6 +1,7 @@
 mod client;
 mod client_id;
 mod debounced_analysis;
+mod diagnostic_store;
 mod did_change_coalescer;
 mod file_diagnostic;
 mod lsp_features;
@@ -11,6 +12,7 @@ mod workspace_manager;
 pub use client::ClientProxy;
 pub use client_id::{ClientId, get_client_id};
 pub use debounced_analysis::{DebouncedAnalysis, Freshness, InFlightChangeGuard};
+pub use diagnostic_store::{DiagnosticStore, Priority};
 pub use did_change_coalescer::DidChangeCoalescer;
 pub use file_diagnostic::FileDiagnostic;
 use glua_code_analysis::EmmyLuaAnalysis;
@@ -191,6 +193,12 @@ impl ServerContext {
             workspace_diagnostic_level,
             lsp_features.clone(),
         ));
+
+        file_diagnostic.store().start(
+            file_diagnostic::workspace_diagnostic_parallelism(),
+            debounced_analysis.clone(),
+            debounced_shutdown.clone(),
+        );
 
         // Supervise the debounce loop: freshness waiters park on it with no
         // deadline, so if it dies the waiters fail fast via the alive flag

@@ -57,11 +57,6 @@ pub async fn on_did_rename_files_handler(
         // 更新
         let mut analysis = context.analysis().write().await;
         let encoding = &analysis.get_emmyrc().workspace.encoding;
-        let interval = analysis
-            .get_emmyrc()
-            .diagnostics
-            .diagnostic_interval
-            .unwrap_or(500);
         // The renames land as one batch of file-system events: each old path
         // deleted and each new one read from disk. Only the text changes here;
         // the debounced loop re-analyses them and whatever read what moved.
@@ -96,11 +91,11 @@ pub async fn on_did_rename_files_handler(
         if !renamed.is_empty() {
             context
                 .file_diagnostic()
-                .note_scoped_sweep_files(renamed.iter().copied())
-                .await;
+                .store()
+                .invalidate(renamed.iter().copied(), &[]);
             context
                 .file_diagnostic()
-                .add_files_diagnostic_task(renamed, interval, Some(debounced_analysis))
+                .note_scoped_sweep_files(renamed.iter().copied())
                 .await;
             context
                 .workspace_manager()

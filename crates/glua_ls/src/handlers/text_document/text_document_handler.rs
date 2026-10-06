@@ -1,13 +1,12 @@
 use glua_code_analysis::{
-    DeferredVfsDrop, DiagnosticCode, Emmyrc, FileId, fetch_schema_urls, read_file_with_encoding,
-    uri_to_file_path,
+    DeferredVfsDrop, Emmyrc, FileId, fetch_schema_urls, read_file_with_encoding, uri_to_file_path,
 };
-use glua_parser::{LineIndex, LuaParseError, LuaParseErrorKind, LuaParser, LuaSyntaxTree};
+use glua_parser::{LineIndex, LuaParser, LuaSyntaxTree};
 use lsp_types::{
-    Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, NumberOrString, PublishDiagnosticsParams,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams,
 };
-use rowan::{NodeCache, TextRange};
+use rowan::NodeCache;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +15,6 @@ use crate::context::{ServerContextSnapshot, WorkspaceDiagnosticLevel};
 struct PreparsedDocument {
     tree: LuaSyntaxTree,
     line_index: LineIndex,
-    syntax_diagnostics: Vec<Diagnostic>,
 }
 
 fn spawn_deferred_drop(deferred_drop: DeferredVfsDrop) {
@@ -142,90 +140,17 @@ async fn check_schema_update(context: &ServerContextSnapshot) {
 }
 
 async fn preparse_document(text: String, emmyrc: Arc<Emmyrc>) -> Option<PreparsedDocument> {
-    let emmyrc_for_parse = emmyrc.clone();
     let parsed = tokio::task::spawn_blocking(move || {
         let mut node_cache = NodeCache::default();
         let line_index = LineIndex::parse(&text);
-        let parse_config = emmyrc_for_parse.get_parse_config(&mut node_cache);
+        let parse_config = emmyrc.get_parse_config(&mut node_cache);
         let tree = LuaParser::parse(&text, parse_config);
-        let parse_errors = tree.get_errors().to_vec();
-        (tree, line_index, parse_errors, text)
+        PreparsedDocument { tree, line_index }
     })
     .await;
-
-    let (tree, line_index, parse_errors, source_text) = match parsed {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            log::error!("failed to preparse text document: {}", err);
-            return None;
-        }
-    };
-
-    let syntax_diagnostics =
-        build_syntax_diagnostics(&parse_errors, &line_index, &source_text, emmyrc.as_ref());
-    Some(PreparsedDocument {
-        tree,
-        line_index,
-        syntax_diagnostics,
-    })
-}
-
-fn build_syntax_diagnostics(
-    parse_errors: &[LuaParseError],
-    line_index: &LineIndex,
-    source_text: &str,
-    emmyrc: &Emmyrc,
-) -> Vec<Diagnostic> {
-    parse_errors
-        .iter()
-        .map(|error| {
-            let code = match error.kind {
-                LuaParseErrorKind::SyntaxError => DiagnosticCode::SyntaxError,
-                LuaParseErrorKind::DocError => DiagnosticCode::DocSyntaxError,
-            };
-
-            let severity = emmyrc
-                .diagnostics
-                .severity
-                .get(&code)
-                .copied()
-                .map(Into::into)
-                .unwrap_or(DiagnosticSeverity::ERROR);
-
-            Diagnostic {
-                message: error.message.clone(),
-                range: parse_error_range_to_lsp_range(error.range, line_index, source_text),
-                severity: Some(severity),
-                code: Some(NumberOrString::String(code.get_name().to_string())),
-                source: Some("GLuaLS".into()),
-                ..Default::default()
-            }
-        })
-        .collect()
-}
-
-fn parse_error_range_to_lsp_range(
-    range: TextRange,
-    line_index: &LineIndex,
-    source_text: &str,
-) -> lsp_types::Range {
-    let (start_line, start_character) = line_index
-        .get_line_col(range.start(), source_text)
-        .unwrap_or((0, 0));
-    let (end_line, end_character) = line_index
-        .get_line_col(range.end(), source_text)
-        .unwrap_or((start_line, start_character));
-
-    lsp_types::Range {
-        start: lsp_types::Position {
-            line: start_line as u32,
-            character: start_character as u32,
-        },
-        end: lsp_types::Position {
-            line: end_line as u32,
-            character: end_character as u32,
-        },
-    }
+    parsed
+        .inspect_err(|err| log::error!("failed to preparse text document: {}", err))
+        .ok()
 }
 
 pub async fn on_did_open_text_document(
@@ -235,8 +160,6 @@ pub async fn on_did_open_text_document(
     let uri = params.text_document.uri;
     let text = params.text_document.text;
     let version = params.text_document.version;
-    let supports_pull = context.lsp_features().supports_pull_diagnostic();
-
     // Check if file should be filtered before acquiring locks
     // Follow lock order: workspace_manager (read) -> analysis (write)
     let should_process = {
@@ -264,15 +187,10 @@ pub async fn on_did_open_text_document(
         let analysis = context.analysis().read().await;
         analysis.get_emmyrc()
     };
-    let interval = emmyrc.diagnostics.diagnostic_interval.unwrap_or(500);
     let preparsed = preparse_document(text.clone(), emmyrc).await;
     if should_drop_stale_version(&context, &uri, version) {
         return Some(());
     }
-
-    let diagnostics = preparsed
-        .as_ref()
-        .map_or_else(Vec::new, |parsed| parsed.syntax_diagnostics.clone());
 
     let file_id = apply_document_update_without_queuing(
         &context,
@@ -290,31 +208,14 @@ pub async fn on_did_open_text_document(
         }
         // Text that differs from what is indexed settles through the
         // debounced loop, as an edit does.
+        let store = context.file_diagnostic().store();
+        store.set_open(file_id, true);
         let untaken = context.analysis().read().await.has_untaken_text(file_id);
         if untaken {
+            store.invalidate([file_id], &[file_id]);
             context
                 .debounced_analysis()
                 .schedule(file_id, uri.clone())
-                .await;
-        }
-    }
-
-    if !supports_pull && file_id.is_some() {
-        context
-            .client()
-            .publish_diagnostics(PublishDiagnosticsParams {
-                uri: uri.clone(),
-                diagnostics,
-                version: Some(version),
-            });
-    }
-
-    // Schedule diagnostic task without holding any locks
-    if !supports_pull {
-        if let Some(file_id) = file_id {
-            context
-                .file_diagnostic()
-                .add_diagnostic_task(file_id, interval, Some(context.debounced_analysis_arc()))
                 .await;
         }
     }
@@ -368,30 +269,21 @@ pub async fn on_did_change_text_document(
     let uri = params.text_document.uri;
     let text = params.content_changes.first()?.text.clone();
     let version = params.text_document.version;
-    let supports_pull = context.lsp_features().supports_pull_diagnostic();
 
     // Single read-lock acquisition: get file_id + emmyrc + should_process
-    let (existing_file_id, emmyrc, should_process) = {
+    let (emmyrc, should_process) = {
         let analysis = context.analysis().read().await;
         let file_id = analysis.get_file_id(&uri);
         let emmyrc = analysis.get_emmyrc();
         if file_id.is_some() {
-            (file_id, emmyrc, true)
+            (emmyrc, true)
         } else {
             drop(analysis);
             let workspace_manager = context.workspace_manager().read().await;
             let should = workspace_manager.is_workspace_file(&uri);
-            (file_id, emmyrc, should)
+            (emmyrc, should)
         }
     };
-
-    // Cancel outstanding diagnostics immediately for this file
-    if let Some(file_id) = existing_file_id {
-        context
-            .file_diagnostic()
-            .cancel_file_diagnostic(file_id)
-            .await;
-    }
 
     if !should_process {
         context.mark_document_closed(&uri);
@@ -402,7 +294,6 @@ pub async fn on_did_change_text_document(
         return Some(());
     }
 
-    let interval = emmyrc.diagnostics.diagnostic_interval.unwrap_or(500);
     // Profiling: time the off-lock parse so `ls_did_change` can report
     // `preparse_ms`. Only when a didChange accumulator is scoped; didOpen and
     // unprofiled runs pay no clock read.
@@ -415,9 +306,6 @@ pub async fn on_did_change_text_document(
     if let Some(start) = preparse_start {
         crate::util::ls_profile::record_did_change_preparse(start.elapsed());
     }
-    let syntax_diagnostics = preparsed
-        .as_ref()
-        .map_or_else(Vec::new, |parsed| parsed.syntax_diagnostics.clone());
     if should_drop_stale_version(&context, &uri, version) {
         return Some(());
     }
@@ -431,27 +319,16 @@ pub async fn on_did_change_text_document(
         preparsed,
     )
     .await;
-    if file_id.is_some() {
+    if let Some(file_id) = file_id {
         context.note_document_applied_version(&uri, version);
+        context
+            .file_diagnostic()
+            .store()
+            .invalidate([file_id], &[file_id]);
     }
 
     if should_drop_stale_version(&context, &uri, version) {
         return Some(());
-    }
-
-    if !supports_pull && file_id.is_some() {
-        let diagnostics = context
-            .file_diagnostic()
-            .cached_file_diagnostics(&uri)
-            .await
-            .unwrap_or(syntax_diagnostics);
-        context
-            .client()
-            .publish_diagnostics(PublishDiagnosticsParams {
-                uri: uri.clone(),
-                diagnostics,
-                version: Some(version),
-            });
     }
 
     // Schedule debounced reindex — rapid edits into a single reindex.
@@ -480,16 +357,6 @@ pub async fn on_did_change_text_document(
         workspace.extend_reindex_delay().await;
     }
 
-    // Schedule diagnostic task
-    if !supports_pull {
-        if let Some(file_id) = file_id {
-            context
-                .file_diagnostic()
-                .add_diagnostic_task(file_id, interval, Some(context.debounced_analysis_arc()))
-                .await;
-        }
-    }
-
     Some(())
 }
 
@@ -498,23 +365,12 @@ pub async fn on_did_close_document(
     params: DidCloseTextDocumentParams,
 ) -> Option<()> {
     let uri = &params.text_document.uri;
-    let lsp_features = context.lsp_features();
-
-    // A closed document has no reader for its cached replay report.
-    if lsp_features.supports_pull_diagnostic() {
-        context
-            .file_diagnostic()
-            .forget_cached_file_diagnostics(uri)
-            .await;
-    }
-
-    let (encoding, interval) = {
+    let encoding = {
         let analysis = context.analysis().read().await;
-        let emmyrc = analysis.get_emmyrc();
-        (
-            emmyrc.workspace.encoding.clone(),
-            emmyrc.diagnostics.diagnostic_interval.unwrap_or(500),
-        )
+        if let Some(file_id) = analysis.get_file_id(uri) {
+            context.file_diagnostic().store().set_open(file_id, false);
+        }
+        analysis.get_emmyrc().workspace.encoding.clone()
     };
 
     // Only remove from the index when the file no longer exists on disk
@@ -554,27 +410,19 @@ pub async fn on_did_close_document(
         }
         (staged, analysis.get_file_id(uri))
     };
+    let store = context.file_diagnostic().store();
+    if deleted {
+        if let Some(file_id) = file_id {
+            store.remove(file_id, uri);
+        }
+    } else if let Some(staged) = staged {
+        store.invalidate([staged], &[]);
+    }
     if let Some(staged) = staged {
         context
             .debounced_analysis()
             .schedule(staged, uri.clone())
             .await;
-    }
-
-    if !lsp_features.supports_pull_diagnostic() {
-        if deleted {
-            context
-                .file_diagnostic()
-                .clear_push_file_diagnostics(uri.clone())
-                .await;
-        } else if let Some(file_id) = file_id
-            && context.is_document_closed(uri)
-        {
-            context
-                .file_diagnostic()
-                .add_diagnostic_task(file_id, interval, Some(context.debounced_analysis_arc()))
-                .await;
-        }
     }
 
     Some(())

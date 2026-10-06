@@ -633,38 +633,34 @@ impl DebouncedAnalysis {
         );
     }
 
-    /// Wait until the given file is no longer pending reindex and the
-    /// re-analysis in progress has no work left in it, which it then settles
-    /// first. Returns `LoopDead` without diagnosing when the debounce loop is
-    /// dead (freshness can never arrive); callers must abort rather than
-    /// diagnose stale data.
-    pub async fn wait_for_reindex(
-        &self,
-        file_id: FileId,
-        cancel_token: CancellationToken,
-    ) -> Freshness {
-        loop {
-            let notified = self.reindex_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
+    /// Resolves once a slice, settle or schedule may have let more files'
+    /// diagnostics be computed.
+    pub fn reindex_notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.reindex_notify.notified()
+    }
 
-            let is_pending = {
-                let pending = self.pending_files.lock().await;
-                let reindexing = self.reindexing_files.lock().await;
-                pending.contains(&file_id) || reindexing.contains(&file_id)
-            } || (self.settling.load(Ordering::Acquire)
-                && self.file_id_is_settling(&*self.analysis.read().await, file_id));
-            if !is_pending {
-                return Freshness::Fresh;
-            }
-            if !self.debounce_loop_alive() {
-                return Freshness::LoopDead;
-            }
-            tokio::select! {
-                _ = notified => {}
-                _ = cancel_token.cancelled() => return Freshness::Cancelled,
-            }
+    /// The first of `candidates` whose diagnostics can be computed now: its
+    /// text was taken and the re-analysis in progress has no work left in it.
+    pub async fn first_ready_for_diagnostics(&self, candidates: &[FileId]) -> Option<FileId> {
+        if !self.has_pending_changes.load(Ordering::Acquire) {
+            return candidates.first().copied();
         }
+        let taken = {
+            let pending = self.pending_files.lock().await;
+            let reindexing = self.reindexing_files.lock().await;
+            candidates
+                .iter()
+                .copied()
+                .filter(|file_id| !pending.contains(file_id) && !reindexing.contains(file_id))
+                .collect::<Vec<_>>()
+        };
+        if !self.settling.load(Ordering::Acquire) {
+            return taken.first().copied();
+        }
+        let analysis = self.analysis.read().await;
+        taken
+            .into_iter()
+            .find(|file_id| !analysis.compilation.is_settling(*file_id))
     }
 
     /// Arm an idle workspace diagnostic refresh so closed files hit by
@@ -831,6 +827,7 @@ impl DebouncedAnalysis {
         affected: Vec<FileId>,
         idle_workspace_diagnostic_token: &mut Option<CancellationToken>,
     ) {
+        self.file_diagnostic.store().note_settled();
         if affected.is_empty() {
             return;
         }
@@ -842,19 +839,11 @@ impl DebouncedAnalysis {
                 self.client.refresh_inlay_hints();
             }
         }
-        let interval = self
-            .analysis
-            .read()
-            .await
-            .get_emmyrc()
-            .diagnostics
-            .diagnostic_interval
-            .unwrap_or(500);
+        self.file_diagnostic
+            .store()
+            .invalidate(affected.iter().copied(), edited);
         self.file_diagnostic
             .note_scoped_sweep_files(affected.iter().copied())
-            .await;
-        self.file_diagnostic
-            .add_files_diagnostic_task(affected, interval, None)
             .await;
         self.arm_idle_workspace_diagnostic(idle_workspace_diagnostic_token);
     }
@@ -1367,44 +1356,6 @@ mod tests {
         })
     }
 
-    /// `wait_for_reindex` parks diagnostic tasks, not requests, so it has no
-    /// cancel token of its own to rely on: without the alive check a dead
-    /// loop parks it forever on a file that will never reindex.
-    #[gtest]
-    fn dead_loop_releases_reindex_waiter() -> Result<()> {
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
-        runtime.block_on(async {
-            let debounced_analysis = test_debounced_analysis();
-            debounced_analysis
-                .pending_files
-                .lock()
-                .await
-                .insert(FileId::new(7));
-            let waiter = tokio::spawn({
-                let debounced_analysis = debounced_analysis.clone();
-                async move {
-                    debounced_analysis
-                        .wait_for_reindex(FileId::new(7), CancellationToken::new())
-                        .await
-                }
-            });
-            let started = Instant::now();
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            debounced_analysis.note_debounce_loop_dead();
-            let reindexed = tokio::time::timeout(Duration::from_secs(10), waiter)
-                .await
-                .expect("parked reindex waiter must be released promptly")
-                .expect("waiter task must not panic");
-            verify_that!(reindexed, eq(Freshness::LoopDead))?;
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "release took {:?}, expected prompt wakeup not the stuck timer",
-                started.elapsed()
-            );
-            Ok(())
-        })
-    }
-
     /// The point of the per-file gate: an edit to one document must not park
     /// requests aimed at a different one, and must park requests aimed at
     /// itself until its own entries have been rebuilt.
@@ -1501,6 +1452,20 @@ mod tests {
                 client.clone(),
                 false,
             ));
+            let shutdown = CancellationToken::new();
+            let debounced_analysis = Arc::new(DebouncedAnalysis::new(
+                analysis.clone(),
+                0,
+                shutdown.clone(),
+                client,
+                file_diagnostic.clone(),
+                file_diagnostic.shared_diagnostic_data_cache(),
+                Arc::new(AtomicU8::new(0)),
+                test_lsp_features(),
+            ));
+            file_diagnostic
+                .store()
+                .start(1, debounced_analysis.clone(), shutdown.clone());
 
             let initial_diagnostics = file_diagnostic
                 .pull_file_diagnostics(user_uri.clone(), CancellationToken::new())
@@ -1525,18 +1490,10 @@ mod tests {
                     .expect("API file should still exist")
             };
 
-            let shared_diagnostic_data_cache = file_diagnostic.shared_diagnostic_data_cache();
-            let debounced_analysis = DebouncedAnalysis::new(
-                analysis.clone(),
-                0,
-                CancellationToken::new(),
-                client,
-                file_diagnostic.clone(),
-                shared_diagnostic_data_cache,
-                Arc::new(AtomicU8::new(0)),
-                test_lsp_features(),
-            );
-            settle(&debounced_analysis, vec![api_file_id]).await;
+            let affected = settle(&debounced_analysis, vec![api_file_id]).await;
+            debounced_analysis
+                .refresh_affected(&[api_file_id], affected, &mut None)
+                .await;
 
             let updated_diagnostics = file_diagnostic
                 .pull_file_diagnostics(user_uri, CancellationToken::new())
@@ -1546,6 +1503,7 @@ mod tests {
                 has_diagnostic_code(&updated_diagnostics, DiagnosticCode::DiscardReturns),
                 eq(true)
             )?;
+            shutdown.cancel();
 
             Ok(())
         })
@@ -1577,16 +1535,20 @@ mod tests {
             false,
         ));
         let shared_diagnostic_data_cache = file_diagnostic.shared_diagnostic_data_cache();
+        let shutdown = CancellationToken::new();
         let debounced_analysis = Arc::new(DebouncedAnalysis::new(
             analysis,
             0,
-            CancellationToken::new(),
+            shutdown.clone(),
             client,
-            file_diagnostic,
+            file_diagnostic.clone(),
             shared_diagnostic_data_cache,
             Arc::new(AtomicU8::new(0)),
             test_lsp_features(),
         ));
+        file_diagnostic
+            .store()
+            .start(1, debounced_analysis.clone(), shutdown);
         (debounced_analysis, peer)
     }
 

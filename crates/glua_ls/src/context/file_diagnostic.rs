@@ -1,22 +1,22 @@
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
 use glua_code_analysis::SharedDiagnosticComponentCache;
 use glua_code_analysis::{EmmyLuaAnalysis, FileId, SharedDiagnosticData};
-use log::{debug, info, warn};
-use lsp_types::{Diagnostic, PublishDiagnosticsParams, Uri};
+use log::{debug, info};
+use lsp_types::{Diagnostic, Uri};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::util::{LongRunningWatchdogStatus, spawn_long_running_watchdog};
 
-use super::{ClientProxy, Freshness, ProgressTask, StatusBar};
+use super::{ClientProxy, ProgressTask, StatusBar};
 
 #[derive(Clone, Default)]
 pub(crate) struct SharedDiagnosticDataCache {
@@ -25,7 +25,10 @@ pub(crate) struct SharedDiagnosticDataCache {
 }
 
 impl SharedDiagnosticDataCache {
-    fn get_or_precompute(&self, analysis: &EmmyLuaAnalysis) -> Arc<SharedDiagnosticData> {
+    pub(crate) fn get_or_precompute(
+        &self,
+        analysis: &EmmyLuaAnalysis,
+    ) -> Arc<SharedDiagnosticData> {
         let mut cached = self.cached.lock().ok();
         if let Some(cache) = cached.as_ref()
             && let Some(shared_data) = cache.as_ref()
@@ -75,9 +78,7 @@ pub struct FileDiagnostic {
     status_bar: Arc<StatusBar>,
     workspace_loaded_notified: Arc<AtomicBool>,
     startup_complete_notified: Arc<AtomicBool>,
-    diagnostic_tokens: Arc<Mutex<HashMap<FileId, CancellationToken>>>,
     workspace_diagnostic_token: Arc<Mutex<Option<CancellationToken>>>,
-    cached_file_diagnostics: Arc<Mutex<HashMap<Uri, Vec<Diagnostic>>>>,
     /// Files an edit reported as diagnostically touched (re-analysed files,
     /// readers the export diff named, textual-refresh candidates). The next
     /// `Fast` workspace sweep diagnoses exactly this set instead of the whole
@@ -87,67 +88,47 @@ pub struct FileDiagnostic {
     /// arm was not edit-scoped — open/reindex/config paths still sweep all.
     scoped_sweep_files: Arc<Mutex<rustc_hash::FxHashSet<FileId>>>,
     shared_diagnostic_data_cache: SharedDiagnosticDataCache,
-    /// Whether diagnostics reach this client by being fetched *and* the client
-    /// accepts `workspace/diagnostic/refresh`.
-    ///
-    /// Both capabilities are needed to drop the pushed report: a client that
-    /// fetches but cannot be asked to re-fetch has no other way to learn about
-    /// a change to a file it is not showing. For a client with both, publishing
-    /// duplicates the fetched report — VS Code keeps the pushed collection
-    /// beside the pulled one and the Problems panel shows their union.
-    fetches_diagnostics: bool,
+    /// Every workspace file's diagnostics, computed again only when they
+    /// may have changed.
+    store: Arc<super::DiagnosticStore>,
 }
 
 impl FileDiagnostic {
+    /// `fetches_diagnostics`: whether diagnostics reach this client by being
+    /// fetched *and* the client accepts `workspace/diagnostic/refresh`. Such a
+    /// client gets nothing published: VS Code keeps a pushed collection beside
+    /// the pulled one and the Problems panel would show their union.
     pub fn new(
         analysis: Arc<RwLock<EmmyLuaAnalysis>>,
         status_bar: Arc<StatusBar>,
         client: Arc<ClientProxy>,
         fetches_diagnostics: bool,
     ) -> Self {
+        let shared_diagnostic_data_cache = SharedDiagnosticDataCache::default();
+        let store = Arc::new(super::DiagnosticStore::new(
+            analysis.clone(),
+            shared_diagnostic_data_cache.clone(),
+            (!fetches_diagnostics).then(|| client.clone()),
+        ));
         Self {
             analysis,
             client,
             workspace_loaded_notified: Arc::new(AtomicBool::new(false)),
             startup_complete_notified: Arc::new(AtomicBool::new(false)),
-            diagnostic_tokens: Arc::new(Mutex::new(HashMap::new())),
             workspace_diagnostic_token: Arc::new(Mutex::new(None)),
-            cached_file_diagnostics: Arc::new(Mutex::new(HashMap::new())),
             scoped_sweep_files: Arc::new(Mutex::new(rustc_hash::FxHashSet::default())),
-            shared_diagnostic_data_cache: SharedDiagnosticDataCache::default(),
+            shared_diagnostic_data_cache,
+            store,
             status_bar,
-            fetches_diagnostics,
         }
+    }
+
+    pub fn store(&self) -> &Arc<super::DiagnosticStore> {
+        &self.store
     }
 
     pub(crate) fn shared_diagnostic_data_cache(&self) -> SharedDiagnosticDataCache {
         self.shared_diagnostic_data_cache.clone()
-    }
-
-    fn get_or_precompute_shared_diagnostic_data(
-        &self,
-        analysis: &EmmyLuaAnalysis,
-    ) -> Arc<SharedDiagnosticData> {
-        self.shared_diagnostic_data_cache
-            .get_or_precompute(analysis)
-    }
-
-    fn diagnose_file_with_shared_data(
-        &self,
-        analysis: &EmmyLuaAnalysis,
-        file_id: FileId,
-        cancel_token: CancellationToken,
-    ) -> Option<Vec<Diagnostic>> {
-        if cancel_token.is_cancelled() {
-            return None;
-        }
-
-        let shared_data = self.get_or_precompute_shared_diagnostic_data(analysis);
-        if cancel_token.is_cancelled() {
-            return None;
-        }
-
-        analysis.diagnose_file_with_shared(file_id, cancel_token, shared_data)
     }
 
     pub fn invalidate_shared_diagnostic_data(&self) {
@@ -185,143 +166,13 @@ impl FileDiagnostic {
         );
     }
 
-    pub async fn cache_fresh_file_diagnostics(&self, uri: &Uri, diagnostics: &[Diagnostic]) {
-        self.cached_file_diagnostics
-            .lock()
-            .await
-            .insert(uri.clone(), diagnostics.to_vec());
-    }
-
+    /// The last diagnostics computed for `uri`, whether or not they still
+    /// hold.
     pub async fn cached_file_diagnostics(&self, uri: &Uri) -> Option<Vec<Diagnostic>> {
-        let cache = self.cached_file_diagnostics.lock().await;
-        cache.get(uri).cloned()
-    }
-
-    /// Record the server's report for one file and forward it to the client
-    /// only if the client needs it pushed.
-    ///
-    /// Every per-file diagnostic producer funnels through here — the edited
-    /// file, the widen set an edit returns, textual-refresh candidates,
-    /// watched-file and rename fanout — so this is the one place that decides
-    /// the channel. A client that fetches is asked to re-poll
-    /// (`workspace/diagnostic` refresh) by the callers instead; publishing as
-    /// well would show the same report twice.
-    pub async fn set_file_diagnostics(
-        &self,
-        uri: Uri,
-        diagnostics: Vec<Diagnostic>,
-        version: Option<i32>,
-    ) {
-        self.cache_fresh_file_diagnostics(&uri, &diagnostics).await;
-        if self.fetches_diagnostics {
-            return;
-        }
-        self.client.publish_diagnostics(PublishDiagnosticsParams {
-            uri,
-            diagnostics,
-            version,
-        });
-    }
-
-    pub async fn add_diagnostic_task(
-        &self,
-        file_id: FileId,
-        interval: u64,
-        debounced_analysis: Option<Arc<crate::context::DebouncedAnalysis>>,
-    ) {
-        let mut tokens = self.diagnostic_tokens.lock().await;
-
-        if let Some(token) = tokens.remove(&file_id) {
-            token.cancel();
-            debug!("cancel diagnostic: {:?}", file_id);
-        }
-
-        // create new token
-        let cancel_token = CancellationToken::new();
-        tokens.insert(file_id, cancel_token.clone());
-        drop(tokens); // free the lock
-
-        let analysis = self.analysis.clone();
-        let file_diagnostic = self.clone();
-        let diagnostic_tokens = self.diagnostic_tokens.clone();
-        let file_id_clone = file_id;
-
-        // Spawn a new task to perform diagnostic
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(interval)) => {
-                    if let Some(da) = debounced_analysis {
-                        if da.wait_for_reindex(file_id_clone, cancel_token.clone()).await
-                            != Freshness::Fresh
-                        {
-                            return;
-                        }
-                    }
-                    if cancel_token.is_cancelled() {
-                        return;
-                    }
-                    let blocking_analysis = analysis.clone();
-                    let blocking_token = cancel_token.clone();
-                    let diagnostic_runner = file_diagnostic.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        if blocking_token.is_cancelled() {
-                            return None;
-                        }
-
-                        // Diagnose under a blocking read lock so CPU work does not run on Tokio workers.
-                        let guard = blocking_analysis.blocking_read();
-                        let uri = guard.get_uri(file_id_clone)?;
-                        let diagnostics = diagnostic_runner.diagnose_file_with_shared_data(
-                            &guard,
-                            file_id_clone,
-                            blocking_token.clone(),
-                        )?;
-                        Some((uri, diagnostics))
-                    })
-                    .await
-                    {
-                        Ok(Some((uri, diagnostics))) => {
-                            file_diagnostic
-                                .set_file_diagnostics(uri, diagnostics, None)
-                                .await;
-                        }
-                        Ok(None) => {
-                            if !cancel_token.is_cancelled() {
-                                info!("file not found: {:?}", file_id_clone);
-                            }
-                        }
-                        Err(err) => {
-                            warn!(
-                                "single-file diagnostic worker failed for file {:?}: {}",
-                                file_id_clone, err
-                            );
-                        }
-                    }
-                    // Remove our token only if this task was not cancelled.
-                    // Keeping the check inside the lock avoids a check/remove race with replacements.
-                    let mut tokens = diagnostic_tokens.lock().await;
-                    if !cancel_token.is_cancelled() {
-                        tokens.remove(&file_id_clone);
-                    }
-                }
-                _ = cancel_token.cancelled() => {
-                    debug!("cancel diagnostic: {:?}", file_id_clone);
-                }
-            }
-        });
-    }
-
-    // todo add message show
-    pub async fn add_files_diagnostic_task(
-        &self,
-        file_ids: Vec<FileId>,
-        interval: u64,
-        debounced_analysis: Option<Arc<crate::context::DebouncedAnalysis>>,
-    ) {
-        for file_id in file_ids {
-            self.add_diagnostic_task(file_id, interval, debounced_analysis.clone())
-                .await;
-        }
+        let file_id = self.analysis.read().await.get_file_id(uri)?;
+        self.store
+            .last(file_id)
+            .map(|stored| stored.diagnostics.to_vec())
     }
 
     /// Accumulate files whose diagnostics an edit may have moved. The debounced
@@ -358,48 +209,16 @@ impl FileDiagnostic {
         self.scoped_sweep_files.lock().await.clear();
     }
 
-    /// Drop the remembered report for a URI without telling the client.
-    pub async fn forget_cached_file_diagnostics(&self, uri: &Uri) {
-        self.cached_file_diagnostics.lock().await.remove(uri);
-    }
-
-    pub async fn clear_push_file_diagnostics(&self, uri: lsp_types::Uri) {
-        self.cached_file_diagnostics.lock().await.remove(&uri);
-
-        let diagnostic_param = PublishDiagnosticsParams {
-            uri,
-            diagnostics: vec![],
-            version: None,
-        };
-        self.client.publish_diagnostics(diagnostic_param);
-    }
-
+    /// After `interval` ms, computes every workspace file's diagnostics again;
+    /// the store publishes those that changed to a client that does not fetch
+    /// them.
     pub async fn add_workspace_diagnostic_task(&self, interval: u64, silent: bool) {
-        let mut token = self.workspace_diagnostic_token.lock().await;
-        if let Some(token) = token.as_ref() {
-            token.cancel();
-            debug!("cancel workspace diagnostic");
-        }
-
-        let cancel_token = CancellationToken::new();
-        token.replace(cancel_token.clone());
-        drop(token);
-
-        let analysis = self.analysis.clone();
-        let client_proxy = self.client.clone();
-        let status_bar = self.status_bar.clone();
+        let cancel_token = self.replace_workspace_diagnostic_token().await;
         let file_diagnostic = self.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(interval)) => {
-                    push_workspace_diagnostic(
-                        file_diagnostic,
-                        analysis,
-                        client_proxy,
-                        status_bar,
-                        silent,
-                        cancel_token,
-                    ).await
+                    file_diagnostic.sweep(None, silent, "push", cancel_token).await;
                 }
                 _ = cancel_token.cancelled() => {
                     log::info!("cancel workspace diagnostic");
@@ -408,21 +227,15 @@ impl FileDiagnostic {
         });
     }
 
-    #[allow(unused)]
-    pub async fn cancel_all(&self) {
-        let mut tokens = self.diagnostic_tokens.lock().await;
-        for token in tokens.values() {
+    async fn replace_workspace_diagnostic_token(&self) -> CancellationToken {
+        let mut token = self.workspace_diagnostic_token.lock().await;
+        if let Some(token) = token.as_ref() {
             token.cancel();
+            debug!("cancel workspace diagnostic");
         }
-        tokens.clear();
-    }
-
-    pub async fn cancel_file_diagnostic(&self, file_id: FileId) {
-        let mut tokens = self.diagnostic_tokens.lock().await;
-        if let Some(token) = tokens.remove(&file_id) {
-            token.cancel();
-            debug!("cancel diagnostic: {:?}", file_id);
-        }
+        let cancel_token = CancellationToken::new();
+        token.replace(cancel_token.clone());
+        cancel_token
     }
 
     pub async fn cancel_workspace_diagnostic(&self) {
@@ -434,40 +247,18 @@ impl FileDiagnostic {
         token.take();
     }
 
+    /// `uri`'s current diagnostics, computed ahead of every other file if
+    /// they do not hold.
     pub async fn pull_file_diagnostics(
         &self,
         uri: Uri,
         cancel_token: CancellationToken,
     ) -> Option<Vec<Diagnostic>> {
-        if cancel_token.is_cancelled() {
-            return None;
-        }
-
-        let analysis = self.analysis.clone();
-        let file_diagnostic = self.clone();
-        match tokio::task::spawn_blocking(move || {
-            if cancel_token.is_cancelled() {
-                return None;
-            }
-
-            // Pull diagnostics under a blocking read lock to avoid blocking async workers.
-            let guard = analysis.blocking_read();
-            let file_id = guard.get_file_id(&uri)?;
-
-            if cancel_token.is_cancelled() {
-                return None;
-            }
-
-            file_diagnostic.diagnose_file_with_shared_data(&guard, file_id, cancel_token)
-        })
-        .await
-        {
-            Ok(diagnostics) => diagnostics,
-            Err(err) => {
-                warn!("pull-file diagnostic worker failed: {}", err);
-                None
-            }
-        }
+        let file_id = self.analysis.read().await.get_file_id(&uri)?;
+        self.store
+            .get(file_id, super::Priority::Edited, &cancel_token)
+            .await
+            .map(|stored| stored.diagnostics.to_vec())
     }
 
     pub async fn pull_workspace_diagnostics_slow(
@@ -475,125 +266,8 @@ impl FileDiagnostic {
         cancel_token: CancellationToken,
     ) -> Vec<(Uri, Vec<Diagnostic>)> {
         info!("workspace diagnostic pull slow started");
-        let watchdog_status =
-            LongRunningWatchdogStatus::new("Preparing workspace diagnostics (slow pull)");
-        let _watchdog =
-            spawn_long_running_watchdog("workspace diagnostics", watchdog_status.clone());
-        let mut token = self.workspace_diagnostic_token.lock().await;
-        if let Some(token) = token.as_ref() {
-            token.cancel();
-            debug!("cancel workspace diagnostic");
-        }
-        token.replace(cancel_token.clone());
-        drop(token);
-
-        let mut result = Vec::new();
-        let status_bar = self.status_bar.clone();
-        status_bar
-            .create_progress_task(ProgressTask::DiagnoseWorkspace)
-            .await;
-        status_bar.update_progress_task(
-            ProgressTask::DiagnoseWorkspace,
-            None,
-            Some(String::from("Preparing diagnostics")),
-        );
-        watchdog_status.set_phase("Preparing workspace diagnostics (slow pull)");
-
-        let (main_workspace_file_ids, shared_data) = {
-            let analysis = self.analysis.read().await;
-            let file_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
-            info!(
-                "precomputing shared diagnostic data for {} workspace files",
-                file_ids.len()
-            );
-            let shared_data = self.get_or_precompute_shared_diagnostic_data(&analysis);
-            (file_ids, shared_data)
-        };
-        let valid_file_count = main_workspace_file_ids.len();
-        if valid_file_count != 0 {
-            status_bar.update_progress_task(
-                ProgressTask::DiagnoseWorkspace,
-                Some(0),
-                Some(format!("Diagnosing 0/{}", valid_file_count)),
-            );
-            watchdog_status.set_progress(
-                "Diagnosing workspace files (slow pull)",
-                0,
-                valid_file_count,
-            );
-        }
-        let in_flight = Arc::new(InFlightDiagnosticFiles::default());
-        watchdog_status.set_detail_source(in_flight.detail_source(self.analysis.clone()));
-        let mut rx = spawn_workspace_diagnostic_workers(
-            self.analysis.clone(),
-            main_workspace_file_ids,
-            shared_data,
-            cancel_token.clone(),
-            in_flight,
-        );
-
-        let mut count = 0;
-        let mut last_percentage = 0;
-        while count < valid_file_count {
-            tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    break;
-                }
-                file_diagnostic_result = rx.recv() => {
-                    let Some(file_diagnostic_result) = file_diagnostic_result else {
-                        break;
-                    };
-
-                    if let Some((diagnostics, uri)) = file_diagnostic_result {
-                        result.push((uri, diagnostics));
-                    }
-                    count += 1;
-                    let percentage_done = ((count as f32 / valid_file_count as f32) * 100.0) as u32;
-                    // The watchdog tracks every file; only the notification to
-                    // the client is rate-limited on the percentage.
-                    watchdog_status.set_progress(
-                        "Diagnosing workspace files (slow pull)",
-                        count,
-                        valid_file_count,
-                    );
-                    if last_percentage != percentage_done {
-                        last_percentage = percentage_done;
-                        let message = format!(
-                            "Diagnosing {}/{} ({}%)",
-                            count, valid_file_count, percentage_done
-                        );
-                        status_bar.update_progress_task(
-                            ProgressTask::DiagnoseWorkspace,
-                            Some(percentage_done),
-                            Some(message),
-                        );
-                    }
-                }
-            }
-        }
-        if count < valid_file_count && !cancel_token.is_cancelled() {
-            warn!(
-                "workspace diagnostic pull slow ended early: completed={} expected={}",
-                count, valid_file_count
-            );
-        }
-
-        status_bar.finish_progress_task(
-            ProgressTask::DiagnoseWorkspace,
-            Some("Diagnostics complete".to_string()),
-        );
-        if count == valid_file_count && !cancel_token.is_cancelled() {
-            self.notify_startup_complete();
-        } else {
-            info!(
-                "workspace diagnostic pull slow finished without startup completion: completed={} expected={} cancelled={}",
-                count,
-                valid_file_count,
-                cancel_token.is_cancelled()
-            );
-        }
-
-        result
+        self.adopt_workspace_diagnostic_token(&cancel_token).await;
+        self.sweep(None, false, "slow pull", cancel_token).await
     }
 
     pub async fn pull_workspace_diagnostics_fast(
@@ -602,158 +276,122 @@ impl FileDiagnostic {
     ) -> Vec<(Uri, Vec<Diagnostic>)> {
         info!("workspace diagnostic pull fast started");
         let sweep_started = crate::util::ls_profile::profile_instant();
-        let watchdog_status =
-            LongRunningWatchdogStatus::new("Preparing workspace diagnostics (fast pull)");
-        let _watchdog =
-            spawn_long_running_watchdog("workspace diagnostics", watchdog_status.clone());
-        let mut token = self.workspace_diagnostic_token.lock().await;
-        if let Some(token) = token.as_ref() {
-            token.cancel();
-            debug!("cancel workspace diagnostic");
-        }
-        token.replace(cancel_token.clone());
-        drop(token);
-
-        let mut result = Vec::new();
-        let status_bar = self.status_bar.clone();
-        status_bar
-            .create_progress_task(ProgressTask::DiagnoseWorkspace)
-            .await;
-        status_bar.update_progress_task(
-            ProgressTask::DiagnoseWorkspace,
-            None,
-            Some(String::from("Preparing diagnostics")),
-        );
-        watchdog_status.set_phase("Preparing workspace diagnostics (fast pull)");
-
+        self.adopt_workspace_diagnostic_token(&cancel_token).await;
         // An armed idle sweep after an edit is scoped to the files the burst
         // touched; the other Fast arms (open, reindex, config) leave the slot
-        // empty and sweep everything. Scoped ids are a subset of the main
-        // workspace list, so retaining keeps its cost-ordered dispatch.
+        // empty and sweep everything.
         let scoped = self.take_scoped_sweep_files().await;
         let was_scoped = scoped.is_some();
-        let (main_workspace_file_ids, shared_data) = {
-            let analysis = self.analysis.read().await;
-            let mut file_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
-            if let Some(scoped_ids) = &scoped {
-                let scoped_set: std::collections::HashSet<FileId> =
-                    scoped_ids.iter().copied().collect();
-                file_ids.retain(|file_id| scoped_set.contains(file_id));
-                info!(
-                    "edit-scoped workspace diagnostic sweep: {} file(s)",
-                    file_ids.len()
-                );
-            }
-            info!(
-                "precomputing shared diagnostic data for {} workspace files",
-                file_ids.len()
-            );
-            let shared_data = self.get_or_precompute_shared_diagnostic_data(&analysis);
-            (file_ids, shared_data)
-        };
-
-        let valid_file_count = main_workspace_file_ids.len();
-        if valid_file_count != 0 {
-            status_bar.update_progress_task(
-                ProgressTask::DiagnoseWorkspace,
-                Some(0),
-                Some(format!("Diagnosing 0/{}", valid_file_count)),
-            );
-            watchdog_status.set_progress(
-                "Diagnosing workspace files (fast pull)",
-                0,
-                valid_file_count,
-            );
-        }
-
-        let in_flight = Arc::new(InFlightDiagnosticFiles::default());
-        watchdog_status.set_detail_source(in_flight.detail_source(self.analysis.clone()));
-        let mut rx = spawn_workspace_diagnostic_workers(
-            self.analysis.clone(),
-            main_workspace_file_ids,
-            shared_data,
-            cancel_token.clone(),
-            in_flight,
-        );
-
-        let mut count = 0;
-        if valid_file_count != 0 {
-            let mut last_percentage = 0;
-
-            while count < valid_file_count {
-                tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        break;
-                    }
-                    file_diagnostic_result = rx.recv() => {
-                        let Some(file_diagnostic_result) = file_diagnostic_result else {
-                            break;
-                        };
-
-                        if let Some((diagnostics, uri)) = file_diagnostic_result {
-                            result.push((uri, diagnostics));
-                        }
-
-                        count += 1;
-                        let percentage_done = ((count as f32 / valid_file_count as f32) * 100.0) as u32;
-                        // See the slow pull above.
-                        watchdog_status.set_progress(
-                            "Diagnosing workspace files (fast pull)",
-                            count,
-                            valid_file_count,
-                        );
-                        if last_percentage != percentage_done {
-                            last_percentage = percentage_done;
-                            let message = format!(
-                                "Diagnosing {}/{} ({}%)",
-                                count, valid_file_count, percentage_done
-                            );
-                            status_bar.update_progress_task(
-                                ProgressTask::DiagnoseWorkspace,
-                                Some(percentage_done),
-                                Some(message),
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        let result = self
+            .sweep(scoped.clone(), false, "fast pull", cancel_token.clone())
+            .await;
         if cancel_token.is_cancelled() {
             // Re-diagnosing the few files already completed is cheap and keeps
             // the next armed sweep's coverage exact.
             self.restore_scoped_sweep_files(scoped.unwrap_or_default())
                 .await;
         }
-        if count < valid_file_count && !cancel_token.is_cancelled() {
-            warn!(
-                "workspace diagnostic pull fast ended early: completed={} expected={}",
-                count, valid_file_count
-            );
-        }
-
-        status_bar.finish_progress_task(
-            ProgressTask::DiagnoseWorkspace,
-            Some("Diagnostics complete".to_string()),
-        );
-        if count == valid_file_count && !cancel_token.is_cancelled() {
-            self.notify_startup_complete();
-        } else {
-            info!(
-                "workspace diagnostic pull fast finished without startup completion: completed={} expected={} cancelled={}",
-                count,
-                valid_file_count,
-                cancel_token.is_cancelled()
-            );
-        }
         if let Some(started) = sweep_started {
-            crate::util::ls_profile::emit_ls_diag_sweep(count, started.elapsed(), was_scoped);
+            crate::util::ls_profile::emit_ls_diag_sweep(
+                result.len(),
+                started.elapsed(),
+                was_scoped,
+            );
+        }
+        result
+    }
+
+    async fn adopt_workspace_diagnostic_token(&self, cancel_token: &CancellationToken) {
+        let mut token = self.workspace_diagnostic_token.lock().await;
+        if let Some(token) = token.as_ref() {
+            token.cancel();
+            debug!("cancel workspace diagnostic");
+        }
+        token.replace(cancel_token.clone());
+    }
+
+    /// The current diagnostics of the workspace files in `scope`, or of every
+    /// workspace file computed again when there is none.
+    async fn sweep(
+        &self,
+        scope: Option<Vec<FileId>>,
+        silent: bool,
+        label: &'static str,
+        cancel_token: CancellationToken,
+    ) -> Vec<(Uri, Vec<Diagnostic>)> {
+        let watchdog_status =
+            LongRunningWatchdogStatus::new(format!("Preparing workspace diagnostics ({label})"));
+        let _watchdog =
+            spawn_long_running_watchdog("workspace diagnostics", watchdog_status.clone());
+        let status_bar = self.status_bar.clone();
+        if !silent {
+            status_bar
+                .create_progress_task(ProgressTask::DiagnoseWorkspace)
+                .await;
+            status_bar.update_progress_task(
+                ProgressTask::DiagnoseWorkspace,
+                None,
+                Some(String::from("Preparing diagnostics")),
+            );
         }
 
-        result
+        let mut file_ids = self
+            .analysis
+            .read()
+            .await
+            .get_main_workspace_file_ids_for_diagnostics();
+        match &scope {
+            Some(scoped_ids) => {
+                let scoped_set = scoped_ids.iter().copied().collect::<HashSet<_>>();
+                file_ids.retain(|file_id| scoped_set.contains(file_id));
+                info!(
+                    "edit-scoped workspace diagnostic sweep: {} file(s)",
+                    file_ids.len()
+                );
+            }
+            None => self.store.invalidate_all(file_ids.iter().copied()),
+        }
+
+        watchdog_status.set_detail_source(self.store.watchdog_detail(self.analysis.clone()));
+        let total = file_ids.len();
+        let progress_label = format!("Diagnosing workspace files ({label})");
+        watchdog_status.set_progress(&progress_label, 0, total);
+        let mut last_percentage = None;
+        let stored = self
+            .store
+            .get_all(&file_ids, &cancel_token, |done| {
+                watchdog_status.set_progress(&progress_label, done, total);
+                let percentage = (done * 100 / total.max(1)) as u32;
+                if !silent && last_percentage != Some(percentage) {
+                    last_percentage = Some(percentage);
+                    status_bar.update_progress_task(
+                        ProgressTask::DiagnoseWorkspace,
+                        Some(percentage),
+                        Some(format!("Diagnosing {done}/{total} ({percentage}%)")),
+                    );
+                }
+            })
+            .await;
+
+        if !silent {
+            status_bar.finish_progress_task(
+                ProgressTask::DiagnoseWorkspace,
+                Some("Diagnostics complete".to_string()),
+            );
+        }
+        if cancel_token.is_cancelled() {
+            info!("workspace diagnostic {label} cancelled");
+        } else {
+            self.notify_startup_complete();
+        }
+        stored
+            .into_iter()
+            .map(|stored| (stored.uri, stored.diagnostics.to_vec()))
+            .collect()
     }
 }
 
-fn workspace_diagnostic_parallelism() -> usize {
+pub(crate) fn workspace_diagnostic_parallelism() -> usize {
     if let Ok(raw) = std::env::var("GLUALS_WORKSPACE_DIAGNOSTIC_PARALLELISM")
         && let Ok(parsed) = raw.parse::<usize>()
         && parsed > 0
@@ -767,327 +405,18 @@ fn workspace_diagnostic_parallelism() -> usize {
         .clamp(1, 16)
 }
 
-type WorkspaceDiagnosticResult = Option<(Vec<Diagnostic>, Uri)>;
-
-fn spawn_workspace_diagnostic_workers(
-    analysis: Arc<RwLock<EmmyLuaAnalysis>>,
-    file_ids: Vec<FileId>,
-    shared_data: Arc<SharedDiagnosticData>,
-    cancel_token: CancellationToken,
-    in_flight: Arc<InFlightDiagnosticFiles>,
-) -> tokio::sync::mpsc::Receiver<WorkspaceDiagnosticResult> {
-    let worker_count = workspace_diagnostic_parallelism().min(file_ids.len());
-    let file_ids = Arc::new(file_ids);
-    let next_file = Arc::new(AtomicUsize::new(0));
-    let (tx, rx) = tokio::sync::mpsc::channel(100);
-
-    for _ in 0..worker_count {
-        let analysis = analysis.clone();
-        let file_ids = file_ids.clone();
-        let next_file = next_file.clone();
-        let shared_data = shared_data.clone();
-        let cancel_token = cancel_token.clone();
-        let in_flight = in_flight.clone();
-        let tx = tx.clone();
-        // Per worker, never per file: fern flushes every record, so a line per
-        // file turns a workspace sweep into a log-I/O hotspot. Per-file
-        // visibility comes from `InFlightDiagnosticFiles` via the watchdog.
-        tokio::spawn(async move {
-            loop {
-                if cancel_token.is_cancelled() {
-                    log::trace!("workspace diagnostic worker exiting: cancelled");
-                    break;
-                }
-                let Some(file_id) = claim_next_diagnostic_file(&file_ids, &next_file) else {
-                    log::trace!("workspace diagnostic worker exiting: queue drained");
-                    break;
-                };
-                in_flight.claim(file_id);
-                let result = diagnose_workspace_file_off_thread(
-                    analysis.clone(),
-                    file_id,
-                    shared_data.clone(),
-                    cancel_token.clone(),
-                )
-                .await;
-                in_flight.release(file_id);
-                if tx.send(result).await.is_err() {
-                    log::trace!("workspace diagnostic worker exiting: receiver gone");
-                    break;
-                }
-            }
-        });
-    }
-
-    rx
-}
-
-/// The files the sweep has started and not finished, with when each was
-/// claimed, so a watchdog line can name the longest-running one.
-#[derive(Default)]
-pub struct InFlightDiagnosticFiles {
-    files: std::sync::Mutex<Vec<(FileId, std::time::Instant)>>,
-}
-
-impl InFlightDiagnosticFiles {
-    fn claim(&self, file_id: FileId) {
-        if let Ok(mut files) = self.files.lock() {
-            files.push((file_id, std::time::Instant::now()));
-        }
-    }
-
-    fn release(&self, file_id: FileId) {
-        if let Ok(mut files) = self.files.lock()
-            && let Some(index) = files.iter().position(|(id, _)| *id == file_id)
-        {
-            files.remove(index);
-        }
-    }
-
-    /// The in-flight files, longest-running first.
-    fn oldest_first(&self) -> Vec<(FileId, std::time::Duration)> {
-        let Ok(files) = self.files.lock() else {
-            return Vec::new();
-        };
-        let mut entries = files
-            .iter()
-            .map(|(id, started)| (*id, started.elapsed()))
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|(_, elapsed)| std::cmp::Reverse(*elapsed));
-        entries
-    }
-
-    /// A watchdog detail source naming the files the sweep is still inside.
-    pub fn detail_source(
-        self: &Arc<Self>,
-        analysis: Arc<RwLock<EmmyLuaAnalysis>>,
-    ) -> crate::util::WatchdogDetailSource {
-        let in_flight = self.clone();
-        Arc::new(move || {
-            let entries = in_flight.oldest_first();
-            if entries.is_empty() {
-                return None;
-            }
-            // `try_read`, because a sweep stuck holding the lock must still get
-            // a line out. Ids are reported bare when the guard is unavailable.
-            let described = match analysis.try_read() {
-                Ok(analysis) => {
-                    let vfs = analysis.compilation.get_db().get_vfs();
-                    entries
-                        .iter()
-                        .take(3)
-                        .map(|(file_id, elapsed)| {
-                            let path = vfs
-                                .get_file_path(file_id)
-                                .map(|path| path.to_string_lossy().to_string())
-                                .unwrap_or_else(|| format!("{file_id:?}"));
-                            format!("{path} ({}s)", elapsed.as_secs())
-                        })
-                        .collect::<Vec<_>>()
-                }
-                Err(_) => entries
-                    .iter()
-                    .take(3)
-                    .map(|(file_id, elapsed)| format!("{file_id:?} ({}s)", elapsed.as_secs()))
-                    .collect::<Vec<_>>(),
-            };
-            Some(format!(
-                "{} file(s) still being diagnosed, longest first: {}",
-                entries.len(),
-                described.join(", ")
-            ))
-        })
-    }
-}
-
-fn claim_next_diagnostic_file(file_ids: &[FileId], next_file: &AtomicUsize) -> Option<FileId> {
-    let index = next_file.fetch_add(1, Ordering::Relaxed);
-    file_ids.get(index).copied()
-}
-
-async fn diagnose_workspace_file_off_thread(
-    analysis: Arc<RwLock<EmmyLuaAnalysis>>,
-    file_id: FileId,
-    shared_data: Arc<glua_code_analysis::SharedDiagnosticData>,
-    cancel_token: CancellationToken,
-) -> Option<(Vec<Diagnostic>, Uri)> {
-    if cancel_token.is_cancelled() {
-        return None;
-    }
-
-    let blocking_analysis = analysis;
-    let blocking_shared_data = shared_data;
-    let blocking_token = cancel_token.clone();
-    match tokio::task::spawn_blocking(move || {
-        if blocking_token.is_cancelled() {
-            return None;
-        }
-
-        // Diagnose under a blocking read lock to avoid starving Tokio worker threads.
-        let guard = blocking_analysis.blocking_read();
-        let diagnostics = guard.diagnose_file_with_shared(
-            file_id,
-            blocking_token.clone(),
-            blocking_shared_data,
-        )?;
-        let uri = guard.get_uri(file_id)?;
-        Some((diagnostics, uri))
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(err) => {
-            warn!(
-                "workspace diagnostic worker failed for file {:?}: {}",
-                file_id, err
-            );
-            None
-        }
-    }
-}
-
-async fn push_workspace_diagnostic(
-    file_diagnostic: FileDiagnostic,
-    analysis: Arc<RwLock<EmmyLuaAnalysis>>,
-    client_proxy: Arc<ClientProxy>,
-    status_bar: Arc<StatusBar>,
-    silent: bool,
-    cancel_token: CancellationToken,
-) {
-    info!("workspace diagnostic push started; silent={}", silent);
-    let watchdog_status = LongRunningWatchdogStatus::new("Preparing workspace diagnostics (push)");
-    let _watchdog = spawn_long_running_watchdog("workspace diagnostics", watchdog_status.clone());
-    if !silent {
-        status_bar
-            .create_progress_task(ProgressTask::DiagnoseWorkspace)
-            .await;
-        status_bar.update_progress_task(
-            ProgressTask::DiagnoseWorkspace,
-            None,
-            Some(String::from("Preparing diagnostics")),
-        );
-    }
-    watchdog_status.set_phase("Preparing workspace diagnostics (push)");
-
-    // The push sweep runs only as the initial workspace pass (push clients get
-    // post-edit coverage from per-file diagnostic tasks), so it deliberately
-    // leaves the scoped-sweep slot alone and diagnoses everything.
-    let (main_workspace_file_ids, shared_data) = {
-        let read_analysis = analysis.read().await;
-        let file_ids = read_analysis.get_main_workspace_file_ids_for_diagnostics();
-        info!(
-            "precomputing shared diagnostic data for {} workspace files",
-            file_ids.len()
-        );
-        let shared_data = file_diagnostic.get_or_precompute_shared_diagnostic_data(&read_analysis);
-        (file_ids, shared_data)
-    };
-    let valid_file_count = main_workspace_file_ids.len();
-    if !silent && valid_file_count != 0 {
-        status_bar.update_progress_task(
-            ProgressTask::DiagnoseWorkspace,
-            Some(0),
-            Some(format!("Diagnosing 0/{}", valid_file_count)),
-        );
-    }
-    if valid_file_count != 0 {
-        watchdog_status.set_progress("Diagnosing workspace files (push)", 0, valid_file_count);
-    }
-
-    let in_flight = Arc::new(InFlightDiagnosticFiles::default());
-    watchdog_status.set_detail_source(in_flight.detail_source(analysis.clone()));
-    let mut rx = spawn_workspace_diagnostic_workers(
-        analysis,
-        main_workspace_file_ids,
-        shared_data,
-        cancel_token.clone(),
-        in_flight,
-    );
-
-    let mut count = 0;
-    if valid_file_count != 0 {
-        let mut last_percentage = 0;
-        while count < valid_file_count {
-            tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    break;
-                }
-                maybe_result = rx.recv() => {
-                    let Some(result) = maybe_result else {
-                        break;
-                    };
-                    if let Some((diagnostics, uri)) = result {
-                        let diagnostic_param = lsp_types::PublishDiagnosticsParams {
-                            uri,
-                            diagnostics,
-                            version: None,
-                        };
-                        client_proxy.publish_diagnostics(diagnostic_param);
-                    }
-                    count += 1;
-                    let percentage_done = ((count as f32 / valid_file_count as f32) * 100.0) as u32;
-                    // See the slow pull above.
-                    watchdog_status.set_progress(
-                        "Diagnosing workspace files (push)",
-                        count,
-                        valid_file_count,
-                    );
-                    if last_percentage != percentage_done {
-                        last_percentage = percentage_done;
-                        if !silent {
-                            let message = format!(
-                                "Diagnosing {}/{} ({}%)",
-                                count, valid_file_count, percentage_done
-                            );
-                            status_bar.update_progress_task(
-                                ProgressTask::DiagnoseWorkspace,
-                                Some(percentage_done),
-                                Some(message),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        if count < valid_file_count && !cancel_token.is_cancelled() {
-            warn!(
-                "workspace diagnostic push ended early: completed={} expected={} silent={}",
-                count, valid_file_count, silent
-            );
-        }
-    }
-
-    if !silent {
-        status_bar.finish_progress_task(
-            ProgressTask::DiagnoseWorkspace,
-            Some("Diagnostics complete".to_string()),
-        );
-        if count == valid_file_count && !cancel_token.is_cancelled() {
-            file_diagnostic.notify_startup_complete();
-        } else {
-            info!(
-                "workspace diagnostic push finished without startup completion: completed={} expected={} cancelled={} silent={}",
-                count,
-                valid_file_count,
-                cancel_token.is_cancelled(),
-                silent
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::context::{ClientProxy, StatusBar};
+    use crate::context::{ClientProxy, ServerContext, StatusBar};
     use glua_code_analysis::{DiagnosticCode, EmmyLuaAnalysis, Emmyrc, FileId, file_path_to_uri};
     use googletest::prelude::*;
     use lsp_server::{Connection, Message};
-    use lsp_types::NumberOrString;
-    use std::sync::{Arc, atomic::AtomicUsize};
+    use lsp_types::{ClientCapabilities, NumberOrString};
+    use std::sync::Arc;
     use tokio::sync::RwLock;
     use tokio_util::sync::CancellationToken;
 
-    use super::{FileDiagnostic, claim_next_diagnostic_file};
+    use super::FileDiagnostic;
 
     #[gtest]
     fn concurrent_diagnostic_pulls_share_the_first_precompute() {
@@ -1130,27 +459,6 @@ mod tests {
             );
             cache.invalidate();
         }
-    }
-
-    #[gtest]
-    fn workspace_diagnostic_workers_claim_the_shared_priority_queue_in_order() -> Result<()> {
-        let prioritized = [FileId::new(9), FileId::new(3), FileId::new(7)];
-        let next_file = AtomicUsize::new(0);
-
-        verify_that!(
-            claim_next_diagnostic_file(&prioritized, &next_file),
-            some(eq(FileId::new(9)))
-        )?;
-        verify_that!(
-            claim_next_diagnostic_file(&prioritized, &next_file),
-            some(eq(FileId::new(3)))
-        )?;
-        verify_that!(
-            claim_next_diagnostic_file(&prioritized, &next_file),
-            some(eq(FileId::new(7)))
-        )?;
-        verify_that!(claim_next_diagnostic_file(&prioritized, &next_file), none())?;
-        Ok(())
     }
 
     #[gtest]
@@ -1218,18 +526,17 @@ mod tests {
             .map(|(id, _)| id)
             .expect("client file should be indexed");
 
-        let (connection, _peer) = Connection::memory();
-        let client = Arc::new(ClientProxy::new(connection));
-        let status_bar = Arc::new(StatusBar::new(client.clone(), true));
-        let analysis = Arc::new(RwLock::new(analysis));
-        let file_diagnostic = FileDiagnostic::new(analysis.clone(), status_bar, client, false);
-
-        let diagnostics = {
-            let guard = analysis.blocking_read();
-            file_diagnostic
-                .diagnose_file_with_shared_data(&guard, client_file, CancellationToken::new())
+        let cache = super::SharedDiagnosticDataCache::default();
+        let diagnose = |analysis: &EmmyLuaAnalysis| {
+            analysis
+                .diagnose_file_with_shared(
+                    client_file,
+                    CancellationToken::new(),
+                    cache.get_or_precompute(analysis),
+                )
                 .unwrap_or_default()
         };
+        let diagnostics = diagnose(&analysis);
 
         let target_code = Some(NumberOrString::String(
             DiagnosticCode::GmodRealmMismatchHeuristic
@@ -1243,23 +550,12 @@ mod tests {
             eq(true)
         )?;
 
-        let first_cached = file_diagnostic.shared_diagnostic_data_cache.cached_ptr();
-        {
-            let guard = analysis.blocking_read();
-            let _ = file_diagnostic.diagnose_file_with_shared_data(
-                &guard,
-                client_file,
-                CancellationToken::new(),
-            );
-        }
-        let second_cached = file_diagnostic.shared_diagnostic_data_cache.cached_ptr();
-        verify_that!(second_cached, eq(first_cached))?;
+        let first_cached = cache.cached_ptr();
+        diagnose(&analysis);
+        verify_that!(cache.cached_ptr(), eq(first_cached))?;
 
-        file_diagnostic.invalidate_shared_diagnostic_data();
-        verify_that!(
-            file_diagnostic.shared_diagnostic_data_cache.is_empty(),
-            eq(true)
-        )?;
+        cache.invalidate();
+        verify_that!(cache.is_empty(), eq(true))?;
 
         Ok(())
     }
@@ -1307,28 +603,28 @@ mod tests {
     fn fast_pull_scopes_to_noted_files() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
-            let mut analysis = EmmyLuaAnalysis::new();
+            let (connection, _peer) = Connection::memory();
+            let context = ServerContext::new(connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
             let workspace = std::env::temp_dir().join("gmod_glua_ls_scoped_fast_pull_workspace");
-            analysis.add_main_workspace(workspace.clone());
-            let mut emmyrc = Emmyrc::default();
-            emmyrc.gmod.enabled = true;
-            analysis.update_config(Arc::new(emmyrc));
-
             let uri_a = file_path_to_uri(&workspace.join("lua/autorun/sh_a.lua"))
                 .expect("uri A should parse");
-            let file_a = analysis
-                .update_file_by_uri(&uri_a, Some("local a = 1".to_string()))
-                .map(|(id, _)| id)
-                .expect("file A should be indexed");
-            let uri_b = file_path_to_uri(&workspace.join("lua/autorun/sh_b.lua"))
-                .expect("uri B should parse");
-            analysis.update_file_by_uri(&uri_b, Some("local b = 1".to_string()));
-
-            let (connection, _peer) = Connection::memory();
-            let client = Arc::new(ClientProxy::new(connection));
-            let status_bar = Arc::new(StatusBar::new(client.clone(), true));
-            let analysis = Arc::new(RwLock::new(analysis));
-            let file_diagnostic = FileDiagnostic::new(analysis.clone(), status_bar, client, false);
+            let file_a = {
+                let mut analysis = snapshot.analysis().write().await;
+                analysis.add_main_workspace(workspace.clone());
+                let mut emmyrc = Emmyrc::default();
+                emmyrc.gmod.enabled = true;
+                analysis.update_config(Arc::new(emmyrc));
+                let file_a = analysis
+                    .update_file_by_uri(&uri_a, Some("local a = 1".to_string()))
+                    .map(|(id, _)| id)
+                    .expect("file A should be indexed");
+                let uri_b = file_path_to_uri(&workspace.join("lua/autorun/sh_b.lua"))
+                    .expect("uri B should parse");
+                analysis.update_file_by_uri(&uri_b, Some("local b = 1".to_string()));
+                file_a
+            };
+            let file_diagnostic = snapshot.file_diagnostic();
 
             // Scoped: only the noted file is swept.
             file_diagnostic.note_scoped_sweep_files([file_a]).await;
