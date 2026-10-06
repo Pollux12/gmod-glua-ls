@@ -331,6 +331,8 @@ pub enum FactKey {
     GmodVguiRegistrations(FileId),
     /// The set of files that have vgui parent calls.
     VguiParentCallFiles,
+    /// What one file's own vgui parent calls resolve to.
+    VguiRelations(FileId),
     /// A vgui panel's parent chain.
     VguiChain(LuaTypeDeclId),
     /// A file's gmod realm, hook, system and scoped-class metadata.
@@ -577,6 +579,7 @@ impl FactKey {
                 | K::FlowTree(_)
                 | K::Metatable(_)
                 | K::VguiChain(_)
+                | K::VguiRelations(_)
                 | K::GmodInferFile(_)
                 | K::GmodRealm(_)
                 | K::GmodLoadFile(_)
@@ -846,6 +849,7 @@ impl FactKey {
             | K::GmodClassFile(file_id)
             | K::GmodBaseClass(file_id)
             | K::GmodVguiRegistrations(file_id)
+            | K::VguiRelations(file_id)
             | K::GmodInferFile(file_id)
             | K::GmodRealm(file_id)
             | K::GmodLoadFile(file_id)
@@ -962,6 +966,8 @@ pub enum DerivationKind {
     /// A file's synthesized scripted-class members, registrations and numeric
     /// populations.
     GmodPost,
+    /// What a file's own vgui parent calls resolve to.
+    VguiRelations,
     /// The workspace vgui parent chains.
     VguiChains,
     /// A file's `AccessorFunc` getters and setters.

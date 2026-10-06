@@ -147,4 +147,76 @@ mod test {
         );
         assert_settled_as_cold(&ws, &texts, "every file moved");
     }
+
+    const VGUI_FILES: &[(&str, &str)] = &[
+        (
+            "lua/vgui/tab_button.lua",
+            r#"
+            ---@class Panel
+            ---@field GetParent fun(self: Panel): Panel
+            ---@class DPanel: Panel
+            ---@class TabButton: Panel
+            local TabButton = {}
+            function TabButton:Click() end
+            vgui.Register("TabButton", TabButton, "Panel")
+            "#,
+        ),
+        (
+            "lua/vgui/tabbed_frame.lua",
+            r#"
+            ---@class TabbedFrame: Panel
+            local TabbedFrame = {}
+            function TabbedFrame:Init()
+                self.tabList = vgui.Create("DPanel", self)
+            end
+            function TabbedFrame:AddTab()
+                local button = vgui.Create("TabButton", self.tabList)
+            end
+            vgui.Register("TabbedFrame", TabbedFrame, "Panel")
+            "#,
+        ),
+        ("lua/autorun/sh_other.lua", "local value = 1\n"),
+    ];
+
+    fn tab_button_chain(ws: &VirtualWorkspace) -> Option<Vec<String>> {
+        ws.analysis
+            .compilation
+            .get_db()
+            .get_gmod_class_metadata_index()
+            .get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("TabButton"))
+            .map(|chain| chain.iter().map(|id| id.get_name().to_string()).collect())
+    }
+
+    fn evaluations(ws: &VirtualWorkspace, kind: DerivationKind) -> usize {
+        ws.analysis.compilation.last_stats().evaluations(kind)
+    }
+
+    #[test]
+    fn an_edit_re_resolves_only_its_own_files_vgui_parent_calls() {
+        let mut ws = workspace(VGUI_FILES);
+        assert_eq!(
+            tab_button_chain(&ws),
+            Some(vec!["DPanel".to_string(), "TabbedFrame".to_string()])
+        );
+        let mut texts = VGUI_FILES
+            .iter()
+            .map(|(path, text)| (*path, text.to_string()))
+            .collect::<Vec<_>>();
+
+        texts[2].1.insert(0, '\n');
+        ws.def_file(texts[2].0, &texts[2].1);
+        assert_eq!(evaluations(&ws, DerivationKind::VguiRelations), 1);
+        assert_eq!(evaluations(&ws, DerivationKind::VguiChains), 0);
+        assert_settled_as_cold(&ws, &texts, "unrelated file moved");
+
+        texts[1].1.insert(0, '\n');
+        ws.def_file(texts[1].0, &texts[1].1);
+        assert_eq!(evaluations(&ws, DerivationKind::VguiChains), 0);
+        assert_settled_as_cold(&ws, &texts, "parent calls moved");
+
+        texts[1].1 = texts[1].1.replace("self.tabList)", "self)");
+        ws.def_file(texts[1].0, &texts[1].1);
+        assert_eq!(tab_button_chain(&ws), Some(vec!["TabbedFrame".to_string()]));
+        assert_settled_as_cold(&ws, &texts, "parent call changed");
+    }
 }

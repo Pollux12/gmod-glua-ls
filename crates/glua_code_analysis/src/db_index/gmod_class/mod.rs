@@ -353,6 +353,23 @@ pub enum GmodVguiParentSourceResolution {
     },
 }
 
+/// One vgui parent call with its child and parent resolved to type ids.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GmodVguiResolvedParentCall {
+    pub child_type_ids: Vec<LuaTypeDeclId>,
+    pub parent: GmodVguiParentSourceResolution,
+}
+
+/// What one file's own vgui parent calls resolve to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct GmodVguiFileRelations {
+    /// The forwarding parents the file's calls propose, sorted by owner and
+    /// method: `None` where two of its calls disagree.
+    pub forwarding_candidates: Vec<((LuaTypeDeclId, String), Option<Vec<LuaTypeDeclId>>)>,
+    /// The file's calls resolved, in source order.
+    pub calls: Vec<GmodVguiResolvedParentCall>,
+}
+
 impl GmodScriptedClassFileMetadata {
     pub fn get_define_baseclass_name(&self) -> Option<&str> {
         self.define_baseclass_calls.iter().rev().find_map(|call| {
@@ -397,6 +414,8 @@ pub struct GmodClassMetadataIndex {
     /// Incremental multiset fingerprint, per panel/skin name, of the
     /// registration calls a name-keyed read can observe.
     meta_fingerprints: CowShards<SmolStr, Fingerprint>,
+    /// What each file's own vgui parent calls resolve to.
+    vgui_file_relations: CowShards<FileId, std::sync::Arc<GmodVguiFileRelations>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -422,6 +441,7 @@ impl GmodClassMetadataIndex {
             vgui_panel_parent_chains: Default::default(),
             incomplete_vgui_panel_parent_chains: Default::default(),
             meta_fingerprints: Default::default(),
+            vgui_file_relations: Default::default(),
         }
     }
 
@@ -550,6 +570,9 @@ impl GmodClassMetadataIndex {
                 derivation::fingerprint_of(&calls.collect::<Vec<_>>())
             }
             FactKey::VguiParentCallFiles => self.vgui_parent_call_files.get(),
+            FactKey::VguiRelations(file_id) => {
+                derivation::fingerprint_opt(self.vgui_file_relations.get(file_id))
+            }
             FactKey::VguiChain(type_id) => {
                 let chain = self.vgui_panel_parent_chains.get(type_id);
                 let incomplete = self.incomplete_vgui_panel_parent_chains.contains(type_id);
@@ -897,6 +920,28 @@ impl GmodClassMetadataIndex {
             .contains(child_type_id)
     }
 
+    /// Stores what `file_id`'s own vgui parent calls resolve to.
+    pub fn set_vgui_file_relations(&mut self, file_id: FileId, relations: GmodVguiFileRelations) {
+        derivation::note_write(|| FactKey::VguiRelations(file_id));
+        self.vgui_file_relations
+            .insert(file_id, std::sync::Arc::new(relations));
+    }
+
+    /// What `file_id`'s own vgui parent calls resolve to.
+    pub fn get_vgui_file_relations(&self, file_id: FileId) -> Option<&GmodVguiFileRelations> {
+        derivation::note_read(|| FactKey::VguiRelations(file_id));
+        self.vgui_file_relations
+            .get(&file_id)
+            .map(|relations| &**relations)
+    }
+
+    /// Drops what `file_id`'s own vgui parent calls resolve to.
+    pub fn remove_vgui_file_relations(&mut self, file_id: FileId) {
+        if self.vgui_file_relations.remove(&file_id).is_some() {
+            derivation::note_write(|| FactKey::VguiRelations(file_id));
+        }
+    }
+
     /// Replaces the parent chains with those `relations` agree on. A child
     /// with an incomplete relation or two disagreeing chains has none.
     pub fn set_vgui_parent_relations(&mut self, relations: &[GmodVguiParentRelation]) {
@@ -1088,6 +1133,25 @@ impl LuaIndex for GmodClassMetadataIndex {
 
     fn remove_files(&mut self, file_ids: &[FileId]) {
         for &file_id in file_ids {
+            self.remove_vgui_file_relations(file_id);
+        }
+        self.remove_file_metadata(file_ids);
+    }
+
+    fn clear(&mut self) {
+        for file_id in self.vgui_file_relations.keys() {
+            derivation::note_write(|| FactKey::VguiRelations(*file_id));
+        }
+        self.vgui_file_relations.clear();
+        self.clear_metadata();
+    }
+}
+
+impl GmodClassMetadataIndex {
+    /// Drops the call metadata of `file_ids`, which their call-site passes
+    /// write; what their vgui parent calls resolve to stays.
+    pub fn remove_file_metadata(&mut self, file_ids: &[FileId]) {
+        for &file_id in file_ids {
             let Some(metadata) = self.file_metadata.remove(&file_id) else {
                 continue;
             };
@@ -1124,7 +1188,7 @@ impl LuaIndex for GmodClassMetadataIndex {
         self.recompute_derived_caches();
     }
 
-    fn clear(&mut self) {
+    fn clear_metadata(&mut self) {
         for file_id in self.file_metadata.keys() {
             derivation::note_write(|| FactKey::GmodClassFile(*file_id));
         }
@@ -1398,4 +1462,5 @@ crate::db_index::cow_shards::task_fork_fields!(GmodClassMetadataIndex {
     vgui_panel_parent_chains,
     incomplete_vgui_panel_parent_chains,
     meta_fingerprints => crate::db_index::cow_shards::merge_sum,
+    vgui_file_relations,
 });

@@ -299,6 +299,20 @@ pub(crate) fn evaluate_post(db: &mut DbIndex, context: &mut AnalyzeContext) {
     collect_numeric_range_table_populations(db, context);
 }
 
+/// What one file's own vgui parent calls resolve to.
+pub(crate) fn evaluate_vgui_relations(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    if !db.get_emmyrc().gmod.enabled {
+        return;
+    }
+    let Some(file_id) = context.tree_list.first().map(|tree| tree.file_id) else {
+        return;
+    };
+    if let Some(relations) = resolve_vgui_file_relations(db, context, file_id) {
+        db.get_gmod_class_metadata_index_mut()
+            .set_vgui_file_relations(file_id, relations);
+    }
+}
+
 /// The workspace vgui parent chains, from every file's parent calls.
 pub(crate) fn evaluate_vgui_chains(db: &mut DbIndex, context: &mut AnalyzeContext) {
     if !db.get_emmyrc().gmod.enabled {

@@ -56,7 +56,7 @@ mod numeric_range_population;
 pub(crate) use derive::{
     apply_pre, compute_pre, evaluate_call_roles, evaluate_class_call_sites, evaluate_load,
     evaluate_load_call_sites, evaluate_net_helper_names, evaluate_network, evaluate_post,
-    evaluate_valid_guards, evaluate_vgui_chains,
+    evaluate_valid_guards, evaluate_vgui_chains, evaluate_vgui_relations,
 };
 pub(crate) use network::{
     FileNetHelpers, apply_net_helpers, apply_network_flows, compute_net_helpers,
@@ -1941,11 +1941,7 @@ pub(crate) fn resolve_scoped_authoring_type(
 
 use crate::GmodVguiParentSourceResolution as ResolvedVguiParentSource;
 
-#[derive(Clone)]
-struct ResolvedVguiParentRelation {
-    child_type_ids: Vec<LuaTypeDeclId>,
-    parent: ResolvedVguiParentSource,
-}
+use crate::GmodVguiResolvedParentCall as ResolvedVguiParentRelation;
 
 #[derive(Clone)]
 enum VguiParentChainResolution {
@@ -1964,60 +1960,115 @@ enum ForwardingParentCandidate {
     Conflicted,
 }
 
+/// What `file_id`'s own vgui parent calls resolve to, `None` without any.
+pub(super) fn resolve_vgui_file_relations(
+    db: &DbIndex,
+    context: &mut AnalyzeContext,
+    file_id: FileId,
+) -> Option<crate::GmodVguiFileRelations> {
+    let calls = db
+        .get_gmod_class_metadata_index()
+        .get_vgui_parent_calls(&file_id)
+        .to_vec();
+    if calls.is_empty() {
+        return None;
+    }
+    let root = db.get_vfs().get_syntax_tree(&file_id)?.get_red_root();
+    let cache = context.infer_manager.get_infer_cache(file_id);
+    let mut candidates = HashMap::default();
+    index_vgui_forwarding_parent_candidates(db, cache, file_id, &root, &calls, &mut candidates);
+    let mut forwarding_candidates = candidates
+        .into_iter()
+        .map(|(key, candidate)| {
+            let parent_type_ids = match candidate {
+                ForwardingParentCandidate::Consistent(parent_type_ids) => Some(parent_type_ids),
+                ForwardingParentCandidate::Conflicted => None,
+            };
+            (key, parent_type_ids)
+        })
+        .collect::<Vec<_>>();
+    forwarding_candidates
+        .sort_by_cached_key(|((owner, method), _)| (format!("{owner:?}"), method.clone()));
+    Some(crate::GmodVguiFileRelations {
+        forwarding_candidates,
+        calls: resolve_vgui_parent_calls(db, cache, &root, &calls),
+    })
+}
+
+/// `calls` of the file whose tree is `root`, with their child and parent
+/// resolved to type ids.
+fn resolve_vgui_parent_calls(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaSyntaxNode,
+    calls: &[GmodVguiParentCallMetadata],
+) -> Vec<ResolvedVguiParentRelation> {
+    let field_assignment_parents = index_vgui_field_assignment_parents(db, cache, root);
+    calls
+        .iter()
+        .filter_map(|call| {
+            let call_expr = call
+                .syntax_id
+                .to_node_from_root(root)
+                .and_then(LuaCallExpr::cast)?;
+            let child_type_ids = resolve_vgui_parent_source_type_ids(
+                db,
+                cache,
+                root,
+                &field_assignment_parents,
+                &call_expr,
+                &call.child,
+            );
+            let parent = resolve_vgui_parent_source(
+                db,
+                cache,
+                root,
+                &field_assignment_parents,
+                &call_expr,
+                &call.parent,
+            );
+            Some(ResolvedVguiParentRelation {
+                child_type_ids,
+                parent,
+            })
+        })
+        .collect()
+}
+
+/// Folds every file's resolved vgui parent calls, and the calls that forward
+/// to a parent the files agree on, into the workspace parent chains.
 fn resolve_vgui_parent_relations(db: &mut DbIndex, context: &mut AnalyzeContext) {
     let file_ids = db.get_gmod_class_metadata_index().vgui_parent_call_files();
-    let _p_cand = crate::profile::PhaseGuard::new("vgui/parent_candidates");
     let mut forwarding_parent_candidates =
         HashMap::<(LuaTypeDeclId, String), ForwardingParentCandidate>::default();
+    let mut relations_by_file = Vec::with_capacity(file_ids.len());
     for file_id in &file_ids {
-        let calls = db
+        let Some(relations) = db
             .get_gmod_class_metadata_index()
-            .get_vgui_parent_calls(file_id);
-        let Some(root) = db
-            .get_vfs()
-            .get_syntax_tree(file_id)
-            .map(|tree| tree.get_red_root())
+            .get_vgui_file_relations(*file_id)
         else {
             continue;
         };
-        let cache = context.infer_manager.get_infer_cache(*file_id);
-        index_vgui_forwarding_parent_candidates(
-            db,
-            cache,
-            *file_id,
-            &root,
-            &calls,
-            &mut forwarding_parent_candidates,
-        );
+        for (key, parent_type_ids) in &relations.forwarding_candidates {
+            match parent_type_ids {
+                Some(parent_type_ids) => record_vgui_forwarding_parent_candidate(
+                    &mut forwarding_parent_candidates,
+                    key.clone(),
+                    parent_type_ids.clone(),
+                ),
+                None => {
+                    forwarding_parent_candidates
+                        .insert(key.clone(), ForwardingParentCandidate::Conflicted);
+                }
+            }
+        }
+        relations_by_file.push(relations.calls.clone());
     }
-    drop(_p_cand);
     let forwarding_parents =
         finalize_vgui_forwarding_parent_candidates(forwarding_parent_candidates);
-    let mut calls_by_file = file_ids
-        .iter()
-        .map(|file_id| {
-            let calls = db
-                .get_gmod_class_metadata_index()
-                .get_vgui_parent_calls(file_id)
-                .to_vec();
-            (*file_id, calls)
-        })
-        .collect::<HashMap<_, _>>();
     for (file_id, forwarded) in
         collect_vgui_forwarding_parent_calls(db, context, &forwarding_parents)
     {
-        calls_by_file.entry(file_id).or_default().extend(forwarded);
-    }
-    let mut calls_by_file = calls_by_file.into_iter().collect::<Vec<_>>();
-    calls_by_file.sort_by_key(|(file_id, _)| file_id.id);
-    let mut relations_by_file = Vec::new();
-    for (file_id, mut calls) in calls_by_file {
-        calls.sort_by_key(|call| {
-            (
-                call.syntax_id.get_range().start(),
-                call.syntax_id.get_range().end(),
-            )
-        });
         let Some(root) = db
             .get_vfs()
             .get_syntax_tree(&file_id)
@@ -2026,43 +2077,12 @@ fn resolve_vgui_parent_relations(db: &mut DbIndex, context: &mut AnalyzeContext)
             continue;
         };
         let cache = context.infer_manager.get_infer_cache(file_id);
-        let field_assignment_parents = index_vgui_field_assignment_parents(db, cache, &root);
-        let mut relations = Vec::with_capacity(calls.len());
-        for call in calls {
-            let Some(call_expr) = call
-                .syntax_id
-                .to_node_from_root(&root)
-                .and_then(LuaCallExpr::cast)
-            else {
-                continue;
-            };
-            let child_type_ids = resolve_vgui_parent_source_type_ids(
-                db,
-                cache,
-                &root,
-                &field_assignment_parents,
-                &call_expr,
-                &call.child,
-            );
-            let parent = resolve_vgui_parent_source(
-                db,
-                cache,
-                &root,
-                &field_assignment_parents,
-                &call_expr,
-                &call.parent,
-            );
-            relations.push(ResolvedVguiParentRelation {
-                child_type_ids,
-                parent,
-            });
-        }
-        relations_by_file.push((file_id, relations));
+        relations_by_file.push(resolve_vgui_parent_calls(db, cache, &root, &forwarded));
     }
 
     let mut direct_parents_by_child = HashMap::<LuaTypeDeclId, Vec<Vec<LuaTypeDeclId>>>::default();
     let mut relations_by_child = HashMap::<LuaTypeDeclId, Vec<ResolvedVguiParentSource>>::default();
-    for (_, relations) in &relations_by_file {
+    for relations in &relations_by_file {
         for relation in relations {
             for child_type_id in &relation.child_type_ids {
                 if let ResolvedVguiParentSource::Direct(parent_type_ids) = &relation.parent {
@@ -2081,7 +2101,7 @@ fn resolve_vgui_parent_relations(db: &mut DbIndex, context: &mut AnalyzeContext)
 
     let mut direct_chain_memo = HashMap::default();
     let mut resolved = Vec::new();
-    for (_, relations) in relations_by_file {
+    for relations in relations_by_file {
         for relation in relations {
             resolved.extend(relation.child_type_ids.into_iter().map(|child_type_id| {
                 let resolution = resolve_vgui_parent_chain(

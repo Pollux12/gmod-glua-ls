@@ -91,6 +91,7 @@ pub(super) fn file_derivations(
         DerivationKind::ChunkReturn,
         DerivationKind::GmodClassCallSites,
         DerivationKind::GmodPost,
+        DerivationKind::VguiRelations,
         DerivationKind::AccessorFunc,
         DerivationKind::DynamicFields,
         DerivationKind::SetmetatableFactory,
@@ -542,6 +543,7 @@ impl Recipes {
             DerivationKind::GmodLoadCallSites => gmod::evaluate_load_call_sites(db, context),
             DerivationKind::GmodClassCallSites => gmod::evaluate_class_call_sites(db, context),
             DerivationKind::GmodPost => gmod::evaluate_post(db, context),
+            DerivationKind::VguiRelations => gmod::evaluate_vgui_relations(db, context),
             DerivationKind::AccessorFunc => synthesize_accessorfunc_members(db, &file_ids),
             DerivationKind::SetmetatableFactory => {
                 setmetatable_factory::synthesize_setmetatable_factory_members(db, &file_ids)

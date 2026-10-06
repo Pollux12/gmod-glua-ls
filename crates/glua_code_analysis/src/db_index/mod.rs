@@ -331,7 +331,10 @@ impl DbIndex {
                 .reset_file_metadata(*file_id),
             K::GmodClassFile(file_id) => self
                 .get_gmod_class_metadata_index_mut()
-                .remove_files(&[*file_id]),
+                .remove_file_metadata(&[*file_id]),
+            K::VguiRelations(file_id) => self
+                .get_gmod_class_metadata_index_mut()
+                .remove_vgui_file_relations(*file_id),
             K::CallSiteFile(file_id) => self.get_call_site_param_index_mut().retract_file(*file_id),
             _ => {}
         }
@@ -510,7 +513,8 @@ impl DbIndex {
             | K::GmodBaseClass(_)
             | K::GmodVguiRegistrations(_)
             | K::VguiChain(_)
-            | K::VguiParentCallFiles => self.gmod_class_index.fact_fingerprint(key),
+            | K::VguiParentCallFiles
+            | K::VguiRelations(_) => self.gmod_class_index.fact_fingerprint(key),
             K::GmodInferFile(_)
             | K::GmodRealm(_)
             | K::GmodRealmAt(..)
