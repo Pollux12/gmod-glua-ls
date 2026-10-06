@@ -382,7 +382,7 @@ pub(crate) struct Engine {
     to_follow: derivation::EditMaps,
     /// Fingerprints of keys with `edits` undone, taken once per value: the
     /// same moved key is checked for every reader it queued.
-    before_edits: std::cell::RefCell<FxHashMap<HashedKey, derivation::Fingerprint>>,
+    before_edits: std::sync::Mutex<FxHashMap<HashedKey, derivation::Fingerprint>>,
     /// Stage rules that moved since the key table was last lent: memos that
     /// read them no longer hold.
     moved_rules: std::cell::RefCell<Vec<HashedKey>>,
@@ -544,7 +544,7 @@ impl Engine {
             })
             .collect();
         self.to_follow = later;
-        self.before_edits.get_mut().clear();
+        self.before_edits_mut().clear();
         self.since_search = None;
     }
 
@@ -565,23 +565,20 @@ impl Engine {
     }
 
     fn fingerprint_before_edits(&self, db: &DbIndex, key: &HashedKey) -> derivation::Fingerprint {
-        if let Some(fingerprint) = self.before_edits.borrow().get(key) {
-            return *fingerprint;
-        }
-        let fingerprint =
-            derivation::fingerprint_before_edits(&self.edits, || db.fact_fingerprint(key));
+        fingerprint_before_edits(db, &self.edits, &self.before_edits, key)
+    }
+
+    fn before_edits_mut(&mut self) -> &mut FxHashMap<HashedKey, derivation::Fingerprint> {
         self.before_edits
-            .borrow_mut()
-            .insert(key.clone(), fingerprint);
-        fingerprint
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// `key`'s current fingerprint, taken once per value. Every write inside
     /// an evaluation is one of its outputs, so a group's touched keys are the
     /// only ones it can move; writes outside `run` forget every fingerprint.
     fn fingerprint(&self, db: &DbIndex, key: &HashedKey) -> derivation::Fingerprint {
-        db.reader_graph()
-            .current_fingerprint(key, |key| db.fact_fingerprint(key))
+        current_fingerprint(db, key)
     }
 
     /// Under `GLUALS_CHECK_FINGERPRINTS`, panics if a cached key other than
@@ -761,7 +758,7 @@ impl Engine {
                 keys.insert(key.clone());
             }
             if !self.edits.is_empty() {
-                self.before_edits.get_mut().remove(key);
+                self.before_edits_mut().remove(key);
                 self.touched.insert(key.clone());
             }
             let readers = readers.unwrap_or_else(|| self.stale_readers(db, key));
@@ -835,7 +832,7 @@ impl Engine {
             keys.insert(key.clone());
         }
         if !self.edits.is_empty() {
-            self.before_edits.get_mut().remove(key);
+            self.before_edits_mut().remove(key);
             self.touched.insert(key.clone());
         }
         if let FactKey::Signature(signature_id) | FactKey::InferredGuard(signature_id) = key.key() {
@@ -1317,7 +1314,10 @@ impl Engine {
             return Dispatched::Root;
         }
         let group = match checked {
-            Some(Checked::Settled) => None,
+            Some(Checked::Settled(staleness)) => {
+                self.settle_staleness(db, id, staleness);
+                None
+            }
             Some(Checked::Stale(group)) => Some(group),
             None => self
                 .needs_evaluation(db, id, reason)
@@ -1390,14 +1390,14 @@ impl Engine {
         db: &DbIndex,
         taken: &[(crate::FileId, Vec<(DerivationId, Reason)>)],
     ) -> Vec<Vec<Option<Checked>>> {
-        if !self.edits.is_empty() || derivation::recording() {
+        if derivation::recording() {
             return taken
                 .iter()
-                .map(|(_, entries)| vec![None; entries.len()])
+                .map(|(_, entries)| entries.iter().map(|_| None).collect())
                 .collect();
         }
         let stage = db.analysis_stage();
-        let graph = db.reader_graph();
+        let (edits, before_edits) = (&self.edits, &self.before_edits);
         taken
             .par_iter()
             .map(|(_, entries)| {
@@ -1407,16 +1407,9 @@ impl Engine {
                         if stage < id.kind.first_stage() || id.kind.is_query() {
                             return None;
                         }
-                        let stale = *reason == Reason::Changed
-                            || graph.is_stale(
-                                *id,
-                                |key| db.fact_fingerprint(key),
-                                |key, _| key.is_stage_rule(),
-                            );
-                        Some(if stale {
-                            Checked::Stale(co_producers(db, *id))
-                        } else {
-                            Checked::Settled
+                        Some(match staleness(db, edits, before_edits, *id, *reason) {
+                            Staleness::Stale => Checked::Stale(co_producers(db, *id)),
+                            settled => Checked::Settled(settled),
                         })
                     })
                     .collect()
@@ -1674,7 +1667,7 @@ impl Engine {
             graph.mark_written(touched);
         }
         derivation::advance_write_generation();
-        self.before_edits.get_mut().clear();
+        self.before_edits_mut().clear();
     }
 
     /// Evaluates `entries` of `file_id` and what they queue in the file at
@@ -1966,7 +1959,7 @@ impl Engine {
         db.reader_graph_mut().hold_windows(touched.iter());
         for key in &touched {
             db.reader_graph().forget_fingerprint(key);
-            forget_before_edits(self.before_edits.get_mut(), db.reader_graph(), key);
+            forget_before_edits(self.before_edits_mut(), db.reader_graph(), key);
         }
         self.loop_focus = members.iter().copied().collect();
         // Settled from nothing, a loop whose rules leave it more than one
@@ -2131,7 +2124,17 @@ impl Engine {
                 .map(|(reader, _)| *reader),
             |key| db.fact_fingerprint(key),
         );
-        for (reader, reason) in std::mem::take(&mut self.waiting) {
+        let waiting = std::mem::take(&mut self.waiting)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let checked = {
+            let (db, edits, before_edits) = (&*db, &self.edits, &self.before_edits);
+            waiting
+                .par_iter()
+                .map(|(reader, reason)| staleness(db, edits, before_edits, *reader, *reason))
+                .collect::<Vec<_>>()
+        };
+        for ((reader, reason), staleness) in waiting.into_iter().zip(checked) {
             if reason == Reason::Changed {
                 self.stats.requeue_cause(reader, "released after the focus");
                 self.worklist.insert(reader, Reason::Changed);
@@ -2143,7 +2146,7 @@ impl Engine {
             } else {
                 Vec::new()
             };
-            if !self.needs_evaluation(db, reader, Reason::Read) {
+            if !self.settle_staleness(db, reader, staleness) {
                 self.moved_from.remove(&reader);
                 continue;
             }
@@ -2177,52 +2180,25 @@ impl Engine {
     /// fact it read moved. A stage rule it saw holds: only a stage barrier
     /// moves one, and the barrier queues the rule's readers itself.
     fn needs_evaluation(&mut self, db: &mut DbIndex, id: DerivationId, reason: Reason) -> bool {
-        if reason == Reason::Changed
-            || db.reader_graph().is_stale(
-                id,
-                |key| db.fact_fingerprint(key),
-                |key, seen| {
-                    key.is_stage_rule()
-                        || (!self.edits.is_empty()
-                            && seen == self.fingerprint_before_edits(db, key))
-                },
-            )
-        {
-            return true;
+        let staleness = staleness(db, &self.edits, &self.before_edits, id, reason);
+        self.settle_staleness(db, id, staleness)
+    }
+
+    /// Applies what [`staleness`] found of `id`: whether it has to run.
+    fn settle_staleness(
+        &mut self,
+        db: &mut DbIndex,
+        id: DerivationId,
+        staleness: Staleness,
+    ) -> bool {
+        match staleness {
+            Staleness::Stale => true,
+            Staleness::Holds => false,
+            Staleness::Rebased(moved) => {
+                db.reader_graph_mut().set_fingerprints(id, moved);
+                false
+            }
         }
-        if self.edits.is_empty() {
-            return false;
-        }
-        let fingerprints = db
-            .reader_graph()
-            .reads_of(id)
-            .map(|key| self.fingerprint(db, key))
-            .collect();
-        // A read that held only with the edit mapped back saw positions the
-        // edit moved. An output made from them is still right if the edit's
-        // remap rewrote it, or if it names none of the positions the edit
-        // moved: with the edit mapped back it fingerprints as it does now. A
-        // fold of every writer's share is judged by this writer's share, which
-        // it also wrote: the fold holds the edited files' shares too.
-        let moved = db.reader_graph().moved_fingerprints(id, fingerprints);
-        if moved.is_empty() {
-            return false;
-        }
-        let outputs = db.reader_graph().outputs_of(id).collect::<Vec<_>>();
-        let holds = outputs.iter().all(|key| {
-            key.follows_edits()
-                || key
-                    .writer_share(id)
-                    .is_some_and(|share| outputs.iter().any(|output| *output.key() == share))
-                || self.fingerprint(db, key) == self.fingerprint_before_edits(db, key)
-        });
-        // Only a derivation that holds is rebased onto the values as they
-        // stand: one that runs is recorded again, and one checked again before
-        // it runs must still be found to need it.
-        if holds {
-            db.reader_graph_mut().set_fingerprints(id, moved);
-        }
-        !holds
     }
 
     /// Under `GLUALS_TRACE_EVALUATIONS`, prints `id`'s file, why it was queued
@@ -2784,7 +2760,7 @@ impl Engine {
                 .flat_map(|(evaluation, _)| evaluation.outputs().chain(evaluation.moved())),
         ) {
             db.reader_graph().forget_fingerprint(key);
-            forget_before_edits(&mut self.before_edits.borrow_mut(), db.reader_graph(), key);
+            forget_before_edits(&mut lock(&self.before_edits), db.reader_graph(), key);
         }
         self.verify_fingerprints(db, touched, step);
         // Out of the index while its records are replaced, so the reads can be
@@ -3273,10 +3249,103 @@ fn file_task(
 }
 
 /// What [`Engine::check_dispatch`] found of a queued entry.
-#[derive(Clone)]
 enum Checked {
-    Settled,
+    /// It holds, as [`staleness`] found.
+    Settled(Staleness),
     Stale(Vec<DerivationId>),
+}
+
+/// Whether a queued derivation has to run.
+enum Staleness {
+    Stale,
+    Holds,
+    /// It holds once the reads the edits only moved are recorded as they
+    /// stand.
+    Rebased(Vec<(derivation::KeyIdx, derivation::Fingerprint)>),
+}
+
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `key`'s current fingerprint, taken once per value.
+fn current_fingerprint(db: &DbIndex, key: &HashedKey) -> derivation::Fingerprint {
+    db.reader_graph()
+        .current_fingerprint(key, |key| db.fact_fingerprint(key))
+}
+
+/// `key`'s fingerprint with `edits` undone, taken once per value into `memo`.
+fn fingerprint_before_edits(
+    db: &DbIndex,
+    edits: &derivation::EditMaps,
+    memo: &std::sync::Mutex<FxHashMap<HashedKey, derivation::Fingerprint>>,
+    key: &HashedKey,
+) -> derivation::Fingerprint {
+    if let Some(fingerprint) = lock(memo).get(key) {
+        return *fingerprint;
+    }
+    let fingerprint = derivation::fingerprint_before_edits(edits, || db.fact_fingerprint(key));
+    lock(memo).insert(key.clone(), fingerprint);
+    fingerprint
+}
+
+/// Whether `id`, queued for `reason`, has to run, without changing anything:
+/// a reader runs only if a fact it read moved. A stage rule it saw holds:
+/// only a stage barrier moves one, and the barrier queues the rule's readers
+/// itself.
+///
+/// A read that held only with `edits` mapped back saw positions an edit
+/// moved. An output made from them is still right if the edit's remap
+/// rewrote it, or if it names none of the positions the edit moved: with the
+/// edit mapped back it fingerprints as it does now. A fold of every writer's
+/// share is judged by this writer's share, which it also wrote: the fold
+/// holds the edited files' shares too. Only a derivation that holds is
+/// rebased onto the values as they stand: one that runs is recorded again,
+/// and one checked again before it runs must still be found to need it.
+fn staleness(
+    db: &DbIndex,
+    edits: &derivation::EditMaps,
+    before_edits: &std::sync::Mutex<FxHashMap<HashedKey, derivation::Fingerprint>>,
+    id: DerivationId,
+    reason: Reason,
+) -> Staleness {
+    let before = |key: &HashedKey| fingerprint_before_edits(db, edits, before_edits, key);
+    if reason == Reason::Changed
+        || db.reader_graph().is_stale(
+            id,
+            |key| db.fact_fingerprint(key),
+            |key, seen| key.is_stage_rule() || (!edits.is_empty() && seen == before(key)),
+        )
+    {
+        return Staleness::Stale;
+    }
+    if edits.is_empty() {
+        return Staleness::Holds;
+    }
+    let fingerprints = db
+        .reader_graph()
+        .reads_of(id)
+        .map(|key| current_fingerprint(db, key))
+        .collect();
+    let moved = db.reader_graph().moved_fingerprints(id, fingerprints);
+    if moved.is_empty() {
+        return Staleness::Holds;
+    }
+    let outputs = db.reader_graph().outputs_of(id).collect::<Vec<_>>();
+    let holds = outputs.iter().all(|key| {
+        key.follows_edits()
+            || key
+                .writer_share(id)
+                .is_some_and(|share| outputs.iter().any(|output| *output.key() == share))
+            || current_fingerprint(db, key) == before(key)
+    });
+    if holds {
+        Staleness::Rebased(moved)
+    } else {
+        Staleness::Stale
+    }
 }
 
 /// What a task left for the barrier.
