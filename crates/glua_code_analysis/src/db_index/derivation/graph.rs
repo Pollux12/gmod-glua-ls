@@ -32,6 +32,33 @@ fn positional_files(key: &FactKey) -> impl Iterator<Item = FileId> {
     key.positional_file().into_iter().chain(referenced)
 }
 
+/// The live slots of `keys` by each file whose positions their key names.
+fn build_positional(keys: &Paged<KeySlot>) -> FxHashMap<FileId, FxHashSet<KeyIdx>> {
+    use rayon::prelude::*;
+    let mut pairs = keys
+        .pages()
+        .par_iter()
+        .enumerate()
+        .flat_map_iter(|(page, slots)| {
+            slots.iter().enumerate().flat_map(move |(offset, entry)| {
+                let slot =
+                    KeyIdx::try_from(page * PAGE + offset).expect("fewer than 2^32 fact keys");
+                entry
+                    .key
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|key| positional_files(key))
+                    .map(move |file_id| (file_id, slot))
+            })
+        })
+        .collect::<Vec<_>>();
+    pairs.par_sort_unstable();
+    pairs
+        .par_chunk_by(|left, right| left.0 == right.0)
+        .map(|group| (group[0].0, group.iter().map(|(_, slot)| *slot).collect()))
+        .collect()
+}
+
 /// A fact key and the derivations that read or produced it. `key` is `None`
 /// while the slot is free.
 #[derive(Debug)]
@@ -565,17 +592,7 @@ impl KeyTable {
     fn positional_slots(&mut self, files: &FxHashSet<FileId>) -> Vec<KeyIdx> {
         let keys = &self.keys;
         let positional = self.positional.get_or_insert_with(|| {
-            let mut positional = FxHashMap::<FileId, FxHashSet<KeyIdx>>::default();
-            for (slot, entry) in keys.iter().enumerate() {
-                let Some(key) = entry.key.as_ref() else {
-                    continue;
-                };
-                let slot = KeyIdx::try_from(slot).expect("fewer than 2^32 fact keys");
-                for file_id in positional_files(key) {
-                    positional.entry(file_id).or_default().insert(slot);
-                }
-            }
-            positional
+            crate::profile::phase("reader graph: positional index", || build_positional(keys))
         });
         let mut slots = files
             .iter()
@@ -1626,23 +1643,29 @@ impl ReaderGraph {
     /// Renames every recorded read of a key `edits` moved to the key's new
     /// position, keeping the fingerprint the reader saw.
     pub fn apply_edits(&mut self, edits: &EditMaps) -> AppliedEdits {
+        use rayon::prelude::*;
         let files: FxHashSet<FileId> = edits.files().collect();
+        let slots = self.table.positional_slots(&files);
+        let keys = &self.table.keys;
+        let mapped = slots
+            .par_iter()
+            .filter_map(|slot| {
+                let entry = &keys[*slot as usize];
+                let key = entry.key.as_ref().filter(|_| !entry.readers.is_empty())?;
+                match edits.map_key(key) {
+                    Some(moved) if moved == **key => None,
+                    moved => Some((*slot, moved.map(HashedKey::new))),
+                }
+            })
+            .collect::<Vec<_>>();
         let mut renames = Vec::new();
         let mut lost = Vec::new();
-        for slot in self.table.positional_slots(&files) {
-            let entry = &self.table.keys[slot as usize];
-            let Some(key) = entry.key.as_ref() else {
-                continue;
-            };
-            let readers = &entry.readers;
-            if readers.is_empty() {
-                continue;
-            }
-            match edits.map_key(key) {
-                Some(moved) if moved == **key => {}
-                Some(moved) => renames.push((slot, HashedKey::new(moved))),
+        for (slot, moved) in mapped {
+            match moved {
+                Some(moved) => renames.push((slot, moved)),
                 None => lost.extend(
-                    readers
+                    self.table.keys[slot as usize]
+                        .readers
                         .iter()
                         .map(|(_, deriv)| self.derivations[deriv as usize].id),
                 ),

@@ -571,7 +571,9 @@ fn replace_files(
     }
     if let Some(edits) = engine.edits_to_apply() {
         engine.follow_removed_outputs(&edits);
-        touched = follow_edits(db, engine, &edits, touched);
+        touched = crate::profile::phase("reanalyze: follow edits", || {
+            follow_edits(db, engine, &edits, touched)
+        });
     }
     for kind in derive::WORKSPACE_DERIVATIONS {
         let id = derivation::DerivationId::workspace(kind);
@@ -598,7 +600,9 @@ fn follow_edits(
         let Some(map) = edits.map(file_id) else {
             continue;
         };
-        let remap = crate::FileRemap::validated(db, file_id, map);
+        let remap = crate::profile::phase("follow edits: file facts", || {
+            crate::FileRemap::validated(db, file_id, map)
+        });
         // A key naming a position the edit destroyed is taken again by the
         // derivation that wrote the member.
         for member_id in db.get_member_index_mut().remap_expr_keys(&remap) {
@@ -607,9 +611,11 @@ fn follow_edits(
                 rerun(engine, producer);
             }
         }
-        let mut lost = crate::remap_into_file(db, &remap)
-            .into_iter()
-            .collect::<Vec<_>>();
+        let mut lost = crate::profile::phase("follow edits: remap indexes", || {
+            crate::remap_into_file(db, &remap)
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
         lost.sort();
         if crate::profile::tracing_evaluations() {
             eprintln!("[trace] remap of {file_id:?} lost positions in {lost:?}");
@@ -624,7 +630,9 @@ fn follow_edits(
             }
         }
     }
-    let applied = db.reader_graph_mut().apply_edits(edits);
+    let applied = crate::profile::phase("follow edits: rename reads", || {
+        db.reader_graph_mut().apply_edits(edits)
+    });
     for reader in applied.lost {
         if crate::profile::tracing_evaluations() {
             eprintln!("[trace] a read of {reader:?} names a destroyed position");

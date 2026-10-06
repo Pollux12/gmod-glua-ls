@@ -45,6 +45,11 @@ impl<T> Paged<T> {
     }
 
     /// The pages, each holding [`PAGE`] consecutive indices.
+    pub(super) fn pages(&self) -> &[Vec<T>] {
+        &self.pages
+    }
+
+    /// The pages, each holding [`PAGE`] consecutive indices.
     pub(super) fn pages_mut(&mut self) -> &mut [Vec<T>] {
         &mut self.pages
     }
