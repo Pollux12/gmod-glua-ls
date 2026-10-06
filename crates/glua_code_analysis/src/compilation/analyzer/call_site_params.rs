@@ -1239,7 +1239,11 @@ fn exact_signature_closure(db: &DbIndex, signature_id: LuaSignatureId) -> Option
             &signature_id.get_file_id(),
             rowan::TextRange::empty(signature_id.get_position()),
         )
-        .map(|tree| tree.get_red_root())?;
+        .map(|tree| tree.get_red_root())
+        .filter(|root| {
+            root.text_range()
+                .contains_inclusive(signature_id.get_position())
+        })?;
     root.token_at_offset(signature_id.get_position())
         .right_biased()
         .and_then(|token| token.parent_ancestors().find_map(LuaClosureExpr::cast))
