@@ -1593,28 +1593,41 @@ impl ReaderGraph {
             .map(|key| self.key(*key))
     }
 
-    /// Replaces `id`'s recorded fingerprints, in [`Self::reads_of`] order.
-    /// Returns whether any differed.
-    pub fn set_fingerprints(&mut self, id: DerivationId, fingerprints: Vec<Fingerprint>) -> bool {
+    /// Each of `id`'s recorded reads whose fingerprint differs from the one
+    /// `fingerprints` gives it, in [`Self::reads_of`] order, with that one.
+    pub fn moved_fingerprints(
+        &self,
+        id: DerivationId,
+        fingerprints: Vec<Fingerprint>,
+    ) -> Vec<(KeyIdx, Fingerprint)> {
+        let Some((deriv, record)) = self.record(id) else {
+            return Vec::new();
+        };
+        record
+            .reads
+            .iter()
+            .zip(fingerprints)
+            .filter(|(slot, fingerprint)| {
+                let entry = &self.table.keys[**slot as usize];
+                // A stage rule a reader saw is the stage it ran at, which only
+                // a stage barrier re-runs it for.
+                entry.readers.seen_by(deriv) != *fingerprint
+                    && !entry.key.as_ref().is_some_and(|key| key.is_stage_rule())
+            })
+            .map(|(slot, fingerprint)| (*slot, fingerprint))
+            .collect()
+    }
+
+    /// Records that `id` saw each fingerprint of `moved` of its slot.
+    pub fn set_fingerprints(&mut self, id: DerivationId, moved: Vec<(KeyIdx, Fingerprint)>) {
         let Some(deriv) = self.deriv_slots.get(&id).copied() else {
-            return false;
+            return;
         };
-        let Some(record) = self.derivations[deriv as usize].record.as_ref() else {
-            return false;
-        };
-        let mut moved = false;
-        for (key, fingerprint) in record.reads.iter().zip(fingerprints) {
-            let entry = &mut self.table.keys[*key as usize];
-            // A stage rule a reader saw is the stage it ran at, which only a
-            // stage barrier re-runs it for.
-            if entry.readers.seen_by(deriv) != fingerprint
-                && !entry.key.as_ref().is_some_and(|key| key.is_stage_rule())
-            {
-                moved = true;
-                entry.readers.insert(deriv, fingerprint);
-            }
+        for (slot, fingerprint) in moved {
+            self.table.keys[slot as usize]
+                .readers
+                .insert(deriv, fingerprint);
         }
-        moved
     }
 
     /// Whether some reader of `key` saw a value other than the one
