@@ -22,6 +22,16 @@ struct Record {
     outputs: Box<[KeyIdx]>,
 }
 
+/// The files whose positions `key` names, which an edit of one of them
+/// renames: its positional file and the files its expression key's type names.
+fn positional_files(key: &FactKey) -> impl Iterator<Item = FileId> {
+    let referenced = key
+        .expr_key_type()
+        .map(crate::db_index::r#type::type_referenced_files)
+        .unwrap_or_default();
+    key.positional_file().into_iter().chain(referenced)
+}
+
 /// A fact key and the derivations that read or produced it. `key` is `None`
 /// while the slot is free.
 #[derive(Debug)]
@@ -374,6 +384,9 @@ pub struct KeyTable {
     /// The keys a cleared loop took away until it settles again, each with the
     /// stamp it was written at before; see [`Self::hold_window`].
     held: FxHashMap<KeyIdx, u64>,
+    /// The live slots of the keys naming each file's positions, built by the
+    /// first edit that renames keys and kept from then on.
+    positional: Option<FxHashMap<FileId, FxHashSet<KeyIdx>>>,
 }
 
 /// Whether what a memo read still holds; see [`KeyTable::written_since`].
@@ -512,6 +525,41 @@ impl KeyTable {
         if let Ok(entry) = self.key_slots.find_entry(key.hash, |filed| *filed == slot) {
             entry.remove();
         }
+        if let Some(positional) = &mut self.positional {
+            for file_id in positional_files(key) {
+                if let Some(slots) = positional.get_mut(&file_id) {
+                    slots.remove(&slot);
+                }
+            }
+        }
+    }
+
+    /// The live slots of the keys naming a position in one of `files`, in
+    /// slot order.
+    fn positional_slots(&mut self, files: &FxHashSet<FileId>) -> Vec<KeyIdx> {
+        let keys = &self.keys;
+        let positional = self.positional.get_or_insert_with(|| {
+            let mut positional = FxHashMap::<FileId, FxHashSet<KeyIdx>>::default();
+            for (slot, entry) in keys.iter().enumerate() {
+                let Some(key) = entry.key.as_ref() else {
+                    continue;
+                };
+                let slot = KeyIdx::try_from(slot).expect("fewer than 2^32 fact keys");
+                for file_id in positional_files(key) {
+                    positional.entry(file_id).or_default().insert(slot);
+                }
+            }
+            positional
+        });
+        let mut slots = files
+            .iter()
+            .filter_map(|file_id| positional.get(file_id))
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        slots.sort_unstable();
+        slots.dedup();
+        slots
     }
 
     /// Interns `key`. A new slot counts as written at stamp `now`: older
@@ -539,6 +587,11 @@ impl KeyTable {
             key.key(),
             FactKey::ReceiverAuthority(_) | FactKey::CallbackParams(_)
         );
+        if let Some(positional) = &mut self.positional {
+            for file_id in positional_files(&key) {
+                positional.entry(file_id).or_default().insert(slot);
+            }
+        }
         entry.key = Some(key);
         entry.stamp = 0;
         entry.written = now;
@@ -1521,22 +1574,13 @@ impl ReaderGraph {
         let files: FxHashSet<FileId> = edits.files().collect();
         let mut renames = Vec::new();
         let mut lost = Vec::new();
-        for (slot, entry) in self.table.keys.iter().enumerate() {
+        for slot in self.table.positional_slots(&files) {
+            let entry = &self.table.keys[slot as usize];
             let Some(key) = entry.key.as_ref() else {
                 continue;
             };
-            let slot = KeyIdx::try_from(slot).expect("fewer than 2^32 fact keys");
             let readers = &entry.readers;
-            if readers.is_empty()
-                || !(key
-                    .positional_file()
-                    .is_some_and(|file_id| files.contains(&file_id))
-                    || key.expr_key_type().is_some_and(|typ| {
-                        crate::db_index::r#type::type_referenced_files(typ)
-                            .iter()
-                            .any(|file_id| files.contains(file_id))
-                    }))
-            {
+            if readers.is_empty() {
                 continue;
             }
             match edits.map_key(key) {
@@ -2612,6 +2656,33 @@ mod tests {
         graph.remove_file(FileId::new(2));
 
         assert_eq!(graph.stale_readers(&decl(20), |_| false).count(), 0);
+    }
+
+    /// A key read after an edit built the positional index is renamed by the
+    /// next edit like every key read before it.
+    #[test]
+    fn a_key_read_after_an_edit_is_renamed_by_the_next() {
+        use crate::{LuaDeclId, PositionMap};
+        let decl = |position: u32| {
+            HashedKey::new(FactKey::Decl(LuaDeclId::new(
+                FileId::new(1),
+                TextSize::new(position),
+            )))
+        };
+        let insert = |at: usize| {
+            let old_text = "a".repeat(40);
+            let new_text = format!("{}b{}", "a".repeat(at), "a".repeat(40 - at));
+            EditMaps::new([(FileId::new(1), PositionMap::new(&old_text, &new_text))])
+        };
+        let mut graph = ReaderGraph::default();
+        graph.replace(id(2, 0), vec![(decl(20), Some(5))], vec![], |_| 0);
+        graph.apply_edits(&insert(0));
+        graph.replace(id(3, 0), vec![(decl(30), Some(6))], vec![], |_| 0);
+
+        let applied = graph.apply_edits(&insert(0));
+
+        assert!(applied.moved.contains(&decl(31)), "{:?}", applied.moved);
+        assert_eq!(graph.stale_readers(&decl(31), |_| false).count(), 1);
     }
 
     #[test]
