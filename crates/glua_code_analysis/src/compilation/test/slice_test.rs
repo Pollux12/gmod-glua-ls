@@ -395,6 +395,34 @@ local directional = state.directional
         assert_settled(&ws, &cold(&[(CONFIG, EDITED_CONFIG)]), "handed back");
     }
 
+    /// A file a request settles first after the edited file handed back
+    /// answers before the rest its settling releases is checked.
+    #[test]
+    fn a_slice_stops_once_a_requested_file_settles_and_releases_the_rest() {
+        let mut ws = workspace();
+        let config = stage_text(&mut ws, CONFIG, EDITED_CONFIG);
+        ws.analysis.begin_reindex(vec![config]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        ws.analysis.advance_reindex(Slice::Until(deadline));
+        let shop = ws
+            .analysis
+            .get_file_id(&ws.virtual_url_generator.new_uri(SHOP))
+            .expect("a workspace file");
+        assert!(ws.analysis.compilation.is_settling(shop));
+        ws.analysis.compilation.prioritise_update(&[shop]);
+
+        let progress = ws.analysis.advance_reindex(Slice::Until(deadline));
+
+        assert!(matches!(progress, UpdateProgress::Settling));
+        assert!(!ws.analysis.compilation.settles_first(shop));
+        settle(&mut ws, 1, |_| {});
+        assert_settled(
+            &ws,
+            &cold(&[(CONFIG, EDITED_CONFIG)]),
+            "requested, then released",
+        );
+    }
+
     /// An edit waiting to be taken in stops the slice in progress; the run
     /// goes on once it is taken.
     #[test]

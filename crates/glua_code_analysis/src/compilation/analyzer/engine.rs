@@ -1074,9 +1074,14 @@ impl Engine {
                         self.handed_back = true;
                         return false;
                     }
-                    if crate::profile::phase("engine: release", || self.release_waiting(db))
-                        || crate::profile::phase("engine: loops", || self.clear_loops(db))
-                    {
+                    if crate::profile::phase("engine: release", || self.release_waiting(db)) {
+                        // What the settled focus released runs in slices sized for it.
+                        if slice.yields() {
+                            return false;
+                        }
+                        continue;
+                    }
+                    if crate::profile::phase("engine: loops", || self.clear_loops(db)) {
                         continue;
                     }
                     break;
