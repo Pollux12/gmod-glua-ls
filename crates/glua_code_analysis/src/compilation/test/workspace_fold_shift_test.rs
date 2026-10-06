@@ -219,4 +219,52 @@ mod test {
         assert_eq!(tab_button_chain(&ws), Some(vec!["TabbedFrame".to_string()]));
         assert_settled_as_cold(&ws, &texts, "parent call changed");
     }
+
+    const LOCAL_HELPER: (&str, &str) = (
+        "lua/autorun/sh_local_helper.lua",
+        r#"
+            local function send(name)
+                net.Start(name)
+                net.Broadcast()
+            end
+            function Broadcast(name)
+                send(name)
+            end
+            "#,
+    );
+
+    fn is_helper_name(ws: &VirtualWorkspace, name: &str) -> bool {
+        ws.analysis
+            .compilation
+            .get_db()
+            .get_gmod_network_index()
+            .is_helper_name(name)
+    }
+
+    #[test]
+    fn an_edit_that_leaves_net_helpers_alone_does_not_fold_them_again() {
+        let mut files = FILES.to_vec();
+        files.push(LOCAL_HELPER);
+        let mut ws = workspace(&files);
+        assert!(is_helper_name(&ws, "Broadcast"));
+        let mut texts = files
+            .iter()
+            .map(|(path, text)| (*path, text.to_string()))
+            .collect::<Vec<_>>();
+        let helper = texts.len() - 1;
+
+        texts[helper]
+            .1
+            .insert_str(0, "local unrelated = 1\nprint(unrelated)\n");
+        ws.def_file(texts[helper].0, &texts[helper].1);
+        assert_eq!(evaluations(&ws, DerivationKind::NetHelperNames), 0);
+        assert_settled_as_cold(&ws, &texts, "unrelated local added");
+
+        texts[helper]
+            .1
+            .push_str("function Relay(name) Broadcast(name) end\n");
+        ws.def_file(texts[helper].0, &texts[helper].1);
+        assert!(is_helper_name(&ws, "Relay"));
+        assert_settled_as_cold(&ws, &texts, "helper added");
+    }
 }

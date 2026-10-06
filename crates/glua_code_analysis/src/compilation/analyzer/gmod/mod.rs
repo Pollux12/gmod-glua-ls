@@ -743,7 +743,9 @@ fn expr_written_name(expr: &LuaExpr) -> Option<SmolStr> {
 /// cannot see `local recv = net.Receive`; carrying the op names lets the same
 /// reference lookup and per-file binding closure that finds helper calls follow
 /// that alias to its call sites.
-fn net_operation_names(annotated_roles: &AnnotatedGmodGlobalCallRoleMap) -> HashSet<SmolStr> {
+pub(super) fn net_operation_names(
+    annotated_roles: &AnnotatedGmodGlobalCallRoleMap,
+) -> HashSet<SmolStr> {
     annotated_roles
         .roles_by_path
         .iter()
@@ -934,10 +936,7 @@ fn expand_sites(db: &DbIndex, file_id: FileId, sites: &[LuaSyntaxId]) -> NetName
 
 /// Every place a local declaration is read, from the reference index.
 fn decl_read_sites(db: &DbIndex, decl_id: LuaDeclId) -> Vec<LuaSyntaxId> {
-    let Some(references) = db
-        .get_reference_index()
-        .get_decl_references(&decl_id.file_id, &decl_id)
-    else {
+    let Some(references) = db.get_reference_index().decl_references(&decl_id) else {
         return Vec::new();
     };
     references

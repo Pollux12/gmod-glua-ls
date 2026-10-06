@@ -97,13 +97,6 @@ fn empty_call_roles() -> Arc<GmodCallRoles> {
     })
 }
 
-/// The current call roles for a fold over them, or empty ones before the
-/// fold first ran.
-pub(super) fn call_roles(db: &DbIndex) -> Arc<GmodCallRoles> {
-    db.get_gmod_call_roles::<GmodCallRoles>()
-        .unwrap_or_else(empty_call_roles)
-}
-
 /// The current call roles for a per-file pass, which reads each entry it
 /// looks up, or empty ones before the fold first ran.
 pub(super) fn call_role_entries(db: &DbIndex) -> Arc<GmodCallRoles> {
@@ -118,8 +111,9 @@ pub(crate) fn evaluate_call_roles(db: &mut DbIndex) {
         return;
     }
     let (registry, roles) = build_call_roles_and_registry(db);
-    db.get_gmod_network_index_mut()
-        .set_canonical_ops(roles.canonical_net_ops());
+    let network = db.get_gmod_network_index_mut();
+    network.set_canonical_ops(roles.canonical_net_ops());
+    network.set_op_names(net_operation_names(&roles));
     db.set_gmod_call_roles(Arc::new(GmodCallRoles { registry, roles }));
 }
 
@@ -129,10 +123,9 @@ pub(crate) fn evaluate_net_helper_names(db: &mut DbIndex) {
     if !db.get_emmyrc().gmod.enabled {
         return;
     }
-    let roles = call_roles(db);
-    let op_names = net_operation_names(&roles.roles);
+    let op_names = db.get_gmod_network_index().op_names();
     let mut names = net_producing_function_names(db, &op_names);
-    names.extend(op_names);
+    names.extend(op_names.iter().cloned());
     db.get_gmod_network_index_mut().set_helper_names(names);
 }
 

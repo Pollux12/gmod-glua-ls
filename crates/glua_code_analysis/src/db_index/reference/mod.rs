@@ -336,6 +336,18 @@ impl LuaReferenceIndex {
                     derivation::fingerprint_of(&(content, present))
                 }
             }
+            FactKey::DeclReferences(decl_id) => self
+                .file_references
+                .get(&decl_id.file_id)
+                .and_then(|file| file.get_decl_references(decl_id))
+                .map_or(derivation::ABSENT, |reference| {
+                    let cells = reference
+                        .cells
+                        .iter()
+                        .map(|cell| (InFiled::new(decl_id.file_id, cell.range), cell.is_write))
+                        .collect::<Vec<_>>();
+                    derivation::fingerprint_of(&(cells, reference.mutable))
+                }),
             FactKey::ReferencesByName(name) if derivation::mapping_back() => {
                 self.recomputed_name_fingerprint(name)
             }
@@ -699,6 +711,15 @@ impl LuaReferenceIndex {
     pub fn get_var_reference_decl(&self, file_id: &FileId, range: TextRange) -> Option<LuaDeclId> {
         derivation::note_file_fact_read(derivation::FileFact::References, *file_id);
         self.file_references.get(file_id)?.get_decl_id(&range)
+    }
+
+    /// Where `decl_id` is read and written, read as that declaration's
+    /// references alone.
+    pub fn decl_references(&self, decl_id: &LuaDeclId) -> Option<&DeclReference> {
+        derivation::note_read(|| FactKey::DeclReferences(*decl_id));
+        self.file_references
+            .get(&decl_id.file_id)?
+            .get_decl_references(decl_id)
     }
 
     pub fn get_decl_references_map(

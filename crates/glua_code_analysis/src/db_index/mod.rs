@@ -373,12 +373,6 @@ impl DbIndex {
         facts
     }
 
-    /// The call roles as a whole, for a fold over them.
-    pub(crate) fn get_gmod_call_roles<T: derivation::CallRoles>(&self) -> Option<Arc<T>> {
-        derivation::note_read(|| derivation::FactKey::HelperRegistry);
-        self.gmod_call_role_entries()
-    }
-
     /// The call roles for a per-file pass, which reads the entries it looks up
     /// one by one.
     pub(crate) fn gmod_call_role_entries<T: derivation::CallRoles>(&self) -> Option<Arc<T>> {
@@ -523,7 +517,7 @@ impl DbIndex {
             | K::GmodInferScan
             | K::GmodSystem(..) => self.gmod_infer_index.fact_fingerprint(key),
             K::GmodLoadFile(_) => self.gmod_load_index.fact_fingerprint(key),
-            K::NetworkFile(_) | K::NetworkScan | K::NetHelperName(_) => {
+            K::NetworkFile(_) | K::NetworkScan | K::NetHelperName(_) | K::NetOperationNames => {
                 self.gmod_network_index.fact_fingerprint(key)
             }
             K::HelperRegistry => {
@@ -575,6 +569,7 @@ impl DbIndex {
             K::Property(_) | K::DeclDefault(_) => self.property_index.fact_fingerprint(key),
             K::Global(_) | K::GlobalScan => self.global_index.fact_fingerprint(key),
             K::References(_)
+            | K::DeclReferences(_)
             | K::ReferencesByName(_)
             | K::IndexReferenceFiles(_)
             | K::DerivedReferences(_)

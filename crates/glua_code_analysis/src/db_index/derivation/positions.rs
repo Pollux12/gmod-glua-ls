@@ -213,6 +213,7 @@ impl EditMaps {
             K::DeclClaim(id) => K::DeclClaim(self.decl_id(*id)?),
             K::Decl(id) => K::Decl(self.decl_id(*id)?),
             K::DeclDefault(id) => K::DeclDefault(self.decl_id(*id)?),
+            K::DeclReferences(id) => K::DeclReferences(self.decl_id(*id)?),
             K::Member(id) => K::Member(self.member_id(*id)?),
             K::MemberObject(id) => K::MemberObject(self.member_id(*id)?),
             K::MemberHome(id) => K::MemberHome(self.member_id(*id)?),

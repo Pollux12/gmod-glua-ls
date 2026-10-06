@@ -356,6 +356,8 @@ pub struct GmodNetworkIndex {
     /// The names of functions that can produce a net operation, directly or
     /// through other such functions.
     helper_names: Arc<FxHashSet<SmolStr>>,
+    /// The names the net operations are declared under.
+    op_names: Arc<FxHashSet<SmolStr>>,
     /// Incremental multiset fingerprint of every live file's network data.
     flows_fingerprint: Fingerprint,
     /// Fingerprint of `canonical_ops`, taken when the table is replaced.
@@ -473,6 +475,7 @@ impl GmodNetworkIndex {
             referencing: Default::default(),
             canonical_ops: Default::default(),
             helper_names: Default::default(),
+            op_names: Default::default(),
             flows_fingerprint: 0,
             canonical_ops_fingerprint: 0,
         }
@@ -482,6 +485,11 @@ impl GmodNetworkIndex {
         match key {
             FactKey::NetworkFile(file_id) => {
                 derivation::fingerprint_opt(self.file_data.get(file_id))
+            }
+            FactKey::NetOperationNames => {
+                let mut names = self.op_names.iter().collect::<Vec<_>>();
+                names.sort_unstable();
+                derivation::fingerprint_of(&names)
             }
             FactKey::NetHelperName(name) => {
                 if self.helper_names.contains(name) {
@@ -505,6 +513,20 @@ impl GmodNetworkIndex {
                 derivation::ABSENT
             }
         }
+    }
+
+    /// Replaces the names the net operations are declared under.
+    pub(crate) fn set_op_names(&mut self, names: FxHashSet<SmolStr>) {
+        if *self.op_names != names {
+            derivation::note_write(|| FactKey::NetOperationNames);
+            self.op_names = Arc::new(names);
+        }
+    }
+
+    /// The names the net operations are declared under.
+    pub(crate) fn op_names(&self) -> Arc<FxHashSet<SmolStr>> {
+        derivation::note_read(|| FactKey::NetOperationNames);
+        Arc::clone(&self.op_names)
     }
 
     /// Replaces the net-helper names, writing each name that joined or left.
@@ -737,6 +759,10 @@ impl GmodNetworkIndex {
             }
         }
         self.helper_names = Arc::default();
+        if !self.op_names.is_empty() {
+            derivation::note_write(|| FactKey::NetOperationNames);
+        }
+        self.op_names = Arc::default();
     }
 
     fn index_file_data(&mut self, file_id: FileId, data: &FileNetworkData) {
@@ -1069,6 +1095,7 @@ crate::db_index::cow_shards::task_fork_fields!(GmodNetworkIndex {
     referencing => crate::db_index::cow_shards::merge_set,
     canonical_ops,
     helper_names,
+    op_names,
     flows_fingerprint => crate::db_index::cow_shards::merge_sum,
     canonical_ops_fingerprint,
 } by_field);

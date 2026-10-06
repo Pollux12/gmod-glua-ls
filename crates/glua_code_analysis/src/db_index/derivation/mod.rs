@@ -386,6 +386,8 @@ pub enum FactKey {
     HelperScanFiles,
     /// Whether a name names a function that can produce a net operation.
     NetHelperName(SmolStr),
+    /// The names the net operations are declared under.
+    NetOperationNames,
     /// One file's net call roles and function-body net summaries.
     NetHelpers(FileId),
     /// One function body's net summary, by the body's block.
@@ -402,6 +404,9 @@ pub enum FactKey {
     GlobalScan,
     /// A file's reference index.
     References(FileId),
+    /// Where one local declaration is read and written, read out of its
+    /// file's [`FactKey::References`].
+    DeclReferences(LuaDeclId),
     /// Name-keyed references across files.
     ReferencesByName(SmolStr),
     IndexReferenceFiles(SmolStr),
@@ -758,6 +763,7 @@ impl FactKey {
                 | FactKey::Member(_)
                 | FactKey::Signature(_)
                 | FactKey::ReferencesByName(_)
+                | FactKey::References(_)
                 | FactKey::SpecialCallFile(_)
                 | FactKey::GmodClassFile(_)
         )
@@ -781,6 +787,7 @@ impl FactKey {
             | FactKey::MemberHome(member_id)
             | FactKey::MemberMarks(member_id) => Some(FactKey::Member(*member_id)),
             FactKey::IndexReferenceFiles(name) => Some(FactKey::ReferencesByName(name.clone())),
+            FactKey::DeclReferences(decl_id) => Some(FactKey::References(decl_id.file_id)),
             FactKey::SpecialCallFor(file_id, _) => Some(FactKey::SpecialCallFile(*file_id)),
             FactKey::GmodBaseClass(file_id) | FactKey::GmodVguiRegistrations(file_id) => {
                 Some(FactKey::GmodClassFile(*file_id))
@@ -860,6 +867,7 @@ impl FactKey {
             | K::NetHelpers(file_id)
             | K::FunctionSummaries(file_id)
             | K::References(file_id)
+            | K::DeclReferences(LuaDeclId { file_id, .. })
             | K::AccessorCalls(file_id)
             | K::Dependency(file_id)
             | K::LoadSites(file_id)
@@ -906,6 +914,7 @@ impl FactKey {
             | K::ValidGuardFiles
             | K::ValidGuardName(_)
             | K::NetHelperName(_)
+            | K::NetOperationNames
             | K::Property(_)
             | K::Global(_)
             | K::GlobalScan
