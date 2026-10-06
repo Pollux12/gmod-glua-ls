@@ -472,13 +472,25 @@ pub const ABSENT: Fingerprint = 0;
 /// known: no value fingerprints to it, so the read never holds.
 pub const UNSEEN: Fingerprint = Fingerprint::MAX;
 
-/// The fingerprint of a present value; never [`ABSENT`].
+/// The fingerprint of a present value; never [`ABSENT`]. Fx hashes are
+/// nearly linear in their input words, so the hash is mixed before use: a
+/// wrapping sum of fingerprints would otherwise take equal steps for unequal
+/// changes, such as two members moving between the same two keys.
 pub fn fingerprint_of<T: std::hash::Hash + ?Sized>(value: &T) -> Fingerprint {
     use std::hash::Hasher;
     let mut hasher = rustc_hash::FxHasher::default();
     positions::hash_value(value, &mut hasher);
-    let hash = hasher.finish();
-    hash.max(1)
+    mix(hasher.finish()).max(1)
+}
+
+/// MurmurHash3's 64-bit finalizer: a bijection in which every input bit
+/// flips each output bit with probability about one half.
+fn mix(mut hash: u64) -> u64 {
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    hash ^ (hash >> 33)
 }
 
 /// An order-independent fingerprint of a set, kept up to date as members

@@ -1317,6 +1317,42 @@ mod tests {
     }
 
     #[test]
+    fn forks_rekeying_different_members_alike_install_the_history_a_recount_gives() {
+        use crate::db_index::cow_shards::TaskFork;
+        let owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new("ix.gui"));
+        let unknown = LuaMemberKey::ExprType(crate::LuaType::Unknown);
+        let string = LuaMemberKey::ExprType(crate::LuaType::String);
+        let movers = [
+            make_index_member_id(FileId::new(330), 4446),
+            make_index_member_id(FileId::new(387), 1174),
+        ];
+        let mut base = LuaMemberIndex::new();
+        for mover in movers {
+            base.add_member(owner.clone(), make_expr_member(mover, unknown.clone()));
+        }
+        let frozen = base.task_fork();
+        let forks = movers
+            .iter()
+            .map(|mover| {
+                let mut fork = frozen.task_fork();
+                fork.rekey_member(*mover, string.clone());
+                fork
+            })
+            .collect::<Vec<_>>();
+        let mut conflicts = vec![Vec::new(); forks.len()];
+        base.install_tasks_reporting(
+            &frozen,
+            forks.into_iter().enumerate().collect(),
+            &mut conflicts,
+        );
+
+        assert_eq!(
+            base.owner_history_fingerprints.get(&owner).copied(),
+            Some(base.recomputed_owner_history_fingerprint(&owner))
+        );
+    }
+
+    #[test]
     fn installing_forks_field_by_field_matches_installing_them_one_by_one() {
         use crate::db_index::cow_shards::TaskFork;
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Shared"));
