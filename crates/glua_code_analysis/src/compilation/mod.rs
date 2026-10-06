@@ -335,6 +335,7 @@ impl LuaCompilation {
         if diagnosed.is_empty() {
             return;
         }
+        let _filing = crate::profile::PhaseGuard::new("diagnostic reads");
         let mut diagnosed = diagnosed.into_iter().collect::<Vec<_>>();
         diagnosed.sort_unstable_by_key(|(file_id, _)| *file_id);
         let graph = self.db.reader_graph_mut();

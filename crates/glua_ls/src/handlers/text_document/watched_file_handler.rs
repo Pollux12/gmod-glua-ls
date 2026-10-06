@@ -14,6 +14,14 @@ pub async fn on_did_change_watched_files(
     context: ServerContextSnapshot,
     params: DidChangeWatchedFilesParams,
 ) -> Option<()> {
+    let started = crate::util::ls_profile::profile_instant();
+    let mut stages = Vec::new();
+    let mut stage = |name: &'static str, at: &mut Option<std::time::Instant>| {
+        if let Some(since) = at.replace(std::time::Instant::now()) {
+            stages.push((name, since.elapsed()));
+        }
+    };
+    let mut at = started;
     // Classify events and read files from disk WITHOUT
     // the analysis write lock so that slow disk I/O does not block
     // hover, completion, and diagnostic handlers.
@@ -70,6 +78,7 @@ pub async fn on_did_change_watched_files(
             }
         }
     } // workspace read lock released here, before any write lock
+    stage("classify", &mut at);
 
     let Ok(lua_batch) =
         tokio::task::spawn_blocking(move || read_lua_events(lua_events, &encoding)).await
@@ -77,8 +86,13 @@ pub async fn on_did_change_watched_files(
         return None;
     };
 
+    stage("read", &mut at);
     let lua_batch = without_applied_renames(&context, lua_batch).await;
+    stage("renames", &mut at);
+    let files = lua_batch.len();
     apply_file_system_changes(&context, lua_batch).await;
+    stage("apply", &mut at);
+    crate::util::ls_profile::emit_ls_watched(files, &stages);
 
     // Handle editorconfig / emmyrc updates
     if apply_editorconfig_updates {
@@ -122,18 +136,34 @@ pub(crate) async fn apply_file_system_changes(
     // final state on disk. The re-analysis settles in the debounced loop's
     // slices, as an edit does, so requests are answered while it runs.
     let final_deleted = finally_deleted_uris(&batch);
-    let staged = {
+    let waiting = crate::util::ls_profile::profile_instant();
+    let (staged, wait, hold) = {
         let mut analysis = context.analysis().write().await;
+        let holding = crate::util::ls_profile::profile_instant();
         let staged = analysis
             .stage_file_system_changes(batch)
             .into_iter()
             .filter_map(|file_id| Some((file_id, analysis.get_uri(file_id)?)))
             .collect::<Vec<_>>();
-        staged
+        let wait = waiting
+            .zip(holding)
+            .map(|(waiting, holding)| holding - waiting);
+        (staged, wait, holding.map(|holding| holding.elapsed()))
     };
+    let scheduling = crate::util::ls_profile::profile_instant();
     let debounced_analysis = context.debounced_analysis_arc();
     for (file_id, uri) in &staged {
         debounced_analysis.schedule(*file_id, uri.clone()).await;
+    }
+    if let (Some(wait), Some(hold), Some(scheduling)) = (wait, hold, scheduling) {
+        crate::util::ls_profile::emit_ls_watched(
+            staged.len(),
+            &[
+                ("write_wait", wait),
+                ("write_hold", hold),
+                ("schedule", scheduling.elapsed()),
+            ],
+        );
     }
     let store = context.file_diagnostic().store();
     for (file_id, uri) in staged.iter().filter(|(_, uri)| final_deleted.contains(uri)) {

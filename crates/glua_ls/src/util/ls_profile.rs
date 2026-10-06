@@ -305,6 +305,20 @@ pub fn emit_ls_did_change(
     );
 }
 
+/// Where one batch of watched-file changes spent its time before its files
+/// were scheduled, stage by stage.
+pub fn emit_ls_watched(files: usize, stages: &[(&str, Duration)]) {
+    if !ls_profile_enabled() {
+        return;
+    }
+    let stages = stages
+        .iter()
+        .map(|(name, duration)| format!("{name}_ms={}", ms(*duration)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!("[profile] ls_watched files={files} {stages}");
+}
+
 // ---------------------------------------------------------------- reindex ---
 
 #[derive(Default)]
