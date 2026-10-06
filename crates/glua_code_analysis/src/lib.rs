@@ -633,16 +633,28 @@ impl EmmyLuaAnalysis {
         matches!((version, current), (Some(incoming), Some(current)) if incoming < current)
     }
 
+    /// Applies `config`, re-analysing every file when it differs from the
+    /// current one: facts are derived under the config they were built with.
     pub fn update_config(&mut self, config: Arc<Emmyrc>) {
         let mut refreshed_config = (*config).clone();
         refreshed_config
             .gmod
             .scripted_class_scopes
             .refresh_resolved_definitions();
+        let changed = match (
+            serde_json::to_value(&refreshed_config),
+            serde_json::to_value(self.emmyrc.as_ref()),
+        ) {
+            (Ok(new), Ok(old)) => new != old,
+            _ => true,
+        };
         let config = Arc::new(refreshed_config);
         self.emmyrc = config.clone();
         self.compilation.update_config(config.clone());
         self.diagnostic.update_config(config);
+        if changed {
+            self.reindex();
+        }
     }
 
     pub fn set_workspace_diagnostic_configs(

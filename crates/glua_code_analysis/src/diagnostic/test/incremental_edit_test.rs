@@ -989,6 +989,56 @@ mod tests {
         expect_that!(affected, contains(eq(&caller)));
     }
 
+    /// The language server reloads a changed config by applying it and
+    /// re-reading every workspace file; files already indexed from the same
+    /// text must still show what a cold build under the new config shows.
+    #[gtest]
+    fn a_realm_config_change_matches_a_cold_build() {
+        let files = [
+            (
+                "lua/myaddon/sv_api.lua",
+                "function ServerApi() return 1 end\n",
+            ),
+            (
+                "lua/autorun/client/cl_use.lua",
+                "local value = ServerApi()\n",
+            ),
+        ];
+        let build = |detect_from_filename: bool| {
+            let mut ws = gmod_workspace_with(DiagnosticCode::GmodRealmMismatchHeuristic);
+            let mut emmyrc = (*ws.analysis.get_emmyrc()).clone();
+            emmyrc.gmod.detect_realm_from_filename = Some(detect_from_filename);
+            ws.update_emmyrc(emmyrc);
+            let uris = files
+                .iter()
+                .map(|(path, text)| {
+                    (
+                        ws.virtual_url_generator.new_uri(path),
+                        Some(text.to_string()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            ws.analysis.update_files_by_uri(uris.clone());
+            (ws, uris)
+        };
+        let caller_of = |ws: &VirtualWorkspace| {
+            let uri = ws.virtual_url_generator.new_uri(files[1].0);
+            ws.analysis.get_file_id(&uri).expect("caller file id")
+        };
+        let (cold, _) = build(false);
+        let expected = shared_diagnostics(&cold, caller_of(&cold));
+
+        let (mut warm, uris) = build(true);
+        let before = shared_diagnostics(&warm, caller_of(&warm));
+        let mut emmyrc = (*warm.analysis.get_emmyrc()).clone();
+        emmyrc.gmod.detect_realm_from_filename = Some(false);
+        warm.update_emmyrc(emmyrc);
+        warm.analysis.update_files_by_uri(uris);
+
+        expect_that!(expected, not(eq(&before)));
+        expect_that!(shared_diagnostics(&warm, caller_of(&warm)), eq(&expected));
+    }
+
     /// A field check asks whether a table literal is empty only for a numeric
     /// key, so a member added to a global table elsewhere leaves a reader of
     /// one of its named fields unaffected.
