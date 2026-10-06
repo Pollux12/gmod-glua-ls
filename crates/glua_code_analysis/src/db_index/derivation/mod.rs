@@ -89,7 +89,7 @@ impl std::fmt::Debug for dyn DerivedFact {
         f.write_str("DerivedFact")
     }
 }
-pub use graph::{KeyIdx, KeyTable, ReaderGraph};
+pub use graph::{KeptRecord, KeyIdx, KeyTable, ReaderGraph};
 pub use positions::{
     EditMaps, FilePosition, Local, fingerprint_before_edits, fingerprinting, hash_local, in_file,
     mapping_back, unmapped,

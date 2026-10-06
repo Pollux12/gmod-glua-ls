@@ -1427,21 +1427,14 @@ impl Engine {
                 file_task(&table, recording, &new_slots, groups)
             })
             .collect::<Vec<_>>();
+        db.reader_graph_mut().restore_keys(table);
         let mut released = Vec::new();
         let mut on_root = Vec::new();
-        let mut evaluations = Vec::new();
+        let mut records = Vec::new();
         for task in filed {
             touched.extend(task.touched);
             on_root.extend(task.on_root);
-            evaluations.extend(task.evaluations);
-        }
-        let records = evaluations
-            .into_par_iter()
-            .map(|(evaluation, seen)| table.keep_record(evaluation, seen))
-            .collect::<Vec<_>>();
-        db.reader_graph_mut().restore_keys(table);
-        for record in &records {
-            touched.extend(record.outputs().iter().cloned());
+            records.extend(task.records);
         }
         db.reader_graph_mut()
             .replace_all_kept(records, &mut released, derivation::new_stamp);
@@ -3051,18 +3044,18 @@ struct GroupRun {
     elapsed: Option<std::time::Duration>,
 }
 
-/// What canonicalising a task's recording leaves to file: the evaluations
-/// to keep records of, in order, each with what it saw of its reads, the
-/// groups that read a query the snapshot had no answer for, each with the
-/// query outputs it read, and the keys its evaluations moved.
+/// What canonicalising a task's recording leaves to file: the records of the
+/// evaluations to keep, in order, the groups that read a query the snapshot
+/// had no answer for, each with the query outputs it read, and the keys its
+/// kept evaluations moved or produced.
 struct FiledTask {
-    evaluations: Vec<(derivation::Evaluation, Vec<derivation::Fingerprint>)>,
+    records: Vec<derivation::KeptRecord>,
     on_root: Vec<(Vec<DerivationId>, Vec<HashedKey>)>,
     touched: Vec<HashedKey>,
 }
 
 /// Canonicalises a task's `recording` into `table`, its new keys interned at
-/// `new_slots`, and sets apart each evaluation `groups` file.
+/// `new_slots`, and keeps the record of each evaluation `groups` file.
 fn file_task(
     table: &derivation::KeyTable,
     recording: derivation::TaskRecording,
@@ -3074,10 +3067,11 @@ fn file_task(
         .expect("no slot is released while tasks run");
     let mut evaluations = evaluations.into_iter().map(Some).collect::<Vec<_>>();
     let mut filed = FiledTask {
-        evaluations: Vec::new(),
+        records: Vec::new(),
         on_root: Vec::new(),
         touched: Vec::new(),
     };
+    let mut kept = Vec::new();
     for group in groups {
         if group.records.iter().any(|(at, _)| {
             evaluations[*at]
@@ -3096,8 +3090,15 @@ fn file_task(
         for (at, seen) in &mut group.records {
             let (evaluation, _) = evaluations[*at].take().expect("a record is filed once");
             filed.touched.extend(evaluation.moved().cloned());
-            filed.evaluations.push((evaluation, std::mem::take(seen)));
+            kept.push((evaluation, std::mem::take(seen)));
         }
+    }
+    filed.records = kept
+        .into_par_iter()
+        .map(|(evaluation, seen)| table.keep_record(evaluation, seen))
+        .collect();
+    for record in &filed.records {
+        filed.touched.extend(record.outputs().iter().cloned());
     }
     filed
 }

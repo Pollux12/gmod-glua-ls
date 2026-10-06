@@ -816,13 +816,14 @@ impl TaskRecording {
         new_slots: &[KeyIdx],
         table: &KeyTable,
     ) -> Option<Vec<(Evaluation, bool)>> {
+        use rayon::prelude::*;
         if !self.keys.known_live(table) {
             return None;
         }
         let slots = self.keys.slots(new_slots);
         Some(
             self.evaluations
-                .into_iter()
+                .into_par_iter()
                 .map(|(mut evaluation, requires_canonical)| {
                     super::remap(&mut evaluation, &slots);
                     evaluation.log_handle.freeze(&evaluation.log);
