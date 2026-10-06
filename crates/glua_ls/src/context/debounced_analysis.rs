@@ -15,6 +15,11 @@ const FRESHNESS_STUCK_WARN_AFTER: Duration = Duration::from_secs(5);
 /// request waits for at most about one slice.
 const SLICE: Duration = Duration::from_millis(10);
 
+/// How long a slice holds the write lock while an edited document still
+/// settles first: requests on it wait for that anyway, and fewer slices
+/// spend less of it waiting on requests elsewhere.
+const FOCUS_SLICE: Duration = Duration::from_millis(100);
+
 /// Breakdown of a freshness wait by observed state, so one summary line
 /// can report where the wait went without per-iteration logging.
 ///
@@ -717,7 +722,11 @@ impl DebouncedAnalysis {
                 let mut guard = analysis.blocking_write();
                 let hold_start = crate::util::ls_profile::profile_instant();
                 guard.compilation.prioritise_update(&prioritised);
-                let progress = guard.advance_reindex(Slice::Until(Instant::now() + SLICE));
+                let focused = edited
+                    .iter()
+                    .any(|file_id| guard.compilation.settles_first(*file_id));
+                let slice = if focused { FOCUS_SLICE } else { SLICE };
+                let progress = guard.advance_reindex(Slice::Until(Instant::now() + slice));
                 let settled_first = edited
                     .into_iter()
                     .filter(|file_id| !guard.compilation.settles_first(*file_id))
