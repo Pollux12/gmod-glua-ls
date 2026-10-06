@@ -51,13 +51,6 @@ impl LspFeatures {
         false
     }
 
-    pub fn supports_pull_diagnostic(&self) -> bool {
-        if let Some(text_document) = &self.client_capabilities.text_document {
-            return text_document.diagnostic.is_some();
-        }
-        false
-    }
-
     pub fn supports_completion_item_deprecated_tags(&self) -> bool {
         self.client_capabilities
             .text_document
@@ -71,32 +64,6 @@ impl LspFeatures {
                         .value_set
                         .contains(&lsp_types::CompletionItemTag::DEPRECATED)
             })
-    }
-
-    pub fn supports_workspace_diagnostic(&self) -> bool {
-        self.supports_pull_diagnostic()
-    }
-
-    /// Whether the client can be told to fetch diagnostics again.
-    ///
-    /// Fetching alone is not enough: without `workspace/diagnostic/refresh`
-    /// there is no way to tell the client that a file it is not showing has
-    /// changed, so the server must keep publishing per-file reports for it.
-    /// With both, publishing duplicates what the fetch returns — the client
-    /// keeps the published collection beside the fetched one.
-    pub fn fetches_diagnostics(&self) -> bool {
-        self.supports_pull_diagnostic() && self.supports_refresh_diagnostic()
-    }
-
-    pub fn supports_refresh_diagnostic(&self) -> bool {
-        if let Some(workspace) = &self.client_capabilities.workspace {
-            if let Some(diagnostic) = &workspace.diagnostics {
-                if let Some(supports) = diagnostic.refresh_support {
-                    return supports;
-                }
-            }
-        }
-        false
     }
 
     pub fn supports_semantic_tokens_refresh(&self) -> bool {

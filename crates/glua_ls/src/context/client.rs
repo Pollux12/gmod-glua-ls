@@ -28,7 +28,6 @@ pub struct ClientProxy {
 
 #[derive(Default)]
 struct RefreshRequestGates {
-    workspace_diagnostics: Option<RequestId>,
     semantic_tokens: Option<RequestId>,
     inlay_hints: Option<RequestId>,
     code_lens: Option<RequestId>,
@@ -36,7 +35,6 @@ struct RefreshRequestGates {
 
 #[derive(Clone, Copy)]
 enum RefreshRequestKind {
-    WorkspaceDiagnostics,
     SemanticTokens,
     InlayHints,
     CodeLens,
@@ -45,7 +43,6 @@ enum RefreshRequestKind {
 impl RefreshRequestKind {
     const fn method(self) -> &'static str {
         match self {
-            Self::WorkspaceDiagnostics => "workspace/diagnostic/refresh",
             Self::SemanticTokens => "workspace/semanticTokens/refresh",
             Self::InlayHints => "workspace/inlayHint/refresh",
             Self::CodeLens => "workspace/codeLens/refresh",
@@ -54,7 +51,6 @@ impl RefreshRequestKind {
 
     fn gate(self, gates: &mut RefreshRequestGates) -> &mut Option<RequestId> {
         match self {
-            Self::WorkspaceDiagnostics => &mut gates.workspace_diagnostics,
             Self::SemanticTokens => &mut gates.semantic_tokens,
             Self::InlayHints => &mut gates.inlay_hints,
             Self::CodeLens => &mut gates.code_lens,
@@ -212,14 +208,6 @@ impl ClientProxy {
         };
 
         if gates
-            .workspace_diagnostics
-            .as_ref()
-            .is_some_and(|in_flight| in_flight == request_id)
-        {
-            gates.workspace_diagnostics = None;
-        }
-
-        if gates
             .semantic_tokens
             .as_ref()
             .is_some_and(|in_flight| in_flight == request_id)
@@ -328,10 +316,6 @@ impl ClientProxy {
         self.send_request_no_wait(request_id, method, params);
     }
 
-    pub fn refresh_workspace_diagnostics(&self) {
-        self.send_deduped_refresh_request(RefreshRequestKind::WorkspaceDiagnostics);
-    }
-
     pub fn refresh_semantic_tokens(&self) {
         self.send_deduped_refresh_request(RefreshRequestKind::SemanticTokens);
     }
@@ -369,35 +353,6 @@ mod tests {
         };
 
         request
-    }
-
-    #[gtest]
-    fn refresh_workspace_diagnostics_dedupes_while_request_is_in_flight() -> Result<()> {
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
-        let (client, peer) = create_client_proxy();
-
-        client.refresh_workspace_diagnostics();
-        client.refresh_workspace_diagnostics();
-
-        let request = recv_request(&peer);
-        verify_that!(request.method.as_str(), eq("workspace/diagnostic/refresh"))?;
-        verify_that!(peer.receiver.try_recv().is_err(), eq(true))?;
-
-        runtime.block_on(client.on_response(Response {
-            id: request.id.clone(),
-            result: Some(serde_json::Value::Null),
-            error: None,
-        }));
-
-        client.refresh_workspace_diagnostics();
-
-        let second_request = recv_request(&peer);
-        verify_that!(
-            second_request.method.as_str(),
-            eq("workspace/diagnostic/refresh")
-        )?;
-        assert_ne!(second_request.id, request.id);
-        Ok(())
     }
 
     #[gtest]
@@ -494,7 +449,6 @@ mod tests {
     fn different_refresh_requests_keep_separate_gates() -> Result<()> {
         let (client, peer) = create_client_proxy();
 
-        client.refresh_workspace_diagnostics();
         client.refresh_semantic_tokens();
         client.refresh_inlay_hints();
         client.refresh_code_lens();
@@ -502,12 +456,10 @@ mod tests {
         let first_request = recv_request(&peer);
         let second_request = recv_request(&peer);
         let third_request = recv_request(&peer);
-        let fourth_request = recv_request(&peer);
         let mut methods = [
             first_request.method,
             second_request.method,
             third_request.method,
-            fourth_request.method,
         ];
         methods.sort();
 
@@ -515,7 +467,6 @@ mod tests {
             methods,
             [
                 "workspace/codeLens/refresh".to_string(),
-                "workspace/diagnostic/refresh".to_string(),
                 "workspace/inlayHint/refresh".to_string(),
                 "workspace/semanticTokens/refresh".to_string()
             ]

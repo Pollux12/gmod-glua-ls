@@ -12,7 +12,7 @@ mod workspace_manager;
 pub use client::ClientProxy;
 pub use client_id::{ClientId, get_client_id};
 pub use debounced_analysis::{DebouncedAnalysis, Freshness, InFlightChangeGuard};
-pub use diagnostic_store::{DiagnosticStore, Priority, StoredDiagnostics};
+pub use diagnostic_store::DiagnosticStore;
 pub use did_change_coalescer::DidChangeCoalescer;
 pub use file_diagnostic::FileDiagnostic;
 use glua_code_analysis::EmmyLuaAnalysis;
@@ -30,13 +30,12 @@ pub use workspace_manager::*;
 use crate::context::snapshot::ServerContextInner;
 
 // LOCK ORDER (acquire low → high; never a lower lock while holding a higher):
-// 1. diagnostic_tokens  2. workspace_diagnostic_token  3. cached_file_diagnostics
-// 4. update_token  5. analysis(read)  6. workspace_manager(read)
-// 7. workspace_manager(write)  8. analysis(write)
+// 1. workspace_diagnostic_token  2. update_token  3. analysis(read)
+// 4. workspace_manager(read)  5. workspace_manager(write)  6. analysis(write)
 // Within `DebouncedAnalysis`: pending_files before reindexing_files, and both
 // are released before anything above is taken.
-// Leaf: document_versions — a synchronous lock, so it can never be held across
-// an `.await`. Never upgrade read→write in place; avoid holding any lock across
+// Leaves: document_versions and the diagnostic store's state — synchronous
+// locks, so they can never be held across an `.await`. Never upgrade read→write in place; avoid holding any lock across
 // `.await`. Atomics are exempt.
 
 /// Panics the debounce supervisor will restart before it stops trying.
@@ -73,32 +72,16 @@ struct InFlightRequest {
 
 // Methods answered with their computed result on cancel instead of an error,
 // so the client keeps its current UI state.
-// - semantic tokens excluded: relative offsets make a stale set wrong.
-// - workspace/diagnostic included: vscode-languageclient permanently stops
-//   workspace pulls after 6 non-cancellation errors.
-// - textDocument/diagnostic excluded: the client rewrites a cancelled pull's
-//   result to an empty full report; an error reschedules instead.
+// Semantic tokens are excluded: relative offsets make a stale set wrong.
 fn keep_stale_editor_data_on_cancel(method: &str) -> bool {
     matches!(
         method,
-        "textDocument/codeLens"
-            | "textDocument/inlayHint"
-            | "gluals/annotator"
-            | "workspace/diagnostic"
+        "textDocument/codeLens" | "textDocument/inlayHint" | "gluals/annotator"
     )
 }
 
 /// The error code — and any `data` payload — for a cancelled request.
 fn cancel_error(features: &LspFeatures, method: &str) -> (ErrorCode, Option<serde_json::Value>) {
-    // The client only retriggers when `data` is present; it ignores the
-    // spec's default-when-absent.
-    if matches!(method, "textDocument/diagnostic" | "workspace/diagnostic") {
-        return (
-            ErrorCode::ServerCancelled,
-            Some(serde_json::json!({ "retriggerRequest": true })),
-        );
-    }
-
     // ContentModified only for methods the client declares it re-sends;
     // others read it as "no result" and clear the feature's UI.
     if features.retries_on_content_modified(method) {
@@ -171,7 +154,6 @@ impl ServerContext {
             analysis.clone(),
             status_bar.clone(),
             client.clone(),
-            lsp_features.fetches_diagnostics(),
         ));
         let workspace_manager_inner = WorkspaceManager::new(
             analysis.clone(),
@@ -494,51 +476,6 @@ mod tests {
         Ok(())
     }
 
-    /// See `keep_stale_editor_data_on_cancel`: cancelled document pulls must
-    /// answer with an error, workspace pulls with a success.
-    #[gtest]
-    fn cancelled_document_diagnostics_answer_with_an_error() -> Result<()> {
-        verify_that!(
-            keep_stale_editor_data_on_cancel("textDocument/diagnostic"),
-            eq(false)
-        )?;
-        verify_that!(
-            keep_stale_editor_data_on_cancel("workspace/diagnostic"),
-            eq(true)
-        )?;
-
-        let features = LspFeatures::new(ClientCapabilities::default());
-        for method in ["textDocument/diagnostic", "workspace/diagnostic"] {
-            let (code, data) = cancel_error(&features, method);
-            verify_that!(code as i32, eq(ErrorCode::ServerCancelled as i32))?;
-            verify_that!(data, eq(&Some(json!({ "retriggerRequest": true }))))?;
-        }
-        Ok(())
-    }
-
-    /// A pull the server refuses while the workspace still initializes asks
-    /// the client to pull again, as VS Code re-sends a diagnostic pull only
-    /// then.
-    #[gtest]
-    fn a_diagnostic_pull_refused_during_init_asks_the_client_to_pull_again() -> Result<()> {
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
-        runtime.block_on(async {
-            let (conn, _peer) = lsp_server::Connection::memory();
-            let context = ServerContext::new(conn, ClientCapabilities::default());
-
-            let response = context.refused_during_init(1.into(), "workspace/diagnostic");
-
-            let error = response.error.expect("the pull is refused");
-            verify_that!(
-                (error.code, error.data),
-                eq(&(
-                    ErrorCode::ServerCancelled as i32,
-                    Some(json!({ "retriggerRequest": true }))
-                ))
-            )
-        })
-    }
-
     #[gtest]
     fn cancel_all_requests_except_preserves_inlay_and_code_lens_requests() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
@@ -582,19 +519,7 @@ mod tests {
                 )
                 .await;
 
-            let diag_id: RequestId = 4.into();
-            context
-                .task(
-                    diag_id.clone(),
-                    RequestTaskMetadata::new("textDocument/diagnostic", None),
-                    |_cancel_token| async move {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        Some(Response::new_ok(diag_id, json!({"kind": "unChanged", "resultId": "abc"})))
-                    },
-                )
-                .await;
-
-            let (inlay_token, code_lens_token, hover_token, diag_token) = {
+            let (inlay_token, code_lens_token, hover_token) = {
                 let requests = context.requests.lock().await;
                 let inlay = requests
                     .get(&RequestId::from(1))
@@ -611,12 +536,7 @@ mod tests {
                     .expect("hover request should exist")
                     .cancel_token
                     .clone();
-                let diag = requests
-                    .get(&RequestId::from(4))
-                    .expect("diagnostic request should exist")
-                    .cancel_token
-                    .clone();
-                (inlay, code_lens, hover, diag)
+                (inlay, code_lens, hover)
             };
 
             context
@@ -628,7 +548,6 @@ mod tests {
 
             verify_that!(inlay_token.is_cancelled(), eq(false))?;
             verify_that!(code_lens_token.is_cancelled(), eq(false))?;
-            verify_that!(diag_token.is_cancelled(), eq(true))?;
             verify_that!(hover_token.is_cancelled(), eq(true))?;
             Ok(())
         })

@@ -30,13 +30,6 @@ pub struct StoredDiagnostics {
     pub result_id: u64,
 }
 
-impl StoredDiagnostics {
-    /// The result id as the client holds it.
-    pub fn wire_id(&self) -> String {
-        format!("{:016x}", self.result_id)
-    }
-}
-
 struct Entry {
     stored: StoredDiagnostics,
     config_gen: u64,
@@ -115,10 +108,8 @@ pub struct DiagnosticStore {
     computed: Notify,
     /// Signalled when a re-analysis settles, for the verifier.
     settled: Notify,
+    /// Where changed diagnostics are published.
     client: Arc<ClientProxy>,
-    /// Whether the client fetches diagnostics instead of having them
-    /// published.
-    fetches: bool,
     /// `GLUALS_DIAG_VERIFY`: every stored result is checked against a fresh
     /// computation, and a difference logged as `LS_DIAG_DRIFT`.
     verify: bool,
@@ -129,7 +120,6 @@ impl DiagnosticStore {
         analysis: Arc<RwLock<EmmyLuaAnalysis>>,
         shared: SharedDiagnosticDataCache,
         client: Arc<ClientProxy>,
-        fetches: bool,
     ) -> Self {
         Self {
             analysis,
@@ -139,7 +129,6 @@ impl DiagnosticStore {
             computed: Notify::new(),
             settled: Notify::new(),
             client,
-            fetches,
             verify: std::env::var_os("GLUALS_DIAG_VERIFY").is_some(),
         }
     }
@@ -291,13 +280,11 @@ impl DiagnosticStore {
     }
 
     fn cleared(&self, uri: Uri) {
-        if !self.fetches {
-            self.client.publish_diagnostics(PublishDiagnosticsParams {
-                uri,
-                diagnostics: Vec::new(),
-                version: None,
-            });
-        }
+        self.client.publish_diagnostics(PublishDiagnosticsParams {
+            uri,
+            diagnostics: Vec::new(),
+            version: None,
+        });
     }
 
     /// A watchdog detail naming the files being computed.
@@ -339,14 +326,6 @@ impl DiagnosticStore {
                 described.join(", ")
             ))
         })
-    }
-
-    /// The last computed diagnostics, whether or not they still hold.
-    pub fn last(&self, file_id: FileId) -> Option<StoredDiagnostics> {
-        self.state()
-            .entries
-            .get(&file_id)
-            .map(|entry| entry.stored.clone())
     }
 
     /// `file_id`'s current diagnostics, computed at `priority` first if they
@@ -482,9 +461,11 @@ impl DiagnosticStore {
             job.token.clone(),
         )
         .await;
-        let (published, open) = {
+        // Held until the result is published, so no edit lands between the
+        // revision check and the publish.
+        let analysis = self.analysis.read().await;
+        let published = {
             let mut state = self.state();
-            let open = state.open.contains(&job.file_id);
             let current = state
                 .computing
                 .get(&job.file_id)
@@ -497,13 +478,32 @@ impl DiagnosticStore {
                 Computed::Cancelled => {
                     let priority = state.priority_of(job.file_id, false);
                     state.invalidate(job.file_id, priority);
-                    (None, open)
+                    None
                 }
                 Computed::Gone => {
                     state.entries.remove(&job.file_id);
-                    (None, open)
+                    None
                 }
-                Computed::Diagnostics(uri, diagnostics) => {
+                Computed::Diagnostics { revision, .. }
+                    if analysis
+                        .compilation
+                        .get_db()
+                        .get_vfs()
+                        .get_file_revision(&job.file_id)
+                        != Some(revision) =>
+                {
+                    // Computed on text that has changed since.
+                    let priority = state.priority_of(job.file_id, false);
+                    state.invalidate(job.file_id, priority);
+                    None
+                }
+                Computed::Diagnostics {
+                    uri,
+                    diagnostics,
+                    version,
+                    ..
+                } => {
+                    let version = version.filter(|_| state.open.contains(&job.file_id));
                     let result_id = result_id(&diagnostics);
                     let changed = state
                         .entries
@@ -521,25 +521,20 @@ impl DiagnosticStore {
                             config_gen: job.config_gen,
                         },
                     );
-                    (changed.then_some(stored), open)
+                    changed.then_some((stored, version))
                 }
             }
         };
+        if let Some((stored, version)) = published {
+            self.client.publish_diagnostics(PublishDiagnosticsParams {
+                uri: stored.uri,
+                diagnostics: stored.diagnostics.to_vec(),
+                version,
+            });
+        }
+        drop(analysis);
         self.computed.notify_waiters();
         self.dirtied.notify_waiters();
-        if let Some(stored) = published {
-            if !self.fetches {
-                self.client.publish_diagnostics(PublishDiagnosticsParams {
-                    uri: stored.uri,
-                    diagnostics: stored.diagnostics.to_vec(),
-                    version: None,
-                });
-            } else if open {
-                // The client ignores workspace reports for open documents,
-                // so it pulls them again.
-                self.client.refresh_workspace_diagnostics();
-            }
-        }
     }
 
     /// Under `GLUALS_DIAG_VERIFY`, computes every file whose stored
@@ -563,7 +558,9 @@ impl DiagnosticStore {
             if debounced.is_dirty() {
                 break;
             }
-            let Computed::Diagnostics(uri, diagnostics) = compute(
+            let Computed::Diagnostics {
+                uri, diagnostics, ..
+            } = compute(
                 self.analysis.clone(),
                 self.shared.clone(),
                 file_id,
@@ -599,7 +596,13 @@ impl DiagnosticStore {
 }
 
 enum Computed {
-    Diagnostics(Uri, Vec<Diagnostic>),
+    Diagnostics {
+        uri: Uri,
+        diagnostics: Vec<Diagnostic>,
+        /// The text revision they were computed on.
+        revision: u64,
+        version: Option<i32>,
+    },
     /// The file left the workspace.
     Gone,
     Cancelled,
@@ -619,9 +622,26 @@ async fn compute(
         let Some(uri) = analysis.get_uri(file_id) else {
             return Computed::Gone;
         };
+        // Text the index has not taken in yet would be diagnosed against the
+        // facts of the text before it.
+        if !analysis.compilation.has_taken_text(file_id) {
+            return Computed::Cancelled;
+        }
+        let vfs = analysis.compilation.get_db().get_vfs();
+        let (Some(revision), version) = (
+            vfs.get_file_revision(&file_id),
+            vfs.get_file_version(&file_id),
+        ) else {
+            return Computed::Gone;
+        };
         let shared = shared.get_or_precompute(&analysis);
         match analysis.diagnose_file_with_shared(file_id, token.clone(), shared) {
-            Some(diagnostics) => Computed::Diagnostics(uri, diagnostics),
+            Some(diagnostics) => Computed::Diagnostics {
+                uri,
+                diagnostics,
+                revision,
+                version,
+            },
             None if token.is_cancelled() => Computed::Cancelled,
             None => Computed::Gone,
         }
@@ -760,6 +780,52 @@ mod tests {
                 .map(|params| params.diagnostics.len())
                 .collect::<Vec<_>>();
             verify_that!(published, eq(&vec![first.diagnostics.len(), 0]))
+        })
+    }
+
+    /// An open file's diagnostics are published with its document version, a
+    /// closed file's without one.
+    #[gtest]
+    fn open_files_publish_with_their_document_version() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, peer) = Connection::memory();
+        runtime.block_on(async {
+            let context = ServerContext::new(connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_diagnostic_store_version");
+            let open_uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/open.lua"))
+                .expect("file URI should parse");
+            let closed_uri =
+                glua_code_analysis::file_path_to_uri(&workspace.join("lua/closed.lua"))
+                    .expect("file URI should parse");
+            let (open_id, closed_id) = {
+                let mut analysis = snapshot.analysis().write().await;
+                analysis.add_main_workspace(workspace);
+                let mut add = |uri| {
+                    let (file_id, _) = analysis
+                        .update_file_by_uri(uri, Some("local unused = UndefinedGlobal".to_string()))
+                        .expect("file id");
+                    analysis
+                        .compilation
+                        .get_db_mut()
+                        .get_vfs_mut()
+                        .update_file_version(&file_id, Some(7));
+                    file_id
+                };
+                (add(&open_uri), add(&closed_uri))
+            };
+            let store = snapshot.file_diagnostic().store();
+            let cancel = CancellationToken::new();
+            store.set_open(open_id, true);
+
+            store.get(open_id, Priority::Edited, &cancel).await;
+            store.get(closed_id, Priority::Closed, &cancel).await;
+
+            let versions = published(&peer)
+                .into_iter()
+                .map(|params| (params.uri, params.version))
+                .collect::<Vec<_>>();
+            verify_that!(versions, eq(&vec![(open_uri, Some(7)), (closed_uri, None)]))
         })
     }
 }

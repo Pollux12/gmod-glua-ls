@@ -14,6 +14,7 @@
 //                             [--edit-find TEXT --edit-replace TEXT]
 //                             [--completion-find TEXT]
 //                             [--other relative/path.lua]
+//                             [--quiet-ms 5000]
 //
 // --edit-find/--edit-replace swap one snippet back and forth on every edit, so
 // a specific real change to real code can be reproduced. --completion-find puts
@@ -30,6 +31,15 @@
 // of the target settles, keeping the slowest answer: no request should wait
 // long on an edit to another file, however far that edit's ripple goes.
 //
+// A server that advertises `diagnosticProvider` is pulled, as VS Code pulls
+// it. One that does not delivers diagnostics only by `publishDiagnostics`:
+// quiet then means no publish for --quiet-ms (after the server's
+// `startupComplete` status), "edit -> fresh answer" is the time to the edited
+// document's first publish at or past the edit's version, and "edit -> all
+// work done" the time to the last publish before the stream goes quiet.
+// Measurements and checks that only exist for pulls are reported as null
+// (`n/a (push)` in the table).
+//
 // LSP_SERVER overrides the binary (default: target/dist/glua_ls[.exe] if built,
 // unless target/release/glua_ls[.exe] is newer — see defaultServerPath).
 // LSP_SERVER_ARGS passes extra space-separated arguments to the server, e.g.
@@ -38,15 +48,14 @@
 // pessimistic case and keeps runs comparable without naming a file per repo.
 //
 // Exits non-zero on a correctness check, not on a latency number: a cancelled
-// diagnostic pull answered with a report thinner than the settled one, or a
-// mid-edit completion that disagrees with the settled one.
+// diagnostic pull answered with a report thinner than the settled one (pull
+// servers only), or a mid-edit completion that disagrees with the settled one.
 'use strict';
 
-const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const {
-    LspClient, sleep, clientCapabilities, defaultServerPath, requireDir, fileUri,
+    sleep, defaultServerPath, requireDir, fileUri, startServer,
 } = require('./lsp_client');
 
 // LSP ContentModified. The client is expected to re-send rather than wait.
@@ -58,6 +67,7 @@ function parseArgs(argv) {
     const opts = {
         json: false, runs: 5, file: null, edit: 'code',
         editFind: null, editReplace: null, completionFind: null, other: null,
+        quietMs: 5000,
     };
     for (let i = 2; i < argv.length; i++) {
         const a = argv[i];
@@ -69,6 +79,7 @@ function parseArgs(argv) {
         else if (a === '--edit-replace') opts.editReplace = argv[++i];
         else if (a === '--completion-find') opts.completionFind = argv[++i];
         else if (a === '--other') opts.other = argv[++i];
+        else if (a === '--quiet-ms') opts.quietMs = Number(argv[++i]);
         else throw new Error(`unknown argument: ${a}`);
     }
     if (opts.edit !== 'code' && opts.edit !== 'comment') {
@@ -80,6 +91,9 @@ function parseArgs(argv) {
     if (opts.editFind === '') throw new Error('--edit-find must not be empty');
     if (!Number.isFinite(opts.runs) || opts.runs < 1) {
         throw new Error('--runs must be a positive integer');
+    }
+    if (!Number.isFinite(opts.quietMs) || opts.quietMs <= 0) {
+        throw new Error('--quiet-ms must be a positive number');
     }
     return opts;
 }
@@ -160,49 +174,17 @@ async function main() {
     const target = opts.file ? path.resolve(codebase, opts.file) : largestLuaFile(codebase);
     if (!fs.existsSync(target)) throw new Error(`target file not found: ${target}`);
 
-    const extraArgs = (process.env.LSP_SERVER_ARGS || '').split(' ').filter(Boolean);
-    const proc = spawn(server, [
-        '--communication', 'stdio',
-        '--gmod-annotations-path', annotations,
-        ...extraArgs,
-    ], { stdio: ['pipe', 'pipe', 'pipe'] });
-
-    const client = new LspClient(proc);
+    const { proc, client, loadMs, push } = await startServer(server, codebase, annotations);
     const report = {
         workspace: codebase,
         file: path.relative(codebase, target),
         server,
         runs: opts.runs,
+        diagnosticDelivery: push ? 'push' : 'pull',
         measurements: {},
         checks: {},
     };
-
-    let workspaceLoadedAt = null;
-    client.onNotification = (message) => {
-        if (message.method === 'gluals/serverStatus'
-            && message.params && message.params.state === 'workspaceLoaded') {
-            workspaceLoadedAt = Date.now();
-        }
-    };
-
-    const startedAt = Date.now();
-    await client.request('initialize', {
-        processId: process.pid,
-        rootUri: fileUri(codebase),
-        workspaceFolders: [{ uri: fileUri(codebase), name: path.basename(codebase) }],
-        capabilities: clientCapabilities(),
-        initializationOptions: {},
-        clientInfo: { name: 'Visual Studio Code', version: '1.95.0' },
-    });
-    client.notify('initialized', {});
-
-    const loadDeadline = Date.now() + 300000;
-    while (!workspaceLoadedAt && Date.now() < loadDeadline) await sleep(100);
-    if (!workspaceLoadedAt) {
-        proc.kill();
-        throw new Error('workspace never finished loading (5 minute timeout)');
-    }
-    report.measurements.workspaceLoad = summarise([workspaceLoadedAt - startedAt]);
+    report.measurements.workspaceLoad = summarise([loadMs]);
 
     const uri = fileUri(target);
     const original = fs.readFileSync(target, 'utf8');
@@ -250,7 +232,9 @@ async function main() {
     const cancelledPulls = [];
     const completionDrift = [];
     const otherHoverWhileSettling = [];
+    let editsWithoutFreshPublish = 0;
     let previousResultId;
+    let lastEditAt = -Infinity;
 
     const labelsOf = (items) =>
         (Array.isArray(items) ? items : []).map((item) => item.label);
@@ -267,6 +251,7 @@ async function main() {
     const editDocument = () => {
         version += 1;
         editSerial += 1;
+        lastEditAt = Date.now();
 
         // `--edit-find`/`--edit-replace` reproduce one specific edit, swapping
         // back and forth so every keystroke is a real change to real code. Use
@@ -303,12 +288,27 @@ async function main() {
 
     // A settled measurement is only meaningful once nothing is pending. An
     // uncancelled diagnostic pull returns exactly when the analysis is fresh,
-    // so it is the cheapest way to wait for quiescence without guessing.
+    // so it is the cheapest way to wait for quiescence without guessing. A
+    // push server has nothing to pull: it is quiet once no publish has
+    // arrived for --quiet-ms since the last edit.
     const waitUntilQuiet = async () => {
+        if (push) {
+            await client.waitForPublishQuiet(opts.quietMs, lastEditAt);
+            return;
+        }
         await client.request('textDocument/diagnostic', {
             textDocument: { uri }, previousResultId,
         });
     };
+
+    // The edited document's first publish that reflects the edit: one at or
+    // past the edit's version, or any later one when the server sends none.
+    const freshPublish = (editVersion) => client.nextPublish(uri,
+        (entry) => entry.version === undefined || entry.version === null || entry.version >= editVersion,
+        opts.quietMs);
+
+    // The startup fill is still publishing until the server says it is done.
+    if (push) await client.waitForStatus('startupComplete', 300000);
 
     for (let run = 0; run < opts.runs; run++) {
         await waitUntilQuiet();
@@ -321,13 +321,18 @@ async function main() {
             : [];
         report.checks.completionItemCount = Array.isArray(items) ? items.length : 0;
 
-        const diagnostic = await client.request('textDocument/diagnostic', {
-            textDocument: { uri }, previousResultId,
-        });
-        settledDiagnostic.push(diagnostic.ms);
-        const described = describeReport(diagnostic.message.result);
-        if (described.resultId) previousResultId = described.resultId;
-        report.checks.diagnosticCount = described.count ?? report.checks.diagnosticCount;
+        if (push) {
+            const published = client.publishes.get(uri);
+            report.checks.diagnosticCount = published ? published.diagnostics.length : 0;
+        } else {
+            const diagnostic = await client.request('textDocument/diagnostic', {
+                textDocument: { uri }, previousResultId,
+            });
+            settledDiagnostic.push(diagnostic.ms);
+            const described = describeReport(diagnostic.message.result);
+            if (described.resultId) previousResultId = described.resultId;
+            report.checks.diagnosticCount = described.count ?? report.checks.diagnosticCount;
+        }
 
         // While typing: the request the user actually waits on. Its result is
         // compared against the settled one, because the whole risk of answering
@@ -379,12 +384,14 @@ async function main() {
         highlightRetries.push(highlightRetried);
 
         // Another document while an edit settles: hover it every 25 ms from
-        // the keystroke until every request the edit owes is answered, and
-        // keep the slowest.
+        // the keystroke until every request the edit owes is answered (for a
+        // push server, until its publishes go quiet), and keep the slowest.
         if (other) {
             await waitUntilQuiet();
             editDocument();
-            const settled = client.request('workspace/diagnostic', { previousResultIds: [] });
+            const settled = push
+                ? client.waitForPublishQuiet(opts.quietMs, lastEditAt)
+                : client.request('workspace/diagnostic', { previousResultIds: [] });
             let done = false;
             settled.then(() => { done = true; });
             let worst = 0;
@@ -401,7 +408,17 @@ async function main() {
         }
 
         // Keystroke to the first answer any index-reading handler can give.
+        // A push server answers with a publish; an edit that leaves the file's
+        // diagnostics unchanged may publish nothing, which is counted rather
+        // than timed. Cancelled pulls only exist for a pull server.
         editDocument();
+        if (push) {
+            const editAt = lastEditAt;
+            const published = await freshPublish(version);
+            if (published) editToFresh.push(published.at - editAt);
+            else editsWithoutFreshPublish += 1;
+            continue;
+        }
         const fresh = await client.request('textDocument/diagnostic', {
             textDocument: { uri }, previousResultId,
         });
@@ -438,45 +455,58 @@ async function main() {
     // the server then sends no refresh, and all related work ends when the
     // edited file itself goes fresh. Both shapes are real; measure whichever
     // this edit produces.
+    //
+    // A push server has no sweep or refresh: all related work is done at the
+    // last publish before the stream goes quiet.
     const waitRefresh = (ms) =>
         client.waitForServerRequest('workspace/diagnostic/refresh', ms).catch(() => null);
     await waitUntilQuiet();
-    // Consume the sweep the workspace load armed: the pending level is what the
-    // next pull claims, and a Slow claim sweeps every file regardless of the
-    // scoped set. Until it drains, a post-edit pull measures the initial sweep,
-    // not the edit's own.
-    await client.request('workspace/diagnostic', { previousResultIds: [] });
-    // The run loop's last edits may have armed a refresh that fires ~3s later;
-    // drain it so the refresh awaited below is unambiguously caused by this edit.
-    await waitRefresh(15000);
-    const allWorkEditAt = Date.now();
-    editDocument();
-    const refreshWait = waitRefresh(15000);
-    // The file going fresh is the last owed work when the edit moves nothing
-    // another file reads; the sweep, when owed, supersedes it.
-    const fresh = client.request('textDocument/diagnostic', {
-        textDocument: { uri }, previousResultId,
-    });
-    await fresh;
-    const freshDoneAt = Date.now();
-    const refresh = await refreshWait;
-    if (refresh) {
-        const workspacePull = await client.request('workspace/diagnostic', {
-            previousResultIds: [],
-        });
-        if (workspacePull.message.error) {
-            throw new Error(`workspace/diagnostic pull failed: ${JSON.stringify(workspacePull.message.error)}`);
-        }
-        report.measurements.editToAllWorkDone = summarise([Date.now() - allWorkEditAt]);
-        report.measurements.workspaceSweep = summarise([workspacePull.ms]);
-        const workspaceItems = (workspacePull.message.result && workspacePull.message.result.items) || [];
-        report.checks.workspaceSweepItems = workspaceItems.length;
-        report.checks.workspaceSweepUnchanged =
-            workspaceItems.filter((item) => item.kind === 'unchanged').length;
+    if (push) {
+        editDocument();
+        const allWorkEditAt = lastEditAt;
+        await client.waitForPublishQuiet(opts.quietMs, allWorkEditAt);
+        report.measurements.editToAllWorkDone = client.lastPublishAt > allWorkEditAt
+            ? summarise([client.lastPublishAt - allWorkEditAt])
+            : null;
+        report.measurements.workspaceSweep = null;
     } else {
-        // No refresh ever came: the edit owed no downstream work, so all
-        // related work ended when the edited file answered fresh.
-        report.measurements.editToAllWorkDone = summarise([freshDoneAt - allWorkEditAt]);
+        // Consume the sweep the workspace load armed: the pending level is what the
+        // next pull claims, and a Slow claim sweeps every file regardless of the
+        // scoped set. Until it drains, a post-edit pull measures the initial sweep,
+        // not the edit's own.
+        await client.request('workspace/diagnostic', { previousResultIds: [] });
+        // The run loop's last edits may have armed a refresh that fires ~3s later;
+        // drain it so the refresh awaited below is unambiguously caused by this edit.
+        await waitRefresh(15000);
+        const allWorkEditAt = Date.now();
+        editDocument();
+        const refreshWait = waitRefresh(15000);
+        // The file going fresh is the last owed work when the edit moves nothing
+        // another file reads; the sweep, when owed, supersedes it.
+        const fresh = client.request('textDocument/diagnostic', {
+            textDocument: { uri }, previousResultId,
+        });
+        await fresh;
+        const freshDoneAt = Date.now();
+        const refresh = await refreshWait;
+        if (refresh) {
+            const workspacePull = await client.request('workspace/diagnostic', {
+                previousResultIds: [],
+            });
+            if (workspacePull.message.error) {
+                throw new Error(`workspace/diagnostic pull failed: ${JSON.stringify(workspacePull.message.error)}`);
+            }
+            report.measurements.editToAllWorkDone = summarise([Date.now() - allWorkEditAt]);
+            report.measurements.workspaceSweep = summarise([workspacePull.ms]);
+            const workspaceItems = (workspacePull.message.result && workspacePull.message.result.items) || [];
+            report.checks.workspaceSweepItems = workspaceItems.length;
+            report.checks.workspaceSweepUnchanged =
+                workspaceItems.filter((item) => item.kind === 'unchanged').length;
+        } else {
+            // No refresh ever came: the edit owed no downstream work, so all
+            // related work ended when the edited file answered fresh.
+            report.measurements.editToAllWorkDone = summarise([freshDoneAt - allWorkEditAt]);
+        }
     }
 
     report.measurements.completionSettled = summarise(settledCompletion);
@@ -490,8 +520,10 @@ async function main() {
     if (otherHoverWhileSettling.length > 0) {
         report.measurements.otherHoverWhileSettling = summarise(otherHoverWhileSettling);
     }
-    report.checks.thinReportsOnCancel =
-        cancelledPulls.filter((p) => p.thinFullReport).length;
+    report.checks.thinReportsOnCancel = push
+        ? null
+        : cancelledPulls.filter((p) => p.thinFullReport).length;
+    if (push) report.checks.editsWithoutFreshPublish = editsWithoutFreshPublish;
     // A mid-edit completion that differs from the settled one is a correctness
     // regression, however fast it came back.
     report.checks.completionDriftWhileTyping = {
@@ -511,39 +543,52 @@ async function main() {
         return failedChecks(report);
     }
 
+    // The third entry marks rows that only exist for a pull server.
     const rows = [
         ['workspace load', report.measurements.workspaceLoad],
         ['completion (settled)', report.measurements.completionSettled],
         ['completion (while typing)', report.measurements.completionWhileTyping],
-        ['diagnostic (settled)', report.measurements.diagnosticSettled],
+        ['diagnostic (settled)', report.measurements.diagnosticSettled, true],
         ['hover (while typing)', report.measurements.hoverWhileTyping],
         ['completion (concurrent)', report.measurements.completionWhileTypingConcurrent],
         ['highlight after edit', report.measurements.highlightAfterEdit],
         ['edit -> fresh answer', report.measurements.editToFreshAnswer],
         ['other doc hover (worst)', report.measurements.otherHoverWhileSettling],
         ['edit -> all work done', report.measurements.editToAllWorkDone],
-        ['workspace sweep', report.measurements.workspaceSweep],
+        ['workspace sweep', report.measurements.workspaceSweep, true],
     ];
     console.log(`workspace : ${report.workspace}`);
     console.log(`file      : ${report.file}`);
     console.log(`server    : ${report.server}`);
-    console.log(`runs      : ${report.runs}\n`);
+    console.log(`runs      : ${report.runs}`);
+    console.log(`delivery  : ${report.diagnosticDelivery}\n`);
     console.log('                             min      median       p95       max');
-    for (const [label, stats] of rows) {
+    for (const [label, stats, pullOnly] of rows) {
+        if (push && pullOnly) {
+            console.log(`${label.padEnd(28)}${'n/a (push)'.padStart(10)}`);
+            continue;
+        }
         if (!stats) continue;
         const fmt = (n) => `${n}ms`.padStart(10);
         console.log(`${label.padEnd(28)}${fmt(stats.min)}${fmt(stats.median)}${fmt(stats.p95)}${fmt(stats.max)}`);
     }
     console.log(`\ncompletion items          : ${report.checks.completionItemCount}`);
     console.log(`diagnostics               : ${report.checks.diagnosticCount}`);
-    if (report.checks.workspaceSweepItems !== undefined) {
+    if (push) {
+        console.log('workspace sweep items     : n/a (push)');
+    } else if (report.checks.workspaceSweepItems !== undefined) {
         console.log(`workspace sweep items     : ${report.checks.workspaceSweepItems}`
             + ` (${report.checks.workspaceSweepUnchanged} unchanged)`);
     } else {
         console.log('workspace sweep items     : (edit owed no downstream work)');
     }
-    console.log(`thin reports on cancel    : ${report.checks.thinReportsOnCancel}`
-        + (report.checks.thinReportsOnCancel === 0 ? '  (good)' : '  (BAD: drops diagnostics)'));
+    if (push) {
+        console.log('thin reports on cancel    : n/a (push)');
+        console.log(`no fresh publish on edit  : ${report.checks.editsWithoutFreshPublish}`);
+    } else {
+        console.log(`thin reports on cancel    : ${report.checks.thinReportsOnCancel}`
+            + (report.checks.thinReportsOnCancel === 0 ? '  (good)' : '  (BAD: drops diagnostics)'));
+    }
     const drift = report.checks.completionDriftWhileTyping;
     const driftOk = drift.worstMissing === 0 && drift.worstExtra === 0;
     console.log(`completion drift mid-edit : -${drift.worstMissing} / +${drift.worstExtra}`

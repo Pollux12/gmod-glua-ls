@@ -443,9 +443,6 @@ pub async fn init_analysis(
     file_diagnostic
         .add_workspace_diagnostic_task(0, false)
         .await;
-    if lsp_features.supports_refresh_diagnostic() {
-        client.refresh_workspace_diagnostics();
-    }
 }
 
 fn build_workspace_collection_folders(
@@ -566,9 +563,8 @@ mod tests {
     use googletest::prelude::*;
     use lsp_server::{Connection, Message};
     use lsp_types::{
-        ClientCapabilities, CodeLensWorkspaceClientCapabilities, DiagnosticClientCapabilities,
-        DiagnosticWorkspaceClientCapabilities, InlayHintWorkspaceClientCapabilities,
-        SemanticTokensWorkspaceClientCapabilities, TextDocumentClientCapabilities,
+        ClientCapabilities, CodeLensWorkspaceClientCapabilities,
+        InlayHintWorkspaceClientCapabilities, SemanticTokensWorkspaceClientCapabilities,
         WorkspaceClientCapabilities,
     };
     use tokio::sync::RwLock;
@@ -596,16 +592,6 @@ mod tests {
                 code_lens: Some(CodeLensWorkspaceClientCapabilities {
                     refresh_support: Some(true),
                 }),
-                diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
-                    refresh_support: Some(true),
-                }),
-                ..Default::default()
-            }),
-            text_document: Some(TextDocumentClientCapabilities {
-                diagnostic: Some(DiagnosticClientCapabilities {
-                    dynamic_registration: Some(true),
-                    related_document_support: Some(true),
-                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -617,7 +603,6 @@ mod tests {
             analysis.clone(),
             status_bar.clone(),
             client.clone(),
-            lsp_features.fetches_diagnostics(),
         ));
 
         runtime.block_on(init_analysis(
@@ -634,7 +619,7 @@ mod tests {
         ));
 
         let mut methods = Vec::new();
-        while methods.len() < 4 {
+        while methods.len() < 3 {
             let message = peer_connection
                 .receiver
                 .recv_timeout(Duration::from_secs(1))
@@ -651,7 +636,6 @@ mod tests {
             methods,
             vec![
                 "workspace/codeLens/refresh".to_string(),
-                "workspace/diagnostic/refresh".to_string(),
                 "workspace/inlayHint/refresh".to_string(),
                 "workspace/semanticTokens/refresh".to_string(),
             ]

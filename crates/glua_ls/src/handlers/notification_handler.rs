@@ -72,14 +72,11 @@ pub async fn on_notification_handler(
             let snapshot = server_context.snapshot();
             snapshot.note_document_seen_version(&uri, params.text_document.version);
             // Exempted requests wait for fresh data instead of being
-            // cancelled: the client clears a file on a cancelled diagnostic
-            // pull, and a cancelled executeCommand drops the user's command.
+            // cancelled: a cancelled executeCommand drops the user's command.
             server_context
                 .cancel_all_requests_except(&[
                     "textDocument/codeLens",
                     "textDocument/inlayHint",
-                    "textDocument/diagnostic",
-                    "workspace/diagnostic",
                     "workspace/executeCommand",
                 ])
                 .await;

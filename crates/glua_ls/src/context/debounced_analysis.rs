@@ -361,67 +361,6 @@ impl DebouncedAnalysis {
         }
     }
 
-    /// Wait until the document at `uri` has nothing left to settle: its own
-    /// entries match its text and the re-analysis in progress has no work
-    /// left in it. While it waits, its work goes first.
-    ///
-    /// Diagnostics need this and no more: the rest of the re-analysis can
-    /// still move what they read, and reports those files affected when it
-    /// settles.
-    pub async fn wait_until_file_settled_for(
-        &self,
-        cancel_token: &CancellationToken,
-        request_method: &'static str,
-        uri: &Uri,
-    ) -> Freshness {
-        #[cfg(test)]
-        self.freshness_waits.fetch_add(1, Ordering::AcqRel);
-
-        let started_at = Instant::now();
-        let mut warned_stuck = false;
-        let mut waiting = None;
-
-        loop {
-            let notified = self.reindex_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            if self.file_is_answerable(uri).await && !self.file_is_settling(uri).await {
-                return Freshness::Fresh;
-            }
-
-            if !self.debounce_loop_alive() {
-                return Freshness::LoopDead;
-            }
-
-            // Only a request that has to wait needs the re-analysis now.
-            waiting.get_or_insert_with(|| self.request_waiting());
-            let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
-
-            tokio::select! {
-                _ = notified => {}
-                _ = cancel_token.cancelled() => return Freshness::Cancelled,
-                _ = tokio::time::sleep(remaining), if !warned_stuck => {
-                    self.log_freshness_stuck(request_method, started_at).await;
-                    warned_stuck = true;
-                }
-            }
-        }
-    }
-
-    /// Whether the re-analysis in progress still has work in the document at
-    /// `uri`; if it has, the next slice settles that work first.
-    async fn file_is_settling(&self, uri: &Uri) -> bool {
-        if !self.settling.load(Ordering::Acquire) {
-            return false;
-        }
-        let analysis = self.analysis.read().await;
-        let Some(file_id) = analysis.get_file_id(uri) else {
-            return false;
-        };
-        self.file_id_is_settling(&analysis, file_id)
-    }
-
     /// Whether `analysis`'s re-analysis in progress still has work in
     /// `file_id`; if it has, the next slice settles that work first.
     fn file_id_is_settling(&self, analysis: &EmmyLuaAnalysis, file_id: FileId) -> bool {
@@ -631,11 +570,16 @@ impl DebouncedAnalysis {
 
     /// The first of `candidates` whose diagnostics can be computed now: its
     /// text was taken and the re-analysis in progress has no work left in it.
+    /// Those it still has work in go first in the next slice.
     pub async fn first_ready_for_diagnostics(&self, candidates: &[FileId]) -> Option<FileId> {
         if !self.has_pending_changes.load(Ordering::Acquire) {
-            return candidates.first().copied();
+            let analysis = self.analysis.read().await;
+            return candidates
+                .iter()
+                .copied()
+                .find(|file_id| analysis.compilation.has_taken_text(*file_id));
         }
-        let taken = {
+        let scheduled = {
             let pending = self.pending_files.lock().await;
             let reindexing = self.reindexing_files.lock().await;
             candidates
@@ -644,13 +588,12 @@ impl DebouncedAnalysis {
                 .filter(|file_id| !pending.contains(file_id) && !reindexing.contains(file_id))
                 .collect::<Vec<_>>()
         };
-        if !self.settling.load(Ordering::Acquire) {
-            return taken.first().copied();
-        }
+        let settling = self.settling.load(Ordering::Acquire);
         let analysis = self.analysis.read().await;
-        taken
-            .into_iter()
-            .find(|file_id| !analysis.compilation.is_settling(*file_id))
+        scheduled.into_iter().find(|file_id| {
+            analysis.compilation.has_taken_text(*file_id)
+                && !(settling && self.file_id_is_settling(&analysis, *file_id))
+        })
     }
 
     /// Takes the edited files into the re-analysis under the write lock, on
@@ -1035,7 +978,6 @@ mod tests {
             analysis.clone(),
             status_bar,
             client.clone(),
-            false,
         ));
         Arc::new(DebouncedAnalysis::new(
             analysis,
@@ -1382,7 +1324,6 @@ mod tests {
                 analysis.clone(),
                 status_bar.clone(),
                 client.clone(),
-                false,
             ));
             let shutdown = CancellationToken::new();
             let debounced_analysis = Arc::new(DebouncedAnalysis::new(
@@ -1398,7 +1339,7 @@ mod tests {
                 .start(1, debounced_analysis.clone(), shutdown.clone());
 
             let initial_diagnostics = file_diagnostic
-                .pull_file_diagnostics(user_uri.clone(), CancellationToken::new())
+                .file_diagnostics(user_uri.clone(), CancellationToken::new())
                 .await
                 .map(|stored| stored.diagnostics.to_vec())
                 .unwrap_or_default();
@@ -1427,7 +1368,7 @@ mod tests {
                 .await;
 
             let updated_diagnostics = file_diagnostic
-                .pull_file_diagnostics(user_uri, CancellationToken::new())
+                .file_diagnostics(user_uri, CancellationToken::new())
                 .await
                 .map(|stored| stored.diagnostics.to_vec())
                 .unwrap_or_default();
@@ -1464,7 +1405,6 @@ mod tests {
             analysis.clone(),
             status_bar,
             client.clone(),
-            false,
         ));
         let shutdown = CancellationToken::new();
         let debounced_analysis = Arc::new(DebouncedAnalysis::new(
@@ -1608,7 +1548,6 @@ mod tests {
                 analysis.clone(),
                 status_bar,
                 client.clone(),
-                false,
             ));
             let debounced_analysis = Arc::new(DebouncedAnalysis::new(
                 analysis.clone(),
@@ -1697,7 +1636,6 @@ mod tests {
                 analysis.clone(),
                 status_bar,
                 client.clone(),
-                false,
             ));
             let debounced_analysis = Arc::new(DebouncedAnalysis::new(
                 analysis.clone(),
@@ -1779,7 +1717,6 @@ mod tests {
                 analysis.clone(),
                 status_bar,
                 client.clone(),
-                false,
             ));
             let debounced_analysis = Arc::new(DebouncedAnalysis::new(
                 analysis.clone(),
@@ -1911,10 +1848,10 @@ mod tests {
         })
     }
 
-    /// A diagnostics pull for a file the re-analysis still has work in waits
-    /// for that work, which the next slice settles first, then answers.
+    /// Diagnostics waiting on a file the re-analysis still has work in put
+    /// that work first, and the file is ready once it settled.
     #[gtest]
-    fn a_diagnostics_wait_for_a_file_still_settling_puts_it_first() -> Result<()> {
+    fn diagnostics_waiting_on_a_file_still_settling_put_it_first() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let mut analysis = EmmyLuaAnalysis::new();
@@ -1943,48 +1880,90 @@ mod tests {
                 analysis.read().await.compilation.is_settling(consumer_id),
                 eq(true)
             )?;
+            debounced_analysis.refresh_dirty_state().await;
 
-            let waiter = tokio::spawn({
-                let debounced_analysis = debounced_analysis.clone();
-                let consumer_uri = consumer_uri.clone();
-                async move {
-                    debounced_analysis
-                        .wait_until_file_settled_for(
-                            &CancellationToken::new(),
-                            "textDocument/diagnostic",
-                            &consumer_uri,
-                        )
-                        .await
-                }
-            });
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !debounced_analysis
+            verify_that!(
+                debounced_analysis
+                    .first_ready_for_diagnostics(&[consumer_id])
+                    .await,
+                none()
+            )?;
+            verify_that!(
+                debounced_analysis
                     .prioritised
                     .lock()
                     .expect("prioritised files")
-                    .contains(&consumer_id)
-                {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("the pull should put its file first");
-            verify_that!(waiter.is_finished(), eq(false))?;
+                    .contains(&consumer_id),
+                eq(true)
+            )?;
 
             while analysis.read().await.compilation.is_settling(consumer_id) {
-                debounced_analysis.reindex_notify.notify_waiters();
                 debounced_analysis
                     .advance_slice(Vec::new())
                     .await
                     .expect("a slice completes");
-                debounced_analysis.reindex_notify.notify_waiters();
             }
-            debounced_analysis.reindex_notify.notify_waiters();
-            let freshness = tokio::time::timeout(Duration::from_secs(5), waiter)
-                .await
-                .expect("the pull should be released once its file settled")
-                .expect("waiter task must not panic");
-            verify_that!(freshness, eq(Freshness::Fresh))?;
+            verify_that!(
+                debounced_analysis
+                    .first_ready_for_diagnostics(&[consumer_id])
+                    .await,
+                some(eq(consumer_id))
+            )?;
+            Ok(())
+        })
+    }
+
+    /// A file whose new text is stored but not yet taken in by a
+    /// re-analysis is not ready for diagnostics, edited or not.
+    #[gtest]
+    fn text_not_yet_taken_in_is_not_ready_for_diagnostics() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let mut analysis = EmmyLuaAnalysis::new();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_untaken");
+            analysis.add_main_workspace(workspace.clone());
+            let uri = file_path_to_uri(&workspace.join("lua/untaken/edited.lua"))
+                .expect("URI should parse");
+            analysis.update_file_by_uri(
+                &uri,
+                Some(
+                    "Value = 1
+"
+                    .to_string(),
+                ),
+            );
+            let file_id = analysis
+                .update_file_text_only(
+                    &uri,
+                    "Value = 2
+"
+                    .to_string(),
+                )
+                .expect("the file should still exist");
+            let analysis = Arc::new(RwLock::new(analysis));
+            let (debounced_analysis, _peer) = loop_test_debounced_analysis(analysis.clone());
+
+            verify_that!(
+                debounced_analysis
+                    .first_ready_for_diagnostics(&[file_id])
+                    .await,
+                none()
+            )?;
+            let _in_flight = debounced_analysis.begin_in_flight_change();
+            verify_that!(
+                debounced_analysis
+                    .first_ready_for_diagnostics(&[file_id])
+                    .await,
+                none()
+            )?;
+
+            analysis.write().await.reindex_files(vec![file_id]);
+            verify_that!(
+                debounced_analysis
+                    .first_ready_for_diagnostics(&[file_id])
+                    .await,
+                some(eq(file_id))
+            )?;
             Ok(())
         })
     }

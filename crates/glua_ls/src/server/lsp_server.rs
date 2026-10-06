@@ -191,8 +191,6 @@ fn should_fail_fast_request_during_init(method: &str) -> bool {
             | "textDocument/codeLens"
             | "textDocument/inlayHint"
             | "textDocument/semanticTokens/full"
-            | "textDocument/diagnostic"
-            | "workspace/diagnostic"
             | "workspace/symbol"
             | "gluals/annotator"
             | "gluals/gmodScriptedClasses"

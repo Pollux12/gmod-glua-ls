@@ -3099,4 +3099,30 @@ end
         );
         assert_eq!(observed, decl_type(&cold, cold_consumer_id, "observed"));
     }
+
+    /// Text stored without re-analysis is not taken in until a re-analysis
+    /// takes it, so nothing diagnoses it against the facts of the old text.
+    #[gtest]
+    fn stored_text_counts_as_taken_once_a_reanalysis_takes_it() {
+        let mut ws = VirtualWorkspace::new();
+        let path = "lua/autorun/sh_taken.lua";
+        let file_id = ws.def_file(
+            path,
+            "local a = 1
+",
+        );
+        expect_that!(ws.analysis.compilation.has_taken_text(file_id), eq(true));
+
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.analysis.update_file_text_only(
+            &uri,
+            "local a = 2
+"
+            .to_string(),
+        );
+        expect_that!(ws.analysis.compilation.has_taken_text(file_id), eq(false));
+
+        ws.analysis.reindex_files(vec![file_id]);
+        expect_that!(ws.analysis.compilation.has_taken_text(file_id), eq(true));
+    }
 }

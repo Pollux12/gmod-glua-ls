@@ -14,6 +14,10 @@ class LspClient {
         this.onNotification = null;
         this.serverRequests = new Set();
         this.requestWaiters = new Map();
+        this.statusAt = new Map();
+        this.publishes = new Map();
+        this.lastPublishAt = -Infinity;
+        this.publishWaiters = new Set();
         proc.stdout.on('data', (chunk) => this._receive(chunk));
         // The server's phase profiler writes to stderr, so LSP_SERVER_STDERR
         // makes those numbers reachable instead of dropping them on the floor.
@@ -62,7 +66,27 @@ class LspClient {
             if (resolve) { this.pending.delete(message.id); resolve(message); }
             return;
         }
+        if (message.method === 'gluals/serverStatus' && message.params
+            && !this.statusAt.has(message.params.state)) {
+            this.statusAt.set(message.params.state, Date.now());
+        }
+        if (message.method === 'textDocument/publishDiagnostics' && message.params) {
+            this._recordPublish(message.params);
+        }
         if (this.onNotification) this.onNotification(message);
+    }
+
+    _recordPublish(params) {
+        const at = Date.now();
+        const entry = { diagnostics: params.diagnostics || [], version: params.version, at };
+        this.publishes.set(params.uri, entry);
+        this.lastPublishAt = at;
+        for (const waiter of this.publishWaiters) {
+            if (waiter.uri === params.uri && waiter.accept(entry)) {
+                this.publishWaiters.delete(waiter);
+                waiter.resolve(entry);
+            }
+        }
     }
 
     _write(payload) {
@@ -84,6 +108,47 @@ class LspClient {
             );
             this.requestWaiters.set(method, (message) => { clearTimeout(timer); resolve(message); });
         });
+    }
+
+    /** Resolves once the server has reported `state` in `gluals/serverStatus` (or rejects on timeout). */
+    async waitForStatus(state, timeoutMs) {
+        const deadline = Date.now() + timeoutMs;
+        while (!this.statusAt.has(state)) {
+            if (Date.now() >= deadline) throw new Error(`timeout waiting for server status ${state}`);
+            await sleep(100);
+        }
+        return this.statusAt.get(state);
+    }
+
+    /** Resolves once no `textDocument/publishDiagnostics` has arrived for `quietMs` since `since`. */
+    async waitForPublishQuiet(quietMs, since = -Infinity) {
+        for (;;) {
+            const idle = Date.now() - Math.max(this.lastPublishAt, since);
+            if (idle >= quietMs) return;
+            await sleep(quietMs - idle);
+        }
+    }
+
+    /**
+     * Resolves with the first publish for `uri` from now on that `accept`
+     * takes, or with null once publishes go quiet for `quietMs` without one.
+     * The entry's `at` is when it arrived, so polling does not skew timings.
+     */
+    async nextPublish(uri, accept, quietMs) {
+        const since = Date.now();
+        let found = null;
+        const waiter = { uri, accept, resolve: (entry) => { found = entry; } };
+        this.publishWaiters.add(waiter);
+        try {
+            while (!found) {
+                const idle = Date.now() - Math.max(this.lastPublishAt, since);
+                if (idle >= quietMs) break;
+                await sleep(Math.min(quietMs - idle, 25));
+            }
+        } finally {
+            this.publishWaiters.delete(waiter);
+        }
+        return found;
     }
 
     /** Returns a promise carrying the response, the elapsed ms, and its id. */
@@ -173,7 +238,11 @@ function fileUri(p) {
     return `file://${encodeURI(withSlash).replace(/#/g, '%23').replace(/\?/g, '%3F')}`;
 }
 
-/** Starts the server on stdio and initializes it as VS Code does. */
+/**
+ * Starts the server on stdio and initializes it as VS Code does. `push` is
+ * whether the server delivers diagnostics only by `publishDiagnostics`: a
+ * server that answers pulls advertises `diagnosticProvider`.
+ */
 async function startServer(server, workspace, annotations) {
     const { spawn } = require('child_process');
     const extraArgs = (process.env.LSP_SERVER_ARGS || '').split(' ').filter(Boolean);
@@ -183,17 +252,8 @@ async function startServer(server, workspace, annotations) {
         ...extraArgs,
     ], { stdio: ['pipe', 'pipe', 'pipe'] });
     const client = new LspClient(proc);
-    let loadedAt = null;
-    const previous = client.onNotification;
-    client.onNotification = (message) => {
-        if (message.method === 'gluals/serverStatus'
-            && message.params && message.params.state === 'workspaceLoaded') {
-            loadedAt = Date.now();
-        }
-        if (previous) previous(message);
-    };
     const startedAt = Date.now();
-    await client.request('initialize', {
+    const initialized = await client.request('initialize', {
         processId: process.pid,
         rootUri: fileUri(workspace),
         workspaceFolders: [{ uri: fileUri(workspace), name: path.basename(workspace) }],
@@ -202,13 +262,16 @@ async function startServer(server, workspace, annotations) {
         clientInfo: { name: 'Visual Studio Code', version: '1.95.0' },
     });
     client.notify('initialized', {});
-    const deadline = Date.now() + 300000;
-    while (!loadedAt && Date.now() < deadline) await sleep(100);
-    if (!loadedAt) {
+    const result = initialized.message.result || {};
+    const capabilities = result.capabilities || {};
+    let loadedAt;
+    try {
+        loadedAt = await client.waitForStatus('workspaceLoaded', 300000);
+    } catch {
         proc.kill();
         throw new Error('workspace never finished loading (5 minute timeout)');
     }
-    return { proc, client, loadMs: loadedAt - startedAt };
+    return { proc, client, loadMs: loadedAt - startedAt, capabilities, push: !capabilities.diagnosticProvider };
 }
 
 module.exports = {

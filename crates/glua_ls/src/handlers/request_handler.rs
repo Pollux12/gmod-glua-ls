@@ -7,20 +7,18 @@ use lsp_types::Uri;
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
     CodeActionRequest, CodeLensRequest, CodeLensResolve, ColorPresentationRequest, Completion,
-    DocumentColor, DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentLinkRequest,
-    DocumentLinkResolve, DocumentSymbolRequest, ExecuteCommand, FoldingRangeRequest, Formatting,
-    GotoDefinition, GotoImplementation, HoverRequest, InlayHintRequest, InlayHintResolveRequest,
+    DocumentColor, DocumentHighlightRequest, DocumentLinkRequest, DocumentLinkResolve,
+    DocumentSymbolRequest, ExecuteCommand, FoldingRangeRequest, Formatting, GotoDefinition,
+    GotoImplementation, HoverRequest, InlayHintRequest, InlayHintResolveRequest,
     InlineValueRequest, OnTypeFormatting, PrepareRenameRequest, RangeFormatting, References,
     Rename, Request as LspRequest, ResolveCompletionItem, SelectionRangeRequest,
-    SemanticTokensFullRequest, SignatureHelpRequest, WorkspaceDiagnosticRequest,
-    WorkspaceSymbolRequest,
+    SemanticTokensFullRequest, SignatureHelpRequest, WorkspaceSymbolRequest,
 };
 use serde::Serialize;
 
 use crate::{
     context::{Freshness, RequestTaskMetadata, ServerContext},
     handlers::{
-        diagnostic::{on_pull_document_diagnostic, on_pull_workspace_diagnostic},
         document_type_format::on_type_formatting_handler,
         emmy_gutter::{
             EmmyGutterDetailRequest, EmmyGutterRequest, on_emmy_gutter_detail_handler,
@@ -368,8 +366,6 @@ pub async fn on_request_handler(
         EmmyAnnotatorRequest => on_emmy_annotator_handler,
         CodeLensRequest => on_code_lens_handler,
         InlayHintRequest => on_inlay_hint_handler,
-        DocumentDiagnosticRequest => on_pull_document_diagnostic,
-        WorkspaceDiagnosticRequest => on_pull_workspace_diagnostic,
     }, wait_for_fresh_index: {
         Completion => on_completion_handler,
         ResolveCompletionItem => on_completion_resolve_handler,

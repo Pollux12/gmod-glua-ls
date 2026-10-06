@@ -253,6 +253,14 @@ impl LuaCompilation {
         &self.last_stats
     }
 
+    /// Whether a re-analysis has taken in `file_id`'s current text.
+    pub fn has_taken_text(&self, file_id: FileId) -> bool {
+        self.db
+            .get_vfs()
+            .get_file_revision(&file_id)
+            .is_some_and(|revision| revision <= self.taken_revision)
+    }
+
     /// Whether `file_id`'s facts were built from its current text.
     pub fn is_indexed(&self, file_id: FileId) -> bool {
         self.db

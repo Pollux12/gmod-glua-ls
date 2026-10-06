@@ -10,13 +10,12 @@ use std::{
 use glua_code_analysis::SharedDiagnosticComponentCache;
 use glua_code_analysis::{EmmyLuaAnalysis, SharedDiagnosticData};
 use log::{debug, info};
-use lsp_types::Uri;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::util::{LongRunningWatchdogStatus, spawn_long_running_watchdog};
 
-use super::{ClientProxy, ProgressTask, StatusBar, StoredDiagnostics};
+use super::{ClientProxy, ProgressTask, StatusBar};
 
 #[derive(Clone, Default)]
 pub(crate) struct SharedDiagnosticDataCache {
@@ -70,21 +69,15 @@ pub struct FileDiagnostic {
 }
 
 impl FileDiagnostic {
-    /// `fetches_diagnostics`: whether diagnostics reach this client by being
-    /// fetched *and* the client accepts `workspace/diagnostic/refresh`. Such a
-    /// client gets nothing published: VS Code keeps a pushed collection beside
-    /// the pulled one and the Problems panel would show their union.
     pub fn new(
         analysis: Arc<RwLock<EmmyLuaAnalysis>>,
         status_bar: Arc<StatusBar>,
         client: Arc<ClientProxy>,
-        fetches_diagnostics: bool,
     ) -> Self {
         let store = Arc::new(super::DiagnosticStore::new(
             analysis.clone(),
             SharedDiagnosticDataCache::default(),
             client.clone(),
-            fetches_diagnostics,
         ));
         Self {
             analysis,
@@ -99,10 +92,6 @@ impl FileDiagnostic {
 
     pub fn store(&self) -> &Arc<super::DiagnosticStore> {
         &self.store
-    }
-
-    pub fn is_workspace_loaded(&self) -> bool {
-        self.workspace_loaded_notified.load(Ordering::Acquire)
     }
 
     pub fn notify_workspace_loaded(&self) {
@@ -130,13 +119,6 @@ impl FileDiagnostic {
                 "state": state,
             }),
         );
-    }
-
-    /// The last diagnostics computed for `uri`, whether or not they still
-    /// hold.
-    pub async fn cached_file_diagnostics(&self, uri: &Uri) -> Option<StoredDiagnostics> {
-        let file_id = self.analysis.read().await.get_file_id(uri)?;
-        self.store.last(file_id)
     }
 
     /// After `interval` ms, computes every workspace file's diagnostics again;
@@ -180,28 +162,20 @@ impl FileDiagnostic {
 
     /// `uri`'s current diagnostics, computed ahead of every other file if
     /// they do not hold.
-    pub async fn pull_file_diagnostics(
+    #[cfg(test)]
+    pub async fn file_diagnostics(
         &self,
-        uri: Uri,
+        uri: lsp_types::Uri,
         cancel_token: CancellationToken,
-    ) -> Option<StoredDiagnostics> {
+    ) -> Option<super::diagnostic_store::StoredDiagnostics> {
         let file_id = self.analysis.read().await.get_file_id(&uri)?;
         self.store
-            .get(file_id, super::Priority::Edited, &cancel_token)
+            .get(
+                file_id,
+                super::diagnostic_store::Priority::Edited,
+                &cancel_token,
+            )
             .await
-    }
-
-    /// The current diagnostics of every workspace file.
-    pub async fn workspace_diagnostics(
-        &self,
-        cancel_token: &CancellationToken,
-    ) -> Vec<StoredDiagnostics> {
-        let file_ids = self
-            .analysis
-            .read()
-            .await
-            .get_main_workspace_file_ids_for_diagnostics();
-        self.store.get_all(&file_ids, cancel_token, |_| {}).await
     }
 
     /// Computes every workspace file's diagnostics again, reporting progress.
@@ -278,11 +252,11 @@ pub(crate) fn workspace_diagnostic_parallelism() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::context::{ClientProxy, ServerContext, StatusBar};
+    use crate::context::{ClientProxy, StatusBar};
     use glua_code_analysis::{DiagnosticCode, EmmyLuaAnalysis, Emmyrc, file_path_to_uri};
     use googletest::prelude::*;
     use lsp_server::{Connection, Message};
-    use lsp_types::{ClientCapabilities, NumberOrString};
+    use lsp_types::NumberOrString;
     use std::sync::Arc;
     use tokio::sync::RwLock;
     use tokio_util::sync::CancellationToken;
@@ -337,7 +311,7 @@ mod tests {
         let client = Arc::new(ClientProxy::new(connection));
         let status_bar = Arc::new(StatusBar::new(client.clone(), true));
         let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
-        let file_diagnostic = FileDiagnostic::new(analysis, status_bar, client, false);
+        let file_diagnostic = FileDiagnostic::new(analysis, status_bar, client);
 
         file_diagnostic.notify_workspace_loaded();
         file_diagnostic.notify_workspace_loaded();
@@ -425,44 +399,5 @@ mod tests {
         verify_that!(cache.cached_ptr(), eq(first_cached))?;
 
         Ok(())
-    }
-
-    /// A workspace pull answers with every workspace file's diagnostics.
-    #[gtest]
-    fn workspace_pull_reports_every_workspace_file() -> Result<()> {
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
-        runtime.block_on(async {
-            let (connection, _peer) = Connection::memory();
-            let context = ServerContext::new(connection, ClientCapabilities::default());
-            let snapshot = context.snapshot();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_scoped_fast_pull_workspace");
-            let uri_a = file_path_to_uri(&workspace.join("lua/autorun/sh_a.lua"))
-                .expect("uri A should parse");
-            let file_a = {
-                let mut analysis = snapshot.analysis().write().await;
-                analysis.add_main_workspace(workspace.clone());
-                let mut emmyrc = Emmyrc::default();
-                emmyrc.gmod.enabled = true;
-                analysis.update_config(Arc::new(emmyrc));
-                let file_a = analysis
-                    .update_file_by_uri(&uri_a, Some("local a = 1".to_string()))
-                    .map(|(id, _)| id)
-                    .expect("file A should be indexed");
-                let uri_b = file_path_to_uri(&workspace.join("lua/autorun/sh_b.lua"))
-                    .expect("uri B should parse");
-                analysis.update_file_by_uri(&uri_b, Some("local b = 1".to_string()));
-                file_a
-            };
-            let report = snapshot
-                .file_diagnostic()
-                .workspace_diagnostics(&CancellationToken::new())
-                .await;
-            let mut uris = report.iter().map(|stored| &stored.uri).collect::<Vec<_>>();
-            uris.sort_by_key(|uri| uri.as_str());
-            verify_that!(uris.len(), eq(2))?;
-            verify_that!(uris.contains(&&uri_a), eq(true))?;
-            let _ = file_a;
-            Ok(())
-        })
     }
 }

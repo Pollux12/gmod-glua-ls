@@ -1,10 +1,16 @@
 // Drift gate for the language server.
 //
 // Drives a real `glua_ls` over stdio as VS Code does: real debounce, slices,
-// threads, watched-file events and diagnostic pulls. After each scenario it
-// compares the diagnostics a client would show for every workspace file with
-// a cold `glua_check` of the text the scenario ends on. Any difference is
-// drift the user would see.
+// threads, watched-file events and diagnostics as the server delivers them.
+// After each scenario it compares the diagnostics a client would show for
+// every workspace file with a cold `glua_check` of the text the scenario ends
+// on. Any difference is drift the user would see.
+//
+// A server that advertises `diagnosticProvider` is pulled, as VS Code pulls
+// it; one that does not is followed by its `publishDiagnostics` alone, where
+// the latest publish per file is what the client shows. A push scenario has
+// settled once no publish has arrived for --quiet-ms, and the load scenario
+// also waits for the server's `startupComplete` status first.
 //
 // Scenarios:
 //   load     the workspace as loaded
@@ -14,7 +20,8 @@
 //            the middle of a re-analysis
 //   revert   the original text back in one change, as an undo
 //   recreate the file closed, deleted on disk and re-created, through
-//            watched-file events
+//            watched-file events; a push server must clear the deleted
+//            file's diagnostics before it is re-created
 //
 // Runs on temporary copies of the workspace; the codebase is never touched.
 //
@@ -216,12 +223,14 @@ async function main() {
             coldCheck(glua, edited, annotations, path.join(scratch, 'edited.json'))
                 .then((output) => loadCold(edited, output)));
 
-        const { proc, client, loadMs } = await startServer(server, work, annotations);
+        const { proc, client, loadMs, push } = await startServer(server, work, annotations);
         children.add(proc);
-        console.log(`[load] workspace loaded in ${(loadMs / 1000).toFixed(1)}s`);
+        console.log(`[load] workspace loaded in ${(loadMs / 1000).toFixed(1)}s`
+            + ` (diagnostics by ${push ? 'push' : 'pull'})`);
 
         // What the client shows: the latest report per file, as VS Code keeps
-        // it. A pull replaces the files it reports and leaves the rest.
+        // it. A pull replaces the files it reports and leaves the rest; a
+        // publish replaces its file, and an empty one clears it.
         const shown = new Map();
         const resultIds = new Map();
         const apply = (uri, report) => {
@@ -231,6 +240,10 @@ async function main() {
             if (keys.length) shown.set(file, keys); else shown.delete(file);
             if (report.resultId) resultIds.set(uri, report.resultId);
         };
+        // Publishes can land before this listener does; the client keeps them.
+        for (const [published, entry] of client.publishes) {
+            apply(published, { kind: 'full', items: entry.diagnostics });
+        }
         client.onNotification = ((previous) => (message) => {
             if (message.method === 'textDocument/publishDiagnostics') {
                 apply(message.params.uri, { kind: 'full', items: message.params.diagnostics });
@@ -255,10 +268,18 @@ async function main() {
         };
 
         const open = new Set();
-        // Settled once a workspace pull, which waits for fresh analysis, is
-        // followed by no refresh request for --quiet-ms; then one more pull
-        // picks up anything a missed refresh armed.
-        const settle = async () => {
+        // A push server has settled once no publish has arrived for --quiet-ms
+        // since the scenario's last change.
+        const settlePush = async () => {
+            if (!client.statusAt.has('startupComplete')) {
+                await client.waitForStatus('startupComplete', 300000);
+            }
+            await client.waitForPublishQuiet(opts.quietMs, Date.now());
+        };
+        // A pull server has settled once a workspace pull, which waits for
+        // fresh analysis, is followed by no refresh request for --quiet-ms;
+        // then one more pull picks up anything a missed refresh armed.
+        const settlePull = async () => {
             for (const uri of open) {
                 const result = await pull('textDocument/diagnostic', () => ({
                     textDocument: { uri }, previousResultId: resultIds.get(uri),
@@ -281,6 +302,7 @@ async function main() {
             }
             await pullWorkspace();
         };
+        const settle = push ? settlePush : settlePull;
 
         let differences = 0;
         await settle();
@@ -314,10 +336,23 @@ async function main() {
         fs.rmSync(target);
         client.notify('workspace/didChangeWatchedFiles', { changes: [{ uri, type: 3 }] });
         await settle();
-        // The server forgets a deleted file's report; the editor drops it and
-        // the result id it held.
-        shown.delete(relativeKey(work, target));
-        resultIds.delete(uri);
+        if (push) {
+            // The server clears a deleted file with an empty publish; anything
+            // still shown for it would stay in the editor.
+            const stale = shown.get(relativeKey(work, target)) || [];
+            if (stale.length) {
+                console.log(`[delete] ${stale.length} diagnostic(s) still shown for the deleted file`);
+                for (const key of stale.slice(0, 40)) console.log(`  STALE   ${relativeKey(work, target)} ${key}`);
+            } else {
+                console.log('[delete] +0 diagnostics');
+            }
+            differences += stale.length;
+        } else {
+            // The server forgets a deleted file's report; the editor drops it
+            // and the result id it held.
+            shown.delete(relativeKey(work, target));
+            resultIds.delete(uri);
+        }
         fs.writeFileSync(target, original);
         client.notify('workspace/didChangeWatchedFiles', { changes: [{ uri, type: 1 }] });
         await settle();
