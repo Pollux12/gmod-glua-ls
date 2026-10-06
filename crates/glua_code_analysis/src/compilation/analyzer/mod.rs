@@ -201,7 +201,7 @@ impl Reanalysis {
     ) -> Self {
         let mut engine = engine::Engine::new(edits, schedule);
         engine.interrupt_with(interrupt);
-        let pass = start_pass(db, &mut engine, file_ids, &mut scopes);
+        let pass = start_pass(db, &mut engine, file_ids, &mut scopes, HashSet::default());
         let mut reanalysis = Self {
             engine,
             pass,
@@ -223,13 +223,17 @@ impl Reanalysis {
         file_ids: Vec<FileId>,
         edits: derivation::EditMaps,
     ) {
-        // What a pending pass's rebuild moved is queued under the edits it
-        // was taken with; source layers are rebuilt at the stage outside a run.
-        self.queue_pending_readers(db);
+        // What a pending pass's rebuild moved follows these edits with what
+        // this rebuild moves; source layers are rebuilt at the stage outside
+        // a run.
+        let pending = match &mut self.pass {
+            Some(Pass::Replaced { touched, .. }) if !file_ids.is_empty() => std::mem::take(touched),
+            _ => HashSet::default(),
+        };
         db.set_analysis_stage(derivation::AnalysisStage::Closed);
         refresh_payload_refs(db, self.engine.payload_holders());
         self.engine.take_edits(edits);
-        if let Some(pass) = start_pass(db, &mut self.engine, file_ids, &mut self.scopes) {
+        if let Some(pass) = start_pass(db, &mut self.engine, file_ids, &mut self.scopes, pending) {
             self.pass = Some(pass);
             self.access_paths = crate::semantic::AccessPaths::default();
         }
@@ -266,6 +270,7 @@ impl Reanalysis {
                 &mut self.engine,
                 stale.into_iter().collect(),
                 &mut self.scopes,
+                HashSet::default(),
             );
             crate::semantic::keep_access_paths(crate::semantic::AccessPaths::default());
         };
@@ -273,18 +278,6 @@ impl Reanalysis {
         self.access_paths = crate::semantic::stop_keeping_access_paths();
         self.pause(db);
         settled
-    }
-
-    /// Queues the readers of what a pending pass's rebuild moved, leaving it
-    /// to open at the next slice: the files being taken in hold text their
-    /// index is not built from yet, which opening a pass would read.
-    fn queue_pending_readers(&mut self, db: &mut DbIndex) {
-        if let Some(Pass::Replaced { touched, .. }) = &mut self.pass {
-            let touched = std::mem::take(touched);
-            crate::profile::phase("reanalyze: readers of touched", || {
-                self.engine.readers_of(db, touched.iter())
-            });
-        }
     }
 
     /// Queues the readers of what the pass's rebuild moved and opens the run.
@@ -390,12 +383,15 @@ impl Drop for Unwinding {
 
 /// Rebuilds `file_ids`' source layers and queues their derivations ahead of
 /// the work already queued, alongside any files still settling first; `None`
-/// when there is nothing to re-analyse.
+/// when there is nothing to re-analyse. `pending` holds keys an earlier
+/// rebuild moved whose readers are not queued yet, positioned as before
+/// these edits.
 fn start_pass(
     db: &mut DbIndex,
     engine: &mut engine::Engine,
     mut file_ids: Vec<FileId>,
     scopes: &mut ScopesCache,
+    pending: HashSet<derivation::HashedKey>,
 ) -> Option<Pass> {
     file_ids.sort();
     file_ids.dedup();
@@ -405,15 +401,15 @@ fn start_pass(
     let scopes = crate::profile::phase("reanalyze: scopes", || scopes.get(db));
     // Queries computed since the last run read the index as it stood before
     // the rebuild moves it.
-    let moved = engine::file_queries(db);
+    let mut moved = pending;
+    moved.extend(engine::file_queries(db));
     engine.replacing(&file_ids);
     engine.note_rebuilt(&file_ids);
     engine.prioritise(&file_ids);
     crate::profile::memory::checkpoint("before the source layer");
-    let mut touched = crate::profile::phase("reanalyze: replace files", || {
-        replace_files(db, engine, &file_ids, &scopes)
+    let touched = crate::profile::phase("reanalyze: replace files", || {
+        replace_files(db, engine, &file_ids, &scopes, moved)
     });
-    touched.extend(moved);
     crate::profile::memory::checkpoint("after the source layer");
     db.reader_graph_mut().forget_fingerprints();
     Some(Pass::Replaced { touched, scopes })
@@ -421,14 +417,15 @@ fn start_pass(
 
 /// Forgets `file_ids`' derivations and facts, rebuilds the live ones' source
 /// layer and queues their derivations. Returns every key whose value may
-/// have changed.
+/// have changed, `moved` among them, each also at its new position.
 fn replace_files(
     db: &mut DbIndex,
     engine: &mut engine::Engine,
     file_ids: &[FileId],
     scopes: &ScriptedScopes,
+    moved: HashSet<derivation::HashedKey>,
 ) -> HashSet<derivation::HashedKey> {
-    let mut touched = HashSet::default();
+    let mut touched = moved;
     touched.insert(derivation::HashedKey::new(derivation::FactKey::FileSet));
     for file_id in file_ids {
         touched.insert(derivation::HashedKey::new(derivation::FactKey::FileText(
