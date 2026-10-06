@@ -1370,7 +1370,7 @@ impl Engine {
         drop(snapshot);
         drop(running);
         let installing = crate::profile::PhaseGuard::new("superstep: install");
-        let mut touched = FxHashSet::default();
+        let mut touched = Vec::new();
         let mut tasks = Vec::with_capacity(outcomes.len());
         let mut recordings = Vec::with_capacity(outcomes.len());
         let (forks, outcomes): (Vec<_>, Vec<_>) = outcomes
@@ -1464,6 +1464,7 @@ impl Engine {
         db.reader_graph_mut().mark_written(&written);
         drop(filing);
         let checking = crate::profile::PhaseGuard::new("superstep: readers of");
+        derivation::dedup_keys(&mut touched);
         self.forget_view(db);
         db.reader_graph().uncheck_derived(&touched);
         self.readers_of(db, touched.iter());

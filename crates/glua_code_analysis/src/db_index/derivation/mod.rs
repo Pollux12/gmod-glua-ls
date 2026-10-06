@@ -453,6 +453,13 @@ impl HashedKey {
     }
 }
 
+/// Sorts `keys` by their stored hashes on worker threads and drops repeats.
+pub(crate) fn dedup_keys(keys: &mut Vec<HashedKey>) {
+    use rayon::prelude::*;
+    keys.par_sort_unstable_by_key(|key| key.hash);
+    keys.dedup();
+}
+
 impl PartialEq for HashedKey {
     fn eq(&self, other: &Self) -> bool {
         self.hash == other.hash && self.key == other.key
