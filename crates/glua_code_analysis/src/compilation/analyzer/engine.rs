@@ -116,6 +116,11 @@ impl Slice {
         }
     }
 
+    /// Whether the run hands back between slices.
+    fn yields(self) -> bool {
+        !matches!(self, Self::Whole)
+    }
+
     /// Whether the slice is over after `evaluated` evaluations in it.
     fn over(self, evaluated: usize) -> bool {
         match self {
@@ -315,6 +320,9 @@ pub(crate) struct Engine {
     /// The files that settle first, until they do: the files being
     /// re-analysed, and any prioritised.
     focus: FxHashSet<crate::FileId>,
+    /// Whether the run handed back once the focus settled, so the next
+    /// quiescence releases the waiting work rather than handing back again.
+    handed_back: bool,
     /// Work in other files queued while the focus settles, with why it was
     /// queued.
     waiting: BTreeMap<DerivationId, Reason>,
@@ -966,9 +974,21 @@ impl Engine {
                     continue;
                 }
                 if self.next_round.is_empty() {
-                    if crate::profile::phase("engine: stage and release", || {
-                        self.advance_stage(db) || self.release_waiting(db)
-                    }) || crate::profile::phase("engine: loops", || self.clear_loops(db))
+                    if crate::profile::phase("engine: stage", || self.advance_stage(db)) {
+                        continue;
+                    }
+                    if slice.yields()
+                        && !self.handed_back
+                        && self.loop_focus.is_empty()
+                        && !self.focus.is_empty()
+                    {
+                        // The focus's files answer before the work waiting on it is checked.
+                        self.focus.clear();
+                        self.handed_back = true;
+                        return false;
+                    }
+                    if crate::profile::phase("engine: release", || self.release_waiting(db))
+                        || crate::profile::phase("engine: loops", || self.clear_loops(db))
                     {
                         continue;
                     }
@@ -1962,6 +1982,7 @@ impl Engine {
     /// that still read a moved fact. Returns whether it queued any.
     fn release_waiting(&mut self, db: &mut DbIndex) -> bool {
         self.focus.clear();
+        self.handed_back = false;
         if !self.loop_focus.is_empty() {
             self.loop_focus.clear();
             let unchanged = std::mem::take(&mut self.loop_before)
