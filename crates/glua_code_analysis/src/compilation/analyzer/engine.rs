@@ -336,6 +336,9 @@ pub(crate) struct Engine {
     /// Whether the run handed back once the focus settled, so the next
     /// quiescence releases the waiting work rather than handing back again.
     handed_back: bool,
+    /// Set from outside while an edit waits: a yielding slice stops between
+    /// two evaluations.
+    interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Work in other files queued while the focus settles, with why it was
     /// queued.
     waiting: BTreeMap<DerivationId, Reason>,
@@ -466,6 +469,20 @@ impl Engine {
             edits,
             ..Self::default()
         }
+    }
+
+    /// Stops a yielding slice between two evaluations while `interrupt` is set.
+    pub(crate) fn interrupt_with(
+        &mut self,
+        interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.interrupt = Some(interrupt);
+    }
+
+    fn interrupted(&self) -> bool {
+        self.interrupt
+            .as_ref()
+            .is_some_and(|interrupt| interrupt.load(std::sync::atomic::Ordering::Acquire))
     }
 
     /// The edits other files' references have yet to follow, once.
@@ -987,7 +1004,9 @@ impl Engine {
         let started = self.stats.total_evaluations();
         loop {
             self.file_queries(db);
-            if slice.over(self.stats.total_evaluations() - started) {
+            if slice.over(self.stats.total_evaluations() - started)
+                || (slice.yields() && self.interrupted())
+            {
                 self.flush_slot_notifications(db);
                 return false;
             }

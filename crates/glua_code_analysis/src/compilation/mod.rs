@@ -11,6 +11,7 @@ pub use analyzer::unresolve::resolve_gmod_hook_callback_doc_function;
 pub(crate) use analyzer::{CallbackArg, CallbackParamsQuery, ReceiverAuthorityQuery};
 pub use analyzer::{Schedule, Slice};
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use crate::{
@@ -40,6 +41,9 @@ pub struct LuaCompilation {
     /// The re-analysis in progress, between its slices. Only `&mut` access
     /// advances it; readers sharing the compilation only ask what it has left.
     reanalysis: Mutex<Option<analyzer::Reanalysis>>,
+    /// Set while an edit waits to be taken in: a slice in progress stops
+    /// between two evaluations.
+    interrupt: Arc<AtomicBool>,
     /// The VFS content revision the re-analysis in progress took its text at.
     taken_revision: u64,
     /// Bumped whenever the index may change; see [`Self::index_revision`].
@@ -75,6 +79,7 @@ impl LuaCompilation {
             last_stats: analyzer::EngineStats::default(),
             schedule: Schedule::default(),
             reanalysis: Mutex::default(),
+            interrupt: Arc::default(),
             taken_revision: 0,
             index_revision: 0,
             scopes: analyzer::ScopesCache::default(),
@@ -164,6 +169,7 @@ impl LuaCompilation {
                     edits,
                     self.schedule,
                     std::mem::take(&mut self.scopes),
+                    self.interrupt.clone(),
                 ));
             }
         }
@@ -197,6 +203,12 @@ impl LuaCompilation {
         self.last_evaluated_files = reanalysed.evaluated_files;
         self.last_stats = reanalysed.stats;
         UpdateProgress::Settled(reanalysed.stale_diagnostics)
+    }
+
+    /// The flag that stops a slice in progress between two evaluations, so
+    /// an edit waiting to be taken in is not held up by it.
+    pub fn interrupt_handle(&self) -> Arc<AtomicBool> {
+        self.interrupt.clone()
     }
 
     /// Whether a re-analysis is in progress.
@@ -351,6 +363,7 @@ impl LuaCompilation {
             last_stats: analyzer::EngineStats::default(),
             schedule: self.schedule,
             reanalysis: Mutex::default(),
+            interrupt: Arc::default(),
             taken_revision: self.taken_revision,
             index_revision: self.index_revision,
             scopes: analyzer::ScopesCache::default(),

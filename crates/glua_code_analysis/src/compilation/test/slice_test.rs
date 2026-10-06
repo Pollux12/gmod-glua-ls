@@ -385,6 +385,26 @@ local directional = state.directional
         assert_settled(&ws, &cold(&[(CONFIG, EDITED_CONFIG)]), "handed back");
     }
 
+    /// An edit waiting to be taken in stops the slice in progress; the run
+    /// goes on once it is taken.
+    #[test]
+    fn a_waiting_edit_stops_the_slice_in_progress() {
+        let mut ws = workspace();
+        let config = stage_text(&mut ws, CONFIG, EDITED_CONFIG);
+        ws.analysis.begin_reindex(vec![config]);
+        let interrupt = ws.analysis.compilation.interrupt_handle();
+        interrupt.store(true, std::sync::atomic::Ordering::Release);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let progress = ws.analysis.advance_reindex(Slice::Until(deadline));
+
+        assert!(matches!(progress, UpdateProgress::Settling));
+        assert!(ws.analysis.compilation.settles_first(config));
+        interrupt.store(false, std::sync::atomic::Ordering::Release);
+        settle(&mut ws, 1, |_| {});
+        assert_settled(&ws, &cold(&[(CONFIG, EDITED_CONFIG)]), "interrupted");
+    }
+
     #[test]
     fn taking_no_files_mid_reanalysis_still_settles_the_work_queued() {
         let mut ws = workspace();

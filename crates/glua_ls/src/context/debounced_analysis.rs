@@ -74,6 +74,9 @@ pub struct DebouncedAnalysis {
     /// Files whose diagnostics wait for them to settle: the next slice settles
     /// them first.
     prioritised: std::sync::Mutex<Vec<FileId>>,
+    /// The analysis's slice interrupt, taken by the first slice: set when an
+    /// edit arrives so the slice in progress stops for it.
+    interrupt: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>>,
     /// False once the supervisor has given up restarting the debounce loop
     /// (see `LS_DEBOUNCE_LOOP_DEAD`). Freshness can then never arrive, so
     /// waiters fail fast instead of parking until their request is cancelled.
@@ -174,6 +177,7 @@ impl DebouncedAnalysis {
             has_pending_changes: AtomicBool::new(false),
             settling: AtomicBool::new(false),
             prioritised: std::sync::Mutex::default(),
+            interrupt: std::sync::OnceLock::new(),
             debounce_loop_alive: AtomicBool::new(true),
             in_flight_changes: AtomicUsize::new(0),
             in_flight_documents: std::sync::Mutex::default(),
@@ -250,6 +254,9 @@ impl DebouncedAnalysis {
 
     fn begin_change(self: &Arc<Self>, document: Option<Uri>) -> InFlightChangeGuard {
         self.in_flight_changes.fetch_add(1, Ordering::AcqRel);
+        if let Some(interrupt) = self.interrupt.get() {
+            interrupt.store(true, Ordering::Release);
+        }
         self.has_pending_changes.store(true, Ordering::Release);
         self.notify.notify_waiters();
         InFlightChangeGuard::new(self.clone(), document, 1)
@@ -713,6 +720,10 @@ impl DebouncedAnalysis {
             .lock()
             .map(|mut prioritised| std::mem::take(&mut *prioritised))
             .unwrap_or_default();
+        if self.interrupt.get().is_none() {
+            let interrupt = self.analysis.read().await.compilation.interrupt_handle();
+            let _ = self.interrupt.set(interrupt);
+        }
         let analysis = self.analysis.clone();
 
         tokio::select! {
@@ -721,6 +732,8 @@ impl DebouncedAnalysis {
                 let wait_start = crate::util::ls_profile::profile_instant();
                 let mut guard = analysis.blocking_write();
                 let hold_start = crate::util::ls_profile::profile_instant();
+                let interrupt = guard.compilation.interrupt_handle();
+                interrupt.store(false, Ordering::Release);
                 guard.compilation.prioritise_update(&prioritised);
                 let focused = edited
                     .iter()

@@ -197,8 +197,10 @@ impl Reanalysis {
         edits: derivation::EditMaps,
         schedule: engine::Schedule,
         mut scopes: ScopesCache,
+        interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         let mut engine = engine::Engine::new(edits, schedule);
+        engine.interrupt_with(interrupt);
         let pass = start_pass(db, &mut engine, file_ids, &mut scopes);
         let mut reanalysis = Self {
             engine,
