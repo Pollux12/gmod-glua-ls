@@ -1350,7 +1350,7 @@ impl Engine {
         let profiling = self.stats.profiling();
         // Tasks lend no table, so stage rules that moved are marked here.
         let moved_rules = std::mem::take(self.moved_rules.get_mut());
-        db.reader_graph_mut().mark_written(moved_rules.iter());
+        db.reader_graph_mut().mark_written(&moved_rules);
         let quarantine = db.reader_graph_mut().quarantine_releases();
         let snapshot = derivation::RecordingSnapshot::new(
             db.reader_graph_shared(),
@@ -1411,8 +1411,8 @@ impl Engine {
         drop(installing);
         let filing = crate::profile::PhaseGuard::new("superstep: file records");
         let written = recordings
-            .iter()
-            .flat_map(|recording| recording.written().iter().cloned())
+            .iter_mut()
+            .flat_map(|recording| recording.take_written())
             .collect::<Vec<_>>();
         let mut table = db.reader_graph_mut().lend_keys();
         let new_slots = recordings
@@ -1461,7 +1461,7 @@ impl Engine {
         let mut table = db.reader_graph_mut().lend_keys();
         quarantine.finish(&mut table);
         db.reader_graph_mut().restore_keys(table);
-        db.reader_graph_mut().mark_written(written.iter());
+        db.reader_graph_mut().mark_written(&written);
         drop(filing);
         let checking = crate::profile::PhaseGuard::new("superstep: readers of");
         self.forget_view(db);

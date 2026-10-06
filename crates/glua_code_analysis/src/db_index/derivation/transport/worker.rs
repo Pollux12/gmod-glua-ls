@@ -787,9 +787,9 @@ pub(crate) struct TaskRecording {
 }
 
 impl TaskRecording {
-    /// Every key the task wrote, each once.
-    pub(crate) fn written(&self) -> &[HashedKey] {
-        &self.written
+    /// Takes every key the task wrote, each once.
+    pub(crate) fn take_written(&mut self) -> Vec<HashedKey> {
+        std::mem::take(&mut self.written)
     }
 
     /// The task's evaluations with their reads as slots of `table`, the keys
@@ -907,8 +907,8 @@ mod tests {
             assert_eq!(evaluation.log, vec![0]);
             assert!(!requires_canonical);
         });
-        let recording = recorder.finish();
-        assert!(recording.written().is_empty());
+        let mut recording = recorder.finish();
+        assert!(recording.take_written().is_empty());
         let mut graph = recover(snapshot);
         let mut table = graph.lend_keys();
         let evaluations = recording.canonicalise(&mut table).unwrap();
@@ -938,8 +938,8 @@ mod tests {
             assert_eq!(derivation::reuse(&read_one, 0, &[], None), Reuse::Stale);
             assert_eq!(derivation::reuse(&read_two, 0, &[], None), Reuse::Held);
         });
-        let recording = recorder.finish();
-        assert_eq!(recording.written(), &[key(1)]);
+        let mut recording = recorder.finish();
+        assert_eq!(recording.take_written(), vec![key(1)]);
         let mut graph = recover(snapshot);
         let mut table = graph.lend_keys();
         guard.finish(&mut table);

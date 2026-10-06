@@ -695,6 +695,17 @@ impl KeyTable {
         logged
     }
 
+    /// Marks each of `slots` written at stamp `now`.
+    fn mark_slots_written(&mut self, slots: &[KeyIdx], now: u64) {
+        if slots.is_empty() {
+            return;
+        }
+        self.last_written = self.last_written.max(now);
+        for slot in slots {
+            self.keys[*slot as usize].written = now;
+        }
+    }
+
     /// Marks `key`, and every key read out of it, written at stamp `now` by an
     /// evaluation that computes it again: a memo that read it before then
     /// holds again if [`Self::close_windows`] finds it came back unchanged,
@@ -1027,11 +1038,21 @@ impl ReaderGraph {
 
     /// Marks `keys` written now: memos that read them no longer hold, and a
     /// window opened on one later restores to this stamp, not an older one.
-    pub(crate) fn mark_written<'a>(&mut self, keys: impl IntoIterator<Item = &'a HashedKey>) {
+    pub(crate) fn mark_written<'a>(
+        &mut self,
+        keys: impl rayon::iter::IntoParallelIterator<Item = &'a HashedKey>,
+    ) {
+        use rayon::prelude::*;
         let now = super::new_stamp();
-        for key in keys {
-            self.table.mark_written(key, now);
-        }
+        let table = &self.table;
+        let slots = keys
+            .into_par_iter()
+            .filter_map(|key| table.find(key))
+            .flat_map_iter(|slot| {
+                std::iter::once(slot).chain(table.derived_slots(slot).iter().copied())
+            })
+            .collect::<Vec<_>>();
+        self.table.mark_slots_written(&slots, now);
     }
 
     /// Holds `keys` written until [`Self::release_held`]; see
@@ -1152,8 +1173,12 @@ impl ReaderGraph {
 
     /// Has the next [`Self::derived_keys_to_check`] of each of `keys` check
     /// its derived keys whatever the base's fingerprint.
-    pub(crate) fn uncheck_derived<'a>(&self, keys: impl IntoIterator<Item = &'a HashedKey>) {
-        for key in keys {
+    pub(crate) fn uncheck_derived<'a>(
+        &self,
+        keys: impl rayon::iter::IntoParallelIterator<Item = &'a HashedKey>,
+    ) {
+        use rayon::prelude::*;
+        keys.into_par_iter().for_each(|key| {
             if let Some(derived) = self
                 .table
                 .find(key)
@@ -1161,7 +1186,7 @@ impl ReaderGraph {
             {
                 derived.checked_at.store(UNCHECKED, Ordering::Relaxed);
             }
-        }
+        });
     }
 
     /// Forgets every cached fingerprint.
