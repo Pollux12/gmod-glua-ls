@@ -27,7 +27,7 @@ pub use virtual_url::VirtualUrlGenerator;
 use crate::compilation::analyzer::parallel::map_items_init;
 use crate::{Emmyrc, PositionMap, WorkspaceKind};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Vfs {
     file_id_map: FxHashMap<PathBuf, u32>,
     file_path_map: FxHashMap<u32, PathBuf>,
@@ -42,7 +42,6 @@ pub struct Vfs {
     line_index_map: FxHashMap<FileId, LineIndex>,
     tree_map: FxHashMap<FileId, LuaSyntaxTree>,
     emmyrc: Option<Arc<Emmyrc>>,
-    node_cache: NodeCache,
     /// Monotonic counter bumped whenever file *content* (or existence) changes.
     /// Lets workspace-wide derived caches (e.g. the gmod helper registry) detect
     /// that their inputs are unchanged and skip a full rescan. It is deliberately
@@ -127,28 +126,6 @@ impl Default for Vfs {
     }
 }
 
-/// The parser's `NodeCache` only deduplicates green nodes, so a clone starts
-/// with an empty one.
-impl Clone for Vfs {
-    fn clone(&self) -> Self {
-        Vfs {
-            file_id_map: self.file_id_map.clone(),
-            file_path_map: self.file_path_map.clone(),
-            file_order_keys: self.file_order_keys.clone(),
-            order_roots: self.order_roots.clone(),
-            remote_file_id_map: self.remote_file_id_map.clone(),
-            file_data: self.file_data.clone(),
-            line_index_map: self.line_index_map.clone(),
-            tree_map: self.tree_map.clone(),
-            emmyrc: self.emmyrc.clone(),
-            node_cache: NodeCache::default(),
-            content_revision: self.content_revision,
-            staged: self.staged.clone(),
-            deleted: self.deleted.clone(),
-        }
-    }
-}
-
 impl Vfs {
     pub fn new() -> Self {
         Vfs {
@@ -161,7 +138,6 @@ impl Vfs {
             line_index_map: FxHashMap::default(),
             tree_map: FxHashMap::default(),
             emmyrc: None,
-            node_cache: NodeCache::default(),
             content_revision: 0,
             staged: FxHashMap::default(),
             deleted: FxHashSet::default(),
@@ -296,12 +272,7 @@ impl Vfs {
         if !self.tree_map.contains_key(&file_id) {
             return false;
         }
-        let parse_config = self
-            .emmyrc
-            .as_ref()
-            .expect("emmyrc set")
-            .get_parse_config(&mut self.node_cache);
-        let new_tree = LuaParser::parse(data, parse_config);
+        let new_tree = self.parse(data).0;
         let old_tree = &self.tree_map[&file_id];
         trees_semantically_equal(old_tree, &new_tree)
     }
@@ -317,12 +288,13 @@ impl Vfs {
         })
     }
 
-    fn parse(&mut self, text: &str) -> (LuaSyntaxTree, LineIndex) {
+    fn parse(&self, text: &str) -> (LuaSyntaxTree, LineIndex) {
+        let mut node_cache = NodeCache::default();
         let parse_config = self
             .emmyrc
             .as_ref()
             .expect("emmyrc set")
-            .get_parse_config(&mut self.node_cache);
+            .get_parse_config(&mut node_cache);
         (LuaParser::parse(text, parse_config), LineIndex::parse(text))
     }
 
@@ -722,7 +694,6 @@ impl Vfs {
         self.staged.clear();
         self.deleted.clear();
         self.emmyrc = None;
-        self.node_cache = NodeCache::default();
     }
 }
 
