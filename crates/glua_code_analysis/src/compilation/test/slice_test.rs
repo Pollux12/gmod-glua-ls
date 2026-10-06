@@ -563,4 +563,161 @@ local directional = state.directional
             "take onto an unopened pass",
         );
     }
+
+    const FOO: &str = "lua/autorun/sh_foo.lua";
+    const FOO_USER: &str = "lua/autorun/server/sv_foo_user.lua";
+    const FOO_CLASS: &str = "lua/autorun/sh_foo_class.lua";
+    const FOO_CALL: &str = "Foo:Bar(1)\n";
+
+    /// `Foo:Bar` declared after `padding` lines of fields.
+    fn foo_text(padding: usize) -> String {
+        let mut text = String::from("---@class Foo\nFoo = {}\n");
+        for line in 0..padding {
+            text.push_str(&format!("Foo.Pad{line} = {line}\n"));
+        }
+        text.push_str("\nfunction Foo:Bar(count)\n    return count\nend\n");
+        text
+    }
+
+    /// The signature of the first closure in `path`.
+    fn first_closure_signature(ws: &VirtualWorkspace, path: &str) -> crate::LuaSignatureId {
+        use glua_parser::{LuaAstNode, LuaClosureExpr};
+        let uri = ws.virtual_url_generator.new_uri(path);
+        let file_id = ws.analysis.get_file_id(&uri).expect("a workspace file");
+        let closure = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("a live file")
+            .get_chunk_node()
+            .descendants::<LuaClosureExpr>()
+            .next()
+            .expect("a closure");
+        crate::LuaSignatureId::new(file_id, closure.get_position())
+    }
+
+    /// Asserts a derivation in another file reads `signature`'s receiver
+    /// authority, so a re-analysis checks that read.
+    fn assert_receiver_authority_read(ws: &VirtualWorkspace, signature: crate::LuaSignatureId) {
+        let key = derivation::HashedKey::new(derivation::FactKey::ReceiverAuthority(signature));
+        let graph = ws.analysis.compilation.get_db().reader_graph();
+        assert!(
+            graph
+                .stale_readers_seen(&key, |_| false)
+                .any(|(reader, _)| reader.file_id != signature.get_file_id()),
+            "another file reads the receiver authority of {signature:?}"
+        );
+    }
+
+    /// `sh_foo.lua` with `Foo:Bar` far down it, called from another file,
+    /// which reads the method's receiver authority.
+    fn foo_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(vec![(FOO, &foo_text(40)), (FOO_USER, FOO_CALL)]);
+        assert_receiver_authority_read(&ws, first_closure_signature(&ws, FOO));
+        ws
+    }
+
+    /// A cold build of [`foo_workspace`] with `sh_foo.lua` holding `text`.
+    fn cold_foo(text: &str) -> Vec<String> {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(vec![(FOO, text), (FOO_USER, FOO_CALL)]);
+        ws.settled_digest()
+    }
+
+    /// A take landing before the previous take's pass opened checks reads of
+    /// a method's receiver authority at the position the previous take moved
+    /// it to, which the newer, shorter text no longer reaches.
+    #[test]
+    fn a_take_onto_a_pass_whose_moved_method_lies_past_the_newer_text_matches_a_cold_build() {
+        let mut ws = foo_workspace();
+        let foo = stage_text(&mut ws, FOO, &foo_text(20));
+        ws.analysis.begin_reindex(vec![foo]);
+        stage_text(&mut ws, FOO, &foo_text(0));
+
+        ws.analysis.begin_reindex(vec![foo]);
+        settle(&mut ws, 1, |_| {});
+
+        assert_settled(&ws, &cold_foo(&foo_text(0)), "two takes, one pass");
+    }
+
+    /// A pass opening after an edit deleted a method checks reads of its
+    /// receiver authority at a position past the end of the shorter text.
+    #[test]
+    fn a_pass_opening_after_a_method_was_cut_from_a_file_matches_a_cold_build() {
+        let mut ws = foo_workspace();
+        let short = "---@class Foo\nFoo = {}\n";
+        let foo = stage_text(&mut ws, FOO, short);
+
+        ws.analysis.begin_reindex(vec![foo]);
+        settle(&mut ws, 1, |_| {});
+
+        assert_settled(&ws, &cold_foo(short), "method cut");
+    }
+
+    /// `Foo:Bar` far down a file that does not declare `Foo`, called with an
+    /// explicit receiver from another file.
+    fn split_foo_files(foo_padding: usize, class: &str) -> Vec<(&'static str, String)> {
+        let mut foo = String::new();
+        for line in 0..foo_padding {
+            foo.push_str(&format!("local pad{line} = {line}\n"));
+        }
+        foo.push_str("\nfunction Foo:Bar(count)\n    return count\nend\n");
+        vec![
+            (FOO_CLASS, class.to_string()),
+            (FOO, foo),
+            (FOO_USER, "Foo.Bar({}, 1)\n".to_string()),
+        ]
+    }
+
+    /// A receiver authority recomputed between slices moves under an edit
+    /// that then shifts its method: its readers are checked where it moved.
+    #[test]
+    fn a_receiver_authority_recomputed_between_slices_follows_a_later_edit_of_its_method() {
+        let class = "---@class Foo\nFoo = {}\n";
+        let unclassed = "Foo = {}\n";
+        let mut ws = VirtualWorkspace::new();
+        let files = split_foo_files(20, class);
+        ws.def_files(
+            files
+                .iter()
+                .map(|(path, text)| (*path, text.as_str()))
+                .collect(),
+        );
+        let signature = first_closure_signature(&ws, FOO);
+        assert_receiver_authority_read(&ws, signature);
+        let db = ws.analysis.compilation.get_db();
+        let before = *db.queries().receiver_authority.get(db, signature);
+
+        let class_file = stage_text(&mut ws, FOO_CLASS, unclassed);
+        ws.analysis.begin_reindex(vec![class_file]);
+        ws.analysis.advance_reindex(Slice::Evaluations(1));
+        let db = ws.analysis.compilation.get_db();
+        let computed = db.queries().receiver_authority.stats().computed;
+        let between = *db.queries().receiver_authority.get(db, signature);
+        assert_eq!(
+            db.queries().receiver_authority.stats().computed,
+            computed + 1,
+            "recomputed between slices"
+        );
+        assert_ne!(
+            before, between,
+            "the class edit moves the receiver authority"
+        );
+        let shifted = split_foo_files(40, unclassed);
+        let foo = stage_text(&mut ws, FOO, &shifted[1].1);
+        ws.analysis.begin_reindex(vec![foo]);
+        settle(&mut ws, 1, |_| {});
+
+        let mut cold = VirtualWorkspace::new();
+        cold.def_files(
+            shifted
+                .iter()
+                .map(|(path, text)| (*path, text.as_str()))
+                .collect(),
+        );
+        assert_settled(&ws, &cold.settled_digest(), "recomputed, then shifted");
+    }
 }
