@@ -817,119 +817,130 @@ fn reuse_worker(
     realm: Option<(GmodRealm, u32)>,
     caller: &'static std::panic::Location<'static>,
 ) -> Option<Reuse> {
-    if !super::transport::active() {
-        return None;
-    }
-    CURRENT.with(|current| {
-        let mut current = current.borrow_mut();
-        let evaluation = current.as_mut()?;
-        super::transport::with_keys(|worker| {
-            let range = provenance.0.start as usize..provenance.0.end as usize;
-            if Arc::ptr_eq(&provenance.0.log, &evaluation.log_handle) {
-                if provenance.0.has_query
-                    && !worker.local_queries_hold(&evaluation.log[range.clone()])
-                {
-                    return Reuse::Elsewhere;
-                }
-                match worker.local_freshness(&evaluation.log[range.clone()], provenance.0.since) {
-                    Freshness::Unwritten => {}
-                    Freshness::Recomputing => return Reuse::Elsewhere,
-                    Freshness::Written => {
-                        count(|stats| stats.stale += 1);
-                        return Reuse::Stale;
-                    }
-                }
-                if provenance.0.since < evaluation.frame_stamp()
-                    && worker.replays_into(provenance, evaluation.frame_stamp(), range.len())
-                {
-                    for at in range {
-                        let local = evaluation.log[at];
-                        worker.log(evaluation, local);
-                        if provenance.0.has_query {
-                            worker.observe_ready(local);
-                        }
-                    }
-                    replay_unkeyed(evaluation, provenance);
-                }
-                count(|stats| {
-                    stats.reused_here += 1;
-                    stats.sites.entry(caller).or_default()[2] += 1;
-                });
-            } else if let Some(log) = worker.task_log(Arc::as_ptr(&provenance.0.log) as usize) {
-                let Some(reads) = log.get(range) else {
-                    return Reuse::Elsewhere;
-                };
-                let reads = reads.to_vec();
-                if provenance.0.has_query && !worker.local_queries_hold(&reads) {
-                    return Reuse::Elsewhere;
-                }
-                match worker.local_freshness(&reads, provenance.0.since) {
-                    Freshness::Unwritten => {}
-                    Freshness::Recomputing => return Reuse::Elsewhere,
-                    Freshness::Written => {
-                        count(|stats| stats.stale += 1);
-                        return Reuse::Stale;
-                    }
-                }
-                if worker.replays_into(provenance, evaluation.frame_stamp(), reads.len()) {
-                    for local in reads {
-                        worker.log(evaluation, local);
-                        if provenance.0.has_query {
-                            worker.observe_ready(local);
-                        }
-                    }
-                    replay_unkeyed(evaluation, provenance);
-                }
-                count(|stats| {
-                    stats.reused += 1;
-                    stats.sites.entry(caller).or_default()[3] += 1;
-                });
-            } else {
-                let Some(reads) = provenance.0.log.0.get().and_then(|log| log.get(range)) else {
-                    return Reuse::Elsewhere;
-                };
-                if provenance.0.has_query && !worker.canonical_queries_hold(reads) {
-                    return Reuse::Elsewhere;
-                }
-                match provenance
-                    .freshness(worker.graph().keys(), reads)
-                    .and(worker.snapshot_freshness(reads, provenance.0.since))
-                {
-                    Freshness::Unwritten => {}
-                    Freshness::Recomputing => return Reuse::Elsewhere,
-                    Freshness::Written => return Reuse::Stale,
-                }
-                if check_cache()
-                    && evaluation.checks.insert(check_identity(
-                        provenance,
-                        worker.graph().keys(),
-                        view,
-                        keyed,
-                        realm,
-                    ))
-                {
-                    REUSED_ACROSS.with(|flag| flag.set(true));
-                }
-                if worker.replays_into(provenance, evaluation.frame_stamp(), reads.len()) {
-                    for slot in reads {
-                        let local = worker
-                            .record_known(evaluation, *slot)
-                            .expect("qualified snapshot read is live");
-                        if provenance.0.has_query {
-                            worker.observe_ready(local);
-                        }
-                    }
-                    replay_unkeyed(evaluation, provenance);
-                }
-                count(|stats| {
-                    stats.reused += 1;
-                    stats.sites.entry(caller).or_default()[3] += 1;
-                });
-            }
-            record_context(evaluation, provenance, realm);
-            Reuse::Held
+    super::transport::with_keys(|worker| {
+        CURRENT.with(|current| {
+            let mut current = current.borrow_mut();
+            let evaluation = current.as_mut()?;
+            Some(reuse_on_worker(
+                worker, evaluation, provenance, view, keyed, realm, caller,
+            ))
         })
     })
+    .flatten()
+}
+
+/// [`reuse_worker`] once the task's recorder and evaluation are in hand.
+fn reuse_on_worker(
+    worker: &mut super::transport::WorkerContext,
+    evaluation: &mut Evaluation,
+    provenance: &Provenance,
+    view: Gates,
+    keyed: &[u64],
+    realm: Option<(GmodRealm, u32)>,
+    caller: &'static std::panic::Location<'static>,
+) -> Reuse {
+    let range = provenance.0.start as usize..provenance.0.end as usize;
+    if Arc::ptr_eq(&provenance.0.log, &evaluation.log_handle) {
+        if provenance.0.has_query && !worker.local_queries_hold(&evaluation.log[range.clone()]) {
+            return Reuse::Elsewhere;
+        }
+        match worker.local_freshness(&evaluation.log[range.clone()], provenance.0.since) {
+            Freshness::Unwritten => {}
+            Freshness::Recomputing => return Reuse::Elsewhere,
+            Freshness::Written => {
+                count(|stats| stats.stale += 1);
+                return Reuse::Stale;
+            }
+        }
+        if provenance.0.since < evaluation.frame_stamp()
+            && worker.replays_into(provenance, evaluation.frame_stamp(), range.len())
+        {
+            for at in range {
+                let local = evaluation.log[at];
+                worker.log(evaluation, local);
+                if provenance.0.has_query {
+                    worker.observe_ready(local);
+                }
+            }
+            replay_unkeyed(evaluation, provenance);
+        }
+        count(|stats| {
+            stats.reused_here += 1;
+            stats.sites.entry(caller).or_default()[2] += 1;
+        });
+    } else if let Some(log) = worker.task_log(Arc::as_ptr(&provenance.0.log) as usize) {
+        let Some(reads) = log.get(range) else {
+            return Reuse::Elsewhere;
+        };
+        let reads = reads.to_vec();
+        if provenance.0.has_query && !worker.local_queries_hold(&reads) {
+            return Reuse::Elsewhere;
+        }
+        match worker.local_freshness(&reads, provenance.0.since) {
+            Freshness::Unwritten => {}
+            Freshness::Recomputing => return Reuse::Elsewhere,
+            Freshness::Written => {
+                count(|stats| stats.stale += 1);
+                return Reuse::Stale;
+            }
+        }
+        if worker.replays_into(provenance, evaluation.frame_stamp(), reads.len()) {
+            for local in reads {
+                worker.log(evaluation, local);
+                if provenance.0.has_query {
+                    worker.observe_ready(local);
+                }
+            }
+            replay_unkeyed(evaluation, provenance);
+        }
+        count(|stats| {
+            stats.reused += 1;
+            stats.sites.entry(caller).or_default()[3] += 1;
+        });
+    } else {
+        let Some(reads) = provenance.0.log.0.get().and_then(|log| log.get(range)) else {
+            return Reuse::Elsewhere;
+        };
+        if provenance.0.has_query && !worker.canonical_queries_hold(reads) {
+            return Reuse::Elsewhere;
+        }
+        match provenance
+            .freshness(worker.graph().keys(), reads)
+            .and(worker.snapshot_freshness(reads, provenance.0.since))
+        {
+            Freshness::Unwritten => {}
+            Freshness::Recomputing => return Reuse::Elsewhere,
+            Freshness::Written => return Reuse::Stale,
+        }
+        if check_cache()
+            && evaluation.checks.insert(check_identity(
+                provenance,
+                worker.graph().keys(),
+                view,
+                keyed,
+                realm,
+            ))
+        {
+            REUSED_ACROSS.with(|flag| flag.set(true));
+        }
+        if worker.replays_into(provenance, evaluation.frame_stamp(), reads.len()) {
+            for slot in reads {
+                let local = worker
+                    .record_known(evaluation, *slot)
+                    .expect("qualified snapshot read is live");
+                if provenance.0.has_query {
+                    worker.observe_ready(local);
+                }
+            }
+            replay_unkeyed(evaluation, provenance);
+        }
+        count(|stats| {
+            stats.reused += 1;
+            stats.sites.entry(caller).or_default()[3] += 1;
+        });
+    }
+    record_context(evaluation, provenance, realm);
+    Reuse::Held
 }
 
 fn replay_unkeyed(evaluation: &mut Evaluation, provenance: &Provenance) {

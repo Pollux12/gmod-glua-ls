@@ -1807,9 +1807,13 @@ impl Evaluation {
 /// Records a read of `key`, interned if a key table is lent, else as its
 /// slot in the viewed graph if it has one. Returns its slot in the lent table.
 fn record_read(evaluation: &mut Evaluation, key: HashedKey) -> Option<KeyIdx> {
-    if transport::active() {
-        return transport::with_keys(|worker| worker.record(evaluation, key));
+    let mut key = Some(key);
+    if let Some(local) = transport::with_keys(|worker| {
+        worker.record(evaluation, key.take().expect("a key to record"))
+    }) {
+        return Some(local);
     }
+    let key = key?;
     KEYS.with(|keys| match keys.borrow_mut().as_mut() {
         Some(table) => {
             // A slot the evaluation interned stays live while it records, so
@@ -1855,9 +1859,7 @@ fn record_read(evaluation: &mut Evaluation, key: HashedKey) -> Option<KeyIdx> {
 }
 
 fn log_recorded(evaluation: &mut Evaluation, slot: KeyIdx) {
-    if transport::active() {
-        transport::with_keys(|worker| worker.log(evaluation, slot));
-    } else {
+    if transport::with_keys(|worker| worker.log(evaluation, slot)).is_none() {
         KEYS.with(|keys| {
             if let Some(table) = keys.borrow_mut().as_mut() {
                 evaluation.log_slot(table, slot);
@@ -2220,28 +2222,30 @@ impl FactRead {
             let Some(evaluation) = current.as_mut() else {
                 return true;
             };
-            if transport::active() {
-                NOTED_READS.with(|count| count.set(count.get() + 1));
-                transport::with_keys(|worker| {
-                    let hint = self.0.load(Ordering::Relaxed);
-                    if let Some(global) = worker.graph().keys().matching_slot(hint, &matches) {
+            let mut key = Some(key);
+            let on_worker = transport::with_keys(|worker| {
+                let hint = self.0.load(Ordering::Relaxed);
+                if let Some(global) = worker.graph().keys().matching_slot(hint, &matches) {
+                    worker
+                        .record_known(evaluation, global)
+                        .expect("snapshot hint is live");
+                } else {
+                    let key = HashedKey::new(key.take().expect("a key to build")());
+                    if let Some(global) = worker.graph().find_slot(&key) {
+                        self.0.store(global, Ordering::Relaxed);
                         worker
                             .record_known(evaluation, global)
-                            .expect("snapshot hint is live");
+                            .expect("snapshot key is live");
                     } else {
-                        let key = HashedKey::new(key());
-                        if let Some(global) = worker.graph().find_slot(&key) {
-                            self.0.store(global, Ordering::Relaxed);
-                            worker
-                                .record_known(evaluation, global)
-                                .expect("snapshot key is live");
-                        } else {
-                            worker.record(evaluation, key);
-                        }
+                        worker.record(evaluation, key);
                     }
-                });
+                }
+            });
+            if on_worker.is_some() {
+                NOTED_READS.with(|count| count.set(count.get() + 1));
                 return true;
             }
+            let key = key.expect("the worker did not build the key");
             if KEYS.with(|keys| keys.borrow().is_none())
                 && VIEW.with(|view| view.borrow().is_none())
             {

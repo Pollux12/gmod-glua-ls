@@ -13,7 +13,7 @@ pub(crate) use worker::{
     note_observed_query_read, query_requires_canonical, require_canonical_query,
     worker_query_readiness,
 };
-pub(super) use worker::{SavedRecording, active, report_worker_replays, with_keys};
+pub(super) use worker::{SavedRecording, WorkerContext, active, report_worker_replays, with_keys};
 
 #[must_use]
 pub(crate) struct ReleaseQuarantine {
@@ -83,24 +83,29 @@ impl WorkerKeys {
         self.visitation.push(0);
         self.written.push(0);
         self.windowed.push(false);
-        let query = match key {
-            WorkerKey::Known(slot) => snapshot.keys().is_query(slot),
-            WorkerKey::New(index) => matches!(
-                self.new_keys[index as usize].key(),
-                super::FactKey::ReceiverAuthority(_) | super::FactKey::CallbackParams(_)
-            ),
+        let (stored, query) = match key {
+            WorkerKey::Known(slot) => (snapshot.key(slot), snapshot.keys().is_query(slot)),
+            WorkerKey::New(index) => {
+                let stored = &self.new_keys[index as usize];
+                let query = matches!(
+                    stored.key(),
+                    super::FactKey::ReceiverAuthority(_) | super::FactKey::CallbackParams(_)
+                );
+                (stored, query)
+            }
         };
         let flags = u8::from(self.snapshot_taints(local, snapshot)) | (u8::from(query) << 1);
         self.flags.push(flags);
-        let key = self.key(local, snapshot).clone();
-        self.hashes.push(key.hash);
+        self.hashes.push(stored.hash);
         let hashes = &self.hashes;
         self.lookup
-            .insert_unique(key.hash, local, |local| hashes[*local as usize]);
-        if let Some(children) = self.awaiting_base.remove(&key) {
+            .insert_unique(stored.hash, local, |local| hashes[*local as usize]);
+        if !self.awaiting_base.is_empty()
+            && let Some(children) = self.awaiting_base.remove(stored)
+        {
             self.derived.entry(local).or_default().extend(children);
         }
-        if let Some(base) = key.base() {
+        if let Some(base) = stored.base() {
             let base = HashedKey::new(base);
             match self.find(&base, snapshot) {
                 Some(base) => {
