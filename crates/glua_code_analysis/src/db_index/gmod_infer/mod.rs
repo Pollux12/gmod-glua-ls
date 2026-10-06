@@ -905,6 +905,26 @@ impl GmodInferIndex {
         self.realm_inputs.insert(file_id, inputs);
     }
 
+    /// Moves the realm branch ranges of `remap`'s file to where the edit put
+    /// them; a range the edit destroyed is dropped, and the file's realm
+    /// inputs, which no longer hold, fold it again.
+    pub(crate) fn remap_realm_ranges(&mut self, remap: &crate::FileRemap) {
+        let Some(metadata) = self.realm_file_metadata.get_mut(&remap.file_id) else {
+            return;
+        };
+        let before = metadata.branch_realm_ranges.clone();
+        metadata.branch_realm_ranges.retain_mut(|branch| {
+            remap
+                .map
+                .map_range(branch.range)
+                .map(|range| branch.range = range)
+                .is_some()
+        });
+        if metadata.branch_realm_ranges != before {
+            derivation::note_write(|| FactKey::GmodRealm(remap.file_id));
+        }
+    }
+
     pub fn get_realm_inputs(&self, file_id: &FileId) -> Option<&GmodRealmInputs> {
         derivation::note_realm_inputs_read(*file_id);
         self.realm_inputs.get(file_id)

@@ -56,6 +56,7 @@ pub fn remap_into_file(db: &mut DbIndex, remap: &FileRemap) -> HashSet<FileId> {
     let pass = db.get_gmod_network_index_mut().remap_file_positions(remap);
     dirty.extend(pass);
     db.get_gmod_load_index_mut().remap_edge_positions(remap);
+    db.get_gmod_infer_index_mut().remap_realm_ranges(remap);
 
     dirty.remove(&remap.file_id);
     dirty

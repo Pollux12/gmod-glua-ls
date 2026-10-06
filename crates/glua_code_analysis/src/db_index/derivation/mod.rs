@@ -636,7 +636,9 @@ impl FactKey {
     /// position outside the writer's own file, so they never name an edited
     /// file's position for a writer that did not run. A writer's share of an
     /// edited file's member fingerprint is an owner there, which the member
-    /// remap re-homes.
+    /// remap re-homes. A file's realm names only its own branch ranges, and a
+    /// load fact only the ranges of its incoming edges, which the gmod remaps
+    /// move.
     pub fn follows_edits(&self) -> bool {
         use FactKey as K;
         matches!(
@@ -676,6 +678,8 @@ impl FactKey {
                 | K::NetHelper(_)
                 | K::NetworkFile(_)
                 | K::NetworkScan
+                | K::GmodRealm(_)
+                | K::GmodLoadFile(_)
                 | K::CallTargets(_)
                 | K::ReceiverAuthority(_)
                 | K::CallbackParams(_)

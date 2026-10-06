@@ -267,4 +267,38 @@ mod test {
         assert!(is_helper_name(&ws, "Relay"));
         assert_settled_as_cold(&ws, &texts, "helper added");
     }
+
+    const REALM_BRANCHES: (&str, &str) = (
+        "lua/myaddon/sh_branches.lua",
+        r#"
+            if SERVER then
+                ServerOnly = true
+            end
+            "#,
+    );
+
+    #[test]
+    fn an_edit_that_only_moves_load_and_realm_facts_does_not_fold_them_again() {
+        let mut files = FILES.to_vec();
+        files.push(REALM_BRANCHES);
+        let mut ws = workspace(&files);
+        let mut texts = files
+            .iter()
+            .map(|(path, text)| (*path, text.to_string()))
+            .collect::<Vec<_>>();
+        let (loader, branches) = (2, texts.len() - 1);
+
+        for file in [loader, branches] {
+            texts[file].1.insert_str(0, "local moved = 1\n");
+            ws.def_file(texts[file].0, &texts[file].1);
+            assert_eq!(evaluations(&ws, DerivationKind::GmodLoad), 0);
+            assert_settled_as_cold(&ws, &texts, texts[file].0);
+        }
+
+        texts[branches]
+            .1
+            .push_str("if CLIENT then ClientOnly = true end\n");
+        ws.def_file(texts[branches].0, &texts[branches].1);
+        assert_settled_as_cold(&ws, &texts, "branch added");
+    }
 }
