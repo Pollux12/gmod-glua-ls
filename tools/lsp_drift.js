@@ -41,7 +41,9 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { sleep, requireDir, fileUri, startServer } = require('./lsp_client');
+const {
+    sleep, requireDir, fileUri, startServer, contentChanges,
+} = require('./lsp_client');
 
 function parseArgs(argv) {
     const opts = {
@@ -223,10 +225,10 @@ async function main() {
             coldCheck(glua, edited, annotations, path.join(scratch, 'edited.json'))
                 .then((output) => loadCold(edited, output)));
 
-        const { proc, client, loadMs, push } = await startServer(server, work, annotations);
+        const { proc, client, loadMs, push, incremental } = await startServer(server, work, annotations);
         children.add(proc);
         console.log(`[load] workspace loaded in ${(loadMs / 1000).toFixed(1)}s`
-            + ` (diagnostics by ${push ? 'push' : 'pull'})`);
+            + ` (diagnostics by ${push ? 'push' : 'pull'}, ${incremental ? 'incremental' : 'full'} text sync)`);
 
         // What the client shows: the latest report per file, as VS Code keeps
         // it. A pull replaces the files it reports and leaves the rest; a
@@ -314,20 +316,23 @@ async function main() {
             textDocument: { uri, languageId: 'lua', version, text: original },
         });
         open.add(uri);
-        for (let i = 0; i < texts.length; i++) {
+        let shownText = original;
+        const change = (text) => {
             version += 1;
             client.notify('textDocument/didChange', {
-                textDocument: { uri, version }, contentChanges: [{ text: texts[i] }],
+                textDocument: { uri, version },
+                contentChanges: contentChanges(shownText, text, incremental),
             });
+            shownText = text;
+        };
+        for (let i = 0; i < texts.length; i++) {
+            change(texts[i]);
             await sleep((i + 1) % opts.pauseEvery === 0 ? opts.pauseMs : opts.keystrokeMs);
         }
         await settle();
         differences += compare(`typing (${texts.length} keystrokes)`, shown, await editedCold);
 
-        version += 1;
-        client.notify('textDocument/didChange', {
-            textDocument: { uri, version }, contentChanges: [{ text: original }],
-        });
+        change(original);
         await settle();
         differences += compare('revert', shown, await originalCold);
 

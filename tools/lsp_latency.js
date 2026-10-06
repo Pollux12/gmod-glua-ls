@@ -55,7 +55,7 @@
 const fs = require('fs');
 const path = require('path');
 const {
-    sleep, defaultServerPath, requireDir, fileUri, startServer,
+    sleep, defaultServerPath, requireDir, fileUri, startServer, contentChanges,
 } = require('./lsp_client');
 
 // LSP ContentModified. The client is expected to re-send rather than wait.
@@ -174,13 +174,14 @@ async function main() {
     const target = opts.file ? path.resolve(codebase, opts.file) : largestLuaFile(codebase);
     if (!fs.existsSync(target)) throw new Error(`target file not found: ${target}`);
 
-    const { proc, client, loadMs, push } = await startServer(server, codebase, annotations);
+    const { proc, client, loadMs, push, incremental } = await startServer(server, codebase, annotations);
     const report = {
         workspace: codebase,
         file: path.relative(codebase, target),
         server,
         runs: opts.runs,
         diagnosticDelivery: push ? 'push' : 'pull',
+        textSync: incremental ? 'incremental' : 'full',
         measurements: {},
         checks: {},
     };
@@ -263,10 +264,11 @@ async function main() {
             if (!text.includes(from)) {
                 throw new Error(`--edit-find text not present in document: ${JSON.stringify(from)}`);
             }
+            const before = text;
             text = text.replace(from, to);
             client.notify('textDocument/didChange', {
                 textDocument: { uri, version },
-                contentChanges: [{ text }],
+                contentChanges: contentChanges(before, text, incremental),
             });
             return;
         }
@@ -279,10 +281,11 @@ async function main() {
         const inserted = opts.edit === 'comment'
             ? '-- perf\n'
             : `function _PerfProbe${editSerial}(a) return a end\n`;
+        const before = text;
         text = text.slice(0, editOffset) + inserted + text.slice(editOffset);
         client.notify('textDocument/didChange', {
             textDocument: { uri, version },
-            contentChanges: [{ text }],
+            contentChanges: contentChanges(before, text, incremental),
         });
     };
 

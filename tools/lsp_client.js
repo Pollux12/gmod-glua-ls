@@ -271,9 +271,48 @@ async function startServer(server, workspace, annotations) {
         proc.kill();
         throw new Error('workspace never finished loading (5 minute timeout)');
     }
-    return { proc, client, loadMs: loadedAt - startedAt, capabilities, push: !capabilities.diagnosticProvider };
+    const sync = capabilities.textDocumentSync;
+    const incremental = (typeof sync === 'number' ? sync : sync?.change) === 2;
+    return {
+        proc, client, loadMs: loadedAt - startedAt, capabilities,
+        push: !capabilities.diagnosticProvider, incremental,
+    };
+}
+
+/**
+ * The didChange `contentChanges` taking `before` to `after`: the full text, or
+ * with incremental sync one ranged change over the span that differs, as VS
+ * Code sends a keystroke. Positions count UTF-16 units and never split a
+ * surrogate pair or a CRLF.
+ */
+function contentChanges(before, after, incremental) {
+    if (!incremental) return [{ text: after }];
+    const splits = (text, i) => {
+        if (i <= 0 || i >= text.length) return false;
+        const prev = text.charCodeAt(i - 1);
+        return (prev === 13 && text.charCodeAt(i) === 10) || (prev >= 0xd800 && prev <= 0xdbff);
+    };
+    const limit = Math.min(before.length, after.length);
+    let start = 0;
+    while (start < limit && before[start] === after[start]) start++;
+    while (splits(before, start) || splits(after, start)) start--;
+    let suffix = 0;
+    while (suffix < limit - start
+        && before[before.length - 1 - suffix] === after[after.length - 1 - suffix]) suffix++;
+    while (splits(before, before.length - suffix) || splits(after, after.length - suffix)) suffix--;
+    const position = (offset) => {
+        const lineStart = offset === 0 ? 0 : before.lastIndexOf('\n', offset - 1) + 1;
+        let line = 0;
+        for (let i = before.indexOf('\n'); i !== -1 && i < offset; i = before.indexOf('\n', i + 1)) line++;
+        return { line, character: offset - lineStart };
+    };
+    return [{
+        range: { start: position(start), end: position(before.length - suffix) },
+        text: after.slice(start, after.length - suffix),
+    }];
 }
 
 module.exports = {
     LspClient, sleep, clientCapabilities, defaultServerPath, requireDir, fileUri, startServer,
+    contentChanges,
 };
