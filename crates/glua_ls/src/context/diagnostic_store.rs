@@ -502,14 +502,16 @@ impl DiagnosticStore {
                     None
                 }
                 Computed::Diagnostics { revision, .. }
-                    if analysis
-                        .compilation
-                        .get_db()
-                        .get_vfs()
-                        .get_file_revision(&job.file_id)
-                        != Some(revision) =>
+                    if !analysis.compilation.has_taken_text(job.file_id)
+                        || analysis
+                            .compilation
+                            .get_db()
+                            .get_vfs()
+                            .get_file_revision(&job.file_id)
+                            != Some(revision) =>
                 {
-                    // Computed on text that has changed since.
+                    // Computed on text that has changed since, or has newer
+                    // text staged.
                     let priority = state.priority_of(job.file_id, false);
                     state.invalidate(job.file_id, priority);
                     None
@@ -843,6 +845,60 @@ mod tests {
                 .map(|params| (params.uri, params.version))
                 .collect::<Vec<_>>();
             verify_that!(versions, eq(&vec![(open_uri, Some(7)), (closed_uri, None)]))
+        })
+    }
+
+    /// Diagnostics are computed on the text a take installed and published
+    /// with its version: none goes out while newer text is staged, and the
+    /// take's publish carries the newer version.
+    #[gtest]
+    fn diagnostics_wait_for_staged_text_and_carry_its_version() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, peer) = Connection::memory();
+        runtime.block_on(async {
+            let context = ServerContext::new(connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_diagnostic_store_staged");
+            let uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/staged.lua"))
+                .expect("file URI should parse");
+            let file_id = {
+                let mut analysis = snapshot.analysis().write().await;
+                analysis.add_main_workspace(workspace);
+                let (file_id, _) = analysis
+                    .update_file_by_uri(&uri, Some("local unused = UndefinedGlobal".to_string()))
+                    .expect("file id");
+                analysis.update_file_text_only(&uri, "local a = Missing".to_string());
+                analysis
+                    .compilation
+                    .get_db_mut()
+                    .get_vfs_mut()
+                    .update_file_version(&file_id, Some(2));
+                file_id
+            };
+            let store = snapshot.file_diagnostic().store();
+            store.set_open(file_id, true);
+            store.invalidate([file_id], &[file_id]);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            verify_that!(published(&peer), is_empty())?;
+
+            {
+                let mut analysis = snapshot.analysis().write().await;
+                analysis.begin_reindex(vec![file_id]);
+                while !matches!(
+                    analysis.advance_reindex(glua_code_analysis::Slice::Whole),
+                    glua_code_analysis::UpdateProgress::Settled(_)
+                ) {}
+            }
+            store.invalidate([file_id], &[file_id]);
+            store
+                .get(file_id, Priority::Edited, &CancellationToken::new())
+                .await
+                .expect("diagnostics");
+            let versions = published(&peer)
+                .into_iter()
+                .map(|params| params.version)
+                .collect::<Vec<_>>();
+            verify_that!(versions, eq(&vec![Some(2)]))
         })
     }
 }

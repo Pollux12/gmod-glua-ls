@@ -463,7 +463,7 @@ impl EmmyLuaAnalysis {
     pub fn forget_document_version(&mut self, uri: &Uri) {
         let vfs = self.compilation.get_db_mut().get_vfs_mut();
         if let Some(file_id) = vfs.get_file_id(uri) {
-            vfs.update_file_version(&file_id, None);
+            vfs.forget_file_version(&file_id);
         }
     }
 
@@ -646,28 +646,25 @@ impl EmmyLuaAnalysis {
         self.update_files_by_uri(files)
     }
 
-    /// Whether the VFS holds exactly `text` for `file_id`.
+    /// Whether the newest text the VFS holds for `file_id` is exactly `text`.
     fn vfs_text_equals(&self, file_id: FileId, text: Option<&str>) -> bool {
         let current = self
             .compilation
             .get_db()
             .get_vfs()
-            .get_file_content(&file_id)
+            .latest_content(&file_id)
             .map(String::as_str);
         text.is_some() && current == text
     }
 
-    /// Whether `file_id` already holds `text` and its index was built from it.
+    /// Whether `file_id` already holds `text`, taken or staged for the next
+    /// take, and has an index.
     fn text_is_indexed(&self, file_id: FileId, text: Option<&str>) -> bool {
         self.vfs_text_equals(file_id, text) && self.compilation.is_indexed(file_id)
     }
 
     fn is_stale_version(&self, file_id: FileId, version: Option<i32>) -> bool {
-        let current = self
-            .compilation
-            .get_db()
-            .get_vfs()
-            .get_file_version(&file_id);
+        let current = self.compilation.get_db().get_vfs().latest_version(&file_id);
         matches!((version, current), (Some(incoming), Some(current)) if incoming < current)
     }
 

@@ -395,7 +395,7 @@ mod tests {
                 .compilation
                 .get_db()
                 .get_vfs()
-                .get_file_content(&file_id)
+                .latest_content(&file_id)
                 .cloned()
         })
     }

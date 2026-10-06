@@ -4433,4 +4433,43 @@ end
         );
         Ok(())
     }
+
+    /// A hover resolving into another file reads that file's taken text while
+    /// shorter text for it is staged: never the staged tree against the
+    /// index built from the taken one.
+    #[gtest]
+    fn hover_reads_another_files_taken_text_while_its_edit_is_staged() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/sh_config.lua",
+            "Config = {}
+
+--- The money every player starts with.
+Config.StartingMoney = 100
+",
+        );
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            "local money = Config.Starting<??>Money
+",
+        )?;
+        let reader = ws.def_file("lua/autorun/sh_reader.lua", &content);
+        let hover_text = |ws: &ProviderVirtualWorkspace| {
+            crate::handlers::hover::hover(&ws.analysis, reader, position, None)
+                .map(|hover| format!("{:?}", hover.contents))
+        };
+        let before = hover_text(&ws);
+        verify_that!(before, some(contains_substring("starts with")))?;
+
+        let config = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/sh_config.lua");
+        ws.analysis.update_file_text_only(
+            &config,
+            "Config = {}
+"
+            .to_string(),
+        );
+
+        verify_that!(hover_text(&ws), eq(&before))
+    }
 }

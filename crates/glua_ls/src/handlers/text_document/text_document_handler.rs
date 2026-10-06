@@ -514,7 +514,7 @@ mod tests {
             let vfs = analysis.compilation.get_db().get_vfs();
             analysis
                 .get_file_id(uri)
-                .and_then(|file_id| vfs.get_file_content(&file_id).cloned())
+                .and_then(|file_id| vfs.latest_content(&file_id).cloned())
         };
         verify_that!(held.as_deref(), some(eq(NEW_TEXT)))?;
         let answered = tokio::time::timeout(
@@ -563,6 +563,39 @@ mod tests {
             change(&snapshot, &uri, 2, NEW_TEXT).await;
 
             verify_new_session_applied(&snapshot, &uri).await
+        })
+    }
+
+    /// An edit is staged until a take installs it; a request that reads
+    /// only the document's syntax waits for that take and then reads the
+    /// edited text.
+    #[gtest]
+    fn a_syntax_request_reads_the_edit_once_it_is_taken() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let (context, _peer, uri) = context_with_disk_file("syntax_request_taken").await;
+            let snapshot = context.snapshot();
+            open(&snapshot, &uri, 1, DISK_TEXT).await;
+            change(&snapshot, &uri, 2, NEW_TEXT).await;
+
+            let taken = tokio::time::timeout(
+                Duration::from_secs(5),
+                snapshot.debounced_analysis().wait_until_text_taken_for(
+                    &CancellationToken::new(),
+                    "textDocument/formatting",
+                    &uri,
+                ),
+            )
+            .await;
+            verify_that!(taken, ok(eq(&crate::context::Freshness::Fresh)))?;
+            let read = {
+                let analysis = snapshot.analysis().read().await;
+                let vfs = analysis.compilation.get_db().get_vfs();
+                analysis
+                    .get_file_id(&uri)
+                    .and_then(|file_id| vfs.get_file_content(&file_id).cloned())
+            };
+            verify_that!(read.as_deref(), some(eq(NEW_TEXT)))
         })
     }
 }

@@ -44,8 +44,6 @@ pub struct LuaCompilation {
     /// Set while an edit waits to be taken in: a slice in progress stops
     /// between two evaluations.
     interrupt: Arc<AtomicBool>,
-    /// The VFS content revision the re-analysis in progress took its text at.
-    taken_revision: u64,
     /// Bumped whenever the index may change; see [`Self::index_revision`].
     index_revision: u64,
     /// The scripted scopes, lent to each re-analysis.
@@ -80,7 +78,6 @@ impl LuaCompilation {
             schedule: Schedule::default(),
             reanalysis: Mutex::default(),
             interrupt: Arc::default(),
-            taken_revision: 0,
             index_revision: 0,
             scopes: analyzer::ScopesCache::default(),
             memos: Mutex::default(),
@@ -160,7 +157,7 @@ impl LuaCompilation {
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        let edits = derivation::EditMaps::new(self.db.get_vfs_mut().take_edit_maps(&file_ids));
+        let edits = derivation::EditMaps::new(self.db.get_vfs_mut().take_staged(&file_ids));
         let reanalysis = self
             .reanalysis
             .get_mut()
@@ -178,7 +175,6 @@ impl LuaCompilation {
                 ));
             }
         }
-        self.taken_revision = self.db.get_vfs().content_revision();
     }
 
     /// Advances the re-analysis in progress by `slice`.
@@ -192,7 +188,7 @@ impl LuaCompilation {
         let Some(reanalysis) = session else {
             return UpdateProgress::Settled(Vec::new());
         };
-        if self.db.get_vfs().content_revision() != self.taken_revision {
+        if self.db.get_vfs().holds_untaken_text() {
             return UpdateProgress::TextChanged;
         }
         if !reanalysis.run(&mut self.db, slice) {
@@ -272,10 +268,8 @@ impl LuaCompilation {
 
     /// Whether a re-analysis has taken in `file_id`'s current text.
     pub fn has_taken_text(&self, file_id: FileId) -> bool {
-        self.db
-            .get_vfs()
-            .get_file_revision(&file_id)
-            .is_some_and(|revision| revision <= self.taken_revision)
+        self.db.get_vfs().get_file_revision(&file_id).is_some()
+            && !self.db.get_vfs().has_untaken_edit(&file_id)
     }
 
     /// Whether `file_id`'s facts were built from its current text.
@@ -369,7 +363,6 @@ impl LuaCompilation {
             schedule: self.schedule,
             reanalysis: Mutex::default(),
             interrupt: Arc::default(),
-            taken_revision: self.taken_revision,
             index_revision: self.index_revision,
             scopes: analyzer::ScopesCache::default(),
             memos: Mutex::default(),

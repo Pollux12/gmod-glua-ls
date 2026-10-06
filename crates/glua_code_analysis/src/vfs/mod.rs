@@ -49,9 +49,9 @@ pub struct Vfs {
     /// NOT bumped by analysis/index updates, so the cold-index main pass and its
     /// stabilization re-run share a revision and the second build is a cache hit.
     content_revision: u64,
-    /// The text each changed file had when it was last indexed (`None` for a
-    /// file that had none), until the next index takes its edit.
-    edit_bases: FxHashMap<FileId, Option<String>>,
+    /// Each changed file's newest text until a re-analysis takes it; readers
+    /// see the text taken last until then, which is what the index holds.
+    staged: FxHashMap<FileId, Staged>,
     /// Files deleted from disk, kept until a re-analysis has taken the
     /// deletion; see [`Vfs::forget_taken_deletions`].
     deleted: FxHashSet<FileId>,
@@ -107,11 +107,18 @@ fn trees_semantically_equal(left: &LuaSyntaxTree, right: &LuaSyntaxTree) -> bool
             })
 }
 
+/// Staged text a later stage replaced, to drop off the lock.
 #[derive(Default)]
 pub struct DeferredVfsDrop {
-    old_file_data: Option<FileContent>,
-    old_line_index: Option<LineIndex>,
-    old_tree: Option<LuaSyntaxTree>,
+    _replaced: Option<Staged>,
+}
+
+/// A file's newest text until a re-analysis takes it.
+#[derive(Debug, Clone)]
+struct Staged {
+    /// `None` when the file is deleted.
+    content: Option<FileContent>,
+    parsed: Option<(LuaSyntaxTree, LineIndex)>,
 }
 
 impl Default for Vfs {
@@ -136,7 +143,7 @@ impl Clone for Vfs {
             emmyrc: self.emmyrc.clone(),
             node_cache: NodeCache::default(),
             content_revision: self.content_revision,
-            edit_bases: self.edit_bases.clone(),
+            staged: self.staged.clone(),
             deleted: self.deleted.clone(),
         }
     }
@@ -156,7 +163,7 @@ impl Vfs {
             emmyrc: None,
             node_cache: NodeCache::default(),
             content_revision: 0,
-            edit_bases: FxHashMap::default(),
+            staged: FxHashMap::default(),
             deleted: FxHashSet::default(),
         }
     }
@@ -310,36 +317,49 @@ impl Vfs {
         })
     }
 
-    pub fn set_file_content(&mut self, uri: &Uri, data: Option<String>) -> FileId {
-        self.content_revision += 1;
-        let fid = self.file_id(uri);
-        log::debug!("file_id: {:?}, uri: {}", fid, uri.as_str());
+    fn parse(&mut self, text: &str) -> (LuaSyntaxTree, LineIndex) {
+        let parse_config = self
+            .emmyrc
+            .as_ref()
+            .expect("emmyrc set")
+            .get_parse_config(&mut self.node_cache);
+        (LuaParser::parse(text, parse_config), LineIndex::parse(text))
+    }
 
-        if let Some(data) = &data {
-            let line_index = LineIndex::parse(data);
-            let parse_config = self
-                .emmyrc
-                .as_ref()
-                .expect("emmyrc set")
-                .get_parse_config(&mut self.node_cache);
-            let tree = LuaParser::parse(data, parse_config);
-            self.tree_map.insert(fid, tree);
-            self.line_index_map.insert(fid, line_index);
-        } else {
-            self.line_index_map.remove(&fid);
-            self.tree_map.remove(&fid);
-        }
-        self.note_edit_base(fid);
+    /// Stages `content` as `fid`'s newest text, replacing what an earlier
+    /// stage left untaken, which it hands back.
+    fn stage(
+        &mut self,
+        fid: FileId,
+        content: Option<String>,
+        parsed: Option<(LuaSyntaxTree, LineIndex)>,
+        is_remote: bool,
+        version: Option<i32>,
+    ) -> Option<Staged> {
+        self.content_revision += 1;
         let revision = self.content_revision;
-        self.file_data[fid.id as usize] = data.map(|content| FileContent {
+        let content = content.map(|content| FileContent {
             content,
-            is_remote: false,
-            version: None,
+            is_remote,
+            version,
             revision,
         });
+        let parsed = parsed.filter(|_| content.is_some());
+        self.staged.insert(fid, Staged { content, parsed })
+    }
+
+    /// Stages `data` as `uri`'s text, or its deletion when `None`; readers
+    /// see it once [`Vfs::take_staged`] takes it.
+    pub fn set_file_content(&mut self, uri: &Uri, data: Option<String>) -> FileId {
+        let fid = self.file_id(uri);
+        log::debug!("file_id: {:?}, uri: {}", fid, uri.as_str());
+        let parsed = data.as_deref().map(|data| self.parse(data));
+        self.stage(fid, data, parsed, false, None);
         fid
     }
 
+    /// [`Vfs::set_file_content`] with a tree parsed elsewhere. A `version`
+    /// older than the file's latest is refused.
     pub fn set_file_content_preparsed(
         &mut self,
         uri: &Uri,
@@ -348,72 +368,12 @@ impl Vfs {
         line_index: LineIndex,
         version: Option<i32>,
     ) -> Option<FileId> {
-        let existing_file_id = self.get_file_id(uri);
-        if text.is_none() && existing_file_id.is_none() {
-            return None;
-        }
-
-        let fid = existing_file_id.unwrap_or_else(|| self.file_id(uri));
-        log::debug!("file_id (preparsed): {:?}, uri: {}", fid, uri.as_str());
-
-        let current_version = self
-            .file_data
-            .get(fid.id as usize)
-            .and_then(Option::as_ref)
-            .and_then(|content| content.version);
-        if let (Some(incoming_version), Some(current_version)) = (version, current_version)
-            && incoming_version < current_version
-        {
-            return None;
-        }
-
-        self.content_revision += 1;
-        self.note_edit_base(fid);
-        let revision = self.content_revision;
-
-        match text {
-            Some(content) => {
-                self.tree_map.insert(fid, tree);
-                self.line_index_map.insert(fid, line_index);
-                self.file_data[fid.id as usize] = Some(FileContent {
-                    content,
-                    is_remote: false,
-                    version,
-                    revision,
-                });
-            }
-            None => {
-                self.line_index_map.remove(&fid);
-                self.tree_map.remove(&fid);
-                self.file_data[fid.id as usize] = None;
-            }
-        }
-
-        Some(fid)
+        self.set_file_content_preparsed_deferred(uri, text, tree, line_index, version)
+            .map(|(fid, _)| fid)
     }
 
-    /// Insert pre-parsed content for a file whose FileId was already assigned via `file_id()`.
-    /// Used by parallel parsing to avoid re-assigning IDs.
-    pub fn insert_preparsed(
-        &mut self,
-        fid: FileId,
-        content: String,
-        tree: LuaSyntaxTree,
-        line_index: LineIndex,
-    ) {
-        self.content_revision += 1;
-        self.note_edit_base(fid);
-        let revision = self.content_revision;
-        self.tree_map.insert(fid, tree);
-        self.line_index_map.insert(fid, line_index);
-        self.file_data[fid.id as usize] = Some(FileContent {
-            content,
-            is_remote: false,
-            version: None,
-            revision,
-        });
-    }
-
+    /// [`Vfs::set_file_content_preparsed`], handing back the staged text it
+    /// replaced so the caller can drop it off the lock.
     pub fn set_file_content_preparsed_deferred(
         &mut self,
         uri: &Uri,
@@ -428,84 +388,35 @@ impl Vfs {
         }
 
         let fid = existing_file_id.unwrap_or_else(|| self.file_id(uri));
-        log::debug!(
-            "file_id (preparsed deferred): {:?}, uri: {}",
-            fid,
-            uri.as_str()
-        );
+        log::debug!("file_id (preparsed): {:?}, uri: {}", fid, uri.as_str());
 
-        let current_version = self
-            .file_data
-            .get(fid.id as usize)
-            .and_then(Option::as_ref)
-            .and_then(|content| content.version);
-        if let (Some(incoming_version), Some(current_version)) = (version, current_version)
+        if let (Some(incoming_version), Some(current_version)) =
+            (version, self.latest_version(&fid))
             && incoming_version < current_version
         {
             return None;
         }
 
-        self.content_revision += 1;
-        self.note_edit_base(fid);
-        let revision = self.content_revision;
-
-        let mut deferred_drop = DeferredVfsDrop::default();
-
-        match text {
-            Some(content) => {
-                deferred_drop.old_tree = self.tree_map.insert(fid, tree);
-                deferred_drop.old_line_index = self.line_index_map.insert(fid, line_index);
-                deferred_drop.old_file_data =
-                    self.file_data[fid.id as usize].replace(FileContent {
-                        content,
-                        is_remote: false,
-                        version,
-                        revision,
-                    });
-            }
-            None => {
-                deferred_drop.old_line_index = self.line_index_map.remove(&fid);
-                deferred_drop.old_tree = self.tree_map.remove(&fid);
-                deferred_drop.old_file_data = self.file_data[fid.id as usize].take();
-            }
-        }
-
-        Some((fid, deferred_drop))
+        let replaced = self.stage(fid, text, Some((tree, line_index)), false, version);
+        Some((
+            fid,
+            DeferredVfsDrop {
+                _replaced: replaced,
+            },
+        ))
     }
 
     pub fn set_remote_file_content(&mut self, uri: &Uri, data: Option<String>) -> FileId {
-        self.content_revision += 1;
-        let fid = self.virtual_file_id(&uri);
+        let fid = self.virtual_file_id(uri);
         log::debug!("virtual file_id: {:?}, uri: {}", fid, uri.as_str());
-
-        if let Some(data) = &data {
-            let line_index = LineIndex::parse(&data);
-            let parse_config = self
-                .emmyrc
-                .as_ref()
-                .expect("emmyrc set")
-                .get_parse_config(&mut self.node_cache);
-            let tree = LuaParser::parse(&data, parse_config);
-            self.tree_map.insert(fid, tree);
-            self.line_index_map.insert(fid, line_index);
-        } else {
-            self.line_index_map.remove(&fid);
-            self.tree_map.remove(&fid);
-        }
-        self.note_edit_base(fid);
-        let revision = self.content_revision;
-        self.file_data[fid.id as usize] = data.map(|content| FileContent {
-            content,
-            is_remote: true,
-            version: None,
-            revision,
-        });
+        let parsed = data.as_deref().map(|data| self.parse(data));
+        self.stage(fid, data, parsed, true, None);
         fid
     }
 
-    /// Takes `uri`'s text away as its deletion from disk. The file keeps its
-    /// entry until a re-analysis has taken the deletion, which re-analyses
-    /// what the file held.
+    /// Stages `uri`'s deletion from disk. The file keeps its entry until a
+    /// re-analysis has taken the deletion, which re-analyses what the file
+    /// held.
     pub fn delete_file_content(&mut self, uri: &Uri) -> Option<FileId> {
         let fid = self.get_file_id(uri)?;
         self.set_file_content(uri, None);
@@ -519,7 +430,7 @@ impl Vfs {
         let taken = self
             .deleted
             .iter()
-            .filter(|fid| !self.edit_bases.contains_key(fid))
+            .filter(|fid| !self.staged.contains_key(fid))
             .copied()
             .collect::<Vec<_>>();
         for fid in taken {
@@ -536,61 +447,75 @@ impl Vfs {
         }
     }
 
+    /// Forgets `uri`'s path at once and stages the removal of its text.
     pub fn remove_file(&mut self, uri: &Uri) -> Option<FileId> {
         let fid = self.get_file_id(uri)?;
-        self.content_revision += 1;
         if let Some(path) = self.file_path_map.remove(&fid.id) {
             self.file_id_map.remove(&path);
         }
         self.file_order_keys.remove(&fid.id);
-        self.note_edit_base(fid);
-        if let Some(data) = self.file_data.get_mut(fid.id as usize) {
-            data.take();
-        }
-        self.line_index_map.remove(&fid);
-        self.tree_map.remove(&fid);
+        self.stage(fid, None, None, false, None);
         Some(fid)
     }
 
-    fn note_edit_base(&mut self, fid: FileId) {
-        if let std::collections::hash_map::Entry::Vacant(entry) = self.edit_bases.entry(fid) {
-            entry.insert(
-                self.file_data
-                    .get(fid.id as usize)
-                    .and_then(Option::as_ref)
-                    .map(|content| content.content.clone()),
-            );
-        }
-    }
-
-    /// Whether `file_id`'s text changed since a re-analysis last took it.
+    /// Whether `file_id` has staged text no re-analysis has taken yet.
     pub fn has_untaken_edit(&self, file_id: &FileId) -> bool {
-        self.edit_bases.contains_key(file_id)
+        self.staged.contains_key(file_id)
     }
 
-    /// The files whose text changed since a re-analysis last took them,
-    /// sorted.
+    /// Whether any file has staged text no re-analysis has taken yet.
+    pub fn holds_untaken_text(&self) -> bool {
+        !self.staged.is_empty()
+    }
+
+    /// The files with staged text no re-analysis has taken yet, sorted.
     pub fn files_changed_since_taken(&self) -> Vec<FileId> {
-        let mut files = self.edit_bases.keys().copied().collect::<Vec<_>>();
+        let mut files = self.staged.keys().copied().collect::<Vec<_>>();
         files.sort_unstable();
         files
     }
 
-    /// Where the edits since `file_ids` were last indexed moved their
-    /// positions, for the files that had text then and still have it; the
-    /// edits are forgotten.
-    pub fn take_edit_maps(&mut self, file_ids: &[FileId]) -> Vec<(FileId, PositionMap)> {
+    /// The newest of `file_id`'s text, staged or taken, for the code that
+    /// stages edits; readers use [`Vfs::get_file_content`].
+    pub fn latest_content(&self, file_id: &FileId) -> Option<&String> {
+        self.latest(file_id).map(|data| &data.content)
+    }
+
+    /// The editor version of `file_id`'s newest text, staged or taken.
+    pub fn latest_version(&self, file_id: &FileId) -> Option<i32> {
+        self.latest(file_id).and_then(|data| data.version)
+    }
+
+    fn latest(&self, file_id: &FileId) -> Option<&FileContent> {
+        match self.staged.get(file_id) {
+            Some(staged) => staged.content.as_ref(),
+            None => self.file_data.get(file_id.id as usize)?.as_ref(),
+        }
+    }
+
+    /// Makes the staged text of `file_ids` what readers see. Returns where
+    /// each one's edit moved its positions, for the files that had text
+    /// before and still have it.
+    pub fn take_staged(&mut self, file_ids: &[FileId]) -> Vec<(FileId, PositionMap)> {
         let mut maps = Vec::new();
         for file_id in file_ids {
-            let Some(Some(old_text)) = self.edit_bases.remove(file_id) else {
+            let Some(staged) = self.staged.remove(file_id) else {
                 continue;
             };
-            if let Some(content) = self
-                .file_data
-                .get(file_id.id as usize)
-                .and_then(Option::as_ref)
-            {
-                maps.push((*file_id, PositionMap::new(&old_text, &content.content)));
+            let slot = &mut self.file_data[file_id.id as usize];
+            if let (Some(old), Some(new)) = (slot.as_ref(), staged.content.as_ref()) {
+                maps.push((*file_id, PositionMap::new(&old.content, &new.content)));
+            }
+            *slot = staged.content;
+            match staged.parsed {
+                Some((tree, line_index)) => {
+                    self.tree_map.insert(*file_id, tree);
+                    self.line_index_map.insert(*file_id, line_index);
+                }
+                None => {
+                    self.tree_map.remove(file_id);
+                    self.line_index_map.remove(file_id);
+                }
             }
         }
         maps
@@ -675,9 +600,32 @@ impl Vfs {
             .map(|content| content.revision)
     }
 
+    /// Sets the editor version of `id`'s newest text, staged or taken.
     pub fn update_file_version(&mut self, id: &FileId, version: Option<i32>) {
-        if let Some(Some(content)) = self.file_data.get_mut(id.id as usize) {
+        let latest = match self.staged.get_mut(id) {
+            Some(staged) => staged.content.as_mut(),
+            None => self
+                .file_data
+                .get_mut(id.id as usize)
+                .and_then(Option::as_mut),
+        };
+        if let Some(content) = latest {
             content.version = version;
+        }
+    }
+
+    /// Forgets the editor version of `id`'s text, staged and taken.
+    pub fn forget_file_version(&mut self, id: &FileId) {
+        let staged = self
+            .staged
+            .get_mut(id)
+            .and_then(|staged| staged.content.as_mut());
+        let taken = self
+            .file_data
+            .get_mut(id.id as usize)
+            .and_then(Option::as_mut);
+        for content in staged.into_iter().chain(taken) {
+            content.version = None;
         }
     }
 
@@ -771,7 +719,7 @@ impl Vfs {
         self.file_data.clear();
         self.line_index_map.clear();
         self.tree_map.clear();
-        self.edit_bases.clear();
+        self.staged.clear();
         self.deleted.clear();
         self.emmyrc = None;
         self.node_cache = NodeCache::default();
@@ -814,6 +762,135 @@ mod tests {
         let mut vfs = Vfs::new();
         vfs.update_config(Arc::new(Emmyrc::default()));
         vfs
+    }
+
+    /// Readers see the text a take installed, never text staged after it,
+    /// while the staging side sees the newest.
+    #[test]
+    fn staged_text_is_read_only_once_taken() {
+        let mut vfs = new_vfs();
+        let uri = file_uri();
+        let file_id = vfs.set_file_content(
+            &uri,
+            Some(
+                "local long_name = 1
+"
+                .to_string(),
+            ),
+        );
+        assert_eq!(vfs.get_file_content(&file_id), None);
+        vfs.take_staged(&[file_id]);
+
+        vfs.set_file_content(
+            &uri,
+            Some(
+                "local a = 2
+"
+                .to_string(),
+            ),
+        );
+        vfs.set_file_content(
+            &uri,
+            Some(
+                "x = 3
+"
+                .to_string(),
+            ),
+        );
+
+        let read = |vfs: &Vfs| {
+            let tree = vfs.get_syntax_tree(&file_id).expect("a tree");
+            (
+                vfs.get_file_content(&file_id).cloned(),
+                tree.get_red_root().text().to_string(),
+            )
+        };
+        let taken = "local long_name = 1
+"
+        .to_string();
+        assert_eq!(read(&vfs), (Some(taken.clone()), taken));
+        assert_eq!(
+            vfs.latest_content(&file_id).map(String::as_str),
+            Some(
+                "x = 3
+"
+            )
+        );
+        assert!(vfs.has_untaken_edit(&file_id));
+
+        let maps = vfs.take_staged(&[file_id]);
+        assert_eq!(maps.len(), 1, "one map from the taken text to the newest");
+        assert_eq!(
+            read(&vfs),
+            (
+                Some(
+                    "x = 3
+"
+                    .to_string()
+                ),
+                "x = 3
+"
+                .to_string()
+            )
+        );
+        assert!(!vfs.has_untaken_edit(&file_id));
+    }
+
+    /// A staged deletion leaves the file readable until it is taken.
+    #[test]
+    fn a_staged_deletion_is_read_only_once_taken() {
+        let mut vfs = new_vfs();
+        let uri = file_uri();
+        let file_id = vfs.set_file_content(
+            &uri,
+            Some(
+                "local a = 1
+"
+                .to_string(),
+            ),
+        );
+        vfs.take_staged(&[file_id]);
+
+        vfs.delete_file_content(&uri);
+        assert!(vfs.get_syntax_tree(&file_id).is_some());
+        assert_eq!(vfs.latest_content(&file_id), None);
+
+        assert!(vfs.take_staged(&[file_id]).is_empty());
+        assert!(vfs.get_syntax_tree(&file_id).is_none());
+        assert_eq!(vfs.get_file_content(&file_id), None);
+    }
+
+    /// An editor version set on staged text is the staged text's; the taken
+    /// text keeps its own until the take.
+    #[test]
+    fn a_version_belongs_to_the_newest_text() {
+        let mut vfs = new_vfs();
+        let uri = file_uri();
+        let (tree, line_index) = parse_lua("local a = 1");
+        let file_id = vfs
+            .set_file_content_preparsed(
+                &uri,
+                Some("local a = 1".to_string()),
+                tree,
+                line_index,
+                Some(1),
+            )
+            .expect("text is staged");
+        vfs.take_staged(&[file_id]);
+        let (tree, line_index) = parse_lua("local a = 2");
+        vfs.set_file_content_preparsed(
+            &uri,
+            Some("local a = 2".to_string()),
+            tree,
+            line_index,
+            Some(2),
+        )
+        .expect("text is staged");
+
+        assert_eq!(vfs.get_file_version(&file_id), Some(1));
+        assert_eq!(vfs.latest_version(&file_id), Some(2));
+        vfs.take_staged(&[file_id]);
+        assert_eq!(vfs.get_file_version(&file_id), Some(2));
     }
 
     #[test]
@@ -878,6 +955,7 @@ mod tests {
         let uri = file_uri();
         let original = "local a = 1\nreturn a";
         let file_id = vfs.set_file_content(&uri, Some(original.to_string()));
+        vfs.take_staged(&[file_id]);
 
         // Trailing whitespace shifts no token offset: still the same program.
         assert!(vfs.content_semantically_matches(file_id, "local a = 1\nreturn a\n"));
@@ -903,6 +981,7 @@ mod tests {
 
         let annotated = "local a = 1\n---@type integer\nlocal b = x";
         let file_id = vfs.set_file_content(&uri, Some(annotated.to_string()));
+        vfs.take_staged(&[file_id]);
         // Join Lines: `\n` -> ` `, every non-trivia token keeps kind/range/text.
         assert!(
             !vfs.content_semantically_matches(file_id, "local a = 1 ---@type integer\nlocal b = x")
@@ -910,6 +989,7 @@ mod tests {
 
         let block = "--- a\r\n--- b\nlocal c = 1";
         let file_id = vfs.set_file_content(&uri, Some(block.to_string()));
+        vfs.take_staged(&[file_id]);
         // Same byte length, but the blank line splits the doc block in two.
         assert!(!vfs.content_semantically_matches(file_id, "--- a\n\n--- b\nlocal c = 1"));
     }
@@ -948,8 +1028,10 @@ mod tests {
                         .any(|error| error.message.contains("too deeply nested")),
                     "deep blocks must trip the stack reserve guard"
                 );
-                vfs.set_file_content_preparsed(&uri, Some(deep.clone()), tree, line_index, Some(1))
+                let fid = vfs
+                    .set_file_content_preparsed(&uri, Some(deep.clone()), tree, line_index, Some(1))
                     .expect("initial deep insert must be accepted");
+                vfs.take_staged(&[fid]);
 
                 let (shallow_tree, shallow_index) = parse_lua("local x = 1");
                 vfs.set_file_content_preparsed(
@@ -960,6 +1042,7 @@ mod tests {
                     Some(2),
                 )
                 .expect("replacement must be accepted");
+                vfs.take_staged(&[fid]);
 
                 let (tree, line_index) = parse_lua(&deep);
                 vfs.set_file_content_preparsed(&uri, Some(deep.clone()), tree, line_index, Some(3))
@@ -1072,6 +1155,8 @@ mod tests {
             .collect();
 
         assert_eq!(serial_ids, concurrent_ids);
+        serial.take_staged(&serial_ids);
+        concurrent.take_staged(&concurrent_ids);
         for id in serial_ids {
             let (expected, actual) = (
                 serial.get_syntax_tree(&id).expect("serial tree"),
@@ -1114,6 +1199,7 @@ mod tests {
                 let mut vfs = new_vfs();
                 let uri = file_uri();
                 let file_id = vfs.set_file_content(&uri, Some(deep.clone()));
+                vfs.take_staged(&[file_id]);
                 assert!(
                     vfs.get_file_parse_error(&file_id)
                         .unwrap_or_default()

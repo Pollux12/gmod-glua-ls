@@ -107,6 +107,8 @@ fn content_modified(id: lsp_server::RequestId) -> Option<Response> {
 macro_rules! dispatch_request {
     ($request:expr, $context:expr, {
         $($req_type:ty => $handler:expr),* $(,)?
+    }, wait_for_taken_text: {
+        $($text_req_type:ty => $text_handler:expr),* $(,)?
     }, wait_for_fresh_index: {
         $($fresh_req_type:ty => $fresh_handler:expr),* $(,)?
     }, content_modified_if_client_retries: {
@@ -120,6 +122,41 @@ macro_rules! dispatch_request {
                         let task_metadata = request_task_metadata(<$req_type>::METHOD, &params);
                         $context.task(id.clone(), task_metadata, |cancel_token| async move {
                             let result = $handler(snapshot, params, cancel_token).await;
+                            Some(Response::new_ok(id, result))
+                        }).await;
+                        return Ok(());
+                    }
+                }
+            )*
+            $(
+                <$text_req_type>::METHOD => {
+                    if let Ok((id, params)) = $request.extract::<<$text_req_type as LspRequest>::Params>(<$text_req_type>::METHOD) {
+                        let snapshot = $context.snapshot();
+                        let task_metadata = request_task_metadata(<$text_req_type>::METHOD, &params);
+                        let target_uri = task_metadata.uri.clone();
+                        $context.task(id.clone(), task_metadata, |cancel_token| async move {
+                            // The analysis reads a document's text once a take
+                            // installs it; positions sent for newer text would
+                            // not line up with the older one.
+                            if let Some(uri) = target_uri.as_ref() {
+                                match snapshot
+                                    .debounced_analysis()
+                                    .wait_until_text_taken_for(
+                                        &cancel_token,
+                                        <$text_req_type>::METHOD,
+                                        uri,
+                                    )
+                                    .await
+                                {
+                                    Freshness::Fresh => {}
+                                    Freshness::Cancelled => return None,
+                                    Freshness::LoopDead => {
+                                        cancel_token.cancel();
+                                        return None;
+                                    }
+                                }
+                            }
+                            let result = $text_handler(snapshot, params, cancel_token).await;
                             Some(Response::new_ok(id, result))
                         }).await;
                         return Ok(());
@@ -354,6 +391,12 @@ pub async fn on_request_handler(
     server_context: &mut ServerContext,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
     dispatch_request!(req, server_context, {
+        // Reads the index but performs its own wait to control the cancel
+        // response.
+        EmmyAnnotatorRequest => on_emmy_annotator_handler,
+        CodeLensRequest => on_code_lens_handler,
+        InlayHintRequest => on_inlay_hint_handler,
+    }, wait_for_taken_text: {
         // Must not resolve declarations/members/globals through the index —
         // those need the `wait_for_fresh_index` arm.
         FoldingRangeRequest => on_folding_range_handler,
@@ -362,12 +405,6 @@ pub async fn on_request_handler(
         Formatting => on_formatting_handler,
         RangeFormatting => on_range_formatting_handler,
         OnTypeFormatting => on_type_formatting_handler,
-
-        // Reads the index but performs its own wait to control the cancel
-        // response.
-        EmmyAnnotatorRequest => on_emmy_annotator_handler,
-        CodeLensRequest => on_code_lens_handler,
-        InlayHintRequest => on_inlay_hint_handler,
     }, wait_for_fresh_index: {
         Completion => on_completion_handler,
         ResolveCompletionItem => on_completion_resolve_handler,
@@ -485,9 +522,10 @@ mod tests {
     fn only_interactive_requests_expedite_the_debounce() {
         use super::{
             CodeLensRequest, Completion, DocumentSymbolRequest, EmmyAnnotatorRequest,
-            FoldingRangeRequest, GluaHoverExpandRequest, GotoDefinition, HoverRequest,
-            InlayHintRequest, LspRequest, ResolveCompletionItem, SemanticTokensFullRequest,
-            SignatureHelpRequest,
+            EmmySyntaxTreeRequest, FoldingRangeRequest, Formatting, GluaHoverExpandRequest,
+            GotoDefinition, HoverRequest, InlayHintRequest, LspRequest, OnTypeFormatting,
+            RangeFormatting, ResolveCompletionItem, SelectionRangeRequest,
+            SemanticTokensFullRequest, SignatureHelpRequest,
         };
         use crate::context::expedites_debounce;
 
@@ -499,11 +537,16 @@ mod tests {
             SignatureHelpRequest::METHOD,
             GotoDefinition::METHOD,
             SemanticTokensFullRequest::METHOD,
+            SelectionRangeRequest::METHOD,
+            Formatting::METHOD,
+            RangeFormatting::METHOD,
+            OnTypeFormatting::METHOD,
         ] {
             assert!(expedites_debounce(method), "{method} should expedite");
         }
         for method in [
             FoldingRangeRequest::METHOD,
+            EmmySyntaxTreeRequest::METHOD,
             DocumentSymbolRequest::METHOD,
             CodeLensRequest::METHOD,
             InlayHintRequest::METHOD,

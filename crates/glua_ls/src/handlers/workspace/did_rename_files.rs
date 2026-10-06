@@ -141,7 +141,7 @@ mod tests {
     async fn content(snapshot: &ServerContextSnapshot, uri: &Uri) -> Option<String> {
         let analysis = snapshot.analysis().read().await;
         let vfs = analysis.compilation.get_db().get_vfs();
-        vfs.get_file_content(&vfs.get_file_id(uri)?).cloned()
+        vfs.latest_content(&vfs.get_file_id(uri)?).cloned()
     }
 
     async fn watch(snapshot: &ServerContextSnapshot, changes: Vec<(Uri, FileChangeType)>) {
@@ -203,9 +203,7 @@ mod tests {
         runtime.block_on(async {
             let workspace = renamed_workspace("echo").await;
             let revision = |analysis: &glua_code_analysis::EmmyLuaAnalysis| {
-                let vfs = analysis.compilation.get_db().get_vfs();
-                vfs.get_file_id(&workspace.new_uri)
-                    .and_then(|file_id| vfs.get_file_revision(&file_id))
+                analysis.compilation.get_db().get_vfs().content_revision()
             };
             let before = revision(&*workspace.snapshot.analysis().read().await);
 

@@ -142,7 +142,20 @@ pub(crate) fn expedites_debounce(method: &str) -> bool {
             | "textDocument/signatureHelp"
             | "textDocument/definition"
             | "textDocument/semanticTokens/full"
+            | "textDocument/selectionRange"
+            | "textDocument/formatting"
+            | "textDocument/rangeFormatting"
+            | "textDocument/onTypeFormatting"
     )
+}
+
+/// What a request aimed at one document waits for.
+#[derive(Clone, Copy)]
+enum DocumentNeed {
+    /// Its own index entries match its text.
+    Answerable,
+    /// Its newest text is the one the analysis reads.
+    TakenText,
 }
 
 /// Takes `count` from `counter`, stopping at zero and logging an underflow.
@@ -396,6 +409,30 @@ impl DebouncedAnalysis {
         request_method: &'static str,
         uri: &Uri,
     ) -> Freshness {
+        self.wait_for_document(cancel_token, request_method, uri, DocumentNeed::Answerable)
+            .await
+    }
+
+    /// Wait until the re-analysis has taken the text of the document at
+    /// `uri`, which is the text the analysis then reads for it. A request that
+    /// reads only the document's syntax needs nothing more.
+    pub async fn wait_until_text_taken_for(
+        &self,
+        cancel_token: &CancellationToken,
+        request_method: &'static str,
+        uri: &Uri,
+    ) -> Freshness {
+        self.wait_for_document(cancel_token, request_method, uri, DocumentNeed::TakenText)
+            .await
+    }
+
+    async fn wait_for_document(
+        &self,
+        cancel_token: &CancellationToken,
+        request_method: &'static str,
+        uri: &Uri,
+        need: DocumentNeed,
+    ) -> Freshness {
         #[cfg(test)]
         self.freshness_waits.fetch_add(1, Ordering::AcqRel);
 
@@ -408,7 +445,11 @@ impl DebouncedAnalysis {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            if self.file_is_answerable(uri).await {
+            let met = match need {
+                DocumentNeed::Answerable => self.file_is_answerable(uri).await,
+                DocumentNeed::TakenText => self.text_is_taken(uri).await,
+            };
+            if met {
                 return Freshness::Fresh;
             }
 
@@ -431,6 +472,18 @@ impl DebouncedAnalysis {
                 }
             }
         }
+    }
+
+    /// Whether the analysis reads the newest text of the document at `uri`:
+    /// none is in flight and none is staged for a take.
+    async fn text_is_taken(&self, uri: &Uri) -> bool {
+        if self.has_in_flight_change_for(uri) {
+            return false;
+        }
+        let analysis = self.analysis.read().await;
+        analysis
+            .get_file_id(uri)
+            .is_none_or(|file_id| !analysis.has_untaken_text(file_id))
     }
 
     /// Whether `analysis`'s re-analysis in progress still has work in

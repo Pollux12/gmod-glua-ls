@@ -158,7 +158,7 @@ async fn without_applied_renames(
         .filter(|(uri, text)| {
             let current = vfs
                 .get_file_id(uri)
-                .and_then(|file_id| vfs.get_file_content(&file_id));
+                .and_then(|file_id| vfs.latest_content(&file_id));
             !renamed.contains(uri) || current.map(String::as_str) != text.as_deref()
         })
         .collect()

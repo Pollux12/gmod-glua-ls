@@ -171,6 +171,7 @@ mod tests {
         let vg = VirtualUrlGenerator::new();
         let uri = vg.new_uri("test.lua");
         let id = vfs.set_file_content(&uri, Some(code.to_string()));
+        vfs.take_staged(&[id]);
         let document = vfs.get_document(&id).unwrap();
 
         assert_eq!(document.get_file_id(), id);
@@ -187,6 +188,7 @@ mod tests {
         let vg = VirtualUrlGenerator::new();
         let uri = vg.new_uri("slice.lua");
         let id = vfs.set_file_content(&uri, Some(code.to_string()));
+        vfs.take_staged(&[id]);
         let document = vfs.get_document(&id).unwrap();
 
         // Slice "Hello" from "Hello, World!"
@@ -202,6 +204,7 @@ mod tests {
         let vg = VirtualUrlGenerator::new();
         let uri = vg.new_uri("conversion.lua");
         let id = vfs.set_file_content(&uri, Some(code.to_string()));
+        vfs.take_staged(&[id]);
         let document = vfs.get_document(&id).unwrap();
 
         // Test conversion of offset to lsp position.
@@ -242,6 +245,7 @@ mod tests {
         let vg = VirtualUrlGenerator::new();
         let uri = vg.new_uri("filename_test.lua");
         let id = vfs.set_file_content(&uri, Some(code.to_string()));
+        vfs.take_staged(&[id]);
         let document = vfs.get_document(&id).unwrap();
 
         assert_eq!(
@@ -258,6 +262,7 @@ mod tests {
         let vg = VirtualUrlGenerator::new();
         let uri = vg.new_uri("doc_range.lua");
         let id = vfs.set_file_content(&uri, Some(code.to_string()));
+        vfs.take_staged(&[id]);
         let document = vfs.get_document(&id).unwrap();
 
         let doc_range = document.get_document_lsp_range();
