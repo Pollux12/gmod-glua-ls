@@ -469,7 +469,7 @@ fn is_member_guard_callee(
         _ => return false,
     };
 
-    let Some(signature) = db.get_signature_index().get(&signature_id) else {
+    let Some(signature) = db.get_signature_index().get_declared(&signature_id) else {
         return false;
     };
 

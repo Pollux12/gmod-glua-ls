@@ -239,6 +239,15 @@ impl LuaSignatureIndex {
         self.signatures.get(signature_id)
     }
 
+    /// Whether `signature_id` returns `never`. Records a read of that alone, so
+    /// a return type that settles on anything else leaves the reader standing.
+    pub fn returns_never(&self, signature_id: &LuaSignatureId) -> bool {
+        derivation::note_signature_returns_never_read(*signature_id);
+        self.signatures
+            .get(signature_id)
+            .is_some_and(LuaSignature::returns_never)
+    }
+
     /// Whether `signature_id` takes special-call params. Records a read of
     /// that alone, so what inference later resolves for the signature leaves
     /// the reader standing.
@@ -863,6 +872,12 @@ impl LuaSignatureIndex {
                 .map_or(derivation::ABSENT, |signature| {
                     derivation::fingerprint_of(&signature.has_special_call_params())
                 }),
+            FactKey::SignatureReturnsNever(signature_id) => self
+                .signatures
+                .get(signature_id)
+                .map_or(derivation::ABSENT, |signature| {
+                    derivation::fingerprint_of(&signature.returns_never())
+                }),
             FactKey::SignatureDecl(signature_id) => self
                 .signatures
                 .get(signature_id)
@@ -1094,6 +1109,56 @@ mod tests {
         assert!(index.inferred_guard_owners_by_file.is_empty());
         assert!(index.inferred_guard_dependencies.is_empty());
         assert!(index.inferred_guard_consumers.is_empty());
+    }
+
+    fn returning(type_ref: LuaType) -> Vec<LuaDocReturnInfo> {
+        vec![LuaDocReturnInfo {
+            name: None,
+            type_ref,
+            default_value: None,
+            description: None,
+            attributes: None,
+            return_kind: Default::default(),
+        }]
+    }
+
+    /// A reader of whether a signature returns `never` records that alone,
+    /// read out of the signature: its returns resolving to anything else hold
+    /// it, resolving to `never` moves it.
+    #[test]
+    fn a_return_that_settles_short_of_never_holds_a_reader_of_never() {
+        let file_id = FileId::new(3);
+        let signature_id = LuaSignatureId::new(file_id, 8.into());
+        let mut index = LuaSignatureIndex::new();
+        index.get_or_create(signature_id);
+        derivation::begin(derivation::DerivationId::workspace(
+            derivation::DerivationKind::GmodLoad,
+        ));
+        assert!(!index.returns_never(&signature_id));
+        let reads = derivation::end().into_recorded().2;
+        let [read] = reads.as_slice() else {
+            panic!("expected one read, got {reads:?}");
+        };
+        let signature = FactKey::Signature(signature_id);
+        assert_eq!(read.base(), Some(signature.clone()));
+        let fingerprint = |index: &LuaSignatureIndex, key: &FactKey| {
+            derivation::in_file(Some(file_id), || index.fact_fingerprint(key))
+        };
+        let (signature_seen, read_seen) =
+            (fingerprint(&index, &signature), fingerprint(&index, read));
+
+        let resolved = index.get_mut(&signature_id).expect("the signature");
+        resolved.resolve_return = SignatureReturnStatus::InferResolve;
+        resolved.return_docs = returning(LuaType::Boolean);
+        assert_ne!(fingerprint(&index, &signature), signature_seen);
+        assert_eq!(fingerprint(&index, read), read_seen);
+
+        index
+            .get_mut(&signature_id)
+            .expect("the signature")
+            .return_docs = returning(LuaType::Never);
+        assert_ne!(fingerprint(&index, read), read_seen);
+        assert!(index.returns_never(&signature_id));
     }
 
     fn table_ref(source: FileId, start: u32, end: u32) -> LuaType {

@@ -474,6 +474,7 @@ impl DbIndex {
             | K::DefinitionSite(_) => self.members_index.fact_fingerprint(key),
             K::Signature(_)
             | K::SignatureDecl(_)
+            | K::SignatureReturnsNever(_)
             | K::SpecialCallSignature(_)
             | K::ValidGuard(_)
             | K::ValidGuardFile(_)

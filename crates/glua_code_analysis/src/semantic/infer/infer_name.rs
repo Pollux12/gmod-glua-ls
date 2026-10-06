@@ -1027,7 +1027,7 @@ fn infer_param_inner(
 
     let mut colon_define = false;
     // find local annotation
-    if let Some(signature) = db.get_signature_index().get(&signature_id) {
+    if let Some(signature) = db.get_signature_index().get_declared(&signature_id) {
         colon_define = signature.is_colon_define;
         if let Some(param_info) = signature.get_param_info_by_id(param_idx) {
             let mut typ = param_info.type_ref.clone();
@@ -2188,7 +2188,7 @@ fn find_param_type_from_type(
 ) -> Option<LuaType> {
     match source_type {
         LuaType::Signature(signature_id) => {
-            let signature = db.get_signature_index().get(&signature_id)?;
+            let signature = db.get_signature_index().get_declared(&signature_id)?;
             let adjusted_idx =
                 adjust_param_idx(param_idx, current_colon_define, signature.is_colon_define);
 

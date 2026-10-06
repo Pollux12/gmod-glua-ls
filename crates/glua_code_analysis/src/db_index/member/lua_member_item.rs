@@ -988,7 +988,7 @@ fn collect_override_callable_shape(
                 }
             }
             LuaType::Signature(signature_id) => {
-                if let Some(signature) = db.get_signature_index().get(signature_id) {
+                if let Some(signature) = db.get_signature_index().get_declared(signature_id) {
                     if signature.is_vararg {
                         shape.has_variadic = true;
                     } else {

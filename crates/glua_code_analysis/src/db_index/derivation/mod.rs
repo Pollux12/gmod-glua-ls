@@ -339,6 +339,9 @@ pub enum FactKey {
     /// overloads, generic params and colon and vararg flags. Read out of its
     /// [`FactKey::Signature`], which also holds what inference resolved.
     SignatureDecl(LuaSignatureId),
+    /// Whether a signature returns `never`. Read out of its
+    /// [`FactKey::Signature`].
+    SignatureReturnsNever(LuaSignatureId),
     /// Whether a signature takes special-call params (string-template or
     /// constructor params, out-params, return aliases). Read out of its
     /// [`FactKey::Signature`].
@@ -632,6 +635,7 @@ impl FactKey {
                 | K::DefinitionFact(_)
                 | K::Signature(_)
                 | K::SignatureDecl(_)
+                | K::SignatureReturnsNever(_)
                 | K::SpecialCallSignature(_)
                 | K::DynamicField(..)
                 | K::DynamicFieldWildcards(_)
@@ -751,7 +755,9 @@ impl FactKey {
             FactKey::GmodMemberRealmAt(file_id, _) | FactKey::GmodRealmInputs(file_id) => {
                 Some(FactKey::GmodInferFile(*file_id))
             }
-            FactKey::SignatureDecl(signature_id) | FactKey::SpecialCallSignature(signature_id) => {
+            FactKey::SignatureDecl(signature_id)
+            | FactKey::SignatureReturnsNever(signature_id)
+            | FactKey::SpecialCallSignature(signature_id) => {
                 Some(FactKey::Signature(*signature_id))
             }
             FactKey::MemberObject(member_id) => Some(FactKey::Member(*member_id)),
@@ -795,6 +801,7 @@ impl FactKey {
             | K::Syntax(site) => Some(site.file_id),
             K::Signature(signature_id)
             | K::SignatureDecl(signature_id)
+            | K::SignatureReturnsNever(signature_id)
             | K::SpecialCallSignature(signature_id)
             | K::ValidGuard(signature_id)
             | K::InferredGuard(signature_id)
@@ -2158,6 +2165,17 @@ pub fn note_signature_decl_read(id: LuaSignatureId) {
             file_position(id.get_file_id(), id.get_position()),
         ),
         || FactKey::SignatureDecl(id),
+    );
+}
+
+/// Records a read of whether the signature `id` returns `never`.
+pub fn note_signature_returns_never_read(id: LuaSignatureId) {
+    note_read_by(
+        (
+            u8::MAX - 21,
+            file_position(id.get_file_id(), id.get_position()),
+        ),
+        || FactKey::SignatureReturnsNever(id),
     );
 }
 

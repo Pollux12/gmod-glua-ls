@@ -230,6 +230,7 @@ impl EditMaps {
             K::Syntax(site) => K::Syntax(self.site(site)?),
             K::Signature(id) => K::Signature(self.signature_id(*id)?),
             K::SignatureDecl(id) => K::SignatureDecl(self.signature_id(*id)?),
+            K::SignatureReturnsNever(id) => K::SignatureReturnsNever(self.signature_id(*id)?),
             K::SpecialCallSignature(id) => K::SpecialCallSignature(self.signature_id(*id)?),
             K::ValidGuard(id) => K::ValidGuard(self.signature_id(*id)?),
             K::InferredGuard(id) => K::InferredGuard(self.signature_id(*id)?),

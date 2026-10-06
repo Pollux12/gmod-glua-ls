@@ -1370,9 +1370,7 @@ fn semantic_decl_returns_never(db: &DbIndex, semantic_decl: LuaSemanticDeclId) -
 }
 
 fn signature_returns_never(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
-    db.get_signature_index()
-        .get(&signature_id)
-        .is_some_and(|signature| signature.get_return_type().is_never())
+    db.get_signature_index().returns_never(&signature_id)
 }
 
 fn type_returns_never(db: &DbIndex, typ: &LuaType) -> bool {

@@ -400,6 +400,11 @@ impl LuaSignature {
         None
     }
 
+    /// Whether [`Self::get_return_type`] is `never`.
+    pub fn returns_never(&self) -> bool {
+        matches!(self.return_docs.as_slice(), [only] if only.type_ref.is_never())
+    }
+
     pub fn get_return_type(&self) -> LuaType {
         match self.return_docs.len() {
             0 => LuaType::Nil,
