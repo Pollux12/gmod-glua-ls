@@ -910,6 +910,85 @@ mod tests {
         expect_that!(affected, contains(eq(&reader)));
     }
 
+    fn gmod_workspace_with(code: DiagnosticCode) -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.analysis.diagnostic.enable_only(code);
+        ws
+    }
+
+    /// `file_id`'s diagnostics as the language server computes them: against
+    /// data shared by every file, built outside any file's recorded reads.
+    fn shared_diagnostics(ws: &VirtualWorkspace, file_id: FileId) -> Vec<lsp_types::Diagnostic> {
+        let shared = ws.analysis.precompute_diagnostic_shared_data();
+        ws.analysis
+            .diagnose_file_with_shared(file_id, CancellationToken::new(), shared)
+            .unwrap_or_default()
+    }
+
+    /// A receiver's network checks compare it with the send flows of the
+    /// whole workspace, shared by every file: a sender's new bit count
+    /// reports the receiver affected, though the receiver was not edited.
+    #[gtest]
+    fn a_senders_new_bit_count_reports_its_receiver_affected() {
+        let mut ws = gmod_workspace_with(DiagnosticCode::GmodNetReadWriteBitsMismatch);
+        let sender = |bits: u32| {
+            format!(
+                "util.AddNetworkString(\"Bits\")\nnet.Start(\"Bits\")\nnet.WriteUInt(1, {bits})\nnet.Broadcast()\n"
+            )
+        };
+        let sender_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/sv_send.lua");
+        write(&mut ws, &sender_uri, &sender(8));
+        let receiver_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/client/cl_receive.lua");
+        let receiver = write(
+            &mut ws,
+            &receiver_uri,
+            "net.Receive(\"Bits\", function()\n    local value = net.ReadUInt(16)\nend)\n",
+        );
+        let before = shared_diagnostics(&ws, receiver);
+
+        let affected = ws
+            .analysis
+            .apply_file_system_changes(vec![(sender_uri, Some(sender(16)))]);
+
+        expect_that!(shared_diagnostics(&ws, receiver), not(eq(&before)));
+        expect_that!(affected, contains(eq(&receiver)));
+    }
+
+    /// Realm checks read the callee realms shared by every file: moving a
+    /// server function into a shared file reports its client caller affected,
+    /// though the caller was not edited.
+    #[gtest]
+    fn moving_a_server_function_to_a_shared_file_reports_its_client_caller_affected() {
+        let mut ws = gmod_workspace_with(DiagnosticCode::GmodRealmMismatchHeuristic);
+        let api = "function ServerApi() return 1 end\n";
+        let server_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/sv_api.lua");
+        write(&mut ws, &server_uri, api);
+        let caller_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/client/cl_use.lua");
+        let caller = write(&mut ws, &caller_uri, "local value = ServerApi()\n");
+        let before = shared_diagnostics(&ws, caller);
+
+        let shared_uri = ws.virtual_url_generator.new_uri("lua/autorun/sh_api.lua");
+        let affected = ws.analysis.apply_file_system_changes(vec![
+            (server_uri, Some(String::new())),
+            (shared_uri, Some(api.to_string())),
+        ]);
+
+        expect_that!(shared_diagnostics(&ws, caller), not(eq(&before)));
+        expect_that!(affected, contains(eq(&caller)));
+    }
+
     /// A field check asks whether a table literal is empty only for a numeric
     /// key, so a member added to a global table elsewhere leaves a reader of
     /// one of its named fields unaffected.
