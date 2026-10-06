@@ -11,97 +11,12 @@ use rustc_hash::FxHashMap as HashMap;
 
 use super::*;
 use crate::db_index::GmodRealmInputs;
-use crate::db_index::derivation::CallRoleKey;
-
-/// The workspace call roles and net-helper registry, folded from every file's
-/// helper scan.
-pub(crate) struct GmodCallRoles {
-    pub(super) registry: Arc<HelperRegistry>,
-    pub(super) roles: Arc<AnnotatedGmodGlobalCallRoleMap>,
-}
-
-impl crate::db_index::derivation::DerivedFact for GmodCallRoles {
-    fn fingerprint(&self) -> crate::db_index::derivation::Fingerprint {
-        crate::db_index::derivation::fingerprint_of(&(
-            self.registry.fingerprint(),
-            self.roles.fingerprint(),
-        ))
-    }
-}
-
-impl crate::db_index::derivation::CallRoles for GmodCallRoles {
-    fn entries(&self) -> Vec<CallRoleKey> {
-        let paths = self
-            .roles
-            .roles_by_path
-            .keys()
-            .map(|path| CallRoleKey::Path(SmolStr::new(path)));
-        let globals = self
-            .registry
-            .globals
-            .keys()
-            .cloned()
-            .map(CallRoleKey::Global);
-        let methods = self
-            .registry
-            .methods
-            .keys()
-            .cloned()
-            .map(CallRoleKey::Method);
-        let signatures = self
-            .registry
-            .signatures
-            .keys()
-            .copied()
-            .map(CallRoleKey::Signature);
-        paths
-            .chain(globals)
-            .chain(methods)
-            .chain(signatures)
-            .collect()
-    }
-
-    fn entry_fingerprint(&self, key: &CallRoleKey) -> crate::db_index::derivation::Fingerprint {
-        use crate::db_index::derivation::fingerprint_opt;
-        let site =
-            |(file_id, syntax_id): &(FileId, LuaSyntaxId)| InFiled::new(*file_id, *syntax_id);
-        match key {
-            CallRoleKey::Path(path) if !crate::db_index::derivation::mapping_back() => self
-                .roles
-                .path_fingerprints
-                .get(path.as_str())
-                .copied()
-                .unwrap_or(crate::db_index::derivation::ABSENT),
-            CallRoleKey::Path(path) => fingerprint_opt(self.roles.roles_by_path.get(path.as_str())),
-            CallRoleKey::Global(global_id) => {
-                fingerprint_opt(self.registry.globals.get(global_id).map(site).as_ref())
-            }
-            CallRoleKey::Method(name) => {
-                fingerprint_opt(self.registry.methods.get(name).map(site).as_ref())
-            }
-            CallRoleKey::Signature(signature_id) => fingerprint_opt(
-                self.registry
-                    .signatures
-                    .get(signature_id)
-                    .map(site)
-                    .as_ref(),
-            ),
-        }
-    }
-}
-
-fn empty_call_roles() -> Arc<GmodCallRoles> {
-    Arc::new(GmodCallRoles {
-        registry: Arc::new(HelperRegistry::default()),
-        roles: Arc::new(AnnotatedGmodGlobalCallRoleMap::default()),
-    })
-}
 
 /// The current call roles for a per-file pass, which reads each entry it
 /// looks up, or empty ones before the fold first ran.
 pub(super) fn call_role_entries(db: &DbIndex) -> Arc<GmodCallRoles> {
     db.gmod_call_role_entries::<GmodCallRoles>()
-        .unwrap_or_else(empty_call_roles)
+        .unwrap_or_default()
 }
 
 /// Folds every file's helper scan into the call roles and the net-helper
@@ -110,11 +25,17 @@ pub(crate) fn evaluate_call_roles(db: &mut DbIndex) {
     if !db.get_emmyrc().gmod.enabled {
         return;
     }
-    let (registry, roles) = build_call_roles_and_registry(db);
-    let network = db.get_gmod_network_index_mut();
-    network.set_canonical_ops(roles.canonical_net_ops());
-    network.set_op_names(net_operation_names(&roles));
-    db.set_gmod_call_roles(Arc::new(GmodCallRoles { registry, roles }));
+    let mut roles = db
+        .take_gmod_call_roles::<GmodCallRoles>()
+        .map(Arc::unwrap_or_clone)
+        .unwrap_or_default();
+    let changes = roles.fold(db);
+    if changes.net_ops {
+        let network = db.get_gmod_network_index_mut();
+        network.set_canonical_ops(roles.roles.canonical_net_ops());
+        network.set_op_names(net_operation_names(&roles.roles));
+    }
+    db.update_gmod_call_roles(Arc::new(roles), &changes.keys);
 }
 
 /// The functions that can produce a net operation, directly or through other

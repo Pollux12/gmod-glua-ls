@@ -301,4 +301,38 @@ mod test {
         ws.def_file(texts[branches].0, &texts[branches].1);
         assert_settled_as_cold(&ws, &texts, "branch added");
     }
+
+    fn call_role_digest(ws: &VirtualWorkspace) -> Vec<String> {
+        ws.analysis.compilation.get_db().call_role_digest()
+    }
+
+    #[test]
+    fn call_roles_follow_a_helper_added_and_removed_as_a_cold_build_has_them() {
+        let mut ws = workspace(FILES);
+        let original = FILES
+            .iter()
+            .map(|(path, text)| (*path, text.to_string()))
+            .collect::<Vec<_>>();
+        let mut texts = original.clone();
+        texts[0].1.insert_str(
+            0,
+            "function SendOther(name, ply) SendThing(name, ply) end\n",
+        );
+
+        ws.def_file(texts[0].0, &texts[0].1);
+        let digest = call_role_digest(&ws);
+        assert!(digest.iter().any(|entry| entry.contains("SendOther")));
+        let cold = workspace(
+            &texts
+                .iter()
+                .map(|(path, text)| (*path, text.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(digest, call_role_digest(&cold));
+        assert_settled_as_cold(&ws, &texts, "helper added");
+
+        ws.def_file(original[0].0, &original[0].1);
+        assert_eq!(call_role_digest(&ws), call_role_digest(&workspace(FILES)));
+        assert_settled_as_cold(&ws, &original, "helper removed");
+    }
 }

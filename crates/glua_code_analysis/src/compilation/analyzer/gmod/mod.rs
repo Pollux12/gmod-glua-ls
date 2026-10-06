@@ -49,10 +49,12 @@ use crate::{
 use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 
+mod call_roles;
 mod derive;
 mod network;
 mod numeric_range_population;
 
+use call_roles::GmodCallRoles;
 pub(crate) use derive::{
     apply_pre, compute_pre, evaluate_call_roles, evaluate_class_call_sites, evaluate_load,
     evaluate_load_call_sites, evaluate_net_helper_names, evaluate_network, evaluate_post,
@@ -403,7 +405,7 @@ fn collect_annotated_load_dependency_site(
 /// `Send + Sync` and can be shared across the parallel per-file collection
 /// workers. Each entry is resolved back to a `(LuaBlock, LuaChunk)` on demand by
 /// rebuilding the owning file's red tree from the (Send) green tree in the VFS.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct HelperRegistry {
     /// Function bodies keyed by the language server's canonical global symbol
     /// identity. This is a call-graph lookup, not a net-op recognizer: the body
@@ -445,31 +447,6 @@ impl HelperRegistry {
             )
         });
         self.signatures.get(signature_id)
-    }
-
-    /// A value fingerprint of the registry: its entries in a stable order.
-    fn fingerprint(&self) -> crate::db_index::derivation::Fingerprint {
-        let site =
-            |(file_id, syntax_id): &(FileId, LuaSyntaxId)| InFiled::new(*file_id, *syntax_id);
-        let mut globals = self
-            .globals
-            .iter()
-            .map(|(k, v)| (k, site(v)))
-            .collect::<Vec<_>>();
-        globals.sort_by(|a, b| a.0.get_name().cmp(b.0.get_name()));
-        let mut methods = self
-            .methods
-            .iter()
-            .map(|(k, v)| (k, site(v)))
-            .collect::<Vec<_>>();
-        methods.sort_by(|a, b| a.0.cmp(b.0));
-        let mut signatures = self
-            .signatures
-            .iter()
-            .map(|(k, v)| (k, site(v)))
-            .collect::<Vec<_>>();
-        signatures.sort_by_key(|(id, _)| (id.get_file_id(), id.get_position()));
-        crate::db_index::derivation::fingerprint_of(&(globals, methods, signatures))
     }
 }
 
@@ -591,42 +568,6 @@ fn global_path_mentions(db: &DbIndex, file_id: FileId, root: &LuaChunk) -> Arc<[
     paths.into()
 }
 
-/// Folds every file's helper scan into the call-role map and the net-helper
-/// registry. Files merge in path order, so the file that wins a call path
-/// both define is a property of the source, not of the session.
-fn build_call_roles_and_registry(
-    db: &DbIndex,
-) -> (Arc<HelperRegistry>, Arc<AnnotatedGmodGlobalCallRoleMap>) {
-    let mut scan_files = db.helper_scan_files();
-    let vfs = db.get_vfs();
-    scan_files.sort_by_cached_key(|file_id| {
-        let raw_path = vfs
-            .get_file_path(file_id)
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_default();
-        (
-            crate::vfs::normalize_path_for_ordering(&raw_path),
-            raw_path,
-            file_id.id,
-        )
-    });
-    let mut role_map = AnnotatedGmodGlobalCallRoleMap::default();
-    let mut definitions: Vec<IndexedHelperDefinition> = Vec::new();
-    for file_id in scan_files {
-        let Some(scan) = db.get_helper_scan::<FileHelperScan>(file_id) else {
-            continue;
-        };
-        role_map.merge_from(&scan.role_map);
-        definitions.extend(scan.definitions.iter().cloned());
-    }
-    let registry = HelperRegistryBuilder {
-        definitions,
-        ..Default::default()
-    }
-    .build(db);
-    (Arc::new(registry), Arc::new(role_map))
-}
-
 #[derive(Default)]
 struct HelperRegistryBuilder {
     definitions: Vec<IndexedHelperDefinition>,
@@ -667,57 +608,6 @@ impl HelperRegistryBuilder {
             LuaSyntaxId::from_node(block.syntax()),
             global_id,
         ));
-    }
-
-    fn build(mut self, db: &DbIndex) -> HelperRegistry {
-        let vfs = db.get_vfs();
-        self.definitions
-            .sort_by_cached_key(|(signature_id, file_id, syntax_id, global_id)| {
-                let raw_path = vfs
-                    .get_file_path(file_id)
-                    .map(|path| path.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                (
-                    crate::vfs::normalize_path_for_ordering(&raw_path),
-                    raw_path,
-                    file_id.id,
-                    syntax_id.get_range().start(),
-                    global_id
-                        .as_ref()
-                        .map(|id| id.get_name().to_string())
-                        .unwrap_or_default(),
-                    signature_id.get_position(),
-                )
-            });
-
-        let mut globals: HashMap<GlobalId, (FileId, LuaSyntaxId)> = HashMap::default();
-        let mut methods: HashMap<SmolStr, (FileId, LuaSyntaxId)> = HashMap::default();
-        let mut signatures: HashMap<LuaSignatureId, (FileId, LuaSyntaxId)> = HashMap::default();
-        let mut duplicate_methods = HashSet::default();
-        for (signature_id, file_id, syntax_id, global_id) in self.definitions {
-            let target = (file_id, syntax_id);
-            signatures.entry(signature_id).or_insert(target);
-            let Some(global_id) = global_id else {
-                continue;
-            };
-            globals.entry(global_id.clone()).or_insert(target);
-            if let Some((_, method_name)) = global_id.get_name().rsplit_once('.') {
-                let method_name = SmolStr::new(method_name);
-                if methods.insert(method_name.clone(), target).is_some() {
-                    duplicate_methods.insert(method_name);
-                }
-            }
-        }
-
-        for method_name in duplicate_methods {
-            methods.remove(&method_name);
-        }
-
-        HelperRegistry {
-            globals,
-            methods,
-            signatures,
-        }
     }
 }
 
@@ -7863,33 +7753,6 @@ impl AnnotatedGmodGlobalCallRoleMap {
         FileHelperScan {
             role_map,
             definitions: builder.definitions,
-        }
-    }
-
-    /// Folds another file's fragment in. Files are merged in a fixed order and
-    /// the first file to define a call path wins, so a path that two files both
-    /// define resolves the same way every run — the previous whole-index fold
-    /// took the signature index's `HashMap` order, which varies per process.
-    fn merge_from(&mut self, other: &Self) {
-        for (path, roles) in &other.roles_by_path {
-            if !self.roles_by_path.contains_key(path) {
-                self.roles_by_path.insert(path.clone(), roles.clone());
-                if let Some(fingerprint) = other.path_fingerprints.get(path) {
-                    self.path_fingerprints.insert(path.clone(), *fingerprint);
-                }
-            }
-        }
-        self.environment_role_source_files
-            .extend(other.environment_role_source_files.iter().copied());
-        for (key, candidate) in &other.canonical_net_ops {
-            self.canonical_net_ops
-                .entry(key.clone())
-                .and_modify(|current| {
-                    if candidate.0 < current.0 {
-                        *current = candidate.clone();
-                    }
-                })
-                .or_insert_with(|| candidate.clone());
         }
     }
 

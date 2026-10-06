@@ -340,6 +340,18 @@ impl DbIndex {
         }
     }
 
+    /// Every call-role entry with its fingerprint, sorted: for comparing two
+    /// analyses of the same workspace.
+    pub fn call_role_digest(&self) -> Vec<String> {
+        let mut entries = self
+            .call_role_fingerprints
+            .iter()
+            .map(|(key, fingerprint)| format!("{key:?} = {fingerprint}"))
+            .collect::<Vec<_>>();
+        entries.sort_unstable();
+        entries
+    }
+
     /// Every stored per-file fact by kind, with its fingerprint, sorted: for
     /// comparing two analyses of the same workspace.
     pub fn stored_fact_fingerprints(&self) -> Vec<(&'static str, FileId, u64)> {
@@ -381,28 +393,38 @@ impl DbIndex {
         roles.downcast::<T>().ok()
     }
 
-    /// Stores the call roles, writing each entry that moved.
-    pub(crate) fn set_gmod_call_roles<T: derivation::CallRoles>(&mut self, roles: Arc<T>) {
+    /// The call roles taken out of the index, for the fold to update in place
+    /// and store again with [`Self::update_gmod_call_roles`].
+    pub(crate) fn take_gmod_call_roles<T: derivation::CallRoles>(&mut self) -> Option<Arc<T>> {
+        let (roles, _) = self.gmod_call_roles.take()?;
+        let roles: Arc<dyn std::any::Any + Send + Sync> = roles;
+        roles.downcast::<T>().ok()
+    }
+
+    /// Stores the call roles, writing each of the `touched` entries that moved.
+    pub(crate) fn update_gmod_call_roles<T: derivation::CallRoles>(
+        &mut self,
+        roles: Arc<T>,
+        touched: &[derivation::CallRoleKey],
+    ) {
         derivation::note_write(|| derivation::FactKey::HelperRegistry);
-        let entries = roles
-            .entries()
-            .into_iter()
-            .map(|key| {
-                let fingerprint = roles.entry_fingerprint(&key);
-                (key, fingerprint)
-            })
-            .collect::<FxHashMap<_, _>>();
-        for (key, fingerprint) in &entries {
-            if self.call_role_fingerprints.get(key) != Some(fingerprint) {
-                derivation::note_write(|| derivation::FactKey::CallRole(key.clone()));
+        for key in touched {
+            let fingerprint = roles.entry_fingerprint(key);
+            let stored = self
+                .call_role_fingerprints
+                .get(key)
+                .copied()
+                .unwrap_or(derivation::ABSENT);
+            if fingerprint == stored {
+                continue;
+            }
+            derivation::note_write(|| derivation::FactKey::CallRole(key.clone()));
+            if fingerprint == derivation::ABSENT {
+                self.call_role_fingerprints.remove(key);
+            } else {
+                self.call_role_fingerprints.insert(key.clone(), fingerprint);
             }
         }
-        for key in self.call_role_fingerprints.keys() {
-            if !entries.contains_key(key) {
-                derivation::note_write(|| derivation::FactKey::CallRole(key.clone()));
-            }
-        }
-        self.call_role_fingerprints = entries.into();
         let fingerprint = roles.fingerprint().max(1);
         self.gmod_call_roles = Some((roles, fingerprint));
     }
