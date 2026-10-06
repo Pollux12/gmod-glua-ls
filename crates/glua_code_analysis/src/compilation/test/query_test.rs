@@ -162,6 +162,7 @@ end
     /// running again once the query moves.
     #[test]
     fn a_reader_demanding_a_stale_query_computes_it_afresh() {
+        let _serial = crate::compilation::analyzer::serial_engine();
         let mut ws = workspace();
         ws.analysis.compilation.set_schedule(Schedule::Deferred);
         ws.def_file(

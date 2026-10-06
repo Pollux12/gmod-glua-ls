@@ -200,6 +200,34 @@ impl Queue {
         self.order.first().map(|(rank, ..)| *rank)
     }
 
+    /// Whether the entries at `rank` belong to more than one file besides
+    /// the workspace's.
+    fn spans_files(&self, rank: u8) -> bool {
+        let mut first = None;
+        for reason in [Reason::Changed, Reason::Read] {
+            let mut from = 0;
+            while let Some(&(entry_rank, entry_reason, file_key, id)) = self
+                .order
+                .range((rank, reason, from, DerivationId::floor())..)
+                .next()
+            {
+                if entry_rank != rank || entry_reason != reason {
+                    break;
+                }
+                if id.file_id != crate::FileId::VIRTUAL
+                    && *first.get_or_insert(id.file_id) != id.file_id
+                {
+                    return true;
+                }
+                let Some(next) = file_key.checked_add(1) else {
+                    break;
+                };
+                from = next;
+            }
+        }
+        false
+    }
+
     /// The entries queued at `rank` with reason `reason`, in order.
     fn at(
         &self,
@@ -1011,9 +1039,11 @@ impl Engine {
                 return false;
             }
             if self.superstep != SuperstepMode::Off
-                && self.focus.is_empty()
                 && self.loop_focus.is_empty()
-                && !self.worklist.is_empty()
+                && self
+                    .worklist
+                    .first_rank()
+                    .is_some_and(|rank| self.worklist.spans_files(rank))
             {
                 if self.superstep == SuperstepMode::Workers {
                     if !self.serial_stage {
@@ -3554,10 +3584,10 @@ enum SuperstepMode {
     Workers,
 }
 
-/// `GLUALS_SUPERSTEP`: unset or `workers` runs the work outside a focus a
-/// superstep at a time with the tasks on worker threads, `serial` (or any
-/// other value but `off`) with the tasks one after another, and `off` on the
-/// serial engine.
+/// `GLUALS_SUPERSTEP`: unset or `workers` runs each rank whose work spans
+/// files a superstep at a time with the tasks on worker threads, `serial` (or
+/// any other value but `off`) with the tasks one after another, and `off` on
+/// the serial engine.
 fn superstep_mode() -> SuperstepMode {
     static MODE: std::sync::OnceLock<SuperstepMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("GLUALS_SUPERSTEP") {
@@ -3964,6 +3994,7 @@ print(entry.extra{index}, entry.damage)"
     /// fallbacks, which no other member's reset touches.
     #[test]
     fn local_fallbacks_reading_their_own_reset_publish_from_workers_and_match_cold() {
+        let _serial = serial_engine();
         let classes = r#"
             ---@class Entity
             ---@class Radio: Entity
