@@ -365,7 +365,7 @@ struct DerivSlot {
 pub struct KeyTable {
     /// Each live slot, found by its key's hash: the key itself is kept only
     /// in its slot.
-    key_slots: HashTable<KeyIdx>,
+    key_slots: HashTable<FiledKey>,
     keys: Paged<KeySlot>,
     free_keys: Vec<KeyIdx>,
     retirement: Option<Arc<AtomicBool>>,
@@ -387,6 +387,27 @@ pub struct KeyTable {
     /// The live slots of the keys naming each file's positions, built by the
     /// first edit that renames keys and kept from then on.
     positional: Option<FxHashMap<FileId, FxHashSet<KeyIdx>>>,
+}
+
+/// A live slot in [`KeyTable::key_slots`], with the low half of its key's
+/// hash: probing and growing the index compare and rehash without reading
+/// the slot.
+#[derive(Debug, Clone, Copy)]
+struct FiledKey {
+    slot: KeyIdx,
+    hash: u32,
+}
+
+impl FiledKey {
+    fn half(key: &HashedKey) -> u32 {
+        key.hash as u32
+    }
+
+    /// The hash the index files `half` under: its low bits are `half`'s, and
+    /// its high bits mix all of it.
+    fn index_hash(half: u32) -> u64 {
+        u64::from(half).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    }
 }
 
 /// Whether what a memo read still holds; see [`KeyTable::written_since`].
@@ -513,16 +534,21 @@ impl KeyTable {
 
     /// The slot `key` is interned to.
     pub(super) fn find(&self, key: &HashedKey) -> Option<KeyIdx> {
+        let half = FiledKey::half(key);
         self.key_slots
-            .find(key.hash, |slot| {
-                self.keys[*slot as usize].key.as_ref() == Some(key)
+            .find(FiledKey::index_hash(half), |filed| {
+                filed.hash == half && self.keys[filed.slot as usize].key.as_ref() == Some(key)
             })
-            .copied()
+            .map(|filed| filed.slot)
     }
 
     /// Unfiles the live `slot`, whose key is `key`.
     fn unfile(&mut self, key: &HashedKey, slot: KeyIdx) {
-        if let Ok(entry) = self.key_slots.find_entry(key.hash, |filed| *filed == slot) {
+        let index_hash = FiledKey::index_hash(FiledKey::half(key));
+        if let Ok(entry) = self
+            .key_slots
+            .find_entry(index_hash, |filed| filed.slot == slot)
+        {
             entry.remove();
         }
         if let Some(positional) = &mut self.positional {
@@ -581,7 +607,7 @@ impl KeyTable {
                 .expect("fewer than 2^32 fact keys"),
         };
         let base = key.base();
-        let hash = key.hash;
+        let half = FiledKey::half(&key);
         let entry = &mut self.keys[slot as usize];
         entry.is_query = matches!(
             key.key(),
@@ -598,14 +624,11 @@ impl KeyTable {
         entry
             .current_generation
             .store(NO_GENERATION, Ordering::Relaxed);
-        let keys = &self.keys;
-        self.key_slots.insert_unique(hash, slot, |filed| {
-            keys[*filed as usize]
-                .key
-                .as_ref()
-                .expect("a filed key slot is live")
-                .hash
-        });
+        self.key_slots.insert_unique(
+            FiledKey::index_hash(half),
+            FiledKey { slot, hash: half },
+            |filed| FiledKey::index_hash(filed.hash),
+        );
         let base = base.map(|base| {
             let base = self.intern(HashedKey::new(base), now);
             self.derived.entry(base).or_default().slots.push(slot);
@@ -974,7 +997,7 @@ impl ReaderGraph {
             .fold((0, 0), |(reads, outputs), record| {
                 (reads + record.reads.len(), outputs + record.outputs.len())
             });
-        let key_map = hash_table_bytes(table.key_slots.capacity(), size_of::<KeyIdx>());
+        let key_map = hash_table_bytes(table.key_slots.capacity(), size_of::<FiledKey>());
         let key_slots = table.keys.capacity() * size_of::<KeySlot>();
         let records = (reads + outputs) * size_of::<KeyIdx>();
         let derivation_maps = hash_table_bytes(
