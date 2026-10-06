@@ -6,6 +6,7 @@ mod cast_type_mismatch_test;
 mod check_return_count_test;
 mod circle_doc_class_test;
 mod code_style;
+mod code_style_check_test;
 mod determinism_test;
 mod disable_line_test;
 mod duplicate_field_test;

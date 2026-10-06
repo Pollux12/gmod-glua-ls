@@ -225,19 +225,19 @@ impl<'a> SemanticBuilder<'a> {
         self.push(token, ty)
     }
 
-    pub fn push_at_position(
+    pub fn push_range_force(
         &mut self,
-        position: TextSize,
-        length: u32,
+        range: TextRange,
         ty: SemanticTokenType,
         modifiers: Option<SemanticTokenModifier>,
     ) -> Option<()> {
-        let lsp_position = self.document.to_lsp_position(position)?;
+        let lsp_position = self.document.to_lsp_position(range.start())?;
         let start_line = lsp_position.line;
         let start_col = lsp_position.character;
+        let length = self.document.get_text_slice(range).encode_utf16().count() as u32;
 
         self.data.insert(
-            position,
+            range.start(),
             SemanticTokenData::Basic(BasicSemanticTokenData {
                 line: start_line,
                 col: start_col,

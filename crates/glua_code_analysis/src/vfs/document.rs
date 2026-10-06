@@ -69,8 +69,16 @@ impl<'a> LuaDocument<'a> {
         self.line_index.get_col(offset, self.text)
     }
 
-    pub fn get_offset(&self, line: usize, col: usize) -> Option<TextSize> {
+    pub fn get_offset(&self, line: usize, col: usize) -> TextSize {
         self.line_index.get_offset(line, col, self.text)
+    }
+
+    pub fn get_offset_by_char_col(&self, line: usize, col: usize) -> TextSize {
+        self.line_index.get_offset_by_char_col(line, col, self.text)
+    }
+
+    pub fn to_offset(&self, position: lsp_types::Position) -> TextSize {
+        self.get_offset(position.line as usize, position.character as usize)
     }
 
     pub fn get_col_offset_at_line(&self, line: usize, col: usize) -> Option<TextSize> {
@@ -122,9 +130,9 @@ impl<'a> LuaDocument<'a> {
     }
 
     pub fn to_rowan_range(&self, range: lsp_types::Range) -> Option<TextRange> {
-        let start = self.get_offset(range.start.line as usize, range.start.character as usize)?;
-        let end = self.get_offset(range.end.line as usize, range.end.character as usize)?;
-        Some(TextRange::new(start, end))
+        let start = self.to_offset(range.start);
+        let end = self.to_offset(range.end);
+        (start <= end).then(|| TextRange::new(start, end))
     }
 
     pub fn get_document_lsp_range(&self) -> lsp_types::Range {

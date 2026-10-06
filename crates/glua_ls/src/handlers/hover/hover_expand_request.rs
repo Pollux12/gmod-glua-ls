@@ -81,10 +81,7 @@ fn compute_max_level_for_type(semantic_model: &SemanticModel, typ: &LuaType) -> 
 /// Returns non-zero for rendered table-like hovers that can show more members.
 pub fn compute_max_level_at_position(semantic_model: &SemanticModel, position: Position) -> u32 {
     let document = semantic_model.get_document();
-    let Some(offset) = document.get_offset(position.line as usize, position.character as usize)
-    else {
-        return 0;
-    };
+    let offset = document.to_offset(position);
     let root = semantic_model.get_root();
     let token = match root.syntax().token_at_offset(offset) {
         TokenAtOffset::Single(t) => t,

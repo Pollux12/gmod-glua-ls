@@ -54,6 +54,42 @@ mod tests {
         Ok(())
     }
 
+    /// The request position and the returned edit ranges count UTF-16 code
+    /// units, so a name after an emoji sits one column further right than its
+    /// character count.
+    #[gtest]
+    fn rename_after_an_emoji_uses_utf16_columns() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let file_id = ws.def("local s = \"\u{1F642}\" local val = 1\nprint(val)\n");
+        let result = rename(
+            &ws.analysis,
+            file_id,
+            Position::new(0, 22),
+            "renamed".to_string(),
+        )
+        .or_fail()?;
+        let mut edits = result
+            .changes
+            .or_fail()?
+            .into_values()
+            .flatten()
+            .collect::<Vec<_>>();
+        edits.sort_by_key(|edit| edit.range.start);
+        verify_eq!(
+            edits,
+            vec![
+                TextEdit {
+                    range: Range::new(Position::new(0, 21), Position::new(0, 24)),
+                    new_text: "renamed".to_string(),
+                },
+                TextEdit {
+                    range: Range::new(Position::new(1, 6), Position::new(1, 9)),
+                    new_text: "renamed".to_string(),
+                },
+            ]
+        )
+    }
+
     #[gtest]
     fn test_int_key() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();

@@ -13,7 +13,7 @@ pub fn build_need_check_nil(
     _data: &Option<serde_json::Value>,
 ) -> Option<()> {
     let document = semantic_model.get_document();
-    let offset = document.get_offset(range.end.line as usize, range.end.character as usize)?;
+    let offset = document.to_offset(range.end);
     let root = semantic_model.get_root();
     let token = match root.syntax().token_at_offset(offset) {
         TokenAtOffset::Single(token) => token,

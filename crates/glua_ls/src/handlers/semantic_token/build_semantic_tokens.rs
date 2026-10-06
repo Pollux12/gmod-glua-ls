@@ -544,11 +544,8 @@ fn build_node_semantic_token(
                         );
                     }
                     LuaExpr::IndexExpr(index_expr) => {
-                        let position = index_expr.syntax().text_range().start();
-                        let len = index_expr.syntax().text_range().len();
-                        builder.push_at_position(
-                            position,
-                            len.into(),
+                        builder.push_range_force(
+                            index_expr.syntax().text_range(),
                             SemanticTokenType::VARIABLE,
                             None,
                         );
@@ -1176,9 +1173,8 @@ fn build_node_semantic_token(
             // 如果文档的开始是 #, 则需要将其渲染为注释而不是文档
             if let Some(start_token) = description.tokens::<LuaGeneralToken>().next() {
                 if start_token.get_text().starts_with('#') {
-                    builder.push_at_position(
-                        start_token.get_range().start(),
-                        1,
+                    builder.push_range_force(
+                        TextRange::at(start_token.get_range().start(), 1.into()),
                         SemanticTokenType::COMMENT,
                         None,
                     );

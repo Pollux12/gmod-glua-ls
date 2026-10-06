@@ -59,7 +59,7 @@ impl CommandSpec for AutoRequireCommand {
             }
         );
         let document = semantic_model.get_document();
-        let offset = document.get_offset(position.line as usize, position.character as usize)?;
+        let offset = document.to_offset(position);
         let root_block = semantic_model.get_root().get_block()?;
         let mut last_require_stat: Option<LuaStat> = None;
         for stat in root_block.get_stats() {

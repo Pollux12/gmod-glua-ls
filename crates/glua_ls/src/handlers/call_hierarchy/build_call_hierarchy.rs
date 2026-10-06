@@ -146,7 +146,7 @@ fn build_incoming_hierarchy_item(
     let tree = db.get_vfs().get_syntax_tree(&file_id)?;
     let root_chunk = tree.get_chunk_node();
     let document = db.get_vfs().get_document(&file_id)?;
-    let pos = document.get_offset(range.start.line as usize, range.start.character as usize)?;
+    let pos = document.to_offset(range.start);
     let token = match root_chunk.syntax().token_at_offset(pos) {
         TokenAtOffset::Single(token) => token,
         TokenAtOffset::Between(left, right) => {

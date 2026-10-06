@@ -109,6 +109,33 @@ mod test {
     }
 
     #[test]
+    fn undefined_global_range_after_an_emoji_is_in_utf16_units() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedGlobal);
+        let file_id = ws.def_file(
+            "test.lua",
+            "local s = \"h\u{e9}llo \u{1F642}\" missing_global()\n",
+        );
+        let ranges = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|diagnostic| diagnostic.range)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ranges,
+            vec![lsp_types::Range::new(
+                lsp_types::Position::new(0, 21),
+                lsp_types::Position::new(0, 35),
+            )]
+        );
+    }
+
+    #[test]
     fn test_issue_250() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(ws.check_code_for(

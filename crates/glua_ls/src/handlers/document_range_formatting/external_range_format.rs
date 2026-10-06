@@ -8,9 +8,8 @@ pub async fn external_tool_range_format(
     file_path: &str,
     options: FormattingOptions,
 ) -> Option<RangeFormatResult> {
-    let start_offset =
-        document.get_offset(range.start.line as usize, range.start.character as usize)?;
-    let end_offset = document.get_offset(range.end.line as usize, range.end.character as usize)?;
+    let start_offset = document.to_offset(range.start);
+    let end_offset = document.to_offset(range.end);
 
     let formatting_range = FormattingRange {
         start_offset,

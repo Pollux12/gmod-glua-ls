@@ -4,8 +4,8 @@ mod text_document_handler;
 mod watched_file_handler;
 
 use lsp_types::{
-    ClientCapabilities, SaveOptions, ServerCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncSaveOptions,
+    ClientCapabilities, PositionEncodingKind, SaveOptions, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncSaveOptions,
 };
 pub use register_file_watch::register_files_watch;
 pub use set_trace::on_set_trace;
@@ -21,6 +21,7 @@ pub struct TextDocumentCapabilities;
 
 impl RegisterCapabilities for TextDocumentCapabilities {
     fn register_capabilities(server_capabilities: &mut ServerCapabilities, _: &ClientCapabilities) {
+        server_capabilities.position_encoding = Some(PositionEncodingKind::UTF16);
         server_capabilities.text_document_sync = Some(TextDocumentSyncCapability::Options(
             lsp_types::TextDocumentSyncOptions {
                 open_close: Some(true),

@@ -77,8 +77,7 @@ pub fn process_inject_lang_string_token(
     }
 
     for quote_range in code_block_info.quote_ranges {
-        let len = u32::from(quote_range.end() - quote_range.start());
-        builder.push_at_position(quote_range.start(), len, SemanticTokenType::STRING, None);
+        builder.push_range_force(quote_range, SemanticTokenType::STRING, None);
     }
     builder.add_special_string_range(str_token.get_range());
 

@@ -226,7 +226,7 @@ impl ProviderVirtualWorkspace {
                 line += 1;
                 column = 0;
             } else {
-                column += 1;
+                column += c.len_utf16();
             }
         }
 

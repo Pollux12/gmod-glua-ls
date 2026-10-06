@@ -73,7 +73,7 @@ pub fn build_disable_next_line_changes(
 ) -> Option<HashMap<Uri, Vec<TextEdit>>> {
     let emmyrc = semantic_model.get_emmyrc();
     let document = semantic_model.get_document();
-    let offset = document.get_offset(start.line as usize, start.character as usize)?;
+    let offset = document.to_offset(start);
     let root = semantic_model.get_root();
     if offset >= root.get_range().end() {
         return None;
