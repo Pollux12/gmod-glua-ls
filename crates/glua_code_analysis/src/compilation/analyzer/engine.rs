@@ -1011,12 +1011,12 @@ impl Engine {
                 return false;
             }
             if self.superstep != SuperstepMode::Off
-                && matches!(slice, Slice::Whole)
+                && self.focus.is_empty()
                 && self.loop_focus.is_empty()
                 && !self.worklist.is_empty()
             {
                 if self.superstep == SuperstepMode::Workers {
-                    if self.edits.is_empty() && self.rebuilt.is_empty() && !self.serial_stage {
+                    if !self.serial_stage {
                         self.superstep_on_workers(db, recipe, slice);
                         continue;
                     }
@@ -3554,9 +3554,10 @@ enum SuperstepMode {
     Workers,
 }
 
-/// `GLUALS_SUPERSTEP`: unset or `workers` runs cold builds a superstep at a
-/// time with the tasks on worker threads, `serial` (or any other value but
-/// `off`) with the tasks one after another, and `off` on the serial engine.
+/// `GLUALS_SUPERSTEP`: unset or `workers` runs the work outside a focus a
+/// superstep at a time with the tasks on worker threads, `serial` (or any
+/// other value but `off`) with the tasks one after another, and `off` on the
+/// serial engine.
 fn superstep_mode() -> SuperstepMode {
     static MODE: std::sync::OnceLock<SuperstepMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("GLUALS_SUPERSTEP") {
@@ -4461,6 +4462,7 @@ print(tuned{index})"
     #[test]
     #[should_panic(expected = "which another member of its batch moved")]
     fn a_batch_member_computing_from_what_another_applies_is_caught() {
+        let _serial = serial_engine();
         let mut ws = VirtualWorkspace::new();
         let db = ws.get_db_mut();
         let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
@@ -4536,6 +4538,7 @@ print(tuned{index})"
     }
 
     fn slot_round_counts(batch: bool) -> (Option<LuaType>, usize) {
+        let _serial = serial_engine();
         let mut ws = VirtualWorkspace::new();
         let db = ws.get_db_mut();
         let recipe = SlotContributors {
@@ -4655,6 +4658,7 @@ print(tuned{index})"
     }
     #[test]
     fn member_round_notifications_are_flushed_before_a_slice_returns() {
+        let _serial = serial_engine();
         let mut ws = VirtualWorkspace::new();
         let db = ws.get_db_mut();
         let recipe = SlotContributors {
