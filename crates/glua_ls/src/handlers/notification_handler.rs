@@ -71,18 +71,22 @@ pub async fn on_notification_handler(
             let uri = params.text_document.uri.clone();
             let snapshot = server_context.snapshot();
             snapshot.note_document_seen_version(&uri, params.text_document.version);
-            // Exempted requests wait for fresh data instead of being
-            // cancelled: a cancelled executeCommand drops the user's command.
+            // Only this document's requests are superseded. Exempted ones
+            // wait for fresh data instead of being cancelled: a cancelled
+            // executeCommand drops the user's command.
             server_context
-                .cancel_all_requests_except(&[
-                    "textDocument/codeLens",
-                    "textDocument/inlayHint",
-                    "workspace/executeCommand",
-                ])
+                .cancel_requests_for_uri(
+                    &uri,
+                    &[
+                        "textDocument/codeLens",
+                        "textDocument/inlayHint",
+                        "workspace/executeCommand",
+                    ],
+                )
                 .await;
-            // Mark analysis dirty BEFORE handing the update to the coalescer so
-            // follow-up requests see the stale state immediately.
-            let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
+            // Mark the document dirty BEFORE handing the update to the
+            // coalescer so follow-up requests see the stale state immediately.
+            let in_flight = snapshot.debounced_analysis_arc().begin_document_change(uri);
             // Profiling: capture the notification receipt (version + seq +
             // clock) so the coalescer worker can report `coalescer_wait_ms`
             // and `total_ms` spanning notification through schedule. `None`
@@ -109,7 +113,7 @@ pub async fn on_notification_handler(
                 let mut workspace = snapshot.workspace_manager().write().await;
                 workspace.current_open_files.insert(uri.clone());
             }
-            server_context.cancel_text_requests_for_uri(&uri).await;
+            server_context.cancel_requests_for_uri(&uri, &[]).await;
             let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
             let task_snapshot = snapshot.clone();
             tokio::spawn(async move {
@@ -139,7 +143,7 @@ pub async fn on_notification_handler(
                 let mut workspace = snapshot.workspace_manager().write().await;
                 workspace.current_open_files.remove(&uri);
             }
-            server_context.cancel_text_requests_for_uri(&uri).await;
+            server_context.cancel_requests_for_uri(&uri, &[]).await;
             let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
             let task_snapshot = snapshot.clone();
             tokio::spawn(async move {

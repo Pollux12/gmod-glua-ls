@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use build_annotator::build_annotators;
 pub use emmy_annotator_request::*;
-use lsp_types::Uri;
+use lsp_types::{Uri, request::Request};
 use tokio_util::sync::CancellationToken;
 
 use crate::context::{Freshness, ServerContextSnapshot};
@@ -23,10 +23,10 @@ pub async fn on_emmy_annotator_handler(
 
     // Wait until this document's entries match its text so we compute
     // against a consistent tree and index. Cancel-aware: bails out when a
-    // new didChange fires cancel_all_requests().
+    // new didChange to this document cancels its requests.
     if context
         .debounced_analysis()
-        .wait_until_file_fresh_for(&cancel_token, "gluals/emmyAnnotator", &uri)
+        .wait_until_file_fresh_for(&cancel_token, EmmyAnnotatorRequest::METHOD, &uri)
         .await
         != Freshness::Fresh
     {

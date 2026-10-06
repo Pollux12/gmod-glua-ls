@@ -194,6 +194,14 @@ impl DiagnosticStore {
         }
     }
 
+    /// Whether any of `file_ids` outside `except` is open in the client.
+    pub fn any_open(&self, file_ids: &[FileId], except: &[FileId]) -> bool {
+        let state = self.state();
+        file_ids
+            .iter()
+            .any(|file_id| !except.contains(file_id) && state.open.contains(file_id))
+    }
+
     /// Marks `file_ids` dirty; those in `edited` are computed first, then
     /// the open ones.
     pub fn invalidate(&self, file_ids: impl IntoIterator<Item = FileId>, edited: &[FileId]) {

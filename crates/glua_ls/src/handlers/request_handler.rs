@@ -88,6 +88,7 @@ fn extract_uri_from_value(value: &serde_json::Value) -> Option<Uri> {
             .and_then(|text_document| text_document.get("uri")),
         value.get("item").and_then(|item| item.get("uri")),
         value.get("data").and_then(|data| data.get("uri")),
+        value.get("uri"),
     ]
     .into_iter()
     .flatten()
@@ -476,6 +477,43 @@ mod tests {
         })
     }
 
+    /// Only what the user waits on while typing ends an edit's debounce, and
+    /// the policy names each by its real method.
+    #[test]
+    fn only_interactive_requests_expedite_the_debounce() {
+        use super::{
+            CodeLensRequest, Completion, DocumentSymbolRequest, EmmyAnnotatorRequest,
+            FoldingRangeRequest, GluaHoverExpandRequest, GotoDefinition, HoverRequest,
+            InlayHintRequest, LspRequest, ResolveCompletionItem, SemanticTokensFullRequest,
+            SignatureHelpRequest,
+        };
+        use crate::context::expedites_debounce;
+
+        for method in [
+            Completion::METHOD,
+            ResolveCompletionItem::METHOD,
+            HoverRequest::METHOD,
+            GluaHoverExpandRequest::METHOD,
+            SignatureHelpRequest::METHOD,
+            GotoDefinition::METHOD,
+            SemanticTokensFullRequest::METHOD,
+        ] {
+            assert!(expedites_debounce(method), "{method} should expedite");
+        }
+        for method in [
+            FoldingRangeRequest::METHOD,
+            DocumentSymbolRequest::METHOD,
+            CodeLensRequest::METHOD,
+            InlayHintRequest::METHOD,
+            EmmyAnnotatorRequest::METHOD,
+        ] {
+            assert!(
+                !expedites_debounce(method),
+                "{method} should wait passively"
+            );
+        }
+    }
+
     #[test]
     fn extracts_text_document_uri() {
         let uri = Uri::from_str("file:///document.lua").expect("uri should parse");
@@ -498,6 +536,16 @@ mod tests {
                 }
             }
         });
+
+        assert_eq!(extract_uri_from_value(&value), Some(uri));
+    }
+
+    /// The custom document requests (annotator, gutter, syntax tree) carry
+    /// their document as a top-level `uri`, which an edit to it must cancel.
+    #[test]
+    fn extracts_top_level_uri() {
+        let uri = Uri::from_str("file:///annotated.lua").expect("uri should parse");
+        let value = json!({ "uri": uri.clone() });
 
         assert_eq!(extract_uri_from_value(&value), Some(uri));
     }

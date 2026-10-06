@@ -11,6 +11,8 @@ mod workspace_manager;
 
 pub use client::ClientProxy;
 pub use client_id::{ClientId, get_client_id};
+#[cfg(test)]
+pub(crate) use debounced_analysis::expedites_debounce;
 pub use debounced_analysis::{DebouncedAnalysis, Freshness, InFlightChangeGuard};
 pub use diagnostic_store::DiagnosticStore;
 pub use did_change_coalescer::DidChangeCoalescer;
@@ -34,7 +36,8 @@ use crate::context::snapshot::ServerContextInner;
 // 4. workspace_manager(read)  5. workspace_manager(write)  6. analysis(write)
 // Within `DebouncedAnalysis`: pending_files before reindexing_files, and both
 // are released before anything above is taken.
-// Leaves: document_versions and the diagnostic store's state — synchronous
+// Leaves: document_versions, the diagnostic store's state and
+// `DebouncedAnalysis::in_flight_documents` — synchronous
 // locks, so they can never be held across an `.await`. Never upgrade read→write in place; avoid holding any lock across
 // `.await`. Atomics are exempt.
 
@@ -340,28 +343,16 @@ impl ServerContext {
         }
     }
 
-    pub async fn cancel_all_requests_except(&self, excluded_methods: &[&str]) {
+    /// Cancels the in-flight requests aimed at `uri`, except those of
+    /// `excluded_methods`.
+    ///
+    /// Request URIs and `uri` both come from the client's own params, so they
+    /// are spelled alike and compare as they are.
+    pub async fn cancel_requests_for_uri(&self, uri: &Uri, excluded_methods: &[&str]) {
         let requests = self.requests.lock().await;
         for request in requests.values() {
-            if excluded_methods
-                .iter()
-                .any(|method| request.metadata.method == *method)
-            {
-                continue;
-            }
-
-            request.cancel_token.cancel();
-        }
-    }
-
-    pub async fn cancel_text_requests_for_uri(&self, uri: &Uri) {
-        let requests = self.requests.lock().await;
-        for request in requests.values() {
-            if request
-                .metadata
-                .uri
-                .as_ref()
-                .is_some_and(|request_uri| request_uri == uri)
+            if request.metadata.uri.as_ref() == Some(uri)
+                && !excluded_methods.contains(&request.metadata.method.as_str())
             {
                 request.cancel_token.cancel();
             }
@@ -388,8 +379,9 @@ mod tests {
     };
     use googletest::prelude::*;
     use lsp_server::{ErrorCode, RequestId, Response};
-    use lsp_types::ClientCapabilities;
+    use lsp_types::{ClientCapabilities, Uri};
     use serde_json::json;
+    use std::str::FromStr;
     use std::time::Duration;
 
     #[test]
@@ -476,80 +468,63 @@ mod tests {
         Ok(())
     }
 
+    /// A document change supersedes only that document's requests: other
+    /// documents' requests, and those aimed at none, keep running, as do the
+    /// exempted methods.
     #[gtest]
-    fn cancel_all_requests_except_preserves_inlay_and_code_lens_requests() -> Result<()> {
+    fn cancelling_a_documents_requests_leaves_other_documents_alone() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let (conn, _peer) = lsp_server::Connection::memory();
             let context = ServerContext::new(conn, ClientCapabilities::default());
+            let edited = Uri::from_str("file:///workspace/edited.lua").expect("uri should parse");
+            let other = Uri::from_str("file:///workspace/other.lua").expect("uri should parse");
 
-            let inlay_id: RequestId = 1.into();
-            context
-                .task(
-                    inlay_id.clone(),
-                    RequestTaskMetadata::new("textDocument/inlayHint", None),
-                    |_cancel_token| async move {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        Some(Response::new_ok(inlay_id, json!([{"label": ": number"}])))
-                    },
-                )
-                .await;
-
-            let hover_id: RequestId = 2.into();
-            context
-                .task(
-                    hover_id.clone(),
-                    RequestTaskMetadata::new("textDocument/hover", None),
-                    |_cancel_token| async move {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        Some(Response::new_ok(hover_id, serde_json::Value::Null))
-                    },
-                )
-                .await;
-
-            let code_lens_id: RequestId = 3.into();
-            context
-                .task(
-                    code_lens_id.clone(),
-                    RequestTaskMetadata::new("textDocument/codeLens", None),
-                    |_cancel_token| async move {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        Some(Response::new_ok(code_lens_id, json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "command": {"title": "test", "command": "test"}}])))
-                    },
-                )
-                .await;
-
-            let (inlay_token, code_lens_token, hover_token) = {
+            let requests = [
+                ("textDocument/inlayHint", Some(edited.clone())),
+                ("textDocument/codeLens", Some(edited.clone())),
+                ("textDocument/hover", Some(edited.clone())),
+                ("textDocument/hover", Some(other)),
+                ("workspace/symbol", None),
+            ];
+            for (id, (method, uri)) in requests.into_iter().enumerate() {
+                let request_id = RequestId::from(id as i32);
+                context
+                    .task(
+                        request_id.clone(),
+                        RequestTaskMetadata::new(method, uri),
+                        |_cancel_token| async move {
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            Some(Response::new_ok(request_id, serde_json::Value::Null))
+                        },
+                    )
+                    .await;
+            }
+            let tokens = {
                 let requests = context.requests.lock().await;
-                let inlay = requests
-                    .get(&RequestId::from(1))
-                    .expect("inlay request should exist")
-                    .cancel_token
-                    .clone();
-                let code_lens = requests
-                    .get(&RequestId::from(3))
-                    .expect("code lens request should exist")
-                    .cancel_token
-                    .clone();
-                let hover = requests
-                    .get(&RequestId::from(2))
-                    .expect("hover request should exist")
-                    .cancel_token
-                    .clone();
-                (inlay, code_lens, hover)
+                (0..5)
+                    .map(|id| {
+                        requests
+                            .get(&RequestId::from(id))
+                            .expect("request should be in flight")
+                            .cancel_token
+                            .clone()
+                    })
+                    .collect::<Vec<_>>()
             };
 
             context
-                .cancel_all_requests_except(&[
-                    "textDocument/inlayHint",
-                    "textDocument/codeLens",
-                ])
+                .cancel_requests_for_uri(
+                    &edited,
+                    &["textDocument/inlayHint", "textDocument/codeLens"],
+                )
                 .await;
 
-            verify_that!(inlay_token.is_cancelled(), eq(false))?;
-            verify_that!(code_lens_token.is_cancelled(), eq(false))?;
-            verify_that!(hover_token.is_cancelled(), eq(true))?;
-            Ok(())
+            let cancelled = tokens
+                .iter()
+                .map(|token| token.is_cancelled())
+                .collect::<Vec<_>>();
+            verify_that!(cancelled, eq(&vec![false, false, true, false, false]))
         })
     }
 }

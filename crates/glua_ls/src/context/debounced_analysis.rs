@@ -75,9 +75,16 @@ pub struct DebouncedAnalysis {
     /// Set once, never re-armed: a dead loop stays dead for process lifetime.
     debounce_loop_alive: AtomicBool,
     in_flight_changes: AtomicUsize,
-    /// Requests waiting for an edited document to be answerable. While any
-    /// waits, a debounce ends at once: the request needs the re-analysis now,
-    /// and only background propagation is worth coalescing.
+    /// The in-flight changes confined to one document, by the URI the client
+    /// sent, so a request aimed at another document is not held back by them.
+    in_flight_documents: std::sync::Mutex<HashMap<Uri, usize>>,
+    /// In-flight changes that may touch any document, such as files changed
+    /// on disk.
+    in_flight_unscoped: AtomicUsize,
+    /// Requests of an [`expedites_debounce`] method waiting for an edited
+    /// document to be answerable. While any waits, a debounce ends at once:
+    /// the request needs the re-analysis now, and only background propagation
+    /// is worth coalescing.
     waiting_requests: AtomicUsize,
     /// A request was refused as stale while edits were pending: the client
     /// re-sends it, so the next debounce ends at once, as for a waiting one.
@@ -114,6 +121,38 @@ impl Drop for WaitingRequest<'_> {
     }
 }
 
+/// Whether a `method` request waiting for an edited document ends the edit's
+/// debounce at once: what the user waits on while typing. Other requests wait
+/// the debounce out.
+pub(crate) fn expedites_debounce(method: &str) -> bool {
+    matches!(
+        method,
+        "textDocument/completion"
+            | "completionItem/resolve"
+            | "textDocument/hover"
+            | "gluals/hoverExpand"
+            | "textDocument/signatureHelp"
+            | "textDocument/definition"
+            | "textDocument/semanticTokens/full"
+    )
+}
+
+/// Takes `count` from `counter`, stopping at zero and logging an underflow.
+fn release(counter: &AtomicUsize, count: usize) {
+    let previous = counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(current.saturating_sub(count))
+        })
+        .unwrap_or_else(|current| current);
+    if previous < count {
+        log::error!(
+            "LS_INFLIGHT_UNDERFLOW attempted to finish {} in-flight changes with only {} pending",
+            count,
+            previous
+        );
+    }
+}
+
 impl DebouncedAnalysis {
     pub(crate) fn new(
         analysis: Arc<RwLock<EmmyLuaAnalysis>>,
@@ -132,6 +171,8 @@ impl DebouncedAnalysis {
             prioritised: std::sync::Mutex::default(),
             debounce_loop_alive: AtomicBool::new(true),
             in_flight_changes: AtomicUsize::new(0),
+            in_flight_documents: std::sync::Mutex::default(),
+            in_flight_unscoped: AtomicUsize::new(0),
             waiting_requests: AtomicUsize::new(0),
             refused_request: AtomicBool::new(false),
             notify: Notify::new(),
@@ -183,17 +224,36 @@ impl DebouncedAnalysis {
         self.notify.notify_waiters();
     }
 
-    /// Signal that document changes are in-flight but not yet scheduled.
+    /// Signal that document changes are in-flight but not yet scheduled; they
+    /// may touch any document, so no document is answerable until they settle.
     ///
     /// Called **synchronously** from the notification handler (inline, before
     /// spawning the didChange task) so that request handlers dispatched
     /// immediately afterward see the dirty flag and wait for reindex instead
     /// of computing on stale analysis data.
     pub fn begin_in_flight_change(self: &Arc<Self>) -> InFlightChangeGuard {
+        self.in_flight_unscoped.fetch_add(1, Ordering::AcqRel);
+        self.begin_change(None)
+    }
+
+    /// [`Self::begin_in_flight_change`] for a change confined to the document
+    /// at `uri`: requests aimed at other documents stay answerable.
+    pub fn begin_document_change(self: &Arc<Self>, uri: Uri) -> InFlightChangeGuard {
+        *self.in_flight_documents().entry(uri.clone()).or_default() += 1;
+        self.begin_change(Some(uri))
+    }
+
+    fn begin_change(self: &Arc<Self>, document: Option<Uri>) -> InFlightChangeGuard {
         self.in_flight_changes.fetch_add(1, Ordering::AcqRel);
         self.has_pending_changes.store(true, Ordering::Release);
         self.notify.notify_waiters();
-        InFlightChangeGuard::new(self.clone(), 1)
+        InFlightChangeGuard::new(self.clone(), document, 1)
+    }
+
+    fn in_flight_documents(&self) -> std::sync::MutexGuard<'_, HashMap<Uri, usize>> {
+        self.in_flight_documents
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     /// Record that the supervising loop has given up restarting the debounce
@@ -211,33 +271,26 @@ impl DebouncedAnalysis {
         self.debounce_loop_alive.load(Ordering::Acquire)
     }
 
-    pub async fn finish_in_flight_changes(&self, count: usize) {
+    /// Settles `count` in-flight changes begun for `document`, or for no one
+    /// document when `None`.
+    pub async fn finish_in_flight_changes(&self, document: Option<&Uri>, count: usize) {
         if count == 0 {
             return;
         }
 
-        let mut current = self.in_flight_changes.load(Ordering::Acquire);
-        loop {
-            let next = current.saturating_sub(count);
-            match self.in_flight_changes.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(previous) => {
-                    if previous < count {
-                        log::error!(
-                            "LS_INFLIGHT_UNDERFLOW attempted to finish {} in-flight changes with only {} pending",
-                            count,
-                            previous
-                        );
+        match document {
+            Some(uri) => {
+                let mut documents = self.in_flight_documents();
+                if let Some(pending) = documents.get_mut(uri) {
+                    *pending = pending.saturating_sub(count);
+                    if *pending == 0 {
+                        documents.remove(uri);
                     }
-                    break;
                 }
-                Err(observed) => current = observed,
             }
+            None => release(&self.in_flight_unscoped, count),
         }
+        release(&self.in_flight_changes, count);
 
         self.refresh_dirty_state().await;
         self.reindex_notify.notify_waiters();
@@ -347,7 +400,9 @@ impl DebouncedAnalysis {
             }
 
             // Only a request that has to wait needs the re-analysis now.
-            waiting.get_or_insert_with(|| self.request_waiting());
+            if expedites_debounce(request_method) {
+                waiting.get_or_insert_with(|| self.request_waiting());
+            }
             let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
 
             tokio::select! {
@@ -490,7 +545,9 @@ impl DebouncedAnalysis {
             }
 
             // Only a request that has to wait needs the re-analysis now.
-            waiting.get_or_insert_with(|| self.request_waiting());
+            if expedites_debounce(request_method) {
+                waiting.get_or_insert_with(|| self.request_waiting());
+            }
             let iter_start = Instant::now();
             let observed_in_flight = self.in_flight_changes.load(Ordering::Acquire) > 0;
             let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
@@ -533,7 +590,7 @@ impl DebouncedAnalysis {
     pub async fn file_is_answerable(&self, uri: &Uri) -> bool {
         // An edit whose text has not been applied yet would have the request
         // resolve a position against the previous tree.
-        if self.in_flight_changes.load(Ordering::Acquire) > 0 {
+        if self.has_in_flight_change_for(uri) {
             return false;
         }
         if !self.has_pending_changes.load(Ordering::Acquire) {
@@ -546,6 +603,13 @@ impl DebouncedAnalysis {
             .await
             .values()
             .any(|blocked| blocked == uri)
+    }
+
+    /// Whether a change to the document at `uri`, or one that may touch any
+    /// document, has text no task has applied yet.
+    fn has_in_flight_change_for(&self, uri: &Uri) -> bool {
+        self.in_flight_unscoped.load(Ordering::Acquire) > 0
+            || self.in_flight_documents().contains_key(uri)
     }
 
     async fn log_freshness_stuck(&self, request_method: &'static str, started_at: Instant) {
@@ -708,16 +772,15 @@ impl DebouncedAnalysis {
         }
     }
 
-    /// Re-diagnoses the files a re-analysis reported affected, the edited
-    /// documents among them when what their diagnostics read moved after the
-    /// client pulled them, and refreshes the client's derived views when the
-    /// edit reached other files.
+    /// Re-diagnoses the files a re-analysis reported affected, and refreshes
+    /// the client's derived views when the edit reached another open file:
+    /// the client re-requests the edited documents' own views itself.
     async fn refresh_affected(&self, edited: &[FileId], affected: Vec<FileId>) {
         self.file_diagnostic.store().note_settled();
         if affected.is_empty() {
             return;
         }
-        if affected.iter().any(|file_id| !edited.contains(file_id)) {
+        if self.file_diagnostic.store().any_open(&affected, edited) {
             if self.lsp_features.supports_semantic_tokens_refresh() {
                 self.client.refresh_semantic_tokens();
             }
@@ -903,20 +966,24 @@ impl DebouncedAnalysis {
 
 pub struct InFlightChangeGuard {
     analysis: Option<Arc<DebouncedAnalysis>>,
+    document: Option<Uri>,
     count: usize,
 }
 
 impl InFlightChangeGuard {
-    fn new(analysis: Arc<DebouncedAnalysis>, count: usize) -> Self {
+    fn new(analysis: Arc<DebouncedAnalysis>, document: Option<Uri>, count: usize) -> Self {
         Self {
             analysis: Some(analysis),
+            document,
             count,
         }
     }
 
     pub async fn finish(mut self) {
         if let Some(analysis) = self.analysis.take() {
-            analysis.finish_in_flight_changes(self.count).await;
+            analysis
+                .finish_in_flight_changes(self.document.as_ref(), self.count)
+                .await;
         }
     }
 }
@@ -927,10 +994,13 @@ impl Drop for InFlightChangeGuard {
             return;
         };
         let count = self.count;
+        let document = self.document.take();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    analysis.finish_in_flight_changes(count).await;
+                    analysis
+                        .finish_in_flight_changes(document.as_ref(), count)
+                        .await;
                 });
             }
             Err(err) => {
@@ -1281,7 +1351,7 @@ mod tests {
         runtime.block_on(async {
             let debounced_analysis = test_debounced_analysis();
 
-            debounced_analysis.finish_in_flight_changes(1).await;
+            debounced_analysis.finish_in_flight_changes(None, 1).await;
 
             verify_that!(debounced_analysis.in_flight_change_count(), eq(0))?;
             verify_that!(debounced_analysis.is_dirty(), eq(false))?;
@@ -2023,6 +2093,188 @@ mod tests {
                 eq(false)
             )?;
             Ok(())
+        })
+    }
+
+    /// A request the user does not wait on while typing waits an edit's
+    /// debounce out instead of ending it.
+    #[gtest]
+    fn a_passive_request_waiting_on_an_edited_document_leaves_the_debounce_alone() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let mut analysis = EmmyLuaAnalysis::new();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_passive");
+            analysis.add_main_workspace(workspace.clone());
+            let uri = file_path_to_uri(&workspace.join("lua/autorun/shared/edited.lua"))
+                .expect("URI should parse");
+            analysis.update_file_by_uri(&uri, Some("Value = 1\n".to_string()));
+            let file_id = analysis
+                .update_file_text_only(&uri, "Value = 2\n".to_string())
+                .expect("the file should still exist");
+            let analysis = Arc::new(RwLock::new(analysis));
+            let (connection, _peer) = Connection::memory();
+            let client = Arc::new(ClientProxy::new(connection));
+            let status_bar = Arc::new(StatusBar::new(client.clone(), true));
+            let file_diagnostic = Arc::new(FileDiagnostic::new(
+                analysis.clone(),
+                status_bar,
+                client.clone(),
+            ));
+            let debounced_analysis = Arc::new(DebouncedAnalysis::new(
+                analysis,
+                60_000,
+                CancellationToken::new(),
+                client,
+                file_diagnostic,
+                test_lsp_features(),
+            ));
+            let loop_task = tokio::spawn({
+                let debounced_analysis = debounced_analysis.clone();
+                async move { debounced_analysis.run().await }
+            });
+            debounced_analysis.schedule(file_id, uri.clone()).await;
+
+            let cancel = CancellationToken::new();
+            let waiter = tokio::spawn({
+                let debounced_analysis = debounced_analysis.clone();
+                let cancel = cancel.clone();
+                async move {
+                    debounced_analysis
+                        .wait_until_file_fresh_for(&cancel, "textDocument/codeLens", &uri)
+                        .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while debounced_analysis.freshness_wait_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the request should reach the freshness wait");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            verify_that!(
+                debounced_analysis
+                    .expedited_debounces
+                    .load(Ordering::Acquire),
+                eq(0)
+            )?;
+            verify_that!(waiter.is_finished(), eq(false))?;
+
+            cancel.cancel();
+            let freshness = waiter.await.expect("the waiter must not panic");
+            verify_that!(freshness, eq(Freshness::Cancelled))?;
+            debounced_analysis.shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(5), loop_task)
+                .await
+                .expect("the loop should stop on shutdown")
+                .expect("the loop task must not panic");
+            Ok(())
+        })
+    }
+
+    /// An edit whose text no task has applied yet holds back only requests
+    /// aimed at its own document; a change that may touch any document holds
+    /// back every one.
+    #[gtest]
+    fn an_in_flight_edit_holds_back_only_its_own_document() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounced_analysis = test_debounced_analysis();
+            let edited = Uri::from_str("file:///workspace/edited.lua").expect("uri should parse");
+            let other = Uri::from_str("file:///workspace/other.lua").expect("uri should parse");
+
+            let edit = debounced_analysis.begin_document_change(edited.clone());
+            verify_that!(debounced_analysis.is_dirty(), eq(true))?;
+            verify_that!(
+                debounced_analysis.file_is_answerable(&other).await,
+                eq(true)
+            )?;
+            verify_that!(
+                debounced_analysis.file_is_answerable(&edited).await,
+                eq(false)
+            )?;
+
+            let disk_change = debounced_analysis.begin_in_flight_change();
+            verify_that!(
+                debounced_analysis.file_is_answerable(&other).await,
+                eq(false)
+            )?;
+
+            disk_change.finish().await;
+            edit.finish().await;
+            verify_that!(
+                debounced_analysis.file_is_answerable(&edited).await,
+                eq(true)
+            )?;
+            verify_that!(debounced_analysis.is_dirty(), eq(false))
+        })
+    }
+
+    /// The client re-requests an edited document's own views, so only an edit
+    /// that reached another open file refreshes them workspace-wide.
+    #[gtest]
+    fn only_an_edit_reaching_another_open_file_refreshes_views() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
+            let (connection, peer) = Connection::memory();
+            let client = Arc::new(ClientProxy::new(connection));
+            let status_bar = Arc::new(StatusBar::new(client.clone(), true));
+            let file_diagnostic = Arc::new(FileDiagnostic::new(
+                analysis.clone(),
+                status_bar,
+                client.clone(),
+            ));
+            let features = LspFeatures::new(
+                serde_json::from_value(serde_json::json!({
+                    "workspace": {
+                        "semanticTokens": { "refreshSupport": true },
+                        "inlayHint": { "refreshSupport": true },
+                    }
+                }))
+                .expect("capabilities should deserialize"),
+            );
+            let debounced_analysis = DebouncedAnalysis::new(
+                analysis,
+                0,
+                CancellationToken::new(),
+                client,
+                file_diagnostic.clone(),
+                Arc::new(features),
+            );
+            let (edited, closed, open) = (FileId::new(1), FileId::new(2), FileId::new(3));
+            let store = file_diagnostic.store();
+            store.set_open(edited, true);
+            store.set_open(open, true);
+            let refreshes = || {
+                let mut methods = peer
+                    .receiver
+                    .try_iter()
+                    .filter_map(|message| match message {
+                        lsp_server::Message::Request(request) => Some(request.method),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                methods.sort();
+                methods
+            };
+
+            debounced_analysis
+                .refresh_affected(&[edited], vec![edited, closed])
+                .await;
+            verify_that!(refreshes(), is_empty())?;
+
+            debounced_analysis
+                .refresh_affected(&[edited], vec![edited, open])
+                .await;
+            verify_that!(
+                refreshes(),
+                eq(&vec![
+                    "workspace/inlayHint/refresh".to_string(),
+                    "workspace/semanticTokens/refresh".to_string(),
+                ])
+            )
         })
     }
 }

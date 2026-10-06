@@ -200,9 +200,6 @@ pub async fn on_did_open_text_document(
     .await;
     if let Some(file_id) = file_id {
         context.note_document_applied_version(&uri, version);
-        if context.lsp_features().supports_semantic_tokens_refresh() {
-            context.client().refresh_semantic_tokens();
-        }
         // Text that differs from what is indexed settles through the
         // debounced loop, as an edit does.
         let store = context.file_diagnostic().store();
@@ -410,8 +407,10 @@ mod tests {
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
+    /// The client asks for an opened document's tokens itself, so opening one
+    /// sends no workspace-wide semantic token refresh.
     #[gtest]
-    fn test_on_did_open_text_document_requests_semantic_tokens_refresh() -> Result<()> {
+    fn opening_a_document_sends_no_semantic_tokens_refresh() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         let (proxy_connection, peer_connection) = Connection::memory();
         let capabilities = ClientCapabilities {
@@ -428,109 +427,28 @@ mod tests {
             let context = ServerContext::new(proxy_connection, capabilities);
             let snapshot = context.snapshot();
             let uri = Uri::from_str("file:///test.lua").unwrap();
-
-            // Manually add the file to analysis so `should_process` becomes true without dealing with paths
             snapshot
                 .analysis()
                 .write()
                 .await
                 .update_file_by_uri(&uri, Some("local x = 1".to_string()));
 
-            on_did_open_text_document(
-                snapshot.clone(),
-                DidOpenTextDocumentParams {
-                    text_document: TextDocumentItem {
-                        uri: uri.clone(),
-                        language_id: "lua".to_string(),
-                        version: 1,
-                        text: "local x = 1".to_string(),
-                    },
-                },
-            )
-            .await;
+            open(&snapshot, &uri, 1, "local x = 2").await;
+            verify_that!(
+                snapshot
+                    .wait_until_latest_document_version_applied(&uri, &CancellationToken::new())
+                    .await,
+                eq(true)
+            )?;
 
-            let mut found_refresh = false;
-            for _ in 0..5 {
-                if let Ok(message) = peer_connection
-                    .receiver
-                    .recv_timeout(Duration::from_secs(1))
-                {
-                    if let lsp_server::Message::Request(request) = message {
-                        if request.method == "workspace/semanticTokens/refresh" {
-                            found_refresh = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            verify_that!(found_refresh, eq(true))?;
-
-            Ok(())
+            let refreshed = peer_connection.receiver.try_iter().any(|message| {
+                matches!(message, lsp_server::Message::Request(request)
+                    if request.method == "workspace/semanticTokens/refresh")
+            });
+            verify_that!(refreshed, eq(false))
         })
     }
 
-    #[gtest]
-    fn test_on_did_open_text_document_does_not_request_refresh_for_stale_version() -> Result<()> {
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
-        let (proxy_connection, peer_connection) = Connection::memory();
-        let capabilities = ClientCapabilities {
-            workspace: Some(WorkspaceClientCapabilities {
-                semantic_tokens: Some(SemanticTokensWorkspaceClientCapabilities {
-                    refresh_support: Some(true),
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        runtime.block_on(async {
-            let context = ServerContext::new(proxy_connection, capabilities);
-            let snapshot = context.snapshot();
-            let uri = Uri::from_str("file:///test.lua").unwrap();
-
-            snapshot
-                .analysis()
-                .write()
-                .await
-                .update_file_by_uri(&uri, Some("local x = 1".to_string()));
-
-            // Mark a newer version as seen so the version 1 is considered stale
-            snapshot.note_document_seen_version(&uri, 2);
-
-            on_did_open_text_document(
-                snapshot.clone(),
-                DidOpenTextDocumentParams {
-                    text_document: TextDocumentItem {
-                        uri: uri.clone(),
-                        language_id: "lua".to_string(),
-                        version: 1,
-                        text: "local x = 1".to_string(),
-                    },
-                },
-            )
-            .await;
-
-            let mut found_refresh = false;
-            for _ in 0..5 {
-                if let Ok(message) = peer_connection
-                    .receiver
-                    .recv_timeout(Duration::from_millis(50))
-                {
-                    if let lsp_server::Message::Request(request) = message {
-                        if request.method == "workspace/semanticTokens/refresh" {
-                            found_refresh = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            verify_that!(found_refresh, eq(false))?;
-
-            Ok(())
-        })
-    }
     const DISK_TEXT: &str = "local x = 1\n";
     const NEW_TEXT: &str = "local x = 1\nfunction Added() end\n";
 
