@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use super::{ClientProxy, FileDiagnostic, StatusBar};
@@ -39,8 +38,6 @@ pub struct WorkspaceManager {
     /// matcher for the first workspace root that is a prefix of the file path,
     /// so each root's `useDefaultIgnores` / `ignoreDirDefaults` stays isolated.
     pub per_root_matchers: HashMap<PathBuf, WorkspaceFileMatcher>,
-    workspace_diagnostic_level: Arc<AtomicU8>,
-    workspace_version: Arc<AtomicI64>,
 }
 
 impl WorkspaceManager {
@@ -64,40 +61,6 @@ impl WorkspaceManager {
             current_open_files: HashSet::new(),
             match_file_pattern: WorkspaceFileMatcher::default(),
             per_root_matchers: HashMap::new(),
-            workspace_diagnostic_level: Arc::new(AtomicU8::new(
-                WorkspaceDiagnosticLevel::Fast.to_u8(),
-            )),
-            workspace_version: Arc::new(AtomicI64::new(0)),
-        }
-    }
-
-    pub fn workspace_diagnostic_level_arc(&self) -> Arc<AtomicU8> {
-        self.workspace_diagnostic_level.clone()
-    }
-
-    /// Take the pending diagnostic level and reset it to `None` in one atomic
-    /// step; a separate load+store pair races with concurrent writers.
-    pub fn claim_workspace_diagnostic_level(&self) -> WorkspaceDiagnosticLevel {
-        let previous = self
-            .workspace_diagnostic_level
-            .swap(WorkspaceDiagnosticLevel::None.to_u8(), Ordering::AcqRel);
-        WorkspaceDiagnosticLevel::from_u8(previous)
-    }
-
-    /// Put a claimed level back after a sweep failed to finish; keeps the
-    /// higher of it and anything requested since.
-    pub fn restore_workspace_diagnostic_level(&self, level: WorkspaceDiagnosticLevel) {
-        self.workspace_diagnostic_level
-            .fetch_max(level.to_u8(), Ordering::AcqRel);
-    }
-
-    /// Request at least `level` of workspace diagnostics. A max, not a store:
-    /// a concurrent request must never downgrade a pending `Slow` sweep.
-    pub fn update_workspace_version(&self, level: WorkspaceDiagnosticLevel, add_version: bool) {
-        self.workspace_diagnostic_level
-            .fetch_max(level.to_u8(), Ordering::AcqRel);
-        if add_version {
-            self.workspace_version.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -124,7 +87,6 @@ impl WorkspaceManager {
         let file_diagnostic = self.file_diagnostic.clone();
         let lsp_features = self.lsp_features.clone();
         let client = self.client.clone();
-        let workspace_diagnostic_level = self.workspace_diagnostic_level.clone();
         tokio::spawn(async move {
             cancel_token.wait_for_reindex().await;
             if cancel_token.is_cancelled() {
@@ -158,12 +120,8 @@ impl WorkspaceManager {
                 loaded.workspace_diagnostic_configs,
                 loaded.workspace_emmyrcs,
                 watchdog_status,
-                workspace_diagnostic_level,
             )
             .await;
-            if lsp_features.supports_refresh_diagnostic() {
-                client.refresh_workspace_diagnostics();
-            }
             // After completion, remove from HashMap
             let mut tokens = config_update_token.lock().await;
             tokens.take();
@@ -187,7 +145,6 @@ impl WorkspaceManager {
         let file_diagnostic = self.file_diagnostic.clone();
         let lsp_features = self.lsp_features.clone();
         let client = self.client.clone();
-        let workspace_diagnostic_status = self.workspace_diagnostic_level.clone();
         tokio::spawn(async move {
             let watchdog_status = LongRunningWatchdogStatus::new("Reloading workspace");
             let _watchdog =
@@ -214,32 +171,14 @@ impl WorkspaceManager {
                 loaded.workspace_diagnostic_configs,
                 loaded.workspace_emmyrcs,
                 watchdog_status,
-                workspace_diagnostic_status.clone(),
             )
             .await;
-
-            // Cancel diagnostics and update status without holding analysis lock
-            file_diagnostic.cancel_workspace_diagnostic().await;
-            // A config reload can move any file's diagnostics — the sweep must
-            // cover everything, which covers the pending scoped set too.
-            file_diagnostic.clear_scoped_sweep_files().await;
-            // Raise, never lower — a pending `Slow` request must survive.
-            workspace_diagnostic_status
-                .fetch_max(WorkspaceDiagnosticLevel::Fast.to_u8(), Ordering::AcqRel);
-
-            if lsp_features.supports_refresh_diagnostic() {
-                client.refresh_workspace_diagnostics();
-            } else {
-                file_diagnostic
-                    .add_workspace_diagnostic_task(500, true)
-                    .await;
-            }
         });
 
         Some(())
     }
 
-    pub async fn extend_reindex_delay(&self) -> Option<()> {
+    pub async fn extend_recheck_delay(&self) -> Option<()> {
         let update_token = self.update_token.lock().await;
         if let Some(token) = update_token.as_ref() {
             token.set_resleep().await;
@@ -248,8 +187,10 @@ impl WorkspaceManager {
         Some(())
     }
 
-    pub async fn reindex_workspace(&self, delay: Duration) -> Option<()> {
-        log::info!("refresh workspace with delay: {:?}", delay);
+    /// After `delay`, re-reads which files exist and computes every file's
+    /// diagnostics again, publishing those that changed.
+    pub async fn recheck_workspace(&self, delay: Duration) -> Option<()> {
+        log::info!("recheck workspace with delay: {:?}", delay);
         let mut update_token = self.update_token.lock().await;
         if let Some(token) = update_token.as_ref() {
             token.cancel();
@@ -263,7 +204,6 @@ impl WorkspaceManager {
         let file_diagnostic = self.file_diagnostic.clone();
         let lsp_features = self.lsp_features.clone();
         let client = self.client.clone();
-        let workspace_diagnostic_status = self.workspace_diagnostic_level.clone();
         tokio::spawn(async move {
             cancel_token.wait_for_reindex().await;
             if cancel_token.is_cancelled() {
@@ -275,30 +215,16 @@ impl WorkspaceManager {
                 let mut analysis = analysis.write().await;
                 // 在重新索引之前清理不存在的文件
                 analysis.cleanup_nonexistent_files();
-                file_diagnostic.invalidate_shared_diagnostic_data();
                 // Release lock immediately after cleanup
             }
 
-            // Cancel diagnostics and update status without holding analysis lock
-            file_diagnostic.cancel_workspace_diagnostic().await;
-            // A reindex can move any file's diagnostics — full sweep, which
-            // also covers whatever the scoped set had noted.
-            file_diagnostic.clear_scoped_sweep_files().await;
-            workspace_diagnostic_status
-                .fetch_max(WorkspaceDiagnosticLevel::Fast.to_u8(), Ordering::AcqRel);
-
+            file_diagnostic.forget_missing().await;
+            file_diagnostic.add_workspace_diagnostic_task(0, true).await;
             if lsp_features.supports_semantic_tokens_refresh() {
                 client.refresh_semantic_tokens();
             }
             if lsp_features.supports_inlay_hint_refresh() {
                 client.refresh_inlay_hints();
-            }
-            if lsp_features.supports_refresh_diagnostic() {
-                client.refresh_workspace_diagnostics();
-            } else {
-                file_diagnostic
-                    .add_workspace_diagnostic_task(500, true)
-                    .await;
             }
         });
 
@@ -1153,28 +1079,6 @@ impl Default for WorkspaceFileMatcher {
     fn default() -> Self {
         let include_pattern = vec!["**/*.lua".to_string()];
         Self::new(include_pattern, vec![], vec![])
-    }
-}
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkspaceDiagnosticLevel {
-    None = 0,
-    Fast = 1,
-    Slow = 2,
-}
-
-impl WorkspaceDiagnosticLevel {
-    pub fn from_u8(value: u8) -> Self {
-        match value {
-            1 => Self::Fast,
-            2 => Self::Slow,
-            _ => Self::None,
-        }
-    }
-
-    pub fn to_u8(self) -> u8 {
-        self as u8
     }
 }
 

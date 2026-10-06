@@ -1,7 +1,7 @@
 mod client;
 mod client_id;
 mod debounced_analysis;
-mod diagnostic_store;
+pub(crate) mod diagnostic_store;
 mod did_change_coalescer;
 mod file_diagnostic;
 mod lsp_features;
@@ -12,7 +12,7 @@ mod workspace_manager;
 pub use client::ClientProxy;
 pub use client_id::{ClientId, get_client_id};
 pub use debounced_analysis::{DebouncedAnalysis, Freshness, InFlightChangeGuard};
-pub use diagnostic_store::{DiagnosticStore, Priority};
+pub use diagnostic_store::{DiagnosticStore, Priority, StoredDiagnostics};
 pub use did_change_coalescer::DidChangeCoalescer;
 pub use file_diagnostic::FileDiagnostic;
 use glua_code_analysis::EmmyLuaAnalysis;
@@ -180,7 +180,6 @@ impl ServerContext {
             file_diagnostic.clone(),
             lsp_features.clone(),
         );
-        let workspace_diagnostic_level = workspace_manager_inner.workspace_diagnostic_level_arc();
         let workspace_manager = Arc::new(RwLock::new(workspace_manager_inner));
         let debounced_shutdown = CancellationToken::new();
         let debounced_analysis = Arc::new(DebouncedAnalysis::new(
@@ -189,8 +188,6 @@ impl ServerContext {
             debounced_shutdown.clone(),
             client.clone(),
             file_diagnostic.clone(),
-            file_diagnostic.shared_diagnostic_data_cache(),
-            workspace_diagnostic_level,
             lsp_features.clone(),
         ));
 
@@ -404,11 +401,11 @@ impl ServerContext {
 mod tests {
     use super::{
         DEBOUNCE_RESTART_BACKOFF_MAX, LspFeatures, RequestTaskMetadata, ServerContext,
-        WorkspaceDiagnosticLevel, cancel_error, debounce_restart_backoff,
-        keep_stale_editor_data_on_cancel, should_send_stale_response_on_cancel,
+        cancel_error, debounce_restart_backoff, keep_stale_editor_data_on_cancel,
+        should_send_stale_response_on_cancel,
     };
     use googletest::prelude::*;
-    use lsp_server::{Connection, ErrorCode, RequestId, Response};
+    use lsp_server::{ErrorCode, RequestId, Response};
     use lsp_types::ClientCapabilities;
     use serde_json::json;
     use std::time::Duration;
@@ -495,55 +492,6 @@ mod tests {
             eq(false)
         )?;
         Ok(())
-    }
-
-    #[gtest]
-    fn a_cancelled_workspace_sweep_restores_the_level_it_claimed() -> Result<()> {
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
-        let (connection, _peer) = Connection::memory();
-
-        runtime.block_on(async {
-            let context = ServerContext::new(connection, ClientCapabilities::default());
-            let workspace = context.snapshot().workspace_manager_arc();
-            let workspace = workspace.read().await;
-
-            workspace.update_workspace_version(WorkspaceDiagnosticLevel::Slow, false);
-            workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, false);
-            verify_that!(
-                workspace.claim_workspace_diagnostic_level(),
-                eq(WorkspaceDiagnosticLevel::Slow)
-            )?;
-
-            workspace.update_workspace_version(WorkspaceDiagnosticLevel::Slow, false);
-
-            // Claiming empties it, so a second pull finds nothing to do.
-            verify_that!(
-                workspace.claim_workspace_diagnostic_level(),
-                eq(WorkspaceDiagnosticLevel::Slow)
-            )?;
-            verify_that!(
-                workspace.claim_workspace_diagnostic_level(),
-                eq(WorkspaceDiagnosticLevel::None)
-            )?;
-
-            // A `Fast` request arriving mid-sweep must not survive as the
-            // restored value in place of the interrupted `Slow`.
-            workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, false);
-            workspace.restore_workspace_diagnostic_level(WorkspaceDiagnosticLevel::Slow);
-            verify_that!(
-                workspace.claim_workspace_diagnostic_level(),
-                eq(WorkspaceDiagnosticLevel::Slow)
-            )?;
-
-            // And restoring never lowers an already-higher pending level.
-            workspace.update_workspace_version(WorkspaceDiagnosticLevel::Slow, false);
-            workspace.restore_workspace_diagnostic_level(WorkspaceDiagnosticLevel::Fast);
-            verify_that!(
-                workspace.claim_workspace_diagnostic_level(),
-                eq(WorkspaceDiagnosticLevel::Slow)
-            )?;
-            Ok(())
-        })
     }
 
     /// See `keep_stale_editor_data_on_cancel`: cancelled document pulls must

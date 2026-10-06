@@ -1,5 +1,4 @@
 mod document_diagnostic;
-mod result_id;
 mod workspace_diagnostic;
 
 use super::RegisterCapabilities;
@@ -7,7 +6,6 @@ pub use document_diagnostic::on_pull_document_diagnostic;
 use lsp_types::{
     ClientCapabilities, DiagnosticOptions, DiagnosticServerCapabilities, ServerCapabilities,
 };
-use result_id::diagnostic_result_id;
 pub use workspace_diagnostic::on_pull_workspace_diagnostic;
 
 pub struct DiagnosticCapabilities;

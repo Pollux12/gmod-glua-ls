@@ -8,15 +8,15 @@ use std::{
 };
 
 use glua_code_analysis::SharedDiagnosticComponentCache;
-use glua_code_analysis::{EmmyLuaAnalysis, FileId, SharedDiagnosticData};
+use glua_code_analysis::{EmmyLuaAnalysis, SharedDiagnosticData};
 use log::{debug, info};
-use lsp_types::{Diagnostic, Uri};
+use lsp_types::Uri;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::util::{LongRunningWatchdogStatus, spawn_long_running_watchdog};
 
-use super::{ClientProxy, ProgressTask, StatusBar};
+use super::{ClientProxy, ProgressTask, StatusBar, StoredDiagnostics};
 
 #[derive(Clone, Default)]
 pub(crate) struct SharedDiagnosticDataCache {
@@ -32,7 +32,7 @@ impl SharedDiagnosticDataCache {
         let mut cached = self.cached.lock().ok();
         if let Some(cache) = cached.as_ref()
             && let Some(shared_data) = cache.as_ref()
-            && self.components.is_fresh(analysis.compilation.get_db())
+            && self.components.is_fresh(&analysis.compilation)
         {
             return shared_data.clone();
         }
@@ -46,13 +46,6 @@ impl SharedDiagnosticDataCache {
         shared_data
     }
 
-    pub(crate) fn invalidate(&self) {
-        if let Ok(mut cache) = self.cached.lock() {
-            *cache = None;
-        }
-        self.components.invalidate();
-    }
-
     #[cfg(test)]
     fn cached_ptr(&self) -> Option<*const SharedDiagnosticData> {
         self.cached
@@ -60,14 +53,6 @@ impl SharedDiagnosticDataCache {
             .expect("shared diagnostic cache mutex should not be poisoned")
             .as_ref()
             .map(Arc::as_ptr)
-    }
-
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.cached
-            .lock()
-            .expect("shared diagnostic cache mutex should not be poisoned")
-            .is_none()
     }
 }
 
@@ -79,15 +64,6 @@ pub struct FileDiagnostic {
     workspace_loaded_notified: Arc<AtomicBool>,
     startup_complete_notified: Arc<AtomicBool>,
     workspace_diagnostic_token: Arc<Mutex<Option<CancellationToken>>>,
-    /// Files an edit reported as diagnostically touched (re-analysed files,
-    /// readers the export diff named, textual-refresh candidates). The next
-    /// `Fast` workspace sweep diagnoses exactly this set instead of the whole
-    /// workspace: nothing outside it can have a stale report, since a
-    /// diagnostic only moves when a fact the file reads moved, and the dirty
-    /// machinery names every such file. `None`-equivalent (empty) means the
-    /// arm was not edit-scoped — open/reindex/config paths still sweep all.
-    scoped_sweep_files: Arc<Mutex<rustc_hash::FxHashSet<FileId>>>,
-    shared_diagnostic_data_cache: SharedDiagnosticDataCache,
     /// Every workspace file's diagnostics, computed again only when they
     /// may have changed.
     store: Arc<super::DiagnosticStore>,
@@ -104,11 +80,11 @@ impl FileDiagnostic {
         client: Arc<ClientProxy>,
         fetches_diagnostics: bool,
     ) -> Self {
-        let shared_diagnostic_data_cache = SharedDiagnosticDataCache::default();
         let store = Arc::new(super::DiagnosticStore::new(
             analysis.clone(),
-            shared_diagnostic_data_cache.clone(),
-            (!fetches_diagnostics).then(|| client.clone()),
+            SharedDiagnosticDataCache::default(),
+            client.clone(),
+            fetches_diagnostics,
         ));
         Self {
             analysis,
@@ -116,8 +92,6 @@ impl FileDiagnostic {
             workspace_loaded_notified: Arc::new(AtomicBool::new(false)),
             startup_complete_notified: Arc::new(AtomicBool::new(false)),
             workspace_diagnostic_token: Arc::new(Mutex::new(None)),
-            scoped_sweep_files: Arc::new(Mutex::new(rustc_hash::FxHashSet::default())),
-            shared_diagnostic_data_cache,
             store,
             status_bar,
         }
@@ -125,14 +99,6 @@ impl FileDiagnostic {
 
     pub fn store(&self) -> &Arc<super::DiagnosticStore> {
         &self.store
-    }
-
-    pub(crate) fn shared_diagnostic_data_cache(&self) -> SharedDiagnosticDataCache {
-        self.shared_diagnostic_data_cache.clone()
-    }
-
-    pub fn invalidate_shared_diagnostic_data(&self) {
-        self.shared_diagnostic_data_cache.invalidate();
     }
 
     pub fn is_workspace_loaded(&self) -> bool {
@@ -168,57 +134,29 @@ impl FileDiagnostic {
 
     /// The last diagnostics computed for `uri`, whether or not they still
     /// hold.
-    pub async fn cached_file_diagnostics(&self, uri: &Uri) -> Option<Vec<Diagnostic>> {
+    pub async fn cached_file_diagnostics(&self, uri: &Uri) -> Option<StoredDiagnostics> {
         let file_id = self.analysis.read().await.get_file_id(uri)?;
-        self.store
-            .last(file_id)
-            .map(|stored| stored.diagnostics.to_vec())
-    }
-
-    /// Accumulate files whose diagnostics an edit may have moved. The debounced
-    /// loop extends this across the whole burst (each ripple's widened set,
-    /// each textual-refresh batch), so the armed idle sweep covers every file
-    /// the burst touched rather than only the last settle's.
-    pub async fn note_scoped_sweep_files(&self, file_ids: impl IntoIterator<Item = FileId>) {
-        self.scoped_sweep_files.lock().await.extend(file_ids);
-    }
-
-    /// The files an edit-scoped sweep owes, sorted for deterministic worker
-    /// dispatch. `None` means no scoped set accumulated — sweep the whole
-    /// workspace (the open/reindex/config arms leave it empty).
-    async fn take_scoped_sweep_files(&self) -> Option<Vec<FileId>> {
-        let mut slot = self.scoped_sweep_files.lock().await;
-        if slot.is_empty() {
-            return None;
-        }
-        let mut files: Vec<FileId> = slot.drain().collect();
-        files.sort_unstable();
-        Some(files)
-    }
-
-    /// Put back the undiagnosed remainder when a scoped sweep is cut short, so
-    /// the re-armed pull re-sweeps it instead of losing it to the cancel.
-    async fn restore_scoped_sweep_files(&self, file_ids: impl IntoIterator<Item = FileId>) {
-        self.scoped_sweep_files.lock().await.extend(file_ids);
-    }
-
-    /// Forget the pending scoped set because a sweep about to run covers the
-    /// whole workspace anyway (config reloads, explicit reindexes): the noted
-    /// files are swept as part of it, so nothing is lost.
-    pub async fn clear_scoped_sweep_files(&self) {
-        self.scoped_sweep_files.lock().await.clear();
+        self.store.last(file_id)
     }
 
     /// After `interval` ms, computes every workspace file's diagnostics again;
-    /// the store publishes those that changed to a client that does not fetch
-    /// them.
+    /// the store publishes those that changed.
     pub async fn add_workspace_diagnostic_task(&self, interval: u64, silent: bool) {
-        let cancel_token = self.replace_workspace_diagnostic_token().await;
+        let cancel_token = {
+            let mut token = self.workspace_diagnostic_token.lock().await;
+            if let Some(token) = token.as_ref() {
+                token.cancel();
+                debug!("cancel workspace diagnostic");
+            }
+            let cancel_token = CancellationToken::new();
+            token.replace(cancel_token.clone());
+            cancel_token
+        };
         let file_diagnostic = self.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(interval)) => {
-                    file_diagnostic.sweep(None, silent, "push", cancel_token).await;
+                    file_diagnostic.refill(silent, cancel_token).await;
                 }
                 _ = cancel_token.cancelled() => {
                     log::info!("cancel workspace diagnostic");
@@ -227,24 +165,17 @@ impl FileDiagnostic {
         });
     }
 
-    async fn replace_workspace_diagnostic_token(&self) -> CancellationToken {
-        let mut token = self.workspace_diagnostic_token.lock().await;
-        if let Some(token) = token.as_ref() {
-            token.cancel();
-            debug!("cancel workspace diagnostic");
-        }
-        let cancel_token = CancellationToken::new();
-        token.replace(cancel_token.clone());
-        cancel_token
-    }
-
-    pub async fn cancel_workspace_diagnostic(&self) {
-        let mut token = self.workspace_diagnostic_token.lock().await;
-        if let Some(token) = token.as_ref() {
-            token.cancel();
-            debug!("cancel workspace diagnostic");
-        }
-        token.take();
+    /// Forgets the stored diagnostics of files no longer in the workspace,
+    /// clearing what the client shows for them.
+    pub async fn forget_missing(&self) {
+        let live = self
+            .analysis
+            .read()
+            .await
+            .get_main_workspace_file_ids_for_diagnostics()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        self.store.forget_missing(&live);
     }
 
     /// `uri`'s current diagnostics, computed ahead of every other file if
@@ -253,74 +184,29 @@ impl FileDiagnostic {
         &self,
         uri: Uri,
         cancel_token: CancellationToken,
-    ) -> Option<Vec<Diagnostic>> {
+    ) -> Option<StoredDiagnostics> {
         let file_id = self.analysis.read().await.get_file_id(&uri)?;
         self.store
             .get(file_id, super::Priority::Edited, &cancel_token)
             .await
-            .map(|stored| stored.diagnostics.to_vec())
     }
 
-    pub async fn pull_workspace_diagnostics_slow(
+    /// The current diagnostics of every workspace file.
+    pub async fn workspace_diagnostics(
         &self,
-        cancel_token: CancellationToken,
-    ) -> Vec<(Uri, Vec<Diagnostic>)> {
-        info!("workspace diagnostic pull slow started");
-        self.adopt_workspace_diagnostic_token(&cancel_token).await;
-        self.sweep(None, false, "slow pull", cancel_token).await
+        cancel_token: &CancellationToken,
+    ) -> Vec<StoredDiagnostics> {
+        let file_ids = self
+            .analysis
+            .read()
+            .await
+            .get_main_workspace_file_ids_for_diagnostics();
+        self.store.get_all(&file_ids, cancel_token, |_| {}).await
     }
 
-    pub async fn pull_workspace_diagnostics_fast(
-        &self,
-        cancel_token: CancellationToken,
-    ) -> Vec<(Uri, Vec<Diagnostic>)> {
-        info!("workspace diagnostic pull fast started");
-        let sweep_started = crate::util::ls_profile::profile_instant();
-        self.adopt_workspace_diagnostic_token(&cancel_token).await;
-        // An armed idle sweep after an edit is scoped to the files the burst
-        // touched; the other Fast arms (open, reindex, config) leave the slot
-        // empty and sweep everything.
-        let scoped = self.take_scoped_sweep_files().await;
-        let was_scoped = scoped.is_some();
-        let result = self
-            .sweep(scoped.clone(), false, "fast pull", cancel_token.clone())
-            .await;
-        if cancel_token.is_cancelled() {
-            // Re-diagnosing the few files already completed is cheap and keeps
-            // the next armed sweep's coverage exact.
-            self.restore_scoped_sweep_files(scoped.unwrap_or_default())
-                .await;
-        }
-        if let Some(started) = sweep_started {
-            crate::util::ls_profile::emit_ls_diag_sweep(
-                result.len(),
-                started.elapsed(),
-                was_scoped,
-            );
-        }
-        result
-    }
-
-    async fn adopt_workspace_diagnostic_token(&self, cancel_token: &CancellationToken) {
-        let mut token = self.workspace_diagnostic_token.lock().await;
-        if let Some(token) = token.as_ref() {
-            token.cancel();
-            debug!("cancel workspace diagnostic");
-        }
-        token.replace(cancel_token.clone());
-    }
-
-    /// The current diagnostics of the workspace files in `scope`, or of every
-    /// workspace file computed again when there is none.
-    async fn sweep(
-        &self,
-        scope: Option<Vec<FileId>>,
-        silent: bool,
-        label: &'static str,
-        cancel_token: CancellationToken,
-    ) -> Vec<(Uri, Vec<Diagnostic>)> {
-        let watchdog_status =
-            LongRunningWatchdogStatus::new(format!("Preparing workspace diagnostics ({label})"));
+    /// Computes every workspace file's diagnostics again, reporting progress.
+    async fn refill(&self, silent: bool, cancel_token: CancellationToken) {
+        let watchdog_status = LongRunningWatchdogStatus::new("Preparing workspace diagnostics");
         let _watchdog =
             spawn_long_running_watchdog("workspace diagnostics", watchdog_status.clone());
         let status_bar = self.status_bar.clone();
@@ -335,32 +221,21 @@ impl FileDiagnostic {
             );
         }
 
-        let mut file_ids = self
+        let file_ids = self
             .analysis
             .read()
             .await
             .get_main_workspace_file_ids_for_diagnostics();
-        match &scope {
-            Some(scoped_ids) => {
-                let scoped_set = scoped_ids.iter().copied().collect::<HashSet<_>>();
-                file_ids.retain(|file_id| scoped_set.contains(file_id));
-                info!(
-                    "edit-scoped workspace diagnostic sweep: {} file(s)",
-                    file_ids.len()
-                );
-            }
-            None => self.store.invalidate_all(file_ids.iter().copied()),
-        }
+        self.store.invalidate_all(file_ids.iter().copied());
 
         watchdog_status.set_detail_source(self.store.watchdog_detail(self.analysis.clone()));
         let total = file_ids.len();
-        let progress_label = format!("Diagnosing workspace files ({label})");
-        watchdog_status.set_progress(&progress_label, 0, total);
+        let progress_label = "Diagnosing workspace files";
+        watchdog_status.set_progress(progress_label, 0, total);
         let mut last_percentage = None;
-        let stored = self
-            .store
+        self.store
             .get_all(&file_ids, &cancel_token, |done| {
-                watchdog_status.set_progress(&progress_label, done, total);
+                watchdog_status.set_progress(progress_label, done, total);
                 let percentage = (done * 100 / total.max(1)) as u32;
                 if !silent && last_percentage != Some(percentage) {
                     last_percentage = Some(percentage);
@@ -380,14 +255,10 @@ impl FileDiagnostic {
             );
         }
         if cancel_token.is_cancelled() {
-            info!("workspace diagnostic {label} cancelled");
+            info!("workspace diagnostics cancelled");
         } else {
             self.notify_startup_complete();
         }
-        stored
-            .into_iter()
-            .map(|stored| (stored.uri, stored.diagnostics.to_vec()))
-            .collect()
     }
 }
 
@@ -408,7 +279,7 @@ pub(crate) fn workspace_diagnostic_parallelism() -> usize {
 #[cfg(test)]
 mod tests {
     use crate::context::{ClientProxy, ServerContext, StatusBar};
-    use glua_code_analysis::{DiagnosticCode, EmmyLuaAnalysis, Emmyrc, FileId, file_path_to_uri};
+    use glua_code_analysis::{DiagnosticCode, EmmyLuaAnalysis, Emmyrc, file_path_to_uri};
     use googletest::prelude::*;
     use lsp_server::{Connection, Message};
     use lsp_types::{ClientCapabilities, NumberOrString};
@@ -436,7 +307,7 @@ mod tests {
         let analysis = RwLock::new(analysis);
         let cache = super::SharedDiagnosticDataCache::default();
         let barrier = std::sync::Barrier::new(8);
-        for _ in 0..2 {
+        {
             let bundles = std::thread::scope(|scope| {
                 let workers = (0..8)
                     .map(|_| {
@@ -457,7 +328,6 @@ mod tests {
                     .iter()
                     .all(|bundle| Arc::ptr_eq(bundle, &bundles[0]))
             );
-            cache.invalidate();
         }
     }
 
@@ -554,53 +424,12 @@ mod tests {
         diagnose(&analysis);
         verify_that!(cache.cached_ptr(), eq(first_cached))?;
 
-        cache.invalidate();
-        verify_that!(cache.is_empty(), eq(true))?;
-
         Ok(())
     }
 
-    /// The scoped-sweep slot accumulates the touched set across a burst, hands
-    /// it out sorted exactly once, then reports nothing until the next note.
+    /// A workspace pull answers with every workspace file's diagnostics.
     #[gtest]
-    fn scoped_sweep_files_round_trip() -> Result<()> {
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
-        runtime.block_on(async {
-            let (connection, _peer) = Connection::memory();
-            let client = Arc::new(ClientProxy::new(connection));
-            let status_bar = Arc::new(StatusBar::new(client.clone(), true));
-            let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
-            let file_diagnostic = FileDiagnostic::new(analysis, status_bar, client, false);
-
-            verify_that!(file_diagnostic.take_scoped_sweep_files().await, none())?;
-
-            file_diagnostic
-                .note_scoped_sweep_files([FileId::new(7), FileId::new(3), FileId::new(7)])
-                .await;
-            file_diagnostic
-                .note_scoped_sweep_files([FileId::new(9)])
-                .await;
-            verify_that!(
-                file_diagnostic.take_scoped_sweep_files().await.as_deref(),
-                some(eq(&[FileId::new(3), FileId::new(7), FileId::new(9)]))
-            )?;
-            verify_that!(file_diagnostic.take_scoped_sweep_files().await, none())?;
-
-            file_diagnostic
-                .restore_scoped_sweep_files([FileId::new(5)])
-                .await;
-            verify_that!(
-                file_diagnostic.take_scoped_sweep_files().await.as_deref(),
-                some(eq(&[FileId::new(5)]))
-            )?;
-            Ok(())
-        })
-    }
-
-    /// A noted touched set scopes the fast pull's sweep to the files the burst
-    /// moved; without one the pull still sweeps every workspace file.
-    #[gtest]
-    fn fast_pull_scopes_to_noted_files() -> Result<()> {
+    fn workspace_pull_reports_every_workspace_file() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let (connection, _peer) = Connection::memory();
@@ -624,21 +453,15 @@ mod tests {
                 analysis.update_file_by_uri(&uri_b, Some("local b = 1".to_string()));
                 file_a
             };
-            let file_diagnostic = snapshot.file_diagnostic();
-
-            // Scoped: only the noted file is swept.
-            file_diagnostic.note_scoped_sweep_files([file_a]).await;
-            let report = file_diagnostic
-                .pull_workspace_diagnostics_fast(CancellationToken::new())
+            let report = snapshot
+                .file_diagnostic()
+                .workspace_diagnostics(&CancellationToken::new())
                 .await;
-            verify_that!(report.len(), eq(1))?;
-            verify_that!(&report[0].0, eq(&uri_a))?;
-
-            // Slot drained: the next pull sweeps the whole workspace again.
-            let report = file_diagnostic
-                .pull_workspace_diagnostics_fast(CancellationToken::new())
-                .await;
-            verify_that!(report.len(), eq(2))?;
+            let mut uris = report.iter().map(|stored| &stored.uri).collect::<Vec<_>>();
+            uris.sort_by_key(|uri| uri.as_str());
+            verify_that!(uris.len(), eq(2))?;
+            verify_that!(uris.contains(&&uri_a), eq(true))?;
+            let _ = file_a;
             Ok(())
         })
     }

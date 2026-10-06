@@ -2,22 +2,18 @@ use glua_code_analysis::{EmmyLuaAnalysis, FileId, Slice, UpdateProgress};
 use lsp_types::Uri;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use super::{ClientProxy, FileDiagnostic, file_diagnostic::SharedDiagnosticDataCache};
+use super::{ClientProxy, FileDiagnostic};
 
 const FRESHNESS_STUCK_WARN_AFTER: Duration = Duration::from_secs(5);
 
 /// How long one slice of a re-analysis holds the analysis write lock. A
 /// request waits for at most about one slice.
 const SLICE: Duration = Duration::from_millis(10);
-
-/// How long the user must stay idle after a reindex before the whole workspace
-/// is re-diagnosed.
-const IDLE_WORKSPACE_DIAGNOSTIC_DELAY: Duration = Duration::from_millis(2000);
 
 /// Breakdown of a freshness wait by observed state, so one summary line
 /// can report where the wait went without per-iteration logging.
@@ -89,13 +85,11 @@ pub struct DebouncedAnalysis {
     notify: Notify,
     reindex_notify: Notify,
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
-    shared_diagnostic_data_cache: SharedDiagnosticDataCache,
     /// Re-diagnoses the files an edit's re-analysis reports as affected.
     file_diagnostic: Arc<FileDiagnostic>,
     debounce_duration: Duration,
     shutdown: CancellationToken,
     client: Arc<ClientProxy>,
-    workspace_diagnostic_level: Arc<AtomicU8>,
     lsp_features: Arc<crate::context::LspFeatures>,
     /// Entries into [`Self::wait_until_fresh_for`], so a test can synchronise
     /// on a handler having reached the wait instead of on a deadline.
@@ -127,8 +121,6 @@ impl DebouncedAnalysis {
         shutdown: CancellationToken,
         client: Arc<ClientProxy>,
         file_diagnostic: Arc<FileDiagnostic>,
-        shared_diagnostic_data_cache: SharedDiagnosticDataCache,
-        workspace_diagnostic_level: Arc<AtomicU8>,
         lsp_features: Arc<crate::context::LspFeatures>,
     ) -> Self {
         Self {
@@ -145,12 +137,10 @@ impl DebouncedAnalysis {
             notify: Notify::new(),
             reindex_notify: Notify::new(),
             analysis,
-            shared_diagnostic_data_cache,
             file_diagnostic,
             debounce_duration: Duration::from_millis(debounce_ms),
             shutdown,
             client,
-            workspace_diagnostic_level,
             lsp_features,
             #[cfg(test)]
             freshness_waits: AtomicUsize::new(0),
@@ -663,42 +653,6 @@ impl DebouncedAnalysis {
             .find(|file_id| !analysis.compilation.is_settling(*file_id))
     }
 
-    /// Arm an idle workspace diagnostic refresh so closed files hit by
-    /// cross-file changes get re-diagnosed once typing pauses.
-    ///
-    /// Cancels the previously armed timer, if any. Clones the arcs it needs and
-    /// takes no lock: the caller may still hold one.
-    fn arm_idle_workspace_diagnostic(&self, token_slot: &mut Option<CancellationToken>) {
-        if let Some(token) = token_slot.take() {
-            token.cancel();
-        }
-        let cancel_token = CancellationToken::new();
-        *token_slot = Some(cancel_token.clone());
-
-        let client = self.client.clone();
-        let status = self.workspace_diagnostic_level.clone();
-        let lsp_features = self.lsp_features.clone();
-        let shutdown = self.shutdown.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = tokio::time::sleep(IDLE_WORKSPACE_DIAGNOSTIC_DELAY) => {
-                    if !cancel_token.is_cancelled() && !shutdown.is_cancelled() {
-                        // Raise, never lower: don't drop a pending Slow sweep.
-                        status.fetch_max(
-                            crate::context::WorkspaceDiagnosticLevel::Fast.to_u8(),
-                            Ordering::AcqRel,
-                        );
-                        if lsp_features.supports_refresh_diagnostic() {
-                            client.refresh_workspace_diagnostics();
-                        }
-                    }
-                }
-                _ = cancel_token.cancelled() => {}
-                _ = shutdown.cancelled() => {}
-            }
-        });
-    }
-
     /// Takes the edited files into the re-analysis under the write lock, on
     /// a blocking thread so neither the wait for the lock nor the work stalls
     /// the Tokio workers; the re-analysis then settles in slices. Returns
@@ -710,7 +664,6 @@ impl DebouncedAnalysis {
     ) -> bool {
         let profile = timing.is_some();
         let analysis = self.analysis.clone();
-        let cache = self.shared_diagnostic_data_cache.clone();
 
         tokio::select! {
             _ = self.shutdown.cancelled() => false,
@@ -720,9 +673,6 @@ impl DebouncedAnalysis {
                 let wait = wait_start.map(|start| start.elapsed()).unwrap_or_default();
                 let hold_start = profile.then(Instant::now);
                 guard.begin_reindex(file_ids);
-                // Under the write lock, so no reader sees the new index next
-                // to stale shared diagnostic data.
-                cache.invalidate();
                 let hold = hold_start.map(|start| start.elapsed()).unwrap_or_default();
                 (wait, hold)
             }) => match result {
@@ -752,7 +702,6 @@ impl DebouncedAnalysis {
             .map(|mut prioritised| std::mem::take(&mut *prioritised))
             .unwrap_or_default();
         let analysis = self.analysis.clone();
-        let cache = self.shared_diagnostic_data_cache.clone();
 
         tokio::select! {
             _ = self.shutdown.cancelled() => None,
@@ -762,7 +711,6 @@ impl DebouncedAnalysis {
                 let hold_start = crate::util::ls_profile::profile_instant();
                 guard.compilation.prioritise_update(&prioritised);
                 let progress = guard.advance_reindex(Slice::Until(Instant::now() + SLICE));
-                cache.invalidate();
                 let settled_first = edited
                     .into_iter()
                     .filter(|file_id| !guard.compilation.settles_first(*file_id))
@@ -821,12 +769,7 @@ impl DebouncedAnalysis {
     /// documents among them when what their diagnostics read moved after the
     /// client pulled them, and refreshes the client's derived views when the
     /// edit reached other files.
-    async fn refresh_affected(
-        &self,
-        edited: &[FileId],
-        affected: Vec<FileId>,
-        idle_workspace_diagnostic_token: &mut Option<CancellationToken>,
-    ) {
+    async fn refresh_affected(&self, edited: &[FileId], affected: Vec<FileId>) {
         self.file_diagnostic.store().note_settled();
         if affected.is_empty() {
             return;
@@ -839,13 +782,7 @@ impl DebouncedAnalysis {
                 self.client.refresh_inlay_hints();
             }
         }
-        self.file_diagnostic
-            .store()
-            .invalidate(affected.iter().copied(), edited);
-        self.file_diagnostic
-            .note_scoped_sweep_files(affected.iter().copied())
-            .await;
-        self.arm_idle_workspace_diagnostic(idle_workspace_diagnostic_token);
+        self.file_diagnostic.store().invalidate(affected, edited);
     }
 
     /// Background loop: waits for edits, debounces them, takes them into the
@@ -853,7 +790,6 @@ impl DebouncedAnalysis {
     /// so requests run between them. New edits pre-empt the slices and are
     /// taken in, settling first. Spawn this once at server startup.
     pub async fn run(&self) {
-        let mut idle_workspace_diagnostic_token: Option<CancellationToken> = None;
         // The edited files of the re-analysis in progress.
         let mut edited: Vec<FileId> = Vec::new();
         let mut cycle = None;
@@ -981,8 +917,7 @@ impl DebouncedAnalysis {
                     if let Some(cycle) = cycle.take() {
                         crate::util::ls_profile::emit_ls_settled(cycle, affected.len());
                     }
-                    self.refresh_affected(&settled, affected, &mut idle_workspace_diagnostic_token)
-                        .await;
+                    self.refresh_affected(&settled, affected).await;
                     self.refresh_dirty_state().await;
                 }
                 // A didChange applied its text; its schedule pre-empts.
@@ -1069,7 +1004,7 @@ impl Drop for InFlightChangeGuard {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     use super::Freshness;
@@ -1102,15 +1037,12 @@ mod tests {
             client.clone(),
             false,
         ));
-        let shared_diagnostic_data_cache = file_diagnostic.shared_diagnostic_data_cache();
         Arc::new(DebouncedAnalysis::new(
             analysis,
             0,
             CancellationToken::new(),
             client,
             file_diagnostic,
-            shared_diagnostic_data_cache,
-            Arc::new(AtomicU8::new(0)),
             test_lsp_features(),
         ))
     }
@@ -1459,8 +1391,6 @@ mod tests {
                 shutdown.clone(),
                 client,
                 file_diagnostic.clone(),
-                file_diagnostic.shared_diagnostic_data_cache(),
-                Arc::new(AtomicU8::new(0)),
                 test_lsp_features(),
             ));
             file_diagnostic
@@ -1470,6 +1400,7 @@ mod tests {
             let initial_diagnostics = file_diagnostic
                 .pull_file_diagnostics(user_uri.clone(), CancellationToken::new())
                 .await
+                .map(|stored| stored.diagnostics.to_vec())
                 .unwrap_or_default();
             verify_that!(
                 has_diagnostic_code(&initial_diagnostics, DiagnosticCode::DiscardReturns),
@@ -1492,12 +1423,13 @@ mod tests {
 
             let affected = settle(&debounced_analysis, vec![api_file_id]).await;
             debounced_analysis
-                .refresh_affected(&[api_file_id], affected, &mut None)
+                .refresh_affected(&[api_file_id], affected)
                 .await;
 
             let updated_diagnostics = file_diagnostic
                 .pull_file_diagnostics(user_uri, CancellationToken::new())
                 .await
+                .map(|stored| stored.diagnostics.to_vec())
                 .unwrap_or_default();
             verify_that!(
                 has_diagnostic_code(&updated_diagnostics, DiagnosticCode::DiscardReturns),
@@ -1534,7 +1466,6 @@ mod tests {
             client.clone(),
             false,
         ));
-        let shared_diagnostic_data_cache = file_diagnostic.shared_diagnostic_data_cache();
         let shutdown = CancellationToken::new();
         let debounced_analysis = Arc::new(DebouncedAnalysis::new(
             analysis,
@@ -1542,8 +1473,6 @@ mod tests {
             shutdown.clone(),
             client,
             file_diagnostic.clone(),
-            shared_diagnostic_data_cache,
-            Arc::new(AtomicU8::new(0)),
             test_lsp_features(),
         ));
         file_diagnostic
@@ -1681,15 +1610,12 @@ mod tests {
                 client.clone(),
                 false,
             ));
-            let shared_diagnostic_data_cache = file_diagnostic.shared_diagnostic_data_cache();
             let debounced_analysis = Arc::new(DebouncedAnalysis::new(
                 analysis.clone(),
                 60_000,
                 CancellationToken::new(),
                 client,
                 file_diagnostic,
-                shared_diagnostic_data_cache,
-                Arc::new(AtomicU8::new(0)),
                 test_lsp_features(),
             ));
             let loop_task = tokio::spawn({
@@ -1773,15 +1699,12 @@ mod tests {
                 client.clone(),
                 false,
             ));
-            let shared_diagnostic_data_cache = file_diagnostic.shared_diagnostic_data_cache();
             let debounced_analysis = Arc::new(DebouncedAnalysis::new(
                 analysis.clone(),
                 60_000,
                 CancellationToken::new(),
                 client,
                 file_diagnostic,
-                shared_diagnostic_data_cache,
-                Arc::new(AtomicU8::new(0)),
                 test_lsp_features(),
             ));
             let loop_task = tokio::spawn({
@@ -1858,15 +1781,12 @@ mod tests {
                 client.clone(),
                 false,
             ));
-            let shared_diagnostic_data_cache = file_diagnostic.shared_diagnostic_data_cache();
             let debounced_analysis = Arc::new(DebouncedAnalysis::new(
                 analysis.clone(),
                 60_000,
                 CancellationToken::new(),
                 client,
                 file_diagnostic,
-                shared_diagnostic_data_cache,
-                Arc::new(AtomicU8::new(0)),
                 test_lsp_features(),
             ));
             let loop_task = tokio::spawn({

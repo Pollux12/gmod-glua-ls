@@ -90,11 +90,6 @@ pub async fn on_did_change_watched_files(
             .into_iter()
             .filter_map(|file_id| Some((file_id, analysis.get_uri(file_id)?)))
             .collect::<Vec<_>>();
-        if !staged.is_empty() {
-            context
-                .file_diagnostic()
-                .invalidate_shared_diagnostic_data();
-        }
         staged
     };
     let debounced_analysis = context.debounced_analysis_arc();
@@ -114,27 +109,7 @@ pub async fn on_did_change_watched_files(
         .into_iter()
         .map(|(file_id, _)| file_id)
         .collect::<Vec<_>>();
-    store.invalidate(file_ids.iter().copied(), &[]);
-
-    // The changed files scope the armed pull's sweep below; the loop adds the
-    // files the re-analysis moves, so it never covers the whole workspace.
-    context
-        .file_diagnostic()
-        .note_scoped_sweep_files(file_ids.iter().copied())
-        .await;
-
-    // Those tasks update the server's report for each file; a client that
-    // fetches diagnostics needs to be told to fetch again, since nothing is
-    // pushed to it any more. Raise the workspace level first: a pull answered
-    // while the level is `None` reports no items at all.
-    if context.lsp_features().supports_refresh_diagnostic() {
-        context
-            .workspace_manager()
-            .read()
-            .await
-            .update_workspace_version(crate::context::WorkspaceDiagnosticLevel::Fast, false);
-        context.client().refresh_workspace_diagnostics();
-    }
+    store.invalidate(file_ids, &[]);
 
     // Handle editorconfig / emmyrc updates
     {

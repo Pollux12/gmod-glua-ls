@@ -191,11 +191,6 @@ pub async fn initialized_handler(
         workspace_diagnostic_configs,
         workspace_emmyrcs,
         watchdog_status.clone(),
-        context
-            .workspace_manager()
-            .read()
-            .await
-            .workspace_diagnostic_level_arc(),
     )
     .await;
 
@@ -216,7 +211,6 @@ pub async fn init_analysis(
     workspace_diagnostic_configs: HashMap<PathBuf, LuaDiagnosticConfig>,
     workspace_emmyrcs: HashMap<PathBuf, Arc<Emmyrc>>,
     watchdog_status: LongRunningWatchdogStatus,
-    workspace_diagnostic_level: Arc<std::sync::atomic::AtomicU8>,
 ) {
     if let Ok(emmyrc_json) = serde_json::to_string_pretty(emmyrc.as_ref()) {
         log::info!("current config : {}", emmyrc_json);
@@ -382,7 +376,6 @@ pub async fn init_analysis(
     };
     let library_collisions = mut_analysis.library_definition_collisions();
 
-    file_diagnostic.invalidate_shared_diagnostic_data();
     drop(mut_analysis);
 
     watchdog_status.set_phase("Workspace index ready");
@@ -419,7 +412,6 @@ pub async fn init_analysis(
         let url_contents = fetch_schema_urls(schema_urls).await;
         let mut mut_analysis = analysis.write().await;
         mut_analysis.apply_fetched_schemas(url_contents);
-        file_diagnostic.invalidate_shared_diagnostic_data();
         watchdog_status.set_phase("JSON schema fetch/apply complete");
         status_bar.update_startup_phase(
             ProgressTask::LoadWorkspace,
@@ -445,23 +437,14 @@ pub async fn init_analysis(
         client.refresh_code_lens();
     }
 
-    if lsp_features.supports_workspace_diagnostic() {
-        // The pending level is claimed by whichever pull arrives first and
-        // reset to `None`, so a pull racing startup consumes the workspace's
-        // one level against a half-built index. Re-arm before asking the
-        // client to pull again, or the request is a no-op.
-        workspace_diagnostic_level.fetch_max(
-            crate::context::WorkspaceDiagnosticLevel::Slow.to_u8(),
-            std::sync::atomic::Ordering::AcqRel,
-        );
-        if lsp_features.supports_refresh_diagnostic() {
-            client.refresh_workspace_diagnostics();
-        }
-    } else {
-        log::info!("client does not support workspace diagnostics; scheduling push diagnostics");
-        file_diagnostic
-            .add_workspace_diagnostic_task(0, false)
-            .await;
+    // Every file's diagnostics are computed again under what was just
+    // loaded; the ones that left the workspace are cleared.
+    file_diagnostic.forget_missing().await;
+    file_diagnostic
+        .add_workspace_diagnostic_task(0, false)
+        .await;
+    if lsp_features.supports_refresh_diagnostic() {
+        client.refresh_workspace_diagnostics();
     }
 }
 
@@ -648,9 +631,6 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             LongRunningWatchdogStatus::new("test"),
-            Arc::new(std::sync::atomic::AtomicU8::new(
-                crate::context::WorkspaceDiagnosticLevel::None.to_u8(),
-            )),
         ));
 
         let mut methods = Vec::new();

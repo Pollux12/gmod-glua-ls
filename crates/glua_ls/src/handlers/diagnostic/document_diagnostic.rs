@@ -5,7 +5,6 @@ use lsp_types::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::diagnostic_result_id;
 use crate::context::{Freshness, ServerContextSnapshot};
 
 fn full_report(
@@ -39,9 +38,8 @@ async fn keep_client_state(
         return unchanged_report(result_id);
     }
 
-    if let Some(items) = context.file_diagnostic().cached_file_diagnostics(uri).await {
-        let result_id = diagnostic_result_id(&items);
-        return full_report(Some(result_id), items);
+    if let Some(stored) = context.file_diagnostic().cached_file_diagnostics(uri).await {
+        return full_report(Some(stored.wire_id()), stored.diagnostics.to_vec());
     }
 
     full_report(None, Vec::new())
@@ -67,7 +65,7 @@ pub async fn on_pull_document_diagnostic(
         return keep_client_state(&context, &uri, previous_result_id).await;
     }
 
-    let Some(diagnostics) = context
+    let Some(stored) = context
         .file_diagnostic()
         .pull_file_diagnostics(uri.clone(), token.clone())
         .await
@@ -80,12 +78,12 @@ pub async fn on_pull_document_diagnostic(
         };
     };
 
-    let result_id = diagnostic_result_id(&diagnostics);
+    let result_id = stored.wire_id();
     if previous_result_id.as_deref() == Some(result_id.as_str()) {
         return unchanged_report(result_id);
     }
 
-    full_report(Some(result_id), diagnostics)
+    full_report(Some(result_id), stored.diagnostics.to_vec())
 }
 
 #[cfg(test)]
@@ -126,7 +124,9 @@ mod tests {
                 .file_diagnostic()
                 .pull_file_diagnostics(uri.clone(), tokio_util::sync::CancellationToken::new())
                 .await
-                .expect("the file has diagnostics");
+                .expect("the file has diagnostics")
+                .diagnostics
+                .to_vec();
             verify_that!(items.is_empty(), eq(false))?;
 
             let result = keep_client_state(&snapshot, &uri, None).await;

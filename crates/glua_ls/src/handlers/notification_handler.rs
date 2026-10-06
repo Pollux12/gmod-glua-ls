@@ -11,7 +11,7 @@ use lsp_types::{
     },
 };
 
-use crate::context::{ServerContext, ServerContextSnapshot, WorkspaceDiagnosticLevel};
+use crate::context::{ServerContext, ServerContextSnapshot};
 
 use super::{
     configuration::on_did_change_configuration,
@@ -111,11 +111,8 @@ pub async fn on_notification_handler(
             {
                 let mut workspace = snapshot.workspace_manager().write().await;
                 workspace.current_open_files.insert(uri.clone());
-                workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, true);
             }
             server_context.cancel_text_requests_for_uri(&uri).await;
-            // The in-flight workspace sweep is deliberately left to finish:
-            // cancelling restarts it from scratch, which livelocks large scans.
             let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
             let task_snapshot = snapshot.clone();
             tokio::spawn(async move {
@@ -144,11 +141,8 @@ pub async fn on_notification_handler(
             {
                 let mut workspace = snapshot.workspace_manager().write().await;
                 workspace.current_open_files.remove(&uri);
-                workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, true);
             }
             server_context.cancel_text_requests_for_uri(&uri).await;
-            // The in-flight workspace sweep is deliberately left to finish —
-            // see the didOpen branch above.
             let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
             let task_snapshot = snapshot.clone();
             tokio::spawn(async move {

@@ -74,9 +74,6 @@ pub async fn on_did_rename_files_handler(
             .into_iter()
             .filter_map(|file_id| Some((file_id, analysis.get_uri(file_id)?)))
             .collect::<Vec<_>>();
-        context
-            .file_diagnostic()
-            .invalidate_shared_diagnostic_data();
         drop(analysis);
 
         let debounced_analysis = context.debounced_analysis_arc();
@@ -93,18 +90,6 @@ pub async fn on_did_rename_files_handler(
                 .file_diagnostic()
                 .store()
                 .invalidate(renamed.iter().copied(), &[]);
-            context
-                .file_diagnostic()
-                .note_scoped_sweep_files(renamed.iter().copied())
-                .await;
-            context
-                .workspace_manager()
-                .read()
-                .await
-                .update_workspace_version(crate::context::WorkspaceDiagnosticLevel::Fast, false);
-            if context.lsp_features().supports_refresh_diagnostic() {
-                context.client().refresh_workspace_diagnostics();
-            }
         }
 
         let analysis = context.analysis().read().await;

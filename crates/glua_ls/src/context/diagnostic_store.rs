@@ -30,6 +30,13 @@ pub struct StoredDiagnostics {
     pub result_id: u64,
 }
 
+impl StoredDiagnostics {
+    /// The result id as the client holds it.
+    pub fn wire_id(&self) -> String {
+        format!("{:016x}", self.result_id)
+    }
+}
+
 struct Entry {
     stored: StoredDiagnostics,
     config_gen: u64,
@@ -108,9 +115,10 @@ pub struct DiagnosticStore {
     computed: Notify,
     /// Signalled when a re-analysis settles, for the verifier.
     settled: Notify,
-    /// Where changed diagnostics are published; `None` while the client
-    /// fetches them instead.
-    publish: Option<Arc<ClientProxy>>,
+    client: Arc<ClientProxy>,
+    /// Whether the client fetches diagnostics instead of having them
+    /// published.
+    fetches: bool,
     /// `GLUALS_DIAG_VERIFY`: every stored result is checked against a fresh
     /// computation, and a difference logged as `LS_DIAG_DRIFT`.
     verify: bool,
@@ -120,7 +128,8 @@ impl DiagnosticStore {
     pub(crate) fn new(
         analysis: Arc<RwLock<EmmyLuaAnalysis>>,
         shared: SharedDiagnosticDataCache,
-        publish: Option<Arc<ClientProxy>>,
+        client: Arc<ClientProxy>,
+        fetches: bool,
     ) -> Self {
         Self {
             analysis,
@@ -129,7 +138,8 @@ impl DiagnosticStore {
             dirtied: Notify::new(),
             computed: Notify::new(),
             settled: Notify::new(),
-            publish,
+            client,
+            fetches,
             verify: std::env::var_os("GLUALS_DIAG_VERIFY").is_some(),
         }
     }
@@ -242,14 +252,52 @@ impl DiagnosticStore {
             state.open.remove(&file_id);
             state.entries.remove(&file_id).is_some()
         };
-        if had && let Some(client) = &self.publish {
-            client.publish_diagnostics(PublishDiagnosticsParams {
-                uri: uri.clone(),
+        if had {
+            self.cleared(uri.clone());
+        }
+        self.computed.notify_waiters();
+    }
+
+    /// Forgets every file not in `live`, clearing what the client shows for
+    /// those it had diagnostics for.
+    pub fn forget_missing(&self, live: &HashSet<FileId>) {
+        let gone = {
+            let mut state = self.state();
+            let missing = state
+                .entries
+                .keys()
+                .chain(state.dirty.keys())
+                .filter(|file_id| !live.contains(file_id))
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let mut gone = Vec::new();
+            for file_id in missing {
+                if let Some((_, token)) = state.computing.remove(&file_id) {
+                    token.cancel();
+                }
+                if let Some((priority, sequence)) = state.dirty.remove(&file_id) {
+                    state.queue.remove(&(priority, sequence, file_id));
+                }
+                if let Some(entry) = state.entries.remove(&file_id) {
+                    gone.push(entry.stored.uri);
+                }
+            }
+            gone
+        };
+        for uri in gone {
+            self.cleared(uri);
+        }
+        self.computed.notify_waiters();
+    }
+
+    fn cleared(&self, uri: Uri) {
+        if !self.fetches {
+            self.client.publish_diagnostics(PublishDiagnosticsParams {
+                uri,
                 diagnostics: Vec::new(),
                 version: None,
             });
         }
-        self.computed.notify_waiters();
     }
 
     /// A watchdog detail naming the files being computed.
@@ -354,6 +402,19 @@ impl DiagnosticStore {
         cancel: &CancellationToken,
         mut progress: impl FnMut(usize),
     ) -> Vec<StoredDiagnostics> {
+        {
+            let mut state = self.state();
+            for &file_id in file_ids {
+                if !state.is_valid(file_id)
+                    && !state.dirty.contains_key(&file_id)
+                    && !state.computing.contains_key(&file_id)
+                {
+                    let priority = state.priority_of(file_id, false);
+                    state.invalidate(file_id, priority);
+                }
+            }
+        }
+        self.dirtied.notify_waiters();
         let mut stored = Vec::with_capacity(file_ids.len());
         for (done, &file_id) in file_ids.iter().enumerate() {
             progress(done);
@@ -421,8 +482,9 @@ impl DiagnosticStore {
             job.token.clone(),
         )
         .await;
-        let published = {
+        let (published, open) = {
             let mut state = self.state();
+            let open = state.open.contains(&job.file_id);
             let current = state
                 .computing
                 .get(&job.file_id)
@@ -435,11 +497,11 @@ impl DiagnosticStore {
                 Computed::Cancelled => {
                     let priority = state.priority_of(job.file_id, false);
                     state.invalidate(job.file_id, priority);
-                    None
+                    (None, open)
                 }
                 Computed::Gone => {
                     state.entries.remove(&job.file_id);
-                    None
+                    (None, open)
                 }
                 Computed::Diagnostics(uri, diagnostics) => {
                     let result_id = result_id(&diagnostics);
@@ -459,20 +521,24 @@ impl DiagnosticStore {
                             config_gen: job.config_gen,
                         },
                     );
-                    changed.then_some(stored)
+                    (changed.then_some(stored), open)
                 }
             }
         };
         self.computed.notify_waiters();
         self.dirtied.notify_waiters();
-        if let Some(stored) = published
-            && let Some(client) = &self.publish
-        {
-            client.publish_diagnostics(PublishDiagnosticsParams {
-                uri: stored.uri,
-                diagnostics: stored.diagnostics.to_vec(),
-                version: None,
-            });
+        if let Some(stored) = published {
+            if !self.fetches {
+                self.client.publish_diagnostics(PublishDiagnosticsParams {
+                    uri: stored.uri,
+                    diagnostics: stored.diagnostics.to_vec(),
+                    version: None,
+                });
+            } else if open {
+                // The client ignores workspace reports for open documents,
+                // so it pulls them again.
+                self.client.refresh_workspace_diagnostics();
+            }
         }
     }
 

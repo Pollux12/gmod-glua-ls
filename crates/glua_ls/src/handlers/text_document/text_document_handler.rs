@@ -10,7 +10,7 @@ use rowan::NodeCache;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::context::{ServerContextSnapshot, WorkspaceDiagnosticLevel};
+use crate::context::ServerContextSnapshot;
 
 struct PreparsedDocument {
     tree: LuaSyntaxTree,
@@ -134,9 +134,6 @@ async fn check_schema_update(context: &ServerContextSnapshot) {
 
     let mut write_analysis = context.analysis().write().await;
     write_analysis.apply_fetched_schemas(url_contents);
-    context
-        .file_diagnostic()
-        .invalidate_shared_diagnostic_data();
 }
 
 async fn preparse_document(text: String, emmyrc: Arc<Emmyrc>) -> Option<PreparsedDocument> {
@@ -228,34 +225,10 @@ pub async fn on_did_save_text_document(
     _: DidSaveTextDocumentParams,
 ) -> Option<()> {
     let emmyrc = context.analysis().read().await.get_emmyrc();
-    if !emmyrc.workspace.enable_reindex {
-        if context.lsp_features().supports_workspace_diagnostic() {
-            context
-                .file_diagnostic()
-                .cancel_workspace_diagnostic()
-                .await;
-
-            {
-                let workspace_manager = context.workspace_manager().write().await;
-                workspace_manager.update_workspace_version(WorkspaceDiagnosticLevel::Slow, true);
-            }
-
-            check_schema_update(&context).await;
-        }
-
-        return Some(());
-    }
-
-    let mut duration = emmyrc.workspace.reindex_duration;
-    // if duration is less than 1000ms, set it to 1000ms
-    if duration < 1000 {
-        duration = 1000;
-    }
-    {
+    if emmyrc.workspace.enable_reindex {
+        let delay = Duration::from_millis(emmyrc.workspace.reindex_duration.max(1000));
         let workspace = context.workspace_manager().read().await;
-        workspace
-            .reindex_workspace(Duration::from_millis(duration))
-            .await;
+        workspace.recheck_workspace(delay).await;
     }
 
     check_schema_update(&context).await;
@@ -354,7 +327,7 @@ pub async fn on_did_change_text_document(
     // Handle reindex without holding locks
     if emmyrc.workspace.enable_reindex {
         let workspace = context.workspace_manager().read().await;
-        workspace.extend_reindex_delay().await;
+        workspace.extend_recheck_delay().await;
     }
 
     Some(())
@@ -403,11 +376,6 @@ pub async fn on_did_close_document(
             .stage_file_system_changes(vec![(uri.clone(), text)])
             .into_iter()
             .next();
-        if staged.is_some() {
-            context
-                .file_diagnostic()
-                .invalidate_shared_diagnostic_data();
-        }
         (staged, analysis.get_file_id(uri))
     };
     let store = context.file_diagnostic().store();

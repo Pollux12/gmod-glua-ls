@@ -18,7 +18,7 @@ use super::checker::{
 };
 use super::{checker::check_file, lua_diagnostic_config::LuaDiagnosticConfig};
 use crate::semantic::LuaAnalysisPhase;
-use crate::{DbIndex, DiagnosticCode, Emmyrc, FileId, LuaCompilation, WorkspaceId};
+use crate::{DiagnosticCode, Emmyrc, FileId, LuaCompilation, WorkspaceId};
 use lsp_types::Diagnostic;
 use tokio_util::sync::CancellationToken;
 
@@ -35,12 +35,11 @@ impl Default for LuaDiagnostic {
     }
 }
 
-/// Snapshot gating every index-derived diagnostic component. The index is a
-/// function of the file contents and the workspace layout, so an unchanged
-/// content revision and layout proves every component is still current.
+/// Snapshot gating every index-derived diagnostic component: an unchanged
+/// index revision and layout proves every component is still current.
 #[derive(Clone, PartialEq, Eq)]
 struct DiagnosticRevisionSnapshot {
-    content_revision: u64,
+    index_revision: u64,
     main_workspace_file_ids: Vec<FileId>,
     local_file_ids: Vec<FileId>,
     main_workspace_ids: Vec<WorkspaceId>,
@@ -48,13 +47,13 @@ struct DiagnosticRevisionSnapshot {
 
 impl DiagnosticRevisionSnapshot {
     fn capture(
-        db: &DbIndex,
+        compilation: &LuaCompilation,
         main_workspace_file_ids: Vec<FileId>,
         local_file_ids: Vec<FileId>,
         main_workspace_ids: Vec<WorkspaceId>,
     ) -> Self {
         Self {
-            content_revision: db.get_vfs().content_revision(),
+            index_revision: compilation.index_revision(),
             main_workspace_file_ids,
             local_file_ids,
             main_workspace_ids,
@@ -126,7 +125,8 @@ impl SharedDiagnosticComponentCache {
 
     /// True when every slot is populated for `db`'s current snapshot: the
     /// cached bundle may be reused whole.
-    pub fn is_fresh(&self, db: &DbIndex) -> bool {
+    pub fn is_fresh(&self, compilation: &LuaCompilation) -> bool {
+        let db = compilation.get_db();
         let module_index = db.get_module_index();
         let mut workspace_file_ids = module_index.get_main_workspace_file_ids();
         workspace_file_ids.sort_unstable();
@@ -135,7 +135,7 @@ impl SharedDiagnosticComponentCache {
         let mut main_workspace_ids = module_index.get_main_workspace_ids();
         main_workspace_ids.sort_by_key(|workspace_id| workspace_id.id);
         let snapshot = DiagnosticRevisionSnapshot::capture(
-            db,
+            compilation,
             workspace_file_ids.clone(),
             local_file_ids,
             main_workspace_ids.clone(),
@@ -378,7 +378,7 @@ impl LuaDiagnostic {
         let mut main_workspace_ids = module_index.get_main_workspace_ids();
         main_workspace_ids.sort_by_key(|workspace_id| workspace_id.id);
         let snapshot = DiagnosticRevisionSnapshot::capture(
-            db,
+            compilation,
             workspace_file_ids.clone(),
             realm_candidate_file_ids.clone(),
             main_workspace_ids.clone(),

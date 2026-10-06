@@ -42,6 +42,8 @@ pub struct LuaCompilation {
     reanalysis: Mutex<Option<analyzer::Reanalysis>>,
     /// The VFS content revision the re-analysis in progress took its text at.
     taken_revision: u64,
+    /// Bumped whenever the index may change; see [`Self::index_revision`].
+    index_revision: u64,
     /// The scripted scopes, lent to each re-analysis.
     scopes: analyzer::ScopesCache,
     /// Each file's inference memo from the last settled re-analysis, which
@@ -74,6 +76,7 @@ impl LuaCompilation {
             schedule: Schedule::default(),
             reanalysis: Mutex::default(),
             taken_revision: 0,
+            index_revision: 0,
             scopes: analyzer::ScopesCache::default(),
             memos: Mutex::default(),
         };
@@ -139,6 +142,7 @@ impl LuaCompilation {
     /// [`Self::advance_update`].
     pub fn begin_update(&mut self, file_ids: Vec<FileId>) {
         self.file_diagnostic_reads();
+        self.index_revision += 1;
         if let Some(log) = &mut self.batch_log {
             log.push(file_ids.clone());
         }
@@ -169,6 +173,7 @@ impl LuaCompilation {
     /// Advances the re-analysis in progress by `slice`.
     pub fn advance_update(&mut self, slice: Slice) -> UpdateProgress {
         self.file_diagnostic_reads();
+        self.index_revision += 1;
         let session = self
             .reanalysis
             .get_mut()
@@ -339,6 +344,7 @@ impl LuaCompilation {
             schedule: self.schedule,
             reanalysis: Mutex::default(),
             taken_revision: self.taken_revision,
+            index_revision: self.index_revision,
             scopes: analyzer::ScopesCache::default(),
             memos: Mutex::default(),
         }
@@ -357,10 +363,12 @@ impl LuaCompilation {
 
     pub fn remove_index(&mut self, file_ids: Vec<FileId>) {
         self.file_diagnostic_reads();
+        self.index_revision += 1;
         self.db.remove_index(file_ids);
     }
 
     pub fn clear_index(&mut self) {
+        self.index_revision += 1;
         *self
             .reanalysis
             .get_mut()
@@ -387,11 +395,19 @@ impl LuaCompilation {
 
     pub fn get_db_mut(&mut self) -> &mut DbIndex {
         self.file_diagnostic_reads();
+        self.index_revision += 1;
         &mut self.db
+    }
+
+    /// Changes whenever the index may have changed since it was last read:
+    /// every path that writes it bumps the revision first.
+    pub fn index_revision(&self) -> u64 {
+        self.index_revision
     }
 
     pub fn update_config(&mut self, config: Arc<Emmyrc>) {
         self.file_diagnostic_reads();
+        self.index_revision += 1;
         self.scopes = analyzer::ScopesCache::default();
         self.emmyrc = config.clone();
         self.db.update_config(config);
