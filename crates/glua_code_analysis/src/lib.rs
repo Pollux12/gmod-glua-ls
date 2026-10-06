@@ -493,8 +493,10 @@ impl EmmyLuaAnalysis {
 
     /// Starts re-analysing `file_ids` from the text the VFS holds for them, or
     /// takes them into the re-analysis in progress, which settles them first.
+    /// A file whose text an earlier take already took is not taken again.
     /// Advance it with [`Self::advance_reindex`].
-    pub fn begin_reindex(&mut self, file_ids: Vec<FileId>) {
+    pub fn begin_reindex(&mut self, mut file_ids: Vec<FileId>) {
+        file_ids.retain(|file_id| self.has_untaken_text(*file_id));
         self.compilation.begin_update(file_ids);
     }
 

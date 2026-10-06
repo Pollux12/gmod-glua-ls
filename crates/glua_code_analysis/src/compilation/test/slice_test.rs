@@ -39,6 +39,13 @@ Ledger = { total = total, back = Label }
                 r#"local money = Config.Money
 Label = { text = Config.Name .. money, ledger = Ledger }
 local recorded = Ledger.total
+
+---@generic T
+---@param name `T`
+---@return T
+function MakeLabel(name)
+    return nil
+end
 "#,
             ),
         ]
@@ -64,6 +71,9 @@ end
 Label = { text = money, ledger = Ledger }
 local recorded = Ledger.back
 "#;
+
+    /// `cl_label.lua` cut to far fewer bytes than its positions reach.
+    const SHORT_LABEL: &str = "Label = {}\n";
 
     fn workspace() -> VirtualWorkspace {
         let mut ws = VirtualWorkspace::new();
@@ -493,5 +503,64 @@ local directional = state.directional
 
         assert_eq!(progress, UpdateProgress::TextChanged);
         assert!(ws.analysis.compilation.is_updating());
+    }
+
+    /// A take also takes text staged before it that it was not given, so no
+    /// slice reads the index against text it was not built from.
+    #[test]
+    fn a_take_takes_every_file_whose_text_changed() {
+        let mut ws = workspace();
+        let config = stage_text(&mut ws, CONFIG, EDITED_CONFIG);
+        let label = stage_text(&mut ws, LABEL, SHORT_LABEL);
+        ws.analysis.begin_reindex(vec![config]);
+
+        assert!(ws.analysis.compilation.has_taken_text(label));
+        settle(&mut ws, 1, |_| {});
+        assert_settled(
+            &ws,
+            &cold(&[(CONFIG, EDITED_CONFIG), (LABEL, SHORT_LABEL)]),
+            "text the take was not given",
+        );
+    }
+
+    /// A file an earlier take already took is not rebuilt when a later take
+    /// names it.
+    #[test]
+    fn a_file_already_taken_is_not_taken_again() {
+        let evaluations = |name_label_again: bool| {
+            let mut ws = workspace();
+            let config = stage_text(&mut ws, CONFIG, EDITED_CONFIG);
+            let label = stage_text(&mut ws, LABEL, SHORT_LABEL);
+            ws.analysis.begin_reindex(vec![config]);
+            if name_label_again {
+                ws.analysis.begin_reindex(vec![label]);
+            }
+            settle(&mut ws, 1, |_| {});
+            ws.analysis.compilation.last_stats().total_evaluations()
+        };
+
+        assert_eq!(evaluations(true), evaluations(false));
+    }
+
+    /// A take that lands before the previous take's pass opened, its file's
+    /// text already shorter, settles as a cold build of both edits.
+    #[test]
+    fn a_take_onto_a_pass_not_yet_opened_matches_a_cold_build() {
+        let mut ws = workspace();
+        let config = stage_text(&mut ws, CONFIG, EDITED_CONFIG);
+        ws.analysis.begin_reindex(vec![config]);
+        let label = stage_text(&mut ws, LABEL, SHORT_LABEL);
+        assert_eq!(
+            ws.analysis.advance_reindex(Slice::Whole),
+            UpdateProgress::TextChanged
+        );
+
+        ws.analysis.begin_reindex(vec![label]);
+        settle(&mut ws, 1, |_| {});
+        assert_settled(
+            &ws,
+            &cold(&[(CONFIG, EDITED_CONFIG), (LABEL, SHORT_LABEL)]),
+            "take onto an unopened pass",
+        );
     }
 }

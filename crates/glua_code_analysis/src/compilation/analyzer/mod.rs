@@ -225,7 +225,7 @@ impl Reanalysis {
     ) {
         // What a pending pass's rebuild moved is queued under the edits it
         // was taken with; source layers are rebuilt at the stage outside a run.
-        self.open_pass(db);
+        self.queue_pending_readers(db);
         db.set_analysis_stage(derivation::AnalysisStage::Closed);
         refresh_payload_refs(db, self.engine.payload_holders());
         self.engine.take_edits(edits);
@@ -273,6 +273,18 @@ impl Reanalysis {
         self.access_paths = crate::semantic::stop_keeping_access_paths();
         self.pause(db);
         settled
+    }
+
+    /// Queues the readers of what a pending pass's rebuild moved, leaving it
+    /// to open at the next slice: the files being taken in hold text their
+    /// index is not built from yet, which opening a pass would read.
+    fn queue_pending_readers(&mut self, db: &mut DbIndex) {
+        if let Some(Pass::Replaced { touched, .. }) = &mut self.pass {
+            let touched = std::mem::take(touched);
+            crate::profile::phase("reanalyze: readers of touched", || {
+                self.engine.readers_of(db, touched.iter())
+            });
+        }
     }
 
     /// Queues the readers of what the pass's rebuild moved and opens the run.

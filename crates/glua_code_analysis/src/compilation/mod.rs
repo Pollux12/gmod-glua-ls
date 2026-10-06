@@ -142,10 +142,15 @@ impl LuaCompilation {
     }
 
     /// Starts re-analysing `file_ids` from their current text, and whatever
-    /// read a fact that moved; see [`analyzer::Reanalysis`]. A re-analysis in
-    /// progress takes them in and settles them first. Advance it with
+    /// read a fact that moved; see [`analyzer::Reanalysis`]. Every other file
+    /// whose text changed since a re-analysis took it is taken too, so the
+    /// index is never read against text it was not built from. A re-analysis
+    /// in progress takes them in and settles them first. Advance it with
     /// [`Self::advance_update`].
-    pub fn begin_update(&mut self, file_ids: Vec<FileId>) {
+    pub fn begin_update(&mut self, mut file_ids: Vec<FileId>) {
+        file_ids.extend(self.db.get_vfs().files_changed_since_taken());
+        file_ids.sort_unstable();
+        file_ids.dedup();
         self.file_diagnostic_reads();
         self.index_revision += 1;
         if let Some(log) = &mut self.batch_log {
