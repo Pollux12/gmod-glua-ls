@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use rustc_hash::FxHashMap as HashMap;
 
 use super::member_id_sort_key;
-use crate::db_index::cow_shards::{Conflict, Merged, merge_list};
+use crate::db_index::cow_shards::{Merged, merge_list};
 use crate::db_index::derivation::{Fingerprint, fingerprint_of, mapping_back};
 use crate::{LuaMemberId, LuaMemberIndexItem, LuaMemberKey};
 
@@ -110,18 +110,18 @@ impl LuaOwnerMembers {
         self.members.insert(key, item);
     }
 
-    /// Merges two tasks' changes to one owner's members key by key; two
-    /// tasks changing one key's item, or removing the owner, conflict.
+    /// Merges two tasks' changes to one owner's members key by key. An absent
+    /// owner has no members, and an emptied one is absent, as the index
+    /// prunes it.
     pub(crate) fn merge(
         current: &mut Option<Self>,
         frozen: Option<&Self>,
         fork: Option<&Self>,
     ) -> Merged {
-        let (Some(merged), Some(fork)) = (current.as_mut(), fork) else {
-            return Err(Conflict);
-        };
         let empty = Self::new();
         let frozen = frozen.unwrap_or(&empty);
+        let fork = fork.unwrap_or(&empty);
+        let merged = current.get_or_insert_with(Self::new);
         let changed = fork
             .members
             .keys()
@@ -154,9 +154,6 @@ impl LuaOwnerMembers {
                 merged.members.insert(key.clone(), item);
             }
         }
-        if merged.members.is_empty() {
-            return Err(Conflict);
-        }
         let mut expr_keys = Some(std::mem::take(&mut merged.expr_keys));
         merge_list(
             &mut expr_keys,
@@ -168,6 +165,9 @@ impl LuaOwnerMembers {
             merged.resolve_state = fork.resolve_state.clone();
         }
         merged.invalidate_sorted_member_ids();
+        if merged.members.is_empty() {
+            *current = None;
+        }
         Ok(())
     }
 
@@ -331,6 +331,7 @@ mod tests {
 
     use super::*;
     use crate::FileId;
+    use crate::db_index::cow_shards::Conflict;
 
     fn member_id(file_id: u32, start: u32) -> LuaMemberId {
         LuaMemberId::new(
@@ -418,13 +419,25 @@ mod tests {
     }
 
     #[test]
-    fn a_task_removing_the_owner_conflicts_with_one_changing_it() {
+    fn a_task_removing_the_owner_keeps_what_another_task_added() {
         let frozen = owner_with(&[("a", member_id(1, 1))]);
         let current = owner_with(&[("a", member_id(1, 1)), ("b", member_id(2, 2))]);
 
+        let merged = merge_owner(Some(&current), Some(&frozen), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged, owner_with(&[("b", member_id(2, 2))]));
+    }
+
+    #[test]
+    fn tasks_each_removing_their_own_members_leave_the_owner_absent() {
+        let frozen = owner_with(&[("a", member_id(1, 1)), ("b", member_id(2, 2))]);
+        let current = owner_with(&[("b", member_id(2, 2))]);
+        let fork = owner_with(&[("a", member_id(1, 1))]);
+
         assert_eq!(
-            merge_owner(Some(&current), Some(&frozen), None),
-            Err(Conflict)
+            merge_owner(Some(&current), Some(&frozen), Some(&fork)),
+            Ok(None)
         );
     }
 

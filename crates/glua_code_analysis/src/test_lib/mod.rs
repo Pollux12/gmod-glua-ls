@@ -1021,6 +1021,17 @@ impl VirtualWorkspace {
             locations.sort();
             format!("{:?} at {locations:?}", decl.get_id())
         }));
+        settled.extend(db.get_type_index().iter_type_decls().filter_map(|decl| {
+            let owner = crate::LuaMemberOwner::Type(decl.get_id());
+            let mut members = db
+                .get_member_index()
+                .get_members(&owner)?
+                .into_iter()
+                .map(|member| format!("{:?}", member.get_id()))
+                .collect::<Vec<_>>();
+            members.sort();
+            Some(format!("{:?} members {members:?}", decl.get_id()))
+        }));
         let network = db.get_gmod_network_index();
         settled.extend(
             network

@@ -192,6 +192,45 @@ vgui.Register(\"PlayerBanButton\", PANEL, \"DButton\")
         ]);
     }
 
+    /// Each panel's accessor first reads its local before `vgui.Register`
+    /// names its class, and files it on the annotated `PANEL` class until it
+    /// does: in a parallel build every file's task takes its own accessor back
+    /// off `PANEL`, and together they leave it with no members.
+    #[test]
+    fn panel_accessors_filed_on_the_panel_class_until_registered_settle_the_same_in_either_order() {
+        let builtins = format!(
+            "{GMOD_CALL_ARG_BUILTINS_FIXTURE}\n---@accessorfunc 3\nfunction AccessorFunc(tab, key, name, force) end\n---@class Panel\nPanel = Panel or {{}}\n---@class PANEL : Panel\nPANEL = Panel\n"
+        );
+        let panel = |class: &str, accessor: &str| {
+            format!(
+                "local PANEL = {{}}\nAccessorFunc(PANEL, \"b{accessor}\", \"{accessor}\", FORCE_BOOL)\nvgui.Register(\"{class}\", PANEL, \"DFrame\")\n"
+            )
+        };
+        let paper = panel("ixPaper", "Editable");
+        let display = panel("ixCombineDisplay", "MaxLines");
+        let data = panel("ixViewData", "CommitOnClose");
+        let objectives = panel("ixViewObjectives", "CommitOnClose");
+        assert_schedule_independent(&[
+            ("lua/includes/builtins.lua", builtins.as_str()),
+            (
+                "gamemodes/hl2rp/plugins/writing/derma/cl_paper.lua",
+                paper.as_str(),
+            ),
+            (
+                "gamemodes/hl2rp/schema/derma/cl_combinedisplay.lua",
+                display.as_str(),
+            ),
+            (
+                "gamemodes/hl2rp/schema/derma/cl_viewdata.lua",
+                data.as_str(),
+            ),
+            (
+                "gamemodes/hl2rp/schema/derma/cl_viewobjectives.lua",
+                objectives.as_str(),
+            ),
+        ]);
+    }
+
     #[test]
     fn a_global_bootstrapped_in_client_shared_and_server_files_settles_the_same_in_either_order() {
         assert_schedule_independent(&[
