@@ -3,8 +3,8 @@ use glua_code_analysis::{
 };
 use glua_parser::{LineIndex, LuaParser, LuaSyntaxTree};
 use lsp_types::{
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    VersionedTextDocumentIdentifier,
 };
 use rowan::NodeCache;
 use std::sync::Arc;
@@ -232,13 +232,14 @@ pub async fn on_did_save_text_document(
     Some(())
 }
 
+/// Applies a document's full text after a didChange, already merged from the
+/// notification's changes by [`crate::context::EditorDocuments`].
 pub async fn on_did_change_text_document(
     context: ServerContextSnapshot,
-    params: DidChangeTextDocumentParams,
+    document: VersionedTextDocumentIdentifier,
+    text: String,
 ) -> Option<()> {
-    let uri = params.text_document.uri;
-    let text = params.content_changes.first()?.text.clone();
-    let version = params.text_document.version;
+    let VersionedTextDocumentIdentifier { uri, version } = document;
 
     // Single read-lock acquisition: get file_id + emmyrc + should_process
     let (emmyrc, should_process) = {
@@ -493,17 +494,11 @@ mod tests {
         snapshot.note_document_seen_version(uri, version);
         on_did_change_text_document(
             snapshot.clone(),
-            DidChangeTextDocumentParams {
-                text_document: lsp_types::VersionedTextDocumentIdentifier {
-                    uri: uri.clone(),
-                    version,
-                },
-                content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
-                    range: None,
-                    range_length: None,
-                    text: text.to_string(),
-                }],
+            VersionedTextDocumentIdentifier {
+                uri: uri.clone(),
+                version,
             },
+            text.to_string(),
         )
         .await;
     }

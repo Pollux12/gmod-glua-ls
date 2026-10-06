@@ -1,4 +1,4 @@
-use lsp_types::{DidChangeTextDocumentParams, Uri};
+use lsp_types::{Uri, VersionedTextDocumentIdentifier};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
@@ -6,7 +6,8 @@ use super::{InFlightChangeGuard, ServerContextSnapshot};
 use crate::handlers::on_did_change_text_document;
 
 struct QueuedDidChange {
-    params: DidChangeTextDocumentParams,
+    document: VersionedTextDocumentIdentifier,
+    text: String,
     in_flight: InFlightChangeGuard,
     enqueue_profile: Option<crate::util::ls_profile::DidChangeEnqueue>,
 }
@@ -18,9 +19,10 @@ struct QueuedDidChange {
 /// handler that competes for `analysis.write()`.  With 33 keystrokes this
 /// creates 33 serialised write-lock acquisitions plus 33 parses.
 ///
-/// The coalescer keeps only the **latest** params per URI and processes
-/// them one batch at a time through a single worker task.  This turns 33
-/// write-lock acquisitions into 1–3.
+/// Each queued change carries the document's full text after it, so the
+/// coalescer keeps only the **latest** text per URI and processes them one
+/// batch at a time through a single worker task.  This turns 33 write-lock
+/// acquisitions into 1–3.
 pub struct DidChangeCoalescer {
     /// Send a didChange to the worker.  The worker reads all pending
     /// messages before doing any work, so the channel acts as a buffer.
@@ -35,17 +37,19 @@ impl DidChangeCoalescer {
         Self { tx }
     }
 
-    /// Enqueue a didChange notification.
-    /// If the worker is busy, the params accumulate in the channel and
+    /// Enqueue a document's full text after a didChange.
+    /// If the worker is busy, the texts accumulate in the channel and
     /// the worker drains + deduplicates them in the next batch.
     pub fn enqueue(
         &self,
-        params: DidChangeTextDocumentParams,
+        document: VersionedTextDocumentIdentifier,
+        text: String,
         in_flight: InFlightChangeGuard,
         enqueue_profile: Option<crate::util::ls_profile::DidChangeEnqueue>,
     ) {
         if let Err(err) = self.tx.send(QueuedDidChange {
-            params,
+            document,
+            text,
             in_flight,
             enqueue_profile,
         }) {
@@ -75,12 +79,10 @@ impl DidChangeCoalescer {
 
             // Drain remaining messages without blocking.
             let mut latest: HashMap<Uri, QueuedDidChange> = HashMap::new();
-            latest.insert(first.params.text_document.uri.clone(), first);
+            latest.insert(first.document.uri.clone(), first);
 
             while let Ok(params) = rx.try_recv() {
-                if let Some(superseded) =
-                    latest.insert(params.params.text_document.uri.clone(), params)
-                {
+                if let Some(superseded) = latest.insert(params.document.uri.clone(), params) {
                     superseded.in_flight.finish().await;
                 }
             }
@@ -92,7 +94,8 @@ impl DidChangeCoalescer {
                 {
                     let task_context = context.clone();
                     let handle = tokio::spawn(async move {
-                        on_did_change_text_document(task_context, queued.params).await;
+                        on_did_change_text_document(task_context, queued.document, queued.text)
+                            .await;
                     });
                     if let Err(err) = handle.await {
                         log::error!(
@@ -116,12 +119,13 @@ impl DidChangeCoalescer {
                 let coalescer_wait = dequeue_at.saturating_duration_since(profile.enqueue_at);
                 let task_context = context.clone();
                 let accum_scope = accum.clone();
-                let params = queued.params;
+                let document = queued.document;
+                let text = queued.text;
                 let in_flight = queued.in_flight;
                 let handle = tokio::spawn(crate::util::ls_profile::LS_DID_CHANGE_ACCUM.scope(
                     accum_scope,
                     async move {
-                        on_did_change_text_document(task_context, params).await;
+                        on_did_change_text_document(task_context, document, text).await;
                     },
                 ));
                 if let Err(err) = handle.await {

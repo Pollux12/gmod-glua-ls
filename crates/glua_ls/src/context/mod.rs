@@ -3,6 +3,7 @@ mod client_id;
 mod debounced_analysis;
 pub(crate) mod diagnostic_store;
 mod did_change_coalescer;
+mod editor_documents;
 mod file_diagnostic;
 mod lsp_features;
 mod snapshot;
@@ -16,6 +17,7 @@ pub(crate) use debounced_analysis::expedites_debounce;
 pub use debounced_analysis::{DebouncedAnalysis, Freshness, InFlightChangeGuard};
 pub use diagnostic_store::DiagnosticStore;
 pub use did_change_coalescer::DidChangeCoalescer;
+pub use editor_documents::{EditorDocuments, SyncError};
 pub use file_diagnostic::FileDiagnostic;
 use glua_code_analysis::EmmyLuaAnalysis;
 pub use lsp_features::LspFeatures;
@@ -138,6 +140,7 @@ pub struct ServerContext {
     debounced_shutdown: CancellationToken,
     inner: Arc<ServerContextInner>,
     did_change_coalescer: DidChangeCoalescer,
+    editor_documents: EditorDocuments,
 }
 
 impl ServerContext {
@@ -249,6 +252,7 @@ impl ServerContext {
             debounced_shutdown,
             inner,
             did_change_coalescer,
+            editor_documents: EditorDocuments::default(),
         }
     }
 
@@ -263,6 +267,10 @@ impl ServerContext {
 
     pub fn did_change_coalescer(&self) -> &DidChangeCoalescer {
         &self.did_change_coalescer
+    }
+
+    pub fn editor_documents(&mut self) -> &mut EditorDocuments {
+        &mut self.editor_documents
     }
 
     pub fn send(&self, response: Response) {

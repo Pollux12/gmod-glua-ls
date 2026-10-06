@@ -3,7 +3,7 @@ use std::error::Error;
 use log::warn;
 use lsp_server::Notification;
 use lsp_types::{
-    CancelParams, NumberOrString,
+    CancelParams, MessageType, NumberOrString, ShowMessageParams, VersionedTextDocumentIdentifier,
     notification::{
         Cancel, DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles,
         DidChangeWorkspaceFolders, DidCloseTextDocument, DidOpenTextDocument, DidRenameFiles,
@@ -11,7 +11,7 @@ use lsp_types::{
     },
 };
 
-use crate::context::{ServerContext, ServerContextSnapshot};
+use crate::context::{ServerContext, ServerContextSnapshot, SyncError};
 
 use super::{
     configuration::on_did_change_configuration,
@@ -68,9 +68,20 @@ pub async fn on_notification_handler(
                 DidChangeTextDocument::METHOD,
             )
         {
-            let uri = params.text_document.uri.clone();
+            let document = params.text_document;
+            let uri = document.uri.clone();
+            let text = match server_context
+                .editor_documents()
+                .change(&uri, params.content_changes)
+            {
+                Ok(text) => text,
+                Err(err) => {
+                    report_sync_error(server_context, &document, err);
+                    return Ok(());
+                }
+            };
             let snapshot = server_context.snapshot();
-            snapshot.note_document_seen_version(&uri, params.text_document.version);
+            snapshot.note_document_seen_version(&uri, document.version);
             // Only this document's requests are superseded. Exempted ones
             // wait for fresh data instead of being cancelled: a cancelled
             // executeCommand drops the user's command.
@@ -92,10 +103,13 @@ pub async fn on_notification_handler(
             // and `total_ms` spanning notification through schedule. `None`
             // when unset: zero clock reads, zero output.
             let enqueue_profile =
-                crate::util::ls_profile::DidChangeEnqueue::capture(params.text_document.version);
-            server_context
-                .did_change_coalescer()
-                .enqueue(params, in_flight, enqueue_profile);
+                crate::util::ls_profile::DidChangeEnqueue::capture(document.version);
+            server_context.did_change_coalescer().enqueue(
+                document,
+                text,
+                in_flight,
+                enqueue_profile,
+            );
         }
         return Ok(());
     }
@@ -107,6 +121,9 @@ pub async fn on_notification_handler(
             )
         {
             let uri = params.text_document.uri.clone();
+            server_context
+                .editor_documents()
+                .open(uri.clone(), params.text_document.text.clone());
             let snapshot = server_context.snapshot();
             snapshot.note_document_seen_version(&uri, params.text_document.version);
             {
@@ -137,6 +154,7 @@ pub async fn on_notification_handler(
             )
         {
             let uri = params.text_document.uri.clone();
+            server_context.editor_documents().close(&uri);
             let snapshot = server_context.snapshot();
             snapshot.mark_document_closed(&uri);
             {
@@ -221,6 +239,36 @@ fn spawn_pending_file_change<F>(
     });
 }
 
+/// A didChange that cannot be applied leaves the document's text as it was:
+/// applying it anyway would corrupt every later edit. The user is told once,
+/// when the document falls out of sync.
+fn report_sync_error(
+    server_context: &ServerContext,
+    document: &VersionedTextDocumentIdentifier,
+    err: SyncError,
+) {
+    log::error!(
+        "LS_SYNC_REJECTED uri={} version={} didChange not applied: {}",
+        document.uri.as_str(),
+        document.version,
+        err
+    );
+    if matches!(err, SyncError::OutOfSync | SyncError::NotOpen) {
+        return;
+    }
+    server_context
+        .snapshot()
+        .client()
+        .show_message(ShowMessageParams {
+            typ: MessageType::ERROR,
+            message: format!(
+                "GLuaLS could not apply an edit to {}: {}. Close and reopen the file so its analysis follows your edits again.",
+                document.uri.as_str(),
+                err
+            ),
+        });
+}
+
 async fn handle_cancel(server_context: &mut ServerContext, params: CancelParams) {
     let req_id = match params.id {
         NumberOrString::Number(i) => i.into(),
@@ -236,9 +284,11 @@ mod tests {
 
     use lsp_server::Connection;
     use lsp_types::{
-        ClientCapabilities, DidChangeWatchedFilesParams, FileChangeType, FileEvent, FileRename,
-        RenameFilesParams, Uri,
+        ClientCapabilities, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+        DidOpenTextDocumentParams, FileChangeType, FileEvent, FileRename, Position, Range,
+        RenameFilesParams, TextDocumentContentChangeEvent, TextDocumentItem, Uri,
     };
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
 
@@ -269,6 +319,87 @@ mod tests {
             drop(held);
 
             assert!(pending);
+        });
+    }
+
+    fn ranged(start: (u32, u32), end: (u32, u32), text: &str) -> TextDocumentContentChangeEvent {
+        TextDocumentContentChangeEvent {
+            range: Some(Range::new(
+                Position::new(start.0, start.1),
+                Position::new(end.0, end.1),
+            )),
+            range_length: None,
+            text: text.to_string(),
+        }
+    }
+
+    /// Ranged changes sent right after the open reach the analysis applied
+    /// to the opened text, in the order the editor sent them.
+    #[test]
+    fn ranged_changes_reach_the_analysis_in_order() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, _peer) = Connection::memory();
+        runtime.block_on(async {
+            let mut context = ServerContext::new(connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            let uri = Uri::from_str("file:///workspace/lua/autorun/sync.lua").unwrap();
+            snapshot
+                .analysis()
+                .write()
+                .await
+                .update_file_by_uri(&uri, Some("local a = 1\n".to_string()));
+
+            let open = DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "lua".to_string(),
+                    version: 1,
+                    text: "local a = 2\r\n".to_string(),
+                },
+            };
+            on_notification_handler(
+                Notification::new(DidOpenTextDocument::METHOD.to_string(), open),
+                &mut context,
+            )
+            .await
+            .expect("the open is handled");
+            let edits = [
+                vec![ranged((0, 7), (0, 7), "b")],
+                vec![ranged((0, 6), (0, 8), "😀")],
+                vec![ranged((1, 0), (1, 0), "x"), ranged((0, 8), (0, 9), "")],
+            ];
+            for (version, content_changes) in (2..).zip(edits) {
+                let change = DidChangeTextDocumentParams {
+                    text_document: lsp_types::VersionedTextDocumentIdentifier {
+                        uri: uri.clone(),
+                        version,
+                    },
+                    content_changes,
+                };
+                on_notification_handler(
+                    Notification::new(DidChangeTextDocument::METHOD.to_string(), change),
+                    &mut context,
+                )
+                .await
+                .expect("the change is handled");
+            }
+
+            let applied = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                snapshot
+                    .wait_until_latest_document_version_applied(&uri, &CancellationToken::new()),
+            )
+            .await;
+            assert_eq!(applied.ok(), Some(true));
+            let analysis = snapshot.analysis().read().await;
+            let file_id = analysis.get_file_id(&uri).expect("the file is indexed");
+            let held = analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_file_content(&file_id)
+                .cloned();
+            assert_eq!(held.as_deref(), Some("local 😀= 2\r\nx"));
         });
     }
 
