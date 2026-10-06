@@ -3558,19 +3558,15 @@ pub(super) fn file_queries(db: &mut DbIndex) -> Vec<HashedKey> {
     let filings = db.queries().take_pending();
     let graph = db.reader_graph_mut();
     let mut moved = Vec::new();
-    let mut released = Vec::new();
+    let mut records = Vec::with_capacity(filings.len());
     for filing in filings {
         if let Some(key) = filing.moved {
             graph.forget_fingerprint(&key);
             moved.push(key);
         }
-        graph.file_viewed(
-            filing.id,
-            derivation::ViewedReads::from_keys(filing.reads),
-            &mut released,
-        );
+        records.push((filing.id, derivation::ViewedReads::from_keys(filing.reads)));
     }
-    graph.release_keys(released);
+    graph.file_viewed(records);
     moved
 }
 

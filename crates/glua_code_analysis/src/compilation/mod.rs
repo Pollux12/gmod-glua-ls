@@ -336,14 +336,12 @@ impl LuaCompilation {
             return;
         }
         let _filing = crate::profile::PhaseGuard::new("diagnostic reads");
-        let mut diagnosed = diagnosed.into_iter().collect::<Vec<_>>();
-        diagnosed.sort_unstable_by_key(|(file_id, _)| *file_id);
-        let graph = self.db.reader_graph_mut();
-        let mut released = Vec::new();
-        for (file_id, reads) in diagnosed {
-            graph.file_viewed(DerivationId::diagnostics(file_id), reads, &mut released);
-        }
-        graph.release_keys(released);
+        let mut diagnosed = diagnosed
+            .into_iter()
+            .map(|(file_id, reads)| (DerivationId::diagnostics(file_id), reads))
+            .collect::<Vec<_>>();
+        diagnosed.sort_unstable_by_key(|(id, _)| id.file_id);
+        self.db.reader_graph_mut().file_viewed(diagnosed);
     }
 
     /// An independent copy-on-write copy; see [`DbIndex::fork_independent`].

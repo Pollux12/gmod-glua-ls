@@ -1263,29 +1263,34 @@ impl ReaderGraph {
         dropped
     }
 
-    /// Files `reads`, made viewing this graph as it stands, as `id`'s record.
-    /// The slots of reads its previous record no longer keeps go to
-    /// `released`, to free with [`Self::release_keys`] once every record
-    /// viewed alongside is filed: another may hold the same slot.
-    pub fn file_viewed(
-        &mut self,
-        id: DerivationId,
-        reads: super::ViewedReads,
-        released: &mut Vec<KeyIdx>,
-    ) {
+    /// Files each of `records`, reads made viewing this graph as it stands, as
+    /// its derivation's record, then frees the slots none of them keeps. The
+    /// new keys are interned in order, and each record is kept and diffed on
+    /// worker threads.
+    pub fn file_viewed(&mut self, records: Vec<(DerivationId, super::ViewedReads)>) {
+        use rayon::prelude::*;
         let now = super::new_stamp();
-        let mut slots = reads
-            .slots
+        let records = records
             .into_iter()
-            .map(|(slot, seen)| (slot, Some(seen)))
+            .map(|(id, reads)| {
+                let mut slots = reads.slots;
+                slots.extend(
+                    reads
+                        .keys
+                        .into_iter()
+                        .map(|(key, seen)| (self.intern_key(key, now), seen)),
+                );
+                (id, slots)
+            })
             .collect::<Vec<_>>();
-        slots.extend(
-            reads
-                .keys
-                .into_iter()
-                .map(|(key, seen)| (self.intern_key(key, now), Some(seen))),
-        );
-        self.replace_slots(id, slots, Vec::new(), |_| super::UNSEEN, released, now);
+        let table = &self.table;
+        let records = records
+            .into_par_iter()
+            .map(|(id, slots)| table.keep_viewed(id, slots))
+            .collect();
+        let mut released = Vec::new();
+        self.replace_all_kept(records, &mut released, || now);
+        self.release_keys(released);
     }
 
     /// Frees each slot of `slots` nothing refers to any more.
@@ -2318,33 +2323,49 @@ impl ReaderOp {
     }
 }
 
+/// The slots one worker updates the readers of at a time: a page of keys
+/// every record reads still spreads over the workers.
+const READER_CHUNK: usize = 1 << 10;
+
+const _: () = assert!(PAGE.is_multiple_of(READER_CHUNK));
+
+const CHUNKS_PER_PAGE: usize = PAGE / READER_CHUNK;
+
 impl KeyTable {
-    /// Applies `ops`, each slot's in order, a page of slots per worker.
     /// Applies each record's `ops`, each slot's in record order: runs of
-    /// records are sorted into pages on worker threads, then each page takes
-    /// its share of every run in order.
+    /// records are sorted into chunks of slots on worker threads, then each
+    /// chunk takes its share of every run in order.
     fn apply_reader_ops(&mut self, ops: Vec<Vec<(KeyIdx, ReaderOp)>>) {
         use rayon::prelude::*;
         let pages = self.keys.pages_mut();
-        let page_count = pages.len();
+        let chunk_count = pages.len() * CHUNKS_PER_PAGE;
         let run = ops.len().div_ceil(rayon::current_num_threads() * 4).max(1);
         let runs = ops
             .par_chunks(run)
             .map(|records| {
-                let mut by_page = vec![Vec::new(); page_count];
+                let mut by_chunk = vec![Vec::new(); chunk_count];
                 for (slot, op) in records.iter().flatten() {
-                    by_page[*slot as usize / PAGE].push((*slot as usize % PAGE, *op));
+                    let slot = *slot as usize;
+                    by_chunk[slot / READER_CHUNK].push((slot % READER_CHUNK, *op));
                 }
-                by_page
+                by_chunk
             })
             .collect::<Vec<_>>();
-        pages.par_iter_mut().enumerate().for_each(|(index, page)| {
-            for by_page in &runs {
-                for (at, op) in &by_page[index] {
-                    op.apply(&mut page[*at].readers);
+        pages
+            .par_iter_mut()
+            .enumerate()
+            .flat_map(|(page_index, page)| {
+                page.par_chunks_mut(READER_CHUNK)
+                    .enumerate()
+                    .map(move |(at, chunk)| (page_index * CHUNKS_PER_PAGE + at, chunk))
+            })
+            .for_each(|(index, chunk)| {
+                for by_chunk in &runs {
+                    for (at, op) in &by_chunk[index] {
+                        op.apply(&mut chunk[*at].readers);
+                    }
                 }
-            }
-        });
+            });
     }
 }
 
@@ -2374,6 +2395,19 @@ impl KeyTable {
             .filter(|slot| self.is_query(**slot))
             .map(|slot| self.key(*slot).clone())
             .collect()
+    }
+
+    /// The record of `slots`, read by `id` with the fingerprint beside each
+    /// and producing nothing.
+    fn keep_viewed(&self, id: DerivationId, slots: Vec<(KeyIdx, Fingerprint)>) -> KeptRecord {
+        let (reads, dropped_reads) = kept_reads(id, slots, |slot| self.key(slot), |_| false);
+        KeptRecord {
+            id,
+            reads,
+            dropped_reads,
+            outputs: Vec::new(),
+            output_slots: Vec::new(),
+        }
     }
 
     /// The record of a task's `evaluation`, whose reads were canonicalised
