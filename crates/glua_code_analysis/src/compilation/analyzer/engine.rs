@@ -214,15 +214,28 @@ impl Queue {
             })
     }
 
-    /// The files with entries at `rank`, in the order a round takes them.
-    fn files_at(&self, rank: u8) -> Vec<crate::FileId> {
-        let mut files = BTreeMap::new();
-        for reason in [Reason::Changed, Reason::Read] {
-            for (_, _, file_key, id) in self.at(rank, reason, 0) {
-                files.entry((*file_key, id.file_id)).or_insert(());
-            }
+    /// Takes out every entry at `rank`, file by file in the order a round
+    /// takes the files, each file's as [`Self::take_file_at`] takes them.
+    fn take_rank(&mut self, rank: u8) -> Vec<(crate::FileId, Vec<(DerivationId, Reason)>)> {
+        let mut taken = self
+            .order
+            .split_off(&(rank, Reason::Changed, 0, DerivationId::floor()));
+        if let Some(next) = rank.checked_add(1) {
+            let mut after = taken.split_off(&(next, Reason::Changed, 0, DerivationId::floor()));
+            self.order.append(&mut after);
         }
-        files.into_keys().map(|(_, file_id)| file_id).collect()
+        let mut by_file = BTreeMap::<_, Vec<_>>::new();
+        for (_, reason, file_key, id) in taken {
+            self.reasons.remove(&id);
+            by_file
+                .entry((file_key, id.file_id))
+                .or_default()
+                .push((id, reason));
+        }
+        by_file
+            .into_iter()
+            .map(|((_, file_id), entries)| (file_id, entries))
+            .collect()
     }
 
     /// Takes out every entry of `file_id` at `rank`.
@@ -1077,12 +1090,7 @@ impl Engine {
         let Some(rank) = self.worklist.first_rank() else {
             return;
         };
-        let tasks = self
-            .worklist
-            .files_at(rank)
-            .into_iter()
-            .map(|file_id| (file_id, self.worklist.take_file_at(rank, file_id)))
-            .collect::<Vec<_>>();
+        let tasks = self.worklist.take_rank(rank);
         self.stats.supersteps += 1;
         self.stats.superstep_tasks += tasks.len();
         let frozen = db.superstep_base();
@@ -1162,12 +1170,7 @@ impl Engine {
         let mut root = Vec::new();
         let mut on_root = Vec::new();
         let mut workspace = Vec::new();
-        let taken = self
-            .worklist
-            .files_at(rank)
-            .into_iter()
-            .map(|file_id| (file_id, self.worklist.take_file_at(rank, file_id)))
-            .collect::<Vec<_>>();
+        let taken = self.worklist.take_rank(rank);
         let checked = self.check_dispatch(db, &taken);
         for ((file_id, entries), checked) in taken.into_iter().zip(checked) {
             if file_id == crate::FileId::VIRTUAL {
