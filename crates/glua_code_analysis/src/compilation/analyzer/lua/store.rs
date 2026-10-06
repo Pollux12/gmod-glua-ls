@@ -401,10 +401,11 @@ impl StatementWrite {
                 export_type,
                 semantic_id,
             } => {
-                if let Some(module_info) = db.get_module_index_mut().get_module_mut(*file_id) {
-                    module_info.export_type = Some(export_type.clone());
-                    module_info.semantic_id = semantic_id.clone();
-                }
+                db.get_module_index_mut().set_export(
+                    *file_id,
+                    export_type.clone(),
+                    semantic_id.clone(),
+                );
             }
             StatementWrite::AddAccessorFuncCall { file_id, metadata } => {
                 db.get_accessor_func_call_index_mut()

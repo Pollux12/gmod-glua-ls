@@ -341,6 +341,11 @@ pub(crate) enum GmodExecutionEnvironmentSource {
 pub struct GmodLoadIndex {
     file_infos: CowCell<HashMap<FileId, GmodFileLoadInfo>>,
     unresolved_edges: CowCell<Vec<GmodLoadEdge>>,
+    /// Source file -> the files, sorted, whose incoming edges it holds the
+    /// call of.
+    edge_targets_by_source: CowCell<HashMap<FileId, Vec<FileId>>>,
+    /// Source file -> where its edges sit in `unresolved_edges`.
+    unresolved_by_source: CowCell<HashMap<FileId, Vec<usize>>>,
     execution_environments: CowCell<HashMap<FileId, HashSet<String>>>,
     execution_environment_sites: CowCell<HashMap<FileId, HashMap<FileId, HashSet<String>>>>,
 }
@@ -350,6 +355,8 @@ impl GmodLoadIndex {
         Self {
             file_infos: Default::default(),
             unresolved_edges: Default::default(),
+            edge_targets_by_source: Default::default(),
+            unresolved_by_source: Default::default(),
             execution_environments: Default::default(),
             execution_environment_sites: Default::default(),
         }
@@ -500,8 +507,30 @@ impl GmodLoadIndex {
         unresolved_edges: Vec<GmodLoadEdge>,
     ) {
         self.note_all_file_writes();
+        let mut edge_targets_by_source: HashMap<FileId, Vec<FileId>> = HashMap::default();
+        for (target, info) in &file_infos {
+            for edge in &info.incoming_edges {
+                edge_targets_by_source
+                    .entry(edge.source_file_id)
+                    .or_default()
+                    .push(*target);
+            }
+        }
+        for targets in edge_targets_by_source.values_mut() {
+            targets.sort_unstable();
+            targets.dedup();
+        }
+        let mut unresolved_by_source: HashMap<FileId, Vec<usize>> = HashMap::default();
+        for (at, edge) in unresolved_edges.iter().enumerate() {
+            unresolved_by_source
+                .entry(edge.source_file_id)
+                .or_default()
+                .push(at);
+        }
         self.file_infos = file_infos.into();
         self.unresolved_edges = unresolved_edges.into();
+        self.edge_targets_by_source = edge_targets_by_source.into();
+        self.unresolved_by_source = unresolved_by_source.into();
         self.note_all_file_writes();
     }
 }
@@ -616,17 +645,30 @@ impl GmodLoadIndex {
             changed
         };
         let mut changed = Vec::new();
-        for (file_id, info) in &mut self.file_infos {
+        let targets = self
+            .edge_targets_by_source
+            .get(&remap.file_id)
+            .cloned()
+            .unwrap_or_default();
+        for file_id in targets {
+            let Some(info) = self.file_infos.get_mut(&file_id) else {
+                continue;
+            };
             let mut moved = false;
             for edge in &mut info.incoming_edges {
                 moved |= remap_edge(edge);
             }
             if moved {
-                changed.push(*file_id);
+                changed.push(file_id);
             }
         }
-        for edge in &mut self.unresolved_edges {
-            remap_edge(edge);
+        let unresolved = self
+            .unresolved_by_source
+            .get(&remap.file_id)
+            .cloned()
+            .unwrap_or_default();
+        for at in unresolved {
+            remap_edge(&mut self.unresolved_edges[at]);
         }
         for file_id in changed {
             derivation::note_write(|| FactKey::GmodLoadFile(file_id));
@@ -643,6 +685,8 @@ impl LuaIndex for GmodLoadIndex {
         self.note_all_file_writes();
         self.file_infos.clear();
         self.unresolved_edges.clear();
+        self.edge_targets_by_source.clear();
+        self.unresolved_by_source.clear();
         self.execution_environments.clear();
         self.execution_environment_sites.clear();
     }
@@ -704,7 +748,10 @@ mod tests {
         let mut index = GmodLoadIndex::new();
         let mut info = GmodFileLoadInfo::fallback_shared();
         info.incoming_edges.push(include_edge(source, target));
-        index.file_infos.insert(target, info);
+        index.set_all_file_infos(
+            rustc_hash::FxHashMap::from_iter([(target, info)]),
+            Vec::new(),
+        );
 
         index.remap_edge_positions(&FileRemap::unvalidated(
             source,
@@ -721,6 +768,26 @@ abcdefgh",
             .incoming_edges[0]
             .range;
         assert_eq!(range, Some(TextRange::new(3.into(), 7.into())));
+    }
+
+    /// An edit above an unresolved edge's call moves its range too.
+    #[test]
+    fn an_edit_moves_an_unresolved_edge_to_its_call() {
+        let source = FileId::new(1);
+        let mut edge = include_edge(source, FileId::new(2));
+        edge.target_file_id = None;
+        let mut index = GmodLoadIndex::new();
+        index.set_all_file_infos(rustc_hash::FxHashMap::default(), vec![edge]);
+
+        index.remap_edge_positions(&FileRemap::unvalidated(
+            source,
+            PositionMap::new("abcdefgh", "\nabcdefgh"),
+        ));
+
+        assert_eq!(
+            index.unresolved_edges()[0].range,
+            Some(TextRange::new(3.into(), 7.into()))
+        );
     }
 
     #[test]
@@ -742,6 +809,8 @@ abcdefgh",
 crate::db_index::cow_shards::task_fork_fields!(GmodLoadIndex {
     file_infos,
     unresolved_edges,
+    edge_targets_by_source,
+    unresolved_by_source,
     execution_environments,
     execution_environment_sites,
 });

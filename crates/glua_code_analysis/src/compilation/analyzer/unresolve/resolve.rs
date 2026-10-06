@@ -520,17 +520,13 @@ pub fn try_resolve_module(
     // Compute semantic_id for the exported expression using the shared helper
     let semantic_id = compute_module_semantic_id(db, module.file_id, &module.expr);
 
-    let module_info = db
+    let changed = db
         .get_module_index_mut()
-        .get_module_mut(module.file_id)
+        .set_export(module.file_id, expr_type, semantic_id)
         .ok_or(InferFailReason::None)?;
     // Re-settling an identical export moves nothing observable: only a novel
     // fact may bump the module epoch.
-    let changed = module_info.export_type.as_ref() != Some(&expr_type)
-        || module_info.semantic_id != semantic_id;
     if changed {
-        module_info.export_type = Some(expr_type);
-        module_info.semantic_id = semantic_id;
         db.get_module_index_mut().note_module_write(module.file_id);
     }
     Ok(())

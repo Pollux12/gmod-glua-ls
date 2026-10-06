@@ -736,10 +736,6 @@ impl<K: Clone, V: Clone> CowShards<K, V> {
             .flat_map(|shard| shard.iter_mut())
     }
 
-    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
-        self.iter_mut().map(|(_, value)| value)
-    }
-
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(&K, &mut V) -> bool) {
         for shard in self.writable_shards() {
             shard.retain(|key, value| keep(key, value));

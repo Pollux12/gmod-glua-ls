@@ -20,7 +20,7 @@ pub use workspace::{Workspace, WorkspaceId, WorkspaceKind};
 
 use super::traits::LuaIndex;
 use crate::db_index::derivation::{self, FactKey, Fingerprint};
-use crate::{Emmyrc, FileId};
+use crate::{Emmyrc, FileId, LuaSemanticDeclId, LuaType};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -32,6 +32,8 @@ pub struct LuaModuleIndex {
     module_root_id: ModuleNodeId,
     module_nodes: CowCell<FxHashMap<ModuleNodeId, ModuleNode>>,
     file_module_map: CowShards<FileId, ModuleInfo>,
+    /// File -> the other files whose module export names a position in it.
+    export_refs: CowShards<FileId, FxHashSet<FileId>>,
     /// The `(file, module name, workspace)` of every module in `file_module_map`.
     module_files: derivation::SetFingerprint,
     file_module_paths: CowCell<FxHashMap<FileId, String>>,
@@ -97,6 +99,22 @@ impl Default for LuaModuleIndex {
     }
 }
 
+/// The files other than its own whose positions `info`'s export names.
+fn export_files(info: &ModuleInfo) -> FxHashSet<FileId> {
+    let mut files = info
+        .export_type
+        .as_ref()
+        .map(crate::db_index::r#type::type_referenced_files)
+        .unwrap_or_default();
+    files.extend(
+        info.semantic_id
+            .as_ref()
+            .and_then(LuaSemanticDeclId::get_file_id),
+    );
+    files.remove(&info.file_id);
+    files
+}
+
 /// One module's contribution to [`FactKey::ModuleFiles`].
 fn module_files_entry(info: &ModuleInfo) -> (FileId, &str, WorkspaceId) {
     (
@@ -113,6 +131,7 @@ impl LuaModuleIndex {
             module_root_id: ModuleNodeId { id: 0 },
             module_nodes: Default::default(),
             file_module_map: Default::default(),
+            export_refs: Default::default(),
             module_files: derivation::SetFingerprint::default(),
             file_module_paths: Default::default(),
             module_name_to_file_ids: Default::default(),
@@ -284,9 +303,56 @@ impl LuaModuleIndex {
     /// source layer registered: none.
     pub(crate) fn reset_export(&mut self, file_id: FileId) {
         if let Some(info) = self.file_module_map.get_mut(&file_id) {
+            let linked = export_files(info);
             info.export_type = None;
             info.semantic_id = None;
             note_module_fact_write(file_id);
+            self.relink_export(file_id, linked);
+        }
+    }
+
+    /// Sets `file_id`'s module export. Returns whether it changed, or `None`
+    /// when the file has no module.
+    pub fn set_export(
+        &mut self,
+        file_id: FileId,
+        export_type: LuaType,
+        semantic_id: Option<LuaSemanticDeclId>,
+    ) -> Option<bool> {
+        derivation::note_read(|| FactKey::Module(file_id));
+        self.note_lookup_keys(file_id);
+        let info = self.file_module_map.get_mut(&file_id)?;
+        if info.export_type.as_ref() == Some(&export_type) && info.semantic_id == semantic_id {
+            return Some(false);
+        }
+        let linked = export_files(info);
+        info.export_type = Some(export_type);
+        info.semantic_id = semantic_id;
+        self.relink_export(file_id, linked);
+        Some(true)
+    }
+
+    /// Re-files `file_id` under the files its export names now, given those
+    /// `linked` it named before.
+    fn relink_export(&mut self, file_id: FileId, linked: FxHashSet<FileId>) {
+        let named = self
+            .file_module_map
+            .get(&file_id)
+            .map(export_files)
+            .unwrap_or_default();
+        for named_file in linked.difference(&named) {
+            if let Some(files) = self.export_refs.get_mut(named_file) {
+                files.remove(&file_id);
+                if files.is_empty() {
+                    self.export_refs.remove(named_file);
+                }
+            }
+        }
+        for named_file in named.difference(&linked) {
+            self.export_refs
+                .entry(*named_file)
+                .or_default()
+                .insert(file_id);
         }
     }
 
@@ -295,10 +361,16 @@ impl LuaModuleIndex {
     /// edit destroyed: they are re-analysed instead.
     pub fn remap_file_exports(&mut self, remap: &crate::FileRemap) -> FxHashSet<FileId> {
         let mut lost = FxHashSet::default();
-        for (file_id, info) in &mut self.file_module_map {
-            if *file_id == remap.file_id {
+        let mut file_ids = self
+            .export_refs
+            .get(&remap.file_id)
+            .map(|files| files.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        file_ids.sort_unstable();
+        for file_id in &file_ids {
+            let Some(info) = self.file_module_map.get_mut(file_id) else {
                 continue;
-            }
+            };
             let export = info
                 .export_type
                 .as_ref()
@@ -329,12 +401,6 @@ impl LuaModuleIndex {
             }
         }
         lost
-    }
-
-    pub fn get_module_mut(&mut self, file_id: FileId) -> Option<&mut ModuleInfo> {
-        derivation::note_read(|| FactKey::Module(file_id));
-        self.note_lookup_keys(file_id);
-        self.file_module_map.get_mut(&file_id)
     }
 
     /// What module lookups (`find_module*`, module nodes, workspace file
@@ -1390,6 +1456,7 @@ impl LuaIndex for LuaModuleIndex {
         }
         let (mut parent_id, mut child_id) =
             if let Some(module_info) = self.file_module_map.remove(&file_id) {
+                self.relink_export(file_id, export_files(&module_info));
                 self.module_files.remove(&module_files_entry(&module_info));
                 let module_id = module_info.module_id;
                 let node = match self.module_nodes.get_mut(&module_id) {
@@ -1450,6 +1517,7 @@ impl LuaIndex for LuaModuleIndex {
         derivation::note_write(|| FactKey::ModuleFiles);
         self.module_nodes.clear();
         self.file_module_map.clear();
+        self.export_refs.clear();
         self.module_files = derivation::SetFingerprint::default();
         self.file_module_paths.clear();
         self.module_name_to_file_ids.clear();
@@ -1465,6 +1533,7 @@ crate::db_index::cow_shards::task_fork_fields!(LuaModuleIndex {
     module_root_id,
     module_nodes,
     file_module_map,
+    export_refs => crate::db_index::cow_shards::merge_set,
     module_files,
     file_module_paths,
     module_name_to_file_ids,

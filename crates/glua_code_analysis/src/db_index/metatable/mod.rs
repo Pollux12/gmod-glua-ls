@@ -1,5 +1,5 @@
 use crate::db_index::cow_shards::CowShards;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashSet as HashSet;
 use std::sync::Arc;
 
 use rowan::{TextRange, TextSize};
@@ -27,6 +27,11 @@ pub struct LuaMetatableIndex {
     metatables: CowShards<InFiled<TextRange>, Vec<MetatableBinding>>,
     by_writer: CowShards<FileId, Vec<InFiled<TextRange>>>,
     factory_bindings: CowShards<FileId, Vec<SetmetatableFactoryBinding>>,
+    /// File -> the table literals of other files one of whose bindings'
+    /// metatables lies in it. A table literal's own file finds it in its shard.
+    sites_by_metatable_file: CowShards<FileId, HashSet<InFiled<TextRange>>>,
+    /// File -> the writers whose factory bindings name a range in it.
+    factory_writers_by_file: CowShards<FileId, HashSet<FileId>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +71,8 @@ impl LuaMetatableIndex {
             metatables: Default::default(),
             by_writer: Default::default(),
             factory_bindings: Default::default(),
+            sites_by_metatable_file: Default::default(),
+            factory_writers_by_file: Default::default(),
         }
     }
 
@@ -77,6 +84,7 @@ impl LuaMetatableIndex {
         writer_sort_key: Arc<str>,
     ) {
         derivation::note_write(|| FactKey::Metatable(table.clone()));
+        let linked = self.site_files(&table);
         let bindings = self.metatables.entry(table.clone()).or_default();
         if let Some(existing) = bindings
             .iter_mut()
@@ -84,6 +92,7 @@ impl LuaMetatableIndex {
         {
             if existing.metatable != metatable {
                 existing.metatable = metatable;
+                self.relink_site(&table, linked);
             }
             return;
         }
@@ -95,10 +104,67 @@ impl LuaMetatableIndex {
         };
         let position = bindings.partition_point(|other| other.order_key() < binding.order_key());
         bindings.insert(position, binding);
+        self.relink_site(&table, linked);
         self.by_writer
             .entry(writer_file_id)
             .or_default()
             .push(table.clone());
+    }
+
+    /// The files other than its own that `table`'s bindings' metatables lie in.
+    fn site_files(&self, table: &InFiled<TextRange>) -> HashSet<FileId> {
+        self.metatables
+            .get(table)
+            .into_iter()
+            .flatten()
+            .map(|binding| binding.metatable.file_id)
+            .filter(|file_id| *file_id != table.file_id)
+            .collect()
+    }
+
+    /// Re-files `table` in `sites_by_metatable_file` under the files it names
+    /// now, given the files it named before its bindings changed.
+    fn relink_site(&mut self, table: &InFiled<TextRange>, linked: HashSet<FileId>) {
+        let files = self.site_files(table);
+        for file_id in linked.difference(&files) {
+            if let Some(sites) = self.sites_by_metatable_file.get_mut(file_id) {
+                sites.remove(table);
+                if sites.is_empty() {
+                    self.sites_by_metatable_file.remove(file_id);
+                }
+            }
+        }
+        for file_id in files.difference(&linked) {
+            self.sites_by_metatable_file
+                .entry(*file_id)
+                .or_default()
+                .insert(table.clone());
+        }
+    }
+
+    /// Re-files `writer` in `factory_writers_by_file` under the files its
+    /// factory bindings name now, given those `previous` named.
+    fn relink_factory_writer(&mut self, writer: FileId, previous: &[SetmetatableFactoryBinding]) {
+        let linked = factory_files(previous);
+        let files = factory_files(
+            self.factory_bindings
+                .get(&writer)
+                .map_or(&[][..], Vec::as_slice),
+        );
+        for file_id in linked.difference(&files) {
+            if let Some(writers) = self.factory_writers_by_file.get_mut(file_id) {
+                writers.remove(&writer);
+                if writers.is_empty() {
+                    self.factory_writers_by_file.remove(file_id);
+                }
+            }
+        }
+        for file_id in files.difference(&linked) {
+            self.factory_writers_by_file
+                .entry(*file_id)
+                .or_default()
+                .insert(writer);
+        }
     }
 
     /// Number of recorded `setmetatable` bindings, so a test can show its
@@ -128,6 +194,18 @@ impl LuaMetatableIndex {
     pub fn add_factory_binding(&mut self, binding: SetmetatableFactoryBinding) {
         let file_id = binding.file_id;
         derivation::note_write(|| FactKey::MetatableFactory(file_id));
+        for named in [binding.table_range.file_id, binding.metatable_range.file_id] {
+            if !self
+                .factory_writers_by_file
+                .get(&named)
+                .is_some_and(|writers| writers.contains(&file_id))
+            {
+                self.factory_writers_by_file
+                    .entry(named)
+                    .or_default()
+                    .insert(file_id);
+            }
+        }
         self.factory_bindings
             .entry(file_id)
             .or_default()
@@ -142,45 +220,80 @@ impl LuaMetatableIndex {
     /// Returns the files whose binding named a literal the edit destroyed.
     pub fn remap_file_ranges(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
         let mut dirty = HashSet::default();
-        let mut rebuilt: HashMap<InFiled<TextRange>, Vec<MetatableBinding>> =
-            HashMap::with_capacity_and_hasher(self.metatables.len(), Default::default());
-        for (table, bindings) in std::mem::take(&mut self.metatables) {
+        let mut sites = self
+            .metatables
+            .file_entries(remap.file_id)
+            .map(|(table, _)| table)
+            .chain(
+                self.sites_by_metatable_file
+                    .get(&remap.file_id)
+                    .into_iter()
+                    .flatten(),
+            )
+            .cloned()
+            .collect::<Vec<_>>();
+        sites.sort_unstable_by_key(site_sort_key);
+        sites.dedup();
+        // Every site is detached before any is re-filed: one literal's new
+        // range can be another's old one.
+        let mut rebuilt: Vec<(InFiled<TextRange>, Vec<MetatableBinding>)> = Vec::new();
+        for table in sites {
+            let linked = self.site_files(&table);
+            let Some(bindings) = self.metatables.remove(&table) else {
+                continue;
+            };
             derivation::note_write(|| FactKey::Metatable(table.clone()));
+            self.relink_site(&table, linked);
             let new_table = map_range(remap, &table);
+            let mut kept = Vec::new();
             for binding in bindings {
+                if let Some(tables) = self.by_writer.get_mut(&binding.writer_file_id) {
+                    tables.retain(|existing| existing != &table);
+                }
                 match (new_table.clone(), map_range(remap, &binding.metatable)) {
-                    (Some(new_table), Some(new_metatable)) => {
-                        rebuilt
-                            .entry(new_table)
-                            .or_default()
-                            .push(MetatableBinding {
-                                metatable: new_metatable,
-                                ..binding
-                            });
-                    }
+                    (Some(_), Some(new_metatable)) => kept.push(MetatableBinding {
+                        metatable: new_metatable,
+                        ..binding
+                    }),
                     // Only the writer can record this binding again.
                     _ => {
                         dirty.insert(binding.writer_file_id);
                     }
                 }
             }
+            if let Some(new_table) = new_table
+                && !kept.is_empty()
+            {
+                rebuilt.push((new_table, kept));
+            }
         }
-
-        self.by_writer.clear();
-        for (table, bindings) in &mut rebuilt {
-            bindings.sort_by(|a, b| a.order_key().cmp(&b.order_key()));
-            for binding in bindings.iter() {
+        for (table, kept) in rebuilt {
+            derivation::note_write(|| FactKey::Metatable(table.clone()));
+            let linked = self.site_files(&table);
+            for binding in &kept {
                 self.by_writer
                     .entry(binding.writer_file_id)
                     .or_default()
                     .push(table.clone());
             }
+            let bindings = self.metatables.entry(table.clone()).or_default();
+            bindings.extend(kept);
+            bindings.sort_by(|a, b| a.order_key().cmp(&b.order_key()));
+            self.relink_site(&table, linked);
         }
-        self.metatables = rebuilt.into();
 
-        for (file_id, bindings) in &mut self.factory_bindings {
-            derivation::note_write(|| FactKey::MetatableFactory(*file_id));
-            let before = bindings.len();
+        let mut writers = self
+            .factory_writers_by_file
+            .get(&remap.file_id)
+            .map(|writers| writers.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        writers.sort_unstable();
+        for writer in writers {
+            let Some(bindings) = self.factory_bindings.get_mut(&writer) else {
+                continue;
+            };
+            derivation::note_write(|| FactKey::MetatableFactory(writer));
+            let previous = bindings.clone();
             bindings.retain_mut(|binding| {
                 let (Some(table_range), Some(metatable_range)) = (
                     map_range(remap, &binding.table_range),
@@ -192,18 +305,15 @@ impl LuaMetatableIndex {
                 binding.metatable_range = metatable_range;
                 true
             });
-            if bindings.len() != before {
-                dirty.insert(*file_id);
+            if bindings.len() != previous.len() {
+                dirty.insert(writer);
             }
+            if bindings.is_empty() {
+                self.factory_bindings.remove(&writer);
+            }
+            self.relink_factory_writer(writer, &previous);
         }
-        self.factory_bindings
-            .retain(|_, bindings| !bindings.is_empty());
         dirty.remove(&remap.file_id);
-        // Every surviving site re-keyed or lost a binding: stamp old and new
-        // keys so readers of either observe the move.
-        for site in self.metatables.keys() {
-            derivation::note_write(|| FactKey::Metatable(site.clone()));
-        }
         dirty
     }
 
@@ -236,9 +346,11 @@ impl LuaMetatableIndex {
     /// Drops every binding of `table` before the derivations that bound it
     /// run again.
     pub(crate) fn reset_table(&mut self, table: &InFiled<TextRange>) {
+        let linked = self.site_files(table);
         let Some(bindings) = self.metatables.remove(table) else {
             return;
         };
+        self.relink_site(table, linked);
         derivation::note_write(|| FactKey::Metatable(table.clone()));
         for binding in bindings {
             if let Some(tables) = self.by_writer.get_mut(&binding.writer_file_id) {
@@ -250,14 +362,16 @@ impl LuaMetatableIndex {
     /// Drops `file_id`'s factory bindings before the derivation that found
     /// them runs again.
     pub(crate) fn reset_factory_bindings(&mut self, file_id: FileId) {
-        if self.factory_bindings.remove(&file_id).is_some() {
+        if let Some(previous) = self.factory_bindings.remove(&file_id) {
             derivation::note_write(|| FactKey::MetatableFactory(file_id));
+            self.relink_factory_writer(file_id, &previous);
         }
     }
 
     fn remove_writer(&mut self, file_id: FileId) {
         for table in self.by_writer.remove(&file_id).unwrap_or_default() {
             derivation::note_write(|| FactKey::Metatable(table.clone()));
+            let linked = self.site_files(&table);
             let Some(bindings) = self.metatables.get_mut(&table) else {
                 continue;
             };
@@ -265,10 +379,9 @@ impl LuaMetatableIndex {
             if bindings.is_empty() {
                 self.metatables.remove(&table);
             }
+            self.relink_site(&table, linked);
         }
-        if self.factory_bindings.remove(&file_id).is_some() {
-            derivation::note_write(|| FactKey::MetatableFactory(file_id));
-        }
+        self.reset_factory_bindings(file_id);
     }
 }
 
@@ -293,7 +406,21 @@ impl LuaIndex for LuaMetatableIndex {
         self.metatables.clear();
         self.by_writer.clear();
         self.factory_bindings.clear();
+        self.sites_by_metatable_file.clear();
+        self.factory_writers_by_file.clear();
     }
+}
+
+fn site_sort_key(site: &InFiled<TextRange>) -> (FileId, TextSize, TextSize) {
+    (site.file_id, site.value.start(), site.value.end())
+}
+
+/// The files `bindings`' table and metatable ranges lie in.
+fn factory_files(bindings: &[SetmetatableFactoryBinding]) -> HashSet<FileId> {
+    bindings
+        .iter()
+        .flat_map(|binding| [binding.table_range.file_id, binding.metatable_range.file_id])
+        .collect()
 }
 
 #[cfg(test)]
@@ -301,12 +428,106 @@ mod tests {
     use std::sync::Arc;
 
     use rowan::{TextRange, TextSize};
+    use rustc_hash::{FxHashMap, FxHashSet};
 
-    use super::{LuaIndex, LuaMetatableIndex};
-    use crate::{FileId, InFiled};
+    use super::{LuaIndex, LuaMetatableIndex, SetmetatableFactoryBinding, factory_files};
+    use crate::{FileId, FileRemap, InFiled, PositionMap};
 
     fn key(path: &str) -> Arc<str> {
         Arc::from(path)
+    }
+
+    /// The reverse indexes name exactly the sites and writers a scan of the
+    /// bindings finds.
+    fn assert_reverse_indexes_match_a_scan(index: &LuaMetatableIndex) {
+        let mut sites: FxHashMap<FileId, FxHashSet<InFiled<TextRange>>> = FxHashMap::default();
+        for (table, binding) in index.iter_bindings() {
+            if binding.metatable.file_id != table.file_id {
+                sites
+                    .entry(binding.metatable.file_id)
+                    .or_default()
+                    .insert(table.clone());
+            }
+        }
+        let indexed: FxHashMap<_, _> = index
+            .sites_by_metatable_file
+            .iter()
+            .map(|(file_id, sites)| (*file_id, sites.clone()))
+            .collect();
+        assert_eq!(indexed, sites);
+        let mut writers: FxHashMap<FileId, FxHashSet<FileId>> = FxHashMap::default();
+        for (writer, bindings) in index.factory_bindings.iter() {
+            for file_id in factory_files(bindings) {
+                writers.entry(file_id).or_default().insert(*writer);
+            }
+        }
+        let indexed: FxHashMap<_, _> = index
+            .factory_writers_by_file
+            .iter()
+            .map(|(file_id, writers)| (*file_id, writers.clone()))
+            .collect();
+        assert_eq!(indexed, writers);
+    }
+
+    #[test]
+    fn reverse_indexes_follow_adds_resets_remaps_and_removals() {
+        let (table_file, metatable_file, writer) = (FileId::new(1), FileId::new(2), FileId::new(3));
+        let range = |start: u32| TextRange::new(TextSize::new(start), TextSize::new(start + 4));
+        let moved = InFiled::new(table_file, range(10));
+        let reset = InFiled::new(table_file, range(30));
+        let mut index = LuaMetatableIndex::new();
+        index.add(
+            moved.clone(),
+            InFiled::new(metatable_file, range(0)),
+            writer,
+            key("w.lua"),
+        );
+        index.add(
+            reset.clone(),
+            InFiled::new(metatable_file, range(20)),
+            writer,
+            key("w.lua"),
+        );
+        index.add(
+            moved.clone(),
+            InFiled::new(table_file, range(50)),
+            table_file,
+            key("t.lua"),
+        );
+        index.add_factory_binding(SetmetatableFactoryBinding {
+            file_id: writer,
+            table_range: InFiled::new(writer, range(0)),
+            metatable_range: InFiled::new(metatable_file, range(40)),
+            local_name: "object".into(),
+            call_position: TextSize::new(0),
+            function_scope: range(0),
+        });
+        assert_reverse_indexes_match_a_scan(&index);
+
+        index.reset_table(&reset);
+        assert_reverse_indexes_match_a_scan(&index);
+
+        let shifted = index.remap_file_ranges(&FileRemap::unvalidated(
+            metatable_file,
+            PositionMap::new("abc", "\nabc"),
+        ));
+        assert!(shifted.is_empty());
+        assert_reverse_indexes_match_a_scan(&index);
+
+        let deleted = index.remap_file_ranges(&FileRemap::unvalidated(
+            metatable_file,
+            PositionMap::whole_file(100, 0),
+        ));
+        assert_eq!(deleted, FxHashSet::from_iter([writer]));
+        assert_eq!(
+            index.get(&moved),
+            Some(&InFiled::new(table_file, range(50)))
+        );
+        assert_reverse_indexes_match_a_scan(&index);
+
+        index.remove(table_file);
+        assert!(index.sites_by_metatable_file.is_empty());
+        assert!(index.factory_writers_by_file.is_empty());
     }
 
     #[test]
@@ -397,4 +618,6 @@ crate::db_index::cow_shards::task_fork_fields!(LuaMetatableIndex {
     metatables,
     by_writer,
     factory_bindings,
+    sites_by_metatable_file => crate::db_index::cow_shards::merge_set,
+    factory_writers_by_file => crate::db_index::cow_shards::merge_set,
 });

@@ -4213,18 +4213,16 @@ mod member_query_memo_tests {
             Err(InferFailReason::UnResolveModuleExport(module))
         );
         db.get_module_index_mut()
-            .get_module_mut(module)
-            .unwrap()
-            .export_type = Some(LuaType::Any);
+            .set_export(module, LuaType::Any, None)
+            .unwrap();
         db.get_module_index_mut().note_module_write(module);
         assert_eq!(
             infer_member_by_member_key(&db, &mut cache, &prefix, expr.clone()),
             Ok(LuaType::Any)
         );
         db.get_module_index_mut()
-            .get_module_mut(module)
-            .unwrap()
-            .export_type = Some(LuaType::Nil);
+            .set_export(module, LuaType::Nil, None)
+            .unwrap();
         db.get_module_index_mut().note_module_write(module);
         assert_eq!(
             infer_member_by_member_key(&db, &mut cache, &prefix, expr.clone()),
@@ -4241,9 +4239,8 @@ mod member_query_memo_tests {
             WorkspaceId { id: 0 },
         );
         db.get_module_index_mut()
-            .get_module_mut(module)
-            .unwrap()
-            .export_type = Some(LuaType::Any);
+            .set_export(module, LuaType::Any, None)
+            .unwrap();
         db.get_module_index_mut().note_module_write(module);
         assert_eq!(
             infer_member_by_member_key(&db, &mut cache, &prefix, expr),
@@ -4265,9 +4262,8 @@ mod member_query_memo_tests {
             WorkspaceId { id: 0 },
         );
         db.get_module_index_mut()
-            .get_module_mut(module)
-            .unwrap()
-            .export_type = Some(LuaType::ModuleRef(module));
+            .set_export(module, LuaType::ModuleRef(module), None)
+            .unwrap();
         derivation::lend_keys(KeyTable::default());
         begin();
         assert_eq!(

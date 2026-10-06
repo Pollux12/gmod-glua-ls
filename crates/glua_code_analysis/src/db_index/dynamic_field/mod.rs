@@ -598,15 +598,23 @@ impl DynamicFieldIndex {
     /// another file is not re-collected when this one is re-indexed, so
     /// nothing else rebuilds it.
     pub fn remap_file_table_owners(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
+        // A table literal's owner lives in its file's shard, so the file's
+        // entries are exactly its literals' owners.
+        let file_id = remap.file_id;
         let owners: HashSet<DynamicFieldOwner> = self
             .owner_fields
-            .keys()
-            .chain(self.field_definitions.keys())
-            .chain(self.direct_field_definitions.keys())
-            .chain(self.finite_named_members.keys())
-            .chain(self.wildcard_definitions.keys())
+            .file_entries(file_id)
+            .map(|(owner, _)| owner)
+            .chain(self.field_definitions.file_entries(file_id).map(|(owner, _)| owner))
+            .chain(
+                self.direct_field_definitions
+                    .file_entries(file_id)
+                    .map(|(owner, _)| owner),
+            )
+            .chain(self.finite_named_members.file_entries(file_id).map(|(owner, _)| owner))
+            .chain(self.wildcard_definitions.file_entries(file_id).map(|(owner, _)| owner))
             .filter(|owner| {
-                matches!(owner, DynamicFieldOwner::Table(range) if range.file_id == remap.file_id)
+                matches!(owner, DynamicFieldOwner::Table(range) if range.file_id == file_id)
             })
             .cloned()
             .collect();
@@ -639,6 +647,7 @@ impl DynamicFieldIndex {
             // anyway.
             let mut lost = lost.into_iter().collect::<Vec<_>>();
             lost.sort_by_cached_key(|owner| format!("{owner:?}"));
+            let contributors = self.owners_contributors(&lost);
             for owner in &lost {
                 self.note_whole_owner_write(owner);
                 self.owner_named_fingerprints.remove(owner);
@@ -661,28 +670,79 @@ impl DynamicFieldIndex {
                 self.finite_named_members.remove(owner);
                 self.wildcard_definitions.remove(owner);
             }
-            for (file_id, entries) in &mut self.file_contributions {
-                let before = entries.len();
-                entries.retain(|(owner, _, _)| !lost.contains(owner));
-                if entries.len() != before {
-                    dirty.insert(*file_id);
+            for file_id in contributors {
+                if let Some(entries) = self.file_contributions.get_mut(&file_id) {
+                    let before = entries.len();
+                    entries.retain(|(owner, _, _)| !lost.contains(owner));
+                    if entries.len() != before {
+                        dirty.insert(file_id);
+                    }
+                }
+                if let Some(entries) = self.wildcard_file_contributions.get_mut(&file_id) {
+                    let before = entries.len();
+                    entries.retain(|(owner, _)| !lost.contains(owner));
+                    if entries.len() != before {
+                        dirty.insert(file_id);
+                    }
+                }
+                if let Some(entries) = self.finite_named_file_contributions.get_mut(&file_id) {
+                    entries.retain(|(owner, _)| !lost.contains(owner));
+                    if entries.is_empty() {
+                        self.finite_named_file_contributions.remove(&file_id);
+                    }
                 }
             }
-            for (file_id, entries) in &mut self.wildcard_file_contributions {
-                let before = entries.len();
-                entries.retain(|(owner, _)| !lost.contains(owner));
-                if entries.len() != before {
-                    dirty.insert(*file_id);
-                }
-            }
-            for entries in self.finite_named_file_contributions.values_mut() {
-                entries.retain(|(owner, _)| !lost.contains(owner));
-            }
-            self.finite_named_file_contributions
-                .retain(|_, entries| !entries.is_empty());
         }
         dirty.remove(&remap.file_id);
         dirty
+    }
+
+    fn holds_owner(&self, owner: &DynamicFieldOwner) -> bool {
+        self.owner_fields.contains_key(owner)
+            || self.field_definitions.contains_key(owner)
+            || self.direct_field_definitions.contains_key(owner)
+            || self.finite_named_members.contains_key(owner)
+            || self.wildcard_definitions.contains_key(owner)
+    }
+
+    /// The files whose contribution lists can name one of `owners`: each
+    /// contribution is filed with the definition or mark it produced, so the
+    /// owner-keyed stores name every contributor. Sorted.
+    fn owners_contributors(&self, owners: &[DynamicFieldOwner]) -> Vec<FileId> {
+        let mut files = owners
+            .iter()
+            .flat_map(|owner| {
+                let named = [&self.field_definitions, &self.direct_field_definitions]
+                    .into_iter()
+                    .filter_map(|definitions| definitions.get(owner))
+                    .flat_map(HashMap::values)
+                    .flatten()
+                    .map(|definition| definition.file_id);
+                let assigning = self
+                    .owner_fields
+                    .get(owner)
+                    .into_iter()
+                    .flat_map(HashMap::values)
+                    .flatten()
+                    .copied();
+                let wildcards = self
+                    .wildcard_definitions
+                    .get(owner)
+                    .into_iter()
+                    .flatten()
+                    .map(|definition| definition.file_id);
+                let finite = self
+                    .finite_named_members
+                    .get(owner)
+                    .into_iter()
+                    .flatten()
+                    .map(|member_id| member_id.file_id);
+                named.chain(assigning).chain(wildcards).chain(finite)
+            })
+            .collect::<Vec<_>>();
+        files.sort_unstable();
+        files.dedup();
+        files
     }
 
     /// Re-keys owners whose table literal shifted offset.
@@ -711,17 +771,28 @@ impl DynamicFieldIndex {
         // are in `map`, so an unanchored literal's cross-file entry can already
         // sit on the range an anchored one moves onto; `extend` on the nested
         // maps would drop that entry instead of merging it.
+        let mut sorted = map.iter().collect::<Vec<_>>();
+        sorted.sort_unstable_by_key(|(old, _)| (old.file_id, old.value.start(), old.value.end()));
+        let moves: Vec<(DynamicFieldOwner, DynamicFieldOwner)> = sorted
+            .into_iter()
+            .map(|(old, new)| {
+                (
+                    DynamicFieldOwner::Table(old.clone()),
+                    DynamicFieldOwner::Table(new.clone()),
+                )
+            })
+            .filter(|(old, _)| self.holds_owner(old))
+            .collect();
+        let contributors =
+            self.owners_contributors(&moves.iter().map(|(old, _)| old.clone()).collect::<Vec<_>>());
+
         macro_rules! remap_owner_keyed {
             ($field:expr, |$slot:ident, $group:ident| $merge:block) => {{
-                let moved: Vec<(DynamicFieldOwner, DynamicFieldOwner)> = $field
-                    .keys()
-                    .filter_map(|owner| Some((owner.clone(), remap_owner(owner, map)?)))
-                    .collect();
                 // Detached before any is re-filed: one literal's new range can
                 // be another's old one.
-                let detached: Vec<_> = moved
-                    .into_iter()
-                    .filter_map(|(old, new)| Some((new, $field.remove(&old)?)))
+                let detached: Vec<_> = moves
+                    .iter()
+                    .filter_map(|(old, new)| Some((new.clone(), $field.remove(old)?)))
                     .collect();
                 for (new, group) in detached {
                     let $slot = $field.entry(new).or_default();
@@ -731,15 +802,9 @@ impl DynamicFieldIndex {
             }};
         }
 
-        let remapped_owners: Vec<DynamicFieldOwner> = self
-            .owner_fields
-            .keys()
-            .chain(self.field_definitions.keys())
-            .chain(self.direct_field_definitions.keys())
-            .chain(self.finite_named_members.keys())
-            .chain(self.wildcard_definitions.keys())
-            .filter_map(|owner| Some([owner.clone(), remap_owner(owner, map)?]))
-            .flatten()
+        let remapped_owners: Vec<DynamicFieldOwner> = moves
+            .iter()
+            .flat_map(|(old, new)| [old.clone(), new.clone()])
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
@@ -768,24 +833,26 @@ impl DynamicFieldIndex {
             self.recompute_owner_named(owner);
         }
 
-        for entries in self.file_contributions.values_mut() {
-            for (owner, _, _) in entries.iter_mut() {
-                if let Some(new) = remap_owner(owner, map) {
-                    *owner = new;
+        for file_id in contributors {
+            if let Some(entries) = self.file_contributions.get_mut(&file_id) {
+                for (owner, _, _) in entries.iter_mut() {
+                    if let Some(new) = remap_owner(owner, map) {
+                        *owner = new;
+                    }
                 }
             }
-        }
-        for entries in self.finite_named_file_contributions.values_mut() {
-            for (owner, _) in entries.iter_mut() {
-                if let Some(new) = remap_owner(owner, map) {
-                    *owner = new;
+            if let Some(entries) = self.finite_named_file_contributions.get_mut(&file_id) {
+                for (owner, _) in entries.iter_mut() {
+                    if let Some(new) = remap_owner(owner, map) {
+                        *owner = new;
+                    }
                 }
             }
-        }
-        for entries in self.wildcard_file_contributions.values_mut() {
-            for (owner, _) in entries.iter_mut() {
-                if let Some(new) = remap_owner(owner, map) {
-                    *owner = new;
+            if let Some(entries) = self.wildcard_file_contributions.get_mut(&file_id) {
+                for (owner, _) in entries.iter_mut() {
+                    if let Some(new) = remap_owner(owner, map) {
+                        *owner = new;
+                    }
                 }
             }
         }
@@ -1700,6 +1767,43 @@ mod tests {
                 InFiled::new(contributor, range(1, 2)),
                 InFiled::new(contributor, range(3, 4)),
             ]
+        );
+    }
+
+    /// A literal the edit destroyed takes the fields other files filed on it
+    /// with it, and those files are analysed again; a moved one keeps its
+    /// contributors' entries under its new range.
+    #[test]
+    fn a_destroyed_literal_drops_only_its_contributors_entries() {
+        let (edited, contributor, bystander) = (FileId::new(1), FileId::new(2), FileId::new(3));
+        let lost = DynamicFieldOwner::Table(InFiled::new(edited, range(2, 6)));
+        let kept = DynamicFieldOwner::Table(InFiled::new(edited, range(20, 30)));
+        let moved = DynamicFieldOwner::Table(InFiled::new(edited, range(16, 26)));
+        let mut index = DynamicFieldIndex::new();
+        index.add_field(lost.clone(), SmolStr::new("f"), contributor, range(1, 2));
+        index.add_wildcard_definition(lost.clone(), contributor, range(3, 4));
+        index.add_field(kept.clone(), SmolStr::new("g"), bystander, range(5, 6));
+
+        let dirty = index.remap_file_table_owners(&crate::FileRemap::unvalidated(
+            edited,
+            crate::PositionMap::new("abcdefgh", "abXh"),
+        ));
+
+        assert_eq!(dirty, HashSet::from_iter([contributor]));
+        assert!(!index.has_field(&lost, "f"));
+        assert!(
+            index
+                .file_contributions
+                .get(&contributor)
+                .is_none_or(Vec::is_empty)
+        );
+        assert!(index.has_field(&moved, "g"));
+        assert_eq!(
+            index
+                .file_contributions
+                .get(&bystander)
+                .map(|entries| &entries[0].0),
+            Some(&moved)
         );
     }
 

@@ -3,7 +3,7 @@ mod flow_tree;
 
 use crate::db_index::cow_shards::{CowCell, CowShardSet, CowShards};
 use rowan::{TextRange, TextSize};
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet};
 
 use std::hash::{Hash, Hasher};
 
@@ -36,6 +36,9 @@ pub struct LuaFlowIndex {
     settled_special_call_facts: CowShardSet<SpecialCallFact>,
     /// Multiset fingerprint of `settled_special_call_facts` per site.
     special_call_fact_fingerprints: CowShards<(FileId, TextSize), Fingerprint>,
+    /// File -> the holders whose special-call effect types name a position in
+    /// it.
+    special_call_holders: CowShards<FileId, FxHashSet<FileId>>,
 }
 
 impl Default for LuaFlowIndex {
@@ -52,6 +55,7 @@ impl LuaFlowIndex {
             special_call_effects: Default::default(),
             settled_special_call_facts: Default::default(),
             special_call_fact_fingerprints: Default::default(),
+            special_call_holders: Default::default(),
         }
     }
 
@@ -93,6 +97,18 @@ impl LuaFlowIndex {
             return false;
         }
         effects.push(effect);
+        for named in crate::db_index::r#type::type_referenced_files(&type_ref) {
+            if !self
+                .special_call_holders
+                .get(&named)
+                .is_some_and(|holders| holders.contains(&file_id))
+            {
+                self.special_call_holders
+                    .entry(named)
+                    .or_default()
+                    .insert(file_id);
+            }
+        }
         derivation::note_write(|| FactKey::SpecialCall(file_id, position));
         derivation::note_write(|| FactKey::SpecialCallFile(file_id));
         self.install_special_call_facts(
@@ -150,16 +166,25 @@ impl LuaFlowIndex {
             return rustc_hash::FxHashSet::default();
         }
         let mut dirty = rustc_hash::FxHashSet::default();
-        for (holder, effects) in self.special_call_effects.iter_mut() {
+        let mut holders = self
+            .special_call_holders
+            .get(&remap.file_id)
+            .map(|holders| holders.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        holders.sort_unstable();
+        for holder in holders {
+            let Some(effects) = self.special_call_effects.get_mut(&holder) else {
+                continue;
+            };
             for (position, effects) in effects.iter_mut() {
                 for effect in effects.iter_mut() {
                     let result = crate::db_index::remap_identities_in_type(&effect.type_ref, remap);
                     if result.lost {
-                        dirty.insert(*holder);
+                        dirty.insert(holder);
                     } else if let Some(typ) = result.typ {
                         effect.type_ref = typ;
-                        derivation::note_write(|| FactKey::SpecialCall(*holder, *position));
-                        derivation::note_write(|| FactKey::FlowTree(*holder));
+                        derivation::note_write(|| FactKey::SpecialCall(holder, *position));
+                        derivation::note_write(|| FactKey::FlowTree(holder));
                     }
                 }
             }
@@ -167,10 +192,34 @@ impl LuaFlowIndex {
         dirty
     }
 
+    /// The files `holder`'s special-call effect types name.
+    fn special_call_files(&self, holder: FileId) -> FxHashSet<FileId> {
+        self.effects_in(&holder)
+            .flat_map(|(_, effect)| {
+                crate::db_index::r#type::type_referenced_files(&effect.type_ref)
+            })
+            .collect()
+    }
+
+    /// Re-files `holder` under the files its effect types name now, given
+    /// those `linked` it named before its effects were dropped.
+    fn unlink_special_call_holder(&mut self, holder: FileId, linked: FxHashSet<FileId>) {
+        let named = self.special_call_files(holder);
+        for file_id in linked.difference(&named) {
+            if let Some(holders) = self.special_call_holders.get_mut(file_id) {
+                holders.remove(&holder);
+                if holders.is_empty() {
+                    self.special_call_holders.remove(file_id);
+                }
+            }
+        }
+    }
+
     /// Drops what the special call at `position` settled, before the
     /// derivation that settled it runs again.
     pub(crate) fn reset_special_call(&mut self, file_id: FileId, position: TextSize) {
         derivation::note_write(|| FactKey::SpecialCall(file_id, position));
+        let linked = self.special_call_files(file_id);
         if let Some(effects) = self.special_call_effects.get_mut(&file_id)
             && effects.remove(&position).is_some()
         {
@@ -178,6 +227,7 @@ impl LuaFlowIndex {
             if effects.is_empty() {
                 self.special_call_effects.remove(&file_id);
             }
+            self.unlink_special_call_holder(file_id, linked);
         }
         self.settled_special_call_facts
             .retain(|fact| fact.site() != (file_id, position));
@@ -337,10 +387,12 @@ impl LuaIndex for LuaFlowIndex {
         });
         // Dropping the effects is a novel fact for their readers, mirroring
         // the signature index's removal tombstones.
+        let linked = self.special_call_files(file_id);
         if let Some(by_position) = self.special_call_effects.remove(&file_id) {
             for position in by_position.keys() {
                 self.note_special_call_write(file_id, *position);
             }
+            self.unlink_special_call_holder(file_id, linked);
         }
     }
     fn clear(&mut self) {
@@ -366,6 +418,7 @@ impl LuaIndex for LuaFlowIndex {
         self.special_call_fact_fingerprints.clear();
         self.special_call_effects.clear();
         self.settled_special_call_facts.clear();
+        self.special_call_holders.clear();
     }
 }
 
@@ -957,6 +1010,61 @@ mod tests {
 
     /// Removing a file evicts its fact records, so reinstalling the same facts
     /// afterwards is novel again: the drop was observable to readers.
+    /// `special_call_holders` names exactly the holders a scan of every
+    /// effect's type finds.
+    fn assert_special_call_holders_match_a_scan(index: &LuaFlowIndex) {
+        let mut expected: HashMap<FileId, FxHashSet<FileId>> = HashMap::default();
+        for (holder, _, effect) in index.special_call_effects() {
+            for file_id in crate::db_index::r#type::type_referenced_files(&effect.type_ref) {
+                expected.entry(file_id).or_default().insert(*holder);
+            }
+        }
+        let indexed: HashMap<_, _> = index
+            .special_call_holders
+            .iter()
+            .map(|(file_id, holders)| (*file_id, holders.clone()))
+            .collect();
+        assert_eq!(indexed, expected);
+    }
+
+    #[test]
+    fn special_call_holders_follow_adds_resets_remaps_and_removals() {
+        let (literal_file, holder) = (FileId::new(1), FileId::new(2));
+        let literal = |start: u32| {
+            LuaType::TableConst(InFiled::new(
+                literal_file,
+                TextRange::new(TextSize::new(start), TextSize::new(start + 2)),
+            ))
+        };
+        let (kept, reset) = (TextSize::new(4), TextSize::new(8));
+        let mut index = LuaFlowIndex::new();
+        index.add_special_call_effect(holder, kept, effect_target(holder), literal(0));
+        index.add_special_call_effect(holder, reset, effect_target(holder), literal(6));
+        index.add_special_call_effect(literal_file, kept, effect_target(literal_file), literal(3));
+        assert_special_call_holders_match_a_scan(&index);
+
+        index.reset_special_call(holder, reset);
+        assert_special_call_holders_match_a_scan(&index);
+
+        let dirty = index.remap_special_call_effect_types(&crate::FileRemap::unvalidated(
+            literal_file,
+            crate::PositionMap::new("abc", "\nabc"),
+        ));
+        assert!(dirty.is_empty());
+        assert_eq!(
+            index
+                .get_special_call_effects(&holder, kept)
+                .expect("the effect")[0]
+                .type_ref,
+            literal(1)
+        );
+        assert_special_call_holders_match_a_scan(&index);
+
+        index.remove(holder);
+        index.remove(literal_file);
+        assert!(index.special_call_holders.is_empty());
+    }
+
     #[test]
     fn removing_file_evicts_its_special_call_facts() {
         let mut index = LuaFlowIndex::new();
@@ -979,4 +1087,5 @@ crate::db_index::cow_shards::task_fork_fields!(LuaFlowIndex {
     special_call_effects,
     settled_special_call_facts,
     special_call_fact_fingerprints,
+    special_call_holders => crate::db_index::cow_shards::merge_set,
 });
