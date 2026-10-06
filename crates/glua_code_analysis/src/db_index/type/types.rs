@@ -2203,7 +2203,11 @@ fn lua_type_sort_detail(ty: &LuaType) -> u64 {
         // String-like: hash the content for determinism
         LuaType::StringConst(s) | LuaType::DocStringConst(s) => hash_str_content(s.as_str()),
         LuaType::Ref(id) | LuaType::Def(id) => hash_str_content(id.get_name()),
-        LuaType::Signature(id) => u32::from(id.get_position()) as u64,
+        // File-major, like `TableConst`: an edit moves one file's positions
+        // without reordering them, so the order survives remapping.
+        LuaType::Signature(id) => {
+            ((id.get_file_id().id as u64) << 32) | (u32::from(id.get_position()) as u64)
+        }
         LuaType::ModuleRef(id) => id.id as u64,
         LuaType::Namespace(s) | LuaType::Language(s) | LuaType::ConditionalInfer(s) => {
             hash_str_content(s.as_str())
@@ -2562,6 +2566,42 @@ mod tests {
         assert_ne!(
             lua_type_sort_key(&LuaType::TplRef(shared.clone())).1,
             lua_type_sort_key(&LuaType::ConstTplRef(shared)).1
+        );
+    }
+
+    /// An edit moves the signatures of one file and an inferred union keeps
+    /// its member order through the remap, so the canonical order has to
+    /// survive such a move and must not hang on the order members came in.
+    #[test]
+    fn inferred_unions_order_signatures_independent_of_edits_and_arrival() {
+        let signature = |file: u32, position: u32| {
+            LuaType::Signature(crate::LuaSignatureId::new(
+                crate::FileId::new(file),
+                position.into(),
+            ))
+        };
+        let members = |types: Vec<LuaType>| -> Vec<LuaType> {
+            match LuaType::from_inferred_vec(types) {
+                LuaType::Union(union) => union.into_vec(),
+                other => vec![other],
+            }
+        };
+        let before_edit = members(vec![signature(238, 40805), signature(1026, 40700)])
+            .into_iter()
+            .map(|typ| match typ {
+                LuaType::Signature(id) if id.get_file_id() == crate::FileId::new(1026) => {
+                    signature(1026, u32::from(id.get_position()) + 120)
+                }
+                typ => typ,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            before_edit,
+            members(vec![signature(238, 40805), signature(1026, 40820)])
+        );
+        assert_eq!(
+            members(vec![signature(1, 5), signature(2, 5)]),
+            members(vec![signature(2, 5), signature(1, 5)])
         );
     }
 
