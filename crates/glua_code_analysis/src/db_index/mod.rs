@@ -461,6 +461,7 @@ impl DbIndex {
                 self.decl_index.fact_fingerprint(key)
             }
             K::Member(_)
+            | K::MemberObject(_)
             | K::MemberSlot(..)
             | K::MemberOwnerMap(_)
             | K::MemberOwnerExprKeys(_)

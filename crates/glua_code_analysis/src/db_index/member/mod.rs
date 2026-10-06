@@ -136,6 +136,16 @@ fn file_element_owner_element(site: &crate::InFiled<TextRange>) -> Fingerprint {
     fingerprint_of(&(2u8, site))
 }
 
+/// What a read of a member object alone observes: its key, feature and global
+/// id.
+fn member_object(member: &LuaMember) -> impl std::hash::Hash + '_ {
+    (
+        member.get_key(),
+        member.get_feature(),
+        member.get_global_id(),
+    )
+}
+
 fn note_slot_write(owner: &LuaMemberOwner, key: &LuaMemberKey) {
     derivation::note_write(|| FactKey::MemberSlot(owner.clone(), key.clone()));
 }
@@ -358,6 +368,10 @@ impl LuaMemberIndex {
     pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
         match key {
             FactKey::Member(id) => self.member_fingerprint(*id),
+            FactKey::MemberObject(id) => self
+                .members
+                .get(id)
+                .map_or(ABSENT, |member| fingerprint_of(&member_object(member))),
             FactKey::MemberSlot(owner, key) => self.slot_fingerprint(owner, key),
             FactKey::MemberOwnerPresence(owner) => {
                 if self.owner_members.contains_key(owner) {
@@ -426,13 +440,7 @@ impl LuaMemberIndex {
 
     /// The member object, its current owner, flags, provenance and scope.
     fn member_fingerprint(&self, id: LuaMemberId) -> Fingerprint {
-        let member = self.members.get(&id).map(|member| {
-            (
-                member.get_key(),
-                member.get_feature(),
-                member.get_global_id(),
-            )
-        });
+        let member = self.members.get(&id).map(member_object);
         let owner = self.member_current_owner.get(&id);
         let provenance = self.member_path_provenance.get(&id);
         let scope = self
@@ -1618,7 +1626,7 @@ impl LuaMemberIndex {
     }
 
     pub fn get_member(&self, id: &LuaMemberId) -> Option<&LuaMember> {
-        derivation::note_member_read(*id);
+        derivation::note_member_object_read(*id);
         self.members.get(id)
     }
 
