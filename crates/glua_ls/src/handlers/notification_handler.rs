@@ -333,10 +333,13 @@ mod tests {
         }
     }
 
-    /// Ranged changes sent right after the open reach the analysis applied
-    /// to the opened text, in the order the editor sent them.
-    #[test]
-    fn ranged_changes_reach_the_analysis_in_order() {
+    /// Runs `edits` (one notification each, from version 2) after opening
+    /// `opened` over an indexed file, and returns the text the analysis holds
+    /// once the latest applied version is reached.
+    fn analysis_text_after_edits(
+        opened: &str,
+        edits: Vec<Vec<TextDocumentContentChangeEvent>>,
+    ) -> Option<String> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         let (connection, _peer) = Connection::memory();
         runtime.block_on(async {
@@ -354,7 +357,7 @@ mod tests {
                     uri: uri.clone(),
                     language_id: "lua".to_string(),
                     version: 1,
-                    text: "local a = 2\r\n".to_string(),
+                    text: opened.to_string(),
                 },
             };
             on_notification_handler(
@@ -363,11 +366,6 @@ mod tests {
             )
             .await
             .expect("the open is handled");
-            let edits = [
-                vec![ranged((0, 7), (0, 7), "b")],
-                vec![ranged((0, 6), (0, 8), "😀")],
-                vec![ranged((1, 0), (1, 0), "x"), ranged((0, 8), (0, 9), "")],
-            ];
             for (version, content_changes) in (2..).zip(edits) {
                 let change = DidChangeTextDocumentParams {
                     text_document: lsp_types::VersionedTextDocumentIdentifier {
@@ -390,17 +388,47 @@ mod tests {
                     .wait_until_latest_document_version_applied(&uri, &CancellationToken::new()),
             )
             .await;
-            assert_eq!(applied.ok(), Some(true));
+            assert_eq!(applied.ok(), Some(true), "the latest version is applied");
             let analysis = snapshot.analysis().read().await;
-            let file_id = analysis.get_file_id(&uri).expect("the file is indexed");
-            let held = analysis
+            let file_id = analysis.get_file_id(&uri)?;
+            analysis
                 .compilation
                 .get_db()
                 .get_vfs()
                 .get_file_content(&file_id)
-                .cloned();
-            assert_eq!(held.as_deref(), Some("local 😀= 2\r\nx"));
-        });
+                .cloned()
+        })
+    }
+
+    /// Ranged changes sent right after the open reach the analysis applied
+    /// to the opened text, in the order the editor sent them.
+    #[test]
+    fn ranged_changes_reach_the_analysis_in_order() {
+        let held = analysis_text_after_edits(
+            "local a = 2\r\n",
+            vec![
+                vec![ranged((0, 7), (0, 7), "b")],
+                vec![ranged((0, 6), (0, 8), "😀")],
+                vec![ranged((1, 0), (1, 0), "x"), ranged((0, 8), (0, 9), "")],
+            ],
+        );
+        assert_eq!(held.as_deref(), Some("local 😀= 2\r\nx"));
+    }
+
+    /// A change that cannot be applied, and the ranged changes after it,
+    /// leave the analysis on the last good text without stalling requests
+    /// that wait for the latest version.
+    #[test]
+    fn a_bad_change_keeps_the_last_good_text() {
+        let held = analysis_text_after_edits(
+            "local a = 2\n",
+            vec![
+                vec![ranged((0, 10), (0, 11), "3")],
+                vec![ranged((9, 0), (9, 0), "x")],
+                vec![ranged((0, 0), (0, 0), "y")],
+            ],
+        );
+        assert_eq!(held.as_deref(), Some("local a = 3\n"));
     }
 
     /// A file rename is pending from the moment it arrives, as a watched-file
