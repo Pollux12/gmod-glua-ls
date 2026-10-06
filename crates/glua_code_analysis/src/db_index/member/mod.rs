@@ -372,6 +372,17 @@ impl LuaMemberIndex {
                 .members
                 .get(id)
                 .map_or(ABSENT, |member| fingerprint_of(&member_object(member))),
+            FactKey::MemberHome(id) => {
+                derivation::fingerprint_opt(self.member_current_owner.get(id))
+            }
+            FactKey::MemberMarks(id) => {
+                let (provenance, flags) = self.member_marks(*id);
+                let scope = self.member_scope(*id);
+                if provenance.is_none() && scope.is_none() && !flags.contains(&true) {
+                    return ABSENT;
+                }
+                fingerprint_of(&(provenance, flags, scope))
+            }
             FactKey::MemberSlot(owner, key) => self.slot_fingerprint(owner, key),
             FactKey::MemberOwnerPresence(owner) => {
                 if self.owner_members.contains_key(owner) {
@@ -442,17 +453,8 @@ impl LuaMemberIndex {
     fn member_fingerprint(&self, id: LuaMemberId) -> Fingerprint {
         let member = self.members.get(&id).map(member_object);
         let owner = self.member_current_owner.get(&id);
-        let provenance = self.member_path_provenance.get(&id);
-        let scope = self
-            .member_function_scope_ranges
-            .get(&id)
-            .map(|range| crate::InFiled::new(id.file_id, *range));
-        let flags = [
-            self.owner_only_members.contains(&id),
-            self.synthesized_owner_members.contains(&id),
-            self.deferred_index_expr_members.contains(&id),
-            self.non_overwriting_assignment_members.contains(&id),
-        ];
+        let (provenance, flags) = self.member_marks(id);
+        let scope = self.member_scope(id);
         if member.is_none()
             && owner.is_none()
             && provenance.is_none()
@@ -462,6 +464,27 @@ impl LuaMemberIndex {
             return ABSENT;
         }
         fingerprint_of(&(member, owner, provenance, scope, flags))
+    }
+
+    /// A member's function scope, in its file.
+    fn member_scope(&self, id: LuaMemberId) -> Option<crate::InFiled<TextRange>> {
+        self.member_function_scope_ranges
+            .get(&id)
+            .map(|range| crate::InFiled::new(id.file_id, *range))
+    }
+
+    /// A member's path provenance and its owner-only, synthesized-owner,
+    /// deferred and non-overwriting flags.
+    fn member_marks(&self, id: LuaMemberId) -> (Option<&GlobalId>, [bool; 4]) {
+        (
+            self.member_path_provenance.get(&id),
+            [
+                self.owner_only_members.contains(&id),
+                self.synthesized_owner_members.contains(&id),
+                self.deferred_index_expr_members.contains(&id),
+                self.non_overwriting_assignment_members.contains(&id),
+            ],
+        )
     }
 
     /// The item listed under `(owner, key)` and both owner-key index slots in
@@ -1185,7 +1208,7 @@ impl LuaMemberIndex {
     }
 
     pub fn has_synthesized_owner(&self, id: &LuaMemberId) -> bool {
-        derivation::note_member_read(*id);
+        derivation::note_member_marks_read(*id);
         self.synthesized_owner_members.contains(id)
     }
 
@@ -1195,7 +1218,7 @@ impl LuaMemberIndex {
     /// class-flip machinery (`set_global_path_class`), not by the prefix-type
     /// read a settled pass re-derives.
     pub fn member_path_provenance(&self, id: &LuaMemberId) -> Option<&GlobalId> {
-        derivation::note_member_read(*id);
+        derivation::note_member_marks_read(*id);
         self.member_path_provenance.get(id)
     }
 
@@ -1210,7 +1233,7 @@ impl LuaMemberIndex {
     }
 
     pub fn is_deferred_index_expr_member(&self, id: &LuaMemberId) -> bool {
-        derivation::note_member_read(*id);
+        derivation::note_member_marks_read(*id);
         self.deferred_index_expr_members.contains(id)
     }
 
@@ -1862,7 +1885,7 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
     ) -> Option<LuaMemberOwner> {
         let class = owner.get_type_id()?;
-        derivation::note_member_read(id);
+        derivation::note_member_marks_read(id);
         let provenance = self.member_path_provenance.get(&id)?;
         derivation::note_global_path_read(provenance);
         let candidates = self.global_path_class_candidates.get(provenance)?;
@@ -2315,7 +2338,8 @@ impl LuaMemberIndex {
         &self,
         member_id: LuaMemberId,
     ) -> Option<&LuaMemberIndexItem> {
-        derivation::note_member_read(member_id);
+        derivation::note_member_home_read(member_id);
+        derivation::note_member_object_read(member_id);
         let owner = self.member_current_owner.get(&member_id)?;
         let member_key = self.members.get(&member_id)?.get_key();
         note_slot_read(owner, member_key);
@@ -2363,12 +2387,12 @@ impl LuaMemberIndex {
     }
 
     pub fn get_current_owner(&self, id: &LuaMemberId) -> Option<&LuaMemberOwner> {
-        derivation::note_member_read(*id);
+        derivation::note_member_home_read(*id);
         self.member_current_owner.get(id)
     }
 
     pub fn get_member_owner(&self, id: &LuaMemberId) -> Option<&LuaMemberOwner> {
-        derivation::note_member_read(*id);
+        derivation::note_member_home_read(*id);
         self.member_current_owner.get(id)
     }
 
@@ -2585,7 +2609,7 @@ impl LuaMemberIndex {
     }
 
     pub fn member_function_scope_range(&self, member_id: LuaMemberId) -> Option<TextRange> {
-        derivation::note_member_read(member_id);
+        derivation::note_member_marks_read(member_id);
         self.member_function_scope_ranges.get(&member_id).copied()
     }
 
@@ -2673,7 +2697,7 @@ impl LuaMemberIndex {
     }
 
     pub fn is_non_overwriting_assignment_member(&self, member_id: LuaMemberId) -> bool {
-        derivation::note_member_read(member_id);
+        derivation::note_member_marks_read(member_id);
         self.non_overwriting_assignment_members.contains(&member_id)
     }
 

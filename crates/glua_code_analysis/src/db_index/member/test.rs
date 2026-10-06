@@ -1046,6 +1046,38 @@ mod tests {
         assert_ne!(fingerprint(&index, read), read_seen);
     }
 
+    /// A reader of a member's owner records the owner alone, read out of the
+    /// member: the member's function scope moving holds it, a move to another
+    /// owner moves it.
+    #[test]
+    fn a_member_scope_move_holds_a_reader_of_the_member_owner() {
+        use crate::db_index::derivation::{self, FactKey};
+        let file_id = FileId::new(9);
+        let member_id = make_member_id(file_id, 20);
+        let mut index = LuaMemberIndex::new();
+        index.add_member(path("Holder"), make_member(member_id, "x"));
+        derivation::begin(derivation::DerivationId::workspace(
+            derivation::DerivationKind::GmodLoad,
+        ));
+        assert_eq!(index.get_current_owner(&member_id), Some(&path("Holder")));
+        let reads = derivation::end().into_recorded().2;
+        let [read] = reads.as_slice() else {
+            panic!("expected one read, got {reads:?}");
+        };
+        assert_eq!(read.base(), Some(FactKey::Member(member_id)));
+        let fingerprint = |index: &LuaMemberIndex, key: &FactKey| {
+            derivation::in_file(Some(file_id), || index.fact_fingerprint(key))
+        };
+        let seen = fingerprint(&index, read);
+
+        let scope = TextRange::new(TextSize::new(10), TextSize::new(100));
+        index.set_member_function_scope_range(member_id, Some(scope));
+        assert_eq!(fingerprint(&index, read), seen);
+
+        index.set_member_owner(path("Other"), file_id, member_id);
+        assert_ne!(fingerprint(&index, read), seen);
+    }
+
     /// `MYTBL["net.handler"] = f` keys one member `net.handler` under `MYTBL`.
     /// Its global path is `MYTBL.net.handler`, whose last dotted segment is
     /// `handler` — a key nothing is stored under.

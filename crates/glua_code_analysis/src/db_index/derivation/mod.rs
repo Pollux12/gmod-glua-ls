@@ -231,6 +231,11 @@ pub enum FactKey {
     /// A member object alone: its key, feature and global id. Read out of its
     /// [`FactKey::Member`].
     MemberObject(LuaMemberId),
+    /// A member's current owner. Read out of its [`FactKey::Member`].
+    MemberHome(LuaMemberId),
+    /// A member's path provenance, flags and function scope. Read out of its
+    /// [`FactKey::Member`].
+    MemberMarks(LuaMemberId),
     /// The visible members of one owner under one key.
     MemberSlot(LuaMemberOwner, LuaMemberKey),
     /// Every member of one owner.
@@ -644,6 +649,8 @@ impl FactKey {
                 | K::SpecialCall(..)
                 | K::Member(_)
                 | K::MemberObject(_)
+                | K::MemberHome(_)
+                | K::MemberMarks(_)
                 | K::MemberSlot(..)
                 | K::MemberOwnerMap(_)
                 | K::MemberOwnerExprKeys(_)
@@ -760,7 +767,9 @@ impl FactKey {
             | FactKey::SpecialCallSignature(signature_id) => {
                 Some(FactKey::Signature(*signature_id))
             }
-            FactKey::MemberObject(member_id) => Some(FactKey::Member(*member_id)),
+            FactKey::MemberObject(member_id)
+            | FactKey::MemberHome(member_id)
+            | FactKey::MemberMarks(member_id) => Some(FactKey::Member(*member_id)),
             FactKey::IndexReferenceFiles(name) => Some(FactKey::ReferencesByName(name.clone())),
             FactKey::SpecialCallFor(file_id, _) => Some(FactKey::SpecialCallFile(*file_id)),
             FactKey::GmodBaseClass(file_id) | FactKey::GmodVguiRegistrations(file_id) => {
@@ -782,7 +791,10 @@ impl FactKey {
             K::DeclClaim(decl_id) | K::Decl(decl_id) | K::DeclDefault(decl_id) => {
                 Some(decl_id.file_id)
             }
-            K::Member(member_id) | K::MemberObject(member_id) => Some(member_id.file_id),
+            K::Member(member_id)
+            | K::MemberObject(member_id)
+            | K::MemberHome(member_id)
+            | K::MemberMarks(member_id) => Some(member_id.file_id),
             K::NetHelper(site) => Some(site.file_id),
             K::GmodRealmAt(file_id, _)
             | K::GmodMemberRealmAt(file_id, _)
@@ -2128,10 +2140,19 @@ fn member_identity(id: &LuaMemberId) -> u128 {
         | u128::from(u32::from(range.end()))
 }
 
-/// Records a read of the member object `id` with its owner, flags and
-/// function scope.
-pub fn note_member_read(id: LuaMemberId) {
-    note_read_by((u8::MAX - 1, member_identity(&id)), || FactKey::Member(id));
+/// Records a read of the current owner of the member `id`.
+pub fn note_member_home_read(id: LuaMemberId) {
+    note_read_by((u8::MAX - 1, member_identity(&id)), || {
+        FactKey::MemberHome(id)
+    });
+}
+
+/// Records a read of the path provenance, flags and function scope of the
+/// member `id`.
+pub fn note_member_marks_read(id: LuaMemberId) {
+    note_read_by((u8::MAX - 22, member_identity(&id)), || {
+        FactKey::MemberMarks(id)
+    });
 }
 
 /// Records a read of the member object `id` alone: its key, feature and

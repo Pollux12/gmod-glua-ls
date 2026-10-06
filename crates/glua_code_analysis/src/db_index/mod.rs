@@ -462,6 +462,8 @@ impl DbIndex {
             }
             K::Member(_)
             | K::MemberObject(_)
+            | K::MemberHome(_)
+            | K::MemberMarks(_)
             | K::MemberSlot(..)
             | K::MemberOwnerMap(_)
             | K::MemberOwnerExprKeys(_)
