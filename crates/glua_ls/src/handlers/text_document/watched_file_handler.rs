@@ -135,21 +135,10 @@ pub(crate) async fn apply_file_system_changes(
     for (file_id, uri) in &staged {
         debounced_analysis.schedule(*file_id, uri.clone()).await;
     }
-    // The files whose text changed are diagnosed first, as soon as their own
-    // re-analysis settles; the loop has the store diagnose the other files the
-    // re-analysis moves.
-    let (deleted, changed): (Vec<_>, Vec<_>) = staged
-        .into_iter()
-        .partition(|(_, uri)| final_deleted.contains(uri));
     let store = context.file_diagnostic().store();
-    for (file_id, uri) in &deleted {
+    for (file_id, uri) in staged.iter().filter(|(_, uri)| final_deleted.contains(uri)) {
         store.remove(*file_id, uri);
     }
-    let file_ids = changed
-        .into_iter()
-        .map(|(file_id, _)| file_id)
-        .collect::<Vec<_>>();
-    store.invalidate(file_ids.iter().copied(), &file_ids);
 }
 
 /// The batch without the watcher's events for a rename `didRenameFiles`

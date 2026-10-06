@@ -206,7 +206,6 @@ pub async fn on_did_open_text_document(
         store.set_open(file_id, true);
         let untaken = context.analysis().read().await.has_untaken_text(file_id);
         if untaken {
-            store.invalidate([file_id], &[file_id]);
             context
                 .debounced_analysis()
                 .schedule(file_id, uri.clone())
@@ -290,12 +289,8 @@ pub async fn on_did_change_text_document(
         preparsed,
     )
     .await;
-    if let Some(file_id) = file_id {
+    if file_id.is_some() {
         context.note_document_applied_version(&uri, version);
-        context
-            .file_diagnostic()
-            .store()
-            .invalidate([file_id], &[file_id]);
     }
 
     if should_drop_stale_version(&context, &uri, version) {
@@ -385,8 +380,6 @@ pub async fn on_did_close_document(
         if let Some(file_id) = file_id {
             store.remove(file_id, uri);
         }
-    } else if let Some(staged) = staged {
-        store.invalidate([staged], &[staged]);
     }
     if let Some(staged) = staged {
         context

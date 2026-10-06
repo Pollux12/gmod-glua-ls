@@ -220,7 +220,12 @@ impl DebouncedAnalysis {
     }
 
     /// Add a file to the pending reindex set and reset the debounce timer.
+    /// Its diagnostics go first, as soon as its own text settles: whatever
+    /// changed its text, it is the file being edited.
     pub async fn schedule(&self, file_id: FileId, uri: Uri) {
+        self.file_diagnostic
+            .store()
+            .invalidate([file_id], &[file_id]);
         {
             let mut pending = self.pending_files.lock().await;
             pending.insert(file_id);
