@@ -23,6 +23,14 @@ fn spawn_deferred_drop(deferred_drop: DeferredVfsDrop) {
     tokio::task::spawn_blocking(move || drop(deferred_drop));
 }
 
+/// Whether an update opens the document, starting a new editor session, or
+/// changes it within the session.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DocumentUpdate {
+    Open,
+    Change,
+}
+
 fn should_drop_stale_version(
     context: &ServerContextSnapshot,
     uri: &lsp_types::Uri,
@@ -36,6 +44,7 @@ async fn apply_document_update_without_queuing(
     uri: &lsp_types::Uri,
     text: String,
     version: i32,
+    update: DocumentUpdate,
     mut preparsed: Option<PreparsedDocument>,
 ) -> Option<FileId> {
     if should_drop_stale_version(context, uri, version) {
@@ -67,6 +76,12 @@ async fn apply_document_update_without_queuing(
             crate::util::ls_profile::record_did_change_write_hold(start.elapsed());
         }
         return None;
+    }
+
+    // Versions order one session's edits: a reopened document starts over,
+    // even if the close never got to forget the last session's version.
+    if update == DocumentUpdate::Open {
+        analysis.forget_document_version(uri);
     }
 
     // Only the text is stored; the debounced loop re-analyses it and
@@ -259,8 +274,15 @@ pub async fn on_did_open_text_document(
         .as_ref()
         .map_or_else(Vec::new, |parsed| parsed.syntax_diagnostics.clone());
 
-    let file_id =
-        apply_document_update_without_queuing(&context, &uri, text, version, preparsed).await;
+    let file_id = apply_document_update_without_queuing(
+        &context,
+        &uri,
+        text,
+        version,
+        DocumentUpdate::Open,
+        preparsed,
+    )
+    .await;
     if let Some(file_id) = file_id {
         context.note_document_applied_version(&uri, version);
         if context.lsp_features().supports_semantic_tokens_refresh() {
@@ -400,8 +422,15 @@ pub async fn on_did_change_text_document(
         return Some(());
     }
 
-    let file_id =
-        apply_document_update_without_queuing(&context, &uri, text, version, preparsed).await;
+    let file_id = apply_document_update_without_queuing(
+        &context,
+        &uri,
+        text,
+        version,
+        DocumentUpdate::Change,
+        preparsed,
+    )
+    .await;
     if file_id.is_some() {
         context.note_document_applied_version(&uri, version);
     }
@@ -513,6 +542,7 @@ pub async fn on_did_close_document(
         if !context.is_document_closed(uri) {
             return Some(());
         }
+        analysis.forget_document_version(uri);
         let staged = analysis
             .stage_file_system_changes(vec![(uri.clone(), text)])
             .into_iter()
@@ -562,6 +592,7 @@ mod tests {
     };
     use std::str::FromStr;
     use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     #[gtest]
     fn test_on_did_open_text_document_requests_semantic_tokens_refresh() -> Result<()> {
@@ -682,6 +713,130 @@ mod tests {
             verify_that!(found_refresh, eq(false))?;
 
             Ok(())
+        })
+    }
+    const DISK_TEXT: &str = "local x = 1\n";
+    const NEW_TEXT: &str = "local x = 1\nfunction Added() end\n";
+
+    /// A context holding `name` on disk and indexed from that text, with the
+    /// client's end of its connection.
+    async fn context_with_disk_file(name: &str) -> (ServerContext, Connection, Uri) {
+        let (connection, peer) = Connection::memory();
+        let context = ServerContext::new(connection, ClientCapabilities::default());
+        let path = std::env::temp_dir().join(format!("gmod_glua_ls_{name}.lua"));
+        std::fs::write(&path, DISK_TEXT).expect("test file should be written");
+        let uri = glua_code_analysis::file_path_to_uri(&path).expect("file URI should parse");
+        context
+            .snapshot()
+            .analysis()
+            .write()
+            .await
+            .update_file_by_uri(&uri, Some(DISK_TEXT.to_string()));
+        (context, peer, uri)
+    }
+
+    async fn open(snapshot: &ServerContextSnapshot, uri: &Uri, version: i32, text: &str) {
+        snapshot.note_document_seen_version(uri, version);
+        on_did_open_text_document(
+            snapshot.clone(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "lua".to_string(),
+                    version,
+                    text: text.to_string(),
+                },
+            },
+        )
+        .await;
+    }
+
+    async fn change(snapshot: &ServerContextSnapshot, uri: &Uri, version: i32, text: &str) {
+        snapshot.note_document_seen_version(uri, version);
+        on_did_change_text_document(
+            snapshot.clone(),
+            DidChangeTextDocumentParams {
+                text_document: lsp_types::VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version,
+                },
+                content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: text.to_string(),
+                }],
+            },
+        )
+        .await;
+    }
+
+    async fn close(snapshot: &ServerContextSnapshot, uri: &Uri) {
+        on_did_close_document(
+            snapshot.clone(),
+            DidCloseTextDocumentParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+            },
+        )
+        .await;
+    }
+
+    /// The reopened session's edit is indexed, and a request waiting for the
+    /// latest version (as semantic tokens do) is answered.
+    async fn verify_new_session_applied(snapshot: &ServerContextSnapshot, uri: &Uri) -> Result<()> {
+        let held = {
+            let analysis = snapshot.analysis().read().await;
+            let vfs = analysis.compilation.get_db().get_vfs();
+            analysis
+                .get_file_id(uri)
+                .and_then(|file_id| vfs.get_file_content(&file_id).cloned())
+        };
+        verify_that!(held.as_deref(), some(eq(NEW_TEXT)))?;
+        let answered = tokio::time::timeout(
+            Duration::from_secs(5),
+            snapshot.wait_until_latest_document_version_applied(uri, &CancellationToken::new()),
+        )
+        .await;
+        verify_that!(answered, ok(eq(&true)))
+    }
+
+    /// An edit undone back to the disk text reaches the server as one change
+    /// with the disk text, so the close finds nothing to restage.
+    #[gtest]
+    fn a_document_reopened_after_an_undone_edit_takes_its_new_edits() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let (context, _peer, uri) = context_with_disk_file("reopen_after_undo").await;
+            let snapshot = context.snapshot();
+            open(&snapshot, &uri, 1, DISK_TEXT).await;
+            change(&snapshot, &uri, 3, DISK_TEXT).await;
+            snapshot.mark_document_closed(&uri);
+            close(&snapshot, &uri).await;
+
+            open(&snapshot, &uri, 1, DISK_TEXT).await;
+            change(&snapshot, &uri, 2, NEW_TEXT).await;
+
+            verify_new_session_applied(&snapshot, &uri).await
+        })
+    }
+
+    /// A reopen that arrives before the close handler runs leaves the close
+    /// nothing to do; the reopened session still starts over.
+    #[gtest]
+    fn a_reopen_that_overtakes_the_close_takes_its_new_edits() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let (context, _peer, uri) = context_with_disk_file("reopen_overtakes_close").await;
+            let snapshot = context.snapshot();
+            open(&snapshot, &uri, 1, DISK_TEXT).await;
+            change(&snapshot, &uri, 3, "local x = 3\n").await;
+            snapshot.mark_document_closed(&uri);
+            snapshot.note_document_seen_version(&uri, 1);
+            close(&snapshot, &uri).await;
+
+            open(&snapshot, &uri, 1, DISK_TEXT).await;
+            change(&snapshot, &uri, 2, NEW_TEXT).await;
+
+            verify_new_session_applied(&snapshot, &uri).await
         })
     }
 }

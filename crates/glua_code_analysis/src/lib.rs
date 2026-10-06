@@ -422,6 +422,15 @@ impl EmmyLuaAnalysis {
             .set_file_content_preparsed_deferred(&uri, text, tree, line_index, version)
     }
 
+    /// Forgets `uri`'s editor version, which orders the edits of one
+    /// open-document session only.
+    pub fn forget_document_version(&mut self, uri: &Uri) {
+        let vfs = self.compilation.get_db_mut().get_vfs_mut();
+        if let Some(file_id) = vfs.get_file_id(uri) {
+            vfs.update_file_version(&file_id, None);
+        }
+    }
+
     /// Stores `text` without re-analysing; [`reindex_files`](Self::reindex_files)
     /// brings the index up to date.
     pub fn update_file_text_only(&mut self, uri: &Uri, text: String) -> Option<FileId> {
