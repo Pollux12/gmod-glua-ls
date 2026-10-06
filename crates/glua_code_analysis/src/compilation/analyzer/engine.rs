@@ -566,10 +566,16 @@ impl Engine {
             .collect();
     }
 
+    /// Queues `id` as changed, or parks it while the focus settles if it
+    /// lies outside the focus.
     pub(crate) fn changed(&mut self, id: DerivationId) {
         self.stats
             .requeue_cause(id, "changed: its file re-analysed or a producer removed");
-        self.queue(id, Reason::Changed);
+        if self.waits(id) {
+            self.wait(id, Reason::Changed);
+        } else {
+            self.queue(id, Reason::Changed);
+        }
     }
 
     /// Queues `id` in this round unless it ranks before the derivation being
@@ -4313,6 +4319,24 @@ print(tuned{index})"
 
         assert_eq!((settled, copied(db)), (true, Some(LuaType::String)));
     }
+    #[test]
+    fn changed_work_outside_the_focus_waits_for_it() {
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        engine.prioritise(&[FileId::new(FILE)]);
+
+        engine.wait(in_file(FILE + 2), Reason::Read);
+        engine.changed(in_file(FILE));
+        engine.changed(in_file(FILE + 1));
+        engine.changed(in_file(FILE + 2));
+
+        let queued = engine.worklist.files().collect::<Vec<_>>();
+        assert_eq!(queued, [FileId::new(FILE)]);
+        for parked in [FILE + 1, FILE + 2] {
+            let reason = engine.waiting.get(&in_file(parked));
+            assert_eq!(reason, Some(&Reason::Changed));
+        }
+    }
+
     fn in_file(file: u32) -> DerivationId {
         DerivationId::new(
             DerivationKind::LocalStat,
