@@ -26,7 +26,7 @@ impl RegisterCapabilities for TextDocumentCapabilities {
         server_capabilities.text_document_sync = Some(TextDocumentSyncCapability::Options(
             lsp_types::TextDocumentSyncOptions {
                 open_close: Some(true),
-                change: Some(TextDocumentSyncKind::FULL),
+                change: Some(TextDocumentSyncKind::INCREMENTAL),
                 will_save: None,
                 will_save_wait_until: None,
                 save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
