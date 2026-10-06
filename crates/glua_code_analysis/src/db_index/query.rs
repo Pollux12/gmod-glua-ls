@@ -322,7 +322,8 @@ impl<F: QueryFamily> QueryTable<F> {
 
     /// The fingerprint of the query's output: its memo's, stale or not, as a
     /// stored fact's holds until it is written; computed only when there is
-    /// no memo. Not a read.
+    /// no memo, and absent for a signature the index does not hold. Not a
+    /// read.
     pub(crate) fn fingerprint(&self, db: &DbIndex, key: LuaSignatureId) -> Fingerprint {
         if let Some(ready) = derivation::worker_query_readiness(&F::output(key)) {
             let memo = self.memos().get(&key).filter(|memo| !memo.stale).cloned();
@@ -339,6 +340,7 @@ impl<F: QueryFamily> QueryTable<F> {
         let memo = self.memos().get(&key).cloned();
         let (value, fingerprint) = match memo {
             Some(memo) => (memo.value, memo.fingerprint),
+            None if db.get_signature_index().get(&key).is_none() => return derivation::ABSENT,
             None => {
                 let observed = self.value_with_fingerprint(db, key);
                 (observed.value, observed.fingerprint)
