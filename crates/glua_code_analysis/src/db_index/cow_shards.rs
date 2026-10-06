@@ -446,6 +446,137 @@ impl<K: ShardKey + Clone + Send + Sync + 'static, V: Clone + PartialEq + Send + 
         conflicted
     }
 
+    /// [`Self::install_with`] of each of `forks`, a fork of `frozen` each
+    /// with its place, in order. While installs write apart, the shards run
+    /// on worker threads, each taking the forks that changed it in order, as
+    /// installing the forks one after another does: no shard's install reads
+    /// another's. Returns the places of the forks that conflicted.
+    fn install_all(
+        &mut self,
+        frozen: &Self,
+        forks: Vec<(usize, Self)>,
+        merge: Option<Merge<V>>,
+    ) -> Vec<usize> {
+        use rayon::prelude::*;
+        if forks.len() < 2 || !self.writes_apart() {
+            return forks
+                .into_iter()
+                .filter_map(|(place, fork)| self.install_with(frozen, fork, merge).then_some(place))
+                .collect();
+        }
+        let mut by_shard = FxHashMap::<usize, Vec<_>>::default();
+        for (place, mut fork) in forks {
+            for at in Self::forked_slots(frozen, &fork) {
+                if !same_shard(frozen.held_shard(at), fork.held_shard(at)) {
+                    by_shard
+                        .entry(at)
+                        .or_default()
+                        .push((place, fork.take_held_shard(at)));
+                }
+            }
+        }
+        let shards = by_shard
+            .into_iter()
+            .map(|(at, forked)| (at, self.take_held_shard(at), forked))
+            .collect::<Vec<_>>();
+        let installed = shards
+            .into_par_iter()
+            .map(|(at, held, forked)| {
+                (
+                    at,
+                    Self::install_shard(frozen.held_shard(at), held, forked, merge),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut conflicted = Vec::new();
+        let mut replaced = Replaced::default();
+        for (at, (shard, conflicts, shard_replaced)) in installed {
+            self.dirty.insert(at as u32, shard);
+            conflicted.extend(conflicts);
+            replaced.shards.extend(shard_replaced.shards);
+            replaced.left.extend(shard_replaced.left);
+            replaced.values.extend(shard_replaced.values);
+        }
+        if !replaced.is_empty() {
+            drop_apart(replaced);
+        }
+        conflicted.sort_unstable();
+        conflicted.dedup();
+        conflicted
+    }
+
+    /// Installs each of `forked`, the shards forks of `frozen` left at one
+    /// slot with their places, in order, into `held`, the shard the slot
+    /// holds, as [`Self::install_with`] does while installs write apart.
+    /// Returns the shard left held, the places that conflicted and what the
+    /// installs replaced.
+    #[allow(clippy::type_complexity)]
+    fn install_shard(
+        was: Option<&Arc<Shard<K, V>>>,
+        mut held: Option<Arc<Shard<K, V>>>,
+        forked: Vec<(usize, Option<Arc<Shard<K, V>>>)>,
+        merge: Option<Merge<V>>,
+    ) -> (Arc<Shard<K, V>>, Vec<usize>, Replaced<K, V>) {
+        let mut conflicted = Vec::new();
+        let mut replaced = Replaced::default();
+        for (place, forked) in forked {
+            if same_shard(was, held.as_ref()) {
+                replaced
+                    .shards
+                    .extend(held.replace(forked.unwrap_or_default()));
+                continue;
+            }
+            let was = was.map(|was| &**was);
+            let mut forked = forked.map(Arc::unwrap_or_clone).unwrap_or_default();
+            let changed = forked
+                .iter()
+                .filter(|(key, value)| was.and_then(|was| was.get(*key)) != Some(*value))
+                .map(|(key, _)| key.clone())
+                .chain(
+                    was.into_iter()
+                        .flat_map(|was| was.keys())
+                        .filter(|key| !forked.contains_key(*key))
+                        .cloned(),
+                )
+                .collect::<Vec<_>>();
+            let target = Arc::make_mut(held.get_or_insert_with(Default::default));
+            let mut fork_conflicted = false;
+            for key in changed {
+                let before = was.and_then(|was| was.get(&key));
+                let value = forked.remove(&key);
+                let now = target.get(&key);
+                if now == value.as_ref() {
+                    continue;
+                }
+                let value = if now == before {
+                    value
+                } else if let Some(merge) = merge {
+                    let mut merged = target.remove(&key);
+                    match merge(&mut merged, before, value.as_ref()) {
+                        Ok(()) => merged,
+                        Err(Conflict) => {
+                            fork_conflicted = true;
+                            replaced.values.extend(merged);
+                            value
+                        }
+                    }
+                } else {
+                    fork_conflicted = true;
+                    value
+                };
+                replaced.values.extend(match value {
+                    Some(value) => target.insert(key, value),
+                    None => target.remove(&key),
+                });
+            }
+            if fork_conflicted {
+                conflicted.push(place);
+            }
+            replaced.left.push(forked);
+        }
+        (held.unwrap_or_default(), conflicted, replaced)
+    }
+
     /// Takes the shard at `at` out of a fork that is being installed.
     fn take_held_shard(&mut self, at: usize) -> Option<Arc<Shard<K, V>>> {
         self.dirty
@@ -830,6 +961,14 @@ impl<K: ShardKey + Clone + Send + Sync + 'static> TaskFork for CowShardSet<K> {
         self.0.install_task(&frozen.0, fork.0)
     }
 
+    fn install_tasks(&mut self, frozen: &Self, forks: Vec<(usize, Self)>) -> Vec<usize> {
+        let forks = forks
+            .into_iter()
+            .map(|(place, fork)| (place, fork.0))
+            .collect();
+        self.0.install_tasks(&frozen.0, forks)
+    }
+
     fn flatten(&mut self) {
         self.0.flatten();
     }
@@ -930,6 +1069,15 @@ pub(crate) trait TaskFork: Sized {
     #[must_use]
     fn install_task(&mut self, frozen: &Self, fork: Self) -> bool;
 
+    /// [`Self::install_task`] of each of `forks`, a fork of `frozen` each
+    /// with its place, in order. Returns the places of those that conflicted.
+    fn install_tasks(&mut self, frozen: &Self, forks: Vec<(usize, Self)>) -> Vec<usize> {
+        forks
+            .into_iter()
+            .filter_map(|(place, fork)| self.install_task(frozen, fork).then_some(place))
+            .collect()
+    }
+
     /// Folds what installs kept apart while storage was shared back into
     /// it, once nothing else shares it.
     fn flatten(&mut self) {}
@@ -954,6 +1102,10 @@ impl<K: ShardKey + Clone + Send + Sync + 'static, V: Clone + PartialEq + Send + 
 
     fn install_task(&mut self, frozen: &Self, fork: Self) -> bool {
         self.install(frozen, fork)
+    }
+
+    fn install_tasks(&mut self, frozen: &Self, forks: Vec<(usize, Self)>) -> Vec<usize> {
+        self.install_all(frozen, forks, None)
     }
 
     fn flatten(&mut self) {
@@ -1062,6 +1214,20 @@ pub(crate) trait MergeFork: TaskFork {
     /// value `merge` refuses conflicts.
     #[must_use]
     fn install_merging(&mut self, frozen: &Self, fork: Self, merge: Merge<Self::Value>) -> bool;
+
+    /// [`Self::install_merging`] of each of `forks` in order, as
+    /// [`TaskFork::install_tasks`] installs them.
+    fn install_merging_tasks(
+        &mut self,
+        frozen: &Self,
+        forks: Vec<(usize, Self)>,
+        merge: Merge<Self::Value>,
+    ) -> Vec<usize> {
+        forks
+            .into_iter()
+            .filter_map(|(place, fork)| self.install_merging(frozen, fork, merge).then_some(place))
+            .collect()
+    }
 }
 
 impl<K: ShardKey + Clone + Send + Sync + 'static, V: Clone + PartialEq + Send + Sync + 'static>
@@ -1071,6 +1237,15 @@ impl<K: ShardKey + Clone + Send + Sync + 'static, V: Clone + PartialEq + Send + 
 
     fn install_merging(&mut self, frozen: &Self, fork: Self, merge: Merge<V>) -> bool {
         self.install_with(frozen, fork, Some(merge))
+    }
+
+    fn install_merging_tasks(
+        &mut self,
+        frozen: &Self,
+        forks: Vec<(usize, Self)>,
+        merge: Merge<V>,
+    ) -> Vec<usize> {
+        self.install_all(frozen, forks, Some(merge))
     }
 }
 
@@ -1448,6 +1623,23 @@ macro_rules! install_field {
 }
 pub(crate) use install_field;
 
+/// [`install_field!`] of a field's value in each fork of a column, in order:
+/// the places of the forks that conflicted.
+macro_rules! install_column {
+    ($current:expr, $frozen:expr, $forks:expr) => {
+        $crate::db_index::cow_shards::TaskFork::install_tasks(&mut $current, &$frozen, $forks)
+    };
+    ($current:expr, $frozen:expr, $forks:expr, $merge:expr) => {
+        $crate::db_index::cow_shards::MergeFork::install_merging_tasks(
+            &mut $current,
+            &$frozen,
+            $forks,
+            $merge,
+        )
+    };
+}
+pub(crate) use install_column;
+
 /// What a domain's `prepare` hook takes before its fields are installed.
 macro_rules! prepare_install {
     ($index:ident, $frozen:ident, $fork:ident) => {
@@ -1573,11 +1765,7 @@ macro_rules! install_tasks_body {
                     .collect::<Vec<_>>();
                 let out = out.next().expect("a report per field");
                 scope.spawn(move |_| {
-                    for (at, value) in column {
-                        if $crate::db_index::cow_shards::install_field!(*target, *base, value $(, $merge)?) {
-                            out.push(at);
-                        }
-                    }
+                    out.extend($crate::db_index::cow_shards::install_column!(*target, *base, column $(, $merge)?));
                 });
             })*
         });
@@ -1940,6 +2128,48 @@ mod tests {
             Some(&vec![1, 3]),
         );
         assert_eq!(merged, Ok(Some(vec![1, 3, 5])));
+    }
+
+    /// Forks of `frozen` that overlap: two change one key apart, one agrees
+    /// with the first, one removes a key, and two write shards no other does.
+    fn overlapping_forks(
+        frozen: &CowShards<LuaTypeOwner, u64>,
+    ) -> Vec<(usize, CowShards<LuaTypeOwner, u64>)> {
+        let mut forks = vec![frozen.fork(); 5];
+        forks[0].insert(owner(1, 0), 11);
+        forks[0].insert(owner(3, 0), 30);
+        forks[1].insert(owner(1, 0), 12);
+        forks[1].remove(&owner(2, 0));
+        forks[2].insert(owner(1, 0), 11);
+        forks[2].insert(owner(4, 1), 41);
+        forks[3].insert(owner(5, 0), 50);
+        forks[4].insert(owner(1, 1), 7);
+        forks.into_iter().enumerate().collect()
+    }
+
+    #[test]
+    fn forks_installed_together_leave_what_installing_them_one_by_one_leaves() {
+        let mut base: CowShards<LuaTypeOwner, u64> = CowShards::default();
+        for file in 1..=4 {
+            base.insert(owner(file, 0), u64::from(file) * 10);
+        }
+        let frozen = base.clone();
+        for merge in [None, Some(merge_sum as Merge<u64>)] {
+            let mut one_by_one = base.clone();
+            let one_by_one_conflicts = overlapping_forks(&frozen)
+                .into_iter()
+                .filter_map(|(place, fork)| {
+                    one_by_one
+                        .install_with(&frozen, fork, merge)
+                        .then_some(place)
+                })
+                .collect::<Vec<_>>();
+            let mut together = base.clone();
+            let together_conflicts =
+                together.install_all(&frozen, overlapping_forks(&frozen), merge);
+            assert_eq!(together_conflicts, one_by_one_conflicts);
+            assert_eq!(sorted(&together), sorted(&one_by_one));
+        }
     }
 
     #[test]
