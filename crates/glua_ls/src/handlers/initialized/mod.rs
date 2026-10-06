@@ -10,20 +10,23 @@ use std::{
 use crate::{
     cmd_args::CmdArgs,
     context::{
-        FileDiagnostic, LspFeatures, ProgressTask, ServerContextSnapshot, StatusBar,
+        FileDiagnostic, LoadedConfig, LspFeatures, ProgressTask, ServerContextSnapshot, StatusBar,
         WorkspaceFileMatcher, get_client_id, load_emmy_config, validate_gmod_annotations_for_ls,
     },
-    handlers::text_document::register_files_watch,
+    handlers::{
+        configuration::register_did_change_configuration, text_document::register_files_watch,
+    },
     logger::init_logger,
     util::{AnalysisProgressReporter, LongRunningWatchdogStatus, spawn_long_running_watchdog},
 };
-pub use client_config::{ClientConfig, get_client_config};
+pub use client_config::{ClientConfig, client_config_sections, get_client_config};
 use codestyle::load_editorconfig;
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, LuaDiagnosticConfig, WorkspaceFolder, calculate_include_and_exclude,
-    collect_workspace_files, fetch_schema_urls, uri_to_file_path,
+    EmmyLuaAnalysis, Emmyrc, FileId, LuaDiagnosticConfig, WorkspaceFolder,
+    calculate_include_and_exclude, collect_workspace_files, fetch_schema_urls, file_path_to_uri,
+    uri_to_file_path,
 };
-use lsp_types::{InitializeParams, MessageType, ShowMessageParams};
+use lsp_types::{InitializeParams, MessageType, ShowMessageParams, Uri};
 use tokio::sync::RwLock;
 
 /// Initialize the workspace.
@@ -133,10 +136,7 @@ pub async fn initialized_handler(
         .map(|workspace| workspace.root.clone())
         .collect();
     let loaded = load_emmy_config(config_roots, client_config.clone());
-    let emmyrc = loaded.emmyrc;
-    let workspace_diagnostic_configs = loaded.workspace_diagnostic_configs;
-    let workspace_emmyrcs = loaded.workspace_emmyrcs;
-    let workspace_matchers = loaded.workspace_matchers;
+    let emmyrc = loaded.emmyrc.clone();
     load_editorconfig(workspace_folders.clone(), emmyrc.as_ref());
     log::info!("configuration loaded");
 
@@ -168,7 +168,7 @@ pub async fn initialized_handler(
         log::info!("standard libraries loaded");
     }
 
-    {
+    let open_files = {
         watchdog_status.set_phase("Preparing workspace manager");
         log::info!("preparing workspace manager");
         let mut workspace_manager = context.workspace_manager().write().await;
@@ -176,9 +176,11 @@ pub async fn initialized_handler(
         let (include, exclude, exclude_dir) = calculate_include_and_exclude(&emmyrc);
         workspace_manager.match_file_pattern =
             WorkspaceFileMatcher::new(include, exclude, exclude_dir);
-        workspace_manager.per_root_matchers = workspace_matchers;
-        log::info!("workspace manager updated with client config and watch file patterns")
-    }
+        workspace_manager.per_root_matchers = loaded.workspace_matchers.clone();
+        workspace_manager.loaded_config = Some(loaded.clone());
+        log::info!("workspace manager updated with client config and watch file patterns");
+        workspace_manager.open_workspace_files()
+    };
 
     init_analysis(
         context.analysis(),
@@ -187,19 +189,22 @@ pub async fn initialized_handler(
         context.file_diagnostic(),
         context.lsp_features(),
         workspace_folders,
-        emmyrc.clone(),
-        workspace_diagnostic_configs,
-        workspace_emmyrcs,
+        loaded,
+        open_files,
         watchdog_status.clone(),
     )
     .await;
 
     register_files_watch(context.clone(), &params.capabilities).await;
+    register_did_change_configuration(context.client(), context.lsp_features(), client_id);
     log::info!("initialized handler completed; notifying workspace loaded");
     context.file_diagnostic().notify_workspace_loaded();
     Ok(())
 }
 
+/// Loads the workspace `loaded` describes: every file it collects is read,
+/// and every other loaded file except std and `open_files` is removed, so the
+/// result equals a cold load.
 pub async fn init_analysis(
     analysis: &RwLock<EmmyLuaAnalysis>,
     client: &crate::context::ClientProxy,
@@ -207,11 +212,16 @@ pub async fn init_analysis(
     file_diagnostic: &FileDiagnostic,
     lsp_features: &LspFeatures,
     workspace_folders: Vec<WorkspaceFolder>,
-    emmyrc: Arc<Emmyrc>,
-    workspace_diagnostic_configs: HashMap<PathBuf, LuaDiagnosticConfig>,
-    workspace_emmyrcs: HashMap<PathBuf, Arc<Emmyrc>>,
+    loaded: LoadedConfig,
+    open_files: HashSet<Uri>,
     watchdog_status: LongRunningWatchdogStatus,
 ) {
+    let LoadedConfig {
+        emmyrc,
+        workspace_diagnostic_configs,
+        workspace_emmyrcs,
+        ..
+    } = loaded;
     if let Ok(emmyrc_json) = serde_json::to_string_pretty(emmyrc.as_ref()) {
         log::info!("current config : {}", emmyrc_json);
     }
@@ -308,44 +318,26 @@ pub async fn init_analysis(
     );
     log::info!("applying workspace configuration to analysis");
 
-    // update config
-    mut_analysis.update_config(emmyrc.clone());
-
-    let mut added_main_roots = HashSet::new();
-    let mut added_library_roots = HashSet::new();
-    for (_, workspace_group) in &workspace_collection_groups {
-        for workspace in workspace_group {
-            if workspace.is_library {
-                if added_library_roots.insert(workspace.root.clone()) {
-                    log::info!("add library: {:?}", workspace.root);
-                    mut_analysis.add_library_workspace(workspace.root.clone());
-                }
-            } else if added_main_roots.insert(workspace.root.clone()) {
-                log::info!("add workspace root: {:?}", workspace.root);
-                mut_analysis.add_main_workspace(workspace.root.clone());
-            }
-        }
+    let roots_moved = mut_analysis.set_workspace_roots(
+        workspace_collection_groups
+            .iter()
+            .flat_map(|(_, workspace_group)| workspace_group),
+    );
+    let reindexed = mut_analysis.update_config(emmyrc.clone()).affects_index();
+    if roots_moved && !reindexed {
+        mut_analysis.reindex();
     }
 
-    // Map workspace root paths to WorkspaceIds for per-workspace diagnostic configs
-    if !workspace_diagnostic_configs.is_empty() {
-        let mut ws_diag_configs = HashMap::new();
-        for (root, diag_config) in workspace_diagnostic_configs {
-            if let Some(workspace_id) = mut_analysis.get_workspace_id_for_root(&root) {
-                log::info!(
-                    "setting per-workspace diagnostic config for {:?} (workspace_id: {:?})",
-                    root,
-                    workspace_id
-                );
-                ws_diag_configs.insert(workspace_id, Arc::new(diag_config));
-            }
-        }
-        if !ws_diag_configs.is_empty() {
-            mut_analysis.set_workspace_diagnostic_configs(ws_diag_configs);
-        }
-    }
+    apply_workspace_diagnostic_configs(&mut mut_analysis, &workspace_diagnostic_configs);
 
-    if file_count != 0 {
+    let mut changes = files
+        .into_iter()
+        .filter_map(|(path, text)| Some((file_path_to_uri(&path)?, text)))
+        .collect::<Vec<_>>();
+    let uncollected = uncollected_files(&mut_analysis, &changes, &open_files);
+    changes.extend(uncollected.iter().map(|(_, uri)| (uri.clone(), None)));
+
+    if !changes.is_empty() {
         watchdog_status.set_progress("Analyzing Lua files", 0, file_count);
         status_bar.update_startup_phase(
             ProgressTask::LoadWorkspace,
@@ -354,11 +346,11 @@ pub async fn init_analysis(
         );
         log::info!("analyzing {} Lua files", file_count);
 
-        // `update_files_by_path` blocks for the whole index, so the phases it
+        // `update_files_by_uri` blocks for the whole index, so the phases it
         // reports are the only progress the client can be given.
         let _progress =
             AnalysisProgressReporter::install(status_bar.clone(), watchdog_status.clone());
-        mut_analysis.update_files_by_path(files);
+        mut_analysis.update_files_by_uri(changes);
         drop(_progress);
 
         watchdog_status.set_progress("Analyzing Lua files", file_count, file_count);
@@ -377,6 +369,9 @@ pub async fn init_analysis(
     let library_collisions = mut_analysis.library_definition_collisions();
 
     drop(mut_analysis);
+    for (file_id, uri) in &uncollected {
+        file_diagnostic.store().remove(*file_id, uri);
+    }
 
     watchdog_status.set_phase("Workspace index ready");
     status_bar.update_startup_phase(
@@ -426,7 +421,61 @@ pub async fn init_analysis(
         Some("Workspace ready".to_string()),
     );
     file_diagnostic.notify_workspace_loaded();
+    refresh_open_document_features(client, lsp_features);
 
+    // Every file's diagnostics are computed again under what was just
+    // loaded; the ones that left the workspace are cleared.
+    file_diagnostic.forget_missing().await;
+    file_diagnostic
+        .add_workspace_diagnostic_task(0, false)
+        .await;
+}
+
+/// The loaded files, std aside, that are neither in `collected` nor open.
+fn uncollected_files(
+    analysis: &EmmyLuaAnalysis,
+    collected: &[(Uri, Option<String>)],
+    open_files: &HashSet<Uri>,
+) -> Vec<(FileId, Uri)> {
+    let kept = collected
+        .iter()
+        .map(|(uri, _)| uri)
+        .chain(open_files)
+        .filter_map(|uri| analysis.get_file_id(uri))
+        .collect::<HashSet<_>>();
+    let db = analysis.compilation.get_db();
+    db.get_vfs()
+        .get_all_local_file_ids()
+        .into_iter()
+        .filter(|file_id| !kept.contains(file_id) && !db.get_module_index().is_std(file_id))
+        .filter_map(|file_id| Some((file_id, analysis.get_uri(file_id)?)))
+        .collect()
+}
+
+/// Gives each workspace root that has its own diagnostic config that config.
+pub fn apply_workspace_diagnostic_configs(
+    analysis: &mut EmmyLuaAnalysis,
+    workspace_diagnostic_configs: &HashMap<PathBuf, LuaDiagnosticConfig>,
+) {
+    let configs = workspace_diagnostic_configs
+        .iter()
+        .filter_map(|(root, config)| {
+            let workspace_id = analysis.get_workspace_id_for_root(root)?;
+            log::info!("setting per-workspace diagnostic config for {root:?} ({workspace_id:?})");
+            Some((workspace_id, Arc::new(config.clone())))
+        })
+        .collect::<HashMap<_, _>>();
+    if !configs.is_empty() {
+        analysis.set_workspace_diagnostic_configs(configs);
+    }
+}
+
+/// Asks the client to request again the open documents' semantic tokens,
+/// inlay hints and code lenses.
+pub fn refresh_open_document_features(
+    client: &crate::context::ClientProxy,
+    lsp_features: &LspFeatures,
+) {
     if lsp_features.supports_semantic_tokens_refresh() {
         client.refresh_semantic_tokens();
     }
@@ -436,13 +485,6 @@ pub async fn init_analysis(
     if lsp_features.supports_code_lens_refresh() {
         client.refresh_code_lens();
     }
-
-    // Every file's diagnostics are computed again under what was just
-    // loaded; the ones that left the workspace are cleared.
-    file_diagnostic.forget_missing().await;
-    file_diagnostic
-        .add_workspace_diagnostic_task(0, false)
-        .await;
 }
 
 fn build_workspace_collection_folders(
@@ -557,9 +599,9 @@ pub async fn init_std_lib(analysis: &RwLock<EmmyLuaAnalysis>, emmyrc: Arc<Emmyrc
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc, time::Duration};
+    use std::{sync::Arc, time::Duration};
 
-    use glua_code_analysis::{EmmyLuaAnalysis, Emmyrc};
+    use glua_code_analysis::EmmyLuaAnalysis;
     use googletest::prelude::*;
     use lsp_server::{Connection, Message};
     use lsp_types::{
@@ -570,7 +612,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     use crate::{
-        context::{ClientProxy, FileDiagnostic, LspFeatures, StatusBar},
+        context::{ClientProxy, FileDiagnostic, LoadedConfig, LspFeatures, StatusBar},
         util::LongRunningWatchdogStatus,
     };
 
@@ -612,9 +654,8 @@ mod tests {
             &file_diagnostic,
             &lsp_features,
             Vec::new(),
-            Arc::new(Emmyrc::default()),
-            HashMap::new(),
-            HashMap::new(),
+            LoadedConfig::default(),
+            Default::default(),
             LongRunningWatchdogStatus::new("test"),
         ));
 

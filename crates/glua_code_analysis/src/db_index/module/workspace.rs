@@ -29,7 +29,7 @@ impl WorkspaceKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workspace {
     pub root: PathBuf,
     pub id: WorkspaceId,

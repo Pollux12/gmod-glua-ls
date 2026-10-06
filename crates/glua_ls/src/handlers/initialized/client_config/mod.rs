@@ -52,6 +52,9 @@ pub async fn get_client_config(
         gmod_annotations_path: None,
         gamemode_base_libraries: Vec::new(),
     };
+    if !supports_config_request {
+        return config;
+    }
     match client_id {
         ClientId::VSCode => {
             get_client_config_vscode(context, &mut config).await;
@@ -59,13 +62,21 @@ pub async fn get_client_config(
         ClientId::Neovim => {
             get_client_config_default(context, &mut config, Some(&["Lua", "gluals"])).await;
         }
-        _ if supports_config_request => {
+        _ => {
             get_client_config_default(context, &mut config, None).await;
         }
-        _ => {}
     };
 
     config
+}
+
+/// The client settings sections `get_client_config` reads for `client_id`.
+pub fn client_config_sections(client_id: ClientId) -> &'static [&'static str] {
+    match client_id {
+        ClientId::VSCode => &["gluals", "files"],
+        ClientId::Neovim => &["Lua", "gluals"],
+        _ => &["gluals"],
+    }
 }
 
 #[cfg(test)]

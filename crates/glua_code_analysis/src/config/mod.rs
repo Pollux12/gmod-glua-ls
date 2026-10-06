@@ -1,3 +1,4 @@
+mod change;
 mod config_loader;
 mod configs;
 mod flatten_config;
@@ -9,6 +10,7 @@ mod test;
 use std::collections::HashMap;
 use std::path::Path;
 
+pub use change::EmmyrcChange;
 pub use config_loader::{ConfigLoadError, load_configs, load_configs_raw, try_load_configs};
 pub use configs::{
     DiagnosticSeveritySetting, DocSyntax, EmmyLibraryConfig, EmmyLibraryItem, EmmyrcCodeAction,

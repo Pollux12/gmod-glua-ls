@@ -413,10 +413,14 @@ impl LuaCompilation {
         self.index_revision
     }
 
-    pub fn update_config(&mut self, config: Arc<Emmyrc>) {
+    /// Applies `config`; `affects_index` says whether facts derived under the
+    /// previous one may no longer hold.
+    pub fn update_config(&mut self, config: Arc<Emmyrc>, affects_index: bool) {
         self.file_diagnostic_reads();
-        self.index_revision += 1;
-        self.scopes = analyzer::ScopesCache::default();
+        if affects_index {
+            self.index_revision += 1;
+            self.scopes = analyzer::ScopesCache::default();
+        }
         self.emmyrc = config.clone();
         self.db.update_config(config);
     }

@@ -1039,6 +1039,35 @@ mod tests {
         expect_that!(shared_diagnostics(&warm, caller_of(&warm)), eq(&expected));
     }
 
+    /// A change only diagnostics read leaves the index as built: nothing is
+    /// analysed again, and diagnostics follow the new config at once.
+    #[gtest]
+    fn a_diagnostics_only_config_change_keeps_the_index() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_unused.lua",
+            "local unused_value = 1
+",
+        );
+        let unused = Some(lsp_types::NumberOrString::String(
+            DiagnosticCode::Unused.get_name().to_string(),
+        ));
+        let reports_unused = |ws: &VirtualWorkspace| {
+            shared_diagnostics(ws, file_id)
+                .iter()
+                .any(|diagnostic| diagnostic.code == unused)
+        };
+        expect_that!(reports_unused(&ws), eq(true));
+
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.diagnostics.disable.push(DiagnosticCode::Unused);
+        ws.analysis.compilation.start_batch_log();
+        ws.update_emmyrc(emmyrc);
+
+        expect_that!(ws.analysis.compilation.take_batch_log(), is_empty());
+        expect_that!(reports_unused(&ws), eq(false));
+    }
+
     /// A field check asks whether a table literal is empty only for a numeric
     /// key, so a member added to a global table elsewhere leaves a reader of
     /// one of its named fields unaffected.

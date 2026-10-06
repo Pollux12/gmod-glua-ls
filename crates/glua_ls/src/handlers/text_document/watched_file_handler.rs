@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use glua_code_analysis::{read_file_with_encoding, uri_to_file_path};
 use lsp_types::{DidChangeWatchedFilesParams, FileChangeType, Uri};
@@ -27,7 +28,7 @@ pub async fn on_did_change_watched_files(
 
     let mut lua_events: Vec<(Uri, FileChangeType)> = Vec::new();
     let mut editorconfig_paths: Vec<PathBuf> = Vec::new();
-    let mut emmyrc_dirs: Vec<PathBuf> = Vec::new();
+    let mut config_changed = false;
 
     {
         let workspace = context.workspace_manager().read().await;
@@ -61,15 +62,9 @@ pub async fn on_did_change_watched_files(
                     }
                 }
                 Some(WatchedFileType::Emmyrc) => {
-                    // Treat DELETE the same as CREATE/CHANGE: the config is
-                    // gone so the workspace must reload with defaults (or a
-                    // parent config).  Derive the parent dir from the URI
-                    // directly since the file no longer exists on disk.
-                    if let Some(path) = uri_to_file_path(&file_event.uri) {
-                        if let Some(dir) = path.parent() {
-                            emmyrc_dirs.push(dir.to_path_buf());
-                        }
-                    }
+                    // A deletion counts too: another config file, or none,
+                    // takes its place.
+                    config_changed |= workspace.is_workspace_config_file(&file_event.uri);
                 }
                 None => {}
             }
@@ -133,9 +128,9 @@ pub async fn on_did_change_watched_files(
     }
     {
         let workspace = context.workspace_manager().read().await;
-        for dir in emmyrc_dirs {
+        if config_changed {
             workspace
-                .add_update_emmyrc_task(dir, context.workspace_manager_arc())
+                .schedule_config_reload(Duration::from_secs(2), context.workspace_manager_arc())
                 .await;
         }
     }

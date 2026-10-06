@@ -51,6 +51,16 @@ impl LspFeatures {
         false
     }
 
+    /// Gates registering `workspace/didChangeConfiguration` with the client.
+    pub fn supports_did_change_configuration_registration(&self) -> bool {
+        self.client_capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.did_change_configuration.as_ref())
+            .and_then(|capability| capability.dynamic_registration)
+            .unwrap_or(false)
+    }
+
     pub fn supports_completion_item_deprecated_tags(&self) -> bool {
         self.client_capabilities
             .text_document

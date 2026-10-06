@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 use glua_code_analysis::{WorkspaceFolder, uri_to_file_path};
 use lsp_types::DidChangeWorkspaceFoldersParams;
@@ -63,7 +63,9 @@ pub async fn on_did_change_workspace_folders(
 
     let mut workspace_manager = context.workspace_manager().write().await;
     workspace_manager.client_config = client_config;
-    workspace_manager.add_reload_workspace_task(context.workspace_manager_arc());
+    workspace_manager
+        .schedule_config_reload(Duration::ZERO, context.workspace_manager_arc())
+        .await;
 
     Some(())
 }

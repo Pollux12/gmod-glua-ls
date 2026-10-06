@@ -327,6 +327,42 @@ impl EmmyLuaAnalysis {
         self.sync_file_order();
     }
 
+    /// Registers `folders` as the main and library workspace roots, in order,
+    /// as a first load registers them, unregistering every other one. Returns
+    /// whether the index must be rebuilt: the registration changed while
+    /// files outside std, whose module paths derive from it, are loaded.
+    pub fn set_workspace_roots<'a>(
+        &mut self,
+        folders: impl IntoIterator<Item = &'a WorkspaceFolder>,
+    ) -> bool {
+        let before = self
+            .compilation
+            .get_db()
+            .get_module_index()
+            .workspaces()
+            .to_vec();
+        self.compilation
+            .get_db_mut()
+            .get_module_index_mut()
+            .remove_main_and_library_workspaces();
+        for folder in folders {
+            if folder.is_library {
+                self.add_library_workspace(folder.root.clone());
+            } else {
+                self.add_main_workspace(folder.root.clone());
+            }
+        }
+        self.sync_file_order();
+        let db = self.compilation.get_db();
+        let module_index = db.get_module_index();
+        module_index.workspaces() != before.as_slice()
+            && db
+                .get_vfs()
+                .get_all_local_file_ids()
+                .iter()
+                .any(|file_id| !module_index.is_std(file_id))
+    }
+
     /// Sets `uri`'s text (`None` removes it) and re-analyses. Returns the file
     /// and every live file whose diagnostics may have changed.
     pub fn update_file_by_uri(
@@ -633,28 +669,24 @@ impl EmmyLuaAnalysis {
         matches!((version, current), (Some(incoming), Some(current)) if incoming < current)
     }
 
-    /// Applies `config`, re-analysing every file when it differs from the
-    /// current one: facts are derived under the config they were built with.
-    pub fn update_config(&mut self, config: Arc<Emmyrc>) {
+    /// Applies `config`, re-analysing every file when the change reaches the
+    /// index: facts are derived under the config they were built with.
+    pub fn update_config(&mut self, config: Arc<Emmyrc>) -> EmmyrcChange {
         let mut refreshed_config = (*config).clone();
         refreshed_config
             .gmod
             .scripted_class_scopes
             .refresh_resolved_definitions();
-        let changed = match (
-            serde_json::to_value(&refreshed_config),
-            serde_json::to_value(self.emmyrc.as_ref()),
-        ) {
-            (Ok(new), Ok(old)) => new != old,
-            _ => true,
-        };
+        let change = self.emmyrc.change_to(&refreshed_config);
         let config = Arc::new(refreshed_config);
         self.emmyrc = config.clone();
-        self.compilation.update_config(config.clone());
+        self.compilation
+            .update_config(config.clone(), change.affects_index());
         self.diagnostic.update_config(config);
-        if changed {
+        if change.affects_index() {
             self.reindex();
         }
+        change
     }
 
     pub fn set_workspace_diagnostic_configs(

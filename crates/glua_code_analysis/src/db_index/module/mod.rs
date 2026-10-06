@@ -1205,9 +1205,13 @@ impl LuaModuleIndex {
         &self.workspaces
     }
 
-    #[allow(unused)]
-    pub fn remove_workspace_root(&mut self, root: &Path) {
-        self.workspaces.retain(|r| r.root != root);
+    /// Unregisters every main and library workspace root.
+    pub fn remove_main_and_library_workspaces(&mut self) {
+        let user_root =
+            |kind: &WorkspaceKind| matches!(kind, WorkspaceKind::Main | WorkspaceKind::Library);
+        self.workspaces
+            .retain(|workspace| !user_root(&workspace.kind));
+        self.workspace_kind_map.retain(|_, kind| !user_root(kind));
     }
 
     pub fn update_config(&mut self, config: Arc<Emmyrc>) {
