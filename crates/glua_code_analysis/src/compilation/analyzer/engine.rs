@@ -364,6 +364,10 @@ pub(crate) struct Engine {
     /// Whether the run handed back once the focus settled, so the next
     /// quiescence releases the waiting work rather than handing back again.
     handed_back: bool,
+    /// Whether the run handed back once a release queued work that has not
+    /// run since: a focus put ahead again in between releases it again, and
+    /// that release goes on into it.
+    released_unrun: bool,
     /// Set from outside while an edit waits: a yielding slice stops between
     /// two evaluations.
     interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -1031,6 +1035,9 @@ impl Engine {
                 self.flush_slot_notifications(db);
                 return false;
             }
+            if self.focus.is_empty() && !self.worklist.is_empty() {
+                self.released_unrun = false;
+            }
             if self.superstep == SuperstepMode::Workers
                 && !self.serial_stage
                 && self.loop_focus.is_empty()
@@ -1063,7 +1070,8 @@ impl Engine {
                     }
                     if crate::profile::phase("engine: release", || self.release_waiting(db)) {
                         // What the settled focus released runs in slices sized for it.
-                        if slice.yields() {
+                        if slice.yields() && !self.released_unrun {
+                            self.released_unrun = true;
                             return false;
                         }
                         continue;
