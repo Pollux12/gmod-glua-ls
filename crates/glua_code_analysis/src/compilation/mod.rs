@@ -153,10 +153,15 @@ impl LuaCompilation {
         if let Some(log) = &mut self.batch_log {
             log.push(file_ids.clone());
         }
-        self.memos
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        let memos = std::mem::take(
+            self.memos
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        // Freeing every file's memo takes long enough to hold up the take.
+        if !memos.is_empty() {
+            std::thread::spawn(move || drop(memos));
+        }
         let edits = derivation::EditMaps::new(self.db.get_vfs_mut().take_staged(&file_ids));
         let reanalysis = self
             .reanalysis
