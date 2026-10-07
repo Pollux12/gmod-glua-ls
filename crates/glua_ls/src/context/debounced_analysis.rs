@@ -11,14 +11,15 @@ use super::{ClientProxy, FileDiagnostic};
 
 const FRESHNESS_STUCK_WARN_AFTER: Duration = Duration::from_secs(5);
 
-/// How long one slice of a re-analysis holds the analysis write lock. A
-/// request waits for at most about one slice.
-const SLICE: Duration = Duration::from_millis(10);
+/// How long one slice of a re-analysis holds the analysis write lock when no
+/// request waits for it: one that does stops the slice between two
+/// evaluations ([`DebouncedAnalysis::yield_to_request`]).
+const SLICE: Duration = Duration::from_millis(50);
 
 /// How long a slice holds the write lock while an edited document still
-/// settles first: requests on it wait for that anyway, and fewer slices
-/// spend less of it waiting on requests elsewhere.
-const FOCUS_SLICE: Duration = Duration::from_millis(500);
+/// settles first. Requests on it wait for that anyway, so requests elsewhere
+/// do not stop the slice: they wait for at most about one.
+const FOCUS_SLICE: Duration = Duration::from_millis(200);
 
 /// Breakdown of a freshness wait by observed state, so one summary line
 /// can report where the wait went without per-iteration logging.
@@ -77,6 +78,9 @@ pub struct DebouncedAnalysis {
     /// The analysis's slice interrupt, taken by the first slice: set when an
     /// edit arrives so the slice in progress stops for it.
     interrupt: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>>,
+    /// Whether the slice in progress settles edited documents first, which a
+    /// request waiting for the lock does not stop.
+    focusing: Arc<AtomicBool>,
     /// False once the supervisor has given up restarting the debounce loop
     /// (see `LS_DEBOUNCE_LOOP_DEAD`). Freshness can then never arrive, so
     /// waiters fail fast instead of parking until their request is cancelled.
@@ -191,6 +195,7 @@ impl DebouncedAnalysis {
             settling: AtomicBool::new(false),
             prioritised: std::sync::Mutex::default(),
             interrupt: std::sync::OnceLock::new(),
+            focusing: Arc::default(),
             debounce_loop_alive: AtomicBool::new(true),
             in_flight_changes: AtomicUsize::new(0),
             in_flight_documents: std::sync::Mutex::default(),
@@ -278,6 +283,18 @@ impl DebouncedAnalysis {
         self.has_pending_changes.store(true, Ordering::Release);
         self.notify.notify_waiters();
         InFlightChangeGuard::new(self.clone(), document, 1)
+    }
+
+    /// Stops the slice in progress between two evaluations, for a request
+    /// waiting for the analysis lock it holds, unless it settles edited
+    /// documents first.
+    pub fn yield_to_request(&self) {
+        if self.focusing.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(interrupt) = self.interrupt.get() {
+            interrupt.store(true, Ordering::Release);
+        }
     }
 
     fn in_flight_documents(&self) -> std::sync::MutexGuard<'_, HashMap<Uri, usize>> {
@@ -783,6 +800,7 @@ impl DebouncedAnalysis {
             let _ = self.interrupt.set(interrupt);
         }
         let analysis = self.analysis.clone();
+        let focusing = self.focusing.clone();
 
         tokio::select! {
             _ = self.shutdown.cancelled() => None,
@@ -797,7 +815,9 @@ impl DebouncedAnalysis {
                     .iter()
                     .any(|file_id| guard.compilation.settles_first(*file_id));
                 let slice = if focused { FOCUS_SLICE } else { SLICE };
+                focusing.store(focused, Ordering::Release);
                 let progress = guard.advance_reindex(Slice::Until(Instant::now() + slice));
+                focusing.store(false, Ordering::Release);
                 let settled_first = edited
                     .into_iter()
                     .filter(|file_id| !guard.compilation.settles_first(*file_id))

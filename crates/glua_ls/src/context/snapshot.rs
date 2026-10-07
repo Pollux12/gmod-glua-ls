@@ -202,6 +202,12 @@ impl ServerContextSnapshot {
         &self,
         cancel_token: &CancellationToken,
     ) -> Option<RwLockReadGuard<'_, EmmyLuaAnalysis>> {
+        if let Ok(guard) = self.analysis().try_read() {
+            return Some(guard);
+        }
+        // A slice of the re-analysis holds the lock: it stops between two
+        // evaluations for the request.
+        self.debounced_analysis().yield_to_request();
         if !crate::util::ls_profile::ls_profile_enabled() {
             return tokio::select! {
                 guard = self.analysis().read() => Some(guard),
