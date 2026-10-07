@@ -1131,11 +1131,11 @@ impl Engine {
             if self.focus.is_empty() && (!self.worklist.is_empty() || !self.carried.is_empty()) {
                 self.released_unrun = false;
             }
-            // A focus settles in canonical order: its files' tasks at one rank
-            // would read each other's unsettled values.
+            // An edit's focus settles in canonical order: its files' tasks at
+            // one rank would read each other's unsettled values.
             let on_workers = self.superstep == SuperstepMode::Workers
                 && !self.serial_stage
-                && self.focus.is_empty()
+                && (self.focus.is_empty() || (self.edits.is_empty() && self.rebuilt.is_empty()))
                 && self.loop_focus.is_empty();
             if !on_workers {
                 self.requeue_carried();
