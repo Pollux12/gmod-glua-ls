@@ -227,7 +227,7 @@ pub async fn on_did_save_text_document(
     if emmyrc.workspace.enable_reindex {
         let delay = Duration::from_millis(emmyrc.workspace.reindex_duration.max(1000));
         let workspace = context.workspace_manager().read().await;
-        workspace.recheck_workspace(delay).await;
+        workspace.recheck_workspace(delay, context.clone()).await;
     }
 
     check_schema_update(&context).await;

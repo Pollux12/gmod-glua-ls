@@ -34,7 +34,7 @@ pub use workspace_manager::*;
 use crate::context::snapshot::ServerContextInner;
 
 // LOCK ORDER (acquire low → high; never a lower lock while holding a higher):
-// 1. workspace_diagnostic_token  2. update_token  3. analysis(read)
+// 1. workspace_diagnostic_token  2. recheck_token  3. analysis(read)
 // 4. workspace_manager(read)  5. workspace_manager(write)  6. analysis(write)
 // Within `DebouncedAnalysis`: pending_files before reindexing_files, and both
 // are released before anything above is taken.

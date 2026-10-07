@@ -49,6 +49,7 @@ use lsp_types::{ClientCapabilities, ServerCapabilities};
 pub use notification_handler::on_notification_handler;
 pub use request_handler::on_request_handler;
 pub use response_handler::on_response_handler;
+pub(crate) use text_document::apply_file_system_changes;
 pub use text_document::on_did_change_text_document;
 
 pub trait RegisterCapabilities {

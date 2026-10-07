@@ -772,44 +772,19 @@ impl EmmyLuaAnalysis {
         self.compilation.update_index(file_ids);
     }
 
-    /// Removes files that no longer exist on the file system
-    pub fn cleanup_nonexistent_files(&mut self) {
-        let mut files_to_remove = Vec::new();
-
-        // Get all files currently in the VFS
-        let vfs = self.compilation.get_db().get_vfs();
-        for file_id in vfs.get_all_local_file_ids() {
-            if self
-                .compilation
-                .get_db()
-                .get_module_index()
-                .is_std(&file_id)
-            {
-                continue;
-            }
-            if let Some(path) = vfs.get_file_path(&file_id).filter(|path| !path.exists())
-                && let Some(uri) = file_path_to_uri(path)
-            {
-                log::info!(
-                    "cleanup_nonexistent_files: removing file_id={:?} path={}",
-                    file_id,
-                    path.display(),
-                );
-                files_to_remove.push(uri);
-            }
-        }
-
-        if !files_to_remove.is_empty() {
-            log::info!(
-                "cleanup_nonexistent_files: removing {} files total",
-                files_to_remove.len()
-            );
-        }
-
-        // Remove files that no longer exist
-        for uri in files_to_remove {
-            self.remove_file_by_uri(&uri);
-        }
+    /// Every local file outside the standard library, with its path: what a
+    /// check for files deleted behind the editor's back looks at.
+    pub fn local_file_paths(&self) -> Vec<(Uri, PathBuf)> {
+        let db = self.compilation.get_db();
+        let vfs = db.get_vfs();
+        vfs.get_all_local_file_ids()
+            .into_iter()
+            .filter(|file_id| !db.get_module_index().is_std(file_id))
+            .filter_map(|file_id| {
+                let path = vfs.get_file_path(&file_id)?;
+                Some((file_path_to_uri(path)?, path.clone()))
+            })
+            .collect()
     }
 
     pub fn check_schema_update(&self) -> bool {

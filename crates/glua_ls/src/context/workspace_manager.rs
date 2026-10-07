@@ -26,9 +26,10 @@ pub struct WorkspaceManager {
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
     client: Arc<ClientProxy>,
     status_bar: Arc<StatusBar>,
-    update_token: Arc<Mutex<Option<Arc<ReindexToken>>>>,
+    /// The workspace recheck still waiting for edits to pause.
+    recheck_token: Arc<Mutex<Option<Arc<QuietPeriod>>>>,
     /// The config reload still waiting out its delay.
-    config_token: Arc<Mutex<Option<Arc<ReindexToken>>>>,
+    config_token: Arc<Mutex<Option<Arc<QuietPeriod>>>>,
     /// Held while a config reload compares and applies, so reloads apply in
     /// the order they load.
     config_apply: Arc<Mutex<()>>,
@@ -63,7 +64,7 @@ impl WorkspaceManager {
             status_bar,
             client_config: ClientConfig::default(),
             workspace_folders: Vec::new(),
-            update_token: Arc::new(Mutex::new(None)),
+            recheck_token: Arc::new(Mutex::new(None)),
             config_token: Arc::new(Mutex::new(None)),
             config_apply: Arc::new(Mutex::new(())),
             file_diagnostic,
@@ -88,13 +89,13 @@ impl WorkspaceManager {
             token.cancel();
             debug!("cancel pending config reload");
         }
-        let token = Arc::new(ReindexToken::new(delay));
+        let token = Arc::new(QuietPeriod::new(delay));
         config_token.replace(token.clone());
         drop(config_token);
 
         let pending = self.config_token.clone();
         tokio::spawn(async move {
-            token.wait_for_reindex().await;
+            token.wait().await;
             if token.is_cancelled() {
                 return;
             }
@@ -200,44 +201,52 @@ impl WorkspaceManager {
     }
 
     pub async fn extend_recheck_delay(&self) -> Option<()> {
-        let update_token = self.update_token.lock().await;
-        if let Some(token) = update_token.as_ref() {
-            token.set_resleep().await;
+        let recheck_token = self.recheck_token.lock().await;
+        if let Some(token) = recheck_token.as_ref() {
+            token.extend().await;
         }
 
         Some(())
     }
 
-    /// After `delay`, re-reads which files exist and computes every file's
-    /// diagnostics again, publishing those that changed.
-    pub async fn recheck_workspace(&self, delay: Duration) -> Option<()> {
+    /// Once edits pause for `delay`, removes the files deleted from disk
+    /// behind the editor's back and computes every file's diagnostics again,
+    /// publishing those that changed.
+    pub async fn recheck_workspace(&self, delay: Duration, context: ServerContextSnapshot) {
         log::info!("recheck workspace with delay: {:?}", delay);
-        let mut update_token = self.update_token.lock().await;
-        if let Some(token) = update_token.as_ref() {
+        let mut recheck_token = self.recheck_token.lock().await;
+        if let Some(token) = recheck_token.as_ref() {
             token.cancel();
-            log::info!("cancel reindex workspace");
+            log::info!("cancel pending workspace recheck");
         }
 
-        let cancel_token = Arc::new(ReindexToken::new(delay));
-        update_token.replace(cancel_token.clone());
-        drop(update_token);
-        let analysis = self.analysis.clone();
+        let token = Arc::new(QuietPeriod::new(delay));
+        recheck_token.replace(token.clone());
+        drop(recheck_token);
         let file_diagnostic = self.file_diagnostic.clone();
         let lsp_features = self.lsp_features.clone();
         let client = self.client.clone();
         tokio::spawn(async move {
-            cancel_token.wait_for_reindex().await;
-            if cancel_token.is_cancelled() {
+            token.wait().await;
+            if token.is_cancelled() {
                 return;
             }
 
-            // Perform reindex with minimal lock holding time
-            {
-                let mut analysis = analysis.write().await;
-                // Remove files that no longer exist before reindexing
-                analysis.cleanup_nonexistent_files();
-                // Release lock immediately after cleanup
+            // The paths are read under the lock, the disk off it.
+            let paths = context.analysis().read().await.local_file_paths();
+            let deleted = tokio::task::spawn_blocking(move || {
+                paths
+                    .into_iter()
+                    .filter(|(_, path)| !path.exists())
+                    .map(|(uri, _)| (uri, None))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            if !deleted.is_empty() {
+                log::info!("recheck removes {} files deleted from disk", deleted.len());
             }
+            apply_file_system_changes(&context, deleted).await;
 
             file_diagnostic.forget_missing().await;
             file_diagnostic.add_workspace_diagnostic_task(0, true).await;
@@ -248,8 +257,6 @@ impl WorkspaceManager {
                 client.refresh_inlay_hints();
             }
         });
-
-        Some(())
     }
 
     /// The open documents the workspace admits, as it would on their opening.
@@ -1042,31 +1049,32 @@ fn inject_gamemode_base_libraries(
     }
 }
 
+/// A wait for a quiet period: each [`Self::extend`] while it runs waits one
+/// period more.
 #[derive(Debug)]
-pub struct ReindexToken {
+pub struct QuietPeriod {
     cancel_token: CancellationToken,
-    time_sleep: Duration,
-    need_re_sleep: Mutex<bool>,
+    period: Duration,
+    extended: Mutex<bool>,
 }
 
-impl ReindexToken {
-    pub fn new(time_sleep: Duration) -> Self {
+impl QuietPeriod {
+    pub fn new(period: Duration) -> Self {
         Self {
             cancel_token: CancellationToken::new(),
-            time_sleep,
-            need_re_sleep: Mutex::new(false),
+            period,
+            extended: Mutex::new(false),
         }
     }
 
-    pub async fn wait_for_reindex(&self) {
+    /// Waits until a whole period passes without an extension, or until
+    /// cancelled.
+    pub async fn wait(&self) {
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(self.time_sleep) => {
-                    // Acquire the lock to safely access and modify need_re_sleep
-                    let mut need_re_sleep = self.need_re_sleep.lock().await;
-                    if *need_re_sleep {
-                        *need_re_sleep = false;
-                    } else {
+                _ = tokio::time::sleep(self.period) => {
+                    let mut extended = self.extended.lock().await;
+                    if !std::mem::replace(&mut *extended, false) {
                         break;
                     }
                 }
@@ -1085,10 +1093,8 @@ impl ReindexToken {
         self.cancel_token.is_cancelled()
     }
 
-    pub async fn set_resleep(&self) {
-        // Acquire the lock to safely modify need_re_sleep
-        let mut need_re_sleep = self.need_re_sleep.lock().await;
-        *need_re_sleep = true;
+    pub async fn extend(&self) {
+        *self.extended.lock().await = true;
     }
 }
 

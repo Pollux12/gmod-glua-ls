@@ -22,8 +22,8 @@ The `workspace` section tells the language server which files to analyze, which 
 | `workspace.ignoreGlobs` | `string[]` | `[]` | Glob patterns of files to exclude from analysis |
 | `workspace.moduleMap` | `array` | `[]` | Module path rewrite rules (regex patterns) |
 | `workspace.encoding` | `string` | `"utf-8"` | File encoding for all Lua files in the workspace |
-| `workspace.enableReindex` | `boolean` | `false` | Trigger a full workspace reindex when files change |
-| `workspace.reindexDuration` | `integer` | `5000` | Delay in ms before a reindex fires after a file change |
+| `workspace.enableReindex` | `boolean` | `false` | After a save, once edits pause, drop files deleted outside the editor and re-diagnose every file |
+| `workspace.reindexDuration` | `integer` | `5000` | How long edits must pause before that recheck runs, in ms (at least 1000) |
 | `workspace.packageDirs` | `string[]` | `[]` | Partial library load; only load package declarations from these dirs, not full analysis |
 
 ---
@@ -208,7 +208,7 @@ You can also configure these settings in VS Code settings with the `gluals.*` pr
 
 | VS Code setting | .gluarc.json key | Type | Default | Description |
 |---|---|---|---|---|
-| `gluals.workspace.enableReindex` | `workspace.enableReindex` | `boolean` | `false` | Enable reindex after file changes |
-| `gluals.workspace.reindexDuration` | `workspace.reindexDuration` | `integer` | `5000` | Delay before reindex (ms) |
+| `gluals.workspace.enableReindex` | `workspace.enableReindex` | `boolean` | `false` | Recheck deleted files and diagnostics after a save |
+| `gluals.workspace.reindexDuration` | `workspace.reindexDuration` | `integer` | `5000` | Quiet period before that recheck (ms) |
 | `gluals.workspace.enableIsolation` | `workspace.enableIsolation` | `boolean \| null` | `null` | Override multi-root isolation |
 | `gluals.workspace.useDefaultIgnores` | `workspace.useDefaultIgnores` | `boolean \| null` | `null` | Override built-in ignore rules |

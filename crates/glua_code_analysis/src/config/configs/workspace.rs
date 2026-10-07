@@ -51,11 +51,13 @@ pub struct EmmyrcWorkspace {
     /// }
     #[serde(default)]
     pub module_map: Vec<EmmyrcWorkspaceModuleMap>,
-    /// Delay between changing a file and full project reindex, in milliseconds.
+    /// How long edits must pause before the recheck `enableReindex` runs, in
+    /// milliseconds (at least 1000).
     #[serde(default = "reindex_duration_default")]
     #[schemars(extend("x-vscode-setting" = true))]
     pub reindex_duration: u64,
-    /// Enable full project reindex after changing a file.
+    /// After a save, once edits pause, drop the files deleted from disk
+    /// outside the editor and compute every file's diagnostics again.
     #[serde(default = "enable_reindex_default")]
     #[schemars(extend("x-vscode-setting" = true))]
     pub enable_reindex: bool,
