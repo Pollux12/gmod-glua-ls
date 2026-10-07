@@ -101,6 +101,9 @@ pub struct DebouncedAnalysis {
     /// A request was refused as stale while edits were pending: the client
     /// re-sends it, so the next debounce ends at once, as for a waiting one.
     refused_request: AtomicBool,
+    /// A change no keystroke follows was scheduled: the next debounce ends
+    /// at once; see [`DebouncedAnalysis::schedule_at_once`].
+    at_once: AtomicBool,
     notify: Notify,
     reindex_notify: Notify,
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
@@ -202,6 +205,7 @@ impl DebouncedAnalysis {
             in_flight_unscoped: AtomicUsize::new(0),
             waiting_requests: AtomicUsize::new(0),
             refused_request: AtomicBool::new(false),
+            at_once: AtomicBool::new(false),
             notify: Notify::new(),
             reindex_notify: Notify::new(),
             analysis,
@@ -254,6 +258,15 @@ impl DebouncedAnalysis {
         }
         self.has_pending_changes.store(true, Ordering::Release);
         self.notify.notify_waiters();
+    }
+
+    /// [`Self::schedule`] for a change typing does not follow, such as files
+    /// changed on disk or a document opened or closed on other text: nothing
+    /// is coming to coalesce with it, so the debounce ends at once. A change
+    /// that follows anyway stops the re-analysis and is taken in.
+    pub async fn schedule_at_once(&self, file_id: FileId, uri: Uri) {
+        self.at_once.store(true, Ordering::Release);
+        self.schedule(file_id, uri).await;
     }
 
     /// Signal that document changes are in-flight but not yet scheduled; they
@@ -939,6 +952,7 @@ impl DebouncedAnalysis {
                     notified.as_mut().enable();
                     if self.waiting_requests.load(Ordering::Acquire) > 0
                         || self.refused_request.swap(false, Ordering::AcqRel)
+                        || self.at_once.swap(false, Ordering::AcqRel)
                     {
                         #[cfg(test)]
                         self.expedited_debounces.fetch_add(1, Ordering::AcqRel);
@@ -1754,6 +1768,74 @@ mod tests {
             )
             .await
             .expect("the request is answered well before the debounce elapses");
+            verify_that!(fresh, eq(Freshness::Fresh))?;
+            verify_that!(
+                debounced_analysis
+                    .expedited_debounces
+                    .load(Ordering::Acquire),
+                eq(1)
+            )?;
+
+            debounced_analysis.shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(5), loop_task)
+                .await
+                .expect("the loop should stop on shutdown")
+                .expect("the loop task must not panic");
+            Ok(())
+        })
+    }
+
+    /// A change no keystroke follows, such as a file changed on disk, ends
+    /// the debounce at once without any request waiting on it.
+    #[gtest]
+    fn a_change_scheduled_at_once_skips_the_debounce() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let mut analysis = EmmyLuaAnalysis::new();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_at_once");
+            analysis.add_main_workspace(workspace.clone());
+            let uri = file_path_to_uri(&workspace.join("lua/autorun/shared/on_disk.lua"))
+                .expect("URI should parse");
+            analysis
+                .update_file_by_uri(&uri, Some("Value = 1\n".to_string()))
+                .map(|(id, _)| id);
+            let analysis = Arc::new(RwLock::new(analysis));
+            let (connection, _peer) = Connection::memory();
+            let client = Arc::new(ClientProxy::new(connection));
+            let status_bar = Arc::new(StatusBar::new(client.clone(), true));
+            let file_diagnostic = Arc::new(FileDiagnostic::new(
+                analysis.clone(),
+                status_bar,
+                client.clone(),
+            ));
+            let debounced_analysis = Arc::new(DebouncedAnalysis::new(
+                analysis.clone(),
+                60_000,
+                CancellationToken::new(),
+                client,
+                file_diagnostic,
+                test_lsp_features(),
+            ));
+            let loop_task = tokio::spawn({
+                let debounced_analysis = debounced_analysis.clone();
+                async move { debounced_analysis.run().await }
+            });
+
+            let file_id = analysis
+                .write()
+                .await
+                .update_file_text_only(&uri, "Value = 2\n".to_string())
+                .expect("the file should still exist");
+            debounced_analysis
+                .schedule_at_once(file_id, uri.clone())
+                .await;
+            let fresh = tokio::time::timeout(
+                Duration::from_secs(10),
+                debounced_analysis
+                    .wait_until_fresh_for(&CancellationToken::new(), "workspace/symbol"),
+            )
+            .await
+            .expect("the change settles well before the debounce elapses");
             verify_that!(fresh, eq(Freshness::Fresh))?;
             verify_that!(
                 debounced_analysis

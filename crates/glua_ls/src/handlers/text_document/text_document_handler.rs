@@ -209,7 +209,7 @@ pub async fn on_did_open_text_document(
             drop(analysis);
             context
                 .debounced_analysis()
-                .schedule(file_id, uri.clone())
+                .schedule_at_once(file_id, uri.clone())
                 .await;
         } else {
             store.publish_opened(file_id, version);
@@ -387,7 +387,7 @@ pub async fn on_did_close_document(
     if let Some(staged) = staged {
         context
             .debounced_analysis()
-            .schedule(staged, uri.clone())
+            .schedule_at_once(staged, uri.clone())
             .await;
     }
 
