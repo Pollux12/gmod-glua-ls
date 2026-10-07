@@ -312,6 +312,106 @@ impl Readers {
         }
     }
 
+    /// Applies `ops` as applying each in order would, the readers moving
+    /// between groups in one pass over each group they leave or join.
+    fn apply_all(&mut self, ops: &[ReaderOp]) {
+        if let [op] = ops {
+            op.apply(self);
+            return;
+        }
+        // Groups in order with their sizes, and each touched reader's group
+        // before the ops and after those applied so far: a group leaves the
+        // order once emptied and joins at its end once its value is first
+        // seen again, as one-by-one application leaves them.
+        let mut order = self
+            .groups()
+            .map(|(seen, derivs)| (seen, derivs.len()))
+            .collect::<Vec<_>>();
+        let mut touched =
+            FxHashMap::<DerivIdx, (Option<Fingerprint>, Option<Fingerprint>)>::default();
+        for op in ops {
+            let (deriv, to) = match *op {
+                ReaderOp::Seen(deriv, seen) | ReaderOp::Insert(deriv, seen) => (deriv, Some(seen)),
+                ReaderOp::Remove(deriv) => (deriv, None),
+            };
+            let (_, now) = touched.entry(deriv).or_insert_with(|| {
+                let before = self.group_of(deriv);
+                (before, before)
+            });
+            if *now == to {
+                continue;
+            }
+            if let Some(from) = *now {
+                let at = order
+                    .iter()
+                    .position(|(seen, _)| *seen == from)
+                    .expect("a reader's group is in the order");
+                order[at].1 -= 1;
+                if order[at].1 == 0 {
+                    order.remove(at);
+                }
+            }
+            if let Some(to) = to {
+                match order.iter_mut().find(|(seen, _)| *seen == to) {
+                    Some((_, len)) => *len += 1,
+                    None => order.push((to, 1)),
+                }
+            }
+            *now = to;
+        }
+        let mut leaving = Vec::new();
+        let mut joining = Vec::new();
+        for (deriv, (before, after)) in touched {
+            if before == after {
+                continue;
+            }
+            leaving.extend(before.map(|seen| (seen, deriv)));
+            joining.extend(after.map(|seen| (seen, deriv)));
+        }
+        if leaving.is_empty() && joining.is_empty() {
+            return;
+        }
+        leaving.sort_unstable();
+        joining.sort_unstable();
+        let mut groups = match std::mem::take(self) {
+            Self::None => Vec::new(),
+            Self::One(seen, reader) => vec![(seen, vec![reader])],
+            Self::Group(seen, derivs) => vec![(seen, derivs)],
+            Self::Groups(groups) => groups,
+        };
+        let of = |moved: &[(Fingerprint, DerivIdx)], seen: Fingerprint| {
+            let start = moved.partition_point(|(group, _)| *group < seen);
+            let end = moved.partition_point(|(group, _)| *group <= seen);
+            moved[start..end]
+                .iter()
+                .map(|(_, deriv)| *deriv)
+                .collect::<Vec<_>>()
+        };
+        let regrouped = order
+            .into_iter()
+            .map(|(seen, len)| {
+                let mut derivs = groups
+                    .iter()
+                    .position(|(group, _)| *group == seen)
+                    .map(|at| groups.swap_remove(at).1)
+                    .unwrap_or_default();
+                remove_sorted(&mut derivs, &of(&leaving, seen));
+                insert_sorted(&mut derivs, &of(&joining, seen));
+                debug_assert_eq!(derivs.len(), len);
+                (seen, derivs)
+            })
+            .collect::<Vec<_>>();
+        *self = Self::Groups(regrouped);
+        self.collapse();
+    }
+
+    /// The group `deriv` reads in, if it is a reader.
+    fn group_of(&self, deriv: DerivIdx) -> Option<Fingerprint> {
+        self.groups()
+            .find(|(_, derivs)| derivs.binary_search(&deriv).is_ok())
+            .map(|(seen, _)| seen)
+    }
+
     fn is_empty(&self) -> bool {
         matches!(self, Self::None)
     }
@@ -370,6 +470,40 @@ impl Readers {
 fn take_from(derivs: &mut Vec<DerivIdx>, deriv: DerivIdx) {
     if let Ok(index) = derivs.binary_search(&deriv) {
         derivs.remove(index);
+    }
+}
+
+/// Removes the sorted `gone` from the sorted `derivs`, moving each kept run
+/// once.
+fn remove_sorted(derivs: &mut Vec<DerivIdx>, gone: &[DerivIdx]) {
+    let (mut read, mut write) = (0, 0);
+    for deriv in gone {
+        let Ok(found) = derivs[read..].binary_search(deriv) else {
+            continue;
+        };
+        let at = read + found;
+        derivs.copy_within(read..at, write);
+        write += at - read;
+        read = at + 1;
+    }
+    let len = derivs.len();
+    derivs.copy_within(read..len, write);
+    derivs.truncate(write + len - read);
+}
+
+/// Inserts the sorted `new`, none of them in it, into the sorted `derivs`,
+/// moving each existing run once.
+fn insert_sorted(derivs: &mut Vec<DerivIdx>, new: &[DerivIdx]) {
+    let mut read_end = derivs.len();
+    derivs.resize(read_end + new.len(), 0);
+    let mut write_end = derivs.len();
+    for deriv in new.iter().rev() {
+        let at = derivs[..read_end].partition_point(|existing| existing < deriv);
+        let run = read_end - at;
+        derivs.copy_within(at..read_end, write_end - run);
+        write_end -= run + 1;
+        derivs[write_end] = *deriv;
+        read_end = at;
     }
 }
 
@@ -1353,7 +1487,8 @@ impl ReaderGraph {
         released: &mut Vec<KeyIdx>,
         now: u64,
     ) -> Vec<HashedKey> {
-        let diffed = self.prepare_kept(record, now).diff();
+        let prepared = self.prepare_kept(record, now);
+        let diffed = prepared.diff(Some(&self.table));
         let (dropped, ops) = self.finish_kept(diffed, released);
         for (slot, op) in ops {
             op.apply(&mut self.table.keys[slot as usize].readers);
@@ -1383,14 +1518,16 @@ impl ReaderGraph {
                 .collect::<Vec<_>>();
             let diffed = prepared
                 .into_par_iter()
-                .map(PreparedRecord::diff)
+                .map(|prepared| prepared.diff(Some(&self.table)))
                 .collect::<Vec<_>>();
             for diffed in diffed {
                 ops.push(self.finish_kept(diffed, released).1);
             }
         } else {
             for record in records {
-                let diffed = self.prepare_kept(record, stamp()).diff();
+                // A later record of the same derivation diffs against
+                // readers the earlier one's ops have yet to move.
+                let diffed = self.prepare_kept(record, stamp()).diff(None);
                 ops.push(self.finish_kept(diffed, released).1);
             }
         }
@@ -1482,11 +1619,40 @@ impl ReaderGraph {
         let Some(derivs) = self.by_file.remove(&file_id) else {
             return Vec::new();
         };
+        let derivs = derivs.into_iter().collect::<Vec<_>>();
+        // Each key's readers lose every derivation of the file at once. A key
+        // a derivation detached later still reads stays filed until then, as
+        // detaching them one at a time leaves it.
+        let mut leaving = derivs
+            .iter()
+            .flat_map(|deriv| {
+                self.derivations[*deriv as usize]
+                    .record
+                    .iter()
+                    .flat_map(|record| record.reads.iter())
+                    .map(|key| (*key, *deriv))
+            })
+            .collect::<Vec<_>>();
+        leaving.sort_unstable();
+        let ops = leaving
+            .iter()
+            .map(|(_, deriv)| ReaderOp::Remove(*deriv))
+            .collect::<Vec<_>>();
+        let mut still_read = FxHashMap::default();
+        let mut start = 0;
+        for same_key in leaving.chunk_by(|(left, _), (right, _)| left == right) {
+            let end = start + same_key.len();
+            self.table.keys[same_key[0].0 as usize]
+                .readers
+                .apply_all(&ops[start..end]);
+            still_read.insert(same_key[0].0, same_key.len());
+            start = end;
+        }
         let mut removed: Vec<_> = derivs
             .into_iter()
             .map(|deriv| {
                 let id = self.derivations[deriv as usize].id;
-                (id, self.detach(deriv))
+                (id, self.detach(deriv, &mut still_read))
             })
             .collect();
         removed.sort_by_key(|entry| entry.0);
@@ -2111,6 +2277,15 @@ impl ReaderGraph {
     /// Frees `slot` if no record reads or produces it. A freed slot reads as
     /// written after every memo, so none replays it.
     fn release_key(&mut self, slot: KeyIdx) {
+        self.release_key_unless_read(slot, &FxHashMap::default());
+    }
+
+    /// [`Self::release_key`], keeping a key `still_read` counts readers of
+    /// that have yet to leave it.
+    fn release_key_unless_read(&mut self, slot: KeyIdx, still_read: &FxHashMap<KeyIdx, usize>) {
+        if still_read.get(&slot).is_some_and(|readers| *readers > 0) {
+            return;
+        }
         let entry = &mut self.table.keys[slot as usize];
         if !entry.readers.is_empty()
             || entry.producer != NO_PRODUCER
@@ -2137,7 +2312,7 @@ impl ReaderGraph {
             derived.slots.retain(|derived| *derived != slot);
             if derived.slots.is_empty() {
                 self.table.derived.remove(&base);
-                self.release_key(base);
+                self.release_key_unless_read(base, still_read);
             }
         }
     }
@@ -2161,11 +2336,6 @@ impl ReaderGraph {
         slot
     }
 
-    fn drop_producer(&mut self, key: KeyIdx, deriv: DerivIdx, file_id: FileId) {
-        self.unproduce(key, deriv, file_id);
-        self.release_key(key);
-    }
-
     /// Removes `deriv` from `key`'s producers, leaving the slot allocated.
     fn unproduce(&mut self, key: KeyIdx, deriv: DerivIdx, file_id: FileId) {
         self.table.remove_producer(key, deriv);
@@ -2180,24 +2350,32 @@ impl ReaderGraph {
         }
     }
 
-    /// Removes `deriv`'s record and edges and frees its slot. Returns the
+    /// Removes `deriv`'s record and edges and frees its slot, its reads'
+    /// readers having left them, each counted out of `still_read`. Returns the
     /// facts it produced.
-    fn detach(&mut self, deriv: DerivIdx) -> Box<[HashedKey]> {
+    fn detach(
+        &mut self,
+        deriv: DerivIdx,
+        still_read: &mut FxHashMap<KeyIdx, usize>,
+    ) -> Box<[HashedKey]> {
         let id = self.derivations[deriv as usize].id;
         let record = self.derivations[deriv as usize]
             .record
             .take()
             .unwrap_or_default();
         for key in record.reads.iter() {
-            self.table.keys[*key as usize].readers.remove(deriv);
-            self.release_key(*key);
+            if let Some(readers) = still_read.get_mut(key) {
+                *readers -= 1;
+            }
+            self.release_key_unless_read(*key, still_read);
         }
         let outputs = record
             .outputs
             .iter()
             .map(|key| {
                 let fact = self.key(*key).clone();
-                self.drop_producer(*key, deriv, id.file_id);
+                self.unproduce(*key, deriv, id.file_id);
+                self.release_key_unless_read(*key, still_read);
                 fact
             })
             .collect();
@@ -2239,7 +2417,9 @@ struct DiffedRecord {
 }
 
 impl PreparedRecord {
-    fn diff(self) -> DiffedRecord {
+    /// Diffs against the record replaced. A read kept at the value its
+    /// reader group in `readers` holds needs no op.
+    fn diff(self, readers: Option<&KeyTable>) -> DiffedRecord {
         let Self {
             id,
             deriv,
@@ -2257,7 +2437,11 @@ impl PreparedRecord {
         loop {
             match (old_reads.peek().copied(), new_reads.peek().copied()) {
                 (Some(old_key), Some((new_key, new_seen))) if old_key == new_key => {
-                    ops.push((new_key, ReaderOp::Seen(deriv, new_seen)));
+                    if readers.is_none_or(|table| {
+                        table.keys[new_key as usize].readers.seen_by(deriv) != new_seen
+                    }) {
+                        ops.push((new_key, ReaderOp::Seen(deriv, new_seen)));
+                    }
                     old_reads.next();
                     new_reads.next();
                 }
@@ -2332,43 +2516,47 @@ const READER_CHUNK: usize = 1 << 10;
 
 const _: () = assert!(PAGE.is_multiple_of(READER_CHUNK));
 
-const CHUNKS_PER_PAGE: usize = PAGE / READER_CHUNK;
-
 impl KeyTable {
-    /// Applies each record's `ops`, each slot's in record order: runs of
-    /// records are sorted into chunks of slots on worker threads, then each
-    /// chunk takes its share of every run in order.
+    /// Applies each record's `ops`, each slot's together in record order:
+    /// every op is sorted by slot on worker threads, a slot's keeping record
+    /// order, then each chunk of slots they reach takes its ops on a worker.
     fn apply_reader_ops(&mut self, ops: Vec<Vec<(KeyIdx, ReaderOp)>>) {
         use rayon::prelude::*;
-        let pages = self.keys.pages_mut();
-        let chunk_count = pages.len() * CHUNKS_PER_PAGE;
-        let run = ops.len().div_ceil(rayon::current_num_threads() * 4).max(1);
-        let runs = ops
-            .par_chunks(run)
-            .map(|records| {
-                let mut by_chunk = vec![Vec::new(); chunk_count];
-                for (slot, op) in records.iter().flatten() {
-                    let slot = *slot as usize;
-                    by_chunk[slot / READER_CHUNK].push((slot % READER_CHUNK, *op));
-                }
-                by_chunk
+        let mut ops = ops.into_iter().flatten().collect::<Vec<_>>();
+        ops.par_sort_by_key(|(slot, _)| *slot);
+        let (slots, ops): (Vec<_>, Vec<_>) = ops.into_par_iter().unzip();
+        let chunk_of = |slot: KeyIdx| slot as usize / READER_CHUNK;
+        let mut reached = Vec::new();
+        let mut start = 0;
+        while let Some(slot) = slots.get(start) {
+            let chunk = chunk_of(*slot);
+            let end = start + slots[start..].partition_point(|slot| chunk_of(*slot) == chunk);
+            reached.push((chunk, start..end));
+            start = end;
+        }
+        let mut reached = reached.into_iter().peekable();
+        let chunks = self
+            .keys
+            .pages_mut()
+            .iter_mut()
+            .flat_map(|page| page.chunks_mut(READER_CHUNK))
+            .enumerate()
+            .filter_map(|(index, chunk)| {
+                reached
+                    .next_if(|(reached, _)| *reached == index)
+                    .map(|(_, range)| (index * READER_CHUNK, chunk, range))
             })
             .collect::<Vec<_>>();
-        pages
-            .par_iter_mut()
-            .enumerate()
-            .flat_map(|(page_index, page)| {
-                page.par_chunks_mut(READER_CHUNK)
-                    .enumerate()
-                    .map(move |(at, chunk)| (page_index * CHUNKS_PER_PAGE + at, chunk))
-            })
-            .for_each(|(index, chunk)| {
-                for by_chunk in &runs {
-                    for (at, op) in &by_chunk[index] {
-                        op.apply(&mut chunk[*at].readers);
-                    }
-                }
-            });
+        chunks.into_par_iter().for_each(|(first, chunk, range)| {
+            let mut start = range.start;
+            for same_slot in slots[range].chunk_by(|left, right| left == right) {
+                let end = start + same_slot.len();
+                chunk[same_slot[0] as usize - first]
+                    .readers
+                    .apply_all(&ops[start..end]);
+                start = end;
+            }
+        });
     }
 }
 
@@ -2715,6 +2903,48 @@ mod tests {
             .groups()
             .map(|(seen, derivs)| (seen, derivs.to_vec()))
             .collect()
+    }
+
+    /// Ops applied together leave the readers exactly as applying them one at
+    /// a time does: the same groups, in the same order and form, over random
+    /// sequences that move readers between several values, insert, see and
+    /// remove the same reader more than once, and empty and refill groups.
+    #[test]
+    fn reader_ops_applied_together_match_them_applied_one_at_a_time() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        for case in 0..2000 {
+            let mut start = Readers::default();
+            for _ in 0..next(40) {
+                start.insert(next(30) as DerivIdx, next(4));
+            }
+            let mut one_by_one = start.clone();
+            let mut ops = Vec::new();
+            for _ in 0..1 + next(30) {
+                let deriv = next(30) as DerivIdx;
+                let op = match next(3) {
+                    // Seen names a current reader, as a record's diff does.
+                    0 if one_by_one.group_of(deriv).is_some() => ReaderOp::Seen(deriv, next(4)),
+                    0 | 1 => ReaderOp::Insert(deriv, next(4)),
+                    _ => ReaderOp::Remove(deriv),
+                };
+                op.apply(&mut one_by_one);
+                ops.push(op);
+            }
+            let mut together = start;
+            together.apply_all(&ops);
+
+            assert_eq!(
+                format!("{together:?}"),
+                format!("{one_by_one:?}"),
+                "case {case}: {ops:?}"
+            );
+        }
     }
 
     #[test]
