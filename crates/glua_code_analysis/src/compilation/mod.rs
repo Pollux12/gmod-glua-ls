@@ -229,10 +229,9 @@ impl LuaCompilation {
         UpdateProgress::Settled(reanalysed.stale_diagnostics)
     }
 
-    /// Has re-analyses that slice their work stop a slice where it plans a
-    /// worker superstep, leaving its tasks to [`Self::run_detached_tasks`],
-    /// which runs them while readers share the compilation. The next `&mut`
-    /// access installs them first.
+    /// Has a re-analysis slice that ends with a worker superstep due leave its
+    /// tasks to [`Self::run_detached_tasks`], which runs them while readers
+    /// share the compilation. The next `&mut` access installs them first.
     pub fn set_detached_tasks(&mut self, detach: bool) {
         self.detach_tasks = detach;
     }

@@ -319,8 +319,8 @@ impl Reanalysis {
         crate::profile::phase("reanalyze: flush", || db.flush_inference_derived_state());
     }
 
-    /// Has yielding slices leave a worker superstep's tasks to run outside
-    /// them; see [`Self::take_detached`].
+    /// Has a slice that ends with a worker superstep due leave its tasks to
+    /// run outside it; see [`Self::take_detached`].
     pub(crate) fn detach_supersteps(&mut self) {
         self.engine.detach_supersteps();
     }

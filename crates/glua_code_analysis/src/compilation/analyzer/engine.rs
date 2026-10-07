@@ -460,9 +460,9 @@ pub(crate) struct Engine {
     /// next superstep runs them as they were decided before it takes another
     /// entry.
     carried: Vec<TaskPlan>,
-    /// Whether a yielding slice that plans a worker superstep stops there,
-    /// leaving its tasks to [`Superstep::run_tasks`] outside the run while
-    /// readers share the index, and installs them when the run goes on.
+    /// Whether a slice that ends with a worker superstep due leaves its tasks
+    /// to [`Superstep::run_tasks`] outside the run while readers share the
+    /// index, and installs them when the run goes on.
     detach: bool,
     /// The worker superstep whose tasks run outside the run, and its files.
     detached: Option<Superstep>,
@@ -570,8 +570,8 @@ impl Engine {
         self.interrupt = Some(interrupt);
     }
 
-    /// Has yielding slices leave a worker superstep's tasks to run outside
-    /// the run; see [`Self::take_detached`].
+    /// Has a slice that ends with a worker superstep due leave its tasks to
+    /// run outside the run; see [`Self::take_detached`].
     pub(crate) fn detach_supersteps(&mut self) {
         self.detach = true;
     }
@@ -639,13 +639,7 @@ impl Engine {
         db: &'a DbIndex,
         key: &'a HashedKey,
     ) -> impl Fn(derivation::Fingerprint) -> bool + 'a {
-        let current = std::cell::OnceCell::new();
-        let before_edits = std::cell::OnceCell::new();
-        move |seen| {
-            seen == *current.get_or_init(|| self.fingerprint(db, key))
-                || (!self.edits.is_empty()
-                    && seen == *before_edits.get_or_init(|| self.fingerprint_before_edits(db, key)))
-        }
+        holds(db, &self.edits, &self.before_edits, key)
     }
 
     fn fingerprint_before_edits(&self, db: &DbIndex, key: &HashedKey) -> derivation::Fingerprint {
@@ -768,23 +762,23 @@ impl Engine {
 
     /// The keys read out of each base among `keys` whose readers have to be
     /// checked at the base's current fingerprint, taken on worker threads
-    /// while nothing is being edited or recorded.
+    /// while nothing is being recorded.
     fn derived_keys_to_check(&self, db: &DbIndex, keys: &[&HashedKey]) -> Vec<HashedKey> {
         let graph = db.reader_graph();
         let bases = keys
             .iter()
             .filter(|key| key.is_base() && graph.has_derived_keys(key))
             .collect::<Vec<_>>();
-        let now = if !self.edits.is_empty() || derivation::recording() {
+        let now = if derivation::recording() {
             bases
                 .iter()
-                .map(|key| self.fingerprint(db, key))
+                .map(|key| current_fingerprint(db, key))
                 .collect::<Vec<_>>()
         } else {
             bases
                 .par_iter()
                 .with_min_len(KEYS_PER_JOB)
-                .map(|key| graph.current_fingerprint(key, |key| db.fact_fingerprint(key)))
+                .map(|key| current_fingerprint(db, key))
                 .collect()
         };
         bases
@@ -794,19 +788,27 @@ impl Engine {
             .collect()
     }
 
-    /// The readers of each of `keys` whose recorded fingerprint differs from
-    /// the key's current one, found on worker threads while nothing is being
-    /// edited or recorded; `None` for a query output, whose fingerprint may
-    /// compute it.
+    /// The readers of each of `keys` whose recorded fingerprint holds neither
+    /// as the key stands nor with the edits mapped back, found on worker
+    /// threads while nothing is being recorded; `None` for a query output,
+    /// whose fingerprint may compute it.
     fn stale_readers_of(
         &self,
         db: &DbIndex,
         keys: &[&HashedKey],
     ) -> Vec<Option<Vec<(DerivationId, derivation::Fingerprint)>>> {
-        if !self.edits.is_empty() || derivation::recording() {
+        if derivation::recording() {
             return vec![None; keys.len()];
         }
+        if !self.edits.is_empty() {
+            // A key that moved fingerprints anew with the edits undone.
+            let mut memo = lock(&self.before_edits);
+            for key in keys {
+                memo.remove(*key);
+            }
+        }
         let graph = db.reader_graph();
+        let (edits, before_edits) = (&self.edits, &self.before_edits);
         keys.par_iter()
             .with_min_len(KEYS_PER_JOB)
             .map(|key| {
@@ -816,9 +818,7 @@ impl Engine {
                 ))
                 .then(|| {
                     graph
-                        .stale_readers_seen(key, |seen| {
-                            seen == graph.current_fingerprint(key, |key| db.fact_fingerprint(key))
-                        })
+                        .stale_readers_seen(key, holds(db, edits, before_edits, key))
                         .collect()
                 })
             })
@@ -1152,41 +1152,36 @@ impl Engine {
         if let Some(mut superstep) = self.detached.take() {
             self.detached_files.clear();
             superstep.stop = StopSignal::new(slice, self.interrupt.as_ref());
-            superstep.stop.progress();
             self.finish_superstep(db, recipe, slice, superstep);
         }
         loop {
             self.file_queries(db);
-            if slice.over(self.stats.total_evaluations() - started)
-                || (slice.yields() && self.interrupted())
-            {
+            let interrupted = slice.yields() && self.interrupted();
+            let on_workers = self.superstep == SuperstepMode::Workers && !self.serial_stage;
+            if !on_workers {
+                self.requeue_carried();
+            }
+            let superstep_due = on_workers
+                && (!self.carried.is_empty()
+                    || self
+                        .worklist
+                        .first_rank()
+                        .is_some_and(|rank| self.worklist.spans_files(rank)));
+            if interrupted || slice.over(self.stats.total_evaluations() - started) {
+                // The superstep due next runs while readers share the index,
+                // and the next slice installs it.
+                if superstep_due && !interrupted && self.detach && matches!(slice, Slice::Until(_))
+                {
+                    self.detach_superstep(db, slice);
+                }
                 self.flush_slot_notifications(db);
                 return false;
             }
             if self.focus.is_empty() && (!self.worklist.is_empty() || !self.carried.is_empty()) {
                 self.released_unrun = false;
             }
-            // An edit's focus settles in canonical order: its files' tasks at
-            // one rank would read each other's unsettled values.
-            let on_workers = self.superstep == SuperstepMode::Workers
-                && !self.serial_stage
-                && (self.focus.is_empty() || (self.edits.is_empty() && self.rebuilt.is_empty()))
-                && self.loop_focus.is_empty();
-            if !on_workers {
-                self.requeue_carried();
-            }
-            if on_workers
-                && (!self.carried.is_empty()
-                    || self
-                        .worklist
-                        .first_rank()
-                        .is_some_and(|rank| self.worklist.spans_files(rank)))
-            {
+            if superstep_due {
                 self.superstep_on_workers(db, recipe, slice);
-                if self.detached.is_some() {
-                    self.flush_slot_notifications(db);
-                    return false;
-                }
                 continue;
             }
             let Some((id, reason)) = self.worklist.pop_first() else {
@@ -1306,16 +1301,31 @@ impl Engine {
             return;
         };
         if !superstep.plans.is_empty() {
-            let detaching = self.detach && matches!(slice, Slice::Until(_));
-            self.start_tasks(db, &mut superstep, detaching);
-            if detaching {
-                self.detached_files = superstep.plans.iter().map(|plan| plan.file_id).collect();
-                self.detached = Some(superstep);
-                return;
-            }
+            self.start_tasks(db, &mut superstep, false);
             superstep.run_tasks(db, recipe);
         }
         self.finish_superstep(db, recipe, slice, superstep);
+    }
+
+    /// Plans the superstep due next and leaves it to run outside the run
+    /// while readers share the index ([`Self::take_detached`]): its tasks,
+    /// then, once the next slice installs them, the entries it left to the
+    /// root list.
+    fn detach_superstep(&mut self, db: &mut DbIndex, slice: Slice) {
+        let Some(mut superstep) = self.plan_superstep(db, slice) else {
+            return;
+        };
+        if !superstep.plans.is_empty() {
+            self.start_tasks(db, &mut superstep, true);
+        }
+        self.detached_files = superstep
+            .plans
+            .iter()
+            .map(|plan| plan.file_id)
+            .chain(superstep.on_root.iter().map(|(file_id, _)| *file_id))
+            .chain(superstep.root.iter().map(|(id, _)| id.file_id))
+            .collect();
+        self.detached = Some(superstep);
     }
 
     /// Plans the next worker superstep: the groups the last one carried, or
@@ -3555,6 +3565,25 @@ fn current_fingerprint(db: &DbIndex, key: &HashedKey) -> derivation::Fingerprint
         .current_fingerprint(key, |key| db.fact_fingerprint(key))
 }
 
+/// Whether reads of `key` that saw a fingerprint still hold: the value is the
+/// same, or the same once `edits`' moves are undone.
+fn holds<'a>(
+    db: &'a DbIndex,
+    edits: &'a derivation::EditMaps,
+    before_edits: &'a std::sync::Mutex<FxHashMap<HashedKey, derivation::Fingerprint>>,
+    key: &'a HashedKey,
+) -> impl Fn(derivation::Fingerprint) -> bool + 'a {
+    let current = std::cell::OnceCell::new();
+    let before = std::cell::OnceCell::new();
+    move |seen| {
+        seen == *current.get_or_init(|| current_fingerprint(db, key))
+            || (!edits.is_empty()
+                && seen
+                    == *before
+                        .get_or_init(|| fingerprint_before_edits(db, edits, before_edits, key)))
+    }
+}
+
 /// `key`'s fingerprint with `edits` undone, taken once per value into `memo`.
 fn fingerprint_before_edits(
     db: &DbIndex,
@@ -4070,8 +4099,8 @@ enum SuperstepMode {
 }
 
 /// `GLUALS_SUPERSTEP`: `off` runs the serial engine; unset or any other value
-/// runs each rank outside a focus whose work spans files a superstep at a
-/// time with the tasks on worker threads.
+/// runs each rank whose work spans files a superstep at a time with the tasks
+/// on worker threads.
 fn superstep_mode() -> SuperstepMode {
     static MODE: std::sync::OnceLock<SuperstepMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("GLUALS_SUPERSTEP").as_deref() {
@@ -5438,8 +5467,9 @@ function holder.receiver:Use() end
         assert_eq!(stopped.digest, whole.digest);
     }
 
-    /// Settles the relays with every yielding slice stopping where it plans a
-    /// worker superstep, the next slice installing it; the first detached
+    /// Settles the relays in slices that end at once, each detaching the
+    /// worker superstep due, the next slice installing it, and work with no
+    /// superstep due running a slice of one evaluation; the first detached
     /// superstep's tasks are left unrun unless `run_first`. Returns how many
     /// supersteps were detached, and the settled digest.
     fn relay_detached(run_first: bool) -> (usize, Vec<String>) {
@@ -5454,12 +5484,14 @@ function holder.receiver:Use() end
             engine.changed(*id);
         }
         engine.open(db);
-        let far = std::time::Instant::now() + std::time::Duration::from_secs(600);
         let mut detached = 0;
-        while !engine.run(db, &recipe, Slice::Until(far)) {
-            let mut superstep = engine
-                .take_detached()
-                .expect("an unhurried slice stops only where it detaches a superstep");
+        while !engine.run(db, &recipe, Slice::Until(std::time::Instant::now())) {
+            let Some(mut superstep) = engine.take_detached() else {
+                if engine.run(db, &recipe, Slice::Evaluations(1)) {
+                    break;
+                }
+                continue;
+            };
             if run_first || detached > 0 {
                 superstep.run_tasks(db, &recipe);
             }
