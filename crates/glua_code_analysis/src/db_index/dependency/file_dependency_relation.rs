@@ -358,10 +358,22 @@ mod tests {
         );
 
         // meta files should come first (2 and 4), non-meta files last (1 and 3)
-        assert!(metas.contains(&result[0]), "the first should be a meta file");
-        assert!(metas.contains(&result[1]), "the second should be a meta file");
-        assert!(!metas.contains(&result[2]), "the third should be a non-meta file");
-        assert!(!metas.contains(&result[3]), "the fourth should be a non-meta file");
+        assert!(
+            metas.contains(&result[0]),
+            "the first should be a meta file"
+        );
+        assert!(
+            metas.contains(&result[1]),
+            "the second should be a meta file"
+        );
+        assert!(
+            !metas.contains(&result[2]),
+            "the third should be a non-meta file"
+        );
+        assert!(
+            !metas.contains(&result[3]),
+            "the fourth should be a non-meta file"
+        );
     }
 
     #[test]
