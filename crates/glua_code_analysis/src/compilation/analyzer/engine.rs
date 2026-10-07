@@ -2119,6 +2119,25 @@ impl Engine {
             })
             .map(|(member, _)| *member)
             .collect::<BTreeSet<_>>();
+        if crate::profile::tracing_evaluations() {
+            for root in &roots {
+                let moved = self.settled_on[root]
+                    .iter()
+                    .filter(|moved| self.net_moved(db, *root, moved))
+                    .map(|moved| {
+                        format!(
+                            "{:?} seen={} settled={} removed={:?} from_before={}",
+                            moved.key.key(),
+                            moved.seen,
+                            moved.settled,
+                            self.removed_outputs.get(&moved.key),
+                            self.from_before.contains(root)
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                self.trace(db, *root, "loop root", &moved);
+            }
+        }
         if roots.is_empty() {
             self.settled_on.clear();
             return false;
