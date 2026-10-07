@@ -3540,12 +3540,12 @@ impl LuaTypeIndex {
                 decls.sort_unstable_by_key(|decl_id| decl_id.position);
                 derivation::fingerprint_of(&decls)
             }
-            FactKey::DeclClaim(decl_id) => self
-                .decl_write_claims
-                .get(decl_id)
-                .map_or(derivation::ABSENT, |(position, may_narrow)| {
+            FactKey::DeclClaim(decl_id) => self.decl_write_claims.get(decl_id).map_or(
+                derivation::ABSENT,
+                |(position, may_narrow)| {
                     derivation::fingerprint_of(&(derivation::Local(position), *may_narrow))
-                }),
+                },
+            ),
             FactKey::TypeDeclScan => self.decl_scan_fingerprint,
             FactKey::TypeFile(file_id) => {
                 let namespace = self.file_namespace.get(file_id);
