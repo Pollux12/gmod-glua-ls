@@ -985,6 +985,8 @@ impl Engine {
             .diagnostics
             .iter()
             .copied()
+            .collect::<Vec<_>>()
+            .into_par_iter()
             .filter(|file_id| {
                 graph.is_stale(
                     DerivationId::diagnostics(*file_id),
