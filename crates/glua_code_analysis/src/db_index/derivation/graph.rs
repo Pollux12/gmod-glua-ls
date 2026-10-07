@@ -1613,14 +1613,15 @@ impl ReaderGraph {
         (dropped, ops)
     }
 
-    /// Forgets every derivation of `file_id`, returning each with the facts
-    /// it produced.
-    pub fn remove_file(&mut self, file_id: FileId) -> Vec<(DerivationId, Box<[HashedKey]>)> {
-        let Some(derivs) = self.by_file.remove(&file_id) else {
-            return Vec::new();
-        };
-        let derivs = derivs.into_iter().collect::<Vec<_>>();
-        // Each key's readers lose every derivation of the file at once. A key
+    /// Forgets every derivation of `file_ids`, returning each with the facts
+    /// it produced, in derivation order.
+    pub fn remove_files(&mut self, file_ids: &[FileId]) -> Vec<(DerivationId, Box<[HashedKey]>)> {
+        let derivs = file_ids
+            .iter()
+            .filter_map(|file_id| self.by_file.remove(file_id))
+            .flatten()
+            .collect::<Vec<_>>();
+        // Each key's readers lose every derivation of the files at once. A key
         // a derivation detached later still reads stays filed until then, as
         // detaching them one at a time leaves it.
         let mut leaving = derivs
@@ -2788,7 +2789,7 @@ mod tests {
         graph.replace(id(1, 0), vec![(key(9), Some(5))], vec![key(1)], |_| 0);
         graph.replace(id(2, 0), vec![(key(1), Some(5))], vec![key(2)], |_| 0);
 
-        let removed = graph.remove_file(FileId::new(1));
+        let removed = graph.remove_files(&[FileId::new(1)]);
 
         assert_eq!(removed.len(), 1);
         assert_eq!(&*removed[0].1, &[key(1)]);
@@ -3011,7 +3012,7 @@ mod tests {
             PositionMap::new(&old_text, &new_text),
         )]));
 
-        graph.remove_file(FileId::new(2));
+        graph.remove_files(&[FileId::new(2)]);
 
         assert_eq!(graph.stale_readers(&decl(20), |_| false).count(), 0);
     }

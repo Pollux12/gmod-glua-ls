@@ -504,6 +504,8 @@ fn replace_files(
 ) -> HashSet<derivation::HashedKey> {
     let mut touched = moved;
     touched.insert(derivation::HashedKey::new(derivation::FactKey::FileSet));
+    let forgetting = crate::profile::PhaseGuard::new("replace: forget derivations");
+    let mut outputs = HashSet::default();
     for file_id in file_ids {
         touched.insert(derivation::HashedKey::new(derivation::FactKey::FileText(
             *file_id,
@@ -548,35 +550,38 @@ fn replace_files(
         {
             engine.rebuilding(*file_id);
         }
-        let outputs = db
-            .reader_graph()
-            .derivations_of_file(*file_id)
-            .flat_map(|id| {
-                db.reader_graph()
-                    .outputs_of(id)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .collect::<HashSet<_>>();
-        for key in outputs {
-            let fingerprint = db.fact_fingerprint(&key);
-            engine.note_removed_output(key, fingerprint);
-        }
-        let removed = db.reader_graph_mut().remove_file(*file_id);
-        for (_, outputs) in removed {
-            for key in outputs.iter() {
-                if key.is_primary() && key.owning_file() != Some(*file_id) {
-                    touched.extend(derivation::capture_writes(|| db.reset_fact(key)));
-                    for producer in db.reader_graph().producers(key).collect::<Vec<_>>() {
-                        if producer.kind != derivation::DerivationKind::Source {
-                            engine.changed(producer);
-                        }
+        outputs.extend(
+            db.reader_graph()
+                .derivations_of_file(*file_id)
+                .flat_map(|id| db.reader_graph().outputs_of(id).cloned()),
+        );
+    }
+    let outputs = outputs.into_iter().collect::<Vec<_>>();
+    let fingerprints = {
+        use rayon::prelude::*;
+        outputs
+            .par_iter()
+            .map(|key| db.fact_fingerprint(key))
+            .collect::<Vec<_>>()
+    };
+    for (key, fingerprint) in outputs.into_iter().zip(fingerprints) {
+        engine.note_removed_output(key, fingerprint);
+    }
+    let removed = db.reader_graph_mut().remove_files(file_ids);
+    for (id, outputs) in removed {
+        for key in outputs.iter() {
+            if key.is_primary() && key.owning_file() != Some(id.file_id) {
+                touched.extend(derivation::capture_writes(|| db.reset_fact(key)));
+                for producer in db.reader_graph().producers(key).collect::<Vec<_>>() {
+                    if producer.kind != derivation::DerivationKind::Source {
+                        engine.changed(producer);
                     }
                 }
             }
-            touched.extend(outputs.into_vec());
         }
+        touched.extend(outputs.into_vec());
     }
+    drop(forgetting);
     // What removal takes out, read off the indexes as they drop it: a
     // recorded output can name a slot the index has since re-homed.
     derivation::begin(derivation::DerivationId::workspace(
