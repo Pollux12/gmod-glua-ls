@@ -211,6 +211,7 @@ impl Reanalysis {
             memos: HashMap::default(),
         };
         reanalysis.pause(db);
+        crate::profile::phase_report("take");
         reanalysis
     }
 
@@ -238,6 +239,7 @@ impl Reanalysis {
             self.access_paths = crate::semantic::AccessPaths::default();
         }
         self.pause(db);
+        crate::profile::phase_report("take");
     }
 
     /// Evaluates until the re-analysis settles or `slice` is over. Returns

@@ -456,6 +456,10 @@ pub(crate) struct Engine {
     serial_stage: bool,
     /// What superstep tasks took, to start the costliest first.
     task_costs: TaskCosts,
+    /// The groups a worker superstep that stopped left unrun, by file: the
+    /// next superstep runs them as they were decided before it takes another
+    /// entry.
+    carried: Vec<TaskPlan>,
 }
 
 /// The seconds a group of each file's superstep task took at each rank, by
@@ -941,6 +945,7 @@ impl Engine {
         if added == 0 {
             return;
         }
+        self.requeue_carried();
         let resumed = self
             .waiting
             .extract_if(.., |id, _| self.focus.contains(&id.file_id))
@@ -978,6 +983,7 @@ impl Engine {
     /// be replaced and queued again.
     pub(crate) fn replacing(&mut self, file_ids: &[crate::FileId]) {
         self.since_search = None;
+        self.requeue_carried();
         let replaced = |id: DerivationId| file_ids.contains(&id.file_id);
         self.worklist.take_where(replaced);
         self.next_round.take_where(replaced);
@@ -1003,6 +1009,7 @@ impl Engine {
                 .chain(self.next_round.files())
                 .chain(self.waiting.keys().map(|id| id.file_id))
                 .chain(self.held.keys().map(|id| id.file_id))
+                .chain(self.carried.iter().map(|plan| plan.file_id))
                 .any(|queued| queued == file_id)
     }
 
@@ -1121,19 +1128,24 @@ impl Engine {
                 self.flush_slot_notifications(db);
                 return false;
             }
-            if self.focus.is_empty() && !self.worklist.is_empty() {
+            if self.focus.is_empty() && (!self.worklist.is_empty() || !self.carried.is_empty()) {
                 self.released_unrun = false;
             }
             // A focus settles in canonical order: its files' tasks at one rank
             // would read each other's unsettled values.
-            if self.superstep == SuperstepMode::Workers
+            let on_workers = self.superstep == SuperstepMode::Workers
                 && !self.serial_stage
                 && self.focus.is_empty()
-                && self.loop_focus.is_empty()
-                && self
-                    .worklist
-                    .first_rank()
-                    .is_some_and(|rank| self.worklist.spans_files(rank))
+                && self.loop_focus.is_empty();
+            if !on_workers {
+                self.requeue_carried();
+            }
+            if on_workers
+                && (!self.carried.is_empty()
+                    || self
+                        .worklist
+                        .first_rank()
+                        .is_some_and(|rank| self.worklist.spans_files(rank)))
             {
                 self.superstep_on_workers(db, recipe, slice);
                 continue;
@@ -1155,6 +1167,7 @@ impl Engine {
                         // The focus's files answer before the work waiting on it is checked.
                         self.focus.clear();
                         self.handed_back = true;
+                        crate::profile::phase_report("focus");
                         return false;
                     }
                     if crate::profile::phase("engine: release", || self.release_waiting(db)) {
@@ -1238,14 +1251,38 @@ impl Engine {
     /// order before checking the readers of everything the tasks touched.
     ///
     /// Once a group ran, the superstep stops between two groups when
-    /// [`StopSignal::reached`] says so; every queued entry a group it did not
-    /// run took is queued again, as if the rank had held only what ran.
+    /// [`StopSignal::reached`] says so. The groups it left unrun are carried:
+    /// the next superstep runs them as decided, on the index as the groups
+    /// that ran left it, before it takes the rank again, so a rank stopped
+    /// often is decided once rather than once per stop. Deciding again could
+    /// only drop a member decided stale whose reads moved back, which then
+    /// runs once more than it had to and moves nothing, or add a co-producer
+    /// a group gained, which the widened check after the group queues as for
+    /// any group: the superstep is split, an order the run settles the same
+    /// in. Entries queued meanwhile wait for the carried groups; a carried
+    /// file that settles on the index since, and every carried group once the
+    /// stage settles on the serial loop, is queued again instead.
     fn superstep_on_workers(&mut self, db: &mut DbIndex, recipe: &dyn Recipe, slice: Slice) {
+        let stop = StopSignal::new(slice, self.interrupt.as_ref());
+        if !self.carried.is_empty() {
+            let carried = std::mem::take(&mut self.carried);
+            let (plans, serial) = carried
+                .into_iter()
+                .partition::<Vec<_>, _>(|plan| !self.serial_files.contains(&plan.file_id));
+            self.requeue(serial);
+            if let Some(rank) = plans
+                .first()
+                .map(|plan| plan.groups[0].members[0].kind.rank())
+            {
+                self.stats.supersteps += 1;
+                self.run_on_workers(db, recipe, slice, rank, plans, &stop);
+            }
+            return;
+        }
         let Some(rank) = self.worklist.first_rank() else {
             return;
         };
         self.stats.supersteps += 1;
-        let stop = StopSignal::new(slice, self.interrupt.as_ref());
         let dispatching = crate::profile::PhaseGuard::new("superstep: dispatch");
         let mut plans = Vec::new();
         let mut root = Vec::new();
@@ -1320,7 +1357,7 @@ impl Engine {
     /// for a group its file's task runs, [`Self::commit_group`] does the rest
     /// of what [`Self::step`] does before it evaluates one once the task ran
     /// it. Deciding that a group runs changes nothing but the cursor, so an
-    /// entry queued again unrun is decided afresh.
+    /// entry queued again is decided afresh.
     fn decide(
         &mut self,
         db: &mut DbIndex,
@@ -1444,8 +1481,8 @@ impl Engine {
 
     /// Runs `plans` on worker threads against the index and reader graph as
     /// they stand, until `stop` is reached, then installs the tasks' forks and
-    /// files what they recorded, in file order. The entries the groups left
-    /// unrun took are queued again.
+    /// files what they recorded, in file order. The groups left unrun are
+    /// carried to the next superstep.
     fn run_on_workers(
         &mut self,
         db: &mut DbIndex,
@@ -1507,19 +1544,25 @@ impl Engine {
         drop(snapshot);
         drop(running);
         let committing = crate::profile::PhaseGuard::new("superstep: commit");
-        let mut unrun = Vec::new();
+        let mut carried = Vec::new();
         let mut started = Vec::with_capacity(outcomes.len());
-        for (plan, outcome) in plans.iter().zip(outcomes) {
-            let ran = outcome.as_ref().map_or(0, |outcome| outcome.groups.len());
-            for group in &plan.groups[..ran] {
-                self.commit_group(db, plan.file_id, group);
+        for (plan, outcome) in plans.into_iter().zip(outcomes) {
+            let TaskPlan {
+                file_id,
+                mut groups,
+            } = plan;
+            let unrun =
+                groups.split_off(outcome.as_ref().map_or(0, |outcome| outcome.groups.len()));
+            for group in &groups {
+                self.commit_group(db, file_id, group);
             }
-            unrun.extend(
-                plan.groups[ran..]
-                    .iter()
-                    .flat_map(|group| group.entries.iter().copied()),
-            );
-            started.extend(outcome.map(|outcome| (plan.file_id, outcome)));
+            if !unrun.is_empty() {
+                carried.push(TaskPlan {
+                    file_id,
+                    groups: unrun,
+                });
+            }
+            started.extend(outcome.map(|outcome| (file_id, outcome)));
         }
         self.stats.superstep_tasks += started.len();
         drop(committing);
@@ -1704,7 +1747,22 @@ impl Engine {
             self.file_queries(db);
             self.step(db, recipe, slice, id, Reason::Changed);
         }
-        for (id, reason) in unrun {
+        self.carried = carried;
+    }
+
+    /// Queues again every entry the carried groups took.
+    fn requeue_carried(&mut self) {
+        let carried = std::mem::take(&mut self.carried);
+        self.requeue(carried);
+    }
+
+    /// Queues again every entry `plans`' groups took.
+    fn requeue(&mut self, plans: Vec<TaskPlan>) {
+        for (id, reason) in plans
+            .into_iter()
+            .flat_map(|plan| plan.groups)
+            .flat_map(|group| group.entries)
+        {
             self.worklist.insert(id, reason);
         }
     }
@@ -5114,12 +5172,25 @@ function holder.receiver:Use() end
         queued
     }
 
+    /// Every entry the carried groups took.
+    fn carried_reasons(engine: &Engine) -> Vec<(DerivationId, Reason)> {
+        let mut carried = engine
+            .carried
+            .iter()
+            .flat_map(|plan| &plan.groups)
+            .flat_map(|group| group.entries.iter().copied())
+            .collect::<Vec<_>>();
+        carried.sort();
+        carried
+    }
+
     /// What a cold build of the relays did in its first worker superstep, run
     /// in `slice`, and once every later one, each in `slice` too, and a whole
     /// run settled it.
     struct RelayRun {
         evaluated_first: usize,
         queued_after_first: Vec<(DerivationId, Reason)>,
+        carried_after_first: Vec<(DerivationId, Reason)>,
         supersteps: usize,
         digest: Vec<String>,
     }
@@ -5138,13 +5209,15 @@ function holder.receiver:Use() end
         engine.superstep_on_workers(db, &recipe, slice);
         let evaluated_first = engine.stats.evaluations(DerivationKind::LocalStat);
         let queued_after_first = queued_reasons(&engine);
-        while !engine.worklist.is_empty() {
+        let carried_after_first = carried_reasons(&engine);
+        while !engine.worklist.is_empty() || !engine.carried.is_empty() {
             engine.superstep_on_workers(db, &recipe, slice);
         }
         assert!(engine.run(db, &recipe, Slice::Whole));
         RelayRun {
             evaluated_first,
             queued_after_first,
+            carried_after_first,
             supersteps: engine.stats.supersteps,
             digest: relay_digest(&mut ws),
         }
@@ -5185,7 +5258,8 @@ function holder.receiver:Use() end
 
         assert_eq!(whole.evaluated_first, 7);
         assert_eq!(stopped.evaluated_first, 1);
-        assert_eq!(stopped.queued_after_first, relays_changed());
+        assert_eq!(stopped.queued_after_first, []);
+        assert_eq!(stopped.carried_after_first, relays_changed());
         assert!(
             stopped.supersteps > whole.supersteps,
             "stopped {} whole {}",
@@ -5208,7 +5282,7 @@ function holder.receiver:Use() end
 
         assert_eq!(interrupted_whole.evaluated_first, 7);
         assert_eq!(interrupted.evaluated_first, 1);
-        assert_eq!(interrupted.queued_after_first, relays_changed());
+        assert_eq!(interrupted.carried_after_first, relays_changed());
         assert_eq!(interrupted_whole.digest, whole.digest);
         assert_eq!(interrupted.digest, whole.digest);
     }
@@ -5216,9 +5290,9 @@ function holder.receiver:Use() end
     /// Settles the relays, moves the source's fact from outside so every
     /// reader is queued to check it, marks two of them changed, one of them
     /// grouped with a reader in its file, and runs the first superstep in
-    /// `slice`. Returns what that left queued, how many supersteps settling
-    /// it took and the settled digest.
-    fn relay_rerun(slice: Slice) -> (Vec<(DerivationId, Reason)>, usize, Vec<String>) {
+    /// `slice`. Returns what that left queued and carried, how many
+    /// supersteps settling it took and the settled digest.
+    fn relay_rerun(slice: Slice) -> RelayRerun {
         let (mut ws, recipe, files, statements) = relay_workspace();
         let db = ws.get_db_mut();
         let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
@@ -5238,23 +5312,32 @@ function holder.receiver:Use() end
         engine.open(db);
         engine.superstep_on_workers(db, &recipe, slice);
         let queued = queued_reasons(&engine);
+        let carried = carried_reasons(&engine);
+        let settling = files
+            .iter()
+            .filter(|file_id| engine.is_settling(**file_id))
+            .copied()
+            .collect();
         assert!(engine.run(db, &recipe, Slice::Whole));
-        (
+        RelayRerun {
             queued,
-            engine.stats.supersteps - settled,
-            relay_digest(&mut ws),
-        )
+            carried,
+            settling,
+            supersteps: engine.stats.supersteps - settled,
+            digest: relay_digest(&mut ws),
+        }
     }
 
-    #[test]
-    fn a_stopped_worker_superstep_queues_again_every_entry_its_unrun_groups_took() {
-        let (whole, stopped) = with_one_thread(|| {
-            (
-                relay_rerun(Slice::Whole),
-                relay_rerun(Slice::Until(std::time::Instant::now())),
-            )
-        });
-        let (_, _, files, _) = relay_workspace();
+    struct RelayRerun {
+        queued: Vec<(DerivationId, Reason)>,
+        carried: Vec<(DerivationId, Reason)>,
+        settling: Vec<FileId>,
+        supersteps: usize,
+        digest: Vec<String>,
+    }
+
+    /// The groups the first superstep left unrun, with the entries each took.
+    fn relay_unrun(files: &[FileId]) -> Vec<(DerivationId, Reason)> {
         let mut unrun = vec![
             (relay_statement(files[2], RELAY), Reason::Read),
             (relay_statement(files[2], RELAY_PAIRED), Reason::Changed),
@@ -5263,15 +5346,84 @@ function holder.receiver:Use() end
             (relay_statement(files[5], RELAY), Reason::Read),
         ];
         unrun.sort();
+        unrun
+    }
 
-        assert_eq!(whole.0, []);
-        assert_eq!(stopped.0, unrun);
+    #[test]
+    fn a_stopped_worker_superstep_carries_its_unrun_groups_and_settles_as_a_whole_one() {
+        let (whole, stopped) = with_one_thread(|| {
+            (
+                relay_rerun(Slice::Whole),
+                relay_rerun(Slice::Until(std::time::Instant::now())),
+            )
+        });
+        let (_, _, files, _) = relay_workspace();
+
+        assert_eq!((whole.queued, whole.carried), (vec![], vec![]));
+        assert_eq!(stopped.queued, []);
+        assert_eq!(stopped.carried, relay_unrun(&files));
+        assert_eq!(stopped.settling, files[2..].to_vec());
         assert!(
-            stopped.1 > whole.1,
+            stopped.supersteps > whole.supersteps,
             "stopped {} whole {}",
-            stopped.1,
-            whole.1
+            stopped.supersteps,
+            whole.supersteps
         );
-        assert_eq!(stopped.2, whole.2);
+        assert_eq!(stopped.digest, whole.digest);
+    }
+
+    /// Stops the relays' first superstep after its first group, then does
+    /// `between` before settling them whole. Returns what was queued and how
+    /// many files had groups carried after `between`, and the settled digest.
+    fn relay_carried_then(
+        between: impl FnOnce(&mut Engine, &[FileId]),
+    ) -> (Vec<(DerivationId, Reason)>, usize, Vec<String>) {
+        let (mut ws, recipe, files, statements) = relay_workspace();
+        let db = ws.get_db_mut();
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        for id in &statements {
+            engine.changed(*id);
+        }
+        engine.open(db);
+        engine.superstep_on_workers(db, &recipe, Slice::Until(std::time::Instant::now()));
+        assert_eq!(carried_reasons(&engine), relays_changed());
+        between(&mut engine, &files);
+        let queued = queued_reasons(&engine);
+        let carried = engine.carried.len();
+        assert!(engine.run(db, &recipe, Slice::Whole));
+        assert!(engine.carried.is_empty());
+        (queued, carried, relay_digest(&mut ws))
+    }
+
+    #[test]
+    fn carried_groups_are_queued_again_when_the_focus_or_the_files_change_or_the_stage_goes_serial()
+    {
+        let (whole, prioritised, replaced, serial) = with_one_thread(|| {
+            (
+                relay_run(Slice::Whole, false).digest,
+                relay_carried_then(|engine, files| engine.prioritise(&files[1..2])),
+                relay_carried_then(|engine, files| engine.replacing(&files[5..])),
+                relay_carried_then(|engine, _| engine.serial_stage = true),
+            )
+        });
+        let (_, _, files, _) = relay_workspace();
+        let changed_in = |keep: &dyn Fn(FileId) -> bool| {
+            relays_changed()
+                .into_iter()
+                .filter(|(id, _)| keep(id.file_id))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            (prioritised.0, prioritised.1),
+            (changed_in(&|file_id| file_id == files[1]), 0)
+        );
+        assert_eq!(prioritised.2, whole);
+        assert_eq!(
+            (replaced.0, replaced.1),
+            (changed_in(&|file_id| file_id != files[5]), 0)
+        );
+        assert_eq!((serial.0, serial.1), (vec![], 5));
+        assert_eq!(serial.2, whole);
     }
 }
