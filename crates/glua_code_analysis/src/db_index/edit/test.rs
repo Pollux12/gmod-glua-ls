@@ -1347,6 +1347,10 @@ ShiftCounts = {}
 for i = 1, 10 do ShiftCounts[i] = i * 2 end
 local mode = "fast"
 ShiftMode = mode
+local claimed
+claimed = ShiftCounts[1]
+claimed = ShiftMode
+ShiftClaimed = claimed
 ---@class ShiftTrace
 ---@field Entity table
 ---@param trace ShiftTrace
