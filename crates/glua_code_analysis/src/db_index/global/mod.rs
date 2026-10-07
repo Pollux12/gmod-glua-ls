@@ -100,15 +100,21 @@ impl LuaGlobalIndex {
     }
 
     pub fn get_all_global_decl_ids(&self) -> Vec<LuaDeclId> {
+        self.get_global_decl_ids_matching(|_| true)
+    }
+
+    /// The declarations of the globals whose names `matches` accepts, in the
+    /// order of [`Self::get_all_global_decl_ids`].
+    pub fn get_global_decl_ids_matching(&self, matches: impl Fn(&str) -> bool) -> Vec<LuaDeclId> {
         derivation::note_read(|| FactKey::GlobalScan);
         // `global_decl` is a `FxHashMap`, so its iteration order is not stable
         // across index states; sort so callers see the same sequence whatever
         // order the globals were discovered in.
         let mut decls = self
             .global_decl
-            .values()
-            .flatten()
-            .copied()
+            .iter()
+            .filter(|(name, _)| matches(name.get_name()))
+            .flat_map(|(_, decl_ids)| decl_ids.iter().copied())
             .collect::<Vec<_>>();
         decls.sort_unstable_by(|a, b| {
             decl_sort_key(&self.file_order, *a).cmp(&decl_sort_key(&self.file_order, *b))
