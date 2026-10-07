@@ -433,7 +433,8 @@ pub enum FactKey {
     DiagnosticFile(FileId),
     /// A file's text and syntax tree.
     FileText(FileId),
-    /// One top-level statement of a file, by its range: its kind and text.
+    /// One statement of a file, by its range: its kind and text, and the kind
+    /// and range of every node between it and the top-level block.
     Syntax(InFiled<TextRange>),
     /// The set of files in the workspace.
     FileSet,

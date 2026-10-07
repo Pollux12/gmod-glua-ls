@@ -2063,13 +2063,13 @@ pub(in crate::compilation::analyzer) fn is_guarded_table_assignment_member(
         .is_some()
 }
 
-/// The node that wrote `member_id`. The checks that ask look only at it and
-/// its ancestors, so only the statement holding it is read.
+/// The node that wrote `member_id`. The checks that ask look only at it, the
+/// statement holding it and the kinds of its ancestors, so only that is read.
 fn member_write_node(db: &DbIndex, member_id: LuaMemberId) -> Option<glua_parser::LuaSyntaxNode> {
     let syntax_id = member_id.get_syntax_id();
     let tree = db
         .get_vfs()
-        .syntax_tree_around(&member_id.file_id, syntax_id.get_range())?;
+        .syntax_tree_at_statement(&member_id.file_id, syntax_id.get_range())?;
     syntax_id.to_node_from_root(&tree.get_red_root())
 }
 

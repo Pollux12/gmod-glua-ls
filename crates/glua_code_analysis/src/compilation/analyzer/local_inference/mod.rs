@@ -253,7 +253,7 @@ fn stores_guessed_local(db: &crate::DbIndex, writer: crate::LuaMemberId) -> bool
     let syntax_id = writer.get_syntax_id();
     let Some(index_expr) = db
         .get_vfs()
-        .syntax_tree_around(&writer.file_id, syntax_id.get_range())
+        .syntax_tree_at_statement(&writer.file_id, syntax_id.get_range())
         .and_then(|tree| syntax_id.to_node_from_root(&tree.get_red_root()))
         .and_then(LuaIndexExpr::cast)
     else {

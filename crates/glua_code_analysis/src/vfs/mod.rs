@@ -12,7 +12,8 @@ pub use file_id::{FileId, InFiled};
 pub use file_renames::FileRenames;
 pub use file_uri_handler::{file_path_to_uri, uri_to_file_path};
 use glua_parser::{
-    LineIndex, LuaAstNode, LuaParseError, LuaParser, LuaSyntaxNode, LuaSyntaxTree, LuaTokenKind,
+    LineIndex, LuaAstNode, LuaParseError, LuaParser, LuaStat, LuaSyntaxNode, LuaSyntaxTree,
+    LuaTokenKind,
 };
 pub(crate) use loader::normalize_path_for_ordering;
 pub use loader::{LuaFileInfo, load_workspace_files, read_file_with_encoding};
@@ -63,6 +64,22 @@ fn top_level_statement(tree: &LuaSyntaxTree, range: TextRange) -> Option<LuaSynt
         .syntax()
         .child_or_token_at_range(range)?
         .into_node()
+}
+
+/// The innermost statement of `tree` that contains `range`, or the child of
+/// the top-level block that does when no statement does, such as a comment.
+fn statement_around(tree: &LuaSyntaxTree, range: TextRange) -> Option<LuaSyntaxNode> {
+    let root = tree.get_red_root();
+    if !root.text_range().contains_range(range) {
+        return None;
+    }
+    let node = match root.covering_element(range) {
+        rowan::NodeOrToken::Node(node) => node,
+        rowan::NodeOrToken::Token(token) => token.parent()?,
+    };
+    node.ancestors()
+        .find(|node| LuaStat::can_cast(node.kind().into()))
+        .or_else(|| top_level_statement(tree, range))
 }
 
 fn trees_semantically_equal(left: &LuaSyntaxTree, right: &LuaSyntaxTree) -> bool {
@@ -521,9 +538,30 @@ impl Vfs {
     /// statement containing `range`: that statement is what it reads, not the
     /// whole file, so edits elsewhere in the file leave the read standing.
     pub fn syntax_tree_around(&self, id: &FileId, range: TextRange) -> Option<&LuaSyntaxTree> {
+        self.syntax_tree_reading(id, range, top_level_statement)
+    }
+
+    /// `id`'s syntax tree, for a caller that inspects only the innermost
+    /// statement containing `range` and the kinds and ranges of the nodes
+    /// around it: edits elsewhere in the statements enclosing it leave the
+    /// read standing.
+    pub fn syntax_tree_at_statement(
+        &self,
+        id: &FileId,
+        range: TextRange,
+    ) -> Option<&LuaSyntaxTree> {
+        self.syntax_tree_reading(id, range, statement_around)
+    }
+
+    fn syntax_tree_reading(
+        &self,
+        id: &FileId,
+        range: TextRange,
+        statement: fn(&LuaSyntaxTree, TextRange) -> Option<LuaSyntaxNode>,
+    ) -> Option<&LuaSyntaxTree> {
         let tree = self.tree_map.get(id)?;
         if crate::db_index::derivation::recording() {
-            match top_level_statement(tree, range) {
+            match statement(tree, range) {
                 Some(statement) => {
                     crate::db_index::derivation::note_syntax_read(*id, statement.text_range())
                 }
@@ -533,8 +571,10 @@ impl Vfs {
         Some(tree)
     }
 
-    /// The fingerprint of the top-level statement at `site`, for
-    /// [`FactKey::Syntax`](crate::db_index::derivation::FactKey::Syntax).
+    /// The fingerprint of the statement at `site`, for
+    /// [`FactKey::Syntax`](crate::db_index::derivation::FactKey::Syntax): its
+    /// kind and text, and the kind and range of every node between it and the
+    /// top-level block.
     pub(crate) fn statement_fingerprint(
         &self,
         site: &InFiled<TextRange>,
@@ -542,7 +582,7 @@ impl Vfs {
         let statement = self
             .tree_map
             .get(&site.file_id)
-            .and_then(|tree| top_level_statement(tree, site.value))
+            .and_then(|tree| statement_around(tree, site.value))
             .filter(|statement| statement.text_range() == site.value)
             .and_then(|statement| {
                 let content = &self
@@ -551,7 +591,13 @@ impl Vfs {
                     .as_ref()?
                     .content;
                 let text = content.get(std::ops::Range::<usize>::from(site.value))?;
-                Some((site, statement.kind(), text))
+                let context = statement
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|node| node.parent().and_then(|parent| parent.parent()).is_some())
+                    .map(|node| (node.kind(), InFiled::new(site.file_id, node.text_range())))
+                    .collect::<Vec<_>>();
+                Some((site, statement.kind(), text, context))
             });
         crate::db_index::derivation::fingerprint_opt(statement.as_ref())
     }

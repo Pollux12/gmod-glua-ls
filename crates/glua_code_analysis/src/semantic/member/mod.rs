@@ -1471,7 +1471,7 @@ fn dynamic_field_definition_syntax_uncached(
     let mut syntax = DynamicFieldDefinitionSyntax::default();
     let file_id = definition.file_id;
     let range = definition.value;
-    let Some(tree) = db.get_vfs().syntax_tree_around(&file_id, range) else {
+    let Some(tree) = db.get_vfs().syntax_tree_at_statement(&file_id, range) else {
         return syntax;
     };
     let root = tree.get_red_root();
