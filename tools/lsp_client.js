@@ -23,8 +23,16 @@ class LspClient {
         // makes those numbers reachable instead of dropping them on the floor.
         const stderrPath = process.env.LSP_SERVER_STDERR;
         if (stderrPath) fs.writeFileSync(stderrPath, '');
+        // LSP_SERVER_STDERR_STAMP=1 prefixes each line with the epoch ms it arrived at.
+        const stamp = process.env.LSP_SERVER_STDERR_STAMP === '1';
+        let partial = '';
         proc.stderr.on('data', (chunk) => {
-            if (stderrPath) fs.appendFileSync(stderrPath, chunk);
+            if (!stderrPath) return;
+            if (!stamp) return fs.appendFileSync(stderrPath, chunk);
+            const lines = (partial + chunk).split('\n');
+            partial = lines.pop();
+            const at = Date.now();
+            if (lines.length) fs.appendFileSync(stderrPath, lines.map((line) => `${at} ${line}\n`).join(''));
         });
     }
 
