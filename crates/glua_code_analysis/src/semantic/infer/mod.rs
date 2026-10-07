@@ -491,7 +491,7 @@ where
     Ok(value_types)
 }
 
-/// 推断值已经绑定的类型(不是推断值的类型). 例如从右值推断左值类型, 从调用参数推断函数参数类型参数类型
+/// Infers the type a value is already bound to (not the type of the value itself). For example, inferring the left value type from the right value, or the function parameter type from call arguments
 /// Whether the local `target` names was declared as a copy of the variable
 /// `expr` reads (`local value = argument` ... `value = argument`): what it holds
 /// then came from that variable, so storing the variable back into it is the
@@ -554,7 +554,7 @@ pub fn infer_bind_value_type(
                         if let LuaVarExpr::IndexExpr(index_expr) = var {
                             let prefix_expr = index_expr.get_prefix_expr()?;
                             let prefix_type = infer_expr(db, cache, prefix_expr).ok()?;
-                            // 如果前缀类型是定义类型, 则不认为存在左值绑定
+                            // If the prefix type is a definition type, there is no left-value binding
                             if let LuaType::Def(_) = prefix_type {
                                 return None;
                             }
@@ -602,7 +602,7 @@ pub fn infer_bind_value_type(
         }
         LuaAst::LuaCallArgList(call_arg_list) => {
             let call_expr = call_arg_list.get_parent::<LuaCallExpr>()?;
-            // 获取调用位置
+            // Get the call position
             let mut param_pos = 0;
             for (idx, arg) in call_arg_list.get_args().enumerate() {
                 if arg == expr {

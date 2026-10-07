@@ -663,12 +663,12 @@ impl LuaIndex for LuaPropertyIndex {
     }
 }
 
-/// 尝试从 @field 定义中提取函数类型的位置信息
+/// Tries to extract the position of a function type from a @field definition
 pub fn try_extract_signature_id_from_field(
     db: &DbIndex,
     member: &LuaMember,
 ) -> Option<LuaSignatureId> {
-    // 检查是否是 field 定义
+    // Check whether it is a field definition
     if !member.is_field() {
         return None;
     }
@@ -679,10 +679,10 @@ pub fn try_extract_signature_id_from_field(
         .get_red_root();
     let field_node = member.get_syntax_id().to_node_from_root(&root)?;
 
-    // 尝试转换为 LuaDocTagField
+    // Try converting to LuaDocTagField
     let field_tag = LuaDocTagField::cast(field_node)?;
 
-    // 获取类型定义
+    // Get the type definition
     let type_node = field_tag.get_type()?;
 
     match &type_node {

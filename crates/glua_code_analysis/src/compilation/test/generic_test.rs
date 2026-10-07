@@ -832,7 +832,7 @@ mod test {
             let result_ty = ws.expr_ty("result");
             assert_eq!(result_ty, ws.ty("number"));
         }
-        // 类的默认泛型约束暂时不支持
+        // Default generic constraints on classes are not supported yet
         // {
         //     ws.def(
         //         r#"

@@ -104,7 +104,7 @@ fn find_enum_origin(
     }
 }
 
-/// 解析 require 调用表达式并获取模块信息
+/// Parses a require call expression and gets the module info
 pub fn parse_require_module_info<'a>(
     semantic_model: &'a SemanticModel,
     decl: &LuaDecl,

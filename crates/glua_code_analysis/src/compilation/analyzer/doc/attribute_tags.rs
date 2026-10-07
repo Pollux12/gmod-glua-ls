@@ -181,7 +181,7 @@ fn infer_attribute_arg_type(expr: LuaLiteralExpr) -> LuaType {
     LuaType::Unknown
 }
 
-/// 寻找特性的所有者
+/// Finds the owner of an attribute
 fn attribute_use_get_owner(
     analyzer: &mut DocAnalyzer,
     attribute_use: &LuaDocTagAttributeUse,
@@ -242,7 +242,7 @@ fn find_up_attribute(
                         }
                     }
                 }
-                // 某些情况下我们需要以 --- 为分割中断寻找
+                // In some cases the search must stop at a --- separator
                 LuaKind::Token(LuaTokenKind::TkDocContinue) => {
                     if stop_by_continue {
                         return None;

@@ -1074,7 +1074,7 @@ fn get_closure_expr_comment(closure_expr: &LuaClosureExpr) -> Option<LuaComment>
     }
 }
 
-/// 获取属于自身的返回语句
+/// Gets the return statements that belong to the node itself
 pub fn get_return_stats(closure_expr: &LuaClosureExpr) -> impl Iterator<Item = LuaReturnStat> + '_ {
     closure_expr
         .descendants::<LuaReturnStat>()
@@ -1087,7 +1087,7 @@ pub fn get_return_stats(closure_expr: &LuaClosureExpr) -> impl Iterator<Item = L
 
 pub fn humanize_lint_type(db: &DbIndex, typ: &LuaType) -> String {
     match typ {
-        // TODO: 应该仅去掉命名空间
+        // TODO: should only strip the namespace
         // LuaType::Ref(type_decl_id) => type_decl_id.get_simple_name().to_string(),
         // LuaType::Generic(generic_type) => generic_type
         //     .get_base_type_id()

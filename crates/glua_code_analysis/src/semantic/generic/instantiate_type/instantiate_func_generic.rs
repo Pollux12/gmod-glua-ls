@@ -419,10 +419,10 @@ pub fn instantiate_func_generic_with_bindings(
         context.substitutor.add_need_infer_tpls(generic_tpls);
 
         if let Some(type_list) = call_expr.get_call_generic_type_list() {
-            // 如果使用了`obj:abc--[[@<string>]]("abc")`强制指定了泛型, 那么我们只需要直接应用
+            // If the generic was forced with `obj:abc--[[@<string>]]("abc")`, apply it directly
             apply_call_generic_type_list(db, file_id, &mut context, &type_list);
         } else {
-            // 如果没有指定泛型, 则需要从调用参数中推断
+            // If no generic is specified, infer it from the call arguments
             infer_generic_types_from_call(
                 db,
                 &mut context,
@@ -631,7 +631,7 @@ fn infer_generic_types_from_call(
         if !func_param_type.is_variadic()
             && check_expr_can_later_infer(context, func_param_type, call_arg_expr)?
         {
-            // 如果参数不能被后续推断, 那么我们先不处理
+            // If the parameter cannot be inferred later, do not handle it for now
             unresolve_tpls.push((func_param_type.clone(), call_arg_expr.clone()));
             continue;
         }

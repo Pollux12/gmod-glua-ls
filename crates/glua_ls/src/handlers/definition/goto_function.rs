@@ -58,8 +58,8 @@ pub fn find_matching_function_definitions(
                     has_match = true;
                 }
 
-                // 无论是否匹配, 都需要将真实的定义添加到结果中
-                // 如果存在原始定义, 则优先使用原始定义
+                // Whether or not it matches, the real definition must be added to the result
+                // If an original definition exists, prefer it
                 let origin = extract_semantic_decl_from_signature(compilation, &signature_id);
                 if let Some(origin) = origin {
                     result.insert(0, origin);
@@ -151,7 +151,7 @@ fn handle_signature_match(
     }
 }
 
-/// 从函数签名中提取其定义的语义ID
+/// Extracts the semantic ID of the definition from a function signature
 pub fn extract_semantic_decl_from_signature(
     compilation: &LuaCompilation,
     signature_id: &LuaSignatureId,
@@ -175,7 +175,7 @@ pub fn extract_semantic_decl_from_signature(
     semantic_model.find_decl(NodeOrToken::Token(token), SemanticDeclLevel::default())
 }
 
-/// 获取最匹配的函数(并不能确保完全匹配)
+/// Gets the best-matching function (a full match is not guaranteed)
 fn get_call_function(
     semantic_model: &SemanticModel,
     call_expr: &LuaCallExpr,
@@ -209,7 +209,7 @@ fn check_params_count_is_match(
         }
     }
     if call_args_count < fake_params.len() {
-        // 调用参数包含 `...`
+        // The call arguments contain `...`
         for arg in call_args.iter() {
             if let LuaExpr::LiteralExpr(literal_expr) = arg
                 && let Some(literal_token) = literal_expr.get_literal()
@@ -218,7 +218,7 @@ fn check_params_count_is_match(
                 return Some(true);
             }
         }
-        // 对调用参数的最后一个参数进行特殊处理
+        // Special handling for the last call argument
         if let Some(last_arg) = call_args.last()
             && let Ok(LuaType::Variadic(variadic)) = semantic_model.infer_expr(last_arg.clone())
         {
@@ -248,7 +248,7 @@ fn check_params_count_is_match(
             }
         }
     } else if call_args_count > fake_params.len() {
-        // 参数定义中最后一个参数是 `...`
+        // The last parameter in the definition is `...`
         if fake_params.last().is_some_and(|(name, typ)| {
             name == "..."
                 || if let Some(typ) = typ {
@@ -283,7 +283,7 @@ fn get_signature_functions(signature: &LuaSignature) -> Vec<Arc<LuaFunctionType>
     functions
 }
 
-/// 比较函数类型是否匹配, 会处理泛型情况
+/// Compares whether function types match, handling generics
 pub fn compare_function_types(
     semantic_model: &SemanticModel,
     call_function: &LuaFunctionType,

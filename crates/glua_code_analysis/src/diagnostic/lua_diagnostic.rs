@@ -297,7 +297,7 @@ impl LuaDiagnostic {
         self.workspace_configs = configs.into_iter().collect();
     }
 
-    // 只开启指定的诊断
+    // Only enable the given diagnostic
     pub fn enable_only(&mut self, code: DiagnosticCode) {
         let mut emmyrc = Emmyrc::default();
         emmyrc.diagnostics.enables.push(code);

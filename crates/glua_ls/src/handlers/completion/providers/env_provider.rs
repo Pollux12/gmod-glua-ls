@@ -23,7 +23,7 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
         LuaAst::LuaBlock(_) => {}
         LuaAst::LuaClosureExpr(_) => {}
         LuaAst::LuaCallArgList(_) => {}
-        // 字符串中触发的补全
+        // Completion triggered inside a string
         LuaAst::LuaLiteralExpr(_) => return None,
         _ => return None,
     };
@@ -65,7 +65,7 @@ fn check_can_add_completion(builder: &CompletionBuilder) -> Option<()> {
             }
         }
 
-        // 即时是主动触发, 也不允许在函数定义的参数列表中添加
+        // Even when triggered explicitly, adding is not allowed in a function definition's parameter list
         if trigger_text == "(" && LuaParamList::can_cast(parent.kind().into()) {
             return None;
         }
@@ -126,7 +126,7 @@ fn add_local_env(
         if builder.is_cancelled() {
             return None;
         }
-        // 获取变量名和类型
+        // Get the variable name and type
         let (name, typ) = {
             let decl = builder
                 .semantic_model
@@ -156,7 +156,7 @@ fn add_local_env(
 
         // let flow_id = LuaClosureId::from_node(node.syntax());
         // let var_ref_id = LuaVarRefId::DeclId(*decl_id);
-        // // 类型缩窄
+        // // Type narrowing
         // if let Some(chain) = builder
         //     .semantic_model
         //     .get_db()
@@ -219,7 +219,7 @@ pub fn add_global_env(
             duplicated_name.insert(name.clone());
             continue;
         }
-        // 如果范围相同, 则是在定义一个新的全局变量, 不需要添加
+        // If the ranges are the same, a new global variable is being defined and need not be added
         if decl.get_range() == builder.trigger_token.text_range() {
             continue;
         }
@@ -232,13 +232,13 @@ pub fn add_global_env(
 }
 
 fn env_check_match_word(trigger_text: &str, name: &str) -> bool {
-    // 如果首字母是`(`或者`,`则允许, 用于在函数参数调用处触发补全
+    // Allowed if the first character is `(` or `,`, used to trigger completion at function call arguments
     if matches!(trigger_text.chars().next(), Some('(') | Some(',')) {
         return true;
     }
 
     if check_match_word(trigger_text, name) {
-        // 如果首字母匹配, 则需要检查 trigger_text 的每个字符是否都存在于 name 中
+        // If the first letter matches, check that every character of trigger_text exists in name
 
         return true;
     }

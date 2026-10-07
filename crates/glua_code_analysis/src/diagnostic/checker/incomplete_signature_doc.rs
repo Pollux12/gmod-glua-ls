@@ -86,7 +86,7 @@ fn check_doc(
         .map(|return_doc| return_doc.get_types().count())
         .sum();
 
-    // 如果文档中没有参数和返回值注解, 且不是全局函数, 则不检查
+    // Skip the check if the doc has no parameter or return annotations and the function is not global
     if doc_param_names.is_empty() && doc_return_len == 0 && !is_global {
         return Some(());
     }

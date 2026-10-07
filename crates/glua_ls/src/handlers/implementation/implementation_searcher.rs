@@ -189,7 +189,7 @@ pub fn search_member_implementations(
             let document = reference_semantic_model.get_document();
             let range = in_filed_syntax_id.value.get_range();
             let location = document.to_lsp_location(range)?;
-            // 由于允许函数声明重载, 所以需要将签名放在前面
+            // Function declarations may be overloaded, so the signature goes first
             if is_signature {
                 result.insert(0, location);
             } else {
@@ -200,7 +200,7 @@ pub fn search_member_implementations(
     Some(())
 }
 
-/// 检查成员引用是否符合实现
+/// Checks whether a member reference conforms to the implementation
 fn check_member_reference(semantic_model: &SemanticModel, node: LuaSyntaxNode) -> Option<bool> {
     match &node {
         expr_node if LuaIndexExpr::can_cast(expr_node.kind().into()) => {
@@ -214,14 +214,14 @@ fn check_member_reference(semantic_model: &SemanticModel, node: LuaSyntaxNode) -
             {
                 is_signature = true;
             }
-            // 往上寻找 stat 节点
+            // Look upwards for the stat node
             let stat = expr.ancestors::<LuaStat>().next()?;
             match stat {
                 LuaStat::FuncStat(_) => {
                     return Some(is_signature);
                 }
                 LuaStat::AssignStat(assign_stat) => {
-                    // 判断是否在左侧
+                    // Determine whether it is on the left side
                     let (vars, _) = assign_stat.get_var_and_expr_list();
                     for var in vars {
                         if var

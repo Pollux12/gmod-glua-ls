@@ -30,7 +30,7 @@ pub fn hover_const_type(db: &DbIndex, typ: &LuaType, render_level: RenderLevel) 
 pub fn hover_humanize_type(
     builder: &mut HoverBuilder,
     ty: &LuaType,
-    fallback_level: Option<RenderLevel>, // 当有值时, 若获取类型描述为空会回退到使用`humanize_type()`
+    fallback_level: Option<RenderLevel>, // When set, falls back to `humanize_type()` if the type description is empty
 ) -> String {
     let db = builder.semantic_model.get_db();
     match ty {
@@ -159,7 +159,7 @@ fn hover_multi_line_union_type(
     type_name
 }
 
-/// 推断前缀是否为全局定义, 如果是, 则返回全局名称, 否则返回 None
+/// Infers whether the prefix is a global definition; if so returns the global name, otherwise None
 pub fn infer_prefix_global_name<'a>(
     semantic_model: &'a SemanticModel,
     member: &LuaMember,
@@ -192,7 +192,7 @@ pub fn infer_prefix_global_name<'a>(
     None
 }
 
-/// 描述信息结构体
+/// Description info struct
 #[derive(Debug, Clone)]
 pub struct DescriptionInfo {
     pub description: Option<String>,
@@ -221,7 +221,7 @@ impl DescriptionInfo {
     }
 }
 
-/// 从属性所有者获取描述信息
+/// Gets the description info from the attribute owner
 pub fn extract_description_from_property_owner(
     semantic_model: &SemanticModel,
     property_owner: &LuaSemanticDeclId,
@@ -387,7 +387,7 @@ fn realm_from_doc_tag(tag: &LuaDocTagRealm) -> Option<GmodRealm> {
     }
 }
 
-/// 从 element_id 中提取所有者名称
+/// Extracts the owner name from element_id
 pub fn extract_owner_name_from_element(
     semantic_model: &SemanticModel,
     element_id: &InFiled<TextRange>,
@@ -398,7 +398,7 @@ pub fn extract_owner_name_from_element(
         .get_syntax_tree(&element_id.file_id)?
         .get_red_root();
 
-    // 通过 TextRange 找到对应的 AST 节点
+    // Find the corresponding AST node through the TextRange
     let node = LuaSyntaxId::to_node_at_range(&root, element_id.value)?;
     let stat = LuaStat::cast(node.clone().parent()?)?;
     match stat {

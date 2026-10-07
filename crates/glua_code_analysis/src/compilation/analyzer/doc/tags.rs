@@ -121,7 +121,7 @@ pub fn analyze_tag(analyzer: &mut DocAnalyzer, tag: LuaDocTag) -> Option<()> {
         LuaDocTag::Readonly(readonly) => {
             analyze_readonly(analyzer, readonly)?;
         }
-        // 属性使用, 与 ---@tag 的语法不同
+        // Attribute usage; its syntax differs from ---@tag
         LuaDocTag::AttributeUse(attribute_use) => {
             analyze_tag_attribute_use(analyzer, attribute_use)?;
         }

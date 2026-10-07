@@ -8,7 +8,7 @@ use crate::{
     infer_doc_type,
 };
 
-// 泛型约束上下文
+// Generic constraint context
 pub struct CallConstraintContext {
     pub params: Vec<(String, Option<LuaType>)>,
     pub arg_infos: Vec<LuaType>,
@@ -25,7 +25,7 @@ pub fn build_call_constraint_context(
 
     let mut substitutor = TypeSubstitutor::new();
 
-    // 读取显式传入的泛型实参
+    // Read the explicitly passed generic arguments
     if let Some(type_list) = call_expr.get_call_generic_type_list() {
         let doc_ctx =
             DocTypeInferContext::new(semantic_model.get_db(), semantic_model.get_file_id());
@@ -35,7 +35,7 @@ pub fn build_call_constraint_context(
         }
     }
 
-    // 处理冒号调用与函数定义在 self 参数上的差异
+    // Handle the difference between colon calls and function definitions on the self parameter
     match (call_expr.is_colon_call(), doc_func.is_colon_define()) {
         (true, true) | (false, false) => {}
         (false, true) => {
@@ -58,7 +58,7 @@ pub fn build_call_constraint_context(
     ))
 }
 
-// 将推导结果转换为更易比较的形式
+// Convert the inference result into a form that is easier to compare
 pub fn normalize_constraint_type(db: &DbIndex, ty: LuaType) -> LuaType {
     match ty {
         LuaType::Tuple(tuple) if tuple.is_infer_resolve() => tuple.cast_down_array_base(db),
@@ -70,7 +70,7 @@ pub fn normalize_constraint_type(db: &DbIndex, ty: LuaType) -> LuaType {
     }
 }
 
-// 收集各个参数对应的泛型推导
+// Collect the generic inference for each parameter
 fn collect_generic_assignments(
     substitutor: &mut TypeSubstitutor,
     params: &[(String, Option<LuaType>)],
@@ -87,7 +87,7 @@ fn collect_generic_assignments(
     }
 }
 
-// 实际写入泛型替换表
+// Actually write into the generic substitution table
 fn record_generic_assignment(
     param_type: &LuaType,
     arg_type: &LuaType,
@@ -112,7 +112,7 @@ fn record_generic_assignment(
     }
 }
 
-// 解析冒号调用时调用者的具体类型
+// Resolve the concrete type of the caller for colon calls
 fn infer_call_source_type(
     semantic_model: &SemanticModel,
     call_expr: &LuaCallExpr,
@@ -181,7 +181,7 @@ fn infer_call_source_type(
     None
 }
 
-// 推导每个实参类型
+// Infer the type of each argument
 fn get_arg_infos(semantic_model: &SemanticModel, call_expr: &LuaCallExpr) -> Option<Vec<LuaType>> {
     let arg_exprs = call_expr.get_args_list()?.get_args().collect::<Vec<_>>();
     let mut arg_infos = infer_expr_list_types(semantic_model, &arg_exprs);
@@ -292,7 +292,7 @@ fn overload_matches_call(
     true
 }
 
-// 获取约束类型
+// Get the constraint type
 fn get_constraint_type(
     semantic_model: &SemanticModel,
     arg_type: &LuaType,
@@ -356,7 +356,7 @@ fn rebuild_constraint_union(
     )
 }
 
-// 将多个表达式推导为具体类型列表
+// Infer multiple expressions into a list of concrete types
 fn infer_expr_list_types(
     semantic_model: &SemanticModel,
     exprs: &[LuaExpr],

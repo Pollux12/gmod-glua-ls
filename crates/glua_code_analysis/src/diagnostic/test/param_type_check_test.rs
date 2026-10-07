@@ -2659,7 +2659,7 @@ mod test {
             "#
         ));
 
-        // 测试泛型
+        // Test generics
         assert!(ws.check_code_for(
             DiagnosticCode::ParamTypeMismatch,
             r#"

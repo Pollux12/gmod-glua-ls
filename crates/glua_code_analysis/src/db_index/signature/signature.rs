@@ -433,7 +433,7 @@ impl LuaSignature {
             }
             match owner_type {
                 Some(owner_type) => {
-                    // 一些类型不应该被视为 method
+                    // Some types should not be treated as methods
                     if matches!(owner_type, LuaType::Ref(_) | LuaType::Def(_))
                         && first_param_may_not_self(param_type)
                     {

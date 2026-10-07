@@ -48,7 +48,7 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
         )?,
         prefix_type => prefix_type,
     };
-    // 如果是枚举类型且为函数参数, 则不进行补全
+    // No completion for an enum type used as a function parameter
     if enum_variable_is_param(
         builder.semantic_model.get_db(),
         &mut builder.semantic_model.get_cache().borrow_mut(),
@@ -354,7 +354,7 @@ fn add_completions_for_members_with_gmod_owner(
     completion_status: CompletionTriggerStatus,
     gmod_fallback_owner: Option<GmodFallbackOwner<'_>>,
 ) -> Option<()> {
-    // 排序
+    // Sort
     let mut sorted_entries: Vec<_> = members.iter().collect();
     sorted_entries.sort_unstable_by_key(|(name, _)| *name);
 
@@ -491,7 +491,7 @@ fn gmod_fallback_description_hint(
     Some(format!("from {source_owner_name}"))
 }
 
-/// 过滤成员信息，返回需要的成员列表和重载数量
+/// Filters member info, returning the needed member list and the overload count
 fn filter_member_infos<'a>(
     semantic_model: &SemanticModel,
     member_infos: &'a Vec<LuaMemberInfo>,
@@ -507,12 +507,12 @@ fn filter_member_infos<'a>(
     let mut all_doc_function = true;
     let mut overload_count = 0;
 
-    // 一次遍历收集所有信息
+    // Collect all info in a single pass
     for member_info in member_infos {
         let owner_id = get_owner_type_id(semantic_model.get_db(), member_info);
         member_with_owners.push((member_info, owner_id.clone()));
 
-        // 寻找第一个 file_decl 作为参考，如果没有则使用第一个
+        // Use the first file_decl as the reference, or the first member if there is none
         if file_decl_member.is_none()
             && let Some(feature) = member_info.feature
             && feature.is_file_decl()
@@ -528,7 +528,7 @@ fn filter_member_infos<'a>(
             gmod_meta_member = Some(member_info);
         }
 
-        // 检查是否全为 DocFunction，同时计算重载数量
+        // Check whether all are DocFunction while counting overloads
         match &member_info.typ {
             LuaType::DocFunction(_) => {
                 overload_count += 1;
@@ -546,11 +546,11 @@ fn filter_member_infos<'a>(
         }
     }
 
-    // 确定最终使用的参考 owner
+    // Determine the reference owner to use
     let final_reference_owner = if let Some(meta_member_info) = gmod_meta_member {
         get_owner_type_id(semantic_model.get_db(), meta_member_info)
     } else if let Some(file_decl_member_info) = file_decl_member {
-        // 与第一个成员进行类型检查, 确保子类成员的类型与父类成员的类型一致
+        // Type-check against the first member so subclass member types are consistent with parent class member types
         if let Some((first_member, first_owner)) = member_with_owners.first() {
             let type_check_result =
                 semantic_model.type_check(&file_decl_member_info.typ, &first_member.typ);
@@ -563,13 +563,13 @@ fn filter_member_infos<'a>(
             get_owner_type_id(semantic_model.get_db(), file_decl_member_info)
         }
     } else {
-        // 没有找到 file_decl，使用第一个成员作为参考
+        // No file_decl found, use the first member as the reference
         member_with_owners
             .first()
             .and_then(|(_, owner)| owner.clone())
     };
 
-    // 过滤出相同 owner_type_id 的成员
+    // Filter members with the same owner_type_id
     let mut filtered_member_infos: Vec<&LuaMemberInfo> = member_with_owners
         .into_iter()
         .filter_map(|(member_info, owner_id)| {
@@ -581,7 +581,7 @@ fn filter_member_infos<'a>(
         })
         .collect();
 
-    // 处理重载计数
+    // Handle overload counting
     let final_overload_count = if overload_count >= 1 {
         let count = overload_count - 1;
         if count == 0 { None } else { Some(count) }
@@ -589,7 +589,7 @@ fn filter_member_infos<'a>(
         None
     };
 
-    // 如果全为 DocFunction, 只保留第一个
+    // If all are DocFunction, keep only the first
     if all_doc_function && !filtered_member_infos.is_empty() {
         filtered_member_infos.truncate(1);
     }

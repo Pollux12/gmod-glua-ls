@@ -185,7 +185,7 @@ impl<'de> Deserialize<'de> for EmmyrcSpecialSymbol {
     where
         D: Deserializer<'de>,
     {
-        // 首先尝试使用默认的 derive 实现
+        // Try the default derive implementation first
         let s = String::deserialize(deserializer)?;
         match s.as_str() {
             "none" => Ok(EmmyrcSpecialSymbol::None),
@@ -194,7 +194,7 @@ impl<'de> Deserialize<'de> for EmmyrcSpecialSymbol {
             "assert" => Ok(EmmyrcSpecialSymbol::Assert),
             "type" => Ok(EmmyrcSpecialSymbol::Type),
             "setmetatable" => Ok(EmmyrcSpecialSymbol::Setmetatable),
-            // 对于任何不匹配的值，返回 None
+            // Return None for any value that does not match
             _ => Ok(EmmyrcSpecialSymbol::None),
         }
     }

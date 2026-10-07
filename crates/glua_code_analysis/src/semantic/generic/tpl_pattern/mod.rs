@@ -343,17 +343,17 @@ fn object_tpl_pattern_match(
 ) -> TplPatternMatchResult {
     match target {
         LuaType::Object(target_object) => {
-            // 先匹配 fields
+            // Match fields first
             for (k, v) in origin_obj.get_fields().iter().sorted_by_key(|(k, _)| *k) {
                 let target_value = target_object.get_fields().get(k);
                 if let Some(target_value) = target_value {
                     tpl_pattern_match(context, v, target_value)?;
                 }
             }
-            // 再匹配索引访问
+            // Then match index access
             let target_index_access = target_object.get_index_access();
             for (origin_key, v) in origin_obj.get_index_access() {
-                // 先匹配 key 类型进行转换
+                // Match the key type first for conversion
                 let target_access = target_index_access.iter().find(|(target_key, _)| {
                     check_type_compact(context.db, origin_key, target_key).is_ok()
                 });
@@ -564,7 +564,7 @@ fn table_generic_tpl_pattern_match(
     Ok(())
 }
 
-// KV 表匹配 ref/def/tableconst
+// KV table matches ref/def/tableconst
 fn table_generic_tpl_pattern_member_owner_match(
     context: &mut TplContext,
     table_generic_params: &[LuaType],
@@ -590,7 +590,7 @@ fn table_generic_tpl_pattern_member_owner_match(
     };
 
     let members = get_member_map(context.db, &owner_type).ok_or(InferFailReason::None)?;
-    // 如果是 pairs 调用, 我们需要尝试寻找元方法, 但目前`__pairs` 被放进成员表中
+    // For a pairs call we need to look for a metamethod, but `__pairs` is currently put into the member table
     if is_pairs_call(context).unwrap_or(false)
         && try_handle_pairs_metamethod(context, table_generic_params, &members).is_ok()
     {
@@ -718,7 +718,7 @@ fn union_tpl_pattern_match(
     let mut last_error = InferFailReason::None;
     for u in union.types() {
         match tpl_pattern_match(context, u, target) {
-            // 返回 ok 时并不一定匹配成功, 仅表示没有发生错误
+            // Returning ok does not necessarily mean the match succeeded, only that no error occurred
             Ok(_) => {}
             Err(e) => {
                 error_count += 1;
@@ -1189,7 +1189,7 @@ fn try_handle_pairs_metamethod(
         .ok_or(InferFailReason::None)?
         .first()
         .ok_or(InferFailReason::None)?;
-    // 获取迭代函数返回类型
+    // Get the iterator function return type
     let meta_return = match &pairs_member.typ {
         LuaType::Signature(signature_id) => context
             .db
@@ -1201,7 +1201,7 @@ fn try_handle_pairs_metamethod(
     }
     .ok_or(InferFailReason::None)?;
 
-    // 解析出迭代函数返回类型
+    // Resolve the iterator function return type
     let final_return_type = match meta_return {
         LuaType::DocFunction(doc_func) => Some(doc_func.get_ret().clone()),
         LuaType::Signature(signature_id) => context

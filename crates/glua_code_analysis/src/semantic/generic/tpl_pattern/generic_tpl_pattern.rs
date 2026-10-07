@@ -123,7 +123,7 @@ fn generic_tpl_pattern_match_inner(
             }
         }
         _ => {
-            // 对于 @alias 类型, 我们能拿到的 target 实际上很有可能是实例化后的类型, 因此我们需要实例化后再进行匹配
+            // For @alias types the target we get is very likely the instantiated type, so it must be instantiated before matching
             let substitutor = TypeSubstitutor::new();
             let typ = instantiate_generic(context.db, source_generic, &substitutor);
             if LuaType::from(source_generic.clone()) != typ {

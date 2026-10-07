@@ -130,7 +130,7 @@ impl PartialEq for LuaType {
             (LuaType::ConditionalInfer(a), LuaType::ConditionalInfer(b)) => a == b,
             (LuaType::Mapped(a), LuaType::Mapped(b)) => a == b,
             (LuaType::TableOf(a), LuaType::TableOf(b)) => a == b,
-            _ => false, // 不同变体之间不相等
+            _ => false, // Different variants are never equal
         }
     }
 }
@@ -987,7 +987,7 @@ impl LuaFunctionType {
                     }
                     match owner_type {
                         Some(owner_type) => {
-                            // 一些类型不应该被视为 method
+                            // Some types should not be treated as methods
                             if matches!(owner_type, LuaType::Ref(_) | LuaType::Def(_))
                                 && first_param_may_not_self(t)
                             {
@@ -996,7 +996,7 @@ impl LuaFunctionType {
                             if semantic_model.type_check(owner_type, t).is_ok() {
                                 return true;
                             }
-                            // 如果名称是`self`, 则做更宽泛的检查
+                            // If the name is `self`, do a broader check
                             name == "self" && semantic_model.type_check(t, owner_type).is_ok()
                         }
                         None => name == "self",
@@ -1701,7 +1701,7 @@ impl VariadicType {
         }
     }
 
-    /// 获取可变参数的最小长度, 如果可变参数是无限长度, 则返回 None
+    /// Gets the minimum length of the variadic parameters; returns None if they have unbounded length
     pub fn get_min_len(&self) -> Option<usize> {
         match self {
             VariadicType::Base(_) => None,
@@ -1723,7 +1723,7 @@ impl VariadicType {
         }
     }
 
-    /// 获取可变参数的最大长度, 如果可变参数是无限长度, 则返回 None
+    /// Gets the maximum length of the variadic parameters; returns None if they have unbounded length
     pub fn get_max_len(&self) -> Option<usize> {
         match self {
             VariadicType::Base(_) => None,
@@ -2000,7 +2000,7 @@ pub struct LuaConditionalType {
     condition: LuaType,
     true_type: LuaType,
     false_type: LuaType,
-    /// infer 参数声明, 这些参数只在 true_type 的作用域内可见
+    /// infer parameter declarations, visible only within the scope of true_type
     infer_params: Vec<GenericParam>,
     pub has_new: bool,
 }

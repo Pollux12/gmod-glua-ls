@@ -222,7 +222,7 @@ pub fn analyze_param(analyzer: &mut DocAnalyzer, tag: LuaDocTagParam) -> Option<
     // bind type ref to signature and param
     if let Some(closure) = find_owner_closure(analyzer) {
         let id = LuaSignatureId::from_closure(analyzer.file_id, &closure);
-        // 绑定`attribute`标记
+        // Bind the `attribute` tag
         let attributes =
             find_attach_attribute(LuaAst::LuaDocTagParam(tag)).and_then(|tag_attribute_uses| {
                 let result: Vec<LuaAttributeUse> = tag_attribute_uses
@@ -261,7 +261,7 @@ pub fn analyze_param(analyzer: &mut DocAnalyzer, tag: LuaDocTagParam) -> Option<
             );
         }
     } else if let Some(LuaAst::LuaForRangeStat(for_range)) = analyzer.comment.get_owner() {
-        // for in 支持 @param 语法
+        // `for in` supports the @param syntax
         for it_name_token in for_range.get_var_name_list() {
             let it_name = it_name_token.get_name_text();
             if it_name == name {

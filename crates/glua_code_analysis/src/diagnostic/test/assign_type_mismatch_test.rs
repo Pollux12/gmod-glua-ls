@@ -146,8 +146,8 @@ mod tests {
             "#
         ));
 
-        // TODO: 解决枚举值运算结果的推断问题
-        // 暂时没有好的方式去处理这个警告, 在 ts 中, 枚举值运算的结果不是实际值, 但我们目前的结果是实际值, 所以难以处理
+        // TODO: fix the inference of enum value operation results
+        // No good way to handle this warning yet: in ts the result of an enum value operation is not the actual value, but ours is, which makes it hard to handle
         assert!(ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
@@ -369,12 +369,12 @@ mod tests {
         ));
     }
 
-    /// 暂时无法解决的测试
+    /// Tests that cannot be solved yet
     #[test]
     fn test_error() {
         // let mut ws = VirtualWorkspace::new();
 
-        // 推断类型异常
+        // Inference anomaly
         // assert!(ws.check_code_for_namespace(
         //     DiagnosticCode::AssignTypeMismatch,
         //     r#"
@@ -782,7 +782,7 @@ return t
         ));
     }
 
-    // 可能需要处理的
+    // May need handling
     #[test]
     fn test_pending() {
         let mut ws = VirtualWorkspace::new();
@@ -818,7 +818,7 @@ return t
                         "#
         ));
 
-        // 数组类型匹配允许可空, 但在初始化赋值时, 不允许直接赋值`nil`(其实是偷懒了, table_expr 推断没有处理边缘情况, 可能后续会做处理允许)
+        // Array types allow nullable matching, but initialization must not assign `nil` directly (really a shortcut: table_expr inference does not handle the edge case, and may allow it later)
         assert!(ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
@@ -861,8 +861,8 @@ return t
     #[test]
     fn test_issue_295() {
         let mut ws = VirtualWorkspace::new();
-        // TODO: 解决枚举值运算结果的推断问题
-        // 暂时没有好的方式去处理这个警告, 在 ts 中, 枚举值运算的结果不是实际值, 但我们目前的结果是实际值, 所以难以处理
+        // TODO: fix the inference of enum value operation results
+        // No good way to handle this warning yet: in ts the result of an enum value operation is not the actual value, but ours is, which makes it hard to handle
         assert!(ws.check_code_for(
             DiagnosticCode::AssignTypeMismatch,
             r#"

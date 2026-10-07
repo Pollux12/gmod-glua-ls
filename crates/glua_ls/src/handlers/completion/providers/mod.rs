@@ -26,7 +26,7 @@ pub fn add_completions(builder: &mut CompletionBuilder) -> Option<()> {
     if builder.is_cancelled() {
         return None;
     }
-    // `function_provider`优先级必须高于`env_provider`
+    // `function_provider` must have higher priority than `env_provider`
     function_provider::add_completion(builder);
     if builder.is_cancelled() {
         return None;
@@ -35,7 +35,7 @@ pub fn add_completions(builder: &mut CompletionBuilder) -> Option<()> {
     if builder.is_cancelled() {
         return None;
     }
-    // 如果`table_field_provider`执行成功会中止补全, 同时优先级必须高于`env_provider`
+    // If `table_field_provider` succeeds it aborts completion, and it must have higher priority than `env_provider`
     table_field_provider::add_completion(builder);
     if builder.is_cancelled() {
         return None;

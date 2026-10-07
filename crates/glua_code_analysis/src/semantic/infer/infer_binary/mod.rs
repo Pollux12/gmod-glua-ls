@@ -195,7 +195,7 @@ fn infer_union_binary_expr(
         return None;
     };
 
-    // 只在实际调用时才 clone，而不是预先 clone
+    // Only clone on an actual call instead of cloning up front
     let inferred = u
         .types()
         .filter_map(|ty| {
@@ -243,7 +243,7 @@ fn infer_binary_custom_operator(
     right: &LuaType,
     op: LuaOperatorMetaMethod,
 ) -> InferResult {
-    // 先检查 left 是否是自定义类型，避免不必要的 clone
+    // Check whether left is a custom type first to avoid unnecessary clones
     if left.is_custom_type()
         && let Some(operators) = get_custom_type_operator(db, left.clone(), op)
     {
@@ -255,7 +255,7 @@ fn infer_binary_custom_operator(
         }
     }
 
-    // 再检查 right 是否是自定义类型，只在需要时 clone
+    // Then check whether right is a custom type, cloning only when needed
     if right.is_custom_type()
         && let Some(operators) = get_custom_type_operator(db, right.clone(), op)
     {

@@ -309,7 +309,7 @@ fn check_general_type_compact(
             Err(TypeCheckFailReason::TypeNotMatch)
         }
         LuaType::Never => {
-            // never 只能赋值给 never
+            // never can only be assigned to never
             if compact_type.is_never() {
                 return Ok(());
             }

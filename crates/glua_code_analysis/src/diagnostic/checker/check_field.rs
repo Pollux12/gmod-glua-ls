@@ -796,7 +796,7 @@ fn is_valid_member_inner(
             }
         }
         LuaType::Ref(_) => {
-            // 如果类型是 Ref 的 enum, 那么需要检查变量是否为参数, 因为作为参数的 enum 本质上是 value 而不是 enum
+            // If the type is a Ref enum, check whether the variable is a parameter, since an enum used as a parameter is essentially a value rather than an enum
             if check_enum_is_param(semantic_model, prefix_typ, index_expr).is_some() {
                 return None;
             }
@@ -946,13 +946,13 @@ fn is_valid_member_inner(
 
         for child in index_expr.syntax().children_with_tokens() {
             if child.kind() == LuaTokenKind::TkLeftBracket.into() {
-                // 此时为 [] 访问, 大部分类型都可以直接通行
+                // This is a [] access; most types can pass directly
                 match prefix_typ {
                     LuaType::Ref(id) | LuaType::Def(id) => {
                         if let Some(decl) =
                             semantic_model.get_db().get_type_index().get_type_decl(id)
                         {
-                            // enum 仍然需要检查
+                            // enum still needs checking
                             if decl.is_enum() {
                                 break;
                             } else {
@@ -980,7 +980,7 @@ fn is_valid_member_inner(
                 return Some(());
             }
             Ok(typ) => typ,
-            // 解析失败时认为其是合法的, 因为他可能没有标注类型
+            // Treat as valid on resolution failure, since it may have no type annotation
             Err(InferFailReason::UnResolveDeclType(_)) => {
                 return Some(());
             }
@@ -992,7 +992,7 @@ fn is_valid_member_inner(
         return None;
     };
 
-    // 一些类型组合需要特殊处理
+    // Some type combinations need special handling
     if let (LuaType::Ref(id) | LuaType::Def(id), _) = (prefix_typ, &key_type)
         && let Some(decl) = semantic_model.get_db().get_type_index().get_type_decl(id)
         && decl.is_class()
@@ -1006,7 +1006,7 @@ fn is_valid_member_inner(
     }
 
     /*
-    允许这种写法
+    This form is allowed
             ---@type string?
             local field
             local a = Class[field]
@@ -1033,7 +1033,7 @@ fn is_valid_member_inner(
                 }
             }
             if members.is_empty() {
-                // 当没有任何成员信息且是 enum 类型时, 需要检查参数是否为自己
+                // When there is no member info and the type is an enum, check whether the parameter is itself
                 if check_enum_self_reference(semantic_model, &prefix_type, &key_types).is_some() {
                     return Some(());
                 }
@@ -1222,7 +1222,7 @@ fn is_table_const_from_doc_tag(
     is_doc_tag_table_const(&tree.get_red_root(), id.value)
 }
 
-/// 检查枚举类型的自引用
+/// Checks self-reference of an enum type
 fn check_enum_self_reference(
     semantic_model: &SemanticModel,
     prefix_type: &LuaType,
@@ -1313,25 +1313,25 @@ fn get_key_types(context: &DiagnosticContext, db: &DbIndex, typ: &LuaType) -> Ha
     type_set
 }
 
-/// 判断给定的AST节点是否位于判断语句的条件表达式中
+/// Determines whether the given AST node is inside the condition expression of a conditional statement
 ///
-/// 该函数检查节点是否位于以下语句的条件部分：
-/// - if语句的条件表达式
-/// - while循环的条件表达式
-/// - for循环的迭代表达式
-/// - repeat循环的条件表达式
-/// - elseif子句的条件表达式
+/// This function checks whether the node is in the condition part of the following statements:
+/// - the condition expression of an if statement
+/// - the condition expression of a while loop
+/// - the iterator expression of a for loop
+/// - the condition expression of a repeat loop
+/// - the condition expression of an elseif clause
 ///
-/// # 参数
-/// * `node` - 要检查的AST节点
+/// # Parameters
+/// * `node` - the AST node to check
 ///
-/// # 返回值
-/// * `true` - 节点位于判断语句的条件表达式中
-/// * `false` - 节点不在判断语句的条件表达式中
+/// # Returns
+/// * `true` - the node is in the condition expression of a conditional statement
+/// * `false` - the node is not in the condition expression of a conditional statement
 fn in_conditional_statement<T: LuaAstNode>(node: &T) -> bool {
     let node_range = node.get_range();
 
-    // 遍历所有祖先节点，查找条件语句
+    // Walk all ancestor nodes looking for conditional statements
     for ancestor in node.syntax().ancestors() {
         match ancestor.kind().into() {
             LuaSyntaxKind::IfStat => {

@@ -1,13 +1,13 @@
 use crate::{LuaExportScope, ModuleInfo, SemanticModel};
 
-/// 检查模块是否可见.
+/// Checks whether a module is visible.
 ///
-/// 如果没有 export 标记, 视为可见.
+/// A module without an export tag is visible.
 pub fn check_export_visibility(
     semantic_model: &SemanticModel,
     module_info: &ModuleInfo,
 ) -> Option<bool> {
-    // 检查模块是否有 export 标记
+    // Check whether the module has an export tag
     let Some(export) = module_info.get_export(semantic_model.get_db()) else {
         return check_default_export_visibility(semantic_model, module_info);
     };
@@ -46,17 +46,17 @@ pub fn check_export_visibility(
     Some(false)
 }
 
-/// 检查默认导出作用域下的可见性
+/// Checks visibility under the default export scope
 fn check_default_export_visibility(
     semantic_model: &SemanticModel,
     module_info: &ModuleInfo,
 ) -> Option<bool> {
-    // 如果没有启用 require_export_global, 则默认认为是可见的.
+    // If require_export_global is not enabled, the module is visible by default.
     if !semantic_model.emmyrc.strict.require_export_global {
         return Some(true);
     }
 
-    // 如果被声明为库文件, 则我们不认为是可见的.
+    // A module declared as a library file is not considered visible.
     if semantic_model
         .db
         .get_module_index()

@@ -58,12 +58,12 @@ impl<'a> FileDependencyRelation<'a> {
         let mut queue = VecDeque::with_capacity(n);
         let mut popped = 0usize;
 
-        // 入度为0的节点，按优先级排序：meta文件优先，然后按FileId排序
+        // Nodes with in-degree 0, sorted by priority: meta files first, then by FileId
         let mut zero_in_degree: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
         zero_in_degree.sort_by(|&a, &b| {
             let a_is_meta = metas.contains(&file_ids[a]);
             let b_is_meta = metas.contains(&file_ids[b]);
-            // meta文件优先（true > false，所以反过来比较）
+            // meta files first (true > false, so compare in reverse)
             match (b_is_meta, a_is_meta) {
                 (true, false) => std::cmp::Ordering::Greater,
                 (false, true) => std::cmp::Ordering::Less,
@@ -83,7 +83,7 @@ impl<'a> FileDependencyRelation<'a> {
             levels[level].push(file_ids[idx]);
             popped += 1;
 
-            // 收集新的入度为0的节点
+            // Collect new nodes with in-degree 0
             let mut new_zero: Vec<usize> = Vec::new();
             for &neighbor in &adjacency[idx] {
                 in_degree[neighbor] -= 1;
@@ -94,7 +94,7 @@ impl<'a> FileDependencyRelation<'a> {
                 }
             }
 
-            // 同样按优先级排序后加入队列
+            // Sort by priority as well before adding to the queue
             if new_zero.len() > 1 {
                 new_zero.sort_by(|&a, &b| {
                     let a_is_meta = metas.contains(&file_ids[a]);
@@ -111,7 +111,7 @@ impl<'a> FileDependencyRelation<'a> {
             }
         }
 
-        // 处理循环依赖
+        // Handle circular dependencies
         if popped < n {
             for (idx, &deg) in in_degree.iter().enumerate() {
                 if deg > 0 {
@@ -157,66 +157,66 @@ mod tests {
     #[test]
     fn test_best_analysis_order() {
         let mut map = HashMap::default();
-        // 文件1依赖文件2
+        // File 1 depends on file 2
         map.insert(FileId::new(1), {
             let mut s = HashSet::default();
             s.insert(FileId::new(2));
             s
         });
-        // 文件2没有依赖
+        // File 2 has no dependencies
         map.insert(FileId::new(2), HashSet::default());
         let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
         let result =
             rel.get_best_analysis_order(&[FileId::new(1), FileId::new(2)], &HashSet::default());
-        // 文件2没有依赖，应该在前；文件1依赖文件2，在后
+        // File 2 has no dependencies so it comes first; file 1 depends on file 2 so it comes after
         assert_eq!(result, vec![FileId::new(2), FileId::new(1)]);
     }
 
     #[test]
     fn test_best_analysis_order2() {
         let mut map = HashMap::default();
-        // 文件1依赖文件2和文件3
+        // File 1 depends on files 2 and 3
         map.insert(1.into(), {
             let mut s = HashSet::default();
             s.insert(2.into());
             s.insert(3.into());
             s
         });
-        // 文件2依赖文件3
+        // File 2 depends on file 3
         map.insert(2.into(), {
             let mut s = HashSet::default();
             s.insert(3.into());
             s
         });
-        // 文件3没有依赖
+        // File 3 has no dependencies
         map.insert(3.into(), HashSet::default());
         let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
         let result =
             rel.get_best_analysis_order(&[1.into(), 2.into(), 3.into()], &HashSet::default());
-        // 文件3没有依赖，应该在最前面；然后是2，最后是1
+        // File 3 has no dependencies so it comes first, then 2, and 1 last
         assert_eq!(result, vec![3.into(), 2.into(), 1.into()]);
     }
 
     #[test]
     fn test_no_deps_files_first() {
         let mut map = HashMap::default();
-        // 文件1依赖文件2
+        // File 1 depends on file 2
         map.insert(FileId::new(1), {
             let mut s = HashSet::default();
             s.insert(FileId::new(2));
             s
         });
-        // 文件2依赖文件1（循环依赖）
+        // File 2 depends on file 1 (circular dependency)
         map.insert(FileId::new(2), {
             let mut s = HashSet::default();
             s.insert(FileId::new(1));
             s
         });
-        // 文件3没有依赖
+        // File 3 has no dependencies
         map.insert(FileId::new(3), HashSet::default());
-        // 文件4没有依赖
+        // File 4 has no dependencies
         map.insert(FileId::new(4), HashSet::default());
 
         let map = CowShards::from(map);
@@ -231,10 +231,10 @@ mod tests {
             &HashSet::default(),
         );
 
-        // 文件3和4没有依赖，应该在前面
+        // Files 3 and 4 have no dependencies so they come first
         assert_eq!(result[0], FileId::new(3));
         assert_eq!(result[1], FileId::new(4));
-        // 文件1和2有循环依赖，在后面
+        // Files 1 and 2 have a circular dependency so they come last
         assert!(result.contains(&FileId::new(1)));
         assert!(result.contains(&FileId::new(2)));
     }
@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn test_meta_files_first() {
         let mut map = HashMap::default();
-        // 所有文件都没有依赖
+        // No file has dependencies
         map.insert(FileId::new(1), HashSet::default());
         map.insert(FileId::new(2), HashSet::default());
         map.insert(FileId::new(3), HashSet::default());
@@ -342,7 +342,7 @@ mod tests {
         let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
 
-        // 文件2和4是meta文件
+        // Files 2 and 4 are meta files
         let mut metas = HashSet::default();
         metas.insert(FileId::new(2));
         metas.insert(FileId::new(4));
@@ -357,11 +357,11 @@ mod tests {
             &metas,
         );
 
-        // meta文件应该在前面（2和4），非meta文件在后面（1和3）
-        assert!(metas.contains(&result[0]), "第一个应该是meta文件");
-        assert!(metas.contains(&result[1]), "第二个应该是meta文件");
-        assert!(!metas.contains(&result[2]), "第三个应该是非meta文件");
-        assert!(!metas.contains(&result[3]), "第四个应该是非meta文件");
+        // meta files should come first (2 and 4), non-meta files last (1 and 3)
+        assert!(metas.contains(&result[0]), "the first should be a meta file");
+        assert!(metas.contains(&result[1]), "the second should be a meta file");
+        assert!(!metas.contains(&result[2]), "the third should be a non-meta file");
+        assert!(!metas.contains(&result[3]), "the fourth should be a non-meta file");
     }
 
     #[test]

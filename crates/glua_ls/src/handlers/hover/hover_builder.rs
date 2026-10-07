@@ -54,7 +54,7 @@ pub struct HoverBuilder<'a> {
     pub annotation_description: Vec<MarkedString>,
     /// Dedicated @source annotation rendered as a clickable link in hover.
     source: Option<String>,
-    /// 一些类型的完整追加显示, 通常是 @alias
+    /// Full additional display for some types, usually @alias
     pub type_expansion: Option<Vec<String>>,
     /// For `@see` and unknown tags tags
     tag_content: Option<Vec<(String, String)>>,
@@ -68,7 +68,7 @@ pub struct HoverBuilder<'a> {
     pub detail_render_level: RenderLevel,
 
     pub is_completion: bool,
-    // 默认的泛型替换器
+    // Default generic replacer
     pub substitutor: Option<TypeSubstitutor>,
 }
 
@@ -401,7 +401,7 @@ impl<'a> HoverBuilder<'a> {
 
         let mut result = sections.join("\n\n---\n\n");
 
-        // 清除空白字符
+        // Clear whitespace characters
         result = result.trim().to_string();
 
         Some(Hover {
@@ -435,7 +435,7 @@ fn marked_string_to_markdown(marked_string: &MarkedString) -> String {
     }
 }
 
-// 推断基础泛型替换器
+// Infer the base generic replacer
 fn infer_substitutor_base_type(
     semantic_model: &SemanticModel,
     trigger_token: LuaSyntaxToken,

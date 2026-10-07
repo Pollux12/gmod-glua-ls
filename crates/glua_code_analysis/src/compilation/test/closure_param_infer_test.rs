@@ -517,7 +517,7 @@ mod test {
             A = Test.e
             "#,
         );
-        // 必须要这样写, 无法直接`A = a`拿到`a`的实际类型, `A`的推断目前是独立的且在`Test.e`推断之前缓存
+        // This has to be written this way: `A = a` cannot yield the actual type of `a`, `A` is inferred independently and cached before `Test.e` is inferred
         let ty = ws.expr_ty("A");
         let expected_a = ws.ty("string|number");
         // let expected_a_str = ws.humanize_type(expected_a);

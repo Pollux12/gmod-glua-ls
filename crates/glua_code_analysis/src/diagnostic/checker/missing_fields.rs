@@ -393,7 +393,7 @@ fn table_literal_looks_array_like(fields: &[LuaTableField]) -> bool {
 
 fn get_required_fields(
     context: &mut DiagnosticContext,
-    // types 应为广度优先, 子类型会先于父类型被遍历, 而子类型的优先级高于父类型
+    // types should be breadth-first: subtypes are visited before supertypes, and subtypes have higher priority than supertypes
     types: &[LuaType],
 ) -> Option<HashSet<String>> {
     let db = context.db;
@@ -402,7 +402,7 @@ fn get_required_fields(
 
 fn get_required_fields_for_types(
     db: &DbIndex,
-    // types 应为广度优先, 子类型会先于父类型被遍历, 而子类型的优先级高于父类型
+    // types should be breadth-first: subtypes are visited before supertypes, and subtypes have higher priority than supertypes
     types: &[LuaType],
     mut is_cancelled: impl FnMut() -> bool,
 ) -> Option<HashSet<String>> {
@@ -431,7 +431,7 @@ fn get_required_fields_for_types(
                 generic_type.get_base_type_id().clone(),
                 &mut is_cancelled,
             ),
-            // 处理 ---@class test: { a: number }
+            // Handle ---@class test: { a: number }
             LuaType::Object(object_type) => {
                 let fields = object_type.get_fields();
                 for (key, decl_type) in fields {

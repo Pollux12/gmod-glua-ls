@@ -772,11 +772,11 @@ impl EmmyLuaAnalysis {
         self.compilation.update_index(file_ids);
     }
 
-    /// 清理文件系统中不再存在的文件
+    /// Removes files that no longer exist on the file system
     pub fn cleanup_nonexistent_files(&mut self) {
         let mut files_to_remove = Vec::new();
 
-        // 获取所有当前在VFS中的文件
+        // Get all files currently in the VFS
         let vfs = self.compilation.get_db().get_vfs();
         for file_id in vfs.get_all_local_file_ids() {
             if self
@@ -806,7 +806,7 @@ impl EmmyLuaAnalysis {
             );
         }
 
-        // 移除不存在的文件
+        // Remove files that no longer exist
         for uri in files_to_remove {
             self.remove_file_by_uri(&uri);
         }

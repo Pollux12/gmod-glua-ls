@@ -138,7 +138,7 @@ fn check_call_expr(
     let colon_call = call_expr.is_colon_call();
     let colon_define = func.is_colon_define();
     if matches!((colon_call, colon_define), (false, true)) {
-        // 插入 self 参数
+        // Insert the self parameter
         params.insert(0, ("self".into(), Some(LuaType::SelfInfer)));
     }
 
@@ -160,7 +160,7 @@ fn check_call_expr(
         (true, true) | (false, false) => {}
         (false, true) => {}
         (true, false) => {
-            // 往调用参数插入插入调用者类型
+            // Insert the caller type into the call arguments
             let source_type = get_call_source_type(semantic_model, &call_expr)?;
             arg_types.insert(0, source_type);
             arg_ranges.insert(0, call_expr.get_colon_token()?.get_range());
@@ -254,9 +254,9 @@ fn check_call_expr(
                 {
                     continue;
                 }
-                // 这里执行了`AssignTypeMismatch`的检查
+                // The `AssignTypeMismatch` check is performed here
                 if arg_type.is_table() {
-                    // 表字段已经报错了, 则不添加参数不匹配的诊断避免干扰
+                    // The table field already reports an error, so do not add a parameter mismatch diagnostic to avoid noise
                     if let Some(arg_expr) = arg_expr
                         && let Some(add_diagnostic) = check_table_expr(
                             context,

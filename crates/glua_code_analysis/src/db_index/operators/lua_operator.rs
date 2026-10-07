@@ -75,7 +75,7 @@ impl LuaOperator {
 
                 LuaType::Any
             }
-            // 只有 .field 才有`operand`, call 不会有这个
+            // Only .field has an `operand`; call does not
             OperatorFunction::DefaultClassCtor { .. } => LuaType::Unknown,
         }
     }

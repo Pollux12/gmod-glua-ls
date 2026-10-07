@@ -195,7 +195,7 @@ impl ProviderVirtualWorkspace {
         self.analysis.update_config(Arc::new(emmyrc));
     }
 
-    /// 处理文件内容
+    /// Processes the file content
     pub fn handle_file_content(content: &str) -> Result<(String, Position)> {
         let (content, position) = Self::handle_file_content_option(content)?;
         Ok((
@@ -282,7 +282,7 @@ impl ProviderVirtualWorkspace {
         )
         .ok_or("failed to get completion")
         .or_fail()?;
-        // 对比
+        // Compare
         let mut items = match result {
             CompletionResponse::Array(items) => items,
             CompletionResponse::List(list) => list.items,

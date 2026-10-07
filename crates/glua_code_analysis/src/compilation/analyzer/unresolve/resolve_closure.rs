@@ -670,11 +670,11 @@ fn resolve_closure_member_type(
                 let mut doc_params = doc_func.get_params().to_vec();
                 match (doc_func.is_colon_define(), signature.is_colon_define) {
                     (true, false) => {
-                        // 原始签名是冒号定义, 但未解析的签名不是冒号定义, 即要插入第一个参数
+                        // The original signature is colon-defined but the unresolved one is not, so the first parameter must be inserted
                         doc_params.insert(0, ("self".to_string(), Some(LuaType::SelfInfer)));
                     }
                     (false, true) => {
-                        // 原始签名不是冒号定义, 但未解析的签名是冒号定义, 即要删除第一个参数
+                        // The original signature is not colon-defined but the unresolved one is, so the first parameter must be removed
                         if !doc_params.is_empty() {
                             doc_params.remove(0);
                         }
@@ -685,7 +685,7 @@ fn resolve_closure_member_type(
                 for (idx, param) in doc_params.iter().enumerate() {
                     if let Some(final_param) = final_params.get(idx) {
                         if final_param.0 == "..." {
-                            // 如果`doc_params`当前与之后的参数的类型不一致, 那么`variadic_type`为`Any`
+                            // If the type of `doc_params` differs from the following parameters, `variadic_type` is `Any`
                             for i in idx..doc_params.len() {
                                 if let Some(param) = doc_params.get(i)
                                     && let Some(typ) = &param.1
@@ -782,10 +782,10 @@ fn resolve_doc_function(
     signature.async_state = doc_func.get_async_state();
 
     let mut doc_params = doc_func.get_params().to_vec();
-    // doc_func 是往上追溯的有效签名, signature 是未解析的签名
+    // doc_func is the valid signature traced upwards, signature is the unresolved signature
     match (doc_func.is_colon_define(), signature.is_colon_define) {
         (true, false) => {
-            // 原始签名是冒号定义, 但未解析的签名不是冒号定义, 即要插入第一个参数
+            // The original signature is colon-defined but the unresolved one is not, so the first parameter must be inserted
             doc_params.insert(0, ("self".to_string(), Some(LuaType::SelfInfer)));
         }
         (false, true) => {
@@ -1148,7 +1148,7 @@ fn find_best_function_type(
     origin_signature: &LuaSignature,
     origin_sig_id: Option<&LuaSignatureId>,
 ) -> Option<LuaType> {
-    // 寻找非自身定义的签名
+    // Find a signature that is not the one itself
     if let Ok(result) = find_decl_function_type(db, cache, prefix_type, index_member_expr) {
         let preserve_implicit_receiver = !origin_signature.is_colon_define
             && origin_signature

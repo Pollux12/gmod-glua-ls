@@ -154,7 +154,7 @@ fn table_backing_range_from_expr(
 //         let index_members = find_members(db, &member.typ)?;
 //         let table_type = infer_expr(db, cache, LuaExpr::TableExpr(table_expr.clone())).ok()?;
 //         let table_members = find_members(db, &table_type)?;
-//         // 如果 index_members 包含了 table_members 中的所有成员，则返回 meta_type
+//         // If index_members contains all members of table_members, return meta_type
 //         if table_members.iter().all(|table_member| {
 //             index_members
 //                 .iter()

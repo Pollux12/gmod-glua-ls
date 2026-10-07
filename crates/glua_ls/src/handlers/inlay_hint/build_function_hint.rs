@@ -91,12 +91,12 @@ pub fn build_label_parts(semantic_model: &SemanticModel, typ: &LuaType) -> Vec<I
             }
         }
     }
-    // 去重
+    // Deduplicate
     let parts: Vec<InlayHintLabelPart> = parts
         .into_iter()
         .unique_by(|part| part.value.clone())
         .collect();
-    // 将 "?" 标签移到最后
+    // Move the "?" label to the end
     let mut normal_parts = Vec::new();
     let mut nil_parts = Vec::new();
     for part in parts {
@@ -115,7 +115,7 @@ pub fn build_label_parts(semantic_model: &SemanticModel, typ: &LuaType) -> Vec<I
         }
         result.push(part);
     }
-    // 如果只有一个`nil`标签, 那么将其改为": nil"
+    // If there is only a single `nil` label, change it to ": nil"
     if result.len() == 1 && result[0].value == "?" {
         result[0].value = ": nil".to_string();
     }

@@ -35,7 +35,7 @@ pub fn check_intersection_type_compact(
             }
         }
         LuaType::Object(_) => {
-            // 检查对象是否满足交叉类型的所有组成部分
+            // Check whether the object satisfies all components of the intersection type
             for intersection_component in source_intersection.get_types() {
                 // Keep expression-specific member facts while isolating mutable branch state.
                 let mut component_context = context.clone();
@@ -49,7 +49,7 @@ pub fn check_intersection_type_compact(
             Ok(())
         }
         LuaType::Intersection(compact_intersection) => {
-            // 交叉类型对交叉类型：检查所有组成部分
+            // Intersection against intersection: check all components
             check_intersection_type_compact_intersection(
                 context,
                 source_intersection,
@@ -57,9 +57,9 @@ pub fn check_intersection_type_compact(
                 check_guard.next_level()?,
             )
         }
-        LuaType::Table => Ok(()), // 通用表类型可以匹配任何交叉类型
+        LuaType::Table => Ok(()), // The generic table type matches any intersection type
         _ => {
-            // 对于其他类型，检查是否至少满足一个组成部分
+            // For other types, check that at least one component is satisfied
             for intersection_component in source_intersection.get_types() {
                 let mut component_context = context.clone();
                 if check_general_type_compact(
@@ -84,7 +84,7 @@ fn check_intersection_type_compact_table(
     table_owner: LuaMemberOwner,
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
-    // 交叉类型要求 TableConst 必须满足所有组成部分
+    // An intersection type requires TableConst to satisfy all components
     for intersection_component in source_intersection.get_types() {
         let mut component_context = context.clone();
         check_general_type_compact(
@@ -109,7 +109,7 @@ fn check_intersection_type_compact_intersection(
     compact_intersection: &LuaIntersectionType,
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
-    // 检查源交叉类型的每个组成部分是否都能在目标交叉类型中找到匹配
+    // Check that every component of the source intersection finds a match in the target intersection
     for source_component in source_intersection.get_types() {
         let mut component_matched = false;
 

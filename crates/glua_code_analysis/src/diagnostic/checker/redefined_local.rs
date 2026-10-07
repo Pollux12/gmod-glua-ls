@@ -50,7 +50,7 @@ impl Checker for RedefinedLocalChecker {
             &syntax_registrations,
         );
 
-        // 添加诊断信息
+        // Add the diagnostic
         for decl_id in diagnostics {
             if let Some(decl) = decl_tree.get_decl(&decl_id) {
                 context.add_diagnostic(
@@ -79,7 +79,7 @@ fn check_scope_for_redefined_locals(
     let should_add_to_parent = should_add_to_parent_scope(scope);
     let scope_change_start = changes.len();
 
-    // 检查当前作用域中的声明
+    // Check the declarations in the current scope
     for child in scope.get_children() {
         if let ScopeOrDeclId::Decl(decl_id) = child
             && let Some(decl) = decl_tree.get_decl(decl_id)
@@ -116,16 +116,16 @@ fn check_scope_for_redefined_locals(
                         continue;
                     }
 
-                    // 发现重定义，记录诊断
+                    // Redefinition found, record the diagnostic
                     diagnostics.insert(*decl_id);
                 }
-                // 将当前声明加入映射
+                // Add the current declaration to the map
                 insert_visible_local(visible_locals, changes, name, *decl_id);
             }
         }
     }
 
-    // 检查子作用域
+    // Check child scopes
     for child in scope.get_children() {
         if let ScopeOrDeclId::Scope(scope_id) = child
             && let Some(child_scope) = decl_tree.get_scope(scope_id)
@@ -144,7 +144,7 @@ fn check_scope_for_redefined_locals(
         }
     }
 
-    // 更新到父作用域
+    // Update to the parent scope
     if !should_add_to_parent {
         rollback_visible_locals(visible_locals, changes, scope_change_start);
     }
@@ -188,7 +188,7 @@ fn rollback_visible_locals(
     }
 }
 
-/// 处理 a = function(a)
+/// Handles a = function(a)
 fn var_name_not_conflicts_with_function_param_name(
     current_decl: &LuaDecl,
     old_decl: Option<&LuaDecl>,
@@ -204,7 +204,7 @@ fn var_name_not_conflicts_with_function_param_name(
         if let crate::LuaDeclExtra::Param { signature_id, .. } = current_decl.extra
             && value_syntax_id.get_range().start() == signature_id.get_position()
         {
-            return Some(()); // 不冲突
+            return Some(()); // No conflict
         }
     }
 
@@ -368,7 +368,7 @@ fn table_arg_range(
         .map(|arg| arg.syntax_id.get_range())
 }
 
-/// 检查是否需要加入到父作用域
+/// Checks whether it needs to be added to the parent scope
 fn should_add_to_parent_scope(scope: &LuaScope) -> bool {
     scope.get_kind() == LuaScopeKind::FuncStat
         || scope.get_kind() == LuaScopeKind::LocalOrAssignStat

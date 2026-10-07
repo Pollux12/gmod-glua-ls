@@ -840,15 +840,15 @@ fn check_local_stat(
     Some(())
 }
 
-/// 检查整个表, 返回`true`表示诊断出异常.
+/// Checks the whole table; returns `true` if an anomaly is diagnosed.
 pub fn check_table_expr(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     decl_node: NodeOrToken<LuaSyntaxNode, LuaSyntaxToken>,
     table_expr: &LuaExpr,
-    table_type: Option<&LuaType>, // 记录的类型
+    table_type: Option<&LuaType>, // Recorded type
 ) -> Option<bool> {
-    // 检查是否附加了元数据以跳过诊断
+    // Check whether metadata is attached to skip the diagnostic
     if let Some(semantic_decl) = semantic_model.find_decl(decl_node, SemanticDeclLevel::default()) {
         if let Some(property) = semantic_model
             .get_db()
@@ -874,7 +874,7 @@ pub fn check_table_expr(
     Some(false)
 }
 
-// 处理 value_expr 是 TableExpr 的情况, 但不会处理 `local a = { x = 1 }, local v = a`
+// Handles value_expr being a TableExpr, but not `local a = { x = 1 }, local v = a`
 fn check_table_expr_content(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
@@ -893,7 +893,7 @@ fn check_table_expr_content(
         let expr_fact = semantic_model.infer_expr_fact(value_expr.clone());
         let expr_type = expr_fact.typ().clone();
 
-        // 位于的最后的 TableFieldValue 允许接受函数调用返回的多值, 而且返回的值必然会从下标 1 开始覆盖掉所有索引字段.
+        // The last TableFieldValue may accept multiple values from a function call, and the returned values necessarily overwrite all index fields starting from index 1.
         if field.is_value_field()
             && idx == fields.len() - 1
             && let LuaType::Variadic(variadic) = &expr_type
@@ -939,7 +939,7 @@ fn check_table_expr_content(
             && should_check_nested_table_fields(&source_type)
             && let Some(table_expr) = LuaTableExpr::cast(value_expr.syntax().clone())
         {
-            // 检查子表
+            // Check the sub-table
             if let Some(result) =
                 check_table_expr_content(context, semantic_model, &source_type, &table_expr)
             {
@@ -1038,7 +1038,7 @@ fn check_assign_type_mismatch(
     source_is_direct_target: bool,
 ) -> Option<bool> {
     let source_type = source_type.unwrap_or(&LuaType::Any);
-    // 如果一致, 则不进行类型检查
+    // If identical, skip the type check
     if source_type == value_type {
         return Some(false);
     }
@@ -1057,16 +1057,16 @@ fn check_assign_type_mismatch(
         return Some(false);
     }
 
-    // 某些情况下我们应允许可空, 例如: boolean[]
+    // In some cases nullable should be allowed, e.g. boolean[]
     if allow_nil && value_type.is_nullable() {
         return Some(false);
     }
 
     match (&source_type, &value_type) {
-        // 如果源类型是定义类型, 则仅在目标类型是定义类型或引用类型时进行类型检查
+        // If the source type is a definition type, only check when the target type is a definition or reference type
         (LuaType::Def(_), LuaType::Def(_) | LuaType::Ref(_)) => {}
         (LuaType::Def(_), _) => return Some(false),
-        // 此时检查交给 table_field
+        // The check is left to table_field here
         (LuaType::Ref(_) | LuaType::Tuple(_), LuaType::TableConst(_)) => return Some(false),
         // Inferred/derived nil is a sentinel. Explicit nil/void direct targets remain authoritative.
         (LuaType::Nil, _) if !source_is_explicit => return Some(false),

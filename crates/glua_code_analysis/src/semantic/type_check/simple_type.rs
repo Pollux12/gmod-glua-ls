@@ -375,7 +375,7 @@ fn get_alias_real_type<'a>(
     Ok(compact_type)
 }
 
-/// 检查基础类型是否匹配自定义类型
+/// Checks whether a basic type matches a custom type
 fn check_base_type_for_ref_compact(
     context: &mut TypeCheckContext,
     source: &LuaType,
@@ -423,7 +423,7 @@ fn check_base_type_for_ref_compact(
     Err(TypeCheckFailReason::TypeNotMatch)
 }
 
-/// 检查`enum`的所有字段是否匹配`source`
+/// Checks whether all fields of the `enum` match `source`
 fn check_enum_fields_match_source(
     context: &mut TypeCheckContext,
     source: &LuaType,

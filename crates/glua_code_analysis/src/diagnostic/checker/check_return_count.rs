@@ -27,7 +27,7 @@ impl Checker for CheckReturnCount {
     }
 }
 
-// 获取(是否doc标注过返回值, 返回值类型)
+// Get (whether the return values are doc-annotated, the return value types)
 fn get_function_return_info(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
@@ -68,17 +68,17 @@ fn check_missing_return(
     let (is_doc_resolve_return, return_type) =
         get_function_return_info(context, semantic_model, closure_expr)?;
 
-    // 如果返回状态不是 DocResolve, 则跳过检查
+    // Skip the check if the return status is not DocResolve
     if !is_doc_resolve_return {
         return None;
     }
 
-    // 最小返回值数
+    // Minimum number of return values
     let min_expected_return_count = match &return_type {
         LuaType::Variadic(variadic) => {
             let min_len = variadic.get_min_len()?;
             let mut real_min_len = min_len;
-            // 逆序检查
+            // Check in reverse order
             if min_len > 0 {
                 for i in (0..min_len).rev() {
                     if let Some(ty) = variadic.get_type(i) {
@@ -107,7 +107,7 @@ fn check_missing_return(
         );
     }
 
-    // 检测缺少返回语句需要处理 if while
+    // Detecting a missing return statement needs to handle if and while
     if min_expected_return_count > 0 {
         let range = if let Some(block) = closure_expr.get_block() {
             let result = check_return_block(context, semantic_model, block);
@@ -147,12 +147,12 @@ fn check_return_block(
     semantic_model: &SemanticModel,
     block: LuaBlock,
 ) -> Result<(), LuaBlock> {
-    // 检查是否存在return语句
+    // Check whether a return statement exists
     if block.children::<LuaReturnStat>().count() > 0 {
         return Ok(());
     }
 
-    // 检查是否 error() 了
+    // Check whether error() is called
     for call_expr_stat in block.children::<LuaCallExprStat>() {
         if let Some(call_expr) = call_expr_stat.get_call_expr()
             && call_expr.is_error()
@@ -161,7 +161,7 @@ fn check_return_block(
         }
     }
 
-    // 检查`if`和`while`语句
+    // Check `if` and `while` statements
     let has_return = check_if_stat(context, semantic_model, &block)?
         | check_while_stat(context, semantic_model, &block)?;
 
@@ -175,7 +175,7 @@ fn check_if_stat(
 ) -> Result<bool, LuaBlock> {
     let mut has_return = false;
     for if_stat in block.children::<LuaIfStat>() {
-        // 检查`if`的主块
+        // Check the main block of the `if`
         if let Some(if_block) = if_stat.get_block() {
             if check_return_block(context, semantic_model, if_block.clone()).is_err() {
                 has_return = false;
@@ -184,7 +184,7 @@ fn check_if_stat(
             return Err(block.clone());
         }
 
-        // 检查所有条件分支
+        // Check all conditional branches
         for clause in if_stat.get_all_clause() {
             if let Some(clause_block) = clause.get_block() {
                 if check_return_block(context, semantic_model, clause_block.clone()).is_err() {
@@ -195,7 +195,7 @@ fn check_if_stat(
             }
         }
 
-        // 检查是否存在`else`分支, 如果存在则上面已经检查过
+        // Check whether an `else` branch exists; if so it was already checked above
         if if_stat.get_else_clause().is_some() {
             has_return = true;
         }
@@ -221,7 +221,7 @@ fn check_while_stat(
             return Err(block.clone());
         }
 
-        // 检查`while`条件是否恒真, 如果恒真则代表存在返回语句(上面已经检查过子块)
+        // Check whether the `while` condition is always true; if so a return statement exists (the sub-block was checked above)
         if is_while_condition_true(semantic_model, &while_stat).is_some() {
             has_return = true;
         }
@@ -229,7 +229,7 @@ fn check_while_stat(
     Ok(has_return)
 }
 
-/// 确定 LuaWhileStat 的条件表达式是否为`true`
+/// Determines whether the condition expression of a LuaWhileStat is `true`
 fn is_while_condition_true(
     semantic_model: &SemanticModel,
     while_stat: &LuaWhileStat,
@@ -250,7 +250,7 @@ fn is_while_condition_true(
     }
 }
 
-/// 检查返回值数量
+/// Checks the number of return values
 fn check_return_count(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
@@ -265,7 +265,7 @@ fn check_return_count(
         _ => Some(1),
     };
 
-    // 计算实际返回的表达式数量并记录多余的范围
+    // Count the expressions actually returned and record the excess range
     let expr_list = return_stat.get_expr_list().collect::<Vec<_>>();
     let mut total_return_count = 0;
     let mut tail_return_nil = false;
@@ -301,7 +301,7 @@ fn check_return_count(
         return Some(());
     }
 
-    // 检查缺失的返回值
+    // Check for missing return values
     if total_return_count < min_expected_return_count {
         context.add_diagnostic(
             DiagnosticCode::MissingReturnValue,
@@ -316,7 +316,7 @@ fn check_return_count(
         );
     }
 
-    // 检查多余的返回值
+    // Check for excess return values
     for range in redundant_ranges {
         context.add_diagnostic(
             DiagnosticCode::RedundantReturnValue,

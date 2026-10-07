@@ -31,7 +31,7 @@ pub fn instantiate_alias_call(
             if operands.len() != 2 {
                 return LuaType::Unknown;
             }
-            // 如果类型为`Union`且只有一个类型, 则会解开`Union`包装
+            // If the type is `Union` with a single type, unwrap the `Union`
             TypeOps::Remove.apply(db, &operands[0], &operands[1])
         }
         LuaAliasCallKind::Add => {
@@ -57,7 +57,7 @@ pub fn instantiate_alias_call(
                 .collect::<Vec<_>>();
             LuaType::Tuple(LuaTupleType::new(member_key_types, LuaTupleStatus::InferResolve).into())
         }
-        // 条件类型不在此处理
+        // Conditional types are not handled here
         LuaAliasCallKind::Extends => {
             if operands.len() != 2 {
                 return LuaType::Unknown;

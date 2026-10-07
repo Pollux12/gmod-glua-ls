@@ -197,8 +197,8 @@ pub fn make_auto_require(
     add_to: FileId,
     need_require_file_id: FileId,
     position: Position,
-    local_name: String,          // 导入时使用的名称
-    member_name: Option<String>, // 导入的成员名, 不要包含前缀`.`号, 它将拼接到 `require` 后面. 例如 require("a").member
+    local_name: String,          // Name used on import
+    member_name: Option<String>, // Imported member name, without the leading `.`; it is appended after `require`. For example require("a").member
 ) -> Command {
     let args = vec![
         serde_json::to_value(add_to).unwrap(),

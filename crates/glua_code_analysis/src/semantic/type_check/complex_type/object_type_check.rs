@@ -317,7 +317,7 @@ fn check_object_type_compact_table_const(
     let member_index = db.get_member_index();
     let source_fields = source_object.get_fields();
 
-    // 检查名称字段
+    // Check name fields
     for (key, source_type) in source_fields {
         let member_item = match member_index.get_member_item(&member_owner, key) {
             Some(member_item) => member_item,
@@ -345,7 +345,7 @@ fn check_object_type_compact_table_const(
         return Ok(());
     }
 
-    // 检查索引访问字段
+    // Check index access fields
     let members = member_index.get_members(&member_owner).unwrap_or_default();
     for (key_type, source_type) in source_object.get_index_access() {
         for member in &members {

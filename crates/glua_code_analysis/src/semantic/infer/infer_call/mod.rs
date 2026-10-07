@@ -163,7 +163,7 @@ fn infer_call_expr_func_miss(
             args_count,
         ),
         LuaType::Union(union) => {
-            // 此时我们将其视为泛型实例化联合体
+            // Treat it as a generic-instantiation union here
             if union.types().all(|t| matches!(t, LuaType::DocFunction(_))) {
                 infer_generic_doc_function_union(db, cache, union, call_expr.clone(), args_count)
             } else {
@@ -1819,7 +1819,7 @@ fn infer_union(
     call_expr: LuaCallExpr,
     args_count: Option<usize>,
 ) -> InferCallFuncResult {
-    // 此时一般是 signature + doc_function 的联合体
+    // This is usually a union of signature + doc_function
     let mut all_overloads = Vec::new();
     let mut base_signatures = Vec::new();
 
@@ -1835,7 +1835,7 @@ fn infer_union(
                         return Err(InferFailReason::UnResolveSignatureReturn(signature_id));
                     }
 
-                    // 处理 overloads
+                    // Handle overloads
                     let overloads = if signature.is_generic() {
                         signature
                             .overloads
@@ -1854,7 +1854,7 @@ fn infer_union(
                     };
                     all_overloads.extend(overloads);
 
-                    // 处理 signature 本身的函数类型
+                    // Handle the signature's own function type
                     let mut fake_doc_function = LuaFunctionType::new(
                         signature.async_state,
                         signature.is_colon_define,
@@ -2127,7 +2127,7 @@ fn signature_is_generic(
         };
         let prefix_type = infer_expr(db, cache, index_expr.get_prefix_expr()?).ok()?;
         match prefix_type {
-            // 对于 Generic 直接认为是泛型
+            // Treat Generic directly as generic
             LuaType::Generic(_) => Some(true),
             _ => Some(prefix_type.contain_tpl()),
         }

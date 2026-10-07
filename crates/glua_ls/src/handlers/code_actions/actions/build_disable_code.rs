@@ -88,7 +88,7 @@ pub fn build_disable_next_line_changes(
     let stat = token.parent_ancestors().find_map(LuaStat::cast)?;
     let mut ast = DisableLineAst::Stat(stat.clone());
     let expr = token.parent_ancestors().find_map(LuaExpr::cast);
-    // 如果 expr 是 stat 的子节点, 则认为是 expr
+    // If expr is a child node of stat, treat it as expr
     if let Some(expr) = expr
         && stat.get_range().contains(expr.get_range().start())
     {

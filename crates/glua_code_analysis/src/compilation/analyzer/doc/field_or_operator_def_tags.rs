@@ -151,8 +151,8 @@ pub fn analyze_field(analyzer: &mut DocAnalyzer, tag: LuaDocTagField) -> Option<
     }
 
     if !description.is_empty() {
-        // 不需要传入`owner`, 当前`owner`的效果是判断是否为`signature`, 如果是则不移除`['#', '@']`首字符
-        // 但以`field`定义的必须移除首字符
+        // `owner` need not be passed in; it only decides whether the owner is a `signature`, in which case the leading `['#', '@']` is not removed
+        // but a `field` definition must always remove the leading character
         let description = preprocess_description(&description, None);
         analyzer.db.get_property_index_mut().add_description(
             analyzer.file_id,

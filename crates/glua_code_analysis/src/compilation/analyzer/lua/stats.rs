@@ -49,7 +49,7 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
         for local_name in name_list {
             let position = local_name.get_position();
             let decl_id = LuaDeclId::new(analyzer.file_id, position);
-            // 标记了延迟定义属性, 此时将跳过绑定类型, 等待第一次赋值时再绑定类型
+            // A deferred-definition attribute is set: skip binding the type and bind it on the first assignment
             if has_delayed_definition_attribute(analyzer, decl_id) {
                 return Some(());
             }
@@ -161,7 +161,7 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                     continue;
                 }
 
-                // 当`call`参数包含表时, 表可能未被分析, 需要延迟
+                // When the `call` arguments contain a table, the table may not have been analyzed yet and must be deferred
                 if let LuaType::Instance(instance) = &expr_type
                     && instance.get_base().is_unknown()
                     && call_expr_has_effect_table_arg(&expr).is_some()
@@ -1044,7 +1044,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             continue;
         }
 
-        // 如果具有延迟定义属性, 则先绑定最初的定义
+        // With a deferred-definition attribute, bind the initial definition first
         if let LuaVarExpr::NameExpr(name_expr) = var {
             if let Some(decl_id) = get_delayed_definition_decl_id(analyzer, name_expr) {
                 analyzer.write(StatementWrite::BindType {
@@ -2917,7 +2917,7 @@ pub(super) fn is_local_mutable(analyzer: &LuaAnalyzer, decl_id: LuaDeclId) -> bo
         .unwrap_or(false)
 }
 
-// 获取延迟定义的声明id
+// Get the declaration id of the deferred definition
 fn get_delayed_definition_decl_id(
     analyzer: &LuaAnalyzer,
     name_expr: &LuaNameExpr,

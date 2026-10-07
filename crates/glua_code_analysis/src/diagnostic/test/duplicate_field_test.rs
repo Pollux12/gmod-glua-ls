@@ -203,7 +203,7 @@ mod test {
     #[test]
     fn test_duplicate_function_4() {
         let mut ws = VirtualWorkspace::new();
-        // 如果是 .member = 参数, 则不报错
+        // No error for `.member = param`
         assert!(ws.check_code_for(
             DiagnosticCode::DuplicateSetField,
             r#"

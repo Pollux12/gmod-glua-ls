@@ -4243,7 +4243,7 @@ fn get_real_type_with_depth<'a>(
     }
 }
 
-// 第一个参数是否不应该视为 self
+// Whether the first parameter should not be treated as self
 pub fn first_param_may_not_self(typ: &LuaType) -> bool {
     if typ.is_table()
         || matches!(

@@ -143,7 +143,7 @@ fn check_export_index_expr(
     if !decl.is_local() {
         return Some(());
     }
-    // 且该声明标记了 `export`
+    // and the declaration is marked `export`
     let property = semantic_model
         .get_db()
         .get_property_index()
@@ -157,7 +157,7 @@ fn check_export_index_expr(
         return Some(());
     };
 
-    // 不是导入表, 且定义位于当前文件中, 则尝试检查本地表.
+    // Not an imported table and defined in the current file, so try checking the local table.
     if code != DiagnosticCode::UndefinedField && table_const.file_id != semantic_model.get_file_id()
     {
         return Some(());
@@ -423,7 +423,7 @@ fn check_require_table_const_with_export<'a>(
         .get_local_reference(&semantic_model.get_file_id())
         .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))?;
 
-    // 获取声明
+    // Get the declaration
     let decl = semantic_model
         .get_db()
         .get_decl_index()

@@ -2484,13 +2484,13 @@ fn infer_custom_type_member(
         return Ok(dynamic_field.typ);
     }
 
-    // 解决`key`为表达式的情况
+    // Handle `key` being an expression
     if let LuaIndexKey::Expr(expr) = index_key
         && let Some(keys) = get_expr_member_key(db, cache, &expr)
     {
         let mut result_types = Vec::new();
         for key in keys {
-            // 解决 enum[enum] | class[class] 的情况
+            // Handle enum[enum] | class[class]
             if let Some(member_type) = get_expr_key_members(db, &key, &owner) {
                 result_types.push(member_type);
                 continue;
@@ -2621,7 +2621,7 @@ fn get_expr_key_members(
 
 fn get_all_member_key(db: &DbIndex, origin_type: &LuaType) -> Option<Vec<LuaMemberKey>> {
     let mut result = Vec::new();
-    let mut stack = vec![origin_type.clone()]; // 堆栈用于迭代处理
+    let mut stack = vec![origin_type.clone()]; // Stack used for iterative processing
     let mut visited = FxHashSet::default();
 
     while let Some(current_type) = stack.pop() {
@@ -2640,7 +2640,7 @@ fn get_all_member_key(db: &DbIndex, origin_type: &LuaType) -> Option<Vec<LuaMemb
                             result.push((*i).into());
                         }
                         LuaType::Ref(_) => {
-                            stack.push(typ.clone()); // 将 Ref 类型推入堆栈进一步处理
+                            stack.push(typ.clone()); // Push the Ref type onto the stack for further processing
                         }
                         _ => {}
                     }
@@ -2649,7 +2649,7 @@ fn get_all_member_key(db: &DbIndex, origin_type: &LuaType) -> Option<Vec<LuaMemb
             LuaType::Union(union_type) => {
                 for typ in union_type.types() {
                     if let LuaType::Ref(_) = typ {
-                        stack.push(typ.clone()); // 推入堆栈
+                        stack.push(typ.clone()); // Push onto the stack
                     }
                 }
             }
@@ -3998,7 +3998,7 @@ fn get_expr_member_key(
         }
     }
 
-    // 转换为 Vec 并排序以确保顺序确定性
+    // Convert to a Vec and sort to ensure deterministic order
     let mut keys: Vec<_> = keys.into_iter().collect();
     keys.sort();
     Some(keys)

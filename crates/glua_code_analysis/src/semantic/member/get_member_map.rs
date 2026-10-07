@@ -50,7 +50,7 @@ fn build_member_map(
     for member in members {
         let key = member.key.clone();
         let typ = &member.typ;
-        // 通常是泛型实例化推断结果
+        // Usually a generic instantiation inference result
         if let LuaType::Union(u) = typ
             && u.types().all(|f| f.is_function())
         {

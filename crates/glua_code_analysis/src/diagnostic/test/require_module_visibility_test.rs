@@ -7,7 +7,7 @@ mod tests {
         let mut ws = VirtualWorkspace::new();
         ws.enable_check(DiagnosticCode::RequireModuleNotVisible);
 
-        // 定义具有 @export namespace 限制的模块
+        // Define a module with an @export namespace restriction
         ws.def_file(
             "test.lua",
             r#"
@@ -33,7 +33,7 @@ mod tests {
         let mut ws = VirtualWorkspace::new();
         ws.enable_check(DiagnosticCode::RequireModuleNotVisible);
 
-        // `@export`没有命名空间限制
+        // `@export` without a namespace restriction
         ws.def_file(
             "test.lua",
             r#"
@@ -59,7 +59,7 @@ mod tests {
         let mut ws = VirtualWorkspace::new();
         ws.enable_check(DiagnosticCode::RequireModuleNotVisible);
 
-        // 如果是`@export namespace` 但当前文件没有命名空间, 则视为不可见
+        // With `@export namespace` but no namespace in the current file, the module is treated as invisible
         ws.def_file(
             "test.lua",
             r#"

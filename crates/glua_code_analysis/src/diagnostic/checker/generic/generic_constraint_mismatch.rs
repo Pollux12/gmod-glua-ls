@@ -159,7 +159,7 @@ fn check_param(
     from_union: bool,
     substitutor: &TypeSubstitutor,
 ) -> Option<()> {
-    // 应该先通过泛型体操约束到唯一类型再进行检查
+    // Should first be constrained to a single type through generic gymnastics before checking
     match param_type {
         LuaType::StrTplRef(str_tpl_ref) => {
             let extend_type = str_tpl_ref.get_constraint().cloned().map(|ty| {
@@ -208,7 +208,7 @@ fn check_param(
             validate_tpl_ref(context, semantic_model, &extend_type, arg_type, arg_range);
         }
         LuaType::Union(union_type) => {
-            // 如果不是来自 union, 才展开 union 中的每个类型进行检查
+            // Only when not from a union, expand each type in the union and check
             if !from_union {
                 for union_member_type in union_type.types() {
                     check_param(

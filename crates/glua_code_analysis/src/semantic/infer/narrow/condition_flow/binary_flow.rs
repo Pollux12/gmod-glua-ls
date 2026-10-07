@@ -773,7 +773,7 @@ fn maybe_var_eq_narrow(
 
             let result_type = match condition_flow {
                 InferConditionFlow::TrueCondition => {
-                    // self 是特殊的, 我们删除其 nil 类型
+                    // self is special; remove its nil type
                     if var_ref_id.is_self_ref() && !right_expr_type.is_nil() {
                         TypeOps::Remove.apply(db, &right_expr_type, &LuaType::Nil)
                     } else {

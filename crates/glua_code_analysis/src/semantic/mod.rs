@@ -599,7 +599,7 @@ impl<'a> SemanticModel<'a> {
         .ok()
     }
 
-    /// 推断表达式列表类型, 位于最后的表达式会触发多值推断
+    /// Infers the types of an expression list; the last expression triggers multi-value inference
     pub fn infer_expr_list_types(
         &self,
         exprs: &[LuaExpr],
@@ -659,7 +659,7 @@ impl<'a> SemanticModel<'a> {
         )
     }
 
-    /// 推断值已经绑定的类型(不是推断值的类型). 例如从右值推断左值类型, 从调用参数推断函数参数类型
+    /// Infers the type a value is already bound to (not the type of the value itself). For example, inferring the left value type from the right value, or the function parameter type from call arguments
     pub fn infer_bind_value_type(&self, expr: LuaExpr) -> Option<LuaType> {
         infer_bind_value_type(self.db, &mut self.infer_cache.borrow_mut(), expr)
     }

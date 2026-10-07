@@ -14,7 +14,7 @@ pub struct CompletionBuilder<'a> {
     cancel_token: CancellationToken,
     stopped: bool,
     pub trigger_kind: CompletionTriggerKind,
-    /// 是否为空格字符触发的补全(非主动触发)
+    /// Whether completion was triggered by a space character (not triggered explicitly)
     pub is_space_trigger_character: bool,
     pub position_offset: TextSize,
     supports_deprecated_completion_tags: bool,
@@ -75,7 +75,7 @@ impl<'a> CompletionBuilder<'a> {
         self.trigger_token.text().trim_end().to_string()
     }
 
-    /// 主动补全
+    /// Explicitly triggered completion
     pub fn is_invoked(&self) -> bool {
         self.trigger_kind == CompletionTriggerKind::INVOKED
     }

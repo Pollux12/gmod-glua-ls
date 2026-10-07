@@ -332,7 +332,7 @@ pub fn analyze_alias(analyzer: &mut DocAnalyzer, tag: LuaDocTagAlias) -> Option<
     Some(())
 }
 
-/// 分析属性定义
+/// Analyzes an attribute definition
 pub fn analyze_attribute(analyzer: &mut DocAnalyzer, tag: LuaDocTagAttribute) -> Option<()> {
     let file_id = analyzer.file_id;
     let name_token = tag.get_name_token()?;

@@ -18,8 +18,8 @@ pub fn check_doc_func_type_compact(
     compact_type: &LuaType,
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
-    // TODO: 缓存以提高性能
-    // 如果是泛型+不包含模板参数+alias, 那么尝试实例化再检查
+    // TODO: cache to improve performance
+    // If it is generic + no template parameters + alias, try instantiating before checking
     if let LuaType::Generic(generic) = compact_type {
         if !generic.contain_tpl() {
             let base_id = generic.get_base_type_id();

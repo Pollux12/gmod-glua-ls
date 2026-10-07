@@ -151,7 +151,7 @@ fn check_deprecated(
 
         context.add_diagnostic(DiagnosticCode::Deprecated, range, deprecated_message, None);
     }
-    // 检查特性
+    // Check attributes
     if let Some(attribute_uses) = property.attribute_uses() {
         for attribute_use in attribute_uses.iter() {
             if attribute_use.id.get_name() == "deprecated" {

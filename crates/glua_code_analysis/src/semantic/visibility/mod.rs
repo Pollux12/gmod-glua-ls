@@ -173,7 +173,7 @@ fn check_def_visibility(
     let prefix_expr = index_expr.get_prefix_expr()?;
     let typ = infer_expr(db, infer_config, prefix_expr.clone()).ok()?;
 
-    // 这是为解决 require 后仍然是`Def`类型的问题, 但现在不需要了, 不过还是留着以防万一
+    // This fixed `require` results still being a `Def` type; it is no longer needed but kept just in case
     // if !in_def_file(db, &typ, file_id) {
     //     return Some(false);
     // }

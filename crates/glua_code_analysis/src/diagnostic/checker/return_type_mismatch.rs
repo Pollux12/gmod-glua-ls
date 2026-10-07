@@ -78,7 +78,7 @@ fn check_return_stat(
     let (return_expr_types, return_expr_ranges) = {
         let infos = semantic_model.infer_expr_list_types(&return_exprs, None);
         let mut return_expr_types = infos.iter().map(|(typ, _)| typ.clone()).collect::<Vec<_>>();
-        // 解决 setmetatable 的返回值类型问题
+        // Resolve the return type of setmetatable
         let setmetatable_index = has_setmetatable(context, semantic_model, return_stat);
         if let Some(setmetatable_index) = setmetatable_index {
             return_expr_types[setmetatable_index] = LuaType::Any;
@@ -147,7 +147,7 @@ fn check_return_stat(
                 if return_expr_type.is_table()
                     && let Some(return_expr) = return_exprs.first()
                 {
-                    // 表字段已经报错了, 则不添加返回值不匹配的诊断避免干扰
+                    // The table field already reports an error, so do not add a return mismatch diagnostic to avoid noise
                     if let Some(add_diagnostic) = check_table_expr(
                         context,
                         semantic_model,
@@ -247,7 +247,7 @@ fn has_setmetatable(
     None
 }
 
-/// 获取 self 实际类型
+/// Gets the actual type of self
 fn get_self_type(semantic_model: &SemanticModel, closure_expr: &LuaClosureExpr) -> Option<LuaType> {
     let parent = closure_expr.syntax().parent()?;
     let func_stat = LuaFuncStat::cast(parent)?;

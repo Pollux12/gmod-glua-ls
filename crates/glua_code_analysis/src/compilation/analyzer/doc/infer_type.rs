@@ -781,10 +781,10 @@ fn infer_conditional_type(
     cond_type: &LuaDocConditionalType,
 ) -> LuaType {
     if let Some((condition, when_true, when_false)) = cond_type.get_types() {
-        // 收集条件中的所有 infer 声明
+        // Collect all infer declarations in the condition
         let infer_params = collect_cond_infer_params(&condition);
         if !infer_params.is_empty() {
-            // 条件表达式中 infer 声明的类型参数只允许在`true`分支中使用
+            // Type parameters declared by infer in the condition may only be used in the `true` branch
             let true_range = when_true.get_range();
             let scope_id = analyzer
                 .generic_index
@@ -794,7 +794,7 @@ fn infer_conditional_type(
                 .append_generic_params(scope_id, infer_params.clone());
         }
 
-        // 处理条件和分支类型
+        // Process the condition and branch types
         let condition_type = infer_type(analyzer, condition);
         let true_type = infer_type(analyzer, when_true);
         let false_type = infer_type(analyzer, when_false);
@@ -812,7 +812,7 @@ fn infer_conditional_type(
     LuaType::Unknown
 }
 
-/// 收集条件类型中的条件表达式中所有 infer 声明
+/// Collects all infer declarations in the condition expression of a conditional type
 fn collect_cond_infer_params(doc_type: &LuaDocType) -> Vec<GenericParam> {
     let mut params = Vec::new();
     let doc_infer_types = doc_type.descendants::<LuaDocInferType>();

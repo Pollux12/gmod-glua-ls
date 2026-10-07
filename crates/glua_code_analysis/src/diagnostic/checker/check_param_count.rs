@@ -38,7 +38,7 @@ impl Checker for CheckParamCountChecker {
     }
 }
 
-/// 处理左值已绑定类型但右值为匿名函数的情况
+/// Handles the case where the left value has a bound type but the right value is an anonymous function
 fn check_closure_expr(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
@@ -84,7 +84,7 @@ fn check_closure_expr(
         .get_params()
         .collect::<Vec<_>>();
 
-    // 只检查右值参数多于左值参数的情况, 右值参数少于左值参数的情况是能够接受的
+    // Only check when the right value has more parameters than the left; fewer is acceptable
     if source_params_len > params.len() {
         return Some(());
     }
@@ -131,7 +131,7 @@ fn check_call_expr(
     let call_args = call_expr.get_args_list()?.get_args().collect::<Vec<_>>();
     let mut call_args_count = call_args.len();
     let last_arg_is_dots = call_args.last().is_some_and(is_dots_expr);
-    // 根据冒号定义与冒号调用的情况来调整调用参数的数量
+    // Adjust the number of call arguments according to colon definition and colon call
     let colon_call = call_expr.is_colon_call();
     let colon_define = func.is_colon_define();
     match (colon_call, colon_define) {
@@ -147,7 +147,7 @@ fn check_call_expr(
 
     // Check for missing parameters
     if call_args_count < fake_params.len() {
-        // 调用参数包含 `...`
+        // The call arguments contain `...`
         for arg in call_args.iter() {
             if let LuaExpr::LiteralExpr(literal_expr) = arg
                 && let Some(LuaLiteralToken::Dots(_)) = literal_expr.get_literal()
@@ -155,7 +155,7 @@ fn check_call_expr(
                 return Some(());
             }
         }
-        // 对调用参数的最后一个参数进行特殊处理
+        // Special handling for the last call argument
         if let Some(last_arg) = call_args.last()
             && let Ok(last_arg_type) = semantic_model.infer_expr(last_arg.clone())
             && let Some(spread_len) = spread_arg_max_len(&last_arg_type)
@@ -238,7 +238,7 @@ fn check_call_expr(
             return Some(());
         }
 
-        // 参数定义中最后一个参数是 `...`
+        // The last parameter in the definition is `...`
         if fake_params.last().is_some_and(|(name, typ)| {
             name == "..." || typ.as_ref().is_some_and(|typ| typ.is_variadic())
         }) {
@@ -398,7 +398,7 @@ fn get_semantic_decl_value_expr(db: &DbIndex, semantic_decl: LuaSemanticDeclId) 
 
 fn get_params_len(params: &[(String, Option<LuaType>)]) -> Option<usize> {
     if let Some((name, typ)) = params.last() {
-        // 如果最后一个参数是可变参数, 则直接返回, 不需要检查
+        // If the last parameter is variadic, return directly without checking
         if name == "..." || typ.as_ref().is_some_and(|typ| typ.is_variadic()) {
             return None;
         }

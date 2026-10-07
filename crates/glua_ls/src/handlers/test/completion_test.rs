@@ -69,7 +69,7 @@ mod tests {
             ],
         ));
 
-        // 主动触发补全
+        // Explicitly triggered completion
         check!(ws.check_completion(
             r#"
                 ---@overload fun(event: "AAA", callback: fun(trg: string, data: number)): number
@@ -97,7 +97,7 @@ mod tests {
             ],
         ));
 
-        // 被动触发补全
+        // Passively triggered completion
         check!(ws.check_completion_with_kind(
             r#"
                 ---@overload fun(event: "AAA", callback: fun(trg: string, data: number)): number
@@ -126,7 +126,7 @@ mod tests {
     #[gtest]
     fn test_3() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
-        // 被动触发补全
+        // Passively triggered completion
         check!(ws.check_completion_with_kind(
             r#"
                 ---@class Test
@@ -150,7 +150,7 @@ mod tests {
             CompletionTriggerKind::TRIGGER_CHARACTER,
         ));
 
-        // 主动触发补全
+        // Explicitly triggered completion
         check!(ws.check_completion(
             r#"
                 ---@class Test1
@@ -1398,7 +1398,7 @@ mod tests {
     #[gtest]
     fn test_auto_require_field_1() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
-        // 没有 export 标记, 不允许子字段自动导入
+        // No export tag, so child fields are not allowed to be auto-imported
         ws.def_file(
             "AAA.lua",
             r#"
@@ -1681,7 +1681,7 @@ mod tests {
                 A = {}
             "#,
         );
-        // 测试索引成员别名语法
+        // Test the index member alias syntax
         check!(ws.check_completion(
             r#"
                 A.<??>

@@ -234,7 +234,7 @@ impl WorkspaceManager {
             // Perform reindex with minimal lock holding time
             {
                 let mut analysis = analysis.write().await;
-                // 在重新索引之前清理不存在的文件
+                // Remove files that no longer exist before reindexing
                 analysis.cleanup_nonexistent_files();
                 // Release lock immediately after cleanup
             }
@@ -1062,7 +1062,7 @@ impl ReindexToken {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(self.time_sleep) => {
-                    // 获取锁来安全地访问和修改 need_re_sleep
+                    // Acquire the lock to safely access and modify need_re_sleep
                     let mut need_re_sleep = self.need_re_sleep.lock().await;
                     if *need_re_sleep {
                         *need_re_sleep = false;
@@ -1086,7 +1086,7 @@ impl ReindexToken {
     }
 
     pub async fn set_resleep(&self) {
-        // 获取锁来安全地修改 need_re_sleep
+        // Acquire the lock to safely modify need_re_sleep
         let mut need_re_sleep = self.need_re_sleep.lock().await;
         *need_re_sleep = true;
     }

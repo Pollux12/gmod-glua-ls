@@ -1733,7 +1733,7 @@ fn resolve_member_owner(
         LuaSyntaxKind::TableFieldAssign => {
             if LuaTableField::can_cast(current_node.kind().into()) {
                 let table_field = LuaTableField::cast(current_node.clone())?;
-                // 如果表是类, 那么通过类型推断获取 owner
+                // If the table is a class, get the owner through type inference
                 if let Some(owner_id) = resolve_table_field_through_type_inference(
                     db,
                     infer_config,
@@ -1742,7 +1742,7 @@ fn resolve_member_owner(
                 ) {
                     return Some(owner_id);
                 }
-                // 非类, 那么通过右值推断
+                // Not a class, so infer through the right value
                 let value_expr = table_field.get_value_expr()?;
                 let value_node = value_expr.get_syntax_id().to_node_from_root(&root)?;
                 infer_node_semantic_decl(db, infer_config, value_node, SemanticDeclLevel::default())

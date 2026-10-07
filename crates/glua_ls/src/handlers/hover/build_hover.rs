@@ -314,7 +314,7 @@ fn build_decl_hover(
         find_decl_origin_owners(builder.compilation, builder.semantic_model, decl_id)
             .get_types(builder.semantic_model);
 
-    // 处理类型签名
+    // Handle the type signature
     if is_function(&typ) && !builder.type_label().is_inferred() {
         adjust_semantic_decls(
             builder,
@@ -323,7 +323,7 @@ fn build_decl_hover(
             &typ,
         );
 
-        // 处理函数类型
+        // Handle function types
         build_function_hover(builder, db, &semantic_decls);
         // hover_function_type(builder, db, &semantic_decls);
 
@@ -335,7 +335,7 @@ fn build_decl_hover(
             builder.set_location_path(member);
         }
 
-        // `typ`此时可能是泛型实例化后的类型, 所以我们需要从member获取原始类型
+        // `typ` may be a generic-instantiated type here, so the original type must be fetched from member
         builder
             .add_signature_params_rets_description(builder.semantic_model.get_type(decl_id.into()));
     } else {
@@ -372,7 +372,7 @@ fn build_decl_hover(
             builder.set_type_description(builder.format_type_description(description));
         }
 
-        // 添加注释文本
+        // Add the comment text
         let mut semantic_decl_set = HashSet::new();
         let decl_decl = LuaSemanticDeclId::LuaDecl(decl_id);
         semantic_decl_set.insert(&decl_decl);
@@ -597,7 +597,7 @@ fn build_member_hover(
 
         builder.set_location_path(Some(member));
 
-        // `typ`此时可能是泛型实例化后的类型, 所以我们需要从member获取原始类型
+        // `typ` may be a generic-instantiated type here, so the original type must be fetched from member
         let mut has_signature_docs = false;
         let current_signature_type = builder.semantic_model.get_type(member.get_id().into());
         let before_len = builder.annotation_description.len();
@@ -664,7 +664,7 @@ fn build_member_hover(
             builder.set_location_path(Some(member));
         }
 
-        // 添加注释文本
+        // Add the comment text
         let mut semantic_decl_set = HashSet::new();
         let member_decl = LuaSemanticDeclId::Member(member.get_id());
         semantic_decl_set.insert(&member_decl);
@@ -1241,22 +1241,22 @@ fn adjust_semantic_decls(
         return Some(());
     }
 
-    // semantic_decls 是追溯最初定义的结果, 不包含当前内容
+    // semantic_decls is the result of tracing the original definition and does not include the current content
     let current_len = semantic_decls.len();
     if current_len == 0 {
-        // 没有最初定义, 直接添加原始内容
+        // No original definition, add the original content directly
         semantic_decls.push((current_semantic_decl_id.clone(), current_type.clone()));
         return Some(());
     }
-    // 此时有最初定义, 证明当前内容的是派生的或者全部项实例化后联合的结果, 非常难以区分
-    // 如果当前定义是 LuaDecl 且追溯到了最初定义, 那么我们不需要添加
+    // With an original definition, the current content is derived or a union of all instantiated items, which is hard to tell apart
+    // If the current definition is a LuaDecl and the original definition was traced, it need not be added
     if let LuaSemanticDeclId::LuaDecl(_) = current_semantic_decl_id {
         return Some(());
     }
 
-    // 如果当前定义在最初定义组中存在, 那么我们也不需要添加.
-    // 具有一个难以解决的问题, 返回的`current_semantic_decl_id`为 member 时, 不一定是当前 token 指向的内容, 因此我们还需要再做一层判断,
-    // 如果是具有实际定义的, 我们仍然需要添加, 例如 signature.
+    // If the current definition exists in the original definition group, it also need not be added.
+    // There is a hard problem: when the returned `current_semantic_decl_id` is a member, it is not necessarily what the current token points to, so another check is needed;
+    // if it has an actual definition, it still needs to be added, e.g. signature.
     // Also exclude Unknown types: a legacy-module `NameExpr` member has its type bound to the
     // LuaDecl owner (not the Member owner), so the member's cached type is Unknown. In that case
     // we must still add the current Signature type so hover can render the function properly.
@@ -1293,7 +1293,7 @@ fn has_add_to_semantic_decls(
                 let table_expr = LuaTableExpr::cast(parent)?;
                 let table_type = semantic_model.infer_table_should_be(table_expr.clone())?;
                 if matches!(table_type, LuaType::Ref(_) | LuaType::Generic(_)) {
-                    // 如果位于函数调用中, 则不添加
+                    // Not added when inside a function call
                     let is_in_call = table_expr.ancestors::<LuaCallArgList>().next().is_some();
                     return Some(!is_in_call);
                 }

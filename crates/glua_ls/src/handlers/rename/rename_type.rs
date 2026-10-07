@@ -15,7 +15,7 @@ pub fn rename_type_references(
     let full_name = type_decl.get_full_name();
     let mut reserved_namespace = String::new();
 
-    // 取出`full_name`在当前文件中使用的命名空间
+    // Take the namespace `full_name` uses in the current file
     if let Some(file_namespace) = type_index.get_file_namespace(&semantic_model.get_file_id())
         && full_name.starts_with(&format!("{}.", file_namespace))
     {
@@ -59,7 +59,7 @@ pub fn rename_type_references(
             document_cache.get(&in_filed_reference_range.file_id)?
         };
 
-        // 根据引用文件的命名空间上下文决定使用简名还是全名
+        // Use the short or full name depending on the namespace context of the referencing file
         let actual_new_name = determine_type_name_for_file(
             semantic_model,
             in_filed_reference_range.file_id,
@@ -77,7 +77,7 @@ pub fn rename_type_references(
     Some(())
 }
 
-/// 根据引用文件的命名空间上下文决定使用简名还是全名
+/// Uses the short or full name depending on the namespace context of the referencing file
 fn determine_type_name_for_file(
     semantic_model: &SemanticModel,
     reference_file_id: glua_code_analysis::FileId,
@@ -86,7 +86,7 @@ fn determine_type_name_for_file(
 ) -> String {
     let type_index = semantic_model.get_db().get_type_index();
 
-    // 检查引用文件是否声明了相同的命名空间
+    // Check whether the referencing file declares the same namespace
     if let Some(file_namespace) = type_index.get_file_namespace(&reference_file_id) {
         if file_namespace == reserved_namespace {
             return new_simple_name.to_string();
@@ -96,7 +96,7 @@ fn determine_type_name_for_file(
         }
     }
 
-    // 检查引用文件是否使用了相应的命名空间
+    // Check whether the referencing file uses the corresponding namespace
     if let Some(using_namespaces) = type_index.get_file_using_namespace(&reference_file_id) {
         for using_namespace in using_namespaces {
             if using_namespace == reserved_namespace {
@@ -108,7 +108,7 @@ fn determine_type_name_for_file(
         }
     }
 
-    // `reserved_namespace`不为空，则使用保留的命名空间与新名称组合
+    // If `reserved_namespace` is not empty, combine it with the new name
     if !reserved_namespace.is_empty() {
         return format!("{}.{}", reserved_namespace, new_simple_name);
     }

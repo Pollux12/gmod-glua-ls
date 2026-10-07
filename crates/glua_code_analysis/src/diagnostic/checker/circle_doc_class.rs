@@ -12,7 +12,7 @@ pub struct CircleDocClassChecker;
 impl Checker for CircleDocClassChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::CircleDocClass];
 
-    /// 检查循环继承的类
+    /// Checks classes with circular inheritance
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let Some(buckets) = context.file_buckets() else {
             return;

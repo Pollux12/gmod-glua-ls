@@ -80,7 +80,7 @@ fn visible_super_types_for_index(
     }
 }
 
-/// 寻找声明的函数类型(排除自身), 假设目标具有多个声明, 那么将返回一个联合类型
+/// Finds the declared function type (excluding itself); if the target has multiple declarations, a union type is returned
 pub fn find_decl_function_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,

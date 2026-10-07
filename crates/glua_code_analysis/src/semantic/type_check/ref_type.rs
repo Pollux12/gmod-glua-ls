@@ -129,7 +129,7 @@ fn check_ref_enum(
     check_guard: TypeCheckGuard,
     type_decl: &LuaTypeDecl,
 ) -> TypeCheckResult {
-    // 直接匹配相同类型
+    // Match identical types directly
     if matches!(compact_type, LuaType::Def(id) | LuaType::Ref(id) if id == source_id) {
         return Ok(());
     }
@@ -154,7 +154,7 @@ fn check_ref_enum(
         .get_enum_field_type(context.db)
         .ok_or(TypeCheckFailReason::TypeNotMatch)?;
 
-    // 移除掉枚举类型本身
+    // Remove the enum type itself
     let compact_type = match compact_type {
         LuaType::Union(union_types) => {
             let new_types: Vec<_> = union_types
@@ -183,7 +183,7 @@ fn check_ref_enum(
         _ => compact_type.clone(),
     };
 
-    // 当 enum 的值全为整数常量时, 可能会用于位运算, 此时右值推断为整数
+    // When all enum values are integer constants they may be used in bitwise operations, so the right value is inferred as an integer
     if let LuaType::Union(union_types) = &enum_fields
         && union_types
             .types()
@@ -254,7 +254,7 @@ fn check_ref_class(
                 return Ok(());
             }
 
-            // `compact`为枚举时的额外处理
+            // Extra handling when `compact` is an enum
             if let Some(compact_decl) = context.db.get_type_index().get_type_decl(id)
                 && compact_decl.is_enum()
                 && let Some(LuaType::Union(enum_fields)) =
@@ -486,7 +486,7 @@ fn check_ref_type_compact_object(
     source_type_id: &LuaTypeDeclId,
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
-    // ref 可能继承自其他类型, 所以需要使用 infer_members 来获取所有成员
+    // ref may inherit from other types, so infer_members is needed to get all members
     let Some(source_type_members) =
         find_structural_members(context.db, &LuaType::Ref(source_type_id.clone()))
     else {
@@ -586,7 +586,7 @@ fn check_ref_type_compact_tuple(
         }
         match &key {
             LuaMemberKey::Integer(index) => {
-                // 在 lua 中数组索引从 1 开始, 当数组被解析为元组时也必然从 1 开始
+                // Array indices start at 1 in Lua, so an array parsed as a tuple also starts at 1
                 if *index <= 0 {
                     return Err(TypeCheckFailReason::TypeNotMatch);
                 }
@@ -603,7 +603,7 @@ fn check_ref_type_compact_tuple(
                 )?;
             }
             LuaMemberKey::ExprType(LuaType::Integer) => {
-                // 遍历元组确定所有内容是否匹配
+                // Walk the tuple to check that all elements match
                 for tuple_type in tuple_types {
                     check_general_type_compact(
                         context,

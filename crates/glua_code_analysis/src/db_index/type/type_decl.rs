@@ -420,7 +420,7 @@ impl LuaTypeDecl {
         })
     }
 
-    /// 获取枚举字段的类型
+    /// Gets the type of an enum field
     pub fn get_enum_field_type(&self, db: &DbIndex) -> Option<LuaType> {
         if !self.is_enum() {
             return None;

@@ -296,7 +296,7 @@ fn infer_table_type_by_callee(
     match &typ {
         LuaType::TableConst(_) => {}
         LuaType::Union(union) => {
-            // TODO: 假设存在多个匹配项, 我们需要根据字段的匹配情况来确定最终的类型
+            // TODO: if there are multiple matches, determine the final type from how the fields match
             return Ok(union_remove_non_table_type(db, union));
         }
         _ => {}
@@ -340,7 +340,7 @@ fn infer_call_arg_should_be(
     Ok(typ)
 }
 
-/// 移除掉一些非`table`类型
+/// Removes some non-`table` types
 fn union_remove_non_table_type(db: &DbIndex, union: &Arc<LuaUnionType>) -> LuaType {
     union
         .into_set()
@@ -369,7 +369,7 @@ fn infer_table_field_type_by_parent(
                 LuaType::TableConst(_) => {}
                 LuaType::Tuple(tuple) => {
                     let types = tuple.get_types();
-                    // 这种情况下缓存的类型可能是不精确的
+                    // The cached type may be imprecise in this case
                     if tuple.is_infer_resolve() && types.len() == 1 && types[0].is_unknown() {
                     } else {
                         return Ok(typ.clone());

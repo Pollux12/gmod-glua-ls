@@ -2505,7 +2505,7 @@ fn set_signature_to_default_call(
     let Some(LuaSemanticDeclId::Member(member_id)) = member_info.property_owner_id else {
         return None;
     };
-    // 我们仍然需要再做一次判断确定是否来源于`Def`类型
+    // We still need another check to confirm the origin is a `Def` type
     let root = db
         .get_vfs()
         .get_syntax_tree(&member_id.file_id)?
@@ -2516,7 +2516,7 @@ fn set_signature_to_default_call(
     let LuaType::Def(decl_id) = prefix_type else {
         return None;
     };
-    // 如果已经存在显式的`__call`定义, 则不添加
+    // Do not add if an explicit `__call` definition already exists
     let call = db.get_operator_index().get_operators(
         &LuaOperatorOwner::Type(decl_id.clone()),
         LuaOperatorMetaMethod::Call,
@@ -2529,7 +2529,7 @@ fn set_signature_to_default_call(
         decl_id.clone().into(),
         LuaOperatorMetaMethod::Call,
         member_id.file_id,
-        // 必须指向名称, 使用 index_expr 的完整范围不会跳转到函数上
+        // Must point at the name; the full range of index_expr would not jump to the function
         index_expr.get_name_token()?.syntax().text_range(),
         OperatorFunction::DefaultClassCtor {
             id: signature_id,

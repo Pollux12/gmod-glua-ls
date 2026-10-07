@@ -95,10 +95,10 @@ fn check_last(last_type: &LuaType) -> bool {
 #[allow(unused)]
 fn check_last_expr(semantic_model: &SemanticModel, last_expr: &LuaExpr) -> Option<bool> {
     match last_expr {
-        // TODO: 为 signature 建立独立规则
+        // TODO: establish a separate rule for signature
         LuaExpr::CallExpr(call_expr) => {
             Some(true)
-            // 目前仅允许 pcall 和 xpcall 禁用检查, 或许我们应该禁用所有函数调用的检查?
+            // For now only pcall and xpcall may disable the check; perhaps the check should be disabled for all function calls?
             // let decl_id = semantic_model.find_decl(
             //     call_expr.get_prefix_expr()?.syntax().clone().into(),
             //     SemanticDeclLevel::Trace(50),

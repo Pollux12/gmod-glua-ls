@@ -341,9 +341,9 @@ fn get_call_expr_var_ref_id(
 
             let obj_expr = args_iter.next()?;
             let root = call_var_ref_root(get_var_expr_var_ref_id(db, cache, obj_expr.clone())?)?;
-            // 开始构建 access_path
+            // Start building access_path
             let mut access_path = String::new();
-            access_path.push_str(obj_expr.syntax().text().to_string().as_str()); // 这里不需要精确的文本
+            access_path.push_str(obj_expr.syntax().text().to_string().as_str()); // The text need not be exact here
             access_path.push('.');
             let key_expr = args_iter.next()?;
             match key_expr {

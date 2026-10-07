@@ -39,7 +39,7 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
 fn get_token_should_type(builder: &mut CompletionBuilder) -> Option<Vec<LuaType>> {
     let token = builder.trigger_token.clone();
     let mut parent_node = token.parent()?;
-    // 输入`""`时允许往上找
+    // Allow searching upwards when `""` is typed
     if LuaLiteralExpr::can_cast(parent_node.kind().into()) {
         parent_node = parent_node.parent()?;
     }
@@ -56,7 +56,7 @@ fn get_token_should_type(builder: &mut CompletionBuilder) -> Option<Vec<LuaType>
         }
         LuaSyntaxKind::Block => {
             /*
-               补全以下形式:
+               Completes the following form:
                ```lua
                ---@class A
                ---@field func fun(a: string)
@@ -193,7 +193,7 @@ fn add_union_member_completion(
     union_typ: &LuaUnionType,
     infer_guard: &InferGuardRef,
 ) -> Option<()> {
-    // 如果存在 strtplref, 那么将其移动到最后面
+    // If a strtplref exists, move it to the end
     let mut union_types = union_typ.into_vec();
     union_types.sort_by_key(|typ| matches!(typ, LuaType::StrTplRef(_)));
 
@@ -288,7 +288,7 @@ fn infer_param_list(
         .filter(|it| !it.is_empty())
         .collect::<Vec<_>>();
 
-    // names 去掉 params 已有的
+    // names minus those already in params
     names.retain(|name| !params.contains(name));
     if names.len() > 1 {
         builder.add_completion_item(CompletionItem {
@@ -306,7 +306,7 @@ fn infer_param_list(
         });
     }
 
-    // 不返回类型, 因为字符串类型会被加上双引号, 但这里需要的是不带双引号的字符串, 我们选择直接在这里添加
+    // Do not return a type, since string types get double quotes added but a string without double quotes is needed here; we add it directly here instead
     None
 }
 
@@ -348,7 +348,7 @@ fn infer_call_arg_list(
         substitutor,
         &mut types,
     );
-    Some(types.into_iter().unique().collect()) // 需要去重
+    Some(types.into_iter().unique().collect()) // Needs deduplication
 }
 
 fn resolve_param_type(
@@ -426,7 +426,7 @@ fn push_function_overloads_param(
         SemanticDeclLevel::default(),
     )?;
 
-    // 收集函数类型
+    // Collect function types
     let functions = match semantic_decl {
         LuaSemanticDeclId::Member(member_id) => {
             let member = member_index.get_member(&member_id)?;
@@ -468,7 +468,7 @@ fn push_function_overloads_param(
         _ => None,
     }?;
 
-    // 获取重载函数列表
+    // Get the list of overloaded functions
     let signature_index = builder.semantic_model.get_db().get_signature_index();
     let mut overloads = Vec::new();
     for function in functions {
@@ -485,23 +485,23 @@ fn push_function_overloads_param(
         }
     }
 
-    // 筛选匹配的参数类型并添加到结果中
+    // Filter the matching parameter types and add them to the result
     for overload in overloads.iter() {
         let overload_params = overload.get_params();
 
-        // 检查前面的参数是否匹配
+        // Check whether the preceding parameters match
         if !params_match_prefix(call_params, overload_params, param_idx) {
             continue;
         }
 
-        // 添加匹配的参数类型
+        // Add the matching parameter types
         if let Some(param_type) = overload_params.get(param_idx).and_then(|p| p.1.clone()) {
             let param_type = resolve_param_type(builder, param_type, substitutor);
             types.push(param_type);
         }
     }
 
-    /// 过滤出函数类型的成员
+    /// Filters out members of function type
     fn filter_function_members(
         db: &DbIndex,
         members: Vec<&LuaMember>,
@@ -523,7 +523,7 @@ fn push_function_overloads_param(
         result_members
     }
 
-    /// 判断前面的参数是否匹配
+    /// Determines whether the preceding parameters match
     fn params_match_prefix(
         call_params: &[(String, Option<LuaType>)],
         overload_params: &[(String, Option<LuaType>)],
@@ -651,7 +651,7 @@ fn add_enum_members_completion(
         .sorted_by(|a, b| a.0.cmp(&b.0))
         .collect::<Vec<_>>();
 
-    // 判断是否为字符串字面量触发
+    // Determine whether it was triggered by a string literal
     let is_string_literal_trigger = builder.get_trigger_text() == "\"\""
         && builder
             .trigger_token
@@ -662,10 +662,10 @@ fn add_enum_members_completion(
 
     let file_id = builder.semantic_model.get_file_id();
     let is_same_file = locations.iter().all(|it| it.file_id == file_id);
-    // 可能存在的本地变量名
+    // Possible local variable name
     let variable_name = get_enum_decl_variable_name(builder, locations, is_same_file);
 
-    // 遍历成员并生成补全项
+    // Walk the members and generate completion items
     for (key, typ, description) in members {
         // The value a member stands for stays visible beside its name, matching
         // how declarations and members present literals elsewhere. Not under a
@@ -697,7 +697,7 @@ fn add_enum_members_completion(
             match key {
                 LuaMemberKey::Name(str) => format!("{}.{}", var_name, str),
                 LuaMemberKey::Integer(i) => format!("{}[{}]", var_name, i),
-                _ => continue, // 跳过不支持的key类型
+                _ => continue, // Skip unsupported key types
             }
         } else {
             humanize_type(builder.semantic_model.get_db(), &typ, RenderLevel::Minimal)
@@ -810,22 +810,22 @@ fn add_str_tpl_ref_completion(
     let module_index = db.get_module_index();
     let types = db.get_type_index().get_all_types();
     let tpl_id = str_tpl.get_tpl_id();
-    // 泛型约束
+    // Generic constraint
     let extend_type = get_tpl_ref_extend_type(builder, &tpl_id).unwrap_or(LuaType::Any);
 
     let mut completion_items: Vec<_> = types
         .into_iter()
-        // 过滤非类
+        // Filter out non-classes
         .filter(|type_decl| type_decl.is_class())
         .filter(|type_decl| {
-            // 过滤标准库
+            // Filter out the standard library
             !type_decl
                 .get_locations()
                 .iter()
                 .any(|loc| module_index.is_std(&loc.file_id))
         })
         .filter(|type_decl| {
-            // 检查名称是否匹配
+            // Check whether the name matches
             let name = type_decl.get_full_name();
             let prefix = str_tpl.get_prefix();
             let suffix = str_tpl.get_suffix();
@@ -834,7 +834,7 @@ fn add_str_tpl_ref_completion(
                 && (suffix.is_empty() || name.ends_with(suffix))
         })
         .filter(|type_decl| {
-            // 检查泛型约束
+            // Check the generic constraint
             let current_type = LuaType::Ref(type_decl.get_id());
             builder
                 .semantic_model
@@ -868,7 +868,7 @@ fn add_const_tpl_ref_completion(
     tpl_id: &GenericTplId,
     infer_guard: &InferGuardRef,
 ) -> Option<()> {
-    // 泛型约束
+    // Generic constraint
     let extend_type = get_tpl_ref_extend_type(builder, tpl_id)?;
     dispatch_type(builder, extend_type, infer_guard);
 
@@ -928,7 +928,7 @@ fn get_tpl_ref_extend_type(builder: &CompletionBuilder, tpl_id: &GenericTplId) -
     }
 }
 
-/// 确保所有成员均为 function 或者 nil, 然后返回 function 的联合类型, 如果非 function 则返回 None
+/// Ensures all members are function or nil, then returns a union of the functions; returns None if any is not a function
 pub fn get_function_remove_nil(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
     match typ {
         LuaType::Union(union_typ) => {

@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn test_4() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
-        // TODO 该测试被`setmetatable`强行覆盖, 未正常诊断`debug.setmetatable`
+        // TODO: this test is forcibly overridden by `setmetatable`, so `debug.setmetatable` is not diagnosed properly
         assert!(ws.check_code_for(
             DiagnosticCode::ReturnTypeMismatch,
             r#"

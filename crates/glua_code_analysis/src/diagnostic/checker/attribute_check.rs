@@ -64,7 +64,7 @@ fn check_attribute_use(
     Some(())
 }
 
-/// 检查参数数量是否匹配
+/// Checks whether the number of parameters matches
 fn check_param_count(
     context: &mut DiagnosticContext,
     def_params: &[(String, Option<LuaType>)],
@@ -72,7 +72,7 @@ fn check_param_count(
     args: &[LuaLiteralExpr],
 ) -> Option<()> {
     let call_args_count = args.len();
-    // 调用参数少于定义参数, 需要考虑可空参数
+    // Fewer call arguments than defined parameters; nullable parameters must be considered
     if call_args_count < def_params.len() {
         for def_param in def_params[call_args_count..].iter() {
             if def_param.0 == "..." {
@@ -97,9 +97,9 @@ fn check_param_count(
             );
         }
     }
-    // 调用参数多于定义参数, 需要考虑可变参数
+    // More call arguments than defined parameters; variadic parameters must be considered
     else if call_args_count > def_params.len() {
-        // 参数定义中最后一个参数是 `...`
+        // The last parameter in the definition is `...`
         if def_params.last().is_some_and(|(name, typ)| {
             name == "..." || typ.as_ref().is_some_and(|typ| typ.is_variadic())
         }) {
@@ -123,7 +123,7 @@ fn check_param_count(
     Some(())
 }
 
-/// 检查参数是否匹配
+/// Checks whether the parameters match
 fn check_param(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,

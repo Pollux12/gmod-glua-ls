@@ -381,7 +381,7 @@ pub fn get_var_ref_type(
 
         if let Some(type_cache) = db.get_type_index().get_type_cache(&decl.get_id().into()) {
             let result = type_cache.as_type().clone();
-            // 不要在此阶段展开泛型别名, 必须让后续的泛型匹配阶段基于声明形态完成推断
+            // Do not expand generic aliases at this stage; the later generic matching stage must infer from the declared form
             return Ok(result);
         }
 
