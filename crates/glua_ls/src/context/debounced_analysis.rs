@@ -284,18 +284,29 @@ impl DebouncedAnalysis {
     /// [`Self::begin_in_flight_change`] for a change confined to the document
     /// at `uri`: requests aimed at other documents stay answerable.
     pub fn begin_document_change(self: &Arc<Self>, uri: Uri) -> InFlightChangeGuard {
-        *self.in_flight_documents().entry(uri.clone()).or_default() += 1;
-        self.begin_change(Some(uri))
+        self.begin_documents_change(vec![uri])
     }
 
-    fn begin_change(self: &Arc<Self>, document: Option<Uri>) -> InFlightChangeGuard {
+    /// [`Self::begin_in_flight_change`] for a change confined to the documents
+    /// at `uris`: requests aimed at other documents stay answerable.
+    pub fn begin_documents_change(self: &Arc<Self>, uris: Vec<Uri>) -> InFlightChangeGuard {
+        {
+            let mut documents = self.in_flight_documents();
+            for uri in &uris {
+                *documents.entry(uri.clone()).or_default() += 1;
+            }
+        }
+        self.begin_change(Some(uris))
+    }
+
+    fn begin_change(self: &Arc<Self>, documents: Option<Vec<Uri>>) -> InFlightChangeGuard {
         self.in_flight_changes.fetch_add(1, Ordering::AcqRel);
         if let Some(interrupt) = self.interrupt.get() {
             interrupt.store(true, Ordering::Release);
         }
         self.has_pending_changes.store(true, Ordering::Release);
         self.notify.notify_waiters();
-        InFlightChangeGuard::new(self.clone(), document, 1)
+        InFlightChangeGuard::new(self.clone(), documents, 1)
     }
 
     /// Stops the slice in progress between two evaluations, for a request
@@ -331,20 +342,22 @@ impl DebouncedAnalysis {
         self.debounce_loop_alive.load(Ordering::Acquire)
     }
 
-    /// Settles `count` in-flight changes begun for `document`, or for no one
+    /// Settles `count` in-flight changes begun for `documents`, or for no one
     /// document when `None`.
-    pub async fn finish_in_flight_changes(&self, document: Option<&Uri>, count: usize) {
+    pub async fn finish_in_flight_changes(&self, documents: Option<&[Uri]>, count: usize) {
         if count == 0 {
             return;
         }
 
-        match document {
-            Some(uri) => {
+        match documents {
+            Some(uris) => {
                 let mut documents = self.in_flight_documents();
-                if let Some(pending) = documents.get_mut(uri) {
-                    *pending = pending.saturating_sub(count);
-                    if *pending == 0 {
-                        documents.remove(uri);
+                for uri in uris {
+                    if let Some(pending) = documents.get_mut(uri) {
+                        *pending = pending.saturating_sub(count);
+                        if *pending == 0 {
+                            documents.remove(uri);
+                        }
                     }
                 }
             }
@@ -1086,15 +1099,16 @@ impl DebouncedAnalysis {
 
 pub struct InFlightChangeGuard {
     analysis: Option<Arc<DebouncedAnalysis>>,
-    document: Option<Uri>,
+    /// The documents the change is confined to; `None` when it may touch any.
+    documents: Option<Vec<Uri>>,
     count: usize,
 }
 
 impl InFlightChangeGuard {
-    fn new(analysis: Arc<DebouncedAnalysis>, document: Option<Uri>, count: usize) -> Self {
+    fn new(analysis: Arc<DebouncedAnalysis>, documents: Option<Vec<Uri>>, count: usize) -> Self {
         Self {
             analysis: Some(analysis),
-            document,
+            documents,
             count,
         }
     }
@@ -1102,7 +1116,7 @@ impl InFlightChangeGuard {
     pub async fn finish(mut self) {
         if let Some(analysis) = self.analysis.take() {
             analysis
-                .finish_in_flight_changes(self.document.as_ref(), self.count)
+                .finish_in_flight_changes(self.documents.as_deref(), self.count)
                 .await;
         }
     }
@@ -1114,12 +1128,12 @@ impl Drop for InFlightChangeGuard {
             return;
         };
         let count = self.count;
-        let document = self.document.take();
+        let documents = self.documents.take();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
                     analysis
-                        .finish_in_flight_changes(document.as_ref(), count)
+                        .finish_in_flight_changes(documents.as_deref(), count)
                         .await;
                 });
             }
@@ -2396,6 +2410,33 @@ mod tests {
                 eq(true)
             )?;
             verify_that!(debounced_analysis.is_dirty(), eq(false))
+        })
+    }
+
+    /// Files changed on disk hold back the documents they are, not others.
+    #[gtest]
+    fn a_change_to_some_files_holds_back_only_those_documents() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounced_analysis = test_debounced_analysis();
+            let changed = ["a", "b"].map(|name| {
+                Uri::from_str(&format!("file:///workspace/{name}.lua")).expect("uri should parse")
+            });
+            let other = Uri::from_str("file:///workspace/other.lua").expect("uri should parse");
+
+            let change = debounced_analysis.begin_documents_change(changed.to_vec());
+            let answerable_during = (
+                debounced_analysis.file_is_answerable(&changed[0]).await,
+                debounced_analysis.file_is_answerable(&changed[1]).await,
+                debounced_analysis.file_is_answerable(&other).await,
+            );
+            change.finish().await;
+
+            verify_that!(answerable_during, eq((false, false, true)))?;
+            verify_that!(
+                debounced_analysis.file_is_answerable(&changed[0]).await,
+                eq(true)
+            )
         })
     }
 

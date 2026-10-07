@@ -17,7 +17,7 @@ use super::{
     configuration::on_did_change_configuration,
     text_document::{
         on_did_change_watched_files, on_did_close_document, on_did_open_text_document,
-        on_did_save_text_document, on_set_trace,
+        on_did_save_text_document, on_set_trace, watched_change_scope,
     },
     workspace::{on_did_change_workspace_folders, on_did_rename_files_handler},
 };
@@ -131,7 +131,9 @@ pub async fn on_notification_handler(
                 workspace.current_open_files.insert(uri.clone());
             }
             server_context.cancel_requests_for_uri(&uri, &[]).await;
-            let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
+            let in_flight = snapshot
+                .debounced_analysis_arc()
+                .begin_document_change(uri.clone());
             let task_snapshot = snapshot.clone();
             tokio::spawn(async move {
                 let handler_snapshot = task_snapshot.clone();
@@ -162,7 +164,9 @@ pub async fn on_notification_handler(
                 workspace.current_open_files.remove(&uri);
             }
             server_context.cancel_requests_for_uri(&uri, &[]).await;
-            let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
+            let in_flight = snapshot
+                .debounced_analysis_arc()
+                .begin_document_change(uri.clone());
             let task_snapshot = snapshot.clone();
             tokio::spawn(async move {
                 let handler_snapshot = task_snapshot.clone();
@@ -184,9 +188,13 @@ pub async fn on_notification_handler(
                 DidChangeWatchedFiles::METHOD,
             )
         {
-            spawn_pending_file_change(server_context, DidChangeWatchedFiles::METHOD, |snapshot| {
-                on_did_change_watched_files(snapshot, params)
-            });
+            let scope = watched_change_scope(&params);
+            spawn_pending_file_change(
+                server_context,
+                DidChangeWatchedFiles::METHOD,
+                scope,
+                |snapshot| on_did_change_watched_files(snapshot, params),
+            );
         }
         return Ok(());
     }
@@ -195,7 +203,8 @@ pub async fn on_notification_handler(
         if let Ok(params) = notification
             .extract::<<DidRenameFiles as LspNotification>::Params>(DidRenameFiles::METHOD)
         {
-            spawn_pending_file_change(server_context, DidRenameFiles::METHOD, |snapshot| {
+            // A renamed folder moves every file under it.
+            spawn_pending_file_change(server_context, DidRenameFiles::METHOD, None, |snapshot| {
                 on_did_rename_files_handler(snapshot, params)
             });
         }
@@ -218,18 +227,24 @@ pub async fn on_notification_handler(
 }
 
 /// Runs the handler of a change to files on disk with the change pending
-/// from the moment it arrives: a diagnostics pull answered before the handler
+/// from the moment it arrives, for the documents in `scope` or for every
+/// document when `None`: a diagnostics pull answered before the handler
 /// applies it would report the files as they were.
 fn spawn_pending_file_change<F>(
     server_context: &ServerContext,
     method: &'static str,
+    scope: Option<Vec<lsp_types::Uri>>,
     handler: impl FnOnce(ServerContextSnapshot) -> F + Send + 'static,
 ) where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
     let snapshot = server_context.snapshot();
-    let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
+    let debounced_analysis = snapshot.debounced_analysis_arc();
+    let in_flight = match scope {
+        Some(uris) => debounced_analysis.begin_documents_change(uris),
+        None => debounced_analysis.begin_in_flight_change(),
+    };
     tokio::spawn(async move {
         let handle = tokio::spawn(handler(snapshot));
         if let Err(err) = handle.await {

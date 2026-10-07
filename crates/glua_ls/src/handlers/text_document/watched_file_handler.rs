@@ -247,6 +247,20 @@ enum WatchedFileType {
     Emmyrc,
 }
 
+/// The documents a batch of watched-file changes can change: its own Lua
+/// files, or every document (`None`) when a config or `.editorconfig` file is
+/// among them.
+pub(crate) fn watched_change_scope(params: &DidChangeWatchedFilesParams) -> Option<Vec<Uri>> {
+    params
+        .changes
+        .iter()
+        .map(|change| {
+            matches!(get_file_type(&change.uri), Some(WatchedFileType::Lua))
+                .then(|| change.uri.clone())
+        })
+        .collect()
+}
+
 fn get_file_type(uri: &Uri) -> Option<WatchedFileType> {
     let path = uri_to_file_path(uri)?;
     let file_name = path.file_name()?.to_str()?;
