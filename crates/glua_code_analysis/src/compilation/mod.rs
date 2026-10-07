@@ -51,6 +51,9 @@ pub struct LuaCompilation {
     /// Each file's inference memo from the last settled re-analysis, which
     /// the file's next diagnostics take; the next re-analysis drops the rest.
     memos: Mutex<rustc_hash::FxHashMap<FileId, LuaInferCache>>,
+    /// Whether re-analyses leave worker supersteps' tasks to
+    /// [`Self::run_detached_tasks`]; see [`Self::set_detached_tasks`].
+    detach_tasks: bool,
 }
 
 /// Where the re-analysis in progress stands after
@@ -81,6 +84,7 @@ impl LuaCompilation {
             index_revision: 0,
             scopes: analyzer::ScopesCache::default(),
             memos: Mutex::default(),
+            detach_tasks: false,
         };
 
         compilation.db.update_config(emmyrc.clone());
@@ -149,6 +153,7 @@ impl LuaCompilation {
         file_ids.sort_unstable();
         file_ids.dedup();
         self.file_diagnostic_reads();
+        self.install_detached();
         self.index_revision += 1;
         if let Some(log) = &mut self.batch_log {
             log.push(file_ids.clone());
@@ -170,14 +175,18 @@ impl LuaCompilation {
         match reanalysis {
             Some(reanalysis) => reanalysis.take(&mut self.db, file_ids, edits),
             None => {
-                *reanalysis = Some(analyzer::Reanalysis::begin(
+                let mut begun = analyzer::Reanalysis::begin(
                     &mut self.db,
                     file_ids,
                     edits,
                     self.schedule,
                     std::mem::take(&mut self.scopes),
                     self.interrupt.clone(),
-                ));
+                );
+                if self.detach_tasks {
+                    begun.detach_supersteps();
+                }
+                *reanalysis = Some(begun);
             }
         }
     }
@@ -194,10 +203,19 @@ impl LuaCompilation {
             return UpdateProgress::Settled(Vec::new());
         };
         if self.db.get_vfs().holds_untaken_text() {
+            reanalysis.install_detached(&mut self.db);
             return UpdateProgress::TextChanged;
         }
-        if !reanalysis.run(&mut self.db, slice) {
-            return UpdateProgress::Settling;
+        if !reanalysis.wrapped() {
+            if !reanalysis.run(&mut self.db, slice) {
+                return UpdateProgress::Settling;
+            }
+            reanalysis.wrap_up(&mut self.db);
+            // Which diagnostics went stale is checked while readers share
+            // the index.
+            if self.detach_tasks && matches!(slice, Slice::Until(_)) {
+                return UpdateProgress::Settling;
+            }
         }
         let reanalysis = session.take().expect("a re-analysis in progress");
         let reanalysed = reanalysis.finish(&mut self.db);
@@ -209,6 +227,59 @@ impl LuaCompilation {
         self.last_evaluated_files = reanalysed.evaluated_files;
         self.last_stats = reanalysed.stats;
         UpdateProgress::Settled(reanalysed.stale_diagnostics)
+    }
+
+    /// Has re-analyses that slice their work stop a slice where it plans a
+    /// worker superstep, leaving its tasks to [`Self::run_detached_tasks`],
+    /// which runs them while readers share the compilation. The next `&mut`
+    /// access installs them first.
+    pub fn set_detached_tasks(&mut self, detach: bool) {
+        self.detach_tasks = detach;
+    }
+
+    /// Whether the last slice left work to [`Self::run_detached_tasks`].
+    pub fn has_detached_tasks(&self) -> bool {
+        self.session()
+            .as_ref()
+            .is_some_and(|reanalysis| reanalysis.has_detached() || reanalysis.needs_stale_check())
+    }
+
+    /// Runs what the last slice left to run outside it while readers share
+    /// the compilation: a superstep's tasks, each on its own fork of the
+    /// index, or the check of which diagnostics a settled run left stale.
+    /// The next slice installs the tasks or reports the check.
+    pub fn run_detached_tasks(&self) {
+        let detached = {
+            let mut session = self.session();
+            let Some(reanalysis) = session.as_mut() else {
+                return;
+            };
+            if reanalysis.needs_stale_check() {
+                reanalysis.check_stale(&self.db);
+                return;
+            }
+            reanalysis.take_detached()
+        };
+        let Some((mut superstep, recipes)) = detached else {
+            return;
+        };
+        superstep.run_tasks(&self.db, &*recipes);
+        if let Some(reanalysis) = self.session().as_mut() {
+            reanalysis.restore_detached(superstep);
+        }
+    }
+
+    /// Installs the tasks a slice left to run outside it, whether they ran or
+    /// not, so the index can be written: what diagnostics read is filed
+    /// against the reader graph the tasks ran on first.
+    fn install_detached(&mut self) {
+        if let Some(reanalysis) = self
+            .reanalysis
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            reanalysis.install_detached(&mut self.db);
+        }
     }
 
     /// The flag that stops a slice in progress between two evaluations, so
@@ -224,6 +295,8 @@ impl LuaCompilation {
 
     /// Settles `file_ids` before the rest of the re-analysis in progress.
     pub fn prioritise_update(&mut self, file_ids: &[FileId]) {
+        self.file_diagnostic_reads();
+        self.install_detached();
         if let Some(reanalysis) = self
             .reanalysis
             .get_mut()
@@ -370,6 +443,7 @@ impl LuaCompilation {
             index_revision: self.index_revision,
             scopes: analyzer::ScopesCache::default(),
             memos: Mutex::default(),
+            detach_tasks: self.detach_tasks,
         }
     }
 
@@ -386,6 +460,7 @@ impl LuaCompilation {
 
     pub fn remove_index(&mut self, file_ids: Vec<FileId>) {
         self.file_diagnostic_reads();
+        self.install_detached();
         self.index_revision += 1;
         self.db.remove_index(file_ids);
     }
@@ -418,6 +493,7 @@ impl LuaCompilation {
 
     pub fn get_db_mut(&mut self) -> &mut DbIndex {
         self.file_diagnostic_reads();
+        self.install_detached();
         self.index_revision += 1;
         &mut self.db
     }
@@ -432,6 +508,7 @@ impl LuaCompilation {
     /// previous one may no longer hold.
     pub fn update_config(&mut self, config: Arc<Emmyrc>, affects_index: bool) {
         self.file_diagnostic_reads();
+        self.install_detached();
         if affects_index {
             self.index_revision += 1;
             self.scopes = analyzer::ScopesCache::default();

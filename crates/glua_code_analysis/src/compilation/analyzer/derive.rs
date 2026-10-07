@@ -116,7 +116,7 @@ pub(super) const WORKSPACE_DERIVATIONS: [DerivationKind; 5] = [
 ];
 
 /// What every evaluation of one engine run shares.
-pub(super) struct Recipes {
+pub(crate) struct Recipes {
     special_call_direct_matcher: lua::call::SpecialCallDirectMatcher,
     scopes: ScriptedScopes,
     /// Each file's inference memo, reused across its evaluations: an entry

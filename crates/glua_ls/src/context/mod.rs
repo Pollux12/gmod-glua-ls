@@ -150,7 +150,9 @@ impl ServerContext {
             receiver: conn.receiver.clone(),
         }));
 
-        let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
+        let mut analysis = EmmyLuaAnalysis::new();
+        analysis.compilation.set_detached_tasks(true);
+        let analysis = Arc::new(RwLock::new(analysis));
         let lsp_features = Arc::new(LspFeatures::new(client_capabilities));
         let status_bar = Arc::new(StatusBar::new(
             client.clone(),

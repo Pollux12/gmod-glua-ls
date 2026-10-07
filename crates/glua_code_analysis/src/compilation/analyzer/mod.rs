@@ -186,6 +186,11 @@ pub(crate) struct Reanalysis {
     /// The inference memos of the passes that settled; a later pass's
     /// replaces an earlier one's.
     memos: HashMap<FileId, crate::LuaInferCache>,
+    /// Whether the run settled and was wrapped up, leaving the check of
+    /// which diagnostics went stale; see [`Self::wrap_up`].
+    wrapped: bool,
+    /// The files whose diagnostics went stale, once checked.
+    stale: Option<Vec<FileId>>,
 }
 
 impl Reanalysis {
@@ -209,6 +214,8 @@ impl Reanalysis {
             stage: derivation::AnalysisStage::Closed,
             scopes,
             memos: HashMap::default(),
+            wrapped: false,
+            stale: None,
         };
         reanalysis.pause(db);
         crate::profile::phase_report("take");
@@ -232,6 +239,8 @@ impl Reanalysis {
             _ => HashSet::default(),
         };
         db.set_analysis_stage(derivation::AnalysisStage::Closed);
+        self.wrapped = false;
+        self.stale = None;
         refresh_payload_refs(db, self.engine.payload_holders());
         self.engine.take_edits(edits);
         if let Some(pass) = start_pass(db, &mut self.engine, file_ids, &mut self.scopes, pending) {
@@ -256,13 +265,15 @@ impl Reanalysis {
             };
             let slice = slice.remaining(self.engine.stats().total_evaluations() - evaluated);
             let settled = crate::profile::phase("reanalyze: engine run", || {
-                self.engine.run(db, recipes, slice)
+                self.engine.run(db, &**recipes, slice)
             });
             if !settled {
                 break false;
             }
             crate::profile::memory::checkpoint("after the engine run");
             if let Some(Pass::Open(recipes)) = self.pass.take() {
+                let recipes = std::sync::Arc::into_inner(recipes)
+                    .expect("no superstep's tasks outlive their pass");
                 self.memos.extend(recipes.into_memos());
             }
             let stale = self.engine.take_stale_sources();
@@ -297,7 +308,7 @@ impl Reanalysis {
         let recipes =
             crate::profile::phase("reanalyze: recipes", || derive::Recipes::new(db, scopes));
         self.engine.open(db);
-        self.pass = Some(Pass::Open(recipes));
+        self.pass = Some(Pass::Open(std::sync::Arc::new(recipes)));
     }
 
     /// Leaves the index as it reads outside any run until the next slice.
@@ -306,6 +317,41 @@ impl Reanalysis {
         self.stage = db.analysis_stage();
         db.set_analysis_stage(derivation::AnalysisStage::Closed);
         crate::profile::phase("reanalyze: flush", || db.flush_inference_derived_state());
+    }
+
+    /// Has yielding slices leave a worker superstep's tasks to run outside
+    /// them; see [`Self::take_detached`].
+    pub(crate) fn detach_supersteps(&mut self) {
+        self.engine.detach_supersteps();
+    }
+
+    /// The superstep whose tasks the last slice left to run outside it, with
+    /// the recipes they evaluate by: run them while readers share the index
+    /// and hand the superstep back with [`Self::restore_detached`].
+    pub(crate) fn take_detached(
+        &mut self,
+    ) -> Option<(engine::Superstep, std::sync::Arc<derive::Recipes>)> {
+        let Some(Pass::Open(recipes)) = &self.pass else {
+            return None;
+        };
+        let recipes = std::sync::Arc::clone(recipes);
+        Some((self.engine.take_detached()?, recipes))
+    }
+
+    pub(crate) fn restore_detached(&mut self, superstep: engine::Superstep) {
+        self.engine.restore_detached(superstep);
+    }
+
+    pub(crate) fn has_detached(&self) -> bool {
+        self.engine.has_detached()
+    }
+
+    /// Installs the tasks of a superstep left to run outside the slices, so
+    /// the index can be written.
+    pub(crate) fn install_detached(&mut self, db: &mut DbIndex) {
+        if self.has_detached() {
+            self.run(db, engine::Slice::Evaluations(0));
+        }
     }
 
     /// Settles `file_ids` before the other work still queued.
@@ -324,30 +370,59 @@ impl Reanalysis {
         self.engine.in_focus(file_id)
     }
 
-    /// Wraps up a settled re-analysis.
-    pub(crate) fn finish(self, db: &mut DbIndex) -> Reanalysed {
-        debug_assert!(self.pass.is_none(), "finishing an unsettled re-analysis");
+    /// Whether the run settled and was wrapped up; see [`Self::wrap_up`].
+    pub(crate) fn wrapped(&self) -> bool {
+        self.wrapped
+    }
+
+    /// Writes what a settled run leaves the index: what the payloads its
+    /// files hold refer to, and the call targets it settled. What is left is
+    /// the check of which diagnostics went stale, which only reads the index
+    /// ([`Self::check_stale`]), and [`Self::finish`].
+    pub(crate) fn wrap_up(&mut self, db: &mut DbIndex) {
+        debug_assert!(self.pass.is_none(), "wrapping up an unsettled re-analysis");
+        if std::mem::replace(&mut self.wrapped, true) {
+            return;
+        }
         crate::profile::phase("reanalyze: payload refs", || {
             refresh_payload_refs(db, self.engine.payload_holders())
         });
         call_target::check_settled_call_targets(db);
         crate::profile::phase_report("reanalyze");
-        let stats = self.engine.stats().clone();
-        let evaluated_files = self.engine.evaluated_files();
-        stats.report(evaluated_files.len());
+        self.engine
+            .stats()
+            .report(self.engine.evaluated_files().len());
         if crate::profile::profiling() {
             for (kind, query_stats) in db.queries().stats() {
                 eprintln!("[query] {kind:?} {query_stats:?}");
             }
         }
         crate::profile::memory::checkpoint("end of re-analysis");
-        let stale_diagnostics = crate::profile::phase("reanalyze: stale diagnostics", || {
-            self.engine.stale_diagnostics(db)
-        });
+    }
+
+    /// Whether the run is wrapped up and its stale diagnostics not checked.
+    pub(crate) fn needs_stale_check(&self) -> bool {
+        self.wrapped && self.stale.is_none()
+    }
+
+    /// Checks which files' diagnostics went stale, on the wrapped-up index.
+    pub(crate) fn check_stale(&mut self, db: &DbIndex) {
+        if self.stale.is_none() {
+            self.stale = Some(crate::profile::phase(
+                "reanalyze: stale diagnostics",
+                || self.engine.stale_diagnostics(db),
+            ));
+        }
+    }
+
+    /// Wraps up a settled re-analysis.
+    pub(crate) fn finish(mut self, db: &mut DbIndex) -> Reanalysed {
+        self.wrap_up(db);
+        self.check_stale(db);
         Reanalysed {
-            stale_diagnostics,
-            evaluated_files,
-            stats,
+            stale_diagnostics: self.stale.take().unwrap_or_default(),
+            evaluated_files: self.engine.evaluated_files(),
+            stats: self.engine.stats().clone(),
             scopes: self.scopes,
             memos: self.memos,
         }
@@ -371,7 +446,7 @@ enum Pass {
         touched: HashSet<derivation::HashedKey>,
         scopes: ScriptedScopes,
     },
-    Open(derive::Recipes),
+    Open(std::sync::Arc<derive::Recipes>),
 }
 
 /// Stops keeping access paths if a slice unwinds.

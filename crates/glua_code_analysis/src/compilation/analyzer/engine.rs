@@ -460,6 +460,13 @@ pub(crate) struct Engine {
     /// next superstep runs them as they were decided before it takes another
     /// entry.
     carried: Vec<TaskPlan>,
+    /// Whether a yielding slice that plans a worker superstep stops there,
+    /// leaving its tasks to [`Superstep::run_tasks`] outside the run while
+    /// readers share the index, and installs them when the run goes on.
+    detach: bool,
+    /// The worker superstep whose tasks run outside the run, and its files.
+    detached: Option<Superstep>,
+    detached_files: Vec<crate::FileId>,
 }
 
 /// The seconds a group of each file's superstep task took at each rank, by
@@ -561,6 +568,27 @@ impl Engine {
         interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
         self.interrupt = Some(interrupt);
+    }
+
+    /// Has yielding slices leave a worker superstep's tasks to run outside
+    /// the run; see [`Self::take_detached`].
+    pub(crate) fn detach_supersteps(&mut self) {
+        self.detach = true;
+    }
+
+    /// The superstep whose tasks the last slice left to run outside it, to
+    /// run them on the index while readers share it and hand it back with
+    /// [`Self::restore_detached`]. The next slice installs them, run or not.
+    pub(crate) fn take_detached(&mut self) -> Option<Superstep> {
+        self.detached.take()
+    }
+
+    pub(crate) fn restore_detached(&mut self, superstep: Superstep) {
+        self.detached = Some(superstep);
+    }
+
+    pub(crate) fn has_detached(&self) -> bool {
+        self.detached.is_some()
     }
 
     fn interrupted(&self) -> bool {
@@ -1010,6 +1038,7 @@ impl Engine {
                 .chain(self.waiting.keys().map(|id| id.file_id))
                 .chain(self.held.keys().map(|id| id.file_id))
                 .chain(self.carried.iter().map(|plan| plan.file_id))
+                .chain(self.detached_files.iter().copied())
                 .any(|queued| queued == file_id)
     }
 
@@ -1120,6 +1149,12 @@ impl Engine {
     /// evaluations and goes on from there.
     pub(crate) fn run(&mut self, db: &mut DbIndex, recipe: &dyn Recipe, slice: Slice) -> bool {
         let started = self.stats.total_evaluations();
+        if let Some(mut superstep) = self.detached.take() {
+            self.detached_files.clear();
+            superstep.stop = StopSignal::new(slice, self.interrupt.as_ref());
+            superstep.stop.progress();
+            self.finish_superstep(db, recipe, slice, superstep);
+        }
         loop {
             self.file_queries(db);
             if slice.over(self.stats.total_evaluations() - started)
@@ -1148,6 +1183,10 @@ impl Engine {
                         .is_some_and(|rank| self.worklist.spans_files(rank)))
             {
                 self.superstep_on_workers(db, recipe, slice);
+                if self.detached.is_some() {
+                    self.flush_slot_notifications(db);
+                    return false;
+                }
                 continue;
             }
             let Some((id, reason)) = self.worklist.pop_first() else {
@@ -1263,6 +1302,26 @@ impl Engine {
     /// file that settles on the index since, and every carried group once the
     /// stage settles on the serial loop, is queued again instead.
     fn superstep_on_workers(&mut self, db: &mut DbIndex, recipe: &dyn Recipe, slice: Slice) {
+        let Some(mut superstep) = self.plan_superstep(db, slice) else {
+            return;
+        };
+        if !superstep.plans.is_empty() {
+            let detaching = self.detach && matches!(slice, Slice::Until(_));
+            self.start_tasks(db, &mut superstep, detaching);
+            if detaching {
+                self.detached_files = superstep.plans.iter().map(|plan| plan.file_id).collect();
+                self.detached = Some(superstep);
+                return;
+            }
+            superstep.run_tasks(db, recipe);
+        }
+        self.finish_superstep(db, recipe, slice, superstep);
+    }
+
+    /// Plans the next worker superstep: the groups the last one carried, or
+    /// what each entry queued at the first rank comes to. `None` when there
+    /// is nothing to run.
+    fn plan_superstep(&mut self, db: &mut DbIndex, slice: Slice) -> Option<Superstep> {
         let stop = StopSignal::new(slice, self.interrupt.as_ref());
         if !self.carried.is_empty() {
             let carried = std::mem::take(&mut self.carried);
@@ -1270,18 +1329,20 @@ impl Engine {
                 .into_iter()
                 .partition::<Vec<_>, _>(|plan| !self.serial_files.contains(&plan.file_id));
             self.requeue(serial);
-            if let Some(rank) = plans
+            let rank = plans
                 .first()
-                .map(|plan| plan.groups[0].members[0].kind.rank())
-            {
-                self.stats.supersteps += 1;
-                self.run_on_workers(db, recipe, slice, rank, plans, &stop);
-            }
-            return;
+                .map(|plan| plan.groups[0].members[0].kind.rank())?;
+            self.stats.supersteps += 1;
+            return Some(Superstep {
+                rank,
+                plans,
+                on_root: Vec::new(),
+                root: Vec::new(),
+                stop,
+                tasks: None,
+            });
         }
-        let Some(rank) = self.worklist.first_rank() else {
-            return;
-        };
+        let rank = self.worklist.first_rank()?;
         self.stats.supersteps += 1;
         let dispatching = crate::profile::PhaseGuard::new("superstep: dispatch");
         let mut plans = Vec::new();
@@ -1324,8 +1385,36 @@ impl Engine {
             }
         }
         drop(dispatching);
-        if !plans.is_empty() {
-            self.run_on_workers(db, recipe, slice, rank, plans, &stop);
+        root.extend(workspace);
+        Some(Superstep {
+            rank,
+            plans,
+            on_root,
+            root,
+            stop,
+            tasks: None,
+        })
+    }
+
+    /// Installs what `superstep`'s tasks ran, then runs the entries it left
+    /// to the root list until its stop signal is reached.
+    fn finish_superstep(
+        &mut self,
+        db: &mut DbIndex,
+        recipe: &dyn Recipe,
+        slice: Slice,
+        superstep: Superstep,
+    ) {
+        let Superstep {
+            rank,
+            plans,
+            on_root,
+            root,
+            stop,
+            tasks,
+        } = superstep;
+        if let Some(tasks) = tasks {
+            self.install_tasks(db, recipe, slice, rank, plans, tasks);
         }
         let _root = crate::profile::PhaseGuard::new("superstep: root list");
         for (file_id, entries) in on_root {
@@ -1342,7 +1431,7 @@ impl Engine {
                 self.worklist.insert(id, reason);
             }
         }
-        for (id, reason) in root.into_iter().chain(workspace) {
+        for (id, reason) in root {
             if stop.reached() {
                 self.worklist.insert(id, reason);
                 continue;
@@ -1479,57 +1568,63 @@ impl Engine {
             .collect()
     }
 
-    /// Runs `plans` on worker threads against the index and reader graph as
-    /// they stand, until `stop` is reached, then installs the tasks' forks and
-    /// files what they recorded, in file order. The groups left unrun are
-    /// carried to the next superstep.
-    fn run_on_workers(
-        &mut self,
-        db: &mut DbIndex,
-        recipe: &dyn Recipe,
-        slice: Slice,
-        rank: u8,
-        plans: Vec<TaskPlan>,
-        stop: &StopSignal,
-    ) {
-        let profiling = self.stats.profiling();
-        let snapshotting = crate::profile::PhaseGuard::new("superstep: snapshot");
+    /// Snapshots the index and the reader graph for `superstep`'s tasks. Tasks
+    /// that run detached do so while readers share the index, which is left
+    /// first as a pause leaves it, so the pause writes nothing the snapshot
+    /// shares; they stop only for an interrupt.
+    fn start_tasks(&mut self, db: &mut DbIndex, superstep: &mut Superstep, detaching: bool) {
+        let _snapshotting = crate::profile::PhaseGuard::new("superstep: snapshot");
         // Tasks lend no table, so stage rules that moved are marked here.
         let moved_rules = std::mem::take(self.moved_rules.get_mut());
         db.reader_graph_mut().mark_written(&moved_rules);
+        if detaching {
+            db.flush_inference_derived_state();
+            superstep.stop = StopSignal::new(Slice::Whole, None);
+            superstep.stop.interrupt = self.interrupt.clone();
+        }
         let quarantine = db.reader_graph_mut().quarantine_releases();
         let snapshot = derivation::RecordingSnapshot::new(
             db.reader_graph_shared(),
             quarantine.started(),
             db.queries().ready_outputs(),
         );
-        let mut frozen = db.fork();
-        let files = plans.iter().map(|plan| plan.file_id).collect::<Vec<_>>();
-        let by_file = plans
-            .iter()
-            .map(|plan| (plan.file_id, plan))
-            .collect::<FxHashMap<_, _>>();
-        drop(snapshotting);
-        let running = crate::profile::PhaseGuard::new("superstep: tasks");
-        let longest = std::sync::Mutex::new(std::time::Duration::ZERO);
-        let cost = self.task_costs.estimates(rank, &plans);
-        let outcomes = super::parallel::map_tasks_collect(db, &files, cost, |_, file_id| {
-            let started = std::time::Instant::now();
-            let outcome = run_task_on_worker(
-                &frozen,
-                &snapshot,
-                by_file[&file_id],
-                recipe,
-                profiling,
-                stop,
-            );
-            let elapsed = started.elapsed();
-            crate::profile::add_phase("superstep: task cpu", elapsed, 0);
-            let mut longest = lock(&longest);
-            *longest = (*longest).max(elapsed);
-            (outcome, elapsed)
+        superstep.tasks = Some(StartedTasks {
+            frozen: db.fork(),
+            snapshot: Some(snapshot),
+            quarantine,
+            cost: self.task_costs.estimates(superstep.rank, &superstep.plans),
+            profiling: self.stats.profiling(),
+            outcomes: None,
         });
-        crate::profile::add_phase("superstep: longest task", *lock(&longest), 0);
+    }
+
+    /// Installs the forks of the tasks that ran and files what they
+    /// recorded, in file order. The groups left unrun are carried to the
+    /// next superstep.
+    fn install_tasks(
+        &mut self,
+        db: &mut DbIndex,
+        recipe: &dyn Recipe,
+        slice: Slice,
+        rank: u8,
+        plans: Vec<TaskPlan>,
+        tasks: StartedTasks,
+    ) {
+        let StartedTasks {
+            mut frozen,
+            snapshot,
+            quarantine,
+            profiling,
+            outcomes,
+            ..
+        } = tasks;
+        drop(snapshot);
+        let outcomes = outcomes.unwrap_or_else(|| {
+            plans
+                .iter()
+                .map(|_| (None, std::time::Duration::ZERO))
+                .collect()
+        });
         let outcomes = plans
             .iter()
             .zip(outcomes)
@@ -1541,8 +1636,6 @@ impl Engine {
                 outcome
             })
             .collect::<Vec<_>>();
-        drop(snapshot);
-        drop(running);
         let committing = crate::profile::PhaseGuard::new("superstep: commit");
         let mut carried = Vec::new();
         let mut started = Vec::with_capacity(outcomes.len());
@@ -3223,6 +3316,80 @@ impl EngineStats {
 struct TaskPlan {
     file_id: crate::FileId,
     groups: Vec<PlannedGroup>,
+}
+
+/// A worker superstep from its plan to its install: the file tasks at its
+/// rank, the entries it leaves to the root list, and, once started, the
+/// snapshot the tasks run on.
+pub(crate) struct Superstep {
+    rank: u8,
+    plans: Vec<TaskPlan>,
+    on_root: Vec<(crate::FileId, Vec<(DerivationId, Reason)>)>,
+    root: Vec<(DerivationId, Reason)>,
+    stop: StopSignal,
+    tasks: Option<StartedTasks>,
+}
+
+/// The snapshot a superstep's tasks run on, and what they ran once they did.
+struct StartedTasks {
+    frozen: DbIndex,
+    snapshot: Option<derivation::RecordingSnapshot>,
+    quarantine: derivation::ReleaseQuarantine,
+    cost: Option<Vec<f64>>,
+    profiling: bool,
+    outcomes: Option<Vec<(Option<TaskOutcome>, std::time::Duration)>>,
+}
+
+impl Superstep {
+    /// Runs the tasks on worker threads, each on its own fork of the index as
+    /// the superstep found it, until the stop signal is reached, then lets go
+    /// of the reader graph they shared. `db` only places them on the threads.
+    pub(crate) fn run_tasks(&mut self, db: &DbIndex, recipe: &dyn Recipe) {
+        let Some(tasks) = &mut self.tasks else {
+            return;
+        };
+        let _running = crate::profile::PhaseGuard::new("superstep: tasks");
+        let files = self
+            .plans
+            .iter()
+            .map(|plan| plan.file_id)
+            .collect::<Vec<_>>();
+        let by_file = self
+            .plans
+            .iter()
+            .map(|plan| (plan.file_id, plan))
+            .collect::<FxHashMap<_, _>>();
+        let longest = std::sync::Mutex::new(std::time::Duration::ZERO);
+        let cost = tasks.cost.take();
+        let snapshot = tasks.snapshot.take().expect("a superstep's tasks run once");
+        let (frozen, profiling, stop) = (&tasks.frozen, tasks.profiling, &self.stop);
+        let mut outcomes = super::parallel::map_tasks_collect(db, &files, cost, |_, file_id| {
+            let started = std::time::Instant::now();
+            let outcome = run_task_on_worker(
+                frozen,
+                &snapshot,
+                by_file[&file_id],
+                recipe,
+                profiling,
+                stop,
+            );
+            let elapsed = started.elapsed();
+            crate::profile::add_phase("superstep: task cpu", elapsed, 0);
+            let mut longest = lock(&longest);
+            *longest = (*longest).max(elapsed);
+            (outcome, elapsed)
+        });
+        crate::profile::add_phase("superstep: longest task", *lock(&longest), 0);
+        drop(snapshot);
+        tasks.frozen.release_reader_graph();
+        for outcome in outcomes
+            .iter_mut()
+            .filter_map(|(outcome, _)| outcome.as_mut())
+        {
+            outcome.fork.release_reader_graph();
+        }
+        tasks.outcomes = Some(outcomes);
+    }
 }
 
 /// A group a file's task runs in a worker superstep.
@@ -5267,6 +5434,53 @@ function holder.receiver:Use() end
             whole.supersteps
         );
         assert_eq!(stopped.digest, whole.digest);
+    }
+
+    /// Settles the relays with every yielding slice stopping where it plans a
+    /// worker superstep, the next slice installing it; the first detached
+    /// superstep's tasks are left unrun unless `run_first`. Returns how many
+    /// supersteps were detached, and the settled digest.
+    fn relay_detached(run_first: bool) -> (usize, Vec<String>) {
+        let (mut ws, recipe, _, statements) = relay_workspace();
+        let db = ws.get_db_mut();
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        engine.interrupt_with(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        engine.detach_supersteps();
+        for id in &statements {
+            engine.changed(*id);
+        }
+        engine.open(db);
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let mut detached = 0;
+        while !engine.run(db, &recipe, Slice::Until(far)) {
+            let mut superstep = engine
+                .take_detached()
+                .expect("an unhurried slice stops only where it detaches a superstep");
+            if run_first || detached > 0 {
+                superstep.run_tasks(db, &recipe);
+            }
+            engine.restore_detached(superstep);
+            detached += 1;
+        }
+        (detached, relay_digest(&mut ws))
+    }
+
+    #[test]
+    fn detached_supersteps_settle_as_inline_ones_whether_their_tasks_ran_or_not() {
+        let (whole, (ran, ran_digest), (skipped, skipped_digest)) = with_one_thread(|| {
+            (
+                relay_run(Slice::Whole, false),
+                relay_detached(true),
+                relay_detached(false),
+            )
+        });
+
+        assert!(ran > 0, "no superstep was detached");
+        assert_eq!(skipped, ran + 1);
+        assert_eq!(ran_digest, whole.digest);
+        assert_eq!(skipped_digest, whole.digest);
     }
 
     #[test]

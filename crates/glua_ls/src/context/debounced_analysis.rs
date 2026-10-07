@@ -810,6 +810,12 @@ impl DebouncedAnalysis {
                         settled_first.len(),
                     );
                 }
+                // A superstep's tasks run on forks of the index, which
+                // requests read meanwhile; the next slice installs them.
+                if guard.compilation.has_detached_tasks() {
+                    let shared = guard.downgrade();
+                    shared.compilation.run_detached_tasks();
+                }
                 (progress, settled_first)
             }) => match result {
                 Ok(outcome) => Some(outcome),
