@@ -513,12 +513,12 @@ fn dedups_by_equality(ty: &LuaType) -> bool {
 /// join it lands on decides the result.
 ///
 /// Otherwise the two paths can only disagree about member *order*, and only
-/// when both of these hold. Sorting settles it if every member is
-/// order-insensitive, since the final `from_vec_structural` orders them anyway.
-/// And splicing only happens for a nested union: the pairwise rule joining a
-/// plain accumulator to a union puts that union's members *first* and the
-/// accumulator last, where absorbing in sequence keeps the accumulator first.
-/// With no nested union to splice, the two visit members identically.
+/// when an order-sensitive member takes part: sorting settles it if every
+/// member is order-insensitive, since the final `from_vec_structural` orders
+/// them anyway. With one, the pairwise rule sorts the members it holds while
+/// they are all order-insensitive and appends from the first sensitive one on,
+/// and joining a plain accumulator to a nested union puts that union's members
+/// *first*; absorbing in sequence does neither.
 fn visiting_order_is_observable(types: &[LuaType]) -> bool {
     fn is_multi_line_union(typ: &LuaType) -> bool {
         matches!(typ, LuaType::MultiLineUnion(_))
@@ -545,7 +545,7 @@ fn visiting_order_is_observable(types: &[LuaType]) -> bool {
         })
     });
 
-    order_sensitive && types.iter().any(LuaType::is_union)
+    order_sensitive
 }
 
 /// Whether `LuaType::from_vec_structural` alone matches the pairwise fold.
@@ -554,8 +554,18 @@ fn visiting_order_is_observable(types: &[LuaType]) -> bool {
 /// pairwise path costs ~65% more indexing time, and this decides the cases
 /// where the two agree.
 ///
-/// The flags mirror [`try_collapse`] arm for arm.
+/// The flags mirror [`try_collapse`] arm for arm. Before an order-sensitive
+/// member the pairwise rule keeps the members sorted, so the input has to be
+/// sorted up to the first one too.
 fn can_use_structural_union(types: &[LuaType]) -> bool {
+    let first_sensitive = types
+        .iter()
+        .position(|typ| !LuaUnionType::is_order_insensitive_member(typ));
+    if let Some(first_sensitive) = first_sensitive
+        && !types[..first_sensitive].is_sorted_by_key(lua_type_sort_key)
+    {
+        return false;
+    }
     let (mut num, mut num_variant) = (false, false);
     let (mut int, mut int_const) = (false, false);
     let (mut string, mut string_const) = (false, false);

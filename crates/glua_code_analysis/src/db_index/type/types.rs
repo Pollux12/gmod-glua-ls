@@ -1149,7 +1149,11 @@ impl From<LuaObjectType> for LuaType {
         LuaType::Object(t.into())
     }
 }
-#[derive(Debug, Clone, Eq)]
+/// Member order is part of a union's identity: unions of callables and
+/// templates keep the order they were built in (see [`Self::from_vec`]), and
+/// every type built from a union inherits it, so only unions in the same
+/// order are interchangeable.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LuaUnionType {
     Nullable(LuaType),
     Multi(Vec<LuaType>),
@@ -1387,43 +1391,6 @@ impl From<LuaUnionType> for LuaType {
     fn from(t: LuaUnionType) -> Self {
         LuaType::Union(t.into())
     }
-}
-
-impl PartialEq for LuaUnionType {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (LuaUnionType::Nullable(a), LuaUnionType::Nullable(b)) => a == b,
-            (LuaUnionType::Multi(a), LuaUnionType::Multi(b)) => same_members(a, b),
-            _ => false,
-        }
-    }
-}
-
-/// The most members [`same_members`] compares pairwise, without a set.
-const PAIRWISE_MEMBERS: usize = 16;
-
-/// Whether `b` takes out each distinct member of `a` exactly once, as many
-/// members as `a` has: `a`'s members as a set, `b`'s as a list.
-fn same_members(a: &[LuaType], b: &[LuaType]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    if a.len() > PAIRWISE_MEMBERS {
-        let mut a_set: rustc_hash::FxHashSet<_> = a.iter().collect();
-        return b.iter().all(|item| a_set.remove(item)) && a_set.is_empty();
-    }
-    // A member of `a` stands for itself and every later equal one.
-    let mut taken = 0u32;
-    for item in b {
-        let Some(at) = a.iter().position(|member| member == item) else {
-            return false;
-        };
-        if taken & (1 << at) != 0 {
-            return false;
-        }
-        taken |= 1 << at;
-    }
-    (0..a.len()).all(|at| taken & (1 << at) != 0 || a[..at].contains(&a[at]))
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -2341,22 +2308,23 @@ mod tests {
         union_of(values.into_iter().map(LuaType::IntegerConst))
     }
 
+    /// A memo keyed by a union answers only for its member order: a value
+    /// built from one order is never handed to a lookup of another.
     #[test]
-    fn unions_with_the_same_members_in_another_order_are_equal() {
+    fn unions_with_the_same_members_in_another_order_differ() {
         let union = union_of([LuaType::String, LuaType::Integer, LuaType::Boolean]);
         let reordered = union_of([LuaType::Boolean, LuaType::String, LuaType::Integer]);
-        let other = union_of([LuaType::String, LuaType::Integer, LuaType::Nil]);
+        let large = integers(0..40);
+        let large_reordered = integers((0..40).rev());
 
-        assert_eq!((union == reordered, union == other), (true, false));
-    }
-
-    #[test]
-    fn large_unions_with_the_same_members_in_another_order_are_equal() {
-        let union = integers(0..40);
-        let reordered = integers((0..40).rev());
-        let other = integers(1..41);
-
-        assert_eq!((union == reordered, union == other), (true, false));
+        assert_eq!(
+            (
+                union == union.clone(),
+                union == reordered,
+                large == large_reordered
+            ),
+            (true, false, false)
+        );
     }
 
     #[test]
