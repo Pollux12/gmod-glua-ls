@@ -98,7 +98,7 @@ use crate::{
     FileId,
     db_index::{DbIndex, LuaType},
 };
-use crate::{LuaFunctionType, LuaMemberId, LuaMemberKey, LuaTypeOwner};
+use crate::{LuaFunctionType, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaTypeOwner};
 pub use generic::*;
 pub use guard::{InferGuard, InferGuardRef};
 pub use infer::InferFailReason;
@@ -360,6 +360,18 @@ impl<'a> SemanticModel<'a> {
                 .get_syntax_tree(&file_id)?
                 .get_chunk_node(),
         )
+    }
+
+    /// The closure `signature_id` is the signature of, if it is one.
+    pub fn get_signature_closure(&self, signature_id: LuaSignatureId) -> Option<LuaClosureExpr> {
+        let file_id = signature_id.get_file_id();
+        self.get_root_by_file_id(file_id)?
+            .syntax()
+            .token_at_offset(signature_id.get_position())
+            .right_biased()?
+            .parent_ancestors()
+            .find_map(LuaClosureExpr::cast)
+            .filter(|closure| LuaSignatureId::from_closure(file_id, closure) == signature_id)
     }
 
     pub fn get_file_parse_error(&self) -> Option<Vec<LuaParseError>> {

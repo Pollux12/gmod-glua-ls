@@ -3,13 +3,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaCallArgList, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaIndexKey,
-    LuaStat, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
+    LuaAssignStat, LuaAstNode, LuaCallArgList, LuaCallExpr, LuaExpr, LuaIndexKey, LuaStat,
+    LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 
 use crate::{
-    DbIndex, DiagnosticCode, LuaMemberFeature, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId,
-    LuaType, LuaTypeCache, LuaTypeDeclId, SemanticModel,
+    DbIndex, DiagnosticCode, LuaMemberFeature, LuaMemberOwner, LuaSemanticDeclId, LuaType,
+    LuaTypeCache, LuaTypeDeclId, SemanticModel,
 };
 
 use super::{Checker, DiagnosticContext, PrecomputedMissingRequiredFields, humanize_lint_type};
@@ -301,7 +301,7 @@ fn remove_fields_filled_by_callee(
     }
     let param_name = signature.params.get(param_index)?;
 
-    let closure = find_closure(semantic_model, &signature_id)?;
+    let closure = semantic_model.get_signature_closure(signature_id)?;
     let block = closure.get_block()?;
     // Only the body's own statements count, the same rule
     // `remove_fields_completed_after` applies to the caller side: a write nested
@@ -328,20 +328,6 @@ fn remove_fields_filled_by_callee(
     }
 
     Some(())
-}
-
-fn find_closure(
-    semantic_model: &SemanticModel,
-    signature_id: &LuaSignatureId,
-) -> Option<LuaClosureExpr> {
-    let file_id = signature_id.get_file_id();
-    let root = semantic_model.get_root_by_file_id(file_id)?;
-    root.syntax()
-        .token_at_offset(signature_id.get_position())
-        .right_biased()?
-        .parent_ancestors()
-        .find_map(LuaClosureExpr::cast)
-        .filter(|closure| LuaSignatureId::from_closure(file_id, closure) == *signature_id)
 }
 
 /// The path the literal is assigned to, e.g. `self.portals` or `cfg`.
