@@ -1652,11 +1652,11 @@ fn is_provably_builtin_global_call(
     let Some(LuaExpr::NameExpr(call_name)) = call_expr.get_prefix_expr() else {
         return false;
     };
-    if db
+    if let Some(decl_id) = db
         .get_reference_index()
         .get_local_reference(&file_id)
         .and_then(|references| references.get_decl_id(&call_name.get_range()))
-        .is_some()
+        && !aliases_global(db, file_id, decl_id, builtin_name)
     {
         return false;
     }
@@ -1687,6 +1687,24 @@ fn is_provably_builtin_global_call(
             })
             || decl_preserves_builtin_semantics(db, *decl_id, builtin_name)
     })
+}
+
+/// Whether the local `decl_id` is `local name = name` for the global `name`,
+/// never reassigned: it names the global wherever it is read.
+fn aliases_global(db: &DbIndex, file_id: crate::FileId, decl_id: LuaDeclId, name: &str) -> bool {
+    let Some(LuaExpr::NameExpr(initializer)) = local_initializer_expr(db, decl_id) else {
+        return false;
+    };
+    initializer.get_name_text().as_deref() == Some(name)
+        && db
+            .get_reference_index()
+            .get_local_reference(&file_id)
+            .and_then(|references| references.get_decl_id(&initializer.get_range()))
+            .is_none()
+        && db
+            .get_reference_index()
+            .first_local_reassignment(file_id, &decl_id)
+            .is_none()
 }
 
 fn decl_preserves_builtin_semantics(db: &DbIndex, decl_id: LuaDeclId, builtin_name: &str) -> bool {

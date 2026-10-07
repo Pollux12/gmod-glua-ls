@@ -246,4 +246,29 @@ local name = Sizes.name
             &[(REGISTRY.0, REGISTRY.1)],
         );
     }
+
+    /// `local pairs = pairs`, which many files open with, is the builtin
+    /// `pairs` wherever it is read.
+    #[test]
+    fn a_local_alias_of_pairs_copies_a_table_into_itself_as_pairs_does() {
+        let aliased = format!(
+            "local pairs = pairs
+{}",
+            REGISTRY.1
+        );
+        let (mut ws, file_ids) = workspace(&[(REGISTRY.0, &aliased), META_READS]);
+
+        assert_eq!(
+            (
+                local_type(&mut ws, file_ids[1], "base"),
+                local_type(&mut ws, file_ids[1], "width"),
+                local_type(&mut ws, file_ids[1], "oldEntity"),
+            ),
+            (
+                "(string|unknown)".to_string(),
+                "1".to_string(),
+                "any".to_string()
+            )
+        );
+    }
 }
