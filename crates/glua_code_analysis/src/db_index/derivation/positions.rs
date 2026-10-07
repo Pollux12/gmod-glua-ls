@@ -47,14 +47,16 @@ impl EditMaps {
     }
 
     pub fn map(&self, file_id: FileId) -> Option<PositionMap> {
-        self.maps.get(&file_id).copied()
+        self.maps.get(&file_id).cloned()
     }
 
     /// These edits followed by `later`, edits of the text these produced.
     pub fn then(&self, later: &Self) -> Self {
         let mut maps = self.maps.clone();
         for (file_id, map) in &later.maps {
-            let composed = maps.get(file_id).map_or(*map, |earlier| earlier.then(map));
+            let composed = maps
+                .get(file_id)
+                .map_or_else(|| map.clone(), |earlier| earlier.then(map));
             maps.insert(*file_id, composed);
         }
         Self::new(maps)
@@ -184,7 +186,7 @@ impl EditMaps {
         for (file_id, map) in &self.maps {
             let result = crate::db_index::remap_identities_in_type(
                 &typ,
-                &crate::FileRemap::unvalidated(*file_id, *map),
+                &crate::FileRemap::unvalidated(*file_id, map.clone()),
             );
             if result.lost {
                 return None;

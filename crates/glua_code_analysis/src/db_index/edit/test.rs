@@ -17,7 +17,7 @@ fn range(start: u32, end: u32) -> TextRange {
 #[gtest]
 fn an_insertion_shifts_everything_after_it_and_loses_nothing() {
     let map = PositionMap::new("abcdef", "abcXXdef");
-    expect_that!(map.hunk(), eq((3, 3, 5)));
+    expect_that!(map.hunks(), eq(&vec![(3, 3, 3, 5)]));
     expect_that!(map.map(TextSize::new(2)), some(eq(TextSize::new(2))));
     // The insertion point itself belongs to what follows it.
     expect_that!(map.map(TextSize::new(3)), some(eq(TextSize::new(5))));
@@ -54,21 +54,21 @@ fn two_edits_in_a_row_compose_to_one_map_of_every_offset_both_keep() {
     expect_that!(
         PositionMap::new("abcdef", "XXabcdef")
             .then(&PositionMap::new("XXabcdef", "XXYYabcdef"))
-            .hunk(),
-        eq(PositionMap::new("abcdef", "XXYYabcdef").hunk())
+            .hunks(),
+        eq(&PositionMap::new("abcdef", "XXYYabcdef").hunks())
     );
     expect_that!(
         PositionMap::identity()
             .then(&PositionMap::new("abc", "aXbc"))
-            .hunk(),
-        eq((1, 1, 2))
+            .hunks(),
+        eq(&vec![(1, 1, 1, 2)])
     );
 }
 
 #[gtest]
 fn a_deletion_loses_only_what_was_inside_it() {
     let map = PositionMap::new("abcXXdef", "abcdef");
-    expect_that!(map.hunk(), eq((3, 5, 3)));
+    expect_that!(map.hunks(), eq(&vec![(3, 5, 3, 3)]));
     expect_that!(map.map(TextSize::new(2)), some(eq(TextSize::new(2))));
     expect_that!(map.map(TextSize::new(4)), none());
     expect_that!(map.map(TextSize::new(5)), some(eq(TextSize::new(3))));
@@ -80,7 +80,7 @@ fn a_deletion_loses_only_what_was_inside_it() {
 #[gtest]
 fn a_replacement_maps_the_text_on_either_side() {
     let map = PositionMap::new("abcXYZdef", "abcQdef");
-    expect_that!(map.hunk(), eq((3, 6, 4)));
+    expect_that!(map.hunks(), eq(&vec![(3, 6, 3, 4)]));
     expect_that!(map.map(TextSize::new(1)), some(eq(TextSize::new(1))));
     expect_that!(map.map(TextSize::new(4)), none());
     expect_that!(map.map(TextSize::new(6)), some(eq(TextSize::new(4))));
@@ -116,7 +116,7 @@ fn a_whole_file_replacement_keeps_only_a_range_that_brackets_it() {
 #[gtest]
 fn a_range_that_spans_the_hunk_moves_with_its_end() {
     let map = PositionMap::new("aaXXbb", "aaYYYbb");
-    expect_that!(map.hunk(), eq((2, 4, 5)));
+    expect_that!(map.hunks(), eq(&vec![(2, 4, 2, 5)]));
     expect_that!(map.map_range(range(0, 6)), some(eq(range(0, 7))));
     expect_that!(map.map_range(range(2, 4)), some(eq(range(2, 5))));
     // One endpoint strictly inside is still lost.
@@ -124,12 +124,77 @@ fn a_range_that_spans_the_hunk_moves_with_its_end() {
     expect_that!(map.map_range(range(0, 3)), none());
 }
 
+/// An agent's rewrite adds lines at the top and parameters further down: the
+/// code between the changes keeps its identity, shifted, rather than every
+/// position from the first change to the last being lost.
+#[gtest]
+fn separate_changes_keep_the_text_between_them() {
+    let old = "function f()
+  return 1
+end
+function g()
+end
+";
+    let new = "X = 1
+function f(a)
+  return 1
+end
+function g(b)
+end
+";
+    let map = PositionMap::new(old, new);
+    expect_that!(map.hunks().len(), eq(3));
+    let body = old.find("return").unwrap() as u32;
+    let moved = new.find("return").unwrap() as u32;
+    expect_that!(map.map(TextSize::new(body)), some(eq(TextSize::new(moved))));
+    let g = old.find("g()").unwrap() as u32;
+    expect_that!(
+        map.map(TextSize::new(g)),
+        some(eq(TextSize::new(new.find("g(b)").unwrap() as u32)))
+    );
+    // The function's range takes the parameter in.
+    expect_that!(
+        map.map_range(range(0, old.find("end").unwrap() as u32 + 3)),
+        some(eq(range(6, new.find("end").unwrap() as u32 + 3)))
+    );
+    expect_that!(
+        map.inverse().map(TextSize::new(moved)),
+        some(eq(TextSize::new(body)))
+    );
+}
+
+/// Re-indenting or changing line endings changes only whitespace: every
+/// token keeps its identity.
+#[gtest]
+fn whitespace_changes_lose_no_token() {
+    let old = "if x then
+	y()
+end
+";
+    let reindented = "if x then
+    y()
+end
+";
+    let map = PositionMap::new(old, reindented);
+    expect_that!(map.hunks(), eq(&vec![(10, 11, 10, 14)]));
+    expect_that!(map.map(TextSize::new(11)), some(eq(TextSize::new(14))));
+
+    let crlf = old.replace('\n', "\r\n");
+    let map = PositionMap::new(old, &crlf);
+    expect_that!(map.hunks().len(), eq(3));
+    let end = old.find("end").unwrap() as u32;
+    expect_that!(
+        map.map(TextSize::new(end)),
+        some(eq(TextSize::new(crlf.find("end").unwrap() as u32)))
+    );
+}
+
 #[gtest]
 fn a_hunk_boundary_never_splits_a_code_point() {
     // The two strings share the first byte of `é` (0xC3) but differ in the
     // second, so the raw byte prefix would end mid-character.
     let map = PositionMap::new("aé", "aè");
-    let (start, old_end, new_end) = map.hunk();
+    let (start, old_end, _, new_end) = map.hunks()[0];
     expect_that!(start, eq(1));
     expect_that!(old_end, eq(3));
     expect_that!(new_end, eq(3));
@@ -139,7 +204,7 @@ fn a_hunk_boundary_never_splits_a_code_point() {
     // A trailing multibyte character shared by both sides must stay whole in
     // the suffix too.
     let map = PositionMap::new("aXé", "aYYé");
-    let (start, old_end, new_end) = map.hunk();
+    let (start, old_end, _, new_end) = map.hunks()[0];
     expect_that!(start, eq(1));
     expect_that!("aXé".is_char_boundary(old_end as usize), is_true());
     expect_that!("aYYé".is_char_boundary(new_end as usize), is_true());
@@ -481,9 +546,9 @@ fn shift_only_edit_moves_synthesized_doc_class_support_ids() {
     ws.analysis.compilation.remove_index(vec![provider_id]);
     ws.analysis.compilation.update_index(vec![provider_id]);
     let map = PositionMap::new(provider, &shifted);
+    let expected = map.map_range(decl_range).expect("a shift maps every range");
     let remap = FileRemap::validated(ws.analysis.compilation.get_db(), provider_id, map);
     let id = glua_parser::LuaSyntaxId::new(LuaKind::Syntax(LuaSyntaxKind::DocTagClass), decl_range);
-    let expected = map.map_range(decl_range).expect("a shift maps every range");
     assert_eq!(
         remap.syntax_id(provider_id, id),
         super::Remap::Moved(glua_parser::LuaSyntaxId::new(
