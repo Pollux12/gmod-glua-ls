@@ -1085,13 +1085,13 @@ impl Engine {
                 )
             })
             .collect::<Vec<_>>();
-        if self.stats.profiling() && !stale.is_empty() {
+        if crate::profile::tracing_evaluations() && !stale.is_empty() {
             self.report_stale_diagnostics(db, &stale);
         }
         stale
     }
 
-    /// Under `GLUALS_PROFILE`, prints which kinds of moved facts made
+    /// Under `GLUALS_TRACE_EVALUATIONS`, prints which kinds of moved facts made
     /// `stale` files' diagnostics stale, most common first.
     fn report_stale_diagnostics(&self, db: &DbIndex, stale: &[crate::FileId]) {
         let mut kinds = FxHashMap::<String, usize>::default();

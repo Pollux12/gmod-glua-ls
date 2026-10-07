@@ -580,6 +580,13 @@ impl DiagnosticStore {
             });
         }
         drop(analysis);
+        let idle = {
+            let state = self.state();
+            state.dirty.is_empty() && state.computing.is_empty()
+        };
+        if idle {
+            crate::util::ls_profile::emit_ls_diagnostics_idle();
+        }
         self.computed.notify_waiters();
         self.dirtied.notify_waiters();
     }

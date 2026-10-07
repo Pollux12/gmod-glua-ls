@@ -371,3 +371,11 @@ pub fn emit_ls_settled(cycle: u64, affected: usize) {
     }
     eprintln!("[profile] ls_settled cycle={cycle} affected={affected}");
 }
+
+/// The diagnostic store finished every file it had to compute.
+pub fn emit_ls_diagnostics_idle() {
+    if !ls_profile_enabled() {
+        return;
+    }
+    eprintln!("[profile] ls_diagnostics_idle");
+}
