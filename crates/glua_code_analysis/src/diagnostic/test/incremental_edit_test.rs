@@ -1004,6 +1004,51 @@ end)
         expect_that!(affected, not(contains(eq(&receiver))));
     }
 
+    /// A sender's network checks read only whether its message is received:
+    /// another sender of the message changing what it writes reports the
+    /// receiver affected, not the sender.
+    #[gtest]
+    fn another_sender_of_a_message_leaves_a_sender_unaffected() {
+        let mut ws = gmod_workspace_with(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+        let sender = |bits: u32| {
+            format!(
+                "util.AddNetworkString(\"Chat\")
+net.Start(\"Chat\")
+net.WriteUInt(1, {bits})
+net.Broadcast()
+"
+            )
+        };
+        let edited_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/sv_edited.lua");
+        write(&mut ws, &edited_uri, &sender(16));
+        let other_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/sv_other.lua");
+        let other = write(&mut ws, &other_uri, &sender(16));
+        let receiver_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/client/cl_receive.lua");
+        let receiver = write(
+            &mut ws,
+            &receiver_uri,
+            "net.Receive(\"Chat\", function()
+    local value = net.ReadUInt(16)
+end)
+",
+        );
+        shared_diagnostics(&ws, other);
+        shared_diagnostics(&ws, receiver);
+
+        let affected = ws
+            .analysis
+            .apply_file_system_changes(vec![(edited_uri, Some(sender(8)))]);
+
+        expect_that!(affected, contains(eq(&receiver)));
+        expect_that!(affected, not(contains(eq(&other))));
+    }
+
     /// A receiver's network checks see a sender's flows by their place in
     /// the sender's file: lines inserted above them leave it unaffected.
     #[gtest]

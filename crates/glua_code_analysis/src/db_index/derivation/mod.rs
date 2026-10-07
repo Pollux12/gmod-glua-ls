@@ -374,8 +374,10 @@ pub enum FactKey {
     NetworkFile(FileId),
     /// Network flows by message name (whole-map).
     NetworkScan,
-    /// The network flows sent and received under one message name.
-    NetMessage(SmolStr),
+    /// The network flows sent under one message name.
+    NetSends(SmolStr),
+    /// The network flows received under one message name.
+    NetReceives(SmolStr),
     /// Whether flows elsewhere materialize the net send defined at a site,
     /// which then stands for them.
     NetDefinitionUses(InFiled<TextRange>),
@@ -683,7 +685,8 @@ impl FactKey {
                 | K::NetHelper(_)
                 | K::NetworkFile(_)
                 | K::NetworkScan
-                | K::NetMessage(_)
+                | K::NetSends(_)
+                | K::NetReceives(_)
                 | K::NetDefinitionUses(_)
                 | K::GmodRealm(_)
                 | K::GmodLoadFile(_)
@@ -917,7 +920,8 @@ impl FactKey {
             | K::GmodInferScan
             | K::GmodSystem(..)
             | K::NetworkScan
-            | K::NetMessage(_)
+            | K::NetSends(_)
+            | K::NetReceives(_)
             | K::NetDefinitionUses(_)
             | K::HelperRegistry
             | K::CallRole(CallRoleKey::Path(_) | CallRoleKey::Global(_) | CallRoleKey::Method(_))

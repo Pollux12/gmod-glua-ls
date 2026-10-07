@@ -218,12 +218,12 @@ pub fn precompute_sorted_send_flows(
     cache
 }
 
-/// The send flows sorted under `name`, read as that message's flows.
+/// The send flows sorted under `name`, read as that message's sends.
 fn sent_under<'a>(
     sorted_send_flows: &'a SortedSendFlowCache,
     name: &str,
 ) -> Option<&'a Vec<(FileId, NetSendFlow, SenderSortKey)>> {
-    crate::GmodNetworkIndex::note_message_read(name);
+    crate::GmodNetworkIndex::note_sends_read(name);
     sorted_send_flows.get(name)
 }
 

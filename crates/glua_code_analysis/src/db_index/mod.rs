@@ -547,7 +547,8 @@ impl DbIndex {
             K::GmodLoadFile(_) => self.gmod_load_index.fact_fingerprint(key),
             K::NetworkFile(_)
             | K::NetworkScan
-            | K::NetMessage(_)
+            | K::NetSends(_)
+            | K::NetReceives(_)
             | K::NetDefinitionUses(_)
             | K::NetHelperName(_)
             | K::NetOperationNames => self.gmod_network_index.fact_fingerprint(key),
