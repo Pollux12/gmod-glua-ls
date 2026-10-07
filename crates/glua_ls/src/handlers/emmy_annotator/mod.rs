@@ -20,6 +20,7 @@ pub async fn on_emmy_annotator_handler(
     }
 
     let uri = Uri::from_str(&params.uri).ok()?;
+    let references = params.references.unwrap_or(true);
 
     // Wait until this document's entries match its text so we compute
     // against a consistent tree and index. Cancel-aware: bails out when a
@@ -44,7 +45,7 @@ pub async fn on_emmy_annotator_handler(
 
         let file_id = analysis.get_file_id(&uri)?;
         let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
-        let annotators = build_annotators(&semantic_model);
+        let annotators = build_annotators(&semantic_model, references);
         EmmyAnnotatorResult { annotators }
     };
 

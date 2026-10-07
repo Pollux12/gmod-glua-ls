@@ -13,6 +13,10 @@ impl Request for EmmyAnnotatorRequest {
 #[derive(Debug, Eq, PartialEq, Clone, Deserialize, Serialize)]
 pub struct EmmyAnnotatorParams {
     pub uri: String,
+    /// Whether to annotate local, parameter and global references; they are
+    /// annotated when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub references: Option<bool>,
 }
 
 /// Annotator response: style annotators (read-only/mutable underlines, doc
