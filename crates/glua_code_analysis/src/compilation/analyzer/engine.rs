@@ -454,6 +454,58 @@ pub(crate) struct Engine {
     /// the queries it read to be computed since the run entered its stage.
     query_deferrals: FxHashMap<DerivationId, u8>,
     serial_stage: bool,
+    /// What superstep tasks took, to start the costliest first.
+    task_costs: TaskCosts,
+}
+
+/// The seconds a group of each file's superstep task took at each rank, by
+/// its last task there, and their average at each rank: the estimates that
+/// start a superstep's costliest tasks first.
+#[derive(Default)]
+struct TaskCosts {
+    per_group: FxHashMap<(crate::FileId, u8), f64>,
+    by_rank: FxHashMap<u8, (f64, usize)>,
+}
+
+impl TaskCosts {
+    /// Notes that the task of `file_id` at `rank` ran `groups` groups in
+    /// `elapsed`.
+    fn observe(
+        &mut self,
+        rank: u8,
+        file_id: crate::FileId,
+        groups: usize,
+        elapsed: std::time::Duration,
+    ) {
+        if groups == 0 {
+            return;
+        }
+        let per_group = elapsed.as_secs_f64() / groups as f64;
+        self.per_group.insert((file_id, rank), per_group);
+        let (sum, count) = self.by_rank.entry(rank).or_default();
+        *sum += per_group;
+        *count += 1;
+    }
+
+    /// The estimated cost of each of `plans` at `rank`, a file with no task
+    /// there yet taken at the average; `None` before any task ran at `rank`.
+    fn estimates(&self, rank: u8, plans: &[TaskPlan]) -> Option<Vec<f64>> {
+        let (sum, count) = self.by_rank.get(&rank)?;
+        let average = sum / *count as f64;
+        Some(
+            plans
+                .iter()
+                .map(|plan| {
+                    let per_group = self
+                        .per_group
+                        .get(&(plan.file_id, rank))
+                        .copied()
+                        .unwrap_or(average);
+                    per_group * plan.groups.len() as f64
+                })
+                .collect(),
+        )
+    }
 }
 
 /// A fact that moved under a statement: what the statement had seen of it,
@@ -699,6 +751,7 @@ impl Engine {
         } else {
             bases
                 .par_iter()
+                .with_min_len(KEYS_PER_JOB)
                 .map(|key| graph.current_fingerprint(key, |key| db.fact_fingerprint(key)))
                 .collect()
         };
@@ -723,6 +776,7 @@ impl Engine {
         }
         let graph = db.reader_graph();
         keys.par_iter()
+            .with_min_len(KEYS_PER_JOB)
             .map(|key| {
                 (!matches!(
                     key.key(),
@@ -1120,6 +1174,16 @@ impl Engine {
                 self.stats.round_started(self.worklist.order.len());
                 continue;
             };
+            let name = if !self.loop_focus.is_empty() {
+                "serial: loop focus"
+            } else if self.serial_stage {
+                "serial: serial stage"
+            } else if id.file_id == crate::FileId::VIRTUAL {
+                "serial: workspace"
+            } else {
+                "serial: one file"
+            };
+            let _serial = crate::profile::PhaseGuard::new(name);
             self.step(db, recipe, slice, id, reason);
         }
         self.cursor = None;
@@ -1221,7 +1285,7 @@ impl Engine {
         }
         drop(dispatching);
         if !plans.is_empty() {
-            self.run_on_workers(db, recipe, slice, plans, &stop);
+            self.run_on_workers(db, recipe, slice, rank, plans, &stop);
         }
         let _root = crate::profile::PhaseGuard::new("superstep: root list");
         for (file_id, entries) in on_root {
@@ -1384,10 +1448,12 @@ impl Engine {
         db: &mut DbIndex,
         recipe: &dyn Recipe,
         slice: Slice,
+        rank: u8,
         plans: Vec<TaskPlan>,
         stop: &StopSignal,
     ) {
         let profiling = self.stats.profiling();
+        let snapshotting = crate::profile::PhaseGuard::new("superstep: snapshot");
         // Tasks lend no table, so stage rules that moved are marked here.
         let moved_rules = std::mem::take(self.moved_rules.get_mut());
         db.reader_graph_mut().mark_written(&moved_rules);
@@ -1397,25 +1463,47 @@ impl Engine {
             quarantine.started(),
             db.queries().ready_outputs(),
         );
-        let frozen = db.fork();
+        let mut frozen = db.fork();
         let files = plans.iter().map(|plan| plan.file_id).collect::<Vec<_>>();
         let by_file = plans
             .iter()
             .map(|plan| (plan.file_id, plan))
             .collect::<FxHashMap<_, _>>();
+        drop(snapshotting);
         let running = crate::profile::PhaseGuard::new("superstep: tasks");
-        let outcomes = super::parallel::map_files_collect(db, &files, |_, file_id| {
-            run_task_on_worker(
+        let longest = std::sync::Mutex::new(std::time::Duration::ZERO);
+        let cost = self.task_costs.estimates(rank, &plans);
+        let outcomes = super::parallel::map_tasks_collect(db, &files, cost, |_, file_id| {
+            let started = std::time::Instant::now();
+            let outcome = run_task_on_worker(
                 &frozen,
                 &snapshot,
                 by_file[&file_id],
                 recipe,
                 profiling,
                 stop,
-            )
+            );
+            let elapsed = started.elapsed();
+            crate::profile::add_phase("superstep: task cpu", elapsed, 0);
+            let mut longest = lock(&longest);
+            *longest = (*longest).max(elapsed);
+            (outcome, elapsed)
         });
+        crate::profile::add_phase("superstep: longest task", *lock(&longest), 0);
+        let outcomes = plans
+            .iter()
+            .zip(outcomes)
+            .map(|(plan, (outcome, elapsed))| {
+                if let Some(outcome) = &outcome {
+                    self.task_costs
+                        .observe(rank, plan.file_id, outcome.groups.len(), elapsed);
+                }
+                outcome
+            })
+            .collect::<Vec<_>>();
         drop(snapshot);
         drop(running);
+        let committing = crate::profile::PhaseGuard::new("superstep: commit");
         let mut unrun = Vec::new();
         let mut started = Vec::with_capacity(outcomes.len());
         for (plan, outcome) in plans.iter().zip(outcomes) {
@@ -1431,25 +1519,52 @@ impl Engine {
             started.extend(outcome.map(|outcome| (plan.file_id, outcome)));
         }
         self.stats.superstep_tasks += started.len();
+        drop(committing);
         let installing = crate::profile::PhaseGuard::new("superstep: install");
         let mut touched = Vec::new();
-        let mut tasks = Vec::with_capacity(started.len());
+        let mut forks = Vec::with_capacity(started.len());
         let mut recordings = Vec::with_capacity(started.len());
-        let (forks, outcomes): (Vec<_>, Vec<_>) = started
-            .into_iter()
-            .map(|(file_id, outcome)| {
-                let TaskOutcome {
-                    fork,
-                    recording,
-                    groups,
-                    touched,
-                    reruns,
-                } = outcome;
-                (fork, (file_id, recording, groups, touched, reruns))
-            })
-            .unzip();
-        let installed = db.install_tasks(&frozen, forks);
-        for ((file_id, recording, groups, task_touched, reruns), conflicts) in
+        let mut outcomes = Vec::with_capacity(started.len());
+        for (file_id, outcome) in started {
+            let TaskOutcome {
+                mut fork,
+                recording,
+                groups,
+                touched,
+                reruns,
+            } = outcome;
+            fork.release_reader_graph();
+            forks.push(fork);
+            recordings.push(recording);
+            outcomes.push((file_id, groups, touched, reruns));
+        }
+        let written = recordings
+            .iter_mut()
+            .flat_map(|recording| recording.take_written())
+            .collect::<Vec<_>>();
+        // The forks install into the index while the reader graph interns the
+        // keys the tasks read first: neither reads what the other writes.
+        frozen.release_reader_graph();
+        let mut table = db.reader_graph_mut().lend_keys();
+        let (installed, new_slots) = rayon::join(
+            || {
+                let installed =
+                    crate::profile::phase("install: tasks", || db.install_tasks(&frozen, forks));
+                drop(frozen);
+                crate::profile::phase("install: flatten", || db.flatten_installs());
+                installed
+            },
+            || {
+                crate::profile::phase("records: intern", || {
+                    recordings
+                        .iter_mut()
+                        .map(|recording| recording.intern(&mut table))
+                        .collect::<Vec<_>>()
+                })
+            },
+        );
+        let mut tasks = Vec::with_capacity(outcomes.len());
+        for ((file_id, groups, task_touched, reruns), conflicts) in
             outcomes.into_iter().zip(installed)
         {
             if !conflicts.is_empty() {
@@ -1459,22 +1574,11 @@ impl Engine {
                 *self.stats.task_conflicts.entry(field).or_default() += 1;
             }
             touched.extend(task_touched.iter().cloned());
-            recordings.push(recording);
             tasks.push((file_id, groups, task_touched, reruns, !conflicts.is_empty()));
         }
-        drop(frozen);
-        db.flatten_installs();
         drop(installing);
         let filing = crate::profile::PhaseGuard::new("superstep: file records");
-        let written = recordings
-            .iter_mut()
-            .flat_map(|recording| recording.take_written())
-            .collect::<Vec<_>>();
-        let mut table = db.reader_graph_mut().lend_keys();
-        let new_slots = recordings
-            .iter_mut()
-            .map(|recording| recording.intern(&mut table))
-            .collect::<Vec<_>>();
+        let canonicalising = crate::profile::PhaseGuard::new("records: canonicalise");
         let filed = recordings
             .into_par_iter()
             .zip(new_slots)
@@ -1484,6 +1588,7 @@ impl Engine {
             })
             .collect::<Vec<_>>();
         db.reader_graph_mut().restore_keys(table);
+        drop(canonicalising);
         let mut released = Vec::new();
         let mut on_root = Vec::new();
         let mut records = Vec::new();
@@ -1514,16 +1619,25 @@ impl Engine {
         drop(filing);
         let checking = crate::profile::PhaseGuard::new("superstep: readers of");
         derivation::dedup_keys(&mut touched);
-        self.forget_view(db);
+        self.forget_installed(db, &touched, &written);
         db.reader_graph().uncheck_derived(&touched);
         self.readers_of(db, touched.iter());
         drop(checking);
-        for (_, groups, _, reruns, _) in &tasks {
-            for group in groups {
-                if self.widened(db, &group.members) {
-                    self.stats.requeue_cause(group.members[0], "group widened");
-                    self.worklist.insert(group.members[0], Reason::Changed);
-                }
+        let _after = crate::profile::PhaseGuard::new("superstep: after");
+        let widened = tasks
+            .par_iter()
+            .map(|(_, groups, ..)| {
+                groups
+                    .iter()
+                    .filter(|group| widened(db, &group.members))
+                    .map(|group| group.members[0])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for ((_, _, _, reruns, _), widened) in tasks.iter().zip(widened) {
+            for id in widened {
+                self.stats.requeue_cause(id, "group widened");
+                self.worklist.insert(id, Reason::Changed);
             }
             for id in reruns {
                 self.stats
@@ -1592,25 +1706,20 @@ impl Engine {
         }
     }
 
-    /// Whether a member of `group` now shares a primary output with a
-    /// derivation outside it, which it ran without.
-    fn widened(&self, db: &DbIndex, group: &[DerivationId]) -> bool {
-        group.iter().any(|member| {
-            db.reader_graph().outputs_of(*member).any(|key| {
-                key.is_primary()
-                    && db.reader_graph().producers(key).any(|producer| {
-                        producer.kind != DerivationKind::Source && !group.contains(&producer)
-                    })
-            })
-        })
-    }
-
-    /// Forgets what was taken of another view of the index than `db`'s:
-    /// cached fingerprints and inference.
-    fn forget_view(&mut self, db: &mut DbIndex) {
-        db.reader_graph_mut().forget_fingerprints();
+    /// Forgets what was taken of the index before the tasks' forks were
+    /// installed: inference, and the cached fingerprints of the keys the
+    /// tasks `touched` and `written`, the only ones whose values they moved.
+    fn forget_installed(&mut self, db: &DbIndex, touched: &[HashedKey], written: &[HashedKey]) {
+        let graph = db.reader_graph();
+        touched
+            .par_iter()
+            .chain(written.par_iter())
+            .for_each(|key| graph.forget_fingerprint(key));
         derivation::advance_write_generation();
-        self.before_edits_mut().clear();
+        let before_edits = self.before_edits_mut();
+        for key in touched.iter().chain(written) {
+            forget_before_edits(before_edits, graph, key);
+        }
     }
 
     /// Evaluates `entries` of `file_id` and what they queue in the file at
@@ -1742,7 +1851,7 @@ impl Engine {
         }
         // A member that now shares a key with a derivation outside the
         // group ran without it; the next evaluation takes both.
-        if self.widened(db, &group) {
+        if widened(db, &group) {
             // Again in this round: nothing ran after it yet.
             self.stats.requeue_cause(id, "group widened");
             self.worklist.insert(id, Reason::Changed);
@@ -3647,6 +3756,19 @@ impl ResetOwners {
     }
 }
 
+/// Whether a member of `group` now shares a primary output with a derivation
+/// outside it, which it ran without.
+fn widened(db: &DbIndex, group: &[DerivationId]) -> bool {
+    group.iter().any(|member| {
+        db.reader_graph().outputs_of(*member).any(|key| {
+            key.is_primary()
+                && db.reader_graph().producers(key).any(|producer| {
+                    producer.kind != DerivationKind::Source && !group.contains(&producer)
+                })
+        })
+    })
+}
+
 fn co_producers(db: &DbIndex, id: DerivationId) -> Vec<DerivationId> {
     let graph = db.reader_graph();
     let mut group = BTreeSet::from([id]);
@@ -3699,6 +3821,10 @@ thread_local! {
 /// How often a worker superstep runs one derivation within a stage before the
 /// stage settles on the serial loop.
 const SUPERSTEP_RUN_LIMIT: u32 = 64;
+
+/// The fewest keys one worker job checks the readers of: an evaluation's
+/// handful runs on its own thread rather than waking the pool.
+const KEYS_PER_JOB: usize = 64;
 
 /// How many supersteps a group waits for the queries it read before it runs
 /// on the index instead.

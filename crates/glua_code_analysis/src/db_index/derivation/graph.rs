@@ -673,6 +673,9 @@ impl KeyTable {
     /// release epoch began, whichever evaluation of the epoch publishes it first.
     pub(super) fn intern_worker_read(&mut self, key: HashedKey) -> KeyIdx {
         let (slot, created) = self.intern_created(key, self.retirement_started);
+        if self.windows.is_empty() && self.held.is_empty() {
+            return slot;
+        }
         let mut base_slot = match created {
             Some(None) => return slot,
             Some(Some(base_slot)) => base_slot,

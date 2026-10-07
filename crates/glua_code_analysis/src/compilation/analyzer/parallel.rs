@@ -97,9 +97,16 @@ pub(crate) fn task_file() -> Option<FileId> {
 /// The pool's size is [`init_pool`]'s business; this only decides whether to
 /// reach for it at all.
 pub(crate) fn runs_inline(file_count: usize) -> bool {
+    file_count < MIN_PARALLEL_FILES || runs_on_caller(file_count)
+}
+
+/// [`runs_inline`] for work each of whose files costs far more than handing
+/// it to the pool: only a single file, a superstep task running, or nothing
+/// to run in parallel on keeps it on the caller's thread.
+fn runs_on_caller(file_count: usize) -> bool {
     // An evaluation records its reads on its own thread; work handed to a
     // pool worker would read unrecorded.
-    file_count < MIN_PARALLEL_FILES
+    file_count < 2
         || crate::db_index::derivation::recording()
         || task_file().is_some()
         || analysis_threads() <= 1
@@ -133,10 +140,45 @@ where
     T: Send,
     F: Fn(&DbIndex, FileId) -> T + Sync,
 {
-    let n = file_ids.len();
-    if runs_inline(n) {
+    if runs_inline(file_ids.len()) {
         return file_ids.iter().map(|&id| f(db, id)).collect();
     }
+    map_files_on_pool(db, file_ids, dispatch_order(db, file_ids), f)
+}
+
+/// [`map_files_collect`] for superstep tasks, which each cost far more than
+/// the dispatch: two files already run on the pool, the costliest first by
+/// `cost`, each file's estimate, when there is one.
+pub(crate) fn map_tasks_collect<T, F>(
+    db: &DbIndex,
+    file_ids: &[FileId],
+    cost: Option<Vec<f64>>,
+    f: F,
+) -> Vec<T>
+where
+    T: Send,
+    F: Fn(&DbIndex, FileId) -> T + Sync,
+{
+    if runs_on_caller(file_ids.len()) {
+        return file_ids.iter().map(|&id| f(db, id)).collect();
+    }
+    let dispatch = match cost {
+        Some(cost) => {
+            let mut order = (0..file_ids.len()).collect::<Vec<_>>();
+            order.sort_by(|left, right| cost[*right].total_cmp(&cost[*left]).then(left.cmp(right)));
+            order
+        }
+        None => dispatch_order(db, file_ids),
+    };
+    map_files_on_pool(db, file_ids, dispatch, f)
+}
+
+fn map_files_on_pool<T, F>(db: &DbIndex, file_ids: &[FileId], dispatch: Vec<usize>, f: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(&DbIndex, FileId) -> T + Sync,
+{
+    let n = file_ids.len();
 
     let _p = Profile::cond_new("parallel map_files", n > 1);
     init_pool();
@@ -146,7 +188,6 @@ where
     // alone while every other worker idled. Only the order in which files are
     // picked up changes; each result carries its own index, so callers see the
     // same index-aligned `Vec` as before.
-    let dispatch = dispatch_order(db, file_ids);
     let report_step = if crate::progress::is_active() {
         (n / 50).max(1)
     } else {

@@ -261,6 +261,12 @@ impl DbIndex {
         Arc::clone(&self.derivations)
     }
 
+    /// Lets go of this fork's share of the reader graph, which its index
+    /// then writes without copying it.
+    pub(crate) fn release_reader_graph(&mut self) {
+        self.derivations = Arc::default();
+    }
+
     pub(crate) fn reader_graph_mut(&mut self) -> &mut derivation::ReaderGraph {
         Arc::make_mut(&mut self.derivations)
     }

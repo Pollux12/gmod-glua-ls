@@ -124,22 +124,26 @@ impl Drop for PhaseGuard {
         let Some((start, allocs_before)) = self.start else {
             return;
         };
-        let elapsed = start.elapsed();
         let allocs = ALLOC_COUNT
             .load(Ordering::Relaxed)
             .saturating_sub(allocs_before);
-        let mut phases = PHASES.lock().unwrap_or_else(|poison| poison.into_inner());
-        match phases
-            .iter_mut()
-            .find(|(phase, _, _, _)| *phase == self.name)
-        {
-            Some((_, total, count, total_allocs)) => {
-                *total += elapsed;
-                *count += 1;
-                *total_allocs += allocs;
-            }
-            None => phases.push((self.name, elapsed, 1, allocs)),
+        add_phase(self.name, start.elapsed(), allocs);
+    }
+}
+
+/// Accumulates `elapsed` and `allocs` under `name`, as one call.
+pub fn add_phase(name: &'static str, elapsed: Duration, allocs: u64) {
+    if !phase_enabled() {
+        return;
+    }
+    let mut phases = PHASES.lock().unwrap_or_else(|poison| poison.into_inner());
+    match phases.iter_mut().find(|(phase, _, _, _)| *phase == name) {
+        Some((_, total, count, total_allocs)) => {
+            *total += elapsed;
+            *count += 1;
+            *total_allocs += allocs;
         }
+        None => phases.push((name, elapsed, 1, allocs)),
     }
 }
 
