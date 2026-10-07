@@ -107,4 +107,64 @@ print(s)
             "reads missing with the memo: {missing:?}"
         );
     }
+
+    /// Diagnostic reads filed a part at a time leave the same files stale
+    /// after an edit as reads filed all at once.
+    #[test]
+    fn diagnostic_reads_filed_in_parts_leave_what_filing_them_whole_leaves() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.enable_full_diagnostic();
+        ws.def_file(
+            "lua/autorun/provider.lua",
+            "Provider = {}
+---@return string
+function Provider.Describe() end
+",
+        );
+        let readers = (0..4)
+            .map(|reader| {
+                ws.def_file(
+                    &format!("lua/autorun/reader{reader}.lua"),
+                    "local described = Provider.Describe()
+print(described:upper())
+",
+                )
+            })
+            .collect::<Vec<_>>();
+        for file_id in ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_all_file_ids()
+        {
+            ws.analysis
+                .diagnose_file(file_id, tokio_util::sync::CancellationToken::new());
+        }
+        let stale_after_edit = |mut analysis: crate::EmmyLuaAnalysis| {
+            let uri = ws.virtual_url_generator.new_uri("lua/autorun/provider.lua");
+            let provider = analysis
+                .update_file_text_only(
+                    &uri,
+                    "Provider = {}
+---@return number
+function Provider.Describe() end
+"
+                    .to_string(),
+                )
+                .expect("provider file id");
+            analysis.reindex_files(vec![provider])
+        };
+
+        let mut in_parts = ws.analysis.fork();
+        while in_parts.compilation.file_some_diagnostic_reads(1) {}
+        let whole = stale_after_edit(ws.analysis.fork());
+        let parts = stale_after_edit(in_parts);
+
+        assert!(
+            readers.iter().all(|reader| whole.contains(reader)),
+            "an edit the readers read left {whole:?} stale"
+        );
+        assert_eq!(parts, whole);
+    }
 }

@@ -422,6 +422,39 @@ impl LuaCompilation {
         self.db.reader_graph_mut().file_viewed(diagnosed);
     }
 
+    /// Files what the diagnostics of up to `files` files read, as
+    /// [`Self::file_diagnostic_reads`] does for every file, so a quiet moment
+    /// files them a part at a time instead of the next change all at once.
+    /// Returns whether any are left to file.
+    pub fn file_some_diagnostic_reads(&mut self, files: usize) -> bool {
+        let diagnosed = self
+            .diagnosed
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut file_ids = diagnosed.keys().copied().collect::<Vec<_>>();
+        file_ids.sort_unstable();
+        let part = file_ids
+            .iter()
+            .take(files)
+            .filter_map(|file_id| {
+                let reads = diagnosed.remove(file_id)?;
+                Some((DerivationId::diagnostics(*file_id), reads))
+            })
+            .collect::<Vec<_>>();
+        if part.is_empty() {
+            return false;
+        }
+        let _filing = crate::profile::PhaseGuard::new("diagnostic reads part");
+        let more = !diagnosed.is_empty();
+        let graph = self.db.reader_graph_mut();
+        if more {
+            graph.file_viewed_part(part);
+        } else {
+            graph.file_viewed(part);
+        }
+        more
+    }
+
     /// An independent copy-on-write copy; see [`DbIndex::fork_independent`].
     pub fn fork(&self) -> Self {
         let diagnosed = self

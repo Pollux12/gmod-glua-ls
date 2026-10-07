@@ -13,6 +13,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::{ClientProxy, DebouncedAnalysis, file_diagnostic::SharedDiagnosticDataCache};
 
+/// How many files' diagnostic reads one write lock files while idle.
+const FILED_PER_LOCK: usize = 64;
+
 /// Which dirty diagnostics are computed first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Priority {
@@ -108,6 +111,8 @@ pub struct DiagnosticStore {
     computed: Notify,
     /// Signalled when a re-analysis settles, for the verifier.
     settled: Notify,
+    /// Signalled when no file is dirty or computing, for the filer.
+    idle: Notify,
     /// Where changed diagnostics are published.
     client: Arc<ClientProxy>,
     /// `GLUALS_DIAG_VERIFY`: every stored result is checked against a fresh
@@ -128,6 +133,7 @@ impl DiagnosticStore {
             dirtied: Notify::new(),
             computed: Notify::new(),
             settled: Notify::new(),
+            idle: Notify::new(),
             client,
             verify: std::env::var_os("GLUALS_DIAG_VERIFY").is_some(),
         }
@@ -138,8 +144,9 @@ impl DiagnosticStore {
     }
 
     /// Starts `workers` tasks computing dirty files once no edit is pending,
-    /// the edited ones as soon as their own text has settled, and the
-    /// verifier under `GLUALS_DIAG_VERIFY`.
+    /// the edited ones as soon as their own text has settled, one filing what
+    /// they read once none is left, and the verifier under
+    /// `GLUALS_DIAG_VERIFY`.
     pub fn start(
         self: &Arc<Self>,
         workers: usize,
@@ -157,6 +164,20 @@ impl DiagnosticStore {
                         _ = shutdown.cancelled() => return,
                     };
                     store.run(job).await;
+                }
+            });
+        }
+        {
+            let store = self.clone();
+            let debounced = debounced.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = store.idle.notified() => {}
+                        _ = shutdown.cancelled() => return,
+                    }
+                    store.file_reads_while_idle(&debounced).await;
                 }
             });
         }
@@ -580,15 +601,37 @@ impl DiagnosticStore {
             });
         }
         drop(analysis);
-        let idle = {
-            let state = self.state();
-            state.dirty.is_empty() && state.computing.is_empty()
-        };
-        if idle {
+        if self.is_idle() {
             crate::util::ls_profile::emit_ls_diagnostics_idle();
+            self.idle.notify_one();
         }
         self.computed.notify_waiters();
         self.dirtied.notify_waiters();
+    }
+
+    fn is_idle(&self) -> bool {
+        let state = self.state();
+        state.dirty.is_empty() && state.computing.is_empty()
+    }
+
+    /// Files what the computed diagnostics read, a part per write lock, while
+    /// no file or edit waits: the next re-analysis files whatever is left
+    /// before it starts, holding up the edit it takes.
+    async fn file_reads_while_idle(&self, debounced: &DebouncedAnalysis) {
+        while !debounced.is_dirty() && self.is_idle() {
+            let mut analysis = self.analysis.write().await;
+            if debounced.is_dirty() || analysis.compilation.is_updating() {
+                return;
+            }
+            if !analysis
+                .compilation
+                .file_some_diagnostic_reads(FILED_PER_LOCK)
+            {
+                return;
+            }
+            drop(analysis);
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Under `GLUALS_DIAG_VERIFY`, computes every file whose stored

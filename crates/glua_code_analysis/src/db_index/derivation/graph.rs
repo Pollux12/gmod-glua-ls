@@ -1106,6 +1106,9 @@ pub struct ReaderGraph {
     foreign_producers: FxHashMap<FileId, FxHashSet<DerivIdx>>,
     /// Cached fingerprints taken in an older generation are forgotten.
     generation: u32,
+    /// Slots [`Self::file_viewed_part`] left unreferenced, kept until every
+    /// viewed record naming the graph as it stood is filed.
+    held_releases: Vec<KeyIdx>,
 }
 
 impl ReaderGraph {
@@ -1405,6 +1408,25 @@ impl ReaderGraph {
     /// new keys are interned in order, and each record is kept and diffed on
     /// worker threads.
     pub fn file_viewed(&mut self, records: Vec<(DerivationId, super::ViewedReads)>) {
+        let mut released = std::mem::take(&mut self.held_releases);
+        self.keep_viewed(records, &mut released);
+        self.release_keys(released);
+    }
+
+    /// [`Self::file_viewed`] for some of the records viewing this graph, the
+    /// slots it leaves unreferenced kept for the rest, which may still name
+    /// them, until [`Self::file_viewed`] files those.
+    pub fn file_viewed_part(&mut self, records: Vec<(DerivationId, super::ViewedReads)>) {
+        let mut released = std::mem::take(&mut self.held_releases);
+        self.keep_viewed(records, &mut released);
+        self.held_releases = released;
+    }
+
+    fn keep_viewed(
+        &mut self,
+        records: Vec<(DerivationId, super::ViewedReads)>,
+        released: &mut Vec<KeyIdx>,
+    ) {
         use rayon::prelude::*;
         let now = super::new_stamp();
         let records = records
@@ -1425,9 +1447,7 @@ impl ReaderGraph {
             .into_par_iter()
             .map(|(id, slots)| table.keep_viewed(id, slots))
             .collect();
-        let mut released = Vec::new();
-        self.replace_all_kept(records, &mut released, || now);
-        self.release_keys(released);
+        self.replace_all_kept(records, released, || now);
     }
 
     /// Frees each slot of `slots` nothing refers to any more.
