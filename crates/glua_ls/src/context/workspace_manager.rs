@@ -4,10 +4,12 @@ use std::path::Path;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use super::{ClientProxy, FileDiagnostic, StatusBar};
-use crate::codestyle::apply_workspace_code_style;
+use crate::codestyle::apply_workspace_code_style_off_workers;
+use crate::context::ServerContextSnapshot;
 use crate::context::lsp_features::LspFeatures;
 use crate::handlers::{
-    ClientConfig, apply_workspace_diagnostic_configs, init_analysis, refresh_open_document_features,
+    ClientConfig, apply_file_system_changes, apply_workspace_diagnostic_configs, init_analysis,
+    refresh_open_document_features,
 };
 use crate::util::{LongRunningWatchdogStatus, spawn_long_running_watchdog};
 use glua_code_analysis::uri_to_file_path;
@@ -138,7 +140,9 @@ impl WorkspaceManager {
         let watchdog_status = LongRunningWatchdogStatus::new("Reloading GLuaLS configuration");
         let _watchdog =
             spawn_long_running_watchdog("workspace config reload", watchdog_status.clone());
-        let loaded = load_emmy_config(collect_config_roots(&workspace_folders), client_config);
+        let loaded =
+            load_emmy_config_off_workers(collect_config_roots(&workspace_folders), client_config)
+                .await;
         let (change, open_files) = {
             let mut manager = workspace_manager.write().await;
             let change = manager
@@ -161,7 +165,11 @@ impl WorkspaceManager {
         match change {
             EmmyrcChange::Unchanged => {}
             EmmyrcChange::Workspace => {
-                apply_workspace_code_style(&workspace_folders, loaded.emmyrc.as_ref());
+                apply_workspace_code_style_off_workers(
+                    workspace_folders.clone(),
+                    loaded.emmyrc.clone(),
+                )
+                .await;
                 init_analysis(
                     &analysis,
                     &client,
@@ -177,7 +185,11 @@ impl WorkspaceManager {
             }
             EmmyrcChange::Editor | EmmyrcChange::Diagnostics | EmmyrcChange::Analysis => {
                 if change >= EmmyrcChange::Diagnostics {
-                    apply_workspace_code_style(&workspace_folders, loaded.emmyrc.as_ref());
+                    apply_workspace_code_style_off_workers(
+                        workspace_folders.clone(),
+                        loaded.emmyrc.clone(),
+                    )
+                    .await;
                 }
                 {
                     let mut analysis = analysis.write().await;
@@ -400,6 +412,16 @@ impl LoadedConfig {
     fn root_emmyrc(&self, root: &Path) -> &Emmyrc {
         self.workspace_emmyrcs.get(root).unwrap_or(&self.emmyrc)
     }
+}
+
+/// [`load_emmy_config`] on a blocking thread: it reads every config file.
+pub async fn load_emmy_config_off_workers(
+    config_roots: Vec<PathBuf>,
+    client_config: ClientConfig,
+) -> LoadedConfig {
+    tokio::task::spawn_blocking(move || load_emmy_config(config_roots, client_config))
+        .await
+        .unwrap_or_else(|err| std::panic::resume_unwind(err.into_panic()))
 }
 
 pub fn load_emmy_config(config_roots: Vec<PathBuf>, client_config: ClientConfig) -> LoadedConfig {

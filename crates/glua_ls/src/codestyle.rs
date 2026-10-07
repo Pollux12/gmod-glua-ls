@@ -14,6 +14,21 @@ use walkdir::{DirEntry, WalkDir};
 
 const VCS_DIRS: [&str; 3] = [".git", ".hg", ".svn"];
 
+/// [`apply_workspace_code_style`] on a blocking thread: it reads every
+/// `.editorconfig` under the folders.
+pub async fn apply_workspace_code_style_off_workers(
+    workspace_folders: Vec<WorkspaceFolder>,
+    emmyrc: std::sync::Arc<Emmyrc>,
+) {
+    let applied = tokio::task::spawn_blocking(move || {
+        apply_workspace_code_style(&workspace_folders, &emmyrc);
+    })
+    .await;
+    if let Err(err) = applied {
+        std::panic::resume_unwind(err.into_panic());
+    }
+}
+
 pub fn apply_workspace_code_style(
     workspace_folders: &[WorkspaceFolder],
     emmyrc: &Emmyrc,

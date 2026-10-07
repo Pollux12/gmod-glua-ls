@@ -1,5 +1,4 @@
 mod client_config;
-mod codestyle;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -9,9 +8,11 @@ use std::{
 
 use crate::{
     cmd_args::CmdArgs,
+    codestyle::apply_workspace_code_style_off_workers,
     context::{
         FileDiagnostic, LoadedConfig, LspFeatures, ProgressTask, ServerContextSnapshot, StatusBar,
-        WorkspaceFileMatcher, get_client_id, load_emmy_config, validate_gmod_annotations_for_ls,
+        WorkspaceFileMatcher, get_client_id, load_emmy_config_off_workers,
+        validate_gmod_annotations_for_ls,
     },
     handlers::{
         configuration::register_did_change_configuration, text_document::register_files_watch,
@@ -20,7 +21,6 @@ use crate::{
     util::{AnalysisProgressReporter, LongRunningWatchdogStatus, spawn_long_running_watchdog},
 };
 pub use client_config::{ClientConfig, client_config_sections, get_client_config};
-use codestyle::load_editorconfig;
 use glua_code_analysis::{
     EmmyLuaAnalysis, Emmyrc, FileId, LuaDiagnosticConfig, WorkspaceFolder,
     calculate_include_and_exclude, collect_workspace_files, fetch_schema_urls, file_path_to_uri,
@@ -135,9 +135,9 @@ pub async fn initialized_handler(
         .iter()
         .map(|workspace| workspace.root.clone())
         .collect();
-    let loaded = load_emmy_config(config_roots, client_config.clone());
+    let loaded = load_emmy_config_off_workers(config_roots, client_config.clone()).await;
     let emmyrc = loaded.emmyrc.clone();
-    load_editorconfig(workspace_folders.clone(), emmyrc.as_ref());
+    apply_workspace_code_style_off_workers(workspace_folders.clone(), emmyrc.clone()).await;
     log::info!("configuration loaded");
 
     // LS-only fail-fast: when GMod mode is enabled, require a resolved,
