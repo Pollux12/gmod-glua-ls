@@ -78,27 +78,25 @@ impl LspServer {
         }
 
         // Process all pending messages after initialization
-        if self
+        let mut exited = self
             .processor
             .process_pending_messages(&mut self.connection, &mut self.server_context)
-            .await?
-        {
-            self.server_context.close().await;
-            return Ok(()); // Shutdown requested during pending message processing
-        }
+            .await?;
 
         // Now focus on normal message processing
-        while let Some(msg) = self.connection.recv().await {
-            if self
+        while !exited && let Some(msg) = self.connection.recv().await {
+            exited = self
                 .processor
                 .process_message(msg, &mut self.connection, &mut self.server_context)
-                .await?
-            {
-                break; // Shutdown requested
-            }
+                .await?;
         }
 
         self.server_context.close().await;
+        if exited && !self.processor.shutdown_requested() {
+            return Err(
+                ExitError("exit notification without a shutdown request".to_owned()).into(),
+            );
+        }
         Ok(())
     }
 
