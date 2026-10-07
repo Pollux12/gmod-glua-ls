@@ -50,6 +50,7 @@ pub(crate) use infer::{
     AccessPaths, keep_access_paths, restore_access_path_snapshot, stop_keeping_access_paths,
     take_access_path_snapshot, with_access_paths,
 };
+pub(crate) use infer::{declaring_for_range, try_infer_enclosing_for_range_iter_type};
 use infer::{infer_call_arg_expr_list_types, infer_expr_list_types, infer_expr_list_value_type_at};
 pub use infer::{infer_table_field_value_should_be, infer_table_should_be};
 use lsp_types::Uri;

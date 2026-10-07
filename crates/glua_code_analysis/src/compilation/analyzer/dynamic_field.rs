@@ -13,7 +13,8 @@ use crate::{
     db_index::{DbIndex, DynamicFieldOwner, LuaMemberOwner, LuaSemanticDeclId, WorkspaceKind},
     find_signature_attribute_use,
     semantic::{
-        find_members_with_key, get_var_expr_var_ref_id, infer_expr, unwrap_paren_to_name_expr,
+        declaring_for_range, find_members_with_key, get_var_expr_var_ref_id, infer_expr,
+        try_infer_enclosing_for_range_iter_type, unwrap_paren_to_name_expr,
     },
 };
 
@@ -1073,7 +1074,7 @@ fn get_field_names(
                 };
             }
 
-            let names = string_const_names(&infer_expr(db, cache, expr.clone()).ok());
+            let names = string_const_names(&computed_key_type(db, cache, &expr));
             if !names.is_empty() {
                 return ResolvedDynamicFieldNames {
                     names,
@@ -1094,6 +1095,28 @@ fn get_field_names(
         }
         _ => ResolvedDynamicFieldNames::default(),
     }
+}
+
+/// A computed key's type as this pass may read it. A loop variable's stored
+/// type was settled with the fields this pass builds visible: read back, a
+/// field it named would name itself again after whatever first gave it was
+/// gone. So its type is inferred from its loop's iterator, under this pass's
+/// view.
+fn computed_key_type(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    expr: &LuaExpr,
+) -> Option<LuaType> {
+    if let LuaExpr::NameExpr(name_expr) = expr
+        && let Some(decl_id) = db
+            .get_reference_index()
+            .get_local_reference(&cache.get_file_id())
+            .and_then(|references| references.get_decl_id(&name_expr.get_range()))
+        && declaring_for_range(name_expr, decl_id).is_some()
+    {
+        return try_infer_enclosing_for_range_iter_type(db, cache, name_expr, decl_id);
+    }
+    infer_expr(db, cache, expr.clone()).ok()
 }
 
 fn collect_local_reassignment_positions(
@@ -1159,7 +1182,7 @@ fn finite_dynamic_key_strings(
     expr: &LuaExpr,
     visiting: &mut FxHashSet<LuaDeclId>,
 ) -> Vec<SmolStr> {
-    let inferred = string_const_names(&infer_expr(db, cache, expr.clone()).ok());
+    let inferred = string_const_names(&computed_key_type(db, cache, expr));
     if !inferred.is_empty() {
         return inferred;
     }

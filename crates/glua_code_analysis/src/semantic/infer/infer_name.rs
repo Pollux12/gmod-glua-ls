@@ -524,7 +524,27 @@ fn name_expr_resolves_to_decl(
         == Some(decl_id)
 }
 
-fn try_infer_enclosing_for_range_iter_type(
+/// The `for ... in` loop around `name_expr` that declares `decl_id`, with the
+/// variable's index among the loop's.
+pub(crate) fn declaring_for_range(
+    name_expr: &LuaNameExpr,
+    decl_id: LuaDeclId,
+) -> Option<(LuaForRangeStat, usize)> {
+    name_expr
+        .syntax()
+        .ancestors()
+        .filter_map(LuaForRangeStat::cast)
+        .find_map(|for_range| {
+            let var_idx = for_range
+                .get_var_name_list()
+                .position(|var_name| var_name.get_position() == decl_id.position)?;
+            Some((for_range, var_idx))
+        })
+}
+
+/// The type of the loop variable `decl_id`, inferred from its loop's
+/// iterator under `cache`'s view.
+pub(crate) fn try_infer_enclosing_for_range_iter_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     name_expr: &LuaNameExpr,
@@ -537,14 +557,7 @@ fn try_infer_enclosing_for_range_iter_type(
         };
     }
 
-    let for_range = name_expr
-        .syntax()
-        .ancestors()
-        .find_map(LuaForRangeStat::cast)?;
-    let var_idx = for_range
-        .get_var_name_list()
-        .enumerate()
-        .find_map(|(idx, var_name)| (var_name.get_position() == decl_id.position).then_some(idx))?;
+    let (for_range, var_idx) = declaring_for_range(name_expr, decl_id)?;
     let iter_exprs = for_range.get_expr_list().collect::<Vec<_>>();
     cache
         .for_range_iter_var_type_cache
