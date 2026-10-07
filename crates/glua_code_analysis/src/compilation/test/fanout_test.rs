@@ -826,6 +826,56 @@ function WriteCityName(value) end
         );
     }
 
+    /// A path whose class a derivation binds keeps nothing under its own key,
+    /// whichever order its writers were filed in, so re-indexing another
+    /// file that writes through the path leaves the binding file alone.
+    #[test]
+    fn re_indexing_a_writer_of_a_derivation_bound_global_re_runs_only_that_file() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let files = ws.def_files(vec![
+            (
+                "lua/glide/server/fuel.lua",
+                "local A = X.Y\n\nfunction X.Y.f() end\n",
+            ),
+            (
+                "lua/glide/sh_fuel.lua",
+                "X = X or {}\nX.Y = X.Y or {}\n\n---@class C\nlocal A = X.Y\n\nfunction A.g() end\n\nX.Y = A\n",
+            ),
+        ]);
+        let writer = files[0];
+        let path = crate::GlobalId::new("X.Y");
+        let class = crate::LuaMemberOwner::Type(crate::LuaTypeDeclId::global("C"));
+        {
+            let index = ws.analysis.compilation.get_db().get_member_index();
+            assert!(
+                !index.sorted_global_path_owners().contains(&path),
+                "{:?}",
+                index.sorted_global_path_owners()
+            );
+            let homed = index
+                .get_members(&class)
+                .unwrap_or_default()
+                .iter()
+                .any(|member| member.get_id().file_id == writer);
+            assert!(homed, "the writer's member is homed on the bound class");
+        }
+
+        ws.analysis.reindex_files(vec![writer]);
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![writer]);
+        assert!(
+            !ws.analysis
+                .compilation
+                .get_db()
+                .get_member_index()
+                .sorted_global_path_owners()
+                .contains(&path)
+        );
+    }
+
     /// The class's file re-homed the other file's members, but where those
     /// members sit in their file is that file's own business: editing it
     /// leaves the class's file standing.

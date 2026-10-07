@@ -1735,16 +1735,18 @@ impl LuaMemberIndex {
     /// proposal. Read-only and cheap, so producers may consult it per write.
     ///
     /// The membership arm is not covered by the `GlobalPath` domain epoch —
-    /// filing a member under the path only bumps membership clocks — so it
-    /// records the owner map read as well, which member-map-armed scopes
-    /// compare through `read_version`.
+    /// filing a member under the path only bumps membership clocks — so when
+    /// it decides the answer it records the owner presence read as well.
     pub fn is_known_global_path(&self, path: &GlobalId) -> bool {
         derivation::note_global_path_read(path);
-        note_owner_presence_read(&LuaMemberOwner::GlobalPath(path.clone()));
-        self.owner_members
-            .contains_key(&LuaMemberOwner::GlobalPath(path.clone()))
-            || self.global_path_class_candidates.contains_key(path)
+        if self.global_path_class_candidates.contains_key(path)
             || self.path_definition_sites.contains_key(path)
+        {
+            return true;
+        }
+        let owner = LuaMemberOwner::GlobalPath(path.clone());
+        note_owner_presence_read(&owner);
+        self.owner_members.contains_key(&owner)
     }
 
     /// Records `path` as the provenance of members that do not have one yet.
@@ -2101,6 +2103,41 @@ impl LuaMemberIndex {
             }
             self.set_member_owner(to.clone(), member_id.file_id, member_id);
             self.add_member_to_owner(to.clone(), member_id);
+        }
+        if *to != path_owner {
+            self.vacate_bound_path_owner(&path_owner);
+        }
+    }
+
+    /// Drops every item and key-index entry a class-bound path's own key
+    /// holds for members homed elsewhere.
+    ///
+    /// Every reader canonicalises the path to its class, so what is left
+    /// under the path itself is only a trace of whether its members were
+    /// filed before or after the class was bound.
+    fn vacate_bound_path_owner(&mut self, path_owner: &LuaMemberOwner) {
+        let listed = self
+            .owner_members
+            .get(path_owner)
+            .into_iter()
+            .flat_map(|members| members.get_member_items())
+            .flat_map(member_ids_from_item);
+        let indexed = [
+            &self.member_owner_key_index,
+            &self.member_owner_key_history_index,
+        ]
+        .into_iter()
+        .filter_map(|index| index.get(path_owner))
+        .flat_map(|slots| slots.values().flatten().copied());
+        let mut member_ids = listed
+            .chain(indexed)
+            .filter(|id| self.member_current_owner.get(id) != Some(path_owner))
+            .collect::<Vec<_>>();
+        member_ids.sort_unstable_by_key(|id| member_id_sort_key(*id));
+        member_ids.dedup();
+        for member_id in member_ids {
+            self.remove_member_from_all_owner_key_indexes(path_owner, member_id);
+            self.remove_member_from_owner_item(path_owner, member_id);
         }
     }
 
