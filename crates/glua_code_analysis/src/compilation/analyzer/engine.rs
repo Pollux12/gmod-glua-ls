@@ -1124,8 +1124,11 @@ impl Engine {
             if self.focus.is_empty() && !self.worklist.is_empty() {
                 self.released_unrun = false;
             }
+            // A focus settles in canonical order: its files' tasks at one rank
+            // would read each other's unsettled values.
             if self.superstep == SuperstepMode::Workers
                 && !self.serial_stage
+                && self.focus.is_empty()
                 && self.loop_focus.is_empty()
                 && self
                     .worklist
@@ -3840,8 +3843,8 @@ enum SuperstepMode {
 }
 
 /// `GLUALS_SUPERSTEP`: `off` runs the serial engine; unset or any other value
-/// runs each rank whose work spans files a superstep at a time with the
-/// tasks on worker threads.
+/// runs each rank outside a focus whose work spans files a superstep at a
+/// time with the tasks on worker threads.
 fn superstep_mode() -> SuperstepMode {
     static MODE: std::sync::OnceLock<SuperstepMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("GLUALS_SUPERSTEP").as_deref() {
