@@ -4,10 +4,15 @@ use std::time::{Duration, Instant};
 
 fn profile_gate() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("GLUALS_PROFILE").is_some())
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("GLUALS_PROFILE").is_some()
+            || std::env::var_os("GLUALS_LS_PROFILE").is_some()
+    })
 }
 
-/// Whether `GLUALS_PROFILE` instrumentation should record and emit.
+/// Whether `GLUALS_PROFILE` instrumentation should record and emit; or
+/// `GLUALS_LS_PROFILE`, which emits these server records alone, without the
+/// analysis profile's per-evaluation bookkeeping.
 ///
 /// All `ls_*` records are gated on this. When unset there is no output and
 /// callers must not pay for `Instant::now()` or extra locking.
