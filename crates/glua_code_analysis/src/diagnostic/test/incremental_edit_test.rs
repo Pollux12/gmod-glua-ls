@@ -1004,6 +1004,44 @@ end)
         expect_that!(affected, not(contains(eq(&receiver))));
     }
 
+    /// A receiver's network checks see a sender's flows by their place in
+    /// the sender's file: lines inserted above them leave it unaffected.
+    #[gtest]
+    fn lines_inserted_above_a_senders_flow_leave_its_receiver_unaffected() {
+        let mut ws = gmod_workspace_with(DiagnosticCode::GmodNetReadWriteBitsMismatch);
+        let sender = "util.AddNetworkString(\"Bits\")
+local function send()
+    net.Start(\"Bits\")
+    net.WriteUInt(1, 16)
+    net.Broadcast()
+end
+send()
+";
+        let sender_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/sv_send.lua");
+        write(&mut ws, &sender_uri, sender);
+        let receiver_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/client/cl_receive.lua");
+        let receiver = write(
+            &mut ws,
+            &receiver_uri,
+            "net.Receive(\"Bits\", function()
+    local value = net.ReadUInt(16)
+end)
+",
+        );
+        shared_diagnostics(&ws, receiver);
+
+        let affected = ws.analysis.apply_file_system_changes(vec![(
+            sender_uri,
+            Some(format!("function ScnAdd(a, b) return a + b end\n{sender}")),
+        )]);
+
+        expect_that!(affected, not(contains(eq(&receiver))));
+    }
+
     /// Realm checks read the callee realms shared by every file: moving a
     /// server function into a shared file reports its client caller affected,
     /// though the caller was not edited.
