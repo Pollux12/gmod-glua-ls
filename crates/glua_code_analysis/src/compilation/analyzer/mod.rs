@@ -542,11 +542,12 @@ fn replace_files(
                 _ => engine.changed(producer),
             }
         }
-        if db
-            .reader_graph()
-            .derivations_of_file(*file_id)
-            .next()
-            .is_some()
+        if live
+            && db
+                .reader_graph()
+                .derivations_of_file(*file_id)
+                .next()
+                .is_some()
         {
             engine.rebuilding(*file_id);
         }
