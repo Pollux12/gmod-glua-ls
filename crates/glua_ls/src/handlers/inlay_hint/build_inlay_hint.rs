@@ -14,7 +14,7 @@ use glua_parser::{
 };
 use glua_parser::{LuaAstToken, LuaTokenKind};
 use lsp_types::{InlayHint, InlayHintKind, InlayHintLabel, InlayHintLabelPart, Location};
-use rowan::NodeOrToken;
+use rowan::{NodeOrToken, TextRange, WalkEvent};
 
 use rowan::TokenAtOffset;
 use tokio_util::sync::CancellationToken;
@@ -24,17 +24,30 @@ use crate::handlers::completion::get_index_alias_name;
 use crate::handlers::definition::compare_function_types;
 use crate::handlers::inlay_hint::build_function_hint::{build_closure_hint, build_label_parts};
 
+/// The hints of the nodes `range` reaches, or of the whole file.
 pub fn build_inlay_hints(
     semantic_model: &SemanticModel,
+    range: Option<TextRange>,
     client_id: ClientId,
     cancel_token: &CancellationToken,
 ) -> Option<Vec<InlayHint>> {
     let mut result = Vec::new();
     let root = semantic_model.get_root();
-    for node in root.clone().descendants::<LuaAst>() {
+    let mut walk = root.syntax().preorder();
+    while let Some(event) = walk.next() {
+        let WalkEvent::Enter(node) = event else {
+            continue;
+        };
         if cancel_token.is_cancelled() {
             return None;
         }
+        if range.is_some_and(|range| node.text_range().intersect(range).is_none()) {
+            walk.skip_subtree();
+            continue;
+        }
+        let Some(node) = LuaAst::cast(node) else {
+            continue;
+        };
         match node {
             LuaAst::LuaClosureExpr(closure) => {
                 build_closure_hint(semantic_model, &mut result, closure);

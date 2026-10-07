@@ -34,6 +34,33 @@ mod tests {
         Ok(())
     }
 
+    /// A request for some lines gets the hints of what lies on them.
+    #[gtest]
+    fn hints_are_built_for_the_requested_range() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_inlay_hint_in(
+            r#"
+                ---@class Hint1
+
+                ---@param a Hint1
+                local function test(a)
+                    local b = a
+                end
+            "#,
+            Some(lsp_types::Range::new(
+                lsp_types::Position::new(5, 0),
+                lsp_types::Position::new(6, 0),
+            )),
+            vec![VirtualInlayHint {
+                label: ": Hint1".to_string(),
+                line: 5,
+                pos: 27,
+                ref_file: Some("".to_string()),
+            }]
+        ));
+        Ok(())
+    }
+
     #[gtest]
     fn test_2() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();

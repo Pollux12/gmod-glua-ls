@@ -476,11 +476,27 @@ impl ProviderVirtualWorkspace {
         block_str: &str,
         expected: Vec<VirtualInlayHint>,
     ) -> Result<()> {
+        self.check_inlay_hint_in(block_str, None, expected)
+    }
+
+    /// [`Self::check_inlay_hint`] for the hints a request for `range` gets.
+    pub fn check_inlay_hint_in(
+        &mut self,
+        block_str: &str,
+        range: Option<lsp_types::Range>,
+        expected: Vec<VirtualInlayHint>,
+    ) -> Result<()> {
         let file_id = self.def(block_str);
         let cancel_token = tokio_util::sync::CancellationToken::new();
-        let result = inlay_hint(&self.analysis, file_id, ClientId::VSCode, &cancel_token)
-            .ok_or("failed to get inlay hints")
-            .or_fail()?;
+        let result = inlay_hint(
+            &self.analysis,
+            file_id,
+            range,
+            ClientId::VSCode,
+            &cancel_token,
+        )
+        .ok_or("failed to get inlay hints")
+        .or_fail()?;
 
         let items = result
             .into_iter()

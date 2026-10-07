@@ -59,6 +59,7 @@ pub async fn on_inlay_hint_handler(
         inlay_hint(
             &analysis,
             analysis.get_file_id(&uri)?,
+            Some(params.range),
             client_id,
             &cancel_token,
         )
@@ -67,14 +68,22 @@ pub async fn on_inlay_hint_handler(
     result
 }
 
+/// The inlay hints of `file_id` within `range`, or of the whole file.
 pub fn inlay_hint(
     analysis: &EmmyLuaAnalysis,
     file_id: FileId,
+    range: Option<lsp_types::Range>,
     client_id: ClientId,
     cancel_token: &CancellationToken,
 ) -> Option<Vec<InlayHint>> {
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
-    build_inlay_hints(&semantic_model, client_id, cancel_token)
+    let text_range = range.and_then(|range| semantic_model.get_document().to_rowan_range(range));
+    let mut hints = build_inlay_hints(&semantic_model, text_range, client_id, cancel_token)?;
+    // A node reaching into the range can place a hint outside it.
+    if let Some(range) = range {
+        hints.retain(|hint| range.start <= hint.position && hint.position <= range.end);
+    }
+    Some(hints)
 }
 
 #[allow(unused_variables)]
