@@ -411,12 +411,12 @@ pub(crate) struct Engine {
     /// before they were removed: what a reader settled on of it, whatever it
     /// saw while the files were rebuilt.
     removed_outputs: FxHashMap<HashedKey, derivation::Fingerprint>,
-    /// The statements of the loops this run cleared. A loop is cleared once
-    /// per run: settled again from nothing, it holds nothing from before the
-    /// run, and what moves under it later it follows as any reader does. A
-    /// loop that runs through a whole-file pass, which a loop of statements
-    /// leaves out, could otherwise be cleared without end, each time from
-    /// what the pass made of the last.
+    /// The members of the loops this run cleared. A loop is cleared once per
+    /// run: settled again from nothing, it holds nothing from before the run,
+    /// and what moves under it later it follows as any reader does. A loop
+    /// through a pass that runs from the first stage, which loops leave out,
+    /// could otherwise be cleared without end, each time from what the pass
+    /// made of the last.
     cleared: FxHashSet<DerivationId>,
     /// Since the last loop check cleared loops: every key whose readers were
     /// checked. A loop the next check can clear lies downstream of one; `None`
@@ -2079,8 +2079,10 @@ impl Engine {
         })
     }
 
-    /// At quiescence, clears every loop of statements one of whose members
-    /// reads from outside the loop a fact that moved since it settled on it:
+    /// At quiescence, clears every loop of statements, closed directly or
+    /// through the passes that run once statements settle (see
+    /// [`DerivationKind::closes_loops`]), one of whose statements reads from
+    /// outside the loop a fact that moved since it settled on it:
     /// each member's primary outputs, and those of whatever shares them, go
     /// back to the source layer, they run again, and the run starts over from
     /// the first stage, as a cold build settles a loop through them. Returns
@@ -2092,7 +2094,7 @@ impl Engine {
         // downstream of one.
         let since = self.since_search.take().map(|keys| {
             db.reader_graph()
-                .readers_downstream(keys.iter(), DerivationKind::is_statement)
+                .readers_downstream(keys.iter(), DerivationKind::closes_loops)
         });
         // A loop is cleared for a member that read a fact that net-moved, so
         // only such members can be roots of one.
@@ -2116,7 +2118,7 @@ impl Engine {
         // on the way, not from what the other settles to.
         let loops = db.reader_graph().read_loops(
             roots.iter().copied(),
-            DerivationKind::is_statement,
+            DerivationKind::closes_loops,
             |lp| {
                 lp.iter().any(|member| !self.cleared.contains(member))
                     && lp

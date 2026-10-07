@@ -1063,6 +1063,14 @@ impl DerivationKind {
         self.rank() == Self::LocalStat.rank()
     }
 
+    /// Whether a loop of statements can close through derivations of this
+    /// kind: statements, and the passes that run once the statements settle,
+    /// which read what statements settled to and write facts statements read
+    /// back. A cold build settles such a loop from the statements alone.
+    pub fn closes_loops(self) -> bool {
+        self.is_statement() || (self.first_stage() == AnalysisStage::Closed && !self.is_query())
+    }
+
     /// Whether derivations of this kind are queries: computed when first
     /// read rather than scheduled, and re-computed when a read of theirs moves.
     pub fn is_query(self) -> bool {
