@@ -132,8 +132,8 @@ static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 /// Edit each sampled file (append a comment, so the token-identity no-op gate
 /// does not skip the work), timing the full production keystroke cost: the
 /// re-analysis of the file and of everything that read a fact it moved, then
-/// the post-edit diagnostics pass. Restores the original text after each edit.
-/// Returns the worst edit.
+/// re-diagnosis of every file whose diagnostics went stale. Restores the
+/// original text after each edit. Returns the worst edit.
 fn run_incremental_edits(
     analysis: &mut EmmyLuaAnalysis,
     sample: Vec<(FileId, usize)>,
@@ -149,6 +149,14 @@ fn run_incremental_edits(
         .and_then(|value| value.parse().ok())
         .unwrap_or(1)
         .max(1);
+    // `BENCH_EDIT_SLICE_MS=N` settles each edit in slices of N ms, the way
+    // the language server does, instead of in one call.
+    let slice_ms: Option<u64> = std::env::var("BENCH_EDIT_SLICE_MS")
+        .ok()
+        .and_then(|value| value.parse().ok());
+    if slice_ms.is_some() {
+        analysis.compilation.set_detached_tasks(true);
+    }
     let sample: Vec<(FileId, usize)> = sample
         .into_iter()
         .flat_map(|entry| std::iter::repeat_n(entry, repeats))
@@ -193,7 +201,10 @@ fn run_incremental_edits(
             }
             analysis.update_file_text_only(&uri, edited_text);
             let t = Instant::now();
-            let affected = analysis.reindex_files(vec![file_id]);
+            let affected = match slice_ms {
+                Some(ms) => reindex_in_slices(analysis, file_id, ms),
+                None => analysis.reindex_files(vec![file_id]),
+            };
             let reindex = t.elapsed();
             glua_code_analysis::profile::work::report(&format!("edit {name}"));
             eprintln!(
@@ -202,8 +213,7 @@ fn run_incremental_edits(
             );
 
             let t = Instant::now();
-            let shared = analysis.precompute_diagnostic_shared_data();
-            analysis.diagnose_file_with_shared(file_id, CancellationToken::new(), shared);
+            diagnose_files(analysis, &affected);
             let diagnostics = t.elapsed();
             let elapsed = reindex + diagnostics;
             total += elapsed;
@@ -230,13 +240,67 @@ fn run_incremental_edits(
     Some(worst)
 }
 
+/// Diagnoses `file_ids` on every available thread, as the language server
+/// re-diagnoses the files an edit left stale.
+fn diagnose_files(analysis: &EmmyLuaAnalysis, file_ids: &[FileId]) {
+    let shared = analysis.precompute_diagnostic_shared_data();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            let shared = shared.clone();
+            let next = &next;
+            s.spawn(move || {
+                loop {
+                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(file_id) = file_ids.get(idx) else {
+                        break;
+                    };
+                    analysis.diagnose_file_with_shared(
+                        *file_id,
+                        CancellationToken::new(),
+                        shared.clone(),
+                    );
+                }
+            });
+        }
+    });
+}
+
+/// Re-analyses `file_id` in slices of `ms`, running what each slice leaves to
+/// run outside it as the language server does between slices. Returns every
+/// live file whose diagnostics may have changed.
+fn reindex_in_slices(analysis: &mut EmmyLuaAnalysis, file_id: FileId, ms: u64) -> Vec<FileId> {
+    analysis.begin_reindex(vec![file_id]);
+    let mut slices = 0usize;
+    loop {
+        slices += 1;
+        let deadline = Instant::now() + std::time::Duration::from_millis(ms);
+        match analysis.advance_reindex(glua_code_analysis::Slice::Until(deadline)) {
+            glua_code_analysis::UpdateProgress::Settled(mut affected) => {
+                eprintln!("  [incremental] settled in {slices} slice(s)");
+                affected.push(file_id);
+                affected.sort_unstable();
+                affected.dedup();
+                return affected;
+            }
+            _ => {
+                if analysis.compilation.has_detached_tasks() {
+                    analysis.compilation.run_detached_tasks();
+                }
+            }
+        }
+    }
+}
+
 /// The edits this harness applies to one sampled file, each labelled with the
 /// class of change it makes.
 ///
 /// `no-op` is a comment appended at EOF: nothing above it moves and nothing it
 /// exports changes, so a correct edit path does no cross-file work at all.
 /// The other two do change what the file exports, which is what makes the
-/// ripple numbers a workload measurement rather than a floor.
+/// ripple numbers a workload measurement rather than a floor. `prepend` types a
+/// function at the top, as an editor does, so every position in the file moves.
 ///
 /// `BENCH_EDIT_FIND` and `BENCH_EDIT_REPLACE` add a `find-replace` edit that
 /// replaces the first occurrence, for files that contain the text.
@@ -247,10 +311,15 @@ fn incremental_edit_variants(text: &str) -> Vec<(&'static str, String)> {
             "new-export",
             format!("{text}\nfunction BenchIncrementalExport() end\n"),
         ),
+        (
+            "prepend",
+            format!("function BenchPrepended(a, b)\nlocal r = a + b\nreturn r\nend\n{text}"),
+        ),
     ];
     if let Some(edited) = add_param_to_first_function(text) {
         variants.push(("param-add", edited));
     }
+    variants.push(("rewrite", agent_rewrite(text)));
     if let (Ok(find), Ok(replace)) = (
         std::env::var("BENCH_EDIT_FIND"),
         std::env::var("BENCH_EDIT_REPLACE"),
@@ -259,6 +328,54 @@ fn incremental_edit_variants(text: &str) -> Vec<(&'static str, String)> {
         variants.push(("find-replace", text.replacen(&find, &replace, 1)));
     }
     variants
+}
+
+/// What an agent's light rewrite of a file does in the language-server
+/// scenarios: three globals defined at the top, and a parameter added to each
+/// of the first three `function name(...)` lines that take a fixed list.
+fn agent_rewrite(text: &str) -> String {
+    let mut added = 0;
+    let mut body = String::with_capacity(text.len() + 64);
+    for line in text.split_inclusive('\n') {
+        let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+        let rest = &line[indent..];
+        let signature = rest
+            .strip_prefix("function")
+            .filter(|after| after.starts_with([' ', '\t']))
+            .and_then(|after| {
+                let name = after.trim_start_matches([' ', '\t']);
+                let open = name.find('(')?;
+                let valid = name[..open].trim_end().split(['.', ':']).all(|part| {
+                    part.chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                        && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                });
+                let close = name[open..].find(')')? + open;
+                let at = line.len() - name.len();
+                valid.then_some((at + open, at + close))
+            });
+        match signature {
+            Some((open, close))
+                if added < 3 && !line[open + 1..close].trim_end().ends_with("...") =>
+            {
+                added += 1;
+                let params = line[open + 1..close].trim();
+                let params = if params.is_empty() {
+                    "_scn".to_string()
+                } else {
+                    format!("{}, _scn", &line[open + 1..close])
+                };
+                body.push_str(&line[..open + 1]);
+                body.push_str(&params);
+                body.push_str(&line[close..]);
+            }
+            _ => body.push_str(line),
+        }
+    }
+    format!(
+        "function ScnA_bench(a, b) return a + b end\nfunction ScnB_bench(self, n) local r = {{}} for i = 1, n do r[i] = i end return r end\nScnV_bench = {{ name = \"scn\", count = 3 }}\n{body}"
+    )
 }
 
 /// Adds a parameter to the file's first top-level `function name(...)`, which
@@ -641,10 +758,106 @@ async fn run() {
         duration: indexing_duration,
     });
 
-    // Phase 4b: Incremental edit latency — the full cost a keystroke pays
-    // once it lands: re-analysis of the edited file and everything that
-    // read a fact it moved, then the post-edit diagnostics pass (shared-data
-    // recompute + the edited file), matching the production LS flow.
+    // Phase 5: Diagnostics (parallel, matching real LS behavior)
+    let t = Instant::now();
+    let main_file_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
+    let diag_file_count = main_file_ids.len();
+
+    // Precompute shared diagnostic data once (avoids per-file workspace-wide scans)
+    let precompute_t = Instant::now();
+    let shared_data = analysis.precompute_diagnostic_shared_data();
+    eprintln!(
+        "  [diag] precompute_shared_data: {:.3}s",
+        precompute_t.elapsed().as_secs_f64()
+    );
+
+    eprintln!(
+        "Diagnostics: {} files, {} threads",
+        diag_file_count, parallelism
+    );
+
+    let total_diagnostics = std::sync::atomic::AtomicUsize::new(0);
+    let error_count = std::sync::atomic::AtomicUsize::new(0);
+    let warning_count = std::sync::atomic::AtomicUsize::new(0);
+    let info_count = std::sync::atomic::AtomicUsize::new(0);
+    let hint_count = std::sync::atomic::AtomicUsize::new(0);
+    let next_file = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..parallelism {
+            let analysis = &analysis;
+            let counter = &total_diagnostics;
+            let errors = &error_count;
+            let warnings = &warning_count;
+            let infos = &info_count;
+            let hints = &hint_count;
+            let next = &next_file;
+            let file_ids = &main_file_ids;
+            let shared = shared_data.clone();
+            s.spawn(move || {
+                loop {
+                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if idx >= file_ids.len() {
+                        break;
+                    }
+                    let cancel_token = CancellationToken::new();
+                    if let Some(diagnostics) = analysis.diagnose_file_with_shared(
+                        file_ids[idx],
+                        cancel_token,
+                        shared.clone(),
+                    ) {
+                        counter.fetch_add(diagnostics.len(), std::sync::atomic::Ordering::Relaxed);
+                        for d in &diagnostics {
+                            match d.severity {
+                                Some(lsp_types::DiagnosticSeverity::ERROR) => {
+                                    errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Some(lsp_types::DiagnosticSeverity::WARNING) => {
+                                    warnings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Some(lsp_types::DiagnosticSeverity::INFORMATION) => {
+                                    infos.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Some(lsp_types::DiagnosticSeverity::HINT) => {
+                                    hints.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let total_diagnostics = total_diagnostics.load(std::sync::atomic::Ordering::Relaxed);
+    let errors = error_count.load(std::sync::atomic::Ordering::Relaxed);
+    let warnings = warning_count.load(std::sync::atomic::Ordering::Relaxed);
+    let infos = info_count.load(std::sync::atomic::Ordering::Relaxed);
+    let hints = hint_count.load(std::sync::atomic::Ordering::Relaxed);
+    let diagnostics_duration = t.elapsed();
+    glua_code_analysis::profile::work::report("diagnostics");
+    glua_code_analysis::profile::memory::checkpoint("after diagnostics");
+    if glua_code_analysis::profile::profiling() {
+        eprintln!("[mem] {}", analysis.compilation.memory_census());
+    }
+    alloc_report!("diagnostics", alloc_mark);
+    results.push(BenchmarkResult {
+        phase: format!(
+            "diagnostics ({} files, {} issues)",
+            diag_file_count, total_diagnostics
+        ),
+        duration: diagnostics_duration,
+    });
+
+    eprintln!();
+    eprintln!(
+        "Diagnostic breakdown: {} errors, {} warnings, {} info, {} hints",
+        errors, warnings, infos, hints
+    );
+
+    // Phase 6: Incremental edit latency on the diagnosed workspace, as the
+    // language server holds it — the full cost a keystroke pays once it
+    // lands: re-analysis of the edited file and everything that read a fact
+    // it moved, then re-diagnosis of every file whose diagnostics went stale.
     // Worst-case biased: files are ranked by how many other files read their
     // facts and the top hubs are edited.
     let mut incremental_worst: Option<std::time::Duration> = None;
@@ -760,102 +973,6 @@ async fn run() {
             incremental_worst = run_incremental_edits(&mut analysis, sample);
         }
     }
-
-    // Phase 5: Diagnostics (parallel, matching real LS behavior)
-    let t = Instant::now();
-    let main_file_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
-    let diag_file_count = main_file_ids.len();
-
-    // Precompute shared diagnostic data once (avoids per-file workspace-wide scans)
-    let precompute_t = Instant::now();
-    let shared_data = analysis.precompute_diagnostic_shared_data();
-    eprintln!(
-        "  [diag] precompute_shared_data: {:.3}s",
-        precompute_t.elapsed().as_secs_f64()
-    );
-
-    eprintln!(
-        "Diagnostics: {} files, {} threads",
-        diag_file_count, parallelism
-    );
-
-    let total_diagnostics = std::sync::atomic::AtomicUsize::new(0);
-    let error_count = std::sync::atomic::AtomicUsize::new(0);
-    let warning_count = std::sync::atomic::AtomicUsize::new(0);
-    let info_count = std::sync::atomic::AtomicUsize::new(0);
-    let hint_count = std::sync::atomic::AtomicUsize::new(0);
-    let next_file = std::sync::atomic::AtomicUsize::new(0);
-    std::thread::scope(|s| {
-        for _ in 0..parallelism {
-            let analysis = &analysis;
-            let counter = &total_diagnostics;
-            let errors = &error_count;
-            let warnings = &warning_count;
-            let infos = &info_count;
-            let hints = &hint_count;
-            let next = &next_file;
-            let file_ids = &main_file_ids;
-            let shared = shared_data.clone();
-            s.spawn(move || {
-                loop {
-                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if idx >= file_ids.len() {
-                        break;
-                    }
-                    let cancel_token = CancellationToken::new();
-                    if let Some(diagnostics) = analysis.diagnose_file_with_shared(
-                        file_ids[idx],
-                        cancel_token,
-                        shared.clone(),
-                    ) {
-                        counter.fetch_add(diagnostics.len(), std::sync::atomic::Ordering::Relaxed);
-                        for d in &diagnostics {
-                            match d.severity {
-                                Some(lsp_types::DiagnosticSeverity::ERROR) => {
-                                    errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
-                                Some(lsp_types::DiagnosticSeverity::WARNING) => {
-                                    warnings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
-                                Some(lsp_types::DiagnosticSeverity::INFORMATION) => {
-                                    infos.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
-                                Some(lsp_types::DiagnosticSeverity::HINT) => {
-                                    hints.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
-    let total_diagnostics = total_diagnostics.load(std::sync::atomic::Ordering::Relaxed);
-    let errors = error_count.load(std::sync::atomic::Ordering::Relaxed);
-    let warnings = warning_count.load(std::sync::atomic::Ordering::Relaxed);
-    let infos = info_count.load(std::sync::atomic::Ordering::Relaxed);
-    let hints = hint_count.load(std::sync::atomic::Ordering::Relaxed);
-    let diagnostics_duration = t.elapsed();
-    glua_code_analysis::profile::work::report("diagnostics");
-    glua_code_analysis::profile::memory::checkpoint("after diagnostics");
-    if glua_code_analysis::profile::profiling() {
-        eprintln!("[mem] {}", analysis.compilation.memory_census());
-    }
-    alloc_report!("diagnostics", alloc_mark);
-    results.push(BenchmarkResult {
-        phase: format!(
-            "diagnostics ({} files, {} issues)",
-            diag_file_count, total_diagnostics
-        ),
-        duration: diagnostics_duration,
-    });
-
-    eprintln!();
-    eprintln!(
-        "Diagnostic breakdown: {} errors, {} warnings, {} info, {} hints",
-        errors, warnings, infos, hints
-    );
 
     // Output results
     eprintln!();
