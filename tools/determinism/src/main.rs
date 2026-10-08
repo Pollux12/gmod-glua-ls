@@ -173,6 +173,9 @@ struct ColdInput {
     overrides: Vec<(PathBuf, String)>,
     removed: Vec<PathBuf>,
     created: Vec<(PathBuf, String)>,
+    /// Files moved from the first path to the second with their text, each
+    /// keeping its id as the server's move does.
+    moved: Vec<(PathBuf, PathBuf, String)>,
 }
 
 /// The codebase's configuration, as the server loads it.
@@ -242,7 +245,7 @@ fn build_cold(
         // baseline, and every diff taken against it would read as "identical".
         assert_eq!(matched, 1, "override did not match one workspace file");
     }
-    if !input.removed.is_empty() || !input.created.is_empty() {
+    if !input.removed.is_empty() || !input.created.is_empty() || !input.moved.is_empty() {
         let vfs = analysis.compilation.get_db().get_vfs();
         files.sort_by_cached_key(|(path, _)| vfs.order_key_for_path(path));
         let vfs = analysis.compilation.get_db_mut().get_vfs_mut();
@@ -263,6 +266,15 @@ fn build_cold(
         );
         for path in &input.removed {
             vfs.remove_file(&file_uri(path));
+        }
+        for (from, to, text) in &input.moved {
+            vfs.move_file(&file_uri(from), &file_uri(to), text.clone())
+                .expect("a moved path names one workspace file");
+            let file = files
+                .iter_mut()
+                .find(|(path, _)| path_key(path) == path_key(from))
+                .expect("a moved path names one workspace file");
+            *file = (to.clone(), Some(text.clone()));
         }
         let mut created = input.created.clone();
         created.sort_by_cached_key(|(path, _)| vfs.order_key_for_path(path));
@@ -3274,9 +3286,9 @@ impl Harness<'_> {
                 .collect::<Vec<_>>();
             events.extend(
                 input
-                    .created
+                    .moved
                     .iter()
-                    .map(|(path, text)| (file_uri(path), Some(text.clone()))),
+                    .map(|(_, path, text)| (file_uri(path), Some(text.clone()))),
             );
             self.watched(&label, vec![events], &ids, &input);
         }
@@ -3364,15 +3376,15 @@ fn sweep_input(stage: &str, files: &[SweepFile]) -> ColdInput {
             ..ColdInput::default()
         },
         "rename" => ColdInput {
-            removed: removed(),
-            created: files
+            moved: files
                 .iter()
                 .map(|(path, _, _, text)| {
                     let stem = path
                         .file_stem()
                         .expect("workspace file has a name")
                         .to_string_lossy();
-                    (path.with_file_name(format!("{stem}_rn.lua")), text.clone())
+                    let renamed = path.with_file_name(format!("{stem}_rn.lua"));
+                    (path.clone(), renamed, text.clone())
                 })
                 .collect(),
             ..ColdInput::default()

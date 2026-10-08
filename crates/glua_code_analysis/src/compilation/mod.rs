@@ -388,6 +388,8 @@ impl LuaCompilation {
             return diagnose();
         }
         derivation::begin(DerivationId::diagnostics(file_id));
+        // Diagnostics are shown at the file's path, so a move makes them stale.
+        derivation::note_file_fact_read(derivation::FileFact::FilePath, file_id);
         let viewed = derivation::view_graph(self.db.reader_graph_shared());
         let result = diagnose();
         drop(viewed);

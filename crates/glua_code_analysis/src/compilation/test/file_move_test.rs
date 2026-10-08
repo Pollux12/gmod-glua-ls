@@ -4,6 +4,7 @@ mod test {
         Emmyrc, EmmyrcGmodScriptedClassScopeEntry, FileId, GmodRealm, LuaTypeDeclId,
         VirtualWorkspace,
     };
+    use tokio_util::sync::CancellationToken;
 
     fn gmod_workspace() -> VirtualWorkspace {
         let mut ws = VirtualWorkspace::new();
@@ -295,6 +296,36 @@ mod test {
         let stats = ws.analysis.compilation.last_stats();
         assert_eq!(stats.loops_cleared, 0);
         assert_eq!(stats.rebuilt_sources, 0);
+    }
+
+    /// A moved file's diagnostics are shown at its new path, so the move
+    /// reports them affected even where nothing else about them changed.
+    #[test]
+    fn moving_a_file_reports_its_diagnostics_affected() {
+        let mut ws = gmod_workspace();
+        ws.def_files(vec![(
+            "lua/autorun/sh_unused.lua",
+            "local unused = 1\nUnusedValue = unused\n",
+        )]);
+        let moved = file_id(&ws, "lua/autorun/sh_unused.lua").expect("the file has an id");
+        ws.analysis
+            .diagnose_file(moved, CancellationToken::new())
+            .expect("the file is diagnosed");
+
+        let affected = ws.analysis.apply_file_system_changes(vec![
+            (
+                ws.virtual_url_generator
+                    .new_uri("lua/autorun/sh_unused.lua"),
+                None,
+            ),
+            (
+                ws.virtual_url_generator.new_uri("lua/autorun/sh_moved.lua"),
+                Some("local unused = 1\nUnusedValue = unused\n".to_string()),
+            ),
+        ]);
+
+        assert_eq!(file_id(&ws, "lua/autorun/sh_moved.lua"), Some(moved));
+        assert!(affected.contains(&moved), "{affected:?}");
     }
 
     const HUD: &str = "gamemode/cl_hud.lua";
