@@ -202,8 +202,7 @@ pub struct LuaInferCache {
     #[allow(clippy::type_complexity)]
     call_cache_local:
         FxHashMap<(LuaSyntaxId, Option<usize>), Vec<(LuaType, CacheEntry<Arc<LuaFunctionType>>)>>,
-    pub call_arg_types_cache:
-        TrackedMap<(LuaSyntaxId, Option<usize>), Arc<Vec<(LuaType, TextRange)>>>,
+    pub call_arg_types_cache: TrackedMap<(LuaSyntaxId, Option<usize>), Arc<[(LuaType, TextRange)]>>,
     pub generic_call_bindings: Untracked<FxHashMap<LuaSyntaxId, GenericCallBindings>>,
     pub flow_node_cache: FxHashMap<VarRefCacheKey, FlowEntries>,
     pub(crate) condition_flow_cache:

@@ -650,7 +650,7 @@ impl<'a> SemanticModel<'a> {
         &self,
         call_expr: LuaCallExpr,
         var_count: Option<usize>,
-    ) -> Arc<Vec<(LuaType, TextRange)>> {
+    ) -> Arc<[(LuaType, TextRange)]> {
         infer_call_arg_expr_list_types(
             self.db,
             &mut self.infer_cache.borrow_mut(),
