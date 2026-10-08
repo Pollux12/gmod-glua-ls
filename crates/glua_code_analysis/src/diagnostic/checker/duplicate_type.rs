@@ -39,13 +39,15 @@ fn check_duplicate_class(context: &mut DiagnosticContext, class_tag: LuaDocTagCl
         .get_db()
         .get_type_index()
         .find_type_decl(file_id, name)?;
-    let locations = type_decl.get_locations();
-    if locations.len() > 1 {
+    let flags = type_decl
+        .get_location_flags()
+        .map(|(_, flag)| flag)
+        .collect::<Vec<_>>();
+    if flags.len() > 1 {
         let mut type_times = 0;
         let mut partial_times = 0;
         let mut constructor_times = 0;
-        for location in locations {
-            let flag = location.flag;
+        for flag in flags {
             if flag.contains(LuaTypeFlag::Meta) {
                 continue;
             }
@@ -99,12 +101,14 @@ fn check_duplicate_enum(context: &mut DiagnosticContext, enum_tag: LuaDocTagEnum
         .get_db()
         .get_type_index()
         .find_type_decl(file_id, name)?;
-    let locations = type_decl.get_locations();
-    if locations.len() > 1 {
+    let flags = type_decl
+        .get_location_flags()
+        .map(|(_, flag)| flag)
+        .collect::<Vec<_>>();
+    if flags.len() > 1 {
         let mut type_times = 0;
         let mut partial_times = 0;
-        for location in locations {
-            let flag = location.flag;
+        for flag in flags {
             if flag.contains(LuaTypeFlag::Meta) {
                 continue;
             }
@@ -144,11 +148,13 @@ fn check_duplicate_alias(context: &mut DiagnosticContext, alias_tag: LuaDocTagAl
         .get_db()
         .get_type_index()
         .find_type_decl(file_id, name)?;
-    let locations = type_decl.get_locations();
-    if locations.len() > 1 {
+    let flags = type_decl
+        .get_location_flags()
+        .map(|(_, flag)| flag)
+        .collect::<Vec<_>>();
+    if flags.len() > 1 {
         let mut type_times = 0;
-        for location in locations {
-            let flag = location.flag;
+        for flag in flags {
             if !flag.contains(LuaTypeFlag::Meta) {
                 type_times += 1;
             }

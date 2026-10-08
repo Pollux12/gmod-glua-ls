@@ -3,6 +3,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use rowan::TextSize;
 use smol_str::SmolStr;
 
+use crate::db_index::derivation;
 use crate::{
     DbIndex, FileId, GlobalId, InferGuardRef, LuaGenericType, LuaInstanceType, LuaIntersectionType,
     LuaMemberKey, LuaMemberOwner, LuaMergedTableType, LuaObjectType, LuaSemanticDeclId,
@@ -530,16 +531,19 @@ fn super_types_for_context<'a>(
         |position| infer_index.get_realm_at_offset(&caller_file_id, position),
     );
     let module_index = db.get_module_index();
+    let gmod_enabled = db.get_emmyrc().gmod.enabled;
     let mut visible = entries
         .iter()
         .filter_map(|entry| {
-            if db.get_emmyrc().gmod.enabled
-                && !caller_realm.is_compatible_with(
+            if gmod_enabled {
+                derivation::note_type_super_realms_read(type_decl_id, entry.file_id);
+                let entry_realm = derivation::untracked(|| {
                     infer_index
-                        .get_realm_at_offset(&entry.file_id, entry.value.source_range.start()),
-                )
-            {
-                return None;
+                        .get_realm_at_offset(&entry.file_id, entry.value.source_range.start())
+                });
+                if !caller_realm.is_compatible_with(entry_realm) {
+                    return None;
+                }
             }
 
             let candidate_workspace_id = module_index
@@ -551,29 +555,21 @@ fn super_types_for_context<'a>(
                 workspace_key,
                 candidate_workspace_id != caller_workspace_id,
                 entry.file_id,
-                entry.value.source_range,
                 &entry.value.typ,
             ))
         })
         .collect::<Vec<_>>();
-    visible.sort_by_key(
-        |(workspace_key, is_other_workspace, file_id, source_range, _)| {
-            (
-                *workspace_key,
-                *is_other_workspace,
-                file_id.id,
-                u32::from(source_range.start()),
-                u32::from(source_range.end()),
-            )
-        },
-    );
+    // The sort is stable, so a file's edges stay in position order.
+    visible.sort_by_key(|(workspace_key, is_other_workspace, file_id, _)| {
+        (*workspace_key, *is_other_workspace, file_id.id)
+    });
     let mut seen_super_types = HashSet::default();
-    visible.retain(|(_, _, _, _, super_type)| seen_super_types.insert(*super_type));
+    visible.retain(|(_, _, _, super_type)| seen_super_types.insert(*super_type));
 
     Some(
         visible
             .into_iter()
-            .map(|(_, _, _, _, super_type)| super_type)
+            .map(|(_, _, _, super_type)| super_type)
             .collect(),
     )
 }

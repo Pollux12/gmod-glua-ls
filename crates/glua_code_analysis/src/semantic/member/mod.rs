@@ -147,10 +147,10 @@ pub(crate) fn local_class_table_member_ids(
     //
     // The class's files bound where the tables may live; binds outside them
     // cannot contribute, so the lookup only reads those (type, file) slots.
-    let mut class_files = FxHashSet::default();
-    for location in type_decl.get_locations() {
-        class_files.insert(location.file_id);
-    }
+    let class_files: FxHashSet<FileId> = type_decl
+        .get_location_flags()
+        .map(|(file_id, _)| file_id)
+        .collect();
     let bound_decls: Vec<crate::LuaDeclId> = db
         .get_type_index()
         .decls_bound_to_type(type_id, &class_files)

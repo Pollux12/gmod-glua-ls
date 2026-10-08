@@ -182,8 +182,22 @@ pub enum FactKey {
     TypeDecl(LuaTypeDeclId),
     /// Where a type declaration is declared: its locations and their flags.
     TypeDeclLocations(LuaTypeDeclId),
+    /// The files a type declaration is declared in and the flags each location
+    /// carries, not where in the file. Read out of its
+    /// [`FactKey::TypeDeclLocations`].
+    TypeDeclFiles(LuaTypeDeclId),
     /// A type declaration's supertypes.
     TypeSupers(LuaTypeDeclId),
+    /// A type declaration's distinct supertypes in order, not where each is
+    /// declared. Read out of its [`FactKey::TypeSupers`].
+    TypeSuperTypes(LuaTypeDeclId),
+    /// A type declaration's super edges as the file and type of each in
+    /// order, not where in the file. Read out of its [`FactKey::TypeSupers`].
+    TypeSuperEdges(LuaTypeDeclId),
+    /// The gmod realm at each of a type declaration's super edges in a file,
+    /// in order. Read out of the file's [`FactKey::GmodRealm`]; the type index
+    /// also notes it written when the edges in the file change.
+    TypeSuperRealms(LuaTypeDeclId, FileId),
     /// A type declaration's generic parameters.
     TypeGenericParams(LuaTypeDeclId),
     /// A type declaration as the source layer declares it: whether it does,
@@ -794,6 +808,8 @@ impl FactKey {
                 | FactKey::References(_)
                 | FactKey::SpecialCallFile(_)
                 | FactKey::GmodClassFile(_)
+                | FactKey::TypeDeclLocations(_)
+                | FactKey::TypeSupers(_)
         )
     }
 
@@ -820,6 +836,11 @@ impl FactKey {
             FactKey::GmodBaseClass(file_id) | FactKey::GmodVguiRegistrations(file_id) => {
                 Some(FactKey::GmodClassFile(*file_id))
             }
+            FactKey::TypeDeclFiles(decl_id) => Some(FactKey::TypeDeclLocations(decl_id.clone())),
+            FactKey::TypeSuperTypes(decl_id) | FactKey::TypeSuperEdges(decl_id) => {
+                Some(FactKey::TypeSupers(decl_id.clone()))
+            }
+            FactKey::TypeSuperRealms(_, file_id) => Some(FactKey::GmodRealm(*file_id)),
             _ => None,
         }
     }
@@ -913,7 +934,11 @@ impl FactKey {
             K::OperatorOwner(LuaOperatorOwner::Table(site)) => Some(site.file_id),
             K::TypeDecl(_)
             | K::TypeDeclLocations(_)
+            | K::TypeDeclFiles(_)
             | K::TypeSupers(_)
+            | K::TypeSuperTypes(_)
+            | K::TypeSuperEdges(_)
+            | K::TypeSuperRealms(..)
             | K::TypeGenericParams(_)
             | K::SourceTypeDecl(_)
             | K::SubTypes(_)
@@ -2169,11 +2194,40 @@ pub fn note_type_decl_locations_read(decl_id: &LuaTypeDeclId) {
     );
 }
 
-/// Records a read of `decl_id`'s supertypes.
-pub fn note_type_supers_read(decl_id: &LuaTypeDeclId) {
+/// Records a read of the files `decl_id` is declared in and the flags each
+/// location carries.
+pub fn note_type_decl_files_read(decl_id: &LuaTypeDeclId) {
+    note_read_by(
+        (u8::MAX - 23, u128::from(decl_id.interned_address())),
+        || FactKey::TypeDeclFiles(decl_id.clone()),
+    );
+}
+
+/// Records a read of `decl_id`'s super edges as the file and type of each.
+pub fn note_type_super_edges_read(decl_id: &LuaTypeDeclId) {
     note_read_by(
         (u8::MAX - 7, u128::from(decl_id.interned_address())),
-        || FactKey::TypeSupers(decl_id.clone()),
+        || FactKey::TypeSuperEdges(decl_id.clone()),
+    );
+}
+
+/// Records a read of the gmod realm at each of `decl_id`'s super edges in
+/// `file_id`.
+pub fn note_type_super_realms_read(decl_id: &LuaTypeDeclId, file_id: FileId) {
+    note_read_by(
+        (
+            u8::MAX - 25,
+            u128::from(decl_id.interned_address()) << 32 | u128::from(file_id.id),
+        ),
+        || FactKey::TypeSuperRealms(decl_id.clone(), file_id),
+    );
+}
+
+/// Records a read of `decl_id`'s distinct supertypes in order.
+pub fn note_type_super_types_read(decl_id: &LuaTypeDeclId) {
+    note_read_by(
+        (u8::MAX - 24, u128::from(decl_id.interned_address())),
+        || FactKey::TypeSuperTypes(decl_id.clone()),
     );
 }
 

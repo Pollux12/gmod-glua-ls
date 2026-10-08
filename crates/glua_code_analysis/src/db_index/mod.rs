@@ -457,7 +457,10 @@ impl DbIndex {
             | K::DefinitionFact(_)
             | K::TypeDecl(_)
             | K::TypeDeclLocations(_)
+            | K::TypeDeclFiles(_)
             | K::TypeSupers(_)
+            | K::TypeSuperTypes(_)
+            | K::TypeSuperEdges(_)
             | K::TypeGenericParams(_)
             | K::SourceTypeDecl(_)
             | K::TypeContrib(_)
@@ -467,6 +470,22 @@ impl DbIndex {
             | K::TypeDeclScan
             | K::TypeFile(_)
             | K::TableClass(_) => self.types_index.fact_fingerprint(key),
+            K::TypeSuperRealms(decl_id, file_id) => {
+                let realms = derivation::untracked(|| {
+                    self.types_index
+                        .super_edges_in_file(decl_id, *file_id)
+                        .map(|entry| {
+                            self.gmod_infer_index
+                                .get_realm_at_offset(file_id, entry.value.source_range.start())
+                        })
+                        .collect::<Vec<_>>()
+                });
+                if realms.is_empty() {
+                    derivation::ABSENT
+                } else {
+                    derivation::fingerprint_of(&realms)
+                }
+            }
             K::Decl(_) | K::DeclTree(_) | K::DeclContrib(_) => {
                 self.decl_index.fact_fingerprint(key)
             }

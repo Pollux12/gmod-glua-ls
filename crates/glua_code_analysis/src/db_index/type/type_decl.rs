@@ -80,6 +80,27 @@ impl LuaTypeDecl {
         &self.locations
     }
 
+    /// The file and flags of each place the type is declared, without where
+    /// in the file.
+    pub fn get_location_flags(&self) -> impl Iterator<Item = (FileId, FlagSet<LuaTypeFlag>)> + '_ {
+        crate::db_index::derivation::note_type_decl_files_read(&self.id);
+        self.locations
+            .iter()
+            .map(|location| (location.file_id, location.flag))
+    }
+
+    /// What [`Self::get_location_flags`] observes, in a stable order: records
+    /// no read.
+    pub(super) fn sorted_location_flags(&self) -> Vec<(FileId, u8)> {
+        let mut flags: Vec<(FileId, u8)> = self
+            .locations
+            .iter()
+            .map(|location| (location.file_id, location.flag.bits()))
+            .collect();
+        flags.sort_unstable();
+        flags
+    }
+
     /// [`Self::get_locations`] for the type index's own bookkeeping: records
     /// no read.
     pub(super) fn locations(&self) -> &[LuaDeclLocation] {
@@ -137,14 +158,8 @@ impl LuaTypeDecl {
     /// a member on this type, and `(partial)`/`(private)` gate diagnostics that
     /// other files report.
     pub fn kind_and_flags(&self) -> (LuaDeclTypeKind, Vec<(FileId, u8)>) {
-        let kind = self.kind();
-        let mut flags: Vec<(FileId, u8)> = self
-            .get_locations()
-            .iter()
-            .map(|location| (location.file_id, location.flag.bits()))
-            .collect();
-        flags.sort_unstable();
-        (kind, flags)
+        crate::db_index::derivation::note_type_decl_files_read(&self.id);
+        (self.kind(), self.sorted_location_flags())
     }
 
     /// The enum's base type and flatness, or the attribute's type. `None` for

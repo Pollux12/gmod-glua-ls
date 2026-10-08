@@ -193,9 +193,8 @@ fn check_def_visibility(
                             .get_type_index()
                             .get_type_decl(&left)
                             .is_some_and(|decl| {
-                                decl.get_locations()
-                                    .iter()
-                                    .any(|location| location.file_id == file_id)
+                                decl.get_location_flags()
+                                    .any(|(location_file_id, _)| location_file_id == file_id)
                             })),
             ),
             (LuaType::TableConst(left), _) => Some(

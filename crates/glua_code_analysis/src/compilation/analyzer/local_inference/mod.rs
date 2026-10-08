@@ -2054,6 +2054,10 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        let threads = crate::compilation::analyzer::parallel::THREADS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::compilation::analyzer::parallel::set_analysis_threads(1);
         super::SUBTYPE_SCANS.with(|scans| scans.set(0));
 
         ws.def_files(vec![
@@ -2087,6 +2091,8 @@ mod tests {
             ),
         ]);
 
+        crate::compilation::analyzer::parallel::set_analysis_threads(0);
+        drop(threads);
         let evaluations = ws
             .analysis
             .compilation
@@ -2105,6 +2111,10 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        let threads = crate::compilation::analyzer::parallel::THREADS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::compilation::analyzer::parallel::set_analysis_threads(1);
         super::SUBTYPE_SCANS.with(|scans| scans.set(0));
 
         ws.def_files(vec![
@@ -2135,6 +2145,8 @@ mod tests {
             ),
         ]);
 
+        crate::compilation::analyzer::parallel::set_analysis_threads(0);
+        drop(threads);
         assert_eq!(super::SUBTYPE_SCANS.with(std::cell::Cell::get), 0);
     }
 
