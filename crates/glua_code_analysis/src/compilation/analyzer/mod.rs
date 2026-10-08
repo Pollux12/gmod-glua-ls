@@ -803,6 +803,7 @@ fn follow_edits(
 ) -> HashSet<derivation::HashedKey> {
     let mut files = edits.files().collect::<Vec<_>>();
     files.sort();
+    let mut remapped = Vec::new();
     for file_id in files {
         let Some(map) = edits.map(file_id) else {
             continue;
@@ -818,9 +819,18 @@ fn follow_edits(
                 rerun(engine, producer);
             }
         }
+        // A fact another file holds that names a moved position is filed
+        // again; its readers check it as the edit moved it.
+        derivation::begin(derivation::DerivationId::workspace(
+            derivation::DerivationKind::Source,
+        ));
         let lost = crate::profile::phase("follow edits: remap indexes", || {
             crate::remap_into_file(db, &remap)
         });
+        let remap_writes = derivation::end();
+        remapped.extend(remap_writes.moved().cloned());
+        let (_, _, written) = remap_writes.into_parts(|_| derivation::ABSENT);
+        remapped.extend(written);
         if crate::profile::tracing_evaluations() && !lost.is_empty() {
             let keys = lost.iter().map(|fact| &fact.key).collect::<Vec<_>>();
             eprintln!("[trace] remap of {file_id:?} lost positions in {keys:?}");
@@ -851,6 +861,7 @@ fn follow_edits(
             std::iter::once(key).chain(moved)
         })
         .chain(applied.moved)
+        .chain(remapped)
         .collect()
 }
 
