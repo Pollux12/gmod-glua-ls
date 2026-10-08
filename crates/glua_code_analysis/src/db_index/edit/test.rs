@@ -14,6 +14,83 @@ fn range(start: u32, end: u32) -> TextRange {
 
 // --- PositionMap arithmetic ---
 
+/// Texts that differ the way edits make them differ: lines inserted, removed,
+/// replaced, edited in place and re-indented, from a fixed seed.
+fn edited_texts(seed: u64) -> (String, String) {
+    let mut state = seed;
+    let mut next = |bound: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % bound
+    };
+    let words = [
+        "local", "x", "t", "end", "function", "f(a)", "=", "{}", "1", "return", "if",
+    ];
+    let line = |next: &mut dyn FnMut(u64) -> u64| {
+        let indent = "  ".repeat(next(3) as usize);
+        let body = (0..1 + next(4))
+            .map(|_| words[next(words.len() as u64) as usize])
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{indent}{body}\n")
+    };
+    let old = (0..20).map(|_| line(&mut next)).collect::<Vec<_>>();
+    let mut new = Vec::new();
+    for old_line in &old {
+        match next(8) {
+            0 => {}
+            1 => new.push(line(&mut next)),
+            2 => {
+                new.push(line(&mut next));
+                new.push(old_line.clone());
+            }
+            3 => new.push(old_line.replacen(' ', "  ", 1)),
+            4 => new.push(format!("x{old_line}")),
+            _ => new.push(old_line.clone()),
+        }
+    }
+    (old.concat(), new.concat())
+}
+
+/// Whatever a map keeps is the same text on both sides, in order, and two
+/// maps in a row compose to the map of every offset both keep.
+#[gtest]
+fn every_kept_offset_names_the_same_byte_and_maps_compose() {
+    for seed in 1..400u64 {
+        let (old, new) = edited_texts(seed * 7919);
+        let (_, third) = edited_texts(seed * 104_729 + 1);
+        let third = format!("{new}{third}");
+        let map = PositionMap::new(&old, &new);
+        let mut last = None;
+        for offset in 0..=old.len() as u32 {
+            let Some(image) = map.map(TextSize::new(offset)) else {
+                continue;
+            };
+            let image = u32::from(image);
+            if (offset as usize) < old.len() && (image as usize) < new.len() {
+                assert_eq!(
+                    old.as_bytes()[offset as usize],
+                    new.as_bytes()[image as usize],
+                    "seed {seed} offset {offset}: {old:?} -> {new:?}"
+                );
+            }
+            assert!(
+                last.is_none_or(|last| last < image),
+                "seed {seed}: not monotonic"
+            );
+            last = Some(image);
+        }
+        let later = PositionMap::new(&new, &third);
+        let both = map.then(&later);
+        for offset in 0..=old.len() as u32 {
+            let offset = TextSize::new(offset);
+            let stepwise = map.map(offset).and_then(|moved| later.map(moved));
+            assert_eq!(both.map(offset), stepwise, "seed {seed} offset {offset:?}");
+        }
+    }
+}
+
 #[gtest]
 fn an_insertion_shifts_everything_after_it_and_loses_nothing() {
     let map = PositionMap::new("abcdef", "abcXXdef");
