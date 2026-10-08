@@ -11,7 +11,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{call_site_params, dynamic_field};
 use crate::db_index::derivation::{DerivedFact, Fingerprint, fingerprint_of, hash_local, in_file};
-use crate::{DbIndex, FileId};
+use crate::{DbIndex, FileId, LuaSignatureId};
 
 /// A file's function summaries, each keyed by its closure's position.
 #[derive(Debug, Default)]
@@ -22,6 +22,10 @@ pub(crate) struct FileFunctionSummaries {
     pub(super) mutated_params: FxHashMap<TextSize, Vec<usize>>,
     /// The closures whose unmutated explicit `self` parameter is returned.
     pub(super) returns_explicit_self: FxHashSet<TextSize>,
+    /// Access path → the signatures of the function statements declaring it,
+    /// by position. Left out of the fingerprint: only the file's own passes
+    /// read it, and its source layer replaces them.
+    pub(super) source_signatures: FxHashMap<String, Vec<LuaSignatureId>>,
 }
 
 impl FileFunctionSummaries {
@@ -29,6 +33,21 @@ impl FileFunctionSummaries {
         self.field_setter_helpers.is_empty()
             && self.mutated_params.is_empty()
             && self.returns_explicit_self.is_empty()
+            && self.source_signatures.is_empty()
+    }
+
+    /// The last function statement at or before `position` declaring `path`.
+    pub(super) fn source_signature_at(
+        &self,
+        path: &str,
+        position: TextSize,
+    ) -> Option<LuaSignatureId> {
+        self.source_signatures
+            .get(path)?
+            .iter()
+            .rev()
+            .copied()
+            .find(|signature_id| signature_id.get_position() <= position)
     }
 }
 
@@ -74,6 +93,7 @@ pub(super) fn collect_function_summaries(
         field_setter_helpers: dynamic_field::collect_field_setter_helpers(root),
         mutated_params,
         returns_explicit_self,
+        source_signatures: call_site_params::source_signatures_in_file(file_id, root),
     };
     if summaries.is_empty() {
         return None;

@@ -8,8 +8,8 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use super::{
-    AnalysisPipeline, AnalyzeContext, ScriptedScopes, call_site_params, call_target, dynamic_field,
-    gmod, local_inference, lua, setmetatable_factory, synthesize_accessorfunc_members, unresolve,
+    AnalyzeContext, ScriptedScopes, call_site_params, call_target, dynamic_field, gmod,
+    local_inference, lua, setmetatable_factory, synthesize_accessorfunc_members, unresolve,
 };
 use crate::db_index::derivation::{DerivationId, DerivationKind};
 use crate::{DbIndex, FileId, InFiled};
@@ -35,8 +35,9 @@ fn is_inert_value_field(
     !shaped
 }
 
-/// The derivations of one file's statements, closures, calls, call targets
-/// and table fields, and of its dynamic-field write sites, in tree order;
+/// The derivations of one file's statements, closures, calls, the targets and
+/// call-site parameters of its calls, and table fields, and of its
+/// dynamic-field write sites, in tree order;
 /// positional fields of tables that are not shaped array literals have none.
 pub(super) fn syntax_derivations(file_id: FileId, root: &LuaChunk) -> Vec<DerivationId> {
     let mut ids = Vec::new();
@@ -62,11 +63,9 @@ pub(super) fn syntax_derivations(file_id: FileId, root: &LuaChunk) -> Vec<Deriva
         let syntax_id = LuaSyntaxId::from_node(node.syntax());
         ids.push(DerivationId::new(kind, file_id, syntax_id));
         if matches!(node, LuaAst::LuaCallExpr(_)) {
-            ids.push(DerivationId::new(
-                DerivationKind::CallTarget,
-                file_id,
-                syntax_id,
-            ));
+            for kind in [DerivationKind::CallTarget, DerivationKind::CallSiteParam] {
+                ids.push(DerivationId::new(kind, file_id, syntax_id));
+            }
         }
         if matches!(
             kind,
@@ -261,7 +260,7 @@ impl Recipes {
 
 impl super::engine::Recipe for Recipes {
     fn splits(&self, kind: DerivationKind) -> bool {
-        // Call-site contributions are collected with call-site facts invisible;
+        // Callback contributions are collected with call-site facts invisible;
         // net helpers read other files' helper scans, and net flows their net
         // helpers: no file's computation reads what another's of its kind writes.
         // Helper and valid-guard scans read source facts and the folds over other
@@ -282,9 +281,9 @@ impl super::engine::Recipe for Recipes {
 
     fn compute(&self, db: &DbIndex, id: DerivationId) -> Box<dyn std::any::Any + Send> {
         match id.kind {
-            DerivationKind::CallSiteParams => {
-                Box::new(call_site_params::collect_file_contributions(db, id.file_id))
-            }
+            DerivationKind::CallSiteParams => Box::new(
+                call_site_params::collect_callback_contributions(db, id.file_id),
+            ),
             DerivationKind::NetHelpers => Box::new(gmod::compute_net_helpers(db, id.file_id)),
             DerivationKind::Network => Box::new(gmod::compute_network_flows(db, id.file_id)),
             DerivationKind::LocalFallbacks => Box::new(if guesses_locals(db) {
@@ -330,7 +329,7 @@ impl super::engine::Recipe for Recipes {
                     .downcast::<Vec<call_site_params::Contribution>>()
                     .expect("call-site contributions");
                 db.get_call_site_param_index_mut()
-                    .set_file_contributions(id.file_id, contributions);
+                    .set_callback_contributions(id.file_id, contributions);
             }
             DerivationKind::NetHelpers => {
                 let helpers = *computed
@@ -558,8 +557,17 @@ impl Recipes {
                 call_target::derive_call_target(db, cache, id.syntax_id());
                 cache.config_mut().call_site_params_visible = true;
             }
+            DerivationKind::CallSiteParam => {
+                let cache = context.infer_manager.get_infer_cache(id.file_id);
+                cache.config_mut().call_site_params_visible = false;
+                call_site_params::derive_call_site_param(db, cache, id.syntax_id());
+                cache.config_mut().call_site_params_visible = true;
+            }
             DerivationKind::CallSiteParams => {
-                call_site_params::CallSiteParamAnalysisPipeline::analyze(db, context)
+                let contributions =
+                    call_site_params::collect_callback_contributions(db, id.file_id);
+                db.get_call_site_param_index_mut()
+                    .set_callback_contributions(id.file_id, contributions);
             }
             DerivationKind::Network => gmod::evaluate_network(db, context),
             DerivationKind::Source

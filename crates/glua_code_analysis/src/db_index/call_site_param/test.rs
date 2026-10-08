@@ -1,9 +1,21 @@
 #[cfg(test)]
 mod tests {
     use crate::db_index::call_site_param::*;
+    use rowan::{TextRange, TextSize};
 
     fn signature_id(file_id: FileId, position: u32) -> LuaSignatureId {
         serde_json::from_str(&format!("\"{}|{}\"", file_id.id, position)).unwrap()
+    }
+
+    fn facts(
+        contributions: Vec<(LuaSignatureId, usize, LuaType)>,
+    ) -> Vec<(LuaSignatureId, usize, LuaTypeFact)> {
+        contributions
+            .into_iter()
+            .map(|(signature_id, param_idx, typ)| {
+                (signature_id, param_idx, LuaTypeFact::certain(typ))
+            })
+            .collect()
     }
 
     fn set(
@@ -11,15 +23,20 @@ mod tests {
         file_id: FileId,
         contributions: Vec<(LuaSignatureId, usize, LuaType)>,
     ) {
-        index.set_file_contributions(
-            file_id,
-            contributions
-                .into_iter()
-                .map(|(signature_id, param_idx, typ)| {
-                    (signature_id, param_idx, LuaTypeFact::certain(typ))
-                })
-                .collect(),
-        );
+        index.set_callback_contributions(file_id, facts(contributions));
+    }
+
+    fn call(start: u32, end: u32) -> TextRange {
+        TextRange::new(TextSize::new(start), TextSize::new(end))
+    }
+
+    fn set_call(
+        index: &mut CallSiteParamIndex,
+        file_id: FileId,
+        range: TextRange,
+        contributions: Vec<(LuaSignatureId, usize, LuaType)>,
+    ) {
+        index.set_call_contributions(file_id, range, facts(contributions));
     }
 
     fn inferred_union_members(
@@ -163,12 +180,142 @@ mod tests {
             dirty,
             [crate::LostFact::new(
                 caller,
-                crate::db_index::derivation::FactKey::CallSiteFile(caller)
+                crate::db_index::derivation::FactKey::CallSiteCallbacks(caller)
             )]
         );
         assert_eq!(
             index.get_inferred_param(&destroyed, 0),
             Some(&LuaType::Integer)
+        );
+    }
+
+    /// A file's calls fold in the order of their ranges, whichever order their
+    /// derivations stored them in.
+    #[test]
+    fn calls_fold_in_range_order_whatever_order_they_were_stored_in() {
+        let file_id = FileId::new(1);
+        let signature_id = signature_id(FileId::new(10), 0);
+        let (outer, nested, later) = (call(0, 20), call(0, 10), call(30, 40));
+        let strings = vec![(signature_id, 0, LuaType::String)];
+        let integers = vec![(signature_id, 0, LuaType::Integer)];
+        let booleans = vec![(signature_id, 0, LuaType::Boolean)];
+        let mut forward = CallSiteParamIndex::new();
+        set_call(&mut forward, file_id, outer, strings.clone());
+        set_call(&mut forward, file_id, nested, integers.clone());
+        set_call(&mut forward, file_id, later, booleans.clone());
+
+        let mut reverse = CallSiteParamIndex::new();
+        set_call(&mut reverse, file_id, later, booleans);
+        set_call(&mut reverse, file_id, nested, integers);
+        set_call(&mut reverse, file_id, outer, strings);
+
+        assert_eq!(forward.inferred_params, reverse.inferred_params);
+        assert_eq!(forward.file_contributions, reverse.file_contributions);
+        assert_eq!(forward.contributors, reverse.contributors);
+        for key in [
+            FactKey::CallSiteFile(file_id),
+            FactKey::CallSiteParam(InFiled::new(file_id, outer)),
+            FactKey::Contrib(signature_id, 0),
+        ] {
+            assert_eq!(
+                forward.fact_fingerprint(&key),
+                reverse.fact_fingerprint(&key)
+            );
+        }
+        assert_eq!(inferred_union_members(&forward, &signature_id).len(), 3);
+    }
+
+    /// Replacing or retracting one call's evidence leaves the others', and
+    /// the index a fresh build of the surviving evidence would have.
+    #[test]
+    fn a_call_replaces_and_retracts_only_its_own_evidence() {
+        let file_id = FileId::new(1);
+        let signature_id = signature_id(FileId::new(10), 0);
+        let (first, second) = (call(0, 10), call(20, 30));
+        let mut index = CallSiteParamIndex::new();
+        set_call(
+            &mut index,
+            file_id,
+            first,
+            vec![(signature_id, 0, LuaType::String)],
+        );
+        set_call(
+            &mut index,
+            file_id,
+            second,
+            vec![(signature_id, 0, LuaType::Boolean)],
+        );
+        let second_key = FactKey::CallSiteParam(InFiled::new(file_id, second));
+        let second_fingerprint = index.fact_fingerprint(&second_key);
+
+        set_call(
+            &mut index,
+            file_id,
+            first,
+            vec![(signature_id, 0, LuaType::Number)],
+        );
+        assert_eq!(index.fact_fingerprint(&second_key), second_fingerprint);
+        let members = inferred_union_members(&index, &signature_id);
+        assert!(members.contains(&LuaType::Boolean) && members.contains(&LuaType::Number));
+        assert_eq!(members.len(), 2);
+
+        index.retract_call(file_id, first);
+        let mut fresh = CallSiteParamIndex::new();
+        set_call(
+            &mut fresh,
+            file_id,
+            second,
+            vec![(signature_id, 0, LuaType::Boolean)],
+        );
+        assert_eq!(index.inferred_params, fresh.inferred_params);
+        assert_eq!(index.file_contributions, fresh.file_contributions);
+        assert_eq!(index.contributors, fresh.contributors);
+        assert_eq!(index.referencing, fresh.referencing);
+
+        index.retract_call(file_id, second);
+        assert!(index.file_contributions.is_empty());
+        assert!(index.contributors.is_empty());
+        assert!(index.inferred_params.is_empty());
+        assert!(index.referencing.is_empty());
+    }
+
+    /// A shift carries each of a file's calls' evidence to the moved
+    /// signature it names.
+    #[test]
+    fn a_shift_carries_each_calls_evidence() {
+        let caller = FileId::new(1);
+        let callee_file = FileId::new(10);
+        let mut index = CallSiteParamIndex::new();
+        set_call(
+            &mut index,
+            caller,
+            call(0, 10),
+            vec![(signature_id(callee_file, 2), 0, LuaType::Integer)],
+        );
+        set_call(
+            &mut index,
+            caller,
+            call(20, 30),
+            vec![(signature_id(callee_file, 4), 0, LuaType::String)],
+        );
+
+        let dirty = index.remap_file_identities(&FileRemap::unvalidated(
+            callee_file,
+            crate::PositionMap::new("abcdef", "\nabcdef"),
+        ));
+
+        assert!(dirty.is_empty());
+        assert_eq!(
+            index.get_inferred_param(&signature_id(callee_file, 3), 0),
+            Some(&LuaType::Integer)
+        );
+        assert_eq!(
+            index.get_inferred_param(&signature_id(callee_file, 5), 0),
+            Some(&LuaType::String)
+        );
+        assert_eq!(
+            index.get_inferred_param(&signature_id(callee_file, 2), 0),
+            None
         );
     }
 }

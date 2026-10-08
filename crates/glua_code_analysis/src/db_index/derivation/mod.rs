@@ -274,8 +274,14 @@ pub enum FactKey {
     ReceiverOutParam(SmolStr),
     /// A call-site-inferred parameter of a callee.
     Contrib(LuaSignatureId, usize),
-    /// The call-site parameter evidence one file's calls contributed.
+    /// The call-site parameter evidence one file holds, every call's and its
+    /// callback receivers'.
     CallSiteFile(FileId),
+    /// The call-site parameter evidence one call contributed.
+    CallSiteParam(InFiled<TextRange>),
+    /// The call-site parameter evidence one file's callback receivers
+    /// contributed.
+    CallSiteCallbacks(FileId),
     /// A module's export and metadata.
     Module(FileId),
     /// A module's metadata without its export: path, name, workspace, flags
@@ -621,7 +627,8 @@ impl FactKey {
                 | K::OperatorContrib(_)
                 | K::DynamicFieldSite(_)
                 | K::GmodClassFile(_)
-                | K::CallSiteFile(_)
+                | K::CallSiteParam(_)
+                | K::CallSiteCallbacks(_)
         )
     }
 
@@ -686,6 +693,8 @@ impl FactKey {
                 | K::MemberOwnerFields(_)
                 | K::Contrib(..)
                 | K::CallSiteFile(_)
+                | K::CallSiteParam(_)
+                | K::CallSiteCallbacks(_)
                 | K::NetHelpers(_)
                 | K::NetHelper(_)
                 | K::NetworkFile(_)
@@ -846,6 +855,7 @@ impl FactKey {
             },
             K::DefinitionSite(site)
             | K::CallTarget(site)
+            | K::CallSiteParam(site)
             | K::Metatable(site)
             | K::TableClass(site)
             | K::DynamicFieldSite(site)
@@ -895,6 +905,7 @@ impl FactKey {
             | K::DiagnosticFile(file_id)
             | K::CallSiteFile(file_id)
             | K::TypeFallbacks(file_id)
+            | K::CallSiteCallbacks(file_id)
             | K::DerivedReferences(file_id)
             | K::FileText(file_id) => Some(*file_id),
             K::DynamicField(DynamicFieldOwner::Table(site), _)
@@ -1018,7 +1029,11 @@ pub enum DerivationKind {
     ReceiverAuthority,
     /// A query: what a function passes to each callback parameter it calls.
     CallbackParams,
-    /// A file's call-site parameter contributions and return consumers.
+    /// What one call contributes to the parameters of the functions it calls
+    /// and passes closures to.
+    CallSiteParam,
+    /// A file's callback receiver contributions: what its named vgui
+    /// callbacks receive.
     CallSiteParams,
     /// A file's local types guessed from their uses.
     LocalFallbacks,
@@ -1061,6 +1076,7 @@ impl DerivationKind {
             | Self::CallTarget
             | Self::ReceiverAuthority
             | Self::CallbackParams
+            | Self::CallSiteParam
             | Self::CallSiteParams
             | Self::NetHelpers
             | Self::Network => AnalysisStage::Closed,

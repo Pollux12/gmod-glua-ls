@@ -341,7 +341,12 @@ impl DbIndex {
             K::VguiRelations(file_id) => self
                 .get_gmod_class_metadata_index_mut()
                 .remove_vgui_file_relations(*file_id),
-            K::CallSiteFile(file_id) => self.get_call_site_param_index_mut().retract_file(*file_id),
+            K::CallSiteParam(site) => self
+                .get_call_site_param_index_mut()
+                .retract_call(site.file_id, site.value),
+            K::CallSiteCallbacks(file_id) => self
+                .get_call_site_param_index_mut()
+                .retract_callbacks(*file_id),
             _ => {}
         }
     }
@@ -511,7 +516,9 @@ impl DbIndex {
             | K::InferredGuard(_)
             | K::SignatureFile(_)
             | K::ReceiverOutParam(_) => self.signature_index.fact_fingerprint(key),
-            K::Contrib(..) | K::CallSiteFile(_) => self.call_site_param_index.fact_fingerprint(key),
+            K::Contrib(..) | K::CallSiteFile(_) | K::CallSiteParam(_) | K::CallSiteCallbacks(_) => {
+                self.call_site_param_index.fact_fingerprint(key)
+            }
             K::Module(_)
             | K::ModuleMeta(_)
             | K::ModuleName(_)

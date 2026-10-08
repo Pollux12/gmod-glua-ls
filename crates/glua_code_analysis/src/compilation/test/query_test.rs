@@ -47,7 +47,7 @@ mod test {
         ws.analysis
             .compilation
             .last_stats()
-            .evaluations(DerivationKind::CallSiteParams)
+            .evaluations(DerivationKind::CallSiteParam)
     }
 
     fn index_expr_type(ws: &VirtualWorkspace, file_id: FileId, text: &str) -> Option<LuaType> {
@@ -90,7 +90,7 @@ mod test {
 
         ws.def_file(RUNNER, &format!("-- moved down a line\n{RUNNER_TEXT}"));
 
-        assert_eq!(call_site_param_runs(&ws), 1, "only the runner's own pass");
+        assert_eq!(call_site_param_runs(&ws), 1, "only the runner's own call");
         assert!(
             callback_stats(&ws).computed + callback_stats(&ws).recomputed
                 > before.computed + before.recomputed,
@@ -200,7 +200,11 @@ end)
             ),
         ]);
 
-        assert_eq!(call_site_param_runs(&ws), 2, "each edited file's pass once");
+        assert_eq!(
+            call_site_param_runs(&ws),
+            1,
+            "the edited caller's call once"
+        );
         assert!(is_string(index_expr_type(&ws, files[1], "state.label")));
     }
 }

@@ -23,12 +23,9 @@ use crate::db_index::derivation::{DerivationKind, FactKey};
 use glua_parser::LuaSyntaxId;
 
 use super::{
-    AnalysisPipeline, AnalyzeContext,
     function_summary::function_summaries,
     gmod::{is_vgui_register_table_call, vgui_register_table_type_decl_id},
 };
-
-pub struct CallSiteParamAnalysisPipeline;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SignatureLookupKind {
@@ -51,36 +48,22 @@ struct ReturnedMemberSignature {
 
 pub(super) type Contribution = (LuaSignatureId, usize, LuaTypeFact);
 
-/// What the calls of one file's collection share. Lives for one evaluation,
+/// What the lookups of one call's collection share. Lives for one evaluation,
 /// so every read behind a memoised answer is recorded by that evaluation.
-struct FileScope {
-    /// Access path → the file's function-statement signatures, by position.
-    source_signatures: HashMap<String, Vec<LuaSignatureId>>,
+#[derive(Default)]
+struct CallScope {
     returned_tables: HashMap<FileId, Option<Arc<ReturnedTableInfo>>>,
-    exact_receiver_candidates: HashMap<LuaMemberKey, bool>,
 }
 
-impl FileScope {
-    fn new(db: &DbIndex, file_id: FileId, root: &glua_parser::LuaChunk) -> Self {
-        Self {
-            source_signatures: source_signatures_in_file(file_id, root),
-            returned_tables: HashMap::default(),
-            exact_receiver_candidates: collect_exact_receiver_candidates(
-                db,
-                exact_receiver_member_keys_in_file(root),
-            ),
-        }
-    }
-
-    /// The last function statement at or before `position` declaring `path`.
-    fn source_signature_at(&self, path: &str, position: TextSize) -> Option<LuaSignatureId> {
-        self.source_signatures
-            .get(path)?
-            .iter()
-            .rev()
-            .copied()
-            .find(|signature_id| signature_id.get_position() <= position)
-    }
+/// The last function statement of `file_id` at or before `position`
+/// declaring `path`.
+fn source_signature_at(
+    db: &DbIndex,
+    file_id: FileId,
+    path: &str,
+    position: TextSize,
+) -> Option<LuaSignatureId> {
+    function_summaries(db, file_id)?.source_signature_at(path, position)
 }
 
 /// Whether the function statement declaring `signature_id` assigns to
@@ -96,22 +79,35 @@ fn is_param_mutated(db: &DbIndex, signature_id: LuaSignatureId, param_idx: usize
 
 const RETURN_ALIAS_ATTRIBUTE: &str = "return_alias";
 
-impl AnalysisPipeline for CallSiteParamAnalysisPipeline {
-    fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
-        let file_ids = context
-            .tree_list
-            .iter()
-            .map(|tree| tree.file_id)
-            .collect::<Vec<_>>();
-        for file_id in file_ids {
-            let contributions = collect_file_contributions(db, file_id);
-            db.get_call_site_param_index_mut()
-                .set_file_contributions(file_id, contributions);
-        }
-    }
+/// Collects what the call `syntax_id` names contributes with `cache`, which
+/// infers under the view [`super::call_target::pass_view`] names, and stores
+/// it.
+pub(super) fn derive_call_site_param(
+    db: &mut DbIndex,
+    cache: &mut LuaInferCache,
+    syntax_id: LuaSyntaxId,
+) {
+    let file_id = cache.get_file_id();
+    let Some(call_expr) = super::call_target::call_at(db, file_id, syntax_id) else {
+        return;
+    };
+    let range = call_expr.get_range();
+    let mut contributions = Vec::new();
+    collect_call_site_param_types(
+        db,
+        cache,
+        &mut CallScope::default(),
+        file_id,
+        call_expr,
+        &mut contributions,
+    );
+    db.get_call_site_param_index_mut()
+        .set_call_contributions(file_id, range, contributions);
 }
 
-pub(super) fn collect_file_contributions(db: &DbIndex, file_id: FileId) -> Vec<Contribution> {
+/// What the named vgui callbacks of `file_id` receive, which is decided by
+/// every use of a callback together.
+pub(super) fn collect_callback_contributions(db: &DbIndex, file_id: FileId) -> Vec<Contribution> {
     let Some(root) = db
         .get_vfs()
         .get_syntax_tree(&file_id)
@@ -119,19 +115,8 @@ pub(super) fn collect_file_contributions(db: &DbIndex, file_id: FileId) -> Vec<C
     else {
         return Vec::new();
     };
-    let mut scope = FileScope::new(db, file_id, &root);
     let mut cache = LuaInferCache::new(file_id, super::call_target::pass_view());
     let mut contributions = Vec::new();
-    for call_expr in root.descendants::<LuaCallExpr>() {
-        collect_call_site_param_types(
-            db,
-            &mut cache,
-            &mut scope,
-            file_id,
-            call_expr,
-            &mut contributions,
-        );
-    }
     collect_vgui_named_callback_receiver_types(db, &mut cache, file_id, &root, &mut contributions);
     contributions
 }
@@ -425,7 +410,7 @@ fn concrete_vgui_receiver_id(db: &DbIndex, typ: &LuaType) -> Option<LuaTypeDeclI
     }
 }
 
-fn source_signatures_in_file(
+pub(super) fn source_signatures_in_file(
     file_id: FileId,
     root: &glua_parser::LuaChunk,
 ) -> HashMap<String, Vec<LuaSignatureId>> {
@@ -603,22 +588,14 @@ fn implicit_receiver_decl_id(file_id: FileId, closure: &LuaClosureExpr) -> Optio
 fn collect_call_site_param_types(
     db: &DbIndex,
     cache: &mut LuaInferCache,
-    scope: &mut FileScope,
+    scope: &mut CallScope,
     file_id: FileId,
     call_expr: LuaCallExpr,
     contributions: &mut Vec<Contribution>,
 ) -> Option<()> {
     let args = call_expr.get_args_list()?;
     let prefix_expr = call_expr.get_prefix_expr()?;
-    collect_exact_colon_receiver_type(
-        db,
-        cache,
-        scope,
-        file_id,
-        &call_expr,
-        &prefix_expr,
-        contributions,
-    );
+    collect_exact_colon_receiver_type(db, cache, file_id, &call_expr, &prefix_expr, contributions);
 
     let call_args = args.get_args().collect::<Vec<_>>();
     let useful_args = call_args
@@ -986,7 +963,6 @@ fn call_arg_to_param_index(
 fn collect_exact_colon_receiver_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
-    scope: &mut FileScope,
     file_id: FileId,
     call_expr: &LuaCallExpr,
     prefix_expr: &LuaExpr,
@@ -999,9 +975,6 @@ fn collect_exact_colon_receiver_type(
         return None;
     };
     let member_key = exact_receiver_member_key(&index_expr)?;
-    if scope.exact_receiver_candidates.get(&member_key) == Some(&false) {
-        return None;
-    }
     let receiver_expr = index_expr.get_prefix_expr()?;
     let signature_id = super::call_target::call_target_of(db, file_id, call_expr)?.declared?;
     if !is_call_site_realm_compatible(db, file_id, call_expr.get_position(), signature_id) {
@@ -1015,6 +988,9 @@ fn collect_exact_colon_receiver_type(
         || is_param_mutated(db, signature_id, 0)
         || !exact_explicit_self_param_is_eligible(db, signature_id)
     {
+        return None;
+    }
+    if !exact_receiver_key_has_candidate(db, &member_key) {
         return None;
     }
 
@@ -1048,28 +1024,6 @@ fn collect_exact_colon_receiver_type(
         ),
     ));
     Some(())
-}
-
-fn collect_exact_receiver_candidates(
-    db: &DbIndex,
-    keys: HashSet<LuaMemberKey>,
-) -> HashMap<LuaMemberKey, bool> {
-    keys.into_iter()
-        .map(|member_key| {
-            let has_candidate = exact_receiver_key_has_candidate(db, &member_key);
-            (member_key, has_candidate)
-        })
-        .collect()
-}
-
-fn exact_receiver_member_keys_in_file(root: &glua_parser::LuaChunk) -> HashSet<LuaMemberKey> {
-    root.descendants::<LuaCallExpr>()
-        .filter(|call_expr| call_expr.is_colon_call())
-        .filter_map(|call_expr| match call_expr.get_prefix_expr()? {
-            LuaExpr::IndexExpr(index_expr) => exact_receiver_member_key(&index_expr),
-            _ => None,
-        })
-        .collect()
 }
 
 fn exact_receiver_key_has_candidate(db: &DbIndex, member_key: &LuaMemberKey) -> bool {
@@ -1320,7 +1274,7 @@ fn has_gmod_param_name_hint(db: &DbIndex, param_name: &str) -> bool {
 fn signature_ids_from_call_prefix(
     db: &DbIndex,
     cache: &mut LuaInferCache,
-    scope: &mut FileScope,
+    scope: &mut CallScope,
     file_id: FileId,
     call_expr: &LuaCallExpr,
     prefix_expr: &LuaExpr,
@@ -1328,11 +1282,11 @@ fn signature_ids_from_call_prefix(
     let call_position = call_expr.get_position();
     let direct = match prefix_expr {
         LuaExpr::NameExpr(name_expr) => {
-            signature_id_from_name_expr(db, scope, file_id, name_expr, call_position)
+            signature_id_from_name_expr(db, file_id, name_expr, call_position)
         }
         LuaExpr::IndexExpr(index_expr) => index_expr
             .get_access_path()
-            .and_then(|path| scope.source_signature_at(path.as_str(), call_position)),
+            .and_then(|path| source_signature_at(db, file_id, path.as_str(), call_position)),
         _ => None,
     };
     if let Some(signature_id) = direct {
@@ -1367,7 +1321,7 @@ fn signature_ids_from_call_prefix(
 fn signature_ids_from_include_returned_table_member(
     db: &DbIndex,
     cache: &mut LuaInferCache,
-    scope: &mut FileScope,
+    scope: &mut CallScope,
     file_id: FileId,
     name_expr: &LuaNameExpr,
     call_position: TextSize,
@@ -1921,7 +1875,7 @@ fn direct_called_prefix(call_expr: &LuaCallExpr) -> Option<LuaCallExpr> {
 
 fn returned_table_info(
     db: &DbIndex,
-    scope: &mut FileScope,
+    scope: &mut CallScope,
     target_file_id: FileId,
 ) -> Option<Arc<ReturnedTableInfo>> {
     scope
@@ -2014,13 +1968,12 @@ fn is_self_name_expr(expr: &LuaExpr) -> bool {
 
 fn signature_id_from_name_expr(
     db: &DbIndex,
-    scope: &FileScope,
     file_id: FileId,
     name_expr: &LuaNameExpr,
     call_position: TextSize,
 ) -> Option<LuaSignatureId> {
     let name = name_expr.get_name_text()?;
-    let signature_id = scope.source_signature_at(name.as_str(), call_position)?;
+    let signature_id = source_signature_at(db, file_id, name.as_str(), call_position)?;
 
     if name_expr_resolves_to_different_local_decl(db, file_id, name_expr, signature_id) {
         return None;

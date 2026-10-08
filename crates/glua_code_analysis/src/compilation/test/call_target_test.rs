@@ -148,7 +148,7 @@ mod test {
         let (_, counts) =
             counted(|| ws.def_file("lua/autorun/sh_caller.lua", "Greet()\nGreet()\n"));
         let inferred = counts
-            .get(&(Work::Infer, Some(DerivationKind::CallSiteParams)))
+            .get(&(Work::Infer, Some(DerivationKind::CallSiteParam)))
             .map_or(0, |(computed, _)| *computed);
 
         assert_eq!(inferred, 0);
@@ -243,5 +243,84 @@ RunWith(function(b) end)
 
         assert!(distinct > 0, "the pass inferred no callback argument");
         assert_eq!(computed, distinct as u64);
+    }
+
+    /// The call-site evidence of every file, rendered for an exact comparison.
+    fn call_site_records(ws: &VirtualWorkspace) -> Vec<(FileId, Vec<String>)> {
+        let mut records = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_call_site_param_index()
+            .iter_file_contributions()
+            .map(|(file_id, contributions)| {
+                (
+                    *file_id,
+                    contributions
+                        .into_iter()
+                        .map(|contribution| format!("{contribution:?}"))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        records.sort_by_key(|(file_id, _)| *file_id);
+        records
+    }
+
+    const PROBE: &str = "lua/autorun/sh_probe.lua";
+    const PROBE_TEXT: &str = "function Probe() return 1 end\n";
+    const EDITED_PROBE_TEXT: &str = "function Probe() return 2 end\n";
+    const GREETER: &str = "lua/autorun/sh_greeter.lua";
+    // Each call reads whether the calls before it return, so the call whose
+    // argument depends on the edited file is the last. Its evidence moves its
+    // callee's signature, which every call of that callee reads, so it calls
+    // another function than the others.
+    const GREETER_TEXT: &str = "function Greet(ply) return ply end\nfunction Wave(ply) return ply end\nGreet(\"a\")\nGreet(\"b\")\nWave(Probe())\n";
+
+    /// An edit of what a call's argument depends on leaves the call-site
+    /// evidence and diagnostics a cold build of the edited text has.
+    #[test]
+    fn an_edit_leaves_the_call_site_evidence_a_cold_build_has() {
+        let mut warm = gmod_workspace();
+        let file_ids = warm.def_files(vec![(PROBE, PROBE_TEXT), (GREETER, GREETER_TEXT)]);
+        warm.def_file(PROBE, EDITED_PROBE_TEXT);
+        let mut cold = gmod_workspace();
+        let cold_ids = cold.def_files(vec![(PROBE, EDITED_PROBE_TEXT), (GREETER, GREETER_TEXT)]);
+
+        let records = call_site_records(&warm);
+        assert!(
+            records
+                .iter()
+                .any(|(_, contributions)| !contributions.is_empty()),
+            "the calls contribute evidence: {records:?}"
+        );
+        assert_eq!(file_ids, cold_ids);
+        assert_eq!(records, call_site_records(&cold));
+        assert_eq!(warm.semantic_digest(), cold.semantic_digest());
+        assert!(warm.stale_derivations().is_empty());
+
+        warm.def_file(PROBE, PROBE_TEXT);
+        let mut reverted = gmod_workspace();
+        reverted.def_files(vec![(PROBE, PROBE_TEXT), (GREETER, GREETER_TEXT)]);
+        assert_eq!(call_site_records(&warm), call_site_records(&reverted));
+        assert_eq!(warm.semantic_digest(), reverted.semantic_digest());
+    }
+
+    /// Editing what one call's argument depends on re-runs that call's
+    /// call-site derivation alone, not the other calls of its file.
+    #[test]
+    fn editing_one_calls_argument_re_runs_only_that_calls_call_site_params() {
+        let mut ws = gmod_workspace();
+        ws.def_files(vec![(PROBE, PROBE_TEXT), (GREETER, GREETER_TEXT)]);
+        ws.def_file(PROBE, EDITED_PROBE_TEXT);
+
+        let evaluations = ws
+            .analysis
+            .compilation
+            .last_stats()
+            .evaluations(DerivationKind::CallSiteParam);
+
+        // `Probe()` and the call it is the argument of.
+        assert_eq!(evaluations, 2);
     }
 }

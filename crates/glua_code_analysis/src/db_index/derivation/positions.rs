@@ -231,6 +231,7 @@ impl EditMaps {
             K::DefinitionSite(site) => K::DefinitionSite(self.site(site)?),
             K::Metatable(site) => K::Metatable(self.site(site)?),
             K::CallTarget(site) => K::CallTarget(self.site(site)?),
+            K::CallSiteParam(site) => K::CallSiteParam(self.site(site)?),
             K::TableClass(site) => K::TableClass(self.site(site)?),
             K::DynamicFieldSite(site) => K::DynamicFieldSite(self.site(site)?),
             K::NetHelper(site) => K::NetHelper(self.site(site)?),

@@ -111,7 +111,6 @@ pub fn phase_label(pipeline_type_name: &str) -> &str {
         "PreDynamicUnResolveAnalysisPipeline" | "UnResolveAnalysisPipeline" => {
             "Resolving deferred types"
         }
-        "CallSiteParamAnalysisPipeline" => "Inferring parameters from call sites",
         "GmodNetworkAnalysisPipeline" => "Analysing net messages",
         "GmodPostAnalysisPipeline" => "Finishing GMod analysis",
         other => other,

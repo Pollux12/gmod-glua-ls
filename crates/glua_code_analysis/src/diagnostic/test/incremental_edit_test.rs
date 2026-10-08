@@ -3122,7 +3122,7 @@ end
                 (
                     *file_id,
                     contributions
-                        .iter()
+                        .into_iter()
                         .map(|contribution| format!("{contribution:?}"))
                         .collect::<Vec<_>>(),
                 )
