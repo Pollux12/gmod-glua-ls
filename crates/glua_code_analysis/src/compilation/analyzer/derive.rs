@@ -189,7 +189,8 @@ impl Recipes {
 
     /// Commits the transaction and clears the local state of every memo held
     /// by [`Self::settle_later`], concurrently, and returns it to the store.
-    /// Inside a superstep task it settles that file's memos alone, in place.
+    /// Inside a superstep task it settles the memos of the task's files
+    /// alone, in place.
     fn settle_caches(&self) {
         let settle = |(file_id, mut cache): (FileId, crate::LuaInferCache)| {
             cache.commit_transaction();
@@ -197,15 +198,15 @@ impl Recipes {
             self.store_cache(file_id, cache);
         };
         let mut held = self.unsettled.lock().expect("unsettled memos");
-        let Some(task) = super::parallel::task_file() else {
+        if !super::parallel::task_running() {
             let unsettled = std::mem::take(&mut *held);
             drop(held);
             unsettled.into_par_iter().for_each(settle);
             return;
-        };
+        }
         let (own, others): (Vec<_>, Vec<_>) = std::mem::take(&mut *held)
             .into_iter()
-            .partition(|(file_id, _)| *file_id == task);
+            .partition(|(file_id, _)| super::parallel::task_covers(*file_id));
         *held = others;
         drop(held);
         own.into_iter().for_each(settle);
@@ -304,6 +305,9 @@ impl super::engine::Recipe for Recipes {
                 crate::db_index::compute_valid_guard_signatures(db, id.file_id),
             ),
             DerivationKind::GmodPre => Box::new(gmod::compute_pre(db, id.file_id, &self.scopes)),
+            DerivationKind::ReceiverAuthority | DerivationKind::CallbackParams => {
+                db.queries().compute(db, id)
+            }
             kind => unreachable!("{kind:?} does not split"),
         }
     }
@@ -383,6 +387,9 @@ impl super::engine::Recipe for Recipes {
                 self.with_file_context(db, id.file_id, |db, context| {
                     gmod::apply_pre(db, context, metadata);
                 });
+            }
+            DerivationKind::ReceiverAuthority | DerivationKind::CallbackParams => {
+                db.queries().publish(id, computed)
             }
             kind => unreachable!("{kind:?} does not split"),
         }
@@ -597,7 +604,7 @@ mod tests {
             );
         }
 
-        super::super::parallel::in_task(own, || recipes.settle_caches());
+        super::super::parallel::in_task(&[own], || recipes.settle_caches());
 
         let unsettled = recipes.unsettled.lock().expect("unsettled memos");
         assert_eq!(

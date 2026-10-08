@@ -7,6 +7,7 @@
 //! it read moves, the engine marks its memo stale and computes it again, and
 //! its readers run again only if its value's fingerprint moved.
 
+use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -385,6 +386,27 @@ impl<F: QueryFamily> QueryTable<F> {
             return;
         }
         let value = Arc::new(computing(id, || F::compute(db, key)));
+        self.store(id, value);
+    }
+
+    /// Computes query `id` without storing it, for [`Self::publish`]: what
+    /// [`Self::recompute`] computes, on a worker.
+    pub(crate) fn compute(&self, db: &DbIndex, id: DerivationId) -> Box<dyn Any + Send> {
+        let key = Self::key(id);
+        Box::new(Arc::new(computing(id, || F::compute(db, key))))
+    }
+
+    /// Stores the value [`Self::compute`] returned and writes the query's
+    /// output, inside the engine's evaluation of it.
+    pub(crate) fn publish(&self, id: DerivationId, computed: Box<dyn Any + Send>) {
+        let value = *computed
+            .downcast::<Arc<F::Value>>()
+            .expect("a computed query value");
+        self.store(id, value);
+    }
+
+    fn store(&self, id: DerivationId, value: Arc<F::Value>) {
+        let key = Self::key(id);
         let fingerprint = Self::fingerprint_of(&value);
         let previous = self.memos().insert(
             key,
@@ -505,6 +527,24 @@ impl Queries {
         match id.kind {
             DerivationKind::ReceiverAuthority => self.receiver_authority.recompute(db, id),
             DerivationKind::CallbackParams => self.callback_params.recompute(db, id),
+            kind => unreachable!("{kind:?} is not a query"),
+        }
+    }
+
+    /// Computes query `id` without storing it; see [`QueryTable::compute`].
+    pub(crate) fn compute(&self, db: &DbIndex, id: DerivationId) -> Box<dyn Any + Send> {
+        match id.kind {
+            DerivationKind::ReceiverAuthority => self.receiver_authority.compute(db, id),
+            DerivationKind::CallbackParams => self.callback_params.compute(db, id),
+            kind => unreachable!("{kind:?} is not a query"),
+        }
+    }
+
+    /// Stores what [`Self::compute`] returned; see [`QueryTable::publish`].
+    pub(crate) fn publish(&self, id: DerivationId, computed: Box<dyn Any + Send>) {
+        match id.kind {
+            DerivationKind::ReceiverAuthority => self.receiver_authority.publish(id, computed),
+            DerivationKind::CallbackParams => self.callback_params.publish(id, computed),
             kind => unreachable!("{kind:?} is not a query"),
         }
     }

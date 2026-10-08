@@ -1044,7 +1044,7 @@ impl Engine {
                 .chain(self.next_round.files())
                 .chain(self.waiting.keys().map(|id| id.file_id))
                 .chain(self.held.keys().map(|id| id.file_id))
-                .chain(self.carried.iter().map(|plan| plan.file_id))
+                .chain(self.carried.iter().flat_map(TaskPlan::files))
                 .chain(self.detached_files.iter().copied())
                 .any(|queued| queued == file_id)
     }
@@ -1285,9 +1285,12 @@ impl Engine {
     /// each file's task on a worker thread on its own fork of the index as
     /// the superstep found it; work an evaluation queues for another file at
     /// the same rank waits for the next superstep. The root decides what each task runs, as
-    /// [`Self::step`] does before it evaluates a group; a group that reaches
-    /// another file, a query and workspace derivations run on the index after
-    /// the barrier. A task evaluates its groups in order on its own fork of
+    /// [`Self::step`] does before it evaluates a group; a group that spans
+    /// files runs in the task of the first file that queued one of its
+    /// members. A group with a member in a serial file or the workspace, a
+    /// query and workspace derivations run on the index after the barrier,
+    /// the queries computed concurrently when the run is whole. A task
+    /// evaluates its groups in order on its own fork of
     /// the index, recording against the reader graph as the superstep found
     /// it, and runs nothing more: what its writes move is found at the
     /// barrier, which installs the forks and files the records in file
@@ -1330,7 +1333,7 @@ impl Engine {
         self.detached_files = superstep
             .plans
             .iter()
-            .map(|plan| plan.file_id)
+            .flat_map(TaskPlan::files)
             .chain(superstep.on_root.iter().map(|(file_id, _)| *file_id))
             .chain(superstep.root.iter().map(|(id, _)| id.file_id))
             .collect();
@@ -1344,9 +1347,12 @@ impl Engine {
         let stop = StopSignal::new(slice, self.interrupt.as_ref());
         if !self.carried.is_empty() {
             let carried = std::mem::take(&mut self.carried);
-            let (plans, serial) = carried
-                .into_iter()
-                .partition::<Vec<_>, _>(|plan| !self.serial_files.contains(&plan.file_id));
+            let (plans, serial) = carried.into_iter().partition::<Vec<_>, _>(|plan| {
+                !plan
+                    .files()
+                    .iter()
+                    .any(|file_id| self.serial_files.contains(file_id))
+            });
             self.requeue(serial);
             let rank = plans
                 .first()
@@ -1364,10 +1370,13 @@ impl Engine {
         let rank = self.worklist.first_rank()?;
         self.stats.supersteps += 1;
         let dispatching = crate::profile::PhaseGuard::new("superstep: dispatch");
-        let mut plans = Vec::new();
+        let mut plans = Vec::<TaskPlan>::new();
         let mut root = Vec::new();
         let mut on_root = Vec::new();
         let mut workspace = Vec::new();
+        // Each member of a planned group, with the plan and position of its
+        // group: the files of a group that spans several share one.
+        let mut grouped = FxHashMap::<DerivationId, (usize, usize)>::default();
         let taken = self.worklist.take_rank(rank);
         let checked = self.check_dispatch(db, &taken);
         for ((file_id, entries), checked) in taken.into_iter().zip(checked) {
@@ -1380,17 +1389,23 @@ impl Engine {
                 continue;
             }
             let mut groups = Vec::<PlannedGroup>::new();
-            let mut grouped = FxHashMap::<DerivationId, usize>::default();
+            let plan = plans.len();
             for ((id, reason), checked) in entries.into_iter().zip(checked) {
-                if let Some(at) = grouped.get(&id) {
-                    groups[*at].entries.push((id, reason));
+                if let Some(&(at_plan, at)) = grouped.get(&id) {
+                    let planned = if at_plan == plan {
+                        &mut groups[at]
+                    } else {
+                        &mut plans[at_plan].groups[at]
+                    };
+                    planned.entries.push((id, reason));
                     continue;
                 }
-                match self.decide(db, file_id, id, reason, checked) {
+                match self.decide(db, id, reason, checked) {
                     Dispatched::Settled => {}
                     Dispatched::Root => root.push((id, reason)),
                     Dispatched::Task(members, rerun) => {
-                        grouped.extend(members.iter().map(|member| (*member, groups.len())));
+                        grouped
+                            .extend(members.iter().map(|member| (*member, (plan, groups.len()))));
                         groups.push(PlannedGroup {
                             members,
                             rerun,
@@ -1450,7 +1465,32 @@ impl Engine {
                 self.worklist.insert(id, reason);
             }
         }
-        for (id, reason) in root {
+        let mut root = root.into_iter().peekable();
+        while let Some((id, reason)) = root.next() {
+            if id.kind.is_query() {
+                let mut queries = vec![(id, reason)];
+                while let Some(query) = root.next_if(|(id, _)| id.kind.is_query()) {
+                    queries.push(query);
+                }
+                let left = self.run_recorded_queries(db, recipe, slice, queries);
+                self.run_root(db, recipe, slice, &stop, left);
+                continue;
+            }
+            self.run_root(db, recipe, slice, &stop, vec![(id, reason)]);
+        }
+    }
+
+    /// Evaluates `entries` of the root list one at a time on the index, until
+    /// `stop` is reached; the rest wait for the next superstep.
+    fn run_root(
+        &mut self,
+        db: &mut DbIndex,
+        recipe: &dyn Recipe,
+        slice: Slice,
+        stop: &StopSignal,
+        entries: Vec<(DerivationId, Reason)>,
+    ) {
+        for (id, reason) in entries {
             if stop.reached() {
                 self.worklist.insert(id, reason);
                 continue;
@@ -1461,22 +1501,30 @@ impl Engine {
         }
     }
 
-    /// Decides what queued `id` of `file_id` comes to in a worker superstep:
-    /// for a group its file's task runs, [`Self::commit_group`] does the rest
+    /// Holds `id` until its kind's first stage when the run has not reached
+    /// it. Returns whether it did.
+    fn hold_for_stage(&mut self, db: &DbIndex, id: DerivationId, reason: Reason) -> bool {
+        if db.analysis_stage() >= id.kind.first_stage() {
+            return false;
+        }
+        let held = self.held.entry(id).or_insert(reason);
+        *held = (*held).min(reason);
+        true
+    }
+
+    /// Decides what queued `id` comes to in a worker superstep: for a group
+    /// a task runs, [`Self::commit_group`] does the rest
     /// of what [`Self::step`] does before it evaluates one once the task ran
     /// it. Deciding that a group runs changes nothing but the cursor, so an
     /// entry queued again is decided afresh.
     fn decide(
         &mut self,
         db: &mut DbIndex,
-        file_id: crate::FileId,
         id: DerivationId,
         reason: Reason,
         checked: Option<Checked>,
     ) -> Dispatched {
-        if db.analysis_stage() < id.kind.first_stage() {
-            let held = self.held.entry(id).or_insert(reason);
-            *held = (*held).min(reason);
+        if self.hold_for_stage(db, id, reason) {
             return Dispatched::Settled;
         }
         self.cursor = Some(id);
@@ -1497,7 +1545,9 @@ impl Engine {
             self.moved_from.remove(&id);
             return Dispatched::Settled;
         };
-        if group.iter().any(|member| member.file_id != file_id) {
+        if group.iter().any(|member| {
+            member.file_id == crate::FileId::VIRTUAL || self.serial_files.contains(&member.file_id)
+        }) {
             return Dispatched::Root;
         }
         let rerun = self.stats.profiling()
@@ -1507,12 +1557,11 @@ impl Engine {
         Dispatched::Task(group, rerun)
     }
 
-    /// Does for `group`, which `file_id`'s task ran, what [`Self::step`] does
-    /// before it evaluates one, in the order the groups were decided.
+    /// Does for `group`, which a task ran, what [`Self::step`] does before it
+    /// evaluates one, in the order the groups were decided.
     fn commit_group(
         &mut self,
         db: &DbIndex,
-        file_id: crate::FileId,
         group: &PlannedGroup,
         moved_in_task: &[Vec<(HashedKey, derivation::Fingerprint)>],
     ) {
@@ -1548,7 +1597,14 @@ impl Engine {
                 self.settled_on(*member, moved);
             }
         }
-        self.evaluated.insert(file_id);
+        self.evaluated
+            .extend(group.iter().map(|member| member.file_id));
+        if group
+            .iter()
+            .any(|member| member.file_id != group[0].file_id)
+        {
+            self.stats.cross_file_groups += 1;
+        }
         for member in group {
             let runs = self.task_runs.entry(*member).or_default();
             *runs += 1;
@@ -1685,7 +1741,7 @@ impl Engine {
                 .as_ref()
                 .map_or(&[][..], |outcome| &outcome.groups[..]);
             for (group, run) in groups.iter().zip(ran) {
-                self.commit_group(db, file_id, group, &run.moved);
+                self.commit_group(db, group, &run.moved);
             }
             if !unrun.is_empty() {
                 carried.push(TaskPlan {
@@ -1939,7 +1995,7 @@ impl Engine {
         }
         let mut ran = Vec::new();
         self.task = Some(file_id);
-        super::parallel::in_task(file_id, || {
+        super::parallel::in_task(&[file_id], || {
             while let Some((id, reason)) = local.pop_first() {
                 ran.push(id);
                 self.file_queries(db);
@@ -1963,9 +2019,7 @@ impl Engine {
         id: DerivationId,
         reason: Reason,
     ) {
-        if db.analysis_stage() < id.kind.first_stage() {
-            let held = self.held.entry(id).or_insert(reason);
-            *held = (*held).min(reason);
+        if self.hold_for_stage(db, id, reason) {
             return;
         }
         self.cursor = Some(id);
@@ -2688,6 +2742,75 @@ impl Engine {
             }
             return false;
         }
+        self.publish_recorded_batch(db, first.kind, batch, popped, recipe);
+        true
+    }
+
+    /// Evaluates the queries of a superstep's root list that have to run,
+    /// computing them concurrently as [`Self::run_recorded_batch`] does a
+    /// batch. A query reads only the index, which publishing one leaves as it
+    /// is, so each computes what it would have alone; one that read another
+    /// query still being computed is evaluated again in order. Returns the
+    /// entries left to evaluate one at a time: all of them unless the run is
+    /// whole and enough have to run to pay for the workers.
+    fn run_recorded_queries(
+        &mut self,
+        db: &mut DbIndex,
+        recipe: &dyn Recipe,
+        slice: Slice,
+        queries: Vec<(DerivationId, Reason)>,
+    ) -> Vec<(DerivationId, Reason)> {
+        if !matches!(slice, Slice::Whole)
+            || !super::parallel::records_on_workers()
+            || super::parallel::runs_inline(queries.len())
+        {
+            return queries;
+        }
+        let mut batch = Vec::new();
+        let mut popped = Vec::new();
+        for (id, reason) in queries {
+            self.file_queries(db);
+            if self.hold_for_stage(db, id, reason) {
+                continue;
+            }
+            self.cursor = Some(id);
+            if !self.needs_evaluation(db, id, reason) {
+                self.moved_from.remove(&id);
+                db.queries().set_stale(id, false);
+                continue;
+            }
+            self.check_convergence(id);
+            let batched = co_producers(db, id).len() == 1;
+            if batched {
+                batch.push(id);
+            }
+            popped.push((id, reason, batched));
+        }
+        if super::parallel::runs_inline(batch.len()) {
+            return popped
+                .into_iter()
+                .map(|(id, reason, _)| (id, reason))
+                .collect();
+        }
+        self.stats.queries_on_workers += batch.len();
+        self.publish_recorded_batch(db, batch[0].kind, batch, popped, recipe);
+        Vec::new()
+    }
+
+    /// Computes `batch`, derivations of `kind` that each need evaluating
+    /// alone, on pool workers against the canonical index and publishes them
+    /// in order on this thread; `popped` holds every derivation the batch was
+    /// gathered from, with whether it joined it. A result whose reads no
+    /// longer hold, or that read a key another member's reset moved, is
+    /// discarded and evaluated here instead.
+    fn publish_recorded_batch(
+        &mut self,
+        db: &mut DbIndex,
+        kind: DerivationKind,
+        batch: Vec<DerivationId>,
+        popped: Vec<(DerivationId, Reason, bool)>,
+        recipe: &dyn Recipe,
+    ) {
         let mut alone = Vec::new();
         for (id, reason, batched) in popped {
             self.trace_evaluation(db, id, reason);
@@ -2735,13 +2858,7 @@ impl Engine {
                 quarantine.started(),
                 db.queries().ready_outputs(),
             );
-            let by_file = batch
-                .iter()
-                .map(|id| (id.file_id, *id))
-                .collect::<FxHashMap<_, _>>();
-            let files = batch.iter().map(|id| id.file_id).collect::<Vec<_>>();
-            super::parallel::map_files_collect(db, &files, |db, file_id| {
-                let id = by_file[&file_id];
+            super::parallel::map_derivations_collect(db, &batch, |db, id| {
                 let started = profiling.then(std::time::Instant::now);
                 let (result, additions) =
                     crate::semantic::with_access_paths(paths.as_ref(), || {
@@ -2845,13 +2962,12 @@ impl Engine {
         db.reader_graph_mut().restore_keys(table);
         if let Some(started) = started {
             self.stats
-                .timed(first.kind, started.elapsed(), reruns, batch.len());
+                .timed(kind, started.elapsed(), reruns, batch.len());
         }
         self.readers_of(db, touched.iter());
         for id in alone {
             self.worklist.insert(id, Reason::Changed);
         }
-        true
     }
 
     /// Resets the primary outputs of `members` to the source layer. Returns
@@ -3081,6 +3197,10 @@ pub(crate) struct EngineStats {
     /// Supersteps run, and file tasks across them.
     supersteps: usize,
     superstep_tasks: usize,
+    /// Groups of derivations in several files that tasks ran, and queries the
+    /// root list computed on workers.
+    cross_file_groups: usize,
+    queries_on_workers: usize,
     /// Tasks run again on the index, by the first value they conflicted on.
     conflicting_tasks: usize,
     task_conflicts: BTreeMap<&'static str, usize>,
@@ -3297,6 +3417,10 @@ impl EngineStats {
                 self.serial_stages,
                 self.task_conflicts
             );
+            eprintln!(
+                "[engine] cross-file groups={} queries on workers={}",
+                self.cross_file_groups, self.queries_on_workers
+            );
         }
         let mut distinct = BTreeMap::<DerivationKind, usize>::new();
         for id in &self.distinct {
@@ -3387,6 +3511,22 @@ impl EngineStats {
 struct TaskPlan {
     file_id: crate::FileId,
     groups: Vec<PlannedGroup>,
+}
+
+impl TaskPlan {
+    /// The files the task covers: its own and those of its groups' members,
+    /// in order.
+    fn files(&self) -> Vec<crate::FileId> {
+        let mut files = vec![self.file_id];
+        files.extend(
+            self.groups
+                .iter()
+                .flat_map(|group| group.members.iter().map(|member| member.file_id)),
+        );
+        files.sort_unstable();
+        files.dedup();
+        files
+    }
 }
 
 /// A worker superstep from its plan to its install: the file tasks at its
@@ -3522,9 +3662,10 @@ impl StopSignal {
 enum Dispatched {
     /// Nothing runs: it waits for its stage, or what it read holds.
     Settled,
-    /// Its file's task runs the group; whether every member ran before.
+    /// A task runs the group; whether every member ran before.
     Task(Vec<DerivationId>, bool),
-    /// It runs on the index after the barrier.
+    /// It runs on the index after the barrier: a query, a group with a
+    /// member in the workspace or in a file that settles on the index.
     Root,
 }
 
@@ -3744,7 +3885,7 @@ fn run_task_on_worker(
     let mut db = frozen.task_fork();
     let recorder = derivation::TaskRecorder::start(snapshot);
     let mut touched = FxHashSet::default();
-    let groups = super::parallel::in_task(plan.file_id, || {
+    let groups = super::parallel::in_task(&plan.files(), || {
         plan.groups
             .iter()
             .enumerate()
@@ -5765,5 +5906,154 @@ function holder.receiver:Use() end
         );
         assert_eq!((serial.0, serial.1), (vec![], 5));
         assert_eq!(serial.2, whole);
+    }
+
+    /// Statements that all bind one fact in the source's file, so those of
+    /// different files run as one group; every one but the source's copies
+    /// the source's value into a fact of its own.
+    struct Spanning {
+        source: FileId,
+        value: Mutex<LuaType>,
+    }
+
+    impl Recipe for Spanning {
+        fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
+            let source = relay_owner(self.source, RELAY);
+            if id.file_id == self.source {
+                bind_relay(db, source, self.value.lock().unwrap().clone());
+            } else {
+                let seen = db
+                    .get_type_index()
+                    .get_type_cache(&source)
+                    .map_or(LuaType::Unknown, |cache| cache.as_type().clone());
+                let start = u32::from(id.syntax_id().get_range().start());
+                bind_relay(db, relay_owner(id.file_id, start), seen);
+            }
+            bind_relay(db, relay_owner(self.source, RELAY_SHARED), LuaType::Nil);
+        }
+
+        fn splits(&self, _: DerivationKind) -> bool {
+            false
+        }
+
+        fn compute(&self, _: &DbIndex, _: DerivationId) -> Box<dyn std::any::Any + Send> {
+            unreachable!("a spanning statement does not split")
+        }
+
+        fn apply(&self, _: &mut DbIndex, _: DerivationId, _: Box<dyn std::any::Any + Send>) {
+            unreachable!("a spanning statement does not split")
+        }
+    }
+
+    /// What each reader file's copy settles to after the spanning statements
+    /// are built and then changed, and how many groups across files ran in
+    /// tasks.
+    fn spanning_run(serial: bool) -> (Vec<Option<LuaType>>, usize) {
+        let _serial = serial.then(serial_engine);
+        let (mut ws, _, files, statements) = relay_workspace();
+        let recipe = Spanning {
+            source: files[0],
+            value: Mutex::new(LuaType::IntegerConst(7)),
+        };
+        let db = ws.get_db_mut();
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        for value in [7, 8] {
+            *recipe.value.lock().unwrap() = LuaType::IntegerConst(value);
+            for id in &statements {
+                engine.changed(*id);
+            }
+            engine.open(db);
+            assert!(engine.run(db, &recipe, Slice::Whole));
+        }
+        let copies = files[1..]
+            .iter()
+            .map(|file_id| {
+                db.get_type_index()
+                    .get_type_cache(&relay_owner(*file_id, RELAY))
+                    .map(|cache| cache.as_type().clone())
+            })
+            .collect();
+        (copies, engine.stats.cross_file_groups)
+    }
+
+    #[test]
+    fn a_group_spanning_files_runs_in_a_task_and_settles_as_the_serial_engine_does() {
+        let serial = spanning_run(true);
+        let workers = spanning_run(false);
+
+        assert_eq!(serial.1, 0);
+        assert!(workers.1 > 0, "no group across files ran in a task");
+        assert_eq!(workers.0, serial.0);
+        assert!(
+            workers
+                .0
+                .iter()
+                .all(|copy| *copy == Some(LuaType::IntegerConst(8))),
+            "{:?}",
+            workers.0
+        );
+    }
+
+    /// Twelve runners, each passing its callers a table, and a caller of
+    /// each.
+    fn runner_files(ready: &str) -> Vec<(String, String)> {
+        let runners = (0..12).map(|index| {
+            (
+                format!("lua/autorun/sh_runner_{index}.lua"),
+                format!("function RunWith{index}(cb)\n    cb({{ ready = {ready} }})\nend\n"),
+            )
+        });
+        let callers = (0..12).map(|index| {
+            (
+                format!("lua/autorun/sh_caller_{index}.lua"),
+                format!("RunWith{index}(function(state)\n    local seen = state.ready\nend)\n"),
+            )
+        });
+        runners.chain(callers).collect()
+    }
+
+    /// How many queries the root list computed on workers when every runner
+    /// changed what it passes, and the records everything settled to, with
+    /// `threads` analysis threads.
+    fn runners_edited(threads: usize) -> (usize, Vec<String>) {
+        let _threads = parallel::THREADS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        parallel::set_analysis_threads(threads);
+        let _restore = OnDrop(|| parallel::set_analysis_threads(0));
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        for ready in ["true", "7"] {
+            let files = runner_files(ready);
+            ws.def_files(
+                files
+                    .iter()
+                    .map(|(path, text)| (path.as_str(), text.as_str()))
+                    .collect(),
+            );
+        }
+        let on_workers = ws.analysis.compilation.last_stats().queries_on_workers;
+        (on_workers, recorded_digest(&mut ws))
+    }
+
+    #[test]
+    fn queries_a_superstep_leaves_to_the_root_list_compute_on_workers_and_settle_as_serially() {
+        let serial = runners_edited(1);
+        let workers = runners_edited(4);
+
+        assert_eq!(serial.0, 0);
+        assert!(workers.0 > 0, "no query was computed on a worker");
+        assert!(
+            serial.1 == workers.1,
+            "serial and worker records differ: {:?}",
+            serial
+                .1
+                .iter()
+                .filter(|line| !workers.1.contains(line))
+                .take(10)
+                .collect::<Vec<_>>()
+        );
     }
 }

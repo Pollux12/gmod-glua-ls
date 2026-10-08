@@ -23,6 +23,7 @@ use std::sync::{Mutex, Once};
 use rayon::prelude::*;
 
 use crate::db_index::DbIndex;
+use crate::db_index::derivation::DerivationId;
 use crate::{FileId, profile::Profile};
 
 /// Below this many files, dispatch and cross-thread handoff cost more than the
@@ -67,27 +68,36 @@ pub(crate) fn records_on_workers() -> bool {
 pub(crate) static THREADS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 thread_local! {
-    /// The file whose superstep task runs on this thread.
-    static TASK_FILE: std::cell::Cell<Option<FileId>> = const { std::cell::Cell::new(None) };
+    /// The files whose groups the superstep task on this thread runs.
+    static TASK_FILES: std::cell::RefCell<Option<Vec<FileId>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Runs `f` as the superstep task of `file_id`: batches it reaches run on this
-/// thread, so no other task's work interleaves with it on a worker blocked in
-/// a nested join.
-pub(crate) fn in_task<T>(file_id: FileId, f: impl FnOnce() -> T) -> T {
-    struct Restore(Option<FileId>);
+/// Runs `f` as the superstep task over `files`: batches it reaches run on
+/// this thread, so no other task's work interleaves with it on a worker
+/// blocked in a nested join.
+pub(crate) fn in_task<T>(files: &[FileId], f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Vec<FileId>>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            TASK_FILE.with(|task| task.set(self.0));
+            TASK_FILES.with(|task| *task.borrow_mut() = self.0.take());
         }
     }
-    let _restore = Restore(TASK_FILE.with(|task| task.replace(Some(file_id))));
+    let _restore = Restore(TASK_FILES.with(|task| task.borrow_mut().replace(files.to_vec())));
     f()
 }
 
-/// The file whose superstep task runs on this thread, if any.
-pub(crate) fn task_file() -> Option<FileId> {
-    TASK_FILE.with(|task| task.get())
+/// Whether a superstep task runs on this thread.
+pub(crate) fn task_running() -> bool {
+    TASK_FILES.with(|task| task.borrow().is_some())
+}
+
+/// Whether the superstep task running on this thread covers `file_id`.
+pub(crate) fn task_covers(file_id: FileId) -> bool {
+    TASK_FILES.with(|task| {
+        task.borrow()
+            .as_ref()
+            .is_some_and(|files| files.contains(&file_id))
+    })
 }
 
 /// Whether this batch is better run on the caller's thread than handed to the
@@ -108,7 +118,7 @@ fn runs_on_caller(file_count: usize) -> bool {
     // pool worker would read unrecorded.
     file_count < 2
         || crate::db_index::derivation::recording()
-        || task_file().is_some()
+        || task_running()
         || analysis_threads() <= 1
 }
 
@@ -143,7 +153,21 @@ where
     if runs_inline(file_ids.len()) {
         return file_ids.iter().map(|&id| f(db, id)).collect();
     }
-    map_files_on_pool(db, file_ids, dispatch_order(db, file_ids), f)
+    map_on_pool(db, file_ids, dispatch_order(db, file_ids), f)
+}
+
+/// [`map_files_collect`] for derivations: several may belong to one file, and
+/// each is computed on its own. Results align with `ids`.
+pub(crate) fn map_derivations_collect<T, F>(db: &DbIndex, ids: &[DerivationId], f: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(&DbIndex, DerivationId) -> T + Sync,
+{
+    if runs_inline(ids.len()) {
+        return ids.iter().map(|&id| f(db, id)).collect();
+    }
+    let files = ids.iter().map(|id| id.file_id).collect::<Vec<_>>();
+    map_on_pool(db, ids, dispatch_order(db, &files), f)
 }
 
 /// [`map_files_collect`] for superstep tasks, which each cost far more than
@@ -170,15 +194,16 @@ where
         }
         None => dispatch_order(db, file_ids),
     };
-    map_files_on_pool(db, file_ids, dispatch, f)
+    map_on_pool(db, file_ids, dispatch, f)
 }
 
-fn map_files_on_pool<T, F>(db: &DbIndex, file_ids: &[FileId], dispatch: Vec<usize>, f: F) -> Vec<T>
+fn map_on_pool<I, T, F>(db: &DbIndex, items: &[I], dispatch: Vec<usize>, f: F) -> Vec<T>
 where
+    I: Copy + Sync,
     T: Send,
-    F: Fn(&DbIndex, FileId) -> T + Sync,
+    F: Fn(&DbIndex, I) -> T + Sync,
 {
-    let n = file_ids.len();
+    let n = items.len();
 
     let _p = Profile::cond_new("parallel map_files", n > 1);
     init_pool();
@@ -209,7 +234,7 @@ where
             if report_step != 0 && seq.is_multiple_of(report_step) {
                 crate::progress::advance_current_phase(seq, n, "files");
             }
-            local.push((idx, f(db, file_ids[idx])));
+            local.push((idx, f(db, items[idx])));
         }
         computed
             .lock()
@@ -275,7 +300,7 @@ where
     let Some(id) = crate::db_index::derivation::current() else {
         return items.iter().map(f).collect();
     };
-    if items.len() < MIN_PARALLEL_FILES || analysis_threads() <= 1 || task_file().is_some() {
+    if items.len() < MIN_PARALLEL_FILES || analysis_threads() <= 1 || task_running() {
         return items.iter().map(f).collect();
     }
 

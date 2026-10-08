@@ -10384,7 +10384,7 @@ fn rebuild_gmod_load_index(
     drop(_p_prep);
     let _p_sites = crate::profile::PhaseGuard::new("gmodload/resolve_sites");
     let dependencies = db.get_file_dependencies_index();
-    let mut dependency_sites = db
+    let sites = db
         .get_vfs()
         .get_all_file_ids()
         .iter()
@@ -10393,9 +10393,10 @@ fn rebuild_gmod_load_index(
                 .get_dependency_sites(file_id)
                 .unwrap_or_default()
         })
-        .cloned()
-        .map(|site| resolve_load_dependency_site(db, site))
         .collect::<Vec<_>>();
+    let mut dependency_sites = super::parallel::map_items_recorded(&sites, |site| {
+        resolve_load_dependency_site(db, (**site).clone())
+    });
     // This vector is the visit order of the load fixpoint below, so it decides both the edge
     // order and (through the `states` stamp) the edge set. Order it by a property of the
     // source text.
