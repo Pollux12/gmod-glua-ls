@@ -231,7 +231,10 @@ fn collect_vgui_named_callback_receiver_types(
         let Some(candidate) = candidate else {
             continue;
         };
-        let Some(signature) = db.get_signature_index().get(&candidate.signature_id) else {
+        let Some(signature) = db
+            .get_signature_index()
+            .get_declared(&candidate.signature_id)
+        else {
             continue;
         };
         if signature.is_colon_define
@@ -640,7 +643,7 @@ fn collect_call_site_param_types(
         if !is_call_site_realm_compatible(db, file_id, call_expr.get_position(), signature_id) {
             continue;
         }
-        let Some(signature) = db.get_signature_index().get(&signature_id) else {
+        let Some(signature) = db.get_signature_index().get_declared(&signature_id) else {
             continue;
         };
         let has_authoritative_receiver =
@@ -754,7 +757,7 @@ fn collect_direct_callback_param_types(
     {
         return;
     }
-    let Some(callee_signature) = db.get_signature_index().get(&callee_signature_id) else {
+    let Some(callee_signature) = db.get_signature_index().get_declared(&callee_signature_id) else {
         return;
     };
     let callback_args = db.callback_params(callee_signature_id);
@@ -768,7 +771,8 @@ fn collect_direct_callback_param_types(
             continue;
         };
         let target_signature_id = LuaSignatureId::from_closure(file_id, target_closure);
-        let Some(target_signature) = db.get_signature_index().get(&target_signature_id) else {
+        let Some(target_signature) = db.get_signature_index().get_declared(&target_signature_id)
+        else {
             continue;
         };
         for callback_arg in callback_args
@@ -851,7 +855,7 @@ impl QueryFamily for CallbackParamsQuery {
 /// order.
 fn callback_args(db: &DbIndex, callee_signature_id: LuaSignatureId) -> Vec<CallbackArg> {
     let mut args = Vec::new();
-    let Some(callee_signature) = db.get_signature_index().get(&callee_signature_id) else {
+    let Some(callee_signature) = db.get_signature_index().get_declared(&callee_signature_id) else {
         return args;
     };
     let Some(callee_params) = exact_signature_closure(db, callee_signature_id)
@@ -981,7 +985,7 @@ fn collect_exact_colon_receiver_type(
         return None;
     }
 
-    let signature = db.get_signature_index().get(&signature_id)?;
+    let signature = db.get_signature_index().get_declared(&signature_id)?;
     if signature.is_colon_define
         || signature.params.first().is_none_or(|param| param != "self")
         || signature.param_docs.contains_key(&0)
@@ -1893,7 +1897,7 @@ fn returned_table_info(
                         return None;
                     };
                     let signature_id = LuaSignatureId::from_closure(target_file_id, &closure);
-                    let signature = db.get_signature_index().get(&signature_id)?;
+                    let signature = db.get_signature_index().get_declared(&signature_id)?;
                     let receiver_param_idx = if signature.is_colon_define {
                         signature.params.len()
                     } else if signature

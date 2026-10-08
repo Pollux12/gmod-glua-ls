@@ -281,10 +281,17 @@ RunWith(function(b) end)
     const EDITED_PROBE_TEXT: &str = "function Probe() return 2 end\n";
     const GREETER: &str = "lua/autorun/sh_greeter.lua";
     // Each call reads whether the calls before it return, so the call whose
-    // argument depends on the edited file is the last. Its evidence moves its
-    // callee's signature, which every call of that callee reads, so it calls
-    // another function than the others.
-    const GREETER_TEXT: &str = "function Greet(ply) return ply end\nfunction Wave(ply) return ply end\nGreet(\"a\")\nGreet(\"b\")\nWave(Probe())\n";
+    // argument depends on the edited file is the last.
+    const GREETER_TEXT: &str = "function Greet(ply) return ply end
+Greet(\"a\")
+Greet(\"b\")
+Greet(Probe())
+";
+    const LOCAL_GREETER_TEXT: &str = "local function Greet(ply) return ply end
+Greet(\"a\")
+Greet(\"b\")
+Greet(Probe())
+";
 
     /// An edit of what a call's argument depends on leaves the call-site
     /// evidence and diagnostics a cold build of the edited text has.
@@ -316,20 +323,37 @@ RunWith(function(b) end)
     }
 
     /// Editing what one call's argument depends on re-runs that call's
-    /// call-site derivation alone, not the other calls of its file.
+    /// call-site derivation alone, not the other calls of its file, including
+    /// the calls of the callee whose parameter its evidence moves, and leaves
+    /// what a cold build of the edit has. A local callee takes no evidence
+    /// from its calls here, so none of them runs again.
     #[test]
     fn editing_one_calls_argument_re_runs_only_that_calls_call_site_params() {
-        let mut ws = gmod_workspace();
-        ws.def_files(vec![(PROBE, PROBE_TEXT), (GREETER, GREETER_TEXT)]);
-        ws.def_file(PROBE, EDITED_PROBE_TEXT);
+        for (greeter_text, expected) in [(GREETER_TEXT, 1), (LOCAL_GREETER_TEXT, 0)] {
+            let mut ws = gmod_workspace();
+            ws.def_files(vec![(PROBE, PROBE_TEXT), (GREETER, greeter_text)]);
+            ws.def_file(PROBE, EDITED_PROBE_TEXT);
+            let mut cold = gmod_workspace();
+            cold.def_files(vec![(PROBE, EDITED_PROBE_TEXT), (GREETER, greeter_text)]);
 
-        let evaluations = ws
-            .analysis
-            .compilation
-            .last_stats()
-            .evaluations(DerivationKind::CallSiteParam);
+            let evaluations = ws
+                .analysis
+                .compilation
+                .last_stats()
+                .evaluations(DerivationKind::CallSiteParam);
 
-        // `Probe()` and the call it is the argument of.
-        assert_eq!(evaluations, 2);
+            assert_eq!(
+                call_site_records(&ws),
+                call_site_records(&cold),
+                "{greeter_text}"
+            );
+            assert_eq!(
+                ws.semantic_digest(),
+                cold.semantic_digest(),
+                "{greeter_text}"
+            );
+            assert!(ws.stale_derivations().is_empty(), "{greeter_text}");
+            assert_eq!(evaluations, expected, "{greeter_text}");
+        }
     }
 }

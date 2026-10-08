@@ -339,7 +339,8 @@ pub enum FactKey {
     /// [`FactKey::GmodRealm`].
     GmodRealmAt(FileId, TextSize),
     /// A signature as declared: its params with their docs and attributes,
-    /// overloads, generic params and colon and vararg flags. Read out of its
+    /// overloads, generic params and colon and vararg flags, and the local
+    /// function declaration it is bound to. Read out of its
     /// [`FactKey::Signature`], which also holds what inference resolved.
     SignatureDecl(LuaSignatureId),
     /// Whether a signature returns `never`. Read out of its

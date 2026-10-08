@@ -269,15 +269,15 @@ impl LuaSignatureIndex {
     }
 
     pub fn local_func_decl_for(&self, signature_id: &LuaSignatureId) -> Option<LuaDeclId> {
-        derivation::note_signature_read(*signature_id);
+        derivation::note_signature_decl_read(*signature_id);
         self.local_func_decls.get(signature_id).copied()
     }
 
     pub fn bind_local_func_decl(&mut self, signature_id: LuaSignatureId, decl_id: LuaDeclId) {
         if self.local_func_decls.get(&signature_id) != Some(&decl_id) {
             self.local_func_decls.insert(signature_id, decl_id);
-            // `local_func_decl_for` records a signature read: the write
-            // lands on that signature's contract clock.
+            // `local_func_decl_for` records a declaration read: the write
+            // lands on that signature's declaration.
             self.note_return_write(signature_id);
         }
     }
@@ -881,12 +881,17 @@ impl LuaSignatureIndex {
                 .map_or(derivation::ABSENT, |signature| {
                     derivation::fingerprint_of(&signature.returns_never())
                 }),
-            FactKey::SignatureDecl(signature_id) => self
-                .signatures
-                .get(signature_id)
-                .map_or(derivation::ABSENT, |signature| {
-                    derivation::fingerprint_of(&signature.declaration())
-                }),
+            FactKey::SignatureDecl(signature_id) => {
+                let signature = self.signatures.get(signature_id);
+                let local_func_decl = self.local_func_decls.get(signature_id);
+                if signature.is_none() && local_func_decl.is_none() {
+                    return derivation::ABSENT;
+                }
+                derivation::fingerprint_of(&(
+                    signature.map(LuaSignature::declaration),
+                    local_func_decl,
+                ))
+            }
             FactKey::ValidGuardFile(file_id) => {
                 derivation::fingerprint_opt(self.valid_guard_file_contributions.get(file_id))
             }
