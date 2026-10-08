@@ -34,13 +34,15 @@
 //! others, so a value an outside fact stops supporting stays: a loop that
 //! settled before some outside fact it read did, in a cold build as in an
 //! update, keeps what that fact supported on the way. Before the run ends,
-//! each loop a fact from outside moved under since it last settled is
-//! cleared and settles again from the first stage, until none is: what a loop
-//! holds is a function of what it reads, not of the order it read it in. A
-//! loop among the work a settled focus or loop leaves waiting is cleared
-//! before that work is released when no other waiting work lies upstream of
-//! it: run first, its members would only settle on what it held, and so would
-//! everything downstream of it, before it is cleared.
+//! once no source layer is left to rebuild, each loop a fact from outside
+//! moved under since it last settled is cleared and settles again from the
+//! first stage, until none is: what a loop holds is a function of what it
+//! reads, not of the order it read it in. A loop downstream of another,
+//! through derivations of any kind, waits for it to settle. A loop among the
+//! work a settled focus or loop leaves waiting is cleared before that work is
+//! released when no other waiting work lies upstream of it: run first, its
+//! members would only settle on what it held, and so would everything
+//! downstream of it, before it is cleared.
 //!
 //! A run settles in stages (see [`derivation::AnalysisStage`]). Some reads
 //! only have a final answer once nothing can add a fact any more: a field no
@@ -1225,7 +1227,10 @@ impl Engine {
                         }
                         continue;
                     }
-                    if crate::profile::phase("engine: loops", || self.clear_loops(db)) {
+                    // A source layer left to rebuild moves what loops read.
+                    if self.stale_sources.is_empty()
+                        && crate::profile::phase("engine: loops", || self.clear_loops(db))
+                    {
                         continue;
                     }
                     break;
@@ -2192,14 +2197,15 @@ impl Engine {
             })
     }
 
-    /// At quiescence, clears every loop of statements, closed directly or
-    /// through the passes that run once statements settle (see
-    /// [`DerivationKind::closes_loops`]), one of whose statements reads from
-    /// outside the loop a fact that moved since it settled on it:
-    /// each member's primary outputs, and those of whatever shares them, go
-    /// back to the source layer, they run again, and the run starts over from
-    /// the first stage, as a cold build settles a loop through them. Returns
-    /// whether it cleared any.
+    /// At quiescence, once no source layer is left to rebuild, clears every
+    /// loop of statements, closed directly or through the passes that run
+    /// once statements settle (see [`DerivationKind::closes_loops`]), one of
+    /// whose statements reads from outside the loop a fact that moved since
+    /// it settled on it, and that no other such loop lies upstream of (see
+    /// [`Self::upstream_loops`]): each member's primary outputs, and those of
+    /// whatever shares them, go back to the source layer, they run again, and
+    /// the run starts over from the first stage, as a cold build settles a
+    /// loop through them. Returns whether it cleared any.
     fn clear_loops(&mut self, db: &mut DbIndex) -> bool {
         // After a check that cleared loops, what a loop's members read and
         // write, and what their facts hold, moved only through the keys
@@ -2270,15 +2276,58 @@ impl Engine {
         }
         drop(_search);
         self.since_search = Some(FxHashSet::default());
+        let loops = self.upstream_loops(db, loops);
         self.cleared.extend(loops.iter().flatten().copied());
         self.clear(db, &loops);
         true
     }
 
+    /// Of `loops`, those no other of them lies upstream of through
+    /// derivations of any evaluated kind, unless it lies downstream of that
+    /// one too: cleared together, a loop downstream of another would settle
+    /// from what the other held on the way, not from what it settles to. The
+    /// next check searches from the members of the rest, which wait for it.
+    fn upstream_loops(
+        &mut self,
+        db: &DbIndex,
+        loops: Vec<Vec<DerivationId>>,
+    ) -> Vec<Vec<DerivationId>> {
+        if loops.len() < 2 {
+            return loops;
+        }
+        let _order = crate::profile::PhaseGuard::new("loops: order");
+        let graph = db.reader_graph();
+        let members = loops.iter().flatten().copied().collect::<FxHashSet<_>>();
+        // Loops that read one another through any kind share a component.
+        let upstream_members = graph
+            .read_loops(
+                loops.iter().flatten().copied(),
+                |kind| !matches!(kind, DerivationKind::Source | DerivationKind::Diagnostics),
+                |component| component.iter().any(|id| members.contains(id)),
+            )
+            .into_iter()
+            .flatten()
+            .collect::<FxHashSet<_>>();
+        let (upstream, waiting) = loops
+            .into_iter()
+            .partition::<Vec<_>, _>(|lp| upstream_members.contains(&lp[0]));
+        if let Some(keys) = &mut self.since_search {
+            keys.extend(
+                waiting
+                    .iter()
+                    .flatten()
+                    .flat_map(|member| graph.outputs_of(*member))
+                    .cloned(),
+            );
+        }
+        upstream
+    }
+
     /// Once a focus or a loop settled, before the waiting work `released` is
     /// queued: clears the loops [`Self::clear_loops`] would clear once that
     /// work ran that have a member among it, if none of that work, nor a
-    /// source layer still to rebuild, lies upstream of them. Run first, their
+    /// source layer still to rebuild, nor another of those loops (see
+    /// [`Self::upstream_loops`]), lies upstream of them. Run first, their
     /// members would settle on what the loops held, and so would whatever
     /// reads them, all to run again once the loops are cleared. A loop cleared
     /// here that a fact from outside moves under after all is cleared once
@@ -2350,6 +2399,7 @@ impl Engine {
             .into_iter()
             .filter(|lp| !lp.iter().any(|member| downstream.contains(member)))
             .collect::<Vec<_>>();
+        let loops = self.upstream_loops(db, loops);
         if loops.is_empty() {
             return false;
         }
@@ -5891,9 +5941,64 @@ function holder.receiver:Use() end
 
     /// Statements in `FILE`, each at its start with the positions it reads:
     /// each binds at its start the union of what is bound where it reads, so
-    /// a loop of them keeps every value it ever saw until it is cleared.
+    /// a loop of them keeps every value it ever saw until it is cleared. At
+    /// the positions in `exports`, a module export does the same: a kind no
+    /// loop closes through.
     struct Unions {
         reads: Vec<(u32, Vec<u32>)>,
+        exports: Vec<u32>,
+    }
+
+    impl Unions {
+        fn derivation(&self, start: u32) -> DerivationId {
+            if !self.exports.contains(&start) {
+                return statement(start);
+            }
+            DerivationId::new(
+                DerivationKind::ChunkReturn,
+                FileId::new(FILE),
+                LuaSyntaxId::new(
+                    LuaSyntaxKind::Chunk.into(),
+                    TextRange::at(TextSize::new(start), TextSize::new(1)),
+                ),
+            )
+        }
+
+        /// What each of the derivations binds, in order.
+        fn bound(&self, db: &DbIndex) -> Vec<Option<LuaType>> {
+            self.reads
+                .iter()
+                .map(|(start, _)| {
+                    db.get_type_index()
+                        .get_type_cache(&owner(*start))
+                        .map(|cache| cache.as_type().clone())
+                })
+                .collect()
+        }
+
+        /// A workspace the derivations settled in from nothing, `INPUT`
+        /// holding `value`.
+        fn settled_from(&self, value: &str) -> VirtualWorkspace {
+            let mut ws = VirtualWorkspace::new();
+            let db = ws.get_db_mut();
+            bind(db, INPUT, text(value));
+            let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+            for (start, _) in &self.reads {
+                engine.changed(self.derivation(*start));
+            }
+            engine.open(db);
+            assert!(engine.run(db, self, Slice::Whole));
+            ws
+        }
+    }
+
+    /// Turns `INPUT` to `value` under the derivations that read it, and has
+    /// `engine` check them.
+    fn move_input(db: &mut DbIndex, engine: &mut Engine, value: &str) {
+        bind(db, INPUT, text(value));
+        let input = HashedKey::new(FactKey::TypeCache(owner(INPUT)));
+        db.reader_graph().forget_fingerprint(&input);
+        engine.readers_of(db, [&input]);
     }
 
     impl Recipe for Unions {
@@ -5936,52 +6041,24 @@ function holder.receiver:Use() end
         }
     }
 
-    /// What `recipe`'s statements bind, in order, once `INPUT` turns from
-    /// "old" to "new" under them, with the stats of that run; and what they
-    /// bind in a cold build from "new".
+    /// What `recipe`'s derivations bind, in order, once `INPUT` turns from
+    /// "old" to "new" under them in a run that takes files in `schedule`'s
+    /// order, with the stats of that run; and what they bind in a cold build
+    /// from "new".
     fn unions_after_edit(
         recipe: &Unions,
+        schedule: Schedule,
     ) -> (Vec<Option<LuaType>>, EngineStats, Vec<Option<LuaType>>) {
         let _serial = serial_engine();
-        let statements = recipe
-            .reads
-            .iter()
-            .map(|(start, _)| *start)
-            .collect::<Vec<_>>();
-        let bound = |db: &DbIndex| {
-            statements
-                .iter()
-                .map(|start| {
-                    db.get_type_index()
-                        .get_type_cache(&owner(*start))
-                        .map(|cache| cache.as_type().clone())
-                })
-                .collect::<Vec<_>>()
-        };
-        let settled_from = |value: &str| {
-            let mut ws = VirtualWorkspace::new();
-            let db = ws.get_db_mut();
-            bind(db, INPUT, text(value));
-            let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
-            for start in &statements {
-                engine.changed(statement(*start));
-            }
-            engine.open(db);
-            assert!(engine.run(db, recipe, Slice::Whole));
-            ws
-        };
-        let mut warm = settled_from("old");
+        let mut warm = recipe.settled_from("old");
         let db = warm.get_db_mut();
-        bind(db, INPUT, text("new"));
-        let input = HashedKey::new(FactKey::TypeCache(owner(INPUT)));
-        db.reader_graph().forget_fingerprint(&input);
-        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
-        engine.readers_of(db, [&input]);
+        let mut engine = Engine::new(derivation::EditMaps::default(), schedule);
+        move_input(db, &mut engine, "new");
         engine.open(db);
         assert!(engine.run(db, recipe, Slice::Whole));
-        let warm_bound = bound(&*db);
-        let mut cold = settled_from("new");
-        let cold_bound = bound(&*cold.get_db_mut());
+        let warm_bound = recipe.bound(db);
+        let mut cold = recipe.settled_from("new");
+        let cold_bound = recipe.bound(cold.get_db_mut());
         (warm_bound, engine.stats().clone(), cold_bound)
     }
 
@@ -5994,9 +6071,10 @@ function holder.receiver:Use() end
                 (30, vec![INPUT, 40]),
                 (40, vec![30]),
             ],
+            exports: Vec::new(),
         };
 
-        let (warm, stats, cold) = unions_after_edit(&recipe);
+        let (warm, stats, cold) = unions_after_edit(&recipe, Schedule::Canonical);
 
         assert_eq!(warm, cold);
         assert_eq!((stats.loops_cleared, stats.loop_waves), (2, 1));
@@ -6011,9 +6089,10 @@ function holder.receiver:Use() end
                 (30, vec![10, 40]),
                 (40, vec![30]),
             ],
+            exports: Vec::new(),
         };
 
-        let (warm, stats, cold) = unions_after_edit(&recipe);
+        let (warm, stats, cold) = unions_after_edit(&recipe, Schedule::Canonical);
 
         assert_eq!(warm, cold);
         assert_eq!(
@@ -6036,9 +6115,10 @@ function holder.receiver:Use() end
                 (40, vec![30]),
                 (50, vec![10]),
             ],
+            exports: Vec::new(),
         };
 
-        let (warm, stats, cold) = unions_after_edit(&recipe);
+        let (warm, stats, cold) = unions_after_edit(&recipe, Schedule::Canonical);
 
         assert_eq!(warm, cold);
         assert_eq!(
@@ -6048,6 +6128,75 @@ function holder.receiver:Use() end
                 stats.loops_cleared_parked
             ),
             (2, 2, 0)
+        );
+    }
+
+    #[test]
+    fn a_loop_downstream_of_another_only_through_a_pass_loops_leave_out_waits_for_it() {
+        let recipe = Unions {
+            reads: vec![
+                (10, vec![INPUT, 20]),
+                (20, vec![10]),
+                (25, vec![10]),
+                (30, vec![25, 40]),
+                (40, vec![30]),
+            ],
+            exports: vec![25],
+        };
+
+        for schedule in [
+            Schedule::Canonical,
+            Schedule::Reversed,
+            Schedule::Shuffled(7),
+            Schedule::Deferred,
+        ] {
+            let (warm, stats, cold) = unions_after_edit(&recipe, schedule);
+
+            assert_eq!(warm, cold, "{schedule:?}");
+            assert_eq!(
+                (
+                    stats.loops_cleared,
+                    stats.loop_waves,
+                    stats.loops_cleared_parked
+                ),
+                (2, 2, 0),
+                "{schedule:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_loop_clears_once_no_source_layer_is_left_to_rebuild() {
+        let _serial = serial_engine();
+        let recipe = Unions {
+            reads: vec![(10, vec![INPUT, 20]), (20, vec![10])],
+            exports: Vec::new(),
+        };
+        let mut warm = recipe.settled_from("old");
+        let db = warm.get_db_mut();
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        move_input(db, &mut engine, "mid");
+        engine.source_stale(FileId::new(FILE));
+        engine.open(db);
+        assert!(engine.run(db, &recipe, Slice::Whole));
+        let cleared_while_pending = engine.stats().loops_cleared;
+
+        // The rebuilt source layer moves what the loop reads once more.
+        assert_eq!(
+            engine.take_stale_sources(),
+            BTreeSet::from([FileId::new(FILE)])
+        );
+        move_input(db, &mut engine, "new");
+        engine.open(db);
+        assert!(engine.run(db, &recipe, Slice::Whole));
+
+        assert_eq!(
+            (cleared_while_pending, engine.stats().loops_cleared),
+            (0, 1)
+        );
+        assert_eq!(
+            recipe.bound(db),
+            recipe.bound(recipe.settled_from("new").get_db_mut())
         );
     }
 }
