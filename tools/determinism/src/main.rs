@@ -47,6 +47,10 @@
 //!   an evaluation queues wait for the next round. The settled result must
 //!   not depend on the order derivations run in.
 //! - `split:N`: cold build in N batches, compared with the base.
+//! - `rewrite`, `unrewrite`: sweeps of document edits an agent makes:
+//!   three globals defined at the top of every swept file and a parameter
+//!   added to each of its first three functions, settled at once; `unrewrite`
+//!   then puts the original text back and settles again, its oracle the base.
 //! - `touch`, `shift`, `delete`, `recreate`, `rename`: sweeps through
 //!   watched-file events (delete, recreate, rename) or document edits (touch
 //!   appends a comment, shift prepends a newline; any evaluated file outside
@@ -2846,11 +2850,13 @@ impl Harness<'_> {
                         .iter()
                         .map(|target_file| self.recreated_input(target_file)),
                 ),
-                "touch" | "shift" | "delete" | "recreate" | "rename" => inputs.extend(
-                    self.sweep_batches(stage)
-                        .iter()
-                        .map(|(_, files)| sweep_input(stage, files)),
-                ),
+                "touch" | "shift" | "rewrite" | "unrewrite" | "delete" | "recreate" | "rename" => {
+                    inputs.extend(
+                        self.sweep_batches(stage)
+                            .iter()
+                            .map(|(_, files)| sweep_input(stage, files)),
+                    )
+                }
                 _ => {}
             }
         }
@@ -3212,14 +3218,22 @@ impl Harness<'_> {
                 apply_text(&mut warm, uri, *file_id, sweep_edited(stage, text), 1);
             }
             let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
-            let affected = warm.reindex_files(ids.clone());
+            let mut affected = warm.reindex_files(ids.clone());
+            if stage == "unrewrite" {
+                for (_, uri, file_id, text) in &files {
+                    apply_text(&mut warm, uri, *file_id, text.clone(), 2);
+                }
+                affected.extend(warm.reindex_files(ids.clone()));
+            }
             let reach = warm.settled(affected);
+            // A rewrite changes what the files export, so its readers run.
+            let strict = matches!(stage, "touch" | "shift");
             self.finish(
                 &label,
                 warm,
                 &ids,
                 &reach,
-                true,
+                strict,
                 &sweep_input(stage, &files),
             );
         }
@@ -3269,20 +3283,68 @@ impl Harness<'_> {
     }
 }
 
-/// A sweep file's text after the `touch` or `shift` edit.
+/// A sweep file's text after the `touch`, `shift` or `rewrite` edit.
 fn sweep_edited(stage: &str, text: &str) -> String {
     match stage {
         "touch" => format!("{text}\n-- touch\n"),
         "shift" => format!("\n{text}"),
+        "rewrite" | "unrewrite" => agent_rewrite(text),
         _ => unreachable!("{stage} edits no text"),
     }
+}
+
+/// What an agent's light rewrite of a file does in the language-server
+/// scenarios: three globals defined at the top, and a parameter added to each
+/// of the first three `function name(...)` lines that take a fixed list.
+fn agent_rewrite(text: &str) -> String {
+    let mut added = 0;
+    let mut body = String::with_capacity(text.len() + 64);
+    for line in text.split_inclusive('\n') {
+        let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+        let signature = line[indent..]
+            .strip_prefix("function")
+            .filter(|after| after.starts_with([' ', '\t']))
+            .and_then(|after| {
+                let name = after.trim_start_matches([' ', '\t']);
+                let open = name.find('(')?;
+                let valid = name[..open].trim_end().split(['.', ':']).all(|part| {
+                    part.chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                        && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                });
+                let close = name[open..].find(')')? + open;
+                let at = line.len() - name.len();
+                valid.then_some((at + open, at + close))
+            });
+        match signature {
+            Some((open, close))
+                if added < 3 && !line[open + 1..close].trim_end().ends_with("...") =>
+            {
+                added += 1;
+                let params = if line[open + 1..close].trim().is_empty() {
+                    "_scn".to_string()
+                } else {
+                    format!("{}, _scn", &line[open + 1..close])
+                };
+                body.push_str(&line[..open + 1]);
+                body.push_str(&params);
+                body.push_str(&line[close..]);
+            }
+            _ => body.push_str(line),
+        }
+    }
+    format!(
+        "function ScnA_det(a, b) return a + b end\nfunction ScnB_det(self, n) local r = {{}} for i = 1, n do r[i] = i end return r end\nScnV_det = {{ name = \"scn\", count = 3 }}\n{body}"
+    )
 }
 
 /// The cold input a sweep `stage` ends on for `files`.
 fn sweep_input(stage: &str, files: &[SweepFile]) -> ColdInput {
     let removed = || files.iter().map(|(path, ..)| path.clone()).collect();
     match stage {
-        "touch" | "shift" => ColdInput {
+        "unrewrite" => ColdInput::default(),
+        "touch" | "shift" | "rewrite" => ColdInput {
             overrides: files
                 .iter()
                 .map(|(path, _, _, text)| (path.clone(), sweep_edited(stage, text)))
@@ -3374,6 +3436,8 @@ fn run() {
                         | "exact"
                         | "touch"
                         | "shift"
+                        | "rewrite"
+                        | "unrewrite"
                         | "delete"
                         | "recreate"
                         | "rename"
@@ -3491,7 +3555,7 @@ fn run() {
                 "noop" => harness.noop(&targets),
                 "reload" => harness.reload(),
                 "exact" => harness.exact(&targets),
-                "touch" | "shift" => harness.sweep_edit(stage),
+                "touch" | "shift" | "rewrite" | "unrewrite" => harness.sweep_edit(stage),
                 "delete" => harness.sweep_delete(),
                 "recreate" => harness.sweep_recreate(),
                 "rename" => harness.sweep_rename(),
