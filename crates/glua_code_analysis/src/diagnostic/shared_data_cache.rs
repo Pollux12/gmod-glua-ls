@@ -10,8 +10,7 @@ use super::checker::{
     PrecomputedCalleeRealmMap, PrecomputedMissingRequiredFields, PrecomputedRealmCallCandidates,
     SharedDiagnosticData, SortedSendFlowCache, fold_gm_method_realms, fold_required_fields,
     gm_method_realm_annotations, own_field_requirements, own_fields_owner,
-    precompute_property_name_candidates, precompute_sorted_send_flows,
-    resolve_file_callee_realms,
+    precompute_property_name_candidates, precompute_sorted_send_flows, resolve_file_callee_realms,
 };
 use crate::db_index::derivation::{
     self, DerivationId, DerivationKind, FactKey, Fingerprint, HashedKey,
@@ -37,7 +36,10 @@ impl<T> Recorded<T> {
     /// records, with the fingerprints they read now.
     fn compute(db: &DbIndex, f: impl FnOnce() -> T) -> Self {
         let (value, keys) = derivation::detached(unit_id(), f);
-        let keys = keys.into_iter().map(read_out_of_base).collect::<FxHashSet<_>>();
+        let keys = keys
+            .into_iter()
+            .map(read_out_of_base)
+            .collect::<FxHashSet<_>>();
         let reads = keys
             .into_iter()
             .map(|key| {
@@ -247,8 +249,9 @@ fn refresh(db: &DbIndex, state: &mut CacheState) -> Arc<SharedDiagnosticData> {
             ));
         });
         s.spawn(|_| {
-            sorted_send_flows = Some(crate::profile::phase("shared diagnostics: send flows", || {
-                match held_send_flows {
+            sorted_send_flows = Some(crate::profile::phase(
+                "shared diagnostics: send flows",
+                || match held_send_flows {
                     Some(held) if held.holds(db) => (held, false),
                     _ => (
                         Recorded::compute(db, || {
@@ -259,8 +262,8 @@ fn refresh(db: &DbIndex, state: &mut CacheState) -> Arc<SharedDiagnosticData> {
                         }),
                         true,
                     ),
-                }
-            }));
+                },
+            ));
         });
         s.spawn(|_| {
             property_name_candidates = Some(crate::profile::phase(
@@ -274,8 +277,7 @@ fn refresh(db: &DbIndex, state: &mut CacheState) -> Arc<SharedDiagnosticData> {
     let (required_fields, type_chains, own_fields) =
         required_fields.expect("required fields refresh ran");
     let (sorted_send_flows, send_flows) = sorted_send_flows.expect("send flow refresh ran");
-    let property_name_candidates =
-        property_name_candidates.expect("property name candidates ran");
+    let property_name_candidates = property_name_candidates.expect("property name candidates ran");
 
     state.rebuilt = Rebuilt {
         realm_files,
@@ -362,7 +364,11 @@ fn refresh_realms(
         .into_par_iter()
         .map(|(file_id, held)| match held {
             Some(held) if held.holds(db) => (file_id, held, false),
-            held => (file_id, compute_file_realms(db, file_id, held.as_ref()), true),
+            held => (
+                file_id,
+                compute_file_realms(db, file_id, held.as_ref()),
+                true,
+            ),
         })
         .collect::<Vec<_>>();
     let rebuilt = units
@@ -513,9 +519,8 @@ fn refresh_required_fields(
         .map(|(owner_id, held)| match held {
             Some(held) if held.holds(db) => (owner_id, held, false),
             held => {
-                let Recorded { value, reads } = Recorded::compute(db, || {
-                    own_field_requirements(db, &owner_id, &mut || false)
-                });
+                let Recorded { value, reads } =
+                    Recorded::compute(db, || own_field_requirements(db, &owner_id, &mut || false));
                 let held = held.and_then(|held| held.value);
                 let value = value.map(|own| keep_equal(held.as_ref(), own));
                 (owner_id, Recorded { value, reads }, true)
@@ -699,7 +704,11 @@ mod tests {
         let api_uri = ws
             .virtual_url_generator
             .new_uri("lua/autorun/server/sv_api.lua");
-        let api_file = write(&mut ws, &api_uri, "function ServerOnlyApi() return true end\n");
+        let api_file = write(
+            &mut ws,
+            &api_uri,
+            "function ServerOnlyApi() return true end\n",
+        );
         let caller_uri = ws
             .virtual_url_generator
             .new_uri("lua/autorun/client/cl_use.lua");
@@ -773,9 +782,7 @@ mod tests {
     #[test]
     fn invalidation_drops_every_unit() {
         let mut ws = workspace();
-        let uri = ws
-            .virtual_url_generator
-            .new_uri("lua/autorun/shared/a.lua");
+        let uri = ws.virtual_url_generator.new_uri("lua/autorun/shared/a.lua");
         let file = write(&mut ws, &uri, "function Alpha() return 1 end\n");
         let cache = SharedDiagnosticComponentCache::new();
         build_matching_cold(&ws, &cache, &[file]);

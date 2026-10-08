@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use glua_code_analysis::{EmmyLuaAnalysis, FileId};
 use lsp_types::{Diagnostic, PublishDiagnosticsParams, Uri};
+use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -118,6 +119,8 @@ pub struct DiagnosticStore {
     /// `GLUALS_DIAG_VERIFY`: every stored result is checked against a fresh
     /// computation, and a difference logged as `LS_DIAG_DRIFT`.
     verify: bool,
+    /// Whether workers were started: without them no job is ever claimed.
+    working: std::sync::atomic::AtomicBool,
 }
 
 impl DiagnosticStore {
@@ -136,6 +139,7 @@ impl DiagnosticStore {
             idle: Notify::new(),
             client,
             verify: std::env::var_os("GLUALS_DIAG_VERIFY").is_some(),
+            working: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -153,6 +157,8 @@ impl DiagnosticStore {
         debounced: Arc<DebouncedAnalysis>,
         shutdown: CancellationToken,
     ) {
+        self.working
+            .store(true, std::sync::atomic::Ordering::Release);
         for _ in 0..workers.max(1) {
             let store = self.clone();
             let debounced = debounced.clone();
@@ -237,6 +243,45 @@ impl DiagnosticStore {
                 version: Some(version),
             });
         }
+    }
+
+    /// Resolve when a computation finishes and when a file turns dirty, the
+    /// two events that can end [`Self::edited_work_pending`].
+    pub fn progress(&self) -> (Notified<'_>, Notified<'_>) {
+        (self.computed.notified(), self.dirtied.notified())
+    }
+
+    /// Whether a file is being computed or a worker could claim a dirty Edited
+    /// file now: its text was taken and the re-analysis has no work left in it.
+    /// Counts the workers as started without spawning any, so queued jobs
+    /// stay unclaimed.
+    #[cfg(test)]
+    pub(crate) fn mark_working(&self) {
+        self.working
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub async fn edited_work_pending(&self, debounced: &DebouncedAnalysis) -> bool {
+        if !self.working.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        let edited = {
+            let state = self.state();
+            if !state.computing.is_empty() {
+                return true;
+            }
+            state
+                .queue
+                .iter()
+                .take_while(|&&(priority, _, _)| priority == Priority::Edited)
+                .map(|&(_, _, file_id)| file_id)
+                .collect::<Vec<_>>()
+        };
+        !edited.is_empty()
+            && debounced
+                .first_ready_for_diagnostics(&edited)
+                .await
+                .is_some()
     }
 
     /// The priority `file_id` waits at to be computed, if it is dirty.

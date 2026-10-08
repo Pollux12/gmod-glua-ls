@@ -888,36 +888,47 @@ impl DebouncedAnalysis {
         self.in_flight_change_count() == 0
     }
 
-    /// Once the edited files settled, waits while changes are still
-    /// arriving: what their settled focus released would otherwise carry a
-    /// passing state of the text into the rest of the workspace, only for the
-    /// next change to carry it back out. Ends once no change has arrived for
-    /// a debounce, at the next change, or for a request that has to wait.
+    /// Once the edited files settled, holds back the work their settled focus
+    /// released while their diagnostics are computed, so the next slice does
+    /// not take the write lock between two of them, and while changes are still
+    /// arriving: that work would otherwise carry a passing state of the text
+    /// into the rest of the workspace, only for the next change to carry it back
+    /// out. Ends once neither holds, at the next change, or for a request that
+    /// has to wait.
     async fn hold_while_editing(&self) {
+        let store = self.file_diagnostic.store();
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+            let (computed, dirtied) = store.progress();
+            tokio::pin!(computed);
+            tokio::pin!(dirtied);
+            computed.as_mut().enable();
+            dirtied.as_mut().enable();
+            if self.waiting_requests.load(Ordering::Acquire) > 0
+                || self.refused_request.load(Ordering::Acquire)
+                || self.in_flight_change_count() > 0
+                || !self.pending_files.lock().await.is_empty()
+            {
+                return;
+            }
             let quiet_at = self
                 .last_change
                 .lock()
                 .ok()
                 .and_then(|last_change| *last_change)
                 .map(|at| at + self.debounce_duration);
-            let Some(quiet_at) = quiet_at else {
-                return;
-            };
-            if Instant::now() >= quiet_at
-                || self.waiting_requests.load(Ordering::Acquire) > 0
-                || self.in_flight_change_count() > 0
-                || !self.pending_files.lock().await.is_empty()
-            {
+            let typing = quiet_at.is_some_and(|quiet_at| Instant::now() < quiet_at);
+            if !typing && !store.edited_work_pending(self).await {
                 return;
             }
             tokio::select! {
                 _ = notified => {}
+                _ = computed => {}
+                _ = dirtied => {}
                 _ = self.shutdown.cancelled() => return,
-                _ = tokio::time::sleep_until(quiet_at.into()) => return,
+                _ = tokio::time::sleep_until(quiet_at.unwrap_or_else(Instant::now).into()), if typing => {}
             }
         }
     }
@@ -1240,7 +1251,15 @@ mod tests {
     }
 
     fn test_debounced_analysis_with_debounce(debounce_ms: u64) -> Arc<DebouncedAnalysis> {
-        let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
+        debounced_analysis_over(Arc::new(RwLock::new(EmmyLuaAnalysis::new())), debounce_ms)
+    }
+
+    /// A debounced analysis over `analysis` whose diagnostic workers are not
+    /// started.
+    fn debounced_analysis_over(
+        analysis: Arc<RwLock<EmmyLuaAnalysis>>,
+        debounce_ms: u64,
+    ) -> Arc<DebouncedAnalysis> {
         let (connection, _peer) = Connection::memory();
         let client = Arc::new(ClientProxy::new(connection));
         let status_bar = Arc::new(StatusBar::new(client.clone(), true));
@@ -1413,6 +1432,116 @@ mod tests {
             verify_that!(debounced_analysis.slice_can_start().await, eq(false))?;
             in_flight.finish().await;
             verify_that!(debounced_analysis.slice_can_start().await, eq(true))?;
+            Ok(())
+        })
+    }
+
+    /// The edited files' diagnostics are published before the re-analysis
+    /// resumes: once the hold ends, the next slice's write lock finds them out.
+    #[gtest]
+    fn the_edited_files_diagnostics_are_published_before_the_re_analysis_resumes() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let mut analysis = EmmyLuaAnalysis::new();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_edited_first");
+            analysis.add_main_workspace(workspace.clone());
+            analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::UndefinedGlobal);
+            let uri = file_path_to_uri(&workspace.join("lua/edited_first/edited.lua"))
+                .expect("URI should parse");
+            let (file_id, _) = analysis
+                .update_file_by_uri(&uri, Some("Missing()\n".to_string()))
+                .expect("file id");
+            let analysis = Arc::new(RwLock::new(analysis));
+            let (debounced_analysis, peer) = loop_test_debounced_analysis(analysis.clone());
+            debounced_analysis
+                .file_diagnostic
+                .store()
+                .invalidate([file_id], &[file_id]);
+
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                debounced_analysis.hold_while_editing(),
+            )
+            .await
+            .expect("the hold ends once the edited file is diagnosed");
+            let next_slice = analysis.write().await;
+            let published = peer
+                .receiver
+                .try_iter()
+                .filter_map(|message| publish_params(&message))
+                .filter(|params| params.uri == uri)
+                .collect::<Vec<_>>();
+            drop(next_slice);
+
+            verify_that!(published.len(), eq(1))?;
+            verify_that!(
+                has_diagnostic_code(&published[0].diagnostics, DiagnosticCode::UndefinedGlobal),
+                eq(true)
+            )?;
+            debounced_analysis.shutdown.cancel();
+            Ok(())
+        })
+    }
+
+    /// Edited files whose diagnostics wait hold the re-analysis back only until
+    /// a change arrives, a request has to wait, or the server shuts down.
+    #[gtest]
+    fn waiting_for_the_edited_diagnostics_ends_for_a_change_a_request_or_shutdown() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let mut analysis = EmmyLuaAnalysis::new();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_edited_escape");
+            analysis.add_main_workspace(workspace.clone());
+            let uri = file_path_to_uri(&workspace.join("lua/edited_escape/edited.lua"))
+                .expect("URI should parse");
+            let (file_id, _) = analysis
+                .update_file_by_uri(&uri, Some("Value = 1\n".to_string()))
+                .expect("file id");
+            let debounced_analysis = debounced_analysis_over(Arc::new(RwLock::new(analysis)), 0);
+            let store = debounced_analysis.file_diagnostic.store();
+            store.mark_working();
+            store.invalidate([file_id], &[file_id]);
+            let held = || {
+                tokio::spawn({
+                    let debounced_analysis = debounced_analysis.clone();
+                    async move { debounced_analysis.hold_while_editing().await }
+                })
+            };
+            let ends = |hold: tokio::task::JoinHandle<()>| async move {
+                tokio::time::timeout(Duration::from_secs(5), hold)
+                    .await
+                    .expect("the hold must end")
+                    .expect("the hold must not panic");
+            };
+
+            let hold = held();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            verify_that!(hold.is_finished(), eq(false))?;
+            let waiting = debounced_analysis.request_waiting();
+            ends(hold).await;
+            drop(waiting);
+
+            let hold = held();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            verify_that!(hold.is_finished(), eq(false))?;
+            let in_flight = debounced_analysis.begin_in_flight_change();
+            ends(hold).await;
+            in_flight.finish().await;
+
+            let hold = held();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            verify_that!(hold.is_finished(), eq(false))?;
+            debounced_analysis.schedule(file_id, uri).await;
+            ends(hold).await;
+            debounced_analysis.pending_files.lock().await.clear();
+
+            let hold = held();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            verify_that!(hold.is_finished(), eq(false))?;
+            debounced_analysis.shutdown.cancel();
+            ends(hold).await;
             Ok(())
         })
     }

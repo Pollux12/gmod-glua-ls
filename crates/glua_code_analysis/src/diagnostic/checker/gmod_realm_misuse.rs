@@ -1565,9 +1565,7 @@ pub fn resolve_file_callee_realms(
 }
 
 /// Every file's GM method realm annotations, in the index's order.
-pub fn gm_method_realm_annotations(
-    db: &crate::DbIndex,
-) -> Vec<(FileId, Vec<(String, GmodRealm)>)> {
+pub fn gm_method_realm_annotations(db: &crate::DbIndex) -> Vec<(FileId, Vec<(String, GmodRealm)>)> {
     db.get_gmod_infer_index()
         .iter_gm_method_realm_annotations()
         .map(|(file_id, method_realms)| (*file_id, method_realms.clone()))

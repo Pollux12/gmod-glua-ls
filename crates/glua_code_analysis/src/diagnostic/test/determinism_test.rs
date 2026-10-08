@@ -346,7 +346,9 @@ mod tests {
             })
             .expect("expected library declaration");
         assert_that!(
-            precomputed.get(&LuaSemanticDeclId::LuaDecl(library_decl_id)).is_some(),
+            precomputed
+                .get(&LuaSemanticDeclId::LuaDecl(library_decl_id))
+                .is_some(),
             eq(true)
         );
     }

@@ -392,9 +392,13 @@ fn get_required_fields_for_types(
     types: &[LuaType],
     mut is_cancelled: impl FnMut() -> bool,
 ) -> Option<HashSet<String>> {
-    Some(fold_required_fields(types, &mut is_cancelled, |type_decl_id, is_cancelled| {
-        own_field_requirements(db, type_decl_id, is_cancelled).map(Arc::new)
-    }))
+    Some(fold_required_fields(
+        types,
+        &mut is_cancelled,
+        |type_decl_id, is_cancelled| {
+            own_field_requirements(db, type_decl_id, is_cancelled).map(Arc::new)
+        },
+    ))
 }
 
 /// What one type's own members require of a table literal, and the names
