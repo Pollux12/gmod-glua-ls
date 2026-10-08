@@ -261,14 +261,14 @@ impl Recipes {
             .push((file_id, cache));
     }
 
-    /// Commits the transaction and clears the local state of every memo held
+    /// Commits the transaction and parks every memo held
     /// by [`Self::settle_later`], concurrently, and returns it to the store.
     /// Inside a superstep task it settles the memos of the task's files
     /// alone, in place.
     fn settle_caches(&self) {
         let settle = |(file_id, mut cache): (FileId, crate::LuaInferCache)| {
             cache.commit_transaction();
-            cache.clear();
+            cache.park();
             self.store_cache(file_id, cache);
         };
         let mut held = self.unsettled.lock().expect("unsettled memos");
@@ -511,7 +511,7 @@ impl Recipes {
         f(db, &mut context);
         unresolve::resolve_inline(db, &mut context);
         if let Some(mut cache) = context.infer_manager.take_file(file_id) {
-            cache.clear();
+            cache.park();
             self.caches
                 .lock()
                 .expect("cache store")

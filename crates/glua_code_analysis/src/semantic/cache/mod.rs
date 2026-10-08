@@ -833,6 +833,48 @@ impl LuaInferCache {
         empty(&mut self.signature_is_generic_cache.0);
     }
 
+    /// [`Self::clear`]s a memo stored between evaluations, and frees the room
+    /// its local values took.
+    pub fn park(&mut self) {
+        for key in std::mem::take(&mut self.flow_local_keys) {
+            if let Some(entries) = self.flow_node_cache.get_mut(&key) {
+                entries.clear_local();
+                entries.release_local();
+            }
+        }
+        for key in std::mem::take(&mut self.keyed_flow_local_keys) {
+            if let Some(entries) = self.keyed_flow_node_cache.get_mut(&key) {
+                entries.clear_local();
+                entries.release_local();
+            }
+        }
+        self.clear();
+        macro_rules! release {
+            ($($field:ident),+ $(,)?) => {
+                $(self.$field.release_local();)+
+            };
+        }
+        release!(
+            expr_cache,
+            member_query_cache,
+            call_arg_types_cache,
+            condition_flow_cache,
+            flow_node_realm_cache,
+            numeric_table_index_query_cache,
+            branch_special_call_effect_cache,
+            expr_var_ref_id_cache,
+            self_type_cache,
+            dynamic_field_resolution_cache,
+            exact_table_member_cache,
+            local_class_table_member_ids_cache,
+            dynamic_field_type_cache,
+            dynamic_field_definition_syntax_cache,
+            call_returns_never_cache,
+            owner_raw_member_type_cache,
+            root_gamemode_class_cache,
+        );
+    }
+
     /// Discards the inference a wave of deferred resolution can have
     /// invalidated.
     pub fn clear_deferred_inference_results(&mut self) {
@@ -1110,7 +1152,10 @@ impl LuaInferCache {
     ) {
         let key = (syntax_id, args_count);
         let Some(provenance) = provenance else {
-            let bucket = self.call_cache_local.entry(key).or_default();
+            let bucket = self
+                .call_cache_local
+                .entry(key)
+                .or_insert_with(|| Vec::with_capacity(1));
             match bucket.iter_mut().find(|(ty, _)| *ty == call_expr_type) {
                 Some(slot) => *slot = (call_expr_type, entry),
                 None => bucket.push((call_expr_type, entry)),
@@ -1121,7 +1166,11 @@ impl LuaInferCache {
             bucket.retain(|(ty, _)| *ty != call_expr_type);
         }
         self.capture_call(&key);
-        let bucket = self.call_cache.entry(key).or_default();
+        // Almost every call site holds one entry: a bucket starts sized for it.
+        let bucket = self
+            .call_cache
+            .entry(key)
+            .or_insert_with(|| Vec::with_capacity(1));
         match bucket.iter_mut().find(|(ty, _, _)| *ty == call_expr_type) {
             Some(slot) => *slot = (call_expr_type, entry, provenance),
             None => bucket.push((call_expr_type, entry, provenance)),

@@ -123,6 +123,13 @@ impl<K: Hash + Eq + Clone, V> TrackedMap<K, V> {
         }
     }
 
+    /// Frees the room local values took once none is left.
+    pub(super) fn release_local(&mut self) {
+        if self.local.is_empty() && self.local.capacity() != 0 {
+            self.local = FxHashMap::default();
+        }
+    }
+
     pub fn clear(&mut self) {
         self.local.clear();
         if self.shared.is_empty() {
