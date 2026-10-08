@@ -3157,11 +3157,17 @@ impl LuaTypeIndex {
     }
 
     /// Rewrites every cached type, definition fact and inference-support array
-    /// that names an identity in the edited file.
+    /// that names an identity in the edited file, except the types of
+    /// `rebuilt`, which the file's re-indexed source layer wrote at the new
+    /// positions already.
     ///
     /// Returns the files whose entry named something the edit destroyed: those
     /// cannot be rewritten and have to be re-analysed instead.
-    pub fn remap_file_identities(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
+    pub fn remap_file_identities(
+        &mut self,
+        remap: &crate::FileRemap,
+        rebuilt: &HashSet<LuaTypeOwner>,
+    ) -> HashSet<FileId> {
         let mut dirty = HashSet::default();
 
         // Only caches that actually name an identity in the edited file can
@@ -3179,6 +3185,9 @@ impl LuaTypeIndex {
         let mut updates = Vec::new();
         let mut statement_updates = Vec::new();
         for owner in candidate_owners {
+            if rebuilt.contains(&owner) {
+                continue;
+            }
             if let Some(statement) = self.statement_type(&owner)
                 && let Some(cache) = &statement.cache
             {
@@ -5071,7 +5080,7 @@ mod batch_removal_tests {
 
         // An insertion at offset 3 shifts everything after it by two.
         let remap = FileRemap::unvalidated(edited, PositionMap::new("abcdef", "abcXXdef"));
-        index.remap_file_identities(&remap);
+        index.remap_file_identities(&remap, &HashSet::default());
         assert_reverse_maps_consistent(&index);
 
         assert_eq!(
@@ -5118,7 +5127,11 @@ mod remap_walker_tests {
         let mut index = LuaTypeIndex::new();
         index.bind_definition_fact(definition, LuaTypeFact::certain(instance(3, 5)));
         let insertion = FileRemap::unvalidated(source, PositionMap::new("abcde", "XXabcde"));
-        assert!(index.remap_file_identities(&insertion).is_empty());
+        assert!(
+            index
+                .remap_file_identities(&insertion, &HashSet::default())
+                .is_empty()
+        );
         assert_eq!(
             index.get_definition_fact(&definition).unwrap().typ(),
             &instance(5, 7),
@@ -5126,7 +5139,7 @@ mod remap_walker_tests {
 
         let deletion = FileRemap::unvalidated(source, PositionMap::new("XXabcde", "XXa"));
         assert_eq!(
-            index.remap_file_identities(&deletion),
+            index.remap_file_identities(&deletion, &HashSet::default()),
             [consumer].into_iter().collect(),
         );
     }

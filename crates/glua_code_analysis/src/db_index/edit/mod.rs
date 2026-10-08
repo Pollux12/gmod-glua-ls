@@ -32,7 +32,20 @@ pub fn remap_into_file(db: &mut DbIndex, remap: &FileRemap) -> HashSet<FileId> {
 
     let pass = db.get_signature_index_mut().remap_payload_types(remap);
     dirty.extend(pass);
-    let pass = db.get_type_index_mut().remap_file_identities(remap);
+    // The edited file's own types, written by its re-indexed source layer,
+    // already name its new positions.
+    let rebuilt = db
+        .reader_graph()
+        .derivations_of_file(remap.file_id)
+        .flat_map(|id| db.reader_graph().outputs_of(id))
+        .filter_map(|key| match key.key() {
+            crate::db_index::derivation::FactKey::TypeCache(owner) => Some(owner.clone()),
+            _ => None,
+        })
+        .collect::<rustc_hash::FxHashSet<_>>();
+    let pass = db
+        .get_type_index_mut()
+        .remap_file_identities(remap, &rebuilt);
     dirty.extend(pass);
     let pass = db
         .get_dynamic_field_index_mut()

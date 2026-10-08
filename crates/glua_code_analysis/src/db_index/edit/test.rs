@@ -812,6 +812,40 @@ fn a_cross_file_signature_cache_survives_a_collision_at_its_old_offset() {
     expect_that!(live.contains(&u32::from(mapped_pos)), is_true());
 }
 
+/// The edited file's own types are written at the new positions by its
+/// re-indexed source layer, so remapping them again would shift them twice;
+/// here the second shift lands `fa` exactly on `fb`'s closure.
+#[gtest]
+fn an_edited_files_own_signature_types_shift_once() {
+    let first = "function fa(x) end\nfunction fb(y, z) end\n";
+    let second = "local pad = 123456\nfunction fa(x) end\nfunction fb(y, z) end\n";
+    // Fixture guard: the inserted line is as long as `fa`'s, so a second shift
+    // moves `fa`'s closure onto `fb`'s.
+    expect_that!(second.find('\n'), eq(first.find('\n')));
+
+    let mut ws = workspace();
+    let uri = ws.virtual_url_generator.new_uri("lua/provider.lua");
+    let file_id = write(&mut ws, &uri, first);
+    edit_and_reevaluated(&mut ws, &uri, file_id, second);
+
+    let mut cold = workspace();
+    let cold_uri = cold.virtual_url_generator.new_uri("lua/provider.lua");
+    let cold_id = write(&mut cold, &cold_uri, second);
+
+    let positions = |db: &DbIndex, file_id| {
+        let mut found = cached_signature_ids(db, file_id)
+            .iter()
+            .map(|id| u32::from(id.get_position()))
+            .collect::<Vec<_>>();
+        found.sort();
+        found
+    };
+    expect_that!(
+        positions(ws.analysis.compilation.get_db(), file_id),
+        eq(&positions(cold.analysis.compilation.get_db(), cold_id))
+    );
+}
+
 /// A same-length edit still destroys what it replaced: an identity mapping
 /// onto its own offset is not evidence it survived, so the dependent must be
 /// re-analysed rather than left pointing at the replacement bytes.
