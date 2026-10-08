@@ -44,6 +44,14 @@ pub struct LuaSignature {
     /// returns may be refreshed when the inherited contract settles; explicit
     /// doc-tag returns may not.
     pub return_filled_from_slot: bool,
+    /// The facts few signatures carry; `None` exactly when all are empty.
+    facts: Option<Box<SignatureFacts>>,
+    pub return_cast: Option<super::LuaSignatureCast>,
+}
+
+/// Parameter/return relations inferred from a function body.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SignatureFacts {
     require_guard_param: Option<usize>,
     nil_return_guard_params: Vec<usize>,
     return_correlations: Vec<LuaReturnCorrelation>,
@@ -53,7 +61,6 @@ pub struct LuaSignature {
     class_name_param_return_alias: Option<usize>,
     falsy_param_nil_free_return_slots: Vec<LuaFalsyParamNilFreeReturnSlot>,
     falsy_param_return_aliases: Vec<LuaFalsyParamReturnAlias>,
-    pub return_cast: Option<super::LuaSignatureCast>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -133,13 +140,13 @@ impl Hash for LuaSignature {
         self.is_vararg.hash(state);
         self.params_filled_from_slot.hash(state);
         self.return_filled_from_slot.hash(state);
-        self.require_guard_param.hash(state);
-        self.nil_return_guard_params.hash(state);
-        self.return_correlations.hash(state);
-        self.direct_param_return_alias.hash(state);
-        self.class_name_param_return_alias.hash(state);
-        self.falsy_param_nil_free_return_slots.hash(state);
-        self.falsy_param_return_aliases.hash(state);
+        self.require_guard_param().hash(state);
+        self.nil_return_guard_params().hash(state);
+        self.return_correlations().hash(state);
+        self.direct_param_return_alias().hash(state);
+        self.class_name_param_return_alias().hash(state);
+        self.falsy_param_nil_free_return_slots().hash(state);
+        self.falsy_param_return_aliases().hash(state);
         self.return_cast.hash(state);
     }
 }
@@ -166,23 +173,33 @@ impl LuaSignature {
             is_vararg: false,
             params_filled_from_slot: false,
             return_filled_from_slot: false,
-            require_guard_param: None,
-            nil_return_guard_params: Vec::new(),
-            return_correlations: Vec::new(),
-            direct_param_return_alias: None,
-            class_name_param_return_alias: None,
-            falsy_param_nil_free_return_slots: Vec::new(),
-            falsy_param_return_aliases: Vec::new(),
+            facts: None,
             return_cast: None,
         }
     }
 
+    fn facts_mut(&mut self) -> &mut SignatureFacts {
+        self.facts.get_or_insert_default()
+    }
+
     pub fn return_correlations(&self) -> &[LuaReturnCorrelation] {
-        &self.return_correlations
+        match &self.facts {
+            Some(facts) => &facts.return_correlations,
+            None => &[],
+        }
     }
 
     pub fn set_return_correlations(&mut self, correlations: Vec<LuaReturnCorrelation>) {
-        self.return_correlations = correlations;
+        match &mut self.facts {
+            Some(facts) => {
+                facts.return_correlations = correlations;
+                if **facts == SignatureFacts::default() {
+                    self.facts = None;
+                }
+            }
+            None if correlations.is_empty() => {}
+            None => self.facts_mut().return_correlations = correlations,
+        }
     }
 
     pub fn return_correlation_implies(
@@ -190,44 +207,47 @@ impl LuaSignature {
         discriminant_slot: usize,
         implied_slot: usize,
     ) -> bool {
-        self.return_correlations.iter().any(|correlation| {
+        self.return_correlations().iter().any(|correlation| {
             correlation.discriminant_slot == discriminant_slot
                 && correlation.implied_non_nil_slots.contains(&implied_slot)
         })
     }
 
     pub fn set_direct_param_return_alias(&mut self, param_idx: usize) {
-        self.direct_param_return_alias = Some(param_idx);
+        self.facts_mut().direct_param_return_alias = Some(param_idx);
     }
 
     pub fn direct_param_return_alias(&self) -> Option<usize> {
-        self.direct_param_return_alias
+        self.facts.as_ref()?.direct_param_return_alias
     }
 
     pub fn set_class_name_param_return_alias(&mut self, param_idx: usize) {
-        self.class_name_param_return_alias = Some(param_idx);
+        self.facts_mut().class_name_param_return_alias = Some(param_idx);
     }
 
     pub fn class_name_param_return_alias(&self) -> Option<usize> {
-        self.class_name_param_return_alias
+        self.facts.as_ref()?.class_name_param_return_alias
     }
 
     pub fn require_guard_param(&self) -> Option<usize> {
-        self.require_guard_param
+        self.facts.as_ref()?.require_guard_param
     }
 
     pub fn set_require_guard_param(&mut self, param_idx: usize) {
-        self.require_guard_param = Some(param_idx);
+        self.facts_mut().require_guard_param = Some(param_idx);
     }
 
     pub fn add_nil_return_guard_param(&mut self, param_idx: usize) {
-        if !self.nil_return_guard_params.contains(&param_idx) {
-            self.nil_return_guard_params.push(param_idx);
+        if !self.nil_return_guard_params().contains(&param_idx) {
+            self.facts_mut().nil_return_guard_params.push(param_idx);
         }
     }
 
     pub fn nil_return_guard_params(&self) -> &[usize] {
-        &self.nil_return_guard_params
+        match &self.facts {
+            Some(facts) => &facts.nil_return_guard_params,
+            None => &[],
+        }
     }
 
     pub fn add_falsy_param_nil_free_return_slot(&mut self, param_idx: usize, return_slot: usize) {
@@ -235,13 +255,18 @@ impl LuaSignature {
             param_idx,
             return_slot,
         };
-        if !self.falsy_param_nil_free_return_slots.contains(&fact) {
-            self.falsy_param_nil_free_return_slots.push(fact);
+        if !self.falsy_param_nil_free_return_slots().contains(&fact) {
+            self.facts_mut()
+                .falsy_param_nil_free_return_slots
+                .push(fact);
         }
     }
 
     pub fn falsy_param_nil_free_return_slots(&self) -> &[LuaFalsyParamNilFreeReturnSlot] {
-        &self.falsy_param_nil_free_return_slots
+        match &self.facts {
+            Some(facts) => &facts.falsy_param_nil_free_return_slots,
+            None => &[],
+        }
     }
 
     pub fn add_falsy_param_return_alias(
@@ -255,13 +280,16 @@ impl LuaSignature {
             aliased_param_idx,
             return_slot,
         };
-        if !self.falsy_param_return_aliases.contains(&fact) {
-            self.falsy_param_return_aliases.push(fact);
+        if !self.falsy_param_return_aliases().contains(&fact) {
+            self.facts_mut().falsy_param_return_aliases.push(fact);
         }
     }
 
     pub fn falsy_param_return_aliases(&self) -> &[LuaFalsyParamReturnAlias] {
-        &self.falsy_param_return_aliases
+        match &self.facts {
+            Some(facts) => &facts.falsy_param_return_aliases,
+            None => &[],
+        }
     }
 
     pub fn is_generic(&self) -> bool {
@@ -277,8 +305,8 @@ impl LuaSignature {
             type_contains_str_tpl_ref(&param_info.type_ref)
                 || param_info.get_attribute_by_name("constructor").is_some()
         }) || !self.out_params.is_empty()
-            || self.direct_param_return_alias.is_some()
-            || self.class_name_param_return_alias.is_some()
+            || self.direct_param_return_alias().is_some()
+            || self.class_name_param_return_alias().is_some()
             || self
                 .overloads
                 .iter()
