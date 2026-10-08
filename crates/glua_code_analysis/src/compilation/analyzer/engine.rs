@@ -276,6 +276,78 @@ impl Queue {
             .collect()
     }
 
+    /// [`Self::take_rank`] bounded to the files, in order, whose entries come
+    /// to `entries`, with the file that reaches it whole; the workspace's
+    /// entries stay queued until the rank's last files are taken.
+    fn take_rank_bounded(
+        &mut self,
+        rank: u8,
+        entries: usize,
+    ) -> Vec<(crate::FileId, Vec<(DerivationId, Reason)>)> {
+        let Some(cut) = self.rank_cut(rank, entries) else {
+            return self.take_rank(rank);
+        };
+        let mut taken = Vec::new();
+        for reason in [Reason::Changed, Reason::Read] {
+            let mut from = self
+                .order
+                .split_off(&(rank, reason, 0, DerivationId::floor()));
+            let mut after = from.split_off(&(rank, reason, cut, DerivationId::floor()));
+            self.order.append(&mut after);
+            taken.extend(from);
+        }
+        let mut by_file = BTreeMap::<_, Vec<_>>::new();
+        for (entry_rank, reason, file_key, id) in taken {
+            if id.file_id == crate::FileId::VIRTUAL {
+                self.order.insert((entry_rank, reason, file_key, id));
+                continue;
+            }
+            self.reasons.remove(&id);
+            by_file
+                .entry((file_key, id.file_id))
+                .or_default()
+                .push((id, reason));
+        }
+        by_file
+            .into_iter()
+            .map(|((_, file_id), entries)| (file_id, entries))
+            .collect()
+    }
+
+    /// The file key [`Self::take_rank_bounded`] stops before: that of the
+    /// first file after those, in order, whose entries come to `entries`.
+    /// `None` when the rank's files come to no more.
+    fn rank_cut(&self, rank: u8, entries: usize) -> Option<u64> {
+        let range = |reason| {
+            self.order
+                .range((rank, reason, 0, DerivationId::floor())..)
+                .take_while(move |(entry_rank, entry_reason, ..)| {
+                    *entry_rank == rank && *entry_reason == reason
+                })
+                .filter(|(.., id)| id.file_id != crate::FileId::VIRTUAL)
+                .map(|(_, _, file_key, _)| *file_key)
+                .peekable()
+        };
+        let (mut changed, mut read) = (range(Reason::Changed), range(Reason::Read));
+        let mut count = 0;
+        let mut current = None;
+        loop {
+            let file_key = match (changed.peek(), read.peek()) {
+                (Some(a), Some(b)) if a <= b => changed.next(),
+                (Some(_), Some(_)) | (None, Some(_)) => read.next(),
+                (Some(_), None) => changed.next(),
+                (None, None) => return None,
+            }?;
+            if current != Some(file_key) {
+                if count >= entries {
+                    return Some(file_key);
+                }
+                current = Some(file_key);
+            }
+            count += 1;
+        }
+    }
+
     /// Takes out every entry of `file_id` at `rank`.
     fn take_file_at(&mut self, rank: u8, file_id: crate::FileId) -> Vec<(DerivationId, Reason)> {
         let file_key = self.schedule.file_key(file_id);
@@ -1415,7 +1487,7 @@ impl Engine {
         // Each member of a planned group, with the plan and position of its
         // group: the files of a group that spans several share one.
         let mut grouped = FxHashMap::<DerivationId, (usize, usize)>::default();
-        let taken = self.worklist.take_rank(rank);
+        let taken = self.worklist.take_rank_bounded(rank, SUPERSTEP_ENTRIES);
         let checked = self.check_dispatch(db, &taken);
         for ((file_id, entries), checked) in taken.into_iter().zip(checked) {
             if file_id == crate::FileId::VIRTUAL {
@@ -4563,6 +4635,11 @@ fn scopeguard_lent_keys() -> OnDrop {
 /// How often one derivation may be evaluated within one stage before
 /// [`Engine::check_convergence`] reports that the facts it reads do not settle.
 const MAX_STAGE_EVALUATIONS: u32 = 1000;
+
+/// The queued entries one worker superstep takes at most, short of a file's:
+/// its tasks' forks and recordings live until it installs them, so this
+/// bounds what it holds.
+const SUPERSTEP_ENTRIES: usize = 32_768;
 
 /// How often a worker superstep runs one derivation within a stage before the
 /// stage settles on the serial loop.
