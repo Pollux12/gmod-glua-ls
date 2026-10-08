@@ -151,12 +151,10 @@ pub(crate) async fn apply_file_system_changes(
         (staged, wait, holding.map(|holding| holding.elapsed()))
     };
     let scheduling = crate::util::ls_profile::profile_instant();
-    let debounced_analysis = context.debounced_analysis_arc();
-    for (file_id, uri) in &staged {
-        debounced_analysis
-            .schedule_at_once(*file_id, uri.clone())
-            .await;
-    }
+    context
+        .debounced_analysis_arc()
+        .schedule_all_at_once(&staged)
+        .await;
     if let (Some(wait), Some(hold), Some(scheduling)) = (wait, hold, scheduling) {
         crate::util::ls_profile::emit_ls_watched(
             staged.len(),

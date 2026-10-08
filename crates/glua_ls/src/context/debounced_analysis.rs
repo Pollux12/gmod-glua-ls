@@ -264,6 +264,33 @@ impl DebouncedAnalysis {
         self.schedule(file_id, uri).await;
     }
 
+    /// [`Self::schedule_at_once`] for files one change brought together, such
+    /// as files changed on disk at once: one re-analysis takes them all in,
+    /// never some of them ahead of the rest.
+    pub async fn schedule_all_at_once(&self, files: &[(FileId, Uri)]) {
+        if files.is_empty() {
+            return;
+        }
+        let file_ids = files
+            .iter()
+            .map(|(file_id, _)| *file_id)
+            .collect::<Vec<_>>();
+        self.file_diagnostic
+            .store()
+            .invalidate(file_ids.iter().copied(), &file_ids);
+        self.pending_files
+            .lock()
+            .await
+            .extend(file_ids.iter().copied());
+        self.blocked_documents
+            .lock()
+            .await
+            .extend(files.iter().cloned());
+        self.has_pending_changes.store(true, Ordering::Release);
+        self.at_once.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
     /// Signal that document changes are in-flight but not yet scheduled; they
     /// may touch any document, so no document is answerable until they settle.
     ///
