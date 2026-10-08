@@ -29,6 +29,8 @@ impl LineIndex {
         line_only_ascii_vec.push(is_line_only_ascii);
 
         assert_eq!(line_offsets.len(), line_only_ascii_vec.len());
+        line_offsets.shrink_to_fit();
+        line_only_ascii_vec.shrink_to_fit();
         LineIndex {
             line_offsets,
             line_only_ascii_vec,
