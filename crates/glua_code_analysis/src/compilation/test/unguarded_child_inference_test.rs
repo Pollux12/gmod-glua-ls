@@ -2272,4 +2272,134 @@ mod test {
             "Radio"
         );
     }
+
+    const TYPES: &str = "lua/autorun/sh_types.lua";
+    const LIB: &str = "lua/autorun/sh_lib.lua";
+    const USER: &str = "lua/autorun/sh_user.lua";
+    const TYPES_TEXT: &str = "---@class Player
+---@class Vehicle
+---@class Dummy1
+---@param ply Player
+function Kick(ply) end
+---@param car Vehicle
+function Tow(car) end
+";
+    const LIB_TEXT: &str = "Lib = {}
+function Lib.Get(a) return Mystery end
+";
+    const USER_TEXT: &str = "local target = Lib.Get(1)
+Kick(target)
+local towed = Lib.Get(2)
+Tow(towed)
+";
+
+    fn retyped_types_text() -> String {
+        TYPES_TEXT.replace("---@param ply Player", "---@param ply Dummy1")
+    }
+
+    fn file_diagnostics(ws: &VirtualWorkspace, file_id: crate::FileId) -> Vec<String> {
+        let mut diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|diagnostic| {
+                format!(
+                    "{:?} {:?} {}",
+                    diagnostic.range, diagnostic.code, diagnostic.message
+                )
+            })
+            .collect::<Vec<_>>();
+        diagnostics.sort();
+        diagnostics
+    }
+
+    /// An edit that retypes one local's fallback leaves the types and
+    /// diagnostics a cold build of the edited text has.
+    #[test]
+    fn an_edit_leaves_the_local_fallbacks_and_diagnostics_a_cold_build_has() {
+        let edited = retyped_types_text();
+        let mut warm = VirtualWorkspace::new();
+        let file_ids = warm.def_files(vec![
+            (TYPES, TYPES_TEXT),
+            (LIB, LIB_TEXT),
+            (USER, USER_TEXT),
+        ]);
+        warm.def_file(TYPES, &edited);
+        let mut cold = VirtualWorkspace::new();
+        cold.def_files(vec![
+            (TYPES, edited.as_str()),
+            (LIB, LIB_TEXT),
+            (USER, USER_TEXT),
+        ]);
+
+        let settled = warm.settled_digest();
+        assert!(settled.iter().any(|line| line.ends_with("target = Dummy1")));
+        assert!(settled.iter().any(|line| line.ends_with("towed = Vehicle")));
+        assert_eq!(settled, cold.settled_digest());
+        assert_eq!(
+            file_diagnostics(&warm, file_ids[2]),
+            file_diagnostics(&cold, file_ids[2])
+        );
+        assert!(warm.stale_derivations().is_empty());
+        assert!(warm.phantom_derivations().is_empty());
+    }
+
+    /// Editing what types one local re-runs the fallbacks of that local's
+    /// file alone.
+    #[test]
+    fn editing_what_types_one_local_re_runs_only_its_files_fallbacks() {
+        let fallbacks_after_the_edit = |files: Vec<(&str, &str)>| {
+            let mut ws = VirtualWorkspace::new();
+            ws.def_files(files);
+            ws.def_file(TYPES, &retyped_types_text());
+            ws.analysis
+                .compilation
+                .last_stats()
+                .evaluations(crate::db_index::derivation::DerivationKind::LocalFallbacks)
+        };
+
+        let with_user = fallbacks_after_the_edit(vec![
+            (TYPES, TYPES_TEXT),
+            (LIB, LIB_TEXT),
+            (USER, USER_TEXT),
+        ]);
+        let without_user = fallbacks_after_the_edit(vec![(TYPES, TYPES_TEXT), (LIB, LIB_TEXT)]);
+
+        assert_eq!(with_user, without_user + 1);
+    }
+
+    const BLAST: &str = "lua/autorun/sh_blast.lua";
+    const FIRE: &str = "lua/autorun/sh_fire.lua";
+    const BLAST_TEXT: &str = "---@class Entity
+---@class Player: Entity
+---@param inflictor Entity
+---@param attacker Player
+function Blast(inflictor, attacker) end
+";
+    const FIRE_TEXT: &str = "local attacker, inflictor
+function Fire(params)
+    attacker = params.attacker
+    inflictor = params.inflictor or attacker
+    Blast(inflictor, attacker)
+end
+";
+
+    /// Locals whose guesses feed each other, one assigned from the other, are
+    /// guessed together: a cold build settles them, and an edit of what types
+    /// them leaves what a cold build of the edited text has.
+    #[test]
+    fn locals_whose_guesses_feed_each_other_settle_as_a_cold_build_has_them() {
+        let edited = BLAST_TEXT.replace("---@param attacker Player", "---@param attacker Entity");
+        let mut warm = VirtualWorkspace::new();
+        warm.def_files(vec![(BLAST, BLAST_TEXT), (FIRE, FIRE_TEXT)]);
+        assert!(warm.stale_derivations().is_empty());
+        warm.def_file(BLAST, &edited);
+        let mut cold = VirtualWorkspace::new();
+        cold.def_files(vec![(BLAST, edited.as_str()), (FIRE, FIRE_TEXT)]);
+
+        assert_eq!(warm.settled_digest(), cold.settled_digest());
+        assert!(warm.stale_derivations().is_empty());
+        assert!(warm.phantom_derivations().is_empty());
+    }
 }

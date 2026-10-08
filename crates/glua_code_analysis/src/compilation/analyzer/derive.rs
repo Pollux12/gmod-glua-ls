@@ -280,12 +280,6 @@ impl super::engine::Recipe for Recipes {
         )
     }
 
-    fn records_on_workers(&self, kind: DerivationKind) -> bool {
-        // A file's local fallbacks read the class bindings another file's
-        // local fallbacks settle.
-        kind == DerivationKind::LocalFallbacks
-    }
-
     fn compute(&self, db: &DbIndex, id: DerivationId) -> Box<dyn std::any::Any + Send> {
         match id.kind {
             DerivationKind::CallSiteParams => {
