@@ -46,6 +46,11 @@ impl EditMaps {
         self.maps.keys().copied()
     }
 
+    /// Whether these edits change `file_id`'s text.
+    pub fn edits(&self, file_id: FileId) -> bool {
+        self.maps.contains_key(&file_id)
+    }
+
     pub fn map(&self, file_id: FileId) -> Option<PositionMap> {
         self.maps.get(&file_id).cloned()
     }

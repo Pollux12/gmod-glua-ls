@@ -33,6 +33,7 @@ pub(crate) use lua::{
 };
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::db_index::derivation;
@@ -87,16 +88,26 @@ pub(crate) struct ScriptedScopes {
 }
 
 impl ScriptedScopes {
+    #[cfg(test)]
     fn new(db: &DbIndex) -> Self {
-        let mut context = AnalyzeContext::new();
-        for file_id in db.get_vfs().get_all_local_file_ids() {
-            if let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) {
-                context.add_tree_chunk(InFiled::new(file_id, tree.get_chunk_node()));
-            }
-        }
+        Self::of(db, &live_paths(db), &root_gamemodes(db))
+    }
+
+    /// The scopes of the live files at `paths`, given the gamemode folders
+    /// the main workspaces hold.
+    fn of(
+        db: &DbIndex,
+        paths: &HashMap<FileId, Option<PathBuf>>,
+        gamemodes: &[(PathBuf, GmodScopedClassInfo)],
+    ) -> Self {
+        let files = paths
+            .iter()
+            .map(|(file_id, path)| (*file_id, path.as_deref()))
+            .collect::<Vec<_>>();
+        let (files, infos) = scan_scopes(db, &files, gamemodes);
         Self {
-            files: context.get_or_compute_scripted_scope_files(db),
-            infos: context.get_or_compute_scripted_scope_infos(db),
+            files: Arc::new(files),
+            infos: Arc::new(infos),
         }
     }
 
@@ -119,38 +130,183 @@ impl ScriptedScopes {
     }
 }
 
-/// What [`ScriptedScopes`] are computed from, besides the config.
-#[derive(PartialEq, Eq)]
-struct ScopesKey {
-    files: Vec<(FileId, Option<std::path::PathBuf>)>,
-    workspaces: Vec<(WorkspaceId, Option<std::path::PathBuf>)>,
+/// Which of `files` are scripted-class scopes, and the class info of those
+/// that author one, given the gamemode folders the main workspaces hold.
+fn scan_scopes(
+    db: &DbIndex,
+    files: &[(FileId, Option<&Path>)],
+    gamemodes: &[(PathBuf, GmodScopedClassInfo)],
+) -> (HashSet<FileId>, HashMap<FileId, GmodScopedClassInfo>) {
+    let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
+    if scopes.resolved_definitions_slice().is_empty() {
+        let files = files.iter().map(|(file_id, _)| *file_id).collect();
+        return (files, HashMap::default());
+    }
+    let paths = files
+        .iter()
+        .filter_map(|(file_id, path)| Some((*file_id, (*path)?)))
+        .collect::<Vec<_>>();
+    let (scope_files, scope_matches) =
+        scopes.scan_scripted_class_scope_files(paths.iter().copied());
+    let mut scope_files: HashSet<_> = scope_files.into_iter().collect();
+    let mut infos = scope_matches
+        .into_iter()
+        .map(|(file_id, scope_match)| {
+            (
+                file_id,
+                GmodScopedClassInfo {
+                    class_name: scope_match.class_name,
+                    global_name: scope_match.definition.class_global,
+                    is_global_singleton: scope_match.definition.is_global_singleton,
+                    aliases: scope_match.definition.aliases,
+                    super_types: scope_match.definition.super_types,
+                    class_name_prefix: scope_match.definition.class_name_prefix,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    // A workspace rooted at a gamemode checkout has `gamemode/` directly
+    // under the root — no `gamemodes/<name>` segment for the scope path
+    // rules to anchor on — but its `gamemode/**` files author `GM` just
+    // like `gamemodes/*/gamemode/**`. Scope them the same way.
+    for (gamemode_dir, info) in gamemodes {
+        for (file_id, path) in &paths {
+            if infos.contains_key(file_id) || !path.starts_with(gamemode_dir) {
+                continue;
+            }
+            scope_files.insert(*file_id);
+            infos.insert(*file_id, info.clone());
+        }
+    }
+    (scope_files, infos)
 }
 
-impl ScopesKey {
-    fn of(db: &DbIndex) -> Self {
+/// The gamemode folders the main workspaces hold, each with the class its
+/// files author, in workspace order.
+fn root_gamemodes(db: &DbIndex) -> Vec<(PathBuf, GmodScopedClassInfo)> {
+    db.get_module_index()
+        .get_main_workspace_ids()
+        .into_iter()
+        .filter_map(|workspace_id| gmod::root_gamemode_scope(db, workspace_id))
+        .map(|(gamemode_dir, scope_match)| {
+            (
+                gamemode_dir,
+                GmodScopedClassInfo {
+                    class_name: scope_match.class_name,
+                    global_name: scope_match.global_name,
+                    is_global_singleton: scope_match.is_global_singleton,
+                    aliases: scope_match.aliases,
+                    super_types: scope_match.super_types,
+                    class_name_prefix: scope_match.class_name_prefix,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Each live file's path.
+fn live_paths(db: &DbIndex) -> HashMap<FileId, Option<PathBuf>> {
+    let vfs = db.get_vfs();
+    vfs.get_all_local_file_ids()
+        .into_iter()
+        .filter(|file_id| vfs.get_syntax_tree(file_id).is_some())
+        .map(|file_id| (file_id, vfs.get_file_path(&file_id).cloned()))
+        .collect()
+}
+
+/// The main workspaces with their roots, by id.
+fn main_workspace_roots(db: &DbIndex) -> Vec<(WorkspaceId, Option<PathBuf>)> {
+    let module_index = db.get_module_index();
+    let mut workspaces = module_index
+        .get_main_workspace_ids()
+        .into_iter()
+        .map(|id| (id, module_index.get_workspace_root(id).map(Into::into)))
+        .collect::<Vec<_>>();
+    workspaces.sort_by_key(|(id, _)| id.id);
+    workspaces
+}
+
+/// [`ScriptedScopes`] with what they were computed from besides the config:
+/// each live file's path, the main workspaces and their gamemode folders.
+struct HeldScopes {
+    paths: HashMap<FileId, Option<PathBuf>>,
+    workspaces: Vec<(WorkspaceId, Option<PathBuf>)>,
+    gamemodes: Vec<(PathBuf, GmodScopedClassInfo)>,
+    scopes: ScriptedScopes,
+}
+
+impl HeldScopes {
+    /// Takes in the live files' paths as they stand, scanning again the files
+    /// that moved, came or went: a file's scope follows from its own path.
+    /// Returns those it scopes otherwise, sorted.
+    fn follow_paths(&mut self, db: &DbIndex) -> Vec<FileId> {
         let vfs = db.get_vfs();
-        let mut files = vfs
-            .get_all_local_file_ids()
-            .into_iter()
-            .filter(|file_id| vfs.get_syntax_tree(file_id).is_some())
-            .map(|file_id| (file_id, vfs.get_file_path(&file_id).cloned()))
+        let mut live = HashSet::default();
+        let mut changed = Vec::new();
+        for file_id in vfs.get_all_local_file_ids() {
+            if vfs.get_syntax_tree(&file_id).is_none() {
+                continue;
+            }
+            live.insert(file_id);
+            let path = vfs.get_file_path(&file_id);
+            if self
+                .paths
+                .get(&file_id)
+                .is_none_or(|held| held.as_ref() != path)
+            {
+                self.paths.insert(file_id, path.cloned());
+                changed.push(file_id);
+            }
+        }
+        self.paths.retain(|file_id, _| {
+            let kept = live.contains(file_id);
+            if !kept {
+                changed.push(*file_id);
+            }
+            kept
+        });
+        if changed.is_empty() {
+            return Vec::new();
+        }
+        changed.sort_unstable();
+        let before = changed
+            .iter()
+            .map(|file_id| {
+                (
+                    self.scopes.files.contains(file_id),
+                    self.scopes.infos.get(file_id).cloned(),
+                )
+            })
             .collect::<Vec<_>>();
-        files.sort_unstable();
-        let module_index = db.get_module_index();
-        let mut workspaces = module_index
-            .get_main_workspace_ids()
-            .into_iter()
-            .map(|id| (id, module_index.get_workspace_root(id).map(Into::into)))
+        let scanned = changed
+            .iter()
+            .filter_map(|file_id| Some((*file_id, self.paths.get(file_id)?.as_deref())))
             .collect::<Vec<_>>();
-        workspaces.sort_by_key(|(id, _)| id.id);
-        Self { files, workspaces }
+        let (files, infos) = scan_scopes(db, &scanned, &self.gamemodes);
+        let scope_files = Arc::make_mut(&mut self.scopes.files);
+        let scope_infos = Arc::make_mut(&mut self.scopes.infos);
+        for file_id in &changed {
+            scope_files.remove(file_id);
+            scope_infos.remove(file_id);
+        }
+        scope_files.extend(files);
+        scope_infos.extend(infos);
+        changed
+            .into_iter()
+            .zip(before)
+            .filter(|(file_id, (scoped, info))| {
+                *scoped != scope_files.contains(file_id)
+                    || info.as_ref() != scope_infos.get(file_id)
+            })
+            .map(|(file_id, _)| file_id)
+            .collect()
     }
 }
 
-/// The last [`ScriptedScopes`], reused while what they were computed from
-/// stands. A new config clears it.
+/// The last [`ScriptedScopes`], followed file by file while the main
+/// workspaces and their gamemode folders stand. A new config clears it.
 #[derive(Default)]
-pub(crate) struct ScopesCache(Option<(ScopesKey, ScriptedScopes)>);
+pub(crate) struct ScopesCache(Option<HeldScopes>);
 
 impl std::fmt::Debug for ScopesCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -164,19 +320,28 @@ impl ScopesCache {
     /// The scopes of the files as they stand, and the files they scope
     /// otherwise than the scopes held last did, sorted.
     fn get(&mut self, db: &DbIndex) -> (ScriptedScopes, Vec<FileId>) {
-        let key = ScopesKey::of(db);
-        if let Some((cached, scopes)) = &self.0
-            && *cached == key
+        let workspaces = main_workspace_roots(db);
+        let gamemodes = root_gamemodes(db);
+        if let Some(held) = &mut self.0
+            && held.workspaces == workspaces
+            && held.gamemodes == gamemodes
         {
-            return (scopes.clone(), Vec::new());
+            let rescoped = held.follow_paths(db);
+            return (held.scopes.clone(), rescoped);
         }
-        let scopes = ScriptedScopes::new(db);
+        let paths = live_paths(db);
+        let scopes = ScriptedScopes::of(db, &paths, &gamemodes);
         let rescoped = self
             .0
             .as_ref()
-            .map(|(_, held)| held.rescoped(&scopes))
+            .map(|held| held.scopes.rescoped(&scopes))
             .unwrap_or_default();
-        self.0 = Some((key, scopes.clone()));
+        self.0 = Some(HeldScopes {
+            paths,
+            workspaces,
+            gamemodes,
+            scopes: scopes.clone(),
+        });
         (scopes, rescoped)
     }
 }
@@ -199,7 +364,8 @@ pub(crate) struct Reanalysed {
 /// forgets what their previous analysis produced, rebuilds each live file's
 /// source layer, and evaluates every derivation that is new or read a fact
 /// that changed until nothing is stale. A file without a syntax tree is
-/// treated as deleted.
+/// treated as deleted; a file that only moved keeps its analysis, which takes
+/// in where it now is.
 ///
 /// It advances in slices ([`Self::run`]). Between two, no evaluation is open
 /// and the index reads as it does outside any run, so readers can use it.
@@ -487,11 +653,11 @@ impl Drop for Unwinding {
     }
 }
 
-/// Rebuilds `file_ids`' source layers and queues their derivations ahead of
-/// the work already queued, alongside any files still settling first; `None`
-/// when there is nothing to re-analyse. `pending` holds keys an earlier
-/// rebuild moved whose readers are not queued yet, positioned as before
-/// these edits.
+/// Rebuilds `file_ids`' source layers, or takes in where a file that only
+/// moved now is, and queues their derivations ahead of the work already
+/// queued, alongside any files still settling first; `None` when there is
+/// nothing to re-analyse. `pending` holds keys an earlier rebuild moved whose
+/// readers are not queued yet, positioned as before these edits.
 fn start_pass(
     db: &mut DbIndex,
     engine: &mut engine::Engine,
@@ -505,25 +671,125 @@ fn start_pass(
         return None;
     }
     let (scopes, rescoped) = crate::profile::phase("reanalyze: scopes", || scopes.get(db));
-    // A file whose scope changed with other files' paths is re-indexed, as a
-    // moved file is.
+    let repathed = repathed_files(db, engine, &file_ids, &rescoped);
+    // A file whose scope changed with its own or other files' paths is
+    // re-indexed.
     file_ids.extend(rescoped);
     file_ids.sort();
     file_ids.dedup();
+    let replaced = file_ids
+        .iter()
+        .copied()
+        .filter(|file_id| repathed.binary_search(file_id).is_err())
+        .collect::<Vec<_>>();
     // Queries computed since the last run read the index as it stood before
     // the rebuild moves it.
     let mut moved = pending;
     moved.extend(engine::file_queries(db));
-    engine.replacing(&file_ids);
+    engine.replacing(&replaced);
     engine.note_rebuilt(&file_ids);
     engine.prioritise(&file_ids);
     crate::profile::memory::checkpoint("before the source layer");
     let touched = crate::profile::phase("reanalyze: replace files", || {
-        replace_files(db, engine, &file_ids, &scopes, moved)
+        replace_files(db, engine, &replaced, &repathed, &scopes, moved)
     });
     crate::profile::memory::checkpoint("after the source layer");
     db.reader_graph_mut().forget_fingerprints();
     Some(Pass::Replaced { touched, scopes })
+}
+
+/// The files among `file_ids` that only moved, sorted: their source layer was
+/// built from the text they hold, and where they now are leaves their scope,
+/// their workspace and the files they load by path as they were. What their
+/// source layer derived from their path [`repath_files`] takes in; the rest of
+/// it, and every derivation of theirs that did not read where they are,
+/// stands.
+fn repathed_files(
+    db: &DbIndex,
+    engine: &engine::Engine,
+    file_ids: &[FileId],
+    rescoped: &[FileId],
+) -> Vec<FileId> {
+    let vfs = db.get_vfs();
+    file_ids
+        .iter()
+        .copied()
+        .filter(|file_id| {
+            if !vfs.has_left_paths(file_id)
+                || engine.edits_text_of(*file_id)
+                || rescoped.binary_search(file_id).is_ok()
+            {
+                return false;
+            }
+            let (Some(tree), Some(path)) = (
+                vfs.get_syntax_tree(file_id),
+                vfs.get_file_path(file_id).and_then(|path| path.to_str()),
+            ) else {
+                return false;
+            };
+            let source = derivation::DerivationId::new(
+                derivation::DerivationKind::Source,
+                *file_id,
+                LuaSyntaxId::from_node(&tree.get_red_root()),
+            );
+            db.reader_graph().contains(source)
+                && db.get_module_index().belongs_alike_at(*file_id, path)
+                && !db.get_file_dependencies_index().loads_by_path(*file_id)
+        })
+        .collect()
+}
+
+/// Touches `file_id`'s path and the paths it is and was at, taking the ones it
+/// left.
+fn touch_paths(db: &mut DbIndex, file_id: FileId, touched: &mut HashSet<derivation::HashedKey>) {
+    touched.insert(derivation::HashedKey::new(derivation::FactKey::FilePath(
+        file_id,
+    )));
+    let vfs = db.get_vfs_mut();
+    let paths = vfs.take_left_paths(&file_id);
+    for path in paths
+        .into_iter()
+        .chain(vfs.get_file_path(&file_id).cloned())
+    {
+        touched.insert(derivation::HashedKey::new(derivation::FactKey::PathFile(
+            Arc::from(path),
+        )));
+    }
+}
+
+/// Takes in where each of `file_ids`, files that only moved, now is: re-files
+/// its module under its path and ranks what its source layer ordered by its
+/// path by where it is, as building it there would. Returns every key whose
+/// value may have changed.
+fn repath_files(db: &mut DbIndex, file_ids: &[FileId]) -> Vec<derivation::HashedKey> {
+    if file_ids.is_empty() {
+        return Vec::new();
+    }
+    derivation::begin(derivation::DerivationId::workspace(
+        derivation::DerivationKind::Source,
+    ));
+    let mut order_keys = Vec::with_capacity(file_ids.len());
+    for file_id in file_ids {
+        db.get_file_dependencies_index_mut()
+            .forget_unresolved_target(*file_id);
+        if let Some(path) = db
+            .get_vfs()
+            .get_file_path(file_id)
+            .and_then(|path| path.to_str())
+            .map(str::to_string)
+        {
+            db.get_module_index_mut().repath_module(*file_id, &path);
+        }
+        order_keys.push((*file_id, db.get_vfs().file_order_key(file_id)));
+    }
+    db.get_global_index_mut().rekey_files(&order_keys);
+    db.get_property_index_mut().rekey_files(&order_keys);
+    db.get_type_index_mut().rekey_files(&order_keys);
+    let refresh = derivation::end();
+    let mut touched = refresh.moved().cloned().collect::<Vec<_>>();
+    let (_, _, written) = refresh.into_parts(|_| derivation::ABSENT);
+    touched.extend(written);
+    touched
 }
 
 /// For each derivation among the `foreign` producers of the replaced files'
@@ -561,12 +827,14 @@ fn unkept_foreign_outputs(
 }
 
 /// Forgets `file_ids`' derivations and facts, rebuilds the live ones' source
-/// layer and queues their derivations. Returns every key whose value may
-/// have changed, `moved` among them, each also at its new position.
+/// layer and queues their derivations, and takes in where each of
+/// `repathed`, files that only moved, now is. Returns every key whose value
+/// may have changed, `moved` among them, each also at its new position.
 fn replace_files(
     db: &mut DbIndex,
     engine: &mut engine::Engine,
     file_ids: &[FileId],
+    repathed: &[FileId],
     scopes: &ScriptedScopes,
     moved: HashSet<derivation::HashedKey>,
 ) -> HashSet<derivation::HashedKey> {
@@ -589,16 +857,7 @@ fn replace_files(
         touched.insert(derivation::HashedKey::new(derivation::FactKey::FileText(
             *file_id,
         )));
-        touched.insert(derivation::HashedKey::new(derivation::FactKey::FilePath(
-            *file_id,
-        )));
-        let vfs = db.get_vfs_mut();
-        let paths = vfs.take_left_paths(file_id);
-        for path in paths.into_iter().chain(vfs.get_file_path(file_id).cloned()) {
-            touched.insert(derivation::HashedKey::new(derivation::FactKey::PathFile(
-                Arc::from(path),
-            )));
-        }
+        touch_paths(db, *file_id, &mut touched);
         let live = live_files.contains(file_id);
         for producer in producers {
             if replaced.contains(&producer.file_id) {
@@ -702,6 +961,14 @@ fn replace_files(
     touched.extend(removal.moved().cloned());
     let (_, _, removed) = removal.into_parts(|_| derivation::ABSENT);
     touched.extend(removed);
+    // Files that only moved re-file their modules before any file registers,
+    // so a load by path resolves against the workspace as it stands.
+    for file_id in repathed {
+        touch_paths(db, *file_id, &mut touched);
+    }
+    touched.extend(crate::profile::phase("replace: repath files", || {
+        repath_files(db, repathed)
+    }));
 
     let live = file_ids
         .iter()
@@ -1230,7 +1497,6 @@ pub struct AnalyzeContext {
     tree_list: Vec<InFiled<LuaChunk>>,
     metas: HashSet<FileId>,
     scripted_scope_files: Option<Arc<HashSet<FileId>>>,
-    scripted_scope_infos: Option<Arc<HashMap<FileId, GmodScopedClassInfo>>>,
     unresolves: Vec<(UnResolve, InferFailReason)>,
     pending_unresolve_decl_ids: HashSet<LuaDeclId>,
     infer_manager: InferCacheManager,
@@ -1246,7 +1512,6 @@ impl AnalyzeContext {
             tree_list: Vec::new(),
             metas: HashSet::default(),
             scripted_scope_files: None,
-            scripted_scope_infos: None,
             unresolves: Vec::new(),
             pending_unresolve_decl_ids: HashSet::default(),
             infer_manager: InferCacheManager::new(),
@@ -1262,7 +1527,6 @@ impl AnalyzeContext {
     pub(crate) fn for_files(db: &DbIndex, file_ids: Vec<FileId>, scopes: &ScriptedScopes) -> Self {
         let mut context = Self::new();
         context.scripted_scope_files = Some(scopes.files.clone());
-        context.scripted_scope_infos = Some(scopes.infos.clone());
         for file_id in file_ids {
             let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
                 continue;
@@ -1326,94 +1590,23 @@ impl AnalyzeContext {
             .clone()
     }
 
-    pub fn get_or_compute_scripted_scope_infos(
-        &mut self,
-        db: &DbIndex,
-    ) -> Arc<HashMap<FileId, GmodScopedClassInfo>> {
-        self.ensure_scripted_scope_cache(db);
-
-        self.scripted_scope_infos
-            .as_ref()
-            .expect("set above")
-            .clone()
-    }
-
     fn ensure_scripted_scope_cache(&mut self, db: &DbIndex) {
-        if self.scripted_scope_files.is_some() && self.scripted_scope_infos.is_some() {
+        if self.scripted_scope_files.is_some() {
             return;
         }
-
-        let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
-        if scopes.resolved_definitions_slice().is_empty() {
-            let file_ids = self
-                .tree_list
-                .iter()
-                .map(|in_filed_tree| in_filed_tree.file_id)
-                .collect::<HashSet<_>>();
-            self.scripted_scope_files = Some(Arc::new(file_ids));
-            self.scripted_scope_infos = Some(Arc::new(HashMap::default()));
-            return;
-        }
-
-        let file_paths = self
+        let files = self
             .tree_list
             .iter()
-            .filter_map(|in_filed_tree| {
-                db.get_vfs()
-                    .get_file_path(&in_filed_tree.file_id)
-                    .map(|path| (in_filed_tree.file_id, path.as_path()))
-            })
-            .collect::<Vec<_>>();
-        let (scripted_scope_files, scoped_matches) =
-            scopes.scan_scripted_class_scope_files(file_paths.iter().copied());
-        let mut scripted_scope_files: HashSet<_> = scripted_scope_files.into_iter().collect();
-        let mut scripted_scope_infos = scoped_matches
-            .into_iter()
-            .map(|(file_id, scope_match)| {
+            .map(|in_filed_tree| {
+                let file_id = in_filed_tree.file_id;
                 (
                     file_id,
-                    GmodScopedClassInfo {
-                        class_name: scope_match.class_name,
-                        global_name: scope_match.definition.class_global,
-                        is_global_singleton: scope_match.definition.is_global_singleton,
-                        aliases: scope_match.definition.aliases,
-                        super_types: scope_match.definition.super_types,
-                        class_name_prefix: scope_match.definition.class_name_prefix,
-                    },
+                    db.get_vfs().get_file_path(&file_id).map(PathBuf::as_path),
                 )
             })
-            .collect::<HashMap<_, _>>();
-
-        // A workspace rooted at a gamemode checkout has `gamemode/` directly
-        // under the root — no `gamemodes/<name>` segment for the scope path
-        // rules to anchor on — but its `gamemode/**` files author `GM` just
-        // like `gamemodes/*/gamemode/**`. Scope them the same way.
-        for workspace_id in db.get_module_index().get_main_workspace_ids() {
-            let Some((gamemode_dir, scope_match)) = gmod::root_gamemode_scope(db, workspace_id)
-            else {
-                continue;
-            };
-            for (file_id, path) in &file_paths {
-                if scripted_scope_infos.contains_key(file_id) || !path.starts_with(&gamemode_dir) {
-                    continue;
-                }
-                scripted_scope_files.insert(*file_id);
-                scripted_scope_infos.insert(
-                    *file_id,
-                    GmodScopedClassInfo {
-                        class_name: scope_match.class_name.clone(),
-                        global_name: scope_match.global_name.clone(),
-                        is_global_singleton: scope_match.is_global_singleton,
-                        aliases: scope_match.aliases.clone(),
-                        super_types: scope_match.super_types.clone(),
-                        class_name_prefix: scope_match.class_name_prefix.clone(),
-                    },
-                );
-            }
-        }
-
-        self.scripted_scope_files = Some(Arc::new(scripted_scope_files));
-        self.scripted_scope_infos = Some(Arc::new(scripted_scope_infos));
+            .collect::<Vec<_>>();
+        let (files, _) = scan_scopes(db, &files, &root_gamemodes(db));
+        self.scripted_scope_files = Some(Arc::new(files));
     }
 }
 

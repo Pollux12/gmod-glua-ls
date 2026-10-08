@@ -217,6 +217,14 @@ impl LuaDependencyIndex {
             .and_then(|dependencies| dependencies.get(dependency_id))
     }
 
+    /// Whether `file_id` loads a file by a path, which it resolves from where
+    /// it is.
+    pub(crate) fn loads_by_path(&self, file_id: FileId) -> bool {
+        self.dependency_sites
+            .get(&file_id)
+            .is_some_and(|sites| sites.iter().any(|site| site.path.is_some()))
+    }
+
     pub fn get_dependency_sites(&self, file_id: &FileId) -> Option<&[LuaDependencySite]> {
         derivation::note_read(|| FactKey::Dependency(*file_id));
         self.dependency_sites.get(file_id).map(Vec::as_slice)

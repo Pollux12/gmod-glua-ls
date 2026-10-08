@@ -701,6 +701,12 @@ impl Engine {
             .is_some_and(|interrupt| interrupt.load(std::sync::atomic::Ordering::Acquire))
     }
 
+    /// Whether the edits other files' references have yet to follow change
+    /// `file_id`'s text.
+    pub(crate) fn edits_text_of(&self, file_id: crate::FileId) -> bool {
+        self.to_follow.edits(file_id)
+    }
+
     /// The edits other files' references have yet to follow, once.
     pub(crate) fn edits_to_apply(&mut self) -> Option<derivation::EditMaps> {
         (!self.to_follow.is_empty()).then(|| std::mem::take(&mut self.to_follow))

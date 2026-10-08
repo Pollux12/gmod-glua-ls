@@ -137,6 +137,42 @@ impl LuaPropertyIndex {
             .insert(file_id, (workspace_rank, path));
     }
 
+    /// Orders the documentation contributions of each of `order_keys`' files
+    /// by its new order key, republishing every merged view they are part of.
+    pub(crate) fn rekey_files(&mut self, order_keys: &[(FileId, Arc<str>)]) {
+        for (file_id, order_key) in order_keys {
+            let Some((workspace_rank, held)) = self.file_merge_order.get(file_id).cloned() else {
+                continue;
+            };
+            if held == *order_key {
+                continue;
+            }
+            let before = self.contributor_key(*file_id);
+            self.file_merge_order
+                .insert(*file_id, (workspace_rank, order_key.clone()));
+            let after = self.contributor_key(*file_id);
+            let owners = self
+                .in_filed_owner
+                .get(file_id)
+                .map(|owners| owners.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            for owner_id in owners {
+                let Some(property_id) = self.property_owners_map.get(&owner_id).copied() else {
+                    continue;
+                };
+                let Some(contributions) = self.contributions.get_mut(&property_id) else {
+                    continue;
+                };
+                let Some(contribution) = contributions.remove(&before) else {
+                    continue;
+                };
+                contributions.insert(after.clone(), contribution);
+                self.rebuild_merged(property_id);
+                self.note_property_write(property_id);
+            }
+        }
+    }
+
     fn contributor_key(&self, file_id: FileId) -> PropertyContributorKey {
         let (workspace_rank, normalized_path) = self
             .file_merge_order

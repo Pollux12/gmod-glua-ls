@@ -292,6 +292,45 @@ impl LuaModuleIndex {
         self.file_module_paths.get(&file_id).map(String::as_str)
     }
 
+    /// Whether `file_id` at `path` belongs where it does now: a module in the
+    /// same workspace, or no module. Its module path may differ.
+    pub(crate) fn belongs_alike_at(&self, file_id: FileId, path: &str) -> bool {
+        let workspace_id = self
+            .extract_module_path(&path.replace('\\', "/"))
+            .map(|(_, workspace_id)| workspace_id);
+        workspace_id
+            == self
+                .file_module_map
+                .get(&file_id)
+                .map(|info| info.workspace_id)
+    }
+
+    /// Re-files `file_id`'s module, registered from its path, under `path`,
+    /// keeping what its source and module return declared of it. A module a
+    /// `---@module` annotation names stays as it is.
+    pub(crate) fn repath_module(&mut self, file_id: FileId, path: &str) {
+        if !self.file_module_paths.contains_key(&file_id) {
+            return;
+        }
+        let Some(declared) = self.file_module_map.get(&file_id).cloned() else {
+            return;
+        };
+        let legacy_envs = self.legacy_module_envs.get(&file_id).cloned();
+        self.add_module_by_path(file_id, path);
+        if let Some(info) = self.file_module_map.get_mut(&file_id) {
+            info.visible = declared.visible;
+            info.version_conds = declared.version_conds;
+            info.is_meta = declared.is_meta;
+            info.export_type = declared.export_type;
+            info.semantic_id = declared.semantic_id;
+        }
+        self.relink_export(file_id, FxHashSet::default());
+        if let Some(envs) = legacy_envs {
+            self.legacy_module_envs.insert(file_id, envs);
+        }
+        self.note_lookup_keys(file_id);
+    }
+
     pub fn get_module(&self, file_id: FileId) -> Option<&ModuleInfo> {
         derivation::note_read(|| FactKey::Module(file_id));
         let module = self.file_module_map.get(&file_id)?;

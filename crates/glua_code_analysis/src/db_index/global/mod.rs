@@ -85,6 +85,67 @@ impl LuaGlobalIndex {
         }
     }
 
+    /// Files each of `order_keys`' files under its new order key: its
+    /// declarations take the place in each global's list and in the scan that
+    /// the key gives them.
+    pub(crate) fn rekey_files(&mut self, order_keys: &[(FileId, Arc<str>)]) {
+        let rekeyed = order_keys
+            .iter()
+            .filter(|(file_id, key)| self.file_order.get(file_id).is_some_and(|held| held != key))
+            .cloned()
+            .collect::<Vec<_>>();
+        if rekeyed.is_empty() {
+            return;
+        }
+        let files = rekeyed
+            .iter()
+            .map(|(file_id, _)| *file_id)
+            .collect::<rustc_hash::FxHashSet<_>>();
+        let names = self
+            .global_decl
+            .iter()
+            .filter(|(_, decl_ids)| {
+                decl_ids
+                    .iter()
+                    .any(|decl_id| files.contains(&decl_id.file_id))
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let scan_share = |index: &Self| {
+            let mut share: Fingerprint = 0;
+            for id in &names {
+                for decl_id in index.global_decl.get(id).into_iter().flatten() {
+                    if files.contains(&decl_id.file_id) {
+                        share = share.wrapping_add(scan_element(
+                            &index.file_order,
+                            id.get_name(),
+                            *decl_id,
+                        ));
+                    }
+                }
+            }
+            share
+        };
+        let before = scan_share(self);
+        for (file_id, key) in rekeyed {
+            self.file_order.insert(file_id, key);
+        }
+        let file_order = &self.file_order;
+        for id in &names {
+            if let Some(decl_ids) = self.global_decl.get_mut(id) {
+                decl_ids.sort_by(|left, right| {
+                    decl_sort_key(file_order, *left).cmp(&decl_sort_key(file_order, *right))
+                });
+            }
+            note_global_write(id.get_name());
+        }
+        let after = scan_share(self);
+        self.scan_fingerprint = self
+            .scan_fingerprint
+            .wrapping_sub(before)
+            .wrapping_add(after);
+    }
+
     /// Drops one declaration of `name`.
     pub(crate) fn remove_global_decl(&mut self, name: &str, decl_id: LuaDeclId) {
         let id = GlobalId::new(name);

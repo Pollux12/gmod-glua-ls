@@ -245,6 +245,12 @@ impl Vfs {
         self.left_paths.remove(id).unwrap_or_default()
     }
 
+    /// Whether `id` moved or was removed from a path since a re-analysis last
+    /// took its paths.
+    pub fn has_left_paths(&self, id: &FileId) -> bool {
+        self.left_paths.contains_key(id)
+    }
+
     pub fn get_uri(&self, id: &FileId) -> Option<Uri> {
         crate::db_index::derivation::note_file_path_read(*id);
         let path = self.file_path_map.get(&id.id)?;

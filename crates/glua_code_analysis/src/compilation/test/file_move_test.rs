@@ -1,8 +1,9 @@
 #[cfg(test)]
 mod test {
+    use crate::db_index::derivation::DerivationKind;
     use crate::{
-        Emmyrc, EmmyrcGmodScriptedClassScopeEntry, FileId, GmodRealm, LuaTypeDeclId,
-        VirtualWorkspace,
+        Emmyrc, EmmyrcGmodScriptedClassScopeEntry, FileId, GmodRealm, LuaSemanticDeclId, LuaType,
+        LuaTypeDeclId, VirtualWorkspace,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -514,5 +515,172 @@ mod test {
         let stats = ws.analysis.compilation.last_stats();
         assert_eq!(stats.loops_cleared, 0);
         assert_eq!(stats.rebuilt_sources, 0);
+    }
+
+    /// The path of `file_id` in `ws`, relative to the workspace.
+    fn relative_path(ws: &VirtualWorkspace, file_id: FileId) -> String {
+        ws.analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_path(&file_id)
+            .and_then(|path| path.strip_prefix(&ws.virtual_url_generator.base).ok())
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default()
+    }
+
+    /// Moving a directory whose files keep their scope and workspace re-runs
+    /// none of their statements: none of them reads where its file is.
+    #[test]
+    fn moving_a_directory_re_runs_none_of_its_statements() {
+        let warm = assert_move_matches_cold(
+            &[
+                (
+                    "lua/mylib/sh_first.lua",
+                    "local a = 1\nlocal b = a + 1\nMyLibFirst = b\n",
+                ),
+                (
+                    "lua/mylib/sh_second.lua",
+                    "local c = 2\nlocal d = c * 2\nMyLibSecond = d\n",
+                ),
+                (
+                    "lua/autorun/sh_reader.lua",
+                    "local sum = MyLibFirst + MyLibSecond\n",
+                ),
+            ],
+            &[
+                ("lua/mylib/sh_first.lua", "lua/moved/sh_first.lua"),
+                ("lua/mylib/sh_second.lua", "lua/moved/sh_second.lua"),
+            ],
+        );
+
+        let stats = warm.analysis.compilation.last_stats();
+        assert_eq!(stats.evaluations(DerivationKind::LocalStat), 0);
+        assert_eq!(stats.rebuilt_sources, 0);
+    }
+
+    /// Two files declare one global, listed in the order of their paths:
+    /// renaming one lists them as a cold build of the renamed layout does.
+    #[test]
+    fn renaming_a_file_re_orders_the_declarations_of_its_globals() {
+        let warm = assert_move_matches_cold(
+            &[
+                ("lua/autorun/sh_first.lua", "SharedGlobal = 1\n"),
+                ("lua/autorun/sh_second.lua", "SharedGlobal = \"text\"\n"),
+                ("lua/autorun/sh_reader.lua", "local value = SharedGlobal\n"),
+            ],
+            &[("lua/autorun/sh_first.lua", "lua/autorun/sh_third.lua")],
+        );
+
+        let decl_paths = warm
+            .analysis
+            .compilation
+            .get_db()
+            .get_global_index()
+            .get_global_decl_ids("SharedGlobal")
+            .into_iter()
+            .flatten()
+            .map(|decl_id| relative_path(&warm, decl_id.file_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decl_paths,
+            vec!["lua/autorun/sh_second.lua", "lua/autorun/sh_third.lua"]
+        );
+    }
+
+    /// Two files declare one alias, and the one first by path gives its
+    /// origin: renaming one selects the origin a cold build selects.
+    #[test]
+    fn renaming_a_file_re_selects_the_origin_of_an_alias_it_declares() {
+        let warm = assert_move_matches_cold(
+            &[
+                (
+                    "lua/autorun/sh_first.lua",
+                    "---@alias SharedAlias integer\n",
+                ),
+                (
+                    "lua/autorun/sh_second.lua",
+                    "---@alias SharedAlias string\n",
+                ),
+            ],
+            &[("lua/autorun/sh_first.lua", "lua/autorun/sh_third.lua")],
+        );
+
+        let origin = warm
+            .analysis
+            .compilation
+            .get_db()
+            .get_type_index()
+            .get_type_decl(&LuaTypeDeclId::global("SharedAlias"))
+            .and_then(|decl| decl.get_alias_ref().cloned());
+        assert_eq!(origin, Some(LuaType::String));
+    }
+
+    /// Two files document one class, and the first by path gives its
+    /// description: renaming one merges the docs as a cold build does.
+    #[test]
+    fn renaming_a_file_re_orders_the_docs_of_a_class_it_documents() {
+        const FIRST: &str = "--- First description\n---@class SharedDoc\nlocal first = {}\n";
+        const SECOND: &str = "--- Second description\n---@class SharedDoc\nlocal second = {}\n";
+        let description = |ws: &VirtualWorkspace| {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_property_index()
+                .get_property(&LuaSemanticDeclId::TypeDecl(LuaTypeDeclId::global(
+                    "SharedDoc",
+                )))
+                .and_then(|property| property.description().cloned())
+        };
+        let warm = assert_move_matches_cold(
+            &[
+                ("lua/autorun/sh_first.lua", FIRST),
+                ("lua/autorun/sh_second.lua", SECOND),
+            ],
+            &[("lua/autorun/sh_first.lua", "lua/autorun/sh_third.lua")],
+        );
+        let mut cold = gmod_workspace();
+        cold.def_files(vec![
+            ("lua/autorun/sh_second.lua", SECOND),
+            ("lua/autorun/sh_third.lua", FIRST),
+        ]);
+
+        assert_eq!(description(&warm), description(&cold));
+        assert!(
+            description(&warm).is_some_and(|text| text.contains("Second")),
+            "{:?}",
+            description(&warm)
+        );
+    }
+
+    /// A moved file that loads another by a path relative to it loads the
+    /// file next to where it now is, as a cold build of the moved layout does.
+    #[test]
+    fn a_moved_file_loads_by_path_from_where_it_now_is() {
+        let warm = assert_move_matches_cold(
+            &[
+                (
+                    "lua/first/sv_boot.lua",
+                    "include(\"helper.lua\")\nlocal value = HelperValue\n",
+                ),
+                ("lua/first/helper.lua", "HelperValue = 1\n"),
+                ("lua/second/helper.lua", "HelperValue = \"text\"\n"),
+            ],
+            &[("lua/first/sv_boot.lua", "lua/second/sv_boot.lua")],
+        );
+
+        let boot = file_id(&warm, "lua/second/sv_boot.lua").expect("the loader has an id");
+        let targets = warm
+            .analysis
+            .compilation
+            .get_db()
+            .get_file_dependencies_index()
+            .get_dependency_sites(&boot)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|site| site.target_file_id)
+            .map(|target| relative_path(&warm, target))
+            .collect::<Vec<_>>();
+        assert_eq!(targets, vec!["lua/second/helper.lua"]);
     }
 }

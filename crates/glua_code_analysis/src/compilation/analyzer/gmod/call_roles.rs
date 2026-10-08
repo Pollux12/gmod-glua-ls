@@ -27,6 +27,15 @@ impl FileRank {
             file_id.id,
         )))
     }
+
+    /// Whether `file_id` still ranks as `self`: it is at the path ranked.
+    fn holds(&self, db: &DbIndex, file_id: &FileId) -> bool {
+        db.get_vfs()
+            .get_file_path(file_id)
+            .map(|path| path.to_string_lossy())
+            .unwrap_or_default()
+            == self.0.1.as_str()
+    }
 }
 
 /// Where a helper definition ranks among those naming the same entry: by
@@ -267,7 +276,7 @@ pub(super) struct CallRoleChanges {
 
 impl GmodCallRoles {
     /// Folds in the current helper scan of every file, re-folding only the
-    /// files whose scan was replaced since the last step.
+    /// files whose scan was replaced or that moved since the last step.
     pub(super) fn fold(&mut self, db: &DbIndex) -> CallRoleChanges {
         let scans = db
             .helper_scan_files()
@@ -282,11 +291,12 @@ impl GmodCallRoles {
         let mut replaced = contributions
             .files
             .iter()
-            .filter(|(file_id, (folded, _))| {
+            .filter(|(file_id, (folded, rank))| {
                 !current.contains(file_id)
                     || scans
                         .binary_search_by_key(file_id, |(file_id, _)| file_id)
                         .is_ok_and(|at| !Arc::ptr_eq(&scans[at].1, folded))
+                    || !rank.holds(db, file_id)
             })
             .map(|(file_id, _)| *file_id)
             .collect::<Vec<_>>();

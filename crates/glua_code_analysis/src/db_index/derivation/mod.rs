@@ -2286,12 +2286,9 @@ pub fn note_file_fact_read(fact: FileFact, file_id: FileId) {
     });
 }
 
-/// Records a read of `file_id`'s path. A derivation's own file is not a read:
-/// a move re-indexes the file, which replaces its derivations.
+/// Records a read of `file_id`'s path, its own file's included: a move keeps
+/// a file's derivations, and re-runs those that read where it is.
 pub fn note_file_path_read(file_id: FileId) {
-    if current().is_some_and(|id| id.file_id == file_id) {
-        return;
-    }
     note_file_fact_read(FileFact::FilePath, file_id);
 }
 

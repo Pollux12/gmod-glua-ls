@@ -2038,6 +2038,56 @@ impl LuaTypeIndex {
         self.reselect_extra_source(&decl_id);
     }
 
+    /// Ranks the `---@alias`, `---@enum` and `---@attribute` sources of each of
+    /// `order_keys`' files by its new order key, re-selecting each winner.
+    pub(crate) fn rekey_files(&mut self, order_keys: &[(FileId, Arc<str>)]) {
+        let keys = order_keys.iter().cloned().collect::<HashMap<_, _>>();
+        let rekeys = |site: &InFiled<TextRange>, order_key: &LuaDeclSourceKey| {
+            keys.get(&site.file_id)
+                .is_some_and(|key| order_key.file_order_key != *key)
+        };
+        let aliases = self
+            .alias_sources
+            .iter()
+            .filter(|(_, sources)| {
+                sources
+                    .iter()
+                    .any(|(site, source)| rekeys(site, &source.order_key))
+            })
+            .map(|(decl_id, _)| decl_id.clone())
+            .collect::<Vec<_>>();
+        let extras = self
+            .extra_sources
+            .iter()
+            .filter(|(_, sources)| {
+                sources
+                    .iter()
+                    .any(|(site, (order_key, _))| rekeys(site, order_key))
+            })
+            .map(|(decl_id, _)| decl_id.clone())
+            .collect::<Vec<_>>();
+        for decl_id in aliases {
+            if let Some(sources) = self.alias_sources.get_mut(&decl_id) {
+                for (site, source) in sources.iter_mut() {
+                    if let Some(key) = keys.get(&site.file_id) {
+                        source.order_key.file_order_key = key.clone();
+                    }
+                }
+            }
+            self.reselect_alias_source(&decl_id);
+        }
+        for decl_id in extras {
+            if let Some(sources) = self.extra_sources.get_mut(&decl_id) {
+                for (site, (order_key, _)) in sources.iter_mut() {
+                    if let Some(key) = keys.get(&site.file_id) {
+                        order_key.file_order_key = key.clone();
+                    }
+                }
+            }
+            self.reselect_extra_source(&decl_id);
+        }
+    }
+
     fn reselect_extra_source(&mut self, decl_id: &LuaTypeDeclId) {
         let winner = self.extra_sources.get(decl_id).and_then(|sources| {
             sources

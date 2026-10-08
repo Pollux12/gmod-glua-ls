@@ -2217,30 +2217,41 @@ struct Reached {
 }
 
 impl Reached {
-    /// Labels each file by the base, or by the warm run for a file it created.
+    /// Labels each file by its path in the base and in the warm run: a file
+    /// the run moved keeps its id and goes by both.
     fn of(
         base: &EmmyLuaAnalysis,
         warm: &EmmyLuaAnalysis,
         edited: &[FileId],
         reach: &Reach,
     ) -> Self {
-        let label = |file_id: &FileId| {
-            [base, warm]
-                .into_iter()
-                .find_map(|analysis| {
-                    analysis
-                        .compilation
-                        .get_db()
-                        .get_vfs()
-                        .get_file_path(file_id)
-                        .map(|path| path.display().to_string().replace('\\', "/"))
+        let labels = |file_ids: &[FileId]| {
+            file_ids
+                .iter()
+                .flat_map(|file_id| {
+                    let paths = [base, warm]
+                        .into_iter()
+                        .filter_map(|analysis| {
+                            analysis
+                                .compilation
+                                .get_db()
+                                .get_vfs()
+                                .get_file_path(file_id)
+                                .map(|path| path.display().to_string().replace('\\', "/"))
+                        })
+                        .collect::<Vec<_>>();
+                    if paths.is_empty() {
+                        vec![format!("{file_id:?}")]
+                    } else {
+                        paths
+                    }
                 })
-                .unwrap_or_else(|| format!("{file_id:?}"))
+                .collect()
         };
         Self {
-            edited: edited.iter().map(label).collect(),
-            evaluated: reach.evaluated.iter().map(label).collect(),
-            affected: reach.affected.iter().map(label).collect(),
+            edited: labels(edited),
+            evaluated: labels(&reach.evaluated),
+            affected: labels(&reach.affected),
         }
     }
 }
