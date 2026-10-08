@@ -466,6 +466,43 @@ impl Readers {
     }
 }
 
+/// The sorted `reads` with each source of `moves`, sorted by source, replaced
+/// by its target, sorted and without repeats.
+fn renamed_reads(reads: &[KeyIdx], moves: &[(KeyIdx, KeyIdx)]) -> Box<[KeyIdx]> {
+    let mut kept = Vec::with_capacity(reads.len());
+    let mut renamed = Vec::with_capacity(moves.len());
+    let mut next = 0;
+    for &read in reads {
+        while next < moves.len() && moves[next].0 < read {
+            next += 1;
+        }
+        match moves.get(next) {
+            Some(&(source, target)) if source == read => renamed.push(target),
+            _ => kept.push(read),
+        }
+    }
+    renamed.sort_unstable();
+    renamed.dedup();
+    let mut merged = Vec::with_capacity(kept.len() + renamed.len());
+    let (mut kept_at, mut renamed_at) = (0, 0);
+    while kept_at < kept.len() && renamed_at < renamed.len() {
+        if kept[kept_at] < renamed[renamed_at] {
+            merged.push(kept[kept_at]);
+            kept_at += 1;
+        } else if kept[kept_at] > renamed[renamed_at] {
+            merged.push(renamed[renamed_at]);
+            renamed_at += 1;
+        } else {
+            merged.push(kept[kept_at]);
+            kept_at += 1;
+            renamed_at += 1;
+        }
+    }
+    merged.extend_from_slice(&kept[kept_at..]);
+    merged.extend_from_slice(&renamed[renamed_at..]);
+    merged.into_boxed_slice()
+}
+
 /// Removes `deriv` from the sorted `derivs`, if there.
 fn take_from(derivs: &mut Vec<DerivIdx>, deriv: DerivIdx) {
     if let Ok(index) = derivs.binary_search(&deriv) {
@@ -724,6 +761,7 @@ impl KeyTable {
     /// The live slots of the keys naming a position in one of `files`, in
     /// slot order.
     fn positional_slots(&mut self, files: &FxHashSet<FileId>) -> Vec<KeyIdx> {
+        use rayon::prelude::*;
         let keys = &self.keys;
         let positional = self.positional.get_or_insert_with(|| {
             crate::profile::phase("reader graph: positional index", || build_positional(keys))
@@ -734,7 +772,7 @@ impl KeyTable {
             .flatten()
             .copied()
             .collect::<Vec<_>>();
-        slots.sort_unstable();
+        slots.par_sort_unstable();
         slots.dedup();
         slots
     }
@@ -973,10 +1011,35 @@ impl KeyTable {
     /// Whether no record reads or produces the key in `slot` and no key is
     /// read out of it.
     fn unreferenced(&self, slot: KeyIdx) -> bool {
+        self.unreferenced_after(slot, &FxHashMap::default())
+    }
+
+    /// [`Self::unreferenced`] with the derived keys `freed_from` counts freed
+    /// out of each base already gone from the base's list.
+    fn unreferenced_after(&self, slot: KeyIdx, freed_from: &FxHashMap<KeyIdx, usize>) -> bool {
         let entry = &self.keys[slot as usize];
         entry.readers.is_empty()
             && entry.producer == NO_PRODUCER
-            && !self.derived.contains_key(&slot)
+            && self
+                .derived
+                .get(&slot)
+                .is_none_or(|derived| freed_from.get(&slot) == Some(&derived.slots.len()))
+    }
+
+    /// Drops the freed slots from the derived keys of each of `bases`, and
+    /// the list of one left empty.
+    fn drop_freed_derived(&mut self, bases: impl Iterator<Item = KeyIdx>) {
+        for base in bases {
+            let Some(derived) = self.derived.get_mut(&base) else {
+                continue;
+            };
+            derived
+                .slots
+                .retain(|slot| self.keys[*slot as usize].key.is_some());
+            if derived.slots.is_empty() {
+                self.derived.remove(&base);
+            }
+        }
     }
 
     fn add_producer(&mut self, slot: KeyIdx, deriv: DerivIdx) {
@@ -1484,9 +1547,7 @@ impl ReaderGraph {
                 .filter(|slot| table.live_key(*slot).is_some() && table.unreferenced(*slot))
                 .collect()
         };
-        for slot in slots {
-            self.release_key(slot);
-        }
+        self.release_slots(slots, &FxHashMap::default());
     }
 
     /// [`Self::replace`] with the reads already interned at `now`. The slots
@@ -1899,24 +1960,33 @@ impl ReaderGraph {
     pub fn apply_edits(&mut self, edits: &EditMaps) -> AppliedEdits {
         use rayon::prelude::*;
         let files: FxHashSet<FileId> = edits.files().collect();
-        let slots = self.table.positional_slots(&files);
-        let keys = &self.table.keys;
-        let mapped = slots
-            .par_iter()
-            .filter_map(|slot| {
-                let entry = &keys[*slot as usize];
-                let key = entry.key.as_ref().filter(|_| !entry.readers.is_empty())?;
-                match edits.map_key(key) {
-                    Some(moved) if moved == **key => None,
-                    moved => Some((*slot, moved.map(HashedKey::new))),
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut renames = Vec::new();
+        let positional = crate::profile::phase("rename reads: positional slots", || {
+            self.table.positional_slots(&files)
+        });
+        let mapped = crate::profile::phase("rename reads: map keys", || {
+            let keys = &self.table.keys;
+            positional
+                .par_iter()
+                .filter_map(|slot| {
+                    let entry = &keys[*slot as usize];
+                    let key = entry.key.as_ref().filter(|_| !entry.readers.is_empty())?;
+                    match edits.map_key(key) {
+                        Some(moved) if moved == **key => None,
+                        moved => Some((*slot, moved.map(HashedKey::new))),
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        let mapped_keys = mapped.len();
+        let mut sources = Vec::new();
+        let mut new_keys = Vec::new();
         let mut lost = Vec::new();
         for (slot, moved) in mapped {
             match moved {
-                Some(moved) => renames.push((slot, moved)),
+                Some(moved) => {
+                    sources.push(slot);
+                    new_keys.push(moved);
+                }
                 None => lost.extend(
                     self.table.keys[slot as usize]
                         .readers
@@ -1925,46 +1995,88 @@ impl ReaderGraph {
                 ),
             }
         }
+        lost.sort();
+        lost.dedup();
+        let moved_to = new_keys.par_iter().cloned().collect::<Vec<_>>();
         // Every moved key gives up its readers before any takes new ones:
         // positions shift in chains, where one key's new place is another's
         // old one.
-        let moved = renames
-            .into_iter()
-            .map(|(slot, new_key)| {
-                let readers = std::mem::take(&mut self.table.keys[slot as usize].readers);
-                (slot, new_key, readers)
-            })
+        let taken = sources
+            .iter()
+            .map(|slot| std::mem::take(&mut self.table.keys[*slot as usize].readers))
             .collect::<Vec<_>>();
-        let mut rewrites: FxHashMap<DerivIdx, FxHashMap<KeyIdx, KeyIdx>> = FxHashMap::default();
-        let mut vacated = Vec::with_capacity(moved.len());
-        let mut moved_to = Vec::with_capacity(moved.len());
         let now = super::new_stamp();
-        for (slot, new_key, readers) in moved {
-            moved_to.push(new_key.clone());
-            let target = self.intern_key(new_key, now);
-            for (seen, deriv) in readers.iter() {
-                self.table.keys[target as usize].readers.insert(deriv, seen);
-                rewrites.entry(deriv).or_default().insert(slot, target);
-            }
-            vacated.push(slot);
-        }
-        for (deriv, rewrite) in rewrites {
+        let targets = crate::profile::phase("rename reads: intern moved keys", || {
+            new_keys
+                .into_iter()
+                .map(|key| self.intern_key(key, now))
+                .collect::<Vec<_>>()
+        });
+        let (edges, rewritten) = crate::profile::phase("rename reads: rewrite records", || {
+            let mut moves = sources
+                .par_iter()
+                .zip(&targets)
+                .zip(&taken)
+                .flat_map_iter(|((source, target), readers)| {
+                    let (source, target) = (*source, *target);
+                    readers
+                        .iter()
+                        .map(move |(_, deriv)| (deriv, source, target))
+                })
+                .collect::<Vec<_>>();
+            moves.par_sort_unstable();
+            let derivations = &self.derivations;
+            let rewritten = moves
+                .par_chunk_by(|left, right| left.0 == right.0)
+                .filter_map(|group| {
+                    let deriv = group[0].0;
+                    let record = derivations[deriv as usize].record.as_ref()?;
+                    let shifts = group
+                        .iter()
+                        .map(|&(_, source, target)| (source, target))
+                        .collect::<Vec<_>>();
+                    Some((deriv, renamed_reads(&record.reads, &shifts)))
+                })
+                .collect::<Vec<_>>();
+            (moves.len(), rewritten)
+        });
+        let rewrite_stats = crate::profile::phase_enabled().then(|| {
+            let reads = rewritten
+                .iter()
+                .map(|(_, reads)| reads.len())
+                .sum::<usize>();
+            (rewritten.len(), reads)
+        });
+        for (deriv, reads) in rewritten {
             if let Some(record) = self.derivations[deriv as usize].record.as_mut() {
-                let mut reads = record
-                    .reads
-                    .iter()
-                    .map(|key| rewrite.get(key).copied().unwrap_or(*key))
-                    .collect::<Vec<_>>();
-                reads.sort_unstable();
-                reads.dedup();
-                record.reads = reads.into_boxed_slice();
+                record.reads = reads;
             }
         }
-        for slot in vacated {
-            self.release_key(slot);
+        let moved = targets.len();
+        crate::profile::phase("rename reads: file readers", || {
+            for (target, readers) in targets.into_iter().zip(taken) {
+                let filed = &mut self.table.keys[target as usize].readers;
+                if filed.is_empty() {
+                    *filed = readers;
+                } else {
+                    for (seen, deriv) in readers.iter() {
+                        filed.insert(deriv, seen);
+                    }
+                }
+            }
+        });
+        crate::profile::phase("rename reads: release vacated", || {
+            self.release_keys(sources)
+        });
+        if let Some((records, reads)) = rewrite_stats {
+            eprintln!(
+                "[phase] rename reads: {} positional keys, {moved} moved, {} lost, {edges} reader edges, {records} records rewritten over {reads} reads, {} key slots ({} free)",
+                positional.len(),
+                mapped_keys - moved,
+                self.table.keys.len(),
+                self.table.free_keys.len()
+            );
         }
-        lost.sort();
-        lost.dedup();
         AppliedEdits {
             lost,
             moved: moved_to,
@@ -2515,20 +2627,41 @@ impl ReaderGraph {
         self.table.intern(key, now)
     }
 
-    /// Frees `slot` once no derivation reads or produces its key.
     /// Frees `slot` if no record reads or produces it. A freed slot reads as
     /// written after every memo, so none replays it.
+    #[cfg(test)]
     fn release_key(&mut self, slot: KeyIdx) {
-        self.release_key_unless_read(slot, &FxHashMap::default());
+        self.release_slots([slot], &FxHashMap::default());
     }
 
-    /// [`Self::release_key`], keeping a key `still_read` counts readers of
-    /// that have yet to leave it.
-    fn release_key_unless_read(&mut self, slot: KeyIdx, still_read: &FxHashMap<KeyIdx, usize>) {
+    /// Frees each of `slots` that no record reads or produces and no key is
+    /// read out of, and the bases that leaves unreferenced, keeping a key
+    /// `still_read` counts readers of that have yet to leave it. A base's list
+    /// of derived keys drops its freed slots once, after the last is freed.
+    fn release_slots(
+        &mut self,
+        slots: impl IntoIterator<Item = KeyIdx>,
+        still_read: &FxHashMap<KeyIdx, usize>,
+    ) {
+        let mut freed_from = FxHashMap::default();
+        for slot in slots {
+            self.release_one(slot, still_read, &mut freed_from);
+        }
+        self.table.drop_freed_derived(freed_from.into_keys());
+    }
+
+    /// [`Self::release_slots`] for one slot, counting in `freed_from` the
+    /// derived keys freed out of each base.
+    fn release_one(
+        &mut self,
+        slot: KeyIdx,
+        still_read: &FxHashMap<KeyIdx, usize>,
+        freed_from: &mut FxHashMap<KeyIdx, usize>,
+    ) {
         if still_read.get(&slot).is_some_and(|readers| *readers > 0) {
             return;
         }
-        if !self.table.unreferenced(slot) {
+        if !self.table.unreferenced_after(slot, freed_from) {
             return;
         }
         let entry = &mut self.table.keys[slot as usize];
@@ -2547,12 +2680,14 @@ impl ReaderGraph {
         else {
             return;
         };
-        if let Some(derived) = self.table.derived.get_mut(&base) {
-            derived.slots.retain(|derived| *derived != slot);
-            if derived.slots.is_empty() {
-                self.table.derived.remove(&base);
-                self.release_key_unless_read(base, still_read);
-            }
+        let Some(derived) = self.table.derived.get(&base) else {
+            return;
+        };
+        let derived_keys = derived.slots.len();
+        let freed = freed_from.entry(base).or_default();
+        *freed += 1;
+        if *freed == derived_keys {
+            self.release_one(base, still_read, freed_from);
         }
     }
 
@@ -2611,7 +2746,7 @@ impl ReaderGraph {
             if let Some(readers) = still_read.get_mut(key) {
                 *readers -= 1;
             }
-            self.release_key_unless_read(*key, still_read);
+            self.release_slots([*key], still_read);
         }
         let outputs = record
             .outputs
@@ -2619,7 +2754,7 @@ impl ReaderGraph {
             .map(|key| {
                 let fact = self.key(*key).clone();
                 self.unproduce(*key, deriv, id.file_id);
-                self.release_key_unless_read(*key, still_read);
+                self.release_slots([*key], still_read);
                 fact
             })
             .collect();
@@ -3546,5 +3681,232 @@ mod tests {
             graph.latest_upstream_loops(&loops, &all, |_| true),
             [None, None]
         );
+    }
+
+    /// The slots, derived keys, free slots and records of `graph`, as filed.
+    fn filed_graph(graph: &ReaderGraph) -> String {
+        let keys = (0..graph.table.keys.len())
+            .map(|slot| {
+                let entry = &graph.table.keys[slot];
+                format!(
+                    "{slot} {:?} {:?}",
+                    entry.key.as_ref().map(HashedKey::key),
+                    entry.readers
+                )
+            })
+            .collect::<Vec<_>>();
+        let records = graph
+            .derivations
+            .iter()
+            .map(|slot| {
+                format!(
+                    "{:?} {:?}",
+                    slot.id,
+                    slot.record.as_ref().map(|record| &record.reads)
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut derived = graph
+            .table
+            .derived
+            .iter()
+            .map(|(base, derived)| (*base, derived.slots.clone()))
+            .collect::<Vec<_>>();
+        derived.sort();
+        format!(
+            "{keys:#?}\n{records:#?}\n{derived:?}\n{:?}",
+            graph.table.free_keys
+        )
+    }
+
+    fn decl_key(file: u32, position: u32) -> HashedKey {
+        HashedKey::new(FactKey::Decl(crate::LuaDeclId::new(
+            FileId::new(file),
+            TextSize::new(position),
+        )))
+    }
+
+    /// Derivations reading several declarations of file 1, at positions that
+    /// neighbour each other, each at a value that varies with the reader.
+    fn crowded_decl_graph() -> ReaderGraph {
+        let mut graph = ReaderGraph::default();
+        for reader in 0..600u32 {
+            let mut positions = (1..=5u32)
+                .map(|step| (reader * (2 * step + 5)) % 400)
+                .collect::<Vec<_>>();
+            positions.sort_unstable();
+            positions.dedup();
+            let mut reads = positions
+                .into_iter()
+                .map(|position| {
+                    let seen = u64::from((reader + position) % 3) + 1;
+                    (decl_key(1, position), Some(seen))
+                })
+                .collect::<Vec<_>>();
+            reads.push((decl_key(2, reader % 50), Some(7)));
+            graph.replace(id(2, reader), reads, vec![], |_| 0);
+        }
+        graph
+    }
+
+    /// Renames the reads of the keys `edits` moved one key at a time.
+    fn renamed_one_at_a_time(graph: &mut ReaderGraph, edits: &EditMaps) -> AppliedEdits {
+        let files: FxHashSet<FileId> = edits.files().collect();
+        let mut lost = Vec::new();
+        let mut renames = Vec::new();
+        for slot in graph.table.positional_slots(&files) {
+            let entry = &graph.table.keys[slot as usize];
+            let Some(key) = entry.key.as_ref().filter(|_| !entry.readers.is_empty()) else {
+                continue;
+            };
+            match edits.map_key(key) {
+                Some(new) if new == **key => {}
+                Some(new) => renames.push((slot, HashedKey::new(new))),
+                None => lost.extend(
+                    entry
+                        .readers
+                        .iter()
+                        .map(|(_, deriv)| graph.derivations[deriv as usize].id),
+                ),
+            }
+        }
+        let taken = renames
+            .iter()
+            .map(|(slot, _)| std::mem::take(&mut graph.table.keys[*slot as usize].readers))
+            .collect::<Vec<_>>();
+        let now = super::super::new_stamp();
+        let mut moved = Vec::new();
+        let mut rewrites: FxHashMap<DerivIdx, FxHashMap<KeyIdx, KeyIdx>> = FxHashMap::default();
+        for ((slot, new_key), readers) in renames.iter().zip(&taken) {
+            moved.push(new_key.clone());
+            let target = graph.intern_key(new_key.clone(), now);
+            for (seen, deriv) in readers.iter() {
+                graph.table.keys[target as usize]
+                    .readers
+                    .insert(deriv, seen);
+                rewrites.entry(deriv).or_default().insert(*slot, target);
+            }
+        }
+        for (deriv, rewrite) in rewrites {
+            if let Some(record) = graph.derivations[deriv as usize].record.as_mut() {
+                let mut reads = record
+                    .reads
+                    .iter()
+                    .map(|key| rewrite.get(key).copied().unwrap_or(*key))
+                    .collect::<Vec<_>>();
+                reads.sort_unstable();
+                reads.dedup();
+                record.reads = reads.into_boxed_slice();
+            }
+        }
+        for (slot, _) in &renames {
+            graph.release_key(*slot);
+        }
+        lost.sort();
+        lost.dedup();
+        AppliedEdits { lost, moved }
+    }
+
+    /// An insertion shifts the declarations after it in chains onto each
+    /// other's places, a deletion merges the ones after it onto the places of
+    /// the ones it removed.
+    #[test]
+    fn applying_edits_files_the_graph_as_renaming_one_key_at_a_time_does() {
+        use crate::PositionMap;
+        let plain = "a".repeat(400);
+        let inserted = format!("{}x{}", "a".repeat(150), "a".repeat(250));
+        let with_gap = format!("{}{}{}", "a".repeat(100), "b".repeat(10), "c".repeat(290));
+        let deleted = format!("{}{}", "a".repeat(100), "c".repeat(290));
+        for (old, new) in [(plain, inserted), (with_gap, deleted)] {
+            let edits = EditMaps::new([(FileId::new(1), PositionMap::new(&old, &new))]);
+            let mut graph = crowded_decl_graph();
+            let mut reference = graph.clone();
+
+            let applied = graph.apply_edits(&edits);
+            let expected = renamed_one_at_a_time(&mut reference, &edits);
+
+            assert!(!applied.moved.is_empty());
+            assert_eq!(applied.lost, expected.lost);
+            assert_eq!(applied.moved, expected.moved);
+            assert_eq!(filed_graph(&graph), filed_graph(&reference));
+        }
+    }
+
+    /// Typing and undoing in a file leaves the key table the size it was.
+    #[test]
+    fn edits_that_cancel_leave_the_key_table_the_size_it_was() {
+        use crate::PositionMap;
+        let text = "a".repeat(40);
+        let grown = format!("b{text}");
+        let grow = EditMaps::new([(FileId::new(1), PositionMap::new(&text, &grown))]);
+        let shrink = EditMaps::new([(FileId::new(1), PositionMap::new(&grown, &text))]);
+        let mut graph = ReaderGraph::default();
+        for reader in 0..30 {
+            graph.replace(
+                id(2, reader),
+                vec![(decl_key(1, 5 + reader), Some(5))],
+                vec![],
+                |_| 0,
+            );
+        }
+        graph.apply_edits(&grow);
+        graph.apply_edits(&shrink);
+        let settled = (graph.table.keys.len(), graph.table.free_keys.len());
+
+        for _ in 0..10 {
+            graph.apply_edits(&grow);
+            graph.apply_edits(&shrink);
+        }
+
+        assert_eq!(
+            (graph.table.keys.len(), graph.table.free_keys.len()),
+            settled
+        );
+        assert_eq!(graph.read_keys().count(), 30);
+        assert!((5..35).all(|position| graph.table.find(&decl_key(1, position)).is_some()));
+    }
+
+    /// Freeing keys read out of one base together drops them from its list
+    /// once, and frees the base after the last, as freeing them singly does.
+    #[test]
+    fn releasing_derived_keys_in_a_batch_frees_what_releasing_them_singly_frees() {
+        let references = |position: u32| {
+            HashedKey::new(FactKey::DeclReferences(crate::LuaDeclId::new(
+                FileId::new(1),
+                TextSize::new(position),
+            )))
+        };
+        let base = HashedKey::new(FactKey::References(FileId::new(1)));
+        let mut graph = ReaderGraph::default();
+        let slots = (0..40)
+            .map(|position| graph.intern_read(references(position)))
+            .collect::<Vec<_>>();
+        let evens = slots.iter().copied().step_by(2).collect::<Vec<_>>();
+        let odds = slots.iter().copied().skip(1).step_by(2).collect::<Vec<_>>();
+        let mut batched = graph.clone();
+        let mut singly = graph.clone();
+
+        batched.release_keys(evens.clone());
+        for slot in &evens {
+            singly.release_key(*slot);
+        }
+
+        assert_eq!(filed_graph(&batched), filed_graph(&singly));
+        assert_eq!(
+            batched.derived_keys(&base),
+            (0..40)
+                .skip(1)
+                .step_by(2)
+                .map(references)
+                .collect::<Vec<_>>()
+        );
+
+        batched.release_keys(odds.clone());
+        for slot in &odds {
+            singly.release_key(*slot);
+        }
+
+        assert_eq!(filed_graph(&batched), filed_graph(&singly));
+        assert!(batched.find_slot(&base).is_none());
     }
 }
