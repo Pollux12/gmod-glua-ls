@@ -210,12 +210,12 @@ impl LuaCallTargetIndex {
     }
 
     /// Moves the signatures of `remap`'s file the targets name to their new
-    /// place. A holder whose target names a signature the edit destroyed is
-    /// reported for re-analysis instead.
-    pub fn remap_file_identities(&mut self, remap: &crate::FileRemap) -> FxHashSet<FileId> {
-        let mut dirty = FxHashSet::default();
+    /// place. A holder whose target names a signature the edit destroyed has
+    /// its targets reported to be resolved again instead.
+    pub fn remap_file_identities(&mut self, remap: &crate::FileRemap) -> Vec<crate::LostFact> {
+        let mut lost = Vec::new();
         if remap.map.is_identity() {
-            return dirty;
+            return lost;
         }
         let mut holders = self
             .referencing
@@ -231,17 +231,22 @@ impl LuaCallTargetIndex {
             for (range, target) in &held.targets {
                 let mut remapped = target.clone();
                 let mut changed = false;
+                let mut named_lost = false;
                 for signature_id in remapped.signature_ids_mut() {
                     match remap.signature_id(*signature_id) {
                         crate::Remap::Moved(new) if new != *signature_id => {
                             *signature_id = new;
                             changed = true;
                         }
-                        crate::Remap::Lost => {
-                            dirty.insert(holder);
-                        }
+                        crate::Remap::Lost => named_lost = true,
                         crate::Remap::Moved(_) | crate::Remap::Unrelated => {}
                     }
+                }
+                if named_lost {
+                    lost.push(crate::LostFact::new(
+                        holder,
+                        FactKey::CallTarget(InFiled::new(holder, *range)),
+                    ));
                 }
                 if changed {
                     moved.push((*range, remapped));
@@ -252,7 +257,7 @@ impl LuaCallTargetIndex {
                 self.set_target(holder, range, remapped);
             }
         }
-        dirty
+        lost
     }
 
     pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {

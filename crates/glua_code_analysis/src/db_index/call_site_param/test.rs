@@ -159,7 +159,13 @@ mod tests {
             crate::PositionMap::new("abcdef", "abXYef"),
         ));
 
-        assert_eq!(dirty.into_iter().collect::<Vec<_>>(), vec![caller]);
+        assert_eq!(
+            dirty,
+            [crate::LostFact::new(
+                caller,
+                crate::db_index::derivation::FactKey::CallSiteFile(caller)
+            )]
+        );
         assert_eq!(
             index.get_inferred_param(&destroyed, 0),
             Some(&LuaType::Integer)

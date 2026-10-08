@@ -3214,13 +3214,10 @@ impl LuaMemberIndex {
     /// Re-homes every table-literal owner in the edited file onto its new
     /// range, and purges the ones the edit destroyed.
     ///
-    /// Returns the members forgotten with a destroyed owner - their cached
-    /// types have to come off with them - and the files that had registered a
-    /// member on one, which nothing else will rebuild.
-    pub fn remap_file_element_owners(
-        &mut self,
-        remap: &crate::FileRemap,
-    ) -> (Vec<LuaMemberId>, HashSet<FileId>) {
+    /// Returns the members forgotten with a destroyed owner: their cached
+    /// types have to come off with them, and their writers have to take them
+    /// again.
+    pub fn remap_file_element_owners(&mut self, remap: &crate::FileRemap) -> Vec<LuaMemberId> {
         let mut moved: rustc_hash::FxHashMap<crate::InFiled<TextRange>, crate::InFiled<TextRange>> =
             rustc_hash::FxHashMap::default();
         let mut deleted: Vec<crate::InFiled<TextRange>> = Vec::new();
@@ -3233,14 +3230,6 @@ impl LuaMemberIndex {
                 }
                 crate::Remap::Unrelated => {}
                 crate::Remap::Lost => deleted.push(range),
-            }
-        }
-
-        let mut dirty = HashSet::default();
-        for range in &deleted {
-            let owner = LuaMemberOwner::Element(range.clone());
-            for member in self.get_members(&owner).unwrap_or_default() {
-                dirty.insert(member.get_id().file_id);
             }
         }
 
@@ -3271,9 +3260,7 @@ impl LuaMemberIndex {
         }
 
         self.remap_elements(&moved);
-        let forgotten = self.remove_deleted_element_owners(&deleted);
-        dirty.remove(&remap.file_id);
-        (forgotten, dirty)
+        self.remove_deleted_element_owners(&deleted)
     }
 
     pub fn remap_elements(

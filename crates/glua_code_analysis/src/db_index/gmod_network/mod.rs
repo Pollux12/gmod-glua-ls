@@ -768,19 +768,16 @@ impl GmodNetworkIndex {
     }
 
     /// Carries the positions of `remap`'s file that other files' flows name
-    /// to their new place. Returns the files whose flows named one the edit
-    /// destroyed.
-    pub(crate) fn remap_file_positions(
-        &mut self,
-        remap: &FileRemap,
-    ) -> std::collections::HashSet<FileId> {
+    /// to their new place. Returns the flows of each file that named one the
+    /// edit destroyed.
+    pub(crate) fn remap_file_positions(&mut self, remap: &FileRemap) -> Vec<crate::LostFact> {
         let mut files = self
             .referencing
             .get(&remap.file_id)
             .map(|files| files.iter().copied().collect::<Vec<_>>())
             .unwrap_or_default();
         files.sort_unstable();
-        let mut lost = std::collections::HashSet::default();
+        let mut lost = Vec::new();
         for file_id in files {
             let Some(data) = self.file_data.get(&file_id) else {
                 continue;
@@ -788,7 +785,7 @@ impl GmodNetworkIndex {
             match remap_file_data(data, remap) {
                 Remap::Moved(data) => self.add_file_data(file_id, data),
                 Remap::Lost => {
-                    lost.insert(file_id);
+                    lost.push(crate::LostFact::new(file_id, FactKey::NetworkFile(file_id)));
                 }
                 Remap::Unrelated => {}
             }

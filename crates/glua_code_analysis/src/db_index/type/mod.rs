@@ -1464,6 +1464,11 @@ struct StatementType {
     metadata: Option<LuaTypeFactMetadata>,
 }
 
+/// The fact holding the type `owner`'s statements wrote.
+fn statement_fact(owner: &LuaTypeOwner) -> crate::LostFact {
+    crate::LostFact::new(owner.get_file_id(), FactKey::TypeCache(owner.clone()))
+}
+
 /// Notes a write of `owner`'s stored type. A file's local fallbacks move it
 /// without producing it: what they publish over the statements is theirs, a
 /// [`FactKey::TypeFallbacks`], and the statements stay its producers.
@@ -3135,9 +3140,13 @@ impl LuaTypeIndex {
     /// rather than as part of a file sweep.
     ///
     /// A member whose owning table literal is gone leaves a cache entry no
-    /// re-index will reach, because the file it belongs to is not being
-    /// re-analysed.
-    pub fn remove_member_type_caches(&mut self, member_ids: &[crate::LuaMemberId]) {
+    /// re-index of its own file will reach. Returns the owners that had one,
+    /// for their producers to compute again.
+    pub fn remove_member_type_caches(
+        &mut self,
+        member_ids: &[crate::LuaMemberId],
+    ) -> Vec<LuaTypeOwner> {
+        let mut removed = Vec::new();
         for member_id in member_ids {
             let owner = LuaTypeOwner::Member(*member_id);
             derivation::note_write(|| FactKey::TypeCache(owner.clone()));
@@ -3149,11 +3158,13 @@ impl LuaTypeIndex {
             if let Some(previous) = self.types.remove(&owner) {
                 self.cache_refs
                     .remove(member_id.file_id, previous.as_type());
+                removed.push(owner.clone());
             }
             self.fact_metadata.remove(&owner);
             self.drop_fact_refs(&owner);
             self.source_types.remove(&owner);
         }
+        removed
     }
 
     /// Rewrites every cached type, definition fact and inference-support array
@@ -3161,14 +3172,14 @@ impl LuaTypeIndex {
     /// `rebuilt`, which the file's re-indexed source layer wrote at the new
     /// positions already.
     ///
-    /// Returns the files whose entry named something the edit destroyed: those
-    /// cannot be rewritten and have to be re-analysed instead.
+    /// Returns the facts whose entry named something the edit destroyed: those
+    /// cannot be rewritten and have to be computed again instead.
     pub fn remap_file_identities(
         &mut self,
         remap: &crate::FileRemap,
         rebuilt: &HashSet<LuaTypeOwner>,
-    ) -> HashSet<FileId> {
-        let mut dirty = HashSet::default();
+    ) -> Vec<crate::LostFact> {
+        let mut lost = Vec::new();
 
         // Only caches that actually name an identity in the edited file can
         // contain something the edit moved or destroyed, and `cache_refs`
@@ -3193,7 +3204,7 @@ impl LuaTypeIndex {
             {
                 let result = remap_identities_in_type(cache.as_type(), remap);
                 if result.lost {
-                    dirty.insert(owner.get_file_id());
+                    lost.push(statement_fact(&owner));
                 } else if let Some(new_type) = result.typ {
                     let cache = match cache {
                         LuaTypeCache::DocType(_) => LuaTypeCache::DocType(new_type),
@@ -3213,9 +3224,9 @@ impl LuaTypeIndex {
             };
             let result = remap_identities_in_type(cache.as_type(), remap);
             if result.lost {
-                // A lost nested identity is left in place; the owner is
-                // re-analysed instead of being rewritten to a guessed value.
-                dirty.insert(owner.get_file_id());
+                // A lost nested identity is left in place; the owner's type is
+                // computed again instead of being rewritten to a guessed value.
+                lost.push(self.visible_type_fact(&owner));
             } else if let Some(new_type) = result.typ {
                 let new_cache = match &cache.cache {
                     LuaTypeCache::DocType(_) => LuaTypeCache::DocType(new_type),
@@ -3239,9 +3250,19 @@ impl LuaTypeIndex {
         if !changed_files.is_empty() {
             self.mark_inference_derived_state_dirty();
         }
-        dirty.extend(self.remap_inference_facts(remap));
-        dirty.remove(&remap.file_id);
-        dirty
+        lost.extend(self.remap_inference_facts(remap));
+        lost
+    }
+
+    /// The fact holding `owner`'s visible type: its file's local fallbacks
+    /// when they cover it, else the type the statements wrote.
+    fn visible_type_fact(&self, owner: &LuaTypeOwner) -> crate::LostFact {
+        if self.statement_type(owner).is_some() {
+            let file_id = owner.get_file_id();
+            crate::LostFact::new(file_id, FactKey::TypeFallbacks(file_id))
+        } else {
+            statement_fact(owner)
+        }
     }
 
     /// Rewrites the provenance of every stored fact, and the payload of every
@@ -3254,8 +3275,8 @@ impl LuaTypeIndex {
     /// another file's table literal or signature; its provenance names the
     /// inference nodes the fact was derived from, which is what
     /// `files_depending_on_inference_nodes` indexes.
-    fn remap_inference_facts(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
-        let mut dirty = HashSet::default();
+    fn remap_inference_facts(&mut self, remap: &crate::FileRemap) -> Vec<crate::LostFact> {
+        let mut lost_facts = Vec::new();
         let mut metadata_updates = Vec::new();
         let candidates = self
             .fact_refs_by_file
@@ -3273,10 +3294,10 @@ impl LuaTypeIndex {
                     }
                 })
             };
-            let mut lost = false;
+            let mut statement_lost = false;
             if let Some(statement) = self.statement_type(&owner)
                 && let Some(metadata) = &statement.metadata
-                && let Some(metadata) = remapped(metadata, &mut lost)
+                && let Some(metadata) = remapped(metadata, &mut statement_lost)
             {
                 statement_updates.push((
                     owner.clone(),
@@ -3286,13 +3307,17 @@ impl LuaTypeIndex {
                     },
                 ));
             }
+            let mut visible_lost = false;
             if let Some(metadata) = self.fact_metadata.get(&owner)
-                && let Some(metadata) = remapped(metadata, &mut lost)
+                && let Some(metadata) = remapped(metadata, &mut visible_lost)
             {
                 metadata_updates.push((owner.clone(), metadata));
             }
-            if lost {
-                dirty.insert(owner.get_file_id());
+            if statement_lost {
+                lost_facts.push(statement_fact(&owner));
+            }
+            if visible_lost {
+                lost_facts.push(self.visible_type_fact(&owner));
             }
         }
         statement_updates.sort_by(|left, right| left.0.stable_cmp(&right.0));
@@ -3321,7 +3346,10 @@ impl LuaTypeIndex {
                 fact_updates.push((definition, fact));
             }
             if lost {
-                dirty.insert(definition.file_id());
+                lost_facts.push(crate::LostFact::new(
+                    definition.file_id(),
+                    FactKey::DefinitionFact(definition),
+                ));
             }
         }
         fact_updates.sort_by(|left, right| left.0.stable_cmp(&right.0));
@@ -3329,7 +3357,7 @@ impl LuaTypeIndex {
             self.definition_facts.insert(definition, fact);
             derivation::note_write(|| FactKey::DefinitionFact(definition));
         }
-        dirty
+        lost_facts
     }
 
     /// What `fork`, a task fork of `frozen`, changed that the merged state
@@ -5140,7 +5168,10 @@ mod remap_walker_tests {
         let deletion = FileRemap::unvalidated(source, PositionMap::new("XXabcde", "XXa"));
         assert_eq!(
             index.remap_file_identities(&deletion, &HashSet::default()),
-            [consumer].into_iter().collect(),
+            [crate::LostFact::new(
+                consumer,
+                FactKey::DefinitionFact(definition)
+            )],
         );
     }
 

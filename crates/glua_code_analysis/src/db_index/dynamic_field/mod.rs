@@ -470,11 +470,11 @@ impl DynamicFieldIndex {
     /// Re-keys the table-literal owners in the edited file and drops the
     /// groups whose literal the edit destroyed.
     ///
-    /// Returns the files that contributed a field to a destroyed group: a
-    /// dynamic field is filed under the literal's range and a write from
-    /// another file is not re-collected when this one is re-indexed, so
-    /// nothing else rebuilds it.
-    pub fn remap_file_table_owners(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
+    /// Returns the dynamic fields of each file that contributed a field to a
+    /// destroyed group: a dynamic field is filed under the literal's range and
+    /// a write from another file is not re-collected when this one is
+    /// re-indexed, so nothing else rebuilds it.
+    pub fn remap_file_table_owners(&mut self, remap: &crate::FileRemap) -> Vec<crate::LostFact> {
         // A table literal's owner lives in its file's shard, so the file's
         // entries are exactly its literals' owners.
         let file_id = remap.file_id;
@@ -517,7 +517,7 @@ impl DynamicFieldIndex {
 
         self.remap_table_ranges(&moved);
 
-        let mut dirty = HashSet::default();
+        let mut dirty = Vec::new();
         if !lost.is_empty() {
             // Ticked in a stable owner order: the counter values must not
             // depend on hash iteration. Comparison-only, but deterministic
@@ -556,14 +556,16 @@ impl DynamicFieldIndex {
                 entries.wildcards.retain(|(owner, _)| !lost.contains(owner));
                 entries.finite.retain(|(owner, _)| !lost.contains(owner));
                 if entries.named.len() + entries.wildcards.len() != before {
-                    dirty.insert(site.file_id);
+                    dirty.push(crate::LostFact::new(
+                        site.file_id,
+                        FactKey::DynamicFieldSite(site.clone()),
+                    ));
                 }
                 if entries.is_empty() {
                     self.site_contributions.remove(&site);
                 }
             }
         }
-        dirty.remove(&remap.file_id);
         dirty
     }
 
@@ -1570,7 +1572,13 @@ mod tests {
             crate::PositionMap::new("abcdefgh", "abXh"),
         ));
 
-        assert_eq!(dirty, HashSet::from_iter([contributor]));
+        assert_eq!(
+            dirty,
+            [range(1, 2), range(3, 4)].map(|site| crate::LostFact::new(
+                contributor,
+                FactKey::DynamicFieldSite(InFiled::new(contributor, site))
+            ))
+        );
         assert!(!index.has_field(&lost, "f"));
         assert!(file_sites(&index, contributor).is_empty());
         assert!(index.has_field(&moved, "g"));

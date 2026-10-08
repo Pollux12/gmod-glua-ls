@@ -218,10 +218,11 @@ impl CallSiteParamIndex {
 
     /// Carries the evidence other files contributed through the edited file's
     /// moved identities: a callee signature, and whatever its types and
-    /// provenance name. Returns the files whose evidence named an identity the
-    /// edit destroyed; theirs stays as it is until they are analysed again.
-    pub fn remap_file_identities(&mut self, remap: &FileRemap) -> HashSet<FileId> {
-        let mut dirty = HashSet::default();
+    /// provenance name. Returns the evidence of each file that named an
+    /// identity the edit destroyed; it stays as it is until it is computed
+    /// again.
+    pub fn remap_file_identities(&mut self, remap: &FileRemap) -> Vec<crate::LostFact> {
+        let mut dirty = Vec::new();
         let contributing = self
             .referencing
             .get(&remap.file_id)
@@ -254,7 +255,10 @@ impl CallSiteParamIndex {
                 })
                 .collect::<Vec<_>>();
             if lost {
-                dirty.insert(file_id);
+                dirty.push(crate::LostFact::new(
+                    file_id,
+                    FactKey::CallSiteFile(file_id),
+                ));
             } else if moved {
                 self.set_file_contributions(file_id, remapped);
             }

@@ -357,10 +357,10 @@ impl LuaModuleIndex {
     }
 
     /// Rewrites the exports of other files' modules that name positions of
-    /// `remap.file_id`. Returns the files whose export named a position the
-    /// edit destroyed: they are re-analysed instead.
-    pub fn remap_file_exports(&mut self, remap: &crate::FileRemap) -> FxHashSet<FileId> {
-        let mut lost = FxHashSet::default();
+    /// `remap.file_id`. Returns the modules whose export named a position the
+    /// edit destroyed: they are computed again instead.
+    pub fn remap_file_exports(&mut self, remap: &crate::FileRemap) -> Vec<crate::LostFact> {
+        let mut lost = Vec::new();
         let mut file_ids = self
             .export_refs
             .get(&remap.file_id)
@@ -382,7 +382,7 @@ impl LuaModuleIndex {
             if export.as_ref().is_some_and(|export| export.lost)
                 || semantic_id.as_ref().is_some_and(crate::Remap::is_lost)
             {
-                lost.insert(*file_id);
+                lost.push(crate::LostFact::new(*file_id, FactKey::Module(*file_id)));
                 continue;
             }
             let mut moved = false;

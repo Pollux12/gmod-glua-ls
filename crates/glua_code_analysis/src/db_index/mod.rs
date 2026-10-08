@@ -812,28 +812,26 @@ impl DbIndex {
     }
 
     /// Carries the positions of `remap`'s file that other files' net helpers
-    /// name to their new place. Returns the files whose net helpers named one
-    /// the edit destroyed.
-    pub(crate) fn remap_net_helpers(
-        &mut self,
-        remap: &crate::FileRemap,
-    ) -> std::collections::HashSet<FileId> {
+    /// name to their new place. Returns the net helpers of each file that
+    /// named one the edit destroyed.
+    pub(crate) fn remap_net_helpers(&mut self, remap: &crate::FileRemap) -> Vec<crate::LostFact> {
         let mut files = self
             .net_helper_refs
             .get(&remap.file_id)
             .map(|files| files.iter().copied().collect::<Vec<_>>())
             .unwrap_or_default();
         files.sort_unstable();
-        let mut lost = std::collections::HashSet::default();
+        let mut lost = Vec::new();
         for file_id in files {
             let Some((helpers, _)) = self.net_helpers.get(&file_id) else {
                 continue;
             };
             match helpers.remap(remap) {
                 crate::Remap::Moved(helpers) => self.store_net_helpers(file_id, helpers),
-                crate::Remap::Lost => {
-                    lost.insert(file_id);
-                }
+                crate::Remap::Lost => lost.push(crate::LostFact::new(
+                    file_id,
+                    derivation::FactKey::NetHelpers(file_id),
+                )),
                 crate::Remap::Unrelated => {}
             }
         }

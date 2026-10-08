@@ -217,9 +217,10 @@ impl LuaMetatableIndex {
     ///
     /// Both halves of a binding are table literals and either can live in a
     /// file other than the one that wrote the call, so both sides are mapped.
-    /// Returns the files whose binding named a literal the edit destroyed.
-    pub fn remap_file_ranges(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
-        let mut dirty = HashSet::default();
+    /// Returns the bindings that named a literal the edit destroyed, each with
+    /// the file that wrote it.
+    pub fn remap_file_ranges(&mut self, remap: &crate::FileRemap) -> Vec<crate::LostFact> {
+        let mut lost = Vec::new();
         let mut sites = self
             .metatables
             .file_entries(remap.file_id)
@@ -256,9 +257,10 @@ impl LuaMetatableIndex {
                         ..binding
                     }),
                     // Only the writer can record this binding again.
-                    _ => {
-                        dirty.insert(binding.writer_file_id);
-                    }
+                    _ => lost.push(crate::LostFact::new(
+                        binding.writer_file_id,
+                        FactKey::Metatable(table.clone()),
+                    )),
                 }
             }
             if let Some(new_table) = new_table
@@ -306,15 +308,17 @@ impl LuaMetatableIndex {
                 true
             });
             if bindings.len() != previous.len() {
-                dirty.insert(writer);
+                lost.push(crate::LostFact::new(
+                    writer,
+                    FactKey::MetatableFactory(writer),
+                ));
             }
             if bindings.is_empty() {
                 self.factory_bindings.remove(&writer);
             }
             self.relink_factory_writer(writer, &previous);
         }
-        dirty.remove(&remap.file_id);
-        dirty
+        lost
     }
 
     pub fn factory_bindings_for_file(
@@ -431,7 +435,8 @@ mod tests {
     use rustc_hash::{FxHashMap, FxHashSet};
 
     use super::{LuaIndex, LuaMetatableIndex, SetmetatableFactoryBinding, factory_files};
-    use crate::{FileId, FileRemap, InFiled, PositionMap};
+    use crate::db_index::derivation::FactKey;
+    use crate::{FileId, FileRemap, InFiled, LostFact, PositionMap};
 
     fn key(path: &str) -> Arc<str> {
         Arc::from(path)
@@ -518,7 +523,13 @@ mod tests {
             metatable_file,
             PositionMap::whole_file(100, 0),
         ));
-        assert_eq!(deleted, FxHashSet::from_iter([writer]));
+        assert_eq!(
+            deleted,
+            [
+                LostFact::new(writer, FactKey::Metatable(moved.clone())),
+                LostFact::new(writer, FactKey::MetatableFactory(writer)),
+            ]
+        );
         assert_eq!(
             index.get(&moved),
             Some(&InFiled::new(table_file, range(50)))

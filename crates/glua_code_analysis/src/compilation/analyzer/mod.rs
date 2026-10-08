@@ -756,23 +756,15 @@ fn follow_edits(
                 rerun(engine, producer);
             }
         }
-        let mut lost = crate::profile::phase("follow edits: remap indexes", || {
+        let lost = crate::profile::phase("follow edits: remap indexes", || {
             crate::remap_into_file(db, &remap)
-        })
-        .into_iter()
-        .collect::<Vec<_>>();
-        lost.sort();
-        if crate::profile::tracing_evaluations() {
-            eprintln!("[trace] remap of {file_id:?} lost positions in {lost:?}");
+        });
+        if crate::profile::tracing_evaluations() && !lost.is_empty() {
+            let keys = lost.iter().map(|fact| &fact.key).collect::<Vec<_>>();
+            eprintln!("[trace] remap of {file_id:?} lost positions in {keys:?}");
         }
-        for lost_file in lost {
-            let ids = db
-                .reader_graph()
-                .derivations_of_file(lost_file)
-                .collect::<Vec<_>>();
-            for id in ids {
-                rerun(engine, id);
-            }
+        for id in producers_of_lost(db, file_id, &lost) {
+            rerun(engine, id);
         }
     }
     let applied = crate::profile::phase("follow edits: rename reads", || {
@@ -798,6 +790,41 @@ fn follow_edits(
         })
         .chain(applied.moved)
         .collect()
+}
+
+/// The derivations that compute `lost` again, sorted: each fact's producers
+/// outside the edited file, whose own derivations its source layer already
+/// re-runs. A fact no derivation produced is rebuilt by re-analysing the file
+/// storing it whole. Read before the reader graph takes the edits, while it
+/// still files each key at the positions the remap found it under.
+fn producers_of_lost(
+    db: &DbIndex,
+    edited: FileId,
+    lost: &[crate::LostFact],
+) -> Vec<derivation::DerivationId> {
+    let graph = db.reader_graph();
+    let mut ids = Vec::new();
+    let mut unproduced = Vec::new();
+    for fact in lost {
+        let producers = graph
+            .producers(&derivation::HashedKey::new(fact.key.clone()))
+            .collect::<Vec<_>>();
+        if producers.is_empty() {
+            unproduced.push(fact.file_id);
+        }
+        ids.extend(producers.into_iter().filter(|id| id.file_id != edited));
+    }
+    unproduced.sort_unstable();
+    unproduced.dedup();
+    if crate::profile::tracing_evaluations() && !unproduced.is_empty() {
+        eprintln!("[trace] lost facts no derivation produced in {unproduced:?}");
+    }
+    for file_id in unproduced {
+        ids.extend(graph.derivations_of_file(file_id));
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 /// Re-takes which files the signatures of every file whose signatures moved

@@ -1122,6 +1122,78 @@ local first = controllers[1]
         assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![shared]);
     }
 
+    const LIB: &str = "lua/autorun/sh_lib.lua";
+    const LIB_TEXT: &str = "Lib = Lib or {}
+Lib.first = function() end
+Lib.second = function() end
+Lib.third = function() end
+";
+    const LIB_CALLER: &str = "lua/autorun/client/cl_lib_caller.lua";
+    const LIB_CALLER_TEXT: &str = "Lib.first()\nLib.second()\nLib.third()\n";
+
+    fn gmod(ws: &mut VirtualWorkspace) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+    }
+
+    /// A callee the edit destroys re-runs what computed the caller's facts
+    /// that named it, not every derivation of the caller's file: the caller's
+    /// source layer and other passes run exactly as often as without the
+    /// caller, and its other calls as often as without them.
+    #[test]
+    fn destroying_a_callee_re_runs_only_what_named_it_in_the_caller() {
+        let destroyed =
+            LIB_TEXT.replace("Lib.second = function() end", "Lib.second = nil           ");
+        assert_eq!(destroyed.len(), LIB_TEXT.len());
+        let edits = [(LIB, destroyed.as_str())];
+        let with_caller = VirtualWorkspace::assert_warm_matches_cold(
+            gmod,
+            &[(LIB, LIB_TEXT), (LIB_CALLER, LIB_CALLER_TEXT)],
+            &edits,
+        );
+        let with_one_call = VirtualWorkspace::assert_warm_matches_cold(
+            gmod,
+            &[(LIB, LIB_TEXT), (LIB_CALLER, "Lib.second()\n")],
+            &edits,
+        );
+        let alone = VirtualWorkspace::assert_warm_matches_cold(gmod, &[(LIB, LIB_TEXT)], &edits);
+
+        assert_eq!(
+            with_caller
+                .analysis
+                .compilation
+                .last_stats()
+                .rebuilt_sources,
+            alone.analysis.compilation.last_stats().rebuilt_sources
+        );
+        let evaluations = |ws: &VirtualWorkspace, kind: DerivationKind| {
+            ws.analysis.compilation.last_stats().evaluations(kind)
+        };
+        assert_eq!(
+            evaluations(&with_caller, DerivationKind::Call),
+            evaluations(&with_one_call, DerivationKind::Call)
+        );
+        for kind in [
+            DerivationKind::GmodHelperScan,
+            DerivationKind::GmodLoadCallSites,
+            DerivationKind::GmodPre,
+            DerivationKind::ChunkReturn,
+            DerivationKind::GmodClassCallSites,
+            DerivationKind::GmodPost,
+            DerivationKind::AccessorFunc,
+            DerivationKind::DynamicFieldWrite,
+            DerivationKind::LocalFallbacks,
+        ] {
+            assert_eq!(
+                evaluations(&with_caller, kind),
+                evaluations(&alone, kind),
+                "{kind:?}"
+            );
+        }
+    }
+
     const RANKS: &str = "gamemodes/cityrp/gamemode/core/sh_configuration.lua";
     /// A table literal of CityRP's ranks with a method that reads its fields.
     const RANKS_TEXT: &str = r#"cityrp = cityrp or {}

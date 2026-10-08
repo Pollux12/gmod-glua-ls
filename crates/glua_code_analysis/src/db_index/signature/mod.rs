@@ -729,10 +729,10 @@ impl LuaSignatureIndex {
     ///
     /// Candidates come only from the reverse payload map, never from a scan.
     /// Each affected signature/guard payload is atomic: a lost nested identity
-    /// leaves that payload untouched and dirties its holder file instead.
+    /// leaves that payload untouched and reports its fact instead.
     /// Coordinate-only moves never call `note_return_write`, so export hashing
     /// with the same `FileRemap` stays stable.
-    pub(crate) fn remap_payload_types(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
+    pub(crate) fn remap_payload_types(&mut self, remap: &crate::FileRemap) -> Vec<crate::LostFact> {
         let mut candidates: Vec<FileId> = self
             .payload_holders_by_source
             .get(&remap.file_id)
@@ -741,12 +741,11 @@ impl LuaSignatureIndex {
             .into_iter()
             .collect();
         candidates.sort();
-        let mut dirty = HashSet::default();
+        let mut lost = Vec::new();
         for holder in candidates {
             if holder == remap.file_id {
                 continue;
             }
-            let mut holder_lost = false;
             let (signature_ids, fact_owners) = self.holder_payload_keys(holder);
             for signature_id in signature_ids {
                 derivation::note_write(|| FactKey::Signature(signature_id));
@@ -754,14 +753,20 @@ impl LuaSignatureIndex {
                 if let Some(signature) = self.signatures.get_mut(&signature_id) {
                     let outcome = signature.remap_payload_types(remap);
                     if outcome.lost {
-                        holder_lost = true;
+                        lost.push(crate::LostFact::new(
+                            holder,
+                            FactKey::Signature(signature_id),
+                        ));
                     }
                 }
                 if let Some(guard) = self.inferred_positive_guards.get_mut(&signature_id) {
                     let result =
                         crate::db_index::remap_identities_in_type(&guard.narrowed_type, remap);
                     if result.lost {
-                        holder_lost = true;
+                        lost.push(crate::LostFact::new(
+                            holder,
+                            FactKey::InferredGuard(signature_id),
+                        ));
                     } else if let Some(new_ty) = result.typ {
                         guard.narrowed_type = new_ty;
                     }
@@ -773,19 +778,17 @@ impl LuaSignatureIndex {
                     let result =
                         crate::db_index::remap_identities_in_type(&guard.narrowed_type, remap);
                     if result.lost {
-                        holder_lost = true;
+                        lost.push(crate::LostFact::new(
+                            holder,
+                            FactKey::InferredGuard(owner.signature_id()),
+                        ));
                     } else if let Some(new_ty) = result.typ {
                         guard.narrowed_type = new_ty;
                     }
                 }
             }
-
-            if holder_lost {
-                dirty.insert(holder);
-            }
         }
-        dirty.remove(&remap.file_id);
-        dirty
+        lost
     }
 
     pub fn clear_inferred_positive_guards_for_file(&mut self, file_id: FileId) {
