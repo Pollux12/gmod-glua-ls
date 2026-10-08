@@ -1413,8 +1413,12 @@ impl Engine {
                     Dispatched::Settled => {}
                     Dispatched::Root => root.push((id, reason)),
                     Dispatched::Task(members, rerun) => {
-                        grouped
-                            .extend(members.iter().map(|member| (*member, (plan, groups.len()))));
+                        // A group of one is its own entry, queued once.
+                        if members.len() > 1 {
+                            grouped.extend(
+                                members.iter().map(|member| (*member, (plan, groups.len()))),
+                            );
+                        }
                         groups.push(PlannedGroup {
                             members,
                             rerun,
@@ -1831,7 +1835,8 @@ impl Engine {
         drop(canonicalising);
         let mut released = Vec::new();
         let mut on_root = Vec::new();
-        let mut records = Vec::new();
+        let mut records = Vec::with_capacity(filed.iter().map(|task| task.records.len()).sum());
+        touched.reserve(filed.iter().map(|task| task.touched.len()).sum());
         for task in filed {
             touched.extend(task.touched);
             on_root.extend(task.on_root);
@@ -1839,12 +1844,14 @@ impl Engine {
         }
         db.reader_graph_mut()
             .replace_all_kept(records, &mut released, derivation::new_stamp);
-        for member in tasks
-            .iter()
-            .flat_map(|(_, groups, ..)| groups.iter().flat_map(|group| &group.members))
-        {
-            if member.kind.is_statement() && self.rebuilt.contains(&member.file_id) {
-                self.settled_on_removed(db, *member);
+        if !self.removed_outputs.is_empty() {
+            for member in tasks
+                .iter()
+                .flat_map(|(_, groups, ..)| groups.iter().flat_map(|group| &group.members))
+            {
+                if member.kind.is_statement() && self.rebuilt.contains(&member.file_id) {
+                    self.settled_on_removed(db, *member);
+                }
             }
         }
         for (_, groups, ..) in &tasks {
@@ -2109,16 +2116,17 @@ impl Engine {
     /// was cleared before release since: settled from nothing after the
     /// removal, it holds nothing the removed derivations supplied.
     fn settled_on_removed(&mut self, db: &DbIndex, member: DerivationId) {
-        if self.cleared_parked.contains(&member) {
+        if self.removed_outputs.is_empty() || self.cleared_parked.contains(&member) {
             return;
         }
         let removed = db
             .reader_graph()
             .reads_of(member)
             .filter_map(|key| {
+                let seen = *self.removed_outputs.get(key)?;
                 Some(Moved {
                     key: key.clone(),
-                    seen: *self.removed_outputs.get(key)?,
+                    seen,
                     settled: true,
                 })
             })
@@ -3941,12 +3949,14 @@ fn file_task(
             kept.push((evaluation, std::mem::take(seen)));
         }
     }
-    filed.records = kept
+    let kept = kept
         .into_par_iter()
         .map(|(evaluation, seen)| table.keep_record(evaluation, seen))
-        .collect();
-    for record in &filed.records {
-        filed.touched.extend(record.outputs().iter().cloned());
+        .collect::<Vec<_>>();
+    filed.records.reserve(kept.len());
+    for (record, written) in kept {
+        filed.records.push(record);
+        filed.touched.extend(written);
     }
     filed
 }

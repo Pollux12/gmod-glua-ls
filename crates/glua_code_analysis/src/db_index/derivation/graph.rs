@@ -872,15 +872,21 @@ impl KeyTable {
         logged
     }
 
-    /// Marks each of `slots` written at stamp `now`.
-    fn mark_slots_written(&mut self, slots: &[KeyIdx], now: u64) {
+    /// Marks each of `slots` written at stamp `now`, a chunk of slots at a
+    /// time on worker threads.
+    fn mark_slots_written(&mut self, slots: &mut [KeyIdx], now: u64) {
+        use rayon::prelude::*;
         if slots.is_empty() {
             return;
         }
         self.last_written = self.last_written.max(now);
-        for slot in slots {
-            self.keys[*slot as usize].written = now;
-        }
+        slots.par_sort_unstable();
+        let slots: &[KeyIdx] = slots;
+        self.par_reached_chunks(slots, |first, chunk, range| {
+            for slot in &slots[range] {
+                chunk[*slot as usize - first].written = now;
+            }
+        });
     }
 
     /// Marks `key`, and every key read out of it, written at stamp `now` by an
@@ -962,6 +968,15 @@ impl KeyTable {
                 }
             }
         }
+    }
+
+    /// Whether no record reads or produces the key in `slot` and no key is
+    /// read out of it.
+    fn unreferenced(&self, slot: KeyIdx) -> bool {
+        let entry = &self.keys[slot as usize];
+        entry.readers.is_empty()
+            && entry.producer == NO_PRODUCER
+            && !self.derived.contains_key(&slot)
     }
 
     fn add_producer(&mut self, slot: KeyIdx, deriv: DerivIdx) {
@@ -1082,6 +1097,10 @@ impl KeyTable {
         (Some(first), is_query)
     }
 }
+
+/// The slots to release from which [`ReaderGraph::release_keys`] checks them
+/// on worker threads.
+const PARALLEL_RELEASE: usize = 1 << 12;
 
 /// What [`ReaderGraph::apply_edits`] did to the recorded reads.
 #[derive(Debug, Default)]
@@ -1225,14 +1244,14 @@ impl ReaderGraph {
         use rayon::prelude::*;
         let now = super::new_stamp();
         let table = &self.table;
-        let slots = keys
+        let mut slots = keys
             .into_par_iter()
             .filter_map(|key| table.find(key))
             .flat_map_iter(|slot| {
                 std::iter::once(slot).chain(table.derived_slots(slot).iter().copied())
             })
             .collect::<Vec<_>>();
-        self.table.mark_slots_written(&slots, now);
+        self.table.mark_slots_written(&mut slots, now);
     }
 
     /// Holds `keys` written until [`Self::release_held`]; see
@@ -1450,8 +1469,21 @@ impl ReaderGraph {
         self.replace_all_kept(records, released, || now);
     }
 
-    /// Frees each slot of `slots` nothing refers to any more.
+    /// Frees each slot of `slots` nothing refers to any more. A large batch
+    /// is first cut, on worker threads, to the slots that are live and
+    /// unreferenced: a slot referenced now is freed only along with its last
+    /// derived key, so its own turn changes nothing.
     pub fn release_keys(&mut self, slots: Vec<KeyIdx>) {
+        use rayon::prelude::*;
+        let slots = if slots.len() < PARALLEL_RELEASE {
+            slots
+        } else {
+            let table = &self.table;
+            slots
+                .into_par_iter()
+                .filter(|slot| table.live_key(*slot).is_some() && table.unreferenced(*slot))
+                .collect()
+        };
         for slot in slots {
             self.release_key(slot);
         }
@@ -1491,8 +1523,8 @@ impl ReaderGraph {
                 id,
                 reads,
                 dropped_reads,
-                output_slots: vec![None; outputs.len()],
-                outputs,
+                outputs: Vec::new(),
+                new_outputs: outputs,
             },
             released,
             now,
@@ -1507,8 +1539,12 @@ impl ReaderGraph {
         released: &mut Vec<KeyIdx>,
         now: u64,
     ) -> Vec<HashedKey> {
-        let prepared = self.prepare_kept(record, now);
-        let diffed = prepared.diff(Some(&self.table));
+        let deriv = self.intern_derivation(record.id);
+        let prepared = self.prepare_kept(record, deriv, now);
+        let diffed = prepared.diff(
+            self.derivations[deriv as usize].record.as_ref(),
+            Some(&self.table),
+        );
         let (dropped, ops) = self.finish_kept(diffed, released);
         for (slot, op) in ops {
             op.apply(&mut self.table.keys[slot as usize].readers);
@@ -1528,17 +1564,31 @@ impl ReaderGraph {
         mut stamp: impl FnMut() -> u64,
     ) {
         use rayon::prelude::*;
-        let mut ids = FxHashSet::default();
+        let mut ids = FxHashSet::with_capacity_and_hasher(records.len(), Default::default());
         let distinct = records.iter().all(|record| ids.insert(record.id));
+        drop(ids);
         let mut ops = Vec::with_capacity(records.len());
         if distinct {
+            let known = records
+                .par_iter()
+                .map(|record| self.deriv_slots.get(&record.id).copied())
+                .collect::<Vec<_>>();
             let prepared = records
                 .into_iter()
-                .map(|record| self.prepare_kept(record, stamp()))
+                .zip(known)
+                .map(|(record, known)| {
+                    let now = stamp();
+                    let deriv = known.unwrap_or_else(|| self.new_derivation(record.id));
+                    self.prepare_kept(record, deriv, now)
+                })
                 .collect::<Vec<_>>();
+            let (derivations, table) = (&self.derivations, &self.table);
             let diffed = prepared
                 .into_par_iter()
-                .map(|prepared| prepared.diff(Some(&self.table)))
+                .map(|prepared| {
+                    let old = derivations[prepared.deriv as usize].record.as_ref();
+                    prepared.diff(old, Some(table))
+                })
                 .collect::<Vec<_>>();
             for diffed in diffed {
                 ops.push(self.finish_kept(diffed, released).1);
@@ -1547,42 +1597,36 @@ impl ReaderGraph {
             for record in records {
                 // A later record of the same derivation diffs against
                 // readers the earlier one's ops have yet to move.
-                let diffed = self.prepare_kept(record, stamp()).diff(None);
+                let now = stamp();
+                let deriv = self.intern_derivation(record.id);
+                let prepared = self.prepare_kept(record, deriv, now);
+                let diffed = prepared.diff(self.derivations[deriv as usize].record.as_ref(), None);
                 ops.push(self.finish_kept(diffed, released).1);
             }
         }
         self.table.apply_reader_ops(ops);
     }
 
-    /// Interns `record`'s derivation and outputs at `now` and takes out the
-    /// record it replaces.
-    fn prepare_kept(&mut self, record: KeptRecord, now: u64) -> PreparedRecord {
+    /// Interns the outputs of `record`, which is `deriv`'s, at `now`.
+    fn prepare_kept(&mut self, record: KeptRecord, deriv: DerivIdx, now: u64) -> PreparedRecord {
         let KeptRecord {
             id,
             reads,
             dropped_reads,
-            outputs,
-            output_slots,
+            mut outputs,
+            new_outputs,
         } = record;
-        let deriv = self.intern_derivation(id);
-        let mut outputs = outputs
-            .into_iter()
-            .zip(output_slots)
-            .map(|(key, slot)| slot.unwrap_or_else(|| self.intern_key(key, now)))
-            .collect::<Vec<_>>();
-        outputs.sort_unstable();
-        outputs.dedup();
-        let old = self.derivations[deriv as usize]
-            .record
-            .take()
-            .unwrap_or_default();
+        if !new_outputs.is_empty() {
+            outputs.extend(new_outputs.into_iter().map(|key| self.intern_key(key, now)));
+            outputs.sort_unstable();
+            outputs.dedup();
+        }
         PreparedRecord {
             id,
             deriv,
             reads,
             dropped_reads,
             outputs,
-            old,
         }
     }
 
@@ -1628,8 +1672,14 @@ impl ReaderGraph {
         // started producing.
         released.extend(unread);
         released.extend(dropped_reads);
-        self.by_file.entry(id.file_id).or_default().insert(deriv);
-        self.derivations[deriv as usize].record = Some(record);
+        if let Some(record) = record
+            && self.derivations[deriv as usize]
+                .record
+                .replace(record)
+                .is_none()
+        {
+            self.by_file.entry(id.file_id).or_default().insert(deriv);
+        }
         (dropped, ops)
     }
 
@@ -2303,13 +2353,10 @@ impl ReaderGraph {
         if still_read.get(&slot).is_some_and(|readers| *readers > 0) {
             return;
         }
-        let entry = &mut self.table.keys[slot as usize];
-        if !entry.readers.is_empty()
-            || entry.producer != NO_PRODUCER
-            || self.table.derived.contains_key(&slot)
-        {
+        if !self.table.unreferenced(slot) {
             return;
         }
+        let entry = &mut self.table.keys[slot as usize];
         let Some(key) = entry.key.take() else {
             return;
         };
@@ -2338,6 +2385,11 @@ impl ReaderGraph {
         if let Some(slot) = self.deriv_slots.get(&id) {
             return *slot;
         }
+        self.new_derivation(id)
+    }
+
+    /// Gives `id`, which has no slot, one.
+    fn new_derivation(&mut self, id: DerivationId) -> DerivIdx {
         let entry = DerivSlot { id, record: None };
         let slot = match self.free_derivations.pop() {
             Some(slot) => {
@@ -2408,20 +2460,19 @@ impl ReaderGraph {
     }
 }
 
-/// A record whose derivation and outputs are interned, with the record it
-/// replaces taken out, to diff against it.
+/// A record whose derivation and outputs are interned, to diff against the
+/// record it replaces.
 struct PreparedRecord {
     id: DerivationId,
     deriv: DerivIdx,
     reads: Vec<(KeyIdx, Fingerprint)>,
     dropped_reads: Vec<KeyIdx>,
     outputs: Vec<KeyIdx>,
-    old: Record,
 }
 
 /// What a record changes of the one it replaces: its reads' readers, the
 /// reads it stopped making, the outputs it added and dropped, and the
-/// record to keep.
+/// record to keep, `None` when it is the one replaced.
 struct DiffedRecord {
     id: DerivationId,
     deriv: DerivIdx,
@@ -2430,22 +2481,25 @@ struct DiffedRecord {
     dropped_reads: Vec<KeyIdx>,
     added: Vec<KeyIdx>,
     dropped: Vec<KeyIdx>,
-    record: Record,
+    record: Option<Record>,
 }
 
 impl PreparedRecord {
-    /// Diffs against the record replaced. A read kept at the value its
-    /// reader group in `readers` holds needs no op.
-    fn diff(self, readers: Option<&KeyTable>) -> DiffedRecord {
+    /// Diffs against the record `old` it replaces, if the derivation has one.
+    /// A read kept at the value its reader group in `readers` holds needs no
+    /// op.
+    fn diff(self, old: Option<&Record>, readers: Option<&KeyTable>) -> DiffedRecord {
         let Self {
             id,
             deriv,
             reads,
             dropped_reads,
             outputs,
-            old,
         } = self;
-        let mut ops = Vec::with_capacity(reads.len());
+        let none = Record::default();
+        let filed = old.is_some();
+        let old = old.unwrap_or(&none);
+        let mut ops = Vec::new();
         let mut unread = Vec::new();
         let (mut old_reads, mut new_reads) = (
             old.reads.iter().copied().peekable(),
@@ -2483,11 +2537,12 @@ impl PreparedRecord {
             |key| dropped.push(key),
             |key| added.push(key),
         );
-        // The old record's reads were diffed above; its buffer holds the new
-        // record's.
-        let mut record_reads = Vec::from(old.reads);
-        record_reads.clear();
-        record_reads.extend(reads.iter().map(|(key, _)| *key));
+        let unchanged =
+            filed && ops.is_empty() && unread.is_empty() && added.is_empty() && dropped.is_empty();
+        let record = (!unchanged).then(|| Record {
+            reads: reads.iter().map(|(key, _)| *key).collect(),
+            outputs: outputs.into_boxed_slice(),
+        });
         DiffedRecord {
             id,
             deriv,
@@ -2496,10 +2551,7 @@ impl PreparedRecord {
             dropped_reads,
             added,
             dropped,
-            record: Record {
-                reads: record_reads.into_boxed_slice(),
-                outputs: outputs.into_boxed_slice(),
-            },
+            record,
         }
     }
 }
@@ -2527,8 +2579,8 @@ impl ReaderOp {
     }
 }
 
-/// The slots one worker updates the readers of at a time: a page of keys
-/// every record reads still spreads over the workers.
+/// The slots one worker updates at a time: a page of keys every record reads
+/// still spreads over the workers.
 const READER_CHUNK: usize = 1 << 10;
 
 const _: () = assert!(PAGE.is_multiple_of(READER_CHUNK));
@@ -2539,9 +2591,34 @@ impl KeyTable {
     /// order, then each chunk of slots they reach takes its ops on a worker.
     fn apply_reader_ops(&mut self, ops: Vec<Vec<(KeyIdx, ReaderOp)>>) {
         use rayon::prelude::*;
-        let mut ops = ops.into_iter().flatten().collect::<Vec<_>>();
+        let mut flat = Vec::with_capacity(ops.iter().map(Vec::len).sum::<usize>());
+        for record_ops in ops {
+            flat.extend(record_ops);
+        }
+        let mut ops = flat;
         ops.par_sort_by_key(|(slot, _)| *slot);
         let (slots, ops): (Vec<_>, Vec<_>) = ops.into_par_iter().unzip();
+        self.par_reached_chunks(&slots, |first, chunk, range| {
+            let mut start = range.start;
+            for same_slot in slots[range].chunk_by(|left, right| left == right) {
+                let end = start + same_slot.len();
+                chunk[same_slot[0] as usize - first]
+                    .readers
+                    .apply_all(&ops[start..end]);
+                start = end;
+            }
+        });
+    }
+
+    /// Runs `apply` on worker threads for each chunk of slots that the
+    /// ascending `slots` reach, with the chunk's first slot, the chunk, and
+    /// the range of `slots` in it.
+    fn par_reached_chunks(
+        &mut self,
+        slots: &[KeyIdx],
+        apply: impl Fn(usize, &mut [KeySlot], std::ops::Range<usize>) + Sync,
+    ) {
+        use rayon::prelude::*;
         let chunk_of = |slot: KeyIdx| slot as usize / READER_CHUNK;
         let mut reached = Vec::new();
         let mut start = 0;
@@ -2564,16 +2641,9 @@ impl KeyTable {
                     .map(|(_, range)| (index * READER_CHUNK, chunk, range))
             })
             .collect::<Vec<_>>();
-        chunks.into_par_iter().for_each(|(first, chunk, range)| {
-            let mut start = range.start;
-            for same_slot in slots[range].chunk_by(|left, right| left == right) {
-                let end = start + same_slot.len();
-                chunk[same_slot[0] as usize - first]
-                    .readers
-                    .apply_all(&ops[start..end]);
-                start = end;
-            }
-        });
+        chunks
+            .into_par_iter()
+            .for_each(|(first, chunk, range)| apply(first, chunk, range));
     }
 }
 
@@ -2583,15 +2653,10 @@ pub struct KeptRecord {
     id: DerivationId,
     reads: Vec<(KeyIdx, Fingerprint)>,
     dropped_reads: Vec<KeyIdx>,
-    outputs: Vec<HashedKey>,
-    /// Each output's slot, where the table already had one.
-    output_slots: Vec<Option<KeyIdx>>,
-}
-
-impl KeptRecord {
-    pub fn outputs(&self) -> &[HashedKey] {
-        &self.outputs
-    }
+    /// The slots of the outputs the table already has, sorted.
+    outputs: Vec<KeyIdx>,
+    /// The outputs it has no slot for, interned in this order.
+    new_outputs: Vec<HashedKey>,
 }
 
 impl KeyTable {
@@ -2614,28 +2679,43 @@ impl KeyTable {
             reads,
             dropped_reads,
             outputs: Vec::new(),
-            output_slots: Vec::new(),
+            new_outputs: Vec::new(),
         }
     }
 
     /// The record of a task's `evaluation`, whose reads were canonicalised
-    /// into this table, each with the fingerprint in `seen` at its position.
-    pub fn keep_record(&self, evaluation: super::Evaluation, seen: Vec<Fingerprint>) -> KeptRecord {
-        let (id, slots, outputs) = evaluation.into_recorded_seen(seen);
+    /// into this table, each with the fingerprint in `seen` at its position,
+    /// and the keys the evaluation wrote.
+    pub fn keep_record(
+        &self,
+        evaluation: super::Evaluation,
+        seen: Vec<Fingerprint>,
+    ) -> (KeptRecord, Vec<HashedKey>) {
+        let (id, slots, written) = evaluation.into_recorded_seen(seen);
         let (reads, dropped_reads) = kept_reads(
             id,
             slots,
             |slot| self.key(slot),
-            |key| super::contains_hashed(&outputs, key),
+            |key| super::contains_hashed(&written, key),
         );
-        let output_slots = outputs.iter().map(|key| self.find(key)).collect();
-        KeptRecord {
+        let mut outputs = Vec::with_capacity(written.len());
+        let mut new_outputs = Vec::new();
+        for key in &written {
+            match self.find(key) {
+                Some(slot) => outputs.push(slot),
+                None => new_outputs.push(key.clone()),
+            }
+        }
+        outputs.sort_unstable();
+        outputs.dedup();
+        let record = KeptRecord {
             id,
             reads,
             dropped_reads,
             outputs,
-            output_slots,
-        }
+            new_outputs,
+        };
+        (record, written)
     }
 }
 
@@ -3086,5 +3166,144 @@ mod tests {
             graph.outputs_of(id(1, 0)).collect::<Vec<_>>(),
             vec![&key(9)]
         );
+    }
+
+    /// The records of `id` and the readers and producers of `keys`, as the
+    /// graph holds them.
+    fn filed_state(graph: &ReaderGraph, id: DerivationId, keys: &[HashedKey]) -> String {
+        let keyed = keys
+            .iter()
+            .map(|key| {
+                let slot = graph.table.find(key).expect("a filed key is interned");
+                (
+                    format!("{:?}", graph.table.keys[slot as usize].readers),
+                    graph.producers(key).collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        format!(
+            "{:?} {:?} {} {keyed:?}",
+            graph.reads_of(id).collect::<Vec<_>>(),
+            graph.outputs_of(id).collect::<Vec<_>>(),
+            graph.derivations_of_file(id.file_id).count()
+        )
+    }
+
+    #[test]
+    fn filing_an_unchanged_record_again_leaves_the_graph_as_filing_it_once_does() {
+        let keys = [key(100), key(101), key(102)];
+        let fresh = || {
+            let mut graph = ReaderGraph::default();
+            let slots = keys.each_ref().map(|key| graph.intern_read(key.clone()));
+            (graph, slots)
+        };
+        let file = |graph: &mut ReaderGraph, slots: &[KeyIdx; 3], seen: Fingerprint| {
+            let record = KeptRecord {
+                id: id(1, 0),
+                reads: vec![(slots[0], seen), (slots[1], seen)],
+                dropped_reads: Vec::new(),
+                outputs: vec![slots[2]],
+                new_outputs: Vec::new(),
+            };
+            let mut released = Vec::new();
+            graph.replace_all_kept(vec![record], &mut released, super::super::new_stamp);
+            released
+        };
+        let (mut once, slots) = fresh();
+        file(&mut once, &slots, 5);
+        let (mut twice, _) = fresh();
+        file(&mut twice, &slots, 5);
+        let reads_filed = |graph: &ReaderGraph| {
+            graph.derivations[0]
+                .record
+                .as_ref()
+                .expect("the record is filed")
+                .reads
+                .as_ptr()
+        };
+        let filed = reads_filed(&twice);
+
+        let released = file(&mut twice, &slots, 5);
+
+        assert!(released.is_empty());
+        assert_eq!(reads_filed(&twice), filed, "the record was replaced");
+        assert_eq!(
+            filed_state(&twice, id(1, 0), &keys),
+            filed_state(&once, id(1, 0), &keys)
+        );
+
+        file(&mut twice, &slots, 6);
+        let (mut other, _) = fresh();
+        file(&mut other, &slots, 6);
+
+        assert_eq!(
+            filed_state(&twice, id(1, 0), &keys),
+            filed_state(&other, id(1, 0), &keys)
+        );
+        assert_eq!(twice.stale_readers(&keys[0], |seen| seen == 6).count(), 0);
+        assert_eq!(twice.stale_readers(&keys[0], |seen| seen == 5).count(), 1);
+    }
+
+    /// A large batch frees the slots one at a time would, in the same order,
+    /// whichever of its slots repeat, are read, or are already free.
+    #[test]
+    fn a_large_batch_of_released_slots_frees_the_slots_one_at_a_time_frees() {
+        let mut graph = ReaderGraph::default();
+        let slots = (0..2 * PARALLEL_RELEASE as u32)
+            .map(|file| graph.intern_read(key(1000 + file)))
+            .collect::<Vec<_>>();
+        let mut released = Vec::new();
+        let mut file = |graph: &mut ReaderGraph, id, slots: Vec<KeyIdx>| {
+            graph.replace_slots(
+                id,
+                slots.into_iter().map(|slot| (slot, Some(1))).collect(),
+                vec![],
+                |_| 0,
+                &mut released,
+                super::super::new_stamp(),
+            );
+        };
+        file(&mut graph, id(1, 0), slots.clone());
+        file(
+            &mut graph,
+            id(2, 0),
+            slots.iter().step_by(3).copied().collect(),
+        );
+        file(&mut graph, id(1, 0), Vec::new());
+        assert!(released.len() >= PARALLEL_RELEASE);
+        released.extend(released.clone());
+        let mut one_at_a_time = graph.clone();
+        for slot in released.iter().copied() {
+            one_at_a_time.release_key(slot);
+        }
+
+        graph.release_keys(released);
+
+        assert_eq!(graph.table.free_keys, one_at_a_time.table.free_keys);
+        assert_eq!(graph.read_keys().count(), one_at_a_time.read_keys().count());
+        assert_eq!(graph.read_keys().count(), slots.len().div_ceil(3));
+    }
+
+    /// Slots across several chunks are marked written at one stamp, and the
+    /// others keep theirs.
+    #[test]
+    fn marking_keys_written_stamps_exactly_their_slots() {
+        let mut graph = ReaderGraph::default();
+        let keys = (0..3 * READER_CHUNK as u32)
+            .map(|file| key(1000 + file))
+            .collect::<Vec<_>>();
+        let slots = keys
+            .iter()
+            .map(|key| graph.intern_read(key.clone()))
+            .collect::<Vec<_>>();
+        let marked = keys.iter().step_by(2).cloned().collect::<Vec<_>>();
+
+        graph.mark_written(&marked);
+
+        let now = graph.table.last_written();
+        for (position, slot) in slots.iter().enumerate() {
+            let written = graph.table.keys[*slot as usize].written;
+            assert_eq!(written == now, position % 2 == 0, "slot {slot}");
+        }
     }
 }
