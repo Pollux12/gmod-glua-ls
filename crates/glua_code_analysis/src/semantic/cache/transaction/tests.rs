@@ -278,6 +278,44 @@ fn parallel_cache_rollback_restores_keyed_flow_locations_after_nested_swaps() {
     finish();
 }
 
+/// A walk repeated from the same origin finds the entries only this
+/// evaluation may use, until the evaluation clears them.
+#[test]
+fn keyed_flow_keeps_local_entries_for_its_origin_until_cleared() {
+    let mut cache = cache();
+    let reference = VarRefId::VarRef(LuaDeclId::new(FileId::new(1), TextSize::from(1)));
+    let key = VarRefCacheKey::from(&reference);
+    let inner = (FlowId(1), GmodRealm::Server, super::super::FlowOrigin::Real);
+    let local = |cache: &LuaInferCache| match cache.flow_node_cache.get(&key)?.peek(&inner) {
+        Some(CacheEntry::Cache(value)) => Some(value.as_ref().clone()),
+        _ => None,
+    };
+
+    let previous = cache.key_flow_cache(&reference, &LuaType::String);
+    cache.set_flow_cache_with_origin_by_key(
+        &key,
+        FlowId(1),
+        GmodRealm::Server,
+        super::super::FlowOrigin::Real,
+        CacheEntry::Cache(Arc::new(LuaType::String)),
+        None,
+    );
+    cache.unkey_flow_cache(&reference, LuaType::String, previous);
+
+    let previous = cache.key_flow_cache(&reference, &LuaType::Boolean);
+    assert_eq!(local(&cache), None, "another origin does not see the entry");
+    cache.unkey_flow_cache(&reference, LuaType::Boolean, previous);
+
+    let previous = cache.key_flow_cache(&reference, &LuaType::String);
+    assert_eq!(local(&cache), Some(LuaType::String), "the same origin does");
+    cache.unkey_flow_cache(&reference, LuaType::String, previous);
+
+    cache.clear();
+    let previous = cache.key_flow_cache(&reference, &LuaType::String);
+    assert_eq!(local(&cache), None, "clearing the evaluation drops it");
+    cache.unkey_flow_cache(&reference, LuaType::String, previous);
+}
+
 #[test]
 fn parallel_cache_clone_has_independent_undo_and_query_marker_is_detached() {
     begin();

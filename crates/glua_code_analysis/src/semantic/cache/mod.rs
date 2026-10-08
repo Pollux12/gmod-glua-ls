@@ -268,6 +268,8 @@ pub struct LuaInferCache {
     /// seed or an index ref's member type — by that origin: they hold for it
     /// alone.
     keyed_flow_node_cache: FxHashMap<(VarRefCacheKey, LuaType), FlowEntries>,
+    /// Keyed flow entry sets holding entries only this evaluation may use.
+    keyed_flow_local_keys: Vec<(VarRefCacheKey, LuaType)>,
     /// Cache for `find_decl` results so that multiple diagnostic checkers
     /// processing the same file don't redo the full member-resolution chain.
     pub decl_cache: Untracked<FxHashMap<LuaSyntaxId, Option<LuaSemanticDeclId>>>,
@@ -395,6 +397,7 @@ impl LuaInferCache {
             self_base_seed: None,
             self_base_seed_mark: derivation::ScopeMark::default(),
             keyed_flow_node_cache: Default::default(),
+            keyed_flow_local_keys: Vec::new(),
             decl_cache: Default::default(),
             for_range_iter_var_type_cache: Default::default(),
             in_place_ipairs_transform_cache: Default::default(),
@@ -778,6 +781,7 @@ impl LuaInferCache {
                 entries.clear_local();
             }
         }
+        self.clear_keyed_flow_locals();
         empty(&mut self.call_cache_local);
         self.call_arg_types_cache.clear_local();
         empty(&mut self.generic_call_bindings.0);
@@ -810,6 +814,7 @@ impl LuaInferCache {
     /// Discards the inference a wave of deferred resolution can have
     /// invalidated.
     pub fn clear_deferred_inference_results(&mut self) {
+        self.clear_keyed_flow_locals();
         self.expr_cache.clear();
         self.condition_flow_cache.clear();
         self.member_query_cache.clear();
@@ -868,6 +873,7 @@ impl LuaInferCache {
     /// derived only from the immutable syntax/reference/flow indexes survive the
     /// phase transition so unresolve does not rebuild them for every expression.
     pub fn clear_for_unresolve(&mut self, db: &DbIndex) {
+        self.clear_keyed_flow_locals();
         self.expr_cache.clear();
         self.condition_flow_cache.clear();
         self.member_query_cache.clear();
@@ -1138,7 +1144,8 @@ impl LuaInferCache {
     }
 
     /// Keeps the entries walked from `origin` and restores `previous`. The
-    /// entries only this evaluation may use go.
+    /// entries only this evaluation may use stay until it clears them, as
+    /// unkeyed walks keep theirs.
     pub(crate) fn unkey_flow_cache(
         &mut self,
         var_ref_id: &VarRefId,
@@ -1149,12 +1156,23 @@ impl LuaInferCache {
         self.capture_flow(&cache_key);
         let keyed_key = (cache_key.clone(), origin);
         self.capture_keyed_flow(&keyed_key);
-        if let Some(mut keyed) = self.flow_node_cache.remove(&cache_key) {
-            keyed.clear_local();
+        if let Some(keyed) = self.flow_node_cache.remove(&cache_key) {
+            if keyed.has_local() {
+                self.keyed_flow_local_keys.push(keyed_key.clone());
+            }
             self.keyed_flow_node_cache.insert(keyed_key, keyed);
         }
         if let Some(previous) = previous {
             self.flow_node_cache.insert(cache_key, previous);
+        }
+    }
+
+    /// Drops the keyed flow entries only this evaluation may use.
+    fn clear_keyed_flow_locals(&mut self) {
+        for key in self.keyed_flow_local_keys.drain(..) {
+            if let Some(entries) = self.keyed_flow_node_cache.get_mut(&key) {
+                entries.clear_local();
+            }
         }
     }
 

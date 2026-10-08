@@ -234,6 +234,11 @@ impl<K: Hash + Eq + Clone, V> TrackedMap<K, V> {
         self.local.is_empty() && self.shared.is_empty()
     }
 
+    /// Whether it holds entries only this evaluation may use.
+    pub fn has_local(&self) -> bool {
+        !self.local.is_empty()
+    }
+
     pub fn len(&self) -> usize {
         self.local.len() + self.shared.len()
     }
