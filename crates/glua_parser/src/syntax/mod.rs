@@ -333,6 +333,23 @@ pub struct LuaSyntaxId {
     range: TextRange,
 }
 
+/// Source order: by range start, then range end, then kind.
+impl Ord for LuaSyntaxId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.range.start(), self.range.end(), self.kind).cmp(&(
+            other.range.start(),
+            other.range.end(),
+            other.kind,
+        ))
+    }
+}
+
+impl PartialOrd for LuaSyntaxId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl LuaSyntaxId {
     pub fn new(kind: LuaKind, range: TextRange) -> Self {
         LuaSyntaxId { kind, range }
