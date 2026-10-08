@@ -214,8 +214,17 @@ fn insert_definition(into: &mut Vec<InFiled<TextRange>>, definition: InFiled<Tex
     if into.get(at) == Some(&definition) {
         return false;
     }
+    reserve_first(into);
     into.insert(at, definition);
     true
+}
+
+/// Most lists hold one entry: the first insert gets room for one, later
+/// ones grow as usual.
+fn reserve_first<T>(list: &mut Vec<T>) {
+    if list.capacity() == 0 {
+        list.reserve_exact(1);
+    }
 }
 
 /// Merges two tasks' changes to one list of definition sites, which stays in
@@ -319,9 +328,9 @@ impl DynamicFieldIndex {
 
         if is_new_definition {
             self.note_dynamic_write(owner.clone(), Some(field_name.clone()));
-            self.site_record(site)
-                .named
-                .push((owner, field_name, range));
+            let named = &mut self.site_record(site).named;
+            reserve_first(named);
+            named.push((owner, field_name, range));
         }
         is_new_definition
     }
@@ -339,7 +348,9 @@ impl DynamicFieldIndex {
         let is_new_definition = insert_definition(definitions, definition);
         if is_new_definition {
             derivation::note_write(|| FactKey::DynamicFieldWildcards(owner.clone()));
-            self.site_record(site).wildcards.push((owner, range));
+            let wildcards = &mut self.site_record(site).wildcards;
+            reserve_first(wildcards);
+            wildcards.push((owner, range));
         }
         is_new_definition
     }
@@ -372,9 +383,9 @@ impl DynamicFieldIndex {
             .insert(InFiled::new(site.file_id, range));
         if is_new {
             derivation::note_write(|| FactKey::UnattributedField(field_name.clone()));
-            self.site_record(site)
-                .unattributed
-                .push((field_name, range));
+            let unattributed = &mut self.site_record(site).unattributed;
+            reserve_first(unattributed);
+            unattributed.push((field_name, range));
         }
         is_new
     }
@@ -831,7 +842,9 @@ impl DynamicFieldIndex {
             .insert(member_id);
         if is_new {
             derivation::note_write(|| FactKey::DynamicFieldFinite(owner.clone()));
-            self.site_record(site).finite.push((owner, member_id));
+            let finite = &mut self.site_record(site).finite;
+            reserve_first(finite);
+            finite.push((owner, member_id));
         }
         is_new
     }
