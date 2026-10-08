@@ -369,6 +369,12 @@ impl LuaDependencyIndex {
     /// site a build would have left unresolved on its own.
     ///
     /// [`transition_target_sites_to_unresolved`]: Self::transition_target_sites_to_unresolved
+    /// Forgets the sites `target_file_id`'s removal left unresolved: the file
+    /// came back at another path, so the paths they name are resolved anew.
+    pub fn forget_unresolved_target(&mut self, target_file_id: FileId) {
+        self.unresolved_by_removal.remove(&target_file_id);
+    }
+
     pub fn relink_unresolved_target(&mut self, target_file_id: FileId) {
         let Some(unresolved_by_removal) = self.unresolved_by_removal.remove(&target_file_id) else {
             return;

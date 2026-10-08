@@ -287,6 +287,11 @@ impl LuaModuleIndex {
         Some(())
     }
 
+    /// The path `file_id`'s module was registered from, `/`-separated.
+    pub fn registered_path(&self, file_id: FileId) -> Option<&str> {
+        self.file_module_paths.get(&file_id).map(String::as_str)
+    }
+
     pub fn get_module(&self, file_id: FileId) -> Option<&ModuleInfo> {
         derivation::note_read(|| FactKey::Module(file_id));
         let module = self.file_module_map.get(&file_id)?;

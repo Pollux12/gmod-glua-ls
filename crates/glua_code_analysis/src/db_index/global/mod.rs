@@ -18,12 +18,17 @@ pub struct LuaGlobalIndex {
     /// Each declaring file's `Vfs::file_order_key`, which orders its
     /// declarations among the other files'.
     file_order: CowShards<FileId, Arc<str>>,
-    /// Multiset fingerprint of every `(name, decl id)`, for `GlobalScan`.
+    /// Multiset fingerprint of every `(name, decl id, file order key)`, for
+    /// `GlobalScan`: the order key decides where a scan lists the declaration.
     scan_fingerprint: Fingerprint,
 }
 
-fn scan_element(name: &str, decl_id: LuaDeclId) -> Fingerprint {
-    derivation::fingerprint_of(&(name, decl_id))
+fn scan_element(
+    file_order: &CowShards<FileId, Arc<str>>,
+    name: &str,
+    decl_id: LuaDeclId,
+) -> Fingerprint {
+    derivation::fingerprint_of(&(name, decl_id, decl_sort_key(file_order, decl_id).0))
 }
 
 fn note_global_write(name: &str) {
@@ -75,7 +80,7 @@ impl LuaGlobalIndex {
             decl_ids.insert(insert_at, decl_id);
             self.scan_fingerprint = self
                 .scan_fingerprint
-                .wrapping_add(scan_element(name, decl_id));
+                .wrapping_add(scan_element(file_order, name, decl_id));
             note_global_write(name);
         }
     }
@@ -93,9 +98,9 @@ impl LuaGlobalIndex {
         if decl_ids.is_empty() {
             self.global_decl.remove(&id);
         }
-        self.scan_fingerprint = self
-            .scan_fingerprint
-            .wrapping_sub(scan_element(name, decl_id));
+        self.scan_fingerprint =
+            self.scan_fingerprint
+                .wrapping_sub(scan_element(&self.file_order, name, decl_id));
         note_global_write(name);
     }
 
@@ -198,7 +203,7 @@ impl LuaGlobalIndex {
                 .flat_map(|(id, decl_ids)| {
                     decl_ids
                         .iter()
-                        .map(|decl_id| scan_element(id.get_name(), *decl_id))
+                        .map(|decl_id| scan_element(&self.file_order, id.get_name(), *decl_id))
                 })
                 .fold(0, Fingerprint::wrapping_add),
             FactKey::GlobalScan => self.scan_fingerprint,
@@ -214,14 +219,18 @@ impl LuaGlobalIndex {
     /// left with no declaration.
     fn retain_decls(&mut self, removed: impl Fn(FileId) -> bool, on_emptied: impl Fn(&GlobalId)) {
         let mut scan_fingerprint = self.scan_fingerprint;
+        let file_order = &self.file_order;
         self.global_decl.retain(|global_id, decl_ids| {
             let before_len = decl_ids.len();
             decl_ids.retain(|decl_id| {
                 if !removed(decl_id.file_id) {
                     return true;
                 }
-                scan_fingerprint =
-                    scan_fingerprint.wrapping_sub(scan_element(global_id.get_name(), *decl_id));
+                scan_fingerprint = scan_fingerprint.wrapping_sub(scan_element(
+                    file_order,
+                    global_id.get_name(),
+                    *decl_id,
+                ));
                 false
             });
             if decl_ids.len() != before_len {

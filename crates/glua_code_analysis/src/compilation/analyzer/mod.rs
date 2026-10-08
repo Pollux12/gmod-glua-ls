@@ -104,15 +104,19 @@ impl ScriptedScopes {
 /// What [`ScriptedScopes`] are computed from, besides the config.
 #[derive(PartialEq, Eq)]
 struct ScopesKey {
-    files: Vec<FileId>,
+    files: Vec<(FileId, Option<std::path::PathBuf>)>,
     workspaces: Vec<(WorkspaceId, Option<std::path::PathBuf>)>,
 }
 
 impl ScopesKey {
     fn of(db: &DbIndex) -> Self {
         let vfs = db.get_vfs();
-        let mut files = vfs.get_all_local_file_ids();
-        files.retain(|file_id| vfs.get_syntax_tree(file_id).is_some());
+        let mut files = vfs
+            .get_all_local_file_ids()
+            .into_iter()
+            .filter(|file_id| vfs.get_syntax_tree(file_id).is_some())
+            .map(|file_id| (file_id, vfs.get_file_path(&file_id).cloned()))
+            .collect::<Vec<_>>();
         files.sort_unstable();
         let module_index = db.get_module_index();
         let mut workspaces = module_index
@@ -555,6 +559,9 @@ fn replace_files(
         touched.insert(derivation::HashedKey::new(derivation::FactKey::FileText(
             *file_id,
         )));
+        touched.insert(derivation::HashedKey::new(derivation::FactKey::FilePath(
+            *file_id,
+        )));
         let live = live_files.contains(file_id);
         for producer in producers {
             if replaced.contains(&producer.file_id) {
@@ -636,6 +643,20 @@ fn replace_files(
     drop(forgetting);
     // What removal takes out, read off the indexes as they drop it: a
     // recorded output can name a slot the index has since re-homed.
+    // A file taken in at another path than its module was registered from
+    // moved: the sites that named it by its old path stay unresolved.
+    let moved = file_ids
+        .iter()
+        .copied()
+        .filter(|file_id| {
+            let registered = db.get_module_index().registered_path(*file_id);
+            let current = db
+                .get_vfs()
+                .get_file_path(file_id)
+                .map(|path| path.to_string_lossy().replace('\\', "/"));
+            registered.is_some() && registered != current.as_deref()
+        })
+        .collect::<HashSet<_>>();
     derivation::begin(derivation::DerivationId::workspace(
         derivation::DerivationKind::Source,
     ));
@@ -651,8 +672,12 @@ fn replace_files(
         .filter(|file_id| db.get_vfs().get_syntax_tree(file_id).is_some())
         .collect::<Vec<_>>();
     for file_id in &live {
-        db.get_file_dependencies_index_mut()
-            .relink_unresolved_target(*file_id);
+        let dependencies = db.get_file_dependencies_index_mut();
+        if moved.contains(file_id) {
+            dependencies.forget_unresolved_target(*file_id);
+        } else {
+            dependencies.relink_unresolved_target(*file_id);
+        }
     }
     // Every file registers its module before any file declares, so a
     // dependency call resolves against the whole workspace's modules, and

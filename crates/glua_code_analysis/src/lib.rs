@@ -36,7 +36,7 @@ use resources::load_resource_std;
 use rustc_hash::FxHashSet;
 use schema_to_glua::SchemaConverter;
 pub use semantic::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path};
 use std::str::FromStr;
 use std::{path::PathBuf, sync::Arc};
@@ -570,8 +570,10 @@ impl EmmyLuaAnalysis {
     }
 
     /// Sets the text of a batch of file-system events, the last event per
-    /// file winning, without re-analysing. Returns the files whose text
-    /// changed, deleted ones included, for [`Self::begin_reindex`].
+    /// file winning, without re-analysing. A deleted file whose text a created
+    /// one has is taken as moved there ([`Self::move_file`]). Returns the
+    /// files whose text or path changed, deleted ones included, for
+    /// [`Self::begin_reindex`].
     pub fn stage_file_system_changes(&mut self, files: Vec<(Uri, Option<String>)>) -> Vec<FileId> {
         let mut files = files;
         let vfs = self.compilation.get_db().get_vfs();
@@ -591,6 +593,11 @@ impl EmmyLuaAnalysis {
                 !existing.is_some_and(|file_id| self.text_is_indexed(file_id, text.as_deref()))
             })
             .collect();
+        let (moves, pending) = self.pair_moves(pending);
+        let mut changed = moves
+            .into_iter()
+            .filter_map(|(old, new, text)| self.move_file(&old, &new, text))
+            .collect::<Vec<_>>();
         let texts: Vec<&str> = pending
             .iter()
             .filter_map(|(_, text)| text.as_deref())
@@ -603,7 +610,6 @@ impl EmmyLuaAnalysis {
             .map(Vec::into_iter);
 
         let vfs = self.compilation.get_db_mut().get_vfs_mut();
-        let mut changed = Vec::new();
         for (uri, text) in pending {
             let file_id = match text {
                 Some(text) => match parsed.as_mut().and_then(Iterator::next) {
@@ -617,6 +623,65 @@ impl EmmyLuaAnalysis {
             changed.extend(file_id);
         }
         changed
+    }
+
+    /// Splits `events`, sorted by order key, into the moves among them and
+    /// the rest. A deletion of a file pairs with the first creation, in order,
+    /// of a path no file has whose text is the deleted file's newest; which of
+    /// several equal texts pair decides nothing, since file ids never do.
+    #[allow(clippy::type_complexity)]
+    fn pair_moves(
+        &self,
+        events: Vec<(Uri, Option<String>)>,
+    ) -> (Vec<(Uri, Uri, String)>, Vec<(Uri, Option<String>)>) {
+        let moved_to = {
+            let vfs = self.compilation.get_db().get_vfs();
+            let mut creations: HashMap<&str, VecDeque<usize>> = HashMap::new();
+            for (at, (uri, text)) in events.iter().enumerate() {
+                if let Some(text) = text
+                    && vfs.get_file_id(uri).is_none()
+                {
+                    creations.entry(text.as_str()).or_default().push_back(at);
+                }
+            }
+            let mut moved_to = vec![None; events.len()];
+            for (at, (uri, text)) in events.iter().enumerate() {
+                if text.is_some() {
+                    continue;
+                }
+                let Some(old_text) = vfs
+                    .get_file_id(uri)
+                    .and_then(|file_id| vfs.latest_content(&file_id))
+                else {
+                    continue;
+                };
+                moved_to[at] = creations
+                    .get_mut(old_text.as_str())
+                    .and_then(VecDeque::pop_front);
+            }
+            moved_to
+        };
+        let mut events = events.into_iter().map(Some).collect::<Vec<_>>();
+        let mut moves = Vec::new();
+        for (at, created) in moved_to.into_iter().enumerate() {
+            if let Some(created) = created
+                && let (Some((old, _)), Some((new, Some(text)))) =
+                    (events[at].take(), events[created].take())
+            {
+                moves.push((old, new, text));
+            }
+        }
+        (moves, events.into_iter().flatten().collect())
+    }
+
+    /// Moves the file at `old` to `new`, whose text is `text`, keeping its id,
+    /// without re-analysing. `None` when `old` names no file or `new` already
+    /// names one.
+    pub fn move_file(&mut self, old: &Uri, new: &Uri, text: String) -> Option<FileId> {
+        self.compilation
+            .get_db_mut()
+            .get_vfs_mut()
+            .move_file(old, new, text)
     }
 
     /// For every file, the other files whose analysis read a fact it owns,

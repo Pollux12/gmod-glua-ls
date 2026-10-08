@@ -206,12 +206,22 @@ impl Vfs {
     }
 
     pub fn get_uri(&self, id: &FileId) -> Option<Uri> {
+        crate::db_index::derivation::note_file_path_read(*id);
         let path = self.file_path_map.get(&id.id)?;
         file_path_to_uri(path)
     }
 
     pub fn get_file_path(&self, id: &FileId) -> Option<&PathBuf> {
+        crate::db_index::derivation::note_file_path_read(*id);
         self.file_path_map.get(&id.id)
+    }
+
+    /// The fingerprint of `id`'s path and order key, for
+    /// [`FactKey::FilePath`](crate::db_index::derivation::FactKey::FilePath).
+    pub(crate) fn path_fingerprint(&self, id: &FileId) -> crate::db_index::derivation::Fingerprint {
+        let path = self.file_path_map.get(&id.id);
+        let order_key = self.file_order_keys.get(&id.id);
+        crate::db_index::derivation::fingerprint_opt(path.map(|path| (path, order_key)).as_ref())
     }
 
     /// The file's place in a stable cross-file ordering; see
@@ -223,6 +233,7 @@ impl Vfs {
     /// documentation, table writers, load sites — orders on this instead. A file
     /// the VFS does not know sorts last.
     pub fn file_order_key(&self, id: &FileId) -> Arc<str> {
+        crate::db_index::derivation::note_file_path_read(*id);
         self.file_order_keys
             .get(&id.id)
             .cloned()
@@ -436,6 +447,37 @@ impl Vfs {
         }
     }
 
+    /// Moves `old`'s file to `new`, staging `text` as its text so a
+    /// re-analysis takes the move as it takes an edit. The file keeps its id.
+    /// `None` when `old` names no file or `new` already names one.
+    pub fn move_file(&mut self, old: &Uri, new: &Uri, text: String) -> Option<FileId> {
+        let fid = self.get_file_id(old)?;
+        let new_path = uri_to_file_path(new)?;
+        if self.file_id_map.contains_key(&new_path) {
+            return None;
+        }
+        if let Some(old_path) = self.file_path_map.remove(&fid.id) {
+            self.file_id_map.remove(&old_path);
+        }
+        self.file_id_map.insert(new_path.clone(), fid.id);
+        self.file_order_keys
+            .insert(fid.id, Arc::from(self.order_key_for_path(&new_path)));
+        self.file_path_map.insert(fid.id, new_path);
+        let reused = match self.staged.get(&fid) {
+            Some(staged) => staged.parsed.clone(),
+            None => self
+                .tree_map
+                .get(&fid)
+                .cloned()
+                .zip(self.line_index_map.get(&fid).cloned()),
+        };
+        let parsed = reused
+            .filter(|_| self.latest_content(&fid) == Some(&text))
+            .unwrap_or_else(|| self.parse(&text));
+        self.stage(fid, Some(text), Some(parsed), false, None);
+        Some(fid)
+    }
+
     /// Forgets `uri`'s path at once and stages the removal of its text.
     pub fn remove_file(&mut self, uri: &Uri) -> Option<FileId> {
         let fid = self.get_file_id(uri)?;
@@ -646,7 +688,7 @@ impl Vfs {
     }
 
     pub fn get_document(&self, id: &FileId) -> Option<LuaDocument<'_>> {
-        let path = self.file_path_map.get(&id.id)?;
+        let path = self.get_file_path(id)?;
         let text = self.get_file_content(id)?;
         let line_index = self.line_index_map.get(id)?;
         Some(LuaDocument::new(*id, path, text, line_index))
@@ -732,6 +774,7 @@ impl Vfs {
     pub fn clear(&mut self) {
         self.file_id_map.clear();
         self.file_path_map.clear();
+        self.file_order_keys.clear();
         self.file_data.clear();
         self.line_index_map.clear();
         self.tree_map.clear();

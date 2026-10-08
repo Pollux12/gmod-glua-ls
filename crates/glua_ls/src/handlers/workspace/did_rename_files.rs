@@ -63,21 +63,25 @@ pub async fn on_did_rename_files_handler(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::Duration;
 
-    use glua_code_analysis::file_path_to_uri;
+    use glua_code_analysis::{FileId, file_path_to_uri};
     use lsp_server::{Connection, Message};
     use lsp_types::{
         ClientCapabilities, DidChangeWatchedFilesParams, FileChangeType, FileEvent, FileRename,
-        RenameFilesParams, Uri,
+        PublishDiagnosticsParams, RenameFilesParams, Uri,
     };
+    use tokio_util::sync::CancellationToken;
 
     use crate::{
-        context::{ServerContext, ServerContextSnapshot},
+        context::{ServerContext, ServerContextSnapshot, diagnostic_store::Priority},
         handlers::text_document::on_did_change_watched_files,
     };
 
     const LOADER: &str = "include(\"sh_old.lua\")\n";
     const RENAMED: &str = "SHARED_VALUE = 1\n";
+    /// Text with a syntax error, so it always has a diagnostic.
+    const DIAGNOSED: &str = "SHARED_VALUE = 1\nlocal broken =\n";
 
     struct RenamedWorkspace {
         root: PathBuf,
@@ -85,6 +89,7 @@ mod tests {
         client: Connection,
         old_uri: Uri,
         new_uri: Uri,
+        old_id: FileId,
         _context: ServerContext,
     }
 
@@ -95,16 +100,15 @@ mod tests {
     }
 
     /// A workspace where `lua/autorun/sh_old.lua`, which another file
-    /// includes, was renamed on disk to `sh_new.lua` and `didRenameFiles` was
-    /// handled.
-    async fn renamed_workspace(name: &str) -> RenamedWorkspace {
+    /// includes, was renamed on disk to `sh_new.lua`, which holds `text`.
+    async fn workspace_to_rename(name: &str, text: &str) -> RenamedWorkspace {
         let root = std::env::temp_dir().join(format!(
             "gmod_glua_ls_did_rename_{name}_{}",
             std::process::id()
         ));
         let autorun = root.join("lua/autorun");
         std::fs::create_dir_all(&autorun).expect("workspace folder is created");
-        std::fs::write(autorun.join("sh_new.lua"), RENAMED).expect("renamed file is written");
+        std::fs::write(autorun.join("sh_new.lua"), text).expect("renamed file is written");
         let old_uri = file_path_to_uri(&autorun.join("sh_old.lua")).expect("old URI");
         let new_uri = file_path_to_uri(&autorun.join("sh_new.lua")).expect("new URI");
         let loader_uri = file_path_to_uri(&autorun.join("sh_loader.lua")).expect("loader URI");
@@ -112,30 +116,65 @@ mod tests {
         let (connection, client) = Connection::memory();
         let context = ServerContext::new(connection, ClientCapabilities::default());
         let snapshot = context.snapshot();
-        {
+        let old_id = {
             let mut analysis = snapshot.analysis().write().await;
             analysis.add_main_workspace(root.clone());
-            analysis.update_file_by_uri(&old_uri, Some(RENAMED.to_string()));
             analysis.update_file_by_uri(&loader_uri, Some(LOADER.to_string()));
-        }
-        super::on_did_rename_files_handler(
-            snapshot.clone(),
-            RenameFilesParams {
-                files: vec![FileRename {
-                    old_uri: old_uri.to_string(),
-                    new_uri: new_uri.to_string(),
-                }],
-            },
-        )
-        .await;
+            analysis
+                .update_file_by_uri(&old_uri, Some(text.to_string()))
+                .expect("the renamed file is added")
+                .0
+        };
         RenamedWorkspace {
             root,
             snapshot,
             client,
             old_uri,
             new_uri,
+            old_id,
             _context: context,
         }
+    }
+
+    /// Hands the rename of `workspace` to `didRenameFiles`.
+    async fn rename(workspace: &RenamedWorkspace) {
+        super::on_did_rename_files_handler(
+            workspace.snapshot.clone(),
+            RenameFilesParams {
+                files: vec![FileRename {
+                    old_uri: workspace.old_uri.to_string(),
+                    new_uri: workspace.new_uri.to_string(),
+                }],
+            },
+        )
+        .await;
+    }
+
+    /// [`workspace_to_rename`] with `didRenameFiles` handled.
+    async fn renamed_workspace(name: &str) -> RenamedWorkspace {
+        let workspace = workspace_to_rename(name, RENAMED).await;
+        rename(&workspace).await;
+        workspace
+    }
+
+    async fn file_id(snapshot: &ServerContextSnapshot, uri: &Uri) -> Option<FileId> {
+        snapshot.analysis().read().await.get_file_id(uri)
+    }
+
+    /// The diagnostics published to the client so far, in order.
+    fn published(client: &Connection) -> Vec<PublishDiagnosticsParams> {
+        client
+            .receiver
+            .try_iter()
+            .filter_map(|message| match message {
+                Message::Notification(notification)
+                    if notification.method == "textDocument/publishDiagnostics" =>
+                {
+                    serde_json::from_value(notification.params).ok()
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     async fn content(snapshot: &ServerContextSnapshot, uri: &Uri) -> Option<String> {
@@ -167,6 +206,89 @@ mod tests {
             let new = content(&workspace.snapshot, &workspace.new_uri).await;
 
             assert_eq!((old, new), (None, Some(RENAMED.to_string())));
+        });
+    }
+
+    /// A renamed file is the same file at its new path.
+    #[test]
+    fn a_handled_rename_keeps_the_file_id() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let workspace = renamed_workspace("keeps_id").await;
+
+            let old = file_id(&workspace.snapshot, &workspace.old_uri).await;
+            let new = file_id(&workspace.snapshot, &workspace.new_uri).await;
+
+            assert_eq!((old, new), (None, Some(workspace.old_id)));
+        });
+    }
+
+    /// A move the watcher alone reports, as a deletion and a creation of the
+    /// same text, keeps the file's id too.
+    #[test]
+    fn a_watched_move_keeps_the_file_id() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let workspace = workspace_to_rename("watched_move", RENAMED).await;
+
+            watch(
+                &workspace.snapshot,
+                vec![
+                    (workspace.old_uri.clone(), FileChangeType::DELETED),
+                    (workspace.new_uri.clone(), FileChangeType::CREATED),
+                ],
+            )
+            .await;
+
+            let old = file_id(&workspace.snapshot, &workspace.old_uri).await;
+            let new = file_id(&workspace.snapshot, &workspace.new_uri).await;
+            assert_eq!((old, new), (None, Some(workspace.old_id)));
+            assert_eq!(
+                content(&workspace.snapshot, &workspace.new_uri).await,
+                Some(RENAMED.to_string())
+            );
+        });
+    }
+
+    /// What the client showed at a renamed file's old URI is cleared, and its
+    /// diagnostics go out at the new URI.
+    #[test]
+    fn a_handled_rename_moves_the_diagnostics_to_the_new_uri() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let workspace = workspace_to_rename("diagnostics", DIAGNOSED).await;
+            let store = workspace.snapshot.file_diagnostic().store();
+            let cancel = CancellationToken::new();
+            let before = store
+                .get(workspace.old_id, Priority::Edited, &cancel)
+                .await
+                .expect("diagnostics before the rename");
+            assert!(!before.diagnostics.is_empty());
+
+            rename(&workspace).await;
+            let after = tokio::time::timeout(
+                Duration::from_secs(60),
+                store.get(workspace.old_id, Priority::Edited, &cancel),
+            )
+            .await
+            .expect("the moved file is diagnosed")
+            .expect("diagnostics after the rename");
+
+            assert_eq!(after.uri, workspace.new_uri);
+            let count = before.diagnostics.len();
+            let published = published(&workspace.client)
+                .into_iter()
+                .filter(|params| [&workspace.old_uri, &workspace.new_uri].contains(&&params.uri))
+                .map(|params| (params.uri, params.diagnostics.len()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                published,
+                vec![
+                    (workspace.old_uri.clone(), count),
+                    (workspace.old_uri.clone(), 0),
+                    (workspace.new_uri.clone(), count),
+                ]
+            );
         });
     }
 

@@ -573,10 +573,14 @@ impl DiagnosticStore {
                         .get_file_version(&job.file_id)
                         .filter(|_| state.open.contains(&job.file_id));
                     let result_id = result_id(&diagnostics);
-                    let changed = state
-                        .entries
-                        .get(&job.file_id)
-                        .is_none_or(|entry| entry.stored.result_id != result_id);
+                    // A file that moved shows its diagnostics at its new URI
+                    // only.
+                    let previous = state.entries.get(&job.file_id).map(|entry| &entry.stored);
+                    let moved_from = previous
+                        .filter(|previous| previous.uri != uri)
+                        .map(|previous| previous.uri.clone());
+                    let changed = moved_from.is_some()
+                        || previous.is_none_or(|previous| previous.result_id != result_id);
                     let stored = StoredDiagnostics {
                         uri,
                         diagnostics: diagnostics.into(),
@@ -589,11 +593,14 @@ impl DiagnosticStore {
                             config_gen: job.config_gen,
                         },
                     );
-                    changed.then_some((stored, version))
+                    changed.then_some((stored, version, moved_from))
                 }
             }
         };
-        if let Some((stored, version)) = published {
+        if let Some((stored, version, moved_from)) = published {
+            if let Some(moved_from) = moved_from {
+                self.cleared(moved_from);
+            }
             self.client.publish_diagnostics(PublishDiagnosticsParams {
                 uri: stored.uri,
                 diagnostics: stored.diagnostics.to_vec(),

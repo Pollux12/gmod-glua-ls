@@ -622,6 +622,7 @@ impl DbIndex {
             }
             K::DiagnosticFile(_) => self.diagnostic_index.fact_fingerprint(key),
             K::FileText(file_id) => self.vfs.text_fingerprint(file_id),
+            K::FilePath(file_id) => self.vfs.path_fingerprint(file_id),
             K::Syntax(site) => self.vfs.statement_fingerprint(site),
             K::FileSet => self.vfs.file_set_fingerprint(),
             K::StageRule(rule) => derivation::fingerprint_of(&rule.holds_at(self.analysis_stage)),

@@ -440,6 +440,8 @@ pub enum FactKey {
     DiagnosticFile(FileId),
     /// A file's text and syntax tree.
     FileText(FileId),
+    /// A file's path and its place in the file order.
+    FilePath(FileId),
     /// One statement of a file, by its range: its kind and text, and the kind
     /// and range of every node between it and the top-level block.
     Syntax(InFiled<TextRange>),
@@ -907,7 +909,8 @@ impl FactKey {
             | K::TypeFallbacks(file_id)
             | K::CallSiteCallbacks(file_id)
             | K::DerivedReferences(file_id)
-            | K::FileText(file_id) => Some(*file_id),
+            | K::FileText(file_id)
+            | K::FilePath(file_id) => Some(*file_id),
             K::DynamicField(DynamicFieldOwner::Table(site), _)
             | K::DynamicFieldWildcards(DynamicFieldOwner::Table(site))
             | K::DynamicFieldFinite(DynamicFieldOwner::Table(site)) => Some(site.file_id),
@@ -2107,6 +2110,7 @@ pub enum FileFact {
     FlowTree,
     DeclTree,
     FunctionSummaries,
+    FilePath,
 }
 
 /// Records a read of `file_id`'s `fact`.
@@ -2119,7 +2123,17 @@ pub fn note_file_fact_read(fact: FileFact, file_id: FileId) {
         FileFact::FlowTree => FactKey::FlowTree(file_id),
         FileFact::DeclTree => FactKey::DeclTree(file_id),
         FileFact::FunctionSummaries => FactKey::FunctionSummaries(file_id),
+        FileFact::FilePath => FactKey::FilePath(file_id),
     });
+}
+
+/// Records a read of `file_id`'s path. A derivation's own file is not a read:
+/// a move re-indexes the file, which replaces its derivations.
+pub fn note_file_path_read(file_id: FileId) {
+    if current().is_some_and(|id| id.file_id == file_id) {
+        return;
+    }
+    note_file_fact_read(FileFact::FilePath, file_id);
 }
 
 /// Records a read of the global path `path`; see [`note_type_decl_read`].
