@@ -25,6 +25,9 @@ use crate::{
 /// The number of hash pages workspace-owned keys are spread over.
 const PAGES: usize = 4096;
 
+/// The slot table grows in steps of this many slots.
+const SLOT_CHUNK: usize = 256;
+
 /// Which shard owns a key.
 pub(crate) enum ShardOwner {
     File(FileId),
@@ -32,10 +35,15 @@ pub(crate) enum ShardOwner {
 }
 
 pub(crate) trait ShardKey: Eq + Hash {
+    /// Whether a key may be workspace-owned and so need the hash pages.
+    const PAGED: bool = true;
+
     fn shard_owner(&self) -> ShardOwner;
 }
 
 impl ShardKey for FileId {
+    const PAGED: bool = false;
+
     fn shard_owner(&self) -> ShardOwner {
         ShardOwner::File(*self)
     }
@@ -60,12 +68,16 @@ impl ShardKey for smol_str::SmolStr {
 }
 
 impl ShardKey for LuaTypeOwner {
+    const PAGED: bool = false;
+
     fn shard_owner(&self) -> ShardOwner {
         ShardOwner::File(self.get_file_id())
     }
 }
 
 impl ShardKey for LuaMemberId {
+    const PAGED: bool = false;
+
     fn shard_owner(&self) -> ShardOwner {
         ShardOwner::File(self.file_id)
     }
@@ -91,6 +103,8 @@ impl ShardKey for LuaMemberKey {
 macro_rules! file_keys {
     ($($ty:ty => |$key:ident| $file:expr;)*) => {
         $(impl ShardKey for $ty {
+            const PAGED: bool = false;
+
             fn shard_owner(&self) -> ShardOwner {
                 let $key = self;
                 ShardOwner::File($file)
@@ -131,6 +145,8 @@ workspace_keys!(
 );
 
 impl ShardKey for InFiled<rowan::TextRange> {
+    const PAGED: bool = false;
+
     fn shard_owner(&self) -> ShardOwner {
         ShardOwner::File(self.file_id)
     }
@@ -167,13 +183,16 @@ impl ShardKey for (LuaMemberOwner, LuaMemberKey) {
     }
 }
 
-fn file_slot(file_id: FileId) -> usize {
-    PAGES + file_id.id as usize
+/// A map whose keys are all file-owned has no hash pages in front of its
+/// file shards.
+fn file_slot<K: ShardKey + ?Sized>(file_id: FileId) -> usize {
+    let pages = if K::PAGED { PAGES } else { 0 };
+    pages + file_id.id as usize
 }
 
 fn slot_of<K: ShardKey + ?Sized>(key: &K) -> usize {
     match key.shard_owner() {
-        ShardOwner::File(file_id) => file_slot(file_id),
+        ShardOwner::File(file_id) => file_slot::<K>(file_id),
         // The low bits pick the bucket inside a shard's table and the top
         // seven its control byte, so the page comes from bits in between.
         ShardOwner::Workspace => (FxBuildHasher.hash_one(key) >> 40) as usize % PAGES,
@@ -277,8 +296,11 @@ impl<K, V> CowShards<K, V> {
     }
 
     /// The entries held in `file_id`'s shard: every file-owned key of the file.
-    pub(crate) fn file_entries(&self, file_id: FileId) -> impl Iterator<Item = (&K, &V)> {
-        self.shard(file_slot(file_id))
+    pub(crate) fn file_entries(&self, file_id: FileId) -> impl Iterator<Item = (&K, &V)>
+    where
+        K: ShardKey,
+    {
+        self.shard(file_slot::<K>(file_id))
             .into_iter()
             .flat_map(|shard| shard.iter())
     }
@@ -307,7 +329,7 @@ impl<K, V> CowShards<K, V> {
     /// The slot table, grown to hold `at` and owned by this map alone.
     fn slots_mut(&mut self, at: usize) -> &mut [Option<Arc<Shard<K, V>>>] {
         if at >= self.slots.len() {
-            let len = (at + 1).next_power_of_two();
+            let len = (at + 1).next_multiple_of(SLOT_CHUNK);
             let mut grown = Vec::with_capacity(len);
             grown.extend(self.slots.iter().cloned());
             grown.resize(len, None);
