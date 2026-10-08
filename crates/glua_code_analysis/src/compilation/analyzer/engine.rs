@@ -526,9 +526,11 @@ pub(crate) struct Engine {
     /// What the outputs of the loops being cleared held before: a memo that
     /// read one holds again once the loops settle if it settles back to it.
     loop_before: FxHashMap<HashedKey, derivation::Fingerprint>,
-    /// Under `GLUALS_CHECK_CONVERGENCE` or debug assertions: how often each
-    /// derivation was evaluated since the run last entered a stage.
-    stage_evaluations: FxHashMap<DerivationId, u32>,
+    /// How often each derivation ran since the run entered its stage.
+    stage_runs: FxHashMap<DerivationId, StageRuns>,
+    /// Whether a derivation that runs more often within a stage than settling
+    /// can need panics rather than being left as its last run left it.
+    unsettled_panics: bool,
     batch_slot_notifications: bool,
     /// How cold builds are driven; see [`superstep_mode`].
     superstep: SuperstepMode,
@@ -536,11 +538,9 @@ pub(crate) struct Engine {
     /// In a superstep, the file whose superstep task is running:
     /// its batches take no other file's work.
     task: Option<crate::FileId>,
-    /// In worker supersteps, how often each derivation ran in a
-    /// task since the run entered its stage; the files whose work settles on
-    /// the index, each to quiescence, since one of their derivations ran so
-    /// often; and whether the stage settles on the serial loop instead.
-    task_runs: FxHashMap<DerivationId, u32>,
+    /// In worker supersteps, the files whose work settles on the index, each
+    /// to quiescence, since one of their derivations ran too often; and
+    /// whether the stage settles on the serial loop instead.
     serial_files: FxHashSet<crate::FileId>,
     /// How often each group, by its first member, waited a superstep for
     /// the queries it read to be computed since the run entered its stage.
@@ -661,6 +661,7 @@ impl Engine {
             next_round: Queue::new(schedule),
             to_follow: edits.clone(),
             edits,
+            unsettled_panics: cfg!(debug_assertions) || check_convergence(),
             ..Self::default()
         }
     }
@@ -1680,7 +1681,6 @@ impl Engine {
     ) {
         let (id, reason) = group.entries[0];
         self.trace_evaluation(db, id, reason);
-        self.check_convergence(id);
         let group = &group.members;
         let settled = db.analysis_stage() == AnalysisStage::Closed;
         for (member, moved_in_task) in group.iter().zip(moved_in_task) {
@@ -1719,8 +1719,8 @@ impl Engine {
             self.stats.cross_file_groups += 1;
         }
         for member in group {
-            let runs = self.task_runs.entry(*member).or_default();
-            *runs += 1;
+            let runs = &mut self.stage_runs.entry(*member).or_default().in_tasks;
+            *runs = runs.saturating_add(1);
             // A loop that keeps moving under supersteps, where a task runs
             // only what was queued before it began, settles as the serial
             // loop settles it: its file's work runs to quiescence on the
@@ -2133,7 +2133,7 @@ impl Engine {
         let stale = crate::profile::phase("engine: stale check", || {
             self.needs_evaluation(db, id, reason)
         });
-        if !stale {
+        if !stale || !self.admit_run(id) {
             self.moved_from.remove(&id);
             if id.kind.is_query() {
                 db.queries().set_stale(id, false);
@@ -2141,7 +2141,6 @@ impl Engine {
             return;
         }
         self.trace_evaluation(db, id, reason);
-        self.check_convergence(id);
         let group = crate::profile::phase("engine: co-producers", || co_producers(db, id));
         if group.len() == 1 && self.task.is_none() && recipe.splits(id.kind) {
             crate::profile::phase("engine: batch", || self.run_batch(db, id, recipe));
@@ -2680,25 +2679,32 @@ impl Engine {
         }
     }
 
-    /// Under `GLUALS_CHECK_CONVERGENCE` or debug assertions, panics once `id`
-    /// was evaluated more often within one stage than settling can need: the
-    /// facts it reads keep moving, so some rule among them does not converge.
-    fn check_convergence(&mut self, id: DerivationId) {
-        if !(cfg!(debug_assertions) || check_convergence()) {
-            return;
+    /// Counts a run of `id` on the index and returns whether it may run. Past
+    /// [`MAX_INDEX_RUNS`] within one stage the facts it reads keep moving, so
+    /// some rule among them does not converge: it panics under
+    /// `GLUALS_CHECK_CONVERGENCE` or debug assertions, and otherwise warns
+    /// once and leaves `id` as its last run left it.
+    fn admit_run(&mut self, id: DerivationId) -> bool {
+        let runs = &mut self.stage_runs.entry(id).or_default().on_index;
+        *runs = runs.saturating_add(1);
+        if *runs <= MAX_INDEX_RUNS {
+            return true;
         }
-        let evaluations = self.stage_evaluations.entry(id).or_default();
-        *evaluations += 1;
         assert!(
-            *evaluations <= MAX_STAGE_EVALUATIONS,
-            "{id:?} evaluated {evaluations} times without the run moving to another stage"
+            !self.unsettled_panics,
+            "{id:?} evaluated {runs} times without the run moving to another stage"
         );
+        if *runs == MAX_INDEX_RUNS + 1 {
+            log::warn!(
+                "{id:?} ran {MAX_INDEX_RUNS} times without settling; it keeps what its last run left"
+            );
+        }
+        false
     }
 
     /// Moves the run to `stage`. Returns the keys of the rules that moved.
     fn enter_stage(&mut self, db: &mut DbIndex, stage: AnalysisStage) -> Vec<HashedKey> {
-        self.stage_evaluations.clear();
-        self.task_runs.clear();
+        self.stage_runs.clear();
         self.serial_files.clear();
         self.query_deferrals.clear();
         self.serial_stage = false;
@@ -3098,12 +3104,11 @@ impl Engine {
                 continue;
             }
             self.cursor = Some(id);
-            if !self.needs_evaluation(db, id, reason) {
+            if !self.needs_evaluation(db, id, reason) || !self.admit_run(id) {
                 self.moved_from.remove(&id);
                 db.queries().set_stale(id, false);
                 continue;
             }
-            self.check_convergence(id);
             let batched = co_producers(db, id).len() == 1;
             if batched {
                 batch.push(id);
@@ -4631,11 +4636,9 @@ fn scopeguard_lent_keys() -> OnDrop {
     OnDrop(derivation::forget_lent_keys)
 }
 
-/// `GLUALS_CHECK_FINGERPRINTS`: recompute every cached fingerprint and panic on
-/// a key that moved without being written.
-/// How often one derivation may be evaluated within one stage before
-/// [`Engine::check_convergence`] reports that the facts it reads do not settle.
-const MAX_STAGE_EVALUATIONS: u32 = 1000;
+/// How often one derivation may run on the index within one stage before
+/// [`Engine::admit_run`] takes it that the facts it reads do not settle.
+const MAX_INDEX_RUNS: u16 = 32;
 
 /// The queued entries one worker superstep takes at most, short of a file's:
 /// its tasks' forks and recordings live until it installs them, so this
@@ -4644,7 +4647,7 @@ const SUPERSTEP_ENTRIES: usize = 32_768;
 
 /// How often a worker superstep runs one derivation within a stage before the
 /// stage settles on the serial loop.
-const SUPERSTEP_RUN_LIMIT: u32 = 64;
+const SUPERSTEP_RUN_LIMIT: u16 = 64;
 
 /// The fewest keys one worker job checks the readers of: an evaluation's
 /// handful runs on its own thread rather than waking the pool.
@@ -4653,6 +4656,14 @@ const KEYS_PER_JOB: usize = 64;
 /// How many supersteps a group waits for the queries it read before it runs
 /// on the index instead.
 const QUERY_DEFERRALS: u8 = 2;
+
+/// How often one derivation ran within a stage: in worker superstep tasks,
+/// and on the index.
+#[derive(Debug, Clone, Copy, Default)]
+struct StageRuns {
+    in_tasks: u16,
+    on_index: u16,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum SuperstepMode {
@@ -4684,6 +4695,8 @@ fn check_convergence() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("GLUALS_CHECK_CONVERGENCE").is_some())
 }
 
+/// `GLUALS_CHECK_FINGERPRINTS`: recompute every cached fingerprint and panic on
+/// a key that moved without being written.
 fn check_fingerprints() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("GLUALS_CHECK_FINGERPRINTS").is_some())
@@ -5140,6 +5153,65 @@ print(tuned{index})"
         db.get_type_index()
             .get_type_cache(&owner(COPIED))
             .map(|cache| cache.as_type().clone())
+    }
+
+    /// Two statements that never settle: the reader copies `WRITTEN` plus one
+    /// into `COPIED`, and the writer copies `COPIED` back into `WRITTEN`.
+    struct Feedback;
+
+    fn integer(db: &DbIndex, position: u32) -> i64 {
+        match db
+            .get_type_index()
+            .get_type_cache(&owner(position))
+            .map(|cache| cache.as_type().clone())
+        {
+            Some(LuaType::IntegerConst(value)) => value,
+            _ => 0,
+        }
+    }
+
+    impl Recipe for Feedback {
+        fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
+            if id == statement(READER) {
+                let next = integer(db, WRITTEN) + 1;
+                bind(db, COPIED, LuaType::IntegerConst(next));
+            } else {
+                let copied = integer(db, COPIED);
+                bind(db, WRITTEN, LuaType::IntegerConst(copied));
+            }
+        }
+
+        fn splits(&self, _: DerivationKind) -> bool {
+            false
+        }
+
+        fn compute(&self, _: &DbIndex, _: DerivationId) -> Box<dyn std::any::Any + Send> {
+            unreachable!("feedback does not split")
+        }
+
+        fn apply(&self, _: &mut DbIndex, _: DerivationId, _: Box<dyn std::any::Any + Send>) {
+            unreachable!("feedback does not split")
+        }
+    }
+
+    #[test]
+    fn a_loop_that_never_settles_stops_where_its_runs_run_out() {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        engine.unsettled_panics = false;
+        for start in [READER, WRITER] {
+            engine.changed(statement(start));
+        }
+        engine.open(db);
+
+        let settled = engine.run(db, &Feedback, Slice::Whole);
+
+        let runs = i64::from(MAX_INDEX_RUNS);
+        assert_eq!(
+            (settled, integer(db, COPIED), integer(db, WRITTEN)),
+            (true, runs, runs)
+        );
     }
 
     #[test]
