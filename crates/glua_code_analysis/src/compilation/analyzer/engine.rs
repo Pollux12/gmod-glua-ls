@@ -1500,12 +1500,19 @@ impl Engine {
 
     /// Does for `group`, which `file_id`'s task ran, what [`Self::step`] does
     /// before it evaluates one, in the order the groups were decided.
-    fn commit_group(&mut self, db: &DbIndex, file_id: crate::FileId, group: &PlannedGroup) {
+    fn commit_group(
+        &mut self,
+        db: &DbIndex,
+        file_id: crate::FileId,
+        group: &PlannedGroup,
+        moved_in_task: &[Vec<(HashedKey, derivation::Fingerprint)>],
+    ) {
         let (id, reason) = group.entries[0];
         self.trace_evaluation(db, id, reason);
         self.check_convergence(id);
         let group = &group.members;
-        for member in group {
+        let settled = db.analysis_stage() == AnalysisStage::Closed;
+        for (member, moved_in_task) in group.iter().zip(moved_in_task) {
             if *member != id {
                 self.stats
                     .requeue_cause(*member, "run with a queued co-producer");
@@ -1518,8 +1525,17 @@ impl Engine {
             {
                 self.from_before.insert(*member);
             }
-            let moved = self.moved_from.remove(member).unwrap_or_default();
+            let mut moved = self.moved_from.remove(member).unwrap_or_default();
             if member.kind.is_statement() {
+                for (key, seen) in moved_in_task {
+                    if moved.iter().all(|moved| moved.key != *key) {
+                        moved.push(Moved {
+                            key: key.clone(),
+                            seen: *seen,
+                            settled,
+                        });
+                    }
+                }
                 self.settled_on(*member, moved);
             }
         }
@@ -1656,8 +1672,11 @@ impl Engine {
             } = plan;
             let unrun =
                 groups.split_off(outcome.as_ref().map_or(0, |outcome| outcome.groups.len()));
-            for group in &groups {
-                self.commit_group(db, file_id, group);
+            let ran = outcome
+                .as_ref()
+                .map_or(&[][..], |outcome| &outcome.groups[..]);
+            for (group, run) in groups.iter().zip(ran) {
+                self.commit_group(db, file_id, group, &run.moved);
             }
             if !unrun.is_empty() {
                 carried.push(TaskPlan {
@@ -1748,6 +1767,14 @@ impl Engine {
         }
         db.reader_graph_mut()
             .replace_all_kept(records, &mut released, derivation::new_stamp);
+        for member in tasks
+            .iter()
+            .flat_map(|(_, groups, ..)| groups.iter().flat_map(|group| &group.members))
+        {
+            if member.kind.is_statement() && self.rebuilt.contains(&member.file_id) {
+                self.settled_on_removed(db, *member);
+            }
+        }
         for (_, groups, ..) in &tasks {
             for group in groups {
                 if let Some(started) = group.elapsed.filter(|_| profiling) {
@@ -2022,22 +2049,26 @@ impl Engine {
         }
         self.queue_reruns();
         crate::profile::phase("engine: readers of", || self.readers_of(db, touched.iter()));
-        // A statement of a rebuilt file settled, before the run, on what
-        // the removed derivations wrote.
         for member in rebuilt {
-            let removed = db
-                .reader_graph()
-                .reads_of(member)
-                .filter_map(|key| {
-                    Some(Moved {
-                        key: key.clone(),
-                        seen: *self.removed_outputs.get(key)?,
-                        settled: true,
-                    })
-                })
-                .collect::<Vec<_>>();
-            self.settled_on(member, removed);
+            self.settled_on_removed(db, member);
         }
+    }
+
+    /// Notes that `member`, a statement of a rebuilt file, settled before the
+    /// run on what the removed derivations it reads wrote.
+    fn settled_on_removed(&mut self, db: &DbIndex, member: DerivationId) {
+        let removed = db
+            .reader_graph()
+            .reads_of(member)
+            .filter_map(|key| {
+                Some(Moved {
+                    key: key.clone(),
+                    seen: *self.removed_outputs.get(key)?,
+                    settled: true,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.settled_on(member, removed);
     }
 
     /// Notes that statement `member` settled on what it saw of each fact in
@@ -3493,6 +3524,9 @@ enum Dispatched {
 struct GroupRun {
     members: Vec<DerivationId>,
     records: Vec<(usize, Vec<derivation::Fingerprint>)>,
+    /// For each member, the reads of its record from before the superstep
+    /// that an earlier group of the task moved, with what it had seen.
+    moved: Vec<Vec<(HashedKey, derivation::Fingerprint)>>,
     rerun: bool,
     elapsed: Option<std::time::Duration>,
 }
@@ -3709,8 +3743,13 @@ fn run_task_on_worker(
             .map(|(_, group)| {
                 stop.progress();
                 let started = profiling.then(std::time::Instant::now);
+                let moved = group
+                    .members
+                    .iter()
+                    .map(|member| moved_in_task(&db, frozen, &touched, *member))
+                    .collect();
                 let (records, group_touched) =
-                    evaluate_on_worker(&mut db, frozen, &recorder, &group.members, recipe);
+                    evaluate_on_worker(&mut db, &recorder, &group.members, recipe);
                 touched.extend(group_touched);
                 GroupRun {
                     members: group.members.clone(),
@@ -3718,6 +3757,7 @@ fn run_task_on_worker(
                         .into_iter()
                         .map(|(at, _, seen)| (at, seen))
                         .collect(),
+                    moved,
                     rerun: group.rerun,
                     elapsed: started.map(|started| started.elapsed()),
                 }
@@ -3742,7 +3782,6 @@ fn run_task_on_worker(
 #[allow(clippy::type_complexity)]
 fn evaluate_on_worker(
     db: &mut DbIndex,
-    frozen: &DbIndex,
     recorder: &derivation::TaskRecorder,
     group: &[DerivationId],
     recipe: &dyn Recipe,
@@ -3814,7 +3853,7 @@ fn evaluate_on_worker(
                             derivation::ReadState::Snapshot(slot) => db
                                 .reader_graph()
                                 .slot_fingerprint(slot, |key| db.fact_fingerprint(key)),
-                            derivation::ReadState::Fact(key) => closed_read_seen(db, frozen, &key),
+                            derivation::ReadState::Fact(key) => db.fact_fingerprint(&key),
                         })
                         .collect();
                     (at, id, seen)
@@ -3832,19 +3871,32 @@ fn evaluate_on_worker(
     }
 }
 
-/// What a task's read of `key` saw, which the task wrote: in the closed stage,
-/// a key the superstep began without is recorded as seen absent, as a read
-/// the serial loop makes before the key's producer runs again sees it, so a
-/// loop that read it settles canonically as there.
-fn closed_read_seen(db: &DbIndex, frozen: &DbIndex, key: &HashedKey) -> derivation::Fingerprint {
-    let seen = db.fact_fingerprint(key);
-    if seen != derivation::ABSENT
-        && db.analysis_stage() == AnalysisStage::Closed
-        && frozen.fact_fingerprint(key) == derivation::ABSENT
-    {
-        return derivation::ABSENT;
+/// The reads of `member`'s record from before the superstep that the groups
+/// its task ran before it moved, with what `member` had seen of each: what the
+/// serial loop notes of a reader when it evaluates those groups first.
+fn moved_in_task(
+    db: &DbIndex,
+    frozen: &DbIndex,
+    written: &FxHashSet<HashedKey>,
+    member: DerivationId,
+) -> Vec<(HashedKey, derivation::Fingerprint)> {
+    if !member.kind.is_statement() || written.is_empty() {
+        return Vec::new();
     }
-    seen
+    let graph = frozen.reader_graph();
+    graph
+        .reads_of(member)
+        .zip(graph.recorded_slots(member))
+        .filter(|(key, _)| {
+            !key.is_stage_rule()
+                && (written.contains(*key)
+                    || key
+                        .base()
+                        .is_some_and(|base| written.contains(&HashedKey::new(base))))
+        })
+        .filter(|(key, (_, seen))| db.fact_fingerprint(key) != *seen)
+        .map(|(key, (_, seen))| (key.clone(), seen))
+        .collect()
 }
 
 /// `key`'s fingerprint as a task's fork holds it: through the reader graph's
