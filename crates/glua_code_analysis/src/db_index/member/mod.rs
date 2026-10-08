@@ -384,6 +384,10 @@ impl LuaMemberIndex {
                 fingerprint_of(&(provenance, flags, scope))
             }
             FactKey::MemberSlot(owner, key) => self.slot_fingerprint(owner, key),
+            FactKey::FunctionScope(site) => fingerprint_of(&crate::InFiled::new(
+                site.file_id,
+                self.innermost_function_scope(site.file_id, site.value),
+            )),
             FactKey::MemberOwnerPresence(owner) => {
                 if self.owner_members.contains_key(owner) {
                     fingerprint_of(&true)
@@ -2614,7 +2618,11 @@ impl LuaMemberIndex {
         file_id: FileId,
         position: TextSize,
     ) -> Option<TextRange> {
-        derivation::note_file_read(file_id);
+        derivation::note_function_scope_read(file_id, position);
+        self.innermost_function_scope(file_id, position)
+    }
+
+    fn innermost_function_scope(&self, file_id: FileId, position: TextSize) -> Option<TextRange> {
         let ranges = self.function_scope_ranges.get(&file_id)?;
         let mut index = ranges.partition_point(|range| range.start() <= position);
         while index > 0 {

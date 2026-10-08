@@ -496,6 +496,7 @@ impl DbIndex {
             | K::MemberOwnerPresence(_)
             | K::MemberKey(_)
             | K::MemberFile(_)
+            | K::FunctionScope(_)
             | K::GlobalPath(_)
             | K::PathClassContrib(_)
             | K::DefinitionSite(_) => self.members_index.fact_fingerprint(key),

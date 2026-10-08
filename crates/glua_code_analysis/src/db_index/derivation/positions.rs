@@ -234,6 +234,10 @@ impl EditMaps {
             K::NetHelper(site) => K::NetHelper(self.site(site)?),
             K::NetDefinitionUses(site) => K::NetDefinitionUses(self.site(site)?),
             K::Syntax(site) => K::Syntax(self.site(site)?),
+            K::FunctionScope(site) => K::FunctionScope(InFiled::new(
+                site.file_id,
+                self.position(site.file_id, site.value)?,
+            )),
             K::Signature(id) => K::Signature(self.signature_id(*id)?),
             K::SignatureDecl(id) => K::SignatureDecl(self.signature_id(*id)?),
             K::SignatureReturnsNever(id) => K::SignatureReturnsNever(self.signature_id(*id)?),

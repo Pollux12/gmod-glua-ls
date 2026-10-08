@@ -436,6 +436,9 @@ pub enum FactKey {
     /// One statement of a file, by its range: its kind and text, and the kind
     /// and range of every node between it and the top-level block.
     Syntax(InFiled<TextRange>),
+    /// The innermost function statement or closure of a file around a
+    /// position, by its range.
+    FunctionScope(InFiled<TextSize>),
     /// The set of files in the workspace.
     FileSet,
     /// Whether a stage rule holds at the stage the engine run is in.
@@ -884,6 +887,7 @@ impl FactKey {
             | K::FunctionSummaries(file_id)
             | K::References(file_id)
             | K::DeclReferences(LuaDeclId { file_id, .. })
+            | K::FunctionScope(InFiled { file_id, .. })
             | K::AccessorCalls(file_id)
             | K::Dependency(file_id)
             | K::LoadSites(file_id)
@@ -2427,24 +2431,27 @@ pub fn take_noted_reads() -> u64 {
 /// Records a read of the top-level statement `statement` of `file_id`. A
 /// derivation's own file is not a read, as for [`note_file_read`].
 pub fn note_syntax_read(file_id: FileId, statement: TextRange) {
-    if UNTRACKED.with(|depth| depth.get() > 0) {
-        return;
-    }
-    CURRENT.with(|current| {
-        if let Some(evaluation) = current.borrow_mut().as_mut()
-            && evaluation.id.file_id != file_id
-        {
-            record_read(
-                evaluation,
-                HashedKey::new(FactKey::Syntax(InFiled::new(file_id, statement))),
-            );
-        }
+    note_read_of_file(file_id, || {
+        FactKey::Syntax(InFiled::new(file_id, statement))
     });
 }
 
 /// Records a read of `file_id`'s text. A derivation's own file is not a
 /// read: its derivations are replaced whenever that text changes.
 pub fn note_file_read(file_id: FileId) {
+    note_read_of_file(file_id, || FactKey::FileText(file_id));
+}
+
+/// Records a read of the innermost function scope of `file_id` around
+/// `position`. A derivation's own file is not a read, as for
+/// [`note_file_read`].
+pub fn note_function_scope_read(file_id: FileId, position: TextSize) {
+    note_read_of_file(file_id, || {
+        FactKey::FunctionScope(InFiled::new(file_id, position))
+    });
+}
+
+fn note_read_of_file(file_id: FileId, key: impl FnOnce() -> FactKey) {
     if UNTRACKED.with(|depth| depth.get() > 0) {
         return;
     }
@@ -2452,7 +2459,7 @@ pub fn note_file_read(file_id: FileId) {
         if let Some(evaluation) = current.borrow_mut().as_mut()
             && evaluation.id.file_id != file_id
         {
-            record_read(evaluation, HashedKey::new(FactKey::FileText(file_id)));
+            record_read(evaluation, HashedKey::new(key()));
         }
     });
 }

@@ -1147,6 +1147,77 @@ function PLAYER:GetRankData()
 end
 "#;
 
+    const REGISTRY: &str = "gamemodes/cityrp/gamemode/core/sh_registry.lua";
+    /// A member written inside a function before the table is generated
+    /// again at the top level: whether it survives turns on the two writes'
+    /// function scopes.
+    const REGISTRY_TEXT: &str = "function SetupRegistry()
+    Registry.Value = 1
+end
+
+Registry = {}
+";
+
+    /// The registry file and a file reading its member.
+    fn registry_workspace() -> (VirtualWorkspace, FileId) {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(REGISTRY, REGISTRY_TEXT);
+        let reader = ws.def_file(
+            "gamemodes/cityrp/gamemode/core/sh_registry_reader.lua",
+            "local value = Registry.Value
+",
+        );
+        (ws, reader)
+    }
+
+    /// A reader of a table member that survives the table being generated
+    /// again reads the function scopes around the two writes, not the text of
+    /// the file holding them.
+    #[test]
+    fn a_reader_of_a_member_written_before_its_table_is_generated_reads_no_file_text() {
+        let (ws, reader) = registry_workspace();
+        let graph = ws.analysis.compilation.get_db().reader_graph();
+
+        let reads = graph
+            .derivations_of_file(reader)
+            .flat_map(|id| graph.reads_of(id))
+            .map(|key| key.key().clone())
+            .collect::<Vec<_>>();
+
+        assert!(
+            reads
+                .iter()
+                .any(|key| matches!(key, crate::db_index::derivation::FactKey::FunctionScope(_)))
+        );
+        assert!(
+            !reads
+                .iter()
+                .any(|key| matches!(key, crate::db_index::derivation::FactKey::FileText(_)))
+        );
+    }
+
+    /// A comment appended to the registry file leaves the function scopes
+    /// the reader read as they were.
+    #[test]
+    fn a_comment_appended_to_a_file_whose_member_survives_a_table_generation_re_runs_nothing_in_its_reader()
+     {
+        let (mut ws, _) = registry_workspace();
+
+        let registry = ws.def_file(
+            REGISTRY,
+            &format!(
+                "{REGISTRY_TEXT}
+-- touch
+"
+            ),
+        );
+
+        assert_eq!(
+            ws.analysis.compilation.last_evaluated_files(),
+            vec![registry]
+        );
+    }
+
     /// The ranks file, a plugin that also bootstraps the configuration table,
     /// and a file calling a ranks method, which is returned.
     fn ranks_workspace() -> (VirtualWorkspace, FileId) {
