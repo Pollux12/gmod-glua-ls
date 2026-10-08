@@ -748,10 +748,20 @@ impl EmmyLuaAnalysis {
     /// not). Dispatching the expensive files first keeps one of them from being
     /// left alone on the critical path after the other workers have gone idle.
     pub fn get_main_workspace_file_ids_for_diagnostics(&self) -> Vec<FileId> {
+        let file_ids = self
+            .compilation
+            .get_db()
+            .get_module_index()
+            .get_main_workspace_file_ids();
+        self.order_for_diagnostics(file_ids)
+    }
+
+    /// `file_ids` with the files that cost the most to diagnose first; see
+    /// [`Self::get_main_workspace_file_ids_for_diagnostics`].
+    pub fn order_for_diagnostics(&self, mut file_ids: Vec<FileId>) -> Vec<FileId> {
         let db = self.compilation.get_db();
         let vfs = db.get_vfs();
         let flow_index = db.get_flow_index();
-        let mut file_ids = db.get_module_index().get_main_workspace_file_ids();
         file_ids.sort_by_cached_key(|file_id| {
             let bindings = flow_index
                 .get_flow_tree(file_id)

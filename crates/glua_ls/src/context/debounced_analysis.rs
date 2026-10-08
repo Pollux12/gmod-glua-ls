@@ -969,6 +969,7 @@ impl DebouncedAnalysis {
                 self.client.refresh_inlay_hints();
             }
         }
+        let affected = self.analysis.read().await.order_for_diagnostics(affected);
         self.file_diagnostic.store().invalidate(affected, edited);
     }
 

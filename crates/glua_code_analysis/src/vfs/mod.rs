@@ -516,12 +516,10 @@ impl Vfs {
 
     pub fn get_file_content(&self, id: &FileId) -> Option<&String> {
         crate::db_index::derivation::note_file_read(*id);
-        let opt = &self.file_data[id.id as usize];
-        if let Some(s) = opt {
-            Some(&s.content)
-        } else {
-            None
-        }
+        self.file_data
+            .get(id.id as usize)?
+            .as_ref()
+            .map(|data| &data.content)
     }
 
     /// The fingerprint of `id`'s text, for [`FactKey::FileText`](crate::db_index::derivation::FactKey::FileText).

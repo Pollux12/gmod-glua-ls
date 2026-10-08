@@ -28,6 +28,13 @@ impl SharedDiagnosticDataCache {
         &self,
         analysis: &EmmyLuaAnalysis,
     ) -> Arc<SharedDiagnosticData> {
+        // Checked before the lock, so files diagnosed together do not queue
+        // on it while the shared data holds.
+        if self.components.is_fresh(&analysis.compilation)
+            && let Some(shared_data) = self.cached.lock().ok().and_then(|cached| cached.clone())
+        {
+            return shared_data;
+        }
         let mut cached = self.cached.lock().ok();
         if let Some(cache) = cached.as_ref()
             && let Some(shared_data) = cache.as_ref()
