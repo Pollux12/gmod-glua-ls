@@ -99,6 +99,24 @@ impl ScriptedScopes {
             infos: context.get_or_compute_scripted_scope_infos(db),
         }
     }
+
+    /// The files `self` and `other` scope differently, sorted.
+    fn rescoped(&self, other: &Self) -> Vec<FileId> {
+        let mut files = self
+            .files
+            .symmetric_difference(&other.files)
+            .chain(
+                self.infos
+                    .keys()
+                    .chain(other.infos.keys())
+                    .filter(|file_id| self.infos.get(*file_id) != other.infos.get(*file_id)),
+            )
+            .copied()
+            .collect::<Vec<_>>();
+        files.sort_unstable();
+        files.dedup();
+        files
+    }
 }
 
 /// What [`ScriptedScopes`] are computed from, besides the config.
@@ -143,16 +161,23 @@ impl std::fmt::Debug for ScopesCache {
 }
 
 impl ScopesCache {
-    fn get(&mut self, db: &DbIndex) -> ScriptedScopes {
+    /// The scopes of the files as they stand, and the files they scope
+    /// otherwise than the scopes held last did, sorted.
+    fn get(&mut self, db: &DbIndex) -> (ScriptedScopes, Vec<FileId>) {
         let key = ScopesKey::of(db);
         if let Some((cached, scopes)) = &self.0
             && *cached == key
         {
-            return scopes.clone();
+            return (scopes.clone(), Vec::new());
         }
         let scopes = ScriptedScopes::new(db);
+        let rescoped = self
+            .0
+            .as_ref()
+            .map(|(_, held)| held.rescoped(&scopes))
+            .unwrap_or_default();
         self.0 = Some((key, scopes.clone()));
-        scopes
+        (scopes, rescoped)
     }
 }
 
@@ -479,7 +504,12 @@ fn start_pass(
     if file_ids.is_empty() {
         return None;
     }
-    let scopes = crate::profile::phase("reanalyze: scopes", || scopes.get(db));
+    let (scopes, rescoped) = crate::profile::phase("reanalyze: scopes", || scopes.get(db));
+    // A file whose scope changed with other files' paths is re-indexed, as a
+    // moved file is.
+    file_ids.extend(rescoped);
+    file_ids.sort();
+    file_ids.dedup();
     // Queries computed since the last run read the index as it stood before
     // the rebuild moves it.
     let mut moved = pending;
@@ -562,6 +592,13 @@ fn replace_files(
         touched.insert(derivation::HashedKey::new(derivation::FactKey::FilePath(
             *file_id,
         )));
+        let vfs = db.get_vfs_mut();
+        let paths = vfs.take_left_paths(file_id);
+        for path in paths.into_iter().chain(vfs.get_file_path(file_id).cloned()) {
+            touched.insert(derivation::HashedKey::new(derivation::FactKey::PathFile(
+                Arc::from(path),
+            )));
+        }
         let live = live_files.contains(file_id);
         for producer in producers {
             if replaced.contains(&producer.file_id) {
@@ -1340,10 +1377,11 @@ impl AnalyzeContext {
         // under the root — no `gamemodes/<name>` segment for the scope path
         // rules to anchor on — but its `gamemode/**` files author `GM` just
         // like `gamemodes/*/gamemode/**`. Scope them the same way.
-        let root_gamemode = file_paths
-            .first()
-            .and_then(|(file_id, _)| gmod::detect_root_gamemode_scope(db, *file_id));
-        if let Some((gamemode_dir, scope_match)) = root_gamemode {
+        for workspace_id in db.get_module_index().get_main_workspace_ids() {
+            let Some((gamemode_dir, scope_match)) = gmod::root_gamemode_scope(db, workspace_id)
+            else {
+                continue;
+            };
             for (file_id, path) in &file_paths {
                 if scripted_scope_infos.contains_key(file_id) || !path.starts_with(&gamemode_dir) {
                     continue;

@@ -55,6 +55,9 @@ pub struct Vfs {
     /// Files deleted from disk, kept until a re-analysis has taken the
     /// deletion; see [`Vfs::forget_taken_deletions`].
     deleted: FxHashSet<FileId>,
+    /// The paths each file moved or was removed from, until a re-analysis
+    /// takes them; see [`Vfs::take_left_paths`].
+    left_paths: FxHashMap<FileId, Vec<PathBuf>>,
 }
 
 /// The child of `tree`'s top-level block that contains `range`.
@@ -158,6 +161,7 @@ impl Vfs {
             content_revision: 0,
             staged: FxHashMap::default(),
             deleted: FxHashSet::default(),
+            left_paths: FxHashMap::default(),
         }
     }
 
@@ -200,9 +204,45 @@ impl Vfs {
         }
     }
 
+    /// The id `uri`'s path is filed under, its text staged or taken. Analysis
+    /// asks [`Vfs::file_at`] instead.
     pub fn get_file_id(&self, uri: &Uri) -> Option<FileId> {
         let path = uri_to_file_path(uri)?;
         self.file_id_map.get(&path).map(|&id| FileId { id })
+    }
+
+    /// The file at `uri` whose text readers see, recorded as a read of that
+    /// path's occupant: a file created at, deleted from or moved to or from
+    /// the path re-runs the reader.
+    pub fn file_at(&self, uri: &Uri) -> Option<FileId> {
+        let path = uri_to_file_path(uri)?;
+        crate::db_index::derivation::note_read(|| {
+            crate::db_index::derivation::FactKey::PathFile(Arc::from(path.as_path()))
+        });
+        self.occupant(&path)
+    }
+
+    fn occupant(&self, path: &Path) -> Option<FileId> {
+        let id = *self.file_id_map.get(path)?;
+        self.file_data
+            .get(id as usize)?
+            .as_ref()
+            .map(|_| FileId { id })
+    }
+
+    /// The fingerprint of the file at `path`, for
+    /// [`FactKey::PathFile`](crate::db_index::derivation::FactKey::PathFile).
+    pub(crate) fn occupant_fingerprint(
+        &self,
+        path: &Path,
+    ) -> crate::db_index::derivation::Fingerprint {
+        crate::db_index::derivation::fingerprint_opt(self.occupant(path).as_ref())
+    }
+
+    /// The paths `id` moved or was removed from since a re-analysis last took
+    /// them.
+    pub fn take_left_paths(&mut self, id: &FileId) -> Vec<PathBuf> {
+        self.left_paths.remove(id).unwrap_or_default()
     }
 
     pub fn get_uri(&self, id: &FileId) -> Option<Uri> {
@@ -458,6 +498,7 @@ impl Vfs {
         }
         if let Some(old_path) = self.file_path_map.remove(&fid.id) {
             self.file_id_map.remove(&old_path);
+            self.left_paths.entry(fid).or_default().push(old_path);
         }
         self.file_id_map.insert(new_path.clone(), fid.id);
         self.file_order_keys
@@ -483,6 +524,7 @@ impl Vfs {
         let fid = self.get_file_id(uri)?;
         if let Some(path) = self.file_path_map.remove(&fid.id) {
             self.file_id_map.remove(&path);
+            self.left_paths.entry(fid).or_default().push(path);
         }
         self.file_order_keys.remove(&fid.id);
         self.stage(fid, None, None, false, None);
@@ -780,6 +822,7 @@ impl Vfs {
         self.tree_map.clear();
         self.staged.clear();
         self.deleted.clear();
+        self.left_paths.clear();
         self.emmyrc = None;
     }
 }

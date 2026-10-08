@@ -6689,6 +6689,14 @@ fn detect_scoped_class_from_path(db: &DbIndex, file_id: FileId) -> Option<GmodSc
     file_path.starts_with(&gamemode_dir).then_some(scope_match)
 }
 
+/// [`root_gamemode_scope`] of `file_id`'s workspace.
+pub(crate) fn detect_root_gamemode_scope(
+    db: &DbIndex,
+    file_id: FileId,
+) -> Option<(PathBuf, GmodScopedClassMatch)> {
+    root_gamemode_scope(db, db.get_module_index().get_workspace_id(file_id)?)
+}
+
 /// Detect the "workspace root *is* a gamemode folder" layout: `gamemode/`
 /// sits directly under the workspace root (e.g. opening a `gamemodes/<name>`
 /// checkout itself in the editor), so no `gamemodes/<name>` segment exists
@@ -6696,16 +6704,15 @@ fn detect_scoped_class_from_path(db: &DbIndex, file_id: FileId) -> Option<GmodSc
 ///
 /// Returns the gamemode directory and a scope match named
 /// `gamemode_<root dir name>` (the same identifier `gamemode.Register`
-/// derives from the folder at runtime). The entry files are always loaded
-/// for a real gamemode workspace, so probing the VFS for them keeps the
-/// answer independent of how analysis was batched. Callers decide whether a
-/// given file lives under the returned directory; files already claimed by
-/// another scope (e.g. `gamemode/schema.lua` → `SCHEMA`) keep their match.
-pub(crate) fn detect_root_gamemode_scope(
+/// derives from the folder at runtime). The layout is told by an entry file
+/// being there, a probe of each entry path that creating, deleting or moving
+/// a file there re-runs. Callers decide whether a given file lives under the
+/// returned directory; files already claimed by another scope (e.g.
+/// `gamemode/schema.lua` → `SCHEMA`) keep their match.
+pub(crate) fn root_gamemode_scope(
     db: &DbIndex,
-    file_id: FileId,
+    workspace_id: crate::WorkspaceId,
 ) -> Option<(PathBuf, GmodScopedClassMatch)> {
-    let workspace_id = db.get_module_index().get_workspace_id(file_id)?;
     if !db.get_module_index().is_main_workspace_id(workspace_id) {
         return None;
     }
@@ -6715,7 +6722,7 @@ pub(crate) fn detect_root_gamemode_scope(
         .iter()
         .any(|name| {
             crate::vfs::file_path_to_uri(&gamemode_dir.join(name))
-                .and_then(|uri| db.get_vfs().get_file_id(&uri))
+                .and_then(|uri| db.get_vfs().file_at(&uri))
                 .is_some()
         });
     if !has_entry {

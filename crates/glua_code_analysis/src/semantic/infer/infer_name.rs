@@ -14,7 +14,7 @@ use super::{
 use crate::{
     CacheEntry, FileId, GmodStateMask, LuaArrayLen, LuaArrayType, LuaDecl, LuaDeclExtra, LuaDeclId,
     LuaInferCache, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType,
-    LuaTypeDeclId, SemanticDeclLevel, TypeOps,
+    LuaTypeDeclId, ScriptedSingletons, SemanticDeclLevel, TypeOps,
     compilation::analyzer::{
         gmod::{
             detect_root_gamemode_scope, get_scripted_class_type_decl_id,
@@ -175,57 +175,91 @@ fn resolve_global_singleton_scripted_type_decl_id(
     cache: &mut LuaInferCache,
     name: &str,
 ) -> Option<LuaTypeDeclId> {
-    if cache.scripted_global_singleton_type_cache.is_none() {
-        let emmyrc = db.get_emmyrc();
-        let mut lookup = rustc_hash::FxHashMap::default();
-
-        if emmyrc.gmod.enabled {
-            for definition in emmyrc
-                .gmod
-                .scripted_class_scopes
-                .resolved_definitions_slice()
-                .iter()
-                .filter(|definition| definition.is_global_singleton)
-            {
-                let class_name = definition
-                    .fixed_class_name
-                    .as_deref()
-                    .unwrap_or(&definition.class_global);
-                let type_decl_id =
-                    get_scripted_class_type_decl_id(&definition.class_global, class_name);
-                lookup.insert(definition.class_global.clone(), type_decl_id.clone());
-                for alias in &definition.aliases {
-                    lookup.insert(alias.clone(), type_decl_id.clone());
-                }
-            }
-
-            // A workspace rooted at a gamemode folder scopes `GM`/`GAMEMODE`
-            // to that gamemode's class workspace-wide: the runtime global
-            // `GAMEMODE` is the gamemode table, so plugin and entity files
-            // see the same members `gamemode/**` files author.
-            if let Some((_, scope_match)) = detect_root_gamemode_scope(db, cache.get_file_id()) {
-                let type_decl_id = get_scripted_class_type_decl_id(
-                    &scope_match.global_name,
-                    &scope_match.class_name,
-                );
-                lookup.insert(scope_match.global_name.clone(), type_decl_id.clone());
-                for alias in &scope_match.aliases {
-                    lookup.insert(alias.clone(), type_decl_id.clone());
-                }
-                if scope_match.global_name == "GM" {
-                    lookup.insert("GAMEMODE".to_string(), type_decl_id);
-                }
-            }
-        }
-
-        cache.scripted_global_singleton_type_cache = Some(lookup);
+    let singletons = cache
+        .scripted_global_singleton_type_cache
+        .get_or_insert_with(|| scripted_singletons(db));
+    if singletons.root_gamemode_names.contains(name)
+        && let Some(type_decl_id) = root_gamemode_class(db, cache)
+    {
+        return Some(type_decl_id);
     }
-
     cache
         .scripted_global_singleton_type_cache
-        .as_ref()
-        .and_then(|lookup| lookup.get(name))
+        .as_ref()?
+        .classes
+        .get(name)
         .cloned()
+}
+
+/// The global singleton names the config's scripted-class scopes bind.
+fn scripted_singletons(db: &DbIndex) -> ScriptedSingletons {
+    let mut singletons = ScriptedSingletons::default();
+    let emmyrc = db.get_emmyrc();
+    if !emmyrc.gmod.enabled {
+        return singletons;
+    }
+    let definitions = emmyrc
+        .gmod
+        .scripted_class_scopes
+        .resolved_definitions_slice();
+    for definition in definitions
+        .iter()
+        .filter(|definition| definition.is_global_singleton)
+    {
+        let class_name = definition
+            .fixed_class_name
+            .as_deref()
+            .unwrap_or(&definition.class_global);
+        let type_decl_id = get_scripted_class_type_decl_id(&definition.class_global, class_name);
+        singletons
+            .classes
+            .insert(definition.class_global.clone(), type_decl_id.clone());
+        for alias in &definition.aliases {
+            singletons
+                .classes
+                .insert(alias.clone(), type_decl_id.clone());
+        }
+    }
+    // A workspace rooted at a gamemode folder scopes `GM`/`GAMEMODE` to that
+    // gamemode's class workspace-wide: the runtime global `GAMEMODE` is the
+    // gamemode table, so plugin and entity files see the same members
+    // `gamemode/**` files author.
+    if let Some(definition) = definitions
+        .iter()
+        .find(|definition| definition.id == "gamemodes")
+    {
+        singletons
+            .root_gamemode_names
+            .insert(definition.class_global.clone());
+        singletons
+            .root_gamemode_names
+            .extend(definition.aliases.iter().cloned());
+        if definition.class_global == "GM" {
+            singletons
+                .root_gamemode_names
+                .insert("GAMEMODE".to_string());
+        }
+    }
+    singletons
+}
+
+/// The gamemode class of the cache's file's workspace when it is rooted at a
+/// gamemode folder.
+fn root_gamemode_class(db: &DbIndex, cache: &mut LuaInferCache) -> Option<LuaTypeDeclId> {
+    if let Some(class) = cache.tracked_get(|cache| &mut cache.root_gamemode_class_cache, &()) {
+        return class;
+    }
+    let frame = crate::db_index::derivation::open_frame();
+    let class = detect_root_gamemode_scope(db, cache.get_file_id()).map(|(_, scope_match)| {
+        get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name)
+    });
+    cache.tracked_insert(
+        |cache| &mut cache.root_gamemode_class_cache,
+        (),
+        class.clone(),
+        frame,
+    );
+    class
 }
 
 fn infer_local_decl_name_type(

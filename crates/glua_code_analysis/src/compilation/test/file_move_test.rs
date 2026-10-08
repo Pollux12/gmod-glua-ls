@@ -296,4 +296,144 @@ mod test {
         assert_eq!(stats.loops_cleared, 0);
         assert_eq!(stats.rebuilt_sources, 0);
     }
+
+    const HUD: &str = "gamemode/cl_hud.lua";
+    const HUD_TEXT: &str = "function GM:HUDPaint() end\n";
+    const PLUGIN: &str = "plugins/foo/sh_main.lua";
+    const PLUGIN_TEXT: &str = "local paint = GAMEMODE.HUDPaint\n";
+    const ENTRY: &str = "gamemode/init.lua";
+    const ENTRY_TEXT: &str = "GM.Name = \"Root\"\n";
+    const BOOT: &str = "gamemode/core/sv_boot.lua";
+
+    /// A workspace holding `files` whose root may be a gamemode folder.
+    fn root_gamemode_workspace(files: &[(&str, &str)]) -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(files.to_vec());
+        ws
+    }
+
+    /// Applies `events` to `warm` in one batch and asserts it settles as a
+    /// workspace built with `final_files`.
+    fn assert_events_match_cold(
+        warm: &mut VirtualWorkspace,
+        events: &[(&str, Option<&str>)],
+        final_files: &[(&str, &str)],
+    ) {
+        let events = events
+            .iter()
+            .map(|(path, text)| {
+                (
+                    warm.virtual_url_generator.new_uri(path),
+                    text.map(str::to_string),
+                )
+            })
+            .collect();
+        warm.analysis.apply_file_system_changes(events);
+        assert_eq!(warm.stale_derivations(), Vec::new());
+        assert_eq!(digest(warm), digest(&root_gamemode_workspace(final_files)));
+    }
+
+    /// Whether the file at `path` authors a scripted class.
+    fn is_scoped(ws: &VirtualWorkspace, path: &str) -> bool {
+        file_id(ws, path).is_some_and(|file_id| {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_gmod_infer_index()
+                .get_scoped_class_info(&file_id)
+                .is_some()
+        })
+    }
+
+    /// Creating a gamemode entry file at the workspace root makes the root a
+    /// gamemode folder, as a cold build with the file finds it.
+    #[test]
+    fn creating_a_gamemode_entry_file_makes_the_root_a_gamemode() {
+        let mut ws = root_gamemode_workspace(&[(HUD, HUD_TEXT), (PLUGIN, PLUGIN_TEXT)]);
+        assert!(!is_scoped(&ws, HUD));
+        assert_events_match_cold(
+            &mut ws,
+            &[(ENTRY, Some(ENTRY_TEXT))],
+            &[(HUD, HUD_TEXT), (PLUGIN, PLUGIN_TEXT), (ENTRY, ENTRY_TEXT)],
+        );
+        assert!(is_scoped(&ws, HUD));
+    }
+
+    /// Deleting the only gamemode entry file leaves the root a plain folder.
+    #[test]
+    fn deleting_the_gamemode_entry_file_leaves_the_root_plain() {
+        let mut ws =
+            root_gamemode_workspace(&[(HUD, HUD_TEXT), (PLUGIN, PLUGIN_TEXT), (ENTRY, ENTRY_TEXT)]);
+        assert!(is_scoped(&ws, HUD));
+        assert_events_match_cold(
+            &mut ws,
+            &[(ENTRY, None)],
+            &[(HUD, HUD_TEXT), (PLUGIN, PLUGIN_TEXT)],
+        );
+        assert!(!is_scoped(&ws, HUD));
+    }
+
+    /// Moving the only gamemode entry file away vacates its path: the root is
+    /// a plain folder, though the moved file keeps its id.
+    #[test]
+    fn moving_the_gamemode_entry_file_away_leaves_the_root_plain() {
+        let mut ws =
+            root_gamemode_workspace(&[(HUD, HUD_TEXT), (PLUGIN, PLUGIN_TEXT), (ENTRY, ENTRY_TEXT)]);
+        let entry = file_id(&ws, ENTRY).expect("the entry file has an id");
+        assert_events_match_cold(
+            &mut ws,
+            &[(ENTRY, None), (BOOT, Some(ENTRY_TEXT))],
+            &[(HUD, HUD_TEXT), (PLUGIN, PLUGIN_TEXT), (BOOT, ENTRY_TEXT)],
+        );
+        assert_eq!(file_id(&ws, BOOT), Some(entry));
+        assert!(!is_scoped(&ws, HUD));
+    }
+
+    /// Moving a file onto a gamemode entry path makes the root a gamemode
+    /// folder.
+    #[test]
+    fn moving_a_file_onto_the_gamemode_entry_path_makes_the_root_a_gamemode() {
+        let mut ws =
+            root_gamemode_workspace(&[(HUD, HUD_TEXT), (PLUGIN, PLUGIN_TEXT), (BOOT, ENTRY_TEXT)]);
+        let boot = file_id(&ws, BOOT).expect("the boot file has an id");
+        assert!(!is_scoped(&ws, HUD));
+        assert_events_match_cold(
+            &mut ws,
+            &[(BOOT, None), (ENTRY, Some(ENTRY_TEXT))],
+            &[(HUD, HUD_TEXT), (PLUGIN, PLUGIN_TEXT), (ENTRY, ENTRY_TEXT)],
+        );
+        assert_eq!(file_id(&ws, ENTRY), Some(boot));
+        assert!(is_scoped(&ws, HUD));
+    }
+
+    /// Creating a file at a path no analysis probed re-runs nothing outside
+    /// the file, though files read the gamemode entry paths.
+    #[test]
+    fn creating_a_file_at_an_unprobed_path_re_runs_only_the_file() {
+        let mut ws =
+            root_gamemode_workspace(&[(HUD, HUD_TEXT), (PLUGIN, PLUGIN_TEXT), (ENTRY, ENTRY_TEXT)]);
+        ws.analysis.apply_file_system_changes(vec![(
+            ws.virtual_url_generator
+                .new_uri("lua/autorun/sh_unrelated.lua"),
+            Some("local unused = 1\n".to_string()),
+        )]);
+
+        let created = file_id(&ws, "lua/autorun/sh_unrelated.lua").expect("the file has an id");
+        let evaluated = ws
+            .analysis
+            .compilation
+            .last_evaluated_files()
+            .iter()
+            .copied()
+            .filter(|file_id| *file_id != FileId::VIRTUAL)
+            .collect::<Vec<_>>();
+        assert_eq!(evaluated, vec![created]);
+        let stats = ws.analysis.compilation.last_stats();
+        assert_eq!(stats.loops_cleared, 0);
+        assert_eq!(stats.rebuilt_sources, 0);
+    }
 }

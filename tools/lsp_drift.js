@@ -204,8 +204,9 @@ async function main() {
     }
     const started = Date.now();
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'glua_drift_'));
-    const work = path.join(scratch, 'work');
-    const edited = path.join(scratch, 'edited');
+    // Each copy keeps the codebase's folder name, which names a gamemode rooted there.
+    const work = path.join(scratch, 'work', path.basename(path.resolve(codebase)));
+    const edited = path.join(scratch, 'edited', path.basename(path.resolve(codebase)));
     try {
         copyWorkspace(codebase, work);
         copyWorkspace(codebase, edited);

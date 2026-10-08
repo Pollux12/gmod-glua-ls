@@ -434,6 +434,8 @@ pub enum FactKey {
     FileText(FileId),
     /// A file's path and its place in the file order.
     FilePath(FileId),
+    /// Which file is at a path: the one there whose text readers see.
+    PathFile(std::sync::Arc<std::path::Path>),
     /// One statement of a file, by its range: its kind and text, and the kind
     /// and range of every node between it and the top-level block.
     Syntax(InFiled<TextRange>),
@@ -941,6 +943,7 @@ impl FactKey {
             | K::HelperScanFiles
             | K::LoadScanFiles
             | K::FileSet
+            | K::PathFile(_)
             | K::StageRule(_)
             | K::ValidGuardFiles
             | K::ValidGuardName(_)

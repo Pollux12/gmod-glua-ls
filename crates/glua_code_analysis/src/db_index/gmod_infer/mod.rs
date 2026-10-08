@@ -447,7 +447,7 @@ impl Default for GmodRealmFileMetadata {
 }
 
 /// Cached scoped class detection result and its configured semantic metadata.
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodScopedClassInfo {
     pub class_name: String,
     pub global_name: String,

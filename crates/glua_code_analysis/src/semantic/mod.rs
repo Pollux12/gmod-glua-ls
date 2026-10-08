@@ -23,7 +23,7 @@ pub(crate) use infer::narrow::get_type_at_flow::BASELINE_FLOW_WALKS;
 pub(crate) use cache::detach_transaction;
 pub use cache::{
     CacheEntry, CacheOptions, DynamicFieldDefinitionSyntax, LuaAnalysisPhase, LuaInferCache,
-    VarRefCacheRootKey,
+    ScriptedSingletons, VarRefCacheRootKey,
 };
 pub use decl::{enum_variable_is_param, parse_require_module_info};
 use glua_parser::{

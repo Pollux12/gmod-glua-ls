@@ -48,6 +48,17 @@ impl<K, S> IsEmpty for std::collections::HashSet<K, S> {
 }
 pub type FlowEntries = TrackedMap<FlowCacheInnerKey, CacheEntry<Arc<LuaType>>>;
 
+/// The classes the configured scripted-class scopes bind global singleton
+/// names to. Config alone decides it.
+#[derive(Debug, Clone, Default)]
+pub struct ScriptedSingletons {
+    /// The class each global singleton name names.
+    pub classes: FxHashMap<String, LuaTypeDeclId>,
+    /// The names a workspace rooted at a gamemode folder binds to its
+    /// gamemode class instead.
+    pub root_gamemode_names: FxHashSet<String>,
+}
+
 /// The syntax-derived facts about one dynamic-field definition site.
 ///
 /// Both are a pure function of the definition's file tree, so they are read
@@ -250,7 +261,10 @@ pub struct LuaInferCache {
     /// and where each narrowing began: a walk of a path under the owner stops
     /// there.
     pub(crate) field_literal_narrowing: FxHashMap<LuaSyntaxId, derivation::ScopeMark>,
-    pub scripted_global_singleton_type_cache: Option<FxHashMap<String, LuaTypeDeclId>>,
+    pub scripted_global_singleton_type_cache: Option<ScriptedSingletons>,
+    /// The gamemode class of the file's workspace when it is rooted at a
+    /// gamemode folder.
+    pub root_gamemode_class_cache: TrackedMap<(), Option<LuaTypeDeclId>>,
     /// Cache for `self` type per enclosing method (keyed by LuaFuncStat syntax_id).
     /// Avoids repeated ancestor walks and type resolution for each `self` reference
     /// within the same method body.
@@ -393,6 +407,7 @@ impl LuaInferCache {
             expr_var_ref_id_cache: Default::default(),
             field_literal_narrowing: Default::default(),
             scripted_global_singleton_type_cache: None,
+            root_gamemode_class_cache: Default::default(),
             self_type_cache: Default::default(),
             self_base_seed: None,
             self_base_seed_mark: derivation::ScopeMark::default(),
@@ -797,6 +812,7 @@ impl LuaInferCache {
         empty(&mut self.field_literal_narrowing);
         self.self_type_cache.clear_local();
         self.self_base_seed = None;
+        self.root_gamemode_class_cache.clear_local();
 
         empty(&mut self.decl_cache.0);
         empty(&mut self.for_range_iter_var_type_cache.0);
