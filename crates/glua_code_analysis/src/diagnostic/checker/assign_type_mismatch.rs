@@ -11,7 +11,7 @@ use rowan::{NodeOrToken, TextRange};
 use crate::{
     DbIndex, DiagnosticCode, LuaDeclExtra, LuaDeclId, LuaMemberKey, LuaSemanticDeclId, LuaType,
     SemanticDeclLevel, SemanticModel, TypeCheckFailReason, TypeCheckResult, VariadicType,
-    infer_index_expr,
+    infer_index_expr, semantic::member_key_matches_type,
 };
 
 use super::{
@@ -190,36 +190,15 @@ fn check_index_expr(
         return Some(());
     }
 
-    let source_is_inferred = inferred_member_flags(semantic_model, index_expr)
-        .map(|(is_inferred, _)| is_inferred)
-        .unwrap_or_else(|| {
-            index_expr
-                .get_prefix_expr()
-                .and_then(|prefix| semantic_model.infer_expr(prefix).ok())
-                .is_some_and(|t| {
-                    matches!(
-                        t,
-                        LuaType::TableConst(_)
-                            | LuaType::Table
-                            | LuaType::Object(_)
-                            | LuaType::MergedTable(_)
-                    )
-                })
-        });
-
-    // Prefer the pre-write member type to avoid the current assignment
-    // widening the target field type before comparison.
-    let source_type = pre_write_index_expr_type(semantic_model, index_expr)
-        .or_else(|| prior_writers_type(semantic_model, index_expr))
-        .or_else(|| {
-            infer_index_expr(
-                semantic_model.get_db(),
-                &mut semantic_model.get_cache().borrow_mut(),
-                index_expr.clone(),
-                false,
-            )
-            .ok()
-        });
+    let (source_type, source_is_inferred) =
+        match class_computed_key_target(semantic_model, index_expr) {
+            Some(ComputedKeyTarget::Undeclared) => return Some(()),
+            Some(ComputedKeyTarget::Declared(declared_type)) => (Some(declared_type), false),
+            None => (
+                index_target_type(semantic_model, index_expr),
+                index_target_is_inferred(semantic_model, index_expr),
+            ),
+        };
 
     let value_type = semantic_model.infer_expr_list_value_type_at(exprs, value_idx)?;
     check_assign_type_mismatch(
@@ -247,6 +226,110 @@ fn check_index_expr(
         }
     }
     Some(())
+}
+
+fn index_target_is_inferred(semantic_model: &SemanticModel, index_expr: &LuaIndexExpr) -> bool {
+    inferred_member_flags(semantic_model, index_expr)
+        .map(|(is_inferred, _)| is_inferred)
+        .unwrap_or_else(|| {
+            index_expr
+                .get_prefix_expr()
+                .and_then(|prefix| semantic_model.infer_expr(prefix).ok())
+                .is_some_and(|t| {
+                    matches!(
+                        t,
+                        LuaType::TableConst(_)
+                            | LuaType::Table
+                            | LuaType::Object(_)
+                            | LuaType::MergedTable(_)
+                    )
+                })
+        })
+}
+
+fn index_target_type(semantic_model: &SemanticModel, index_expr: &LuaIndexExpr) -> Option<LuaType> {
+    // Prefer the pre-write member type to avoid the current assignment
+    // widening the target field type before comparison.
+    pre_write_index_expr_type(semantic_model, index_expr)
+        .or_else(|| prior_writers_type(semantic_model, index_expr))
+        .or_else(|| {
+            infer_index_expr(
+                semantic_model.get_db(),
+                &mut semantic_model.get_cache().borrow_mut(),
+                index_expr.clone(),
+                false,
+            )
+            .ok()
+        })
+}
+
+enum ComputedKeyTarget {
+    Declared(LuaType),
+    Undeclared,
+}
+
+/// What a computed-key write on a class instance is held to. An `ExprType`
+/// key names no slot, so other computed-key writes on the class share only a
+/// key type with it and state nothing; only a declared `[K]: V` index field
+/// on the class or a super does. `None` for literal keys and non-class prefixes.
+fn class_computed_key_target(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+) -> Option<ComputedKeyTarget> {
+    let db = semantic_model.get_db();
+    let index_key = index_expr.get_index_key()?;
+    let LuaMemberKey::ExprType(access_key_type) =
+        LuaMemberKey::from_index_key(db, &mut semantic_model.get_cache().borrow_mut(), &index_key)
+            .ok()?
+    else {
+        return None;
+    };
+    let prefix_type = semantic_model
+        .infer_expr(index_expr.get_prefix_expr()?)
+        .ok()?;
+    let (LuaType::Def(type_id) | LuaType::Ref(type_id)) = &prefix_type else {
+        return None;
+    };
+
+    let mut class_types = vec![LuaType::Ref(type_id.clone())];
+    type_id.collect_super_types(db, &mut class_types);
+    let member_index = db.get_member_index();
+    let type_index = db.get_type_index();
+    let declared_ids = class_types
+        .iter()
+        .filter_map(|class_type| match class_type {
+            LuaType::Ref(id) | LuaType::Def(id) => {
+                member_index.get_expr_key_members(&crate::LuaMemberOwner::Type(id.clone()))
+            }
+            _ => None,
+        })
+        .flatten()
+        .filter(|member| {
+            type_index
+                .get_type_cache(&member.get_id().into())
+                .is_some_and(|cache| cache.is_doc())
+                && member_key_matches_type(db, &access_key_type, member.get_key())
+        })
+        .map(|member| member.get_id())
+        .collect::<Vec<_>>();
+    if declared_ids.is_empty() {
+        return Some(ComputedKeyTarget::Undeclared);
+    }
+
+    let visible_ids = crate::LuaMemberIndexItem::Many(declared_ids)
+        .visible_member_ids_with_realm_at_offset(
+            db,
+            &semantic_model.get_file_id(),
+            index_expr.get_range().start(),
+        );
+    if visible_ids.is_empty() {
+        return Some(ComputedKeyTarget::Undeclared);
+    }
+    Some(
+        crate::LuaMemberIndexItem::Many(visible_ids)
+            .resolve_type(db)
+            .map_or(ComputedKeyTarget::Undeclared, ComputedKeyTarget::Declared),
+    )
 }
 
 fn expr_blocks_initialized_assignment_fast_path(expr: &LuaExpr, index_expr: &LuaIndexExpr) -> bool {

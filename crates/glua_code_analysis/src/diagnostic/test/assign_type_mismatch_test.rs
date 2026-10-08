@@ -3941,3 +3941,114 @@ fn forwarded_dots_binds_open_variadic_param() {
         "a forwarded vararg pack must keep its open arity: {diags:#?}"
     );
 }
+
+#[cfg(test)]
+fn def_player_meta_library(ws: &mut crate::VirtualWorkspace) {
+    ws.def(
+        r#"
+        ---@meta
+        ---@class Entity
+
+        ---@class Player : Entity
+        ---@field Money number
+
+        ---@generic T : table
+        ---@param metaName `T`
+        ---@return (definition) T
+        function _G.FindMetaTable(metaName) end
+
+        ---@return Player
+        function LocalPlayer() end
+        "#,
+    );
+    ws.def_file(
+        "gamemode/core/metatables/sh_player.lua",
+        r#"
+        ---@param name string
+        ---@param prefix string?
+        function PlayerNSReader(name, prefix)
+            local pMeta = FindMetaTable("Player")
+            local fn = (prefix or "Get") .. name
+            pMeta[fn] = function(self, def)
+                return def
+            end
+        end
+        "#,
+    );
+}
+
+/// Regression (CityRP `cl_hooks.lua`): a computed-key write on an entity lands
+/// in its Lua table under whatever key it names. The `pMeta[fn]` accessors
+/// share only a `string` key type with it, not a slot, so they state no type
+/// the write can mismatch.
+#[test]
+fn computed_key_write_on_class_is_not_held_to_other_computed_key_writes() {
+    let mut ws = crate::VirtualWorkspace::new();
+    def_player_meta_library(&mut ws);
+    assert!(ws.check_file_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        "gamemode/core/hooks/cl_hooks.lua",
+        r#"
+        ---@param key string
+        ---@param value number
+        local function storeLocalVariable(key, value)
+            LocalPlayer()[key] = value
+        end
+        "#,
+    ));
+}
+
+/// A literal key names a declared field, so a wrong value is still reported.
+#[test]
+fn literal_key_write_on_class_still_reports_declared_field_mismatch() {
+    let mut ws = crate::VirtualWorkspace::new();
+    def_player_meta_library(&mut ws);
+    assert!(!ws.check_file_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        "gamemode/core/hooks/cl_money_name.lua",
+        r#"
+        LocalPlayer().Money = "broke"
+        "#,
+    ));
+    assert!(!ws.check_file_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        "gamemode/core/hooks/cl_money_string.lua",
+        r#"
+        LocalPlayer()["Money"] = "broke"
+        "#,
+    ));
+}
+
+/// A declared `[string]: V` index field is the contract for computed-key writes.
+#[test]
+fn computed_key_write_on_class_is_held_to_declared_index_field() {
+    let mut ws = crate::VirtualWorkspace::new();
+    ws.def(
+        r#"
+        ---@class NetVarStore
+        ---@field [string] number
+        "#,
+    );
+    assert!(!ws.check_file_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        "gamemode/core/libraries/sh_netvar_bad.lua",
+        r#"
+        ---@param store NetVarStore
+        ---@param key string
+        local function set(store, key)
+            store[key] = "x"
+        end
+        "#,
+    ));
+    assert!(ws.check_file_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        "gamemode/core/libraries/sh_netvar_ok.lua",
+        r#"
+        ---@param store NetVarStore
+        ---@param key string
+        local function set(store, key)
+            store[key] = 1
+        end
+        "#,
+    ));
+}
