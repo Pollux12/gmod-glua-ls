@@ -31,7 +31,7 @@ impl Hash for LuaDecl {
         self.initializer.is_some().hash(state);
         if let Some(initializer) = &self.initializer {
             initializer.expr_id.hash_in_file(self.file_id, state);
-            initializer.ret_idx.hash(state);
+            (initializer.ret_idx as usize).hash(state);
         }
         self.extra.hash(state);
     }
@@ -40,12 +40,15 @@ impl Hash for LuaDecl {
 #[derive(Eq, PartialEq, Hash, Debug, Clone, Copy)]
 pub struct LuaDeclInitializer {
     expr_id: LuaSyntaxId,
-    ret_idx: usize,
+    ret_idx: u32,
 }
 
 impl LuaDeclInitializer {
     pub fn new(expr_id: LuaSyntaxId, ret_idx: usize) -> Self {
-        Self { expr_id, ret_idx }
+        Self {
+            expr_id,
+            ret_idx: ret_idx as u32,
+        }
     }
 
     pub fn get_expr_syntax_id(&self) -> LuaSyntaxId {
@@ -53,7 +56,7 @@ impl LuaDeclInitializer {
     }
 
     pub fn get_ret_idx(&self) -> usize {
-        self.ret_idx
+        self.ret_idx as usize
     }
 }
 

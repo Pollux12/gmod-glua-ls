@@ -567,7 +567,13 @@ fn insert_interesting_child(
         // Same key twice is the same scope filing again; declarations never
         // share a key (their child index is unique per push).
         Ok(_) if matches!(child, InterestingChild::Scope(_)) => {}
-        Ok(at) | Err(at) => entries.insert(at, (key, child)),
+        Ok(at) | Err(at) => {
+            // Most hold one entry: the first is room for one, later ones grow as usual.
+            if entries.is_empty() {
+                entries.reserve_exact(1);
+            }
+            entries.insert(at, (key, child));
+        }
     }
 }
 
@@ -590,7 +596,13 @@ fn insert_named_interesting_child(
         // Child scopes may be filed once per direct declaration; preserve one
         // scope entry for each `(position, child index)` key.
         Ok(_) if matches!(child, InterestingChild::Scope(_)) => {}
-        Ok(at) | Err(at) => entries.insert(at, (key, child)),
+        Ok(at) | Err(at) => {
+            // Most hold one entry: the first is room for one, later ones grow as usual.
+            if entries.is_empty() {
+                entries.reserve_exact(1);
+            }
+            entries.insert(at, (key, child));
+        }
     }
 }
 
