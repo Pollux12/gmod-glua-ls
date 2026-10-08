@@ -297,8 +297,8 @@ pub enum FactKey {
     /// reference: their positions and targets, read out of its
     /// [`FactKey::SpecialCallFile`].
     SpecialCallFor(FileId, crate::VarRefId),
-    /// What the callee of each of a file's calls resolves to.
-    CallTargets(FileId),
+    /// What the callee of one call resolves to.
+    CallTarget(InFiled<TextRange>),
     /// A file's flow tree and casts.
     FlowTree(FileId),
     /// One dynamic field (`None`: the owner's named fields as a whole).
@@ -591,7 +591,7 @@ impl FactKey {
                 | K::InferredGuard(_)
                 | K::Module(_)
                 | K::SpecialCall(..)
-                | K::CallTargets(_)
+                | K::CallTarget(_)
                 | K::FlowTree(_)
                 | K::Metatable(_)
                 | K::VguiChain(_)
@@ -694,7 +694,7 @@ impl FactKey {
                 | K::NetDefinitionUses(_)
                 | K::GmodRealm(_)
                 | K::GmodLoadFile(_)
-                | K::CallTargets(_)
+                | K::CallTarget(_)
                 | K::ReceiverAuthority(_)
                 | K::CallbackParams(_)
         )
@@ -844,6 +844,7 @@ impl FactKey {
                 _ => None,
             },
             K::DefinitionSite(site)
+            | K::CallTarget(site)
             | K::Metatable(site)
             | K::TableClass(site)
             | K::Syntax(site) => Some(site.file_id),
@@ -860,7 +861,6 @@ impl FactKey {
             K::SpecialCall(file_id, _)
             | K::SpecialCallFile(file_id)
             | K::SpecialCallFor(file_id, _)
-            | K::CallTargets(file_id)
             | K::ValidGuardFile(file_id)
             | K::TypeFile(file_id)
             | K::DeclTree(file_id)
@@ -1008,8 +1008,8 @@ pub enum DerivationKind {
     DynamicFields,
     /// A file's setmetatable factory members.
     SetmetatableFactory,
-    /// What the callee of each of a file's calls resolves to.
-    CallTargets,
+    /// What the callee of one call resolves to.
+    CallTarget,
     /// A query: whether a method's receiver is authoritative.
     ReceiverAuthority,
     /// A query: what a function passes to each callback parameter it calls.
@@ -1053,7 +1053,7 @@ impl DerivationKind {
             // statements settled: run earlier, a file's pass runs again whole
             // for each read that settles after it.
             Self::DynamicFields
-            | Self::CallTargets
+            | Self::CallTarget
             | Self::ReceiverAuthority
             | Self::CallbackParams
             | Self::CallSiteParams

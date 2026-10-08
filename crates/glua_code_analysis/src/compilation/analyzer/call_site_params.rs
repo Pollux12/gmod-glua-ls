@@ -3,13 +3,13 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
 
 use crate::{
-    DbIndex, FileCallTargets, FileId, InFiled, LuaCallTarget, LuaDeclExtra, LuaDeclId,
-    LuaDependencyKind, LuaInferCache, LuaInferenceConfidence, LuaInferenceEventId,
-    LuaInferenceNodeId, LuaInferenceProvenanceKind, LuaInferenceStep, LuaMemberId,
-    LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaSemanticDeclId,
-    LuaSignatureId, LuaType, LuaTypeDeclId, LuaTypeFact, WorkspaceId, find_signature_attribute_use,
-    get_member_map, get_member_value_expr, get_prefix_expr_signature_id,
-    infer_authoritative_method_self_type, infer_expr, infer_expr_semantic_decl,
+    DbIndex, FileId, InFiled, LuaCallTarget, LuaDeclExtra, LuaDeclId, LuaDependencyKind,
+    LuaInferCache, LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId,
+    LuaInferenceProvenanceKind, LuaInferenceStep, LuaMemberId, LuaMemberIndexItem, LuaMemberKey,
+    LuaMemberOwner, LuaObjectType, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId,
+    LuaTypeFact, WorkspaceId, find_signature_attribute_use, get_member_map, get_member_value_expr,
+    get_prefix_expr_signature_id, infer_authoritative_method_self_type, infer_expr,
+    infer_expr_semantic_decl,
 };
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat,
@@ -58,8 +58,6 @@ struct FileScope {
     source_signatures: HashMap<String, Vec<LuaSignatureId>>,
     returned_tables: HashMap<FileId, Option<Arc<ReturnedTableInfo>>>,
     exact_receiver_candidates: HashMap<LuaMemberKey, bool>,
-    /// What the file's calls target.
-    targets: Arc<FileCallTargets>,
 }
 
 impl FileScope {
@@ -71,13 +69,7 @@ impl FileScope {
                 db,
                 exact_receiver_member_keys_in_file(root),
             ),
-            targets: super::call_target::file_call_targets(db, file_id),
         }
-    }
-
-    /// What `call_expr`, one of the file's calls, targets.
-    fn call_target(&self, call_expr: &LuaCallExpr) -> Option<&LuaCallTarget> {
-        self.targets.get(&call_expr.get_range())
     }
 
     /// The last function statement at or before `position` declaring `path`.
@@ -643,7 +635,7 @@ fn collect_call_site_param_types(
             .iter()
             .any(|arg| matches!(arg, LuaExpr::ClosureExpr(_)))
     {
-        match scope.call_target(&call_expr) {
+        match super::call_target::call_target_of(db, file_id, &call_expr) {
             Some(LuaCallTarget {
                 declared: Some(signature_id),
                 ..
@@ -1011,7 +1003,7 @@ fn collect_exact_colon_receiver_type(
         return None;
     }
     let receiver_expr = index_expr.get_prefix_expr()?;
-    let signature_id = scope.call_target(call_expr)?.declared?;
+    let signature_id = super::call_target::call_target_of(db, file_id, call_expr)?.declared?;
     if !is_call_site_realm_compatible(db, file_id, call_expr.get_position(), signature_id) {
         return None;
     }
@@ -1347,8 +1339,7 @@ fn signature_ids_from_call_prefix(
         return (vec![signature_id], SignatureLookupKind::Direct);
     }
 
-    let mut signature_ids = scope
-        .call_target(call_expr)
+    let mut signature_ids = super::call_target::call_target_of(db, file_id, call_expr)
         .map(|target| target.inferred.clone())
         .unwrap_or_default();
     let mut lookup_kind = SignatureLookupKind::InferredCallable;

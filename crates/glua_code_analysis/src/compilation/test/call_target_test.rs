@@ -30,6 +30,87 @@ mod test {
             .expect("the file has a call")
     }
 
+    /// What each call of `file_ids` targets, as text.
+    fn call_targets(ws: &VirtualWorkspace, file_ids: &[FileId]) -> Vec<String> {
+        let db = ws.analysis.compilation.get_db();
+        let mut targets = Vec::new();
+        for file_id in file_ids {
+            let root = db
+                .get_vfs()
+                .get_syntax_tree(file_id)
+                .expect("the file is parsed")
+                .get_chunk_node();
+            for call in root.descendants::<LuaCallExpr>() {
+                targets.push(format!(
+                    "{file_id:?} {:?} {:?}",
+                    call.get_range(),
+                    db.get_call_target_index()
+                        .target(*file_id, call.get_range())
+                ));
+            }
+        }
+        targets
+    }
+
+    /// An edit leaves the call targets and diagnostics a cold build of the
+    /// edited text has, for a callee that moved and one that went away.
+    #[test]
+    fn an_edit_leaves_the_call_targets_and_diagnostics_a_cold_build_has() {
+        const LIB: &str = "lua/autorun/sh_lib.lua";
+        const CALLER: &str = "lua/autorun/sh_caller.lua";
+        const CALLER_TEXT: &str = "Greet(\"a\")\nWave(\"b\")\nGreet(\"c\")\n";
+        const LIB_TEXT: &str =
+            "function Greet(name) return name end\nfunction Wave(name) return name end\n";
+        const EDITED_LIB_TEXT: &str =
+            "-- lib\nfunction Greet(name) return name end\nfunction Hello(name) return name end\n";
+
+        let mut warm = VirtualWorkspace::new();
+        let file_ids = warm.def_files(vec![(LIB, LIB_TEXT), (CALLER, CALLER_TEXT)]);
+        warm.def_file(LIB, EDITED_LIB_TEXT);
+        let mut cold = VirtualWorkspace::new();
+        cold.def_files(vec![(LIB, EDITED_LIB_TEXT), (CALLER, CALLER_TEXT)]);
+
+        let targets = call_targets(&warm, &file_ids);
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.contains("declared: Some")),
+            "a call still resolves: {targets:?}"
+        );
+        assert_eq!(targets, call_targets(&cold, &file_ids));
+        assert_eq!(warm.semantic_digest(), cold.semantic_digest());
+        assert!(warm.stale_derivations().is_empty());
+    }
+
+    /// Editing what one call targets re-runs that call's derivation alone,
+    /// not the other calls of its file.
+    #[test]
+    fn editing_one_calls_callee_re_runs_only_that_calls_target() {
+        const LIB: &str = "lua/autorun/sh_lib.lua";
+        const CALLER: &str = "lua/autorun/sh_caller.lua";
+        const LIB_TEXT: &str =
+            "LibA = {}\nLibA.f = function() end\n\nLibB = {}\nLibB.f = function() end\n";
+        const EDITED_LIB_TEXT: &str =
+            "LibA = {}\nLibA.f = nil           \n\nLibB = {}\nLibB.f = function() end\n";
+        // Each call reads whether the calls before it return, so the edited
+        // callee is called last.
+        const CALLER_TEXT: &str = "LibB.f()\nLibB.f()\nLibA.f()\n";
+
+        let mut ws = VirtualWorkspace::new();
+        let file_ids = ws.def_files(vec![(LIB, LIB_TEXT), (CALLER, CALLER_TEXT)]);
+        ws.def_file(LIB, EDITED_LIB_TEXT);
+        let evaluations = ws
+            .analysis
+            .compilation
+            .last_stats()
+            .evaluations(DerivationKind::CallTarget);
+        let mut cold = VirtualWorkspace::new();
+        cold.def_files(vec![(LIB, EDITED_LIB_TEXT), (CALLER, CALLER_TEXT)]);
+
+        assert_eq!(evaluations, 1);
+        assert_eq!(call_targets(&ws, &file_ids), call_targets(&cold, &file_ids));
+    }
+
     /// The net helper pass reads each call's callee from the file's call
     /// targets instead of inferring it again, and still finds the net roles.
     #[test]
@@ -88,8 +169,8 @@ mod test {
         let db = ws.analysis.compilation.get_db();
         let stored = db
             .get_call_target_index()
-            .file(caller)
-            .and_then(|targets| targets.get(&call.get_range()).cloned())
+            .target(caller, call.get_range())
+            .cloned()
             .expect("the call's target is stored");
         let fresh = resolve_call_target(db, &mut LuaInferCache::new(caller, pass_view()), &call);
 

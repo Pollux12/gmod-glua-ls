@@ -35,9 +35,9 @@ fn is_inert_value_field(
     !shaped
 }
 
-/// The derivations of one file's statements, closures, calls and table
-/// fields, in tree order; positional fields of tables that are not shaped
-/// array literals have none.
+/// The derivations of one file's statements, closures, calls, call targets
+/// and table fields, in tree order; positional fields of tables that are not
+/// shaped array literals have none.
 pub(super) fn syntax_derivations(file_id: FileId, root: &LuaChunk) -> Vec<DerivationId> {
     let mut ids = Vec::new();
     let mut shaped_tables = FxHashMap::default();
@@ -59,11 +59,15 @@ pub(super) fn syntax_derivations(file_id: FileId, root: &LuaChunk) -> Vec<Deriva
             LuaAst::LuaCallExpr(_) => DerivationKind::Call,
             _ => continue,
         };
-        ids.push(DerivationId::new(
-            kind,
-            file_id,
-            LuaSyntaxId::from_node(node.syntax()),
-        ));
+        let syntax_id = LuaSyntaxId::from_node(node.syntax());
+        ids.push(DerivationId::new(kind, file_id, syntax_id));
+        if matches!(node, LuaAst::LuaCallExpr(_)) {
+            ids.push(DerivationId::new(
+                DerivationKind::CallTarget,
+                file_id,
+                syntax_id,
+            ));
+        }
     }
     ids
 }
@@ -95,7 +99,6 @@ pub(super) fn file_derivations(
         DerivationKind::AccessorFunc,
         DerivationKind::DynamicFields,
         DerivationKind::SetmetatableFactory,
-        DerivationKind::CallTargets,
         DerivationKind::CallSiteParams,
         DerivationKind::LocalFallbacks,
         DerivationKind::NetHelpers,
@@ -124,11 +127,6 @@ pub(crate) struct Recipes {
     caches: std::sync::Mutex<FxHashMap<FileId, crate::LuaInferCache>>,
     /// Memos of applied results, committed and stored by [`Self::settle_caches`].
     unsettled: std::sync::Mutex<Vec<(FileId, crate::LuaInferCache)>>,
-}
-
-struct ComputedCallTargets {
-    targets: crate::FileCallTargets,
-    cache: crate::LuaInferCache,
 }
 
 struct ComputedDynamicFields {
@@ -248,31 +246,12 @@ impl super::engine::Recipe for Recipes {
         // settle.
         matches!(
             kind,
-            DerivationKind::CallTargets
-                | DerivationKind::DynamicFields
-                | DerivationKind::LocalFallbacks
+            DerivationKind::DynamicFields | DerivationKind::LocalFallbacks
         )
     }
 
     fn compute(&self, db: &DbIndex, id: DerivationId) -> Box<dyn std::any::Any + Send> {
         match id.kind {
-            DerivationKind::CallTargets => {
-                let mut context = AnalyzeContext::for_files(db, vec![id.file_id], &self.scopes);
-                if let Some(cache) = self.caches.lock().expect("cache store").remove(&id.file_id) {
-                    context.infer_manager.restore_file(id.file_id, cache);
-                }
-                let cache = context.infer_manager.get_infer_cache(id.file_id);
-                let transaction = cache.begin_transaction();
-                cache.config_mut().call_site_params_visible = false;
-                let targets = call_target::compute_file_call_targets_with(db, cache);
-                cache.config_mut().call_site_params_visible = true;
-                drop(transaction);
-                let cache = context
-                    .infer_manager
-                    .take_file(id.file_id)
-                    .expect("call-target cache");
-                Box::new(ComputedCallTargets { targets, cache })
-            }
             DerivationKind::CallSiteParams => {
                 Box::new(call_site_params::collect_file_contributions(db, id.file_id))
             }
@@ -314,13 +293,6 @@ impl super::engine::Recipe for Recipes {
 
     fn apply(&self, db: &mut DbIndex, id: DerivationId, computed: Box<dyn std::any::Any + Send>) {
         match id.kind {
-            DerivationKind::CallTargets => {
-                let ComputedCallTargets { targets, cache } = *computed
-                    .downcast::<ComputedCallTargets>()
-                    .expect("call targets");
-                call_target::apply_file_call_targets(db, id.file_id, targets);
-                self.settle_later(id.file_id, cache);
-            }
             DerivationKind::CallSiteParams => {
                 let contributions = *computed
                     .downcast::<Vec<call_site_params::Contribution>>()
@@ -400,21 +372,13 @@ impl super::engine::Recipe for Recipes {
     }
 
     fn discard(&self, id: DerivationId, computed: Box<dyn std::any::Any + Send>) {
-        let mut cache = match id.kind {
-            DerivationKind::CallTargets => {
-                computed
-                    .downcast::<ComputedCallTargets>()
-                    .expect("call targets")
-                    .cache
-            }
-            DerivationKind::DynamicFields => {
-                computed
-                    .downcast::<ComputedDynamicFields>()
-                    .expect("dynamic fields")
-                    .cache
-            }
-            _ => return,
-        };
+        if id.kind != DerivationKind::DynamicFields {
+            return;
+        }
+        let mut cache = computed
+            .downcast::<ComputedDynamicFields>()
+            .expect("dynamic fields")
+            .cache;
         cache.rollback_transaction();
         self.store_cache(id.file_id, cache);
     }
@@ -555,12 +519,11 @@ impl Recipes {
             DerivationKind::SetmetatableFactory => {
                 setmetatable_factory::synthesize_setmetatable_factory_members(db, &file_ids)
             }
-            DerivationKind::CallTargets => {
+            DerivationKind::CallTarget => {
                 let cache = context.infer_manager.get_infer_cache(id.file_id);
                 cache.config_mut().call_site_params_visible = false;
-                let targets = call_target::compute_file_call_targets_with(db, cache);
+                call_target::derive_call_target(db, cache, id.syntax_id());
                 cache.config_mut().call_site_params_visible = true;
-                call_target::apply_file_call_targets(db, id.file_id, targets);
             }
             DerivationKind::CallSiteParams => {
                 call_site_params::CallSiteParamAnalysisPipeline::analyze(db, context)

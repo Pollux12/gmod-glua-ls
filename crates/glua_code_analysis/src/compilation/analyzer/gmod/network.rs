@@ -395,11 +395,9 @@ fn build_file_net_helpers(
 ) -> Option<FileNetHelpers> {
     let root = db.get_vfs().get_syntax_tree(&file_id)?.get_chunk_node();
     let functions = FileFunctionMap::build(&root);
-    let targets = super::super::call_target::file_call_targets(db, file_id);
     let mut calls = HashMap::default();
     for call_expr in root.descendants::<LuaCallExpr>() {
-        let signature_id = targets
-            .get(&call_expr.get_range())
+        let signature_id = super::super::call_target::call_target_of(db, file_id, &call_expr)
             .and_then(crate::LuaCallTarget::signature_id);
         let role =
             signature_id.and_then(|signature_id| net_call_role(db, &call_expr, signature_id));

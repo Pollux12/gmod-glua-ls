@@ -1,5 +1,5 @@
-//! What each call's callee resolves to, one file at a time, so the per-file
-//! passes read it instead of resolving every callee again.
+//! What each call's callee resolves to, so the passes that read it do not
+//! resolve every callee again.
 
 use crate::db_index::cow_shards::CowShards;
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::derivation::{self, FactKey, Fingerprint};
 use super::traits::LuaIndex;
-use crate::{FileId, LuaSignatureId, LuaType};
+use crate::{FileId, InFiled, LuaSignatureId, LuaType};
 
 /// A call's callee.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
@@ -104,8 +104,43 @@ fn unique_signature_id(typ: &LuaType) -> Option<LuaSignatureId> {
     }
 }
 
-/// One file's call targets, by call range.
-pub type FileCallTargets = FxHashMap<TextRange, LuaCallTarget>;
+/// One file's call targets, by call range, and how many signature ids they
+/// name in each file.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct FileCallTargets {
+    targets: FxHashMap<TextRange, LuaCallTarget>,
+    named: FxHashMap<FileId, usize>,
+}
+
+impl FileCallTargets {
+    /// Counts the signatures `target` names, adding to `linked` each file
+    /// named for the first time.
+    fn name(&mut self, target: &LuaCallTarget, linked: &mut Vec<FileId>) {
+        for signature_id in target.signature_ids() {
+            let count = self.named.entry(signature_id.get_file_id()).or_default();
+            *count += 1;
+            if *count == 1 {
+                linked.push(signature_id.get_file_id());
+            }
+        }
+    }
+
+    /// Uncounts the signatures `target` names, adding to `unlinked` each file
+    /// no target names any more.
+    fn unname(&mut self, target: &LuaCallTarget, unlinked: &mut Vec<FileId>) {
+        for signature_id in target.signature_ids() {
+            let file_id = signature_id.get_file_id();
+            let Some(count) = self.named.get_mut(&file_id) else {
+                continue;
+            };
+            *count -= 1;
+            if *count == 0 {
+                self.named.remove(&file_id);
+                unlinked.push(file_id);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct LuaCallTargetIndex {
@@ -119,48 +154,59 @@ impl LuaCallTargetIndex {
         Self::default()
     }
 
-    /// Stores `file_id`'s call targets.
-    pub fn set_file(&mut self, file_id: FileId, targets: FileCallTargets) {
-        derivation::note_write(|| FactKey::CallTargets(file_id));
-        let named = signature_files(&targets);
-        let previous = self.files.insert(file_id, Arc::new(targets));
-        self.relink(file_id, previous.as_deref(), named);
+    /// Stores what the call at `range` of `file_id` targets.
+    pub fn set_target(&mut self, file_id: FileId, range: TextRange, target: LuaCallTarget) {
+        derivation::note_write(|| FactKey::CallTarget(InFiled::new(file_id, range)));
+        let held = Arc::make_mut(self.files.entry(file_id).or_default());
+        let (mut linked, mut unlinked) = (Vec::new(), Vec::new());
+        held.name(&target, &mut linked);
+        if let Some(previous) = held.targets.insert(range, target) {
+            held.unname(&previous, &mut unlinked);
+        }
+        self.relink(file_id, linked, unlinked);
     }
 
-    /// Re-files `holder` under the files its targets name now, given the
-    /// targets it held before.
-    fn relink(
-        &mut self,
-        holder: FileId,
-        previous: Option<&FileCallTargets>,
-        named: FxHashSet<FileId>,
-    ) {
-        let linked = previous.map(signature_files).unwrap_or_default();
-        for file_id in linked.difference(&named) {
-            if let Some(holders) = self.referencing.get_mut(file_id) {
+    /// Re-files `holder` under the files its targets came to name and no
+    /// longer name.
+    fn relink(&mut self, holder: FileId, linked: Vec<FileId>, unlinked: Vec<FileId>) {
+        for file_id in unlinked {
+            if let Some(holders) = self.referencing.get_mut(&file_id) {
                 holders.remove(&holder);
                 if holders.is_empty() {
-                    self.referencing.remove(file_id);
+                    self.referencing.remove(&file_id);
                 }
             }
         }
-        for file_id in named.difference(&linked) {
-            self.referencing.entry(*file_id).or_default().insert(holder);
+        for file_id in linked {
+            self.referencing.entry(file_id).or_default().insert(holder);
         }
     }
 
-    /// `file_id`'s call targets.
-    pub fn file(&self, file_id: FileId) -> Option<Arc<FileCallTargets>> {
-        derivation::note_read(|| FactKey::CallTargets(file_id));
-        self.files.get(&file_id).cloned()
+    /// What the call at `range` of `file_id` targets.
+    pub fn target(&self, file_id: FileId, range: TextRange) -> Option<&LuaCallTarget> {
+        derivation::note_read(|| FactKey::CallTarget(InFiled::new(file_id, range)));
+        self.files.get(&file_id)?.targets.get(&range)
     }
 
-    /// Drops `file_id`'s call targets, before the derivation that resolved
-    /// them runs again.
-    pub(crate) fn reset_file(&mut self, file_id: FileId) {
-        derivation::note_write(|| FactKey::CallTargets(file_id));
-        let previous = self.files.remove(&file_id);
-        self.relink(file_id, previous.as_deref(), FxHashSet::default());
+    /// Drops what the call at `range` of `file_id` targets, before the
+    /// derivation that resolved it runs again.
+    pub(crate) fn reset_target(&mut self, file_id: FileId, range: TextRange) {
+        derivation::note_write(|| FactKey::CallTarget(InFiled::new(file_id, range)));
+        let Some(held) = self.files.get_mut(&file_id) else {
+            return;
+        };
+        if !held.targets.contains_key(&range) {
+            return;
+        }
+        let held = Arc::make_mut(held);
+        let mut unlinked = Vec::new();
+        if let Some(previous) = held.targets.remove(&range) {
+            held.unname(&previous, &mut unlinked);
+        }
+        if held.targets.is_empty() {
+            self.files.remove(&file_id);
+        }
+        self.relink(file_id, Vec::new(), unlinked);
     }
 
     /// Moves the signatures of `remap`'s file the targets name to their new
@@ -178,11 +224,11 @@ impl LuaCallTargetIndex {
             .unwrap_or_default();
         holders.sort_unstable();
         for holder in holders {
-            let Some(targets) = self.files.get_mut(&holder) else {
+            let Some(held) = self.files.get(&holder) else {
                 continue;
             };
-            let mut moved = None::<FileCallTargets>;
-            for (range, target) in targets.iter() {
+            let mut moved = Vec::new();
+            for (range, target) in &held.targets {
                 let mut remapped = target.clone();
                 let mut changed = false;
                 for signature_id in remapped.signature_ids_mut() {
@@ -198,14 +244,12 @@ impl LuaCallTargetIndex {
                     }
                 }
                 if changed {
-                    moved
-                        .get_or_insert_with(|| FileCallTargets::clone(targets))
-                        .insert(*range, remapped);
+                    moved.push((*range, remapped));
                 }
             }
-            if let Some(moved) = moved {
-                *targets = Arc::new(moved);
-                derivation::note_write(|| FactKey::CallTargets(holder));
+            moved.sort_unstable_by_key(|(range, _)| (range.start(), range.end()));
+            for (range, remapped) in moved {
+                self.set_target(holder, range, remapped);
             }
         }
         dirty
@@ -213,11 +257,12 @@ impl LuaCallTargetIndex {
 
     pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
         match key {
-            FactKey::CallTargets(file_id) => self
+            FactKey::CallTarget(site) => self
                 .files
-                .get(file_id)
-                .map_or(derivation::ABSENT, |targets| {
-                    targets_fingerprint(*file_id, targets)
+                .get(&site.file_id)
+                .and_then(|held| held.targets.get(&site.value))
+                .map_or(derivation::ABSENT, |target| {
+                    derivation::in_file(Some(site.file_id), || derivation::fingerprint_of(target))
                 }),
             _ => {
                 debug_assert!(false, "{key:?} is not a call target fact");
@@ -230,20 +275,14 @@ impl LuaCallTargetIndex {
     pub fn file_fingerprints(&self) -> impl Iterator<Item = (FileId, Fingerprint)> + '_ {
         self.files
             .iter()
-            .map(|(file_id, targets)| (*file_id, targets_fingerprint(*file_id, targets)))
+            .map(|(file_id, held)| (*file_id, targets_fingerprint(*file_id, &held.targets)))
     }
 }
 
-/// The files the signatures `targets` name lie in.
-fn signature_files(targets: &FileCallTargets) -> FxHashSet<FileId> {
-    targets
-        .values()
-        .flat_map(LuaCallTarget::signature_ids)
-        .map(LuaSignatureId::get_file_id)
-        .collect()
-}
-
-fn targets_fingerprint(file_id: FileId, targets: &FileCallTargets) -> Fingerprint {
+fn targets_fingerprint(
+    file_id: FileId,
+    targets: &FxHashMap<TextRange, LuaCallTarget>,
+) -> Fingerprint {
     derivation::in_file(Some(file_id), || {
         targets
             .iter()
@@ -255,16 +294,20 @@ fn targets_fingerprint(file_id: FileId, targets: &FileCallTargets) -> Fingerprin
 
 impl LuaIndex for LuaCallTargetIndex {
     fn remove(&mut self, file_id: FileId) {
-        if let Some(previous) = self.files.remove(&file_id) {
-            derivation::note_write(|| FactKey::CallTargets(file_id));
-            self.relink(file_id, Some(&previous), FxHashSet::default());
+        if let Some(held) = self.files.remove(&file_id) {
+            for range in held.targets.keys() {
+                derivation::note_write(|| FactKey::CallTarget(InFiled::new(file_id, *range)));
+            }
+            self.relink(file_id, Vec::new(), held.named.keys().copied().collect());
         }
     }
 
     fn clear(&mut self) {
         if derivation::recording() {
-            for file_id in self.files.keys() {
-                derivation::note_write(|| FactKey::CallTargets(*file_id));
+            for (file_id, held) in self.files.iter() {
+                for range in held.targets.keys() {
+                    derivation::note_write(|| FactKey::CallTarget(InFiled::new(*file_id, *range)));
+                }
             }
         }
         self.files.clear();
@@ -277,16 +320,19 @@ mod tests {
     use rowan::{TextRange, TextSize};
     use rustc_hash::{FxHashMap, FxHashSet};
 
-    use super::{LuaCallTarget, LuaCallTargetIndex, signature_files};
+    use super::{LuaCallTarget, LuaCallTargetIndex};
     use crate::{FileId, FileRemap, LuaSignatureId, PositionMap, db_index::LuaIndex};
 
     /// `referencing` names exactly the holders a scan of every file's targets
     /// finds.
     fn assert_referencing_matches_a_scan(index: &LuaCallTargetIndex) {
         let mut expected: FxHashMap<FileId, FxHashSet<FileId>> = FxHashMap::default();
-        for (holder, targets) in index.files.iter() {
-            for file_id in signature_files(targets) {
-                expected.entry(file_id).or_default().insert(*holder);
+        for (holder, held) in index.files.iter() {
+            for signature_id in held.targets.values().flat_map(LuaCallTarget::signature_ids) {
+                expected
+                    .entry(signature_id.get_file_id())
+                    .or_default()
+                    .insert(*holder);
             }
         }
         let indexed: FxHashMap<_, _> = index
@@ -310,17 +356,12 @@ mod tests {
         let call = TextRange::new(TextSize::new(0), TextSize::new(4));
         let local_call = TextRange::new(TextSize::new(8), TextSize::new(12));
         let mut index = LuaCallTargetIndex::new();
-        index.set_file(
-            holder,
-            FxHashMap::from_iter([
-                (call, declared(callee, 10)),
-                (local_call, declared(holder, 5)),
-            ]),
-        );
-        index.set_file(other, FxHashMap::from_iter([(call, declared(callee, 20))]));
+        index.set_target(holder, call, declared(callee, 10));
+        index.set_target(holder, local_call, declared(holder, 5));
+        index.set_target(other, call, declared(callee, 20));
         assert_referencing_matches_a_scan(&index);
 
-        index.set_file(holder, FxHashMap::from_iter([(call, declared(other, 3))]));
+        index.set_target(holder, call, declared(other, 3));
         assert_referencing_matches_a_scan(&index);
 
         let dirty = index.remap_file_identities(&FileRemap::unvalidated(
@@ -329,12 +370,13 @@ mod tests {
         ));
         assert!(dirty.is_empty());
         assert_eq!(
-            index.file(other).expect("targets")[&call].declared,
+            index.target(other, call).expect("target").declared,
             Some(LuaSignatureId::new(callee, TextSize::new(21)))
         );
         assert_referencing_matches_a_scan(&index);
 
-        index.reset_file(other);
+        index.reset_target(other, call);
+        assert!(index.target(other, call).is_none());
         assert_referencing_matches_a_scan(&index);
         index.remove(holder);
         assert!(index.referencing.is_empty());

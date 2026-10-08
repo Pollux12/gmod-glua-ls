@@ -1020,7 +1020,8 @@ impl Engine {
         self.next_round.take_where(replaced);
         self.waiting.retain(|id, _| !replaced(*id));
         self.held.retain(|id, _| !replaced(*id));
-        self.stale_sources.retain(|file_id| !files.contains(file_id));
+        self.stale_sources
+            .retain(|file_id| !files.contains(file_id));
     }
 
     /// Notes that `file_id`'s derivations are removed and built again.
@@ -4455,8 +4456,11 @@ mod tests {
     impl Recipe for RecordedTargets {
         fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
             self.applied.lock().unwrap().push((id.file_id, false));
-            db.get_call_target_index_mut()
-                .set_file(id.file_id, Default::default());
+            db.get_call_target_index_mut().set_target(
+                id.file_id,
+                id.syntax_id().get_range(),
+                Default::default(),
+            );
         }
 
         fn splits(&self, _: DerivationKind) -> bool {
@@ -4464,7 +4468,7 @@ mod tests {
         }
 
         fn records_on_workers(&self, kind: DerivationKind) -> bool {
-            kind == DerivationKind::CallTargets
+            kind == DerivationKind::CallTarget
         }
 
         fn compute(&self, _: &DbIndex, id: DerivationId) -> Box<dyn std::any::Any + Send> {
@@ -4477,8 +4481,11 @@ mod tests {
         fn apply(&self, db: &mut DbIndex, id: DerivationId, value: Box<dyn std::any::Any + Send>) {
             assert_eq!(*value.downcast::<FileId>().unwrap(), id.file_id);
             self.applied.lock().unwrap().push((id.file_id, true));
-            db.get_call_target_index_mut()
-                .set_file(id.file_id, Default::default());
+            db.get_call_target_index_mut().set_target(
+                id.file_id,
+                id.syntax_id().get_range(),
+                Default::default(),
+            );
         }
 
         fn discard(&self, _: DerivationId, _: Box<dyn std::any::Any + Send>) {
@@ -4510,18 +4517,30 @@ mod tests {
                     .unwrap()
                     .get_chunk_node();
                 DerivationId::new(
-                    DerivationKind::CallTargets,
+                    DerivationKind::CallTarget,
                     *file_id,
                     LuaSyntaxId::from_node(root.syntax()),
                 )
             })
             .collect::<Vec<_>>();
+        for id in &ids {
+            db.get_call_target_index_mut().set_target(
+                id.file_id,
+                id.syntax_id().get_range(),
+                Default::default(),
+            );
+        }
         let proof = {
             derivation::lend_keys(db.reader_graph_mut().lend_keys());
             let lent = scopeguard_lent_keys();
             derivation::begin(statement(0));
             let frame = derivation::open_frame().unwrap();
-            derivation::note_read(|| FactKey::CallTargets(files[0]));
+            derivation::note_read(|| {
+                FactKey::CallTarget(crate::InFiled::new(
+                    files[0],
+                    ids[0].syntax_id().get_range(),
+                ))
+            });
             let proof = derivation::close_frame(frame, 0).unwrap();
             derivation::end();
             db.reader_graph_mut().restore_keys(derivation::take_keys());
@@ -4541,7 +4560,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         parallel::set_analysis_threads(4);
-        while let Some((first, _)) = engine.worklist.pop_first_of(DerivationKind::CallTargets) {
+        while let Some((first, _)) = engine.worklist.pop_first_of(DerivationKind::CallTarget) {
             assert!(engine.run_recorded_batch(db, first, &recipe));
         }
         parallel::set_analysis_threads(0);
@@ -4557,11 +4576,11 @@ mod tests {
             files.len() - 1
         );
         assert!(applied.contains(&(files[3], false)));
-        assert!(
-            files
-                .iter()
-                .all(|file| db.get_call_target_index().file(*file).is_some())
-        );
+        assert!(ids.iter().all(|id| {
+            db.get_call_target_index()
+                .target(id.file_id, id.syntax_id().get_range())
+                .is_some()
+        }));
         derivation::lend_keys(db.reader_graph_mut().lend_keys());
         let lent = scopeguard_lent_keys();
         derivation::begin(statement(0));
@@ -4654,7 +4673,7 @@ mod tests {
     }
 
     #[test]
-    fn recorded_call_targets_match_serial_evaluation_cold_and_after_an_edit() {
+    fn call_targets_match_across_analysis_threads_cold_and_after_an_edit() {
         let edited = INVENTORY.replace(
             "function Inventory.Format(value) return tostring(value) end",
             "function Inventory.Format(value) return value * 2 end
@@ -4664,38 +4683,25 @@ mod tests {
         let files = inventory_files(&shops);
         let edits = [("lua/autorun/sh_inventory.lua", edited.as_str())];
         let _serial = serial_engine();
-        let published = || WORKER_PUBLISHED.with(std::cell::Cell::get);
         let analyse = |threads: usize| {
             parallel::set_analysis_threads(threads);
-            let start = published();
             let mut ws = VirtualWorkspace::new();
             ws.def_files(files.clone());
             let cold = recorded_digest(&mut ws);
-            let edit = published();
             for (path, text) in edits {
                 ws.def_file(path, text);
             }
             let warm = recorded_digest(&mut ws);
-            (cold, warm, edit - start, published() - edit)
+            (cold, warm)
         };
         let threads = parallel::THREADS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let serial = analyse(1);
-        let recorded = analyse(4);
+        let threaded = analyse(4);
         parallel::set_analysis_threads(0);
         drop(threads);
-        assert_eq!((serial.2, serial.3), (0, 0));
-        assert!(
-            recorded.2 > 0,
-            "no cold call targets were published from workers"
-        );
-        assert!(
-            recorded.3 > 0,
-            "no call targets were republished from workers after the edit"
-        );
-        assert_eq!(serial.0, recorded.0);
-        assert_eq!(serial.1, recorded.1);
+        assert_eq!(serial, threaded);
     }
 
     /// Each shop's dynamic fields infer `print` first, under the collecting
@@ -4720,10 +4726,12 @@ mod tests {
         let readers = graph
             .derivations()
             .filter(|id| {
-                id.kind == DerivationKind::CallTargets
+                id.kind == DerivationKind::CallTarget
                     && graph.reads_of(*id).any(|key| *key.key() == read)
             })
-            .count();
+            .map(|id| id.file_id)
+            .collect::<FxHashSet<_>>()
+            .len();
         assert_eq!(readers, shops.len());
     }
 
@@ -4949,7 +4957,7 @@ print(tuned{index})"
         }
 
         fn records_on_workers(&self, kind: DerivationKind) -> bool {
-            kind == DerivationKind::CallTargets
+            kind == DerivationKind::CallTarget
         }
 
         fn compute(&self, db: &DbIndex, _: DerivationId) -> Box<dyn std::any::Any + Send> {
@@ -4994,7 +5002,7 @@ print(tuned{index})"
                     .unwrap()
                     .get_chunk_node();
                 DerivationId::new(
-                    DerivationKind::CallTargets,
+                    DerivationKind::CallTarget,
                     *file_id,
                     LuaSyntaxId::from_node(root.syntax()),
                 )
@@ -5018,7 +5026,7 @@ print(tuned{index})"
             for id in &ids {
                 engine.worklist.insert(*id, Reason::Changed);
             }
-            while let Some((first, _)) = engine.worklist.pop_first_of(DerivationKind::CallTargets) {
+            while let Some((first, _)) = engine.worklist.pop_first_of(DerivationKind::CallTarget) {
                 assert!(engine.run_recorded_batch(db, first, &recipe));
             }
             eprintln!(

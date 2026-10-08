@@ -230,6 +230,7 @@ impl EditMaps {
             K::MemberOwnerPresence(owner) => K::MemberOwnerPresence(self.member_owner(owner)?),
             K::DefinitionSite(site) => K::DefinitionSite(self.site(site)?),
             K::Metatable(site) => K::Metatable(self.site(site)?),
+            K::CallTarget(site) => K::CallTarget(self.site(site)?),
             K::TableClass(site) => K::TableClass(self.site(site)?),
             K::NetHelper(site) => K::NetHelper(self.site(site)?),
             K::NetDefinitionUses(site) => K::NetDefinitionUses(self.site(site)?),

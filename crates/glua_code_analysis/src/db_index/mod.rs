@@ -39,7 +39,7 @@ use std::{path::PathBuf, sync::Arc};
 use crate::{Emmyrc, FileId, Vfs, profile::Profile};
 pub use accessor_func::*;
 pub use call_site_param::{CallSiteParamContribution, CallSiteParamIndex};
-pub use call_target::{FileCallTargets, LuaCallTarget, LuaCallTargetIndex};
+pub use call_target::{LuaCallTarget, LuaCallTargetIndex};
 use cow_shards::{CowCell, CowShards};
 pub use declaration::*;
 pub use dependency::{
@@ -313,7 +313,9 @@ impl DbIndex {
             K::SpecialCall(file_id, position) => self
                 .get_flow_index_mut()
                 .reset_special_call(*file_id, *position),
-            K::CallTargets(file_id) => self.get_call_target_index_mut().reset_file(*file_id),
+            K::CallTarget(site) => self
+                .get_call_target_index_mut()
+                .reset_target(site.file_id, site.value),
             K::DynamicFieldFile(file_id) => {
                 self.get_dynamic_field_index_mut().remove_files(&[*file_id])
             }
@@ -521,7 +523,7 @@ impl DbIndex {
             K::SpecialCall(..) | K::SpecialCallFile(_) | K::SpecialCallFor(..) | K::FlowTree(_) => {
                 self.flow_index.fact_fingerprint(key)
             }
-            K::CallTargets(_) => self.call_target_index.fact_fingerprint(key),
+            K::CallTarget(_) => self.call_target_index.fact_fingerprint(key),
             K::DynamicField(..)
             | K::DynamicFieldWildcards(_)
             | K::DynamicFieldFinite(_)

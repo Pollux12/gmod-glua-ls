@@ -34,9 +34,8 @@ mod test {
     }
 
     /// The passes that infer across a whole file.
-    const WHOLE_FILE_PASSES: [DerivationKind; 6] = [
+    const WHOLE_FILE_PASSES: [DerivationKind; 5] = [
         DerivationKind::DynamicFields,
-        DerivationKind::CallTargets,
         DerivationKind::CallSiteParams,
         DerivationKind::LocalFallbacks,
         DerivationKind::NetHelpers,
@@ -44,7 +43,8 @@ mod test {
     ];
 
     /// The whole-file passes run once the statements have settled, so a read
-    /// that settles only at the last stage runs none of them again.
+    /// that settles only at the last stage runs none of them again, nor the
+    /// derivation of any of the file's five calls.
     #[test]
     fn whole_file_passes_run_once_when_a_read_settles_at_the_last_stage() {
         let mut ws = gmod_workspace();
@@ -70,6 +70,7 @@ net.Broadcast()
         let stats = ws.analysis.compilation.last_stats();
         let evaluations = WHOLE_FILE_PASSES.map(|kind| (kind, stats.evaluations(kind)));
         assert_eq!(evaluations, WHOLE_FILE_PASSES.map(|kind| (kind, 1)));
+        assert_eq!(stats.evaluations(DerivationKind::CallTarget), 5);
     }
 
     /// The helper scan reads what a file's signatures declare, so a return

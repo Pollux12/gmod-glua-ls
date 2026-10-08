@@ -1,14 +1,10 @@
-//! Resolves each call's callee once per file, for the per-file passes that
-//! read it: call-site parameters and net helpers.
+//! Resolves each call's callee in a derivation of its own, for the passes
+//! that read it: call-site parameters and net helpers.
 
-use std::sync::Arc;
-
-use glua_parser::{LuaAstNode, LuaCallExpr};
+use glua_parser::{LuaAstNode, LuaCallExpr, LuaSyntaxId};
 
 use crate::semantic::{get_prefix_expr_signature_id, infer_expr};
-use crate::{
-    CacheOptions, DbIndex, FileCallTargets, FileId, LuaAnalysisPhase, LuaCallTarget, LuaInferCache,
-};
+use crate::{CacheOptions, DbIndex, FileId, LuaAnalysisPhase, LuaCallTarget, LuaInferCache};
 
 /// The view the per-file passes infer callees under: after the statements,
 /// with dynamic fields, and without the call-site parameter facts one of them
@@ -21,33 +17,26 @@ pub(crate) fn pass_view() -> CacheOptions {
     }
 }
 
-/// What each call of `file_id` targets.
-pub(super) fn compute_file_call_targets(db: &DbIndex, file_id: FileId) -> FileCallTargets {
-    compute_file_call_targets_with(db, &mut LuaInferCache::new(file_id, pass_view()))
+/// The call `syntax_id` names in `file_id`, if the file still has it.
+fn call_at(db: &DbIndex, file_id: FileId, syntax_id: LuaSyntaxId) -> Option<LuaCallExpr> {
+    let root = db.get_vfs().get_syntax_tree(&file_id)?.get_chunk_node();
+    LuaCallExpr::cast(syntax_id.to_node_from_root(root.syntax())?)
 }
 
-/// What each call of `cache`'s file targets, inferred with `cache`.
-pub(super) fn compute_file_call_targets_with(
-    db: &DbIndex,
+/// Resolves the call `syntax_id` names with `cache`, which infers under the
+/// view [`pass_view`] names, and stores what it targets.
+pub(super) fn derive_call_target(
+    db: &mut DbIndex,
     cache: &mut LuaInferCache,
-) -> FileCallTargets {
-    let Some(root) = db
-        .get_vfs()
-        .get_syntax_tree(&cache.get_file_id())
-        .map(|tree| tree.get_chunk_node())
-    else {
-        return FileCallTargets::default();
+    syntax_id: LuaSyntaxId,
+) {
+    let file_id = cache.get_file_id();
+    let Some(call_expr) = call_at(db, file_id, syntax_id) else {
+        return;
     };
-    root.descendants::<LuaCallExpr>()
-        .map(|call_expr| {
-            let target = resolve_call_target(db, cache, &call_expr);
-            (call_expr.get_range(), target)
-        })
-        .collect()
-}
-
-pub(super) fn apply_file_call_targets(db: &mut DbIndex, file_id: FileId, targets: FileCallTargets) {
-    db.get_call_target_index_mut().set_file(file_id, targets);
+    let target = resolve_call_target(db, cache, &call_expr);
+    db.get_call_target_index_mut()
+        .set_target(file_id, call_expr.get_range(), target);
 }
 
 /// What `call_expr` targets, inferred with `cache`.
@@ -63,16 +52,23 @@ pub(crate) fn resolve_call_target(
     LuaCallTarget::new(declared, prefix_type.as_ref())
 }
 
-/// What `file_id`'s calls target, for a pass ranked after the file's
-/// `CallTargets` derivation and starting at the same stage, so that it ran
-/// first.
-pub(super) fn file_call_targets(db: &DbIndex, file_id: FileId) -> Arc<FileCallTargets> {
-    let targets = db.get_call_target_index().file(file_id);
+/// What `call_expr`, one of `file_id`'s calls, targets, for a pass ranked after
+/// the `CallTarget` derivations and starting at the same stage, so that the
+/// call's ran first.
+pub(super) fn call_target_of<'a>(
+    db: &'a DbIndex,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+) -> Option<&'a LuaCallTarget> {
+    let target = db
+        .get_call_target_index()
+        .target(file_id, call_expr.get_range());
     debug_assert!(
-        targets.is_some(),
-        "{file_id:?}'s call targets resolve first"
+        target.is_some(),
+        "{file_id:?}'s call target at {:?} resolves first",
+        call_expr.get_range()
     );
-    targets.unwrap_or_default()
+    target
 }
 
 /// Under `GLUALS_CHECK_CACHE`, once a re-analysis settled: reports every
@@ -84,14 +80,23 @@ pub(super) fn check_settled_call_targets(db: &DbIndex) {
     let mut file_ids = db.get_vfs().get_all_local_file_ids();
     file_ids.sort_unstable();
     for file_id in file_ids {
-        let Some(stored) = db.get_call_target_index().file(file_id) else {
+        let Some(root) = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .map(|tree| tree.get_chunk_node())
+        else {
             continue;
         };
-        for (range, fresh) in compute_file_call_targets(db, file_id) {
-            if stored.get(&range) != Some(&fresh) {
+        let mut cache = LuaInferCache::new(file_id, pass_view());
+        for call_expr in root.descendants::<LuaCallExpr>() {
+            let range = call_expr.get_range();
+            let Some(stored) = db.get_call_target_index().target(file_id, range) else {
+                continue;
+            };
+            let fresh = resolve_call_target(db, &mut cache, &call_expr);
+            if *stored != fresh {
                 eprintln!(
-                    "[cache] call target mismatch {file_id:?} {range:?} stored={:?} fresh={fresh:?}",
-                    stored.get(&range),
+                    "[cache] call target mismatch {file_id:?} {range:?} stored={stored:?} fresh={fresh:?}",
                 );
             }
         }

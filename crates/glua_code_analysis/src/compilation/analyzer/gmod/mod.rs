@@ -6930,9 +6930,6 @@ struct AnnotatedGmodCallRoleMap<'a> {
     local_roles_by_path: HashMap<(LuaDeclId, String), AnnotatedGmodCallRoles>,
     local_candidate_names: HashSet<String>,
     file_id: FileId,
-    /// The file's call targets, read the first time a call's roles come
-    /// from its receiver.
-    targets: std::cell::OnceCell<std::sync::Arc<crate::FileCallTargets>>,
 }
 
 #[derive(Clone, Default, Hash)]
@@ -7886,7 +7883,6 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
             local_roles_by_path: HashMap::default(),
             local_candidate_names: HashSet::default(),
             file_id,
-            targets: std::cell::OnceCell::new(),
         };
 
         for func_stat in root.descendants::<LuaFuncStat>() {
@@ -8208,8 +8204,8 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
     }
 
     /// The roles of the method `call_expr`'s receiver resolves to, from the
-    /// file's call targets. Those resolve after the statements, so a pass
-    /// that runs before them finds none and runs again once they land.
+    /// call's target. Those resolve after the statements, so a pass that runs
+    /// before them finds none and runs again once they land.
     fn roles_from_receiver_target(
         &self,
         db: &DbIndex,
@@ -8219,12 +8215,10 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
         if !inferred_receiver_method_candidate(call_expr, call_path) {
             return None;
         }
-        let targets = self.targets.get_or_init(|| {
-            db.get_call_target_index()
-                .file(self.file_id)
-                .unwrap_or_default()
-        });
-        let signature_id = targets.get(&call_expr.get_range())?.declared?;
+        let signature_id = db
+            .get_call_target_index()
+            .target(self.file_id, call_expr.get_range())?
+            .declared?;
         roles_from_signature(db, signature_id)?.select_for_call(call_expr)
     }
 }
