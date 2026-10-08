@@ -1031,8 +1031,13 @@ impl Engine {
     /// Whether `file_id` has work still to settle: queued, waiting, in the
     /// focus or a source layer to rebuild.
     pub(crate) fn is_settling(&self, file_id: crate::FileId) -> bool {
-        self.focus.contains(&file_id)
-            || self.stale_sources.contains(&file_id)
+        self.focus.contains(&file_id) || self.has_work(file_id)
+    }
+
+    /// Whether `file_id` has work queued, waiting, held or on a worker, or a
+    /// source layer to rebuild.
+    fn has_work(&self, file_id: crate::FileId) -> bool {
+        self.stale_sources.contains(&file_id)
             || self
                 .worklist
                 .files()
@@ -1044,9 +1049,11 @@ impl Engine {
                 .any(|queued| queued == file_id)
     }
 
-    /// Whether `file_id` is in the focus that is still settling.
+    /// Whether `file_id` is in the focus that is still settling and has work
+    /// left in it: one whose own work settled answers while the rest of the
+    /// focus settles.
     pub(crate) fn in_focus(&self, file_id: crate::FileId) -> bool {
-        self.focus.contains(&file_id)
+        self.focus.contains(&file_id) && self.has_work(file_id)
     }
 
     /// Whether `reader` waits for the focus to settle.
@@ -5269,6 +5276,18 @@ print(tuned{index})"
             .collect::<Vec<_>>();
         assert!(eager == batched, "{differences:#?}");
     }
+    #[test]
+    fn a_focus_file_whose_work_settled_leaves_the_focus_ahead_of_the_rest() {
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        let settled = FileId::new(FILE + 1);
+        engine.prioritise(&[settled, FileId::new(FILE)]);
+        engine.changed(statement(1));
+
+        assert!(engine.in_focus(FileId::new(FILE)));
+        assert!(!engine.in_focus(settled));
+        assert!(engine.is_settling(settled));
+    }
+
     #[test]
     fn member_round_notifications_are_flushed_before_a_slice_returns() {
         let _serial = serial_engine();
