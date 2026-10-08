@@ -37,12 +37,16 @@
 //! once no source layer is left to rebuild, each loop a fact from outside
 //! moved under since it last settled is cleared and settles again from the
 //! first stage, until none is: what a loop holds is a function of what it
-//! reads, not of the order it read it in. A loop downstream of another,
-//! through derivations of any kind, waits for it to settle. A loop among the
-//! work a settled focus or loop leaves waiting is cleared before that work is
-//! released when no other waiting work lies upstream of it: run first, its
-//! members would only settle on what it held, and so would everything
-//! downstream of it, before it is cleared.
+//! reads, not of the order it read it in. A loop downstream of another
+//! through the kinds loops close through waits for it to settle; loops
+//! joined only through other kinds are cleared together, and one that a
+//! loop cleared as late or later reaches through what moved since settled
+//! on what that one held on the way, so it is cleared again once a fact
+//! from outside moved under it. A loop among the work a settled focus or
+//! loop leaves waiting is cleared before that work is released when no
+//! other waiting work lies upstream of it: run first, its members would only
+//! settle on what it held, and so would everything downstream of it, before
+//! it is cleared.
 //!
 //! A run settles in stages (see [`derivation::AnalysisStage`]). Some reads
 //! only have a final answer once nothing can add a fact any more: a field no
@@ -410,18 +414,30 @@ pub(crate) struct Engine {
     /// before they were removed: what a reader settled on of it, whatever it
     /// saw while the files were rebuilt.
     removed_outputs: FxHashMap<HashedKey, derivation::Fingerprint>,
-    /// The members of the loops this run cleared at quiescence. A loop is
-    /// cleared there once per run: settled again from nothing, it holds
-    /// nothing from before the run, and what moves under it later it follows
-    /// as any reader does. A loop through a pass that runs from the first
-    /// stage, which loops leave out, could otherwise be cleared without end,
-    /// each time from what the pass made of the last.
+    /// The members of the loops this run cleared at quiescence for good, at
+    /// the first check after them that cleared none (see
+    /// [`Self::settled_loop_members`]). Settled again from nothing once the
+    /// loops that reach it settled, a loop holds nothing from before the
+    /// run, and what moves under it later it follows as any reader does. A
+    /// loop through a pass that runs from the first stage, which loops leave
+    /// out, could otherwise be cleared without end, each time from what the
+    /// pass made of the last.
     cleared: FxHashSet<DerivationId>,
     /// The members of the loops this run cleared before the waiting work
     /// they belong to was released (see [`Self::clear_parked_loops`]), once
     /// each: should a fact from outside move under one after all, quiescence
     /// clears it once more.
     cleared_parked: FxHashSet<DerivationId>,
+    /// The loops cleared since the last loop check at quiescence that
+    /// cleared none, each as last cleared.
+    pending_loops: Vec<ClearedLoop>,
+    /// Since the first of `pending_loops` was cleared: every key whose
+    /// readers were checked.
+    pending_moved: FxHashSet<HashedKey>,
+    /// The members of cleared loops that a loop cleared as late or later
+    /// reaches: they settled on what it held on the way, so, as for a
+    /// statement from before the run, every fact that moved under one counts.
+    settled_early: FxHashSet<DerivationId>,
     /// Since the last loop check cleared loops: every key whose readers were
     /// checked. A loop the next check can clear lies downstream of one; `None`
     /// has the next check search every statement that settled on a moved fact.
@@ -523,6 +539,17 @@ impl TaskCosts {
     }
 }
 
+/// A loop the run cleared, as it was cleared last.
+#[derive(Debug)]
+struct ClearedLoop {
+    members: Vec<DerivationId>,
+    /// Whether it was cleared at quiescence rather than before the waiting
+    /// work it belongs to was released.
+    at_quiescence: bool,
+    /// The wave it was cleared in, counted over the engine's runs.
+    wave: usize,
+}
+
 /// A fact that moved under a statement: what the statement had seen of it,
 /// and whether it moved once the run was settled, at the last stage.
 #[derive(Debug, Clone)]
@@ -611,26 +638,22 @@ impl Engine {
     /// reference follows `later` alone.
     pub(crate) fn take_edits(&mut self, later: derivation::EditMaps) {
         self.edits = self.edits.then(&later);
-        self.touched = std::mem::take(&mut self.touched)
-            .into_iter()
-            .flat_map(|key| {
-                let moved = later
-                    .map_key(&key)
-                    .filter(|moved| moved != key.key())
-                    .map(HashedKey::new);
-                std::iter::once(key).chain(moved)
-            })
-            .collect();
-        self.pending_slot_notifications = std::mem::take(&mut self.pending_slot_notifications)
-            .into_iter()
-            .flat_map(|key| {
-                let moved = later
-                    .map_key(&key)
-                    .filter(|moved| moved != key.key())
-                    .map(HashedKey::new);
-                std::iter::once(key).chain(moved)
-            })
-            .collect();
+        // Each key, and where `later` moved it.
+        let followed = |keys: FxHashSet<HashedKey>| {
+            keys.into_iter()
+                .flat_map(|key| {
+                    let moved = later
+                        .map_key(&key)
+                        .filter(|moved| moved != key.key())
+                        .map(HashedKey::new);
+                    std::iter::once(key).chain(moved)
+                })
+                .collect::<FxHashSet<_>>()
+        };
+        self.touched = followed(std::mem::take(&mut self.touched));
+        self.pending_slot_notifications =
+            followed(std::mem::take(&mut self.pending_slot_notifications));
+        self.pending_moved = followed(std::mem::take(&mut self.pending_moved));
         self.to_follow = later;
         self.before_edits_mut().clear();
         self.since_search = None;
@@ -844,9 +867,7 @@ impl Engine {
                 FactKey::MemberSlot(..) | FactKey::MemberOwnerMap(_)
             )
         {
-            if let Some(keys) = &mut self.since_search {
-                keys.insert(key.clone());
-            }
+            self.note_checked(key);
             if !self.edits.is_empty() {
                 self.before_edits_mut().remove(key);
                 self.touched.insert(key.clone());
@@ -862,6 +883,16 @@ impl Engine {
             return;
         }
         self.queue_readers_now(db, key, readers);
+    }
+
+    /// Notes that the readers of `key` are checked, for the next loop check.
+    fn note_checked(&mut self, key: &HashedKey) {
+        if let Some(keys) = &mut self.since_search {
+            keys.insert(key.clone());
+        }
+        if !self.pending_loops.is_empty() {
+            self.pending_moved.insert(key.clone());
+        }
     }
 
     fn stale_readers(
@@ -918,9 +949,7 @@ impl Engine {
         key: &HashedKey,
         readers: Option<Vec<(DerivationId, derivation::Fingerprint)>>,
     ) {
-        if let Some(keys) = &mut self.since_search {
-            keys.insert(key.clone());
-        }
+        self.note_checked(key);
         if !self.edits.is_empty() {
             self.before_edits_mut().remove(key);
             self.touched.insert(key.clone());
@@ -2166,9 +2195,12 @@ impl Engine {
 
     /// Whether statement `member` holds what a run that settled before this
     /// one left: it ran in this run with a record from before it, or it is a
-    /// reader that has not run in it yet.
+    /// reader that has not run in it yet; or what a loop cleared with its own
+    /// held on the way.
     fn settled_before_run(&self, member: DerivationId) -> bool {
-        self.from_before.contains(&member) || !self.ran.contains(&member)
+        self.from_before.contains(&member)
+            || self.settled_early.contains(&member)
+            || !self.ran.contains(&member)
     }
 
     /// Whether a fact `member` of `lp` reads from outside the loop now holds
@@ -2209,12 +2241,15 @@ impl Engine {
     /// loop of statements, closed directly or through the passes that run
     /// once statements settle (see [`DerivationKind::closes_loops`]), one of
     /// whose statements reads from outside the loop a fact that moved since
-    /// it settled on it, and that no other such loop lies upstream of (see
-    /// [`Self::upstream_loops`]): each member's primary outputs, and those of
-    /// whatever shares them, go back to the source layer, they run again, and
-    /// the run starts over from the first stage, as a cold build settles a
-    /// loop through them. Returns whether it cleared any.
+    /// it settled on it, and that is not cleared already (see
+    /// [`Self::settled_loop_members`]): each member's primary outputs, and
+    /// those of whatever shares them, go back to the source layer, they run
+    /// again, and the run starts over from the first stage, as a cold build
+    /// settles a loop through them. Returns whether it cleared any; one that
+    /// cleared none clears for good the loops cleared at quiescence since
+    /// the last that did not.
     fn clear_loops(&mut self, db: &mut DbIndex) -> bool {
+        let settled = self.settled_loop_members(db);
         // After a check that cleared loops, what a loop's members read and
         // write, and what their facts hold, moved only through the keys
         // checked since: a loop it left that the next one clears is
@@ -2259,6 +2294,7 @@ impl Engine {
             }
         }
         if roots.is_empty() {
+            self.commit_cleared_loops();
             self.settled_on.clear();
             return false;
         }
@@ -2272,70 +2308,68 @@ impl Engine {
             roots.iter().copied(),
             DerivationKind::closes_loops,
             |lp| {
-                lp.iter().any(|member| !self.cleared.contains(member))
+                lp.iter()
+                    .any(|member| !self.cleared.contains(member) && !settled.contains(member))
                     && lp
                         .iter()
                         .any(|member| self.moved_from_outside(db, lp, *member, &parked))
             },
         );
         if loops.is_empty() {
+            self.commit_cleared_loops();
             self.settled_on.clear();
             return false;
         }
         drop(_search);
         self.since_search = Some(FxHashSet::default());
-        let loops = self.upstream_loops(db, loops);
-        self.cleared.extend(loops.iter().flatten().copied());
-        self.clear(db, &loops);
+        self.clear(db, loops, true);
         true
     }
 
-    /// Of `loops`, those no other of them lies upstream of through
-    /// derivations of any evaluated kind, unless it lies downstream of that
-    /// one too: cleared together, a loop downstream of another would settle
-    /// from what the other held on the way, not from what it settles to. The
-    /// next check searches from the members of the rest, which wait for it.
-    fn upstream_loops(
-        &mut self,
-        db: &DbIndex,
-        loops: Vec<Vec<DerivationId>>,
-    ) -> Vec<Vec<DerivationId>> {
-        if loops.len() < 2 {
-            return loops;
-        }
+    /// Of the loops cleared at quiescence since the last check that cleared
+    /// none, the members of those this check leaves: no other loop cleared
+    /// since, as late or later, reaches one through what moved since, unless
+    /// it reaches that one in turn. Each loop such a one reaches settled on
+    /// what it held on the way, so every fact that moved under one of its
+    /// members counts, and the check clears it again if one from outside did.
+    fn settled_loop_members(&mut self, db: &DbIndex) -> FxHashSet<DerivationId> {
         let _order = crate::profile::PhaseGuard::new("loops: order");
-        let graph = db.reader_graph();
-        let members = loops.iter().flatten().copied().collect::<FxHashSet<_>>();
-        // Loops that read one another through any kind share a component.
-        let upstream_members = graph
-            .read_loops(
-                loops.iter().flatten().copied(),
-                |kind| !matches!(kind, DerivationKind::Source | DerivationKind::Diagnostics),
-                |component| component.iter().any(|id| members.contains(id)),
-            )
-            .into_iter()
-            .flatten()
-            .collect::<FxHashSet<_>>();
-        let (upstream, waiting) = loops
-            .into_iter()
-            .partition::<Vec<_>, _>(|lp| upstream_members.contains(&lp[0]));
-        if let Some(keys) = &mut self.since_search {
-            keys.extend(
-                waiting
-                    .iter()
-                    .flatten()
-                    .flat_map(|member| graph.outputs_of(*member))
-                    .cloned(),
-            );
+        let loops = self
+            .pending_loops
+            .iter()
+            .map(|lp| (lp.members.as_slice(), lp.wave))
+            .collect::<Vec<_>>();
+        let upstream =
+            db.reader_graph()
+                .latest_upstream_loops(&loops, &self.pending_moved, |kind| {
+                    !matches!(kind, DerivationKind::Source | DerivationKind::Diagnostics)
+                });
+        let mut settled = FxHashSet::default();
+        for (lp, upstream) in self.pending_loops.iter().zip(upstream) {
+            if upstream.is_some_and(|wave| wave >= lp.wave) {
+                self.settled_early.extend(lp.members.iter().copied());
+            } else if lp.at_quiescence {
+                settled.extend(lp.members.iter().copied());
+            }
         }
-        upstream
+        settled
+    }
+
+    /// Clears for good the loops cleared at quiescence since the last check
+    /// that cleared none.
+    fn commit_cleared_loops(&mut self) {
+        for lp in std::mem::take(&mut self.pending_loops) {
+            if lp.at_quiescence {
+                self.cleared.extend(lp.members);
+            }
+        }
+        self.pending_moved.clear();
     }
 
     /// Once a focus or a loop settled, before the waiting work `released` is
     /// queued: clears the loops [`Self::clear_loops`] would clear once that
     /// work ran that have a member among it, if none of that work, nor a
-    /// source layer still to rebuild, nor another of those loops (see
-    /// [`Self::upstream_loops`]), lies upstream of them. Run first, their
+    /// source layer still to rebuild, lies upstream of them. Run first, their
     /// members would settle on what the loops held, and so would whatever
     /// reads them, all to run again once the loops are cleared. A loop cleared
     /// here that a fact from outside moves under after all is cleared once
@@ -2362,12 +2396,22 @@ impl Engine {
         if roots.is_empty() {
             return false;
         }
+        // A loop cleared since the last check that cleared none settles at
+        // quiescence.
+        let pending = self
+            .pending_loops
+            .iter()
+            .flat_map(|lp| &lp.members)
+            .copied()
+            .collect::<FxHashSet<_>>();
         let loops = db.reader_graph().read_loops(
             roots.iter().copied(),
             DerivationKind::closes_loops,
             |lp| {
                 lp.iter().any(|member| {
-                    !self.cleared.contains(member) && !self.cleared_parked.contains(member)
+                    !self.cleared.contains(member)
+                        && !self.cleared_parked.contains(member)
+                        && !pending.contains(member)
                 }) && lp
                     .iter()
                     .any(|member| self.moved_from_outside(db, lp, *member, &parked))
@@ -2407,23 +2451,24 @@ impl Engine {
             .into_iter()
             .filter(|lp| !lp.iter().any(|member| downstream.contains(member)))
             .collect::<Vec<_>>();
-        let loops = self.upstream_loops(db, loops);
         if loops.is_empty() {
             return false;
         }
         self.stats.loops_cleared_parked += loops.len();
         self.cleared_parked.extend(loops.iter().flatten().copied());
-        self.clear(db, &loops);
+        self.clear(db, loops, false);
         true
     }
 
-    /// Clears `loops`: each member's primary outputs, and those of whatever
-    /// shares them, go back to the source layer, they run again before any
-    /// other work, and the run starts over from the first stage.
-    fn clear(&mut self, db: &mut DbIndex, loops: &[Vec<DerivationId>]) {
+    /// Clears `loops`, at quiescence or before waiting work is released:
+    /// each member's primary outputs, and those of whatever shares them, go
+    /// back to the source layer, they run again before any other work, and
+    /// the run starts over from the first stage. Checks at quiescence clear
+    /// them again or leave them (see [`Self::settled_loop_members`]).
+    fn clear(&mut self, db: &mut DbIndex, loops: Vec<Vec<DerivationId>>, at_quiescence: bool) {
         let _clear = crate::profile::PhaseGuard::new("loops: clear");
         if crate::profile::tracing_evaluations() {
-            self.trace_loop_edges(db, loops);
+            self.trace_loop_edges(db, &loops);
         }
         self.stats.loop_waves += 1;
         self.stats.loops_cleared += loops.len();
@@ -2442,6 +2487,15 @@ impl Engine {
         for member in &members {
             touched.extend(db.reader_graph().outputs_of(*member).cloned());
         }
+        self.pending_loops
+            .retain(|lp| !lp.members.iter().any(|member| members.contains(member)));
+        let wave = self.stats.loop_waves;
+        self.pending_loops
+            .extend(loops.into_iter().map(|lp| ClearedLoop {
+                members: lp,
+                at_quiescence,
+                wave,
+            }));
         self.loop_before = touched
             .iter()
             .map(|key| (key.clone(), self.fingerprint(db, key)))
@@ -5949,11 +6003,11 @@ function holder.receiver:Use() end
 
     const INPUT: u32 = 500;
 
-    /// Statements in `FILE`, each at its start with the positions it reads:
-    /// each binds at its start the union of what is bound where it reads, so
-    /// a loop of them keeps every value it ever saw until it is cleared. At
-    /// the positions in `exports`, a module export does the same: a kind no
-    /// loop closes through.
+    /// Statements, each at its start with the positions it reads: each binds
+    /// at its start the union of what is bound where it reads, so a loop of
+    /// them keeps every value it ever saw until it is cleared. At the
+    /// positions in `exports`, a module export does the same: a kind no loop
+    /// closes through. Each hundred positions lie in a file of their own.
     struct Unions {
         reads: Vec<(u32, Vec<u32>)>,
         exports: Vec<u32>,
@@ -5961,14 +6015,16 @@ function holder.receiver:Use() end
 
     impl Unions {
         fn derivation(&self, start: u32) -> DerivationId {
-            if !self.exports.contains(&start) {
-                return statement(start);
-            }
+            let (kind, syntax) = if self.exports.contains(&start) {
+                (DerivationKind::ChunkReturn, LuaSyntaxKind::Chunk)
+            } else {
+                (DerivationKind::LocalStat, LuaSyntaxKind::LocalStat)
+            };
             DerivationId::new(
-                DerivationKind::ChunkReturn,
-                FileId::new(FILE),
+                kind,
+                FileId::new(FILE + start / 100),
                 LuaSyntaxId::new(
-                    LuaSyntaxKind::Chunk.into(),
+                    syntax.into(),
                     TextRange::at(TextSize::new(start), TextSize::new(1)),
                 ),
             )
@@ -6053,13 +6109,14 @@ function holder.receiver:Use() end
 
     /// What `recipe`'s derivations bind, in order, once `INPUT` turns from
     /// "old" to "new" under them in a run that takes files in `schedule`'s
-    /// order, with the stats of that run; and what they bind in a cold build
-    /// from "new".
+    /// order, on the serial engine if `serial`, with the stats of that run;
+    /// and what they bind in a cold build from "new".
     fn unions_after_edit(
         recipe: &Unions,
         schedule: Schedule,
+        serial: bool,
     ) -> (Vec<Option<LuaType>>, EngineStats, Vec<Option<LuaType>>) {
-        let _serial = serial_engine();
+        let _serial = serial.then(serial_engine);
         let mut warm = recipe.settled_from("old");
         let db = warm.get_db_mut();
         let mut engine = Engine::new(derivation::EditMaps::default(), schedule);
@@ -6084,7 +6141,7 @@ function holder.receiver:Use() end
             exports: Vec::new(),
         };
 
-        let (warm, stats, cold) = unions_after_edit(&recipe, Schedule::Canonical);
+        let (warm, stats, cold) = unions_after_edit(&recipe, Schedule::Canonical, true);
 
         assert_eq!(warm, cold);
         assert_eq!((stats.loops_cleared, stats.loop_waves), (2, 1));
@@ -6102,7 +6159,7 @@ function holder.receiver:Use() end
             exports: Vec::new(),
         };
 
-        let (warm, stats, cold) = unions_after_edit(&recipe, Schedule::Canonical);
+        let (warm, stats, cold) = unions_after_edit(&recipe, Schedule::Canonical, true);
 
         assert_eq!(warm, cold);
         assert_eq!(
@@ -6128,7 +6185,7 @@ function holder.receiver:Use() end
             exports: Vec::new(),
         };
 
-        let (warm, stats, cold) = unions_after_edit(&recipe, Schedule::Canonical);
+        let (warm, stats, cold) = unions_after_edit(&recipe, Schedule::Canonical, true);
 
         assert_eq!(warm, cold);
         assert_eq!(
@@ -6160,18 +6217,50 @@ function holder.receiver:Use() end
             Schedule::Shuffled(7),
             Schedule::Deferred,
         ] {
-            let (warm, stats, cold) = unions_after_edit(&recipe, schedule);
+            let (warm, stats, cold) = unions_after_edit(&recipe, schedule, true);
 
             assert_eq!(warm, cold, "{schedule:?}");
+            // Cleared with the loop upstream of it, then again once that loop settled.
             assert_eq!(
                 (
                     stats.loops_cleared,
                     stats.loop_waves,
                     stats.loops_cleared_parked
                 ),
-                (2, 2, 0),
+                (3, 2, 0),
                 "{schedule:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_chain_of_loops_joined_through_passes_settles_as_a_cold_build_in_any_order() {
+        let recipe = Unions {
+            reads: vec![
+                (110, vec![INPUT, 120]),
+                (120, vec![110]),
+                (125, vec![110]),
+                (210, vec![125, 220]),
+                (220, vec![210]),
+                (225, vec![210]),
+                (310, vec![225, 320]),
+                (320, vec![310]),
+            ],
+            exports: vec![125, 225],
+        };
+
+        for serial in [true, false] {
+            for schedule in [
+                Schedule::Canonical,
+                Schedule::Reversed,
+                Schedule::Shuffled(7),
+                Schedule::Deferred,
+            ] {
+                let (warm, stats, cold) = unions_after_edit(&recipe, schedule, serial);
+
+                assert_eq!(warm, cold, "{schedule:?} serial={serial}");
+                assert_eq!(stats.loop_waves, 3, "{schedule:?} serial={serial}");
+            }
         }
     }
 

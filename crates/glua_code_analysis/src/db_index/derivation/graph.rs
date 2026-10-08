@@ -2229,6 +2229,181 @@ impl ReaderGraph {
         loops
     }
 
+    /// Of `loops`, each with a stamp, the latest stamp of the others each
+    /// reads from, through keys among `moved` and derivations of the kinds
+    /// `follows` accepts, that do not read from it in turn. The search keeps
+    /// to what the loops' moved outputs reach.
+    pub fn latest_upstream_loops(
+        &self,
+        loops: &[(&[DerivationId], usize)],
+        moved: &FxHashSet<HashedKey>,
+        follows: impl Fn(DerivationKind) -> bool,
+    ) -> Vec<Option<usize>> {
+        if loops.len() < 2 {
+            return vec![None; loops.len()];
+        }
+        let moved = moved
+            .iter()
+            .filter_map(|key| self.table.find(key))
+            .collect::<FxHashSet<_>>();
+        // Each loop is one node, numbered by its position; each derivation
+        // its moved outputs reach is another, numbered after them.
+        let mut node_of = FxHashMap::<DerivIdx, u32>::default();
+        let mut derivs_of = Vec::<Vec<DerivIdx>>::with_capacity(loops.len());
+        for (lp, _) in loops {
+            let node = u32::try_from(derivs_of.len()).expect("fewer than 2^32 loops");
+            let members = lp
+                .iter()
+                .filter_map(|id| self.deriv_slots.get(id).copied())
+                .collect::<Vec<_>>();
+            for member in &members {
+                node_of.insert(*member, node);
+            }
+            derivs_of.push(members);
+        }
+        let mut pending = derivs_of.iter().flatten().copied().collect::<Vec<_>>();
+        while let Some(deriv) = pending.pop() {
+            let Some(record) = self.derivations[deriv as usize].record.as_ref() else {
+                continue;
+            };
+            for output in record.outputs.iter().filter(|slot| moved.contains(*slot)) {
+                for slot in std::iter::once(output).chain(self.table.derived_slots(*output)) {
+                    for (_, reader) in self.table.keys[*slot as usize].readers.iter() {
+                        if node_of.contains_key(&reader)
+                            || !follows(self.derivations[reader as usize].id.kind)
+                        {
+                            continue;
+                        }
+                        let node = u32::try_from(derivs_of.len()).expect("fewer than 2^32 nodes");
+                        node_of.insert(reader, node);
+                        derivs_of.push(vec![reader]);
+                        pending.push(reader);
+                    }
+                }
+            }
+        }
+        let producers_read_by = |node: u32| {
+            let mut producers = Vec::new();
+            for deriv in &derivs_of[node as usize] {
+                let Some(record) = self.derivations[*deriv as usize].record.as_ref() else {
+                    continue;
+                };
+                for slot in record.reads.iter().filter(|slot| moved.contains(*slot)) {
+                    let base = self
+                        .table
+                        .key(*slot)
+                        .base()
+                        .and_then(|base| self.table.find(&HashedKey::new(base)));
+                    for slot in std::iter::once(*slot).chain(base) {
+                        producers.extend(
+                            self.table
+                                .producers(slot)
+                                .filter_map(|producer| node_of.get(&producer).copied())
+                                .filter(|producer| *producer != node),
+                        );
+                    }
+                }
+            }
+            producers.sort_unstable();
+            producers.dedup();
+            producers
+        };
+        // Tarjan's algorithm along reads from each loop, as in
+        // [`Self::read_loops`]: each component carries the latest stamp of the
+        // loops in or upstream of it, and each loop the latest its component
+        // reads from another.
+        struct Visit {
+            node: u32,
+            producers: Vec<u32>,
+            next: usize,
+        }
+        const UNVISITED: u32 = u32::MAX;
+        let count = derivs_of.len();
+        let mut order = vec![(UNVISITED, UNVISITED); count];
+        let mut next_index = 0;
+        let mut stack = Vec::new();
+        let mut on_stack = vec![false; count];
+        let mut component_of = vec![usize::MAX; count];
+        let mut latest = Vec::<Option<usize>>::new();
+        let mut reads_latest = vec![None::<usize>; count];
+        let mut upstream = vec![None; loops.len()];
+        let mut visit = |node: u32, order: &mut [(u32, u32)], stack: &mut Vec<u32>| {
+            order[node as usize] = (next_index, next_index);
+            next_index += 1;
+            stack.push(node);
+            Visit {
+                node,
+                producers: producers_read_by(node),
+                next: 0,
+            }
+        };
+        for root in 0..u32::try_from(loops.len()).expect("fewer than 2^32 loops") {
+            if order[root as usize].0 != UNVISITED {
+                continue;
+            }
+            on_stack[root as usize] = true;
+            let mut calls = vec![visit(root, &mut order, &mut stack)];
+            while let Some(top) = calls.last_mut() {
+                if let Some(producer) = top.producers.get(top.next).copied() {
+                    top.next += 1;
+                    let reader = top.node as usize;
+                    let at = producer as usize;
+                    if order[at].0 == UNVISITED {
+                        on_stack[at] = true;
+                        let call = visit(producer, &mut order, &mut stack);
+                        calls.push(call);
+                    } else if on_stack[at] {
+                        order[reader].1 = order[reader].1.min(order[at].0);
+                    } else {
+                        reads_latest[reader] = reads_latest[reader].max(latest[component_of[at]]);
+                    }
+                    continue;
+                }
+                let finished = calls.pop().expect("a call");
+                let (index, low) = order[finished.node as usize];
+                if let Some(parent) = calls.last() {
+                    let parent_low = &mut order[parent.node as usize].1;
+                    *parent_low = (*parent_low).min(low);
+                }
+                if index != low {
+                    continue;
+                }
+                let mut members = Vec::new();
+                loop {
+                    let member = stack.pop().expect("on the stack");
+                    on_stack[member as usize] = false;
+                    members.push(member);
+                    if member == finished.node {
+                        break;
+                    }
+                }
+                let component = latest.len();
+                for member in &members {
+                    component_of[*member as usize] = component;
+                }
+                let read = members
+                    .iter()
+                    .map(|member| reads_latest[*member as usize])
+                    .max()
+                    .flatten();
+                let mut reached = read;
+                for member in members
+                    .iter()
+                    .filter(|member| (**member as usize) < loops.len())
+                {
+                    upstream[*member as usize] = read;
+                    reached = reached.max(Some(loops[*member as usize].1));
+                }
+                latest.push(reached);
+                if let Some(parent) = calls.last() {
+                    let parent = &mut reads_latest[parent.node as usize];
+                    *parent = (*parent).max(reached);
+                }
+            }
+        }
+        upstream
+    }
+
     pub fn contains(&self, id: DerivationId) -> bool {
         self.record(id).is_some()
     }
@@ -3305,5 +3480,71 @@ mod tests {
             let written = graph.table.keys[*slot as usize].written;
             assert_eq!(written == now, position % 2 == 0, "slot {slot}");
         }
+    }
+
+    /// Records `id` reading the keys of `reads` and writing those of `writes`.
+    fn record(graph: &mut ReaderGraph, id: DerivationId, reads: &[u32], writes: &[u32]) {
+        graph.replace(
+            id,
+            reads.iter().map(|read| (key(*read), Some(0))).collect(),
+            writes.iter().map(|write| key(*write)).collect(),
+            |_| 0,
+        );
+    }
+
+    /// Two loops, the second reading the first through a pass between them.
+    fn two_loops(graph: &mut ReaderGraph, first_reads: &[u32]) -> [Vec<DerivationId>; 2] {
+        record(graph, id(1, 0), first_reads, &[11]);
+        record(graph, id(1, 1), &[11], &[12]);
+        record(graph, id(2, 0), &[11], &[20]);
+        record(graph, id(3, 0), &[20, 32], &[31]);
+        record(graph, id(3, 1), &[31], &[32]);
+        [vec![id(1, 0), id(1, 1)], vec![id(3, 0), id(3, 1)]]
+    }
+
+    #[test]
+    fn a_loop_takes_the_latest_stamp_of_those_reaching_it_through_moved_keys_alone() {
+        let mut graph = ReaderGraph::default();
+        let [first, second] = two_loops(&mut graph, &[12]);
+        let loops = [(first.as_slice(), 2), (second.as_slice(), 1)];
+        let all = [11, 12, 20, 31, 32]
+            .map(key)
+            .into_iter()
+            .collect::<FxHashSet<_>>();
+        let pass_held = all
+            .iter()
+            .filter(|moved| **moved != key(20))
+            .cloned()
+            .collect::<FxHashSet<_>>();
+
+        assert_eq!(
+            graph.latest_upstream_loops(&loops, &all, |_| true),
+            [None, Some(2)]
+        );
+        assert_eq!(
+            graph.latest_upstream_loops(&loops, &pass_held, |_| true),
+            [None, None]
+        );
+        assert_eq!(
+            graph.latest_upstream_loops(&loops, &all, |kind| kind != DerivationKind::LocalStat),
+            [None, None]
+        );
+    }
+
+    #[test]
+    fn loops_that_reach_each_other_through_moved_keys_take_no_stamp_of_each_other() {
+        let mut graph = ReaderGraph::default();
+        let [first, second] = two_loops(&mut graph, &[12, 40]);
+        record(&mut graph, id(4, 0), &[31], &[40]);
+        let loops = [(first.as_slice(), 1), (second.as_slice(), 2)];
+        let all = [11, 12, 20, 31, 32, 40]
+            .map(key)
+            .into_iter()
+            .collect::<FxHashSet<_>>();
+
+        assert_eq!(
+            graph.latest_upstream_loops(&loops, &all, |_| true),
+            [None, None]
+        );
     }
 }
