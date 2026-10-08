@@ -459,17 +459,7 @@ impl LuaModuleIndex {
                     return derivation::ABSENT;
                 }
                 derivation::fingerprint_of(&(
-                    module_info.map(|info| {
-                        (
-                            info.full_module_name.as_str(),
-                            info.name.as_str(),
-                            info.visible,
-                            &info.version_conds,
-                            info.workspace_id,
-                            info.is_meta,
-                        )
-                    }),
-                    self.file_module_paths.get(file_id),
+                    module_info.map(|info| (info.workspace_id, info.is_meta)),
                     legacy_envs,
                 ))
             }

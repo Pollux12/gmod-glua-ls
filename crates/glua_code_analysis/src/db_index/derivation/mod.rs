@@ -273,8 +273,8 @@ pub enum FactKey {
     CallSiteCallbacks(FileId),
     /// A module's export and metadata.
     Module(FileId),
-    /// A module's metadata without its export: path, name, workspace, flags
-    /// and legacy environments.
+    /// A module's workspace, its meta flag and its legacy environments: what
+    /// a reader asking where a file belongs sees, not its path or name.
     ModuleMeta(FileId),
     /// The modules whose name (last path segment) is this: every module
     /// lookup of a path ending in it.

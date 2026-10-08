@@ -298,6 +298,54 @@ mod test {
         assert_eq!(stats.rebuilt_sources, 0);
     }
 
+    /// Moving a file another file reads a global of re-runs only the moved
+    /// file: where it belongs does not change, so neither do its readers.
+    #[test]
+    fn moving_a_file_whose_global_is_read_re_runs_only_the_file() {
+        let mut ws = gmod_workspace();
+        ws.def_files(vec![
+            (
+                "lua/autorun/sh_values.lua",
+                "SharedValue = 1
+",
+            ),
+            (
+                "lua/autorun/sh_reader.lua",
+                "local value = SharedValue + 1
+",
+            ),
+        ]);
+        let moved = file_id(&ws, "lua/autorun/sh_values.lua").expect("the file has an id");
+
+        ws.analysis.apply_file_system_changes(vec![
+            (
+                ws.virtual_url_generator
+                    .new_uri("lua/autorun/sh_values.lua"),
+                None,
+            ),
+            (
+                ws.virtual_url_generator
+                    .new_uri("lua/autorun/sh_values_moved.lua"),
+                Some(
+                    "SharedValue = 1
+"
+                    .to_string(),
+                ),
+            ),
+        ]);
+
+        assert_eq!(file_id(&ws, "lua/autorun/sh_values_moved.lua"), Some(moved));
+        let evaluated = ws
+            .analysis
+            .compilation
+            .last_evaluated_files()
+            .iter()
+            .copied()
+            .filter(|file_id| *file_id != FileId::VIRTUAL)
+            .collect::<Vec<_>>();
+        assert_eq!(evaluated, vec![moved]);
+    }
+
     /// A moved file's diagnostics are shown at its new path, so the move
     /// reports them affected even where nothing else about them changed.
     #[test]
