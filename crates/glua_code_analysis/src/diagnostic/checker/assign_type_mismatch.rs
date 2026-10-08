@@ -368,7 +368,7 @@ fn pre_write_index_expr_type(
     let root = semantic_model
         .get_db()
         .get_vfs()
-        .get_syntax_tree(&in_file_range.file_id)?;
+        .syntax_tree_at_statement(&in_file_range.file_id, in_file_range.value)?;
     let red_root = root.get_red_root();
     let table_node = red_root.covering_element(in_file_range.value).into_node()?;
     let table_expr = LuaTableExpr::cast(table_node)?;

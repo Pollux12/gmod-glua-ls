@@ -4,7 +4,7 @@ use glua_parser::{
     LuaNameExpr, LuaReturnStat, LuaStat, LuaSyntaxId, LuaSyntaxNode, LuaTableExpr, LuaTableField,
     LuaVarExpr, PathTrait,
 };
-use rowan::TextSize;
+use rowan::{TextRange, TextSize};
 use std::sync::Arc;
 
 use super::{
@@ -1191,15 +1191,11 @@ fn infer_param_type_from_call_sites(
         return None;
     }
 
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&signature_id.get_file_id())?
-        .get_red_root();
     let target_decl_id = db
         .get_signature_index()
         .local_func_decl_for(&signature_id)?;
     let call_sites =
-        local_function_call_sites(db, cache, signature_id.get_file_id(), &root, target_decl_id);
+        local_function_call_sites(db, cache, signature_id.get_file_id(), target_decl_id);
     infer_param_type_from_local_call_sites_inner(
         db,
         cache,
@@ -1302,8 +1298,12 @@ fn infer_supported_non_param_call_arg_type(
             if !matches!(decl.extra, LuaDeclExtra::Local { .. }) {
                 return None;
             }
-            let root = db.get_vfs().get_syntax_tree(&file_id)?.get_red_root();
-            let value_node = decl.get_value_syntax_id()?.to_node_from_root(&root)?;
+            let value_syntax_id = decl.get_value_syntax_id()?;
+            let root = db
+                .get_vfs()
+                .syntax_tree_around(&file_id, value_syntax_id.get_range())?
+                .get_red_root();
+            let value_node = value_syntax_id.to_node_from_root(&root)?;
             let value_expr = LuaExpr::cast(value_node)?;
             match &value_expr {
                 LuaExpr::LiteralExpr(_) => {}
@@ -1329,16 +1329,8 @@ fn infer_unread_local_call_site_args(
     let Some(target_decl_id) = db.get_signature_index().local_func_decl_for(&signature_id) else {
         return Ok(None);
     };
-    let Some(root) = db
-        .get_vfs()
-        .get_syntax_tree(&signature_id.get_file_id())
-        .map(|tree| tree.get_red_root())
-    else {
-        return Ok(None);
-    };
-
     let unread_args =
-        local_function_call_sites(db, cache, signature_id.get_file_id(), &root, target_decl_id)
+        local_function_call_sites(db, cache, signature_id.get_file_id(), target_decl_id)
             .into_iter()
             .filter_map(|(_, call_expr)| {
                 call_expr
@@ -1405,7 +1397,10 @@ fn infer_forwarded_param_arg_type(
 
     let root = db
         .get_vfs()
-        .get_syntax_tree(&signature_id.get_file_id())?
+        .syntax_tree_around(
+            &signature_id.get_file_id(),
+            TextRange::empty(signature_id.get_position()),
+        )?
         .get_red_root();
     // The signature's position is where its closure starts, so descend to that
     // offset instead of scanning every node in the file.
@@ -1421,7 +1416,7 @@ fn infer_forwarded_param_arg_type(
     let target_decl_id = LuaDeclId::new(signature_id.get_file_id(), local_func_name.get_position());
 
     let call_sites =
-        local_function_call_sites(db, cache, signature_id.get_file_id(), &root, target_decl_id);
+        local_function_call_sites(db, cache, signature_id.get_file_id(), target_decl_id);
     infer_param_type_from_local_call_sites_inner(
         db,
         cache,
@@ -1432,13 +1427,18 @@ fn infer_forwarded_param_arg_type(
     )
 }
 
+/// The calls of a local function in `file_id`, read out of the file's
+/// references, which a call added or removed moves, and the top-level
+/// statement of each.
 fn local_function_call_sites(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     file_id: FileId,
-    root: &LuaSyntaxNode,
     target_decl_id: LuaDeclId,
 ) -> Vec<(FileId, LuaCallExpr)> {
+    let Some(file_refs) = db.get_reference_index().get_local_reference(&file_id) else {
+        return Vec::new();
+    };
     // Parameter inference asks for the same function's call sites once per
     // parameter index, and each miss walks the tree from the root for every
     // reference. Derive the set once and re-resolve the ids on later calls.
@@ -1448,7 +1448,7 @@ fn local_function_call_sites(
             let ids = Arc::new(find_local_function_call_sites(
                 db,
                 file_id,
-                root,
+                file_refs,
                 target_decl_id,
             ));
             cache
@@ -1461,7 +1461,11 @@ fn local_function_call_sites(
     syntax_ids
         .iter()
         .filter_map(|syntax_id| {
-            let node = syntax_id.to_node_from_root(root)?;
+            let root = db
+                .get_vfs()
+                .syntax_tree_around(&file_id, syntax_id.get_range())?
+                .get_red_root();
+            let node = syntax_id.to_node_from_root(&root)?;
             Some((file_id, LuaCallExpr::cast(node)?))
         })
         .collect()
@@ -1470,14 +1474,10 @@ fn local_function_call_sites(
 fn find_local_function_call_sites(
     db: &DbIndex,
     file_id: FileId,
-    root: &LuaSyntaxNode,
+    file_refs: &crate::FileReference,
     target_decl_id: LuaDeclId,
 ) -> Vec<LuaSyntaxId> {
-    let Some(decl_refs) = db
-        .get_reference_index()
-        .get_local_reference(&file_id)
-        .and_then(|file_refs| file_refs.get_decl_references(&target_decl_id))
-    else {
+    let Some(decl_refs) = file_refs.get_decl_references(&target_decl_id) else {
         return Vec::new();
     };
 
@@ -1487,7 +1487,10 @@ fn find_local_function_call_sites(
     cells
         .into_iter()
         .filter_map(|cell| {
-            root.covering_element(cell.range)
+            db.get_vfs()
+                .syntax_tree_around(&file_id, cell.range)?
+                .get_red_root()
+                .covering_element(cell.range)
                 .ancestors()
                 .find_map(LuaNameExpr::cast)
                 .filter(|name_expr| name_expr.get_range() == cell.range)
@@ -1723,7 +1726,7 @@ fn find_param_type_from_outer_factory_member(
 ) -> Option<LuaType> {
     let root = db
         .get_vfs()
-        .get_syntax_tree(&member_id.file_id)?
+        .syntax_tree_around(&member_id.file_id, member_id.get_syntax_id().get_range())?
         .get_red_root();
     let current_node = member_id.get_syntax_id().to_node_from_root(&root)?;
     let outer_func = current_node
@@ -1980,9 +1983,13 @@ fn find_param_type_from_contextual_member(
     is_self_param: bool,
     is_dots: bool,
 ) -> Option<LuaType> {
+    let syntax_id = member_id.get_syntax_id();
+    if !LuaTableField::can_cast(syntax_id.get_kind()) {
+        return None;
+    }
     let root = db
         .get_vfs()
-        .get_syntax_tree(&member_id.file_id)?
+        .syntax_tree_at_statement(&member_id.file_id, syntax_id.get_range())?
         .get_chunk_node();
     let table_field = direct_table_field_from_member_id(&root, member_id)?;
     let field_type = infer_table_field_value_should_be(db, cache, table_field.clone()).ok()?;
