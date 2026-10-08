@@ -1261,7 +1261,107 @@ pub struct Evaluation {
     staged: rustc_hash::FxHashMap<HashedKey, Fingerprint>,
 }
 
+/// An evaluation a superstep task ended, kept until the barrier files it: its
+/// results without the lookups it needed only while it recorded, and with the
+/// sets a task's evaluation rarely fills boxed apart.
+pub(crate) struct EndedEvaluation {
+    pub id: DerivationId,
+    log: Vec<KeyIdx>,
+    read: Vec<KeyIdx>,
+    log_handle: std::sync::Arc<frames::LogHandle>,
+    stamp: u64,
+    outputs: Vec<HashedKey>,
+    rare: Option<Box<RareResults>>,
+}
+
+/// The results of an [`EndedEvaluation`] that are empty for most.
+#[derive(Default)]
+struct RareResults {
+    checks: FxHashSet<u64>,
+    reads: FxHashSet<HashedKey>,
+    viewed: FxHashSet<KeyIdx>,
+    moved: FxHashSet<HashedKey>,
+    staged: rustc_hash::FxHashMap<HashedKey, Fingerprint>,
+}
+
+impl EndedEvaluation {
+    /// The keys the evaluation wrote, once per write.
+    pub fn outputs(&self) -> impl Iterator<Item = &HashedKey> {
+        self.outputs.iter()
+    }
+
+    /// The keys the evaluation re-filed without producing them.
+    pub fn moved(&self) -> impl Iterator<Item = &HashedKey> {
+        self.rare.iter().flat_map(|rare| rare.moved.iter())
+    }
+
+    /// The evaluation as it ended, to file.
+    pub(crate) fn into_evaluation(self) -> Evaluation {
+        let rare = self.rare.map(|rare| *rare).unwrap_or_default();
+        Evaluation {
+            id: self.id,
+            log: self.log,
+            read: self.read,
+            frames: Vec::new(),
+            unkeyed: Vec::new(),
+            checks: rare.checks,
+            log_handle: self.log_handle,
+            stamp: self.stamp,
+            reads: rare.reads,
+            viewed: rare.viewed,
+            named_reads: hashbrown::HashTable::new(),
+            read_identities: rustc_hash::FxHashMap::default(),
+            seen_slots: hashbrown::HashTable::new(),
+            outputs: self.outputs,
+            moved: rare.moved,
+            staged: rare.staged,
+        }
+    }
+}
+
 impl Evaluation {
+    /// The evaluation as a task keeps it once it ended: the lookups
+    /// [`end_unfrozen`] took are empty.
+    pub(crate) fn into_ended(self) -> EndedEvaluation {
+        let Self {
+            id,
+            log,
+            read,
+            checks,
+            log_handle,
+            stamp,
+            reads,
+            viewed,
+            outputs,
+            moved,
+            staged,
+            ..
+        } = self;
+        let rare = (!checks.is_empty()
+            || !reads.is_empty()
+            || !viewed.is_empty()
+            || !moved.is_empty()
+            || !staged.is_empty())
+        .then(|| {
+            Box::new(RareResults {
+                checks,
+                reads,
+                viewed,
+                moved,
+                staged,
+            })
+        });
+        EndedEvaluation {
+            id,
+            log,
+            read,
+            log_handle,
+            stamp,
+            outputs,
+            rare,
+        }
+    }
+
     /// The keys the evaluation wrote, once per write.
     pub fn outputs(&self) -> impl Iterator<Item = &HashedKey> {
         self.outputs.iter()

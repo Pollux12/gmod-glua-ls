@@ -8,8 +8,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::graph::Freshness;
 use super::super::{
-    self as derivation, DerivationId, Evaluation, FactKey, Fingerprint, HashedKey, KeyIdx,
-    KeyTable, Provenance, ReaderGraph,
+    self as derivation, DerivationId, EndedEvaluation, Evaluation, FactKey, Fingerprint, HashedKey,
+    KeyIdx, KeyTable, Provenance, ReaderGraph,
 };
 use super::WorkerKeys;
 
@@ -91,7 +91,7 @@ pub(in super::super) struct WorkerContext {
 /// snapshot had no answer for, and each found by its log's handle.
 #[derive(Default)]
 struct TaskLogs {
-    evaluations: Vec<(Evaluation, bool)>,
+    evaluations: Vec<(EndedEvaluation, bool)>,
     by_log: FxHashMap<usize, usize>,
 }
 
@@ -673,7 +673,8 @@ impl TaskRecorder {
             let at = task.evaluations.len();
             task.by_log
                 .insert(Arc::as_ptr(&evaluation.log_handle) as usize, at);
-            task.evaluations.push((evaluation, requires_canonical));
+            task.evaluations
+                .push((evaluation.into_ended(), requires_canonical));
             at
         })
         .expect("the task recorder is installed")
@@ -681,7 +682,11 @@ impl TaskRecorder {
 
     /// Runs `f` on the evaluation the task ended at `at` and whether it read
     /// a query the snapshot had no answer for.
-    pub(crate) fn with_ended<T>(&self, at: usize, f: impl FnOnce(&Evaluation, bool) -> T) -> T {
+    pub(crate) fn with_ended<T>(
+        &self,
+        at: usize,
+        f: impl FnOnce(&EndedEvaluation, bool) -> T,
+    ) -> T {
         with_keys(|worker| {
             let (evaluation, requires_canonical) = &worker
                 .task
@@ -781,7 +786,7 @@ impl Drop for TaskRecorder {
 /// entries their logs name, and every key it wrote.
 pub(crate) struct TaskRecording {
     keys: WorkerKeys,
-    evaluations: Vec<(Evaluation, bool)>,
+    evaluations: Vec<(EndedEvaluation, bool)>,
     written: Vec<HashedKey>,
     stamp: u64,
 }
@@ -824,7 +829,8 @@ impl TaskRecording {
         Some(
             self.evaluations
                 .into_par_iter()
-                .map(|(mut evaluation, requires_canonical)| {
+                .map(|(ended, requires_canonical)| {
+                    let mut evaluation = ended.into_evaluation();
                     super::remap(&mut evaluation, &slots);
                     evaluation.log_handle.freeze(&evaluation.log);
                     (evaluation, requires_canonical)
