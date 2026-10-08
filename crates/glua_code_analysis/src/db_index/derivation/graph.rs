@@ -18,8 +18,35 @@ type DerivIdx = u32;
 /// the key ([`Readers`]).
 #[derive(Debug, Clone, Default)]
 struct Record {
-    reads: Box<[KeyIdx]>,
-    outputs: Box<[KeyIdx]>,
+    /// The reads, then the outputs.
+    keys: Box<[KeyIdx]>,
+    reads: u32,
+}
+
+impl Record {
+    fn new(reads: impl ExactSizeIterator<Item = KeyIdx>, outputs: &[KeyIdx]) -> Self {
+        let read_count = u32::try_from(reads.len()).expect("fewer than 2^32 reads");
+        let mut keys = Vec::with_capacity(reads.len() + outputs.len());
+        keys.extend(reads);
+        keys.extend_from_slice(outputs);
+        Self {
+            keys: keys.into_boxed_slice(),
+            reads: read_count,
+        }
+    }
+
+    fn reads(&self) -> &[KeyIdx] {
+        &self.keys[..self.reads as usize]
+    }
+
+    fn outputs(&self) -> &[KeyIdx] {
+        &self.keys[self.reads as usize..]
+    }
+
+    /// This record with `reads` in place of its reads.
+    fn with_reads(&self, reads: &[KeyIdx]) -> Self {
+        Self::new(reads.iter().copied(), self.outputs())
+    }
 }
 
 /// The files whose positions `key` names, which an edit of one of them
@@ -65,9 +92,9 @@ fn build_positional(keys: &Paged<KeySlot>) -> FxHashMap<FileId, FxHashSet<KeyIdx
 struct KeySlot {
     key: Option<HashedKey>,
     readers: Readers,
-    /// The key's first producer ([`NO_PRODUCER`]: none); the rest are in
-    /// [`KeyTable::more_producers`].
-    producer: DerivIdx,
+    /// The key's first producer ([`NO_PRODUCER`]: none) in the bits under
+    /// [`MORE_PRODUCERS`], [`WINDOWED`] and [`HELD`].
+    marks: u32,
     /// The key's fingerprint as last taken, and the generation it was taken in
     /// ([`NO_GENERATION`]: none); see [`ReaderGraph::current_fingerprint`].
     current: AtomicU64,
@@ -76,15 +103,38 @@ struct KeySlot {
     stamp: u64,
     /// The stamp current when the key was last written.
     written: u64,
-    /// Whether an evaluation took the value away to compute it again; see
-    /// [`KeyTable::open_window`].
-    windowed: bool,
-    /// Whether a loop the engine cleared took the value away until it settles
-    /// again; see [`KeyTable::hold_window`].
-    held: bool,
-    /// Whether [`KeyTable::more_producers`] holds producers of the key.
-    more_producers: bool,
-    is_query: bool,
+}
+
+impl KeySlot {
+    fn producer(&self) -> DerivIdx {
+        self.marks & NO_PRODUCER
+    }
+
+    fn set_producer(&mut self, deriv: DerivIdx) {
+        self.marks = (self.marks & !NO_PRODUCER) | deriv;
+    }
+
+    fn marked(&self, mark: u32) -> bool {
+        (self.marks & mark) != 0
+    }
+
+    fn set_mark(&mut self, mark: u32, on: bool) {
+        if on {
+            self.marks |= mark;
+        } else {
+            self.marks &= !mark;
+        }
+    }
+
+    /// Whether the key is a query's output.
+    fn is_query(&self) -> bool {
+        self.key.as_ref().is_some_and(|key| {
+            matches!(
+                key.key(),
+                FactKey::ReceiverAuthority(_) | FactKey::CallbackParams(_)
+            )
+        })
+    }
 }
 
 impl Clone for KeySlot {
@@ -93,15 +143,11 @@ impl Clone for KeySlot {
         Self {
             key: self.key.clone(),
             readers: self.readers.clone(),
-            producer: self.producer,
+            marks: self.marks,
             current: AtomicU64::new(self.current.load(Ordering::Relaxed)),
             current_generation: AtomicU32::new(generation),
             stamp: self.stamp,
             written: self.written,
-            windowed: self.windowed,
-            held: self.held,
-            more_producers: self.more_producers,
-            is_query: self.is_query,
         }
     }
 }
@@ -111,21 +157,26 @@ impl Default for KeySlot {
         Self {
             key: None,
             readers: Readers::default(),
-            producer: NO_PRODUCER,
+            marks: NO_PRODUCER,
             current: AtomicU64::new(0),
             current_generation: AtomicU32::new(NO_GENERATION),
             stamp: 0,
             written: 0,
-            windowed: false,
-            held: false,
-            more_producers: false,
-            is_query: false,
         }
     }
 }
 
 const NO_GENERATION: u32 = u32::MAX;
-const NO_PRODUCER: DerivIdx = DerivIdx::MAX;
+const NO_PRODUCER: DerivIdx = (1 << 29) - 1;
+/// The mark of a key whose producers past the first are in
+/// [`KeyTable::more_producers`].
+const MORE_PRODUCERS: u32 = 1 << 29;
+/// The mark of a key an evaluation took away to compute again; see
+/// [`KeyTable::open_window`].
+const WINDOWED: u32 = 1 << 30;
+/// The mark of a key a loop the engine cleared took away until it settles
+/// again; see [`KeyTable::hold_window`].
+const HELD: u32 = 1 << 31;
 
 #[cfg(test)]
 mod query_presence_tests {
@@ -135,7 +186,7 @@ mod query_presence_tests {
 
     #[test]
     fn parallel_transport_query_slot_width_clone_and_recycle() {
-        assert_eq!(std::mem::size_of::<KeySlot>(), 128);
+        assert_eq!(std::mem::size_of::<KeySlot>(), 120);
         let mut graph = ReaderGraph::default();
         let query = HashedKey::new(FactKey::CallbackParams(LuaSignatureId::new(
             FileId::new(1),
@@ -211,6 +262,7 @@ impl Readers {
             }
             Self::Group(group, derivs) if *group == seen => {
                 if let Err(at) = derivs.binary_search(&deriv) {
+                    reserve_readers(derivs, 1);
                     derivs.insert(at, deriv);
                 }
             }
@@ -218,6 +270,7 @@ impl Readers {
                 for (group, derivs) in groups.iter_mut() {
                     if *group == seen {
                         if let Err(at) = derivs.binary_search(&deriv) {
+                            reserve_readers(derivs, 1);
                             derivs.insert(at, deriv);
                         }
                     } else {
@@ -503,6 +556,14 @@ fn renamed_reads(reads: &[KeyIdx], moves: &[(KeyIdx, KeyIdx)]) -> Box<[KeyIdx]> 
     merged.into_boxed_slice()
 }
 
+/// Makes room in `derivs` for `more` readers, growing it by half at least:
+/// the spare room a doubling leaves is kept across millions of keys.
+fn reserve_readers(derivs: &mut Vec<DerivIdx>, more: usize) {
+    if derivs.capacity() - derivs.len() < more {
+        derivs.reserve_exact(more.max(derivs.len() / 2).max(4));
+    }
+}
+
 /// Removes `deriv` from the sorted `derivs`, if there.
 fn take_from(derivs: &mut Vec<DerivIdx>, deriv: DerivIdx) {
     if let Ok(index) = derivs.binary_search(&deriv) {
@@ -531,6 +592,7 @@ fn remove_sorted(derivs: &mut Vec<DerivIdx>, gone: &[DerivIdx]) {
 /// Inserts the sorted `new`, none of them in it, into the sorted `derivs`,
 /// moving each existing run once.
 fn insert_sorted(derivs: &mut Vec<DerivIdx>, new: &[DerivIdx]) {
+    reserve_readers(derivs, new.len());
     let mut read_end = derivs.len();
     derivs.resize(read_end + new.len(), 0);
     let mut write_end = derivs.len();
@@ -542,6 +604,12 @@ fn insert_sorted(derivs: &mut Vec<DerivIdx>, new: &[DerivIdx]) {
         derivs[write_end] = *deriv;
         read_end = at;
     }
+}
+
+/// The hash [`ReaderGraph::deriv_slots`] files `id` under.
+fn deriv_hash(id: &DerivationId) -> u64 {
+    use std::hash::BuildHasher;
+    rustc_hash::FxBuildHasher.hash_one(id)
 }
 
 #[derive(Debug, Clone)]
@@ -798,10 +866,6 @@ impl KeyTable {
         let base = key.base();
         let half = FiledKey::half(&key);
         let entry = &mut self.keys[slot as usize];
-        entry.is_query = matches!(
-            key.key(),
-            FactKey::ReceiverAuthority(_) | FactKey::CallbackParams(_)
-        );
         if let Some(positional) = &mut self.positional {
             for file_id in positional_files(&key) {
                 positional.entry(file_id).or_default().insert(slot);
@@ -834,7 +898,7 @@ impl KeyTable {
     }
 
     pub(super) fn is_query(&self, slot: KeyIdx) -> bool {
-        self.keys[slot as usize].is_query
+        self.keys[slot as usize].is_query()
     }
 
     pub(super) fn intern_read(&mut self, key: HashedKey, now: u64) -> KeyIdx {
@@ -868,11 +932,11 @@ impl KeyTable {
             let entry = &mut self.keys[slot as usize];
             if windowed {
                 self.windows.entry(slot).or_insert(entry.written);
-                entry.windowed = true;
+                entry.set_mark(WINDOWED, true);
             }
             if held {
                 self.held.entry(slot).or_insert(entry.written);
-                entry.held = true;
+                entry.set_mark(HELD, true);
             }
             let Some(base) = self.key(base_slot).base() else {
                 return slot;
@@ -945,7 +1009,7 @@ impl KeyTable {
             let entry = &mut self.keys[*slot as usize];
             self.windows.entry(*slot).or_insert(entry.written);
             entry.written = now;
-            entry.windowed = true;
+            entry.set_mark(WINDOWED, true);
         }
     }
 
@@ -955,7 +1019,7 @@ impl KeyTable {
         let windows = std::mem::take(&mut self.windows);
         for (slot, before) in &windows {
             let entry = &mut self.keys[*slot as usize];
-            entry.windowed = false;
+            entry.set_mark(WINDOWED, false);
             let Some(key) = entry.key.as_ref() else {
                 continue;
             };
@@ -985,7 +1049,7 @@ impl KeyTable {
             let entry = &mut self.keys[*slot as usize];
             self.held.entry(*slot).or_insert(entry.written);
             entry.written = now;
-            entry.held = true;
+            entry.set_mark(HELD, true);
         }
     }
 
@@ -995,7 +1059,7 @@ impl KeyTable {
         let held = std::mem::take(&mut self.held);
         for (slot, before) in &held {
             let entry = &mut self.keys[*slot as usize];
-            entry.held = false;
+            entry.set_mark(HELD, false);
             let Some(key) = entry.key.as_ref() else {
                 continue;
             };
@@ -1023,7 +1087,7 @@ impl KeyTable {
     fn unreferenced_after(&self, slot: KeyIdx, freed_from: &FxHashMap<KeyIdx, usize>) -> bool {
         let entry = &self.keys[slot as usize];
         entry.readers.is_empty()
-            && entry.producer == NO_PRODUCER
+            && entry.producer() == NO_PRODUCER
             && self
                 .derived
                 .get(&slot)
@@ -1048,19 +1112,19 @@ impl KeyTable {
 
     fn add_producer(&mut self, slot: KeyIdx, deriv: DerivIdx) {
         let entry = &mut self.keys[slot as usize];
-        if entry.producer == NO_PRODUCER {
-            entry.producer = deriv;
+        if entry.producer() == NO_PRODUCER {
+            entry.set_producer(deriv);
         } else {
-            entry.more_producers = true;
+            entry.set_mark(MORE_PRODUCERS, true);
             self.more_producers.entry(slot).or_default().push(deriv);
         }
     }
 
     fn remove_producer(&mut self, slot: KeyIdx, deriv: DerivIdx) {
         let entry = &mut self.keys[slot as usize];
-        if !entry.more_producers {
-            if entry.producer == deriv {
-                entry.producer = NO_PRODUCER;
+        if !entry.marked(MORE_PRODUCERS) {
+            if entry.producer() == deriv {
+                entry.set_producer(NO_PRODUCER);
             }
             return;
         }
@@ -1068,13 +1132,13 @@ impl KeyTable {
             .more_producers
             .get_mut(&slot)
             .expect("a slot marked with more producers has them");
-        if entry.producer == deriv {
-            entry.producer = more.pop().expect("more producers are never empty");
+        if entry.producer() == deriv {
+            entry.set_producer(more.pop().expect("more producers are never empty"));
         } else if let Some(at) = more.iter().position(|producer| *producer == deriv) {
             more.swap_remove(at);
         }
         if more.is_empty() {
-            entry.more_producers = false;
+            entry.set_mark(MORE_PRODUCERS, false);
             self.more_producers.remove(&slot);
         }
     }
@@ -1082,11 +1146,11 @@ impl KeyTable {
     fn producers(&self, slot: KeyIdx) -> impl Iterator<Item = DerivIdx> + '_ {
         let entry = &self.keys[slot as usize];
         let more = entry
-            .more_producers
+            .marked(MORE_PRODUCERS)
             .then(|| self.more_producers.get(&slot))
             .flatten();
-        (entry.producer != NO_PRODUCER)
-            .then_some(entry.producer)
+        (entry.producer() != NO_PRODUCER)
+            .then_some(entry.producer())
             .into_iter()
             .chain(more.into_iter().flatten().copied())
     }
@@ -1100,11 +1164,11 @@ impl KeyTable {
 
     /// Whether `slot`'s value is being computed again.
     pub(super) fn windowed(&self, slot: KeyIdx) -> bool {
-        self.keys[slot as usize].windowed
+        self.keys[slot as usize].marked(WINDOWED)
     }
 
     pub(super) fn held(&self, slot: KeyIdx) -> bool {
-        self.keys[slot as usize].held
+        self.keys[slot as usize].marked(HELD)
     }
 
     /// Whether a read of `slot` sees a value only the evaluation reading it
@@ -1112,7 +1176,7 @@ impl KeyTable {
     /// until it settles.
     pub(super) fn taints(&self, slot: KeyIdx) -> bool {
         let entry = &self.keys[slot as usize];
-        entry.windowed || entry.held
+        entry.marked(WINDOWED | HELD)
     }
 
     /// Whether a slot was written or released after stamp `stamp`.
@@ -1155,7 +1219,7 @@ impl KeyTable {
         evaluation: u64,
     ) -> (Option<bool>, bool) {
         let entry = &mut self.keys[slot as usize];
-        let is_query = entry.is_query;
+        let is_query = entry.is_query();
         if entry.stamp >= frame {
             return (None, is_query);
         }
@@ -1182,8 +1246,10 @@ pub struct AppliedEdits {
 #[derive(Debug, Clone, Default)]
 pub struct ReaderGraph {
     table: KeyTable,
-    deriv_slots: FxHashMap<DerivationId, DerivIdx>,
-    derivations: Vec<DerivSlot>,
+    /// Each derivation's slot, found by its id's hash: the id itself is kept
+    /// only in its slot.
+    deriv_slots: HashTable<DerivIdx>,
+    derivations: Paged<DerivSlot>,
     free_derivations: Vec<DerivIdx>,
     by_file: FxHashMap<FileId, FxHashSet<DerivIdx>>,
     /// Derivations that produced a key owned by another file, by that file.
@@ -1238,15 +1304,16 @@ impl ReaderGraph {
             .iter()
             .filter_map(|slot| slot.record.as_ref())
             .fold((0, 0), |(reads, outputs), record| {
-                (reads + record.reads.len(), outputs + record.outputs.len())
+                (
+                    reads + record.reads().len(),
+                    outputs + record.outputs().len(),
+                )
             });
         let key_map = hash_table_bytes(table.key_slots.capacity(), size_of::<FiledKey>());
         let key_slots = table.keys.capacity() * size_of::<KeySlot>();
         let records = (reads + outputs) * size_of::<KeyIdx>();
-        let derivation_maps = hash_table_bytes(
-            self.deriv_slots.capacity(),
-            size_of::<DerivationId>() + size_of::<DerivIdx>(),
-        ) + self.derivations.capacity() * size_of::<DerivSlot>();
+        let derivation_maps = hash_table_bytes(self.deriv_slots.capacity(), size_of::<DerivIdx>())
+            + self.derivations.capacity() * size_of::<DerivSlot>();
         let total = key_map
             + key_slots
             + group_bytes
@@ -1428,10 +1495,10 @@ impl ReaderGraph {
     /// Every derivation with a record, sorted.
     pub(crate) fn recorded_derivations(&self) -> Vec<DerivationId> {
         let mut ids = self
-            .deriv_slots
+            .derivations
             .iter()
-            .filter(|(_, deriv)| self.derivations[**deriv as usize].record.is_some())
-            .map(|(id, _)| *id)
+            .filter(|slot| slot.record.is_some())
+            .map(|slot| slot.id)
             .collect::<Vec<_>>();
         ids.sort_unstable();
         ids
@@ -1636,7 +1703,7 @@ impl ReaderGraph {
         if distinct {
             let known = records
                 .par_iter()
-                .map(|record| self.deriv_slots.get(&record.id).copied())
+                .map(|record| self.deriv_slot(&record.id))
                 .collect::<Vec<_>>();
             let prepared = records
                 .into_iter()
@@ -1766,7 +1833,7 @@ impl ReaderGraph {
                 self.derivations[*deriv as usize]
                     .record
                     .iter()
-                    .flat_map(|record| record.reads.iter())
+                    .flat_map(|record| record.reads().iter())
                     .map(|key| (*key, *deriv))
             })
             .collect::<Vec<_>>();
@@ -1840,7 +1907,7 @@ impl ReaderGraph {
     ) {
         let slots = ids
             .filter_map(|id| self.record(id))
-            .flat_map(|(_, record)| record.reads.iter().copied())
+            .flat_map(|(_, record)| record.reads().iter().copied())
             .collect();
         self.warm_slots(slots, fingerprint);
     }
@@ -1871,7 +1938,7 @@ impl ReaderGraph {
         let Some((deriv, record)) = self.record(id) else {
             return true;
         };
-        record.reads.iter().any(|slot| {
+        record.reads().iter().any(|slot| {
             let seen = self.seen(*slot, deriv);
             seen != self.slot_fingerprint(*slot, &fingerprint)
                 && !holds_moved(self.key(*slot), seen)
@@ -1883,7 +1950,7 @@ impl ReaderGraph {
         self.record(id)
             .map(|(deriv, record)| {
                 record
-                    .reads
+                    .reads()
                     .iter()
                     .map(|slot| (*slot, self.seen(*slot, deriv)))
                     .collect()
@@ -1895,7 +1962,7 @@ impl ReaderGraph {
     pub fn reads_of(&self, id: DerivationId) -> impl Iterator<Item = &HashedKey> + '_ {
         self.record(id)
             .into_iter()
-            .flat_map(|(_, record)| record.reads.iter())
+            .flat_map(|(_, record)| record.reads().iter())
             .map(|key| self.key(*key))
     }
 
@@ -1910,7 +1977,7 @@ impl ReaderGraph {
             return Vec::new();
         };
         record
-            .reads
+            .reads()
             .iter()
             .zip(fingerprints)
             .filter(|(slot, fingerprint)| {
@@ -1926,7 +1993,7 @@ impl ReaderGraph {
 
     /// Records that `id` saw each fingerprint of `moved` of its slot.
     pub fn set_fingerprints(&mut self, id: DerivationId, moved: Vec<(KeyIdx, Fingerprint)>) {
-        let Some(deriv) = self.deriv_slots.get(&id).copied() else {
+        let Some(deriv) = self.deriv_slot(&id) else {
             return;
         };
         for (slot, fingerprint) in moved {
@@ -2039,7 +2106,7 @@ impl ReaderGraph {
                         .iter()
                         .map(|&(_, source, target)| (source, target))
                         .collect::<Vec<_>>();
-                    Some((deriv, renamed_reads(&record.reads, &shifts)))
+                    Some((deriv, renamed_reads(record.reads(), &shifts)))
                 })
                 .collect::<Vec<_>>();
             (moves.len(), rewritten)
@@ -2053,7 +2120,7 @@ impl ReaderGraph {
         });
         for (deriv, reads) in rewritten {
             if let Some(record) = self.derivations[deriv as usize].record.as_mut() {
-                record.reads = reads;
+                *record = record.with_reads(&reads);
             }
         }
         let moved = targets.len();
@@ -2139,7 +2206,7 @@ impl ReaderGraph {
             let Some(record) = self.derivations[deriv as usize].record.as_ref() else {
                 continue;
             };
-            for output in record.outputs.iter() {
+            for output in record.outputs().iter() {
                 self.mark_readers(*output, marked, &mut pending, follows);
             }
         }
@@ -2200,7 +2267,7 @@ impl ReaderGraph {
         let count = self.derivations.len();
         let roots = roots
             .into_iter()
-            .filter_map(|root| self.deriv_slots.get(&root).copied())
+            .filter_map(|root| self.deriv_slot(&root))
             .collect::<Vec<_>>();
         // A loop through a root, and whatever lies between two such loops,
         // is downstream of a root: the search keeps to what is.
@@ -2217,7 +2284,7 @@ impl ReaderGraph {
             let Some(record) = self.derivations[deriv as usize].record.as_ref() else {
                 return producers;
             };
-            for slot in record.reads.iter() {
+            for slot in record.reads().iter() {
                 let base_slot = &mut base_slots[*slot as usize];
                 if *base_slot == UNSEEN {
                     *base_slot = self
@@ -2370,7 +2437,7 @@ impl ReaderGraph {
             let node = u32::try_from(derivs_of.len()).expect("fewer than 2^32 loops");
             let members = lp
                 .iter()
-                .filter_map(|id| self.deriv_slots.get(id).copied())
+                .filter_map(|id| self.deriv_slot(id))
                 .collect::<Vec<_>>();
             for member in &members {
                 node_of.insert(*member, node);
@@ -2382,7 +2449,7 @@ impl ReaderGraph {
             let Some(record) = self.derivations[deriv as usize].record.as_ref() else {
                 continue;
             };
-            for output in record.outputs.iter().filter(|slot| moved.contains(*slot)) {
+            for output in record.outputs().iter().filter(|slot| moved.contains(*slot)) {
                 for slot in std::iter::once(output).chain(self.table.derived_slots(*output)) {
                     for (_, reader) in self.table.keys[*slot as usize].readers.iter() {
                         if node_of.contains_key(&reader)
@@ -2404,7 +2471,7 @@ impl ReaderGraph {
                 let Some(record) = self.derivations[*deriv as usize].record.as_ref() else {
                     continue;
                 };
-                for slot in record.reads.iter().filter(|slot| moved.contains(*slot)) {
+                for slot in record.reads().iter().filter(|slot| moved.contains(*slot)) {
                     let base = self
                         .table
                         .key(*slot)
@@ -2527,7 +2594,7 @@ impl ReaderGraph {
     pub fn outputs_of(&self, id: DerivationId) -> impl Iterator<Item = &HashedKey> + '_ {
         self.record(id)
             .into_iter()
-            .flat_map(|(_, record)| record.outputs.iter())
+            .flat_map(|(_, record)| record.outputs().iter())
             .map(|key| self.key(*key))
     }
 
@@ -2569,7 +2636,7 @@ impl ReaderGraph {
     }
 
     fn record(&self, id: DerivationId) -> Option<(DerivIdx, &Record)> {
-        let deriv = *self.deriv_slots.get(&id)?;
+        let deriv = self.deriv_slot(&id)?;
         Some((deriv, self.derivations[deriv as usize].record.as_ref()?))
     }
 
@@ -2673,7 +2740,7 @@ impl ReaderGraph {
             return;
         };
         entry.written = u64::MAX;
-        entry.held = false;
+        entry.set_mark(HELD, false);
         self.table.held.remove(&slot);
         self.table.last_written = super::new_stamp();
         self.table.unfile(&key, slot);
@@ -2695,9 +2762,18 @@ impl ReaderGraph {
         }
     }
 
+    /// The slot `id` is interned to.
+    fn deriv_slot(&self, id: &DerivationId) -> Option<DerivIdx> {
+        self.deriv_slots
+            .find(deriv_hash(id), |deriv| {
+                self.derivations[*deriv as usize].id == *id
+            })
+            .copied()
+    }
+
     fn intern_derivation(&mut self, id: DerivationId) -> DerivIdx {
-        if let Some(slot) = self.deriv_slots.get(&id) {
-            return *slot;
+        if let Some(slot) = self.deriv_slot(&id) {
+            return slot;
         }
         self.new_derivation(id)
     }
@@ -2710,12 +2786,16 @@ impl ReaderGraph {
                 self.derivations[slot as usize] = entry;
                 slot
             }
-            None => {
-                self.derivations.push(entry);
-                DerivIdx::try_from(self.derivations.len() - 1).expect("fewer than 2^32 derivations")
-            }
+            None => DerivIdx::try_from(self.derivations.push(entry))
+                .ok()
+                .filter(|slot| *slot < NO_PRODUCER)
+                .expect("fewer than 2^29 derivations"),
         };
-        self.deriv_slots.insert(id, slot);
+        let derivations = &self.derivations;
+        self.deriv_slots
+            .insert_unique(deriv_hash(&id), slot, |deriv| {
+                deriv_hash(&derivations[*deriv as usize].id)
+            });
         slot
     }
 
@@ -2746,14 +2826,14 @@ impl ReaderGraph {
             .record
             .take()
             .unwrap_or_default();
-        for key in record.reads.iter() {
+        for key in record.reads().iter() {
             if let Some(readers) = still_read.get_mut(key) {
                 *readers -= 1;
             }
             self.release_slots([*key], still_read);
         }
         let outputs = record
-            .outputs
+            .outputs()
             .iter()
             .map(|key| {
                 let fact = self.key(*key).clone();
@@ -2768,7 +2848,12 @@ impl ReaderGraph {
                 self.by_file.remove(&id.file_id);
             }
         }
-        self.deriv_slots.remove(&id);
+        if let Ok(entry) = self
+            .deriv_slots
+            .find_entry(deriv_hash(&id), |slot| *slot == deriv)
+        {
+            entry.remove();
+        }
         self.free_derivations.push(deriv);
         outputs
     }
@@ -2816,7 +2901,7 @@ impl PreparedRecord {
         let mut ops = Vec::new();
         let mut unread = Vec::new();
         let (mut old_reads, mut new_reads) = (
-            old.reads.iter().copied().peekable(),
+            old.reads().iter().copied().peekable(),
             reads.iter().copied().peekable(),
         );
         loop {
@@ -2846,17 +2931,14 @@ impl PreparedRecord {
         let mut dropped = Vec::new();
         let mut added = Vec::new();
         merge_sorted(
-            old.outputs.iter().copied(),
+            old.outputs().iter().copied(),
             outputs.iter().copied(),
             |key| dropped.push(key),
             |key| added.push(key),
         );
         let unchanged =
             filed && ops.is_empty() && unread.is_empty() && added.is_empty() && dropped.is_empty();
-        let record = (!unchanged).then(|| Record {
-            reads: reads.iter().map(|(key, _)| *key).collect(),
-            outputs: outputs.into_boxed_slice(),
-        });
+        let record = (!unchanged).then(|| Record::new(reads.iter().map(|(key, _)| *key), &outputs));
         DiffedRecord {
             id,
             deriv,
@@ -3534,7 +3616,7 @@ mod tests {
                 .record
                 .as_ref()
                 .expect("the record is filed")
-                .reads
+                .reads()
                 .as_ptr()
         };
         let filed = reads_filed(&twice);
@@ -3708,7 +3790,7 @@ mod tests {
                 format!(
                     "{:?} {:?}",
                     slot.id,
-                    slot.record.as_ref().map(|record| &record.reads)
+                    slot.record.as_ref().map(Record::reads)
                 )
             })
             .collect::<Vec<_>>();
@@ -3796,13 +3878,13 @@ mod tests {
         for (deriv, rewrite) in rewrites {
             if let Some(record) = graph.derivations[deriv as usize].record.as_mut() {
                 let mut reads = record
-                    .reads
+                    .reads()
                     .iter()
                     .map(|key| rewrite.get(key).copied().unwrap_or(*key))
                     .collect::<Vec<_>>();
                 reads.sort_unstable();
                 reads.dedup();
-                record.reads = reads.into_boxed_slice();
+                *record = record.with_reads(&reads);
             }
         }
         for (slot, _) in &renames {
