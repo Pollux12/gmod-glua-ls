@@ -6,6 +6,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use glua_parser::{LuaAstNode, LuaClosureExpr, LuaDocFuncType};
 use rowan::TextSize;
+use smol_str::SmolStr;
 
 use crate::db_index::signature::async_state::AsyncState;
 use crate::{DbIndex, LuaAttributeUse, SemanticModel, VariadicType, first_param_may_not_self};
@@ -25,7 +26,7 @@ pub struct LuaSignature {
     pub overloads: Vec<Arc<LuaFunctionType>>,
     pub param_docs: HashMap<usize, LuaDocParamInfo>,
     pub out_params: Vec<LuaOutParamInfo>,
-    pub params: Vec<String>,
+    pub params: Vec<SmolStr>,
     pub return_docs: Vec<LuaDocReturnInfo>,
     pub resolve_return: SignatureReturnStatus,
     pub is_colon_define: bool,
@@ -375,9 +376,9 @@ impl LuaSignature {
         let mut type_params = Vec::new();
         for (idx, param_name) in self.params.iter().enumerate() {
             if let Some(param_info) = self.param_docs.get(&idx) {
-                type_params.push((param_name.clone(), Some(param_info.type_ref.clone())));
+                type_params.push((param_name.to_string(), Some(param_info.type_ref.clone())));
             } else {
-                type_params.push((param_name.clone(), None));
+                type_params.push((param_name.to_string(), None));
             }
         }
 
@@ -406,11 +407,11 @@ impl LuaSignature {
 
     pub fn get_param_name_by_id(&self, idx: usize) -> Option<String> {
         if idx < self.params.len() {
-            return Some(self.params[idx].clone());
+            return Some(self.params[idx].to_string());
         } else if let Some(name) = self.params.last()
             && name == "..."
         {
-            return Some(name.clone());
+            return Some(name.to_string());
         }
 
         None
@@ -953,7 +954,7 @@ mod tests {
     #[test]
     fn call_arg_roles_for_param_keeps_multiple_attributes() {
         let mut signature = LuaSignature::new();
-        signature.params.push("name".to_string());
+        signature.params.push("name".into());
         signature.param_docs.insert(
             0,
             LuaDocParamInfo {
@@ -985,7 +986,7 @@ mod tests {
     #[test]
     fn call_arg_roles_for_param_keeps_field_path_attributes() {
         let mut signature = LuaSignature::new();
-        signature.params.push("panel".to_string());
+        signature.params.push("panel".into());
         signature.param_docs.insert(
             0,
             LuaDocParamInfo {

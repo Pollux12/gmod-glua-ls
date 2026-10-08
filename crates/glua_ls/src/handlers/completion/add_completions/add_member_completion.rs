@@ -529,9 +529,13 @@ fn get_resolve_function_params_str(
             .iter()
             .map(|param| param.0.clone())
             .collect::<Vec<_>>(),
-        LuaType::Signature(signature_id) => {
-            db.get_signature_index().get(signature_id)?.params.clone()
-        }
+        LuaType::Signature(signature_id) => db
+            .get_signature_index()
+            .get(signature_id)?
+            .params
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         _ => return None,
     };
 

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use glua_parser::{LuaSyntaxId, LuaVersionCondition};
 use rowan::{TextRange, TextSize};
 use rustc_hash::FxHashMap;
+use smol_str::SmolStr;
 
 use crate::{
     FileId, InFiled, LuaMemberId, LuaSemanticDeclId, LuaSignatureId, LuaTypeOwner, WorkspaceId,
@@ -46,7 +47,7 @@ pub(super) enum DeclOp {
     Signature {
         id: LuaSignatureId,
         is_colon_define: bool,
-        params: Vec<String>,
+        params: Vec<SmolStr>,
         is_vararg: Option<bool>,
     },
     BindLocalFuncDecl {

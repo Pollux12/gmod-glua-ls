@@ -897,7 +897,7 @@ mod tests {
 
     fn signature_with_param_roles(param_name: &str, roles: Vec<LuaAttributeUse>) -> LuaSignature {
         let mut signature = LuaSignature::new();
-        signature.params.push(param_name.to_string());
+        signature.params.push(param_name.into());
         signature.param_docs.insert(
             0,
             LuaDocParamInfo {

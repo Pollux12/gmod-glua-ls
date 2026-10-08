@@ -324,12 +324,12 @@ fn export_signature(
             .enumerate()
             .map(|(i, name)| match signature.param_docs.get(&i) {
                 Some(param_info) => FnParam {
-                    name: Some(name.clone()),
+                    name: Some(name.to_string()),
                     typ: Some(render_typ(db, &param_info.type_ref, RenderLevel::Simple)),
                     desc: param_info.description.clone(),
                 },
                 None => FnParam {
-                    name: Some(name.clone()),
+                    name: Some(name.to_string()),
                     ..Default::default()
                 },
             })

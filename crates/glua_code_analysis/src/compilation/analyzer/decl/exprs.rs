@@ -3,6 +3,7 @@ use glua_parser::{
     LuaDocTagCast, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLiteralExpr,
     LuaLiteralToken, LuaNameExpr, LuaTableExpr, LuaVarExpr, NumberResult,
 };
+use smol_str::SmolStr;
 
 use crate::{
     EmmyrcLuaVersion, FileId, InFiled, LegacyModuleEnv, LuaDeclExtra, LuaDeclId, LuaMemberFeature,
@@ -273,9 +274,9 @@ fn closure_params(closure: &LuaClosureExpr, signature: &mut DeclOp) -> Option<()
         }
 
         let name = if let Some(name_token) = param.get_name_token() {
-            name_token.get_name_text().to_string()
+            SmolStr::new(name_token.get_name_text())
         } else if param.is_dots() {
-            "...".to_string()
+            SmolStr::new_static("...")
         } else {
             return None;
         };

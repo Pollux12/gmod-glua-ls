@@ -4,6 +4,7 @@ use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexMemberExpr, LuaLiteralToken, LuaTableExpr, LuaVarExpr,
 };
 use rustc_hash::FxHashSet;
+use smol_str::SmolStr;
 
 use crate::{
     DbIndex, GlobalId, GmodHookKind, InferFailReason, InferGuard, InferGuardRef, LuaDocParamInfo,
@@ -106,7 +107,7 @@ pub fn try_resolve_call_closure_params(
         if signature.params.len() < params_to_insert.len() {
             let missing_start = signature.params.len();
             for (name, _) in params_to_insert.iter().skip(missing_start) {
-                signature.params.push(name.clone());
+                signature.params.push(SmolStr::new(name));
             }
         }
 
@@ -807,11 +808,14 @@ fn resolve_doc_function(
     let filled_from_slot_before = signature.params_filled_from_slot;
     signature.params_filled_from_slot |= !doc_params.is_empty();
     for (index, param) in doc_params.iter().enumerate() {
-        let name = signature.params.get(index).unwrap_or(&param.0);
+        let name = signature
+            .params
+            .get(index)
+            .map_or(param.0.as_str(), SmolStr::as_str);
         signature.param_docs.insert(
             index,
             LuaDocParamInfo {
-                name: name.clone(),
+                name: name.to_string(),
                 type_ref: param.1.clone().unwrap_or(LuaType::Any),
                 default_value: None,
                 description: None,
