@@ -288,9 +288,18 @@ impl Recipes {
 
     /// Each file's inference memo.
     pub(super) fn into_memos(self) -> FxHashMap<FileId, crate::LuaInferCache> {
-        self.caches
+        let memos = self
+            .caches
             .into_inner()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if crate::profile::profiling() {
+            let mut footprint = crate::semantic::MemoFootprint::default();
+            for cache in memos.values() {
+                footprint.add(cache);
+            }
+            footprint.report("memos of the run");
+        }
+        memos
     }
 }
 

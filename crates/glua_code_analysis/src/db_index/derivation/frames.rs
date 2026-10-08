@@ -415,6 +415,26 @@ impl Provenance {
         freshness
     }
 
+    /// Under `GLUALS_PROFILE`: its identity and bytes, and its log's.
+    pub(crate) fn footprint(&self) -> (usize, usize, usize, usize) {
+        let computed = std::mem::size_of::<Computed>()
+            + 16
+            + self
+                .0
+                .unkeyed
+                .as_ref()
+                .map_or(0, |unkeyed| unkeyed.len() * 8);
+        let log = std::mem::size_of::<LogHandle>()
+            + 16
+            + self.0.log.window.get().map_or(0, |window| window.len() * 4);
+        (
+            self.identity(),
+            computed,
+            Arc::as_ptr(&self.0.log) as usize,
+            log,
+        )
+    }
+
     pub(super) fn identity(&self) -> usize {
         Arc::as_ptr(&self.0) as usize
     }

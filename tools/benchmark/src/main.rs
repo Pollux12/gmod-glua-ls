@@ -33,6 +33,19 @@ mod alloc_stats {
     pub static BYTES: AtomicU64 = AtomicU64::new(0);
     pub static LIVE: AtomicUsize = AtomicUsize::new(0);
     pub static PEAK: AtomicUsize = AtomicUsize::new(0);
+    /// The highest live bytes since the profile last took it.
+    pub static PEAK_SINCE: AtomicUsize = AtomicUsize::new(0);
+
+    /// Lends the profile these counters for its memory checkpoints.
+    pub fn lend_to_profile() {
+        glua_code_analysis::profile::memory::set_alloc_counters(
+            glua_code_analysis::profile::memory::AllocCounters {
+                live: || LIVE.load(Relaxed),
+                take_peak: || PEAK_SINCE.swap(LIVE.load(Relaxed), Relaxed),
+                allocated: || (ALLOCS.load(Relaxed), BYTES.load(Relaxed)),
+            },
+        );
+    }
 
     pub struct Counting(pub super::MiMalloc);
 
@@ -42,6 +55,7 @@ mod alloc_stats {
             BYTES.fetch_add(layout.size() as u64, Relaxed);
             let live = LIVE.fetch_add(layout.size(), Relaxed) + layout.size();
             PEAK.fetch_max(live, Relaxed);
+            PEAK_SINCE.fetch_max(live, Relaxed);
             unsafe { self.0.alloc(layout) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -54,6 +68,7 @@ mod alloc_stats {
             LIVE.fetch_sub(layout.size(), Relaxed);
             let live = LIVE.fetch_add(new_size, Relaxed) + new_size;
             PEAK.fetch_max(live, Relaxed);
+            PEAK_SINCE.fetch_max(live, Relaxed);
             unsafe { self.0.realloc(ptr, layout, new_size) }
         }
     }
@@ -552,6 +567,8 @@ async fn run() {
     let _ = PROCESS_START.set(Instant::now());
     #[allow(unused_mut, unused_assignments, unused_variables)]
     let mut alloc_mark = (0u64, 0u64);
+    #[cfg(all(feature = "alloc-stats", not(feature = "dhat-heap")))]
+    alloc_stats::lend_to_profile();
     setup_logger();
 
     let large_codebase = std::env::var("BENCH_CODEBASE").unwrap_or_else(|_| {
@@ -753,6 +770,26 @@ async fn run() {
     glua_code_analysis::profile::work::report("index");
     glua_code_analysis::profile::memory::checkpoint("after indexing");
     alloc_report!("indexing", alloc_mark);
+    // `BENCH_MEM_PARTS=1` (with `--features alloc-stats`) drops the indexed analysis
+    // part by part and prints the live bytes each part held, then exits.
+    #[cfg(all(feature = "alloc-stats", not(feature = "dhat-heap")))]
+    if std::env::var_os("BENCH_MEM_PARTS").is_some() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mib = |bytes: isize| bytes as f64 / (1 << 20) as f64;
+        let mut live = alloc_stats::LIVE.load(Relaxed) as isize;
+        eprintln!("[mem part] live before {:.1} MiB", mib(live));
+        analysis.compilation.drop_by_part(|part| {
+            let now = alloc_stats::LIVE.load(Relaxed) as isize;
+            eprintln!("[mem part] {part:<32} {:>9.1} MiB", mib(live - now));
+            live = now;
+        });
+        drop(analysis);
+        eprintln!(
+            "[mem part] live after everything {:.1} MiB",
+            mib(alloc_stats::LIVE.load(Relaxed) as isize)
+        );
+        std::process::exit(0);
+    }
     results.push(BenchmarkResult {
         phase: "indexing (total)".into(),
         duration: indexing_duration,

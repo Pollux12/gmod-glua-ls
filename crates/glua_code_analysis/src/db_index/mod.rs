@@ -179,6 +179,96 @@ impl Default for DbIndex {
 }
 
 impl DbIndex {
+    /// Drops the index part by part, calling `dropped` with each part's name
+    /// once it is gone, for a census of what each part holds.
+    pub fn drop_by_part(&mut self, mut dropped: impl FnMut(&'static str)) {
+        let Self {
+            decl_index,
+            references_index,
+            types_index,
+            modules_index,
+            members_index,
+            property_index,
+            signature_index,
+            diagnostic_index,
+            operator_index,
+            flow_index,
+            call_target_index,
+            accessor_func_index,
+            accessor_func_call_index,
+            call_site_param_index,
+            gmod_class_index,
+            gmod_infer_index,
+            gmod_load_index,
+            gmod_network_index,
+            dynamic_field_index,
+            vfs,
+            file_dependencies_index,
+            numeric_range_population_index,
+            metatable_index,
+            global_index,
+            json_schema_index,
+            derivations,
+            gmod_call_roles,
+            call_role_fingerprints,
+            role_mentions,
+            emmyrc,
+            helper_scans,
+            load_scans,
+            net_sites,
+            net_helper_refs,
+            function_summaries,
+            queries,
+            ..
+        } = std::mem::take(self);
+        macro_rules! drop_parts {
+            ($($part:ident),*) => {
+                $(
+                    drop($part);
+                    dropped(stringify!($part));
+                )*
+            };
+        }
+        drop_parts!(
+            decl_index,
+            references_index,
+            types_index,
+            modules_index,
+            members_index,
+            property_index,
+            signature_index,
+            diagnostic_index,
+            operator_index,
+            flow_index,
+            call_target_index,
+            accessor_func_index,
+            accessor_func_call_index,
+            call_site_param_index,
+            gmod_class_index,
+            gmod_infer_index,
+            gmod_load_index,
+            gmod_network_index,
+            dynamic_field_index,
+            vfs,
+            file_dependencies_index,
+            numeric_range_population_index,
+            metatable_index,
+            global_index,
+            json_schema_index,
+            derivations,
+            gmod_call_roles,
+            call_role_fingerprints,
+            role_mentions,
+            emmyrc,
+            helper_scans,
+            load_scans,
+            net_sites,
+            net_helper_refs,
+            function_summaries,
+            queries
+        );
+    }
+
     pub fn new() -> Self {
         Self {
             type_structure_revision: next_type_structure_revision(),

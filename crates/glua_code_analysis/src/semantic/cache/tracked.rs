@@ -45,6 +45,13 @@ impl<K, V> Default for TrackedMap<K, V> {
     }
 }
 
+impl<K, V> TrackedMap<K, V> {
+    /// The shared and local tables, for measuring them.
+    pub(super) fn tables(&self) -> (&FxHashMap<K, (V, Provenance)>, &FxHashMap<K, V>) {
+        (&self.shared, &self.local)
+    }
+}
+
 impl<K: Hash + Eq + Clone, V> TrackedMap<K, V> {
     /// The value for `key` if it holds under `lookup` with the references
     /// `keyed` walking from a keyed origin, recording what it was computed

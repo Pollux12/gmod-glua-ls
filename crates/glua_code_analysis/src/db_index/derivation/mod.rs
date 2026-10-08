@@ -1581,6 +1581,14 @@ impl ViewedReads {
         (slots, self.keys.into_vec())
     }
 
+    /// The heap bytes the reads hold, their keys' own heap aside.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        use std::mem::size_of;
+        self.slots.len() * size_of::<KeyIdx>()
+            + self.seen.len() * size_of::<Fingerprint>()
+            + self.keys.len() * size_of::<(HashedKey, Fingerprint)>()
+    }
+
     /// Every key read, for tests.
     #[cfg(test)]
     pub fn keys<'a>(&'a self, graph: &'a ReaderGraph) -> impl Iterator<Item = &'a FactKey> {

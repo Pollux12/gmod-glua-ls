@@ -3613,6 +3613,7 @@ impl EngineStats {
                 "[engine] stage {stage:?} queues {queued} after {} evaluations",
                 self.total_evaluations()
             );
+            crate::profile::memory::checkpoint(&format!("stage {stage:?}"));
         }
     }
 

@@ -70,18 +70,60 @@ fn megabytes(bytes: usize) -> f64 {
     bytes as f64 / 1_048_576.0
 }
 
-/// Prints the process's memory at `label` under `GLUALS_PROFILE`.
+/// Counters a binary with a counting allocator lends the profile.
+#[derive(Debug, Clone, Copy)]
+pub struct AllocCounters {
+    /// The bytes allocated and not yet freed.
+    pub live: fn() -> usize,
+    /// The highest live bytes since the last call, resetting it to the live bytes.
+    pub take_peak: fn() -> usize,
+    /// The allocations made and the bytes they asked for, in total.
+    pub allocated: fn() -> (u64, u64),
+}
+
+static ALLOC_COUNTERS: std::sync::OnceLock<AllocCounters> = std::sync::OnceLock::new();
+static LAST_ALLOCATED: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+
+/// Lends the profile the allocator's counters, which checkpoints then print.
+pub fn set_alloc_counters(counters: AllocCounters) {
+    let _ = ALLOC_COUNTERS.set(counters);
+}
+
+/// Whether checkpoints print: under `GLUALS_PROFILE` or `GLUALS_MEMORY`.
+pub fn checkpoints() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| super::profiling() || std::env::var_os("GLUALS_MEMORY").is_some())
+}
+
+/// Prints the process's memory at `label` under `GLUALS_PROFILE` or
+/// `GLUALS_MEMORY`.
 pub fn checkpoint(label: &str) {
-    if !super::profiling() {
+    if !checkpoints() {
         return;
     }
+    let allocator = ALLOC_COUNTERS.get().map(|counters| {
+        let (allocations, bytes) = (counters.allocated)();
+        let mut last = LAST_ALLOCATED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let since = (allocations - last.0, bytes - last.1);
+        *last = (allocations, bytes);
+        format!(
+            "; live {:.0} MB, peak since last {:.0} MB, {} allocations of {:.0} MB since last",
+            megabytes((counters.live)()),
+            megabytes((counters.take_peak)()),
+            since.0,
+            megabytes(since.1 as usize)
+        )
+    });
     if let Some(memory) = process_memory() {
         eprintln!(
-            "[mem] {label}: working set {:.0} MB, private {:.0} MB (peak working set {:.0} MB, peak private {:.0} MB)",
+            "[mem] {label}: working set {:.0} MB, private {:.0} MB (peak working set {:.0} MB, peak private {:.0} MB){}",
             megabytes(memory.working_set),
             megabytes(memory.private),
             megabytes(memory.peak_working_set),
-            megabytes(memory.peak_private)
+            megabytes(memory.peak_private),
+            allocator.unwrap_or_default()
         );
     }
 }

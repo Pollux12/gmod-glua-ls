@@ -1,7 +1,9 @@
 mod cache_options;
+mod footprint;
 mod tracked;
 mod transaction;
 
+pub(crate) use footprint::MemoFootprint;
 pub(crate) use transaction::detach_transaction;
 
 pub use cache_options::{CacheOptions, LuaAnalysisPhase};

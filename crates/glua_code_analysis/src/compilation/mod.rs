@@ -516,9 +516,49 @@ impl LuaCompilation {
             .clear();
     }
 
+    /// Drops the compilation part by part, calling `dropped` with each part's
+    /// name once it is gone, for a census of what each part holds.
+    pub fn drop_by_part(&mut self, mut dropped: impl FnMut(&'static str)) {
+        drop(
+            self.reanalysis
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(),
+        );
+        dropped("reanalysis");
+        drop(std::mem::take(
+            self.memos
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        ));
+        dropped("inference memos");
+        drop(std::mem::take(
+            self.diagnosed
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        ));
+        dropped("diagnostic reads");
+        self.scopes = analyzer::ScopesCache::default();
+        dropped("scopes");
+        self.db.drop_by_part(dropped);
+    }
+
     /// The reader graph's census, for the profile.
     pub fn memory_census(&self) -> String {
-        format!("reader graph: {}", self.db.reader_graph().census())
+        let diagnosed = self
+            .diagnosed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let diagnosed_bytes = diagnosed
+            .values()
+            .map(derivation::ViewedReads::heap_bytes)
+            .sum::<usize>();
+        format!(
+            "reader graph: {}; unfiled diagnostic reads: {} files, MB {}",
+            self.db.reader_graph().census(),
+            diagnosed.len(),
+            crate::profile::megabytes(diagnosed_bytes)
+        )
     }
 
     pub fn get_db(&self) -> &DbIndex {
