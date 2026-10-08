@@ -398,7 +398,7 @@ impl AssignmentFlowInfo {
 pub struct FlowTree {
     decl_bind_expr_ref: HashMap<LuaDeclId, LuaAstPtr<LuaExpr>>,
     flow_nodes: Vec<FlowNode>,
-    multiple_antecedents: Vec<Vec<FlowId>>,
+    multiple_antecedents: Vec<Box<[FlowId]>>,
     // labels: HashMap<LuaClosureId, HashMap<SmolStr, FlowId>>,
     bindings: HashMap<LuaSyntaxId, FlowId>,
     /// Per-BranchLabel metadata used to skip redundant merges.
@@ -406,14 +406,14 @@ pub struct FlowTree {
     /// Branch labels reached only by one condition's outcomes, mapped to the
     /// node the condition is evaluated from.
     condition_label_entries: HashMap<FlowId, FlowId>,
-    assignment_flow_info: Vec<AssignmentFlowInfo>,
+    assignment_flow_info: Vec<Option<Box<AssignmentFlowInfo>>>,
     narrowing_capability: FileNarrowingCapability,
 }
 
 impl FlowTree {
     pub fn new(
         decl_bind_expr_ref: HashMap<LuaDeclId, LuaAstPtr<LuaExpr>>,
-        flow_nodes: Vec<FlowNode>,
+        mut flow_nodes: Vec<FlowNode>,
         multiple_antecedents: Vec<Vec<FlowId>>,
         // labels: HashMap<LuaClosureId, HashMap<SmolStr, FlowId>>,
         bindings: HashMap<LuaSyntaxId, FlowId>,
@@ -422,6 +422,17 @@ impl FlowTree {
         assignment_flow_info: Vec<AssignmentFlowInfo>,
         narrowing_capability: FileNarrowingCapability,
     ) -> Self {
+        flow_nodes.shrink_to_fit();
+        let mut multiple_antecedents = multiple_antecedents
+            .into_iter()
+            .map(Vec::into_boxed_slice)
+            .collect::<Vec<_>>();
+        multiple_antecedents.shrink_to_fit();
+        let mut assignment_flow_info = assignment_flow_info
+            .into_iter()
+            .map(|info| (!info.is_empty()).then(|| Box::new(info)))
+            .collect::<Vec<_>>();
+        assignment_flow_info.shrink_to_fit();
         Self {
             decl_bind_expr_ref,
             flow_nodes,
@@ -477,7 +488,7 @@ impl FlowTree {
     pub fn get_multi_antecedents(&self, id: u32) -> Option<&[FlowId]> {
         self.multiple_antecedents
             .get(id as usize)
-            .map(|v| v.as_slice())
+            .map(|antecedents| &**antecedents)
     }
 
     pub fn get_decl_ref_expr(&self, decl_id: &LuaDeclId) -> Option<LuaAstPtr<LuaExpr>> {
@@ -493,8 +504,9 @@ impl FlowTree {
     }
 
     pub fn get_assignment_flow_info(&self, flow_id: FlowId) -> Option<&AssignmentFlowInfo> {
-        let info = self.assignment_flow_info.get(flow_id.0 as usize)?;
-        (!info.is_empty()).then_some(info)
+        self.assignment_flow_info
+            .get(flow_id.0 as usize)?
+            .as_deref()
     }
 
     pub fn reaching_definitions(

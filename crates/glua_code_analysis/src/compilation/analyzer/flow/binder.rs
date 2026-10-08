@@ -161,7 +161,7 @@ impl<'a> FlowBinder<'a> {
     }
 
     pub fn create_name_label(&mut self, name: &str, closure_id: LuaClosureId) -> FlowId {
-        let label_id = self.create_node(FlowNodeKind::NamedLabel(SmolStr::new(name)));
+        let label_id = self.create_node(FlowNodeKind::NamedLabel);
         self.labels
             .entry(closure_id)
             .or_default()

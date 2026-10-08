@@ -3,7 +3,6 @@ use glua_parser::{
     LuaExpr, LuaForStat, LuaFuncStat, LuaSyntaxKind, LuaSyntaxNode,
 };
 use rowan::{TextRange, TextSize};
-use smol_str::SmolStr;
 use std::hash::{Hash, Hasher};
 
 use crate::db_index::derivation::hash_local;
@@ -53,7 +52,7 @@ pub enum FlowNodeKind {
     /// Label for loops (while, for, repeat)
     LoopLabel,
     /// Named label (goto target)
-    NamedLabel(SmolStr),
+    NamedLabel,
     /// Declaration position
     DeclPosition(TextSize),
     /// Entry to a deferred closure body. Its antecedent preserves persistent
@@ -89,9 +88,9 @@ impl Hash for FlowNodeKind {
             | FlowNodeKind::Unreachable
             | FlowNodeKind::BranchLabel
             | FlowNodeKind::LoopLabel
+            | FlowNodeKind::NamedLabel
             | FlowNodeKind::Break
             | FlowNodeKind::Return => {}
-            FlowNodeKind::NamedLabel(name) => name.hash(state),
             FlowNodeKind::DeclPosition(position) | FlowNodeKind::ClosureEntry(position) => {
                 hash_local(position, state)
             }
@@ -121,7 +120,7 @@ impl FlowNodeKind {
     }
 
     pub fn is_named_label(&self) -> bool {
-        matches!(self, FlowNodeKind::NamedLabel(_))
+        matches!(self, FlowNodeKind::NamedLabel)
     }
 
     pub fn is_change_flow(&self) -> bool {

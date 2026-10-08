@@ -495,7 +495,7 @@ fn get_type_at_flow_walk(
                 }
                 antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
             }
-            FlowNodeKind::BranchLabel | FlowNodeKind::NamedLabel(_) => {
+            FlowNodeKind::BranchLabel | FlowNodeKind::NamedLabel => {
                 if matches!(flow_node.kind, FlowNodeKind::BranchLabel)
                     && let Some(info) = tree.get_branch_label_info(antecedent_flow_id)
                 {
@@ -1507,7 +1507,7 @@ fn get_flow_node_realm(
         | FlowNodeKind::Unreachable
         | FlowNodeKind::BranchLabel
         | FlowNodeKind::LoopLabel
-        | FlowNodeKind::NamedLabel(_)
+        | FlowNodeKind::NamedLabel
         | FlowNodeKind::Break
         | FlowNodeKind::Return => None,
     };
