@@ -557,6 +557,14 @@ fn replace_files(
                 .flat_map(|id| db.reader_graph().outputs_of(id).cloned()),
         );
     }
+    // A key read out of a removed output held, before the removal, what its
+    // base did: its readers count against that, as the base's do.
+    let derived = outputs
+        .iter()
+        .filter(|key| key.is_base())
+        .flat_map(|key| db.reader_graph().derived_keys(key))
+        .collect::<Vec<_>>();
+    outputs.extend(derived);
     let outputs = outputs.into_iter().collect::<Vec<_>>();
     let fingerprints = {
         use rayon::prelude::*;
