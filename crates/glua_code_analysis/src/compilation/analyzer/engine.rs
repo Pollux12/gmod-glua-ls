@@ -2196,10 +2196,13 @@ impl Engine {
         // write, and what their facts hold, moved only through the keys
         // checked since: a loop it left that the next one clears is
         // downstream of one.
-        let since = self.since_search.take().map(|keys| {
-            db.reader_graph()
-                .readers_downstream(keys.iter(), DerivationKind::closes_loops)
+        let since = crate::profile::phase("loops: since", || {
+            self.since_search.take().map(|keys| {
+                db.reader_graph()
+                    .readers_downstream(keys.iter(), DerivationKind::closes_loops)
+            })
         });
+        let _roots = crate::profile::PhaseGuard::new("loops: roots");
         // A loop is cleared for a member that read a fact that net-moved, so
         // only such members can be roots of one.
         let roots = self
@@ -2239,6 +2242,8 @@ impl Engine {
         // A loop downstream of another that is cleared waits for it to
         // settle: cleared together, it would settle from what the other held
         // on the way, not from what the other settles to.
+        drop(_roots);
+        let _search = crate::profile::PhaseGuard::new("loops: search");
         let loops = db.reader_graph().read_loops(
             roots.iter().copied(),
             DerivationKind::closes_loops,
@@ -2252,6 +2257,11 @@ impl Engine {
         if loops.is_empty() {
             self.settled_on.clear();
             return false;
+        }
+        drop(_search);
+        let _clear = crate::profile::PhaseGuard::new("loops: clear");
+        if crate::profile::tracing_evaluations() {
+            self.trace_loop_edges(db, &loops);
         }
         self.stats.loops_cleared += loops.len();
         self.since_search = Some(FxHashSet::default());
@@ -2307,6 +2317,46 @@ impl Engine {
         self.enter_stage(db, AnalysisStage::Open);
         self.cursor = None;
         true
+    }
+
+    /// Under `GLUALS_TRACE_EVALUATIONS`, prints each loop about to be cleared:
+    /// its members by kind, its files, and the kinds of the facts that close
+    /// it, read by one member and written by another.
+    fn trace_loop_edges(&self, db: &DbIndex, loops: &[Vec<DerivationId>]) {
+        let graph = db.reader_graph();
+        for lp in loops {
+            let members = lp.iter().copied().collect::<FxHashSet<_>>();
+            let mut kinds = BTreeMap::<String, usize>::new();
+            for member in lp {
+                *kinds.entry(format!("{:?}", member.kind)).or_default() += 1;
+            }
+            let files = lp
+                .iter()
+                .map(|member| member.file_id)
+                .collect::<FxHashSet<_>>()
+                .len();
+            let mut edges = FxHashMap::<String, usize>::default();
+            for member in lp {
+                for key in graph.reads_of(*member) {
+                    let base = key.base().map(HashedKey::new);
+                    let closes = graph
+                        .producers(key)
+                        .chain(base.iter().flat_map(|base| graph.producers(base)))
+                        .any(|producer| producer != *member && members.contains(&producer));
+                    if closes {
+                        *edges.entry(variant_name(key)).or_default() += 1;
+                    }
+                }
+            }
+            let mut edges = edges.into_iter().collect::<Vec<_>>();
+            edges.sort_unstable_by(|left, right| {
+                right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0))
+            });
+            eprintln!(
+                "[trace] loop of {} members in {files} files {kinds:?}, closed by {edges:?}",
+                lp.len()
+            );
+        }
     }
 
     /// Queues again, in this round, the evaluations that asked to run again
@@ -2432,6 +2482,7 @@ impl Engine {
         self.focus.clear();
         self.handed_back = false;
         if !self.loop_focus.is_empty() {
+            let _held = crate::profile::PhaseGuard::new("release: held");
             self.loop_focus.clear();
             let unchanged = std::mem::take(&mut self.loop_before)
                 .into_iter()
@@ -2445,6 +2496,7 @@ impl Engine {
             self.next_round = Queue::new(self.schedule);
         }
         let mut queued = 0;
+        let _warm = crate::profile::PhaseGuard::new("release: warm");
         db.reader_graph().warm_reads(
             self.waiting
                 .iter()
@@ -2455,6 +2507,8 @@ impl Engine {
         let waiting = std::mem::take(&mut self.waiting)
             .into_iter()
             .collect::<Vec<_>>();
+        drop(_warm);
+        let _staleness = crate::profile::PhaseGuard::new("release: staleness");
         let checked = {
             let (db, edits, before_edits) = (&*db, &self.edits, &self.before_edits);
             waiting
@@ -2462,6 +2516,8 @@ impl Engine {
                 .map(|(reader, reason)| staleness(db, edits, before_edits, *reader, *reason))
                 .collect::<Vec<_>>()
         };
+        drop(_staleness);
+        let _settle = crate::profile::PhaseGuard::new("release: settle");
         for ((reader, reason), staleness) in waiting.into_iter().zip(checked) {
             if reason == Reason::Changed {
                 self.stats.requeue_cause(reader, "released after the focus");
@@ -3570,7 +3626,7 @@ impl Superstep {
             .iter()
             .map(|plan| (plan.file_id, plan))
             .collect::<FxHashMap<_, _>>();
-        let longest = std::sync::Mutex::new(std::time::Duration::ZERO);
+        let longest = std::sync::Mutex::new((std::time::Duration::ZERO, crate::FileId::VIRTUAL));
         let cost = tasks.cost.take();
         let snapshot = tasks.snapshot.take().expect("a superstep's tasks run once");
         let (frozen, profiling, stop) = (&tasks.frozen, tasks.profiling, &self.stop);
@@ -3587,10 +3643,28 @@ impl Superstep {
             let elapsed = started.elapsed();
             crate::profile::add_phase("superstep: task cpu", elapsed, 0);
             let mut longest = lock(&longest);
-            *longest = (*longest).max(elapsed);
+            if elapsed > longest.0 {
+                *longest = (elapsed, file_id);
+            }
             (outcome, elapsed)
         });
-        crate::profile::add_phase("superstep: longest task", *lock(&longest), 0);
+        let (longest, longest_file) = *lock(&longest);
+        crate::profile::add_phase("superstep: longest task", longest, 0);
+        if crate::profile::phase_enabled() && longest > std::time::Duration::from_millis(20) {
+            let plan = by_file[&longest_file];
+            let mut kinds = BTreeMap::<String, usize>::new();
+            for group in &plan.groups {
+                for member in &group.members {
+                    *kinds.entry(format!("{:?}", member.kind)).or_default() += 1;
+                }
+            }
+            eprintln!(
+                "[superstep] longest {}ms {longest_file:?} groups={} of {} tasks {kinds:?}",
+                longest.as_millis(),
+                plan.groups.len(),
+                files.len(),
+            );
+        }
         drop(snapshot);
         tasks.frozen.release_reader_graph();
         for outcome in outcomes
