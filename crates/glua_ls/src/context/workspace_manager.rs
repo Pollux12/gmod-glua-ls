@@ -1174,6 +1174,7 @@ mod tests {
         fs,
         path::{Path, PathBuf},
         str::FromStr,
+        sync::atomic::{AtomicUsize, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1189,11 +1190,16 @@ mod tests {
     };
 
     fn create_temp_dir() -> PathBuf {
-        let unique = SystemTime::now()
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let started = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time should be valid")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("glua_ls_config_test_{unique}"));
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "glua_ls_config_test_{started}_{}_{unique}",
+            std::process::id()
+        ));
         fs::create_dir_all(&dir).expect("failed to create temp test dir");
         dir
     }
