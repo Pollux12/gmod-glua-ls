@@ -314,8 +314,8 @@ impl Readers {
 
     /// Applies `ops` as applying each in order would, the readers moving
     /// between groups in one pass over each group they leave or join.
-    fn apply_all(&mut self, ops: &[ReaderOp]) {
-        if let [op] = ops {
+    fn apply_all(&mut self, ops: &[(KeyIdx, ReaderOp)]) {
+        if let [(_, op)] = ops {
             op.apply(self);
             return;
         }
@@ -329,7 +329,7 @@ impl Readers {
             .collect::<Vec<_>>();
         let mut touched =
             FxHashMap::<DerivIdx, (Option<Fingerprint>, Option<Fingerprint>)>::default();
-        for op in ops {
+        for (_, op) in ops {
             let (deriv, to) = match *op {
                 ReaderOp::Seen(deriv, seen) | ReaderOp::Insert(deriv, seen) => (deriv, Some(seen)),
                 ReaderOp::Remove(deriv) => (deriv, None),
@@ -920,11 +920,15 @@ impl KeyTable {
         self.last_written = self.last_written.max(now);
         slots.par_sort_unstable();
         let slots: &[KeyIdx] = slots;
-        self.par_reached_chunks(slots, |first, chunk, range| {
-            for slot in &slots[range] {
-                chunk[*slot as usize - first].written = now;
-            }
-        });
+        self.par_reached_chunks(
+            slots,
+            |slot| *slot,
+            |first, chunk, range| {
+                for slot in &slots[range] {
+                    chunk[*slot as usize - first].written = now;
+                }
+            },
+        );
     }
 
     /// Marks `key`, and every key read out of it, written at stamp `now` by an
@@ -2907,34 +2911,36 @@ impl KeyTable {
         }
         let mut ops = flat;
         ops.par_sort_by_key(|(slot, _)| *slot);
-        let (slots, ops): (Vec<_>, Vec<_>) = ops.into_par_iter().unzip();
-        self.par_reached_chunks(&slots, |first, chunk, range| {
-            let mut start = range.start;
-            for same_slot in slots[range].chunk_by(|left, right| left == right) {
-                let end = start + same_slot.len();
-                chunk[same_slot[0] as usize - first]
-                    .readers
-                    .apply_all(&ops[start..end]);
-                start = end;
-            }
-        });
+        let ops: &[(KeyIdx, ReaderOp)] = &ops;
+        self.par_reached_chunks(
+            ops,
+            |(slot, _)| *slot,
+            |first, chunk, range| {
+                for same_slot in ops[range].chunk_by(|(left, _), (right, _)| left == right) {
+                    chunk[same_slot[0].0 as usize - first]
+                        .readers
+                        .apply_all(same_slot);
+                }
+            },
+        );
     }
 
-    /// Runs `apply` on worker threads for each chunk of slots that the
-    /// ascending `slots` reach, with the chunk's first slot, the chunk, and
-    /// the range of `slots` in it.
-    fn par_reached_chunks(
+    /// Runs `apply` on worker threads for each chunk of slots that `items`,
+    /// ascending by the slot `slot_of` gives each, reach, with the chunk's
+    /// first slot, the chunk, and the range of `items` in it.
+    fn par_reached_chunks<T>(
         &mut self,
-        slots: &[KeyIdx],
+        items: &[T],
+        slot_of: impl Fn(&T) -> KeyIdx,
         apply: impl Fn(usize, &mut [KeySlot], std::ops::Range<usize>) + Sync,
     ) {
         use rayon::prelude::*;
-        let chunk_of = |slot: KeyIdx| slot as usize / READER_CHUNK;
+        let chunk_of = |item: &T| slot_of(item) as usize / READER_CHUNK;
         let mut reached = Vec::new();
         let mut start = 0;
-        while let Some(slot) = slots.get(start) {
-            let chunk = chunk_of(*slot);
-            let end = start + slots[start..].partition_point(|slot| chunk_of(*slot) == chunk);
+        while let Some(item) = items.get(start) {
+            let chunk = chunk_of(item);
+            let end = start + items[start..].partition_point(|item| chunk_of(item) == chunk);
             reached.push((chunk, start..end));
             start = end;
         }
@@ -3341,7 +3347,7 @@ mod tests {
                     _ => ReaderOp::Remove(deriv),
                 };
                 op.apply(&mut one_by_one);
-                ops.push(op);
+                ops.push((0, op));
             }
             let mut together = start;
             together.apply_all(&ops);
