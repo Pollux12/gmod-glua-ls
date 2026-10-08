@@ -1636,6 +1636,7 @@ impl ReaderGraph {
     /// Forgets every derivation of `file_ids`, returning each with the facts
     /// it produced, in derivation order.
     pub fn remove_files(&mut self, file_ids: &[FileId]) -> Vec<(DerivationId, Box<[HashedKey]>)> {
+        use rayon::prelude::*;
         let derivs = file_ids
             .iter()
             .filter_map(|file_id| self.by_file.remove(file_id))
@@ -1654,21 +1655,16 @@ impl ReaderGraph {
                     .map(|key| (*key, *deriv))
             })
             .collect::<Vec<_>>();
-        leaving.sort_unstable();
+        leaving.par_sort_unstable();
+        let mut still_read = leaving
+            .chunk_by(|(left, _), (right, _)| left == right)
+            .map(|same_key| (same_key[0].0, same_key.len()))
+            .collect::<FxHashMap<_, _>>();
         let ops = leaving
-            .iter()
-            .map(|(_, deriv)| ReaderOp::Remove(*deriv))
-            .collect::<Vec<_>>();
-        let mut still_read = FxHashMap::default();
-        let mut start = 0;
-        for same_key in leaving.chunk_by(|(left, _), (right, _)| left == right) {
-            let end = start + same_key.len();
-            self.table.keys[same_key[0].0 as usize]
-                .readers
-                .apply_all(&ops[start..end]);
-            still_read.insert(same_key[0].0, same_key.len());
-            start = end;
-        }
+            .into_par_iter()
+            .map(|(slot, deriv)| (slot, ReaderOp::Remove(deriv)))
+            .collect();
+        self.table.apply_reader_ops(vec![ops]);
         let mut removed: Vec<_> = derivs
             .into_iter()
             .map(|deriv| {

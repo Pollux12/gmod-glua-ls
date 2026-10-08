@@ -1014,13 +1014,13 @@ impl Engine {
         // An edit's focus hands the run back once it settles.
         self.handed_back = false;
         self.requeue_carried();
-        let replaced = |id: DerivationId| file_ids.contains(&id.file_id);
+        let files = file_ids.iter().copied().collect::<FxHashSet<_>>();
+        let replaced = |id: DerivationId| files.contains(&id.file_id);
         self.worklist.take_where(replaced);
         self.next_round.take_where(replaced);
         self.waiting.retain(|id, _| !replaced(*id));
         self.held.retain(|id, _| !replaced(*id));
-        self.stale_sources
-            .retain(|file_id| !file_ids.contains(file_id));
+        self.stale_sources.retain(|file_id| !files.contains(file_id));
     }
 
     /// Notes that `file_id`'s derivations are removed and built again.

@@ -492,6 +492,40 @@ fn start_pass(
     Some(Pass::Replaced { touched, scopes })
 }
 
+/// For each derivation among the `foreign` producers of the replaced files'
+/// facts, the live files among `live_files` it stored a fact in that the
+/// indexes do not keep when the file is re-indexed. Each producer's outputs
+/// are read once, on the pool, however many files it stored in.
+fn unkept_foreign_outputs(
+    db: &DbIndex,
+    foreign: &[Vec<derivation::DerivationId>],
+    replaced: &HashSet<FileId>,
+    live_files: &HashSet<FileId>,
+) -> HashMap<derivation::DerivationId, HashSet<FileId>> {
+    use rayon::prelude::*;
+    let mut producers = foreign
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|producer| !replaced.contains(&producer.file_id))
+        .collect::<Vec<_>>();
+    producers.sort_unstable();
+    producers.dedup();
+    producers
+        .into_par_iter()
+        .map(|producer| {
+            let unkept = db
+                .reader_graph()
+                .outputs_of(producer)
+                .filter(|key| !key.keeps_foreign_contributions())
+                .filter_map(|key| key.owning_file())
+                .filter(|file_id| live_files.contains(file_id))
+                .collect::<HashSet<_>>();
+            (producer, unkept)
+        })
+        .collect()
+}
+
 /// Forgets `file_ids`' derivations and facts, rebuilds the live ones' source
 /// layer and queues their derivations. Returns every key whose value may
 /// have changed, `moved` among them, each also at its new position.
@@ -506,23 +540,32 @@ fn replace_files(
     touched.insert(derivation::HashedKey::new(derivation::FactKey::FileSet));
     let forgetting = crate::profile::PhaseGuard::new("replace: forget derivations");
     let mut outputs = HashSet::default();
-    for file_id in file_ids {
+    let replaced = file_ids.iter().copied().collect::<HashSet<_>>();
+    let live_files = file_ids
+        .iter()
+        .copied()
+        .filter(|file_id| db.get_vfs().get_syntax_tree(file_id).is_some())
+        .collect::<HashSet<_>>();
+    let foreign = file_ids
+        .iter()
+        .map(|file_id| db.reader_graph().foreign_producers(*file_id))
+        .collect::<Vec<_>>();
+    let unkept = unkept_foreign_outputs(db, &foreign, &replaced, &live_files);
+    for (file_id, producers) in file_ids.iter().zip(foreign) {
         touched.insert(derivation::HashedKey::new(derivation::FactKey::FileText(
             *file_id,
         )));
-        let live = db.get_vfs().get_syntax_tree(file_id).is_some();
-        for producer in db.reader_graph().foreign_producers(*file_id) {
-            if file_ids.contains(&producer.file_id) {
+        let live = live_files.contains(file_id);
+        for producer in producers {
+            if replaced.contains(&producer.file_id) {
                 continue;
             }
             // What it stored in a file that is re-indexed, not deleted, the
             // indexes keep, and the edit remap carries to its new place.
             if live
-                && db
-                    .reader_graph()
-                    .outputs_of(producer)
-                    .filter(|key| key.owning_file() == Some(*file_id))
-                    .all(|key| key.keeps_foreign_contributions())
+                && unkept
+                    .get(&producer)
+                    .is_none_or(|lost| !lost.contains(file_id))
             {
                 continue;
             }
