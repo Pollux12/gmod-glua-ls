@@ -346,6 +346,7 @@ impl DebouncedAnalysis {
 
         self.refresh_dirty_state().await;
         self.reindex_notify.notify_waiters();
+        self.notify.notify_waiters();
     }
 
     /// Check whether document changes are pending reindex.
@@ -357,7 +358,6 @@ impl DebouncedAnalysis {
         self.has_pending_changes.load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
     fn in_flight_change_count(&self) -> usize {
         self.in_flight_changes.load(Ordering::Acquire)
     }
@@ -800,10 +800,6 @@ impl DebouncedAnalysis {
             .lock()
             .map(|mut prioritised| std::mem::take(&mut *prioritised))
             .unwrap_or_default();
-        if self.interrupt.get().is_none() {
-            let interrupt = self.analysis.read().await.compilation.interrupt_handle();
-            let _ = self.interrupt.set(interrupt);
-        }
         let analysis = self.analysis.clone();
 
         tokio::select! {
@@ -812,8 +808,6 @@ impl DebouncedAnalysis {
                 let wait_start = crate::util::ls_profile::profile_instant();
                 let mut guard = analysis.blocking_write();
                 let hold_start = crate::util::ls_profile::profile_instant();
-                let interrupt = guard.compilation.interrupt_handle();
-                interrupt.store(false, Ordering::Release);
                 guard.compilation.prioritise_update(&prioritised);
                 let progress = guard.advance_reindex(Slice::Until(Instant::now() + SLICE));
                 let settled_first = edited
@@ -843,6 +837,21 @@ impl DebouncedAnalysis {
                 }
             }
         }
+    }
+
+    /// Clears the slice interrupt for the next slice, unless a change is on
+    /// its way: one that arrived before the slice starts holds it back until
+    /// its text is applied, and one that arrives later stops it. Returns
+    /// whether the slice can start.
+    async fn slice_can_start(&self) -> bool {
+        if self.interrupt.get().is_none() {
+            let interrupt = self.analysis.read().await.compilation.interrupt_handle();
+            let _ = self.interrupt.set(interrupt);
+        }
+        if let Some(interrupt) = self.interrupt.get() {
+            interrupt.store(false, Ordering::Release);
+        }
+        self.in_flight_change_count() == 0
     }
 
     /// Takes in the files whose text changed without a schedule reaching the
@@ -1005,6 +1014,13 @@ impl DebouncedAnalysis {
                 continue;
             }
 
+            if !self.slice_can_start().await {
+                tokio::select! {
+                    _ = notified => {}
+                    _ = self.shutdown.cancelled() => return,
+                }
+                continue;
+            }
             let Some((progress, settled_first)) = self.advance_slice(edited.clone()).await else {
                 if self.shutdown.is_cancelled() {
                     return;
@@ -1303,6 +1319,22 @@ mod tests {
 
             verify_that!(debounced_analysis.in_flight_change_count(), eq(0))?;
             verify_that!(debounced_analysis.is_dirty(), eq(false))?;
+            Ok(())
+        })
+    }
+
+    /// A change on its way holds the next slice back until its text is
+    /// applied: a slice started meanwhile would run its length before the
+    /// change could stop it.
+    #[gtest]
+    fn a_change_on_its_way_holds_back_the_next_slice() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounced_analysis = test_debounced_analysis();
+            let in_flight = debounced_analysis.begin_in_flight_change();
+            verify_that!(debounced_analysis.slice_can_start().await, eq(false))?;
+            in_flight.finish().await;
+            verify_that!(debounced_analysis.slice_can_start().await, eq(true))?;
             Ok(())
         })
     }
