@@ -14,7 +14,7 @@
 //! tainted, and its value stays with the evaluation.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::graph::Freshness;
 use super::{CURRENT, Evaluation, KEYS, KeyIdx, KeyTable, latest_stamp, next_stamp, with_viewed};
@@ -55,13 +55,75 @@ pub(super) struct Frame {
 pub struct OpenFrame(u32);
 
 /// An evaluation's read log, kept once the evaluation ends for the memos
-/// that point into it.
-#[derive(Debug, Default)]
-pub(super) struct LogHandle(pub(super) std::sync::OnceLock<Box<[KeyIdx]>>);
+/// that point into it: only the window of it their ranges cover.
+///
+/// Until frozen, `start` and `end` bound the ranges of the memos computed so
+/// far; once frozen, `start` is where the kept window begins in the log and
+/// `end` is the length the log had.
+#[derive(Debug)]
+pub(super) struct LogHandle {
+    start: AtomicU32,
+    end: AtomicU32,
+    window: std::sync::OnceLock<Box<[KeyIdx]>>,
+}
+
+impl Default for LogHandle {
+    fn default() -> Self {
+        Self {
+            start: AtomicU32::new(u32::MAX),
+            end: AtomicU32::new(0),
+            window: std::sync::OnceLock::new(),
+        }
+    }
+}
 
 impl LogHandle {
+    /// Widens the window to cover a memo computed from `start..end`. Only the
+    /// thread recording the evaluation calls it, before the log is frozen.
+    fn cover(&self, start: u32, end: u32) {
+        if self.window.get().is_some() {
+            return;
+        }
+        if start < self.start.load(Ordering::Relaxed) {
+            self.start.store(start, Ordering::Relaxed);
+        }
+        if end > self.end.load(Ordering::Relaxed) {
+            self.end.store(end, Ordering::Relaxed);
+        }
+    }
+
     pub(super) fn freeze(&self, log: &[KeyIdx]) {
-        let _ = self.0.set(log.into());
+        if self.window.get().is_some() {
+            return;
+        }
+        let start = self.start.load(Ordering::Relaxed);
+        let end = self.end.load(Ordering::Relaxed);
+        let (start, end) = if start <= end { (start, end) } else { (0, 0) };
+        self.start.store(start, Ordering::Relaxed);
+        self.end.store(
+            u32::try_from(log.len()).expect("fewer than 2^32 reads"),
+            Ordering::Relaxed,
+        );
+        let _ = self.window.set(log[start as usize..end as usize].into());
+    }
+
+    /// The reads `start..end` of the frozen log, as slicing the whole log
+    /// would give them.
+    fn reads(&self, start: u32, end: u32) -> Option<&[KeyIdx]> {
+        let window = self.window.get()?;
+        if end > self.end.load(Ordering::Relaxed) {
+            return None;
+        }
+        if start == end {
+            return Some(&[]);
+        }
+        let offset = self.start.load(Ordering::Relaxed);
+        window.get((start.checked_sub(offset)? as usize)..((end - offset) as usize))
+    }
+
+    #[cfg(test)]
+    fn is_frozen(&self) -> bool {
+        self.window.get().is_some()
     }
 }
 
@@ -120,7 +182,7 @@ mod query_presence_tests {
     fn parallel_transport_query_presence_keeps_proof_and_frame_widths() {
         assert_eq!(std::mem::size_of::<Computed>(), 64);
         assert_eq!(std::mem::size_of::<Frame>(), 48);
-        assert_eq!(std::mem::size_of::<LogHandle>(), 24);
+        assert_eq!(std::mem::size_of::<LogHandle>(), 32);
     }
 
     #[test]
@@ -438,7 +500,11 @@ pub fn close_frame(frame: OpenFrame, view: Gates) -> Option<Provenance> {
             "frames close in order"
         );
         let closed = evaluation.frames.pop()?;
-        let unkeyed = unkeyed_since(&evaluation.unkeyed, closed.unkeyed);
+        let unkeyed = closed
+            .taint
+            .is_none()
+            .then(|| unkeyed_since(&evaluation.unkeyed, closed.unkeyed))
+            .flatten();
         if evaluation.frames.is_empty() {
             evaluation.unkeyed.clear();
         }
@@ -468,10 +534,12 @@ pub fn close_frame(frame: OpenFrame, view: Gates) -> Option<Provenance> {
             stats.shared += 1;
             stats.sites.entry(caller).or_default()[1] += 1;
         });
+        let end = u32::try_from(evaluation.log.len()).expect("fewer than 2^32 reads");
+        evaluation.log_handle.cover(closed.start, end);
         Some(Provenance(Arc::new(Computed {
             log: Arc::clone(&evaluation.log_handle),
             start: closed.start,
-            end: u32::try_from(evaluation.log.len()).expect("fewer than 2^32 reads"),
+            end,
             since: closed.stamp,
             gates: closed.gates,
             view: view & closed.gates,
@@ -730,7 +798,7 @@ pub fn reuse(
                         stats.sites.entry(caller).or_default()[2] += 1;
                     });
                 } else {
-                    let Some(reads) = provenance.0.log.0.get().and_then(|log| log.get(range))
+                    let Some(reads) = provenance.0.log.reads(provenance.0.start, provenance.0.end)
                     else {
                         return Reuse::Elsewhere;
                     };
@@ -898,7 +966,7 @@ fn reuse_on_worker(
             stats.sites.entry(caller).or_default()[3] += 1;
         });
     } else {
-        let Some(reads) = provenance.0.log.0.get().and_then(|log| log.get(range)) else {
+        let Some(reads) = provenance.0.log.reads(provenance.0.start, provenance.0.end) else {
             return Reuse::Elsewhere;
         };
         if provenance.0.has_query && !worker.canonical_queries_hold(reads) {
@@ -990,8 +1058,7 @@ fn reuse_viewed(
 ) -> Option<Reuse> {
     with_viewed(|evaluation, graph| {
         let table = graph.keys();
-        let range = provenance.0.start as usize..provenance.0.end as usize;
-        let Some(reads) = provenance.0.log.0.get().and_then(|log| log.get(range)) else {
+        let Some(reads) = provenance.0.log.reads(provenance.0.start, provenance.0.end) else {
             return Reuse::Elsewhere;
         };
         match provenance.freshness(table, reads) {
@@ -1175,13 +1242,17 @@ mod tests {
         derivation::note_read(|| FactKey::GmodRealm(FileId::new(2)));
         let proof = close_frame(frame, 0).unwrap();
         let suspended = derivation::suspend();
-        assert!(proof.0.log.0.get().is_none());
+        assert!(!proof.0.log.is_frozen());
         assert_eq!(derivation::current(), Some(parent));
         derivation::end();
         derivation::resume(suspended);
         derivation::note_read(|| FactKey::GmodRealm(FileId::new(3)));
         derivation::end();
-        assert_eq!(proof.0.log.0.get().unwrap().len(), 2);
+        assert_eq!(
+            proof.0.log.reads(proof.0.start, proof.0.end).unwrap().len(),
+            1
+        );
+        assert_eq!(proof.0.log.end.load(Ordering::Relaxed), 2);
         assert_eq!(proof.0.end, 1);
         derivation::take_keys();
     }
@@ -1200,7 +1271,7 @@ mod tests {
         derivation::resume(suspended);
         assert!(scope_open(mark));
         let proof = close_frame(frame, 1).unwrap();
-        assert!(proof.0.log.0.get().is_none());
+        assert!(!proof.0.log.is_frozen());
         derivation::end();
         derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
         assert_eq!(reuse(&proof, 1, &[], None), Reuse::Held);
@@ -1335,6 +1406,53 @@ mod tests {
         let reuse = reuse(value, 0, &[], None);
         derivation::end();
         reuse
+    }
+
+    /// Writes `key` in an evaluation of its own.
+    fn write(key: fn() -> FactKey) {
+        derivation::begin(DerivationId::workspace(DerivationKind::NetHelperNames));
+        derivation::note_write(key);
+        derivation::end();
+    }
+
+    /// A frozen log keeps only the reads its memos cover, and a memo reads
+    /// them back where it read them: a write of a read outside its frame
+    /// leaves it held, one of a read inside makes it stale.
+    #[test]
+    fn a_frozen_log_keeps_the_reads_its_memos_cover() {
+        let before = || FactKey::GmodRealm(FileId::new(1));
+        let inside = || FactKey::GmodRealm(FileId::new(3));
+        derivation::lend_keys(KeyTable::default());
+        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        derivation::note_read(before);
+        let frame = open_frame().expect("a table is lent");
+        derivation::note_read(|| FactKey::GmodRealm(FileId::new(2)));
+        derivation::note_read(inside);
+        let value = close_frame(frame, 0).expect("the frame saw no taint");
+        derivation::note_read(|| FactKey::GmodRealm(FileId::new(4)));
+        derivation::end();
+        let log = &value.0.log;
+        let window = (
+            log.start.load(Ordering::Relaxed),
+            log.end.load(Ordering::Relaxed),
+            log.window.get().map(|window| window.len()),
+        );
+        write(before);
+        let after_outside = reused(&value);
+        write(inside);
+        let after_inside = reused(&value);
+        derivation::take_keys();
+
+        assert_eq!(
+            (
+                value.0.start,
+                value.0.end,
+                window,
+                after_outside,
+                after_inside
+            ),
+            (1, 3, (1, 4, Some(2)), Reuse::Held, Reuse::Stale)
+        );
     }
 
     /// A value that read a fact an evaluation computes again waits while it
