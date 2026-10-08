@@ -1400,6 +1400,8 @@ impl Evaluation {
             .map(|slot| (slot, graph.slot_fingerprint(slot, &fingerprint)))
             .collect::<Vec<_>>();
         slots.sort_unstable_by_key(|(slot, _)| *slot);
+        let seen = slots.iter().map(|(_, seen)| *seen).collect();
+        let slots = slots.iter().map(|(slot, _)| *slot).collect();
         let keys = self
             .reads
             .drain()
@@ -1410,7 +1412,7 @@ impl Evaluation {
             })
             .collect();
         Spare::park(&mut self);
-        ViewedReads { slots, keys }
+        ViewedReads { slots, seen, keys }
     }
 
     /// [`Self::into_parts`] with each read's fingerprint left to the caller,
@@ -1448,20 +1450,35 @@ impl Evaluation {
 
 /// What an evaluation that viewed the reader graph read, with the
 /// fingerprints it saw: slots of the graph as it stood, which hold only until
-/// the graph next changes, and the keys it had no slot for.
+/// the graph next changes, each beside the fingerprint at its position in
+/// `seen`, and the keys it had no slot for.
 #[derive(Debug, Clone, Default)]
 pub struct ViewedReads {
-    slots: Vec<(KeyIdx, Fingerprint)>,
-    keys: Vec<(HashedKey, Fingerprint)>,
+    slots: Box<[KeyIdx]>,
+    seen: Box<[Fingerprint]>,
+    keys: Box<[(HashedKey, Fingerprint)]>,
 }
 
 impl ViewedReads {
     /// Reads made with no graph viewed, each with the fingerprint it saw.
     pub fn from_keys(keys: Vec<(HashedKey, Fingerprint)>) -> Self {
         Self {
-            slots: Vec::new(),
-            keys,
+            slots: Box::default(),
+            seen: Box::default(),
+            keys: keys.into_boxed_slice(),
         }
+    }
+
+    /// The slot reads, each with the fingerprint it saw, and the key reads.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn into_parts(self) -> (Vec<(KeyIdx, Fingerprint)>, Vec<(HashedKey, Fingerprint)>) {
+        let slots = self
+            .slots
+            .iter()
+            .copied()
+            .zip(self.seen.iter().copied())
+            .collect();
+        (slots, self.keys.into_vec())
     }
 
     /// Every key read, for tests.
@@ -1469,7 +1486,7 @@ impl ViewedReads {
     pub fn keys<'a>(&'a self, graph: &'a ReaderGraph) -> impl Iterator<Item = &'a FactKey> {
         self.slots
             .iter()
-            .map(|(slot, _)| graph.key(*slot).key())
+            .map(|slot| graph.key(*slot).key())
             .chain(self.keys.iter().map(|(key, _)| key.key()))
     }
 }

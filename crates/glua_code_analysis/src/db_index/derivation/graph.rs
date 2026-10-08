@@ -1585,11 +1585,9 @@ impl ReaderGraph {
         let records = records
             .into_iter()
             .map(|(id, reads)| {
-                let mut slots = reads.slots;
+                let (mut slots, keys) = reads.into_parts();
                 slots.extend(
-                    reads
-                        .keys
-                        .into_iter()
+                    keys.into_iter()
                         .map(|(key, seen)| (self.intern_key(key, now), seen)),
                 );
                 (id, slots)
