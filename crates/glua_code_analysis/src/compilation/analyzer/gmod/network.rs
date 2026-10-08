@@ -61,14 +61,15 @@ struct StringTemplate(Vec<TemplatePart>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum TemplatePart {
-    Literal(String),
-    Name(String),
+    Literal(SmolStr),
+    Name(SmolStr),
 }
 
 impl StringTemplate {
     fn of(expr: &LuaExpr) -> Option<Self> {
         let mut parts = Vec::new();
         push_template_parts(expr, &mut parts)?;
+        parts.shrink_to_fit();
         Some(Self(parts))
     }
 
@@ -85,7 +86,7 @@ impl StringTemplate {
         for part in &self.0 {
             match part {
                 TemplatePart::Literal(text) => value.push_str(text),
-                TemplatePart::Name(name) => value.push_str(bindings.get(name)?),
+                TemplatePart::Name(name) => value.push_str(bindings.get(name.as_str())?),
             }
         }
         Some(value)
@@ -94,10 +95,10 @@ impl StringTemplate {
 
 fn push_template_parts(expr: &LuaExpr, parts: &mut Vec<TemplatePart>) -> Option<()> {
     match expr {
-        LuaExpr::LiteralExpr(_) => parts.push(TemplatePart::Literal(static_literal_string(expr)?)),
-        LuaExpr::NameExpr(name_expr) => {
-            parts.push(TemplatePart::Name(name_expr.get_name_text()?.to_string()))
+        LuaExpr::LiteralExpr(_) => {
+            parts.push(TemplatePart::Literal(static_literal_string(expr)?.into()))
         }
+        LuaExpr::NameExpr(name_expr) => parts.push(TemplatePart::Name(name_expr.get_name_text()?)),
         LuaExpr::ParenExpr(paren_expr) => push_template_parts(&paren_expr.get_expr()?, parts)?,
         LuaExpr::BinaryExpr(binary_expr) => {
             if binary_expr.get_op_token()?.get_op() != BinaryOperator::OpConcat {
@@ -116,9 +117,12 @@ fn arg_templates(call_expr: &LuaCallExpr) -> Vec<Option<StringTemplate>> {
     call_expr
         .get_args_list()
         .map(|args| {
-            args.get_args()
+            let mut templates: Vec<_> = args
+                .get_args()
                 .map(|arg| StringTemplate::of(&arg))
-                .collect()
+                .collect();
+            templates.shrink_to_fit();
+            templates
         })
         .unwrap_or_default()
 }
@@ -674,15 +678,22 @@ fn summarize_helper(
     closure: &LuaClosureExpr,
     block: &LuaBlock,
 ) -> NetHelper {
-    let calls = block
+    let mut calls = block
         .descendants::<LuaCallExpr>()
         .map(|call_expr| summarize_helper_call(site, block, &call_expr))
         .collect::<Vec<_>>();
     let mut ops = Vec::new();
     op_items(site, block, block.syntax(), &mut ops);
-    let sends = helper_sends(site, block);
+    let mut sends = helper_sends(site, block);
+    let params = read_params(closure, &calls, &sends);
+    // A call with neither a role nor a target is no net step; only its
+    // arguments could name a parameter, which `params` has read.
+    calls.retain(|call| call.role.is_some() || call.target.is_some());
+    calls.shrink_to_fit();
+    ops.shrink_to_fit();
+    sends.shrink_to_fit();
     NetHelper {
-        params: read_params(closure, &calls, &sends),
+        params,
         calls,
         ops,
         sends,
