@@ -39,6 +39,7 @@ mod net_unit_test;
 mod out_of_order;
 mod overload_field;
 mod overload_test;
+mod owner_presence_test;
 mod pairs_copy_test;
 mod pcall_test;
 mod query_test;

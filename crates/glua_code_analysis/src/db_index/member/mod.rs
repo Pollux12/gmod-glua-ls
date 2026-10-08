@@ -150,10 +150,18 @@ fn note_slot_write(owner: &LuaMemberOwner, key: &LuaMemberKey) {
     derivation::note_write(|| FactKey::MemberSlot(owner.clone(), key.clone()));
 }
 
+/// Notes a change to `owner`'s members. Whether it has a member map at all
+/// moves only where the map appears or goes ([`note_owner_presence_write`]).
 fn note_owner_map_write(owner: &LuaMemberOwner) {
     derivation::note_write(|| FactKey::MemberOwnerMap(owner.clone()));
     derivation::note_write(|| FactKey::MemberOwnerExprKeys(owner.clone()));
     derivation::note_write(|| FactKey::MemberOwnerFields(owner.clone()));
+}
+
+/// Notes that `owner`'s member map appeared or went, or that the owner a
+/// name canonicalises to moved: its members and its presence.
+fn note_owner_presence_write(owner: &LuaMemberOwner) {
+    note_owner_map_write(owner);
     derivation::note_write(|| FactKey::MemberOwnerPresence(owner.clone()));
 }
 
@@ -551,13 +559,13 @@ impl LuaMemberIndex {
         classes: &[Option<&crate::LuaTypeDeclId>],
     ) {
         derivation::note_write(|| FactKey::GlobalPath(path.clone()));
-        note_owner_map_write(&LuaMemberOwner::GlobalPath(path.clone()));
+        note_owner_presence_write(&LuaMemberOwner::GlobalPath(path.clone()));
         if let Some(site) = site {
             derivation::note_write(|| FactKey::DefinitionSite(site.clone()));
-            note_owner_map_write(&LuaMemberOwner::Element(site.clone()));
+            note_owner_presence_write(&LuaMemberOwner::Element(site.clone()));
         }
         for class in classes.iter().flatten() {
-            note_owner_map_write(&LuaMemberOwner::Type((*class).clone()));
+            note_owner_presence_write(&LuaMemberOwner::Type((*class).clone()));
         }
     }
 
@@ -752,7 +760,7 @@ impl LuaMemberIndex {
     /// Removes `owner`'s member map, keeping the fingerprints that name it.
     fn remove_owner_entry(&mut self, owner: &LuaMemberOwner) -> Option<LuaOwnerMembers> {
         let removed = self.owner_members.remove(owner)?;
-        note_owner_map_write(owner);
+        note_owner_presence_write(owner);
         if derivation::recording() {
             for key in removed.get_member_keys() {
                 note_slot_write(owner, key);
@@ -780,7 +788,7 @@ impl LuaMemberIndex {
             derivation::note_write(|| FactKey::Member(*id));
         }
         for (owner, members) in &self.owner_members {
-            note_owner_map_write(owner);
+            note_owner_presence_write(owner);
             for key in members.get_member_keys() {
                 note_slot_write(owner, key);
             }
@@ -1298,10 +1306,13 @@ impl LuaMemberIndex {
         id: LuaMemberId,
     ) {
         note_slot_write(&owner, &key);
-        note_owner_map_write(&owner);
-        if let LuaMemberOwner::Element(range) = &owner
-            && !self.owner_members.contains_key(&owner)
-        {
+        let creates_map = !self.owner_members.contains_key(&owner);
+        if creates_map {
+            note_owner_presence_write(&owner);
+        } else {
+            note_owner_map_write(&owner);
+        }
+        if creates_map && let LuaMemberOwner::Element(range) = &owner {
             self.fold_file_fingerprint(range.file_id, file_element_owner_element(range), true);
         }
         let owner_members = self
