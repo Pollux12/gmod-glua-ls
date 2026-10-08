@@ -332,7 +332,6 @@ mod tests {
             .get(&workspace_id)
             .cloned()
             .unwrap_or_default();
-        assert_that!(precomputed.is_empty(), eq(false));
         let library_decl_id = ws
             .analysis
             .compilation
@@ -347,7 +346,7 @@ mod tests {
             })
             .expect("expected library declaration");
         assert_that!(
-            precomputed.contains_key(&LuaSemanticDeclId::LuaDecl(library_decl_id)),
+            precomputed.get(&LuaSemanticDeclId::LuaDecl(library_decl_id)).is_some(),
             eq(true)
         );
     }

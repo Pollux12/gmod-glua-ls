@@ -72,12 +72,14 @@ use super::{
 
 pub use gmod_network::SortedSendFlowCache;
 pub use gmod_network::precompute_sorted_send_flows;
-pub use gmod_realm_misuse::GmMethodRealmMap;
-pub use gmod_realm_misuse::PrecomputedCalleeRealmMap;
-pub use gmod_realm_misuse::PrecomputedRealmCallCandidates;
-pub use gmod_realm_misuse::precompute_callee_realm_data_for_workspace;
-pub use gmod_realm_misuse::precompute_gm_method_realms;
-pub use missing_fields::precompute_missing_required_fields;
+pub use gmod_realm_misuse::{
+    FileCalleeRealms, FileRealmAccessPaths, GmMethodRealmMap, PrecomputedCalleeRealmMap,
+    PrecomputedRealmCallCandidates, fold_gm_method_realms, gm_method_realm_annotations,
+    resolve_file_callee_realms,
+};
+pub use missing_fields::{
+    OwnFieldRequirements, fold_required_fields, own_field_requirements, own_fields_owner,
+};
 pub use property_name_candidates::{
     PrecomputedPropertyNameCandidates, precompute_property_name_candidates,
 };

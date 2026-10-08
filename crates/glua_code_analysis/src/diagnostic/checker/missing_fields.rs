@@ -12,7 +12,7 @@ use crate::{
     LuaTypeCache, LuaTypeDeclId, SemanticModel,
 };
 
-use super::{Checker, DiagnosticContext, PrecomputedMissingRequiredFields, humanize_lint_type};
+use super::{Checker, DiagnosticContext, humanize_lint_type};
 use itertools::Itertools;
 
 pub struct MissingFieldsChecker;
@@ -351,20 +351,6 @@ fn assigned_target_path(expr: &LuaTableExpr, stat: &LuaStat) -> Option<String> {
     }
 }
 
-pub fn precompute_missing_required_fields(db: &DbIndex) -> PrecomputedMissingRequiredFields {
-    db.get_type_index()
-        .get_all_types()
-        .into_iter()
-        .filter_map(|type_decl| {
-            let type_decl_id = type_decl.get_id();
-            let typ = LuaType::Ref(type_decl_id.clone());
-            let types = type_decl_id.collect_super_types_with_self(db, typ);
-            let required_fields = get_required_fields_for_types(db, &types, || false)?;
-            Some((type_decl_id, Arc::new(required_fields)))
-        })
-        .collect()
-}
-
 fn get_precomputed_required_fields(
     context: &DiagnosticContext,
     type_decl_id: &LuaTypeDeclId,
@@ -406,131 +392,132 @@ fn get_required_fields_for_types(
     types: &[LuaType],
     mut is_cancelled: impl FnMut() -> bool,
 ) -> Option<HashSet<String>> {
-    let member_index = db.get_member_index();
-    let mut required_fields: HashSet<String> = HashSet::default();
+    Some(fold_required_fields(types, &mut is_cancelled, |type_decl_id, is_cancelled| {
+        own_field_requirements(db, type_decl_id, is_cancelled).map(Arc::new)
+    }))
+}
 
+/// What one type's own members require of a table literal, and the names
+/// they leave optional to write.
+#[derive(Debug, Default, PartialEq)]
+pub struct OwnFieldRequirements {
+    required: HashSet<String>,
+    optional: HashSet<String>,
+}
+
+/// `type_decl_id`'s own field requirements: `None` when it has no member map
+/// or the walk was cancelled.
+pub fn own_field_requirements(
+    db: &DbIndex,
+    type_decl_id: &LuaTypeDeclId,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<OwnFieldRequirements> {
+    let members = db
+        .get_member_index()
+        .get_members(&LuaMemberOwner::Type(type_decl_id.clone()))?;
+    let mut own = OwnFieldRequirements::default();
+    for member in members {
+        if is_cancelled() {
+            return None;
+        }
+        if matches!(
+            member.get_feature(),
+            LuaMemberFeature::FileMethodDecl | LuaMemberFeature::MetaMethodDecl
+        ) {
+            continue;
+        }
+        let name = member.get_key().to_path();
+
+        // A field the class never declared, attached by a plain `v.X = ...`
+        // write somewhere, is an addition to a value — not part of the
+        // contract a constructor has to satisfy. Only what the class
+        // declares can be required of a literal; runtime writes make the
+        // field available to read, at most optional to write.
+        if member.is_assignment_define() {
+            own.optional.insert(name);
+            continue;
+        }
+        let decl_type = db
+            .get_type_index()
+            .get_type_cache(&member.get_id().into())
+            .unwrap_or(&LuaTypeCache::InferType(LuaType::Unknown))
+            .as_type()
+            .clone();
+
+        // Treat fields with documented defaults as optional-for-writing,
+        // matching the semantic table-compatibility rule in type_check.
+        let has_default = {
+            let owner_id = LuaSemanticDeclId::Member(member.get_id());
+            db.get_property_index()
+                .get_property(&owner_id)
+                .is_some_and(|p| p.default_value().is_some())
+                || match &decl_type {
+                    LuaType::Signature(sig_id) => db
+                        .get_property_index()
+                        .get_property(&LuaSemanticDeclId::Signature(sig_id.clone()))
+                        .is_some_and(|p| p.default_value().is_some()),
+                    _ => false,
+                }
+        };
+        if has_default {
+            own.optional.insert(name);
+            continue;
+        }
+
+        record_required_fields(&mut own.required, &mut own.optional, name, decl_type);
+    }
+    Some(own)
+}
+
+/// The type whose own requirements a super chain entry contributes.
+pub fn own_fields_owner(typ: &LuaType) -> Option<&LuaTypeDeclId> {
+    match typ {
+        LuaType::Ref(type_decl_id) => Some(type_decl_id),
+        LuaType::Generic(generic_type) => Some(generic_type.get_base_type_id_ref()),
+        _ => None,
+    }
+}
+
+/// The fields a table literal of `types` must set, folding each type's own
+/// requirements (`own`) in order: earlier types take priority.
+pub fn fold_required_fields<C: FnMut() -> bool>(
+    types: &[LuaType],
+    is_cancelled: &mut C,
+    mut own: impl FnMut(&LuaTypeDeclId, &mut C) -> Option<Arc<OwnFieldRequirements>>,
+) -> HashSet<String> {
+    let mut required_fields: HashSet<String> = HashSet::default();
     let mut optional_type = HashSet::default();
     for super_type in types {
         if is_cancelled() {
-            return Some(required_fields);
+            return required_fields;
         }
-        match super_type {
-            LuaType::Ref(type_decl_id) => process_type_decl_id(
-                db,
-                member_index,
-                &mut required_fields,
-                &mut optional_type,
-                type_decl_id.clone(),
-                &mut is_cancelled,
-            ),
-            LuaType::Generic(generic_type) => process_type_decl_id(
-                db,
-                member_index,
-                &mut required_fields,
-                &mut optional_type,
-                generic_type.get_base_type_id().clone(),
-                &mut is_cancelled,
-            ),
-            // Handle ---@class test: { a: number }
-            LuaType::Object(object_type) => {
-                let fields = object_type.get_fields();
-                for (key, decl_type) in fields {
-                    if is_cancelled() {
-                        return Some(required_fields);
-                    }
-                    let name = key.to_path();
-                    record_required_fields(
-                        &mut required_fields,
-                        &mut optional_type,
-                        name,
-                        decl_type.clone(),
-                    );
+        // Handle ---@class test: { a: number }
+        if let LuaType::Object(object_type) = super_type {
+            for (key, decl_type) in object_type.get_fields() {
+                if is_cancelled() {
+                    return required_fields;
                 }
-                continue;
+                record_required_fields(
+                    &mut required_fields,
+                    &mut optional_type,
+                    key.to_path(),
+                    decl_type.clone(),
+                );
             }
-            _ => continue,
+            continue;
+        }
+        let Some(owned) = own_fields_owner(super_type).and_then(|owner| own(owner, is_cancelled))
+        else {
+            continue;
         };
-    }
-
-    fn process_type_decl_id(
-        db: &DbIndex,
-        member_index: &crate::LuaMemberIndex,
-        required_fields: &mut HashSet<String>,
-        optional_type: &mut HashSet<String>,
-        type_decl_id: LuaTypeDeclId,
-        is_cancelled: &mut impl FnMut() -> bool,
-    ) -> Option<()> {
-        let members = member_index.get_members(&LuaMemberOwner::Type(type_decl_id))?;
-        let mut type_required_fields = HashSet::default();
-        let mut type_optional_fields = HashSet::default();
-
-        for member in members {
-            if is_cancelled() {
-                return Some(());
-            }
-            if matches!(
-                member.get_feature(),
-                LuaMemberFeature::FileMethodDecl | LuaMemberFeature::MetaMethodDecl
-            ) {
-                continue;
-            }
-            let name = member.get_key().to_path();
-
-            // A field the class never declared, attached by a plain `v.X = ...`
-            // write somewhere, is an addition to a value — not part of the
-            // contract a constructor has to satisfy. Only what the class
-            // declares can be required of a literal; runtime writes make the
-            // field available to read, at most optional to write.
-            if member.is_assignment_define() {
-                type_optional_fields.insert(name);
-                continue;
-            }
-            let decl_type = db
-                .get_type_index()
-                .get_type_cache(&member.get_id().into())
-                .unwrap_or(&LuaTypeCache::InferType(LuaType::Unknown))
-                .as_type()
-                .clone();
-
-            // Treat fields with documented defaults as optional-for-writing,
-            // matching the semantic table-compatibility rule in type_check.
-            let has_default = {
-                let owner_id = LuaSemanticDeclId::Member(member.get_id());
-                db.get_property_index()
-                    .get_property(&owner_id)
-                    .is_some_and(|p| p.default_value().is_some())
-                    || match &decl_type {
-                        LuaType::Signature(sig_id) => db
-                            .get_property_index()
-                            .get_property(&LuaSemanticDeclId::Signature(sig_id.clone()))
-                            .is_some_and(|p| p.default_value().is_some()),
-                        _ => false,
-                    }
-            };
-            if has_default {
-                type_optional_fields.insert(name);
-                continue;
-            }
-
-            record_required_fields(
-                &mut type_required_fields,
-                &mut type_optional_fields,
-                name,
-                decl_type,
-            );
-        }
-
-        optional_type.extend(type_optional_fields.iter().cloned());
-        for name in type_required_fields {
-            if !optional_type.contains(&name) {
-                required_fields.insert(name);
+        optional_type.extend(owned.optional.iter().cloned());
+        for name in &owned.required {
+            if !optional_type.contains(name) {
+                required_fields.insert(name.clone());
             }
         }
-
-        Some(())
     }
-
-    Some(required_fields)
+    required_fields
 }
 
 fn record_required_fields(

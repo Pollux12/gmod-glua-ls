@@ -194,7 +194,6 @@ impl LuaCompilation {
     /// Advances the re-analysis in progress by `slice`.
     pub fn advance_update(&mut self, slice: Slice) -> UpdateProgress {
         self.file_diagnostic_reads();
-        self.index_revision += 1;
         let session = self
             .reanalysis
             .get_mut()
@@ -202,6 +201,7 @@ impl LuaCompilation {
         let Some(reanalysis) = session else {
             return UpdateProgress::Settled(Vec::new());
         };
+        self.index_revision += 1;
         if self.db.get_vfs().holds_untaken_text() {
             reanalysis.install_detached(&mut self.db);
             return UpdateProgress::TextChanged;
