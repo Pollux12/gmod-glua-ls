@@ -22,8 +22,8 @@
 //! A re-analysis settles the re-analysed files first. Until their derivations
 //! settle through every stage, a reader in another file only waits: what it
 //! would re-check is still being rebuilt, and most of it comes back as it was.
-//! Once they settle, the readers whose reads still moved run from the first
-//! stage again, like any other work.
+//! Once they settle, the readers whose reads still moved run at the stage the
+//! run reached, like any other work.
 //!
 //! A run can advance in slices: it stops between two evaluations and picks up
 //! where it stopped, so readers can use the index in between.
@@ -36,7 +36,11 @@
 //! update, keeps what that fact supported on the way. Before the run ends,
 //! each loop a fact from outside moved under since it last settled is
 //! cleared and settles again from the first stage, until none is: what a loop
-//! holds is a function of what it reads, not of the order it read it in.
+//! holds is a function of what it reads, not of the order it read it in. A
+//! loop among the work a settled focus or loop leaves waiting is cleared
+//! before that work is released when no other waiting work lies upstream of
+//! it: run first, its members would only settle on what it held, and so would
+//! everything downstream of it, before it is cleared.
 //!
 //! A run settles in stages (see [`derivation::AnalysisStage`]). Some reads
 //! only have a final answer once nothing can add a fact any more: a field no
@@ -404,13 +408,18 @@ pub(crate) struct Engine {
     /// before they were removed: what a reader settled on of it, whatever it
     /// saw while the files were rebuilt.
     removed_outputs: FxHashMap<HashedKey, derivation::Fingerprint>,
-    /// The members of the loops this run cleared. A loop is cleared once per
-    /// run: settled again from nothing, it holds nothing from before the run,
-    /// and what moves under it later it follows as any reader does. A loop
-    /// through a pass that runs from the first stage, which loops leave out,
-    /// could otherwise be cleared without end, each time from what the pass
-    /// made of the last.
+    /// The members of the loops this run cleared at quiescence. A loop is
+    /// cleared there once per run: settled again from nothing, it holds
+    /// nothing from before the run, and what moves under it later it follows
+    /// as any reader does. A loop through a pass that runs from the first
+    /// stage, which loops leave out, could otherwise be cleared without end,
+    /// each time from what the pass made of the last.
     cleared: FxHashSet<DerivationId>,
+    /// The members of the loops this run cleared before the waiting work
+    /// they belong to was released (see [`Self::clear_parked_loops`]), once
+    /// each: should a fact from outside move under one after all, quiescence
+    /// clears it once more.
+    cleared_parked: FxHashSet<DerivationId>,
     /// Since the last loop check cleared loops: every key whose readers were
     /// checked. A loop the next check can clear lies downstream of one; `None`
     /// has the next check search every statement that settled on a moved fact.
@@ -1208,8 +1217,9 @@ impl Engine {
                         return false;
                     }
                     if crate::profile::phase("engine: release", || self.release_waiting(db)) {
-                        // What the settled focus released runs in slices sized for it.
-                        if slice.yields() && !self.released_unrun {
+                        // What the settled focus released runs in slices sized
+                        // for it; loops cleared ahead of it settle first.
+                        if slice.yields() && !self.released_unrun && self.loop_focus.is_empty() {
                             self.released_unrun = true;
                             return false;
                         }
@@ -2090,8 +2100,13 @@ impl Engine {
     }
 
     /// Notes that `member`, a statement of a rebuilt file, settled before the
-    /// run on what the removed derivations it reads wrote.
+    /// run on what the removed derivations it reads wrote, unless its loop
+    /// was cleared before release since: settled from nothing after the
+    /// removal, it holds nothing the removed derivations supplied.
     fn settled_on_removed(&mut self, db: &DbIndex, member: DerivationId) {
+        if self.cleared_parked.contains(&member) {
+            return;
+        }
         let removed = db
             .reader_graph()
             .reads_of(member)
@@ -2132,16 +2147,39 @@ impl Engine {
         let removed = self.removed_outputs.get(&moved.key).copied();
         ((moved.settled && moved.seen == derivation::ABSENT)
             || removed.is_some()
-            || self.from_before.contains(&member))
+            || self.settled_before_run(member))
             && !self.key_holds(db, &moved.key)(removed.unwrap_or(moved.seen))
     }
 
+    /// Whether statement `member` holds what a run that settled before this
+    /// one left: it ran in this run with a record from before it, or it is a
+    /// reader that has not run in it yet.
+    fn settled_before_run(&self, member: DerivationId) -> bool {
+        self.from_before.contains(&member) || !self.ran.contains(&member)
+    }
+
     /// Whether a fact `member` of `lp` reads from outside the loop now holds
-    /// another value than the one `member` had settled on.
-    fn moved_from_outside(&self, db: &DbIndex, lp: &[DerivationId], member: DerivationId) -> bool {
+    /// another value than the one `member` had settled on: one it settled on
+    /// when it ran, or, when it is among the `parked` readers that have yet
+    /// to run again, one that moved under it since.
+    fn moved_from_outside(
+        &self,
+        db: &DbIndex,
+        lp: &[DerivationId],
+        member: DerivationId,
+        parked: &FxHashSet<DerivationId>,
+    ) -> bool {
         let graph = db.reader_graph();
-        self.settled_on.get(&member).is_some_and(|moved| {
-            moved.iter().any(|moved| {
+        let moved_since = parked
+            .contains(&member)
+            .then(|| self.moved_from.get(&member))
+            .flatten();
+        self.settled_on
+            .get(&member)
+            .into_iter()
+            .chain(moved_since)
+            .flatten()
+            .any(|moved| {
                 // A fact a removed derivation wrote is read from outside the
                 // loop: what the removed writer supplied, nothing in the loop
                 // supplies any more.
@@ -2152,7 +2190,6 @@ impl Engine {
                             || producers.any(|producer| !lp.contains(&producer))
                     })
             })
-        })
     }
 
     /// At quiescence, clears every loop of statements, closed directly or
@@ -2216,6 +2253,7 @@ impl Engine {
         // on the way, not from what the other settles to.
         drop(_roots);
         let _search = crate::profile::PhaseGuard::new("loops: search");
+        let parked = FxHashSet::default();
         let loops = db.reader_graph().read_loops(
             roots.iter().copied(),
             DerivationKind::closes_loops,
@@ -2223,7 +2261,7 @@ impl Engine {
                 lp.iter().any(|member| !self.cleared.contains(member))
                     && lp
                         .iter()
-                        .any(|member| self.moved_from_outside(db, lp, *member))
+                        .any(|member| self.moved_from_outside(db, lp, *member, &parked))
             },
         );
         if loops.is_empty() {
@@ -2231,13 +2269,106 @@ impl Engine {
             return false;
         }
         drop(_search);
-        let _clear = crate::profile::PhaseGuard::new("loops: clear");
-        if crate::profile::tracing_evaluations() {
-            self.trace_loop_edges(db, &loops);
-        }
-        self.stats.loops_cleared += loops.len();
         self.since_search = Some(FxHashSet::default());
         self.cleared.extend(loops.iter().flatten().copied());
+        self.clear(db, &loops);
+        true
+    }
+
+    /// Once a focus or a loop settled, before the waiting work `released` is
+    /// queued: clears the loops [`Self::clear_loops`] would clear once that
+    /// work ran that have a member among it, if none of that work, nor a
+    /// source layer still to rebuild, lies upstream of them. Run first, their
+    /// members would settle on what the loops held, and so would whatever
+    /// reads them, all to run again once the loops are cleared. A loop cleared
+    /// here that a fact from outside moves under after all is cleared once
+    /// more at quiescence, so what it holds never rests on how far that work
+    /// had settled. Returns whether it cleared any.
+    fn clear_parked_loops(&mut self, db: &mut DbIndex, released: &[DerivationId]) -> bool {
+        if released.is_empty() {
+            return false;
+        }
+        let parked = released.iter().copied().collect::<FxHashSet<_>>();
+        // Statements that settled on a moved fact root loops too, so a loop
+        // downstream of one of theirs waits for it.
+        let roots = released
+            .iter()
+            .filter_map(|reader| self.moved_from.get_key_value(reader))
+            .chain(&self.settled_on)
+            .filter(|(member, moved)| {
+                moved
+                    .iter()
+                    .any(|moved| self.net_moved(db, **member, moved))
+            })
+            .map(|(member, _)| *member)
+            .collect::<BTreeSet<_>>();
+        if roots.is_empty() {
+            return false;
+        }
+        let loops = db.reader_graph().read_loops(
+            roots.iter().copied(),
+            DerivationKind::closes_loops,
+            |lp| {
+                lp.iter().any(|member| {
+                    !self.cleared.contains(member) && !self.cleared_parked.contains(member)
+                }) && lp
+                    .iter()
+                    .any(|member| self.moved_from_outside(db, lp, *member, &parked))
+            },
+        );
+        let loops = loops
+            .into_iter()
+            .filter(|lp| lp.iter().any(|member| parked.contains(member)))
+            .collect::<Vec<_>>();
+        if loops.is_empty() {
+            return false;
+        }
+        // Waiting work outside the loops moves what they read when it runs,
+        // through derivations of any kind.
+        let downstream = {
+            let graph = db.reader_graph();
+            let members = loops
+                .iter()
+                .flatten()
+                .flat_map(|statement| co_producers(db, *statement))
+                .collect::<FxHashSet<_>>();
+            let sources = self.stale_sources.iter().flat_map(|file_id| {
+                graph
+                    .derivations_of_file(*file_id)
+                    .filter(|id| id.kind == DerivationKind::Source)
+            });
+            let upstream = released
+                .iter()
+                .copied()
+                .filter(|reader| !members.contains(reader))
+                .chain(sources)
+                .collect::<Vec<_>>();
+            let outputs = upstream.iter().flat_map(|id| graph.outputs_of(*id));
+            graph.readers_downstream(outputs, |_| true)
+        };
+        let loops = loops
+            .into_iter()
+            .filter(|lp| !lp.iter().any(|member| downstream.contains(member)))
+            .collect::<Vec<_>>();
+        if loops.is_empty() {
+            return false;
+        }
+        self.stats.loops_cleared_parked += loops.len();
+        self.cleared_parked.extend(loops.iter().flatten().copied());
+        self.clear(db, &loops);
+        true
+    }
+
+    /// Clears `loops`: each member's primary outputs, and those of whatever
+    /// shares them, go back to the source layer, they run again before any
+    /// other work, and the run starts over from the first stage.
+    fn clear(&mut self, db: &mut DbIndex, loops: &[Vec<DerivationId>]) {
+        let _clear = crate::profile::PhaseGuard::new("loops: clear");
+        if crate::profile::tracing_evaluations() {
+            self.trace_loop_edges(db, loops);
+        }
+        self.stats.loop_waves += 1;
+        self.stats.loops_cleared += loops.len();
         let mut members = BTreeSet::new();
         for statement in loops.iter().flatten() {
             members.extend(co_producers(db, *statement));
@@ -2288,7 +2419,6 @@ impl Engine {
         }
         self.enter_stage(db, AnalysisStage::Open);
         self.cursor = None;
-        true
     }
 
     /// Under `GLUALS_TRACE_EVALUATIONS`, prints each loop about to be cleared:
@@ -2449,7 +2579,9 @@ impl Engine {
 
     /// Once the focus settled, queues the waiting readers whose reads still
     /// moved at the stage the run reached, and marks the source layers that
-    /// still read a moved fact. Returns whether it queued any.
+    /// still read a moved fact; or, when it can clear loops among them first
+    /// ([`Self::clear_parked_loops`]), leaves the rest waiting for those.
+    /// Returns whether it queued any.
     fn release_waiting(&mut self, db: &mut DbIndex) -> bool {
         self.focus.clear();
         self.handed_back = false;
@@ -2490,11 +2622,10 @@ impl Engine {
         };
         drop(_staleness);
         let _settle = crate::profile::PhaseGuard::new("release: settle");
+        let mut released = Vec::new();
         for ((reader, reason), staleness) in waiting.into_iter().zip(checked) {
             if reason == Reason::Changed {
-                self.stats.requeue_cause(reader, "released after the focus");
-                self.worklist.insert(reader, Reason::Changed);
-                queued += 1;
+                released.push((reader, reason));
                 continue;
             }
             let moved = if crate::profile::tracing_evaluations() {
@@ -2512,12 +2643,29 @@ impl Engine {
             if reader.kind == DerivationKind::Source {
                 self.stale_sources.insert(reader.file_id);
             } else {
-                // Found to need evaluating, it is queued as changed rather
-                // than checked again.
-                self.stats.requeue_cause(reader, "released after the focus");
-                self.worklist.insert(reader, Reason::Changed);
-                queued += 1;
+                released.push((reader, reason));
             }
+        }
+        drop(_settle);
+        let readers = released
+            .iter()
+            .map(|(reader, _)| *reader)
+            .collect::<Vec<_>>();
+        if crate::profile::phase("release: loops", || self.clear_parked_loops(db, &readers)) {
+            // The rest waits for the loops, then is checked again.
+            for (reader, reason) in released {
+                if !self.loop_focus.contains(&reader) {
+                    self.wait(reader, reason);
+                }
+            }
+            return true;
+        }
+        for (reader, _) in released {
+            // Found to need evaluating, it is queued as changed rather than
+            // checked again.
+            self.stats.requeue_cause(reader, "released after the focus");
+            self.worklist.insert(reader, Reason::Changed);
+            queued += 1;
         }
         self.stats.focus_settled(queued);
         let after_loops = std::mem::take(&mut self.after_loops);
@@ -3198,6 +3346,11 @@ pub(crate) struct EngineStats {
     /// Loops of statements cleared, and the derivations they ran again.
     pub(crate) loops_cleared: usize,
     pub(crate) loop_members_cleared: usize,
+    /// How often loops were cleared, each time settling together from the
+    /// first stage, and how many of them were cleared before the waiting
+    /// work they belong to was released.
+    pub(crate) loop_waves: usize,
+    pub(crate) loops_cleared_parked: usize,
     /// Source layers rebuilt because a fact they read moved.
     pub(crate) rebuilt_sources: usize,
     /// Under `GLUALS_PROFILE`: time per kind, the part of it spent
@@ -3383,12 +3536,14 @@ impl EngineStats {
             .map(|(kind, count)| format!("{kind:?}={count}"))
             .collect::<Vec<_>>();
         eprintln!(
-            "[engine] evaluations={} rounds={} rebuilt sources={} loops cleared={} ({} derivations) files={files} {}",
+            "[engine] evaluations={} rounds={} rebuilt sources={} loops cleared={} ({} derivations, {} waves, {} before release) files={files} {}",
             self.total_evaluations(),
             self.rounds,
             self.rebuilt_sources,
             self.loops_cleared,
             self.loop_members_cleared,
+            self.loop_waves,
+            self.loops_cleared_parked,
             kinds.join(" ")
         );
         eprintln!(
@@ -5729,6 +5884,170 @@ function holder.receiver:Use() end
                 .filter(|line| !workers.1.contains(line))
                 .take(10)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    const INPUT: u32 = 500;
+
+    /// Statements in `FILE`, each at its start with the positions it reads:
+    /// each binds at its start the union of what is bound where it reads, so
+    /// a loop of them keeps every value it ever saw until it is cleared.
+    struct Unions {
+        reads: Vec<(u32, Vec<u32>)>,
+    }
+
+    impl Recipe for Unions {
+        fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
+            let start = u32::from(id.syntax_id().get_range().start());
+            let (_, reads) = self
+                .reads
+                .iter()
+                .find(|(at, _)| *at == start)
+                .expect("a statement of the recipe");
+            let mut value = None::<LuaType>;
+            for position in reads {
+                let Some(read) = db
+                    .get_type_index()
+                    .get_type_cache(&owner(*position))
+                    .map(|cache| cache.as_type().clone())
+                else {
+                    continue;
+                };
+                value = Some(match value {
+                    Some(value) => TypeOps::Union.apply(db, &value, &read),
+                    None => read,
+                });
+            }
+            if let Some(value) = value {
+                bind(db, start, value);
+            }
+        }
+
+        fn splits(&self, _: DerivationKind) -> bool {
+            false
+        }
+
+        fn compute(&self, _: &DbIndex, _: DerivationId) -> Box<dyn std::any::Any + Send> {
+            unreachable!("unions do not split")
+        }
+
+        fn apply(&self, _: &mut DbIndex, _: DerivationId, _: Box<dyn std::any::Any + Send>) {
+            unreachable!("unions do not split")
+        }
+    }
+
+    /// What `recipe`'s statements bind, in order, once `INPUT` turns from
+    /// "old" to "new" under them, with the stats of that run; and what they
+    /// bind in a cold build from "new".
+    fn unions_after_edit(
+        recipe: &Unions,
+    ) -> (Vec<Option<LuaType>>, EngineStats, Vec<Option<LuaType>>) {
+        let _serial = serial_engine();
+        let statements = recipe
+            .reads
+            .iter()
+            .map(|(start, _)| *start)
+            .collect::<Vec<_>>();
+        let bound = |db: &DbIndex| {
+            statements
+                .iter()
+                .map(|start| {
+                    db.get_type_index()
+                        .get_type_cache(&owner(*start))
+                        .map(|cache| cache.as_type().clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        let settled_from = |value: &str| {
+            let mut ws = VirtualWorkspace::new();
+            let db = ws.get_db_mut();
+            bind(db, INPUT, text(value));
+            let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+            for start in &statements {
+                engine.changed(statement(*start));
+            }
+            engine.open(db);
+            assert!(engine.run(db, recipe, Slice::Whole));
+            ws
+        };
+        let mut warm = settled_from("old");
+        let db = warm.get_db_mut();
+        bind(db, INPUT, text("new"));
+        let input = HashedKey::new(FactKey::TypeCache(owner(INPUT)));
+        db.reader_graph().forget_fingerprint(&input);
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        engine.readers_of(db, [&input]);
+        engine.open(db);
+        assert!(engine.run(db, recipe, Slice::Whole));
+        let warm_bound = bound(&*db);
+        let mut cold = settled_from("new");
+        let cold_bound = bound(&*cold.get_db_mut());
+        (warm_bound, engine.stats().clone(), cold_bound)
+    }
+
+    #[test]
+    fn independent_loops_an_edit_moves_clear_in_one_wave_and_settle_as_a_cold_build() {
+        let recipe = Unions {
+            reads: vec![
+                (10, vec![INPUT, 20]),
+                (20, vec![10]),
+                (30, vec![INPUT, 40]),
+                (40, vec![30]),
+            ],
+        };
+
+        let (warm, stats, cold) = unions_after_edit(&recipe);
+
+        assert_eq!(warm, cold);
+        assert_eq!((stats.loops_cleared, stats.loop_waves), (2, 1));
+    }
+
+    #[test]
+    fn a_loop_downstream_of_a_cleared_one_clears_before_its_waiting_members_run() {
+        let recipe = Unions {
+            reads: vec![
+                (10, vec![INPUT, 20]),
+                (20, vec![10]),
+                (30, vec![10, 40]),
+                (40, vec![30]),
+            ],
+        };
+
+        let (warm, stats, cold) = unions_after_edit(&recipe);
+
+        assert_eq!(warm, cold);
+        assert_eq!(
+            (
+                stats.loops_cleared,
+                stats.loop_waves,
+                stats.loops_cleared_parked
+            ),
+            (2, 2, 1)
+        );
+    }
+
+    #[test]
+    fn a_loop_with_waiting_work_upstream_of_it_waits_for_that_work_to_settle() {
+        let recipe = Unions {
+            reads: vec![
+                (10, vec![INPUT, 20]),
+                (20, vec![10]),
+                (30, vec![10, 50, 40]),
+                (40, vec![30]),
+                (50, vec![10]),
+            ],
+        };
+
+        let (warm, stats, cold) = unions_after_edit(&recipe);
+
+        assert_eq!(warm, cold);
+        assert_eq!(
+            (
+                stats.loops_cleared,
+                stats.loop_waves,
+                stats.loops_cleared_parked
+            ),
+            (2, 2, 0)
         );
     }
 }
