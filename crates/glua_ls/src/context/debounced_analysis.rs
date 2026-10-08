@@ -73,6 +73,9 @@ pub struct DebouncedAnalysis {
     /// The analysis's slice interrupt, taken by the first slice: set when an
     /// edit arrives so the slice in progress stops for it.
     interrupt: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>>,
+    /// When the newest change arrived: while changes keep arriving, the work
+    /// a settled focus released waits; see [`DebouncedAnalysis::hold_while_editing`].
+    last_change: std::sync::Mutex<Option<Instant>>,
     /// False once the supervisor has given up restarting the debounce loop
     /// (see `LS_DEBOUNCE_LOOP_DEAD`). Freshness can then never arrive, so
     /// waiters fail fast instead of parking until their request is cancelled.
@@ -190,6 +193,7 @@ impl DebouncedAnalysis {
             settling: AtomicBool::new(false),
             prioritised: std::sync::Mutex::default(),
             interrupt: std::sync::OnceLock::new(),
+            last_change: std::sync::Mutex::new(None),
             debounce_loop_alive: AtomicBool::new(true),
             in_flight_changes: AtomicUsize::new(0),
             in_flight_documents: std::sync::Mutex::default(),
@@ -292,6 +296,9 @@ impl DebouncedAnalysis {
 
     fn begin_change(self: &Arc<Self>, documents: Option<Vec<Uri>>) -> InFlightChangeGuard {
         self.in_flight_changes.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut last_change) = self.last_change.lock() {
+            *last_change = Some(Instant::now());
+        }
         if let Some(interrupt) = self.interrupt.get() {
             interrupt.store(true, Ordering::Release);
         }
@@ -854,6 +861,40 @@ impl DebouncedAnalysis {
         self.in_flight_change_count() == 0
     }
 
+    /// Once the edited files settled, waits while changes are still
+    /// arriving: what their settled focus released would otherwise carry a
+    /// passing state of the text into the rest of the workspace, only for the
+    /// next change to carry it back out. Ends once no change has arrived for
+    /// a debounce, at the next change, or for a request that has to wait.
+    async fn hold_while_editing(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let quiet_at = self
+                .last_change
+                .lock()
+                .ok()
+                .and_then(|last_change| *last_change)
+                .map(|at| at + self.debounce_duration);
+            let Some(quiet_at) = quiet_at else {
+                return;
+            };
+            if Instant::now() >= quiet_at
+                || self.waiting_requests.load(Ordering::Acquire) > 0
+                || self.in_flight_change_count() > 0
+                || !self.pending_files.lock().await.is_empty()
+            {
+                return;
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = self.shutdown.cancelled() => return,
+                _ = tokio::time::sleep_until(quiet_at.into()) => return,
+            }
+        }
+    }
+
     /// Takes in the files whose text changed without a schedule reaching the
     /// loop, so a re-analysis never waits on text it has not taken.
     async fn take_unscheduled_text(&self) -> Vec<FileId> {
@@ -1035,7 +1076,12 @@ impl DebouncedAnalysis {
                 continue;
             };
             self.release_documents(&settled_first).await;
+            let focus_settled = !edited.is_empty() && settled_first.len() == edited.len();
             match progress {
+                UpdateProgress::Settling if focus_settled => {
+                    self.reindex_notify.notify_waiters();
+                    self.hold_while_editing().await;
+                }
                 UpdateProgress::Settling => {}
                 UpdateProgress::Settled(affected) => {
                     self.settling.store(false, Ordering::Release);
@@ -1162,6 +1208,10 @@ mod tests {
     }
 
     fn test_debounced_analysis() -> Arc<DebouncedAnalysis> {
+        test_debounced_analysis_with_debounce(0)
+    }
+
+    fn test_debounced_analysis_with_debounce(debounce_ms: u64) -> Arc<DebouncedAnalysis> {
         let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
         let (connection, _peer) = Connection::memory();
         let client = Arc::new(ClientProxy::new(connection));
@@ -1173,7 +1223,7 @@ mod tests {
         ));
         Arc::new(DebouncedAnalysis::new(
             analysis,
-            0,
+            debounce_ms,
             CancellationToken::new(),
             client,
             file_diagnostic,
@@ -1335,6 +1385,45 @@ mod tests {
             verify_that!(debounced_analysis.slice_can_start().await, eq(false))?;
             in_flight.finish().await;
             verify_that!(debounced_analysis.slice_can_start().await, eq(true))?;
+            Ok(())
+        })
+    }
+
+    /// Once the edited files settled, the work they released waits while
+    /// changes keep arriving and goes on a debounce after the last one; a
+    /// request that has to wait, or the next edit, ends the wait at once.
+    #[gtest]
+    fn released_work_waits_for_changes_to_stop() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounce = Duration::from_millis(300);
+            let debounced_analysis = test_debounced_analysis_with_debounce(300);
+
+            debounced_analysis.begin_in_flight_change().finish().await;
+            let started = Instant::now();
+            debounced_analysis.hold_while_editing().await;
+            verify_that!(started.elapsed() >= debounce * 3 / 4, eq(true))?;
+
+            debounced_analysis.begin_in_flight_change().finish().await;
+            let waiting = debounced_analysis.request_waiting();
+            let started = Instant::now();
+            debounced_analysis.hold_while_editing().await;
+            verify_that!(started.elapsed() < debounce * 3 / 4, eq(true))?;
+            drop(waiting);
+
+            debounced_analysis.begin_in_flight_change().finish().await;
+            let edit = tokio::spawn({
+                let debounced_analysis = debounced_analysis.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    let uri = Uri::from_str("file:///held.lua").expect("URI should parse");
+                    debounced_analysis.schedule(FileId::new(1), uri).await;
+                }
+            });
+            let started = Instant::now();
+            debounced_analysis.hold_while_editing().await;
+            verify_that!(started.elapsed() < debounce * 3 / 4, eq(true))?;
+            edit.await.expect("the edit task must not panic");
             Ok(())
         })
     }

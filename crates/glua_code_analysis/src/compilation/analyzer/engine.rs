@@ -1011,6 +1011,8 @@ impl Engine {
     /// be replaced and queued again.
     pub(crate) fn replacing(&mut self, file_ids: &[crate::FileId]) {
         self.since_search = None;
+        // An edit's focus hands the run back once it settles.
+        self.handed_back = false;
         self.requeue_carried();
         let replaced = |id: DerivationId| file_ids.contains(&id.file_id);
         self.worklist.take_where(replaced);
