@@ -3,19 +3,21 @@ mod lua_member_feature;
 mod lua_member_item;
 mod lua_member_owner;
 mod lua_owner_members;
+mod slot_ids;
 mod test;
 
 use crate::db_index::cow_shards::{CowCell, CowShardSet, CowShards, ShardKey};
 use rowan::{TextRange, TextSize};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use super::traits::LuaIndex;
 use crate::db_index::derivation::{
     self, ABSENT, DerivationId, FactKey, Fingerprint, fingerprint_of,
 };
 use crate::{FileId, GlobalId, db_index::member::lua_owner_members::LuaOwnerMembers};
+use slot_ids::SlotIds;
 
 pub use lua_member::{LuaMember, LuaMemberId, LuaMemberKey};
 pub use lua_member_feature::LuaMemberFeature;
@@ -29,7 +31,7 @@ pub use lua_member_owner::LuaMemberOwner;
 /// Two of these are kept. The visible one answers lookups; the history one also
 /// keeps members a later write displaced, so a removal can still find where they
 /// were filed.
-type OwnerKeyMap = CowShards<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>;
+type OwnerKeyMap = CowShards<LuaMemberOwner, HashMap<LuaMemberKey, SlotIds>>;
 
 /// Files `id` in its slot unless the slot already holds it.
 fn push_owner_key_id_unique(
@@ -53,13 +55,20 @@ fn push_owner_key_id_unique(
 /// Merges two tasks' changes to one owner-key slot, which stays sorted by
 /// [`member_id_sort_key`].
 fn merge_member_ids(
-    current: &mut Option<Vec<LuaMemberId>>,
-    frozen: Option<&Vec<LuaMemberId>>,
-    fork: Option<&Vec<LuaMemberId>>,
+    current: &mut Option<SlotIds>,
+    frozen: Option<&SlotIds>,
+    fork: Option<&SlotIds>,
 ) -> crate::db_index::cow_shards::Merged {
-    crate::db_index::cow_shards::merge_sorted_by(current, frozen, fork, |id| {
-        member_id_sort_key(*id)
-    })
+    let to_vec = |ids: Option<&SlotIds>| ids.map(|ids| ids.to_vec());
+    let mut merged = to_vec(current.as_ref());
+    crate::db_index::cow_shards::merge_sorted_by(
+        &mut merged,
+        to_vec(frozen).as_ref(),
+        to_vec(fork).as_ref(),
+        |id| member_id_sort_key(*id),
+    )?;
+    *current = merged.map(SlotIds::from_vec);
+    Ok(())
 }
 
 /// The member fingerprints a task install rebuilds.
@@ -203,7 +212,9 @@ struct SourceMemberState {
 pub struct LuaMemberIndex {
     members: CowShards<LuaMemberId, LuaMember>,
     source_members: CowShards<LuaMemberId, SourceMember>,
-    in_filed: CowShards<FileId, HashSet<MemberOrOwner>>,
+    /// The owners each file's members are filed under. The members themselves
+    /// are the file's shard of `members`.
+    in_filed: CowShards<FileId, HashSet<LuaMemberOwner>>,
     owner_members: CowShards<LuaMemberOwner, LuaOwnerMembers>,
     member_current_owner: CowShards<LuaMemberId, LuaMemberOwner>,
     member_owner_key_index: OwnerKeyMap,
@@ -213,9 +224,8 @@ pub struct LuaMemberIndex {
     /// than every owner in the workspace. Entries may outlive the members that
     /// caused them; a sweep of an owner that holds none is a no-op.
     owner_key_index_owners_by_file: CowShards<FileId, HashSet<LuaMemberOwner>>,
-    current_owner_member_history:
-        CowShards<LuaMemberOwner, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
-    current_members_by_key: CowShards<LuaMemberKey, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
+    current_owner_member_history: CowShards<LuaMemberOwner, SlotIds>,
+    current_members_by_key: CowShards<LuaMemberKey, SlotIds>,
     /// The members filed under an expression key that names another file's
     /// positions, by that file.
     expr_key_members_by_file: CowShards<FileId, HashSet<LuaMemberId>>,
@@ -293,12 +303,6 @@ pub struct LuaMemberIndex {
     /// Per-file multiset fingerprint of the file's members, function scopes
     /// and element owners, for [`FactKey::MemberFile`].
     file_fingerprints: CowShards<FileId, Fingerprint>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum MemberOrOwner {
-    Member(LuaMemberId),
-    Owner(LuaMemberOwner),
 }
 
 /// One file's `---@class` proposal for a global path's declaration.
@@ -426,7 +430,7 @@ impl LuaMemberIndex {
                 .get(key)
                 .map_or(ABSENT, |members| {
                     members
-                        .values()
+                        .iter()
                         .map(fingerprint_of)
                         .fold(ABSENT, Fingerprint::wrapping_add)
                 }),
@@ -518,7 +522,7 @@ impl LuaMemberIndex {
             return ABSENT;
         }
         let entries = [visible, history].map(|ids| {
-            ids.map_or(&[][..], Vec::as_slice)
+            ids.map_or(&[][..], SlotIds::as_slice)
                 .iter()
                 .map(|id| {
                     let homed = self.member_current_owner.get(id) == Some(owner);
@@ -593,7 +597,7 @@ impl LuaMemberIndex {
             .current_owner_member_history
             .get(owner)
             .into_iter()
-            .flat_map(|history| history.values())
+            .flat_map(|history| history.iter())
             .map(|id| current_history_element(*id));
         keyed
             .chain(current)
@@ -621,14 +625,9 @@ impl LuaMemberIndex {
     /// incremental `file_fingerprints` sum holds.
     fn recomputed_file_fingerprint(&self, file_id: FileId) -> Fingerprint {
         let members = self
-            .in_filed
-            .get(&file_id)
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| match entry {
-                MemberOrOwner::Member(id) => Some(file_member_element(*id)),
-                MemberOrOwner::Owner(_) => None,
-            });
+            .members
+            .file_entries(file_id)
+            .map(|(id, _)| file_member_element(*id));
         let scopes = self
             .function_scope_ranges
             .get(&file_id)
@@ -654,7 +653,7 @@ impl LuaMemberIndex {
         self.current_members_by_key
             .get(key)
             .into_iter()
-            .flat_map(|members| members.values())
+            .flat_map(|members| members.iter())
             .map(fingerprint_of)
             .fold(ABSENT, Fingerprint::wrapping_add)
     }
@@ -1022,17 +1021,19 @@ impl LuaMemberIndex {
             // pushing it again would list the member twice in the slot.
             already_filed_here = same_owner && !key_changed;
         }
-        self.members.insert(id, member);
+        let first_filing = self.members.insert(id, member).is_none();
         if member_object_changed {
             self.note_member_object_write(id);
         }
         self.set_member_function_scope_range(id, function_scope);
-        self.add_in_file_object(file_id, MemberOrOwner::Member(id));
+        if first_filing {
+            self.fold_file_fingerprint(file_id, file_member_element(id), true);
+        }
         if !owner.is_unknown() {
             self.member_current_owner.insert(id, owner.clone());
             self.add_current_member_key(id);
             self.insert_current_owner_member(&owner, id);
-            self.add_in_file_object(file_id, MemberOrOwner::Owner(owner.clone()));
+            self.add_file_owner(file_id, owner.clone());
             if is_owner_only {
                 self.owner_only_members.insert(id);
             } else {
@@ -1052,8 +1053,7 @@ impl LuaMemberIndex {
             .current_owner_member_history
             .entry(owner.clone())
             .or_default()
-            .insert(member_id_sort_key(id), id)
-            .is_none();
+            .insert_sorted(id);
         if inserted {
             self.fold_history_fingerprint(owner, current_history_element(id), true);
         }
@@ -1117,19 +1117,8 @@ impl LuaMemberIndex {
         Some(())
     }
 
-    fn add_in_file_object(&mut self, file_id: FileId, member_or_owner: MemberOrOwner) {
-        let member = match &member_or_owner {
-            MemberOrOwner::Member(id) => Some(*id),
-            MemberOrOwner::Owner(_) => None,
-        };
-        let inserted = self
-            .in_filed
-            .entry(file_id)
-            .or_default()
-            .insert(member_or_owner);
-        if inserted && let Some(id) = member {
-            self.fold_file_fingerprint(file_id, file_member_element(id), true);
-        }
+    fn add_file_owner(&mut self, file_id: FileId, owner: LuaMemberOwner) {
+        self.in_filed.entry(file_id).or_default().insert(owner);
     }
 
     /// Files `id` under `owner`. A slot holds every member written or declared
@@ -1292,7 +1281,7 @@ impl LuaMemberIndex {
         }
 
         self.merge_member_into_owner_item(owner.clone(), key, id);
-        self.add_in_file_object(file_id, MemberOrOwner::Owner(owner));
+        self.add_file_owner(file_id, owner);
         Some(())
     }
 
@@ -1658,7 +1647,7 @@ impl LuaMemberIndex {
             let function_scope = self.assignment_file_define_scope_for_member(member);
             self.set_member_function_scope_range(id, function_scope);
         }
-        self.add_in_file_object(file_id, MemberOrOwner::Owner(owner));
+        self.add_file_owner(file_id, owner);
 
         Some(())
     }
@@ -2857,7 +2846,7 @@ impl LuaMemberIndex {
             return Vec::new();
         };
         member_ids
-            .values()
+            .iter()
             .filter_map(|member_id| self.get_member(member_id))
             .collect()
     }
@@ -2867,7 +2856,7 @@ impl LuaMemberIndex {
             let Some(members) = self.current_owner_member_history.get_mut(owner) else {
                 return;
             };
-            let removed = members.remove(&member_id_sort_key(member_id)).is_some();
+            let removed = members.remove_sorted(member_id);
             if members.is_empty() {
                 self.current_owner_member_history.remove(owner);
             }
@@ -2885,7 +2874,7 @@ impl LuaMemberIndex {
         };
 
         member_ids
-            .values()
+            .iter()
             .filter_map(|member_id| self.get_member(member_id))
             .collect()
     }
@@ -2907,8 +2896,7 @@ impl LuaMemberIndex {
             .current_members_by_key
             .entry(key.clone())
             .or_default()
-            .insert(member_id_sort_key(member_id), member_id)
-            .is_none()
+            .insert_sorted(member_id)
         {
             derivation::note_write(|| FactKey::MemberKey(key.clone()));
             fold_fingerprint(
@@ -2939,7 +2927,7 @@ impl LuaMemberIndex {
             let Some(members) = self.current_members_by_key.get_mut(&key) else {
                 return;
             };
-            let removed = members.remove(&member_id_sort_key(member_id)).is_some();
+            let removed = members.remove_sorted(member_id);
             if members.is_empty() {
                 self.current_members_by_key.remove(&key);
             }
@@ -2960,30 +2948,26 @@ impl LuaMemberIndex {
     pub(crate) fn file_member_ids(&self, file_id: FileId) -> Vec<LuaMemberId> {
         derivation::note_read(|| FactKey::MemberFile(file_id));
         let mut ids = self
-            .in_filed
-            .get(&file_id)
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| match entry {
-                MemberOrOwner::Member(member_id) => Some(*member_id),
-                MemberOrOwner::Owner(_) => None,
-            })
+            .members
+            .file_entries(file_id)
+            .map(|(id, _)| *id)
             .collect::<Vec<_>>();
         ids.sort_by_key(|id| member_id_sort_key(*id));
         ids
     }
 
+    /// The members filed under `file_id`, sorted.
     pub fn get_file_members(&self, file_id: FileId) -> Vec<&LuaMember> {
         derivation::note_read(|| FactKey::MemberFile(file_id));
-        let Some(member_or_owners) = self.in_filed.get(&file_id) else {
-            return Vec::new();
-        };
-
-        let mut members = Vec::with_capacity(member_or_owners.len());
-        members.extend(member_or_owners.iter().filter_map(|entry| match entry {
-            MemberOrOwner::Member(member_id) => self.get_member(member_id),
-            MemberOrOwner::Owner(_) => None,
-        }));
+        let mut members = self
+            .members
+            .file_entries(file_id)
+            .map(|(id, member)| {
+                derivation::note_member_object_read(*id);
+                member
+            })
+            .collect::<Vec<_>>();
+        members.sort_by_key(|member| member_id_sort_key(member.get_id()));
         members
     }
 }
@@ -3051,7 +3035,7 @@ impl LuaMemberIndex {
             self.remove_current_owner_member(&owner, member_id);
             self.remove_current_member_key(member_id);
         }
-        self.members.remove(&member_id);
+        let removed = self.members.remove(&member_id).is_some();
         self.source_members.remove(&member_id);
         self.member_current_owner.remove(&member_id);
         self.member_path_provenance.remove(&member_id);
@@ -3061,18 +3045,8 @@ impl LuaMemberIndex {
         self.note_member_object_write(member_id);
         self.deferred_index_expr_members.remove(&member_id);
         self.member_function_scope_ranges.remove(&member_id);
-        if let Some(set) = self.in_filed.get_mut(&member_id.file_id) {
-            let removed = set.remove(&MemberOrOwner::Member(member_id));
-            if set.is_empty() {
-                self.in_filed.remove(&member_id.file_id);
-            }
-            if removed {
-                self.fold_file_fingerprint(
-                    member_id.file_id,
-                    file_member_element(member_id),
-                    false,
-                );
-            }
+        if removed {
+            self.fold_file_fingerprint(member_id.file_id, file_member_element(member_id), false);
         }
     }
 
@@ -3081,20 +3055,16 @@ impl LuaMemberIndex {
     /// `remove_files`, not here — running them per file made removal cost
     /// O(files × index) and dominated incremental edits of high fan-in files.
     fn remove_file_owned_entries(&mut self, file_id: FileId) {
-        if let Some(member_ids) = self.in_filed.remove(&file_id) {
-            let mut owners = HashSet::default();
-            for member_id_or_owner in member_ids {
-                match member_id_or_owner {
-                    MemberOrOwner::Member(member_id) => {
-                        self.fold_file_fingerprint(file_id, file_member_element(member_id), false);
-                        self.forget_member(member_id);
-                    }
-                    MemberOrOwner::Owner(owner) => {
-                        owners.insert(owner);
-                    }
-                }
-            }
-
+        let owners = self.in_filed.remove(&file_id);
+        let member_ids = self
+            .members
+            .file_entries(file_id)
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for member_id in member_ids {
+            self.forget_member(member_id);
+        }
+        if let Some(owners) = owners {
             let mut need_removed_owner = Vec::new();
             for owner in owners {
                 // `iter_mut` invalidates the owner's revision on entry, so an
@@ -3215,9 +3185,8 @@ impl LuaMemberIndex {
     /// `set_member_owner` files it under the contributing member's file, so a
     /// single Element owner can be registered by several files at once.
     fn remove_owner_from_all_files(&mut self, owner: &LuaMemberOwner) {
-        let entry = MemberOrOwner::Owner(owner.clone());
         self.in_filed.retain(|_, set| {
-            set.remove(&entry);
+            set.remove(owner);
             !set.is_empty()
         });
     }
@@ -3518,12 +3487,8 @@ crate::db_index::cow_shards::task_fork_fields!(LuaMemberIndex {
         crate::db_index::cow_shards::merge_map(current, frozen, fork, merge_member_ids)
     },
     owner_key_index_owners_by_file => crate::db_index::cow_shards::merge_set,
-    current_owner_member_history => |current, frozen, fork| {
-        crate::db_index::cow_shards::merge_map(current, frozen, fork, crate::db_index::cow_shards::refuse)
-    },
-    current_members_by_key => |current, frozen, fork| {
-        crate::db_index::cow_shards::merge_map(current, frozen, fork, crate::db_index::cow_shards::refuse)
-    },
+    current_owner_member_history => merge_member_ids,
+    current_members_by_key => merge_member_ids,
     expr_key_members_by_file => crate::db_index::cow_shards::merge_set,
     non_overwriting_assignment_members,
     preserved_co_writer_reconciled,
