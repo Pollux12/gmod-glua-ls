@@ -3,7 +3,7 @@
 //! Workspace derivations fold per-file facts (call roles, the load graph and
 //! file realms, valid-guard signatures, vgui parent chains). Per-file
 //! derivations collect one file's metadata, call sites, synthesized members
-//! and net flows, reading the workspace folds through the index.
+//! and net-helper names, reading the workspace folds through the index.
 
 use std::sync::Arc;
 
@@ -233,12 +233,4 @@ pub(crate) fn evaluate_vgui_chains(db: &mut DbIndex, context: &mut AnalyzeContex
         return;
     }
     resolve_vgui_parent_relations(db, context);
-}
-
-/// One file's net message flows.
-pub(crate) fn evaluate_network(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    if !db.get_emmyrc().gmod.enabled {
-        return;
-    }
-    network::collect_network_flows(db, context);
 }

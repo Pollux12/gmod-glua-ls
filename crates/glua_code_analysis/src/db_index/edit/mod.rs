@@ -86,7 +86,7 @@ pub fn remap_into_file(db: &mut DbIndex, remap: &FileRemap) -> Vec<LostFact> {
         db.get_call_site_param_index_mut()
             .remap_file_identities(remap),
     );
-    lost.extend(db.remap_net_helpers(remap));
+    lost.extend(db.remap_net_sites(remap));
     lost.extend(db.get_gmod_network_index_mut().remap_file_positions(remap));
     db.get_gmod_load_index_mut().remap_edge_positions(remap);
     db.get_gmod_infer_index_mut().remap_realm_ranges(remap);

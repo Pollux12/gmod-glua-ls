@@ -329,6 +329,65 @@ pub struct FileNetworkData {
     pub receive_flows: Vec<NetReceiveFlow>,
 }
 
+/// The flows one call starts, receives or materializes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct CallFlows {
+    pub send_flows: Vec<NetSendFlow>,
+    pub receive_flows: Vec<NetReceiveFlow>,
+}
+
+impl CallFlows {
+    pub fn is_empty(&self) -> bool {
+        self.send_flows.is_empty() && self.receive_flows.is_empty()
+    }
+}
+
+/// How a send flow ranks among the flows starting at one position: a flow
+/// written directly, a wrapped definition's, then a materialized call's.
+fn send_rank(flow: &NetSendFlow) -> u8 {
+    if flow.is_wrapped {
+        1
+    } else if flow.materialized_from.is_some() {
+        2
+    } else {
+        0
+    }
+}
+
+/// A file's flows from those of its calls: sends in the order of their start,
+/// receives in the order of their registration, each call's flows in the
+/// order it filed them.
+fn assemble_file_data(calls: &FxHashMap<TextRange, CallFlows>) -> FileNetworkData {
+    let mut calls = calls.iter().collect::<Vec<_>>();
+    calls.sort_unstable_by_key(|(call, _)| (call.start(), call.end()));
+    let mut send_flows = Vec::new();
+    let mut receive_flows = Vec::new();
+    for (call, flows) in calls {
+        let origin = (call.end(), call.start());
+        for (idx, flow) in flows.send_flows.iter().enumerate() {
+            send_flows.push((
+                (flow.start_range.start(), send_rank(flow), origin, idx),
+                flow,
+            ));
+        }
+        for (idx, flow) in flows.receive_flows.iter().enumerate() {
+            receive_flows.push(((flow.receive_range.start(), origin, idx), flow));
+        }
+    }
+    send_flows.sort_by_key(|(key, _)| *key);
+    receive_flows.sort_by_key(|(key, _)| *key);
+    FileNetworkData {
+        send_flows: send_flows
+            .into_iter()
+            .map(|(_, flow)| flow.clone())
+            .collect(),
+        receive_flows: receive_flows
+            .into_iter()
+            .map(|(_, flow)| flow.clone())
+            .collect(),
+    }
+}
+
 /// What one reference site in one file contributes to the net-helper name
 /// closure: the written names of the functions enclosing the sites, and the
 /// local declarations those functions are bound to (whose own references carry
@@ -341,6 +400,9 @@ pub struct NetNameExpansion {
 
 #[derive(Debug, Default, Clone)]
 pub struct GmodNetworkIndex {
+    /// What each file's calls filed, by call range.
+    call_flows: CowShards<FileId, Arc<FxHashMap<TextRange, CallFlows>>>,
+    /// Each file's flows, assembled from its calls'.
     file_data: CowShards<FileId, FileNetworkData>,
     send_flows_by_message: CowShards<String, Vec<(FileId, usize)>>,
     receive_flows_by_message: CowShards<String, Vec<(FileId, usize)>>,
@@ -471,7 +533,7 @@ impl RemapOutcome {
 
 /// `data` with the positions of `remap`'s file it names moved to their new
 /// place.
-fn remap_file_data(data: &FileNetworkData, remap: &FileRemap) -> Remap<FileNetworkData> {
+fn remap_call_flows(data: &CallFlows, remap: &FileRemap) -> Remap<CallFlows> {
     let mut data = data.clone();
     let mut outcome = RemapOutcome::default();
     for flow in &mut data.send_flows {
@@ -501,6 +563,7 @@ fn remap_file_data(data: &FileNetworkData, remap: &FileRemap) -> Remap<FileNetwo
 impl GmodNetworkIndex {
     pub fn new() -> Self {
         Self {
+            call_flows: Default::default(),
             file_data: Default::default(),
             send_flows_by_message: Default::default(),
             receive_flows_by_message: Default::default(),
@@ -519,6 +582,15 @@ impl GmodNetworkIndex {
             FactKey::NetworkFile(file_id) => {
                 derivation::fingerprint_opt(self.file_data.get(file_id))
             }
+            FactKey::NetFlows(site) => self
+                .call_flows
+                .get(&site.file_id)
+                .and_then(|calls| calls.get(&site.value))
+                .map_or(derivation::ABSENT, |flows| {
+                    derivation::in_file(Some(site.file_id), || {
+                        derivation::fingerprint_of(&(site.file_id, flows))
+                    })
+                }),
             FactKey::NetOperationNames => {
                 let mut names = self.op_names.iter().collect::<Vec<_>>();
                 names.sort_unstable();
@@ -649,9 +721,50 @@ impl GmodNetworkIndex {
         coverage
     }
 
-    pub fn add_file_data(&mut self, file_id: FileId, data: FileNetworkData) {
+    /// Files the flows the call at `call` of `file_id` starts, receives or
+    /// materializes.
+    pub fn set_call_flows(&mut self, file_id: FileId, call: TextRange, flows: CallFlows) {
+        if flows.is_empty() {
+            self.reset_call_flows(file_id, call);
+            return;
+        }
+        self.insert_call_flows(file_id, call, flows);
+        self.assemble_file(file_id);
+    }
+
+    fn insert_call_flows(&mut self, file_id: FileId, call: TextRange, flows: CallFlows) {
+        derivation::note_write(|| FactKey::NetFlows(crate::InFiled::new(file_id, call)));
+        Arc::make_mut(self.call_flows.entry(file_id).or_default()).insert(call, flows);
+    }
+
+    /// Drops the flows the call at `call` of `file_id` filed, before the
+    /// derivation that found them runs again.
+    pub(crate) fn reset_call_flows(&mut self, file_id: FileId, call: TextRange) {
+        derivation::note_write(|| FactKey::NetFlows(crate::InFiled::new(file_id, call)));
+        let Some(calls) = self.call_flows.get_mut(&file_id) else {
+            return;
+        };
+        if !calls.contains_key(&call) {
+            return;
+        }
+        let calls = Arc::make_mut(calls);
+        calls.remove(&call);
+        if calls.is_empty() {
+            self.call_flows.remove(&file_id);
+        }
+        self.assemble_file(file_id);
+    }
+
+    /// Replaces the file's flows with those of its calls.
+    fn assemble_file(&mut self, file_id: FileId) {
         derivation::note_write(|| FactKey::NetworkFile(file_id));
-        self.remove_file(file_id);
+        if let Some(data) = self.file_data.remove(&file_id) {
+            self.remove_file_data_indexes(file_id, &data);
+        }
+        let Some(calls) = self.call_flows.get(&file_id) else {
+            return;
+        };
+        let data = assemble_file_data(calls);
         self.index_file_data(file_id, &data);
         self.file_data.insert(file_id, data);
     }
@@ -762,6 +875,13 @@ impl GmodNetworkIndex {
 
     pub fn remove_file(&mut self, file_id: FileId) {
         derivation::note_write(|| FactKey::NetworkFile(file_id));
+        if let Some(calls) = self.call_flows.remove(&file_id)
+            && derivation::recording()
+        {
+            for call in calls.keys() {
+                derivation::note_write(|| FactKey::NetFlows(crate::InFiled::new(file_id, *call)));
+            }
+        }
         if let Some(data) = self.file_data.remove(&file_id) {
             self.remove_file_data_indexes(file_id, &data);
         }
@@ -779,22 +899,42 @@ impl GmodNetworkIndex {
         files.sort_unstable();
         let mut lost = Vec::new();
         for file_id in files {
-            let Some(data) = self.file_data.get(&file_id) else {
+            let Some(calls) = self.call_flows.get(&file_id) else {
                 continue;
             };
-            match remap_file_data(data, remap) {
-                Remap::Moved(data) => self.add_file_data(file_id, data),
-                Remap::Lost => {
-                    lost.push(crate::LostFact::new(file_id, FactKey::NetworkFile(file_id)));
+            let mut calls = calls.iter().collect::<Vec<_>>();
+            calls.sort_unstable_by_key(|(call, _)| (call.start(), call.end()));
+            let mut moved = Vec::new();
+            for (call, flows) in calls {
+                match remap_call_flows(flows, remap) {
+                    Remap::Moved(flows) => moved.push((*call, flows)),
+                    Remap::Lost => lost.push(crate::LostFact::new(
+                        file_id,
+                        FactKey::NetFlows(crate::InFiled::new(file_id, *call)),
+                    )),
+                    Remap::Unrelated => {}
                 }
-                Remap::Unrelated => {}
             }
+            if moved.is_empty() {
+                continue;
+            }
+            for (call, flows) in moved {
+                self.insert_call_flows(file_id, call, flows);
+            }
+            self.assemble_file(file_id);
         }
         lost
     }
 
     pub fn clear(&mut self) {
         if derivation::recording() {
+            for (file_id, calls) in self.call_flows.iter() {
+                for call in calls.keys() {
+                    derivation::note_write(|| {
+                        FactKey::NetFlows(crate::InFiled::new(*file_id, *call))
+                    });
+                }
+            }
             for file_id in self.file_data.keys() {
                 derivation::note_write(|| FactKey::NetworkFile(*file_id));
             }
@@ -811,6 +951,7 @@ impl GmodNetworkIndex {
         derivation::note_write(|| FactKey::NetworkScan);
         self.flows_fingerprint = 0;
         self.canonical_ops_fingerprint = 0;
+        self.call_flows.clear();
         self.file_data.clear();
         self.send_flows_by_message.clear();
         self.receive_flows_by_message.clear();
@@ -946,6 +1087,34 @@ mod tests {
 
     fn range(start: u32) -> TextRange {
         TextRange::new(TextSize::new(start), TextSize::new(start + 1))
+    }
+
+    impl GmodNetworkIndex {
+        /// Replaces the file's flows with `data`, each flow filed by the call
+        /// it starts or registers at.
+        fn add_file_data(&mut self, file_id: FileId, data: FileNetworkData) {
+            self.remove_file(file_id);
+            let mut calls = FxHashMap::<TextRange, CallFlows>::default();
+            for flow in data.send_flows {
+                calls
+                    .entry(flow.start_range)
+                    .or_default()
+                    .send_flows
+                    .push(flow);
+            }
+            for flow in data.receive_flows {
+                calls
+                    .entry(flow.receive_range)
+                    .or_default()
+                    .receive_flows
+                    .push(flow);
+            }
+            let mut calls = calls.into_iter().collect::<Vec<_>>();
+            calls.sort_by_key(|(call, _)| call.start());
+            for (call, flows) in calls {
+                self.set_call_flows(file_id, call, flows);
+            }
+        }
     }
 
     fn send_flow(message_name: &str, start: u32) -> NetSendFlow {
@@ -1163,6 +1332,7 @@ mod tests {
 }
 
 crate::db_index::cow_shards::task_fork_fields!(GmodNetworkIndex {
+    call_flows,
     file_data,
     send_flows_by_message => crate::db_index::cow_shards::merge_list,
     receive_flows_by_message => crate::db_index::cow_shards::merge_list,

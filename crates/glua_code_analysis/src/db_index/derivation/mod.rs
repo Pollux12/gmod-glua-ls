@@ -48,17 +48,6 @@ pub trait DerivedFact: std::any::Any + Send + Sync {
     fn remap(&self, _remap: &crate::FileRemap) -> crate::Remap<std::sync::Arc<dyn DerivedFact>> {
         crate::Remap::Unrelated
     }
-
-    /// The ranges of the parts other files read one at a time, as
-    /// [`FactKey::NetHelper`].
-    fn part_ranges(&self) -> Vec<TextRange> {
-        Vec::new()
-    }
-
-    /// One part's fingerprint, [`ABSENT`] when there is none.
-    fn part_fingerprint(&self, _range: TextRange) -> Fingerprint {
-        ABSENT
-    }
 }
 
 /// The workspace call roles and net-helper registry: the folds read it whole,
@@ -377,7 +366,7 @@ pub enum FactKey {
     LoadScan(FileId),
     /// Which files have a load scan.
     LoadScanFiles,
-    /// A file's network flows.
+    /// A file's network flows, assembled from its calls' [`FactKey::NetFlows`].
     NetworkFile(FileId),
     /// Network flows by message name (whole-map).
     NetworkScan,
@@ -402,10 +391,13 @@ pub enum FactKey {
     NetHelperName(SmolStr),
     /// The names the net operations are declared under.
     NetOperationNames,
-    /// One file's net call roles and function-body net summaries.
-    NetHelpers(FileId),
+    /// What one call is in the net subsystem: its role, the function body it
+    /// expands into, and whether it can expand into a helper.
+    NetCall(InFiled<TextRange>),
     /// One function body's net summary, by the body's block.
     NetHelper(InFiled<TextRange>),
+    /// The net flows one call starts, receives or materializes.
+    NetFlows(InFiled<TextRange>),
     /// A file's function-body summaries, from its syntax and local references.
     FunctionSummaries(FileId),
     /// A property (docs, attributes, visibility) of a semantic declaration.
@@ -609,12 +601,13 @@ impl FactKey {
                 | K::GmodRealm(_)
                 | K::GmodLoadFile(_)
                 | K::LoadScan(_)
-                | K::NetworkFile(_)
+                | K::NetCall(_)
+                | K::NetHelper(_)
+                | K::NetFlows(_)
                 | K::HelperRegistry
                 | K::CallRole(_)
                 | K::HelperScan(_)
                 | K::RoleMentions(_)
-                | K::NetHelpers(_)
                 | K::DeclDefault(_)
                 | K::AccessorCalls(_)
                 | K::LoadSites(_)
@@ -697,8 +690,9 @@ impl FactKey {
                 | K::CallSiteFile(_)
                 | K::CallSiteParam(_)
                 | K::CallSiteCallbacks(_)
-                | K::NetHelpers(_)
+                | K::NetCall(_)
                 | K::NetHelper(_)
+                | K::NetFlows(_)
                 | K::NetworkFile(_)
                 | K::NetworkScan
                 | K::NetSends(_)
@@ -843,7 +837,7 @@ impl FactKey {
             | K::MemberObject(member_id)
             | K::MemberHome(member_id)
             | K::MemberMarks(member_id) => Some(member_id.file_id),
-            K::NetHelper(site) => Some(site.file_id),
+            K::NetCall(site) | K::NetHelper(site) | K::NetFlows(site) => Some(site.file_id),
             K::GmodRealmAt(file_id, _)
             | K::GmodMemberRealmAt(file_id, _)
             | K::GmodRealmInputs(file_id) => Some(*file_id),
@@ -896,7 +890,6 @@ impl FactKey {
             | K::NetworkFile(file_id)
             | K::HelperScan(file_id)
             | K::RoleMentions(file_id)
-            | K::NetHelpers(file_id)
             | K::FunctionSummaries(file_id)
             | K::References(file_id)
             | K::DeclReferences(LuaDeclId { file_id, .. })
@@ -906,8 +899,8 @@ impl FactKey {
             | K::LoadSites(file_id)
             | K::DiagnosticFile(file_id)
             | K::CallSiteFile(file_id)
-            | K::TypeFallbacks(file_id)
             | K::CallSiteCallbacks(file_id)
+            | K::TypeFallbacks(file_id)
             | K::DerivedReferences(file_id)
             | K::FileText(file_id)
             | K::FilePath(file_id) => Some(*file_id),
@@ -1040,10 +1033,12 @@ pub enum DerivationKind {
     CallSiteParams,
     /// A file's local types guessed from their uses.
     LocalFallbacks,
-    /// A file's net call roles and function-body net summaries.
-    NetHelpers,
-    /// A file's net message flows.
-    Network,
+    /// What one call is in the net subsystem.
+    NetCall,
+    /// One function body's net summary.
+    NetHelper,
+    /// The net flows one call starts, receives or materializes.
+    NetFlows,
     /// A file's diagnostics: reads only, never evaluated by the engine.
     Diagnostics,
 }
@@ -1072,17 +1067,18 @@ impl DerivationKind {
             // Locals are guessed only once unsettled reads floor.
             Self::LocalFallbacks => StageRule::FloorUnsettled.holds_from(),
             // The passes that infer across a whole file, and the per-site
-            // dynamic-field writes and call targets, run once the statements
-            // settled: run earlier, each runs again for every read that
-            // settles after it.
+            // dynamic-field writes, call targets and net derivations, run once
+            // the statements settled: run earlier, each runs again for every
+            // read that settles after it.
             Self::DynamicFieldWrite
             | Self::CallTarget
             | Self::ReceiverAuthority
             | Self::CallbackParams
             | Self::CallSiteParam
             | Self::CallSiteParams
-            | Self::NetHelpers
-            | Self::Network => AnalysisStage::Closed,
+            | Self::NetCall
+            | Self::NetHelper
+            | Self::NetFlows => AnalysisStage::Closed,
             _ => AnalysisStage::Open,
         }
     }

@@ -35,6 +35,7 @@ mod member_infer_test;
 mod metatable_test;
 mod module_annotation;
 mod multi_return;
+mod net_unit_test;
 mod out_of_order;
 mod overload_field;
 mod overload_test;

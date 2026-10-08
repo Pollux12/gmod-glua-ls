@@ -35,10 +35,11 @@ fn is_inert_value_field(
     !shaped
 }
 
-/// The derivations of one file's statements, closures, calls, the targets and
-/// call-site parameters of its calls, and table fields, and of its
-/// dynamic-field write sites, in tree order;
-/// positional fields of tables that are not shaped array literals have none.
+/// The derivations of one file's statements, closures, calls, the targets,
+/// call-site parameters, net facts and net flows of its calls, the net
+/// summaries of its function bodies, its table fields and its dynamic-field
+/// write sites, in tree order; positional fields of tables that are not
+/// shaped array literals have none.
 pub(super) fn syntax_derivations(file_id: FileId, root: &LuaChunk) -> Vec<DerivationId> {
     let mut ids = Vec::new();
     let mut shaped_tables = FxHashMap::default();
@@ -63,9 +64,23 @@ pub(super) fn syntax_derivations(file_id: FileId, root: &LuaChunk) -> Vec<Deriva
         let syntax_id = LuaSyntaxId::from_node(node.syntax());
         ids.push(DerivationId::new(kind, file_id, syntax_id));
         if matches!(node, LuaAst::LuaCallExpr(_)) {
-            for kind in [DerivationKind::CallTarget, DerivationKind::CallSiteParam] {
+            for kind in [
+                DerivationKind::CallTarget,
+                DerivationKind::CallSiteParam,
+                DerivationKind::NetCall,
+                DerivationKind::NetFlows,
+            ] {
                 ids.push(DerivationId::new(kind, file_id, syntax_id));
             }
+        }
+        if let LuaAst::LuaClosureExpr(closure) = &node
+            && closure.get_block().is_some()
+        {
+            ids.push(DerivationId::new(
+                DerivationKind::NetHelper,
+                file_id,
+                syntax_id,
+            ));
         }
         if matches!(
             kind,
@@ -113,8 +128,6 @@ pub(super) fn file_derivations(
         DerivationKind::SetmetatableFactory,
         DerivationKind::CallSiteParams,
         DerivationKind::LocalFallbacks,
-        DerivationKind::NetHelpers,
-        DerivationKind::Network,
     ] {
         ids.push(DerivationId::new(kind, file_id, chunk));
     }
@@ -142,6 +155,9 @@ pub(crate) struct Recipes {
     /// Each file's dynamic-field write targets, read off its syntax when its
     /// first write site is evaluated.
     write_sites: std::sync::Mutex<FxHashMap<FileId, std::sync::Arc<dynamic_field::FileWriteSites>>>,
+    /// Each file's function lookup and local bindings for its net derivations,
+    /// read off its syntax when the first of them is evaluated.
+    net_syntax: std::sync::Mutex<FxHashMap<FileId, std::sync::Arc<gmod::FileNetSyntax>>>,
 }
 
 struct ComputedDynamicFields {
@@ -166,6 +182,7 @@ impl Recipes {
             caches: std::sync::Mutex::default(),
             unsettled: std::sync::Mutex::default(),
             write_sites: std::sync::Mutex::default(),
+            net_syntax: std::sync::Mutex::default(),
         }
     }
 }
@@ -206,6 +223,21 @@ impl Recipes {
             .expect("write sites")
             .entry(file_id)
             .or_insert(sites)
+            .clone()
+    }
+
+    /// The file's net syntax, read once per pass: a pass rebuilds no source
+    /// layer.
+    fn net_syntax(&self, db: &DbIndex, file_id: FileId) -> std::sync::Arc<gmod::FileNetSyntax> {
+        if let Some(syntax) = self.net_syntax.lock().expect("net syntax").get(&file_id) {
+            return syntax.clone();
+        }
+        let syntax = std::sync::Arc::new(gmod::FileNetSyntax::new(db, file_id));
+        self.net_syntax
+            .lock()
+            .expect("net syntax")
+            .entry(file_id)
+            .or_insert(syntax)
             .clone()
     }
 
@@ -260,17 +292,13 @@ impl Recipes {
 
 impl super::engine::Recipe for Recipes {
     fn splits(&self, kind: DerivationKind) -> bool {
-        // Callback contributions are collected with call-site facts invisible;
-        // net helpers read other files' helper scans, and net flows their net
-        // helpers: no file's computation reads what another's of its kind writes.
+        // Call-site contributions are collected with call-site facts invisible.
         // Helper and valid-guard scans read source facts and the folds over other
         // kinds; gmod metadata reads the source layer, call targets and call
         // roles, which no gmod pre pass writes.
         matches!(
             kind,
             DerivationKind::CallSiteParams
-                | DerivationKind::NetHelpers
-                | DerivationKind::Network
                 | DerivationKind::GmodLoadCallSites
                 | DerivationKind::GmodClassCallSites
                 | DerivationKind::GmodHelperScan
@@ -284,8 +312,6 @@ impl super::engine::Recipe for Recipes {
             DerivationKind::CallSiteParams => Box::new(
                 call_site_params::collect_callback_contributions(db, id.file_id),
             ),
-            DerivationKind::NetHelpers => Box::new(gmod::compute_net_helpers(db, id.file_id)),
-            DerivationKind::Network => Box::new(gmod::compute_network_flows(db, id.file_id)),
             DerivationKind::LocalFallbacks => Box::new(if guesses_locals(db) {
                 local_inference::scan_file(db, id.file_id)
             } else {
@@ -330,18 +356,6 @@ impl super::engine::Recipe for Recipes {
                     .expect("call-site contributions");
                 db.get_call_site_param_index_mut()
                     .set_callback_contributions(id.file_id, contributions);
-            }
-            DerivationKind::NetHelpers => {
-                let helpers = *computed
-                    .downcast::<Option<gmod::FileNetHelpers>>()
-                    .expect("net helpers");
-                gmod::apply_net_helpers(db, id.file_id, helpers);
-            }
-            DerivationKind::Network => {
-                let flows = *computed
-                    .downcast::<crate::db_index::FileNetworkData>()
-                    .expect("net flows");
-                gmod::apply_network_flows(db, id.file_id, flows);
             }
             DerivationKind::LocalFallbacks => {
                 let scan = *computed
@@ -417,7 +431,18 @@ impl super::engine::Recipe for Recipes {
 
     fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
         match id.kind {
-            DerivationKind::NetHelpers => gmod::evaluate_net_helpers(db, id.file_id),
+            DerivationKind::NetCall => {
+                let syntax = self.net_syntax(db, id.file_id);
+                gmod::evaluate_net_call(db, id, &syntax);
+            }
+            DerivationKind::NetHelper => {
+                let syntax = self.net_syntax(db, id.file_id);
+                gmod::evaluate_net_helper(db, id, &syntax);
+            }
+            DerivationKind::NetFlows => {
+                let syntax = self.net_syntax(db, id.file_id);
+                gmod::evaluate_net_flows(db, id, &syntax);
+            }
             DerivationKind::GmodCallRoles => gmod::evaluate_call_roles(db),
             DerivationKind::NetHelperNames => gmod::evaluate_net_helper_names(db),
             DerivationKind::GmodLoad => gmod::evaluate_load(db),
@@ -569,13 +594,14 @@ impl Recipes {
                 db.get_call_site_param_index_mut()
                     .set_callback_contributions(id.file_id, contributions);
             }
-            DerivationKind::Network => gmod::evaluate_network(db, context),
             DerivationKind::Source
             | DerivationKind::LocalFallbacks
             | DerivationKind::DynamicFieldWrite
             | DerivationKind::GmodPre
             | DerivationKind::GmodHelperScan
-            | DerivationKind::NetHelpers
+            | DerivationKind::NetCall
+            | DerivationKind::NetHelper
+            | DerivationKind::NetFlows
             | DerivationKind::ValidGuardScan
             | DerivationKind::GmodCallRoles
             | DerivationKind::NetHelperNames

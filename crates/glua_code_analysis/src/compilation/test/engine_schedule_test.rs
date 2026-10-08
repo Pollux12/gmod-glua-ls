@@ -35,17 +35,24 @@ mod test {
 
     /// The passes that infer across a whole file, and the dynamic-field
     /// writes, of which the probe has one.
-    const WHOLE_FILE_PASSES: [DerivationKind; 5] = [
+    const WHOLE_FILE_PASSES: [DerivationKind; 3] = [
         DerivationKind::DynamicFieldWrite,
         DerivationKind::CallSiteParams,
         DerivationKind::LocalFallbacks,
-        DerivationKind::NetHelpers,
-        DerivationKind::Network,
+    ];
+
+    /// The passes of each call and function body, which run once for every
+    /// call of the probe and every closure with a body.
+    const PER_SITE_PASSES: [DerivationKind; 4] = [
+        DerivationKind::CallTarget,
+        DerivationKind::NetCall,
+        DerivationKind::NetHelper,
+        DerivationKind::NetFlows,
     ];
 
     /// The whole-file passes run once the statements have settled, so a read
     /// that settles only at the last stage runs none of them again, nor the
-    /// derivations of any of the file's five calls.
+    /// derivation of any of the file's five calls or one closure.
     #[test]
     fn whole_file_passes_run_once_when_a_read_settles_at_the_last_stage() {
         let mut ws = gmod_workspace();
@@ -71,7 +78,17 @@ net.Broadcast()
         let stats = ws.analysis.compilation.last_stats();
         let evaluations = WHOLE_FILE_PASSES.map(|kind| (kind, stats.evaluations(kind)));
         assert_eq!(evaluations, WHOLE_FILE_PASSES.map(|kind| (kind, 1)));
+        let reader_graph = ws.analysis.compilation.get_db().reader_graph();
+        for kind in PER_SITE_PASSES {
+            let sites = reader_graph
+                .derivations()
+                .filter(|id| id.kind == kind)
+                .count();
+            assert_eq!(stats.evaluations(kind), sites, "{kind:?}");
+        }
         assert_eq!(stats.evaluations(DerivationKind::CallTarget), 5);
+        assert_eq!(stats.evaluations(DerivationKind::NetFlows), 5);
+        assert_eq!(stats.evaluations(DerivationKind::NetHelper), 1);
         assert_eq!(stats.evaluations(DerivationKind::CallSiteParam), 5);
     }
 
@@ -100,30 +117,41 @@ end
     /// the local stands, and only the edited file's pass runs.
     #[test]
     fn a_statement_that_keeps_its_value_does_not_run_its_files_local_fallbacks_again() {
-        let mut ws = VirtualWorkspace::new();
-        ws.def_files(vec![
-            (
-                "player.lua",
-                "---@class Player\n---@param ply Player\nfunction Kick(ply) end\n",
-            ),
-            (
+        let player = (
+            "player.lua",
+            "---@class Player\n---@param ply Player\nfunction Kick(ply) end\n",
+        );
+        let lib = (
+            "lib.lua",
+            "Lib = {}\nfunction Lib.Get(a) return Mystery end\n",
+        );
+        let fallbacks_after_the_edit = |files: Vec<(&str, &str)>| {
+            let mut ws = VirtualWorkspace::new();
+            ws.def_files(files);
+            ws.def_file(
                 "lib.lua",
-                "Lib = {}\nfunction Lib.Get(a) return Mystery end\n",
-            ),
+                "Lib = {}\nfunction Lib.Get(a, b) return Mystery end\n",
+            );
+            let evaluations = ws
+                .analysis
+                .compilation
+                .last_stats()
+                .evaluations(DerivationKind::LocalFallbacks);
+            (ws, evaluations)
+        };
+        let (ws, with_user) = fallbacks_after_the_edit(vec![
+            player,
+            lib,
             ("user.lua", "local target = Lib.Get(1)\nKick(target)\n"),
         ]);
-        ws.def_file(
-            "lib.lua",
-            "Lib = {}\nfunction Lib.Get(a, b) return Mystery end\n",
-        );
+        let (_, without_user) = fallbacks_after_the_edit(vec![player, lib]);
 
-        let stats = ws.analysis.compilation.last_stats();
         assert!(
             ws.settled_digest()
                 .iter()
                 .any(|line| line.ends_with("target = Player"))
         );
-        assert_eq!(stats.evaluations(DerivationKind::LocalFallbacks), 1);
+        assert_eq!(with_user, without_user);
     }
 
     fn gmod_workspace() -> VirtualWorkspace {

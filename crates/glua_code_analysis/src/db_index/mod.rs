@@ -18,6 +18,7 @@ mod intern;
 mod member;
 mod metatable;
 mod module;
+mod net_site;
 mod numeric_range_population;
 mod operators;
 mod property;
@@ -120,9 +121,9 @@ pub struct DbIndex {
     load_scans: CowShards<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
     /// The set of files in `load_scans`.
     load_scan_files: derivation::SetFingerprint,
-    /// Each file's net helper summaries with their fingerprint when stored.
-    net_helpers: CowShards<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
-    /// Each file with the files whose net helpers name its positions.
+    /// Each file's net call facts and function-body summaries.
+    net_sites: CowShards<FileId, Arc<net_site::FileNetSites>>,
+    /// Each file with the files whose net sites name its positions.
     net_helper_refs: CowShards<FileId, FxHashSet<FileId>>,
     /// Each file's function-body summaries with their fingerprint when stored.
     function_summaries:
@@ -161,34 +162,6 @@ fn stored_fact_fingerprint(
     } else {
         *fingerprint
     }
-}
-
-/// Records a write of each of `file_id`'s net helper summaries that differs
-/// between `previous` and `next`.
-fn note_net_helper_writes(
-    file_id: FileId,
-    previous: Option<&Arc<dyn derivation::DerivedFact>>,
-    next: Option<&Arc<dyn derivation::DerivedFact>>,
-) {
-    let fingerprint = |helpers: Option<&Arc<dyn derivation::DerivedFact>>, range| {
-        helpers.map_or(derivation::ABSENT, |helpers| {
-            helpers.part_fingerprint(range)
-        })
-    };
-    derivation::in_file(Some(file_id), || {
-        let ranges = previous
-            .into_iter()
-            .chain(next)
-            .flat_map(|helpers| helpers.part_ranges())
-            .collect::<rustc_hash::FxHashSet<_>>();
-        for range in ranges {
-            if fingerprint(previous, range) != fingerprint(next, range) {
-                derivation::note_write(|| {
-                    derivation::FactKey::NetHelper(crate::InFiled::new(file_id, range))
-                });
-            }
-        }
-    });
 }
 
 fn downcast_fact<T: derivation::DerivedFact>(
@@ -243,7 +216,7 @@ impl DbIndex {
             helper_scan_files: derivation::SetFingerprint::default(),
             load_scans: Default::default(),
             load_scan_files: derivation::SetFingerprint::default(),
-            net_helpers: Default::default(),
+            net_sites: Default::default(),
             net_helper_refs: Default::default(),
             function_summaries: Default::default(),
             analysis_stage: derivation::AnalysisStage::default(),
@@ -283,7 +256,11 @@ impl DbIndex {
             K::HelperScan(file_id) => self.remove_helper_scan(*file_id),
             K::RoleMentions(file_id) => self.remove_role_mentions(*file_id),
             K::LoadScan(file_id) => self.remove_load_scan(*file_id),
-            K::NetHelpers(file_id) => self.remove_net_helpers(*file_id),
+            K::NetCall(site) => self.reset_net_site(net_site::NetSiteKind::Call, site),
+            K::NetHelper(site) => self.reset_net_site(net_site::NetSiteKind::Helper, site),
+            K::NetFlows(site) => self
+                .get_gmod_network_index_mut()
+                .reset_call_flows(site.file_id, site.value),
             K::DeclClaim(decl_id) => self.get_type_index_mut().reset_decl_claim(decl_id),
             K::DefinitionFact(definition) => {
                 self.get_type_index_mut().reset_definition_fact(definition)
@@ -317,7 +294,6 @@ impl DbIndex {
                 .get_call_target_index_mut()
                 .reset_target(site.file_id, site.value),
             K::DynamicFieldSite(site) => self.get_dynamic_field_index_mut().retract_site(site),
-            K::NetworkFile(file_id) => self.get_gmod_network_index_mut().remove_file(*file_id),
             K::Module(file_id) => self.get_module_index_mut().reset_export(*file_id),
             K::Metatable(table) => self.get_metatable_index_mut().reset_table(table),
             K::MetatableFactory(file_id) => self
@@ -369,7 +345,6 @@ impl DbIndex {
         let tables = [
             ("helper_scan", &self.helper_scans),
             ("load_scan", &self.load_scans),
-            ("net_helpers", &self.net_helpers),
             ("function_summaries", &self.function_summaries),
         ];
         let mut facts = tables
@@ -390,6 +365,11 @@ impl DbIndex {
                 self.call_target_index
                     .file_fingerprints()
                     .map(|(file_id, fingerprint)| ("call_targets", file_id, fingerprint)),
+            )
+            .chain(
+                self.net_sites
+                    .iter()
+                    .map(|(file_id, sites)| ("net_sites", *file_id, sites.fingerprint(*file_id))),
             )
             .collect::<Vec<_>>();
         facts.sort_unstable();
@@ -553,7 +533,8 @@ impl DbIndex {
             | K::GmodInferScan
             | K::GmodSystem(..) => self.gmod_infer_index.fact_fingerprint(key),
             K::GmodLoadFile(_) => self.gmod_load_index.fact_fingerprint(key),
-            K::NetworkFile(_)
+            K::NetFlows(_)
+            | K::NetworkFile(_)
             | K::NetworkScan
             | K::NetSends(_)
             | K::NetReceives(_)
@@ -592,16 +573,8 @@ impl DbIndex {
                 .get(file_id)
                 .map_or(derivation::ABSENT, stored_fact_fingerprint),
             K::LoadScanFiles => self.load_scan_files.get(),
-            K::NetHelpers(file_id) => self
-                .net_helpers
-                .get(file_id)
-                .map_or(derivation::ABSENT, stored_fact_fingerprint),
-            K::NetHelper(site) => self
-                .net_helpers
-                .get(&site.file_id)
-                .map_or(derivation::ABSENT, |(helpers, _)| {
-                    helpers.part_fingerprint(site.value)
-                }),
+            K::NetCall(site) => self.net_site_fingerprint(net_site::NetSiteKind::Call, site),
+            K::NetHelper(site) => self.net_site_fingerprint(net_site::NetSiteKind::Helper, site),
             K::FunctionSummaries(file_id) => self
                 .function_summaries
                 .get(file_id)
@@ -748,14 +721,15 @@ impl DbIndex {
         scans
     }
 
-    pub(crate) fn get_net_helpers<T: derivation::DerivedFact>(
+    /// The net fact of the call at `range` of `file_id`, read as that call's
+    /// fact alone.
+    pub(crate) fn get_net_call<T: derivation::DerivedFact>(
         &self,
         file_id: FileId,
+        range: rowan::TextRange,
     ) -> Option<Arc<T>> {
-        derivation::note_read(|| derivation::FactKey::NetHelpers(file_id));
-        self.net_helpers
-            .get(&file_id)
-            .and_then(|(helpers, _)| downcast_fact(helpers))
+        derivation::note_read(|| derivation::FactKey::NetCall(crate::InFiled::new(file_id, range)));
+        self.net_site(net_site::NetSiteKind::Call, file_id, range)
     }
 
     /// `site`'s file's net helpers, read as the one summary of the body at
@@ -765,82 +739,152 @@ impl DbIndex {
         site: &crate::InFiled<rowan::TextRange>,
     ) -> Option<Arc<T>> {
         derivation::note_read(|| derivation::FactKey::NetHelper(site.clone()));
-        self.net_helpers
-            .get(&site.file_id)
-            .and_then(|(helpers, _)| downcast_fact(helpers))
+        self.net_site(net_site::NetSiteKind::Helper, site.file_id, site.value)
     }
 
-    pub(crate) fn set_net_helpers<T: derivation::DerivedFact>(
+    fn net_site<T: derivation::DerivedFact>(
+        &self,
+        kind: net_site::NetSiteKind,
+        file_id: FileId,
+        range: rowan::TextRange,
+    ) -> Option<Arc<T>> {
+        let (fact, _) = self.net_sites.get(&file_id)?.get(kind, range)?;
+        downcast_fact(fact)
+    }
+
+    fn net_site_fingerprint(
+        &self,
+        kind: net_site::NetSiteKind,
+        site: &crate::InFiled<rowan::TextRange>,
+    ) -> derivation::Fingerprint {
+        self.net_sites
+            .get(&site.file_id)
+            .and_then(|sites| sites.get(kind, site.value))
+            .map_or(derivation::ABSENT, stored_fact_fingerprint)
+    }
+
+    /// Stores the net fact of the call at `range` of `file_id`.
+    pub(crate) fn set_net_call<T: derivation::DerivedFact>(
         &mut self,
         file_id: FileId,
-        helpers: Arc<T>,
+        range: rowan::TextRange,
+        fact: Arc<T>,
     ) {
-        self.store_net_helpers(file_id, helpers);
+        self.store_net_site(net_site::NetSiteKind::Call, file_id, range, fact);
     }
 
-    fn store_net_helpers(&mut self, file_id: FileId, helpers: Arc<dyn derivation::DerivedFact>) {
-        derivation::note_write(|| derivation::FactKey::NetHelpers(file_id));
-        if derivation::recording() {
-            let previous = self.net_helpers.get(&file_id).map(|(previous, _)| previous);
-            note_net_helper_writes(file_id, previous, Some(&helpers));
-        }
-        self.forget_net_helper_refs(file_id);
-        for named in helpers.named_files(file_id) {
-            self.net_helper_refs
-                .entry(named)
-                .or_default()
-                .insert(file_id);
-        }
-        let fingerprint = derivation::in_file(Some(file_id), || helpers.fingerprint()).max(1);
-        self.net_helpers.insert(file_id, (helpers, fingerprint));
+    /// Stores the net summary of the function body at `range` of `file_id`.
+    pub(crate) fn set_net_helper<T: derivation::DerivedFact>(
+        &mut self,
+        file_id: FileId,
+        range: rowan::TextRange,
+        summary: Arc<T>,
+    ) {
+        self.store_net_site(net_site::NetSiteKind::Helper, file_id, range, summary);
     }
 
-    fn remove_net_helpers(&mut self, file_id: FileId) {
-        self.forget_net_helper_refs(file_id);
-        if let Some((helpers, _)) = self.net_helpers.remove(&file_id) {
-            derivation::note_write(|| derivation::FactKey::NetHelpers(file_id));
-            if derivation::recording() {
-                note_net_helper_writes(file_id, Some(&helpers), None);
-            }
-        }
+    fn store_net_site(
+        &mut self,
+        kind: net_site::NetSiteKind,
+        file_id: FileId,
+        range: rowan::TextRange,
+        fact: Arc<dyn derivation::DerivedFact>,
+    ) {
+        derivation::note_write(|| kind.key(file_id, range));
+        let fingerprint = derivation::in_file(Some(file_id), || fact.fingerprint()).max(1);
+        let sites = Arc::make_mut(self.net_sites.entry(file_id).or_default());
+        let (mut linked, mut unlinked) = (Vec::new(), Vec::new());
+        sites.insert(
+            file_id,
+            kind,
+            range,
+            (fact, fingerprint),
+            &mut linked,
+            &mut unlinked,
+        );
+        self.relink_net_sites(file_id, linked, unlinked);
     }
 
-    fn forget_net_helper_refs(&mut self, file_id: FileId) {
-        let Some((helpers, _)) = self.net_helpers.get(&file_id) else {
+    fn reset_net_site(
+        &mut self,
+        kind: net_site::NetSiteKind,
+        site: &crate::InFiled<rowan::TextRange>,
+    ) {
+        derivation::note_write(|| kind.key(site.file_id, site.value));
+        let Some(sites) = self.net_sites.get_mut(&site.file_id) else {
             return;
         };
-        for named in helpers.named_files(file_id) {
-            if let Some(files) = self.net_helper_refs.get_mut(&named) {
-                files.remove(&file_id);
-                if files.is_empty() {
-                    self.net_helper_refs.remove(&named);
+        if sites.get(kind, site.value).is_none() {
+            return;
+        }
+        let mut unlinked = Vec::new();
+        let sites = Arc::make_mut(sites);
+        sites.remove(site.file_id, kind, site.value, &mut unlinked);
+        if sites.is_empty() {
+            self.net_sites.remove(&site.file_id);
+        }
+        self.relink_net_sites(site.file_id, Vec::new(), unlinked);
+    }
+
+    /// Drops every net site of `file_id`.
+    fn remove_net_sites(&mut self, file_id: FileId) {
+        let Some(sites) = self.net_sites.remove(&file_id) else {
+            return;
+        };
+        if derivation::recording() {
+            for (kind, range, _) in sites.sorted() {
+                derivation::note_write(|| kind.key(file_id, range));
+            }
+        }
+        self.relink_net_sites(file_id, Vec::new(), sites.named_files().collect());
+    }
+
+    /// Re-files `holder` under the files its net sites came to name and no
+    /// longer name.
+    fn relink_net_sites(&mut self, holder: FileId, linked: Vec<FileId>, unlinked: Vec<FileId>) {
+        for file_id in unlinked {
+            if let Some(holders) = self.net_helper_refs.get_mut(&file_id) {
+                holders.remove(&holder);
+                if holders.is_empty() {
+                    self.net_helper_refs.remove(&file_id);
                 }
             }
         }
+        for file_id in linked {
+            self.net_helper_refs
+                .entry(file_id)
+                .or_default()
+                .insert(holder);
+        }
     }
 
-    /// Carries the positions of `remap`'s file that other files' net helpers
-    /// name to their new place. Returns the net helpers of each file that
-    /// named one the edit destroyed.
-    pub(crate) fn remap_net_helpers(&mut self, remap: &crate::FileRemap) -> Vec<crate::LostFact> {
-        let mut files = self
+    /// Carries the positions of `remap`'s file that other files' net sites
+    /// name to their new place. Returns the sites of each file that named
+    /// one the edit destroyed.
+    pub(crate) fn remap_net_sites(&mut self, remap: &crate::FileRemap) -> Vec<crate::LostFact> {
+        let mut holders = self
             .net_helper_refs
             .get(&remap.file_id)
-            .map(|files| files.iter().copied().collect::<Vec<_>>())
+            .map(|holders| holders.iter().copied().collect::<Vec<_>>())
             .unwrap_or_default();
-        files.sort_unstable();
+        holders.sort_unstable();
         let mut lost = Vec::new();
-        for file_id in files {
-            let Some((helpers, _)) = self.net_helpers.get(&file_id) else {
+        for holder in holders {
+            let Some(sites) = self.net_sites.get(&holder) else {
                 continue;
             };
-            match helpers.remap(remap) {
-                crate::Remap::Moved(helpers) => self.store_net_helpers(file_id, helpers),
-                crate::Remap::Lost => lost.push(crate::LostFact::new(
-                    file_id,
-                    derivation::FactKey::NetHelpers(file_id),
-                )),
-                crate::Remap::Unrelated => {}
+            let mut moved = Vec::new();
+            for (kind, range, (fact, _)) in sites.sorted() {
+                match fact.remap(remap) {
+                    crate::Remap::Moved(fact) => moved.push((kind, range, fact)),
+                    crate::Remap::Lost => {
+                        lost.push(crate::LostFact::new(holder, kind.key(holder, range)))
+                    }
+                    crate::Remap::Unrelated => {}
+                }
+            }
+            for (kind, range, fact) in moved {
+                self.store_net_site(kind, holder, range, fact);
             }
         }
         lost
@@ -890,7 +934,7 @@ impl DbIndex {
             self.remove_helper_scan(file_id);
             self.remove_role_mentions(file_id);
             self.remove_load_scan(file_id);
-            self.remove_net_helpers(file_id);
+            self.remove_net_sites(file_id);
             if self.function_summaries.remove(&file_id).is_some() {
                 derivation::note_write(|| derivation::FactKey::FunctionSummaries(file_id));
             }
@@ -1301,7 +1345,7 @@ impl DbIndex {
             helper_scan_files: self.helper_scan_files,
             load_scans: self.load_scans.clone(),
             load_scan_files: self.load_scan_files,
-            net_helpers: self.net_helpers.clone(),
+            net_sites: self.net_sites.clone(),
             net_helper_refs: self.net_helper_refs.clone(),
             function_summaries: self.function_summaries.clone(),
             analysis_stage: self.analysis_stage,
@@ -1369,7 +1413,7 @@ impl DbIndex {
             helper_scan_files,
             load_scans,
             load_scan_files,
-            net_helpers,
+            net_sites,
             net_helper_refs,
             function_summaries
         )
@@ -1501,7 +1545,7 @@ impl DbIndex {
             helper_scan_files,
             load_scans,
             load_scan_files,
-            net_helpers,
+            net_sites,
             net_helper_refs,
             function_summaries
         );
@@ -1549,7 +1593,7 @@ impl DbIndex {
             helper_scan_files,
             load_scans,
             load_scan_files,
-            net_helpers,
+            net_sites,
             net_helper_refs => cow_shards::merge_set,
             function_summaries
         );
@@ -1699,7 +1743,7 @@ impl LuaIndex for DbIndex {
         self.helper_scan_files = derivation::SetFingerprint::default();
         self.load_scans.clear();
         self.load_scan_files = derivation::SetFingerprint::default();
-        self.net_helpers.clear();
+        self.net_sites.clear();
         self.net_helper_refs.clear();
         self.function_summaries.clear();
         self.derivations = Arc::default();

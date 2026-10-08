@@ -455,9 +455,22 @@ mod test {
         assert_that!(send_op_kinds(chained[0]), eq(&vec!["string".to_string()]));
     }
 
+    /// What the net derivations of `file_id`'s calls read, as keys.
+    fn net_reads(
+        db: &crate::DbIndex,
+        file_id: crate::FileId,
+    ) -> Vec<crate::db_index::derivation::FactKey> {
+        use crate::db_index::derivation::DerivationKind;
+        db.reader_graph()
+            .derivations_of_file(file_id)
+            .filter(|id| matches!(id.kind, DerivationKind::NetCall | DerivationKind::NetFlows))
+            .flat_map(|id| db.reader_graph().reads_of(id).map(|key| key.key().clone()))
+            .collect()
+    }
+
     #[gtest]
     fn a_files_network_flows_read_only_its_own_helper_call_sites() {
-        use crate::db_index::derivation::{DerivationKind, FactKey};
+        use crate::db_index::derivation::FactKey;
 
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -483,25 +496,15 @@ mod test {
             "#,
         );
 
-        let db = ws.get_db_mut();
-        let network = db
-            .reader_graph()
-            .derivations_of_file(caller)
-            .find(|id| id.kind == DerivationKind::Network)
-            .expect("the caller has a network derivation");
-        let workspace_wide = db
-            .reader_graph()
-            .reads_of(network)
-            .filter(|key| matches!(key.key(), FactKey::ReferencesByName(_)))
-            .map(|key| key.key().clone())
+        let workspace_wide = net_reads(ws.get_db_mut(), caller)
+            .into_iter()
+            .filter(|key| matches!(key, FactKey::ReferencesByName(_)))
             .collect::<Vec<_>>();
         expect_that!(workspace_wide, is_empty());
     }
 
     #[gtest]
     fn a_files_network_reads_do_not_grow_with_the_workspace_helper_names() {
-        use crate::db_index::derivation::DerivationKind;
-
         let network_reads = |helper_count: usize| {
             let mut ws = VirtualWorkspace::new();
             set_gmod_enabled(&mut ws);
@@ -522,13 +525,7 @@ end
                 "SendPing0()
 ",
             );
-            let db = ws.get_db_mut();
-            let network = db
-                .reader_graph()
-                .derivations_of_file(caller)
-                .find(|id| id.kind == DerivationKind::Network)
-                .expect("the caller has a network derivation");
-            db.reader_graph().reads_of(network).count()
+            net_reads(ws.get_db_mut(), caller).len()
         };
 
         expect_that!(network_reads(40), eq(network_reads(5)));
@@ -636,7 +633,7 @@ end
 
     #[gtest]
     fn a_callers_network_flows_read_the_helpers_summary_not_its_body() {
-        use crate::db_index::derivation::{DerivationKind, FactKey};
+        use crate::db_index::derivation::FactKey;
 
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -661,23 +658,19 @@ end
             some(eq(helpers))
         );
 
-        let network = db
-            .reader_graph()
-            .derivations_of_file(caller)
-            .find(|id| id.kind == DerivationKind::Network)
-            .expect("the caller has a network derivation");
-        let reads = db
-            .reader_graph()
-            .reads_of(network)
-            .map(|key| key.key().clone())
-            .collect::<Vec<_>>();
+        let reads = net_reads(db, caller);
         expect_that!(
             reads
                 .iter()
                 .any(|key| matches!(key, FactKey::NetHelper(site) if site.file_id == helpers)),
             eq(true)
         );
-        expect_that!(reads.contains(&FactKey::NetHelpers(helpers)), eq(false));
+        expect_that!(
+            reads
+                .iter()
+                .any(|key| matches!(key, FactKey::NetCall(site) if site.file_id == helpers)),
+            eq(false)
+        );
         expect_that!(reads.contains(&FactKey::FileText(helpers)), eq(false));
     }
 
@@ -698,7 +691,8 @@ end
         let caller = ws.def_file(caller_path, "SendPing(ply)\nSendPing(ply)\n");
 
         let stats = ws.analysis.compilation.last_stats();
-        expect_that!(stats.evaluations(DerivationKind::NetHelpers), eq(1));
+        expect_that!(stats.evaluations(DerivationKind::NetHelper), eq(0));
+        expect_that!(stats.evaluations(DerivationKind::NetCall), eq(2));
         let flows = ws
             .get_db_mut()
             .get_gmod_network_index()

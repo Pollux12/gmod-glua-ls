@@ -95,11 +95,19 @@ end
     const SCORE_CALLER: &str = "gamemodes/cityrp/gamemode/core/cl_score.lua";
     const SCORE_CALLER_TEXT: &str = "cityrp.SendScore(3)\n";
 
-    const PER_FILE_GMOD_PASSES: [DerivationKind; 4] = [
+    const PER_FILE_GMOD_PASSES: [DerivationKind; 3] = [
         DerivationKind::GmodPre,
         DerivationKind::GmodLoadCallSites,
         DerivationKind::GmodClassCallSites,
-        DerivationKind::NetHelpers,
+    ];
+
+    /// The net derivations of each call and function body. The configuration
+    /// file has two calls and two functions, so an edit of it, which re-runs
+    /// its own sites alone, runs each kind at most twice.
+    const PER_SITE_NET_PASSES: [DerivationKind; 3] = [
+        DerivationKind::NetCall,
+        DerivationKind::NetHelper,
+        DerivationKind::NetFlows,
     ];
 
     /// Values keep their literal types, so a value's readers see it change;
@@ -213,6 +221,9 @@ end
         for kind in PER_FILE_GMOD_PASSES {
             assert_eq!(workspace.evaluations(kind), 1, "{kind:?}");
         }
+        for kind in PER_SITE_NET_PASSES {
+            assert!(workspace.evaluations(kind) <= 2, "{kind:?}");
+        }
     }
 
     /// The load graph is folded from each file's load sites and load scan,
@@ -243,6 +254,9 @@ end
 
         for kind in PER_FILE_GMOD_PASSES {
             assert_eq!(workspace.evaluations(kind), 1, "{kind:?}");
+        }
+        for kind in PER_SITE_NET_PASSES {
+            assert!(workspace.evaluations(kind) <= 2, "{kind:?}");
         }
     }
 
@@ -350,7 +364,7 @@ end
 
     /// A helper's summary keeps the parameters its message and argument
     /// templates read, so a parameter nothing reads leaves its callers' network
-    /// flows standing.
+    /// flows standing: only the flows of the helper's own three calls run.
     #[test]
     fn adding_an_unread_parameter_to_a_net_helper_re_runs_no_callers_network_flows() {
         let mut workspace = cityrp_workspace();
@@ -365,7 +379,7 @@ end
             ),
         );
 
-        assert_eq!(workspace.evaluations(DerivationKind::Network), 1);
+        assert_eq!(workspace.evaluations(DerivationKind::NetFlows), 3);
     }
 
     #[test]
@@ -427,7 +441,8 @@ end
         analysed_after.ws.def_file(CONFIGURATION, &shifted);
         analysed_after.ws.def_file(CALLER, CALLER_TEXT);
 
-        let key = crate::db_index::derivation::FactKey::NetHelpers(caller);
+        let call = rowan::TextRange::up_to(rowan::TextSize::of(CALLER_TEXT.trim_end()));
+        let key = crate::db_index::derivation::FactKey::NetCall(crate::InFiled::new(caller, call));
         assert_eq!(
             edited.fingerprint(key.clone()),
             analysed_after.fingerprint(key)

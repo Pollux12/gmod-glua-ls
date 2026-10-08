@@ -234,7 +234,9 @@ impl EditMaps {
             K::CallSiteParam(site) => K::CallSiteParam(self.site(site)?),
             K::TableClass(site) => K::TableClass(self.site(site)?),
             K::DynamicFieldSite(site) => K::DynamicFieldSite(self.site(site)?),
+            K::NetCall(site) => K::NetCall(self.site(site)?),
             K::NetHelper(site) => K::NetHelper(self.site(site)?),
+            K::NetFlows(site) => K::NetFlows(self.site(site)?),
             K::NetDefinitionUses(site) => K::NetDefinitionUses(self.site(site)?),
             K::Syntax(site) => K::Syntax(self.site(site)?),
             K::FunctionScope(site) => K::FunctionScope(InFiled::new(

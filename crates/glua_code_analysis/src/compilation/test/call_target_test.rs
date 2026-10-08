@@ -111,8 +111,8 @@ mod test {
         assert_eq!(call_targets(&ws, &file_ids), call_targets(&cold, &file_ids));
     }
 
-    /// The net helper pass reads each call's callee from the file's call
-    /// targets instead of inferring it again, and still finds the net roles.
+    /// The net passes read each call's callee from the file's call targets
+    /// instead of inferring it again, and still find the net roles.
     #[test]
     fn net_helpers_read_the_files_call_targets() {
         let mut ws = gmod_workspace();
@@ -122,9 +122,18 @@ mod test {
                 "net.Start(\"MyMessage\")\nnet.WriteString(\"hello\")\nnet.Broadcast()\n",
             )
         });
-        let inferred = counts
-            .get(&(Work::Infer, Some(DerivationKind::NetHelpers)))
-            .map_or(0, |(computed, _)| *computed);
+        let inferred = [
+            DerivationKind::NetCall,
+            DerivationKind::NetHelper,
+            DerivationKind::NetFlows,
+        ]
+        .into_iter()
+        .map(|kind| {
+            counts
+                .get(&(Work::Infer, Some(kind)))
+                .map_or(0, |(computed, _)| *computed)
+        })
+        .sum::<u64>();
         let flows = ws
             .analysis
             .compilation

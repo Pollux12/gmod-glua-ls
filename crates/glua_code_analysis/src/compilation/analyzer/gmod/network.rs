@@ -1,11 +1,13 @@
 //! Net message flow collection.
 //!
-//! Each file's [`FileNetHelpers`] fact holds what inference decides about its
-//! calls (their net role and the function body they expand into) and a
-//! syntax-free summary of each of its function bodies. A file's flows walk its
-//! own syntax against its own fact and expand helper calls by composing the
-//! helpers' summaries, so a helper body is analysed once per change of its
-//! file rather than once per evaluation of every file that calls it.
+//! Each call has a [`NetCallFact`] of what inference decides about it (its net
+//! role and the function body it expands into), and each function body a
+//! syntax-free [`NetHelper`] summary built from the facts of the calls in it.
+//! A call's flows walk its own syntax against the facts of the calls around it
+//! and expand helper calls by composing the helpers' summaries, so a helper
+//! body is analysed once per change of its summary rather than once per
+//! evaluation of every call into it, and a change reaches only the calls and
+//! bodies that read it.
 //!
 //! Summaries only describe their own body: a nested helper is named, never
 //! inlined. The composition (bindings, consensus, cycles) runs in the caller's
@@ -154,6 +156,9 @@ struct NetCallFact {
     target: Option<HelperId>,
     /// The payload op's bit-width parameter, as a call argument index.
     bits_param_idx: Option<usize>,
+    /// Whether the call goes through a name that can reach a net operation,
+    /// which makes it a call site of a net helper.
+    candidate: bool,
 }
 
 /// One step of a payload walk, in evaluation order: an op, or a call into a
@@ -223,39 +228,14 @@ struct NetHelper {
     sends: Vec<HelperSend>,
 }
 
-/// One file's net call facts and function-body summaries.
-#[derive(Debug, Default)]
-pub(crate) struct FileNetHelpers {
-    calls: HashMap<TextRange, NetCallFact>,
-    helpers: HashMap<TextRange, Arc<NetHelper>>,
-}
-
-impl FileNetHelpers {
-    fn call(&self, call_expr: &LuaCallExpr) -> Option<&NetCallFact> {
-        self.calls.get(&call_expr.get_range())
-    }
-}
-
-impl Hash for FileNetHelpers {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        let mut calls = self.calls.iter().collect::<Vec<_>>();
-        calls.sort_by_key(|(range, _)| (range.start(), range.end()));
-        calls.len().hash(state);
-        for (range, fact) in calls {
-            crate::db_index::derivation::hash_local(range, state);
-            fact.hash(state);
-        }
-        let mut helpers = self.helpers.iter().collect::<Vec<_>>();
-        helpers.sort_by_key(|(range, _)| (range.start(), range.end()));
-        helpers.len().hash(state);
-        for (range, helper) in helpers {
-            crate::db_index::derivation::hash_local(range, state);
-            helper.hash(state);
-        }
-    }
-}
-
 impl NetOpItem {
+    fn target(&self) -> Option<&HelperId> {
+        match self {
+            NetOpItem::Helper { target, .. } => Some(target),
+            NetOpItem::Op(_) => None,
+        }
+    }
+
     fn visit_target(&mut self, visit: &mut impl FnMut(&mut HelperId)) {
         if let NetOpItem::Helper { target, .. } = self {
             visit(target);
@@ -264,6 +244,29 @@ impl NetOpItem {
 }
 
 impl NetHelper {
+    /// Every helper the summary calls into.
+    fn targets(&self) -> Vec<&HelperId> {
+        let mut targets = Vec::new();
+        for call in &self.calls {
+            targets.extend(call.target.as_ref());
+            targets.extend(
+                call.receive_reads
+                    .items
+                    .iter()
+                    .flatten()
+                    .filter_map(NetOpItem::target),
+            );
+        }
+        targets.extend(self.ops.iter().filter_map(NetOpItem::target));
+        targets.extend(
+            self.sends
+                .iter()
+                .flat_map(|send| send.stats.iter().flatten())
+                .filter_map(NetOpItem::target),
+        );
+        targets
+    }
+
     /// Visits every helper the summary calls into.
     fn visit_targets(&mut self, visit: &mut impl FnMut(&mut HelperId)) {
         for call in &mut self.calls {
@@ -287,26 +290,61 @@ impl NetHelper {
     }
 }
 
-impl crate::db_index::derivation::DerivedFact for FileNetHelpers {
+/// Where the function body at `target` moved to under `remap`.
+fn remap_target(remap: &crate::FileRemap, target: &HelperId) -> crate::Remap<HelperId> {
+    let block = LuaSyntaxId::new(
+        glua_parser::LuaKind::Syntax(glua_parser::LuaSyntaxKind::Block),
+        target.value,
+    );
+    match remap.syntax_id(target.file_id, block) {
+        crate::Remap::Moved(block) if block.get_range() != target.value => {
+            crate::Remap::Moved(InFiled::new(target.file_id, block.get_range()))
+        }
+        crate::Remap::Lost => crate::Remap::Lost,
+        crate::Remap::Moved(_) | crate::Remap::Unrelated => crate::Remap::Unrelated,
+    }
+}
+
+impl crate::db_index::derivation::DerivedFact for NetCallFact {
     fn fingerprint(&self) -> crate::db_index::derivation::Fingerprint {
         crate::db_index::derivation::fingerprint_of(self)
     }
 
-    fn part_ranges(&self) -> Vec<TextRange> {
-        self.helpers.keys().copied().collect()
+    fn named_files(&self, own: FileId) -> rustc_hash::FxHashSet<FileId> {
+        self.target
+            .iter()
+            .map(|target| target.file_id)
+            .filter(|file_id| *file_id != own)
+            .collect()
     }
 
-    fn part_fingerprint(&self, range: TextRange) -> crate::db_index::derivation::Fingerprint {
-        crate::db_index::derivation::fingerprint_opt(
-            self.helpers.get(&range).map(|helper| &**helper),
-        )
+    fn remap(
+        &self,
+        remap: &crate::FileRemap,
+    ) -> crate::Remap<Arc<dyn crate::db_index::derivation::DerivedFact>> {
+        let Some(target) = &self.target else {
+            return crate::Remap::Unrelated;
+        };
+        match remap_target(remap, target) {
+            crate::Remap::Moved(target) => crate::Remap::Moved(Arc::new(NetCallFact {
+                target: Some(target),
+                ..self.clone()
+            })),
+            crate::Remap::Lost => crate::Remap::Lost,
+            crate::Remap::Unrelated => crate::Remap::Unrelated,
+        }
+    }
+}
+
+impl crate::db_index::derivation::DerivedFact for NetHelper {
+    fn fingerprint(&self) -> crate::db_index::derivation::Fingerprint {
+        crate::db_index::derivation::fingerprint_of(self)
     }
 
     /// Every helper a summary calls into is some call's target.
     fn named_files(&self, own: FileId) -> rustc_hash::FxHashSet<FileId> {
-        self.calls
-            .values()
-            .filter_map(|fact| fact.target.as_ref())
+        self.targets()
+            .into_iter()
             .map(|target| target.file_id)
             .filter(|file_id| *file_id != own)
             .collect()
@@ -317,149 +355,293 @@ impl crate::db_index::derivation::DerivedFact for FileNetHelpers {
         remap: &crate::FileRemap,
     ) -> crate::Remap<Arc<dyn crate::db_index::derivation::DerivedFact>> {
         let mut moves = HashMap::default();
-        for target in self.calls.values().filter_map(|fact| fact.target.as_ref()) {
-            let block = LuaSyntaxId::new(
-                glua_parser::LuaKind::Syntax(glua_parser::LuaSyntaxKind::Block),
-                target.value,
-            );
-            match remap.syntax_id(target.file_id, block) {
-                crate::Remap::Moved(block) if block.get_range() != target.value => {
-                    moves.insert(
-                        target.clone(),
-                        InFiled::new(target.file_id, block.get_range()),
-                    );
+        for target in self.targets() {
+            match remap_target(remap, target) {
+                crate::Remap::Moved(moved) => {
+                    moves.insert(target.clone(), moved);
                 }
                 crate::Remap::Lost => return crate::Remap::Lost,
-                crate::Remap::Moved(_) | crate::Remap::Unrelated => {}
+                crate::Remap::Unrelated => {}
             }
         }
         if moves.is_empty() {
             return crate::Remap::Unrelated;
         }
-        let mut move_target = |target: &mut HelperId| {
-            if let Some(moved) = moves.get(target) {
-                *target = moved.clone();
+        let mut moved = self.clone();
+        moved.visit_targets(&mut |target: &mut HelperId| {
+            if let Some(new) = moves.get(target) {
+                *target = new.clone();
             }
+        });
+        crate::Remap::Moved(Arc::new(moved))
+    }
+}
+
+/// A file's function lookup and local bindings, read off its syntax once per
+/// analysis pass: a pass rebuilds no source layer, so the file's syntax and
+/// declarations hold for all of it.
+#[derive(Default)]
+pub(crate) struct FileNetSyntax {
+    /// The body block of each function a bare name defines once in the file.
+    bare: HashMap<String, TextRange>,
+    /// The body blocks of the functions the file binds to a name or a field.
+    named_blocks: HashSet<TextRange>,
+    /// The written names of the values bound to each name, sorted.
+    bindings: HashMap<SmolStr, Vec<SmolStr>>,
+}
+
+impl FileNetSyntax {
+    pub(crate) fn new(db: &DbIndex, file_id: FileId) -> Self {
+        let Some(root) = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .map(|tree| tree.get_chunk_node())
+        else {
+            return Self::default();
         };
-        let mut calls = self.calls.clone();
-        for target in calls.values_mut().filter_map(|fact| fact.target.as_mut()) {
-            move_target(target);
-        }
-        let helpers = self
-            .helpers
-            .iter()
-            .map(|(range, helper)| {
-                let mut moved = NetHelper::clone(helper);
-                moved.visit_targets(&mut move_target);
-                let helper = if moved == **helper {
-                    helper.clone()
-                } else {
-                    Arc::new(moved)
+        let functions = FileFunctionMap::build(&root);
+        let mut bindings: HashMap<SmolStr, Vec<SmolStr>> = HashMap::default();
+        if let Some(decl_tree) = db.get_decl_index().get_decl_tree(&file_id) {
+            for decl in decl_tree.get_decls().values() {
+                let Some(source) = decl
+                    .get_value_syntax_id()
+                    .and_then(|syntax_id| syntax_id.to_node_from_root(root.syntax()))
+                    .and_then(LuaExpr::cast)
+                    .as_ref()
+                    .and_then(expr_written_name)
+                else {
+                    continue;
                 };
-                (*range, helper)
-            })
-            .collect();
-        crate::Remap::Moved(Arc::new(FileNetHelpers { calls, helpers }))
+                bindings
+                    .entry(SmolStr::new(decl.get_name()))
+                    .or_default()
+                    .push(source);
+            }
+        }
+        for sources in bindings.values_mut() {
+            sources.sort_unstable();
+            sources.dedup();
+        }
+        Self {
+            bare: functions
+                .bare
+                .iter()
+                .map(|(name, block)| (name.clone(), block.syntax().text_range()))
+                .collect(),
+            named_blocks: functions
+                .all_blocks
+                .iter()
+                .map(|block| block.syntax().text_range())
+                .collect(),
+            bindings,
+        }
+    }
+
+    /// Whether `name` is a net-helper name, or is bound to a value written as
+    /// one that is.
+    fn reaches_helper(
+        &self,
+        network: &crate::db_index::GmodNetworkIndex,
+        name: &SmolStr,
+        visited: &mut HashSet<SmolStr>,
+    ) -> bool {
+        if network.is_helper_name(name) {
+            return true;
+        }
+        if !visited.insert(name.clone()) {
+            return false;
+        }
+        self.bindings.get(name).is_some_and(|sources| {
+            sources
+                .iter()
+                .any(|source| self.reaches_helper(network, source, visited))
+        })
+    }
+
+    /// Whether `name`, which is not a net-helper name, is bound to a value
+    /// written as a net-helper name or as another such alias.
+    fn is_alias(&self, network: &crate::db_index::GmodNetworkIndex, name: &SmolStr) -> bool {
+        let mut visited = HashSet::default();
+        visited.insert(name.clone());
+        self.bindings.get(name).is_some_and(|sources| {
+            sources
+                .iter()
+                .any(|source| self.reaches_helper(network, source, &mut visited))
+        })
     }
 }
 
-/// One file's net call facts and function-body summaries.
-pub(crate) fn evaluate_net_helpers(db: &mut DbIndex, file_id: FileId) {
-    let helpers = compute_net_helpers(db, file_id);
-    apply_net_helpers(db, file_id, helpers);
-}
-
-/// A file's net helpers, read off the index; [`apply_net_helpers`] stores them.
-pub(crate) fn compute_net_helpers(db: &DbIndex, file_id: FileId) -> Option<FileNetHelpers> {
-    if !db.get_emmyrc().gmod.enabled {
-        return None;
-    }
-    let roles = derive::call_role_entries(db);
-    build_file_net_helpers(db, file_id, &roles.registry)
-}
-
-pub(crate) fn apply_net_helpers(
+/// One call's net fact.
+pub(crate) fn evaluate_net_call(
     db: &mut DbIndex,
-    file_id: FileId,
-    helpers: Option<FileNetHelpers>,
+    id: crate::db_index::derivation::DerivationId,
+    syntax: &FileNetSyntax,
 ) {
-    if let Some(helpers) = helpers {
-        db.set_net_helpers(file_id, Arc::new(helpers));
+    if !db.get_emmyrc().gmod.enabled {
+        return;
     }
+    let file_id = id.file_id;
+    let Some(call_expr) = super::super::call_target::call_at(db, file_id, id.syntax_id()) else {
+        return;
+    };
+    let roles = derive::call_role_entries(db);
+    let Some(fact) = net_call_fact(db, file_id, &call_expr, &roles.registry, syntax) else {
+        return;
+    };
+    db.set_net_call(file_id, call_expr.get_range(), Arc::new(fact));
 }
 
-fn build_file_net_helpers(
+/// What `call_expr` is in the net subsystem, `None` for a call that is none.
+fn net_call_fact(
     db: &DbIndex,
     file_id: FileId,
+    call_expr: &LuaCallExpr,
     helper_registry: &HelperRegistry,
-) -> Option<FileNetHelpers> {
-    let root = db.get_vfs().get_syntax_tree(&file_id)?.get_chunk_node();
-    let functions = FileFunctionMap::build(&root);
-    let mut calls = HashMap::default();
-    for call_expr in root.descendants::<LuaCallExpr>() {
-        let signature_id = super::super::call_target::call_target_of(db, file_id, &call_expr)
-            .and_then(crate::LuaCallTarget::signature_id);
-        let role =
-            signature_id.and_then(|signature_id| net_call_role(db, &call_expr, signature_id));
-        let target = resolve_call_to_function_block(
-            file_id,
-            &call_expr,
-            helper_registry,
-            &functions,
-            signature_id,
-            db,
-        );
-        let bits_param_idx = match (&role, signature_id) {
-            (Some(NetCallRole::Payload(_)), Some(signature_id)) => {
-                bits_param_idx(db, &call_expr, signature_id)
-            }
-            _ => None,
-        };
-        calls.insert(
-            call_expr.get_range(),
-            NetCallFact {
-                role,
-                target,
-                bits_param_idx,
-            },
-        );
-    }
-    if calls.is_empty() {
+    syntax: &FileNetSyntax,
+) -> Option<NetCallFact> {
+    let signature_id = super::super::call_target::call_target_of(db, file_id, call_expr)
+        .and_then(crate::LuaCallTarget::signature_id);
+    let role = signature_id.and_then(|signature_id| net_call_role(db, call_expr, signature_id));
+    let target = resolve_call_to_function_block(
+        file_id,
+        call_expr,
+        helper_registry,
+        syntax,
+        signature_id,
+        db,
+    );
+    if role.is_none() && target.is_none() {
         return None;
     }
-    let mut file = FileNetHelpers {
-        calls,
-        helpers: HashMap::default(),
+    let bits_param_idx = match (&role, signature_id) {
+        (Some(NetCallRole::Payload(_)), Some(signature_id)) => {
+            bits_param_idx(db, call_expr, signature_id)
+        }
+        _ => None,
     };
-    let site = NetFileSite {
-        file_id,
-        functions: &functions,
-        calls: &file,
-    };
-    let helpers = root
-        .descendants::<LuaClosureExpr>()
-        .filter_map(|closure| {
-            let block = closure.get_block()?;
-            Some((
-                block.syntax().text_range(),
-                Arc::new(summarize_helper(&site, &closure, &block)),
-            ))
-        })
-        .collect();
-    file.helpers = helpers;
-    Some(file)
+    Some(NetCallFact {
+        role,
+        target,
+        bits_param_idx,
+        candidate: is_net_helper_call(db, file_id, call_expr, syntax),
+    })
 }
 
-/// A file's syntax together with its call facts.
-struct NetFileSite<'a> {
+/// Whether `call_expr` is a call site of a net helper: the reference index
+/// files its callee under a helper name, or the callee is a local bound to a
+/// helper name or to a name that is one.
+///
+/// A lookup rather than a walk: the call sites that can expand into a
+/// net-producing helper come from the reference index, which already records
+/// every reference to those helpers' names.
+fn is_net_helper_call(
+    db: &DbIndex,
     file_id: FileId,
-    functions: &'a FileFunctionMap,
-    calls: &'a FileNetHelpers,
+    call_expr: &LuaCallExpr,
+    syntax: &FileNetSyntax,
+) -> bool {
+    let Some(prefix) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Some(name) = expr_written_name(&prefix) else {
+        return false;
+    };
+    let network = db.get_gmod_network_index();
+    let helper_name = network.is_helper_name(&name);
+    if helper_name
+        && db
+            .get_reference_index()
+            .name_sites_in_file([&name], file_id)
+            .contains(&LuaSyntaxId::from_node(prefix.syntax()))
+    {
+        return true;
+    }
+    // Locals never enter the global reference table, so a helper declared
+    // `local function send()` is reached through its own declaration's
+    // references instead, and `local sendString = MyLib.SendString` calls the
+    // helper under a name the reference index files under the local binding.
+    let LuaExpr::NameExpr(name_expr) = &prefix else {
+        return false;
+    };
+    if !helper_name && !syntax.is_alias(network, &name) {
+        return false;
+    }
+    let range = name_expr.get_range();
+    let references = db.get_reference_index();
+    let Some(decl_id) = references.get_var_reference_decl(&file_id, range) else {
+        return false;
+    };
+    db.get_decl_index()
+        .get_decl(&decl_id)
+        .is_some_and(|decl| decl.is_local())
+        && references
+            .decl_references(&decl_id)
+            .is_some_and(|references| {
+                references
+                    .cells
+                    .iter()
+                    .any(|cell| cell.range == range && !cell.is_write)
+            })
 }
 
-impl NetFileSite<'_> {
-    fn call(&self, call_expr: &LuaCallExpr) -> Option<&NetCallFact> {
-        self.calls.call(call_expr)
+/// One function body's net summary, from the facts of the calls in it.
+pub(crate) fn evaluate_net_helper(
+    db: &mut DbIndex,
+    id: crate::db_index::derivation::DerivationId,
+    syntax: &FileNetSyntax,
+) {
+    if !db.get_emmyrc().gmod.enabled {
+        return;
+    }
+    let file_id = id.file_id;
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .map(|tree| tree.get_chunk_node())
+    else {
+        return;
+    };
+    let Some(closure) = id
+        .syntax_id()
+        .to_node_from_root(root.syntax())
+        .and_then(LuaClosureExpr::cast)
+    else {
+        return;
+    };
+    let Some(block) = closure.get_block() else {
+        return;
+    };
+    let summary = summarize_helper(
+        &NetFileSite::new(db, file_id, &root, syntax),
+        &closure,
+        &block,
+    );
+    if summary != NetHelper::default() {
+        db.set_net_helper(file_id, block.syntax().text_range(), Arc::new(summary));
+    }
+}
+
+/// A file's syntax together with the net facts of its calls.
+struct NetFileSite<'a> {
+    db: &'a DbIndex,
+    file_id: FileId,
+    root: LuaSyntaxNode,
+    syntax: &'a FileNetSyntax,
+}
+
+impl<'a> NetFileSite<'a> {
+    fn new(db: &'a DbIndex, file_id: FileId, root: &LuaChunk, syntax: &'a FileNetSyntax) -> Self {
+        Self {
+            db,
+            file_id,
+            root: root.syntax().clone(),
+            syntax,
+        }
+    }
+
+    fn call(&self, call_expr: &LuaCallExpr) -> Option<Arc<NetCallFact>> {
+        self.db
+            .get_net_call::<NetCallFact>(self.file_id, call_expr.get_range())
     }
 
     fn role(&self, call_expr: &LuaCallExpr) -> Option<NetCallRole> {
@@ -468,6 +650,15 @@ impl NetFileSite<'_> {
 
     fn target(&self, call_expr: &LuaCallExpr) -> Option<HelperId> {
         self.call(call_expr).and_then(|fact| fact.target.clone())
+    }
+
+    /// The body of the function a bare name defines once in the file.
+    fn bare_block(&self, name: &str) -> Option<LuaBlock> {
+        let block = LuaSyntaxId::new(
+            glua_parser::LuaKind::Syntax(glua_parser::LuaSyntaxKind::Block),
+            *self.syntax.bare.get(name)?,
+        );
+        LuaBlock::cast(block.to_node_from_root(&self.root)?)
     }
 }
 
@@ -693,7 +884,7 @@ fn receive_reads(
     else {
         return NetReceiveReads::default();
     };
-    match resolve_callback_block(&callback_expr, site.functions) {
+    match resolve_callback_block(&callback_expr, site) {
         Some(callback_block) => {
             let mut items = Vec::new();
             op_items(site, &callback_block, callback_block.syntax(), &mut items);
@@ -717,20 +908,14 @@ fn receive_reads(
 /// inline closures (`function() ... end`) and same-file local/global function
 /// references (`net.Receive("Msg", doRetrieve)` paired with
 /// `local function doRetrieve() ... end` or `local doRetrieve = function() ... end`).
-fn resolve_callback_block(
-    callback_expr: &LuaExpr,
-    functions: &FileFunctionMap,
-) -> Option<LuaBlock> {
+fn resolve_callback_block(callback_expr: &LuaExpr, site: &NetFileSite<'_>) -> Option<LuaBlock> {
     if let LuaExpr::ClosureExpr(closure_expr) = callback_expr {
         return closure_expr.get_block();
     }
     let LuaExpr::NameExpr(name_expr) = callback_expr else {
         return None;
     };
-    functions
-        .bare
-        .get(name_expr.get_name_text()?.as_str())
-        .cloned()
+    site.bare_block(name_expr.get_name_text()?.as_str())
 }
 
 /// The body block at a helper-registry entry: the registry files each body by
@@ -744,7 +929,7 @@ fn resolve_call_to_function_block(
     root_file_id: FileId,
     call_expr: &LuaCallExpr,
     helper_registry: &HelperRegistry,
-    functions: &FileFunctionMap,
+    syntax: &FileNetSyntax,
     signature_id: Option<LuaSignatureId>,
     db: &DbIndex,
 ) -> Option<HelperId> {
@@ -773,9 +958,9 @@ fn resolve_call_to_function_block(
     // written bare name identifies exactly one function body in that file.
     if let Some(LuaExpr::NameExpr(name_expr)) = call_expr.get_prefix_expr()
         && let Some(name) = name_expr.get_name_text()
-        && let Some(block) = functions.bare.get(name.as_str())
+        && let Some(block) = syntax.bare.get(name.as_str())
     {
-        return Some(InFiled::new(root_file_id, block.syntax().text_range()));
+        return Some(InFiled::new(root_file_id, *block));
     }
 
     // Dynamic receivers sometimes have no inferable class in Lua source. Keep
@@ -856,111 +1041,96 @@ fn bits_param_idx(
     )
 }
 
-/// Collects the net message flows of the context's files.
+/// One call's net message flows.
 ///
-/// A file's flows read its own [`FileNetHelpers`] and those of the helpers it
-/// expands into, so they re-derive when one of those changes.
-pub(super) fn collect_network_flows(db: &mut DbIndex, context: &AnalyzeContext) {
-    for file_id in context
-        .tree_list
-        .iter()
-        .map(|tree| tree.file_id)
-        .collect::<Vec<_>>()
-    {
-        let network_data = compute_network_flows(db, file_id);
-        apply_network_flows(db, file_id, network_data);
-    }
-}
-
-/// A file's net message flows, read off the index; [`apply_network_flows`]
-/// stores them.
-pub(crate) fn compute_network_flows(
-    db: &DbIndex,
-    file_id: FileId,
-) -> crate::db_index::FileNetworkData {
-    if !db.get_emmyrc().gmod.enabled {
-        return crate::db_index::FileNetworkData::default();
-    }
-    collect_file_network_flows(db, file_id)
-}
-
-pub(crate) fn apply_network_flows(
+/// The call reads the facts of the calls around it and the summaries of the
+/// helpers it expands into, so it runs again when one of those changes.
+pub(crate) fn evaluate_net_flows(
     db: &mut DbIndex,
-    file_id: FileId,
-    network_data: crate::db_index::FileNetworkData,
+    id: crate::db_index::derivation::DerivationId,
+    syntax: &FileNetSyntax,
 ) {
-    if network_data.send_flows.is_empty() && network_data.receive_flows.is_empty() {
+    if !db.get_emmyrc().gmod.enabled {
         return;
     }
-    db.get_gmod_network_index_mut()
-        .add_file_data(file_id, network_data);
-}
-
-fn collect_file_network_flows(db: &DbIndex, file_id: FileId) -> crate::db_index::FileNetworkData {
-    let Some(calls) = db.get_net_helpers::<FileNetHelpers>(file_id) else {
-        return crate::db_index::FileNetworkData::default();
-    };
+    let file_id = id.file_id;
     let Some(root) = db
         .get_vfs()
         .get_syntax_tree(&file_id)
         .map(|tree| tree.get_chunk_node())
     else {
-        return crate::db_index::FileNetworkData::default();
+        return;
     };
-
-    let (functions, file_blocks, callee_names) =
-        crate::profile::phase("gmodnet/file_scan", || FileFunctionMap::scan(&root));
-    let helper_call_sites = net_helper_call_sites(db, file_id, &callee_names);
-    let mut ctx = NetCollectCtx {
-        db,
-        site: NetFileSite {
-            file_id,
-            functions: &functions,
-            calls: &calls,
-        },
-        memo: HelperMemo::default(),
+    let Some(call_expr) = id
+        .syntax_id()
+        .to_node_from_root(root.syntax())
+        .and_then(LuaCallExpr::cast)
+    else {
+        return;
     };
-    let net_candidates = crate::profile::phase("gmodnet/net_candidates", || {
-        net_candidate_call_exprs(db, file_id, &root, &helper_call_sites)
-    });
-
-    let mut receive_flows = Vec::new();
-    for call_expr in &net_candidates {
-        if let Some(receive_flow) = collect_net_receive_flow(&mut ctx, call_expr) {
-            receive_flows.push(receive_flow);
-        } else if call_has_literal_string_arg(call_expr) {
-            collect_receive_flows_from_helper_call(&mut ctx, call_expr, &mut receive_flows);
-        }
-    }
-    receive_flows.sort_by_key(|flow| flow.receive_range.start());
-
-    let mut send_flows = crate::profile::phase("gmodnet/send_direct", || {
-        collect_net_send_flows(&mut ctx, &file_blocks)
-    });
-    send_flows.extend(crate::profile::phase("gmodnet/send_wrapped", || {
-        collect_wrapped_net_send_flows(&mut ctx, &file_blocks)
-    }));
-    send_flows.extend(crate::profile::phase("gmodnet/send_unannotated", || {
-        collect_unannotated_net_wrapper_send_flows(&mut ctx, &net_candidates)
-    }));
-    send_flows.sort_by_key(|flow| flow.start_range.start());
-    let mut unique_send_flows = Vec::with_capacity(send_flows.len());
-    for flow in send_flows {
-        if !unique_send_flows.contains(&flow) {
-            unique_send_flows.push(flow);
-        }
-    }
-
-    crate::db_index::FileNetworkData {
-        send_flows: unique_send_flows,
-        receive_flows,
+    let flows = {
+        let mut ctx = NetCollectCtx {
+            site: NetFileSite::new(db, file_id, &root, syntax),
+            memo: HelperMemo::default(),
+        };
+        collect_call_flows(&mut ctx, &call_expr)
+    };
+    if !flows.is_empty() {
+        db.get_gmod_network_index_mut()
+            .set_call_flows(file_id, call_expr.get_range(), flows);
     }
 }
 
-/// One file's flow collection: its own syntax and facts, the database for
-/// helper summaries, and the evaluation's composition memos.
+/// The flows `call_expr` starts, receives or materializes: the receive it
+/// registers, the send written at it, the send of a wrapper that holds it, and
+/// the sends of the helper it calls.
+fn collect_call_flows(ctx: &mut NetCollectCtx<'_>, call_expr: &LuaCallExpr) -> CallFlows {
+    let mut flows = CallFlows::default();
+    let candidate = ctx.site.call(call_expr).is_some_and(|fact| fact.candidate);
+    if candidate {
+        if let Some(receive_flow) = collect_net_receive_flow(ctx, call_expr) {
+            flows.receive_flows.push(receive_flow);
+        } else if call_has_literal_string_arg(call_expr) {
+            collect_receive_flows_from_helper_call(ctx, call_expr, &mut flows.receive_flows);
+        }
+    }
+    let mut send_flows = Vec::new();
+    if call_has_literal_string_arg(call_expr)
+        && let Some((block, stat)) = call_stat_in_block(call_expr)
+    {
+        send_flows.extend(collect_net_send_flow(ctx, &block, &stat, call_expr));
+        send_flows.extend(collect_wrapped_net_send_flow(ctx, &block, &stat, call_expr));
+    }
+    if candidate {
+        send_flows.extend(collect_unannotated_net_wrapper_send_flows(ctx, call_expr));
+    }
+    for flow in send_flows {
+        if !flows.send_flows.contains(&flow) {
+            flows.send_flows.push(flow);
+        }
+    }
+    flows
+}
+
+/// The statement `call_expr` is, and the block that holds it.
+fn call_stat_in_block(call_expr: &LuaCallExpr) -> Option<(LuaBlock, LuaStat)> {
+    let stat = LuaStat::cast(call_expr.syntax().parent()?)?;
+    if call_expr_from_stat(&stat)?.syntax() != call_expr.syntax() {
+        return None;
+    }
+    let block = LuaBlock::cast(stat.syntax().parent()?)?;
+    Some((block, stat))
+}
+
+/// The statements that follow `stat` in its block.
+fn stats_after(stat: &LuaStat) -> impl Iterator<Item = LuaStat> {
+    std::iter::successors(stat.syntax().next_sibling(), |node| node.next_sibling())
+        .filter_map(LuaStat::cast)
+}
+
+/// One call's flow collection: its own syntax and the facts around it, and
+/// the evaluation's composition memos.
 struct NetCollectCtx<'a> {
-    db: &'a DbIndex,
     site: NetFileSite<'a>,
     memo: HelperMemo,
 }
@@ -969,9 +1139,9 @@ impl NetCollectCtx<'_> {
     /// A helper's summary, read as that summary alone; a body without one
     /// contributes nothing.
     fn helper(&self, id: &HelperId) -> Arc<NetHelper> {
-        self.db
-            .get_net_helper::<FileNetHelpers>(id)
-            .and_then(|file| file.helpers.get(&id.value).cloned())
+        self.site
+            .db
+            .get_net_helper::<NetHelper>(id)
             .unwrap_or_default()
     }
 }
@@ -1033,91 +1203,75 @@ impl HelperMemo {
     }
 }
 
-fn collect_net_send_flows(ctx: &mut NetCollectCtx<'_>, blocks: &[LuaBlock]) -> Vec<NetSendFlow> {
-    let mut flows = Vec::new();
+/// The transaction written at `call_expr`, a statement of `block`: the
+/// `net.Start` or helper call, the payload statements after it, and the send
+/// that ends it.
+fn collect_net_send_flow(
+    ctx: &mut NetCollectCtx<'_>,
+    block: &LuaBlock,
+    stat: &LuaStat,
+    call_expr: &LuaCallExpr,
+) -> Option<NetSendFlow> {
+    let message_name = match ctx.site.role(call_expr) {
+        Some(NetCallRole::Start { message_idx }) => {
+            extract_static_string_arg_value(call_expr, message_idx)
+        }
+        Some(_) => None,
+        None => resolve_helper_start_message(ctx, call_expr),
+    }?;
 
-    for block in blocks {
-        let stats: Vec<LuaStat> = block.get_stats().collect();
-        for (index, stat) in stats.iter().enumerate() {
-            let Some(call_expr) = call_expr_from_stat(stat) else {
-                continue;
-            };
+    let mut writes = Vec::new();
+    let mut send = None;
 
-            if !call_has_literal_string_arg(&call_expr) {
-                continue;
-            }
-
-            let message_name = match ctx.site.role(&call_expr) {
-                Some(NetCallRole::Start { message_idx }) => {
-                    extract_static_string_arg_value(&call_expr, message_idx)
+    for next_stat in stats_after(stat) {
+        if let Some(next_call_expr) = call_expr_from_stat(&next_stat) {
+            match ctx.site.role(&next_call_expr) {
+                Some(NetCallRole::Start { .. }) => break,
+                Some(NetCallRole::Send(send_kind)) => {
+                    let target = extract_send_target_text(&next_call_expr, send_kind);
+                    send = Some((
+                        next_call_expr.get_range(),
+                        send_kind,
+                        target,
+                        call_display_name(&next_call_expr),
+                    ));
+                    break;
                 }
-                Some(_) => None,
-                None => resolve_helper_start_message(ctx, &call_expr),
-            };
-            let Some(message_name) = message_name else {
-                continue;
-            };
-
-            let mut writes = Vec::new();
-            let mut send = None;
-
-            for next_stat in stats.iter().skip(index + 1) {
-                if let Some(next_call_expr) = call_expr_from_stat(next_stat) {
-                    match ctx.site.role(&next_call_expr) {
-                        Some(NetCallRole::Start { .. }) => break,
-                        Some(NetCallRole::Send(send_kind)) => {
-                            let target = extract_send_target_text(&next_call_expr, send_kind);
-                            send = Some((
-                                next_call_expr.get_range(),
-                                send_kind,
-                                target,
-                                call_display_name(&next_call_expr),
-                            ));
-                            break;
-                        }
-                        Some(_) => {}
-                        None => {
-                            if resolve_helper_start_message(ctx, &next_call_expr).is_some() {
-                                break;
-                            }
-                            if let Some((send_kind, send_target)) =
-                                resolve_helper_send(ctx, &next_call_expr)
-                            {
-                                send = Some((
-                                    next_call_expr.get_range(),
-                                    send_kind,
-                                    send_target,
-                                    call_display_name(&next_call_expr),
-                                ));
-                                break;
-                            }
-                        }
+                Some(_) => {}
+                None => {
+                    if resolve_helper_start_message(ctx, &next_call_expr).is_some() {
+                        break;
+                    }
+                    if let Some((send_kind, send_target)) =
+                        resolve_helper_send(ctx, &next_call_expr)
+                    {
+                        send = Some((
+                            next_call_expr.get_range(),
+                            send_kind,
+                            send_target,
+                            call_display_name(&next_call_expr),
+                        ));
+                        break;
                     }
                 }
-
-                collect_net_write_ops_from_stat(ctx, block, next_stat, &mut writes);
             }
-
-            let Some((send_range, send_kind, send_target, send_display_name)) = send else {
-                continue;
-            };
-
-            flows.push(NetSendFlow {
-                message_name,
-                start_range: call_expr.get_range(),
-                writes,
-                send_range,
-                send_kind,
-                send_display_name,
-                send_target,
-                is_wrapped: false,
-                materialized_from: None,
-            });
         }
+
+        collect_net_write_ops_from_stat(ctx, block, &next_stat, &mut writes);
     }
 
-    flows.sort_by_key(|flow| flow.start_range.start());
-    flows
+    let (send_range, send_kind, send_target, send_display_name) = send?;
+    Some(NetSendFlow {
+        message_name,
+        start_range: call_expr.get_range(),
+        writes,
+        send_range,
+        send_kind,
+        send_display_name,
+        send_target,
+        is_wrapped: false,
+        materialized_from: None,
+    })
 }
 
 fn resolve_helper_start_message(
@@ -1247,127 +1401,98 @@ fn helper_send(
     (answer, low)
 }
 
-fn collect_wrapped_net_send_flows(
-    ctx: &mut NetCollectCtx<'_>,
-    blocks: &[LuaBlock],
-) -> Vec<NetSendFlow> {
-    let mut flows = Vec::new();
-
-    let owned_ranges: HashSet<TextRange> = ctx
-        .site
-        .functions
-        .all_blocks
-        .iter()
-        .map(|block| block.syntax().text_range())
-        .collect();
-    for block in blocks {
-        // The block's own closure (if any) owns it; a block with no enclosing
-        // closure is top-level chunk code, which the direct scan covers.
-        // Blocks inside an anonymous callback (e.g. a `net.Receive` receiver)
-        // have no named owner and are skipped. A block nested inside another
-        // named function is visited under that inner owner.
-        let Some(owner_range) = block
-            .syntax()
-            .ancestors()
-            .find_map(LuaClosureExpr::cast)
-            .and_then(|closure| closure.get_block())
-            .map(|owner| owner.syntax().text_range())
-        else {
-            continue;
-        };
-        if !owned_ranges.contains(&owner_range) {
-            continue;
-        }
-        collect_wrapped_net_send_flows_in_block(ctx, block, &mut flows);
-    }
-
-    flows.sort_by_key(|flow| flow.start_range.start());
-    flows
-}
-
-fn collect_wrapped_net_send_flows_in_block(
+/// The transaction a function holds at `call_expr`, a statement of `block`.
+///
+/// The block's own closure (if any) owns it; a block with no enclosing
+/// closure is top-level chunk code, which the direct scan covers. Blocks
+/// inside an anonymous callback (e.g. a `net.Receive` receiver) have no named
+/// owner and are skipped. A block nested inside another named function is
+/// visited under that inner owner.
+fn collect_wrapped_net_send_flow(
     ctx: &mut NetCollectCtx<'_>,
     block: &LuaBlock,
-    flows: &mut Vec<NetSendFlow>,
-) {
-    let stats: Vec<LuaStat> = block.get_stats().collect();
-    for (index, stat) in stats.iter().enumerate() {
-        let Some(call_expr) = call_expr_from_stat(stat) else {
-            continue;
-        };
+    stat: &LuaStat,
+    call_expr: &LuaCallExpr,
+) -> Option<NetSendFlow> {
+    let owner = block
+        .syntax()
+        .ancestors()
+        .find_map(LuaClosureExpr::cast)
+        .and_then(|closure| closure.get_block())?;
+    if !ctx
+        .site
+        .syntax
+        .named_blocks
+        .contains(&owner.syntax().text_range())
+    {
+        return None;
+    }
 
-        if !call_has_literal_string_arg(&call_expr) {
-            continue;
-        }
+    let Some(NetCallRole::Start { message_idx }) = ctx.site.role(call_expr) else {
+        return None;
+    };
+    let message_name = extract_static_string_arg_value(call_expr, message_idx)?;
 
-        let Some(NetCallRole::Start { message_idx }) = ctx.site.role(&call_expr) else {
-            continue;
-        };
-        let Some(message_name) = extract_static_string_arg_value(&call_expr, message_idx) else {
-            continue;
-        };
+    let mut writes = Vec::new();
+    let mut send = None;
 
-        let mut writes = Vec::new();
-        let mut send = None;
-
-        for next_stat in stats.iter().skip(index + 1) {
-            if let Some(next_call_expr) = call_expr_from_stat(next_stat) {
-                match ctx.site.role(&next_call_expr) {
-                    Some(NetCallRole::Start { .. }) => break,
-                    Some(NetCallRole::Send(send_kind)) => {
-                        let target = extract_send_target_text(&next_call_expr, send_kind);
-                        send = Some((
-                            next_call_expr.get_range(),
-                            send_kind,
-                            target,
-                            call_display_name(&next_call_expr),
-                        ));
-                        break;
-                    }
-                    _ => {}
+    for next_stat in stats_after(stat) {
+        if let Some(next_call_expr) = call_expr_from_stat(&next_stat) {
+            match ctx.site.role(&next_call_expr) {
+                Some(NetCallRole::Start { .. }) => break,
+                Some(NetCallRole::Send(send_kind)) => {
+                    let target = extract_send_target_text(&next_call_expr, send_kind);
+                    send = Some((
+                        next_call_expr.get_range(),
+                        send_kind,
+                        target,
+                        call_display_name(&next_call_expr),
+                    ));
+                    break;
                 }
+                _ => {}
             }
-
-            collect_net_write_ops_from_stat(ctx, block, next_stat, &mut writes);
         }
 
-        if let Some((send_range, send_kind, send_target, send_display_name)) = send {
-            flows.push(NetSendFlow {
-                message_name,
-                start_range: call_expr.get_range(),
-                writes,
-                send_range,
-                send_kind,
-                send_display_name,
-                send_target,
-                is_wrapped: true,
-                materialized_from: None,
-            });
-            continue;
-        }
+        collect_net_write_ops_from_stat(ctx, block, &next_stat, &mut writes);
+    }
 
-        // Wrapped helper flows can start a net message in one function and send at call-site.
-        // Keep a conservative stub so counterpart diagnostics can still resolve by message name.
-        // The realm is a placeholder: `is_wrapped` flows are used for counterpart
-        // presence only and are skipped by every realm-sensitive check.
-        flows.push(NetSendFlow {
+    if let Some((send_range, send_kind, send_target, send_display_name)) = send {
+        return Some(NetSendFlow {
             message_name,
             start_range: call_expr.get_range(),
-            writes: Vec::new(),
-            send_range: call_expr.get_range(),
-            send_kind: NetSendKind {
-                receiver_realm: GmodRealm::Client,
-                target_arg_idx: None,
-            },
-            send_display_name: call_display_name(&call_expr),
-            send_target: None,
+            writes,
+            send_range,
+            send_kind,
+            send_display_name,
+            send_target,
             is_wrapped: true,
             materialized_from: None,
         });
     }
+
+    // Wrapped helper flows can start a net message in one function and send at call-site.
+    // Keep a conservative stub so counterpart diagnostics can still resolve by message name.
+    // The realm is a placeholder: `is_wrapped` flows are used for counterpart
+    // presence only and are skipped by every realm-sensitive check.
+    Some(NetSendFlow {
+        message_name,
+        start_range: call_expr.get_range(),
+        writes: Vec::new(),
+        send_range: call_expr.get_range(),
+        send_kind: NetSendKind {
+            receiver_realm: GmodRealm::Client,
+            target_arg_idx: None,
+        },
+        send_display_name: call_display_name(call_expr),
+        send_target: None,
+        is_wrapped: true,
+        materialized_from: None,
+    })
 }
 
-/// Collect complete send flows performed by ordinary, unannotated helpers.
+/// Collect complete send flows performed by an ordinary, unannotated helper
+/// that `call_expr` calls.
 ///
 /// Literal string arguments at the call site bind the helper's parameters, so
 /// `net.Start(messageName)` becomes concrete at
@@ -1375,136 +1500,32 @@ fn collect_wrapped_net_send_flows_in_block(
 /// path, which lets a no-argument helper produce a complete call-site flow.
 fn collect_unannotated_net_wrapper_send_flows(
     ctx: &mut NetCollectCtx<'_>,
-    candidates: &[LuaCallExpr],
+    call_expr: &LuaCallExpr,
 ) -> Vec<NetSendFlow> {
-    let mut flows = Vec::new();
-    for call_expr in candidates {
-        if ctx.site.role(call_expr).is_some() {
-            continue;
-        }
-        let Some(target) = ctx.site.target(call_expr) else {
-            continue;
-        };
-        let args = arg_templates(call_expr);
-        let (bodies, _) =
-            helper_send_body(ctx, target, &args, &HashMap::default(), &mut Vec::new());
-        let origin_range = call_expr.get_range();
-        let display_name = call_display_name(call_expr);
-        for body in bodies {
-            flows.push(NetSendFlow {
-                message_name: body.message_name,
-                start_range: origin_range,
-                writes: body.writes,
-                send_range: origin_range,
-                send_kind: body.send_kind,
-                send_display_name: display_name.clone(),
-                send_target: body.send_target,
-                is_wrapped: false,
-                materialized_from: body.materialized_from,
-            });
-        }
+    if ctx.site.role(call_expr).is_some() {
+        return Vec::new();
     }
-    flows
-}
-
-/// The calls in a file that can take part in net-flow collection.
-///
-/// A lookup rather than a walk: the call sites that can expand into a
-/// net-producing helper come from the reference index, which already records
-/// every reference to those helpers' names.
-fn net_candidate_call_exprs(
-    db: &DbIndex,
-    file_id: FileId,
-    root: &LuaChunk,
-    helper_call_sites: &NetHelperCallSites<'_>,
-) -> Vec<LuaCallExpr> {
-    let root_syntax = root.syntax().clone();
-    // Locals never enter the global reference table, so a helper declared
-    // `local function send()` is reached through its own declaration's
-    // references instead.
-    let mut local_sites: Vec<LuaSyntaxId> = Vec::new();
-    if let Some(decl_tree) = db.get_decl_index().get_decl_tree(&file_id) {
-        // `local sendString = MyLib.SendString` calls the helper under a name
-        // the reference index files under the local binding rather than under
-        // the helper, so this file's own bindings of a helper name count as
-        // call sites too. Chains settle by iterating, bounded by the number of
-        // bindings in the file.
-        let mut aliases: HashSet<SmolStr> = HashSet::default();
-        let bindings = decl_tree
-            .get_decls()
-            .values()
-            .filter_map(|decl| {
-                let source = decl
-                    .get_value_syntax_id()?
-                    .to_node_from_root(&root_syntax)
-                    .and_then(LuaExpr::cast)
-                    .as_ref()
-                    .and_then(expr_written_name)?;
-                Some((SmolStr::new(decl.get_name()), source))
-            })
-            .collect::<Vec<_>>();
-        loop {
-            let mut added = false;
-            for (bound, source) in &bindings {
-                if (helper_call_sites.is_helper_name(source) || aliases.contains(source))
-                    && !helper_call_sites.is_helper_name(bound)
-                    && aliases.insert(bound.clone())
-                {
-                    added = true;
-                }
-            }
-            if !added {
-                break;
-            }
-        }
-
-        for decl in decl_tree.get_decls().values() {
-            let name = decl.get_name();
-            if !decl.is_local()
-                || !helper_call_sites.is_called(name)
-                || !(helper_call_sites.is_helper_name(name) || aliases.contains(name))
-            {
-                continue;
-            }
-            let Some(references) = db
-                .get_reference_index()
-                .get_decl_references(&file_id, &decl.get_id())
-            else {
-                continue;
-            };
-            local_sites.extend(
-                references
-                    .cells
-                    .iter()
-                    .filter(|cell| !cell.is_write)
-                    .map(|cell| {
-                        LuaSyntaxId::new(glua_parser::LuaSyntaxKind::NameExpr.into(), cell.range)
-                    }),
-            );
-        }
-    }
-    let mut calls = helper_call_sites
-        .sites
-        .iter()
-        .chain(local_sites.iter())
-        .filter_map(|syntax_id| syntax_id.to_node_from_root(&root_syntax))
-        .filter_map(|node| {
-            let call_expr = LuaCallExpr::cast(node.parent()?)?;
-            // The reference is the callee only when it is the call's prefix;
-            // `f(SendThing)` passes it as an argument instead.
-            (call_expr.get_prefix_expr()?.syntax() == &node).then_some(call_expr)
+    let Some(target) = ctx.site.target(call_expr) else {
+        return Vec::new();
+    };
+    let args = arg_templates(call_expr);
+    let (bodies, _) = helper_send_body(ctx, target, &args, &HashMap::default(), &mut Vec::new());
+    let origin_range = call_expr.get_range();
+    let display_name = call_display_name(call_expr);
+    bodies
+        .into_iter()
+        .map(|body| NetSendFlow {
+            message_name: body.message_name,
+            start_range: origin_range,
+            writes: body.writes,
+            send_range: origin_range,
+            send_kind: body.send_kind,
+            send_display_name: display_name.clone(),
+            send_target: body.send_target,
+            is_wrapped: false,
+            materialized_from: body.materialized_from,
         })
-        .collect::<Vec<_>>();
-
-    // Source order. The key is the whole range so that equal calls reached
-    // through both the name and the local-declaration lookup end up adjacent
-    // and the dedup can see them.
-    calls.sort_by_key(|call_expr| {
-        let range = call_expr.get_range();
-        (range.start(), range.end())
-    });
-    calls.dedup_by_key(|call_expr| call_expr.get_range());
-    calls
+        .collect()
 }
 
 /// Send transactions a helper performs for one set of caller bindings,
