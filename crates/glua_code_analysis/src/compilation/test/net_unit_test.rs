@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod test {
     use crate::db_index::derivation::DerivationKind;
-    use crate::{Emmyrc, VirtualWorkspace};
+    use crate::{Emmyrc, FileId, VirtualWorkspace};
 
     fn gmod_workspace() -> VirtualWorkspace {
         let mut ws = VirtualWorkspace::new();
@@ -147,5 +147,206 @@ end
         assert_eq!((net_flows, net_helpers), (7 + 1, 3));
         assert_eq!(ws.settled_digest(), cold.settled_digest());
         assert!(ws.stale_derivations().is_empty());
+    }
+
+    const PAYLOAD: &str = "addons/mytest/lua/autorun/server/sv_payload.lua";
+    const NOTICES: &str = "addons/mytest/lua/autorun/server/sv_notices.lua";
+    const PAYLOAD_TEXT: &str = "function WritePayload(value)
+    net.WriteString(value)
+    net.WriteBool(true)
+end
+
+function SendNotice(ply, text)
+    net.Start(\"Notice\")
+    WritePayload(text)
+    net.Send(ply)
+end
+";
+
+    fn notices_text(count: usize) -> String {
+        (0..count)
+            .map(|i| format!("SendNotice(ply, \"notice {i}\")\n"))
+            .collect()
+    }
+
+    /// A send flow's message and the wire formats it writes.
+    fn writes(message: &str, kinds: &[&str]) -> (String, Vec<String>) {
+        (
+            message.to_string(),
+            kinds.iter().map(|kind| kind.to_string()).collect(),
+        )
+    }
+
+    /// The id of the file at `path`.
+    fn path_id(ws: &VirtualWorkspace, path: &str) -> FileId {
+        ws.analysis
+            .get_file_id(&ws.virtual_url_generator.new_uri(path))
+            .expect("a workspace file")
+    }
+
+    /// The wire formats each send flow of `file_id` writes, by message.
+    fn sent_writes(ws: &VirtualWorkspace, file_id: FileId) -> Vec<(String, Vec<String>)> {
+        ws.analysis
+            .compilation
+            .get_db()
+            .get_gmod_network_index()
+            .get_file_data(file_id)
+            .into_iter()
+            .flat_map(|data| &data.send_flows)
+            .map(|flow| {
+                let writes = flow
+                    .writes
+                    .iter()
+                    .map(|entry| entry.op.wire_format.to_string())
+                    .collect();
+                (flow.message_name.clone(), writes)
+            })
+            .collect()
+    }
+
+    /// Every call of a wrapper writes the payload of the helper the wrapper
+    /// writes through, which the file's calls compose once and share.
+    #[test]
+    fn every_call_of_a_wrapper_writes_the_payload_its_shared_composition_holds() {
+        let mut ws = gmod_workspace();
+        let notices = notices_text(8);
+        ws.def_files(vec![(PAYLOAD, PAYLOAD_TEXT), (NOTICES, notices.as_str())]);
+
+        assert_eq!(
+            sent_writes(&ws, path_id(&ws, NOTICES)),
+            vec![writes("Notice", &["string", "bool"]); 8]
+        );
+        assert!(ws.stale_derivations().is_empty());
+    }
+
+    /// Editing the payload helper re-runs the calls that write through it,
+    /// which then hold the flows and diagnostics a cold build has.
+    #[test]
+    fn editing_a_composed_helper_leaves_the_flows_of_a_cold_build() {
+        let wider = PAYLOAD_TEXT.replace(
+            "net.WriteBool(true)\n",
+            "net.WriteBool(true)\n    net.WriteString(\"more\")\n",
+        );
+        let notices = notices_text(4);
+
+        let mut warm = gmod_workspace();
+        warm.def_files(vec![(PAYLOAD, PAYLOAD_TEXT), (NOTICES, notices.as_str())]);
+        warm.def_file(PAYLOAD, &wider);
+        let mut cold = gmod_workspace();
+        cold.def_files(vec![(PAYLOAD, wider.as_str()), (NOTICES, notices.as_str())]);
+
+        assert_eq!(
+            sent_writes(&cold, path_id(&cold, NOTICES)),
+            vec![writes("Notice", &["string", "bool", "string"]); 4]
+        );
+        assert_eq!(warm.settled_digest(), cold.settled_digest());
+        assert!(warm.stale_derivations().is_empty());
+    }
+
+    const WRAPPER: &str = "addons/mytest/lua/autorun/server/sv_wrapper.lua";
+    const WRAPPER_TEXT: &str = "function WriteBoth(value)
+    WritePayload(value)
+end
+";
+    const BOTH: &str = "addons/mytest/lua/autorun/server/sv_both.lua";
+    const BOTH_TEXT: &str = "net.Start(\"Both\")
+WriteBoth(\"a\")
+net.Broadcast()
+";
+
+    /// A helper's composed ops name the positions of the helpers it reaches in
+    /// other files: after a shift of one of those files and an edit of the
+    /// caller, the caller holds the flows of a cold build.
+    #[test]
+    fn a_shift_of_a_reached_helpers_file_leaves_its_callers_the_flows_of_a_cold_build() {
+        let shifted = format!("-- shifted\n{PAYLOAD_TEXT}");
+        let edited_both = format!("-- edited\n{BOTH_TEXT}");
+
+        let mut warm = gmod_workspace();
+        warm.def_files(vec![
+            (PAYLOAD, PAYLOAD_TEXT),
+            (WRAPPER, WRAPPER_TEXT),
+            (BOTH, BOTH_TEXT),
+        ]);
+        warm.def_file(PAYLOAD, &shifted);
+        warm.def_file(BOTH, &edited_both);
+        let mut cold = gmod_workspace();
+        cold.def_files(vec![
+            (PAYLOAD, shifted.as_str()),
+            (WRAPPER, WRAPPER_TEXT),
+            (BOTH, edited_both.as_str()),
+        ]);
+
+        assert_eq!(
+            sent_writes(&cold, path_id(&cold, BOTH)),
+            vec![writes("Both", &["string", "bool"])]
+        );
+        assert_eq!(warm.settled_digest(), cold.settled_digest());
+        assert!(warm.stale_derivations().is_empty());
+    }
+
+    const LOOPS: &str = "addons/mytest/lua/autorun/server/sv_loops.lua";
+    const LOOP_CALLS: &str = "addons/mytest/lua/autorun/server/sv_loop_calls.lua";
+    const LOOPS_TEXT: &str = "function WriteLoopA(n)
+    net.WriteString(\"a\")
+    if n > 0 then
+        WriteLoopB(n - 1)
+    end
+end
+
+function WriteLoopB(n)
+    net.WriteBool(true)
+    WriteLoopA(n)
+end
+
+function FinishLoopA(ply)
+    if ply then
+        net.Send(ply)
+    end
+    FinishLoopB(ply)
+end
+
+function FinishLoopB(ply)
+    FinishLoopA(ply)
+end
+";
+    const LOOP_CALLS_TEXT: &str = "net.Start(\"LoopA\")
+WriteLoopA(3)
+FinishLoopA(ply)
+
+net.Start(\"LoopB\")
+WriteLoopB(2)
+FinishLoopB(ply)
+";
+
+    /// Helpers that call each other settle after an edit of one of them and
+    /// its revert as a cold build of each text does.
+    #[test]
+    fn mutually_recursive_helpers_settle_after_an_edit_and_its_revert_as_cold() {
+        let wider = LOOPS_TEXT.replace(
+            "net.WriteBool(true)\n",
+            "net.WriteBool(true)\n    net.WriteString(\"b\")\n",
+        );
+
+        let mut warm = gmod_workspace();
+        warm.def_files(vec![(LOOPS, LOOPS_TEXT), (LOOP_CALLS, LOOP_CALLS_TEXT)]);
+        assert_eq!(
+            sent_writes(&warm, path_id(&warm, LOOP_CALLS)),
+            vec![
+                writes("LoopA", &["string", "bool"]),
+                writes("LoopB", &["bool", "string"]),
+            ]
+        );
+        warm.def_file(LOOPS, &wider);
+        let mut cold_wider = gmod_workspace();
+        cold_wider.def_files(vec![(LOOPS, wider.as_str()), (LOOP_CALLS, LOOP_CALLS_TEXT)]);
+        assert_eq!(warm.settled_digest(), cold_wider.settled_digest());
+        assert!(warm.stale_derivations().is_empty());
+
+        warm.def_file(LOOPS, LOOPS_TEXT);
+        let mut cold = gmod_workspace();
+        cold.def_files(vec![(LOOPS, LOOPS_TEXT), (LOOP_CALLS, LOOP_CALLS_TEXT)]);
+        assert_eq!(warm.settled_digest(), cold.settled_digest());
+        assert!(warm.stale_derivations().is_empty());
     }
 }

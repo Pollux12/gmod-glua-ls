@@ -158,6 +158,9 @@ pub(crate) struct Recipes {
     /// Each file's function lookup and local bindings for its net derivations,
     /// read off its syntax when the first of them is evaluated.
     net_syntax: std::sync::Mutex<FxHashMap<FileId, std::sync::Arc<gmod::FileNetSyntax>>>,
+    /// Each file's net helper compositions, taken out for one evaluation of a
+    /// call's flows and returned for the next.
+    net_compositions: std::sync::Mutex<FxHashMap<FileId, gmod::NetCompositions>>,
 }
 
 struct ComputedDynamicFields {
@@ -183,6 +186,7 @@ impl Recipes {
             unsettled: std::sync::Mutex::default(),
             write_sites: std::sync::Mutex::default(),
             net_syntax: std::sync::Mutex::default(),
+            net_compositions: std::sync::Mutex::default(),
         }
     }
 }
@@ -441,7 +445,17 @@ impl super::engine::Recipe for Recipes {
             }
             DerivationKind::NetFlows => {
                 let syntax = self.net_syntax(db, id.file_id);
-                gmod::evaluate_net_flows(db, id, &syntax);
+                let mut compositions = self
+                    .net_compositions
+                    .lock()
+                    .expect("net compositions")
+                    .remove(&id.file_id)
+                    .unwrap_or_default();
+                gmod::evaluate_net_flows(db, id, &syntax, &mut compositions);
+                self.net_compositions
+                    .lock()
+                    .expect("net compositions")
+                    .insert(id.file_id, compositions);
             }
             DerivationKind::GmodCallRoles => gmod::evaluate_call_roles(db),
             DerivationKind::NetHelperNames => gmod::evaluate_net_helper_names(db),

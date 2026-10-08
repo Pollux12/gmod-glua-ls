@@ -61,7 +61,7 @@ pub(crate) use derive::{
     evaluate_vgui_chains, evaluate_vgui_relations,
 };
 pub(crate) use network::{
-    FileNetSyntax, evaluate_net_call, evaluate_net_flows, evaluate_net_helper,
+    FileNetSyntax, NetCompositions, evaluate_net_call, evaluate_net_flows, evaluate_net_helper,
 };
 
 /// Cheap pre-analysis flags used to skip unrelated GMod collectors.

@@ -15,7 +15,8 @@ mod test {
         "print(1)\nprint(2)\nprint(3)\n\n---@class Child : Base\nprint(4)\n";
     const DERIVED_AFTER: &str =
         "---@class Child : Base\nprint(4)\n\nprint(1)\nprint(2)\nprint(3)\n";
-    const DERIVED_IN_BRANCH: &str = "if SERVER then\n    ---@class Child : Base\n    local child = {}\nend\n";
+    const DERIVED_IN_BRANCH: &str =
+        "if SERVER then\n    ---@class Child : Base\n    local child = {}\nend\n";
     const READER: &str = "---@param child Child
 local function read(child)
     local value = child.speed
