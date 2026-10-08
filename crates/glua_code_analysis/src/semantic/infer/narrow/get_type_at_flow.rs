@@ -128,7 +128,7 @@ pub fn get_type_at_flow_with_origin(
             return Ok(narrow_type);
         }
         Some(CacheEntry::Error(reason)) => {
-            return Err(reason.clone());
+            return Err(InferFailReason::clone(reason));
         }
         _ => {}
     }
@@ -191,7 +191,7 @@ pub fn get_type_at_flow_with_origin(
             };
 
             if should_cache {
-                let entry = CacheEntry::Error(reason.clone());
+                let entry = CacheEntry::error(reason.clone());
                 cache.set_flow_cache_batch_with_origin_by_key(
                     &cache_key,
                     &visited_flow_ids,
@@ -458,7 +458,7 @@ fn get_type_at_flow_walk(
                 Some(CacheEntry::Cache(cached_type)) => {
                     return Ok(cached_type.as_ref().clone());
                 }
-                Some(CacheEntry::Error(reason)) => return Err(reason.clone()),
+                Some(CacheEntry::Error(reason)) => return Err(InferFailReason::clone(reason)),
                 _ => {}
             }
         }

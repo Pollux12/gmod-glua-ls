@@ -132,8 +132,15 @@ pub enum CacheEntry<T> {
     Ready,
     Cache(T),
     /// Cached error result — used during diagnostics to prevent recomputation
-    /// of expressions whose type couldn't be resolved.
-    Error(InferFailReason),
+    /// of expressions whose type couldn't be resolved. Shared, so an entry
+    /// stays two words and the copies a flow walk stores share one reason.
+    Error(Arc<InferFailReason>),
+}
+
+impl<T> CacheEntry<T> {
+    pub fn error(reason: InferFailReason) -> Self {
+        Self::Error(Arc::new(reason))
+    }
 }
 
 /// A `self` seed replaced by [`LuaInferCache::seed_self`], and where its
@@ -1532,7 +1539,7 @@ mod tests {
             FlowId(1),
             query_realm,
             FlowOrigin::Real,
-            CacheEntry::Error(InferFailReason::None),
+            CacheEntry::error(InferFailReason::None),
             None,
         );
         assert!(matches!(
@@ -1542,7 +1549,7 @@ mod tests {
                 query_realm,
                 FlowOrigin::Real
             ),
-            Some(CacheEntry::Error(InferFailReason::None))
+            Some(CacheEntry::Error(reason)) if **reason == InferFailReason::None
         ));
 
         cache.set_flow_cache_batch_with_origin_by_key(
@@ -1551,7 +1558,7 @@ mod tests {
             FlowId(2),
             query_realm,
             FlowOrigin::Real,
-            CacheEntry::Error(InferFailReason::FieldNotFound),
+            CacheEntry::error(InferFailReason::FieldNotFound),
             None,
         );
         for flow_id in [FlowId(2), FlowId(3)] {
@@ -1562,8 +1569,18 @@ mod tests {
                     query_realm,
                     FlowOrigin::Real
                 ),
-                Some(CacheEntry::Error(InferFailReason::FieldNotFound))
+                Some(CacheEntry::Error(reason)) if **reason == InferFailReason::FieldNotFound
             ));
         }
+    }
+
+    /// A flow entry is two words whichever answer it holds, so a flow walk's
+    /// entries stay small.
+    #[test]
+    fn flow_cache_entries_stay_two_words() {
+        assert_eq!(
+            std::mem::size_of::<CacheEntry<Arc<LuaType>>>(),
+            2 * std::mem::size_of::<usize>()
+        );
     }
 }

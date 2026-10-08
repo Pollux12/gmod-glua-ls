@@ -93,7 +93,7 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
                 // has a type), invalidate the entry and re-infer. This handles
                 // cases where generic type resolution makes progress within
                 // the same Lua pass.
-                if let InferFailReason::UnResolveDeclType(decl_id) = reason {
+                if let InferFailReason::UnResolveDeclType(decl_id) = &**reason {
                     let decl_id = *decl_id;
                     if db
                         .get_type_index()
@@ -106,7 +106,7 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
                         return Err(InferFailReason::UnResolveDeclType(decl_id));
                     }
                 } else {
-                    return Err(reason.clone());
+                    return Err(InferFailReason::clone(reason));
                 }
             }
             CacheEntry::Ready => return Err(InferFailReason::RecursiveInfer),
@@ -208,7 +208,7 @@ fn infer_expr_miss(
             } else if is_diagnostics {
                 (
                     Err(InferFailReason::FieldNotFound),
-                    Some(Some(CacheEntry::Error(InferFailReason::FieldNotFound))),
+                    Some(Some(CacheEntry::error(InferFailReason::FieldNotFound))),
                 )
             } else {
                 (Err(InferFailReason::FieldNotFound), Some(None))
@@ -224,7 +224,7 @@ fn infer_expr_miss(
         }
         Err(reason) => {
             if is_diagnostics {
-                let stored = CacheEntry::Error(reason.clone());
+                let stored = CacheEntry::error(reason.clone());
                 (Err(reason), Some(Some(stored)))
             } else if matches!(reason, InferFailReason::UnResolveDeclType(_)) {
                 // Cache UnResolveDeclType as an error during analysis to prevent
@@ -233,7 +233,7 @@ fn infer_expr_miss(
                 // same Lua pass won't help. The unresolve phase calls clear()
                 // and re-infers from scratch. Other errors are still removed
                 // so same-pass re-inference can pick up newly-added members.
-                let stored = CacheEntry::Error(reason.clone());
+                let stored = CacheEntry::error(reason.clone());
                 (Err(reason), Some(Some(stored)))
             } else {
                 (Err(reason), Some(None))

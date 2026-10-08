@@ -329,7 +329,7 @@ fn run_fallback_narrow_raw(
 fn cache_entry_to_infer_result(entry: &CacheEntry<Arc<LuaType>>) -> InferResult {
     match entry {
         CacheEntry::Cache(ty) => Ok(ty.as_ref().clone()),
-        CacheEntry::Error(reason) => Err(reason.clone()),
+        CacheEntry::Error(reason) => Err(InferFailReason::clone(reason)),
         CacheEntry::Ready => Err(InferFailReason::None),
     }
 }
@@ -349,7 +349,7 @@ fn infer_result_to_cache_entry(
                 _ => true,
             };
 
-            should_cache.then(|| CacheEntry::Error(reason.clone()))
+            should_cache.then(|| CacheEntry::error(reason.clone()))
         }
     }
 }

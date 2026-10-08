@@ -601,7 +601,7 @@ pub(crate) fn try_infer_enclosing_for_range_iter_type(
         Err(reason) => {
             cache
                 .for_range_iter_var_type_cache
-                .insert(decl_id, CacheEntry::Error(reason));
+                .insert(decl_id, CacheEntry::error(reason));
             return None;
         }
     };
@@ -1956,7 +1956,7 @@ pub fn infer_param_with_cache(
     if let Some(cache_entry) = cache.param_type_cache.get(&decl_id) {
         return match cache_entry {
             CacheEntry::Cache(typ) => Ok(typ.clone()),
-            CacheEntry::Error(reason) => Err(reason.clone()),
+            CacheEntry::Error(reason) => Err(InferFailReason::clone(reason)),
             CacheEntry::Ready => Err(InferFailReason::RecursiveInfer),
         };
     }
@@ -1975,10 +1975,10 @@ pub fn infer_param_with_cache(
         Err(reason) if cache.get_config().analysis_phase.is_diagnostics() => {
             cache
                 .param_type_cache
-                .insert(decl_id, CacheEntry::Error(reason.clone()));
+                .insert(decl_id, CacheEntry::error(reason.clone()));
             cache
                 .param_type_source_cache
-                .insert(decl_id, CacheEntry::Error(reason.clone()));
+                .insert(decl_id, CacheEntry::error(reason.clone()));
         }
         Err(_) => {
             cache.param_type_cache.remove(&decl_id);

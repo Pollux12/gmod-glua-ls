@@ -160,7 +160,7 @@ fn parallel_cache_rollback_preserves_raw_call_bucket_and_old_lookup_during_compu
         syntax(1),
         None,
         LuaType::Integer,
-        CacheEntry::Error(super::super::InferFailReason::FieldNotFound),
+        CacheEntry::error(super::super::InferFailReason::FieldNotFound),
         Some(provisional),
     );
     cache.remove_call_func_cache(syntax(1), None, &LuaType::String);
@@ -560,7 +560,7 @@ fn parallel_cache_sparse_finish_restores_partial_flow_retain() {
         &mut cache,
         &flow_key(1),
         2,
-        CacheEntry::Error(super::super::InferFailReason::FieldNotFound),
+        CacheEntry::error(super::super::InferFailReason::FieldNotFound),
         old.clone(),
     );
     put_flow(

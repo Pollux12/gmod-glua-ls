@@ -110,7 +110,7 @@ fn infer_call_expr_func_miss(
         let stored = result
             .as_ref()
             .map(|it| CacheEntry::Cache(it.clone()))
-            .unwrap_or_else(|err| CacheEntry::Error(err.clone()));
+            .unwrap_or_else(|err| CacheEntry::error(err.clone()));
         return (result, Some(Some(stored)));
     }
 
