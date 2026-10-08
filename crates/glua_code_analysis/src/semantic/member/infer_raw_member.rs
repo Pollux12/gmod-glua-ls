@@ -265,15 +265,20 @@ pub(crate) fn infer_owner_raw_member_type_with_realm_cached(
         shared,
         source_min_position,
     );
-    if let Some(cached) = cache.owner_raw_member_type_cache.get(&cache_key) {
-        return cached.clone();
+    if let Some(cached) =
+        cache.tracked_get(|cache| &mut cache.owner_raw_member_type_cache, &cache_key)
+    {
+        return cached;
     }
     if let Some(position) = caller_position {
         cache_key.3 = MemberReadSite::At(position);
-        if let Some(cached) = cache.owner_raw_member_type_cache.get(&cache_key) {
-            return cached.clone();
+        if let Some(cached) =
+            cache.tracked_get(|cache| &mut cache.owner_raw_member_type_cache, &cache_key)
+        {
+            return cached;
         }
     }
+    let frame = crate::db_index::derivation::open_frame();
     let result = infer_owner_raw_member_type_with_realm_uncached(
         db,
         &cache_key.0,
@@ -285,9 +290,16 @@ pub(crate) fn infer_owner_raw_member_type_with_realm_cached(
     if !site.as_ref().is_some_and(CallerSite::position_read) {
         cache_key.3 = shared;
     }
-    cache
-        .owner_raw_member_type_cache
-        .insert(cache_key, result.clone());
+    if matches!(result, Err(InferFailReason::RecursiveInfer)) {
+        cache.close_frame(frame);
+    } else {
+        cache.tracked_insert(
+            |cache| &mut cache.owner_raw_member_type_cache,
+            cache_key,
+            result.clone(),
+            frame,
+        );
+    }
     result
 }
 

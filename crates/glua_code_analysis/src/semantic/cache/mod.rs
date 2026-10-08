@@ -283,7 +283,7 @@ pub struct LuaInferCache {
     pub in_place_ipairs_transform_cache:
         Untracked<FxHashMap<LuaDeclId, Option<(TextSize, LuaType)>>>,
     pub dynamic_field_scope_metatable_cache:
-        Untracked<FxHashMap<TextRange, FxHashMap<VarRefId, Vec<(TextRange, LuaType)>>>>,
+        TrackedMap<TextRange, Arc<FxHashMap<VarRefId, Vec<(TextRange, LuaType)>>>>,
     pub dynamic_field_resolution_cache: TrackedMap<
         (LuaType, LuaMemberKey, Option<TextSize>),
         Option<(LuaType, Option<LuaSemanticDeclId>)>,
@@ -309,17 +309,15 @@ pub struct LuaInferCache {
     /// Position sensitivity comes only from offset visibility, which the read
     /// site and cutoff in the key capture. Derived from member/type/realm index state, so it is
     /// dropped wherever expression inference results are dropped.
-    pub owner_raw_member_type_cache: Untracked<
-        FxHashMap<
-            (
-                LuaMemberOwner,
-                LuaMemberKey,
-                FileId,
-                crate::semantic::member::MemberReadSite,
-                Option<InFiled<TextSize>>,
-            ),
-            Result<LuaType, InferFailReason>,
-        >,
+    pub owner_raw_member_type_cache: TrackedMap<
+        (
+            LuaMemberOwner,
+            LuaMemberKey,
+            FileId,
+            crate::semantic::member::MemberReadSite,
+            Option<InFiled<TextSize>>,
+        ),
+        Result<LuaType, InferFailReason>,
     >,
     /// Memo for `local_class_table_member_ids`, keyed by class and member key.
     /// Each entry carries the `DbIndex::type_structure_revision` it was built
@@ -802,8 +800,8 @@ impl LuaInferCache {
         empty(&mut self.decl_cache.0);
         empty(&mut self.for_range_iter_var_type_cache.0);
         empty(&mut self.in_place_ipairs_transform_cache.0);
-        empty(&mut self.dynamic_field_scope_metatable_cache.0);
-        empty(&mut self.owner_raw_member_type_cache.0);
+        self.dynamic_field_scope_metatable_cache.clear_local();
+        self.owner_raw_member_type_cache.clear_local();
         self.dynamic_field_type_cache.clear_local();
         self.dynamic_field_definition_syntax_cache.clear_local();
         empty(&mut self.dynamic_field_resolving);

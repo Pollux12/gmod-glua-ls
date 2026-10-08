@@ -860,19 +860,27 @@ fn infer_setmetatable_target_type(
     let prefix_var_ref_id = get_var_expr_var_ref_id(db, cache, prefix_expr.clone())?;
     let scope = nearest_dynamic_field_binding_scope(prefix_expr.syntax())?;
     let scope_range = scope.text_range();
-    if !cache
-        .dynamic_field_scope_metatable_cache
-        .contains_key(&scope_range)
-    {
-        let bindings = collect_setmetatable_bindings_by_var_in_scope(db, cache, &scope);
-        cache
-            .dynamic_field_scope_metatable_cache
-            .insert(scope_range, bindings);
-    }
+    let bindings = match cache.tracked_get(
+        |cache| &mut cache.dynamic_field_scope_metatable_cache,
+        &scope_range,
+    ) {
+        Some(bindings) => bindings,
+        None => {
+            let frame = crate::db_index::derivation::open_frame();
+            let bindings = std::sync::Arc::new(collect_setmetatable_bindings_by_var_in_scope(
+                db, cache, &scope,
+            ));
+            cache.tracked_insert(
+                |cache| &mut cache.dynamic_field_scope_metatable_cache,
+                scope_range,
+                bindings.clone(),
+                frame,
+            );
+            bindings
+        }
+    };
 
-    cache
-        .dynamic_field_scope_metatable_cache
-        .get(&scope_range)?
+    bindings
         .get(&prefix_var_ref_id)?
         .iter()
         .take_while(|(range, _)| range.end() <= assignment_range.start())
