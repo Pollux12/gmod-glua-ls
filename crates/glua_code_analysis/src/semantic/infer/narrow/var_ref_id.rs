@@ -336,35 +336,9 @@ fn get_call_expr_var_ref_id(
 
     match alias_call_type.get_call_kind() {
         LuaAliasCallKind::RawGet => {
-            let args_list = call_expr.get_args_list()?;
-            let mut args_iter = args_list.get_args();
-
-            let obj_expr = args_iter.next()?;
-            let root = call_var_ref_root(get_var_expr_var_ref_id(db, cache, obj_expr.clone())?)?;
-            // Start building access_path
-            let mut access_path = String::new();
-            access_path.push_str(obj_expr.syntax().text().to_string().as_str()); // The text need not be exact here
-            access_path.push('.');
-            let key_expr = args_iter.next()?;
-            match key_expr {
-                LuaExpr::LiteralExpr(literal_expr) => match literal_expr.get_literal()? {
-                    LuaLiteralToken::String(string_token) => {
-                        access_path.push_str(string_token.get_value().as_str());
-                    }
-                    LuaLiteralToken::Number(number_token) => {
-                        access_path.push_str(number_token.get_number_value().to_string().as_str());
-                    }
-                    _ => return None,
-                },
-                LuaExpr::NameExpr(name_expr) => {
-                    access_path.push_str(name_expr.get_access_path()?.as_str());
-                }
-                LuaExpr::IndexExpr(index_expr) => {
-                    access_path.push_str(index_expr.get_access_path()?.as_str());
-                }
-                _ => return None,
-            }
-
+            let obj_expr = call_expr.get_args_list()?.get_args().next()?;
+            let root = call_var_ref_root(get_var_expr_var_ref_id(db, cache, obj_expr)?)?;
+            let access_path = raw_get_access_path(call_expr)?;
             Some(VarRefId::IndexRef(
                 root,
                 crate::db_index::intern_smol_str(&access_path),
@@ -372,6 +346,33 @@ fn get_call_expr_var_ref_id(
         }
         _ => None,
     }
+}
+
+/// The access path a `rawget(obj, key)`-style call names, read off its
+/// syntax: the object's text, which need not be exact, and the key.
+pub(crate) fn raw_get_access_path(call_expr: &LuaCallExpr) -> Option<String> {
+    let mut args = call_expr.get_args_list()?.get_args();
+    let mut access_path = args.next()?.syntax().text().to_string();
+    access_path.push('.');
+    match args.next()? {
+        LuaExpr::LiteralExpr(literal_expr) => match literal_expr.get_literal()? {
+            LuaLiteralToken::String(string_token) => {
+                access_path.push_str(string_token.get_value().as_str());
+            }
+            LuaLiteralToken::Number(number_token) => {
+                access_path.push_str(number_token.get_number_value().to_string().as_str());
+            }
+            _ => return None,
+        },
+        LuaExpr::NameExpr(name_expr) => {
+            access_path.push_str(name_expr.get_access_path()?.as_str());
+        }
+        LuaExpr::IndexExpr(index_expr) => {
+            access_path.push_str(index_expr.get_access_path()?.as_str());
+        }
+        _ => return None,
+    }
+    Some(access_path)
 }
 
 pub fn get_var_expr_var_ref_id(

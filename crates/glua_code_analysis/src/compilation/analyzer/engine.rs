@@ -2477,8 +2477,8 @@ impl Engine {
     }
 
     /// Once the focus settled, queues the waiting readers whose reads still
-    /// moved and restarts the stages for them, and marks the source layers
-    /// that still read a moved fact. Returns whether it queued any.
+    /// moved at the stage the run reached, and marks the source layers that
+    /// still read a moved fact. Returns whether it queued any.
     fn release_waiting(&mut self, db: &mut DbIndex) -> bool {
         self.focus.clear();
         self.handed_back = false;
@@ -2556,7 +2556,6 @@ impl Engine {
         if !after_loops.is_empty() {
             self.prioritise(&after_loops);
         }
-        self.enter_stage(db, AnalysisStage::Open);
         self.cursor = None;
         true
     }

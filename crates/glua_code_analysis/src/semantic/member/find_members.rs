@@ -1872,9 +1872,9 @@ mod tests {
         add_type_decl(&mut db, caller_file, type_decl_id.clone());
 
         db.get_dynamic_field_index_mut().add_field(
+            &InFiled::new(caller_file, definition_range),
             DynamicFieldOwner::Type(type_decl_id.clone()),
             field_name.into(),
-            caller_file,
             definition_range,
         );
         let table_range = InFiled::new(
@@ -1882,9 +1882,9 @@ mod tests {
             TextRange::new(TextSize::new(20), TextSize::new(21)),
         );
         db.get_dynamic_field_index_mut().add_field(
+            &InFiled::new(caller_file, definition_range),
             DynamicFieldOwner::Table(table_range.clone()),
             field_name.into(),
-            caller_file,
             definition_range,
         );
 
@@ -1953,11 +1953,12 @@ mod tests {
         );
         bind_member_type(&mut db, declared, LuaType::String);
         for (at, name) in [(10, "dynamicA"), (20, "dynamicB")] {
+            let range = TextRange::new(TextSize::new(at), TextSize::new(at + 1));
             db.get_dynamic_field_index_mut().add_field(
+                &InFiled::new(file_id, range),
                 DynamicFieldOwner::Type(type_decl_id.clone()),
                 name.into(),
-                file_id,
-                TextRange::new(TextSize::new(at), TextSize::new(at + 1)),
+                range,
             );
         }
         let prefix = LuaType::Ref(type_decl_id);

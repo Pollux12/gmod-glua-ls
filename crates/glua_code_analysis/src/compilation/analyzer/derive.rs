@@ -36,8 +36,8 @@ fn is_inert_value_field(
 }
 
 /// The derivations of one file's statements, closures, calls, call targets
-/// and table fields, in tree order; positional fields of tables that are not
-/// shaped array literals have none.
+/// and table fields, and of its dynamic-field write sites, in tree order;
+/// positional fields of tables that are not shaped array literals have none.
 pub(super) fn syntax_derivations(file_id: FileId, root: &LuaChunk) -> Vec<DerivationId> {
     let mut ids = Vec::new();
     let mut shaped_tables = FxHashMap::default();
@@ -64,6 +64,20 @@ pub(super) fn syntax_derivations(file_id: FileId, root: &LuaChunk) -> Vec<Deriva
         if matches!(node, LuaAst::LuaCallExpr(_)) {
             ids.push(DerivationId::new(
                 DerivationKind::CallTarget,
+                file_id,
+                syntax_id,
+            ));
+        }
+        if matches!(
+            kind,
+            DerivationKind::AssignStat
+                | DerivationKind::FuncStat
+                | DerivationKind::Call
+                | DerivationKind::Setmetatable
+        ) && dynamic_field::is_write_site(node.syntax())
+        {
+            ids.push(DerivationId::new(
+                DerivationKind::DynamicFieldWrite,
                 file_id,
                 syntax_id,
             ));
@@ -97,7 +111,6 @@ pub(super) fn file_derivations(
         DerivationKind::GmodPost,
         DerivationKind::VguiRelations,
         DerivationKind::AccessorFunc,
-        DerivationKind::DynamicFields,
         DerivationKind::SetmetatableFactory,
         DerivationKind::CallSiteParams,
         DerivationKind::LocalFallbacks,
@@ -127,10 +140,13 @@ pub(crate) struct Recipes {
     caches: std::sync::Mutex<FxHashMap<FileId, crate::LuaInferCache>>,
     /// Memos of applied results, committed and stored by [`Self::settle_caches`].
     unsettled: std::sync::Mutex<Vec<(FileId, crate::LuaInferCache)>>,
+    /// Each file's dynamic-field write targets, read off its syntax when its
+    /// first write site is evaluated.
+    write_sites: std::sync::Mutex<FxHashMap<FileId, std::sync::Arc<dynamic_field::FileWriteSites>>>,
 }
 
 struct ComputedDynamicFields {
-    fields: dynamic_field::FileDynamicFields,
+    fields: dynamic_field::SiteDynamicFields,
     cache: crate::LuaInferCache,
 }
 
@@ -150,6 +166,7 @@ impl Recipes {
             scopes,
             caches: std::sync::Mutex::default(),
             unsettled: std::sync::Mutex::default(),
+            write_sites: std::sync::Mutex::default(),
         }
     }
 }
@@ -167,6 +184,30 @@ impl Recipes {
             .infer_manager
             .take_file(file_id)
             .expect("file cache")
+    }
+
+    /// The file's dynamic-field write targets, read once per pass: a pass
+    /// rebuilds no source layer.
+    fn write_sites(
+        &self,
+        db: &DbIndex,
+        file_id: FileId,
+    ) -> std::sync::Arc<dynamic_field::FileWriteSites> {
+        if let Some(sites) = self.write_sites.lock().expect("write sites").get(&file_id) {
+            return sites.clone();
+        }
+        let sites = std::sync::Arc::new(
+            db.get_vfs()
+                .get_syntax_tree(&file_id)
+                .map(|tree| dynamic_field::FileWriteSites::new(&tree.get_chunk_node()))
+                .unwrap_or_default(),
+        );
+        self.write_sites
+            .lock()
+            .expect("write sites")
+            .entry(file_id)
+            .or_insert(sites)
+            .clone()
     }
 
     /// Returns the file's inference memo to the store.
@@ -240,14 +281,9 @@ impl super::engine::Recipe for Recipes {
     }
 
     fn records_on_workers(&self, kind: DerivationKind) -> bool {
-        // A file's dynamic fields infer through owners whose wildcard and
-        // finite-name state another file's dynamic fields write; a file's local
-        // fallbacks read the class bindings another file's local fallbacks
-        // settle.
-        matches!(
-            kind,
-            DerivationKind::DynamicFields | DerivationKind::LocalFallbacks
-        )
+        // A file's local fallbacks read the class bindings another file's
+        // local fallbacks settle.
+        kind == DerivationKind::LocalFallbacks
     }
 
     fn compute(&self, db: &DbIndex, id: DerivationId) -> Box<dyn std::any::Any + Send> {
@@ -268,13 +304,15 @@ impl super::engine::Recipe for Recipes {
             DerivationKind::GmodClassCallSites => Box::new(gmod::compute_annotated_call_sites(
                 db, id.file_id, false, true,
             )),
-            DerivationKind::DynamicFields => {
+            DerivationKind::DynamicFieldWrite => {
+                let sites = self.write_sites(db, id.file_id);
                 let mut cache = self.take_cache(db, id.file_id);
                 let transaction = cache.begin_transaction();
-                let fields = dynamic_field::compute_file_dynamic_fields(
+                let fields = dynamic_field::compute_site_dynamic_fields(
                     db,
                     &mut cache,
-                    dynamic_field::DynamicFieldAnalysisMode::Full,
+                    &sites,
+                    id.syntax_id(),
                 );
                 drop(transaction);
                 Box::new(ComputedDynamicFields { fields, cache })
@@ -333,11 +371,12 @@ impl super::engine::Recipe for Recipes {
                     .expect("annotated call sites");
                 gmod::apply_annotated_call_sites(db, id.file_id, sites);
             }
-            DerivationKind::DynamicFields => {
+            DerivationKind::DynamicFieldWrite => {
                 let ComputedDynamicFields { fields, cache } = *computed
                     .downcast::<ComputedDynamicFields>()
                     .expect("dynamic fields");
-                dynamic_field::apply_dynamic_fields(db, [(fields, id.file_id)]);
+                let site = InFiled::new(id.file_id, id.syntax_id().get_range());
+                dynamic_field::apply_site_dynamic_fields(db, &site, fields);
                 self.settle_later(id.file_id, cache);
             }
             DerivationKind::GmodHelperScan => {
@@ -372,7 +411,7 @@ impl super::engine::Recipe for Recipes {
     }
 
     fn discard(&self, id: DerivationId, computed: Box<dyn std::any::Any + Send>) {
-        if id.kind != DerivationKind::DynamicFields {
+        if id.kind != DerivationKind::DynamicFieldWrite {
             return;
         }
         let mut cache = computed
@@ -402,7 +441,7 @@ impl super::engine::Recipe for Recipes {
                 db.queries().recompute(db, id);
             }
             DerivationKind::LocalFallbacks
-            | DerivationKind::DynamicFields
+            | DerivationKind::DynamicFieldWrite
             | DerivationKind::GmodHelperScan
             | DerivationKind::ValidGuardScan
             | DerivationKind::GmodPre => {
@@ -531,7 +570,7 @@ impl Recipes {
             DerivationKind::Network => gmod::evaluate_network(db, context),
             DerivationKind::Source
             | DerivationKind::LocalFallbacks
-            | DerivationKind::DynamicFields
+            | DerivationKind::DynamicFieldWrite
             | DerivationKind::GmodPre
             | DerivationKind::GmodHelperScan
             | DerivationKind::NetHelpers

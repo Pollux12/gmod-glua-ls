@@ -11,6 +11,7 @@ mod closure_return_test;
 mod decl_test;
 mod dependency_test;
 mod diagnostic_disable_test;
+mod dynamic_field_site_test;
 mod engine_schedule_test;
 mod export_test;
 mod fanout_test;

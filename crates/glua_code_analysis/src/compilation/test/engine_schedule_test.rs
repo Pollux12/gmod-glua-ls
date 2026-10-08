@@ -33,9 +33,10 @@ mod test {
         assert_eq!((canonical_evaluations, reversed_evaluations), (2, 1));
     }
 
-    /// The passes that infer across a whole file.
+    /// The passes that infer across a whole file, and the dynamic-field
+    /// writes, of which the probe has one.
     const WHOLE_FILE_PASSES: [DerivationKind; 5] = [
-        DerivationKind::DynamicFields,
+        DerivationKind::DynamicFieldWrite,
         DerivationKind::CallSiteParams,
         DerivationKind::LocalFallbacks,
         DerivationKind::NetHelpers,
@@ -277,8 +278,10 @@ end
             &format!("{SETTER_HELPERS}local unrelated = 1\n"),
         );
 
+        // The edited file's two write sites run again; the caller's call
+        // does not.
         let stats = ws.analysis.compilation.last_stats();
-        assert_eq!(stats.evaluations(DerivationKind::DynamicFields), 1);
+        assert_eq!(stats.evaluations(DerivationKind::DynamicFieldWrite), 2);
         assert!(has_dynamic_field(&ws, "buoyancy"));
     }
 

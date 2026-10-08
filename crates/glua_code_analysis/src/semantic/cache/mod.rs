@@ -282,8 +282,6 @@ pub struct LuaInferCache {
     /// declaration's block each time.
     pub in_place_ipairs_transform_cache:
         Untracked<FxHashMap<LuaDeclId, Option<(TextSize, LuaType)>>>,
-    pub dynamic_field_scope_metatable_cache:
-        TrackedMap<TextRange, Arc<FxHashMap<VarRefId, Vec<(TextRange, LuaType)>>>>,
     pub dynamic_field_resolution_cache: TrackedMap<
         (LuaType, LuaMemberKey, Option<TextSize>),
         Option<(LuaType, Option<LuaSemanticDeclId>)>,
@@ -400,7 +398,6 @@ impl LuaInferCache {
             decl_cache: Default::default(),
             for_range_iter_var_type_cache: Default::default(),
             in_place_ipairs_transform_cache: Default::default(),
-            dynamic_field_scope_metatable_cache: Default::default(),
             dynamic_field_resolution_cache: Default::default(),
             exact_table_member_cache: Default::default(),
             owner_raw_member_type_cache: Default::default(),
@@ -800,7 +797,6 @@ impl LuaInferCache {
         empty(&mut self.decl_cache.0);
         empty(&mut self.for_range_iter_var_type_cache.0);
         empty(&mut self.in_place_ipairs_transform_cache.0);
-        self.dynamic_field_scope_metatable_cache.clear_local();
         self.owner_raw_member_type_cache.clear_local();
         self.dynamic_field_type_cache.clear_local();
         self.dynamic_field_definition_syntax_cache.clear_local();
@@ -906,7 +902,6 @@ impl LuaInferCache {
         self.decl_cache.clear();
         self.for_range_iter_var_type_cache.clear();
         self.in_place_ipairs_transform_cache.clear();
-        self.dynamic_field_scope_metatable_cache.clear();
         self.dynamic_field_resolution_cache.clear();
         self.exact_table_member_cache.clear();
         self.dynamic_field_type_cache.clear();

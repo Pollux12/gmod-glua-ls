@@ -316,9 +316,7 @@ impl DbIndex {
             K::CallTarget(site) => self
                 .get_call_target_index_mut()
                 .reset_target(site.file_id, site.value),
-            K::DynamicFieldFile(file_id) => {
-                self.get_dynamic_field_index_mut().remove_files(&[*file_id])
-            }
+            K::DynamicFieldSite(site) => self.get_dynamic_field_index_mut().retract_site(site),
             K::NetworkFile(file_id) => self.get_gmod_network_index_mut().remove_file(*file_id),
             K::Module(file_id) => self.get_module_index_mut().reset_export(*file_id),
             K::Metatable(table) => self.get_metatable_index_mut().reset_table(table),
@@ -528,7 +526,7 @@ impl DbIndex {
             | K::DynamicFieldWildcards(_)
             | K::DynamicFieldFinite(_)
             | K::UnattributedField(_)
-            | K::DynamicFieldFile(_) => self.dynamic_field_index.fact_fingerprint(key),
+            | K::DynamicFieldSite(_) => self.dynamic_field_index.fact_fingerprint(key),
             K::OperatorOwner(_) | K::OperatorFile(_) | K::OperatorContrib(_) => {
                 self.operator_index.fact_fingerprint(key)
             }

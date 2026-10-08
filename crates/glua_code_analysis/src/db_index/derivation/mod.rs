@@ -210,8 +210,9 @@ pub enum FactKey {
     DeclContrib(DerivationId),
     /// The member-key references one derivation added.
     ReferenceContrib(DerivationId),
-    /// The dynamic-field definitions of one file.
-    DynamicFieldFile(FileId),
+    /// What one dynamic-field write site filed: an assignment or function
+    /// statement, or a call, by its range.
+    DynamicFieldSite(InFiled<TextRange>),
     /// The direct subtypes of a type declaration.
     SubTypes(LuaTypeDeclId),
     /// The declarations of one file whose stored type names a class.
@@ -618,7 +619,7 @@ impl FactKey {
                 | K::DeclContrib(_)
                 | K::ReferenceContrib(_)
                 | K::OperatorContrib(_)
-                | K::DynamicFieldFile(_)
+                | K::DynamicFieldSite(_)
                 | K::GmodClassFile(_)
                 | K::CallSiteFile(_)
         )
@@ -662,7 +663,7 @@ impl FactKey {
                 | K::ModuleMeta(_)
                 | K::ModuleName(_)
                 | K::ModulePath(_)
-                | K::DynamicFieldFile(_)
+                | K::DynamicFieldSite(_)
                 | K::TypeCache(_)
                 | K::TypeFallbacks(_)
                 | K::DefinitionFact(_)
@@ -847,6 +848,7 @@ impl FactKey {
             | K::CallTarget(site)
             | K::Metatable(site)
             | K::TableClass(site)
+            | K::DynamicFieldSite(site)
             | K::Syntax(site) => Some(site.file_id),
             K::Signature(signature_id)
             | K::SignatureDecl(signature_id)
@@ -866,7 +868,6 @@ impl FactKey {
             | K::DeclTree(file_id)
             | K::MemberFile(file_id)
             | K::SignatureFile(file_id)
-            | K::DynamicFieldFile(file_id)
             | K::Module(file_id)
             | K::ModuleMeta(file_id)
             | K::FlowTree(file_id)
@@ -1004,8 +1005,11 @@ pub enum DerivationKind {
     VguiChains,
     /// A file's `AccessorFunc` getters and setters.
     AccessorFunc,
-    /// A file's dynamic fields.
-    DynamicFields,
+    /// The dynamic fields one write site files: an assignment or function
+    /// statement with an indexed target, or a call with two or more
+    /// arguments, which can set fields through `setmetatable` or a setter
+    /// helper.
+    DynamicFieldWrite,
     /// A file's setmetatable factory members.
     SetmetatableFactory,
     /// What the callee of one call resolves to.
@@ -1049,10 +1053,11 @@ impl DerivationKind {
         match self {
             // Locals are guessed only once unsettled reads floor.
             Self::LocalFallbacks => StageRule::FloorUnsettled.holds_from(),
-            // The passes that infer across a whole file run once the
-            // statements settled: run earlier, a file's pass runs again whole
-            // for each read that settles after it.
-            Self::DynamicFields
+            // The passes that infer across a whole file, and the per-site
+            // dynamic-field writes and call targets, run once the statements
+            // settled: run earlier, each runs again for every read that
+            // settles after it.
+            Self::DynamicFieldWrite
             | Self::CallTarget
             | Self::ReceiverAuthority
             | Self::CallbackParams
@@ -2580,7 +2585,7 @@ pub fn take_reruns() -> Vec<DerivationId> {
 /// either way holds only under a view that answers the same.
 pub fn dynamic_fields_visible() -> bool {
     consult_gates(DYNAMIC_FIELDS_GATE);
-    current().is_none_or(|id| id.kind != DerivationKind::DynamicFields)
+    current().is_none_or(|id| id.kind != DerivationKind::DynamicFieldWrite)
 }
 
 /// The derivation being evaluated on this thread, if any.
