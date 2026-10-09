@@ -1070,7 +1070,7 @@ fn get_closure_expr_comment(closure_expr: &LuaClosureExpr) -> Option<LuaComment>
     match comment.kind().into() {
         LuaSyntaxKind::Comment => {
             let comment = LuaComment::cast(comment)?;
-            Some(comment)
+            (comment.get_owner_closure().as_ref() == Some(closure_expr)).then_some(comment)
         }
         _ => None,
     }

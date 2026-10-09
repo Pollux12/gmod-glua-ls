@@ -25,4 +25,16 @@ mod tests {
         "#
         ));
     }
+
+    #[test]
+    fn test_doc_param_applies_only_to_the_owner_closure() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedDocParam,
+            r#"
+            ---@param ply Player
+            concommand.Add("x", function(ply) end, function(cmd, args) end)
+        "#
+        ));
+    }
 }

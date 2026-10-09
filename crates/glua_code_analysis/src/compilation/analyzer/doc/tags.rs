@@ -135,25 +135,7 @@ pub fn analyze_tag(analyzer: &mut DocAnalyzer, tag: LuaDocTag) -> Option<()> {
 }
 
 pub fn find_owner_closure(analyzer: &DocAnalyzer) -> Option<LuaClosureExpr> {
-    if let Some(owner) = analyzer.comment.get_owner() {
-        match owner {
-            LuaAst::LuaFuncStat(func) => {
-                if let Some(closure) = func.get_closure() {
-                    return Some(closure);
-                }
-            }
-            LuaAst::LuaLocalFuncStat(local_func) => {
-                if let Some(closure) = local_func.get_closure() {
-                    return Some(closure);
-                }
-            }
-            owner => {
-                return owner.descendants::<LuaClosureExpr>().next();
-            }
-        }
-    }
-
-    None
+    analyzer.comment.get_owner_closure()
 }
 
 pub fn find_owner_closure_or_report(
