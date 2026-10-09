@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use crate::db_index::derivation::DerivationKind;
+    use crate::db_index::derivation::{DerivationKind, FactKey};
     use crate::{Emmyrc, FileId, VirtualWorkspace};
 
     const CONFIGURATION: &str = "gamemodes/cityrp/gamemode/core/sh_configuration.lua";
@@ -1736,5 +1736,99 @@ GM = {}
             ws.analysis.compilation.last_evaluated_files(),
             vec![files[0]]
         );
+    }
+
+    const WEAPON_BASE: &str = "entities/weapons/cw_base";
+
+    fn weapon_base_workspace(
+        base_text: &str,
+        reader_text: &str,
+    ) -> (VirtualWorkspace, FileId, FileId) {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "lua/annotations/swep.lua",
+            "---@class Entity
+---@class WEAPON : Entity
+---@class Player : Entity
+---@class SWEP : WEAPON
+SWEP = {}
+---@return Player
+function LocalPlayer() end
+---@return WEAPON
+function Player:GetActiveWeapon() end
+---@return boolean
+function IsValid(obj) end
+",
+        );
+        let base = ws.def_file(&format!("{WEAPON_BASE}/sh_attachments.lua"), base_text);
+        let reader = ws.def_file(&format!("{WEAPON_BASE}/cl_hooks.lua"), reader_text);
+        (ws, base, reader)
+    }
+
+    fn files_reading_the_text_of(ws: &VirtualWorkspace, file_id: FileId) -> Vec<FileId> {
+        let graph = ws.analysis.compilation.get_db().reader_graph();
+        let mut files = graph
+            .derivations()
+            .filter(|id| id.file_id != file_id)
+            .filter(|id| {
+                graph
+                    .reads_of(*id)
+                    .any(|key| matches!(key.key(), FactKey::FileText(read) if *read == file_id))
+            })
+            .map(|id| id.file_id)
+            .collect::<Vec<_>>();
+        files.sort();
+        files.dedup();
+        files
+    }
+
+    /// A call through a method assigned from a local function inspects the
+    /// statement that declares the function, not the whole file.
+    #[test]
+    fn calling_a_method_assigned_from_a_local_function_reads_no_file_text_of_its_file() {
+        let base_text = "local proneFunction = function(self)
+	return self.Owner:IsProne()
+end
+
+function SWEP:Initialize()
+	self.isPlayerProne = proneFunction
+end
+";
+        let reader_text = "function SWEP:Think()
+	if self:isPlayerProne() then
+		return 1
+	end
+end
+";
+        let (ws, base, _) = weapon_base_workspace(base_text, reader_text);
+
+        assert_eq!(files_reading_the_text_of(&ws, base), Vec::<FileId>::new());
+    }
+
+    /// Reading a dynamic field written from a local's member inspects only
+    /// the statement that declares the local.
+    #[test]
+    fn reading_a_dynamic_field_written_from_a_local_reads_no_file_text_of_its_file() {
+        let base_text = "function SWEP:_attach(inherit)
+	local att = inherit
+	self.renderTargetFunc = att.drawRenderTarget
+end
+";
+        let reader_text = "local function Render()
+	local wep = LocalPlayer():GetActiveWeapon()
+	if IsValid(wep) and wep.CW20Weapon then
+		if wep.renderTargetFunc then
+			wep.renderTargetFunc(wep)
+		end
+	end
+end
+";
+        let (ws, base, _) = weapon_base_workspace(base_text, reader_text);
+
+        assert_eq!(files_reading_the_text_of(&ws, base), Vec::<FileId>::new());
     }
 }

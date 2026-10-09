@@ -1105,7 +1105,7 @@ fn expr_may_have_exact_receiver_signature(
                 .and_then(|decl| decl.get_value_syntax_id())
                 .and_then(|syntax_id| {
                     db.get_vfs()
-                        .get_syntax_tree(&file_id)
+                        .syntax_tree_around(&file_id, syntax_id.get_range())
                         .and_then(|tree| syntax_id.to_node_from_root(&tree.get_red_root()))
                 })
                 .and_then(LuaExpr::cast)

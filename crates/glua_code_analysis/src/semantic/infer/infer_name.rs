@@ -752,11 +752,12 @@ fn try_infer_local_initializer_type(
 fn local_initializer_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<(usize, LuaExpr)> {
     let decl = db.get_decl_index().get_decl(&decl_id)?;
     let initializer = decl.get_initializer()?;
+    let syntax_id = initializer.get_expr_syntax_id();
     let root = db
         .get_vfs()
-        .get_syntax_tree(&decl_id.file_id)?
+        .syntax_tree_around(&decl_id.file_id, syntax_id.get_range())?
         .get_red_root();
-    let node = initializer.get_expr_syntax_id().to_node_from_root(&root)?;
+    let node = syntax_id.to_node_from_root(&root)?;
     Some((initializer.get_ret_idx(), LuaExpr::cast(node)?))
 }
 
