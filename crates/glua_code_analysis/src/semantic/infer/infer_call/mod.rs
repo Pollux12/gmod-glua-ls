@@ -10,6 +10,7 @@ use super::{
 };
 use crate::AsyncState;
 use crate::compilation::analyzer::unresolve::get_wrapped_callable_target_expr;
+use crate::db_index::callee_signature_ids;
 use crate::semantic::{local_name_closure_signature_id, semantic_decl_signature_id};
 use crate::{
     CacheEntry, DbIndex, InFiled, LuaArrayType, LuaFunctionType, LuaGenericType, LuaInstanceType,
@@ -22,8 +23,8 @@ use crate::{
     InferGuardRef,
     semantic::{
         generic::{
-            TypeSubstitutor, check_vgui_panel_ref_role, get_tpl_ref_extend_type,
-            instantiate_doc_function,
+            TplContext, TypeSubstitutor, check_vgui_panel_ref_role, get_tpl_ref_extend_type,
+            instantiate_doc_function, tpl_pattern_match,
         },
         infer::narrow::get_type_at_call_expr_inline_cast,
         infer_expr_semantic_decl,
@@ -653,8 +654,14 @@ fn infer_doc_function(
             || !signature.falsy_param_nil_free_return_slots().is_empty()
             || !signature.falsy_param_return_aliases().is_empty())
     {
-        let specialized =
-            specialize_return_aliases_for_call(db, cache, signature, func, &call_expr);
+        let specialized = specialize_return_aliases_for_call(
+            db,
+            cache,
+            signature_id,
+            signature,
+            func,
+            &call_expr,
+        );
         return Ok(specialize_falsy_param_returns_for_call(
             db,
             cache,
@@ -937,6 +944,7 @@ fn infer_signature_doc_function(
         let fake_doc_function = specialize_return_aliases_for_call(
             db,
             cache,
+            signature_id,
             signature,
             fake_doc_function.as_ref(),
             &call_expr,
@@ -989,9 +997,15 @@ fn infer_signature_doc_function(
             resolved.as_ref(),
             &call_expr,
         );
-        let resolved =
-            specialize_return_aliases_for_call(db, cache, signature, resolved.as_ref(), &call_expr)
-                .unwrap_or(resolved);
+        let resolved = specialize_return_aliases_for_call(
+            db,
+            cache,
+            signature_id,
+            signature,
+            resolved.as_ref(),
+            &call_expr,
+        )
+        .unwrap_or(resolved);
         Ok(specialize_registered_convar_return_for_call(
             db,
             cache,
@@ -1040,28 +1054,106 @@ pub(crate) fn signature_call_selects_declared_overload(
     .is_ok_and(|(_, selected_idx)| selected_idx < declared_overload_count)
 }
 
+/// Returns what the callee the class name is forwarded to returns for the
+/// caller's class name, resolved as a direct call of that callee would be: its
+/// declared return instantiated, return kinds applied and refined like a
+/// direct call's.
 fn specialize_class_name_param_return_alias_for_call(
     db: &DbIndex,
     cache: &mut LuaInferCache,
+    signature_id: LuaSignatureId,
     signature: &LuaSignature,
     func_ty: &LuaFunctionType,
     call_expr: &LuaCallExpr,
 ) -> Option<Arc<LuaFunctionType>> {
-    let param_idx = signature.class_name_param_return_alias()?;
+    let alias = signature.class_name_param_return_alias()?;
     let args = call_expr
         .get_args_list()
         .map(|args| args.get_args().collect::<Vec<_>>())
         .unwrap_or_default();
-    let arg = call_arg_for_param(call_expr, func_ty, &args, param_idx)?;
-    let class_name = resolve_class_name_string_from_arg(db, cache, &arg)?;
-    let type_id = LuaTypeDeclId::global(&class_name);
-    db.get_type_index().get_type_decl(&type_id)?;
-
-    let range = InFiled {
-        file_id: cache.get_file_id(),
-        value: call_expr.get_range(),
+    let class_names = alias
+        .forwarded
+        .iter()
+        .filter_map(|(param_idx, arg_idx)| {
+            let arg = call_arg_for_param(call_expr, func_ty, &args, *param_idx)?;
+            let class_name = resolve_class_name_string_from_arg(db, cache, &arg)?;
+            Some((*arg_idx, class_name))
+        })
+        .collect::<Vec<_>>();
+    if class_names.is_empty() {
+        return None;
+    }
+    let wrapper_file = signature_id.get_file_id();
+    let wrapper_start = signature_id.get_position();
+    let root = db.get_vfs().get_syntax_tree(&wrapper_file)?.get_red_root();
+    let call_at = |range: TextRange| {
+        let range = range + wrapper_start;
+        root.token_at_offset(range.start())
+            .right_biased()?
+            .parent_ancestors()
+            .find_map(LuaCallExpr::cast)
+            .filter(|call| call.get_range() == range)
     };
-    let return_type = LuaType::Instance(LuaInstanceType::new(LuaType::Ref(type_id), range).into());
+    let create_call = call_at(alias.create_call)?;
+    let receiver_call = match alias.receiver_call {
+        Some(range) => Some(call_at(range)?),
+        None => None,
+    };
+
+    let mut foreign_cache = (wrapper_file != cache.get_file_id())
+        .then(|| LuaInferCache::new(wrapper_file, cache.get_config().clone()));
+    if let Some(receiver_call) = receiver_call {
+        let method_id = get_prefix_expr_signature_id(
+            db,
+            foreign_cache.as_mut().unwrap_or(&mut *cache),
+            &receiver_call,
+        )?;
+        if !db.get_signature_index().get(&method_id)?.returns_receiver() {
+            return None;
+        }
+    }
+    let callee = infer_expr(
+        db,
+        foreign_cache.as_mut().unwrap_or(&mut *cache),
+        create_call.get_prefix_expr()?,
+    )
+    .ok()?;
+    let (callee, class_param_type, class_name) = callee_signature_ids(&callee)
+        .into_iter()
+        .find_map(|callee_id| {
+            let callee = db.get_signature_index().get(&callee_id)?;
+            class_names.iter().find_map(|(arg_idx, class_name)| {
+                let class_param_type =
+                    callee.str_tpl_param_for_call_arg(create_call.is_colon_call(), *arg_idx)?;
+                Some((callee, class_param_type.clone(), class_name.clone()))
+            })
+        })?;
+
+    let mut substitutor = TypeSubstitutor::new();
+    let mut context = TplContext {
+        db,
+        cache: foreign_cache.as_mut().unwrap_or(&mut *cache),
+        substitutor: &mut substitutor,
+        call_expr: None,
+        source_range: create_call.get_range(),
+    };
+    tpl_pattern_match(
+        &mut context,
+        &class_param_type,
+        &LuaType::StringConst(smol_str::SmolStr::new(class_name).into()),
+    )
+    .ok()?;
+    let return_type = instantiate_type_generic(db, &callee.get_return_type(), &substitutor);
+    if return_type.contain_tpl() {
+        return None;
+    }
+    let return_type = apply_signature_return_kinds(callee, return_type);
+    let return_type = refine_known_vgui_panel_return(
+        db,
+        foreign_cache.as_mut().unwrap_or(&mut *cache),
+        return_type,
+        &create_call,
+    );
 
     Some(Arc::new(
         LuaFunctionType::new(
@@ -1098,6 +1190,7 @@ fn resolve_class_name_string_from_arg(
 fn specialize_return_aliases_for_call(
     db: &DbIndex,
     cache: &mut LuaInferCache,
+    signature_id: LuaSignatureId,
     signature: &LuaSignature,
     func_ty: &LuaFunctionType,
     call_expr: &LuaCallExpr,
@@ -1105,7 +1198,12 @@ fn specialize_return_aliases_for_call(
     specialize_direct_param_return_alias_for_call(db, cache, signature, func_ty, call_expr)
         .or_else(|| {
             specialize_class_name_param_return_alias_for_call(
-                db, cache, signature, func_ty, call_expr,
+                db,
+                cache,
+                signature_id,
+                signature,
+                func_ty,
+                call_expr,
             )
         })
         .or_else(|| restore_definition_through_return_alias(db, cache, func_ty, call_expr))

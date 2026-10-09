@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::{collections::HashMap, sync::Arc};
 
 use glua_parser::{LuaAstNode, LuaClosureExpr, LuaDocFuncType};
-use rowan::TextSize;
+use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 
 use crate::db_index::signature::async_state::AsyncState;
@@ -57,11 +57,29 @@ struct SignatureFacts {
     nil_return_guard_params: Vec<usize>,
     return_correlations: Vec<LuaReturnCorrelation>,
     direct_param_return_alias: Option<usize>,
-    /// Param index of a classname string passed to a class-name factory
-    /// (`vgui.Create` / `ents.Create` / any `` `T` `` create) whose result is returned.
-    class_name_param_return_alias: Option<usize>,
+    class_name_param_return_alias: Option<LuaClassNameReturnAlias>,
+    /// Every return is the colon receiver `self`, never reassigned.
+    returns_receiver: bool,
     falsy_param_nil_free_return_slots: Vec<LuaFalsyParamNilFreeReturnSlot>,
     falsy_param_return_aliases: Vec<LuaFalsyParamReturnAlias>,
+}
+
+/// A call whose result the function returns and which is handed some of the
+/// function's parameters unchanged. Whether one of them reaches a `` `T` ``
+/// parameter of the callee is decided at each call site, so a call passing a
+/// class name returns what the callee returns for it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LuaClassNameReturnAlias {
+    /// The call, relative to the function's start so a shift of its file
+    /// leaves the fact unchanged.
+    pub create_call: TextRange,
+    /// `(parameter, argument)` pairs: the call's argument `argument` is the
+    /// function's parameter `parameter`, never reassigned before the return.
+    pub forwarded: Vec<(usize, usize)>,
+    /// A method call on the created value that is returned in its place; it
+    /// keeps the created type only when the method returns its receiver.
+    /// Relative to the function's start like `create_call`.
+    pub receiver_call: Option<TextRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -146,6 +164,7 @@ impl Hash for LuaSignature {
         self.return_correlations().hash(state);
         self.direct_param_return_alias().hash(state);
         self.class_name_param_return_alias().hash(state);
+        self.returns_receiver().hash(state);
         self.falsy_param_nil_free_return_slots().hash(state);
         self.falsy_param_return_aliases().hash(state);
         self.return_cast.hash(state);
@@ -222,12 +241,22 @@ impl LuaSignature {
         self.facts.as_ref()?.direct_param_return_alias
     }
 
-    pub fn set_class_name_param_return_alias(&mut self, param_idx: usize) {
-        self.facts_mut().class_name_param_return_alias = Some(param_idx);
+    pub fn set_class_name_param_return_alias(&mut self, alias: LuaClassNameReturnAlias) {
+        self.facts_mut().class_name_param_return_alias = Some(alias);
     }
 
-    pub fn class_name_param_return_alias(&self) -> Option<usize> {
-        self.facts.as_ref()?.class_name_param_return_alias
+    pub fn class_name_param_return_alias(&self) -> Option<&LuaClassNameReturnAlias> {
+        self.facts.as_ref()?.class_name_param_return_alias.as_ref()
+    }
+
+    pub fn set_returns_receiver(&mut self) {
+        self.facts_mut().returns_receiver = true;
+    }
+
+    pub fn returns_receiver(&self) -> bool {
+        self.facts
+            .as_ref()
+            .is_some_and(|facts| facts.returns_receiver)
     }
 
     pub fn require_guard_param(&self) -> Option<usize> {
@@ -307,7 +336,6 @@ impl LuaSignature {
                 || param_info.get_attribute_by_name("constructor").is_some()
         }) || !self.out_params.is_empty()
             || self.direct_param_return_alias().is_some()
-            || self.class_name_param_return_alias().is_some()
             || self
                 .overloads
                 .iter()
@@ -427,6 +455,22 @@ impl LuaSignature {
         }
 
         None
+    }
+
+    /// The declared type of the parameter call argument `arg_idx` binds, when
+    /// it is a string-template generic (`` `T` ``).
+    pub fn str_tpl_param_for_call_arg(
+        &self,
+        is_colon_call: bool,
+        arg_idx: usize,
+    ) -> Option<&LuaType> {
+        let param_idx = match (self.is_colon_define, is_colon_call) {
+            (true, false) => arg_idx.checked_sub(1)?,
+            (false, true) => arg_idx + 1,
+            _ => arg_idx,
+        };
+        let type_ref = &self.get_param_info_by_id(param_idx)?.type_ref;
+        type_contains_str_tpl_ref(type_ref).then_some(type_ref)
     }
 
     /// Whether [`Self::get_return_type`] is `never`.
@@ -852,6 +896,21 @@ pub fn find_call_arg_role_from_type(
         }
     });
     best
+}
+
+/// The signatures a callee type names: its own, or each of a union's.
+pub(crate) fn callee_signature_ids(callee: &LuaType) -> Vec<LuaSignatureId> {
+    match callee {
+        LuaType::Signature(id) => vec![*id],
+        LuaType::Union(union) => union
+            .types()
+            .filter_map(|typ| match typ {
+                LuaType::Signature(id) => Some(*id),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn type_contains_str_tpl_ref(typ: &LuaType) -> bool {

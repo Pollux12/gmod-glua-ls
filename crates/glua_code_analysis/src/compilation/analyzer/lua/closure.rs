@@ -17,7 +17,10 @@ use crate::{
         UnResolveCallClosureParams, UnResolveClosureReturn, UnResolveParentAst,
         UnResolveParentClosureParams, UnResolveReturn,
     },
-    db_index::{LuaDocReturnInfo, LuaMemberOwner, LuaReturnCorrelation, LuaSignatureId},
+    db_index::{
+        LuaClassNameReturnAlias, LuaDocReturnInfo, LuaMemberOwner, LuaReturnCorrelation,
+        LuaSignatureId,
+    },
     infer_expr,
 };
 
@@ -57,6 +60,7 @@ pub fn analyze_closure(analyzer: &mut LuaAnalyzer, closure: LuaClosureExpr) -> O
     analyze_falsy_param_nil_free_return_slots(analyzer, &signature_id, &closure);
     analyze_direct_param_return_alias(analyzer, &signature_id, &closure);
     analyze_class_name_param_return_alias(analyzer, &signature_id, &closure);
+    analyze_returns_receiver(analyzer, &signature_id, &closure);
     analyze_return(analyzer, &signature_id, &closure);
     Some(())
 }
@@ -184,47 +188,136 @@ fn analyze_class_name_param_return_alias(
         return Some(());
     };
 
-    let create = find_class_name_create_for_return(analyzer, &block, return_expr)?;
-    let class_param_name = expr_name_text(&create.class_arg)?;
-    let param_idx = params.iter().position(|p| p == &class_param_name)?;
+    let create = find_class_name_create_for_return(&params, &block, return_expr)?;
+    let forwarded = create
+        .forwarded
+        .into_iter()
+        .filter(|(param_idx, _)| {
+            !classname_param_is_tainted(&block, &return_stat, &params[*param_idx])
+        })
+        .collect::<Vec<_>>();
+    if forwarded.is_empty() {
+        return Some(());
+    }
 
-    if classname_param_is_tainted(&block, &return_stat, &class_param_name) {
+    let closure_start = closure.get_range().start();
+    analyzer.write(StatementWrite::Signature {
+        signature_id: *signature_id,
+        change: SignatureChange::ClassNameParamReturnAlias(LuaClassNameReturnAlias {
+            create_call: create.call_range - closure_start,
+            forwarded,
+            receiver_call: create.receiver_call.map(|range| range - closure_start),
+        }),
+    });
+    Some(())
+}
+
+/// Records that a colon method returns its receiver: its every return is a
+/// lone `self`, the body ends in one, and nothing in it rebinds `self`.
+fn analyze_returns_receiver(
+    analyzer: &mut LuaAnalyzer,
+    signature_id: &LuaSignatureId,
+    closure: &LuaClosureExpr,
+) -> Option<()> {
+    let signature = analyzer.db.get_signature_index().get(signature_id)?;
+    if !signature.is_colon_define
+        || !signature.overloads.is_empty()
+        || (signature.resolve_return == SignatureReturnStatus::DocResolve
+            && !signature.return_docs.is_empty())
+    {
+        return Some(());
+    }
+
+    let block = closure.get_block()?;
+    if !matches!(block.get_stats().last(), Some(LuaStat::ReturnStat(_))) {
+        return Some(());
+    }
+    let returns_self = |return_stat: &LuaReturnStat| {
+        let exprs = return_stat.get_expr_list().collect::<Vec<_>>();
+        matches!(exprs.as_slice(), [expr] if expr_name_text(expr).as_deref() == Some("self"))
+    };
+    if !closure_own_return_stats(analyzer, closure, &block)
+        .iter()
+        .all(returns_self)
+    {
+        return Some(());
+    }
+    let rebinds_self = block.descendants::<LuaAssignStat>().any(|assign| {
+        assign
+            .get_var_and_expr_list()
+            .0
+            .iter()
+            .any(|var| var_source_text(var) == "self")
+    }) || block.descendants::<LuaLocalStat>().any(|local_stat| {
+        local_stat
+            .get_local_name_list()
+            .filter_map(|local| local.get_name_token())
+            .any(|token| token.get_name_text() == "self")
+    });
+    if rebinds_self {
         return Some(());
     }
 
     analyzer.write(StatementWrite::Signature {
         signature_id: *signature_id,
-        change: SignatureChange::ClassNameParamReturnAlias(param_idx),
+        change: SignatureChange::ReturnsReceiver,
     });
     Some(())
 }
 
 struct ClassNameCreateCall {
-    class_arg: LuaExpr,
+    call_range: TextRange,
+    forwarded: Vec<(usize, usize)>,
+    receiver_call: Option<TextRange>,
 }
 
 fn find_class_name_create_for_return(
-    analyzer: &mut LuaAnalyzer,
+    params: &[String],
     block: &LuaBlock,
     return_expr: &LuaExpr,
 ) -> Option<ClassNameCreateCall> {
     match return_expr {
-        LuaExpr::CallExpr(call) => class_name_create_call_info(analyzer, call),
+        LuaExpr::CallExpr(call) => class_name_create_call_info(params, call)
+            .or_else(|| receiver_method_create_call(params, block, call)),
         LuaExpr::NameExpr(name_expr) => {
             let local_name = name_expr.get_name_text()?;
-            find_local_init_create(analyzer, block, &local_name)
+            find_local_init_create(params, block, &local_name)
         }
-        LuaExpr::IndexExpr(index_expr) => resolve_index_to_create_call(analyzer, block, index_expr),
+        LuaExpr::IndexExpr(index_expr) => resolve_index_to_create_call(params, block, index_expr),
         LuaExpr::ParenExpr(paren) => {
             let inner = paren.get_expr()?;
-            find_class_name_create_for_return(analyzer, block, &inner)
+            find_class_name_create_for_return(params, block, &inner)
         }
         _ => None,
     }
 }
 
+/// `local pnl = create(c); return pnl:Method()`: the create, kept only at a
+/// call site where `Method` returns its receiver.
+fn receiver_method_create_call(
+    params: &[String],
+    block: &LuaBlock,
+    call: &LuaCallExpr,
+) -> Option<ClassNameCreateCall> {
+    if !call.is_colon_call() {
+        return None;
+    }
+    let LuaExpr::IndexExpr(method) = call.get_prefix_expr()? else {
+        return None;
+    };
+    let LuaExpr::NameExpr(receiver) = method.get_prefix_expr()? else {
+        return None;
+    };
+    let local_name = receiver.get_name_text()?;
+    let create = find_local_init_create(params, block, &local_name)?;
+    Some(ClassNameCreateCall {
+        receiver_call: Some(call.get_range()),
+        ..create
+    })
+}
+
 fn find_local_init_create(
-    analyzer: &mut LuaAnalyzer,
+    params: &[String],
     block: &LuaBlock,
     local_name: &str,
 ) -> Option<ClassNameCreateCall> {
@@ -246,7 +339,7 @@ fn find_local_init_create(
                 continue;
             };
             if let LuaExpr::CallExpr(call) = value
-                && let Some(info) = class_name_create_call_info(analyzer, call)
+                && let Some(info) = class_name_create_call_info(params, call)
             {
                 if found.is_some() {
                     return None;
@@ -261,7 +354,7 @@ fn find_local_init_create(
 }
 
 fn resolve_index_to_create_call(
-    analyzer: &mut LuaAnalyzer,
+    params: &[String],
     block: &LuaBlock,
     index_expr: &LuaIndexExpr,
 ) -> Option<ClassNameCreateCall> {
@@ -292,7 +385,7 @@ fn resolve_index_to_create_call(
                 continue;
             };
             if let LuaExpr::CallExpr(call) = value
-                && let Some(info) = class_name_create_call_info(analyzer, call)
+                && let Some(info) = class_name_create_call_info(params, call)
             {
                 if found.is_some() {
                     return None;
@@ -314,30 +407,25 @@ fn index_key_name(index_expr: &LuaIndexExpr) -> Option<String> {
     }
 }
 
+/// A call handed some of `params` unchanged.
 fn class_name_create_call_info(
-    _analyzer: &mut LuaAnalyzer,
+    params: &[String],
     call: &LuaCallExpr,
 ) -> Option<ClassNameCreateCall> {
-    let prefix = call.get_prefix_expr()?;
-    let LuaExpr::IndexExpr(index) = prefix else {
-        return None;
-    };
-    let method = index_key_name(&index)?;
-    if method != "Create" {
-        return None;
-    }
-    let owner = index.get_prefix_expr().and_then(|p| expr_name_text(&p))?;
-    if owner != "vgui" && owner != "ents" {
-        return None;
-    }
-
-    let args = call
-        .get_args_list()
-        .map(|a| a.get_args().collect::<Vec<_>>())
-        .unwrap_or_default();
-    let class_arg = args.first()?.clone();
-    let _ = expr_name_text(&class_arg)?;
-    Some(ClassNameCreateCall { class_arg })
+    let forwarded = call
+        .get_args_list()?
+        .get_args()
+        .enumerate()
+        .filter_map(|(arg_idx, arg)| {
+            let name = expr_name_text(&arg)?;
+            Some((params.iter().position(|param| *param == name)?, arg_idx))
+        })
+        .collect::<Vec<_>>();
+    (!forwarded.is_empty()).then(|| ClassNameCreateCall {
+        call_range: call.get_range(),
+        forwarded,
+        receiver_call: None,
+    })
 }
 
 fn classname_param_is_tainted(

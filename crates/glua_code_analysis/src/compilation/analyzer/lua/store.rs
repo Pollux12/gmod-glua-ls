@@ -7,10 +7,10 @@ use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 
 use crate::{
-    DbIndex, FileId, GlobalId, InFiled, LuaDeclId, LuaDocReturnInfo, LuaInferenceNodeId, LuaMember,
-    LuaMemberFeature, LuaMemberId, LuaMemberOwner, LuaOperator, LuaReturnCorrelation,
-    LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeFact, LuaTypeOwner,
-    SignatureReturnStatus,
+    DbIndex, FileId, GlobalId, InFiled, LuaClassNameReturnAlias, LuaDeclId, LuaDocReturnInfo,
+    LuaInferenceNodeId, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberOwner, LuaOperator,
+    LuaReturnCorrelation, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeFact,
+    LuaTypeOwner, SignatureReturnStatus,
     compilation::analyzer::{
         common::{
             DeclWrite, TypeCacheWriteMode, add_member, bind_decl_write, bind_type, write_type_cache,
@@ -122,7 +122,8 @@ pub(in crate::compilation::analyzer) enum SignatureChange {
     DirectParamReturnAlias(usize),
     /// Applies unless the signature already returns a parameter directly or
     /// by class name, or has overloads.
-    ClassNameParamReturnAlias(usize),
+    ClassNameParamReturnAlias(LuaClassNameReturnAlias),
+    ReturnsReceiver,
     FalsyParamReturnAlias {
         falsy_param_idx: usize,
         aliased_param_idx: usize,
@@ -149,14 +150,15 @@ impl SignatureChange {
             SignatureChange::DirectParamReturnAlias(param_idx) => {
                 signature.set_direct_param_return_alias(*param_idx);
             }
-            SignatureChange::ClassNameParamReturnAlias(param_idx) => {
+            SignatureChange::ClassNameParamReturnAlias(alias) => {
                 if signature.direct_param_return_alias().is_none()
                     && signature.class_name_param_return_alias().is_none()
                     && signature.overloads.is_empty()
                 {
-                    signature.set_class_name_param_return_alias(*param_idx);
+                    signature.set_class_name_param_return_alias(alias.clone());
                 }
             }
+            SignatureChange::ReturnsReceiver => signature.set_returns_receiver(),
             SignatureChange::FalsyParamReturnAlias {
                 falsy_param_idx,
                 aliased_param_idx,

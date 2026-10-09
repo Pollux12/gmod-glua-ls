@@ -6,6 +6,7 @@ mod assign_widening_scaling_test;
 mod attribute_test;
 mod call_target_test;
 mod class_declaration_move_test;
+mod class_name_return_alias_test;
 mod closure_generic;
 mod closure_param_infer_test;
 mod closure_return_test;
