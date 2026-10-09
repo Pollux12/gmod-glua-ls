@@ -4841,7 +4841,7 @@ fn scopeguard_lent_keys() -> OnDrop {
 
 /// How often one derivation may run on the index within one stage before
 /// [`Engine::admit_run`] takes it that the facts it reads do not settle.
-const MAX_INDEX_RUNS: u16 = 32;
+const MAX_INDEX_RUNS: u16 = 16;
 
 /// The queued entries one worker superstep takes at most, short of a file's:
 /// its tasks' forks and recordings live until it installs them, so this
@@ -4850,7 +4850,7 @@ const SUPERSTEP_ENTRIES: usize = 32_768;
 
 /// How often a worker superstep runs one derivation within a stage before the
 /// stage settles on the serial loop.
-const SUPERSTEP_RUN_LIMIT: u16 = 64;
+const SUPERSTEP_RUN_LIMIT: u16 = 16;
 
 /// The fewest keys one worker job checks the readers of: an evaluation's
 /// handful runs on its own thread rather than waking the pool.
