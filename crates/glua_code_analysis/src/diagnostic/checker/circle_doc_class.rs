@@ -38,19 +38,19 @@ fn check_doc_tag_class(
 
     let type_index = context.db.get_type_index();
 
-    let class_decl =
-        type_index.find_type_decl(context.file_id, tag.get_name_token()?.get_name_text())?;
+    let class_decl = type_index
+        .find_type_decl_by_site(context.file_id, tag.get_name_token()?.syntax().text_range())?;
 
     if !class_decl.is_class() {
         return Some(());
     }
 
-    let name = class_decl.get_full_name();
+    let class_id = class_decl.get_id();
 
     let mut queue = Vec::new();
     let mut visited = FxHashSet::default();
 
-    queue.push(class_decl.get_id());
+    queue.push(class_id.clone());
     while let Some(current_id) = queue.pop() {
         if context.is_cancelled() {
             return Some(());
@@ -66,7 +66,7 @@ fn check_doc_tag_class(
                     return Some(());
                 }
                 if let LuaType::Ref(super_type_id) = &super_type {
-                    if super_type_id.get_name() == name {
+                    if *super_type_id == class_id {
                         context.add_diagnostic(
                             DiagnosticCode::CircleDocClass,
                             get_lint_range(tag).unwrap_or(tag.get_range()),
