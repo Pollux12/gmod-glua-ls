@@ -858,17 +858,14 @@ fn callback_args(db: &DbIndex, callee_signature_id: LuaSignatureId) -> Vec<Callb
     let Some(callee_signature) = db.get_signature_index().get_declared(&callee_signature_id) else {
         return args;
     };
-    let Some(callee_params) = exact_signature_closure(db, callee_signature_id)
-        .and_then(|closure| closure.get_params_list())
-    else {
+    let Some(callee_closure) = exact_signature_closure(db, callee_signature_id) else {
+        return args;
+    };
+    let Some(callee_params) = callee_closure.get_params_list() else {
         return args;
     };
     let source_file_id = callee_signature_id.get_file_id();
-    let Some(source_root) = db
-        .get_vfs()
-        .get_syntax_tree(&source_file_id)
-        .map(|tree| tree.get_red_root())
-    else {
+    let Some(source_root) = callee_closure.syntax().ancestors().last() else {
         return args;
     };
     let Some(source_refs) = db
@@ -1569,14 +1566,10 @@ fn member_has_narrower_enclosing_realm(db: &DbIndex, member_id: LuaMemberId) -> 
     if member_mask.is_empty() {
         return false;
     }
-    let Some(root) = db
+    let Some(node) = db
         .get_vfs()
-        .get_syntax_tree(&member_id.file_id)
-        .map(|tree| tree.get_red_root())
+        .syntax_node_around(&member_id.file_id, *member_id.get_syntax_id())
     else {
-        return false;
-    };
-    let Some(node) = member_id.get_syntax_id().to_node_from_root(&root) else {
         return false;
     };
 
@@ -2070,11 +2063,7 @@ fn infer_supported_call_site_arg_type(
                 .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
                 .filter(|decl| matches!(decl.extra, LuaDeclExtra::Local { .. }))
                 .and_then(|decl| decl.get_value_syntax_id())
-                .and_then(|syntax_id| {
-                    db.get_vfs()
-                        .get_syntax_tree(&file_id)
-                        .and_then(|tree| syntax_id.to_node_from_root(&tree.get_red_root()))
-                })
+                .and_then(|syntax_id| db.get_vfs().syntax_node_around(&file_id, syntax_id))
                 .and_then(LuaExpr::cast)
                 .filter(|value_expr| match value_expr {
                     LuaExpr::LiteralExpr(_) | LuaExpr::TableExpr(_) => true,
@@ -2120,16 +2109,9 @@ fn is_supported_call_site_arg_shape(db: &DbIndex, file_id: FileId, arg: &LuaExpr
             if !matches!(decl.extra, LuaDeclExtra::Local { .. }) {
                 return false;
             }
-            let Some(root) = db
-                .get_vfs()
-                .get_syntax_tree(&file_id)
-                .map(|tree| tree.get_red_root())
-            else {
-                return false;
-            };
             let Some(value_expr) = decl
                 .get_value_syntax_id()
-                .and_then(|syntax_id| syntax_id.to_node_from_root(&root))
+                .and_then(|syntax_id| db.get_vfs().syntax_node_around(&file_id, syntax_id))
                 .and_then(LuaExpr::cast)
             else {
                 return false;

@@ -1540,7 +1540,10 @@ fn numeric_for_write_covers_integer_access(
         return false;
     };
 
-    let Some(root) = db.get_vfs().get_syntax_tree(&member.get_file_id()) else {
+    let Some(root) = db
+        .get_vfs()
+        .syntax_tree_around(&member.get_file_id(), member.get_syntax_id().get_range())
+    else {
         return false;
     };
     let root = root.get_red_root();

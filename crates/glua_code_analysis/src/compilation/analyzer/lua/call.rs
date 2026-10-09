@@ -508,10 +508,11 @@ fn decl_value_matches_direct_special_call_inner(
     let Some(value_syntax_id) = decl.get_value_syntax_id() else {
         return false;
     };
-    let Some(root) = analyzer.db.get_vfs().get_syntax_tree(&decl.get_file_id()) else {
-        return false;
-    };
-    let Some(node) = value_syntax_id.to_node_from_root(&root.get_red_root()) else {
+    let Some(node) = analyzer
+        .db
+        .get_vfs()
+        .syntax_node_around(&decl.get_file_id(), value_syntax_id)
+    else {
         return false;
     };
 
@@ -734,10 +735,11 @@ fn decl_value_matches_direct_special_call_member_chain(
     let Some(value_syntax_id) = decl.get_value_syntax_id() else {
         return false;
     };
-    let Some(root) = analyzer.db.get_vfs().get_syntax_tree(&decl.get_file_id()) else {
-        return false;
-    };
-    let Some(node) = value_syntax_id.to_node_from_root(&root.get_red_root()) else {
+    let Some(node) = analyzer
+        .db
+        .get_vfs()
+        .syntax_node_around(&decl.get_file_id(), value_syntax_id)
+    else {
         return false;
     };
 

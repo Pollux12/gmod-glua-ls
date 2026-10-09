@@ -1377,11 +1377,10 @@ fn local_initializer_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<LuaExpr> {
     if initializer.get_ret_idx() != 0 {
         return None;
     }
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&decl_id.file_id)?
-        .get_red_root();
-    LuaExpr::cast(initializer.get_expr_syntax_id().to_node_from_root(&root)?)
+    LuaExpr::cast(
+        db.get_vfs()
+            .syntax_node_around(&decl_id.file_id, initializer.get_expr_syntax_id())?,
+    )
 }
 
 fn concatenate_finite_strings(left: &[SmolStr], right: &[SmolStr]) -> Vec<SmolStr> {

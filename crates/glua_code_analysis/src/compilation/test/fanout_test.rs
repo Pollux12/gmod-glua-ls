@@ -1831,4 +1831,54 @@ end
 
         assert_eq!(files_reading_the_text_of(&ws, base), Vec::<FileId>::new());
     }
+
+    /// Calling a function through a global another file aliases from a local
+    /// inspects the statement that declares the local, not the whole file.
+    #[test]
+    fn calling_a_function_another_file_aliases_from_a_local_reads_no_file_text_of_its_file() {
+        let base_text = "local function helper(a) return a end
+local alias = helper
+GlobalAlias = alias
+";
+        let reader_text = "function SWEP:Think()
+	return GlobalAlias(1)
+end
+";
+        let (ws, base, _) = weapon_base_workspace(base_text, reader_text);
+
+        assert_eq!(files_reading_the_text_of(&ws, base), Vec::<FileId>::new());
+    }
+
+    /// Calling a special-call function through a global another file aliases
+    /// from a local reads only the statement that declares the local.
+    #[test]
+    fn calling_a_special_call_another_file_aliases_from_a_local_reads_no_file_text_of_its_file() {
+        let base_text = "local find = ents.FindByClass
+FindEntities = find
+";
+        let reader_text = "function SWEP:Think()
+	FindEntities(\"prop_physics\")
+end
+";
+        let (ws, base, _) = weapon_base_workspace(base_text, reader_text);
+
+        assert_eq!(files_reading_the_text_of(&ws, base), Vec::<FileId>::new());
+    }
+
+    /// Reading an enum another file exposes through a global inspects the
+    /// statement that declares the enum local, not the whole file.
+    #[test]
+    fn reading_an_enum_another_file_exposes_from_a_local_reads_no_file_text_of_its_file() {
+        let base_text = "---@enum Mode
+local Mode = { Fast = 1 }
+GlobalMode = Mode
+";
+        let reader_text = "function SWEP:Think()
+	return GlobalMode.Fast
+end
+";
+        let (ws, base, _) = weapon_base_workspace(base_text, reader_text);
+
+        assert_eq!(files_reading_the_text_of(&ws, base), Vec::<FileId>::new());
+    }
 }

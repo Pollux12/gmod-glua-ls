@@ -222,12 +222,10 @@ fn resolve_direct_local_table_prefix_member_owner(
     if initializer.get_ret_idx() != 0 {
         return None;
     }
-    let root = analyzer
+    let node = analyzer
         .db
         .get_vfs()
-        .get_syntax_tree(&decl_id.file_id)?
-        .get_red_root();
-    let node = initializer.get_expr_syntax_id().to_node_from_root(&root)?;
+        .syntax_node_around(&decl_id.file_id, initializer.get_expr_syntax_id())?;
     let table_expr = LuaTableExpr::cast(node)?;
     Some(LuaMemberOwner::Element(InFiled::new(
         decl_id.file_id,
@@ -520,11 +518,10 @@ fn alias_target_global_path_depth(
             match decl {
                 Some(decl) if decl.is_local() => {
                     let initializer = decl.get_initializer()?.get_expr_syntax_id();
-                    let root = db
-                        .get_vfs()
-                        .get_syntax_tree(&decl.get_file_id())?
-                        .get_red_root();
-                    let initializer = LuaExpr::cast(initializer.to_node_from_root(&root)?)?;
+                    let initializer = LuaExpr::cast(
+                        db.get_vfs()
+                            .syntax_node_around(&decl.get_file_id(), initializer)?,
+                    )?;
                     alias_target_global_path_depth(db, decl.get_file_id(), &initializer, depth - 1)
                 }
                 _ => registered_global_path(db, &name_expr.get_access_path()?),

@@ -100,16 +100,14 @@ fn resolve_table_backing_range(
     )?;
     let (value_file_id, value_expr) = match semantic_decl {
         crate::LuaSemanticDeclId::LuaDecl(decl_id) => {
-            let root = db
-                .get_vfs()
-                .get_syntax_tree(&decl_id.file_id)?
-                .get_red_root();
+            let value_syntax_id = db
+                .get_decl_index()
+                .get_decl(&decl_id)?
+                .get_value_syntax_id()?;
             (
                 decl_id.file_id,
-                db.get_decl_index()
-                    .get_decl(&decl_id)?
-                    .get_value_syntax_id()?
-                    .to_node_from_root(&root)
+                db.get_vfs()
+                    .syntax_node_around(&decl_id.file_id, value_syntax_id)
                     .and_then(LuaExpr::cast)?,
             )
         }
@@ -513,7 +511,7 @@ fn last_table_literal_index_type(
 ) -> Option<LuaType> {
     let root = db
         .get_vfs()
-        .get_syntax_tree(&table_range.file_id)?
+        .syntax_tree_around(&table_range.file_id, table_range.value)?
         .get_red_root();
     let table = root
         .token_at_offset(table_range.value.start())

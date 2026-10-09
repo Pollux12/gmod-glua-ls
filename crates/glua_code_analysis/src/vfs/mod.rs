@@ -12,8 +12,8 @@ pub use file_id::{FileId, InFiled};
 pub use file_renames::FileRenames;
 pub use file_uri_handler::{file_path_to_uri, uri_to_file_path};
 use glua_parser::{
-    LineIndex, LuaAstNode, LuaParseError, LuaParser, LuaStat, LuaSyntaxNode, LuaSyntaxTree,
-    LuaTokenKind,
+    LineIndex, LuaAstNode, LuaParseError, LuaParser, LuaStat, LuaSyntaxId, LuaSyntaxNode,
+    LuaSyntaxTree, LuaTokenKind,
 };
 pub(crate) use loader::normalize_path_for_ordering;
 pub use loader::{LuaFileInfo, load_workspace_files, read_file_with_encoding};
@@ -627,6 +627,13 @@ impl Vfs {
     /// whole file, so edits elsewhere in the file leave the read standing.
     pub fn syntax_tree_around(&self, id: &FileId, range: TextRange) -> Option<&LuaSyntaxTree> {
         self.syntax_tree_reading(id, range, top_level_statement)
+    }
+
+    /// The node `syntax_id` names in `id`'s tree, reading only the top-level
+    /// statement that holds it.
+    pub fn syntax_node_around(&self, id: &FileId, syntax_id: LuaSyntaxId) -> Option<LuaSyntaxNode> {
+        let tree = self.syntax_tree_around(id, syntax_id.get_range())?;
+        syntax_id.to_node_from_root(&tree.get_red_root())
     }
 
     /// `id`'s syntax tree, for a caller that inspects only the innermost

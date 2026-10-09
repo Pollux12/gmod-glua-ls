@@ -128,12 +128,10 @@ fn infer_call_source_type(
                 && let Some(LuaSemanticDeclId::Member(member_id)) =
                     semantic_model.get_member_origin_owner(member_id)
             {
-                let root = semantic_model
+                let cur_node = semantic_model
                     .get_db()
                     .get_vfs()
-                    .get_syntax_tree(&member_id.file_id)?
-                    .get_red_root();
-                let cur_node = member_id.get_syntax_id().to_node_from_root(&root)?;
+                    .syntax_node_around(&member_id.file_id, *member_id.get_syntax_id())?;
                 let index_expr = LuaIndexExpr::cast(cur_node)?;
 
                 return index_expr.get_prefix_expr().map(|prefix_expr| {
@@ -158,12 +156,10 @@ fn infer_call_source_type(
                 SemanticDeclLevel::default(),
             )?;
             if let LuaSemanticDeclId::Member(member_id) = decl {
-                let root = semantic_model
+                let cur_node = semantic_model
                     .get_db()
                     .get_vfs()
-                    .get_syntax_tree(&member_id.file_id)?
-                    .get_red_root();
-                let cur_node = member_id.get_syntax_id().to_node_from_root(&root)?;
+                    .syntax_node_around(&member_id.file_id, *member_id.get_syntax_id())?;
                 let index_expr = LuaIndexExpr::cast(cur_node)?;
 
                 return index_expr.get_prefix_expr().map(|prefix_expr| {

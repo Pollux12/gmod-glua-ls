@@ -177,14 +177,10 @@ fn table_backing_range_from_expr(
                 return receiver_owner_table_range(analyzer, name_expr, signature_id);
             }
 
-            let root = analyzer
+            let value_expr = analyzer
                 .db
                 .get_vfs()
-                .get_syntax_tree(&decl_id.file_id)?
-                .get_red_root();
-            let value_expr = decl
-                .get_value_syntax_id()?
-                .to_node_from_root(&root)
+                .syntax_node_around(&decl_id.file_id, decl.get_value_syntax_id()?)
                 .and_then(LuaExpr::cast)?;
             table_backing_range_from_expr(analyzer, &value_expr)
         }

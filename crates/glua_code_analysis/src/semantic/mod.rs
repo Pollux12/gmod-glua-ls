@@ -366,8 +366,10 @@ impl<'a> SemanticModel<'a> {
     /// The closure `signature_id` is the signature of, if it is one.
     pub fn get_signature_closure(&self, signature_id: LuaSignatureId) -> Option<LuaClosureExpr> {
         let file_id = signature_id.get_file_id();
-        self.get_root_by_file_id(file_id)?
-            .syntax()
+        self.db
+            .get_vfs()
+            .syntax_tree_around(&file_id, TextRange::empty(signature_id.get_position()))?
+            .get_red_root()
             .token_at_offset(signature_id.get_position())
             .right_biased()?
             .parent_ancestors()

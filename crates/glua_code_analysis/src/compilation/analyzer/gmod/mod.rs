@@ -8213,7 +8213,10 @@ fn roles_from_signature(
 fn closure_from_signature_id(db: &DbIndex, signature_id: LuaSignatureId) -> Option<LuaClosureExpr> {
     let root = db
         .get_vfs()
-        .get_syntax_tree(&signature_id.get_file_id())?
+        .syntax_tree_around(
+            &signature_id.get_file_id(),
+            TextRange::empty(signature_id.get_position()),
+        )?
         .get_red_root();
     // A signature's position is the offset its closure starts at, so descend to
     // that offset rather than scanning every node in the file.
@@ -8348,11 +8351,9 @@ fn local_decl_aliases_global_name(db: &DbIndex, decl_id: LuaDeclId, global_name:
 fn local_decl_initializer_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<(usize, LuaExpr)> {
     let decl = db.get_decl_index().get_decl(&decl_id)?;
     let initializer = decl.get_initializer()?;
-    let root = db
+    let node = db
         .get_vfs()
-        .get_syntax_tree(&decl_id.file_id)?
-        .get_red_root();
-    let node = initializer.get_expr_syntax_id().to_node_from_root(&root)?;
+        .syntax_node_around(&decl_id.file_id, initializer.get_expr_syntax_id())?;
     Some((initializer.get_ret_idx(), LuaExpr::cast(node)?))
 }
 
@@ -8433,11 +8434,9 @@ fn annotated_roles_from_local_name_expr(
 fn signature_id_from_decl_value(db: &DbIndex, decl_id: LuaDeclId) -> Option<LuaSignatureId> {
     let decl = db.get_decl_index().get_decl(&decl_id)?;
     let value_syntax_id = decl.get_value_syntax_id()?;
-    let root = db
+    let value_node = db
         .get_vfs()
-        .get_syntax_tree(&decl_id.file_id)?
-        .get_red_root();
-    let value_node = value_syntax_id.to_node_from_root(&root)?;
+        .syntax_node_around(&decl_id.file_id, value_syntax_id)?;
     let closure = LuaClosureExpr::cast(value_node)?;
     Some(LuaSignatureId::from_closure(decl_id.file_id, &closure))
 }

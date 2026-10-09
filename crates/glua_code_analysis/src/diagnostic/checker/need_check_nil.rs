@@ -1810,9 +1810,9 @@ fn local_call_initializer_slot(
     let db = semantic_model.get_db();
     let decl = db.get_decl_index().get_decl(&decl_id)?;
     let initializer = decl.get_initializer()?;
-    let tree = db.get_vfs().get_syntax_tree(&decl_id.file_id)?;
-    let root = tree.get_red_root();
-    let node = initializer.get_expr_syntax_id().to_node_from_root(&root)?;
+    let node = db
+        .get_vfs()
+        .syntax_node_around(&decl_id.file_id, initializer.get_expr_syntax_id())?;
     let call_expr = LuaCallExpr::cast(node)?;
     Some((call_expr, initializer.get_ret_idx()))
 }
@@ -3411,8 +3411,10 @@ fn semantic_decl_value_expr(
         LuaSemanticDeclId::LuaDecl(decl_id) => {
             let decl = db.get_decl_index().get_decl(&decl_id)?;
             let value_syntax_id = decl.get_value_syntax_id()?;
-            let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
-            LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)
+            LuaExpr::cast(
+                db.get_vfs()
+                    .syntax_node_around(&decl.get_file_id(), value_syntax_id)?,
+            )
         }
         LuaSemanticDeclId::Member(member_id) => get_member_value_expr(db, member_id),
         LuaSemanticDeclId::Signature(_) | LuaSemanticDeclId::TypeDecl(_) => None,

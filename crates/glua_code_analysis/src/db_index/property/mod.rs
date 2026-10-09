@@ -709,11 +709,9 @@ pub fn try_extract_signature_id_from_field(
         return None;
     }
 
-    let root = db
+    let field_node = db
         .get_vfs()
-        .get_syntax_tree(&member.get_file_id())?
-        .get_red_root();
-    let field_node = member.get_syntax_id().to_node_from_root(&root)?;
+        .syntax_node_around(&member.get_file_id(), member.get_syntax_id())?;
 
     // Try converting to LuaDocTagField
     let field_tag = LuaDocTagField::cast(field_node)?;

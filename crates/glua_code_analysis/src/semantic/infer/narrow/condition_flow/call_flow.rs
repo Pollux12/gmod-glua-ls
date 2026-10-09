@@ -905,8 +905,10 @@ fn get_local_name_signature_id(
         .get_var_reference_decl(&cache.get_file_id(), name_expr.get_range())?;
     let decl = db.get_decl_index().get_decl(&decl_id)?;
     let value_syntax_id = decl.get_value_syntax_id()?;
-    let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
-    let value_expr = LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)?;
+    let value_expr = LuaExpr::cast(
+        db.get_vfs()
+            .syntax_node_around(&decl.get_file_id(), value_syntax_id)?,
+    )?;
 
     if let LuaExpr::ClosureExpr(closure) = &value_expr {
         return Some(LuaSignatureId::from_closure(decl.get_file_id(), closure));
@@ -968,8 +970,10 @@ fn get_semantic_decl_value_expr(db: &DbIndex, semantic_decl: LuaSemanticDeclId) 
         LuaSemanticDeclId::LuaDecl(decl_id) => {
             let decl = db.get_decl_index().get_decl(&decl_id)?;
             let value_syntax_id = decl.get_value_syntax_id()?;
-            let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
-            LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)
+            LuaExpr::cast(
+                db.get_vfs()
+                    .syntax_node_around(&decl.get_file_id(), value_syntax_id)?,
+            )
         }
         LuaSemanticDeclId::Member(member_id) => get_member_value_expr(db, member_id),
         LuaSemanticDeclId::Signature(_) | LuaSemanticDeclId::TypeDecl(_) => None,

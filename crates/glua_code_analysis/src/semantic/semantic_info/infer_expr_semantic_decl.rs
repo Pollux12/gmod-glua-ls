@@ -142,15 +142,15 @@ fn infer_name_expr_semantic_decl(
         match value_expr_id.get_kind() {
             LuaSyntaxKind::NameExpr | LuaSyntaxKind::IndexExpr => {
                 let file_id = decl.get_file_id();
-                let (Some(tree), Some(next_guard), Some(next_level)) = (
-                    db.get_vfs().get_syntax_tree(&file_id),
+                let (Some(node), Some(next_guard), Some(next_level)) = (
+                    db.get_vfs().syntax_node_around(&file_id, value_expr_id),
                     semantic_guard.next_level(),
                     level.next_level(),
                 ) else {
                     return Ok(None);
                 };
                 // second infer
-                let Some(value_expr) = value_expr_id.to_node(tree).and_then(LuaExpr::cast) else {
+                let Some(value_expr) = LuaExpr::cast(node) else {
                     return Ok(None);
                 };
                 let semantic_id = if file_id == cache.get_file_id() {
@@ -171,10 +171,10 @@ fn infer_name_expr_semantic_decl(
             }
             LuaSyntaxKind::RequireCallExpr => {
                 let file_id = decl.get_file_id();
-                let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
-                    return Ok(None);
-                };
-                let call_expr = value_expr_id.to_node(tree).and_then(LuaCallExpr::cast);
+                let call_expr = db
+                    .get_vfs()
+                    .syntax_node_around(&file_id, value_expr_id)
+                    .and_then(LuaCallExpr::cast);
                 if let Some(call_expr) = call_expr
                     && call_expr.is_require()
                     && let Some(semantic_id) =

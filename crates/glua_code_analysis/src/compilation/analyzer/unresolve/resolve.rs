@@ -128,11 +128,10 @@ fn create_deferred_index_expr_member(
     alias_path: Option<GlobalId>,
     set_owner_only: bool,
 ) -> Option<()> {
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&member_id.file_id)?
-        .get_red_root();
-    let index_expr = LuaIndexExpr::cast(member_id.get_syntax_id().to_node_from_root(&root)?)?;
+    let index_expr = LuaIndexExpr::cast(
+        db.get_vfs()
+            .syntax_node_around(&member_id.file_id, *member_id.get_syntax_id())?,
+    )?;
     let index_key = index_expr.get_index_key()?;
     let member_key = LuaMemberKey::from_index_key_or_unknown(db, cache, &index_key).ok()?;
     // An unknown key cannot pick between candidate tables, so pinning the member
@@ -1069,8 +1068,10 @@ fn get_semantic_decl_value_expr(db: &DbIndex, semantic_decl: LuaSemanticDeclId) 
         LuaSemanticDeclId::LuaDecl(decl_id) => {
             let decl = db.get_decl_index().get_decl(&decl_id)?;
             let value_syntax_id = decl.get_value_syntax_id()?;
-            let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
-            LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)
+            LuaExpr::cast(
+                db.get_vfs()
+                    .syntax_node_around(&decl.get_file_id(), value_syntax_id)?,
+            )
         }
         LuaSemanticDeclId::Member(member_id) => get_member_value_expr(db, member_id),
         LuaSemanticDeclId::Signature(_) | LuaSemanticDeclId::TypeDecl(_) => None,
@@ -2506,11 +2507,10 @@ fn set_signature_to_default_call(
         return None;
     };
     // We still need another check to confirm the origin is a `Def` type
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&member_id.file_id)?
-        .get_red_root();
-    let index_expr = LuaIndexExpr::cast(member_id.get_syntax_id().to_node_from_root(&root)?)?;
+    let index_expr = LuaIndexExpr::cast(
+        db.get_vfs()
+            .syntax_node_around(&member_id.file_id, *member_id.get_syntax_id())?,
+    )?;
     let prefix_expr = index_expr.get_prefix_expr()?;
     let prefix_type = infer_expr(db, cache, prefix_expr.clone()).ok()?;
     let LuaType::Def(decl_id) = prefix_type else {

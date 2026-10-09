@@ -134,11 +134,9 @@ fn infer_call_target_type(
 
     let decl = db.get_decl_index().get_decl(&decl_id)?;
     let value_syntax_id = decl.get_value_syntax_id()?;
-    let root = db
+    let node = db
         .get_vfs()
-        .get_syntax_tree(&decl_id.file_id)?
-        .get_red_root();
-    let node = value_syntax_id.to_node_from_root(&root)?;
+        .syntax_node_around(&decl_id.file_id, value_syntax_id)?;
     let expr = LuaExpr::cast(node)?;
     semantic_model.infer_expr(expr).ok()
 }
