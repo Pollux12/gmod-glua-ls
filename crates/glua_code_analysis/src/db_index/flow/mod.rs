@@ -726,7 +726,7 @@ mod tests {
         let file_id = FileId::new(1);
         let read_ref = effect_target(file_id);
         let other_ref = VarRefId::VarRef(crate::LuaDeclId::new(file_id, TextSize::new(8)));
-        derivation::begin(derivation::DerivationId::workspace(
+        let _recording = derivation::begin(derivation::DerivationId::workspace(
             derivation::DerivationKind::GmodLoad,
         ));
         assert!(!index.has_special_call_effect_for(&file_id, &read_ref));

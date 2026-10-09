@@ -64,7 +64,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::DbIndex;
 use crate::db_index::derivation::{
-    self, AnalysisStage, DerivationId, DerivationKind, FactKey, HashedKey, StageRule,
+    self, AnalysisStage, DerivationId, DerivationKind, FactKey, HashedKey, OnDrop, StageRule,
 };
 
 /// Why a derivation is on the worklist.
@@ -3099,7 +3099,7 @@ impl Engine {
                 .collect::<Vec<_>>();
             super::parallel::map_files_collect(db, &files, |db, file_id| {
                 let id = by_file[&file_id];
-                derivation::begin(id);
+                let _recording = derivation::begin(id);
                 let started = profiling.then(std::time::Instant::now);
                 let computed = recipe.compute(db, id);
                 let elapsed = started.map(|started| started.elapsed()).unwrap_or_default();
@@ -3132,7 +3132,7 @@ impl Engine {
                         if let Some(reads) = &reads {
                             assert_batch_reads_held(db, *member, reads);
                         }
-                        derivation::resume(evaluation);
+                        let _recording = derivation::resume(evaluation);
                         let started = profiling.then(std::time::Instant::now);
                         recipe.apply(db, *member, computed);
                         let applying = started.map(|started| started.elapsed()).unwrap_or_default();
@@ -3349,7 +3349,7 @@ impl Engine {
                     .expect("validated worker slots");
                 derivation::lend_keys(table);
                 let lent = scopeguard_lent_keys();
-                derivation::resume(evaluation);
+                let _recording = derivation::resume(evaluation);
                 recipe.apply(db, *id, result.value);
                 let evaluation = derivation::end();
                 db.reader_graph_mut().restore_keys(derivation::take_keys());
@@ -3362,7 +3362,7 @@ impl Engine {
                 recipe.discard(*id, result.value);
                 derivation::lend_keys(table);
                 let lent = scopeguard_lent_keys();
-                derivation::begin(*id);
+                let _recording = derivation::begin(*id);
                 recipe.evaluate(db, *id);
                 let evaluation = derivation::end();
                 db.reader_graph_mut().restore_keys(derivation::take_keys());
@@ -3535,7 +3535,7 @@ impl Engine {
             let mut cleared = FxHashSet::default();
             let (evaluations, found) = self.with_lent_keys(db, &touched, |db| {
                 run_group(db, group, own, &reset, &mut cleared, |db, member| {
-                    derivation::begin(member);
+                    let _recording = derivation::begin(member);
                     recipe.evaluate(db, member);
                     let evaluation = derivation::end();
                     let outputs = evaluation.outputs().cloned().collect();
@@ -4825,17 +4825,8 @@ fn co_producers(db: &DbIndex, id: DerivationId) -> Vec<DerivationId> {
     group.into_iter().collect()
 }
 
-/// Runs its function when dropped, including while unwinding.
-struct OnDrop(fn());
-
-impl Drop for OnDrop {
-    fn drop(&mut self) {
-        (self.0)();
-    }
-}
-
 /// Forgets the lent key table if evaluating a group unwinds.
-fn scopeguard_lent_keys() -> OnDrop {
+fn scopeguard_lent_keys() -> impl Drop {
     OnDrop(derivation::forget_lent_keys)
 }
 
@@ -5665,7 +5656,7 @@ print(tuned{index})"
         engine.changed(statement(READER));
         engine.open(db);
         assert!(!engine.run(db, &recipe, Slice::Evaluations(1)));
-        derivation::begin(statement(WRITER));
+        let _recording = derivation::begin(statement(WRITER));
         recipe.evaluate(db, statement(WRITER));
         let evaluation = derivation::end();
         let mut touched = evaluation.outputs().cloned().collect::<FxHashSet<_>>();

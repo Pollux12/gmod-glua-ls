@@ -4431,7 +4431,7 @@ mod super_type_tests {
 
     /// Declares class `name` in `file`, as that file's derivation.
     fn declare(index: &mut LuaTypeIndex, name: &str, file: u32) {
-        derivation::begin(derivation_in(file));
+        let _recording = derivation::begin(derivation_in(file));
         index.add_type_decl(
             FileId::new(file),
             LuaTypeDecl::new(
@@ -4509,7 +4509,7 @@ mod super_type_tests {
 
     /// Adds `child : Base` declared in `file`, as that file's derivation.
     fn derive_from_base(index: &mut LuaTypeIndex, child: &str, file: u32) {
-        derivation::begin(derivation_in(file));
+        let _recording = derivation::begin(derivation_in(file));
         index.add_super_type(
             LuaTypeDeclId::global(child),
             FileId::new(file),
@@ -4640,25 +4640,25 @@ mod super_type_tests {
         let owner = LuaTypeOwner::Decl(LuaDeclId::new(FileId::new(1), 0.into()));
         let id = DerivationId::workspace(derivation::DerivationKind::GmodLoad);
         derivation::lend_keys(derivation::KeyTable::default());
-        derivation::begin(id);
+        let _recording = derivation::begin(id);
         assert!(index.get_type_cache(&owner).is_none());
         let absent = derivation::end().into_recorded().1;
         index.force_bind_type(owner.clone(), LuaTypeCache::InferType(LuaType::String));
-        derivation::begin(id);
+        let _recording = derivation::begin(id);
         assert_eq!(
             index.get_type_cache(&owner).map(LuaTypeCache::as_type),
             Some(&LuaType::String)
         );
         let present = derivation::end().into_recorded().1;
         index.force_bind_type(owner.clone(), LuaTypeCache::InferType(LuaType::Number));
-        derivation::begin(id);
+        let _recording = derivation::begin(id);
         assert_eq!(
             index.get_type_cache(&owner).map(LuaTypeCache::as_type),
             Some(&LuaType::Number)
         );
         let changed = derivation::end().into_recorded().1;
         index.remove_files(&[FileId::new(1)]);
-        derivation::begin(id);
+        let _recording = derivation::begin(id);
         assert!(index.get_type_cache(&owner).is_none());
         let removed = derivation::end().into_recorded().1;
         derivation::take_keys();
@@ -4800,7 +4800,7 @@ mod super_type_tests {
     /// Runs `read` as a derivation and returns what it gave with the one fact
     /// it recorded a read of.
     fn read_by_a_derivation<T>(read: impl FnOnce() -> T) -> (T, FactKey) {
-        derivation::begin(DerivationId::workspace(
+        let _recording = derivation::begin(DerivationId::workspace(
             derivation::DerivationKind::GmodLoad,
         ));
         let value = read();
@@ -4813,7 +4813,7 @@ mod super_type_tests {
 
     /// Adds `child : base` to `file`'s derivation, the edge named at `start`.
     fn derive_super_at(index: &mut LuaTypeIndex, child: &str, file: u32, start: u32, base: &str) {
-        derivation::begin(derivation_in(file));
+        let _recording = derivation::begin(derivation_in(file));
         index.add_super_type(
             LuaTypeDeclId::global(child),
             FileId::new(file),
@@ -4826,7 +4826,7 @@ mod super_type_tests {
     /// Declares class `name` in `file`'s derivation, the declaration named at
     /// `start`.
     fn declare_at(index: &mut LuaTypeIndex, name: &str, file: u32, start: u32) {
-        derivation::begin(derivation_in(file));
+        let _recording = derivation::begin(derivation_in(file));
         index.add_type_decl(
             FileId::new(file),
             LuaTypeDecl::new(
@@ -4950,7 +4950,7 @@ mod super_type_tests {
         assert_ne!(index.fact_fingerprint(&locations), locations_seen);
         assert_eq!(index.fact_fingerprint(&read), read_seen);
 
-        derivation::begin(derivation_in(2));
+        let _recording = derivation::begin(derivation_in(2));
         index.add_type_decl_location(
             FileId::new(2),
             &moved,

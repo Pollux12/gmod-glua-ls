@@ -1021,7 +1021,7 @@ mod tests {
         let member_id = make_member_id(file_id, 20);
         let mut index = LuaMemberIndex::new();
         index.add_member(path("Holder"), make_member(member_id, "x"));
-        derivation::begin(derivation::DerivationId::workspace(
+        let _recording = derivation::begin(derivation::DerivationId::workspace(
             derivation::DerivationKind::GmodLoad,
         ));
         assert!(index.get_member(&member_id).is_some());
@@ -1056,7 +1056,7 @@ mod tests {
         let member_id = make_member_id(file_id, 20);
         let mut index = LuaMemberIndex::new();
         index.add_member(path("Holder"), make_member(member_id, "x"));
-        derivation::begin(derivation::DerivationId::workspace(
+        let _recording = derivation::begin(derivation::DerivationId::workspace(
             derivation::DerivationKind::GmodLoad,
         ));
         assert_eq!(index.get_current_owner(&member_id), Some(&path("Holder")));

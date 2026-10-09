@@ -498,7 +498,7 @@ mod tests {
     }
 
     fn evaluation() -> Evaluation {
-        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
         derivation::suspend()
     }
 
@@ -513,7 +513,7 @@ mod tests {
         let mut reference_log = Vec::new();
         let mut reference_reads = Vec::new();
         derivation::lend_keys(KeyTable::default());
-        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
         let mut read = |file| {
             derivation::CURRENT.with(|current| {
                 let mut current = current.borrow_mut();
@@ -640,7 +640,8 @@ mod tests {
                 graph.restore_keys(table);
             }
             derivation::lend_keys(KeyTable::default());
-            derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+            let _recording =
+                derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
             let frame = derivation::open_frame().unwrap();
             let mut evaluation = derivation::suspend();
             let table = derivation::take_keys();
@@ -649,7 +650,7 @@ mod tests {
             keys.record(&mut evaluation, child, &graph);
             assert_eq!(keys.new_keys.len(), 1);
             derivation::lend_keys(table);
-            derivation::resume(evaluation);
+            let _recording = derivation::resume(evaluation);
             assert!(derivation::close_frame(frame, 0).is_none());
             derivation::end();
             derivation::take_keys();
@@ -678,7 +679,8 @@ mod tests {
                     }
                     let guard = graph.quarantine_releases();
                     derivation::lend_keys(KeyTable::default());
-                    derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+                    let _recording =
+                        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
                     let mut keys = WorkerKeys::default();
                     let frame = derivation::open_frame().unwrap();
                     let local = derivation::CURRENT.with(|current| {
@@ -725,7 +727,7 @@ mod tests {
         let global = graph.intern_read(key(1));
         let guard = graph.quarantine_releases();
         derivation::lend_keys(KeyTable::default());
-        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
         let outer = derivation::open_frame().unwrap();
         let mut keys = WorkerKeys::default();
         let known = derivation::CURRENT
@@ -764,7 +766,7 @@ mod tests {
             new_global
         );
         derivation::lend_keys(table);
-        derivation::resume(evaluation);
+        let _recording = derivation::resume(evaluation);
         assert_eq!(
             derivation::reuse(&inner_proof, 0, &[], None),
             derivation::Reuse::Held
@@ -773,7 +775,7 @@ mod tests {
         derivation::note_read(|| key(3).key().clone());
         let late_proof = derivation::close_frame(late, 0).unwrap();
         derivation::end();
-        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
         assert_eq!(
             derivation::reuse(&outer_proof, 0, &[], None),
             derivation::Reuse::Held

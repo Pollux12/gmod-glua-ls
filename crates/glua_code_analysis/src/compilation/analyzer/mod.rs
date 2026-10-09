@@ -765,7 +765,7 @@ fn repath_files(db: &mut DbIndex, file_ids: &[FileId]) -> Vec<derivation::Hashed
     if file_ids.is_empty() {
         return Vec::new();
     }
-    derivation::begin(derivation::DerivationId::workspace(
+    let _recording = derivation::begin(derivation::DerivationId::workspace(
         derivation::DerivationKind::Source,
     ));
     let mut order_keys = Vec::with_capacity(file_ids.len());
@@ -953,7 +953,7 @@ fn replace_files(
             registered.is_some() && registered != current.as_deref()
         })
         .collect::<HashSet<_>>();
-    derivation::begin(derivation::DerivationId::workspace(
+    let _recording = derivation::begin(derivation::DerivationId::workspace(
         derivation::DerivationKind::Source,
     ));
     db.remove_index(file_ids.to_vec());
@@ -1088,7 +1088,7 @@ fn follow_edits(
         }
         // A fact another file holds that names a moved position is filed
         // again; its readers check it as the edit moved it.
-        derivation::begin(derivation::DerivationId::workspace(
+        let _recording = derivation::begin(derivation::DerivationId::workspace(
             derivation::DerivationKind::Source,
         ));
         let lost = crate::profile::phase("follow edits: remap indexes", || {
@@ -1190,7 +1190,7 @@ fn register_source(db: &mut DbIndex, file_id: FileId) -> derivation::Evaluation 
         .get_syntax_tree(&file_id)
         .expect("a live file has a syntax tree")
         .get_red_root();
-    derivation::begin(derivation::DerivationId::new(
+    let _recording = derivation::begin(derivation::DerivationId::new(
         derivation::DerivationKind::Source,
         file_id,
         LuaSyntaxId::from_node(&root),
@@ -1213,7 +1213,7 @@ fn declare_source(
     scopes: &ScriptedScopes,
     walk: decl::DeclWalk,
 ) -> (derivation::Evaluation, AnalyzeContext) {
-    derivation::resume(evaluation);
+    let _recording = derivation::resume(evaluation);
     let mut context = AnalyzeContext::for_files(db, vec![file_id], scopes);
     crate::profile::phase("declaration writes", || walk.apply(db, &mut context));
     let mut evaluation = derivation::end();
@@ -1269,7 +1269,7 @@ fn document_source(
     mut context: AnalyzeContext,
     tail: SourceTail,
 ) -> (Vec<derivation::HashedKey>, Vec<derivation::DerivationId>) {
-    derivation::resume(evaluation);
+    let _recording = derivation::resume(evaluation);
     run_analysis::<doc::DocAnalysisPipeline>(db, &mut context);
     publish_callable_signatures(db, &context);
     resolve_early_member_owners(db, &mut context);

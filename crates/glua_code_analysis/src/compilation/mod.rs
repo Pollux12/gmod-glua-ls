@@ -387,7 +387,7 @@ impl LuaCompilation {
         if self.db.get_vfs().get_syntax_tree(&file_id).is_none() {
             return diagnose();
         }
-        derivation::begin(DerivationId::diagnostics(file_id));
+        let _recording = derivation::begin(DerivationId::diagnostics(file_id));
         // Diagnostics are shown at the file's path, so a move makes them stale.
         derivation::note_file_fact_read(derivation::FileFact::FilePath, file_id);
         let viewed = derivation::view_graph(self.db.reader_graph_shared());

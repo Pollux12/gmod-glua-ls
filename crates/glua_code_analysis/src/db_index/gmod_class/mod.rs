@@ -1399,7 +1399,7 @@ mod tests {
 
         let mut index = GmodClassMetadataIndex::new();
         let file = FileId::new(1);
-        derivation::begin(derivation::DerivationId::workspace(
+        let _recording = derivation::begin(derivation::DerivationId::workspace(
             derivation::DerivationKind::GmodLoad,
         ));
         assert!(index.get_define_baseclass_name(&file).is_none());

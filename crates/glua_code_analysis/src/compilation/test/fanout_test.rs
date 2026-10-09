@@ -1569,7 +1569,7 @@ Foo = {}
             .get_red_root();
         let foo = crate::LuaTypeDeclId::global("Foo");
 
-        derivation::begin(DerivationId::new(
+        let _recording = derivation::begin(DerivationId::new(
             DerivationKind::Diagnostics,
             file_id,
             glua_parser::LuaSyntaxId::from_node(&root),

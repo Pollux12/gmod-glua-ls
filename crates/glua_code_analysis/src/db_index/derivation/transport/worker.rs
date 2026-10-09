@@ -569,7 +569,7 @@ pub(crate) fn compute_recorded<T>(
             task: None,
         })
     });
-    derivation::begin(id);
+    let _recording = derivation::begin(id);
     let value = compute();
     let evaluation = derivation::suspend();
     assert!(
@@ -659,7 +659,7 @@ impl TaskRecorder {
     /// Starts recording the evaluation of `id`.
     pub(crate) fn begin(&self, id: DerivationId) {
         with_keys(|worker| worker.requires_canonical.store(false, Ordering::Relaxed));
-        derivation::begin(id);
+        let _recording = derivation::begin(id);
     }
 
     /// Ends the evaluation [`Self::begin`] started and keeps it with the
@@ -871,7 +871,7 @@ mod tests {
     fn canonical_proof() -> (ReaderGraph, Provenance) {
         let mut graph = ReaderGraph::default();
         derivation::lend_keys(graph.lend_keys());
-        derivation::begin(id());
+        let _recording = derivation::begin(id());
         let frame = derivation::open_frame().unwrap();
         derivation::note_read(|| key(1).key().clone());
         let proof = derivation::close_frame(frame, 0).unwrap();
@@ -926,7 +926,7 @@ mod tests {
                 .all(|(evaluation, _)| evaluation.log == vec![slot])
         );
         derivation::lend_keys(table);
-        derivation::begin(id());
+        let _recording = derivation::begin(id());
         assert_eq!(derivation::reuse(&proof, 0, &[], None), Reuse::Held);
         assert_eq!(derivation::end().into_recorded().1, vec![slot]);
         let mut table = derivation::take_keys();
@@ -958,7 +958,7 @@ mod tests {
         let child = HashedKey::new(FactKey::GmodRealmAt(FileId::new(1), TextSize::new(5)));
         let mut graph = ReaderGraph::default();
         derivation::lend_keys(graph.lend_keys());
-        derivation::begin(id());
+        let _recording = derivation::begin(id());
         let read_child = memo_of(&child);
         let read_other = memo_of(&key(2));
         derivation::end();
@@ -1070,10 +1070,10 @@ mod tests {
         let slot = table.find(&key(1)).unwrap();
         let evaluation = result.evaluation.canonicalise(&mut table).unwrap();
         derivation::lend_keys(table);
-        derivation::resume(evaluation);
+        let _recording = derivation::resume(evaluation);
         derivation::end();
         for proof in [result.value.0, result.value.1, result.value.2] {
-            derivation::begin(id());
+            let _recording = derivation::begin(id());
             assert_eq!(derivation::reuse(&proof, 0, &[], None), Reuse::Held);
             assert_eq!(derivation::end().into_recorded().1, vec![slot]);
         }
@@ -1102,11 +1102,11 @@ mod tests {
         let early_evaluation = early.evaluation.canonicalise(&mut table).unwrap();
         derivation::lend_keys(table);
         for evaluation in [late, early_evaluation] {
-            derivation::resume(evaluation);
+            let _recording = derivation::resume(evaluation);
             derivation::end();
         }
         derivation::note_written([key(99)]);
-        derivation::begin(id());
+        let _recording = derivation::begin(id());
         assert_eq!(derivation::reuse(&early.value, 0, &[], None), Reuse::Held);
         derivation::end();
         let mut table = derivation::take_keys();
@@ -1193,9 +1193,9 @@ mod tests {
         let other = table.find(&key(1)).unwrap();
         assert_eq!(evaluation.log, vec![global, other, global, other]);
         derivation::lend_keys(table);
-        derivation::resume(evaluation);
+        let _recording = derivation::resume(evaluation);
         derivation::end();
-        derivation::begin(id());
+        let _recording = derivation::begin(id());
         assert_eq!(
             derivation::reuse(&result.value.0, 0, &[], None),
             Reuse::Held
@@ -1338,7 +1338,7 @@ mod tests {
     fn parallel_transport_worker_unwind_restores_parent_and_drops_snapshot_views() {
         let (snapshot, guard) = snapshot(ReaderGraph::default());
         derivation::lend_keys(KeyTable::default());
-        derivation::begin(id());
+        let _recording = derivation::begin(id());
         let frame = derivation::open_frame().unwrap();
         derivation::note_read(|| key(2).key().clone());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1371,7 +1371,7 @@ mod tests {
     fn parallel_transport_worker_canonical_replay_preserves_context_and_complete_inputs() {
         let mut graph = ReaderGraph::default();
         derivation::lend_keys(graph.lend_keys());
-        derivation::begin(id());
+        let _recording = derivation::begin(id());
         let frame = derivation::open_frame().unwrap();
         derivation::note_read(|| key(1).key().clone());
         derivation::consult_gates(1);
@@ -1471,7 +1471,7 @@ mod tests {
             evaluation.log[1]
         );
         derivation::lend_keys(table);
-        derivation::resume(evaluation);
+        let _recording = derivation::resume(evaluation);
         derivation::end();
         let mut table = derivation::take_keys();
         guard.finish(&mut table);

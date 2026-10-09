@@ -2041,7 +2041,7 @@ mod tests {
         let mut graph = ReaderGraph::default();
         derivation::lend_keys(graph.lend_keys());
         let calls = [0, 1].map(|start| {
-            derivation::begin(call(start));
+            let _recording = derivation::begin(call(start));
             let value = composed(&mut memo, &helper, || {
                 computed.set(computed.get() + 1);
                 derivation::note_read(|| summary.clone());

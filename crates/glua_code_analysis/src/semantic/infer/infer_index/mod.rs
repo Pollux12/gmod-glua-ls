@@ -4173,7 +4173,7 @@ mod member_query_memo_tests {
     }
 
     fn begin() {
-        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
     }
 
     #[test]
@@ -4355,7 +4355,7 @@ mod member_query_memo_tests {
         let syntax = expr.get_syntax_id();
         let prefix = LuaType::ModuleRef(FileId::new(2));
         let graph = std::sync::Arc::new(derivation::ReaderGraph::default());
-        derivation::begin(DerivationId::diagnostics(file));
+        let _recording = derivation::begin(DerivationId::diagnostics(file));
         let view = derivation::view_graph(graph.clone());
         let expected = Err(InferFailReason::FieldNotFound);
         assert_eq!(
@@ -4379,7 +4379,7 @@ mod member_query_memo_tests {
         drop(view);
         let reads = derivation::end().into_viewed_reads(&graph, |_| 1);
         assert_eq!(reads.keys(&graph).count(), 1);
-        derivation::begin(DerivationId::diagnostics(file));
+        let _recording = derivation::begin(DerivationId::diagnostics(file));
         let view = derivation::view_graph(graph.clone());
         assert!(cache.member_query_local_key(syntax, &prefix).is_some());
         assert!(cache.member_query_local_cache.is_empty());
@@ -4408,7 +4408,7 @@ mod member_query_memo_tests {
         let graph = std::sync::Arc::new(derivation::ReaderGraph::default());
         let expected = Err(InferFailReason::FieldNotFound);
         for _ in 0..2 {
-            derivation::begin(DerivationId::diagnostics(file));
+            let _recording = derivation::begin(DerivationId::diagnostics(file));
             let view = derivation::view_graph(graph.clone());
             cache
                 .expr_in_progress

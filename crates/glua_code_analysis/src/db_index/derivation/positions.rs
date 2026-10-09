@@ -316,9 +316,8 @@ thread_local! {
 /// and syntax ids name while fingerprinting (see [`hash_local`]).
 pub fn in_file<T>(file_id: Option<FileId>, f: impl FnOnce() -> T) -> T {
     let outer = FACT_FILE.with(|current| current.replace(file_id));
-    let result = f();
-    FACT_FILE.with(|current| current.set(outer));
-    result
+    let _restore = super::OnDrop(|| FACT_FILE.with(|current| current.set(outer)));
+    f()
 }
 
 /// Hashes a position that does not carry its file: one of the file whose
@@ -362,19 +361,19 @@ pub fn fingerprint_before_edits(
     }
     BACK_MAPS.with(|maps| *maps.borrow_mut() = Some(edits.inverse()));
     MAPPING_BACK.fetch_add(1, Ordering::Relaxed);
-    let result = fingerprint();
-    MAPPING_BACK.fetch_sub(1, Ordering::Relaxed);
-    BACK_MAPS.with(|maps| *maps.borrow_mut() = None);
-    result
+    let _restore = super::OnDrop(|| {
+        MAPPING_BACK.fetch_sub(1, Ordering::Relaxed);
+        BACK_MAPS.with(|maps| *maps.borrow_mut() = None);
+    });
+    fingerprint()
 }
 
 /// Runs `f` with fingerprints taken as they stand, even inside
 /// [`fingerprint_before_edits`]: for a value stored while one is taken.
 pub fn unmapped<T>(f: impl FnOnce() -> T) -> T {
-    let maps = BACK_MAPS.with(|maps| maps.borrow_mut().take());
-    let result = f();
-    BACK_MAPS.with(|slot| *slot.borrow_mut() = maps);
-    result
+    let mut maps = BACK_MAPS.with(|maps| maps.borrow_mut().take());
+    let _restore = super::OnDrop(move || BACK_MAPS.with(|slot| *slot.borrow_mut() = maps.take()));
+    f()
 }
 
 /// Hashes a fact value; inside [`fingerprint_before_edits`] its positional
@@ -386,11 +385,13 @@ pub(super) fn hash_value<T: Hash + ?Sized, H: Hasher>(value: &T, state: &mut H) 
     if mapping {
         HASHING.with(|hashing| hashing.set(true));
     }
+    let _restore = super::OnDrop(|| {
+        if mapping {
+            HASHING.with(|hashing| hashing.set(false));
+        }
+        FINGERPRINTING.with(|flag| flag.set(outer));
+    });
     value.hash(state);
-    if mapping {
-        HASHING.with(|hashing| hashing.set(false));
-    }
-    FINGERPRINTING.with(|flag| flag.set(outer));
 }
 
 /// What a positional identity in `file_id` hashes as right now: `None` to

@@ -188,7 +188,7 @@ mod query_presence_tests {
     #[test]
     fn parallel_transport_query_presence_covers_direct_hint_identity_and_named_hits() {
         derivation::lend_keys(KeyTable::default());
-        derivation::begin(id());
+        let _recording = derivation::begin(id());
         let outer = open_frame().unwrap();
         derivation::note_read(query);
         let inner = open_frame().unwrap();
@@ -218,7 +218,7 @@ mod query_presence_tests {
     #[test]
     fn parallel_transport_query_presence_propagates_tainted_children() {
         derivation::lend_keys(KeyTable::default());
-        derivation::begin(id());
+        let _recording = derivation::begin(id());
         let outer = open_frame().unwrap();
         let inner = open_frame().unwrap();
         derivation::note_read(query);
@@ -246,7 +246,7 @@ mod query_presence_tests {
         let mut graph = ReaderGraph::default();
         graph.intern_read(HashedKey::new(FactKey::FileText(FileId::new(99))));
         derivation::lend_keys(graph.lend_keys());
-        derivation::begin(id());
+        let _recording = derivation::begin(id());
         let frame = open_frame().unwrap();
         derivation::note_read(query);
         let proof = close_frame(frame, 0).unwrap();
@@ -301,9 +301,9 @@ mod query_presence_tests {
         let mut table = graph.lend_keys();
         let evaluation = recorded.evaluation.canonicalise(&mut table).unwrap();
         derivation::lend_keys(table);
-        derivation::resume(evaluation);
+        let _recording = derivation::resume(evaluation);
         derivation::end();
-        derivation::begin(id());
+        let _recording = derivation::begin(id());
         let frame = open_frame().unwrap();
         assert_eq!(reuse(&recorded.value, 0, &[], None), Reuse::Held);
         assert!(close_frame(frame, 0).unwrap().0.has_query);
@@ -348,7 +348,7 @@ mod query_presence_tests {
     #[test]
     fn viewed_frames_hold_within_their_evaluation_and_stay_ordinary_on_workers() {
         let graph = Arc::new(ReaderGraph::default());
-        derivation::begin(DerivationId::diagnostics(FileId::new(1)));
+        let _recording = derivation::begin(DerivationId::diagnostics(FileId::new(1)));
         let view = derivation::view_graph(Arc::clone(&graph));
         assert!(open_frame().is_none());
         let frame = open_frame_viewed().unwrap();
@@ -357,7 +357,7 @@ mod query_presence_tests {
         assert_eq!(reuse(&proof, 0, &[], None), Reuse::Held);
         drop(view);
         derivation::end();
-        derivation::begin(DerivationId::diagnostics(FileId::new(1)));
+        let _recording = derivation::begin(DerivationId::diagnostics(FileId::new(1)));
         let view = derivation::view_graph(Arc::clone(&graph));
         assert_eq!(reuse(&proof, 0, &[], None), Reuse::Stale);
         drop(view);
@@ -1255,9 +1255,9 @@ mod tests {
     fn parallel_transport_suspend_defers_freezing_and_restores_nested_parent() {
         derivation::lend_keys(KeyTable::default());
         let parent = DerivationId::workspace(DerivationKind::GmodLoad);
-        derivation::begin(parent);
+        let _recording = derivation::begin(parent);
         derivation::note_read(|| FactKey::GmodRealm(FileId::new(1)));
-        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
         let frame = open_frame().unwrap();
         derivation::note_read(|| FactKey::GmodRealm(FileId::new(2)));
         let proof = close_frame(frame, 0).unwrap();
@@ -1265,7 +1265,7 @@ mod tests {
         assert!(!proof.0.log.is_frozen());
         assert_eq!(derivation::current(), Some(parent));
         derivation::end();
-        derivation::resume(suspended);
+        let _recording = derivation::resume(suspended);
         derivation::note_read(|| FactKey::GmodRealm(FileId::new(3)));
         derivation::end();
         assert_eq!(
@@ -1280,7 +1280,7 @@ mod tests {
     #[test]
     fn parallel_transport_suspend_preserves_open_frame_context_in_place() {
         derivation::lend_keys(KeyTable::default());
-        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
         let frame = open_frame().unwrap();
         consult_gates(1);
         consult_unkeyed(7);
@@ -1288,12 +1288,12 @@ mod tests {
         let mark = scope_mark();
         let suspended = derivation::suspend();
         assert_eq!(suspended.frames.len(), 1);
-        derivation::resume(suspended);
+        let _recording = derivation::resume(suspended);
         assert!(scope_open(mark));
         let proof = close_frame(frame, 1).unwrap();
         assert!(!proof.0.log.is_frozen());
         derivation::end();
-        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
         assert_eq!(reuse(&proof, 1, &[], None), Reuse::Held);
         assert_eq!(reuse(&proof, 1, &[7], None), Reuse::Elsewhere);
         derivation::end();
@@ -1303,7 +1303,7 @@ mod tests {
     #[test]
     fn stored_fact_handle_leaves_unlent_reads_to_the_identity_recorder() {
         let handle = derivation::FactRead::default();
-        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
         assert!(!handle.note(|| panic!("the legacy path owns this read"), |_| false));
         let (_, reads, _) = derivation::end().into_parts(|_| 1);
         assert!(reads.is_empty());
@@ -1314,10 +1314,10 @@ mod tests {
         let handle = derivation::FactRead::default();
         let key = || FactKey::GmodRealm(FileId::new(1));
         derivation::lend_keys(KeyTable::default());
-        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
         assert!(handle.note(key, |fact| fact == &key()));
         let first = derivation::end().into_recorded().1;
-        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
         assert!(handle.note(
             || panic!("a cached handle must not build a key"),
             |fact| fact == &key()
@@ -1333,7 +1333,7 @@ mod tests {
         let handle = derivation::FactRead::default();
         let key = || FactKey::GmodRealm(FileId::new(1));
         derivation::lend_keys(KeyTable::default());
-        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
         assert!(handle.note(key, |fact| fact == &key()));
         let frame = open_frame().expect("a table is lent");
         assert!(handle.note(
@@ -1342,7 +1342,7 @@ mod tests {
         ));
         let value = close_frame(frame, 0).expect("the frame saw no taint");
         derivation::end();
-        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
         derivation::note_write(key);
         let result = reuse(&value, 0, &[], None);
         derivation::end();
@@ -1354,7 +1354,7 @@ mod tests {
     fn stored_fact_handle_records_diagnostic_reads_in_a_viewed_graph() {
         let handle = derivation::FactRead::default();
         derivation::lend_keys(KeyTable::default());
-        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
         assert!(handle.note(
             || FactKey::GmodRealm(FileId::new(1)),
             |fact| matches!(fact, FactKey::GmodRealm(file) if *file == FileId::new(1))
@@ -1364,7 +1364,7 @@ mod tests {
         let mut graph = super::super::ReaderGraph::default();
         graph.restore_keys(table);
         let graph = Arc::new(graph);
-        derivation::begin(DerivationId::diagnostics(FileId::new(1)));
+        let _recording = derivation::begin(DerivationId::diagnostics(FileId::new(1)));
         let viewed = derivation::view_graph(Arc::clone(&graph));
         assert!(handle.note(
             || panic!("viewed reads must use the cached handle"),
@@ -1381,14 +1381,14 @@ mod tests {
     fn a_key_read_before_and_while_viewing_the_graph_is_read_once() {
         let read = || FactKey::FilePath(FileId::new(1));
         derivation::lend_keys(KeyTable::default());
-        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
         derivation::note_read(read);
         derivation::end();
         let mut graph = super::super::ReaderGraph::default();
         graph.restore_keys(derivation::take_keys());
         let graph = Arc::new(graph);
 
-        derivation::begin(DerivationId::diagnostics(FileId::new(1)));
+        let _recording = derivation::begin(DerivationId::diagnostics(FileId::new(1)));
         derivation::note_read(read);
         let viewed = derivation::view_graph(Arc::clone(&graph));
         derivation::note_read(read);
@@ -1405,13 +1405,13 @@ mod tests {
     fn a_value_reused_again_in_a_nested_frame_is_recorded_by_it() {
         let read = || FactKey::GmodRealm(FileId::new(1));
         derivation::lend_keys(KeyTable::default());
-        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
         let frame = open_frame().expect("a table is lent");
         derivation::note_read(read);
         let value = close_frame(frame, 0).expect("the frame saw no taint");
         derivation::end();
 
-        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
         let outer = open_frame().expect("a table is lent");
         let reused_outside = reuse(&value, 0, &[], None);
         let inner = open_frame().expect("a table is lent");
@@ -1420,7 +1420,7 @@ mod tests {
         let _ = close_frame(outer, 0);
         derivation::end();
 
-        derivation::begin(DerivationId::workspace(DerivationKind::NetHelperNames));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::NetHelperNames));
         derivation::note_write(read);
         let nested_holds = reuse(&nested, 0, &[], None);
         derivation::end();
@@ -1434,7 +1434,7 @@ mod tests {
 
     /// Computes a value that reads `read` in its own evaluation.
     fn value_reading(read: fn() -> FactKey) -> Provenance {
-        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
         let frame = open_frame().expect("a table is lent");
         derivation::note_read(read);
         let value = close_frame(frame, 0).expect("the frame saw no taint");
@@ -1444,7 +1444,7 @@ mod tests {
 
     /// Whether `value` holds in a new evaluation.
     fn reused(value: &Provenance) -> Reuse {
-        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
         let _frame = open_frame().expect("a table is lent");
         let reuse = reuse(value, 0, &[], None);
         derivation::end();
@@ -1453,7 +1453,7 @@ mod tests {
 
     /// Writes `key` in an evaluation of its own.
     fn write(key: fn() -> FactKey) {
-        derivation::begin(DerivationId::workspace(DerivationKind::NetHelperNames));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::NetHelperNames));
         derivation::note_write(key);
         derivation::end();
     }
@@ -1466,7 +1466,7 @@ mod tests {
         let before = || FactKey::GmodRealm(FileId::new(1));
         let inside = || FactKey::GmodRealm(FileId::new(3));
         derivation::lend_keys(KeyTable::default());
-        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
         derivation::note_read(before);
         let frame = open_frame().expect("a table is lent");
         derivation::note_read(|| FactKey::GmodRealm(FileId::new(2)));
@@ -1529,7 +1529,7 @@ mod tests {
         derivation::lend_keys(KeyTable::default());
         let _ = value_reading(read);
         note_recomputing([HashedKey::new(read())]);
-        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
         let frame = open_frame().expect("a table is lent");
         derivation::note_read(read);
         let shared = close_frame(frame, 0).is_some();
@@ -1605,7 +1605,7 @@ mod tests {
         derivation::lend_keys(KeyTable::default());
         let _ = value_reading(read);
         hold(read());
-        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
         let frame = open_frame().expect("a table is lent");
         derivation::note_read(read);
         let shared = close_frame(frame, 0).is_some();
@@ -1623,7 +1623,7 @@ mod tests {
         const READ: u64 = 3;
         const OTHER: u64 = 5;
         derivation::lend_keys(KeyTable::default());
-        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
         let frame = open_frame().expect("a table is lent");
         consult_unkeyed(READ);
         let value = close_frame(frame, 0).expect("the frame saw no taint");
@@ -1652,13 +1652,13 @@ mod tests {
     fn holds_after_write_of_a_read_made_before_its_frame(note: fn()) -> Reuse {
         let read = || FactKey::GmodRealm(FileId::new(1));
         derivation::lend_keys(KeyTable::default());
-        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
         note();
         let frame = open_frame().expect("a table is lent");
         note();
         let value = close_frame(frame, 0).expect("the frame saw no taint");
         derivation::end();
-        derivation::begin(DerivationId::workspace(DerivationKind::NetHelperNames));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::NetHelperNames));
         derivation::note_write(read);
         let holds = reuse(&value, 0, &[], None);
         derivation::end();
@@ -1688,7 +1688,7 @@ mod tests {
         derivation::lend_keys(KeyTable::default());
         let _ = value_reading(read);
         note_recomputing([HashedKey::new(read())]);
-        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
         note();
         let frame = open_frame().expect("a table is lent");
         note();
@@ -1732,11 +1732,11 @@ mod tests {
         note: fn(),
         read: fn() -> FactKey,
     ) -> Reuse {
-        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
         note();
         let evaluation = derivation::end();
         derivation::lend_keys(KeyTable::default());
-        derivation::resume(evaluation);
+        let _recording = derivation::resume(evaluation);
         let frame = open_frame().expect("a table is lent");
         note();
         let value = close_frame(frame, 0).expect("the frame saw no taint");
@@ -1791,7 +1791,7 @@ mod tests {
         derivation::lend_keys(KeyTable::default());
         let value = value_reading(read);
         let _ = value_reading(unread);
-        derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
         let reused = reuse(&value, 0, &[], None);
         let before = derivation::write_generation();
         derivation::note_write(unread);
@@ -1815,7 +1815,7 @@ mod tests {
         use crate::{FileId, GlobalId, InFiled};
         let file = FileId::new(3);
         let site = |end: u32| InFiled::new(file, rowan::TextRange::new(4.into(), end.into()));
-        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
         derivation::note_definition_site_read(&site(9));
         derivation::note_definition_site_read(&site(12));
         derivation::note_global_path_read(&GlobalId::new("identity_test.a"));
@@ -1834,7 +1834,7 @@ mod tests {
         use crate::{GlobalId, LuaMemberKey, LuaMemberOwner};
         let owner = |path: &str| LuaMemberOwner::GlobalPath(GlobalId::new(path));
         let name = |name: &str| LuaMemberKey::Name(name.into());
-        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
         derivation::note_member_slot_read(&owner("named_test.a"), &name("x"));
         derivation::note_member_slot_read(&owner("named_test.a"), &name("y"));
         derivation::note_member_slot_read(&owner("named_test.b"), &name("x"));

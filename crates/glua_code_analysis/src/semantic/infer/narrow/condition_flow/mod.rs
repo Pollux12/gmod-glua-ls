@@ -455,7 +455,7 @@ mod memo_tests {
         let db = ws.get_db_mut();
         let mut cache = LuaInferCache::new(file, Default::default());
         derivation::lend_keys(db.reader_graph_mut().lend_keys());
-        derivation::begin(DerivationId::workspace(DerivationKind::Diagnostics));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::Diagnostics));
         CONDITION_COMPUTATIONS.with(|count| count.set(0));
         let tree = db.get_flow_index().get_flow_tree(&file).unwrap();
         for (seed, outcome, expected) in [
@@ -494,7 +494,7 @@ mod memo_tests {
         }
         let _ = derivation::end();
         cache.clear();
-        derivation::begin(DerivationId::workspace(DerivationKind::VguiChains));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::VguiChains));
         assert_eq!(
             seeded_condition(
                 db,
@@ -523,7 +523,7 @@ mod memo_tests {
             .expr_var_ref_id_cache
             .insert(condition.get_syntax_id(), var.clone(), None);
         derivation::lend_keys(db.reader_graph_mut().lend_keys());
-        derivation::begin(DerivationId::workspace(DerivationKind::Diagnostics));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::Diagnostics));
         CONDITION_COMPUTATIONS.with(|count| count.set(0));
         let tree = db.get_flow_index().get_flow_tree(&file).unwrap();
         for _ in 0..2 {
@@ -555,7 +555,7 @@ mod memo_tests {
         let tree = db.get_flow_index().get_flow_tree(&file).unwrap().clone();
         let mut cache = LuaInferCache::new(file, Default::default());
         derivation::lend_keys(db.reader_graph_mut().lend_keys());
-        derivation::begin(DerivationId::workspace(DerivationKind::Diagnostics));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::Diagnostics));
         CONDITION_COMPUTATIONS.with(|count| count.set(0));
         let first = seeded_condition(
             db,
@@ -597,7 +597,7 @@ mod memo_tests {
         let db = ws.get_db_mut();
         let mut cache = LuaInferCache::new(file, Default::default());
         derivation::lend_keys(db.reader_graph_mut().lend_keys());
-        derivation::begin(DerivationId::workspace(DerivationKind::Diagnostics));
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::Diagnostics));
         CONDITION_COMPUTATIONS.with(|count| count.set(0));
         let tree = db.get_flow_index().get_flow_tree(&file).unwrap();
         for _ in 0..2 {

@@ -1139,7 +1139,7 @@ mod tests {
         let signature_id = LuaSignatureId::new(file_id, 8.into());
         let mut index = LuaSignatureIndex::new();
         index.get_or_create(signature_id);
-        derivation::begin(derivation::DerivationId::workspace(
+        let _recording = derivation::begin(derivation::DerivationId::workspace(
             derivation::DerivationKind::GmodLoad,
         ));
         assert!(!index.returns_never(&signature_id));

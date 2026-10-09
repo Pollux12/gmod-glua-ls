@@ -1688,10 +1688,13 @@ pub fn capture_writes(f: impl FnOnce()) -> FxHashSet<HashedKey> {
         CURRENT.with(|current| current.borrow().is_none()),
         "writes captured inside an evaluation"
     );
-    let previous = CAPTURED.with(|captured| captured.replace(Some(FxHashSet::default())));
+    let mut previous = Some(CAPTURED.with(|captured| captured.replace(Some(FxHashSet::default()))));
+    let _restore = OnDrop(move || {
+        CAPTURED.with(|captured| *captured.borrow_mut() = previous.take().flatten())
+    });
     f();
     CAPTURED
-        .with(|captured| captured.replace(previous))
+        .with(|captured| captured.borrow_mut().take())
         .unwrap_or_default()
 }
 
@@ -1707,14 +1710,22 @@ pub(crate) fn advance_write_generation() {
     WRITE_GENERATION.with(|generation| generation.set(generation.get() + 1));
 }
 
+/// Runs its function when dropped, unwinding included.
+pub(crate) struct OnDrop<F: FnMut()>(pub(crate) F);
+
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
 /// Runs `f` without recording its reads. For an index's own bookkeeping: a
 /// lookup that only decides where a write is stored, when the index keeps
 /// that placement consistent itself whatever the order of writes.
 pub fn untracked<T>(f: impl FnOnce() -> T) -> T {
     UNTRACKED.with(|depth| depth.set(depth.get() + 1));
-    let result = f();
-    UNTRACKED.with(|depth| depth.set(depth.get() - 1));
-    result
+    let _depth = OnDrop(|| UNTRACKED.with(|depth| depth.set(depth.get() - 1)));
+    f()
 }
 
 /// Runs `f` noting each output it writes once: a write of a key `f` already
@@ -1747,9 +1758,8 @@ pub fn noting_writes_once<T>(f: impl FnOnce() -> T) -> T {
 /// their producers.
 pub fn rehoming<T>(f: impl FnOnce() -> T) -> T {
     REHOMING.with(|depth| depth.set(depth.get() + 1));
-    let result = f();
-    REHOMING.with(|depth| depth.set(depth.get() - 1));
-    result
+    let _depth = OnDrop(|| REHOMING.with(|depth| depth.set(depth.get() - 1)));
+    f()
 }
 
 /// Lends `table` to this thread: evaluations begun until [`take_keys`]
@@ -1770,8 +1780,44 @@ pub fn forget_lent_keys() {
     KEYS.with(|keys| keys.borrow_mut().take());
 }
 
+/// An evaluation [`begin`] or [`resume`] started on this thread. Dropped while
+/// the evaluation unwinds before it ends, it discards the evaluation and
+/// whatever began inside it, and the evaluation it suspended records again:
+/// the thread records as it did before it began.
+#[must_use = "held until the evaluation ends, so an unwind restores the thread's recording"]
+pub struct Recording {
+    stamp: u64,
+    /// How many evaluations were suspended when it started.
+    suspended: usize,
+    /// Whether it suspended one that was recording.
+    suspends: bool,
+}
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let started = |evaluation: &Evaluation| evaluation.stamp == self.stamp;
+        let live = CURRENT.with(|current| current.borrow().as_ref().is_some_and(started))
+            || SUSPENDED.with(|suspended| {
+                suspended
+                    .borrow()
+                    .get(self.suspended..)
+                    .is_some_and(|above| above.iter().any(started))
+            });
+        if !live {
+            return;
+        }
+        let above = SUSPENDED.with(|suspended| suspended.borrow_mut().split_off(self.suspended));
+        let previous = self.suspends.then(|| above.into_iter().next()).flatten();
+        let discarded = CURRENT.with(|current| current.replace(previous));
+        drop(discarded);
+    }
+}
+
 /// Starts recording the evaluation of `id` on this thread.
-pub fn begin(id: DerivationId) {
+pub fn begin(id: DerivationId) -> Recording {
     let stamp = next_stamp();
     let spare = SPARE
         .with(|spare| spare.borrow_mut().pop())
@@ -1793,7 +1839,7 @@ pub fn begin(id: DerivationId) {
         outputs: spare.outputs,
         moved: spare.moved,
         staged: spare.staged,
-    });
+    })
 }
 
 /// The lookups an evaluation needs only while it records, and the buffers it
@@ -1917,12 +1963,19 @@ impl Spare {
 /// Makes `evaluation` the one recording on this thread. One already recording
 /// is suspended until `evaluation` ends: a thread waiting in the pool runs
 /// other work, which may record its own evaluation.
-fn start(evaluation: Evaluation) {
-    CURRENT.with(|current| {
-        if let Some(previous) = current.borrow_mut().replace(evaluation) {
-            SUSPENDED.with(|suspended| suspended.borrow_mut().push(previous));
-        }
-    });
+fn start(evaluation: Evaluation) -> Recording {
+    let stamp = evaluation.stamp;
+    let suspended = SUSPENDED.with(|suspended| suspended.borrow().len());
+    let previous = CURRENT.with(|current| current.borrow_mut().replace(evaluation));
+    let suspends = previous.is_some();
+    if let Some(previous) = previous {
+        SUSPENDED.with(|suspended| suspended.borrow_mut().push(previous));
+    }
+    Recording {
+        stamp,
+        suspended,
+        suspends,
+    }
 }
 
 /// Runs `f` as the evaluation of `id`, nested in whatever this thread is
@@ -1931,7 +1984,7 @@ fn start(evaluation: Evaluation) {
 /// do not apply to it, so what it read can be filed whatever it ran inside.
 pub fn detached<T>(id: DerivationId, f: impl FnOnce() -> T) -> (T, Vec<HashedKey>) {
     let saved = transport::SavedRecording::take();
-    begin(id);
+    let _recording = begin(id);
     let result = f();
     let evaluation = end();
     drop(saved);
@@ -1941,7 +1994,7 @@ pub fn detached<T>(id: DerivationId, f: impl FnOnce() -> T) -> (T, Vec<HashedKey
 
 /// Continues recording an evaluation that [`end`] handed back, for a
 /// derivation evaluated in stages.
-pub fn resume(mut evaluation: Evaluation) {
+pub fn resume(mut evaluation: Evaluation) -> Recording {
     // Slots other evaluations logged since it began would read as logged by
     // it.
     evaluation.stamp = next_stamp();
@@ -1949,7 +2002,7 @@ pub fn resume(mut evaluation: Evaluation) {
     evaluation.read_identities.clear();
     evaluation.named_reads.clear();
     evaluation.seen_slots.clear();
-    start(evaluation);
+    start(evaluation)
 }
 
 /// Stops recording and hands back what the evaluation read and wrote.
@@ -2823,7 +2876,7 @@ mod noting_tests {
     #[test]
     fn a_scope_notes_each_output_once_and_leaves_writes_outside_it_alone() {
         let file = FileId::new(1);
-        begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let _recording = begin(DerivationId::workspace(DerivationKind::GmodLoad));
         noting_writes_once(|| {
             note_write(|| FactKey::MemberFile(file));
             note_write(|| FactKey::NetworkScan);
@@ -2838,6 +2891,54 @@ mod noting_tests {
                 noted(&evaluation, &FactKey::NetworkScan)
             ),
             (1, 2)
+        );
+    }
+}
+
+#[cfg(test)]
+mod unwind_tests {
+    use super::*;
+
+    fn reads(evaluation: Evaluation) -> Vec<HashedKey> {
+        let (_, reads, _) = evaluation.into_unfingerprinted_parts();
+        reads.into_iter().map(|(key, _)| key).collect()
+    }
+
+    /// An evaluation that panics leaves the thread recording as it did before
+    /// it began: the one it suspended records again, and the next evaluation
+    /// records only its own reads.
+    #[test]
+    fn an_evaluation_that_unwinds_leaves_the_thread_recording_as_before() {
+        let unwound = std::panic::catch_unwind(|| capture_writes(|| panic!("a reset panics")));
+        assert!(unwound.is_err());
+        let outer_id = DerivationId::workspace(DerivationKind::GmodLoad);
+        let _outer = begin(outer_id);
+        let unwound = std::panic::catch_unwind(|| {
+            let _inner = begin(DerivationId::workspace(DerivationKind::ValidGuards));
+            let _nested = begin(DerivationId::workspace(DerivationKind::NetHelperNames));
+            rehoming(|| untracked(|| panic!("an evaluation panics")));
+        });
+        assert!(unwound.is_err());
+
+        assert_eq!(current(), Some(outer_id));
+        assert_eq!(SUSPENDED.with(|suspended| suspended.borrow().len()), 0);
+        assert_eq!(
+            (
+                UNTRACKED.with(std::cell::Cell::get),
+                REHOMING.with(std::cell::Cell::get),
+                CAPTURED.with(|captured| captured.borrow().is_some()),
+            ),
+            (0, 0, false)
+        );
+        note_read(|| FactKey::NetworkScan);
+        assert_eq!(reads(end()), vec![HashedKey::new(FactKey::NetworkScan)]);
+        assert!(!recording());
+
+        let _next = begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        note_read(|| FactKey::MemberFile(FileId::new(1)));
+        assert_eq!(
+            reads(end()),
+            vec![HashedKey::new(FactKey::MemberFile(FileId::new(1)))]
         );
     }
 }

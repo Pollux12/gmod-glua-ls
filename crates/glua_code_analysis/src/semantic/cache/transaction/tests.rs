@@ -21,7 +21,7 @@ fn begin() {
 }
 
 fn next() {
-    derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+    let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
 }
 
 fn proof(cache: &LuaInferCache) -> Provenance {

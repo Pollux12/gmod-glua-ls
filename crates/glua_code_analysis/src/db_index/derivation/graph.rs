@@ -213,7 +213,7 @@ mod query_presence_tests {
         let mut graph = ReaderGraph::default();
         let fact_slot = graph.intern_read(fact.clone());
         graph.intern_read(query.clone());
-        super::super::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        let _recording = super::super::begin(DerivationId::workspace(DerivationKind::ValidGuards));
         super::super::note_read(|| query.key().clone());
         super::super::note_read(|| fact.key().clone());
         let evaluation = super::super::end();
@@ -3384,8 +3384,8 @@ mod tests {
     fn an_evaluation_begun_inside_another_suspends_it_until_it_ends() {
         use super::super::{begin, end};
 
-        begin(id(1, 0));
-        begin(id(2, 0));
+        let _recording = begin(id(1, 0));
+        let _recording = begin(id(2, 0));
 
         assert_eq!(end().id, id(2, 0));
         assert_eq!(end().id, id(1, 0));
