@@ -2015,7 +2015,6 @@ mod test {
         let file_id = ws.def(
             r#"
             ---@class Entity
-            ---@field GetClass fun(self: Entity): string
             ---@class Player: Entity
             ---@field GetClass fun(self: Player): string
             ---@class Holder
@@ -2605,6 +2604,73 @@ filter:SetUpdateOnType(true)
         assert_eq!(
             diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
             0
+        );
+    }
+
+    fn guard_form_diagnostic_count(use_site: &str) -> usize {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_gmod_type_predicates();
+        let source = format!(
+            r#"
+            ---@class Entity
+            ---@class Car: Entity
+            ---@field Honk fun(self: Car)
+            ---@param ent Entity
+            local function use(ent)
+                {use_site}
+            end
+            "#
+        );
+        let file_id = ws.def(&source);
+        diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild)
+    }
+
+    #[test]
+    fn unguarded_use_fires_without_any_guard() {
+        assert_eq!(guard_form_diagnostic_count("ent:Honk()"), 1);
+    }
+
+    #[test]
+    fn member_presence_if_guard_does_not_fire() {
+        assert_eq!(
+            guard_form_diagnostic_count("if ent.Honk then ent:Honk() end"),
+            0
+        );
+    }
+
+    #[test]
+    fn member_presence_and_guard_does_not_fire() {
+        assert_eq!(
+            guard_form_diagnostic_count("local _ = ent.Honk and ent:Honk()"),
+            0
+        );
+    }
+
+    #[test]
+    fn member_presence_early_return_guard_does_not_fire() {
+        assert_eq!(
+            guard_form_diagnostic_count(
+                "if not ent.Honk then return end
+                ent:Honk()"
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn isfunction_member_guard_does_not_fire() {
+        assert_eq!(
+            guard_form_diagnostic_count("if isfunction(ent.Honk) then ent:Honk() end"),
+            0
+        );
+    }
+
+    #[test]
+    fn is_valid_guard_alone_does_not_narrow_to_child() {
+        assert_eq!(
+            guard_form_diagnostic_count("if IsValid(ent) then ent:Honk() end"),
+            1
         );
     }
 }
