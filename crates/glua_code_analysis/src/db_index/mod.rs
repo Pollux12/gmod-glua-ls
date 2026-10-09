@@ -1340,7 +1340,16 @@ impl DbIndex {
         Arc::make_mut(&mut self.gmod_network_index)
     }
 
+    /// The dynamic fields filed so far; none before their writers' stage of a
+    /// run, so a run reads what it files, not what an earlier one left.
     pub fn get_dynamic_field_index(&self) -> &DynamicFieldIndex {
+        static UNFILED: std::sync::LazyLock<DynamicFieldIndex> =
+            std::sync::LazyLock::new(DynamicFieldIndex::default);
+        if !self.dynamic_field_index.is_empty()
+            && !self.stage_rule_holds(derivation::StageRule::DynamicFieldsFiled)
+        {
+            return &UNFILED;
+        }
         self.dynamic_field_index.as_ref()
     }
 

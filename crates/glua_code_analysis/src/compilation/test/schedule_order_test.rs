@@ -12,6 +12,10 @@ pub(super) mod test {
     enum Build {
         Whole,
         OneEvaluationAtATime,
+        /// The earlier half of the files first, the later half's empty, then
+        /// every file: a later file's analysis starts from what the first
+        /// batch settled.
+        TwoBatches,
     }
 
     /// Every type cache, type declaration, dynamic field, net flow and the semantic
@@ -51,6 +55,24 @@ pub(super) mod test {
                     Build::Whole => {
                         ws.def_files(
                             files
+                                .iter()
+                                .map(|(path, text)| (path.as_str(), text.as_str()))
+                                .collect(),
+                        );
+                    }
+                    Build::TwoBatches => {
+                        let cut = files.len() / 2;
+                        ws.def_files(
+                            files
+                                .iter()
+                                .enumerate()
+                                .map(|(at, (path, text))| {
+                                    (path.as_str(), if at < cut { text.as_str() } else { "" })
+                                })
+                                .collect(),
+                        );
+                        ws.def_files(
+                            files[cut..]
                                 .iter()
                                 .map(|(path, text)| (path.as_str(), text.as_str()))
                                 .collect(),
@@ -341,6 +363,11 @@ Config = {}
                     Build::OneEvaluationAtATime,
                 )
                 .expect("slices settle"),
+            ),
+            (
+                "two batches",
+                settled_in(Schedule::Canonical, files, false, Build::TwoBatches)
+                    .expect("two batches settle"),
             ),
         ];
         for (name, other) in others {
@@ -782,6 +809,69 @@ vgui.Register(\"{class}\", PANEL, \"Panel\")
             (
                 "gamemodes/terrortown/gamemode/vgui/scrolllabel.lua",
                 scroll.as_str(),
+            ),
+        ]);
+    }
+
+    /// The thrown knife reads its `fingerprints` before the closure below
+    /// writes it, and that write reads the local back: a loop whose field is
+    /// filed only once the statements settled. A batch analysing the knife
+    /// after another batch filed every entity's `fingerprints` must not read
+    /// them before its own statements settle, as a cold build cannot.
+    #[test]
+    fn a_field_read_before_its_own_write_settles_the_same_after_a_batch_filed_it_elsewhere() {
+        assert_schedule_independent(&[
+            (
+                "lua/includes/builtins.lua",
+                "---@class Entity
+---@class Weapon : Entity
+---@class Player : Entity
+local Player = {}
+---@return Weapon
+function Player:Give(class) end
+ents = {}
+---@return Entity
+function ents.Create(class) end
+",
+            ),
+            (
+                "gamemodes/terrortown/entities/entities/ttt_radio.lua",
+                "ENT.Type = \"anim\"
+function ENT:Initialize()
+   self.fingerprints = {}
+end
+---@param activator Player
+function ENT:UseOverride(activator)
+   local prints = self.fingerprints or {}
+   local wep = activator:Give(\"weapon_ttt_radio\")
+   wep.fingerprints = wep.fingerprints or {}
+end
+",
+            ),
+            (
+                "gamemodes/terrortown/entities/weapons/weapon_tttbase.lua",
+                "SWEP.fingerprints = {}
+function SWEP:Equip(newowner)
+   self.fingerprints = self.fingerprints or {}
+end
+",
+            ),
+            (
+                "gamemodes/terrortown/entities/entities/ttt_knife_proj.lua",
+                "ENT.Type = \"anim\"
+function ENT:StickTo(other)
+   local knife = self
+   local prints = self.fingerprints
+   other.effect_fn = function(rag)
+      knife.fingerprints = prints
+   end
+end
+function ENT:BecomeWeapon()
+   local wep = ents.Create(\"weapon_ttt_knife\")
+   wep.fingerprints = wep.fingerprints or {}
+   return wep
+end
+",
             ),
         ]);
     }

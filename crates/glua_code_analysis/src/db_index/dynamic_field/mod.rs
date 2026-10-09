@@ -248,6 +248,11 @@ impl DynamicFieldIndex {
         Self::default()
     }
 
+    /// Whether no write site filed anything.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.site_contributions.len() == 0
+    }
+
     /// The record of what `site` filed, created on its first contribution.
     fn site_record(&mut self, site: &InFiled<TextRange>) -> &mut SiteContributions {
         self.site_contributions.entry(site.clone()).or_default()

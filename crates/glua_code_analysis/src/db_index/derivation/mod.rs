@@ -131,16 +131,25 @@ pub enum StageRule {
     /// A read of a fact that has not landed answers with a floor: unknown, or
     /// nil for a field no writer declares.
     FloorUnsettled,
+    /// The dynamic fields their writers file once the statements settle are
+    /// read; before then a run reads none, as a cold build does, rather than
+    /// what an earlier run left.
+    DynamicFieldsFiled,
 }
 
 impl StageRule {
-    pub const ALL: [Self; 2] = [Self::SkipUntypedWriters, Self::FloorUnsettled];
+    pub const ALL: [Self; 3] = [
+        Self::SkipUntypedWriters,
+        Self::FloorUnsettled,
+        Self::DynamicFieldsFiled,
+    ];
 
     /// The first stage the rule holds at.
     pub fn holds_from(self) -> AnalysisStage {
         match self {
             Self::SkipUntypedWriters => AnalysisStage::SkipUntyped,
             Self::FloorUnsettled => AnalysisStage::Closed,
+            Self::DynamicFieldsFiled => DerivationKind::DynamicFieldWrite.first_stage(),
         }
     }
 
