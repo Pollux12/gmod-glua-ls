@@ -735,4 +735,17 @@ end
             ),
         ]);
     }
+
+    #[test]
+    fn a_gamemode_base_alias_its_shared_client_and_server_files_declare_settles_the_same_in_either_order()
+     {
+        const DERIVE: &str = "DEFINE_BASECLASS(\"gamemode_base\")
+function GM:Initialize() end
+";
+        assert_schedule_independent(&[
+            ("gamemodes/sandbox/gamemode/cl_init.lua", DERIVE),
+            ("gamemodes/sandbox/gamemode/init.lua", DERIVE),
+            ("gamemodes/sandbox/gamemode/shared.lua", DERIVE),
+        ]);
+    }
 }

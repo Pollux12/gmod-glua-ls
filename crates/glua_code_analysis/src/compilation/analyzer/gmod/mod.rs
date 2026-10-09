@@ -5133,22 +5133,19 @@ fn synthesize_define_baseclass_parent_alias(
     // check must be realm-scoped, not bare existence: a write in the other
     // realm (e.g. a second DEFINE_BASECLASS entry file) is not a definition
     // this realm's readers can see. It must NOT be position-scoped though: a
-    // write later in this same file is still the user's definition.
+    // write later in this same file is still the user's definition. Aliases
+    // other files synthesized are not the user's definition: counting them
+    // would keep whichever entry files happened to synthesize first.
     if let Some(item) = db.get_member_index().get_member_item(&owner, &member_key)
-        && !item.visible_member_ids_with_realm(db, &file_id).is_empty()
+        && item
+            .visible_member_ids_with_realm(db, &file_id)
+            .iter()
+            .any(|member_id| !is_define_baseclass_parent_alias(db, member_id))
     {
         return;
     }
 
-    // Prefer the base-name string argument's syntax id for provenance; fall
-    // back to the call itself so hover/goto still lands somewhere useful.
-    let syntax_id = call
-        .args
-        .first()
-        .map(|a| a.syntax_id)
-        .unwrap_or(call.syntax_id);
-
-    let member_id = LuaMemberId::new(syntax_id, file_id);
+    let member_id = LuaMemberId::new(define_baseclass_parent_alias_syntax_id(call), file_id);
     let member = LuaMember::new(member_id, member_key, LuaMemberFeature::FileFieldDecl, None);
     db.get_member_index_mut().add_member(owner, member);
     write_type_cache(
@@ -5157,6 +5154,26 @@ fn synthesize_define_baseclass_parent_alias(
         LuaTypeCache::DocType(LuaType::Ref(LuaTypeDeclId::global(base_name))),
         TypeCacheWriteMode::InsertOnly,
     );
+}
+
+/// The syntax id a `DEFINE_BASECLASS` call's parent alias is declared at: the
+/// base-name argument, or the call itself when it has none.
+fn define_baseclass_parent_alias_syntax_id(call: &GmodScriptedClassCallMetadata) -> LuaSyntaxId {
+    call.args
+        .first()
+        .map(|a| a.syntax_id)
+        .unwrap_or(call.syntax_id)
+}
+
+/// Whether `member_id` is a parent alias synthesized from a `DEFINE_BASECLASS` call.
+fn is_define_baseclass_parent_alias(db: &DbIndex, member_id: &LuaMemberId) -> bool {
+    db.get_gmod_class_metadata_index()
+        .get_file_metadata(&member_id.file_id)
+        .is_some_and(|metadata| {
+            metadata.define_baseclass_calls.iter().any(|call| {
+                define_baseclass_parent_alias_syntax_id(call) == *member_id.get_syntax_id()
+            })
+        })
 }
 
 /// Uppercase the first ASCII letter of `s`, leaving the rest untouched.
