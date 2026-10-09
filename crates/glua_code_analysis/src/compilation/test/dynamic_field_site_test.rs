@@ -185,4 +185,60 @@ e[key] = 4
             (true, false)
         );
     }
+
+    /// Two instances assigning a class's method give it a union of dynamic
+    /// methods; a subclass putting the method back from its base class reads
+    /// them together with the method they override, as it does for one.
+    #[test]
+    fn a_method_read_from_a_base_class_keeps_the_overridden_method_beside_several_dynamic_ones() {
+        let mut ws = dynamic_field_workspace();
+        ws.def_gmod_call_arg_builtins();
+        let annotations = ws.def_file(
+            "lua/aaa_annotations/panels.lua",
+            "---@class Panel
+Panel = Panel or {}
+---@class Label : Panel
+---@class DLabel : Label
+---@class DButton : DLabel
+---@class DImageButton : DButton
+---@param w number
+---@param h number
+function Panel:PaintOver(w, h) end
+",
+        );
+        ws.def_file(
+            "gamemodes/base/gamemode/cl_scoreboard.lua",
+            "---@param mute DImageButton
+local function SetupMute(mute)
+    mute.PaintOver = function(s, w, h) end
+end
+---@param deafen DImageButton
+local function SetupDeafen(deafen)
+    deafen.PaintOver = function(s, w, h) end
+end
+",
+        );
+        let wire = ws.def_file(
+            "gamemodes/terrortown/entities/entities/ttt_c4/cl_init.lua",
+            "local PANEL = {}
+function PANEL:DoClick()
+    local putBack = self.BaseClass.PaintOver
+    self.PaintOver = putBack
+end
+vgui.Register(\"DisarmWire\", PANEL, \"DImageButton\")
+",
+        );
+
+        let put_back = ws.local_ty(wire, "putBack");
+        let crate::LuaType::Union(union) = &put_back else {
+            panic!("expected a union of methods, got {put_back:?}");
+        };
+        assert!(
+            union.types().any(|arm| matches!(
+                arm,
+                crate::LuaType::Signature(signature) if signature.get_file_id() == annotations
+            )),
+            "expected the overridden Panel:PaintOver among {put_back:?}"
+        );
+    }
 }

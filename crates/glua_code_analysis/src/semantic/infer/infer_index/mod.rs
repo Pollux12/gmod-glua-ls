@@ -2467,8 +2467,11 @@ fn infer_custom_type_member(
 
                 match result {
                     Ok(super_member_type) => {
-                        if dynamic_field.typ.is_function() || super_member_type.is_function() {
-                            return Ok(LuaType::from_vec(vec![
+                        if holds_function(&dynamic_field.typ) || holds_function(&super_member_type)
+                        {
+                            // Assignments, not overloads: their order says
+                            // only which writer the batch filed first.
+                            return Ok(LuaType::from_inferred_vec(vec![
                                 dynamic_field.typ,
                                 super_member_type,
                             ]));
@@ -2544,6 +2547,16 @@ fn infer_custom_type_member(
 
     cache.record_missed_member_read(db, owner, key);
     Err(InferFailReason::FieldNotFound)
+}
+
+/// Whether `typ` is a method: a function type, or a union of them. A dynamic
+/// method is merged with the method it overrides whether one writer or
+/// several assigned it.
+fn holds_function(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Union(union) => union.types().all(LuaType::is_function),
+        typ => typ.is_function(),
+    }
 }
 
 pub(crate) fn resolve_decl_backed_global_path_member_type(
