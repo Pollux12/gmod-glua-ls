@@ -47,6 +47,8 @@ When you open a whole Garry's Mod folder (named `garrysmod`, holding both `addon
 
 Any other folder, such as one gamemode or the `addons/` folder, loads everything.
 
+In VS Code, when the folder has several custom gamemodes and none is picked, GLuaLS asks which to load: one gamemode, **Load all custom** (`"*"`), or **Load all** (`loadEverything`). Run **GLuaLS: Select Gamemode** or click the status bar item to change it later. The pick is saved to `.gluarc.json` when the folder is in a git repository and has a `.gluarc.json` or no other config file, and otherwise to the workspace folder's settings.
+
 | Option | Default | Description |
 |---|---|---|
 | `gmod.activeGamemode` | none | Gamemode folder to load with the addons. `"*"` loads every custom gamemode |
