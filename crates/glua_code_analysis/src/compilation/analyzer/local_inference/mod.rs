@@ -19,8 +19,8 @@ use crate::{
     SignatureReturnStatus, TypeOps,
     compilation::analyzer::AnalyzeContext,
     semantic::{
-        infer_bind_value_type, infer_expr, infer_true_condition_narrowing,
-        resolve_dynamic_field_member,
+        LuaInferCache, dynamic_field_type_without, infer_bind_value_type, infer_expr,
+        infer_true_condition_narrowing, resolve_dynamic_field_member,
     },
 };
 
@@ -97,7 +97,8 @@ pub(super) fn stabilize_unknown_locals(
             else {
                 continue;
             };
-            let candidate = match guessed_slot_evidence(db, file_id, &name_expr) {
+            let cache = context.infer_manager.get_infer_cache(file_id);
+            let candidate = match guessed_slot_evidence(db, cache, file_id, &name_expr) {
                 Some(Some(evidence)) => evidence,
                 Some(None) => continue,
                 None => candidate,
@@ -209,9 +210,12 @@ fn guesses(db: &crate::DbIndex, decl_id: &crate::LuaDeclId) -> bool {
 /// guesses, the stored local's own included, so reading it back would derive
 /// each guess from the guesses. A writer in another file is taken as it
 /// stands: telling what it stores would read that file's text, so every edit
-/// of it would reach this file. `None` when the read is no such store.
+/// of it would reach this file. A store through an instance files no member
+/// of the slot: its writers are the field's dynamic ones. `None` when the
+/// read is no such store.
 fn guessed_slot_evidence(
     db: &crate::DbIndex,
+    cache: &mut LuaInferCache,
     file_id: crate::FileId,
     name_expr: &LuaNameExpr,
 ) -> Option<Option<LuaType>> {
@@ -227,8 +231,21 @@ fn guessed_slot_evidence(
     let member_id = crate::LuaMemberId::new(target.get_syntax_id(), file_id);
     let key = member_index.get_member(&member_id)?.get_key().clone();
     let owner = member_index.get_current_owner(&member_id)?.clone();
-    let (guessed, others): (Vec<_>, Vec<_>) = member_index
-        .get_member_item(&owner, &key)?
+    let Some(item) = member_index
+        .get_member_item(&owner, &key)
+        .filter(|item| item.get_member_ids().contains(&member_id))
+    else {
+        let prefix_type = infer_expr(db, cache, target.get_prefix_expr()?).ok()?;
+        return dynamic_field_type_without(
+            db,
+            cache,
+            &prefix_type,
+            key.get_name()?,
+            name_expr.get_position(),
+            |writer| writer.file_id == file_id && stores_guessed_local(db, writer),
+        );
+    };
+    let (guessed, others): (Vec<_>, Vec<_>) = item
         .get_member_ids()
         .into_iter()
         .partition(|writer| writer.file_id == file_id && stores_guessed_local(db, *writer));

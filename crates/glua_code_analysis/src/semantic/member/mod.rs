@@ -1121,7 +1121,50 @@ fn resolve_dynamic_field_uncached(
     if definitions.is_empty() {
         return None;
     }
+    Some(dynamic_field_definitions_type(db, cache, definitions))
+}
 
+/// What `field_name` holds on `prefix_type` at `access_position`, from every
+/// dynamic writer but those `skip` names: `None` when it names none of them,
+/// and an inner `None` when no other writer is left.
+pub(crate) fn dynamic_field_type_without(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    prefix_type: &LuaType,
+    field_name: &str,
+    access_position: TextSize,
+    skip: impl Fn(LuaMemberId) -> bool,
+) -> Option<Option<LuaType>> {
+    if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
+        return None;
+    }
+    let caller_file_id = cache.get_file_id();
+    let (skipped, kept): (Vec<_>, Vec<_>) = dynamic_field_definitions(
+        db,
+        cache,
+        caller_file_id,
+        prefix_type,
+        field_name,
+        Some(access_position),
+    )
+    .into_iter()
+    .partition(|definition| definition.member_id.is_some_and(&skip));
+    if skipped.is_empty() {
+        return None;
+    }
+    if kept.is_empty() {
+        return Some(None);
+    }
+    Some(Some(dynamic_field_definitions_type(db, cache, kept).0))
+}
+
+/// The type the dynamic writers `definitions` give a field, with the member
+/// the first of them names.
+fn dynamic_field_definitions_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    definitions: Vec<VisibleDynamicFieldDefinition>,
+) -> (LuaType, Option<LuaSemanticDeclId>) {
     let mut member_types = Vec::new();
     let mut semantic_decl = None;
     let mut has_runtime_type = false;
@@ -1151,7 +1194,7 @@ fn resolve_dynamic_field_uncached(
         [only] => only.clone(),
         _ => LuaType::from_vec(member_types),
     };
-    Some((typ, semantic_decl))
+    (typ, semantic_decl)
 }
 
 pub(crate) fn resolve_dynamic_field_member_for_file(
