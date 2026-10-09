@@ -2782,4 +2782,57 @@ filter:SetUpdateOnType(true)
             "expected `Car` but found `Entity`. Add a guard to narrow the parent to `Car`."
         );
     }
+
+    fn closure_receiver_hint_count(write_avatar: bool) -> usize {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let avatar_write = if write_avatar {
+            r#"pnl.Avatar = vgui.Create("AvatarImage", pnl)"#
+        } else {
+            ""
+        };
+        let file_id = ws.def(&format!(
+            r#"
+            ---@class Panel
+            ---@field Paint fun(self: Panel, w: number, h: number)
+            ---@field PerformLayout fun(self: Panel)
+            ---@field SetPlayer fun(self: Panel, ply: any, size: number)
+            ---@class AvatarImage: Panel
+            ---@field SetPlayer fun(self: AvatarImage, ply: any, size: number)
+            ---@class DFrame: Panel
+            ---@field Avatar AvatarImage
+
+            vgui = vgui or {{}}
+
+            ---@generic T : Panel
+            ---@param classname `T`
+            ---@param parent? Panel
+            ---@return T
+            function vgui.Create(classname, parent) end
+
+            ---@param pnl Panel
+            local function build(pnl)
+                {avatar_write}
+                pnl.Paint = function(s, w, h)
+                    s.Avatar:SetPlayer(nil, 1)
+                end
+                pnl.PerformLayout = function(s)
+                    s.Avatar:SetPlayer(nil, 2)
+                end
+                pnl.SetPlayer = function(s, ply, size) s.Avatar:SetPlayer(ply, size) end
+            end
+            "#
+        ));
+        diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild)
+    }
+
+    #[test]
+    fn closure_assigned_to_member_sees_receiver_member_writes() {
+        assert_eq!(closure_receiver_hint_count(true), 0);
+    }
+
+    #[test]
+    fn closure_assigned_to_member_without_receiver_write_still_hints() {
+        assert!(closure_receiver_hint_count(false) > 0);
+    }
 }

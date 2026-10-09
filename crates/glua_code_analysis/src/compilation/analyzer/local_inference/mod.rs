@@ -19,7 +19,7 @@ use crate::{
     LuaTypeFact, SignatureReturnStatus, TypeOps,
     compilation::analyzer::AnalyzeContext,
     semantic::{
-        LuaInferCache, VarRefId, dynamic_field_type_without, get_var_expr_var_ref_id,
+        LuaInferCache, VarRefId, VarRefRootId, dynamic_field_type_without, get_var_expr_var_ref_id,
         infer_bind_value_type, infer_expr, infer_true_condition_narrowing,
         resolve_dynamic_field_member,
     },
@@ -1179,6 +1179,9 @@ fn collect_unguarded_child_file(
 
 /// Whether every path reaching `path` assigns that same access path first, so
 /// its value there is the assigned one rather than a lookup on the declared type.
+/// A closure assigned to a member of `recv` receives `recv` as its first
+/// parameter, so a path on that parameter continues as the same path on `recv`
+/// from where the closure is created.
 fn member_path_assigned_before(
     db: &crate::DbIndex,
     cache: &mut crate::LuaInferCache,
@@ -1198,15 +1201,42 @@ fn member_path_assigned_before(
     else {
         return false;
     };
+    path_assigned_on_every_path(db, cache, flow_tree, &root, path, flow_id, path_ref)
+}
+
+fn path_assigned_on_every_path(
+    db: &crate::DbIndex,
+    cache: &mut crate::LuaInferCache,
+    flow_tree: &crate::FlowTree,
+    root: &glua_parser::LuaChunk,
+    path: &LuaIndexExpr,
+    flow_id: crate::FlowId,
+    path_ref: VarRefId,
+) -> bool {
     let root_ref = match &path_ref {
         VarRefId::IndexRef(path_root, _) => path_root.as_decl_id().map(VarRefId::VarRef),
         _ => None,
     };
     flow_tree.every_path_settles(flow_id, |node| {
+        if let FlowNodeKind::ClosureEntry(position) = node.kind {
+            let Some(crate::FlowAntecedent::Single(antecedent)) = node.antecedent else {
+                return None;
+            };
+            let receiver_path = closure_receiver_path_ref(db, cache, path, position, &path_ref)?;
+            return Some(path_assigned_on_every_path(
+                db,
+                cache,
+                flow_tree,
+                root,
+                path,
+                antecedent,
+                receiver_path,
+            ));
+        }
         let FlowNodeKind::Assignment(assignment, _) = &node.kind else {
             return None;
         };
-        let (vars, _) = assignment.to_node(&root)?.get_var_and_expr_list();
+        let (vars, _) = assignment.to_node(root)?.get_var_and_expr_list();
         let mut assigns_path = false;
         for var in vars {
             let var_ref = get_var_expr_var_ref_id(db, cache, var.to_expr())?;
@@ -1218,6 +1248,57 @@ fn member_path_assigned_before(
         }
         assigns_path.then_some(true)
     })
+}
+
+/// `path_ref` rewritten onto the receiver when the closure created at `position`
+/// is the direct value of `recv.field = function(self_param, ...)` and the path
+/// is rooted at that first parameter.
+fn closure_receiver_path_ref(
+    db: &crate::DbIndex,
+    cache: &mut crate::LuaInferCache,
+    path: &LuaIndexExpr,
+    position: rowan::TextSize,
+    path_ref: &VarRefId,
+) -> Option<VarRefId> {
+    let VarRefId::IndexRef(path_root, key) = path_ref else {
+        return None;
+    };
+    let closure = path
+        .ancestors::<LuaClosureExpr>()
+        .find(|closure| closure.get_position() == position)?;
+    let first_param = closure.get_params_list()?.get_params().next()?;
+    let param_name = first_param.get_name_token()?.get_name_text().to_string();
+    let param_decl = crate::LuaDeclId::new(
+        cache.get_file_id(),
+        glua_parser::LuaAstToken::get_range(&first_param.get_name_token()?).start(),
+    );
+    if path_root.as_decl_id()? != param_decl {
+        return None;
+    }
+    let assign = LuaAssignStat::cast(closure.syntax().parent()?)?;
+    let (vars, exprs) = assign.get_var_and_expr_list();
+    let index = exprs
+        .iter()
+        .position(|expr| expr.syntax() == closure.syntax())?;
+    let LuaVarExpr::IndexExpr(target) = vars.get(index)? else {
+        return None;
+    };
+    let LuaExpr::NameExpr(receiver) = target.get_prefix_expr()? else {
+        return None;
+    };
+    let VarRefId::VarRef(receiver_decl) =
+        get_var_expr_var_ref_id(db, cache, LuaExpr::NameExpr(receiver.clone()))?
+    else {
+        return None;
+    };
+    let rest = key.strip_prefix(param_name.as_str())?;
+    Some(VarRefId::IndexRef(
+        VarRefRootId::Decl(receiver_decl),
+        internment::ArcIntern::new(smol_str::SmolStr::new(format!(
+            "{}{rest}",
+            receiver.get_name_text()?
+        ))),
+    ))
 }
 
 /// The next level of a member path, e.g. `self.Owner:ConCommand` from
