@@ -1744,6 +1744,7 @@ impl Engine {
         for member in group {
             let runs = &mut self.stage_runs.entry(*member).or_default().in_tasks;
             *runs = runs.saturating_add(1);
+            self.stats.note_runs(*member, *runs);
             // A loop that keeps moving under supersteps, where a task runs
             // only what was queued before it began, settles as the serial
             // loop settles it: its file's work runs to quiescence on the
@@ -2791,6 +2792,7 @@ impl Engine {
     fn admit_run(&mut self, id: DerivationId) -> bool {
         let runs = &mut self.stage_runs.entry(id).or_default().on_index;
         *runs = runs.saturating_add(1);
+        self.stats.note_runs(id, *runs);
         if *runs <= MAX_INDEX_RUNS {
             return true;
         }
@@ -3640,6 +3642,8 @@ pub(crate) struct EngineStats {
     serial_files: usize,
     serial_stages: usize,
     cycle_members: usize,
+    /// The most times one derivation ran within a stage, and which one.
+    most_runs: Option<(u16, DerivationId)>,
     /// Loops of statements cleared, and the derivations they ran again.
     pub(crate) loops_cleared: usize,
     pub(crate) loop_members_cleared: usize,
@@ -3805,6 +3809,18 @@ impl EngineStats {
         }
     }
 
+    fn note_runs(&mut self, id: DerivationId, runs: u16) {
+        if self.most_runs.is_none_or(|(most, _)| runs > most) {
+            self.most_runs = Some((runs, id));
+        }
+    }
+
+    /// The most times one derivation ran within a stage.
+    #[cfg(test)]
+    pub(crate) fn most_runs(&self) -> u16 {
+        self.most_runs.map_or(0, |(runs, _)| runs)
+    }
+
     fn evaluated(&mut self, id: DerivationId) {
         *self.evaluations.entry(id.kind).or_default() += 1;
         if self.profiling() {
@@ -3862,6 +3878,9 @@ impl EngineStats {
             "[engine] parallel attempts={} fallbacks={}",
             self.parallel_attempts, self.parallel_fallbacks
         );
+        if let Some((runs, id)) = self.most_runs {
+            eprintln!("[engine] most runs in a stage={runs} by {id:?}");
+        }
         if self.supersteps > 0 {
             eprintln!(
                 "[engine] supersteps={} tasks={} conflicting={} serial files={} serial stages={} cycle members={} conflicts={:?}",
