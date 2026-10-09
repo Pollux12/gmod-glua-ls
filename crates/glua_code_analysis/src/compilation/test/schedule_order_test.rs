@@ -752,6 +752,8 @@ function GM:Initialize() end
     /// Each file's global `PANEL` is its own scratch table: registering it must
     /// not propose the panel's class as the class of every file's `PANEL`,
     /// which sent a file's methods to whichever class won while it was filed.
+    /// A `self` field first listed under `PANEL`, while the table still named
+    /// it, must leave that listing when its writer runs again.
     #[test]
     fn global_panel_tables_two_files_register_settle_the_same_in_either_order() {
         let builtins = format!(
@@ -765,7 +767,9 @@ PANEL = Panel
         let panel = |class: &str| {
             format!(
                 "PANEL = {{}}
-function PANEL:Init() end
+function PANEL:Init()
+    self.Label = vgui.Create(\"DLabel\", self)
+end
 vgui.Register(\"{class}\", PANEL, \"Panel\")
 "
             )

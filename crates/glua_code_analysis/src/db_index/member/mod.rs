@@ -885,16 +885,24 @@ impl LuaMemberIndex {
         );
     }
 
-    /// Records that a derivation listed `id` under `owner`.
+    /// Records that a derivation listed `id` under `owner`, and under the
+    /// owner that name resolves to now, which is where the listing lands: a
+    /// reset must find it there even after the name resolves elsewhere.
     fn note_derived_owner(&mut self, id: LuaMemberId, owner: &LuaMemberOwner) {
         if derivation::writes_source() {
             return;
         }
         self.snapshot_member(id);
-        if let Some(source) = self.source_members.get_mut(&id)
-            && !source.derived_owners.contains(owner)
-        {
-            source.derived_owners.push(owner.clone());
+        let listed = self
+            .effective_path_member_owner(id, owner)
+            .unwrap_or_else(|| owner.clone());
+        let listed = self.canonical(&listed).clone();
+        if let Some(source) = self.source_members.get_mut(&id) {
+            for owner in [owner, &listed] {
+                if !source.derived_owners.contains(owner) {
+                    source.derived_owners.push(owner.clone());
+                }
+            }
         }
     }
 
