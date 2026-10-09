@@ -409,4 +409,19 @@ end
 
         assert!(ws.analysis.compilation.last_stats().most_runs() <= 4);
     }
+
+    /// Two tables whose metatables index each other: each local's type is
+    /// read back through the other's `__index`, so the two swap values when
+    /// both are re-checked only in the round after the writes that moved them.
+    #[test]
+    fn locals_indexing_each_other_through_metatables_settle_in_a_few_runs() {
+        let _serial = crate::compilation::analyzer::serial_engine();
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/sh_mutual.lua",
+            "local mtA = {}\nlocal mtB = {}\nlocal a = setmetatable({}, mtA)\nlocal b = setmetatable({}, mtB)\nmtA.__index = b\nmtB.__index = a\n",
+        );
+
+        assert!(ws.analysis.compilation.last_stats().most_runs() <= 6);
+    }
 }

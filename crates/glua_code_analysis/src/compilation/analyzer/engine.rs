@@ -544,12 +544,17 @@ pub(crate) struct Engine {
     /// to quiescence, since one of their derivations ran too often; and
     /// whether the stage settles on the serial loop instead.
     serial_files: FxHashSet<crate::FileId>,
-    /// The members of a cycle among a worker superstep's work whose outputs
-    /// alternate: tasks run them from one snapshot, where each reads what
-    /// the others held before, so they can swap values every superstep. They
-    /// run on the index for the rest of the stage, one after another as the
-    /// serial loop runs them.
+    /// The members of a cycle whose outputs alternate: worker superstep
+    /// tasks run them from one snapshot, and a round re-checks those it
+    /// sent to the next round on what the others held in the last one, so
+    /// each reads what the others held before and they can swap values every
+    /// superstep or round. For the rest of the stage they run on the index,
+    /// one after another as the serial loop runs them, each again in the
+    /// round that moved it.
     cycle_members: FxHashSet<DerivationId>,
+    /// The readers a round sent to the next one as back edges, until they run
+    /// again: one whose outputs then alternate joins [`Self::cycle_members`].
+    back_edges: FxHashSet<DerivationId>,
     /// For each member of a cycle a superstep closed, the fingerprints of
     /// its outputs after the last two supersteps that closed one through it.
     cycle_outputs: FxHashMap<DerivationId, [Option<derivation::Fingerprint>; 2]>,
@@ -843,15 +848,17 @@ impl Engine {
     /// evaluated on the index in the round's order, or ranks before the one a
     /// superstep decided last, else in the next. A changed entry stays changed.
     fn queue(&mut self, id: DerivationId, reason: Reason) {
-        if self.cursor.is_some_and(|(cursor, cursor_reason)| {
-            self.worklist.schedule == Schedule::Deferred
-                || match cursor_reason {
-                    Some(cursor_reason) => {
-                        self.worklist.entry(id, reason) < self.worklist.entry(cursor, cursor_reason)
-                    }
-                    None => id.kind.rank() < cursor.kind.rank(),
-                }
+        let Some((cursor, cursor_reason)) = self.cursor else {
+            self.worklist.insert(id, reason);
+            return;
+        };
+        if self.worklist.schedule == Schedule::Deferred || id.kind.rank() < cursor.kind.rank() {
+            self.next_round.insert(id, reason);
+        } else if cursor_reason.is_some_and(|cursor_reason| {
+            !self.cycle_members.contains(&id)
+                && self.worklist.entry(id, reason) < self.worklist.entry(cursor, cursor_reason)
         }) {
+            self.back_edges.insert(id);
             self.next_round.insert(id, reason);
         } else {
             self.worklist.insert(id, reason);
@@ -2299,6 +2306,14 @@ impl Engine {
         let touched = crate::profile::phase("engine: evaluate", || {
             self.evaluate_group(db, &group, recipe)
         });
+        for member in &group {
+            if self.back_edges.remove(member)
+                && self.outputs_alternate(db, *member)
+                && self.cycle_members.insert(*member)
+            {
+                self.stats.cycle_members += 1;
+            }
+        }
         if let Some(started) = started {
             let elapsed = started.elapsed();
             for member in &group {
@@ -2835,6 +2850,7 @@ impl Engine {
         self.serial_files.clear();
         self.cycle_members.clear();
         self.cycle_outputs.clear();
+        self.back_edges.clear();
         self.query_deferrals.clear();
         self.serial_stage = false;
         let before = db.analysis_stage();
